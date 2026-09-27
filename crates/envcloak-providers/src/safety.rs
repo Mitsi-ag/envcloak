@@ -391,9 +391,12 @@ pub enum AuthSlot {
         name: String,
         scheme: Option<String>,
     },
-    /// The user-name part of `Authorization: Basic`.
+    /// The user-name part of `Authorization: Basic` (Stripe). The
+    /// placeholder must be the whole user name, and the password is never
+    /// substituted (SPEC §6.2 rule 3).
     BasicUser,
-    /// The password part of `Authorization: Basic`.
+    /// The password part of `Authorization: Basic`. The placeholder must be
+    /// the whole password, and the user name is never substituted.
     BasicPassword,
     /// A query parameter.
     Query { name: String },

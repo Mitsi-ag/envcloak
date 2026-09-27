@@ -725,6 +725,22 @@ fn auth_slot_rules() {
     for label in ["query:key", "header:authorization"] {
         assert!(load(&with(label)).is_ok(), "{label}");
     }
+    // A Basic slot names one part (SPEC §6.2 rule 3): a provider that takes
+    // its key as the user name, as Stripe does, declares that part only, and
+    // a request cannot put the key in the other.
+    let basic_user =
+        |label: &str| with(label).replacen(AUTH, "[{ basic = \"user\" }, { query = \"key\" }]", 1);
+    let r = load(&basic_user("basic:user")).unwrap();
+    let p = r.get("example").unwrap();
+    assert_eq!(p.auth_slots[0], AuthSlot::BasicUser);
+    assert_eq!(
+        p.balance.as_ref().unwrap().request.auth,
+        AuthSlot::BasicUser
+    );
+    assert_eq!(
+        fails(&basic_user("basic:password")),
+        (K::AuthSlotNotDeclared, Some(REQUEST_LINE))
+    );
     let f = edit("method = \"GET\"", "method = \"POST\"");
     assert_eq!(fails(&f), (K::InvalidMethod, Some(REQUEST_LINE)));
     for bad in ["balance", "$", "$..balance", "$.data[01]", "$.data['x']"] {

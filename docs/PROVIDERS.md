@@ -98,7 +98,7 @@ Where a provider takes its key (SPEC §6.2 step 3). The proxy substitutes a plac
 |---|---|
 | `{ header = "<name>" }` | The whole value of that request header, such as `x-api-key` |
 | `{ header = "<name>", scheme = "<scheme>" }` | The value after the scheme and a space, such as `Authorization: Bearer` |
-| `{ basic = "user" }`, `{ basic = "password" }` | That part of `Authorization: Basic` |
+| `{ basic = "user" }`, `{ basic = "password" }` | That whole part of `Authorization: Basic`; the other part is never substituted (SPEC §6.2 rule 3). Stripe takes its key as the user name |
 | `{ query = "<name>" }` | A query parameter |
 
 Header names are lowercase letters, digits and `-`, at most 64 bytes, and not a framing, routing or cookie header (`host`, `cookie`, `content-length`, `transfer-encoding`, `connection`, `proxy-authorization`, `forwarded` and the like). A scheme is a letter, then letters, digits, `.`, `_` or `-`, at most 32 bytes, and not `Basic`, which has its own slots. Two slots that differ only in the ASCII case of the header name or scheme are the same slot. `[[auth]]` tables are not the format; use the inline list.
