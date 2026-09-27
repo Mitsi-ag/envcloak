@@ -572,7 +572,7 @@ impl Vault {
 
     /// Decrypts a field's current value.
     pub fn read_value(&self, field: FieldId) -> Result<SecretBytes, VaultError> {
-        let (class, rv) = self.field_context(field)?;
+        let (class, rv, _) = self.field_context(field)?;
         let stored: Option<Vec<u8>> = self
             .file
             .conn
@@ -597,9 +597,11 @@ impl Vault {
         opened.map_err(|k| self.changed_while_open(k))
     }
 
-    /// Decrypts one of a field's prior values, 0 being the newest.
+    /// Decrypts one of a field's prior values, 0 being the newest. A stored
+    /// list that is missing, or holds another number of values than the
+    /// field's record counts, was changed on disk.
     pub fn read_prior(&self, field: FieldId, index: usize) -> Result<SecretBytes, VaultError> {
-        let (class, rv) = self.field_context(field)?;
+        let (class, rv, count) = self.field_context(field)?;
         let stored: Option<Option<Vec<u8>>> = self
             .file
             .conn
@@ -619,7 +621,7 @@ impl Vault {
             class,
             rv,
         );
-        let priors = open_priors(item_key(&self.keys, class), &aad, stored.as_deref())
+        let priors = open_priors(item_key(&self.keys, class), &aad, stored.as_deref(), count)
             .map_err(|_| self.changed_while_open(VaultErrorKind::Tampered))?;
         priors
             .into_iter()
@@ -627,7 +629,12 @@ impl Vault {
             .ok_or_else(|| VaultErrorKind::UnknownField.into())
     }
 
-    fn field_context(&self, field: FieldId) -> Result<(crate::crypto::ItemClass, u64), VaultError> {
+    /// A field's item class, row version and prior count, as verified at
+    /// unlock or written since.
+    fn field_context(
+        &self,
+        field: FieldId,
+    ) -> Result<(crate::crypto::ItemClass, u64, u8), VaultError> {
         let f = self
             .state
             .fields
@@ -638,7 +645,7 @@ impl Vault {
             .items
             .get(&f.item)
             .ok_or(VaultErrorKind::UnknownItem)?;
-        Ok((item.class, f.row_version))
+        Ok((item.class, f.row_version, f.record.prior_count))
     }
 
     fn changed_while_open(&self, k: VaultErrorKind) -> VaultError {

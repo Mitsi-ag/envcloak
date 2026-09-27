@@ -330,8 +330,15 @@ impl<'v> Txn<'v> {
             .optional()?;
         let (sealed_value, sealed_prior) = stored.ok_or_else(changed_on_disk)?;
         let previous = open_value(k, &a(FieldTag::FieldValue), &sealed_value).map_err(tampered)?;
-        let older = open_priors(k, &a(FieldTag::FieldPrior), sealed_prior.as_deref())
-            .map_err(|_| changed_on_disk())?;
+        // The history carried forward must be the one the record counts: a
+        // list removed on disk is refused, not sealed into the new row.
+        let older = open_priors(
+            k,
+            &a(FieldTag::FieldPrior),
+            sealed_prior.as_deref(),
+            old.record.prior_count,
+        )
+        .map_err(|_| changed_on_disk())?;
         let mut priors = Vec::with_capacity(MAX_PRIOR + 1);
         priors.push(previous);
         priors.extend(older);

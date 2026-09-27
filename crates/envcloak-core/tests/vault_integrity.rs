@@ -2,9 +2,10 @@
 //! copy, makes unlock report tampering and open read-only. Every table is
 //! covered, `meta` and the header included, on a fresh open and on the
 //! handle `lock` keeps. Also: altered plaintext columns, moved ciphertext,
-//! an altered schema, an empty vault without its header, a row changed in
-//! the file while the vault is open, the documented whole-file rollback
-//! limit, file modes, and the digest's cost at 10,000 rows.
+//! an altered schema, an empty vault without its header, a row or prior
+//! list changed in the file while the vault is open, the documented
+//! whole-file rollback limit, file modes, and the digest's cost at 10,000
+//! rows.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -799,6 +800,76 @@ fn unlocking_the_handle_kept_by_lock_reads_the_file_again() {
         Some(TamperKind::DigestMismatch),
         Some(p.keep),
         "a column altered while locked",
+    );
+}
+
+/// Codex F-21: a field's prior list removed on disk while the vault is
+/// open. The authenticated prior count held since unlock says the list is
+/// there, so its absence is tampering whether a read or a rotation meets it
+/// first. The rotation is refused, so no digest vouches for the lost
+/// history, and the next unlock reports it.
+#[test]
+fn a_prior_list_removed_while_open_is_tampering() {
+    let _serial = alone();
+    let p = pristine();
+    p.restore();
+    let mut v = p.f.unlock();
+    for n in 0..2 {
+        let value = SecretBytes::copy_from(format!("rotation {n}").as_bytes());
+        v.transact(|t| t.set_value(p.other, value)).unwrap();
+    }
+    drop(v);
+    let rotated = p.f.home.root().join("rotated.db");
+    std::fs::copy(p.f.db(), &rotated).unwrap();
+    // Only `other` has a prior list.
+    let remove = "UPDATE fields SET sealed_prior = NULL WHERE sealed_prior IS NOT NULL;";
+
+    // Met by a read.
+    std::fs::copy(&rotated, p.f.db()).unwrap();
+    let v = p.f.unlock();
+    assert!(v.read_prior(p.other, 1).unwrap().ct_eq(b"other value"));
+    rewrite_on_disk(&p.f, remove);
+    v.evict_page_cache_for_testing().unwrap();
+    assert_eq!(
+        v.read_prior(p.other, 0).unwrap_err().kind(),
+        VaultErrorKind::Tampered
+    );
+    assert_read_only(
+        v,
+        Some(TamperKind::ChangedWhileOpen),
+        Some(p.keep),
+        "met by a read",
+    );
+    // Unlock's own check: the record counts priors, the row holds none.
+    assert_read_only(
+        p.f.unlock(),
+        Some(TamperKind::RowInconsistent),
+        Some(p.keep),
+        "reopened after a read",
+    );
+
+    // Met by a rotation, with no read first.
+    std::fs::copy(&rotated, p.f.db()).unwrap();
+    let before = sealed_value_of(&p.f, p.other);
+    let mut v = p.f.unlock();
+    rewrite_on_disk(&p.f, remove);
+    let e = v
+        .transact(|t| t.set_value(p.other, SecretBytes::copy_from(b"a third rotation")))
+        .unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Tampered);
+    assert_read_only(
+        v,
+        Some(TamperKind::ChangedWhileOpen),
+        Some(p.keep),
+        "met by a rotation",
+    );
+    // Nothing was committed: the row still holds the value it had.
+    assert_eq!(sealed_value_of(&p.f, p.other), before);
+    assert_read_only(
+        p.f.unlock(),
+        Some(TamperKind::RowInconsistent),
+        Some(p.keep),
+        "reopened after a rotation",
     );
 }
 

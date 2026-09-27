@@ -107,18 +107,30 @@ pub(crate) fn seal_priors(
     Ok(Some(seal(k, aad, &buf)?.to_bytes()))
 }
 
-/// Opens [`seal_priors`]'s output. `None` stored means no priors.
+/// Opens [`seal_priors`]'s output, which must hold `count` values: the
+/// authenticated `prior_count` of the field's record. `None` stored is no
+/// priors, and is accepted only when `count` is 0, so a list removed from
+/// the row (a NULL has no seal to fail) is caught like an altered one.
 #[allow(clippy::disallowed_methods)] // Unpacks prior values.
 pub(crate) fn open_priors(
     k: &SubKey,
     aad: &Aad,
     stored: Option<&[u8]>,
+    count: u8,
 ) -> Result<Vec<SecretBytes>, CryptoOrRecord> {
     let Some(stored) = stored else {
-        return Ok(Vec::new());
+        return if count == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(CryptoOrRecord::Record)
+        };
     };
     let packed = open_stored(k, aad, stored).map_err(|_| CryptoOrRecord::Crypto)?;
-    unpack_priors(packed.expose_secret()).map_err(|_| CryptoOrRecord::Record)
+    let priors = unpack_priors(packed.expose_secret()).map_err(|_| CryptoOrRecord::Record)?;
+    if priors.len() != usize::from(count) {
+        return Err(CryptoOrRecord::Record);
+    }
+    Ok(priors)
 }
 
 fn unpack_priors(b: &[u8]) -> Result<Vec<SecretBytes>, VaultError> {
@@ -194,19 +206,43 @@ mod tests {
             SecretBytes::copy_from(b"x"),
         ];
         let stored = seal_priors(k, &aad(4), &priors).unwrap().unwrap();
-        let back = open_priors(k, &aad(4), Some(&stored)).unwrap();
+        let back = open_priors(k, &aad(4), Some(&stored), 3).unwrap();
         assert_eq!(back.len(), 3);
         for (a, b) in priors.iter().zip(&back) {
             assert_eq!(a.expose_secret(), b.expose_secret());
         }
         assert!(matches!(
-            open_priors(k, &aad(5), Some(&stored)),
+            open_priors(k, &aad(5), Some(&stored), 3),
             Err(CryptoOrRecord::Crypto)
         ));
         assert!(seal_priors(k, &aad(4), &[]).unwrap().is_none());
-        assert!(open_priors(k, &aad(4), None).unwrap().is_empty());
+        assert!(open_priors(k, &aad(4), None, 0).unwrap().is_empty());
         let four: Vec<_> = (0..4).map(|_| SecretBytes::copy_from(b"v")).collect();
         assert!(seal_priors(k, &aad(4), &four).is_err());
+    }
+
+    /// Codex F-21: the stored list must agree with the authenticated count.
+    /// A removed list (NULL) where the record counts priors, or a list of
+    /// another length, is refused.
+    #[test]
+    fn priors_must_match_the_authenticated_count() {
+        let kr = Keyring::derive(&Vmk::generate(), &VaultId([1; 16]), 1);
+        let k = kr.key(Purpose::Data);
+        let two = [SecretBytes::copy_from(b"b"), SecretBytes::copy_from(b"a")];
+        let stored = seal_priors(k, &aad(4), &two).unwrap().unwrap();
+        assert_eq!(open_priors(k, &aad(4), Some(&stored), 2).unwrap().len(), 2);
+        for count in [0, 1, 3] {
+            assert!(matches!(
+                open_priors(k, &aad(4), Some(&stored), count),
+                Err(CryptoOrRecord::Record)
+            ));
+        }
+        for count in 1..=3 {
+            assert!(matches!(
+                open_priors(k, &aad(4), None, count),
+                Err(CryptoOrRecord::Record)
+            ));
+        }
     }
 
     #[test]

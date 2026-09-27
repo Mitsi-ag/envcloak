@@ -81,7 +81,7 @@ Integers are big-endian. A byte string is a `u32` length then the bytes; text is
 
 **Field**: `version(1) name prior_count(1) created_at(8) updated_at(8)`. `prior_count` is 0 exactly when `sealed_prior` is NULL.
 
-**Prior list**: `version(1) count(1)`, then `u32 length || value` for each prior value, newest first. At most 3.
+**Prior list**: `version(1) count(1)`, then `u32 length || value` for each prior value, newest first. At most 3. Its count must equal the field's `prior_count`: unlock checks that the list is present exactly when the count is not 0, and a read or rotation of prior values while the vault is open checks both (a list set to NULL has no seal to fail).
 
 **Project**: `version(1) key(bytes) display_path manifest_sha256(32) count(4) (env_name reference)... last_seen(8)`.
 
@@ -154,7 +154,7 @@ Without an anchor (Linux, and macOS before M3), restoring the whole file togethe
 - Each write names the row version it replaces (`WHERE id = ? AND row_version = ?`). A row that is not there means the file changed behind the process's back: the transaction fails and the vault turns read-only.
 - At commit the state digest is recomputed from the stamps held in memory, which only this process's writes change, and the header is rewritten in the same transaction. A row changed on disk while the vault is open is therefore never folded into a fresh digest.
 - The exclusive lock does not stop another program from writing the file directly, and in exclusive mode SQLite never checks the file for such a change: it would serve pages cached before it, and a commit to another row on a cached page would write the old copy back over it, erasing the change unreported. Every unlock and every write transaction therefore first drops SQLite's page cache and reads the file as it is. A read between them may still be served from the cache, and so sees what this process wrote; the change is met at the next write or unlock. A page whose newer copy is in the WAL is read from the WAL, so a change to its older copy in `vault.db` is never read and is overwritten at the next checkpoint.
-- A read or write that meets a row changed on disk (its sealed columns no longer open under the row version held in memory) turns the vault read-only, reporting "changed while open", and the next unlock reports the change. `tests/vault_integrity.rs` writes to the file behind an open vault and checks both, that a commit to another row on the same page does not vouch for the changed one or erase it, and that a row deleted, restored or altered while the vault is locked is reported by the next unlock through the same handle.
+- A read or write that meets a row changed on disk (its sealed columns no longer open under the row version held in memory, or its prior list does not match the field's prior count) turns the vault read-only, reporting "changed while open", and the next unlock reports the change. A write that meets it is refused, so it never seals what it read into a new row. `tests/vault_integrity.rs` writes to the file behind an open vault and checks both, that a commit to another row on the same page does not vouch for the changed one or erase it, that a removed prior list is refused by a rotation, and that a row deleted, restored or altered while the vault is locked is reported by the next unlock through the same handle.
 - Replacing a value makes the old one the newest prior value; three are kept.
 - Deleting an item deletes its fields; `secure_delete` overwrites the freed pages.
 
