@@ -21,6 +21,10 @@ pub enum TableTag {
     Projects = 4,
     Policies = 5,
     Audit = 6,
+    /// `unlockers` rows hold envelopes, which authenticate themselves, so
+    /// no sealed value uses this tag; it names the table's rows in the
+    /// vault's state digest.
+    Unlockers = 7,
 }
 
 /// The column a sealed value is stored in. Part of the vault format, like

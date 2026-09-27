@@ -10,19 +10,31 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test support only (`envcloak_core::testing`): exporting and importing a
+# VMK, and opening a vault with a migration plan other than the shipped one.
+# Release binaries never enable it.
+testing = []
+
 [dependencies]
 argon2.workspace = true
 blake2.workspace = true
 blake3.workspace = true
 chacha20poly1305.workspace = true
+envcloak-sys.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
+rusqlite.workspace = true
 secrecy.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Enables the `testing` feature for this crate's own tests.
+envcloak-core = { path = ".", features = ["testing"] }
 envcloak-testkit.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 static_assertions.workspace = true
+tempfile.workspace = true

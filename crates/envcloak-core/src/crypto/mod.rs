@@ -26,6 +26,8 @@ mod kdf;
 mod keys;
 
 pub use aad::{Aad, FieldTag, ItemClass, TableTag};
+#[cfg(test)]
+pub(crate) use aead::OPEN_ATTEMPTS;
 pub use aead::{Sealed, open, seal};
 pub use envelope::{
     Envelope, EnvelopeCtx, UnlockerKind, rewrap_vmk, unwrap_vmk, unwrap_vmk_with, wrap_vmk,

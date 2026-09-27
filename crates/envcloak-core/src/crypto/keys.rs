@@ -33,7 +33,7 @@ impl VaultId {
 }
 
 /// An unlocker's random identifier. Not secret.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnlockerId(pub [u8; 16]);
 
 impl UnlockerId {
@@ -88,6 +88,28 @@ impl Vmk {
 impl core::fmt::Debug for Vmk {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("Vmk(..)")
+    }
+}
+
+/// Test support only (feature `testing`): moving a VMK between processes,
+/// so crash tests can reopen a vault without running Argon2 each time.
+/// Release binaries never enable the feature.
+#[cfg(feature = "testing")]
+impl Vmk {
+    /// The key's bytes, as a plain vector for a test to hand to a child
+    /// process.
+    #[allow(clippy::disallowed_methods)] // Test support: copies the key out.
+    pub fn export_for_testing(&self) -> Vec<u8> {
+        self.0.expose_secret().to_vec()
+    }
+
+    /// A VMK from [`Vmk::export_for_testing`]'s bytes; `None` unless there
+    /// are exactly 32.
+    pub fn import_for_testing(b: &[u8]) -> Option<Self> {
+        let b: &[u8; 32] = b.try_into().ok()?;
+        Some(Vmk(SecretBox::init_with_mut(|k: &mut [u8; 32]| {
+            k.copy_from_slice(b)
+        })))
     }
 }
 

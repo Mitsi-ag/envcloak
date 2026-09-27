@@ -11,4 +11,5 @@ crates/envcloak-core/src/secret.rs           # SecretBytes and SecretBuf themsel
 crates/envcloak-core/src/crypto/aead.rs      # seal and open: read a subkey to encrypt or decrypt
 crates/envcloak-core/src/crypto/envelope.rs  # wraps and unwraps the VMK under keys derived from a KEK
 crates/envcloak-core/src/crypto/kdf.rs       # Argon2id reads the passphrase or Recovery Kit
-crates/envcloak-core/src/crypto/keys.rs      # derives subkeys from the VMK; keyed hashing under a subkey
+crates/envcloak-core/src/crypto/keys.rs      # derives subkeys from the VMK; keyed hashing under a subkey; VMK export for tests (feature testing only)
+crates/envcloak-core/src/vault/values.rs     # the vault's plaintext boundary: seals, opens and hashes values and prior values, re-seals them in a migration, hands opened metadata to its decoder
