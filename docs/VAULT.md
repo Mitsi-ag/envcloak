@@ -33,8 +33,8 @@ All tables are `STRICT`. Row ids are ULIDs: 48 bits of creation time in millisec
 
 ```
 meta      (vault_id BLOB, schema_version INTEGER, created_at INTEGER)
-header    (epoch INTEGER, sealed BLOB)
-unlockers (id BLOB PRIMARY KEY, kind INTEGER, envelope BLOB, created_at INTEGER)
+header    (epoch INTEGER, vault_id BLOB, schema_version INTEGER, sealed BLOB)
+unlockers (id BLOB PRIMARY KEY, vault_id BLOB, kind INTEGER, envelope BLOB, created_at INTEGER)
 items     (id BLOB PRIMARY KEY, row_version INTEGER, class INTEGER, slug_hash BLOB UNIQUE,
            sealed_meta BLOB, updated_at INTEGER)
 fields    (id BLOB PRIMARY KEY, item_id BLOB, row_version INTEGER, sealed_name BLOB,
@@ -45,14 +45,17 @@ policies  (id BLOB PRIMARY KEY, row_version INTEGER, sealed BLOB)
 
 `meta` and `header` hold exactly one row each. There are no other tables, indexes, triggers or views; the exact DDL is `SCHEMA_V1` in `schema.rs`.
 
+The vault id is stored in `meta`, in the header and in every unlocker, and the schema version in `meta` and in the header, so that no single row decides them (see Unlock).
+
 ### What each column holds
 
 | Column | Contents | Key |
 |---|---|---|
-| `meta.*` | Plaintext. `vault_id` and `schema_version` are in the associated data of every sealed value, so changing either makes nothing open. `created_at` is informational and not authenticated. | |
-| `header.epoch` | Plaintext; the key epoch. Changing it derives other subkeys, so nothing opens. | |
+| `meta.*` | Plaintext. `vault_id` and `schema_version` are in the associated data of every sealed value, so nothing opens under wrong ones. `created_at` is informational and not authenticated. | |
+| `header.epoch`, `vault_id`, `schema_version` | Plaintext: the key epoch, vault id and schema version the header was sealed under (its subkey and associated data use them). | |
 | `header.sealed` | The header record | `header` |
 | `unlockers.envelope` | A 159-byte envelope (CRYPTO.md) | its own KEK |
+| `unlockers.vault_id` | Plaintext; the envelope's commitment binds it. Covered by the state digest. | |
 | `unlockers.kind`, `created_at` | Plaintext, covered by the state digest | |
 | `items.class` | Plaintext: 1 secret, 2 card, 3 issuer credential | |
 | `items.slug_hash` | `keyed_hash(index, "envcloak/v1/slug", slug)` | `index` |
@@ -95,7 +98,7 @@ Each row of `unlockers`, `items`, `fields`, `projects` and `policies` has a stam
 
 | Table | Hashed bytes |
 |---|---|
-| unlockers | `kind(8) created_at(8) envelope` |
+| unlockers | `len vault_id kind(8) created_at(8) envelope` |
 | items | `class(8) len slug_hash updated_at(8) sealed_meta` |
 | fields | `len item_id len value_hash len sealed_name len sealed_value has_prior(1) [sealed_prior]` |
 | projects | `len dir_hash sealed` |
@@ -111,24 +114,30 @@ The table tags are CRYPTO.md's: unlockers 7, items 2, fields 3, projects 4, poli
 
 ## Unlock
 
-`LockedVault::open` checks the directories and the file, takes the exclusive lock, and reads `meta` and the epoch (from `header`, or from the unlockers when the header row is missing or doubled). A schema version newer than this build's is refused, and nothing is written. Unlocker envelopes can be listed without the key.
+`LockedVault::open` checks the directories and the file, takes the exclusive lock, and reads the plaintext that names the vault. No single row decides it, so one deleted, doubled or altered row still lets the vault open (and unlock then reports it):
+- the vault id is the one most of the `meta`, header and unlocker rows hold (a tie is refused as damaged);
+- the epoch is the header's when an envelope carries it, otherwise the one every envelope carries;
+- the schema version is the header's, then `meta`'s. When every row that names one names a version newer than this build's, the vault is refused and nothing is written.
+
+Unlocker envelopes of that epoch can then be listed without the key and unwrapped with that vault id.
 
 `unlock` with the VMK then:
 1. derives the subkeys for the vault id and epoch;
 2. compares `sqlite_schema` with the objects the schema version defines;
-3. opens the header;
+3. checks that `meta` is one row naming that vault id and schema version, and opens every header row, checking its plaintext columns;
 4. reads every row, computes its stamp, and decrypts the item, field, project and policy records. It never opens `sealed_value` or `sealed_prior`: values are decrypted one at a time, on request;
-5. checks each row's plaintext columns against its sealed contents (the slug and project hashes, the item a field belongs to, unique slugs and field names, an unlocker's id, kind and epoch);
+5. checks each row's plaintext columns against its sealed contents (the slug and project hashes, the item a field belongs to, unique slugs and field names, an unlocker's id, vault id, kind and epoch);
 6. recomputes the state digest and compares it with the header's.
 
-If nothing opens under the key, neither the header nor any row, unlock fails with a key mismatch. Otherwise any failure in steps 2 to 6 opens the vault read-only and reports the first one found:
+When the header and the rows name different schema versions, unlock uses the first one under which the header or a row opens. If the file holds a header row or a sealed row and nothing opens under the key, unlock fails with a key mismatch (or, when some row names a newer version, with an unsupported version). An empty vault whose header was deleted holds nothing sealed to check the key against: it opens read-only and empty. Otherwise any failure in steps 2 to 6 opens the vault read-only and reports the first one found:
 
 | Report | Meaning |
 |---|---|
 | header unreadable | The header is missing, doubled or does not open, while rows open |
+| meta altered | The `meta` row is missing or doubled, or names another vault id or schema version |
 | digest mismatch | A row was deleted, added, altered, or restored from an older copy |
 | row unreadable | A sealed column does not open (moved, altered, or a changed class) |
-| row inconsistent | Plaintext columns disagree with the sealed contents |
+| row inconsistent | Plaintext columns disagree with the sealed contents, the header's included |
 | schema altered | A table, index, trigger or view was added or changed |
 | changed while open | A row on disk no longer matches what this process wrote |
 

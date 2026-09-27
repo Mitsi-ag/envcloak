@@ -37,7 +37,9 @@ pub(crate) const APPLICATION_ID: i32 = 0x4543_5631;
 
 /// Schema version 1 (SPEC §5; docs/VAULT.md). Plaintext columns hold only
 /// opaque ids, row versions, timestamps, kinds and keyed hashes; `sealed*`
-/// columns hold XChaCha20-Poly1305 output.
+/// columns hold XChaCha20-Poly1305 output. The vault id is kept in `meta`,
+/// the header and every unlocker, and the schema version in `meta` and the
+/// header, so one deleted or altered row does not stop the vault opening.
 pub(crate) const SCHEMA_V1: &str = "\
 CREATE TABLE meta (
   vault_id BLOB NOT NULL,
@@ -46,10 +48,13 @@ CREATE TABLE meta (
 ) STRICT;
 CREATE TABLE header (
   epoch INTEGER NOT NULL,
+  vault_id BLOB NOT NULL,
+  schema_version INTEGER NOT NULL,
   sealed BLOB NOT NULL
 ) STRICT;
 CREATE TABLE unlockers (
   id BLOB PRIMARY KEY NOT NULL,
+  vault_id BLOB NOT NULL,
   kind INTEGER NOT NULL,
   envelope BLOB NOT NULL,
   created_at INTEGER NOT NULL

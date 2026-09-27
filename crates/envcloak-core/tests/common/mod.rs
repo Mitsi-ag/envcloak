@@ -8,12 +8,15 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
     Argon2id, EnvelopeCtx, ItemClass, KdfParams, UnlockerId, UnlockerKind, VaultId, Vmk,
-    wrap_vmk_with,
+    unwrap_vmk_with, wrap_vmk_with,
 };
 use envcloak_core::vault::{
     FieldName, INITIAL_EPOCH, ItemDetails, LockedVault, NewItem, Slug, Vault, VaultPaths,
 };
 use envcloak_testkit::TestHome;
+
+/// The passphrase of every fixture vault's passphrase unlocker.
+pub const PASSPHRASE: &[u8] = b"a test passphrase, not a fixture";
 
 /// A vault in its own test home, and the VMK's bytes to reopen it with.
 pub struct Fixture {
@@ -35,7 +38,7 @@ impl Fixture {
         let bytes = vmk.export_for_testing();
         let env = wrap_vmk_with(
             &vmk,
-            &SecretBytes::copy_from(b"a test passphrase, not a fixture"),
+            &SecretBytes::copy_from(PASSPHRASE),
             UnlockerKind::Passphrase,
             &EnvelopeCtx {
                 vault_id,
@@ -74,6 +77,26 @@ impl Fixture {
             .unlock(self.vmk())
             .map_err(|(_, e)| e)
             .unwrap()
+    }
+
+    /// Opens the vault the way the daemon will: lists the envelopes without
+    /// the key, unwraps the passphrase envelope with the vault id and epoch
+    /// the file reports, and unlocks with the VMK that gives.
+    pub fn unlock_with_passphrase(&self) -> Vault {
+        let locked = LockedVault::open(&self.paths).unwrap();
+        let envs = locked.unlockers().unwrap();
+        let env = envs
+            .iter()
+            .find(|e| e.kind() == UnlockerKind::Passphrase)
+            .expect("the passphrase envelope is listed");
+        let ctx = EnvelopeCtx {
+            vault_id: locked.vault_id(),
+            unlocker_id: env.unlocker_id(),
+            epoch: locked.epoch(),
+        };
+        let vmk = unwrap_vmk_with(env, &SecretBytes::copy_from(PASSPHRASE), &ctx, &Argon2id)
+            .expect("the passphrase unwraps the VMK");
+        locked.unlock(vmk).map_err(|(_, e)| e).unwrap()
     }
 
     /// The path of the database file, canonicalized as the vault opens it.

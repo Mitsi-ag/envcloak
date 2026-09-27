@@ -15,7 +15,7 @@ use envcloak_core::SecretBytes;
 use envcloak_core::crypto::Vmk;
 use envcloak_core::vault::{
     FieldId, Integrity, LockedVault, Migration, MigrationPlan, MigrationTx, PolicyId, ProjectKey,
-    ProjectRecord, Vault, VaultError, VaultErrorKind, VaultPaths,
+    ProjectRecord, TamperKind, Vault, VaultError, VaultErrorKind, VaultPaths,
 };
 use envcloak_testkit::fresh_seed;
 use rusqlite::types::Value;
@@ -191,7 +191,7 @@ fn a_migration_reseals_everything_and_verifies() {
         ("fields", 6),
         ("projects", 3),
         ("policies", 2),
-        ("header", 1),
+        ("header", 3),
     ] {
         let old = blobs(&before, table, col);
         let new = blobs(&after, table, col);
@@ -215,6 +215,15 @@ fn a_migration_reseals_everything_and_verifies() {
         })
         .unwrap();
     assert_eq!(tiers, 10);
+    // Both rows that name the version say 2.
+    let versions: (i64, i64) = raw
+        .query_row(
+            "SELECT (SELECT schema_version FROM meta), (SELECT schema_version FROM header)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(versions, (2, 2));
     drop(raw);
 
     // Reopened with the same plan: nothing left to migrate, and writes
@@ -253,6 +262,60 @@ fn a_tampered_vault_is_not_migrated() {
     assert!(v.read_value(values[0].0).unwrap().ct_eq(&values[0].1));
     drop(v);
     assert_eq!(dump(&f), before);
+}
+
+/// Gate 6 across a migration: `meta` restored from the copy taken before
+/// the vault moved to version 2, or the header's copy of the version
+/// lowered, opens read-only at the version the header and rows were sealed
+/// under. Nothing is migrated or written. A build that reads only version 1
+/// reports a newer vault instead of a wrong key.
+#[test]
+fn a_meta_row_from_before_a_migration_opens_read_only() {
+    let (f, values) = populated(3);
+    let v1 = f.home.root().join("v1.db");
+    std::fs::copy(f.db(), &v1).unwrap();
+    drop(open_with(&f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap());
+    let v2 = f.home.root().join("v2.db");
+    std::fs::copy(f.db(), &v2).unwrap();
+
+    for (case, want) in [
+        ("meta restored from version 1", TamperKind::MetaAltered),
+        ("the header's version lowered", TamperKind::RowInconsistent),
+    ] {
+        std::fs::copy(&v2, f.db()).unwrap();
+        let raw = f.raw();
+        if want == TamperKind::MetaAltered {
+            raw.execute("ATTACH DATABASE ?1 AS old", [v1.to_str().unwrap()])
+                .unwrap();
+            raw.execute_batch(
+                "DELETE FROM main.meta; INSERT INTO main.meta SELECT * FROM old.meta; \
+                 DETACH DATABASE old;",
+            )
+            .unwrap();
+        } else {
+            raw.execute_batch("UPDATE header SET schema_version = 1;")
+                .unwrap();
+        }
+        drop(raw);
+        let before = dump(&f);
+
+        let mut v = open_with(&f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap();
+        assert_eq!(v.integrity(), Integrity::Tampered(want), "{case}");
+        assert_eq!(v.schema_version(), 2, "{case}");
+        assert_values(&v, &values);
+        let e = v
+            .transact(|t| t.set_value(values[1].0, SecretBytes::copy_from(b"no")))
+            .unwrap_err();
+        assert_eq!(e.kind(), VaultErrorKind::ReadOnly, "{case}");
+        drop(v);
+        assert_eq!(dump(&f), before, "{case}: the file changed");
+
+        let (_, e) = LockedVault::open(&f.paths)
+            .unwrap()
+            .unlock(f.vmk())
+            .unwrap_err();
+        assert_eq!(e.kind(), VaultErrorKind::UnsupportedVersion, "{case}");
+    }
 }
 
 const MIGRATOR: &str = "ENVCLOAK_VAULT_MIGRATOR";

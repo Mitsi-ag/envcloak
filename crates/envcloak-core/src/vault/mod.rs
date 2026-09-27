@@ -126,40 +126,13 @@ impl LockedVault {
         if app_id != schema::APPLICATION_ID {
             return Err(VaultErrorKind::Damaged.into());
         }
-        let metas = {
-            let mut st = conn.prepare("SELECT vault_id, schema_version, created_at FROM meta")?;
-            let rows = st.query_map([], |r| {
-                Ok((
-                    r.get::<_, Vec<u8>>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        let [(vault_id, version, created_at)] = metas.as_slice() else {
-            return Err(VaultErrorKind::Damaged.into());
-        };
-        let vault_id = VaultId(
-            vault_id
-                .as_slice()
-                .try_into()
-                .map_err(|_| VaultError::from(VaultErrorKind::Damaged))?,
-        );
-        let schema_version = u16::try_from(*version)
-            .ok()
-            .filter(|v| *v >= 1)
-            .ok_or(VaultErrorKind::Damaged)?;
-        if schema_version > plan.target() {
-            return Err(VaultErrorKind::UnsupportedVersion.into());
-        }
-        let epoch = read_epoch(&conn)?;
+        let id = read_identity(&conn, plan.target())?;
         Ok(LockedVault {
+            vault_id: id.vault_id,
+            schema_version: *id.versions.first().ok_or(VaultErrorKind::Damaged)?,
+            epoch: id.epoch,
+            created_at: id.created_at,
             conn,
-            vault_id,
-            schema_version,
-            epoch,
-            created_at: u64::try_from(*created_at).unwrap_or(0),
             plan,
         })
     }
@@ -172,6 +145,8 @@ impl LockedVault {
         self.epoch
     }
 
+    /// The schema version the file names (before unlock), or the one it
+    /// verified under (after an unlock).
     pub fn schema_version(&self) -> u16 {
         self.schema_version
     }
@@ -207,17 +182,49 @@ impl LockedVault {
     /// the state digest, decrypts item metadata (never a value), and
     /// migrates an older format when the vault verified. On failure the
     /// locked vault comes back with the error.
+    ///
+    /// When the file names more than one schema version (an altered or
+    /// restored `meta` or header row), the vault opens under the first one
+    /// its header or rows open under, and reports the row read-only.
     pub fn unlock(mut self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
         let keys = Keyring::derive(&vmk, &self.vault_id, self.epoch);
-        let mut ctx = VaultCtx {
-            vault_id: self.vault_id,
-            schema_version: self.schema_version,
-            epoch: self.epoch,
-        };
-        let mut loaded = match load_verified(&self.conn, &keys, &ctx, &self.plan) {
-            Ok(l) => l,
+        // The file cannot have changed since `open`: this handle holds the
+        // exclusive lock.
+        let id = match read_identity(&self.conn, self.plan.target()) {
+            Ok(id) => id,
             Err(e) => return Err((self, e)),
         };
+        let others = id.versions.iter().filter(|v| **v != self.schema_version);
+        let versions: Vec<u16> = core::iter::once(self.schema_version)
+            .chain(others.copied())
+            .collect();
+        let mut opened = None;
+        for schema_version in versions {
+            let ctx = VaultCtx {
+                vault_id: self.vault_id,
+                schema_version,
+                epoch: self.epoch,
+            };
+            match load_verified(&self.conn, &keys, &ctx, &self.plan) {
+                Ok(l) => {
+                    opened = Some((ctx, l));
+                    break;
+                }
+                Err(e) if e.kind() == VaultErrorKind::KeyMismatch => {}
+                Err(e) => return Err((self, e)),
+            }
+        }
+        let Some((mut ctx, mut loaded)) = opened else {
+            // Nothing opened under a version this build reads: the file is
+            // newer, when it says so, or the key is wrong.
+            let kind = if id.newer {
+                VaultErrorKind::UnsupportedVersion
+            } else {
+                VaultErrorKind::KeyMismatch
+            };
+            return Err((self, kind.into()));
+        };
+        self.schema_version = ctx.schema_version;
         if loaded.integrity == Integrity::Ok && ctx.schema_version < self.plan.target() {
             let header = loaded.state.header;
             if let Err(e) = migrate::run(&mut self.conn, &keys, &ctx, &header, &self.plan) {
@@ -259,33 +266,122 @@ fn load_verified(
     state::load(conn, keys, ctx, schema_ok)
 }
 
-/// The epoch from the header row or, when that row is missing or
-/// duplicated, from the unlockers, so a vault with a damaged header can
-/// still open read-only.
-fn read_epoch(conn: &Connection) -> Result<u32, VaultError> {
-    let collect = |sql: &str| -> Result<Vec<i64>, VaultError> {
-        let mut st = conn.prepare(sql)?;
-        let rows = st.query_map([], |r| r.get::<_, i64>(0))?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    };
-    let headers = collect("SELECT epoch FROM header")?;
-    let epoch = match headers.as_slice() {
-        [e] => Some(*e),
-        _ => {
-            let mut st = conn.prepare("SELECT envelope FROM unlockers")?;
-            let rows = st.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-            let mut epochs = std::collections::BTreeSet::new();
-            for b in rows {
-                if let Ok(env) = Envelope::from_bytes(&b?) {
-                    epochs.insert(i64::from(env.epoch()));
-                }
-            }
-            (epochs.len() == 1).then(|| epochs.into_iter().next().unwrap_or(0))
+/// What the file's plaintext says about the vault before it is unlocked.
+struct Identity {
+    vault_id: VaultId,
+    /// The schema versions named that this build reads, the header's
+    /// first. Never empty.
+    versions: Vec<u16>,
+    /// Some row names a version newer than this build reads.
+    newer: bool,
+    epoch: u32,
+    created_at: u64,
+}
+
+/// Reads the vault id, schema version and epoch from the rows that hold
+/// them in plaintext: `meta`, the header, and the unlockers (each holds the
+/// vault id, and its envelope the epoch). None of them is trusted alone, so
+/// one deleted, doubled or altered row among them still lets the vault open;
+/// unlock then reports it and opens read-only (SPEC §15.2 gate 6).
+/// - The vault id is the one most of these rows hold. A tie is
+///   [`VaultErrorKind::Damaged`].
+/// - The epoch is the header's when an envelope carries it, otherwise the
+///   one every envelope carries.
+/// - The schema versions are the header's, then `meta`'s, keeping those
+///   this build reads; unlock uses the first that the header or rows open
+///   under. When no row names one, every version this build reads is
+///   tried. When every row names a newer one, the vault is refused with
+///   [`VaultErrorKind::UnsupportedVersion`].
+fn read_identity(conn: &Connection, target: u16) -> Result<Identity, VaultError> {
+    let metas = state::query(
+        conn,
+        "SELECT vault_id, schema_version, created_at FROM meta",
+        |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    let headers = state::query(
+        conn,
+        "SELECT epoch, vault_id, schema_version FROM header",
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    let unlockers = state::query(conn, "SELECT vault_id, envelope FROM unlockers", |r| {
+        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+
+    let mut votes = std::collections::BTreeMap::<[u8; 16], usize>::new();
+    let ids = metas
+        .iter()
+        .map(|m| &m.0)
+        .chain(headers.iter().map(|h| &h.1))
+        .chain(unlockers.iter().map(|u| &u.0));
+    for id in ids {
+        if let Ok(id) = <[u8; 16]>::try_from(id.as_slice()) {
+            *votes.entry(id).or_default() += 1;
         }
+    }
+    let most = votes
+        .values()
+        .copied()
+        .max()
+        .ok_or(VaultErrorKind::Damaged)?;
+    let mut leaders = votes.iter().filter(|(_, n)| **n == most).map(|(id, _)| *id);
+    let (Some(vault_id), None) = (leaders.next(), leaders.next()) else {
+        return Err(VaultErrorKind::Damaged.into());
     };
-    epoch
-        .and_then(|e| u32::try_from(e).ok())
-        .ok_or_else(|| VaultErrorKind::Damaged.into())
+
+    let envelope_epochs: std::collections::BTreeSet<u32> = unlockers
+        .iter()
+        .filter_map(|u| Envelope::from_bytes(&u.1).ok())
+        .map(|e| e.epoch())
+        .collect();
+    let header_epoch = match headers.as_slice() {
+        [h] => u32::try_from(h.0).ok(),
+        _ => None,
+    };
+    let epoch = match (header_epoch, envelope_epochs.first()) {
+        (Some(e), _) if envelope_epochs.contains(&e) => e,
+        (_, Some(e)) if envelope_epochs.len() == 1 => *e,
+        (Some(e), None) => e,
+        _ => return Err(VaultErrorKind::Damaged.into()),
+    };
+
+    let mut versions = Vec::new();
+    let mut newer = false;
+    for v in headers.iter().map(|h| h.2).chain(metas.iter().map(|m| m.1)) {
+        match u16::try_from(v) {
+            Ok(v) if v > target => newer = true,
+            Ok(v) if v >= 1 && !versions.contains(&v) => versions.push(v),
+            _ => {}
+        }
+    }
+    if versions.is_empty() {
+        if newer {
+            return Err(VaultErrorKind::UnsupportedVersion.into());
+        }
+        versions = (1..=target).rev().collect();
+    }
+    let created_at = match metas.as_slice() {
+        [m] => u64::try_from(m.2).unwrap_or(0),
+        _ => 0,
+    };
+    Ok(Identity {
+        vault_id: VaultId(vault_id),
+        versions,
+        newer,
+        epoch,
+        created_at,
+    })
 }
 
 /// An unlocked vault: the file, the VMK and its subkeys, and the verified
@@ -606,14 +702,15 @@ fn build_new(
         let kind = i64::from(env.kind() as u8);
         let bytes = env.to_bytes();
         tx.execute(
-            "INSERT INTO unlockers (id, kind, envelope, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![&id.0[..], kind, &bytes[..], now],
+            "INSERT INTO unlockers (id, vault_id, kind, envelope, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&id.0[..], &vault_id.0[..], kind, &bytes[..], now],
         )?;
         stamps.insert(
             integrity::row_key(TableTag::Unlockers, &id.0),
             integrity::Stamp {
                 row_version: 0,
-                body: unlocker_body(kind, now, &bytes),
+                body: unlocker_body(&vault_id.0, kind, now, &bytes),
             },
         );
     }
@@ -628,8 +725,8 @@ fn build_new(
         &header.encode(),
     )?;
     tx.execute(
-        "INSERT INTO header (epoch, sealed) VALUES (?1, ?2)",
-        params![INITIAL_EPOCH, sealed],
+        "INSERT INTO header (epoch, vault_id, schema_version, sealed) VALUES (?1, ?2, ?3, ?4)",
+        params![INITIAL_EPOCH, &vault_id.0[..], CURRENT_SCHEMA, sealed],
     )?;
     tx.commit()?;
     conn.close().map_err(|(_, e)| VaultError::from(e))

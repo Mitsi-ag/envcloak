@@ -119,8 +119,12 @@ pub enum TamperKind {
     /// A sealed row does not open.
     RowUnreadable,
     /// A row's plaintext columns disagree with its sealed contents (a keyed
-    /// hash, an item reference, an unlocker's kind or id).
+    /// hash, an item reference, an unlocker's kind, id or vault id, or the
+    /// header's epoch, vault id or schema version).
     RowInconsistent,
+    /// The `meta` row is missing or doubled, or names another vault id or
+    /// schema version than the header and rows were sealed under.
+    MetaAltered,
     /// The database holds tables, indexes, triggers or views the vault
     /// format does not define.
     SchemaAltered,
@@ -137,6 +141,7 @@ impl TamperKind {
             }
             TamperKind::RowUnreadable => "a sealed vault row does not open",
             TamperKind::RowInconsistent => "a vault row's columns disagree with its sealed data",
+            TamperKind::MetaAltered => "the vault's meta row is missing, doubled or altered",
             TamperKind::SchemaAltered => "the vault database's schema was altered",
             TamperKind::ChangedWhileOpen => "a vault row changed on disk while the vault was open",
         }
@@ -169,9 +174,20 @@ fn len32(b: &[u8]) -> [u8; 4] {
     u32::try_from(b.len()).unwrap_or(u32::MAX).to_be_bytes()
 }
 
-/// `unlockers`: `kind(8) created_at(8) envelope`.
-pub(crate) fn unlocker_body(kind: i64, created_at: i64, envelope: &[u8]) -> [u8; 32] {
-    sha256(&[&kind.to_be_bytes(), &created_at.to_be_bytes(), envelope])
+/// `unlockers`: `len(4) vault_id kind(8) created_at(8) envelope`.
+pub(crate) fn unlocker_body(
+    vault_id: &[u8],
+    kind: i64,
+    created_at: i64,
+    envelope: &[u8],
+) -> [u8; 32] {
+    sha256(&[
+        &len32(vault_id),
+        vault_id,
+        &kind.to_be_bytes(),
+        &created_at.to_be_bytes(),
+        envelope,
+    ])
 }
 
 /// `items`: `class(8) len(4) slug_hash updated_at(8) sealed_meta`.

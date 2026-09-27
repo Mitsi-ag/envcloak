@@ -471,24 +471,31 @@ fn create_open_and_lock_refusals() {
 fn a_foreign_or_newer_file_is_refused() {
     let (f, v) = Fixture::create();
     drop(v);
-    let raw = f.raw();
-    raw.execute("UPDATE meta SET schema_version = 99", [])
+    // A newer file names its version in both `meta` and the header. (One of
+    // them alone is an altered row: vault_integrity.rs.)
+    f.raw()
+        .execute_batch(
+            "UPDATE meta SET schema_version = 99; UPDATE header SET schema_version = 99;",
+        )
         .unwrap();
-    drop(raw);
     assert_eq!(
         LockedVault::open(&f.paths).unwrap_err().kind(),
         VaultErrorKind::UnsupportedVersion
     );
-    let raw = f.raw();
-    raw.execute("UPDATE meta SET schema_version = 0", [])
+    // No row names a vault id.
+    f.raw()
+        .execute_batch(
+            "UPDATE meta SET schema_version = 1; UPDATE header SET schema_version = 1; \
+             UPDATE meta SET vault_id = x'00'; UPDATE header SET vault_id = x'00'; \
+             UPDATE unlockers SET vault_id = x'00';",
+        )
         .unwrap();
-    drop(raw);
     assert_eq!(
         LockedVault::open(&f.paths).unwrap_err().kind(),
         VaultErrorKind::Damaged
     );
     let raw = f.raw();
-    raw.execute("UPDATE meta SET schema_version = 1", [])
+    raw.execute("UPDATE meta SET vault_id = ?1", [&f.vault_id.0[..]])
         .unwrap();
     raw.pragma_update(None, "application_id", 7).unwrap();
     drop(raw);

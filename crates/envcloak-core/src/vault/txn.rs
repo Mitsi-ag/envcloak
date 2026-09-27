@@ -583,27 +583,26 @@ impl<'v> Txn<'v> {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
         let id = env.unlocker_id();
+        let vault_id = &self.ctx.vault_id.0[..];
         let kind = i64::from(env.kind() as u8);
         let created_at = to_i64(self.now)?;
         let bytes = env.to_bytes();
         let n = if replace {
             self.tx.execute(
-                "UPDATE unlockers SET kind = ?1, envelope = ?2, created_at = ?3 WHERE id = ?4",
-                params![kind, &bytes[..], created_at, &id.0[..]],
+                "UPDATE unlockers SET vault_id = ?1, kind = ?2, envelope = ?3, created_at = ?4 \
+                 WHERE id = ?5",
+                params![vault_id, kind, &bytes[..], created_at, &id.0[..]],
             )?
         } else {
             self.tx.execute(
-                "INSERT INTO unlockers (id, kind, envelope, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![&id.0[..], kind, &bytes[..], created_at],
+                "INSERT INTO unlockers (id, vault_id, kind, envelope, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![&id.0[..], vault_id, kind, &bytes[..], created_at],
             )?
         };
         one_row(n)?;
-        self.stamp(
-            TableTag::Unlockers,
-            &id.0,
-            0,
-            unlocker_body(kind, created_at, &bytes),
-        );
+        let body = unlocker_body(vault_id, kind, created_at, &bytes);
+        self.stamp(TableTag::Unlockers, &id.0, 0, body);
         self.state.unlockers.insert(id, env);
         Ok(())
     }

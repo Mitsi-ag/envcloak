@@ -15,7 +15,8 @@
 //!
 //! Then `meta.schema_version` is set, the schema is compared with the
 //! expected one, the state digest is recomputed from the migrated rows and
-//! the header is written, and the transaction commits.
+//! the header, with its copy of the schema version, is written, and the
+//! transaction commits.
 //!
 //! Version 1 is the first format, so the shipped plan has no steps.
 
@@ -180,8 +181,8 @@ fn migrate_in(
     };
     let sealed = seal_record(keys.key(Purpose::Header), &to.header_aad(), &next.encode())?;
     let n = tx.execute(
-        "UPDATE header SET sealed = ?1 WHERE epoch = ?2",
-        params![sealed, ctx.epoch],
+        "UPDATE header SET sealed = ?1, schema_version = ?2 WHERE epoch = ?3",
+        params![sealed, version, ctx.epoch],
     )?;
     if n != 1 {
         return Err(VaultErrorKind::Migration.into());

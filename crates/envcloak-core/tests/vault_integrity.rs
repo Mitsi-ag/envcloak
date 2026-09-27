@@ -1,8 +1,9 @@
 //! Gate 6 (SPEC §15.2): deleting a row, or restoring one row from an older
-//! copy, makes unlock report tampering and open read-only. Also: altered
-//! plaintext columns, moved ciphertext, an altered schema, the header, the
-//! documented whole-file rollback limit, file modes, and the digest's cost
-//! at 10,000 rows.
+//! copy, makes unlock report tampering and open read-only. Every table is
+//! covered, `meta` and the header included. Also: altered plaintext
+//! columns, moved ciphertext, an altered schema, an empty vault without its
+//! header, the documented whole-file rollback limit, file modes, and the
+//! digest's cost at 10,000 rows.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -14,11 +15,11 @@ use std::time::Instant;
 use common::{Fixture, copy_dir, name, secret_item, slug};
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
-    Argon2id, EnvelopeCtx, KdfParams, UnlockerId, UnlockerKind, wrap_vmk_with,
+    Argon2id, EnvelopeCtx, KdfParams, UnlockerId, UnlockerKind, Vmk, wrap_vmk_with,
 };
 use envcloak_core::vault::{
-    FieldId, INITIAL_EPOCH, Integrity, ItemDetails, PolicyId, ProjectKey, ProjectRecord,
-    TamperKind, Vault, VaultErrorKind,
+    FieldId, INITIAL_EPOCH, Integrity, ItemDetails, LockedVault, PolicyId, ProjectKey,
+    ProjectRecord, TamperKind, Vault, VaultErrorKind,
 };
 
 /// A closed vault with two items (three fields), a project, a policy and
@@ -294,9 +295,13 @@ fn restoring_one_row_from_an_older_copy_opens_read_only() {
         (
             "an unlocker row",
             "unlockers",
-            "id, kind, envelope, created_at",
+            "id, vault_id, kind, envelope, created_at",
         ),
-        ("the header row alone", "header", "epoch, sealed"),
+        (
+            "the header row alone",
+            "header",
+            "epoch, vault_id, schema_version, sealed",
+        ),
     ];
     for (case, table, cols) in cases {
         // Start from the current file and put back one table's older rows
@@ -476,7 +481,7 @@ fn an_altered_schema_or_header_opens_read_only() {
         ),
         (
             "a second header",
-            "INSERT INTO header SELECT epoch, sealed FROM header;",
+            "INSERT INTO header SELECT * FROM header;",
             TamperKind::HeaderUnreadable,
         ),
     ] {
@@ -497,6 +502,124 @@ fn an_altered_schema_or_header_opens_read_only() {
         Some(p.keep),
         "a damaged header",
     );
+}
+
+/// Gate 6 for the rows that name the vault: `meta` (its id and schema
+/// version), the header's plaintext columns, and an unlocker's copy of the
+/// vault id. Deleting, doubling or altering one of them opens read-only
+/// like any other row. The passphrase still unlocks it: before unlock the
+/// file reports the vault id, epoch and envelopes that the other rows agree
+/// on (docs/VAULT.md "Unlock").
+#[test]
+fn the_rows_that_name_the_vault_are_covered_too() {
+    let p = pristine();
+    let cases = [
+        (
+            "the meta row deleted",
+            "DELETE FROM meta;",
+            TamperKind::MetaAltered,
+        ),
+        (
+            "the meta row doubled",
+            "INSERT INTO meta SELECT * FROM meta;",
+            TamperKind::MetaAltered,
+        ),
+        (
+            "meta.vault_id",
+            "UPDATE meta SET vault_id = zeroblob(16);",
+            TamperKind::MetaAltered,
+        ),
+        (
+            "meta.schema_version newer than this build",
+            "UPDATE meta SET schema_version = 7;",
+            TamperKind::MetaAltered,
+        ),
+        (
+            "meta.schema_version invalid",
+            "UPDATE meta SET schema_version = 0;",
+            TamperKind::MetaAltered,
+        ),
+        (
+            "header.epoch",
+            "UPDATE header SET epoch = epoch + 1;",
+            TamperKind::RowInconsistent,
+        ),
+        (
+            "header.vault_id",
+            "UPDATE header SET vault_id = zeroblob(16);",
+            TamperKind::RowInconsistent,
+        ),
+        (
+            "header.schema_version",
+            "UPDATE header SET schema_version = 7;",
+            TamperKind::RowInconsistent,
+        ),
+        (
+            "an unlocker's vault_id",
+            "UPDATE unlockers SET vault_id = zeroblob(16) \
+             WHERE rowid = (SELECT max(rowid) FROM unlockers);",
+            TamperKind::RowInconsistent,
+        ),
+        (
+            "the header deleted",
+            "DELETE FROM header;",
+            TamperKind::HeaderUnreadable,
+        ),
+        (
+            "the header and the meta row deleted",
+            "DELETE FROM header; DELETE FROM meta;",
+            TamperKind::HeaderUnreadable,
+        ),
+    ];
+    for (case, sql, want) in cases {
+        p.restore();
+        p.f.raw().execute_batch(sql).unwrap();
+        let locked = LockedVault::open(&p.f.paths).unwrap();
+        assert_eq!(locked.vault_id(), p.f.vault_id, "{case}");
+        assert_eq!(locked.epoch(), INITIAL_EPOCH, "{case}");
+        assert_eq!(locked.unlockers().unwrap().len(), 2, "{case}");
+        drop(locked);
+        let v = p.f.unlock_with_passphrase();
+        assert_eq!(v.vault_id(), p.f.vault_id, "{case}");
+        assert_eq!(v.schema_version(), 1, "{case}");
+        assert_read_only(v, Some(want), Some(p.keep), case);
+    }
+}
+
+/// An empty vault's only sealed row is its header. Deleting or doubling it
+/// still opens read-only instead of passing for a wrong key, and a wrong key
+/// is still refused whenever a header row is there.
+#[test]
+fn an_empty_vault_without_its_header_opens_read_only() {
+    let (f, v) = Fixture::create();
+    drop(v);
+    let snapshot = f.home.root().join("empty");
+    copy_dir(&f.paths.vault_dir, &snapshot);
+    let tamper = |sql: &str| {
+        std::fs::copy(snapshot.join("vault.db"), f.db()).unwrap();
+        f.raw().execute_batch(sql).unwrap();
+    };
+    for (case, sql) in [
+        ("header deleted", "DELETE FROM header;"),
+        ("header doubled", "INSERT INTO header SELECT * FROM header;"),
+    ] {
+        tamper(sql);
+        let v = f.unlock_with_passphrase();
+        assert!(v.items().is_empty(), "{case}");
+        assert_read_only(v, Some(TamperKind::HeaderUnreadable), None, case);
+    }
+    for sql in [
+        "",
+        "INSERT INTO header SELECT * FROM header;",
+        "UPDATE header SET epoch = epoch + 1;",
+    ] {
+        tamper(sql);
+        let (_, e) = LockedVault::open(&f.paths)
+            .unwrap()
+            .unlock(Vmk::generate())
+            .unwrap_err();
+        assert_eq!(e.kind(), VaultErrorKind::KeyMismatch, "{sql}");
+    }
 }
 
 /// SPEC §5 "Integrity": without an anchor (Linux, and macOS before M3),

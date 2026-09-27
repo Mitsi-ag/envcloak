@@ -2,10 +2,11 @@
 //!
 //! [`load`] reads every row, decrypts the metadata (item records, field
 //! records, projects, policies) and never a value, checks each row's
-//! plaintext columns against its sealed contents, and recomputes the state
-//! digest from the rows' stamps. Anything wrong is recorded as a
-//! [`TamperKind`] and the vault opens read-only; rows that do not open are
-//! left out.
+//! plaintext columns against its sealed contents (`meta` and the header's
+//! against the vault id, schema version and epoch it opened under), and
+//! recomputes the state digest from the rows' stamps. Anything wrong is
+//! recorded as a [`TamperKind`] and the vault opens read-only; rows that do
+//! not open are left out.
 
 use std::collections::BTreeMap;
 
@@ -185,6 +186,7 @@ impl State {
 /// The rows of each table as stored, before any check.
 struct RawUnlocker {
     id: Vec<u8>,
+    vault_id: Vec<u8>,
     kind: i64,
     envelope: Vec<u8>,
     created_at: i64,
@@ -225,7 +227,7 @@ struct Raw {
     policies: Vec<RawSealed>,
 }
 
-fn query<T>(
+pub(crate) fn query<T>(
     conn: &Connection,
     sql: &str,
     f: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
@@ -239,13 +241,14 @@ fn read_raw(conn: &Connection) -> Result<Raw, VaultError> {
     Ok(Raw {
         unlockers: query(
             conn,
-            "SELECT id, kind, envelope, created_at FROM unlockers",
+            "SELECT id, vault_id, kind, envelope, created_at FROM unlockers",
             |r| {
                 Ok(RawUnlocker {
                     id: r.get(0)?,
-                    kind: r.get(1)?,
-                    envelope: r.get(2)?,
-                    created_at: r.get(3)?,
+                    vault_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    envelope: r.get(3)?,
+                    created_at: r.get(4)?,
                 })
             },
         )?,
@@ -316,7 +319,7 @@ impl RawUnlocker {
     fn stamp(&self) -> Option<(RowKey, Stamp)> {
         // Unlockers carry no row version; a changed envelope changes the
         // body.
-        let body = unlocker_body(self.kind, self.created_at, &self.envelope);
+        let body = unlocker_body(&self.vault_id, self.kind, self.created_at, &self.envelope);
         stamp(TableTag::Unlockers, &self.id, 0, body)
     }
 }
@@ -407,8 +410,11 @@ fn note_stamp(st: &mut State, found: &mut Findings, s: Option<(RowKey, Stamp)>) 
 /// Reads and verifies the vault. `schema_ok` is [`verify_schema`]'s
 /// answer.
 ///
-/// Fails with [`VaultErrorKind::KeyMismatch`] when nothing opens under
-/// `keys`: neither the header nor any sealed row.
+/// Fails with [`VaultErrorKind::KeyMismatch`] when the file holds something
+/// sealed (a header row or a sealed row) and nothing of it opens under
+/// `keys`. A file with nothing sealed at all, which is an empty vault whose
+/// header was deleted, has nothing to check the key against: it opens
+/// read-only and empty, reporting the header.
 ///
 /// [`verify_schema`]: super::schema::verify_schema
 pub(crate) fn load(
@@ -422,22 +428,63 @@ pub(crate) fn load(
         found.note(TamperKind::SchemaAltered);
     }
 
-    let headers = query(conn, "SELECT epoch, sealed FROM header", |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+    // `meta` is one row naming the vault id and schema version everything
+    // opened under.
+    let metas = query(conn, "SELECT vault_id, schema_version FROM meta", |r| {
+        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
     })?;
-    let header = match headers.as_slice() {
-        [(epoch, sealed)] if *epoch == i64::from(ctx.epoch) => open_record(
+    match metas.as_slice() {
+        [(id, version)]
+            if id[..] == ctx.vault_id.0[..] && *version == i64::from(ctx.schema_version) => {}
+        _ => found.note(TamperKind::MetaAltered),
+    }
+
+    // Every header row is tried, whatever its plaintext columns say, so a
+    // doubled header or an altered epoch still proves the key.
+    let headers = query(
+        conn,
+        "SELECT epoch, vault_id, schema_version, sealed FROM header",
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
+        },
+    )?;
+    let mut opened_headers = Vec::new();
+    for (epoch, vault_id, version, sealed) in &headers {
+        let opened = open_record(
             keys.key(Purpose::Header),
             &ctx.header_aad(),
             sealed,
             HeaderState::decode,
-        )
-        .ok(),
+        );
+        if let Ok(h) = opened {
+            let consistent = *epoch == i64::from(ctx.epoch)
+                && vault_id[..] == ctx.vault_id.0[..]
+                && *version == i64::from(ctx.schema_version);
+            opened_headers.push((h, consistent));
+        }
+    }
+    let mut opened_any = !opened_headers.is_empty();
+    let header = match (headers.len(), opened_headers.as_slice()) {
+        (1, [(h, consistent)]) => {
+            if !consistent {
+                found.note(TamperKind::RowInconsistent);
+            }
+            Some(*h)
+        }
         _ => None,
     };
-    let mut opened_any = header.is_some();
 
     let raw = read_raw(conn)?;
+    let sealed_present = !headers.is_empty()
+        || !raw.items.is_empty()
+        || !raw.fields.is_empty()
+        || !raw.projects.is_empty()
+        || !raw.policies.is_empty();
     let mut st = State {
         header: header.unwrap_or_default(),
         ..State::default()
@@ -448,6 +495,7 @@ pub(crate) fn load(
         note_stamp(&mut st, &mut found, u.stamp());
         let env = Envelope::from_bytes(&u.envelope).ok().filter(|e| {
             Some(e.unlocker_id().0) == id16(&u.id)
+                && u.vault_id[..] == ctx.vault_id.0[..]
                 && i64::from(e.kind() as u8) == u.kind
                 && e.epoch() == ctx.epoch
         });
@@ -605,7 +653,7 @@ pub(crate) fn load(
     }
 
     let integrity = if header.is_none() {
-        if !opened_any {
+        if sealed_present && !opened_any {
             return Err(VaultErrorKind::KeyMismatch.into());
         }
         Integrity::Tampered(TamperKind::HeaderUnreadable)
