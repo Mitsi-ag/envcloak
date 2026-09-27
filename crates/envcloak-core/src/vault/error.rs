@@ -2,6 +2,7 @@
 //! bound parameter, a path or upstream error text (SPEC §5 "Logging").
 
 use crate::crypto::{CryptoError, CryptoErrorKind};
+use crate::passphrase::PassphraseRejected;
 
 use super::paths::{PathError, PathErrorKind};
 
@@ -64,6 +65,8 @@ pub enum VaultErrorKind {
     UnknownUnlocker,
     /// Removing the vault's last unlocker would leave no way to open it.
     LastUnlocker,
+    /// A new passphrase breaks the passphrase rules.
+    Passphrase(PassphraseRejected),
     /// An authenticated record failed to decode: a bug, not an attack.
     Corrupt,
 }
@@ -112,6 +115,7 @@ impl VaultErrorKind {
             VaultErrorKind::UnknownField => "no such field",
             VaultErrorKind::UnknownUnlocker => "no such unlocker",
             VaultErrorKind::LastUnlocker => "the vault's last unlocker cannot be removed",
+            VaultErrorKind::Passphrase(r) => r.message(),
             VaultErrorKind::Corrupt => "a sealed vault record could not be decoded",
         }
     }
@@ -135,6 +139,12 @@ impl From<PathError> for VaultError {
             PathErrorKind::Missing => VaultErrorKind::NotFound.into(),
             k => VaultErrorKind::Path(k).into(),
         }
+    }
+}
+
+impl From<PassphraseRejected> for VaultError {
+    fn from(r: PassphraseRejected) -> Self {
+        VaultErrorKind::Passphrase(r).into()
     }
 }
 
@@ -200,6 +210,7 @@ mod tests {
             VaultErrorKind::Crypto(CryptoErrorKind::Seal),
             VaultErrorKind::Tampered,
             VaultErrorKind::Corrupt,
+            VaultErrorKind::Passphrase(PassphraseRejected::Common),
         ] {
             let e = VaultError::from(k);
             assert_eq!(e.to_string(), k.message());

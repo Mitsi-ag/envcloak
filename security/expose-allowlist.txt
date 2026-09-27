@@ -13,3 +13,5 @@ crates/envcloak-core/src/crypto/envelope.rs  # wraps and unwraps the VMK under k
 crates/envcloak-core/src/crypto/kdf.rs       # Argon2id reads the passphrase or Recovery Kit
 crates/envcloak-core/src/crypto/keys.rs      # derives subkeys from the VMK; keyed hashing under a subkey; VMK export for tests (feature testing only)
 crates/envcloak-core/src/vault/values.rs     # the vault's plaintext boundary: seals, opens and hashes values and prior values, re-seals them in a migration, hands opened metadata to its decoder
+crates/envcloak-core/src/passphrase.rs       # reads a new passphrase to check its length and the common-password list
+crates/envcloak-core/src/recovery.rs         # encodes the Recovery Kit for display and decodes a typed kit
