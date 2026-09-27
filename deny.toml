@@ -25,6 +25,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# envcloak-testkit is never published and is only a dev-dependency, so it is
+# referenced by path alone (cargo publish strips path-only dev-dependencies).
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
