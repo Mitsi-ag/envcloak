@@ -30,9 +30,10 @@ pub use home::{TEST_ENV_VARS, TEST_PATH, TestHome};
 /// canary counts as holding it.
 pub const PROBE_WINDOW: usize = 12;
 
-/// Arms the allocator probe with the raw value of every canary. The test
-/// binary must install [`ProbeAllocator`] as its global allocator.
+/// Arms the allocator probe with every canary's [`Canary::probe_needle`]:
+/// the raw value, or its random part where the value has fixed parts. The
+/// test binary must install [`ProbeAllocator`] as its global allocator.
 pub fn probe_canaries(cs: &[Canary], mode: ProbeMode) -> ProbeSession {
-    let needles: Vec<&[u8]> = cs.iter().map(Canary::value).collect();
+    let needles: Vec<&[u8]> = cs.iter().map(Canary::probe_needle).collect();
     ProbeSession::start(&needles, PROBE_WINDOW, mode)
 }

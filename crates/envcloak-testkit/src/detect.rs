@@ -1,6 +1,7 @@
 //! Finding canaries and their encodings in bytes, files and directories.
 
 use std::collections::HashSet;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
@@ -58,11 +59,18 @@ pub struct Found {
     pub offset: usize,
 }
 
-/// One finding of [`sweep_dir`]. Holds no value bytes.
+/// One finding of [`sweep_dir`]. Holds no value bytes, but a `path` whose
+/// name holds a canary does: do not print the path of a [`Hit::Name`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hit {
     /// A canary, or one of its encodings, inside a file.
     Canary { path: PathBuf, found: Found },
+    /// A canary in the name (the last component of `path`) of a file,
+    /// directory, symlink or other entry.
+    Name { path: PathBuf, found: Found },
+    /// A canary in the target of the symlink at `path`, which the sweep
+    /// does not follow.
+    LinkTarget { path: PathBuf, found: Found },
     /// A file or directory the sweep could not read, so it cannot vouch for
     /// it. Make it readable before sweeping, or remove it.
     Unreadable {
@@ -171,15 +179,25 @@ pub fn assert_no_canary(haystack: &[u8], cs: &[Canary]) {
     Detector::new(cs).assert_absent(haystack);
 }
 
-/// Scans every regular file under `dir` for canaries. Symlinks are not
-/// followed, and FIFOs, sockets and devices are skipped, so a sweep never
-/// hangs or leaves the tree. Anything unreadable is reported as
-/// [`Hit::Unreadable`].
+/// Scans everything under `dir` for canaries: the contents of every regular
+/// file, the name of every entry below `dir`, and the target of every
+/// symlink. Symlinks are not followed, and the contents of FIFOs, sockets
+/// and devices are not read, so a sweep never hangs or leaves the tree.
+/// Anything unreadable is reported as [`Hit::Unreadable`].
 pub fn sweep_dir(dir: &Path, cs: &[Canary]) -> Vec<Hit> {
     let detector = Detector::new(cs);
     let mut hits = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(path) = stack.pop() {
+        // The root's own name was chosen by the caller.
+        if let Some(name) = path.file_name().filter(|_| path != dir) {
+            for found in detector.find(name.as_bytes()) {
+                hits.push(Hit::Name {
+                    path: path.clone(),
+                    found,
+                });
+            }
+        }
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) => {
@@ -205,6 +223,21 @@ pub fn sweep_dir(dir: &Path, cs: &[Canary]) -> Vec<Hit> {
                     }
                     children.sort();
                     stack.extend(children.into_iter().rev());
+                }
+                Err(e) => hits.push(Hit::Unreadable {
+                    path,
+                    kind: e.kind(),
+                }),
+            }
+        } else if meta.file_type().is_symlink() {
+            match std::fs::read_link(&path) {
+                Ok(target) => {
+                    for found in detector.find(target.as_os_str().as_bytes()) {
+                        hits.push(Hit::LinkTarget {
+                            path: path.clone(),
+                            found,
+                        });
+                    }
                 }
                 Err(e) => hits.push(Hit::Unreadable {
                     path,

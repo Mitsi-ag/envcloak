@@ -10,8 +10,8 @@ use std::process::Command;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use envcloak_testkit::{
-    Canary, Detector, Hit, TEST_ENV_VARS, TestHome, assert_no_canary, by_label, canaries,
-    encodings, find, fresh_seed, labels, sweep_dir,
+    Canary, Detector, Hit, PROBE_WINDOW, TEST_ENV_VARS, TestHome, assert_no_canary, by_label,
+    canaries, encodings, find, fresh_seed, labels, sweep_dir,
 };
 
 fn panic_message(f: impl FnOnce()) -> Option<String> {
@@ -227,7 +227,7 @@ fn sweep_dir_reports_hits_and_never_follows_symlinks_or_hangs() {
         .iter()
         .filter_map(|h| match h {
             Hit::Canary { path, found } => Some((path, found)),
-            Hit::Unreadable { .. } => None,
+            _ => None,
         })
         .collect();
     assert!(!canary_hits.is_empty());
@@ -236,10 +236,7 @@ fn sweep_dir_reports_hits_and_never_follows_symlinks_or_hangs() {
         assert_eq!(found.label, labels::STRIPE_SECRET_KEY);
         assert_eq!(found.encoding, "hex-upper");
     }
-    assert!(
-        !hits.iter().any(|h| matches!(h, Hit::Unreadable { .. })),
-        "{hits:?}"
-    );
+    assert_eq!(hits.len(), canary_hits.len(), "{hits:?}");
     assert_eq!(home.sweep(&cs), hits);
 
     // An unreadable file is reported, since the sweep cannot vouch for it.
@@ -355,4 +352,95 @@ fn test_home_children_inherit_nothing_from_the_parent() {
         String::from_utf8_lossy(&out.stdout).contains("isolation: checked"),
         "the child did not run the check: {out:?}"
     );
+}
+
+#[test]
+fn probe_needles_share_no_window_across_seeds() {
+    // The allocator probe matches any PROBE_WINDOW bytes of a needle, and an
+    // armed probe sees every thread's frees. A window shared between seeds
+    // would let one test's fixtures, or a fixture template, count as another
+    // test's leak.
+    let mut owner: std::collections::HashMap<Vec<u8>, u64> = std::collections::HashMap::new();
+    for seed in 0..64u64 {
+        for c in canaries(seed) {
+            let needle = c.probe_needle();
+            for w in needle.windows(PROBE_WINDOW.min(needle.len())) {
+                let prev = *owner.entry(w.to_vec()).or_insert(seed);
+                assert_eq!(
+                    prev, seed,
+                    "{} shares a probe window between seeds {prev} and {seed}",
+                    c.label
+                );
+            }
+        }
+    }
+
+    // DATABASE_URL is watched by its password; every other canary whole.
+    let cs = canaries(fresh_seed());
+    for c in &cs {
+        if c.label == labels::DATABASE_URL {
+            let url = c.as_str();
+            let needle = std::str::from_utf8(c.probe_needle()).unwrap();
+            assert_eq!(
+                url,
+                format!("postgres://acme:{needle}@db.acme.internal:5432/acme")
+            );
+        } else {
+            assert_eq!(c.probe_needle(), c.value(), "{}", c.label);
+        }
+    }
+}
+
+#[test]
+fn sweep_dir_checks_entry_names_and_symlink_targets() {
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let root = home.home();
+    let github = by_label(&cs, labels::GITHUB_TOKEN);
+    let short = by_label(&cs, labels::SHORT_TOKEN);
+    let openai = by_label(&cs, labels::OPENAI_API_KEY);
+
+    // A backup file named after a value, with clean contents.
+    let backup = root.join(format!("backup-{}.bak", github.as_str()));
+    std::fs::write(&backup, noise(10)).unwrap();
+    // A directory named after a value's hex encoding.
+    let hex: String = short.value().iter().map(|b| format!("{b:02x}")).collect();
+    let dir = root.join(&hex);
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("clean.txt"), noise(10)).unwrap();
+    // A dangling symlink whose target holds a value: reported, not followed.
+    let link = root.join("link");
+    std::os::unix::fs::symlink(format!("/nonexistent/{}", openai.as_str()), &link).unwrap();
+
+    let hits = sweep_dir(home.root(), &cs);
+    let mut seen: Vec<(&str, &str, &str)> = hits
+        .iter()
+        .map(|h| match h {
+            Hit::Name { path, found } if path == &backup => ("name", "backup", found.encoding),
+            Hit::Name { path, found } if path == &dir => ("name", "dir", found.encoding),
+            Hit::LinkTarget { path, found } if path == &link => ("target", "link", found.encoding),
+            other => panic!("unexpected hit {other:?}"),
+        })
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        [
+            ("name", "backup", "raw"),
+            ("name", "dir", "hex-lower"),
+            ("target", "link", "raw"),
+        ]
+    );
+    // The labels are right too.
+    for h in &hits {
+        let (Hit::Name { found, .. } | Hit::LinkTarget { found, .. }) = h else {
+            unreachable!()
+        };
+        let expected = match h {
+            Hit::Name { path, .. } if path == &backup => labels::GITHUB_TOKEN,
+            Hit::Name { .. } => labels::SHORT_TOKEN,
+            _ => labels::OPENAI_API_KEY,
+        };
+        assert_eq!(found.label, expected);
+    }
 }

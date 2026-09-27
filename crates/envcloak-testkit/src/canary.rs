@@ -1,6 +1,7 @@
 //! Runtime-generated fixture secrets.
 
 use std::hash::{BuildHasher, RandomState};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,21 +33,35 @@ pub struct Canary {
     /// Names the canary in reports and failure messages. Not secret.
     pub label: String,
     value: Zeroizing<String>,
+    /// The bytes of `value` that are random per seed.
+    random: Range<usize>,
 }
 
 impl Canary {
     /// A canary with a caller-chosen value, for fixtures [`canaries`] does
     /// not cover. Generate the value at test time.
     pub fn new(label: impl Into<String>, value: String) -> Self {
+        let random = 0..value.len();
         Canary {
             label: label.into(),
             value: Zeroizing::new(value),
+            random,
         }
     }
 
     /// The value, for injecting into the code under test.
     pub fn value(&self) -> &[u8] {
         self.value.as_bytes()
+    }
+
+    /// What the allocator probe watches for: the part of the value that is
+    /// random per seed. That is the password of [`labels::DATABASE_URL`],
+    /// whose scheme, user and host are the same for every seed, and the
+    /// whole value of every other canary. A freed buffer that holds only the
+    /// URL's fixed parts (a template, an error message, another test's URL)
+    /// is then not reported as a leak.
+    pub fn probe_needle(&self) -> &[u8] {
+        &self.value.as_bytes()[self.random.clone()]
     }
 
     /// The value as text; every canary is UTF-8.
@@ -110,13 +125,21 @@ pub fn canaries(seed: u64) -> Vec<Canary> {
             labels::GITHUB_TOKEN,
             format!("{github}{}", rng.string(ALNUM, 36)),
         ),
-        Canary::new(
-            labels::DATABASE_URL,
-            format!("postgres://acme:{password}@db.acme.internal:5432/acme"),
-        ),
+        database_url(&password),
         Canary::new(labels::SHORT_TOKEN, rng.string(ALNUM, 10)),
         Canary::new(labels::VAULT_PASSPHRASE, words.join(" ")),
     ]
+}
+
+/// A Postgres URL canary whose probe needle is the password alone.
+fn database_url(password: &str) -> Canary {
+    const USER: &str = "postgres://acme:";
+    let mut c = Canary::new(
+        labels::DATABASE_URL,
+        format!("{USER}{password}@db.acme.internal:5432/acme"),
+    );
+    c.random = USER.len()..USER.len() + password.len();
+    c
 }
 
 /// The canary labeled `label`.
