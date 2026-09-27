@@ -65,12 +65,12 @@ The developer's real question is not only "where is my key" but "what is this co
 - **Card health.** "Your Visa ending 4242 expires next month; 14 providers bill it: OpenAI, Vercel, AWS ..." with a checklist and direct links to each billing page. Failed-payment signals from provider billing APIs where available.
 - **Subscriptions.** Recurring plans (hosting, AI subscriptions, SaaS) with price, renewal date, account and card, alongside usage-billed API keys. One number: monthly burn across everything. A subscription and the card payment that settles it are one cost, never counted twice.
 - **Budgets.** Budgets per key, provider, project or account, with alerts and forecasts ("at this burn rate your Anthropic credit runs out Thursday"). A budget is enforced only by the controls below, and the UI shows which ones apply to it.
-- **Spend controls are separate things.** EnvCloak models and shows each one separately. It says "hard cap" only for the first two, and only for the traffic they see.
+- **Spend controls are separate things.** EnvCloak models and shows each one separately. It says "hard cap" only for a provider-enforced cap, or for a proxy gate whose provider adapter supplies a conservative per-request cost bound, and only for the traffic that control sees.
 
 | Control | Enforced by | Stops | Does not stop |
 |---|---|---|---|
 | Provider-enforced usage cap | The provider (a spend or key limit set in its API or dashboard) | Usage the provider refuses after the cap, under its own rules | Usage accrued before the provider applies the cap; provider-specific lag |
-| Proxy budget gate (M6) | EnvCloak's proxy, synchronously, per request | Requests through an EnvCloak proxy session once estimated spend reaches the budget | Traffic outside the proxy (inject mode, other machines, the provider's console); estimation error |
+| Proxy spend gate (M6) | EnvCloak's proxy, synchronously, per request. By default an estimated-spend gate. It is a hard cap only when the provider adapter supplies a conservative per-request cost bound: the proxy then atomically reserves that bound before dispatch (counting concurrent and retried requests), reconciles actual charges afterwards, and refuses request classes that have no safe bound | Requests through an EnvCloak proxy session once reserved or estimated spend reaches the budget | Traffic outside the proxy (inject mode, other machines, the provider's console); for the estimated gate, estimation error and requests already in flight |
 | Automatic key disable | EnvCloak or Cloud, after polling usage, where the provider's API can disable a key | New usage after the key is disabled | Usage between polls and during the provider's billing lag |
 | Card authorization limit | The card issuer | Payments the provider tries to collect on that card | Usage already delivered: the provider can bill another method, suspend the account or pursue the debt |
 | Alert only | Notifications | Nothing | Everything |
@@ -620,13 +620,16 @@ Providers without an API get manual fields (balance, renewal date) and a billing
 - **Replication.** An append-only change log with per-field last-writer-wins, ordered by hybrid logical clocks (HLC), and tombstones for deletes.
   - Each change entry is signed with the origin device's Ed25519 key and sealed under `sync`, with AAD (vault_id, epoch, origin_device, seq). Per-device sequence numbers expose replays and gaps.
   - A remote HLC whose physical component is more than 5 minutes ahead of the local clock is quarantined, not applied.
-  - Security-critical records (device list, unlockers, policy, registry overrides) are accepted only with a valid approval signature from the origin device's pinned `approve` key.
+  - Security-critical records (device list, unlockers, policy, registry overrides, revocations) are accepted only with a valid approval signature from the origin device's pinned `approve` key (§10b defines the key on each platform).
   - Grants never replicate. Audit logs replicate for viewing only, with one chain per device.
   - Secret fields never lose a value to last-writer-wins: the losing concurrent value is kept as a sealed prior version (up to 3) and shown as a conflict.
   - Tombstones are kept for 180 days; a device offline for longer must do a full transfer.
 - **Revocation.**
   - Removing a device starts a new VMK epoch: a new random VMK, every row re-sealed, new subkeys. The new VMK is sent to each remaining device by HPKE to its X25519 key, signed by the revoking device.
-  - The removed device's EndpointId is blocked, and its entries with an HLC after the revocation are rejected.
+  - The revocation record is signed with the revoking device's `approve` key and names, for the removed device, the last per-device sequence number accepted (the cutoff) and the new epoch. It replicates like any security-critical record.
+  - After revocation, an entry originated by the removed device is accepted only if its sequence number is at or below the cutoff, whoever relays it and whatever HLC it carries. Timestamps chosen by the removed device never decide acceptance.
+  - Entries sealed under the old epoch are accepted only from devices still in the membership and only up to each device's cutoff recorded at the epoch change; anything else is quarantined and needs a human-approved recovery.
+  - The removed device's EndpointId is blocked.
   - The removed device keeps every value it already had. The app lists each secret that device held and opens rotation for each.
 
 The `spake2` crate states that it has had no independent audit. It is pinned, wrapped behind an internal interface, and included in the pre-1.0 audit.
@@ -722,6 +725,7 @@ A manifest change that leaves the bindings a subset does not prompt; the new has
 - Request ids are 8 Crockford base32 characters, unique among pending requests. Pending requests expire after 10 minutes.
 - macOS with the app (M3): the app renders every field, computes SHA-256 over the canonical encoding of exactly what it rendered, and signs it with the Secure Enclave `approve` key, using a fresh `LAContext` with reuse duration 0. The daemon verifies the signature with the pinned public key and checks that the statement equals its pending request.
 - Linux, and macOS without the app: the human runs `envcloak approve <request_id> [--once | --for <duration>] [--live <ENV_NAME>]...` in a terminal they control, reads the same statement, and enters the vault passphrase on `/dev/tty` (or `--passphrase-fd`). The daemon verifies the passphrase against the envelope.
+- **Approval signing key without a Secure Enclave.** On Linux, and on macOS without the app, each device has an Ed25519 `approve` key generated at vault creation or pairing. Its private key is stored only inside its own Argon2id envelope under the passphrase (not under the VMK), so it is usable only when the passphrase is presented. For each approval that must be recorded or replicated (policy, registry overrides, device add or remove, revocation), the daemon unwraps it with the presented passphrase, signs the canonical statement, and wipes it. The public key is pinned in the device record at pairing. This is weaker than a Secure Enclave key: the envelope can be guessed offline from a copy of the vault, and the key is briefly in daemon memory, so peers display which kind of key signed a record. Gates: Linux-to-macOS and Linux-to-Linux pairing, policy replication and revocation succeed with passphrase-signed records, and a record signed by any other key is rejected.
 - A y/n answer is never an approval. Approval input is never read from the requesting process's terminal.
 - The daemon refuses any proof (approve, unlock, rotate, remove, reveal, recover) submitted by a caller with a known agent in its ancestry or agent markers in its claims. This only tightens.
 - Honest limits:
