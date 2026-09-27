@@ -10,10 +10,13 @@ use std::path::{Path, PathBuf};
 
 use envcloak_redact::RedactorBuilder;
 
-/// The JSON fixture value: every JSON escape class.
-const JSON_VALUE: &str = "ab/cd\"ef\\gh\u{8}ij\u{e9}kl\u{1F600}mn+op qr'st<uv";
-/// The URL fixture value: reserved characters, a space and non-ASCII.
-const URL_VALUE: &str = "tok/en+val ue~!*'()&=x\u{e9}";
+/// Reads a fixture value written by generate.sh (exact UTF-8 bytes).
+fn value(file: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(file);
+    std::fs::read_to_string(path).expect("fixture value file")
+}
 
 fn fixtures(kind: &str) -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -34,13 +37,17 @@ fn name(p: &Path) -> String {
 
 #[test]
 fn every_generated_json_fixture_is_redacted_completely() {
-    let (r, _) = RedactorBuilder::new().secret("t", JSON_VALUE).build();
+    let json_value = value("value-json.txt");
+    let (r, report) = RedactorBuilder::new().secret("t", &json_value).build();
+    // The value exercises every escape class, so combinations are capped and
+    // reported; the named serializer styles must still cover every fixture.
+    assert_eq!(report.truncated, vec!["t".to_string()]);
     for path in fixtures("json") {
         let bytes = std::fs::read(&path).unwrap();
         let decoded: String = serde_json::from_slice(&bytes).expect("fixture is valid JSON");
         assert_eq!(
             decoded,
-            JSON_VALUE,
+            json_value,
             "{} does not decode to the value",
             name(&path)
         );
@@ -126,13 +133,14 @@ fn lower_hex_escapes(s: &[u8]) -> Vec<u8> {
 
 #[test]
 fn every_generated_url_fixture_is_redacted_in_both_hex_cases() {
-    let (r, _) = RedactorBuilder::new().secret("u", URL_VALUE).build();
+    let url_value = value("value-url.txt");
+    let (r, _) = RedactorBuilder::new().secret("u", &url_value).build();
     for path in fixtures("url") {
         let file = name(&path);
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(
             percent_decode(&bytes, is_form_style(&file)),
-            URL_VALUE.as_bytes(),
+            url_value.as_bytes(),
             "{file} does not decode to the value"
         );
         for (case, input) in [

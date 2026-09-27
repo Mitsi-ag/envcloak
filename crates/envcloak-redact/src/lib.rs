@@ -29,8 +29,11 @@
 //! - JSON string escaping as produced by common serializers: `\"` or `\u0022`
 //!   quotes, optional `\/`,
 //!   short or `\u` control escapes, raw or `\u`-escaped non-ASCII (with
-//!   surrogate pairs), optional HTML-safe, apostrophe, plus and line-separator
-//!   escapes, with uppercase or lowercase hex.
+//!   surrogate pairs), optional HTML-safe, apostrophe, plus, backtick, DEL and
+//!   line-separator escapes, with uppercase or lowercase hex. The default
+//!   styles of serde_json, JavaScript, Python, Go, .NET, PHP and Ruby are
+//!   always generated; other combinations are capped and a capped secret is
+//!   listed in [`BuildReport::truncated`].
 //!
 //! Anything else (compression, encryption, custom transforms, partial
 //! values) is not covered. Redaction is a guard against accidents, never a
@@ -74,6 +77,10 @@ pub struct BuildReport {
     /// every alignment. The raw value and whole-value encodings are still
     /// redacted.
     pub partial: Vec<String>,
+    /// Secrets whose value mixes so many JSON escape classes that not every
+    /// combination of serializer options was generated. The named styles of
+    /// real serializers are always generated first, so they stay covered.
+    pub truncated: Vec<String>,
 }
 
 /// Builds a [`Redactor`].
@@ -129,9 +136,12 @@ impl RedactorBuilder {
                 continue;
             }
             let owner = labels.len();
-            let (vars, partial) = variants(&value);
+            let (vars, partial, truncated) = variants(&value);
             if partial {
                 report.partial.push(label.clone());
+            }
+            if truncated {
+                report.truncated.push(label.clone());
             }
             labels.push(label);
             for v in vars {
@@ -195,9 +205,10 @@ fn hash_bytes(b: &[u8]) -> u64 {
     h.finish()
 }
 
-/// Every form of `value` the redactor looks for, the raw value first, and
-/// whether some embedded-base64 fragment was too short to include.
-fn variants(value: &[u8]) -> (Vec<Zeroizing<Vec<u8>>>, bool) {
+/// Every form of `value` the redactor looks for, the raw value first, plus
+/// whether some embedded-base64 fragment was too short to include and whether
+/// the JSON style combinations were capped.
+fn variants(value: &[u8]) -> (Vec<Zeroizing<Vec<u8>>>, bool, bool) {
     let mut out: Vec<Zeroizing<Vec<u8>>> = Vec::new();
     let mut push = |v: Zeroizing<Vec<u8>>| {
         if !v.is_empty() && !out.iter().any(|o| o.as_slice() == v.as_slice()) {
@@ -241,12 +252,15 @@ fn variants(value: &[u8]) -> (Vec<Zeroizing<Vec<u8>>>, bool) {
             push(percent_encode(value, profile, upper));
         }
     }
+    let mut truncated = false;
     if let Ok(s) = std::str::from_utf8(value) {
-        for v in json_variants(s) {
+        let (json, capped) = json_variants(s);
+        truncated = capped;
+        for v in json {
             push(v);
         }
     }
-    (out, partial)
+    (out, partial, truncated)
 }
 
 fn hex(value: &[u8], digits: &[u8; 16]) -> Zeroizing<Vec<u8>> {
@@ -296,9 +310,9 @@ const PERCENT_PROFILES: &[PercentProfile] = &[
         safe: b"-_.!*()",
         space_plus: true,
     },
-    // Go url.PathEscape.
+    // Go url.PathEscape: escapes , ; / ? and leaves $ & + : = @ raw.
     PercentProfile {
-        safe: b"-._~$&+,:;=@",
+        safe: b"-._~$&+:=@",
         space_plus: false,
     },
     // Lenient path/query encoders that keep sub-delimiters.
@@ -338,6 +352,7 @@ struct JsonStyle {
     esc_html: bool,
     esc_apos: bool,
     esc_plus: bool,
+    esc_backtick: bool,
     esc_del: bool,
     esc_line_sep: bool,
     upper_hex: bool,
@@ -345,7 +360,66 @@ struct JsonStyle {
 
 type StyleSetter = fn(&mut JsonStyle);
 
-fn json_variants(s: &str) -> Vec<Zeroizing<Vec<u8>>> {
+/// Default output styles of real serializers, generated before any
+/// combination so a cap can never drop them.
+const JSON_PRESETS: &[JsonStyle] = &[
+    // serde_json, JavaScript JSON.stringify, Ruby, Python ensure_ascii=False.
+    JsonStyle::PLAIN,
+    // Python json.dumps default (ensure_ascii=True).
+    JsonStyle {
+        esc_nonascii: true,
+        esc_del: true,
+        esc_line_sep: true,
+        ..JsonStyle::PLAIN
+    },
+    // Go encoding/json (HTML-safe by default).
+    JsonStyle {
+        esc_html: true,
+        esc_line_sep: true,
+        ..JsonStyle::PLAIN
+    },
+    // .NET System.Text.Json default encoder.
+    JsonStyle {
+        esc_quote: true,
+        esc_nonascii: true,
+        esc_html: true,
+        esc_apos: true,
+        esc_plus: true,
+        esc_backtick: true,
+        esc_del: true,
+        esc_line_sep: true,
+        upper_hex: true,
+        ..JsonStyle::PLAIN
+    },
+    // PHP json_encode default.
+    JsonStyle {
+        esc_slash: true,
+        esc_nonascii: true,
+        esc_line_sep: true,
+        ..JsonStyle::PLAIN
+    },
+];
+
+impl JsonStyle {
+    const PLAIN: JsonStyle = JsonStyle {
+        esc_quote: false,
+        esc_slash: false,
+        u_controls: false,
+        esc_nonascii: false,
+        esc_html: false,
+        esc_apos: false,
+        esc_plus: false,
+        esc_backtick: false,
+        esc_del: false,
+        esc_line_sep: false,
+        upper_hex: false,
+    };
+}
+
+/// JSON encodings of `s`: the named presets, then every combination of the
+/// escape classes present in `s` up to [`MAX_JSON_VARIANTS`]. The flag is
+/// true when combinations were capped.
+fn json_variants(s: &str) -> (Vec<Zeroizing<Vec<u8>>>, bool) {
     let has = |f: fn(char) -> bool| s.chars().any(f);
     let mut dims: Vec<StyleSetter> = vec![|st| st.upper_hex = true];
     if has(|c| c == '"') {
@@ -369,6 +443,9 @@ fn json_variants(s: &str) -> Vec<Zeroizing<Vec<u8>>> {
     if has(|c| c == '+') {
         dims.push(|st| st.esc_plus = true);
     }
+    if has(|c| c == '`') {
+        dims.push(|st| st.esc_backtick = true);
+    }
     if has(|c| c == '\u{7f}') {
         dims.push(|st| st.esc_del = true);
     }
@@ -376,8 +453,12 @@ fn json_variants(s: &str) -> Vec<Zeroizing<Vec<u8>>> {
         dims.push(|st| st.esc_line_sep = true);
     }
 
-    let combos = (1usize << dims.len()).min(MAX_JSON_VARIANTS);
-    let mut out = Vec::with_capacity(combos);
+    let total = 1usize << dims.len();
+    let combos = total.min(MAX_JSON_VARIANTS);
+    let mut out = Vec::with_capacity(JSON_PRESETS.len() + combos);
+    for &preset in JSON_PRESETS {
+        out.push(json_encode(s, preset));
+    }
     for mask in 0..combos {
         let mut st = JsonStyle::default();
         for (bit, set) in dims.iter().enumerate() {
@@ -387,7 +468,7 @@ fn json_variants(s: &str) -> Vec<Zeroizing<Vec<u8>>> {
         }
         out.push(json_encode(s, st));
     }
-    out
+    (out, total > MAX_JSON_VARIANTS)
 }
 
 fn json_encode(s: &str, st: JsonStyle) -> Zeroizing<Vec<u8>> {
@@ -421,6 +502,7 @@ fn json_encode(s: &str, st: JsonStyle) -> Zeroizing<Vec<u8>> {
             '<' | '>' | '&' if st.esc_html => u(&mut out, c as u16),
             '\'' if st.esc_apos => u(&mut out, c as u16),
             '+' if st.esc_plus => u(&mut out, c as u16),
+            '`' if st.esc_backtick => u(&mut out, c as u16),
             '\u{2028}' | '\u{2029}' if st.esc_line_sep || st.esc_nonascii => u(&mut out, c as u16),
             c if !c.is_ascii() && st.esc_nonascii => {
                 for &unit in c.encode_utf16(&mut units).iter() {
