@@ -1,16 +1,17 @@
 //! Gate 6 (SPEC §15.2): deleting a row, or restoring one row from an older
 //! copy, makes unlock report tampering and open read-only. Every table is
-//! covered, `meta` and the header included. Also: altered plaintext
-//! columns, moved ciphertext, an altered schema, an empty vault without its
-//! header, a row changed in the file while the vault is open, the
-//! documented whole-file rollback limit, file modes, and the digest's cost
-//! at 10,000 rows.
+//! covered, `meta` and the header included, on a fresh open and on the
+//! handle `lock` keeps. Also: altered plaintext columns, moved ciphertext,
+//! an altered schema, an empty vault without its header, a row changed in
+//! the file while the vault is open, the documented whole-file rollback
+//! limit, file modes, and the digest's cost at 10,000 rows.
 #![allow(clippy::unwrap_used)]
 
 mod common;
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use common::{Fixture, copy_dir, name, secret_item, slug};
@@ -22,6 +23,22 @@ use envcloak_core::vault::{
     FieldId, INITIAL_EPOCH, Integrity, ItemDetails, LockedVault, PolicyId, ProjectKey,
     ProjectRecord, TamperKind, Vault, VaultErrorKind,
 };
+
+/// This build's SQLite keeps one page cache for every connection in the
+/// process (`SQLITE_ENABLE_MEMORY_MANAGEMENT`), so one test's connections,
+/// unlocks and writes can drop the pages another test's vault has cached.
+/// The tests that change the file behind an open or locked vault check
+/// what happens while those pages are still cached, so each runs
+/// [`alone`]; every other test runs [`beside`] the others.
+static SERIAL: RwLock<()> = RwLock::new(());
+
+fn alone() -> RwLockWriteGuard<'static, ()> {
+    SERIAL.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn beside() -> RwLockReadGuard<'static, ()> {
+    SERIAL.read().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// A closed vault with two items (three fields), a project, a policy and
 /// two unlockers, and a copy of its directory to restore between cases.
@@ -187,6 +204,7 @@ fn unhex(s: &str) -> Vec<u8> {
 
 #[test]
 fn deleting_any_row_opens_read_only() {
+    let _serial = beside();
     let p = pristine();
     // The pristine copy itself verifies.
     p.restore();
@@ -244,6 +262,7 @@ fn deleting_any_row_opens_read_only() {
 
 #[test]
 fn restoring_one_row_from_an_older_copy_opens_read_only() {
+    let _serial = beside();
     let p = pristine();
     let old = p.snapshot.join("vault.db");
     // Move every kind of row one version on, then close.
@@ -339,6 +358,7 @@ fn restoring_one_row_from_an_older_copy_opens_read_only() {
 
 #[test]
 fn altered_plaintext_columns_or_moved_ciphertext_open_read_only() {
+    let _serial = beside();
     let p = pristine();
     let (a, b) = {
         p.restore();
@@ -462,6 +482,7 @@ fn altered_plaintext_columns_or_moved_ciphertext_open_read_only() {
 
 #[test]
 fn an_altered_schema_or_header_opens_read_only() {
+    let _serial = beside();
     let p = pristine();
     for (case, sql, want) in [
         (
@@ -522,6 +543,7 @@ fn an_altered_schema_or_header_opens_read_only() {
 /// on (docs/VAULT.md "Unlock").
 #[test]
 fn the_rows_that_name_the_vault_are_covered_too() {
+    let _serial = beside();
     let p = pristine();
     let cases = [
         (
@@ -601,6 +623,7 @@ fn the_rows_that_name_the_vault_are_covered_too() {
 /// is still refused whenever a header row is there.
 #[test]
 fn an_empty_vault_without_its_header_opens_read_only() {
+    let _serial = beside();
     let (f, v) = Fixture::create();
     drop(v);
     let snapshot = f.home.root().join("empty");
@@ -667,12 +690,126 @@ fn flip_on_disk(f: &Fixture, sealed: &[u8]) {
     file.sync_all().unwrap();
 }
 
+/// The number of the database page that holds `sealed`, a column stored
+/// once in the closed file.
+fn page_of(f: &Fixture, sealed: &[u8]) -> usize {
+    let bytes = std::fs::read(f.db()).unwrap();
+    let page_size = usize::from(u16::from_be_bytes([bytes[16], bytes[17]]));
+    let at = bytes
+        .windows(sealed.len())
+        .position(|w| w == sealed)
+        .unwrap();
+    at / page_size
+}
+
+/// Writes `sql`'s changes over `vault.db` while a vault holds it: copies
+/// the file, runs `sql` on the copy through a plain connection, and writes
+/// the result back into the same file, as another program can (the vault's
+/// lock is advisory). The vault must not have written since it was opened,
+/// so its WAL is empty and every page it reads comes from `vault.db`.
+fn rewrite_on_disk(f: &Fixture, sql: &str) {
+    let copy = f.home.root().join("rewrite.db");
+    std::fs::copy(f.db(), &copy).unwrap();
+    let raw = rusqlite::Connection::open(&copy).unwrap();
+    raw.execute_batch(sql).unwrap();
+    drop(raw);
+    let bytes = std::fs::read(&copy).unwrap();
+    std::fs::remove_file(&copy).unwrap();
+    assert_ne!(bytes, std::fs::read(f.db()).unwrap(), "no change: {sql}");
+    std::fs::write(f.db(), bytes).unwrap();
+}
+
+/// Gate 6 on the daemon's path (SPEC stories S9 and S10): `lock` keeps the
+/// file open and locked, and the next unlock goes through the handle it
+/// kept. A row deleted, restored from an older copy, or altered while the
+/// vault was locked is reported at that unlock, as on a fresh open. SQLite
+/// in exclusive locking mode never checks the file for such changes, so
+/// this fails if unlock checks the pages it cached before the lock.
+#[test]
+fn unlocking_the_handle_kept_by_lock_reads_the_file_again() {
+    let _serial = alone();
+    let p = pristine();
+    let unlock = |locked: LockedVault| locked.unlock(p.f.vmk()).map_err(|(_, e)| e).unwrap();
+    // Opened and not written since, so the WAL is empty; then locked.
+    let open_and_lock = || {
+        let v = p.f.unlock();
+        assert_eq!(v.integrity(), Integrity::Ok);
+        v.policies().unwrap().for_each(drop);
+        v.lock()
+    };
+
+    // Untouched, after a session's writes (the WAL holds pages), the kept
+    // handle unlocks as before.
+    p.restore();
+    let mut v = p.f.unlock();
+    v.transact(|t| t.set_value(p.other, SecretBytes::copy_from(b"rotated in session")))
+        .unwrap();
+    let v = unlock(v.lock());
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert!(v.read_value(p.other).unwrap().ct_eq(b"rotated in session"));
+    assert_eq!(v.policies().unwrap().count(), 1);
+    drop(v);
+
+    // A deleted row.
+    p.restore();
+    let locked = open_and_lock();
+    rewrite_on_disk(&p.f, "DELETE FROM policies;");
+    assert_read_only(
+        unlock(locked),
+        Some(TamperKind::DigestMismatch),
+        Some(p.keep),
+        "a row deleted while locked",
+    );
+
+    // One row restored from an older copy: the snapshot holds the policy
+    // at version 1, the file at version 2.
+    p.restore();
+    let mut v = p.f.unlock();
+    let policy = v.policies().unwrap().next().unwrap().0;
+    v.transact(|t| t.put_policy(policy, b"policy v2")).unwrap();
+    drop(v);
+    let locked = open_and_lock();
+    rewrite_on_disk(
+        &p.f,
+        &format!(
+            "ATTACH DATABASE '{}' AS old; DELETE FROM main.policies; \
+             INSERT INTO main.policies SELECT * FROM old.policies; DETACH DATABASE old;",
+            p.snapshot.join("vault.db").display()
+        ),
+    );
+    assert_read_only(
+        unlock(locked),
+        Some(TamperKind::DigestMismatch),
+        Some(p.keep),
+        "a row restored while locked",
+    );
+
+    // A sealed column altered in place.
+    p.restore();
+    let sealed = sealed_value_of(&p.f, p.other);
+    let locked = open_and_lock();
+    flip_on_disk(&p.f, &sealed);
+    let v = unlock(locked);
+    assert_eq!(
+        v.read_value(p.other).unwrap_err().kind(),
+        VaultErrorKind::Tampered
+    );
+    assert_read_only(
+        v,
+        Some(TamperKind::DigestMismatch),
+        Some(p.keep),
+        "a column altered while locked",
+    );
+}
+
 /// A row changed in the file while the vault is open turns it read-only
 /// at the first read or write that meets the row, and the next unlock
-/// reports it. SQLite reads the file again once it drops the page it
-/// cached at unlock; the test drops it on purpose.
+/// reports it. A read may be served from the page SQLite cached at unlock,
+/// so the read case drops that page on purpose; a write transaction reads
+/// the file as it is, so the write case does not.
 #[test]
 fn a_row_changed_on_disk_while_open_turns_the_vault_read_only() {
+    let _serial = alone();
     let p = pristine();
 
     // Met by a read.
@@ -700,11 +837,10 @@ fn a_row_changed_on_disk_while_open_turns_the_vault_read_only() {
         "reopened after a read",
     );
 
-    // Met by a write.
+    // Met by a write, with every page still cached.
     p.restore();
     let mut v = p.f.unlock();
     flip_on_disk(&p.f, &sealed);
-    v.evict_page_cache_for_testing().unwrap();
     let e = v
         .transact(|t| t.set_value(p.other, SecretBytes::copy_from(b"a new value")))
         .unwrap_err();
@@ -725,15 +861,23 @@ fn a_row_changed_on_disk_while_open_turns_the_vault_read_only() {
 
 /// A commit's digest comes from the rows this process wrote, never from the
 /// file: a row changed behind its back and not touched by the write is not
-/// folded into a fresh digest, and the next unlock still reports it.
+/// folded into a fresh digest, and the next unlock still reports it. Nor
+/// does the commit write back a copy of that row's page cached before the
+/// change, which would erase the change unreported (the two fields share a
+/// page, and nothing drops the cache here but the write itself).
 #[test]
 fn a_commit_never_vouches_for_a_row_changed_on_disk() {
+    let _serial = alone();
     let p = pristine();
     p.restore();
     let sealed = sealed_value_of(&p.f, p.other);
+    assert_eq!(
+        page_of(&p.f, &sealed),
+        page_of(&p.f, &sealed_value_of(&p.f, p.keep))
+    );
     let mut v = p.f.unlock();
+    assert!(v.read_value(p.other).unwrap().ct_eq(b"other value"));
     flip_on_disk(&p.f, &sealed);
-    v.evict_page_cache_for_testing().unwrap();
     v.transact(|t| t.set_value(p.keep, SecretBytes::copy_from(b"a later value")))
         .unwrap();
     assert_eq!(v.integrity(), Integrity::Ok);
@@ -754,6 +898,7 @@ fn a_commit_never_vouches_for_a_row_changed_on_disk() {
 /// deliberate spec change.
 #[test]
 fn restoring_the_whole_file_is_not_detected_locally() {
+    let _serial = beside();
     let p = pristine();
     p.restore();
     let mut v = p.f.unlock();
@@ -828,6 +973,7 @@ fn file_modes_child() {
 
 #[test]
 fn files_are_private_even_under_a_permissive_umask() {
+    let _serial = beside();
     let home = envcloak_testkit::TestHome::new();
     let exe = std::env::current_exe().unwrap();
     let out = home
@@ -852,6 +998,7 @@ fn files_are_private_even_under_a_permissive_umask() {
 /// timings are printed.
 #[test]
 fn the_digest_stays_cheap_at_ten_thousand_rows() {
+    let _serial = beside();
     let (f, mut v) = Fixture::create();
     let start = Instant::now();
     let first = v

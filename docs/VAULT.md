@@ -130,6 +130,8 @@ Unlocker envelopes of that epoch can then be listed without the key and unwrappe
 5. checks each row's plaintext columns against its sealed contents (the slug and project hashes, the item a field belongs to, unique slugs and field names, an unlocker's id, vault id, kind and epoch);
 6. recomputes the state digest and compares it with the header's.
 
+Unlock first drops SQLite's page cache (see Writes), so it checks the file as it is at that moment, also when it goes through the handle that `lock` kept open.
+
 When the header and the rows name different schema versions, unlock uses the first one under which the header or a row opens. If the file holds a header row or a sealed row and nothing opens under the key, unlock fails with a key mismatch (or, when some row names a newer version, with an unsupported version). An empty vault whose header was deleted holds nothing sealed to check the key against: it opens read-only and empty. Otherwise any failure in steps 2 to 6 opens the vault read-only and reports the first one found:
 
 | Report | Meaning |
@@ -151,7 +153,8 @@ Without an anchor (Linux, and macOS before M3), restoring the whole file togethe
 - A write transaction is one `BEGIN IMMEDIATE` SQLite transaction. Values are sealed before they are bound to a statement; only sealed bytes, keyed hashes, ids, row versions, kinds and timestamps are bound.
 - Each write names the row version it replaces (`WHERE id = ? AND row_version = ?`). A row that is not there means the file changed behind the process's back: the transaction fails and the vault turns read-only.
 - At commit the state digest is recomputed from the stamps held in memory, which only this process's writes change, and the header is rewritten in the same transaction. A row changed on disk while the vault is open is therefore never folded into a fresh digest.
-- A read or write that meets a row changed on disk (its sealed columns no longer open under the row version held in memory) turns the vault read-only, reporting "changed while open", and the next unlock reports the change. `tests/vault_integrity.rs` writes to the file behind an open vault and checks both, and that a commit to another row does not vouch for the changed one.
+- The exclusive lock does not stop another program from writing the file directly, and in exclusive mode SQLite never checks the file for such a change: it would serve pages cached before it, and a commit to another row on a cached page would write the old copy back over it, erasing the change unreported. Every unlock and every write transaction therefore first drops SQLite's page cache and reads the file as it is. A read between them may still be served from the cache, and so sees what this process wrote; the change is met at the next write or unlock. A page whose newer copy is in the WAL is read from the WAL, so a change to its older copy in `vault.db` is never read and is overwritten at the next checkpoint.
+- A read or write that meets a row changed on disk (its sealed columns no longer open under the row version held in memory) turns the vault read-only, reporting "changed while open", and the next unlock reports the change. `tests/vault_integrity.rs` writes to the file behind an open vault and checks both, that a commit to another row on the same page does not vouch for the changed one or erase it, and that a row deleted, restored or altered while the vault is locked is reported by the next unlock through the same handle.
 - Replacing a value makes the old one the newest prior value; three are kept.
 - Deleting an item deletes its fields; `secure_delete` overwrites the freed pages.
 

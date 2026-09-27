@@ -143,6 +143,29 @@ pub(crate) fn configure(conn: &Connection, wal: bool) -> Result<(), VaultError> 
     Ok(())
 }
 
+/// Drops every page SQLite has cached for `conn`, so the next read comes
+/// from the file (or from the WAL this connection wrote). Fails inside a
+/// transaction, where pages in use would stay cached.
+///
+/// Under `locking_mode=EXCLUSIVE` SQLite never checks the file for a change
+/// another program made, and the lock does not stop a program that writes
+/// the file directly. A page cached before such a change would hide it
+/// from unlock, and a commit to another row on that page would write the
+/// cached copy back over it, erasing the change unreported. Every unlock
+/// and every write transaction therefore starts here.
+///
+/// The bundled SQLite keeps one page cache for all connections in the
+/// process (`SQLITE_ENABLE_MEMORY_MANAGEMENT`), so this also drops other
+/// connections' unused pages: a cost for them, never a change in what they
+/// read.
+pub(crate) fn drop_page_cache(conn: &Connection) -> Result<(), VaultError> {
+    if !conn.is_autocommit() {
+        return Err(VaultErrorKind::Storage(-1).into());
+    }
+    conn.execute_batch("PRAGMA shrink_memory")?;
+    Ok(())
+}
+
 /// The settings in effect on a vault connection, read back from SQLite.
 /// Value-free; for `status` and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]

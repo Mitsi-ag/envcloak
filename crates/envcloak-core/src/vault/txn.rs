@@ -26,6 +26,7 @@ use super::items::{
     PolicyId, ProjectId, ProjectKey, ProjectRecord, Slug, encode_field, encode_item,
     encode_project,
 };
+use super::schema::drop_page_cache;
 use super::state::{
     FieldRow, ItemRow, PolicyRow, ProjectRow, State, VaultCtx, dir_hash, item_key, slug_hash,
 };
@@ -80,12 +81,16 @@ fn one_row(n: usize) -> Result<(), VaultError> {
 }
 
 impl<'v> Txn<'v> {
+    /// Starts the transaction on the file as it is now: a page cached
+    /// before another program changed the file must not be written back
+    /// over the change (see [`drop_page_cache`]).
     pub(crate) fn begin(
         conn: &'v mut Connection,
         keys: &'v Keyring,
         ctx: VaultCtx,
         state: State,
     ) -> Result<Self, VaultError> {
+        drop_page_cache(conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Ok(Txn {
             tx,

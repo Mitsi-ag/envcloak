@@ -205,9 +205,13 @@ impl LockedVault {
         if let Err(e) = self.conn.pragma_update(None, "query_only", "OFF") {
             return Err((self, e.into()));
         }
+        // This handle holds the exclusive lock, but another program can
+        // still write the file directly, and a handle kept by `Vault::lock`
+        // has pages cached from before. Check the file as it is now.
+        if let Err(e) = schema::drop_page_cache(&self.conn) {
+            return Err((self, e));
+        }
         let keys = Keyring::derive(&vmk, &self.vault_id, self.epoch);
-        // The file cannot have changed since `open`: this handle holds the
-        // exclusive lock.
         let id = match read_identity(&self.conn, self.plan.target()) {
             Ok(id) => id,
             Err(e) => return Err((self, e)),
@@ -743,15 +747,16 @@ impl Vault {
     /// Test support only: drops the pages SQLite has cached, so the next
     /// read of a row comes from the file, as it does once the cache evicts
     /// the page. Lets a test see a change another program made to the file
-    /// while the vault is open.
+    /// while the vault is open. (Unlock and every write transaction drop
+    /// them anyway; a read between them may be served from the cache.)
     #[cfg(feature = "testing")]
     pub fn evict_page_cache_for_testing(&self) -> Result<(), VaultError> {
-        self.file.conn.execute_batch("PRAGMA shrink_memory")?;
-        Ok(())
+        schema::drop_page_cache(&self.file.conn)
     }
 
     /// Locks: drops the VMK, the subkeys and the decrypted metadata, which
-    /// are wiped as they are freed, and keeps the file open and locked.
+    /// are wiped as they are freed, and keeps the file open and locked. The
+    /// next [`LockedVault::unlock`] checks the file as it is then.
     pub fn lock(self) -> LockedVault {
         let Vault { file, .. } = self;
         file
