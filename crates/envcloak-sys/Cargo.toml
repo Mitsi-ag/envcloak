@@ -8,8 +8,20 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[lints]
-workspace = true
+# The workspace lint tables, repeated with one change: unsafe_code is "deny"
+# rather than "forbid", so the files of this crate, and only they, can allow
+# it. scripts/check-unsafe.sh fails if these tables drift from the
+# workspace's in any other way.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(envcloak_lint_canary)", "cfg(envcloak_unsafe_canary)"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+disallowed_methods = "deny"
+unwrap_used = "warn"
+dbg_macro = "warn"
 
 [features]
 # Test support only: the inspection allocator for the allocator probe and

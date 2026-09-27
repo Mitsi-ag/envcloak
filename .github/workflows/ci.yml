@@ -40,10 +40,14 @@ jobs:
           echo "ENVCLOAK_TEST_CORE_DIR=/tmp/eccores" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - name: Unsafe-code and secret-exposure boundaries
-        run: scripts/check-unsafe.sh
+        run: |
+          python3 --version
+          scripts/check-unsafe.sh
       - run: cargo clippy --workspace --all-targets --locked
       - name: expose_secret lint canary
         run: scripts/check-expose-lint.sh
+      - name: unsafe_code forbid canary
+        run: scripts/check-unsafe-lint.sh
       - run: cargo test --workspace --locked
 
   deny:

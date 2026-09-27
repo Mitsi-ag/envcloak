@@ -17,20 +17,52 @@ fn unsafe_lint() -> String {
     ["unsafe", "_code"].concat()
 }
 
+/// `disallowed_methods`, as a key in a clippy lint table.
+fn exposure_key() -> String {
+    ["disallowed", "_methods"].concat()
+}
+
 fn exposure_lint() -> String {
-    ["clippy::disallowed", "_methods"].concat()
+    format!("clippy::{}", exposure_key())
 }
 
 fn warnings_lint() -> String {
     ["warn", "ings"].concat()
 }
 
-/// The clean fixture's root manifest, followed by `extra`.
-fn root_manifest(extra: &str) -> String {
+/// The clean fixture's `[workspace.lints.clippy]` body.
+fn clippy_body() -> String {
     format!(
-        "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.lints.rust]\n{} = \"deny\"\n{extra}",
+        "all = {{ level = \"warn\", priority = -1 }}\n{} = \"deny\"\n",
+        exposure_key()
+    )
+}
+
+/// A root manifest whose `[workspace.lints.rust]` table forbids unsafe code
+/// and adds `rust`, whose clippy table holds `clippy`, followed by `tail`.
+fn root_manifest(rust: &str, clippy: &str, tail: &str) -> String {
+    format!(
+        "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.lints.rust]\n{} = \"forbid\"\n{rust}\n[workspace.lints.clippy]\n{clippy}\n{tail}",
         unsafe_lint()
     )
+}
+
+/// envcloak-sys's manifest, repeating those tables with unsafe code denied.
+fn sys_manifest(rust: &str, clippy: &str) -> String {
+    format!(
+        "[package]\nname = \"envcloak-sys\"\nversion = \"0.1.0\"\n\n[lints.rust]\n{} = \"deny\"\n{rust}\n[lints.clippy]\n{clippy}",
+        unsafe_lint()
+    )
+}
+
+/// Writes a matching root and envcloak-sys manifest pair.
+fn set_lints(t: &TestHome, rust: &str, clippy: &str) {
+    write(&t.home(), "Cargo.toml", &root_manifest(rust, clippy, ""));
+    write(
+        &t.home(),
+        "crates/envcloak-sys/Cargo.toml",
+        &sys_manifest(rust, clippy),
+    );
 }
 
 fn run(root: &Path) -> Output {
@@ -54,7 +86,7 @@ fn clean_tree() -> TestHome {
     let t = TestHome::new();
     let r = t.home();
     let uc = unsafe_lint();
-    write(&r, "Cargo.toml", &root_manifest(""));
+    set_lints(&t, "", &clippy_body());
     write(
         &r,
         "clippy.toml",
@@ -65,7 +97,6 @@ fn clean_tree() -> TestHome {
         "security/expose-allowlist.txt",
         "# comment\n\ncrates/envcloak-core/src/secret.rs  # the secret types\n",
     );
-    write(&r, "crates/envcloak-sys/Cargo.toml", MEMBER);
     write(
         &r,
         "crates/envcloak-sys/src/lib.rs",
@@ -85,7 +116,10 @@ fn clean_tree() -> TestHome {
     write(
         &r,
         "crates/envcloak-core/src/secret.rs",
-        &format!("#[allow({})]\npub fn open() {{}}\n", exposure_lint()),
+        &format!(
+            "#[allow({})]\npub fn open() {{}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{}}\n}}\n",
+            exposure_lint()
+        ),
     );
     t
 }
@@ -153,6 +187,56 @@ fn allow_unsafe_code_outside_sys_fails() {
 }
 
 #[test]
+fn raw_identifier_lint_names_are_read_as_rustc_reads_them() {
+    let uc = unsafe_lint();
+    let dm = exposure_key();
+    let w = warnings_lint();
+    for (text, message) in [
+        (
+            format!("#[allow(r#{uc})]\nfn f() {{}}\n"),
+            "unsafe_code may only be relaxed",
+        ),
+        (
+            format!("#[allow(clippy::r#{dm})]\nfn f() {{}}\n"),
+            "allows disallowed_methods but is not listed",
+        ),
+        (
+            format!("#[allow(r#clippy::r#{dm})]\nfn f() {{}}\n"),
+            "allows disallowed_methods but is not listed",
+        ),
+        (
+            format!("#[allow(r#{w})]\nfn f() {{}}\n"),
+            "must not allow warnings",
+        ),
+        (
+            "#![allow(clippy::r#style)]\n".to_owned(),
+            "may not be allowed",
+        ),
+        (
+            "#![expect(r#clippy::r#all)]\n".to_owned(),
+            "may not be allowed",
+        ),
+        (
+            format!("macro_rules! m {{ ($l:ident) => {{}} }}\nm!(r#{uc});\n"),
+            "mentions unsafe_code outside a lint attribute",
+        ),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), "crates/envcloak-core/src/raw.rs", &text);
+        assert_fails(&t, message);
+    }
+
+    // Raw identifiers elsewhere are fine.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/fine.rs",
+        "pub fn f(r#type: u8) -> u8 {\n    let r#match = r#type;\n    r#match\n}\n",
+    );
+    assert_passes(&t);
+}
+
+#[test]
 fn a_crate_that_does_not_inherit_workspace_lints_fails() {
     let t = clean_tree();
     write(
@@ -172,6 +256,22 @@ fn a_crate_that_does_not_inherit_workspace_lints_fails() {
         ),
     );
     assert_fails(&t, "crates/envcloak-core/Cargo.toml");
+
+    // `workspace = true` inside a string is not a lints table (the old
+    // line-based reading took it for one).
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/Cargo.toml",
+        &format!(
+            "[package]\nname = \"x\"\ndescription = \"\"\"\n[lints]\nworkspace = true\n\"\"\"\n\n[lints.rust]\n{} = \"allow\"\n",
+            warnings_lint()
+        ),
+    );
+    assert_fails(
+        &t,
+        "crates/envcloak-core/Cargo.toml: needs [lints] workspace = true",
+    );
 }
 
 #[test]
@@ -185,7 +285,230 @@ fn a_relaxed_workspace_lint_fails() {
             unsafe_lint()
         ),
     );
-    assert_fails(&t, "Cargo.toml");
+    assert_fails(&t, "must set unsafe_code = \"forbid\"");
+
+    // Deny is not enough: a source attribute can lower a deny, not a forbid.
+    let t = clean_tree();
+    let text = root_manifest("", &clippy_body(), "").replace("\"forbid\"", "\"deny\"");
+    write(&t.home(), "Cargo.toml", &text);
+    assert_fails(&t, "must set unsafe_code = \"forbid\"");
+}
+
+#[test]
+fn workspace_tables_are_read_as_cargo_reads_them() {
+    let uc = unsafe_lint();
+    let dm = exposure_key();
+    // The reviewer's bypass: the required line sits in a multi-line string,
+    // and the real table has a quoted key the old line match did not know.
+    let decoy = format!(
+        "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.metadata.notes]\ntext = \"\"\"\n[workspace.lints.rust]\n{uc} = \"forbid\"\n\"\"\"\n\n[workspace.\"lints\".rust]\n{uc} = \"allow\"\n\n[workspace.\"lints\".clippy]\n{dm} = \"deny\"\n"
+    );
+    // Inline and dotted spellings of a relaxed level.
+    let inline = format!(
+        "[workspace]\nlints = {{ rust = {{ {uc} = \"forbid\" }}, clippy = {{ all = \"allow\", {dm} = \"deny\" }} }}\n"
+    );
+    let dotted = format!(
+        "[workspace]\nlints.rust.{uc} = \"forbid\"\nlints.clippy.{dm} = \"deny\"\nlints.clippy.style = {{ level = \"allow\", priority = 1 }}\n"
+    );
+    for (text, message) in [
+        (decoy, "must set unsafe_code = \"forbid\""),
+        (inline, "all must stay at warn or above"),
+        (dotted, "style must stay at warn or above"),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), "Cargo.toml", &text);
+        assert_fails(&t, message);
+    }
+
+    // A file that is not valid TOML fails rather than being skipped.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "Cargo.toml",
+        &root_manifest("", &clippy_body(), "[workspace.lints.rust]\n"),
+    );
+    assert_fails(&t, "Cargo.toml: cannot be read as TOML");
+}
+
+#[test]
+fn relaxed_workspace_lint_tables_fail() {
+    let dm = exposure_key();
+    let w = warnings_lint();
+    let all = "all = { level = \"warn\", priority = -1 }\n";
+    for (rust, clippy, message) in [
+        (
+            String::new(),
+            format!("{all}{dm} = \"allow\"\n"),
+            "must set disallowed_methods = \"deny\"",
+        ),
+        (
+            String::new(),
+            format!("{all}disallowed-methods = {{ level = \"warn\" }}\n"),
+            "must set disallowed_methods = \"deny\"",
+        ),
+        (
+            String::new(),
+            all.to_owned(),
+            "must set disallowed_methods = \"deny\"",
+        ),
+        (
+            String::new(),
+            format!("{all}{dm} = \"deny\"\nstyle = {{ level = \"allow\", priority = 1 }}\n"),
+            "style must stay at warn or above",
+        ),
+        (
+            String::new(),
+            format!("all = 'allow'\n{dm} = \"deny\"\n"),
+            "all must stay at warn or above",
+        ),
+        // A group applied after disallowed_methods would set its level.
+        (
+            String::new(),
+            format!("all = {{ level = \"warn\", priority = 5 }}\n{dm} = \"deny\"\n"),
+            "needs a lower priority than disallowed_methods",
+        ),
+        (
+            String::new(),
+            format!("{all}{dm} = \"deny\"\n\"clippy::style\" = \"allow\"\n"),
+            "use one plain lint name per key",
+        ),
+        (
+            String::new(),
+            format!("{all}{dm} = \"deny\"\n{dm} = \"deny\"\n"),
+            "cannot be read as TOML",
+        ),
+        (
+            String::new(),
+            format!("{all}{dm} = \"deny\"\ndisallowed-methods = \"deny\"\n"),
+            "this lint is set twice",
+        ),
+        (
+            format!("{w} = \"allow\"\n"),
+            clippy_body(),
+            "warnings must stay at warn or above",
+        ),
+    ] {
+        let t = clean_tree();
+        set_lints(&t, &rust, &clippy);
+        assert_fails(&t, message);
+    }
+
+    // A sub-table sets the group's level too.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "Cargo.toml",
+        &root_manifest(
+            "",
+            &clippy_body(),
+            "[workspace.lints.clippy.style]\nlevel = \"allow\"\n",
+        ),
+    );
+    assert_fails(&t, "style must stay at warn or above");
+
+    // Raising levels is fine.
+    let t = clean_tree();
+    set_lints(
+        &t,
+        &format!("{w} = \"warn\"\n"),
+        &format!("{all}{dm} = {{ level = \"forbid\", priority = 1 }}\n"),
+    );
+    assert_passes(&t);
+}
+
+#[test]
+fn the_sys_lint_tables_must_mirror_the_workspace() {
+    let uc = unsafe_lint();
+    let w = warnings_lint();
+    let body = clippy_body();
+    for text in [
+        // Inheriting would forbid the unsafe code sys exists for; it is
+        // still reported, so the tree says what it means.
+        MEMBER.to_owned(),
+        sys_manifest("", &format!("{body}unwrap_used = \"allow\"\n")),
+        sys_manifest(&format!("{w} = \"allow\"\n"), &body),
+        sys_manifest("", "all = { level = \"warn\", priority = -1 }\n"),
+        sys_manifest("", &body).replace("\"deny\"\n", "\"allow\"\n"),
+        format!("[package]\nname = \"envcloak-sys\"\n\n[lints.rust]\n{uc} = \"deny\"\n"),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), "crates/envcloak-sys/Cargo.toml", &text);
+        assert_fails(&t, "crates/envcloak-sys/Cargo.toml: its [lints] tables");
+    }
+}
+
+#[test]
+fn build_scripts_proc_macros_and_outside_targets_fail() {
+    let lints = "\n[lints]\nworkspace = true\n";
+    for (extra_manifest, files, message) in [
+        ("", vec![("build.rs", "fn main() {}\n")], "build scripts"),
+        ("build = \"gen.rs\"\n", vec![], "build scripts"),
+        ("\n[lib]\nproc-macro = true\n", vec![], "proc-macro crates"),
+        ("\n[lib]\npath = \"src/lib.txt\"\n", vec![], "[lib] path"),
+        (
+            "\n[[bin]]\nname = \"b\"\npath = \"../../outside/main.rs\"\n",
+            vec![],
+            "[bin] path",
+        ),
+        (
+            "\n[[test]]\nname = \"t\"\npath = \"/tmp/t.rs\"\n",
+            vec![],
+            "[test] path",
+        ),
+    ] {
+        let t = clean_tree();
+        let r = t.home();
+        let (package, rest) = match extra_manifest.strip_prefix('\n') {
+            Some(tables) => (String::new(), format!("{lints}\n{tables}")),
+            None => (extra_manifest.to_owned(), lints.to_owned()),
+        };
+        write(
+            &r,
+            "crates/envcloak-core/Cargo.toml",
+            &format!("[package]\nname = \"x\"\nversion = \"0.1.0\"\n{package}{rest}"),
+        );
+        for (name, text) in files {
+            write(&r, &format!("crates/envcloak-core/{name}"), text);
+        }
+        assert_fails(&t, message);
+    }
+
+    // A build script switched off, and targets inside the package, are fine.
+    let t = clean_tree();
+    let r = t.home();
+    write(
+        &r,
+        "crates/envcloak-core/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nbuild = false\n\n[lints]\nworkspace = true\n\n[[test]]\nname = \"t\"\npath = \"tests/t.rs\"\n",
+    );
+    write(&r, "crates/envcloak-core/build.rs", "fn main() {}\n");
+    assert_passes(&t);
+}
+
+#[test]
+fn patches_and_rustflags_in_manifests_fail() {
+    for (tail, message) in [
+        (
+            "[patch.crates-io]\nsecrecy = { path = \"vendor/secrecy\" }\n",
+            "[patch] is not allowed",
+        ),
+        (
+            "[replace]\n\"zeroize:1.9.0\" = { path = \"vendor/zeroize\" }\n",
+            "[replace] is not allowed",
+        ),
+        (
+            "[profile.dev]\nrustflags = [\"-A\", \"x\"]\n",
+            "must not set rustflags",
+        ),
+    ] {
+        let t = clean_tree();
+        write(
+            &t.home(),
+            "Cargo.toml",
+            &root_manifest("", &clippy_body(), tail),
+        );
+        assert_fails(&t, message);
+    }
 }
 
 #[test]
@@ -208,6 +531,69 @@ fn exposure_allowed_outside_the_allowlist_fails() {
 }
 
 #[test]
+fn listed_files_may_not_declare_out_of_line_modules() {
+    // The allow in secret.rs would reach secret/leak.rs, which is not listed.
+    let t = clean_tree();
+    let r = t.home();
+    write(
+        &r,
+        "crates/envcloak-core/src/secret.rs",
+        &format!("#![allow({})]\n\nmod leak;\n", exposure_lint()),
+    );
+    write(&r, "crates/envcloak-core/src/secret/leak.rs", "fn f() {}\n");
+    assert_fails(
+        &t,
+        "crates/envcloak-core/src/secret.rs:3: files listed in security/expose-allowlist.txt may not declare out-of-line modules",
+    );
+
+    // The same declaration in an unlisted file is fine.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/other.rs",
+        "mod inner;\n",
+    );
+    assert_passes(&t);
+}
+
+#[test]
+fn include_and_path_attributes_fail() {
+    let i = ["incl", "ude"].concat();
+    let p = ["pa", "th"].concat();
+    for text in [
+        format!("{i}!(\"leak.txt\");\n"),
+        format!("fn f() {{\n    std::{i}!(\"/tmp/leak.txt\");\n}}\n"),
+        format!("r#{i}!(\"leak.txt\");\n"),
+        format!("#[{p} = \"leak.txt\"]\nmod leak;\n"),
+        format!("#[cfg_attr(all(), {p} = \"leak.txt\")]\nmod leak;\n"),
+        format!("#[\n    {p}\n    = \"leak.txt\"\n]\nmod leak;\n"),
+        // A macro that receives the pieces from elsewhere.
+        format!("macro_rules! m {{ ($m:ident) => {{ $m!(\"leak.txt\"); }} }}\nm!({i});\n"),
+        format!(
+            "macro_rules! m {{ ($a:meta) => {{ #[$a] mod leak; }} }}\nm!({p} = \"leak.txt\");\n"
+        ),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), "crates/envcloak-core/src/inc.rs", &text);
+        assert_fails(&t, "crates/envcloak-core/src/inc.rs");
+    }
+
+    // Ordinary uses of the words are fine.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/fine.rs",
+        &format!(
+            "// {i}!(\"in a comment\") and #[{p} = \"x\"]\n\
+             const A: &str = \"{i}!(x) #[{p} = y]\";\n\
+             const B: &[u8] = {i}_bytes!(\"fine.rs\");\n\
+             fn f(x: u8) -> u8 {{\n    let {p} = 1;\n    let mut q = {p};\n    q = q + {p};\n    if {p} == q {{}}\n    match x {{\n        0 => 1,\n        {p} => {p},\n    }}\n}}\n"
+        ),
+    );
+    assert_passes(&t);
+}
+
+#[test]
 fn stale_allowlist_entries_fail() {
     let t = clean_tree();
     write(
@@ -223,6 +609,15 @@ fn weakened_clippy_configuration_fails() {
     let t = clean_tree();
     write(&t.home(), "clippy.toml", "allow-unwrap-in-tests = true\n");
     assert_fails(&t, "clippy.toml");
+
+    // Paths in a comment do not configure anything.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "clippy.toml",
+        "# \"secrecy::ExposeSecret::expose_secret\"\n# \"secrecy::ExposeSecretMut::expose_secret_mut\"\ndisallowed-methods = []\n",
+    );
+    assert_fails(&t, "clippy.toml: disallowed-methods must list");
 
     let t = clean_tree();
     write(
@@ -294,44 +689,6 @@ fn allowing_warnings_anywhere_fails() {
 }
 
 #[test]
-fn relaxed_workspace_lint_tables_fail() {
-    let w = warnings_lint();
-    for extra in [
-        "\n[workspace.lints.clippy]\ndisallowed_methods = \"allow\"\n".to_owned(),
-        "\n[workspace.lints.clippy]\ndisallowed-methods = { level = \"allow\" }\n".to_owned(),
-        "\n[workspace.lints.clippy]\nstyle = { level = \"allow\", priority = 1 }\n".to_owned(),
-        "\n[workspace.lints.clippy]\nall = 'allow'\n".to_owned(),
-        format!("{w} = \"allow\"\n"),
-        "\n[workspace.lints.clippy.style]\nlevel = \"allow\"\n".to_owned(),
-        "\n[workspace.lints]\nclippy = { all = \"allow\" }\n".to_owned(),
-    ] {
-        let t = clean_tree();
-        write(&t.home(), "Cargo.toml", &root_manifest(&extra));
-        assert_fails(&t, "Cargo.toml");
-    }
-
-    let t = clean_tree();
-    let r = t.home();
-    let text = root_manifest("").replace(
-        "[workspace]\n",
-        "[workspace]\nlints.clippy.all = \"allow\"\n",
-    );
-    write(&r, "Cargo.toml", &text);
-    assert_fails(&t, "Cargo.toml");
-
-    // Raising levels is fine.
-    let t = clean_tree();
-    write(
-        &t.home(),
-        "Cargo.toml",
-        &root_manifest(&format!(
-            "{w} = \"warn\"\n\n[workspace.lints.clippy]\nall = {{ level = \"warn\", priority = -1 }}\ndisallowed_methods = \"deny\"\n"
-        )),
-    );
-    assert_passes(&t);
-}
-
-#[test]
 fn comments_and_strings_neither_satisfy_nor_trip_the_checks() {
     let uc = unsafe_lint();
     for text in [
@@ -384,14 +741,29 @@ fn a_file_the_check_cannot_read_fails() {
 }
 
 #[test]
-fn cargo_config_rustflags_fail() {
-    let t = clean_tree();
-    write(
-        &t.home(),
-        ".cargo/config.toml",
-        &format!("[build]\nrustflags = [\"-A\", \"{}\"]\n", warnings_lint()),
-    );
-    assert_fails(&t, ".cargo/config.toml");
+fn cargo_configuration_files_fail() {
+    for (rel, text) in [
+        (
+            ".cargo/config.toml",
+            format!("[build]\nrustflags = [\"-A\", \"{}\"]\n", warnings_lint()),
+        ),
+        (
+            ".cargo/config.toml",
+            "[build]\nrustc-workspace-wrapper = \"tools/strip-lints\"\n".to_owned(),
+        ),
+        (
+            ".cargo/config",
+            "[env]\nCLIPPY_CONF_DIR = \"/tmp\"\n".to_owned(),
+        ),
+        (
+            "crates/envcloak-core/.cargo/config.toml",
+            "[env]\nX = \"1\"\n".to_owned(),
+        ),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), rel, &text);
+        assert_fails(&t, rel);
+    }
 }
 
 #[test]
@@ -403,6 +775,19 @@ fn every_package_in_the_tree_inherits_workspace_lints() {
         "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
     );
     assert_fails(&t, "security/lint-canary/Cargo.toml");
+
+    // A nested workspace or virtual manifest is not a package of this one.
+    let t = clean_tree();
+    write(&t.home(), "tools/Cargo.toml", "[workspace]\nmembers = []\n");
+    assert_fails(&t, "tools/Cargo.toml: must be a package of this workspace");
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "tools/Cargo.toml",
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[workspace]\n\n[lints]\nworkspace = true\n",
+    );
+    assert_fails(&t, "tools/Cargo.toml: must be a package of this workspace");
 
     let t = clean_tree();
     write(&t.home(), "security/lint-canary/Cargo.toml", MEMBER);

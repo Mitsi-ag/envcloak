@@ -289,7 +289,7 @@ A single vault per user under the platform data directory: `~/Library/Applicatio
 - On macOS, protection against debugger attach comes from the hardened runtime without `get-task-allow`, checked in CI. `PT_DENY_ATTACH` is not relied on.
 - Builds without these protections (source, Homebrew from source) report "unhardened" in `envcloak status`. Source installs sign ad hoc with the hardened runtime (`codesign -s - -o runtime`).
 - Release builds use `panic = "abort"`, and there is no third-party crash reporter.
-- The workspace keeps `unsafe_code = "deny"` everywhere except `envcloak-sys`, which CI enforces.
+- The workspace sets `unsafe_code = "forbid"` for every crate except `envcloak-sys`, so the compiler rejects unsafe code, and any `allow` of it, everywhere else. CI checks the manifests and proves the level with a compile canary.
 
 #### Logging
 

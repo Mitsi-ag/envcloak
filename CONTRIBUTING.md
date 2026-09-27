@@ -21,7 +21,7 @@ The macOS app lives in `apps/macos/` and needs Xcode 16 or later.
 - `cargo fmt --all`
 - `cargo clippy --workspace --all-targets` with no warnings
 - `cargo test --workspace`
-- `scripts/check-unsafe.sh` and `scripts/check-expose-lint.sh`
+- `scripts/check-unsafe.sh`, `scripts/check-unsafe-lint.sh` and `scripts/check-expose-lint.sh` (the first needs `python3` 3.11 or later)
 - New behaviour has tests. Anything that touches secret handling has a test proving the value does not leak (to output, logs, errors or panics).
 - User-facing changes update the docs.
 
@@ -30,8 +30,8 @@ The macOS app lives in `apps/macos/` and needs Xcode 16 or later.
 1. Secret values live in `SecretBytes` or `SecretBuf` (`envcloak-core`) and are never `Debug`- or `Display`-printed. Only files listed in [`security/expose-allowlist.txt`](security/expose-allowlist.txt) may call `expose_secret`; clippy enforces it, and adding a file needs review.
 2. Errors never include secret values.
 3. No new cryptography. Use the crates listed in the spec.
-4. `unsafe` is denied workspace-wide. It is allowed only in `crates/envcloak-sys` (`scripts/check-unsafe.sh` enforces this), and every `unsafe` block there needs a `// SAFETY:` comment (clippy `undocumented_unsafe_blocks`).
-5. Never allow `warnings`, `clippy::all` or `clippy::style`, in source or in the workspace lint tables, and never set rustflags in a cargo config: each of these also silences the `expose_secret` lint. Allow the specific lint you need instead. `scripts/check-unsafe.sh` enforces this.
+4. `unsafe` is forbidden workspace-wide, so the compiler rejects it and any `allow` of it. Only `crates/envcloak-sys` has its own lint tables, identical apart from `unsafe_code = "deny"`, and every `unsafe` block there needs a `// SAFETY:` comment (clippy `undocumented_unsafe_blocks`). `scripts/check-unsafe.sh` keeps the manifests that way, and `scripts/check-unsafe-lint.sh` proves the compiler enforces it.
+5. Never allow `warnings`, `clippy::all` or `clippy::style`, in source or in the workspace lint tables: each of these can silence the `expose_secret` lint. Allow the specific lint you need instead. The tree also holds no cargo config, build scripts, proc-macro crates, `include!` or `#[path]`, each of which can change lint levels or compile code the checks never read. `scripts/check-unsafe.sh` enforces this.
 6. Tests never contain real or key-shaped secrets. Generate fixture values at test time with `envcloak-testkit` (`canaries`), and check outputs with its canary sweep. Start processes from tests through `TestHome::apply`, which clears the environment, so nothing exported in your shell reaches a child or a core file it leaves.
 
 ## Reporting security issues

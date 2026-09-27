@@ -15,3 +15,7 @@ xcuserdata/
 
 # Claude <-> Codex review channel (local only)
 .collab/
+
+# Written and removed by scripts/check-unsafe-lint.sh
+/security/unsafe-canary/src/generated.rs
+/security/unsafe-canary/src/generated_included.rs

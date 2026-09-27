@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-# security/lint-canary is a member so it inherits the workspace lints; see
-# scripts/check-expose-lint.sh.
-members = ["crates/*", "security/lint-canary"]
+# The canaries under security/ are members so they inherit the workspace
+# lints; see scripts/check-expose-lint.sh and scripts/check-unsafe-lint.sh.
+members = ["crates/*", "security/lint-canary", "security/unsafe-canary"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,13 +36,22 @@ serde_json = "1.0.151"
 static_assertions = "1.1.0"
 tempfile = "3.27.0"
 
+# Every crate but envcloak-sys inherits these tables, so the compiler rejects
+# unsafe code, and any `allow` of it, everywhere else. envcloak-sys repeats
+# them in its own manifest with `unsafe_code = "deny"`, which its files may
+# relax; scripts/check-unsafe.sh checks that the two stay identical apart
+# from that one level.
 [workspace.lints.rust]
-unsafe_code = "deny"
+unsafe_code = "forbid"
 missing_debug_implementations = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(envcloak_lint_canary)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(envcloak_lint_canary)", "cfg(envcloak_unsafe_canary)"] }
 
+# disallowed_methods (clippy.toml's expose_secret ban) is an error, and its
+# priority puts it after the groups that contain it, so neither
+# `allow(warnings)` nor a group level can quiet it.
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+disallowed_methods = "deny"
 unwrap_used = "warn"
 dbg_macro = "warn"
 

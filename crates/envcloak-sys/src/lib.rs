@@ -8,9 +8,11 @@
 //!   attached debugger; [`hardening_status`] reports what took effect.
 //! - [`lock_memory`]: best-effort `mlock` (plus `MADV_DONTDUMP` on Linux).
 //!
-//! `scripts/check-unsafe.sh` fails the build if any other crate allows
-//! `unsafe_code`. Every `unsafe` block and impl here carries a `SAFETY`
-//! comment, which clippy checks.
+//! Every other crate inherits the workspace's `unsafe_code = "forbid"`, so
+//! the compiler rejects unsafe code there and any `allow` of it. This crate
+//! repeats the workspace lint tables with `unsafe_code = "deny"`, which
+//! `scripts/check-unsafe.sh` keeps in step. Every `unsafe` block and impl
+//! here carries a `SAFETY` comment, which clippy checks.
 #![allow(unsafe_code)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
