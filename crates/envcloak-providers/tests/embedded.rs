@@ -137,7 +137,33 @@ fn the_embedded_registry_loads() {
     let github = r.get("github").unwrap();
     assert!(github.path_denied("/repos/acme/web/keys"));
     assert!(github.path_denied("/repos/acme/web/actions/runners/registration-token"));
-    assert!(!github.path_denied("/repos/acme/web/pulls"));
+    // Every place GitHub keeps secrets or hands out credentials.
+    for path in [
+        "/user/codespaces/secrets/X",
+        "/repos/acme/web/codespaces/secrets",
+        "/repos/acme/web/codespaces/secrets/public-key",
+        "/orgs/acme/codespaces/secrets/X",
+        "/repos/acme/web/dependabot/secrets",
+        "/orgs/acme/dependabot/secrets/X",
+        "/repos/acme/web/actions/secrets/X",
+        "/repos/acme/web/environments/prod/secrets/X",
+        "/orgs/acme/actions/secrets",
+        "/orgs/acme/private-registries",
+        "/orgs/acme/credential-authorizations",
+        "/orgs/acme/credential-authorizations/1",
+        "/enterprises/big/actions/runners/registration-token",
+        "/orgs/acme/actions/runners/remove-token",
+    ] {
+        assert!(github.path_denied(path), "{path}");
+    }
+    for path in [
+        "/repos/acme/web/pulls",
+        "/repos/acme/web/codespaces",
+        "/repos/acme/web/dependabot/alerts",
+        "/orgs/acme/members",
+    ] {
+        assert!(!github.path_denied(path), "{path}");
+    }
     let stripe = r.get("stripe").unwrap();
     assert!(stripe.path_denied("/v1/ephemeral_keys"));
     assert!(!stripe.path_denied("/v1/charges"));

@@ -20,8 +20,11 @@ auth = [
 ]
 # Endpoints that manage or mint credentials: OAuth authorizations and
 # applications, GitHub App installation tokens, SSH, GPG and deploy keys,
-# Actions and Codespaces secrets, runner registration tokens and
-# organization token policies; and site administration.
+# Actions, Codespaces and Dependabot secrets (user, repository,
+# environment and organization), organization private registries,
+# runner registration and removal tokens (repository, organization and
+# enterprise), organization token policies and SSO credential
+# authorizations; and site administration.
 denied_paths = [
   "/authorizations",
   "/applications",
@@ -34,11 +37,18 @@ denied_paths = [
   "/repos/*/*/keys",
   "/repos/*/*/actions/secrets",
   "/repos/*/*/actions/runners",
+  "/repos/*/*/codespaces/secrets",
+  "/repos/*/*/dependabot/secrets",
   "/repos/*/*/environments/*/secrets",
   "/orgs/*/actions/secrets",
   "/orgs/*/actions/runners",
+  "/orgs/*/codespaces/secrets",
+  "/orgs/*/dependabot/secrets",
+  "/orgs/*/private-registries",
+  "/orgs/*/credential-authorizations",
   "/orgs/*/personal-access-tokens",
   "/orgs/*/personal-access-token-requests",
+  "/enterprises/*/actions/runners",
 ]
 
 [links]
