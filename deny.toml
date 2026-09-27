@@ -21,6 +21,10 @@ allow = [
   "MPL-2.0",
   "CDLA-Permissive-2.0",
 ]
+# envcloak-core compiles in the EFF word list (THIRD_PARTY_NOTICES.md).
+exceptions = [
+  { crate = "envcloak-core", allow = ["CC-BY-3.0-US"] },
+]
 
 [bans]
 multiple-versions = "warn"

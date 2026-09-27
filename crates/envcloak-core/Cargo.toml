@@ -3,7 +3,10 @@ name = "envcloak-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# The crate's own code is MIT OR Apache-2.0. It also compiles in the EFF
+# word list (CC BY 3.0 US) and the Pwdb-Public common-password list (MIT);
+# THIRD_PARTY_NOTICES.md, packaged with the crate, has their notices.
+license = "(MIT OR Apache-2.0) AND CC-BY-3.0-US AND MIT"
 repository.workspace = true
 authors.workspace = true
 
