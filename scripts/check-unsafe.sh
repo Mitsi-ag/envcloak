@@ -28,14 +28,28 @@ fail() {
 b='(^|[^A-Za-z0-9_])'
 e='([^A-Za-z0-9_]|$)'
 
+# Every file to check. In a git checkout: tracked files plus untracked ones
+# that are not ignored (so build output and local scratch copies are
+# skipped). Elsewhere, such as the test fixtures: every file outside
+# target/ and .git/.
+all_files() {
+  if [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ]; then
+    git ls-files --cached --others --exclude-standard | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\n' "$f"
+    done
+  else
+    find . \( -name target -o -name .git \) -prune -o -type f -print | sed 's|^\./||'
+  fi | LC_ALL=C sort -u
+}
+
 rust_files() {
-  find . \( -name target -o -name .git \) -prune -o -type f -name '*.rs' -print | sed 's|^\./||' | LC_ALL=C sort
+  all_files | grep -E '\.rs$' || true
 }
 
 # 1. Workspace lint table and per-crate inheritance.
 if ! awk '
   /^\[/ { in_rust = ($0 == "[workspace.lints.rust]") }
-  in_rust && /^[[:space:]]*unsafe_code[[:space:]]*=[[:space:]]*"(deny|forbid)"/ { found = 1 }
+  in_rust && /^[ \t]*unsafe_code[ \t]*=[ \t]*"(deny|forbid)"/ { found = 1 }
   END { exit found ? 0 : 1 }
 ' Cargo.toml; then
   fail "Cargo.toml: [workspace.lints.rust] must set unsafe_code = \"deny\""
@@ -45,7 +59,7 @@ for manifest in crates/*/Cargo.toml; do
   [ -e "$manifest" ] || continue
   if ! awk '
     /^\[/ { in_lints = ($0 == "[lints]") }
-    in_lints && /^[[:space:]]*workspace[[:space:]]*=[[:space:]]*true/ { found = 1 }
+    in_lints && /^[ \t]*workspace[ \t]*=[ \t]*true/ { found = 1 }
     END { exit found ? 0 : 1 }
   ' "$manifest"; then
     fail "$manifest: needs [lints] workspace = true, or the unsafe_code deny does not apply"
@@ -82,8 +96,7 @@ done
 
 while IFS= read -r extra; do
   fail "$extra: only the workspace root may hold clippy configuration"
-done < <(find . \( -name target -o -name .git \) -prune -o -type f \( -name clippy.toml -o -name .clippy.toml \) -print \
-  | sed 's|^\./||' | grep -vxF clippy.toml || true)
+done < <(all_files | grep -E '(^|/)\.?clippy\.toml$' | grep -vxF clippy.toml || true)
 
 allowlist=security/expose-allowlist.txt
 allowed=""

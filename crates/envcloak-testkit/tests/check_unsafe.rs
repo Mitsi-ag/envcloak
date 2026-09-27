@@ -226,3 +226,29 @@ fn weakened_clippy_configuration_fails() {
     );
     assert_fails(&t, "crates/envcloak-core/clippy.toml");
 }
+
+#[test]
+fn in_a_git_checkout_ignored_files_are_skipped_and_untracked_ones_checked() {
+    let t = clean_tree();
+    let r = t.home();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(&r)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    write(&r, ".gitignore", "scratch/\n");
+    let violation = format!("#![allow({})]\n", unsafe_lint());
+    write(&r, "scratch/copy/src/lib.rs", &violation);
+    assert_passes(&t);
+
+    // Not ignored and not yet added: still checked.
+    write(&r, "crates/envcloak-core/src/new.rs", &violation);
+    assert_fails(&t, "crates/envcloak-core/src/new.rs");
+}
