@@ -21,10 +21,10 @@
 //! into a temporary file next to `vault.db`, opens it at the version it
 //! was backed up at, and requires its digest to verify and its header to
 //! match the manifest. It then migrates an older format, as any unlock
-//! does, and verifies it again. It then wraps
-//! the VMK under the new passphrase (current default parameters), makes
-//! that the only passphrase envelope, records the kit as confirmed (it was
-//! just used), and closes the file. Only then does it touch the current
+//! does, verifies it again, wraps the VMK under the new passphrase
+//! (current default parameters), makes that the only passphrase envelope,
+//! records the kit as confirmed (it was just used), and closes the file.
+//! Only then does it touch the current
 //! vault: it closes it, keeps it as `vault/replaced-<UTC time>.db` (a hard
 //! link, so `vault.db` never goes missing), moves aside any side file
 //! beside `vault.db` (also one left without a database, which SQLite would
