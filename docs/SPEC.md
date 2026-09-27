@@ -17,6 +17,38 @@ EnvCloak is a local-first, open-source secrets vault for developers who work wit
 
 Existing tools solve slices: 1Password (GUI, `op run`, masking) is paid and not agent-native; Infisical and Doppler are cloud-first web dashboards without output masking; Varlock adds redaction but no store or GUI; Infisical Agent Vault proxies HTTP credentials but has no vault UI or spend view. Nobody combines a local vault, a native GUI, agent-native guardrails, a spend and expiry dashboard, and peer-to-peer device transfer in one open-source tool.
 
+## 2a. Scope: one control plane for everything agents use
+
+Secrets are the wedge, not the whole product. Every coding agent a developer runs (Claude Code, Codex, Cursor, Gemini CLI, OpenCode, Copilot, Kimi CLI, Qwen Code, and the next one) keeps its own copy of the same things in its own format: API keys, MCP servers, skills, instructions files, hooks, permission rules. A heavy user can have a thousand skills and two dozen MCP servers configured separately per agent, with literal keys inside those configs, and no way to carry the setup to a second machine.
+
+EnvCloak is built as modules on one core (vault, policy, audit, sync):
+
+| Module | What it does | Release |
+|---|---|---|
+| Keys | The vault, run and redact, proxy mode, leak doctor, Touch ID approvals | v0.1 |
+| Spend | Balance, spend, plan and expiry per key and account, alerts | v0.1 |
+| MCP servers | One list of MCP servers, installed into every agent's config in its native format (JSON, TOML, YAML), with secrets injected by EnvCloak instead of written into configs | v0.2 |
+| Skills and instructions | See every skill, instructions file, hook and rule across agents; enable per agent and per project; show the context cost of each; sync across devices; translate to agents that use a different format | v0.3 |
+
+Principles for the wider scope:
+
+- **Interoperate, don't fork standards.** Read and write the open Agent Skills format (`SKILL.md`), `AGENTS.md`, and each agent's native config. Work alongside existing installers such as the `skills` CLI rather than replacing them.
+- **Translation is compilation.** A canonical definition compiles into each agent's native format. Most of it is mechanical (skills, instructions, MCP config). Hooks and permission rules map partially; the translator reports anything that cannot map instead of guessing. Optional model-assisted rewriting uses the user's own key from the vault, with the cost shown.
+- **Configs never hold secrets.** Any MCP server, skill or hook that needs a key gets it through EnvCloak at run time.
+
+## 2b. Free and paid
+
+EnvCloak itself is free and open source forever, with everything a single developer needs locally, including device-to-device sync between their own machines.
+
+EnvCloak Cloud is an optional paid service on AWS for things a laptop cannot do. The client and protocols stay open; the hosted service is closed source. The service is zero-knowledge wherever possible.
+
+- **Always-on backup and sync**: end-to-end encrypted; devices no longer need to be online at the same time. The server stores ciphertext only.
+- **24/7 spend watch**: polls providers while the laptop is closed; alerts by email, Slack or push on low balance, spend spikes, expiring or leaked keys; enforces hard budget caps where a provider's API allows disabling a key.
+- **Secrets for cloud agents and CI**: cloud coding agents (Codex cloud, Claude Code on the web, background agents) and CI jobs get placeholders; a hosted credential proxy swaps in the real key only for allowed hosts. The proxy runs in AWS Nitro Enclaves with published attestation, so the operator cannot read keys.
+- **Teams**: share keys, MCP sets and skill packs; per-member policies; onboarding and offboarding with rotation prompts; central audit; SSO.
+
+Indicative pricing: Pro for individuals around US$5 a month; Team around US$12 per user per month. Final pricing follows the waitlist and early usage.
+
 ## 3. Principles
 
 1. **Local-first, no account.** The vault lives on your machine, encrypted. No EnvCloak cloud, no sign-up. Sync is device to device.
