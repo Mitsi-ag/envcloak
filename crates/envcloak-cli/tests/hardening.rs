@@ -10,9 +10,11 @@
 //! environment, so no core file can hold anything from the developer's
 //! shell. The positive core-dump control deliberately crashes a process, so
 //! it runs only where core files go to a known directory: set
-//! `ENVCLOAK_TEST_CORE_DIR` to a directory the kernel's core pattern writes
-//! `core.<pid>` files into (CI does this on Linux). Elsewhere the test says
-//! the control is unverified.
+//! `ENVCLOAK_TEST_CORE_DIR` to a directory the kernel writes `core.<pid>`
+//! files into (Linux `kernel.core_pattern`, macOS `kern.corefile`; CI does
+//! this on both). Elsewhere the test says the control is unverified. macOS
+//! writes a core only for a process signed with `get-task-allow`, so there
+//! the control and the CLI under test are copies signed with it.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Read};
@@ -99,20 +101,36 @@ fn hold(home: &TestHome, cwd: &Path, script: &str, arg0: &str, env: &[(&str, &st
     held(cmd.spawn().unwrap())
 }
 
-/// Waits for `child` to print the line `ready`. Earlier lines are kept as
-/// the report.
+/// Waits up to 30 seconds for `child` to print the line `ready`. Earlier
+/// lines are kept as the report. A child that is not ready in time is
+/// killed and the test fails, so a regression cannot hang the suite.
 fn held(mut child: Child) -> Held {
     let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut report = String::new();
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     loop {
-        match lines.next() {
-            Some(Ok(line)) if line == "ready" => break,
-            Some(Ok(line)) => {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) if line == "ready" => break,
+            Ok(line) => {
                 report.push_str(&line);
                 report.push('\n');
             }
-            _ => panic!("process exited before it was ready; output so far:\n{report}"),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("process was not ready ({e}); output so far:\n{report}");
+            }
         }
     }
     Held {
@@ -124,8 +142,19 @@ fn held(mut child: Child) -> Held {
 
 /// Holds the CLI, started by a shell that ran `prelude` first.
 fn hold_cli(home: &TestHome, cwd: &Path, prelude: &str, env: &[(&str, &str)]) -> Held {
+    hold_program(home, cwd, prelude, Path::new(cli()), env)
+}
+
+/// Holds `program` (the CLI or a signed copy of it) in its hold mode.
+fn hold_program(
+    home: &TestHome,
+    cwd: &Path,
+    prelude: &str,
+    program: &Path,
+    env: &[(&str, &str)],
+) -> Held {
     let script = format!("{prelude}exec \"$0\" internal hardening --hold");
-    hold(home, cwd, &script, cli(), env)
+    hold(home, cwd, &script, program.to_str().unwrap(), env)
 }
 
 /// The directory the kernel writes `core.<pid>` files into, when the
@@ -141,7 +170,66 @@ fn core_dump_dir() -> Option<PathBuf> {
             "ENVCLOAK_TEST_CORE_DIR is set, but kernel.core_pattern is {pattern:?}"
         );
     }
+    #[cfg(target_os = "macos")]
+    {
+        let sysctl = |name: &str| {
+            let out = Command::new("/usr/sbin/sysctl")
+                .args(["-n", name])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "sysctl {name}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        assert_eq!(
+            sysctl("kern.coredump"),
+            "1",
+            "ENVCLOAK_TEST_CORE_DIR is set, but kern.coredump is off"
+        );
+        let pattern = sysctl("kern.corefile");
+        assert_eq!(
+            Path::new(&pattern),
+            dir.join("core.%P"),
+            "ENVCLOAK_TEST_CORE_DIR is set, but kern.corefile is {pattern:?}"
+        );
+    }
     Some(dir)
+}
+
+/// Set in the environment of the positive core-dump control.
+const CONTROL_ENV: &str = "ENVCLOAK_TEST_ABORT_CONTROL";
+
+/// Runs only as the positive core-dump control started by
+/// `forced_abort_leaves_no_core_file`: says it is ready, then waits for
+/// the signal (or for stdin to close).
+#[test]
+fn abort_control_child() {
+    if std::env::var_os(CONTROL_ENV).is_none() {
+        return;
+    }
+    // libtest has printed "test abort_control_child ... " without a line
+    // break.
+    println!("\nready");
+    let mut rest = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut rest);
+}
+
+/// The control program (this test binary) and the CLI to crash. On macOS
+/// both are copies in `dir` signed ad hoc with `get-task-allow`, without
+/// which the kernel never writes a core, so a missing core would prove
+/// nothing. Elsewhere they are the built binaries.
+fn crash_subjects(dir: &Path) -> (PathBuf, PathBuf) {
+    let this = std::env::current_exe().unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let control = signed_copy(&this, dir, "control", false, true);
+        let program = signed_copy(Path::new(cli()), dir, "envcloak", false, true);
+        (control, program)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+        (this, PathBuf::from(cli()))
+    }
 }
 
 /// Core files a crash of `pid` could have left: `core` or `core.*` in
@@ -207,21 +295,31 @@ fn unknown_arguments_are_never_echoed() {
 fn forced_abort_leaves_no_core_file() {
     let home = TestHome::new();
     let dumps = core_dump_dir();
-    if cfg!(target_os = "linux") && std::env::var_os("GITHUB_ACTIONS").is_some() {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
         assert!(
             dumps.is_some(),
             "CI must run the positive core-dump control"
         );
     }
+    let tmp = home.root().join("tmp");
+    let (control_program, program) = crash_subjects(&tmp);
 
     match &dumps {
-        // Positive control: an ordinary process with the same raised limit
-        // and the same cleared environment dumps core into the known
-        // directory. Without it, "no core file" could mean only that this
-        // machine never writes any.
+        // Positive control: an ordinary process, signed like the CLI below
+        // and started with the same raised limit and cleared environment,
+        // dumps core into the known directory. Without it, "no core file"
+        // could mean only that this machine never writes any.
         Some(dir) => {
-            let script = format!("{RAISE_CORE_LIMIT}echo ready; exec sleep 60");
-            let control = hold(&home, &home.root().join("tmp"), &script, "sh", &[]);
+            let script = format!(
+                "{RAISE_CORE_LIMIT}exec \"$0\" --exact abort_control_child --nocapture --test-threads=1"
+            );
+            let control = hold(
+                &home,
+                &tmp,
+                &script,
+                control_program.to_str().unwrap(),
+                &[(CONTROL_ENV, "1")],
+            );
             let pid = control.pid();
             control.signal("-ABRT");
             let status = control.wait();
@@ -242,7 +340,7 @@ fn forced_abort_leaves_no_core_file() {
 
     // The CLI lowers the limit its parent shell raised, and does not dump.
     let cwd = home.home();
-    let held = hold_cli(&home, &cwd, RAISE_CORE_LIMIT, &[]);
+    let held = hold_program(&home, &cwd, RAISE_CORE_LIMIT, &program, &[]);
     assert!(held.report.contains("rlimit_core=0/0\n"), "{}", held.report);
     let pid = held.pid();
     held.signal("-ABRT");
@@ -474,29 +572,73 @@ fn libc_eperm() -> i32 {
     1
 }
 
+/// Entitlements that let a debugger attach to the process (and, on macOS,
+/// let it dump core).
+#[cfg(target_os = "macos")]
+const GET_TASK_ALLOW: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>\n";
+
+/// Copies `program` to `dir/name` and signs the copy ad hoc, with the
+/// hardened runtime if `runtime`, and with `get-task-allow` if
+/// `debuggable`. Checks with `codesign --display` that the signature says
+/// exactly that, and returns the copy.
+#[cfg(target_os = "macos")]
+fn signed_copy(program: &Path, dir: &Path, name: &str, runtime: bool, debuggable: bool) -> PathBuf {
+    let copy = dir.join(name);
+    std::fs::copy(program, &copy).unwrap();
+    let mut cmd = Command::new("codesign");
+    cmd.args(["--force", "--sign", "-"]);
+    if runtime {
+        cmd.args(["--options", "runtime"]);
+    }
+    if debuggable {
+        let plist = dir.join(format!("{name}.entitlements"));
+        std::fs::write(&plist, GET_TASK_ALLOW).unwrap();
+        cmd.arg("--entitlements").arg(plist);
+    }
+    let signed = cmd.arg(&copy).output().unwrap();
+    assert!(signed.status.success(), "codesign failed: {signed:?}");
+    let shown = Command::new("codesign")
+        .args(["--display", "--verbose=2", "--entitlements", "-"])
+        .arg(&copy)
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&shown.stdout),
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let runtime_flag = text
+        .lines()
+        .filter(|l| l.starts_with("CodeDirectory "))
+        .any(|l| {
+            l.split_whitespace()
+                .find_map(|w| w.strip_prefix("flags="))
+                .is_some_and(|f| f.contains("runtime"))
+        });
+    assert_eq!(runtime_flag, runtime, "{text}");
+    assert_eq!(
+        text.contains("com.apple.security.get-task-allow"),
+        debuggable,
+        "{text}"
+    );
+    copy
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_signed_copy_reports_the_hardened_runtime_without_get_task_allow() {
     let home = TestHome::new();
-    let copy = home.root().join("tmp").join("envcloak");
-    std::fs::copy(cli(), &copy).unwrap();
-    let signed = Command::new("codesign")
-        .args(["--force", "--sign", "-", "--options", "runtime"])
-        .arg(&copy)
-        .status()
-        .unwrap();
-    assert!(signed.success(), "codesign failed");
+    let tmp = home.root().join("tmp");
+    let copy = signed_copy(Path::new(cli()), &tmp, "envcloak", true, false);
     let report = report_of(&copy, &home);
     assert!(report.contains("hardened_runtime=true\n"), "{report}");
-    let ents = Command::new("codesign")
-        .args(["-d", "--entitlements", "-"])
-        .arg(&copy)
-        .output()
-        .unwrap();
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&ents.stdout),
-        String::from_utf8_lossy(&ents.stderr)
-    );
-    assert!(!text.contains("get-task-allow"), "{text}");
+
+    // Negative control: the same runtime signature with get-task-allow, which
+    // lets a debugger attach, is not reported as protected.
+    let copy = signed_copy(Path::new(cli()), &tmp, "envcloak-debuggable", true, true);
+    let report = report_of(&copy, &home);
+    assert!(report.contains("hardened_runtime=false\n"), "{report}");
 }
