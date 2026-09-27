@@ -16,11 +16,15 @@
 //! ```
 //!
 //! Every block the probe hands out is zero-initialized, including the grown
-//! region of a reallocation, so inspecting a whole block before it is freed
-//! never reads memory that was never written (the F-10 lesson). One caveat
-//! stays: a typed write of a struct with padding makes those padding bytes
-//! formally uninitialized again. The probe reads them as bytes anyway; it is
-//! a test instrument and is not run under Miri.
+//! region of a reallocation (the F-10 lesson). That alone does not make a
+//! freed block safe to read from Rust: a typed write of a struct with
+//! padding leaves the padding bytes uninitialized again, and loading them as
+//! `u8` is undefined behavior (F-16). So Rust code here never loads a byte of
+//! a block before it is wiped. The needle search runs in C, through libc's
+//! `memmem` and `memcmp`, where reading indeterminate `unsigned char` values
+//! is defined; Rust only sees the pointer or comparison result. After the
+//! wipe every byte has been written with a zero, and Rust reads the block
+//! directly to check that.
 //!
 //! Outside [`ProbeMode::Unwiped`], every call goes through the very
 //! `GlobalAlloc` impl the binaries install, [`crate::WipingAllocator`],
@@ -32,7 +36,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::WipingAllocator;
@@ -80,10 +84,11 @@ static MODE_UNWIPED: AtomicBool = AtomicBool::new(false);
 static NEEDLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WINDOW: AtomicUsize = AtomicUsize::new(0);
 static NEEDLE_LENS: [AtomicUsize; MAX_NEEDLES] = [const { AtomicUsize::new(0) }; MAX_NEEDLES];
+/// Needle `k` starts at `k * MAX_NEEDLE_LEN`. Written only while the probe is
+/// disarmed and no inspection is in flight, and read by C code (`memmem`,
+/// `memcmp`) only while it is armed, so the accesses never race.
 static NEEDLE_BYTES: [AtomicU8; MAX_NEEDLES * MAX_NEEDLE_LEN] =
     [const { AtomicU8::new(0) }; MAX_NEEDLES * MAX_NEEDLE_LEN];
-/// One bit per byte pair that starts a needle window: a cheap prefilter.
-static PAIRS: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
 
 static FREED: AtomicUsize = AtomicUsize::new(0);
 static HELD: AtomicUsize = AtomicUsize::new(0);
@@ -121,20 +126,12 @@ impl ProbeSession {
         let serial = SESSION.lock().unwrap_or_else(PoisonError::into_inner);
         disarm();
 
-        for p in &PAIRS {
-            p.store(0, Ordering::Relaxed);
-        }
         for (k, n) in needles.iter().enumerate() {
             let base = k * MAX_NEEDLE_LEN;
             for (i, b) in n.iter().enumerate() {
                 NEEDLE_BYTES[base + i].store(*b, Ordering::Relaxed);
             }
             NEEDLE_LENS[k].store(n.len(), Ordering::Relaxed);
-            let win = window.min(n.len());
-            for j in 0..=n.len() - win {
-                let pair = usize::from(n[j]) << 8 | usize::from(n[j + 1]);
-                PAIRS[pair >> 6].fetch_or(1 << (pair & 63), Ordering::Relaxed);
-            }
         }
         NEEDLE_COUNT.store(needles.len(), Ordering::Relaxed);
         WINDOW.store(window, Ordering::Relaxed);
@@ -180,46 +177,101 @@ fn disarm() {
 
 /// Whether the block holds a window of any needle.
 ///
+/// Rust never loads a byte of the block: it may hold uninitialized padding
+/// (see the module documentation). libc's `memmem` finds anchors, and
+/// `memcmp` confirms whole windows around each anchor hit. For a window of
+/// `w` bytes, anchors of `a = ceil(w / 2)` bytes every `w - a + 1` bytes of
+/// the needle guarantee that every window of the needle contains one whole
+/// anchor.
+///
 /// # Safety
-/// `ptr` is valid for reads of `size` bytes, all of them written at least
-/// once (every probe block starts zeroed).
+/// `ptr` is valid for reads of `size` bytes.
 unsafe fn holds_needle(ptr: *const u8, size: usize) -> bool {
-    if size < 2 {
-        return false;
-    }
-    // SAFETY: guaranteed by the caller.
-    let block = unsafe { std::slice::from_raw_parts(ptr, size) };
     let count = NEEDLE_COUNT.load(Ordering::Relaxed);
     let window = WINDOW.load(Ordering::Relaxed);
-    for i in 0..size - 1 {
-        let pair = usize::from(block[i]) << 8 | usize::from(block[i + 1]);
-        if PAIRS[pair >> 6].load(Ordering::Relaxed) & (1 << (pair & 63)) == 0 {
+    // AtomicU8 has the same in-memory representation as u8.
+    let table = NEEDLE_BYTES.as_ptr().cast::<u8>();
+    for (k, slot) in NEEDLE_LENS.iter().enumerate().take(count) {
+        let len = slot.load(Ordering::Relaxed);
+        let win = window.min(len);
+        if win == 0 || size < win {
             continue;
         }
-        for (k, slot) in NEEDLE_LENS.iter().enumerate().take(count) {
-            let len = slot.load(Ordering::Relaxed);
-            let win = window.min(len);
-            if i + win > size {
-                continue;
-            }
-            let base = k * MAX_NEEDLE_LEN;
-            'start: for j in 0..=len - win {
-                for t in 0..win {
-                    if NEEDLE_BYTES[base + j + t].load(Ordering::Relaxed) != block[i + t] {
-                        continue 'start;
-                    }
-                }
+        // SAFETY: needle `k` occupies `len <= MAX_NEEDLE_LEN` bytes of the
+        // table from this offset.
+        let needle = unsafe { table.add(k * MAX_NEEDLE_LEN) };
+        let anchor = win.div_ceil(2);
+        let stride = win - anchor + 1;
+        let mut a = 0;
+        while a + anchor <= len {
+            // SAFETY: `a + anchor <= len`, so the anchor lies in the needle;
+            // the caller guarantees the block.
+            if unsafe { window_at_anchor(ptr, size, needle, len, win, a, anchor) } {
                 return true;
             }
+            a += stride;
         }
     }
     false
 }
 
+/// Whether the block holds a `win`-byte window of the needle (`len` bytes at
+/// `needle`) that contains the needle's anchor `needle[a..a + anchor]`.
+///
 /// # Safety
-/// `ptr` is valid for reads of `size` bytes.
+/// `ptr` is valid for reads of `size` bytes and `needle` for `len` bytes,
+/// with `a + anchor <= len`, `anchor >= 1` and `win <= len`.
+unsafe fn window_at_anchor(
+    ptr: *const u8,
+    size: usize,
+    needle: *const u8,
+    len: usize,
+    win: usize,
+    a: usize,
+    anchor: usize,
+) -> bool {
+    // Needle windows `[i, i + win)` that contain the anchor.
+    let first = (a + anchor).saturating_sub(win);
+    let last = a.min(len - win);
+    let mut from = 0;
+    while from + anchor <= size {
+        // SAFETY: the haystack is the block's last `size - from` bytes and
+        // the anchor lies inside the needle; memmem only reads them.
+        let hit = unsafe {
+            libc::memmem(
+                ptr.add(from).cast(),
+                size - from,
+                needle.add(a).cast(),
+                anchor,
+            )
+        };
+        if hit.is_null() {
+            return false;
+        }
+        let h = hit.cast::<u8>().addr() - ptr.addr();
+        for i in first..=last {
+            // The window starts `a - i` bytes before the anchor hit.
+            let Some(start) = h.checked_sub(a - i) else {
+                continue;
+            };
+            if start + win > size {
+                continue;
+            }
+            // SAFETY: both ranges are in bounds, as checked above.
+            if unsafe { libc::memcmp(ptr.add(start).cast(), needle.add(i).cast(), win) } == 0 {
+                return true;
+            }
+        }
+        from = h + 1;
+    }
+    false
+}
+
+/// # Safety
+/// `ptr` is valid for reads of `size` bytes, all of them written (the block
+/// was just wiped), so Rust may load them.
 unsafe fn all_zero(ptr: *const u8, size: usize) -> bool {
-    // SAFETY: guaranteed by the caller; the block was just wiped.
+    // SAFETY: guaranteed by the caller.
     unsafe { std::slice::from_raw_parts(ptr, size) }
         .iter()
         .all(|b| *b == 0)

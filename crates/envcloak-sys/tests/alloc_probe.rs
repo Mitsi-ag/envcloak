@@ -111,6 +111,75 @@ fn window_matches_partial_copies_only_at_full_width() {
 }
 
 #[test]
+fn a_window_is_found_at_every_block_offset_and_needle_offset() {
+    const BLOCK: usize = 40;
+    let n = needle(8);
+    let released = |f: &dyn Fn(&mut [u8])| {
+        probe(&n, ProbeMode::Unwiped, || {
+            let mut block = vec![0u8; BLOCK];
+            f(&mut block);
+            drop(std::hint::black_box(block));
+        })
+        .released_with_needle
+    };
+    for start in 0..=n.len() - WINDOW {
+        let piece = &n[start..start + WINDOW];
+        for at in 0..=BLOCK - WINDOW {
+            let put = |b: &mut [u8]| b[at..at + WINDOW].copy_from_slice(piece);
+            assert_eq!(released(&put), 1, "needle[{start}..] at {at}");
+            // One changed byte anywhere in the window: no match. Needle
+            // bytes are uppercase letters; the flip makes one lowercase.
+            for flip in 0..WINDOW {
+                let near = |b: &mut [u8]| {
+                    put(b);
+                    b[at + flip] ^= 0x20;
+                };
+                assert_eq!(released(&near), 0, "needle[{start}..] at {at}, flip {flip}");
+            }
+        }
+        // A window cut short by either end of the block: no match.
+        let head = |b: &mut [u8]| b[..WINDOW - 1].copy_from_slice(&piece[1..]);
+        let tail = |b: &mut [u8]| b[BLOCK - (WINDOW - 1)..].copy_from_slice(&piece[..WINDOW - 1]);
+        assert_eq!(released(&head), 0, "needle[{start}..] cut at the start");
+        assert_eq!(released(&tail), 0, "needle[{start}..] cut at the end");
+    }
+}
+
+#[test]
+fn blocks_with_uninitialized_padding_are_inspected() {
+    // Typed writes leave the padding bytes of these structs uninitialized.
+    // The probe must inspect such blocks without loading those bytes in
+    // Rust (F-16); its needle search runs in libc instead.
+    #[repr(C)]
+    struct Padded {
+        tag: u8,
+        value: u64,
+        tail: u16,
+    }
+    let n = needle(9);
+    for mode in [ProbeMode::Wiping, ProbeMode::Unwiped] {
+        let report = probe(&n, mode, || {
+            let v: Vec<Padded> = (0..64u8)
+                .map(|i| Padded {
+                    tag: i,
+                    value: u64::from(i),
+                    tail: 7,
+                })
+                .collect();
+            drop(std::hint::black_box(v));
+            drop(std::hint::black_box(Box::new(Padded {
+                tag: 1,
+                value: 2,
+                tail: 3,
+            })));
+        });
+        assert!(report.freed >= 2, "{mode:?}: {report:?}");
+        assert_eq!(report.released_with_needle, 0, "{mode:?}: {report:?}");
+        assert_eq!(report.not_zeroed, 0, "{mode:?}: {report:?}");
+    }
+}
+
+#[test]
 fn every_block_and_every_grown_region_starts_zeroed() {
     // The F-10 lesson: the probe may only inspect initialized memory.
     let layout = Layout::from_size_align(64, 8).unwrap();
