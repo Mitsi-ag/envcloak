@@ -12,6 +12,7 @@
 use hkdf::Hkdf;
 use secrecy::{ExposeSecret, SecretBox};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use super::fill_random_or_panic;
@@ -82,6 +83,14 @@ impl Vmk {
         Vmk(SecretBox::init_with_mut(|k: &mut [u8; 32]| {
             fill_random_or_panic(k)
         }))
+    }
+
+    /// Whether two VMKs are the same key, compared in constant time: a
+    /// Recovery Kit is confirmed only when its envelope holds this vault's
+    /// VMK.
+    #[allow(clippy::disallowed_methods)] // Compares two keys without revealing either.
+    pub(crate) fn ct_eq(&self, other: &Vmk) -> bool {
+        bool::from(self.0.expose_secret().ct_eq(other.0.expose_secret()))
     }
 }
 

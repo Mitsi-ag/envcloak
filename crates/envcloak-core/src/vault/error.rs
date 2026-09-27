@@ -67,6 +67,10 @@ pub enum VaultErrorKind {
     LastUnlocker,
     /// A new passphrase breaks the passphrase rules.
     Passphrase(PassphraseRejected),
+    /// The vault has no passphrase unlocker.
+    NoPassphrase,
+    /// The vault has no Recovery Kit unlocker.
+    NoRecoveryKit,
     /// An authenticated record failed to decode: a bug, not an attack.
     Corrupt,
 }
@@ -116,6 +120,8 @@ impl VaultErrorKind {
             VaultErrorKind::UnknownUnlocker => "no such unlocker",
             VaultErrorKind::LastUnlocker => "the vault's last unlocker cannot be removed",
             VaultErrorKind::Passphrase(r) => r.message(),
+            VaultErrorKind::NoPassphrase => "the vault has no passphrase unlocker",
+            VaultErrorKind::NoRecoveryKit => "the vault has no Recovery Kit unlocker",
             VaultErrorKind::Corrupt => "a sealed vault record could not be decoded",
         }
     }
@@ -211,6 +217,7 @@ mod tests {
             VaultErrorKind::Tampered,
             VaultErrorKind::Corrupt,
             VaultErrorKind::Passphrase(PassphraseRejected::Common),
+            VaultErrorKind::NoRecoveryKit,
         ] {
             let e = VaultError::from(k);
             assert_eq!(e.to_string(), k.message());

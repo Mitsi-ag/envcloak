@@ -148,6 +148,15 @@ A read-only vault refuses every write and still serves the items and values that
 
 Without an anchor (Linux, and macOS before M3), restoring the whole file together with its header is not detected locally (SPEC §5). `tests/vault_integrity.rs` pins this limit.
 
+## Unlockers
+
+The code is in `crates/envcloak-core/src/unlock.rs`; the envelope, passphrase and Recovery Kit formats are in CRYPTO.md.
+- `create_vault` checks the passphrase against the rules, then generates the vault id, the VMK and the Recovery Kit, wraps the VMK under the passphrase (kind 1) and the kit (kind 2) with the chosen Argon2id parameters and a salt each, and creates the vault with both envelopes. It returns the kit for the caller to show once; the vault never stores it. `recovery_confirmed` starts false.
+- `unlock_with_passphrase` and `unlock_with_kit` try each envelope of that kind from `LockedVault::unlockers` with the vault id and epoch the file names, then unlock with the VMK the first one gives. A wrong secret and a damaged envelope give the one generic error; a vault without an envelope of that kind says so. The locked vault comes back with the error, for another try.
+- `change_passphrase` checks the new passphrase, wraps the VMK under it with the current default parameters and a fresh salt, and in one transaction replaces the passphrase envelope under the same unlocker id (and removes any other passphrase envelope). The kit envelope is unchanged. The caller has already checked a proof.
+- `confirm_recovery_kit` unwraps a kit envelope with the kit and requires the result to equal the vault's VMK (compared in constant time); it then sets `recovery_confirmed` in the sealed header. SPEC §6.4 deletes imported plaintext only after that.
+- A vault that failed its integrity check, or could not be migrated, refuses a passphrase change and a kit confirmation before any key derivation.
+
 ## Writes
 
 - A write transaction is one `BEGIN IMMEDIATE` SQLite transaction. Values are sealed before they are bound to a statement; only sealed bytes, keyed hashes, ids, row versions, kinds and timestamps are bound.
@@ -184,3 +193,4 @@ Any failure, or a crash, rolls all of it back: the vault stays at its old versio
 | 6: integrity digest | `tests/vault_integrity.rs` |
 | 7: migration failure | `tests/vault_migrate.rs` |
 | 11, storage part: no fixture in freed memory | `tests/vault_probe.rs` |
+| 3, unlocker part: one generic error for a wrong passphrase, a wrong kit or a damaged envelope; a passphrase change re-wraps with the current defaults | `tests/unlock.rs` |

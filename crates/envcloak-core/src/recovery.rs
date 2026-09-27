@@ -106,6 +106,11 @@ impl RecoveryKit {
         }
         Ok(RecoveryKit(SecretBytes::from_vec(bytes)))
     }
+
+    /// The 16 raw bytes, the secret the kit's envelope is wrapped under.
+    pub(crate) fn secret(&self) -> &SecretBytes {
+        &self.0
+    }
 }
 
 impl core::fmt::Debug for RecoveryKit {

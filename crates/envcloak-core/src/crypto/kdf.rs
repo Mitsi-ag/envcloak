@@ -63,6 +63,15 @@ impl KdfParams {
         Self::fresh(Self::MIN_M_KIB, Self::MIN_T, Self::MIN_P)
     }
 
+    /// The same parameters with a fresh random salt: each envelope draws
+    /// its own.
+    ///
+    /// # Panics
+    /// When the OS random number generator fails.
+    pub fn with_fresh_salt(&self) -> Self {
+        Self::fresh(self.m_kib, self.t, self.p)
+    }
+
     fn fresh(m_kib: u32, t: u32, p: u32) -> Self {
         let mut salt = [0u8; 16];
         fill_random_or_panic(&mut salt);

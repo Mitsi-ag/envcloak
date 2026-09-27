@@ -11,9 +11,9 @@ authors.workspace = true
 workspace = true
 
 [features]
-# Test support only (`envcloak_core::testing`): exporting and importing a
-# VMK, and opening a vault with a migration plan other than the shipped one.
-# Release binaries never enable it.
+# Test support only: exporting and importing a VMK, opening a vault with a
+# migration plan other than the shipped one, and wrapping a new passphrase
+# at other Argon2id parameters. Release binaries never enable it.
 testing = []
 
 [dependencies]
