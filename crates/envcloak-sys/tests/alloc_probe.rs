@@ -5,7 +5,9 @@
 
 use std::alloc::{Layout, alloc, dealloc, realloc};
 
-use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeReport, ProbeSession};
+use envcloak_sys::testing::{
+    INSPECT_CHUNK, ProbeAllocator, ProbeMode, ProbeReport, ProbeSession, read_own_memory,
+};
 use zeroize::Zeroizing;
 
 #[global_allocator]
@@ -148,8 +150,8 @@ fn a_window_is_found_at_every_block_offset_and_needle_offset() {
 #[test]
 fn blocks_with_uninitialized_padding_are_inspected() {
     // Typed writes leave the padding bytes of these structs uninitialized.
-    // The probe must inspect such blocks without loading those bytes in
-    // Rust (F-16); its needle search runs in libc instead.
+    // The probe must inspect such blocks without loading those bytes in Rust
+    // or C (F-16): it searches a copy the kernel makes.
     #[repr(C)]
     struct Padded {
         tag: u8,
@@ -226,4 +228,61 @@ fn disarmed_probe_counts_nothing() {
     let report = session.finish();
     drop(std::hint::black_box(n.clone()));
     assert_eq!(report.released_with_needle, 0);
+}
+
+#[test]
+fn windows_across_inspection_chunks_are_found() {
+    // The probe copies a block out in chunks of INSPECT_CHUNK bytes, each
+    // starting WINDOW - 1 bytes before the previous one ended, so a window
+    // that straddles a chunk boundary lies whole in the next chunk.
+    const BLOCK: usize = 3 * INSPECT_CHUNK + 77;
+    let n = needle(10);
+    let piece = &n[5..5 + WINDOW];
+    let released = |at: usize, flip: Option<usize>| {
+        probe(&n, ProbeMode::Unwiped, || {
+            let mut block = vec![0u8; BLOCK];
+            block[at..at + WINDOW].copy_from_slice(piece);
+            if let Some(f) = flip {
+                block[at + f] ^= 0x20;
+            }
+            drop(std::hint::black_box(block));
+        })
+        .released_with_needle
+    };
+    let step = INSPECT_CHUNK - (WINDOW - 1);
+    let mut edges = vec![BLOCK - WINDOW];
+    for k in 1..=3 {
+        // Where chunk k starts, and where chunk k - 1 ends.
+        edges.push(k * step);
+        edges.push((k - 1) * step + INSPECT_CHUNK);
+    }
+    for edge in edges {
+        for at in edge.saturating_sub(WINDOW + 1)..=(edge + 1).min(BLOCK - WINDOW) {
+            assert_eq!(released(at, None), 1, "window at {at}");
+            assert_eq!(released(at, Some(WINDOW / 2)), 0, "flipped window at {at}");
+        }
+    }
+}
+
+#[test]
+fn the_kernel_copy_reads_padding_and_reports_unmapped_memory() {
+    #[repr(C)]
+    struct Padded {
+        tag: u8,
+        value: u64,
+    }
+    let p = Padded { tag: 7, value: 9 };
+    let mut out = [0xEEu8; std::mem::size_of::<Padded>()];
+    read_own_memory(std::ptr::from_ref(&p).cast(), &mut out).unwrap();
+    assert_eq!(out[0], 7);
+    assert_eq!(&out[8..], &9u64.to_ne_bytes());
+
+    // Across a chunk-sized buffer, byte for byte.
+    let src: Vec<u8> = (0..INSPECT_CHUNK + 5).map(|i| (i % 251) as u8).collect();
+    let mut copy = vec![0u8; src.len()];
+    read_own_memory(src.as_ptr(), &mut copy).unwrap();
+    assert_eq!(copy, src);
+
+    // The kernel checks the source range; this process never touches it.
+    assert!(read_own_memory(std::ptr::null(), &mut out).is_err());
 }

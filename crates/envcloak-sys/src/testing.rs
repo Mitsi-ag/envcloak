@@ -17,14 +17,20 @@
 //!
 //! Every block the probe hands out is zero-initialized, including the grown
 //! region of a reallocation (the F-10 lesson). That alone does not make a
-//! freed block safe to read from Rust: a typed write of a struct with
-//! padding leaves the padding bytes uninitialized again, and loading them as
-//! `u8` is undefined behavior (F-16). So Rust code here never loads a byte of
-//! a block before it is wiped. The needle search runs in C, through libc's
-//! `memmem` and `memcmp`, where reading indeterminate `unsigned char` values
-//! is defined; Rust only sees the pointer or comparison result. After the
-//! wipe every byte has been written with a zero, and Rust reads the block
-//! directly to check that.
+//! freed block safe to read: a typed write of a struct with padding leaves
+//! the padding bytes uninitialized again, and loading them is undefined
+//! behavior, in Rust and equally in a C library call such as `memcmp`
+//! (F-16). So neither Rust nor C code here reads a block before it is
+//! wiped. The probe asks the kernel to copy the block into an initialized
+//! buffer ([`read_own_memory`]: `process_vm_readv` on Linux,
+//! `mach_vm_read_overwrite` on macOS). The kernel copies bytes, not typed
+//! values, outside both languages' abstract machines, and what it writes
+//! into the buffer is initialized, as with `read(2)`. The needle search
+//! runs on that copy, in chunks of [`INSPECT_CHUNK`] bytes that overlap by
+//! one byte less than the window, so no window is split. After the wipe
+//! every byte has been written with a zero, and Rust reads the block
+//! directly to check that. A block the kernel refuses to copy makes
+//! [`ProbeSession::finish`] panic rather than pass unseen.
 //!
 //! Outside [`ProbeMode::Unwiped`], every call goes through the very
 //! `GlobalAlloc` impl the binaries install, [`crate::WipingAllocator`],
@@ -46,6 +52,9 @@ use crate::alloc::Backing;
 pub const MAX_NEEDLES: usize = 32;
 /// Maximum length of one needle.
 pub const MAX_NEEDLE_LEN: usize = 512;
+/// How many bytes of a freed block the probe copies out and searches at a
+/// time. Consecutive chunks overlap by `window - 1` bytes.
+pub const INSPECT_CHUNK: usize = 4096;
 
 /// How the probe treats freed blocks while a session is armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +103,8 @@ static FREED: AtomicUsize = AtomicUsize::new(0);
 static HELD: AtomicUsize = AtomicUsize::new(0);
 static NOT_ZEROED: AtomicUsize = AtomicUsize::new(0);
 static RELEASED: AtomicUsize = AtomicUsize::new(0);
+/// Blocks the kernel would not copy out, so the probe could not inspect.
+static UNREADABLE: AtomicUsize = AtomicUsize::new(0);
 
 /// Sessions share the counters, so they run one at a time.
 static SESSION: Mutex<()> = Mutex::new(());
@@ -136,7 +147,7 @@ impl ProbeSession {
         NEEDLE_COUNT.store(needles.len(), Ordering::Relaxed);
         WINDOW.store(window, Ordering::Relaxed);
         MODE_UNWIPED.store(mode == ProbeMode::Unwiped, Ordering::Relaxed);
-        for c in [&FREED, &HELD, &NOT_ZEROED, &RELEASED] {
+        for c in [&FREED, &HELD, &NOT_ZEROED, &RELEASED, &UNREADABLE] {
             c.store(0, Ordering::Relaxed);
         }
         ARMED.store(true, Ordering::SeqCst);
@@ -144,8 +155,17 @@ impl ProbeSession {
     }
 
     /// Disarms the probe and returns what it saw.
+    ///
+    /// # Panics
+    /// When the kernel refused to copy out a freed block, so the probe could
+    /// not inspect it (never seen in practice; see [`read_own_memory`]).
     pub fn finish(self) -> ProbeReport {
         disarm();
+        let unreadable = UNREADABLE.load(Ordering::SeqCst);
+        assert!(
+            unreadable == 0,
+            "the probe could not copy {unreadable} freed block(s) out through the kernel, so it cannot vouch for them"
+        );
         ProbeReport {
             freed: FREED.load(Ordering::SeqCst),
             held_needle: HELD.load(Ordering::SeqCst),
@@ -175,18 +195,147 @@ fn disarm() {
     }
 }
 
+/// Copies `dst.len()` bytes of this process's memory at `addr` into `dst`
+/// through the kernel: `process_vm_readv` on this process on Linux,
+/// `mach_vm_read_overwrite` on this task on macOS. The kernel copies raw
+/// bytes, so the source may hold uninitialized bytes (struct padding), and
+/// `dst` comes back initialized. Nothing in this process dereferences
+/// `addr`: an unmapped range is an error (EFAULT, KERN_INVALID_ADDRESS),
+/// not a fault. A range another thread writes during the call may be
+/// copied torn. Neither allocates nor panics, so the probe calls it from
+/// inside the allocator.
+///
+/// # Errors
+/// When the kernel refuses or copies fewer bytes.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn read_own_memory(addr: *const u8, dst: &mut [u8]) -> io::Result<()> {
+    // SAFETY: getpid has no preconditions.
+    let pid = unsafe { libc::getpid() };
+    let mut done = 0usize;
+    while done < dst.len() {
+        let rest = dst.len() - done;
+        let local = libc::iovec {
+            iov_base: dst.as_mut_ptr().wrapping_add(done).cast(),
+            iov_len: rest,
+        };
+        let remote = libc::iovec {
+            iov_base: addr.wrapping_add(done).cast_mut().cast(),
+            iov_len: rest,
+        };
+        // SAFETY: `local` describes the last `rest` bytes of `dst`, which
+        // are writable. The kernel reads the remote range itself and
+        // reports an unmapped one as EFAULT; this process never
+        // dereferences it.
+        let n = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        done += n.unsigned_abs();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// `<mach/mach_vm.h>`: copies `size` bytes at `address` in
+    /// `target_task` to `data` in this task.
+    fn mach_vm_read_overwrite(
+        target_task: libc::vm_map_t,
+        address: libc::mach_vm_address_t,
+        size: libc::mach_vm_size_t,
+        data: libc::mach_vm_address_t,
+        outsize: *mut libc::mach_vm_size_t,
+    ) -> libc::kern_return_t;
+
+    /// `<mach/mach_init.h>`: this task's port, what `mach_task_self()`
+    /// returns.
+    static mach_task_self_: libc::mach_port_t;
+}
+
+/// Copies `dst.len()` bytes of this process's memory at `addr` into `dst`
+/// through the kernel. See the Linux version.
+///
+/// # Errors
+/// When the kernel refuses or copies fewer bytes.
+#[cfg(target_os = "macos")]
+pub fn read_own_memory(addr: *const u8, dst: &mut [u8]) -> io::Result<()> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    let len = dst.len() as libc::mach_vm_size_t;
+    let mut copied: libc::mach_vm_size_t = 0;
+    // SAFETY: `mach_task_self_` is a port name set before main and never
+    // written again. The destination is `dst`, writable for `len` bytes;
+    // the kernel reads the source range itself and reports an unmapped one
+    // as an error.
+    let kr = unsafe {
+        mach_vm_read_overwrite(
+            mach_task_self_,
+            addr.addr() as libc::mach_vm_address_t,
+            len,
+            dst.as_mut_ptr().addr() as libc::mach_vm_address_t,
+            &mut copied,
+        )
+    };
+    if kr != libc::KERN_SUCCESS {
+        return Err(io::ErrorKind::Other.into());
+    }
+    if copied != len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
+}
+
 /// Whether the block holds a window of any needle.
 ///
-/// Rust never loads a byte of the block: it may hold uninitialized padding
-/// (see the module documentation). libc's `memmem` finds anchors, and
-/// `memcmp` confirms whole windows around each anchor hit. For a window of
-/// `w` bytes, anchors of `a = ceil(w / 2)` bytes every `w - a + 1` bytes of
-/// the needle guarantee that every window of the needle contains one whole
-/// anchor.
+/// Neither Rust nor C reads the block itself: it may hold uninitialized
+/// padding (see the module documentation). Each chunk is first copied out
+/// by the kernel, and the search runs on the copy. A block the kernel does
+/// not copy counts as unreadable, which fails the session.
 ///
 /// # Safety
 /// `ptr` is valid for reads of `size` bytes.
 unsafe fn holds_needle(ptr: *const u8, size: usize) -> bool {
+    let overlap = WINDOW
+        .load(Ordering::Relaxed)
+        .min(MAX_NEEDLE_LEN)
+        .saturating_sub(1);
+    let mut buf = [0u8; INSPECT_CHUNK];
+    let mut off = 0usize;
+    loop {
+        let n = (size - off).min(INSPECT_CHUNK);
+        let Some(chunk) = buf.get_mut(..n) else {
+            return false;
+        };
+        if read_own_memory(ptr.wrapping_add(off), chunk).is_err() {
+            UNREADABLE.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if copy_holds_needle(chunk) {
+            return true;
+        }
+        if off + n >= size {
+            return false;
+        }
+        // A window of at most `overlap + 1` bytes that did not fit in this
+        // chunk starts within its last `overlap` bytes.
+        off += n - overlap;
+    }
+}
+
+/// Whether `copy`, an initialized copy of (part of) a block, holds a window
+/// of any needle. libc's `memmem` finds anchors, and `memcmp` confirms
+/// whole windows around each anchor hit. For a window of `w` bytes,
+/// anchors of `a = ceil(w / 2)` bytes every `w - a + 1` bytes of the needle
+/// guarantee that every window of the needle contains one whole anchor.
+fn copy_holds_needle(copy: &[u8]) -> bool {
     let count = NEEDLE_COUNT.load(Ordering::Relaxed);
     let window = WINDOW.load(Ordering::Relaxed);
     // AtomicU8 has the same in-memory representation as u8.
@@ -194,7 +343,7 @@ unsafe fn holds_needle(ptr: *const u8, size: usize) -> bool {
     for (k, slot) in NEEDLE_LENS.iter().enumerate().take(count) {
         let len = slot.load(Ordering::Relaxed);
         let win = window.min(len);
-        if win == 0 || size < win {
+        if win == 0 || copy.len() < win {
             continue;
         }
         // SAFETY: needle `k` occupies `len <= MAX_NEEDLE_LEN` bytes of the
@@ -204,9 +353,9 @@ unsafe fn holds_needle(ptr: *const u8, size: usize) -> bool {
         let stride = win - anchor + 1;
         let mut a = 0;
         while a + anchor <= len {
-            // SAFETY: `a + anchor <= len`, so the anchor lies in the needle;
-            // the caller guarantees the block.
-            if unsafe { window_at_anchor(ptr, size, needle, len, win, a, anchor) } {
+            // SAFETY: `a + anchor <= len`, so the anchor lies in the needle,
+            // and `copy` is an initialized slice.
+            if unsafe { window_at_anchor(copy.as_ptr(), copy.len(), needle, len, win, a, anchor) } {
                 return true;
             }
             a += stride;
@@ -215,12 +364,13 @@ unsafe fn holds_needle(ptr: *const u8, size: usize) -> bool {
     false
 }
 
-/// Whether the block holds a `win`-byte window of the needle (`len` bytes at
-/// `needle`) that contains the needle's anchor `needle[a..a + anchor]`.
+/// Whether the copy (`size` bytes at `ptr`) holds a `win`-byte window of the
+/// needle (`len` bytes at `needle`) that contains the needle's anchor
+/// `needle[a..a + anchor]`.
 ///
 /// # Safety
-/// `ptr` is valid for reads of `size` bytes and `needle` for `len` bytes,
-/// with `a + anchor <= len`, `anchor >= 1` and `win <= len`.
+/// `ptr` is valid for reads of `size` initialized bytes and `needle` for
+/// `len` bytes, with `a + anchor <= len`, `anchor >= 1` and `win <= len`.
 unsafe fn window_at_anchor(
     ptr: *const u8,
     size: usize,
@@ -235,8 +385,9 @@ unsafe fn window_at_anchor(
     let last = a.min(len - win);
     let mut from = 0;
     while from + anchor <= size {
-        // SAFETY: the haystack is the block's last `size - from` bytes and
-        // the anchor lies inside the needle; memmem only reads them.
+        // SAFETY: the haystack is the copy's last `size - from` bytes, all
+        // initialized, and the anchor lies inside the needle; memmem only
+        // reads them.
         let hit = unsafe {
             libc::memmem(
                 ptr.add(from).cast(),
