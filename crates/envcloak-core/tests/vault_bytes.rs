@@ -3,9 +3,10 @@
 //!
 //! The vault directory is swept while the vault is open (the WAL holds the
 //! latest frames), after it is closed (the WAL has been checkpointed into
-//! the main file), and after a writer is killed mid-transaction (the WAL
-//! holds frames that never committed). A positive control shows the sweep
-//! finds a value SQLite stores in plaintext.
+//! the main file), after a migration has re-sealed every row, and after a
+//! writer is killed mid-transaction (the WAL holds frames that never
+//! committed). A positive control shows the sweep finds a value SQLite
+//! stores in plaintext.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -16,7 +17,10 @@ use std::time::Duration;
 use common::{Fixture, Rng, kill_child, name, read_stdin, secret_item, spawn_self, wait_for};
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::Vmk;
-use envcloak_core::vault::{FieldId, Integrity, LockedVault, Vault, VaultPaths};
+use envcloak_core::vault::{
+    CURRENT_SCHEMA, FieldId, Integrity, LockedVault, Migration, MigrationPlan, MigrationTx, Vault,
+    VaultError, VaultPaths,
+};
 use envcloak_testkit::{
     Canary, Hit, assert_sweep_clean, by_label, canaries, fresh_seed, labels, sweep_dir,
 };
@@ -106,6 +110,59 @@ fn values_never_reach_the_database_files() {
     let v = f.unlock();
     assert_eq!(v.integrity(), Integrity::Ok);
     assert_eq!(v.items().len(), cs.len());
+}
+
+fn no_transform(_: &MigrationTx<'_>) -> Result<(), VaultError> {
+    Ok(())
+}
+
+/// A migration re-seals every sealed column, values and prior values
+/// included, in one transaction: no fixture reaches the files while the
+/// migrated vault is open (the WAL holds the re-sealed frames) or after it
+/// is checkpointed.
+#[test]
+fn a_migration_writes_no_value_either() {
+    let cs = canaries(fresh_seed());
+    let (f, mut v) = Fixture::create();
+    let ids = store_every_fixture(&mut v, &cs);
+    let openai = ids
+        .iter()
+        .find(|(_, l)| l == labels::OPENAI_API_KEY)
+        .unwrap()
+        .0;
+    v.transact(|t| t.set_value(openai, value(by_label(&cs, labels::OPENAI_API_KEY_ROTATED))))
+        .unwrap();
+    drop(v);
+
+    let plan = MigrationPlan::new(vec![Migration {
+        from: CURRENT_SCHEMA,
+        ddl: "ALTER TABLE items ADD COLUMN tier INTEGER NOT NULL DEFAULT 0;",
+        transform: no_transform,
+    }])
+    .unwrap();
+    let v = LockedVault::open_with_plan(&f.paths, plan)
+        .unwrap()
+        .unlock(f.vmk())
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_eq!(v.migration_error(), None);
+    assert_eq!(v.schema_version(), CURRENT_SCHEMA + 1);
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert!(
+        v.read_prior(openai, 0)
+            .unwrap()
+            .ct_eq(by_label(&cs, labels::OPENAI_API_KEY).value())
+    );
+    let wal = std::fs::canonicalize(&f.paths.vault_dir)
+        .unwrap()
+        .join("vault.db-wal");
+    assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+    assert_sweep_clean(&f.paths.data_dir, &cs);
+
+    drop(v);
+    assert!(!wal.exists());
+    assert_sweep_clean(&f.paths.data_dir, &cs);
+    f.home.assert_clean(&cs);
 }
 
 #[test]
