@@ -95,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "base64",
+ "envcloak-testkit",
  "form_urlencoded",
  "proptest",
  "serde_json",

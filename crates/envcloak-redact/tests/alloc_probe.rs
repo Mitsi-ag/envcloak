@@ -1,118 +1,88 @@
-//! Regression probe for memory hygiene: no buffer holding secret bytes may be
-//! released without being wiped. A custom allocator forces every reallocation
-//! to move and inspects each block just before it is freed.
-#![allow(unsafe_code, clippy::unwrap_used)]
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+//! Regression probe for memory hygiene (gate 11): no buffer holding secret
+//! bytes may be released without being wiped. This binary installs the
+//! shared inspection allocator from `envcloak-sys` (through the testkit),
+//! which zero-initializes every block, forces every reallocation to move and
+//! inspects each block just before it is freed.
+#![allow(clippy::unwrap_used)]
 
 use envcloak_redact::RedactorBuilder;
-
-const NEEDLE: &[u8] = b"tk-demo-ALLOCPROBE-0123456789abcdefghijKLMNOP";
-/// A freed block containing any 12-byte run of the needle counts as a leak.
-const WINDOW: usize = 12;
-
-static ARMED: AtomicBool = AtomicBool::new(false);
-static LEAKS: AtomicUsize = AtomicUsize::new(0);
-/// Tests in this binary share the allocator counters; run them one at a time.
-static SERIAL: Mutex<()> = Mutex::new(());
-
-struct Probe;
-
-fn contains_needle_run(block: &[u8]) -> bool {
-    NEEDLE
-        .windows(WINDOW)
-        .any(|run| block.windows(WINDOW).any(|w| w == run))
-}
-
-unsafe impl GlobalAlloc for Probe {
-    // Every block is zero-initialized so that inspecting a whole block
-    // before it is freed never reads uninitialized memory (which would be
-    // undefined behaviour and make the probe's result meaningless).
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ARMED.load(Ordering::SeqCst) && layout.size() >= WINDOW {
-            let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
-            if contains_needle_run(block) {
-                LEAKS.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // Always move, so in-place growth bugs show up as freed copies. The
-        // new block is zeroed, so its tail beyond the copied bytes is
-        // initialized too.
-        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let new_ptr = unsafe { System.alloc_zeroed(new_layout) };
-        if !new_ptr.is_null() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
-                self.dealloc(ptr, layout);
-            }
-        }
-        new_ptr
-    }
-}
+use envcloak_testkit::{
+    ProbeAllocator, ProbeMode, by_label, canaries, fresh_seed, labels, probe_canaries,
+};
 
 #[global_allocator]
-static ALLOCATOR: Probe = Probe;
-
-fn measure(f: impl FnOnce()) -> usize {
-    LEAKS.store(0, Ordering::SeqCst);
-    ARMED.store(true, Ordering::SeqCst);
-    f();
-    ARMED.store(false, Ordering::SeqCst);
-    LEAKS.load(Ordering::SeqCst)
-}
+static ALLOCATOR: ProbeAllocator = ProbeAllocator;
 
 #[test]
 fn probe_detects_an_unwiped_growing_buffer() {
-    let _guard = SERIAL.lock().unwrap();
-    let leaks = measure(|| {
-        let mut v = Vec::with_capacity(NEEDLE.len());
-        v.extend_from_slice(NEEDLE);
-        v.extend_from_slice(b"forces a moving reallocation");
-        drop(v);
-    });
-    assert!(leaks >= 1, "the probe must catch the bug it guards against");
+    let cs = canaries(fresh_seed());
+    let needle = by_label(&cs, labels::OPENAI_API_KEY).value();
+    let session = probe_canaries(&cs, ProbeMode::Unwiped);
+    let mut v = Vec::with_capacity(needle.len());
+    v.extend_from_slice(needle);
+    v.extend_from_slice(b"forces a moving reallocation");
+    drop(std::hint::black_box(v));
+    let report = session.finish();
+    assert!(
+        report.released_with_needle >= 1,
+        "the probe must catch the bug it guards against"
+    );
 }
 
 #[test]
 fn stream_redactor_frees_no_unwiped_secret_bytes() {
-    let _guard = SERIAL.lock().unwrap();
-    let (redactor, _) = RedactorBuilder::new().secret("probe", NEEDLE).build();
+    let cs = canaries(fresh_seed());
+    let needle = by_label(&cs, labels::OPENAI_API_KEY).value();
+    let (redactor, _) = RedactorBuilder::new().secret("probe", needle).build();
     let mut text = b"prefix noise ".to_vec();
-    text.extend_from_slice(NEEDLE);
+    text.extend_from_slice(needle);
     text.extend_from_slice(b" suffix noise");
     let splits: Vec<(Vec<u8>, Vec<u8>)> = (0..=text.len())
         .map(|i| (text[..i].to_vec(), text[i..].to_vec()))
         .collect();
     let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(splits.len());
 
-    let leaks = measure(|| {
-        for (a, b) in &splits {
-            let mut out = Vec::new();
-            let mut s = redactor.stream();
-            s.push(a, &mut out);
-            s.flush_idle(&mut out);
-            s.push(b, &mut out);
-            s.finish(&mut out);
-            outputs.push(out);
-        }
-    });
-
-    assert_eq!(leaks, 0, "a buffer holding secret bytes was freed unwiped");
-    for out in &outputs {
-        assert!(!out.windows(NEEDLE.len()).any(|w| w == NEEDLE));
+    // The allocator does not wipe here, so the stream code must.
+    let session = probe_canaries(&cs, ProbeMode::Unwiped);
+    for (a, b) in &splits {
+        let mut out = Vec::new();
+        let mut s = redactor.stream();
+        s.push(a, &mut out);
+        s.flush_idle(&mut out);
+        s.push(b, &mut out);
+        s.finish(&mut out);
+        outputs.push(out);
     }
+    let report = session.finish();
+
+    assert_eq!(
+        report.released_with_needle, 0,
+        "a buffer holding secret bytes was freed unwiped"
+    );
+    for out in &outputs {
+        assert!(!out.windows(needle.len()).any(|w| w == needle));
+    }
+}
+
+#[test]
+fn building_and_dropping_the_redactor_leaves_nothing_under_the_wiping_allocator() {
+    // The automata keep their own unwiped copies of the patterns; the wiping
+    // allocator is what clears them (T12 relies on this).
+    let cs = canaries(fresh_seed());
+    let needle = by_label(&cs, labels::OPENAI_API_KEY).value();
+    let session = probe_canaries(&cs, ProbeMode::Wiping);
+    let (redactor, _) = RedactorBuilder::new().secret("probe", needle).build();
+    let mut out = Vec::new();
+    let mut s = redactor.stream();
+    s.push(needle, &mut out);
+    s.finish(&mut out);
+    drop(s);
+    drop(redactor);
+    let report = session.finish();
+    assert!(
+        report.held_needle >= 1,
+        "the automata must have held the needle: {report:?}"
+    );
+    assert_eq!(report.not_zeroed, 0, "{report:?}");
+    assert_eq!(report.released_with_needle, 0, "{report:?}");
 }
