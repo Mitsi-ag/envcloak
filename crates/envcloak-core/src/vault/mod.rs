@@ -58,7 +58,7 @@ pub use paths::{PathError, PathErrorKind, Platform, VaultPaths, data_dir_for};
 pub use schema::{CURRENT_SCHEMA, StorageReport};
 pub use txn::Txn;
 
-pub(crate) use aside::{set_aside, utc_stamp, with_suffix};
+pub(crate) use aside::{REPLACED_PREFIX, set_aside, utc_stamp, with_suffix};
 use integrity::{state_digest, unlocker_body};
 pub(crate) use paths::{check_private_dir, check_private_file};
 use state::{State, VaultCtx, item_key};

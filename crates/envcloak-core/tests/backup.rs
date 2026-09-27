@@ -23,12 +23,13 @@ use common::{
     other_passphrase, secret_item,
 };
 use envcloak_core::backup::{
-    BACKUP_CHUNK, BACKUP_EXTENSION, RestoreStep, restore_backup_observed, restore_backup_with_plan,
+    BACKUP_CHUNK, BACKUP_EXTENSION, RestoreStep, remove_replaced_files, replaced_files,
+    restore_backup_observed, restore_backup_with_plan,
 };
 use envcloak_core::crypto::{CryptoErrorKind, Envelope, KdfParams, UnlockerKind};
 use envcloak_core::vault::{
     Integrity, ItemMeta, LockedVault, Migration, MigrationPlan, MigrationTx, PathErrorKind,
-    TamperKind, VaultError, VaultErrorKind,
+    TamperKind, VaultError, VaultErrorKind, VaultPaths,
 };
 use envcloak_core::{PassphraseRejected, SecretBytes, restore_backup};
 use envcloak_testkit::assert_no_canary;
@@ -654,6 +655,61 @@ fn an_older_format_backup_restores_and_is_migrated() {
         LockedVault::open(&f.paths).unwrap_err().kind(),
         VaultErrorKind::UnsupportedVersion
     );
+    f.home.assert_clean(&f.cs);
+}
+
+/// The replaced vault is kept whole until it is deleted: it still opens
+/// with the old passphrase and, being the same vault, gives the restored
+/// vault's key, which is why callers offer to delete it. `replaced_files`
+/// lists what a restore kept (regular files only) and
+/// `remove_replaced_files` deletes it, leaving the restored vault.
+#[test]
+fn a_replaced_vault_is_kept_until_removed() {
+    let (f, v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    drop(v);
+    assert!(replaced_files(&f.paths).unwrap().is_empty());
+    std::fs::create_dir(f.paths.vault_dir.join("replaced-not-a-file")).unwrap();
+    let new = other_passphrase(4);
+    let (v, report) = restore_backup(&f.paths, &info.path, &f.kit(), &new).unwrap();
+    let restored_key = v.vmk().export_for_testing();
+    drop(v);
+    let [kept] = &report.replaced[..] else {
+        panic!("{:?}", report.replaced);
+    };
+    assert_eq!(replaced_files(&f.paths).unwrap(), report.replaced);
+
+    // A copy of the kept file opens with the old passphrase and holds the
+    // restored vault's key.
+    let elsewhere = VaultPaths::under(f.home.root().join("elsewhere"));
+    elsewhere.ensure_dirs().unwrap();
+    let copy = std::fs::canonicalize(&elsewhere.vault_dir)
+        .unwrap()
+        .join("vault.db");
+    std::fs::copy(kept, copy).unwrap();
+    let old = LockedVault::open(&elsewhere)
+        .unwrap()
+        .unlock_with_passphrase(&f.pass())
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_eq!(old.integrity(), Integrity::Ok);
+    assert!(old.vmk().export_for_testing() == restored_key);
+    drop(old);
+
+    assert_eq!(remove_replaced_files(&f.paths).unwrap(), report.replaced);
+    assert!(replaced_files(&f.paths).unwrap().is_empty());
+    assert_eq!(
+        dir_names(&f.paths.vault_dir),
+        ["replaced-not-a-file", "vault.db"]
+    );
+    let v = f
+        .open()
+        .unlock_with_passphrase(&new)
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_holds_canaries(&v, &f.cs);
+    drop(v);
     f.home.assert_clean(&f.cs);
 }
 

@@ -60,9 +60,9 @@ use crate::recovery::RecoveryKit;
 use crate::secret::SecretBytes;
 use crate::unlock::{install_passphrase, passphrase_envelope, passphrase_unlockers};
 use crate::vault::{
-    DB_NAME, Integrity, LockedVault, MigrationPlan, TEMP_PREFIX, Vault, VaultError, VaultErrorKind,
-    VaultPaths, check_private_dir, open_record, remove_temp, seal_record, set_aside, sync_dir,
-    utc_stamp, with_suffix,
+    DB_NAME, Integrity, LockedVault, MigrationPlan, REPLACED_PREFIX, TEMP_PREFIX, Vault,
+    VaultError, VaultErrorKind, VaultPaths, check_private_dir, open_record, remove_temp,
+    seal_record, set_aside, sync_dir, utc_stamp, with_suffix,
 };
 
 /// The extension of backup files.
@@ -112,7 +112,7 @@ pub struct RestoreReport {
     /// `vault.db`, now `vault/replaced-<UTC time>.db`, first, then its
     /// side files under the same name with SQLite's suffixes (or only side
     /// files, when they were left without a database). Empty when there
-    /// was nothing.
+    /// was nothing. They stay until deleted: see [`replaced_files`].
     pub replaced: Vec<PathBuf>,
 }
 
@@ -673,6 +673,46 @@ fn write_record(w: &mut impl Write, sealed: &[u8]) -> Result<(), VaultError> {
     w.write_all(&len.to_be_bytes())?;
     w.write_all(sealed)?;
     Ok(())
+}
+
+/// The files a restore or [`Vault::create`] moved aside in the vault
+/// directory, `vault/replaced-*`, sorted by name. Nothing removes them on
+/// its own.
+///
+/// A replaced vault is a whole vault, and still opens with its own
+/// passphrase envelope, which may use weaker Argon2id parameters than the
+/// restored vault's. When it is the same vault as the backup, it wraps the
+/// same VMK: until it is deleted, the old passphrase, or offline guessing
+/// against that envelope, yields the restored vault's key. Callers report
+/// these files (after a restore and in status) and offer to delete them,
+/// with [`remove_replaced_files`], once the restored vault has verified.
+pub fn replaced_files(p: &VaultPaths) -> Result<Vec<PathBuf>, VaultError> {
+    check_private_dir(&p.vault_dir)?;
+    let dir = std::fs::canonicalize(&p.vault_dir)?;
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let named = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(REPLACED_PREFIX));
+        if named && entry.file_type()?.is_file() {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Deletes every file [`replaced_files`] lists, syncs the vault directory,
+/// and returns what it deleted.
+pub fn remove_replaced_files(p: &VaultPaths) -> Result<Vec<PathBuf>, VaultError> {
+    let files = replaced_files(p)?;
+    for f in &files {
+        remove_file_if_present(f)?;
+    }
+    sync_dir(&std::fs::canonicalize(&p.vault_dir)?)?;
+    Ok(files)
 }
 
 /// Opens the backup without following a symlink, and without blocking on a
