@@ -107,14 +107,20 @@ Header names are lowercase letters, digits and `-`, at most 64 bytes, and not a 
 
 Key-management, admin and credential-minting endpoints (SPEC §6.2 step 4). A denied path is `/`, then segments of letters, digits and `._~-`, where a segment `*` stands for any one segment, at most 256 bytes, with no empty, `.` or `..` segment. It covers each request path it is a prefix of, segment by segment and without ASCII case: `/v1/organization` covers `/v1/organization/admin_api_keys` but not `/v1/organizations`, and `/repos/*/*/keys` covers `/repos/acme/web/keys/1`.
 
-A request path that is not normalized counts as denied: an empty, `.` or `..` segment, a `%` escape or a backslash anywhere in it, since a server that normalizes it could reach a denied endpoint. The query and fragment are ignored. The proxy (M6) normalizes paths before it asks.
+A request path that is not normalized counts as denied, since a server that normalizes it could reach a denied endpoint:
+
+- an empty segment, other than a trailing `/`;
+- a segment that ends in `.`, which covers `.` and `..` and the trailing dot some servers strip (`/v1/organization./admin_api_keys`);
+- any byte outside the path characters of RFC 3986 (letters, digits, `-._~!$&'()*+,=:@`), which covers a `%` escape, `;` path parameters that some servers strip from a segment (`/v1/organization;x=1/admin_api_keys`), a backslash, whitespace, control and non-ASCII bytes.
+
+`:` and `@` stay plain, so APIs with paths such as `/v1/models/name:generate` are not denied wholesale. The query and fragment are ignored. The proxy (M6) normalizes paths before it asks.
 
 ### Adapters
 
 A balance adapter is one request and where its JSON response holds the value:
 
 - `request`: `method` (`GET` only), `url` and `auth`, all required.
-  - `url` is `https://`, with no fragment, and its host must be matched by one of the provider's allowed hosts.
+  - `url` is `https://`, with no fragment, and its host must be matched by one of the provider's allowed hosts. Its path must not be under one of the provider's denied paths, or fail to be normalized as above (`RequestPathDenied`): the request carries the key, so it may not go to an endpoint the proxy would refuse. A URL with no path has the path `/`.
   - `auth` names one of the provider's declared slots: `bearer` (the `authorization` header with scheme `Bearer`), `header:<name>` (the one header slot of that name), `basic:user`, `basic:password` or `query:<name>`. A request cannot put the key anywhere else.
 - `value`, required, and `currency`, optional: JSON paths, `$` then up to 16 `.name` or `[index]` steps (`name` a letter or `_`, then letters, digits or `_`; `index` 0 to 9999, without leading zeros).
 
@@ -158,3 +164,4 @@ A registry error is a kind, the file and, where the parser recorded one, the lin
 | 11, detection part: no fixture in freed memory, even with the allocator's wipe off | `tests/detect_probe.rs` |
 | Errors carry no value | `tests/loader.rs` |
 | A key pattern without a literal prefix fails to load | `tests/loader.rs` |
+| A balance request to a denied path, in any spelling a server could normalize to one, fails to load | `tests/loader.rs` |

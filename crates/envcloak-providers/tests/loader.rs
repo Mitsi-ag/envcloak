@@ -385,6 +385,56 @@ fn gate18_a_wildcard_over_a_multi_tenant_suffix_fails_to_load() {
     );
 }
 
+/// A balance request is sent with the key, so it may not go to one of the
+/// provider's own denied paths (SPEC §6.2 rule 4), in any spelling a server
+/// could normalize to one.
+#[test]
+fn a_balance_request_to_a_denied_path_fails_to_load() {
+    for path in [
+        "/v1/keys",
+        "/v1/keys/",
+        "/v1/keys/k_1/balance",
+        "/V1/Keys",
+        "/v1/keys?limit=1",
+        "/orgs/acme/tokens",
+        "/orgs/acme/tokens/t_1",
+        // Not normalized: denied wherever the oddity is.
+        "/v1/%6beys",
+        "/v1/balance/../keys",
+        "/v1//keys",
+        "/v1/keys;x=1",
+        "/v1/keys.",
+        "/v1/balance;x",
+    ] {
+        let url = format!("https://api.example.com{path}");
+        assert_eq!(
+            fails(&edit(REQUEST_URL, &url)),
+            (K::RequestPathDenied, Some(REQUEST_LINE)),
+            "{url}"
+        );
+    }
+    // Near misses load.
+    for path in [
+        "/v1/keysx",
+        "/v1/balance/keys",
+        "/orgs/acme",
+        "",
+        "/",
+        "?x=/v1/keys",
+    ] {
+        let url = format!("https://api.example.com{path}");
+        assert!(load(&edit(REQUEST_URL, &url)).is_ok(), "{url}");
+    }
+    // The denied paths are what refuse it: without them the same request
+    // loads.
+    let f = edit("denied_paths = [\"/v1/keys\", \"/orgs/*/tokens\"]\n", "").replacen(
+        REQUEST_URL,
+        "https://api.example.com/v1/keys",
+        1,
+    );
+    assert!(load(&f).is_ok());
+}
+
 #[test]
 fn one_bad_provider_fails_the_whole_registry() {
     let bad = edit(REQUEST_URL, "https://evil.test/v1/balance");

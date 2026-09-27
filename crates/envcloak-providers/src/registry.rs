@@ -150,8 +150,10 @@ impl Provider {
     }
 
     /// Whether the request path `path` is under a denied path. A path
-    /// that is not normalized (empty, `.` or `..` segments, `%` escapes,
-    /// backslashes) counts as denied.
+    /// that is not normalized (an empty segment, a segment ending in `.`,
+    /// a `%` escape, `;` path parameters, a backslash, whitespace, control
+    /// or non-ASCII bytes) counts as denied when the provider has any
+    /// denied path.
     pub fn path_denied(&self, path: &str) -> bool {
         self.denied_paths
             .iter()
@@ -533,6 +535,7 @@ impl Parser<'_> {
         e: Option<Entry<'_>>,
         hosts: &[HostPattern],
         slots: &[AuthSlot],
+        denied: &[String],
     ) -> Result<Option<Adapter>, RegistryError> {
         let Some((item, at)) = e else {
             return Ok(None);
@@ -542,7 +545,7 @@ impl Parser<'_> {
         for (key, v) in t.iter() {
             let kat = t.key(key).and_then(|k| k.span()).or_else(|| at.clone());
             match key {
-                "request" => request = Some(self.request(v, kat, hosts, slots)?),
+                "request" => request = Some(self.request(v, kat, hosts, slots, denied)?),
                 "value" => value = Some(self.json_path(v, kat)?),
                 "currency" => currency = Some(self.json_path(v, kat)?),
                 _ => return Err(self.err(K::UnknownKey, kat)),
@@ -559,13 +562,15 @@ impl Parser<'_> {
     }
 
     /// `{ method = "GET", url = "https://...", auth = "<slot>" }`: the URL's
-    /// host must be allowed, and the key must go in a declared slot.
+    /// host must be allowed, its path must not be denied, and the key must
+    /// go in a declared slot.
     fn request(
         &self,
         item: &Item,
         at: Span,
         hosts: &[HostPattern],
         slots: &[AuthSlot],
+        denied: &[String],
     ) -> Result<Request, RegistryError> {
         let t = self.table(item, at.clone())?;
         let (mut method, mut url, mut auth) = (None, None, None);
@@ -593,6 +598,9 @@ impl Parser<'_> {
         let url = HttpsUrl::parse(url, false).map_err(|kind| self.err(kind, u_at.clone()))?;
         if !hosts.iter().any(|h| h.matches(url.host())) {
             return Err(self.err(K::RequestHostNotAllowed, u_at));
+        }
+        if denied.iter().any(|p| safety::path_under(p, url.path())) {
+            return Err(self.err(K::RequestPathDenied, u_at));
         }
         let auth = AuthSlot::resolve(auth, slots).map_err(|kind| self.err(kind, a_at))?;
         Ok(Request { method, url, auth })
@@ -708,7 +716,7 @@ fn parse_provider(
     }
 
     let links = p.links(r.links)?;
-    let balance = p.balance(r.balance, &allowed_hosts, &auth_slots)?;
+    let balance = p.balance(r.balance, &allowed_hosts, &auth_slots, &denied_paths)?;
 
     Ok(Provider {
         id: id_ok,

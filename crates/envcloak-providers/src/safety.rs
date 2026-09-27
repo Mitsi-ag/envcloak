@@ -338,6 +338,15 @@ impl HttpsUrl {
     pub fn host(&self) -> &str {
         &self.text[Self::SCHEME.len()..self.host_end]
     }
+
+    /// The path, without the query or fragment; `/` when the URL has none.
+    pub fn path(&self) -> &str {
+        let rest = &self.text[self.host_end..];
+        match &rest[..rest.find(['?', '#']).unwrap_or(rest.len())] {
+            "" => "/",
+            path => path,
+        }
+    }
 }
 
 impl core::fmt::Display for HttpsUrl {
@@ -521,12 +530,23 @@ pub(crate) fn valid_denied_path(s: &str) -> bool {
         })
 }
 
+/// A byte a request path segment may hold and still count as normalized:
+/// the path characters of RFC 3986 (unreserved, sub-delimiters, `:` and
+/// `@`), except `%`, which starts an escape, and `;`, which starts path
+/// parameters that some servers strip from a segment.
+fn plain_path_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-._~!$&'()*+,=:@".contains(&b)
+}
+
 /// Whether the request path `path` (a query and fragment are ignored)
 /// falls under the denied path `pattern`. Segments compare without ASCII
-/// case. It fails closed: a path that is not normalized counts as denied
-/// when it has an empty, `.` or `..` segment, a `%` escape or a
-/// backslash anywhere, so a server that normalizes it cannot reach a denied
-/// endpoint. The proxy (M6) normalizes paths before asking.
+/// case. It fails closed: a path that is not normalized counts as denied,
+/// so a server that normalizes it cannot reach a denied endpoint. That is
+/// a path with an empty segment (other than a trailing `/`), a segment
+/// that ends in `.` (so `.` and `..` as well), or any byte
+/// [`plain_path_byte`] refuses: a `%` escape, `;` path parameters, a
+/// backslash, whitespace, control or non-ASCII bytes. The proxy (M6)
+/// normalizes paths before asking.
 pub(crate) fn path_under(pattern: &str, path: &str) -> bool {
     let path = path.split(['?', '#']).next().unwrap_or("");
     let Some(path) = path.strip_prefix('/') else {
@@ -535,7 +555,7 @@ pub(crate) fn path_under(pattern: &str, path: &str) -> bool {
     let segs: Vec<&str> = path.split('/').collect();
     let last = segs.len() - 1;
     let odd = segs.iter().enumerate().any(|(i, s)| {
-        (s.is_empty() && i != last) || *s == "." || *s == ".." || s.contains(['%', '\\'])
+        (s.is_empty() && i != last) || s.ends_with('.') || !s.bytes().all(plain_path_byte)
     });
     if odd {
         return true;
@@ -779,6 +799,16 @@ mod tests {
         );
         let l = HttpsUrl::parse("https://console.example.com/iam#/keys", true).unwrap();
         assert_eq!(l.host(), "console.example.com");
+        for (s, path) in [
+            ("https://api.example.com/v1/x?y=1", "/v1/x"),
+            ("https://api.example.com/v1/x/", "/v1/x/"),
+            ("https://api.example.com", "/"),
+            ("https://api.example.com?y=/v1/keys", "/"),
+            ("https://api.example.com/?y=1", "/"),
+        ] {
+            assert_eq!(HttpsUrl::parse(s, false).unwrap().path(), path, "{s}");
+        }
+        assert_eq!(l.path(), "/iam");
         for (s, k) in [
             ("http://api.example.com/", K::NotHttps),
             ("HTTPS://api.example.com/", K::NotHttps),
@@ -993,8 +1023,37 @@ mod tests {
             "/v1/chat\\..\\organization",
             "v1/organization",
             "",
+            // Path parameters, which some servers strip from a segment.
+            "/v1/organization;x=1/admin_api_keys",
+            "/v1/organization;/admin_api_keys",
+            "/v1/chat;/../organization",
+            // A trailing dot or space, which some servers strip.
+            "/v1/organization./admin_api_keys",
+            "/v1/organization.",
+            "/v1/chat.../x",
+            "/v1/organization /admin_api_keys",
+            "/v1/organization\t/x",
+            "/v1/organization\u{0}/x",
+            // Bytes outside the path characters of RFC 3986.
+            "/v1/organization\u{e9}/x",
+            "/v1/organization\"/x",
+            "/v1/organization|/x",
+            "/v1/organization{x}",
+            "/v1/[organization]",
         ] {
-            assert!(path_under(p, odd), "{odd}");
+            assert!(path_under(p, odd), "{odd:?}");
+        }
+        // Path characters servers do not strip stay plain, so an API that
+        // uses them is not denied wholesale.
+        for plain in [
+            "/v1/models/gpt-4o:generate",
+            "/v1/files/file-1@2",
+            "/v1/a!$&'()*+,=b",
+            "/v1/chat.completions",
+            "/v1/chat/completions/",
+            "/v1/chat?x=;.%20",
+        ] {
+            assert!(!path_under(p, plain), "{plain}");
         }
         let g = "/repos/*/*/keys";
         assert!(path_under(g, "/repos/o/r/keys/1"));

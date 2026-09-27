@@ -59,6 +59,9 @@ pub enum RegistryErrorKind {
     InvalidUrl,
     /// A request URL whose host no allowed host matches.
     RequestHostNotAllowed,
+    /// A request URL whose path is under one of the provider's denied
+    /// paths, or is not normalized.
+    RequestPathDenied,
     InvalidAuthSlot,
     DuplicateAuthSlot,
     /// A request puts the key in a slot the provider does not declare.
@@ -131,6 +134,9 @@ impl RegistryErrorKind {
                  spaces or backslashes (and no fragment in a request)"
             }
             K::RequestHostNotAllowed => "a request URL's host is not in allowed_hosts",
+            K::RequestPathDenied => {
+                "a request URL's path is under one of denied_paths, or is not normalized"
+            }
             K::InvalidAuthSlot => {
                 "invalid auth slot: { header = \"<name>\", scheme = \"<scheme>\" }, { basic = \
                  \"user\" | \"password\" } or { query = \"<name>\" }"

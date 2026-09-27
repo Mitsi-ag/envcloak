@@ -63,10 +63,12 @@ fn the_embedded_registry_loads() {
         assert!(!p.key_patterns.is_empty(), "{}", p.id);
         // No wildcard hosts ship yet: each key goes to named hosts only.
         assert!(p.allowed_hosts.iter().all(|h| !h.is_wildcard()), "{}", p.id);
-        // A balance request goes to an allowed host in a declared slot.
+        // A balance request goes to an allowed host in a declared slot, and
+        // not to a denied path.
         if let Some(b) = &p.balance {
             assert!(p.host_allowed(b.request.url.host()), "{}", p.id);
             assert!(p.auth_slots.contains(&b.request.auth), "{}", p.id);
+            assert!(!p.path_denied(b.request.url.path()), "{}", p.id);
         }
     }
 
@@ -120,6 +122,15 @@ fn the_embedded_registry_loads() {
     let openai = r.get("openai").unwrap();
     assert!(openai.path_denied("/v1/organization/admin_api_keys"));
     assert!(!openai.path_denied("/v1/chat/completions"));
+    // Spellings a server could strip back to a denied path.
+    for odd in [
+        "/v1/organization;x=1/admin_api_keys",
+        "/v1/organization;/admin_api_keys",
+        "/v1/organization./admin_api_keys",
+        "/v1/organization /admin_api_keys",
+    ] {
+        assert!(openai.path_denied(odd), "{odd}");
+    }
     let anthropic = r.get("anthropic").unwrap();
     assert!(anthropic.path_denied("/v1/organizations/api_keys"));
     assert!(!anthropic.path_denied("/v1/messages"));
