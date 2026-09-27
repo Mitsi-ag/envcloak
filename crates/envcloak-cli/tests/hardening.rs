@@ -284,6 +284,10 @@ fn linux_same_uid_ptrace_and_proc_reads_are_denied() {
     use envcloak_sys::testing::try_attach;
 
     if running_as_root() {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "CI must run this check as an ordinary user"
+        );
         eprintln!("skipped: root bypasses the dumpable check");
         return;
     }
