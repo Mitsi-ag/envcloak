@@ -1,5 +1,6 @@
 [package]
 name = "envcloak-policy"
+description = "EnvCloak project manifests, env files, bindings, project identity and effective policy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,3 +12,10 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+envcloak-core.workspace = true
+secrecy.workspace = true
+sha2.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+envcloak-testkit.workspace = true
