@@ -1,0 +1,11 @@
+# Proc-macro crates that may be compiled for workspace crates, checked by
+# scripts/check-sources.sh.
+#
+# A proc-macro writes code no source check reads, and can assemble lint
+# attributes (`allow(clippy::disallowed_methods)`) or `include!` from
+# pieces. List only crates whose output is fixed by the item they are
+# applied to, such as derives of well-known traits, never a token-pasting or
+# code-generating macro that takes arbitrary input. One package name per
+# line, followed by `#` and the reason. Adding a line needs review.
+
+zerocopy-derive  # derives for zerocopy, which ppv-lite86 uses under proptest (envcloak-redact dev-dependency); emits trait impls only

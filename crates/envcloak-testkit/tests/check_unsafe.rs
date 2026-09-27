@@ -39,29 +39,34 @@ fn clippy_body() -> String {
 }
 
 /// A root manifest whose `[workspace.lints.rust]` table forbids unsafe code
-/// and adds `rust`, whose clippy table holds `clippy`, followed by `tail`.
-fn root_manifest(rust: &str, clippy: &str, tail: &str) -> String {
+/// and adds `rust`, whose clippy table holds `clippy_lints`, followed by
+/// `tail`.
+fn root_manifest(rust: &str, clippy_lints: &str, tail: &str) -> String {
     format!(
-        "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.lints.rust]\n{} = \"forbid\"\n{rust}\n[workspace.lints.clippy]\n{clippy}\n{tail}",
+        "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.lints.rust]\n{} = \"forbid\"\n{rust}\n[workspace.lints.clippy]\n{clippy_lints}\n{tail}",
         unsafe_lint()
     )
 }
 
 /// envcloak-sys's manifest, repeating those tables with unsafe code denied.
-fn sys_manifest(rust: &str, clippy: &str) -> String {
+fn sys_manifest(rust: &str, clippy_lints: &str) -> String {
     format!(
-        "[package]\nname = \"envcloak-sys\"\nversion = \"0.1.0\"\n\n[lints.rust]\n{} = \"deny\"\n{rust}\n[lints.clippy]\n{clippy}",
+        "[package]\nname = \"envcloak-sys\"\nversion = \"0.1.0\"\n\n[lints.rust]\n{} = \"deny\"\n{rust}\n[lints.clippy]\n{clippy_lints}",
         unsafe_lint()
     )
 }
 
 /// Writes a matching root and envcloak-sys manifest pair.
-fn set_lints(t: &TestHome, rust: &str, clippy: &str) {
-    write(&t.home(), "Cargo.toml", &root_manifest(rust, clippy, ""));
+fn set_lints(t: &TestHome, rust: &str, clippy_lints: &str) {
+    write(
+        &t.home(),
+        "Cargo.toml",
+        &root_manifest(rust, clippy_lints, ""),
+    );
     write(
         &t.home(),
         "crates/envcloak-sys/Cargo.toml",
-        &sys_manifest(rust, clippy),
+        &sys_manifest(rust, clippy_lints),
     );
 }
 
@@ -335,7 +340,7 @@ fn relaxed_workspace_lint_tables_fail() {
     let dm = exposure_key();
     let w = warnings_lint();
     let all = "all = { level = \"warn\", priority = -1 }\n";
-    for (rust, clippy, message) in [
+    for (rust, clippy_lints, message) in [
         (
             String::new(),
             format!("{all}{dm} = \"allow\"\n"),
@@ -389,7 +394,7 @@ fn relaxed_workspace_lint_tables_fail() {
         ),
     ] {
         let t = clean_tree();
-        set_lints(&t, &rust, &clippy);
+        set_lints(&t, &rust, &clippy_lints);
         assert_fails(&t, message);
     }
 
@@ -572,6 +577,18 @@ fn include_and_path_attributes_fail() {
         format!(
             "macro_rules! m {{ ($a:meta) => {{ #[$a] mod leak; }} }}\nm!({p} = \"leak.txt\");\n"
         ),
+        // The reviewer's bypasses: the argument sits after `{` or `mod`,
+        // or ends in `;`. scripts/check-sources.sh catches every spelling
+        // (tests/check_sources.rs); these keep the text check honest too.
+        format!(
+            "macro_rules! m {{ ($a:meta) => {{ #[$a] pub mod leak; }}; }}\nm! {{ {p} = \"leak.txt\" }}\n"
+        ),
+        format!(
+            "macro_rules! m {{ (mod $a:meta) => {{ #[$a] pub mod leak; }}; }}\nm!(mod {p} = \"leak.txt\");\n"
+        ),
+        format!(
+            "macro_rules! m {{ ($a:meta;) => {{ #[$a] pub mod leak; }}; }}\nm! {{ {p} = r#\"leak.txt\"#; }}\n"
+        ),
     ] {
         let t = clean_tree();
         write(&t.home(), "crates/envcloak-core/src/inc.rs", &text);
@@ -587,8 +604,36 @@ fn include_and_path_attributes_fail() {
             "// {i}!(\"in a comment\") and #[{p} = \"x\"]\n\
              const A: &str = \"{i}!(x) #[{p} = y]\";\n\
              const B: &[u8] = {i}_bytes!(\"fine.rs\");\n\
-             fn f(x: u8) -> u8 {{\n    let {p} = 1;\n    let mut q = {p};\n    q = q + {p};\n    if {p} == q {{}}\n    match x {{\n        0 => 1,\n        {p} => {p},\n    }}\n}}\n"
+             fn f(x: u8) -> u8 {{\n    let {p} = 1;\n    let mut q = {p};\n    q = q + {p};\n    if {p} == q {{}}\n    match x {{\n        0 => 1,\n        {p} => {p},\n    }}\n}}\n\
+             fn g() -> usize {{\n    let {p} = \"a\";\n    let mut other = \"b\";\n    other = {p};\n    let mut {p} = \"c\";\n    {p} = other;\n    {p}.len()\n}}\n"
         ),
+    );
+    assert_passes(&t);
+}
+
+#[test]
+fn the_clippy_cfg_fails() {
+    // Code under cfg(not(clippy)) compiles but is never linted, so it could
+    // call expose_secret anywhere.
+    for text in [
+        "#[cfg(not(clippy))]\npub fn open() {}\n",
+        "#[cfg_attr(clippy, allow(dead_code))]\nfn f() {}\n",
+        "fn f() -> bool {\n    cfg!(clippy)\n}\n",
+        "#[cfg(not(r#clippy))]\nfn f() {}\n",
+        "#[cfg(any(test, clippy\n))]\nfn f() {}\n",
+        "macro_rules! m { ($c:ident) => { #[cfg(not($c))] fn f() {} } }\nm!(clippy);\n",
+    ] {
+        let t = clean_tree();
+        write(&t.home(), "crates/envcloak-core/src/hide.rs", text);
+        assert_fails(&t, "names the clippy cfg");
+    }
+
+    // Lint paths, tool attributes and longer names are fine.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/fine.rs",
+        "#![allow(clippy::unwrap_used)]\n#[cfg_attr(test, allow(clippy\n    ::too_many_lines))]\n#[clippy::msrv = \"1.85\"]\nfn f() {\n    let clippy_lints = 1;\n    let _ = clippy_lints;\n}\n",
     );
     assert_passes(&t);
 }

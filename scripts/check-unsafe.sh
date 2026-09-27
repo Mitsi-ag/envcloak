@@ -20,7 +20,11 @@
 #    files may not declare out-of-line modules that would inherit an allow.
 #    Nothing may allow `warnings`, `clippy::all` or `clippy::style`.
 # 3. No Rust file uses `include!` or a `#[path]` attribute, either of which
-#    compiles a file this check never reads.
+#    compiles a file this check never reads, or names the `clippy` cfg,
+#    which compiles code clippy never lints (`cfg(not(clippy))`) or code
+#    only clippy compiles. These are guesses from the text: a macro can
+#    build `#[path]` or `include!` from pieces. scripts/check-sources.sh
+#    settles it with the compiler's own list of the files it read.
 #
 # Rust files are read with comments and the contents of string and
 # character literals removed, raw identifiers (`r#name`) reduced to their
@@ -33,8 +37,16 @@
 # this script reads are the levels in effect.
 #
 # Usage: scripts/check-unsafe.sh [workspace-root]
+#        scripts/check-unsafe.sh --list-rust [workspace-root]
+# The second form prints the Rust files the first one reads, one per line,
+# relative to the root, and checks nothing.
 set -euo pipefail
 
+list_only=0
+if [ "${1:-}" = "--list-rust" ]; then
+  list_only=1
+  shift
+fi
 root="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$root"
 
@@ -65,6 +77,11 @@ all_files() {
 rust_files() {
   all_files | grep -E '\.rs$' || true
 }
+
+if [ "$list_only" -eq 1 ]; then
+  rust_files
+  exit 0
+fi
 
 if ! python3 -c 'import tomllib' 2>/dev/null; then
   echo "check-unsafe: needs python3 3.11 or later (tomllib) to read the manifests" >&2
@@ -313,6 +330,20 @@ function before(s, pos, k) {
   while (k > 0 && substr(s, k, 1) ~ /[ \t\n]/) k--
   return (k > 0) ? substr(s, k, 1) : ""
 }
+# The position of the first character of `s` from `pos` on that is not
+# whitespace.
+function next_at(s, pos) {
+  while (pos <= length(s) && substr(s, pos, 1) ~ /[ \t\n]/) pos++
+  return pos
+}
+# The identifier that ends just before `pos`, whitespace skipped.
+function word_before(s, pos, k, e) {
+  k = pos - 1
+  while (k > 0 && substr(s, k, 1) ~ /[ \t\n]/) k--
+  e = k
+  while (k > 0 && ident(substr(s, k, 1))) k--
+  return substr(s, k + 1, e - k)
+}
 function check(level, lint, ln, relax) {
   relax = (level == "allow" || level == "expect")
   if (lint == "unsafe_code") {
@@ -447,17 +478,32 @@ END {
     masked = substr(masked, 1, s - 1) blank(grp) substr(masked, s + l)
     pos = s + l
   }
-  # `path = ...` in an attribute position: #[path], or a cfg_attr or macro
-  # argument that becomes one.
+  # `path = ...` in an attribute position (#[path], or a cfg_attr or macro
+  # argument that becomes one), or `path = "..."` anywhere but a let
+  # binding, which a macro can turn into #[path] (`m! { path = "x" }`).
   pos = 1
   while (match(substr(masked, pos), /path[ \t\n]*=/)) {
     s = pos + RSTART - 1
     l = RLENGTH
     nx = substr(masked, s + l, 1)
     pc = before(masked, s)
+    wb = word_before(masked, s)
+    literal = substr(masked, next_at(masked, s + l), 1) == "\""
     if ((s == 1 || !ident(substr(masked, s - 1, 1))) && nx != "=" && nx != ">" &&
-        (pc == "[" || pc == "(" || pc == ","))
-      report(line_of(s), "a #[path] attribute compiles a file this check does not read")
+        (pc == "[" || pc == "(" || pc == "," || (literal && wb != "let" && wb != "mut")))
+      report(line_of(s), "a #[path] attribute compiles a file this check does not read (a `path = \"...\"` outside a let binding can become one; rename the variable)")
+    pos = s + l
+  }
+  # The clippy cfg: code under cfg(not(clippy)) compiles but is never
+  # linted, so it could open secrets anywhere. Lint paths (`clippy::x`) are
+  # the only other use of the name.
+  pos = 1
+  while (match(substr(masked, pos), /clippy/)) {
+    s = pos + RSTART - 1
+    l = RLENGTH
+    if ((s == 1 || !ident(substr(masked, s - 1, 1))) && !ident(substr(masked, s + l, 1)) &&
+        substr(masked, next_at(masked, s + l), 2) != "::")
+      report(line_of(s), "names the clippy cfg, which hides code from clippy; only lint paths (clippy::name) may use the name")
     pos = s + l
   }
   # An allow in a listed file would reach the modules it declares out of line.

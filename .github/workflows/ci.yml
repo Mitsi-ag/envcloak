@@ -44,6 +44,11 @@ jobs:
           python3 --version
           scripts/check-unsafe.sh
       - run: cargo clippy --workspace --all-targets --locked
+      # The shipped binaries' own configuration: release profile, no
+      # test-only features. Code compiled only there is linted too.
+      - run: cargo clippy --release --locked
+      - name: Compiled sources are the scanned sources
+        run: scripts/check-sources.sh
       - name: expose_secret lint canary
         run: scripts/check-expose-lint.sh
       - name: unsafe_code forbid canary
