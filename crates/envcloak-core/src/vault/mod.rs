@@ -14,7 +14,9 @@
 //!   decrypts item metadata into memory and gives a [`Vault`]. Values stay
 //!   sealed until [`Vault::read_value`] opens one.
 //! - A vault that fails its integrity check opens read-only
-//!   ([`Integrity::Tampered`]).
+//!   ([`Integrity::Tampered`]) so its owner can recover what it holds. It
+//!   serves items and values, but no policies, project records or header:
+//!   nothing a grant, run or proxy decision may rest on.
 //! - Writes go through [`Vault::transact`] and a [`Txn`].
 //!
 //! Errors are [`VaultError`]s with fixed messages and no values.
@@ -407,6 +409,15 @@ fn read_identity(conn: &Connection, target: u16) -> Result<Identity, VaultError>
 
 /// An unlocked vault: the file, the VMK and its subkeys, and the verified
 /// metadata.
+///
+/// When [`Vault::integrity`] is not [`Integrity::Ok`], rows may be missing
+/// or restored from an older copy. The vault then serves items and values
+/// only for its owner to recover them; [`Vault::policies`],
+/// [`Vault::projects`], [`Vault::find_project`] and [`Vault::header`] fail
+/// with [`VaultErrorKind::Tampered`]. Callers must not evaluate a grant,
+/// release a value to an agent, or trust an item's allowed hosts or
+/// classification unless the integrity is `Ok`: it can change to tampered
+/// while the vault is open.
 pub struct Vault {
     file: LockedVault,
     ctx: VaultCtx,
@@ -514,9 +525,23 @@ impl Vault {
         self.migration_error
     }
 
-    /// The header as of the last commit.
-    pub fn header(&self) -> HeaderState {
-        self.state.header
+    /// The header as of the last commit. Fails with
+    /// [`VaultErrorKind::Tampered`] unless the vault verified: a tampered
+    /// vault's policy epoch, audit head and counters cannot be trusted (and
+    /// are defaults when its header did not open).
+    pub fn header(&self) -> Result<HeaderState, VaultError> {
+        self.trusted()?;
+        Ok(self.state.header)
+    }
+
+    /// Fails with [`VaultErrorKind::Tampered`] unless [`Vault::integrity`]
+    /// is [`Integrity::Ok`].
+    fn trusted(&self) -> Result<(), VaultError> {
+        if self.integrity.get() == Integrity::Ok {
+            Ok(())
+        } else {
+            Err(VaultErrorKind::Tampered.into())
+        }
     }
 
     /// The VMK, for wrapping new unlocker envelopes. Its bytes cannot be
@@ -626,23 +651,40 @@ impl Vault {
         txn::find_by_value(&self.keys, &self.state, v)
     }
 
-    /// Every project record.
-    pub fn projects(&self) -> impl Iterator<Item = (ProjectId, &ProjectRecord)> {
-        self.state.projects.iter().map(|(id, r)| (*id, &r.record))
+    /// Every project record. Fails with [`VaultErrorKind::Tampered`] unless
+    /// the vault verified: a project's bindings decide what `run` releases.
+    pub fn projects(
+        &self,
+    ) -> Result<impl Iterator<Item = (ProjectId, &ProjectRecord)>, VaultError> {
+        self.trusted()?;
+        Ok(self.state.projects.iter().map(|(id, r)| (*id, &r.record)))
     }
 
-    pub fn find_project(&self, key: &ProjectKey) -> Option<(ProjectId, &ProjectRecord)> {
+    /// The record for `key`'s project. Fails as [`Vault::projects`] does.
+    pub fn find_project(
+        &self,
+        key: &ProjectKey,
+    ) -> Result<Option<(ProjectId, &ProjectRecord)>, VaultError> {
+        self.trusted()?;
         let h = state::dir_hash(&self.keys, key.as_bytes());
-        let id = *self.state.project_keys.get(&h)?;
-        self.state.projects.get(&id).map(|r| (id, &r.record))
+        let found = self
+            .state
+            .project_keys
+            .get(&h)
+            .and_then(|id| self.state.projects.get(id).map(|r| (*id, &r.record)));
+        Ok(found)
     }
 
-    /// Every policy record.
-    pub fn policies(&self) -> impl Iterator<Item = (PolicyId, &[u8])> {
-        self.state
+    /// Every policy record. Fails with [`VaultErrorKind::Tampered`] unless
+    /// the vault verified: a deleted or rolled-back policy row must not
+    /// loosen a decision.
+    pub fn policies(&self) -> Result<impl Iterator<Item = (PolicyId, &[u8])>, VaultError> {
+        self.trusted()?;
+        Ok(self
+            .state
             .policies
             .iter()
-            .map(|(id, p)| (*id, p.body.as_slice()))
+            .map(|(id, p)| (*id, p.body.as_slice())))
     }
 
     /// The unlocker envelopes that verified at unlock.

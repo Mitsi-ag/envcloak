@@ -323,6 +323,7 @@ fn assert_matches(v: &Vault, m: &Model, ctx: &str) {
     }
     let projects: BTreeMap<Vec<u8>, u64> = v
         .projects()
+        .unwrap()
         .map(|(_, r)| (r.key.as_bytes().to_vec(), r.last_seen))
         .collect();
     assert_eq!(projects, m.projects, "{ctx}: projects");
@@ -352,7 +353,7 @@ fn crash_writer() {
         .map_err(|(_, e)| e)
         .unwrap();
     assert_eq!(v.integrity(), Integrity::Ok);
-    let mut n = v.header().write_counter;
+    let mut n = v.header().unwrap().write_counter;
     let mut model = Model::default();
     advance(seed, &mut model, 1, n);
     println!("@@ready {n}");
@@ -441,7 +442,7 @@ fn crash_worker(seed: u64) -> Tally {
         let ctx = format!("seed {seed}: kill {kill}");
         let v = f.unlock();
         assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
-        let k = v.header().write_counter;
+        let k = v.header().unwrap().write_counter;
         assert!(
             k == reported || k == reported + 1,
             "{ctx}: counter {k}, last reported commit {reported}"
@@ -559,7 +560,7 @@ fn kill_9_during_create_leaves_no_vault_or_a_whole_one() {
                     .map_err(|(_, e)| e)
                     .unwrap();
                 assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
-                assert_eq!(v.header().write_counter, 1, "{ctx}");
+                assert_eq!(v.header().unwrap().write_counter, 1, "{ctx}");
                 v
             }
             Err(e) => {

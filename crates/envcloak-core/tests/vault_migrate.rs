@@ -206,12 +206,12 @@ fn a_failing_step_later_in_the_plan_rolls_back_every_step() {
 fn a_migration_reseals_everything_and_verifies() {
     let (f, values) = populated(10);
     let before = dump(&f);
-    let counter = f.unlock().header().write_counter;
+    let counter = f.unlock().header().unwrap().write_counter;
 
     let v = open_with(&f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap();
     assert_eq!(v.schema_version(), 2);
     assert_eq!(v.integrity(), Integrity::Ok);
-    assert_eq!(v.header().write_counter, counter + 1);
+    assert_eq!(v.header().unwrap().write_counter, counter + 1);
     assert_values(&v, &values);
     drop(v);
 
@@ -273,7 +273,7 @@ fn a_migration_reseals_everything_and_verifies() {
     // work at the new version.
     let mut v = open_with(&f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap();
     assert_eq!(v.integrity(), Integrity::Ok);
-    assert_eq!(v.header().write_counter, counter + 1);
+    assert_eq!(v.header().unwrap().write_counter, counter + 1);
     v.transact(|t| t.set_value(values[1].0, SecretBytes::copy_from(b"at v2")))
         .unwrap();
     drop(v);

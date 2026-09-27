@@ -141,7 +141,7 @@ When the header and the rows name different schema versions, unlock uses the fir
 | schema altered | A table, index, trigger or view was added or changed |
 | changed while open | A row on disk no longer matches what this process wrote |
 
-A read-only vault refuses every write and still serves the items and values that open, so their owner can recover them.
+A read-only vault refuses every write and still serves the items and values that open, so their owner can recover them. It serves no policies, project records or header (those calls fail as tampered): a deleted or rolled-back row must never loosen a decision. No grant is evaluated, no value is released to an agent, and no item's allowed hosts or classification is trusted from a vault whose integrity is not `Ok`, which can change while it is open.
 
 Without an anchor (Linux, and macOS before M3), restoring the whole file together with its header is not detected locally (SPEC §5). `tests/vault_integrity.rs` pins this limit.
 

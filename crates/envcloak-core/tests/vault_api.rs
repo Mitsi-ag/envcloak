@@ -45,7 +45,7 @@ fn a_new_vault_is_empty_verified_and_durable() {
     let (f, v) = Fixture::create();
     assert_eq!(v.integrity(), Integrity::Ok);
     assert!(v.items().is_empty());
-    assert_eq!(v.header().write_counter, 1);
+    assert_eq!(v.header().unwrap().write_counter, 1);
     assert_eq!(v.schema_version(), 1);
     assert_eq!(v.epoch(), INITIAL_EPOCH);
     assert_eq!(v.vault_id(), f.vault_id);
@@ -95,7 +95,7 @@ fn items_fields_and_values_round_trip() {
             Ok((item, key, org))
         })
         .unwrap();
-    assert_eq!(v.header().write_counter, 2);
+    assert_eq!(v.header().unwrap().write_counter, 2);
     let slugs: Vec<&str> = v.items().iter().map(|i| i.slug.as_str()).collect();
     assert_eq!(slugs, ["a/first", "openai/work"], "sorted by slug");
     let meta = v.find(&slug("openai/work")).unwrap();
@@ -156,7 +156,7 @@ fn a_failed_transaction_changes_nothing() {
             t.add_field(i, name("value"), value(b"kept value"))
         })
         .unwrap();
-    let before = v.header();
+    let before = v.header().unwrap();
     let err = v
         .transact(|t| -> Result<(), _> {
             t.create_item(secret_item("gone/soon"))?;
@@ -166,12 +166,12 @@ fn a_failed_transaction_changes_nothing() {
         })
         .unwrap_err();
     assert_eq!(err.kind(), VaultErrorKind::InvalidRecord);
-    assert_eq!(v.header(), before);
+    assert_eq!(v.header().unwrap(), before);
     assert!(v.find(&slug("gone/soon")).is_none());
     assert!(v.read_value(field).unwrap().ct_eq(b"kept value"));
     drop(v);
     let v = f.unlock();
-    assert_eq!(v.header(), before);
+    assert_eq!(v.header().unwrap(), before);
     assert_eq!(v.items().len(), 1);
     assert!(v.read_value(field).unwrap().ct_eq(b"kept value"));
 }
@@ -382,11 +382,11 @@ fn projects_policies_and_header_fields_persist() {
     drop(v);
     let mut v = f.unlock();
     assert_eq!(v.integrity(), Integrity::Ok);
-    assert_eq!(v.find_project(&key).unwrap(), (pid, &updated));
-    assert_eq!(v.projects().count(), 1);
-    let policies: Vec<_> = v.policies().collect();
+    assert_eq!(v.find_project(&key).unwrap().unwrap(), (pid, &updated));
+    assert_eq!(v.projects().unwrap().count(), 1);
+    let policies: Vec<_> = v.policies().unwrap().collect();
     assert_eq!(policies, [(policy, &b"policy body v2"[..])]);
-    let h = v.header();
+    let h = v.header().unwrap();
     assert_eq!(h.audit_head.unwrap().seq, 42);
     assert!(h.recovery_confirmed);
     assert_eq!(h.policy_epoch, 1);
@@ -396,8 +396,8 @@ fn projects_policies_and_header_fields_persist() {
     drop(v);
     let v = f.unlock();
     assert_eq!(v.integrity(), Integrity::Ok);
-    assert_eq!(v.projects().count(), 0);
-    assert_eq!(v.policies().count(), 0);
+    assert_eq!(v.projects().unwrap().count(), 0);
+    assert_eq!(v.policies().unwrap().count(), 0);
 }
 
 #[test]

@@ -160,7 +160,7 @@ fn fixture_writer() {
         .unwrap();
     let mut rng = Rng(seed);
     // Earlier children's items remain: slugs start from this run's counter.
-    let base = v.header().write_counter;
+    let base = v.header().unwrap().write_counter;
     println!("@@ready");
     // Runs until the parent kills it.
     let mut n = 0u64;

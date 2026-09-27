@@ -149,7 +149,9 @@ fn swap_blobs(raw: &rusqlite::Connection, table: &str, col: &str, a: &[u8], b: &
 }
 
 /// The vault opened read-only with `want` (or any kind when `None`), still
-/// serves the untouched value, and refuses writes.
+/// serves the untouched value, refuses writes, and serves nothing a grant
+/// or policy decision could rest on: no policies, project records or
+/// header.
 fn assert_read_only(mut v: Vault, want: Option<TamperKind>, keep: Option<FieldId>, case: &str) {
     match (v.integrity(), want) {
         (Integrity::Tampered(got), Some(want)) => assert_eq!(got, want, "{case}"),
@@ -159,6 +161,13 @@ fn assert_read_only(mut v: Vault, want: Option<TamperKind>, keep: Option<FieldId
     if let Some(keep) = keep {
         assert!(v.read_value(keep).unwrap().ct_eq(KEEP), "{case}");
     }
+    let untrusted = |r: Result<(), envcloak_core::vault::VaultError>| {
+        assert_eq!(r.unwrap_err().kind(), VaultErrorKind::Tampered, "{case}");
+    };
+    untrusted(v.policies().map(drop));
+    untrusted(v.projects().map(drop));
+    untrusted(v.find_project(&project(1).key).map(drop));
+    untrusted(v.header().map(drop));
     let e = v
         .transact(|t| t.create_item(secret_item("new/item")))
         .unwrap_err();
@@ -256,7 +265,7 @@ fn restoring_one_row_from_an_older_copy_opens_read_only() {
     )
     .unwrap();
     let item = v.find(&slug("b/other")).unwrap().id;
-    let policy = v.policies().next().unwrap().0;
+    let policy = v.policies().unwrap().next().unwrap().0;
     v.transact(|t| {
         t.set_value(p.other, SecretBytes::copy_from(b"rotated value"))?;
         t.update_item(
@@ -748,14 +757,14 @@ fn restoring_the_whole_file_is_not_detected_locally() {
     let p = pristine();
     p.restore();
     let mut v = p.f.unlock();
-    let before = v.header().write_counter;
+    let before = v.header().unwrap().write_counter;
     v.transact(|t| t.set_value(p.other, SecretBytes::copy_from(b"newer value")))
         .unwrap();
     drop(v);
     p.restore();
     let v = p.f.unlock();
     assert_eq!(v.integrity(), Integrity::Ok);
-    assert_eq!(v.header().write_counter, before);
+    assert_eq!(v.header().unwrap().write_counter, before);
     assert!(v.read_value(p.other).unwrap().ct_eq(b"other value"));
 }
 
