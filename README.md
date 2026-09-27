@@ -45,6 +45,7 @@ STRIPE_SECRET_KEY = "stripe/acme-live"
 ## Design
 
 The full product and architecture spec, including the threat model, is in [docs/SPEC.md](docs/SPEC.md).
+The vault's byte formats and key derivations are in [docs/CRYPTO.md](docs/CRYPTO.md).
 
 ## Contributing
 

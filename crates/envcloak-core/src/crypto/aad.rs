@@ -1,4 +1,5 @@
-//! Canonical associated data for sealed values (SPEC §5 "Vault").
+//! Canonical associated data for sealed values (SPEC §5 "Vault"; layout in
+//! docs/CRYPTO.md).
 //!
 //! Every sealed value is bound to (vault_id, schema_version, key_epoch,
 //! table, row_id, field, item_class, row_version). The encoding is fixed

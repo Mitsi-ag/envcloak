@@ -305,8 +305,8 @@ fn the_same_plaintext_seals_differently_each_time() {
     assert_ne!(a.ciphertext, b.ciphertext);
 }
 
-/// The encoding, rebuilt here field by field from the documented layout,
-/// independently of `Aad::encode`.
+/// The encoding, rebuilt here field by field from the documented layout
+/// (docs/CRYPTO.md), independently of `Aad::encode`.
 fn canonical(a: &Aad) -> Vec<u8> {
     let mut v = vec![1u8];
     v.extend(a.vault_id.0);

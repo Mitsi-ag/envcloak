@@ -1,5 +1,5 @@
 //! Unlocker envelopes: the VMK wrapped under a passphrase or Recovery Kit
-//! (SPEC §5 "Key hierarchy").
+//! (SPEC §5 "Key hierarchy"; byte layout in docs/CRYPTO.md).
 //!
 //! - KEK = Argon2id(secret, salt, params), through [`derive_kek`], which
 //!   checks the stored parameters against the bounds first.

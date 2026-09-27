@@ -1,4 +1,5 @@
-//! Crypto primitives for the vault (SPEC §5 "Vault", §11).
+//! Crypto primitives for the vault (SPEC §5 "Vault", §11; the byte formats
+//! are in docs/CRYPTO.md).
 //!
 //! - [`seal`] and [`open`]: XChaCha20-Poly1305 under a [`SubKey`], with a
 //!   fresh 192-bit nonce from the OS CSPRNG per seal and the canonical
