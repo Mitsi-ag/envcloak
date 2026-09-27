@@ -9,9 +9,11 @@
 //!   percent and form encodings in both hex cases, and JSON escaping as
 //!   common serializers produce it. The encoders here are written
 //!   independently of `envcloak-redact`, so they do not share its bugs.
-//! - [`assert_no_canary`], [`find`] and [`sweep_dir`]: detection. Failure
-//!   messages and [`Found`] or [`Hit`] values name the canary's label and
-//!   the encoding, never the value.
+//! - [`assert_no_canary`], [`find`], [`sweep_dir`] and
+//!   [`assert_sweep_clean`]: detection. Failure messages, and the `Debug`
+//!   and `Display` output of [`Found`] and [`Hit`], name the canary's label
+//!   and the encoding, never the value; a path whose names hold a value
+//!   prints with `<LABEL>` in their place.
 //! - [`probe_canaries`]: arms the allocator probe (gate 11) with canaries.
 //! - [`TestHome`]: an isolated HOME and XDG tree under a short `/tmp` path,
 //!   and a cleared environment for the processes a test starts.
@@ -22,7 +24,10 @@ mod encode;
 mod home;
 
 pub use canary::{Canary, by_label, canaries, fresh_seed, labels};
-pub use detect::{Detector, Found, Hit, assert_no_canary, encodings, find, sweep_dir};
+pub use detect::{
+    Detector, Found, Hit, SweptPath, assert_no_canary, assert_sweep_clean, encodings, find,
+    sweep_dir,
+};
 pub use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeReport, ProbeSession};
 pub use home::{TEST_ENV_VARS, TEST_PATH, TestHome};
 

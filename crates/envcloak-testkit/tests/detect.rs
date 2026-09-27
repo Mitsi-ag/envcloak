@@ -10,8 +10,8 @@ use std::process::Command;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use envcloak_testkit::{
-    Canary, Detector, Hit, PROBE_WINDOW, TEST_ENV_VARS, TestHome, assert_no_canary, by_label,
-    canaries, encodings, find, fresh_seed, labels, sweep_dir,
+    Canary, Detector, Hit, PROBE_WINDOW, TEST_ENV_VARS, TestHome, assert_no_canary,
+    assert_sweep_clean, by_label, canaries, encodings, find, fresh_seed, labels, sweep_dir,
 };
 
 fn panic_message(f: impl FnOnce()) -> Option<String> {
@@ -232,7 +232,7 @@ fn sweep_dir_reports_hits_and_never_follows_symlinks_or_hangs() {
         .collect();
     assert!(!canary_hits.is_empty());
     for (path, found) in &canary_hits {
-        assert!(path.ends_with("a/b/log.txt"), "{path:?}");
+        assert!(path.raw().ends_with("a/b/log.txt"), "{path:?}");
         assert_eq!(found.label, labels::STRIPE_SECRET_KEY);
         assert_eq!(found.encoding, "hex-upper");
     }
@@ -443,4 +443,98 @@ fn sweep_dir_checks_entry_names_and_symlink_targets() {
         };
         assert_eq!(found.label, expected);
     }
+}
+
+/// Every way a test prints hits: each hit's `Debug`, pretty `Debug` and
+/// `Display`, and the whole list.
+fn printed(hits: &[Hit]) -> String {
+    let mut out = format!("{hits:?}\n{hits:#?}\n");
+    for h in hits {
+        out.push_str(&format!("{h}\n{h:?}\n"));
+    }
+    out
+}
+
+#[test]
+fn printed_hits_never_repeat_a_canary() {
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let root = home.home();
+    let github = by_label(&cs, labels::GITHUB_TOKEN);
+    let stripe = by_label(&cs, labels::STRIPE_SECRET_KEY);
+    let openai = by_label(&cs, labels::OPENAI_API_KEY);
+
+    // A file named after a value; a directory named after a value holding a
+    // file with a value inside and an unreadable file; a symlink to a value.
+    std::fs::write(
+        root.join(format!("backup-{}.bak", github.as_str())),
+        noise(10),
+    )
+    .unwrap();
+    let dir = root.join(format!("cache-{}", stripe.as_str()));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("log.txt"), openai.value()).unwrap();
+    let locked = dir.join("locked.txt");
+    std::fs::write(&locked, b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::os::unix::fs::symlink(format!("/nowhere/{}", openai.as_str()), dir.join("link")).unwrap();
+
+    let hits = sweep_dir(home.root(), &cs);
+    assert!(hits.len() >= 4, "{hits:?}");
+    let text = printed(&hits);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        find(text.as_bytes(), &cs).is_empty(),
+        "printed hits hold a value"
+    );
+    // Still useful: the value-bearing names show as their labels.
+    assert!(text.contains(&format!("backup-<{}>", labels::GITHUB_TOKEN)));
+    assert!(text.contains(&format!("<{}>/log.txt", labels::STRIPE_SECRET_KEY)));
+
+    // assert_sweep_clean fails with the same value-free lines.
+    let message = panic_message(|| assert_sweep_clean(home.root(), &cs)).unwrap();
+    assert!(message.starts_with("canary sweep: "), "{message}");
+    assert!(
+        find(message.as_bytes(), &cs).is_empty(),
+        "the panic holds a value"
+    );
+    let message = panic_message(|| home.assert_clean(&cs)).unwrap();
+    assert!(
+        find(message.as_bytes(), &cs).is_empty(),
+        "the panic holds a value"
+    );
+
+    let clean = TestHome::new();
+    std::fs::write(clean.home().join("notes.txt"), noise(100)).unwrap();
+    assert_sweep_clean(clean.root(), &cs);
+    clean.assert_clean(&cs);
+}
+
+#[test]
+fn a_canary_spread_over_nested_names_is_found_and_never_printed() {
+    // A value with a `/` in it (a path-like token, or base64 of binary
+    // data) written into a path spans directories. The generated canaries
+    // are alphanumeric, so this test makes its own from one at runtime.
+    let cs = canaries(fresh_seed());
+    let base = by_label(&cs, labels::OPENAI_API_KEY).as_str();
+    let spread = Canary::new("SPREAD", format!("{}/{}", &base[8..28], &base[28..48]));
+    let cs = vec![spread];
+    let home = TestHome::new();
+    let deep = home.home().join(cs[0].as_str());
+    std::fs::create_dir_all(deep.join("inner")).unwrap();
+
+    let hits = sweep_dir(home.root(), &cs);
+    let names: Vec<&Hit> = hits
+        .iter()
+        .filter(|h| matches!(h, Hit::Name { path, .. } if path == &deep))
+        .collect();
+    assert_eq!(names.len(), 1, "{hits:?}");
+    // Reported once, at the deepest entry it reaches, not again below it.
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let text = printed(&hits);
+    assert!(
+        find(text.as_bytes(), &cs).is_empty(),
+        "printed hits hold a value"
+    );
+    assert!(text.contains("<redacted>"), "{text}");
 }

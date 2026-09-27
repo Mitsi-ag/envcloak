@@ -7,7 +7,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use crate::canary::Canary;
-use crate::detect::{Hit, sweep_dir};
+use crate::detect::{Hit, assert_sweep_clean, sweep_dir};
 
 /// The `PATH` [`TestHome::apply`] gives a child: system directories only.
 pub const TEST_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -90,6 +90,12 @@ impl TestHome {
     /// Sweeps the whole tree for canaries.
     pub fn sweep(&self, cs: &[Canary]) -> Vec<Hit> {
         sweep_dir(self.root(), cs)
+    }
+
+    /// Panics if the tree holds any canary, listing the hits without
+    /// values (see [`assert_sweep_clean`]).
+    pub fn assert_clean(&self, cs: &[Canary]) {
+        assert_sweep_clean(self.root(), cs);
     }
 }
 
