@@ -338,6 +338,36 @@ fn a_changed_or_tampered_vault_is_not_backed_up() {
     assert!(dir_names(&f.paths.backups_dir).is_empty());
 }
 
+/// A vault file whose structure is damaged behind the open vault (its
+/// SQLite header overwritten) cannot be read into a verified image: the
+/// backup is refused, and the vault turns read-only as for any other
+/// change found while open, instead of staying trusted (F-23).
+#[test]
+fn a_structurally_damaged_vault_is_not_backed_up() {
+    let (f, v) = KitFixture::create();
+    drop(v);
+    let v = f.unlock();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(f.db())
+            .unwrap();
+        file.write_all_at(&[0u8; 16], 0).unwrap();
+        file.sync_all().unwrap();
+    }
+    let e = v.create_backup().unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Tampered);
+    assert_eq!(
+        v.integrity(),
+        Integrity::Tampered(TamperKind::ChangedWhileOpen)
+    );
+    assert_eq!(v.header().unwrap_err().kind(), VaultErrorKind::Tampered);
+    assert!(v.policies().is_err() && v.projects().is_err());
+    assert!(dir_names(&f.paths.backups_dir).is_empty());
+}
+
 #[test]
 fn a_vault_without_a_kit_is_not_backed_up() {
     let (f, v) = Fixture::create();

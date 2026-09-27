@@ -10,7 +10,10 @@
 //! memory and verified with the vault's keys: the digest must verify and
 //! the header must be the one this process last committed. A file changed
 //! behind the vault's back therefore never becomes a backup; the vault
-//! turns read-only instead, as for any other change found while open.
+//! turns read-only instead, as for any other change found while open. So
+//! does a file that can no longer be read or opened as a database at all:
+//! whatever the reason, a vault that cannot produce a verified image of
+//! itself is no longer trusted until an unlock verifies it again.
 
 use rusqlite::{Connection, MAIN_DB};
 
@@ -26,9 +29,19 @@ const SQLITE_HEADER_LEN: usize = 100;
 impl Vault {
     /// The database image, verified. Refused with
     /// [`VaultErrorKind::Tampered`] unless the vault verified at unlock and
-    /// still matches what this process committed.
+    /// still matches what this process committed; any failure to read or
+    /// verify the image turns the vault read-only
+    /// ([`TamperKind::ChangedWhileOpen`]) and is reported as tampering.
     pub(crate) fn snapshot(&self) -> Result<Vec<u8>, VaultError> {
         self.trusted()?;
+        self.verified_image().map_err(|_| {
+            self.integrity
+                .set(Integrity::Tampered(TamperKind::ChangedWhileOpen));
+            VaultErrorKind::Tampered.into()
+        })
+    }
+
+    fn verified_image(&self) -> Result<Vec<u8>, VaultError> {
         // Read the file as it is now, not pages cached before another
         // program changed it.
         schema::drop_page_cache(&self.file.conn)?;
@@ -47,8 +60,6 @@ impl Vault {
             }
         }
         if !self.image_matches(&image)? {
-            self.integrity
-                .set(Integrity::Tampered(TamperKind::ChangedWhileOpen));
             return Err(VaultErrorKind::Tampered.into());
         }
         Ok(image)
