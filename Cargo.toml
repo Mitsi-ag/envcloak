@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+# security/lint-canary is a member so it inherits the workspace lints; see
+# scripts/check-expose-lint.sh.
+members = ["crates/*", "security/lint-canary"]
 
 [workspace.package]
 version = "0.1.0"
@@ -37,6 +39,7 @@ tempfile = "3.27.0"
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(envcloak_lint_canary)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

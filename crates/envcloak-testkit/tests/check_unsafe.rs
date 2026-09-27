@@ -21,6 +21,18 @@ fn exposure_lint() -> String {
     ["clippy::disallowed", "_methods"].concat()
 }
 
+fn warnings_lint() -> String {
+    ["warn", "ings"].concat()
+}
+
+/// The clean fixture's root manifest, followed by `extra`.
+fn root_manifest(extra: &str) -> String {
+    format!(
+        "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.lints.rust]\n{} = \"deny\"\n{extra}",
+        unsafe_lint()
+    )
+}
+
 fn run(root: &Path) -> Output {
     Command::new("bash")
         .arg(repo_root().join("scripts/check-unsafe.sh"))
@@ -42,13 +54,7 @@ fn clean_tree() -> TestHome {
     let t = TestHome::new();
     let r = t.home();
     let uc = unsafe_lint();
-    write(
-        &r,
-        "Cargo.toml",
-        &format!(
-            "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.lints.rust]\n{uc} = \"deny\"\n"
-        ),
-    );
+    write(&r, "Cargo.toml", &root_manifest(""));
     write(
         &r,
         "clippy.toml",
@@ -251,4 +257,154 @@ fn in_a_git_checkout_ignored_files_are_skipped_and_untracked_ones_checked() {
     // Not ignored and not yet added: still checked.
     write(&r, "crates/envcloak-core/src/new.rs", &violation);
     assert_fails(&t, "crates/envcloak-core/src/new.rs");
+}
+
+#[test]
+fn allowing_warnings_anywhere_fails() {
+    let w = warnings_lint();
+    for (rel, text) in [
+        (
+            "crates/envcloak-core/src/leak.rs",
+            format!("#![allow({w})]\n"),
+        ),
+        (
+            "crates/envcloak-core/src/a.rs",
+            format!("#[expect({w}, reason = \"noise\")]\nfn f() {{}}\n"),
+        ),
+        (
+            "crates/envcloak-core/tests/b.rs",
+            format!("#![cfg_attr(test, allow(\n    dead_code,\n    {w}\n))]\n"),
+        ),
+        // Not even envcloak-sys may do it.
+        ("crates/envcloak-sys/src/c.rs", format!("#![allow({w})]\n")),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), rel, &text);
+        assert_fails(&t, rel);
+    }
+
+    // Warning about warnings, or naming a variable after them, is fine.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/fine.rs",
+        &format!("#![deny({w})]\nfn f() {{\n    let {w} = 1;\n    let _ = {w};\n}}\n"),
+    );
+    assert_passes(&t);
+}
+
+#[test]
+fn relaxed_workspace_lint_tables_fail() {
+    let w = warnings_lint();
+    for extra in [
+        "\n[workspace.lints.clippy]\ndisallowed_methods = \"allow\"\n".to_owned(),
+        "\n[workspace.lints.clippy]\ndisallowed-methods = { level = \"allow\" }\n".to_owned(),
+        "\n[workspace.lints.clippy]\nstyle = { level = \"allow\", priority = 1 }\n".to_owned(),
+        "\n[workspace.lints.clippy]\nall = 'allow'\n".to_owned(),
+        format!("{w} = \"allow\"\n"),
+        "\n[workspace.lints.clippy.style]\nlevel = \"allow\"\n".to_owned(),
+        "\n[workspace.lints]\nclippy = { all = \"allow\" }\n".to_owned(),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), "Cargo.toml", &root_manifest(&extra));
+        assert_fails(&t, "Cargo.toml");
+    }
+
+    let t = clean_tree();
+    let r = t.home();
+    let text = root_manifest("").replace(
+        "[workspace]\n",
+        "[workspace]\nlints.clippy.all = \"allow\"\n",
+    );
+    write(&r, "Cargo.toml", &text);
+    assert_fails(&t, "Cargo.toml");
+
+    // Raising levels is fine.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "Cargo.toml",
+        &root_manifest(&format!(
+            "{w} = \"warn\"\n\n[workspace.lints.clippy]\nall = {{ level = \"warn\", priority = -1 }}\ndisallowed_methods = \"deny\"\n"
+        )),
+    );
+    assert_passes(&t);
+}
+
+#[test]
+fn comments_and_strings_neither_satisfy_nor_trip_the_checks() {
+    let uc = unsafe_lint();
+    for text in [
+        // A deny in a trailing comment does not excuse the allow.
+        format!("#![allow({uc})] // the workspace sets deny({uc})\n"),
+        format!("/* deny({uc}) */ #![allow({uc})]\n"),
+        format!("#![allow({uc})] const S: &str = \"deny({uc})\";\n"),
+        // A deny and an allow on one line.
+        format!("#![deny({uc})] #![allow({uc})]\n"),
+        // A lint name that reaches an attribute some other way.
+        format!("macro_rules! m {{ ($l:ident) => {{ #[allow($l)] fn f() {{}} }} }}\nm!({uc});\n"),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), "crates/envcloak-core/src/x.rs", &text);
+        assert_fails(&t, "crates/envcloak-core/src/x.rs");
+    }
+
+    let w = warnings_lint();
+    let dm = exposure_lint();
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/y.rs",
+        &format!(
+            "#![deny({uc})] // allow({uc}) would fail here\n\
+             // #![allow({uc})]\n\
+             /* #![allow({w})] /* nested allow({dm}) */ allow(clippy::all) */\n\
+             /// Doc text: allow(clippy::style)\n\
+             const A: &str = \"#![allow({uc})]\";\n\
+             const B: &str = r#\"allow({w}) \"quoted\" allow({dm})\"#;\n\
+             const C: &[u8] = b\"allow({uc})\\\"\";\n\
+             const D: char = '\"';\n\
+             const E: u8 = b'\\'';\n\
+             fn f<'a>(x: &'a str) -> &'a str {{\n    'outer: loop {{\n        break 'outer;\n    }}\n    let _ = \"allow(\\\"{uc}\\\")\";\n    x\n}}\n"
+        ),
+    );
+    assert_passes(&t);
+}
+
+#[test]
+fn a_file_the_check_cannot_read_fails() {
+    for text in [
+        "const S: &str = \"unterminated;\n",
+        "/* open /* nested */\n",
+    ] {
+        let t = clean_tree();
+        write(&t.home(), "crates/envcloak-core/src/z.rs", text);
+        assert_fails(&t, "crates/envcloak-core/src/z.rs");
+    }
+}
+
+#[test]
+fn cargo_config_rustflags_fail() {
+    let t = clean_tree();
+    write(
+        &t.home(),
+        ".cargo/config.toml",
+        &format!("[build]\nrustflags = [\"-A\", \"{}\"]\n", warnings_lint()),
+    );
+    assert_fails(&t, ".cargo/config.toml");
+}
+
+#[test]
+fn every_package_in_the_tree_inherits_workspace_lints() {
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "security/lint-canary/Cargo.toml",
+        "[package]\nname = \"c\"\nversion = \"0.1.0\"\n",
+    );
+    assert_fails(&t, "security/lint-canary/Cargo.toml");
+
+    let t = clean_tree();
+    write(&t.home(), "security/lint-canary/Cargo.toml", MEMBER);
+    assert_passes(&t);
 }

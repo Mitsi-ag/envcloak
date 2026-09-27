@@ -1,7 +1,12 @@
 //! A deliberate violation: every way this file opens a secret must be
 //! reported by clippy's disallowed-methods lint, configured in the root
-//! clippy.toml. scripts/check-expose-lint.sh counts the reports against the
+//! clippy.toml, at the lint levels every workspace crate inherits.
+//! scripts/check-expose-lint.sh counts the reports against the
 //! EXPECT-DISALLOWED markers. Never add this file to the expose allowlist.
+//!
+//! Compiled only with `--cfg envcloak_lint_canary`, so ordinary workspace
+//! builds, which deny warnings in CI, see an empty crate.
+#![cfg(envcloak_lint_canary)]
 
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox};
 
@@ -19,6 +24,7 @@ pub fn mutable(s: &mut SecretBox<[u8; 4]>) {
 
 /// A wrapper like `envcloak_core::SecretBytes`: calls on it resolve to the
 /// same trait method.
+#[derive(Debug)]
 pub struct Wrapper(SecretBox<[u8; 4]>);
 
 impl ExposeSecret<[u8; 4]> for Wrapper {

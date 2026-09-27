@@ -1,14 +1,19 @@
 [package]
 name = "envcloak-lint-canary"
-version = "0.0.0"
-edition = "2024"
+description = "A deliberate expose_secret violation that proves clippy's disallowed-methods lint is active for workspace crates"
 publish = false
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
 
-# Not a member of the EnvCloak workspace. scripts/check-expose-lint.sh runs
-# clippy here, under the root clippy.toml, and expects every call site marked
-# EXPECT-DISALLOWED in src/lib.rs to be reported.
-[workspace]
+# A workspace member, so it builds under the workspace lint levels and the
+# root clippy.toml like every crate. Its code compiles only with
+# `--cfg envcloak_lint_canary`, which scripts/check-expose-lint.sh passes;
+# ordinary builds see an empty crate.
+[lints]
+workspace = true
 
 [dependencies]
-secrecy = "=0.10.3"
+secrecy.workspace = true

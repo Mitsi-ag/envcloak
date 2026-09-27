@@ -78,6 +78,13 @@ name = "envcloak-ipc"
 version = "0.1.0"
 
 [[package]]
+name = "envcloak-lint-canary"
+version = "0.1.0"
+dependencies = [
+ "secrecy",
+]
+
+[[package]]
 name = "envcloak-mcp"
 version = "0.1.0"
 
