@@ -94,22 +94,17 @@ pub fn parse_tracer_pid(status: &str) -> Option<u32> {
 
 /// Whether a debugger or other tracer is attached to this process right now.
 ///
-/// Linux reads `TracerPid` from `/proc/self/status`. macOS reads the
-/// kernel's traced flag with `proc_pidinfo(PROC_PIDTBSDINFO)`, the same flag
-/// Apple's QA1361 reads through `sysctl` as `P_TRACED`. This is defense in
-/// depth: on Linux, non-dumpable blocks new attaches, and on signed macOS
-/// builds the hardened runtime does.
+/// Linux reads `TracerPid` for every thread under `/proc/self/task`, since
+/// ptrace attaches to threads and `/proc/self/status` shows only the main
+/// one. macOS reads the kernel's traced flag with
+/// `proc_pidinfo(PROC_PIDTBSDINFO)`, the same flag Apple's QA1361 reads
+/// through `sysctl` as `P_TRACED`. This is defense in depth: on Linux,
+/// non-dumpable blocks new attaches, and on signed macOS builds the hardened
+/// runtime does.
 pub fn tracer_present() -> io::Result<bool> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let status = std::fs::read_to_string("/proc/self/status")?;
-        match parse_tracer_pid(&status) {
-            Some(pid) => Ok(pid != 0),
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "no TracerPid field in /proc/self/status",
-            )),
-        }
+        linux_traced()
     }
     #[cfg(target_os = "macos")]
     {
@@ -119,6 +114,36 @@ pub fn tracer_present() -> io::Result<bool> {
     {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_traced() -> io::Result<bool> {
+    let tracer_of = |status: &str| {
+        parse_tracer_pid(status).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no TracerPid field in a status file",
+            )
+        })
+    };
+    let mut threads = 0usize;
+    for entry in std::fs::read_dir("/proc/self/task")? {
+        let status = match std::fs::read_to_string(entry?.path().join("status")) {
+            Ok(s) => s,
+            // The thread exited between listing and reading.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if tracer_of(&status)? != 0 {
+            return Ok(true);
+        }
+        threads += 1;
+    }
+    if threads == 0 {
+        // Every listed thread vanished; the main thread cannot have.
+        return Ok(tracer_of(&std::fs::read_to_string("/proc/self/status")?)? != 0);
+    }
+    Ok(false)
 }
 
 /// Locks `region` into RAM with `mlock` and, on Linux, excludes its pages

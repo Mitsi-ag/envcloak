@@ -20,6 +20,12 @@ testing = []
 libc.workspace = true
 zeroize.workspace = true
 
+# Runs its own main so the traced child calls PTRACE_TRACEME on its main
+# thread (see the file).
+[[test]]
+name = "tracer"
+harness = false
+
 [dev-dependencies]
 # Enables the `testing` feature for this crate's own tests.
 envcloak-sys = { path = ".", features = ["testing"] }

@@ -1,5 +1,11 @@
-//! `tracer_present` against a real tracer: a child copy of this test binary
-//! asks to be traced by its parent (this process) and reports what it sees.
+//! `tracer_present` against a real tracer: a child copy of this binary asks
+//! to be traced by its parent (this process) and reports what it sees.
+//!
+//! This binary has no libtest harness (`harness = false`), so the child
+//! calls `PTRACE_TRACEME` on its main thread. From a libtest worker thread
+//! it would hang on Linux: when a traced non-leader thread exits it stays a
+//! zombie until its tracer reaps it with `__WALL`, and until then the
+//! process never finishes exiting.
 #![allow(clippy::unwrap_used)]
 
 use std::process::Command;
@@ -8,28 +14,18 @@ use envcloak_sys::tracer_present;
 
 const CHILD_ENV: &str = "ENVCLOAK_SYS_TRACER_CHILD";
 
-#[test]
-fn untraced_process_reports_no_tracer() {
-    assert!(!tracer_present().unwrap());
-}
-
-/// Runs only as the child of `traced_process_reports_a_tracer`.
-#[test]
-fn traced_child() {
-    if std::env::var_os(CHILD_ENV).is_none() {
+fn main() {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let before = tracer_present().unwrap();
+        envcloak_sys::testing::trace_me().unwrap();
+        let after = tracer_present().unwrap();
+        println!("before={before} after={after}");
         return;
     }
-    let before = tracer_present().unwrap();
-    envcloak_sys::testing::trace_me().unwrap();
-    let after = tracer_present().unwrap();
-    println!("before={before} after={after}");
-}
 
-#[test]
-fn traced_process_reports_a_tracer() {
-    let exe = std::env::current_exe().unwrap();
-    let out = Command::new(exe)
-        .args(["--exact", "traced_child", "--nocapture", "--test-threads=1"])
+    assert!(!tracer_present().unwrap(), "no tracer expected");
+
+    let out = Command::new(std::env::current_exe().unwrap())
         .env(CHILD_ENV, "1")
         .output()
         .unwrap();
@@ -39,4 +35,5 @@ fn traced_process_reports_a_tracer() {
         stdout.contains("before=false after=true"),
         "child output: {stdout}"
     );
+    println!("tracer: untraced and traced checks passed");
 }
