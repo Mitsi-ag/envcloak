@@ -228,8 +228,10 @@ impl Vault {
 ///   ([`VaultErrorKind::Tampered`]);
 /// - the current vault is open ([`VaultErrorKind::Busy`]).
 ///
-/// A current vault that is not an EnvCloak vault at all is moved aside
-/// too. See the module documentation for the order of the steps.
+/// A current file that is not an EnvCloak vault at all, or opens as
+/// [`VaultErrorKind::Damaged`] (its plaintext tables altered, say), is
+/// moved aside too. See the module documentation for the order of the
+/// steps.
 ///
 /// Fails with [`VaultErrorKind::RestoreUnverified`] when the backup was
 /// installed but the installed vault does not open or verify, or verifies
@@ -314,6 +316,8 @@ fn restore(
     // A vault is opened, which takes its lock and folds in its WAL. A file
     // that is not one is left to be moved aside with its side files as
     // they are: SQLite would delete a WAL next to a file it cannot read.
+    // So is one that opens as damaged; a busy vault, a path or permission
+    // failure, or a newer format stops the restore.
     let old = if looks_like_a_vault(&p.db)? {
         match LockedVault::open(p) {
             Ok(v) => Some(v),

@@ -394,6 +394,9 @@ struct Identity {
 ///   under. When no row names one, every version this build reads is
 ///   tried. When every row names a newer one, the vault is refused with
 ///   [`VaultErrorKind::UnsupportedVersion`].
+///
+/// A table or column these rows need that is missing from the file is
+/// [`VaultErrorKind::Damaged`] too: its plaintext layout was altered.
 fn read_identity(conn: &Connection, target: u16) -> Result<Identity, VaultError> {
     let metas = state::query(
         conn,
@@ -405,7 +408,8 @@ fn read_identity(conn: &Connection, target: u16) -> Result<Identity, VaultError>
                 r.get::<_, i64>(2)?,
             ))
         },
-    )?;
+    )
+    .map_err(layout_damaged)?;
     let headers = state::query(
         conn,
         "SELECT epoch, vault_id, schema_version FROM header",
@@ -416,10 +420,12 @@ fn read_identity(conn: &Connection, target: u16) -> Result<Identity, VaultError>
                 r.get::<_, i64>(2)?,
             ))
         },
-    )?;
+    )
+    .map_err(layout_damaged)?;
     let unlockers = state::query(conn, "SELECT vault_id, envelope FROM unlockers", |r| {
         Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
-    })?;
+    })
+    .map_err(layout_damaged)?;
 
     let mut votes = std::collections::BTreeMap::<[u8; 16], usize>::new();
     let ids = metas
@@ -484,6 +490,18 @@ fn read_identity(conn: &Connection, target: u16) -> Result<Identity, VaultError>
         epoch,
         created_at,
     })
+}
+
+/// SQLite's generic error from a statement on the file's own tables: a
+/// table or column that is not there (or a view, which the connection
+/// refuses to read). Other failures keep their kind.
+fn layout_damaged(e: VaultError) -> VaultError {
+    match e.kind() {
+        VaultErrorKind::Storage(code) if code & 0xff == rusqlite::ffi::SQLITE_ERROR => {
+            VaultErrorKind::Damaged.into()
+        }
+        _ => e,
+    }
 }
 
 /// An unlocked vault: the file, the VMK and its subkeys, and the verified

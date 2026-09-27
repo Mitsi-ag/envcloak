@@ -13,7 +13,7 @@
 //!   another state installed, valid or not, fails;
 //! - a restore refuses an open vault, a weak new passphrase, and a backup
 //!   path that is a symlink, a FIFO or a directory, and moves aside a file
-//!   that is not a vault.
+//!   that is not a vault or is a damaged one.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -718,6 +718,49 @@ fn a_restore_fails_when_another_valid_state_is_installed() {
     drop(v);
     assert!(opens_with(&f, &requested));
     assert!(!opens_with(&f, &later_pass));
+    f.home.assert_clean(&f.cs);
+}
+
+/// A file with the vault's magic and application id that is missing a
+/// table SQLite reads before unlock is damaged, not a storage failure: it
+/// opens with `Damaged`, and a restore moves it aside, byte for byte, and
+/// installs the backup.
+#[test]
+fn a_restore_moves_aside_a_vault_missing_a_table() {
+    let (f, v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    drop(v);
+    for (n, table) in (20u64..).zip(["meta", "header", "unlockers"]) {
+        let raw = rusqlite::Connection::open(f.db()).unwrap();
+        raw.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        raw.close().unwrap();
+        let damaged = std::fs::read(f.db()).unwrap();
+        assert_eq!(
+            LockedVault::open(&f.paths).unwrap_err().kind(),
+            VaultErrorKind::Damaged,
+            "{table}"
+        );
+
+        let (v, report) = restore_backup_observed(
+            &f.paths,
+            &info.path,
+            &f.kit(),
+            &other_passphrase(n),
+            &KdfParams::minimum(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(v.integrity(), Integrity::Ok, "{table}");
+        assert_eq!(v.items(), &items[..], "{table}");
+        drop(v);
+        let [kept] = &report.replaced[..] else {
+            panic!("{table}: {:?}", report.replaced);
+        };
+        assert_eq!(std::fs::read(kept).unwrap(), damaged, "{table}");
+        assert_eq!(f.unlock().integrity(), Integrity::Ok, "{table}");
+        remove_replaced_files(&f.paths).unwrap();
+    }
     f.home.assert_clean(&f.cs);
 }
 
