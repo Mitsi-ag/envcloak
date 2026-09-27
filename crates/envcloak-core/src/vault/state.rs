@@ -19,8 +19,8 @@ use crate::crypto::{
 
 use super::error::{VaultError, VaultErrorKind};
 use super::integrity::{
-    HeaderState, Integrity, RowKey, Stamp, TamperKind, field_body, item_body, policy_body,
-    project_body, row_key, state_digest, unlocker_body,
+    HeaderState, Integrity, RowKey, Stamp, TamperKind, digest_eq, field_body, item_body,
+    policy_body, project_body, row_key, state_digest, unlocker_body,
 };
 use super::items::{
     FieldId, FieldMeta, FieldRecord, ItemDetails, ItemId, ItemMeta, PolicyId, ProjectId,
@@ -658,7 +658,7 @@ pub(crate) fn load(
         }
         Integrity::Tampered(TamperKind::HeaderUnreadable)
     } else {
-        if state_digest(keys, &st.stamps) != st.header.state_digest {
+        if !digest_eq(&state_digest(keys, &st.stamps), &st.header.state_digest) {
             found.note(TamperKind::DigestMismatch);
         }
         match found.0 {

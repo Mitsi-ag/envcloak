@@ -105,12 +105,12 @@ Each row of `unlockers`, `items`, `fields`, `projects` and `policies` has a stam
 | policies | `sealed` |
 
 ```
-state_digest = keyed_hash(header subkey, "envcloak/v1/state-digest",
+state_digest = keyed_hash(index subkey, "envcloak/v1/state-digest",
                           for each row sorted by (table tag, row id):
                               table(2) || row_id(16) || row_version(8) || sha256(hashed bytes)(32))
 ```
 
-The table tags are CRYPTO.md's: unlockers 7, items 2, fields 3, projects 4, policies 5.
+The table tags are CRYPTO.md's: unlockers 7, items 2, fields 3, projects 4, policies 5. The `index` subkey keys every keyed hash in the vault, each in its own domain; the `header` subkey only seals the header. Unlock compares the digests in constant time.
 
 ## Unlock
 

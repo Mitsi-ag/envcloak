@@ -3,10 +3,12 @@
 //!
 //! Every row of `unlockers`, `items`, `fields`, `projects` and `policies`
 //! has a stamp: its row version and the SHA-256 of its stored columns. The
-//! state digest is keyed BLAKE3, under the `header` subkey, over the stamps
-//! sorted by (table, row id). The header, sealed under the same subkey,
-//! holds the digest and a write counter and is rewritten in the same
-//! SQLite transaction as every write.
+//! state digest is keyed BLAKE3 over the stamps sorted by (table, row id),
+//! under the `index` subkey, which keys every keyed hash in the vault, in
+//! a domain of its own. The header, sealed under the `header` subkey (used
+//! for nothing else), holds the digest and a write counter and is
+//! rewritten in the same SQLite transaction as every write. Digests are
+//! compared in constant time.
 //!
 //! At unlock the digest is recomputed from the rows on disk. A deleted,
 //! added or altered row, or one row restored from an older copy, changes it,
@@ -21,6 +23,7 @@
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::crypto::{Keyring, Purpose, TableTag, keyed_hash};
 
@@ -238,7 +241,7 @@ pub(crate) fn policy_body(sealed: &[u8]) -> [u8; 32] {
 pub(crate) const DIGEST_DOMAIN: &str = "envcloak/v1/state-digest";
 const ENTRY_LEN: usize = 2 + 16 + 8 + 32;
 
-/// Keyed BLAKE3 under the `header` subkey over every stamp, in (table, row
+/// Keyed BLAKE3 under the `index` subkey over every stamp, in (table, row
 /// id) order: `table(2) row_id(16) row_version(8) body(32)` each.
 pub(crate) fn state_digest(keys: &Keyring, stamps: &BTreeMap<RowKey, Stamp>) -> [u8; 32] {
     let mut entries = Vec::with_capacity(stamps.len() * ENTRY_LEN);
@@ -248,7 +251,12 @@ pub(crate) fn state_digest(keys: &Keyring, stamps: &BTreeMap<RowKey, Stamp>) -> 
         entries.extend_from_slice(&s.row_version.to_be_bytes());
         entries.extend_from_slice(&s.body);
     }
-    keyed_hash(keys.key(Purpose::Header), DIGEST_DOMAIN, &entries)
+    keyed_hash(keys.key(Purpose::Index), DIGEST_DOMAIN, &entries)
+}
+
+/// Whether two digests are equal, compared in constant time.
+pub(crate) fn digest_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    bool::from(a.ct_eq(b))
 }
 
 #[cfg(test)]
@@ -323,6 +331,40 @@ mod tests {
         );
         let other = Keyring::derive(&Vmk::generate(), &vid, 1);
         assert_ne!(state_digest(&other, &stamps), base);
+    }
+
+    /// The `header` subkey only seals the header. The digest is a keyed
+    /// hash under `index`, the subkey of every keyed hash in the vault, in
+    /// a domain of its own: one key, one primitive.
+    #[test]
+    fn the_digest_is_keyed_under_index_not_header() {
+        let keys = Keyring::derive(&Vmk::generate(), &VaultId::generate(), 1);
+        let mut stamps = BTreeMap::new();
+        stamps.insert(
+            row_key(TableTag::Items, &[1; 16]),
+            Stamp {
+                row_version: 2,
+                body: [7; 32],
+            },
+        );
+        let mut entries = Vec::new();
+        entries.extend_from_slice(&(TableTag::Items as u16).to_be_bytes());
+        entries.extend_from_slice(&[1; 16]);
+        entries.extend_from_slice(&2u64.to_be_bytes());
+        entries.extend_from_slice(&[7; 32]);
+        let digest = state_digest(&keys, &stamps);
+        assert_eq!(
+            digest,
+            keyed_hash(keys.key(Purpose::Index), DIGEST_DOMAIN, &entries)
+        );
+        assert_ne!(
+            digest,
+            keyed_hash(keys.key(Purpose::Header), DIGEST_DOMAIN, &entries)
+        );
+        assert!(digest_eq(&digest, &digest));
+        let mut other = digest;
+        other[31] ^= 1;
+        assert!(!digest_eq(&digest, &other));
     }
 
     #[test]

@@ -35,7 +35,7 @@ VMK (32 random bytes, one per epoch)
 keyed_hash(subkey, domain, v) = BLAKE3-keyed(subkey, u32(len(domain)) || domain || v)
 ```
 
-The domain is a fixed label such as `envcloak/v1/slug`. Its length prefix keeps every (domain, value) pair distinct.
+The domain is a fixed label such as `envcloak/v1/slug`. Its length prefix keeps every (domain, value) pair distinct. In the vault every keyed hash (slugs, project keys, values, the state digest) is under the `index` subkey, each in its own domain, and the `data`, `card` and `header` subkeys only seal, so no subkey serves two primitives.
 
 ## Associated data
 
