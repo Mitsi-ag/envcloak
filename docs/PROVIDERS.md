@@ -17,6 +17,10 @@ python3 scripts/gen-providers.py --check    # exits 1 if embedded.rs is stale
 
 The crate's `embedded` test compares the compiled copy with `providers/` and fails when they differ, so an edit that was not regenerated fails CI.
 
+## Review
+
+A change to `providers/`, to `embedded.rs`, to the generator or to the loader rules (`safety.rs`, `registry.rs`) needs a code owner's review: `.github/CODEOWNERS` names the owners, and the crate's `embedded` test fails if it stops covering those files. SPEC §8 asks for two maintainer reviews of any change to `allowed_hosts`, `auth` or `denied_paths`. CODEOWNERS cannot enforce that alone: it is the branch protection on `main` (require a pull request, review from code owners and 2 approving reviews), which a repository admin sets.
+
 ## Provider file format
 
 One TOML file per provider, `providers/<id>.toml`, UTF-8, at most 64 KiB. Unknown tables and keys fail to load, as does a value of the wrong type. Lists hold at most 64 entries. Every top-level key, with DeepSeek's values (`providers/deepseek.toml` leaves out the empty lists):
@@ -165,3 +169,4 @@ A registry error is a kind, the file and, where the parser recorded one, the lin
 | Errors carry no value | `tests/loader.rs` |
 | A key pattern without a literal prefix fails to load | `tests/loader.rs` |
 | A balance request to a denied path, in any spelling a server could normalize to one, fails to load | `tests/loader.rs` |
+| CODEOWNERS covers the provider files, their compiled copy, the generator and the loader rules | `tests/embedded.rs` |

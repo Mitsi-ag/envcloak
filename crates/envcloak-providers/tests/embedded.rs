@@ -169,6 +169,38 @@ fn the_embedded_registry_loads() {
     assert!(!stripe.path_denied("/v1/charges"));
 }
 
+/// SPEC §8: a change to allowed hosts, auth slots or denied paths needs
+/// code-owner review. CODEOWNERS must name an owner for the provider files,
+/// the compiled copy and the loader rules that check them.
+#[test]
+fn codeowners_cover_the_registry() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/CODEOWNERS");
+    let text = std::fs::read_to_string(path).unwrap();
+    let owned: Vec<(&str, usize)> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let mut words = l.split_whitespace();
+            let pattern = words.next().unwrap();
+            (pattern, words.filter(|w| w.starts_with('@')).count())
+        })
+        .collect();
+    for want in [
+        "/providers/",
+        "/crates/envcloak-providers/src/embedded.rs",
+        "/crates/envcloak-providers/src/safety.rs",
+        "/crates/envcloak-providers/src/registry.rs",
+        "/scripts/gen-providers.py",
+        "/.github/CODEOWNERS",
+    ] {
+        assert!(
+            owned.iter().any(|(p, owners)| *p == want && *owners > 0),
+            "CODEOWNERS names no owner for {want}"
+        );
+    }
+}
+
 #[test]
 fn env_hint_suggestions() {
     let r = load_embedded().unwrap();
