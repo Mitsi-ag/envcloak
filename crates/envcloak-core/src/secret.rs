@@ -51,6 +51,14 @@ impl SecretBytes {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Whether the value equals `other`, compared in constant time for
+    /// equal lengths. Lengths are not secret.
+    #[allow(clippy::disallowed_methods)] // Compares without revealing.
+    pub fn ct_eq(&self, other: &[u8]) -> bool {
+        use subtle::ConstantTimeEq;
+        bool::from(self.0.expose_secret().ct_eq(other))
+    }
 }
 
 #[allow(clippy::disallowed_methods)] // The one place SecretBytes is opened.
@@ -220,6 +228,16 @@ mod tests {
         assert_eq!(s.len(), v.len());
         assert!(!s.is_empty());
         assert!(SecretBytes::from_vec(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn ct_eq_compares_whole_values() {
+        let s = SecretBytes::copy_from(b"value");
+        assert!(s.ct_eq(b"value"));
+        assert!(!s.ct_eq(b"valuf"));
+        assert!(!s.ct_eq(b"valu"));
+        assert!(!s.ct_eq(b"values"));
+        assert!(SecretBytes::copy_from(b"").ct_eq(b""));
     }
 
     #[test]

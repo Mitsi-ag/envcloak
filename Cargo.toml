@@ -45,6 +45,16 @@ libc = "=0.2.189"
 secrecy = "=0.10.3"
 zeroize = "=1.9.0"
 
+# Crypto (SPEC §11). The 2026 RustCrypto majors are adopted together.
+# The `zeroize` features make the ciphers, hashers and HMAC states wipe
+# themselves on drop.
+blake3 = { version = "=1.8.7", default-features = false, features = ["std", "zeroize"] }
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
+getrandom = "=0.4.3"
+hkdf = "=0.13.0"
+sha2 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
+subtle = { version = "=2.6.1", default-features = false }
+
 aho-corasick = "1.1.5"
 base64 = "0.23.1"
 form_urlencoded = "1.2.2"
@@ -78,6 +88,19 @@ dbg_macro = "warn"
 # opt-level 0 plain writes before free survive and would hide a broken wipe.
 [profile.dev.package.envcloak-sys]
 opt-level = 3
+
+# Gate 2 seals a million times, so the crypto crates are optimized in dev and
+# test builds too. envcloak-core is included because the AEAD's generic code
+# is compiled into the crate that uses it; debug assertions and overflow
+# checks stay on.
+[profile.dev.package.blake3]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+[profile.dev.package.envcloak-core]
+opt-level = 2
 
 [profile.release]
 lto = "thin"
