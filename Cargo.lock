@@ -109,6 +109,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "envcloak-testkit"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "base64",
+ "envcloak-sys",
+ "form_urlencoded",
+ "serde_json",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "envcloakd"
 version = "0.1.0"
 

@@ -1,0 +1,24 @@
+[package]
+name = "envcloak-testkit"
+description = "Test support for EnvCloak: runtime-generated canaries, their encodings, canary sweeps and the allocator probe"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aho-corasick.workspace = true
+envcloak-sys = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+form_urlencoded.workspace = true
+serde_json.workspace = true

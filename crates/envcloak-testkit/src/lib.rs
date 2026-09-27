@@ -1,0 +1,37 @@
+//! Test support for EnvCloak. Never published, never a normal dependency of
+//! a shipped crate.
+//!
+//! - [`canaries`]: fixture secret values generated at test time from a seed,
+//!   in the shapes the M1 acceptance story uses (SPEC §15.1). Nothing
+//!   key-shaped is committed; GitHub push protection is on.
+//! - [`encodings`]: every listed encoding of a canary (SPEC §15.2 gate 8):
+//!   hex, base64 and base64url whole and embedded at each alignment,
+//!   percent and form encodings in both hex cases, and JSON escaping as
+//!   common serializers produce it. The encoders here are written
+//!   independently of `envcloak-redact`, so they do not share its bugs.
+//! - [`assert_no_canary`], [`find`] and [`sweep_dir`]: detection. Failure
+//!   messages and [`Found`] or [`Hit`] values name the canary's label and
+//!   the encoding, never the value.
+//! - [`probe_canaries`]: arms the allocator probe (gate 11) with canaries.
+//! - [`TestHome`]: an isolated HOME and XDG tree under a short `/tmp` path.
+
+mod canary;
+mod detect;
+mod encode;
+mod home;
+
+pub use canary::{Canary, by_label, canaries, fresh_seed, labels};
+pub use detect::{Detector, Found, Hit, assert_no_canary, encodings, find, sweep_dir};
+pub use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeReport, ProbeSession};
+pub use home::TestHome;
+
+/// Default probe window: a freed block holding any 12 consecutive bytes of a
+/// canary counts as holding it.
+pub const PROBE_WINDOW: usize = 12;
+
+/// Arms the allocator probe with the raw value of every canary. The test
+/// binary must install [`ProbeAllocator`] as its global allocator.
+pub fn probe_canaries(cs: &[Canary], mode: ProbeMode) -> ProbeSession {
+    let needles: Vec<&[u8]> = cs.iter().map(Canary::value).collect();
+    ProbeSession::start(&needles, PROBE_WINDOW, mode)
+}
