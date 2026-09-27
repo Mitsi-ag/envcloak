@@ -48,6 +48,17 @@ The developer's real question is not only "where is my key" but "what is this co
 - **Receipts.** Collect invoices from provider billing APIs (and optionally a mail connector) and export them for bookkeeping.
 - **Later: agent payments with a human on the trigger.** An agent can request a top-up; the human approves with Touch ID; payment uses a single-use token or virtual card. Built on emerging agent-payment standards once they settle.
 
+## 2a-quater. Auth: every credential on the machine
+
+API keys in `.env` files are only half of what agents can use. The other half is the logins already sitting on the machine: `~/.aws/credentials` and SSO caches, `gh`, `gcloud`, `vercel`, `supabase`, `stripe`, `fly`, `wrangler`, npm and Docker registry tokens, kubeconfigs, SSH keys, `~/.netrc` and git credentials, and the agents' own auth files. An agent that never sees a single API key can still run `aws iam create-access-key` with whatever profile is lying around.
+
+- **Inventory.** `envcloak auth scan` lists every CLI credential on the machine with its tool, account or identity, scope where knowable, age, expiry and last use, without printing values. The app shows it as an Auth tab next to Keys.
+- **Native credential helpers, so static credentials leave the disk.** EnvCloak plugs into each tool's own extension point and serves credentials on demand, through the same approval, grant and audit path as `envcloak run`:
+  - AWS: `credential_process` in `~/.aws/config`. EnvCloak holds the long-lived key (or better, an IAM Identity Center session) and hands out short-lived STS credentials per approved session.
+  - git: a git credential helper. Docker: a `docker-credential-envcloak` helper. Kubernetes: an exec credential plugin. GitHub CLI, npm and others: injected tokens via `envcloak run`.
+- **AWS accounts and IAM.** For linked accounts (AWS Organizations or multiple profiles), a read-only view of identities per account: IAM users and their access keys (age, last used), roles, Identity Center access, root MFA status. Findings with fixes: rotate or delete keys older than 90 days or unused, move humans to Identity Center, never give agents admin profiles. Changes are proposed as commands for the human to approve, never applied silently.
+- **Agent identity separation.** Agents get their own scoped identities (an `agent` AWS role with a permission boundary, a fine-grained GitHub token limited to the repo) instead of the human's full-power sessions, with the grant and expiry shown in the app.
+
 ## 2a-ter. What makes EnvCloak the best tool in its category
 
 Ranked by value to developers; each is scheduled in the milestones.
@@ -341,6 +352,6 @@ XChaCha20-Poly1305 (`chacha20poly1305`), Argon2id (`argon2`), HKDF-SHA256 (`hkdf
 | M6 | Proxy mode | Placeholder-only child process reaches a provider API successfully; non-allowlisted host gets the placeholder |
 | M7 | Packaging and release: signed and notarized app, Homebrew, cargo-dist binaries, docs site, landing page with Cloud waitlist | `brew install --cask envcloak` works on a clean Mac |
 | M8 | Launch (v0.1: Keys + Spend) | Public repo, launch posts, directory listings |
-| M9 | v0.2: MCP servers module, browser capture extension, rotation assistant | MCP set installed into four agents from one list |
+| M9 | v0.2: MCP servers module, Auth module (inventory, AWS credential_process, git and Docker helpers, AWS multi-account IAM view), browser capture extension, rotation assistant | MCP set installed into four agents from one list; no static AWS keys left on disk |
 | M10 | v0.3: Skills and instructions module with translation; Raycast and editor extensions | A skill compiles to five agents' formats with a loss report |
 | M11 | EnvCloak Cloud MVP on AWS: encrypted backup and sync mailbox, 24/7 spend watch and alerts, then the Nitro Enclave credential proxy and Teams | Paying users |

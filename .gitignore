@@ -12,3 +12,6 @@ apps/macos/build/
 apps/macos/DerivedData/
 *.xcuserstate
 xcuserdata/
+
+# Claude <-> Codex review channel (local only)
+.collab/
