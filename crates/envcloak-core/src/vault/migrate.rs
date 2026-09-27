@@ -5,7 +5,9 @@
 //! runs at unlock, when the key is available, and only on a vault that
 //! passed its integrity check. All of it, from the first step's DDL to the
 //! rewritten header, is one SQLite transaction: a failure at any point, or
-//! a crash, leaves the vault at its old version, intact and openable.
+//! a crash, leaves the vault at its old version, intact and openable. After
+//! a failure the unlock still succeeds, read-only at the old version
+//! ([`Vault::migration_error`](super::Vault::migration_error)).
 //!
 //! Each step moves the vault from `from` to `from + 1`:
 //! 1. its DDL runs;

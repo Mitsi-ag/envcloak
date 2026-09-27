@@ -35,7 +35,7 @@ pub enum VaultErrorKind {
     /// The vault was written by a newer schema than this build reads.
     UnsupportedVersion,
     /// A format migration failed and was rolled back; the vault is as it
-    /// was.
+    /// was, and open read-only.
     Migration,
     /// The key opens nothing in this vault: a wrong VMK, or a vault whose
     /// every sealed row is damaged.

@@ -168,7 +168,7 @@ The schema version is in the associated data of every sealed value, so a migrati
 2. `meta.schema_version` is set, and the schema is compared with the one the new version defines;
 3. the state digest is recomputed from the migrated rows, and the header is written with the write counter one higher, sealed under the new version.
 
-Any failure, or a crash, rolls all of it back: the vault stays at its old version, intact and openable (gate 7). Version 1 is the first format, so the shipped plan has no steps; the tests migrate through test-only plans.
+Any failure, or a crash, rolls all of it back: the vault stays at its old version, intact and openable (gate 7). A build whose migration failed still unlocks the vault, read-only at its old version and with the failure reported, so its owner can read and back up what it holds; it refuses writes, and every unlock tries the migration again. Version 1 is the first format, so the shipped plan has no steps; the tests migrate through test-only plans.
 
 ## Gates
 

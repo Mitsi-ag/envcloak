@@ -1,8 +1,9 @@
 //! Gate 7 (SPEC §15.2): a failure mid-migration leaves the old vault
-//! intact and openable. Also: a migration that succeeds re-seals every
-//! sealed column under the new schema version and verifies; an older build
-//! refuses the newer file; `kill -9` during a migration leaves the old or
-//! the new vault, never a mix.
+//! intact and openable, by the old build and, read-only, by the build whose
+//! migration failed. Also: a migration that succeeds re-seals every sealed
+//! column under the new schema version and verifies; an older build refuses
+//! the newer file; `kill -9` during a migration leaves the old or the new
+//! vault, never a mix.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -117,19 +118,62 @@ fn open_with(f: &Fixture, plan: MigrationPlan) -> Result<Vault, (LockedVault, Va
         .unlock(f.vmk())
 }
 
+/// The build whose migration failed opens the vault too: read-only, at
+/// its old version, every value readable, so the owner can back it up.
+fn assert_opens_unmigrated(f: &Fixture, plan: MigrationPlan, values: &[(FieldId, Vec<u8>)]) {
+    let mut v = open_with(f, plan).map_err(|(_, e)| e).unwrap();
+    assert_eq!(v.migration_error(), Some(VaultErrorKind::Migration));
+    assert_eq!(v.integrity(), Integrity::Ok, "the vault itself verified");
+    assert_eq!(v.schema_version(), 1);
+    assert_values(&v, values);
+    let e = v
+        .transact(|t| t.set_value(values[1].0, SecretBytes::copy_from(b"refused")))
+        .unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Migration);
+}
+
 #[test]
 fn a_failing_transform_leaves_the_old_vault_intact_and_openable() {
     let (f, values) = populated(20);
     let before = dump(&f);
-    let (locked, e) = open_with(&f, to_v2(set_tier_then_fail)).unwrap_err();
-    assert_eq!(e.kind(), VaultErrorKind::Migration);
-    assert_eq!(locked.schema_version(), 1);
-    drop(locked);
+    assert_opens_unmigrated(&f, to_v2(set_tier_then_fail), &values);
     // Byte for byte the same rows and schema: no new table, no new column.
     assert_eq!(dump(&f), before);
+    // Every open retries the migration, and changes nothing when it fails.
+    assert_opens_unmigrated(&f, to_v2(set_tier_then_fail), &values);
+    assert_eq!(dump(&f), before);
+    // A build without the migration opens it as it was.
     let v = f.unlock();
     assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.migration_error(), None);
     assert_eq!(v.schema_version(), 1);
+    assert_values(&v, &values);
+    drop(v);
+    // And a build whose migration works migrates it.
+    let v = open_with(&f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap();
+    assert_eq!(v.migration_error(), None);
+    assert_eq!(v.schema_version(), 2);
+    assert_values(&v, &values);
+}
+
+static FAILED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Fails the first time it runs in this process, then works.
+fn fail_once(tx: &MigrationTx<'_>) -> Result<(), VaultError> {
+    if !FAILED_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(VaultErrorKind::Migration.into());
+    }
+    set_tier(tx)
+}
+
+#[test]
+fn locking_and_unlocking_again_retries_a_failed_migration() {
+    let (f, values) = populated(4);
+    let v = open_with(&f, to_v2(fail_once)).map_err(|(_, e)| e).unwrap();
+    assert_eq!(v.migration_error(), Some(VaultErrorKind::Migration));
+    let v = v.lock().unlock(f.vmk()).map_err(|(_, e)| e).unwrap();
+    assert_eq!(v.migration_error(), None);
+    assert_eq!(v.schema_version(), 2);
     assert_values(&v, &values);
 }
 
@@ -151,8 +195,7 @@ fn a_failing_step_later_in_the_plan_rolls_back_every_step() {
         },
     ])
     .unwrap();
-    let (_, e) = open_with(&f, plan).unwrap_err();
-    assert_eq!(e.kind(), VaultErrorKind::Migration);
+    assert_opens_unmigrated(&f, plan, &values);
     assert_eq!(dump(&f), before);
     let v = f.unlock();
     assert_eq!(v.integrity(), Integrity::Ok);

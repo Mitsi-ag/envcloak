@@ -183,10 +183,19 @@ impl LockedVault {
     /// migrates an older format when the vault verified. On failure the
     /// locked vault comes back with the error.
     ///
+    /// A migration that fails is rolled back and does not fail the unlock:
+    /// the vault opens read-only at its old version, with
+    /// [`Vault::migration_error`] set, so its owner can still read and back
+    /// up what it holds (SPEC §15.2 gate 7). The next unlock tries again.
+    ///
     /// When the file names more than one schema version (an altered or
     /// restored `meta` or header row), the vault opens under the first one
     /// its header or rows open under, and reports the row read-only.
     pub fn unlock(mut self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
+        // A vault locked after opening read-only is judged afresh.
+        if let Err(e) = self.conn.pragma_update(None, "query_only", "OFF") {
+            return Err((self, e.into()));
+        }
         let keys = Keyring::derive(&vmk, &self.vault_id, self.epoch);
         // The file cannot have changed since `open`: this handle holds the
         // exclusive lock.
@@ -225,19 +234,23 @@ impl LockedVault {
             return Err((self, kind.into()));
         };
         self.schema_version = ctx.schema_version;
+        let mut migration_error = None;
         if loaded.integrity == Integrity::Ok && ctx.schema_version < self.plan.target() {
             let header = loaded.state.header;
-            if let Err(e) = migrate::run(&mut self.conn, &keys, &ctx, &header, &self.plan) {
-                return Err((self, e));
+            match migrate::run(&mut self.conn, &keys, &ctx, &header, &self.plan) {
+                Ok(()) => {
+                    self.schema_version = self.plan.target();
+                    ctx.schema_version = self.schema_version;
+                    loaded = match load_verified(&self.conn, &keys, &ctx, &self.plan) {
+                        Ok(l) => l,
+                        Err(e) => return Err((self, e)),
+                    };
+                }
+                // Rolled back: the file, and so `loaded`, are as they were.
+                Err(e) => migration_error = Some(e.kind()),
             }
-            self.schema_version = self.plan.target();
-            ctx.schema_version = self.schema_version;
-            loaded = match load_verified(&self.conn, &keys, &ctx, &self.plan) {
-                Ok(l) => l,
-                Err(e) => return Err((self, e)),
-            };
         }
-        if loaded.integrity != Integrity::Ok {
+        if loaded.integrity != Integrity::Ok || migration_error.is_some() {
             // Belt and braces: `transact` refuses writes already.
             if let Err(e) = self.conn.pragma_update(None, "query_only", "ON") {
                 return Err((self, e.into()));
@@ -252,6 +265,7 @@ impl LockedVault {
             state: loaded.state,
             view,
             integrity: Cell::new(loaded.integrity),
+            migration_error,
         })
     }
 }
@@ -395,6 +409,7 @@ pub struct Vault {
     /// `state`'s items sorted by slug, rebuilt after every commit.
     view: Vec<ItemMeta>,
     integrity: Cell<Integrity>,
+    migration_error: Option<VaultErrorKind>,
 }
 
 impl core::fmt::Debug for Vault {
@@ -482,6 +497,14 @@ impl Vault {
     /// longer matches.
     pub fn integrity(&self) -> Integrity {
         self.integrity.get()
+    }
+
+    /// Why this build could not migrate the vault to its schema version,
+    /// or `None`. When set, the vault verified but is open read-only at its
+    /// on-disk version ([`Vault::schema_version`]): values and metadata
+    /// read as usual, and writes fail with [`VaultErrorKind::Migration`].
+    pub fn migration_error(&self) -> Option<VaultErrorKind> {
+        self.migration_error
     }
 
     /// The header as of the last commit.
@@ -628,13 +651,17 @@ impl Vault {
     /// vouches for them, commit together when `f` returns `Ok`, and not at
     /// all when it returns an error or panics. Refused with
     /// [`VaultErrorKind::ReadOnly`] when the vault failed its integrity
-    /// check.
+    /// check, and with [`VaultErrorKind::Migration`] when it could not be
+    /// migrated.
     pub fn transact<T>(
         &mut self,
         f: impl FnOnce(&mut Txn<'_>) -> Result<T, VaultError>,
     ) -> Result<T, VaultError> {
         if self.integrity.get() != Integrity::Ok {
             return Err(VaultErrorKind::ReadOnly.into());
+        }
+        if self.migration_error.is_some() {
+            return Err(VaultErrorKind::Migration.into());
         }
         let run = || -> Result<(T, State), VaultError> {
             let mut txn = Txn::begin(
