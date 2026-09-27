@@ -240,3 +240,4 @@ Any failure, or a crash, rolls all of it back: the vault stays at its old versio
 | 4: after the passphrase is lost, the kit restores identical items; a wrong kit fails | `tests/recovery.rs` |
 | Backups: unusable without the kit, any change refused, a changed vault never backed up, a restored digest verifies | `tests/backup.rs` |
 | Restore is atomic: `kill -9` leaves the old or the new vault | `tests/restore_crash.rs` |
+| 11, unlocker part: no passphrase, kit or fixture in freed memory | `tests/unlock_probe.rs` |
