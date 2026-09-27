@@ -7,17 +7,30 @@
 //!   HKDF-SHA256(ikm = VMK, salt = vault_id, info =
 //!   `envcloak/v1/<purpose>/e<epoch>`). [`keyed_hash`] is keyed BLAKE3 under
 //!   a subkey.
+//! - [`KdfParams`] and [`Kdf`]: Argon2id, with stored parameters checked
+//!   against fixed bounds before any key derivation work.
+//! - [`Envelope`]: the VMK wrapped under a passphrase or Recovery Kit. The
+//!   key-encryption key comes from Argon2id; a key-commitment tag over the
+//!   envelope header is checked in constant time before decryption.
 //!
 //! Errors are [`CryptoError`]s, whose `Display` comes from a fixed set of
 //! strings and whose `Debug` names the kind only. Upstream error text is
-//! never forwarded.
+//! never forwarded. A wrong passphrase or Recovery Kit, a damaged
+//! envelope and an envelope from another vault all give the same error.
 
 mod aad;
 mod aead;
+mod envelope;
+mod kdf;
 mod keys;
 
 pub use aad::{Aad, FieldTag, ItemClass, TableTag};
 pub use aead::{Sealed, open, seal};
+pub use envelope::{
+    Envelope, EnvelopeCtx, UnlockerKind, rewrap_vmk, unwrap_vmk, unwrap_vmk_with, wrap_vmk,
+    wrap_vmk_with,
+};
+pub use kdf::{Argon2id, Kdf, KdfParams, Kek};
 pub use keys::{Keyring, Purpose, SubKey, UnlockerId, VaultId, Vmk, keyed_hash};
 
 /// A crypto failure. Carries its kind only: no values, sizes of secrets or
@@ -40,15 +53,32 @@ pub enum CryptoErrorKind {
     Malformed,
     /// The OS random number generator failed.
     Random,
+    /// Argon2id parameters outside the bounds in [`KdfParams`].
+    KdfParams,
+    /// Argon2id failed (out of memory, say).
+    Kdf,
+    /// Envelope bytes of the wrong length, magic, version, kind or KDF.
+    EnvelopeFormat,
+    /// The envelope names another unlocker or key epoch than the caller
+    /// expects.
+    EnvelopeMismatch,
+    /// The one error for a wrong passphrase or Recovery Kit, a damaged
+    /// envelope, or an envelope from another vault.
+    Unlock,
 }
 
 impl CryptoErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [CryptoErrorKind; 4] = [
+    pub const ALL: [CryptoErrorKind; 9] = [
         CryptoErrorKind::Seal,
         CryptoErrorKind::Open,
         CryptoErrorKind::Malformed,
         CryptoErrorKind::Random,
+        CryptoErrorKind::KdfParams,
+        CryptoErrorKind::Kdf,
+        CryptoErrorKind::EnvelopeFormat,
+        CryptoErrorKind::EnvelopeMismatch,
+        CryptoErrorKind::Unlock,
     ];
 
     /// The fixed message for this kind.
@@ -58,6 +88,17 @@ impl CryptoErrorKind {
             CryptoErrorKind::Open => "decryption failed: the data is damaged or belongs elsewhere",
             CryptoErrorKind::Malformed => "sealed data is malformed",
             CryptoErrorKind::Random => "the system random number generator failed",
+            CryptoErrorKind::KdfParams => "key derivation parameters are out of bounds",
+            CryptoErrorKind::Kdf => "key derivation failed",
+            CryptoErrorKind::EnvelopeFormat => {
+                "unlocker envelope is malformed or has an unsupported format"
+            }
+            CryptoErrorKind::EnvelopeMismatch => {
+                "unlocker envelope belongs to another unlocker or key epoch"
+            }
+            CryptoErrorKind::Unlock => {
+                "wrong passphrase or Recovery Kit, or the unlocker envelope is damaged"
+            }
         }
     }
 }
@@ -114,6 +155,11 @@ mod tests {
             CryptoErrorKind::Open => 1,
             CryptoErrorKind::Malformed => 2,
             CryptoErrorKind::Random => 3,
+            CryptoErrorKind::KdfParams => 4,
+            CryptoErrorKind::Kdf => 5,
+            CryptoErrorKind::EnvelopeFormat => 6,
+            CryptoErrorKind::EnvelopeMismatch => 7,
+            CryptoErrorKind::Unlock => 8,
         }
     }
 

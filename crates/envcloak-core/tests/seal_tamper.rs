@@ -1,4 +1,4 @@
-//! SPEC §15.2 gates 1 and 2 (the crypto part).
+//! SPEC §15.2 gates 1, 2 (the crypto part) and 3.
 //!
 //! - Gate 1: any bit flip in a sealed value's nonce, ciphertext or tag, and
 //!   any change to its associated data (another row, field, table, item
@@ -6,13 +6,23 @@
 //!   value-free error.
 //! - Gate 2: a million seals repeat no nonce; the associated data is the
 //!   canonical tuple; sealed bytes hold no fixture in any encoding.
+//! - Gate 3: out-of-bounds Argon2id parameters are rejected before any
+//!   derivation (a spy KDF counts calls); re-wraps use the current
+//!   defaults; every wrong secret or damaged envelope gives one generic
+//!   error; the commitment rejects a wrong KEK.
+//!
+//! Argon2id runs at the minimum bounds (64 MiB, t = 2, p = 1), except where
+//! a test checks the defaults.
 #![allow(clippy::unwrap_used)]
 
+use std::cell::Cell;
 use std::collections::HashSet;
 
+use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
-    Aad, CryptoError, CryptoErrorKind, FieldTag, ItemClass, Keyring, Purpose, Sealed, TableTag,
-    VaultId, Vmk, open, seal,
+    Aad, Argon2id, CryptoError, CryptoErrorKind, Envelope, EnvelopeCtx, FieldTag, ItemClass, Kdf,
+    KdfParams, Kek, Keyring, Purpose, Sealed, TableTag, UnlockerId, UnlockerKind, VaultId, Vmk,
+    keyed_hash, open, rewrap_vmk, seal, unwrap_vmk, unwrap_vmk_with, wrap_vmk, wrap_vmk_with,
 };
 use envcloak_testkit::{Canary, Detector, by_label, canaries, fresh_seed, labels};
 
@@ -402,7 +412,367 @@ fn sealed_bytes_hold_no_fixture() {
         }
     }
     det.assert_absent(&all);
-    det.assert_absent(format!("{kr:?}").as_bytes());
+    let pass = SecretBytes::copy_from(by_label(&cs, labels::VAULT_PASSPHRASE).value());
+    let env = wrap_min(&Vmk::generate(), &pass, UnlockerKind::Passphrase, &ctx(1));
+    det.assert_absent(&env.to_bytes());
+    det.assert_absent(format!("{env:?} {kr:?}").as_bytes());
+}
+
+// ---------------------------------------------------------------- gate 3
+
+/// Counts derivations, then runs the real Argon2id.
+struct SpyKdf(Cell<usize>);
+
+impl SpyKdf {
+    fn new() -> Self {
+        SpyKdf(Cell::new(0))
+    }
+    fn calls(&self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Kdf for SpyKdf {
+    fn derive(&self, secret: &SecretBytes, params: &KdfParams) -> Result<Kek, CryptoError> {
+        self.0.set(self.0.get() + 1);
+        Argon2id.derive(secret, params)
+    }
+}
+
+fn ctx(epoch: u32) -> EnvelopeCtx {
+    EnvelopeCtx {
+        vault_id: VaultId::generate(),
+        unlocker_id: UnlockerId::generate(),
+        epoch,
+    }
+}
+
+fn wrap_min(vmk: &Vmk, secret: &SecretBytes, kind: UnlockerKind, c: &EnvelopeCtx) -> Envelope {
+    wrap_vmk_with(vmk, secret, kind, c, &KdfParams::minimum(), &Argon2id).unwrap()
+}
+
+/// A value that identifies a VMK without revealing it.
+fn fingerprint(vmk: &Vmk) -> [u8; 32] {
+    let kr = Keyring::derive(vmk, &VaultId([0; 16]), 0);
+    keyed_hash(kr.key(Purpose::Index), "envcloak/v1/test-fingerprint", b"")
+}
+
+fn out_of_bounds() -> Vec<(u32, u32, u32)> {
+    vec![
+        (KdfParams::MIN_M_KIB - 1, 2, 1),
+        (8, 2, 1),
+        (0, 2, 1),
+        (KdfParams::MAX_M_KIB + 1, 2, 1),
+        (u32::MAX, 2, 1),
+        (KdfParams::MIN_M_KIB, 1, 1),
+        (KdfParams::MIN_M_KIB, 0, 1),
+        (KdfParams::MIN_M_KIB, 17, 1),
+        (KdfParams::MIN_M_KIB, u32::MAX, 1),
+        (KdfParams::MIN_M_KIB, 2, 0),
+        (KdfParams::MIN_M_KIB, 2, 17),
+        (KdfParams::MIN_M_KIB, 2, u32::MAX),
+    ]
+}
+
+#[test]
+fn out_of_bounds_params_are_rejected_before_any_kdf_work() {
+    let cs = fixtures();
+    let det = Detector::new(&cs);
+    let pass = SecretBytes::copy_from(by_label(&cs, labels::VAULT_PASSPHRASE).value());
+    let c = ctx(1);
+    let vmk = Vmk::generate();
+    let spy = SpyKdf::new();
+
+    // Wrapping with out-of-bounds parameters never reaches the KDF.
+    for (m_kib, t, p) in out_of_bounds() {
+        let params = KdfParams {
+            m_kib,
+            t,
+            p,
+            ..KdfParams::minimum()
+        };
+        let e =
+            wrap_vmk_with(&vmk, &pass, UnlockerKind::Passphrase, &c, &params, &spy).unwrap_err();
+        assert_value_free(&e, CryptoErrorKind::KdfParams, &det);
+    }
+    assert_eq!(spy.calls(), 0);
+
+    // Stored parameters are bounded when read: an envelope whose bytes
+    // carry them does not parse, so there is nothing to unwrap. (Unwrap's
+    // own check is covered by a unit test in envelope.rs.)
+    let env = wrap_vmk_with(
+        &vmk,
+        &pass,
+        UnlockerKind::Passphrase,
+        &c,
+        &KdfParams::minimum(),
+        &spy,
+    )
+    .unwrap();
+    assert_eq!(spy.calls(), 1);
+    let bytes = env.to_bytes();
+    for (m_kib, t, p) in out_of_bounds() {
+        let mut b = bytes;
+        b[27..31].copy_from_slice(&m_kib.to_be_bytes());
+        b[31..35].copy_from_slice(&t.to_be_bytes());
+        b[35..39].copy_from_slice(&p.to_be_bytes());
+        let e = Envelope::from_bytes(&b).unwrap_err();
+        assert_value_free(&e, CryptoErrorKind::KdfParams, &det);
+    }
+
+    // Control: in-bounds parameters do reach the KDF, once per unwrap.
+    let parsed = Envelope::from_bytes(&bytes).unwrap();
+    let got = unwrap_vmk_with(&parsed, &pass, &c, &spy).unwrap();
+    assert_eq!(spy.calls(), 2);
+    assert_eq!(fingerprint(&got), fingerprint(&vmk));
+}
+
+#[test]
+fn an_envelope_for_another_unlocker_or_epoch_is_refused_before_kdf_work() {
+    let cs = fixtures();
+    let det = Detector::new(&cs);
+    let pass = SecretBytes::copy_from(by_label(&cs, labels::VAULT_PASSPHRASE).value());
+    let c = ctx(2);
+    let env = wrap_min(&Vmk::generate(), &pass, UnlockerKind::Passphrase, &c);
+    let spy = SpyKdf::new();
+    let other_unlocker = EnvelopeCtx {
+        unlocker_id: UnlockerId::generate(),
+        ..c
+    };
+    let other_epoch = EnvelopeCtx { epoch: 3, ..c };
+    for wrong in [other_unlocker, other_epoch] {
+        let e = unwrap_vmk_with(&env, &pass, &wrong, &spy).unwrap_err();
+        assert_value_free(&e, CryptoErrorKind::EnvelopeMismatch, &det);
+    }
+    assert_eq!(spy.calls(), 0);
+}
+
+#[test]
+fn wrap_and_unwrap_round_trip_for_both_kinds() {
+    let cs = fixtures();
+    let pass = SecretBytes::copy_from(by_label(&cs, labels::VAULT_PASSPHRASE).value());
+    let kit = SecretBytes::copy_from(&[0x5a; 16]);
+    let c = ctx(0);
+    let vmk = Vmk::generate();
+    for (kind, secret) in [
+        (UnlockerKind::Passphrase, &pass),
+        (UnlockerKind::RecoveryKit, &kit),
+    ] {
+        let env = wrap_min(&vmk, secret, kind, &c);
+        assert_eq!(env.kind(), kind);
+        assert_eq!(env.unlocker_id(), c.unlocker_id);
+        assert_eq!(env.epoch(), c.epoch);
+        assert_eq!(env.version(), Envelope::FORMAT_VERSION);
+        let parsed = Envelope::from_bytes(&env.to_bytes()).unwrap();
+        assert!(parsed == env);
+        let got = unwrap_vmk(&parsed, secret, &c).unwrap();
+        assert_eq!(fingerprint(&got), fingerprint(&vmk));
+    }
+    // Two wraps of the same VMK share no salt, nonce or ciphertext.
+    let a = wrap_min(&vmk, &pass, UnlockerKind::Passphrase, &c).to_bytes();
+    let b = wrap_min(&vmk, &pass, UnlockerKind::Passphrase, &c).to_bytes();
+    assert_ne!(a[39..55], b[39..55], "salt");
+    assert_ne!(a[55..79], b[55..79], "nonce");
+    assert_ne!(a[111..], b[111..], "ciphertext");
+}
+
+/// A wrong passphrase or kit, a damaged envelope and an envelope from
+/// another vault all give the same error, with the same text.
+#[test]
+fn every_wrong_secret_or_damaged_envelope_gives_one_generic_error() {
+    let cs = fixtures();
+    let det = Detector::new(&cs);
+    let pass_value = by_label(&cs, labels::VAULT_PASSPHRASE).value();
+    let pass = SecretBytes::copy_from(pass_value);
+    let c = ctx(5);
+    let env = wrap_min(&Vmk::generate(), &pass, UnlockerKind::Passphrase, &c);
+    let bytes = env.to_bytes();
+
+    let mut attempts: Vec<(&str, Envelope, SecretBytes, EnvelopeCtx)> = Vec::new();
+    let wrong_secrets: Vec<(&str, SecretBytes)> = vec![
+        (
+            "wrong passphrase",
+            SecretBytes::copy_from(b"not the passphrase at all"),
+        ),
+        (
+            "prefix",
+            SecretBytes::copy_from(&pass_value[..pass_value.len() - 1]),
+        ),
+        (
+            "extended",
+            SecretBytes::copy_from(&[pass_value, b" "].concat()),
+        ),
+        ("empty", SecretBytes::copy_from(b"")),
+        ("a kit", SecretBytes::copy_from(&[0x5a; 16])),
+        (
+            "another fixture",
+            SecretBytes::copy_from(by_label(&cs, labels::OPENAI_API_KEY).value()),
+        ),
+    ];
+    for (what, s) in wrong_secrets {
+        attempts.push((what, env.clone(), s, c));
+    }
+    // One flipped bit in each region the KDF, commitment or AEAD covers,
+    // with the right passphrase.
+    let regions = [
+        ("magic-free kind byte", 5usize),
+        ("salt", 39),
+        ("salt end", 54),
+        ("nonce", 55),
+        ("nonce end", 78),
+        ("commitment", 79),
+        ("commitment end", 110),
+        ("ciphertext", 111),
+        ("tag", 158),
+    ];
+    for (what, at) in regions {
+        let mut b = bytes;
+        b[at] ^= if what.starts_with("magic-free") {
+            0x03
+        } else {
+            0x01
+        };
+        if let Ok(e) = Envelope::from_bytes(&b) {
+            attempts.push((what, e, SecretBytes::copy_from(pass_value), c));
+        }
+    }
+    // An in-bounds change of the stored parameters: the KDF runs with them,
+    // then the commitment fails.
+    let mut b = bytes;
+    b[34] ^= 1; // t = 2 becomes 3
+    attempts.push((
+        "kdf params",
+        Envelope::from_bytes(&b).unwrap(),
+        SecretBytes::copy_from(pass_value),
+        c,
+    ));
+    // The same envelope presented as another vault's.
+    let moved = EnvelopeCtx {
+        vault_id: VaultId::generate(),
+        ..c
+    };
+    attempts.push((
+        "another vault",
+        env.clone(),
+        SecretBytes::copy_from(pass_value),
+        moved,
+    ));
+
+    assert!(attempts.len() >= 15);
+    let mut messages = HashSet::new();
+    for (what, e, s, ctx) in &attempts {
+        let err = unwrap_vmk(e, s, ctx).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), CryptoErrorKind::Unlock, "{what}");
+        assert_value_free(&err, CryptoErrorKind::Unlock, &det);
+        messages.insert(err.to_string());
+    }
+    assert_eq!(messages.len(), 1);
+
+    // The flipped kind byte (passphrase 1 to kit 2) parses and still fails
+    // generically; an unknown kind does not parse.
+    let mut b = bytes;
+    b[5] = 9;
+    assert_eq!(
+        Envelope::from_bytes(&b).unwrap_err().kind(),
+        CryptoErrorKind::EnvelopeFormat
+    );
+
+    // Control: the right passphrase opens it.
+    unwrap_vmk(&env, &pass, &c).unwrap();
+}
+
+#[test]
+fn the_commitment_rejects_a_wrong_kek_even_when_nothing_else_changed() {
+    // Only the commitment differs, and the passphrase is right: the AEAD
+    // would accept this envelope, so only the commitment check refuses it.
+    let pass = SecretBytes::copy_from(b"a passphrase that is right");
+    let c = ctx(1);
+    let env = wrap_min(&Vmk::generate(), &pass, UnlockerKind::Passphrase, &c);
+    unwrap_vmk(&env, &pass, &c).unwrap();
+    for bit in [0usize, 7, 100, 255] {
+        let mut b = env.to_bytes();
+        b[79 + bit / 8] ^= 1 << (bit % 8);
+        let e = unwrap_vmk(&Envelope::from_bytes(&b).unwrap(), &pass, &c).unwrap_err();
+        assert_eq!(e.kind(), CryptoErrorKind::Unlock);
+    }
+}
+
+#[test]
+fn envelope_parsing_rejects_malformed_bytes() {
+    let pass = SecretBytes::copy_from(b"a passphrase for parsing");
+    let env = wrap_min(&Vmk::generate(), &pass, UnlockerKind::RecoveryKit, &ctx(1));
+    let bytes = env.to_bytes();
+    assert_eq!(bytes.len(), Envelope::LEN);
+    let format = CryptoErrorKind::EnvelopeFormat;
+    let kind = |b: &[u8]| Envelope::from_bytes(b).unwrap_err().kind();
+    assert_eq!(kind(&[]), format);
+    assert_eq!(kind(&bytes[..Envelope::LEN - 1]), format);
+    assert_eq!(kind(&[&bytes[..], &[0]].concat()), format);
+    for (at, value) in [
+        (0usize, b'X'),
+        (3, 0),
+        (4, 0),
+        (4, 2),
+        (5, 0),
+        (5, 3),
+        (26, 0),
+        (26, 2),
+    ] {
+        let mut b = bytes;
+        b[at] = value;
+        assert_eq!(kind(&b), format, "byte {at} = {value}");
+    }
+    assert!(Envelope::from_bytes(&bytes).unwrap() == env);
+    assert_eq!(&bytes[..6], b"ECEV\x01\x02");
+}
+
+#[test]
+fn wrap_vmk_uses_the_current_defaults() {
+    let pass = SecretBytes::copy_from(b"a passphrase for the defaults");
+    let c = ctx(1);
+    let vmk = Vmk::generate();
+    let env = wrap_vmk(&vmk, &pass, UnlockerKind::Passphrase, &c).unwrap();
+    let d = KdfParams::current_defaults();
+    let k = env.kdf();
+    assert_eq!((k.m_kib, k.t, k.p), (d.m_kib, d.t, d.p));
+    assert_eq!((k.m_kib, k.t, k.p), (256 * 1024, 3, 4));
+    assert_ne!(k.salt, d.salt);
+    assert_eq!(
+        fingerprint(&unwrap_vmk(&env, &pass, &c).unwrap()),
+        fingerprint(&vmk)
+    );
+}
+
+#[test]
+fn a_rewrap_uses_the_current_defaults_not_the_stored_params() {
+    let old = SecretBytes::copy_from(b"the old passphrase here");
+    let new = SecretBytes::copy_from(b"the new passphrase here");
+    let c = ctx(6);
+    let vmk = Vmk::generate();
+    let env = wrap_min(&vmk, &old, UnlockerKind::Passphrase, &c);
+    assert_eq!(env.kdf().m_kib, KdfParams::MIN_M_KIB);
+
+    // The old secret is required.
+    let e = rewrap_vmk(&env, &new, &new, &c).unwrap_err();
+    assert_eq!(e.kind(), CryptoErrorKind::Unlock);
+
+    let re = rewrap_vmk(&env, &old, &new, &c).unwrap();
+    let k = re.kdf();
+    assert_eq!(
+        (k.m_kib, k.t, k.p),
+        (
+            KdfParams::DEFAULT_M_KIB,
+            KdfParams::DEFAULT_T,
+            KdfParams::DEFAULT_P
+        )
+    );
+    assert_ne!(k.salt, env.kdf().salt);
+    assert_eq!(re.kind(), env.kind());
+    assert_eq!(re.unlocker_id(), env.unlocker_id());
+    assert_eq!(
+        fingerprint(&unwrap_vmk(&re, &new, &c).unwrap()),
+        fingerprint(&vmk)
+    );
 }
 
 // ---------------------------------------------------------------- errors
@@ -419,6 +789,23 @@ fn error_display_strings_are_enumerated() {
         (
             CryptoErrorKind::Random,
             "the system random number generator failed",
+        ),
+        (
+            CryptoErrorKind::KdfParams,
+            "key derivation parameters are out of bounds",
+        ),
+        (CryptoErrorKind::Kdf, "key derivation failed"),
+        (
+            CryptoErrorKind::EnvelopeFormat,
+            "unlocker envelope is malformed or has an unsupported format",
+        ),
+        (
+            CryptoErrorKind::EnvelopeMismatch,
+            "unlocker envelope belongs to another unlocker or key epoch",
+        ),
+        (
+            CryptoErrorKind::Unlock,
+            "wrong passphrase or Recovery Kit, or the unlocker envelope is damaged",
         ),
     ];
     assert_eq!(CryptoErrorKind::ALL.len(), expected.len());
@@ -451,6 +838,12 @@ static_assertions::assert_not_impl_any!(
 );
 static_assertions::assert_not_impl_any!(
     envcloak_core::crypto::SubKey: Clone,
+    Copy,
+    std::fmt::Display,
+    serde::Serialize
+);
+static_assertions::assert_not_impl_any!(
+    Kek: Clone,
     Copy,
     std::fmt::Display,
     serde::Serialize
