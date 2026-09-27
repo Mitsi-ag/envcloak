@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# Never commit plaintext secrets. envcloak.toml holds references only and is meant to be committed.
+.env
+.env.*
+!.env.example
+
+# macOS app build output
+apps/macos/build/
+apps/macos/DerivedData/
+*.xcuserstate
+xcuserdata/
