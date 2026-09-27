@@ -11,9 +11,11 @@
 
 use std::ops::Range;
 
-use envcloak_core::vault::Links;
+use envcloak_core::vault::{Classification, ItemDetails, Links};
+use regex::bytes::{Regex, RegexSet};
 use toml_edit::{Document, Item, TableLike};
 
+use crate::detect::Detection;
 use crate::embedded;
 use crate::error::{RegistryError, RegistryErrorKind as K};
 use crate::safety::{self, Anchor, AuthSlot, HostPattern, HttpsUrl, JsonPath, Suffixes};
@@ -64,17 +66,22 @@ impl PartialEq<&str> for ProviderId {
     }
 }
 
-/// A pattern as written in the registry. The loader has checked it: it
-/// compiles for linear-time matching on bytes, with no captures.
+/// A pattern as written in the registry, compiled for linear-time matching
+/// on bytes, with no captures.
 #[derive(Debug, Clone)]
 pub struct KeyPattern {
     source: String,
+    regex: Regex,
 }
 
 impl KeyPattern {
     /// The pattern as written.
     pub fn as_str(&self) -> &str {
         &self.source
+    }
+
+    pub(crate) fn is_match(&self, value: &[u8]) -> bool {
+        self.regex.is_match(value)
     }
 }
 
@@ -130,6 +137,13 @@ pub struct Provider {
 }
 
 impl Provider {
+    /// Whether the variable `env_name` names one of this provider's env
+    /// hints: equal to one, or containing one between `_` or the ends
+    /// (`VITE_OPENAI_API_KEY`, `OPENAI_API_KEY_2`), ignoring ASCII case.
+    pub fn hinted_by(&self, env_name: &str) -> bool {
+        self.env_hints.iter().any(|h| names_hint(env_name, h))
+    }
+
     /// Whether an allowed host matches `host`.
     pub fn host_allowed(&self, host: &str) -> bool {
         self.allowed_hosts.iter().any(|h| h.matches(host))
@@ -143,6 +157,33 @@ impl Provider {
             .iter()
             .any(|p| safety::path_under(p, path))
     }
+
+    /// Test, live or unknown, for a value that matched a key pattern. Both
+    /// or neither kinds of pattern matching gives unknown.
+    pub(crate) fn classify(&self, value: &[u8]) -> Classification {
+        let live = self.live_patterns.iter().any(|p| p.is_match(value));
+        let test = self.test_patterns.iter().any(|p| p.is_match(value));
+        match (live, test) {
+            (true, false) => Classification::Live,
+            (false, true) => Classification::Test,
+            _ => Classification::Unknown,
+        }
+    }
+}
+
+/// `hint` appears in `name`, ignoring ASCII case, with `_` or an end of
+/// `name` on each side.
+fn names_hint(name: &str, hint: &str) -> bool {
+    let (n, h) = (name.as_bytes(), hint.as_bytes());
+    if h.is_empty() || h.len() > n.len() {
+        return false;
+    }
+    (0..=n.len() - h.len()).any(|i| {
+        let end = i + h.len();
+        n[i..end].eq_ignore_ascii_case(h)
+            && (i == 0 || n[i - 1] == b'_')
+            && (end == n.len() || n[end] == b'_')
+    })
 }
 
 /// The loaded provider registry.
@@ -150,6 +191,10 @@ impl Provider {
 pub struct Registry {
     /// Sorted by id.
     providers: Vec<Provider>,
+    /// Every provider's key patterns, in provider order.
+    keys: RegexSet,
+    /// For each pattern in `keys`, its provider's index.
+    key_owner: Vec<usize>,
     suffixes: Vec<String>,
 }
 
@@ -169,6 +214,69 @@ impl Registry {
     /// The multi-tenant suffixes the loader checked wildcards against.
     pub fn multi_tenant_suffixes(&self) -> &[String] {
         &self.suffixes
+    }
+
+    /// The provider whose env hints name `env_name`, when exactly one
+    /// does. A suggestion for a value no key pattern matched, such as an
+    /// AWS secret access key; it is not a detection, and
+    /// [`Registry::prefill`] does not use it.
+    pub fn by_env_hint(&self, env_name: &str) -> Option<&Provider> {
+        let mut hinted = self.providers.iter().filter(|p| p.hinted_by(env_name));
+        let first = hinted.next()?;
+        hinted.next().is_none().then_some(first)
+    }
+
+    /// Pre-fills a new item's metadata from a detection (SPEC §6.3, §6.4):
+    /// the provider, its links, a snapshot of its allowed hosts, the
+    /// classification, and a title and env hint when those are empty. Only
+    /// empty fields are filled. When `details` already names a provider
+    /// and the detection does not agree, nothing changes.
+    pub fn prefill(&self, d: &Detection, details: &mut ItemDetails) {
+        if let Some(set) = details.provider.as_deref() {
+            if d.provider.as_ref().is_none_or(|id| id.as_str() != set) {
+                return;
+            }
+        }
+        if details.classification == Classification::Unknown {
+            details.classification = d.classification;
+        }
+        let Some(p) = d.provider.as_ref().and_then(|id| self.get(id.as_str())) else {
+            return;
+        };
+        details.provider.get_or_insert_with(|| p.id.to_string());
+        if details.title.is_empty() {
+            details.title.clone_from(&p.name);
+        }
+        if details.env_hint.is_none() {
+            details.env_hint = p.env_hints.first().cloned();
+        }
+        if details.allowed_hosts.is_empty() {
+            details.allowed_hosts = p.allowed_hosts.iter().map(|h| h.to_string()).collect();
+        }
+        let l = &mut details.links;
+        for (mine, theirs) in [
+            (&mut l.docs, &p.links.docs),
+            (&mut l.billing, &p.links.billing),
+            (&mut l.keys_page, &p.links.keys_page),
+            (&mut l.dashboard, &p.links.dashboard),
+        ] {
+            if mine.is_none() {
+                mine.clone_from(theirs);
+            }
+        }
+    }
+
+    /// The indices of the providers with a key pattern that matches
+    /// `value` whole, ascending.
+    pub(crate) fn key_matches(&self, value: &[u8]) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .keys
+            .matches(value)
+            .iter()
+            .map(|i| self.key_owner[i])
+            .collect();
+        out.dedup();
+        out
     }
 }
 
@@ -229,8 +337,21 @@ fn load(files: &[(&str, &[u8])]) -> Result<Registry, RegistryError> {
         let file = format!("{}.toml", w[1].id);
         return Err(RegistryError::new(K::DuplicateId, &file, None));
     }
+
+    let mut key_owner = Vec::new();
+    let mut sources = Vec::new();
+    for (i, p) in providers.iter().enumerate() {
+        for k in &p.key_patterns {
+            sources.push(k.as_str());
+            key_owner.push(i);
+        }
+    }
+    let keys =
+        safety::pattern_set(sources).map_err(|kind| RegistryError::new(kind, "*.toml", None))?;
     Ok(Registry {
         providers,
+        keys,
+        key_owner,
         suffixes: suffixes.as_slice().to_vec(),
     })
 }
@@ -329,8 +450,9 @@ impl Parser<'_> {
             .into_iter()
             .map(|(s, at)| {
                 safety::compile_pattern(s, anchor)
-                    .map(|_| KeyPattern {
+                    .map(|regex| KeyPattern {
                         source: s.to_owned(),
+                        regex,
                     })
                     .map_err(|kind| self.err(kind, at))
             })
@@ -606,6 +728,30 @@ fn parse_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hints() {
+        let h = "OPENAI_API_KEY";
+        for yes in [
+            "OPENAI_API_KEY",
+            "openai_api_key",
+            "VITE_OPENAI_API_KEY",
+            "OPENAI_API_KEY_2",
+            "MY_OPENAI_API_KEY_PROD",
+        ] {
+            assert!(names_hint(yes, h), "{yes}");
+        }
+        for no in [
+            "OPENAI_API_KEYS",
+            "XOPENAI_API_KEY",
+            "OPENAI_API",
+            "",
+            "API_KEY",
+        ] {
+            assert!(!names_hint(no, h), "{no}");
+        }
+        assert!(!names_hint("A", ""));
+    }
 
     #[test]
     fn ids_names_and_hints() {

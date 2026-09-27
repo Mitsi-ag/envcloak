@@ -1,7 +1,7 @@
 //! The registry compiled into the release (SPEC §8 "Registry safety"): it
 //! is `providers/` byte for byte, so an edit that was not regenerated with
 //! scripts/gen-providers.py fails here; it loads under the gate 18 rules;
-//! and its providers carry the hosts, slots, links and paths they should.
+//! and its providers carry what import and `add` pre-fill.
 #![allow(clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
@@ -130,4 +130,19 @@ fn the_embedded_registry_loads() {
     let stripe = r.get("stripe").unwrap();
     assert!(stripe.path_denied("/v1/ephemeral_keys"));
     assert!(!stripe.path_denied("/v1/charges"));
+}
+
+#[test]
+fn env_hint_suggestions() {
+    let r = load_embedded().unwrap();
+    let id = |n: &str| r.by_env_hint(n).map(|p| p.id.to_string());
+    assert_eq!(id("AWS_SECRET_ACCESS_KEY").as_deref(), Some("aws"));
+    assert_eq!(
+        id("NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY").as_deref(),
+        Some("stripe")
+    );
+    assert_eq!(id("GH_TOKEN").as_deref(), Some("github"));
+    assert_eq!(id("DATABASE_URL"), None);
+    // Named by two providers' hints: no suggestion.
+    assert_eq!(id("OPENAI_API_KEY_OR_DEEPSEEK_API_KEY"), None);
 }

@@ -25,7 +25,7 @@
 //! [`RegistryErrorKind::NotHttps`]: crate::RegistryErrorKind::NotHttps
 //! [`RegistryErrorKind::WildcardUnderMultiTenantSuffix`]: crate::RegistryErrorKind::WildcardUnderMultiTenantSuffix
 
-use regex::bytes::{Regex, RegexBuilder};
+use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use regex_syntax::hir::Look;
 
 use crate::error::RegistryErrorKind as K;
@@ -60,6 +60,17 @@ pub(crate) fn compile_pattern(src: &str, anchor: Anchor) -> Result<Regex, K> {
         .unicode(false)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .nest_limit(NEST_LIMIT)
+        .build()
+        .map_err(|_| K::InvalidPattern)
+}
+
+/// One set over every key pattern, so detection is one pass.
+pub(crate) fn pattern_set<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Result<RegexSet, K> {
+    RegexSetBuilder::new(patterns)
+        .unicode(false)
+        .size_limit(REGEX_SIZE_LIMIT.saturating_mul(16))
+        .dfa_size_limit(REGEX_SIZE_LIMIT.saturating_mul(16))
         .nest_limit(NEST_LIMIT)
         .build()
         .map_err(|_| K::InvalidPattern)

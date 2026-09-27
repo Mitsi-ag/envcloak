@@ -14,14 +14,20 @@
 //!   is under a multi-tenant suffix; key patterns match whole values of at
 //!   least 16 bytes and keep no captures. One bad file fails the whole
 //!   registry.
+//! - [`Registry::detect`]: a value's provider and classification, with the
+//!   variable name breaking ties. It returns ids only, never the value.
+//! - [`Registry::prefill`]: a new item's provider, links, allowed hosts and
+//!   classification from a detection.
 //!
 //! The format is in docs/PROVIDERS.md.
 
+mod detect;
 mod embedded;
 mod error;
 mod registry;
 mod safety;
 
+pub use detect::Detection;
 pub use error::{RegistryError, RegistryErrorKind};
 #[cfg(feature = "testing")]
 pub use registry::load_from;
