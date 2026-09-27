@@ -1,0 +1,172 @@
+# EnvCloak: vault storage format
+
+Status: schema version 1 (M1). This file fixes how SPEC §5 "Vault", "Integrity" and "Items" are stored on disk: the SQLite schema, what each column holds, the records sealed into rows, the state digest, and how writes, crashes and migrations are handled. The crypto it builds on (sealing, associated data, subkeys, keyed hashes, envelopes) is in [CRYPTO.md](CRYPTO.md). The code is in `crates/envcloak-core/src/vault/`.
+
+A change to any layout, label or number here is a format change: it needs a new schema version and a migration.
+
+## Location
+
+| | macOS | Linux |
+|---|---|---|
+| Data directory | `~/Library/Application Support/EnvCloak/` | `$XDG_DATA_HOME/envcloak/`, default `~/.local/share/envcloak/` |
+| Database | `<data>/vault/vault.db` | same |
+| Audit log, backups | `<data>/audit/`, `<data>/backups/` | same |
+
+- Every directory is 0700 and every file 0600. The process sets its umask to 077 before creating or opening anything, and SQLite gives its side files the database file's mode.
+- A directory or file EnvCloak trusts must not be a symlink, must be owned by the effective uid, and must not be writable by group or others. One that is only readable by others is tightened; one that fails another check is refused.
+- A relative `XDG_DATA_HOME` is ignored, as the XDG specification says. A missing or relative `HOME` is an error.
+
+## Connection settings
+
+Every connection to a vault file:
+- opens it with `SQLITE_OPEN_NOFOLLOW` on its canonical path, without `SQLITE_OPEN_URI`;
+- turns on the defensive flag, turns off triggers, views, the trusted schema, double-quoted string literals, and `ATTACH` creating or writing files;
+- sets `busy_timeout` to 0 and `locking_mode=EXCLUSIVE`, so it holds the file's lock until it closes. Another EnvCloak process, or any other SQLite client, gets "busy". The WAL index then lives in process memory, so there is no `-shm` file;
+- sets `journal_mode=WAL`, `synchronous=FULL`, `secure_delete=ON`, `temp_store=MEMORY`, `cell_size_check=ON` and `foreign_keys=OFF`;
+- on macOS, sets `fullfsync=ON` and `checkpoint_fullfsync=ON`, because a plain `fsync` there does not flush the drive's cache.
+
+`PRAGMA application_id` is `0x45435631` ("ECV1"). A file with another id is refused.
+
+## Schema version 1
+
+All tables are `STRICT`. Row ids are ULIDs: 48 bits of creation time in milliseconds, then 80 random bits.
+
+```
+meta      (vault_id BLOB, schema_version INTEGER, created_at INTEGER)
+header    (epoch INTEGER, sealed BLOB)
+unlockers (id BLOB PRIMARY KEY, kind INTEGER, envelope BLOB, created_at INTEGER)
+items     (id BLOB PRIMARY KEY, row_version INTEGER, class INTEGER, slug_hash BLOB UNIQUE,
+           sealed_meta BLOB, updated_at INTEGER)
+fields    (id BLOB PRIMARY KEY, item_id BLOB, row_version INTEGER, sealed_name BLOB,
+           sealed_value BLOB, value_hash BLOB, sealed_prior BLOB NULL)
+projects  (id BLOB PRIMARY KEY, row_version INTEGER, dir_hash BLOB UNIQUE, sealed BLOB)
+policies  (id BLOB PRIMARY KEY, row_version INTEGER, sealed BLOB)
+```
+
+`meta` and `header` hold exactly one row each. There are no other tables, indexes, triggers or views; the exact DDL is `SCHEMA_V1` in `schema.rs`.
+
+### What each column holds
+
+| Column | Contents | Key |
+|---|---|---|
+| `meta.*` | Plaintext. `vault_id` and `schema_version` are in the associated data of every sealed value, so changing either makes nothing open. `created_at` is informational and not authenticated. | |
+| `header.epoch` | Plaintext; the key epoch. Changing it derives other subkeys, so nothing opens. | |
+| `header.sealed` | The header record | `header` |
+| `unlockers.envelope` | A 159-byte envelope (CRYPTO.md) | its own KEK |
+| `unlockers.kind`, `created_at` | Plaintext, covered by the state digest | |
+| `items.class` | Plaintext: 1 secret, 2 card, 3 issuer credential | |
+| `items.slug_hash` | `keyed_hash(index, "envcloak/v1/slug", slug)` | `index` |
+| `items.sealed_meta` | The item record | `card` for cards, `data` otherwise |
+| `fields.item_id` | Plaintext, covered by the state digest | |
+| `fields.sealed_name` | The field record | as its item |
+| `fields.sealed_value` | The value | as its item |
+| `fields.value_hash` | `keyed_hash(index, "envcloak/v1/value", value)` | `index` |
+| `fields.sealed_prior` | The prior list, or NULL when there is none | as its item |
+| `projects.dir_hash` | `keyed_hash(index, "envcloak/v1/project", project key)` | `index` |
+| `projects.sealed` | The project record | `data` |
+| `policies.sealed` | A policy record, whose format the policy layer owns | `data` |
+
+Every sealed column is bound to the associated data of CRYPTO.md: the vault id, the schema version, the key epoch, the table, the row id, the field tag of the column, the item's class (`none` outside items and fields) and the row's `row_version`. The header uses row id all zeros and row version 0. All sealed columns of a row carry the same `row_version`, and every write to a row bumps it and re-seals all of them, so one column restored from an older version does not open.
+
+## Records
+
+Integers are big-endian. A byte string is a `u32` length then the bytes; text is a byte string of UTF-8. An optional value is `0`, or `1` then the value. A list is a `u32` count then the items. Each record starts with its format version, `1`.
+
+**Header** (91 bytes): `version(1) write_counter(8) state_digest(32) policy_epoch(8) audit_present(1) audit_seq(8) audit_mac(32) recovery_confirmed(1)`. `write_counter` is 1 after `create` and goes up by one with every write transaction.
+
+**Item**: `version(1) slug title provider? account.email? account.label? account.org_id? env_hint? classification(1) allowed_hosts[] allow_short(1) tags[] links.docs? links.billing? links.keys_page? links.dashboard? created_at(8) expires_at? rotated_at? last_used_at? notes`. Classification: 0 unknown, 1 test, 2 live.
+
+**Field**: `version(1) name prior_count(1) created_at(8) updated_at(8)`. `prior_count` is 0 exactly when `sealed_prior` is NULL.
+
+**Prior list**: `version(1) count(1)`, then `u32 length || value` for each prior value, newest first. At most 3.
+
+**Project**: `version(1) key(bytes) display_path manifest_sha256(32) count(4) (env_name reference)... last_seen(8)`.
+
+Slugs are one or more parts separated by `/`; each part starts with a lowercase ASCII letter or digit and continues with those, `.`, `_` or `-`; at most 128 bytes. Field names start with a lowercase ASCII letter, digit or `_` and continue with those, `.` or `-`; at most 64 bytes.
+
+## Size caps
+
+- 64 KiB for a value and for the plaintext of any other sealed record.
+- 1 MiB per row. A field row with a full-size value and three full-size prior values stays under it.
+
+## State digest
+
+Each row of `unlockers`, `items`, `fields`, `projects` and `policies` has a stamp: its row version (0 for unlockers) and the SHA-256 of its stored columns, laid out as follows (`len` is a 4-byte length, integers are 8 bytes):
+
+| Table | Hashed bytes |
+|---|---|
+| unlockers | `kind(8) created_at(8) envelope` |
+| items | `class(8) len slug_hash updated_at(8) sealed_meta` |
+| fields | `len item_id len value_hash len sealed_name len sealed_value has_prior(1) [sealed_prior]` |
+| projects | `len dir_hash sealed` |
+| policies | `sealed` |
+
+```
+state_digest = keyed_hash(header subkey, "envcloak/v1/state-digest",
+                          for each row sorted by (table tag, row id):
+                              table(2) || row_id(16) || row_version(8) || sha256(hashed bytes)(32))
+```
+
+The table tags are CRYPTO.md's: unlockers 7, items 2, fields 3, projects 4, policies 5.
+
+## Unlock
+
+`LockedVault::open` checks the directories and the file, takes the exclusive lock, and reads `meta` and the epoch (from `header`, or from the unlockers when the header row is missing or doubled). A schema version newer than this build's is refused, and nothing is written. Unlocker envelopes can be listed without the key.
+
+`unlock` with the VMK then:
+1. derives the subkeys for the vault id and epoch;
+2. compares `sqlite_schema` with the objects the schema version defines;
+3. opens the header;
+4. reads every row, computes its stamp, and decrypts the item, field, project and policy records. It never opens `sealed_value` or `sealed_prior`: values are decrypted one at a time, on request;
+5. checks each row's plaintext columns against its sealed contents (the slug and project hashes, the item a field belongs to, unique slugs and field names, an unlocker's id, kind and epoch);
+6. recomputes the state digest and compares it with the header's.
+
+If nothing opens under the key, neither the header nor any row, unlock fails with a key mismatch. Otherwise any failure in steps 2 to 6 opens the vault read-only and reports the first one found:
+
+| Report | Meaning |
+|---|---|
+| header unreadable | The header is missing, doubled or does not open, while rows open |
+| digest mismatch | A row was deleted, added, altered, or restored from an older copy |
+| row unreadable | A sealed column does not open (moved, altered, or a changed class) |
+| row inconsistent | Plaintext columns disagree with the sealed contents |
+| schema altered | A table, index, trigger or view was added or changed |
+| changed while open | A row on disk no longer matches what this process wrote |
+
+A read-only vault refuses every write and still serves the items and values that open, so their owner can recover them.
+
+Without an anchor (Linux, and macOS before M3), restoring the whole file together with its header is not detected locally (SPEC §5). `tests/vault_integrity.rs` pins this limit.
+
+## Writes
+
+- A write transaction is one `BEGIN IMMEDIATE` SQLite transaction. Values are sealed before they are bound to a statement; only sealed bytes, keyed hashes, ids, row versions, kinds and timestamps are bound.
+- Each write names the row version it replaces (`WHERE id = ? AND row_version = ?`). A row that is not there means the file changed behind the process's back: the transaction fails and the vault turns read-only.
+- At commit the state digest is recomputed from the stamps held in memory, which only this process's writes change, and the header is rewritten in the same transaction. A row changed on disk while the vault is open is therefore never folded into a fresh digest.
+- Replacing a value makes the old one the newest prior value; three are kept.
+- Deleting an item deletes its fields; `secure_delete` overwrites the freed pages.
+
+## Create
+
+`create` builds the database under a temporary name (`vault/.vault.db.new-<16 hex digits>`) in rollback-journal mode, commits, closes and syncs it, then hard-links it to `vault.db` (which fails if a vault is already there), removes the temporary name and syncs the directory. A crash leaves either no `vault.db` or a complete one. The next `create` removes leftover temporary files. The first open switches the file to WAL.
+
+## Crash safety
+
+SQLite's WAL with `synchronous=FULL` (and `fullfsync` on macOS) makes each transaction atomic and durable, and the header is part of the same transaction as the rows it vouches for. `tests/vault_crash.rs` kills a writer with `kill -9` at 1,000 random points and checks, each time, that the vault reopens at the last reported commit (or the one after, when the kill landed between the commit and its report), that the digest verifies, and that every value and prior value matches a model of the seeded workload (gate 5).
+
+## Migrations
+
+The schema version is in the associated data of every sealed value, so a migration re-seals every sealed column. It runs at unlock, only on a vault that verified, in one SQLite transaction:
+1. each step runs its DDL, re-seals every sealed column from its old version to its new one, then runs its data transform;
+2. `meta.schema_version` is set, and the schema is compared with the one the new version defines;
+3. the state digest is recomputed from the migrated rows, and the header is written with the write counter one higher, sealed under the new version.
+
+Any failure, or a crash, rolls all of it back: the vault stays at its old version, intact and openable (gate 7). Version 1 is the first format, so the shipped plan has no steps; the tests migrate through test-only plans.
+
+## Gates
+
+| Gate (SPEC §15.2) | Test |
+|---|---|
+| 2, storage part: no fixture in the main, WAL, shared-memory or journal bytes | `tests/vault_bytes.rs` |
+| 5: crash consistency | `tests/vault_crash.rs` |
+| 6: integrity digest | `tests/vault_integrity.rs` |
+| 7: migration failure | `tests/vault_migrate.rs` |
+| 11, storage part: no fixture in freed memory | `tests/vault_probe.rs` |

@@ -1,6 +1,6 @@
 # EnvCloak: crypto formats
 
-Status: format version 1 (M1). This file fixes the byte layouts that SPEC §5 describes in prose, so a vault can be read by any implementation that follows it. The code is in `crates/envcloak-core/src/crypto/`. `crates/envcloak-core/tests/crypto_kat.rs` checks each layout against vectors that `scripts/crypto-kat-vectors.py` computes with independent implementations: OpenSSL's Argon2id, pycryptodome's XChaCha20-Poly1305, Python's HMAC, and a BLAKE3 written from its specification.
+Status: format version 1 (M1). This file fixes the byte layouts that SPEC §5 describes in prose, so a vault can be read by any implementation that follows it. How these are stored in the vault file is in [VAULT.md](VAULT.md). The code is in `crates/envcloak-core/src/crypto/`. `crates/envcloak-core/tests/crypto_kat.rs` checks each layout against vectors that `scripts/crypto-kat-vectors.py` computes with independent implementations: OpenSSL's Argon2id, pycryptodome's XChaCha20-Poly1305, Python's HMAC, and a BLAKE3 written from its specification.
 
 A change to any layout, label or number here is a format change: it needs a new format version and a migration.
 
@@ -63,8 +63,10 @@ The tag numbers are fixed and never reused.
 | projects | 4 | fields.sealed_value | 4 | issuer_credential | 3 |
 | policies | 5 | fields.sealed_prior | 5 | | |
 | audit | 6 | projects.sealed | 6 | | |
-| | | policies.sealed | 7 | | |
+| unlockers | 7 | policies.sealed | 7 | | |
 | | | audit entry | 8 | | |
+
+No sealed value uses table 7: unlocker envelopes authenticate themselves. The number names the `unlockers` rows in the vault's state digest (docs/VAULT.md).
 
 ## Sealed values
 
