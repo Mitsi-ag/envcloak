@@ -1,0 +1,27 @@
+# OpenAI. Format and loader rules: docs/PROVIDERS.md.
+id = "openai"
+name = "OpenAI"
+
+# Project, service-account, admin and user keys. The last pattern is the
+# older user-key shape: `sk-` and letters and digits only. Keys of
+# OpenAI-compatible providers can share it (DeepSeek's do), so when both
+# match, detection goes by the variable name.
+key_patterns = [
+  '^sk-(?:proj|svcacct|admin|None)-[A-Za-z0-9_-]{20,}$',
+  '^sk-[A-Za-z0-9]{32,}$',
+]
+# OpenAI has no test mode: every key acts on the real account.
+live_patterns = ['^sk-']
+env_hints = ["OPENAI_API_KEY", "OPENAI_ADMIN_KEY"]
+
+allowed_hosts = ["api.openai.com"]
+auth = [{ header = "authorization", scheme = "Bearer" }]
+# The Admin API: admin keys, project API keys, service accounts, users and
+# invites.
+denied_paths = ["/v1/organization"]
+
+[links]
+docs = "https://platform.openai.com/docs/api-reference/authentication"
+billing = "https://platform.openai.com/settings/organization/billing/overview"
+keys = "https://platform.openai.com/api-keys"
+dashboard = "https://platform.openai.com/usage"

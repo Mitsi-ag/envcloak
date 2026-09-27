@@ -1,0 +1,25 @@
+# DeepSeek. Format and loader rules: docs/PROVIDERS.md.
+id = "deepseek"
+name = "DeepSeek"
+
+# `sk-` and 32 lowercase hex digits. OpenAI's older user-key pattern also
+# matches this shape, so detection goes by the variable name when both do.
+key_patterns = ['^sk-[a-f0-9]{32}$']
+# DeepSeek has no test mode: every key acts on the real account.
+live_patterns = ['^sk-']
+env_hints = ["DEEPSEEK_API_KEY"]
+
+allowed_hosts = ["api.deepseek.com"]
+auth = [{ header = "authorization", scheme = "Bearer" }]
+
+[links]
+docs = "https://api-docs.deepseek.com"
+billing = "https://platform.deepseek.com/usage"
+keys = "https://platform.deepseek.com/api_keys"
+
+# Balance adapter (M4 polls it). Its request may go only to an allowed host,
+# over HTTPS, with the key in a declared auth slot.
+[balance]
+request = { method = "GET", url = "https://api.deepseek.com/user/balance", auth = "bearer" }
+value = "$.balance_infos[0].total_balance"
+currency = "$.balance_infos[0].currency"

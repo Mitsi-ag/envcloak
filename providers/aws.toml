@@ -1,0 +1,21 @@
+# Amazon Web Services. Format and loader rules: docs/PROVIDERS.md.
+id = "aws"
+name = "AWS"
+
+# Access key ids: long-term (`AKIA`) and temporary (`ASIA`). The secret
+# access key has no shape of its own to detect.
+key_patterns = ['^(?:AKIA|ASIA)[A-Z2-7]{16}$']
+# AWS has no test mode: every key acts on the real account.
+live_patterns = ['^(?:AKIA|ASIA)']
+env_hints = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+
+# No hosts and no auth slots: AWS signs requests with SigV4, which proxy mode
+# does not support (SPEC §6.2); use the native credential helper. A wildcard
+# such as *.amazonaws.com would be refused anyway: it is a multi-tenant
+# suffix.
+allowed_hosts = []
+
+[links]
+docs = "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html"
+billing = "https://console.aws.amazon.com/billing/home"
+keys = "https://console.aws.amazon.com/iam/home#/security_credentials"

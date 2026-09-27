@@ -1,5 +1,6 @@
 [package]
 name = "envcloak-providers"
+description = "EnvCloak provider registry: the embedded provider files, the loader's safety rules and key detection"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,4 +11,20 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test support only: loading a registry from caller-supplied files, so the
+# loader's rules can be tested on files that break them. Release binaries
+# never enable it; the shipped registry is the embedded one.
+testing = []
+
 [dependencies]
+envcloak-core.workspace = true
+regex.workspace = true
+regex-syntax.workspace = true
+secrecy.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+# Enables the `testing` feature for this crate's own tests.
+envcloak-providers = { path = ".", features = ["testing"] }
+envcloak-testkit.workspace = true

@@ -1,0 +1,84 @@
+# Domains under which many unrelated parties get hosts of their own. The
+# registry loader refuses a wildcard allowed host (`*.<domain>`) whose domain
+# is one of these or is under one: the key could then be sent to a host
+# anyone can create. A tenant's own host, such as acme.supabase.co, is stored
+# on the item instead (SPEC §8 "Registry safety"). One domain per line,
+# lowercase; `#` starts a comment. Format: docs/PROVIDERS.md.
+
+# Application and function hosting
+supabase.co
+supabase.in
+workers.dev
+pages.dev
+r2.dev
+trycloudflare.com
+vercel.app
+vercel.dev
+now.sh
+herokuapp.com
+herokudns.com
+netlify.app
+netlify.com
+fly.dev
+onrender.com
+railway.app
+deno.dev
+deno.net
+glitch.me
+repl.co
+replit.app
+replit.dev
+surge.sh
+pythonanywhere.com
+modal.run
+hf.space
+ngrok.io
+ngrok.app
+ngrok-free.app
+loca.lt
+
+# Cloud platforms: storage buckets, functions, API gateways and customer
+# resources such as <resource>.openai.azure.com
+amazonaws.com
+cloudfront.net
+awsapps.com
+on.aws
+azure.com
+azurewebsites.net
+azure-api.net
+azurestaticapps.net
+azureedge.net
+cloudapp.net
+windows.net
+googleapis.com
+googleusercontent.com
+appspot.com
+run.app
+cloudfunctions.net
+web.app
+firebaseapp.com
+firebaseio.com
+digitaloceanspaces.com
+ondigitalocean.app
+linodeobjects.com
+
+# Code and page hosting
+github.io
+githubusercontent.com
+gitlab.io
+bitbucket.io
+codeberg.page
+
+# Public suffixes of two labels, under which anyone can register a domain
+co.uk
+org.uk
+com.au
+net.au
+org.au
+co.nz
+co.jp
+com.br
+com.cn
+co.in
+co.za
+com.mx

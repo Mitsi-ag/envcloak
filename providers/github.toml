@@ -1,0 +1,47 @@
+# GitHub. Format and loader rules: docs/PROVIDERS.md.
+id = "github"
+name = "GitHub"
+
+# Classic personal access tokens (`ghp_`), OAuth (`gho_`), user-to-server
+# (`ghu_`), server-to-server (`ghs_`) and refresh (`ghr_`) tokens, and
+# fine-grained personal access tokens (`github_pat_`).
+key_patterns = [
+  '^gh[pousr]_[A-Za-z0-9]{36,251}$',
+  '^github_pat_[A-Za-z0-9_]{36,244}$',
+]
+# GitHub has no test mode: every token acts on real repositories.
+live_patterns = ['^gh[pousr]_', '^github_pat_']
+env_hints = ["GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GITHUB_PERSONAL_ACCESS_TOKEN"]
+
+allowed_hosts = ["api.github.com", "uploads.github.com"]
+auth = [
+  { header = "authorization", scheme = "Bearer" },
+  { header = "authorization", scheme = "token" },
+]
+# Endpoints that manage or mint credentials: OAuth authorizations and
+# applications, GitHub App installation tokens, SSH, GPG and deploy keys,
+# Actions and Codespaces secrets, runner registration tokens and
+# organization token policies; and site administration.
+denied_paths = [
+  "/authorizations",
+  "/applications",
+  "/app",
+  "/admin",
+  "/user/keys",
+  "/user/gpg_keys",
+  "/user/ssh_signing_keys",
+  "/user/codespaces/secrets",
+  "/repos/*/*/keys",
+  "/repos/*/*/actions/secrets",
+  "/repos/*/*/actions/runners",
+  "/repos/*/*/environments/*/secrets",
+  "/orgs/*/actions/secrets",
+  "/orgs/*/actions/runners",
+  "/orgs/*/personal-access-tokens",
+  "/orgs/*/personal-access-token-requests",
+]
+
+[links]
+docs = "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens"
+billing = "https://github.com/settings/billing"
+keys = "https://github.com/settings/tokens"

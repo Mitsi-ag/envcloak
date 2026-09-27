@@ -1,0 +1,46 @@
+# Stripe. Format and loader rules: docs/PROVIDERS.md.
+id = "stripe"
+name = "Stripe"
+
+# Secret (`sk_`), restricted (`rk_`) and publishable (`pk_`) keys, each in
+# live or test mode, and webhook signing secrets.
+key_patterns = [
+  '^[rsp]k_(?:live|test)_[0-9A-Za-z]{10,247}$',
+  '^whsec_[0-9A-Za-z+/=]{20,}$',
+]
+live_patterns = ['^[rsp]k_live_']
+test_patterns = ['^[rsp]k_test_']
+env_hints = [
+  "STRIPE_SECRET_KEY",
+  "STRIPE_API_KEY",
+  "STRIPE_RESTRICTED_KEY",
+  "STRIPE_PUBLISHABLE_KEY",
+  "STRIPE_WEBHOOK_SECRET",
+]
+
+allowed_hosts = ["api.stripe.com", "files.stripe.com"]
+# Stripe takes the key as a bearer token or as the Basic auth user name.
+auth = [
+  { header = "authorization", scheme = "Bearer" },
+  { basic = "user" },
+]
+# Endpoints that mint credentials or hand out account access: ephemeral
+# keys, Connect account links, sessions and accounts (with their login
+# links), app secrets, webhook endpoints (creating one returns its signing
+# secret), Terminal connection tokens and Issuing (card numbers).
+denied_paths = [
+  "/v1/ephemeral_keys",
+  "/v1/account_links",
+  "/v1/account_sessions",
+  "/v1/accounts",
+  "/v1/apps/secrets",
+  "/v1/webhook_endpoints",
+  "/v1/terminal/connection_tokens",
+  "/v1/issuing",
+]
+
+[links]
+docs = "https://docs.stripe.com/keys"
+billing = "https://dashboard.stripe.com/settings/billing"
+keys = "https://dashboard.stripe.com/apikeys"
+dashboard = "https://dashboard.stripe.com/"
