@@ -1,0 +1,611 @@
+//! Gate 6 (SPEC §15.2): deleting a row, or restoring one row from an older
+//! copy, makes unlock report tampering and open read-only. Also: altered
+//! plaintext columns, moved ciphertext, an altered schema, the header, the
+//! documented whole-file rollback limit, file modes, and the digest's cost
+//! at 10,000 rows.
+#![allow(clippy::unwrap_used)]
+
+mod common;
+
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+use std::time::Instant;
+
+use common::{Fixture, copy_dir, name, secret_item, slug};
+use envcloak_core::SecretBytes;
+use envcloak_core::crypto::{
+    Argon2id, EnvelopeCtx, KdfParams, UnlockerId, UnlockerKind, wrap_vmk_with,
+};
+use envcloak_core::vault::{
+    FieldId, INITIAL_EPOCH, Integrity, ItemDetails, PolicyId, ProjectKey, ProjectRecord,
+    TamperKind, Vault, VaultErrorKind,
+};
+
+/// A closed vault with two items (three fields), a project, a policy and
+/// two unlockers, and a copy of its directory to restore between cases.
+struct Pristine {
+    f: Fixture,
+    snapshot: std::path::PathBuf,
+    keep: FieldId,
+    other: FieldId,
+}
+
+const KEEP: &[u8] = b"value that stays readable";
+
+fn pristine() -> Pristine {
+    let (f, mut v) = Fixture::create();
+    let vmk = f.vmk();
+    let kit = wrap_vmk_with(
+        &vmk,
+        &SecretBytes::copy_from(b"kit stand-in"),
+        UnlockerKind::RecoveryKit,
+        &EnvelopeCtx {
+            vault_id: f.vault_id,
+            unlocker_id: UnlockerId::generate(),
+            epoch: INITIAL_EPOCH,
+        },
+        &KdfParams::minimum(),
+        &Argon2id,
+    )
+    .unwrap();
+    let (keep, other) = v
+        .transact(|t| {
+            let a = t.create_item(secret_item("a/keep"))?;
+            let keep = t.add_field(a, name("value"), SecretBytes::copy_from(KEEP))?;
+            let b = t.create_item(secret_item("b/other"))?;
+            let other = t.add_field(b, name("value"), SecretBytes::copy_from(b"other value"))?;
+            t.add_field(b, name("second"), SecretBytes::copy_from(b"second value"))?;
+            t.upsert_project(project(1))?;
+            t.put_policy(PolicyId::generate(), b"a policy")?;
+            t.add_unlocker(kit)?;
+            Ok((keep, other))
+        })
+        .unwrap();
+    drop(v);
+    let snapshot = f.home.root().join("pristine");
+    assert_closed(&f);
+    copy_dir(&f.paths.vault_dir, &snapshot);
+    Pristine {
+        f,
+        snapshot,
+        keep,
+        other,
+    }
+}
+
+fn project(last_seen: u64) -> ProjectRecord {
+    ProjectRecord {
+        key: ProjectKey::new(b"dev-and-inode").unwrap(),
+        display_path: "/src/acme-web".into(),
+        manifest_sha256: [3; 32],
+        bindings: Vec::new(),
+        last_seen,
+    }
+}
+
+/// A closed vault is one file: the WAL was checkpointed and removed.
+fn assert_closed(f: &Fixture) {
+    let names: Vec<String> = std::fs::read_dir(&f.paths.vault_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["vault.db"]);
+}
+
+impl Pristine {
+    fn restore(&self) {
+        std::fs::copy(self.snapshot.join("vault.db"), self.f.db()).unwrap();
+    }
+
+    /// Restores the pristine vault, runs `sql` on it through a plain
+    /// SQLite connection, and unlocks it.
+    fn tampered(&self, sql: &str) -> Vault {
+        self.tampered_by(|raw| raw.execute_batch(sql).unwrap())
+    }
+
+    fn tampered_by(&self, f: impl FnOnce(&rusqlite::Connection)) -> Vault {
+        self.restore();
+        let raw = self.f.raw();
+        f(&raw);
+        drop(raw);
+        self.f.unlock()
+    }
+}
+
+/// Flips one bit of byte `at` of a blob column (`select` names the one
+/// row's column; `update` writes `?1` back to it).
+fn flip_bit(raw: &rusqlite::Connection, select: &str, update: &str, at: usize) {
+    let mut b: Vec<u8> = raw.query_row(select, [], |r| r.get(0)).unwrap();
+    b[at] ^= 0x10;
+    assert_eq!(raw.execute(update, [b]).unwrap(), 1);
+}
+
+/// The vault opened read-only with `want` (or any kind when `None`), still
+/// serves the untouched value, and refuses writes.
+fn assert_read_only(mut v: Vault, want: Option<TamperKind>, keep: Option<FieldId>, case: &str) {
+    match (v.integrity(), want) {
+        (Integrity::Tampered(got), Some(want)) => assert_eq!(got, want, "{case}"),
+        (Integrity::Tampered(_), None) => {}
+        (Integrity::Ok, _) => panic!("{case}: tampering was not detected"),
+    }
+    if let Some(keep) = keep {
+        assert!(v.read_value(keep).unwrap().ct_eq(KEEP), "{case}");
+    }
+    let e = v
+        .transact(|t| t.create_item(secret_item("new/item")))
+        .unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::ReadOnly, "{case}");
+}
+
+fn hex(id: &[u8]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn deleting_any_row_opens_read_only() {
+    let p = pristine();
+    // The pristine copy itself verifies.
+    p.restore();
+    assert_eq!(p.f.unlock().integrity(), Integrity::Ok);
+
+    let other_item = {
+        p.restore();
+        let v = p.f.unlock();
+        hex(v.find(&slug("b/other")).unwrap().id.as_bytes())
+    };
+    let cases = [
+        (
+            "an item row and its fields",
+            format!(
+                "DELETE FROM fields WHERE item_id = x'{other_item}'; DELETE FROM items WHERE id = x'{other_item}';"
+            ),
+        ),
+        (
+            "an item row alone",
+            format!("DELETE FROM items WHERE id = x'{other_item}';"),
+        ),
+        (
+            "a field row",
+            format!(
+                "DELETE FROM fields WHERE id = x'{}';",
+                hex(p.other.as_bytes())
+            ),
+        ),
+        ("the project row", "DELETE FROM projects;".to_owned()),
+        ("the policy row", "DELETE FROM policies;".to_owned()),
+        (
+            "an unlocker row",
+            "DELETE FROM unlockers WHERE rowid = (SELECT max(rowid) FROM unlockers);".to_owned(),
+        ),
+    ];
+    for (case, sql) in cases {
+        let v = p.tampered(&sql);
+        assert_read_only(v, None, Some(p.keep), case);
+    }
+    // The deleted field is gone from the read-only view; the vault did not
+    // invent it back.
+    let v = p.tampered(&format!(
+        "DELETE FROM fields WHERE id = x'{}';",
+        hex(p.other.as_bytes())
+    ));
+    assert_eq!(
+        v.integrity(),
+        Integrity::Tampered(TamperKind::DigestMismatch)
+    );
+    assert_eq!(
+        v.read_value(p.other).unwrap_err().kind(),
+        VaultErrorKind::UnknownField
+    );
+}
+
+#[test]
+fn restoring_one_row_from_an_older_copy_opens_read_only() {
+    let p = pristine();
+    let old = p.snapshot.join("vault.db");
+    // Move every kind of row one version on, then close.
+    p.restore();
+    let mut v = p.f.unlock();
+    let vmk = p.f.vmk();
+    let first_unlocker = v.unlockers().next().unwrap().unlocker_id();
+    let replaced = wrap_vmk_with(
+        &vmk,
+        &SecretBytes::copy_from(b"a new passphrase"),
+        UnlockerKind::Passphrase,
+        &EnvelopeCtx {
+            vault_id: p.f.vault_id,
+            unlocker_id: first_unlocker,
+            epoch: INITIAL_EPOCH,
+        },
+        &KdfParams::minimum(),
+        &Argon2id,
+    )
+    .unwrap();
+    let item = v.find(&slug("b/other")).unwrap().id;
+    let policy = v.policies().next().unwrap().0;
+    v.transact(|t| {
+        t.set_value(p.other, SecretBytes::copy_from(b"rotated value"))?;
+        t.update_item(
+            item,
+            ItemDetails {
+                title: "renamed".into(),
+                ..ItemDetails::default()
+            },
+        )?;
+        t.upsert_project(project(2))?;
+        t.put_policy(policy, b"policy v2")?;
+        t.replace_unlocker(replaced)
+    })
+    .unwrap();
+    drop(v);
+    assert_eq!(p.f.unlock().integrity(), Integrity::Ok);
+    let current = p.f.home.root().join("current.db");
+    std::fs::copy(p.f.db(), &current).unwrap();
+
+    let cases: [(&str, &str, &str); 6] = [
+        (
+            "a field row",
+            "fields",
+            "id, item_id, row_version, sealed_name, sealed_value, value_hash, sealed_prior",
+        ),
+        (
+            "an item row",
+            "items",
+            "id, row_version, class, slug_hash, sealed_meta, updated_at",
+        ),
+        (
+            "the project row",
+            "projects",
+            "id, row_version, dir_hash, sealed",
+        ),
+        ("the policy row", "policies", "id, row_version, sealed"),
+        (
+            "an unlocker row",
+            "unlockers",
+            "id, kind, envelope, created_at",
+        ),
+        ("the header row alone", "header", "epoch, sealed"),
+    ];
+    for (case, table, cols) in cases {
+        // Start from the current file and put back one table's older rows
+        // (each table here has exactly the rows that changed, plus rows
+        // that did not, which are identical in both copies).
+        std::fs::copy(&current, p.f.db()).unwrap();
+        let raw = p.f.raw();
+        raw.execute("ATTACH DATABASE ?1 AS old", [old.to_str().unwrap()])
+            .unwrap();
+        raw.execute_batch(&format!(
+            "DELETE FROM main.{table}; INSERT INTO main.{table} ({cols}) SELECT {cols} FROM old.{table};"
+        ))
+        .unwrap();
+        raw.execute("DETACH DATABASE old", []).unwrap();
+        drop(raw);
+        let v = p.f.unlock();
+        if table == "fields" {
+            // The rolled-back row is internally consistent and opens: only
+            // the digest catches it.
+            assert!(v.read_value(p.other).unwrap().ct_eq(b"other value"));
+        }
+        assert_read_only(v, Some(TamperKind::DigestMismatch), Some(p.keep), case);
+    }
+}
+
+#[test]
+fn altered_plaintext_columns_or_moved_ciphertext_open_read_only() {
+    let p = pristine();
+    let (a, b) = {
+        p.restore();
+        let v = p.f.unlock();
+        (
+            hex(v.find(&slug("a/keep")).unwrap().id.as_bytes()),
+            hex(v.find(&slug("b/other")).unwrap().id.as_bytes()),
+        )
+    };
+    let keep = hex(p.keep.as_bytes());
+    let other = hex(p.other.as_bytes());
+    // (case, SQL, the finding expected first, whether `a/keep`'s value
+    // stays readable)
+    let cases = [
+        (
+            "items.updated_at",
+            "UPDATE items SET updated_at = updated_at + 1;".to_owned(),
+            Some(TamperKind::DigestMismatch),
+            true,
+        ),
+        (
+            "items.slug_hash swapped",
+            format!(
+                "CREATE TEMP TABLE s AS SELECT id, slug_hash FROM items; \
+                 UPDATE items SET slug_hash = randomblob(32); \
+                 UPDATE items SET slug_hash = (SELECT slug_hash FROM s \
+                   WHERE s.id = CASE items.id WHEN x'{a}' THEN x'{b}' ELSE x'{a}' END);"
+            ),
+            Some(TamperKind::RowInconsistent),
+            false,
+        ),
+        (
+            "items.class",
+            format!("UPDATE items SET class = 3 WHERE id = x'{b}';"),
+            Some(TamperKind::RowUnreadable),
+            true,
+        ),
+        (
+            "fields.value_hash",
+            format!("UPDATE fields SET value_hash = zeroblob(32) WHERE id = x'{other}';"),
+            Some(TamperKind::DigestMismatch),
+            true,
+        ),
+        (
+            "fields.item_id moved to another item",
+            format!("UPDATE fields SET item_id = x'{a}' WHERE item_id = x'{b}' AND id != x'{other}';"),
+            Some(TamperKind::DigestMismatch),
+            true,
+        ),
+        (
+            "fields.item_id moved onto a field of the same name",
+            format!("UPDATE fields SET item_id = x'{a}' WHERE id = x'{other}';"),
+            Some(TamperKind::RowInconsistent),
+            true,
+        ),
+        (
+            "unlockers.created_at",
+            "UPDATE unlockers SET created_at = created_at + 1;".to_owned(),
+            Some(TamperKind::DigestMismatch),
+            true,
+        ),
+        (
+            "projects.dir_hash",
+            "UPDATE projects SET dir_hash = zeroblob(32);".to_owned(),
+            Some(TamperKind::RowInconsistent),
+            true,
+        ),
+        (
+            "sealed values swapped between fields",
+            format!(
+                "UPDATE fields SET sealed_value = CASE id WHEN x'{keep}' THEN (SELECT sealed_value FROM fields WHERE id = x'{other}') \
+                 ELSE (SELECT sealed_value FROM fields WHERE id = x'{keep}') END \
+                 WHERE id IN (x'{keep}', x'{other}');"
+            ),
+            Some(TamperKind::DigestMismatch),
+            false,
+        ),
+        (
+            "item metadata swapped between items",
+            format!(
+                "UPDATE items SET sealed_meta = CASE id WHEN x'{a}' THEN (SELECT sealed_meta FROM items WHERE id = x'{b}') \
+                 ELSE (SELECT sealed_meta FROM items WHERE id = x'{a}') END;"
+            ),
+            Some(TamperKind::RowUnreadable),
+            false,
+        ),
+        (
+            "a row copied under a new id",
+            "INSERT INTO policies SELECT x'00112233445566778899aabbccddeeff', row_version, sealed FROM policies;"
+                .to_owned(),
+            Some(TamperKind::RowUnreadable),
+            true,
+        ),
+    ];
+    for (case, sql, want, keep_readable) in cases {
+        let v = p.tampered(&sql);
+        if case.starts_with("sealed values") {
+            // A value moved to another row does not open there.
+            assert_eq!(
+                v.read_value(p.keep).unwrap_err().kind(),
+                VaultErrorKind::Tampered
+            );
+        }
+        assert_read_only(v, want, keep_readable.then_some(p.keep), case);
+    }
+
+    // One flipped bit in a nonce, the ciphertext or the tag of a field
+    // name, which unlock opens.
+    for at in [3, 30, 60] {
+        let v = p.tampered_by(|raw| {
+            flip_bit(
+                raw,
+                &format!("SELECT sealed_name FROM fields WHERE id = x'{other}'"),
+                &format!("UPDATE fields SET sealed_name = ?1 WHERE id = x'{other}'"),
+                at,
+            );
+        });
+        assert_read_only(
+            v,
+            Some(TamperKind::RowUnreadable),
+            Some(p.keep),
+            "a flipped bit",
+        );
+    }
+}
+
+#[test]
+fn an_altered_schema_or_header_opens_read_only() {
+    let p = pristine();
+    for (case, sql, want) in [
+        (
+            "a trigger",
+            "CREATE TRIGGER t AFTER INSERT ON items BEGIN SELECT 1; END;",
+            TamperKind::SchemaAltered,
+        ),
+        (
+            "a view",
+            "CREATE VIEW v AS SELECT id FROM items;",
+            TamperKind::SchemaAltered,
+        ),
+        (
+            "a table",
+            "CREATE TABLE extra (x BLOB);",
+            TamperKind::SchemaAltered,
+        ),
+        (
+            "an index",
+            "CREATE INDEX extra_idx ON fields (value_hash);",
+            TamperKind::SchemaAltered,
+        ),
+        (
+            "a deleted header",
+            "DELETE FROM header;",
+            TamperKind::HeaderUnreadable,
+        ),
+        (
+            "a second header",
+            "INSERT INTO header SELECT epoch, sealed FROM header;",
+            TamperKind::HeaderUnreadable,
+        ),
+    ] {
+        let v = p.tampered(sql);
+        assert_read_only(v, Some(want), Some(p.keep), case);
+    }
+    let v = p.tampered_by(|raw| {
+        flip_bit(
+            raw,
+            "SELECT sealed FROM header",
+            "UPDATE header SET sealed = ?1",
+            40,
+        );
+    });
+    assert_read_only(
+        v,
+        Some(TamperKind::HeaderUnreadable),
+        Some(p.keep),
+        "a damaged header",
+    );
+}
+
+/// SPEC §5 "Integrity": without an anchor (Linux, and macOS before M3),
+/// restoring the whole file together with its header is not detected
+/// locally. This test pins that documented limit, so a change in it is a
+/// deliberate spec change.
+#[test]
+fn restoring_the_whole_file_is_not_detected_locally() {
+    let p = pristine();
+    p.restore();
+    let mut v = p.f.unlock();
+    let before = v.header().write_counter;
+    v.transact(|t| t.set_value(p.other, SecretBytes::copy_from(b"newer value")))
+        .unwrap();
+    drop(v);
+    p.restore();
+    let v = p.f.unlock();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.header().write_counter, before);
+    assert!(v.read_value(p.other).unwrap().ct_eq(b"other value"));
+}
+
+const MODES_CHILD: &str = "ENVCLOAK_VAULT_MODES_CHILD";
+
+/// Runs only as the child of the test below, under umask 000.
+#[test]
+fn file_modes_child() {
+    let Some(dir) = std::env::var_os(MODES_CHILD) else {
+        return;
+    };
+    let data = Path::new(&dir).join("data");
+    // Before the vault code runs, this process creates world-writable
+    // files: the umask really is 000.
+    let probe = Path::new(&dir).join("probe");
+    std::fs::write(&probe, b"").unwrap();
+    assert_eq!(std::fs::metadata(&probe).unwrap().mode() & 0o777, 0o666);
+
+    let paths = envcloak_core::vault::VaultPaths::under(&data);
+    let vmk = envcloak_core::crypto::Vmk::generate();
+    let vault_id = envcloak_core::crypto::VaultId::generate();
+    let env = wrap_vmk_with(
+        &vmk,
+        &SecretBytes::copy_from(b"modes passphrase"),
+        UnlockerKind::Passphrase,
+        &EnvelopeCtx {
+            vault_id,
+            unlocker_id: UnlockerId::generate(),
+            epoch: INITIAL_EPOCH,
+        },
+        &KdfParams::minimum(),
+        &Argon2id,
+    )
+    .unwrap();
+    let mut v = Vault::create(&paths, vault_id, vmk, vec![env]).unwrap();
+    v.transact(|t| {
+        let i = t.create_item(secret_item("m/one"))?;
+        t.add_field(i, name("value"), SecretBytes::copy_from(b"mode test value"))
+    })
+    .unwrap();
+    // While the vault is open its WAL exists; every file is 0600 and every
+    // directory 0700.
+    let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o777;
+    for d in [
+        &paths.data_dir,
+        &paths.vault_dir,
+        &paths.audit_dir,
+        &paths.backups_dir,
+    ] {
+        assert_eq!(mode(d), 0o700, "{}", d.display());
+    }
+    let mut files = 0;
+    for e in std::fs::read_dir(&paths.vault_dir).unwrap() {
+        let e = e.unwrap();
+        assert_eq!(mode(&e.path()), 0o600, "{:?}", e.file_name());
+        files += 1;
+    }
+    assert!(files >= 2, "the database and its WAL");
+    println!("modes: checked");
+}
+
+#[test]
+fn files_are_private_even_under_a_permissive_umask() {
+    let home = envcloak_testkit::TestHome::new();
+    let exe = std::env::current_exe().unwrap();
+    let out = home
+        .apply(&mut std::process::Command::new("/bin/sh"))
+        .args([
+            "-c",
+            "umask 000; exec \"$0\" --exact file_modes_child --nocapture --test-threads=1",
+        ])
+        .arg(&exe)
+        .env(MODES_CHILD, home.root())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "child failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("modes: checked"),
+        "the child did not run the check: {out:?}"
+    );
+}
+
+/// SPEC T3 pitfall: the digest is recomputed on every commit; benchmark it
+/// at 10,000 rows. The bounds are loose so a slow CI runner passes; the
+/// timings are printed.
+#[test]
+fn the_digest_stays_cheap_at_ten_thousand_rows() {
+    let (f, mut v) = Fixture::create();
+    let start = Instant::now();
+    let first = v
+        .transact(|t| {
+            let mut first = None;
+            for n in 0..5_000u32 {
+                let i = t.create_item(secret_item(&format!("bulk/item-{n:05}")))?;
+                let fid = t.add_field(
+                    i,
+                    name("value"),
+                    SecretBytes::copy_from(format!("bulk value number {n:05}").as_bytes()),
+                )?;
+                first.get_or_insert(fid);
+            }
+            Ok(first.unwrap())
+        })
+        .unwrap();
+    let fill = start.elapsed();
+
+    let start = Instant::now();
+    v.transact(|t| t.set_value(first, SecretBytes::copy_from(b"one small change")))
+        .unwrap();
+    let commit = start.elapsed();
+    drop(v);
+
+    let start = Instant::now();
+    let v = f.unlock();
+    let unlock = start.elapsed();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items().len(), 5_000);
+    println!("10k rows: fill {fill:?}, one-row commit {commit:?}, unlock {unlock:?}");
+    assert!(commit.as_secs_f64() < 2.0, "one-row commit took {commit:?}");
+    assert!(unlock.as_secs_f64() < 10.0, "unlock took {unlock:?}");
+}
