@@ -11,10 +11,10 @@ authors.workspace = true
 workspace = true
 
 [features]
-# Test support only: exporting and importing a VMK, opening a vault with a
-# migration plan other than the shipped one, wrapping a new passphrase at
-# other Argon2id parameters, and observing a restore step by step. Release
-# binaries never enable it.
+# Test support only: exporting and importing a VMK, opening or restoring a
+# vault with a migration plan other than the shipped one, wrapping a new
+# passphrase at other Argon2id parameters, and observing a restore step by
+# step. Release binaries never enable it.
 testing = []
 
 [dependencies]

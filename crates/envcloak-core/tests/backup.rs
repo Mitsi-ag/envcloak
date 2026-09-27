@@ -22,10 +22,13 @@ use common::{
     Fixture, KitFixture, Rng, assert_holds_canaries, dir_names, later_wal, name, other_passphrase,
     secret_item,
 };
-use envcloak_core::backup::{BACKUP_CHUNK, BACKUP_EXTENSION, RestoreStep, restore_backup_observed};
+use envcloak_core::backup::{
+    BACKUP_CHUNK, BACKUP_EXTENSION, RestoreStep, restore_backup_observed, restore_backup_with_plan,
+};
 use envcloak_core::crypto::{CryptoErrorKind, Envelope, KdfParams, UnlockerKind};
 use envcloak_core::vault::{
-    Integrity, ItemMeta, LockedVault, PathErrorKind, TamperKind, VaultErrorKind,
+    Integrity, ItemMeta, LockedVault, Migration, MigrationPlan, MigrationTx, PathErrorKind,
+    TamperKind, VaultError, VaultErrorKind,
 };
 use envcloak_core::{PassphraseRejected, SecretBytes, restore_backup};
 use envcloak_testkit::assert_no_canary;
@@ -577,6 +580,65 @@ fn a_restore_fails_when_the_installed_vault_does_not_verify() {
     assert_eq!(report.replaced.len(), 1, "{:?}", report.replaced);
     drop(v);
     assert_eq!(f.unlock().integrity(), Integrity::Ok);
+}
+
+fn no_change(_: &MigrationTx<'_>) -> Result<(), VaultError> {
+    Ok(())
+}
+
+/// A plan to schema version 2 whose step only adds a table.
+fn to_v2() -> MigrationPlan {
+    MigrationPlan::new(vec![Migration {
+        from: 1,
+        ddl: "CREATE TABLE notes (id BLOB PRIMARY KEY NOT NULL) STRICT;",
+        transform: no_change,
+    }])
+    .unwrap()
+}
+
+/// A backup of an older format restores with a build that migrates it
+/// (F-22): the image is checked against its manifest as it was backed up,
+/// then migrated, and the restored vault verifies at the new version.
+#[test]
+fn an_older_format_backup_restores_and_is_migrated() {
+    let (f, v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    assert_eq!(v.schema_version(), 1);
+    drop(v);
+
+    let new = other_passphrase(8);
+    let (v, report) = restore_backup_with_plan(
+        &f.paths,
+        &info.path,
+        &f.kit(),
+        &new,
+        &KdfParams::minimum(),
+        to_v2(),
+    )
+    .unwrap();
+    assert_eq!(v.schema_version(), 2);
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items(), &items[..]);
+    assert_holds_canaries(&v, &f.cs);
+    assert_eq!(report.backup_write_counter, info.write_counter);
+    drop(v);
+
+    let v = LockedVault::open_with_plan(&f.paths, to_v2())
+        .unwrap()
+        .unlock_with_passphrase(&new)
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_eq!(v.schema_version(), 2);
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_holds_canaries(&v, &f.cs);
+    drop(v);
+    // This build, which knows version 1 only, refuses the newer file.
+    assert_eq!(
+        LockedVault::open(&f.paths).unwrap_err().kind(),
+        VaultErrorKind::UnsupportedVersion
+    );
+    f.home.assert_clean(&f.cs);
 }
 
 /// A restored vault can be backed up and restored again.

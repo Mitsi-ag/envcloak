@@ -18,8 +18,10 @@
 //! in the file opens without the VMK, which only the kit unwraps.
 //!
 //! [`restore_backup`] unwraps the VMK with the kit, decrypts the image
-//! into a temporary file next to `vault.db`, opens it, and requires its
-//! digest to verify and its header to match the manifest. It then wraps
+//! into a temporary file next to `vault.db`, opens it at the version it
+//! was backed up at, and requires its digest to verify and its header to
+//! match the manifest. It then migrates an older format, as any unlock
+//! does, and verifies it again. It then wraps
 //! the VMK under the new passphrase (current default parameters), makes
 //! that the only passphrase envelope, records the kit as confirmed (it was
 //! just used), and closes the file. Only then does it touch the current
@@ -58,9 +60,9 @@ use crate::recovery::RecoveryKit;
 use crate::secret::SecretBytes;
 use crate::unlock::{install_passphrase, passphrase_envelope, passphrase_unlockers};
 use crate::vault::{
-    DB_NAME, Integrity, LockedVault, TEMP_PREFIX, Vault, VaultError, VaultErrorKind, VaultPaths,
-    check_private_dir, open_record, remove_temp, seal_record, set_aside, sync_dir, utc_stamp,
-    with_suffix,
+    DB_NAME, Integrity, LockedVault, MigrationPlan, TEMP_PREFIX, Vault, VaultError, VaultErrorKind,
+    VaultPaths, check_private_dir, open_record, remove_temp, seal_record, set_aside, sync_dir,
+    utc_stamp, with_suffix,
 };
 
 /// The extension of backup files.
@@ -240,6 +242,7 @@ pub fn restore_backup(
         kit,
         new_pass,
         &KdfParams::current_defaults(),
+        MigrationPlan::current(),
         &mut |_| {},
     )
 }
@@ -256,7 +259,30 @@ pub fn restore_backup_observed(
     pass_kdf: &KdfParams,
     observe: &mut dyn FnMut(RestoreStep),
 ) -> Result<(Vault, RestoreReport), VaultError> {
-    restore(p, backup, kit, new_pass, pass_kdf, observe)
+    restore(
+        p,
+        backup,
+        kit,
+        new_pass,
+        pass_kdf,
+        MigrationPlan::current(),
+        observe,
+    )
+}
+
+/// Test support only (feature `testing`): [`restore_backup`] by a build
+/// whose migration plan is `plan`, wrapping the new passphrase with
+/// `pass_kdf`: restores a backup of an older format.
+#[cfg(feature = "testing")]
+pub fn restore_backup_with_plan(
+    p: &VaultPaths,
+    backup: &Path,
+    kit: &RecoveryKit,
+    new_pass: &SecretBytes,
+    pass_kdf: &KdfParams,
+    plan: MigrationPlan,
+) -> Result<(Vault, RestoreReport), VaultError> {
+    restore(p, backup, kit, new_pass, pass_kdf, plan, &mut |_| {})
 }
 
 fn restore(
@@ -265,6 +291,7 @@ fn restore(
     kit: &RecoveryKit,
     new_pass: &SecretBytes,
     pass_kdf: &KdfParams,
+    plan: MigrationPlan,
     observe: &mut dyn FnMut(RestoreStep),
 ) -> Result<(Vault, RestoreReport), VaultError> {
     check_passphrase(new_pass)?;
@@ -298,7 +325,12 @@ fn restore(
     staging.file.sync_all()?;
     observe(RestoreStep::StagingWritten);
 
-    let (vmk, items) = prepare_staged(&staging.path, p, vmk, &head, &manifest, new_pass, pass_kdf)?;
+    let staged = Staged {
+        head: &head,
+        manifest: &manifest,
+        plan: &plan,
+    };
+    let (vmk, items) = staged.prepare(&staging.path, p, vmk, new_pass, pass_kdf)?;
     staging.finish()?;
     observe(RestoreStep::StagingReady);
 
@@ -315,7 +347,7 @@ fn restore(
 
     // The file verified under its temporary name; it must still verify
     // under its own. A restore never hands back a vault it did not check.
-    let vault = LockedVault::open(p)
+    let vault = LockedVault::open_with(p, plan)
         .and_then(|l| l.unlock(vmk).map_err(|(_, e)| e))
         .ok()
         .filter(|v| v.integrity() == Integrity::Ok)
@@ -333,60 +365,76 @@ fn restore(
     ))
 }
 
-/// Opens the staged database, requires it to be the backed-up vault with
-/// a verified digest, installs the new passphrase envelope, and closes it.
-/// Returns the VMK and the number of items.
-fn prepare_staged(
-    staged: &Path,
-    p: &VaultPaths,
-    vmk: Vmk,
-    head: &Header,
-    manifest: &Manifest,
-    new_pass: &SecretBytes,
-    pass_kdf: &KdfParams,
-) -> Result<(Vmk, usize), VaultError> {
-    // The image opened under the backup key, so a file that is not a vault
-    // or does not open under the VMK is a backup made wrongly or forged
-    // with the key.
-    let mut vault = LockedVault::open_staged(staged, p)
-        .and_then(|l| l.unlock(vmk).map_err(|(_, e)| e))
-        .map_err(|e| match e.kind() {
-            VaultErrorKind::KeyMismatch | VaultErrorKind::Damaged => {
-                VaultErrorKind::BackupDamaged.into()
-            }
-            _ => e,
+/// What the staged database must be.
+struct Staged<'a> {
+    head: &'a Header,
+    manifest: &'a Manifest,
+    plan: &'a MigrationPlan,
+}
+
+impl Staged<'_> {
+    /// Opens the staged database and requires it to be the backed-up vault,
+    /// as it was backed up, with a verified digest; migrates it if it is of
+    /// an older format, and requires it to verify again; installs the new
+    /// passphrase envelope, and closes it. Returns the VMK and the number
+    /// of items.
+    fn prepare(
+        &self,
+        staged: &Path,
+        p: &VaultPaths,
+        vmk: Vmk,
+        new_pass: &SecretBytes,
+        pass_kdf: &KdfParams,
+    ) -> Result<(Vmk, usize), VaultError> {
+        let (head, manifest) = (self.head, self.manifest);
+        // The image opened under the backup key, so a file that is not a
+        // vault or does not open under the VMK is a backup made wrongly or
+        // forged with the key.
+        let vault = LockedVault::open_staged(staged, p, self.plan.clone())
+            .and_then(|l| l.unlock_as_stored(vmk).map_err(|(_, e)| e))
+            .map_err(|e| match e.kind() {
+                VaultErrorKind::KeyMismatch | VaultErrorKind::Damaged => {
+                    VaultErrorKind::BackupDamaged.into()
+                }
+                _ => e,
+            })?;
+        if vault.integrity() != Integrity::Ok {
+            return Err(VaultErrorKind::Tampered.into());
+        }
+        // Before any migration rewrites it, the header must be the one the
+        // backup recorded.
+        let header = vault.header()?;
+        let matches = vault.vault_id() == head.ctx.vault_id
+            && vault.epoch() == head.ctx.epoch
+            && vault.schema_version() == head.ctx.schema_version
+            && header.write_counter == manifest.write_counter
+            && bool::from(header.state_digest.ct_eq(&manifest.state_digest));
+        if !matches {
+            return Err(VaultErrorKind::BackupDamaged.into());
+        }
+        // Unlocked again, it is verified afresh and migrated, as at any
+        // unlock, when its format is older than this build's.
+        let (locked, vmk) = vault.lock_keeping_key();
+        let mut vault = locked.unlock(vmk).map_err(|(_, e)| e)?;
+        if vault.integrity() != Integrity::Ok {
+            return Err(VaultErrorKind::Tampered.into());
+        }
+        if vault.migration_error().is_some() {
+            return Err(VaultErrorKind::Migration.into());
+        }
+        let existing = passphrase_unlockers(&vault);
+        let env = passphrase_envelope(&vault, new_pass, &existing, pass_kdf)?;
+        vault.transact(|t| {
+            install_passphrase(t, env, &existing)?;
+            // The kit was just used: the user holds it.
+            t.set_recovery_confirmed(true);
+            Ok(())
         })?;
-    if vault.integrity() != Integrity::Ok {
-        return Err(VaultErrorKind::Tampered.into());
+        let items = vault.items().len();
+        let (locked, vmk) = vault.lock_keeping_key();
+        drop(locked);
+        Ok((vmk, items))
     }
-    if vault.migration_error().is_some() {
-        return Err(VaultErrorKind::Migration.into());
-    }
-    // The header must be the one the backup recorded, unless unlock just
-    // migrated an older format, which rewrites it (after verifying the
-    // digest of the old one).
-    let header = vault.header()?;
-    let migrated = vault.schema_version() != head.ctx.schema_version;
-    let same_state = header.write_counter == manifest.write_counter
-        && bool::from(header.state_digest.ct_eq(&manifest.state_digest));
-    let matches = vault.vault_id() == head.ctx.vault_id
-        && vault.epoch() == head.ctx.epoch
-        && (migrated || same_state);
-    if !matches {
-        return Err(VaultErrorKind::BackupDamaged.into());
-    }
-    let existing = passphrase_unlockers(&vault);
-    let env = passphrase_envelope(&vault, new_pass, &existing, pass_kdf)?;
-    vault.transact(|t| {
-        install_passphrase(t, env, &existing)?;
-        // The kit was just used: the user holds it.
-        t.set_recovery_confirmed(true);
-        Ok(())
-    })?;
-    let items = vault.items().len();
-    let (locked, vmk) = vault.lock_keeping_key();
-    drop(locked);
-    Ok((vmk, items))
 }
 
 /// Whether `db` starts as an EnvCloak vault does: SQLite's magic and the
@@ -865,5 +913,116 @@ mod tests {
         bad[0] = 2;
         assert!(Manifest::decode(&bad).is_err());
         assert!(Manifest::decode(&base.encode()[..MANIFEST_LEN - 1]).is_err());
+    }
+
+    fn no_change(_: &crate::vault::MigrationTx<'_>) -> Result<(), VaultError> {
+        Ok(())
+    }
+
+    /// A plan to schema version 2 whose step changes nothing but adds a
+    /// table.
+    fn to_v2() -> MigrationPlan {
+        MigrationPlan::new(vec![crate::vault::Migration {
+            from: 1,
+            ddl: "CREATE TABLE notes (id BLOB PRIMARY KEY NOT NULL) STRICT;",
+            transform: no_change,
+        }])
+        .unwrap()
+    }
+
+    /// The staged image is checked against the manifest as it was backed
+    /// up, before a migration rewrites its header (F-22): a backup whose
+    /// manifest names another write counter or state digest than its image
+    /// holds is refused, by this build and by one that migrates it. The
+    /// forged manifests are sealed with the backup key, so only that check
+    /// can catch them.
+    #[test]
+    fn the_image_must_match_its_manifest_before_any_migration() {
+        use crate::crypto::{ItemClass, Purpose};
+        use crate::vault::{ItemDetails, NewItem, Slug};
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = VaultPaths::under(dir.path().join("data"));
+        let pass = SecretBytes::copy_from(b"a unit test passphrase, not a secret");
+        let (mut v, kit) = crate::unlock::create_vault(&p, &pass, KdfParams::minimum()).unwrap();
+        v.transact(|t| {
+            let item = t.create_item(NewItem {
+                class: ItemClass::Secret,
+                slug: Slug::new("unit/item").unwrap(),
+                details: ItemDetails::default(),
+            })?;
+            t.add_field(
+                item,
+                crate::vault::FieldName::new("value").unwrap(),
+                SecretBytes::copy_from(b"unit value"),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let info = v.create_backup().unwrap();
+        let good = std::fs::read(&info.path).unwrap();
+
+        // Re-seals the manifest, changed by `change`, with the backup key.
+        let forge = |change: fn(&mut Manifest)| -> Vec<u8> {
+            let mut r = &good[..];
+            let head = read_header(&mut r).unwrap();
+            let at = good.len() - r.len();
+            let sealed = read_record(&mut r).unwrap();
+            let k = v.keys().key(Purpose::Backup);
+            let mut m = open_record(k, &head.ctx.aad(0), &sealed, Manifest::decode).unwrap();
+            change(&mut m);
+            let resealed = seal_record(k, &head.ctx.aad(0), &m.encode()).unwrap();
+            assert_eq!(resealed.len(), sealed.len());
+            let len = u32::try_from(resealed.len()).unwrap().to_be_bytes();
+            [
+                &good[..at],
+                &len[..],
+                &resealed,
+                &good[at + 4 + sealed.len()..],
+            ]
+            .concat()
+        };
+        let forged = [
+            ("an older write counter", forge(|m| m.write_counter -= 1)),
+            ("a newer write counter", forge(|m| m.write_counter += 1)),
+            ("another state digest", forge(|m| m.state_digest[7] ^= 1)),
+        ];
+        drop(v);
+        let db = std::fs::read(&p.db).unwrap();
+
+        let bad = dir.path().join("forged.ecbackup");
+        let new_pass = SecretBytes::copy_from(b"another unit test passphrase");
+        for (what, bytes) in &forged {
+            std::fs::write(&bad, bytes).unwrap();
+            for (build, plan) in [("this build", MigrationPlan::current()), ("v2", to_v2())] {
+                let e = restore(
+                    &p,
+                    &bad,
+                    &kit,
+                    &new_pass,
+                    &KdfParams::minimum(),
+                    plan,
+                    &mut |_| {},
+                )
+                .unwrap_err();
+                assert_eq!(e.kind(), VaultErrorKind::BackupDamaged, "{what}, {build}");
+                assert_eq!(std::fs::read(&p.db).unwrap(), db, "{what}, {build}");
+            }
+        }
+
+        // Control: the backup as written restores and migrates.
+        let (v, _) = restore(
+            &p,
+            &info.path,
+            &kit,
+            &new_pass,
+            &KdfParams::minimum(),
+            to_v2(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(v.schema_version(), 2);
+        assert_eq!(v.integrity(), Integrity::Ok);
+        assert_eq!(v.items().len(), 1);
     }
 }

@@ -116,7 +116,7 @@ impl LockedVault {
         Self::open_with(p, plan)
     }
 
-    fn open_with(p: &VaultPaths, plan: MigrationPlan) -> Result<Self, VaultError> {
+    pub(crate) fn open_with(p: &VaultPaths, plan: MigrationPlan) -> Result<Self, VaultError> {
         envcloak_sys::restrict_umask();
         check_private_dir(&p.data_dir)?;
         check_private_dir(&p.vault_dir)?;
@@ -169,7 +169,11 @@ impl LockedVault {
     /// vault directory `paths` names, in rollback-journal mode, so closing
     /// it leaves no WAL behind to be renamed away from it. Takes its lock
     /// as [`LockedVault::open`] does, and removes no temporary files.
-    pub(crate) fn open_staged(db: &Path, paths: &VaultPaths) -> Result<Self, VaultError> {
+    pub(crate) fn open_staged(
+        db: &Path,
+        paths: &VaultPaths,
+        plan: MigrationPlan,
+    ) -> Result<Self, VaultError> {
         envcloak_sys::restrict_umask();
         check_private_file(db)?;
         let conn = schema::open_db(db, false)?;
@@ -178,7 +182,7 @@ impl LockedVault {
         if app_id != schema::APPLICATION_ID {
             return Err(VaultErrorKind::Damaged.into());
         }
-        Self::from_conn(conn, MigrationPlan::current(), paths.clone())
+        Self::from_conn(conn, plan, paths.clone())
     }
 
     /// Where the vault lives.
@@ -258,7 +262,19 @@ impl LockedVault {
     /// When the file names more than one schema version (an altered or
     /// restored `meta` or header row), the vault opens under the first one
     /// its header or rows open under, and reports the row read-only.
-    pub fn unlock(mut self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
+    pub fn unlock(self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
+        self.unlock_with(vmk, true)
+    }
+
+    /// Unlocks as [`LockedVault::unlock`] does but never migrates: the
+    /// vault opens at its on-disk version, read-only, with its header as
+    /// stored. For a restore, which checks a staged vault against its
+    /// backup's manifest before migrating it.
+    pub(crate) fn unlock_as_stored(self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
+        self.unlock_with(vmk, false)
+    }
+
+    fn unlock_with(mut self, vmk: Vmk, migrate: bool) -> Result<Vault, (Self, VaultError)> {
         // A vault locked after opening read-only is judged afresh.
         if let Err(e) = self.conn.pragma_update(None, "query_only", "OFF") {
             return Err((self, e.into()));
@@ -306,7 +322,7 @@ impl LockedVault {
         };
         self.schema_version = ctx.schema_version;
         let mut migration_error = None;
-        if loaded.integrity == Integrity::Ok && ctx.schema_version < self.plan.target() {
+        if migrate && loaded.integrity == Integrity::Ok && ctx.schema_version < self.plan.target() {
             let header = loaded.state.header;
             match migrate::run(&mut self.conn, &keys, &ctx, &header, &self.plan) {
                 Ok(()) => {
@@ -321,8 +337,9 @@ impl LockedVault {
                 Err(e) => migration_error = Some(e.kind()),
             }
         }
-        if loaded.integrity != Integrity::Ok || migration_error.is_some() {
-            // Belt and braces: `transact` refuses writes already.
+        if !migrate || loaded.integrity != Integrity::Ok || migration_error.is_some() {
+            // Belt and braces: `transact` refuses writes already (but for
+            // a vault opened as stored, which nothing writes to).
             if let Err(e) = self.conn.pragma_update(None, "query_only", "ON") {
                 return Err((self, e.into()));
             }

@@ -4,8 +4,8 @@
 //! The `testing` feature adds test support that release binaries never
 //! enable: `crypto::Vmk::export_for_testing` and `import_for_testing`,
 //! `vault::LockedVault::open_with_plan`,
-//! `vault::Vault::change_passphrase_for_testing` and
-//! `backup::restore_backup_observed`.
+//! `vault::Vault::change_passphrase_for_testing`,
+//! `backup::restore_backup_observed` and `backup::restore_backup_with_plan`.
 
 pub mod backup;
 pub mod crypto;
