@@ -635,7 +635,7 @@ impl StreamRedactor<'_> {
 mod tests {
     use super::*;
 
-    const KEY: &str = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+    const KEY: &str = "tk-demo-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
     const M: &str = "[envcloak:openai/work]";
 
     fn redactor() -> Redactor {
@@ -813,7 +813,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut s = r.stream();
-        s.push(b"token sk-proj-Ab", &mut out);
+        s.push(b"token tk-demo-Ab", &mut out);
         s.flush_idle(&mut out);
         assert_eq!(out, b"token ");
         s.push(&KEY.as_bytes()[10..], &mut out);

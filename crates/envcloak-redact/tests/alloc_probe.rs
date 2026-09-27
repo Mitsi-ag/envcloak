@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use envcloak_redact::RedactorBuilder;
 
-const NEEDLE: &[u8] = b"sk-proj-ALLOCPROBE-0123456789abcdefghijKLMNOP";
+const NEEDLE: &[u8] = b"tk-demo-ALLOCPROBE-0123456789abcdefghijKLMNOP";
 /// A freed block containing any 12-byte run of the needle counts as a leak.
 const WINDOW: usize = 12;
 
