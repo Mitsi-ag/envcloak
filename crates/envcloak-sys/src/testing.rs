@@ -22,18 +22,21 @@
 //! formally uninitialized again. The probe reads them as bytes anyway; it is
 //! a test instrument and is not run under Miri.
 //!
-//! The probe runs the production wipe and realloc code from `alloc.rs`
-//! ([`ProbeMode::Wiping`]), so a broken wipe or an in-place realloc in
-//! [`crate::WipingAllocator`] shows up as `not_zeroed` or
-//! `released_with_needle`. [`ProbeMode::Unwiped`] turns the allocator's wipe
-//! off to check that the code under test wipes its own buffers.
+//! Outside [`ProbeMode::Unwiped`], every call goes through the very
+//! `GlobalAlloc` impl the binaries install, [`crate::WipingAllocator`],
+//! instantiated over the probe's backing. A broken wipe, a skipped wipe or
+//! an in-place realloc there shows up as `not_zeroed`, as a freed block the
+//! probe never saw, or as memory that was not zero-initialized.
+//! [`ProbeMode::Unwiped`] turns the allocator's wipe off to check that the
+//! code under test wipes its own buffers.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::alloc::{Backing, free_wiped, realloc_moving};
+use crate::WipingAllocator;
+use crate::alloc::Backing;
 
 /// Maximum number of needles a session can watch for.
 pub const MAX_NEEDLES: usize = 32;
@@ -233,6 +236,11 @@ impl Backing for ProbeBacking {
         unsafe { System.alloc_zeroed(layout) }
     }
 
+    unsafe fn allocate_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded from the caller.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
     unsafe fn release(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: forwarded from the caller.
         unsafe { System.dealloc(ptr, layout) }
@@ -286,18 +294,25 @@ unsafe fn free_unwiped(ptr: *mut u8, layout: Layout) {
     unsafe { System.dealloc(ptr, layout) }
 }
 
-// SAFETY: every block comes from `System.alloc_zeroed` and goes back to
-// `System.dealloc` with the layout it was allocated with. Inspection only
-// reads blocks the caller still owns. Nothing here allocates, locks or logs.
+/// The production allocator's `GlobalAlloc` impl over the probe's backing.
+#[inline]
+fn production(armed: bool) -> WipingAllocator<ProbeBacking> {
+    WipingAllocator::with_backing(ProbeBacking { armed })
+}
+
+// SAFETY: every block comes from `System.alloc_zeroed` (through
+// `ProbeBacking`) and goes back to `System.dealloc` with the layout it was
+// allocated with. Inspection only reads blocks the caller still owns.
+// Nothing here allocates, locks or logs.
 unsafe impl GlobalAlloc for ProbeAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded from the caller.
-        unsafe { System.alloc_zeroed(layout) }
+        unsafe { production(false).alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded from the caller.
-        unsafe { System.alloc_zeroed(layout) }
+        unsafe { production(false).alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -310,7 +325,7 @@ unsafe impl GlobalAlloc for ProbeAllocator {
                 unsafe { free_unwiped(ptr, layout) }
             } else {
                 // SAFETY: forwarded from the caller.
-                unsafe { free_wiped(&ProbeBacking { armed }, ptr, layout) }
+                unsafe { production(armed).dealloc(ptr, layout) }
             }
         });
     }
@@ -321,10 +336,8 @@ unsafe impl GlobalAlloc for ProbeAllocator {
                 FREED.fetch_add(1, Ordering::Relaxed);
             }
             if !unwiped {
-                // The production path: allocate (zeroed here), copy, wipe,
-                // free.
                 // SAFETY: forwarded from the caller.
-                return unsafe { realloc_moving(&ProbeBacking { armed }, ptr, layout, new_size) };
+                return unsafe { production(armed).realloc(ptr, layout, new_size) };
             }
             // Unwiped mode still always moves, so in-place growth cannot hide
             // a stale copy, and the new block is zeroed so its grown region

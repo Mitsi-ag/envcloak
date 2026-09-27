@@ -26,14 +26,37 @@ use zeroize::Zeroize;
 /// static ALLOCATOR: envcloak_sys::WipingAllocator = envcloak_sys::WipingAllocator;
 /// ```
 ///
-/// Allocation is delegated to the system allocator unchanged. `dealloc`
+/// Allocation is delegated to the backing allocator unchanged. `dealloc`
 /// zeroes the whole block first. `realloc` always moves: allocate, copy
 /// `min(old, new)` bytes, wipe the old block, free it. Alignment is kept
 /// because the new block uses the old layout's alignment.
+///
+/// `B` is where blocks come from: the system allocator ([`SystemBacking`])
+/// in every binary. The test probe (`testing::ProbeAllocator`) runs this
+/// same `GlobalAlloc` impl over an inspecting backing, so gate 11 checks the
+/// code the binaries install, not a copy of it.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct WipingAllocator;
+pub struct WipingAllocator<B = SystemBacking> {
+    backing: B,
+}
 
-/// Set by the first free that goes through [`WipingAllocator`].
+/// The wiping allocator over the system allocator, as a value, so it is
+/// written like a unit struct: `static A: WipingAllocator = WipingAllocator;`.
+#[allow(non_upper_case_globals)]
+pub const WipingAllocator: WipingAllocator = WipingAllocator {
+    backing: SystemBacking,
+};
+
+#[cfg(feature = "testing")]
+impl<B> WipingAllocator<B> {
+    /// The wiping allocator over another backing (the test probe's).
+    pub(crate) const fn with_backing(backing: B) -> Self {
+        WipingAllocator { backing }
+    }
+}
+
+/// Set by the first free that goes through a [`WipingAllocator`] (in a test
+/// binary, also the probe's wiping mode).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Returns true when this process frees memory through [`WipingAllocator`],
@@ -54,12 +77,16 @@ fn mark_active() {
 
 /// Where blocks come from and go to, with hooks around the wipe. The
 /// production backing is the system allocator with no hooks; the test
-/// probe (`testing::ProbeAllocator`) zero-initializes every block and
-/// inspects blocks around the wipe, running the same wipe and realloc code.
+/// probe's backing (`testing::ProbeBacking`) zero-initializes every block
+/// and inspects blocks around the wipe.
 pub(crate) trait Backing {
     /// # Safety
     /// As [`GlobalAlloc::alloc`].
     unsafe fn allocate(&self, layout: Layout) -> *mut u8;
+
+    /// # Safety
+    /// As [`GlobalAlloc::alloc_zeroed`].
+    unsafe fn allocate_zeroed(&self, layout: Layout) -> *mut u8;
 
     /// Returns a block to the system without wiping it.
     ///
@@ -70,25 +97,34 @@ pub(crate) trait Backing {
     /// Called just before the block is wiped.
     ///
     /// # Safety
-    /// `ptr` is valid for reads of `size` bytes.
+    /// `ptr` is valid for reads of `size` bytes, which may include
+    /// uninitialized ones (struct padding).
     #[inline(always)]
     unsafe fn before_wipe(&self, _ptr: *const u8, _size: usize) {}
 
     /// Called just after the block is wiped.
     ///
     /// # Safety
-    /// `ptr` is valid for reads of `size` bytes.
+    /// `ptr` is valid for reads of `size` bytes, all of them just zeroed.
     #[inline(always)]
     unsafe fn after_wipe(&self, _ptr: *const u8, _size: usize) {}
 }
 
-struct SystemBacking;
+/// The production backing: the system allocator, with no hooks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemBacking;
 
 impl Backing for SystemBacking {
     #[inline(always)]
     unsafe fn allocate(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded from the caller's GlobalAlloc contract.
         unsafe { System.alloc(layout) }
+    }
+
+    #[inline(always)]
+    unsafe fn allocate_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded from the caller's GlobalAlloc contract.
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     #[inline(always)]
@@ -161,34 +197,34 @@ pub(crate) unsafe fn realloc_moving<B: Backing>(
     new_ptr
 }
 
-// SAFETY: allocation is delegated to `System`, which upholds the
-// GlobalAlloc contract; `dealloc` and `realloc` only add a wipe of memory
-// the caller still owns before handing it back. Nothing here allocates,
-// panics (see `wipe`), locks or logs.
-unsafe impl GlobalAlloc for WipingAllocator {
+// SAFETY: allocation is delegated to the backing (`System` in production),
+// which upholds the GlobalAlloc contract; `dealloc` and `realloc` only add a
+// wipe of memory the caller still owns before handing it back. Nothing here
+// allocates, panics (see `wipe`), locks or logs.
+unsafe impl<B: Backing> GlobalAlloc for WipingAllocator<B> {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded from the caller.
-        unsafe { System.alloc(layout) }
+        unsafe { self.backing.allocate(layout) }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarded from the caller.
-        unsafe { System.alloc_zeroed(layout) }
+        unsafe { self.backing.allocate_zeroed(layout) }
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         mark_active();
         // SAFETY: forwarded from the caller.
-        unsafe { free_wiped(&SystemBacking, ptr, layout) }
+        unsafe { free_wiped(&self.backing, ptr, layout) }
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         mark_active();
         // SAFETY: forwarded from the caller.
-        unsafe { realloc_moving(&SystemBacking, ptr, layout, new_size) }
+        unsafe { realloc_moving(&self.backing, ptr, layout, new_size) }
     }
 }

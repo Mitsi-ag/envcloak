@@ -1,7 +1,8 @@
 //! `WipingAllocator` as a real global allocator: it must behave like the
-//! system allocator (contents, alignment, zeroed allocations) while wiping.
-//! What it leaves in freed memory is checked by `alloc_probe.rs`, which runs
-//! the same wipe and realloc code under an inspecting backing.
+//! system allocator (contents, alignment, zeroed allocations) while wiping,
+//! and its realloc must always move. What it leaves in freed memory is
+//! checked by `alloc_probe.rs`, which runs this same `GlobalAlloc` impl over
+//! an inspecting backing.
 #![allow(unsafe_code, clippy::unwrap_used)]
 
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc, realloc};
@@ -42,6 +43,38 @@ fn realloc_keeps_contents_and_alignment() {
                 assert_eq!(r.add(i).read(), i as u8);
             }
             dealloc(r, Layout::from_size_align(16, align).unwrap());
+        }
+    }
+}
+
+#[test]
+fn realloc_always_moves() {
+    // An in-place realloc would leave the old bytes where they were, never
+    // wiped. The moving realloc allocates the new block while the old one is
+    // still live, so the address always changes. The system allocator
+    // reuses the block for most of these size changes (same size class,
+    // shrinking a large block), so a realloc that delegates to it fails here.
+    let sizes = [
+        (16, 24),
+        (24, 17),
+        (32, 31),
+        (64, 65),
+        (4096, 4000),
+        (100_000, 100_008),
+        (100_000, 50_000),
+    ];
+    for (from, to) in sizes {
+        let layout = Layout::from_size_align(from, 8).unwrap();
+        // SAFETY: non-zero-sized layouts; each block is freed once with its
+        // current layout. The old pointer is only compared, never used.
+        unsafe {
+            let p = alloc(layout);
+            assert!(!p.is_null());
+            p.write_bytes(0x42, from);
+            let q = realloc(p, layout, to);
+            assert!(!q.is_null());
+            assert_ne!(p.addr(), q.addr(), "realloc {from} -> {to} stayed in place");
+            dealloc(q, Layout::from_size_align(to, 8).unwrap());
         }
     }
 }

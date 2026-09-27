@@ -19,7 +19,7 @@ mod harden;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-pub use alloc::{WipingAllocator, wiping_allocator_active};
+pub use alloc::{SystemBacking, WipingAllocator, wiping_allocator_active};
 pub use harden::{
     Hardening, core_dump_limit, disable_core_dumps, harden_process, hardening_report,
     hardening_status, lock_memory, parse_tracer_pid, set_non_dumpable, tracer_present,
