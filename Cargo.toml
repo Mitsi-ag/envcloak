@@ -60,8 +60,9 @@ subtle = { version = "=2.6.1", default-features = false }
 
 # Vault storage (SPEC §5 "Vault"): SQLite built from the bundled amalgamation,
 # so every platform runs the same, known SQLite. Only sealed bytes, keyed
-# hashes and opaque ids are ever bound to a statement.
-rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+# hashes and opaque ids are ever bound to a statement. `serialize` copies
+# the database into an encrypted backup and verifies the copy in memory.
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "serialize"] }
 
 aho-corasick = "1.1.5"
 base64 = "0.23.1"

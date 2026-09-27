@@ -25,6 +25,9 @@ pub enum TableTag {
     /// no sealed value uses this tag; it names the table's rows in the
     /// vault's state digest.
     Unlockers = 7,
+    /// A vault backup file (docs/VAULT.md "Backups"); the row id is the
+    /// backup's id and the row version the record's index.
+    Backup = 8,
 }
 
 /// The column a sealed value is stored in. Part of the vault format, like
@@ -48,6 +51,10 @@ pub enum FieldTag {
     Policy = 7,
     /// An audit log entry.
     AuditEntry = 8,
+    /// A backup's manifest, record 0.
+    BackupManifest = 9,
+    /// A chunk of a backup's database image, records 1 and up.
+    BackupChunk = 10,
 }
 
 /// The class of the item a sealed value belongs to (SPEC §5 "Items").

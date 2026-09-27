@@ -71,6 +71,10 @@ pub enum VaultErrorKind {
     NoPassphrase,
     /// The vault has no Recovery Kit unlocker.
     NoRecoveryKit,
+    /// A backup file is malformed, truncated or altered, or is not an
+    /// EnvCloak vault backup. (A wrong Recovery Kit is
+    /// [`CryptoErrorKind::Unlock`].)
+    BackupDamaged,
     /// An authenticated record failed to decode: a bug, not an attack.
     Corrupt,
 }
@@ -122,6 +126,9 @@ impl VaultErrorKind {
             VaultErrorKind::Passphrase(r) => r.message(),
             VaultErrorKind::NoPassphrase => "the vault has no passphrase unlocker",
             VaultErrorKind::NoRecoveryKit => "the vault has no Recovery Kit unlocker",
+            VaultErrorKind::BackupDamaged => {
+                "the backup file is damaged or truncated, or is not an EnvCloak vault backup"
+            }
             VaultErrorKind::Corrupt => "a sealed vault record could not be decoded",
         }
     }
@@ -218,6 +225,7 @@ mod tests {
             VaultErrorKind::Corrupt,
             VaultErrorKind::Passphrase(PassphraseRejected::Common),
             VaultErrorKind::NoRecoveryKit,
+            VaultErrorKind::BackupDamaged,
         ] {
             let e = VaultError::from(k);
             assert_eq!(e.to_string(), k.message());

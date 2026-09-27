@@ -1,0 +1,915 @@
+//! Encrypted vault backups and restore (SPEC §5, §6.4 and §15.1 step 11;
+//! the file format is in docs/VAULT.md "Backups").
+//!
+//! [`Vault::create_backup`] writes the whole vault to
+//! `backups/vault-<UTC time>-<id>.ecbackup`:
+//! - a plaintext header: the vault id, schema version and key epoch, the
+//!   backup's random id, and the vault's Recovery Kit envelopes, which
+//!   authenticate themselves. The passphrase envelope is not there, so a
+//!   copied backup offers nothing to guess but the 128-bit kit;
+//! - a sealed manifest: the SHA-256 of that header, the time, the write
+//!   counter and state digest the vault had, and the image's length;
+//! - the database image, a verified snapshot of the vault file
+//!   (`Vault::snapshot`), in sealed chunks of 1 MiB.
+//!
+//! Every record is XChaCha20-Poly1305 under the `backup` subkey, bound to
+//! the backup's id and the record's index, so nothing can be altered,
+//! reordered, dropped, added or moved between backups unnoticed. Nothing
+//! in the file opens without the VMK, which only the kit unwraps.
+//!
+//! [`restore_backup`] unwraps the VMK with the kit, decrypts the image
+//! into a temporary file next to `vault.db`, opens it, and requires its
+//! digest to verify and its header to match the manifest. It then wraps
+//! the VMK under the new passphrase (current default parameters), makes
+//! that the only passphrase envelope, records the kit as confirmed (it was
+//! just used), and closes the file. Only then does it touch the current
+//! vault: it closes it, keeps it as `vault/replaced-<UTC time>.db` (a hard
+//! link, so `vault.db` never goes missing), renames the new file over
+//! `vault.db`, and syncs the directory. A crash at any point leaves the
+//! old vault or the new one in place, never neither; leftovers are removed
+//! by the next open.
+//!
+//! Restore takes the vault's lock through [`LockedVault::open`], so it
+//! fails with [`VaultErrorKind::Busy`] while the vault is open: the daemon
+//! locks and closes its handle first, and its instance lock keeps any
+//! other writer away while the files are swapped.
+
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
+use crate::crypto::{
+    Aad, Argon2id, CryptoErrorKind, Envelope, EnvelopeCtx, FieldTag, ItemClass, KdfParams, Keyring,
+    Purpose, Sealed, SubKey, TableTag, UnlockerKind, VaultId, Vmk, fill_random_or_panic,
+    unwrap_vmk_with,
+};
+use crate::passphrase::check_passphrase;
+use crate::recovery::RecoveryKit;
+use crate::secret::SecretBytes;
+use crate::unlock::{install_passphrase, passphrase_envelope, passphrase_unlockers};
+use crate::vault::{
+    DB_NAME, Integrity, LockedVault, SIDE_FILES, TEMP_PREFIX, Vault, VaultError, VaultErrorKind,
+    VaultPaths, check_private_dir, open_record, remove_temp, seal_record, sync_dir,
+};
+
+/// The extension of backup files.
+pub const BACKUP_EXTENSION: &str = "ecbackup";
+/// Bytes of database image per sealed chunk.
+pub const BACKUP_CHUNK: usize = 1 << 20;
+
+const MAGIC: [u8; 4] = *b"ECBK";
+/// The only backup format version this build reads and writes.
+const FORMAT_VERSION: u8 = 1;
+const MANIFEST_VERSION: u8 = 1;
+/// `magic(4) version(1) vault_id(16) schema_version(2) epoch(4)
+/// backup_id(16) envelope_count(1)`.
+const HEADER_FIXED: usize = 44;
+/// `version(1) header_sha256(32) created_at(8) write_counter(8)
+/// state_digest(32) image_len(8) chunk_count(4)`.
+const MANIFEST_LEN: usize = 93;
+/// At most this many Recovery Kit envelopes are carried.
+const MAX_ENVELOPES: usize = 8;
+const BACKUP_PREFIX: &str = "vault-";
+const REPLACED_PREFIX: &str = "replaced-";
+
+/// A backup [`Vault::create_backup`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupInfo {
+    pub path: PathBuf,
+    pub backup_id: [u8; 16],
+    /// Unix seconds.
+    pub created_at: u64,
+    /// The vault's write counter when it was backed up.
+    pub write_counter: u64,
+    pub items: usize,
+    /// The file's size.
+    pub bytes: u64,
+}
+
+/// What [`restore_backup`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub vault_id: VaultId,
+    pub backup_id: [u8; 16],
+    /// When the backup was made, Unix seconds, from its sealed manifest.
+    pub backup_created_at: u64,
+    /// The vault's write counter when it was backed up.
+    pub backup_write_counter: u64,
+    pub items: usize,
+    /// Where the vault that was replaced now is, if there was one.
+    pub replaced: Option<PathBuf>,
+}
+
+/// The points a restore passes, in order. Tests stop a restore at each
+/// one; the vault on disk is the old one up to [`RestoreStep::Installed`]
+/// and the new one from then on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RestoreStep {
+    /// The kit unwrapped the VMK and the manifest opened.
+    KitAccepted,
+    /// The current vault, if any, is open and locked.
+    OldVaultOpened,
+    /// The decrypted image is in the temporary file and synced.
+    StagingWritten,
+    /// The staged vault verified, holds the new passphrase envelope, and
+    /// is closed and synced.
+    StagingReady,
+    /// The current vault is closed.
+    OldVaultClosed,
+    /// The current vault is also linked as `replaced-<time>.db`.
+    OldVaultKept,
+    /// The new vault is `vault.db`, and the directory is synced.
+    Installed,
+}
+
+impl Vault {
+    /// Writes an encrypted backup of the vault to its `backups` directory.
+    ///
+    /// Refused with [`VaultErrorKind::Tampered`] unless the vault verified
+    /// and still holds what this process committed (the vault then turns
+    /// read-only), and with [`VaultErrorKind::NoRecoveryKit`] when it has
+    /// no Recovery Kit envelope, which a restore needs. A vault that could
+    /// not be migrated is backed up at its on-disk version.
+    pub fn create_backup(&self) -> Result<BackupInfo, VaultError> {
+        let header = self.header()?;
+        let envelopes: Vec<&Envelope> = self
+            .unlockers()
+            .filter(|e| e.kind() == UnlockerKind::RecoveryKit)
+            .take(MAX_ENVELOPES)
+            .collect();
+        if envelopes.is_empty() {
+            return Err(VaultErrorKind::NoRecoveryKit.into());
+        }
+        let image = self.snapshot()?;
+
+        let paths = self.paths();
+        paths.ensure_dirs()?;
+        let dir = std::fs::canonicalize(&paths.backups_dir)?;
+        remove_stale_backup_temps(&dir)?;
+        let created_at = now_secs();
+        let mut backup_id = [0u8; 16];
+        fill_random_or_panic(&mut backup_id);
+        let name = format!(
+            "{BACKUP_PREFIX}{}-{}.{BACKUP_EXTENSION}",
+            utc_stamp(created_at),
+            hex(&backup_id[..4])
+        );
+        let path = dir.join(&name);
+        let tmp = dir.join(format!(".{name}.tmp"));
+
+        let ctx = BackupCtx {
+            vault_id: self.vault_id(),
+            schema_version: self.schema_version(),
+            epoch: self.epoch(),
+            backup_id,
+        };
+        let head = ctx.header(&envelopes);
+        let chunk_count = u32::try_from(image.len().div_ceil(BACKUP_CHUNK))
+            .map_err(|_| VaultError::from(VaultErrorKind::TooLarge))?;
+        let manifest = Manifest {
+            header_sha256: Sha256::digest(&head).into(),
+            created_at,
+            write_counter: header.write_counter,
+            state_digest: header.state_digest,
+            image_len: image.len() as u64,
+            chunk_count,
+        };
+        let k = self.keys().key(Purpose::Backup);
+        let written = write_backup(&tmp, &head, &manifest, &image, k, &ctx);
+        let linked = written.and_then(|()| Ok(std::fs::hard_link(&tmp, &path)?));
+        let removed = remove_file_if_present(&tmp);
+        linked?;
+        removed?;
+        sync_dir(&dir)?;
+        Ok(BackupInfo {
+            bytes: std::fs::metadata(&path)?.len(),
+            path,
+            backup_id,
+            created_at,
+            write_counter: header.write_counter,
+            items: self.items().len(),
+        })
+    }
+}
+
+/// Restores the vault at `p` from `backup`, unlocked with `kit`, and makes
+/// `new_pass` its passphrase. Returns the restored vault, unlocked.
+///
+/// Fails, and leaves the current vault as it was, when:
+/// - `new_pass` breaks the passphrase rules ([`VaultErrorKind::Passphrase`],
+///   checked before any key derivation);
+/// - the kit does not open the backup (the generic
+///   [`CryptoErrorKind::Unlock`], as for a wrong passphrase);
+/// - the file is not a backup, or was altered, truncated or extended
+///   ([`VaultErrorKind::BackupDamaged`]), or its vault does not verify
+///   ([`VaultErrorKind::Tampered`]);
+/// - the current vault is open ([`VaultErrorKind::Busy`]).
+///
+/// A current vault that is not an EnvCloak vault at all is moved aside
+/// too. See the module documentation for the order of the steps.
+pub fn restore_backup(
+    p: &VaultPaths,
+    backup: &Path,
+    kit: &RecoveryKit,
+    new_pass: &SecretBytes,
+) -> Result<(Vault, RestoreReport), VaultError> {
+    restore(
+        p,
+        backup,
+        kit,
+        new_pass,
+        &KdfParams::current_defaults(),
+        &mut |_| {},
+    )
+}
+
+/// Test support only (feature `testing`): [`restore_backup`], wrapping the
+/// new passphrase with `pass_kdf` instead of the current defaults, and
+/// calling `observe` at each [`RestoreStep`].
+#[cfg(feature = "testing")]
+pub fn restore_backup_observed(
+    p: &VaultPaths,
+    backup: &Path,
+    kit: &RecoveryKit,
+    new_pass: &SecretBytes,
+    pass_kdf: &KdfParams,
+    observe: &mut dyn FnMut(RestoreStep),
+) -> Result<(Vault, RestoreReport), VaultError> {
+    restore(p, backup, kit, new_pass, pass_kdf, observe)
+}
+
+fn restore(
+    p: &VaultPaths,
+    backup: &Path,
+    kit: &RecoveryKit,
+    new_pass: &SecretBytes,
+    pass_kdf: &KdfParams,
+    observe: &mut dyn FnMut(RestoreStep),
+) -> Result<(Vault, RestoreReport), VaultError> {
+    check_passphrase(new_pass)?;
+    pass_kdf.check_bounds()?;
+    let mut reader = open_backup(backup)?;
+    let head = read_header(&mut reader)?;
+    let vmk = unwrap_with_kit(&head, kit)?;
+    let keys = Keyring::derive(&vmk, &head.ctx.vault_id, head.ctx.epoch);
+    let k = keys.key(Purpose::Backup);
+    let manifest = read_manifest(&mut reader, k, &head)?;
+    observe(RestoreStep::KitAccepted);
+
+    p.ensure_dirs()?;
+    // A vault is opened, which takes its lock and folds in its WAL. A file
+    // that is not one is left to be moved aside with its side files as
+    // they are: SQLite would delete a WAL next to a file it cannot read.
+    let old = if looks_like_a_vault(&p.db)? {
+        match LockedVault::open(p) {
+            Ok(v) => Some(v),
+            Err(e) if e.kind() == VaultErrorKind::Damaged => None,
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    observe(RestoreStep::OldVaultOpened);
+
+    let dir = std::fs::canonicalize(&p.vault_dir)?;
+    let mut staging = Staging::create(&dir)?;
+    write_image(&mut reader, &mut staging.file, k, &head, &manifest)?;
+    staging.file.sync_all()?;
+    observe(RestoreStep::StagingWritten);
+
+    let (vmk, items) = prepare_staged(&staging.path, p, vmk, &head, &manifest, new_pass, pass_kdf)?;
+    staging.finish()?;
+    observe(RestoreStep::StagingReady);
+
+    drop(old);
+    observe(RestoreStep::OldVaultClosed);
+    let db = dir.join(DB_NAME);
+    let replaced = if std::fs::symlink_metadata(&db).is_ok() {
+        Some(keep_old_vault(&dir, &db)?)
+    } else {
+        None
+    };
+    observe(RestoreStep::OldVaultKept);
+    std::fs::rename(&staging.path, &db)?;
+    staging.disarm();
+    sync_dir(&dir)?;
+    observe(RestoreStep::Installed);
+
+    let vault = LockedVault::open(p)?.unlock(vmk).map_err(|(_, e)| e)?;
+    Ok((
+        vault,
+        RestoreReport {
+            vault_id: head.ctx.vault_id,
+            backup_id: head.ctx.backup_id,
+            backup_created_at: manifest.created_at,
+            backup_write_counter: manifest.write_counter,
+            items,
+            replaced,
+        },
+    ))
+}
+
+/// Opens the staged database, requires it to be the backed-up vault with
+/// a verified digest, installs the new passphrase envelope, and closes it.
+/// Returns the VMK and the number of items.
+fn prepare_staged(
+    staged: &Path,
+    p: &VaultPaths,
+    vmk: Vmk,
+    head: &Header,
+    manifest: &Manifest,
+    new_pass: &SecretBytes,
+    pass_kdf: &KdfParams,
+) -> Result<(Vmk, usize), VaultError> {
+    // The image opened under the backup key, so a file that is not a vault
+    // or does not open under the VMK is a backup made wrongly or forged
+    // with the key.
+    let mut vault = LockedVault::open_staged(staged, p)
+        .and_then(|l| l.unlock(vmk).map_err(|(_, e)| e))
+        .map_err(|e| match e.kind() {
+            VaultErrorKind::KeyMismatch | VaultErrorKind::Damaged => {
+                VaultErrorKind::BackupDamaged.into()
+            }
+            _ => e,
+        })?;
+    if vault.integrity() != Integrity::Ok {
+        return Err(VaultErrorKind::Tampered.into());
+    }
+    if vault.migration_error().is_some() {
+        return Err(VaultErrorKind::Migration.into());
+    }
+    // The header must be the one the backup recorded, unless unlock just
+    // migrated an older format, which rewrites it (after verifying the
+    // digest of the old one).
+    let header = vault.header()?;
+    let migrated = vault.schema_version() != head.ctx.schema_version;
+    let same_state = header.write_counter == manifest.write_counter
+        && bool::from(header.state_digest.ct_eq(&manifest.state_digest));
+    let matches = vault.vault_id() == head.ctx.vault_id
+        && vault.epoch() == head.ctx.epoch
+        && (migrated || same_state);
+    if !matches {
+        return Err(VaultErrorKind::BackupDamaged.into());
+    }
+    let existing = passphrase_unlockers(&vault);
+    let env = passphrase_envelope(&vault, new_pass, &existing, pass_kdf)?;
+    vault.transact(|t| {
+        install_passphrase(t, env, &existing)?;
+        // The kit was just used: the user holds it.
+        t.set_recovery_confirmed(true);
+        Ok(())
+    })?;
+    let items = vault.items().len();
+    let (locked, vmk) = vault.lock_keeping_key();
+    drop(locked);
+    Ok((vmk, items))
+}
+
+/// Whether `db` starts as an EnvCloak vault does: SQLite's magic and the
+/// vault's application id. False when there is no file.
+fn looks_like_a_vault(db: &Path) -> Result<bool, VaultError> {
+    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    const APPLICATION_ID: [u8; 4] = *b"ECV1";
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(db)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(VaultErrorKind::Path(crate::vault::PathErrorKind::Symlink).into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(VaultErrorKind::Path(crate::vault::PathErrorKind::NotFile).into());
+    }
+    let mut head = [0u8; 72];
+    match file.read_exact(&mut head) {
+        Ok(()) => Ok(head[..16] == MAGIC[..] && head[68..72] == APPLICATION_ID),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Links the current vault file as `replaced-<time>.db` and moves any side
+/// file of it along, so the new file never meets the old one's WAL.
+fn keep_old_vault(dir: &Path, db: &Path) -> Result<PathBuf, VaultError> {
+    let stamp = utc_stamp(now_secs());
+    let mut n = 0u32;
+    let kept = loop {
+        let name = if n == 0 {
+            format!("{REPLACED_PREFIX}{stamp}.db")
+        } else {
+            format!("{REPLACED_PREFIX}{stamp}-{n}.db")
+        };
+        let target = dir.join(name);
+        match std::fs::hard_link(db, &target) {
+            Ok(()) => break target,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n += 1,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    for side in SIDE_FILES {
+        let from = with_suffix(db, side);
+        if std::fs::symlink_metadata(&from).is_ok() {
+            std::fs::rename(&from, with_suffix(&kept, side))?;
+        }
+    }
+    sync_dir(dir)?;
+    Ok(kept)
+}
+
+fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// The temporary file a restore builds the new vault in. Removed, with its
+/// side files, unless it was renamed into place.
+struct Staging {
+    path: PathBuf,
+    file: File,
+    armed: bool,
+}
+
+impl Staging {
+    fn create(dir: &Path) -> Result<Self, VaultError> {
+        let mut suffix = [0u8; 8];
+        fill_random_or_panic(&mut suffix);
+        let path = dir.join(format!("{TEMP_PREFIX}{}", hex(&suffix)));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        Ok(Staging {
+            path,
+            file,
+            armed: true,
+        })
+    }
+
+    /// After the staged vault is closed: removes the rollback journal
+    /// SQLite keeps in exclusive mode, refuses any other side file, and
+    /// syncs the database.
+    fn finish(&self) -> Result<(), VaultError> {
+        remove_file_if_present(&with_suffix(&self.path, "-journal"))?;
+        for side in ["-wal", "-shm"] {
+            if std::fs::symlink_metadata(with_suffix(&self.path, side)).is_ok() {
+                return Err(VaultErrorKind::Storage(-1).into());
+            }
+        }
+        Ok(File::open(&self.path)?.sync_all()?)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = remove_temp(&self.path);
+        }
+    }
+}
+
+impl core::fmt::Debug for Staging {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Staging").finish_non_exhaustive()
+    }
+}
+
+/// What every sealed record of one backup shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackupCtx {
+    vault_id: VaultId,
+    schema_version: u16,
+    epoch: u32,
+    backup_id: [u8; 16],
+}
+
+impl BackupCtx {
+    /// Record 0 is the manifest; records 1 and up are the image's chunks.
+    fn aad(&self, index: u64) -> Aad {
+        Aad {
+            vault_id: self.vault_id,
+            schema_version: self.schema_version,
+            key_epoch: self.epoch,
+            table: TableTag::Backup,
+            row_id: self.backup_id,
+            field: if index == 0 {
+                FieldTag::BackupManifest
+            } else {
+                FieldTag::BackupChunk
+            },
+            item_class: ItemClass::None,
+            row_version: index,
+        }
+    }
+
+    fn header(&self, envelopes: &[&Envelope]) -> Vec<u8> {
+        let mut h = Vec::with_capacity(HEADER_FIXED + envelopes.len() * Envelope::LEN);
+        h.extend_from_slice(&MAGIC);
+        h.push(FORMAT_VERSION);
+        h.extend_from_slice(&self.vault_id.0);
+        h.extend_from_slice(&self.schema_version.to_be_bytes());
+        h.extend_from_slice(&self.epoch.to_be_bytes());
+        h.extend_from_slice(&self.backup_id);
+        h.push(u8::try_from(envelopes.len()).unwrap_or(0));
+        for e in envelopes {
+            h.extend_from_slice(&e.to_bytes());
+        }
+        h
+    }
+}
+
+/// The plaintext header as read.
+struct Header {
+    ctx: BackupCtx,
+    envelopes: Vec<Envelope>,
+    sha256: [u8; 32],
+}
+
+/// The sealed manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Manifest {
+    header_sha256: [u8; 32],
+    created_at: u64,
+    write_counter: u64,
+    state_digest: [u8; 32],
+    image_len: u64,
+    chunk_count: u32,
+}
+
+impl Manifest {
+    fn encode(&self) -> Vec<u8> {
+        let mut m = Vec::with_capacity(MANIFEST_LEN);
+        m.push(MANIFEST_VERSION);
+        m.extend_from_slice(&self.header_sha256);
+        m.extend_from_slice(&self.created_at.to_be_bytes());
+        m.extend_from_slice(&self.write_counter.to_be_bytes());
+        m.extend_from_slice(&self.state_digest);
+        m.extend_from_slice(&self.image_len.to_be_bytes());
+        m.extend_from_slice(&self.chunk_count.to_be_bytes());
+        m
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, VaultError> {
+        let damaged = || VaultError::from(VaultErrorKind::BackupDamaged);
+        if b.len() != MANIFEST_LEN || b[0] != MANIFEST_VERSION {
+            return Err(damaged());
+        }
+        let mut r = Cursor { buf: b, at: 1 };
+        let m = Manifest {
+            header_sha256: r.take()?,
+            created_at: u64::from_be_bytes(r.take()?),
+            write_counter: u64::from_be_bytes(r.take()?),
+            state_digest: r.take()?,
+            image_len: u64::from_be_bytes(r.take()?),
+            chunk_count: u32::from_be_bytes(r.take()?),
+        };
+        // Every chunk but the last is full, and the last is not empty.
+        let chunks = u64::from(m.chunk_count);
+        let full = BACKUP_CHUNK as u64;
+        if chunks == 0 || m.image_len <= (chunks - 1) * full || m.image_len > chunks * full {
+            return Err(damaged());
+        }
+        Ok(m)
+    }
+}
+
+struct Cursor<'a> {
+    buf: &'a [u8],
+    at: usize,
+}
+
+impl Cursor<'_> {
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], VaultError> {
+        let s = self
+            .buf
+            .get(self.at..self.at + N)
+            .ok_or(VaultErrorKind::BackupDamaged)?;
+        self.at += N;
+        let mut out = [0u8; N];
+        out.copy_from_slice(s);
+        Ok(out)
+    }
+}
+
+fn write_backup(
+    tmp: &Path,
+    head: &[u8],
+    manifest: &Manifest,
+    image: &[u8],
+    k: &SubKey,
+    ctx: &BackupCtx,
+) -> Result<(), VaultError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(tmp)?;
+    let mut w = BufWriter::new(file);
+    w.write_all(head)?;
+    write_record(&mut w, &seal_record(k, &ctx.aad(0), &manifest.encode())?)?;
+    for (i, chunk) in image.chunks(BACKUP_CHUNK).enumerate() {
+        let sealed = seal_record(k, &ctx.aad(i as u64 + 1), chunk)?;
+        write_record(&mut w, &sealed)?;
+    }
+    let file = w
+        .into_inner()
+        .map_err(|e| VaultError::from(e.into_error()))?;
+    Ok(file.sync_all()?)
+}
+
+fn write_record(w: &mut impl Write, sealed: &[u8]) -> Result<(), VaultError> {
+    let len =
+        u32::try_from(sealed.len()).map_err(|_| VaultError::from(VaultErrorKind::TooLarge))?;
+    w.write_all(&len.to_be_bytes())?;
+    w.write_all(sealed)?;
+    Ok(())
+}
+
+/// Opens the backup without following a symlink, and without blocking on a
+/// FIFO; anything but a regular file is refused.
+fn open_backup(path: &Path) -> Result<BufReader<File>, VaultError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => VaultErrorKind::Path(crate::vault::PathErrorKind::Symlink).into(),
+            _ => VaultError::from(e),
+        })?;
+    if !file.metadata()?.is_file() {
+        return Err(VaultErrorKind::Path(crate::vault::PathErrorKind::NotFile).into());
+    }
+    Ok(BufReader::new(file))
+}
+
+/// Maps a short read to [`VaultErrorKind::BackupDamaged`].
+fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> Result<(), VaultError> {
+    r.read_exact(buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            VaultErrorKind::BackupDamaged.into()
+        } else {
+            VaultError::from(e)
+        }
+    })
+}
+
+fn read_header(r: &mut impl Read) -> Result<Header, VaultError> {
+    let damaged = || VaultError::from(VaultErrorKind::BackupDamaged);
+    let mut fixed = [0u8; HEADER_FIXED];
+    read_exact(r, &mut fixed)?;
+    if fixed[..4] != MAGIC {
+        return Err(damaged());
+    }
+    if fixed[4] != FORMAT_VERSION {
+        return Err(VaultErrorKind::UnsupportedVersion.into());
+    }
+    let mut c = Cursor { buf: &fixed, at: 5 };
+    let ctx = BackupCtx {
+        vault_id: VaultId(c.take()?),
+        schema_version: u16::from_be_bytes(c.take()?),
+        epoch: u32::from_be_bytes(c.take()?),
+        backup_id: c.take()?,
+    };
+    let [count] = c.take::<1>()?;
+    let count = usize::from(count);
+    if count == 0 || count > MAX_ENVELOPES {
+        return Err(damaged());
+    }
+    let mut h = Sha256::new();
+    h.update(fixed);
+    let mut envelopes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut b = [0u8; Envelope::LEN];
+        read_exact(r, &mut b)?;
+        h.update(b);
+        // Out-of-bounds parameters are refused here, before any Argon2id.
+        let env = Envelope::from_bytes(&b).map_err(|_| damaged())?;
+        if env.kind() != UnlockerKind::RecoveryKit || env.epoch() != ctx.epoch {
+            return Err(damaged());
+        }
+        envelopes.push(env);
+    }
+    Ok(Header {
+        ctx,
+        envelopes,
+        sha256: h.finalize().into(),
+    })
+}
+
+/// Unwraps the VMK from the first envelope the kit opens.
+fn unwrap_with_kit(head: &Header, kit: &RecoveryKit) -> Result<Vmk, VaultError> {
+    for env in &head.envelopes {
+        let ctx = EnvelopeCtx {
+            vault_id: head.ctx.vault_id,
+            unlocker_id: env.unlocker_id(),
+            epoch: head.ctx.epoch,
+        };
+        match unwrap_vmk_with(env, kit.secret(), &ctx, &Argon2id) {
+            Ok(vmk) => return Ok(vmk),
+            Err(e) if e.kind() == CryptoErrorKind::Unlock => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(VaultErrorKind::Crypto(CryptoErrorKind::Unlock).into())
+}
+
+/// Reads one record: `len(4)` then the sealed bytes, at most a full chunk
+/// and the seal's overhead.
+fn read_record(r: &mut impl Read) -> Result<Vec<u8>, VaultError> {
+    let mut len = [0u8; 4];
+    read_exact(r, &mut len)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if !(Sealed::OVERHEAD..=BACKUP_CHUNK + Sealed::OVERHEAD).contains(&len) {
+        return Err(VaultErrorKind::BackupDamaged.into());
+    }
+    let mut buf = vec![0u8; len];
+    read_exact(r, &mut buf)?;
+    Ok(buf)
+}
+
+fn read_manifest(r: &mut impl Read, k: &SubKey, head: &Header) -> Result<Manifest, VaultError> {
+    let sealed = read_record(r)?;
+    let m = open_record(k, &head.ctx.aad(0), &sealed, Manifest::decode)
+        .map_err(|_| VaultError::from(VaultErrorKind::BackupDamaged))?;
+    if !bool::from(m.header_sha256.ct_eq(&head.sha256)) {
+        return Err(VaultErrorKind::BackupDamaged.into());
+    }
+    Ok(m)
+}
+
+/// Decrypts every chunk into `out`, then requires the end of the file.
+fn write_image(
+    r: &mut impl Read,
+    out: &mut File,
+    k: &SubKey,
+    head: &Header,
+    m: &Manifest,
+) -> Result<(), VaultError> {
+    let mut w = BufWriter::new(out);
+    let mut total = 0u64;
+    for i in 1..=u64::from(m.chunk_count) {
+        let sealed = read_record(r)?;
+        let mut io_error = None;
+        let opened = open_record(k, &head.ctx.aad(i), &sealed, |pt| {
+            // Every chunk but the last is full.
+            if i < u64::from(m.chunk_count) && pt.len() != BACKUP_CHUNK {
+                return Err(VaultErrorKind::BackupDamaged.into());
+            }
+            if let Err(e) = w.write_all(pt) {
+                io_error = Some(e);
+                return Err(VaultErrorKind::BackupDamaged.into());
+            }
+            Ok(pt.len() as u64)
+        });
+        if let Some(e) = io_error {
+            return Err(e.into());
+        }
+        total += opened.map_err(|_| VaultError::from(VaultErrorKind::BackupDamaged))?;
+    }
+    if total != m.image_len {
+        return Err(VaultErrorKind::BackupDamaged.into());
+    }
+    let mut extra = [0u8; 1];
+    loop {
+        match r.read(&mut extra) {
+            Ok(0) => break,
+            Ok(_) => return Err(VaultErrorKind::BackupDamaged.into()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Removes what an interrupted `create_backup` left.
+fn remove_stale_backup_temps(dir: &Path) -> Result<(), VaultError> {
+    check_private_dir(dir)?;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&format!(".{BACKUP_PREFIX}")) && name.ends_with(".tmp") {
+            remove_file_if_present(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_file_if_present(p: &Path) -> Result<(), VaultError> {
+    match std::fs::remove_file(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `YYYYMMDDTHHMMSSZ` for Unix seconds `secs`, in UTC.
+fn utc_stamp(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    let (hour, minute, second) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_stamps() {
+        for (secs, want) in [
+            (0, "19700101T000000Z"),
+            (951_782_400, "20000229T000000Z"),
+            (1_709_251_199, "20240229T235959Z"),
+            (1_790_000_000, "20260921T141320Z"),
+            (4_102_444_799, "20991231T235959Z"),
+        ] {
+            assert_eq!(utc_stamp(secs), want);
+        }
+    }
+
+    #[test]
+    fn layout_lengths() {
+        assert_eq!(HEADER_FIXED, 4 + 1 + 16 + 2 + 4 + 16 + 1);
+        let m = Manifest {
+            header_sha256: [1; 32],
+            created_at: 2,
+            write_counter: 3,
+            state_digest: [4; 32],
+            image_len: 4096,
+            chunk_count: 1,
+        };
+        let e = m.encode();
+        assert_eq!(e.len(), MANIFEST_LEN);
+        assert_eq!(Manifest::decode(&e).unwrap(), m);
+    }
+
+    #[test]
+    fn manifests_with_impossible_chunking_are_refused() {
+        let base = Manifest {
+            header_sha256: [0; 32],
+            created_at: 0,
+            write_counter: 1,
+            state_digest: [0; 32],
+            image_len: 4096,
+            chunk_count: 1,
+        };
+        let full = BACKUP_CHUNK as u64;
+        for (image_len, chunk_count) in [(0, 1), (4096, 0), (4096, 2), (full + 1, 1), (full, 2)] {
+            let m = Manifest {
+                image_len,
+                chunk_count,
+                ..base
+            };
+            let e = Manifest::decode(&m.encode()).unwrap_err();
+            assert_eq!(
+                e.kind(),
+                VaultErrorKind::BackupDamaged,
+                "{image_len} {chunk_count}"
+            );
+        }
+        let mut bad = base.encode();
+        bad[0] = 2;
+        assert!(Manifest::decode(&bad).is_err());
+        assert!(Manifest::decode(&base.encode()[..MANIFEST_LEN - 1]).is_err());
+    }
+}

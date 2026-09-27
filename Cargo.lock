@@ -243,6 +243,7 @@ dependencies = [
  "envcloak-testkit",
  "getrandom 0.4.3",
  "hkdf",
+ "libc",
  "rusqlite",
  "secrecy",
  "serde",

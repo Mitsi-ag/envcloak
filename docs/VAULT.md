@@ -1,6 +1,6 @@
 # EnvCloak: vault storage format
 
-Status: schema version 1 (M1). This file fixes how SPEC §5 "Vault", "Integrity" and "Items" are stored on disk: the SQLite schema, what each column holds, the records sealed into rows, the state digest, and how writes, crashes and migrations are handled. The crypto it builds on (sealing, associated data, subkeys, keyed hashes, envelopes) is in [CRYPTO.md](CRYPTO.md). The code is in `crates/envcloak-core/src/vault/`.
+Status: schema version 1 (M1). This file fixes how SPEC §5 "Vault", "Integrity" and "Items" are stored on disk: the SQLite schema, what each column holds, the records sealed into rows, the state digest, how writes, crashes and migrations are handled, and how a vault is unlocked, backed up and restored. The crypto it builds on (sealing, associated data, subkeys, keyed hashes, envelopes, the Recovery Kit) is in [CRYPTO.md](CRYPTO.md). The code is in `crates/envcloak-core/src/vault/`, `unlock.rs` and `backup.rs`.
 
 A change to any layout, label or number here is a format change: it needs a new schema version and a migration.
 
@@ -157,6 +157,49 @@ The code is in `crates/envcloak-core/src/unlock.rs`; the envelope, passphrase an
 - `confirm_recovery_kit` unwraps a kit envelope with the kit and requires the result to equal the vault's VMK (compared in constant time); it then sets `recovery_confirmed` in the sealed header. SPEC §6.4 deletes imported plaintext only after that.
 - A vault that failed its integrity check, or could not be migrated, refuses a passphrase change and a kit confirmation before any key derivation.
 
+## Backups
+
+`Vault::create_backup` writes `backups/vault-<YYYYMMDDTHHMMSSZ>-<8 hex digits>.ecbackup`, mode 0600. The code is in `crates/envcloak-core/src/backup.rs`.
+
+It refuses a vault that failed its integrity check, and one without a Recovery Kit envelope. A vault that could not be migrated is backed up at its on-disk version.
+
+**The database image.** The vault's own connection serializes the database (`sqlite3_serialize`), which reads every page through SQLite, WAL included, so the image is the committed state. Bytes 18 and 19 are set to 1 (rollback journal): the WAL is already folded in. The image is then opened in memory and verified with the vault's keys: the digest must verify and the header must equal the one this process last committed. An image that fails, because the file was changed behind the open vault, is not written, and the vault turns read-only ("changed while open"). The image holds exactly what `vault.db` holds: sealed columns, keyed hashes, ids, row versions and timestamps.
+
+**The file**, all integers big-endian:
+
+```
+magic "ECBK"(4) version 1(1) vault_id(16) schema_version(2) epoch(4) backup_id(16) n(1)
+n Recovery Kit envelopes (159 bytes each, CRYPTO.md), 1 <= n <= 8
+record 0: the manifest
+records 1 to chunk_count: the image, in chunks of 1 MiB (the last one shorter)
+```
+
+Each record is `len(4)` followed by a sealed value (CRYPTO.md): XChaCha20-Poly1305 under the `backup` subkey of the vault's epoch, with the associated data `(vault_id, schema_version, epoch, table 8, row_id = backup_id, field, item_class 0, row_version = index)`, field 9 for the manifest and 10 for a chunk. `len` is at most 1 MiB plus the 40 bytes of nonce and tag.
+
+The manifest (93 bytes): `version 1(1) header_sha256(32) created_at(8) write_counter(8) state_digest(32) image_len(8) chunk_count(4)`. `header_sha256` covers every byte before record 0. Every chunk but the last is full and the last is not empty, so `image_len` fixes `chunk_count`.
+
+The passphrase envelope is not in the header: a copied backup offers nothing to guess but the 128-bit kit. Everything else opens only with the VMK, which only the kit unwraps. A record that is altered, moved to another index, taken from another backup, dropped, repeated or appended fails to open or breaks the count, and a changed header breaks the manifest's digest.
+
+A backup is written to `backups/.<name>.tmp` (created exclusively, not following symlinks), synced, hard-linked to its name, and the directory is synced. A leftover `.tmp` file is removed by the next backup.
+
+## Restore
+
+`restore_backup` takes the paths, the backup file, the Recovery Kit and a new passphrase, and returns the restored vault unlocked. In order:
+1. The new passphrase is checked against the rules. The backup is opened without following a symlink or blocking on a FIFO; anything but a regular file is refused.
+2. The header is read and its envelopes parsed (out-of-bounds Argon2id parameters are refused before any key derivation). The kit unwraps the VMK, with the header's vault id and epoch; a wrong kit gives the generic unlock error.
+3. The manifest is opened and its digest of the header compared.
+4. If `vault.db` starts as a vault does (SQLite's magic and the application id), it is opened, which takes its lock (a vault open elsewhere fails as busy) and folds in its WAL. A file that is not a vault is not opened, so SQLite does not delete a WAL beside it.
+5. The chunks are decrypted into `vault/.vault.db.new-<16 hex digits>` (created exclusively), the length is checked, the end of the file is required, and the file is synced.
+6. The temporary file is opened as a vault in rollback-journal mode and unlocked with the VMK. Its digest must verify, and its vault id, epoch, write counter and state digest must be the manifest's.
+7. The VMK is wrapped under the new passphrase with the current default parameters and a fresh salt, and one transaction makes that the only passphrase envelope (under the old one's unlocker id) and sets `recovery_confirmed`: the kit was just used. The file is closed, its journal removed, and it is synced.
+8. Only now is the current vault touched: its handle is closed, which folds in and removes its WAL; `vault.db` is hard-linked to `vault/replaced-<YYYYMMDDTHHMMSSZ>.db` (with a numeric suffix if that name is taken), and any side file of it is renamed along; the directory is synced.
+9. The temporary file is renamed over `vault.db`, and the directory is synced.
+10. The vault is opened and unlocked with the VMK.
+
+`vault.db` is the old vault until step 9 and the new one from then on; it is never missing. A crash before step 9 leaves the temporary file, which the next open or create removes, and possibly a second link to the old vault named `replaced-...`. `tests/restore_crash.rs` kills a restorer with `kill -9` after each step, at random moments within the step's measured duration, and checks each time that the vault opens with a verified digest and is exactly the old vault or exactly the restored one; it also restores where no vault exists.
+
+A restore assumes one writer: the daemon locks and drops its handle first, and its instance lock keeps any other EnvCloak process away while the files are swapped.
+
 ## Writes
 
 - A write transaction is one `BEGIN IMMEDIATE` SQLite transaction. Values are sealed before they are bound to a statement; only sealed bytes, keyed hashes, ids, row versions, kinds and timestamps are bound.
@@ -169,7 +212,7 @@ The code is in `crates/envcloak-core/src/unlock.rs`; the envelope, passphrase an
 
 ## Create
 
-`create` builds the database under a temporary name (`vault/.vault.db.new-<16 hex digits>`) in rollback-journal mode, commits, closes and syncs it, then hard-links it to `vault.db` (which fails if a vault is already there), removes the temporary name and syncs the directory. A crash leaves either no `vault.db` or a complete one. A leftover temporary name is removed by the next `create` or, once it holds the lock, by the next open (a crash between the link and the removal leaves it as a second link to the vault). The first open switches the file to WAL.
+`create` builds the database under a temporary name (`vault/.vault.db.new-<16 hex digits>`) in rollback-journal mode, commits, closes and syncs it, then hard-links it to `vault.db` (which fails if a vault is already there), removes the temporary name and syncs the directory. A crash leaves either no `vault.db` or a complete one. A leftover temporary name, and any side file of it, is removed by the next `create` or, once it holds the lock, by the next open (a crash between the link and the removal leaves it as a second link to the vault). A restore builds the new file under the same prefix (see Restore). The first open switches the file to WAL.
 
 ## Crash safety
 
@@ -193,4 +236,7 @@ Any failure, or a crash, rolls all of it back: the vault stays at its old versio
 | 6: integrity digest | `tests/vault_integrity.rs` |
 | 7: migration failure | `tests/vault_migrate.rs` |
 | 11, storage part: no fixture in freed memory | `tests/vault_probe.rs` |
-| 3, unlocker part: one generic error for a wrong passphrase, a wrong kit or a damaged envelope; a passphrase change re-wraps with the current defaults | `tests/unlock.rs` |
+| 3, unlocker part: one generic error for a wrong passphrase, a wrong kit or a damaged envelope; a passphrase change and a restore re-wrap with the current defaults | `tests/unlock.rs`, `tests/backup.rs` |
+| 4: after the passphrase is lost, the kit restores identical items; a wrong kit fails | `tests/recovery.rs` |
+| Backups: unusable without the kit, any change refused, a changed vault never backed up, a restored digest verifies | `tests/backup.rs` |
+| Restore is atomic: `kill -9` leaves the old or the new vault | `tests/restore_crash.rs` |

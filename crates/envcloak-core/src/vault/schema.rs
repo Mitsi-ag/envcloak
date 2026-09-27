@@ -107,7 +107,7 @@ pub(crate) fn open_db(path: &Path, create: bool) -> Result<Connection, VaultErro
 
 /// The per-connection flags that keep an altered file from steering
 /// EnvCloak's statements.
-fn harden_connection(conn: &Connection) -> Result<(), VaultError> {
+pub(crate) fn harden_connection(conn: &Connection) -> Result<(), VaultError> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;

@@ -1,0 +1,489 @@
+//! Encrypted vault backups (SPEC §5, §6.4, §15.1 step 11; the format is in
+//! docs/VAULT.md "Backups"):
+//! - a backup is a private file in `backups/` that holds no fixture, no
+//!   plaintext metadata and none of the vault file's own bytes, and carries
+//!   only the Recovery Kit envelope, so it is unusable without the kit;
+//! - any change to a backup (a flipped bit, a truncation, an extension, a
+//!   reordered, dropped or foreign record) is refused, and a refused
+//!   restore changes nothing;
+//! - a vault changed on disk behind an open vault is never backed up;
+//! - a restored vault's digest verifies, and its new passphrase envelope
+//!   uses the current default parameters (gate 3);
+//! - a restore refuses an open vault, a weak new passphrase, and a backup
+//!   path that is a symlink, a FIFO or a directory, and moves aside a file
+//!   that is not a vault.
+#![allow(clippy::unwrap_used)]
+
+mod common;
+
+use std::path::{Path, PathBuf};
+
+use common::{
+    Fixture, KitFixture, Rng, assert_holds_canaries, dir_names, name, other_passphrase, secret_item,
+};
+use envcloak_core::backup::{BACKUP_CHUNK, BACKUP_EXTENSION};
+use envcloak_core::crypto::{CryptoErrorKind, Envelope, KdfParams, UnlockerKind};
+use envcloak_core::vault::{
+    Integrity, ItemMeta, LockedVault, PathErrorKind, TamperKind, VaultErrorKind,
+};
+use envcloak_core::{PassphraseRejected, SecretBytes, restore_backup};
+use envcloak_testkit::assert_no_canary;
+
+const HEADER_FIXED: usize = 44;
+
+/// Where each record of a backup starts and how long it is, `len` field
+/// included.
+fn records(b: &[u8]) -> (usize, Vec<(usize, usize)>) {
+    let header = HEADER_FIXED + usize::from(b[43]) * Envelope::LEN;
+    let mut at = header;
+    let mut out = Vec::new();
+    while at < b.len() {
+        let len = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+        out.push((at, 4 + len));
+        at += 4 + len;
+    }
+    assert_eq!(at, b.len());
+    (header, out)
+}
+
+/// The only file in the backups directory.
+fn only_backup(f: &KitFixture) -> PathBuf {
+    let names = dir_names(&f.paths.backups_dir);
+    let [name] = &names[..] else {
+        panic!("backups: {names:?}");
+    };
+    f.paths.backups_dir.join(name)
+}
+
+/// Every blob column of the closed vault file.
+fn stored_blobs(f: &KitFixture) -> Vec<(String, Vec<u8>)> {
+    let raw = rusqlite::Connection::open(f.db()).unwrap();
+    let mut out = Vec::new();
+    for (table, cols) in [
+        ("items", "slug_hash, sealed_meta"),
+        ("fields", "value_hash, sealed_value"),
+        ("projects", "dir_hash, sealed"),
+        ("header", "sealed, sealed"),
+        ("unlockers", "envelope, envelope"),
+    ] {
+        let mut st = raw.prepare(&format!("SELECT {cols} FROM {table}")).unwrap();
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap();
+        for row in rows {
+            let (a, b) = row.unwrap();
+            out.push((format!("{table} first"), a));
+            out.push((format!("{table} second"), b));
+        }
+    }
+    out
+}
+
+#[test]
+fn a_backup_is_a_private_file_holding_ciphertext_only() {
+    let (f, v) = KitFixture::create();
+    // What an interrupted backup left is removed.
+    std::fs::write(f.paths.backups_dir.join(".vault-x.ecbackup.tmp"), b"x").unwrap();
+    let info = v.create_backup().unwrap();
+    let kit_env = v
+        .unlockers()
+        .find(|e| e.kind() == UnlockerKind::RecoveryKit)
+        .unwrap()
+        .to_bytes();
+    drop(v);
+
+    assert_eq!(only_backup(&f).file_name(), info.path.file_name());
+    let name = info.path.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("vault-") && name.ends_with(&format!(".{BACKUP_EXTENSION}")));
+    // vault-YYYYMMDDTHHMMSSZ-xxxxxxxx.ecbackup
+    assert_eq!(
+        name.len(),
+        "vault-".len() + 16 + 1 + 8 + 1 + BACKUP_EXTENSION.len()
+    );
+    let meta = std::fs::metadata(&info.path).unwrap();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
+        0o600
+    );
+    assert_eq!(info.bytes, meta.len());
+    assert_eq!(info.items, 5, "one item per stored canary");
+
+    let bytes = std::fs::read(&info.path).unwrap();
+    assert_no_canary(&bytes, &f.cs);
+    // Only the kit envelope is readable, byte for byte; the passphrase
+    // envelope, the database's magic, slugs and every stored column are
+    // not there.
+    assert_eq!(&bytes[..4], b"ECBK");
+    assert_eq!(bytes[43], 1, "one envelope");
+    assert_eq!(
+        &bytes[HEADER_FIXED..HEADER_FIXED + Envelope::LEN],
+        &kit_env[..]
+    );
+    let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    assert!(!contains(b"SQLite format 3"));
+    assert!(!contains(b"t4/"));
+    for (what, blob) in stored_blobs(&f) {
+        if blob[..] == kit_env[..] || blob.len() < 16 {
+            continue;
+        }
+        assert!(!contains(&blob), "{what} is in the backup");
+    }
+    f.home.assert_clean(&f.cs);
+}
+
+/// A vault large enough for several chunks: `n` items with a 60 KB value
+/// each, besides the canaries.
+fn big_vault() -> (KitFixture, envcloak_core::vault::Vault) {
+    let (f, mut v) = KitFixture::create();
+    let mut rng = Rng(f.seed);
+    v.transact(|t| {
+        for i in 0..45 {
+            let item = t.create_item(secret_item(&format!("bulk/item-{i}")))?;
+            t.add_field(
+                item,
+                name("blob"),
+                SecretBytes::copy_from(&rng.text(60_000)),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    (f, v)
+}
+
+/// Every change to a backup is refused: nothing is restored, the current
+/// vault is untouched, and no temporary file is left.
+#[test]
+fn every_change_to_a_backup_is_refused_and_changes_nothing() {
+    let (f, v) = big_vault();
+    let a = v.create_backup().unwrap();
+    let b = v.create_backup().unwrap();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    drop(v);
+    let good = std::fs::read(&a.path).unwrap();
+    let other = std::fs::read(&b.path).unwrap();
+    let (header, recs) = records(&good);
+    assert!(recs.len() >= 4, "a manifest and at least three chunks");
+    assert_eq!(recs[1].1, 4 + BACKUP_CHUNK + 40, "full chunks");
+    let (_, other_recs) = records(&other);
+    let db_before = std::fs::read(f.db()).unwrap();
+    let files_before = dir_names(&f.paths.vault_dir);
+
+    let rec = |i: usize| &good[recs[i].0..recs[i].0 + recs[i].1];
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    let flips = [
+        ("magic", 0),
+        ("format version", 4),
+        ("vault id", 5),
+        ("schema version", 21),
+        ("epoch", 25),
+        ("backup id", 27),
+        ("envelope count", 43),
+        ("envelope memory", HEADER_FIXED + 29),
+        ("envelope salt", HEADER_FIXED + 40),
+        ("envelope commitment", HEADER_FIXED + 90),
+        ("envelope sealed key", HEADER_FIXED + 120),
+        ("manifest length", recs[0].0 + 3),
+        ("manifest nonce", recs[0].0 + 4),
+        ("manifest body", recs[0].0 + 60),
+        ("manifest tag", recs[0].0 + recs[0].1 - 1),
+        ("chunk length", recs[1].0 + 2),
+        ("chunk nonce", recs[2].0 + 10),
+        ("chunk body", recs[2].0 + 5000),
+        ("last chunk tag", good.len() - 1),
+    ];
+    for (what, at) in flips {
+        let mut m = good.clone();
+        m[at] ^= 0x04;
+        cases.push((format!("flip {what}"), m));
+    }
+    for (what, len) in [
+        ("empty", 0),
+        ("magic only", 4),
+        ("header only", header),
+        ("mid manifest", recs[0].0 + 50),
+        ("manifest only", recs[1].0),
+        ("mid chunk", recs[2].0 + 1000),
+        ("last chunk dropped", recs[recs.len() - 1].0),
+        ("last byte dropped", good.len() - 1),
+    ] {
+        cases.push((format!("truncated: {what}"), good[..len].to_vec()));
+    }
+    cases.push(("one byte appended".into(), [&good[..], &[0]].concat()));
+    cases.push((
+        "last record repeated".into(),
+        [&good[..], rec(recs.len() - 1)].concat(),
+    ));
+    let mut swapped = good[..recs[1].0].to_vec();
+    swapped.extend_from_slice(rec(2));
+    swapped.extend_from_slice(rec(1));
+    swapped.extend_from_slice(&good[recs[3].0..]);
+    cases.push(("chunks 1 and 2 swapped".into(), swapped));
+    let mut dropped = good[..recs[2].0].to_vec();
+    dropped.extend_from_slice(&good[recs[3].0..]);
+    cases.push(("middle chunk dropped".into(), dropped));
+    let mut foreign = good[..recs[2].0].to_vec();
+    foreign.extend_from_slice(&other[other_recs[2].0..other_recs[2].0 + other_recs[2].1]);
+    foreign.extend_from_slice(&good[recs[3].0..]);
+    cases.push(("chunk from another backup".into(), foreign));
+    let mut foreign_manifest = good[..recs[0].0].to_vec();
+    foreign_manifest.extend_from_slice(&other[other_recs[0].0..other_recs[1].0]);
+    foreign_manifest.extend_from_slice(&good[recs[1].0..]);
+    cases.push(("manifest from another backup".into(), foreign_manifest));
+    let mut other_header = other[..header].to_vec();
+    other_header.extend_from_slice(&good[header..]);
+    cases.push(("header from another backup".into(), other_header));
+
+    let bad = f.home.root().join("bad.ecbackup");
+    for (what, bytes) in &cases {
+        std::fs::write(&bad, bytes).unwrap();
+        let e = restore_backup(&f.paths, &bad, &f.kit(), &other_passphrase(1)).unwrap_err();
+        assert!(
+            matches!(
+                e.kind(),
+                VaultErrorKind::BackupDamaged
+                    | VaultErrorKind::UnsupportedVersion
+                    | VaultErrorKind::Crypto(CryptoErrorKind::Unlock)
+            ),
+            "{what}: {:?}",
+            e.kind()
+        );
+        assert_eq!(std::fs::read(f.db()).unwrap(), db_before, "{what}");
+        assert_eq!(dir_names(&f.paths.vault_dir), files_before, "{what}");
+    }
+
+    // Control: the untouched copy restores.
+    std::fs::write(&bad, &good).unwrap();
+    let (v, _) = restore_backup(&f.paths, &bad, &f.kit(), &other_passphrase(1)).unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items(), &items[..]);
+    assert_holds_canaries(&v, &f.cs);
+    drop(v);
+    f.home.assert_clean(&f.cs);
+}
+
+/// A vault file changed behind the open vault is never backed up; the
+/// vault turns read-only. A vault that failed its check at unlock is not
+/// backed up either.
+#[test]
+fn a_changed_or_tampered_vault_is_not_backed_up() {
+    let (f, v) = KitFixture::create();
+    let field = v.items()[0].fields[0].id;
+    drop(v);
+    let raw = rusqlite::Connection::open(f.db()).unwrap();
+    let sealed: Vec<u8> = raw
+        .query_row(
+            "SELECT sealed_value FROM fields WHERE id = ?1",
+            [&field.as_bytes()[..]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(raw);
+
+    let v = f.unlock();
+    // Another program flips a byte of the file while the vault is open.
+    {
+        use std::os::unix::fs::FileExt;
+        let bytes = std::fs::read(f.db()).unwrap();
+        let at = bytes
+            .windows(sealed.len())
+            .position(|w| w == &sealed[..])
+            .unwrap()
+            + 30;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(f.db())
+            .unwrap();
+        file.write_at(&[bytes[at] ^ 0x10], at as u64).unwrap();
+        file.sync_all().unwrap();
+    }
+    let e = v.create_backup().unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Tampered);
+    assert_eq!(
+        v.integrity(),
+        Integrity::Tampered(TamperKind::ChangedWhileOpen)
+    );
+    assert!(dir_names(&f.paths.backups_dir).is_empty());
+    drop(v);
+
+    let v = f.unlock();
+    assert!(matches!(v.integrity(), Integrity::Tampered(_)));
+    assert_eq!(
+        v.create_backup().unwrap_err().kind(),
+        VaultErrorKind::Tampered
+    );
+    assert!(dir_names(&f.paths.backups_dir).is_empty());
+}
+
+#[test]
+fn a_vault_without_a_kit_is_not_backed_up() {
+    let (f, v) = Fixture::create();
+    assert_eq!(
+        v.create_backup().unwrap_err().kind(),
+        VaultErrorKind::NoRecoveryKit
+    );
+    assert!(dir_names(&f.paths.backups_dir).is_empty());
+}
+
+/// Gate 3 for restore: the new passphrase envelope has the current
+/// defaults and a fresh salt, although the backed-up vault's envelopes had
+/// the minimum; the kit envelope is carried over unchanged.
+#[test]
+fn a_restore_wraps_the_new_passphrase_with_the_current_defaults() {
+    let (f, v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    let old_pass = v
+        .unlockers()
+        .find(|e| e.kind() == UnlockerKind::Passphrase)
+        .unwrap()
+        .clone();
+    let kit = v
+        .unlockers()
+        .find(|e| e.kind() == UnlockerKind::RecoveryKit)
+        .unwrap()
+        .clone();
+    drop(v);
+    let (v, _) = restore_backup(&f.paths, &info.path, &f.kit(), &other_passphrase(2)).unwrap();
+    let pass: Vec<&Envelope> = v
+        .unlockers()
+        .filter(|e| e.kind() == UnlockerKind::Passphrase)
+        .collect();
+    let [pass] = &pass[..] else {
+        panic!("one passphrase envelope");
+    };
+    let k = pass.kdf();
+    assert_eq!(
+        (k.m_kib, k.t, k.p),
+        (
+            KdfParams::DEFAULT_M_KIB,
+            KdfParams::DEFAULT_T,
+            KdfParams::DEFAULT_P
+        )
+    );
+    assert_eq!(old_pass.kdf().m_kib, KdfParams::MIN_M_KIB);
+    assert_ne!(k.salt, old_pass.kdf().salt);
+    assert_eq!(pass.unlocker_id(), old_pass.unlocker_id());
+    let kits: Vec<&Envelope> = v
+        .unlockers()
+        .filter(|e| e.kind() == UnlockerKind::RecoveryKit)
+        .collect();
+    assert!(kits.len() == 1 && *kits[0] == kit);
+}
+
+#[test]
+fn a_restore_refuses_an_open_vault_or_a_weak_passphrase_first() {
+    let (f, v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    drop(v);
+    let db_before = std::fs::read(f.db()).unwrap();
+
+    let held = f.open();
+    let e = restore_backup(&f.paths, &info.path, &f.kit(), &other_passphrase(3)).unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Busy);
+    drop(held);
+
+    let e = restore_backup(
+        &f.paths,
+        &info.path,
+        &f.kit(),
+        &SecretBytes::copy_from(b"too short"),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.kind(),
+        VaultErrorKind::Passphrase(PassphraseRejected::TooShort)
+    );
+    assert_eq!(std::fs::read(f.db()).unwrap(), db_before);
+    assert_eq!(dir_names(&f.paths.vault_dir), ["vault.db"]);
+}
+
+/// The backup path is opened without following a symlink or blocking on a
+/// FIFO; only a regular file is read.
+#[test]
+fn a_restore_reads_only_a_regular_backup_file() {
+    let (f, v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    drop(v);
+    let root = f.home.root();
+    let link = root.join("link.ecbackup");
+    std::os::unix::fs::symlink(&info.path, &link).unwrap();
+    let fifo = root.join("fifo.ecbackup");
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let cases: [(&Path, VaultErrorKind); 4] = [
+        (&link, VaultErrorKind::Path(PathErrorKind::Symlink)),
+        (&fifo, VaultErrorKind::Path(PathErrorKind::NotFile)),
+        (root, VaultErrorKind::Path(PathErrorKind::NotFile)),
+        (
+            &root.join("missing"),
+            VaultErrorKind::Io(std::io::ErrorKind::NotFound),
+        ),
+    ];
+    for (path, want) in cases {
+        let e = restore_backup(&f.paths, path, &f.kit(), &other_passphrase(4)).unwrap_err();
+        assert_eq!(e.kind(), want, "{}", path.display());
+    }
+    assert_eq!(dir_names(&f.paths.vault_dir), ["vault.db"]);
+}
+
+/// A file at `vault.db` that is not a vault, with a side file, is moved
+/// aside whole, and the restore proceeds.
+#[test]
+fn a_restore_moves_aside_a_file_that_is_not_a_vault() {
+    let (f, v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    drop(v);
+    std::fs::write(f.db(), b"not a database at all").unwrap();
+    let wal = f.db().with_file_name("vault.db-wal");
+    std::fs::write(&wal, b"not a wal").unwrap();
+
+    let (v, report) = restore_backup(&f.paths, &info.path, &f.kit(), &other_passphrase(5)).unwrap();
+    assert_eq!(v.items(), &items[..]);
+    drop(v);
+    let kept = report.replaced.unwrap();
+    assert_eq!(std::fs::read(&kept).unwrap(), b"not a database at all");
+    let mut kept_wal = kept.clone().into_os_string();
+    kept_wal.push("-wal");
+    assert_eq!(std::fs::read(&kept_wal).unwrap(), b"not a wal");
+    let kept_name = kept.file_name().unwrap().to_str().unwrap().to_owned();
+    assert_eq!(
+        dir_names(&f.paths.vault_dir),
+        [
+            kept_name.clone(),
+            format!("{kept_name}-wal"),
+            "vault.db".into()
+        ]
+    );
+}
+
+/// A restored vault can be backed up and restored again.
+#[test]
+fn a_restored_vault_backs_up_and_restores_again() {
+    let (f, v) = KitFixture::create();
+    let first = v.create_backup().unwrap();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    drop(v);
+    let (v, _) = restore_backup(&f.paths, &first.path, &f.kit(), &other_passphrase(6)).unwrap();
+    let second = v.create_backup().unwrap();
+    assert_ne!(second.backup_id, first.backup_id);
+    drop(v);
+    let (v, report) =
+        restore_backup(&f.paths, &second.path, &f.kit(), &other_passphrase(7)).unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items(), &items[..]);
+    assert_eq!(report.backup_write_counter, first.write_counter + 1);
+    drop(v);
+    let v = LockedVault::open(&f.paths)
+        .unwrap()
+        .unlock_with_passphrase(&other_passphrase(7))
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_holds_canaries(&v, &f.cs);
+    f.home.assert_clean(&f.cs);
+}

@@ -64,9 +64,13 @@ The tag numbers are fixed and never reused.
 | policies | 5 | fields.sealed_prior | 5 | | |
 | audit | 6 | projects.sealed | 6 | | |
 | unlockers | 7 | policies.sealed | 7 | | |
-| | | audit entry | 8 | | |
+| backup | 8 | audit entry | 8 | | |
+| | | backup manifest | 9 | | |
+| | | backup chunk | 10 | | |
 
 No sealed value uses table 7: unlocker envelopes authenticate themselves. The number names the `unlockers` rows in the vault's state digest (docs/VAULT.md).
+
+A backup file's records use table 8, with the backup's random id as the row id and the record's index as the row version: 0 for the manifest (field 9) and 1 and up for the chunks of the database image (field 10). Their layout is in VAULT.md, "Backups".
 
 ## Sealed values
 
@@ -120,7 +124,7 @@ A failure in step 3 or 4 gives the same error, whatever the cause: a wrong passp
 
 XChaCha20-Poly1305 does not commit to its key: one ciphertext can be made to open under many keys. Checking the commitment before decryption stops a wrong KEK there, so unlock attempts cannot be used as a partitioning oracle over guessed passphrases.
 
-New envelopes, and every re-wrap, use the current defaults (m = 256 MiB, t = 3, p = 4) with a fresh salt, never the stored parameters. `vault create` may choose a lower memory setting for small machines, down to the 64 MiB bound.
+New envelopes, and every re-wrap, use the current defaults (m = 256 MiB, t = 3, p = 4) with a fresh salt, never the stored parameters. `vault create` may choose a lower memory setting for small machines, down to the 64 MiB bound. Every envelope has a salt of its own, including the two `vault create` makes. A passphrase change and a restore's new passphrase envelope are re-wraps: they use the current defaults whatever the old envelope used.
 
 ## Passphrases
 

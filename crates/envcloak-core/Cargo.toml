@@ -12,8 +12,9 @@ workspace = true
 
 [features]
 # Test support only: exporting and importing a VMK, opening a vault with a
-# migration plan other than the shipped one, and wrapping a new passphrase
-# at other Argon2id parameters. Release binaries never enable it.
+# migration plan other than the shipped one, wrapping a new passphrase at
+# other Argon2id parameters, and observing a restore step by step. Release
+# binaries never enable it.
 testing = []
 
 [dependencies]
@@ -24,6 +25,7 @@ chacha20poly1305.workspace = true
 envcloak-sys.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
+libc.workspace = true
 rusqlite.workspace = true
 secrecy.workspace = true
 sha2.workspace = true

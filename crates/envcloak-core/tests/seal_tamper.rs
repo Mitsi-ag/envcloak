@@ -371,6 +371,8 @@ fn the_associated_data_is_the_canonical_tuple() {
         (TableTag::Projects, 4),
         (TableTag::Policies, 5),
         (TableTag::Audit, 6),
+        (TableTag::Unlockers, 7),
+        (TableTag::Backup, 8),
     ];
     for (t, n) in tables {
         assert_eq!(t as u16, n);
@@ -384,6 +386,8 @@ fn the_associated_data_is_the_canonical_tuple() {
         (FieldTag::Project, 6),
         (FieldTag::Policy, 7),
         (FieldTag::AuditEntry, 8),
+        (FieldTag::BackupManifest, 9),
+        (FieldTag::BackupChunk, 10),
     ];
     for (f, n) in fields {
         assert_eq!(f as u16, n);

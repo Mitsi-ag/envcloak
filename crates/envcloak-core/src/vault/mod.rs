@@ -28,6 +28,7 @@ mod items;
 mod migrate;
 mod paths;
 mod schema;
+mod snapshot;
 mod state;
 mod txn;
 mod values;
@@ -56,18 +57,22 @@ pub use schema::{CURRENT_SCHEMA, StorageReport};
 pub use txn::Txn;
 
 use integrity::{state_digest, unlocker_body};
-use paths::{check_private_dir, check_private_file};
+pub(crate) use paths::{check_private_dir, check_private_file};
 use state::{State, VaultCtx, item_key};
-use values::{open_priors, open_value, seal_record};
+use values::{open_priors, open_value};
+pub(crate) use values::{open_record, seal_record};
 
 /// The key epoch of a new vault.
 pub const INITIAL_EPOCH: u32 = 1;
 
 /// The database's file name inside the vault directory.
-const DB_NAME: &str = "vault.db";
-/// `create` builds the database under this prefix, then links it into
-/// place, so a crash never leaves a half-built `vault.db`.
-const TEMP_PREFIX: &str = ".vault.db.new-";
+pub(crate) const DB_NAME: &str = "vault.db";
+/// `create` and a restore build the database under this prefix, then link
+/// or rename it into place, so a crash never leaves a half-built
+/// `vault.db`.
+pub(crate) const TEMP_PREFIX: &str = ".vault.db.new-";
+/// SQLite's side files of a database, by suffix.
+pub(crate) const SIDE_FILES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 /// An open vault file without its key.
 pub struct LockedVault {
@@ -77,6 +82,8 @@ pub struct LockedVault {
     epoch: u32,
     created_at: u64,
     plan: MigrationPlan,
+    /// Boxed: a failed unlock hands the locked vault back in its error.
+    paths: Box<VaultPaths>,
 }
 
 impl core::fmt::Debug for LockedVault {
@@ -115,7 +122,7 @@ impl LockedVault {
         let dir = std::fs::canonicalize(&p.vault_dir)?;
         let db = dir.join(DB_NAME);
         check_private_file(&db)?;
-        for side in ["-wal", "-shm", "-journal"] {
+        for side in SIDE_FILES {
             let mut name = db.clone().into_os_string();
             name.push(side);
             match std::fs::symlink_metadata(&name) {
@@ -135,6 +142,14 @@ impl LockedVault {
         // link to this vault; nothing else uses these names once `vault.db`
         // exists.
         remove_stale_temps(&dir)?;
+        Self::from_conn(conn, plan, p.clone())
+    }
+
+    fn from_conn(
+        conn: Connection,
+        plan: MigrationPlan,
+        paths: VaultPaths,
+    ) -> Result<Self, VaultError> {
         let id = read_identity(&conn, plan.target())?;
         Ok(LockedVault {
             vault_id: id.vault_id,
@@ -143,7 +158,29 @@ impl LockedVault {
             created_at: id.created_at,
             conn,
             plan,
+            paths: Box::new(paths),
         })
+    }
+
+    /// Opens a database a restore has staged under a temporary name in the
+    /// vault directory `paths` names, in rollback-journal mode, so closing
+    /// it leaves no WAL behind to be renamed away from it. Takes its lock
+    /// as [`LockedVault::open`] does, and removes no temporary files.
+    pub(crate) fn open_staged(db: &Path, paths: &VaultPaths) -> Result<Self, VaultError> {
+        envcloak_sys::restrict_umask();
+        check_private_file(db)?;
+        let conn = schema::open_db(db, false)?;
+        schema::configure(&conn, false)?;
+        let app_id: i32 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
+        if app_id != schema::APPLICATION_ID {
+            return Err(VaultErrorKind::Damaged.into());
+        }
+        Self::from_conn(conn, MigrationPlan::current(), paths.clone())
+    }
+
+    /// Where the vault lives.
+    pub fn paths(&self) -> &VaultPaths {
+        &self.paths
     }
 
     pub fn vault_id(&self) -> VaultId {
@@ -554,6 +591,16 @@ impl Vault {
         &self.vmk
     }
 
+    /// The subkeys of the vault's epoch.
+    pub(crate) fn keys(&self) -> &Keyring {
+        &self.keys
+    }
+
+    /// Where the vault lives.
+    pub fn paths(&self) -> &VaultPaths {
+        &self.file.paths
+    }
+
     /// Every item, sorted by slug. Metadata only.
     pub fn items(&self) -> &[ItemMeta] {
         &self.view
@@ -768,6 +815,13 @@ impl Vault {
         let Vault { file, .. } = self;
         file
     }
+
+    /// Locks, keeping the VMK: for a restore, which closes the staged file
+    /// and then opens it again under its final name.
+    pub(crate) fn lock_keeping_key(self) -> (LockedVault, Vmk) {
+        let Vault { file, vmk, .. } = self;
+        (file, vmk)
+    }
 }
 
 /// Builds a complete vault in the empty file `tmp`, in rollback-journal
@@ -830,8 +884,9 @@ fn build_new(
     conn.close().map_err(|(_, e)| VaultError::from(e))
 }
 
-/// Removes what an interrupted `create` left: temporary databases (possibly
-/// a second link to a finished vault) and their journals.
+/// Removes what an interrupted `create` or restore left: temporary
+/// databases (possibly a second link to a finished vault) and their side
+/// files.
 fn remove_stale_temps(dir: &Path) -> Result<(), VaultError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -843,8 +898,8 @@ fn remove_stale_temps(dir: &Path) -> Result<(), VaultError> {
     Ok(())
 }
 
-fn remove_temp(p: &Path) -> Result<(), VaultError> {
-    for side in ["", "-journal"] {
+pub(crate) fn remove_temp(p: &Path) -> Result<(), VaultError> {
+    for side in ["", "-wal", "-shm", "-journal"] {
         let mut name = p.as_os_str().to_owned();
         name.push(side);
         match std::fs::remove_file(&name) {
@@ -858,7 +913,7 @@ fn remove_temp(p: &Path) -> Result<(), VaultError> {
 
 /// Makes a directory's entries durable. On macOS `sync_all` is
 /// `F_FULLFSYNC`.
-fn sync_dir(dir: &Path) -> Result<(), VaultError> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), VaultError> {
     Ok(std::fs::File::open(dir)?.sync_all()?)
 }
 
