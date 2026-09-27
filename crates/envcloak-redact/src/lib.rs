@@ -23,9 +23,11 @@
 //! - lowercase and uppercase hex;
 //! - percent-encoding as produced by common encoders (RFC 3986 strict,
 //!   `encodeURIComponent`, Python `quote` and `quote_plus`, WHATWG form
-//!   encoding, lenient path/query encoders), each with uppercase and
-//!   lowercase hex digits. Mixed-case hex within one value is not covered;
-//! - JSON string escaping as produced by common serializers: optional `\/`,
+//!   encoding, .NET `WebUtility`/`HttpUtility.UrlEncode`, Go `PathEscape`,
+//!   lenient path/query encoders), each with uppercase and lowercase hex
+//!   digits. Mixed-case hex within one value is not covered;
+//! - JSON string escaping as produced by common serializers: `\"` or `\u0022`
+//!   quotes, optional `\/`,
 //!   short or `\u` control escapes, raw or `\u`-escaped non-ASCII (with
 //!   surrogate pairs), optional HTML-safe, apostrophe, plus and line-separator
 //!   escapes, with uppercase or lowercase hex.
@@ -289,6 +291,16 @@ const PERCENT_PROFILES: &[PercentProfile] = &[
         safe: b"*-._",
         space_plus: true,
     },
+    // .NET WebUtility.UrlEncode and HttpUtility.UrlEncode (lowercase hex).
+    PercentProfile {
+        safe: b"-_.!*()",
+        space_plus: true,
+    },
+    // Go url.PathEscape.
+    PercentProfile {
+        safe: b"-._~$&+,:;=@",
+        space_plus: false,
+    },
     // Lenient path/query encoders that keep sub-delimiters.
     PercentProfile {
         safe: b"-._~!$&'()*+,;=:@/?",
@@ -319,6 +331,7 @@ fn percent_encode(value: &[u8], profile: &PercentProfile, upper: bool) -> Zeroiz
 /// a character of that class.
 #[derive(Clone, Copy, Default)]
 struct JsonStyle {
+    esc_quote: bool,
     esc_slash: bool,
     u_controls: bool,
     esc_nonascii: bool,
@@ -335,6 +348,9 @@ type StyleSetter = fn(&mut JsonStyle);
 fn json_variants(s: &str) -> Vec<Zeroizing<Vec<u8>>> {
     let has = |f: fn(char) -> bool| s.chars().any(f);
     let mut dims: Vec<StyleSetter> = vec![|st| st.upper_hex = true];
+    if has(|c| c == '"') {
+        dims.push(|st| st.esc_quote = true);
+    }
     if has(|c| c == '/') {
         dims.push(|st| st.esc_slash = true);
     }
@@ -391,6 +407,7 @@ fn json_encode(s: &str, st: JsonStyle) -> Zeroizing<Vec<u8>> {
     let mut units = [0u16; 2];
     for c in s.chars() {
         match c {
+            '"' if st.esc_quote => u(&mut out, 0x22),
             '"' => out.extend_from_slice(b"\\\""),
             '\\' => out.extend_from_slice(b"\\\\"),
             '/' if st.esc_slash => out.extend_from_slice(b"\\/"),
@@ -672,24 +689,10 @@ mod tests {
     #[test]
     fn json_from_independent_serializers() {
         let r = RedactorBuilder::new().secret("t", TRICKY).build().0;
-        // serde_json (Rust) as an independent oracle.
+        // serde_json (Rust) as an in-process oracle. Output of other
+        // runtimes is tested from generated files in tests/serializers.rs.
         let serde = serde_json::to_string(TRICKY).unwrap();
         assert_redacted(&r, "t", &serde[1..serde.len() - 1], "serde_json");
-        // Python 3 json.dumps with ensure_ascii True (default) and False,
-        // captured from a real interpreter.
-        let py_ascii = r#"ab/cd\"ef\\gh\bijékl😀mn+op qr'st<uv"#;
-        let py_utf8 = "ab/cd\\\"ef\\\\gh\\bij\u{e9}kl\u{1F600}mn+op qr'st<uv";
-        assert_redacted(&r, "t", py_ascii, "python ensure_ascii");
-        assert_redacted(&r, "t", py_utf8, "python utf8");
-        // PHP json_encode default escapes slashes and non-ASCII.
-        let php = r#"ab\/cd\"ef\\gh\bijékl😀mn+op qr'st<uv"#;
-        assert_redacted(&r, "t", php, "php");
-        // Go encoding/json is HTML-safe by default; .NET escapes + and ' in
-        // uppercase hex.
-        let go = r#"ab/cd\"ef\\gh\bijékl😀mn+op qr'st<uv"#;
-        let dotnet = r#"ab/cd\"ef\\gh\bijékl😀mn+op qr'st<uv"#;
-        assert_redacted(&r, "t", go, "go");
-        assert_redacted(&r, "t", dotnet, ".net");
     }
 
     #[test]
@@ -699,23 +702,6 @@ mod tests {
         let form: String = form_urlencoded::byte_serialize(v.as_bytes()).collect();
         assert_redacted(&r, "u", &form, "WHATWG form");
         assert_redacted(&r, "u", &lower_percent(&form), "WHATWG form lowercase");
-        // Python urllib.parse, captured from a real interpreter.
-        for (case, encoded) in [
-            ("quote", "tok/en%2Bval%20ue~%21%2A%27%28%29%26%3Dx"),
-            ("quote_plus", "tok%2Fen%2Bval+ue~%21%2A%27%28%29%26%3Dx"),
-            (
-                "quote safe=''",
-                "tok%2Fen%2Bval%20ue~%21%2A%27%28%29%26%3Dx",
-            ),
-        ] {
-            assert_redacted(&r, "u", encoded, case);
-            assert_redacted(
-                &r,
-                "u",
-                &lower_percent(encoded),
-                &format!("{case} lowercase"),
-            );
-        }
     }
 
     fn lower_percent(s: &str) -> String {
