@@ -13,6 +13,9 @@ pub const PRIVATE_UMASK: u32 = 0o077;
 /// Sets the process umask to [`PRIVATE_UMASK`] and returns the previous
 /// mask. The umask is process-wide: call it at startup, before any thread
 /// creates files.
+// `mode_t` is u16 on macOS and u32 on Linux, where the conversion is a
+// no-op.
+#[allow(clippy::useless_conversion)]
 pub fn restrict_umask() -> u32 {
     // SAFETY: umask has no preconditions and cannot fail.
     let previous = unsafe { libc::umask(PRIVATE_UMASK as libc::mode_t) };

@@ -246,7 +246,7 @@ fn size_caps_hold() {
         .unwrap_err();
     assert_eq!(e.kind(), VaultErrorKind::InvalidValue);
     // Three full-size prior values still fit the 1 MiB row cap.
-    for c in [b'c', b'd', b'e', b'f'] {
+    for c in *b"cdef" {
         v.transact(|t| t.set_value(field, value(&vec![c; MAX_FIELD])))
             .unwrap();
     }

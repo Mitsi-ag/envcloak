@@ -162,7 +162,10 @@ fn fixture_writer() {
     // Earlier children's items remain: slugs start from this run's counter.
     let base = v.header().write_counter;
     println!("@@ready");
-    for n in 0u64.. {
+    // Runs until the parent kills it.
+    let mut n = 0u64;
+    loop {
+        n += 1;
         let c = &cs[rng.below(cs.len() as u64) as usize];
         v.transact(|t| {
             let item = t.create_item(secret_item(&format!("w/{base}-{n}")))?;
