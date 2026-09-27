@@ -41,7 +41,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::crypto::{
-    Envelope, FieldTag, Keyring, Purpose, TableTag, UnlockerId, VaultId, Vmk, fill_random_or_panic,
+    Envelope, FieldTag, Keyring, Purpose, TableTag, UnlockerId, UnlockerKind, VaultId, Vmk,
+    fill_random_or_panic,
 };
 use crate::secret::SecretBytes;
 
@@ -219,6 +220,24 @@ impl LockedVault {
             }
         }
         Ok(out)
+    }
+
+    /// Whether an unlocker row whose `kind` column names `kind` holds no
+    /// well-formed envelope of that kind and epoch: a damaged envelope,
+    /// which [`LockedVault::unlockers`] leaves out. Unreadable rows count
+    /// as damaged.
+    pub(crate) fn has_damaged_unlocker(&self, kind: UnlockerKind) -> bool {
+        let rows = state::query(&self.conn, "SELECT kind, envelope FROM unlockers", |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        });
+        let Ok(rows) = rows else {
+            return true;
+        };
+        rows.iter().any(|(k, bytes)| {
+            *k == i64::from(kind as u8)
+                && !Envelope::from_bytes(bytes)
+                    .is_ok_and(|e| e.kind() == kind && e.epoch() == self.epoch)
+        })
     }
 
     /// The SQLite settings in effect.

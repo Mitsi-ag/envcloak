@@ -154,9 +154,10 @@ fn create_vault_moves_aside_side_files_left_without_a_vault() {
 
 // ------------------------------------------------------ gate 3
 
-/// A wrong passphrase, a wrong kit, and a passphrase or kit envelope whose
-/// commitment or ciphertext was damaged all give the same error, and the
-/// locked vault comes back for another try.
+/// A wrong passphrase, a wrong kit, and a passphrase or kit envelope
+/// damaged anywhere (its plaintext header, which keeps it off the list of
+/// envelopes, its commitment or its ciphertext) all give the same error,
+/// and the locked vault comes back for another try.
 #[test]
 fn every_wrong_secret_or_damaged_envelope_gives_one_generic_error() {
     let (f, v) = KitFixture::create();
@@ -195,12 +196,30 @@ fn every_wrong_secret_or_damaged_envelope_gives_one_generic_error() {
         v.unlockers().map(|e| (e.kind(), e.to_bytes())).collect();
     drop(v);
 
-    // Damage each envelope's commitment, then its sealed VMK, on disk.
+    // Damage each envelope on disk: its header's magic, version and kind
+    // (to no kind, then to the other kind), its epoch, its KDF id and
+    // Argon2id parameters, its unlocker id, then its commitment and its
+    // sealed VMK.
+    let damage = [
+        (0, 0x80),
+        (4, 0x80),
+        (5, 0x80),
+        (5, 0x03),
+        (6, 0x01),
+        (22, 0x80),
+        (26, 0x80),
+        (27, 0x80),
+        (31, 0x80),
+        (35, 0x80),
+        (79 + 5, 0x01),
+        (111 + 3, 0x01),
+        (Envelope::LEN - 1, 0x01),
+    ];
     for (kind, bytes) in &envelopes {
-        for at in [79 + 5, 111 + 3, Envelope::LEN - 1] {
+        for (at, mask) in damage {
             let raw = rusqlite::Connection::open(f.db()).unwrap();
             let mut damaged = bytes.to_vec();
-            damaged[at] ^= 0x01;
+            damaged[at] ^= mask;
             raw.execute(
                 "UPDATE unlockers SET envelope = ?1 WHERE envelope = ?2",
                 rusqlite::params![damaged, &bytes[..]],
@@ -213,7 +232,7 @@ fn every_wrong_secret_or_damaged_envelope_gives_one_generic_error() {
             }
             .unwrap_err()
             .1;
-            check(e, &format!("{kind:?} envelope byte {at}"));
+            check(e, &format!("{kind:?} envelope byte {at} ^ {mask:#x}"));
             let raw = rusqlite::Connection::open(f.db()).unwrap();
             raw.execute(
                 "UPDATE unlockers SET envelope = ?1 WHERE envelope = ?2",
@@ -357,4 +376,30 @@ fn a_missing_unlocker_kind_is_named() {
         .unlock_with_kit(&RecoveryKit::generate())
         .unwrap_err();
     assert_eq!(e.kind(), VaultErrorKind::NoRecoveryKit);
+
+    // Only a missing row says so: the vault with a kit whose kit row was
+    // deleted, and the one whose passphrase row was.
+    let (f, v) = KitFixture::create();
+    drop(v);
+    for (kind, want) in [
+        (UnlockerKind::RecoveryKit, VaultErrorKind::NoRecoveryKit),
+        (UnlockerKind::Passphrase, VaultErrorKind::NoPassphrase),
+    ] {
+        let raw = rusqlite::Connection::open(f.db()).unwrap();
+        let n = raw
+            .execute(
+                "DELETE FROM unlockers WHERE kind = ?1",
+                [i64::from(kind as u8)],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        drop(raw);
+        let e = match kind {
+            UnlockerKind::Passphrase => f.open().unlock_with_passphrase(&f.pass()),
+            UnlockerKind::RecoveryKit => f.open().unlock_with_kit(&f.kit()),
+        }
+        .unwrap_err()
+        .1;
+        assert_eq!(e.kind(), want);
+    }
 }

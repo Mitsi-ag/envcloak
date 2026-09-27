@@ -7,7 +7,8 @@
 //! - [`LockedVault::unlock_with_passphrase`] and
 //!   [`LockedVault::unlock_with_kit`] try each envelope of that kind. A
 //!   wrong secret gives one error, [`CryptoErrorKind::Unlock`], whether the
-//!   secret was wrong or the envelope damaged.
+//!   secret was wrong or the envelope damaged, in its sealed part or in its
+//!   plaintext header (which leaves it out of the list of envelopes).
 //! - [`Vault::change_passphrase`] wraps the VMK under a new passphrase with
 //!   the current default parameters and a fresh salt, never the stored
 //!   ones, and replaces the passphrase envelope in one transaction.
@@ -70,7 +71,7 @@ impl LockedVault {
     /// Unlocks with the passphrase. On failure the locked vault comes back
     /// with the error: [`CryptoErrorKind::Unlock`] for a wrong passphrase
     /// or a damaged envelope, [`VaultErrorKind::NoPassphrase`] when the
-    /// vault has no passphrase envelope.
+    /// vault has no passphrase unlocker row at all.
     pub fn unlock_with_passphrase(self, s: &SecretBytes) -> Result<Vault, (Self, VaultError)> {
         self.unlock_with_secret(UnlockerKind::Passphrase, s, &Argon2id)
     }
@@ -98,6 +99,12 @@ impl LockedVault {
         };
         match unwrap_first(&envelopes, kind, secret, ctx, kdf) {
             Ok(vmk) => self.unlock(vmk),
+            // An envelope damaged in its plaintext header does not parse,
+            // so it is not listed: that is still the one generic error,
+            // not "the vault has none".
+            Err(e) if e.kind() == missing(kind).kind() && self.has_damaged_unlocker(kind) => {
+                Err((self, VaultErrorKind::Crypto(CryptoErrorKind::Unlock).into()))
+            }
             Err(e) => Err((self, e)),
         }
     }
