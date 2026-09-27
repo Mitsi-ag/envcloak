@@ -10,8 +10,8 @@ use std::process::Command;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use envcloak_testkit::{
-    Canary, Detector, Hit, TestHome, assert_no_canary, by_label, canaries, encodings, find,
-    fresh_seed, labels, sweep_dir,
+    Canary, Detector, Hit, TEST_ENV_VARS, TestHome, assert_no_canary, by_label, canaries,
+    encodings, find, fresh_seed, labels, sweep_dir,
 };
 
 fn panic_message(f: impl FnOnce()) -> Option<String> {
@@ -292,4 +292,67 @@ fn test_home_is_short_isolated_and_complete() {
     let kept = root.to_path_buf();
     drop(home);
     assert!(!kept.exists(), "the tree is removed on drop");
+}
+
+const ISOLATION_CHILD: &str = "ENVCLOAK_TESTKIT_ISOLATION_CHILD";
+const PARENT_ONLY: &str = "ENVCLOAK_TESTKIT_PARENT_ONLY";
+
+/// Runs only as the child started by the test below, whose environment
+/// holds a marker the child's own children must not see.
+#[test]
+fn isolation_child() {
+    if std::env::var_os(ISOLATION_CHILD).is_none() {
+        return;
+    }
+    let marker = std::env::var(PARENT_ONLY).unwrap();
+    let env_of = |cmd: &mut Command| {
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // Control: by default a child inherits the marker.
+    let inherited = env_of(&mut Command::new("/usr/bin/env"));
+    assert!(
+        inherited.contains(&marker),
+        "control: the marker must be inherited"
+    );
+
+    let home = TestHome::new();
+    let isolated = env_of(home.apply(&mut Command::new("/usr/bin/env")));
+    assert!(
+        !isolated.contains(&marker),
+        "a parent-only variable reached the child"
+    );
+    let names: Vec<&str> = isolated
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+        .collect();
+    for name in &names {
+        assert!(TEST_ENV_VARS.contains(name), "unexpected variable {name}");
+    }
+    assert_eq!(names.len(), TEST_ENV_VARS.len(), "{names:?}");
+    println!("isolation: checked");
+}
+
+#[test]
+fn test_home_children_inherit_nothing_from_the_parent() {
+    // A fabricated marker stands in for an exported credential.
+    let marker = format!("parent-only-{:016x}", fresh_seed());
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "isolation_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ISOLATION_CHILD, "1")
+        .env(PARENT_ONLY, &marker)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "child failed: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("isolation: checked"),
+        "the child did not run the check: {out:?}"
+    );
 }

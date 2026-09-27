@@ -13,7 +13,8 @@
 //!   messages and [`Found`] or [`Hit`] values name the canary's label and
 //!   the encoding, never the value.
 //! - [`probe_canaries`]: arms the allocator probe (gate 11) with canaries.
-//! - [`TestHome`]: an isolated HOME and XDG tree under a short `/tmp` path.
+//! - [`TestHome`]: an isolated HOME and XDG tree under a short `/tmp` path,
+//!   and a cleared environment for the processes a test starts.
 
 mod canary;
 mod detect;
@@ -23,7 +24,7 @@ mod home;
 pub use canary::{Canary, by_label, canaries, fresh_seed, labels};
 pub use detect::{Detector, Found, Hit, assert_no_canary, encodings, find, sweep_dir};
 pub use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeReport, ProbeSession};
-pub use home::TestHome;
+pub use home::{TEST_ENV_VARS, TEST_PATH, TestHome};
 
 /// Default probe window: a freed block holding any 12 consecutive bytes of a
 /// canary counts as holding it.

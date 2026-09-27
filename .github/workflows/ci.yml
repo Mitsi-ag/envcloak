@@ -30,6 +30,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The gate 19 crash test runs its positive core-dump control only when
+      # core files go to a known directory, which it checks and cleans up.
+      - name: Route core dumps to a known directory (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p /tmp/eccores
+          sudo sysctl -w kernel.core_pattern=/tmp/eccores/core.%p
+          echo "ENVCLOAK_TEST_CORE_DIR=/tmp/eccores" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - name: Unsafe-code and secret-exposure boundaries
         run: scripts/check-unsafe.sh

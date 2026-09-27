@@ -4,10 +4,18 @@
 //! `environ` are denied; on macOS a copy signed with the hardened runtime
 //! reports it. Each check that can only pass vacuously in a hostile test
 //! environment runs a control process first.
+//!
+//! Every process these tests start runs in [`TestHome::apply`]'s cleared
+//! environment, so no core file can hold anything from the developer's
+//! shell. The positive core-dump control deliberately crashes a process, so
+//! it runs only where core files go to a known directory: set
+//! `ENVCLOAK_TEST_CORE_DIR` to a directory the kernel's core pattern writes
+//! `core.<pid>` files into (CI does this on Linux). Elsewhere the test says
+//! the control is unverified.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 
 use envcloak_testkit::{TestHome, by_label, canaries, fresh_seed, labels};
@@ -60,16 +68,18 @@ impl Drop for Held {
     }
 }
 
-/// Starts `script` under `sh` in `cwd` with core dumps raised as far as the
-/// hard limit allows, and waits for the line `ready`. Earlier lines are kept
-/// as the report.
+/// Shell prefix that raises the core limit as far as the hard limit allows.
+/// Only ever used in [`TestHome::apply`]'s cleared environment.
+const RAISE_CORE_LIMIT: &str =
+    "ulimit -c unlimited 2>/dev/null || ulimit -c \"$(ulimit -H -c)\" 2>/dev/null; ";
+
+/// Starts `script` under `sh` in `cwd`, in `home`'s cleared environment plus
+/// `env`, and waits for the line `ready`. Earlier lines are kept as the
+/// report.
 fn hold(home: &TestHome, cwd: &Path, script: &str, arg0: &str, env: &[(&str, &str)]) -> Held {
-    let full = format!(
-        "ulimit -c unlimited 2>/dev/null || ulimit -c \"$(ulimit -H -c)\" 2>/dev/null; {script}"
-    );
     let mut cmd = Command::new("sh");
     home.apply(&mut cmd)
-        .args(["-c", &full, arg0])
+        .args(["-c", script, arg0])
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -98,29 +108,44 @@ fn hold(home: &TestHome, cwd: &Path, script: &str, arg0: &str, env: &[(&str, &st
     }
 }
 
-fn hold_cli(home: &TestHome, cwd: &Path, env: &[(&str, &str)]) -> Held {
-    hold(
-        home,
-        cwd,
-        "exec \"$0\" internal hardening --hold",
-        cli(),
-        env,
-    )
+/// Holds the CLI, started by a shell that ran `prelude` first.
+fn hold_cli(home: &TestHome, cwd: &Path, prelude: &str, env: &[(&str, &str)]) -> Held {
+    let script = format!("{prelude}exec \"$0\" internal hardening --hold");
+    hold(home, cwd, &script, cli(), env)
 }
 
-/// Core files a crash of `pid` could have left in `cwd` (or in `/cores` on
-/// macOS).
-fn core_files(cwd: &Path, pid: i32) -> Vec<String> {
-    let mut found: Vec<String> = std::fs::read_dir(cwd)
+/// The directory the kernel writes `core.<pid>` files into, when the
+/// environment names one (see the module documentation).
+fn core_dump_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("ENVCLOAK_TEST_CORE_DIR")?);
+    assert!(dir.is_dir(), "ENVCLOAK_TEST_CORE_DIR is not a directory");
+    #[cfg(target_os = "linux")]
+    {
+        let pattern = std::fs::read_to_string("/proc/sys/kernel/core_pattern").unwrap();
+        assert!(
+            Path::new(pattern.trim()).starts_with(&dir),
+            "ENVCLOAK_TEST_CORE_DIR is set, but kernel.core_pattern is {pattern:?}"
+        );
+    }
+    Some(dir)
+}
+
+/// Core files a crash of `pid` could have left: `core` or `core.*` in
+/// `cwd`, `/cores/core.<pid>` (macOS), and `core.<pid>` in `dumps`.
+fn core_files(cwd: &Path, dumps: Option<&Path>, pid: i32) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(cwd)
         .unwrap()
         .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n == "core" || n.starts_with("core."))
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name == "core" || name.starts_with("core.")
+        })
+        .map(|e| e.path())
         .collect();
-    let mac = format!("/cores/core.{pid}");
-    if Path::new(&mac).exists() {
-        found.push(mac);
-    }
+    let mut elsewhere = vec![PathBuf::from(format!("/cores/core.{pid}"))];
+    elsewhere.extend(dumps.map(|d| d.join(format!("core.{pid}"))));
+    found.extend(elsewhere.into_iter().filter(|p| p.exists()));
     found
 }
 
@@ -161,35 +186,57 @@ fn unknown_arguments_are_never_echoed() {
 #[test]
 fn forced_abort_leaves_no_core_file() {
     let home = TestHome::new();
+    let dumps = core_dump_dir();
+    if cfg!(target_os = "linux") && std::env::var_os("GITHUB_ACTIONS").is_some() {
+        assert!(
+            dumps.is_some(),
+            "CI must run the positive core-dump control"
+        );
+    }
 
-    // Control: an unhardened process under the same limits. Whether it
-    // dumps depends on the machine (core_pattern, /cores permissions); the
-    // assertion below only means something where it does, so say which.
-    let control_dir = home.root().join("tmp");
-    let control = hold(&home, &control_dir, "echo ready; exec sleep 60", "sh", &[]);
-    let control_pid = control.pid();
-    control.signal("-ABRT");
-    let control_status = control.wait();
-    let control_dumped =
-        control_status.core_dumped_flag() || !core_files(&control_dir, control_pid).is_empty();
-    eprintln!("control process dumped core: {control_dumped}");
+    match &dumps {
+        // Positive control: an ordinary process with the same raised limit
+        // and the same cleared environment dumps core into the known
+        // directory. Without it, "no core file" could mean only that this
+        // machine never writes any.
+        Some(dir) => {
+            let script = format!("{RAISE_CORE_LIMIT}echo ready; exec sleep 60");
+            let control = hold(&home, &home.root().join("tmp"), &script, "sh", &[]);
+            let pid = control.pid();
+            control.signal("-ABRT");
+            let status = control.wait();
+            let core = dir.join(format!("core.{pid}"));
+            let written = core.exists();
+            let _ = std::fs::remove_file(&core);
+            assert!(
+                status.core_dumped_flag() && written,
+                "control: an ordinary process must dump core into {} ({status:?}, file written: {written})",
+                dir.display()
+            );
+        }
+        None => eprintln!(
+            "forced_abort_leaves_no_core_file: positive control unverified; \
+             set ENVCLOAK_TEST_CORE_DIR to run it"
+        ),
+    }
 
+    // The CLI lowers the limit its parent shell raised, and does not dump.
     let cwd = home.home();
-    let held = hold_cli(&home, &cwd, &[]);
+    let held = hold_cli(&home, &cwd, RAISE_CORE_LIMIT, &[]);
     assert!(held.report.contains("rlimit_core=0/0\n"), "{}", held.report);
     let pid = held.pid();
     held.signal("-ABRT");
     let status = held.wait();
     assert_eq!(status.signal_number(), Some(6), "{status:?}");
+    let left = core_files(&cwd, dumps.as_deref(), pid);
+    for path in &left {
+        let _ = std::fs::remove_file(path);
+    }
     assert!(
         !status.core_dumped_flag(),
         "the kernel reported a core dump"
     );
-    assert!(
-        core_files(&cwd, pid).is_empty(),
-        "{:?}",
-        core_files(&cwd, pid)
-    );
+    assert!(left.is_empty(), "{left:?}");
 }
 
 trait StatusExt {
@@ -242,7 +289,7 @@ fn linux_same_uid_ptrace_and_proc_reads_are_denied() {
     );
     drop(control);
 
-    let held = hold_cli(&home, &home.home(), &env);
+    let held = hold_cli(&home, &home.home(), "", &env);
     assert!(
         held.report.contains("non_dumpable=true\n"),
         "{}",

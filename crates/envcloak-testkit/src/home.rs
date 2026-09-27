@@ -9,6 +9,24 @@ use tempfile::TempDir;
 use crate::canary::Canary;
 use crate::detect::{Hit, sweep_dir};
 
+/// The `PATH` [`TestHome::apply`] gives a child: system directories only.
+pub const TEST_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// Every variable [`TestHome::apply`] sets. A child started through it sees
+/// these and nothing else from this process.
+pub const TEST_ENV_VARS: [&str; 10] = [
+    "PATH",
+    "LANG",
+    "TERM",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+    "TMPDIR",
+];
+
 /// A temporary directory under `/tmp` with a short name (`/tmp/ecXXXXXX`),
 /// so socket paths below it stay well under the 104-byte macOS `sun_path`
 /// limit. It holds `home/`, `config/`, `data/`, `state/`, `cache/`, `tmp/`
@@ -48,11 +66,19 @@ impl TestHome {
         self.root().join("home")
     }
 
-    /// Points `HOME`, every `XDG_*` base directory and `TMPDIR` of `cmd`
-    /// into this tree.
+    /// Clears the environment of `cmd`, so nothing exported in the
+    /// developer's shell (tokens, cloud credentials) reaches the child or
+    /// any core file it might leave. Then sets [`TEST_PATH`], `LANG=C` and
+    /// `TERM=dumb`, and points `HOME`, every `XDG_*` base directory and
+    /// `TMPDIR` into this tree. Call it before adding the command's own
+    /// variables: it clears those too.
     pub fn apply<'c>(&self, cmd: &'c mut Command) -> &'c mut Command {
         let r = self.root();
-        cmd.env("HOME", r.join("home"))
+        cmd.env_clear()
+            .env("PATH", TEST_PATH)
+            .env("LANG", "C")
+            .env("TERM", "dumb")
+            .env("HOME", r.join("home"))
             .env("XDG_CONFIG_HOME", r.join("config"))
             .env("XDG_DATA_HOME", r.join("data"))
             .env("XDG_STATE_HOME", r.join("state"))
