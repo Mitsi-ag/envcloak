@@ -19,8 +19,8 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{
-    Fixture, KitFixture, Rng, assert_holds_canaries, dir_names, later_wal, name, other_passphrase,
-    secret_item,
+    Fixture, KitFixture, Rng, assert_holds_canaries, canary_slug, dir_names, later_wal, name,
+    other_passphrase, secret_item,
 };
 use envcloak_core::backup::{
     BACKUP_CHUNK, BACKUP_EXTENSION, RestoreStep, restore_backup_observed, restore_backup_with_plan,
@@ -127,7 +127,23 @@ fn a_backup_is_a_private_file_holding_ciphertext_only() {
     );
     let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
     assert!(!contains(b"SQLite format 3"));
-    assert!(!contains(b"t4/"));
+    // No slug, title, env hint or project path. Each needle is 10 bytes or
+    // more: in about 60 KB of ciphertext a chance match of one is out of
+    // reach, where a 3-byte needle would match about once in 270 backups.
+    let mut needles: Vec<Vec<u8>> = vec![b"t4-project".to_vec(), b"/src/acme-web".to_vec()];
+    for c in &f.cs {
+        needles.push(canary_slug(&c.label).as_str().as_bytes().to_vec());
+        needles.push(format!("fixture {}", c.label).into_bytes());
+        needles.push(c.label.as_bytes().to_vec());
+    }
+    for needle in &needles {
+        assert!(needle.len() >= 10, "{}", String::from_utf8_lossy(needle));
+        assert!(
+            !contains(needle),
+            "{} is in the backup",
+            String::from_utf8_lossy(needle)
+        );
+    }
     for (what, blob) in stored_blobs(&f) {
         if blob[..] == kit_env[..] || blob.len() < 16 {
             continue;
