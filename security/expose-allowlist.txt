@@ -1,0 +1,10 @@
+# Files allowed to call secrecy::ExposeSecret::expose_secret or
+# ExposeSecretMut::expose_secret_mut, which clippy.toml otherwise forbids.
+#
+# One repo-relative path per line, followed by `#` and the reason. Every
+# call site still needs `#[allow(clippy::disallowed_methods)]`, and
+# scripts/check-unsafe.sh fails on such an allow in any file not listed here
+# and on entries whose file no longer exists. Adding a line needs review:
+# each one is a place a plaintext value can escape.
+
+crates/envcloak-core/src/secret.rs  # SecretBytes and SecretBuf themselves, and their unit tests

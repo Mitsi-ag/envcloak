@@ -31,7 +31,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      - name: Unsafe-code and secret-exposure boundaries
+        run: scripts/check-unsafe.sh
       - run: cargo clippy --workspace --all-targets --locked
+      - name: expose_secret lint canary
+        run: scripts/check-expose-lint.sh
       - run: cargo test --workspace --locked
 
   deny:

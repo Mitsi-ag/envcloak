@@ -21,15 +21,17 @@ The macOS app lives in `apps/macos/` and needs Xcode 16 or later.
 - `cargo fmt --all`
 - `cargo clippy --workspace --all-targets` with no warnings
 - `cargo test --workspace`
+- `scripts/check-unsafe.sh` and `scripts/check-expose-lint.sh`
 - New behaviour has tests. Anything that touches secret handling has a test proving the value does not leak (to output, logs, errors or panics).
 - User-facing changes update the docs.
 
 ## Rules for code that handles secrets
 
-1. Secret values live in `secrecy`/`zeroize` types and are never `Debug`- or `Display`-printed.
+1. Secret values live in `SecretBytes` or `SecretBuf` (`envcloak-core`) and are never `Debug`- or `Display`-printed. Only files listed in [`security/expose-allowlist.txt`](security/expose-allowlist.txt) may call `expose_secret`; clippy enforces it, and adding a file needs review.
 2. Errors never include secret values.
 3. No new cryptography. Use the crates listed in the spec.
-4. `unsafe` is denied workspace-wide; exceptions need a written justification and a maintainer's review.
+4. `unsafe` is denied workspace-wide. It is allowed only in `crates/envcloak-sys` (`scripts/check-unsafe.sh` enforces this), and every `unsafe` block there needs a `// SAFETY:` comment (clippy `undocumented_unsafe_blocks`).
+5. Tests never contain real or key-shaped secrets. Generate fixture values at test time with `envcloak-testkit` (`canaries`), and check outputs with its canary sweep.
 
 ## Reporting security issues
 
