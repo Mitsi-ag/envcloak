@@ -1,0 +1,26 @@
+[package]
+name = "envcloak-sys"
+description = "The one EnvCloak crate allowed unsafe code: the wiping allocator, process hardening and OS interfaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Test support only: the inspection allocator for the allocator probe and
+# ptrace helpers. Release binaries never enable it.
+testing = []
+
+[dependencies]
+libc.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# Enables the `testing` feature for this crate's own tests.
+envcloak-sys = { path = ".", features = ["testing"] }
+tempfile.workspace = true

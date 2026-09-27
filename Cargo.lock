@@ -99,6 +99,16 @@ name = "envcloak-sync"
 version = "0.1.0"
 
 [[package]]
+name = "envcloak-sys"
+version = "0.1.0"
+dependencies = [
+ "envcloak-sys",
+ "libc",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "envcloakd"
 version = "0.1.0"
 
