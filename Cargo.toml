@@ -3,6 +3,24 @@ resolver = "3"
 # The canaries under security/ are members so they inherit the workspace
 # lints; see scripts/check-expose-lint.sh and scripts/check-unsafe-lint.sh.
 members = ["crates/*", "security/lint-canary", "security/unsafe-canary"]
+# A plain `cargo build` or `cargo build --release` at the root builds these.
+# They leave out envcloak-testkit, whose normal dependency on
+# envcloak-sys/testing would otherwise be unified into the shipped binaries,
+# and the canaries. CI builds and tests with --workspace.
+default-members = [
+  "crates/envcloak-agents",
+  "crates/envcloak-cli",
+  "crates/envcloak-core",
+  "crates/envcloak-daemon",
+  "crates/envcloak-ipc",
+  "crates/envcloak-mcp",
+  "crates/envcloak-policy",
+  "crates/envcloak-providers",
+  "crates/envcloak-proxy",
+  "crates/envcloak-redact",
+  "crates/envcloak-sync",
+  "crates/envcloak-sys",
+]
 
 [workspace.package]
 version = "0.1.0"
