@@ -34,10 +34,11 @@ fn report_of(program: &Path, home: &TestHome) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// A process held alive for inspection. Killed on drop.
+/// A process held alive for inspection until its stdin closes. Killed on
+/// drop.
 struct Held {
     child: Child,
-    _stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     report: String,
 }
 
@@ -57,6 +58,12 @@ impl Held {
     }
 
     fn wait(mut self) -> ExitStatus {
+        self.child.wait().unwrap()
+    }
+
+    /// Closes stdin, which lets the process exit, and waits for it.
+    fn release(mut self) -> ExitStatus {
+        drop(self.stdin.take());
         self.child.wait().unwrap()
     }
 }
@@ -87,7 +94,12 @@ fn hold(home: &TestHome, cwd: &Path, script: &str, arg0: &str, env: &[(&str, &st
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().unwrap();
+    held(cmd.spawn().unwrap())
+}
+
+/// Waits for `child` to print the line `ready`. Earlier lines are kept as
+/// the report.
+fn held(mut child: Child) -> Held {
     let stdin = child.stdin.take().unwrap();
     let mut report = String::new();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
@@ -103,7 +115,7 @@ fn hold(home: &TestHome, cwd: &Path, script: &str, arg0: &str, env: &[(&str, &st
     }
     Held {
         child,
-        _stdin: stdin,
+        stdin: Some(stdin),
         report,
     }
 }
@@ -166,6 +178,12 @@ fn cli_reports_hardening_and_the_wiping_allocator() {
         // report says so instead of claiming protection.
         assert!(report.contains("hardened_runtime=false\n"), "{report}");
     }
+
+    // The held form reports the same, and exits once stdin closes.
+    let held = hold_cli(&home, &home.home(), "", &[]);
+    assert_eq!(held.report, report);
+    let status = held.release();
+    assert!(status.success(), "{status:?}");
 }
 
 #[test]
@@ -303,6 +321,40 @@ fn linux_same_uid_ptrace_and_proc_reads_are_denied() {
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     let err = std::fs::read(format!("/proc/{pid}/environ")).expect_err("environ must be denied");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+}
+
+/// Gate 19 also asks that a traced CLI refuse to request values. There is
+/// no value path before T12, which owns that refusal test. This checks what
+/// the refusal rests on: a CLI that starts under a tracer (as under `strace`
+/// or `gdb`, which non-dumpable cannot keep out) reports it, while
+/// `cli_reports_hardening_and_the_wiping_allocator` sees
+/// `tracer_present=false` without one.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_a_cli_started_under_a_tracer_reports_it() {
+    use envcloak_sys::testing::spawn_traced;
+
+    let home = TestHome::new();
+    let mut cmd = Command::new(cli());
+    home.apply(&mut cmd)
+        .args(["internal", "hardening", "--hold"])
+        .current_dir(home.home())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let held = held(spawn_traced(&mut cmd).unwrap());
+    assert!(
+        held.report.contains("tracer_present=true\n"),
+        "{}",
+        held.report
+    );
+    assert!(
+        held.report.contains("non_dumpable=true\n"),
+        "{}",
+        held.report
+    );
+    let status = held.release();
+    assert!(status.success(), "{status:?}");
 }
 
 #[cfg(target_os = "linux")]

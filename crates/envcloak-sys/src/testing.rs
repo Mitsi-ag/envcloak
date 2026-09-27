@@ -438,24 +438,101 @@ pub fn trace_me() -> io::Result<()> {
     Ok(())
 }
 
+/// Linux: the calling thread's kernel thread id.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn current_tid() -> i32 {
+    // SAFETY: gettid has no preconditions.
+    unsafe { libc::gettid() }
+}
+
+/// Linux: waits for a ptrace stop of `tid`, retrying on EINTR. Returns the
+/// wait status.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn wait_stop(tid: i32) -> io::Result<i32> {
+    let mut status = 0;
+    loop {
+        // SAFETY: `status` is writable; __WALL also waits for tracees that
+        // are threads of another process.
+        if unsafe { libc::waitpid(tid, &mut status, libc::__WALL) } != -1 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+    if libc::WIFSTOPPED(status) {
+        Ok(status)
+    } else {
+        Err(io::Error::other("the tracee exited instead of stopping"))
+    }
+}
+
+/// Linux: attaches to thread `tid` (of any process, or a process's main
+/// thread) with `PTRACE_ATTACH` and waits for its attach stop. The thread
+/// stays stopped and traced until [`detach`]; if this process exits first,
+/// the kernel detaches it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn attach(tid: i32) -> io::Result<()> {
+    let null = std::ptr::null_mut::<libc::c_void>();
+    // SAFETY: PTRACE_ATTACH takes a thread id and ignores addr and data.
+    if unsafe { libc::ptrace(libc::PTRACE_ATTACH, tid, null, null) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    wait_stop(tid).map(drop)
+}
+
+/// Linux: detaches from thread `tid`, which must be in a ptrace stop, and
+/// lets it run without delivering a signal.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn detach(tid: i32) -> io::Result<()> {
+    let null = std::ptr::null_mut::<libc::c_void>();
+    // SAFETY: the tracee is in a ptrace stop; data 0 delivers no signal.
+    if unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, null, null) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Linux: attaches to `pid` with `PTRACE_ATTACH`, waits for the attach
 /// stop and detaches again. Returns the attach error when the kernel
 /// refuses, which is what gate 19 expects for a non-dumpable process.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn try_attach(pid: i32) -> io::Result<()> {
-    let null = std::ptr::null_mut::<libc::c_void>();
-    // SAFETY: PTRACE_ATTACH takes a pid and ignores addr and data.
-    if unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid, null, null) } == -1 {
-        return Err(io::Error::last_os_error());
+    attach(pid)?;
+    detach(pid)
+}
+
+/// Linux: spawns `cmd` traced by this process from its first instruction:
+/// the child calls `PTRACE_TRACEME` before `exec`, and this process waits
+/// for the exec stop and continues it. The child stays traced; this process
+/// is its parent, so `Child::wait` sees its exit. Only for programs that do
+/// not exec again or receive stopping signals, whose ptrace stops nobody
+/// would continue. `SIGKILL` is fine.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn spawn_traced(cmd: &mut std::process::Command) -> io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: the hook runs between fork and exec and only makes the
+    // ptrace system call, which is async-signal-safe and does not allocate.
+    unsafe { cmd.pre_exec(trace_me) };
+    let mut child = cmd.spawn()?;
+    let pid = i32::try_from(child.id()).map_err(io::Error::other)?;
+    let started = wait_stop(pid).and_then(|status| {
+        if libc::WSTOPSIG(status) != libc::SIGTRAP {
+            return Err(io::Error::other("expected the exec stop"));
+        }
+        let null = std::ptr::null_mut::<libc::c_void>();
+        // SAFETY: the tracee is in its exec stop; data 0 delivers no signal.
+        if unsafe { libc::ptrace(libc::PTRACE_CONT, pid, null, null) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    });
+    if let Err(e) = started {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
     }
-    let mut status = 0;
-    // SAFETY: `status` is writable; we wait only for the attach stop.
-    if unsafe { libc::waitpid(pid, &mut status, libc::__WALL) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the tracee is in a ptrace stop; data 0 delivers no signal.
-    if unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, null, null) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    Ok(child)
 }
