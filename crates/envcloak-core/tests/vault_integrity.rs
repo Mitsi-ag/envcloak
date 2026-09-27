@@ -120,6 +120,32 @@ fn flip_bit(raw: &rusqlite::Connection, select: &str, update: &str, at: usize) {
     assert_eq!(raw.execute(update, [b]).unwrap(), 1);
 }
 
+/// Swaps a blob column between the rows with ids `a` and `b`. Both
+/// originals are read first and written back crosswise as bound
+/// parameters (a correlated UPDATE would see its own first write), through
+/// a placeholder so a UNIQUE column never holds a duplicate. Then checks
+/// that each row holds the other's original.
+fn swap_blobs(raw: &rusqlite::Connection, table: &str, col: &str, a: &[u8], b: &[u8]) {
+    let get = |id: &[u8]| -> Vec<u8> {
+        raw.query_row(
+            &format!("SELECT {col} FROM {table} WHERE id = ?1"),
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let set = |id: &[u8], v: &[u8]| {
+        let sql = format!("UPDATE {table} SET {col} = ?1 WHERE id = ?2");
+        assert_eq!(raw.execute(&sql, rusqlite::params![v, id]).unwrap(), 1);
+    };
+    let (va, vb) = (get(a), get(b));
+    assert_ne!(va, vb);
+    set(a, b"swap placeholder, never a real value");
+    set(b, &va);
+    set(a, &vb);
+    assert_eq!((get(a), get(b)), (vb, va), "{table}.{col} was not swapped");
+}
+
 /// The vault opened read-only with `want` (or any kind when `None`), still
 /// serves the untouched value, and refuses writes.
 fn assert_read_only(mut v: Vault, want: Option<TamperKind>, keep: Option<FieldId>, case: &str) {
@@ -139,6 +165,13 @@ fn assert_read_only(mut v: Vault, want: Option<TamperKind>, keep: Option<FieldId
 
 fn hex(id: &[u8]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 #[test]
@@ -300,7 +333,6 @@ fn altered_plaintext_columns_or_moved_ciphertext_open_read_only() {
             hex(v.find(&slug("b/other")).unwrap().id.as_bytes()),
         )
     };
-    let keep = hex(p.keep.as_bytes());
     let other = hex(p.other.as_bytes());
     // (case, SQL, the finding expected first, whether `a/keep`'s value
     // stays readable)
@@ -310,17 +342,6 @@ fn altered_plaintext_columns_or_moved_ciphertext_open_read_only() {
             "UPDATE items SET updated_at = updated_at + 1;".to_owned(),
             Some(TamperKind::DigestMismatch),
             true,
-        ),
-        (
-            "items.slug_hash swapped",
-            format!(
-                "CREATE TEMP TABLE s AS SELECT id, slug_hash FROM items; \
-                 UPDATE items SET slug_hash = randomblob(32); \
-                 UPDATE items SET slug_hash = (SELECT slug_hash FROM s \
-                   WHERE s.id = CASE items.id WHEN x'{a}' THEN x'{b}' ELSE x'{a}' END);"
-            ),
-            Some(TamperKind::RowInconsistent),
-            false,
         ),
         (
             "items.class",
@@ -359,25 +380,6 @@ fn altered_plaintext_columns_or_moved_ciphertext_open_read_only() {
             true,
         ),
         (
-            "sealed values swapped between fields",
-            format!(
-                "UPDATE fields SET sealed_value = CASE id WHEN x'{keep}' THEN (SELECT sealed_value FROM fields WHERE id = x'{other}') \
-                 ELSE (SELECT sealed_value FROM fields WHERE id = x'{keep}') END \
-                 WHERE id IN (x'{keep}', x'{other}');"
-            ),
-            Some(TamperKind::DigestMismatch),
-            false,
-        ),
-        (
-            "item metadata swapped between items",
-            format!(
-                "UPDATE items SET sealed_meta = CASE id WHEN x'{a}' THEN (SELECT sealed_meta FROM items WHERE id = x'{b}') \
-                 ELSE (SELECT sealed_meta FROM items WHERE id = x'{a}') END;"
-            ),
-            Some(TamperKind::RowUnreadable),
-            false,
-        ),
-        (
             "a row copied under a new id",
             "INSERT INTO policies SELECT x'00112233445566778899aabbccddeeff', row_version, sealed FROM policies;"
                 .to_owned(),
@@ -387,15 +389,41 @@ fn altered_plaintext_columns_or_moved_ciphertext_open_read_only() {
     ];
     for (case, sql, want, keep_readable) in cases {
         let v = p.tampered(&sql);
-        if case.starts_with("sealed values") {
-            // A value moved to another row does not open there.
-            assert_eq!(
-                v.read_value(p.keep).unwrap_err().kind(),
-                VaultErrorKind::Tampered
-            );
-        }
         assert_read_only(v, want, keep_readable.then_some(p.keep), case);
     }
+
+    // Columns swapped between two rows (Codex F-20: read both originals
+    // first, never a correlated UPDATE).
+    let (a_id, b_id) = (unhex(&a), unhex(&b));
+    let (keep_id, other_id) = (p.keep.as_bytes().to_vec(), p.other.as_bytes().to_vec());
+    let v = p.tampered_by(|raw| swap_blobs(raw, "items", "slug_hash", &a_id, &b_id));
+    assert_read_only(
+        v,
+        Some(TamperKind::RowInconsistent),
+        None,
+        "slug_hash swapped",
+    );
+    let v = p.tampered_by(|raw| swap_blobs(raw, "items", "sealed_meta", &a_id, &b_id));
+    assert_read_only(
+        v,
+        Some(TamperKind::RowUnreadable),
+        None,
+        "item metadata swapped",
+    );
+    let v = p.tampered_by(|raw| swap_blobs(raw, "fields", "sealed_value", &keep_id, &other_id));
+    // A value moved to another row does not open there, in either row.
+    for id in [p.keep, p.other] {
+        assert_eq!(
+            v.read_value(id).unwrap_err().kind(),
+            VaultErrorKind::Tampered
+        );
+    }
+    assert_read_only(
+        v,
+        Some(TamperKind::DigestMismatch),
+        None,
+        "sealed values swapped",
+    );
 
     // One flipped bit in a nonce, the ciphertext or the tag of a field
     // name, which unlock opens.
