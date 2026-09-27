@@ -126,12 +126,18 @@ fn linux_traced() -> io::Result<bool> {
             )
         })
     };
+    // Thread names are arbitrary bytes, so the files need not be UTF-8.
+    let read = |path: &std::path::Path| {
+        std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned())
+    };
     let mut threads = 0usize;
     for entry in std::fs::read_dir("/proc/self/task")? {
-        let status = match std::fs::read_to_string(entry?.path().join("status")) {
+        let status = match read(&entry?.path().join("status")) {
             Ok(s) => s,
-            // The thread exited between listing and reading.
+            // The thread exited between listing and reading: its entry is
+            // gone (ENOENT), or no task is left behind it (ESRCH).
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
             Err(e) => return Err(e),
         };
         if tracer_of(&status)? != 0 {
@@ -141,7 +147,7 @@ fn linux_traced() -> io::Result<bool> {
     }
     if threads == 0 {
         // Every listed thread vanished; the main thread cannot have.
-        return Ok(tracer_of(&std::fs::read_to_string("/proc/self/status")?)? != 0);
+        return Ok(tracer_of(&read(std::path::Path::new("/proc/self/status"))?)? != 0);
     }
     Ok(false)
 }

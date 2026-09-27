@@ -2,9 +2,12 @@
 //! It lowers the hard core limit for good, so it lives in its own binary.
 #![allow(clippy::unwrap_used)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use envcloak_sys::{
     core_dump_limit, disable_core_dumps, harden_process, hardening_report, hardening_status,
-    lock_memory, set_non_dumpable,
+    lock_memory, set_non_dumpable, tracer_present,
 };
 
 #[test]
@@ -44,4 +47,33 @@ fn lock_memory_locks_a_page() {
     let mut page = vec![0u8; 4096];
     lock_memory(&mut page).unwrap();
     lock_memory(&mut []).unwrap();
+}
+
+#[test]
+fn tracer_present_survives_threads_coming_and_going() {
+    // Linux lists /proc/self/task and reads each thread's status. A thread
+    // that exits in between must be skipped, not turn the answer into an
+    // error (its read fails with ENOENT or ESRCH).
+    let stop = Arc::new(AtomicBool::new(false));
+    let churn = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let threads: Vec<_> = (0..8).map(|_| std::thread::spawn(|| {})).collect();
+                for t in threads {
+                    t.join().unwrap();
+                }
+            }
+        })
+    };
+    let mut errors = 0;
+    for _ in 0..3000 {
+        match tracer_present() {
+            Ok(traced) => assert!(!traced),
+            Err(_) => errors += 1,
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    churn.join().unwrap();
+    assert_eq!(errors, 0, "tracer_present failed while threads exited");
 }
