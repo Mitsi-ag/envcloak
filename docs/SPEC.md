@@ -36,6 +36,34 @@ Principles for the wider scope:
 - **Translation is compilation.** A canonical definition compiles into each agent's native format. Most of it is mechanical (skills, instructions, MCP config). Hooks and permission rules map partially; the translator reports anything that cannot map instead of guessing. Optional model-assisted rewriting uses the user's own key from the vault, with the cost shown.
 - **Configs never hold secrets.** Any MCP server, skill or hook that needs a key gets it through EnvCloak at run time.
 
+## 2a-bis. Money: cards, subscriptions and budgets
+
+The developer's real question is not only "where is my key" but "what is this costing me, on which account, on which card, and when does it break". EnvCloak treats money as a first-class part of the agent environment.
+
+- **Card items.** Brand, last four digits, expiry, issuer, cardholder, billing address, and which accounts and providers bill it. The full number and CVV are optional, sealed like any secret, revealable only by a human with Touch ID in the app. Card numbers are never available to agents, the CLI's agent paths, MCP, redaction lists shipped anywhere, or EnvCloak Cloud in plaintext.
+- **Card health.** "Your Visa ending 4242 expires next month; 14 providers bill it: OpenAI, Vercel, AWS ..." with a checklist and direct links to each billing page. Failed-payment signals from provider billing APIs where available.
+- **Subscriptions.** Recurring plans (hosting, AI subscriptions, SaaS) with price, renewal date, account and card, alongside usage-billed API keys. One number: monthly burn across everything.
+- **Budgets and caps.** Budgets per key, provider, project or account with alerts and forecasts ("at this burn rate your Anthropic credit runs out Thursday"). Hard caps where a provider's API allows disabling or limiting a key; otherwise, optional **virtual cards** per provider through issuer APIs, so a runaway key hits a card limit instead of your statement.
+- **Cost per project.** Attribute spend to projects from provider per-key usage and EnvCloak's own run audit.
+- **Receipts.** Collect invoices from provider billing APIs (and optionally a mail connector) and export them for bookkeeping.
+- **Later: agent payments with a human on the trigger.** An agent can request a top-up; the human approves with Touch ID; payment uses a single-use token or virtual card. Built on emerging agent-payment standards once they settle.
+
+## 2a-ter. What makes EnvCloak the best tool in its category
+
+Ranked by value to developers; each is scheduled in the milestones.
+
+1. **A 60-second first run that proves its worth.** Scan the machine, import every key (dotenv files, shell profiles, MCP configs, exports from 1Password, Bitwarden, Doppler, Infisical, Vercel and AWS), deduplicate, detect providers and owning accounts, and show what already leaked. The result screen is the product's best marketing.
+2. **Agents never see keys.** Inject and redact, proxy mode, paste guard, hooks and rules for every agent, reveal blocked for agents.
+3. **Live-key guard.** Agents get test-mode keys by default (`sk_test_` over `sk_live_`, sandbox over production); live keys need an explicit, time-boxed grant.
+4. **One wallet view.** Keys, accounts, cards, subscriptions, spend, expiry and docs in one place, searchable from the menu bar.
+5. **Capture at creation.** A browser extension notices when you create a key on a provider's site and saves it straight into EnvCloak with the account email from the page, so "which email bought this" is never a question again.
+6. **Rotation assistant.** Guided rotation for every provider and one-click rotation where the provider's API can mint keys; every project referencing the key picks up the new one.
+7. **Hard spend protection.** Budgets, forecasts, caps, virtual cards, and 24/7 watching in Cloud.
+8. **New machine in one step.** Pair, and keys, MCP servers, skills, instructions and agent configs arrive together.
+9. **Every agent, every format.** MCP, skills, instructions, hooks and rules managed once and compiled to each agent.
+10. **Everywhere developers work.** CLI, menu bar, Raycast, VS Code and Cursor extension (status and "insert reference"), shell integration for human shells only, git pre-commit leak guard, and sync targets for Vercel, AWS, GitHub Actions and other hosts.
+11. **Trust you can check.** Open source, reproducible signed builds, published threat model, external audit before 1.0, bug bounty.
+
 ## 2b. Free and paid
 
 EnvCloak itself is free and open source forever, with everything a single developer needs locally, including device-to-device sync between their own machines.
@@ -305,11 +333,14 @@ XChaCha20-Poly1305 (`chacha20poly1305`), Argon2id (`argon2`), HKDF-SHA256 (`hkdf
 | # | Milestone | Done when |
 |---|---|---|
 | M0 | Repo, CI, spec, license, community files | CI green on an empty workspace |
-| M1 | Core vault, crypto, passphrase unlock, CLI (`init`, `add`, `ls`, `show`, `ref`, `run`, `check`, `import`), redactor | End-to-end test: import a fixture repo, run a command, value redacted in output |
-| M2 | Daemon, grants and approvals (TTY), audit log, agent detection, MCP server, agent installers, `doctor`, `scrub`, `migrate-mcp` | Claude Code and Codex run a fixture project via EnvCloak with no value in any transcript |
-| M3 | macOS app: unlock with Secure Enclave and Touch ID, approvals, paste sheet, keys, projects, activity, install CLI, login item | Manual QA script passes on a clean user account |
-| M4 | Provider registry and dashboard (balance, spend, expiry, alerts) | Registry covers the top providers; dashboard shows live data |
-| M5 | Pairing, transfer, sync over iroh | Two machines pair with a code and converge after concurrent edits |
+| M1 | Core vault, crypto, passphrase unlock, CLI (`init`, `add`, `ls`, `show`, `ref`, `run`, `check`, `import`), redactor, provider detection | End-to-end test: import a fixture repo, run a command, value redacted in output |
+| M2 | Daemon, grants and approvals (TTY), live-key guard, audit log, agent detection, MCP server, agent installers, `doctor`, `scrub`, `migrate-mcp`, machine-wide first-run scan and import | Claude Code and Codex run a fixture project via EnvCloak with no value in any transcript |
+| M3 | macOS app: unlock with Secure Enclave and Touch ID, approvals, paste sheet, first-run scan screen, keys, projects, activity, install CLI, login item | Manual QA script passes on a clean user account |
+| M4 | Spend and money: provider registry, balance, spend, expiry, cards, subscriptions, budgets, alerts, forecasts | Registry covers the top providers; dashboard shows live data |
+| M5 | Pairing, transfer, sync over iroh; new-machine bootstrap | Two machines pair with a code and converge after concurrent edits |
 | M6 | Proxy mode | Placeholder-only child process reaches a provider API successfully; non-allowlisted host gets the placeholder |
-| M7 | Packaging and release: signed and notarized app, Homebrew, cargo-dist binaries, docs site | `brew install --cask envcloak` works on a clean Mac |
-| M8 | Launch | Public repo, launch posts, directory listings |
+| M7 | Packaging and release: signed and notarized app, Homebrew, cargo-dist binaries, docs site, landing page with Cloud waitlist | `brew install --cask envcloak` works on a clean Mac |
+| M8 | Launch (v0.1: Keys + Spend) | Public repo, launch posts, directory listings |
+| M9 | v0.2: MCP servers module, browser capture extension, rotation assistant | MCP set installed into four agents from one list |
+| M10 | v0.3: Skills and instructions module with translation; Raycast and editor extensions | A skill compiles to five agents' formats with a loss report |
+| M11 | EnvCloak Cloud MVP on AWS: encrypted backup and sync mailbox, 24/7 spend watch and alerts, then the Nitro Enclave credential proxy and Teams | Paying users |
