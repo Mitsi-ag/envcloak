@@ -1,9 +1,10 @@
 //! Gate 19 (process hardening) for the `envcloak` binary, observed from
 //! outside the process: core dumps are off and a forced abort leaves no core;
 //! on Linux a same-uid ptrace attach and reads of `/proc/<pid>/mem` and
-//! `environ` are denied; on macOS a copy signed with the hardened runtime
-//! reports it. Each check that can only pass vacuously in a hostile test
-//! environment runs a control process first.
+//! `environ` are denied, and a CLI started under a tracer refuses to request
+//! values; on macOS a copy signed with the hardened runtime reports it. Each
+//! check that can only pass vacuously in a hostile test environment runs a
+//! control process first.
 //!
 //! Every process these tests start runs in [`TestHome::apply`]'s cleared
 //! environment, so no core file can hold anything from the developer's
@@ -14,9 +15,10 @@
 //! the control is unverified.
 #![allow(clippy::unwrap_used)]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use envcloak_testkit::{TestHome, by_label, canaries, fresh_seed, labels};
 
@@ -327,11 +329,9 @@ fn linux_same_uid_ptrace_and_proc_reads_are_denied() {
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
 }
 
-/// Gate 19 also asks that a traced CLI refuse to request values. There is
-/// no value path before T12, which owns that refusal test. This checks what
-/// the refusal rests on: a CLI that starts under a tracer (as under `strace`
-/// or `gdb`, which non-dumpable cannot keep out) reports it, while
-/// `cli_reports_hardening_and_the_wiping_allocator` sees
+/// What the refusal below rests on: a CLI that starts under a tracer (as
+/// under `strace` or `gdb`, which non-dumpable cannot keep out) detects it,
+/// while `cli_reports_hardening_and_the_wiping_allocator` sees
 /// `tracer_present=false` without one.
 #[cfg(target_os = "linux")]
 #[test]
@@ -359,6 +359,114 @@ fn linux_a_cli_started_under_a_tracer_reports_it() {
     );
     let status = held.release();
     assert!(status.success(), "{status:?}");
+}
+
+/// Waits up to `limit` for `child` to exit, then collects its output. A
+/// child that does not exit in time is killed and the test fails, so a
+/// regression cannot hang the suite.
+fn finish_within(mut child: Child, limit: Duration) -> Output {
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the process did not exit within {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_end(&mut stdout).unwrap();
+    }
+    if let Some(mut err) = child.stderr.take() {
+        err.read_to_end(&mut stderr).unwrap();
+    }
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+/// `envcloak run -- /bin/sh -c 'echo ran > marker' <marker> <canary>`,
+/// ready to spawn, and the marker the command would create.
+fn run_command(home: &TestHome, secret: &str) -> (Command, PathBuf) {
+    let marker = home.home().join("command-ran");
+    let mut cmd = Command::new(cli());
+    home.apply(&mut cmd)
+        .args(["run", "--", "/bin/sh", "-c", "echo ran > \"$0\""])
+        .arg(&marker)
+        .arg(secret)
+        .current_dir(home.home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    (cmd, marker)
+}
+
+#[test]
+fn run_without_a_tracer_gets_past_the_tracer_check() {
+    // The control for the traced refusal: without a tracer, `run` gets to
+    // the daemon step, which this build does not have yet. It starts
+    // nothing and echoes nothing either way.
+    let cs = canaries(fresh_seed());
+    let secret = by_label(&cs, labels::STRIPE_SECRET_KEY).as_str();
+    let home = TestHome::new();
+    let (mut cmd, marker) = run_command(&home, secret);
+    let out = finish_within(cmd.spawn().unwrap(), Duration::from_secs(30));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(125), "{stderr}");
+    assert!(
+        stderr.starts_with("envcloak: daemon_unavailable"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+    assert!(!marker.exists(), "run started the command");
+    envcloak_testkit::assert_no_canary(&out.stderr, &cs);
+
+    // Without a command or with options it is a usage error, still silent
+    // about its arguments.
+    for args in [
+        &["run"][..],
+        &["run", "--"],
+        &["run", "--ref", secret, "--", "true"],
+    ] {
+        let out = home
+            .apply(&mut Command::new(cli()))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        envcloak_testkit::assert_no_canary(&out.stderr, &cs);
+    }
+}
+
+/// Gate 19: a traced CLI refuses to request values. Started under a tracer
+/// from its first instruction, `envcloak run` exits 125 with `traced`
+/// before any step that could ask for a value, and never starts the
+/// command. `run_without_a_tracer_gets_past_the_tracer_check` is the
+/// control: the same command line, untraced, goes on to the daemon step.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_a_traced_cli_refuses_to_request_values() {
+    use envcloak_sys::testing::spawn_traced;
+
+    let cs = canaries(fresh_seed());
+    let secret = by_label(&cs, labels::STRIPE_SECRET_KEY).as_str();
+    let home = TestHome::new();
+    let (mut cmd, marker) = run_command(&home, secret);
+    let out = finish_within(spawn_traced(&mut cmd).unwrap(), Duration::from_secs(30));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(125), "{:?}: {stderr}", out.status);
+    assert!(stderr.starts_with("envcloak: traced:"), "{stderr}");
+    assert!(!stderr.contains("daemon_unavailable"), "{stderr}");
+    assert!(out.stdout.is_empty());
+    assert!(!marker.exists(), "a traced run started the command");
+    envcloak_testkit::assert_no_canary(&out.stderr, &cs);
 }
 
 #[cfg(target_os = "linux")]
