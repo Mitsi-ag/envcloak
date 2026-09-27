@@ -691,6 +691,16 @@ impl Vault {
         self.file.storage_report()
     }
 
+    /// Test support only: drops the pages SQLite has cached, so the next
+    /// read of a row comes from the file, as it does once the cache evicts
+    /// the page. Lets a test see a change another program made to the file
+    /// while the vault is open.
+    #[cfg(feature = "testing")]
+    pub fn evict_page_cache_for_testing(&self) -> Result<(), VaultError> {
+        self.file.conn.execute_batch("PRAGMA shrink_memory")?;
+        Ok(())
+    }
+
     /// Locks: drops the VMK, the subkeys and the decrypted metadata, which
     /// are wiped as they are freed, and keeps the file open and locked.
     pub fn lock(self) -> LockedVault {

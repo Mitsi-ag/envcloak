@@ -150,6 +150,7 @@ Without an anchor (Linux, and macOS before M3), restoring the whole file togethe
 - A write transaction is one `BEGIN IMMEDIATE` SQLite transaction. Values are sealed before they are bound to a statement; only sealed bytes, keyed hashes, ids, row versions, kinds and timestamps are bound.
 - Each write names the row version it replaces (`WHERE id = ? AND row_version = ?`). A row that is not there means the file changed behind the process's back: the transaction fails and the vault turns read-only.
 - At commit the state digest is recomputed from the stamps held in memory, which only this process's writes change, and the header is rewritten in the same transaction. A row changed on disk while the vault is open is therefore never folded into a fresh digest.
+- A read or write that meets a row changed on disk (its sealed columns no longer open under the row version held in memory) turns the vault read-only, reporting "changed while open", and the next unlock reports the change. `tests/vault_integrity.rs` writes to the file behind an open vault and checks both, and that a commit to another row does not vouch for the changed one.
 - Replacing a value makes the old one the newest prior value; three are kept.
 - Deleting an item deletes its fields; `secure_delete` overwrites the freed pages.
 

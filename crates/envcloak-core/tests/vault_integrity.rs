@@ -2,8 +2,9 @@
 //! copy, makes unlock report tampering and open read-only. Every table is
 //! covered, `meta` and the header included. Also: altered plaintext
 //! columns, moved ciphertext, an altered schema, an empty vault without its
-//! header, the documented whole-file rollback limit, file modes, and the
-//! digest's cost at 10,000 rows.
+//! header, a row changed in the file while the vault is open, the
+//! documented whole-file rollback limit, file modes, and the digest's cost
+//! at 10,000 rows.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -620,6 +621,122 @@ fn an_empty_vault_without_its_header_opens_read_only() {
             .unwrap_err();
         assert_eq!(e.kind(), VaultErrorKind::KeyMismatch, "{sql}");
     }
+}
+
+/// The stored `sealed_value` of `field`, read through a plain connection
+/// while the vault is closed.
+fn sealed_value_of(f: &Fixture, field: FieldId) -> Vec<u8> {
+    f.raw()
+        .query_row(
+            "SELECT sealed_value FROM fields WHERE id = ?1",
+            [&field.as_bytes()[..]],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Flips one bit inside the ciphertext of `sealed`, a column stored once in
+/// the database file, with a plain write to the file. The vault's lock is
+/// advisory, so another program can do this while the vault is open.
+fn flip_on_disk(f: &Fixture, sealed: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let db = f.db();
+    let bytes = std::fs::read(&db).unwrap();
+    let hits: Vec<usize> = bytes
+        .windows(sealed.len())
+        .enumerate()
+        .filter(|(_, w)| *w == sealed)
+        .map(|(i, _)| i)
+        .collect();
+    let [at] = hits[..] else {
+        panic!("the column is stored {} times in the file", hits.len());
+    };
+    // Past the 24-byte nonce: a ciphertext byte.
+    let at = at + 30;
+    let file = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+    file.write_at(&[bytes[at] ^ 0x10], at as u64).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// A row changed in the file while the vault is open turns it read-only
+/// at the first read or write that meets the row, and the next unlock
+/// reports it. SQLite reads the file again once it drops the page it
+/// cached at unlock; the test drops it on purpose.
+#[test]
+fn a_row_changed_on_disk_while_open_turns_the_vault_read_only() {
+    let p = pristine();
+
+    // Met by a read.
+    p.restore();
+    let sealed = sealed_value_of(&p.f, p.other);
+    let v = p.f.unlock();
+    flip_on_disk(&p.f, &sealed);
+    v.evict_page_cache_for_testing().unwrap();
+    assert!(v.read_value(p.keep).unwrap().ct_eq(KEEP));
+    assert_eq!(v.integrity(), Integrity::Ok, "an untouched row still reads");
+    assert_eq!(
+        v.read_value(p.other).unwrap_err().kind(),
+        VaultErrorKind::Tampered
+    );
+    assert_read_only(
+        v,
+        Some(TamperKind::ChangedWhileOpen),
+        Some(p.keep),
+        "met by a read",
+    );
+    assert_read_only(
+        p.f.unlock(),
+        Some(TamperKind::DigestMismatch),
+        Some(p.keep),
+        "reopened after a read",
+    );
+
+    // Met by a write.
+    p.restore();
+    let mut v = p.f.unlock();
+    flip_on_disk(&p.f, &sealed);
+    v.evict_page_cache_for_testing().unwrap();
+    let e = v
+        .transact(|t| t.set_value(p.other, SecretBytes::copy_from(b"a new value")))
+        .unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Tampered);
+    assert_read_only(
+        v,
+        Some(TamperKind::ChangedWhileOpen),
+        Some(p.keep),
+        "met by a write",
+    );
+    assert_read_only(
+        p.f.unlock(),
+        Some(TamperKind::DigestMismatch),
+        Some(p.keep),
+        "reopened after a write",
+    );
+}
+
+/// A commit's digest comes from the rows this process wrote, never from the
+/// file: a row changed behind its back and not touched by the write is not
+/// folded into a fresh digest, and the next unlock still reports it.
+#[test]
+fn a_commit_never_vouches_for_a_row_changed_on_disk() {
+    let p = pristine();
+    p.restore();
+    let sealed = sealed_value_of(&p.f, p.other);
+    let mut v = p.f.unlock();
+    flip_on_disk(&p.f, &sealed);
+    v.evict_page_cache_for_testing().unwrap();
+    v.transact(|t| t.set_value(p.keep, SecretBytes::copy_from(b"a later value")))
+        .unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    drop(v);
+    let v = p.f.unlock();
+    assert!(v.read_value(p.keep).unwrap().ct_eq(b"a later value"));
+    assert_read_only(
+        v,
+        Some(TamperKind::DigestMismatch),
+        None,
+        "a commit after the change",
+    );
 }
 
 /// SPEC §5 "Integrity": without an anchor (Linux, and macOS before M3),
