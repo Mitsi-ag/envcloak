@@ -2,7 +2,10 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
@@ -160,6 +163,8 @@ pub struct Detector {
     /// Per pattern: canary index and encoding name.
     meta: Vec<(usize, &'static str)>,
     labels: Vec<String>,
+    /// The length of the longest pattern.
+    longest: usize,
 }
 
 impl std::fmt::Debug for Detector {
@@ -198,6 +203,7 @@ impl Detector {
             matcher,
             meta,
             labels: cs.iter().map(|c| c.label.clone()).collect(),
+            longest: patterns.iter().map(Vec::len).max().unwrap_or(0),
         }
     }
 
@@ -208,6 +214,47 @@ impl Detector {
             .into_iter()
             .map(|(f, _)| f)
             .collect()
+    }
+
+    /// As [`Detector::find`] over everything `reader` yields, reading at
+    /// most `chunk` bytes at a time. Only the last chunk and the tail of the
+    /// one before it (one byte short of the longest pattern) are held, so a
+    /// file of any size costs a fixed amount of memory. Occurrences come out
+    /// exactly as [`Detector::find`] would report them for the whole input:
+    /// each once, in order of end offset, with offsets from the start.
+    fn find_streaming(&self, reader: &mut dyn Read, chunk: usize) -> io::Result<Vec<Found>> {
+        let keep = self.longest.saturating_sub(1);
+        let mut piece = vec![0u8; chunk.max(1)];
+        let mut window: Vec<u8> = Vec::with_capacity(keep + piece.len());
+        // The input offset of window[0].
+        let mut base = 0usize;
+        let mut found = Vec::new();
+        loop {
+            let n = match reader.read(&mut piece) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            // Occurrences that end in the carried tail were reported with
+            // the chunk they end in; one that ends in the new bytes starts
+            // no earlier than the tail, which is one byte short of the
+            // longest pattern.
+            let carried = window.len();
+            window.extend_from_slice(&piece[..n]);
+            for (mut f, end) in self.find_ending(&window) {
+                if end > carried {
+                    f.offset += base;
+                    found.push(f);
+                }
+            }
+            if window.len() > keep {
+                let drop = window.len() - keep;
+                window.drain(..drop);
+                base += drop;
+            }
+        }
+        Ok(found)
     }
 
     /// As [`Detector::find`], with the end offset of each occurrence.
@@ -321,13 +368,52 @@ pub fn assert_no_canary(haystack: &[u8], cs: &[Canary]) {
     Detector::new(cs).assert_absent(haystack);
 }
 
+/// Bytes [`sweep_dir`] reads from a file at a time.
+const SWEEP_CHUNK: usize = 64 * 1024;
+
+/// Opens `path` for reading only if it is a regular file: without
+/// following a symlink in its last component, without blocking on a FIFO,
+/// and with the type checked again on the open descriptor, so an entry
+/// replaced after the sweep looked at it is refused rather than followed
+/// or waited on.
+fn open_regular(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("no longer a regular file"));
+    }
+    Ok(file)
+}
+
+/// Every canary occurrence in the regular file at `path`, read in
+/// [`SWEEP_CHUNK`] pieces. See [`open_regular`].
+fn scan_file(detector: &Detector, path: &Path) -> io::Result<Vec<Found>> {
+    let mut file = open_regular(path)?;
+    detector.find_streaming(&mut file, SWEEP_CHUNK)
+}
+
+/// Whether `path` is still the directory `before` described: same device
+/// and inode, not replaced by a symlink or anything else.
+fn same_dir(path: &Path, before: &std::fs::Metadata) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|now| now.is_dir() && now.dev() == before.dev() && now.ino() == before.ino())
+}
+
 /// Scans everything under `dir` for canaries: the contents of every regular
 /// file, the path of every entry below `dir` (so a canary in a name, or
 /// spread over nested names, is found), and the target of every symlink.
 /// Symlinks are not followed, and the contents of FIFOs, sockets and
-/// devices are not read, so a sweep never hangs or leaves the tree.
-/// Anything unreadable is reported as [`Hit::Unreadable`]. Hits print
-/// without values; [`assert_sweep_clean`] panics with them.
+/// devices are not read, so a sweep never hangs or leaves the tree. That
+/// holds for entries that change while the sweep runs, as a daemon still
+/// writing might make them: a file is opened without following a symlink
+/// or blocking and must still be a regular file once open, and a directory
+/// counts only if it is the same directory after it was listed. Anything
+/// that fails those checks, or cannot be read, is reported as
+/// [`Hit::Unreadable`]. Files are read in fixed-size pieces, so a large
+/// file costs no more memory than a small one. Hits print without values;
+/// [`assert_sweep_clean`] panics with them.
 pub fn sweep_dir(dir: &Path, cs: &[Canary]) -> Vec<Hit> {
     let detector = Detector::new(cs);
     let shown = |p: &Path| detector.swept_path(dir, p);
@@ -373,6 +459,15 @@ pub fn sweep_dir(dir: &Path, cs: &[Canary]) -> Vec<Hit> {
                             }),
                         }
                     }
+                    // Listed through a symlink swapped in after the check
+                    // above: the names are not this tree's.
+                    if !same_dir(&path, &meta) {
+                        hits.push(Hit::Unreadable {
+                            path: shown(&path),
+                            kind: io::ErrorKind::Other,
+                        });
+                        continue;
+                    }
                     children.sort();
                     stack.extend(children.into_iter().rev());
                 }
@@ -397,9 +492,9 @@ pub fn sweep_dir(dir: &Path, cs: &[Canary]) -> Vec<Hit> {
                 }),
             }
         } else if meta.is_file() {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    for found in detector.find(&bytes) {
+            match scan_file(&detector, &path) {
+                Ok(found) => {
+                    for found in found {
                         hits.push(Hit::Canary {
                             path: shown(&path),
                             found,
@@ -435,4 +530,149 @@ pub fn assert_sweep_clean(dir: &Path, cs: &[Canary]) {
             ""
         }
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::io::{self, Read};
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{Detector, Found, encodings, same_dir, scan_file};
+    use crate::canary::{canaries, fresh_seed};
+    use crate::home::TestHome;
+
+    /// Hands out at most `step` bytes per read, and fails every third read
+    /// with `Interrupted`, which the reader must retry.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        step: usize,
+        calls: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls % 3 == 0 {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let n = self.step.min(buf.len()).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// Every encoding of every canary, some back to back and some apart,
+    /// so occurrences overlap, touch and straddle any chunk boundary.
+    fn haystack() -> (Detector, Vec<u8>) {
+        let cs = canaries(fresh_seed());
+        let mut hay = Vec::new();
+        for (i, c) in cs.iter().enumerate() {
+            for (j, (_, bytes)) in encodings(c).into_iter().enumerate() {
+                hay.extend(std::iter::repeat_n(b'~', (i * 7 + j * 3) % 11));
+                hay.extend_from_slice(&bytes);
+            }
+        }
+        (Detector::new(&cs), hay)
+    }
+
+    #[test]
+    fn streaming_finds_what_a_whole_input_search_finds() {
+        let (detector, hay) = haystack();
+        let whole: Vec<Found> = detector.find(&hay);
+        assert!(whole.len() > 100, "{}", whole.len());
+        for chunk in [1, 2, 3, 5, 7, 16, 61, 4096, hay.len() + 1] {
+            for step in [1, 3, 64, usize::MAX] {
+                let mut reader = Trickle {
+                    data: &hay,
+                    step,
+                    calls: 0,
+                };
+                let streamed = detector.find_streaming(&mut reader, chunk).unwrap();
+                assert!(
+                    streamed == whole,
+                    "chunk {chunk}, step {step}: {} occurrences streamed, {} in the whole input",
+                    streamed.len(),
+                    whole.len()
+                );
+            }
+        }
+    }
+
+    /// Runs `f` on another thread and gives up after ten seconds, so a
+    /// scan that blocks fails the test instead of hanging it.
+    fn within_ten_seconds<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the scan blocked")
+    }
+
+    /// What the sweep meets when a file it saw as regular is replaced
+    /// before it opens it.
+    #[test]
+    fn a_file_swapped_for_a_fifo_or_symlink_is_refused() {
+        let cs = canaries(fresh_seed());
+        let home = TestHome::new();
+        let root = home.home();
+
+        let fifo = root.join("fifo");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        let detector = Detector::new(&cs);
+        let result = within_ten_seconds(move || scan_file(&detector, &fifo).map(|_| ()));
+        assert!(result.is_err(), "a FIFO was scanned");
+
+        let outside = TestHome::new();
+        let secret = outside.root().join("secret.txt");
+        std::fs::write(&secret, cs[0].value()).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let detector = Detector::new(&cs);
+        assert!(
+            scan_file(&detector, &link).is_err(),
+            "a symlink was followed"
+        );
+
+        // Control: the same file, opened where it is, is scanned.
+        let found = scan_file(&detector, &secret).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.label == cs[0].label && f.offset == 0)
+        );
+    }
+
+    #[test]
+    fn a_directory_counts_only_while_it_is_the_same_directory() {
+        let home = TestHome::new();
+        let dir = home.home().join("d");
+        let moved = home.home().join("moved");
+        std::fs::create_dir(&dir).unwrap();
+        let before = std::fs::symlink_metadata(&dir).unwrap();
+        assert!(same_dir(&dir, &before));
+
+        // Moved away and replaced by a symlink to it: listing `dir` would
+        // follow the link.
+        std::fs::rename(&dir, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &dir).unwrap();
+        assert!(!same_dir(&dir, &before));
+
+        // Replaced by another directory. The original still exists, so its
+        // inode cannot be handed out again.
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!same_dir(&dir, &before));
+
+        // The original, back in place, is the same directory.
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::rename(&moved, &dir).unwrap();
+        assert!(same_dir(&dir, &before));
+    }
 }

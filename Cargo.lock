@@ -135,6 +135,7 @@ dependencies = [
  "base64",
  "envcloak-sys",
  "form_urlencoded",
+ "libc",
  "serde_json",
  "tempfile",
  "zeroize",

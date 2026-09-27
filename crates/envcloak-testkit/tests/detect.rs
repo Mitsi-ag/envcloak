@@ -391,6 +391,40 @@ fn probe_needles_share_no_window_across_seeds() {
     }
 }
 
+/// Files are read in 64 KiB pieces, not whole. An occurrence across a piece
+/// boundary, or ending on one, is found once, at its offset in the file,
+/// exactly as a search of the whole contents finds it.
+#[test]
+fn sweep_dir_finds_canaries_across_read_boundaries() {
+    let cs = canaries(fresh_seed());
+    let v = by_label(&cs, labels::STRIPE_SECRET_KEY).value();
+    let piece = 64 * 1024;
+    let offsets = [piece - 1, 2 * piece - v.len() / 2, 3 * piece - v.len()];
+    let mut data = noise(4 * piece);
+    for &at in &offsets {
+        data[at..at + v.len()].copy_from_slice(v);
+    }
+    let home = TestHome::new();
+    let file = home.home().join("big.log");
+    std::fs::write(&file, &data).unwrap();
+
+    let hits = sweep_dir(&home.home(), &cs);
+    let found: Vec<_> = hits
+        .iter()
+        .map(|h| match h {
+            Hit::Canary { path, found } if path == &file => found.clone(),
+            other => panic!("unexpected hit: {other}"),
+        })
+        .collect();
+    assert_eq!(found, find(&data, &cs));
+    let raw: Vec<usize> = found
+        .iter()
+        .filter(|f| f.encoding == "raw")
+        .map(|f| f.offset)
+        .collect();
+    assert_eq!(raw, offsets);
+}
+
 #[test]
 fn sweep_dir_checks_entry_names_and_symlink_targets() {
     let cs = canaries(fresh_seed());
