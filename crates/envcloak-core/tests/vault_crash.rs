@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::io::BufReader;
 use std::time::{Duration, Instant};
 
-use common::{Fixture, Rng, kill_child, last_number, name, read_stdin, rest, spawn_self, wait_for};
+use common::{
+    Fixture, Rng, dir_names, kill_child, last_number, name, read_stdin, rest, spawn_self, wait_for,
+};
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
     Argon2id, Envelope, EnvelopeCtx, KdfParams, UnlockerId, UnlockerKind, VaultId, Vmk,
@@ -549,7 +551,7 @@ fn kill_9_during_create_leaves_no_vault_or_a_whole_one() {
         }
         kill_child(&mut child, "creator");
         let ctx = format!("seed {seed}: round {round}");
-        match LockedVault::open(&paths) {
+        let v = match LockedVault::open(&paths) {
             Ok(locked) => {
                 whole += 1;
                 let v = locked
@@ -558,6 +560,7 @@ fn kill_9_during_create_leaves_no_vault_or_a_whole_one() {
                     .unwrap();
                 assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
                 assert_eq!(v.header().write_counter, 1, "{ctx}");
+                v
             }
             Err(e) => {
                 assert_eq!(e.kind(), VaultErrorKind::NotFound, "{ctx}");
@@ -567,9 +570,18 @@ fn kill_9_during_create_leaves_no_vault_or_a_whole_one() {
                 let vmk2 = Vmk::import_for_testing(&input[16..48]).unwrap();
                 let v = Vault::create(&paths, vault_id, vmk2, vec![env.clone()]).unwrap();
                 assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
-                drop(v);
+                v
             }
-        }
+        };
+        // Either way, nothing of the killed create is left: no temporary
+        // file, and no second name for the vault.
+        let names = dir_names(&paths.vault_dir);
+        assert!(
+            names.iter().all(|n| n == "vault.db" || n == "vault.db-wal"),
+            "{ctx}: {names:?}"
+        );
+        drop(v);
+        assert_eq!(dir_names(&paths.vault_dir), ["vault.db"], "{ctx}");
     }
     println!("create kills: {none} left no vault, {whole} left a whole one");
     assert!(

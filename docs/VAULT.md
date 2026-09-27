@@ -156,7 +156,7 @@ Without an anchor (Linux, and macOS before M3), restoring the whole file togethe
 
 ## Create
 
-`create` builds the database under a temporary name (`vault/.vault.db.new-<16 hex digits>`) in rollback-journal mode, commits, closes and syncs it, then hard-links it to `vault.db` (which fails if a vault is already there), removes the temporary name and syncs the directory. A crash leaves either no `vault.db` or a complete one. The next `create` removes leftover temporary files. The first open switches the file to WAL.
+`create` builds the database under a temporary name (`vault/.vault.db.new-<16 hex digits>`) in rollback-journal mode, commits, closes and syncs it, then hard-links it to `vault.db` (which fails if a vault is already there), removes the temporary name and syncs the directory. A crash leaves either no `vault.db` or a complete one. A leftover temporary name is removed by the next `create` or, once it holds the lock, by the next open (a crash between the link and the removal leaves it as a second link to the vault). The first open switches the file to WAL.
 
 ## Crash safety
 

@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{Fixture, name, secret_item, slug};
+use common::{Fixture, dir_names, name, secret_item, slug};
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
     Argon2id, EnvelopeCtx, ItemClass, KdfParams, UnlockerId, UnlockerKind, VaultId, Vmk,
@@ -465,6 +465,31 @@ fn create_open_and_lock_refusals() {
     // create needs at least one unlocker of the initial epoch.
     let e = Vault::create(&paths, VaultId::generate(), Vmk::generate(), Vec::new()).unwrap_err();
     assert_eq!(e.kind(), VaultErrorKind::InvalidRecord);
+}
+
+/// A kill between `create` linking its file into place and removing the
+/// temporary name leaves a second name for the live vault. Opening, once
+/// it holds the lock, removes it and any leftover temporary journal.
+#[test]
+fn opening_removes_what_an_interrupted_create_left() {
+    use std::os::unix::fs::MetadataExt;
+    let (f, v) = Fixture::create();
+    drop(v);
+    let dir = std::fs::canonicalize(&f.paths.vault_dir).unwrap();
+    std::fs::hard_link(f.db(), dir.join(".vault.db.new-0011223344556677")).unwrap();
+    std::fs::write(dir.join(".vault.db.new-8899aabbccddeeff-journal"), b"").unwrap();
+    assert_eq!(std::fs::metadata(f.db()).unwrap().nlink(), 2);
+
+    let v = f.unlock();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert!(
+        !dir_names(&dir)
+            .iter()
+            .any(|n| n.starts_with(".vault.db.new-"))
+    );
+    drop(v);
+    assert_eq!(dir_names(&dir), ["vault.db"]);
+    assert_eq!(std::fs::metadata(f.db()).unwrap().nlink(), 1);
 }
 
 #[test]

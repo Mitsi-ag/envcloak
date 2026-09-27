@@ -90,8 +90,9 @@ impl core::fmt::Debug for LockedVault {
 impl LockedVault {
     /// Opens the vault at `p` and takes its exclusive lock, which it holds
     /// until dropped. Does not create anything: a missing vault is
-    /// [`VaultErrorKind::NotFound`]. Sets the process umask to 077 first,
-    /// as [`VaultPaths::ensure_dirs`] does.
+    /// [`VaultErrorKind::NotFound`]. Removes what an interrupted
+    /// [`Vault::create`] left. Sets the process umask to 077 first, as
+    /// [`VaultPaths::ensure_dirs`] does.
     pub fn open(p: &VaultPaths) -> Result<Self, VaultError> {
         Self::open_with(p, MigrationPlan::current())
     }
@@ -109,7 +110,8 @@ impl LockedVault {
         check_private_dir(&p.vault_dir)?;
         // SQLite's NOFOLLOW refuses any symlink on the path, and the data
         // directory's own ancestors (macOS `/tmp`, say) may be symlinks.
-        let db = std::fs::canonicalize(&p.vault_dir)?.join(DB_NAME);
+        let dir = std::fs::canonicalize(&p.vault_dir)?;
+        let db = dir.join(DB_NAME);
         check_private_file(&db)?;
         for side in ["-wal", "-shm", "-journal"] {
             let mut name = db.clone().into_os_string();
@@ -126,6 +128,11 @@ impl LockedVault {
         if app_id != schema::APPLICATION_ID {
             return Err(VaultErrorKind::Damaged.into());
         }
+        // This handle now holds the vault's lock. A `create` killed after
+        // linking its file into place left the temporary name as a second
+        // link to this vault; nothing else uses these names once `vault.db`
+        // exists.
+        remove_stale_temps(&dir)?;
         let id = read_identity(&conn, plan.target())?;
         Ok(LockedVault {
             vault_id: id.vault_id,
@@ -769,8 +776,8 @@ fn build_new(
     conn.close().map_err(|(_, e)| VaultError::from(e))
 }
 
-/// Removes what an interrupted `create` left: temporary databases and their
-/// journals.
+/// Removes what an interrupted `create` left: temporary databases (possibly
+/// a second link to a finished vault) and their journals.
 fn remove_stale_temps(dir: &Path) -> Result<(), VaultError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;

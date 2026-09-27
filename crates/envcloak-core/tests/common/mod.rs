@@ -231,6 +231,16 @@ pub fn read_stdin() -> Vec<u8> {
     b
 }
 
+/// The names in a directory, sorted.
+pub fn dir_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 /// Copies every regular file of `from` into `to` (created), for snapshots
 /// of a closed vault directory.
 pub fn copy_dir(from: &Path, to: &Path) {
