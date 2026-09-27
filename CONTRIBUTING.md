@@ -4,7 +4,7 @@ Thanks for helping. EnvCloak guards other people's credentials, so we hold every
 
 ## The fastest way to contribute: add a provider
 
-Every provider EnvCloak knows about is one TOML file in [`providers/`](providers/). A provider file teaches EnvCloak how to recognise a key by its prefix, where its docs, billing and key pages are, which hosts the key may be sent to in proxy mode, and (optionally) how to read balance, spend and expiry. See the format in [docs/SPEC.md](docs/SPEC.md#8-dashboard-balance-spend-expiry). Most providers take ten minutes.
+Every provider EnvCloak knows about is one TOML file in [`providers/`](providers/). A provider file teaches EnvCloak how to recognise a key by its prefix, where its docs, billing and key pages are, which hosts the key may be sent to in proxy mode, and (optionally) how to read balance, spend and expiry. The format and the rules the loader enforces are in [docs/PROVIDERS.md](docs/PROVIDERS.md); after editing `providers/`, run `python3 scripts/gen-providers.py`, which compiles the files into the release. Most providers take ten minutes.
 
 ## Development setup
 
