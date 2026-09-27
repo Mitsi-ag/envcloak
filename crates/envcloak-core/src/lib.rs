@@ -1,14 +1,6 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! EnvCloak core: secret types, and (in later M1 tasks) crypto, the vault
+//! format and storage, unlockers, backups and the audit log.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod secret;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use secret::{CapacityExceeded, SecretBuf, SecretBytes};

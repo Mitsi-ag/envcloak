@@ -61,6 +61,13 @@ version = "0.1.0"
 [[package]]
 name = "envcloak-core"
 version = "0.1.0"
+dependencies = [
+ "envcloak-testkit",
+ "secrecy",
+ "serde",
+ "static_assertions",
+ "zeroize",
+]
 
 [[package]]
 name = "envcloak-ipc"
@@ -358,6 +365,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -398,6 +414,12 @@ dependencies = [
  "serde_core",
  "zmij",
 ]
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "syn"

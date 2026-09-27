@@ -15,17 +15,21 @@ authors = ["EnvCloak contributors"]
 # pinned to exact versions and bumped deliberately. Others use caret
 # requirements; Cargo.lock pins them and CI builds with --locked.
 [workspace.dependencies]
+envcloak-core = { path = "crates/envcloak-core", version = "0.1.0" }
 envcloak-sys = { path = "crates/envcloak-sys", version = "0.1.0" }
 # Test only, never published.
 envcloak-testkit = { path = "crates/envcloak-testkit" }
 
 libc = "=0.2.189"
+secrecy = "=0.10.3"
 zeroize = "=1.9.0"
 
 aho-corasick = "1.1.5"
 base64 = "0.23.1"
 form_urlencoded = "1.2.2"
+serde = "1.0.229"
 serde_json = "1.0.151"
+static_assertions = "1.1.0"
 tempfile = "3.27.0"
 
 [workspace.lints.rust]
