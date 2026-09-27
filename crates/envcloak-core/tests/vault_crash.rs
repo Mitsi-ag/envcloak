@@ -11,6 +11,12 @@
 //! verifies, and that every item, value and prior value equals a model
 //! replayed from the same seed. Set `ENVCLOAK_VAULT_CRASH_SEED` to replay a
 //! run.
+//!
+//! Reopening the vault checkpoints and removes the WAL, so a writer the
+//! parent starts next opens a clean file. To kill during WAL recovery too,
+//! the parent sometimes starts another writer on the WAL the killed one
+//! left, before reopening the vault itself, and kills it while it opens,
+//! recovers and unlocks the vault.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -371,20 +377,29 @@ fn crash_writer() {
 struct Tally {
     /// The write counter its vault ended at.
     counter: u64,
-    /// Kills that landed while the child started, opened or recovered the
-    /// vault.
+    /// Kills timed to land while the child started, opened and unlocked a
+    /// clean vault.
     early: u32,
     /// Kills that landed inside a transaction, after at least one commit
     /// of that child had been seen.
     after_commits: u32,
+    /// Extra kills of a writer started on the WAL a killed writer left.
+    recoveries: u32,
+    /// Those that landed before that writer reported it was ready: while
+    /// it opened the vault, recovered the WAL or unlocked.
+    recoveries_before_ready: u32,
 }
 
-/// One worker: its own vault, `KILLS_PER_WORKER` kill points.
+/// One worker: its own vault, `KILLS_PER_WORKER` kill points, each checked
+/// by reopening the vault.
 ///
 /// Most kills wait for the child to report 0 to 3 commits and then land
 /// at a uniformly random moment within one more commit's duration (a
 /// moving average), so they fall inside writes on fast and slow disks
-/// alike. One in ten lands while the child is still starting.
+/// alike. One in ten lands while the child is still starting. After one
+/// kill in four that left a non-empty WAL, a second writer is started on
+/// it and killed within a start-up's duration, mostly while it recovers
+/// the WAL, before the vault is reopened and checked.
 fn crash_worker(seed: u64) -> Tally {
     let (f, v) = Fixture::create();
     drop(v);
@@ -438,8 +453,39 @@ fn crash_worker(seed: u64) -> Tally {
         if let Some(n) = last_number(&tail, "@@committed ") {
             reported = n;
         }
-
         let ctx = format!("seed {seed}: kill {kill}");
+
+        let mut wal = f.db().into_os_string();
+        wal.push("-wal");
+        let hot = std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0);
+        if hot && rng.below(4) == 0 {
+            tally.recoveries += 1;
+            let mut child = spawn_self(
+                &f.home,
+                "crash_writer",
+                &[(WRITER, &data), (SEED, &seed_text)],
+                &f.vmk,
+            );
+            let mut out = BufReader::new(child.stdout.take().unwrap());
+            let us = rng.below(ready_time.as_micros() as u64 + 1);
+            std::thread::sleep(Duration::from_micros(us));
+            kill_child(&mut child, "recovering writer");
+            let text = rest(&mut out);
+            match last_number(&text, "@@ready ") {
+                None => tally.recoveries_before_ready += 1,
+                Some(n) => {
+                    assert!(
+                        n == reported || n == reported + 1,
+                        "{ctx}: recovered to {n}, last reported commit {reported}"
+                    );
+                    reported = n;
+                }
+            }
+            if let Some(n) = last_number(&text, "@@committed ") {
+                reported = n;
+            }
+        }
+
         let v = f.unlock();
         assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
         let k = v.header().unwrap().write_counter;
@@ -466,16 +512,24 @@ fn kill_9_at_a_thousand_points_leaves_the_last_commit() {
         })
         .collect();
     let (mut commits, mut early, mut after) = (0, 0, 0);
+    let (mut recoveries, mut in_recovery) = (0, 0);
     for w in workers {
         let t = w.join().unwrap();
         commits += t.counter - 1;
         early += t.early;
         after += t.after_commits;
+        recoveries += t.recoveries;
+        in_recovery += t.recoveries_before_ready;
     }
     let kills = WORKERS * u64::from(KILLS_PER_WORKER);
     println!(
         "gate 5: {kills} kills ({early} during start-up, {after} after one or more commits), \
-         {commits} commits survived"
+         {commits} commits survived; {recoveries} more kills of a writer started on a \
+         killed writer's WAL, {in_recovery} of them before it was ready"
+    );
+    assert!(
+        in_recovery > 0,
+        "no kill landed before a writer started on a killed writer's WAL was ready"
     );
     // The kills landed among writes: the vaults moved on by more than one
     // commit per kill that waited for commits.
