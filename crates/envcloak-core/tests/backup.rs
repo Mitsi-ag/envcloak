@@ -9,6 +9,8 @@
 //! - a vault changed on disk behind an open vault is never backed up;
 //! - a restored vault's digest verifies, and its new passphrase envelope
 //!   uses the current default parameters (gate 3);
+//! - a restore hands back only the state it prepared: one that finds
+//!   another state installed, valid or not, fails;
 //! - a restore refuses an open vault, a weak new passphrase, and a backup
 //!   path that is a symlink, a FIFO or a directory, and moves aside a file
 //!   that is not a vault.
@@ -627,6 +629,96 @@ fn a_restore_fails_when_the_installed_vault_does_not_verify() {
     assert_eq!(report.replaced.len(), 1, "{:?}", report.replaced);
     drop(v);
     assert_eq!(f.unlock().integrity(), Integrity::Ok);
+}
+
+/// Opens the vault with `pass`: Ok, or the generic unlock error.
+fn opens_with(f: &KitFixture, pass: &SecretBytes) -> bool {
+    match f.open().unlock_with_passphrase(pass) {
+        Ok(v) => v.integrity() == Integrity::Ok,
+        Err((_, e)) => {
+            assert_eq!(e.kind(), VaultErrorKind::Crypto(CryptoErrorKind::Unlock));
+            false
+        }
+    }
+}
+
+/// The installed vault must be the state the restore prepared, not merely
+/// one that verifies (F-24). A WAL the same vault wrote after a passphrase
+/// change is coherent: replayed onto the installed file, it gives a vault
+/// that verifies under the VMK but holds another passphrase envelope, and
+/// in the second case other items. Planted after the way was cleared, it
+/// makes the restore fail with `RestoreUnverified`, where it used to report
+/// the backup's items and a passphrase that no longer opens the vault. A
+/// second restore then installs the backup, and its report counts the
+/// items the installed vault holds.
+#[test]
+fn a_restore_fails_when_another_valid_state_is_installed() {
+    let (f, mut v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    let later_pass = other_passphrase(77);
+    v.change_passphrase_for_testing(&later_pass, &KdfParams::minimum())
+        .unwrap();
+    let pass_only = std::fs::read(f.db().with_file_name("vault.db-wal")).unwrap();
+    let pass_and_items = later_wal(&mut v, &f.db());
+    let later_items: Vec<ItemMeta> = v.items().to_vec();
+    assert_eq!(later_items.len(), items.len() + 20);
+    drop(v);
+    let wal_path = f.db().with_file_name("vault.db-wal");
+
+    let cases = [
+        ("a passphrase change", &pass_only, &items),
+        (
+            "a passphrase change and more items",
+            &pass_and_items,
+            &later_items,
+        ),
+    ];
+    for (n, (what, wal, planted_items)) in (10u64..).zip(cases) {
+        let requested = other_passphrase(n);
+        let e = restore_backup_observed(
+            &f.paths,
+            &info.path,
+            &f.kit(),
+            &requested,
+            &KdfParams::minimum(),
+            &mut |s| {
+                if s == RestoreStep::OldVaultKept {
+                    std::fs::write(&wal_path, wal).unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), VaultErrorKind::RestoreUnverified, "{what}");
+
+        // What is in place verifies: only the comparison with the prepared
+        // state can have caught it.
+        let v = f.unlock();
+        assert_eq!(v.integrity(), Integrity::Ok, "{what}");
+        assert_eq!(v.items(), &planted_items[..], "{what}");
+        drop(v);
+        assert!(!opens_with(&f, &requested), "{what}");
+        assert!(opens_with(&f, &later_pass), "{what}");
+    }
+
+    let requested = other_passphrase(3);
+    let (v, report) = restore_backup_observed(
+        &f.paths,
+        &info.path,
+        &f.kit(),
+        &requested,
+        &KdfParams::minimum(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items(), &items[..]);
+    assert_eq!(report.items, items.len());
+    assert_holds_canaries(&v, &f.cs);
+    drop(v);
+    assert!(opens_with(&f, &requested));
+    assert!(!opens_with(&f, &later_pass));
+    f.home.assert_clean(&f.cs);
 }
 
 fn no_change(_: &MigrationTx<'_>) -> Result<(), VaultError> {

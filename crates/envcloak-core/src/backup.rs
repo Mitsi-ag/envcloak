@@ -31,8 +31,12 @@
 //! otherwise replay onto the new file), renames the new file over
 //! `vault.db`, and syncs the directory. A crash at any point leaves the
 //! old vault or the new one in place, never neither; leftovers are removed
-//! by the next open. The installed vault is then opened again and must
-//! verify.
+//! by the next open. The installed vault is then opened again: it must
+//! verify, and be the state the restore prepared, with the vault id, epoch,
+//! schema version and sealed header it committed. The header's state
+//! digest covers every row, the new passphrase envelope included, so
+//! another valid state of the same vault (a WAL it wrote, replayed onto the
+//! installed file) is refused too.
 //!
 //! Restore takes the vault's lock through [`LockedVault::open`], so it
 //! fails with [`VaultErrorKind::Busy`] while the vault is open. It takes no
@@ -60,8 +64,8 @@ use crate::recovery::RecoveryKit;
 use crate::secret::SecretBytes;
 use crate::unlock::{install_passphrase, passphrase_envelope, passphrase_unlockers};
 use crate::vault::{
-    DB_NAME, Integrity, LockedVault, MigrationPlan, REPLACED_PREFIX, TEMP_PREFIX, Vault,
-    VaultError, VaultErrorKind, VaultPaths, check_private_dir, open_record, remove_temp,
+    DB_NAME, HeaderState, Integrity, LockedVault, MigrationPlan, REPLACED_PREFIX, TEMP_PREFIX,
+    Vault, VaultError, VaultErrorKind, VaultPaths, check_private_dir, open_record, remove_temp,
     seal_record, set_aside, sync_dir, utc_stamp, with_suffix,
 };
 
@@ -107,6 +111,7 @@ pub struct RestoreReport {
     pub backup_created_at: u64,
     /// The vault's write counter when it was backed up.
     pub backup_write_counter: u64,
+    /// The number of items the installed vault holds.
     pub items: usize,
     /// Every file moved out of the new vault's way: the file that was
     /// `vault.db`, now `vault/replaced-<UTC time>.db`, first, then its
@@ -227,9 +232,10 @@ impl Vault {
 /// too. See the module documentation for the order of the steps.
 ///
 /// Fails with [`VaultErrorKind::RestoreUnverified`] when the backup was
-/// installed but the installed vault does not open or verify (something
-/// else changed the vault directory meanwhile): the vault is then the
-/// restored file, and the replaced one is kept aside.
+/// installed but the installed vault does not open or verify, or verifies
+/// as another state than the one prepared (something else changed the
+/// vault directory meanwhile): the vault is then not the restored one, and
+/// the replaced one is kept aside.
 pub fn restore_backup(
     p: &VaultPaths,
     backup: &Path,
@@ -330,7 +336,7 @@ fn restore(
         manifest: &manifest,
         plan: &plan,
     };
-    let (vmk, items) = staged.prepare(&staging.path, p, vmk, new_pass, pass_kdf)?;
+    let prepared = staged.prepare(&staging.path, p, vmk, new_pass, pass_kdf)?;
     staging.finish()?;
     observe(RestoreStep::StagingReady);
 
@@ -345,13 +351,16 @@ fn restore(
     sync_dir(&dir)?;
     observe(RestoreStep::Installed);
 
-    // The file verified under its temporary name; it must still verify
-    // under its own. A restore never hands back a vault it did not check.
+    // The file verified under its temporary name; under its own it must
+    // verify again and be what was prepared there, not merely a state that
+    // verifies. A restore never hands back a vault it did not check.
+    let Prepared { vmk, committed } = prepared;
     let vault = LockedVault::open_with(p, plan)
         .and_then(|l| l.unlock(vmk).map_err(|(_, e)| e))
         .ok()
-        .filter(|v| v.integrity() == Integrity::Ok)
+        .filter(|v| committed.is(v))
         .ok_or(VaultErrorKind::RestoreUnverified)?;
+    let items = vault.items().len();
     Ok((
         vault,
         RestoreReport {
@@ -365,6 +374,47 @@ fn restore(
     ))
 }
 
+/// What [`Staged::prepare`] left in the staged file.
+struct Prepared {
+    vmk: Vmk,
+    committed: Committed,
+}
+
+/// The state a restore committed to the staged file: after any migration,
+/// the new passphrase envelope and the kit's confirmation.
+struct Committed {
+    vault_id: VaultId,
+    epoch: u32,
+    schema_version: u16,
+    header: HeaderState,
+}
+
+impl Committed {
+    fn of(v: &Vault) -> Result<Self, VaultError> {
+        Ok(Committed {
+            vault_id: v.vault_id(),
+            epoch: v.epoch(),
+            schema_version: v.schema_version(),
+            header: v.header()?,
+        })
+    }
+
+    /// Whether `v` verified, writable, as exactly this state. Its header
+    /// holds the write counter and the digest over every row, and is
+    /// compared whole, in constant time.
+    fn is(&self, v: &Vault) -> bool {
+        let Ok(header) = v.header() else {
+            return false;
+        };
+        v.integrity() == Integrity::Ok
+            && v.migration_error().is_none()
+            && v.vault_id() == self.vault_id
+            && v.epoch() == self.epoch
+            && v.schema_version() == self.schema_version
+            && bool::from(header.encode().ct_eq(&self.header.encode()))
+    }
+}
+
 /// What the staged database must be.
 struct Staged<'a> {
     head: &'a Header,
@@ -376,8 +426,8 @@ impl Staged<'_> {
     /// Opens the staged database and requires it to be the backed-up vault,
     /// as it was backed up, with a verified digest; migrates it if it is of
     /// an older format, and requires it to verify again; installs the new
-    /// passphrase envelope, and closes it. Returns the VMK and the number
-    /// of items.
+    /// passphrase envelope, and closes it. Returns the VMK and the state it
+    /// committed.
     fn prepare(
         &self,
         staged: &Path,
@@ -385,7 +435,7 @@ impl Staged<'_> {
         vmk: Vmk,
         new_pass: &SecretBytes,
         pass_kdf: &KdfParams,
-    ) -> Result<(Vmk, usize), VaultError> {
+    ) -> Result<Prepared, VaultError> {
         let (head, manifest) = (self.head, self.manifest);
         // The image opened under the backup key, so a file that is not a
         // vault or does not open under the VMK is a backup made wrongly or
@@ -430,10 +480,10 @@ impl Staged<'_> {
             t.set_recovery_confirmed(true);
             Ok(())
         })?;
-        let items = vault.items().len();
+        let committed = Committed::of(&vault)?;
         let (locked, vmk) = vault.lock_keeping_key();
         drop(locked);
-        Ok((vmk, items))
+        Ok(Prepared { vmk, committed })
     }
 }
 

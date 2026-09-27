@@ -76,7 +76,8 @@ pub enum VaultErrorKind {
     /// [`CryptoErrorKind::Unlock`].)
     BackupDamaged,
     /// A restore installed the backup as `vault.db`, but the installed
-    /// vault then failed to open or verify: something changed the vault
+    /// vault then failed to open or verify, or verified as another state
+    /// than the one the restore prepared: something changed the vault
     /// directory during the restore. The replaced vault is kept aside.
     RestoreUnverified,
     /// An authenticated record failed to decode: a bug, not an attack.
@@ -134,7 +135,7 @@ impl VaultErrorKind {
                 "the backup file is damaged or truncated, or is not an EnvCloak vault backup"
             }
             VaultErrorKind::RestoreUnverified => {
-                "the backup was installed as the vault, but the installed vault did not open or verify"
+                "the backup was installed as the vault, but the installed vault did not open or verify as the restored one"
             }
             VaultErrorKind::Corrupt => "a sealed vault record could not be decoded",
         }
