@@ -89,7 +89,8 @@ Slugs are one or more parts separated by `/`; each part starts with a lowercase 
 
 ## Size caps
 
-- 64 KiB for a value and for the plaintext of any other sealed record.
+- 64 KiB for a value, and for the plaintext of every other sealed record except the prior list.
+- The prior list packs up to three prior values into one sealed column. Each was a value, so each is at most 64 KiB; the list is at most 2 + 3 × (4 + 64 KiB) bytes, about 192 KiB.
 - 1 MiB per row. A field row with a full-size value and three full-size prior values stays under it.
 
 ## State digest
