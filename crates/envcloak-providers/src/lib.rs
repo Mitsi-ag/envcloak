@@ -12,9 +12,9 @@
 //!   line (gate 18): every URL is `https://`; a request goes only to an
 //!   allowed host, with the key in a declared auth slot; no wildcard host
 //!   is under or over a multi-tenant suffix, or over a public suffix; key
-//!   patterns match whole values of at
-//!   least 16 bytes and keep no captures. One bad file fails the whole
-//!   registry.
+//!   patterns match whole values of at least 16 bytes, start with a
+//!   literal of at least 3 bytes and keep no captures. One bad file fails
+//!   the whole registry.
 //! - [`Registry::detect`]: a value's provider and classification, with the
 //!   variable name breaking ties. It returns ids only, never the value.
 //! - [`Registry::prefill`]: a new item's provider, links, allowed hosts and
@@ -37,5 +37,6 @@ pub use registry::{
     embedded_files, load_embedded,
 };
 pub use safety::{
-    AuthSlot, HostPattern, HttpsUrl, JsonPath, MAX_PATTERN, MIN_KEY_LEN, PathSegment,
+    AuthSlot, HostPattern, HttpsUrl, JsonPath, MAX_PATTERN, MIN_KEY_LEN, MIN_KEY_PREFIX,
+    PathSegment,
 };

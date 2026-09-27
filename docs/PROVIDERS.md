@@ -67,6 +67,7 @@ Patterns are regular expressions in the syntax of the Rust `regex` crate, compil
 - No capturing groups. Use `(?:...)`. Detection never records where or what a pattern matched.
 - A key pattern is anchored at both ends: every match starts at the start of the value and ends at its end. `^a|b$` is not anchored, and neither is `(?m)^...$`, whose `^` also matches after a newline.
 - A key pattern matches no value shorter than 16 bytes, so a pattern cannot claim every short value. Doctor reports registry-pattern matches of any length (SPEC §6.5), which would otherwise make it a guess-confirmation oracle.
+- A key pattern starts with a literal of at least 3 bytes: every value it matches begins with one of a finite set of literals, such as `sk-`, `AKIA` or `ASIA`, or `pk_live_` and the like from `[rsp]k_(?:live|test)_`. Detection pre-fills a new item's allowed hosts from the provider it finds, so a pattern that matched values of any shape (`^(?s:.){16,}$`, `^[A-Za-z0-9]{24}$`) would attach its hosts to unrelated secrets such as database URLs. The check uses the `regex-syntax` literal extractor, which gives up on a class of more than 10 bytes or a set of more than 250 literals, so `^[a-f0-9]{32}$` and `^[0-9]{16,}$` fail. The prefix makes a pattern's reach plain in review; it does not prove the pattern narrow.
 - A live or test pattern is anchored at the start, and may be short (`^sk_live_`).
 
 A provider with no test mode lists its keys as live: they act on the real account.
@@ -156,3 +157,4 @@ A registry error is a kind, the file and, where the parser recorded one, the lin
 | Detection over generated values, and the OpenAI and DeepSeek tie broken by the variable name | `tests/detect.rs` |
 | 11, detection part: no fixture in freed memory, even with the allocator's wipe off | `tests/detect_probe.rs` |
 | Errors carry no value | `tests/loader.rs` |
+| A key pattern without a literal prefix fails to load | `tests/loader.rs` |

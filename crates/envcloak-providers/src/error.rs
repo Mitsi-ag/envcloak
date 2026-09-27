@@ -37,6 +37,9 @@ pub enum RegistryErrorKind {
     PatternHasCaptures,
     /// A key pattern that matches values shorter than 16 bytes.
     PatternTooShort,
+    /// A key pattern whose matches do not all start with a literal of at
+    /// least 3 bytes, such as `^sk-`: it could claim values of any shape.
+    PatternNoLiteralPrefix,
     NoKeyPatterns,
     /// Not an uppercase environment variable name.
     InvalidEnvHint,
@@ -100,6 +103,9 @@ impl RegistryErrorKind {
             }
             K::PatternHasCaptures => "patterns keep no captures: use (?:...) for groups",
             K::PatternTooShort => "a key pattern must not match values shorter than 16 bytes",
+            K::PatternNoLiteralPrefix => {
+                "a key pattern must start with a literal of at least 3 bytes, such as ^sk-"
+            }
             K::NoKeyPatterns => "key_patterns is empty",
             K::InvalidEnvHint => "an env hint is not an uppercase variable name",
             K::InvalidHost => {

@@ -430,6 +430,13 @@ fn key_pattern_rules() {
         ),
         ("['^ex_[a-z0-9]{12}$']", K::PatternTooShort),
         ("['^.*$']", K::PatternTooShort),
+        ("['^(?s:.){16,}$']", K::PatternNoLiteralPrefix),
+        ("['^[A-Za-z0-9_-]{24,}$']", K::PatternNoLiteralPrefix),
+        ("['^ex[a-z0-9]{24}$']", K::PatternNoLiteralPrefix),
+        (
+            "['^ex_(?:live|test)_[a-z0-9]{24}$', '^.{16,}$']",
+            K::PatternNoLiteralPrefix,
+        ),
         ("['^ex_[a-z0-9{24}$']", K::InvalidPattern),
         ("['^ex_\\p{L}{24}$']", K::InvalidPattern),
         ("[3]", K::WrongType),

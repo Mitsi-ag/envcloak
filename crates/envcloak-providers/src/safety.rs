@@ -20,7 +20,13 @@
 //! Key patterns are compiled for linear-time matching on bytes and keep no
 //! captures. A key pattern must match whole values of at least
 //! [`MIN_KEY_LEN`] bytes, so a pattern cannot claim every short value (doctor
-//! reports registry-pattern matches of any length, SPEC §6.5).
+//! reports registry-pattern matches of any length, SPEC §6.5). It must also
+//! start with a literal of at least [`MIN_KEY_PREFIX`] bytes, such as `sk-`:
+//! detection pre-fills an item's allowed hosts from the provider it names,
+//! so a pattern that matched values of any shape, such as `^(?s:.){16,}$`,
+//! would attach its hosts to unrelated secrets (a database URL, a generic
+//! token). The prefix makes a pattern's reach plain in review; it does not
+//! prove the pattern narrow.
 //!
 //! [`RegistryErrorKind::RequestHostNotAllowed`]: crate::RegistryErrorKind::RequestHostNotAllowed
 //! [`RegistryErrorKind::NotHttps`]: crate::RegistryErrorKind::NotHttps
@@ -28,7 +34,8 @@
 //! [`RegistryErrorKind::WildcardOverMultiTenantSuffix`]: crate::RegistryErrorKind::WildcardOverMultiTenantSuffix
 
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
-use regex_syntax::hir::Look;
+use regex_syntax::hir::literal::{ExtractKind, Extractor};
+use regex_syntax::hir::{Hir, Look};
 
 use crate::error::RegistryErrorKind as K;
 
@@ -36,6 +43,8 @@ use crate::error::RegistryErrorKind as K;
 pub const MAX_PATTERN: usize = 256;
 /// The shortest value a key pattern may match, in bytes.
 pub const MIN_KEY_LEN: usize = 16;
+/// The shortest literal a key pattern must start with, in bytes: `sk-`.
+pub const MIN_KEY_PREFIX: usize = 3;
 const MAX_URL: usize = 2048;
 const MAX_JSON_PATH: usize = 256;
 const MAX_JSON_SEGMENTS: usize = 16;
@@ -106,8 +115,23 @@ fn check_pattern(src: &str, anchor: Anchor) -> Result<(), K> {
         if p.minimum_len().is_none_or(|n| n < MIN_KEY_LEN) {
             return Err(K::PatternTooShort);
         }
+        if !has_literal_prefix(&hir) {
+            return Err(K::PatternNoLiteralPrefix);
+        }
     }
     Ok(())
+}
+
+/// Every value the pattern matches starts with one of a finite set of
+/// literals, each at least [`MIN_KEY_PREFIX`] bytes long. The extractor's
+/// limits give up on classes of more than 10 bytes and on sets of more than
+/// 250 literals, so `.`, `[a-f0-9]` or `[0-9]{3}` at the start leave no
+/// literal of that length, and a pattern that could claim values of any
+/// shape fails.
+fn has_literal_prefix(hir: &Hir) -> bool {
+    let seq = Extractor::new().kind(ExtractKind::Prefix).extract(hir);
+    seq.literals()
+        .is_some_and(|lits| !lits.is_empty() && lits.iter().all(|l| l.len() >= MIN_KEY_PREFIX))
 }
 
 fn printable(b: u8) -> bool {
@@ -810,7 +834,7 @@ mod tests {
         );
         assert_eq!(c("sk-", Anchor::Start), Err(K::PatternNotAnchored));
         assert_eq!(c("^.{15}$", Anchor::Whole), Err(K::PatternTooShort));
-        assert_eq!(c("^.{16}$", Anchor::Whole), Ok(()));
+        assert_eq!(c("^abc.{13}$", Anchor::Whole), Ok(()));
         assert_eq!(c("^sk-[a-z]*$", Anchor::Whole), Err(K::PatternTooShort));
         assert_eq!(c("^[a&&b]{20}$", Anchor::Whole), Err(K::PatternTooShort));
         assert_eq!(c("^sk-[a-f0-9$", Anchor::Whole), Err(K::InvalidPattern));
@@ -820,6 +844,42 @@ mod tests {
         assert_eq!(c(&long, Anchor::Whole), Err(K::InvalidPattern));
         // Unicode classes are not compiled in; patterns are ASCII.
         assert_eq!(c("^\\p{L}{20}$", Anchor::Whole), Err(K::InvalidPattern));
+
+        // A key pattern starts with a literal of at least 3 bytes, so it
+        // cannot claim values of every shape.
+        for broad in [
+            "^.{16}$",
+            "^(?s:.){16,}$",
+            "^[A-Za-z0-9]{24}$",
+            "^[a-f0-9]{32}$",
+            // Ten digits expand to 100 two-digit prefixes, then give up.
+            "^[0-9]{16,}$",
+            "^ab[a-z]{16}$",
+            "^(?:sk-|[a-z]{3})[a-z]{16}$",
+            "^(?:|sk-)[a-z]{16}$",
+            "^(?:sk-)?[a-z]{16}$",
+            "^[a-z]?sk-[a-z]{16}$",
+        ] {
+            assert_eq!(
+                c(broad, Anchor::Whole),
+                Err(K::PatternNoLiteralPrefix),
+                "{broad}"
+            );
+        }
+        for ok in [
+            "^sk-[a-f0-9]{32}$",
+            "^sk-ant-[a-z]{2,10}[0-9]{2}-[A-Za-z0-9_-]{20,}$",
+            "^(?:AKIA|ASIA)[A-Z2-7]{16}$",
+            "^[rsp]k_(?:live|test)_[0-9A-Za-z]{10,247}$",
+            "^gh[pousr]_[A-Za-z0-9]{36,251}$",
+            "(?i)^sk-[a-z]{16}$",
+            "^(?:sk-|pk-)[a-z]{16}$",
+        ] {
+            assert_eq!(c(ok, Anchor::Whole), Ok(()), "{ok}");
+        }
+        // Live and test patterns need no prefix: they are tried only on a
+        // value a key pattern matched.
+        assert_eq!(c("^[a-z]", Anchor::Start), Ok(()));
     }
 
     #[test]
