@@ -136,6 +136,8 @@ impl Backing for SystemBacking {
 
 /// Zeroes `size` bytes at `ptr` with volatile writes the compiler cannot
 /// remove as dead stores, even though the block is freed right after.
+/// `tests/freed_memory.rs` reads freed blocks back in an optimized build,
+/// where plain writes here would be removed.
 ///
 /// # Safety
 /// `ptr` must be valid for writes of `size` bytes. The bytes may be

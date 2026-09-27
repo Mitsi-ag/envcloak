@@ -38,6 +38,12 @@ zeroize.workspace = true
 name = "tracer"
 harness = false
 
+# Its own main, so nothing else allocates between a free and the read-back
+# of the freed memory (see the file).
+[[test]]
+name = "freed_memory"
+harness = false
+
 [dev-dependencies]
 # Enables the `testing` feature for this crate's own tests.
 envcloak-sys = { path = ".", features = ["testing"] }

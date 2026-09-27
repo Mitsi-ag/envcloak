@@ -55,6 +55,12 @@ disallowed_methods = "deny"
 unwrap_used = "warn"
 dbg_macro = "warn"
 
+# The wiping allocator's dead-store guard (crates/envcloak-sys/tests/
+# freed_memory.rs) must run optimized code, as release builds do: at
+# opt-level 0 plain writes before free survive and would hide a broken wipe.
+[profile.dev.package.envcloak-sys]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
