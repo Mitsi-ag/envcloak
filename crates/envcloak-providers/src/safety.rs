@@ -9,8 +9,9 @@
 //!   ([`RegistryErrorKind::RequestHostNotAllowed`]);
 //! - any URL that is not `https://` ([`RegistryErrorKind::NotHttps`]);
 //! - a wildcard allowed host under a multi-tenant suffix
-//!   ([`RegistryErrorKind::WildcardUnderMultiTenantSuffix`]) or over a whole
-//!   top-level domain;
+//!   ([`RegistryErrorKind::WildcardUnderMultiTenantSuffix`]) or over one
+//!   ([`RegistryErrorKind::WildcardOverMultiTenantSuffix`]), and one over a
+//!   whole top-level domain or public suffix of two labels (`*.co.kr`);
 //! - hosts and URLs in any but one canonical spelling: lowercase DNS names,
 //!   no user name, port, IP address, trailing dot or backslash, so what a
 //!   reviewer reads is the host the key goes to;
@@ -24,6 +25,7 @@
 //! [`RegistryErrorKind::RequestHostNotAllowed`]: crate::RegistryErrorKind::RequestHostNotAllowed
 //! [`RegistryErrorKind::NotHttps`]: crate::RegistryErrorKind::NotHttps
 //! [`RegistryErrorKind::WildcardUnderMultiTenantSuffix`]: crate::RegistryErrorKind::WildcardUnderMultiTenantSuffix
+//! [`RegistryErrorKind::WildcardOverMultiTenantSuffix`]: crate::RegistryErrorKind::WildcardOverMultiTenantSuffix
 
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use regex_syntax::hir::Look;
@@ -174,8 +176,35 @@ impl Suffixes {
         &self.0
     }
 
-    fn covers(&self, domain: &str) -> bool {
-        self.0.iter().any(|s| under(domain, s))
+    /// Whether a wildcard over `domain` and the multi-tenant zone of a
+    /// listed suffix overlap. Under or at a suffix, the wildcard covers
+    /// tenant hosts; above one, it covers every tenant host under it.
+    fn check_wildcard(&self, domain: &str) -> Result<(), K> {
+        if self.0.iter().any(|s| under(domain, s)) {
+            return Err(K::WildcardUnderMultiTenantSuffix);
+        }
+        if self.0.iter().any(|s| under(s, domain)) {
+            return Err(K::WildcardOverMultiTenantSuffix);
+        }
+        Ok(())
+    }
+}
+
+/// Second-level labels under which many country-code domains register
+/// names for anyone: `co.kr`, `com.sg` and `org.il` are public suffixes, so
+/// a wildcard over a two-label domain that starts with one covers hosts
+/// anyone can register, whether or not the list names it.
+const PUBLIC_SECOND_LEVEL: &[&str] = &[
+    "ac", "biz", "co", "com", "edu", "gen", "go", "gob", "gov", "govt", "gv", "info", "int", "ltd",
+    "me", "mil", "ne", "net", "nic", "nom", "or", "org", "plc", "sch", "web",
+];
+
+/// A wildcard domain of one label (`com`), or of two whose first is a
+/// public second-level label (`co.kr`).
+fn public_suffix_shaped(domain: &str) -> bool {
+    match domain.split_once('.') {
+        None => true,
+        Some((first, rest)) => !rest.contains('.') && PUBLIC_SECOND_LEVEL.contains(&first),
     }
 }
 
@@ -200,8 +229,11 @@ impl HostPattern {
             }
             return Err(K::InvalidHost);
         }
-        if wildcard && suffixes.covers(domain) {
-            return Err(K::WildcardUnderMultiTenantSuffix);
+        if wildcard {
+            suffixes.check_wildcard(domain)?;
+            if public_suffix_shaped(domain) {
+                return Err(K::WildcardTooBroad);
+            }
         }
         Ok(HostPattern {
             text: s.to_owned(),
@@ -638,6 +670,37 @@ mod tests {
         assert!(p("*.notvercel.app").is_ok());
         // Exact tenant hosts are not wildcards.
         assert!(p("acme.vercel.app").is_ok());
+        // A wildcard over a whole public suffix of two labels.
+        for broad in ["*.com.sg", "*.co.kr", "*.com.tw", "*.org.il", "*.ac.jp"] {
+            assert_eq!(p(broad), Err(K::WildcardTooBroad), "{broad}");
+        }
+        assert!(p("*.coms.sg").is_ok() && p("*.com.sg.example.com").is_ok());
+
+        // A wildcard over a suffix matches every tenant host under it, so a
+        // wildcard at or above a listed suffix is refused as well as one
+        // under it; a sibling is not.
+        let deep = Suffixes::parse("tenants.example.net\napp.region.example.org\n").unwrap();
+        let q = |x: &str| HostPattern::parse(x, &deep);
+        for over in ["*.example.net", "*.example.org", "*.region.example.org"] {
+            assert_eq!(q(over), Err(K::WildcardOverMultiTenantSuffix), "{over}");
+        }
+        for under in [
+            "*.tenants.example.net",
+            "*.acme.tenants.example.net",
+            "*.app.region.example.org",
+        ] {
+            assert_eq!(q(under), Err(K::WildcardUnderMultiTenantSuffix), "{under}");
+        }
+        for ok in [
+            "*.other.example.net",
+            "*.other.region.example.org",
+            "*.tenants.example.net.example.com",
+            "*.xtenants.example.net",
+            "evil.tenants.example.net",
+            "example.net",
+        ] {
+            assert!(q(ok).is_ok(), "{ok}");
+        }
 
         let w = p("*.example.com").unwrap();
         assert!(w.is_wildcard());

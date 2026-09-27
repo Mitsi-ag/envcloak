@@ -11,7 +11,8 @@
 //! - The loader's rules, each a [`RegistryErrorKind`] with a file and a
 //!   line (gate 18): every URL is `https://`; a request goes only to an
 //!   allowed host, with the key in a declared auth slot; no wildcard host
-//!   is under a multi-tenant suffix; key patterns match whole values of at
+//!   is under or over a multi-tenant suffix, or over a public suffix; key
+//!   patterns match whole values of at
 //!   least 16 bytes and keep no captures. One bad file fails the whole
 //!   registry.
 //! - [`Registry::detect`]: a value's provider and classification, with the

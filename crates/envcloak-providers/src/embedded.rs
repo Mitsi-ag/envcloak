@@ -140,10 +140,14 @@ keys = "https://github.com/settings/tokens"
         "multi-tenant-suffixes.txt",
         r#"# Domains under which many unrelated parties get hosts of their own. The
 # registry loader refuses a wildcard allowed host (`*.<domain>`) whose domain
-# is one of these or is under one: the key could then be sent to a host
-# anyone can create. A tenant's own host, such as acme.supabase.co, is stored
-# on the item instead (SPEC §8 "Registry safety"). One domain per line,
-# lowercase; `#` starts a comment. Format: docs/PROVIDERS.md.
+# is one of these, is under one, or is above one: the key could then be sent
+# to a host anyone can create. A tenant's own host, such as acme.supabase.co,
+# is stored on the item instead (SPEC §8 "Registry safety"). One domain per
+# line, lowercase; `#` starts a comment. Format: docs/PROVIDERS.md.
+#
+# The list is kept by hand, so a wildcard over a platform it misses would
+# load: no shipped provider uses a wildcard, and adding one needs a check
+# against the Public Suffix List in review.
 
 # Application and function hosting
 supabase.co
@@ -176,6 +180,26 @@ ngrok.io
 ngrok.app
 ngrok-free.app
 loca.lt
+ngrok.dev
+ngrok-free.dev
+amplifyapp.com
+elasticbeanstalk.com
+azurecontainerapps.io
+csb.app
+codesandbox.io
+stackblitz.io
+webcontainer.io
+gitpod.io
+github.dev
+koyeb.app
+streamlit.app
+lovable.app
+val.run
+webflow.io
+wixsite.com
+myshopify.com
+blogspot.com
+ts.net
 
 # Cloud platforms: storage buckets, functions, API gateways and customer
 # resources such as <resource>.openai.azure.com
@@ -201,6 +225,15 @@ firebaseio.com
 digitaloceanspaces.com
 ondigitalocean.app
 linodeobjects.com
+azurefd.net
+azurecr.io
+firebasestorage.app
+cloudflarestorage.com
+aliyuncs.com
+myqcloud.com
+oraclecloud.com
+backblazeb2.com
+wasabisys.com
 
 # Code and page hosting
 github.io
@@ -209,7 +242,10 @@ gitlab.io
 bitbucket.io
 codeberg.page
 
-# Public suffixes of two labels, under which anyone can register a domain
+# Public suffixes of two labels, under which anyone can register a domain.
+# The loader also refuses a wildcard over any two-label domain whose first
+# label is a public second-level label (co, com, net, org, ac, ...), so these
+# are listed to refuse wildcards under them too.
 co.uk
 org.uk
 com.au

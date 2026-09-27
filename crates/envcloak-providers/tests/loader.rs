@@ -1,6 +1,6 @@
 //! Gate 18 (SPEC §15.2): the registry loader refuses a request host outside
-//! `allowed_hosts`, an `http://` URL, and a wildcard under a multi-tenant
-//! suffix; and the loader's other rules (docs/PROVIDERS.md). Each case
+//! `allowed_hosts`, an `http://` URL, and a wildcard under (or over) a
+//! multi-tenant suffix; and the loader's other rules (docs/PROVIDERS.md). Each case
 //! changes one line of a provider file that loads, and checks the kind and
 //! the line of the error, so a case passes only for the reason it names.
 #![allow(clippy::unwrap_used)]
@@ -289,6 +289,27 @@ fn gate18_a_wildcard_under_a_multi_tenant_suffix_fails_to_load() {
         assert_eq!(fails(&f), (kind, Some(7)), "{host}");
     }
 
+    // A wildcard over a whole public suffix of two labels, which the list
+    // need not name, and multi-tenant platforms the list does name.
+    for host in ["*.com.sg", "*.co.kr", "*.com.tw", "*.net.br", "*.org.il"] {
+        let f = edit(WILDCARD, &format!("\"{host}\""));
+        assert_eq!(fails(&f), (K::WildcardTooBroad, Some(7)), "{host}");
+    }
+    for s in [
+        "amplifyapp.com",
+        "elasticbeanstalk.com",
+        "azurefd.net",
+        "azurecontainerapps.io",
+        "aliyuncs.com",
+        "github.dev",
+        "ts.net",
+        "csb.app",
+        "myshopify.com",
+        "blogspot.com",
+    ] {
+        assert!(list.iter().any(|x| x == s), "{s} is missing from the list");
+    }
+
     // The list is what refuses them: without an entry for vercel.app the same
     // wildcard loads, and with an entry for example.net the fixture fails.
     let f = edit(WILDCARD, "\"*.vercel.app\"");
@@ -301,6 +322,66 @@ fn gate18_a_wildcard_under_a_multi_tenant_suffix_fails_to_load() {
     assert_eq!(
         (e.kind(), e.line()),
         (K::WildcardUnderMultiTenantSuffix, Some(7))
+    );
+}
+
+/// A wildcard over a multi-tenant suffix matches every tenant host under
+/// it, so it is refused like one under the suffix. The shipped list has
+/// two-label entries only, where the domain above is a top-level domain;
+/// these lists have deeper entries, as public-suffix private entries do.
+#[test]
+fn gate18_a_wildcard_over_a_multi_tenant_suffix_fails_to_load() {
+    const WILDCARD: &str = "\"*.example.net\"";
+    let list = b"tenants.example.net\napp.region.example.org\n";
+    let with = |file: &str| load_from(&[("example.toml", file.as_bytes()), (SUFFIX_FILE, list)]);
+    let host = |h: &str| {
+        edit(WILDCARD, &format!("\"{h}\"")).replacen(REQUEST_URL, "https://api.example.com/", 1)
+    };
+
+    // The fixture's *.example.net is over tenants.example.net: it would let a
+    // request reach evil.tenants.example.net.
+    let e = with(GOOD).unwrap_err();
+    assert_eq!(
+        (e.kind(), e.file(), e.line()),
+        (K::WildcardOverMultiTenantSuffix, "example.toml", Some(7))
+    );
+    // Over the parent and over the grandparent of a three-label entry.
+    for h in ["*.region.example.org", "*.example.org"] {
+        let e = with(&host(h)).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.line()),
+            (K::WildcardOverMultiTenantSuffix, Some(7)),
+            "{h}"
+        );
+    }
+    for h in ["*.tenants.example.net", "*.app.region.example.org"] {
+        let e = with(&host(h)).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.line()),
+            (K::WildcardUnderMultiTenantSuffix, Some(7)),
+            "{h}"
+        );
+    }
+    // A sibling of an entry loads, and covers no tenant host.
+    for (h, inside) in [
+        ("*.other.example.net", "a.other.example.net"),
+        ("*.other.region.example.org", "a.other.region.example.org"),
+    ] {
+        let r = with(&host(h)).unwrap();
+        let p = r.get("example").unwrap();
+        assert!(p.host_allowed(inside), "{h}");
+        assert!(!p.host_allowed("evil.tenants.example.net"), "{h}");
+        assert!(!p.host_allowed("evil.app.region.example.org"), "{h}");
+    }
+    // An exact tenant host is stored as it is.
+    assert!(with(&host("acme.tenants.example.net")).is_ok());
+    // Without the deep entries the fixture loads: the list is what refuses it.
+    assert!(
+        load_from(&[
+            ("example.toml", GOOD.as_bytes()),
+            (SUFFIX_FILE, b"# none\n")
+        ])
+        .is_ok()
     );
 }
 

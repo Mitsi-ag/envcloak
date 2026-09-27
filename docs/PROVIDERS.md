@@ -75,14 +75,19 @@ A provider with no test mode lists its keys as live: they act on the real accoun
 
 An allowed host is an exact host, `api.openai.com`, or a wildcard, `*.example.com`, which covers every host under `example.com` but not `example.com` itself. A host is a lowercase DNS name of two or more labels, at most 253 bytes, whose labels are letters, digits and `-` (not first or last) and whose last label starts with a letter. That leaves out IP addresses, ports, user names, trailing dots, uppercase and non-ASCII spellings, so the host a reviewer reads is the host the key goes to.
 
-A wildcard is refused:
+A wildcard is refused (`WildcardTooBroad`):
 
 - over a whole top-level domain (`*.com`);
-- under a multi-tenant suffix: its domain is on `providers/multi-tenant-suffixes.txt`, or is under a domain on it. `*.vercel.app` and `*.acme.vercel.app` are refused, while `*.vercel.app.example.com` and the exact host `acme.vercel.app` are not.
+- over a public suffix of two labels whose first label is a public second-level label (`ac`, `co`, `com`, `edu`, `gov`, `net`, `org` and the like): `*.co.kr` and `*.com.sg` cover domains anyone can register, whether or not the list names them.
+
+A wildcard is also refused when it overlaps the multi-tenant zone of a domain on `providers/multi-tenant-suffixes.txt`:
+
+- under a multi-tenant suffix (`WildcardUnderMultiTenantSuffix`): its domain is on the list, or is under a domain on it. `*.vercel.app` and `*.acme.vercel.app` are refused, while `*.vercel.app.example.com` and the exact host `acme.vercel.app` are not.
+- over a multi-tenant suffix (`WildcardOverMultiTenantSuffix`): a domain on the list is under its domain. With `tenants.example.net` on the list, `*.example.net` would match `evil.tenants.example.net`, so it is refused, while its sibling `*.other.example.net` is not.
 
 Under a multi-tenant suffix anyone can create a host, so a wildcard there would send the key to hosts anyone controls. A tenant's own host, such as `acme.supabase.co`, is stored on the item instead (SPEC §8).
 
-`providers/multi-tenant-suffixes.txt` holds one domain per line, lowercase, two or more labels; `#` starts a comment. It lists application and function hosting (`vercel.app`, `workers.dev`, `supabase.co`, ...), cloud platforms whose customers get subdomains (`amazonaws.com`, `azure.com`, `googleapis.com`, ...), code and page hosting (`github.io`, ...), and public suffixes of two labels under which anyone can register a domain (`co.uk`, `com.au`, ...).
+`providers/multi-tenant-suffixes.txt` holds one domain per line, lowercase, two or more labels; `#` starts a comment. It lists application and function hosting (`vercel.app`, `workers.dev`, `supabase.co`, `amplifyapp.com`, ...), cloud platforms whose customers get subdomains (`amazonaws.com`, `azure.com`, `googleapis.com`, `aliyuncs.com`, ...), code and page hosting (`github.io`, `github.dev`, ...), and public suffixes of two labels under which anyone can register a domain (`co.uk`, `com.au`, ...). The list is kept by hand, so a wildcard over a platform it misses would load. No shipped provider has a wildcard host (the crate's `embedded` test checks this), and a change that adds one is checked against the Public Suffix List in review.
 
 ### Auth slots
 
@@ -145,6 +150,7 @@ A registry error is a kind, the file and, where the parser recorded one, the lin
 | 18: a request host outside `allowed_hosts` fails to load, including hosts that only look allowed | `tests/loader.rs` |
 | 18: an `http://` URL fails to load, in a request or any link | `tests/loader.rs` |
 | 18: a wildcard under each multi-tenant suffix fails to load, and the list is what refuses it | `tests/loader.rs` |
+| 18: a wildcard over a multi-tenant suffix, or over a public suffix of two labels, fails to load | `tests/loader.rs` |
 | One bad provider fails the whole registry | `tests/loader.rs` |
 | The compiled registry is `providers/` byte for byte, and loads | `tests/embedded.rs` |
 | Detection over generated values, and the OpenAI and DeepSeek tie broken by the variable name | `tests/detect.rs` |

@@ -43,10 +43,14 @@ pub enum RegistryErrorKind {
     /// Not a lowercase DNS name of two or more labels, or `*.` and one.
     InvalidHost,
     DuplicateHost,
-    /// A wildcard over a whole top-level domain, such as `*.com`.
+    /// A wildcard over a whole top-level domain, such as `*.com`, or over a
+    /// public suffix of two labels, such as `*.co.kr`.
     WildcardTooBroad,
     /// A wildcard under a multi-tenant suffix, such as `*.vercel.app`.
     WildcardUnderMultiTenantSuffix,
+    /// A wildcard over a multi-tenant suffix: `*.example.net` when
+    /// `tenants.example.net` is on the list. It matches every tenant host.
+    WildcardOverMultiTenantSuffix,
     /// A URL that does not start with `https://`.
     NotHttps,
     InvalidUrl,
@@ -103,10 +107,17 @@ impl RegistryErrorKind {
                  no port, IP address or trailing dot"
             }
             K::DuplicateHost => "a host is listed twice",
-            K::WildcardTooBroad => "a wildcard host covers a whole top-level domain",
+            K::WildcardTooBroad => {
+                "a wildcard host covers a whole top-level domain or public suffix, such as *.com \
+                 or *.co.kr"
+            }
             K::WildcardUnderMultiTenantSuffix => {
                 "a wildcard host under a multi-tenant suffix is refused; store tenant hosts on \
                  the item"
+            }
+            K::WildcardOverMultiTenantSuffix => {
+                "a wildcard host over a multi-tenant suffix is refused: it covers every tenant \
+                 host under the suffix"
             }
             K::NotHttps => "URLs must start with https://",
             K::InvalidUrl => {
