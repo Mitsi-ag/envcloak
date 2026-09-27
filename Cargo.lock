@@ -274,7 +274,9 @@ name = "envcloak-policy"
 version = "0.1.0"
 dependencies = [
  "envcloak-core",
+ "envcloak-sys",
  "envcloak-testkit",
+ "libc",
  "secrecy",
  "sha2",
  "toml_edit",

@@ -83,7 +83,7 @@ Integers are big-endian. A byte string is a `u32` length then the bytes; text is
 
 **Prior list**: `version(1) count(1)`, then `u32 length || value` for each prior value, newest first. At most 3. Its count must equal the field's `prior_count`: unlock checks that the list is present exactly when the count is not 0, and a read or rotation of prior values while the vault is open checks both (a list set to NULL has no seal to fail).
 
-**Project**: `version(1) key(bytes) display_path manifest_sha256(32) count(4) (env_name reference)... last_seen(8)`.
+**Project**: `version(1) key(bytes) display_path manifest_sha256(32) count(4) (env_name reference)... last_seen(8)`. The key is the project's identity as [MANIFEST.md](MANIFEST.md) "Project identity" lays it out.
 
 Slugs are one or more parts separated by `/`; each part starts with a lowercase ASCII letter or digit and continues with those, `.`, `_` or `-`; at most 128 bytes. Field names start with a lowercase ASCII letter, digit or `_` and continue with those, `.` or `-`; at most 64 bytes.
 
