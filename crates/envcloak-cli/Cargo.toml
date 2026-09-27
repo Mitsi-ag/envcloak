@@ -11,3 +11,8 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+envcloak-sys.workspace = true
+
+[dev-dependencies]
+envcloak-sys = { workspace = true, features = ["testing"] }
+envcloak-testkit.workspace = true
