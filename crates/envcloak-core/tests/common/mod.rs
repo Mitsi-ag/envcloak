@@ -321,6 +321,28 @@ impl KitFixture {
     }
 }
 
+/// Commits 20 more items to `v`, whose file is `db`, and returns its WAL
+/// as it is on disk while the vault is open: what a daemon killed before a
+/// checkpoint leaves beside `vault.db`.
+pub fn later_wal(v: &mut Vault, db: &Path) -> Vec<u8> {
+    v.transact(|t| {
+        for i in 0..20 {
+            let item = t.create_item(secret_item(&format!("later/item-{i}")))?;
+            t.add_field(
+                item,
+                name("value"),
+                SecretBytes::copy_from(b"a value written later"),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let wal = std::fs::read(db.with_file_name("vault.db-wal")).unwrap();
+    // A 32-byte header, then frames of a 24-byte header and a page.
+    assert!(wal.len() > 32 + 24 + 4096, "the WAL holds frames");
+    wal
+}
+
 /// A passphrase that passes the rules and is no canary: `n` picks one.
 pub fn other_passphrase(n: u64) -> SecretBytes {
     SecretBytes::copy_from(format!("another passphrase, number {n}").as_bytes())

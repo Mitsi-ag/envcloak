@@ -192,13 +192,13 @@ A backup is written to `backups/.<name>.tmp` (created exclusively, not following
 5. The chunks are decrypted into `vault/.vault.db.new-<16 hex digits>` (created exclusively), the length is checked, the end of the file is required, and the file is synced.
 6. The temporary file is opened as a vault in rollback-journal mode and unlocked with the VMK. Its digest must verify, and its vault id, epoch, write counter and state digest must be the manifest's.
 7. The VMK is wrapped under the new passphrase with the current default parameters and a fresh salt, and one transaction makes that the only passphrase envelope (under the old one's unlocker id) and sets `recovery_confirmed`: the kit was just used. The file is closed, its journal removed, and it is synced.
-8. Only now is the current vault touched: its handle is closed, which folds in and removes its WAL; `vault.db` is hard-linked to `vault/replaced-<YYYYMMDDTHHMMSSZ>.db` (with a numeric suffix if that name is taken), and any side file of it is renamed along; the directory is synced.
+8. Only now is the current vault touched: its handle is closed, which folds in and removes its WAL; `vault.db` is hard-linked to `vault/replaced-<YYYYMMDDTHHMMSSZ>.db` (with a numeric suffix if that name, or one of its side files' names, is taken), and any side file of it is renamed along under the same name with its suffix. Side files left beside a missing `vault.db` (a WAL a killed daemon left before a checkpoint, say) are moved aside the same way: SQLite replays any WAL, and rolls back any hot journal, that it finds beside a database when it opens it, and a WAL is not tied to the file it was written for. The directory is synced.
 9. The temporary file is renamed over `vault.db`, and the directory is synced.
-10. The vault is opened and unlocked with the VMK.
+10. The vault is opened and unlocked with the VMK, and its digest must verify. If it does not open or verify (something changed the directory during the restore), the restore fails with "the backup was installed as the vault, but the installed vault did not open or verify" instead of handing back a vault it did not check; the replaced vault is still kept aside, and restoring again moves the failed file aside too.
 
 `vault.db` is the old vault until step 9 and the new one from then on; it is never missing. A crash before step 9 leaves the temporary file, which the next open or create removes, and possibly a second link to the old vault named `replaced-...`. `tests/restore_crash.rs` kills a restorer with `kill -9` after each step, at random moments within the step's measured duration, and checks each time that the vault opens with a verified digest and is exactly the old vault or exactly the restored one; it also restores where no vault exists.
 
-A restore assumes one writer: the daemon locks and drops its handle first, and its instance lock keeps any other EnvCloak process away while the files are swapped.
+The core library takes no lock across a restore or a create: a restore holds the old vault's SQLite lock only up to step 8, and none when there is no vault, and an open or create removes any `.vault.db.new-` file it finds, a restore's staging file included. The caller keeps every other EnvCloak process away for the whole call: the daemon runs both under its instance lock, after locking and dropping its own handle.
 
 ## Writes
 
@@ -212,7 +212,7 @@ A restore assumes one writer: the daemon locks and drops its handle first, and i
 
 ## Create
 
-`create` builds the database under a temporary name (`vault/.vault.db.new-<16 hex digits>`) in rollback-journal mode, commits, closes and syncs it, then hard-links it to `vault.db` (which fails if a vault is already there), removes the temporary name and syncs the directory. A crash leaves either no `vault.db` or a complete one. A leftover temporary name, and any side file of it, is removed by the next `create` or, once it holds the lock, by the next open (a crash between the link and the removal leaves it as a second link to the vault). A restore builds the new file under the same prefix (see Restore). The first open switches the file to WAL.
+`create` builds the database under a temporary name (`vault/.vault.db.new-<16 hex digits>`) in rollback-journal mode, commits, closes and syncs it, moves aside any side file left beside a missing `vault.db` (as a restore does, step 8), then hard-links it to `vault.db` (which fails if a vault is already there), removes the temporary name and syncs the directory. A crash leaves either no `vault.db` or a complete one. A leftover temporary name, and any side file of it, is removed by the next `create` or, once it holds the lock, by the next open (a crash between the link and the removal leaves it as a second link to the vault). A restore builds the new file under the same prefix (see Restore). The first open switches the file to WAL.
 
 ## Crash safety
 
@@ -238,6 +238,6 @@ Any failure, or a crash, rolls all of it back: the vault stays at its old versio
 | 11, storage part: no fixture in freed memory | `tests/vault_probe.rs` |
 | 3, unlocker part: one generic error for a wrong passphrase, a wrong kit or a damaged envelope; a passphrase change and a restore re-wrap with the current defaults | `tests/unlock.rs`, `tests/backup.rs` |
 | 4: after the passphrase is lost, the kit restores identical items; a wrong kit fails | `tests/recovery.rs` |
-| Backups: unusable without the kit, any change refused, a changed vault never backed up, a restored digest verifies | `tests/backup.rs` |
+| Backups: unusable without the kit, any change refused, a changed vault never backed up, a restored digest verifies (also next to side files left without a vault, and a restore that cannot verify what it installed fails) | `tests/backup.rs` |
 | Restore is atomic: `kill -9` leaves the old or the new vault | `tests/restore_crash.rs` |
 | 11, unlocker part: no passphrase, kit or fixture in freed memory | `tests/unlock_probe.rs` |

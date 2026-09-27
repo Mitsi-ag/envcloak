@@ -75,6 +75,10 @@ pub enum VaultErrorKind {
     /// EnvCloak vault backup. (A wrong Recovery Kit is
     /// [`CryptoErrorKind::Unlock`].)
     BackupDamaged,
+    /// A restore installed the backup as `vault.db`, but the installed
+    /// vault then failed to open or verify: something changed the vault
+    /// directory during the restore. The replaced vault is kept aside.
+    RestoreUnverified,
     /// An authenticated record failed to decode: a bug, not an attack.
     Corrupt,
 }
@@ -128,6 +132,9 @@ impl VaultErrorKind {
             VaultErrorKind::NoRecoveryKit => "the vault has no Recovery Kit unlocker",
             VaultErrorKind::BackupDamaged => {
                 "the backup file is damaged or truncated, or is not an EnvCloak vault backup"
+            }
+            VaultErrorKind::RestoreUnverified => {
+                "the backup was installed as the vault, but the installed vault did not open or verify"
             }
             VaultErrorKind::Corrupt => "a sealed vault record could not be decoded",
         }
@@ -226,6 +233,7 @@ mod tests {
             VaultErrorKind::Passphrase(PassphraseRejected::Common),
             VaultErrorKind::NoRecoveryKit,
             VaultErrorKind::BackupDamaged,
+            VaultErrorKind::RestoreUnverified,
         ] {
             let e = VaultError::from(k);
             assert_eq!(e.to_string(), k.message());

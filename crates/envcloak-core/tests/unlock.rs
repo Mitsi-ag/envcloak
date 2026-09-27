@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{KitFixture, other_passphrase};
+use common::{KitFixture, dir_names, later_wal, other_passphrase};
 use envcloak_core::crypto::{CryptoErrorKind, Envelope, KdfParams, UnlockerKind};
 use envcloak_core::vault::{Integrity, LockedVault, VaultErrorKind, VaultPaths};
 use envcloak_core::{PassphraseRejected, RecoveryKit, SecretBytes, create_vault};
@@ -98,6 +98,58 @@ fn create_vault_refuses_a_weak_passphrase_or_bad_parameters_before_writing() {
     let e = create_vault(&paths, &other_passphrase(1), low).unwrap_err();
     assert_eq!(e.kind(), VaultErrorKind::Crypto(CryptoErrorKind::KdfParams));
     assert!(!paths.data_dir.exists());
+}
+
+/// A WAL or journal left beside a missing `vault.db` is moved aside before
+/// the new vault is linked into place, so SQLite never replays it onto the
+/// new file, whether it was written for the vault that was there or for
+/// another one.
+#[test]
+fn create_vault_moves_aside_side_files_left_without_a_vault() {
+    let (f, mut v) = KitFixture::create();
+    let same = later_wal(&mut v, &f.db());
+    drop(v);
+    let (g, mut w) = KitFixture::create();
+    let other = later_wal(&mut w, &g.db());
+    drop(w);
+
+    let db = f.db();
+    for (n, (what, wal)) in [("same vault", &same), ("another vault", &other)]
+        .into_iter()
+        .enumerate()
+    {
+        std::fs::remove_file(&db).unwrap();
+        std::fs::write(db.with_file_name("vault.db-wal"), wal).unwrap();
+        std::fs::write(db.with_file_name("vault.db-journal"), b"stale journal").unwrap();
+        let pass = other_passphrase(10 + n as u64);
+        let (v, _kit) = create_vault(&f.paths, &pass, KdfParams::minimum()).unwrap();
+        assert_eq!(v.integrity(), Integrity::Ok, "{what}");
+        assert!(v.items().is_empty(), "{what}: a new vault is empty");
+        drop(v);
+
+        let names = dir_names(&f.paths.vault_dir);
+        let kept: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with("replaced-"))
+            .collect();
+        assert_eq!(kept.len(), 2 * (n + 1), "{what}: {names:?}");
+        let wal_kept = kept
+            .iter()
+            .filter(|k| k.ends_with(".db-wal"))
+            .map(|k| std::fs::read(f.paths.vault_dir.join(k)).unwrap())
+            .any(|b| b == *wal);
+        assert!(wal_kept, "{what}: the WAL is kept byte for byte");
+        assert!(names.contains(&"vault.db".to_owned()));
+
+        let v = f
+            .open()
+            .unlock_with_passphrase(&pass)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        assert_eq!(v.integrity(), Integrity::Ok, "{what}: reopened");
+        assert!(v.items().is_empty(), "{what}: reopened");
+    }
+    f.home.assert_clean(&f.cs);
 }
 
 // ------------------------------------------------------ gate 3

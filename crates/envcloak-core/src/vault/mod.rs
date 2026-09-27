@@ -21,6 +21,7 @@
 //!
 //! Errors are [`VaultError`]s with fixed messages and no values.
 
+mod aside;
 mod codec;
 mod error;
 mod integrity;
@@ -56,6 +57,7 @@ pub use paths::{PathError, PathErrorKind, Platform, VaultPaths, data_dir_for};
 pub use schema::{CURRENT_SCHEMA, StorageReport};
 pub use txn::Txn;
 
+pub(crate) use aside::{set_aside, utc_stamp, with_suffix};
 use integrity::{state_digest, unlocker_body};
 pub(crate) use paths::{check_private_dir, check_private_file};
 use state::{State, VaultCtx, item_key};
@@ -488,6 +490,11 @@ impl Vault {
     /// and linked into place, so `vault.db` either does not exist or is
     /// complete. Fails with [`VaultErrorKind::AlreadyExists`] if a vault is
     /// there.
+    ///
+    /// A side file left beside a missing `vault.db` (the WAL of a vault
+    /// whose file was deleted, say) is first moved aside to
+    /// `replaced-<UTC time>.db-wal` and so on: SQLite would otherwise
+    /// replay it onto the new file when it opens it.
     pub fn create(
         p: &VaultPaths,
         vault_id: VaultId,
@@ -525,7 +532,8 @@ impl Vault {
             .open(&tmp)?;
         let built = build_new(&tmp, vault_id, &vmk, &unlockers)
             .and_then(|()| Ok(std::fs::File::open(&tmp)?.sync_all()?));
-        let linked = built.and_then(|()| match std::fs::hard_link(&tmp, &db) {
+        let cleared = built.and_then(|()| set_aside(&dir));
+        let linked = cleared.and_then(|_| match std::fs::hard_link(&tmp, &db) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(VaultErrorKind::AlreadyExists.into())

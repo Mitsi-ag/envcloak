@@ -19,9 +19,10 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{
-    Fixture, KitFixture, Rng, assert_holds_canaries, dir_names, name, other_passphrase, secret_item,
+    Fixture, KitFixture, Rng, assert_holds_canaries, dir_names, later_wal, name, other_passphrase,
+    secret_item,
 };
-use envcloak_core::backup::{BACKUP_CHUNK, BACKUP_EXTENSION};
+use envcloak_core::backup::{BACKUP_CHUNK, BACKUP_EXTENSION, RestoreStep, restore_backup_observed};
 use envcloak_core::crypto::{CryptoErrorKind, Envelope, KdfParams, UnlockerKind};
 use envcloak_core::vault::{
     Integrity, ItemMeta, LockedVault, PathErrorKind, TamperKind, VaultErrorKind,
@@ -446,11 +447,12 @@ fn a_restore_moves_aside_a_file_that_is_not_a_vault() {
     let (v, report) = restore_backup(&f.paths, &info.path, &f.kit(), &other_passphrase(5)).unwrap();
     assert_eq!(v.items(), &items[..]);
     drop(v);
-    let kept = report.replaced.unwrap();
-    assert_eq!(std::fs::read(&kept).unwrap(), b"not a database at all");
-    let mut kept_wal = kept.clone().into_os_string();
-    kept_wal.push("-wal");
-    assert_eq!(std::fs::read(&kept_wal).unwrap(), b"not a wal");
+    let [kept, kept_wal] = &report.replaced[..] else {
+        panic!("{:?}", report.replaced);
+    };
+    assert_eq!(std::fs::read(kept).unwrap(), b"not a database at all");
+    assert_eq!(kept_wal.as_os_str(), &*format!("{}-wal", kept.display()));
+    assert_eq!(std::fs::read(kept_wal).unwrap(), b"not a wal");
     let kept_name = kept.file_name().unwrap().to_str().unwrap().to_owned();
     assert_eq!(
         dir_names(&f.paths.vault_dir),
@@ -460,6 +462,121 @@ fn a_restore_moves_aside_a_file_that_is_not_a_vault() {
             "vault.db".into()
         ]
     );
+}
+
+/// A WAL, shared-memory file or journal left beside a missing `vault.db`
+/// (a daemon killed before a checkpoint, then `vault.db` deleted) is moved
+/// aside and kept, never replayed onto the restored vault, whether it was
+/// written for the same vault or for another one.
+#[test]
+fn a_restore_moves_aside_side_files_left_without_a_vault() {
+    let (f, mut v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    let same = later_wal(&mut v, &f.db());
+    drop(v);
+    let (g, mut w) = KitFixture::create();
+    let other = later_wal(&mut w, &g.db());
+    drop(w);
+
+    let db = f.db();
+    let side = |suffix: &str| db.with_file_name(format!("vault.db{suffix}"));
+    for (what, wal) in [("same vault", &same), ("another vault", &other)] {
+        std::fs::remove_file(&db).unwrap();
+        std::fs::write(side("-wal"), wal).unwrap();
+        std::fs::write(side("-shm"), b"stale shared memory").unwrap();
+        std::fs::write(side("-journal"), b"stale journal").unwrap();
+        let mut before = dir_names(&f.paths.vault_dir);
+        before.retain(|n| !n.starts_with("vault.db"));
+
+        let (v, report) =
+            restore_backup(&f.paths, &info.path, &f.kit(), &other_passphrase(1)).unwrap();
+        assert_eq!(v.integrity(), Integrity::Ok, "{what}");
+        assert_eq!(v.items(), &items[..], "{what}");
+        assert_holds_canaries(&v, &f.cs);
+        drop(v);
+
+        let [wal_kept, shm_kept, journal_kept] = &report.replaced[..] else {
+            panic!("{what}: {:?}", report.replaced);
+        };
+        let kept = |p: &Path, suffix: &str| {
+            let n = p.file_name().unwrap().to_str().unwrap().to_owned();
+            assert!(
+                n.starts_with("replaced-") && n.ends_with(suffix),
+                "{what}: {n}"
+            );
+            assert_eq!(p.parent(), db.parent(), "{what}");
+            n
+        };
+        let mut want = before.clone();
+        want.push(kept(wal_kept, ".db-wal"));
+        want.push(kept(shm_kept, ".db-shm"));
+        want.push(kept(journal_kept, ".db-journal"));
+        want.push("vault.db".into());
+        want.sort();
+        assert_eq!(dir_names(&f.paths.vault_dir), want, "{what}");
+        assert_eq!(std::fs::read(wal_kept).unwrap(), *wal, "{what}");
+        assert_eq!(std::fs::read(shm_kept).unwrap(), b"stale shared memory");
+        assert_eq!(std::fs::read(journal_kept).unwrap(), b"stale journal");
+
+        let v = f.unlock();
+        assert_eq!(v.integrity(), Integrity::Ok, "{what}: reopened");
+        assert_eq!(v.items(), &items[..], "{what}: reopened");
+    }
+    f.home.assert_clean(&f.cs);
+}
+
+/// Should something put a WAL beside `vault.db` after the restore cleared
+/// the way, the installed vault no longer verifies. The restore then says
+/// so rather than hand back a vault it did not check, the replaced vault is
+/// still kept aside, and a second restore puts a verified vault in place.
+#[test]
+fn a_restore_fails_when_the_installed_vault_does_not_verify() {
+    let (f, mut v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    let wal = later_wal(&mut v, &f.db());
+    drop(v);
+    let old = std::fs::read(f.db()).unwrap();
+    let wal_path = f.db().with_file_name("vault.db-wal");
+
+    let e = restore_backup_observed(
+        &f.paths,
+        &info.path,
+        &f.kit(),
+        &other_passphrase(2),
+        &KdfParams::minimum(),
+        &mut |s| {
+            if s == RestoreStep::OldVaultKept {
+                std::fs::write(&wal_path, &wal).unwrap();
+            }
+        },
+    )
+    .unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::RestoreUnverified);
+    let kept: Vec<String> = dir_names(&f.paths.vault_dir)
+        .into_iter()
+        .filter(|n| n.starts_with("replaced-"))
+        .collect();
+    let [kept] = &kept[..] else {
+        panic!("{kept:?}");
+    };
+    assert_eq!(
+        std::fs::read(f.paths.vault_dir.join(kept)).unwrap(),
+        old,
+        "the replaced vault is kept"
+    );
+    // What is in place now does not verify (or does not open at all).
+    if let Ok(Ok(v)) = LockedVault::open(&f.paths).map(|l| l.unlock(f.vmk())) {
+        assert_ne!(v.integrity(), Integrity::Ok);
+    }
+
+    let (v, report) = restore_backup(&f.paths, &info.path, &f.kit(), &other_passphrase(3)).unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items(), &items[..]);
+    assert_eq!(report.replaced.len(), 1, "{:?}", report.replaced);
+    drop(v);
+    assert_eq!(f.unlock().integrity(), Integrity::Ok);
 }
 
 /// A restored vault can be backed up and restored again.

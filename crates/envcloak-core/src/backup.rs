@@ -24,15 +24,21 @@
 //! that the only passphrase envelope, records the kit as confirmed (it was
 //! just used), and closes the file. Only then does it touch the current
 //! vault: it closes it, keeps it as `vault/replaced-<UTC time>.db` (a hard
-//! link, so `vault.db` never goes missing), renames the new file over
+//! link, so `vault.db` never goes missing), moves aside any side file
+//! beside `vault.db` (also one left without a database, which SQLite would
+//! otherwise replay onto the new file), renames the new file over
 //! `vault.db`, and syncs the directory. A crash at any point leaves the
 //! old vault or the new one in place, never neither; leftovers are removed
-//! by the next open.
+//! by the next open. The installed vault is then opened again and must
+//! verify.
 //!
 //! Restore takes the vault's lock through [`LockedVault::open`], so it
-//! fails with [`VaultErrorKind::Busy`] while the vault is open: the daemon
-//! locks and closes its handle first, and its instance lock keeps any
-//! other writer away while the files are swapped.
+//! fails with [`VaultErrorKind::Busy`] while the vault is open. It takes no
+//! lock when there is no vault, and it releases the old vault's lock before
+//! the files are swapped; [`Vault::create`] takes none either. The caller
+//! must keep every other EnvCloak process away from the vault directory
+//! for the whole call: the daemon runs both under its instance lock, after
+//! locking and closing its own handle.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -52,8 +58,9 @@ use crate::recovery::RecoveryKit;
 use crate::secret::SecretBytes;
 use crate::unlock::{install_passphrase, passphrase_envelope, passphrase_unlockers};
 use crate::vault::{
-    DB_NAME, Integrity, LockedVault, SIDE_FILES, TEMP_PREFIX, Vault, VaultError, VaultErrorKind,
-    VaultPaths, check_private_dir, open_record, remove_temp, seal_record, sync_dir,
+    DB_NAME, Integrity, LockedVault, TEMP_PREFIX, Vault, VaultError, VaultErrorKind, VaultPaths,
+    check_private_dir, open_record, remove_temp, seal_record, set_aside, sync_dir, utc_stamp,
+    with_suffix,
 };
 
 /// The extension of backup files.
@@ -74,7 +81,6 @@ const MANIFEST_LEN: usize = 93;
 /// At most this many Recovery Kit envelopes are carried.
 const MAX_ENVELOPES: usize = 8;
 const BACKUP_PREFIX: &str = "vault-";
-const REPLACED_PREFIX: &str = "replaced-";
 
 /// A backup [`Vault::create_backup`] wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,8 +106,12 @@ pub struct RestoreReport {
     /// The vault's write counter when it was backed up.
     pub backup_write_counter: u64,
     pub items: usize,
-    /// Where the vault that was replaced now is, if there was one.
-    pub replaced: Option<PathBuf>,
+    /// Every file moved out of the new vault's way: the file that was
+    /// `vault.db`, now `vault/replaced-<UTC time>.db`, first, then its
+    /// side files under the same name with SQLite's suffixes (or only side
+    /// files, when they were left without a database). Empty when there
+    /// was nothing.
+    pub replaced: Vec<PathBuf>,
 }
 
 /// The points a restore passes, in order. Tests stop a restore at each
@@ -121,7 +131,8 @@ pub enum RestoreStep {
     StagingReady,
     /// The current vault is closed.
     OldVaultClosed,
-    /// The current vault is also linked as `replaced-<time>.db`.
+    /// The current vault is also linked as `replaced-<time>.db`, and any
+    /// side file beside `vault.db` is moved aside.
     OldVaultKept,
     /// The new vault is `vault.db`, and the directory is synced.
     Installed,
@@ -212,6 +223,11 @@ impl Vault {
 ///
 /// A current vault that is not an EnvCloak vault at all is moved aside
 /// too. See the module documentation for the order of the steps.
+///
+/// Fails with [`VaultErrorKind::RestoreUnverified`] when the backup was
+/// installed but the installed vault does not open or verify (something
+/// else changed the vault directory meanwhile): the vault is then the
+/// restored file, and the replaced one is kept aside.
 pub fn restore_backup(
     p: &VaultPaths,
     backup: &Path,
@@ -288,19 +304,22 @@ fn restore(
 
     drop(old);
     observe(RestoreStep::OldVaultClosed);
-    let db = dir.join(DB_NAME);
-    let replaced = if std::fs::symlink_metadata(&db).is_ok() {
-        Some(keep_old_vault(&dir, &db)?)
-    } else {
-        None
-    };
+    // Closing the old vault folded in and removed its WAL. Anything still
+    // beside `vault.db`, or left there without it, goes too.
+    let replaced = set_aside(&dir)?;
     observe(RestoreStep::OldVaultKept);
-    std::fs::rename(&staging.path, &db)?;
+    std::fs::rename(&staging.path, dir.join(DB_NAME))?;
     staging.disarm();
     sync_dir(&dir)?;
     observe(RestoreStep::Installed);
 
-    let vault = LockedVault::open(p)?.unlock(vmk).map_err(|(_, e)| e)?;
+    // The file verified under its temporary name; it must still verify
+    // under its own. A restore never hands back a vault it did not check.
+    let vault = LockedVault::open(p)
+        .and_then(|l| l.unlock(vmk).map_err(|(_, e)| e))
+        .ok()
+        .filter(|v| v.integrity() == Integrity::Ok)
+        .ok_or(VaultErrorKind::RestoreUnverified)?;
     Ok((
         vault,
         RestoreReport {
@@ -396,40 +415,6 @@ fn looks_like_a_vault(db: &Path) -> Result<bool, VaultError> {
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e.into()),
     }
-}
-
-/// Links the current vault file as `replaced-<time>.db` and moves any side
-/// file of it along, so the new file never meets the old one's WAL.
-fn keep_old_vault(dir: &Path, db: &Path) -> Result<PathBuf, VaultError> {
-    let stamp = utc_stamp(now_secs());
-    let mut n = 0u32;
-    let kept = loop {
-        let name = if n == 0 {
-            format!("{REPLACED_PREFIX}{stamp}.db")
-        } else {
-            format!("{REPLACED_PREFIX}{stamp}-{n}.db")
-        };
-        let target = dir.join(name);
-        match std::fs::hard_link(db, &target) {
-            Ok(()) => break target,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n += 1,
-            Err(e) => return Err(e.into()),
-        }
-    };
-    for side in SIDE_FILES {
-        let from = with_suffix(db, side);
-        if std::fs::symlink_metadata(&from).is_ok() {
-            std::fs::rename(&from, with_suffix(&kept, side))?;
-        }
-    }
-    sync_dir(dir)?;
-    Ok(kept)
-}
-
-fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
-    let mut s = p.as_os_str().to_owned();
-    s.push(suffix);
-    PathBuf::from(s)
 }
 
 /// The temporary file a restore builds the new vault in. Removed, with its
@@ -832,40 +817,9 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `YYYYMMDDTHHMMSSZ` for Unix seconds `secs`, in UTC.
-fn utc_stamp(secs: u64) -> String {
-    let days = i64::try_from(secs / 86_400).unwrap_or(0);
-    let rem = secs % 86_400;
-    let (hour, minute, second) = (rem / 3600, rem % 3600 / 60, rem % 60);
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn utc_stamps() {
-        for (secs, want) in [
-            (0, "19700101T000000Z"),
-            (951_782_400, "20000229T000000Z"),
-            (1_709_251_199, "20240229T235959Z"),
-            (1_790_000_000, "20260921T141320Z"),
-            (4_102_444_799, "20991231T235959Z"),
-        ] {
-            assert_eq!(utc_stamp(secs), want);
-        }
-    }
 
     #[test]
     fn layout_lengths() {

@@ -82,7 +82,7 @@ fn a_deleted_vault_is_restored_from_a_backup_with_the_kit() {
     assert_eq!(report.backup_write_counter, before_header.write_counter);
     assert_eq!(report.backup_created_at, info.created_at);
     assert_eq!(report.items, before.len());
-    assert_eq!(report.replaced, None);
+    assert!(report.replaced.is_empty(), "{:?}", report.replaced);
     drop(v);
 
     // The new passphrase opens it; the old one no longer does.
@@ -149,14 +149,16 @@ fn a_destroyed_passphrase_envelope_is_recovered_from_a_backup() {
     assert_eq!(v.items(), &before[..]);
     assert_holds_canaries(&v, &f.cs);
     drop(v);
-    let kept = report.replaced.expect("the replaced vault is kept");
+    let [kept] = &report.replaced[..] else {
+        panic!("the replaced vault is kept: {:?}", report.replaced);
+    };
     assert_eq!(kept.parent(), Some(f.db().parent().unwrap()));
     let name = kept.file_name().unwrap().to_str().unwrap().to_owned();
     assert!(
         name.starts_with("replaced-") && name.ends_with(".db"),
         "{name}"
     );
-    assert_eq!(std::fs::read(&kept).unwrap(), damaged, "kept byte for byte");
+    assert_eq!(std::fs::read(kept).unwrap(), damaged, "kept byte for byte");
     let mut names = dir_names(&f.paths.vault_dir);
     names.retain(|n| n != "vault.db-wal");
     assert_eq!(names, [name.as_str(), "vault.db"]);
