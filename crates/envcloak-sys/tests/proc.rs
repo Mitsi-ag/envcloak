@@ -290,6 +290,34 @@ fn with_argv(argv: &[&str], canary: &str) -> Child {
         .unwrap()
 }
 
+/// The arguments of a [`with_argv`] child, read once it runs xargs. On
+/// Linux, spawning can return while the child still shares its parent's
+/// memory (a vfork parent is woken before the child's new memory is
+/// installed) or before exec has set the new argument area, and `/proc`
+/// then shows the parent's arguments, or none.
+fn argv_once_exec_is_done(child: &Child) -> Vec<OsString> {
+    let pid = i32::try_from(child.id()).unwrap();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let runs_xargs = proc_info(pid)
+            .ok()
+            .and_then(|p| p.exe)
+            .is_some_and(|e| e.path.file_name() == Some("xargs".as_ref()));
+        // Every case has at least argv[0]; none is a new argument area not
+        // yet set.
+        let argv = if runs_xargs {
+            proc_argv(pid).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !argv.is_empty() {
+            return argv;
+        }
+        assert!(std::time::Instant::now() < end, "xargs did not start");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Review finding F-33: an empty `argv[0]`, or several leading empty
 /// arguments, are arguments, and the environment after them is never read
 /// as one.
@@ -312,10 +340,9 @@ fn empty_arguments_are_read_as_empty_and_the_environment_is_not() {
         &["xargs", "", "x"],
     ] {
         let mut child = with_argv(argv, &canary);
-        let got = proc_argv(i32::try_from(child.id()).unwrap());
+        let got = argv_once_exec_is_done(&child);
         let _ = child.kill();
         let _ = child.wait();
-        let got = got.unwrap();
         assert_eq!(got, argv, "{argv:?}");
         assert!(
             !got.iter().any(|a| a.to_string_lossy().contains(&canary)),
