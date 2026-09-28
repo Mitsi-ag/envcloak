@@ -519,6 +519,95 @@ fn remove_needs_the_passphrase_backs_up_first_and_ends_grants() {
     );
 }
 
+/// When the backup cannot be written, `items.remove` removes nothing
+/// (SPEC §10b): the answer is `backup_failed`, the item keeps its value
+/// and prior value, the grant that binds it stays in force, and the audit
+/// log records no removal. With the backups directory back, the same
+/// target is removed. (Ignoring the backup's error, or taking the backup
+/// after the delete, fails this test.)
+#[test]
+fn remove_removes_nothing_when_the_backup_cannot_be_written() {
+    let mut f = Fixture::new();
+    let grant = f.grant();
+    let mut c = client(&f.home);
+    let rotating = f.target("openai/acme-web");
+    c.items_rotate(
+        &rotating,
+        f.value(labels::OPENAI_API_KEY_ROTATED),
+        f.pass(),
+        &[],
+    )
+    .unwrap();
+    let target = f.target("openai/acme-web");
+
+    // A regular file where the backups directory goes: the vault's
+    // directory check refuses it, so no backup can be written.
+    let backups = data_dir(&f.home).join("backups");
+    if backups.exists() {
+        std::fs::remove_dir_all(&backups).unwrap();
+    }
+    std::fs::write(&backups, b"not a directory").unwrap();
+    let e = c.items_remove(&target, f.pass(), &[]).unwrap_err();
+    assert_eq!(rpc(e), (ErrorKind::BackupFailed, None));
+    let shown = c.items_show("openai/acme-web").unwrap();
+    assert_eq!(shown.id, target.item.id);
+    assert_eq!(shown.fields[0].prior_count, 1);
+    let grants = c.grants_list().unwrap();
+    assert_eq!(grants.grants.len(), 1);
+    assert_eq!(grants.grants[0].id, grant);
+    assert!(matches!(
+        f.run_decision().unwrap(),
+        DecisionView::Covered { .. }
+    ));
+    assert_eq!(c.status().unwrap().approvals.proof_failures, 0);
+
+    // The backups directory back: the removal goes ahead.
+    std::fs::remove_file(&backups).unwrap();
+    let removed = c.items_remove(&target, f.pass(), &[]).unwrap();
+    assert_eq!(removed.grants_ended, 1);
+    drop(c);
+    assert!(backups.join(&removed.backup).is_file());
+
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let removals: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::Remove)
+        .map(|e| e.record.decision.outcome.as_str())
+        .collect();
+    assert_eq!(removals, ["removed"]);
+    sweep_entries(&entries, &f.cs);
+    drop(v);
+    f.sweep();
+
+    // The backup taken on the second try holds the value and prior value
+    // the failed removal left in place.
+    let kit = RecoveryKit::parse(&SecretBytes::copy_from(f.kit.value())).unwrap();
+    let (restored, _) = restore_backup(
+        &VaultPaths::under(data_dir(&f.home)),
+        &backups.join(&removed.backup),
+        &kit,
+        &f.pass(),
+    )
+    .unwrap();
+    let item = restored
+        .find(&Slug::new("openai/acme-web").unwrap())
+        .unwrap();
+    let field = item.fields[0].id;
+    assert!(
+        restored
+            .read_value(field)
+            .unwrap()
+            .ct_eq(by_label(&f.cs, labels::OPENAI_API_KEY_ROTATED).value())
+    );
+    assert!(
+        restored
+            .read_prior(field, 0)
+            .unwrap()
+            .ct_eq(by_label(&f.cs, labels::OPENAI_API_KEY).value())
+    );
+}
+
 /// A caller whose environment claims an agent gives no proof: the target
 /// is not shown, and nothing is rotated or removed, before the passphrase
 /// is looked at (no attempt is counted).
