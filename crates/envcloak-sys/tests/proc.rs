@@ -41,12 +41,15 @@ struct Py {
     pid: i32,
 }
 
-const PY: &str = r#"import os, pty, socket, sys
+const PY: &str = r#"import os, pty, socket, sys, time
 how, sock = sys.argv[1], sys.argv[2]
-def run():
+def connect():
     if sock:
         s = socket.socket(socket.AF_UNIX)
         s.connect(sock)
+        return s
+def run():
+    s = connect()
     print('ready %d' % os.getpid(), flush=True)
     sys.stdin.read()
 if how == 'setsid':
@@ -56,10 +59,11 @@ elif how == 'pty':
     r, w = os.pipe()
     pid, fd = pty.fork()
     if pid == 0:
+        # Stays alive until the driver below kills it.
         os.close(r)
-        os.dup2(w, 1)
-        os.dup2(os.open('/dev/null', os.O_RDONLY), 0)
-        run()
+        s = connect()
+        os.write(w, b'ready %d\n' % os.getpid())
+        time.sleep(3600)
         sys.exit(0)
     os.close(w)
     out = os.fdopen(r)
@@ -102,7 +106,13 @@ impl Py {
 
 impl Drop for Py {
     fn drop(&mut self) {
+        // Closing stdin ends it (and the `pty` driver kills its child);
+        // kill it only if it does not end.
         drop(self.child.stdin.take());
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(self.child.try_wait(), Ok(None)) && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
