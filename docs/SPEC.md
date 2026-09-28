@@ -354,7 +354,7 @@ The manifest contains no secret values and is safe for agents to read. The manif
 1. The CLI finds the nearest `envcloak.toml` upward from the working directory.
 2. The CLI sends the manifest path, profile, requested bindings (`--ref`, `--env-file`) and argv. The daemon opens and canonicalizes the manifest itself (realpath, then `fstat` of the opened directory for device and inode) and resolves bindings from the file it read. It treats the client-supplied argv only as display text, and never uses manifest content supplied by the client.
 3. **Caller evidence.**
-   - The daemon walks the caller's ancestry from the kernel, recording each ancestor's pid, start time, executable path and code identity (macOS: Team ID, signing ID and cdhash; Linux: device, inode and SHA-256 of the executable).
+   - The daemon walks the caller's ancestry from the kernel, recording each ancestor's pid, start time, executable path and code identity (macOS: Team ID, signing ID and cdhash; Linux: device, inode and, from M2, SHA-256 of the executable). M1 records the Linux executable's device and inode only: hashing a large binary on every request needs a cache keyed by device, inode and change time, which M2 adds with the full agent catalog.
    - It classifies known agents by executable identity and interpreter arguments, using `integrations/agents.toml` plus any user extension files, which can only add entries.
    - Environment markers (`CLAUDECODE`, `CODEX_THREAD_ID` and so on) are recorded as the caller's own claims.
    - Evidence can only make handling stricter. A marker can turn a request into an agent request, but the absence of markers, or of an agent ancestor, never removes a restriction (§10a).

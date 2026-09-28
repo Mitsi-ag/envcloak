@@ -9,8 +9,8 @@
 //!   - macOS: `sysctl(KERN_PROC_PID)` (`kinfo_proc`), which unlike
 //!     `proc_pidinfo(PROC_PIDTBSDINFO)` also answers for processes of other
 //!     users (`login`, `launchd`); `getsid`; `proc_pidpath`; and the code
-//!     signature the kernel validated at exec (`csops`: signing identifier
-//!     and Team ID). Arguments come from `KERN_PROCARGS2`.
+//!     signature the kernel validated at exec (`csops`: signing identifier,
+//!     Team ID and cdhash). Arguments come from `KERN_PROCARGS2`.
 //!   - Linux: `/proc/<pid>/stat` and `status`, and `/proc/<pid>/exe` for
 //!     the executable's path and its device and inode. A process that made
 //!     itself non-dumpable (the EnvCloak CLI does) or belongs to another
@@ -69,6 +69,9 @@ pub const MAX_ARGV: usize = 64;
 /// would go past it is dropped, with every one after it.
 pub const MAX_ARGV_BYTES: usize = 16 * 1024;
 
+/// Bytes in a macOS code directory hash (`CS_CDHASH_LEN`).
+pub const CDHASH_LEN: usize = 20;
+
 /// The code signature a macOS kernel validated when the process started
 /// its current executable (`CS_VALID`). Evidence only: an ad hoc signature
 /// can carry any identifier.
@@ -79,6 +82,11 @@ pub struct CodeSignature {
     /// The Team ID of a Developer ID signature; `None` for ad hoc and
     /// platform signatures.
     pub team_id: Option<String>,
+    /// The code directory hash (cdhash) of the running executable, which
+    /// names its exact build (SPEC §6.1): the kernel's own record, so it
+    /// is the file the process runs even when the file on disk changed.
+    /// `None` when the kernel would not say.
+    pub cdhash: Option<[u8; CDHASH_LEN]>,
 }
 
 /// A process's executable.
@@ -89,7 +97,9 @@ pub struct ExeIdentity {
     /// file was removed).
     pub path: PathBuf,
     /// Linux: the device and inode of the file the process runs, read
-    /// through `/proc/<pid>/exe`. `None` on macOS.
+    /// through `/proc/<pid>/exe`. `None` on macOS. The executable's
+    /// SHA-256, which SPEC §6.1 also names, is deferred to M2 (see
+    /// docs/AGENTS.md "Limits").
     pub file: Option<(u64, u64)>,
     /// macOS: see [`CodeSignature`]. `None` on Linux and for unsigned or
     /// invalid signatures.

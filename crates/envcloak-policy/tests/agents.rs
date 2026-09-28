@@ -46,6 +46,7 @@ fn signed(path: &str, identifier: &str, team: Option<&str>) -> ProcInfo {
     p.exe.as_mut().unwrap().signature = Some(CodeSignature {
         identifier: identifier.to_owned(),
         team_id: team.map(str::to_owned),
+        cdhash: None,
     });
     p
 }

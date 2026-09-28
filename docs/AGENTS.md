@@ -67,7 +67,7 @@ The daemon identifies a caller at accept (docs/IPC.md): uid, pid and start time.
 |---|---|---|
 | Parent, start time, uid, controlling terminal, command name | `sysctl(KERN_PROC_PID)` (`kinfo_proc`), which answers for processes of other users (`login`, `launchd`) where `proc_pidinfo` refuses | `/proc/<pid>/stat` and `status` |
 | Session | `getsid` | `stat` field 6 |
-| Executable | `proc_pidpath`, and the code signature (`csops`) | `/proc/<pid>/exe`, with its device and inode |
+| Executable | `proc_pidpath`, and the code signature (`csops`: signing identifier, Team ID, cdhash) | `/proc/<pid>/exe`, with its device and inode |
 | Arguments | `KERN_PROCARGS2` | `/proc/<pid>/cmdline` |
 
 Neither kernel offers a race-free parent chain, so the walk is checked:
@@ -133,6 +133,7 @@ In each case the process's new request gets a root of its own, and a person appr
 - An agent that starts a pseudo-terminal of its own (`script`, `tmux`) and escapes into it creates a terminal session. SPEC §10a says a terminal subject never proves a person is there.
 - macOS records start times on the wall clock. A clock stepped backwards between a parent's start and its child's makes the walk fail its order check; the request is refused (`ancestry_changed`) until the processes restart.
 - On Linux, `/proc` mounted with `hidepid=1` or `hidepid=2` (some hardened distributions and shared hosts) hides other users' processes from the daemon, and nearly every chain has one (`sshd`, `login`, `init`). Every request is then refused with `ancestry_hidden`: closed, but EnvCloak does not work there. The mount's `gid=` option names a group whose members see every process; an administrator can add the user to it.
+- SPEC §6.1 names the executable's SHA-256 on Linux. M1 records its device and inode only (`ExeIdentity::file`); the hash, with a cache keyed by device, inode and change time so a large binary is not hashed on every request, comes in M2. On macOS the cdhash the kernel validated is recorded. Neither decides a match: matching uses pid and start time, and the catalog.
 - Any program running as the user can write `agents.d`. An extension that matches the user's shell makes every request from it an agent request and refuses its proofs: a denial of service, never a way to widen a grant.
 
 ## Tests

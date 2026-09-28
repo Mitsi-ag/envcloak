@@ -163,6 +163,39 @@ fn this_process_is_reported_as_the_kernel_sees_it() {
     assert_eq!(proc_info(own_pid()).unwrap(), me);
 }
 
+/// SPEC §6.1 (review finding F-35): on macOS each executable's cdhash is
+/// recorded as the kernel validated it, the one `codesign` reports for the
+/// running process, and two builds have two.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_cdhash_is_the_one_the_kernel_validated() {
+    fn codesign_cdhash(pid: i32) -> String {
+        let out = Command::new("/usr/bin/codesign")
+            .args(["-d", "-vvv", &pid.to_string()])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        text.lines()
+            .find_map(|l| l.strip_prefix("CDHash="))
+            .unwrap_or_else(|| panic!("no CDHash for {pid}: {text}"))
+            .to_owned()
+    }
+    fn recorded(pid: i32) -> [u8; envcloak_sys::CDHASH_LEN] {
+        let sig = proc_info(pid).unwrap().exe.unwrap().signature;
+        sig.unwrap_or_else(|| panic!("{pid} has a valid signature"))
+            .cdhash
+            .unwrap_or_else(|| panic!("{pid} has a cdhash"))
+    }
+    let hex = |h: &[u8]| h.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    // This test binary (the linker signs it ad hoc) and launchd (another
+    // user's platform binary).
+    let mine = recorded(own_pid());
+    assert_eq!(hex(&mine), codesign_cdhash(own_pid()));
+    let launchd = recorded(1);
+    assert_eq!(hex(&launchd), codesign_cdhash(1));
+    assert_ne!(mine, launchd);
+}
+
 #[test]
 fn the_top_of_the_tree_and_missing_processes() {
     // pid 1 runs as root: macOS's proc_pidinfo refuses it, kinfo_proc

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
-use super::{CodeSignature, ExeIdentity, ProcInfo, parse_procargs2};
+use super::{CDHASH_LEN, CodeSignature, ExeIdentity, ProcInfo, parse_procargs2};
 use crate::StartTime;
 
 /// `struct extern_proc` from `<sys/proc.h>`, LP64. Only a few fields are
@@ -166,6 +166,7 @@ unsafe extern "C" {
 }
 
 const CS_OPS_STATUS: libc::c_uint = 0;
+const CS_OPS_CDHASH: libc::c_uint = 5;
 const CS_OPS_IDENTITY: libc::c_uint = 11;
 const CS_OPS_TEAMID: libc::c_uint = 14;
 /// The kernel validated the signature and every page run so far.
@@ -226,6 +227,16 @@ fn cs_string(pid: i32, op: libc::c_uint) -> Option<String> {
     String::from_utf8(s.to_vec()).ok()
 }
 
+/// The code directory hash the kernel validated the running executable
+/// against (`CS_OPS_CDHASH`, which answers for any process).
+fn cdhash(pid: i32) -> Option<[u8; CDHASH_LEN]> {
+    let mut hash = [0u8; CDHASH_LEN];
+    // SAFETY: `hash` is writable for its length, which is passed; the
+    // kernel refuses any other size and writes exactly that many bytes.
+    let rc = unsafe { csops(pid, CS_OPS_CDHASH, hash.as_mut_ptr().cast(), hash.len()) };
+    (rc == 0).then_some(hash)
+}
+
 fn signature(pid: i32) -> Option<CodeSignature> {
     let mut flags: u32 = 0;
     // SAFETY: CS_OPS_STATUS writes one u32 into `flags`, whose size we pass.
@@ -243,6 +254,7 @@ fn signature(pid: i32) -> Option<CodeSignature> {
     Some(CodeSignature {
         identifier: cs_string(pid, CS_OPS_IDENTITY)?,
         team_id: cs_string(pid, CS_OPS_TEAMID),
+        cdhash: cdhash(pid),
     })
 }
 
