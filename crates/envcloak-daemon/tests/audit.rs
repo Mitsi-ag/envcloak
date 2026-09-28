@@ -16,10 +16,12 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
+use base64::Engine as _;
 use common::{MANIFEST, client, data_dir, passphrase, project, seed_vault, start};
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::{AuditEntry, AuditKind, ProblemKind, VerifyReport};
-use envcloak_core::vault::{LockedVault, VaultPaths};
+use envcloak_core::crypto::ItemClass;
+use envcloak_core::vault::{FieldName, ItemDetails, LockedVault, NewItem, Slug, VaultPaths};
 use envcloak_ipc::ClientError;
 use envcloak_ipc::proto::{ErrorKind, RunRequestParams};
 use envcloak_ipc::view::{AnchorState, AuditProblemKind, DecisionView};
@@ -37,15 +39,28 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with(|_| {}, MANIFEST)
+    }
+
+    /// The story's vault, then `more` done to it before the daemon starts,
+    /// and a project with `manifest`.
+    fn with(more: impl FnOnce(&mut envcloak_core::vault::Vault), manifest: &str) -> Self {
         common::terminal_session();
         let cs = canaries(fresh_seed());
         let home = TestHome::new();
         let kit = seed_vault(&home, &cs);
         let mut cs = cs;
         cs.push(kit);
+        let mut v = LockedVault::open(&VaultPaths::under(data_dir(&home)))
+            .unwrap()
+            .unlock_with_passphrase(&passphrase(&cs))
+            .map_err(|(_, e)| e)
+            .unwrap();
+        more(&mut v);
+        drop(v);
         let d = start(&home);
         client(&home).unlock(passphrase(&cs), &[]).unwrap();
-        let manifest = project(&home, "acme-web", MANIFEST);
+        let manifest = project(&home, "acme-web", manifest);
         Fixture {
             cs,
             home,
@@ -422,5 +437,76 @@ fn a_moved_segment_or_directory_does_not_take_a_delivery_with_it() {
     assert_eq!(entries[0].seq, 5);
     assert_eq!(entries[0].record.grant_id.as_deref(), Some(grant.as_str()));
     assert_eq!(saved, Some(6));
+    f.sweep(&entries);
+}
+
+/// Gate 33: the redactor does not look for a value under its 8-byte floor,
+/// raw or encoded, so a request that binds one keeps none of its command
+/// line; a value in an encoding the redactor covers (base64, hex) is masked
+/// like the raw one.
+#[test]
+fn a_short_value_withholds_the_command_line_and_an_encoded_one_is_masked() {
+    const PIN: &str = "Zq!7x";
+    let add_pin = |v: &mut envcloak_core::vault::Vault| {
+        v.transact(|t| {
+            let id = t.create_item(NewItem {
+                class: ItemClass::Secret,
+                slug: Slug::new("pin/acme-web").unwrap(),
+                details: ItemDetails {
+                    title: "pin".to_owned(),
+                    ..ItemDetails::default()
+                },
+            })?;
+            t.add_field(
+                id,
+                FieldName::new("value").unwrap(),
+                SecretBytes::copy_from(PIN.as_bytes()),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    };
+    let manifest = format!("{MANIFEST}\n[env.pin]\nPIN_CODE = \"pin/acme-web\"\n");
+    let mut f = Fixture::with(add_pin, &manifest);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let openai = f.value(labels::OPENAI_API_KEY);
+    let stripe = f.value(labels::STRIPE_SECRET_KEY);
+    let hex: String = stripe.bytes().map(|b| format!("{b:02x}")).collect();
+    pending(&f.request(
+        &[
+            "./emit".to_owned(),
+            format!("--b64={}", b64.encode(&openai)),
+            hex,
+        ],
+        None,
+    ));
+    let pin_b64 = b64.encode(PIN);
+    pending(&f.request(
+        &[
+            "./emit".to_owned(),
+            format!("--pin={PIN}"),
+            format!("--pin64={pin_b64}"),
+        ],
+        Some("pin"),
+    ));
+
+    let (entries, report, _) = f.stop_and_read();
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(
+        entries[1].record.argv_redacted,
+        vec![
+            "./emit",
+            "--b64=[envcloak:openai/acme-web]",
+            "[envcloak:stripe/acme-web]"
+        ]
+    );
+    assert_eq!(
+        entries[2].record.argv_redacted,
+        vec!["[envcloak: command line not kept: the request binds a value too short to mask]"]
+    );
+    for e in &entries {
+        let text = format!("{:?}", e.record);
+        assert!(!text.contains(PIN) && !text.contains(&pin_b64), "{text}");
+    }
     f.sweep(&entries);
 }

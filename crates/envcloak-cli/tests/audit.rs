@@ -9,7 +9,8 @@
 mod common;
 
 use common::{
-    outside_dir, run, run_on_terminal, secret_file, seed_vault, start_daemon, stderr, stdout,
+    data_dir, outside_dir, run, run_on_terminal, secret_file, seed_vault, start_daemon, stderr,
+    stdout,
 };
 use envcloak_testkit::{TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels};
 
@@ -142,6 +143,48 @@ fn audit_verify_reports_the_chain_the_anchor_and_tampering() {
 
     let usage = run(&home, &["audit", "list"], &[]);
     assert_eq!(usage.status.code(), Some(2));
+    assert_no_canary(&d.log_bytes(), &cs);
+    home.assert_clean(&cs);
+}
+
+/// `envcloak status` while the vault is unlocked but its audit log cannot
+/// be opened (a file is where its directory goes): one line says so, its
+/// words spaced as written.
+#[test]
+fn status_says_when_the_audit_log_is_unavailable() {
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let kit = seed_vault(&home, &cs);
+    let mut cs = cs;
+    cs.push(kit);
+    let d = start_daemon(&home);
+    let files = outside_dir();
+    let pass = secret_file(
+        files.path(),
+        "pass",
+        by_label(&cs, labels::VAULT_PASSPHRASE).value(),
+    );
+    let audit = data_dir(&home).join("audit");
+    if audit.exists() {
+        std::fs::remove_dir_all(&audit).unwrap();
+    }
+    std::fs::write(&audit, b"in the way").unwrap();
+    let o = run_on_terminal(
+        &home,
+        &["unlock", "--passphrase-fd", "3"],
+        &[(3, &pass, true)],
+    );
+    assert!(o.status.success(), "{}{}", stderr(&o), d.log());
+    let st = run(&home, &["status"], &[]);
+    assert!(st.status.success(), "{}", stderr(&st));
+    let out = stdout(&st);
+    assert!(
+        out.lines().any(|l| l
+            == "audit log: UNAVAILABLE: requests that would release values are denied until it \
+                can be written"),
+        "{out}"
+    );
+    assert_no_canary(&st.stdout, &cs);
     assert_no_canary(&d.log_bytes(), &cs);
     home.assert_clean(&cs);
 }

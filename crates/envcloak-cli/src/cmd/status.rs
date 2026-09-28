@@ -157,7 +157,8 @@ fn print_human(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
             audit.unanchored
         ),
         (false, _, VaultState::Unlocked) => println!(
-            "audit log: UNAVAILABLE: requests that would release values are denied until it can              be written"
+            "audit log: UNAVAILABLE: requests that would release values are denied until it can \
+             be written"
         ),
         _ => println!("audit log: closed while the vault is locked"),
     }

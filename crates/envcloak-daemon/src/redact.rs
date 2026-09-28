@@ -10,8 +10,11 @@
 //! 2. Every word a provider's key pattern matches is masked too
 //!    (`Registry::mask_keys`), for keys the request does not bind.
 //!
-//! Values shorter than the redactor's floor (8 bytes) are not masked, as
-//! everywhere else: they are refused for injection (SPEC §6.1 step 6).
+//! The redactor does not look for values shorter than its floor (8 bytes),
+//! nor for their encodings: they are refused for injection (SPEC §6.1 step
+//! 6). When the request binds such a value (and it is not empty), nothing
+//! of the command line is kept, since it could hold the value, raw or
+//! encoded, in any form.
 //!
 //! This file is on security/expose-allowlist.txt: it hands the request's
 //! values to the redactor. They stay in the daemon, and the redactor,
@@ -23,8 +26,14 @@ use envcloak_providers::Registry;
 use envcloak_redact::RedactorBuilder;
 use secrecy::ExposeSecret;
 
+/// What the entry keeps instead of a command line that could hold a value
+/// too short to mask.
+pub const SHORT_VALUE_WITHHELD: &str =
+    "[envcloak: command line not kept: the request binds a value too short to mask]";
+
 /// `argv` with every value in `values` (labelled by slug) and every
-/// key-shaped word masked.
+/// key-shaped word masked; or only [`SHORT_VALUE_WITHHELD`] when a value
+/// is too short for the redactor.
 pub fn redact_argv(
     argv: &[String],
     values: &[(String, SecretBytes)],
@@ -36,7 +45,13 @@ pub fn redact_argv(
         let bytes: &[u8] = v.expose_secret();
         builder = builder.secret(label.clone(), bytes);
     }
-    let (redactor, _) = builder.build();
+    let (redactor, report) = builder.build();
+    let short = values
+        .iter()
+        .any(|(label, v)| !v.is_empty() && report.skipped.contains(label));
+    if short {
+        return vec![SHORT_VALUE_WITHHELD.to_owned()];
+    }
     let each: Vec<String> = argv.iter().map(|a| redactor.redact_str(a)).collect();
     // Masking the arguments one by one gives the same line as masking the
     // whole line, unless a value runs across an argument boundary.
@@ -94,6 +109,37 @@ mod tests {
         let argv = strings(&["a value with a space", "a value", "with a space"]);
         let out = redact_argv(&argv, &[v("db/acme", "a value with a space")], None);
         assert_eq!(out, strings(&["[envcloak:db/acme] [envcloak:db/acme]"]));
+    }
+
+    /// A value in an encoding the redactor covers is masked like the raw
+    /// value.
+    #[test]
+    fn an_encoded_value_is_masked() {
+        use base64::Engine as _;
+        let secret = "a value with a space";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
+        let hex: String = secret.bytes().map(|b| format!("{b:02x}")).collect();
+        let argv = strings(&["./emit", &format!("--b64={b64}"), &hex]);
+        let out = redact_argv(&argv, &[v("db/acme", secret)], None);
+        assert_eq!(
+            out,
+            strings(&["./emit", "--b64=[envcloak:db/acme]", "[envcloak:db/acme]"])
+        );
+    }
+
+    /// A value under the redactor's floor could be anywhere in the command
+    /// line, raw or encoded, and would not be found: none of the command
+    /// line is kept. An empty value hides in nothing.
+    #[test]
+    fn a_value_too_short_to_mask_withholds_the_command_line() {
+        let argv = strings(&["./emit", "--pin=7391", "--pin64=NzM5MQ=="]);
+        let values = [v("db/acme", "a value with a space"), v("pin/acme", "7391")];
+        let out = redact_argv(&argv, &values, None);
+        assert_eq!(out, strings(&[SHORT_VALUE_WITHHELD]));
+        assert!(!out.concat().contains("7391") && !out.concat().contains("NzM5"));
+
+        let out = redact_argv(&argv, &[v("empty/acme", "")], None);
+        assert_eq!(out, argv);
     }
 
     #[test]
