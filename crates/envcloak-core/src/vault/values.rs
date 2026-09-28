@@ -221,7 +221,7 @@ mod tests {
         assert!(seal_priors(k, &aad(4), &four).is_err());
     }
 
-    /// Codex F-21: the stored list must agree with the authenticated count.
+    /// Review finding F-21: the stored list must agree with the authenticated count.
     /// A removed list (NULL) where the record counts priors, or a list of
     /// another length, is refused.
     #[test]

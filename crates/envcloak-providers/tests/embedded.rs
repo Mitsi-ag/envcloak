@@ -122,7 +122,7 @@ fn the_embedded_registry_loads() {
     let openai = r.get("openai").unwrap();
     assert!(openai.path_denied("/v1/organization/admin_api_keys"));
     assert!(!openai.path_denied("/v1/chat/completions"));
-    // Realtime routes that mint client secrets from the key (Codex F-27).
+    // Realtime routes that mint client secrets from the key (review finding F-27).
     for minting in [
         "/v1/realtime/client_secrets",
         "/v1/realtime/translations/client_secrets",

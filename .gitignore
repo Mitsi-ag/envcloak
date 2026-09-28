@@ -13,7 +13,7 @@ apps/macos/DerivedData/
 *.xcuserstate
 xcuserdata/
 
-# Claude <-> Codex review channel (local only)
+# Local review notes (never published)
 .collab/
 
 # Written and removed by scripts/check-unsafe-lint.sh

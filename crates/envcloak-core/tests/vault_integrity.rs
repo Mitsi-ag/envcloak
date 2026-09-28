@@ -428,7 +428,7 @@ fn altered_plaintext_columns_or_moved_ciphertext_open_read_only() {
         assert_read_only(v, want, keep_readable.then_some(p.keep), case);
     }
 
-    // Columns swapped between two rows (Codex F-20: read both originals
+    // Columns swapped between two rows (review finding F-20: read both originals
     // first, never a correlated UPDATE).
     let (a_id, b_id) = (unhex(&a), unhex(&b));
     let (keep_id, other_id) = (p.keep.as_bytes().to_vec(), p.other.as_bytes().to_vec());
@@ -803,7 +803,7 @@ fn unlocking_the_handle_kept_by_lock_reads_the_file_again() {
     );
 }
 
-/// Codex F-21: a field's prior list removed on disk while the vault is
+/// Review finding F-21: a field's prior list removed on disk while the vault is
 /// open. The authenticated prior count held since unlock says the list is
 /// there, so its absence is tampering whether a read or a rotation meets it
 /// first. The rotation is refused, so no digest vouches for the lost
