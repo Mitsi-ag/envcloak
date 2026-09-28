@@ -31,9 +31,9 @@
 //! - **Kind** ([`SubjectEvidence::kind`]), in this order:
 //!   1. a known agent in the ancestry: [`SubjectKind::Agent`];
 //!   2. no session leader in the chain, so the ancestry is lost (an
-//!      orphan, an escaped process), or a chain cut at [`MAX_ANCESTRY`]
-//!      processes, above which an agent may hide:
-//!      [`SubjectKind::Unknown`], whatever the claims say;
+//!      orphan, an escaped process) or never had one (pid 1's session), or
+//!      a chain cut at [`MAX_ANCESTRY`] processes, above which an agent
+//!      may hide: [`SubjectKind::Unknown`], whatever the claims say;
 //!   3. agent markers in the claims: [`SubjectKind::Agent`];
 //!   4. a session without a controlling terminal (`setsid`, a service, a
 //!      job launched by `launchd` or `systemd`): [`SubjectKind::Unknown`];
@@ -62,6 +62,9 @@
 //! cut chain fails closed: without a known agent below the cut its kind is
 //! [`SubjectKind::Unknown`] (no terminal grant covers it), and
 //! [`SubjectEvidence::agent_involved`] is true (its proofs are refused).
+//! So does an orphan ([`SubjectEvidence::orphaned`]): a command that
+//! double-forks out of an agent's tree keeps the terminal it had, and must
+//! not give a proof there that it may not give from inside.
 //!
 //! The Linux CLI makes itself non-dumpable, so its own `exe` is hidden
 //! from the daemon; its `stat` and `cmdline` are not, and the walk starts
@@ -443,12 +446,28 @@ impl SubjectEvidence {
             .or(self.claimed.as_ref())
     }
 
+    /// Whether the caller has lost its ancestry: its chain no longer
+    /// reaches its session's leader, as after a double fork or `nohup`
+    /// out of a terminal, or the leader's death. Whatever ran it is no
+    /// longer seen. pid 1's session without a controlling terminal, where
+    /// GUI apps and `launchd` jobs run on macOS, is not counted: pid 1
+    /// leads it and is in every chain. With a terminal (a container whose
+    /// init is a shell) it is, as a process there may have been
+    /// reparented to it.
+    pub fn orphaned(&self) -> bool {
+        self.session_leader.is_none() && (self.chain[0].sid != Some(1) || self.terminal)
+    }
+
     /// Whether an agent is or may be involved by any evidence: one in the
-    /// ancestry, markers in the claims, or a chain cut at [`MAX_ANCESTRY`]
+    /// ancestry, markers in the claims, an orphan's lost ancestry
+    /// ([`SubjectEvidence::orphaned`]) or a chain cut at [`MAX_ANCESTRY`]
     /// (an agent may be above the cut). Proofs (approve, unlock, rotate,
-    /// remove, recover) from such a caller are refused (SPEC §10b).
+    /// remove, recover) from such a caller are refused (SPEC §10b). An
+    /// orphan that keeps its terminal could otherwise prompt on it for a
+    /// proof that the same command, run inside its agent's tree, may not
+    /// give.
     pub fn agent_involved(&self) -> bool {
-        self.nearest_agent.is_some() || self.claims.claims_agent() || self.cut
+        self.nearest_agent.is_some() || self.claims.claims_agent() || self.cut || self.orphaned()
     }
 
     /// Whether a grant rooted at `root`, approved for a subject of kind

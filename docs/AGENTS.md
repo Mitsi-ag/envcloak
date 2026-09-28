@@ -113,7 +113,7 @@ Rule 1 may pick an agent above the caller's session, and must: Claude Code and C
 
 The remaining match rules (expiry, epochs, project, bindings, mode) are the grant store's (SPEC §10b).
 
-**Proofs** (approve, unlock, rotate, remove, recover) are refused from a caller with a known agent in its ancestry, agent markers in its claims, or a chain cut at 64 processes (SPEC §10b).
+**Proofs** (approve, unlock, rotate, remove, recover) are refused from a caller with a known agent in its ancestry, agent markers in its claims, an orphan's lost ancestry, or a chain cut at 64 processes (SPEC §10b). An orphan's chain no longer reaches its session's leader: a double fork or `nohup` out of a terminal keeps that terminal, and could prompt on it for a proof the same command may not give from inside its agent's tree. pid 1's session without a controlling terminal, where macOS runs GUI apps and `launchd` jobs, is not an orphan's (pid 1 leads it and is in every chain); with one (a container whose init is a shell), it is.
 
 **Claims** can turn a terminal subject into an agent subject and make its proofs refused (SPEC §10b); they never change the chain, the root or a lower kind. `CLAUDECODE=1` set in a person's shell therefore only tightens.
 
@@ -129,7 +129,7 @@ A process that leaves the tree loses every grant rooted in it (gate 26):
 | `launchctl submit` | Started by `launchd` | unknown |
 | `systemd-run --user` | Started by the user's service manager, leading its own session without a terminal | unknown |
 
-In each case the process's new request gets a root of its own, and a person approves it or not. `setsid` alone, without the parent exiting, leaves the process a child of its parent: it is still in the tree, and an agent's grant still covers it.
+In each case the process's new request gets a root of its own, and a person approves it or not. After a double fork or `nohup` it is an orphan, and its proofs are refused; after the others it has no terminal to prompt on. `setsid` alone, without the parent exiting, leaves the process a child of its parent: it is still in the tree, and an agent's grant still covers it.
 
 ## Limits
 

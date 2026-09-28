@@ -412,6 +412,9 @@ read x
     assert!(!orphan.covered_by(&leader, SubjectKind::Terminal));
     assert!(!orphan.covered_by(&leader, SubjectKind::Unknown));
     assert!(orphan.nearest_agent().is_none());
+    // It could prompt on that terminal: its proofs are refused.
+    assert!(orphan.orphaned());
+    assert!(orphan.agent_involved());
     s.finish();
 }
 
@@ -609,8 +612,16 @@ fn escape_case(escape: &str, extra: &[&str], own_session: Option<bool>) {
     assert!(!out.root().same(&root));
     assert!(!out.terminal());
     match own_session {
-        Some(true) => assert!(out.session_leader().unwrap().same(out.caller()), "{out:?}"),
-        Some(false) => assert!(out.session_leader().is_none(), "{out:?}"),
+        Some(true) => {
+            assert!(out.session_leader().unwrap().same(out.caller()), "{out:?}");
+            assert!(!out.orphaned());
+        }
+        Some(false) => {
+            assert!(out.session_leader().is_none(), "{out:?}");
+            // An orphan: its proofs are refused, as they were inside.
+            assert!(out.orphaned(), "{out:?}");
+            assert!(out.agent_involved(), "{out:?}");
+        }
         None => {}
     }
     s.finish();

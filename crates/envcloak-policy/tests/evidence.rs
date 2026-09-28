@@ -132,10 +132,13 @@ fn without_an_agent_the_session_leader_is_the_root() {
     assert!(!e.agent_involved());
     assert!(e.label().is_none());
 
-    // No controlling terminal (setsid, a service): unknown, same root.
+    // No controlling terminal (setsid, a service): unknown, same root. Its
+    // ancestry reaches its session leader: not an orphan.
     let e = ev(terminal_chain(None), false, &[]);
     assert_eq!(e.kind(), SubjectKind::Unknown);
     assert_eq!(e.root().pid, 70);
+    assert!(!e.orphaned());
+    assert!(!e.agent_involved());
 }
 
 #[test]
@@ -148,6 +151,19 @@ fn an_orphan_has_lost_its_ancestry() {
         assert!(e.session_leader().is_none());
         assert_eq!(e.kind(), SubjectKind::Unknown, "{claims:?}");
         assert_eq!(e.root().pid, 95, "the topmost in its session");
+        // Whatever ran it is no longer seen: its proofs are refused, as
+        // they were inside the agent's tree it may have left (SPEC §10b).
+        assert!(e.orphaned(), "{claims:?}");
+        assert!(e.agent_involved(), "{claims:?}");
+    }
+    // Without a terminal, or reparented to a subreaper, all the same.
+    for chain in [
+        vec![p(95, 70, None), p(1, 1, None)],
+        vec![p(95, 70, None), p(40, 40, None), p(1, 1, None)],
+    ] {
+        let e = ev(chain, false, &[]);
+        assert!(e.orphaned());
+        assert!(e.agent_involved());
     }
     // The session leader died; the topmost live ancestor in the session is
     // the root.
@@ -158,6 +174,25 @@ fn an_orphan_has_lost_its_ancestry() {
     );
     assert_eq!(e.kind(), SubjectKind::Unknown);
     assert_eq!(e.root().pid, 85);
+    assert!(e.orphaned());
+    assert!(e.agent_involved());
+    // The session is unknown: fail closed.
+    let e = SubjectEvidence::from_chain(
+        vec![
+            Ancestor {
+                sid: None,
+                ..p(95, 70, None)
+            },
+            p(1, 1, None),
+        ],
+        ChainEnd::Top,
+        false,
+        Claims::none(),
+        None,
+    )
+    .unwrap();
+    assert!(e.orphaned());
+    assert!(e.agent_involved());
 }
 
 #[test]
@@ -173,6 +208,14 @@ fn pid_1_is_never_a_root_nor_an_agent() {
     assert_eq!(e.root().pid, 50);
     assert_eq!(e.kind(), SubjectKind::Unknown);
     assert!(!e.covered_by(&inst(1, 10), SubjectKind::Unknown));
+    // It has lost nothing: pid 1 leads that session and is in the chain.
+    assert!(!e.orphaned());
+    assert!(!e.agent_involved());
+    // With a terminal, pid 1's session is a container's whose init is a
+    // shell; a process there may have been reparented to it.
+    let e = ev(vec![p(90, 1, None), p(1, 1, None)], true, &[]);
+    assert!(e.orphaned());
+    assert!(e.agent_involved());
 
     let e = ev(
         vec![p(90, 90, None), p(1, 1, builtin("claude-code"))],
