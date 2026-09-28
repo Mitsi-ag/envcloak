@@ -654,8 +654,16 @@ fn gate26_nohup_and_disown_escape_the_grant() {
     );
 }
 
+/// Whether the service-manager escapes may run. CI must run them (it sets
+/// the variable on both systems), so a missing variable there fails
+/// rather than skipping a gate case unseen: libtest hides what a passing
+/// test prints.
 fn service_manager_allowed() -> bool {
     if std::env::var_os("ENVCLOAK_TEST_SERVICE_MANAGER").is_none() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must set ENVCLOAK_TEST_SERVICE_MANAGER=1: gate 26 needs the service-manager escape"
+        );
         eprintln!("skipped: set ENVCLOAK_TEST_SERVICE_MANAGER=1 to submit a test job");
         return false;
     }
