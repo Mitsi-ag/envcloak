@@ -375,9 +375,12 @@ impl Scripted {
         self
     }
 
-    fn missing(mut self, pid: i32) -> Self {
-        self.answers
-            .insert(pid, vec![Err(io::ErrorKind::NotFound.into())]);
+    fn missing(self, pid: i32) -> Self {
+        self.refused(pid, io::ErrorKind::NotFound)
+    }
+
+    fn refused(mut self, pid: i32, kind: io::ErrorKind) -> Self {
+        self.answers.insert(pid, vec![Err(kind.into())]);
         self
     }
 }
@@ -508,7 +511,20 @@ fn a_parent_newer_than_its_child_is_a_reused_pid() {
 
 #[test]
 fn a_parent_that_vanished_mid_walk_is_a_change() {
-    let mut t = steady().missing(20);
+    // 20 exited after 30 was read: 30 has been reparented by the time 20's
+    // entry is gone.
+    let mut t = steady()
+        .missing(20)
+        .with(vec![Ok(info(30, 20, 300)), Ok(info(30, 1, 300))]);
+    assert_eq!(
+        ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),
+        AncestryError::Changed
+    );
+    // 30 exited too.
+    let mut t = steady().missing(20).with(vec![
+        Ok(info(30, 20, 300)),
+        Err(io::ErrorKind::NotFound.into()),
+    ]);
     assert_eq!(
         ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),
         AncestryError::Changed
@@ -522,6 +538,40 @@ fn a_parent_that_vanished_mid_walk_is_a_change() {
         ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),
         AncestryError::Changed
     );
+}
+
+/// Linux `/proc` mounted with `hidepid`: another user's parent cannot be
+/// read (`hidepid=2` hides it, `hidepid=1` refuses its files), and its
+/// child still names it. That is no change, and walking again would not
+/// help.
+#[test]
+fn a_parent_hidden_from_the_walk_is_hidden() {
+    for kind in [io::ErrorKind::NotFound, io::ErrorKind::PermissionDenied] {
+        let mut t = steady().refused(20, kind);
+        assert_eq!(
+            ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),
+            AncestryError::Hidden,
+            "{kind:?}"
+        );
+        // The peer's own parent.
+        let mut t = steady().refused(30, kind);
+        assert_eq!(
+            ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),
+            AncestryError::Hidden,
+            "{kind:?}"
+        );
+        // The peer exited meanwhile.
+        let mut t = steady().refused(30, kind).with(vec![
+            Ok(info(40, 30, 400)),
+            Err(io::ErrorKind::NotFound.into()),
+        ]);
+        assert_eq!(
+            ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),
+            AncestryError::PeerGone,
+            "{kind:?}"
+        );
+    }
+    assert!(!AncestryError::Hidden.message().is_empty());
 }
 
 #[test]

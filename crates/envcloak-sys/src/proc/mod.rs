@@ -30,7 +30,10 @@
 //!      entry that passes was the same process throughout, and each link
 //!      held when it was checked.
 //!
-//!   A change is [`AncestryError::Changed`]; the caller walks again.
+//!   A change is [`AncestryError::Changed`]; the caller walks again. A
+//!   parent that cannot be read while its child still names it is
+//!   [`AncestryError::Hidden`] (Linux `/proc` mounted with `hidepid`):
+//!   walking again would not help.
 //!
 //! Arguments can hold other programs' secrets (`--token=...`), and on macOS
 //! `KERN_PROCARGS2` returns the environment after them. So arguments are
@@ -143,6 +146,12 @@ pub enum AncestryError {
     /// session or terminal while the chain was read. Walking again sees
     /// the new state.
     Changed,
+    /// A parent in the chain exists but the kernel does not show it: its
+    /// child still names it after it could not be read. On Linux, `/proc`
+    /// mounted with `hidepid=1` or `hidepid=2` hides other users'
+    /// processes (`login`, `sshd`, `init`) from the daemon. Walking again
+    /// does not help.
+    Hidden,
     /// The kernel refused a read that should succeed.
     Io(io::ErrorKind),
 }
@@ -153,6 +162,10 @@ impl AncestryError {
         match self {
             AncestryError::PeerGone => "the caller exited before its ancestry could be read",
             AncestryError::Changed => "the caller's ancestry changed while it was read",
+            AncestryError::Hidden => {
+                "a process in the caller's ancestry is hidden from the daemon (Linux: /proc \
+                 mounted with hidepid)"
+            }
             AncestryError::Io(_) => "the caller's ancestry could not be read",
         }
     }
@@ -266,7 +279,8 @@ pub fn ancestry(
 /// # Errors
 /// [`AncestryError::PeerGone`] when the peer is not the process the socket
 /// reported, [`AncestryError::Changed`] when the chain changed under the
-/// walk, [`AncestryError::Io`] when a read failed otherwise.
+/// walk, [`AncestryError::Hidden`] when a parent is there but cannot be
+/// read, [`AncestryError::Io`] when a read failed otherwise.
 pub fn ancestry_in(
     table: &mut dyn ProcessTable,
     peer: &PeerIdentity,
@@ -289,9 +303,30 @@ pub fn ancestry_in(
         }
         let parent = match table.info(child.ppid) {
             Ok(p) => p,
-            // The parent exited after the child was read: the child is
-            // being reparented.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(AncestryError::Changed),
+            // Either the parent exited after the child was read, or the
+            // kernel hides it. A process's children are reparented when it
+            // exits, before its entry goes, so reading the child again
+            // tells them apart: still naming the parent, the parent is
+            // there but hidden.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                let (pid, ppid, start) = (child.pid, child.ppid, child.start_time);
+                return Err(match table.info(pid) {
+                    Ok(again) if again.ppid == ppid && again.start_time == start => {
+                        AncestryError::Hidden
+                    }
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => io(e),
+                    Ok(again) if pid == peer.pid && again.start_time != start => {
+                        AncestryError::PeerGone
+                    }
+                    Err(_) if pid == peer.pid => AncestryError::PeerGone,
+                    _ => AncestryError::Changed,
+                });
+            }
             Err(e) => return Err(io(e)),
         };
         if parent.pid != child.ppid || parent.start_time > child.start_time {

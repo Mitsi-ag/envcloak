@@ -236,6 +236,10 @@ pub enum EvidenceError {
     CallerGone,
     /// The ancestry kept changing while it was read.
     Changed,
+    /// A process in the ancestry is hidden from the daemon: on Linux,
+    /// `/proc` mounted with `hidepid` hides other users' processes. See
+    /// docs/AGENTS.md "Limits".
+    Hidden,
     /// The kernel refused a read.
     Io(std::io::ErrorKind),
 }
@@ -246,6 +250,7 @@ impl EvidenceError {
         match self {
             EvidenceError::CallerGone => "caller_gone",
             EvidenceError::Changed => "ancestry_changed",
+            EvidenceError::Hidden => "ancestry_hidden",
             EvidenceError::Io(_) => "ancestry_unreadable",
         }
     }
@@ -255,6 +260,10 @@ impl EvidenceError {
         match self {
             EvidenceError::CallerGone => "the caller exited before its ancestry could be read",
             EvidenceError::Changed => "the caller's ancestry kept changing while it was read",
+            EvidenceError::Hidden => {
+                "a process in the caller's ancestry is hidden from the daemon (Linux: /proc \
+                 mounted with hidepid)"
+            }
             EvidenceError::Io(_) => "the caller's ancestry could not be read",
         }
     }
@@ -265,6 +274,7 @@ impl From<AncestryError> for EvidenceError {
         match e {
             AncestryError::PeerGone => EvidenceError::CallerGone,
             AncestryError::Changed => EvidenceError::Changed,
+            AncestryError::Hidden => EvidenceError::Hidden,
             AncestryError::Io(k) => EvidenceError::Io(k),
         }
     }
@@ -494,7 +504,8 @@ fn classifiable(p: &ProcInfo, uid: u32) -> bool {
 /// # Errors
 /// [`EvidenceError::CallerGone`] when the peer is no longer the process
 /// that connected, [`EvidenceError::Changed`] when every walk saw a
-/// change, [`EvidenceError::Io`] when a read failed.
+/// change, [`EvidenceError::Hidden`] when the kernel hides an ancestor,
+/// [`EvidenceError::Io`] when a read failed.
 pub fn gather_in(
     table: &mut dyn ProcessTable,
     peer: &PeerIdentity,

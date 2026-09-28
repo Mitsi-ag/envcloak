@@ -660,6 +660,22 @@ fn an_ancestry_that_keeps_changing_is_refused() {
     assert_eq!(t.reads[&90], 2 * GATHER_ATTEMPTS);
 }
 
+/// Linux `/proc` mounted with `hidepid`: the caller's ancestors of
+/// another user (here 60, above zsh) are hidden. The request is refused as
+/// `ancestry_hidden`, at once, not as a change walked three times.
+#[test]
+fn a_hidden_ancestor_is_refused_as_hidden() {
+    let cat = AgentCatalog::builtin();
+    let mut t = Table::default()
+        .add(vec![info(90, 70, 70, 501, Some("/usr/local/bin/envcloak"))])
+        .add(vec![info(70, 60, 70, 501, Some("/bin/zsh"))]);
+    let err = gather_in(&mut t, &peer(90), Claims::none(), &cat).unwrap_err();
+    assert_eq!(err, EvidenceError::Hidden);
+    assert_eq!(err.token(), "ancestry_hidden");
+    assert!(err.to_string().contains("hidepid"), "{err}");
+    assert_eq!(t.reads[&90], 1, "one walk");
+}
+
 #[test]
 fn a_caller_that_is_gone_is_refused_at_once() {
     let cat = AgentCatalog::builtin();
