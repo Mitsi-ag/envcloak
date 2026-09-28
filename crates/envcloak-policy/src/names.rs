@@ -145,6 +145,44 @@ impl core::str::FromStr for Reference {
     }
 }
 
+/// The shortest run of ASCII letters and digits [`value_shaped`] takes for
+/// a generated key or token.
+pub const VALUE_RUN: usize = 24;
+
+/// Whether `s` looks like a value rather than a name a person chose: it
+/// holds a run of at least [`VALUE_RUN`] ASCII letters and digits that
+/// mixes two of lowercase, uppercase and digits, as generated keys and
+/// tokens do (a hex secret, the body of a `ghp_` or `sk_test_` key) and
+/// names rarely do. Names separate their words (`stripe/acme-live`,
+/// `OPENAI_API_KEY`, `a.person@example.com`).
+///
+/// Values are never taken on the command line (gate 13), so a name that
+/// looks like one was most likely pasted by mistake: commands refuse it
+/// without echoing it, and output shows a placeholder in its place. The
+/// check does not catch a value made of words; a provider's key pattern
+/// (`envcloak_providers::Registry::mask_keys`) catches more.
+pub fn value_shaped(s: &str) -> bool {
+    let (mut run, mut classes) = (0usize, 0u8);
+    for b in s.bytes() {
+        let class = if b.is_ascii_lowercase() {
+            1
+        } else if b.is_ascii_uppercase() {
+            2
+        } else if b.is_ascii_digit() {
+            4
+        } else {
+            (run, classes) = (0, 0);
+            continue;
+        };
+        run += 1;
+        classes |= class;
+        if run >= VALUE_RUN && classes.count_ones() >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
 /// One environment variable bound to one reference.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Binding {
@@ -165,5 +203,62 @@ impl Binding {
             env_name,
             reference: Reference::parse(reference)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generated keys and tokens are value-shaped, whatever their prefix;
+    /// the names people give items, variables and accounts are not.
+    #[test]
+    fn values_are_told_from_names() {
+        let seed = envcloak_testkit::fresh_seed();
+        for c in envcloak_testkit::canaries(seed) {
+            let shaped = value_shaped(c.as_str());
+            match c.label.as_str() {
+                // Words, and a short token: not shaped like a key.
+                envcloak_testkit::labels::VAULT_PASSPHRASE
+                | envcloak_testkit::labels::SHORT_TOKEN
+                | envcloak_testkit::labels::DATABASE_URL => {}
+                // The body of every generated key is one long run of mixed
+                // letters and digits, unless its random `-` and `_` cut
+                // every run short (the OpenAI shape), which a key pattern
+                // catches instead.
+                envcloak_testkit::labels::OPENAI_API_KEY
+                | envcloak_testkit::labels::OPENAI_API_KEY_ROTATED => {}
+                label => assert!(shaped, "{label} (seed {seed})"),
+            }
+        }
+        let hex: String = (0..40)
+            .map(|i| char::from(b"0123456789abcdef"[i * 7 % 16]))
+            .collect();
+        for v in [
+            hex.as_str(),
+            "AKIA0123456789ABCDEFGHIJ",
+            "x=ab12cd34ef56ab12cd34ef56",
+            "ab12cd34ef56ab12cd34ef56",
+            "QmFzZTY0IGlzIG5vdCBhIG5hbWU",
+            "aBcDeFgHiJkLmNoPqRsTuVwX",
+        ] {
+            assert!(value_shaped(v), "{v}");
+        }
+        for name in [
+            "openai/acme-web",
+            "stripe/acme-live-2024",
+            "OPENAI_API_KEY",
+            "a.person2024@example.com",
+            "acme-web",
+            "value",
+            "0123456789012345678901234567890123",
+            "abcdefghijklmnopqrstuvwxyzabcdefghij",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ",
+            "ab12cd34ef56ab12cd34ef5",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "",
+        ] {
+            assert!(!value_shaped(name), "{name}");
+        }
     }
 }

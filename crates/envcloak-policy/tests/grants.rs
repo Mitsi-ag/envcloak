@@ -876,6 +876,60 @@ fn revoke_lock_root_exit_and_epochs_end_grants() {
     assert_eq!(s.grants().count(), 0);
 }
 
+/// SPEC §10b "A grant ends on": deleting a bound item ends every grant
+/// that binds it, and every pending request that asks for it; grants and
+/// requests for other items stay.
+#[test]
+fn removing_an_item_ends_the_grants_and_requests_that_bind_it() {
+    let it = items();
+    let now = now_at(0);
+    let both = || {
+        request(
+            terminal(),
+            vec![
+                bound("OPENAI_API_KEY", &it[0]),
+                bound("STRIPE_SECRET_KEY", &it[1]),
+            ],
+            &["./emit"],
+        )
+    };
+    let stripe = || {
+        request(
+            under_agent(),
+            vec![bound("STRIPE_SECRET_KEY", &it[1])],
+            &["./emit"],
+        )
+    };
+    let github = || {
+        request(
+            under_agent(),
+            vec![bound("GITHUB_TOKEN", &it[2])],
+            &["./emit"],
+        )
+    };
+    let mut s = store();
+    let g_both = approve(&mut s, both(), session(60), &now).unwrap();
+    let g_stripe = approve(&mut s, stripe(), session(60), &now).unwrap();
+    // The same item for another project: no grant covers it, so it waits.
+    let mut other = stripe();
+    other.project = project("/src/other", 2, 200);
+    let waiting_stripe = pending_id(&s.decide(other, &now));
+    let waiting_github = pending_id(&s.decide(github(), &now));
+    assert_eq!(s.binding_item(it[1].item), 2);
+    assert_eq!(s.binding_item(it[2].item), 0);
+
+    assert_eq!(s.on_item_removed(it[1].item), 2);
+    assert!(s.grant(g_both).is_none());
+    assert!(s.grant(g_stripe).is_none());
+    assert!(s.pending_descriptor(&waiting_stripe, &now).is_none());
+    assert!(s.pending_descriptor(&waiting_github, &now).is_some());
+    assert_eq!(s.binding_item(it[1].item), 0);
+    // Nothing else binds it: removing it again ends nothing.
+    assert_eq!(s.on_item_removed(it[1].item), 0);
+    assert_eq!(s.on_item_removed(it[0].item), 0);
+    assert!(s.pending_descriptor(&waiting_github, &now).is_some());
+}
+
 // ---------------------------------------------------------- once grants
 
 /// Gate 30: a `once` grant covers exactly one request. The store is used

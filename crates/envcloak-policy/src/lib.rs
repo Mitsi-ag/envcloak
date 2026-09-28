@@ -74,7 +74,7 @@ pub use manifest::{
     AgentsPolicy, Manifest, ManifestError, ManifestErrorKind, ManifestPolicy, Mode, Origin,
     parse_manifest, resolve,
 };
-pub use names::{Binding, EnvName, ProfileName, Reference};
+pub use names::{Binding, EnvName, ProfileName, Reference, VALUE_RUN, value_shaped};
 pub use pending::{PENDING_TTL, Pending, PendingId};
 pub use project::{
     MANIFEST_NAME, Project, ProjectIdentity, find_manifest, load_project, project_identity,

@@ -154,6 +154,11 @@ impl EnvFileError {
         self.line
     }
 
+    /// The kind's fixed message, without the line.
+    pub fn message(&self) -> &'static str {
+        self.kind.message()
+    }
+
     /// The stable token `envcloak run` prints (SPEC §6.1 step 9).
     pub fn token(&self) -> &'static str {
         "binding_unresolved"

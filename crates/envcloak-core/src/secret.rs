@@ -66,6 +66,14 @@ impl SecretBytes {
     pub fn ct_eq_secret(&self, other: &SecretBytes) -> bool {
         self.ct_eq(other.0.expose_secret())
     }
+
+    /// Whether the value holds the byte `b` anywhere: a NUL, say, which no
+    /// environment variable can carry. One bit about the value, and never
+    /// where the byte is.
+    #[allow(clippy::disallowed_methods)] // Answers yes or no.
+    pub fn contains_byte(&self, b: u8) -> bool {
+        self.0.expose_secret().contains(&b)
+    }
 }
 
 #[allow(clippy::disallowed_methods)] // The one place SecretBytes is opened.
@@ -268,6 +276,15 @@ mod tests {
         assert!(s.ct_eq_secret(&SecretBytes::copy_from(b"value")));
         assert!(!s.ct_eq_secret(&SecretBytes::copy_from(b"valuE")));
         assert!(!s.ct_eq_secret(&SecretBytes::copy_from(b"value!")));
+    }
+
+    #[test]
+    fn contains_byte_finds_a_byte_anywhere() {
+        assert!(!SecretBytes::copy_from(b"value").contains_byte(0));
+        for v in [&b"\0value"[..], b"va\0lue", b"value\0", b"\0"] {
+            assert!(SecretBytes::copy_from(v).contains_byte(0), "{v:?}");
+        }
+        assert!(!SecretBytes::copy_from(b"").contains_byte(0));
     }
 
     #[test]

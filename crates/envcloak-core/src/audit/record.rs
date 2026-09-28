@@ -60,11 +60,19 @@ pub enum AuditKind {
     /// What the writer found when it opened the log: a torn last entry it
     /// removed, damage, or a log that ends before the vault's saved head.
     Log = 12,
+    /// An item was added (`envcloak add`). Adding needs no proof.
+    Add = 13,
+    /// An item's value was replaced (`envcloak rotate`), with a proof, or
+    /// the proof failed.
+    Rotate = 14,
+    /// An item was removed (`envcloak rm`), with a proof, or the proof
+    /// failed. The count says how many grants that ended.
+    Remove = 15,
 }
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 12] = [
+    pub const ALL: [AuditKind; 15] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -77,6 +85,9 @@ impl AuditKind {
         AuditKind::ProofRefused,
         AuditKind::Dropped,
         AuditKind::Log,
+        AuditKind::Add,
+        AuditKind::Rotate,
+        AuditKind::Remove,
     ];
 
     /// The kind's stable token.
@@ -94,6 +105,9 @@ impl AuditKind {
             AuditKind::ProofRefused => "proof_refused",
             AuditKind::Dropped => "dropped",
             AuditKind::Log => "log",
+            AuditKind::Add => "add",
+            AuditKind::Rotate => "rotate",
+            AuditKind::Remove => "remove",
         }
     }
 
@@ -399,7 +413,7 @@ mod tests {
             assert_eq!(AuditKind::from_u8(k as u8), Some(k));
         }
         assert_eq!(AuditKind::from_u8(0), None);
-        assert_eq!(AuditKind::from_u8(13), None);
+        assert_eq!(AuditKind::from_u8(16), None);
     }
 
     /// 100 KB of command line (gate 31's size) and long strings everywhere

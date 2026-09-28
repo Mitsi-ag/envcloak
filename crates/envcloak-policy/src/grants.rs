@@ -760,6 +760,28 @@ impl GrantStore {
         Ok(DenyOutcome { root_auto_denied })
     }
 
+    /// Item `item` was deleted (SPEC §10b "A grant ends on"): every grant
+    /// that binds it ends, and so does every pending request that asks for
+    /// it, which would otherwise be approved into a grant for an item that
+    /// is gone. Returns how many grants ended. An item created later under
+    /// the same slug has another id, so nothing approved before covers it.
+    pub fn on_item_removed(&mut self, item: ItemId) -> usize {
+        let before = self.grants.len();
+        self.grants
+            .retain(|_, g| !g.bindings.iter().any(|b| b.item == item));
+        self.pending
+            .retain(|_, p| !p.request.bindings.iter().any(|b| b.binding.item == item));
+        before - self.grants.len()
+    }
+
+    /// How many grants bind item `item`, for what `rm` says it will end.
+    pub fn binding_item(&self, item: ItemId) -> usize {
+        self.grants
+            .values()
+            .filter(|g| g.bindings.iter().any(|b| b.item == item))
+            .count()
+    }
+
     /// The vault locked: every grant and pending request ends. Denials
     /// and auto-denied roots stay.
     pub fn on_lock(&mut self) {
