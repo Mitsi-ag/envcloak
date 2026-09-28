@@ -11,6 +11,7 @@
 //!   the uid a trusted directory must belong to.
 //! - [`open_beneath`]: `openat` from a directory handle, never following a
 //!   symlink and never blocking on a FIFO.
+//! - [`sync_file`]: durable writes, with `F_FULLFSYNC` on macOS.
 //! - The daemon's socket and lifecycle: [`peer_identity`] and [`peer_uid`]
 //!   (who is on the other end of a Unix socket), [`try_lock_exclusive`]
 //!   (`flock`), [`TerminationSignals`] (`sigwait` on SIGTERM, SIGINT and
@@ -40,6 +41,7 @@ mod peer;
 mod perm;
 mod proc;
 mod signal;
+mod sync;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod tty;
@@ -65,4 +67,5 @@ pub use proc::{
     proc_info, reaches_top,
 };
 pub use signal::{TerminationSignals, TerminationWatch, exit_by_signal, termination_recorded};
+pub use sync::{SyncMethod, sync_file};
 pub use tty::{SecretInput, wait_readable};

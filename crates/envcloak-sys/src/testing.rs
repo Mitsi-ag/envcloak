@@ -1,6 +1,9 @@
 //! Test support, behind the `testing` feature. Release binaries never enable
 //! it.
 //!
+//! [`sync_counts`] is the counting shim for durable writes: how many
+//! `F_FULLFSYNC` and `fsync` calls [`crate::sync_file`] made on this thread.
+//!
 //! [`ProbeAllocator`] is the inspection allocator for the allocator probe
 //! (SPEC §15.2 gate 11). A test binary installs it as its global allocator
 //! and brackets the code under test with a [`ProbeSession`]:
@@ -561,6 +564,38 @@ unsafe impl GlobalAlloc for ProbeAllocator {
             new_ptr
         })
     }
+}
+
+/// How many times [`crate::sync_file`] made each call on one thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncCounts {
+    /// Successful `fcntl(F_FULLFSYNC)` calls (macOS).
+    pub full_fsync: u64,
+    /// Successful `fsync` calls.
+    pub fsync: u64,
+}
+
+thread_local! {
+    static SYNCS: core::cell::Cell<SyncCounts> = const {
+        core::cell::Cell::new(SyncCounts { full_fsync: 0, fsync: 0 })
+    };
+}
+
+/// The successful [`crate::sync_file`] calls this thread has made so far,
+/// by kind: the counting shim a test reads before and after a write path.
+pub fn sync_counts() -> SyncCounts {
+    SYNCS.with(core::cell::Cell::get)
+}
+
+pub(crate) fn note_sync(m: crate::SyncMethod) {
+    SYNCS.with(|c| {
+        let mut n = c.get();
+        match m {
+            crate::SyncMethod::FullFsync => n.full_fsync += 1,
+            crate::SyncMethod::Fsync => n.fsync += 1,
+        }
+        c.set(n);
+    });
 }
 
 /// Linux: whether [`crate::peer_identity`] skips `SO_PEERPIDFD` and takes
