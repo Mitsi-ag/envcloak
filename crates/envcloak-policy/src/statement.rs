@@ -114,9 +114,11 @@ pub struct BindingSummary {
     pub classification: String,
     /// No adopted project uses the item yet (SPEC §6.4).
     pub first_use: bool,
-    /// A grant in force for this process tree and project already covers
-    /// this binding: the request asks again only because of the others
-    /// (SPEC §10b "prompts for the difference").
+    /// A session grant in force for this process tree and project covered
+    /// this binding when the request was made: the request asks again
+    /// only because of the others (SPEC §10b "prompts for the
+    /// difference"). The new grant holds it too, for its own uses and
+    /// length.
     pub granted: bool,
 }
 
@@ -372,8 +374,9 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
         e(&p.project.manifest_sha256)
     );
     // The difference first: what no grant in force covers. The bindings
-    // a grant already covers follow, so the statement still shows all the
-    // new grant will hold.
+    // a grant already covered follow, under a heading that says this grant
+    // holds them too, for its own uses and length: the statement shows
+    // all the new grant will hold.
     let (new, granted): (Vec<&BindingSummary>, Vec<&BindingSummary>) =
         p.bindings.iter().partition(|b| !b.granted);
     if granted.is_empty() {
@@ -391,7 +394,8 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
     if !granted.is_empty() {
         let _ = writeln!(
             t,
-            "  bindings a grant for this process tree and project already covers:"
+            "  also held by this grant (a grant for this process tree and project covered \
+             them when this was asked):"
         );
         for b in &granted {
             t.push_str(&binding_line(b, o));

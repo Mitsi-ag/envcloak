@@ -71,7 +71,8 @@ pub struct Pending {
 
 impl Pending {
     /// Opens `request` as pending request `id` at `now`. `granted` says,
-    /// binding by binding, whether a grant in force already covers it.
+    /// binding by binding, whether a session grant in force already covers
+    /// it.
     pub(crate) fn open(
         id: PendingId,
         request: AccessRequest,

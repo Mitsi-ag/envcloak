@@ -611,6 +611,58 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
             .unwrap();
         assert_eq!(s.grant(g2).unwrap().bindings.len(), n);
     }
+    // A `once` grant marks nothing: it ends at its next use, so the new
+    // grant is what would hold those bindings. The statement asks for all
+    // of them.
+    let mut once_store = store();
+    let once = approve(
+        &mut once_store,
+        request(under_agent(), two(), &["./emit"]),
+        ApprovalOptions {
+            uses: Uses::Once,
+            ttl_secs: 3600,
+            live: Vec::new(),
+        },
+        &now,
+    )
+    .unwrap();
+    let mut three = two();
+    three.push(bound("GITHUB_TOKEN", &it[2]));
+    let id =
+        pending_id(&once_store.decide(request(under_agent(), three.clone(), &["./emit"]), &now));
+    assert!(
+        once_store
+            .pending_descriptor(&id, &now)
+            .unwrap()
+            .bindings
+            .iter()
+            .all(|b| !b.granted)
+    );
+    // A session grant's bindings are marked; the once grant's still are
+    // not.
+    approve(
+        &mut once_store,
+        request(
+            under_agent(),
+            vec![bound("GITHUB_TOKEN", &it[2])],
+            &["./emit"],
+        ),
+        session(3600),
+        &now,
+    )
+    .unwrap();
+    let id = pending_id(&once_store.decide(request(under_agent(), three, &["./emit", "2"]), &now));
+    let granted: Vec<&str> = once_store
+        .pending_descriptor(&id, &now)
+        .unwrap()
+        .bindings
+        .iter()
+        .filter(|b| b.granted)
+        .map(|b| b.env_name.as_str())
+        .collect();
+    assert_eq!(granted, vec!["GITHUB_TOKEN"]);
+    assert!(once_store.grant(once).is_some());
+
     // A grant held by another root, or for another project, marks
     // nothing: another agent's request asks for everything.
     let mut s3 = store();

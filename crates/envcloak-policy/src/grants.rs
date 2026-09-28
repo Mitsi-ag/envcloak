@@ -25,8 +25,9 @@
 //! A manifest change that leaves the bindings a subset does not prompt;
 //! the daemon audits the new hash. Any added or changed binding prompts
 //! for the difference: the statement asks for the bindings no grant in
-//! force for the caller and project covers, and lists the ones a grant
-//! already covers apart, since the new grant holds the whole request.
+//! force for the caller and project covers, and lists the ones a session
+//! grant already covers apart, since the new grant holds the whole
+//! request.
 //!
 //! **Lifetimes.** Grants last [`DEFAULT_TTL`] by default; agent grants
 //! [`MAX_AGENT_TTL`] at most, and terminal and unknown ones
@@ -521,14 +522,20 @@ impl GrantStore {
             .map(|g| g.id)
     }
 
-    /// For each binding of `r`, whether a grant in force for its caller,
-    /// project and mode already holds it: what the statement lists apart
-    /// from the difference it asks for.
+    /// For each binding of `r`, whether a session grant in force for its
+    /// caller, project and mode already holds it: what the statement lists
+    /// apart from the difference it asks for. A `once` grant does not
+    /// count: it ends at its next use, so the new grant would be what
+    /// holds the binding from then on.
     fn granted_bindings(&self, r: &AccessRequest, now: &Now) -> Vec<bool> {
         let grants: Vec<&Grant> = self
             .grants
             .values()
-            .filter(|g| self.in_force_for(g, r, now) && g.covers_project_and_mode(r))
+            .filter(|g| {
+                g.uses == Uses::Session
+                    && self.in_force_for(g, r, now)
+                    && g.covers_project_and_mode(r)
+            })
             .collect();
         r.bindings
             .iter()

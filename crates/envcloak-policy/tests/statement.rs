@@ -248,13 +248,14 @@ fn descriptors_and_options_cross_the_wire_as_json() {
 
 /// Gate 28's statement: when a grant already covers some of a request's
 /// bindings, the statement asks for the difference first and lists the
-/// rest apart; the new grant holds them all, so all are shown.
+/// rest apart, saying the new grant holds them too, so a person sees all
+/// the passphrase grants.
 #[test]
 fn the_statement_asks_for_the_difference_first() {
     let d = descriptor(strings(&["./emit"]));
     let text = render_statement(&d, &opts());
     assert!(text.contains("  bindings (inject mode):"), "{text}");
-    assert!(!text.contains("already covers"), "{text}");
+    assert!(!text.contains("also held by this grant"), "{text}");
 
     let mut d = d;
     d.bindings[0].granted = true;
@@ -263,7 +264,7 @@ fn the_statement_asks_for_the_difference_first() {
         .find("which this asks for:")
         .unwrap_or_else(|| panic!("{text}"));
     let covered = text
-        .find("already covers:")
+        .find("  also held by this grant (")
         .unwrap_or_else(|| panic!("{text}"));
     let stripe = text.find("STRIPE_SECRET_KEY = ").unwrap();
     let openai = text.find("OPENAI_API_KEY = ").unwrap();
