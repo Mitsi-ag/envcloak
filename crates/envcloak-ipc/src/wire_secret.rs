@@ -103,13 +103,20 @@ impl<'de> Visitor<'de> for SecretVisitor {
 }
 
 /// Decodes standard padded base64 into an exact-size secret, or `None`.
+/// Each chunk is decoded as a value of its own, which may end in padding,
+/// so a chunk before the last must hold none: padding belongs to the final
+/// quantum only (RFC 4648 §4).
 fn decode(text: &[u8]) -> Option<SecretBytes> {
     if text.len() % 4 != 0 {
         return None;
     }
     let mut out = SecretBuf::with_capacity(base64::decoded_len_estimate(text.len()));
     let mut step = Zeroizing::new([0u8; CHUNK / 4 * 3]);
-    for chunk in text.chunks(CHUNK) {
+    let mut chunks = text.chunks(CHUNK).peekable();
+    while let Some(chunk) = chunks.next() {
+        if chunks.peek().is_some() && chunk.contains(&b'=') {
+            return None;
+        }
         let n = STANDARD.decode_slice(chunk, &mut step[..]).ok()?;
         out.extend(step.get(..n)?).ok()?;
     }
@@ -160,6 +167,51 @@ mod tests {
         }
         // Non-canonical trailing bits.
         assert!(serde_json::from_str::<WireSecret>("\"aGl=\"").is_err());
+    }
+
+    fn decoded(text: &str) -> Option<Vec<u8>> {
+        decode(text.as_bytes()).map(|v| v.expose_secret().to_vec())
+    }
+
+    /// Padding belongs to the final quantum only (RFC 4648 §4). A value is
+    /// decoded 1024 symbols at a time, so padding that ends an inner chunk
+    /// must be refused just as decoding the whole string at once refuses
+    /// it (F-30). Padded quanta are put just before, at and after the
+    /// first and second chunk boundaries, with and without more symbols
+    /// after them; the whole-string decoder is the oracle.
+    #[test]
+    fn padding_is_refused_anywhere_but_the_end() {
+        let mut refused = 0;
+        for prefix in (1000..=1040).chain(2030..=2060).step_by(4) {
+            for quantum in ["AAAA", "AAA=", "AA==", "A===", "===="] {
+                for suffix in ["", "AAAA", "AAAAAAAA", "AA=="] {
+                    let text = format!("{}{quantum}{suffix}", "A".repeat(prefix));
+                    let want = STANDARD.decode(&text).ok();
+                    let got = decoded(&text);
+                    assert!(
+                        got == want,
+                        "prefix {prefix} {quantum} {suffix}: accepted {}, whole-string {}",
+                        got.is_some(),
+                        want.is_some()
+                    );
+                    refused += usize::from(want.is_none());
+                }
+            }
+        }
+        assert!(refused > 0);
+        // The case F-30 found: 1022 symbols, padding, then one more quantum.
+        let text = format!("{}==AAAA", "A".repeat(1022));
+        assert_eq!(decoded(&text), None);
+    }
+
+    /// Values whose base64 spans one, two and three chunks, and lengths
+    /// around each boundary, round-trip.
+    #[test]
+    fn values_around_the_chunk_boundaries_round_trip() {
+        for len in (760..=776).chain(1530..=1542).chain([2303, 2304, 2305]) {
+            let v: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            assert_eq!(round_trip(&v), v, "{len}");
+        }
     }
 
     #[test]
