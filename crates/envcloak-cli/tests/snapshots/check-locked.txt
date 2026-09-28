@@ -1,0 +1,9 @@
+exit: 1
+--- stdout
+manifest: <ROOT>/acme-web/envcloak.toml
+references: not checked: the vault is locked; run `envcloak unlock`
+env files:
+  .env.example: no key-shaped values
+result: the references were not checked
+--- stderr
+envcloak: check_failed: the check found problems; the report above says which

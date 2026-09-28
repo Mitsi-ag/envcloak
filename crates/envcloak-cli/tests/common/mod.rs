@@ -74,15 +74,19 @@ os.execv(sys.argv[2], sys.argv[2:])
 /// with the descriptors named in argv[1] opened as [`DETACH`] opens them.
 /// Its stdout and stderr stay this wrapper's, so a test reads them apart;
 /// its stdin is the terminal, where nothing is typed (on macOS a session
-/// whose terminal no process holds open loses it). What it writes to the
-/// terminal is read and dropped. Exits with the command's code, or 128
-/// plus the signal that ended it.
+/// whose terminal no process holds open loses it). When argv[1] puts a
+/// file on descriptor 0, the terminal stays open on descriptor 9 for the
+/// same reason. What it writes to the terminal is read and dropped. Exits
+/// with the command's code, or 128 plus the signal that ended it.
 const ON_TERMINAL: &str = "import os, pty, select, sys
 out, err = os.dup(1), os.dup(2)
 pid, fd = pty.fork()
 if pid == 0:
     os.dup2(out, 1)
     os.dup2(err, 2)
+    if any(i.startswith('0<') for i in sys.argv[1].split(',')):
+        os.dup2(0, 9)
+        os.set_inheritable(9, True)
     for item in [i for i in sys.argv[1].split(',') if i]:
         if '<' in item:
             n, p = item.split('<', 1)

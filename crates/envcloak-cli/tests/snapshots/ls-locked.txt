@@ -1,0 +1,4 @@
+exit: 1
+--- stdout
+--- stderr
+envcloak: vault_locked: the vault is locked; run `envcloak unlock`

@@ -1,0 +1,16 @@
+exit: 0
+--- stdout
+Approval request <REQ1>
+  requested by: a process of unknown origin (caller pid <PID>), rooted at pid <PID> started at <START>
+  project: <ROOT>/acme-web (new project: the vault has no record of it)
+  manifest: <ROOT>/acme-web/envcloak.toml sha256 3d8a4004f5505540e41cdf981c0c32865ffb91ad1d87ddd7bbcdfb277bb23a2b
+  bindings (inject mode):
+    GITHUB_TOKEN = github/acme-web#value  (unknown key, first use: no project uses this item yet)
+    OPENAI_API_KEY = openai/acme-web#value  (unknown key, first use: no project uses this item yet)
+    STRIPE_SECRET_KEY = stripe/acme-web#value  (unknown key, first use: no project uses this item yet)
+  command (1 arguments):
+    [0] ./emit
+  grant: every request from this process tree for <DUR>
+The passphrase you enter approves exactly this, and nothing else.
+Approved request <REQ1>: grant <ULID>, for <DUR>.
+--- stderr

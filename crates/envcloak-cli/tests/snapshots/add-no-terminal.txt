@@ -1,0 +1,4 @@
+exit: 1
+--- stdout
+--- stderr
+envcloak: no_terminal: there is no terminal to type the value on; pipe it in with --stdin

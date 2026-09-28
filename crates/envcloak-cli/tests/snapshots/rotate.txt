@@ -1,0 +1,7 @@
+exit: 0
+--- stdout
+Rotated openai/acme-web#value: the new value is in place, and 1 prior value is kept.
+--- stderr
+Rotate openai/acme-web#value (openai/acme-web; not classified).
+  The current value becomes the newest prior value; the vault keeps 3 at most (0 now).
+  Grants that bind this item stay in force: 0.

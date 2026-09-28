@@ -1,0 +1,4 @@
+exit: 125
+--- stdout
+--- stderr
+envcloak: approval_required: request=<REQ1>: run "envcloak approve <REQ1>" in a terminal you control

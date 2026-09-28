@@ -1,0 +1,4 @@
+exit: 1
+--- stdout
+--- stderr
+envcloak: proof_refused: a proof is taken only in a terminal session with no agent in it: not from a process with an agent in its ancestry, agent markers in its environment or a lost ancestry, nor from one without a controlling terminal (a service manager's job, setsid); run this in a terminal you control

@@ -1,0 +1,5 @@
+exit: 0
+--- stdout
+Added EXTRA = misc/extra to [env.short] in <ROOT>/acme-web/envcloak.toml.
+warning: the reference does not resolve yet: no item has that slug
+--- stderr

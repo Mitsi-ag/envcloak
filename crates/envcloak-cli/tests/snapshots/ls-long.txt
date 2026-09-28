@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+SLUG             PROVIDER  KIND     FIELDS  UPDATED     ENV  ACCOUNT  TITLE
+github/acme-web  -         unknown  value   <DATE>  -    -        github/acme-web
+openai/acme-web  -         unknown  value   <DATE>  -    -        openai/acme-web
+short/acme-web   -         unknown  value   <DATE>  -    -        short/acme-web
+stripe/acme-web  -         unknown  value   <DATE>  -    -        stripe/acme-web
+--- stderr

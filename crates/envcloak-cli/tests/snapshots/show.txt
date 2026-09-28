@@ -1,0 +1,13 @@
+exit: 0
+--- stdout
+openai/acme-web
+  title: openai/acme-web
+  id: <ULID>
+  provider: -
+  kind: not classified
+  short values: not allowed
+  fields:
+    value: set <TIME>, 0 prior values kept
+  created: <TIME>
+  updated: <TIME>
+--- stderr

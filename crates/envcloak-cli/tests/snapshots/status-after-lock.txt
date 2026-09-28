@@ -1,0 +1,12 @@
+exit: 0
+--- stdout
+daemon: running (pid <PID>, version <VER>)
+daemon identity: unverified (this build pins no code signature, so only the daemon's user was checked; a program running as you could impersonate it)
+daemon hardening: <HARDENING>
+cli hardening: <HARDENING>
+vault: locked
+idle lock: after <DUR> idle
+last locked by: request
+grants: 0 in force, 0 waiting for approval
+audit log: closed while the vault is locked
+--- stderr

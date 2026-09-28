@@ -1,0 +1,7 @@
+exit: 0
+--- stdout
+audit log: 10 entries in 1 segment, through entry 10
+anchor: none saved in the vault yet
+check: OK, the chain holds from the first entry to the last
+unanchored tail: entries 1 to 10 were written after the anchor; had entries been removed from the end of the log after them, that would not show
+--- stderr

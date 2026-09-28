@@ -1,0 +1,5 @@
+exit: 0
+--- stdout
+Vault created and unlocked.
+The Recovery Kit went only to the descriptor you named.
+--- stderr

@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+Denied request <REQ2>.
+--- stderr

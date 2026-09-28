@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+Added misc/extra.
+  provider: not classified
+  field: value
+  account: dev@acme.example
+Reference it in a project with: envcloak ref DATABASE_URL=misc/extra
+--- stderr

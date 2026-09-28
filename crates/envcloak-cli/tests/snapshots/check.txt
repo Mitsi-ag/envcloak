@@ -1,0 +1,15 @@
+exit: 1
+--- stdout
+manifest: <ROOT>/acme-web/envcloak.toml (project acme-web)
+references:
+  ok       [env] OPENAI_API_KEY = openai/acme-web
+  ok       [env] STRIPE_SECRET_KEY = stripe/acme-web
+  ok       [env.short] SHORT_TOKEN = short/acme-web
+env files:
+  .env: 1 key in plaintext
+    line 2: GITHUB_TOKEN (github key)
+    line 4: ok       OPENAI_API_KEY = envcloak://openai/acme-web
+  .env.example: no key-shaped values
+result: 1 plaintext key in env files: move them into the vault with `envcloak add`, and rotate any that were shared
+--- stderr
+envcloak: check_failed: the check found problems; the report above says which

@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+{"change":"unchanged","env_name":"GITHUB_TOKEN","manifest":"<ROOT>/acme-web/envcloak.toml","previous":"github/acme-web","profile":null,"reference":"github/acme-web","resolves":"ok"}
+--- stderr

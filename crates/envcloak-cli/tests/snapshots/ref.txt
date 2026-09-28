@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+Added GITHUB_TOKEN = github/acme-web to [env] in <ROOT>/acme-web/envcloak.toml.
+--- stderr

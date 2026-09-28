@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+SLUG             PROVIDER  KIND     FIELDS  UPDATED
+github/acme-web  -         unknown  value   <DATE>
+openai/acme-web  -         unknown  value   <DATE>
+short/acme-web   -         unknown  value   <DATE>
+stripe/acme-web  -         unknown  value   <DATE>
+--- stderr
