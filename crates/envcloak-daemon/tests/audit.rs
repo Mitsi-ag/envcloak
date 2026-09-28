@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use common::{MANIFEST, client, data_dir, passphrase, project, seed_vault, start};
 use envcloak_core::SecretBytes;
-use envcloak_core::audit::{AuditEntry, AuditKind, VerifyReport};
+use envcloak_core::audit::{AuditEntry, AuditKind, ProblemKind, VerifyReport};
 use envcloak_core::vault::{LockedVault, VaultPaths};
 use envcloak_ipc::ClientError;
 use envcloak_ipc::proto::{ErrorKind, RunRequestParams};
@@ -362,4 +362,65 @@ fn audit_verify_reports_the_anchor_the_tail_and_tampering() {
     assert_eq!(v.anchor.state, AnchorState::Missing);
     assert_eq!(v.live_head_matches, Some(false));
     assert_no_canary(&f.d.log_bytes(), &f.cs);
+}
+
+/// Codex F-44, through the daemon: after the log's segment is renamed out
+/// of its directory, and after the directory itself is renamed away, a
+/// covered request's entry still goes into the log before the answer, in a
+/// new segment where the log is; nothing goes into the moved files. The
+/// entries that went with them are flagged as missing.
+#[test]
+fn a_moved_segment_or_directory_does_not_take_a_delivery_with_it() {
+    let mut f = Fixture::new();
+    let argv = vec!["./emit".to_owned()];
+    let id = pending(&f.request(&argv, None));
+    let grant = f
+        .approve(
+            &id,
+            ApprovalOptions::session(Duration::from_secs(3600)),
+            f.pass(),
+        )
+        .unwrap();
+    let dir = f.audit_dir();
+    let seg = |n: u64| format!("{n:020}.seg");
+    let outside = f.home.root().join("moved");
+    std::fs::create_dir(&outside).unwrap();
+
+    // Entries 1 to 3 (unlock, pending, approve) are in segment 1: it is
+    // renamed out of the directory.
+    let renamed = outside.join("renamed");
+    std::fs::rename(dir.join(seg(1)), &renamed).unwrap();
+    let renamed_len = std::fs::metadata(&renamed).unwrap().len();
+    assert_eq!(covered(&f.request(&argv, None)), grant);
+    assert_eq!(std::fs::metadata(&renamed).unwrap().len(), renamed_len);
+    assert!(dir.join(seg(4)).is_file(), "entry 4 started a new segment");
+
+    // The directory renamed away.
+    let aside = f.home.root().join("audit.aside");
+    std::fs::rename(&dir, &aside).unwrap();
+    let aside_len = std::fs::metadata(aside.join(seg(4))).unwrap().len();
+    assert_eq!(covered(&f.request(&argv, None)), grant);
+    assert_eq!(
+        std::fs::metadata(aside.join(seg(4))).unwrap().len(),
+        aside_len
+    );
+    assert!(dir.join(seg(5)).is_file(), "entry 5 is where the log is");
+
+    let (entries, report, saved) = f.stop_and_read();
+    assert_eq!(
+        report.first_problem.map(|p| (p.seq, p.kind)),
+        Some((1, ProblemKind::Missing)),
+        "{report:?}"
+    );
+    assert_eq!(
+        outline(&entries),
+        vec![
+            o(AuditKind::Run, "covered", None),
+            o(AuditKind::Lock, "locked", Some("signal")),
+        ]
+    );
+    assert_eq!(entries[0].seq, 5);
+    assert_eq!(entries[0].record.grant_id.as_deref(), Some(grant.as_str()));
+    assert_eq!(saved, Some(6));
+    f.sweep(&entries);
 }

@@ -13,7 +13,7 @@ mod common;
 
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -47,6 +47,9 @@ struct Plan {
     fail_frame_write: bool,
     /// Fail the next flush of a segment.
     fail_file_sync: bool,
+    /// Rename this file to that one just before the next frame is written,
+    /// as another program racing the writer would.
+    move_before_frame: Option<(PathBuf, PathBuf)>,
 }
 
 /// The counting shim: records every call, then runs the real one, or fails
@@ -68,6 +71,11 @@ impl AuditIo for Shim {
     fn write(&mut self, f: &File, bytes: &[u8]) -> io::Result<()> {
         let mut p = self.0.lock().unwrap();
         p.ops.push(Op::Write(bytes.len()));
+        if bytes.len() != HEADER_LEN {
+            if let Some((from, to)) = p.move_before_frame.take() {
+                std::fs::rename(from, to)?;
+            }
+        }
         if bytes.len() != HEADER_LEN && p.fail_frame_write {
             p.fail_frame_write = false;
             // Half the frame reaches the file, as a full disk would leave it.
@@ -712,4 +720,76 @@ fn damage_at_the_end_is_kept_for_the_check() {
     assert_eq!(log.segments().len(), 2);
     let r = log.verify(None);
     assert_eq!(problem(&r), Some((3, ProblemKind::Unreadable)), "{r:?}");
+}
+
+/// Codex F-44: a segment renamed out of the directory, a segment replaced
+/// by a copy of itself, and the directory renamed away all keep a link
+/// count above zero, but entries written to them would not be in the log
+/// the check reads. The writer notices each and starts a new segment in
+/// the log's directory, which leaves the gap for the check to flag. A
+/// segment moved while an entry is written to it fails that append, and
+/// the retry goes to a new segment.
+#[test]
+fn a_renamed_segment_or_directory_takes_no_entry_with_it() {
+    let log = Log::new();
+    let shim = Shim::default();
+    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+    fill(&mut w, 1, 2);
+    let seqs = |dir: &Path| -> Vec<u64> {
+        let (entries, _) = read_entries(dir, &log.keys, None).unwrap();
+        entries.iter().map(|e| e.seq).collect()
+    };
+    let outside = log.f.home.root().join("moved");
+    std::fs::create_dir(&outside).unwrap();
+
+    // The segment renamed out of the directory.
+    let renamed = outside.join("renamed");
+    std::fs::rename(log.segments().pop().unwrap(), &renamed).unwrap();
+    let renamed_len = std::fs::metadata(&renamed).unwrap().len();
+    assert_eq!(w.append(&record(3)).unwrap(), 3);
+    assert_eq!(
+        std::fs::metadata(&renamed).unwrap().len(),
+        renamed_len,
+        "nothing went to the renamed segment"
+    );
+    assert_eq!(seqs(&log.dir), vec![3]);
+
+    // The segment replaced by a copy: the name is there, but it names
+    // another file.
+    let third = log.segments().pop().unwrap();
+    let copy = log.dir.join("copy");
+    std::fs::copy(&third, &copy).unwrap();
+    std::fs::rename(&copy, &third).unwrap();
+    assert_eq!(w.append(&record(4)).unwrap(), 4);
+    assert_eq!(seqs(&log.dir), vec![3, 4]);
+    assert_eq!(log.segments().len(), 2);
+
+    // The directory renamed away: a new one is made where the log is.
+    let aside = log.f.home.root().join("audit.aside");
+    std::fs::rename(&log.dir, &aside).unwrap();
+    assert_eq!(w.append(&record(5)).unwrap(), 5);
+    assert_eq!(
+        seqs(&aside),
+        vec![3, 4],
+        "nothing went to the moved directory"
+    );
+    assert_eq!(seqs(&log.dir), vec![5]);
+
+    // The segment moved while entry 6 is written to it: the append fails,
+    // the moved file is cut back, the head stays, and the retry goes to a
+    // new segment in the log.
+    let current = log.segments().pop().unwrap();
+    let current_len = std::fs::metadata(&current).unwrap().len();
+    let raced = outside.join("raced");
+    shim.plan().move_before_frame = Some((current, raced.clone()));
+    let head = w.head();
+    assert!(w.append(&record(6)).is_err());
+    assert_eq!(w.head(), head);
+    assert_eq!(std::fs::metadata(&raced).unwrap().len(), current_len);
+    assert_eq!(w.append(&record(6)).unwrap(), 6);
+    assert_eq!(seqs(&log.dir), vec![6]);
+
+    let r = log.verify(None);
+    assert_eq!(problem(&r), Some((1, ProblemKind::Missing)), "{r:?}");
+    assert_eq!(r.last_seq, 6);
 }

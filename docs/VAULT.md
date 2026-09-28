@@ -233,7 +233,7 @@ Any failure, or a crash, rolls all of it back: the vault stays at its old versio
 
 The daemon records every security event in `<data>/audit/` (SPEC §3 principle 4, §6.1 step 5): tamper-evident, not tamper-proof, since a program running as the user can delete it. The code is in `crates/envcloak-core/src/audit/`.
 
-**Segments.** The log is a series of files named after the sequence number of their first entry, `<20 decimal digits>.seg`, 0600 in the 0700 directory. The writer appends to the last segment and starts a new one when it reaches 1 MiB, when the last one is damaged, or when the file it wrote to was removed. A segment is a header, then entries one after another:
+**Segments.** The log is a series of files named after the sequence number of their first entry, `<20 decimal digits>.seg`, 0600 in the 0700 directory. The writer appends to the last segment and starts a new one when it reaches 1 MiB, when the last one is damaged, or when the file it wrote to is no longer in the log: removed, renamed, replaced, or its directory moved (before each append, and again after the flush, the writer checks that the segment's name in the directory is still the file it has open, by device and inode; a segment moved during the write fails the append). A segment is a header, then entries one after another:
 
 ```
 header = "ECAUDIT1" | version(1) = 1 | vault_id(16) | epoch(4) | first_seq(8) | prev_mac(32) | header_mac(32)
@@ -256,7 +256,7 @@ entry  = len(4) | seq(8) | sealed(len) | mac(32)
 
 | Gate (SPEC §15.2) | Test |
 |---|---|
-| 33: entries flushed before an append returns (`F_FULLFSYNC` on macOS, counted by a shim); a failed write or flush leaves the log whole; entries sealed, with no value; a modified, deleted or reordered entry, a removed or damaged segment, and a log cut before its anchor flagged at the sequence number; the unanchored tail reported | `tests/audit.rs` |
+| 33: entries flushed before an append returns (`F_FULLFSYNC` on macOS, counted by a shim); a failed write or flush leaves the log whole; entries sealed, with no value; a modified, deleted or reordered entry, a removed or damaged segment, and a log cut before its anchor flagged at the sequence number; the unanchored tail reported; a segment renamed or replaced, or its directory moved, gets no entry | `tests/audit.rs` |
 | 2, storage part: no fixture in the main, WAL, shared-memory or journal bytes | `tests/vault_bytes.rs` |
 | 5: crash consistency | `tests/vault_crash.rs` |
 | 6: integrity digest | `tests/vault_integrity.rs` |

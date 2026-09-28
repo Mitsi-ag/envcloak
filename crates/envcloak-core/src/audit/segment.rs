@@ -29,8 +29,9 @@
 //!
 //! [`AuditWriter::append`] writes one frame and flushes it with
 //! [`envcloak_sys::sync_file`] (`F_FULLFSYNC` on macOS) before it returns:
-//! the entry is durable when the call succeeds, and a failed call leaves
-//! the segment as it was, so the caller can deny what the entry was for.
+//! the entry is durable, in a segment the log's directory still names,
+//! when the call succeeds, and a failed call leaves the segment as it was,
+//! so the caller can deny what the entry was for.
 
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -514,6 +515,15 @@ impl AuditWriter {
                 self.io
                     .sync(&cur.file)
                     .map_err(|_| AuditErrorKind::Sync.into())
+            })
+            .and_then(|()| {
+                // The segment was moved out of the log while the entry was
+                // written: the entry is not where the check reads.
+                if in_log(&self.dir, &cur) {
+                    Ok(())
+                } else {
+                    Err(io::Error::from(io::ErrorKind::NotFound).into())
+                }
             });
         match written {
             Ok(()) => {
@@ -550,13 +560,14 @@ impl AuditWriter {
     }
 
     /// The segment to append to, and its length now: the current one,
-    /// unless it is full, broken or no longer in the directory (removed
-    /// by another program: entries written to it would be lost), else a
-    /// new one.
+    /// unless it is full, broken or no longer in the log (removed or
+    /// renamed by another program, or the directory itself moved: entries
+    /// written to it would not be where the check reads), else a new one
+    /// in the log's directory, which leaves the gap for the check to see.
     fn segment(&mut self) -> Result<(Current, u64), AuditError> {
         if let Some(cur) = self.current.take() {
             if let Ok(m) = cur.file.metadata() {
-                if m.nlink() > 0 && m.is_file() && !cur.broken && m.len() < self.max_segment {
+                if !cur.broken && m.len() < self.max_segment && in_log(&self.dir, &cur) {
                     return Ok((cur, m.len()));
                 }
             }
@@ -595,6 +606,20 @@ impl AuditWriter {
             broken: false,
         })
     }
+}
+
+/// Whether `cur` is still in the log: `dir` is still this user's private
+/// directory (not a symlink), and the segment's name in it is not a symlink
+/// and is the file the writer has open (same device and inode). A link
+/// count above zero is not enough: a segment renamed out of the directory,
+/// or a directory renamed away, keeps it.
+fn in_log(dir: &Path, cur: &Current) -> bool {
+    let Ok(open) = cur.file.metadata() else {
+        return false;
+    };
+    check_private_dir(dir).is_ok()
+        && std::fs::symlink_metadata(&cur.path)
+            .is_ok_and(|m| m.is_file() && m.dev() == open.dev() && m.ino() == open.ino())
 }
 
 fn open_append(path: &Path) -> Result<File, AuditError> {
