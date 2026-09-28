@@ -10,7 +10,12 @@
 //! - [`restrict_umask`] and [`effective_uid`]: private creation modes, and
 //!   the uid a trusted directory must belong to.
 //! - [`open_beneath`]: `openat` from a directory handle, never following a
-//!   symlink and never blocking on a FIFO.
+//!   symlink and never blocking on a FIFO; [`list_dir`],
+//!   [`open_dir_beneath`], [`create_beneath`], [`link_beneath`],
+//!   [`rename_beneath`] and [`unlink_beneath`]: the other name operations
+//!   a scan and `envcloak init` make in a directory they hold open;
+//!   [`volume_of`]: whether a directory is on a network volume; and
+//!   [`open_elsewhere`]: whether another process has a file open.
 //! - [`sync_file`]: durable writes, with `F_FULLFSYNC` on macOS.
 //! - The daemon's socket and lifecycle: [`peer_identity`] and [`peer_uid`]
 //!   (who is on the other end of a Unix socket), [`try_lock_exclusive`]
@@ -39,9 +44,11 @@
 mod alloc;
 mod child;
 mod clock;
+mod dir;
 mod fd;
 mod fs;
 mod harden;
+mod inuse;
 mod lockfile;
 mod peer;
 mod perm;
@@ -55,12 +62,17 @@ mod tty;
 pub use alloc::{SystemBacking, WipingAllocator, wiping_allocator_active};
 pub use child::{SignalRelay, signal_group, signal_process, wait_for_exit};
 pub use clock::{awake_time, time_including_sleep};
+pub use dir::{
+    DirEntryKind, DirEntryName, MAX_DIR_ENTRIES, Volume, create_beneath, link_beneath, list_dir,
+    open_dir_beneath, rename_beneath, unlink_beneath, volume_of,
+};
 pub use fd::{cloexec_flag, inherited_fd};
 pub use fs::open_beneath;
 pub use harden::{
     Hardening, core_dump_limit, disable_core_dumps, harden_process, hardening_report,
     hardening_status, lock_memory, parse_tracer_pid, set_non_dumpable, tracer_present,
 };
+pub use inuse::open_elsewhere;
 pub use lockfile::try_lock_exclusive;
 pub use peer::{
     PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_identity, peer_uid,

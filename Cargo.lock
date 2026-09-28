@@ -360,6 +360,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "envcloak-scan"
+version = "0.1.0"
+dependencies = [
+ "envcloak-core",
+ "envcloak-policy",
+ "envcloak-sys",
+ "envcloak-testkit",
+ "libc",
+ "proptest",
+ "secrecy",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "envcloak-sync"
 version = "0.1.0"
 

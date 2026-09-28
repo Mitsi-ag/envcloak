@@ -1,0 +1,25 @@
+[package]
+name = "envcloak-scan"
+description = "EnvCloak's filesystem-safe scanning, dotenv parsing and atomic file replacement"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+envcloak-core.workspace = true
+envcloak-policy.workspace = true
+envcloak-sys.workspace = true
+libc.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+envcloak-testkit.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
