@@ -118,7 +118,7 @@ Rule 1 may pick an agent above the caller's session, and must: Claude Code and C
 - K is `terminal` only if the caller is a terminal subject;
 - R, when it is above the caller's session, is an agent a builtin entry matched by its executable path or signature, or a process that is no agent and is not in pid 1's session. A caller in pid 1's session without a terminal (an IDE's extension host, an MCP server it runs, a `launchd` job) is rooted by rule 3 at the topmost process below pid 1: the whole app. Its grant covers the app's callers in that session, never the sessions the app starts: its integrated terminals, and the commands an agent the catalog does not know runs in sessions of their own.
 
-The remaining match rules (expiry, epochs, project, bindings, mode) are the grant store's (SPEC §10b).
+The remaining match rules (expiry, epochs, project, bindings, mode) are the grant store's (SPEC §10b; docs/GRANTS.md).
 
 **Proofs** (approve, unlock, rotate, remove, recover) are refused from a caller with a known agent in its ancestry, agent markers in its claims, an orphan's lost ancestry, or a chain cut at 64 processes (SPEC §10b). An orphan's chain no longer reaches its session's leader: a double fork or `nohup` out of a terminal keeps that terminal, and could prompt on it for a proof the same command may not give from inside its agent's tree. pid 1's session without a controlling terminal, where macOS runs GUI apps and `launchd` jobs, is not an orphan's (pid 1 leads it and is in every chain); with one (a container whose init is a shell), it is.
 

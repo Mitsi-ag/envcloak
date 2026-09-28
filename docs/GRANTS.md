@@ -1,0 +1,92 @@
+# EnvCloak: grants and approvals
+
+Status: M1. This file fixes how SPEC §10a "Bounds and display" and §10b are carried out: what the daemon keeps for a request, how a grant is matched, how a person approves one with the passphrase, what the approval statement is, and the bounds on prompts and passphrase attempts. The code is in `crates/envcloak-policy/src/{grants,pending,statement,flood,limiter}.rs`, the daemon handlers in `crates/envcloak-daemon/src/requests.rs`, and the commands in `crates/envcloak-cli/src/cmd/{run,approve,grants}.rs`. The wire form of each method is in docs/IPC.md; the caller evidence a grant is scoped to is in docs/AGENTS.md.
+
+## A request
+
+`envcloak run [--profile NAME] [--ref NAME=slug[#field]]... -- <cmd...>` sends `run.request` with the manifest's path, the profile, the `--ref` bindings, the command line as display text, and the names of the agent markers in its environment. The daemon then, in order:
+
+1. reads the caller's evidence from the kernel (docs/AGENTS.md): the chain, the root instance, the kind;
+2. opens the manifest itself from the path sent (a symlinked manifest is refused, SPEC §5) and resolves the bindings from the file it read; the caller's argv is never used for anything but display;
+3. binds each reference to a field of a secret item in the vault, and looks up whether the vault has a record of the project ("new project") and whether any adopted project's bindings name each item ("first use", SPEC §6.4 "Adoption");
+4. applies the effective policy: the vault's policy for the project (approve, redact, inject in M1), tightened by the manifest's `[policy]`, for the subject's kind. `agents = "deny"` refuses an agent or unknown subject (`policy_denied`); a required proxy mode is refused in M1 (`mode_unsupported`), never injected;
+5. asks the grant store for the decision: `covered` (with the grant id, whether output is redacted, the mode, and whether the manifest's hash differs from the one at approval), `pending` (with the request id) or `denied` (with the reason).
+
+No value crosses in this build: the release path is T12's. A covered run in this build exits 2 saying so. A pending run exits 125 with `approval_required request=<id>: run "envcloak approve <id>" in a terminal you control`, and reads nothing from its own terminal: that terminal may be an agent's, and a `y` typed there approves nothing.
+
+No decision is made, and no proof taken, from a vault that failed its integrity check (`vault_tampered`): its project index and policy cannot be trusted.
+
+## The grant store
+
+The store lives in the daemon's memory under its state lock, is cleared at every lock, and is never written to disk or synced. It holds at most 256 grants and 20 pending requests.
+
+A grant records what SPEC §10b lists: the root process instance (pid and start time, plus the executable for display), the subject's kind and the agent's name, the project identity (canonical directory, device, inode), the manifest's hash at approval, the bindings as (variable, item id, field id) with the display slug and the `live` tick, the mode, `once` or `session`, both deadlines, and the vault and policy epochs.
+
+**Match.** Request R is covered by grant G when all of these hold:
+
+1. G has not passed either deadline (below), been revoked or been used up;
+2. G was made under the vault's current epoch and the current policy epoch;
+3. G's root is in R's kernel-verified chain, pid and start time alike, and no known agent sits between the root and the caller unless the root is that agent; a grant approved for a terminal subject covers only a terminal subject (docs/AGENTS.md "Coverage");
+4. R's project identity equals G's: a symlinked path to the same directory keeps it, a copy (another inode) or a move (another canonical path) is another project;
+5. R's bindings are a subset of G's, compared by (variable, item id, field id): a renamed or retargeted variable, an added reference, another field or a profile switch each prompt again, for the whole request;
+6. R's mode is at least as strict as G's.
+
+A manifest change that leaves the bindings a subset does not prompt; the daemon audits `manifest changed grant=<id>` and the decision says `manifest_changed`. When a session grant and a once grant both cover a request, the session grant is used and the once grant kept.
+
+**Once.** A `once` grant is used up by the first request it covers. The decision and the consumption happen under one lock, so of concurrent requests exactly one is covered; the others are pending, and identical ones share one pending request.
+
+**Deadlines.** An approval sets two: the wall clock plus the grant's length, and time awake plus the same length. Either passing ends the grant, so a clock stepped either way cannot lengthen one. Lengths: 8 hours by default (`--for` sets it, from 30 seconds), at most 24 hours for an agent or unknown subject and 12 hours for a terminal subject.
+
+**A grant ends on** expiry; its first use, if `once`; the root process exiting (a tick every second drops grants whose root's pid is gone or has another start time); `envcloak grants revoke <id> | --all`, which any client may run (tightening needs no proof); lock, for any reason (a request, idle time, sleep, a signal), which also drops every pending request; a daemon restart, which starts empty; a policy epoch bump; a vault epoch change.
+
+## Pending requests and approval
+
+A request no grant covers becomes a pending request: an id of 8 Crockford base32 characters (unique among the pending requests; `I`, `L` and `O` read as `1` and `0`), a 32-byte daemon nonce, the request as the daemon built it, and the descriptor an approval surface shows (`pending.get`). A pending request expires after 10 minutes of awake time. An identical request (the same root, project, bindings, mode and argv) while one is pending gets the same id.
+
+`envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]`, run by a person in a terminal they control:
+
+1. refuses under a tracer (gate 19), before anything is read;
+2. fetches the descriptor and renders the statement (below);
+3. reads the vault passphrase from `/dev/tty` with echo off, or from the descriptor named, never from argv or the environment;
+4. sends `approve` with the request id, the options, the SHA-256 of the canonical statement it rendered with those options, the passphrase, and the names of the agent markers in its environment.
+
+The daemon, before any key derivation: reads the approver's evidence and refuses a caller with a known agent in its ancestry, agent markers in its claims, a lost ancestry (an orphan) or a chain cut at the walk's limit (`proof_refused`, audited); checks that the request exists (`no_such_request`), that the options are within bounds (`invalid_options`), that the digest equals the digest of its own descriptor with the same options (`statement_mismatch`), and that the attempt limiter admits the attempt (`too_many_attempts`). Only then does it run Argon2id, with the vault taken out of its slot as an unlock takes it: other requests see `busy` for that moment, and a lock that arrives meanwhile wins. A wrong passphrase gives `wrong_passphrase` and counts. The right one creates the grant and removes the request.
+
+The statement shown by the CLI is advisory: the daemon approves what its own pending request says, and refuses when the digest differs. The passphrase is the proof; a `y` typed anywhere is nothing. `envcloak deny <REQUEST>` refuses a request and needs no proof.
+
+`unlock` is a proof too: it is refused from the same callers as `approve`, and counted by the same limiter. The CLI sends its marker names with it.
+
+## The statement
+
+The descriptor (`envcloak_policy::PendingDescriptor`) holds: the request id, the nonce (hex), when the request was opened and its expiry, the subject (kind, the agent's name, the caller's pid, the root's pid, start time and executable path), the project (canonical directory, manifest path, manifest SHA-256, whether it is new), each binding (variable, slug, item id, field id, field name, `test`, `live` or `unknown`, whether it is a first use), the mode, and argv.
+
+**Canonical encoding** (`canonical_statement`): the bytes `envcloak-statement/1\n`, then every field of the descriptor and of the options (`once` or `session`, the length in seconds, the `live` names), each as a 4-byte big-endian length followed by the bytes, lists preceded by their count, numbers as decimal strings, booleans as `1` or `0`. Nothing is ambiguous whatever the strings hold, and the full argv is in it. `statement_digest` is its SHA-256. The nonce binds the digest to one request of one daemon.
+
+**Rendering** (`render_statement`): the text a person reads. Every string from the daemon goes through `escape_for_display`: backslash, `\n`, `\r` and `\t` as those escapes, and every other control character, bidirectional control, zero-width or other invisible character as `\u{...}`. Argv is a list, one argument per line with its index; rendered argv beyond 2048 bytes is cut on a character boundary with `(N more bytes)` and a line saying that the passphrase approves the full command line. The rendering ends with "The passphrase you enter approves exactly this, and nothing else."
+
+`envcloak grants list` escapes what it prints the same way; its `--json` form prints the daemon's answer as JSON, whose own encoding escapes control characters.
+
+## Bounds
+
+- At most 3 pending requests per root and 20 per daemon; a request beyond either is denied (`pending_per_root`, `pending_total`).
+- A request identical to one denied in the last 10 minutes is denied without a prompt (`repeated`).
+- Three denials for one root within 10 minutes deny that root for 30 minutes (`root_denied`); the daemon logs a notice, until there is a surface for a notification (M3).
+- Denials are remembered for 10 minutes and at most 64 at a time; this state outlives a lock, since it only tightens.
+- The passphrase attempt limiter is one for every proof: after 5 failures, each further attempt must wait, 30 seconds after the fifth failure and twice as long after each failure beyond it, up to an hour; an attempt that comes early is refused without a passphrase being checked. A success clears it. `envcloak status` shows the failures and the wait.
+- Windows count time awake: a machine asleep serves none of them.
+
+## Gates
+
+| Gate | Where |
+|---|---|
+| 23: a `y` on the requester's terminal approves nothing; a missing or wrong passphrase fails; a statement that differs is rejected; approval input is never read from the requester's terminal; proofs from an agent-descended caller are refused | `crates/envcloak-cli/tests/approve.rs`, `crates/envcloak-daemon/tests/grants.rs`, `crates/envcloak-policy/tests/grants.rs` |
+| 24: a loosening manifest with a scripted agent still needs approval, and redaction stays on | `crates/envcloak-cli/tests/approve.rs` |
+| 25, the grant half: a terminal grant does not cover the agent under it | `crates/envcloak-cli/tests/approve.rs`, `crates/envcloak-policy/tests/grants.rs` |
+| 27: a recycled root pid is not covered | `crates/envcloak-policy/tests/grants.rs` (synthetic instances; the daemon matches on the same evidence) |
+| 28: binding changes prompt for the difference; a comment-only change is covered and audited; a copy or move is a new identity, a symlink keeps it | `crates/envcloak-daemon/tests/grants.rs`, `crates/envcloak-policy/tests/grants.rs` |
+| 29: wall-clock and awake-time expiry apart; revoke without a proof; lock, restart, sleep and root exit end grants | `crates/envcloak-policy/tests/grants.rs`, `crates/envcloak-daemon/tests/grants.rs`, `crates/envcloak-cli/tests/approve.rs` |
+| 30: concurrent requests on a `once` grant, exactly one covered | `crates/envcloak-daemon/tests/grants.rs`, `crates/envcloak-policy/tests/grants.rs` |
+| 31: escapes, `\r`, U+202E, zero-width characters and 100 KB of argv render escaped and truncated; the statement covers the full argv | `crates/envcloak-policy/tests/statement.rs`, `crates/envcloak-cli/tests/approve.rs` |
+| 32: the pending caps, three denials, the attempt limiter | `crates/envcloak-policy/tests/grants.rs`, `crates/envcloak-daemon/tests/grants.rs` |
+
+The daemon and CLI tests unlock and approve from the test process, so they need it to have no agent in its ancestry, as CI has. Under a developer's Claude Code those proofs are refused, as SPEC §10b requires; run the tests outside the agent's tree then (on macOS, `launchctl submit` runs a command under `launchd`).

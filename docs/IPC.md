@@ -38,7 +38,7 @@ Start-up errors print `envcloakd: <token>: <message>` and exit 1; usage errors e
 | Linux 6.5+ | `SO_PEERCRED` | `/proc/<pid>/stat`, read while `SO_PEERPIDFD` pins the process: it must still be alive after the read. Whether the kernel has `SO_PEERPIDFD` is found once; on one that has it, a peer it gives no pidfd for (one reaped before the accept gets `EINVAL`) is refused, never checked the way older kernels are |
 | Linux before 6.5 | `SO_PEERCRED` | `/proc/<pid>/stat`; a process that started after the accept is refused. A narrow race remains: the peer exits and its pid is reused between its `connect` and the `accept` |
 
-A peer running as another uid is closed at once, answered nothing, and audited. At most 32 connections are served at a time, and at most 8 for any one process (by pid), so one process that keeps connections open cannot lock the user's own `envcloak lock` and `status` out; more are closed at once. Many processes together can still fill the 32; per-agent limits come with T9's flood control.
+A peer running as another uid is closed at once, answered nothing, and audited. At most 32 connections are served at a time, and at most 8 for any one process (by pid), so one process that keeps connections open cannot lock the user's own `envcloak lock` and `status` out; more are closed at once. Many processes together can still fill the 32; the pending-request caps and the denial rules (docs/GRANTS.md "Bounds") limit what an agent can ask for.
 
 **Client, before it sends anything.** `Client::connect` checks the runtime directory as the daemon does (without changing it), checks that the socket is a socket of this uid, connects (the descriptor is close-on-exec), and checks with `getpeereid` (macOS) or `SO_PEERCRED` (Linux) that the process at the other end runs as this uid. A missing directory, socket or listener is `daemon_unavailable`; any failed check is `daemon_unverified`, and nothing is sent. A passphrase is read only after the daemon is verified, and sent on a connection verified again.
 
@@ -82,15 +82,23 @@ Response, one of:
 
 | Method | Params | Result |
 |---|---|---|
-| `status` | none | `daemon` (version, pid, hardening, whether the runtime directory fell back), `vault` (state `absent`, `locked`, `unlocked` or `unavailable`; integrity; read-only; the reason it is unavailable; whether an unlock is in progress; failed unlocks), `lock` (last reason, idle limit, idle time left) |
+| `status` | none | `daemon` (version, pid, hardening, whether the runtime directory fell back), `vault` (state `absent`, `locked`, `unlocked` or `unavailable`; integrity; read-only; the reason it is unavailable; whether an unlock is in progress; failed unlocks), `lock` (last reason, idle limit, idle time left), `approvals` (grants in force, pending requests, failed proofs since the last success, seconds before the next proof is admitted) |
 | `vault.create` | `passphrase`, `recovery_kit` (the kit's text as the user wrote it down), `kdf_memory_kib` (optional, 65536 to 4194304) | `locked` (true when a lock arrived while Argon2id ran: the vault was created, then locked), `integrity`, `read_only` |
-| `unlock` | `passphrase` | `integrity`, `read_only`, `already` (true when it was unlocked already; nothing was checked) |
+| `unlock` | `passphrase`, `claims` (optional: the names of the agent markers in the caller's environment) | `integrity`, `read_only`, `already` (true when it was unlocked already; nothing was checked) |
 | `lock` | none | `was_unlocked` |
+| `run.request` | `manifest` (the absolute path of `envcloak.toml`), `profile` (optional), `refs` (`NAME=<slug>[#field]` strings), `argv` (display text), `claims` | `decision`: `covered` with `grant`, `redact`, `mode` and `manifest_changed`; `pending` with `request`; or `denied` with `reason` (`repeated`, `root_denied`, `pending_per_root`, `pending_total`) |
+| `pending.get` | `request` | the pending request's descriptor (`envcloak_policy::PendingDescriptor`; docs/GRANTS.md "The statement") |
+| `approve` | `request`, `options` (`uses`: `once` or `session`; `ttl_secs`; `live`: variable names), `digest` (SHA-256 of the canonical statement, 64 hex characters), `passphrase`, `claims` | `grant`, `expires_in_secs` |
+| `deny` | `request` | `root_auto_denied` |
+| `grants.list` | none | `grants`: each with `id`, `kind`, `label`, `root_pid`, `root_exe`, `project_dir`, `bindings` (`env_name`, `slug`, `live`), `mode`, `uses`, `created_secs`, `remaining_secs` |
+| `grants.revoke` | `grant`, or `all: true` | `revoked` (a count) |
 
 - `vault.create` checks the Argon2id bounds, the passphrase rules and the kit's check symbols before any key derivation. The CLI generates the Recovery Kit and shows it (on the terminal, or the descriptor `--kit-fd` names, never stdout or stderr), so the kit crosses the socket only from the client to the daemon (SPEC §4.4: unlocker material is never sent to a client). Both envelopes use Argon2id with the given memory, 3 passes and 4 lanes.
 - A `vault.create` result means the vault exists under the passphrase and the kit sent, so the kit the CLI showed is valid, whether `locked` is true or not. The CLI calls a kit void only when no vault was created: the daemon refused before creating anything (`vault_exists`, `busy`, `passphrase_rejected`, `kdf_params`, `invalid_params`, `traced`), or the connection failed or the answer was unreadable and a new `status` then shows no vault and nothing in progress. Otherwise it says to keep the kit.
-- `unlock` and `vault.create` run Argon2id on the connection's thread, outside the state lock, one at a time. Both refuse (`traced`) while a tracer is attached to the daemon. A wrong passphrase and a damaged envelope give the one error `wrong_passphrase`, which is counted and audited.
-- `lock` needs no proof: locking only tightens.
+- `unlock`, `vault.create` and `approve` run Argon2id on the connection's thread, outside the state lock, one at a time. All refuse (`traced`) while a tracer is attached to the daemon. A wrong passphrase and a damaged envelope give the one error `wrong_passphrase`, which is counted and audited.
+- `unlock` and `approve` are proofs (SPEC §10b): the daemon reads the caller's evidence first and refuses a caller with a known agent in its ancestry, agent markers in its claims, a lost ancestry or a chain cut at the walk's limit (`proof_refused`, audited as `proof refused method=<name>`). Both count against one attempt limiter: after 5 failures each further attempt waits, 30 seconds doubling to an hour, and an early attempt is refused (`too_many_attempts`) without a passphrase being checked. `status` reports the failures and the wait.
+- `run.request` decides only; the values a covered run receives are T12's. `pending.get`, `deny`, `grants.list` and `grants.revoke` carry metadata only and need no proof: denying and revoking only tighten. Ids are Crockford base32 (26 characters for a grant, 8 for a request); a malformed one is `invalid_params`, an unknown or expired one `no_such_request`. docs/GRANTS.md has the rules.
+- `lock` needs no proof: locking only tightens. It drops every grant and pending request.
 
 ## App-role methods
 
@@ -115,16 +123,28 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `traced` | -32009 | A tracer is attached to the daemon |
 | `vault_unavailable` | -32010 | The vault file could not be opened; `reason` is `busy`, `damaged`, `unsupported_version`, `permissions`, `disk_full`, `storage`, `io` or `migration` |
 | `frame_too_large` | -32011 | A frame over 1 MiB |
+| `evidence` | -32012 | The caller's ancestry could not be read; `reason` is `caller_gone`, `ancestry_changed`, `ancestry_hidden` or `ancestry_unreadable` |
+| `manifest_invalid` | -32013 | The manifest, or the path it was opened from; `reason` is a `ManifestErrorKind` token (`not_found`, `syntax`, `loose_policy`, `symlinked_manifest`, ...) or a binding kind that makes the manifest invalid (`card_reference`, ...) |
+| `binding_unresolved` | -32014 | A `--profile` or `--ref` the run asked for; `reason` is `unknown_profile`, `unknown_item`, `unknown_field`, `ambiguous_field`, `no_field`, `invalid_reference` or `duplicate_env_name` |
+| `policy_denied` | -32015 | The effective policy refuses agent requests for the project |
+| `mode_unsupported` | -32016 | The effective mode is proxy, which M1 does not have |
+| `no_such_request` | -32017 | No pending request has the id, or it expired |
+| `statement_mismatch` | -32018 | The digest is not the pending request's with the options sent |
+| `proof_refused` | -32019 | A proof from a caller with an agent in its evidence |
+| `too_many_attempts` | -32020 | The attempt limiter refused the attempt |
+| `vault_tampered` | -32021 | The vault failed its integrity check; no decision, no proof |
+| `too_many_grants` | -32022 | 256 grants are in force |
+| `invalid_options` | -32023 | `reason` is `ttl_zero`, `ttl_too_long` or `live_not_bound` |
 | `internal` | -32099 | The daemon failed |
 
-The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daemon_unavailable`, `daemon_unverified` and `protocol_error` for the connection. `envcloak run` exits 125 on them (SPEC §6.1); the other commands exit 1, and 2 on a usage error.
+The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daemon_unavailable`, `daemon_unverified` and `protocol_error` for the connection, `approval_required request=<id>` and `approval_denied` for a run's decision, and `traced` when a tracer is attached to it. `envcloak run` exits 125 on them (SPEC §6.1); the other commands exit 1, and 2 on a usage error.
 
 ## Lock
 
 The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then removes the socket and exits 0), after the machine slept, and after the idle limit (8 hours by default, 1 minute to 24 hours with `--idle-lock`). Locking drops the unlocked vault, whose VMK, subkeys and decrypted metadata are wiped as they are freed, and keeps the file open and its lock held.
 
 - **Sleep.** On a one-second tick and before every request, the daemon compares how far two clocks moved since its last reading: time awake (macOS `CLOCK_UPTIME_RAW`, Linux `CLOCK_MONOTONIC`) and time including sleep (macOS `CLOCK_MONOTONIC_RAW`, Linux `CLOCK_BOOTTIME`). Each pair counts the same timebase from boot, so the difference is only the time asleep. When the second ran more than 5 seconds ahead, the machine slept. Deltas since the last reading, never totals, so drift does not add up.
-- **Idle.** Awake time since the last activity: a successful `unlock` or `vault.create` in M1, and every value release from T12. `status` and `lock` are not activity, so polling never keeps the vault open.
+- **Idle.** Awake time since the last activity: a successful `unlock`, `vault.create` or `approve`, a covered `run.request`, and every value release from T12. `status`, `lock`, `grants.list` and `pending.get` are not activity, so polling never keeps the vault open.
 - **During an unlock.** Every lock bumps a generation number. An unlock that started under an older one (a lock request, sleep or a signal arrived while Argon2id ran) finishes locked and answers `vault_locked`. A `vault.create` in that case still creates the vault, whose kit the client has already shown, leaves it locked and answers `locked: true`. Idle time does not cut either short. A signal that stops the daemon during `vault.create` may leave the vault created or not; the client gets no answer and says to keep the kit.
 
 ## Service definitions
@@ -140,6 +160,7 @@ The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then remo
 | 21: a server of another uid refused and sent nothing; the CLI never starts `envcloakd` from `PATH` | `crates/envcloak-cli/tests/squat.rs`, `crates/envcloak-ipc/tests/client.rs`, `crates/envcloak-cli/tests/daemon_commands.rs` |
 | 22: every `app`-role method rejected and audited | `crates/envcloak-daemon/tests/roles.rs` |
 | 32, frames: over 1 MiB rejected, memory bounded under a flood from many processes, one process held to 8 connections, a stalled frame dropped | `crates/envcloak-daemon/tests/frames.rs`, `crates/envcloak-ipc/tests/frame.rs` |
+| 23 and 27 to 32, the grant methods | docs/GRANTS.md "Gates" |
 | 11, for IPC frames: no freed block holds a value or its base64 | `crates/envcloak-ipc/tests/frame_probe.rs` |
 
 The other-uid checks need a second user and `sudo`; CI creates one on Linux (`ENVCLOAK_TEST_OTHER_USER`). The service-manager check runs where `ENVCLOAK_TEST_SERVICE_MANAGER=1`, which CI sets on both systems.

@@ -9,99 +9,15 @@
 mod common;
 
 use std::process::Output;
-use std::time::Duration;
 
-use common::{cli, finish_within, outside_dir, python3, run, start_daemon, stdout};
+use common::{cli, drive, run, start_daemon, stdout};
 use envcloak_testkit::{TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels};
-
-/// Runs argv[2..] on a new pseudo-terminal. argv[1] is a JSON file of
-/// steps `[expect, send]`: wait until the terminal shows `expect`, then
-/// type `send`, a piece at a time while the terminal's output is read, so
-/// a paste larger than the terminal's input queue arrives whole.
-/// `@SUGGESTED@` in `send` stands for the generated passphrase the
-/// terminal showed, and `@PAUSE@` for a pause of 50 ms, as between two
-/// pieces of a paste. Prints everything the terminal showed, then the exit
-/// code on stderr.
-const DRIVER: &str = r#"import json, os, pty, re, select, sys, time
-steps = json.load(open(sys.argv[1]))
-pid, fd = pty.fork()
-if pid == 0:
-    os.execv(sys.argv[2], sys.argv[2:])
-out = b''
-def more(deadline):
-    global out
-    r, _, _ = select.select([fd], [], [], max(0.0, deadline - time.time()))
-    if not r:
-        return False
-    try:
-        chunk = os.read(fd, 4096)
-    except OSError:
-        chunk = b''
-    if not chunk:
-        return False
-    out += chunk
-    return True
-for expect, send in steps:
-    deadline = time.time() + 60
-    while expect.encode() not in out:
-        if not more(deadline):
-            sys.stdout.buffer.write(out)
-            sys.exit('did not see ' + repr(expect))
-    if '@SUGGESTED@' in send:
-        words = re.search(rb'Write it down:\r?\n\r?\n    ([a-z -]+)\r?\n', out).group(1).decode()
-        send = send.replace('@SUGGESTED@', words)
-    for i, piece in enumerate(send.split('@PAUSE@')):
-        if i:
-            time.sleep(0.05)
-        data = piece.encode()
-        deadline = time.time() + 60
-        while data:
-            if time.time() > deadline:
-                sys.exit('could not type ' + repr(expect))
-            r, w, _ = select.select([fd], [fd], [], 1.0)
-            if r:
-                more(time.time())
-            if w:
-                data = data[os.write(fd, data[:256]):]
-while more(time.time() + 60):
-    pass
-_, status = os.waitpid(pid, 0)
-sys.stdout.buffer.write(out)
-sys.stderr.write('exit=%d\n' % os.waitstatus_to_exitcode(status))
-"#;
 
 /// Runs `envcloak <args>` on a pseudo-terminal, typing `steps`.
 fn on_terminal(home: &TestHome, args: &[&str], steps: &[(&str, &str)]) -> (Output, i32) {
     let mut argv = vec![cli().to_str().unwrap()];
     argv.extend_from_slice(args);
     drive(home, &argv, steps)
-}
-
-/// Runs `argv` on a pseudo-terminal, typing `steps`.
-fn drive(home: &TestHome, argv: &[&str], steps: &[(&str, &str)]) -> (Output, i32) {
-    let files = outside_dir();
-    let script = files.path().join("steps.json");
-    let json =
-        serde_json::to_string(&steps.iter().map(|(a, b)| [a, b]).collect::<Vec<_>>()).unwrap();
-    std::fs::write(&script, json).unwrap();
-    let mut cmd = std::process::Command::new(python3());
-    home.apply(&mut cmd)
-        .args(["-c", DRIVER])
-        .arg(&script)
-        .args(argv)
-        .current_dir(home.home())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let out = finish_within(cmd, Duration::from_secs(120));
-    let err = String::from_utf8_lossy(&out.stderr).into_owned();
-    let code = err
-        .lines()
-        .find_map(|l| l.strip_prefix("exit="))
-        .unwrap_or_else(|| panic!("the driver failed: {err}\n{}", stdout(&out)))
-        .parse()
-        .unwrap();
-    (out, code)
 }
 
 /// `vault create` on the terminal, then `unlock` there: typed passphrases

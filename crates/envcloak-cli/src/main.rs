@@ -8,10 +8,16 @@
 //! Commands in this build:
 //! - `envcloak vault create`, `unlock`, `lock`, `status` and `daemon
 //!   install` / `daemon uninstall` (see [`cmd`]);
-//! - `envcloak run -- <cmd...>` (SPEC §6.1), whose first step refuses to go
-//!   on under a tracer, with exit 125 and `traced` (gate 19), before any
-//!   contact with the daemon. It then connects to a verified daemon; the
-//!   runner itself arrives in T12.
+//! - `envcloak run [--profile p] [--ref NAME=slug[#field]]... -- <cmd...>`
+//!   (SPEC §6.1 steps 1 to 4), whose first step refuses to go on under a
+//!   tracer, with exit 125 and `traced` (gate 19), before any contact with
+//!   the daemon. It asks a verified daemon for the decision; the runner
+//!   itself arrives in T12;
+//! - `envcloak approve`, `deny` and `grants list` / `grants revoke` (SPEC
+//!   §10b).
+//!
+//! Every command that reads, shows or sends a secret or a proof (`vault
+//! create`, `unlock`, `approve`, `run`) refuses under a tracer first.
 //!
 //! `envcloak internal hardening [--hold]` is a hidden, value-free diagnostic
 //! used by the gate 19 tests: it prints `key=value` hardening lines and, with
@@ -28,7 +34,7 @@ mod tty;
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use fail::{Failure, RUN_FAILURE, USAGE};
+use fail::USAGE;
 
 #[global_allocator]
 static ALLOCATOR: envcloak_sys::WipingAllocator = envcloak_sys::WipingAllocator;
@@ -40,7 +46,11 @@ const HELP: &str = "usage:
   envcloak status [--json]
   envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
   envcloak daemon uninstall
-  envcloak run -- <cmd...>";
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... -- <cmd...>
+  envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
+  envcloak deny <REQUEST>
+  envcloak grants list [--json]
+  envcloak grants revoke <GRANT> | --all";
 
 fn main() -> ExitCode {
     envcloak_sys::harden_process();
@@ -58,12 +68,15 @@ fn main() -> ExitCode {
         }
         ["internal", "hardening"] => internal_hardening(false),
         ["internal", "hardening", "--hold"] => internal_hardening(true),
-        ["run", rest @ ..] => run(rest),
+        ["run", rest @ ..] => cmd::run::run(rest),
         ["vault", rest @ ..] => cmd::vault::run(rest),
         ["unlock", rest @ ..] => cmd::unlock::run(rest),
         ["lock", rest @ ..] => cmd::lock::run(rest),
         ["status", rest @ ..] => cmd::status::run(rest),
         ["daemon", rest @ ..] => cmd::daemon::run(rest),
+        ["approve", rest @ ..] => cmd::approve::approve(rest),
+        ["deny", rest @ ..] => cmd::approve::deny(rest),
+        ["grants", rest @ ..] => cmd::grants::run(rest),
         // Never echo arguments: one of them could be a pasted secret.
         _ => {
             eprintln!("envcloak: unknown command\n{HELP}");
@@ -89,46 +102,4 @@ fn internal_hardening(hold: bool) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
-}
-
-/// What must hold before this process asks the daemon for any value (SPEC
-/// §5 "Process hardening"): no tracer is attached. Non-dumpable keeps new
-/// same-uid attaches out, but not a tracer that started the process
-/// (`strace`, `gdb`), so the CLI refuses instead. When the check cannot
-/// tell, it refuses too.
-fn ready_to_request_values() -> Result<(), Failure> {
-    match envcloak_sys::tracer_present() {
-        Ok(false) => Ok(()),
-        Ok(true) | Err(_) => Err(Failure::new(
-            "traced",
-            "a debugger or tracer is attached to this process, so it will not request values",
-        )),
-    }
-}
-
-/// `envcloak run -- <cmd...>`. Never echoes its arguments: the command line
-/// could hold a pasted secret.
-fn run(args: &[&str]) -> ExitCode {
-    match args {
-        ["--", _, ..] => {}
-        [] | ["--"] => {
-            eprintln!("envcloak: run needs a command: envcloak run -- <cmd...>");
-            return ExitCode::from(USAGE);
-        }
-        _ => {
-            eprintln!("envcloak: run takes no options in this build yet: envcloak run -- <cmd...>");
-            return ExitCode::from(USAGE);
-        }
-    }
-    if let Err(failure) = ready_to_request_values() {
-        return failure.report(RUN_FAILURE);
-    }
-    // Only a verified daemon is ever asked; with none, run says how to
-    // start one and starts nothing.
-    if let Err(failure) = connect::connect() {
-        return failure.report(RUN_FAILURE);
-    }
-    // The runner (T12) goes here.
-    eprintln!("envcloak: run cannot start commands in this build yet");
-    ExitCode::from(USAGE)
 }
