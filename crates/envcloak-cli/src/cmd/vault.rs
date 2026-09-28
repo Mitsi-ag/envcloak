@@ -9,10 +9,16 @@
 //! 3. The Recovery Kit is generated here, and shown on the terminal or
 //!    written to the descriptor `--kit-fd` names, never to stdout or
 //!    stderr. It is written before the vault exists, so a vault never
-//!    exists whose kit was lost; if creation then fails, the kit is void
-//!    and the message says so.
-//! 4. The daemon creates the vault with both, and leaves it unlocked. The
-//!    kit crosses the socket only from here to the daemon (SPEC §4.4).
+//!    exists whose kit was lost.
+//! 4. The daemon creates the vault with both, and leaves it unlocked, or
+//!    locked when a lock arrived while it derived the keys; the vault
+//!    exists either way and the kit is valid. The kit crosses the socket
+//!    only from here to the daemon (SPEC §4.4).
+//! 5. When creation fails, the message says what that means for the kit.
+//!    It is called void only when the vault certainly was not created: the
+//!    daemon refused before creating anything, or says afterwards that
+//!    there is no vault. When the answer was lost, or a vault exists after
+//!    an error, the message says to keep the kit.
 
 use std::fs::File;
 use std::io::Write;
@@ -150,27 +156,107 @@ fn create(a: &CreateArgs) -> Result<ExitCode, Failure> {
     }
     drop(kit_out);
 
-    let mut client = connect()?;
+    let mut client = connect().map_err(|f| with_kit_outcome(f, KitOutcome::Void))?;
     let created = client.vault_create(
         passphrase,
         SecretBytes::copy_from(text.as_bytes()),
         a.kdf_memory_kib,
     );
     drop(text);
-    if let Err(e) = created {
-        let mut f = Failure::from(e);
-        f.message = format!(
-            "{}; no vault was created, so the Recovery Kit just shown or written is void",
-            f.message
-        )
-        .into();
-        return Err(f);
+    drop(client);
+    match created {
+        Ok(v) if !v.locked => println!("Vault created and unlocked."),
+        Ok(_) => println!(
+            "Vault created, then locked: a lock request, sleep or stop came while its keys were \
+             derived. The Recovery Kit is valid; keep it. Run `envcloak unlock` to open the vault."
+        ),
+        Err(e) => {
+            let outcome = kit_outcome(e);
+            return Err(with_kit_outcome(Failure::from(e), outcome));
+        }
     }
-    println!("Vault created and unlocked.");
     if a.kit_fd.is_some() {
         println!("The Recovery Kit went only to the descriptor you named.");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// What a failed `vault.create` means for the Recovery Kit already shown
+/// or written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KitOutcome {
+    /// No vault was created with it.
+    Void,
+    /// A vault exists now, which may have been created with it.
+    MaybeCreated,
+    /// Whether a vault was created with it is unknown.
+    Unknown,
+}
+
+/// Whether the daemon gives error `e` only before it creates anything, so
+/// no vault was created with this kit.
+fn refused_before_creating(e: ClientError) -> bool {
+    match e {
+        ClientError::Unavailable | ClientError::Unverified(_) | ClientError::Paths(_) => true,
+        ClientError::Rpc(r) => matches!(
+            r.kind,
+            ErrorKind::VaultExists
+                | ErrorKind::Busy
+                | ErrorKind::PassphraseRejected
+                | ErrorKind::KdfParams
+                | ErrorKind::InvalidParams
+                | ErrorKind::Traced
+                | ErrorKind::RoleDenied
+                | ErrorKind::MethodNotFound
+                | ErrorKind::InvalidRequest
+                | ErrorKind::ParseError
+                | ErrorKind::FrameTooLarge
+        ),
+        // The connection failed or the answer was unreadable: the daemon
+        // may have created the vault first.
+        ClientError::Frame(_) | ClientError::Protocol => false,
+    }
+}
+
+/// The kit's fate after `vault.create` failed with `e`: certain from the
+/// error alone, or else asked of the daemon on a new connection.
+fn kit_outcome(e: ClientError) -> KitOutcome {
+    if refused_before_creating(e) {
+        return KitOutcome::Void;
+    }
+    match connect().and_then(|mut c| c.status().map_err(Failure::from)) {
+        Ok(s) => outcome_from_status(s.vault.state, s.vault.busy),
+        Err(_) => KitOutcome::Unknown,
+    }
+}
+
+fn outcome_from_status(state: VaultState, busy: bool) -> KitOutcome {
+    match state {
+        // Still running: the vault may yet be created.
+        _ if busy => KitOutcome::Unknown,
+        VaultState::Absent => KitOutcome::Void,
+        VaultState::Locked | VaultState::Unlocked | VaultState::Unavailable => {
+            KitOutcome::MaybeCreated
+        }
+    }
+}
+
+fn with_kit_outcome(mut f: Failure, outcome: KitOutcome) -> Failure {
+    let tail = match outcome {
+        KitOutcome::Void => {
+            "no vault was created, so the Recovery Kit just shown or written is void"
+        }
+        KitOutcome::MaybeCreated => {
+            "a vault exists now and may have been created with the Recovery Kit just shown or \
+             written: keep the Recovery Kit, and try `envcloak unlock`"
+        }
+        KitOutcome::Unknown => {
+            "the vault may have been created before the answer was lost: keep the Recovery Kit \
+             just shown or written, and run `envcloak status` once the daemon is running"
+        }
+    };
+    f.message = format!("{}; {tail}", f.message).into();
+    f
 }
 
 fn no_terminal(a: &CreateArgs) -> Failure {
@@ -242,6 +328,57 @@ mod tests {
         ] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
+    }
+
+    /// The kit is called void only when no vault can have been created
+    /// with it; otherwise the message says to keep it.
+    #[test]
+    fn the_kit_is_void_only_when_no_vault_was_created() {
+        use envcloak_ipc::FrameError;
+        for e in [
+            ClientError::Unavailable,
+            ClientError::Rpc(RpcError::new(ErrorKind::VaultExists)),
+            ClientError::Rpc(RpcError::new(ErrorKind::Busy)),
+            ClientError::Rpc(RpcError::with_reason(
+                ErrorKind::PassphraseRejected,
+                "common",
+            )),
+            ClientError::Rpc(RpcError::new(ErrorKind::KdfParams)),
+            ClientError::Rpc(RpcError::new(ErrorKind::Traced)),
+        ] {
+            assert!(refused_before_creating(e), "{e:?}");
+        }
+        for e in [
+            ClientError::Frame(FrameError::Closed),
+            ClientError::Protocol,
+            ClientError::Rpc(RpcError::new(ErrorKind::VaultLocked)),
+            ClientError::Rpc(RpcError::new(ErrorKind::Internal)),
+            ClientError::Rpc(RpcError::with_reason(ErrorKind::VaultUnavailable, "io")),
+        ] {
+            assert!(!refused_before_creating(e), "{e:?}");
+        }
+        assert_eq!(
+            outcome_from_status(VaultState::Absent, false),
+            KitOutcome::Void
+        );
+        assert_eq!(
+            outcome_from_status(VaultState::Locked, false),
+            KitOutcome::MaybeCreated
+        );
+        assert_eq!(
+            outcome_from_status(VaultState::Unavailable, false),
+            KitOutcome::MaybeCreated
+        );
+        assert_eq!(
+            outcome_from_status(VaultState::Locked, true),
+            KitOutcome::Unknown
+        );
+        let f = with_kit_outcome(Failure::new("x", "failed"), KitOutcome::Unknown);
+        assert!(f.message.contains("keep the Recovery Kit"), "{}", f.message);
+        assert!(!f.message.contains("void"), "{}", f.message);
+        let f = with_kit_outcome(Failure::new("x", "failed"), KitOutcome::MaybeCreated);
+        assert!(f.message.contains("keep the Recovery Kit"), "{}", f.message);
+        assert!(!f.message.contains("void"), "{}", f.message);
     }
 
     #[test]

@@ -164,6 +164,59 @@ fn a_termination_signal_locks_and_exits() {
     home.assert_clean(&all);
 }
 
+/// A `lock` that arrives while `vault.create` runs Argon2id: the vault is
+/// still created, under the passphrase and kit sent, and then locked, and
+/// the answer says so (the client told the user to keep that kit). A
+/// second create is refused, and the passphrase unlocks the vault.
+#[test]
+fn a_lock_during_vault_create_leaves_it_created_and_locked() {
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let d = start(&home);
+    let kit = RecoveryKit::generate();
+    let text = kit.to_display().to_string();
+    let creating = {
+        let paths = run_paths(&home);
+        let pass = passphrase(&cs);
+        let text = SecretBytes::copy_from(text.as_bytes());
+        std::thread::spawn(move || {
+            Client::connect(&paths)
+                .unwrap()
+                .vault_create(pass, text, Some(256 * 1024))
+        })
+    };
+    let mut c = client(&home);
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !c.status().unwrap().vault.busy {
+        assert!(std::time::Instant::now() < end, "vault.create never ran");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!c.lock().unwrap().was_unlocked);
+    let created = creating.join().unwrap().unwrap();
+    assert!(created.locked, "{created:?}");
+    let st = c.status().unwrap();
+    assert_eq!(st.vault.state, VaultState::Locked);
+    assert_eq!(st.lock.last_reason, Some(LockReason::Request));
+    let e = c
+        .vault_create(
+            passphrase(&cs),
+            SecretBytes::copy_from(RecoveryKit::generate().to_display().as_bytes()),
+            Some(common::TEST_KDF_KIB),
+        )
+        .unwrap_err();
+    assert_eq!(rpc_kind(e), ErrorKind::VaultExists);
+    assert!(!c.unlock(passphrase(&cs)).unwrap().already);
+    assert!(
+        d.log().contains("vault created, then locked"),
+        "{}",
+        d.log()
+    );
+    let mut all = cs.clone();
+    all.push(envcloak_testkit::Canary::new("RECOVERY_KIT", text));
+    assert_no_canary(&d.log_bytes(), &all);
+    home.assert_clean(&all);
+}
+
 #[test]
 fn the_idle_limit_is_configurable_within_bounds() {
     let home = TestHome::new();

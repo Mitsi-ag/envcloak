@@ -13,8 +13,10 @@
 //! are wiped as they are freed, and keeps the file open. Every lock bumps
 //! a generation number; an unlock that started under an older generation
 //! (a lock request, sleep or stop arrived while Argon2id ran) finishes
-//! locked. Idle time does not count against an unlock in progress: it
-//! applies only to an unlocked vault.
+//! locked. A `vault create` in that case still creates the vault, whose
+//! Recovery Kit the client has already shown, and leaves it locked; its
+//! answer says so. Idle time does not count against an unlock in progress:
+//! it applies only to an unlocked vault.
 //!
 //! Every method here runs with the daemon's state mutex held and returns
 //! quickly; Argon2id runs between a `begin_*` and its `finish_*`, outside
@@ -28,8 +30,8 @@ use envcloak_core::vault::{Integrity, LockedVault, Vault, VaultError, VaultError
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::{
-    DaemonView, Integrity as IntegrityView, LockReason, LockView, StatusView, UnlockedView,
-    VaultState, VaultView,
+    CreatedView, DaemonView, Integrity as IntegrityView, LockReason, LockView, StatusView,
+    UnlockedView, VaultState, VaultView,
 };
 
 use crate::lock::{LockTimer, Reading};
@@ -201,23 +203,27 @@ impl State {
         }
     }
 
-    /// Finishes `vault create` begun under `generation`.
+    /// Finishes `vault create` begun under `generation`. A vault created
+    /// after a lock arrived is kept, locked: it exists under the passphrase
+    /// and the kit the client sent, so the answer is a success that says it
+    /// is locked, never an error that would make the kit look void.
     pub fn finish_create(
         &mut self,
         generation: u64,
         now: Reading,
         result: Result<Vault, VaultError>,
-    ) -> Result<UnlockedView, RpcError> {
+    ) -> Result<CreatedView, RpcError> {
         match result {
             Ok(v) if generation == self.generation => {
-                let view = unlocked_view(&v, false);
+                let view = created_view(&v, false);
                 self.slot = Slot::Unlocked(Box::new(v));
                 self.timer.touch(now);
                 Ok(view)
             }
             Ok(v) => {
+                let view = created_view(&v, true);
                 self.slot = Slot::Locked(v.lock());
-                Err(RpcError::new(ErrorKind::VaultLocked))
+                Ok(view)
             }
             Err(e) => {
                 // Whatever the failure left on disk decides the slot.
@@ -264,6 +270,15 @@ fn probe(paths: &VaultPaths) -> Slot {
         Ok(v) => Slot::Locked(v),
         Err(e) if e.kind() == VaultErrorKind::NotFound => Slot::Absent,
         Err(e) => Slot::Unavailable(vault_reason(e.kind())),
+    }
+}
+
+fn created_view(v: &Vault, locked: bool) -> CreatedView {
+    let u = unlocked_view(v, false);
+    CreatedView {
+        locked,
+        integrity: u.integrity,
+        read_only: u.read_only,
     }
 }
 
@@ -498,6 +513,58 @@ mod tests {
         s.finish_unlock(generation, now(&f.clocks), r).unwrap();
         assert!(matches!(s.slot(), Slot::Unlocked(_)));
         assert_eq!(s.observe(now(&f.clocks)), None);
+    }
+
+    /// A lock that arrives while `vault create` runs Argon2id does not undo
+    /// the creation: the vault exists under the passphrase and kit sent,
+    /// the answer says it was created and then locked, and both unlock it.
+    #[test]
+    fn a_lock_during_create_leaves_the_vault_created_and_locked() {
+        for reason in [LockReason::Request, LockReason::Sleep, LockReason::Signal] {
+            let f = fixture();
+            let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+            let generation = s.begin_create().unwrap();
+            assert!(!s.lock(reason));
+            let kit = RecoveryKit::generate();
+            let v = create_vault_with_kit(
+                &f.paths,
+                &SecretBytes::copy_from(PASS),
+                &kit,
+                KdfParams::minimum(),
+            );
+            let created = s.finish_create(generation, now(&f.clocks), v).unwrap();
+            assert!(created.locked, "{reason:?}");
+            assert_eq!(created.integrity, IntegrityView::Ok);
+            assert!(matches!(s.slot(), Slot::Locked(_)));
+            let st = s.status(now(&f.clocks), daemon_view());
+            assert_eq!(st.vault.state, VaultState::Locked);
+            assert_eq!(st.lock.last_reason, Some(reason));
+            assert!(!unlock(&f, &mut s, PASS).unwrap().already);
+            s.lock(LockReason::Request);
+            let BeginUnlock::Proceed(locked, generation) = s.begin_unlock().unwrap() else {
+                panic!("expected to proceed");
+            };
+            let r = locked.unlock_with_kit(&kit);
+            s.finish_unlock(generation, now(&f.clocks), r).unwrap();
+        }
+        // Idle time passing during a create does not lock it.
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), Duration::from_secs(60), now(&f.clocks));
+        let generation = s.begin_create().unwrap();
+        f.clocks.run(Duration::from_secs(600));
+        assert_eq!(s.observe(now(&f.clocks)), None);
+        let v = create_vault_with_kit(
+            &f.paths,
+            &SecretBytes::copy_from(PASS),
+            &RecoveryKit::generate(),
+            KdfParams::minimum(),
+        );
+        assert!(
+            !s.finish_create(generation, now(&f.clocks), v)
+                .unwrap()
+                .locked
+        );
+        assert!(matches!(s.slot(), Slot::Unlocked(_)));
     }
 
     #[test]

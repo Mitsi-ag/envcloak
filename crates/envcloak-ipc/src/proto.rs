@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::frame::{DecodeError, Frame, FrameError};
-use crate::view::{LockedView, StatusView, UnlockedView};
+use crate::view::{CreatedView, LockedView, StatusView, UnlockedView};
 use crate::wire_secret::WireSecret;
 
 /// The protocol version string every message carries.
@@ -49,14 +49,15 @@ impl Method for Status {
     type Output = StatusView;
 }
 
-/// `vault.create`: creates the vault and leaves it unlocked.
+/// `vault.create`: creates the vault and leaves it unlocked, or locked
+/// when a lock arrived while Argon2id ran ([`CreatedView::locked`]).
 #[derive(Debug)]
 pub struct VaultCreate;
 
 impl Method for VaultCreate {
     const NAME: &'static str = "vault.create";
     type Params = VaultCreateParams;
-    type Output = UnlockedView;
+    type Output = CreatedView;
 }
 
 /// The passphrase and the Recovery Kit the client generated and showed,

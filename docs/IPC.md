@@ -83,11 +83,12 @@ Response, one of:
 | Method | Params | Result |
 |---|---|---|
 | `status` | none | `daemon` (version, pid, hardening, whether the runtime directory fell back), `vault` (state `absent`, `locked`, `unlocked` or `unavailable`; integrity; read-only; the reason it is unavailable; whether an unlock is in progress; failed unlocks), `lock` (last reason, idle limit, idle time left) |
-| `vault.create` | `passphrase`, `recovery_kit` (the kit's text as the user wrote it down), `kdf_memory_kib` (optional, 65536 to 4194304) | `integrity`, `read_only`, `already` |
+| `vault.create` | `passphrase`, `recovery_kit` (the kit's text as the user wrote it down), `kdf_memory_kib` (optional, 65536 to 4194304) | `locked` (true when a lock arrived while Argon2id ran: the vault was created, then locked), `integrity`, `read_only` |
 | `unlock` | `passphrase` | `integrity`, `read_only`, `already` (true when it was unlocked already; nothing was checked) |
 | `lock` | none | `was_unlocked` |
 
 - `vault.create` checks the Argon2id bounds, the passphrase rules and the kit's check symbols before any key derivation. The CLI generates the Recovery Kit and shows it (on the terminal, or the descriptor `--kit-fd` names, never stdout or stderr), so the kit crosses the socket only from the client to the daemon (SPEC §4.4: unlocker material is never sent to a client). Both envelopes use Argon2id with the given memory, 3 passes and 4 lanes.
+- A `vault.create` result means the vault exists under the passphrase and the kit sent, so the kit the CLI showed is valid, whether `locked` is true or not. The CLI calls a kit void only when no vault was created: the daemon refused before creating anything (`vault_exists`, `busy`, `passphrase_rejected`, `kdf_params`, `invalid_params`, `traced`), or the connection failed or the answer was unreadable and a new `status` then shows no vault and nothing in progress. Otherwise it says to keep the kit.
 - `unlock` and `vault.create` run Argon2id on the connection's thread, outside the state lock, one at a time. Both refuse (`traced`) while a tracer is attached to the daemon. A wrong passphrase and a damaged envelope give the one error `wrong_passphrase`, which is counted and audited.
 - `lock` needs no proof: locking only tightens.
 
@@ -104,7 +105,7 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `method_not_found` | -32601 | No such method |
 | `invalid_params` | -32602 | Parameters missing, malformed, or a value that is not plain base64 |
 | `role_denied` | -32001 | An `app`-role method |
-| `vault_locked` | -32002 | The vault is locked, or locked while an unlock ran |
+| `vault_locked` | -32002 | The vault is locked, or was locked while an unlock ran |
 | `no_vault` | -32003 | There is no vault yet |
 | `vault_exists` | -32004 | `vault.create` found a vault |
 | `wrong_passphrase` | -32005 | Wrong passphrase or Recovery Kit, or a damaged envelope |
@@ -124,7 +125,7 @@ The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then remo
 
 - **Sleep.** On a one-second tick and before every request, the daemon compares how far two clocks moved since its last reading: time awake (macOS `CLOCK_UPTIME_RAW`, Linux `CLOCK_MONOTONIC`) and time including sleep (macOS `CLOCK_MONOTONIC`, Linux `CLOCK_BOOTTIME`). When the second ran more than 5 seconds ahead, the machine slept. Deltas since the last reading, never totals, so drift does not add up.
 - **Idle.** Awake time since the last activity: a successful `unlock` or `vault.create` in M1, and every value release from T12. `status` and `lock` are not activity, so polling never keeps the vault open.
-- **During an unlock.** Every lock bumps a generation number. An unlock that started under an older one (a lock request, sleep or a signal arrived while Argon2id ran) finishes locked and answers `vault_locked`. Idle time does not cut an unlock short.
+- **During an unlock.** Every lock bumps a generation number. An unlock that started under an older one (a lock request, sleep or a signal arrived while Argon2id ran) finishes locked and answers `vault_locked`. A `vault.create` in that case still creates the vault, whose kit the client has already shown, leaves it locked and answers `locked: true`. Idle time does not cut either short. A signal that stops the daemon during `vault.create` may leave the vault created or not; the client gets no answer and says to keep the kit.
 
 ## Service definitions
 

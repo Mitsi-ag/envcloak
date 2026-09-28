@@ -10,8 +10,8 @@ mod common;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use common::{
     cli, cli_command, daemon_exe, finish_within, outside_dir, run, secret_file, start_daemon,
@@ -19,8 +19,10 @@ use common::{
 };
 use envcloak_core::vault::{LockedVault, VaultPaths};
 use envcloak_core::{RecoveryKit, SecretBytes};
+use envcloak_ipc::{Client, RunPaths};
 use envcloak_testkit::{
-    Canary, TEST_PATH, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
+    Canary, TEST_PATH, TestHome, assert_no_canary, by_label, canaries, daemon_run_dir, fresh_seed,
+    labels,
 };
 
 fn assert_clean_output(o: &std::process::Output, cs: &[Canary]) {
@@ -328,6 +330,134 @@ fn vault_create_refuses_before_anything_is_created() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).starts_with("envcloak: vault_exists:"));
     assert_eq!(std::fs::read(&second_kit).unwrap(), b"");
+}
+
+/// Starts `vault create --passphrase-fd 3 --kit-fd 4 --kdf-memory 256MiB`
+/// and waits until the daemon is running Argon2id for it.
+fn create_in_background(home: &TestHome, pass_file: &Path, kit_file: &Path) -> Child {
+    let mut cmd = cli_command(
+        home,
+        &[
+            "vault",
+            "create",
+            "--passphrase-fd",
+            "3",
+            "--kit-fd",
+            "4",
+            "--kdf-memory",
+            "256MiB",
+        ],
+        &[(3, pass_file, true), (4, kit_file, false)],
+    );
+    let mut child = cmd.spawn().unwrap();
+    let paths = RunPaths::under(daemon_run_dir(home)).unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        let busy = Client::connect(&paths).and_then(|mut c| c.status());
+        if matches!(busy, Ok(ref s) if s.vault.busy) {
+            return child;
+        }
+        if Instant::now() > end || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!("vault create never reached the daemon: {}", stderr(&out));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Waits up to a minute for `child` and collects its output.
+fn wait_output(child: Child) -> std::process::Output {
+    let end = Instant::now() + Duration::from_secs(60);
+    let mut child = child;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > end {
+            let _ = child.kill();
+            panic!("vault create did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// `envcloak lock` while `vault create` runs Argon2id: the vault is created
+/// and then locked. The CLI says so, exits 0 and tells the user to keep
+/// the kit, which really unlocks the vault; it never calls the kit void.
+#[test]
+fn a_lock_during_vault_create_keeps_the_vault_and_the_kit() {
+    let cs = canaries(fresh_seed());
+    let pass = by_label(&cs, labels::VAULT_PASSPHRASE).value();
+    let home = TestHome::new();
+    let mut d = start_daemon(&home);
+    let files = outside_dir();
+    let pass_file = secret_file(files.path(), "pass", pass);
+    let kit_file = files.path().join("kit");
+
+    let creating = create_in_background(&home, &pass_file, &kit_file);
+    let lock = run(&home, &["lock"], &[]);
+    assert_eq!(stdout(&lock), "The vault was not unlocked.\n");
+    let out = wait_output(creating);
+    let (said, err) = (stdout(&out), stderr(&out));
+    assert!(out.status.success(), "{said}{err}");
+    assert!(said.contains("Vault created, then locked"), "{said}");
+    assert!(said.contains("keep it"), "{said}");
+    assert!(!format!("{said}{err}").contains("void"), "{said}{err}");
+    let status = stdout(&run(&home, &["status"], &[]));
+    assert!(status.contains("vault: locked"), "{status}");
+    assert!(status.contains("last locked by: request"), "{status}");
+
+    let kit_text = std::fs::read_to_string(&kit_file).unwrap();
+    let kit_text = kit_text.trim_end().to_owned();
+    let kit = RecoveryKit::parse(&SecretBytes::copy_from(kit_text.as_bytes())).unwrap();
+    let mut all = cs.clone();
+    all.push(Canary::new("RECOVERY_KIT", kit_text));
+    assert_clean_output(&out, &all);
+    let good = run(
+        &home,
+        &["unlock", "--passphrase-fd", "3"],
+        &[(3, &pass_file, true)],
+    );
+    assert_eq!(stdout(&good), "Vault unlocked.\n", "{}", stderr(&good));
+    d.signal("-TERM");
+    assert!(d.wait_exit(Duration::from_secs(20)).unwrap().success());
+    let v = LockedVault::open(&VaultPaths::under(data_dir(&home)))
+        .unwrap()
+        .unlock_with_kit(&kit)
+        .map_err(|(_, e)| e)
+        .unwrap();
+    drop(v);
+    assert_no_canary(&d.log_bytes(), &all);
+    home.assert_clean(&all);
+}
+
+/// The daemon stops while `vault create` runs Argon2id, so the answer
+/// never comes. Whether the vault exists is unknown to the CLI, so it
+/// says to keep the kit rather than calling it void.
+#[test]
+fn a_daemon_that_stops_during_vault_create_leaves_the_kit_kept() {
+    let cs = canaries(fresh_seed());
+    let pass = by_label(&cs, labels::VAULT_PASSPHRASE).value();
+    let home = TestHome::new();
+    let mut d = start_daemon(&home);
+    let files = outside_dir();
+    let pass_file = secret_file(files.path(), "pass", pass);
+    let kit_file = files.path().join("kit");
+
+    let creating = create_in_background(&home, &pass_file, &kit_file);
+    d.signal("-TERM");
+    assert!(d.wait_exit(Duration::from_secs(20)).unwrap().success());
+    let out = wait_output(creating);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.starts_with("envcloak: daemon_unavailable:"), "{err}");
+    assert!(err.contains("keep the Recovery Kit"), "{err}");
+    assert!(!err.contains("void"), "{err}");
+    let kit_text = std::fs::read_to_string(&kit_file).unwrap();
+    assert!(!kit_text.trim().is_empty());
+    let mut all = cs.clone();
+    all.push(Canary::new("RECOVERY_KIT", kit_text.trim_end().to_owned()));
+    assert_clean_output(&out, &all);
+    assert_no_canary(&d.log_bytes(), &all);
 }
 
 // ------------------------------------------------------- daemon install

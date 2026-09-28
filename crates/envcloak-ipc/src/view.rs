@@ -134,7 +134,18 @@ impl LockReason {
     }
 }
 
-/// `vault.create` and `unlock`: the vault is unlocked.
+/// `vault.create`: the vault exists, under the passphrase and the Recovery
+/// Kit the client sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedView {
+    /// A lock (a request, sleep or a signal) arrived while Argon2id ran: the
+    /// vault was created and then locked. The kit is valid all the same.
+    pub locked: bool,
+    pub integrity: Integrity,
+    pub read_only: bool,
+}
+
+/// `unlock`: the vault is unlocked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnlockedView {
     pub integrity: Integrity,

@@ -46,7 +46,7 @@ pub fn create_vault(home: &TestHome, cs: &[Canary]) -> Canary {
             Some(TEST_KDF_KIB),
         )
         .unwrap();
-    assert!(!v.already);
+    assert!(!v.locked);
     Canary::new("RECOVERY_KIT", text.to_string())
 }
 

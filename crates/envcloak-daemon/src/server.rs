@@ -46,7 +46,9 @@ use envcloak_ipc::proto::{
     self, ErrorKind, IncomingRequest, Lock, Method, Role, Status, Unlock, UnlockParams,
     VaultCreate, VaultCreateParams, loggable_method, required_role,
 };
-use envcloak_ipc::view::{DaemonView, LockReason, LockedView, StatusView, UnlockedView};
+use envcloak_ipc::view::{
+    CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
+};
 use envcloak_ipc::{Frame, FrameError, RpcError, RunPathErrorKind, RunPaths};
 use envcloak_sys::{PeerIdentity, TerminationSignals};
 
@@ -505,7 +507,7 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
     r
 }
 
-fn create(shared: &Shared, p: VaultCreateParams) -> Result<UnlockedView, RpcError> {
+fn create(shared: &Shared, p: VaultCreateParams) -> Result<CreatedView, RpcError> {
     let pass = p.passphrase.into_inner();
     let kit_text = p.recovery_kit.into_inner();
     let mut kdf = KdfParams::current_defaults();
@@ -527,8 +529,14 @@ fn create(shared: &Shared, p: VaultCreateParams) -> Result<UnlockedView, RpcErro
     drop((pass, kit));
     let now = Reading::now(&shared.clocks);
     let r = locked(&shared.state).finish_create(generation, now, result);
-    if r.is_ok() {
-        eprintln!("envcloakd: vault created and unlocked");
+    match &r {
+        Ok(v) if v.locked => {
+            eprintln!(
+                "envcloakd: vault created, then locked (a lock arrived while it was created)"
+            );
+        }
+        Ok(_) => eprintln!("envcloakd: vault created and unlocked"),
+        Err(_) => {}
     }
     r
 }

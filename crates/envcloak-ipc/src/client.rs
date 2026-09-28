@@ -33,7 +33,7 @@ use crate::proto::{
     self, Lock, Method, NoParams, ResponseError, RpcError, Status, Unlock, UnlockParams,
     VaultCreate, VaultCreateParams,
 };
-use crate::view::{LockedView, StatusView, UnlockedView};
+use crate::view::{CreatedView, LockedView, StatusView, UnlockedView};
 use crate::wire_secret::WireSecret;
 
 /// How long a call may wait for its response. `vault create` runs
@@ -239,13 +239,15 @@ impl Client {
     /// `vault.create` with the passphrase and the kit's text.
     ///
     /// # Errors
-    /// As [`Client::call`].
+    /// As [`Client::call`]. An error does not always mean that no vault was
+    /// created: after a [`ClientError::Frame`] or [`ClientError::Protocol`]
+    /// the daemon may have created it before the answer was lost.
     pub fn vault_create(
         &mut self,
         passphrase: SecretBytes,
         recovery_kit: SecretBytes,
         kdf_memory_kib: Option<u32>,
-    ) -> Result<UnlockedView, ClientError> {
+    ) -> Result<CreatedView, ClientError> {
         let params = VaultCreateParams {
             passphrase: WireSecret::new(passphrase),
             recovery_kit: WireSecret::new(recovery_kit),
