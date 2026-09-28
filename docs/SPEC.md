@@ -716,7 +716,7 @@ A manifest change that leaves the bindings a subset does not prompt; the new has
 
 **Lifetimes.**
 - Agent grants: default 8 h, maximum 24 h.
-- Terminal grants: maximum 12 h.
+- Terminal grants: maximum 12 h. Unknown grants take the same maximum: missing evidence gets the tighter bound.
 - A grant never outlives its root process.
 - Grants live only in daemon memory and are never persisted or synced.
 

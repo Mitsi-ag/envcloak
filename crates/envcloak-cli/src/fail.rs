@@ -118,7 +118,7 @@ fn reason_text(reason: &str) -> &'static str {
         "unknown_item_class" => "a reference names an item of a class that cannot be bound",
         // Approval options.
         "ttl_zero" => "the grant length must be more than zero",
-        "ttl_too_long" => "the grant length is over the limit (24h for agents, 12h for terminals)",
+        "ttl_too_long" => "the grant length is over the limit (24h for an agent, 12h otherwise)",
         "live_not_bound" => "a --live name is not one of the request's variables",
         _ => "no detail",
     }

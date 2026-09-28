@@ -35,7 +35,7 @@ A manifest change that leaves the bindings a subset does not prompt; the daemon 
 
 **Once.** A `once` grant is used up by the first request it covers. The decision and the consumption happen under one lock, so of concurrent requests exactly one is covered; the others are pending, and identical ones share one pending request.
 
-**Deadlines.** An approval sets two: the wall clock plus the grant's length, and time awake plus the same length. Either passing ends the grant, so a clock stepped either way cannot lengthen one. Lengths: 8 hours by default (`--for` sets it, from 30 seconds), at most 24 hours for an agent or unknown subject and 12 hours for a terminal subject.
+**Deadlines.** An approval sets two: the wall clock plus the grant's length, and time awake plus the same length. Either passing ends the grant, so a clock stepped either way cannot lengthen one. Lengths: 8 hours by default (`--for` sets it, from 30 seconds), at most 24 hours for an agent subject and 12 hours for a terminal or unknown subject: an unknown subject's evidence is missing, so it takes the tighter bound.
 
 **A grant ends on** expiry; its first use, if `once`; the root process exiting (a tick every second drops grants whose root's pid is gone or has another start time); `envcloak grants revoke <id> | --all`, which any client may run (tightening needs no proof); lock, for any reason (a request, idle time, sleep, a signal), which also drops every pending request; a daemon restart, which starts empty; a policy epoch bump; a vault epoch change.
 

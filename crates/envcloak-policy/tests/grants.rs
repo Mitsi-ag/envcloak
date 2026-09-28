@@ -418,9 +418,18 @@ fn approval_options_are_bounded() {
     let now = now_at(0);
     let agent_request = || request(under_agent(), vec![bound("OPENAI_API_KEY", &it[0])], &["x"]);
     let terminal_request = || request(terminal(), vec![bound("OPENAI_API_KEY", &it[0])], &["x"]);
+    // A job a service manager started: its evidence is missing, so it gets
+    // the tighter bound, a terminal's, not an agent's.
+    let unknown_request = || {
+        let job = ev(vec![p(97, 1, None), p(1, 1, None)], false, &[]);
+        assert_eq!(job.kind(), SubjectKind::Unknown);
+        request(job, vec![bound("OPENAI_API_KEY", &it[0])], &["x"])
+    };
+    assert!(MAX_TERMINAL_TTL < MAX_AGENT_TTL);
     for (mk, max) in [
         (&agent_request as &dyn Fn() -> AccessRequest, MAX_AGENT_TTL),
         (&terminal_request, MAX_TERMINAL_TTL),
+        (&unknown_request, MAX_TERMINAL_TTL),
     ] {
         let mut s = store();
         let e = approve(&mut s, mk(), session(max.as_secs() + 1), &now).unwrap_err();

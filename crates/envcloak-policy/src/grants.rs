@@ -28,9 +28,10 @@
 //! force for the caller and project covers, and lists the ones a grant
 //! already covers apart, since the new grant holds the whole request.
 //!
-//! **Lifetimes.** Agent (and unknown) grants last [`DEFAULT_TTL`] by
-//! default and [`MAX_AGENT_TTL`] at most; terminal grants
-//! [`MAX_TERMINAL_TTL`] at most. Both a wall-clock and an awake-time
+//! **Lifetimes.** Grants last [`DEFAULT_TTL`] by default; agent grants
+//! [`MAX_AGENT_TTL`] at most, and terminal and unknown ones
+//! [`MAX_TERMINAL_TTL`] at most: missing evidence takes the tighter
+//! bound. Both a wall-clock and an awake-time
 //! deadline are set at approval and either ends the grant, so a clock
 //! stepped either way cannot lengthen one. A grant never outlives its root
 //! process: [`GrantStore::sweep`] drops grants whose root is gone. Lock
@@ -65,9 +66,11 @@ use crate::statement::{PendingDescriptor, statement_digest};
 
 /// A session grant's length when the approver names none.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(8 * 3600);
-/// The longest grant for an agent or unknown subject.
+/// The longest grant for an agent subject.
 pub const MAX_AGENT_TTL: Duration = Duration::from_secs(24 * 3600);
-/// The longest grant for a terminal subject.
+/// The longest grant for a terminal or unknown subject. An unknown subject
+/// is one whose evidence is missing (an orphan, a service manager's job, a
+/// caller without a terminal), so it takes the tighter of the two bounds.
 pub const MAX_TERMINAL_TTL: Duration = Duration::from_secs(12 * 3600);
 /// Grants held at once.
 pub const MAX_GRANTS: usize = 256;
@@ -606,8 +609,8 @@ impl GrantStore {
     ) -> Result<(), ApproveError> {
         let p = self.pending(id, now).ok_or(ApproveError::NoSuchRequest)?;
         let max = match p.request.subject.kind() {
-            SubjectKind::Terminal => MAX_TERMINAL_TTL,
-            SubjectKind::Agent | SubjectKind::Unknown => MAX_AGENT_TTL,
+            SubjectKind::Agent => MAX_AGENT_TTL,
+            SubjectKind::Terminal | SubjectKind::Unknown => MAX_TERMINAL_TTL,
         };
         if opts.ttl_secs == 0 {
             return Err(ApproveError::InvalidOptions(OptionsError::TtlZero));
