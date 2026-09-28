@@ -14,10 +14,11 @@ use std::path::PathBuf;
 
 use envcloak_policy::{
     AGENTS_DIR, AgentCatalog, AgentLabel, Ancestor, CatalogSource, ChainEnd, Claims, EvidenceError,
-    GATHER_ATTEMPTS, ProcessInstance, SubjectEvidence, SubjectKind, gather_in,
+    GATHER_ATTEMPTS, MatchBasis, ProcessInstance, SubjectEvidence, SubjectKind, gather_in,
 };
 use envcloak_sys::{
-    ExeIdentity, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo, ProcessTable, StartTime,
+    CodeSignature, ExeIdentity, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo, ProcessTable,
+    StartTime,
 };
 
 fn inst(pid: i32, start: u64) -> ProcessInstance {
@@ -29,11 +30,12 @@ fn inst(pid: i32, start: u64) -> ProcessInstance {
     }
 }
 
-fn label(id: &str, source: CatalogSource) -> AgentLabel {
+fn label(id: &str, source: CatalogSource, basis: MatchBasis) -> AgentLabel {
     AgentLabel {
         id: id.to_owned(),
         name: id.to_owned(),
         source,
+        basis,
     }
 }
 
@@ -47,12 +49,18 @@ fn p(pid: i32, sid: i32, agent: Option<AgentLabel>) -> Ancestor {
     }
 }
 
+/// A builtin entry matched the executable.
 fn builtin(id: &str) -> Option<AgentLabel> {
-    Some(label(id, CatalogSource::Builtin))
+    Some(label(id, CatalogSource::Builtin, MatchBasis::Executable))
+}
+
+/// A builtin entry matched what the process says about itself.
+fn asserted(id: &str) -> Option<AgentLabel> {
+    Some(label(id, CatalogSource::Builtin, MatchBasis::Asserted))
 }
 
 fn extension(id: &str) -> Option<AgentLabel> {
-    Some(label(id, CatalogSource::Extension))
+    Some(label(id, CatalogSource::Extension, MatchBasis::Executable))
 }
 
 fn ev(chain: Vec<Ancestor>, terminal: bool, claims: &[&str]) -> SubjectEvidence {
@@ -194,6 +202,46 @@ fn an_extension_agent_above_the_session_does_not_widen_the_root() {
     assert!(e.covered_by(&e.root(), SubjectKind::Agent));
 }
 
+/// Review finding F-37: a builtin agent matched only on what it says about
+/// itself (`argv[0]`, its script, its command name) is an agent, and a
+/// barrier, but no root above the caller's session.
+#[test]
+fn an_asserted_agent_above_the_session_does_not_widen_the_root() {
+    // As in the_nearest_agent_is_the_root, the agent (80) above the
+    // caller's own session (90).
+    let chain = |agent| {
+        vec![
+            p(90, 90, None),
+            p(80, 70, agent),
+            p(70, 70, None),
+            p(1, 1, None),
+        ]
+    };
+    let by_exe = ev(chain(builtin("claude-code")), true, &[]);
+    assert_eq!(by_exe.root().pid, 80);
+    let e = ev(chain(asserted("claude-code")), true, &[]);
+    assert_eq!(e.kind(), SubjectKind::Agent);
+    assert!(e.agent_involved());
+    assert_eq!(e.label().unwrap().id, "claude-code");
+    assert_eq!(e.nearest_agent().unwrap().0, 1);
+    assert_eq!(e.root().pid, 90, "the caller's session leader");
+    assert!(e.covered_by(&e.root(), SubjectKind::Agent));
+    for kind in [
+        SubjectKind::Agent,
+        SubjectKind::Unknown,
+        SubjectKind::Terminal,
+    ] {
+        assert!(!e.covered_by(&e.chain()[1].instance, kind), "{kind:?}");
+        // Nor above it: the agent barrier.
+        assert!(!e.covered_by(&e.chain()[2].instance, kind), "{kind:?}");
+    }
+
+    // Within the caller's session it is the root, as any agent is.
+    let e = ev(terminal_chain(asserted("claude-code")), true, &[]);
+    assert_eq!(e.root().pid, 80);
+    assert!(e.covered_by(&e.root(), SubjectKind::Agent));
+}
+
 #[test]
 fn claims_only_tighten() {
     let plain = ev(terminal_chain(None), true, &[]);
@@ -285,7 +333,7 @@ fn long_chain(agent_at: Option<usize>) -> Vec<Ancestor> {
             p(
                 pid,
                 sid,
-                (agent_at == Some(k)).then(|| label("codex", CatalogSource::Builtin)),
+                (agent_at == Some(k)).then(|| builtin("codex").unwrap()),
             )
         })
         .collect()
@@ -432,6 +480,9 @@ fn gather_classifies_the_callers_processes_from_what_it_reads() {
     assert_eq!(t.argv_reads, [80, 90]);
     assert_eq!(e.nearest_agent().unwrap().0, 1);
     assert_eq!(e.label().unwrap().id, "claude-code");
+    // Known by its script, which it names itself; in the caller's session
+    // that still roots the grant.
+    assert_eq!(e.label().unwrap().basis, MatchBasis::Asserted);
     // Another user's `claude` is not an agent.
     assert!(e.chain()[3].agent.is_none());
     assert_eq!(e.root().pid, 80);
@@ -603,6 +654,163 @@ fn an_extension_interpreter_does_not_widen_the_root() {
         ] {
             assert!(!sibling.covered_by(&holder, kind), "{argv:?} {kind:?}");
         }
+    }
+}
+
+/// The table of the F-37 review probe: envcloak (320) <- zsh (300, a
+/// session leader) <- the holder (200) <- launchd, and beside it envcloak
+/// (330) <- zsh (310, another session leader) <- the holder.
+fn sibling_sessions(holder: ProcInfo, argv: Option<Vec<&'static str>>) -> Table {
+    let t = Table::default()
+        .add(vec![info(
+            320,
+            300,
+            300,
+            501,
+            Some("/usr/local/bin/envcloak"),
+        )])
+        .add(vec![info(300, 200, 300, 501, Some("/bin/zsh"))])
+        .add(vec![info(
+            330,
+            310,
+            310,
+            501,
+            Some("/usr/local/bin/envcloak"),
+        )])
+        .add(vec![info(310, 200, 310, 501, Some("/bin/zsh"))])
+        .add(vec![holder])
+        .add(vec![info(1, 0, 1, 0, Some("/sbin/launchd"))]);
+    match argv {
+        Some(a) => t.with_argv(200, a),
+        None => t,
+    }
+}
+
+/// The holder: pid 200, its own session leader, run by launchd, with
+/// executable `exe`, command name `comm` and, on macOS, `signature`.
+fn holder(exe: Option<&str>, comm: &str, signature: Option<(&str, &str)>) -> ProcInfo {
+    let mut h = info(200, 1, 200, 501, exe);
+    h.comm = OsString::from(comm);
+    if let (Some(e), Some((identifier, team))) = (h.exe.as_mut(), signature) {
+        e.signature = Some(CodeSignature {
+            identifier: identifier.to_owned(),
+            team_id: Some(team.to_owned()),
+            cdhash: None,
+        });
+    }
+    h
+}
+
+/// Review finding F-37, as its probe found it: with the builtin catalog
+/// alone and the holder's executable unchanged, changing only its
+/// `argv[0]` (or its script, or its command name) made it Codex or Claude
+/// Code, rooted the grant for a caller in one session at it, and so let
+/// that grant cover the sibling session. Now such a match labels and
+/// tightens only: the root stays the caller's session leader. A match on
+/// the executable or signature still roots above the session, as an
+/// agent that runs each command in a session of its own needs.
+#[test]
+fn only_the_executable_roots_a_grant_above_the_session() {
+    let cat = AgentCatalog::builtin();
+    let asserted_cases: Vec<(&str, ProcInfo, Option<Vec<&'static str>>, &str)> = vec![
+        (
+            "argv[0]",
+            holder(Some("/usr/bin/node"), "node", None),
+            Some(vec!["codex"]),
+            "codex",
+        ),
+        (
+            "script",
+            holder(Some("/usr/bin/node"), "node", None),
+            Some(vec!["node", "/opt/x/@anthropic-ai/claude-code/cli.js"]),
+            "claude-code",
+        ),
+        (
+            "command name",
+            holder(Some("/usr/bin/tmux"), "claude", None),
+            None,
+            "claude-code",
+        ),
+        (
+            "hidden executable",
+            holder(None, "x", None),
+            Some(vec!["/opt/vendor/codex"]),
+            "codex",
+        ),
+    ];
+    // The control: node as itself is no agent, and roots nothing.
+    let mut t = sibling_sessions(
+        holder(Some("/usr/bin/node"), "node", None),
+        Some(vec!["node"]),
+    );
+    let e = gather_in(&mut t, &peer(320), Claims::none(), &cat).unwrap();
+    assert!(e.nearest_agent().is_none());
+    assert_eq!(e.root().pid, 300);
+
+    for (what, h, argv, id) in asserted_cases {
+        let mut t = sibling_sessions(h.clone(), argv.clone());
+        let e = gather_in(&mut t, &peer(320), Claims::none(), &cat).unwrap();
+        let (n, l) = e.nearest_agent().unwrap();
+        assert_eq!(
+            (n, l.id.as_str(), l.source, l.basis),
+            (2, id, CatalogSource::Builtin, MatchBasis::Asserted),
+            "{what}"
+        );
+        assert!(!l.may_root_above_session(), "{what}");
+        assert_eq!(e.kind(), SubjectKind::Agent, "{what}");
+        assert!(e.agent_involved(), "{what}");
+        assert_eq!(e.root().pid, 300, "{what}");
+        let root = e.root();
+        let held = e.chain()[2].instance.clone();
+
+        let mut t = sibling_sessions(h, argv);
+        let sibling = gather_in(&mut t, &peer(330), Claims::none(), &cat).unwrap();
+        assert_eq!(sibling.root().pid, 310, "{what}");
+        for kind in [
+            SubjectKind::Agent,
+            SubjectKind::Unknown,
+            SubjectKind::Terminal,
+        ] {
+            assert!(!sibling.covered_by(&root, kind), "{what} {kind:?}");
+            assert!(!sibling.covered_by(&held, kind), "{what} {kind:?}");
+        }
+    }
+
+    // The executable, or the signature: the holder is the agent, and the
+    // root of both sessions' grants.
+    for (what, h) in [
+        (
+            "executable",
+            holder(
+                Some("/Users/u/.local/share/claude/versions/2.1.0"),
+                "2.1.0",
+                None,
+            ),
+        ),
+        (
+            "signature",
+            holder(
+                Some("/tmp/x/renamed"),
+                "renamed",
+                Some(("com.anthropic.claude-code", "Q6L2SF6YDW")),
+            ),
+        ),
+    ] {
+        let mut t = sibling_sessions(h.clone(), None);
+        let e = gather_in(&mut t, &peer(320), Claims::none(), &cat).unwrap();
+        let (n, l) = e.nearest_agent().unwrap();
+        assert_eq!(
+            (n, l.id.as_str(), l.basis),
+            (2, "claude-code", MatchBasis::Executable),
+            "{what}"
+        );
+        assert!(l.may_root_above_session());
+        assert_eq!(e.root().pid, 200, "{what}");
+        let mut t = sibling_sessions(h, None);
+        let sibling = gather_in(&mut t, &peer(330), Claims::none(), &cat).unwrap();
+        assert_eq!(sibling.root().pid, 200, "{what}");
+        assert!(sibling.covered_by(&e.root(), SubjectKind::Agent), "{what}");
+        assert!(!sibling.covered_by(&e.root(), SubjectKind::Terminal));
     }
 }
 

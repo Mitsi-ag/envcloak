@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use envcloak_policy::{
     AGENTS_DIR, AgentCatalog, CatalogErrorKind, CatalogSource, Claims, ClaimsError,
-    MAX_EXTENSION_FILES,
+    MAX_EXTENSION_FILES, MatchBasis,
 };
 use envcloak_sys::{CodeSignature, ExeIdentity, ProcInfo, StartTime};
 
@@ -462,6 +462,106 @@ fn arguments_read_for_an_extension_interpreter_are_extension_evidence() {
     let hidden = proc_with(None, "x", Some(&["/opt/vendor/codex"]));
     let l = cat.classify(&hidden).unwrap();
     assert_eq!((l.id.as_str(), l.source), ("codex", CatalogSource::Builtin));
+}
+
+/// Review finding F-37: what a process says about itself (`argv[0]`, its
+/// script, its command name) is caller-asserted (SPEC §10a). A match on it
+/// is labeled [`MatchBasis::Asserted`] and may not root a grant above the
+/// caller's session; a builtin match on the executable's path or its
+/// signature is [`MatchBasis::Executable`] and may.
+#[test]
+fn what_a_process_says_about_itself_is_asserted() {
+    let cat = AgentCatalog::builtin();
+    let basis = |p: &ProcInfo| {
+        let l = cat.classify(p).unwrap();
+        let wide = l.may_root_above_session();
+        (l.id, l.source, l.basis, wide)
+    };
+    let by_exe = |id: &str| {
+        (
+            id.to_owned(),
+            CatalogSource::Builtin,
+            MatchBasis::Executable,
+            true,
+        )
+    };
+    let said = |id: &str| {
+        (
+            id.to_owned(),
+            CatalogSource::Builtin,
+            MatchBasis::Asserted,
+            false,
+        )
+    };
+    for path in [
+        "/home/u/.local/share/claude/versions/2.1.112",
+        "/opt/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+    ] {
+        assert_eq!(basis(&exe(path)), by_exe("claude-code"), "{path}");
+    }
+    assert_eq!(basis(&exe("/opt/homebrew/bin/codex")), by_exe("codex"));
+    assert_eq!(
+        basis(&signed(
+            "/tmp/x/renamed",
+            "com.anthropic.claude-code",
+            Some("Q6L2SF6YDW")
+        )),
+        by_exe("claude-code")
+    );
+    // The executable unchanged, the process's own word changed.
+    for (p, id) in [
+        // argv[0] under a builtin interpreter (node's process.title).
+        (
+            proc_with(Some("/usr/bin/node"), "node", Some(&["codex"])),
+            "codex",
+        ),
+        // A script it names.
+        (
+            proc_with(
+                Some("/usr/bin/node"),
+                "node",
+                Some(&["node", "/opt/x/@anthropic-ai/claude-code/cli.js"]),
+            ),
+            "claude-code",
+        ),
+        // Linux: a command name set by prctl, or by a link named `claude`.
+        (
+            proc_with(Some("/usr/bin/tmux"), "claude", None),
+            "claude-code",
+        ),
+        // A hidden executable: argv[0] and the command name stand in.
+        (proc_with(None, "codex", Some(&["x"])), "codex"),
+        (proc_with(None, "x", Some(&["/opt/vendor/codex"])), "codex"),
+    ] {
+        assert_eq!(basis(&p), said(id), "{p:?}");
+    }
+    // The executable wins over what the process says: Codex by its path,
+    // though its command name says Claude Code.
+    assert_eq!(
+        basis(&proc_with(Some("/opt/homebrew/bin/codex"), "claude", None)),
+        by_exe("codex")
+    );
+    // A marker is a claim.
+    assert_eq!(
+        cat.agent_for_marker("CLAUDECODE").unwrap().basis,
+        MatchBasis::Asserted
+    );
+
+    // An extension's executable match roots nothing above the session
+    // either.
+    let (root, dir) = data_dir();
+    write(
+        &dir,
+        "a.toml",
+        "[[agent]]\nid = \"aider\"\nname = \"Aider\"\nexecutables = [\"aider\"]\n",
+    );
+    let cat = AgentCatalog::load(root.path());
+    let l = cat.classify(&exe("/usr/local/bin/aider")).unwrap();
+    assert_eq!(
+        (l.source, l.basis),
+        (CatalogSource::Extension, MatchBasis::Executable)
+    );
+    assert!(!l.may_root_above_session());
 }
 
 #[test]

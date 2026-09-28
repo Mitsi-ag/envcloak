@@ -2,7 +2,7 @@
 
 Status: M1. This file fixes the format of the agent catalog (`integrations/agents.toml` and the user's extensions), how the daemon reads a caller's process ancestry, and how that evidence picks a grant's root, the subject's kind and whether a grant covers a caller (SPEC §10a, §10b "Root selection" and "Match" rules 3 and 4; gates 25 and 26). The code is in `crates/envcloak-sys/src/proc/` (the kernel's view) and `crates/envcloak-policy/src/{agents,evidence}.rs`.
 
-Everything here is evidence, and evidence only tightens. Matching a process as an agent makes handling stricter; the absence of a match never removes a restriction, and evidence the daemon cannot read in full (an orphan's lost ancestry, a chain cut at the depth limit) is handled as if an agent may be there. The one thing a missed agent costs is the agent barrier: an unrecognized agent started in a terminal that holds a terminal grant would be covered by it. The catalog exists to make that rare, and the daemon's other defenses (approval proofs, the manifest's tighten-only rule, proxy mode) do not depend on it.
+Evidence here tightens, with one exception. Matching a process as an agent makes handling stricter (an agent subject, the agent barrier, proofs refused); the absence of a match never removes a restriction, and evidence the daemon cannot read in full (an orphan's lost ancestry, a chain cut at the depth limit) is handled as if an agent may be there. The exception is the root: an agent runs each command in a session of its own, so its grants are rooted at the agent process, above the caller's session, and cover every command it runs. Only a builtin match on the executable's path or its macOS code signature roots a grant there; a match on what a process says about itself (`argv[0]`, its script, its command name) or on a user extension's entry roots it no higher than the caller's session leader (Root, below). The one thing a missed agent costs is the agent barrier: an unrecognized agent started in a terminal that holds a terminal grant would be covered by it. The catalog exists to make that rare, and the daemon's other defenses (approval proofs, the manifest's tighten-only rule, proxy mode) do not depend on it.
 
 ## Where the catalog comes from
 
@@ -42,6 +42,8 @@ markers = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]
 | `scripts` | Patterns matched against an interpreter's script arguments: the first 3 arguments that do not start with `-`, among the first 16 after `argv[0]` |
 | `signatures` | macOS only: `identifier` (the signing identifier, printable ASCII) and optionally `team` (a 10-character Team ID). Matched against the signature the kernel validated when the process started its executable (`csops`, `CS_VALID`) |
 | `markers` | Environment variables the agent sets in the commands it runs. Variable names. They are the caller's claims, not ancestry evidence (below) |
+
+A match records what it rests on (`MatchBasis`): the executable's path or its code signature (`Executable`), or `argv[0]`, a script or the command name (`Asserted`), each of which the process sets itself (`exec -a`, node's `process.title`, and on Linux `prctl(PR_SET_NAME)` or the name of a link it was run through). The executable's path and signature are tried first, for every agent, so a process whose path names one agent and whose command name names another is the first. What differs is where it may root a grant (Root, below).
 
 A pattern is a path suffix of 1 to 8 components separated by `/`, at most 256 bytes. Each component is a name or `*`, which stands for any one component, and at least one is a name. `.`, `..`, empty components, a `*` inside a name and control characters are refused. `claude/versions/*` matches `/home/u/.local/share/claude/versions/2.1.112`; `claude` matches `/usr/local/bin/claude`, `./claude` and the command name `claude`, and not `claude2` or `Claude`. Matching is byte for byte and case-sensitive.
 
@@ -90,7 +92,9 @@ The Linux CLI makes itself non-dumpable, so its own `/proc/<pid>/exe` is hidden 
 2. otherwise the caller's session leader, when it is in the verified chain (so alive, with its start time checked);
 3. otherwise the topmost ancestor still in the caller's session: the session leader died, or the caller left its tree.
 
-pid 1 (`launchd`, `init`) is never a root and never counts as a session leader: every process descends from it, and GUI apps on macOS run in its session. An agent matched only through an extension is the root only at or below the point rule 2 or 3 would pick; above it, rules 2 and 3 apply. So an extension that matches a terminal emulator or an IDE cannot widen a grant beyond the caller's session.
+pid 1 (`launchd`, `init`) is never a root and never counts as a session leader: every process descends from it, and GUI apps on macOS run in its session.
+
+Rule 1 may pick an agent above the caller's session, and must: Claude Code and Codex run each command in a session of its own, without a terminal, so the command leads its own session. Only a builtin match on the agent's executable path or signature does that. An agent matched only on `argv[0]`, a script or its command name, or only through an extension, is the root only at or below the point rule 2 or 3 would pick; above it, rules 2 and 3 apply. So a process that calls itself `claude`, and an extension that matches a terminal emulator or an IDE, cannot widen a grant beyond the caller's session; they still make the caller an agent subject, stand as a barrier and refuse its proofs.
 
 **Kind**, in this order:
 
@@ -105,7 +109,7 @@ pid 1 (`launchd`, `init`) is never a root and never counts as a session leader: 
 - R is in the caller's chain with its pid and start time (a recycled pid never matches, and pid 1 never does);
 - no known agent sits between R and the caller, the caller included, unless R is that agent (the agent barrier);
 - K is `terminal` only if the caller is a terminal subject;
-- R, when it is above the caller's session, is not an agent that only an extension matched.
+- R, when it is an agent above the caller's session, is one a builtin entry matched by its executable path or signature.
 
 The remaining match rules (expiry, epochs, project, bindings, mode) are the grant store's (SPEC §10b).
 
@@ -130,6 +134,8 @@ In each case the process's new request gets a root of its own, and a person appr
 ## Limits
 
 - A renamed agent binary on Linux, or a renamed unsigned one on macOS, is not recognized, and a grant for the terminal it runs in covers its commands. When it sets its markers, its commands are still agent subjects, which a terminal grant does not cover.
+- An agent known only by what it says about itself (the older npm build of Claude Code, `node .../cli.js`; an agent whose executable is hidden, as a non-dumpable process's is on Linux) roots its grants no higher than the caller's session. As it runs each command in a session of its own, each command asks. The native builds are known by their executables.
+- An executable's path is the name of whatever file the process runs: a program copied to a file named `claude` matches Claude Code by path, and roots grants above the caller's session, over every session it holds. The root's executable is part of a grant's subject (SPEC §10b). On macOS the signature is the identity a copy cannot take.
 - An agent that starts a pseudo-terminal of its own (`script`, `tmux`) and escapes into it creates a terminal session. SPEC §10a says a terminal subject never proves a person is there.
 - macOS records start times on the wall clock. A clock stepped backwards between a parent's start and its child's makes the walk fail its order check; the request is refused (`ancestry_changed`) until the processes restart.
 - On Linux, `/proc` mounted with `hidepid=1` or `hidepid=2` (some hardened distributions and shared hosts) hides other users' processes from the daemon, and nearly every chain has one (`sshd`, `login`, `init`). Every request is then refused with `ancestry_hidden`: closed, but EnvCloak does not work there. The mount's `gid=` option names a group whose members see every process; an administrator can add the user to it.
@@ -139,6 +145,6 @@ In each case the process's new request gets a root of its own, and a person appr
 ## Tests
 
 - `crates/envcloak-sys/tests/proc.rs`: this process, pid 1 and real children (a new session, a pseudo-terminal) as the kernel reports them; the walk and its re-validation against a table whose answers change; the `KERN_PROCARGS2`, `cmdline` and `stat` parsers against arbitrary bytes.
-- `crates/envcloak-policy/tests/agents.rs`: the builtin catalog, installs of Claude Code and Codex, ordinary programs, extensions and their checks, claims.
+- `crates/envcloak-policy/tests/agents.rs`: the builtin catalog, installs of Claude Code and Codex, ordinary programs, what each match rests on, extensions and their checks, claims.
 - `crates/envcloak-policy/tests/evidence.rs`: root, kind, claims and coverage on synthetic chains; what `gather` reads and classifies; walking again.
-- `crates/envcloak-policy/tests/evidence_gates.rs`: gates 25 and 26 with real processes, the test fixture agent (also 70 nested shells below it, past the cut), a pseudo-terminal, and `launchctl submit` or `systemd-run --user` where `ENVCLOAK_TEST_SERVICE_MANAGER=1`.
+- `crates/envcloak-policy/tests/evidence_gates.rs`: gates 25 and 26 with real processes, the test fixture agent (also 70 nested shells below it, past the cut), processes that only call themselves agents (by `argv[0]` or a script under `node`, or by a link's name on Linux), a pseudo-terminal, and `launchctl submit` or `systemd-run --user` where `ENVCLOAK_TEST_SERVICE_MANAGER=1`.

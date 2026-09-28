@@ -13,18 +13,25 @@
 //!   executable (path, `argv[0]` or command name), its script when an
 //!   interpreter runs it, or its macOS code signature. Builtin entries are
 //!   tried first, and the label says which kind matched
-//!   ([`CatalogSource`]): an agent matched only through an extension is a
-//!   grant root only at or below the caller's session leader
-//!   (`crate::SubjectEvidence`), so an extension that matches a terminal
-//!   emulator or `launchd` cannot widen a grant. That includes a match on
-//!   arguments read only because an extension names an interpreter: the
-//!   builtin pass uses arguments only where the builtin catalog alone
-//!   would read them.
+//!   ([`CatalogSource`]) and on what ([`MatchBasis`]).
 //!
-//! Classification is evidence, and it only tightens: a process wrongly
-//! matched is handled as an agent (stricter), and a missed agent is the
-//! risk the catalog exists to shrink. Errors are value-free: a kind and a
-//! line.
+//! A match labels the process an agent, which only tightens: the caller
+//! is an agent subject, the agent barrier applies, and its proofs are
+//! refused. One use of a match can widen: an agent runs each command in a
+//! session of its own, so a grant for it is rooted at the agent process,
+//! above the caller's session (`crate::SubjectEvidence`). Only a builtin
+//! match on the executable's path or its code signature
+//! ([`AgentLabel::may_root_above_session`]) does that (SPEC §10a). A match
+//! on what a process says about itself (`argv[0]`, its script, its command
+//! name), or one that needed a user extension, roots a grant no higher
+//! than the caller's session leader, so it cannot widen a grant to sibling
+//! sessions. That includes a match on arguments read only because an
+//! extension names an interpreter: the builtin pass uses arguments only
+//! where the builtin catalog alone would read them.
+//!
+//! So a builtin `executables` pattern must name agents only: one that also
+//! matched a terminal multiplexer's executable would root grants at it.
+//! Errors are value-free: a kind and a line.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -74,8 +81,23 @@ pub enum CatalogSource {
     Extension,
 }
 
+/// What a match rests on (SPEC §10a: an executable's identity is
+/// evidence; argv is caller-asserted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MatchBasis {
+    /// The executable's path as the kernel reports it, or the macOS code
+    /// signature the kernel validated when it started.
+    Executable,
+    /// What the process says about itself, which it can set: its
+    /// `argv[0]`, an interpreter's script argument, or its command name
+    /// (Linux: `prctl(PR_SET_NAME)`, or the name of a link it was run
+    /// through). Also an environment marker's label.
+    Asserted,
+}
+
 /// What an agent is shown as. Display only (SPEC §10b `kind:
-/// agent(label)`).
+/// agent(label)`), except that [`AgentLabel::may_root_above_session`]
+/// limits where a grant may be rooted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgentLabel {
     /// The catalog id: `claude-code`, `codex`, ...
@@ -84,6 +106,19 @@ pub struct AgentLabel {
     pub name: String,
     /// Whether a builtin entry matched, or only an extension did.
     pub source: CatalogSource,
+    /// Whether the match rests on the executable, or only on what the
+    /// process says about itself.
+    pub basis: MatchBasis,
+}
+
+impl AgentLabel {
+    /// Whether this match may root a grant above the caller's session: a
+    /// builtin entry matched the executable's path or its code signature.
+    /// Any other match roots a grant no higher than the session rules
+    /// would (SPEC §10b "Root selection").
+    pub fn may_root_above_session(&self) -> bool {
+        self.source == CatalogSource::Builtin && self.basis == MatchBasis::Executable
+    }
 }
 
 /// What is wrong with a catalog file. Every message is fixed text.
@@ -428,13 +463,14 @@ impl AgentCatalog {
             .flat_map(|a| a.markers.iter().map(|(m, _)| m.as_str()))
     }
 
-    /// The agent that sets marker `name`, if the catalog knows one.
+    /// The agent that sets marker `name`, if the catalog knows one. A
+    /// marker is a claim: the label's basis is [`MatchBasis::Asserted`].
     pub fn agent_for_marker(&self, name: &str) -> Option<AgentLabel> {
         self.agents.iter().find_map(|a| {
             a.markers
                 .iter()
                 .find(|(m, _)| m == name)
-                .map(|(_, source)| label(a, *source))
+                .map(|(_, source)| label(a, *source, MatchBasis::Asserted))
         })
     }
 
@@ -473,16 +509,29 @@ impl AgentCatalog {
     }
 
     /// The agent `p` is, if any. Builtin entries are tried first; the
-    /// label's [`AgentLabel::source`] says whether one matched.
+    /// label's [`AgentLabel::source`] says whether one matched. Within
+    /// each pass, a match on the executable's path or its signature is
+    /// preferred to one on what the process says about itself; the label's
+    /// [`AgentLabel::basis`] says which it was.
+    ///
+    /// `argv[0]`, the script and the command name are the process's own
+    /// word (SPEC §10a "Environment markers and argv": caller-asserted), so
+    /// a match on them is [`MatchBasis::Asserted`], which roots no grant
+    /// above the caller's session (review finding F-37).
     ///
     /// Each pass uses `p`'s arguments only where that pass's catalog would
     /// read them itself ([`AgentCatalog::needs_argv`] reads them for either
     /// pass). Arguments read only because an extension names an
     /// interpreter are not builtin evidence: a match on them (its `argv[0]`
     /// or its script, even against a builtin pattern) is an extension
-    /// match, which cannot root a grant above the caller's session
-    /// (review finding F-36).
+    /// match (review finding F-36).
     pub fn classify(&self, p: &ProcInfo) -> Option<AgentLabel> {
+        let path = p
+            .exe
+            .as_ref()
+            .map(|e| e.path.as_os_str().as_bytes())
+            .filter(|n| !n.is_empty());
+        let signature = p.exe.as_ref().and_then(|e| e.signature.as_ref());
         for source in [CatalogSource::Builtin, CatalogSource::Extension] {
             let extensions = source == CatalogSource::Extension;
             let argv = if self.reads_argv(p, extensions) {
@@ -496,8 +545,7 @@ impl AgentCatalog {
             } else {
                 Vec::new()
             };
-            let names: Vec<&[u8]> = [
-                p.exe.as_ref().map(|e| e.path.as_os_str().as_bytes()),
+            let said: Vec<&[u8]> = [
                 Some(p.comm.as_bytes()),
                 argv.and_then(|a| a.first()).map(|a| a.as_bytes()),
             ]
@@ -505,34 +553,43 @@ impl AgentCatalog {
             .flatten()
             .filter(|n| !n.is_empty())
             .collect();
-            let signature = p.exe.as_ref().and_then(|e| e.signature.as_ref());
             let counts = |s: &CatalogSource| extensions || *s == CatalogSource::Builtin;
-            for a in &self.agents {
-                let by_exe = a
-                    .executables
-                    .iter()
-                    .filter(|(_, s)| counts(s))
-                    .any(|(pat, _)| names.iter().any(|n| pat.matches(n)));
-                let by_script = a
-                    .scripts
-                    .iter()
-                    .filter(|(_, s)| counts(s))
-                    .any(|(pat, _)| scripts.iter().any(|n| pat.matches(n)));
-                let by_signature = signature.is_some_and(|sig| {
-                    a.signatures
+            let by_executable = |a: &Agent| {
+                let by_path = path.is_some_and(|path| {
+                    a.executables
                         .iter()
                         .filter(|(_, s)| counts(s))
-                        .any(|(want, _)| {
-                            want.identifier == sig.identifier
-                                && want
-                                    .team
-                                    .as_ref()
-                                    .is_none_or(|t| sig.team_id.as_ref() == Some(t))
-                        })
+                        .any(|(pat, _)| pat.matches(path))
                 });
-                if by_exe || by_script || by_signature {
-                    return Some(label(a, source));
-                }
+                by_path
+                    || signature.is_some_and(|sig| {
+                        a.signatures
+                            .iter()
+                            .filter(|(_, s)| counts(s))
+                            .any(|(want, _)| {
+                                want.identifier == sig.identifier
+                                    && want
+                                        .team
+                                        .as_ref()
+                                        .is_none_or(|t| sig.team_id.as_ref() == Some(t))
+                            })
+                    })
+            };
+            let by_assertion = |a: &Agent| {
+                a.executables
+                    .iter()
+                    .filter(|(_, s)| counts(s))
+                    .any(|(pat, _)| said.iter().any(|n| pat.matches(n)))
+                    || a.scripts
+                        .iter()
+                        .filter(|(_, s)| counts(s))
+                        .any(|(pat, _)| scripts.iter().any(|n| pat.matches(n)))
+            };
+            if let Some(a) = self.agents.iter().find(|a| by_executable(a)) {
+                return Some(label(a, source, MatchBasis::Executable));
+            }
+            if let Some(a) = self.agents.iter().find(|a| by_assertion(a)) {
+                return Some(label(a, source, MatchBasis::Asserted));
             }
         }
         None
@@ -570,11 +627,12 @@ impl AgentCatalog {
     }
 }
 
-fn label(a: &Agent, source: CatalogSource) -> AgentLabel {
+fn label(a: &Agent, source: CatalogSource, basis: MatchBasis) -> AgentLabel {
     AgentLabel {
         id: a.id.clone(),
         name: a.name.clone(),
         source,
+        basis,
     }
 }
 

@@ -667,11 +667,11 @@ The daemon records evidence about every caller and uses it only as this table al
 | Caller descends from process instance P (pid and start time) | Strong for membership: the kernel keeps the parent chain, and joining another tree needs control of a process in it. On Linux with Yama `ptrace_scope = 0`, any process running as you can attach to an agent and act inside its tree; with `ptrace_scope` ≥ 1, and on macOS (the debugger entitlement plus admin authorization), it cannot. Files the tree will execute (package scripts, git hooks) are another way in (§10b). | Scoping grants |
 | Caller does not descend from P | Worthless: double-fork, `setsid`, launchd, tmux, cron and osascript all leave the tree | Never grants anything |
 | An ancestor is Claude Code, Codex, Cursor and so on | Evidence (executable identity) | Labels, grant root selection, agent barrier, refusing proofs from agent sessions, live-key guard |
-| Environment markers and argv | Caller-asserted | Labels and tightening only |
+| Environment markers, argv and the command name | Caller-asserted | Labels and tightening only |
 | "No agent is involved" or "a human typed this" | Cannot be claimed | Nothing |
 | Project path | Caller-asserted; the daemon reads the manifest itself | Grant scoping together with the subject root |
 
-The ancestry walk records pid and start time for each ancestor, then re-validates the chain: each parent started no later than its child, and each ancestor still has the recorded start time. An orphan reparented to launchd or init has lost its ancestry, which fails closed. So does a chain cut at the walk's depth limit (64 processes): an agent may be above the cut, so the caller is not a terminal subject and its proofs are refused. Agents are recognized by executable path, `argv[0]`, interpreter script and, on macOS, code signature, from a builtin catalog plus add-only user extensions (docs/AGENTS.md).
+The ancestry walk records pid and start time for each ancestor, then re-validates the chain: each parent started no later than its child, and each ancestor still has the recorded start time. An orphan reparented to launchd or init has lost its ancestry, which fails closed. So does a chain cut at the walk's depth limit (64 processes): an agent may be above the cut, so the caller is not a terminal subject and its proofs are refused. Agents are recognized by executable path, `argv[0]`, interpreter script, command name and, on macOS, code signature, from a builtin catalog plus add-only user extensions (docs/AGENTS.md). A match on `argv[0]`, the script or the command name is caller-asserted: it makes the caller an agent subject, but only a builtin match on the executable path or code signature selects a grant root above the caller's session (§10b).
 
 **Bounds and display.**
 - Frames are limited to 1 MiB.
@@ -699,7 +699,7 @@ Grant {
 }
 ```
 
-**Root selection.** If a known agent is in the caller's ancestry, the root is the agent process nearest the caller. Otherwise the root is the caller's session leader (`getsid`). If the session leader is no longer alive, the root is the topmost live ancestor in that session. pid 1 is never a root, nor a session leader for this rule. An agent that only a user extension recognizes is the root only at or below the process the session rules would pick.
+**Root selection.** If a known agent is in the caller's ancestry, the root is the agent process nearest the caller. Otherwise the root is the caller's session leader (`getsid`). If the session leader is no longer alive, the root is the topmost live ancestor in that session. pid 1 is never a root, nor a session leader for this rule. An agent that only a user extension recognizes, or that is recognized only by its `argv[0]`, script or command name, is the root only at or below the process the session rules would pick.
 
 **Subject kind.** `agent` when a known agent is in the ancestry; `unknown` when the ancestry no longer reaches the caller's session leader (an orphan), whatever the caller claims; `agent` when the caller claims agent markers; `unknown` in a session without a controlling terminal; otherwise `terminal`. docs/AGENTS.md has the details.
 

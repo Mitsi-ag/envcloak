@@ -18,10 +18,16 @@
 //!
 //!   `launchd` or `init` (pid 1) is never a root, and never a session
 //!   leader for this purpose: every process descends from it, and GUI apps
-//!   on macOS run in its session. An agent matched only through a user
-//!   extension ([`CatalogSource::Extension`]) is the root only at or below
-//!   the point rule 2 or 3 would pick; above it, rules 2 and 3 apply. A
-//!   root never widens past the caller's own session that way.
+//!   on macOS run in its session. Rule 1 may pick an agent above the
+//!   caller's session, as it must: Claude Code and Codex run each command
+//!   in a session of its own. Only a builtin match on the agent's
+//!   executable or signature may do that
+//!   ([`AgentLabel::may_root_above_session`]). An agent matched only on
+//!   what it says about itself (`argv[0]`, its script, its command name,
+//!   all of which a process sets) or only through a user extension is the
+//!   root only at or below the point rule 2 or 3 would pick; above it,
+//!   rules 2 and 3 apply. A root never widens past the caller's own
+//!   session that way (review finding F-37).
 //! - **Kind** ([`SubjectEvidence::kind`]), in this order:
 //!   1. a known agent in the ancestry: [`SubjectKind::Agent`];
 //!   2. no session leader in the chain, so the ancestry is lost (an
@@ -38,16 +44,17 @@
 //!   with its pid and start time (a recycled pid never matches), no known
 //!   agent sits between the root and the caller unless the root is that
 //!   agent, a grant approved for a terminal subject never covers an agent
-//!   or unknown one, and a root that only an extension called an agent
-//!   covers no caller outside its session.
+//!   or unknown one, and an agent root that could not have been picked
+//!   above a session (see Root) covers no caller outside its session.
 //!
-//! Evidence only tightens. The claims (environment markers the CLI found
-//! in its own environment, SPEC §10a "caller-asserted") can turn a
-//! terminal subject into an agent, never the reverse, and never change the
-//! chain or the root. Classification can make a caller an agent; a
-//! process that is not recognized gains nothing, because the kind then
-//! comes from the session, and escaping the tree loses every grant rooted
-//! in it.
+//! What a caller says only tightens. The claims (environment markers the
+//! CLI found in its own environment, SPEC §10a "caller-asserted") can turn
+//! a terminal subject into an agent, never the reverse, and never change
+//! the chain or the root. A process's `argv[0]`, script and command name
+//! are its own word too: through classification they can make a caller an
+//! agent, and never root a grant above its session. A process that is not
+//! recognized gains nothing, because the kind then comes from the
+//! session, and escaping the tree loses every grant rooted in it.
 //!
 //! A chain longer than [`MAX_ANCESTRY`] is cut ([`ChainEnd::Cut`]), and
 //! what is above the cut is not seen: an agent could run its commands
@@ -71,7 +78,7 @@ use envcloak_sys::{
     StartTime, ancestry_in, reaches_top,
 };
 
-use crate::agents::{AgentCatalog, AgentLabel, CatalogSource};
+use crate::agents::{AgentCatalog, AgentLabel};
 use crate::effective::SubjectKind;
 use crate::names::EnvName;
 
@@ -345,7 +352,7 @@ impl SubjectEvidence {
             }
         }
         let nearest_agent = chain.iter().position(|a| a.agent.is_some());
-        let may_root = |n: usize| n <= limit || builtin_agent(&chain[n]);
+        let may_root = |n: usize| n <= limit || roots_above_session(&chain[n]);
         let root = match nearest_agent {
             Some(n) if may_root(n) => n,
             _ => limit,
@@ -451,9 +458,11 @@ impl SubjectEvidence {
     /// - no known agent sits between `root` and the caller, the caller
     ///   included, unless `root` is that agent;
     /// - a terminal grant covers only a terminal subject;
-    /// - a root above this caller's session is a builtin agent: an agent
-    ///   only a user extension matched is a root for callers in its own
-    ///   session, never above theirs (see the module documentation).
+    /// - an agent root above this caller's session is one a builtin entry
+    ///   matched by its executable or signature: an agent matched only on
+    ///   its `argv[0]`, script or command name, or only through a user
+    ///   extension, is a root for callers in its own session, never above
+    ///   theirs (see the module documentation).
     pub fn covered_by(&self, root: &ProcessInstance, grant_kind: SubjectKind) -> bool {
         if root.pid == 1 {
             return false;
@@ -464,18 +473,19 @@ impl SubjectEvidence {
         if self.nearest_agent.is_some_and(|n| n < k) {
             return false;
         }
-        if k > self.limit && self.chain[k].agent.is_some() && !builtin_agent(&self.chain[k]) {
+        if k > self.limit && self.chain[k].agent.is_some() && !roots_above_session(&self.chain[k]) {
             return false;
         }
         !(grant_kind == SubjectKind::Terminal && self.kind() != SubjectKind::Terminal)
     }
 }
 
-/// Whether a builtin catalog entry matched `a`.
-fn builtin_agent(a: &Ancestor) -> bool {
+/// Whether `a` is an agent that may be a root above the caller's session:
+/// a builtin entry matched its executable or signature.
+fn roots_above_session(a: &Ancestor) -> bool {
     a.agent
         .as_ref()
-        .is_some_and(|l| l.source == CatalogSource::Builtin)
+        .is_some_and(AgentLabel::may_root_above_session)
 }
 
 /// Gathers the evidence for `peer` from the live process table: see

@@ -10,10 +10,14 @@ pub(crate) static AGENTS_TOML: &str = r#"# Known AI coding agents, for caller ev
 #
 # A process in a caller's ancestry is an agent when its executable, its
 # script (under an interpreter) or its macOS code signature matches an entry
-# here. Matching only ever makes handling stricter, so a pattern that is too
-# broad costs prompts, never protection; a pattern that misses an agent lets
-# it ride a terminal grant. Compiled into the release by
-# scripts/gen-agents.py; users add entries under <data>/agents.d/.
+# here. A match makes handling stricter (an agent subject, the agent
+# barrier, proofs refused); a pattern that misses an agent lets it ride a
+# terminal grant. A match on the executable's path or signature also makes
+# the agent the root of its grants above the caller's session, covering
+# every command it runs, so `executables` must name agents only. A match on
+# argv[0], a script or the command name, which a process sets itself, never
+# does that. Compiled into the release by scripts/gen-agents.py; users add
+# entries under <data>/agents.d/.
 
 # Executables that run scripts. For these, the script arguments are matched
 # against each agent's `scripts`.

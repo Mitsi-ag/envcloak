@@ -7,7 +7,9 @@
 //!   does not cover it; `CLAUDECODE=1` in a terminal only tightens. A
 //!   command run under enough nested shells to put the agent past the
 //!   walk's cut is still not a terminal subject, and its proofs are
-//!   refused.
+//!   refused. Only an agent's executable roots a grant above the caller's
+//!   session: a process that calls itself an agent by `argv[0]`, script
+//!   or command name is an agent subject, rooted in the caller's session.
 //! - Gate 26, ancestry escape: a process under the fixture agent escapes by
 //!   double fork, `setsid`, `nohup` with `disown`, `launchctl submit`
 //!   (macOS) or `systemd-run --user` (Linux). Before the escape the same
@@ -34,12 +36,14 @@
 use std::io::Read;
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use envcloak_policy::{
-    AgentCatalog, CatalogSource, Claims, ProcessInstance, SubjectEvidence, SubjectKind, gather,
+    AgentCatalog, CatalogSource, Claims, MatchBasis, ProcessInstance, SubjectEvidence, SubjectKind,
+    gather,
 };
 use envcloak_sys::MAX_ANCESTRY;
 use envcloak_testkit::{TestHome, testkit_bin};
@@ -120,7 +124,20 @@ struct Scenario {
 
 impl Scenario {
     fn start(home: &TestHome, program: &Path, args: &[&std::ffi::OsStr]) -> Self {
+        Self::start_as(home, program, None, args)
+    }
+
+    /// As [`Scenario::start`], with `argv[0]` set to `arg0` when given.
+    fn start_as(
+        home: &TestHome,
+        program: &Path,
+        arg0: Option<&str>,
+        args: &[&std::ffi::OsStr],
+    ) -> Self {
         let mut cmd = Command::new(program);
+        if let Some(arg0) = arg0 {
+            cmd.arg0(arg0);
+        }
         home.apply(&mut cmd);
         let mut child = cmd
             .args(args)
@@ -240,6 +257,7 @@ fn assert_rooted_at_the_fixture(e: &SubjectEvidence, at: usize) {
     assert_eq!(n, at, "{e:?}");
     assert_eq!(label.id, "fixture");
     assert_eq!(label.source, CatalogSource::Builtin);
+    assert_eq!(label.basis, MatchBasis::Executable);
     assert_eq!(e.kind(), SubjectKind::Agent);
     assert_eq!(e.root_index(), at);
     assert_eq!(file_name(&e.root()), "fixture-agent");
@@ -394,6 +412,167 @@ read x
     assert!(!orphan.covered_by(&leader, SubjectKind::Terminal));
     assert!(!orphan.covered_by(&leader, SubjectKind::Unknown));
     assert!(orphan.nearest_agent().is_none());
+    s.finish();
+}
+
+/// Runs a script under `node`, as the older npm build of Claude Code runs:
+/// it runs `/bin/sh` and the arguments after it, and exits with its status.
+const NODE_RUNNER: &str = r#"const a = process.argv.slice(process.argv.indexOf("/bin/sh"));
+const r = require("child_process").spawnSync(a[0], a.slice(1), { stdio: "inherit" });
+process.exit(r.status === null ? 1 : r.status);
+"#;
+
+/// The absolute path of `node`, found on this process's `PATH`. In CI it
+/// must be there; elsewhere a test that needs it is skipped without it.
+fn node() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let found = std::env::split_paths(&path)
+        .map(|d| d.join("node"))
+        .find(|p| p.is_file());
+    if found.is_none() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "node is needed on PATH in CI"
+        );
+        eprintln!("skipped: no node on PATH");
+    }
+    found
+}
+
+/// Two callers under one holder process, each leading a session of its
+/// own, as Claude Code and Codex run their commands: the holder runs
+/// `/bin/sh -c <script> sh <probe> <socket>` (`program`, with `argv[0]`
+/// set to `arg0` when given, and `before` in front of `/bin/sh`), and the
+/// script runs the two callers one after the other. Returns their
+/// evidence, the holder, and the scenario, still running.
+fn two_sessions_under(
+    l: &Listener,
+    program: &Path,
+    arg0: Option<&str>,
+    before: &[&std::ffi::OsStr],
+) -> (SubjectEvidence, SubjectEvidence, ProcessInstance, Scenario) {
+    let p = probe();
+    let sh: [&std::ffi::OsStr; 6] = [
+        "/bin/sh".as_ref(),
+        "-c".as_ref(),
+        "\"$1\" --setsid \"$2\"\n\"$1\" --setsid \"$2\"\nread x\n".as_ref(),
+        "sh".as_ref(),
+        p.as_os_str(),
+        l.sock.as_os_str(),
+    ];
+    let mut args: Vec<&std::ffi::OsStr> = before.to_vec();
+    args.extend(sh);
+    let s = Scenario::start_as(&l.home, program, arg0, &args);
+    let first = l.next();
+    let second = l.next();
+    // Each: probe (its own session) <- sh <- the holder.
+    let holder = first.chain()[2].instance.clone();
+    for e in [&first, &second] {
+        assert!(e.session_leader().unwrap().same(e.caller()), "{e:?}");
+        assert!(e.chain()[2].instance.same(&holder), "{e:?}");
+        assert!(!e.terminal());
+    }
+    (first, second, holder, s)
+}
+
+/// The holder is an agent by what it says about itself only: the callers
+/// are agent subjects, but each is rooted in its own session, and neither
+/// is covered by a grant rooted at the holder or at the other's root.
+fn assert_rooted_in_its_session(
+    first: &SubjectEvidence,
+    second: &SubjectEvidence,
+    holder: &ProcessInstance,
+    id: &str,
+) {
+    for e in [first, second] {
+        let (n, label) = e.nearest_agent().expect("the holder is labeled");
+        assert_eq!(n, 2, "{e:?}");
+        assert_eq!(
+            (label.id.as_str(), label.source, label.basis),
+            (id, CatalogSource::Builtin, MatchBasis::Asserted)
+        );
+        assert_eq!(e.kind(), SubjectKind::Agent);
+        assert!(e.agent_involved());
+        assert!(e.root().same(e.caller()), "{e:?}");
+    }
+    for kind in [
+        SubjectKind::Agent,
+        SubjectKind::Unknown,
+        SubjectKind::Terminal,
+    ] {
+        assert!(!second.covered_by(&first.root(), kind), "{kind:?}");
+        assert!(!second.covered_by(holder, kind), "{kind:?}");
+        assert!(!first.covered_by(holder, kind), "{kind:?}");
+    }
+}
+
+/// Gate 25 and review finding F-37: only an agent's executable roots a
+/// grant above the caller's session. An agent runs each command in a
+/// session of its own, so a grant for the fixture agent, known by its
+/// executable, covers both of its commands. A process that only calls
+/// itself an agent (by `argv[0]` or its script under `node`, or on Linux by
+/// its command name, here from a link named `fixture-agent` to another
+/// program) is an agent subject all the same, but its grants are rooted in
+/// the caller's session, so a grant for one of its commands covers no
+/// other.
+#[test]
+fn gate25_only_an_agents_executable_roots_a_grant_above_the_session() {
+    let outer = outer_agent_root();
+    let l = Listener::new();
+    let f = fixture();
+    // The fixture agent, by its executable.
+    let (first, second, holder, s) = two_sessions_under(&l, &f, None, &[]);
+    let (n, label) = first.nearest_agent().unwrap();
+    assert_eq!(
+        (n, label.id.as_str(), label.basis),
+        (2, "fixture", MatchBasis::Executable)
+    );
+    assert!(first.root().same(&holder));
+    assert!(second.root().same(&holder));
+    assert!(second.covered_by(&first.root(), SubjectKind::Agent));
+    assert!(!second.covered_by(&first.root(), SubjectKind::Terminal));
+    s.finish();
+
+    // Another program, run through a link named `fixture-agent`.
+    let link = l.home.root().join("fixture-agent");
+    std::os::unix::fs::symlink(probe(), &link).unwrap();
+    let (first, second, holder, s) =
+        two_sessions_under(&l, &link, None, &["--session".as_ref(), "--".as_ref()]);
+    if cfg!(target_os = "linux") {
+        // The command name is the link's; the executable is the program's.
+        assert_rooted_in_its_session(&first, &second, &holder, "fixture");
+    } else {
+        // macOS names the process after the file it runs.
+        assert!(first.chain()[2].agent.is_none(), "{first:?}");
+        assert!(!first.root().same(&holder));
+        if outer.is_none() {
+            assert!(first.root().same(first.caller()));
+            assert!(!second.covered_by(&first.root(), SubjectKind::Agent));
+        }
+    }
+    s.finish();
+
+    let Some(node) = node() else {
+        return;
+    };
+    // `node` with argv[0] `fixture-agent` (as `process.title` sets it).
+    let (first, second, holder, s) = two_sessions_under(
+        &l,
+        &node,
+        Some("fixture-agent"),
+        &["-e".as_ref(), NODE_RUNNER.as_ref(), "--".as_ref()],
+    );
+    assert_rooted_in_its_session(&first, &second, &holder, "fixture");
+    s.finish();
+
+    // `node` running a script at the path of Claude Code's npm build.
+    let dir = l.home.root().join("n/@anthropic-ai/claude-code");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cli = dir.join("cli.js");
+    std::fs::write(&cli, NODE_RUNNER).unwrap();
+    let (first, second, holder, s) =
+        two_sessions_under(&l, &node, None, &[cli.as_os_str(), "--".as_ref()]);
+    assert_rooted_in_its_session(&first, &second, &holder, "claude-code");
     s.finish();
 }
 
