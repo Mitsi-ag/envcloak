@@ -229,10 +229,34 @@ The schema version is in the associated data of every sealed value, so a migrati
 
 Any failure, or a crash, rolls all of it back: the vault stays at its old version, intact and openable (gate 7). A build whose migration failed still unlocks the vault, read-only at its old version and with the failure reported, so its owner can read and back up what it holds; it refuses writes, and every unlock tries the migration again. Version 1 is the first format, so the shipped plan has no steps; the tests migrate through test-only plans.
 
+## Audit log
+
+The daemon records every security event in `<data>/audit/` (SPEC §3 principle 4, §6.1 step 5): tamper-evident, not tamper-proof, since a program running as the user can delete it. The code is in `crates/envcloak-core/src/audit/`.
+
+**Segments.** The log is a series of files named after the sequence number of their first entry, `<20 decimal digits>.seg`, 0600 in the 0700 directory. The writer appends to the last segment and starts a new one when it reaches 1 MiB, when the last one is damaged, or when the file it wrote to was removed. A segment is a header, then entries one after another:
+
+```
+header = "ECAUDIT1" | version(1) = 1 | vault_id(16) | epoch(4) | first_seq(8) | prev_mac(32) | header_mac(32)
+entry  = len(4) | seq(8) | sealed(len) | mac(32)
+```
+
+- `sealed` is the entry's record sealed under the `audit` subkey, bound to the vault id, the key epoch and `seq` (CRYPTO.md "Associated data"). Only the header's fields, the lengths and the sequence numbers are in plaintext.
+- `mac` chains the entries: `keyed_hash(index, "envcloak/v1/audit-chain", previous mac || u64(seq) || sealed)`. The first entry's predecessor is the genesis value `keyed_hash(index, "envcloak/v1/audit-genesis", vault_id)`. A segment's `prev_mac` is the chain value before its first entry, and `header_mac = keyed_hash(index, "envcloak/v1/audit-segment", the header's first 69 bytes)`.
+- Sequence numbers start at 1 and go up by one per entry.
+
+**Records.** `version(1) at_ms(8) kind(1) request_id? grant_id? pid(4) uid(4)? subject_kind? agent? root_pid(4)? root_exe? project? count(4) (item_id(16) slug)... outcome reason? method? count(8)? argv[]`, where `project` is `dir manifest_sha256(32) approved_sha256(32)?`. Kinds: 1 run, 2 approve, 3 deny, 4 revoke, 5 manifest changed, 6 role denied, 7 foreign peer, 8 unlock, 9 lock, 10 proof refused, 11 dropped, 12 log. A record is metadata only. The daemon masks the command line before it builds the record: every value the request binds, with the redactor, then every word a registry key pattern matches (`[envcloak:<slug>]`, `[envcloak:key:<provider>]`). Strings are capped at 4 KiB, the command line at 16 KiB and 256 arguments, and items at 256, each with a marker saying what was cut; an entry is at most 64 KiB.
+
+**Durability.** An append writes the entry and flushes the segment (`fcntl(F_FULLFSYNC)` on macOS, `fsync` on Linux; `envcloak_sys::sync_file`) before it returns; a new segment's header and the directory are flushed first. A failed write or flush is cut back off the file, so nothing is acknowledged and the next append takes the same sequence number. The daemon writes a covered request's entry this way before it answers; when it cannot, the request is denied (`audit_failed`), nothing is released, and a `once` grant is left unused. Other events that cannot be written (the vault is locked, so there is no key; or the directory is unusable) wait in memory, at most 256 with a count of the ones dropped, and are written at the next unlock or the next write that succeeds.
+
+**Anchor.** The head (the last entry's sequence number and chain value) is saved in the vault's sealed header at lock (and so at stop), after 100 entries, and after 15 minutes awake with entries not yet saved. When the writer opens the log it removes an entry cut short by a crash (never acknowledged), and when the log ends before the saved head it goes on after the head in a new segment, so the gap stays visible.
+
+**Check.** `audit::verify` (`envcloak audit verify`) walks the segments in name order and reports the first problem at the sequence number where it shows: an entry that does not open (`altered`), one whose chain value is not the one its predecessor gives (`chain_broken`), a number that never comes (`missing`) or comes out of place (`reordered`), a header that does not authenticate or names another vault or epoch (`segment_damaged`), bytes that cannot be framed (`unreadable`), and a saved head the log contradicts (`anchor_mismatch`) or ends before (`missing`). After a problem it takes the stored chain value and goes on. Entries after the anchor are the unanchored tail: a log cut back within them looks the same as one that stopped there, so the report names them rather than calling the log complete. The daemon also says whether the log still ends where it last wrote it.
+
 ## Gates
 
 | Gate (SPEC §15.2) | Test |
 |---|---|
+| 33: entries flushed before an append returns (`F_FULLFSYNC` on macOS, counted by a shim); a failed write or flush leaves the log whole; entries sealed, with no value; a modified, deleted or reordered entry, a removed or damaged segment, and a log cut before its anchor flagged at the sequence number; the unanchored tail reported | `tests/audit.rs` |
 | 2, storage part: no fixture in the main, WAL, shared-memory or journal bytes | `tests/vault_bytes.rs` |
 | 5: crash consistency | `tests/vault_crash.rs` |
 | 6: integrity digest | `tests/vault_integrity.rs` |

@@ -22,7 +22,7 @@
 //! Errors are [`VaultError`]s with fixed messages and no values.
 
 mod aside;
-mod codec;
+pub(crate) mod codec;
 mod error;
 mod integrity;
 mod items;
@@ -57,6 +57,7 @@ pub use migrate::{Migration, MigrationPlan, MigrationTx};
 pub use paths::{PathError, PathErrorKind, Platform, VaultPaths, data_dir_for};
 pub use schema::{CURRENT_SCHEMA, StorageReport};
 pub use txn::Txn;
+pub(crate) use txn::now_secs;
 
 pub(crate) use aside::{REPLACED_PREFIX, set_aside, utc_stamp, with_suffix};
 use integrity::{state_digest, unlocker_body};

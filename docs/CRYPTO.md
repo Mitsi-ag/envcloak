@@ -72,6 +72,8 @@ No sealed value uses table 7: unlocker envelopes authenticate themselves. The nu
 
 A backup file's records use table 8, with the backup's random id as the row id and the record's index as the row version: 0 for the manifest (field 9) and 1 and up for the chunks of the database image (field 10). Their layout is in VAULT.md, "Backups".
 
+An audit log entry uses table 6 and field 8, sealed under the `audit` subkey, with row id all zeros and its sequence number as the row version. Its schema version slot holds the audit log's own format version, `1`, since the log outlives the vault's schema migrations. The entries are chained with keyed hashes under the `index` subkey in the domains `envcloak/v1/audit-chain`, `envcloak/v1/audit-genesis` and `envcloak/v1/audit-segment`, so the `audit` subkey only seals. The layout is in VAULT.md, "Audit log".
+
 ## Sealed values
 
 ```

@@ -1,5 +1,5 @@
 //! EnvCloak core: secret types, crypto, vault storage, unlockers and the
-//! Recovery Kit, encrypted backups, and (in later M1 tasks) the audit log.
+//! Recovery Kit, encrypted backups, and the audit log.
 //!
 //! The `testing` feature adds test support that release binaries never
 //! enable: `crypto::Vmk::export_for_testing` and `import_for_testing`,
@@ -7,6 +7,7 @@
 //! `vault::Vault::change_passphrase_for_testing`,
 //! `backup::restore_backup_observed` and `backup::restore_backup_with_plan`.
 
+pub mod audit;
 pub mod backup;
 pub mod crypto;
 pub mod passphrase;

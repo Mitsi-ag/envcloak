@@ -174,6 +174,18 @@ impl SubKey {
     pub fn purpose(&self) -> Purpose {
         self.purpose
     }
+
+    /// A second copy of this key in its own box, wiped on drop: for a
+    /// component that outlives the keyring it came from (the audit
+    /// writer, which the vault's lock drops with its own copies).
+    #[allow(clippy::disallowed_methods)] // Copies the key into a new box.
+    pub(crate) fn duplicate(&self) -> SubKey {
+        let src = self.key.expose_secret();
+        SubKey {
+            purpose: self.purpose,
+            key: SecretBox::init_with_mut(|k: &mut [u8; 32]| k.copy_from_slice(src)),
+        }
+    }
 }
 
 impl core::fmt::Debug for SubKey {
@@ -261,13 +273,22 @@ pub(crate) fn blake3_keyed(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
 
 /// Keyed BLAKE3 under `k` of `u32be(len(domain)) || domain || v`. The
 /// length prefix keeps every (domain, value) pair distinct.
-#[allow(clippy::disallowed_methods)] // Reads the subkey to key the hash.
 pub fn keyed_hash(k: &SubKey, domain: &'static str, v: &[u8]) -> [u8; 32] {
+    keyed_hash_parts(k, domain, &[v])
+}
+
+/// [`keyed_hash`] of the concatenation of `parts`, without copying them
+/// into one buffer. The caller's layout must be unambiguous (fixed-size
+/// parts, with at most the last one variable).
+#[allow(clippy::disallowed_methods)] // Reads the subkey to key the hash.
+pub(crate) fn keyed_hash_parts(k: &SubKey, domain: &'static str, parts: &[&[u8]]) -> [u8; 32] {
     let len = u32::try_from(domain.len()).expect("domain labels are short");
-    blake3_keyed(
-        k.key.expose_secret(),
-        &[&len.to_be_bytes(), domain.as_bytes(), v],
-    )
+    let len = len.to_be_bytes();
+    let mut all: Vec<&[u8]> = Vec::with_capacity(parts.len() + 2);
+    all.push(&len);
+    all.push(domain.as_bytes());
+    all.extend_from_slice(parts);
+    blake3_keyed(k.key.expose_secret(), &all)
 }
 
 #[cfg(test)]
