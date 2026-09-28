@@ -21,7 +21,8 @@
 //!    no canary in its argv, nor in its environment: on macOS `ps -E`
 //!    prints it; on Linux the process is non-dumpable, so its environment
 //!    cannot be read at all by another process of the user, which the test
-//!    records. `run`'s own `ps` check, once the runner exists, is T12's.
+//!    records. `run`'s own `ps` check, while it runs a command, is in
+//!    tests/run.rs.
 //!
 //! The approver's commands run on a terminal of their own, outside any
 //! agent's tree (see tests/approve.rs); under a developer's Claude Code the

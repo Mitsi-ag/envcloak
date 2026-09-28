@@ -375,16 +375,13 @@ fn an_agents_request_needs_a_persons_approval() {
     );
 
     // S6's decision: covered now, with any command line, under the same
-    // agent.
-    let out = agent.run(&["--", "./emit"]);
-    let err = stderr(&out);
-    assert!(
-        err.contains(&format!(
-            "grant {grant} covers this request (inject mode, output redacted)"
-        )),
-        "{err}"
-    );
-    assert_eq!(out.status.code(), Some(2));
+    // agent. The command gets the value, and prints it redacted.
+    let out = agent.run(&["--", "/bin/sh", "-c", "printf '%s\\n' \"$OPENAI_API_KEY\""]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "[envcloak:openai/acme-web]\n");
+    assert_eq!(stderr(&out), "");
+    let list = stdout(&run(&f.home, &["grants", "list"], &[]));
+    assert!(list.contains(&grant), "{list}");
     // A different binding set prompts for it.
     let out = agent.run(&["--profile", "short", "--", "./emit"]);
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
@@ -480,11 +477,20 @@ fn an_env_file_naming_an_ungranted_item_prompts_for_it() {
     assert!(!shown.contains("PLAIN_SETTING"), "{shown}");
     let g2 = grant_id(&shown);
     assert_ne!(g2, grant);
-    let out = agent.run(&["--env-file", env, "--", "./emit"]);
-    assert!(
-        stderr(&out).contains(&format!("grant {g2} covers this request")),
-        "{}",
-        stderr(&out)
+    // Covered: the reference's value is injected and redacted, and the
+    // ordinary variable is set as it was (its length shown, not it).
+    let out = agent.run(&[
+        "--env-file",
+        env,
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf '%s %s\\n' \"$GITHUB_TOKEN\" \"${#PLAIN_SETTING}\"",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!("[envcloak:github/acme-web] {}\n", value.len())
     );
 
     let bad = f.files.path().join("bad.env");
@@ -979,11 +985,14 @@ fn a_loosening_manifest_still_needs_approval_and_redaction_stays_on() {
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     let id = request_id(&stderr(&out));
     f.approve(&id, &[]);
-    let out = agent.run(&["--", "./emit"]);
-    assert!(
-        stderr(&out).contains("(inject mode, output redacted)"),
-        "{}\n{}",
-        stderr(&out),
+    // `redact = false` did not loosen anything: the value printed is
+    // redacted.
+    let out = agent.run(&["--", "/bin/sh", "-c", "printf '%s\\n' \"$OPENAI_API_KEY\""]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "[envcloak:openai/acme-web]\n",
+        "{}",
         f.d.log()
     );
 
@@ -1055,11 +1064,8 @@ fn a_grant_ends_when_its_root_exits() {
     let id = request_id(&stderr(&out));
     f.approve(&id, &["--for", "1h"]);
     let out = agent.run(&["--", "true"]);
-    assert!(
-        stderr(&out).contains("covers this request"),
-        "{}",
-        stderr(&out)
-    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
     let list = stdout(&run(&f.home, &["grants", "list"], &[]));
     assert!(
         list.contains(&format!("rooted at pid {}", agent.pid())),
@@ -1148,11 +1154,8 @@ fn recycled_root_pid_in_namespace() {
     let id = request_id(&stderr(&out));
     f.approve(&id, &["--for", "1h"]);
     let out = agent.run(&["--", "true"]);
-    assert!(
-        stderr(&out).contains("covers this request"),
-        "{}",
-        stderr(&out)
-    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
     let root = i32::try_from(agent.pid()).unwrap();
     let old = envcloak_sys::proc_info(root).unwrap().start_time;
 

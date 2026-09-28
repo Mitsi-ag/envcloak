@@ -8,11 +8,12 @@
 //! Commands in this build:
 //! - `envcloak vault create`, `unlock`, `lock`, `status` and `daemon
 //!   install` / `daemon uninstall` (see [`cmd`]);
-//! - `envcloak run [--profile p] [--ref NAME=slug[#field]]... -- <cmd...>`
-//!   (SPEC §6.1 steps 1 to 4), whose first step refuses to go on under a
-//!   tracer, with exit 125 and `traced` (gate 19), before any contact with
-//!   the daemon. It asks a verified daemon for the decision; the runner
-//!   itself arrives in T12;
+//! - `envcloak run [--profile p] [--ref NAME=slug[#field]]... [--env-file
+//!   f] -- <cmd...>` (SPEC §6.1), whose first step refuses to go on under
+//!   a tracer, with exit 125 and `traced` (gate 19), before any contact
+//!   with the daemon. It asks a verified daemon for the decision and, when
+//!   a grant covers it, starts the command with the released values in its
+//!   environment and its output redacted (`envcloak_exec`; docs/RUN.md);
 //! - `envcloak approve`, `deny` and `grants list` / `grants revoke` (SPEC
 //!   §10b);
 //! - `envcloak audit verify`: the audit log's check (SPEC §15.2 gate 33);
@@ -59,7 +60,7 @@ const HELP: &str = "usage:
   envcloak status [--json]
   envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
   envcloak daemon uninstall
-  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... -- <cmd...>
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
   envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]

@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 envcloak-core.workspace = true
+envcloak-exec.workspace = true
 envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
 envcloak-providers.workspace = true
@@ -30,4 +31,6 @@ envcloak-sys = { workspace = true, features = ["testing"] }
 envcloak-testkit.workspace = true
 # The output snapshots replace times, ids and paths before comparing.
 regex.workspace = true
+# The run tests compare the digests the command prints of its values.
+sha2.workspace = true
 tempfile.workspace = true

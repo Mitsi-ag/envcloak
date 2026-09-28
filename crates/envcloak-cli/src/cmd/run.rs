@@ -1,7 +1,7 @@
 //! `envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file
-//! FILE] -- <cmd...>` (SPEC §6.1 steps 1 to 4): the request for a run's
-//! values, and the decision. The runner and the redactor (steps 5 to 8)
-//! arrive in T12; this build stops after the decision.
+//! FILE] -- <cmd...>` (SPEC §6.1): the request for a run's values, the
+//! decision, and, when a grant covers it, the command with the values in
+//! its environment and its output redacted.
 //!
 //! 1. Under a tracer the CLI refuses at once, with exit 125 and `traced`
 //!    (gate 19), before any contact with the daemon. Only a verified
@@ -11,8 +11,8 @@
 //!    directory, and sends its path. The daemon opens the manifest itself.
 //! 3. It sends the profile and `--ref` bindings, the `--env-file`'s
 //!    references and the names of its ordinary variables (never their
-//!    values, which the runner will set for the command), the command
-//!    line as display text, and the names of the agent markers in its
+//!    values, which the runner sets for the command), the command line as
+//!    display text, and the names of the agent markers in its
 //!    environment. The env file can hold values, so its bytes are read
 //!    only into a [`SecretBuf`], and an error names its kind and line,
 //!    never text from the file (docs/MANIFEST.md "Env files").
@@ -21,20 +21,39 @@
 //!    request=<id>`, naming `envcloak approve <id>`. Approval input is
 //!    never read here: the terminal this command runs in may be an
 //!    agent's.
+//! 5. A covered answer carries the bindings' values, which the daemon
+//!    sent after their audit entry was on disk. The connection is closed,
+//!    and the runner ([`envcloak_exec`]) takes over: values under 8 bytes,
+//!    and values of 8 to 15 bytes whose item lacks `allow_short`, are
+//!    refused (exit 125, `value_too_short`, naming the slugs); what the
+//!    redactor covers less than fully is printed by slug on standard
+//!    error; then the command starts with the values and the env file's
+//!    ordinary variables in its environment only, its standard output and
+//!    standard error each through the redactor, and this command exits
+//!    with its code, or 128 plus the signal that ended it. A command that
+//!    is not found exits 127, and one that cannot be run 126, as with
+//!    `env(1)`. The command sees pipes rather than a terminal, so programs
+//!    that color their output only on a terminal print plain text; PTY
+//!    mode is M2's (`--pty`, docs/RUN.md).
 //!
 //! No argument is ever echoed, and no value is ever accepted on the
-//! command line (gate 13): `--ref` names an item, never a value.
+//! command line (gate 13): `--ref` names an item, never a value. The
+//! values never enter this process's environment or argv, or a file.
 
+use std::ffi::OsString;
 use std::io::Read;
+use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::ExitCode;
 
-use envcloak_core::SecretBuf;
-use envcloak_ipc::proto::{EnvFileParams, RunRequestParams};
+use envcloak_core::vault::Slug;
+use envcloak_core::{SecretBuf, SecretBytes};
+use envcloak_exec::{CoverageReport, ExecError, IDLE_FLUSH, Label, RunSpec, ShortPolicy};
+use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
 use envcloak_policy::{
-    Binding, EnvFileRefs, GrantId, MAX_ENV_FILE, Mode, PendingId, find_manifest,
+    Binding, EnvFileRefs, EnvName, GrantId, MAX_ENV_FILE, Mode, PendingId, PlainVar, find_manifest,
     parse_env_file_refs,
 };
 use zeroize::Zeroize;
@@ -148,20 +167,18 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
             "the manifest's path is not valid UTF-8, which this build cannot send",
         ));
     };
-    // Its ordinary variables' values stay here: the runner (T12) sets them
-    // for the command.
+    // Its ordinary variables' values stay here: the runner sets them for
+    // the command.
     let env_file = a.env_file.as_deref().map(read_env_file).transpose()?;
     let answer = client.run_request(&RunRequestParams {
         manifest,
         profile: a.profile,
         refs: a.refs,
         env_file: env_file.as_ref().map(|f| EnvFileParams::from(&f.names())),
-        argv: a.argv,
+        argv: a.argv.clone(),
         claims: claims(),
     })?;
     drop(client);
-    // The values a covered answer carries are dropped, and wiped, unused
-    // until the runner starts the command with them.
     let decision = answer.decision;
     match decision {
         DecisionView::Pending { request } => {
@@ -180,25 +197,125 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
                 .ok_or_else(protocol)?;
             Err(Failure::new("approval_denied", message))
         }
-        DecisionView::Covered {
-            grant,
-            redact,
-            mode,
-            ..
-        } => {
-            let grant = GrantId::parse(&grant).ok_or_else(protocol)?;
-            // The runner (T12) goes here.
-            eprintln!(
-                "envcloak: run cannot start commands in this build yet; grant {grant} covers \
-                 this request ({} mode, output {})",
-                match mode {
-                    Mode::Inject => "inject",
-                    Mode::Proxy => "proxy",
-                },
-                if redact { "redacted" } else { "not redacted" }
-            );
-            Ok(ExitCode::from(USAGE))
+        DecisionView::Covered { grant, mode, .. } => {
+            GrantId::parse(&grant).ok_or_else(protocol)?;
+            // Proxy mode is M6's; the daemon refuses it before deciding.
+            if mode != Mode::Inject {
+                return Err(protocol());
+            }
+            // The answer's `redact` is always true in M1, which has no way
+            // to turn redaction off; the runner redacts whatever it says.
+            let plain = env_file.map(|f| f.plain).unwrap_or_default();
+            start(answer.values, plain, a.argv)
         }
+    }
+}
+
+/// Runs `argv` with the released values and the env file's ordinary
+/// variables in its environment, its output redacted. Returns the
+/// command's exit code.
+fn start(
+    values: Vec<ReleasedValue>,
+    plain: Vec<PlainVar>,
+    argv: Vec<String>,
+) -> Result<ExitCode, Failure> {
+    let mut bound: Vec<(EnvName, Slug, SecretBytes, ShortPolicy)> =
+        Vec::with_capacity(values.len());
+    for v in values {
+        let name = EnvName::new(&v.env_name).map_err(|_| protocol())?;
+        let slug = Slug::new(&v.slug).map_err(|_| protocol())?;
+        bound.push((
+            name,
+            slug,
+            v.value.into_inner(),
+            ShortPolicy::from(v.allow_short),
+        ));
+    }
+    let built = {
+        let labels: Vec<Label<'_>> = bound
+            .iter()
+            .map(|(_, slug, value, short)| Label {
+                slug,
+                value,
+                short: *short,
+            })
+            .collect();
+        envcloak_exec::build_redactor(&labels)
+    };
+    let (redactor, report) = match built {
+        Ok(b) => b,
+        Err(ExecError::ValueTooShort(r)) => return Err(too_short(&r)),
+        Err(e) => return Ok(exec_failure(&e)),
+    };
+    print_coverage(&report);
+    let out = |fd: std::os::fd::BorrowedFd<'_>| {
+        fd.try_clone_to_owned().map_err(|_| {
+            Failure::new(
+                "run_failed",
+                "this command's standard output or standard error is not open",
+            )
+        })
+    };
+    // The env file's ordinary variables first: a binding of the same name
+    // (the daemon refuses one) could not be overridden by them.
+    let mut injected: Vec<(EnvName, SecretBytes)> =
+        plain.into_iter().map(|p| (p.name, p.value)).collect();
+    injected.extend(bound.into_iter().map(|(name, _, value, _)| (name, value)));
+    let spec = RunSpec {
+        argv: argv.into_iter().map(OsString::from).collect(),
+        injected,
+        redactor,
+        idle_flush: IDLE_FLUSH,
+        stdin: None,
+        stdout: out(std::io::stdout().as_fd())?,
+        stderr: out(std::io::stderr().as_fd())?,
+    };
+    match envcloak_exec::run(spec) {
+        Ok(exit) => Ok(ExitCode::from(exit.shell_code())),
+        Err(e) => Ok(exec_failure(&e)),
+    }
+}
+
+/// `value_too_short`, naming the refused items by slug.
+fn too_short(r: &CoverageReport) -> Failure {
+    let slugs: Vec<&str> = r.refused_short.iter().map(Slug::as_str).collect();
+    Failure::new(
+        "value_too_short",
+        format!(
+            "{}: a value under 8 bytes is never injected, and one of 8 to 15 bytes only when \
+             its item allows short values; nothing was started",
+            slugs.join(", ")
+        ),
+    )
+}
+
+/// Reports a runner failure with its exit code: 127 for a command not
+/// found and 126 for one that could not be run, as `env(1)` has them, and
+/// 125 for EnvCloak's own.
+fn exec_failure(e: &ExecError) -> ExitCode {
+    Failure::new(e.token(), e.message()).report(e.exit_code())
+}
+
+/// What the redactor covers less than fully, one line per item on
+/// standard error, before the command starts.
+fn print_coverage(r: &CoverageReport) {
+    for s in &r.warned_short {
+        eprintln!(
+            "envcloak: coverage: {s} is 8 to 15 bytes (allowed short): the value and its \
+             whole-value encodings are redacted, but a short value can also match ordinary output"
+        );
+    }
+    for s in &r.partial {
+        eprintln!(
+            "envcloak: coverage: {s}: inside a longer base64 stream it is redacted at some byte \
+             alignments only"
+        );
+    }
+    for s in &r.truncated {
+        eprintln!(
+            "envcloak: coverage: {s}: JSON escapes are redacted as common serializers write \
+             them, not in every combination of options"
+        );
     }
 }
 

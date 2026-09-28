@@ -223,6 +223,7 @@ name = "envcloak"
 version = "0.1.0"
 dependencies = [
  "envcloak-core",
+ "envcloak-exec",
  "envcloak-ipc",
  "envcloak-policy",
  "envcloak-providers",
@@ -231,6 +232,7 @@ dependencies = [
  "libc",
  "regex",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml_edit",
  "zeroize",
