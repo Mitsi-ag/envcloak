@@ -1,10 +1,12 @@
 //! The commands (SPEC §14 M1 list). T7 has `vault create`, `unlock`,
 //! `lock`, `status` and `daemon install`; T9 adds `run`'s request step,
-//! `approve`, `deny` and `grants`; later tasks add the rest.
+//! `approve`, `deny` and `grants`; T10 adds `audit verify`; later tasks
+//! add the rest.
 //!
 //! Argument errors never echo an argument: one could be a pasted secret.
 
 pub mod approve;
+pub mod audit;
 pub mod daemon;
 pub mod grants;
 pub mod lock;

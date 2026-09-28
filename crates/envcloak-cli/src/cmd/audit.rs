@@ -1,0 +1,146 @@
+//! `envcloak audit verify [--json]` (SPEC §15.2 gate 33, story S12): the
+//! daemon checks the sealed audit log against the head saved in the
+//! vault's header, and this prints what it found. Counts, sequence
+//! numbers and fixed words only: no entry's contents cross the socket.
+//!
+//! - The chain checks out: exit 0, with the anchor and any unanchored tail
+//!   (the entries after the anchor, whose removal from the end of the log
+//!   could not be noticed).
+//! - A problem (an entry changed, missing or out of place, a damaged
+//!   segment, an anchor the log contradicts, or a log that no longer ends
+//!   where the daemon last wrote it): the first one at its sequence
+//!   number, and exit 1 with `audit_problem`.
+//!
+//! The vault must be unlocked: the log's keys come from the vault key.
+
+use std::process::ExitCode;
+
+use envcloak_ipc::view::{AnchorState, AuditProblemKind, AuditVerifyView};
+
+use crate::connect::connect;
+use crate::fail::{FAILURE, Failure, usage};
+
+const USAGE: &str = "envcloak audit verify [--json]";
+
+pub fn run(args: &[&str]) -> ExitCode {
+    let json = match args {
+        ["verify"] => false,
+        ["verify", "--json"] => true,
+        _ => return usage(USAGE),
+    };
+    verify(json).unwrap_or_else(|f| f.report(FAILURE))
+}
+
+fn verify(json: bool) -> Result<ExitCode, Failure> {
+    let v = connect()?.audit_verify()?;
+    let problem = v.first_problem.is_some() || v.live_head_matches == Some(false);
+    if json {
+        println!("{}", serde_json::to_value(&v).unwrap_or_default());
+    } else {
+        print_human(&v);
+    }
+    if !problem {
+        return Ok(ExitCode::SUCCESS);
+    }
+    Err(Failure::new(
+        "audit_problem",
+        match v.first_problem {
+            Some(p) => format!(
+                "the audit log was changed or damaged; the first problem is at entry {}",
+                p.seq
+            ),
+            None => "the audit log no longer ends where the daemon last wrote it".to_owned(),
+        },
+    ))
+}
+
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+fn problem_text(k: AuditProblemKind) -> &'static str {
+    match k {
+        AuditProblemKind::Altered => "the entry was changed (it does not open)",
+        AuditProblemKind::ChainBroken => {
+            "the entry does not follow the one before it (changed, replaced or from another log)"
+        }
+        AuditProblemKind::Missing => "the entry is missing (removed, or the log was cut there)",
+        AuditProblemKind::Reordered => "the entry is out of place",
+        AuditProblemKind::SegmentDamaged => {
+            "a segment of the log is damaged, or belongs to another vault"
+        }
+        AuditProblemKind::Unreadable => "the log cannot be read as entries from here",
+        AuditProblemKind::AnchorMismatch => {
+            "the entry is not the one the vault's saved head names (the log was replaced)"
+        }
+    }
+}
+
+fn print_human(v: &AuditVerifyView) {
+    println!(
+        "audit log: {} in {}, through entry {}",
+        plural(v.entries, "entry", "entries"),
+        plural(v.segments, "segment", "segments"),
+        v.last_seq
+    );
+    match (v.anchor.state, v.anchor.seq) {
+        (AnchorState::None, _) => println!("anchor: none saved in the vault yet"),
+        (AnchorState::Matched, Some(seq)) => {
+            println!("anchor: entry {seq}, saved in the vault's header, matches the log");
+        }
+        (AnchorState::Mismatch, Some(seq)) => {
+            println!("anchor: entry {seq}, saved in the vault's header, does NOT match the log");
+        }
+        (AnchorState::Missing, Some(seq)) => {
+            println!("anchor: entry {seq}, saved in the vault's header, is NOT in the log");
+        }
+        _ => println!("anchor: unknown"),
+    }
+    match &v.first_problem {
+        None => println!("check: OK, the chain holds from the first entry to the last"),
+        Some(p) => {
+            println!(
+                "check: PROBLEM at entry {}: {}",
+                p.seq,
+                problem_text(p.kind)
+            );
+            if v.problems > 1 {
+                println!("problems in all: {}", v.problems);
+            }
+        }
+    }
+    if let Some(t) = v.unanchored_tail {
+        if t.first == t.last {
+            println!(
+                "unanchored tail: entry {} was written after the anchor; had entries been \
+                 removed from the end of the log after it, that would not show",
+                t.first
+            );
+        } else {
+            println!(
+                "unanchored tail: entries {} to {} were written after the anchor; had entries \
+                 been removed from the end of the log after them, that would not show",
+                t.first, t.last
+            );
+        }
+    }
+    if v.torn_tail {
+        println!(
+            "note: the last entry was cut short by a crash; it was never acknowledged, and is \
+             removed when the log is next opened"
+        );
+    }
+    if v.live_head_matches == Some(false) {
+        println!(
+            "PROBLEM: the log no longer ends where the daemon last wrote it: entries were removed \
+             while it ran"
+        );
+    }
+    if v.queued > 0 || v.dropped > 0 {
+        println!(
+            "waiting to be written: {}; lost because the queue was full: {}",
+            plural(v.queued, "event", "events"),
+            v.dropped
+        );
+    }
+}

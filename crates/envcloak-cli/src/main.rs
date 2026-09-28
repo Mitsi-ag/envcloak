@@ -14,7 +14,8 @@
 //!   the daemon. It asks a verified daemon for the decision; the runner
 //!   itself arrives in T12;
 //! - `envcloak approve`, `deny` and `grants list` / `grants revoke` (SPEC
-//!   §10b).
+//!   §10b);
+//! - `envcloak audit verify`: the audit log's check (SPEC §15.2 gate 33).
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
 //! create`, `unlock`, `approve`, `run`) refuses under a tracer first.
@@ -53,7 +54,8 @@ const HELP: &str = "usage:
   envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
-  envcloak grants revoke <GRANT> | --all";
+  envcloak grants revoke <GRANT> | --all
+  envcloak audit verify [--json]";
 
 fn main() -> ExitCode {
     envcloak_sys::harden_process();
@@ -91,6 +93,7 @@ fn main() -> ExitCode {
         ["approve", rest @ ..] => cmd::approve::approve(rest),
         ["deny", rest @ ..] => cmd::approve::deny(rest),
         ["grants", rest @ ..] => cmd::grants::run(rest),
+        ["audit", rest @ ..] => cmd::audit::run(rest),
         // Never echo arguments: one of them could be a pasted secret.
         _ => {
             eprintln!("envcloak: unknown command\n{HELP}");

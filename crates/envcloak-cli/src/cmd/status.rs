@@ -150,6 +150,23 @@ fn print_human(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
         "grants: {} in force, {} waiting for approval",
         s.approvals.grants, s.approvals.pending
     );
+    let audit = &s.audit;
+    match (audit.open, audit.head_seq, s.vault.state) {
+        (true, Some(seq), _) => println!(
+            "audit log: open, last entry {seq} ({} not yet anchored in the vault)",
+            audit.unanchored
+        ),
+        (false, _, VaultState::Unlocked) => println!(
+            "audit log: UNAVAILABLE: requests that would release values are denied until it can              be written"
+        ),
+        _ => println!("audit log: closed while the vault is locked"),
+    }
+    if audit.queued > 0 || audit.dropped > 0 {
+        println!(
+            "audit events waiting to be written: {}; lost because the queue was full: {}",
+            audit.queued, audit.dropped
+        );
+    }
     if s.approvals.proof_failures > 0 {
         println!(
             "failed passphrase attempts: {} (next attempt admitted in {})",
