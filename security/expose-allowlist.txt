@@ -20,3 +20,5 @@ crates/envcloak-providers/src/detect.rs      # matches a value against the regis
 crates/envcloak-ipc/src/frame.rs             # frame bodies: parsed in place and written to a verified peer
 crates/envcloak-ipc/src/wire_secret.rs       # base64-encodes a value into a request or response
 crates/envcloak-daemon/src/redact.rs          # hands a request's values to the redactor that masks the command line its audit entry keeps
+crates/envcloak-exec/src/coverage.rs         # hands a run's values to the redactor that masks the command's output
+crates/envcloak-exec/src/spawn.rs            # puts a run's values in the child's environment, and nowhere else

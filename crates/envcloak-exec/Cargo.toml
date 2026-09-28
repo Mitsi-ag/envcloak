@@ -1,0 +1,35 @@
+[package]
+name = "envcloak-exec"
+description = "The EnvCloak run pipeline: the child's environment, its redacted output, signals and exit codes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+envcloak-core.workspace = true
+envcloak-policy.workspace = true
+envcloak-redact.workspace = true
+envcloak-sys.workspace = true
+libc.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+envcloak-sys = { workspace = true, features = ["testing"] }
+envcloak-testkit.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+# Its own main: the binary is also the runner the tests start as a real
+# process (see the file), and a libtest harness would print into the
+# runner's standard output, which is what the tests read.
+[[test]]
+name = "runner"
+harness = false

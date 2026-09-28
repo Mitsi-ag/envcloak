@@ -84,6 +84,20 @@ jobs:
       - name: Allow the launchd test (macOS)
         if: runner.os == 'macOS'
         run: echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
+      # Gate 8 feeds the output of real serializers through the runner
+      # (crates/envcloak-exec/tests/runner.rs). The runners' preinstalled
+      # Node, Go and (Linux) PHP are required, so a missing one fails the
+      # gate instead of narrowing it.
+      - name: Serializers gate 8 requires
+        run: |
+          node --version
+          go version
+          if [ "$RUNNER_OS" = Linux ]; then
+            php --version
+            echo "ENVCLOAK_TEST_REQUIRE_SERIALIZERS=node,go,php" >> "$GITHUB_ENV"
+          else
+            echo "ENVCLOAK_TEST_REQUIRE_SERIALIZERS=node,go" >> "$GITHUB_ENV"
+          fi
       - run: cargo fmt --all --check
       - name: Unsafe-code and secret-exposure boundaries
         run: |

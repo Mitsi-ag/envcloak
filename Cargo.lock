@@ -265,6 +265,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "envcloak-exec"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "envcloak-core",
+ "envcloak-policy",
+ "envcloak-redact",
+ "envcloak-sys",
+ "envcloak-testkit",
+ "libc",
+ "secrecy",
+ "serde_json",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "envcloak-ipc"
 version = "0.1.0"
 dependencies = [

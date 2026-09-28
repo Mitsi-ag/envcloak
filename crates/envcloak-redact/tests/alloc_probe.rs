@@ -67,7 +67,8 @@ fn stream_redactor_frees_no_unwiped_secret_bytes() {
 #[test]
 fn building_and_dropping_the_redactor_leaves_nothing_under_the_wiping_allocator() {
     // The automata keep their own unwiped copies of the patterns; the wiping
-    // allocator is what clears them (T12 relies on this).
+    // allocator is what clears them (the runner, envcloak-exec, relies on
+    // this).
     let cs = canaries(fresh_seed());
     let needle = by_label(&cs, labels::OPENAI_API_KEY).value();
     let session = probe_canaries(&cs, ProbeMode::Wiping);
