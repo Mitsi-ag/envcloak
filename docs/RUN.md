@@ -1,0 +1,60 @@
+# EnvCloak: running a command with secrets
+
+Status: M1. This file fixes how SPEC §6.1 steps 5 to 9 are carried out: how the daemon releases a covered run's values, what the CLI does with them, how the command's output is redacted, and how signals, exit codes and a command's descendants are handled. The code is in `crates/envcloak-exec` (the runner), `crates/envcloak-cli/src/cmd/run.rs` (the command) and `crates/envcloak-daemon/src/requests.rs` and `state.rs` (the release). How a request is decided is in docs/GRANTS.md; the wire form of `run.request` is in docs/IPC.md.
+
+## Release
+
+A covered `run.request` is a delivery. The daemon, holding its state lock since the decision:
+
+1. refuses (`traced`) while a tracer is attached to it;
+2. reads each binding's value from the verified vault. A read that meets a row changed on disk while the vault is open turns the vault tampered (T3), and the request fails with `vault_tampered`: nothing is released, then or later, from that vault;
+3. writes the delivery's audit entry and flushes it to disk (`State::deliver`). When it cannot, the request is denied with `audit_failed`, the values read are dropped (and wiped), and a `once` grant stays unused;
+4. only then puts the values in the answer: for each binding, in the order the daemon resolved them, the variable, the item's slug, its `allow_short`, and the value as base64 in a wiped buffer.
+
+A pending or denied answer carries no value. The client refuses an answer with values beside another decision, a variable or slug of the wrong shape, a variable named twice, or an empty value or one holding a NUL byte (`protocol_error`): a program running as the user can answer in the daemon's place (SPEC §1.1).
+
+## The command
+
+`envcloak run` closes its connection to the daemon, then:
+
+1. **Short values** (gate 9). A value under 8 bytes is never injected. A value of 8 to 15 bytes is injected only when its item has `allow_short` (`envcloak add --allow-short`). Otherwise the run exits 125 with `value_too_short`, naming the items by slug, and starts nothing. The limits come from the redactor: a shorter value would match ordinary output.
+2. **The redactor.** One redactor for the run, labeled with the items' slugs: a value is replaced by `[envcloak:<slug>]`, and so is each encoding `envcloak-redact` covers (the value raw; base64 and base64url, padded and unpadded, whole or inside a longer base64 stream; lower and upper hex; percent-encodings of common encoders; JSON escapes of common serializers). What it covers less than fully is printed on standard error before the command starts, one line per item: `envcloak: coverage: <slug> is 8 to 15 bytes (allowed short)`, `envcloak: coverage: <slug>: inside a longer base64 stream it is redacted at some byte alignments only` (too few whole base64 groups at some alignment), and `envcloak: coverage: <slug>: JSON escapes are redacted as common serializers write them, not in every combination of options`.
+3. **The environment** (gates 13 and 14). The command gets this process's environment plus the env file's ordinary variables and the bindings' values. The values are set only in the new process's environment: never in argv, a temporary file or the CLI's own environment. `Command::env` copies them into strings that are freed right after the spawn; the wiping allocator clears those, as it clears the copies the redactor's automata keep (gate 11). The CLI keeps the redactor, and nothing else holding a value, until the command ends.
+4. **Output.** Standard output and standard error are separate pipes, each read by its own thread through its own stream of the redactor: `push` on every read, `flush_idle` after 40 ms without output (so a prompt without a newline shows at once, unless it could be the start of a value), `finish` at end of stream. Only what the redactor releases is written. Relative order between the two streams is not kept. Standard input is inherited.
+5. **No terminal.** The command's standard output and standard error are pipes, not a terminal, so a program that colors its output or pages only on a terminal prints plain text. There is no switch to unredacted passthrough when a terminal is present. PTY mode (`--pty`, merged output through the redactor) is M2's.
+
+## Signals and exit
+
+- **With a controlling terminal** the command stays in the CLI's process group. The terminal sends SIGINT (Ctrl-C) and SIGQUIT to both; the CLI catches them and stays, so what the command prints on its way out is redacted too. SIGTERM and SIGHUP, which are sent to the CLI alone, are passed on to the command.
+- **Without one** (an agent's tool call, a service), the command leads a process group of its own, and the CLI passes SIGINT, SIGTERM, SIGHUP and SIGQUIT on to that group.
+- The four signals are caught, never ignored, from before the command starts until it ends; `exec` resets a caught signal to its default, so the command starts with the usual dispositions. A signal is passed on only while the command has not exited: the CLI sees the exit with `waitid(WNOWAIT)` and stops passing signals on before it reaps the command, so its pid, and the group it leads, cannot belong to another process by then.
+- **Exit.** The CLI exits with the command's code, or 128 plus the number of the signal that ended it. A command that does not exist exits 127 (`command_not_found`), and one that cannot be run 126 (`command_not_executable`), as with `env(1)`. EnvCloak's own failures exit 125 with one token: `approval_required`, `approval_denied`, `vault_locked`, `vault_tampered`, `daemon_unavailable`, `daemon_unverified`, `manifest_invalid`, `binding_unresolved`, `value_too_short`, `traced`, `protocol_error` or `run_failed`. The command is never `exec`ed in the CLI's place: that would end redaction.
+- **Descendants.** After the command exits, output is read until end of stream. A descendant that still holds the pipes 2 seconds later is cut off: the pipes are closed, what was held back is released redacted, and what it writes afterwards is lost (its next write fails), never passed through.
+- **A lost reader.** When the CLI's standard output (or standard error) can no longer be written, `EPIPE` for a reader that went away, the CLI closes its end of the command's pipe for that stream, so the command's next write fails with `SIGPIPE` or `EPIPE`, as it would writing to the reader directly (`envcloak run -- make | head`). The other stream goes on.
+- **Backpressure.** A slow reader slows the command: nothing is buffered beyond one read (64 KiB) and what the redactor holds back.
+
+## What another process sees
+
+SPEC §1.1 says it plainly: other programs running as you can read a running process's environment. The tests record it on both systems (`crates/envcloak-cli/tests/run.rs`):
+
+| | The CLI (`envcloak run`) | The command |
+|---|---|---|
+| macOS, `ps -E` | the environment it was started with: no value | the values (for a binary that is not a platform binary; macOS hides a platform binary's environment) |
+| Linux, `/proc/<pid>/environ` | unreadable: the CLI is non-dumpable | the values: `exec` makes the command dumpable again |
+
+Neither command line holds a value (gate 13).
+
+## Gates
+
+| Gate | Where |
+|---|---|
+| 8: output of real serializers (Python's JSON with `ensure_ascii` true and false, `quote` and `quote_plus` in both hex cases, form encoding, base64 and base64url padded and unpadded at offsets 0, 1 and 2, hex; Node, PHP and Go where installed; serde_json; the recorded output of .NET, Go, Node, Python and Ruby), written by a real child on both streams, whole and then a byte at a time with an idle flush between bytes, followed by malformed UTF-8, end of stream or SIGTERM: no value or encoding reaches the output, and every payload arrives | `crates/envcloak-exec/tests/runner.rs` (`tests/emitters/`), `crates/envcloak-exec/src/pump.rs` (tests) |
+| 9: under 8 bytes refused, 8 to 15 bytes refused without `allow_short` and reported with it, whole-value encodings of a short value redacted | `crates/envcloak-exec/tests/runner.rs`, `crates/envcloak-exec/src/coverage.rs` (tests), `crates/envcloak-cli/tests/run.rs` |
+| 11, for the runner: building the child's environment and building and dropping the redactor leave no freed block holding a value | `crates/envcloak-exec/tests/alloc_probe.rs` |
+| 13, during a run: `ps` shows no value in the CLI's argv or environment, or in the command's argv | `crates/envcloak-cli/tests/run.rs` |
+| 14: the values are in the command's environment only, a sibling reads it as above, and no file holds a value | `crates/envcloak-cli/tests/run.rs` |
+| 33, release order: values leave the daemon only after their entry is on disk; an audit failure, or a vault changed on disk while open, releases nothing and starts nothing | `crates/envcloak-daemon/src/state.rs` (tests), `crates/envcloak-daemon/tests/release.rs`, `crates/envcloak-cli/tests/run.rs` |
+| Signals with and without a terminal, exit codes, a prompt within 100 ms, a lost reader, 100 MB of backpressure, a descendant cut off after 2 seconds | `crates/envcloak-exec/tests/runner.rs`, `crates/envcloak-exec/src/pump.rs` (tests), `crates/envcloak-sys/tests/child.rs` |
+| 19, the CLI's last item: a traced `envcloak run` refuses before any daemon contact and starts nothing (Linux) | `crates/envcloak-cli/tests/hardening.rs` |
+
+`crates/envcloak-exec/tests/runner.rs` has no libtest harness: the binary is also the runner the tests start as a real process, through `python3`, in a new session without a controlling terminal or on a new pseudo-terminal of its own. Set `ENVCLOAK_TEST_REQUIRE_SERIALIZERS` (a comma-separated list of `node`, `php` and `go`) to make a missing runtime a failure; CI names the ones its runners have.

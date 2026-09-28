@@ -12,7 +12,7 @@ Status: M1. This file fixes how SPEC §10a "Bounds and display" and §10b are ca
 4. applies the effective policy: the vault's policy for the project (approve, redact, inject in M1), tightened by the manifest's `[policy]`, for the subject's kind. `agents = "deny"` refuses an agent or unknown subject (`policy_denied`); a required proxy mode is refused in M1 (`mode_unsupported`), never injected;
 5. asks the grant store for the decision: `covered` (with the grant id, whether output is redacted, the mode, and whether the manifest's hash differs from the one at approval), `pending` (with the request id) or `denied` (with the reason).
 
-No value crosses in this build: the release path is T12's. A covered run in this build exits 2 saying so. A pending run exits 125 with `approval_required request=<id>: run "envcloak approve <id>" in a terminal you control`, and reads nothing from its own terminal: that terminal may be an agent's, and a `y` typed there approves nothing.
+A covered request is a delivery: its answer carries the bindings' values, and `envcloak run` starts the command with them (docs/RUN.md). A pending run exits 125 with `approval_required request=<id>: run "envcloak approve <id>" in a terminal you control`, and reads nothing from its own terminal: that terminal may be an agent's, and a `y` typed there approves nothing.
 
 No decision is made, and no proof taken, from a vault that failed its integrity check (`vault_tampered`): its project index and policy cannot be trusted.
 
@@ -35,7 +35,7 @@ A manifest change that leaves the bindings a subset does not prompt; the daemon 
 
 **Once.** A `once` grant is used up by the first request it covers. The decision and the consumption happen under one lock, so of concurrent requests exactly one is covered; the others are pending, and identical ones share one pending request.
 
-**Audit before release.** A covered request's audit entry is flushed to disk before the answer (and so before T12 releases a value); a `once` grant is consumed only after that. When the entry cannot be written, the request is denied with `audit_failed`, nothing is released, and the grant is left as it was (VAULT.md "Audit log").
+**Audit before release.** A covered request's audit entry is flushed to disk before the answer, and the values go into the answer only after that (docs/RUN.md "Release"); a `once` grant is consumed only after that too. When the entry cannot be written, the request is denied with `audit_failed`, nothing is released, and the grant is left as it was (VAULT.md "Audit log").
 
 **Deadlines.** An approval sets two: the wall clock plus the grant's length, and time awake plus the same length. Either passing ends the grant, so a clock stepped either way cannot lengthen one. Lengths: 8 hours by default (`--for` sets it, from 30 seconds), at most 24 hours for an agent subject and 12 hours for a terminal or unknown subject: an unknown subject's evidence is missing, so it takes the tighter bound.
 

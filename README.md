@@ -48,6 +48,7 @@ The full product and architecture spec, including the threat model, is in [docs/
 The vault's byte formats and key derivations are in [docs/CRYPTO.md](docs/CRYPTO.md), and its storage format in [docs/VAULT.md](docs/VAULT.md).
 Project manifests and env files are in [docs/MANIFEST.md](docs/MANIFEST.md), and the provider registry in [docs/PROVIDERS.md](docs/PROVIDERS.md).
 The daemon protocol, socket checks and lock rules are in [docs/IPC.md](docs/IPC.md), the caller evidence in [docs/AGENTS.md](docs/AGENTS.md), and grants and approvals in [docs/GRANTS.md](docs/GRANTS.md).
+How `envcloak run` releases, injects and redacts values, and handles signals and exit codes, is in [docs/RUN.md](docs/RUN.md).
 
 ## Contributing
 
