@@ -91,17 +91,20 @@ fn parse_options(args: &[&str]) -> Option<DaemonConfig> {
 
 /// `<n>s`, `<n>m` or `<n>h`, from 1 minute to 24 hours.
 fn parse_idle(s: &str) -> Option<Duration> {
-    let (digits, unit) = s.split_at(s.len().checked_sub(1)?);
+    // Match the unit as a suffix rather than splitting at a byte offset: a
+    // value ending in a multi-byte character must fail like any other bad
+    // input, not panic inside that character.
+    let (digits, per_unit) = if let Some(d) = s.strip_suffix('s') {
+        (d, 1)
+    } else if let Some(d) = s.strip_suffix('m') {
+        (d, 60)
+    } else {
+        (s.strip_suffix('h')?, 3600)
+    };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let n: u64 = digits.parse().ok()?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n.checked_mul(60)?,
-        "h" => n.checked_mul(3600)?,
-        _ => return None,
-    };
+    let secs = digits.parse::<u64>().ok()?.checked_mul(per_unit)?;
     let d = Duration::from_secs(secs);
     (lock::MIN_IDLE..=lock::MAX_IDLE).contains(&d).then_some(d)
 }
@@ -127,9 +130,17 @@ mod tests {
             "8H",
             "8 h",
             "99999999999999999999h",
+            // A multi-byte last character is refused, never split inside.
+            "8\u{e9}",
+            "8\u{20ac}",
+            "8\u{1F600}",
+            "8\u{ff48}",
+            "\u{e9}h",
+            "8\u{e9}h",
         ] {
             assert_eq!(parse_idle(bad), None, "{bad}");
         }
+        assert!(parse_options(&["--idle-lock", "8\u{ff48}"]).is_none());
         assert!(parse_options(&["--idle-lock", "2h"]).is_some());
         assert!(parse_options(&["--idle-lock"]).is_none());
         assert!(parse_options(&["--other"]).is_none());

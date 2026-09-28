@@ -175,3 +175,36 @@ fn input_left_after_secret_entry_ends_never_reaches_the_next_reader() {
     let status = stdout(&run(&home, &["status"], &[]));
     assert!(status.contains("vault: none yet"), "{status}");
 }
+
+/// A `SIGTERM` or `SIGINT` sent to the CLI while it reads a passphrase
+/// ends it by that signal, but only after the terminal's settings are
+/// back: the shell that follows (which ignores the signal here, so it is
+/// the only survivor of the process group) still echoes what is typed, and
+/// `head` reads a whole line. Nothing reached the daemon.
+#[test]
+fn external_termination_restores_the_terminal_first() {
+    let home = TestHome::new();
+    let _d = start_daemon(&home);
+    let script = "trap '' TERM INT; \"$0\" vault create --kdf-memory 64MiB; \
+                  echo CLI_EXITED=$?; exec head -n 1";
+    for (send, code) in [("@SIGTERM@", 128 + 15), ("@SIGINT@", 128 + 2)] {
+        let (out, exit) = drive(
+            &home,
+            &["/bin/sh", "-c", script, cli().to_str().unwrap()],
+            &[
+                ("New vault passphrase", send),
+                ("CLI_EXITED", "the next line\n"),
+            ],
+        );
+        let shown = stdout(&out);
+        assert_eq!(exit, 0, "{shown}");
+        assert!(
+            shown.contains(&format!("CLI_EXITED={code}")),
+            "{send}: {shown}"
+        );
+        // Echoed by the restored terminal, then printed by `head`.
+        assert_eq!(shown.matches("the next line").count(), 2, "{send}: {shown}");
+    }
+    let status = stdout(&run(&home, &["status"], &[]));
+    assert!(status.contains("vault: none yet"), "{status}");
+}

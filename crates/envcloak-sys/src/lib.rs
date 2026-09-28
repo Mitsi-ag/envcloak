@@ -64,5 +64,5 @@ pub use proc::{
     ancestry_in, parse_cmdline, parse_proc_stat, parse_procargs2, parse_status_euid, proc_argv,
     proc_info, reaches_top,
 };
-pub use signal::TerminationSignals;
+pub use signal::{TerminationSignals, TerminationWatch, exit_by_signal, termination_recorded};
 pub use tty::SecretInput;

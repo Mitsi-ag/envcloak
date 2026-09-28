@@ -13,6 +13,13 @@
 //! rather than left for the next program on the terminal (the shell, which
 //! would show and run it). When reading ends before Enter, the rest of a
 //! paste still arriving is read and discarded first.
+//!
+//! A `SIGTERM`, `SIGINT` or `SIGHUP` sent to the process while it reads is
+//! recorded by a [`envcloak_sys::TerminationWatch`] instead of ending the
+//! process on the spot: the read returns, the terminal's settings come
+//! back, and only then does the process end by that signal, as it would
+//! have without the watch. `SIGKILL` cannot be caught; a terminal left in
+//! secret-input mode by it is restored by the next `reset` or `stty sane`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -46,6 +53,9 @@ pub enum InputError {
     TooLong,
     /// The descriptor named by `--passphrase-fd` is not open.
     BadFd,
+    /// A termination signal arrived while reading; the process ends by it
+    /// once the terminal is restored.
+    Terminated(i32),
     /// Reading or writing failed.
     Io,
 }
@@ -66,6 +76,7 @@ impl From<InputError> for Failure {
                 "the file descriptor named on the command line is not open",
             ),
             InputError::Io => Failure::new("io", "reading the passphrase failed"),
+            InputError::Terminated(_) => Failure::new("terminated", "stopped by a signal"),
         }
     }
 }
@@ -101,6 +112,9 @@ impl Terminal {
     /// before the prompt appears, so nothing typed after it is echoed or
     /// discarded.
     pub fn read_secret(&mut self, prompt: &str) -> Result<SecretBytes, InputError> {
+        // Installed before the terminal changes, so no signal can end the
+        // process between the two without the settings coming back.
+        let watch = envcloak_sys::TerminationWatch::install().map_err(|_| InputError::Io)?;
         let result = {
             let mode = envcloak_sys::SecretInput::begin(self.file.as_fd())
                 .map_err(|_| InputError::NoTerminal)?;
@@ -117,7 +131,19 @@ impl Terminal {
             drop(mode);
             r
         };
-        self.say("\n")?;
+        let _ = self.say("\n");
+        // A signal that arrived after the last read completed is honoured
+        // too: the terminal is restored either way.
+        let terminated = match (&result, watch.recorded()) {
+            (Err(InputError::Terminated(sig)), _) => Some(*sig),
+            (_, Some(sig)) => Some(sig),
+            _ => None,
+        };
+        if let Some(sig) = terminated {
+            drop(result);
+            drop(watch);
+            envcloak_sys::exit_by_signal(sig);
+        }
         result
     }
 }
@@ -134,7 +160,12 @@ fn read_keys(mut tty: &File) -> Result<SecretBytes, InputError> {
             // The terminal hung up.
             Ok(0) => return Err(InputError::Io),
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if let Some(sig) = envcloak_sys::termination_recorded() {
+                    return Err(InputError::Terminated(sig));
+                }
+                continue;
+            }
             Err(_) => return Err(InputError::Io),
         }
         match b[0] {

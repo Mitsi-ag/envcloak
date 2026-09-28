@@ -163,9 +163,10 @@ pub fn outside_dir() -> tempfile::TempDir {
 /// a paste larger than the terminal's input queue arrives whole.
 /// `@SUGGESTED@` in `send` stands for the generated passphrase the
 /// terminal showed, and `@PAUSE@` for a pause of 50 ms, as between two
-/// pieces of a paste. Prints everything the terminal showed, then the exit
-/// code on stderr.
-pub const DRIVER: &str = r#"import json, os, pty, re, select, sys, time
+/// pieces of a paste. A `send` of `@SIGTERM@` or `@SIGINT@` sends that
+/// signal to the terminal's process group instead of typing. Prints
+/// everything the terminal showed, then the exit code on stderr.
+pub const DRIVER: &str = r#"import json, os, pty, re, select, signal, sys, time
 steps = json.load(open(sys.argv[1]))
 pid, fd = pty.fork()
 if pid == 0:
@@ -190,6 +191,9 @@ for expect, send in steps:
         if not more(deadline):
             sys.stdout.buffer.write(out)
             sys.exit('did not see ' + repr(expect))
+    if send in ('@SIGTERM@', '@SIGINT@'):
+        os.killpg(os.getpgid(pid), getattr(signal, send.strip('@')))
+        continue
     if '@SUGGESTED@' in send:
         words = re.search(rb'Write it down:\r?\n\r?\n    ([a-z -]+)\r?\n', out).group(1).decode()
         send = send.replace('@SUGGESTED@', words)
