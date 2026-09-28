@@ -85,9 +85,13 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
       # Gate 8 feeds the output of real serializers through the runner
-      # (crates/envcloak-exec/tests/runner.rs). The runners' preinstalled
-      # Node, Go and (Linux) PHP are required, so a missing one fails the
-      # gate instead of narrowing it.
+      # (crates/envcloak-exec/tests/runner.rs). Node and Go (set up here:
+      # the macOS image has none) and, on Linux, the image's PHP are
+      # required, so a missing one fails the gate instead of narrowing it.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
       - name: Serializers gate 8 requires
         run: |
           node --version
