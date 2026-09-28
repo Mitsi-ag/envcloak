@@ -6,6 +6,10 @@
 //! time and keep no captures, so the matcher records no part of it. A
 //! [`Detection`] holds provider ids and a classification: never the value,
 //! a piece of it, or where in it a pattern matched. Nothing here logs.
+//!
+//! [`Registry::mask_keys`] reads text that may hold a pasted key (a
+//! command line the audit log keeps) and returns it with every key-shaped
+//! word replaced by a marker.
 
 use envcloak_core::SecretBytes;
 use envcloak_core::vault::Classification;
@@ -73,5 +77,68 @@ impl Registry {
             ambiguous: pick.is_none() && !found.is_empty(),
             candidates: found.iter().map(|&i| providers[i].id.clone()).collect(),
         }
+    }
+}
+
+/// The bytes a key can be made of, narrowly: letters, digits, `_` and `-`,
+/// as every key pattern in the registry today.
+fn narrow(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// The bytes a key can be made of, widely: also `.`, `+`, `/`, `=` and
+/// `~`, for tokens that carry base64 or dots.
+fn wide(b: u8) -> bool {
+    narrow(b) || matches!(b, b'.' | b'+' | b'/' | b'=' | b'~')
+}
+
+impl Registry {
+    /// `text` with every word a provider's key pattern matches whole
+    /// replaced by `[envcloak:key:<provider>]`. A word is a longest run of
+    /// key bytes, taken twice: once of letters, digits, `_` and `-` (so
+    /// `KEY=sk-...` and `Bearer sk-...` give the key alone), and once also
+    /// with `.`, `+`, `/`, `=` and `~`. For a command line an agent ran,
+    /// before the audit log keeps it: agents paste keys into commands.
+    pub fn mask_keys(&self, text: &str) -> String {
+        let b = text.as_bytes();
+        let mut hits: Vec<(usize, usize, usize)> = Vec::new();
+        for class in [narrow as fn(u8) -> bool, wide] {
+            let mut at = 0;
+            while at < b.len() {
+                if !class(b[at]) {
+                    at += 1;
+                    continue;
+                }
+                let start = at;
+                while at < b.len() && class(b[at]) {
+                    at += 1;
+                }
+                if at - start >= crate::MIN_KEY_LEN {
+                    if let Some(&p) = self.key_matches(&b[start..at]).first() {
+                        hits.push((start, at, p));
+                    }
+                }
+            }
+        }
+        if hits.is_empty() {
+            return text.to_owned();
+        }
+        hits.sort_unstable();
+        let providers = self.providers();
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        for (start, end, p) in hits {
+            if end <= at {
+                continue;
+            }
+            // Runs end at ASCII bytes, so these are character boundaries.
+            out.push_str(&text[at..start.max(at)]);
+            out.push_str("[envcloak:key:");
+            out.push_str(providers[p].id.as_str());
+            out.push(']');
+            at = end;
+        }
+        out.push_str(&text[at..]);
+        out
     }
 }

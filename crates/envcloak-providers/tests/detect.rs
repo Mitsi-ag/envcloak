@@ -465,3 +465,47 @@ fn prefill_from_a_detection() {
     r.prefill(&d, &mut item);
     assert_eq!(item, ItemDetails::default());
 }
+
+/// Key-shaped words in a command line are masked, whatever surrounds them
+/// (`KEY=`, `Bearer `, a URL query, quotes, a trailing period), and nothing
+/// else changes: the audit log keeps command lines agents ran, and agents
+/// paste keys into them.
+#[test]
+fn key_shaped_words_in_a_command_line_are_masked() {
+    let r = load_embedded().unwrap();
+    let cs = canaries(fresh_seed());
+    let openai = by_label(&cs, labels::OPENAI_API_KEY).as_str();
+    let stripe = by_label(&cs, labels::STRIPE_SECRET_KEY).as_str();
+    let github = by_label(&cs, labels::GITHUB_TOKEN).as_str();
+    let lines = [
+        format!("OPENAI_API_KEY={openai}"),
+        format!("Authorization: Bearer {openai}"),
+        format!("https://api.example.test/v1?key={stripe}&x=1"),
+        format!("'{github}'"),
+        format!("token {github}."),
+        format!("{stripe}.{openai}"),
+    ];
+    for line in &lines {
+        let masked = r.mask_keys(line);
+        assert_no_canary(masked.as_bytes(), &cs);
+        assert!(masked.contains("[envcloak:key:"), "a key was not masked");
+    }
+    assert_eq!(
+        r.mask_keys(&lines[0]),
+        "OPENAI_API_KEY=[envcloak:key:openai]"
+    );
+    assert_eq!(
+        r.mask_keys(&lines[2]),
+        "https://api.example.test/v1?key=[envcloak:key:stripe]&x=1"
+    );
+    assert_eq!(r.mask_keys(&lines[4]), "token [envcloak:key:github].");
+    // Text without a key, non-ASCII text and short key-like words stay.
+    for plain in [
+        "./emit --flag",
+        "caf\u{e9} \u{1F600} sk-short",
+        "",
+        "--output=/tmp/some/long/path/name.txt",
+    ] {
+        assert_eq!(r.mask_keys(plain), plain);
+    }
+}
