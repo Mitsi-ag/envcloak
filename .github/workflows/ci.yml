@@ -47,6 +47,33 @@ jobs:
           sudo sysctl -w kern.coredump=1
           sudo sysctl -w kern.corefile=/cores/core.%P
           echo "ENVCLOAK_TEST_CORE_DIR=/cores" >> "$GITHUB_ENV"
+      # Gates 20 and 21 need a second user to own a directory, connect
+      # from another uid and squat on a socket (T7). sudo is passwordless on
+      # the runners.
+      - name: Create a second user (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo useradd --no-create-home --shell /usr/sbin/nologin ecother
+          sudo -n -u ecother true
+          echo "ENVCLOAK_TEST_OTHER_USER=ecother" >> "$GITHUB_ENV"
+      # `envcloak daemon install` is tested under the real service manager:
+      # a systemd user manager (lingering keeps it up without a login) on
+      # Linux, launchd on macOS.
+      - name: Start a systemd user manager (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$USER"
+          for _ in $(seq 1 100); do
+            [ -S "/run/user/$uid/bus" ] && break
+            sleep 0.1
+          done
+          XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user show-environment >/dev/null
+          echo "ENVCLOAK_TEST_SERVICE_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
+          echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
+      - name: Allow the launchd test (macOS)
+        if: runner.os == 'macOS'
+        run: echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - name: Unsafe-code and secret-exposure boundaries
         run: |
