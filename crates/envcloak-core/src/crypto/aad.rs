@@ -28,6 +28,10 @@ pub enum TableTag {
     /// A vault backup file (docs/VAULT.md "Backups"); the row id is the
     /// backup's id and the row version the record's index.
     Backup = 8,
+    /// A backup of files EnvCloak deleted (docs/VAULT.md "File backups");
+    /// the row id is the backup's id and the row version the record's
+    /// index.
+    FileBackup = 9,
 }
 
 /// The column a sealed value is stored in. Part of the vault format, like
@@ -55,6 +59,12 @@ pub enum FieldTag {
     BackupManifest = 9,
     /// A chunk of a backup's database image, records 1 and up.
     BackupChunk = 10,
+    /// A file backup's own key, record 0, sealed under `backup`.
+    FileBackupKey = 11,
+    /// A file backup's manifest, record 1.
+    FileBackupManifest = 12,
+    /// One file's contents in a file backup, records 2 and up.
+    FileBackupContent = 13,
 }
 
 /// The class of the item a sealed value belongs to (SPEC §5 "Items").

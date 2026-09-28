@@ -63,11 +63,29 @@ pub(crate) use aside::{REPLACED_PREFIX, set_aside, utc_stamp, with_suffix};
 use integrity::{state_digest, unlocker_body};
 pub(crate) use paths::{check_private_dir, check_private_file};
 use state::{State, VaultCtx, item_key};
-use values::{open_priors, open_value};
-pub(crate) use values::{open_record, seal_record};
+use values::open_priors;
+pub(crate) use values::{open_record, open_value, seal_record, seal_value};
 
 /// The key epoch of a new vault.
 pub const INITIAL_EPOCH: u32 = 1;
+
+/// What [`Vault::value_key`] gives: a keyed hash that stands for a value
+/// in comparisons (import's deduplication, SPEC §6.4). Its `Debug` shows
+/// nothing of it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValueKey([u8; 32]);
+
+impl ValueKey {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for ValueKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ValueKey(..)")
+    }
+}
 
 /// The database's file name inside the vault directory.
 pub(crate) const DB_NAME: &str = "vault.db";
@@ -770,6 +788,14 @@ impl Vault {
     /// duplicate-owner report). Prior values are not searched.
     pub fn find_by_value(&self, v: &SecretBytes) -> Vec<FieldId> {
         txn::find_by_value(&self.keys, &self.state, v)
+    }
+
+    /// A key that stands for `v` in comparisons, without holding it:
+    /// equal values give equal keys. It is the keyed hash under the
+    /// `index` subkey that [`Vault::find_by_value`] compares, so it means
+    /// nothing without this vault's key; it is never stored or sent.
+    pub fn value_key(&self, v: &SecretBytes) -> ValueKey {
+        ValueKey(values::value_hash(self.keys.key(Purpose::Index), v))
     }
 
     /// Every project record. Fails with [`VaultErrorKind::Tampered`] unless

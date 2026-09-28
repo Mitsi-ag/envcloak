@@ -288,6 +288,16 @@ impl Vault {
         })
     }
 
+    /// Checks that `k` is this vault's Recovery Kit: it must unwrap a
+    /// Recovery Kit envelope, and the VMK inside must be this vault's.
+    /// Runs Argon2id, like [`Vault::verify_passphrase`], so a caller can
+    /// check the kit with the vault out of its lock and then record the
+    /// confirmation with [`crate::vault::Txn::set_recovery_confirmed`]. A
+    /// wrong kit gives [`CryptoErrorKind::Unlock`].
+    pub fn verify_recovery_kit(&self, k: &RecoveryKit) -> Result<(), VaultError> {
+        prove_secret(self, UnlockerKind::RecoveryKit, k.secret())
+    }
+
     /// Whether the user has confirmed the Recovery Kit. Fails with
     /// [`VaultErrorKind::Tampered`] unless the vault verified.
     pub fn recovery_confirmed(&self) -> Result<bool, VaultError> {

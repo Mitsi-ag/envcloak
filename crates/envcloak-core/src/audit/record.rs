@@ -68,11 +68,24 @@ pub enum AuditKind {
     /// An item was removed (`envcloak rm`), with a proof, or the proof
     /// failed. The count says how many grants that ended.
     Remove = 15,
+    /// Env-file values were imported (`envcloak init --import`, `envcloak
+    /// import`): the items made; the count says how many items were
+    /// reused. Importing needs no proof.
+    Import = 16,
+    /// An encrypted backup of files about to be deleted was written. The
+    /// request id is the backup's; the count says how many files.
+    FilesBackup = 17,
+    /// A file backup was handed back for `envcloak init --undo`, with a
+    /// proof, or the proof failed.
+    FilesRestore = 18,
+    /// The Recovery Kit was confirmed, with the kit as the proof, or the
+    /// proof failed.
+    RecoveryConfirm = 19,
 }
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 15] = [
+    pub const ALL: [AuditKind; 19] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -88,6 +101,10 @@ impl AuditKind {
         AuditKind::Add,
         AuditKind::Rotate,
         AuditKind::Remove,
+        AuditKind::Import,
+        AuditKind::FilesBackup,
+        AuditKind::FilesRestore,
+        AuditKind::RecoveryConfirm,
     ];
 
     /// The kind's stable token.
@@ -108,6 +125,10 @@ impl AuditKind {
             AuditKind::Add => "add",
             AuditKind::Rotate => "rotate",
             AuditKind::Remove => "remove",
+            AuditKind::Import => "import",
+            AuditKind::FilesBackup => "files_backup",
+            AuditKind::FilesRestore => "files_restore",
+            AuditKind::RecoveryConfirm => "recovery_confirm",
         }
     }
 
@@ -165,7 +186,9 @@ pub struct AuditRecord {
     /// When it happened, to the millisecond.
     pub at: SystemTime,
     pub kind: AuditKind,
-    /// The pending request's id (8 Crockford base32 characters).
+    /// The pending request's id (8 Crockford base32 characters), or for
+    /// [`AuditKind::FilesBackup`] and [`AuditKind::FilesRestore`] the file
+    /// backup's (26).
     pub request_id: Option<String>,
     /// The grant's id (26 Crockford base32 characters).
     pub grant_id: Option<String>,
@@ -413,7 +436,7 @@ mod tests {
             assert_eq!(AuditKind::from_u8(k as u8), Some(k));
         }
         assert_eq!(AuditKind::from_u8(0), None);
-        assert_eq!(AuditKind::from_u8(16), None);
+        assert_eq!(AuditKind::from_u8(20), None);
     }
 
     /// 100 KB of command line (gate 31's size) and long strings everywhere

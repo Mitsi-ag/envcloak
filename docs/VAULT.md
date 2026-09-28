@@ -182,6 +182,25 @@ The passphrase envelope is not in the header: a copied backup offers nothing to 
 
 A backup is written to `backups/.<name>.tmp` (created exclusively, not following symlinks), synced, hard-linked to its name, and the directory is synced. A leftover `.tmp` file is removed by the next backup.
 
+## File backups
+
+`Vault::backup_files` writes the files `envcloak init --delete-plaintext` is about to delete to `backups/files-<YYYYMMDDTHHMMSSZ>-<id>.ecfiles`, mode 0600, where `<id>` is the backup's 16 random bytes as 26 Crockford base32 characters (what `envcloak init --undo` takes). The code is in `crates/envcloak-core/src/file_backup.rs`, and when it is written in [IMPORT.md](IMPORT.md).
+
+**The file**, all integers big-endian:
+
+```
+magic "ECFB"(4) version 1(1) vault_id(16) schema_version(2) epoch(4) backup_id(16) created_at(8)
+record 0: this backup's own key
+record 1: the manifest
+records 2 and up: each file's contents, in the manifest's order
+```
+
+Each record is `len(4)` followed by a sealed value (CRYPTO.md), with the associated data `(vault_id, schema_version, epoch, table 9, row_id = backup_id, field, item_class 0, row_version = index)`. Record 0 is a fresh random 256-bit key, sealed under the `backup` subkey of the vault's epoch (field 11); the others are sealed under that key (field 12 for the manifest, 13 for a file). The manifest: `version 1(1) header_sha256(32) count(4)`, then for each file `path_len(2) path mode(4) len(4)`; `header_sha256` covers the 51 header bytes. A backup holds 1 to 64 files and at most 4 MiB of contents; a path is at most 4096 bytes.
+
+A record that is altered, moved, taken from another backup, dropped or appended fails to open or breaks the manifest; a changed header breaks its digest; a backup of another vault or epoch is refused. Nothing opens without the vault key, which only the passphrase and the Recovery Kit unwrap: a backup is as safe as the vault. No plaintext copy is written: the file is built in `backups/.<name>.tmp` (created exclusively, not following symlinks), synced, hard-linked to its name, and the directory is synced.
+
+`purge_file_backups` removes file backups whose header's `created_at` is more than 7 days old; the daemon runs it after each unlock and whenever it writes one. It needs no key, and leaves vault backups alone.
+
 ## Restore
 
 `restore_backup` takes the paths, the backup file, the Recovery Kit and a new passphrase, and returns the restored vault unlocked. In order:
@@ -266,4 +285,5 @@ entry  = len(4) | seq(8) | sealed(len) | mac(32)
 | 4: after the passphrase is lost, the kit restores identical items; a wrong kit fails | `tests/recovery.rs` |
 | Backups: unusable without the kit, any change refused, a changed vault never backed up, a restored digest verifies (also next to side files left without a vault, and a restore that cannot verify what it installed fails) | `tests/backup.rs` |
 | Restore is atomic: `kill -9` leaves the old or the new vault | `tests/restore_crash.rs` |
+| File backups: ciphertext only, given back byte for byte, any change or another vault's backup refused, purged after 7 days | `tests/file_backup.rs` |
 | 11, unlocker part: no passphrase, kit or fixture in freed memory | `tests/unlock_probe.rs` |

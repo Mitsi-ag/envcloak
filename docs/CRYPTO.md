@@ -65,12 +65,17 @@ The tag numbers are fixed and never reused.
 | audit | 6 | projects.sealed | 6 | | |
 | unlockers | 7 | policies.sealed | 7 | | |
 | backup | 8 | audit entry | 8 | | |
-| | | backup manifest | 9 | | |
+| file backup | 9 | backup manifest | 9 | | |
 | | | backup chunk | 10 | | |
+| | | file backup key | 11 | | |
+| | | file backup manifest | 12 | | |
+| | | file backup content | 13 | | |
 
 No sealed value uses table 7: unlocker envelopes authenticate themselves. The number names the `unlockers` rows in the vault's state digest (docs/VAULT.md).
 
 A backup file's records use table 8, with the backup's random id as the row id and the record's index as the row version: 0 for the manifest (field 9) and 1 and up for the chunks of the database image (field 10). Their layout is in VAULT.md, "Backups".
+
+A file backup's records (the files `envcloak init --delete-plaintext` deletes) use table 9, with the backup's random id as the row id and the record's index as the row version: 0 for the backup's own 256-bit key (field 11), sealed under the `backup` subkey; 1 for the manifest (field 12) and 2 and up for each file's contents (field 13), sealed under that key. Their layout is in VAULT.md, "File backups".
 
 An audit log entry uses table 6 and field 8, sealed under the `audit` subkey, with row id all zeros and its sequence number as the row version. Its schema version slot holds the audit log's own format version, `1`, since the log outlives the vault's schema migrations. The entries are chained with keyed hashes under the `index` subkey in the domains `envcloak/v1/audit-chain`, `envcloak/v1/audit-genesis` and `envcloak/v1/audit-segment`, so the `audit` subkey only seals. The layout is in VAULT.md, "Audit log".
 

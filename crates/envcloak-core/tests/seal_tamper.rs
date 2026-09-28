@@ -373,6 +373,7 @@ fn the_associated_data_is_the_canonical_tuple() {
         (TableTag::Audit, 6),
         (TableTag::Unlockers, 7),
         (TableTag::Backup, 8),
+        (TableTag::FileBackup, 9),
     ];
     for (t, n) in tables {
         assert_eq!(t as u16, n);
@@ -388,6 +389,9 @@ fn the_associated_data_is_the_canonical_tuple() {
         (FieldTag::AuditEntry, 8),
         (FieldTag::BackupManifest, 9),
         (FieldTag::BackupChunk, 10),
+        (FieldTag::FileBackupKey, 11),
+        (FieldTag::FileBackupManifest, 12),
+        (FieldTag::FileBackupContent, 13),
     ];
     for (f, n) in fields {
         assert_eq!(f as u16, n);

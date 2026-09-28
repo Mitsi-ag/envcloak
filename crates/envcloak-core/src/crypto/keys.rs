@@ -188,6 +188,47 @@ impl SubKey {
     }
 }
 
+impl SubKey {
+    /// A fresh random key, for a key kept only sealed under another (a
+    /// file backup's own key, `crate::file_backup`).
+    pub(crate) fn random(purpose: Purpose) -> SubKey {
+        SubKey {
+            purpose,
+            key: SecretBox::init_with_mut(|k: &mut [u8; 32]| super::fill_random_or_panic(k)),
+        }
+    }
+}
+
+/// Seals the key `inner` under `outer`, bound to `aad`.
+#[allow(clippy::disallowed_methods)] // Reads a key to seal it under another.
+pub(crate) fn seal_subkey(
+    outer: &SubKey,
+    aad: &super::Aad,
+    inner: &SubKey,
+) -> Result<super::Sealed, super::CryptoError> {
+    super::seal(outer, aad, inner.key.expose_secret())
+}
+
+/// Opens a key [`seal_subkey`] sealed, as a key for `purpose`. Anything
+/// but exactly 32 bytes inside is malformed.
+#[allow(clippy::disallowed_methods)] // Copies the opened key into its own box.
+pub(crate) fn open_subkey(
+    outer: &SubKey,
+    aad: &super::Aad,
+    sealed: &super::Sealed,
+    purpose: Purpose,
+) -> Result<SubKey, super::CryptoError> {
+    let pt = super::open(outer, aad, sealed)?;
+    let bytes = pt.expose_secret();
+    if bytes.len() != 32 {
+        return Err(super::CryptoErrorKind::Malformed.into());
+    }
+    Ok(SubKey {
+        purpose,
+        key: SecretBox::init_with_mut(|k: &mut [u8; 32]| k.copy_from_slice(bytes)),
+    })
+}
+
 impl core::fmt::Debug for SubKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "SubKey({}, ..)", self.purpose.label())

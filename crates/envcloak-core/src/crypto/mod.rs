@@ -34,8 +34,8 @@ pub use envelope::{
     wrap_vmk_with,
 };
 pub use kdf::{Argon2id, Kdf, KdfParams, Kek};
-pub(crate) use keys::keyed_hash_parts;
 pub use keys::{Keyring, Purpose, SubKey, UnlockerId, VaultId, Vmk, keyed_hash};
+pub(crate) use keys::{keyed_hash_parts, open_subkey, seal_subkey};
 
 /// A crypto failure. Carries its kind only: no values, sizes of secrets or
 /// upstream error text.
