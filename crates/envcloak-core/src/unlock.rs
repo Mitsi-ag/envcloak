@@ -43,6 +43,22 @@ pub fn create_vault(
     pass: &SecretBytes,
     kdf: KdfParams,
 ) -> Result<(Vault, RecoveryKit), VaultError> {
+    let kit = RecoveryKit::generate();
+    let vault = create_vault_with_kit(p, pass, &kit, kdf)?;
+    Ok((vault, kit))
+}
+
+/// Creates a vault as [`create_vault`] does, with a Recovery Kit the
+/// caller generated with [`RecoveryKit::generate`]. The CLI generates the
+/// kit and shows it, so the kit crosses the daemon socket only from the
+/// client to the daemon, never back (SPEC §4.4: unlocker material is never
+/// sent to a client).
+pub fn create_vault_with_kit(
+    p: &VaultPaths,
+    pass: &SecretBytes,
+    kit: &RecoveryKit,
+    kdf: KdfParams,
+) -> Result<Vault, VaultError> {
     check_passphrase(pass)?;
     kdf.check_bounds()?;
     if std::fs::symlink_metadata(&p.db).is_ok() {
@@ -50,7 +66,6 @@ pub fn create_vault(
     }
     let vault_id = VaultId::generate();
     let vmk = Vmk::generate();
-    let kit = RecoveryKit::generate();
     let wrap = |secret: &SecretBytes, kind| {
         let ctx = EnvelopeCtx {
             vault_id,
@@ -63,8 +78,7 @@ pub fn create_vault(
         wrap(pass, UnlockerKind::Passphrase)?,
         wrap(kit.secret(), UnlockerKind::RecoveryKit)?,
     ];
-    let vault = Vault::create(p, vault_id, vmk, envelopes)?;
-    Ok((vault, kit))
+    Vault::create(p, vault_id, vmk, envelopes)
 }
 
 impl LockedVault {

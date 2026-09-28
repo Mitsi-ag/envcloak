@@ -20,4 +20,4 @@ pub use backup::{BackupInfo, RestoreReport, restore_backup};
 pub use passphrase::{PassphraseRejected, check_passphrase, suggest_passphrase};
 pub use recovery::{KitError, RecoveryKit};
 pub use secret::{CapacityExceeded, SecretBuf, SecretBytes};
-pub use unlock::create_vault;
+pub use unlock::{create_vault, create_vault_with_kit};

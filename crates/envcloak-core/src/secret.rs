@@ -59,6 +59,13 @@ impl SecretBytes {
         use subtle::ConstantTimeEq;
         bool::from(self.0.expose_secret().ct_eq(other))
     }
+
+    /// Whether two secrets are equal, as [`SecretBytes::ct_eq`] compares:
+    /// for a passphrase typed twice.
+    #[allow(clippy::disallowed_methods)] // Compares without revealing.
+    pub fn ct_eq_secret(&self, other: &SecretBytes) -> bool {
+        self.ct_eq(other.0.expose_secret())
+    }
 }
 
 #[allow(clippy::disallowed_methods)] // The one place SecretBytes is opened.
@@ -133,6 +140,26 @@ impl SecretBuf {
         next.extend_from_slice(&self.buf);
         // The old buffer is wiped, spare capacity included, when it drops.
         self.buf = next;
+    }
+
+    /// Reads exactly `n` more bytes from `r` straight into the buffer's
+    /// spare capacity. Never reallocates: fails with
+    /// [`std::io::ErrorKind::InvalidInput`], reading nothing, when `n` bytes
+    /// do not fit. On a read error the bytes read so far are wiped and the
+    /// buffer is as it was.
+    pub fn read_exact_from(&mut self, r: &mut impl std::io::Read, n: usize) -> std::io::Result<()> {
+        let start = self.buf.len();
+        let end = start
+            .checked_add(n)
+            .filter(|e| *e <= self.buf.capacity())
+            .ok_or(std::io::ErrorKind::InvalidInput)?;
+        // Within the capacity, so the Vec does not reallocate.
+        self.buf.resize(end, 0);
+        let read = r.read_exact(&mut self.buf[start..end]);
+        if read.is_err() {
+            self.truncate(start);
+        }
+        read
     }
 
     /// Wipes the bytes beyond `len` and shortens the buffer. Does nothing
@@ -238,6 +265,9 @@ mod tests {
         assert!(!s.ct_eq(b"valu"));
         assert!(!s.ct_eq(b"values"));
         assert!(SecretBytes::copy_from(b"").ct_eq(b""));
+        assert!(s.ct_eq_secret(&SecretBytes::copy_from(b"value")));
+        assert!(!s.ct_eq_secret(&SecretBytes::copy_from(b"valuE")));
+        assert!(!s.ct_eq_secret(&SecretBytes::copy_from(b"value!")));
     }
 
     #[test]
@@ -267,6 +297,28 @@ mod tests {
         assert!(b.capacity() >= 32);
         b.extend(b"efgh").unwrap();
         assert_eq!(b.expose_secret(), b"abcdefgh");
+    }
+
+    #[test]
+    fn read_exact_from_fills_spare_capacity_only() {
+        let mut b = SecretBuf::with_capacity(8);
+        let cap = b.capacity();
+        let before = b.expose_secret().as_ptr();
+        b.read_exact_from(&mut &b"abc"[..], 3).unwrap();
+        assert_eq!(b.expose_secret(), b"abc");
+        // More than fits: nothing is read and the buffer is unchanged.
+        let mut src: &[u8] = &vec![b'x'; cap];
+        let e = b.read_exact_from(&mut src, cap).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(src.len(), cap);
+        assert_eq!(b.expose_secret(), b"abc");
+        // A short source fails and leaves the buffer as it was.
+        let e = b.read_exact_from(&mut &b"de"[..], 3).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(b.expose_secret(), b"abc");
+        b.read_exact_from(&mut &b"defgh"[..], cap - 3).unwrap();
+        assert_eq!(b.len(), cap);
+        assert_eq!(b.expose_secret().as_ptr(), before);
     }
 
     #[test]

@@ -12,7 +12,9 @@ mod common;
 use common::{KitFixture, dir_names, later_wal, other_passphrase};
 use envcloak_core::crypto::{CryptoErrorKind, Envelope, KdfParams, UnlockerKind};
 use envcloak_core::vault::{Integrity, LockedVault, VaultErrorKind, VaultPaths};
-use envcloak_core::{PassphraseRejected, RecoveryKit, SecretBytes, create_vault};
+use envcloak_core::{
+    PassphraseRejected, RecoveryKit, SecretBytes, create_vault, create_vault_with_kit,
+};
 use envcloak_testkit::{Detector, TestHome, by_label, labels};
 
 fn secret(s: &str) -> SecretBytes {
@@ -72,6 +74,34 @@ fn create_vault_makes_a_passphrase_and_a_kit_envelope() {
     let e = create_vault(&f.paths, &f.pass(), KdfParams::minimum()).unwrap_err();
     assert_eq!(e.kind(), VaultErrorKind::AlreadyExists);
     f.home.assert_clean(&f.cs);
+}
+
+/// The CLI generates the kit and the daemon wraps the VMK under it: the
+/// kit the caller passed, and only that kit, unlocks the vault.
+#[test]
+fn create_vault_with_kit_wraps_under_the_callers_kit() {
+    let home = TestHome::new();
+    let paths = VaultPaths::under(home.root().join("data"));
+    let pass = other_passphrase(7);
+    let kit = RecoveryKit::generate();
+    let v = create_vault_with_kit(&paths, &pass, &kit, KdfParams::minimum()).unwrap();
+    assert_eq!(v.unlockers().count(), 2);
+    drop(v);
+    let v = LockedVault::open(&paths)
+        .unwrap()
+        .unlock_with_kit(&kit)
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    drop(v);
+    let e = LockedVault::open(&paths)
+        .unwrap()
+        .unlock_with_kit(&RecoveryKit::generate())
+        .map_err(|(_, e)| e)
+        .unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Crypto(CryptoErrorKind::Unlock));
+    let e = create_vault_with_kit(&paths, &pass, &kit, KdfParams::minimum()).unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::AlreadyExists);
 }
 
 #[test]
