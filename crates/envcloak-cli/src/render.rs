@@ -1,0 +1,1105 @@
+//! How the metadata commands print what they found (SPEC §4.4: metadata
+//! only; T11 output discipline).
+//!
+//! Every command's output is a type of `envcloak_ipc::view`, rendered as
+//! text for a person ([`Render::human`]) or as JSON (`--json`,
+//! [`Render::json`]). [`Render`] is implemented only for those types, which
+//! cannot hold a value (`envcloak_ipc::view::View`), so no rendering path
+//! has one to print.
+//!
+//! Every string came from the daemon or a file, both of which the user
+//! does not fully control: a program running as the user could answer in
+//! the daemon's place, and an agent can write the manifest. So text is
+//! escaped before it is printed ([`shown`]: control characters, bidi
+//! overrides and invisible characters become visible escapes), and a name
+//! shaped like a key rather than a name is not printed at all, since it is
+//! most likely a value pasted in its place. JSON escapes control
+//! characters by its own rules.
+//!
+//! Accounts are personal: `ls` shows them only with `--long` (the daemon
+//! sends them only then), and `show` always.
+
+use std::fmt::Write as _;
+
+use envcloak_ipc::view::{
+    AddedView, CheckReport, ClassificationView, EnvFileState, EnvFileView, ItemClassView, ItemView,
+    ItemsView, LengthClass, RefChange, RefEditView, RefStatus, RemovedView, RotatedView,
+    TargetView, View,
+};
+use envcloak_policy::{escape_for_display, value_shaped};
+
+/// What a command prints: text for a person, or JSON. Implemented only for
+/// `envcloak_ipc::view` types.
+pub trait Render: View {
+    /// The text a person reads, ending in a newline.
+    fn human(&self) -> String;
+
+    /// The JSON form, as the daemon's answer carries it.
+    fn json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// Prints `v` on standard output, as JSON when `json`.
+pub fn print(v: &impl Render, json: bool) {
+    if json {
+        println!("{}", v.json());
+    } else {
+        print!("{}", v.human());
+    }
+}
+
+/// What is printed in place of a name that looks like a value.
+pub const HIDDEN: &str = "[not shown: looks like a key or token]";
+
+/// The provider registry compiled into this build, loaded once. `None`
+/// when it did not load; names are then checked by their shape alone.
+pub fn registry() -> Option<&'static envcloak_providers::Registry> {
+    static REGISTRY: std::sync::OnceLock<Option<envcloak_providers::Registry>> =
+        std::sync::OnceLock::new();
+    REGISTRY
+        .get_or_init(|| envcloak_providers::load_embedded().ok())
+        .as_ref()
+}
+
+/// Whether `s` looks like a key or token rather than a name: shaped like
+/// a generated key ([`value_shaped`]), or holding a word that a provider's
+/// key pattern matches whole. A word is a run of letters, digits, `_` and
+/// `-` (and, tried again, `.`, `+`, `/`, `=` and `~`), as the audit log's
+/// masking takes it (`envcloak_providers::Registry::mask_keys`): a key
+/// glued to other letters is not a word of its own.
+pub fn looks_like_value(s: &str) -> bool {
+    value_shaped(s) || registry().is_some_and(|r| r.mask_keys(s) != s)
+}
+
+/// `s` as it may be printed: escaped, or [`HIDDEN`] when it looks like a
+/// value.
+pub fn shown(s: &str) -> String {
+    if looks_like_value(s) {
+        HIDDEN.to_owned()
+    } else {
+        escape_for_display(s)
+    }
+}
+
+/// An id the daemon made (26 Crockford base32 characters) as it may be
+/// printed. Ids are shaped like tokens, so [`shown`] would hide them; one
+/// that is not an id's shape is hidden instead.
+fn shown_id(s: &str) -> String {
+    let crockford = |b: u8| b.is_ascii_digit() || (b.is_ascii_uppercase() && !b"ILOU".contains(&b));
+    if s.len() == 26 && s.bytes().all(crockford) {
+        s.to_owned()
+    } else {
+        HIDDEN.to_owned()
+    }
+}
+
+/// An optional name as it may be printed, `-` when absent.
+fn shown_or_dash(s: Option<&str>) -> String {
+    s.map_or_else(|| "-".to_owned(), shown)
+}
+
+/// Days since 1970-01-01 as a civil date (Howard Hinnant's algorithm).
+fn civil(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (
+        y,
+        u32::try_from(m).unwrap_or(1),
+        u32::try_from(d).unwrap_or(1),
+    )
+}
+
+/// Unix seconds as `YYYY-MM-DD`, UTC.
+pub fn date(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX / 2);
+    let (y, m, d) = civil(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Unix seconds as `YYYY-MM-DD HH:MM:SS UTC`.
+pub fn time(secs: u64) -> String {
+    let s = secs % 86_400;
+    format!(
+        "{} {:02}:{:02}:{:02} UTC",
+        date(secs),
+        s / 3600,
+        s % 3600 / 60,
+        s % 60
+    )
+}
+
+fn class_word(c: ItemClassView) -> &'static str {
+    match c {
+        ItemClassView::Secret => "secret",
+        ItemClassView::Card => "card",
+        ItemClassView::IssuerCredential => "issuer credential",
+        ItemClassView::Other => "unknown class",
+    }
+}
+
+fn kind_word(c: ClassificationView) -> &'static str {
+    match c {
+        ClassificationView::Test => "test key",
+        ClassificationView::Live => "live key",
+        ClassificationView::Unknown => "not classified",
+    }
+}
+
+/// `openai (test key)`, or the classification alone.
+fn provider_and_kind(i: &ItemView) -> String {
+    match i.provider.as_deref() {
+        Some(p) => format!("{} ({})", shown(p), kind_word(i.classification)),
+        None => kind_word(i.classification).to_owned(),
+    }
+}
+
+/// `OpenAI; openai, test key`: an item in a statement.
+fn described(i: &ItemView) -> String {
+    let kind = match i.provider.as_deref() {
+        Some(p) => format!("{}, {}", shown(p), kind_word(i.classification)),
+        None => kind_word(i.classification).to_owned(),
+    };
+    format!("{}; {kind}", shown(&i.title))
+}
+
+/// Words for why the references were not checked.
+fn unchecked_text(token: &str) -> String {
+    match token {
+        "no_manifest" => "there is no envcloak.toml".to_owned(),
+        "daemon_unavailable" => "the EnvCloak daemon is not running".to_owned(),
+        "daemon_unverified" => "the daemon could not be verified".to_owned(),
+        "vault_locked" => "the vault is locked; run `envcloak unlock`".to_owned(),
+        "no_vault" => "there is no vault yet".to_owned(),
+        other => shown(other),
+    }
+}
+
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The account in one line: the email, then the label and org in
+/// parentheses.
+fn account_line(i: &ItemView) -> Option<String> {
+    let a = i.account.as_ref()?;
+    let mut parts = Vec::new();
+    if let Some(e) = &a.email {
+        parts.push(shown(e));
+    }
+    let mut extra = Vec::new();
+    if let Some(l) = &a.label {
+        extra.push(format!("label {}", shown(l)));
+    }
+    if let Some(o) = &a.org_id {
+        extra.push(format!("org {}", shown(o)));
+    }
+    if !extra.is_empty() {
+        parts.push(format!("({})", extra.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Lays out rows in columns two spaces apart, the last column unpadded.
+fn columns(rows: &[Vec<String>]) -> String {
+    let n = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..n)
+        .map(|c| {
+            rows.iter()
+                .filter_map(|r| r.get(c))
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut out = String::new();
+    for r in rows {
+        let mut line = String::new();
+        for (c, cell) in r.iter().enumerate() {
+            if c + 1 == r.len() {
+                line.push_str(cell);
+            } else {
+                let pad = widths[c].saturating_sub(cell.chars().count());
+                line.push_str(cell);
+                line.push_str(&" ".repeat(pad + 2));
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+impl Render for ItemsView {
+    fn human(&self) -> String {
+        if self.items.is_empty() {
+            return "The vault has no items yet. Add one with `envcloak add`.\n".to_owned();
+        }
+        let long = self.items.iter().any(|i| i.account.is_some());
+        let mut header = vec!["SLUG", "PROVIDER", "KIND", "FIELDS", "UPDATED"];
+        if long {
+            header.extend(["ENV", "ACCOUNT", "TITLE"]);
+        }
+        let mut rows = vec![header.into_iter().map(str::to_owned).collect::<Vec<_>>()];
+        for i in &self.items {
+            let fields: Vec<String> = i.fields.iter().map(|f| shown(&f.name)).collect();
+            let mut row = vec![
+                shown(&i.slug),
+                shown_or_dash(i.provider.as_deref()),
+                i.classification.as_str().to_owned(),
+                fields.join(","),
+                date(i.updated_secs),
+            ];
+            if long {
+                row.push(shown_or_dash(i.env_hint.as_deref()));
+                row.push(account_line(i).unwrap_or_else(|| "-".to_owned()));
+                row.push(shown(&i.title));
+            }
+            rows.push(row);
+        }
+        columns(&rows)
+    }
+}
+
+impl Render for ItemView {
+    fn human(&self) -> String {
+        let mut o = String::new();
+        let _ = writeln!(o, "{}", shown(&self.slug));
+        let _ = writeln!(o, "  title: {}", shown(&self.title));
+        let _ = writeln!(o, "  id: {}", shown_id(&self.id));
+        if self.class != ItemClassView::Secret {
+            let _ = writeln!(o, "  class: {}", class_word(self.class));
+        }
+        let _ = writeln!(o, "  provider: {}", shown_or_dash(self.provider.as_deref()));
+        let _ = writeln!(o, "  kind: {}", kind_word(self.classification));
+        if let Some(e) = &self.env_hint {
+            let _ = writeln!(o, "  usual variable: {}", shown(e));
+        }
+        let _ = writeln!(
+            o,
+            "  short values: {}",
+            if self.allow_short {
+                "allowed (values of 8 to 15 bytes may be injected)"
+            } else {
+                "not allowed"
+            }
+        );
+        if let Some(a) = account_line(self) {
+            let _ = writeln!(o, "  account: {a}");
+        }
+        let _ = writeln!(o, "  fields:");
+        for f in &self.fields {
+            let _ = writeln!(
+                o,
+                "    {}: set {}, {} kept",
+                shown(&f.name),
+                time(f.updated_secs),
+                plural(u64::from(f.prior_count), "prior value", "prior values")
+            );
+        }
+        let _ = writeln!(o, "  created: {}", time(self.created_secs));
+        let _ = writeln!(o, "  updated: {}", time(self.updated_secs));
+        if let Some(t) = self.rotated_secs {
+            let _ = writeln!(o, "  rotated: {}", time(t));
+        }
+        if let Some(t) = self.expires_secs {
+            let _ = writeln!(o, "  expires: {}", time(t));
+        }
+        if let Some(d) = &self.detail {
+            if let Some(t) = d.last_used_secs {
+                let _ = writeln!(o, "  last used: {}", time(t));
+            }
+            if !d.allowed_hosts.is_empty() {
+                let hosts: Vec<String> = d.allowed_hosts.iter().map(|h| shown(h)).collect();
+                let _ = writeln!(o, "  allowed hosts: {}", hosts.join(", "));
+            }
+            if !d.tags.is_empty() {
+                let tags: Vec<String> = d.tags.iter().map(|t| shown(t)).collect();
+                let _ = writeln!(o, "  tags: {}", tags.join(", "));
+            }
+            let links = [
+                ("docs", &d.links.docs),
+                ("billing", &d.links.billing),
+                ("keys page", &d.links.keys_page),
+                ("dashboard", &d.links.dashboard),
+            ];
+            for (name, link) in links {
+                if let Some(l) = link {
+                    let _ = writeln!(o, "  {name}: {}", shown(l));
+                }
+            }
+            if let Some(n) = &d.notes {
+                let _ = writeln!(o, "  notes: {}", shown(n));
+            }
+        }
+        o
+    }
+}
+
+/// What the length bucket means for `envcloak run`, when it is worth
+/// saying.
+fn length_note(length: LengthClass, allow_short: bool) -> Option<&'static str> {
+    match (length, allow_short) {
+        (LengthClass::Ok, _) => None,
+        (LengthClass::Short, true) => Some(
+            "the value is 8 to 15 bytes long: `envcloak run` injects it because the item allows \
+             short values, and warns that redaction may miss some of its encodings",
+        ),
+        (LengthClass::Short, false) => Some(
+            "the value is 8 to 15 bytes long: `envcloak run` refuses to inject it unless the \
+             item allows short values (`envcloak add --allow-short`)",
+        ),
+        (LengthClass::TooShort, _) => {
+            Some("the value is under 8 bytes long: `envcloak run` never injects it")
+        }
+    }
+}
+
+impl Render for AddedView {
+    fn human(&self) -> String {
+        let i = &self.item;
+        let mut o = String::new();
+        let _ = writeln!(o, "Added {}.", shown(&i.slug));
+        let _ = writeln!(o, "  provider: {}", provider_and_kind(i));
+        let _ = writeln!(o, "  field: {}", shown(&self.field));
+        if let Some(a) = account_line(i) {
+            let _ = writeln!(o, "  account: {a}");
+        }
+        if let Some(d) = &self.detected {
+            let _ = writeln!(o, "note: the value is shaped like a {} key", shown(d));
+        }
+        if self.ambiguous {
+            let _ = writeln!(
+                o,
+                "note: the value matches the key patterns of several providers; name one with \
+                 `envcloak add <provider>`"
+            );
+        }
+        if let Some(n) = length_note(self.length, i.allow_short) {
+            let _ = writeln!(o, "warning: {n}");
+        }
+        let var = i.env_hint.as_deref().unwrap_or("NAME");
+        let _ = writeln!(
+            o,
+            "Reference it in a project with: envcloak ref {}={}",
+            shown(var),
+            shown(&i.slug)
+        );
+        o
+    }
+}
+
+impl Render for RotatedView {
+    fn human(&self) -> String {
+        let mut o = format!(
+            "Rotated {}#{}: the new value is in place, and {} kept.\n",
+            shown(&self.slug),
+            shown(&self.field),
+            plural(
+                u64::from(self.prior_count),
+                "prior value is",
+                "prior values are"
+            )
+        );
+        if let Some(n) = length_note(self.length, true) {
+            let _ = writeln!(o, "note: {n}");
+        }
+        o
+    }
+}
+
+impl Render for RemovedView {
+    fn human(&self) -> String {
+        let mut o = format!("Removed {} from the vault.\n", shown(&self.slug));
+        let _ = writeln!(
+            o,
+            "  backup: {} in the vault's backups directory; `envcloak recover --backup <file>` \
+             brings the item back",
+            shown(&self.backup)
+        );
+        let _ = writeln!(o, "  grants that bound it and ended: {}", self.grants_ended);
+        o
+    }
+}
+
+/// The words for a reference that does not resolve.
+pub fn status_text(s: RefStatus) -> &'static str {
+    match s {
+        RefStatus::Ok => "ok",
+        RefStatus::UnknownItem => "no item has that slug",
+        RefStatus::UnknownField => "the item has no field of that name",
+        RefStatus::AmbiguousField => "the item has several fields: name one with <slug>#<field>",
+        RefStatus::NoField => "the item has no fields",
+        RefStatus::CardReference => "a card is never bound to a variable",
+        RefStatus::IssuerCredentialReference => "an issuer credential is never bound to a variable",
+        RefStatus::UnknownItemClass => "the item is of a class that cannot be bound",
+        RefStatus::InvalidReference => "not NAME=<slug>[#field]",
+        RefStatus::LooksLikeValue => {
+            "shaped like a key or token rather than a name, so not shown: was a value pasted here?"
+        }
+        RefStatus::Unchecked => "not checked: the daemon could not be asked",
+    }
+}
+
+fn env_file_state(f: &EnvFileView) -> String {
+    match f.state {
+        EnvFileState::Read => {
+            if f.plaintext.is_empty() {
+                "no key-shaped values".to_owned()
+            } else {
+                format!(
+                    "{} in plaintext",
+                    plural(
+                        u64::try_from(f.plaintext.len()).unwrap_or(u64::MAX),
+                        "key",
+                        "keys"
+                    )
+                )
+            }
+        }
+        EnvFileState::Invalid => format!(
+            "not read: {}",
+            f.error
+                .as_deref()
+                .map_or_else(|| "it does not parse".to_owned(), shown)
+        ),
+        EnvFileState::Symlink => "skipped: a symlink, which is never followed".to_owned(),
+        EnvFileState::NotRegular => "skipped: not a regular file".to_owned(),
+        EnvFileState::NotOwned => "skipped: owned by another user".to_owned(),
+        EnvFileState::TooLarge => "skipped: larger than 1 MiB".to_owned(),
+        EnvFileState::Unreadable => "skipped: it could not be read".to_owned(),
+    }
+}
+
+impl Render for CheckReport {
+    fn human(&self) -> String {
+        let mut o = String::new();
+        let mut missing = 0u64;
+        match &self.manifest {
+            Some(m) => {
+                let name = self
+                    .references
+                    .as_ref()
+                    .and_then(|r| r.project_name.as_deref())
+                    .map(|n| format!(" (project {})", shown(n)))
+                    .unwrap_or_default();
+                let _ = writeln!(o, "manifest: {}{name}", shown(m));
+            }
+            None => {
+                let _ = writeln!(o, "manifest: none in this directory or above it");
+            }
+        }
+        match (&self.references, &self.unchecked) {
+            (Some(r), _) => {
+                if r.bindings.is_empty() {
+                    let _ = writeln!(o, "references: none");
+                } else {
+                    let _ = writeln!(o, "references:");
+                }
+                for b in &r.bindings {
+                    let place = b
+                        .profile
+                        .as_deref()
+                        .map_or_else(|| "[env]".to_owned(), |p| format!("[env.{}]", shown(p)));
+                    let binding = match (&b.env_name, &b.reference) {
+                        (Some(n), Some(r)) => format!("{} = {}", shown(n), shown(r)),
+                        _ => HIDDEN.to_owned(),
+                    };
+                    if b.status.is_ok() {
+                        let _ = writeln!(o, "  ok       {place} {binding}");
+                    } else {
+                        missing += 1;
+                        let _ =
+                            writeln!(o, "  MISSING  {place} {binding}: {}", status_text(b.status));
+                    }
+                }
+            }
+            (None, Some(why)) => {
+                let _ = writeln!(o, "references: not checked: {}", unchecked_text(why));
+            }
+            (None, None) => {}
+        }
+        let mut plaintext = 0u64;
+        if self.env_files.is_empty() {
+            let _ = writeln!(o, "env files: none");
+        } else {
+            let _ = writeln!(o, "env files:");
+        }
+        for f in &self.env_files {
+            let _ = writeln!(o, "  {}: {}", shown(&f.file), env_file_state(f));
+            if let Some(line) = f.error_line {
+                let _ = writeln!(o, "    at line {line}");
+            }
+            for p in &f.plaintext {
+                plaintext += 1;
+                let name = shown_or_dash(p.env_name.as_deref());
+                let provider = p
+                    .provider
+                    .as_deref()
+                    .map(|p| format!(" ({} key)", shown(p)))
+                    .unwrap_or_default();
+                let _ = writeln!(o, "    line {}: {name}{provider}", p.line);
+            }
+            for r in &f.references {
+                let binding = match (&r.env_name, &r.reference) {
+                    (Some(n), Some(rf)) => format!("{} = envcloak://{}", shown(n), shown(rf)),
+                    _ => HIDDEN.to_owned(),
+                };
+                if r.status.is_ok() {
+                    let _ = writeln!(o, "    line {}: ok       {binding}", r.line);
+                } else {
+                    missing += 1;
+                    let _ = writeln!(
+                        o,
+                        "    line {}: MISSING  {binding}: {}",
+                        r.line,
+                        status_text(r.status)
+                    );
+                }
+            }
+        }
+        if self.clean() {
+            let _ = writeln!(o, "result: ok");
+        } else {
+            let mut parts = Vec::new();
+            if missing > 0 {
+                parts.push(plural(
+                    missing,
+                    "reference does not resolve",
+                    "references do not resolve",
+                ));
+            }
+            if plaintext > 0 {
+                parts.push(format!(
+                    "{} in env files: move them into the vault with `envcloak add`, and \
+                     rotate any that were shared",
+                    plural(plaintext, "plaintext key", "plaintext keys")
+                ));
+            }
+            if self.unchecked.is_some() {
+                parts.push("the references were not checked".to_owned());
+            }
+            let unread = self
+                .env_files
+                .iter()
+                .filter(|f| f.state != EnvFileState::Read)
+                .count();
+            if unread > 0 {
+                parts.push(plural(
+                    u64::try_from(unread).unwrap_or(u64::MAX),
+                    "env file was not read",
+                    "env files were not read",
+                ));
+            }
+            let _ = writeln!(o, "result: {}", parts.join("; "));
+        }
+        o
+    }
+}
+
+impl Render for RefEditView {
+    fn human(&self) -> String {
+        let place = self
+            .profile
+            .as_deref()
+            .map_or_else(|| "[env]".to_owned(), |p| format!("[env.{}]", shown(p)));
+        let binding = format!("{} = {}", shown(&self.env_name), shown(&self.reference));
+        let mut o = match self.change {
+            RefChange::Added => {
+                format!("Added {binding} to {place} in {}.\n", shown(&self.manifest))
+            }
+            RefChange::Replaced => format!(
+                "Set {binding} in {place} in {} (it was {}).\n",
+                shown(&self.manifest),
+                shown_or_dash(self.previous.as_deref())
+            ),
+            RefChange::Unchanged => format!(
+                "{binding} is already in {place} in {}; nothing changed.\n",
+                shown(&self.manifest)
+            ),
+        };
+        match self.resolves {
+            Some(RefStatus::Ok) => {}
+            Some(s) => {
+                let _ = writeln!(
+                    o,
+                    "warning: the reference does not resolve yet: {}",
+                    status_text(s)
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    o,
+                    "note: the vault was not asked whether the reference resolves; run \
+                     `envcloak check`"
+                );
+            }
+        }
+        o
+    }
+}
+
+/// The statement `rotate` shows before it asks for the passphrase.
+pub fn rotate_statement(t: &TargetView) -> String {
+    let i = &t.item;
+    let field = t.field.as_deref().unwrap_or("");
+    let prior = i
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .map_or(0, |f| f.prior_count);
+    let mut o = format!(
+        "Rotate {}#{} ({}).\n",
+        shown(&i.slug),
+        shown(field),
+        described(i)
+    );
+    let _ = writeln!(
+        o,
+        "  The current value becomes the newest prior value; the vault keeps 3 at most ({} now).",
+        prior
+    );
+    let _ = writeln!(
+        o,
+        "  Grants that bind this item stay in force: {}.",
+        t.grants
+    );
+    o
+}
+
+/// The statement `rm` shows before it asks for the passphrase.
+pub fn remove_statement(t: &TargetView) -> String {
+    let i = &t.item;
+    let fields: Vec<String> = i.fields.iter().map(|f| shown(&f.name)).collect();
+    let mut o = format!(
+        "Remove {} ({}) and its values from the vault.\n",
+        shown(&i.slug),
+        described(i)
+    );
+    let _ = writeln!(o, "  fields: {}", fields.join(", "));
+    let _ = writeln!(
+        o,
+        "  An encrypted backup of the vault is written first, so `envcloak recover --backup \
+         <file>` can bring it back."
+    );
+    let _ = writeln!(o, "  Grants that bind this item end: {}.", t.grants);
+    o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use envcloak_ipc::view::{
+        AccountView, CheckBindingView, CheckView, EnvRefView, FieldView, ItemDetailView, LinksView,
+        PlaintextView,
+    };
+
+    const T0: u64 = 1_790_000_000;
+
+    /// An item as the daemon describes one, at `detail`: 0 summary, 1 with
+    /// the account, 2 with everything.
+    pub(crate) fn item(slug: &str, detail: u8) -> ItemView {
+        ItemView {
+            id: "01K5TESTTESTTESTTESTTESTTE".into(),
+            slug: slug.into(),
+            class: ItemClassView::Secret,
+            title: "OpenAI".into(),
+            provider: Some("openai".into()),
+            classification: ClassificationView::Test,
+            env_hint: Some("OPENAI_API_KEY".into()),
+            allow_short: false,
+            fields: vec![FieldView {
+                name: "value".into(),
+                prior_count: 1,
+                created_secs: T0,
+                updated_secs: T0 + 3600,
+            }],
+            created_secs: T0,
+            updated_secs: T0 + 3600,
+            rotated_secs: Some(T0 + 3600),
+            expires_secs: None,
+            account: (detail >= 1).then(|| AccountView {
+                email: Some("you@work.example".into()),
+                label: None,
+                org_id: Some("org-acme".into()),
+            }),
+            detail: (detail >= 2).then(|| ItemDetailView {
+                allowed_hosts: vec!["api.openai.com".into()],
+                tags: vec![],
+                links: LinksView {
+                    docs: Some("https://platform.openai.com/docs".into()),
+                    billing: None,
+                    keys_page: Some("https://platform.openai.com/api-keys".into()),
+                    dashboard: None,
+                },
+                last_used_secs: None,
+                notes: None,
+            }),
+        }
+    }
+
+    /// Compares `got` with the snapshot `want`, showing both on a mismatch
+    /// (the fixtures hold no value).
+    fn snap(got: impl AsRef<str>, want: &str) {
+        assert_eq!(got.as_ref(), want);
+    }
+
+    /// Every rendered output, text and JSON, is exactly its snapshot: names,
+    /// counts, times and fixed words, and no value anywhere.
+    #[test]
+    fn every_output_matches_its_snapshot() {
+        let ls = ItemsView {
+            items: vec![item("openai/acme-web", 0), item("openai/acme-web-2", 0)],
+        };
+        let long = ItemsView {
+            items: vec![item("openai/acme-web", 1)],
+        };
+        snap(
+            ls.human(),
+            r#"SLUG               PROVIDER  KIND  FIELDS  UPDATED
+openai/acme-web    openai    test  value   2026-09-21
+openai/acme-web-2  openai    test  value   2026-09-21
+"#,
+        );
+        snap(
+            ls.json().to_string(),
+            r#"{"items":[{"allow_short":false,"class":"secret","classification":"test","created_secs":1790000000,"env_hint":"OPENAI_API_KEY","expires_secs":null,"fields":[{"created_secs":1790000000,"name":"value","prior_count":1,"updated_secs":1790003600}],"id":"01K5TESTTESTTESTTESTTESTTE","provider":"openai","rotated_secs":1790003600,"slug":"openai/acme-web","title":"OpenAI","updated_secs":1790003600},{"allow_short":false,"class":"secret","classification":"test","created_secs":1790000000,"env_hint":"OPENAI_API_KEY","expires_secs":null,"fields":[{"created_secs":1790000000,"name":"value","prior_count":1,"updated_secs":1790003600}],"id":"01K5TESTTESTTESTTESTTESTTE","provider":"openai","rotated_secs":1790003600,"slug":"openai/acme-web-2","title":"OpenAI","updated_secs":1790003600}]}"#,
+        );
+        snap(
+            long.human(),
+            r#"SLUG             PROVIDER  KIND  FIELDS  UPDATED     ENV             ACCOUNT                          TITLE
+openai/acme-web  openai    test  value   2026-09-21  OPENAI_API_KEY  you@work.example (org org-acme)  OpenAI
+"#,
+        );
+        snap(
+            ItemsView { items: vec![] }.human(),
+            r#"The vault has no items yet. Add one with `envcloak add`.
+"#,
+        );
+        snap(
+            item("openai/acme-web", 2).human(),
+            r#"openai/acme-web
+  title: OpenAI
+  id: 01K5TESTTESTTESTTESTTESTTE
+  provider: openai
+  kind: test key
+  usual variable: OPENAI_API_KEY
+  short values: not allowed
+  account: you@work.example (org org-acme)
+  fields:
+    value: set 2026-09-21 15:13:20 UTC, 1 prior value kept
+  created: 2026-09-21 14:13:20 UTC
+  updated: 2026-09-21 15:13:20 UTC
+  rotated: 2026-09-21 15:13:20 UTC
+  allowed hosts: api.openai.com
+  docs: https://platform.openai.com/docs
+  keys page: https://platform.openai.com/api-keys
+"#,
+        );
+        snap(
+            item("openai/acme-web", 2).json().to_string(),
+            r#"{"account":{"email":"you@work.example","label":null,"org_id":"org-acme"},"allow_short":false,"class":"secret","classification":"test","created_secs":1790000000,"detail":{"allowed_hosts":["api.openai.com"],"last_used_secs":null,"links":{"billing":null,"dashboard":null,"docs":"https://platform.openai.com/docs","keys_page":"https://platform.openai.com/api-keys"},"notes":null,"tags":[]},"env_hint":"OPENAI_API_KEY","expires_secs":null,"fields":[{"created_secs":1790000000,"name":"value","prior_count":1,"updated_secs":1790003600}],"id":"01K5TESTTESTTESTTESTTESTTE","provider":"openai","rotated_secs":1790003600,"slug":"openai/acme-web","title":"OpenAI","updated_secs":1790003600}"#,
+        );
+        let added = AddedView {
+            item: item("openai", 1),
+            field: "value".into(),
+            detected: None,
+            ambiguous: false,
+            length: LengthClass::Ok,
+        };
+        snap(
+            added.human(),
+            r#"Added openai.
+  provider: openai (test key)
+  field: value
+  account: you@work.example (org org-acme)
+Reference it in a project with: envcloak ref OPENAI_API_KEY=openai
+"#,
+        );
+        let short = AddedView {
+            detected: Some("deepseek".into()),
+            ambiguous: true,
+            length: LengthClass::Short,
+            ..added.clone()
+        };
+        snap(
+            short.human(),
+            r#"Added openai.
+  provider: openai (test key)
+  field: value
+  account: you@work.example (org org-acme)
+note: the value is shaped like a deepseek key
+note: the value matches the key patterns of several providers; name one with `envcloak add <provider>`
+warning: the value is 8 to 15 bytes long: `envcloak run` refuses to inject it unless the item allows short values (`envcloak add --allow-short`)
+Reference it in a project with: envcloak ref OPENAI_API_KEY=openai
+"#,
+        );
+        let rotated = RotatedView {
+            slug: "openai/acme-web".into(),
+            field: "value".into(),
+            prior_count: 1,
+            length: LengthClass::Ok,
+        };
+        snap(
+            rotated.human(),
+            r#"Rotated openai/acme-web#value: the new value is in place, and 1 prior value is kept.
+"#,
+        );
+        let removed = RemovedView {
+            slug: "openai/acme-web".into(),
+            grants_ended: 1,
+            backup: "vault-20260929T120000Z-0123456789abcdef.ecbackup".into(),
+        };
+        snap(
+            removed.human(),
+            r#"Removed openai/acme-web from the vault.
+  backup: vault-20260929T120000Z-0123456789abcdef.ecbackup in the vault's backups directory; `envcloak recover --backup <file>` brings the item back
+  grants that bound it and ended: 1
+"#,
+        );
+        let target = TargetView {
+            item: item("openai/acme-web", 1),
+            field: Some("value".into()),
+            grants: 1,
+        };
+        snap(
+            rotate_statement(&target),
+            r#"Rotate openai/acme-web#value (OpenAI; openai, test key).
+  The current value becomes the newest prior value; the vault keeps 3 at most (1 now).
+  Grants that bind this item stay in force: 1.
+"#,
+        );
+        snap(
+            remove_statement(&target),
+            r#"Remove openai/acme-web (OpenAI; openai, test key) and its values from the vault.
+  fields: value
+  An encrypted backup of the vault is written first, so `envcloak recover --backup <file>` can bring it back.
+  Grants that bind this item end: 1.
+"#,
+        );
+        let check = CheckReport {
+            manifest: Some("/src/acme-web/envcloak.toml".into()),
+            references: Some(CheckView {
+                project_dir: Some("/src/acme-web".into()),
+                project_name: Some("acme-web".into()),
+                bindings: vec![
+                    CheckBindingView {
+                        profile: None,
+                        env_name: Some("OPENAI_API_KEY".into()),
+                        reference: Some("openai/acme-web".into()),
+                        status: RefStatus::Ok,
+                    },
+                    CheckBindingView {
+                        profile: Some("short".into()),
+                        env_name: Some("SHORT_TOKEN".into()),
+                        reference: Some("short/acme-web".into()),
+                        status: RefStatus::UnknownItem,
+                    },
+                    CheckBindingView {
+                        profile: None,
+                        env_name: None,
+                        reference: None,
+                        status: RefStatus::LooksLikeValue,
+                    },
+                ],
+                refs: vec![RefStatus::Ok],
+            }),
+            unchecked: None,
+            env_files: vec![
+                EnvFileView {
+                    file: ".env".into(),
+                    state: EnvFileState::Read,
+                    error_line: None,
+                    error: None,
+                    plaintext: vec![PlaintextView {
+                        line: 2,
+                        env_name: Some("GITHUB_TOKEN".into()),
+                        provider: Some("github".into()),
+                    }],
+                    references: vec![EnvRefView {
+                        line: 3,
+                        env_name: Some("OPENAI_API_KEY".into()),
+                        reference: Some("openai/acme-web".into()),
+                        status: RefStatus::Ok,
+                    }],
+                },
+                EnvFileView {
+                    file: ".env.link".into(),
+                    state: EnvFileState::Symlink,
+                    error_line: None,
+                    error: None,
+                    plaintext: vec![],
+                    references: vec![],
+                },
+            ],
+        };
+        snap(
+            check.human(),
+            r#"manifest: /src/acme-web/envcloak.toml (project acme-web)
+references:
+  ok       [env] OPENAI_API_KEY = openai/acme-web
+  MISSING  [env.short] SHORT_TOKEN = short/acme-web: no item has that slug
+  MISSING  [env] [not shown: looks like a key or token]: shaped like a key or token rather than a name, so not shown: was a value pasted here?
+env files:
+  .env: 1 key in plaintext
+    line 2: GITHUB_TOKEN (github key)
+    line 3: ok       OPENAI_API_KEY = envcloak://openai/acme-web
+  .env.link: skipped: a symlink, which is never followed
+result: 2 references do not resolve; 1 plaintext key in env files: move them into the vault with `envcloak add`, and rotate any that were shared; 1 env file was not read
+"#,
+        );
+        snap(
+            check.json().to_string(),
+            r#"{"env_files":[{"error":null,"error_line":null,"file":".env","plaintext":[{"env_name":"GITHUB_TOKEN","line":2,"provider":"github"}],"references":[{"env_name":"OPENAI_API_KEY","line":3,"reference":"openai/acme-web","status":"ok"}],"state":"read"},{"error":null,"error_line":null,"file":".env.link","plaintext":[],"references":[],"state":"symlink"}],"manifest":"/src/acme-web/envcloak.toml","references":{"bindings":[{"env_name":"OPENAI_API_KEY","profile":null,"reference":"openai/acme-web","status":"ok"},{"env_name":"SHORT_TOKEN","profile":"short","reference":"short/acme-web","status":"unknown_item"},{"env_name":null,"profile":null,"reference":null,"status":"looks_like_value"}],"project_dir":"/src/acme-web","project_name":"acme-web","refs":["ok"]},"unchecked":null}"#,
+        );
+        let clean = CheckReport {
+            references: Some(CheckView {
+                bindings: vec![],
+                refs: vec![],
+                project_dir: None,
+                project_name: None,
+            }),
+            env_files: vec![],
+            ..check.clone()
+        };
+        snap(
+            clean.human(),
+            r#"manifest: /src/acme-web/envcloak.toml
+references: none
+env files: none
+result: ok
+"#,
+        );
+        let unchecked = CheckReport {
+            references: None,
+            unchecked: Some("vault_locked".into()),
+            env_files: vec![],
+            ..check
+        };
+        snap(
+            unchecked.human(),
+            r#"manifest: /src/acme-web/envcloak.toml
+references: not checked: the vault is locked; run `envcloak unlock`
+env files: none
+result: the references were not checked
+"#,
+        );
+        let edit = RefEditView {
+            manifest: "/src/acme-web/envcloak.toml".into(),
+            profile: None,
+            env_name: "GITHUB_TOKEN".into(),
+            reference: "github/acme-web".into(),
+            change: RefChange::Added,
+            previous: None,
+            resolves: Some(RefStatus::Ok),
+        };
+        snap(
+            edit.human(),
+            r#"Added GITHUB_TOKEN = github/acme-web to [env] in /src/acme-web/envcloak.toml.
+"#,
+        );
+        let replaced = RefEditView {
+            profile: Some("short".into()),
+            change: RefChange::Replaced,
+            previous: Some("github/old".into()),
+            resolves: Some(RefStatus::UnknownItem),
+            ..edit.clone()
+        };
+        snap(
+            replaced.human(),
+            r#"Set GITHUB_TOKEN = github/acme-web in [env.short] in /src/acme-web/envcloak.toml (it was github/old).
+warning: the reference does not resolve yet: no item has that slug
+"#,
+        );
+        let same = RefEditView {
+            change: RefChange::Unchanged,
+            resolves: None,
+            ..edit
+        };
+        snap(
+            same.human(),
+            r#"GITHUB_TOKEN = github/acme-web is already in [env] in /src/acme-web/envcloak.toml; nothing changed.
+note: the vault was not asked whether the reference resolves; run `envcloak check`
+"#,
+        );
+    }
+
+    /// Strings from the daemon or a file are escaped, and a name shaped like
+    /// a key is not printed at all: a canary pasted into any name of any
+    /// view never reaches the text, and no raw control character does.
+    #[test]
+    fn names_are_escaped_and_key_shaped_ones_hidden() {
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        for c in &cs {
+            if matches!(
+                c.label.as_str(),
+                envcloak_testkit::labels::VAULT_PASSPHRASE
+                    | envcloak_testkit::labels::SHORT_TOKEN
+                    | envcloak_testkit::labels::DATABASE_URL
+            ) {
+                // Word-like values are not key-shaped; they never reach a
+                // name through EnvCloak (the daemon refuses them as names
+                // only by their shape), so they are not checked here.
+                continue;
+            }
+            let v = c.as_str();
+            let mut i = item(v, 2);
+            i.title = format!("title\u{1b}[31m {v}");
+            i.provider = Some(v.to_owned());
+            i.env_hint = Some(v.to_owned());
+            i.fields[0].name = v.to_owned();
+            if let Some(a) = i.account.as_mut() {
+                a.email = Some(v.to_owned());
+                a.label = Some("rtl\u{202e}txet".to_owned());
+            }
+            if let Some(d) = i.detail.as_mut() {
+                d.tags = vec![v.to_owned()];
+                d.notes = Some(format!("see {v}"));
+            }
+            let target = TargetView {
+                item: i.clone(),
+                field: Some(v.to_owned()),
+                grants: 0,
+            };
+            let texts = [
+                i.human(),
+                ItemsView {
+                    items: vec![i.clone()],
+                }
+                .human(),
+                rotate_statement(&target),
+                remove_statement(&target),
+                AddedView {
+                    item: i.clone(),
+                    field: v.to_owned(),
+                    detected: Some(v.to_owned()),
+                    ambiguous: false,
+                    length: LengthClass::Ok,
+                }
+                .human(),
+            ];
+            for t in &texts {
+                envcloak_testkit::assert_no_canary(t.as_bytes(), &cs);
+                assert!(!t.contains('\u{1b}') && !t.contains('\u{202e}'), "{t}");
+                assert!(t.contains(HIDDEN), "{t}");
+            }
+            assert!(texts[0].contains("rtl\\u{202e}txet"), "{}", texts[0]);
+        }
+    }
+
+    #[test]
+    fn dates_are_civil_utc() {
+        assert_eq!(date(0), "1970-01-01");
+        assert_eq!(time(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(time(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(time(1_790_000_000), "2026-09-21 14:13:20 UTC");
+        assert_eq!(date(4_102_444_799), "2099-12-31");
+    }
+}

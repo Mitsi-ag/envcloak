@@ -107,10 +107,10 @@ fn reason_text(reason: &str) -> &'static str {
         "not_owned" => "envcloak.toml is owned by another user",
         "directory_changed" => "the project directory changed while it was opened",
         // Bindings.
-        "unknown_item" => "a reference names an item the vault does not have",
-        "unknown_field" => "a reference names a field the item does not have",
-        "ambiguous_field" => "a reference names an item with several fields without naming one",
-        "no_field" => "a reference names an item with no fields",
+        "unknown_item" => "no item has that slug",
+        "unknown_field" => "the item has no field of that name",
+        "ambiguous_field" => "the item has several fields: name one with <slug>#<field>",
+        "no_field" => "the item has no fields",
         "card_reference" => "a reference names a card, which is never bound to a variable",
         "issuer_credential_reference" => {
             "a reference names an issuer credential, which is never bound to a variable"
@@ -120,6 +120,26 @@ fn reason_text(reason: &str) -> &'static str {
         "ttl_zero" => "the grant length must be more than zero",
         "ttl_too_long" => "the grant length is over the limit (24h for an agent, 12h otherwise)",
         "live_not_bound" => "a --live name is not one of the request's variables",
+        // Items.
+        "item_changed" => "the slug names another item than the one shown; run it again",
+        "invalid_slug" => {
+            "a slug is lowercase letters and digits, then those, `.`, `_` or `-`, in parts \
+             separated by `/` (at most 128 bytes)"
+        }
+        "invalid_field" => {
+            "a field name is lowercase letters, digits, `_`, `.` or `-` (at most 64 bytes)"
+        }
+        "unknown_provider" => "no provider has that name",
+        "invalid_account" => {
+            "an account is 1 to 254 bytes without blanks, control or invisible characters"
+        }
+        "looks_like_value" => {
+            "a name is shaped like a key or token; values are never taken as names"
+        }
+        "empty_value" => "the value is empty",
+        "nul_byte" => "the value holds a NUL byte, which no environment variable can carry",
+        "value_too_large" => "the value is larger than 64 KiB",
+        "no_free_slug" => "every numbered slug for it is taken; give one with --slug",
         _ => "no detail",
     }
 }

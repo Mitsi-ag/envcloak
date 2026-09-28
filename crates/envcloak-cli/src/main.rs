@@ -15,24 +15,33 @@
 //!   itself arrives in T12;
 //! - `envcloak approve`, `deny` and `grants list` / `grants revoke` (SPEC
 //!   §10b);
-//! - `envcloak audit verify`: the audit log's check (SPEC §15.2 gate 33).
+//! - `envcloak audit verify`: the audit log's check (SPEC §15.2 gate 33);
+//! - `envcloak add`, `ls`, `show`, `ref`, `check`, `rotate` and `rm`: the
+//!   vault's items and the project's references, metadata only (SPEC §6.3,
+//!   §7, §10b). Their output is `envcloak_ipc::view` types rendered by
+//!   [`render`], as text or with `--json`; `rotate` and `rm` need the
+//!   passphrase as a proof.
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
-//! create`, `unlock`, `approve`, `run`) refuses under a tracer first.
+//! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`) refuses
+//! under a tracer first.
 //!
 //! `envcloak internal hardening [--hold]` is a hidden, value-free diagnostic
 //! used by the gate 19 tests: it prints `key=value` hardening lines and, with
 //! `--hold`, prints `ready` and waits for stdin to close, so a test can
 //! inspect the live process from outside.
 //!
-//! No argument is ever echoed: one could be a pasted secret. An argument
-//! that is not valid UTF-8 is refused as a usage error, before anything
-//! else, rather than changed: the command line `run` sends for approval
-//! must be the one it was given.
+//! No argument is ever echoed: one could be a pasted secret. No command
+//! takes a value as an argument (gate 13): values come from a hidden
+//! prompt on `/dev/tty` or from standard input, and a name shaped like a
+//! key or token is refused. An argument that is not valid UTF-8 is
+//! refused as a usage error, before anything else, rather than changed:
+//! the command line `run` sends for approval must be the one it was given.
 
 mod cmd;
 mod connect;
 mod fail;
+mod render;
 mod tty;
 
 use std::io::{Read, Write};
@@ -55,7 +64,15 @@ const HELP: &str = "usage:
   envcloak deny <REQUEST>
   envcloak grants list [--json]
   envcloak grants revoke <GRANT> | --all
-  envcloak audit verify [--json]";
+  envcloak audit verify [--json]
+  envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
+  envcloak ls [--long] [--json]
+  envcloak show <slug> [--json]
+  envcloak ref NAME=<slug>[#field] [--profile NAME] [--json]
+  envcloak check [--json]
+  envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
+  envcloak rm <slug> [--passphrase-fd N] [--json]
+Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
 
 fn main() -> ExitCode {
     envcloak_sys::harden_process();
@@ -94,6 +111,13 @@ fn main() -> ExitCode {
         ["deny", rest @ ..] => cmd::approve::deny(rest),
         ["grants", rest @ ..] => cmd::grants::run(rest),
         ["audit", rest @ ..] => cmd::audit::run(rest),
+        ["add", rest @ ..] => cmd::add::run(rest),
+        ["ls", rest @ ..] => cmd::ls::run(rest),
+        ["show", rest @ ..] => cmd::show::run(rest),
+        ["ref", rest @ ..] => cmd::ref_::run(rest),
+        ["check", rest @ ..] => cmd::check::run(rest),
+        ["rotate", rest @ ..] => cmd::rotate::run(rest),
+        ["rm", rest @ ..] => cmd::rm::run(rest),
         // Never echo arguments: one of them could be a pasted secret.
         _ => {
             eprintln!("envcloak: unknown command\n{HELP}");

@@ -1,16 +1,28 @@
 //! The commands (SPEC §14 M1 list). T7 has `vault create`, `unlock`,
 //! `lock`, `status` and `daemon install`; T9 adds `run`'s request step,
-//! `approve`, `deny` and `grants`; T10 adds `audit verify`; later tasks
-//! add the rest.
+//! `approve`, `deny` and `grants`; T10 adds `audit verify`; T11 adds
+//! `add`, `ls`, `show`, `ref`, `check`, `rotate` and `rm`; later tasks add
+//! the rest.
 //!
 //! Argument errors never echo an argument: one could be a pasted secret.
+//! No command takes a value on the command line (gate 13): values come
+//! from a hidden prompt on `/dev/tty` or from standard input (`--stdin`),
+//! and a name given there that is shaped like a key or token is refused
+//! ([`refuse_value_like`]).
 
+pub mod add;
 pub mod approve;
 pub mod audit;
+pub mod check;
 pub mod daemon;
 pub mod grants;
 pub mod lock;
+pub mod ls;
+pub mod ref_;
+pub mod rm;
+pub mod rotate;
 pub mod run;
+pub mod show;
 pub mod status;
 pub mod unlock;
 pub mod vault;
@@ -42,6 +54,42 @@ pub fn refuse_if_claimed() -> Result<Vec<String>, crate::fail::Failure> {
         ))
         .into())
     }
+}
+
+/// Refuses names given on the command line (a slug, a provider, an
+/// account, a variable) that are shaped like a key or token rather than a
+/// name ([`crate::render::looks_like_value`]): values are never taken on
+/// the command line (gate 13), so one there was most likely pasted by
+/// mistake. The argument is not echoed.
+pub fn refuse_value_like(names: &[&str]) -> Result<(), crate::fail::Failure> {
+    if names.iter().any(|n| crate::render::looks_like_value(n)) {
+        return Err(crate::fail::Failure::new(
+            "value_on_argv",
+            "an argument is shaped like a key or token, and values are never taken on the \
+             command line: type the value at the hidden prompt, or pipe it in with --stdin; if \
+             it was a key, rotate it, since your shell history may hold it now",
+        ));
+    }
+    Ok(())
+}
+
+/// Fails unless the daemon's vault is unlocked: checked before a command
+/// asks for a value or a passphrase, so nothing is typed for nothing.
+pub fn require_unlocked(c: &mut envcloak_ipc::Client) -> Result<(), crate::fail::Failure> {
+    use envcloak_ipc::proto::ErrorKind;
+    use envcloak_ipc::view::VaultState;
+    use envcloak_ipc::{ClientError, RpcError};
+    let vault = c.status()?.vault;
+    let e = match vault.state {
+        VaultState::Unlocked => return Ok(()),
+        VaultState::Locked => RpcError::new(ErrorKind::VaultLocked),
+        VaultState::Absent => RpcError::new(ErrorKind::NoVault),
+        VaultState::Unavailable => RpcError::with_reason(
+            ErrorKind::VaultUnavailable,
+            vault.unavailable.as_deref().unwrap_or("damaged"),
+        ),
+    };
+    Err(ClientError::Rpc(e).into())
 }
 
 /// A file descriptor number given on the command line: digits only.

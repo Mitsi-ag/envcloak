@@ -108,6 +108,14 @@ pub fn run(args: &[&str]) -> ExitCode {
             return usage(USAGE_TEXT);
         }
     };
+    // Names only (gate 13): a `--ref` or `--profile` shaped like a key is
+    // refused, unechoed, before anything is sent. The command after `--`
+    // is the user's own, which the audit entry masks.
+    let mut names: Vec<&str> = a.profile.iter().map(String::as_str).collect();
+    names.extend(a.refs.iter().flat_map(|r| r.split(['=', '#'])));
+    if let Err(f) = super::refuse_value_like(&names) {
+        return f.report(USAGE);
+    }
     match request(a) {
         Ok(code) => code,
         Err(f) => f.report(RUN_FAILURE),

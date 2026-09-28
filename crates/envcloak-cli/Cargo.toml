@@ -15,13 +15,19 @@ workspace = true
 envcloak-core.workspace = true
 envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
+envcloak-providers.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
 serde_json.workspace = true
+# `envcloak ref` edits envcloak.toml in place: comments, order and layout
+# are kept, so it needs the writer as well as the parser.
+toml_edit = { workspace = true, features = ["display"] }
 zeroize.workspace = true
 
 [dev-dependencies]
 envcloak-ipc = { workspace = true, features = ["testing"] }
 envcloak-sys = { workspace = true, features = ["testing"] }
 envcloak-testkit.workspace = true
+# The output snapshots replace times, ids and paths before comparing.
+regex.workspace = true
 tempfile.workspace = true

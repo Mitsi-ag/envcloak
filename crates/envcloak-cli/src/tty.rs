@@ -65,6 +65,10 @@ pub enum InputError {
     Terminated(i32),
     /// Reading or writing failed.
     Io,
+    /// `--stdin` was given, but standard input is a terminal.
+    StdinIsTerminal,
+    /// The value holds a NUL byte, which no environment variable can carry.
+    NulByte,
 }
 
 impl From<InputError> for Failure {
@@ -76,14 +80,26 @@ impl From<InputError> for Failure {
                  --passphrase-fd",
             ),
             InputError::Cancelled => Failure::new("cancelled", "cancelled"),
-            InputError::Empty => Failure::new("no_input", "no passphrase was given"),
-            InputError::TooLong => Failure::new("input_too_long", "the input is over 1024 bytes"),
+            InputError::Empty => Failure::new("no_input", "nothing was entered"),
+            InputError::TooLong => Failure::new(
+                "input_too_long",
+                "the input is too long: 1024 bytes when typed, 64 KiB with --stdin",
+            ),
             InputError::BadFd => Failure::new(
                 "bad_fd",
                 "the file descriptor named on the command line is not open",
             ),
-            InputError::Io => Failure::new("io", "reading the passphrase failed"),
+            InputError::Io => Failure::new("io", "reading the input failed"),
             InputError::Terminated(_) => Failure::new("terminated", "stopped by a signal"),
+            InputError::StdinIsTerminal => Failure::new(
+                "stdin_is_terminal",
+                "--stdin reads a pipe, and standard input is a terminal, where typing is shown; \
+                 leave out --stdin to type the value at a hidden prompt",
+            ),
+            InputError::NulByte => Failure::new(
+                "invalid_value",
+                "the value holds a NUL byte, which no environment variable can carry",
+            ),
         }
     }
 }
@@ -218,6 +234,68 @@ fn read_keys(mut tty: &File) -> Result<SecretBytes, InputError> {
     Ok(buf.freeze())
 }
 
+/// The largest value `--stdin` takes: the vault's 64 KiB field cap.
+pub const MAX_VALUE: usize = envcloak_core::vault::MAX_FIELD;
+
+/// Reads a value from standard input for `--stdin` (SPEC §6.3): all of it,
+/// up to end of input, less one line ending at the very end (`\n` or
+/// `\r\n`), so `echo "$KEY" |` and `printf %s "$KEY" |` give the same value.
+/// The bytes go through a wiped buffer on the stack into a [`SecretBuf`]
+/// with room for [`MAX_VALUE`] and a line ending; a NUL byte is refused.
+/// Standard input that is a terminal is refused too: what is typed there
+/// is echoed, so `--stdin` is for pipes, and a person types the value at
+/// the hidden prompt instead.
+pub fn read_stdin_value() -> Result<SecretBytes, InputError> {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err(InputError::StdinIsTerminal);
+    }
+    read_value_from(&mut stdin.lock())
+}
+
+/// As [`read_stdin_value`], from `r`.
+pub fn read_value_from(r: &mut impl Read) -> Result<SecretBytes, InputError> {
+    // Room for a value at the cap and its line ending; more than that does
+    // not fit, and a value over the cap is refused below.
+    let mut buf = SecretBuf::with_capacity(MAX_VALUE + 2);
+    let mut chunk = zeroize::Zeroizing::new([0u8; 512]);
+    // The last two bytes read, to take a line ending off the end.
+    let mut tail = zeroize::Zeroizing::new([0u8; 2]);
+    loop {
+        match r.read(&mut chunk[..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                let part = chunk.get(..n).ok_or(InputError::Io)?;
+                if part.contains(&0) {
+                    return Err(InputError::NulByte);
+                }
+                buf.extend(part).map_err(|_| InputError::TooLong)?;
+                match part {
+                    [.., a, b] => *tail = [*a, *b],
+                    [b] => *tail = [tail[1], *b],
+                    [] => {}
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(InputError::Io),
+        }
+    }
+    let len = buf.len();
+    if len >= 2 && *tail == *b"\r\n" {
+        buf.truncate(len - 2);
+    } else if len >= 1 && tail[1] == b'\n' {
+        buf.truncate(len - 1);
+    }
+    if buf.len() > MAX_VALUE {
+        return Err(InputError::TooLong);
+    }
+    if buf.is_empty() {
+        return Err(InputError::Empty);
+    }
+    Ok(buf.freeze())
+}
+
 /// Reads one line from the inherited descriptor `fd`, without its line
 /// ending, one byte at a time so nothing past the line is consumed.
 pub fn read_secret_fd(fd: i32) -> Result<SecretBytes, InputError> {
@@ -258,6 +336,68 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// Reads `input` in pieces of `step` bytes, as a pipe delivers it.
+    struct Pieces<'a> {
+        input: &'a [u8],
+        step: usize,
+    }
+
+    impl Read for Pieces<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(buf.len()).min(self.input.len());
+            buf[..n].copy_from_slice(&self.input[..n]);
+            self.input = &self.input[n..];
+            Ok(n)
+        }
+    }
+
+    fn read_value(input: &[u8], step: usize) -> Result<SecretBytes, InputError> {
+        read_value_from(&mut Pieces { input, step })
+    }
+
+    /// `--stdin` takes the whole input less one line ending at the very
+    /// end, however the pipe splits it; NUL bytes, empty input and more
+    /// than 64 KiB are refused.
+    #[test]
+    fn stdin_values_lose_one_final_line_ending() {
+        for step in [1, 2, 3, 512, 4096] {
+            for (input, want) in [
+                (&b"value"[..], &b"value"[..]),
+                (b"value\n", b"value"),
+                (b"value\r\n", b"value"),
+                (b"value\n\n", b"value\n"),
+                (b"two\nlines\n", b"two\nlines"),
+                (b"cr\r", b"cr\r"),
+                (b"x\n", b"x"),
+                (b"\r\nx", b"\r\nx"),
+            ] {
+                let got = read_value(input, step).unwrap();
+                assert!(got.ct_eq(want), "{input:?} in pieces of {step}");
+            }
+            for (input, err) in [
+                (&b""[..], InputError::Empty),
+                (b"\n", InputError::Empty),
+                (b"\r\n", InputError::Empty),
+                (b"nul\0inside", InputError::NulByte),
+            ] {
+                assert_eq!(read_value(input, step).unwrap_err(), err, "{input:?}");
+            }
+        }
+        let full = vec![b'a'; MAX_VALUE];
+        assert_eq!(read_value(&full, 4096).unwrap().len(), MAX_VALUE);
+        let mut with_newline = full.clone();
+        with_newline.push(b'\n');
+        assert_eq!(read_value(&with_newline, 4096).unwrap().len(), MAX_VALUE);
+        let mut crlf = full.clone();
+        crlf.extend_from_slice(b"\r\n");
+        assert_eq!(read_value(&crlf, 4096).unwrap().len(), MAX_VALUE);
+        for extra in [&b"a"[..], b"a\n", b"ab", b"abc\n"] {
+            let mut over = full.clone();
+            over.extend_from_slice(extra);
+            assert_eq!(read_value(&over, 4096).unwrap_err(), InputError::TooLong);
+        }
+    }
 
     /// A termination signal that arrives after the prompt and before the
     /// read blocks still ends the entry, without a key being pressed: the
