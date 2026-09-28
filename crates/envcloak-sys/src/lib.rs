@@ -22,6 +22,11 @@
 //! - Caller evidence: [`proc_info`] and [`proc_argv`] (one process as the
 //!   kernel reports it) and [`ancestry`] (a peer's parent chain, checked
 //!   again after the walk).
+//! - The runner (`envcloak run`): [`SignalRelay`] (signals caught and
+//!   handed to a thread that passes them on), [`wait_for_exit`] (a child's
+//!   exit seen without reaping it, so its pid is not reused while it may
+//!   still be signalled), [`signal_process`] and [`signal_group`] (`kill`),
+//!   and [`wait_writable`] (an output descriptor ready for a write).
 //!
 //! Every other crate inherits the workspace's `unsafe_code = "forbid"`, so
 //! the compiler rejects unsafe code there and any `allow` of it. This crate
@@ -32,6 +37,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 mod alloc;
+mod child;
 mod clock;
 mod fd;
 mod fs;
@@ -47,6 +53,7 @@ pub mod testing;
 mod tty;
 
 pub use alloc::{SystemBacking, WipingAllocator, wiping_allocator_active};
+pub use child::{SignalRelay, signal_group, signal_process, wait_for_exit};
 pub use clock::{awake_time, time_including_sleep};
 pub use fd::{cloexec_flag, inherited_fd};
 pub use fs::open_beneath;
@@ -68,4 +75,4 @@ pub use proc::{
 };
 pub use signal::{TerminationSignals, TerminationWatch, exit_by_signal, termination_recorded};
 pub use sync::{SyncMethod, sync_file};
-pub use tty::{SecretInput, wait_readable};
+pub use tty::{SecretInput, wait_readable, wait_writable};

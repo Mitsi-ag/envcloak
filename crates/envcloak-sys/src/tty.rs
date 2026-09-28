@@ -162,6 +162,31 @@ pub fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> 
     }
 }
 
+/// Waits at most `timeout` for `fd` to accept a write without blocking, or
+/// to have failed (the reader gone). Returns whether it has: the runner
+/// uses it when its output descriptor was left non-blocking by whoever
+/// opened it. A signal handled meanwhile ends the wait with an error of
+/// kind [`io::ErrorKind::Interrupted`].
+///
+/// # Errors
+/// When `poll` fails, `EINTR` included.
+pub fn wait_writable(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `p` is one initialized pollfd, and the descriptor stays open
+    // for the call.
+    let rc = unsafe { libc::poll(&mut p, 1, ms) };
+    match rc {
+        0 => Ok(false),
+        n if n > 0 => Ok(true),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
 impl Drop for SecretInput<'_> {
     fn drop(&mut self) {
         // TCSAFLUSH: input not read yet is discarded, not left for the next
