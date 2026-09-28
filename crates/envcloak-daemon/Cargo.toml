@@ -26,4 +26,6 @@ envcloak-testkit.workspace = true
 # The grant tests tamper with a vault file directly, as the core's do.
 rusqlite.workspace = true
 serde_json.workspace = true
+# Gate 28 checks the audited manifest hash against the file's bytes.
+sha2.workspace = true
 tempfile.workspace = true

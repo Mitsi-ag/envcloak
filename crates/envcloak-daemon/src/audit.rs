@@ -53,8 +53,15 @@ pub enum AuditEvent {
     /// Grants were revoked.
     Revoked { pid: i32, count: usize },
     /// A covered request came with a manifest whose hash differs from the
-    /// one at approval; the bindings were still a subset (SPEC §10b).
-    ManifestChanged { pid: i32, grant: String },
+    /// one at approval; the bindings were still a subset (SPEC §10b). The
+    /// hashes are SHA-256 digests of the manifest's bytes, at approval and
+    /// now.
+    ManifestChanged {
+        pid: i32,
+        grant: String,
+        approved_sha256: [u8; 32],
+        sha256: [u8; 32],
+    },
 }
 
 /// Where events go.
@@ -111,9 +118,39 @@ impl Audit {
             AuditEvent::Revoked { pid, count } => {
                 eprintln!("envcloakd: audit: revoked grants={count} pid={pid}")
             }
-            AuditEvent::ManifestChanged { pid, grant } => {
-                eprintln!("envcloakd: audit: manifest changed grant={grant} pid={pid}")
-            }
+            AuditEvent::ManifestChanged {
+                pid,
+                grant,
+                approved_sha256,
+                sha256,
+            } => eprintln!(
+                "envcloakd: audit: manifest changed grant={grant} approved_sha256={} sha256={} \
+                 pid={pid}",
+                hex(&approved_sha256),
+                hex(&sha256)
+            ),
         }
+    }
+}
+
+/// Lower-case hex, as the approval statement shows a manifest's hash.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(2 * bytes.len()), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hex;
+
+    #[test]
+    fn hashes_are_lower_case_hex() {
+        assert_eq!(hex(&[0x00, 0xab, 0x7f, 0xff]), "00ab7fff");
+        assert_eq!(hex(&[0u8; 32]).len(), 64);
     }
 }

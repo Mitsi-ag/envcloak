@@ -236,21 +236,24 @@ pub fn run_request(
         let again = r.clone();
         match s.grants().decide(r, &now) {
             Decision::Covered(g) => {
-                let (changed, redact) = match s.grants().grant(g) {
-                    Some(grant) => (
-                        grant.manifest_sha256 != project.manifest.sha256,
-                        policy.redact,
-                    ),
-                    None => (false, policy.redact),
-                };
+                // The hash at approval, when the manifest has changed since.
+                let approved = s
+                    .grants()
+                    .grant(g)
+                    .map(|grant| grant.manifest_sha256)
+                    .filter(|h| *h != project.manifest.sha256);
+                let redact = policy.redact;
                 if !s.grants().consume(g) {
                     request = Some(again);
                     continue;
                 }
-                if changed {
+                let changed = approved.is_some();
+                if let Some(approved_sha256) = approved {
                     shared.audit.record(AuditEvent::ManifestChanged {
                         pid: peer.pid,
                         grant: g.to_string(),
+                        approved_sha256,
+                        sha256: project.manifest.sha256,
                     });
                 }
                 s.touch(Reading::now(&shared.clocks));

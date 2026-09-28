@@ -108,6 +108,29 @@ impl Fixture {
     }
 }
 
+/// Lower-case hex of the SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Polls `cond` until it holds or `limit` passes.
+fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn pending(d: &DecisionView) -> String {
     match d {
         DecisionView::Pending { request } => {
@@ -232,21 +255,37 @@ fn a_request_is_pending_until_approved_then_covered() {
         grant
     );
 
-    // Gate 28: a comment-only manifest change is covered and audited; an
-    // added reference, a retargeted or renamed variable and a profile
-    // switch each prompt.
-    std::fs::write(&f.manifest, format!("# a comment\n{MANIFEST}")).unwrap();
+    // Gate 28: a comment-only manifest change is covered, and audited with
+    // the hash at approval and the new one, each the SHA-256 of the file's
+    // bytes; an added reference, a retargeted or renamed variable and a
+    // profile switch each prompt.
+    let rewritten = format!("# a comment\n{MANIFEST}");
+    std::fs::write(&f.manifest, &rewritten).unwrap();
     match f.request(&["./emit"]) {
         DecisionView::Covered {
             manifest_changed, ..
         } => assert!(manifest_changed),
         other => panic!("{other:?}"),
     }
+    let audited = format!(
+        "manifest changed grant={grant} approved_sha256={} sha256={} pid=",
+        sha256_hex(MANIFEST.as_bytes()),
+        sha256_hex(rewritten.as_bytes())
+    );
     assert!(
-        f.d.wait_for_log(
-            &format!("manifest changed grant={grant}"),
-            Duration::from_secs(5)
-        ),
+        f.d.wait_for_log(&audited, Duration::from_secs(5)),
+        "{audited}\n{}",
+        f.d.log()
+    );
+    // Once per covered request: the same change is audited again.
+    let _ = f.request(&["./emit"]);
+    assert!(
+        wait_until(Duration::from_secs(5), || f
+            .d
+            .log()
+            .matches(&audited)
+            .count()
+            == 2),
         "{}",
         f.d.log()
     );
