@@ -18,6 +18,9 @@
 //!   pair that shows the machine slept).
 //! - The CLI's secret input: [`SecretInput`] (a terminal with echo off)
 //!   and [`inherited_fd`] (a descriptor named by `--passphrase-fd`).
+//! - Caller evidence: [`proc_info`] and [`proc_argv`] (one process as the
+//!   kernel reports it) and [`ancestry`] (a peer's parent chain, checked
+//!   again after the walk).
 //!
 //! Every other crate inherits the workspace's `unsafe_code = "forbid"`, so
 //! the compiler rejects unsafe code there and any `allow` of it. This crate
@@ -35,6 +38,7 @@ mod harden;
 mod lockfile;
 mod peer;
 mod perm;
+mod proc;
 mod signal;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -54,5 +58,10 @@ pub use peer::{
     process_start_time,
 };
 pub use perm::{PRIVATE_UMASK, effective_uid, restrict_umask};
+pub use proc::{
+    AncestryError, CodeSignature, ExeIdentity, LiveProcesses, MAX_ANCESTRY, MAX_ARGV,
+    MAX_ARGV_BYTES, ProcInfo, ProcessTable, StatFields, ancestry, ancestry_in, parse_cmdline,
+    parse_proc_stat, parse_procargs2, parse_status_euid, proc_argv, proc_info,
+};
 pub use signal::TerminationSignals;
 pub use tty::SecretInput;

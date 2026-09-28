@@ -47,4 +47,5 @@ harness = false
 [dev-dependencies]
 # Enables the `testing` feature for this crate's own tests.
 envcloak-sys = { path = ".", features = ["testing"] }
+proptest.workspace = true
 tempfile.workspace = true

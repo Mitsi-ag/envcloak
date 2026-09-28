@@ -738,3 +738,15 @@ pub fn spawn_traced(cmd: &mut std::process::Command) -> io::Result<std::process:
     }
     Ok(child)
 }
+
+/// Makes the calling process the leader of a new session with no
+/// controlling terminal (`setsid(2)`), as a program escaping its
+/// session does. Fails with `EPERM` in a process group leader.
+pub fn setsid() -> io::Result<()> {
+    // SAFETY: setsid has no preconditions; it fails without effect when
+    // the caller leads a process group.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
