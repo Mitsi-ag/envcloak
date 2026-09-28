@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use envcloak_sys::{
-    AncestryError, MAX_ARGV, MAX_ARGV_BYTES, PeerIdentity, PeerSource, ProcInfo, ProcessTable,
-    StartTime, ancestry, ancestry_in, effective_uid, parse_cmdline, parse_proc_stat,
+    AncestryError, MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, PeerIdentity, PeerSource, ProcInfo,
+    ProcessTable, StartTime, ancestry, ancestry_in, effective_uid, parse_cmdline, parse_proc_stat,
     parse_procargs2, peer_identity, proc_argv, proc_info, process_start_time, reaches_top,
 };
 use proptest::prelude::*;
@@ -234,6 +234,58 @@ fn arguments_are_read_and_the_environment_is_not() {
     for a in &argv {
         assert!(
             !a.to_str().unwrap().contains("never-an-argument"),
+            "{argv:?}"
+        );
+    }
+}
+
+/// A process run with exactly `argv` (`argv[0]` included) and an
+/// environment holding one variable, `canary`: `/usr/bin/xargs`, which
+/// waits for its standard input whatever its arguments (an empty one is a
+/// utility or an argument to it). The caller kills and reaps it.
+fn with_argv(argv: &[&str], canary: &str) -> Child {
+    use std::os::unix::process::CommandExt;
+    Command::new("/usr/bin/xargs")
+        .arg0(argv[0])
+        .args(&argv[1..])
+        .env_clear()
+        .env("ENVCLOAK_PROC_TEST_ENV", canary)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// Review finding F-33: an empty `argv[0]`, or several leading empty
+/// arguments, are arguments, and the environment after them is never read
+/// as one.
+#[test]
+fn empty_arguments_are_read_as_empty_and_the_environment_is_not() {
+    let canary = format!(
+        "ecq-env-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    for argv in [
+        &["xargs"][..],
+        &[""],
+        &["", ""],
+        &["", "", ""],
+        &["", "", "", "last"],
+        &["xargs", "", "x"],
+    ] {
+        let mut child = with_argv(argv, &canary);
+        let got = proc_argv(i32::try_from(child.id()).unwrap());
+        let _ = child.kill();
+        let _ = child.wait();
+        let got = got.unwrap();
+        assert_eq!(got, argv, "{argv:?}");
+        assert!(
+            !got.iter().any(|a| a.to_string_lossy().contains(&canary)),
             "{argv:?}"
         );
     }
@@ -523,13 +575,16 @@ fn debug_output_names_no_argument() {
     assert!(shown.contains("argc: Some(1)"), "{shown}");
 }
 
-/// A `KERN_PROCARGS2` buffer: argc, the executable's path, padding, then
+/// A `KERN_PROCARGS2` buffer as `exec` lays it out: argc, the executable's
+/// path, its NUL and NULs to the next multiple of [`PROCARGS_ALIGN`], then
 /// the arguments and the environment, each NUL-terminated.
-fn procargs(argc: usize, path: &[u8], pad: usize, args: &[Vec<u8>], env: &[Vec<u8>]) -> Vec<u8> {
+fn procargs(argc: usize, path: &[u8], args: &[Vec<u8>], env: &[Vec<u8>]) -> Vec<u8> {
     let mut b = i32::try_from(argc).unwrap().to_ne_bytes().to_vec();
     b.extend_from_slice(path);
     b.push(0);
-    b.extend(std::iter::repeat_n(0u8, pad));
+    while (b.len() - 4) % PROCARGS_ALIGN != 0 {
+        b.push(0);
+    }
     for s in args.iter().chain(env) {
         b.extend_from_slice(s);
         b.push(0);
@@ -557,22 +612,34 @@ proptest! {
         let _ = parse_proc_stat(&buf);
     }
 
-    /// Well-formed buffers give exactly their arguments, and never an
-    /// environment string, whatever the path, padding and strings. (An
-    /// empty `argv[0]` cannot be told from padding; exec'd programs have a
-    /// name there.)
+    /// Well-formed buffers give exactly their arguments, empty ones
+    /// included (`argv[0]` too: any `exec` may pass one), and never an
+    /// environment string, whatever the path and strings.
     #[test]
     fn procargs2_gives_the_arguments_only(
         path in no_nul(),
-        pad in 0usize..9,
-        first in prop::collection::vec(1u8..=255, 1..40),
-        rest in prop::collection::vec(no_nul(), 0..8),
+        args in prop::collection::vec(no_nul(), 0..8),
         env in prop::collection::vec(no_nul(), 0..8),
     ) {
         use std::os::unix::ffi::OsStringExt;
-        let mut args = vec![first];
+        let b = procargs(args.len(), &path, &args, &env);
+        let want: Vec<OsString> = args.iter().map(|a| OsString::from_vec(a.clone())).collect();
+        prop_assert_eq!(parse_procargs2(&b).unwrap(), want);
+    }
+
+    /// Leading empty arguments right after the padding are arguments, and
+    /// the environment after them stays unread.
+    #[test]
+    fn leading_empty_arguments_are_not_padding(
+        path in no_nul(),
+        empties in 1usize..10,
+        rest in prop::collection::vec(no_nul(), 0..4),
+        env in prop::collection::vec(prop::collection::vec(1u8..=255, 1..20), 1..4),
+    ) {
+        use std::os::unix::ffi::OsStringExt;
+        let mut args = vec![Vec::new(); empties];
         args.extend(rest);
-        let b = procargs(args.len(), &path, pad, &args, &env);
+        let b = procargs(args.len(), &path, &args, &env);
         let want: Vec<OsString> = args.iter().map(|a| OsString::from_vec(a.clone())).collect();
         prop_assert_eq!(parse_procargs2(&b).unwrap(), want);
     }
@@ -584,7 +651,7 @@ proptest! {
         args in prop::collection::vec(prop::collection::vec(1u8..=255, 1..20), 1..6),
         cut in 0usize..200,
     ) {
-        let b = procargs(args.len(), b"/bin/x", 2, &args, &[]);
+        let b = procargs(args.len(), b"/bin/x", &args, &[]);
         let cut = cut.min(b.len() - 1);
         prop_assert!(parse_procargs2(&b[..cut]).is_none());
     }

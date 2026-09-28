@@ -36,8 +36,11 @@
 //! `KERN_PROCARGS2` returns the environment after them. So arguments are
 //! read only for the processes the caller names, at most [`MAX_ARGV`] of
 //! them and [`MAX_ARGV_BYTES`] in all; the rest of the buffer, the
-//! environment included, is never parsed and is wiped. [`ProcInfo`]'s
-//! `Debug` prints how many arguments were read, never what they are.
+//! environment included, is never parsed and is wiped. Where the arguments
+//! start comes from the layout `exec` gives the buffer, not from its
+//! contents: an empty argument is a lone NUL, as padding is (see
+//! [`parse_procargs2`]). [`ProcInfo`]'s `Debug` prints how many arguments
+//! were read, never what they are.
 
 use std::ffi::OsString;
 use std::io;
@@ -432,27 +435,42 @@ pub fn parse_cmdline(bytes: &[u8]) -> Vec<OsString> {
     args
 }
 
+/// The alignment `exec` gives the executable's path in a macOS process's
+/// string area: the new process's pointer size, 8 for every process
+/// current macOS runs (XNU `exec_extract_strings`).
+pub const PROCARGS_ALIGN: usize = 8;
+
 /// Parses the buffer macOS `sysctl(KERN_PROCARGS2)` returns: `argc` as a
-/// native-endian `int`, the executable's path and its NUL, NUL padding,
-/// then `argc` NUL-terminated arguments, then the environment. Only the
-/// arguments are read, at most [`MAX_ARGV`] of them and [`MAX_ARGV_BYTES`]
-/// in all; parsing stops there, so no environment string is ever parsed.
-/// `None` when the buffer ends before the arguments it announces.
+/// native-endian `int`, then the process's string area as `exec` laid it
+/// out (XNU `exec_extract_strings`; `sysctl_procargsx` strips its
+/// `executable_path=` key, 16 bytes, a multiple of the alignment): the
+/// executable's path and its NUL, NULs up to the next multiple of
+/// [`PROCARGS_ALIGN`] bytes from the path's start, then `argc`
+/// NUL-terminated arguments, any of which may be empty, then the
+/// environment.
+///
+/// The arguments start where that layout puts them, never at the first
+/// byte that is not a NUL: an empty `argv[0]` is a lone NUL too, and
+/// skipping it would shift the count into the environment (review finding F-33).
+/// Only the arguments are read, at most [`MAX_ARGV`] of them and
+/// [`MAX_ARGV_BYTES`] in all; parsing stops there, so no environment
+/// string is parsed unless the process rewrote its own argument area.
+/// `None` when the padding holds anything but NULs, or the buffer ends
+/// before the arguments it announces.
 pub fn parse_procargs2(buf: &[u8]) -> Option<Vec<OsString>> {
     let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
     let argc = usize::try_from(argc).ok()?;
-    let mut i = 4;
-    // The executable's path.
-    i += buf.get(i..)?.iter().position(|b| *b == 0)? + 1;
-    // Padding to a word boundary: more NULs.
-    while buf.get(i) == Some(&0) {
-        i += 1;
+    let area = buf.get(4..)?;
+    let path_len = area.iter().position(|b| *b == 0)?;
+    let mut i = (path_len + 1).checked_next_multiple_of(PROCARGS_ALIGN)?;
+    if area.get(path_len..i)?.iter().any(|b| *b != 0) {
+        return None;
     }
     let want = argc.min(MAX_ARGV);
     let mut args = Vec::with_capacity(want);
     let mut total = 0usize;
     while args.len() < want {
-        let rest = buf.get(i..)?;
+        let rest = area.get(i..)?;
         let n = rest.iter().position(|b| *b == 0)?;
         total = total.saturating_add(n);
         if total > MAX_ARGV_BYTES {
@@ -540,11 +558,15 @@ mod tests {
         assert!(parse_cmdline(&unterminated).is_empty());
     }
 
-    fn procargs(argc: i32, path: &[u8], pad: usize, strings: &[&[u8]]) -> Vec<u8> {
+    /// A `KERN_PROCARGS2` buffer laid out as `exec` does: argc, the path,
+    /// its NUL and NULs to the next multiple of 8, then the strings.
+    fn procargs(argc: i32, path: &[u8], strings: &[&[u8]]) -> Vec<u8> {
         let mut b = argc.to_ne_bytes().to_vec();
         b.extend_from_slice(path);
         b.push(0);
-        b.extend(std::iter::repeat_n(0u8, pad));
+        while (b.len() - 4) % PROCARGS_ALIGN != 0 {
+            b.push(0);
+        }
         for s in strings {
             b.extend_from_slice(s);
             b.push(0);
@@ -557,14 +579,40 @@ mod tests {
         let b = procargs(
             2,
             b"/usr/local/bin/node",
-            5,
             &[b"node", b"/opt/cli.js", b"HOME=/Users/x", b"PATH=/bin"],
         );
         assert_eq!(parse_procargs2(&b).unwrap(), ["node", "/opt/cli.js"]);
         assert_eq!(
-            parse_procargs2(&procargs(0, b"/bin/x", 0, &[b"ENV=1"])).unwrap(),
+            parse_procargs2(&procargs(0, b"/bin/x", &[b"ENV=1"])).unwrap(),
             Vec::<OsString>::new()
         );
+    }
+
+    #[test]
+    fn empty_arguments_are_arguments_not_padding() {
+        // Review finding F-33: a path whose NUL ends on the alignment, then
+        // an empty argv[0]. Skipping NULs read "30" as argv[0] and the
+        // environment as argv[1].
+        let b = procargs(2, b"/bin/sl", &[b"", b"30", b"ENVMARK=1"]);
+        assert_eq!(b.len(), 4 + 8 + 1 + 3 + 10);
+        assert_eq!(parse_procargs2(&b).unwrap(), ["", "30"]);
+        // Padding before an empty argv[0], and several empty arguments.
+        for path in [&b"/bin/x"[..], b"/usr/bin/xargs", b"/bin/sleep", b"/a", b""] {
+            let b = procargs(4, path, &[b"", b"", b"", b"z", b"ENVMARK=1"]);
+            assert_eq!(parse_procargs2(&b).unwrap(), ["", "", "", "z"]);
+        }
+    }
+
+    #[test]
+    fn padding_that_is_not_nul_is_refused() {
+        let mut b = procargs(1, b"/bin/x", &[b"a", b"ENVMARK=1"]);
+        // "/bin/x" and its NUL take 7 bytes: one byte of padding.
+        assert_eq!(b[4 + 7], 0);
+        b[4 + 7] = b'q';
+        assert_eq!(parse_procargs2(&b), None);
+        // A buffer that ends inside the padding.
+        let b = procargs(1, b"/bin/x", &[]);
+        assert_eq!(parse_procargs2(&b[..b.len() - 1]), None);
     }
 
     #[test]
@@ -572,7 +620,7 @@ mod tests {
         assert_eq!(parse_procargs2(b""), None);
         assert_eq!(parse_procargs2(&[1, 0, 0]), None);
         assert_eq!(
-            parse_procargs2(&procargs(3, b"/bin/x", 1, &[b"a", b"b"])),
+            parse_procargs2(&procargs(3, b"/bin/x", &[b"a", b"b"])),
             None
         );
         assert_eq!(parse_procargs2(&(-1i32).to_ne_bytes()), None);
