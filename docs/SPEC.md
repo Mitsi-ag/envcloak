@@ -712,7 +712,7 @@ Grant {
 6. R's bindings are a subset of G's bindings, compared by (env_name, item_id, field).
 7. R's effective mode is at least as strict as G's.
 
-A manifest change that leaves the bindings a subset does not prompt; the new hash is recorded in the audit log. Any added or changed binding, env-name remapping, profile switch, `--ref` or `--env-file` reference prompts for the difference only.
+A manifest change that leaves the bindings a subset does not prompt; the new hash is recorded in the audit log. Any added or changed binding, env-name remapping, profile switch, `--ref` or `--env-file` reference prompts for the difference: the statement asks for the bindings no grant in force for the caller and project covers, and lists the ones a grant already covers apart, since the new grant holds the whole request.
 
 **Lifetimes.**
 - Agent grants: default 8 h, maximum 24 h.
@@ -897,7 +897,7 @@ M1:
 26. Ancestry escape. A process escapes by double-fork, `setsid`, `nohup` with `disown`, `launchctl submit` or `systemd-run --user`. The escaped process is not covered and gets a new request labeled "unknown".
 27. PID reuse. After the root exits and its pid is reused, the new process is not covered.
 28. Binding changes after approval.
-    - An added reference, a retargeted env name, a renamed env var, a profile switch, or `--ref` or `--env-file` naming an ungranted item each prompt for the difference only.
+    - An added reference, a retargeted env name, a renamed env var, a profile switch, or `--ref` or `--env-file` naming an ungranted item each prompt for the difference: the statement asks for exactly the bindings no grant in force covers.
     - A comment-only change does not prompt, and its new hash is audited.
     - Copying or moving the repo creates a new identity; a symlinked path to the same directory keeps it.
 29. Expiry and revocation. Wall-clock and monotonic expiry are tested separately. `grants revoke` needs no proof. Lock, daemon restart, sleep and root exit end the affected grants.

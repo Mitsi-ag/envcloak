@@ -11,9 +11,18 @@
 //!   [`DENIAL_WINDOW`] deny that root for [`AUTO_DENY`], whatever it asks.
 //!
 //! Windows count time awake ([`crate::Now::awake`]): a machine asleep
-//! serves none of them. This state survives a lock; it only tightens. It
-//! is bounded: at most [`MAX_DENIALS`] denials are remembered, the oldest
-//! forgotten first, and auto-denied roots leave when their time passes.
+//! serves none of them. This state survives a lock; it only tightens.
+//!
+//! It is bounded without forgetting anything early. A denial is kept for
+//! its whole window: forgetting the oldest to make room would let that
+//! request prompt again inside its quiet window, and would reset its
+//! root's count toward the auto-deny (review finding F-39). Instead, while
+//! [`MAX_DENIALS`] denials are remembered the store opens no new pending
+//! request ([`FloodControl::full`]; the request is denied with
+//! `denials_full`) until the oldest window ends. Only a pending request
+//! can be denied, so the list holds at most [`MAX_DENIALS`] plus the
+//! pending requests open when it filled. Auto-denied roots leave when
+//! their time passes.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -31,7 +40,9 @@ pub const DENIAL_WINDOW: Duration = Duration::from_secs(600);
 pub const DENIALS_TO_AUTO_DENY: u32 = 3;
 /// How long an auto-denied root stays denied.
 pub const AUTO_DENY: Duration = Duration::from_secs(1800);
-/// The most denials remembered at once.
+/// Denials remembered at once before the store stops opening pending
+/// requests; the list itself holds at most this plus
+/// [`MAX_PENDING`].
 pub const MAX_DENIALS: usize = 64;
 
 /// A denied request: whose, what, and when (awake time).
@@ -77,8 +88,19 @@ impl FloodControl {
         })
     }
 
-    /// Records that a request from `root` was denied. Returns whether this
-    /// denial auto-denied the root.
+    /// Whether [`MAX_DENIALS`] denials are remembered at `now`: no new
+    /// pending request may be opened until the oldest window ends, so no
+    /// denial is ever forgotten early.
+    pub fn full(&self, now: &Now) -> bool {
+        self.denials
+            .iter()
+            .filter(|d| now.awake.saturating_sub(d.at) < DENIAL_WINDOW)
+            .count()
+            >= MAX_DENIALS
+    }
+
+    /// Records that a request from `root` was denied, for its whole
+    /// window. Returns whether this denial auto-denied the root.
     pub fn record_denial(
         &mut self,
         root: ProcessInstance,
@@ -86,9 +108,6 @@ impl FloodControl {
         now: &Now,
     ) -> bool {
         self.expire(now);
-        if self.denials.len() >= MAX_DENIALS {
-            self.denials.remove(0);
-        }
         self.denials.push(Denial {
             root: root.clone(),
             fingerprint,

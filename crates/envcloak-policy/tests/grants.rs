@@ -15,7 +15,7 @@ use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, Slug};
 use envcloak_policy::{
     AUTO_DENY, AccessRequest, Ancestor, ApprovalOptions, ApprovalProof, ApproveError,
     AttemptLimiter, BoundBinding, BoundRef, CatalogSource, ChainEnd, Claims, DENIAL_WINDOW,
-    Decision, DenyReason, EnvName, GrantId, MAX_AGENT_TTL, MAX_GRANTS, MAX_PENDING,
+    Decision, DenyReason, EnvName, GrantId, MAX_AGENT_TTL, MAX_DENIALS, MAX_GRANTS, MAX_PENDING,
     MAX_PENDING_PER_ROOT, MAX_TERMINAL_TTL, MatchBasis, Mode, Now, OptionsError, PENDING_TTL,
     PendingId, ProcessInstance, ProjectIdentity, ProofKind, ProofRefusal, RevokeSelector,
     SubjectEvidence, SubjectKind, Uses, statement_digest,
@@ -568,7 +568,14 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
     ];
     let mut other_field = two();
     other_field[0].binding.field = FieldId::generate();
-    for changed in [three, retargeted, renamed, other_field] {
+    // Each prompts for the difference: the statement marks the bindings
+    // the grant already holds, and asks for the rest.
+    for (changed, new) in [
+        (three, vec!["GITHUB_TOKEN"]),
+        (retargeted, vec!["OPENAI_API_KEY"]),
+        (renamed, vec!["OPENAI_KEY"]),
+        (other_field, vec!["OPENAI_API_KEY"]),
+    ] {
         let mut s = store();
         approve(
             &mut s,
@@ -577,11 +584,44 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
             &now,
         )
         .unwrap();
-        assert!(matches!(
-            s.decide(request(under_agent(), changed, &["./emit"]), &now),
-            Decision::Pending(_)
-        ));
+        let n = changed.len();
+        let id = pending_id(&s.decide(request(under_agent(), changed, &["./emit"]), &now));
+        let d = s.pending_descriptor(&id, &now).unwrap();
+        let asked: Vec<&str> = d
+            .bindings
+            .iter()
+            .filter(|b| !b.granted)
+            .map(|b| b.env_name.as_str())
+            .collect();
+        assert_eq!(asked, new);
+        assert!(d.bindings.iter().any(|b| b.granted), "{d:?}");
+        // Approved, the new grant holds the whole request.
+        let digest = statement_digest(d, &session(600));
+        let g2 = s
+            .approve(&id, proof(terminal()), session(600), digest, &now)
+            .unwrap();
+        assert_eq!(s.grant(g2).unwrap().bindings.len(), n);
     }
+    // A grant held by another root, or for another project, marks
+    // nothing: another agent's request asks for everything.
+    let mut s3 = store();
+    approve(
+        &mut s3,
+        request(under_agent(), two(), &["./emit"]),
+        session(3600),
+        &now,
+    )
+    .unwrap();
+    let mut elsewhere = request(under_agent(), two(), &["./emit"]);
+    elsewhere.project = project("/src/other", 1, 200);
+    let id = pending_id(&s3.decide(elsewhere, &now));
+    assert!(
+        s3.pending_descriptor(&id, &now)
+            .unwrap()
+            .bindings
+            .iter()
+            .all(|b| !b.granted)
+    );
     // A stricter mode is covered by a looser grant, not the reverse.
     let mut proxy = request(under_agent(), two(), &["./emit"]);
     proxy.mode = Mode::Proxy;
@@ -972,6 +1012,107 @@ fn denials_are_remembered_and_three_auto_deny_the_root() {
         let id = pending_id(&s.decide(r(u32::try_from(n).unwrap()), &at));
         assert!(!s.deny(&id, &at).unwrap().root_auto_denied);
     }
+}
+
+/// Review finding F-39: denials from many other roots never make the
+/// store forget one early. With [`MAX_DENIALS`] denials remembered and no
+/// time passing, the first request is still denied as repeated, its
+/// root's count toward the auto-deny still holds, and no new request is
+/// opened for anyone (`denials_full`) until the oldest window ends; the
+/// requests already pending can still be denied, and are remembered too.
+#[test]
+fn a_full_denial_list_forgets_nothing_early() {
+    let it = items();
+    let mut s = store();
+    let now = now_at(0);
+    let first = |n: u32| {
+        request(
+            under_agent(),
+            vec![bound("OPENAI_API_KEY", &it[0])],
+            &[&n.to_string()],
+        )
+    };
+    // The first root is denied twice: one more denial auto-denies it.
+    for n in 0..2 {
+        let id = pending_id(&s.decide(first(n), &now));
+        assert!(!s.deny(&id, &now).unwrap().root_auto_denied);
+    }
+    // Other roots, one denial each, until the list is full, with one more
+    // pending request from the first root and a few from others waiting.
+    let other = |k: i32| {
+        let agent = 2000 + k;
+        request(
+            ev(
+                vec![
+                    p(agent + 10_000, 70, None),
+                    p(agent, 70, Some("fixture")),
+                    p(70, 70, None),
+                    p(1, 1, None),
+                ],
+                false,
+                &[],
+            ),
+            vec![bound("OPENAI_API_KEY", &it[0])],
+            &["x"],
+        )
+    };
+    let last = i32::try_from(MAX_DENIALS).unwrap() - 3;
+    for k in 0..last {
+        let id = pending_id(&s.decide(other(k), &now));
+        assert!(!s.deny(&id, &now).unwrap().root_auto_denied);
+    }
+    let waiting_first = pending_id(&s.decide(first(5), &now));
+    let waiting_other = pending_id(&s.decide(other(999), &now));
+    let id = pending_id(&s.decide(other(last), &now));
+    s.deny(&id, &now).unwrap();
+    let k = last;
+    // 64 denials: nothing new opens, for anyone.
+    assert_eq!(
+        s.decide(other(k + 1), &now),
+        Decision::Denied(DenyReason::DenialsFull)
+    );
+    assert_eq!(
+        s.decide(first(6), &now),
+        Decision::Denied(DenyReason::DenialsFull)
+    );
+    // The first denials are still remembered, and requests already
+    // pending are still returned.
+    for n in 0..2 {
+        assert_eq!(
+            s.decide(first(n), &now),
+            Decision::Denied(DenyReason::Repeated)
+        );
+    }
+    assert_eq!(pending_id(&s.decide(first(5), &now)), waiting_first);
+    // Pending requests can still be denied, past the 64, and count: the
+    // first root's third denial auto-denies it.
+    assert!(s.deny(&waiting_first, &now).unwrap().root_auto_denied);
+    assert!(!s.deny(&waiting_other, &now).unwrap().root_auto_denied);
+    assert_eq!(
+        s.decide(first(0), &now),
+        Decision::Denied(DenyReason::RootDenied)
+    );
+    assert_eq!(
+        s.decide(other(999), &now),
+        Decision::Denied(DenyReason::Repeated)
+    );
+    // Within the window nothing is forgotten; after it, requests open
+    // again.
+    let almost = now_at(DENIAL_WINDOW.as_secs() - 1);
+    assert_eq!(
+        s.decide(other(1), &almost),
+        Decision::Denied(DenyReason::Repeated)
+    );
+    assert_eq!(
+        s.decide(other(10_000), &almost),
+        Decision::Denied(DenyReason::DenialsFull)
+    );
+    let after = now_at(DENIAL_WINDOW.as_secs());
+    assert!(matches!(s.decide(other(1), &after), Decision::Pending(_)));
+    assert_eq!(
+        DenyReason::from_token("denials_full"),
+        Some(DenyReason::DenialsFull)
+    );
 }
 
 // ------------------------------------------------------ attempt limiter

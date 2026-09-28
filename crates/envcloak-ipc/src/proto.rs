@@ -528,7 +528,7 @@ impl ErrorKind {
 /// was rejected, why the vault could not be opened, why the caller's
 /// ancestry could not be read, what is wrong with a manifest or a binding,
 /// and what is wrong with approval options.
-pub const REASONS: [&str; 51] = [
+pub const REASONS: [&str; 52] = [
     // Passphrase rules (envcloak_core::PassphraseRejected).
     "not_text",
     "control_character",
@@ -587,6 +587,7 @@ pub const REASONS: [&str; 51] = [
     "root_denied",
     "pending_per_root",
     "pending_total",
+    "denials_full",
 ];
 
 /// An error response. Built from fixed tokens only.

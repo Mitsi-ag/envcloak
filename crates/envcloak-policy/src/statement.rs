@@ -114,6 +114,10 @@ pub struct BindingSummary {
     pub classification: String,
     /// No adopted project uses the item yet (SPEC §6.4).
     pub first_use: bool,
+    /// A grant in force for this process tree and project already covers
+    /// this binding: the request asks again only because of the others
+    /// (SPEC §10b "prompts for the difference").
+    pub granted: bool,
 }
 
 /// Appends length-prefixed fields: unambiguous whatever the strings hold.
@@ -194,7 +198,8 @@ pub fn canonical_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> Vec<u8
             .str(&b.field)
             .str(&b.field_name)
             .str(&b.classification)
-            .flag(b.first_use);
+            .flag(b.first_use)
+            .flag(b.granted);
     }
     e.str(mode_word(p.mode)).count(p.argv.len());
     for a in &p.argv {
@@ -305,8 +310,28 @@ fn render_argv(argv: &[String]) -> String {
     full
 }
 
+/// One binding as the statement shows it, with its notes.
+fn binding_line(b: &BindingSummary, o: &ApprovalOptions) -> String {
+    let e = escape_for_display;
+    let mut notes = vec![format!("{} key", e(&b.classification))];
+    if b.first_use {
+        notes.push("first use: no project uses this item yet".to_owned());
+    }
+    if o.live.iter().any(|l| l.as_str() == b.env_name) {
+        notes.push("live: allowed by you".to_owned());
+    }
+    format!(
+        "    {} = {}#{}  ({})\n",
+        e(&b.env_name),
+        e(&b.slug),
+        e(&b.field_name),
+        notes.join(", ")
+    )
+}
+
 /// The statement as a person reads it. Every string from the request is
-/// escaped; argv is a list, cut with a marker past [`RENDER_LIMIT`].
+/// escaped; argv is a list, cut with a marker past [`RENDER_LIMIT`]. The
+/// bindings no grant in force covers come first.
 pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
     let e = escape_for_display;
     let mut t = String::with_capacity(1024);
@@ -346,23 +371,31 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
         e(&p.project.manifest),
         e(&p.project.manifest_sha256)
     );
-    let _ = writeln!(t, "  bindings ({} mode):", mode_word(p.mode));
-    for b in &p.bindings {
-        let mut notes = vec![format!("{} key", e(&b.classification))];
-        if b.first_use {
-            notes.push("first use: no project uses this item yet".to_owned());
-        }
-        if o.live.iter().any(|l| l.as_str() == b.env_name) {
-            notes.push("live: allowed by you".to_owned());
-        }
+    // The difference first: what no grant in force covers. The bindings
+    // a grant already covers follow, so the statement still shows all the
+    // new grant will hold.
+    let (new, granted): (Vec<&BindingSummary>, Vec<&BindingSummary>) =
+        p.bindings.iter().partition(|b| !b.granted);
+    if granted.is_empty() {
+        let _ = writeln!(t, "  bindings ({} mode):", mode_word(p.mode));
+    } else {
         let _ = writeln!(
             t,
-            "    {} = {}#{}  ({})",
-            e(&b.env_name),
-            e(&b.slug),
-            e(&b.field_name),
-            notes.join(", ")
+            "  bindings no grant covers yet ({} mode), which this asks for:",
+            mode_word(p.mode)
         );
+    }
+    for b in &new {
+        t.push_str(&binding_line(b, o));
+    }
+    if !granted.is_empty() {
+        let _ = writeln!(
+            t,
+            "  bindings a grant for this process tree and project already covers:"
+        );
+        for b in &granted {
+            t.push_str(&binding_line(b, o));
+        }
     }
     let _ = writeln!(t, "  command ({} arguments):", p.argv.len());
     t.push_str(&render_argv(&p.argv));

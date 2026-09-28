@@ -43,6 +43,7 @@ fn descriptor(argv: Vec<String>) -> PendingDescriptor {
                 field_name: "value".to_owned(),
                 classification: "test".to_owned(),
                 first_use: true,
+                granted: false,
             },
             BindingSummary {
                 env_name: "STRIPE_SECRET_KEY".to_owned(),
@@ -52,6 +53,7 @@ fn descriptor(argv: Vec<String>) -> PendingDescriptor {
                 field_name: "value".to_owned(),
                 classification: "live".to_owned(),
                 first_use: false,
+                granted: false,
             },
         ],
         mode: Mode::Inject,
@@ -205,6 +207,9 @@ fn the_canonical_statement_is_unambiguous_and_covers_the_options() {
     let mut binding = d.clone();
     binding.bindings[0].item = "01ARZ3NDEKTSV4RRFFQ69G5FAZ".to_owned();
     assert_ne!(canonical_statement(&binding, &o), bytes);
+    let mut granted = d.clone();
+    granted.bindings[1].granted = true;
+    assert_ne!(canonical_statement(&granted, &o), bytes);
     let mut mode = d.clone();
     mode.mode = Mode::Proxy;
     assert_ne!(canonical_statement(&mode, &o), bytes);
@@ -238,5 +243,32 @@ fn descriptors_and_options_cross_the_wire_as_json() {
     assert!(
         serde_json::from_str::<ApprovalOptions>(r#"{"uses":"once","ttl_secs":1,"live":[],"x":1}"#)
             .is_err()
+    );
+}
+
+/// Gate 28's statement: when a grant already covers some of a request's
+/// bindings, the statement asks for the difference first and lists the
+/// rest apart; the new grant holds them all, so all are shown.
+#[test]
+fn the_statement_asks_for_the_difference_first() {
+    let d = descriptor(strings(&["./emit"]));
+    let text = render_statement(&d, &opts());
+    assert!(text.contains("  bindings (inject mode):"), "{text}");
+    assert!(!text.contains("already covers"), "{text}");
+
+    let mut d = d;
+    d.bindings[0].granted = true;
+    let text = render_statement(&d, &opts());
+    let asks = text
+        .find("which this asks for:")
+        .unwrap_or_else(|| panic!("{text}"));
+    let covered = text
+        .find("already covers:")
+        .unwrap_or_else(|| panic!("{text}"));
+    let stripe = text.find("STRIPE_SECRET_KEY = ").unwrap();
+    let openai = text.find("OPENAI_API_KEY = ").unwrap();
+    assert!(
+        asks < stripe && stripe < covered && covered < openai,
+        "{text}"
     );
 }

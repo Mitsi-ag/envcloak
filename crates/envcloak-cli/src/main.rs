@@ -24,7 +24,10 @@
 //! `--hold`, prints `ready` and waits for stdin to close, so a test can
 //! inspect the live process from outside.
 //!
-//! No argument is ever echoed: one could be a pasted secret.
+//! No argument is ever echoed: one could be a pasted secret. An argument
+//! that is not valid UTF-8 is refused as a usage error, before anything
+//! else, rather than changed: the command line `run` sends for approval
+//! must be the one it was given.
 
 mod cmd;
 mod connect;
@@ -56,7 +59,18 @@ fn main() -> ExitCode {
     envcloak_sys::harden_process();
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
+    // An argument that is not UTF-8 is refused, never replaced: `run` sends
+    // its command line for the approval statement, which must show every
+    // argument as it is (SPEC §10a), and this build carries text only. The
+    // argument is not echoed.
+    let Some(args) = args
+        .iter()
+        .map(|a| a.to_str())
+        .collect::<Option<Vec<&str>>>()
+    else {
+        eprintln!("envcloak: an argument is not valid UTF-8, which this build does not take");
+        return ExitCode::from(USAGE);
+    };
     match args.as_slice() {
         ["--version"] | ["-V"] => {
             println!("envcloak {}", env!("CARGO_PKG_VERSION"));

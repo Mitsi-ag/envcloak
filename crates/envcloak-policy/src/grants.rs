@@ -24,7 +24,9 @@
 //!
 //! A manifest change that leaves the bindings a subset does not prompt;
 //! the daemon audits the new hash. Any added or changed binding prompts
-//! for the whole request, whose statement shows every binding.
+//! for the difference: the statement asks for the bindings no grant in
+//! force for the caller and project covers, and lists the ones a grant
+//! already covers apart, since the new grant holds the whole request.
 //!
 //! **Lifetimes.** Agent (and unknown) grants last [`DEFAULT_TTL`] by
 //! default and [`MAX_AGENT_TTL`] at most; terminal grants
@@ -258,15 +260,22 @@ impl Grant {
     /// Whether the grant covers `r` by rules 5 to 7 (the project, the
     /// bindings and the mode). Rules 3 and 4 are the evidence's.
     fn covers(&self, r: &AccessRequest) -> bool {
-        self.project == r.project
-            && r.mode >= self.mode
-            && r.bindings.iter().all(|b| {
-                self.bindings.iter().any(|g| {
-                    g.env_name == b.binding.env_name
-                        && g.item == b.binding.item
-                        && g.field == b.binding.field
-                })
-            })
+        self.covers_project_and_mode(r) && r.bindings.iter().all(|b| self.has_binding(b))
+    }
+
+    /// Rules 5 and 7: the same project, and a mode at least as strict.
+    fn covers_project_and_mode(&self, r: &AccessRequest) -> bool {
+        self.project == r.project && r.mode >= self.mode
+    }
+
+    /// Whether the grant holds binding `b`, by (env name, item id, field
+    /// id).
+    fn has_binding(&self, b: &BoundRef) -> bool {
+        self.bindings.iter().any(|g| {
+            g.env_name == b.binding.env_name
+                && g.item == b.binding.item
+                && g.field == b.binding.field
+        })
     }
 }
 
@@ -293,6 +302,9 @@ pub enum DenyReason {
     PendingPerRoot,
     /// The daemon has 20 pending requests already.
     PendingTotal,
+    /// 64 requests were denied within their windows: no new request is
+    /// opened until the oldest window ends, so none is forgotten early.
+    DenialsFull,
 }
 
 impl DenyReason {
@@ -303,6 +315,7 @@ impl DenyReason {
             DenyReason::RootDenied => "root_denied",
             DenyReason::PendingPerRoot => "pending_per_root",
             DenyReason::PendingTotal => "pending_total",
+            DenyReason::DenialsFull => "denials_full",
         }
     }
 
@@ -313,6 +326,7 @@ impl DenyReason {
             DenyReason::RootDenied,
             DenyReason::PendingPerRoot,
             DenyReason::PendingTotal,
+            DenyReason::DenialsFull,
         ]
         .into_iter()
         .find(|r| r.token() == t)
@@ -329,6 +343,10 @@ impl DenyReason {
                 "this process tree already has 3 requests waiting for approval"
             }
             DenyReason::PendingTotal => "20 requests are already waiting for approval",
+            DenyReason::DenialsFull => {
+                "64 requests were denied in the last 10 minutes; new requests wait until the \
+                 oldest of those denials is 10 minutes old"
+            }
         }
     }
 }
@@ -479,21 +497,40 @@ impl GrantStore {
         self.flood.expire(now);
     }
 
+    /// Whether grant `g` is in force at `now` for `r`'s caller: not
+    /// expired, of the current epochs, and rooted where it may cover the
+    /// caller (rules 1 to 4).
+    fn in_force_for(&self, g: &Grant, r: &AccessRequest, now: &Now) -> bool {
+        !g.expired(now)
+            && g.vault_epoch == self.vault_epoch
+            && g.policy_epoch == self.policy_epoch
+            && r.subject.covered_by(&g.root, g.kind)
+    }
+
     /// The grant that covers `r`, a session grant before a once grant.
     fn covering(&self, r: &AccessRequest, now: &Now) -> Option<GrantId> {
-        let live = |g: &&Grant| {
-            !g.expired(now)
-                && g.vault_epoch == self.vault_epoch
-                && g.policy_epoch == self.policy_epoch
-                && r.subject.covered_by(&g.root, g.kind)
-                && g.covers(r)
-        };
+        let live = |g: &&Grant| self.in_force_for(g, r, now) && g.covers(r);
         self.grants
             .values()
             .filter(live)
             .find(|g| g.uses == Uses::Session)
             .or_else(|| self.grants.values().find(live))
             .map(|g| g.id)
+    }
+
+    /// For each binding of `r`, whether a grant in force for its caller,
+    /// project and mode already holds it: what the statement lists apart
+    /// from the difference it asks for.
+    fn granted_bindings(&self, r: &AccessRequest, now: &Now) -> Vec<bool> {
+        let grants: Vec<&Grant> = self
+            .grants
+            .values()
+            .filter(|g| self.in_force_for(g, r, now) && g.covers_project_and_mode(r))
+            .collect();
+        r.bindings
+            .iter()
+            .map(|b| grants.iter().any(|g| g.has_binding(b)))
+            .collect()
     }
 
     /// Decides `r` at `now`: covered, pending or denied. See the module
@@ -526,13 +563,20 @@ impl GrantStore {
         if self.pending.len() >= MAX_PENDING {
             return Decision::Denied(DenyReason::PendingTotal);
         }
+        // Every denial is kept for its whole window: with the list full,
+        // no request is opened that a person could deny.
+        if self.flood.full(now) {
+            return Decision::Denied(DenyReason::DenialsFull);
+        }
         let id = loop {
             let id = PendingId::generate();
             if !self.pending.contains_key(&id) {
                 break id;
             }
         };
-        self.pending.insert(id, Pending::open(id, r, fp, now));
+        let granted = self.granted_bindings(&r, now);
+        self.pending
+            .insert(id, Pending::open(id, r, fp, &granted, now));
         Decision::Pending(id)
     }
 

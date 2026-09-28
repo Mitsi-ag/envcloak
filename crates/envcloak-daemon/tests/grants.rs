@@ -260,9 +260,27 @@ fn a_request_is_pending_until_approved_then_covered() {
     profile.profile = Some("short".to_owned());
     let mut ids = Vec::new();
     let mut denied = 0;
-    for p in [added, retargeted, renamed, profile] {
+    // Each prompts for the difference: the statement asks for the
+    // bindings the grant does not hold and marks the ones it does.
+    for (p, new) in [
+        (added, "GITHUB_TOKEN"),
+        (retargeted, "OPENAI_API_KEY"),
+        (renamed, "OPENAI_KEY"),
+        (profile, "SHORT_TOKEN"),
+    ] {
         match client(&f.home).run_request(&p).unwrap() {
-            DecisionView::Pending { request } => ids.push(request),
+            DecisionView::Pending { request } => {
+                let d = c.pending_get(&request, &[]).unwrap();
+                let asked: Vec<&str> = d
+                    .bindings
+                    .iter()
+                    .filter(|b| !b.granted)
+                    .map(|b| b.env_name.as_str())
+                    .collect();
+                assert_eq!(asked, vec![new], "{d:?}");
+                assert!(d.bindings.iter().any(|b| b.granted), "{d:?}");
+                ids.push(request);
+            }
             DecisionView::Denied { reason } => {
                 assert_eq!(reason, DenyReason::PendingPerRoot.token());
                 denied += 1;

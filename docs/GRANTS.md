@@ -28,10 +28,10 @@ A grant records what SPEC §10b lists: the root process instance (pid and start 
 2. G was made under the vault's current epoch and the current policy epoch;
 3. G's root is in R's kernel-verified chain, pid and start time alike, and no known agent sits between the root and the caller unless the root is that agent; a grant approved for a terminal subject covers only a terminal subject (docs/AGENTS.md "Coverage");
 4. R's project identity equals G's: a symlinked path to the same directory keeps it, a copy (another inode) or a move (another canonical path) is another project;
-5. R's bindings are a subset of G's, compared by (variable, item id, field id): a renamed or retargeted variable, an added reference, another field or a profile switch each prompt again, for the whole request;
+5. R's bindings are a subset of G's, compared by (variable, item id, field id): a renamed or retargeted variable, an added reference, another field or a profile switch each prompt again, for the difference (below);
 6. R's mode is at least as strict as G's.
 
-A manifest change that leaves the bindings a subset does not prompt; the daemon audits `manifest changed grant=<id>` and the decision says `manifest_changed`. When a session grant and a once grant both cover a request, the session grant is used and the once grant kept.
+A manifest change that leaves the bindings a subset does not prompt; the daemon audits `manifest changed grant=<id>` and the decision says `manifest_changed`. A request that is not covered only because of some of its bindings prompts for the difference (SPEC §10b): each binding a grant in force for the same caller, project and mode already holds is marked `granted` in the pending request, and the statement asks for the others first and lists these apart. The new grant holds the whole request, so its statement still shows every binding. When a session grant and a once grant both cover a request, the session grant is used and the once grant kept.
 
 **Once.** A `once` grant is used up by the first request it covers. The decision and the consumption happen under one lock, so of concurrent requests exactly one is covered; the others are pending, and identical ones share one pending request.
 
@@ -73,7 +73,7 @@ The descriptor (`envcloak_policy::PendingDescriptor`) holds: the request id, the
 - At most 3 pending requests per root and 20 per daemon; a request beyond either is denied (`pending_per_root`, `pending_total`).
 - A request identical to one denied in the last 10 minutes is denied without a prompt (`repeated`).
 - Three denials for one root within 10 minutes deny that root for 30 minutes (`root_denied`); the daemon logs a notice, until there is a surface for a notification (M3).
-- Denials are remembered for 10 minutes and at most 64 at a time; this state outlives a lock, since it only tightens.
+- Denials are remembered for their whole 10 minutes, and this state outlives a lock, since it only tightens. None is forgotten early to make room: while 64 are remembered, no new pending request is opened (`denials_full`) until the oldest is 10 minutes old, so a denied request never prompts again inside its window and a root's count toward the auto-deny is never reset. Only a pending request can be denied, so at most 64 plus the 20 pending requests are held.
 - The passphrase attempt limiter is one for every proof: after 5 failures, each further attempt must wait, 30 seconds after the fifth failure and twice as long after each failure beyond it, up to an hour; an attempt that comes early is refused without a passphrase being checked. A success clears it. `envcloak status` shows the failures and the wait.
 - Windows count time awake: a machine asleep serves none of them.
 
@@ -85,10 +85,10 @@ The descriptor (`envcloak_policy::PendingDescriptor`) holds: the request id, the
 | 24: a loosening manifest with a scripted agent still needs approval, and redaction stays on | `crates/envcloak-cli/tests/approve.rs` |
 | 25, the grant half: a terminal grant does not cover the agent under it | `crates/envcloak-cli/tests/approve.rs`, `crates/envcloak-policy/tests/grants.rs` |
 | 27: a recycled root pid is not covered | `crates/envcloak-policy/tests/grants.rs` (synthetic instances; the daemon matches on the same evidence) |
-| 28: binding changes prompt for the difference; a comment-only change is covered and audited; a copy or move is a new identity, a symlink keeps it | `crates/envcloak-daemon/tests/grants.rs`, `crates/envcloak-policy/tests/grants.rs` |
+| 28: binding changes prompt for the difference (the statement asks for exactly the bindings no grant holds); a comment-only change is covered and audited; a copy or move is a new identity, a symlink keeps it | `crates/envcloak-daemon/tests/grants.rs`, `crates/envcloak-policy/tests/grants.rs` and `statement.rs` |
 | 29: wall-clock and awake-time expiry apart; revoke without a proof; lock, restart, sleep and root exit end grants | `crates/envcloak-policy/tests/grants.rs`, `crates/envcloak-daemon/tests/grants.rs`, `crates/envcloak-cli/tests/approve.rs` |
 | 30: concurrent requests on a `once` grant, exactly one covered | `crates/envcloak-daemon/tests/grants.rs`, `crates/envcloak-policy/tests/grants.rs` |
 | 31: escapes, `\r`, U+202E, zero-width characters and 100 KB of argv render escaped and truncated; the statement covers the full argv | `crates/envcloak-policy/tests/statement.rs`, `crates/envcloak-cli/tests/approve.rs` |
-| 32: the pending caps, three denials, the attempt limiter | `crates/envcloak-policy/tests/grants.rs`, `crates/envcloak-daemon/tests/grants.rs` |
+| 32: the pending caps, three denials, denials kept for their whole window, the attempt limiter | `crates/envcloak-policy/tests/grants.rs`, `crates/envcloak-daemon/tests/grants.rs` |
 
 The daemon and CLI tests unlock and approve as a terminal subject: the CLI tests run those commands leading a session on a pseudo-terminal of their own (`run_on_terminal`), and the daemon tests make the test process itself a terminal session (`envcloak_sys::testing::enter_terminal_session`). They need no agent in the ancestry, as CI has. Under a developer's Claude Code those proofs are refused, as SPEC §10b requires; run the tests outside the agent's tree then (on macOS, `launchctl submit` runs a command under `launchd`, and `script` gives it a terminal). The service-manager cases run where `ENVCLOAK_TEST_SERVICE_MANAGER=1`, as in CI.

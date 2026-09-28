@@ -841,6 +841,44 @@ fn a_service_managers_job_gives_no_proof() {
     f.sweep();
 }
 
+/// Gate 31: a command line with an argument that is not UTF-8 is refused
+/// as a usage error before anything is sent. It is never shown, or
+/// approved, as something else: replaced by an empty string, two distinct
+/// commands and one with an empty argument would read the same.
+#[test]
+fn a_command_line_that_is_not_utf8_is_refused() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let f = Fixture::new();
+    for bad in [&b"\xff"[..], b"a\xc3", b"\xe2\x82", b"ok\xed\xa0\x80"] {
+        let mut cmd = cli_command(&f.home, &["run", "--", "./emit"], &[]);
+        cmd.current_dir(&f.project)
+            .arg(std::ffi::OsStr::from_bytes(bad));
+        let out = finish_within(cmd, Duration::from_secs(60));
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(stderr(&out).contains("not valid UTF-8"), "{}", stderr(&out));
+        assert!(
+            !out.stderr.windows(bad.len()).any(|w| w == bad),
+            "the argument was echoed"
+        );
+    }
+    let status = stdout(&run(&f.home, &["status"], &[]));
+    assert!(
+        status.contains("grants: 0 in force, 0 waiting for approval"),
+        "{status}"
+    );
+    // An empty argument is an argument, and the statement shows it.
+    let mut cmd = cli_command(&f.home, &["run", "--", "./emit", ""], &[]);
+    cmd.current_dir(&f.project);
+    let out = finish_within(cmd, Duration::from_secs(60));
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    let id = request_id(&stderr(&out));
+    let shown = f.approve(&id, &["--once"]);
+    assert!(shown.contains("command (2 arguments):"), "{shown}");
+    assert!(shown.contains("    [1] \n"), "{shown:?}");
+    f.sweep();
+}
+
 /// Gate 24: a manifest that tries to loosen policy (`redact = false`,
 /// `mode = "inject"`) changes nothing: the agent's request still needs an
 /// approval, and its output stays redacted. `agents = "allow"` does not

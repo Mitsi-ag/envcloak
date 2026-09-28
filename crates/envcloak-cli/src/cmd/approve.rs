@@ -55,17 +55,20 @@ struct ApproveArgs {
 
 /// `<n>s`, `<n>m` or `<n>h`, from 30 seconds to 24 hours.
 fn parse_duration(s: &str) -> Option<Duration> {
-    let (digits, unit) = s.split_at(s.len().checked_sub(1)?);
+    // The unit is matched as a suffix, never split off at a byte offset: a
+    // value ending in a multi-byte character fails like any other bad
+    // input instead of panicking inside that character.
+    let (digits, per_unit) = if let Some(d) = s.strip_suffix('s') {
+        (d, 1)
+    } else if let Some(d) = s.strip_suffix('m') {
+        (d, 60)
+    } else {
+        (s.strip_suffix('h')?, 3600)
+    };
     if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let n: u64 = digits.parse().ok()?;
-    let secs = match unit {
-        "s" => n,
-        "m" => n.checked_mul(60)?,
-        "h" => n.checked_mul(3600)?,
-        _ => return None,
-    };
+    let secs = digits.parse::<u64>().ok()?.checked_mul(per_unit)?;
     let d = Duration::from_secs(secs);
     (Duration::from_secs(30)..=MAX_AGENT_TTL)
         .contains(&d)
@@ -198,7 +201,23 @@ mod tests {
         assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
         assert_eq!(parse_duration("90m"), Some(Duration::from_secs(5400)));
         assert_eq!(parse_duration("24h"), Some(MAX_AGENT_TTL));
-        for bad in ["", "h", "1", "29s", "25h", "1.5h", "8H", "-1h", "9999999h"] {
+        for bad in [
+            "",
+            "h",
+            "1",
+            "29s",
+            "25h",
+            "1.5h",
+            "8H",
+            "-1h",
+            "9999999h",
+            // A multi-byte last character is refused, never split inside.
+            "1\u{e9}",
+            "1\u{20ac}",
+            "1\u{1F600}",
+            "1\u{ff48}",
+            "\u{e9}",
+        ] {
             assert_eq!(parse_duration(bad), None, "{bad}");
         }
         let a = parse(&["ABCDEFGH"]).unwrap();

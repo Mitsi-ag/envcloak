@@ -70,15 +70,17 @@ pub struct Pending {
 }
 
 impl Pending {
-    /// Opens `request` as pending request `id` at `now`.
+    /// Opens `request` as pending request `id` at `now`. `granted` says,
+    /// binding by binding, whether a grant in force already covers it.
     pub(crate) fn open(
         id: PendingId,
         request: AccessRequest,
         fingerprint: [u8; 32],
+        granted: &[bool],
         now: &Now,
     ) -> Self {
         let nonce: [u8; 32] = ids::random();
-        let descriptor = describe(id, &nonce, &request, now);
+        let descriptor = describe(id, &nonce, &request, granted, now);
         Pending {
             id,
             nonce,
@@ -109,7 +111,13 @@ pub(crate) fn classification_word(c: Classification) -> &'static str {
 }
 
 /// The descriptor an approval surface receives for `r`.
-fn describe(id: PendingId, nonce: &[u8; 32], r: &AccessRequest, now: &Now) -> PendingDescriptor {
+fn describe(
+    id: PendingId,
+    nonce: &[u8; 32],
+    r: &AccessRequest,
+    granted: &[bool],
+    now: &Now,
+) -> PendingDescriptor {
     let root = r.subject.root();
     let kind = r.subject.kind();
     let label = match kind {
@@ -147,7 +155,8 @@ fn describe(id: PendingId, nonce: &[u8; 32], r: &AccessRequest, now: &Now) -> Pe
         bindings: r
             .bindings
             .iter()
-            .map(|b| BindingSummary {
+            .enumerate()
+            .map(|(k, b)| BindingSummary {
                 env_name: b.binding.env_name.as_str().to_owned(),
                 slug: b.slug.as_str().to_owned(),
                 item: b.binding.item.to_string(),
@@ -155,6 +164,7 @@ fn describe(id: PendingId, nonce: &[u8; 32], r: &AccessRequest, now: &Now) -> Pe
                 field_name: b.field_name.as_str().to_owned(),
                 classification: classification_word(b.binding.classification).to_owned(),
                 first_use: b.first_use,
+                granted: granted.get(k).copied().unwrap_or(false),
             })
             .collect(),
         mode: r.mode,
