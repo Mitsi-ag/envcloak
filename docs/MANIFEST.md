@@ -100,7 +100,7 @@ Each binding is then tied to the vault's items. A reference names a secret item 
 
 ## Env files
 
-A `--env-file` is a dotenv-style file of at most 1 MiB. It can hold real values, so the CLI reads it into `SecretBytes`, and the parser copies each value only into a `SecretBuf` sized for it.
+A `--env-file` is a dotenv-style file of at most 1 MiB. It can hold real values, so the CLI reads it into `SecretBytes`, and the parser copies each value only into a `SecretBuf` sized for it. The CLI reads only a regular file, opened without blocking. It sends the daemon the file's references and the names of its ordinary variables, each with its line (`EnvFileNames`), never a value: the daemon resolves the run's bindings from those, and the runner sets the ordinary variables for the command.
 
 - Blank lines and lines starting with `#` are skipped. A byte-order mark before the first line is skipped. Lines end in LF or CRLF.
 - Each entry is `[export ]NAME=value`, with blanks allowed around `=`. A variable may appear once.

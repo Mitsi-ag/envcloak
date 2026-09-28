@@ -261,13 +261,19 @@ fn errors_never_carry_a_value() {
     let file = format!("A='{}'\n", c.as_str().replace('\'', ""));
     let r = parse(file.as_bytes());
     assert_no_canary(format!("{r:?}").as_bytes(), &cs);
+    // Nor do the names the daemon is sent.
+    let names = r.names();
+    assert_eq!(names.plain.len(), 1);
+    assert_eq!(names.plain[0].name.as_str(), "A");
+    assert_no_canary(format!("{names:?}").as_bytes(), &cs);
 }
 
 #[test]
 fn env_file_entries_join_the_resolution() {
     let m = parse_manifest(b"[env]\nA = \"a/one\"\nB = \"b/one\"\nC = \"c/one\"\n").unwrap();
     let file = parse(b"B=envcloak://b/two#k\nC=plain value\nD=envcloak://d/one\n");
-    let got = resolve(&m, None, &[], Some(&file)).unwrap();
+    let names = file.names();
+    let got = resolve(&m, None, &[], Some(&names)).unwrap();
     let want: Vec<Binding> = [("A", "a/one"), ("B", "b/two#k"), ("D", "d/one")]
         .iter()
         .map(|(n, r)| Binding {
@@ -281,7 +287,7 @@ fn env_file_entries_join_the_resolution() {
     // `--ref` and `--env-file` may not both name a variable.
     for name in ["B", "C"] {
         let refs = [Binding::parse_arg(&format!("{name}=x/y")).unwrap()];
-        let e = resolve(&m, None, &refs, Some(&file)).unwrap_err();
+        let e = resolve(&m, None, &refs, Some(&names)).unwrap_err();
         assert_eq!(e.kind(), ManifestErrorKind::DuplicateEnvName, "{name}");
         assert_eq!(e.origin(), Some(Origin::Ref { index: 0 }));
     }

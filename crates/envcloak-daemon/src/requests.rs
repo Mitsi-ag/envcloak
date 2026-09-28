@@ -6,8 +6,10 @@
 //! 1. reads the caller's evidence from the kernel ([`gather`]), with the
 //!    marker names the caller claims;
 //! 2. opens the manifest itself, from the path the caller sent, and
-//!    resolves the bindings from the file it read ([`load_project`],
-//!    [`resolve`]); the caller's argv is display text only;
+//!    resolves the bindings from the file it read, the profile, the
+//!    `--ref` arguments and the `--env-file` references and names the CLI
+//!    sent ([`load_project`], [`resolve`]); the caller's argv is display
+//!    text only;
 //! 3. binds them to the vault's items ([`bind_items`]), and looks up
 //!    whether the project and the items are new to the vault (SPEC §6.4
 //!    "Adoption");
@@ -34,7 +36,8 @@ use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{Vault, VaultErrorKind};
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{
-    ApproveParams, ErrorKind, PendingGetParams, RequestParams, RevokeParams, RunRequestParams,
+    ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, RequestParams, RevokeParams,
+    RunRequestParams,
 };
 use envcloak_ipc::view::{
     ApprovedView, DecisionView, DeniedView, GrantBindingView, GrantView, GrantsView, RevokedView,
@@ -185,6 +188,14 @@ pub fn run_request(
         .map(|r| Binding::parse_arg(r))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| RpcError::with_reason(ErrorKind::BindingUnresolved, "invalid_reference"))?;
+    // `--env-file`'s references and the names of its ordinary variables,
+    // checked as `--ref` is; its values never cross.
+    let env_file = p
+        .env_file
+        .as_ref()
+        .map(EnvFileParams::names)
+        .transpose()
+        .map_err(|_| RpcError::with_reason(ErrorKind::BindingUnresolved, "invalid_reference"))?;
     let manifest_path = Path::new(&p.manifest);
     if !manifest_path.is_absolute() {
         return Err(RpcError::with_reason(
@@ -195,8 +206,13 @@ pub fn run_request(
     // The daemon opens the manifest itself; nothing the caller sent about
     // its contents is used.
     let project = load_project(manifest_path).map_err(manifest_error)?;
-    let bindings =
-        resolve(&project.manifest, profile.as_ref(), &refs, None).map_err(manifest_error)?;
+    let bindings = resolve(
+        &project.manifest,
+        profile.as_ref(),
+        &refs,
+        env_file.as_ref(),
+    )
+    .map_err(manifest_error)?;
     let kind = subject.kind();
     let policy = effective_policy(
         &VaultProjectPolicy::default(),

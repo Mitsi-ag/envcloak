@@ -63,6 +63,43 @@ pub struct PlainVar {
     pub value: SecretBytes,
 }
 
+/// What a run's resolution needs of an env file, and all the daemon is
+/// sent of it (SPEC §6.1 step 2): its references and the names of its
+/// ordinary variables, each with its line. Never a value: an ordinary
+/// variable's value stays with `envcloak run`, which sets it for the
+/// command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvFileNames {
+    pub refs: Vec<EnvFileRef>,
+    pub plain: Vec<PlainName>,
+}
+
+/// An ordinary variable's name and line, without its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainName {
+    /// The line the entry starts on, from 1.
+    pub line: u32,
+    pub name: EnvName,
+}
+
+impl EnvFileRefs {
+    /// The file's references and the names of its ordinary variables,
+    /// without their values.
+    pub fn names(&self) -> EnvFileNames {
+        EnvFileNames {
+            refs: self.refs.clone(),
+            plain: self
+                .plain
+                .iter()
+                .map(|p| PlainName {
+                    line: p.line,
+                    name: p.name.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// What is wrong with an env file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]

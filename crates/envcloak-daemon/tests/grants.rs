@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use common::{MANIFEST, SLUGS, client, data_dir, passphrase, project, seed_vault, start};
 use envcloak_core::SecretBytes;
 use envcloak_core::vault::VaultPaths;
-use envcloak_ipc::proto::{ErrorKind, RunRequestParams};
+use envcloak_ipc::proto::{EnvFileLine, EnvFileParams, ErrorKind, RunRequestParams};
 use envcloak_ipc::view::{DecisionView, VaultState};
 use envcloak_ipc::{Client, ClientError};
 use envcloak_policy::{
@@ -74,6 +74,7 @@ impl Fixture {
             manifest: self.manifest.clone(),
             profile: None,
             refs: Vec::new(),
+            env_file: None,
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             claims: Vec::new(),
         }
@@ -340,6 +341,99 @@ fn a_request_is_pending_until_approved_then_covered() {
         rpc_kind(c.grants_revoke(Some("nope")).unwrap_err()).0,
         ErrorKind::InvalidParams
     );
+    f.sweep();
+}
+
+/// Gate 28 through `--env-file`: an env file's references join the
+/// resolution, so one naming an ungranted item, or retargeting a granted
+/// variable, prompts for exactly that binding, and the statement lists
+/// the granted ones apart. References and ordinary variables that leave
+/// the bindings a subset are covered. What `envcloak run` sends of the
+/// file is its references and names (`EnvFileParams`); the CLI's own
+/// reading of a file is in `crates/envcloak-cli/tests/approve.rs`.
+#[test]
+fn an_env_file_prompts_for_its_ungranted_references() {
+    let f = Fixture::new();
+    let mut c = client(&f.home);
+    let id = pending(&f.request(&["./emit"]));
+    let grant = f.approve_ok(&id, session(3600));
+    let with = |refs: &[&str], plain: &[&str]| {
+        let line = |(n, text): (usize, &&str)| EnvFileLine {
+            line: u32::try_from(n + 1).unwrap(),
+            text: (*text).to_owned(),
+        };
+        let mut p = f.params(&["./emit"]);
+        p.env_file = Some(EnvFileParams {
+            refs: refs.iter().enumerate().map(line).collect(),
+            plain: plain.iter().enumerate().map(line).collect(),
+        });
+        p
+    };
+    let ask = |p: &RunRequestParams| client(&f.home).run_request(p);
+
+    // Granted references only, an ordinary variable in place of a bound
+    // one, or an empty file: a subset, covered.
+    for p in [
+        with(&["OPENAI_API_KEY=openai/acme-web"], &[]),
+        with(&[], &["STRIPE_SECRET_KEY", "PLAIN"]),
+        with(&[], &[]),
+    ] {
+        assert_eq!(covered(&ask(&p).unwrap()), grant, "{p:?}");
+    }
+
+    // An ungranted item, and a granted variable retargeted: each asks for
+    // exactly that binding and lists the rest as already covered.
+    let added = with(&["GITHUB_TOKEN=github/acme-web"], &["PLAIN"]);
+    let retargeted = with(&["OPENAI_API_KEY=github/acme-web"], &[]);
+    let mut ids = Vec::new();
+    for (p, asked_for, held) in [
+        (
+            &added,
+            vec!["GITHUB_TOKEN"],
+            vec!["OPENAI_API_KEY", "STRIPE_SECRET_KEY"],
+        ),
+        (
+            &retargeted,
+            vec!["OPENAI_API_KEY"],
+            vec!["STRIPE_SECRET_KEY"],
+        ),
+    ] {
+        let id = pending(&ask(p).unwrap());
+        let d = c.pending_get(&id, &[]).unwrap();
+        let names = |granted: bool| -> Vec<&str> {
+            d.bindings
+                .iter()
+                .filter(|b| b.granted == granted)
+                .map(|b| b.env_name.as_str())
+                .collect()
+        };
+        assert_eq!(names(false), asked_for, "{d:?}");
+        assert_eq!(names(true), held, "{d:?}");
+        ids.push(id);
+    }
+    // Approved, the new grant holds the whole request and covers it.
+    let g2 = f.approve_ok(&ids[0], session(600));
+    assert_ne!(g2, grant);
+    assert_eq!(covered(&ask(&added).unwrap()), g2);
+
+    // An item the vault lacks, a variable named by both `--ref` and the
+    // file, and an entry that is not a reference are unresolved, and
+    // nothing is pending for them.
+    let mut both = with(&["GITHUB_TOKEN=github/acme-web"], &[]);
+    both.refs = vec!["GITHUB_TOKEN=openai/acme-web".to_owned()];
+    for (p, reason) in [
+        (with(&["NOPE=nope/acme-web"], &[]), None),
+        (both, Some("duplicate_env_name")),
+        (with(&["GITHUB_TOKEN"], &[]), Some("invalid_reference")),
+        (with(&[], &["NOT A NAME"]), Some("invalid_reference")),
+    ] {
+        let (kind, why) = rpc_kind(ask(&p).unwrap_err());
+        assert_eq!(kind, ErrorKind::BindingUnresolved, "{p:?}");
+        if reason.is_some() {
+            assert_eq!(why, reason, "{p:?}");
+        }
+    }
+    assert_eq!(c.status().unwrap().approvals.pending, 1);
     f.sweep();
 }
 
@@ -673,6 +767,7 @@ fn a_tampered_vault_gives_no_decision_and_takes_no_proof() {
             manifest: manifest.to_str().unwrap().to_owned(),
             profile: None,
             refs: Vec::new(),
+            env_file: None,
             argv: vec!["./emit".to_owned()],
             claims: Vec::new(),
         })

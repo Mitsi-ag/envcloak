@@ -1,8 +1,8 @@
 //! Approvals with real agents and terminals (SPEC §6.1 step 4, §10a,
 //! §10b; the story's S4 to S6 decisions): gate 23 (forged approvals), 24
 //! (manifest self-authorization), 25's grant half (a grant for the
-//! terminal does not cover the agent), 29's root exit, and 31 as the CLI
-//! shows a statement.
+//! terminal does not cover the agent), 28 through `--env-file`, 29's root
+//! exit, and 31 as the CLI shows a statement.
 //!
 //! The agent is `fixture-agent` (envcloak-testkit), which the builtin
 //! catalog knows, running a shell that takes one command after another,
@@ -425,6 +425,85 @@ fn an_agents_request_needs_a_persons_approval() {
         stderr(&out).starts_with("envcloak: approval_denied:"),
         "{}",
         stderr(&out)
+    );
+    drop(agent);
+    f.sweep();
+}
+
+/// Gate 28 with a real `envcloak run --env-file`: the agent's env file
+/// names an item no grant holds, so its run prompts for exactly that
+/// binding, and the statement lists the granted ones apart as also held
+/// by the new grant. The file's ordinary variable holds a value, which
+/// never reaches the daemon, its log or any output. A malformed file is
+/// refused with its line and kind, and nothing from it is echoed.
+#[test]
+fn an_env_file_naming_an_ungranted_item_prompts_for_it() {
+    let f = Fixture::new();
+    let mut agent = f.agent();
+    let out = agent.run(&["--", "./emit"]);
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    let grant = grant_id(&f.approve(&request_id(&stderr(&out)), &["--for", "1h"]));
+
+    let value = by_label(&f.cs, labels::DATABASE_URL)
+        .as_str()
+        .replace('\'', "");
+    let env = f.files.path().join("env.refs");
+    std::fs::write(
+        &env,
+        format!(
+            "# the agent's env file\n\
+             GITHUB_TOKEN=envcloak://github/acme-web\n\
+             export PLAIN_SETTING='{value}'\n"
+        ),
+    )
+    .unwrap();
+    let env = env.to_str().unwrap();
+    let out = agent.run(&["--env-file", env, "--", "./emit"]);
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    let id = request_id(&stderr(&out));
+    let shown = f.approve(&id, &["--for", "1h"]);
+    let at = |needle: &str| {
+        shown
+            .find(needle)
+            .unwrap_or_else(|| panic!("no {needle:?} in: {shown}"))
+    };
+    let asks = at("which this asks for:");
+    let github = at("GITHUB_TOKEN = github/acme-web#value");
+    let held = at("  also held by this grant (");
+    let openai = at("OPENAI_API_KEY = openai/acme-web#value");
+    let stripe = at("STRIPE_SECRET_KEY = stripe/acme-web#value");
+    assert!(
+        asks < github && github < held && held < openai && held < stripe,
+        "{shown}"
+    );
+    // An ordinary variable is not a binding: it is not shown.
+    assert!(!shown.contains("PLAIN_SETTING"), "{shown}");
+    let g2 = grant_id(&shown);
+    assert_ne!(g2, grant);
+    let out = agent.run(&["--env-file", env, "--", "./emit"]);
+    assert!(
+        stderr(&out).contains(&format!("grant {g2} covers this request")),
+        "{}",
+        stderr(&out)
+    );
+
+    let bad = f.files.path().join("bad.env");
+    std::fs::write(
+        &bad,
+        format!("GITHUB_TOKEN=envcloak://github/acme-web\nB='{value}\n"),
+    )
+    .unwrap();
+    let out = agent.run(&["--env-file", bad.to_str().unwrap(), "--", "./emit"]);
+    assert_eq!(out.status.code(), Some(125));
+    assert_eq!(
+        stderr(&out),
+        "envcloak: binding_unresolved: --env-file: env file line 2: a quoted value is not \
+         closed\n"
+    );
+    let log = f.d.log();
+    assert!(
+        !log.contains(&value) && !log.contains("PLAIN_SETTING"),
+        "{log}"
     );
     drop(agent);
     f.sweep();
@@ -932,6 +1011,7 @@ fn a_grant_for_the_terminal_does_not_cover_the_agent() {
         manifest: f.project.join("envcloak.toml").to_str().unwrap().to_owned(),
         profile: None,
         refs: Vec::new(),
+        env_file: None,
         argv: vec!["./emit".to_owned()],
         claims: Vec::new(),
     };

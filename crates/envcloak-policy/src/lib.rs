@@ -54,8 +54,8 @@ pub use agents::{
 pub use bind::{BindError, BindErrorKind, BoundBinding, bind_items};
 pub use effective::{EffectivePolicy, SubjectKind, VaultProjectPolicy, effective_policy};
 pub use envfile::{
-    EnvFileError, EnvFileErrorKind, EnvFileRef, EnvFileRefs, MAX_ENV_FILE, PlainVar,
-    REFERENCE_SCHEME, parse_env_file_refs,
+    EnvFileError, EnvFileErrorKind, EnvFileNames, EnvFileRef, EnvFileRefs, MAX_ENV_FILE, PlainName,
+    PlainVar, REFERENCE_SCHEME, parse_env_file_refs,
 };
 pub use evidence::{
     Ancestor, ChainEnd, Claims, ClaimsError, EvidenceError, GATHER_ATTEMPTS, ProcessInstance,

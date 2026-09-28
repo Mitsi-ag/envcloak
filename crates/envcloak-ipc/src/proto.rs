@@ -20,7 +20,10 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use envcloak_policy::{ApprovalOptions, PendingDescriptor};
+use envcloak_policy::{
+    ApprovalOptions, Binding, EnvFileNames, EnvFileRef, EnvName, ManifestError, PendingDescriptor,
+    PlainName,
+};
 
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
@@ -136,11 +139,94 @@ pub struct RunRequestParams {
     /// `--ref NAME=<slug>[#field]` arguments, in order.
     #[serde(default)]
     pub refs: Vec<String>,
+    /// `--env-file`: its references and the names of its ordinary
+    /// variables. Never a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<EnvFileParams>,
     /// The command and its arguments. Display only.
     pub argv: Vec<String>,
     /// Marker names, never values (SPEC §10a "caller-asserted").
     #[serde(default)]
     pub claims: Vec<String>,
+}
+
+/// What `envcloak run` sends of an `--env-file` (SPEC §6.1 step 2): what
+/// the daemon needs to resolve the run's bindings, and nothing else. An
+/// ordinary variable's value stays with the CLI, which sets it for the
+/// command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvFileParams {
+    /// Each `NAME=envcloak://<slug>[#field]` entry, as `NAME=<slug>[#field]`
+    /// with its line, in file order.
+    #[serde(default)]
+    pub refs: Vec<EnvFileLine>,
+    /// The name of each ordinary variable, with its line, in file order.
+    #[serde(default)]
+    pub plain: Vec<EnvFileLine>,
+}
+
+/// One entry of an [`EnvFileParams`]: its line, from 1, and its text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvFileLine {
+    pub line: u32,
+    pub text: String,
+}
+
+impl From<&EnvFileNames> for EnvFileParams {
+    fn from(n: &EnvFileNames) -> Self {
+        EnvFileParams {
+            refs: n
+                .refs
+                .iter()
+                .map(|r| EnvFileLine {
+                    line: r.line,
+                    text: format!("{}={}", r.binding.env_name, r.binding.reference),
+                })
+                .collect(),
+            plain: n
+                .plain
+                .iter()
+                .map(|p| EnvFileLine {
+                    line: p.line,
+                    text: p.name.to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl EnvFileParams {
+    /// The names a client sent, checked as the CLI checked them.
+    ///
+    /// # Errors
+    /// A reference that is not `NAME=<slug>[#field]`, or a name that is not
+    /// a variable name. The error names the kind, never the text.
+    pub fn names(&self) -> Result<EnvFileNames, ManifestError> {
+        Ok(EnvFileNames {
+            refs: self
+                .refs
+                .iter()
+                .map(|r| {
+                    Ok(EnvFileRef {
+                        line: r.line,
+                        binding: Binding::parse_arg(&r.text)?,
+                    })
+                })
+                .collect::<Result<_, ManifestError>>()?,
+            plain: self
+                .plain
+                .iter()
+                .map(|p| {
+                    Ok(PlainName {
+                        line: p.line,
+                        name: EnvName::new(&p.text)?,
+                    })
+                })
+                .collect::<Result<_, ManifestError>>()?,
+        })
+    }
 }
 
 /// `pending.get`: what an approval surface shows for a pending request.

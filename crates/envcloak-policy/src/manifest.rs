@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::{Document, InlineTable, Item, TableLike, Value};
 
-use crate::envfile::EnvFileRefs;
+use crate::envfile::EnvFileNames;
 use crate::names::{Binding, EnvName, ProfileName, Reference};
 
 /// Whether a manifest lets agent subjects ask for approval at all.
@@ -536,7 +536,7 @@ pub fn resolve(
     m: &Manifest,
     profile: Option<&ProfileName>,
     refs: &[Binding],
-    env: Option<&EnvFileRefs>,
+    env: Option<&EnvFileNames>,
 ) -> Result<Vec<Binding>, ManifestError> {
     let mut out: BTreeMap<&EnvName, &Reference> =
         m.env.iter().map(|b| (&b.env_name, &b.reference)).collect();

@@ -284,3 +284,104 @@ fn a_response_can_carry_a_value_and_messages_are_never_shown() {
     );
     assert_no_canary(format!("{e:?}").as_bytes(), &cs);
 }
+
+/// `--env-file` crosses the socket as its references and the names of its
+/// ordinary variables, each with its line (SPEC §6.1 step 2): the values
+/// never do, and the daemon reads back exactly what the CLI parsed. What
+/// is not a reference or a name is refused, as a `--ref` is.
+#[test]
+fn an_env_file_crosses_as_references_and_names_only() {
+    use envcloak_ipc::proto::{EnvFileLine, EnvFileParams, RunRequest, RunRequestParams};
+    use envcloak_policy::parse_env_file_refs;
+
+    let cs = canaries(fresh_seed());
+    let value = by_label(&cs, labels::DATABASE_URL)
+        .as_str()
+        .replace('\'', "");
+    let file = format!(
+        "OPENAI_API_KEY=envcloak://openai/acme-web\n\
+         # a comment\n\
+         export PLAIN='{value}'\n\
+         STRIPE_SECRET_KEY=envcloak://stripe/acme-web#value\n"
+    );
+    let parsed = parse_env_file_refs(&SecretBytes::copy_from(file.as_bytes())).unwrap();
+    let names = parsed.names();
+    let sent = EnvFileParams::from(&names);
+    let line = |line: u32, text: &str| EnvFileLine {
+        line,
+        text: text.into(),
+    };
+    assert_eq!(
+        sent,
+        EnvFileParams {
+            refs: vec![
+                line(1, "OPENAI_API_KEY=openai/acme-web"),
+                line(4, "STRIPE_SECRET_KEY=stripe/acme-web#value"),
+            ],
+            plain: vec![line(3, "PLAIN")],
+        }
+    );
+    let params = RunRequestParams {
+        manifest: "/src/acme-web/envcloak.toml".into(),
+        profile: None,
+        refs: Vec::new(),
+        env_file: Some(sent),
+        argv: vec!["./emit".into()],
+        claims: Vec::new(),
+    };
+    let f = proto::request_frame::<RunRequest>(7, &params).unwrap();
+    let mut bytes = Vec::new();
+    f.write_to(&mut bytes).unwrap();
+    assert_no_canary(&bytes, &cs);
+    let got: RunRequestParams = IncomingRequest::parse(&f).unwrap().params().unwrap();
+    assert_eq!(got, params);
+    assert_eq!(got.env_file.unwrap().names().unwrap(), names);
+
+    // Without one, the field is left out.
+    let none = RunRequestParams {
+        env_file: None,
+        ..params
+    };
+    let f = proto::request_frame::<RunRequest>(8, &none).unwrap();
+    let mut bytes = Vec::new();
+    f.write_to(&mut bytes).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("env_file"));
+
+    for bad in [
+        EnvFileParams {
+            refs: vec![line(1, "OPENAI_API_KEY")],
+            plain: Vec::new(),
+        },
+        EnvFileParams {
+            refs: vec![line(1, "OPENAI_API_KEY=not a slug")],
+            plain: Vec::new(),
+        },
+        EnvFileParams {
+            refs: vec![line(1, "1X=openai/acme-web")],
+            plain: Vec::new(),
+        },
+        EnvFileParams {
+            refs: Vec::new(),
+            plain: vec![line(1, "NOT A NAME")],
+        },
+        EnvFileParams {
+            refs: Vec::new(),
+            plain: vec![line(1, "A=b")],
+        },
+    ] {
+        assert!(bad.names().is_err(), "{bad:?}");
+    }
+    // Unknown fields are refused: nothing else of the file can cross.
+    let f = frame(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 9, "method": "run.request",
+        "params": {
+            "manifest": "/x/envcloak.toml", "argv": ["x"],
+            "env_file": {"refs": [], "plain": [], "values": ["x"]}
+        }
+    }));
+    let e = IncomingRequest::parse(&f)
+        .unwrap()
+        .params::<RunRequestParams>()
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::InvalidParams);
+}
