@@ -6,11 +6,15 @@
 //!
 //! | | [`awake_time`] (stops while asleep) | [`time_including_sleep`] |
 //! |---|---|---|
-//! | macOS | `CLOCK_UPTIME_RAW` | `CLOCK_MONOTONIC` |
+//! | macOS | `CLOCK_UPTIME_RAW` (`mach_absolute_time`) | `CLOCK_MONOTONIC_RAW` (`mach_continuous_time`) |
 //! | Linux | `CLOCK_MONOTONIC` | `CLOCK_BOOTTIME` |
 //!
-//! Both are monotonic. When the second advances further than the first
-//! between two readings, the machine slept for the difference.
+//! Each pair shares an origin (boot) and a timebase: the second is the
+//! first plus the time the machine has slept. When the second advances
+//! further than the first between two readings, the machine slept for the
+//! difference. macOS `CLOCK_MONOTONIC` is not used: Apple's libc computes
+//! it as the calendar clock less the boot time, so it follows the calendar
+//! clock's adjustments and steps in microseconds.
 
 use std::io;
 use std::time::Duration;
@@ -37,7 +41,7 @@ pub fn awake_time() -> io::Result<Duration> {
 pub fn time_including_sleep() -> io::Result<Duration> {
     #[cfg(target_os = "macos")]
     {
-        read_clock(libc::CLOCK_MONOTONIC)
+        read_clock(libc::CLOCK_MONOTONIC_RAW)
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {

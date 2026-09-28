@@ -270,7 +270,7 @@ A single vault per user under the platform data directory: `~/Library/Applicatio
   - 8 hours idle (configurable, at most 24);
   - logout;
   - daemon stop.
-- Without the app, the daemon detects sleep by comparing two clocks on a one-second tick and before every request: on macOS `CLOCK_MONOTONIC` (counts sleep) against `CLOCK_UPTIME_RAW` (does not); on Linux `CLOCK_BOOTTIME` (counts suspend) against `CLOCK_MONOTONIC` (does not). A divergence of more than 5 seconds means the machine slept.
+- Without the app, the daemon detects sleep by comparing two clocks on a one-second tick and before every request: on macOS `CLOCK_MONOTONIC_RAW` (`mach_continuous_time`, counts sleep) against `CLOCK_UPTIME_RAW` (`mach_absolute_time`, does not), which share a timebase; on Linux `CLOCK_BOOTTIME` (counts suspend) against `CLOCK_MONOTONIC` (does not). A divergence of more than 5 seconds means the machine slept.
 - Lock erases the VMK and subkeys, drops every grant and pending request, stops proxy substitution and stops helper deliveries.
 - Processes that already received values keep them.
 

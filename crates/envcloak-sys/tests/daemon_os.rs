@@ -49,19 +49,47 @@ fn a_blocked_termination_signal_waits_for_sigwait() {
     assert!(format!("{signals:?}").contains("SIGTERM"));
 }
 
+/// Reads time awake, time including sleep, then time awake again, 50
+/// times, and keeps the reading whose two awake reads were closest: the
+/// middle read then happened, in awake time, within that gap after the
+/// first. Returns (awake, including sleep, gap).
+fn pinned_reading() -> (Duration, Duration, Duration) {
+    (0..50)
+        .map(|_| {
+            let a = awake_time().unwrap();
+            let s = time_including_sleep().unwrap();
+            let gap = awake_time().unwrap() - a;
+            (a, s, gap)
+        })
+        .min_by_key(|r| r.2)
+        .unwrap()
+}
+
+/// The clock pair shares an origin and a timebase: time including sleep is
+/// time awake plus the time the machine has slept since boot. So it never
+/// trails time awake, and while nothing sleeps the two advance by the same
+/// amount, to within how closely each reading is pinned (plus 250 ns for
+/// clock ticks). macOS pairs CLOCK_MONOTONIC_RAW with CLOCK_UPTIME_RAW,
+/// both counts of the mach timebase; CLOCK_MONOTONIC, the calendar clock
+/// less the boot time, has microsecond steps, ran behind CLOCK_UPTIME_RAW
+/// on a CI runner, and drifted from it by 1 to 13 µs in 2 s on a Mac.
 #[test]
-fn the_clock_pair_advances_together_while_awake() {
-    let (a0, s0) = (awake_time().unwrap(), time_including_sleep().unwrap());
-    std::thread::sleep(Duration::from_millis(200));
-    let (a1, s1) = (awake_time().unwrap(), time_including_sleep().unwrap());
+fn the_clock_pair_shares_an_origin_and_a_timebase() {
+    let (a0, s0, g0) = pinned_reading();
+    assert!(
+        s0 >= a0,
+        "time including sleep {s0:?} trails time awake {a0:?}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let (a1, s1, g1) = pinned_reading();
     let awake = a1 - a0;
     let total = s1 - s0;
-    assert!(awake >= Duration::from_millis(150), "{awake:?}");
-    assert!(total >= Duration::from_millis(150), "{total:?}");
-    // Nothing slept here, so neither clock ran ahead by more than noise.
-    // Only deltas compare: the two clocks need not share an origin.
-    let gap = total.abs_diff(awake);
-    assert!(gap < Duration::from_millis(100), "{awake:?} {total:?}");
+    assert!(awake >= Duration::from_millis(1900), "{awake:?}");
+    let slack = g0 + g1 + Duration::from_nanos(250);
+    assert!(
+        total.abs_diff(awake) <= slack,
+        "awake {awake:?}, including sleep {total:?}, allowed {slack:?}"
+    );
 }
 
 #[test]

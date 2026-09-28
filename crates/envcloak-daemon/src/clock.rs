@@ -14,7 +14,7 @@ pub trait Clocks: Send + Sync {
     fn wall(&self) -> SystemTime;
     /// Time awake: macOS `CLOCK_UPTIME_RAW`, Linux `CLOCK_MONOTONIC`.
     fn awake(&self) -> Duration;
-    /// Time including sleep: macOS `CLOCK_MONOTONIC`, Linux
+    /// Time including sleep: macOS `CLOCK_MONOTONIC_RAW`, Linux
     /// `CLOCK_BOOTTIME`.
     fn including_sleep(&self) -> Duration;
 }
