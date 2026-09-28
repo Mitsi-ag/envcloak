@@ -4,7 +4,10 @@
 //! - Gate 25, evidence forgery: the test fixture agent (`fixture-agent`,
 //!   which the builtin catalog knows by its file name) run under `env -i`
 //!   is still an agent by ancestry; a grant for the terminal it runs in
-//!   does not cover it; `CLAUDECODE=1` in a terminal only tightens.
+//!   does not cover it; `CLAUDECODE=1` in a terminal only tightens. A
+//!   command run under enough nested shells to put the agent past the
+//!   walk's cut is still not a terminal subject, and its proofs are
+//!   refused.
 //! - Gate 26, ancestry escape: a process under the fixture agent escapes by
 //!   double fork, `setsid`, `nohup` with `disown`, `launchctl submit`
 //!   (macOS) or `systemd-run --user` (Linux). Before the escape the same
@@ -38,6 +41,7 @@ use std::time::{Duration, Instant};
 use envcloak_policy::{
     AgentCatalog, CatalogSource, Claims, ProcessInstance, SubjectEvidence, SubjectKind, gather,
 };
+use envcloak_sys::MAX_ANCESTRY;
 use envcloak_testkit::{TestHome, testkit_bin};
 
 fn probe() -> PathBuf {
@@ -268,6 +272,49 @@ fn gate25_a_known_agent_under_env_i_is_classified_by_ancestry() {
     // On Linux the caller hides its executable, as the CLI does.
     if cfg!(target_os = "linux") {
         assert!(e.caller().exe.is_none(), "{e:?}");
+    }
+    s.finish();
+}
+
+/// Gate 25: the fixture agent runs its command under `n` nested shells,
+/// the last of which runs the caller under `env -i`. Under 60 the agent is
+/// found at depth 62; under 70 it is past the walk's cut, and the caller
+/// is still no terminal subject and may give no proof.
+#[test]
+fn gate25_an_agent_past_the_cut_still_counts() {
+    let l = Listener::new();
+    let s = under_agent(
+        &l,
+        r#"N='n=$1; shift; if [ "$n" -gt 0 ]; then sh -c "$0" "$0" $((n - 1)) "$@"; :; else exec /usr/bin/env -i "$@"; fi'
+sh -c "$N" "$N" "$3" "$1" "$2"
+sh -c "$N" "$N" "$4" "$1" "$2"
+read x
+"#,
+        &["60", "70"],
+    );
+    // probe <- 60 shells <- sh <- fixture-agent <- the session leader.
+    let within = l.next();
+    assert_eq!(within.chain().len(), MAX_ANCESTRY);
+    assert_rooted_at_the_fixture(&within, 62);
+    assert_eq!(within.session_leader().unwrap().pid, s.pid());
+    assert!(within.claims().markers().is_empty());
+
+    // probe <- 70 shells: the fixture agent is not in the chain.
+    let past = l.next();
+    assert!(past.cut(), "{past:?}");
+    assert_eq!(past.chain().len(), MAX_ANCESTRY);
+    assert!(
+        !past
+            .chain()
+            .iter()
+            .any(|a| file_name(&a.instance) == "fixture-agent")
+    );
+    assert!(past.nearest_agent().is_none());
+    assert!(past.claims().markers().is_empty());
+    assert_eq!(past.kind(), SubjectKind::Unknown);
+    assert!(past.agent_involved(), "its proofs are refused");
+    for a in past.chain() {
+        assert!(!past.covered_by(&a.instance, SubjectKind::Terminal));
     }
     s.finish();
 }

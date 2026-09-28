@@ -61,7 +61,7 @@ pub use perm::{PRIVATE_UMASK, effective_uid, restrict_umask};
 pub use proc::{
     AncestryError, CodeSignature, ExeIdentity, LiveProcesses, MAX_ANCESTRY, MAX_ARGV,
     MAX_ARGV_BYTES, ProcInfo, ProcessTable, StatFields, ancestry, ancestry_in, parse_cmdline,
-    parse_proc_stat, parse_procargs2, parse_status_euid, proc_argv, proc_info,
+    parse_proc_stat, parse_procargs2, parse_status_euid, proc_argv, proc_info, reaches_top,
 };
 pub use signal::TerminationSignals;
 pub use tty::SecretInput;

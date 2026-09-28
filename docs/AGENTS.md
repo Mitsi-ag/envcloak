@@ -2,7 +2,7 @@
 
 Status: M1. This file fixes the format of the agent catalog (`integrations/agents.toml` and the user's extensions), how the daemon reads a caller's process ancestry, and how that evidence picks a grant's root, the subject's kind and whether a grant covers a caller (SPEC §10a, §10b "Root selection" and "Match" rules 3 and 4; gates 25 and 26). The code is in `crates/envcloak-sys/src/proc/` (the kernel's view) and `crates/envcloak-policy/src/{agents,evidence}.rs`.
 
-Everything here is evidence, and evidence only tightens. Matching a process as an agent makes handling stricter; the absence of a match never removes a restriction. The one thing a missed agent costs is the agent barrier: an unrecognized agent started in a terminal that holds a terminal grant would be covered by it. The catalog exists to make that rare, and the daemon's other defenses (approval proofs, the manifest's tighten-only rule, proxy mode) do not depend on it.
+Everything here is evidence, and evidence only tightens. Matching a process as an agent makes handling stricter; the absence of a match never removes a restriction, and evidence the daemon cannot read in full (an orphan's lost ancestry, a chain cut at the depth limit) is handled as if an agent may be there. The one thing a missed agent costs is the agent barrier: an unrecognized agent started in a terminal that holds a terminal grant would be covered by it. The catalog exists to make that rare, and the daemon's other defenses (approval proofs, the manifest's tighten-only rule, proxy mode) do not depend on it.
 
 ## Where the catalog comes from
 
@@ -76,7 +76,7 @@ Neither kernel offers a race-free parent chain, so the walk is checked:
 2. Every parent must have started no later than its child. A pid reused after the real parent exited belongs to a newer process.
 3. After the walk, every entry is read again and must still have its start time, parent, session and terminal. A process keeps its pid until it exits, so an entry that passes was the same process throughout, and every link held when it was checked.
 
-A change means the tree moved under the walk (a parent exited, a process was reparented): the daemon walks again, up to 3 times, and then refuses with `ancestry_changed`. A caller that exited is `caller_gone`. The walk stops at the top of the tree or after 64 processes; a cut chain only loses what is above the cut, which can only make handling stricter.
+A change means the tree moved under the walk (a parent exited, a process was reparented): the daemon walks again, up to 3 times, and then refuses with `ancestry_changed`. A caller that exited is `caller_gone`. The walk stops at the top of the tree or after 64 processes. A cut chain hides what is above the cut, and an agent could put itself there by running its command under enough nested shells with `env -i`, so a cut chain fails closed: unless a known agent is found below the cut, the caller's kind is `unknown` (no terminal grant covers it) and its proofs are refused, as for an agent. Real chains are about 10 processes deep.
 
 Only processes of the caller's uid, other than pid 1, are classified. Arguments are read only for a process whose executable is hidden from the daemon (so `argv[0]` stands in for it) or that runs an interpreter (so its script decides), at most 64 arguments and 16 KiB. On macOS `KERN_PROCARGS2` returns the environment after the arguments: parsing stops at the last argument, and the buffer is wiped. Arguments are dropped after classification; the evidence holds pids, start times, executables and labels.
 
@@ -95,7 +95,7 @@ pid 1 (`launchd`, `init`) is never a root and never counts as a session leader: 
 **Kind**, in this order:
 
 1. a known agent in the ancestry: `agent`;
-2. no session leader in the chain, so the ancestry is lost: `unknown`, whatever the claims say;
+2. no session leader in the chain, so the ancestry is lost, or a chain cut at 64 processes: `unknown`, whatever the claims say;
 3. agent markers in the claims: `agent`;
 4. a session without a controlling terminal: `unknown`;
 5. otherwise `terminal`. This never proves that a person is there.
@@ -108,6 +108,8 @@ pid 1 (`launchd`, `init`) is never a root and never counts as a session leader: 
 - R, when it is above the caller's session, is not an agent that only an extension matched.
 
 The remaining match rules (expiry, epochs, project, bindings, mode) are the grant store's (SPEC §10b).
+
+**Proofs** (approve, unlock, rotate, remove, recover) are refused from a caller with a known agent in its ancestry, agent markers in its claims, or a chain cut at 64 processes (SPEC §10b).
 
 **Claims** can turn a terminal subject into an agent subject and make its proofs refused (SPEC §10b); they never change the chain, the root or a lower kind. `CLAUDECODE=1` set in a person's shell therefore only tightens.
 
@@ -137,4 +139,4 @@ In each case the process's new request gets a root of its own, and a person appr
 - `crates/envcloak-sys/tests/proc.rs`: this process, pid 1 and real children (a new session, a pseudo-terminal) as the kernel reports them; the walk and its re-validation against a table whose answers change; the `KERN_PROCARGS2`, `cmdline` and `stat` parsers against arbitrary bytes.
 - `crates/envcloak-policy/tests/agents.rs`: the builtin catalog, installs of Claude Code and Codex, ordinary programs, extensions and their checks, claims.
 - `crates/envcloak-policy/tests/evidence.rs`: root, kind, claims and coverage on synthetic chains; what `gather` reads and classifies; walking again.
-- `crates/envcloak-policy/tests/evidence_gates.rs`: gates 25 and 26 with real processes, the test fixture agent, a pseudo-terminal, and `launchctl submit` or `systemd-run --user` where `ENVCLOAK_TEST_SERVICE_MANAGER=1`.
+- `crates/envcloak-policy/tests/evidence_gates.rs`: gates 25 and 26 with real processes, the test fixture agent (also 70 nested shells below it, past the cut), a pseudo-terminal, and `launchctl submit` or `systemd-run --user` where `ENVCLOAK_TEST_SERVICE_MANAGER=1`.

@@ -671,7 +671,7 @@ The daemon records evidence about every caller and uses it only as this table al
 | "No agent is involved" or "a human typed this" | Cannot be claimed | Nothing |
 | Project path | Caller-asserted; the daemon reads the manifest itself | Grant scoping together with the subject root |
 
-The ancestry walk records pid and start time for each ancestor, then re-validates the chain: each parent started no later than its child, and each ancestor still has the recorded start time. An orphan reparented to launchd or init has lost its ancestry, which fails closed. Agents are recognized by executable path, `argv[0]`, interpreter script and, on macOS, code signature, from a builtin catalog plus add-only user extensions (docs/AGENTS.md).
+The ancestry walk records pid and start time for each ancestor, then re-validates the chain: each parent started no later than its child, and each ancestor still has the recorded start time. An orphan reparented to launchd or init has lost its ancestry, which fails closed. So does a chain cut at the walk's depth limit (64 processes): an agent may be above the cut, so the caller is not a terminal subject and its proofs are refused. Agents are recognized by executable path, `argv[0]`, interpreter script and, on macOS, code signature, from a builtin catalog plus add-only user extensions (docs/AGENTS.md).
 
 **Bounds and display.**
 - Frames are limited to 1 MiB.

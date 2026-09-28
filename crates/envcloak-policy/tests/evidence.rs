@@ -12,10 +12,12 @@ use std::io;
 use std::path::PathBuf;
 
 use envcloak_policy::{
-    AgentCatalog, AgentLabel, Ancestor, CatalogSource, Claims, EvidenceError, GATHER_ATTEMPTS,
-    ProcessInstance, SubjectEvidence, SubjectKind, gather_in,
+    AgentCatalog, AgentLabel, Ancestor, CatalogSource, ChainEnd, Claims, EvidenceError,
+    GATHER_ATTEMPTS, ProcessInstance, SubjectEvidence, SubjectKind, gather_in,
 };
-use envcloak_sys::{ExeIdentity, PeerIdentity, PeerSource, ProcInfo, ProcessTable, StartTime};
+use envcloak_sys::{
+    ExeIdentity, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo, ProcessTable, StartTime,
+};
 
 fn inst(pid: i32, start: u64) -> ProcessInstance {
     ProcessInstance {
@@ -53,8 +55,18 @@ fn extension(id: &str) -> Option<AgentLabel> {
 }
 
 fn ev(chain: Vec<Ancestor>, terminal: bool, claims: &[&str]) -> SubjectEvidence {
-    SubjectEvidence::from_chain(chain, terminal, Claims::from_markers(claims).unwrap(), None)
-        .unwrap()
+    ev_end(chain, ChainEnd::Top, terminal, claims)
+}
+
+fn ev_end(chain: Vec<Ancestor>, end: ChainEnd, terminal: bool, claims: &[&str]) -> SubjectEvidence {
+    SubjectEvidence::from_chain(
+        chain,
+        end,
+        terminal,
+        Claims::from_markers(claims).unwrap(),
+        None,
+    )
+    .unwrap()
 }
 
 /// A terminal session: envcloak (90) <- sh (80) <- zsh (70, the session
@@ -256,7 +268,69 @@ fn a_recycled_pid_never_matches() {
 
 #[test]
 fn an_empty_chain_is_no_evidence() {
-    assert!(SubjectEvidence::from_chain(Vec::new(), true, Claims::none(), None).is_none());
+    for end in [ChainEnd::Top, ChainEnd::Cut] {
+        assert!(SubjectEvidence::from_chain(Vec::new(), end, true, Claims::none(), None).is_none());
+    }
+}
+
+/// [`MAX_ANCESTRY`] processes, the caller (1000) first, each the child of
+/// the next: the first 51 in a terminal session led by 950, the rest in
+/// session 900. `agent_at` labels one of them a builtin agent.
+fn long_chain(agent_at: Option<usize>) -> Vec<Ancestor> {
+    (0..MAX_ANCESTRY)
+        .map(|k| {
+            let pid = 1000 - i32::try_from(k).unwrap();
+            let sid = if pid >= 950 { 950 } else { 900 };
+            p(
+                pid,
+                sid,
+                (agent_at == Some(k)).then(|| label("codex", CatalogSource::Builtin)),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_cut_chain_fails_closed() {
+    // The same processes, seen whole and cut. Whole, the caller is a
+    // terminal subject rooted at its session leader.
+    let whole = ev_end(long_chain(None), ChainEnd::Top, true, &[]);
+    assert!(!whole.cut());
+    assert_eq!(whole.kind(), SubjectKind::Terminal);
+    assert!(!whole.agent_involved());
+    let leader = whole.session_leader().unwrap().clone();
+    assert_eq!(leader.pid, 950);
+    assert!(whole.covered_by(&leader, SubjectKind::Terminal));
+
+    // Cut, an agent may be above the cut: unknown, its proofs refused, and
+    // no terminal grant covers it wherever it is rooted.
+    for claims in [&[][..], &["CLAUDECODE"][..]] {
+        let cut = ev_end(long_chain(None), ChainEnd::Cut, true, claims);
+        assert!(cut.cut());
+        assert!(cut.nearest_agent().is_none());
+        assert_eq!(cut.kind(), SubjectKind::Unknown, "{claims:?}");
+        assert!(cut.agent_involved(), "{claims:?}");
+        assert_eq!(cut.chain(), whole.chain());
+        assert!(cut.root().same(&whole.root()));
+        for a in cut.chain() {
+            assert!(!cut.covered_by(&a.instance, SubjectKind::Terminal));
+        }
+        // A grant approved for what it is still covers it.
+        assert!(cut.covered_by(&cut.root(), SubjectKind::Unknown));
+    }
+    let cut = ev_end(long_chain(None), ChainEnd::Cut, true, &[]);
+    assert!(cut.label().is_none(), "no agent to show");
+
+    // A known agent below the cut is found as in a whole chain.
+    let cut = ev_end(long_chain(Some(10)), ChainEnd::Cut, true, &[]);
+    assert_eq!(cut.kind(), SubjectKind::Agent);
+    assert_eq!(cut.root_index(), 10);
+    assert_eq!(cut.label().unwrap().id, "codex");
+    assert!(cut.agent_involved());
+    assert!(
+        !cut.covered_by(&leader, SubjectKind::Agent),
+        "the agent barrier"
+    );
 }
 
 /// A process table a test scripts: each pid's answers in order, the last
@@ -374,6 +448,65 @@ fn gather_classifies_the_callers_processes_from_what_it_reads() {
         !shown.contains("npm") && !shown.contains("cli.js"),
         "{shown}"
     );
+}
+
+/// A caller (2000, the CLI) under `shells` nested shells (pids 1999
+/// down), under the native Claude Code, under zsh (100, the session
+/// leader), under launchd.
+fn nested_under_claude(shells: i32) -> Table {
+    let top = 2000 - shells - 1;
+    let mut t = Table::default()
+        .add(vec![info(
+            2000,
+            1999,
+            100,
+            501,
+            Some("/usr/local/bin/envcloak"),
+        )])
+        .add(vec![info(
+            top,
+            100,
+            100,
+            501,
+            Some("/Users/u/.local/share/claude/versions/2.1.0"),
+        )])
+        .add(vec![info(100, 1, 100, 501, Some("/bin/zsh"))])
+        .add(vec![info(1, 0, 1, 0, Some("/sbin/launchd"))]);
+    for pid in top + 1..2000 {
+        t = t.add(vec![info(pid, pid - 1, 100, 501, Some("/bin/sh"))]);
+    }
+    t
+}
+
+#[test]
+fn an_agent_above_the_cut_is_not_forgotten() {
+    let cat = AgentCatalog::builtin();
+    // Shallow: the chain reaches launchd, and Claude Code is the root.
+    let mut t = nested_under_claude(3);
+    let e = gather_in(&mut t, &peer(2000), Claims::none(), &cat).unwrap();
+    assert!(!e.cut());
+    assert_eq!(e.chain().len(), 7);
+    assert_eq!(e.label().unwrap().id, "claude-code");
+    assert_eq!(e.kind(), SubjectKind::Agent);
+    // 72 shells deep, with no markers: Claude Code is past the cut. The
+    // caller is not a terminal subject, and its proofs are refused.
+    let mut t = nested_under_claude(72);
+    let e = gather_in(&mut t, &peer(2000), Claims::none(), &cat).unwrap();
+    assert!(e.cut());
+    assert_eq!(e.chain().len(), MAX_ANCESTRY);
+    assert!(e.nearest_agent().is_none());
+    assert!(e.session_leader().is_none());
+    assert_eq!(e.kind(), SubjectKind::Unknown);
+    assert!(e.agent_involved());
+    for a in e.chain() {
+        assert!(!e.covered_by(&a.instance, SubjectKind::Terminal));
+    }
+    // A chain of exactly MAX_ANCESTRY processes that ends at launchd is
+    // whole.
+    let mut t = nested_under_claude(i32::try_from(MAX_ANCESTRY).unwrap() - 4);
+    let e = gather_in(&mut t, &peer(2000), Claims::none(), &cat).unwrap();
+    assert!(!e.cut(), "{}", e.chain().len());
+    assert_eq!(e.label().unwrap().id, "claude-code");
 }
 
 #[test]

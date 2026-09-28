@@ -45,7 +45,7 @@ pub use envfile::{
     REFERENCE_SCHEME, parse_env_file_refs,
 };
 pub use evidence::{
-    Ancestor, Claims, ClaimsError, EvidenceError, GATHER_ATTEMPTS, ProcessInstance,
+    Ancestor, ChainEnd, Claims, ClaimsError, EvidenceError, GATHER_ATTEMPTS, ProcessInstance,
     SubjectEvidence, gather, gather_in,
 };
 pub use manifest::{

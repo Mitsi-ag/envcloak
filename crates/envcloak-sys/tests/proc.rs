@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use envcloak_sys::{
     AncestryError, MAX_ARGV, MAX_ARGV_BYTES, PeerIdentity, PeerSource, ProcInfo, ProcessTable,
     StartTime, ancestry, ancestry_in, effective_uid, parse_cmdline, parse_proc_stat,
-    parse_procargs2, peer_identity, proc_argv, proc_info, process_start_time,
+    parse_procargs2, peer_identity, proc_argv, proc_info, process_start_time, reaches_top,
 };
 use proptest::prelude::*;
 
@@ -259,11 +259,13 @@ fn the_ancestry_of_a_connected_peer_reaches_the_top() {
     }
     let top = chain.last().unwrap();
     assert_eq!(top.ppid, 0, "{chain:?}");
+    assert!(reaches_top(&chain));
 
-    // Cut at a depth.
+    // Cut at a depth, which the chain shows.
     let two = ancestry(&peer, 2, &|_| false).unwrap();
     assert_eq!(two.len(), 2);
     assert_eq!(two[1].pid, own_pid());
+    assert!(!reaches_top(&two));
     assert_eq!(ancestry(&peer, 0, &|_| false).unwrap().len(), 1);
 
     // The peer must be the process the socket reported.
@@ -383,6 +385,27 @@ fn a_steady_chain_is_walked_once_and_read_again() {
     );
     assert_eq!(chain[1].argv, None, "a refused read leaves None");
     assert_eq!(chain[2].argv, None, "not asked for");
+}
+
+#[test]
+fn a_chain_cut_at_its_depth_does_not_reach_the_top() {
+    for depth in 1..=3 {
+        let mut t = steady();
+        let chain = ancestry_in(&mut t, &peer(40, 400), depth, &|_| false).unwrap();
+        assert_eq!(chain.len(), depth);
+        assert!(!reaches_top(&chain), "{depth}");
+        // Only what the walk kept was read.
+        assert!(!t.reads.contains_key(&[40, 30, 20, 1][depth]));
+    }
+    let mut t = steady();
+    let whole = ancestry_in(&mut t, &peer(40, 400), 4, &|_| false).unwrap();
+    assert!(reaches_top(&whole));
+    assert!(!reaches_top(&[]));
+    // A process named as its own parent ends the walk, and is no top.
+    let mut t = Scripted::default().with(vec![Ok(info(40, 40, 400))]);
+    let looped = ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap();
+    assert_eq!(looped.len(), 1);
+    assert!(!reaches_top(&looped));
 }
 
 #[test]

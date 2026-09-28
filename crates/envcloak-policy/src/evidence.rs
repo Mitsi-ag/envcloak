@@ -25,8 +25,9 @@
 //! - **Kind** ([`SubjectEvidence::kind`]), in this order:
 //!   1. a known agent in the ancestry: [`SubjectKind::Agent`];
 //!   2. no session leader in the chain, so the ancestry is lost (an
-//!      orphan, an escaped process): [`SubjectKind::Unknown`], whatever the
-//!      claims say;
+//!      orphan, an escaped process), or a chain cut at [`MAX_ANCESTRY`]
+//!      processes, above which an agent may hide:
+//!      [`SubjectKind::Unknown`], whatever the claims say;
 //!   3. agent markers in the claims: [`SubjectKind::Agent`];
 //!   4. a session without a controlling terminal (`setsid`, a service, a
 //!      job launched by `launchd` or `systemd`): [`SubjectKind::Unknown`];
@@ -48,6 +49,13 @@
 //! comes from the session, and escaping the tree loses every grant rooted
 //! in it.
 //!
+//! A chain longer than [`MAX_ANCESTRY`] is cut ([`ChainEnd::Cut`]), and
+//! what is above the cut is not seen: an agent could run its commands
+//! under enough nested shells, with `env -i`, to put itself there. So a
+//! cut chain fails closed: without a known agent below the cut its kind is
+//! [`SubjectKind::Unknown`] (no terminal grant covers it), and
+//! [`SubjectEvidence::agent_involved`] is true (its proofs are refused).
+//!
 //! The Linux CLI makes itself non-dumpable, so its own `exe` is hidden
 //! from the daemon; its `stat` and `cmdline` are not, and the walk starts
 //! there. Arguments are read only for processes whose executable is hidden
@@ -60,7 +68,7 @@ use std::os::unix::ffi::OsStrExt;
 
 use envcloak_sys::{
     AncestryError, ExeIdentity, LiveProcesses, MAX_ANCESTRY, PeerIdentity, ProcInfo, ProcessTable,
-    StartTime, ancestry_in,
+    StartTime, ancestry_in, reaches_top,
 };
 
 use crate::agents::{AgentCatalog, AgentLabel, CatalogSource};
@@ -95,6 +103,18 @@ impl ProcessInstance {
                 _ => true,
             }
     }
+}
+
+/// Whether a caller's chain reaches the top of the process tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChainEnd {
+    /// The last process's parent is 0: `launchd`, `init`, or the top of a
+    /// pid namespace.
+    Top,
+    /// The walk stopped at [`MAX_ANCESTRY`] processes; what is above is
+    /// not seen, and the evidence fails closed (see the module
+    /// documentation).
+    Cut,
 }
 
 /// One process in the caller's chain.
@@ -267,6 +287,7 @@ impl std::error::Error for EvidenceError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubjectEvidence {
     chain: Vec<Ancestor>,
+    cut: bool,
     terminal: bool,
     claims: Claims,
     claimed: Option<AgentLabel>,
@@ -279,15 +300,16 @@ pub struct SubjectEvidence {
 }
 
 impl SubjectEvidence {
-    /// Evidence from a verified chain, the caller first, and whether the
-    /// caller's session has a controlling terminal. `claimed` labels the
-    /// claims, when the catalog knows one of their markers. `None` for an
-    /// empty chain.
+    /// Evidence from a verified chain, the caller first, whether it
+    /// reaches the top of the tree, and whether the caller's session has a
+    /// controlling terminal. `claimed` labels the claims, when the catalog
+    /// knows one of their markers. `None` for an empty chain.
     ///
     /// [`gather`] builds evidence from the kernel; tests build it from
     /// synthetic chains. An agent label on pid 1 is ignored.
     pub fn from_chain(
         mut chain: Vec<Ancestor>,
+        end: ChainEnd,
         terminal: bool,
         claims: Claims,
         claimed: Option<AgentLabel>,
@@ -320,6 +342,7 @@ impl SubjectEvidence {
         };
         Some(SubjectEvidence {
             chain,
+            cut: end == ChainEnd::Cut,
             terminal,
             claims,
             claimed,
@@ -334,6 +357,12 @@ impl SubjectEvidence {
     /// [`MAX_ANCESTRY`] processes).
     pub fn chain(&self) -> &[Ancestor] {
         &self.chain
+    }
+
+    /// Whether the chain was cut at [`MAX_ANCESTRY`] processes: an agent
+    /// may be above the cut. See the module documentation.
+    pub fn cut(&self) -> bool {
+        self.cut
     }
 
     /// The caller: the process that connected.
@@ -378,7 +407,7 @@ impl SubjectEvidence {
     pub fn kind(&self) -> SubjectKind {
         if self.nearest_agent.is_some() {
             SubjectKind::Agent
-        } else if self.session_leader.is_none() {
+        } else if self.cut || self.session_leader.is_none() {
             SubjectKind::Unknown
         } else if self.claims.claims_agent() {
             SubjectKind::Agent
@@ -397,11 +426,12 @@ impl SubjectEvidence {
             .or(self.claimed.as_ref())
     }
 
-    /// Whether an agent is involved by any evidence: one in the ancestry or
-    /// markers in the claims. Proofs (approve, unlock, rotate, remove,
-    /// recover) from such a caller are refused (SPEC §10b).
+    /// Whether an agent is or may be involved by any evidence: one in the
+    /// ancestry, markers in the claims, or a chain cut at [`MAX_ANCESTRY`]
+    /// (an agent may be above the cut). Proofs (approve, unlock, rotate,
+    /// remove, recover) from such a caller are refused (SPEC §10b).
     pub fn agent_involved(&self) -> bool {
-        self.nearest_agent.is_some() || self.claims.claims_agent()
+        self.nearest_agent.is_some() || self.claims.claims_agent() || self.cut
     }
 
     /// Whether a grant rooted at `root`, approved for a subject of kind
@@ -484,6 +514,11 @@ pub fn gather_in(
         }
     }
     let procs = procs.ok_or(EvidenceError::Changed)?;
+    let end = if reaches_top(&procs) {
+        ChainEnd::Top
+    } else {
+        ChainEnd::Cut
+    };
     let terminal = procs.first().is_some_and(|p| p.controlling_tty);
     let chain: Vec<Ancestor> = procs
         .into_iter()
@@ -511,5 +546,6 @@ pub fn gather_in(
         .markers()
         .iter()
         .find_map(|m| cat.agent_for_marker(m));
-    SubjectEvidence::from_chain(chain, terminal, claims, claimed).ok_or(EvidenceError::CallerGone)
+    SubjectEvidence::from_chain(chain, end, terminal, claims, claimed)
+        .ok_or(EvidenceError::CallerGone)
 }

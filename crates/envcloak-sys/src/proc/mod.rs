@@ -51,9 +51,11 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
-/// How many processes [`ancestry`] reads at most, the peer included. A
-/// deeper chain is cut: the evidence built from it has no session leader
-/// and no agent above the cut, which only makes handling stricter.
+/// How many processes the caller evidence reads at most, the peer
+/// included. A deeper chain is cut, and [`reaches_top`] says so: what sits
+/// above the cut, an agent included, is not seen, so the evidence built
+/// from a cut chain must fail closed (`envcloak-policy` handles it as if an
+/// agent may be there).
 pub const MAX_ANCESTRY: usize = 64;
 /// Arguments kept per process, `argv[0]` included.
 pub const MAX_ARGV: usize = 64;
@@ -254,7 +256,9 @@ pub fn ancestry(
 /// whose parent is 0), at most `max_depth` processes (at least 1), read
 /// from `table` and re-validated as the module documentation describes.
 /// `argv` is read for each process `want_argv` selects, before the
-/// re-validation; a refused read leaves it `None`.
+/// re-validation; a refused read leaves it `None`. A chain cut at
+/// `max_depth` is returned as it is: [`reaches_top`] tells it from a
+/// whole one.
 ///
 /// # Errors
 /// [`AncestryError::PeerGone`] when the peer is not the process the socket
@@ -322,6 +326,15 @@ pub fn ancestry_in(
         }
     }
     Ok(chain)
+}
+
+/// Whether `chain`, as [`ancestry_in`] returned it, reaches the top of the
+/// process tree: its last process's parent is 0 (`launchd`, `init`, or the
+/// top of a pid namespace). A chain cut at its maximum depth does not, nor
+/// does an empty one or one that stopped at a process named as its own
+/// parent. What is above such a chain is unknown.
+pub fn reaches_top(chain: &[ProcInfo]) -> bool {
+    chain.last().is_some_and(|p| p.ppid <= 0)
 }
 
 /// The fields of a Linux `/proc/<pid>/stat` file the walk uses.
