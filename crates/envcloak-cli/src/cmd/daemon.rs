@@ -7,8 +7,10 @@
 //! - macOS: a LaunchAgent, `~/Library/LaunchAgents/<label>.plist`, loaded
 //!   with `launchctl bootstrap gui/<uid>` (or `user/<uid>` without a GUI
 //!   session);
-//! - Linux: a systemd user unit, `~/.config/systemd/user/<label>.service`,
-//!   enabled and started with `systemctl --user`.
+//! - Linux: a systemd user unit, `<label>.service` in the directory the
+//!   user manager reads (`~/.config/systemd/user` for the manager's own
+//!   `HOME` or `XDG_CONFIG_HOME`), enabled and started with
+//!   `systemctl --user`.
 //!
 //! The daemon is the `envcloakd` next to this `envcloak`, or the absolute
 //! path given with `--daemon`; never one found on `PATH`. The definition
@@ -442,18 +444,23 @@ fn install(a: &InstallArgs) -> Result<ExitCode, Failure> {
         let pid = wait_for_daemon()?;
         println!("envcloakd is running under launchd (pid {pid}).");
     } else {
-        let unit_dir = absolute_env("XDG_CONFIG_HOME")
-            .unwrap_or_else(|| home.join(".config"))
-            .join("systemd/user");
-        let unit = unit_dir.join(format!("{}.service", a.label));
-        write_atomically(&unit, &render_systemd(&daemon_text, &env_refs))?;
-        println!("Wrote {}", unit.display());
         let name = format!("{}.service", a.label);
+        let rendered = render_systemd(&daemon_text, &env_refs);
         if !a.start {
+            let unit = absolute_env("XDG_CONFIG_HOME")
+                .unwrap_or_else(|| home.join(".config"))
+                .join("systemd/user")
+                .join(&name);
+            write_atomically(&unit, &rendered)?;
+            println!("Wrote {}", unit.display());
             println!("Start it with: systemctl --user enable --now {name}");
             return Ok(ExitCode::SUCCESS);
         }
-        systemd_load(&name, &unit)?;
+        let manager = Manager::find()?;
+        let unit = manager.unit_dir().join(&name);
+        write_atomically(&unit, &rendered)?;
+        println!("Wrote {}", unit.display());
+        manager.load(&name)?;
         let pid = wait_for_daemon()?;
         println!("envcloakd is running under systemd (pid {pid}).");
     }
@@ -494,28 +501,83 @@ fn systemctl() -> Result<&'static str, Failure> {
         .ok_or_else(|| failure("service_manager", "systemctl was not found"))
 }
 
-fn systemd_load(name: &str, unit: &Path) -> Result<(), Failure> {
-    let sc = systemctl()?;
-    let user = OsStr::new("--user");
-    let fail = |what: &'static str| failure("service_manager", what);
-    if !succeeded(&run_tool(sc, &[user, "daemon-reload".as_ref()])?) {
-        return Err(fail(
+/// The systemd user manager. It looks for units under its own
+/// `XDG_CONFIG_HOME` (or `HOME/.config`), which can differ from this
+/// shell's; `systemctl --user` edits unit files where its own environment
+/// says. So the unit goes where the manager looks, and systemctl runs with
+/// the manager's `HOME` and `XDG_CONFIG_HOME`.
+#[derive(Debug)]
+struct Manager {
+    systemctl: &'static str,
+    home: PathBuf,
+    config: Option<PathBuf>,
+}
+
+impl Manager {
+    fn unreachable() -> Failure {
+        failure(
+            "service_manager",
             "systemctl --user could not reach your user service manager",
-        ));
+        )
     }
-    if !succeeded(&run_tool(sc, &[user, "enable".as_ref(), name.as_ref()])?) {
-        // The unit is outside the manager's search path (another
-        // XDG_CONFIG_HOME): link it in first.
-        let linked = run_tool(sc, &[user, "link".as_ref(), unit.as_os_str()])?;
-        let enabled = run_tool(sc, &[user, "enable".as_ref(), name.as_ref()])?;
-        if !succeeded(&linked) || !succeeded(&enabled) {
+
+    /// Asks the manager for its environment.
+    fn find() -> Result<Manager, Failure> {
+        let systemctl = systemctl()?;
+        let out = run_tool(systemctl, &["--user".as_ref(), "show-environment".as_ref()])?;
+        if !succeeded(&out) {
+            return Err(Self::unreachable());
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        // `KEY=value`; a value systemd had to quote (`$'...'`) is not used.
+        let var = |name: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name)?.strip_prefix('='))
+                .filter(|v| !v.starts_with("$'"))
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+        };
+        let home = var("HOME").ok_or_else(Self::unreachable)?;
+        Ok(Manager {
+            systemctl,
+            home,
+            config: var("XDG_CONFIG_HOME"),
+        })
+    }
+
+    fn unit_dir(&self) -> PathBuf {
+        self.config
+            .clone()
+            .unwrap_or_else(|| self.home.join(".config"))
+            .join("systemd/user")
+    }
+
+    /// `systemctl --user <args>`, seeing the unit files the manager sees.
+    fn run(&self, args: &[&str]) -> Result<Output, Failure> {
+        let mut cmd = Command::new(self.systemctl);
+        cmd.arg("--user").args(args).env("HOME", &self.home);
+        match &self.config {
+            Some(c) => cmd.env("XDG_CONFIG_HOME", c),
+            None => cmd.env_remove("XDG_CONFIG_HOME"),
+        };
+        cmd.output()
+            .map_err(|_| failure("service_manager", "the service manager could not be run"))
+    }
+
+    /// Reloads, enables and (re)starts the unit `name`.
+    fn load(&self, name: &str) -> Result<(), Failure> {
+        let fail = |what: &'static str| failure("service_manager", what);
+        if !succeeded(&self.run(&["daemon-reload"])?) {
+            return Err(Self::unreachable());
+        }
+        if !succeeded(&self.run(&["enable", name])?) {
             return Err(fail("systemctl --user could not enable the unit"));
         }
+        if !succeeded(&self.run(&["restart", name])?) {
+            return Err(fail("systemctl --user could not start the unit"));
+        }
+        Ok(())
     }
-    if !succeeded(&run_tool(sc, &[user, "restart".as_ref(), name.as_ref()])?) {
-        return Err(fail("systemctl --user could not start the unit"));
-    }
-    Ok(())
 }
 
 fn uninstall(label: &str) -> Result<ExitCode, Failure> {
@@ -531,19 +593,21 @@ fn uninstall(label: &str) -> Result<ExitCode, Failure> {
             .join(format!("{label}.plist"));
         remove(&plist)?;
     } else {
-        let sc = systemctl()?;
         let name = format!("{label}.service");
-        let user = OsStr::new("--user");
-        let _ = run_tool(
-            sc,
-            &[user, "disable".as_ref(), "--now".as_ref(), name.as_ref()],
-        );
-        let unit = absolute_env("XDG_CONFIG_HOME")
-            .unwrap_or_else(|| home.join(".config"))
-            .join("systemd/user")
-            .join(&name);
-        remove(&unit)?;
-        let _ = run_tool(sc, &[user, "daemon-reload".as_ref()]);
+        match Manager::find() {
+            Ok(m) => {
+                let _ = m.run(&["disable", "--now", &name]);
+                remove(&m.unit_dir().join(&name))?;
+                let _ = m.run(&["daemon-reload"]);
+            }
+            // No manager to stop it: remove what `--no-start` wrote.
+            Err(_) => remove(
+                &absolute_env("XDG_CONFIG_HOME")
+                    .unwrap_or_else(|| home.join(".config"))
+                    .join("systemd/user")
+                    .join(&name),
+            )?,
+        }
     }
     println!("Uninstalled the envcloakd service. The vault is unchanged.");
     Ok(ExitCode::SUCCESS)

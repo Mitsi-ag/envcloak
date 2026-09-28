@@ -8,7 +8,7 @@ two drift apart.
 | File | Service manager | Installed as |
 |---|---|---|
 | `launchd/ai.envcloak.envcloakd.plist` | launchd (macOS) | `~/Library/LaunchAgents/ai.envcloak.envcloakd.plist`, loaded into `gui/<uid>` |
-| `systemd/envcloakd.service` | systemd (Linux) | `~/.config/systemd/user/ai.envcloak.envcloakd.service`, enabled for `default.target` |
+| `systemd/envcloakd.service` | systemd (Linux) | `~/.config/systemd/user/ai.envcloak.envcloakd.service` (the user manager's own config directory), enabled for `default.target` |
 
 Placeholders, filled in when the file is written:
 

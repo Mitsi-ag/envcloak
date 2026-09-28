@@ -74,12 +74,9 @@ fn parse(args: &[&str]) -> Option<CreateArgs> {
 /// `64MiB`, `256MiB`, `1GiB`: Argon2id memory in KiB, within the bounds
 /// (64 MiB to 4 GiB).
 fn parse_size_kib(v: &str) -> Option<u32> {
-    let (digits, factor) = if let Some(d) = v.strip_suffix("MiB") {
-        (d, 1024u64)
-    } else if let Some(d) = v.strip_suffix("GiB") {
-        (d, 1024 * 1024)
-    } else {
-        return None;
+    let (digits, factor) = match v.strip_suffix("MiB") {
+        Some(d) => (d, 1024u64),
+        None => (v.strip_suffix("GiB")?, 1024 * 1024),
     };
     if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;

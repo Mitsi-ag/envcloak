@@ -128,7 +128,7 @@ The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then remo
 
 ## Service definitions
 
-`envcloak daemon install` writes `packaging/launchd/ai.envcloak.envcloakd.plist` (a LaunchAgent, loaded with `launchctl bootstrap gui/<uid>`, or `user/<uid>` without a GUI session) or `packaging/systemd/envcloakd.service` (a systemd user unit, enabled and started with `systemctl --user`), filled in with the absolute path of the `envcloakd` beside `envcloak` (or `--daemon`'s absolute path) and the `HOME` and, on Linux, `XDG_*` directories of the installing shell. `launchctl` and `systemctl` are run by absolute path. `envcloak daemon uninstall` stops and removes it; the vault is untouched. See `packaging/README.md`.
+`envcloak daemon install` writes `packaging/launchd/ai.envcloak.envcloakd.plist` (a LaunchAgent, loaded with `launchctl bootstrap gui/<uid>`, or `user/<uid>` without a GUI session) or `packaging/systemd/envcloakd.service` (a systemd user unit, written where the user manager reads units, under the manager's own `XDG_CONFIG_HOME` or `HOME/.config`, and enabled and started with `systemctl --user` run with that environment), filled in with the absolute path of the `envcloakd` beside `envcloak` (or `--daemon`'s absolute path) and the `HOME` and, on Linux, `XDG_*` directories of the installing shell. `launchctl` and `systemctl` are run by absolute path. `envcloak daemon uninstall` stops and removes it; the vault is untouched. See `packaging/README.md`.
 
 ## Gates
 

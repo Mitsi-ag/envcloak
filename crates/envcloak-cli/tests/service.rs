@@ -30,10 +30,13 @@ impl Installed<'_> {
         let mut cmd = cli_command(self.home, args, fds);
         if let Some(dir) = std::env::var_os("ENVCLOAK_TEST_SERVICE_RUNTIME_DIR") {
             let dir = std::path::PathBuf::from(dir);
-            cmd.env("XDG_RUNTIME_DIR", &dir).env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}/bus", dir.display()),
-            );
+            cmd.env("XDG_RUNTIME_DIR", &dir);
+            if dir.join("bus").exists() {
+                cmd.env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}/bus", dir.display()),
+                );
+            }
         }
         finish_within(cmd, Duration::from_secs(120))
     }
