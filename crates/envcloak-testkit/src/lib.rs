@@ -21,6 +21,10 @@
 //!   its log collected, killed on drop.
 //! - [`crash`]: gate 19's core-dump control and signed copies, shared by
 //!   the tests of both binaries.
+//! - [`testkit_bin`]: this crate's programs, for the tests of other crates:
+//!   `fixture-agent`, the stand-in agent the builtin agent catalog knows,
+//!   and `ec-probe`, a caller that connects to a socket after escaping its
+//!   process tree in the ways gate 26 lists.
 
 mod canary;
 pub mod crash;
@@ -37,6 +41,28 @@ pub use detect::{
 };
 pub use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeReport, ProbeSession};
 pub use home::{TEST_ENV_VARS, TEST_PATH, TestHome};
+
+/// The path of `name`, one of this crate's programs (`fixture-agent`,
+/// `ec-probe`), built next to the running test binary: in the target
+/// directory above its `deps/`.
+///
+/// # Panics
+/// When it is not there: `cargo test --workspace` builds it, as does
+/// `cargo build -p envcloak-testkit --bins`.
+pub fn testkit_bin(name: &str) -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|e| panic!("no current exe: {e}"));
+    let dir = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .unwrap_or_else(|| panic!("the test binary is not in a target directory"));
+    let path = dir.join(name);
+    assert!(
+        path.is_file(),
+        "{} is missing: run the tests with --workspace, or cargo build -p envcloak-testkit --bins",
+        path.display()
+    );
+    path
+}
 
 /// Default probe window: a freed block holding any 12 consecutive bytes of a
 /// canary counts as holding it.
