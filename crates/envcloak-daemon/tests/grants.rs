@@ -613,18 +613,42 @@ fn concurrent_requests_on_a_once_grant_cover_exactly_one() {
     let grant = f.approve_ok(&id, ApprovalOptions::once(Duration::from_secs(600)));
     let params = f.params(&["./emit"]);
     let paths = common::run_paths(&f.home);
+    // A connection still held when the requests start, as one the daemon
+    // has not yet seen closed: a request's connection waits for its place.
+    let mut held = client(&f.home);
+    held.status().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+    });
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
     let handles: Vec<_> = (0..8)
         .map(|_| {
             let (params, paths, barrier) = (params.clone(), paths.clone(), barrier.clone());
             std::thread::spawn(move || {
-                let mut c = Client::connect(&paths).unwrap();
+                // The daemon serves at most 8 connections per process, and
+                // one the fixture just closed may not be given back yet:
+                // the daemon then closes a new one at accept. A
+                // connection is kept once it is served, so all 8 are open
+                // at the barrier.
+                let end = Instant::now() + Duration::from_secs(10);
+                let mut c = loop {
+                    let mut c = Client::connect(&paths).unwrap();
+                    match c.status() {
+                        Ok(_) => break c,
+                        Err(e) => {
+                            assert!(Instant::now() < end, "never served: {e:?}");
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                };
                 barrier.wait();
                 c.run_request(&params).unwrap()
             })
         })
         .collect();
     let decisions: Vec<DecisionView> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    release.join().unwrap();
     let covered: Vec<&DecisionView> = decisions
         .iter()
         .filter(|d| matches!(d, DecisionView::Covered { .. }))
