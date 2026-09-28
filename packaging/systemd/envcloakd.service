@@ -1,0 +1,15 @@
+[Unit]
+Description=EnvCloak vault daemon
+Documentation=https://github.com/Mitsi-ag/envcloak
+
+[Service]
+Type=simple
+ExecStart=@ENVCLOAKD@ --foreground
+@ENVIRONMENT@Restart=on-failure
+RestartSec=2
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
