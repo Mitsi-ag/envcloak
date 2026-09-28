@@ -17,13 +17,20 @@
 //! - [`probe_canaries`]: arms the allocator probe (gate 11) with canaries.
 //! - [`TestHome`]: an isolated HOME and XDG tree under a short `/tmp` path,
 //!   and a cleared environment for the processes a test starts.
+//! - [`Daemon`]: an `envcloakd --foreground` child in a [`TestHome`], with
+//!   its log collected, killed on drop.
+//! - [`crash`]: gate 19's core-dump control and signed copies, shared by
+//!   the tests of both binaries.
 
 mod canary;
+pub mod crash;
+mod daemon;
 mod detect;
 mod encode;
 mod home;
 
 pub use canary::{Canary, by_label, canaries, fresh_seed, labels};
+pub use daemon::{Daemon, daemon_run_dir, daemon_socket};
 pub use detect::{
     Detector, Found, Hit, SweptPath, assert_no_canary, assert_sweep_clean, encodings, find,
     sweep_dir,

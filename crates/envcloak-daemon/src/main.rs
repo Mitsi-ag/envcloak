@@ -1,16 +1,37 @@
-//! `envcloakd`: the EnvCloak vault broker daemon.
+//! `envcloakd`: the EnvCloak vault broker daemon, the only process that
+//! holds the unlocked vault key (SPEC §4).
 //!
-//! Every run starts with process hardening (SPEC §5): core dumps off and, on
-//! Linux, non-dumpable. The daemon itself arrives in task T7.
+//! It is started only by launchd or systemd from `envcloak daemon
+//! install`, or by the user as `envcloakd --foreground` by absolute path
+//! (SPEC §4.1). It never daemonizes itself, and the CLI never starts it.
 //!
-//! `envcloakd internal hardening` is a hidden, value-free diagnostic that
-//! prints `key=value` hardening lines.
+//! Every run starts with process hardening (SPEC §5): core dumps off and,
+//! on Linux, non-dumpable, before any argument is read.
+//!
+//! - `envcloakd --foreground [--idle-lock <duration>]` serves the socket
+//!   until SIGTERM, SIGINT or SIGHUP, which lock the vault first. The idle
+//!   limit is 8 hours by default, at most 24 (`90m`, `8h`, `3600s`).
+//! - `envcloakd internal hardening` is a hidden, value-free diagnostic that
+//!   prints `key=value` hardening lines.
+
+mod audit;
+mod clock;
+mod lock;
+mod server;
+mod state;
 
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
+
+use server::{DaemonConfig, run_daemon};
 
 #[global_allocator]
 static ALLOCATOR: envcloak_sys::WipingAllocator = envcloak_sys::WipingAllocator;
+
+const USAGE: &str = "usage: envcloakd --foreground [--idle-lock <duration>]\n\
+    envcloakd is started by launchd or systemd (run `envcloak daemon install`), \
+    or by you with `envcloakd --foreground`, by absolute path";
 
 fn main() -> ExitCode {
     envcloak_sys::harden_process();
@@ -29,10 +50,87 @@ fn main() -> ExitCode {
                 Err(_) => ExitCode::FAILURE,
             }
         }
+        ["--foreground", rest @ ..] => match parse_options(rest) {
+            Some(cfg) => serve(cfg),
+            None => usage(),
+        },
         // Never echo arguments.
-        _ => {
-            eprintln!("envcloakd: the daemon is not available in this build yet");
-            ExitCode::from(2)
+        _ => usage(),
+    }
+}
+
+fn usage() -> ExitCode {
+    eprintln!("{USAGE}");
+    ExitCode::from(2)
+}
+
+fn serve(cfg: DaemonConfig) -> ExitCode {
+    match run_daemon(cfg) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("envcloakd: {}: {}", e.token(), e.message());
+            ExitCode::FAILURE
         }
+    }
+}
+
+fn parse_options(args: &[&str]) -> Option<DaemonConfig> {
+    let mut cfg = DaemonConfig {
+        idle_limit: lock::DEFAULT_IDLE,
+    };
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match *arg {
+            "--idle-lock" => cfg.idle_limit = parse_idle(rest.next()?)?,
+            _ => return None,
+        }
+    }
+    Some(cfg)
+}
+
+/// `<n>s`, `<n>m` or `<n>h`, from 1 minute to 24 hours.
+fn parse_idle(s: &str) -> Option<Duration> {
+    let (digits, unit) = s.split_at(s.len().checked_sub(1)?);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = digits.parse().ok()?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n.checked_mul(60)?,
+        "h" => n.checked_mul(3600)?,
+        _ => return None,
+    };
+    let d = Duration::from_secs(secs);
+    (lock::MIN_IDLE..=lock::MAX_IDLE).contains(&d).then_some(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_limits_parse_within_bounds() {
+        assert_eq!(parse_idle("8h"), Some(Duration::from_secs(8 * 3600)));
+        assert_eq!(parse_idle("90m"), Some(Duration::from_secs(5400)));
+        assert_eq!(parse_idle("60s"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_idle("24h"), Some(Duration::from_secs(86_400)));
+        for bad in [
+            "",
+            "h",
+            "8",
+            "25h",
+            "59s",
+            "-1h",
+            "1.5h",
+            "8H",
+            "8 h",
+            "99999999999999999999h",
+        ] {
+            assert_eq!(parse_idle(bad), None, "{bad}");
+        }
+        assert!(parse_options(&["--idle-lock", "2h"]).is_some());
+        assert!(parse_options(&["--idle-lock"]).is_none());
+        assert!(parse_options(&["--other"]).is_none());
     }
 }
