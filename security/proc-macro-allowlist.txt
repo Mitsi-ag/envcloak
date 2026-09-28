@@ -9,3 +9,4 @@
 # line, followed by `#` and the reason. Adding a line needs review.
 
 zerocopy-derive  # derives for zerocopy, which ppv-lite86 uses under proptest (envcloak-redact dev-dependency); emits trait impls only
+serde_derive     # derives Serialize and Deserialize for the daemon protocol's message types (envcloak-ipc); emits trait impls only

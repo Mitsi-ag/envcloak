@@ -1,5 +1,6 @@
 [package]
 name = "envcloak-ipc"
+description = "EnvCloak daemon protocol: length-prefixed JSON-RPC frames over a Unix socket, the verified client and the socket's location"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,4 +11,24 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test support only: connecting while expecting another uid than this
+# process's, so a test can stand in for a server run by another user.
+# Release binaries never enable it.
+testing = []
+
 [dependencies]
+base64.workspace = true
+envcloak-core.workspace = true
+envcloak-sys.workspace = true
+secrecy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+# Enables the `testing` feature for this crate's own tests.
+envcloak-ipc = { path = ".", features = ["testing"] }
+envcloak-testkit.workspace = true
+static_assertions.workspace = true
+tempfile.workspace = true
