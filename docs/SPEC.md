@@ -699,7 +699,7 @@ Grant {
 }
 ```
 
-**Root selection.** If a known agent is in the caller's ancestry, the root is the agent process nearest the caller. Otherwise the root is the caller's session leader (`getsid`). If the session leader is no longer alive, the root is the topmost live ancestor in that session. pid 1 is never a root, nor a session leader for this rule. An agent that only a user extension recognizes, or that is recognized only by its `argv[0]`, script or command name, is the root only at or below the process the session rules would pick.
+**Root selection.** If a known agent is in the caller's ancestry, the root is the agent process nearest the caller. Otherwise the root is the caller's session leader (`getsid`). If the session leader is no longer alive, the root is the topmost live ancestor in that session. pid 1 is never a root, nor a session leader for this rule; a known agent that is pid 1 (in a container) still makes the caller an agent subject. An agent that only a user extension recognizes, or that is recognized only by its `argv[0]`, script or command name, is the root only at or below the process the session rules would pick.
 
 **Subject kind.** `agent` when a known agent is in the ancestry; `unknown` when the ancestry no longer reaches the caller's session leader (an orphan), or the walk was cut at its depth limit (§10a) with no known agent below the cut, whatever the caller claims; `agent` when the caller claims agent markers; `unknown` in a session without a controlling terminal; otherwise `terminal`. docs/AGENTS.md has the details.
 

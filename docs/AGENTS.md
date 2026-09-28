@@ -80,7 +80,7 @@ Neither kernel offers a race-free parent chain, so the walk is checked:
 
 A change means the tree moved under the walk (a parent exited, a process was reparented): the daemon walks again, up to 3 times, and then refuses with `ancestry_changed`. A caller that exited is `caller_gone`. A parent the kernel will not show while its child still names it (a process that exits has its children reparented before its entry goes) is hidden, not changed: the request is refused at once with `ancestry_hidden` (see Limits). The walk stops at the top of the tree or after 64 processes. A cut chain hides what is above the cut, and an agent could put itself there by running its command under enough nested shells with `env -i`, so a cut chain fails closed: unless a known agent is found below the cut, the caller's kind is `unknown` (no terminal grant covers it) and its proofs are refused, as for an agent. Real chains are about 10 processes deep.
 
-Only processes of the caller's uid, other than pid 1, are classified.
+Only processes of the caller's uid are classified. pid 1 is one only in a container (the host's runs as root), where it may be the agent the entrypoint started.
 
 Arguments are read only for a process whose executable is hidden from the daemon (so `argv[0]` stands in for it) or that runs an interpreter (so its script decides): at most 17 (`argv[0]` and the 16 after it, all the catalog looks at) and 16 KiB. They can hold other programs' secrets, so they are held in storage allocated once and wiped on drop (`envcloak_sys::Argv`), which the catalog borrows to compare; nothing copies them out, `Debug` shows only their count, and errors are fixed text. They are dropped after classification; the evidence holds pids, start times, executables and labels.
 
@@ -99,7 +99,7 @@ The Linux CLI makes itself non-dumpable, so its own `/proc/<pid>/exe` is hidden 
 2. otherwise the caller's session leader, when it is in the verified chain (so alive, with its start time checked);
 3. otherwise the topmost ancestor still in the caller's session: the session leader died, or the caller left its tree.
 
-pid 1 (`launchd`, `init`) is never a root and never counts as a session leader: every process descends from it, and GUI apps on macOS run in its session.
+pid 1 (`launchd`, `init`) is never a root and never counts as a session leader: every process descends from it, and GUI apps on macOS run in its session. A known agent that is pid 1 (a container whose entrypoint ends in `exec claude`, with the daemon started in it) is still an agent for the kind, the agent barrier and proofs; rules 2 and 3 pick the root.
 
 Rule 1 may pick an agent above the caller's session, and must: Claude Code and Codex run each command in a session of its own, without a terminal, so the command leads its own session. Only a builtin match on the agent's executable path or signature does that. An agent matched only on `argv[0]`, a script or its command name, or only through an extension, is the root only at or below the point rule 2 or 3 would pick; above it, rules 2 and 3 apply. So a process that calls itself `claude`, and an extension that matches a terminal emulator or an IDE, cannot widen a grant beyond the caller's session; they still make the caller an agent subject, stand as a barrier and refuse its proofs.
 

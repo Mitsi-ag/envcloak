@@ -18,10 +18,13 @@
 //!
 //!   `launchd` or `init` (pid 1) is never a root, and never a session
 //!   leader for this purpose: every process descends from it, and GUI apps
-//!   on macOS run in its session. Rule 1 may pick an agent above the
-//!   caller's session, as it must: Claude Code and Codex run each command
-//!   in a session of its own. Only a builtin match on the agent's
-//!   executable or signature may do that
+//!   on macOS run in its session. A known agent that is pid 1 (a container
+//!   whose entrypoint execs one) is still an agent for the kind, the
+//!   barrier and proofs, and rules 2 and 3 pick the root.
+//!
+//!   Rule 1 may pick an agent above the caller's session, as it must:
+//!   Claude Code and Codex run each command in a session of its own. Only
+//!   a builtin match on the agent's executable or signature may do that
 //!   ([`AgentLabel::may_root_above_session`]). An agent matched only on
 //!   what it says about itself (`argv[0]`, its script, its command name,
 //!   all of which a process sets) or only through a user extension is the
@@ -329,9 +332,9 @@ impl SubjectEvidence {
     /// knows one of their markers. `None` for an empty chain.
     ///
     /// [`gather`] builds evidence from the kernel; tests build it from
-    /// synthetic chains. An agent label on pid 1 is ignored.
+    /// synthetic chains. pid 1 is never the root, whatever its label.
     pub fn from_chain(
-        mut chain: Vec<Ancestor>,
+        chain: Vec<Ancestor>,
         end: ChainEnd,
         terminal: bool,
         claims: Claims,
@@ -352,13 +355,11 @@ impl SubjectEvidence {
         let session_leader =
             sid.and_then(|s| (0..in_session).find(|&j| chain[j].instance.pid == s));
         let limit = session_leader.unwrap_or(in_session - 1);
-        for a in &mut chain {
-            if a.instance.pid == 1 {
-                a.agent = None;
-            }
-        }
         let nearest_agent = chain.iter().position(|a| a.agent.is_some());
-        let may_root = |n: usize| n <= limit || roots_above_session(&chain[n]);
+        // A known agent that is pid 1 (a container's entrypoint) makes the
+        // caller an agent subject, but pid 1 is never a root.
+        let may_root =
+            |n: usize| chain[n].instance.pid != 1 && (n <= limit || roots_above_session(&chain[n]));
         let root = match nearest_agent {
             Some(n) if may_root(n) => n,
             _ => limit,
@@ -524,9 +525,10 @@ pub fn gather(
 }
 
 /// Whether `p` may be classified as an agent: a process of the caller's
-/// uid, and not pid 1.
+/// uid. pid 1 is one only in a container (the host's runs as root), where
+/// it may be the agent the entrypoint started.
 fn classifiable(p: &ProcInfo, uid: u32) -> bool {
-    p.pid != 1 && p.uid == uid
+    p.uid == uid
 }
 
 /// Walks `peer`'s ancestry in `table` (up to [`GATHER_ATTEMPTS`] times

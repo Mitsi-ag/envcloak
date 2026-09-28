@@ -196,7 +196,7 @@ fn an_orphan_has_lost_its_ancestry() {
 }
 
 #[test]
-fn pid_1_is_never_a_root_nor_an_agent() {
+fn pid_1_is_never_a_root() {
     // A GUI app runs in launchd's session: launchd is its session leader,
     // and is not taken as one.
     let e = ev(
@@ -216,14 +216,84 @@ fn pid_1_is_never_a_root_nor_an_agent() {
     let e = ev(vec![p(90, 1, None), p(1, 1, None)], true, &[]);
     assert!(e.orphaned());
     assert!(e.agent_involved());
+}
 
+/// A known agent that is pid 1 of the daemon's pid namespace (a container
+/// whose entrypoint ends in `exec claude`, with envcloakd started in it) is
+/// an agent all the same: the kind, the label, the barrier and refused
+/// proofs. Only the root comes from the session rules, as pid 1 is never
+/// one.
+#[test]
+fn an_agent_that_is_pid_1_is_an_agent_but_no_root() {
+    let agent_at_1 = |id| p(1, 1, builtin(id));
+    // A command the agent runs in a session of its own, without a
+    // terminal, under `env -i` (no markers), and in its own tree.
+    for chain in [
+        vec![p(95, 95, None), agent_at_1("claude-code")],
+        vec![p(96, 95, None), p(95, 95, None), agent_at_1("claude-code")],
+    ] {
+        let e = ev(chain, false, &[]);
+        assert_eq!(e.nearest_agent().unwrap().1.id, "claude-code");
+        assert_eq!(e.kind(), SubjectKind::Agent);
+        assert_eq!(e.label().unwrap().id, "claude-code");
+        assert!(e.agent_involved(), "its proofs are refused");
+        assert_eq!(e.root().pid, 95, "the session leader, never pid 1");
+        assert!(e.covered_by(&e.root(), SubjectKind::Agent));
+        for kind in [
+            SubjectKind::Agent,
+            SubjectKind::Unknown,
+            SubjectKind::Terminal,
+        ] {
+            assert!(!e.covered_by(&inst(1, 10), kind), "{kind:?}");
+        }
+    }
+    // A pseudo-terminal the agent opened (`script`): its session has a
+    // terminal, and is still no terminal subject's.
     let e = ev(
-        vec![p(90, 90, None), p(1, 1, builtin("claude-code"))],
+        vec![p(97, 96, None), p(96, 96, None), agent_at_1("codex")],
         true,
         &[],
     );
-    assert!(e.nearest_agent().is_none());
-    assert_eq!(e.root().pid, 90);
+    assert_eq!(e.kind(), SubjectKind::Agent);
+    assert!(e.agent_involved());
+    assert!(!e.covered_by(&e.root(), SubjectKind::Terminal));
+    assert!(e.covered_by(&e.root(), SubjectKind::Agent));
+    // An agent below pid 1 is still the nearer one, and the root.
+    let e = ev(
+        vec![
+            p(97, 96, None),
+            p(96, 96, builtin("fixture")),
+            agent_at_1("codex"),
+        ],
+        true,
+        &[],
+    );
+    assert_eq!(e.nearest_agent().unwrap().0, 1);
+    assert_eq!(e.root().pid, 96);
+}
+
+/// The container of the test above, read from a process table: pid 1 of
+/// the caller's uid is classified; the host's, which runs as root, never
+/// is.
+#[test]
+fn gather_classifies_pid_1_of_the_callers_uid() {
+    let cat = AgentCatalog::builtin();
+    for (uid, agent) in [(501, true), (0, false)] {
+        let mut t = Table::default()
+            .add(vec![info(95, 1, 95, 501, Some("/usr/bin/env"))])
+            .add(vec![info(1, 0, 1, uid, Some("/usr/local/bin/claude"))]);
+        let e = gather_in(&mut t, &peer(95), Claims::none(), &cat).unwrap();
+        assert_eq!(e.chain()[1].agent.is_some(), agent, "uid {uid}");
+        assert_eq!(e.root().pid, 95, "uid {uid}");
+        if agent {
+            assert_eq!(e.label().unwrap().id, "claude-code");
+            assert_eq!(e.kind(), SubjectKind::Agent);
+            assert!(e.agent_involved());
+        } else {
+            assert!(e.label().is_none());
+            assert_eq!(e.kind(), SubjectKind::Terminal);
+        }
+    }
 }
 
 #[test]
