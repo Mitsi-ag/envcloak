@@ -422,7 +422,7 @@ Requests with duplicate auth headers or ambiguous framing are rejected. Response
 
 ### 6.3 Adding a key without the agent seeing it
 
-- `envcloak add openai --account you@work.com` reads the value from `/dev/tty` with echo off, or from `--stdin` for scripts. Values never appear on argv. With the macOS app (M3), `--ask` opens a "Paste key" sheet: the value travels from the user straight into the vault, and the agent that ran the command learns only the new slug. A key added through an agent-initiated `--ask` gets no implicit grant, and the sheet shows the requesting process evidence.
+- `envcloak add openai --account you@work.com` reads the value from `/dev/tty` with echo off, or from `--stdin` for scripts (a pipe, read to its end, less one final line ending). Values never appear on argv, and a name given there that is shaped like a key (a slug, account or variable) is refused rather than kept. Without `--slug`, the item is named after its provider (`openai`, then `openai-2`, ...). With the macOS app (M3), `--ask` opens a "Paste key" sheet: the value travels from the user straight into the vault, and the agent that ran the command learns only the new slug. A key added through an agent-initiated `--ask` gets no implicit grant, and the sheet shows the requesting process evidence.
 - `--from-clipboard` (M3) reads the clipboard, then clears it, and warns that clipboard history tools may already hold the value.
 - **Clipboard.** Copies are marked `org.nspasteboard.ConcealedType` and `org.nspasteboard.TransientType`. After 30 seconds the clipboard is cleared, but only if its change count still matches EnvCloak's own copy.
 - The provider is auto-detected from the key's prefix (registry patterns: `sk-proj-`, `sk-ant-`, `AIza`, `ghp_`, `github_pat_`, `sk_live_`, `rk_live_`, `xoxb-`, `AKIA`, and so on), which pre-fills docs, billing and allowed hosts.
@@ -746,7 +746,7 @@ A manifest change that leaves the bindings a subset does not prompt; the new has
 - adding or removing unlockers;
 - standing approvals.
 
-Adding a new item needs none, because nothing is bound to it yet. Replaced values are kept as up to 3 sealed prior versions.
+Adding a new item needs none, because nothing is bound to it yet. Replaced values are kept as up to 3 sealed prior versions. Removing an item (`envcloak rm`) first writes an encrypted backup of the vault, which keeps its values for `envcloak recover`; when the backup cannot be written, nothing is removed.
 
 **Standing approvals (M2).** A standing approval creates session grants automatically for one agent's code identity in one project, for up to 30 days. It covers test-classified keys only; live keys are never standing. The app labels it: "any <agent> session in this project, including one started by another program, gets these keys without asking."
 

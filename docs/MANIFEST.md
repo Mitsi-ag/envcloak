@@ -110,6 +110,29 @@ A `--env-file` is a dotenv-style file of at most 1 MiB. It can hold real values,
 - A value may not contain a NUL byte.
 - A value that is exactly `envcloak://<slug>[#field]` after unquoting is a reference; one that starts with `envcloak://` and is anything else is an error. Every other value is an ordinary variable, passed to the command as written.
 
+## Adding a binding: `envcloak ref`
+
+`envcloak ref NAME=<slug>[#field] [--profile NAME]` sets one binding in the nearest manifest, in `[env]` or in `[env.<profile>]` (made when missing). The manifest holds names only, so it reads and writes no value and needs no daemon; when one answers, it says whether the reference resolves. A binding written is not an approval: `envcloak run` still asks for it.
+
+The edit keeps the rest of the file as it was: comments, order, spacing and quoting stay, a new binding goes at the end of its table, and a replaced one keeps its comment. Setting a binding that is there already (in either form) writes nothing. The write is atomic:
+
+1. The manifest is opened as the daemon opens it (above): through its directory's descriptor, never through a symlink, a regular file of this user of at most 64 KiB. It must parse; its device, inode, size and modification time are noted.
+2. The new text must parse too, with the binding where it was put.
+3. It is written to `.envcloak.toml.<hex>.tmp` beside the manifest (`O_EXCL`, mode 0600, then the manifest's own mode) and flushed.
+4. The manifest is looked at again. When it changed (another program wrote it) or the directory's path names another directory, the new file is removed and nothing is replaced (`manifest_changed`).
+5. The new file is renamed over the manifest, and the directory flushed.
+
+A crash leaves the old manifest or the new one, never part of either. A name or reference shaped like a key or token is refused before anything is read (`value_on_argv`): values are never taken on the command line (SPEC §15.2 gate 13).
+
+## Checking a project: `envcloak check`
+
+`envcloak check` reports, with names, lines and provider ids only:
+
+- every binding of the manifest, in `[env]` and in each profile's own table, and whether the vault has its item and field. The daemon opens the manifest itself, as for a run, and answers with a status per binding (IPC.md `items.check`);
+- the project's env files: `.env` and every `.env.<name>` in the manifest's directory (at most 64), read as `run --env-file` reads one, through the directory's descriptor, never following a symlink or blocking on a FIFO, regular files of this user of at most 1 MiB. Each ordinary variable whose value a provider's key pattern matches is a plaintext key, reported by line, variable and provider; the values are matched in place and wiped with the parse. Their `envcloak://` references are checked with the manifest's.
+
+A name or reference shaped like a key is reported without its text. The exit is 0 when every reference resolves and no env file holds a plaintext key or could not be read, and 1 with `check_failed` otherwise. When the daemon cannot be asked (not running, the vault locked), the env files are still checked, and the report says the references were not.
+
 ## Errors
 
 Errors are value-free. A manifest error is a kind and a place (a manifest line, a `--ref` argument's position or an env-file line); an env-file error is a kind and a line. The TOML library's own messages quote the source, so they are never passed on: a syntax error reports `not valid TOML` and its line. A binding that cannot be tied to an item names its variable and the kind, not the reference.

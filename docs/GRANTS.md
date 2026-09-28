@@ -39,7 +39,7 @@ A manifest change that leaves the bindings a subset does not prompt; the daemon 
 
 **Deadlines.** An approval sets two: the wall clock plus the grant's length, and time awake plus the same length. Either passing ends the grant, so a clock stepped either way cannot lengthen one. Lengths: 8 hours by default (`--for` sets it, from 30 seconds), at most 24 hours for an agent subject and 12 hours for a terminal or unknown subject: an unknown subject's evidence is missing, so it takes the tighter bound.
 
-**A grant ends on** expiry; its first use, if `once`; the root process exiting (a tick every second drops grants whose root's pid is gone or has another start time); `envcloak grants revoke <id> | --all`, which any client may run (tightening needs no proof); lock, for any reason (a request, idle time, sleep, a signal), which also drops every pending request; a daemon restart, which starts empty; a policy epoch bump; a vault epoch change.
+**A grant ends on** expiry; its first use, if `once`; the root process exiting (a tick every second drops grants whose root's pid is gone or has another start time); `envcloak grants revoke <id> | --all`, which any client may run (tightening needs no proof); lock, for any reason (a request, idle time, sleep, a signal), which also drops every pending request; a daemon restart, which starts empty; a policy epoch bump; a vault epoch change; the removal of an item it binds (`envcloak rm`), which also drops every pending request that asks for the item. Rotating a bound item's value does not end a grant.
 
 ## Pending requests and approval
 
