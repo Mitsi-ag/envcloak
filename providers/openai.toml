@@ -16,9 +16,16 @@ env_hints = ["OPENAI_API_KEY", "OPENAI_ADMIN_KEY"]
 
 allowed_hosts = ["api.openai.com"]
 auth = [{ header = "authorization", scheme = "Bearer" }]
-# The Admin API: admin keys, project API keys, service accounts, users and
-# invites.
-denied_paths = ["/v1/organization"]
+# The Admin API (admin keys, project API keys, service accounts, users and
+# invites) and every Realtime route that exchanges the key for a client
+# secret a browser or another process could then use.
+denied_paths = [
+  "/v1/organization",
+  "/v1/realtime/client_secrets",
+  "/v1/realtime/translations/client_secrets",
+  "/v1/realtime/sessions",
+  "/v1/realtime/transcription_sessions",
+]
 
 [links]
 docs = "https://platform.openai.com/docs/api-reference/authentication"

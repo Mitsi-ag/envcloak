@@ -122,6 +122,16 @@ fn the_embedded_registry_loads() {
     let openai = r.get("openai").unwrap();
     assert!(openai.path_denied("/v1/organization/admin_api_keys"));
     assert!(!openai.path_denied("/v1/chat/completions"));
+    // Realtime routes that mint client secrets from the key (Codex F-27).
+    for minting in [
+        "/v1/realtime/client_secrets",
+        "/v1/realtime/translations/client_secrets",
+        "/v1/realtime/sessions",
+        "/v1/realtime/transcription_sessions",
+    ] {
+        assert!(openai.path_denied(minting), "{minting}");
+    }
+    assert!(!openai.path_denied("/v1/realtime/calls"));
     // Spellings a server could strip back to a denied path.
     for odd in [
         "/v1/organization;x=1/admin_api_keys",
