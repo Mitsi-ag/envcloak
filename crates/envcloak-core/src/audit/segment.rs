@@ -474,13 +474,13 @@ impl AuditWriter {
                 writer.io.sync(&File::open(dir)?)?;
                 report.torn_tail_removed = true;
                 report.torn_bytes = last.len;
-            } else if last.torn && last.good_len < last.len {
+            } else if last.torn && last.clean && last.good_len < last.len {
                 // Part of one frame, as a crash in the middle of an append
-                // leaves it (the walk checked that no whole entry is in it
-                // and that the saved head does not cover it): remove it,
-                // whether or not the writer continues this segment.
-                // Anything else is damage, left as it is for the check to
-                // report.
+                // leaves it (the walk checked that the segment is clean up
+                // to it, that no whole entry is in it and that the saved
+                // head does not cover it): remove it, whether or not the
+                // writer continues this segment. Anything else is damage,
+                // left as it is for the check to report.
                 let f = open_append(&last.path)?;
                 f.set_len(last.good_len)?;
                 writer.io.sync(&f)?;

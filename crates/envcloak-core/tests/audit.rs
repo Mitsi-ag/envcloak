@@ -877,6 +877,136 @@ fn a_changed_length_or_a_cut_the_anchor_covers_is_kept_as_damage() {
     assert_eq!(std::fs::read(&seg).unwrap(), &orig[..fr[9].1.start]);
 }
 
+/// Adversarial review of 7fb007d and Codex F-46: bytes at the end of the
+/// last segment count as a crash's only while that segment checked out up
+/// to them, and only when no whole entry is in them.
+/// - The last entry's length made 1 to 11 bytes smaller reads as a shorter
+///   entry (flagged) and a few bytes after it; an earlier entry's length
+///   stretched to end just before the end of the file does the same. The
+///   walk's expected number and chain value then come from a frame it has
+///   already flagged, so the bytes after it say nothing about a crash.
+/// - An entry whose length was stretched past the end and whose sealed
+///   bytes were changed hides the whole entries after it; one whose chain
+///   value was changed still opens where it really ends.
+///
+/// Each is damage: flagged at its entry, not a torn tail, and kept by the
+/// writer (which goes on in a new segment), with or without a saved head.
+#[test]
+fn bytes_after_damage_or_before_a_whole_entry_are_not_a_torn_tail() {
+    let log = Log::new();
+    let mut w = log.writer(None);
+    fill(&mut w, 1, 1);
+    let first = w.head_record();
+    fill(&mut w, 2, 9);
+    let head = w.head_record();
+    drop(w);
+    let seg = log.segments().pop().unwrap();
+    let orig = std::fs::read(&seg).unwrap();
+    let fr = frames(&orig);
+    let reset = |bytes: &[u8]| {
+        for s in log.segments() {
+            std::fs::remove_file(s).unwrap();
+        }
+        std::fs::write(&seg, bytes).unwrap();
+    };
+    // Entry `i + 1`'s length field.
+    let len_of = |i: usize| {
+        let at = fr[i].1.start;
+        u32::from_be_bytes(orig[at..at + 4].try_into().unwrap())
+    };
+    let with_len = |b: &mut Vec<u8>, i: usize, len: u32| {
+        let at = fr[i].1.start;
+        b[at..at + 4].copy_from_slice(&len.to_be_bytes());
+    };
+
+    let mut cases: Vec<(String, Vec<u8>, Option<AuditHead>, u64)> = Vec::new();
+    for less in 1..=11 {
+        let mut b = orig.clone();
+        with_len(&mut b, 9, len_of(9) - less);
+        cases.push((
+            format!("the last length {less} smaller"),
+            b.clone(),
+            None,
+            10,
+        ));
+        cases.push((
+            format!("the last length {less} smaller, under a saved head"),
+            b,
+            Some(head),
+            10,
+        ));
+    }
+    let mut b = orig.clone();
+    let reach = orig.len() - 5 - fr[8].1.start - 12 - 32;
+    with_len(&mut b, 8, u32::try_from(reach).unwrap());
+    cases.push((
+        "entry 9's length reaching 5 bytes short of the end".into(),
+        b,
+        None,
+        9,
+    ));
+    let mut b = orig.clone();
+    with_len(&mut b, 1, u32::try_from(MAX_ENTRY).unwrap());
+    b[fr[1].1.start + 12 + 40] ^= 0x01;
+    cases.push((
+        "entry 2 stretched past the end, its sealed bytes changed".into(),
+        b.clone(),
+        None,
+        2,
+    ));
+    cases.push(("the same, entry 1 anchored".into(), b, Some(first), 2));
+    let mut b = orig.clone();
+    with_len(&mut b, 9, len_of(9) + 1);
+    let end = fr[9].1.end;
+    b[end - 1] ^= 0x01;
+    cases.push((
+        "the last entry stretched, its chain value changed".into(),
+        b,
+        None,
+        10,
+    ));
+
+    for (what, bytes, anchor, seq) in &cases {
+        reset(bytes);
+        let r = log.verify(*anchor);
+        assert_eq!(problem(&r).map(|p| p.0), Some(*seq), "{what}: {r:?}");
+        assert!(!r.torn_tail && r.torn_bytes == 0, "{what}: {r:?}");
+        let (mut w, report) = AuditWriter::open(&log.dir, &log.keys, *anchor).unwrap();
+        assert!(
+            report.damaged && !report.torn_tail_removed && report.torn_bytes == 0,
+            "{what}: {report:?}"
+        );
+        assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{what}: kept");
+        w.append(&record(11)).unwrap();
+        assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{what}: still kept");
+        assert_eq!(log.segments().len(), 2, "{what}: went on in a new segment");
+        let r = log.verify(*anchor);
+        assert_eq!(problem(&r).map(|p| p.0), Some(*seq), "{what}: {r:?}");
+        assert!(!r.torn_tail, "{what}: {r:?}");
+    }
+
+    // Controls: each change alone, on entry 2, is flagged too; and the
+    // same log cut in the middle of its last entry, with no saved head
+    // over it, is still what a crash leaves.
+    let mut stretched = orig.clone();
+    with_len(&mut stretched, 1, u32::try_from(MAX_ENTRY).unwrap());
+    let mut changed = orig.clone();
+    changed[fr[1].1.start + 12 + 40] ^= 0x01;
+    for (what, bytes) in [("stretched", stretched), ("changed", changed)] {
+        reset(&bytes);
+        let r = log.verify(Some(first));
+        assert_eq!(problem(&r).map(|p| p.0), Some(2), "{what}: {r:?}");
+        assert!(!r.torn_tail, "{what}: {r:?}");
+    }
+    let cut = orig[..fr[9].1.end - 10].to_vec();
+    reset(&cut);
+    let r = log.verify(Some(first));
+    assert!(r.ok() && r.torn_tail, "{r:?}");
+    let (_, report) = AuditWriter::open(&log.dir, &log.keys, Some(first)).unwrap();
+    assert!(report.torn_tail_removed && !report.damaged, "{report:?}");
+    assert_eq!(std::fs::read(&seg).unwrap(), &orig[..fr[9].1.start]);
+}
+
 /// Codex review: a crash while the writer makes a segment (the first
 /// append of a log, or a rollover) leaves an empty file, part of its
 /// header, or zeros as the last segment. That is a torn tail, not damage:

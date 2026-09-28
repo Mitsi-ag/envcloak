@@ -124,8 +124,9 @@ pub struct VerifyReport {
     pub unanchored_tail: Option<(u64, u64)>,
     /// The last segment ends in what a crash in the middle of an append
     /// leaves: part of one entry, or of a new segment's header. These bytes
-    /// are counted as that only when no whole entry is in them (none ends
-    /// at the end of the file or where the next entry's number starts) and
+    /// are counted as that only when the segment checked out up to them,
+    /// no whole entry is in them (the expected one ending at the end of the
+    /// file or where the next entry's number starts, or any later one) and
     /// the saved head does not cover them; anything else is flagged as a
     /// problem. The writer removes them when it next opens the log.
     pub torn_tail: bool,
@@ -275,9 +276,16 @@ impl Walker<'_> {
     /// Whether `rest`, the bytes at the end of the last segment that do
     /// not hold the whole frame they start, is what a crash in the middle
     /// of an append leaves: part of the next entry, which the saved head
-    /// does not cover, with no whole entry in it. A whole entry whose
-    /// length was changed is not that: its chain value is where it ends,
-    /// at the end of the file or where the next entry's number starts.
+    /// does not cover, with no whole entry in it. The caller asks only
+    /// while the segment has checked out up to `rest`, so the number and
+    /// chain value the walk expects are the ones the writer used.
+    ///
+    /// A crash leaves part of one frame and nothing after it. So a whole
+    /// entry in `rest` means its bytes were changed: the expected entry
+    /// with its length changed (its chain value checks out, or its sealed
+    /// bytes open, where it really ends: at the end of the file or where
+    /// the next entry's number starts), or a later entry that opens under
+    /// its own number.
     fn crash_tail(&self, rest: &[u8]) -> bool {
         let seq = self.expected;
         if self.anchored(seq) {
@@ -290,10 +298,33 @@ impl Walker<'_> {
         let next = seq.wrapping_add(1).to_be_bytes();
         let starts =
             (min..=rest.len() - FRAME_HEAD).filter(|&p| rest[p + 4..p + FRAME_HEAD] == next);
-        !std::iter::once(rest.len()).chain(starts).any(|end| {
+        let whole = std::iter::once(rest.len()).chain(starts).any(|end| {
             let sealed = &rest[FRAME_HEAD..end - MAC_LEN];
             let computed = self.keys.chain(&self.h, seq, sealed);
             bool::from(computed.ct_eq(&rest[end - MAC_LEN..end]))
+                || self.keys.open(seq, sealed).is_some()
+        });
+        !whole && !self.later_entry(rest, min)
+    }
+
+    /// Whether a whole entry numbered after the expected one is in `rest`:
+    /// a frame at an offset past the first entry's smallest size whose
+    /// number is one `rest` has room for and whose sealed bytes open under
+    /// that number. Only such offsets are opened.
+    fn later_entry(&self, rest: &[u8], min: usize) -> bool {
+        let seq = self.expected;
+        let room = u64::try_from(rest.len() / min).unwrap_or(u64::MAX);
+        (min..=rest.len().saturating_sub(min)).any(|p| {
+            let mut n = [0u8; 8];
+            n.copy_from_slice(&rest[p + 4..p + FRAME_HEAD]);
+            let n = u64::from_be_bytes(n);
+            if n <= seq || n - seq > room {
+                return false;
+            }
+            match next_frame(rest, p) {
+                Next::Frame(f) => self.keys.open(f.seq, f.sealed).is_some(),
+                _ => false,
+            }
         })
     }
 
@@ -476,7 +507,9 @@ fn walk_segment(
     loop {
         match next_frame(data, at) {
             Next::End => return (clean, at, false),
-            Next::Torn if is_last && w.crash_tail(&data[at..]) => return (clean, at, true),
+            Next::Torn if is_last && clean && w.crash_tail(&data[at..]) => {
+                return (clean, at, true);
+            }
             Next::Torn | Next::Unreadable => {
                 let seq = w.expected;
                 w.flag(ProblemKind::Unreadable, seq);
