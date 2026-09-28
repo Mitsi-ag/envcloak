@@ -162,6 +162,12 @@ fn print_human(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
         ),
         _ => println!("audit log: closed while the vault is locked"),
     }
+    if audit.anchor_failed {
+        println!(
+            "audit log: its head could not be saved in the vault; the daemon tries again, and \
+             until then the entries after the last saved head are not anchored"
+        );
+    }
     if audit.queued > 0 || audit.dropped > 0 {
         println!(
             "audit events waiting to be written: {}; lost because the queue was full: {}",

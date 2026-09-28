@@ -199,8 +199,11 @@ pub struct AuditStatusView {
     pub open: bool,
     /// The last entry's sequence number, while open.
     pub head_seq: Option<u64>,
-    /// Entries written since the head was last saved in the vault's header.
+    /// Entries in the log after the head saved in the vault's header.
     pub unanchored: u64,
+    /// The last try to save the head in the vault's header failed; the
+    /// daemon tries again, at most every 15 minutes.
+    pub anchor_failed: bool,
     /// Events held in memory until the log can be written.
     pub queued: u64,
     /// Events lost because that queue was full.

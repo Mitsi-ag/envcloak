@@ -30,8 +30,9 @@
 //! is opened from the vault when it unlocks and closed, with its keys,
 //! when it locks. The head is saved in the vault's sealed header at lock
 //! (and so at stop, which locks), and every 15 minutes or 100 entries
-//! ([`State::audit_tick`]). A delivery's entry is written durably before
-//! the request is answered, or the request is denied
+//! ([`State::audit_tick`]); a save that fails is tried again (see
+//! [`crate::audit::AuditLog`]). A delivery's entry is written durably
+//! before the request is answered, or the request is denied
 //! ([`State::audit_delivery`]).
 //!
 //! Every method here runs with the daemon's state mutex held and returns
@@ -89,6 +90,9 @@ pub enum BeginUnlock {
     Proceed(LockedVault, u64),
 }
 
+/// How the audit log's head is saved in the vault's header.
+type SaveHead = fn(&mut Vault, AuditHead) -> Result<(), VaultError>;
+
 /// The daemon's vault state.
 #[derive(Debug)]
 pub struct State {
@@ -104,6 +108,8 @@ pub struct State {
     /// The head of a log closed while a proof had the vault out: saved in
     /// the header when the vault comes back ([`State::finish_proof`]).
     unsaved_head: Option<AuditHead>,
+    /// [`Vault::save_audit_head`]; tests put a failing one in its place.
+    save_head: SaveHead,
 }
 
 impl State {
@@ -120,6 +126,7 @@ impl State {
             limiter: AttemptLimiter::new(),
             audit: AuditLog::default(),
             unsaved_head: None,
+            save_head: Vault::save_audit_head,
         }
     }
 
@@ -197,7 +204,7 @@ impl State {
         } else {
             let mut vault = vault;
             if let Some(head) = self.unsaved_head.take() {
-                save_head(&mut vault, head);
+                save_at_lock(self.save_head, &mut vault, head);
             }
             self.slot = Slot::Locked((*vault).lock());
             Err(RpcError::new(ErrorKind::VaultLocked))
@@ -230,9 +237,8 @@ impl State {
                 // The log's keys go with the vault's; its head is saved
                 // in the header first.
                 if let Some(head) = self.audit.close() {
-                    save_head(&mut v, head);
+                    save_at_lock(self.save_head, &mut v, head);
                 }
-                self.audit.anchored();
                 // Dropping the Vault wipes the VMK, the subkeys and the
                 // decrypted metadata; the file stays open and locked.
                 self.slot = Slot::Locked((*v).lock());
@@ -248,7 +254,6 @@ impl State {
                     if let Some(head) = self.audit.close() {
                         self.unsaved_head = Some(head);
                     }
-                    self.audit.anchored();
                     self.generation += 1;
                     self.last_reason = Some(reason);
                 }
@@ -386,6 +391,7 @@ impl State {
                 open: self.audit.is_open(),
                 head_seq: self.audit.head().map(|h| h.seq),
                 unanchored: self.audit.unanchored(),
+                anchor_failed: self.audit.anchor_failed(),
                 queued,
                 dropped,
             },
@@ -443,7 +449,7 @@ impl State {
     }
 
     /// The tick's part: saves the head when 15 minutes passed awake with
-    /// entries not yet anchored.
+    /// entries not yet anchored, or tries again after a save that failed.
     pub fn audit_tick(&mut self, now: Reading) {
         self.anchor_if_due(Some(now.awake));
     }
@@ -458,14 +464,25 @@ impl State {
     }
 
     /// Saves the head in the header when a save is due and the vault is
-    /// here to take it.
-    fn anchor_if_due(&mut self, awake: Option<std::time::Duration>) {
+    /// here to take it. A failure is reported once, until a save succeeds
+    /// again; the entries stay counted and a tick tries again.
+    fn anchor_if_due(&mut self, awake: Option<Duration>) {
         let Slot::Unlocked(v) = &mut self.slot else {
             return;
         };
-        if let Some(head) = self.audit.anchor_due(awake) {
-            save_head(v, head);
-            self.audit.anchored();
+        let Some(head) = self.audit.anchor_due(awake) else {
+            return;
+        };
+        let saved = (self.save_head)(v, head);
+        if self.audit.anchor_saved(saved.is_ok(), awake) {
+            match saved {
+                Err(e) => eprintln!(
+                    "envcloakd: warning: the audit log's head could not be saved in the vault \
+                     ({}); it is tried again",
+                    vault_reason(e.kind())
+                ),
+                Ok(()) => eprintln!("envcloakd: the audit log's head was saved in the vault again"),
+            }
         }
     }
 
@@ -498,13 +515,15 @@ impl State {
     }
 }
 
-/// Saves the audit head in `v`'s header. A failure (a vault that failed
-/// its integrity check is read-only) is reported, and the entries stay in
-/// the unanchored tail.
-fn save_head(v: &mut Vault, head: AuditHead) {
-    if let Err(e) = v.save_audit_head(head) {
+/// Saves the audit head in `v`'s header as the vault locks. A failure (a
+/// vault that failed its integrity check is read-only) is reported, and the
+/// entries stay in the unanchored tail: the next unlock counts them and
+/// saves the head when a save is due.
+fn save_at_lock(save: SaveHead, v: &mut Vault, head: AuditHead) {
+    if let Err(e) = save(v, head) {
         eprintln!(
-            "envcloakd: warning: the audit log's head could not be saved in the vault ({})",
+            "envcloakd: warning: the audit log's head could not be saved in the vault ({}); it \
+             is tried again after the next unlock",
             vault_reason(e.kind())
         );
     }
@@ -1063,12 +1082,124 @@ mod tests {
         unlock(&f, &mut s, PASS).unwrap();
         // The two entries and the lock's own, 108, were saved at lock.
         assert_eq!(saved_head(&s), Some(108));
+        let st = s.status(now(&f.clocks), &at(&f.clocks), daemon_view());
+        assert_eq!((st.audit.unanchored, st.audit.anchor_failed), (0, false));
         let log = entries(&s);
         assert_eq!(log.len(), 108);
         assert_eq!(
             log.last().unwrap(),
             &(108, "lock".to_owned(), "locked".to_owned())
         );
+    }
+
+    /// Saves nothing and counts the tries: storage that refuses the write.
+    fn failing_save(_: &mut Vault, _: AuditHead) -> Result<(), VaultError> {
+        FAILED_SAVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(VaultErrorKind::Storage(13).into())
+    }
+    static FAILED_SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn failed_saves() -> u32 {
+        FAILED_SAVES.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Codex F-45: a save of the head that fails is not counted as done.
+    /// Status still counts the entries and says the save failed; events do
+    /// not try again on their own (a read-only vault would fail each one),
+    /// but ticks do, with no new event, after 30 seconds awake and then
+    /// waits that double up to 15 minutes; once storage takes the write the
+    /// head is saved and status is back to normal.
+    #[test]
+    fn a_failed_save_of_the_head_is_tried_again_until_it_is_saved() {
+        use crate::audit::{ANCHOR_EVERY, ANCHOR_INTERVAL, ANCHOR_RETRY_FIRST};
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        create(&f, &mut s);
+        let audit = |s: &State| {
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .audit
+        };
+        for _ in 0..10 {
+            s.audit(revoked());
+        }
+        s.save_head = failing_save;
+        s.audit_tick(now(&f.clocks));
+        f.clocks.run(ANCHOR_INTERVAL);
+        s.audit_tick(now(&f.clocks));
+        assert_eq!(failed_saves(), 1);
+        assert_eq!(saved_head(&s), None);
+        let st = audit(&s);
+        assert_eq!((st.unanchored, st.anchor_failed), (10, true));
+
+        // Events, even past 100 of them, do not try again.
+        for _ in 0..ANCHOR_EVERY {
+            s.audit(revoked());
+        }
+        assert_eq!(failed_saves(), 1);
+        assert_eq!(audit(&s).unanchored, 10 + ANCHOR_EVERY);
+
+        // Ticks do: after 30 seconds, then 60, 120, ... up to 15 minutes.
+        let mut wait = ANCHOR_RETRY_FIRST;
+        for tries in 2..=8 {
+            f.clocks.run(wait - Duration::from_secs(1));
+            s.audit_tick(now(&f.clocks));
+            assert_eq!(failed_saves(), tries - 1, "{wait:?}");
+            f.clocks.run(Duration::from_secs(1));
+            s.audit_tick(now(&f.clocks));
+            assert_eq!(failed_saves(), tries, "{wait:?}");
+            wait = (wait * 2).min(ANCHOR_INTERVAL);
+        }
+        assert_eq!(wait, ANCHOR_INTERVAL);
+
+        // Storage takes writes again; no event comes.
+        s.save_head = Vault::save_audit_head;
+        f.clocks.run(wait - Duration::from_secs(1));
+        s.audit_tick(now(&f.clocks));
+        assert_eq!(saved_head(&s), None);
+        f.clocks.run(Duration::from_secs(1));
+        s.audit_tick(now(&f.clocks));
+        assert_eq!(saved_head(&s), Some(10 + ANCHOR_EVERY));
+        let st = audit(&s);
+        assert_eq!((st.unanchored, st.anchor_failed), (0, false));
+        assert_eq!(failed_saves(), 8);
+
+        // Saves are due as before: after 100 entries.
+        for _ in 0..ANCHOR_EVERY {
+            s.audit(revoked());
+        }
+        assert_eq!(saved_head(&s), Some(10 + 2 * ANCHOR_EVERY));
+    }
+
+    /// A save of the head that fails at lock leaves its entries after the
+    /// saved head. The next unlock counts them from the log, and saves the
+    /// head when a save is due.
+    #[test]
+    fn entries_a_failed_save_at_lock_left_are_counted_and_saved_after_unlock() {
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        create(&f, &mut s);
+        for _ in 0..3 {
+            s.audit(revoked());
+        }
+        assert!(s.lock(LockReason::Request));
+        unlock(&f, &mut s, PASS).unwrap();
+        assert_eq!(saved_head(&s), Some(4));
+        s.audit(revoked());
+
+        s.save_head = |_, _| Err(VaultErrorKind::Storage(13).into());
+        assert!(s.lock(LockReason::Request));
+        s.save_head = Vault::save_audit_head;
+        unlock(&f, &mut s, PASS).unwrap();
+        assert_eq!(saved_head(&s), Some(4));
+        let st = s.status(now(&f.clocks), &at(&f.clocks), daemon_view());
+        assert_eq!(st.audit.head_seq, Some(6));
+        assert_eq!((st.audit.unanchored, st.audit.anchor_failed), (2, false));
+        s.audit_tick(now(&f.clocks));
+        f.clocks.run(crate::audit::ANCHOR_INTERVAL);
+        s.audit_tick(now(&f.clocks));
+        assert_eq!(saved_head(&s), Some(6));
+        let st = s.status(now(&f.clocks), &at(&f.clocks), daemon_view());
+        assert_eq!(st.audit.unanchored, 0);
     }
 
     /// A lock that arrives while a proof has the vault out still writes

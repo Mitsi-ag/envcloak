@@ -34,6 +34,9 @@ pub const QUEUE_MAX: usize = 256;
 pub const ANCHOR_EVERY: u64 = 100;
 /// ... and after this long awake with entries not yet anchored.
 pub const ANCHOR_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// A save that failed is tried again by a tick this long awake after it;
+/// the wait doubles with each failure, up to [`ANCHOR_INTERVAL`].
+pub const ANCHOR_RETRY_FIRST: Duration = Duration::from_secs(30);
 
 /// A `run.request` decision, with what its entry records.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,17 +336,28 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The log as the daemon holds it: the writer while the vault is unlocked,
 /// the queue, and when the head was last saved in the vault's header.
+///
+/// Only a save that succeeded resets the count of entries after the saved
+/// head. A save that failed is tried again by the ticks, after
+/// [`ANCHOR_RETRY_FIRST`] and then waits that double up to
+/// [`ANCHOR_INTERVAL`], and not by events, so a vault that cannot take the
+/// write (a read-only one) is not tried on every event. The count is taken
+/// from the log when it opens, so a save that failed at lock is made up
+/// after the next unlock.
 #[derive(Debug, Default)]
 pub struct AuditLog {
     writer: Option<AuditWriter>,
     queue: VecDeque<AuditRecord>,
     /// Events the queue had no room for since it was last written.
     dropped: u64,
-    /// Entries written since the head was last saved.
+    /// Entries in the log after the head saved in the vault's header.
     since_anchor: u64,
-    /// Awake time when the 15-minute window started (the first tick after
-    /// a save or an unlock); `None` until then.
+    /// Awake time when the current wait started: the 15-minute window (the
+    /// first tick after a save or an unlock), or the wait after a failed
+    /// save; `None` until the next tick.
     window_start: Option<Duration>,
+    /// The last save failed: the wait before a tick tries again.
+    retry_wait: Option<Duration>,
     /// Opening the log failed and was reported; not repeated until the
     /// next unlock.
     open_failed: bool,
@@ -363,9 +377,14 @@ impl AuditLog {
         }
         match v.open_audit() {
             Ok((w, report)) => {
+                // Entries after the saved head: none, unless the save at
+                // the last lock failed or the daemon was killed first.
+                let anchored = v.audit_anchor().map_or(0, |a| a.seq);
+                self.since_anchor = w.head_record().seq.saturating_sub(anchored);
                 self.writer = Some(w);
                 self.open_failed = false;
                 self.window_start = None;
+                self.retry_wait = None;
                 for r in findings(&report).into_iter().rev() {
                     self.queue_front(r);
                 }
@@ -389,11 +408,16 @@ impl AuditLog {
     }
 
     /// Closes the writer (the vault locked), wiping its keys. Returns the
-    /// head when entries were written since it was last saved.
+    /// head when entries were written since it was last saved, for the
+    /// caller to save; the counts start again at the next open.
     pub fn close(&mut self) -> Option<AuditHead> {
         let w = self.writer.take()?;
         self.open_failed = false;
-        (self.since_anchor > 0).then(|| w.head_record())
+        let unsaved = (self.since_anchor > 0).then(|| w.head_record());
+        self.since_anchor = 0;
+        self.window_start = None;
+        self.retry_wait = None;
+        unsaved
     }
 
     /// The head, while open.
@@ -401,9 +425,14 @@ impl AuditLog {
         self.writer.as_ref().map(AuditWriter::head_record)
     }
 
-    /// Entries written since the head was last saved.
+    /// Entries in the log after the head saved in the vault's header.
     pub fn unanchored(&self) -> u64 {
         self.since_anchor
+    }
+
+    /// The last try to save the head failed.
+    pub fn anchor_failed(&self) -> bool {
+        self.retry_wait.is_some()
     }
 
     /// Events waiting, and events dropped.
@@ -487,31 +516,49 @@ impl AuditLog {
 
     /// The head to save now, if a save is due: [`ANCHOR_EVERY`] entries
     /// since the last, or [`ANCHOR_INTERVAL`] awake since the window
-    /// started (`awake`, when known, starts it).
+    /// started (`awake`, a tick's reading, starts it). After a failed save
+    /// only a tick tries again, once its wait is over.
     pub fn anchor_due(&mut self, awake: Option<Duration>) -> Option<AuditHead> {
         if self.since_anchor == 0 {
             return None;
         }
         let head = self.head()?;
-        if self.since_anchor >= ANCHOR_EVERY {
-            return Some(head);
-        }
+        let wait = match self.retry_wait {
+            Some(wait) => wait,
+            None if self.since_anchor >= ANCHOR_EVERY => return Some(head),
+            None => ANCHOR_INTERVAL,
+        };
         let now = awake?;
         match self.window_start {
             None => {
                 self.window_start = Some(now);
                 None
             }
-            Some(start) if now.saturating_sub(start) >= ANCHOR_INTERVAL => Some(head),
+            Some(start) if now.saturating_sub(start) >= wait => Some(head),
             Some(_) => None,
         }
     }
 
-    /// The head was saved (or could not be, which was reported): the
-    /// counts start again.
-    pub fn anchored(&mut self) {
-        self.since_anchor = 0;
-        self.window_start = None;
+    /// The head [`AuditLog::anchor_due`] gave was saved (`saved`), and the
+    /// counts start again; or the save failed, and a tick tries again after
+    /// the next wait, from `awake` (from the next tick when `None`).
+    /// Returns whether this changes what was last reported: the first
+    /// failure, or the first save after failures.
+    pub fn anchor_saved(&mut self, saved: bool, awake: Option<Duration>) -> bool {
+        let failing = self.retry_wait.is_some();
+        if saved {
+            self.since_anchor = 0;
+            self.window_start = None;
+            self.retry_wait = None;
+            failing
+        } else {
+            self.retry_wait = Some(
+                self.retry_wait
+                    .map_or(ANCHOR_RETRY_FIRST, |w| (w * 2).min(ANCHOR_INTERVAL)),
+            );
+            self.window_start = awake;
+            !failing
+        }
     }
 }
 

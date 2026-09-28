@@ -269,7 +269,10 @@ fn status_text_from_the_daemon_is_checked_before_use() {
             },
             "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": null},
             "approvals": {"grants": 0, "pending": 0, "proof_failures": 0, "proof_wait_secs": 0},
-            "audit": {"open": false, "head_seq": null, "unanchored": 0, "queued": 0, "dropped": 0}
+            "audit": {
+                "open": false, "head_seq": null, "unanchored": 0, "anchor_failed": false,
+                "queued": 0, "dropped": 0
+            }
         })
     };
     let cases = [

@@ -166,7 +166,10 @@ fn status_prints_no_control_sequence_a_stand_in_daemon_sends() {
         },
         "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": null},
         "approvals": {"grants": 0, "pending": 0, "proof_failures": 0, "proof_wait_secs": 0},
-        "audit": {"open": false, "head_seq": null, "unanchored": 0, "queued": 0, "dropped": 0}
+        "audit": {
+            "open": false, "head_seq": null, "unanchored": 0, "anchor_failed": false,
+            "queued": 0, "dropped": 0
+        }
     });
     let server = std::thread::spawn(move || {
         for _ in 0..2 {
@@ -198,6 +201,64 @@ fn status_prints_no_control_sequence_a_stand_in_daemon_sends() {
     let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(v["daemon"]["version"], "unrecognized");
     assert_eq!(v["vault"]["unavailable"], "unknown");
+}
+
+/// Codex F-45: when the daemon could not save the audit log's head in the
+/// vault, `status` says so next to the entries still not anchored, and
+/// `--json` carries the flag.
+#[test]
+fn status_says_when_the_audit_head_could_not_be_saved() {
+    let home = TestHome::new();
+    let paths = RunPaths::under(daemon_run_dir(&home)).unwrap();
+    paths.prepare_dir().unwrap();
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let body = serde_json::json!({
+        "daemon": {
+            "version": "0.1.0",
+            "pid": 4242,
+            "hardening": {"core_dumps_off": true, "non_dumpable": true, "hardened_runtime": null},
+            "runtime_dir_fallback": false
+        },
+        "vault": {
+            "state": "unlocked", "integrity": "ok", "read_only": false,
+            "unavailable": null, "busy": false, "failed_unlocks": 0
+        },
+        "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": 28800},
+        "approvals": {"grants": 0, "pending": 0, "proof_failures": 0, "proof_wait_secs": 0},
+        "audit": {
+            "open": true, "head_seq": 17, "unanchored": 12, "anchor_failed": true,
+            "queued": 0, "dropped": 0
+        }
+    });
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let f = Frame::read_from(&mut s).unwrap();
+            let req = IncomingRequest::parse(&f).unwrap();
+            proto::result_frame(req.id, &body)
+                .unwrap()
+                .write_to(&mut s)
+                .unwrap();
+        }
+    });
+    let human = run(&home, &["status"], &[]);
+    let json = run(&home, &["status", "--json"], &[]);
+    server.join().unwrap();
+    assert!(human.status.success(), "{}", stderr(&human));
+    let said = stdout(&human);
+    assert!(
+        said.contains("audit log: open, last entry 17 (12 not yet anchored in the vault)"),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "audit log: its head could not be saved in the vault; the daemon tries again"
+        ),
+        "{said}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(v["audit"]["anchor_failed"], true);
+    assert_eq!(v["audit"]["unanchored"], 12);
 }
 
 /// Story S1 and the lock cycle: `vault create --passphrase-fd 3 --kit-fd 4
