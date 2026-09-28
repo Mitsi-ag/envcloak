@@ -671,7 +671,7 @@ The daemon records evidence about every caller and uses it only as this table al
 | "No agent is involved" or "a human typed this" | Cannot be claimed | Nothing |
 | Project path | Caller-asserted; the daemon reads the manifest itself | Grant scoping together with the subject root |
 
-The ancestry walk records pid and start time for each ancestor, then re-validates the chain: each parent started no later than its child, and each ancestor still has the recorded start time. An orphan reparented to launchd or init has lost its ancestry, which fails closed.
+The ancestry walk records pid and start time for each ancestor, then re-validates the chain: each parent started no later than its child, and each ancestor still has the recorded start time. An orphan reparented to launchd or init has lost its ancestry, which fails closed. Agents are recognized by executable path, `argv[0]`, interpreter script and, on macOS, code signature, from a builtin catalog plus add-only user extensions (docs/AGENTS.md).
 
 **Bounds and display.**
 - Frames are limited to 1 MiB.
@@ -699,13 +699,15 @@ Grant {
 }
 ```
 
-**Root selection.** If a known agent is in the caller's ancestry, the root is the agent process nearest the caller. Otherwise the root is the caller's session leader (`getsid`). If the session leader is no longer alive, the root is the topmost live ancestor in that session.
+**Root selection.** If a known agent is in the caller's ancestry, the root is the agent process nearest the caller. Otherwise the root is the caller's session leader (`getsid`). If the session leader is no longer alive, the root is the topmost live ancestor in that session. pid 1 is never a root, nor a session leader for this rule. An agent that only a user extension recognizes is the root only at or below the process the session rules would pick.
+
+**Subject kind.** `agent` when a known agent is in the ancestry; `unknown` when the ancestry no longer reaches the caller's session leader (an orphan), whatever the caller claims; `agent` when the caller claims agent markers; `unknown` in a session without a controlling terminal; otherwise `terminal`. docs/AGENTS.md has the details.
 
 **Match.** Request R is covered by grant G only if all of these hold:
 1. G is not expired, revoked or used up.
 2. The vault is unlocked at G's epoch.
 3. R's kernel-verified ancestry contains G's root instance, with both pid and start time matching. A recycled pid never matches.
-4. Agent barrier: no known agent sits strictly between G's root and the caller, unless the root is that agent.
+4. Agent barrier: no known agent sits strictly between G's root and the caller, unless the root is that agent. A grant approved for a terminal subject covers only terminal subjects.
 5. R's canonical project directory, and its device and inode, equal G's.
 6. R's bindings are a subset of G's bindings, compared by (env_name, item_id, field).
 7. R's effective mode is at least as strict as G's.
