@@ -594,6 +594,155 @@ mod tests {
         );
     }
 
+    /// A process in a terminal session: pid, start time, session.
+    fn ancestor(pid: i32, sid: i32) -> envcloak_policy::Ancestor {
+        envcloak_policy::Ancestor {
+            instance: envcloak_policy::ProcessInstance {
+                pid,
+                start_time: envcloak_sys::StartTime::from_raw(10 * u64::from(pid.unsigned_abs())),
+                pidversion: None,
+                exe: None,
+            },
+            sid: Some(sid),
+            agent: None,
+        }
+    }
+
+    /// A request from a terminal session (envcloak 90 <- zsh 70, the
+    /// session leader <- login 60 <- launchd 1) for `env` bound to a new
+    /// item.
+    fn request(env: &str) -> envcloak_policy::AccessRequest {
+        use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, Slug};
+        use envcloak_policy::{
+            AccessRequest, BoundBinding, BoundRef, ChainEnd, Claims, EnvName, Mode,
+            ProjectIdentity, SubjectEvidence,
+        };
+        let subject = SubjectEvidence::from_chain(
+            vec![
+                ancestor(90, 70),
+                ancestor(70, 70),
+                ancestor(60, 60),
+                ancestor(1, 1),
+            ],
+            ChainEnd::Top,
+            true,
+            Claims::none(),
+            None,
+        )
+        .unwrap();
+        AccessRequest {
+            subject,
+            project: ProjectIdentity {
+                canonical_dir: "/src/acme-web".into(),
+                dev: 1,
+                ino: 100,
+                manifest_path: "/src/acme-web/envcloak.toml".into(),
+            },
+            manifest_sha256: [7u8; 32],
+            bindings: vec![BoundRef {
+                binding: BoundBinding {
+                    env_name: EnvName::new(env).unwrap(),
+                    item: ItemId::generate(),
+                    field: FieldId::generate(),
+                    classification: Classification::Test,
+                },
+                slug: Slug::new("openai/acme-web").unwrap(),
+                field_name: FieldName::new("value").unwrap(),
+                first_use: false,
+            }],
+            mode: Mode::Inject,
+            argv_display: vec!["./emit".to_owned()],
+            new_project: false,
+        }
+    }
+
+    /// Gate 29: a lock for any reason ends every grant and pending
+    /// request: idle time, sleep and a signal as well as a request. The
+    /// grant here lasts 8 hours and the request 10 minutes awake, so
+    /// neither expires on its own in these steps.
+    #[test]
+    fn every_lock_ends_grants_and_pending_requests() {
+        use envcloak_policy::{
+            ApprovalOptions, ApprovalProof, DEFAULT_TTL, Decision, ProofKind, Uses,
+            statement_digest,
+        };
+        let idle = Duration::from_secs(120);
+        for reason in [
+            LockReason::Idle,
+            LockReason::Sleep,
+            LockReason::Signal,
+            LockReason::Request,
+        ] {
+            let f = fixture();
+            let mut s = State::open(f.paths.clone(), idle, now(&f.clocks));
+            create(&f, &mut s);
+            let t = at(&f.clocks);
+            let first = request("OPENAI_API_KEY");
+            let Decision::Pending(approved) = s.grants().decide(first.clone(), &t) else {
+                panic!("expected a pending request");
+            };
+            let opts = ApprovalOptions {
+                uses: Uses::Session,
+                ttl_secs: DEFAULT_TTL.as_secs(),
+                live: Vec::new(),
+            };
+            let digest =
+                statement_digest(s.grants().pending_descriptor(&approved, &t).unwrap(), &opts);
+            let proof = ApprovalProof {
+                approver: first.subject.clone(),
+                kind: ProofKind::Passphrase,
+            };
+            let g = s
+                .grants()
+                .approve(&approved, proof, opts, digest, &t)
+                .unwrap();
+            // Another item: the grant does not cover it.
+            let Decision::Pending(waiting) = s.grants().decide(request("GITHUB_TOKEN"), &t) else {
+                panic!("expected a pending request");
+            };
+            let counts = |s: &State, t: &Now| {
+                let a = s.approvals(t);
+                (a.grants, a.pending)
+            };
+            assert_eq!(counts(&s, &t), (1, 1), "{reason:?}");
+
+            // Just short of the idle limit nothing locks, and both are
+            // still there.
+            f.clocks.run(idle - Duration::from_secs(1));
+            assert_eq!(s.observe(now(&f.clocks)), None);
+            let t = at(&f.clocks);
+            assert_eq!(counts(&s, &t), (1, 1), "{reason:?}");
+            assert_eq!(s.grants().decide(first.clone(), &t), Decision::Covered(g));
+            match reason {
+                LockReason::Idle => {
+                    f.clocks.run(Duration::from_secs(1));
+                    assert_eq!(s.observe(now(&f.clocks)), Some(LockReason::Idle));
+                }
+                LockReason::Sleep => {
+                    f.clocks.sleep(Duration::from_secs(3600));
+                    assert_eq!(s.observe(now(&f.clocks)), Some(LockReason::Sleep));
+                }
+                LockReason::Signal | LockReason::Request => assert!(s.lock(reason)),
+            }
+            let t = at(&f.clocks);
+            assert!(matches!(s.slot(), Slot::Locked(_)), "{reason:?}");
+            assert_eq!(counts(&s, &t), (0, 0), "{reason:?}");
+            assert!(s.grants().grant(g).is_none(), "{reason:?}");
+            assert!(
+                s.grants().pending_descriptor(&waiting, &t).is_none(),
+                "{reason:?}"
+            );
+            // Unlocked again, the store starts empty: the request the
+            // grant covered is pending again.
+            unlock(&f, &mut s, PASS).unwrap();
+            let t = at(&f.clocks);
+            assert!(
+                matches!(s.grants().decide(first, &t), Decision::Pending(_)),
+                "{reason:?}"
+            );
+        }
+    }
+
     /// A lock that arrives while Argon2id runs wins: the unlock finishes
     /// locked. Idle time does not.
     #[test]
