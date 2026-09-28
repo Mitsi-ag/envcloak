@@ -994,3 +994,120 @@ fn a_grant_ends_when_its_root_exits() {
     drop(agent);
     f.sweep();
 }
+
+/// Gate 27 with a real recycled pid (Linux). The test runs itself again
+/// in a new user and pid namespace, where it may choose the next pid
+/// (`/proc/sys/kernel/ns_last_pid`). There the fixture agent that roots a
+/// grant exits, and a new fixture agent is started with its pid: the new
+/// process's request is not covered, and the grant is swept although a
+/// process with its root's pid runs, because the start time differs.
+/// CI allows unprivileged user namespaces for it; elsewhere it is skipped
+/// when the kernel refuses one. macOS has no such namespace: the
+/// synthetic store test (`crates/envcloak-policy/tests/grants.rs`) and
+/// the sweep's unit test cover it there.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_a_recycled_root_pid_is_not_covered() {
+    const NAME: &str = "linux_a_recycled_root_pid_is_not_covered";
+    if std::env::var_os("ENVCLOAK_TEST_IN_PIDNS").is_some() {
+        recycled_root_pid_in_namespace();
+        return;
+    }
+    let unshare = [
+        "--user",
+        "--map-root-user",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+    ];
+    let usable = Command::new("unshare")
+        .args(unshare)
+        .args(["sh", "-c", "echo 1 >/proc/sys/kernel/ns_last_pid"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !usable {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must allow unprivileged user and pid namespaces: gate 27 needs one"
+        );
+        eprintln!("skipped: no unprivileged user and pid namespace here");
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = Command::new("unshare");
+    cmd.args(unshare)
+        .args(["/bin/sh", "-c", "\"$0\" \"$@\"; exit $?"])
+        .arg(exe)
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env("ENVCLOAK_TEST_IN_PIDNS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = finish_within(cmd, Duration::from_secs(240));
+    let (o, e) = (stdout(&out), stderr(&out));
+    assert!(out.status.success(), "{o}{e}");
+    assert!(o.contains("1 passed"), "{o}{e}");
+}
+
+/// The namespace half of [`linux_a_recycled_root_pid_is_not_covered`]:
+/// this process is the namespace's pid 2, under a shell that is its init.
+#[cfg(target_os = "linux")]
+fn recycled_root_pid_in_namespace() {
+    let f = Fixture::new();
+    let mut agent = f.agent();
+    let out = agent.run(&["--", "true"]);
+    let id = request_id(&stderr(&out));
+    f.approve(&id, &["--for", "1h"]);
+    let out = agent.run(&["--", "true"]);
+    assert!(
+        stderr(&out).contains("covers this request"),
+        "{}",
+        stderr(&out)
+    );
+    let root = i32::try_from(agent.pid()).unwrap();
+    let old = envcloak_sys::proc_info(root).unwrap().start_time;
+
+    // The root exits, and a new fixture agent takes its pid: the kernel
+    // hands out the pid after the one written to ns_last_pid, and nothing
+    // else here starts a process in between.
+    agent.kill();
+    let mut again = None;
+    for _ in 0..50 {
+        std::fs::write("/proc/sys/kernel/ns_last_pid", (root - 1).to_string())
+            .expect("ns_last_pid is writable in this namespace");
+        let a = f.agent();
+        if i32::try_from(a.pid()).unwrap() == root {
+            again = Some(a);
+            break;
+        }
+    }
+    let mut again = again.expect("the root's pid was not handed out again");
+    let new = envcloak_sys::proc_info(root).unwrap().start_time;
+    assert_ne!(new, old, "a reused pid has another start time");
+
+    // The new process with the root's pid is not covered: a person must
+    // approve its request.
+    let out = again.run(&["--", "true"]);
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    assert!(
+        stderr(&out).starts_with("envcloak: approval_required:"),
+        "{}",
+        stderr(&out)
+    );
+    // And the grant is swept although a process with its root's pid runs.
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = stdout(&run(&f.home, &["grants", "list"], &[]));
+        if list == "No grants are in force.\n" {
+            break;
+        }
+        assert!(Instant::now() < end, "the grant outlived its root: {list}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(envcloak_sys::proc_info(root).unwrap().start_time, new);
+    drop(again);
+    drop(agent);
+    f.sweep();
+}

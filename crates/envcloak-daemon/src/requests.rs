@@ -495,3 +495,48 @@ pub fn grants_revoke(
         revoked: u64::try_from(revoked).unwrap_or(u64::MAX),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gate 27, the sweep's half: a root is alive only while its pid has
+    /// the start time the grant recorded. A pid in use by another process
+    /// (the same pid, another start time) is a root that exited, and so is
+    /// a pid no process has.
+    #[test]
+    fn a_root_is_alive_only_with_its_start_time() {
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let me = envcloak_sys::proc_info(pid).unwrap();
+        let root = ProcessInstance {
+            pid,
+            start_time: me.start_time,
+            pidversion: None,
+            exe: None,
+        };
+        assert!(alive(&root));
+        for other in [
+            me.start_time.raw() + 1,
+            me.start_time.raw().saturating_sub(1),
+        ] {
+            let recycled = ProcessInstance {
+                start_time: envcloak_sys::StartTime::from_raw(other),
+                ..root.clone()
+            };
+            assert!(!alive(&recycled), "a pid with another start time");
+        }
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let gone = i32::try_from(child.id()).unwrap();
+        let started = envcloak_sys::proc_info(gone).map(|p| p.start_time);
+        child.wait().unwrap();
+        if let Ok(start_time) = started {
+            let exited = ProcessInstance {
+                pid: gone,
+                start_time,
+                pidversion: None,
+                exe: None,
+            };
+            assert!(!alive(&exited), "an exited process");
+        }
+    }
+}
