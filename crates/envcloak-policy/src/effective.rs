@@ -13,6 +13,8 @@
 //!   nothing. In M1, which has no proxy (SPEC §14), a proxy-mode request is
 //!   refused rather than injected.
 
+use serde::{Deserialize, Serialize};
+
 use crate::manifest::{AgentsPolicy, ManifestPolicy, Mode};
 
 /// The vault's policy for one project. The defaults are the strictest
@@ -38,8 +40,10 @@ impl Default for VaultProjectPolicy {
 }
 
 /// Who a request is for, as the daemon classified its caller (SPEC §10a,
-/// §10b `subject.kind`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// §10b `subject.kind`). On the wire it is `agent`, `terminal` or
+/// `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubjectKind {
     /// A known agent is in the caller's ancestry, or the caller claims to
     /// be one.

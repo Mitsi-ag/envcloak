@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use envcloak_core::vault::FieldName;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::{Document, InlineTable, Item, TableLike, Value};
 
@@ -43,8 +44,12 @@ pub enum AgentsPolicy {
 }
 
 /// How values reach a command. Ordered by strictness: proxy mode keeps the
-/// real value out of the child (SPEC §6.2, M6).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// real value out of the child (SPEC §6.2, M6). On the wire it is
+/// `inject` or `proxy`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// Values in the child's environment (SPEC §6.1).
     #[default]
@@ -152,6 +157,35 @@ pub enum ManifestErrorKind {
 }
 
 impl ManifestErrorKind {
+    /// The stable token, for the daemon's error reasons.
+    pub fn token(self) -> &'static str {
+        use ManifestErrorKind as K;
+        match self {
+            K::TooLarge => "too_large",
+            K::NotUtf8 => "not_utf8",
+            K::Syntax => "syntax",
+            K::DuplicateKey => "duplicate_key",
+            K::UnknownKey => "unknown_key",
+            K::WrongType => "wrong_type",
+            K::InvalidEnvName => "invalid_env_name",
+            K::InvalidProfileName => "invalid_profile_name",
+            K::NestedProfile => "nested_profile",
+            K::InvalidReference => "invalid_reference",
+            K::InvalidProjectName => "invalid_project_name",
+            K::LoosePolicy => "loose_policy",
+            K::InvalidPolicy => "invalid_policy",
+            K::UnknownProfile => "unknown_profile",
+            K::DuplicateEnvName => "duplicate_env_name",
+            K::InvalidPath => "invalid_path",
+            K::NotFound => "not_found",
+            K::SymlinkedManifest => "symlinked_manifest",
+            K::NotRegularFile => "not_regular_file",
+            K::NotOwned => "not_owned",
+            K::DirectoryChanged => "directory_changed",
+            K::Io(_) => "io",
+        }
+    }
+
     fn message(self) -> &'static str {
         use ManifestErrorKind as K;
         match self {

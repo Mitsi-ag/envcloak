@@ -363,6 +363,31 @@ fn confirming_the_kit_needs_the_right_kit() {
     assert!(v.recovery_confirmed().unwrap(), "kept in the sealed header");
 }
 
+/// The proof behind `approve` (SPEC §10b): the passphrase must unwrap this
+/// vault's VMK. Wrong, and another vault's, fail with the one generic
+/// error, and nothing is written.
+#[test]
+fn verifying_the_passphrase_needs_this_vaults_passphrase() {
+    let (f, v) = KitFixture::create();
+    let counter = v.header().unwrap().write_counter;
+    v.verify_passphrase(&f.pass()).unwrap();
+    let e = v.verify_passphrase(&other_passphrase(1)).unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Crypto(CryptoErrorKind::Unlock));
+    // The kit is not a passphrase.
+    let e = v
+        .verify_passphrase(&SecretBytes::copy_from(f.kit().to_display().as_bytes()))
+        .unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Crypto(CryptoErrorKind::Unlock));
+    assert_eq!(v.header().unwrap().write_counter, counter);
+    // Another vault's passphrase does not open this one, even after the
+    // vault's passphrase changed to the same words (the envelope's salt
+    // and vault id differ).
+    let (g, gv) = KitFixture::create();
+    let e = v.verify_passphrase(&g.pass()).unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Crypto(CryptoErrorKind::Unlock));
+    gv.verify_passphrase(&g.pass()).unwrap();
+}
+
 /// A vault that failed its integrity check refuses a passphrase change and
 /// a kit confirmation before any key derivation.
 #[test]

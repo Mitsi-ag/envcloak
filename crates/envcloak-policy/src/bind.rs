@@ -40,6 +40,20 @@ pub enum BindErrorKind {
 }
 
 impl BindErrorKind {
+    /// The stable token, for the daemon's error reasons.
+    pub fn token(self) -> &'static str {
+        use BindErrorKind as K;
+        match self {
+            K::UnknownItem => "unknown_item",
+            K::UnknownField => "unknown_field",
+            K::AmbiguousField => "ambiguous_field",
+            K::NoField => "no_field",
+            K::CardReference => "card_reference",
+            K::IssuerCredentialReference => "issuer_credential_reference",
+            K::UnknownItemClass => "unknown_item_class",
+        }
+    }
+
     fn message(self) -> &'static str {
         use BindErrorKind as K;
         match self {

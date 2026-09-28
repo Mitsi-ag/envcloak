@@ -15,6 +15,9 @@
 //! - [`Vault::confirm_recovery_kit`] proves the user holds the kit: it must
 //!   unwrap this vault's VMK. The header then records it (SPEC §6.4: plain
 //!   files are deleted after import only once the kit is confirmed).
+//! - [`Vault::verify_passphrase`] is the proof behind the passphrase-proven
+//!   methods (SPEC §10b: `approve`, and from T11 `rotate`, `rm` and
+//!   `recover`): the passphrase must unwrap this vault's VMK.
 //!
 //! Argon2id runs for every wrap and unwrap: most of a second at the
 //! defaults. The daemon calls these on a blocking thread. Each proof-taking
@@ -289,6 +292,16 @@ impl Vault {
     /// [`VaultErrorKind::Tampered`] unless the vault verified.
     pub fn recovery_confirmed(&self) -> Result<bool, VaultError> {
         Ok(self.header()?.recovery_confirmed)
+    }
+
+    /// Checks that `s` is this vault's passphrase: it must unwrap a
+    /// passphrase envelope, and the VMK inside must be this vault's. An
+    /// approval proof (SPEC §10b) on Linux and on macOS without the app.
+    /// Runs Argon2id; the caller must have checked who is asking, and the
+    /// attempt limiter, first. A wrong passphrase gives
+    /// [`CryptoErrorKind::Unlock`], like a damaged envelope.
+    pub fn verify_passphrase(&self, s: &SecretBytes) -> Result<(), VaultError> {
+        prove_secret(self, UnlockerKind::Passphrase, s)
     }
 
     /// Fails, before any key derivation, where `transact` would.

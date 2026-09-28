@@ -49,6 +49,21 @@ impl core::fmt::Display for EnvName {
     }
 }
 
+impl serde::Serialize for EnvName {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+/// A name from the wire is checked as one from a manifest is; the error
+/// names the rule, never the text.
+impl<'de> serde::Deserialize<'de> for EnvName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        EnvName::new(&s).map_err(|_| serde::de::Error::custom("not an environment variable name"))
+    }
+}
+
 /// A profile's name: the `<name>` of `[env.<name>]`, and the argument of
 /// `--profile`. A lowercase ASCII letter or digit, then those, `_` or `-`.
 /// At most [`ProfileName::MAX_LEN`] bytes.
