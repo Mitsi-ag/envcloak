@@ -9,6 +9,19 @@ pub mod status;
 pub mod unlock;
 pub mod vault;
 
+/// The names of the agent markers set in this process's environment
+/// (SPEC §10a "caller-asserted"; they only tighten), from the builtin
+/// catalog and the user's extensions.
+pub fn claims() -> Vec<String> {
+    let catalog = match envcloak_core::vault::VaultPaths::for_user() {
+        Ok(p) => envcloak_policy::AgentCatalog::load(&p.data_dir),
+        Err(_) => envcloak_policy::AgentCatalog::builtin(),
+    };
+    envcloak_policy::Claims::from_env(&catalog)
+        .markers()
+        .to_vec()
+}
+
 /// A file descriptor number given on the command line: digits only.
 pub fn fd_number(v: &str) -> Option<i32> {
     if v.is_empty() || v.len() > 9 || !v.bytes().all(|b| b.is_ascii_digit()) {

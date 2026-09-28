@@ -8,8 +8,9 @@
 //! through [`envcloak_ipc::proto::loggable_method`], because a name a
 //! client sent can hold anything.
 
-/// An event worth recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An event worth recording. The ids in it are the daemon's own
+/// (Crockford base32) and the tokens fixed; nothing a client sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditEvent {
     /// A client-role peer called an `app`-role method.
     RoleDenied {
@@ -21,6 +22,34 @@ pub enum AuditEvent {
     ForeignPeer { uid: u32 },
     /// A wrong passphrase was offered to `unlock`.
     UnlockFailed { pid: i32 },
+    /// A `run.request` was decided: `covered` with the grant id, `pending`
+    /// with the request id, `denied` with the reason, or `policy_denied`.
+    Request {
+        pid: i32,
+        decision: &'static str,
+        id: String,
+    },
+    /// A pending request was approved into a grant.
+    Approved {
+        pid: i32,
+        request: String,
+        grant: String,
+    },
+    /// An `approve` failed its proof.
+    ApproveFailed { pid: i32, reason: &'static str },
+    /// A proof was refused because of the caller's evidence.
+    ProofRefused { pid: i32, method: &'static str },
+    /// A pending request was denied.
+    Denied {
+        pid: i32,
+        request: String,
+        root_auto_denied: bool,
+    },
+    /// Grants were revoked.
+    Revoked { pid: i32, count: usize },
+    /// A covered request came with a manifest whose hash differs from the
+    /// one at approval; the bindings were still a subset (SPEC §10b).
+    ManifestChanged { pid: i32, grant: String },
 }
 
 /// Where events go.
@@ -38,6 +67,43 @@ impl Audit {
             }
             AuditEvent::UnlockFailed { pid } => {
                 eprintln!("envcloakd: audit: unlock failed reason=wrong_passphrase pid={pid}")
+            }
+            AuditEvent::Request { pid, decision, id } => {
+                eprintln!("envcloakd: audit: request decision={decision} id={id} pid={pid}")
+            }
+            AuditEvent::Approved {
+                pid,
+                request,
+                grant,
+            } => eprintln!("envcloakd: audit: approved request={request} grant={grant} pid={pid}"),
+            AuditEvent::ApproveFailed { pid, reason } => {
+                eprintln!("envcloakd: audit: approve failed reason={reason} pid={pid}")
+            }
+            AuditEvent::ProofRefused { pid, method } => {
+                eprintln!(
+                    "envcloakd: audit: proof refused method={method} reason=agent_involved pid={pid}"
+                )
+            }
+            AuditEvent::Denied {
+                pid,
+                request,
+                root_auto_denied,
+            } => {
+                eprintln!("envcloakd: audit: denied request={request} pid={pid}");
+                if root_auto_denied {
+                    // The notification of SPEC §10a, until there is a
+                    // surface for one (M3).
+                    eprintln!(
+                        "envcloakd: notice: a process tree was denied three times in 10 minutes \
+                         and is denied for 30"
+                    );
+                }
+            }
+            AuditEvent::Revoked { pid, count } => {
+                eprintln!("envcloakd: audit: revoked grants={count} pid={pid}")
+            }
+            AuditEvent::ManifestChanged { pid, grant } => {
+                eprintln!("envcloakd: audit: manifest changed grant={grant} pid={pid}")
             }
         }
     }

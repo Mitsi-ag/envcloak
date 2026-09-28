@@ -2,10 +2,11 @@
 //! SIZE]` (SPEC §5 "Unlockers", story S1).
 //!
 //! 1. The daemon is verified, and must have no vault yet.
-//! 2. The passphrase comes from the terminal (typed twice, or a generated
-//!    six-word passphrase shown once and typed back), or from the
-//!    descriptor `--passphrase-fd` names. It is checked against the rules
-//!    here first, so a weak one is refused before any key derivation.
+//! 2. Under a tracer nothing is read or shown (gate 19). The passphrase
+//!    comes from the terminal (typed twice, or a generated six-word
+//!    passphrase shown once and typed back), or from the descriptor
+//!    `--passphrase-fd` names. It is checked against the rules here
+//!    first, so a weak one is refused before any key derivation.
 //! 3. The Recovery Kit is generated here, and shown on the terminal or
 //!    written to the descriptor `--kit-fd` names, never to stdout or
 //!    stderr. It is written before the vault exists, so a vault never
@@ -31,7 +32,7 @@ use envcloak_ipc::{ClientError, RpcError};
 
 use super::fd_number;
 use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, usage};
+use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use crate::tty::{InputError, Terminal, read_secret_fd};
 
 const USAGE: &str =
@@ -109,6 +110,7 @@ fn create(a: &CreateArgs) -> Result<ExitCode, Failure> {
         return Err(ClientError::Rpc(RpcError::new(ErrorKind::VaultExists)).into());
     }
     drop(client);
+    refuse_if_traced()?;
 
     let mut kit_out = match a.kit_fd {
         Some(fd) => Some(File::from(

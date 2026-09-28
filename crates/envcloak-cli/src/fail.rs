@@ -74,9 +74,68 @@ fn reason_text(reason: &str) -> &'static str {
         "permissions" => "a vault directory or file has unsafe permissions or ownership",
         "disk_full" => "the disk is full",
         "storage" => "the vault storage failed",
-        "io" => "the vault file could not be accessed",
+        "io" => "the vault file or the manifest could not be accessed",
         "migration" => "the vault format could not be upgraded",
+        // Caller evidence.
+        "caller_gone" => "this process exited before its ancestry could be read",
+        "ancestry_changed" => "this process's ancestry kept changing while it was read",
+        "ancestry_hidden" => {
+            "a process in this process's ancestry is hidden from the daemon (Linux: /proc \
+             mounted with hidepid; see docs/AGENTS.md)"
+        }
+        "ancestry_unreadable" => "this process's ancestry could not be read",
+        // The manifest.
+        "too_large" => "the manifest is larger than 64 KiB",
+        "not_utf8" => "the manifest is not UTF-8",
+        "syntax" => "the manifest is not valid TOML",
+        "duplicate_key" => "the manifest defines a key twice",
+        "unknown_key" => "the manifest has an unknown key",
+        "wrong_type" => "a manifest value has the wrong type",
+        "invalid_env_name" => "a variable name in the manifest or a --ref is invalid",
+        "invalid_profile_name" => "the profile name is invalid",
+        "nested_profile" => "profiles do not nest",
+        "invalid_reference" => "a reference in the manifest or a --ref is invalid",
+        "invalid_project_name" => "the project name is invalid",
+        "loose_policy" => "the manifest's [policy] tries to loosen policy, which is refused",
+        "invalid_policy" => "the manifest's [policy] has an invalid value",
+        "unknown_profile" => "the manifest has no such profile",
+        "duplicate_env_name" => "a variable is bound twice",
+        "invalid_path" => "the manifest path is not absolute, or not named envcloak.toml",
+        "not_found" => "no envcloak.toml there",
+        "symlinked_manifest" => "envcloak.toml is a symlink, which is refused",
+        "not_regular_file" => "envcloak.toml is not a regular file",
+        "not_owned" => "envcloak.toml is owned by another user",
+        "directory_changed" => "the project directory changed while it was opened",
+        // Bindings.
+        "unknown_item" => "a reference names an item the vault does not have",
+        "unknown_field" => "a reference names a field the item does not have",
+        "ambiguous_field" => "a reference names an item with several fields without naming one",
+        "no_field" => "a reference names an item with no fields",
+        "card_reference" => "a reference names a card, which is never bound to a variable",
+        "issuer_credential_reference" => {
+            "a reference names an issuer credential, which is never bound to a variable"
+        }
+        "unknown_item_class" => "a reference names an item of a class that cannot be bound",
+        // Approval options.
+        "ttl_zero" => "the grant length must be more than zero",
+        "ttl_too_long" => "the grant length is over the limit (24h for agents, 12h for terminals)",
+        "live_not_bound" => "a --live name is not one of the request's variables",
         _ => "no detail",
+    }
+}
+
+/// What must hold before this process reads, shows or sends a secret or a
+/// proof (SPEC §5 "Process hardening"): no tracer is attached.
+/// Non-dumpable keeps new same-uid attaches out, but not a tracer that
+/// started the process (`strace`, `gdb`), so the CLI refuses instead.
+/// When the check cannot tell, it refuses too.
+pub fn refuse_if_traced() -> Result<(), Failure> {
+    match envcloak_sys::tracer_present() {
+        Ok(false) => Ok(()),
+        Ok(true) | Err(_) => Err(Failure::new(
+            "traced",
+            "a debugger or tracer is attached to this process, so it will not handle secrets",
+        )),
     }
 }
 

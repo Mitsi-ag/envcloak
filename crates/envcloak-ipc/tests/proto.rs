@@ -29,6 +29,7 @@ fn a_request_carries_its_secret_to_the_daemon_intact() {
     let pass = by_label(&cs, labels::VAULT_PASSPHRASE).value();
     let params = UnlockParams {
         passphrase: WireSecret::new(SecretBytes::copy_from(pass)),
+        claims: Vec::new(),
     };
     let f = proto::request_frame::<Unlock>(41, &params).unwrap();
     let req = IncomingRequest::parse(&f).unwrap();

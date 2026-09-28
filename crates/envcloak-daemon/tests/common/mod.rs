@@ -6,7 +6,9 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use envcloak_core::{RecoveryKit, SecretBytes};
+use envcloak_core::crypto::{ItemClass, KdfParams};
+use envcloak_core::vault::{FieldName, ItemDetails, NewItem, Slug, VaultPaths};
+use envcloak_core::{RecoveryKit, SecretBytes, create_vault_with_kit};
 use envcloak_ipc::{Client, RunPaths};
 use envcloak_testkit::{Canary, Daemon, TestHome, by_label, daemon_run_dir, labels};
 
@@ -117,4 +119,83 @@ pub fn rss_kib(pid: i32) -> u64 {
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+/// The data directory of `home`, as the daemon resolves it.
+pub fn data_dir(home: &TestHome) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        home.home().join("Library/Application Support/EnvCloak")
+    } else {
+        home.root().join("data/envcloak")
+    }
+}
+
+/// The slugs of the seeded items, in the order of [`seed_vault`].
+pub const SLUGS: [&str; 4] = [
+    "openai/acme-web",
+    "stripe/acme-web",
+    "github/acme-web",
+    "short/acme-web",
+];
+
+/// Creates the vault in `home` with the canary passphrase, before any
+/// daemon runs, and seeds it with one secret item per canary of the
+/// story: `openai/acme-web`, `stripe/acme-web`, `github/acme-web` and
+/// `short/acme-web`, each with a `value` field. The vault is left locked
+/// on disk; the daemon opens it. Returns the kit's text as a canary.
+pub fn seed_vault(home: &TestHome, cs: &[Canary]) -> Canary {
+    let kit = RecoveryKit::generate();
+    let text = kit.to_display();
+    let paths = VaultPaths::under(data_dir(home));
+    let mut v = create_vault_with_kit(&paths, &passphrase(cs), &kit, KdfParams::minimum()).unwrap();
+    let values = [
+        labels::OPENAI_API_KEY,
+        labels::STRIPE_SECRET_KEY,
+        labels::GITHUB_TOKEN,
+        labels::SHORT_TOKEN,
+    ];
+    v.transact(|t| {
+        for (slug, label) in SLUGS.iter().zip(values) {
+            let id = t.create_item(NewItem {
+                class: ItemClass::Secret,
+                slug: Slug::new(slug).unwrap(),
+                details: ItemDetails {
+                    title: (*slug).to_owned(),
+                    ..ItemDetails::default()
+                },
+            })?;
+            t.add_field(
+                id,
+                FieldName::new("value").unwrap(),
+                SecretBytes::copy_from(by_label(cs, label).value()),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    drop(v);
+    Canary::new("RECOVERY_KIT", text.to_string())
+}
+
+/// The manifest of the story's project: two bindings in the default
+/// profile, one more in `short`.
+pub const MANIFEST: &str = "[project]
+name = \"acme-web\"
+
+[env]
+OPENAI_API_KEY = \"openai/acme-web\"
+STRIPE_SECRET_KEY = \"stripe/acme-web\"
+
+[env.short]
+SHORT_TOKEN = \"short/acme-web\"
+";
+
+/// Writes a project directory `name` in `home` with `manifest`, and
+/// returns the manifest's path.
+pub fn project(home: &TestHome, name: &str, manifest: &str) -> std::path::PathBuf {
+    let dir = home.root().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("envcloak.toml");
+    std::fs::write(&path, manifest).unwrap();
+    path
 }

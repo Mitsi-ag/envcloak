@@ -146,6 +146,17 @@ fn print_human(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
     if s.vault.failed_unlocks > 0 {
         println!("failed unlocks: {}", s.vault.failed_unlocks);
     }
+    println!(
+        "grants: {} in force, {} waiting for approval",
+        s.approvals.grants, s.approvals.pending
+    );
+    if s.approvals.proof_failures > 0 {
+        println!(
+            "failed passphrase attempts: {} (next attempt admitted in {})",
+            s.approvals.proof_failures,
+            duration(s.approvals.proof_wait_secs)
+        );
+    }
     if s.daemon.runtime_dir_fallback {
         if let Ok(p) = run_paths() {
             println!(

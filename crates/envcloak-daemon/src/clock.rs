@@ -9,14 +9,22 @@ use std::time::{Duration, SystemTime};
 
 /// The clocks lock decisions read.
 pub trait Clocks: Send + Sync {
-    /// The wall clock, UTC. Grant deadlines (T9) read it.
-    #[allow(dead_code)]
+    /// The wall clock, UTC. Grant deadlines read it.
     fn wall(&self) -> SystemTime;
     /// Time awake: macOS `CLOCK_UPTIME_RAW`, Linux `CLOCK_MONOTONIC`.
     fn awake(&self) -> Duration;
     /// Time including sleep: macOS `CLOCK_MONOTONIC_RAW`, Linux
     /// `CLOCK_BOOTTIME`.
     fn including_sleep(&self) -> Duration;
+}
+
+/// One reading of every clock, for the grant store.
+pub fn now_of(c: &dyn Clocks) -> envcloak_policy::Now {
+    envcloak_policy::Now {
+        wall: c.wall(),
+        awake: c.awake(),
+        including_sleep: c.including_sleep(),
+    }
 }
 
 /// The kernel's clocks.

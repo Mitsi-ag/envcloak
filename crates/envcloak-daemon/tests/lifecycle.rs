@@ -34,7 +34,7 @@ fn create_lock_unlock_and_status() {
     assert_eq!(i64::from(st.daemon.pid), i64::from(d.pid()));
     assert_eq!(st.daemon.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(st.lock.idle_limit_secs, 8 * 3600);
-    let e = c.unlock(passphrase(&cs)).unwrap_err();
+    let e = c.unlock(passphrase(&cs), &[]).unwrap_err();
     assert_eq!(rpc_kind(e), ErrorKind::NoVault);
 
     let kit = create_vault(&home, &cs);
@@ -59,14 +59,17 @@ fn create_lock_unlock_and_status() {
     assert_eq!(st.lock.idle_remaining_secs, None);
 
     let e = c
-        .unlock(SecretBytes::copy_from(b"not the passphrase, not at all"))
+        .unlock(
+            SecretBytes::copy_from(b"not the passphrase, not at all"),
+            &[],
+        )
         .unwrap_err();
     assert_eq!(rpc_kind(e), ErrorKind::WrongPassphrase);
     assert_eq!(c.status().unwrap().vault.failed_unlocks, 1);
     assert_eq!(c.status().unwrap().vault.state, VaultState::Locked);
-    let v = c.unlock(passphrase(&cs)).unwrap();
+    let v = c.unlock(passphrase(&cs), &[]).unwrap();
     assert!(!v.already);
-    assert!(c.unlock(passphrase(&cs)).unwrap().already);
+    assert!(c.unlock(passphrase(&cs), &[]).unwrap().already);
     assert_eq!(c.status().unwrap().vault.state, VaultState::Unlocked);
     drop(c);
 
@@ -138,7 +141,7 @@ fn a_termination_signal_locks_and_exits() {
     for sig in ["-TERM", "-INT", "-HUP"] {
         let mut c = client(&home);
         if c.status().unwrap().vault.state != VaultState::Unlocked {
-            c.unlock(passphrase(&cs)).unwrap();
+            c.unlock(passphrase(&cs), &[]).unwrap();
         }
         drop(c);
         d.signal(sig);
@@ -205,7 +208,7 @@ fn a_lock_during_vault_create_leaves_it_created_and_locked() {
         )
         .unwrap_err();
     assert_eq!(rpc_kind(e), ErrorKind::VaultExists);
-    assert!(!c.unlock(passphrase(&cs)).unwrap().already);
+    assert!(!c.unlock(passphrase(&cs), &[]).unwrap().already);
     assert!(
         d.log().contains("vault created, then locked"),
         "{}",

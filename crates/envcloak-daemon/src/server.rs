@@ -44,18 +44,21 @@ use envcloak_core::crypto::KdfParams;
 use envcloak_core::vault::VaultPaths;
 use envcloak_core::{RecoveryKit, check_passphrase, create_vault_with_kit};
 use envcloak_ipc::proto::{
-    self, ErrorKind, IncomingRequest, Lock, Method, Role, Status, Unlock, UnlockParams,
-    VaultCreate, VaultCreateParams, loggable_method, required_role,
+    self, Approve, Deny, ErrorKind, GrantsList, GrantsRevoke, IncomingRequest, Lock, Method,
+    PendingGet, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
+    loggable_method, required_role,
 };
 use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
 };
 use envcloak_ipc::{Frame, FrameError, RpcError, RunPathErrorKind, RunPaths};
+use envcloak_policy::{AgentCatalog, Claims, gather};
 use envcloak_sys::{PeerIdentity, TerminationSignals};
 
 use crate::audit::{Audit, AuditEvent};
-use crate::clock::SystemClocks;
+use crate::clock::{SystemClocks, now_of};
 use crate::lock::Reading;
+use crate::requests;
 use crate::state::{BeginUnlock, State, passphrase_error};
 
 /// Connections served at once. Each holds at most one frame (1 MiB) and a
@@ -146,14 +149,17 @@ impl core::fmt::Display for DaemonError {
 impl std::error::Error for DaemonError {}
 
 /// What every thread shares.
-struct Shared {
-    state: Mutex<State>,
+pub(crate) struct Shared {
+    pub(crate) state: Mutex<State>,
     /// Held while Argon2id runs, so only one runs at a time.
-    proof_gate: Mutex<()>,
-    clocks: SystemClocks,
-    audit: Audit,
+    pub(crate) proof_gate: Mutex<()>,
+    pub(crate) clocks: SystemClocks,
+    pub(crate) audit: Audit,
     places: Mutex<Places>,
     runtime_dir_fallback: bool,
+    /// The known agents: builtin plus the user's extensions, read once at
+    /// start.
+    pub(crate) catalog: AgentCatalog,
 }
 
 /// Why a connection was not served.
@@ -199,7 +205,7 @@ impl Places {
     }
 }
 
-fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -237,6 +243,15 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
     let listener = bind(&run.socket)?;
 
     let clocks = SystemClocks;
+    let catalog = AgentCatalog::load(&vault_paths.data_dir);
+    if !catalog.problems().is_empty() {
+        // File names are not repeated: any program running as the user
+        // can write agents.d (docs/AGENTS.md "Extensions").
+        eprintln!(
+            "envcloakd: warning: {} agent extension file(s) in agents.d were skipped",
+            catalog.problems().len()
+        );
+    }
     let state = State::open(vault_paths, cfg.idle_limit, Reading::now(&clocks));
     eprintln!(
         "envcloakd: listening on {} (pid {}, version {})",
@@ -251,6 +266,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         audit: Audit,
         places: Mutex::new(Places::default()),
         runtime_dir_fallback: run.fallback,
+        catalog,
     });
 
     {
@@ -268,7 +284,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
             .spawn(move || {
                 loop {
                     thread::sleep(Duration::from_secs(1));
-                    observe(&shared);
+                    tick(&shared);
                 }
             })
             .map_err(|_| DaemonError::Signals)?;
@@ -345,6 +361,15 @@ fn observe(shared: &Shared) {
     if let Some(reason) = locked(&shared.state).observe(now) {
         eprintln!("envcloakd: vault locked (reason: {})", reason.as_str());
     }
+}
+
+/// The tick: the sleep and idle checks, then the grant sweep, which
+/// drops expired grants and pending requests and every grant whose root
+/// process exited (SPEC §10b: a grant never outlives its root).
+fn tick(shared: &Shared) {
+    observe(shared);
+    let now = now_of(&shared.clocks);
+    locked(&shared.state).grants().sweep(&now, &requests::alive);
 }
 
 /// Frees a connection's place when its thread ends, or when the thread
@@ -510,6 +535,16 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         }),
         Unlock::NAME => answer::<Unlock>(id, &req, |p| unlock(shared, peer, p)),
         VaultCreate::NAME => answer::<VaultCreate>(id, &req, |p| create(shared, p)),
+        RunRequest::NAME => {
+            answer::<RunRequest>(id, &req, |p| requests::run_request(shared, peer, p))
+        }
+        PendingGet::NAME => answer::<PendingGet>(id, &req, |p| requests::pending_get(shared, p)),
+        Approve::NAME => answer::<Approve>(id, &req, |p| requests::approve(shared, peer, p)),
+        Deny::NAME => answer::<Deny>(id, &req, |p| requests::deny(shared, peer, p)),
+        GrantsList::NAME => answer::<GrantsList>(id, &req, |_| requests::grants_list(shared)),
+        GrantsRevoke::NAME => {
+            answer::<GrantsRevoke>(id, &req, |p| requests::grants_revoke(shared, peer, p))
+        }
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
 }
@@ -537,22 +572,45 @@ fn status(shared: &Shared) -> StatusView {
         runtime_dir_fallback: shared.runtime_dir_fallback,
     };
     let now = Reading::now(&shared.clocks);
-    locked(&shared.state).status(now, daemon)
+    let at = now_of(&shared.clocks);
+    locked(&shared.state).status(now, &at, daemon)
 }
 
 /// The daemon handles no secret under a tracer.
-fn refuse_if_traced() -> Result<(), RpcError> {
+pub(crate) fn refuse_if_traced() -> Result<(), RpcError> {
     match envcloak_sys::tracer_present() {
         Ok(false) => Ok(()),
         _ => Err(RpcError::new(ErrorKind::Traced)),
     }
 }
 
+/// `unlock` is a proof (SPEC §10b): refused from a caller with an agent
+/// in its evidence, and subject to the attempt limiter. The evidence is
+/// read before the vault is looked at, so an agent learns nothing from
+/// the order of the checks.
 fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<UnlockedView, RpcError> {
     let pass = p.passphrase.into_inner();
     refuse_if_traced()?;
+    let claims =
+        Claims::from_markers(&p.claims).map_err(|_| RpcError::new(ErrorKind::InvalidParams))?;
+    let evidence = gather(peer, claims, &shared.catalog)
+        .map_err(|e| RpcError::with_reason(ErrorKind::Evidence, e.token()))?;
+    if evidence.agent_involved() {
+        shared.audit.record(AuditEvent::ProofRefused {
+            pid: peer.pid,
+            method: "unlock",
+        });
+        return Err(RpcError::new(ErrorKind::ProofRefused));
+    }
     let _gate = locked(&shared.proof_gate);
-    let begin = locked(&shared.state).begin_unlock()?;
+    let begin = {
+        let mut s = locked(&shared.state);
+        let at = now_of(&shared.clocks);
+        s.limiter()
+            .check(&at)
+            .map_err(|_| RpcError::new(ErrorKind::TooManyAttempts))?;
+        s.begin_unlock()?
+    };
     let (vault, generation) = match begin {
         BeginUnlock::Already(v) => return Ok(v),
         BeginUnlock::Proceed(v, g) => (v, g),
@@ -560,10 +618,16 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
     let result = vault.unlock_with_passphrase(&pass);
     drop(pass);
     let now = Reading::now(&shared.clocks);
-    let r = locked(&shared.state).finish_unlock(generation, now, result);
+    let at = now_of(&shared.clocks);
+    let mut s = locked(&shared.state);
+    let r = s.finish_unlock(generation, now, result);
     match &r {
-        Ok(_) => eprintln!("envcloakd: vault unlocked"),
+        Ok(_) => {
+            s.limiter().succeeded();
+            eprintln!("envcloakd: vault unlocked");
+        }
         Err(e) if e.kind == ErrorKind::WrongPassphrase => {
+            s.limiter().failed(&at);
             shared
                 .audit
                 .record(AuditEvent::UnlockFailed { pid: peer.pid });

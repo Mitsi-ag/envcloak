@@ -5,7 +5,8 @@
 //!   (1 MiB) of JSON, held in a buffer wiped on drop.
 //! - [`proto`]: the methods, their parameters and results, the roles, and
 //!   error kinds with stable tokens. Errors never carry text from the
-//!   other side.
+//!   other side. The grant methods carry `envcloak_policy`'s wire types
+//!   (a pending request's descriptor, the approval options).
 //! - [`WireSecret`]: a value inside a message, base64 on the wire, decoded
 //!   from the frame straight into a wiped buffer.
 //! - [`paths`]: where the socket lives, and the checks on its directory.

@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 envcloak-core.workspace = true
 envcloak-ipc.workspace = true
+envcloak-policy.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
 
@@ -22,5 +23,7 @@ base64.workspace = true
 envcloak-ipc = { workspace = true, features = ["testing"] }
 envcloak-sys = { workspace = true, features = ["testing"] }
 envcloak-testkit.workspace = true
+# The grant tests tamper with a vault file directly, as the core's do.
+rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

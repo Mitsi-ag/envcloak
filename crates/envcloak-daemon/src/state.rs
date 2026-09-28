@@ -18,6 +18,14 @@
 //! answer says so. Idle time does not count against an unlock in progress:
 //! it applies only to an unlocked vault.
 //!
+//! The grants ([`envcloak_policy::GrantStore`]) and the passphrase attempt
+//! limiter live here too, under the same mutex: a `once` grant is decided
+//! and consumed under it, and a lock for any reason drops every grant and
+//! pending request (SPEC §5 "Lock"). A proof (`approve`) takes the
+//! unlocked vault out ([`State::begin_proof`]) to run Argon2id, as an
+//! unlock does; other requests see [`Slot::Busy`] meanwhile, and a lock
+//! that arrives wins.
+//!
 //! Every method here runs with the daemon's state mutex held and returns
 //! quickly; Argon2id runs between a `begin_*` and its `finish_*`, outside
 //! the mutex.
@@ -30,9 +38,10 @@ use envcloak_core::vault::{Integrity, LockedVault, Vault, VaultError, VaultError
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::{
-    CreatedView, DaemonView, Integrity as IntegrityView, LockReason, LockView, StatusView,
-    UnlockedView, VaultState, VaultView,
+    ApprovalsView, CreatedView, DaemonView, Integrity as IntegrityView, LockReason, LockView,
+    StatusView, UnlockedView, VaultState, VaultView,
 };
+use envcloak_policy::{AttemptLimiter, GrantStore, Now};
 
 use crate::lock::{LockTimer, Reading};
 
@@ -77,6 +86,8 @@ pub struct State {
     last_reason: Option<LockReason>,
     generation: u64,
     failed_unlocks: u32,
+    grants: GrantStore,
+    limiter: AttemptLimiter,
 }
 
 impl State {
@@ -89,6 +100,8 @@ impl State {
             last_reason: None,
             generation: 0,
             failed_unlocks: 0,
+            grants: GrantStore::new(),
+            limiter: AttemptLimiter::new(),
         }
     }
 
@@ -99,6 +112,74 @@ impl State {
 
     pub fn paths(&self) -> &VaultPaths {
         &self.paths
+    }
+
+    /// The grants and pending requests.
+    pub fn grants(&mut self) -> &mut GrantStore {
+        &mut self.grants
+    }
+
+    /// The passphrase attempt limiter, shared by every proof.
+    pub fn limiter(&mut self) -> &mut AttemptLimiter {
+        &mut self.limiter
+    }
+
+    /// The unlocked vault, for a request that reads its metadata under the
+    /// state lock.
+    ///
+    /// # Errors
+    /// [`ErrorKind::VaultLocked`], [`ErrorKind::NoVault`],
+    /// [`ErrorKind::Busy`] or [`ErrorKind::VaultUnavailable`] when it is
+    /// not unlocked, and [`ErrorKind::VaultTampered`] when it failed its
+    /// integrity check: no grant is evaluated from such a vault, and no
+    /// proof taken.
+    pub fn unlocked(&self) -> Result<&Vault, RpcError> {
+        match &self.slot {
+            Slot::Unlocked(v) if v.integrity() == Integrity::Ok => Ok(v),
+            Slot::Unlocked(_) => Err(RpcError::new(ErrorKind::VaultTampered)),
+            Slot::Locked(_) => Err(RpcError::new(ErrorKind::VaultLocked)),
+            Slot::Absent => Err(RpcError::new(ErrorKind::NoVault)),
+            Slot::Busy => Err(RpcError::new(ErrorKind::Busy)),
+            Slot::Unavailable(r) => Err(RpcError::with_reason(ErrorKind::VaultUnavailable, r)),
+        }
+    }
+
+    /// Records activity at `now`: a covered request or an approval keeps
+    /// the vault from locking idle.
+    pub fn touch(&mut self, now: Reading) {
+        self.timer.touch(now);
+    }
+
+    /// Starts a proof: takes the unlocked vault out of the slot for the
+    /// caller to run Argon2id on, and the generation to finish under. The
+    /// vault must be unlocked and verified.
+    ///
+    /// # Errors
+    /// As [`State::unlocked`].
+    pub fn begin_proof(&mut self) -> Result<(Box<Vault>, u64), RpcError> {
+        self.unlocked()?;
+        match std::mem::replace(&mut self.slot, Slot::Busy) {
+            Slot::Unlocked(v) => Ok((v, self.generation)),
+            other => {
+                self.slot = other;
+                Err(RpcError::new(ErrorKind::Internal))
+            }
+        }
+    }
+
+    /// Finishes a proof begun under `generation`: puts the vault back, or
+    /// locks it when a lock arrived meanwhile.
+    ///
+    /// # Errors
+    /// [`ErrorKind::VaultLocked`] when a lock arrived meanwhile.
+    pub fn finish_proof(&mut self, generation: u64, vault: Box<Vault>) -> Result<(), RpcError> {
+        if generation == self.generation {
+            self.slot = Slot::Unlocked(vault);
+            Ok(())
+        } else {
+            self.slot = Slot::Locked((*vault).lock());
+            Err(RpcError::new(ErrorKind::VaultLocked))
+        }
     }
 
     /// Runs the sleep and idle checks at `now`. Returns the reason when it
@@ -114,6 +195,9 @@ impl State {
     /// Locks for `reason`. Returns whether a vault was unlocked. An unlock
     /// in progress finishes locked, unless the reason is idle time.
     pub fn lock(&mut self, reason: LockReason) -> bool {
+        // Whatever the slot holds, a lock ends every grant and pending
+        // request (SPEC §5 "Lock").
+        self.grants.on_lock();
         match std::mem::replace(&mut self.slot, Slot::Absent) {
             Slot::Unlocked(v) => {
                 // Dropping the Vault wipes the VMK, the subkeys and the
@@ -170,6 +254,7 @@ impl State {
         match result {
             Ok(v) if generation == self.generation => {
                 let view = unlocked_view(&v, false);
+                self.start_grants(&v);
                 self.slot = Slot::Unlocked(Box::new(v));
                 self.timer.touch(now);
                 Ok(view)
@@ -188,6 +273,13 @@ impl State {
                 Err(e)
             }
         }
+    }
+
+    /// An unlocked vault: the grant store starts empty at its epochs.
+    fn start_grants(&mut self, v: &Vault) {
+        self.grants.on_lock();
+        let policy_epoch = v.header().map(|h| h.policy_epoch).unwrap_or(0);
+        self.grants.set_epochs(v.epoch(), policy_epoch);
     }
 
     /// Starts `vault create`: there must be no vault.
@@ -216,6 +308,7 @@ impl State {
         match result {
             Ok(v) if generation == self.generation => {
                 let view = created_view(&v, false);
+                self.start_grants(&v);
                 self.slot = Slot::Unlocked(Box::new(v));
                 self.timer.touch(now);
                 Ok(view)
@@ -233,8 +326,8 @@ impl State {
         }
     }
 
-    /// The vault and lock parts of `status`.
-    pub fn status(&self, now: Reading, daemon: DaemonView) -> StatusView {
+    /// The vault, lock and approvals parts of `status`.
+    pub fn status(&self, now: Reading, at: &Now, daemon: DaemonView) -> StatusView {
         let (state, integrity, read_only, unavailable) = match &self.slot {
             Slot::Absent => (VaultState::Absent, None, false, None),
             Slot::Locked(_) | Slot::Busy => (VaultState::Locked, None, false, None),
@@ -260,6 +353,18 @@ impl State {
                 idle_limit_secs: self.timer.idle_limit().as_secs(),
                 idle_remaining_secs: unlocked.then(|| self.timer.idle_remaining(now).as_secs()),
             },
+            approvals: self.approvals(at),
+        }
+    }
+
+    /// The grants, pending requests and limiter parts of `status`.
+    pub fn approvals(&self, at: &Now) -> ApprovalsView {
+        let (grants, pending) = self.grants.counts(at);
+        ApprovalsView {
+            grants: u32::try_from(grants).unwrap_or(u32::MAX),
+            pending: u32::try_from(pending).unwrap_or(u32::MAX),
+            proof_failures: self.limiter.failures(),
+            proof_wait_secs: self.limiter.wait_remaining(at).as_secs(),
         }
     }
 }
@@ -371,6 +476,10 @@ mod tests {
         Reading::now(c)
     }
 
+    fn at(c: &dyn Clocks) -> Now {
+        crate::clock::now_of(c)
+    }
+
     fn daemon_view() -> DaemonView {
         DaemonView {
             version: "test".into(),
@@ -418,7 +527,7 @@ mod tests {
         assert!(s.lock(LockReason::Request));
         assert!(!s.lock(LockReason::Request));
         assert!(matches!(s.slot(), Slot::Locked(_)));
-        let st = s.status(now(&f.clocks), daemon_view());
+        let st = s.status(now(&f.clocks), &at(&f.clocks), daemon_view());
         assert_eq!(st.vault.state, VaultState::Locked);
         assert_eq!(st.lock.last_reason, Some(LockReason::Request));
         assert_eq!(st.lock.idle_remaining_secs, None);
@@ -427,13 +536,15 @@ mod tests {
         assert_eq!(e.kind, ErrorKind::WrongPassphrase);
         assert!(matches!(s.slot(), Slot::Locked(_)));
         assert_eq!(
-            s.status(now(&f.clocks), daemon_view()).vault.failed_unlocks,
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .vault
+                .failed_unlocks,
             1
         );
         let v = unlock(&f, &mut s, PASS).unwrap();
         assert!(!v.already);
         assert_eq!(v.integrity, IntegrityView::Ok);
-        let st = s.status(now(&f.clocks), daemon_view());
+        let st = s.status(now(&f.clocks), &at(&f.clocks), daemon_view());
         assert_eq!(st.vault.state, VaultState::Unlocked);
         assert_eq!(st.lock.idle_remaining_secs, Some(8 * 3600));
     }
@@ -452,7 +563,7 @@ mod tests {
         f.clocks.run(Duration::from_secs(1));
         assert_eq!(s.observe(now(&f.clocks)), Some(LockReason::Idle));
         assert!(matches!(s.slot(), Slot::Locked(_)));
-        let st = s.status(now(&f.clocks), daemon_view());
+        let st = s.status(now(&f.clocks), &at(&f.clocks), daemon_view());
         assert_eq!(st.lock.last_reason, Some(LockReason::Idle));
         // Locked already: later ticks report nothing.
         f.clocks.run(Duration::from_secs(1));
@@ -476,7 +587,9 @@ mod tests {
         assert_eq!(s.observe(now(&f.clocks)), Some(LockReason::Sleep));
         assert!(matches!(s.slot(), Slot::Locked(_)));
         assert_eq!(
-            s.status(now(&f.clocks), daemon_view()).lock.last_reason,
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .lock
+                .last_reason,
             Some(LockReason::Sleep)
         );
     }
@@ -536,7 +649,7 @@ mod tests {
             assert!(created.locked, "{reason:?}");
             assert_eq!(created.integrity, IntegrityView::Ok);
             assert!(matches!(s.slot(), Slot::Locked(_)));
-            let st = s.status(now(&f.clocks), daemon_view());
+            let st = s.status(now(&f.clocks), &at(&f.clocks), daemon_view());
             assert_eq!(st.vault.state, VaultState::Locked);
             assert_eq!(st.lock.last_reason, Some(reason));
             assert!(!unlock(&f, &mut s, PASS).unwrap().already);

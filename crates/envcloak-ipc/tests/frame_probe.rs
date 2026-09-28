@@ -35,6 +35,7 @@ fn round_trip(pass: &[u8], value: &[u8]) {
         1,
         &UnlockParams {
             passphrase: WireSecret::new(SecretBytes::copy_from(pass)),
+            claims: Vec::new(),
         },
     )
     .unwrap();

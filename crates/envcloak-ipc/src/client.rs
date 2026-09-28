@@ -26,14 +26,19 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use envcloak_core::SecretBytes;
+use envcloak_policy::{ApprovalOptions, PendingDescriptor};
 
 use crate::frame::{Frame, FrameError};
 use crate::paths::{RunPathError, RunPathErrorKind, RunPaths};
 use crate::proto::{
-    self, Lock, Method, NoParams, ResponseError, RpcError, Status, Unlock, UnlockParams,
-    VaultCreate, VaultCreateParams,
+    self, Approve, ApproveParams, Deny, GrantsList, GrantsRevoke, Lock, Method, NoParams,
+    PendingGet, RequestParams, ResponseError, RevokeParams, RpcError, RunRequest, RunRequestParams,
+    Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
 };
-use crate::view::{CreatedView, LockedView, StatusView, UnlockedView};
+use crate::view::{
+    ApprovedView, CreatedView, DecisionView, DeniedView, GrantsView, LockedView, RevokedView,
+    StatusView, UnlockedView,
+};
 use crate::wire_secret::WireSecret;
 
 /// How long a call may wait for its response. `vault create` runs
@@ -259,13 +264,19 @@ impl Client {
         self.call::<VaultCreate>(&params)
     }
 
-    /// `unlock` with the passphrase.
+    /// `unlock` with the passphrase, claiming the agent marker names
+    /// `claims` (`envcloak_policy::Claims::from_env`).
     ///
     /// # Errors
     /// As [`Client::call`].
-    pub fn unlock(&mut self, passphrase: SecretBytes) -> Result<UnlockedView, ClientError> {
+    pub fn unlock(
+        &mut self,
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<UnlockedView, ClientError> {
         self.call::<Unlock>(&UnlockParams {
             passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
         })
     }
 
@@ -275,6 +286,75 @@ impl Client {
     /// As [`Client::call`].
     pub fn lock(&mut self) -> Result<LockedView, ClientError> {
         self.call::<Lock>(&NoParams {})
+    }
+
+    /// `run.request`: the decision for a run.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn run_request(&mut self, p: &RunRequestParams) -> Result<DecisionView, ClientError> {
+        self.call::<RunRequest>(p)
+    }
+
+    /// `pending.get` for request `id`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn pending_get(&mut self, id: &str) -> Result<PendingDescriptor, ClientError> {
+        self.call::<PendingGet>(&RequestParams {
+            request: id.to_owned(),
+        })
+    }
+
+    /// `approve` request `id` with `options`, the `digest` of the
+    /// statement read, the passphrase, and the approver's claims.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn approve(
+        &mut self,
+        id: &str,
+        options: ApprovalOptions,
+        digest: &[u8; 32],
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<ApprovedView, ClientError> {
+        self.call::<Approve>(&ApproveParams {
+            request: id.to_owned(),
+            options,
+            digest: digest.iter().map(|b| format!("{b:02x}")).collect(),
+            passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `deny` request `id`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn deny(&mut self, id: &str) -> Result<DeniedView, ClientError> {
+        self.call::<Deny>(&RequestParams {
+            request: id.to_owned(),
+        })
+    }
+
+    /// `grants.list`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn grants_list(&mut self) -> Result<GrantsView, ClientError> {
+        self.call::<GrantsList>(&NoParams {})
+    }
+
+    /// `grants.revoke` for grant `id`, or every grant.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn grants_revoke(&mut self, id: Option<&str>) -> Result<RevokedView, ClientError> {
+        self.call::<GrantsRevoke>(&RevokeParams {
+            grant: id.map(str::to_owned),
+            all: id.is_none(),
+        })
     }
 }
 

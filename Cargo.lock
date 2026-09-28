@@ -224,6 +224,7 @@ version = "0.1.0"
 dependencies = [
  "envcloak-core",
  "envcloak-ipc",
+ "envcloak-policy",
  "envcloak-sys",
  "envcloak-testkit",
  "libc",
@@ -267,6 +268,7 @@ dependencies = [
  "base64",
  "envcloak-core",
  "envcloak-ipc",
+ "envcloak-policy",
  "envcloak-sys",
  "envcloak-testkit",
  "secrecy",
@@ -375,9 +377,11 @@ dependencies = [
  "base64",
  "envcloak-core",
  "envcloak-ipc",
+ "envcloak-policy",
  "envcloak-sys",
  "envcloak-testkit",
  "libc",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]

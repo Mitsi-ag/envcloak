@@ -6,6 +6,7 @@
 //! identity M1 clients cannot verify, so [`crate::Client::status`] passes
 //! them through [`StatusView::sanitize`] before anyone prints them.
 
+use envcloak_policy::{DenyReason, Mode, SubjectKind, Uses};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::REASONS;
@@ -17,12 +18,13 @@ pub const UNRECOGNIZED_VERSION: &str = "unrecognized";
 /// of [`REASONS`].
 pub const UNKNOWN_REASON: &str = "unknown";
 
-/// `status`: the daemon, its vault and its lock.
+/// `status`: the daemon, its vault, its lock, and its grants and proofs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusView {
     pub daemon: DaemonView,
     pub vault: VaultView,
     pub lock: LockView,
+    pub approvals: ApprovalsView,
 }
 
 impl StatusView {
@@ -171,6 +173,120 @@ impl LockReason {
             LockReason::Signal => "signal",
         }
     }
+}
+
+/// Grants, pending requests and the passphrase attempt limiter (SPEC
+/// §10b "Passphrase attempts": `envcloak status` reports the failures).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalsView {
+    /// Grants in force.
+    pub grants: u32,
+    /// Requests waiting for an approval.
+    pub pending: u32,
+    /// Failed proofs (wrong passphrases) since the last success.
+    pub proof_failures: u32,
+    /// Seconds before the next proof is admitted.
+    pub proof_wait_secs: u64,
+}
+
+/// `run.request`: the decision (SPEC §6.1 step 4, §10b).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecisionView {
+    /// A grant covers the request. What a covered run must do follows.
+    Covered {
+        /// The grant's id, 26 Crockford base32 characters.
+        grant: String,
+        /// The effective policy: redact the command's output.
+        redact: bool,
+        /// The effective mode.
+        mode: Mode,
+        /// The manifest's hash differs from the one at approval; the
+        /// bindings are still a subset, so nothing prompted.
+        manifest_changed: bool,
+    },
+    /// No grant covers it; a person must approve request `request`.
+    Pending {
+        /// 8 Crockford base32 characters.
+        request: String,
+    },
+    /// Denied without a prompt; `reason` is a `DenyReason` token.
+    Denied { reason: String },
+}
+
+impl DecisionView {
+    /// The denial reason, when the decision is a denial with a token this
+    /// client knows.
+    pub fn deny_reason(&self) -> Option<DenyReason> {
+        match self {
+            DecisionView::Denied { reason } => DenyReason::from_token(reason),
+            _ => None,
+        }
+    }
+}
+
+/// `approve`: the grant created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedView {
+    /// 26 Crockford base32 characters.
+    pub grant: String,
+    /// The grant's length, in seconds.
+    pub expires_in_secs: u64,
+}
+
+/// `deny`: the request was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeniedView {
+    /// This was the third denial for the root within 10 minutes: the root
+    /// is denied for 30 minutes.
+    pub root_auto_denied: bool,
+}
+
+/// `grants.list`: the grants in force, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantsView {
+    pub grants: Vec<GrantView>,
+}
+
+/// One grant (SPEC §10b). Every string is escaped before it is shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantView {
+    /// 26 Crockford base32 characters.
+    pub id: String,
+    pub kind: SubjectKind,
+    /// The agent's display name, when one is involved.
+    pub label: Option<String>,
+    pub root_pid: i32,
+    pub root_exe: Option<String>,
+    /// The project's canonical directory.
+    pub project_dir: String,
+    pub bindings: Vec<GrantBindingView>,
+    pub mode: Mode,
+    pub uses: Uses,
+    /// When the grant was created, Unix seconds.
+    pub created_secs: u64,
+    /// Seconds left before it expires, by the nearer of its two clocks.
+    pub remaining_secs: u64,
+}
+
+/// One binding of a grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantBindingView {
+    pub env_name: String,
+    pub slug: String,
+    pub live: bool,
+}
+
+/// `grants.revoke`: how many grants ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokedView {
+    pub revoked: u64,
 }
 
 /// `vault.create`: the vault exists, under the passphrase and the Recovery

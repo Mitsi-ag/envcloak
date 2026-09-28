@@ -20,6 +20,7 @@ testing = []
 [dependencies]
 base64.workspace = true
 envcloak-core.workspace = true
+envcloak-policy.workspace = true
 envcloak-sys.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }

@@ -3,8 +3,11 @@
 //! The daemon is verified first, so no passphrase is asked for when there
 //! is no daemon, no vault, or nothing to unlock. The passphrase is read
 //! from `/dev/tty` with echo off, or from the descriptor `--passphrase-fd`
-//! names; never from argv or the environment. It is then sent once, on a
-//! new connection that is verified again, and the daemon runs Argon2id.
+//! names; never from argv or the environment, and never under a tracer.
+//! It is then sent once, on a new connection that is verified again, with
+//! the agent markers this process's environment holds (their names), and
+//! the daemon runs Argon2id. An unlock is a proof (SPEC §10b): the daemon
+//! refuses it from a process with an agent in its ancestry.
 
 use std::process::ExitCode;
 
@@ -12,9 +15,9 @@ use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::VaultState;
 use envcloak_ipc::{ClientError, RpcError};
 
-use super::fd_number;
+use super::{claims, fd_number};
 use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, usage};
+use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use crate::tty::{Terminal, read_secret_fd};
 
 const USAGE: &str = "envcloak unlock [--passphrase-fd N]";
@@ -51,11 +54,12 @@ fn unlock(fd: Option<i32>) -> Result<ExitCode, Failure> {
         }
         VaultState::Locked => {}
     }
+    refuse_if_traced()?;
     let passphrase = match fd {
         Some(fd) => read_secret_fd(fd)?,
         None => Terminal::open()?.read_secret("Vault passphrase: ")?,
     };
-    let unlocked = connect()?.unlock(passphrase)?;
+    let unlocked = connect()?.unlock(passphrase, &claims())?;
     if unlocked.already {
         println!("The vault is already unlocked.");
     } else {

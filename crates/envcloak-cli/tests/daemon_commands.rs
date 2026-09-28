@@ -164,7 +164,8 @@ fn status_prints_no_control_sequence_a_stand_in_daemon_sends() {
             "state": "unavailable", "integrity": null, "read_only": false,
             "unavailable": "\u{1b}[31mdamaged\r\u{8}", "busy": false, "failed_unlocks": 0
         },
-        "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": null}
+        "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": null},
+        "approvals": {"grants": 0, "pending": 0, "proof_failures": 0, "proof_wait_secs": 0}
     });
     let server = std::thread::spawn(move || {
         for _ in 0..2 {

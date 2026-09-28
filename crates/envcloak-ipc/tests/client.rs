@@ -195,7 +195,7 @@ fn a_server_of_another_uid_gets_nothing() {
         wire(&proto::error_frame(Some(req.id), &ErrorKind::WrongPassphrase.into()).unwrap())
     });
     let mut c = Client::connect(&p).unwrap();
-    let e = c.unlock(SecretBytes::copy_from(pass)).unwrap_err();
+    let e = c.unlock(SecretBytes::copy_from(pass), &[]).unwrap_err();
     assert_eq!(e.token(), "wrong_passphrase");
     drop(c);
     assert!(!h.join().unwrap().is_empty());
@@ -267,7 +267,8 @@ fn status_text_from_the_daemon_is_checked_before_use() {
                 "state": "unavailable", "integrity": null, "read_only": false,
                 "unavailable": unavailable, "busy": false, "failed_unlocks": 0
             },
-            "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": null}
+            "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": null},
+            "approvals": {"grants": 0, "pending": 0, "proof_failures": 0, "proof_wait_secs": 0}
         })
     };
     let cases = [
