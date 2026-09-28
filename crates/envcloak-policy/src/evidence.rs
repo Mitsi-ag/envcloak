@@ -47,8 +47,14 @@
 //!   with its pid and start time (a recycled pid never matches), no known
 //!   agent sits between the root and the caller unless the root is that
 //!   agent, a grant approved for a terminal subject never covers an agent
-//!   or unknown one, and an agent root that could not have been picked
-//!   above a session (see Root) covers no caller outside its session.
+//!   or unknown one, and a root above the caller's session is either an
+//!   agent that could have been picked there (see Root) or a process that
+//!   is no agent and not in pid 1's session. Rule 3 roots a caller in pid
+//!   1's session (a GUI app's helper, a `launchd` job) at the topmost
+//!   process below pid 1, the whole app; such a grant covers the app's
+//!   callers in that session, never the sessions the app starts (an IDE's
+//!   integrated terminals, the commands an agent the catalog does not know
+//!   runs in sessions of their own).
 //!
 //! What a caller says only tightens. The claims (environment markers the
 //! CLI found in its own environment, SPEC §10a "caller-asserted") can turn
@@ -481,11 +487,13 @@ impl SubjectEvidence {
     /// - no known agent sits between `root` and the caller, the caller
     ///   included, unless `root` is that agent;
     /// - a terminal grant covers only a terminal subject;
-    /// - an agent root above this caller's session is one a builtin entry
-    ///   matched by its executable or signature: an agent matched only on
-    ///   its `argv[0]`, script or command name, or only through a user
+    /// - a root above this caller's session is an agent a builtin entry
+    ///   matched by its executable or signature, or a process that is not
+    ///   an agent and not in pid 1's session. An agent matched only on its
+    ///   `argv[0]`, script or command name, or only through a user
     ///   extension, is a root for callers in its own session, never above
-    ///   theirs (see the module documentation).
+    ///   theirs; so is a GUI app or `launchd` job, which rule 3 roots at
+    ///   the topmost process below pid 1 (see the module documentation).
     pub fn covered_by(&self, root: &ProcessInstance, grant_kind: SubjectKind) -> bool {
         if root.pid == 1 {
             return false;
@@ -496,7 +504,8 @@ impl SubjectEvidence {
         if self.nearest_agent.is_some_and(|n| n < k) {
             return false;
         }
-        if k > self.limit && self.chain[k].agent.is_some() && !roots_above_session(&self.chain[k]) {
+        let r = &self.chain[k];
+        if k > self.limit && !roots_above_session(r) && (r.agent.is_some() || r.sid == Some(1)) {
             return false;
         }
         !(grant_kind == SubjectKind::Terminal && self.kind() != SubjectKind::Terminal)

@@ -296,6 +296,92 @@ fn gather_classifies_pid_1_of_the_callers_uid() {
     }
 }
 
+/// A caller in pid 1's session without a terminal (a GUI app's helper or
+/// extension host, a `launchd` job) is rooted at the topmost process below
+/// pid 1: the whole app. Such a grant covers the app's callers in that
+/// session, never the sessions the app starts: its integrated terminals,
+/// or the commands an agent the catalog does not know runs in sessions of
+/// their own.
+#[test]
+fn a_root_in_pid_1s_session_covers_no_other_session() {
+    // extension host (90) <- helper (80) <- IDE (50) <- launchd, all in
+    // launchd's session.
+    let ide = vec![
+        p(90, 1, None),
+        p(80, 1, None),
+        p(50, 1, None),
+        p(1, 1, None),
+    ];
+    let helper = ev(ide.clone(), false, &[]);
+    assert_eq!(helper.root().pid, 50);
+    assert_eq!(helper.kind(), SubjectKind::Unknown);
+    let app = helper.root();
+    assert!(helper.covered_by(&app, SubjectKind::Unknown));
+    // Another of the app's callers in that session is covered.
+    let sibling = ev(
+        vec![p(85, 1, None), p(50, 1, None), p(1, 1, None)],
+        false,
+        &[],
+    );
+    assert!(sibling.covered_by(&app, SubjectKind::Unknown));
+    assert!(sibling.covered_by(&app, SubjectKind::Agent));
+
+    // envcloak (97) <- zsh (96, leading a session on the integrated
+    // terminal) <- pty host (60) <- IDE (50) <- launchd.
+    let terminal = ev(
+        vec![
+            p(97, 96, None),
+            p(96, 96, None),
+            p(60, 1, None),
+            p(50, 1, None),
+            p(1, 1, None),
+        ],
+        true,
+        &[],
+    );
+    assert_eq!(terminal.kind(), SubjectKind::Terminal);
+    // A command an unknown agent (70) runs in a session of its own.
+    let command = ev(
+        vec![
+            p(98, 98, None),
+            p(70, 1, None),
+            p(50, 1, None),
+            p(1, 1, None),
+        ],
+        false,
+        &[],
+    );
+    for e in [&terminal, &command] {
+        for kind in [
+            SubjectKind::Agent,
+            SubjectKind::Unknown,
+            SubjectKind::Terminal,
+        ] {
+            assert!(!e.covered_by(&app, kind), "{kind:?}");
+            assert!(!e.covered_by(&e.chain()[2].instance, kind), "{kind:?}");
+        }
+        // Its own grant covers it.
+        assert!(e.covered_by(&e.root(), SubjectKind::Unknown));
+    }
+    // A root above the session outside pid 1's session still covers:
+    // `login` (60, a session of its own) over the shell's session.
+    let e = ev(terminal_chain(None), true, &[]);
+    assert!(e.covered_by(&e.chain()[3].instance, SubjectKind::Unknown));
+    // So does a builtin agent in pid 1's session, known by its
+    // executable: it runs each command in a session of its own.
+    let e = ev(
+        vec![
+            p(98, 98, None),
+            p(70, 1, builtin("claude-code")),
+            p(1, 1, None),
+        ],
+        false,
+        &[],
+    );
+    assert_eq!(e.root().pid, 70);
+    assert!(e.covered_by(&e.root(), SubjectKind::Agent));
+}
+
 #[test]
 fn an_extension_agent_above_the_session_does_not_widen_the_root() {
     // An extension matched the terminal emulator (50): the caller is an
