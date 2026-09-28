@@ -1,15 +1,60 @@
-//! Security events the daemon records (SPEC §3 principle 4, §4.3, gate
-//! 22).
+//! Security events the daemon records (SPEC §3 principle 4, §4.3, §6.1
+//! step 5, gates 22 and 33).
 //!
-//! Until the sealed audit log arrives (T10), each event is one value-free
-//! line on the daemon's standard error, which launchd and systemd keep;
-//! T10 routes the same events into the sealed, MAC-chained log. Every
-//! field is a fixed token or a number: a method name is recorded only
-//! through [`envcloak_ipc::proto::loggable_method`], because a name a
-//! client sent can hold anything.
+//! Every event goes to the sealed, MAC-chained audit log
+//! (`envcloak_core::audit`) and, as one value-free line, to the daemon's
+//! standard error, which launchd and systemd keep. Every field of a line
+//! is a fixed token or a number: a method name is recorded only through
+//! [`envcloak_ipc::proto::loggable_method`], because a name a client sent
+//! can hold anything. An entry holds more (the caller's kind and root, the
+//! project, the items, the command line), all metadata; the command line
+//! is masked before it gets here (`crate::redact`).
+//!
+//! [`AuditLog`] holds the writer while the vault is unlocked, since the
+//! log's keys come from the vault key. Events that cannot be written (the
+//! vault is locked, or the log's directory is unusable) wait in a bounded
+//! queue, with a count of the ones it had no room for, and are written
+//! first at the next chance. A delivery is different: its entry must be
+//! on disk before anything is released, so it is written at once or the
+//! request is denied ([`crate::state::State::audit_delivery`]).
+
+use std::collections::VecDeque;
+use std::time::Duration;
+
+use envcloak_core::audit::{
+    AuditError, AuditKind, AuditRecord, AuditWriter, DecisionSummary, OpenReport, ProjectSummary,
+    SubjectSummary,
+};
+use envcloak_core::vault::{AuditHead, ItemId, Slug, Vault};
+use envcloak_ipc::view::LockReason;
+
+/// Events kept in memory while the log cannot be written.
+pub const QUEUE_MAX: usize = 256;
+/// The head is saved in the vault's header after this many entries.
+pub const ANCHOR_EVERY: u64 = 100;
+/// ... and after this long awake with entries not yet anchored.
+pub const ANCHOR_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// A `run.request` decision, with what its entry records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestAudit {
+    pub pid: i32,
+    /// `covered`, `pending`, `denied` or `policy_denied`.
+    pub decision: &'static str,
+    pub request_id: Option<String>,
+    pub grant_id: Option<String>,
+    /// A `DenyReason` token, for `denied`.
+    pub reason: Option<&'static str>,
+    pub subject: SubjectSummary,
+    pub project: Option<ProjectSummary>,
+    pub items: Vec<(ItemId, Slug)>,
+    /// The command line, masked (`crate::redact::redact_argv`).
+    pub argv: Vec<String>,
+}
 
 /// An event worth recording. The ids in it are the daemon's own
-/// (Crockford base32) and the tokens fixed; nothing a client sent.
+/// (Crockford base32) and the tokens fixed; nothing a client sent but the
+/// masked command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditEvent {
     /// A client-role peer called an `app`-role method.
@@ -19,21 +64,23 @@ pub enum AuditEvent {
         uid: u32,
     },
     /// A peer running as another uid connected; it was closed at accept.
-    ForeignPeer { uid: u32 },
+    ForeignPeer { pid: i32, uid: u32 },
     /// A wrong passphrase was offered to `unlock`.
     UnlockFailed { pid: i32 },
-    /// A `run.request` was decided: `covered` with the grant id, `pending`
-    /// with the request id, `denied` with the reason, or `policy_denied`.
-    Request {
-        pid: i32,
-        decision: &'static str,
-        id: String,
-    },
+    /// The vault was unlocked, or created (and unlocked).
+    Unlocked { pid: i32, created: bool },
+    /// The vault locked.
+    Locked { reason: LockReason },
+    /// A `run.request` was decided.
+    Request(Box<RequestAudit>),
     /// A pending request was approved into a grant.
     Approved {
         pid: i32,
         request: String,
         grant: String,
+        /// `once` or `session`.
+        uses: &'static str,
+        ttl_secs: u64,
     },
     /// An `approve` failed its proof.
     ApproveFailed { pid: i32, reason: &'static str },
@@ -59,77 +106,217 @@ pub enum AuditEvent {
     ManifestChanged {
         pid: i32,
         grant: String,
+        dir: String,
         approved_sha256: [u8; 32],
         sha256: [u8; 32],
     },
 }
 
-/// Where events go.
-#[derive(Debug)]
-pub struct Audit;
-
-impl Audit {
-    pub fn record(&self, e: AuditEvent) {
-        match e {
-            AuditEvent::RoleDenied { method, pid, uid } => eprintln!(
+impl AuditEvent {
+    /// The line for standard error, or `None` for events the daemon
+    /// reports in its own words.
+    pub fn line(&self) -> Option<String> {
+        Some(match self {
+            AuditEvent::RoleDenied { method, pid, uid } => format!(
                 "envcloakd: audit: denied method={method} reason=role_denied role=client pid={pid} uid={uid}"
             ),
-            AuditEvent::ForeignPeer { uid } => {
-                eprintln!("envcloakd: audit: rejected connection reason=foreign_uid uid={uid}")
+            AuditEvent::ForeignPeer { uid, .. } => {
+                format!("envcloakd: audit: rejected connection reason=foreign_uid uid={uid}")
             }
             AuditEvent::UnlockFailed { pid } => {
-                eprintln!("envcloakd: audit: unlock failed reason=wrong_passphrase pid={pid}")
+                format!("envcloakd: audit: unlock failed reason=wrong_passphrase pid={pid}")
             }
-            AuditEvent::Request { pid, decision, id } => {
-                eprintln!("envcloakd: audit: request decision={decision} id={id} pid={pid}")
-            }
+            AuditEvent::Unlocked { .. } | AuditEvent::Locked { .. } => return None,
+            AuditEvent::Request(r) => format!(
+                "envcloakd: audit: request decision={} id={} pid={}",
+                r.decision,
+                r.grant_id
+                    .as_deref()
+                    .or(r.request_id.as_deref())
+                    .or(r.reason)
+                    .unwrap_or(""),
+                r.pid
+            ),
             AuditEvent::Approved {
                 pid,
                 request,
                 grant,
-            } => eprintln!("envcloakd: audit: approved request={request} grant={grant} pid={pid}"),
+                ..
+            } => format!("envcloakd: audit: approved request={request} grant={grant} pid={pid}"),
             AuditEvent::ApproveFailed { pid, reason } => {
-                eprintln!("envcloakd: audit: approve failed reason={reason} pid={pid}")
+                format!("envcloakd: audit: approve failed reason={reason} pid={pid}")
             }
             AuditEvent::ProofRefused {
                 pid,
                 method,
                 reason,
             } => {
-                eprintln!(
-                    "envcloakd: audit: proof refused method={method} reason={reason} pid={pid}"
-                )
+                format!("envcloakd: audit: proof refused method={method} reason={reason} pid={pid}")
             }
             AuditEvent::Denied {
                 pid,
                 request,
                 root_auto_denied,
             } => {
-                eprintln!("envcloakd: audit: denied request={request} pid={pid}");
-                if root_auto_denied {
+                let mut l = format!("envcloakd: audit: denied request={request} pid={pid}");
+                if *root_auto_denied {
                     // The notification of SPEC §10a, until there is a
                     // surface for one (M3).
-                    eprintln!(
-                        "envcloakd: notice: a process tree was denied three times in 10 minutes \
-                         and is denied for 30"
+                    l.push_str(
+                        "\nenvcloakd: notice: a process tree was denied three times in 10 minutes \
+                         and is denied for 30",
                     );
                 }
+                l
             }
             AuditEvent::Revoked { pid, count } => {
-                eprintln!("envcloakd: audit: revoked grants={count} pid={pid}")
+                format!("envcloakd: audit: revoked grants={count} pid={pid}")
             }
             AuditEvent::ManifestChanged {
                 pid,
                 grant,
                 approved_sha256,
                 sha256,
-            } => eprintln!(
+                ..
+            } => format!(
                 "envcloakd: audit: manifest changed grant={grant} approved_sha256={} sha256={} \
                  pid={pid}",
-                hex(&approved_sha256),
-                hex(&sha256)
+                hex(approved_sha256),
+                hex(sha256)
             ),
+        })
+    }
+
+    /// The log entry, made now.
+    pub fn record(&self) -> AuditRecord {
+        let subject = |pid: i32| SubjectSummary {
+            pid,
+            ..SubjectSummary::default()
+        };
+        match self {
+            AuditEvent::RoleDenied { method, pid, .. } => AuditRecord {
+                subject: subject(*pid),
+                decision: decision("denied", Some("role_denied"), Some(method), None),
+                ..AuditRecord::new(AuditKind::RoleDenied, "denied")
+            },
+            AuditEvent::ForeignPeer { pid, uid } => AuditRecord {
+                subject: SubjectSummary {
+                    pid: *pid,
+                    uid: Some(*uid),
+                    ..SubjectSummary::default()
+                },
+                decision: decision("rejected", Some("foreign_uid"), None, None),
+                ..AuditRecord::new(AuditKind::ForeignPeer, "rejected")
+            },
+            AuditEvent::UnlockFailed { pid } => AuditRecord {
+                subject: subject(*pid),
+                decision: decision("failed", Some("wrong_passphrase"), None, None),
+                ..AuditRecord::new(AuditKind::Unlock, "failed")
+            },
+            AuditEvent::Unlocked { pid, created } => AuditRecord {
+                subject: subject(*pid),
+                ..AuditRecord::new(
+                    AuditKind::Unlock,
+                    if *created { "created" } else { "unlocked" },
+                )
+            },
+            AuditEvent::Locked { reason } => AuditRecord {
+                decision: decision("locked", Some(reason.as_str()), None, None),
+                ..AuditRecord::new(AuditKind::Lock, "locked")
+            },
+            AuditEvent::Request(r) => AuditRecord {
+                request_id: r.request_id.clone(),
+                grant_id: r.grant_id.clone(),
+                subject: r.subject.clone(),
+                project: r.project.clone(),
+                items: r.items.clone(),
+                decision: decision(r.decision, r.reason, Some("run.request"), None),
+                argv_redacted: r.argv.clone(),
+                ..AuditRecord::new(AuditKind::Run, r.decision)
+            },
+            AuditEvent::Approved {
+                pid,
+                request,
+                grant,
+                uses,
+                ttl_secs,
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                grant_id: Some(grant.clone()),
+                subject: subject(*pid),
+                decision: decision("approved", Some(uses), None, Some(*ttl_secs)),
+                ..AuditRecord::new(AuditKind::Approve, "approved")
+            },
+            AuditEvent::ApproveFailed { pid, reason } => AuditRecord {
+                subject: subject(*pid),
+                decision: decision("failed", Some(reason), None, None),
+                ..AuditRecord::new(AuditKind::Approve, "failed")
+            },
+            AuditEvent::ProofRefused {
+                pid,
+                method,
+                reason,
+            } => AuditRecord {
+                subject: subject(*pid),
+                decision: decision("refused", Some(reason), Some(method), None),
+                ..AuditRecord::new(AuditKind::ProofRefused, "refused")
+            },
+            AuditEvent::Denied {
+                pid,
+                request,
+                root_auto_denied,
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                subject: subject(*pid),
+                decision: decision(
+                    "denied",
+                    root_auto_denied.then_some("root_auto_denied"),
+                    None,
+                    None,
+                ),
+                ..AuditRecord::new(AuditKind::Deny, "denied")
+            },
+            AuditEvent::Revoked { pid, count } => AuditRecord {
+                subject: subject(*pid),
+                decision: decision(
+                    "revoked",
+                    None,
+                    None,
+                    Some(u64::try_from(*count).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::Revoke, "revoked")
+            },
+            AuditEvent::ManifestChanged {
+                pid,
+                grant,
+                dir,
+                approved_sha256,
+                sha256,
+            } => AuditRecord {
+                grant_id: Some(grant.clone()),
+                subject: subject(*pid),
+                project: Some(ProjectSummary {
+                    dir: dir.clone(),
+                    manifest_sha256: *sha256,
+                    approved_sha256: Some(*approved_sha256),
+                }),
+                ..AuditRecord::new(AuditKind::ManifestChanged, "covered")
+            },
         }
+    }
+}
+
+fn decision(
+    outcome: &str,
+    reason: Option<&str>,
+    method: Option<&str>,
+    count: Option<u64>,
+) -> DecisionSummary {
+    DecisionSummary {
+        outcome: outcome.to_owned(),
+        reason: reason.map(str::to_owned),
+        method: method.map(str::to_owned),
+        count,
     }
 }
 
@@ -144,13 +331,277 @@ fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// The log as the daemon holds it: the writer while the vault is unlocked,
+/// the queue, and when the head was last saved in the vault's header.
+#[derive(Debug, Default)]
+pub struct AuditLog {
+    writer: Option<AuditWriter>,
+    queue: VecDeque<AuditRecord>,
+    /// Events the queue had no room for since it was last written.
+    dropped: u64,
+    /// Entries written since the head was last saved.
+    since_anchor: u64,
+    /// Awake time when the 15-minute window started (the first tick after
+    /// a save or an unlock); `None` until then.
+    window_start: Option<Duration>,
+    /// Opening the log failed and was reported; not repeated until the
+    /// next unlock.
+    open_failed: bool,
+}
+
+impl AuditLog {
+    pub fn is_open(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    /// Opens the writer for the unlocked `v` when it is not open, records
+    /// what it found in the log, and writes what the queue holds. Returns
+    /// whether it is open.
+    pub fn open(&mut self, v: &Vault) -> bool {
+        if self.writer.is_some() {
+            return true;
+        }
+        match v.open_audit() {
+            Ok((w, report)) => {
+                self.writer = Some(w);
+                self.open_failed = false;
+                self.window_start = None;
+                for r in findings(&report).into_iter().rev() {
+                    self.queue_front(r);
+                }
+                // What waited while the log was closed is written now; on
+                // a failure it keeps waiting.
+                let _ = self.flush();
+                true
+            }
+            Err(e) => {
+                if !self.open_failed {
+                    eprintln!(
+                        "envcloakd: warning: the audit log could not be opened ({}); requests that \
+                         would release values are denied until it can",
+                        e.kind().token()
+                    );
+                    self.open_failed = true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Closes the writer (the vault locked), wiping its keys. Returns the
+    /// head when entries were written since it was last saved.
+    pub fn close(&mut self) -> Option<AuditHead> {
+        let w = self.writer.take()?;
+        self.open_failed = false;
+        (self.since_anchor > 0).then(|| w.head_record())
+    }
+
+    /// The head, while open.
+    pub fn head(&self) -> Option<AuditHead> {
+        self.writer.as_ref().map(AuditWriter::head_record)
+    }
+
+    /// Entries written since the head was last saved.
+    pub fn unanchored(&self) -> u64 {
+        self.since_anchor
+    }
+
+    /// Events waiting, and events dropped.
+    pub fn backlog(&self) -> (u64, u64) {
+        (
+            u64::try_from(self.queue.len()).unwrap_or(u64::MAX),
+            self.dropped,
+        )
+    }
+
+    fn queue_back(&mut self, r: AuditRecord) {
+        if self.queue.len() >= QUEUE_MAX {
+            self.dropped = self.dropped.saturating_add(1);
+        } else {
+            self.queue.push_back(r);
+        }
+    }
+
+    fn queue_front(&mut self, r: AuditRecord) {
+        if self.queue.len() >= QUEUE_MAX {
+            self.dropped = self.dropped.saturating_add(1);
+        } else {
+            self.queue.push_front(r);
+        }
+    }
+
+    /// Writes the queue, and the count of dropped events.
+    fn flush(&mut self) -> Result<(), AuditError> {
+        let Some(w) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        while let Some(r) = self.queue.front() {
+            w.append(r)?;
+            self.queue.pop_front();
+            self.since_anchor += 1;
+        }
+        if self.dropped > 0 {
+            let r = AuditRecord {
+                decision: decision("dropped", None, None, Some(self.dropped)),
+                ..AuditRecord::new(AuditKind::Dropped, "dropped")
+            };
+            w.append(&r)?;
+            self.dropped = 0;
+            self.since_anchor += 1;
+        }
+        Ok(())
+    }
+
+    /// Records `r`: written now when the log is open (after whatever is
+    /// queued), else queued. Returns whether it was written.
+    pub fn record(&mut self, r: AuditRecord) -> bool {
+        match self.write_now(&r) {
+            Ok(_) => true,
+            Err(_) => {
+                self.queue_back(r);
+                false
+            }
+        }
+    }
+
+    /// Writes `r` now, durably, after whatever is queued. Nothing is
+    /// queued on failure: the caller decides.
+    ///
+    /// # Errors
+    /// The log is not open, or the write failed.
+    pub fn write_now(&mut self, r: &AuditRecord) -> Result<u64, AuditError> {
+        if self.writer.is_none() {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotConnected).into());
+        }
+        self.flush()?;
+        let seq = self
+            .writer
+            .as_mut()
+            .map(|w| w.append(r))
+            .unwrap_or_else(
+                || Err(std::io::Error::from(std::io::ErrorKind::NotConnected).into()),
+            )?;
+        self.since_anchor += 1;
+        Ok(seq)
+    }
+
+    /// The head to save now, if a save is due: [`ANCHOR_EVERY`] entries
+    /// since the last, or [`ANCHOR_INTERVAL`] awake since the window
+    /// started (`awake`, when known, starts it).
+    pub fn anchor_due(&mut self, awake: Option<Duration>) -> Option<AuditHead> {
+        if self.since_anchor == 0 {
+            return None;
+        }
+        let head = self.head()?;
+        if self.since_anchor >= ANCHOR_EVERY {
+            return Some(head);
+        }
+        let now = awake?;
+        match self.window_start {
+            None => {
+                self.window_start = Some(now);
+                None
+            }
+            Some(start) if now.saturating_sub(start) >= ANCHOR_INTERVAL => Some(head),
+            Some(_) => None,
+        }
+    }
+
+    /// The head was saved (or could not be, which was reported): the
+    /// counts start again.
+    pub fn anchored(&mut self) {
+        self.since_anchor = 0;
+        self.window_start = None;
+    }
+}
+
+/// The entries that record what the writer found when it opened the log.
+fn findings(r: &OpenReport) -> Vec<AuditRecord> {
+    let mut out = Vec::new();
+    let log = |outcome: &str, count: Option<u64>| AuditRecord {
+        decision: decision(outcome, None, None, count),
+        ..AuditRecord::new(AuditKind::Log, outcome)
+    };
+    if r.torn_tail_removed {
+        out.push(log("torn_tail_removed", None));
+    }
+    if r.damaged {
+        out.push(log("damaged", None));
+    }
+    if let Some((_, anchor)) = r.behind_anchor {
+        out.push(log("behind_anchor", Some(anchor)));
+    }
+    if r.other_vault_moved {
+        out.push(log("other_vault_log_moved", None));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::hex;
+    use super::*;
 
     #[test]
     fn hashes_are_lower_case_hex() {
         assert_eq!(hex(&[0x00, 0xab, 0x7f, 0xff]), "00ab7fff");
         assert_eq!(hex(&[0u8; 32]).len(), 64);
+    }
+
+    #[test]
+    fn the_queue_is_bounded_and_counts_what_it_drops() {
+        let mut log = AuditLog::default();
+        for _ in 0..QUEUE_MAX + 5 {
+            assert!(!log.record(AuditRecord::new(AuditKind::Lock, "locked")));
+        }
+        assert_eq!(log.backlog(), (QUEUE_MAX as u64, 5));
+        assert!(
+            log.write_now(&AuditRecord::new(AuditKind::Lock, "locked"))
+                .is_err()
+        );
+        assert_eq!(log.close(), None);
+    }
+
+    #[test]
+    fn every_event_has_an_entry_and_lines_carry_no_free_text() {
+        let events = [
+            AuditEvent::RoleDenied {
+                method: "app.reveal",
+                pid: 7,
+                uid: 501,
+            },
+            AuditEvent::ForeignPeer { pid: 8, uid: 502 },
+            AuditEvent::UnlockFailed { pid: 9 },
+            AuditEvent::Unlocked {
+                pid: 9,
+                created: true,
+            },
+            AuditEvent::Locked {
+                reason: LockReason::Idle,
+            },
+            AuditEvent::Request(Box::new(RequestAudit {
+                pid: 10,
+                decision: "covered",
+                request_id: None,
+                grant_id: Some("01K0000000000000000000000Z".into()),
+                reason: None,
+                subject: SubjectSummary::default(),
+                project: None,
+                items: Vec::new(),
+                argv: vec!["a command line argument".into()],
+            })),
+            AuditEvent::Revoked { pid: 11, count: 2 },
+        ];
+        for e in &events {
+            let r = e.record();
+            assert!(!r.decision.outcome.is_empty(), "{e:?}");
+            if let Some(line) = e.line() {
+                assert!(!line.contains("a command line argument"), "{line}");
+            }
+        }
+        assert_eq!(
+            events[5].line().unwrap(),
+            "envcloakd: audit: request decision=covered id=01K0000000000000000000000Z pid=10"
+        );
+        assert_eq!(events[5].record().argv_redacted.len(), 1);
     }
 }

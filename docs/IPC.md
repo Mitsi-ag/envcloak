@@ -82,16 +82,17 @@ Response, one of:
 
 | Method | Params | Result |
 |---|---|---|
-| `status` | none | `daemon` (version, pid, hardening, whether the runtime directory fell back), `vault` (state `absent`, `locked`, `unlocked` or `unavailable`; integrity; read-only; the reason it is unavailable; whether an unlock is in progress; failed unlocks), `lock` (last reason, idle limit, idle time left), `approvals` (grants in force, pending requests, failed proofs since the last success, seconds before the next proof is admitted) |
+| `status` | none | `daemon` (version, pid, hardening, whether the runtime directory fell back), `vault` (state `absent`, `locked`, `unlocked` or `unavailable`; integrity; read-only; the reason it is unavailable; whether an unlock is in progress; failed unlocks), `lock` (last reason, idle limit, idle time left), `approvals` (grants in force, pending requests, failed proofs since the last success, seconds before the next proof is admitted), `audit` (whether the log is open for writing, its last sequence number, entries not yet anchored in the vault's header, events waiting to be written and events dropped) |
 | `vault.create` | `passphrase`, `recovery_kit` (the kit's text as the user wrote it down), `kdf_memory_kib` (optional, 65536 to 4194304) | `locked` (true when a lock arrived while Argon2id ran: the vault was created, then locked), `integrity`, `read_only` |
 | `unlock` | `passphrase`, `claims` (optional: the names of the agent markers in the caller's environment) | `integrity`, `read_only`, `already` (true when it was unlocked already; nothing was checked) |
 | `lock` | none | `was_unlocked` |
-| `run.request` | `manifest` (the absolute path of `envcloak.toml`), `profile` (optional), `refs` (`NAME=<slug>[#field]` strings), `env_file` (optional: `refs`, each `{line, text}` with `text` as `NAME=<slug>[#field]`, and `plain`, each `{line, text}` with `text` the name of an ordinary variable; never a value), `argv` (display text), `claims` | `decision`: `covered` with `grant`, `redact`, `mode` and `manifest_changed`; `pending` with `request`; or `denied` with `reason` (`repeated`, `root_denied`, `pending_per_root`, `pending_total`, `denials_full`) |
+| `run.request` | `manifest` (the absolute path of `envcloak.toml`), `profile` (optional), `refs` (`NAME=<slug>[#field]` strings), `env_file` (optional: `refs`, each `{line, text}` with `text` as `NAME=<slug>[#field]`, and `plain`, each `{line, text}` with `text` the name of an ordinary variable; never a value), `argv` (display text), `claims` | `decision`: `covered` with `grant`, `redact`, `mode` and `manifest_changed`; `pending` with `request`; or `denied` with `reason` (`repeated`, `root_denied`, `pending_per_root`, `pending_total`, `denials_full`, or `audit_failed` when a grant covers the request but its audit entry could not be written) |
 | `pending.get` | `request`, `claims` | the pending request's descriptor (`envcloak_policy::PendingDescriptor`; docs/GRANTS.md "The statement"), for a caller that may give a proof |
 | `approve` | `request`, `options` (`uses`: `once` or `session`; `ttl_secs`; `live`: variable names), `digest` (SHA-256 of the canonical statement, 64 hex characters), `passphrase`, `claims` | `grant`, `expires_in_secs` |
 | `deny` | `request` | `root_auto_denied` |
 | `grants.list` | none | `grants`: each with `id`, `kind`, `label`, `root_pid`, `root_exe`, `project_dir`, `bindings` (`env_name`, `slug`, `live`), `mode`, `uses`, `created_secs`, `remaining_secs` |
 | `grants.revoke` | `grant`, or `all: true` | `revoked` (a count) |
+| `audit.verify` | none | `segments`, `entries`, `last_seq`, `first_problem` (`seq` and `kind`: `altered`, `chain_broken`, `missing`, `reordered`, `segment_damaged`, `unreadable` or `anchor_mismatch`), `problems`, `anchor` (`state`: `none`, `matched`, `mismatch` or `missing`; `seq`), `unanchored_tail` (`first`, `last`), `torn_tail`, `live_head_matches` (the log still ends where the daemon last wrote it), `queued`, `dropped` |
 
 - `vault.create` checks the Argon2id bounds, the passphrase rules and the kit's check symbols before any key derivation. The CLI generates the Recovery Kit and shows it (on the terminal, or the descriptor `--kit-fd` names, never stdout or stderr), so the kit crosses the socket only from the client to the daemon (SPEC §4.4: unlocker material is never sent to a client). Both envelopes use Argon2id with the given memory, 3 passes and 4 lanes.
 - A `vault.create` result means the vault exists under the passphrase and the kit sent, so the kit the CLI showed is valid, whether `locked` is true or not. The CLI calls a kit void only when no vault was created: the daemon refused before creating anything (`vault_exists`, `busy`, `passphrase_rejected`, `kdf_params`, `invalid_params`, `traced`), or the connection failed or the answer was unreadable and a new `status` then shows no vault and nothing in progress. Otherwise it says to keep the kit.
@@ -99,6 +100,7 @@ Response, one of:
 - `unlock` and `approve` are proofs (SPEC §10b): the daemon reads the caller's evidence first and takes a proof only from a terminal subject, refusing a caller with a known agent in its ancestry or agent markers in its claims, a chain cut at the walk's limit, a lost ancestry, or no controlling terminal (`proof_refused`, audited as `proof refused method=<name> reason=<token>`). `pending.get` is refused to the same callers, before the id is looked up. Both count against one attempt limiter: after 5 failures each further attempt waits, 30 seconds doubling to an hour, and an early attempt is refused (`too_many_attempts`) without a passphrase being checked. `status` reports the failures and the wait.
 - `run.request` decides only; the values a covered run receives are T12's. `pending.get`, `deny`, `grants.list` and `grants.revoke` carry metadata only and need no proof (`pending.get` still needs a caller that may give one): denying and revoking only tighten. Ids are Crockford base32 (26 characters for a grant, 8 for a request); a malformed one is `invalid_params`, an unknown or expired one `no_such_request`. docs/GRANTS.md has the rules.
 - `lock` needs no proof: locking only tightens. It drops every grant and pending request.
+- Every decision, proof, refusal, lock and unlock is recorded in the sealed audit log (VAULT.md "Audit log") and as a value-free line on the daemon's standard error. A covered `run.request` is a delivery: its entry is flushed to disk before the answer, and when it cannot be written the answer is `denied` with `audit_failed`. The command line an entry keeps is masked first. `audit.verify` needs an unlocked vault (the log's keys come from the vault key) and carries counts, sequence numbers and fixed tokens only.
 
 ## App-role methods
 
@@ -135,9 +137,10 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `vault_tampered` | -32021 | The vault failed its integrity check; no decision, no proof |
 | `too_many_grants` | -32022 | 256 grants are in force |
 | `invalid_options` | -32023 | `reason` is `ttl_zero`, `ttl_too_long` or `live_not_bound` |
+| `audit_unavailable` | -32024 | The audit log's directory could not be read (`audit.verify`) |
 | `internal` | -32099 | The daemon failed |
 
-The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daemon_unavailable`, `daemon_unverified` and `protocol_error` for the connection, `approval_required request=<id>` and `approval_denied` for a run's decision, and `traced` when a tracer is attached to it. `envcloak run` exits 125 on them (SPEC §6.1); the other commands exit 1, and 2 on a usage error.
+The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daemon_unavailable`, `daemon_unverified` and `protocol_error` for the connection, `approval_required request=<id>` and `approval_denied` for a run's decision, `audit_problem` when `envcloak audit verify` finds the log changed or damaged, and `traced` when a tracer is attached to it. `envcloak run` exits 125 on them (SPEC §6.1); the other commands exit 1, and 2 on a usage error.
 
 ## Lock
 
@@ -161,6 +164,7 @@ The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then remo
 | 22: every `app`-role method rejected and audited | `crates/envcloak-daemon/tests/roles.rs` |
 | 32, frames: over 1 MiB rejected, memory bounded under a flood from many processes, one process held to 8 connections, a stalled frame dropped | `crates/envcloak-daemon/tests/frames.rs`, `crates/envcloak-ipc/tests/frame.rs` |
 | 23 and 27 to 32, the grant methods | docs/GRANTS.md "Gates" |
+| 33: every decision audited; a covered request's entry flushed before the answer, and a failure to write it denies the request and keeps a `once` grant; command lines masked before sealing (the request's values and key patterns); no canary in an entry, the log or the daemon's output; the head saved every 100 entries, every 15 minutes, at lock and at stop; `audit verify` reports the anchor, the tail and a changed entry | `crates/envcloak-daemon/tests/audit.rs`, `crates/envcloak-daemon/src/state.rs` (tests), `crates/envcloak-cli/tests/audit.rs`, `crates/envcloak-core/tests/audit.rs` |
 | 11, for IPC frames: no freed block holds a value or its base64 | `crates/envcloak-ipc/tests/frame_probe.rs` |
 
 The other-uid checks need a second user and `sudo`; CI creates one on Linux (`ENVCLOAK_TEST_OTHER_USER`). The service-manager check runs where `ENVCLOAK_TEST_SERVICE_MANAGER=1`, which CI sets on both systems.

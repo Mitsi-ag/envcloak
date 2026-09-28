@@ -17,6 +17,7 @@
 mod audit;
 mod clock;
 mod lock;
+mod redact;
 mod requests;
 mod server;
 mod state;

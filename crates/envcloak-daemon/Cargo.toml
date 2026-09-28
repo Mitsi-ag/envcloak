@@ -15,8 +15,11 @@ workspace = true
 envcloak-core.workspace = true
 envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
+envcloak-providers.workspace = true
+envcloak-redact.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
+secrecy.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

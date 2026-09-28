@@ -26,6 +26,14 @@
 //! unlock does; other requests see [`Slot::Busy`] meanwhile, and a lock
 //! that arrives wins.
 //!
+//! The audit log ([`crate::audit::AuditLog`]) lives here too: its writer
+//! is opened from the vault when it unlocks and closed, with its keys,
+//! when it locks. The head is saved in the vault's sealed header at lock
+//! (and so at stop, which locks), and every 15 minutes or 100 entries
+//! ([`State::audit_tick`]). A delivery's entry is written durably before
+//! the request is answered, or the request is denied
+//! ([`State::audit_delivery`]).
+//!
 //! Every method here runs with the daemon's state mutex held and returns
 //! quickly; Argon2id runs between a `begin_*` and its `finish_*`, outside
 //! the mutex.
@@ -34,15 +42,19 @@ use std::time::Duration;
 
 use envcloak_core::PassphraseRejected;
 use envcloak_core::crypto::CryptoErrorKind;
-use envcloak_core::vault::{Integrity, LockedVault, Vault, VaultError, VaultErrorKind, VaultPaths};
+use envcloak_core::vault::{
+    AuditHead, Integrity, LockedVault, Vault, VaultError, VaultErrorKind, VaultPaths,
+};
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::{
-    ApprovalsView, CreatedView, DaemonView, Integrity as IntegrityView, LockReason, LockView,
-    StatusView, UnlockedView, VaultState, VaultView,
+    ApprovalsView, AuditStatusView, AuditVerifyView, CreatedView, DaemonView,
+    Integrity as IntegrityView, LockReason, LockView, StatusView, UnlockedView, VaultState,
+    VaultView,
 };
 use envcloak_policy::{AttemptLimiter, GrantStore, Now};
 
+use crate::audit::{AuditEvent, AuditLog};
 use crate::lock::{LockTimer, Reading};
 
 /// The vault as the daemon holds it.
@@ -88,6 +100,10 @@ pub struct State {
     failed_unlocks: u32,
     grants: GrantStore,
     limiter: AttemptLimiter,
+    audit: AuditLog,
+    /// The head of a log closed while a proof had the vault out: saved in
+    /// the header when the vault comes back ([`State::finish_proof`]).
+    unsaved_head: Option<AuditHead>,
 }
 
 impl State {
@@ -102,6 +118,8 @@ impl State {
             failed_unlocks: 0,
             grants: GrantStore::new(),
             limiter: AttemptLimiter::new(),
+            audit: AuditLog::default(),
+            unsaved_head: None,
         }
     }
 
@@ -177,6 +195,10 @@ impl State {
             self.slot = Slot::Unlocked(vault);
             Ok(())
         } else {
+            let mut vault = vault;
+            if let Some(head) = self.unsaved_head.take() {
+                save_head(&mut vault, head);
+            }
             self.slot = Slot::Locked((*vault).lock());
             Err(RpcError::new(ErrorKind::VaultLocked))
         }
@@ -198,8 +220,19 @@ impl State {
         // Whatever the slot holds, a lock ends every grant and pending
         // request (SPEC §5 "Lock").
         self.grants.on_lock();
+        let recorded = matches!(self.slot, Slot::Unlocked(_))
+            || (matches!(self.slot, Slot::Busy) && reason != LockReason::Idle);
+        if recorded {
+            self.audit(AuditEvent::Locked { reason });
+        }
         match std::mem::replace(&mut self.slot, Slot::Absent) {
-            Slot::Unlocked(v) => {
+            Slot::Unlocked(mut v) => {
+                // The log's keys go with the vault's; its head is saved
+                // in the header first.
+                if let Some(head) = self.audit.close() {
+                    save_head(&mut v, head);
+                }
+                self.audit.anchored();
                 // Dropping the Vault wipes the VMK, the subkeys and the
                 // decrypted metadata; the file stays open and locked.
                 self.slot = Slot::Locked((*v).lock());
@@ -210,6 +243,12 @@ impl State {
             Slot::Busy => {
                 self.slot = Slot::Busy;
                 if reason != LockReason::Idle {
+                    // A proof has the vault out: the head is saved when it
+                    // comes back locked.
+                    if let Some(head) = self.audit.close() {
+                        self.unsaved_head = Some(head);
+                    }
+                    self.audit.anchored();
                     self.generation += 1;
                     self.last_reason = Some(reason);
                 }
@@ -257,6 +296,7 @@ impl State {
                 self.start_grants(&v);
                 self.slot = Slot::Unlocked(Box::new(v));
                 self.timer.touch(now);
+                self.audit_open();
                 Ok(view)
             }
             Ok(v) => {
@@ -311,6 +351,7 @@ impl State {
                 self.start_grants(&v);
                 self.slot = Slot::Unlocked(Box::new(v));
                 self.timer.touch(now);
+                self.audit_open();
                 Ok(view)
             }
             Ok(v) => {
@@ -338,8 +379,16 @@ impl State {
             Slot::Unavailable(r) => (VaultState::Unavailable, None, false, Some((*r).to_owned())),
         };
         let unlocked = matches!(self.slot, Slot::Unlocked(_));
+        let (queued, dropped) = self.audit.backlog();
         StatusView {
             daemon,
+            audit: AuditStatusView {
+                open: self.audit.is_open(),
+                head_seq: self.audit.head().map(|h| h.seq),
+                unanchored: self.audit.unanchored(),
+                queued,
+                dropped,
+            },
             vault: VaultView {
                 state,
                 integrity,
@@ -357,6 +406,86 @@ impl State {
         }
     }
 
+    /// Records `e` in the audit log (and its line on standard error):
+    /// written now when the log is open, queued otherwise (see
+    /// [`crate::audit::AuditLog`]).
+    pub fn audit(&mut self, e: AuditEvent) {
+        if let Some(line) = e.line() {
+            eprintln!("{line}");
+        }
+        self.audit_open();
+        self.audit.record(e.record());
+        self.anchor_if_due(None);
+    }
+
+    /// Writes a delivery's entry durably, before anything is released
+    /// (SPEC §6.1 step 5, gate 33). Returns false when it could not be
+    /// written: the request must then be denied, and nothing released.
+    pub fn audit_delivery(&mut self, e: AuditEvent) -> bool {
+        self.audit_open();
+        match self.audit.write_now(&e.record()) {
+            Ok(_) => {
+                if let Some(line) = e.line() {
+                    eprintln!("{line}");
+                }
+                self.anchor_if_due(None);
+                true
+            }
+            Err(err) => {
+                eprintln!(
+                    "envcloakd: audit: a delivery's entry could not be written ({}); the request \
+                     is denied",
+                    err.kind().token()
+                );
+                false
+            }
+        }
+    }
+
+    /// The tick's part: saves the head when 15 minutes passed awake with
+    /// entries not yet anchored.
+    pub fn audit_tick(&mut self, now: Reading) {
+        self.anchor_if_due(Some(now.awake));
+    }
+
+    /// Opens the log's writer when the vault is unlocked and it is not
+    /// open yet (after an unlock, or after the log's directory was
+    /// unusable).
+    fn audit_open(&mut self) {
+        if let Slot::Unlocked(v) = &self.slot {
+            self.audit.open(v);
+        }
+    }
+
+    /// Saves the head in the header when a save is due and the vault is
+    /// here to take it.
+    fn anchor_if_due(&mut self, awake: Option<std::time::Duration>) {
+        let Slot::Unlocked(v) = &mut self.slot else {
+            return;
+        };
+        if let Some(head) = self.audit.anchor_due(awake) {
+            save_head(v, head);
+            self.audit.anchored();
+        }
+    }
+
+    /// `audit.verify`: the log checked against the head saved in the
+    /// header, and whether it still ends where this daemon last wrote it.
+    ///
+    /// # Errors
+    /// As [`State::unlocked`], and [`ErrorKind::AuditUnavailable`] when
+    /// the log's directory cannot be read.
+    pub fn audit_verify(&mut self) -> Result<AuditVerifyView, RpcError> {
+        let report = self
+            .unlocked()?
+            .verify_audit()
+            .map_err(|_| RpcError::new(ErrorKind::AuditUnavailable))?;
+        let mut view = AuditVerifyView::from(&report);
+        view.live_head_matches = self.audit.head().map(|h| (h.seq, h.mac) == report.head);
+        (view.queued, view.dropped) = self.audit.backlog();
+        Ok(view)
+    }
+
     /// The grants, pending requests and limiter parts of `status`.
     pub fn approvals(&self, at: &Now) -> ApprovalsView {
         let (grants, pending) = self.grants.counts(at);
@@ -366,6 +495,18 @@ impl State {
             proof_failures: self.limiter.failures(),
             proof_wait_secs: self.limiter.wait_remaining(at).as_secs(),
         }
+    }
+}
+
+/// Saves the audit head in `v`'s header. A failure (a vault that failed
+/// its integrity check is read-only) is reported, and the entries stay in
+/// the unanchored tail.
+fn save_head(v: &mut Vault, head: AuditHead) {
+    if let Err(e) = v.save_audit_head(head) {
+        eprintln!(
+            "envcloakd: warning: the audit log's head could not be saved in the vault ({})",
+            vault_reason(e.kind())
+        );
     }
 }
 
@@ -850,5 +991,174 @@ mod tests {
             (e.kind, e.reason),
             (ErrorKind::VaultUnavailable, Some("busy"))
         );
+    }
+
+    /// The head saved in the unlocked vault's header.
+    fn saved_head(s: &State) -> Option<u64> {
+        match s.slot() {
+            Slot::Unlocked(v) => v.header().unwrap().audit_head.map(|h| h.seq),
+            other => panic!("expected an unlocked vault, got {other:?}"),
+        }
+    }
+
+    /// The log's entries, as the unlocked vault reads them.
+    fn entries(s: &State) -> Vec<(u64, String, String)> {
+        match s.slot() {
+            Slot::Unlocked(v) => {
+                let (entries, report) = v.read_audit().unwrap();
+                assert!(report.ok(), "{report:?}");
+                entries
+                    .into_iter()
+                    .map(|e| {
+                        (
+                            e.seq,
+                            e.record.kind.token().to_owned(),
+                            e.record.decision.outcome,
+                        )
+                    })
+                    .collect()
+            }
+            other => panic!("expected an unlocked vault, got {other:?}"),
+        }
+    }
+
+    fn revoked() -> AuditEvent {
+        AuditEvent::Revoked { pid: 1, count: 0 }
+    }
+
+    /// SPEC T10 acceptance: the head is saved in the sealed header every
+    /// 100 entries, after 15 minutes awake with entries not yet saved (the
+    /// window starts at the first tick that sees one), and at lock.
+    #[test]
+    fn the_head_is_saved_every_100_entries_every_15_minutes_and_at_lock() {
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        create(&f, &mut s);
+        for _ in 0..99 {
+            s.audit(revoked());
+        }
+        assert_eq!(saved_head(&s), None);
+        s.audit(revoked());
+        assert_eq!(saved_head(&s), Some(100));
+
+        for _ in 0..5 {
+            s.audit(revoked());
+        }
+        s.audit_tick(now(&f.clocks));
+        f.clocks
+            .run(crate::audit::ANCHOR_INTERVAL - Duration::from_secs(1));
+        s.audit_tick(now(&f.clocks));
+        assert_eq!(saved_head(&s), Some(100));
+        f.clocks.run(Duration::from_secs(1));
+        s.audit_tick(now(&f.clocks));
+        assert_eq!(saved_head(&s), Some(105));
+        // Nothing new: later ticks save nothing.
+        f.clocks.run(crate::audit::ANCHOR_INTERVAL * 2);
+        s.audit_tick(now(&f.clocks));
+        assert_eq!(saved_head(&s), Some(105));
+
+        s.audit(revoked());
+        s.audit(revoked());
+        assert!(s.lock(LockReason::Request));
+        unlock(&f, &mut s, PASS).unwrap();
+        // The two entries and the lock's own, 108, were saved at lock.
+        assert_eq!(saved_head(&s), Some(108));
+        let log = entries(&s);
+        assert_eq!(log.len(), 108);
+        assert_eq!(
+            log.last().unwrap(),
+            &(108, "lock".to_owned(), "locked".to_owned())
+        );
+    }
+
+    /// A lock that arrives while a proof has the vault out still writes
+    /// its entry and closes the log at once (its keys go); the head is saved
+    /// when the proof hands the vault back, locked.
+    #[test]
+    fn a_lock_during_a_proof_saves_the_head_when_the_vault_comes_back() {
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        create(&f, &mut s);
+        s.audit(revoked());
+        let (vault, generation) = s.begin_proof().unwrap();
+        assert!(!s.lock(LockReason::Request));
+        assert!(!s.audit.is_open());
+        assert_eq!(
+            s.finish_proof(generation, vault).unwrap_err().kind,
+            ErrorKind::VaultLocked
+        );
+        unlock(&f, &mut s, PASS).unwrap();
+        assert_eq!(saved_head(&s), Some(2));
+        assert_eq!(
+            entries(&s),
+            vec![
+                (1, "revoke".into(), "revoked".into()),
+                (2, "lock".into(), "locked".into()),
+            ]
+        );
+    }
+
+    /// Events while the vault is locked wait in memory and are written at
+    /// the next unlock, after the lock's entry; a delivery that cannot be
+    /// written is refused, and ordinary events wait until the log can be
+    /// written again.
+    #[test]
+    fn events_wait_while_the_log_cannot_be_written() {
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        create(&f, &mut s);
+        s.audit(revoked());
+        s.lock(LockReason::Request);
+        s.audit(AuditEvent::UnlockFailed { pid: 2 });
+        assert_eq!(s.audit.backlog(), (1, 0));
+        unlock(&f, &mut s, PASS).unwrap();
+        assert_eq!(s.audit.backlog(), (0, 0));
+        assert_eq!(
+            entries(&s),
+            vec![
+                (1, "revoke".into(), "revoked".into()),
+                (2, "lock".into(), "locked".into()),
+                (3, "unlock".into(), "failed".into()),
+            ]
+        );
+
+        // The log's directory replaced by a file: a delivery is refused,
+        // and an event waits.
+        let dir = &f.paths.audit_dir;
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::write(dir, b"in the way").unwrap();
+        let delivery = || {
+            AuditEvent::Request(Box::new(crate::audit::RequestAudit {
+                pid: 3,
+                decision: "covered",
+                request_id: None,
+                grant_id: None,
+                reason: None,
+                subject: Default::default(),
+                project: None,
+                items: Vec::new(),
+                argv: Vec::new(),
+            }))
+        };
+        // The segment is gone and no new one can be made.
+        assert!(!s.audit_delivery(delivery()));
+        s.audit(AuditEvent::Revoked { pid: 4, count: 1 });
+        assert_eq!(s.audit.backlog(), (1, 0));
+        std::fs::remove_file(dir).unwrap();
+        assert!(s.audit_delivery(delivery()));
+        assert_eq!(s.audit.backlog(), (0, 0));
+        match s.slot() {
+            Slot::Unlocked(v) => {
+                let (entries, report) = v.read_audit().unwrap();
+                // The removed segment held entries 1 to 3.
+                assert_eq!(report.first_problem.map(|p| p.seq), Some(1), "{report:?}");
+                let got: Vec<(u64, &str)> = entries
+                    .iter()
+                    .map(|e| (e.seq, e.record.decision.outcome.as_str()))
+                    .collect();
+                assert_eq!(got, vec![(4, "revoked"), (5, "covered")]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

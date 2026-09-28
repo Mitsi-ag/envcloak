@@ -25,6 +25,7 @@ pub struct StatusView {
     pub vault: VaultView,
     pub lock: LockView,
     pub approvals: ApprovalsView,
+    pub audit: AuditStatusView,
 }
 
 impl StatusView {
@@ -189,6 +190,23 @@ pub struct ApprovalsView {
     pub proof_wait_secs: u64,
 }
 
+/// The audit log (SPEC §6.1 step 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditStatusView {
+    /// The log is open for writing: the vault is unlocked and the log's
+    /// directory usable. While unlocked and not open, requests that would
+    /// release values are denied.
+    pub open: bool,
+    /// The last entry's sequence number, while open.
+    pub head_seq: Option<u64>,
+    /// Entries written since the head was last saved in the vault's header.
+    pub unanchored: u64,
+    /// Events held in memory until the log can be written.
+    pub queued: u64,
+    /// Events lost because that queue was full.
+    pub dropped: u64,
+}
+
 /// `run.request`: the decision (SPEC §6.1 step 4, §10b).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
@@ -314,4 +332,144 @@ pub struct UnlockedView {
 pub struct LockedView {
     /// It was unlocked until this request.
     pub was_unlocked: bool,
+}
+
+/// `audit.verify`: the check of the audit log (SPEC §15.2 gate 33). Counts,
+/// sequence numbers and fixed tokens only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditVerifyView {
+    /// Segment files read.
+    pub segments: u64,
+    /// Entries read.
+    pub entries: u64,
+    /// The last sequence number the check reached.
+    pub last_seq: u64,
+    /// The first problem, at its sequence number; `None` when the log
+    /// checks out.
+    pub first_problem: Option<AuditProblemView>,
+    /// Problems in all.
+    pub problems: u64,
+    /// The head saved in the vault's header.
+    pub anchor: AnchorView,
+    /// The entries after the anchor (all of them when there is none):
+    /// entries removed from their end would not be noticed.
+    pub unanchored_tail: Option<SeqRange>,
+    /// The log ends in an entry cut short by a crash (never acknowledged).
+    pub torn_tail: bool,
+    /// Whether the log still ends where the daemon last wrote it. `None`
+    /// when the daemon has not written to it since it was unlocked.
+    pub live_head_matches: Option<bool>,
+    /// Events held in memory until the log can be written (while the vault
+    /// was locked, say), and events lost because that queue was full.
+    pub queued: u64,
+    pub dropped: u64,
+}
+
+/// A problem the check found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditProblemView {
+    pub seq: u64,
+    pub kind: AuditProblemKind,
+}
+
+/// What kind of problem (`envcloak_core::audit::ProblemKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditProblemKind {
+    /// The entry does not open: it was changed.
+    Altered,
+    /// The entry is not the one its predecessor chains to.
+    ChainBroken,
+    /// No entry has this number.
+    Missing,
+    /// The entry is out of place.
+    Reordered,
+    /// A segment's header does not authenticate, or its file cannot be
+    /// read.
+    SegmentDamaged,
+    /// Bytes cannot be read as entries.
+    Unreadable,
+    /// The entry at the saved head is not the one the head names.
+    AnchorMismatch,
+}
+
+/// What became of the saved head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorView {
+    pub state: AnchorState,
+    /// The saved head's sequence number.
+    pub seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorState {
+    /// No head saved yet.
+    None,
+    Matched,
+    Mismatch,
+    /// The saved head's entry is not in the log.
+    Missing,
+}
+
+/// Sequence numbers from `first` to `last`, both included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeqRange {
+    pub first: u64,
+    pub last: u64,
+}
+
+impl From<&envcloak_core::audit::VerifyReport> for AuditVerifyView {
+    fn from(r: &envcloak_core::audit::VerifyReport) -> Self {
+        use envcloak_core::audit::{AnchorCheck, ProblemKind};
+        let kind = |k: ProblemKind| match k {
+            ProblemKind::Altered => AuditProblemKind::Altered,
+            ProblemKind::ChainBroken => AuditProblemKind::ChainBroken,
+            ProblemKind::Missing => AuditProblemKind::Missing,
+            ProblemKind::Reordered => AuditProblemKind::Reordered,
+            ProblemKind::SegmentDamaged => AuditProblemKind::SegmentDamaged,
+            ProblemKind::Unreadable => AuditProblemKind::Unreadable,
+            ProblemKind::AnchorMismatch => AuditProblemKind::AnchorMismatch,
+        };
+        let anchor = match r.anchor {
+            AnchorCheck::None => AnchorView {
+                state: AnchorState::None,
+                seq: None,
+            },
+            AnchorCheck::Matched { seq } => AnchorView {
+                state: AnchorState::Matched,
+                seq: Some(seq),
+            },
+            AnchorCheck::Mismatch { seq } => AnchorView {
+                state: AnchorState::Mismatch,
+                seq: Some(seq),
+            },
+            AnchorCheck::Missing { seq } => AnchorView {
+                state: AnchorState::Missing,
+                seq: Some(seq),
+            },
+        };
+        AuditVerifyView {
+            segments: u64::try_from(r.segments).unwrap_or(u64::MAX),
+            entries: r.entries,
+            last_seq: r.last_seq,
+            first_problem: r.first_problem.map(|p| AuditProblemView {
+                seq: p.seq,
+                kind: kind(p.kind),
+            }),
+            problems: r.problems,
+            anchor,
+            unanchored_tail: r
+                .unanchored_tail
+                .map(|(first, last)| SeqRange { first, last }),
+            torn_tail: r.torn_tail,
+            live_head_matches: None,
+            queued: 0,
+            dropped: 0,
+        }
+    }
 }

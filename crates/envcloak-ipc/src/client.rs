@@ -31,13 +31,13 @@ use envcloak_policy::{ApprovalOptions, PendingDescriptor};
 use crate::frame::{Frame, FrameError};
 use crate::paths::{RunPathError, RunPathErrorKind, RunPaths};
 use crate::proto::{
-    self, Approve, ApproveParams, Deny, GrantsList, GrantsRevoke, Lock, Method, NoParams,
-    PendingGet, PendingGetParams, RequestParams, ResponseError, RevokeParams, RpcError, RunRequest,
-    RunRequestParams, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
+    self, Approve, ApproveParams, AuditVerify, Deny, GrantsList, GrantsRevoke, Lock, Method,
+    NoParams, PendingGet, PendingGetParams, RequestParams, ResponseError, RevokeParams, RpcError,
+    RunRequest, RunRequestParams, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
 };
 use crate::view::{
-    ApprovedView, CreatedView, DecisionView, DeniedView, GrantsView, LockedView, RevokedView,
-    StatusView, UnlockedView,
+    ApprovedView, AuditVerifyView, CreatedView, DecisionView, DeniedView, GrantsView, LockedView,
+    RevokedView, StatusView, UnlockedView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -361,6 +361,14 @@ impl Client {
             grant: id.map(str::to_owned),
             all: id.is_none(),
         })
+    }
+
+    /// `audit.verify`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn audit_verify(&mut self) -> Result<AuditVerifyView, ClientError> {
+        self.call::<AuditVerify>(&NoParams {})
     }
 }
 

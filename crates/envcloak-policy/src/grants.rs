@@ -309,6 +309,10 @@ pub enum DenyReason {
     /// 64 requests were denied within their windows: no new request is
     /// opened until the oldest window ends, so none is forgotten early.
     DenialsFull,
+    /// A grant covered the request, but its audit entry could not be
+    /// written, so nothing was released (SPEC §6.1 step 5, gate 33). The
+    /// daemon decides this one, never the grant store.
+    AuditFailed,
 }
 
 impl DenyReason {
@@ -320,6 +324,7 @@ impl DenyReason {
             DenyReason::PendingPerRoot => "pending_per_root",
             DenyReason::PendingTotal => "pending_total",
             DenyReason::DenialsFull => "denials_full",
+            DenyReason::AuditFailed => "audit_failed",
         }
     }
 
@@ -331,6 +336,7 @@ impl DenyReason {
             DenyReason::PendingPerRoot,
             DenyReason::PendingTotal,
             DenyReason::DenialsFull,
+            DenyReason::AuditFailed,
         ]
         .into_iter()
         .find(|r| r.token() == t)
@@ -350,6 +356,10 @@ impl DenyReason {
             DenyReason::DenialsFull => {
                 "64 requests were denied in the last 10 minutes; new requests wait until the \
                  oldest of those denials is 10 minutes old"
+            }
+            DenyReason::AuditFailed => {
+                "a grant covers this request, but its audit entry could not be written, so \
+                 nothing was released; `envcloak status` and the daemon's log say more"
             }
         }
     }

@@ -28,6 +28,10 @@
 //! Argon2id runs on the connection's thread, outside the state lock, and
 //! one run at a time (the proof gate), so parallel unlock attempts cannot
 //! multiply its memory.
+//!
+//! Security events go to the audit log through the state
+//! ([`State::audit`]); the signal thread's lock saves the log's head in
+//! the vault's header before the daemon exits.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -44,18 +48,19 @@ use envcloak_core::crypto::KdfParams;
 use envcloak_core::vault::VaultPaths;
 use envcloak_core::{RecoveryKit, check_passphrase, create_vault_with_kit};
 use envcloak_ipc::proto::{
-    self, Approve, Deny, ErrorKind, GrantsList, GrantsRevoke, IncomingRequest, Lock, Method,
-    PendingGet, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
-    loggable_method, required_role,
+    self, Approve, AuditVerify, Deny, ErrorKind, GrantsList, GrantsRevoke, IncomingRequest, Lock,
+    Method, PendingGet, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate,
+    VaultCreateParams, loggable_method, required_role,
 };
 use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
 };
 use envcloak_ipc::{Frame, FrameError, RpcError, RunPathErrorKind, RunPaths};
 use envcloak_policy::{AgentCatalog, Claims, gather};
+use envcloak_providers::Registry;
 use envcloak_sys::{PeerIdentity, TerminationSignals};
 
-use crate::audit::{Audit, AuditEvent};
+use crate::audit::AuditEvent;
 use crate::clock::{SystemClocks, now_of};
 use crate::lock::Reading;
 use crate::requests;
@@ -154,12 +159,22 @@ pub(crate) struct Shared {
     /// Held while Argon2id runs, so only one runs at a time.
     pub(crate) proof_gate: Mutex<()>,
     pub(crate) clocks: SystemClocks,
-    pub(crate) audit: Audit,
     places: Mutex<Places>,
     runtime_dir_fallback: bool,
     /// The known agents: builtin plus the user's extensions, read once at
     /// start.
     pub(crate) catalog: AgentCatalog,
+    /// The provider registry compiled into this build, whose key patterns
+    /// mask keys in the command lines the audit log keeps.
+    pub(crate) registry: Option<Registry>,
+}
+
+impl Shared {
+    /// Records an event in the audit log. Takes the state lock: callers
+    /// that hold it use [`State::audit`].
+    pub(crate) fn audit(&self, e: AuditEvent) {
+        locked(&self.state).audit(e);
+    }
 }
 
 /// Why a connection was not served.
@@ -252,6 +267,16 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
             catalog.problems().len()
         );
     }
+    let registry = match envcloak_providers::load_embedded() {
+        Ok(r) => Some(r),
+        Err(_) => {
+            eprintln!(
+                "envcloakd: warning: the provider registry did not load; key-shaped words in \
+                 command lines are not masked in the audit log"
+            );
+            None
+        }
+    };
     let state = State::open(vault_paths, cfg.idle_limit, Reading::now(&clocks));
     eprintln!(
         "envcloakd: listening on {} (pid {}, version {})",
@@ -263,10 +288,10 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         state: Mutex::new(state),
         proof_gate: Mutex::new(()),
         clocks,
-        audit: Audit,
         places: Mutex::new(Places::default()),
         runtime_dir_fallback: run.fallback,
         catalog,
+        registry,
     });
 
     {
@@ -369,7 +394,9 @@ fn observe(shared: &Shared) {
 fn tick(shared: &Shared) {
     observe(shared);
     let now = now_of(&shared.clocks);
-    locked(&shared.state).grants().sweep(&now, &requests::alive);
+    let mut s = locked(&shared.state);
+    s.grants().sweep(&now, &requests::alive);
+    s.audit_tick(Reading::now(&shared.clocks));
 }
 
 /// Frees a connection's place when its thread ends, or when the thread
@@ -405,9 +432,10 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
             }
         };
         if peer.uid != own_uid {
-            shared
-                .audit
-                .record(AuditEvent::ForeignPeer { uid: peer.uid });
+            shared.audit(AuditEvent::ForeignPeer {
+                pid: peer.pid,
+                uid: peer.uid,
+            });
             continue;
         }
         let taken = locked(&shared.places).take(peer.pid);
@@ -517,7 +545,7 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
     // The sleep and idle checks run before every request too.
     observe(shared);
     if required_role(req.method) == Role::App {
-        shared.audit.record(AuditEvent::RoleDenied {
+        shared.audit(AuditEvent::RoleDenied {
             method: loggable_method(req.method),
             pid: peer.pid,
             uid: peer.uid,
@@ -534,7 +562,7 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
             Ok(LockedView { was_unlocked })
         }),
         Unlock::NAME => answer::<Unlock>(id, &req, |p| unlock(shared, peer, p)),
-        VaultCreate::NAME => answer::<VaultCreate>(id, &req, |p| create(shared, p)),
+        VaultCreate::NAME => answer::<VaultCreate>(id, &req, |p| create(shared, peer, p)),
         RunRequest::NAME => {
             answer::<RunRequest>(id, &req, |p| requests::run_request(shared, peer, p))
         }
@@ -546,6 +574,9 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         GrantsList::NAME => answer::<GrantsList>(id, &req, |_| requests::grants_list(shared)),
         GrantsRevoke::NAME => {
             answer::<GrantsRevoke>(id, &req, |p| requests::grants_revoke(shared, peer, p))
+        }
+        AuditVerify::NAME => {
+            answer::<AuditVerify>(id, &req, |_| locked(&shared.state).audit_verify())
         }
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
@@ -622,19 +653,25 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
         Ok(_) => {
             s.limiter().succeeded();
             eprintln!("envcloakd: vault unlocked");
+            s.audit(AuditEvent::Unlocked {
+                pid: peer.pid,
+                created: false,
+            });
         }
         Err(e) if e.kind == ErrorKind::WrongPassphrase => {
             s.limiter().failed(&at);
-            shared
-                .audit
-                .record(AuditEvent::UnlockFailed { pid: peer.pid });
+            s.audit(AuditEvent::UnlockFailed { pid: peer.pid });
         }
         Err(_) => {}
     }
     r
 }
 
-fn create(shared: &Shared, p: VaultCreateParams) -> Result<CreatedView, RpcError> {
+fn create(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: VaultCreateParams,
+) -> Result<CreatedView, RpcError> {
     let pass = p.passphrase.into_inner();
     let kit_text = p.recovery_kit.into_inner();
     let mut kdf = KdfParams::current_defaults();
@@ -655,14 +692,21 @@ fn create(shared: &Shared, p: VaultCreateParams) -> Result<CreatedView, RpcError
     let result = create_vault_with_kit(&paths, &pass, &kit, kdf);
     drop((pass, kit));
     let now = Reading::now(&shared.clocks);
-    let r = locked(&shared.state).finish_create(generation, now, result);
+    let mut s = locked(&shared.state);
+    let r = s.finish_create(generation, now, result);
     match &r {
         Ok(v) if v.locked => {
             eprintln!(
                 "envcloakd: vault created, then locked (a lock arrived while it was created)"
             );
         }
-        Ok(_) => eprintln!("envcloakd: vault created and unlocked"),
+        Ok(_) => {
+            eprintln!("envcloakd: vault created and unlocked");
+            s.audit(AuditEvent::Unlocked {
+                pid: peer.pid,
+                created: true,
+            });
+        }
         Err(_) => {}
     }
     r

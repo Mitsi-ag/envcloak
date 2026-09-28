@@ -27,8 +27,8 @@ use envcloak_policy::{
 
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
-    ApprovedView, CreatedView, DecisionView, DeniedView, GrantsView, LockedView, RevokedView,
-    StatusView, UnlockedView,
+    ApprovedView, AuditVerifyView, CreatedView, DecisionView, DeniedView, GrantsView, LockedView,
+    RevokedView, StatusView, UnlockedView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -327,8 +327,20 @@ pub struct RevokeParams {
     pub all: bool,
 }
 
+/// `audit.verify`: checks the audit log against the head saved in the
+/// vault's header (SPEC §15.2 gate 33). Counts and sequence numbers only;
+/// no entry's contents cross.
+#[derive(Debug)]
+pub struct AuditVerify;
+
+impl Method for AuditVerify {
+    const NAME: &'static str = "audit.verify";
+    type Params = NoParams;
+    type Output = AuditVerifyView;
+}
+
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 10] = [
+pub const CLIENT_METHODS: [&str; 11] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -339,6 +351,7 @@ pub const CLIENT_METHODS: [&str; 10] = [
     Deny::NAME,
     GrantsList::NAME,
     GrantsRevoke::NAME,
+    AuditVerify::NAME,
 ];
 
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
@@ -447,12 +460,14 @@ pub enum ErrorKind {
     TooManyGrants,
     /// The approval options are out of bounds; `reason` says how.
     InvalidOptions,
+    /// The audit log could not be read.
+    AuditUnavailable,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 28] = [
+    pub const ALL: [ErrorKind; 29] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -480,6 +495,7 @@ impl ErrorKind {
         ErrorKind::VaultTampered,
         ErrorKind::TooManyGrants,
         ErrorKind::InvalidOptions,
+        ErrorKind::AuditUnavailable,
         ErrorKind::Internal,
     ];
 
@@ -513,6 +529,7 @@ impl ErrorKind {
             ErrorKind::VaultTampered => -32021,
             ErrorKind::TooManyGrants => -32022,
             ErrorKind::InvalidOptions => -32023,
+            ErrorKind::AuditUnavailable => -32024,
             ErrorKind::Internal => -32099,
         }
     }
@@ -547,6 +564,7 @@ impl ErrorKind {
             ErrorKind::VaultTampered => "vault_tampered",
             ErrorKind::TooManyGrants => "too_many_grants",
             ErrorKind::InvalidOptions => "invalid_options",
+            ErrorKind::AuditUnavailable => "audit_unavailable",
             ErrorKind::Internal => "internal",
         }
     }
@@ -600,6 +618,7 @@ impl ErrorKind {
             }
             ErrorKind::TooManyGrants => "too many grants are in force; revoke some first",
             ErrorKind::InvalidOptions => "the approval options are out of bounds",
+            ErrorKind::AuditUnavailable => "the audit log could not be read",
             ErrorKind::Internal => "the daemon failed",
         }
     }
@@ -614,7 +633,7 @@ impl ErrorKind {
 /// was rejected, why the vault could not be opened, why the caller's
 /// ancestry could not be read, what is wrong with a manifest or a binding,
 /// and what is wrong with approval options.
-pub const REASONS: [&str; 52] = [
+pub const REASONS: [&str; 53] = [
     // Passphrase rules (envcloak_core::PassphraseRejected).
     "not_text",
     "control_character",
@@ -674,6 +693,7 @@ pub const REASONS: [&str; 52] = [
     "pending_per_root",
     "pending_total",
     "denials_full",
+    "audit_failed",
 ];
 
 /// An error response. Built from fixed tokens only.

@@ -17,7 +17,13 @@
 //!    manifest's, for the subject's kind), which can refuse agent requests
 //!    or require proxy mode (refused: M1 has none);
 //! 5. asks the grant store ([`GrantStore::decide`]) and, for a `once`
-//!    grant, consumes it under the same lock.
+//!    grant, consumes it under the same lock;
+//! 6. records the decision in the audit log, with the command line masked
+//!    for the request's values and the registry's key patterns
+//!    ([`crate::redact`]). A covered request is a delivery: its entry is
+//!    written and flushed before the answer, which T12's release follows,
+//!    and when it cannot be written the request is denied (`audit_failed`)
+//!    and a `once` grant is left unused (SPEC §6.1 step 5, gate 33).
 //!
 //! `approve` takes the passphrase as the proof. Before Argon2id runs, the
 //! approver must be a terminal subject with no agent by any evidence
@@ -32,8 +38,10 @@
 
 use std::path::Path;
 
+use envcloak_core::SecretBytes;
+use envcloak_core::audit::{ProjectSummary, SubjectSummary};
 use envcloak_core::crypto::CryptoErrorKind;
-use envcloak_core::vault::{Vault, VaultErrorKind};
+use envcloak_core::vault::{ItemId, Slug, Vault, VaultErrorKind};
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{
     ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, RequestParams, RevokeParams,
@@ -44,13 +52,13 @@ use envcloak_ipc::view::{
 };
 use envcloak_policy::{
     AccessRequest, ApprovalProof, ApproveError, BindError, Binding, BoundRef, Claims, Decision,
-    EvidenceError, GrantId, ManifestError, Mode, PendingDescriptor, PendingId, ProcessInstance,
-    ProfileName, ProofKind, RevokeSelector, SubjectEvidence, VaultProjectPolicy, bind_items,
-    effective_policy, gather, load_project, resolve,
+    DenyReason, EvidenceError, GrantId, ManifestError, Mode, PendingDescriptor, PendingId,
+    ProcessInstance, ProfileName, ProofKind, RevokeSelector, SubjectEvidence, SubjectKind, Uses,
+    VaultProjectPolicy, bind_items, effective_policy, gather, load_project, resolve,
 };
 use envcloak_sys::PeerIdentity;
 
-use crate::audit::AuditEvent;
+use crate::audit::{AuditEvent, RequestAudit};
 use crate::clock::now_of;
 use crate::lock::Reading;
 use crate::server::{Shared, locked, refuse_if_traced};
@@ -69,7 +77,7 @@ pub(crate) fn refuse_unless_prover(
     match evidence.proof_refusal() {
         None => Ok(()),
         Some(r) => {
-            shared.audit.record(AuditEvent::ProofRefused {
+            shared.audit(AuditEvent::ProofRefused {
                 pid: peer.pid,
                 method,
                 reason: r.token(),
@@ -169,6 +177,48 @@ fn bind_request(
     Ok((refs, new_project))
 }
 
+/// Who asked, as the audit log records it.
+fn subject_summary(peer: &PeerIdentity, e: &SubjectEvidence) -> SubjectSummary {
+    let root = e.root();
+    SubjectSummary {
+        pid: peer.pid,
+        uid: None,
+        kind: Some(
+            match e.kind() {
+                SubjectKind::Agent => "agent",
+                SubjectKind::Terminal => "terminal",
+                SubjectKind::Unknown => "unknown",
+            }
+            .to_owned(),
+        ),
+        agent: e.label().map(|l| l.name.clone()),
+        root_pid: Some(root.pid),
+        root_exe: root
+            .exe
+            .as_ref()
+            .map(|x| x.path.to_string_lossy().into_owned()),
+    }
+}
+
+/// The request's command line as its audit entry keeps it: masked for
+/// the values it binds and for key patterns. When a value cannot be read
+/// to mask it, nothing of the command line is kept.
+fn masked_argv(shared: &Shared, vault: &Vault, bound: &[BoundRef], argv: &[String]) -> Vec<String> {
+    let mut values: Vec<(String, SecretBytes)> = Vec::with_capacity(bound.len());
+    for b in bound {
+        match vault.read_value(b.binding.field) {
+            Ok(v) => values.push((b.slug.as_str().to_owned(), v)),
+            Err(_) => {
+                return vec![
+                    "[envcloak: command line not kept: a value to mask it with could not be read]"
+                        .to_owned(),
+                ];
+            }
+        }
+    }
+    crate::redact::redact_argv(argv, &values, shared.registry.as_ref())
+}
+
 /// `run.request`. See the module documentation.
 pub fn run_request(
     shared: &Shared,
@@ -220,11 +270,25 @@ pub fn run_request(
         kind,
     );
     if policy.deny {
-        shared.audit.record(AuditEvent::Request {
+        shared.audit(AuditEvent::Request(Box::new(RequestAudit {
             pid: peer.pid,
             decision: "policy_denied",
-            id: String::new(),
-        });
+            request_id: None,
+            grant_id: None,
+            reason: None,
+            subject: subject_summary(peer, &subject),
+            project: Some(ProjectSummary {
+                dir: project
+                    .identity
+                    .canonical_dir
+                    .to_string_lossy()
+                    .into_owned(),
+                manifest_sha256: project.manifest.sha256,
+                approved_sha256: None,
+            }),
+            items: Vec::new(),
+            argv: Vec::new(),
+        })));
         return Err(RpcError::new(ErrorKind::PolicyDenied));
     }
     if policy.mode == Mode::Proxy {
@@ -234,6 +298,30 @@ pub fn run_request(
     let mut s = locked(&shared.state);
     let vault = s.unlocked()?;
     let (bound, new_project) = bind_request(vault, &bindings, &project.identity.vault_key())?;
+    // What every entry for this request records.
+    let project_dir = project
+        .identity
+        .canonical_dir
+        .to_string_lossy()
+        .into_owned();
+    let entry = RequestAudit {
+        pid: peer.pid,
+        decision: "",
+        request_id: None,
+        grant_id: None,
+        reason: None,
+        subject: subject_summary(peer, &subject),
+        project: Some(ProjectSummary {
+            dir: project_dir.clone(),
+            manifest_sha256: project.manifest.sha256,
+            approved_sha256: None,
+        }),
+        items: bound
+            .iter()
+            .map(|b| (b.binding.item, b.slug.clone()))
+            .collect::<Vec<(ItemId, Slug)>>(),
+        argv: masked_argv(shared, vault, &bound, &p.argv),
+    };
     let request = AccessRequest {
         subject,
         project: project.identity,
@@ -253,31 +341,52 @@ pub fn run_request(
         match s.grants().decide(r, &now) {
             Decision::Covered(g) => {
                 // The hash at approval, when the manifest has changed since.
-                let approved = s
-                    .grants()
-                    .grant(g)
-                    .map(|grant| grant.manifest_sha256)
-                    .filter(|h| *h != project.manifest.sha256);
-                let redact = policy.redact;
-                if !s.grants().consume(g) {
+                let Some(approved) = s.grants().grant(g).map(|grant| grant.manifest_sha256) else {
                     request = Some(again);
                     continue;
-                }
+                };
+                let approved = Some(approved).filter(|h| *h != project.manifest.sha256);
+                let redact = policy.redact;
                 let changed = approved.is_some();
+                // A delivery: its entry (which names the manifest's hash at
+                // approval when it changed since) is on disk before the
+                // answer, or the request is denied and the grant left as
+                // it was.
+                let mut covered = RequestAudit {
+                    decision: "covered",
+                    grant_id: Some(g.to_string()),
+                    ..entry.clone()
+                };
+                if let Some(p) = covered.project.as_mut() {
+                    p.approved_sha256 = approved;
+                }
+                let delivered = s.audit_delivery(AuditEvent::Request(Box::new(covered)));
+                if !delivered {
+                    let reason = DenyReason::AuditFailed.token();
+                    s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                        decision: "denied",
+                        grant_id: Some(g.to_string()),
+                        reason: Some(reason),
+                        ..entry
+                    })));
+                    break DecisionView::Denied {
+                        reason: reason.to_owned(),
+                    };
+                }
                 if let Some(approved_sha256) = approved {
-                    shared.audit.record(AuditEvent::ManifestChanged {
+                    s.audit(AuditEvent::ManifestChanged {
                         pid: peer.pid,
                         grant: g.to_string(),
+                        dir: project_dir.clone(),
                         approved_sha256,
                         sha256: project.manifest.sha256,
                     });
                 }
+                // Under the lock since the decision: the grant is there.
+                if !s.grants().consume(g) {
+                    return Err(RpcError::new(ErrorKind::Internal));
+                }
                 s.touch(Reading::now(&shared.clocks));
-                shared.audit.record(AuditEvent::Request {
-                    pid: peer.pid,
-                    decision: "covered",
-                    id: g.to_string(),
-                });
                 break DecisionView::Covered {
                     grant: g.to_string(),
                     redact,
@@ -286,21 +395,21 @@ pub fn run_request(
                 };
             }
             Decision::Pending(id) => {
-                shared.audit.record(AuditEvent::Request {
-                    pid: peer.pid,
+                s.audit(AuditEvent::Request(Box::new(RequestAudit {
                     decision: "pending",
-                    id: id.to_string(),
-                });
+                    request_id: Some(id.to_string()),
+                    ..entry
+                })));
                 break DecisionView::Pending {
                     request: id.to_string(),
                 };
             }
             Decision::Denied(reason) => {
-                shared.audit.record(AuditEvent::Request {
-                    pid: peer.pid,
+                s.audit(AuditEvent::Request(Box::new(RequestAudit {
                     decision: "denied",
-                    id: reason.token().to_owned(),
-                });
+                    reason: Some(reason.token()),
+                    ..entry
+                })));
                 break DecisionView::Denied {
                     reason: reason.token().to_owned(),
                 };
@@ -387,15 +496,21 @@ pub fn approve(
                 kind: ProofKind::Passphrase,
             };
             let ttl = p.options.ttl_secs;
+            let uses = match p.options.uses {
+                Uses::Once => "once",
+                Uses::Session => "session",
+            };
             let grant = s
                 .grants()
                 .approve(&id, proof, p.options, digest, &now)
                 .map_err(approve_error)?;
             s.touch(Reading::now(&shared.clocks));
-            shared.audit.record(AuditEvent::Approved {
+            s.audit(AuditEvent::Approved {
                 pid: peer.pid,
                 request: id.to_string(),
                 grant: grant.to_string(),
+                uses,
+                ttl_secs: ttl,
             });
             Ok(ApprovedView {
                 grant: grant.to_string(),
@@ -404,7 +519,7 @@ pub fn approve(
         }
         Err(e) if e.kind() == VaultErrorKind::Crypto(CryptoErrorKind::Unlock) => {
             s.limiter().failed(&now);
-            shared.audit.record(AuditEvent::ApproveFailed {
+            s.audit(AuditEvent::ApproveFailed {
                 pid: peer.pid,
                 reason: "wrong_passphrase",
             });
@@ -433,7 +548,7 @@ pub fn deny(
         .grants()
         .deny(&id, &now)
         .map_err(|_| RpcError::new(ErrorKind::NoSuchRequest))?;
-    shared.audit.record(AuditEvent::Denied {
+    shared.audit(AuditEvent::Denied {
         pid: peer.pid,
         request: id.to_string(),
         root_auto_denied: outcome.root_auto_denied,
@@ -506,7 +621,7 @@ pub fn grants_revoke(
         _ => return Err(RpcError::new(ErrorKind::InvalidParams)),
     };
     let revoked = locked(&shared.state).grants().revoke(selector);
-    shared.audit.record(AuditEvent::Revoked {
+    shared.audit(AuditEvent::Revoked {
         pid: peer.pid,
         count: revoked,
     });

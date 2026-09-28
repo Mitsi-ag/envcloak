@@ -19,3 +19,4 @@ crates/envcloak-policy/src/envfile.rs        # parses an --env-file in place; co
 crates/envcloak-providers/src/detect.rs      # matches a value against the registry's key patterns in place; returns provider ids and a classification, never the value
 crates/envcloak-ipc/src/frame.rs             # frame bodies: parsed in place and written to a verified peer
 crates/envcloak-ipc/src/wire_secret.rs       # base64-encodes a value into a request or response
+crates/envcloak-daemon/src/redact.rs          # hands a request's values to the redactor that masks the command line its audit entry keeps
