@@ -9,7 +9,10 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use common::{client, closed, error_kind, raw, read_json, rss_kib, run_paths, send_json, start};
+use common::{
+    client, closed, error_kind, raw, read_json, rss_kib, run_paths, send_json, start,
+    status_when_free,
+};
 use envcloak_ipc::MAX_FRAME;
 use envcloak_ipc::view::VaultState;
 use envcloak_testkit::TestHome;
@@ -87,6 +90,8 @@ fn memory_stays_bounded_under_a_flood() {
         let mut s = connect();
         let _ = s.write_all(&header(MAX_FRAME + 1));
     }
+    // Served again once the flood has drained.
+    status_when_free(&home);
 
     let half = vec![b'x'; MAX_FRAME / 2];
     let mut held = Vec::new();
@@ -103,11 +108,12 @@ fn memory_stays_bounded_under_a_flood() {
     std::thread::sleep(Duration::from_millis(500));
     let during = rss_kib(d.pid());
     eprintln!("resident memory: {before} KiB before, {during} KiB during the flood");
-    // 32 served connections at up to 1.5 MiB each (a body buffer grown to
-    // 1 MiB while the half it replaced is wiped), plus allocator slack.
-    // Without the cap, 96 connections would take about three times that.
+    // 32 served connections at up to about 2 MiB each (a body buffer grown
+    // to 1 MiB while the half it replaced is wiped, a thread's stack and
+    // its allocator arena), plus slack. Without the cap, 96 connections
+    // would take about three times that.
     assert!(
-        during < before + 80 * 1024,
+        during < before + 96 * 1024,
         "resident memory grew from {before} KiB to {during} KiB"
     );
     let refused = held.iter_mut().map(closed).filter(|c| *c).count();
@@ -117,11 +123,7 @@ fn memory_stays_bounded_under_a_flood() {
     );
 
     drop(held);
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(
-        client(&home).status().unwrap().vault.state,
-        VaultState::Absent
-    );
+    assert_eq!(status_when_free(&home).vault.state, VaultState::Absent);
     let log = d.log();
     assert!(log.contains("connection limit reached"), "{log}");
 }

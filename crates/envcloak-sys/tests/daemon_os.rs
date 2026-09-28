@@ -59,10 +59,9 @@ fn the_clock_pair_advances_together_while_awake() {
     assert!(awake >= Duration::from_millis(150), "{awake:?}");
     assert!(total >= Duration::from_millis(150), "{total:?}");
     // Nothing slept here, so neither clock ran ahead by more than noise.
+    // Only deltas compare: the two clocks need not share an origin.
     let gap = total.abs_diff(awake);
     assert!(gap < Duration::from_millis(100), "{awake:?} {total:?}");
-    // Time including sleep never trails time awake since boot.
-    assert!(time_including_sleep().unwrap() + Duration::from_millis(10) >= awake_time().unwrap());
 }
 
 #[test]

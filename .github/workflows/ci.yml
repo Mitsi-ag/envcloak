@@ -89,7 +89,7 @@ jobs:
         run: scripts/check-expose-lint.sh
       - name: unsafe_code forbid canary
         run: scripts/check-unsafe-lint.sh
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --no-fail-fast
 
   deny:
     runs-on: ubuntu-latest

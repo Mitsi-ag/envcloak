@@ -84,10 +84,30 @@ pub fn error_kind(v: &serde_json::Value) -> String {
         .to_owned()
 }
 
-/// Whether the peer closed the connection: a read returns end of stream.
+/// Whether the peer closed the connection: a read returns end of stream,
+/// or, when the peer closed with unread bytes from us (Linux), a reset.
 pub fn closed(s: &mut UnixStream) -> bool {
     let mut b = [0u8; 1];
-    matches!(s.read(&mut b), Ok(0))
+    match s.read(&mut b) {
+        Ok(0) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::ConnectionReset,
+        Ok(_) => false,
+    }
+}
+
+/// `status` from the daemon, retried while it is at its connection limit
+/// (it closes connections past the limit at once).
+pub fn status_when_free(home: &TestHome) -> envcloak_ipc::view::StatusView {
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match Client::connect(&run_paths(home)).and_then(|mut c| c.status()) {
+            Ok(s) => return s,
+            Err(_) if std::time::Instant::now() < end => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("the daemon did not answer: {e:?}"),
+        }
+    }
 }
 
 /// Resident memory of `pid` in KiB, from `ps`.
