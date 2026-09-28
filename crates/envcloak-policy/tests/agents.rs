@@ -13,7 +13,7 @@ use envcloak_policy::{
     AGENTS_DIR, AgentCatalog, CatalogErrorKind, CatalogSource, Claims, ClaimsError,
     MAX_EXTENSION_FILES, MatchBasis,
 };
-use envcloak_sys::{CodeSignature, ExeIdentity, ProcInfo, StartTime};
+use envcloak_sys::{Argv, CodeSignature, ExeIdentity, ProcInfo, StartTime};
 
 fn proc_with(exe: Option<&str>, comm: &str, argv: Option<&[&str]>) -> ProcInfo {
     ProcInfo {
@@ -29,7 +29,7 @@ fn proc_with(exe: Option<&str>, comm: &str, argv: Option<&[&str]>) -> ProcInfo {
             file: None,
             signature: None,
         }),
-        argv: argv.map(|a| a.iter().map(OsString::from).collect()),
+        argv: argv.map(Argv::new),
     }
 }
 

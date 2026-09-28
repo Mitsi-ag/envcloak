@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
-use super::{CDHASH_LEN, CodeSignature, ExeIdentity, ProcInfo, parse_procargs2};
+use super::{Argv, CDHASH_LEN, CodeSignature, ExeIdentity, ProcInfo, parse_procargs2};
 use crate::StartTime;
 
 /// `struct extern_proc` from `<sys/proc.h>`, LP64. Only a few fields are
@@ -323,9 +323,10 @@ fn argmax() -> io::Result<usize> {
         .ok_or_else(|| io::Error::other("an unusable kern.argmax"))
 }
 
-pub(super) fn proc_argv(pid: i32) -> io::Result<Vec<OsString>> {
-    // The kernel copies the end of the argument area, environment
-    // included, so the buffer must hold all of it. It is wiped on drop.
+pub(super) fn proc_argv(pid: i32) -> io::Result<Argv> {
+    // The kernel copies the whole string area, environment included, so
+    // the buffer must hold all of it. It is wiped on drop; the arguments
+    // parsed from it are copied into an `Argv`, which is too.
     let mut buf = Zeroizing::new(vec![0u8; argmax()?]);
     let mut len = buf.len();
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];

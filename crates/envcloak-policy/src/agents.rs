@@ -40,7 +40,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-use envcloak_sys::ProcInfo;
+use envcloak_sys::{Argv, ProcInfo};
 use toml_edit::{Document, Item, TableLike, Value};
 
 use crate::agents_builtin::AGENTS_TOML;
@@ -68,9 +68,11 @@ const MAX_PATTERN: usize = 256;
 /// Bytes in an agent's display name.
 const MAX_NAME: usize = 64;
 /// How many arguments of an interpreter are looked at for its script:
-/// the first few that are not options, among the first few in all.
+/// the first few that are not options, among the first few in all, which
+/// are all the kernel's view keeps after `argv[0]`
+/// ([`envcloak_sys::MAX_ARGV`]).
 const SCRIPT_ARGS: usize = 3;
-const SCRIPT_ARGS_SCANNED: usize = 16;
+const SCRIPT_ARGS_SCANNED: usize = envcloak_sys::MAX_ARGV - 1;
 
 /// Where a catalog entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -477,14 +479,14 @@ impl AgentCatalog {
     /// Whether `p` looks like an interpreter by its executable or command
     /// name, or by `argv[0]` when `argv` is given. Extension interpreters
     /// count only when `extensions` is set.
-    fn interpreter(&self, p: &ProcInfo, extensions: bool, argv: Option<&[OsString]>) -> bool {
+    fn interpreter(&self, p: &ProcInfo, extensions: bool, argv: Option<&Argv>) -> bool {
         let names = [
             p.exe
                 .as_ref()
                 .and_then(|e| e.path.file_name())
                 .map(OsStr::as_bytes),
             Some(p.comm.as_bytes()),
-            argv.and_then(|a| a.first())
+            argv.and_then(Argv::first)
                 .map(|a| last_component(a.as_bytes())),
         ];
         self.interpreters
@@ -535,7 +537,7 @@ impl AgentCatalog {
         for source in [CatalogSource::Builtin, CatalogSource::Extension] {
             let extensions = source == CatalogSource::Extension;
             let argv = if self.reads_argv(p, extensions) {
-                p.argv.as_deref()
+                p.argv.as_ref()
             } else {
                 None
             };
@@ -547,7 +549,7 @@ impl AgentCatalog {
             };
             let said: Vec<&[u8]> = [
                 Some(p.comm.as_bytes()),
-                argv.and_then(|a| a.first()).map(|a| a.as_bytes()),
+                argv.and_then(Argv::first).map(OsStr::as_bytes),
             ]
             .into_iter()
             .flatten()
@@ -644,15 +646,16 @@ fn last_component(path: &[u8]) -> &[u8] {
 
 /// The arguments of an interpreter that may name its script: the first
 /// [`SCRIPT_ARGS`] that are not options, among the first
-/// [`SCRIPT_ARGS_SCANNED`] after `argv[0]`.
-fn script_args(argv: Option<&[OsString]>) -> Vec<&[u8]> {
+/// [`SCRIPT_ARGS_SCANNED`] after `argv[0]`. Borrowed from the wiped
+/// [`Argv`], never copied.
+fn script_args(argv: Option<&Argv>) -> Vec<&[u8]> {
     let Some(argv) = argv else {
         return Vec::new();
     };
     argv.iter()
         .skip(1)
         .take(SCRIPT_ARGS_SCANNED)
-        .map(|a| a.as_bytes())
+        .map(OsStr::as_bytes)
         .filter(|a| !a.is_empty() && !a.starts_with(b"-"))
         .take(SCRIPT_ARGS)
         .collect()

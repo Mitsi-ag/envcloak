@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixListener;
@@ -15,11 +15,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use envcloak_sys::{
-    AncestryError, MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, PeerIdentity, PeerSource, ProcInfo,
-    ProcessTable, StartTime, ancestry, ancestry_in, effective_uid, parse_cmdline, parse_proc_stat,
-    parse_procargs2, peer_identity, proc_argv, proc_info, process_start_time, reaches_top,
+    AncestryError, Argv, MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, PeerIdentity, PeerSource,
+    ProcInfo, ProcessTable, StartTime, ancestry, ancestry_in, effective_uid, parse_cmdline,
+    parse_proc_stat, parse_procargs2, peer_identity, proc_argv, proc_info, process_start_time,
+    reaches_top,
 };
 use proptest::prelude::*;
+
+fn strs(a: &Argv) -> Vec<&OsStr> {
+    a.iter().collect()
+}
 
 fn own_pid() -> i32 {
     i32::try_from(std::process::id()).unwrap()
@@ -248,7 +253,8 @@ fn sessions_and_terminals() {
 #[test]
 fn arguments_are_read_and_the_environment_is_not() {
     let child = Py::start("plain", None, &["--flag", "a b", ""]);
-    let argv = proc_argv(child.pid).unwrap();
+    let got = proc_argv(child.pid).unwrap();
+    let argv = strs(&got);
     let tail: Vec<&str> = argv[argv.len() - 5..]
         .iter()
         .map(|a| a.to_str().unwrap())
@@ -267,7 +273,7 @@ fn arguments_are_read_and_the_environment_is_not() {
     for a in &argv {
         assert!(
             !a.to_str().unwrap().contains("never-an-argument"),
-            "{argv:?}"
+            "{got:?}"
         );
     }
 }
@@ -295,7 +301,7 @@ fn with_argv(argv: &[&str], canary: &str) -> Child {
 /// memory (a vfork parent is woken before the child's new memory is
 /// installed) or before exec has set the new argument area, and `/proc`
 /// then shows the parent's arguments, or none.
-fn argv_once_exec_is_done(child: &Child) -> Vec<OsString> {
+fn argv_once_exec_is_done(child: &Child) -> Argv {
     let pid = i32::try_from(child.id()).unwrap();
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -308,7 +314,7 @@ fn argv_once_exec_is_done(child: &Child) -> Vec<OsString> {
         let argv = if runs_xargs {
             proc_argv(pid).unwrap_or_default()
         } else {
-            Vec::new()
+            Argv::default()
         };
         if !argv.is_empty() {
             return argv;
@@ -343,7 +349,7 @@ fn empty_arguments_are_read_as_empty_and_the_environment_is_not() {
         let got = argv_once_exec_is_done(&child);
         let _ = child.kill();
         let _ = child.wait();
-        assert_eq!(got, argv, "{argv:?}");
+        assert_eq!(strs(&got), argv, "{argv:?}");
         assert!(
             !got.iter().any(|a| a.to_string_lossy().contains(&canary)),
             "{argv:?}"
@@ -457,12 +463,12 @@ impl ProcessTable for Scripted {
         }
     }
 
-    fn argv(&mut self, pid: i32) -> io::Result<Vec<OsString>> {
+    fn argv(&mut self, pid: i32) -> io::Result<Argv> {
         self.argv_reads.push(pid);
         if pid == 30 {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        Ok(vec![OsString::from(format!("prog{pid}"))])
+        Ok(Argv::new([format!("prog{pid}")]))
     }
 }
 
@@ -494,10 +500,7 @@ fn a_steady_chain_is_walked_once_and_read_again() {
     // Each process read twice: the walk and the re-validation.
     assert!(t.reads.values().all(|n| *n == 2), "{:?}", t.reads);
     assert_eq!(t.argv_reads, [40, 30, 1]);
-    assert_eq!(
-        chain[0].argv.as_deref(),
-        Some(&[OsString::from("prog40")][..])
-    );
+    assert_eq!(chain[0].argv, Some(Argv::new(["prog40"])));
     assert_eq!(chain[1].argv, None, "a refused read leaves None");
     assert_eq!(chain[2].argv, None, "not asked for");
 }
@@ -679,7 +682,7 @@ fn an_orphan_walks_straight_to_the_top() {
 #[test]
 fn debug_output_names_no_argument() {
     let mut p = info(40, 30, 400);
-    p.argv = Some(vec![OsString::from("--token=hunter2-not-a-secret")]);
+    p.argv = Some(Argv::new(["--token=hunter2-not-a-secret"]));
     let shown = format!("{p:?}");
     assert!(!shown.contains("hunter2"), "{shown}");
     assert!(shown.contains("argc: Some(1)"), "{shown}");
@@ -734,7 +737,7 @@ proptest! {
         use std::os::unix::ffi::OsStringExt;
         let b = procargs(args.len(), &path, &args, &env);
         let want: Vec<OsString> = args.iter().map(|a| OsString::from_vec(a.clone())).collect();
-        prop_assert_eq!(parse_procargs2(&b).unwrap(), want);
+        prop_assert_eq!(parse_procargs2(&b).unwrap(), Argv::new(want));
     }
 
     /// Leading empty arguments right after the padding are arguments, and
@@ -751,7 +754,7 @@ proptest! {
         args.extend(rest);
         let b = procargs(args.len(), &path, &args, &env);
         let want: Vec<OsString> = args.iter().map(|a| OsString::from_vec(a.clone())).collect();
-        prop_assert_eq!(parse_procargs2(&b).unwrap(), want);
+        prop_assert_eq!(parse_procargs2(&b).unwrap(), Argv::new(want));
     }
 
     /// A buffer cut before its last argument's NUL is refused: it never

@@ -69,9 +69,12 @@
 //! The Linux CLI makes itself non-dumpable, so its own `exe` is hidden
 //! from the daemon; its `stat` and `cmdline` are not, and the walk starts
 //! there. Arguments are read only for processes whose executable is hidden
-//! or that run an interpreter, and are dropped after classification: the
-//! evidence keeps pids, start times, executables and labels, never
-//! arguments.
+//! or that run an interpreter, into wiped storage ([`envcloak_sys::Argv`]),
+//! which the catalog borrows to compare and which is dropped after
+//! classification: the evidence keeps pids, start times, executables and
+//! labels, never arguments. On macOS they can include environment strings
+//! of a process that rewrote its argument area (review finding F-38; see
+//! `envcloak_sys`'s `proc` module).
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;

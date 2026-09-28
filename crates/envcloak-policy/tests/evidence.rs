@@ -17,8 +17,8 @@ use envcloak_policy::{
     GATHER_ATTEMPTS, MatchBasis, ProcessInstance, SubjectEvidence, SubjectKind, gather_in,
 };
 use envcloak_sys::{
-    CodeSignature, ExeIdentity, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo, ProcessTable,
-    StartTime,
+    Argv, CodeSignature, ExeIdentity, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo,
+    ProcessTable, StartTime,
 };
 
 fn inst(pid: i32, start: u64) -> ProcessInstance {
@@ -474,10 +474,10 @@ impl ProcessTable for Table {
         Ok(a)
     }
 
-    fn argv(&mut self, pid: i32) -> io::Result<Vec<OsString>> {
+    fn argv(&mut self, pid: i32) -> io::Result<Argv> {
         self.argv_reads.push(pid);
         let a = self.argv.get(&pid).ok_or(io::ErrorKind::PermissionDenied)?;
-        Ok(a.iter().map(OsString::from).collect())
+        Ok(Argv::new(a))
     }
 }
 

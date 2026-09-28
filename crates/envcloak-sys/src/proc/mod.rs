@@ -35,20 +35,46 @@
 //!   [`AncestryError::Hidden`] (Linux `/proc` mounted with `hidepid`):
 //!   walking again would not help.
 //!
-//! Arguments can hold other programs' secrets (`--token=...`), and on macOS
-//! `KERN_PROCARGS2` returns the environment after them. So arguments are
+//! Arguments can hold other programs' secrets (`--token=...`), so they are
 //! read only for the processes the caller names, at most [`MAX_ARGV`] of
-//! them and [`MAX_ARGV_BYTES`] in all; the rest of the buffer, the
-//! environment included, is never parsed and is wiped. Where the arguments
-//! start comes from the layout `exec` gives the buffer, not from its
-//! contents: an empty argument is a lone NUL, as padding is (see
-//! [`parse_procargs2`]). [`ProcInfo`]'s `Debug` prints how many arguments
-//! were read, never what they are.
+//! them and [`MAX_ARGV_BYTES`] in all, and they are held in an [`Argv`]:
+//! storage wiped on drop, which lends them for comparison and is never
+//! copied out as owned strings. [`ProcInfo`]'s and [`Argv`]'s `Debug` print
+//! how many arguments were read, never what they are, and every error is
+//! fixed text.
+//!
+//! Neither kernel keeps a boundary between a process's arguments and its
+//! environment that the process cannot move, and each lays the environment
+//! right after the arguments:
+//!
+//! - macOS `KERN_PROCARGS2` returns the executable's path, the arguments
+//!   and the environment as they are now in the process's memory, with the
+//!   argument count `exec` saved. The arguments start where `exec` put
+//!   them, not at the first byte that is not a NUL (an empty argument is a
+//!   lone NUL, as padding is; see [`parse_procargs2`]), and the count ends
+//!   them. A process that rewrote its argument area and removed the NULs
+//!   between its arguments (node's `process.title` does, over a short
+//!   command line) makes that count run on into its environment: those
+//!   strings are then read as arguments (review finding F-38). They stay
+//!   in the wiped storage, and the rest of the buffer is wiped unparsed.
+//! - Linux `/proc/<pid>/cmdline` runs on into the environment, up to its
+//!   first NUL, when the process overwrote the NUL that ends its argument
+//!   area (the kernel takes that for `setproctitle`). So no more than the
+//!   area's length is read, from the kernel's own record of where it
+//!   starts and ends (`stat` fields 48 and 49, which only a privileged
+//!   `prctl(PR_SET_MM)` moves). The kernel shows that record only to a
+//!   reader that may trace the process: for a non-dumpable one (the
+//!   EnvCloak CLI) or another user's, the cap alone bounds the read.
+//!
+//! [`MAX_ARGV`] keeps only what the agent catalog looks at, so a rewritten
+//! argument area hands over as few environment strings as it can.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+
+use zeroize::Zeroizing;
 
 use crate::peer::{PeerIdentity, StartTime};
 
@@ -63,8 +89,12 @@ mod macos;
 /// from a cut chain must fail closed (`envcloak-policy` handles it as if an
 /// agent may be there).
 pub const MAX_ANCESTRY: usize = 64;
-/// Arguments kept per process, `argv[0]` included.
-pub const MAX_ARGV: usize = 64;
+/// Arguments kept per process: `argv[0]` and the 16 after it, all that
+/// the agent catalog looks at (docs/AGENTS.md: an interpreter's script is
+/// among the first 16 arguments after `argv[0]`). Each one more could be an
+/// environment string of a process that rewrote its argument area (see
+/// the module documentation).
+pub const MAX_ARGV: usize = 17;
 /// Bytes of arguments kept per process, NULs excluded. An argument that
 /// would go past it is dropped, with every one after it.
 pub const MAX_ARGV_BYTES: usize = 16 * 1024;
@@ -128,7 +158,7 @@ pub struct ProcInfo {
     pub exe: Option<ExeIdentity>,
     /// Filled in by [`ancestry`] for the processes its caller names; `None`
     /// otherwise, and when the kernel refused.
-    pub argv: Option<Vec<OsString>>,
+    pub argv: Option<Argv>,
 }
 
 impl core::fmt::Debug for ProcInfo {
@@ -142,8 +172,89 @@ impl core::fmt::Debug for ProcInfo {
             .field("controlling_tty", &self.controlling_tty)
             .field("comm", &self.comm)
             .field("exe", &self.exe)
-            .field("argc", &self.argv.as_ref().map(Vec::len))
+            .field("argc", &self.argv.as_ref().map(Argv::len))
             .finish()
+    }
+}
+
+/// A process's arguments, `argv[0]` first, as [`proc_argv`] read them: at
+/// most [`MAX_ARGV`] of them and [`MAX_ARGV_BYTES`] in all.
+///
+/// They can hold other programs' secrets, and a process that rewrote its
+/// argument area can have its environment read among them (see the module
+/// documentation). So their bytes live in one buffer allocated at its final
+/// size and wiped when it is dropped; [`Argv::get`] and [`Argv::iter`] lend
+/// them for comparison, nothing copies them out as owned strings, and
+/// `Debug` prints only how many there are.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Argv {
+    /// The arguments' bytes, one after another.
+    bytes: Zeroizing<Vec<u8>>,
+    /// Where each argument ends in `bytes`.
+    ends: Vec<usize>,
+}
+
+impl Argv {
+    /// Arguments copied from `args` (tests, and tables a test controls).
+    pub fn new<I, S>(args: I) -> Argv
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args: Vec<S> = args.into_iter().collect();
+        let slices: Vec<&[u8]> = args.iter().map(|a| a.as_ref().as_bytes()).collect();
+        Argv::from_slices(&slices)
+    }
+
+    /// Copies `args` into a buffer allocated once, at its final size:
+    /// growing it would leave copies in freed memory.
+    fn from_slices(args: &[&[u8]]) -> Argv {
+        let total = args.iter().map(|a| a.len()).sum();
+        let mut bytes = Zeroizing::new(Vec::with_capacity(total));
+        let mut ends = Vec::with_capacity(args.len());
+        for a in args {
+            bytes.extend_from_slice(a);
+            ends.push(bytes.len());
+        }
+        Argv { bytes, ends }
+    }
+
+    /// How many arguments there are.
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// Argument `i`.
+    pub fn get(&self, i: usize) -> Option<&OsStr> {
+        (i < self.len()).then(|| self.arg(i))
+    }
+
+    /// `argv[0]`.
+    pub fn first(&self) -> Option<&OsStr> {
+        self.get(0)
+    }
+
+    /// The arguments in order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &OsStr> + '_ {
+        (0..self.len()).map(|i| self.arg(i))
+    }
+
+    /// Argument `i`, which must exist.
+    fn arg(&self, i: usize) -> &OsStr {
+        let start = i.checked_sub(1).map_or(0, |j| self.ends[j]);
+        OsStr::from_bytes(&self.bytes[start..self.ends[i]])
+    }
+}
+
+impl core::fmt::Debug for Argv {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Argv")
+            .field("argc", &self.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -200,7 +311,7 @@ pub trait ProcessTable {
     /// when there is none.
     fn info(&mut self, pid: i32) -> io::Result<ProcInfo>;
     /// The arguments of process `pid`, capped as [`proc_argv`] caps them.
-    fn argv(&mut self, pid: i32) -> io::Result<Vec<OsString>>;
+    fn argv(&mut self, pid: i32) -> io::Result<Argv>;
 }
 
 /// The kernel's process table: [`proc_info`] and [`proc_argv`].
@@ -212,7 +323,7 @@ impl ProcessTable for LiveProcesses {
         proc_info(pid)
     }
 
-    fn argv(&mut self, pid: i32) -> io::Result<Vec<OsString>> {
+    fn argv(&mut self, pid: i32) -> io::Result<Argv> {
         proc_argv(pid)
     }
 }
@@ -241,13 +352,14 @@ pub fn proc_info(pid: i32) -> io::Result<ProcInfo> {
 }
 
 /// The arguments of process `pid`, `argv[0]` first: at most [`MAX_ARGV`]
-/// of them and [`MAX_ARGV_BYTES`] in all. See the module documentation for
-/// what is read and wiped.
+/// of them and [`MAX_ARGV_BYTES`] in all, in wiped storage. See the module
+/// documentation for what is read, and when environment strings can be
+/// among them.
 ///
 /// # Errors
 /// When the kernel refuses (another user's process on macOS, a process
-/// that exited) or the arguments are malformed.
-pub fn proc_argv(pid: i32) -> io::Result<Vec<OsString>> {
+/// that exited) or the arguments are malformed. The errors are fixed text.
+pub fn proc_argv(pid: i32) -> io::Result<Argv> {
     if pid <= 0 {
         return Err(io::ErrorKind::NotFound.into());
     }
@@ -400,13 +512,31 @@ pub struct StatFields {
     pub tty_nr: i64,
     /// Field 22, in clock ticks since boot.
     pub start_time: StartTime,
+    /// Fields 48 and 49: where the argument area starts and ends in the
+    /// process's memory (`arg_start`, `arg_end`). `None` when the fields are
+    /// missing or malformed, or the kernel shows zeros: it does unless the
+    /// reader may trace the process (not another user's, nor a
+    /// non-dumpable one).
+    pub arg_area: Option<(u64, u64)>,
+}
+
+impl StatFields {
+    /// The argument area's length in bytes, its NULs included, when
+    /// [`StatFields::arg_area`] is known and not empty.
+    pub fn arg_area_len(&self) -> Option<usize> {
+        let (start, end) = self.arg_area?;
+        usize::try_from(end.checked_sub(start)?)
+            .ok()
+            .filter(|n| *n > 0)
+    }
 }
 
 /// Parses the contents of a Linux `/proc/<pid>/stat` file. The command name
 /// in field 2 is in parentheses and may itself hold spaces and
 /// parentheses, so it runs from the first `(` to the last `)`, and the
-/// other fields are counted from there. `None` when a field is missing or
-/// malformed.
+/// other fields are counted from there. `None` when a field up to 22 is
+/// missing or malformed; fields 48 and 49 are optional
+/// ([`StatFields::arg_area`]).
 pub fn parse_proc_stat(stat: &[u8]) -> Option<StatFields> {
     let open = stat.iter().position(|b| *b == b'(')?;
     let close = stat.iter().rposition(|b| *b == b')')?;
@@ -416,7 +546,7 @@ pub fn parse_proc_stat(stat: &[u8]) -> Option<StatFields> {
     let pid = parse_int(std::str::from_utf8(stat.get(..open)?).ok()?.trim_end())?;
     let comm = stat.get(open + 1..close)?.to_vec();
     let rest = std::str::from_utf8(stat.get(close + 1..)?).ok()?;
-    let fields: Vec<&str> = rest.split_ascii_whitespace().take(20).collect();
+    let fields: Vec<&str> = rest.split_ascii_whitespace().take(47).collect();
     // `fields[0]` is field 3.
     let field = |n: usize| fields.get(n - 3).copied();
     let start = field(22)?;
@@ -430,7 +560,19 @@ pub fn parse_proc_stat(stat: &[u8]) -> Option<StatFields> {
         session: i32::try_from(parse_int(field(6)?)?).ok()?,
         tty_nr: parse_int(field(7)?)?,
         start_time: StartTime::from_raw(start.parse().ok()?),
+        arg_area: match (field(48).and_then(parse_u64), field(49).and_then(parse_u64)) {
+            (Some(start), Some(end)) if start != 0 && end != 0 => Some((start, end)),
+            _ => None,
+        },
     })
+}
+
+/// A decimal integer without a sign, and nothing else.
+fn parse_u64(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
 }
 
 /// A decimal integer with an optional leading `-`, and nothing else.
@@ -461,8 +603,8 @@ pub fn parse_status_euid(status: &[u8]) -> Option<u32> {
 /// string without NULs, which counts as one argument. Capped at
 /// [`MAX_ARGV`] arguments and [`MAX_ARGV_BYTES`] bytes; bytes past the
 /// cap, or a last argument cut by it, are dropped.
-pub fn parse_cmdline(bytes: &[u8]) -> Vec<OsString> {
-    let mut args = Vec::new();
+pub fn parse_cmdline(bytes: &[u8]) -> Argv {
+    let mut args: Vec<&[u8]> = Vec::with_capacity(MAX_ARGV);
     let mut total = 0usize;
     let mut rest = bytes;
     while !rest.is_empty() && args.len() < MAX_ARGV {
@@ -474,10 +616,10 @@ pub fn parse_cmdline(bytes: &[u8]) -> Vec<OsString> {
         if total > MAX_ARGV_BYTES || (!terminated && bytes.len() > MAX_ARGV_BYTES) {
             break;
         }
-        args.push(OsString::from_vec(arg.to_vec()));
+        args.push(arg);
         rest = next;
     }
-    args
+    Argv::from_slices(&args)
 }
 
 /// The alignment `exec` gives the executable's path in a macOS process's
@@ -497,12 +639,20 @@ pub const PROCARGS_ALIGN: usize = 8;
 /// The arguments start where that layout puts them, never at the first
 /// byte that is not a NUL: an empty `argv[0]` is a lone NUL too, and
 /// skipping it would shift the count into the environment (review finding F-33).
-/// Only the arguments are read, at most [`MAX_ARGV`] of them and
-/// [`MAX_ARGV_BYTES`] in all; parsing stops there, so no environment
-/// string is parsed unless the process rewrote its own argument area.
+/// Then `argc` NUL-terminated strings are read, at most [`MAX_ARGV`] of
+/// them and [`MAX_ARGV_BYTES`] in all, and parsing stops.
+///
+/// `argc` is the count `exec` saved, and the strings are the process's
+/// memory as it is now: nothing marks where the arguments end. A process
+/// that removed the NULs between its arguments (node's `process.title`
+/// does, over a short command line) is read as fewer, longer arguments,
+/// followed by as many environment strings as it removed NULs (review
+/// finding F-38). The [`Argv`] holding them is wiped on drop and never
+/// shown.
+///
 /// `None` when the padding holds anything but NULs, or the buffer ends
 /// before the arguments it announces.
-pub fn parse_procargs2(buf: &[u8]) -> Option<Vec<OsString>> {
+pub fn parse_procargs2(buf: &[u8]) -> Option<Argv> {
     let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
     let argc = usize::try_from(argc).ok()?;
     let area = buf.get(4..)?;
@@ -512,7 +662,7 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<Vec<OsString>> {
         return None;
     }
     let want = argc.min(MAX_ARGV);
-    let mut args = Vec::with_capacity(want);
+    let mut args: Vec<&[u8]> = Vec::with_capacity(want);
     let mut total = 0usize;
     while args.len() < want {
         let rest = area.get(i..)?;
@@ -521,15 +671,19 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<Vec<OsString>> {
         if total > MAX_ARGV_BYTES {
             break;
         }
-        args.push(OsString::from_vec(rest[..n].to_vec()));
+        args.push(&rest[..n]);
         i += n + 1;
     }
-    Some(args)
+    Some(Argv::from_slices(&args))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strs(a: &Argv) -> Vec<&OsStr> {
+        a.iter().collect()
+    }
 
     fn stat_line(comm: &str, tty: &str, start: &str) -> Vec<u8> {
         format!(
@@ -552,6 +706,44 @@ mod tests {
         assert_eq!(
             parse_proc_stat(&stat_line("x", "0", "5")).unwrap().tty_nr,
             0
+        );
+    }
+
+    /// A current kernel's 52 fields, with `arg_start` and `arg_end` (48
+    /// and 49) as given.
+    fn full_stat(arg_start: &str, arg_end: &str) -> Vec<u8> {
+        let mut f: Vec<String> = (3..=52).map(|n: u32| n.to_string()).collect();
+        f[0] = "S".into();
+        f[22 - 3] = "987654".into();
+        f[48 - 3] = arg_start.into();
+        f[49 - 3] = arg_end.into();
+        format!("4242 (node) {}\n", f.join(" ")).into_bytes()
+    }
+
+    #[test]
+    fn the_argument_area_is_fields_48_and_49() {
+        let f = parse_proc_stat(&full_stat("140736000000000", "140736000000040")).unwrap();
+        assert_eq!((f.pid, f.ppid, f.session), (4242, 4, 6));
+        assert_eq!(f.start_time, StartTime::from_raw(987_654));
+        assert_eq!(f.arg_area, Some((140_736_000_000_000, 140_736_000_000_040)));
+        assert_eq!(f.arg_area_len(), Some(40));
+        // Zeros: the kernel keeps them from a reader that may not trace
+        // the process.
+        let hidden = parse_proc_stat(&full_stat("0", "0")).unwrap();
+        assert_eq!((hidden.arg_area, hidden.arg_area_len()), (None, None));
+        // Malformed, reversed or empty.
+        for (start, end) in [("x", "12"), ("-4", "12"), ("12", "1e3")] {
+            let f = parse_proc_stat(&full_stat(start, end)).unwrap();
+            assert_eq!(f.arg_area_len(), None, "{start} {end}");
+        }
+        for (start, end) in [("50", "40"), ("40", "40")] {
+            let f = parse_proc_stat(&full_stat(start, end)).unwrap();
+            assert_eq!(f.arg_area_len(), None, "{start} {end}");
+        }
+        // A line that stops before field 48.
+        assert_eq!(
+            parse_proc_stat(&stat_line("x", "0", "5")).unwrap().arg_area,
+            None
         );
     }
 
@@ -581,9 +773,12 @@ mod tests {
     #[test]
     fn cmdline_splits_on_nul() {
         let args = parse_cmdline(b"node\0/usr/lib/cli.js\0--flag\0");
-        assert_eq!(args, ["node", "/usr/lib/cli.js", "--flag"]);
-        assert_eq!(parse_cmdline(b"retitled process"), ["retitled process"]);
-        assert_eq!(parse_cmdline(b"a\0\0b\0"), ["a", "", "b"]);
+        assert_eq!(strs(&args), ["node", "/usr/lib/cli.js", "--flag"]);
+        assert_eq!(
+            strs(&parse_cmdline(b"retitled process")),
+            ["retitled process"]
+        );
+        assert_eq!(strs(&parse_cmdline(b"a\0\0b\0")), ["a", "", "b"]);
         assert!(parse_cmdline(b"").is_empty());
     }
 
@@ -626,10 +821,11 @@ mod tests {
             b"/usr/local/bin/node",
             &[b"node", b"/opt/cli.js", b"HOME=/Users/x", b"PATH=/bin"],
         );
-        assert_eq!(parse_procargs2(&b).unwrap(), ["node", "/opt/cli.js"]);
-        assert_eq!(
-            parse_procargs2(&procargs(0, b"/bin/x", &[b"ENV=1"])).unwrap(),
-            Vec::<OsString>::new()
+        assert_eq!(strs(&parse_procargs2(&b).unwrap()), ["node", "/opt/cli.js"]);
+        assert!(
+            parse_procargs2(&procargs(0, b"/bin/x", &[b"ENV=1"]))
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -640,12 +836,75 @@ mod tests {
         // environment as argv[1].
         let b = procargs(2, b"/bin/sl", &[b"", b"30", b"ENVMARK=1"]);
         assert_eq!(b.len(), 4 + 8 + 1 + 3 + 10);
-        assert_eq!(parse_procargs2(&b).unwrap(), ["", "30"]);
+        assert_eq!(strs(&parse_procargs2(&b).unwrap()), ["", "30"]);
         // Padding before an empty argv[0], and several empty arguments.
         for path in [&b"/bin/x"[..], b"/usr/bin/xargs", b"/bin/sleep", b"/a", b""] {
             let b = procargs(4, path, &[b"", b"", b"", b"z", b"ENVMARK=1"]);
-            assert_eq!(parse_procargs2(&b).unwrap(), ["", "", "", "z"]);
+            assert_eq!(strs(&parse_procargs2(&b).unwrap()), ["", "", "", "z"]);
         }
+    }
+
+    /// Review finding F-38: `argc` is the count `exec` saved, and nothing
+    /// marks where the arguments end. A process that removed the NULs
+    /// between its arguments is read with environment strings as
+    /// arguments. They are held in an [`Argv`], which never shows them, and
+    /// no more than [`MAX_ARGV`] are read.
+    #[test]
+    fn removed_separators_read_on_into_the_environment_and_are_never_shown() {
+        let b = procargs(
+            3,
+            b"/usr/local/bin/node",
+            &[b"node /tmp/t.js x", b"ENVMARK=hunter2", b"PATH=/bin"],
+        );
+        let args = parse_procargs2(&b).unwrap();
+        assert_eq!(
+            strs(&args),
+            ["node /tmp/t.js x", "ENVMARK=hunter2", "PATH=/bin"]
+        );
+        assert_eq!(format!("{args:?}"), "Argv { argc: 3, .. }");
+        let mut p = ProcInfo {
+            pid: 7,
+            ppid: 1,
+            start_time: StartTime::from_raw(1),
+            uid: 501,
+            sid: Some(7),
+            controlling_tty: false,
+            comm: OsString::from("node"),
+            exe: None,
+            argv: None,
+        };
+        p.argv = Some(args);
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("argc: Some(3)"), "{shown}");
+
+        let env: Vec<Vec<u8>> = (0..40).map(|k| format!("V{k}=x").into_bytes()).collect();
+        let mut strings: Vec<&[u8]> = vec![b"retitled"];
+        strings.extend(env.iter().map(Vec::as_slice));
+        let b = procargs(41, b"/bin/node", &strings);
+        assert_eq!(parse_procargs2(&b).unwrap().len(), MAX_ARGV);
+    }
+
+    #[test]
+    fn argv_lends_its_arguments_and_shows_only_their_count() {
+        let a = Argv::new(["node", "", "--token=hunter2"]);
+        assert_eq!(a.len(), 3);
+        assert_eq!(a.first(), Some(OsStr::new("node")));
+        assert_eq!(a.get(1), Some(OsStr::new("")));
+        assert_eq!(a.get(2), Some(OsStr::new("--token=hunter2")));
+        assert_eq!(a.get(3), None);
+        assert_eq!(a.iter().len(), 3);
+        assert_eq!(strs(&a), ["node", "", "--token=hunter2"]);
+        let shown = format!("{a:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        // One buffer allocated at its final size: nothing grew and left a
+        // copy behind in freed memory.
+        assert_eq!(a.bytes.capacity(), a.bytes.len());
+        let parsed = parse_cmdline(b"node\0\0--token=hunter2\0");
+        assert_eq!(parsed, a);
+        assert_eq!(parsed.bytes.capacity(), parsed.bytes.len());
+        assert!(Argv::default().is_empty());
+        assert_eq!(Argv::new(Vec::<&str>::new()).first(), None);
     }
 
     #[test]
