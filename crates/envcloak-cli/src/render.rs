@@ -12,9 +12,12 @@
 //! the daemon's place, and an agent can write the manifest. So text is
 //! escaped before it is printed ([`shown`]: control characters, bidi
 //! overrides and invisible characters become visible escapes), and a name
-//! shaped like a key rather than a name is not printed at all, since it is
-//! most likely a value pasted in its place. JSON escapes control
-//! characters by its own rules.
+//! shaped like a key rather than a name is not printed at all, in the text
+//! or in the JSON ([`HIDDEN`] takes its place), since it is most likely a
+//! value pasted in its place. JSON escapes control characters by its own
+//! rules. Two kinds of string are not names: the ids the daemon makes,
+//! which are shaped like tokens and kept when they have an id's shape
+//! ([`shown_id`]), and paths, which are only escaped ([`shown_path`]).
 //!
 //! Accounts are personal: `ls` shows them only with `--long` (the daemon
 //! sends them only then), and `show` always.
@@ -34,9 +37,45 @@ pub trait Render: View {
     /// The text a person reads, ending in a newline.
     fn human(&self) -> String;
 
-    /// The JSON form, as the daemon's answer carries it.
+    /// The JSON form, as the daemon's answer carries it, with the names the
+    /// text hides replaced by [`HIDDEN`] ([`hide_names`]).
     fn json(&self) -> serde_json::Value {
-        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+        let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        hide_names(&mut v, None);
+        v
+    }
+}
+
+/// The JSON keys whose strings are paths, shown whole ([`shown_path`]).
+const PATH_KEYS: [&str; 2] = ["manifest", "project_dir"];
+
+/// Replaces with [`HIDDEN`] every string of `v` that the text would hide:
+/// a name that looks like a value, or an `id` that is not an id's shape.
+/// Paths ([`PATH_KEYS`]) stay. `key` is the key `v` is under; the items of
+/// an array are under the array's key.
+fn hide_names(v: &mut serde_json::Value, key: Option<&str>) {
+    match v {
+        serde_json::Value::String(s) => {
+            let keep = match key {
+                Some("id") => shown_id(s) == *s,
+                Some(k) if PATH_KEYS.contains(&k) => true,
+                _ => !looks_like_value(s),
+            };
+            if !keep {
+                HIDDEN.clone_into(s);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for x in a {
+                hide_names(x, key);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for (k, x) in o.iter_mut() {
+                hide_names(x, Some(k));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -80,6 +119,14 @@ pub fn shown(s: &str) -> String {
     } else {
         escape_for_display(s)
     }
+}
+
+/// A path as it may be printed: escaped only. A path is not a name in
+/// whose place a value gets pasted, and a directory named like a hash (a
+/// git worktree, a CI checkout, `/nix/store`) is common: hiding the path
+/// would hide which file was meant.
+fn shown_path(s: &str) -> String {
+    escape_for_display(s)
 }
 
 /// An id the daemon made (26 Crockford base32 characters) as it may be
@@ -490,7 +537,7 @@ impl Render for CheckReport {
                     .and_then(|r| r.project_name.as_deref())
                     .map(|n| format!(" (project {})", shown(n)))
                     .unwrap_or_default();
-                let _ = writeln!(o, "manifest: {}{name}", shown(m));
+                let _ = writeln!(o, "manifest: {}{name}", shown_path(m));
             }
             None => {
                 let _ = writeln!(o, "manifest: none in this directory or above it");
@@ -611,19 +658,16 @@ impl Render for RefEditView {
             .as_deref()
             .map_or_else(|| "[env]".to_owned(), |p| format!("[env.{}]", shown(p)));
         let binding = format!("{} = {}", shown(&self.env_name), shown(&self.reference));
+        let manifest = shown_path(&self.manifest);
         let mut o = match self.change {
-            RefChange::Added => {
-                format!("Added {binding} to {place} in {}.\n", shown(&self.manifest))
-            }
+            RefChange::Added => format!("Added {binding} to {place} in {manifest}.\n"),
             RefChange::Replaced => format!(
-                "Set {binding} in {place} in {} (it was {}).\n",
-                shown(&self.manifest),
+                "Set {binding} in {place} in {manifest} (it was {}).\n",
                 shown_or_dash(self.previous.as_deref())
             ),
-            RefChange::Unchanged => format!(
-                "{binding} is already in {place} in {}; nothing changed.\n",
-                shown(&self.manifest)
-            ),
+            RefChange::Unchanged => {
+                format!("{binding} is already in {place} in {manifest}; nothing changed.\n")
+            }
         };
         match self.resolves {
             Some(RefStatus::Ok) => {}
@@ -1032,8 +1076,9 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
     }
 
     /// Strings from the daemon or a file are escaped, and a name shaped like
-    /// a key is not printed at all: a canary pasted into any name of any
-    /// view never reaches the text, and no raw control character does.
+    /// a key is not printed at all, as text or as JSON: a canary pasted
+    /// into any name of any view never reaches either form, and no raw
+    /// control character reaches the text.
     #[test]
     fn names_are_escaped_and_key_shaped_ones_hidden() {
         let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
@@ -1068,22 +1113,47 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
                 field: Some(v.to_owned()),
                 grants: 0,
             };
+            let items = ItemsView {
+                items: vec![i.clone()],
+            };
+            let added = AddedView {
+                item: i.clone(),
+                field: v.to_owned(),
+                detected: Some(v.to_owned()),
+                ambiguous: false,
+                length: LengthClass::Ok,
+            };
+            let rotated = RotatedView {
+                slug: v.to_owned(),
+                field: v.to_owned(),
+                prior_count: 1,
+                length: LengthClass::Ok,
+            };
+            let removed = RemovedView {
+                slug: v.to_owned(),
+                grants_ended: 1,
+                backup: v.to_owned(),
+            };
+            let check = canary_check(v);
+            let edit = RefEditView {
+                manifest: "/src/acme-web/envcloak.toml".into(),
+                profile: Some(v.to_owned()),
+                env_name: v.to_owned(),
+                reference: v.to_owned(),
+                change: RefChange::Replaced,
+                previous: Some(v.to_owned()),
+                resolves: Some(RefStatus::Ok),
+            };
             let texts = [
                 i.human(),
-                ItemsView {
-                    items: vec![i.clone()],
-                }
-                .human(),
+                items.human(),
                 rotate_statement(&target),
                 remove_statement(&target),
-                AddedView {
-                    item: i.clone(),
-                    field: v.to_owned(),
-                    detected: Some(v.to_owned()),
-                    ambiguous: false,
-                    length: LengthClass::Ok,
-                }
-                .human(),
+                added.human(),
+                rotated.human(),
+                removed.human(),
+                check.human(),
+                edit.human(),
             ];
             for t in &texts {
                 envcloak_testkit::assert_no_canary(t.as_bytes(), &cs);
@@ -1091,6 +1161,141 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
                 assert!(t.contains(HIDDEN), "{t}");
             }
             assert!(texts[0].contains("rtl\\u{202e}txet"), "{}", texts[0]);
+            // The JSON of every view hides the same names.
+            let jsons = [
+                i.json(),
+                items.json(),
+                added.json(),
+                rotated.json(),
+                removed.json(),
+                check.json(),
+                edit.json(),
+            ];
+            for j in &jsons {
+                let t = j.to_string();
+                envcloak_testkit::assert_no_canary(t.as_bytes(), &cs);
+                assert!(t.contains(HIDDEN), "{t}");
+            }
+            assert_eq!(jsons[6]["previous"], HIDDEN);
+            assert_eq!(jsons[5]["env_files"][0]["file"], HIDDEN);
+            assert_eq!(jsons[5]["references"]["project_name"], HIDDEN);
+            // Ids and paths are not names: they stay.
+            assert_eq!(jsons[0]["id"], "01K5TESTTESTTESTTESTTESTTE");
+            assert_eq!(jsons[6]["manifest"], "/src/acme-web/envcloak.toml");
+            assert_eq!(jsons[5]["references"]["project_dir"], "/src/acme-web");
+        }
+    }
+
+    /// A check report with `v` in every name: the project name, profiles,
+    /// variables, references, env file names, providers and error texts.
+    fn canary_check(v: &str) -> CheckReport {
+        CheckReport {
+            manifest: Some("/src/acme-web/envcloak.toml".into()),
+            references: Some(CheckView {
+                project_dir: Some("/src/acme-web".into()),
+                project_name: Some(v.to_owned()),
+                bindings: vec![CheckBindingView {
+                    profile: Some(v.to_owned()),
+                    env_name: Some(v.to_owned()),
+                    reference: Some(v.to_owned()),
+                    status: RefStatus::UnknownItem,
+                }],
+                refs: vec![RefStatus::Ok],
+            }),
+            unchecked: Some(v.to_owned()),
+            env_files: vec![
+                EnvFileView {
+                    file: v.to_owned(),
+                    state: EnvFileState::Read,
+                    error_line: None,
+                    error: None,
+                    plaintext: vec![PlaintextView {
+                        line: 2,
+                        env_name: Some(v.to_owned()),
+                        provider: Some(v.to_owned()),
+                    }],
+                    references: vec![EnvRefView {
+                        line: 3,
+                        env_name: Some(v.to_owned()),
+                        reference: Some(v.to_owned()),
+                        status: RefStatus::UnknownItem,
+                    }],
+                },
+                EnvFileView {
+                    file: ".env".into(),
+                    state: EnvFileState::Invalid,
+                    error_line: Some(1),
+                    error: Some(v.to_owned()),
+                    plaintext: vec![],
+                    references: vec![],
+                },
+            ],
+        }
+    }
+
+    /// Paths are shown whole, only escaped, even with a directory named like
+    /// a hash (a git worktree, a CI checkout, `/nix/store`), so the user
+    /// sees which file was edited or checked. The ids the daemon makes are
+    /// kept in JSON as in text, and anything else in an id's place is
+    /// hidden.
+    #[test]
+    fn paths_and_ids_are_shown_whole() {
+        let hash: String = (0..28)
+            .map(|i| char::from(b"0123456789abcdef"[(i * 7 + 3) % 16]))
+            .collect();
+        assert!(looks_like_value(&hash));
+        let dir = format!("/tmp/ecrv/{hash}/proj");
+        let manifest = format!("{dir}/envcloak.toml");
+        let edit = RefEditView {
+            manifest: manifest.clone(),
+            profile: None,
+            env_name: "B".into(),
+            reference: "c/d".into(),
+            change: RefChange::Added,
+            previous: None,
+            resolves: Some(RefStatus::Ok),
+        };
+        assert_eq!(
+            edit.human(),
+            format!("Added B = c/d to [env] in {manifest}.\n")
+        );
+        assert_eq!(edit.json()["manifest"], manifest.as_str());
+        let check = CheckReport {
+            manifest: Some(manifest.clone()),
+            references: Some(CheckView {
+                project_dir: Some(dir.clone()),
+                project_name: None,
+                bindings: vec![],
+                refs: vec![],
+            }),
+            unchecked: None,
+            env_files: vec![],
+        };
+        assert!(
+            check
+                .human()
+                .starts_with(&format!("manifest: {manifest}\n")),
+            "{}",
+            check.human()
+        );
+        let j = check.json();
+        assert_eq!(j["manifest"], manifest.as_str());
+        assert_eq!(j["references"]["project_dir"], dir.as_str());
+        // A path is still escaped.
+        let odd = RefEditView {
+            manifest: "/tmp/a\u{1b}[31m\u{202e}/envcloak.toml".into(),
+            ..edit
+        };
+        let t = odd.human();
+        assert!(!t.contains('\u{1b}') && !t.contains('\u{202e}'), "{t}");
+
+        let i = item("openai/acme-web", 0);
+        assert_eq!(i.json()["id"], "01K5TESTTESTTESTTESTTESTTE");
+        for bad in [hash.as_str(), "not an id", "01K5TESTTESTTESTTESTTESTTEX"] {
+            let mut j = i.clone();
+            j.id = bad.to_owned();
+            assert_eq!(j.json()["id"], HIDDEN, "{bad}");
+            assert!(j.human().contains(&format!("id: {HIDDEN}")), "{bad}");
         }
     }
 
