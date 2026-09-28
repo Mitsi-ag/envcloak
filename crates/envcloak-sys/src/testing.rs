@@ -579,6 +579,27 @@ pub(crate) fn peercred_fallback_forced() -> bool {
     PEERCRED_FALLBACK.load(Ordering::SeqCst)
 }
 
+/// Linux: a pid that [`crate::process_start_time`] reports as a live
+/// process with the given start time, and the start time.
+static REUSED_PID: Mutex<Option<(i32, crate::StartTime)>> = Mutex::new(None);
+
+/// Linux: makes [`crate::process_start_time`], and so the start time
+/// [`crate::peer_identity`] reads, report `pid` as a live process that
+/// started at `start`: the pid of a peer that exited, taken over by another
+/// process, without waiting for the kernel to reuse it. `None` turns it
+/// off. Process-wide.
+pub fn pretend_pid_reused(reused: Option<(i32, crate::StartTime)>) {
+    *REUSED_PID.lock().unwrap_or_else(PoisonError::into_inner) = reused;
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn pretended_start_time(pid: i32) -> Option<crate::StartTime> {
+    match *REUSED_PID.lock().unwrap_or_else(PoisonError::into_inner) {
+        Some((p, start)) if p == pid => Some(start),
+        _ => None,
+    }
+}
+
 /// Sends `sig` to the calling thread only, with `pthread_kill`. A signal
 /// the thread blocks then stays pending for it, where
 /// [`crate::TerminationSignals::wait`] collects it, instead of reaching

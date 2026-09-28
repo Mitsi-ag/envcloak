@@ -180,6 +180,73 @@ fn a_peer_that_exited_before_the_accept_is_refused() {
     }
 }
 
+/// Turns the reused-pid pretence off, even when the test fails.
+#[cfg(target_os = "linux")]
+struct PretendReused;
+
+#[cfg(target_os = "linux")]
+impl PretendReused {
+    fn start(pid: i32, start: StartTime) -> Self {
+        envcloak_sys::testing::pretend_pid_reused(Some((pid, start)));
+        PretendReused
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PretendReused {
+    fn drop(&mut self) {
+        envcloak_sys::testing::pretend_pid_reused(None);
+        envcloak_sys::testing::force_peercred_fallback(false);
+    }
+}
+
+/// Linux 6.5+: a peer that connected, exited and was reaped before the
+/// accept, whose pid another process then took, is refused by its pidfd.
+/// The kernel's reuse is stood in for: `/proc/<pid>/stat` reads report the
+/// pid as a live process that started before the accept, as a reused pid
+/// would. The pidfd path must refuse the connection without trusting that
+/// read; the `SO_PEERCRED` fallback, the control, cannot tell and takes the
+/// impostor for the peer. On CI's kernel the pidfd path must be the one a
+/// live peer gets, so an error there cannot fall back unseen.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_a_reaped_peer_whose_pid_was_reused_is_refused_by_its_pidfd() {
+    use envcloak_sys::testing::force_peercred_fallback;
+
+    let _serial = serial();
+    let (_dir, path, l) = listener();
+    let live = Connector::start(&path);
+    let (server, _) = l.accept().unwrap();
+    let source = peer_identity(server.as_fd()).unwrap().source;
+    drop((server, live));
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        assert_eq!(source, PeerSource::PidFd);
+    }
+
+    let child = Connector::start(&path);
+    let pid = child.pid();
+    drop(child);
+    // A start time before the accept: this process's own.
+    let older = process_start_time(own_pid()).unwrap();
+    let pretence = PretendReused::start(pid, older);
+    assert_eq!(process_start_time(pid).unwrap(), older);
+    let (server, _) = l.accept().unwrap();
+    let with_pidfd = peer_identity(server.as_fd());
+    force_peercred_fallback(true);
+    let fallback = peer_identity(server.as_fd());
+    drop(pretence);
+
+    let fallback = fallback.unwrap();
+    assert_eq!(fallback.source, PeerSource::PeerCred);
+    assert_eq!(fallback.pid, pid);
+    if source == PeerSource::PidFd {
+        let err = with_pidfd.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    } else {
+        eprintln!("this kernel has no SO_PEERPIDFD; only the fallback was checked");
+    }
+}
+
 #[test]
 fn start_times_are_stable_and_missing_processes_are_not_found() {
     let _serial = serial();

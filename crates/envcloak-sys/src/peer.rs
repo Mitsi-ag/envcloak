@@ -8,7 +8,13 @@
 //!   - Linux 6.5 and later: `SO_PEERCRED` for the uid and pid, and
 //!     `SO_PEERPIDFD`, a pidfd for the connecting process. The pidfd keeps
 //!     the pid from being reused while the process lives, so a start time
-//!     read while it still lives is that process's.
+//!     read while it still lives is that process's. Whether the kernel has
+//!     `SO_PEERPIDFD` is found once, on a socket pair of this process's
+//!     own; after that, every error for a real peer refuses it and none is
+//!     taken for an older kernel. A peer that was reaped before the accept
+//!     gets `EINVAL` from kernels 6.5 to about 6.15, and a pidfd that is
+//!     already readable from later ones: both refuse it, without reading
+//!     `/proc/<pid>/stat` for a pid another process may hold by then.
 //!   - Linux before 6.5: `SO_PEERCRED` alone. A process whose start time is
 //!     later than the accept cannot have connected, so it is refused. A
 //!     narrow race remains: the peer exits and its pid is reused between
@@ -21,7 +27,8 @@
 //!   it.
 //!
 //! The `testing` feature can force the `SO_PEERCRED` fallback on Linux
-//! kernels that have `SO_PEERPIDFD`, so both paths are tested.
+//! kernels that have `SO_PEERPIDFD`, so both paths are tested, and can make
+//! a pid look reused by an older process, so the race above is tested.
 
 use std::io;
 #[cfg(target_os = "macos")]
@@ -185,12 +192,29 @@ fn fallback_forced() -> bool {
     false
 }
 
+#[cfg(all(feature = "testing", any(target_os = "linux", target_os = "android")))]
+fn pretended_start_time(pid: i32) -> Option<StartTime> {
+    crate::testing::pretended_start_time(pid)
+}
+
+#[cfg(all(
+    not(feature = "testing"),
+    any(target_os = "linux", target_os = "android")
+))]
+fn pretended_start_time(_pid: i32) -> Option<StartTime> {
+    None
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
     use std::io;
-    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+    use std::sync::OnceLock;
 
-    use super::{PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_gone};
+    use super::{
+        PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_gone, pretended_start_time,
+    };
 
     /// Slack, in clock ticks, for rounding between the boot clock and the
     /// kernel's start time.
@@ -231,8 +255,8 @@ mod linux {
         Ok(cred)
     }
 
-    /// The peer's pidfd, or `None` on kernels without `SO_PEERPIDFD`.
-    fn peer_pidfd(fd: BorrowedFd<'_>) -> io::Result<Option<OwnedFd>> {
+    /// `SO_PEERPIDFD` on the socket `fd`, with the kernel's error as is.
+    fn getsockopt_pidfd(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
         let mut pidfd: libc::c_int = -1;
         let mut len = size_of::<libc::c_int>() as libc::socklen_t;
         // SAFETY: `pidfd` is a writable int and `len` its size; the socket
@@ -247,20 +271,47 @@ mod linux {
             )
         };
         if rc != 0 {
-            let err = io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(libc::ENOPROTOOPT) | Some(libc::EINVAL) => Ok(None),
-                // The peer has already been reaped.
-                Some(libc::ESRCH) | Some(libc::ENOTCONN) => Err(peer_gone()),
-                _ => Err(err),
-            };
+            return Err(io::Error::last_os_error());
         }
-        if pidfd < 0 {
-            return Ok(None);
+        if pidfd < 0 || len as usize != size_of::<libc::c_int>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the kernel reported no pidfd",
+            ));
         }
         // SAFETY: the kernel just created `pidfd` for this process, which
         // owns it and nothing else does.
-        Ok(Some(unsafe { OwnedFd::from_raw_fd(pidfd) }))
+        Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
+    }
+
+    /// Whether this kernel has `SO_PEERPIDFD` (Linux 6.5), asked once of a
+    /// socket pair whose peer is this live process, so only an unknown
+    /// option (`ENOPROTOOPT`) can say no. Any other error is returned and
+    /// asked again next time.
+    fn pidfd_supported() -> io::Result<bool> {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        if let Some(s) = SUPPORTED.get() {
+            return Ok(*s);
+        }
+        let (ours, _theirs) = UnixStream::pair()?;
+        let supported = match getsockopt_pidfd(ours.as_fd()) {
+            Ok(_pidfd) => true,
+            Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => false,
+            Err(e) => return Err(e),
+        };
+        Ok(*SUPPORTED.get_or_init(|| supported))
+    }
+
+    /// The peer's pidfd, on a kernel that has `SO_PEERPIDFD`. The errors a
+    /// peer that is gone gives are [`peer_gone`]: `EINVAL` when it was
+    /// reaped (kernels 6.5 to about 6.15), `ESRCH`, `ENODATA` when the
+    /// socket has no peer process, and `ENOTCONN`. None of them means an
+    /// older kernel.
+    fn peer_pidfd(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+        getsockopt_pidfd(fd).map_err(|e| match e.raw_os_error() {
+            Some(libc::EINVAL | libc::ESRCH | libc::ENODATA | libc::ENOTCONN) => peer_gone(),
+            _ => e,
+        })
     }
 
     /// Whether the process `pidfd` refers to is still running: its pidfd
@@ -302,6 +353,9 @@ mod linux {
     }
 
     pub(super) fn start_time(pid: i32) -> io::Result<StartTime> {
+        if let Some(start) = pretended_start_time(pid) {
+            return Ok(start);
+        }
         let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
             Ok(s) => s,
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Err(peer_gone()),
@@ -315,10 +369,10 @@ mod linux {
     pub(super) fn peer_identity(fd: BorrowedFd<'_>) -> io::Result<PeerIdentity> {
         let accepted = boot_ticks()?;
         let cred = peer_cred(fd)?;
-        let pidfd = if super::fallback_forced() {
+        let pidfd = if super::fallback_forced() || !pidfd_supported()? {
             None
         } else {
-            peer_pidfd(fd)?
+            Some(peer_pidfd(fd)?)
         };
         let start = match start_time(cred.pid) {
             Ok(s) => s,

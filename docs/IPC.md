@@ -35,7 +35,7 @@ Start-up errors print `envcloakd: <token>: <message>` and exit 1; usage errors e
 | | uid, pid | start time |
 |---|---|---|
 | macOS | the audit token (`LOCAL_PEERTOKEN`), which also carries the pid version | `proc_pidinfo(PROC_PIDTBSDINFO)`; a process that started after the accept is refused |
-| Linux 6.5+ | `SO_PEERCRED` | `/proc/<pid>/stat`, read while `SO_PEERPIDFD` pins the process: it must still be alive after the read |
+| Linux 6.5+ | `SO_PEERCRED` | `/proc/<pid>/stat`, read while `SO_PEERPIDFD` pins the process: it must still be alive after the read. Whether the kernel has `SO_PEERPIDFD` is found once; on one that has it, a peer it gives no pidfd for (one reaped before the accept gets `EINVAL`) is refused, never checked the way older kernels are |
 | Linux before 6.5 | `SO_PEERCRED` | `/proc/<pid>/stat`; a process that started after the accept is refused. A narrow race remains: the peer exits and its pid is reused between its `connect` and the `accept` |
 
 A peer running as another uid is closed at once, answered nothing, and audited. At most 32 connections are served at a time; more are closed at once.
