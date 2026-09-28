@@ -1,15 +1,58 @@
-//! What the daemon tells a client (SPEC §4.4: metadata only). These types
-//! hold no [`crate::WireSecret`] and no free text from the vault: states,
-//! counts, versions and fixed tokens.
+//! What the daemon tells a client (SPEC §4.4: metadata only), and what
+//! the CLI prints: every command's output is one of these types, rendered
+//! as text or JSON (`envcloak`'s `Render`).
+//!
+//! No type here can hold a value. Each implements [`View`], which needs
+//! `Clone`, and [`crate::WireSecret`], the only way a value crosses the
+//! socket, has no `Clone`: a view with a value in it does not compile.
+//! Beyond that, the strings here are metadata: states, counts, versions,
+//! fixed tokens, and names and paths (slugs, variables, an account), which
+//! the CLI escapes before it prints them.
 //!
 //! The two strings in [`StatusView`] come from the daemon, whose code
 //! identity M1 clients cannot verify, so [`crate::Client::status`] passes
 //! them through [`StatusView::sanitize`] before anyone prints them.
 
+use envcloak_core::crypto::ItemClass;
+use envcloak_core::vault::{Classification, ItemMeta};
 use envcloak_policy::{DenyReason, Mode, SubjectKind, Uses};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::proto::REASONS;
+
+/// What a client may print: a type of this module. `Clone` is the point:
+/// [`crate::WireSecret`] has none, so a type holding a value cannot be a
+/// view.
+pub trait View: Clone + core::fmt::Debug + Serialize + DeserializeOwned {}
+
+macro_rules! views {
+    ($($t:ty),* $(,)?) => {
+        $(impl View for $t {})*
+    };
+}
+
+views!(
+    StatusView,
+    DecisionView,
+    ApprovedView,
+    DeniedView,
+    GrantsView,
+    RevokedView,
+    CreatedView,
+    UnlockedView,
+    LockedView,
+    AuditVerifyView,
+    ItemsView,
+    ItemView,
+    AddedView,
+    TargetView,
+    RotatedView,
+    RemovedView,
+    CheckView,
+    CheckReport,
+    RefEditView,
+);
 
 /// What [`StatusView::sanitize`] puts in place of a version that is not
 /// one a daemon would send.
@@ -480,4 +523,445 @@ impl From<&envcloak_core::audit::VerifyReport> for AuditVerifyView {
             dropped: 0,
         }
     }
+}
+
+/// `items.list`: every item, sorted by slug.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemsView {
+    pub items: Vec<ItemView>,
+}
+
+/// An item's metadata (SPEC §5 "Items"), never its value. How much of it
+/// is filled depends on who asked: `ls` gets the summary, `ls --long` the
+/// account too, and `show` everything ([`ItemDetail`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemView {
+    /// 26 Crockford base32 characters.
+    pub id: String,
+    pub slug: String,
+    pub class: ItemClassView,
+    pub title: String,
+    /// A provider registry id.
+    pub provider: Option<String>,
+    pub classification: ClassificationView,
+    pub env_hint: Option<String>,
+    pub allow_short: bool,
+    /// Sorted by name.
+    pub fields: Vec<FieldView>,
+    /// Unix seconds.
+    pub created_secs: u64,
+    pub updated_secs: u64,
+    pub rotated_secs: Option<u64>,
+    pub expires_secs: Option<u64>,
+    /// Who owns or pays for the key: personal, so filled only for
+    /// `ls --long` and `show`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountView>,
+    /// The rest, for `show`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ItemDetailView>,
+}
+
+/// How much of an item [`ItemView::from_meta`] fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ItemDetail {
+    /// `ls`: no account, no detail.
+    Summary,
+    /// `ls --long`: the account too.
+    Long,
+    /// `show`: everything.
+    Full,
+}
+
+impl ItemView {
+    /// The view of `m` at `detail`.
+    pub fn from_meta(m: &ItemMeta, detail: ItemDetail) -> Self {
+        let d = &m.details;
+        let account = matches!(detail, ItemDetail::Long | ItemDetail::Full).then(|| AccountView {
+            email: d.account.email.clone(),
+            label: d.account.label.clone(),
+            org_id: d.account.org_id.clone(),
+        });
+        let full = (detail == ItemDetail::Full).then(|| ItemDetailView {
+            allowed_hosts: d.allowed_hosts.clone(),
+            tags: d.tags.clone(),
+            links: LinksView {
+                docs: d.links.docs.clone(),
+                billing: d.links.billing.clone(),
+                keys_page: d.links.keys_page.clone(),
+                dashboard: d.links.dashboard.clone(),
+            },
+            last_used_secs: d.last_used_at,
+            notes: (!d.notes.is_empty()).then(|| d.notes.clone()),
+        });
+        ItemView {
+            id: m.id.to_string(),
+            slug: m.slug.as_str().to_owned(),
+            class: ItemClassView::from(m.class),
+            title: d.title.clone(),
+            provider: d.provider.clone(),
+            classification: ClassificationView::from(d.classification),
+            env_hint: d.env_hint.clone(),
+            allow_short: d.allow_short,
+            fields: m
+                .fields
+                .iter()
+                .map(|f| FieldView {
+                    name: f.name.as_str().to_owned(),
+                    prior_count: f.prior_count,
+                    created_secs: f.created_at,
+                    updated_secs: f.updated_at,
+                })
+                .collect(),
+            created_secs: m.created_at,
+            updated_secs: m.updated_at,
+            rotated_secs: d.rotated_at,
+            expires_secs: d.expires_at,
+            account,
+            detail: full,
+        }
+    }
+}
+
+/// An item's class (SPEC §2a-bis): only secrets are bound to variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemClassView {
+    Secret,
+    Card,
+    IssuerCredential,
+    /// A class this build does not know.
+    Other,
+}
+
+impl From<ItemClass> for ItemClassView {
+    fn from(c: ItemClass) -> Self {
+        match c {
+            ItemClass::Secret => ItemClassView::Secret,
+            ItemClass::Card => ItemClassView::Card,
+            ItemClass::IssuerCredential => ItemClassView::IssuerCredential,
+            ItemClass::None => ItemClassView::Other,
+        }
+    }
+}
+
+/// Test, live or unknown (SPEC §5 "Items").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassificationView {
+    Unknown,
+    Test,
+    Live,
+}
+
+impl From<Classification> for ClassificationView {
+    fn from(c: Classification) -> Self {
+        match c {
+            Classification::Unknown => ClassificationView::Unknown,
+            Classification::Test => ClassificationView::Test,
+            Classification::Live => ClassificationView::Live,
+        }
+    }
+}
+
+impl ClassificationView {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClassificationView::Unknown => "unknown",
+            ClassificationView::Test => "test",
+            ClassificationView::Live => "live",
+        }
+    }
+}
+
+/// One field of an item, never its value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldView {
+    pub name: String,
+    /// Prior values kept, up to 3.
+    pub prior_count: u8,
+    pub created_secs: u64,
+    pub updated_secs: u64,
+}
+
+/// Who owns or pays for an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountView {
+    pub email: Option<String>,
+    pub label: Option<String>,
+    pub org_id: Option<String>,
+}
+
+/// What `show` adds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemDetailView {
+    /// The provider's hosts when the item was made (SPEC §8).
+    pub allowed_hosts: Vec<String>,
+    pub tags: Vec<String>,
+    pub links: LinksView,
+    pub last_used_secs: Option<u64>,
+    pub notes: Option<String>,
+}
+
+/// Provider pages for an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinksView {
+    pub docs: Option<String>,
+    pub billing: Option<String>,
+    pub keys_page: Option<String>,
+    pub dashboard: Option<String>,
+}
+
+/// How a value's length stands against the rules for injection (SPEC §6.1
+/// step 6, gate 9): a bucket, never the length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LengthClass {
+    /// 16 bytes or more.
+    Ok,
+    /// 8 to 15 bytes: injected only with `allow_short`, with coverage
+    /// warnings.
+    Short,
+    /// Under 8 bytes: never injected.
+    TooShort,
+}
+
+impl LengthClass {
+    /// The bucket of a value of `len` bytes.
+    pub fn of(len: usize) -> Self {
+        match len {
+            0..8 => LengthClass::TooShort,
+            8..16 => LengthClass::Short,
+            _ => LengthClass::Ok,
+        }
+    }
+}
+
+/// `items.add`: the item made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddedView {
+    pub item: ItemView,
+    /// The field that holds the value.
+    pub field: String,
+    /// The provider the value's shape says, when it is not the item's own
+    /// (none was named and several match, or another was named).
+    pub detected: Option<String>,
+    /// Several providers' key patterns match the value; name one.
+    pub ambiguous: bool,
+    pub length: LengthClass,
+}
+
+/// `items.target`: what a `rotate` or `rm` would change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetView {
+    pub item: ItemView,
+    /// The field a rotation replaces: the one named, or the item's only
+    /// field. `None` when none was named and the item has several.
+    pub field: Option<String>,
+    /// Grants in force that bind the item.
+    pub grants: u64,
+}
+
+/// `items.rotate`: the value was replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotatedView {
+    pub slug: String,
+    pub field: String,
+    /// Prior values now kept, the replaced one first.
+    pub prior_count: u8,
+    pub length: LengthClass,
+}
+
+/// `items.remove`: the item is gone from the vault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovedView {
+    pub slug: String,
+    /// Grants that bound it and ended.
+    pub grants_ended: u64,
+    /// The file name of the encrypted backup written first, in the vault's
+    /// `backups` directory; `envcloak recover` restores the vault from it,
+    /// the removed item included.
+    pub backup: String,
+}
+
+/// Whether a reference resolves (`envcloak_policy::BindErrorKind`, and
+/// two of the checker's own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefStatus {
+    Ok,
+    UnknownItem,
+    UnknownField,
+    AmbiguousField,
+    NoField,
+    CardReference,
+    IssuerCredentialReference,
+    UnknownItemClass,
+    /// Not `NAME=<slug>[#field]`.
+    InvalidReference,
+    /// A name or reference shaped like a key rather than a name: most
+    /// likely a value pasted in its place. Not shown.
+    LooksLikeValue,
+    /// Not checked: the daemon could not be asked.
+    Unchecked,
+}
+
+impl RefStatus {
+    pub fn is_ok(self) -> bool {
+        self == RefStatus::Ok
+    }
+}
+
+/// `items.check`: every binding of the manifest, and each reference sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckView {
+    /// The project's canonical directory, when a manifest was sent.
+    pub project_dir: Option<String>,
+    pub project_name: Option<String>,
+    /// `[env]` first, then each profile's own bindings.
+    pub bindings: Vec<CheckBindingView>,
+    /// One per reference sent, in order.
+    pub refs: Vec<RefStatus>,
+}
+
+/// One binding of the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckBindingView {
+    /// `None` for `[env]`.
+    pub profile: Option<String>,
+    /// `None` when it looks like a value ([`RefStatus::LooksLikeValue`]).
+    pub env_name: Option<String>,
+    /// `<slug>[#field]`; `None` when it looks like a value.
+    pub reference: Option<String>,
+    pub status: RefStatus,
+}
+
+/// `envcloak check`: the references, as the daemon found them, and the
+/// project's env files, as the CLI read them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckReport {
+    /// The manifest, when one was found.
+    pub manifest: Option<String>,
+    /// The daemon's answer; `None` when it could not be asked.
+    pub references: Option<CheckView>,
+    /// Why the references were not checked: an error token.
+    pub unchecked: Option<String>,
+    pub env_files: Vec<EnvFileView>,
+}
+
+impl CheckReport {
+    /// Whether everything checked out: every reference resolves, nothing
+    /// went unchecked, and no env file holds a key-shaped value or could
+    /// not be read.
+    pub fn clean(&self) -> bool {
+        self.unchecked.is_none()
+            && self.references.as_ref().is_none_or(|r| {
+                r.bindings.iter().all(|b| b.status.is_ok()) && r.refs.iter().all(|s| s.is_ok())
+            })
+            && self.env_files.iter().all(EnvFileView::clean)
+    }
+}
+
+/// One env file in the project directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvFileView {
+    /// Its name in the project directory.
+    pub file: String,
+    pub state: EnvFileState,
+    /// A parse error's line (and kind, as a fixed message).
+    pub error_line: Option<u32>,
+    pub error: Option<String>,
+    /// Ordinary variables whose value a provider's key pattern matches:
+    /// plaintext keys, by line. Never the value.
+    pub plaintext: Vec<PlaintextView>,
+    /// `envcloak://` references, by line, and whether each resolves.
+    pub references: Vec<EnvRefView>,
+}
+
+impl EnvFileView {
+    pub fn clean(&self) -> bool {
+        matches!(self.state, EnvFileState::Read)
+            && self.plaintext.is_empty()
+            && self.references.iter().all(|r| r.status.is_ok())
+    }
+}
+
+/// What became of an env file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvFileState {
+    Read,
+    /// It does not parse; see `error`.
+    Invalid,
+    /// A symlink: never followed.
+    Symlink,
+    /// A FIFO, socket, device or directory.
+    NotRegular,
+    /// Owned by another user.
+    NotOwned,
+    /// Over 1 MiB.
+    TooLarge,
+    Unreadable,
+}
+
+/// A plaintext key in an env file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaintextView {
+    pub line: u32,
+    /// The variable; `None` when the name itself looks like a value.
+    pub env_name: Option<String>,
+    /// The provider, when one pattern alone matches.
+    pub provider: Option<String>,
+}
+
+/// A reference in an env file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvRefView {
+    pub line: u32,
+    pub env_name: Option<String>,
+    pub reference: Option<String>,
+    pub status: RefStatus,
+}
+
+/// `envcloak ref`: what changed in the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefEditView {
+    /// The manifest's path.
+    pub manifest: String,
+    /// `None` for `[env]`.
+    pub profile: Option<String>,
+    pub env_name: String,
+    pub reference: String,
+    pub change: RefChange,
+    /// The reference it had, when replaced.
+    pub previous: Option<String>,
+    /// Whether the vault has the item: `None` when it could not be asked.
+    pub resolves: Option<RefStatus>,
+}
+
+/// What `envcloak ref` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefChange {
+    Added,
+    Replaced,
+    /// The binding was there already.
+    Unchanged,
 }

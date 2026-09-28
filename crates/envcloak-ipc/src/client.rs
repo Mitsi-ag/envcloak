@@ -31,13 +31,17 @@ use envcloak_policy::{ApprovalOptions, PendingDescriptor};
 use crate::frame::{Frame, FrameError};
 use crate::paths::{RunPathError, RunPathErrorKind, RunPaths};
 use crate::proto::{
-    self, Approve, ApproveParams, AuditVerify, Deny, GrantsList, GrantsRevoke, Lock, Method,
-    NoParams, PendingGet, PendingGetParams, RequestParams, ResponseError, RevokeParams, RpcError,
-    RunRequest, RunRequestParams, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
+    self, AddParams, Approve, ApproveParams, AuditVerify, CheckParams, Deny, GrantsList,
+    GrantsRevoke, ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow,
+    ItemsTarget, ListParams, Lock, Method, NoParams, PendingGet, PendingGetParams, RemoveParams,
+    RequestParams, ResponseError, RevokeParams, RotateParams, RpcError, RunRequest,
+    RunRequestParams, SlugParams, Status, TargetParams, Unlock, UnlockParams, VaultCreate,
+    VaultCreateParams,
 };
 use crate::view::{
-    ApprovedView, AuditVerifyView, CreatedView, DecisionView, DeniedView, GrantsView, LockedView,
-    RevokedView, StatusView, UnlockedView,
+    AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DecisionView, DeniedView,
+    GrantsView, ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView,
+    TargetView, UnlockedView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -369,6 +373,106 @@ impl Client {
     /// As [`Client::call`].
     pub fn audit_verify(&mut self) -> Result<AuditVerifyView, ClientError> {
         self.call::<AuditVerify>(&NoParams {})
+    }
+
+    /// `items.list`, with each item's account when `long`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_list(&mut self, long: bool) -> Result<ItemsView, ClientError> {
+        self.call::<ItemsList>(&ListParams { long })
+    }
+
+    /// `items.show` for `slug`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_show(&mut self, slug: &str) -> Result<ItemView, ClientError> {
+        self.call::<ItemsShow>(&SlugParams {
+            slug: slug.to_owned(),
+        })
+    }
+
+    /// `items.check` for the manifest at `manifest`, and `refs`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_check(
+        &mut self,
+        manifest: Option<&str>,
+        refs: &[String],
+    ) -> Result<CheckView, ClientError> {
+        self.call::<ItemsCheck>(&CheckParams {
+            manifest: manifest.map(str::to_owned),
+            refs: refs.to_vec(),
+        })
+    }
+
+    /// `items.add`. The value in `p` is wiped with the request frame.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_add(&mut self, p: &AddParams) -> Result<AddedView, ClientError> {
+        self.call::<ItemsAdd>(p)
+    }
+
+    /// `items.target` for `slug` (and `field`), with the caller's claims
+    /// (the daemon serves it only to a caller that may give a proof).
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_target(
+        &mut self,
+        slug: &str,
+        field: Option<&str>,
+        claims: &[String],
+    ) -> Result<TargetView, ClientError> {
+        self.call::<ItemsTarget>(&TargetParams {
+            slug: slug.to_owned(),
+            field: field.map(str::to_owned),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `items.rotate`: `value` in place of the value of `slug`'s field,
+    /// with the passphrase as the proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_rotate(
+        &mut self,
+        target: &TargetView,
+        value: SecretBytes,
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<RotatedView, ClientError> {
+        self.call::<ItemsRotate>(&RotateParams {
+            slug: target.item.slug.clone(),
+            field: target.field.clone(),
+            item: target.item.id.clone(),
+            value: WireSecret::new(value),
+            passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `items.remove`: deletes `target`'s item, with the passphrase as the
+    /// proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_remove(
+        &mut self,
+        target: &TargetView,
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<RemovedView, ClientError> {
+        self.call::<ItemsRemove>(&RemoveParams {
+            slug: target.item.slug.clone(),
+            item: target.item.id.clone(),
+            passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
     }
 }
 

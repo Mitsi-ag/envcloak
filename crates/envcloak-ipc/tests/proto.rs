@@ -385,3 +385,51 @@ fn an_env_file_crosses_as_references_and_names_only() {
         .unwrap_err();
     assert_eq!(e.kind, ErrorKind::InvalidParams);
 }
+
+/// The item methods (T11): `items.add` carries its value to the daemon
+/// intact and prints it nowhere; unknown fields are refused, so a client
+/// cannot slip a value in under another name; and every view a client
+/// prints is a `View`, which a type holding a `WireSecret` cannot be.
+#[test]
+fn item_requests_carry_values_only_where_a_value_goes() {
+    use envcloak_ipc::proto::{AddParams, ItemsAdd, ItemsList, ListParams};
+    use envcloak_ipc::view::{ItemsView, View};
+    let cs = canaries(fresh_seed());
+    let key = by_label(&cs, labels::GITHUB_TOKEN).value();
+    let params = AddParams {
+        slug: Some("github/work".into()),
+        provider: Some("github".into()),
+        field: None,
+        account: None,
+        env_hint: Some("GITHUB_TOKEN".into()),
+        allow_short: false,
+        value: WireSecret::new(SecretBytes::copy_from(key)),
+        claims: Vec::new(),
+    };
+    let f = proto::request_frame::<ItemsAdd>(7, &params).unwrap();
+    let req = IncomingRequest::parse(&f).unwrap();
+    assert_eq!(req.method, "items.add");
+    let got: AddParams = req.params().unwrap();
+    assert!(got.value.as_secret().ct_eq(key));
+    assert_eq!(got.slug.as_deref(), Some("github/work"));
+    assert_no_canary(format!("{got:?} {req:?}").as_bytes(), &cs);
+
+    // A field no method has is refused, whatever it holds.
+    let f = frame(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 8, "method": "items.list",
+        "params": {"long": true, "value": "aGk="}
+    }));
+    let req = IncomingRequest::parse(&f).unwrap();
+    assert_eq!(
+        req.params::<ListParams>().unwrap_err().kind,
+        ErrorKind::InvalidParams
+    );
+    assert_eq!(ItemsList::NAME, "items.list");
+
+    fn is_view<T: View>() {}
+    is_view::<ItemsView>();
+    is_view::<envcloak_ipc::view::ItemView>();
+    is_view::<envcloak_ipc::view::CheckReport>();
+    is_view::<envcloak_ipc::view::RefEditView>();
+    is_view::<envcloak_ipc::view::RemovedView>();
+}

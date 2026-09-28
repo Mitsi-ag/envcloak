@@ -27,8 +27,9 @@ use envcloak_policy::{
 
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
-    ApprovedView, AuditVerifyView, CreatedView, DecisionView, DeniedView, GrantsView, LockedView,
-    RevokedView, StatusView, UnlockedView,
+    AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DecisionView, DeniedView,
+    GrantsView, ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView,
+    TargetView, UnlockedView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -339,8 +340,188 @@ impl Method for AuditVerify {
     type Output = AuditVerifyView;
 }
 
+/// `items.list`: every item's metadata, sorted by slug (`envcloak ls`).
+/// Never a value. The account an item belongs to is personal, so it is
+/// sent only when asked for (`ls --long`).
+#[derive(Debug)]
+pub struct ItemsList;
+
+impl Method for ItemsList {
+    const NAME: &'static str = "items.list";
+    type Params = ListParams;
+    type Output = ItemsView;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListParams {
+    /// Include each item's account.
+    #[serde(default)]
+    pub long: bool,
+}
+
+/// `items.show`: one item's metadata, its account and links included
+/// (`envcloak show`). Never a value.
+#[derive(Debug)]
+pub struct ItemsShow;
+
+impl Method for ItemsShow {
+    const NAME: &'static str = "items.show";
+    type Params = SlugParams;
+    type Output = ItemView;
+}
+
+/// An item by its slug.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlugParams {
+    pub slug: String,
+}
+
+/// `items.check`: whether references resolve to the vault's items
+/// (`envcloak check`): every binding of the manifest the daemon opens
+/// itself, in `[env]` and in each profile, and each reference in `refs`
+/// (an env file's, which the CLI read). Metadata only.
+#[derive(Debug)]
+pub struct ItemsCheck;
+
+impl Method for ItemsCheck {
+    const NAME: &'static str = "items.check";
+    type Params = CheckParams;
+    type Output = CheckView;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckParams {
+    /// The absolute path of `envcloak.toml`, when there is one. The daemon
+    /// opens it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    /// `NAME=<slug>[#field]` references, answered in order.
+    #[serde(default)]
+    pub refs: Vec<String>,
+}
+
+/// `items.add`: a new secret item with one field holding `value` (SPEC
+/// §6.3). Adding needs no proof: nothing is bound to a new item yet
+/// (SPEC §10b "Writes that need a proof").
+#[derive(Debug)]
+pub struct ItemsAdd;
+
+impl Method for ItemsAdd {
+    const NAME: &'static str = "items.add";
+    type Params = AddParams;
+    type Output = AddedView;
+}
+
+/// What `envcloak add` sends: names the person gave, and the value.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddParams {
+    /// The slug; derived from the provider when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// A provider registry id; detected from the value when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The field's name; `value` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// Who owns or pays for the key, such as an email address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The variable the value usually goes in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_hint: Option<String>,
+    /// Values of 8 to 15 bytes may be injected (SPEC §6.1).
+    #[serde(default)]
+    pub allow_short: bool,
+    pub value: WireSecret,
+    /// As [`UnlockParams::claims`], for the audit entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `items.target`: the item a `rotate` or `rm` would change, for the
+/// statement the person reads before giving the passphrase. Served only
+/// to a caller that may give a proof (SPEC §10b), so where none is taken
+/// the command stops before it asks for anything.
+#[derive(Debug)]
+pub struct ItemsTarget;
+
+impl Method for ItemsTarget {
+    const NAME: &'static str = "items.target";
+    type Params = TargetParams;
+    type Output = TargetView;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetParams {
+    pub slug: String,
+    /// The field, when the item has several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `items.rotate`: replaces a field's value, keeping the old one as the
+/// newest of up to three prior values. A proof: the passphrase, from a
+/// terminal subject (SPEC §10b). Grants that bind the item stay.
+#[derive(Debug)]
+pub struct ItemsRotate;
+
+impl Method for ItemsRotate {
+    const NAME: &'static str = "items.rotate";
+    type Params = RotateParams;
+    type Output = RotatedView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateParams {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// The item's id from [`TargetView`]: the rotation is refused when the
+    /// slug names another item by now.
+    pub item: String,
+    pub value: WireSecret,
+    pub passphrase: WireSecret,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `items.remove`: deletes an item, after an encrypted backup of the
+/// vault that keeps its values. A proof, as [`ItemsRotate`]. Grants and
+/// pending requests that bind the item end.
+#[derive(Debug)]
+pub struct ItemsRemove;
+
+impl Method for ItemsRemove {
+    const NAME: &'static str = "items.remove";
+    type Params = RemoveParams;
+    type Output = RemovedView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveParams {
+    pub slug: String,
+    /// As [`RotateParams::item`].
+    pub item: String,
+    pub passphrase: WireSecret,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 11] = [
+pub const CLIENT_METHODS: [&str; 18] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -352,6 +533,13 @@ pub const CLIENT_METHODS: [&str; 11] = [
     GrantsList::NAME,
     GrantsRevoke::NAME,
     AuditVerify::NAME,
+    ItemsList::NAME,
+    ItemsShow::NAME,
+    ItemsCheck::NAME,
+    ItemsAdd::NAME,
+    ItemsTarget::NAME,
+    ItemsRotate::NAME,
+    ItemsRemove::NAME,
 ];
 
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
@@ -462,12 +650,22 @@ pub enum ErrorKind {
     InvalidOptions,
     /// The audit log could not be read.
     AuditUnavailable,
+    /// No item has the slug, or it has no such field; `reason` says which.
+    NoSuchItem,
+    /// An item with the slug exists already.
+    ItemExists,
+    /// A new item's names or a new value are not accepted; `reason` says
+    /// what.
+    InvalidItem,
+    /// The encrypted backup `rm` writes first could not be written, so
+    /// nothing was removed.
+    BackupFailed,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 29] = [
+    pub const ALL: [ErrorKind; 33] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -496,6 +694,10 @@ impl ErrorKind {
         ErrorKind::TooManyGrants,
         ErrorKind::InvalidOptions,
         ErrorKind::AuditUnavailable,
+        ErrorKind::NoSuchItem,
+        ErrorKind::ItemExists,
+        ErrorKind::InvalidItem,
+        ErrorKind::BackupFailed,
         ErrorKind::Internal,
     ];
 
@@ -530,6 +732,10 @@ impl ErrorKind {
             ErrorKind::TooManyGrants => -32022,
             ErrorKind::InvalidOptions => -32023,
             ErrorKind::AuditUnavailable => -32024,
+            ErrorKind::NoSuchItem => -32025,
+            ErrorKind::ItemExists => -32026,
+            ErrorKind::InvalidItem => -32027,
+            ErrorKind::BackupFailed => -32028,
             ErrorKind::Internal => -32099,
         }
     }
@@ -565,6 +771,10 @@ impl ErrorKind {
             ErrorKind::TooManyGrants => "too_many_grants",
             ErrorKind::InvalidOptions => "invalid_options",
             ErrorKind::AuditUnavailable => "audit_unavailable",
+            ErrorKind::NoSuchItem => "no_such_item",
+            ErrorKind::ItemExists => "item_exists",
+            ErrorKind::InvalidItem => "invalid_item",
+            ErrorKind::BackupFailed => "backup_failed",
             ErrorKind::Internal => "internal",
         }
     }
@@ -619,6 +829,13 @@ impl ErrorKind {
             ErrorKind::TooManyGrants => "too many grants are in force; revoke some first",
             ErrorKind::InvalidOptions => "the approval options are out of bounds",
             ErrorKind::AuditUnavailable => "the audit log could not be read",
+            ErrorKind::NoSuchItem => "the vault has no such item or field",
+            ErrorKind::ItemExists => "an item with that slug already exists",
+            ErrorKind::InvalidItem => "the item's names or value are not accepted",
+            ErrorKind::BackupFailed => {
+                "an encrypted backup of the vault could not be written first, so nothing was \
+                 removed"
+            }
             ErrorKind::Internal => "the daemon failed",
         }
     }
@@ -632,8 +849,8 @@ impl ErrorKind {
 /// The detail tokens an error may carry in `data.reason`: why a passphrase
 /// was rejected, why the vault could not be opened, why the caller's
 /// ancestry could not be read, what is wrong with a manifest or a binding,
-/// and what is wrong with approval options.
-pub const REASONS: [&str; 53] = [
+/// what is wrong with approval options, and what is wrong with an item.
+pub const REASONS: [&str; 63] = [
     // Passphrase rules (envcloak_core::PassphraseRejected).
     "not_text",
     "control_character",
@@ -694,6 +911,20 @@ pub const REASONS: [&str; 53] = [
     "pending_total",
     "denials_full",
     "audit_failed",
+    // Items (`items.*`): what is wrong with a name or a value, and a
+    // target that changed. `unknown_item`, `unknown_field`,
+    // `ambiguous_field`, `no_field`, `unknown_item_class` and
+    // `invalid_env_name` are above.
+    "item_changed",
+    "invalid_slug",
+    "invalid_field",
+    "unknown_provider",
+    "invalid_account",
+    "looks_like_value",
+    "empty_value",
+    "nul_byte",
+    "value_too_large",
+    "no_free_slug",
 ];
 
 /// An error response. Built from fixed tokens only.
@@ -702,8 +933,9 @@ pub struct RpcError {
     pub kind: ErrorKind,
     /// One of [`REASONS`], for [`ErrorKind::PassphraseRejected`],
     /// [`ErrorKind::VaultUnavailable`], [`ErrorKind::Evidence`],
-    /// [`ErrorKind::ManifestInvalid`], [`ErrorKind::BindingUnresolved`]
-    /// and [`ErrorKind::InvalidOptions`].
+    /// [`ErrorKind::ManifestInvalid`], [`ErrorKind::BindingUnresolved`],
+    /// [`ErrorKind::InvalidOptions`], [`ErrorKind::NoSuchItem`] and
+    /// [`ErrorKind::InvalidItem`].
     pub reason: Option<&'static str>,
 }
 
