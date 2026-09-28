@@ -355,8 +355,12 @@ pub struct AuditVerifyView {
     /// The entries after the anchor (all of them when there is none):
     /// entries removed from their end would not be noticed.
     pub unanchored_tail: Option<SeqRange>,
-    /// The log ends in an entry cut short by a crash (never acknowledged).
+    /// The log ends in what a crash in the middle of an append leaves:
+    /// part of one entry, or of a new segment's header, with no whole entry
+    /// in it and not covered by the saved head. Anything else is a problem.
     pub torn_tail: bool,
+    /// How many bytes that is.
+    pub torn_bytes: u64,
     /// Whether the log still ends where the daemon last wrote it. `None`
     /// when the daemon has not written to it since it was unlocked.
     pub live_head_matches: Option<bool>,
@@ -467,6 +471,7 @@ impl From<&envcloak_core::audit::VerifyReport> for AuditVerifyView {
                 .unanchored_tail
                 .map(|(first, last)| SeqRange { first, last }),
             torn_tail: r.torn_tail,
+            torn_bytes: r.torn_bytes,
             live_head_matches: None,
             queued: 0,
             dropped: 0,

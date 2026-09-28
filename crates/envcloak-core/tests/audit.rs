@@ -21,8 +21,8 @@ use common::{Fixture, name, secret_item};
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::{
     AnchorCheck, AuditIo, AuditKind, AuditRecord, AuditWriter, DecisionSummary, HEADER_LEN,
-    MAX_SEGMENT, OsIo, Problem, ProblemKind, ProjectSummary, SubjectSummary, VerifyReport,
-    read_entries, verify,
+    MAX_ENTRY, MAX_SEGMENT, OsIo, Problem, ProblemKind, ProjectSummary, SubjectSummary,
+    VerifyReport, read_entries, verify,
 };
 use envcloak_core::crypto::Keyring;
 use envcloak_core::vault::{AuditHead, INITIAL_EPOCH, ItemId, Slug};
@@ -542,9 +542,11 @@ fn the_writer_removes_a_torn_entry_and_goes_on() {
     let r = log.verify(None);
     assert!(r.ok(), "{r:?}");
     assert!(r.torn_tail);
+    assert_eq!(r.torn_bytes, 40);
 
     let (mut w, report) = AuditWriter::open(&log.dir, &log.keys, None).unwrap();
     assert!(report.torn_tail_removed);
+    assert_eq!(report.torn_bytes, 40);
     assert!(!report.damaged);
     assert_eq!(std::fs::metadata(&seg).unwrap().len(), whole as u64);
     assert_eq!(w.append(&record(4)).unwrap(), 4);
@@ -792,4 +794,152 @@ fn a_renamed_segment_or_directory_takes_no_entry_with_it() {
     let r = log.verify(None);
     assert_eq!(problem(&r), Some((1, ProblemKind::Missing)), "{r:?}");
     assert_eq!(r.last_seq, 6);
+}
+
+/// A whole entry whose length field was made larger than the bytes left
+/// looks like a write cut short, but is not one: its chain value is where
+/// the entry really ends, before the next entry's number or at the end of
+/// the file. It is flagged where it is, and the writer removes nothing,
+/// with or without a saved head. A cut that the saved head covers is not a
+/// crash's either (the entry was acknowledged): it is flagged and kept.
+/// The same cut with no saved head over it is a torn tail.
+#[test]
+fn a_changed_length_or_a_cut_the_anchor_covers_is_kept_as_damage() {
+    let log = Log::new();
+    let mut w = log.writer(None);
+    fill(&mut w, 1, 10);
+    let anchor = w.head_record();
+    drop(w);
+    let seg = log.segments().pop().unwrap();
+    let orig = std::fs::read(&seg).unwrap();
+    let fr = frames(&orig);
+    let reset = |bytes: &[u8]| {
+        for s in log.segments() {
+            std::fs::remove_file(s).unwrap();
+        }
+        std::fs::write(&seg, bytes).unwrap();
+    };
+
+    let mut seventh_inflated = orig.clone();
+    let big = u32::try_from(MAX_ENTRY).unwrap().to_be_bytes();
+    seventh_inflated[fr[6].1.start..fr[6].1.start + 4].copy_from_slice(&big);
+    let mut last_inflated = orig.clone();
+    let at = fr[9].1.start;
+    let len = u32::from_be_bytes(orig[at..at + 4].try_into().unwrap());
+    last_inflated[at..at + 4].copy_from_slice(&(len + 1).to_be_bytes());
+    let cut = orig[..fr[9].1.end - 10].to_vec();
+
+    for (what, bytes, anchor, seq) in [
+        ("entry 7's length inflated", &seventh_inflated, None, 7),
+        (
+            "the same, under a saved head",
+            &seventh_inflated,
+            Some(anchor),
+            7,
+        ),
+        ("the last entry's length inflated", &last_inflated, None, 10),
+        (
+            "the last entry cut, under a saved head",
+            &cut,
+            Some(anchor),
+            10,
+        ),
+    ] {
+        reset(bytes);
+        let r = log.verify(anchor);
+        assert_eq!(
+            problem(&r),
+            Some((seq, ProblemKind::Unreadable)),
+            "{what}: {r:?}"
+        );
+        assert!(!r.torn_tail, "{what}: {r:?}");
+        let (mut w, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+        assert!(
+            report.damaged && !report.torn_tail_removed,
+            "{what}: {report:?}"
+        );
+        assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{what}: kept");
+        w.append(&record(11)).unwrap();
+        assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{what}: kept");
+        let r = log.verify(anchor);
+        assert_eq!(problem(&r).map(|p| p.0), Some(seq), "{what}: {r:?}");
+    }
+
+    // The same cut with no saved head over it: what a crash leaves.
+    reset(&cut);
+    let r = log.verify(None);
+    assert!(r.ok() && r.torn_tail, "{r:?}");
+    let torn = (fr[9].1.len() - 10) as u64;
+    assert_eq!(r.torn_bytes, torn);
+    let (_, report) = AuditWriter::open(&log.dir, &log.keys, None).unwrap();
+    assert!(report.torn_tail_removed && !report.damaged, "{report:?}");
+    assert_eq!(report.torn_bytes, torn);
+    assert_eq!(std::fs::read(&seg).unwrap(), &orig[..fr[9].1.start]);
+}
+
+/// Codex review: a crash while the writer makes a segment (the first
+/// append of a log, or a rollover) leaves an empty file, part of its
+/// header, or zeros as the last segment. That is a torn tail, not damage:
+/// the check passes, and the writer removes the file and makes it again.
+/// Bytes that are not the start of the header the writer would write, or
+/// a segment the saved head covers, are damage and are kept.
+#[test]
+fn a_crash_while_a_segment_is_made_is_a_torn_tail() {
+    let log = Log::new();
+    // One entry per segment: segment 4's header is the one the writer
+    // writes after entry 3.
+    let mut w = log.writer_with(Shim::default(), 1);
+    fill(&mut w, 1, 3);
+    let three = w.head_record();
+    fill(&mut w, 4, 1);
+    let four = w.head_record();
+    drop(w);
+    let segs = log.segments();
+    assert_eq!(segs.len(), 4);
+    let fourth = segs[3].clone();
+    let header = std::fs::read(&fourth).unwrap()[..HEADER_LEN].to_vec();
+
+    for (what, bytes, anchor) in [
+        ("an empty file", Vec::new(), None),
+        ("part of the header", header[..40].to_vec(), Some(three)),
+        ("all but a byte", header[..HEADER_LEN - 1].to_vec(), None),
+        ("zeros", vec![0; HEADER_LEN], Some(three)),
+    ] {
+        std::fs::write(&fourth, &bytes).unwrap();
+        let r = log.verify(anchor);
+        assert!(r.ok() && r.torn_tail, "{what}: {r:?}");
+        assert_eq!(r.torn_bytes, bytes.len() as u64, "{what}");
+        let (mut w, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+        assert!(
+            report.torn_tail_removed && !report.damaged,
+            "{what}: {report:?}"
+        );
+        assert_eq!(report.torn_bytes, bytes.len() as u64, "{what}");
+        assert!(!fourth.exists(), "{what}: removed");
+        assert_eq!(w.append(&record(4)).unwrap(), 4, "{what}");
+        let r = log.verify(anchor);
+        assert!(r.ok() && !r.torn_tail && r.last_seq == 4, "{what}: {r:?}");
+    }
+
+    let mut changed = header[..40].to_vec();
+    changed[20] ^= 0x01;
+    for (what, bytes, anchor) in [
+        ("a changed byte", changed, Some(three)),
+        ("under a saved head", header[..40].to_vec(), Some(four)),
+    ] {
+        std::fs::write(&fourth, &bytes).unwrap();
+        let r = log.verify(anchor);
+        assert_eq!(
+            problem(&r),
+            Some((4, ProblemKind::SegmentDamaged)),
+            "{what}: {r:?}"
+        );
+        assert!(!r.torn_tail, "{what}: {r:?}");
+        let (_, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+        assert!(
+            report.damaged && !report.torn_tail_removed,
+            "{what}: {report:?}"
+        );
+        assert_eq!(std::fs::read(&fourth).unwrap(), bytes, "{what}: kept");
+    }
 }

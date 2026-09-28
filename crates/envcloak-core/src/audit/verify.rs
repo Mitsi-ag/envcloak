@@ -2,8 +2,9 @@
 //! holds from the first entry to the last, the sequence numbers run
 //! without a gap, and the head saved in the vault's header is in it.
 //!
-//! The walk reads the segments in the order of their names. For each
-//! entry it expects the next sequence number and the chain value after
+//! The walk reads the segments in the order of their names, one at a
+//! time (only one segment is in memory, with the numbers of any entries
+//! found out of place). For each entry it expects the next sequence number and the chain value after
 //! the entry before. The first thing that does not match is reported at
 //! the sequence number where it shows:
 //! - an entry that does not open (its bytes, or its number, were changed):
@@ -34,13 +35,14 @@ use std::path::{Path, PathBuf};
 
 use subtle::ConstantTimeEq;
 
-use crate::crypto::Keyring;
+use crate::crypto::{Keyring, Sealed};
 use crate::vault::AuditHead;
 
 use super::AuditError;
 use super::record::AuditRecord;
 use super::segment::{
-    HEADER_LEN, LogKeys, Next, list_segments, next_frame, parse_header, read_segment,
+    FRAME_HEAD, HEADER_LEN, LogKeys, MAC_LEN, Next, list_segments, next_frame, parse_header,
+    read_segment,
 };
 
 /// What went wrong at a sequence number.
@@ -120,9 +122,15 @@ pub struct VerifyReport {
     /// (first, last): entries removed from the end of these would not be
     /// noticed.
     pub unanchored_tail: Option<(u64, u64)>,
-    /// The last segment ends in an entry cut short by a crash. It was never
-    /// acknowledged; the writer removes it when it next opens the log.
+    /// The last segment ends in what a crash in the middle of an append
+    /// leaves: part of one entry, or of a new segment's header. These bytes
+    /// are counted as that only when no whole entry is in them (none ends
+    /// at the end of the file or where the next entry's number starts) and
+    /// the saved head does not cover them; anything else is flagged as a
+    /// problem. The writer removes them when it next opens the log.
     pub torn_tail: bool,
+    /// How many bytes that is.
+    pub torn_bytes: u64,
     /// The chain's head at the end of the walk: the last sequence number
     /// and chain value. The daemon compares it with its own.
     pub head: (u64, [u8; 32]),
@@ -149,9 +157,11 @@ pub(crate) struct LastSegment {
     /// From its name.
     pub(crate) first_seq: u64,
     pub(crate) len: u64,
-    /// Just past its last whole entry (or its header).
+    /// Just past its last whole entry (or its header); 0 when its header
+    /// was cut short.
     pub(crate) good_len: u64,
-    /// It ends in an entry cut short (the bytes from `good_len` on).
+    /// It ends in what a crash leaves (the bytes from `good_len` on; see
+    /// [`VerifyReport::torn_tail`]).
     pub(crate) torn: bool,
     /// Its header authenticated and its own entries checked out.
     pub(crate) clean: bool,
@@ -214,12 +224,17 @@ struct Walker<'a> {
     keys: &'a LogKeys,
     anchor: Option<AuditHead>,
     anchor_state: Option<AnchorCheck>,
-    /// Every sequence number in the log, to tell a missing entry from a
-    /// misplaced one; empty when not classifying.
-    all: HashSet<u64>,
+    /// The sequence numbers of entries found after the place where they
+    /// belong. The number the walk expects only grows, so a number that
+    /// does not come where it should can only come later: it was reordered
+    /// when it is here at the end of the walk, and is missing otherwise.
+    late: HashSet<u64>,
     expected: u64,
     h: [u8; 32],
     first_problem: Option<Problem>,
+    /// The first problem is a number that did not come where it should:
+    /// missing or reordered, decided at the end of the walk.
+    first_absent: bool,
     problems: u64,
     entries: u64,
     last_seq: u64,
@@ -233,12 +248,8 @@ impl Walker<'_> {
 
     /// Entry `seq` is not where it should be: missing, or later.
     fn absent(&mut self, seq: u64) {
-        let kind = if self.all.contains(&seq) {
-            ProblemKind::Reordered
-        } else {
-            ProblemKind::Missing
-        };
-        self.flag(kind, seq);
+        self.first_absent |= self.first_problem.is_none();
+        self.flag(ProblemKind::Missing, seq);
     }
 
     /// Checks the anchor against the chain value `mac` after entry `seq`.
@@ -254,6 +265,61 @@ impl Walker<'_> {
             self.flag(ProblemKind::AnchorMismatch, seq);
         }
     }
+
+    /// Whether the saved head names entry `seq` or a later one: then entry
+    /// `seq` was acknowledged, and no crash can have cut it short.
+    fn anchored(&self, seq: u64) -> bool {
+        self.anchor.is_some_and(|a| a.seq >= seq)
+    }
+
+    /// Whether `rest`, the bytes at the end of the last segment that do
+    /// not hold the whole frame they start, is what a crash in the middle
+    /// of an append leaves: part of the next entry, which the saved head
+    /// does not cover, with no whole entry in it. A whole entry whose
+    /// length was changed is not that: its chain value is where it ends,
+    /// at the end of the file or where the next entry's number starts.
+    fn crash_tail(&self, rest: &[u8]) -> bool {
+        let seq = self.expected;
+        if self.anchored(seq) {
+            return false;
+        }
+        let min = FRAME_HEAD + Sealed::OVERHEAD + MAC_LEN;
+        if rest.len() < min {
+            return true;
+        }
+        let next = seq.wrapping_add(1).to_be_bytes();
+        let starts =
+            (min..=rest.len() - FRAME_HEAD).filter(|&p| rest[p + 4..p + FRAME_HEAD] == next);
+        !std::iter::once(rest.len()).chain(starts).any(|end| {
+            let sealed = &rest[FRAME_HEAD..end - MAC_LEN];
+            let computed = self.keys.chain(&self.h, seq, sealed);
+            bool::from(computed.ct_eq(&rest[end - MAC_LEN..end]))
+        })
+    }
+
+    /// Whether `data`, the last segment, whose header does not
+    /// authenticate, is what a crash while the writer created it leaves:
+    /// no longer than a header, all zeros or the start of the header the
+    /// writer would have written, and not covered by the saved head.
+    fn torn_header(&self, name_seq: u64, data: &[u8]) -> bool {
+        if data.len() > HEADER_LEN || self.anchored(name_seq) {
+            return false;
+        }
+        if data.iter().all(|&b| b == 0) {
+            return true;
+        }
+        // The writer chains a new segment on from its head: where the walk
+        // ended, or the saved head when the log ended before it.
+        let mut prevs = vec![self.h];
+        if let Some(a) = self.anchor {
+            if a.seq.checked_add(1) == Some(name_seq) {
+                prevs.push(a.mac);
+            }
+        }
+        prevs
+            .iter()
+            .any(|p| self.keys.header(name_seq, p).starts_with(data))
+    }
 }
 
 pub(crate) fn walk_with(
@@ -264,47 +330,41 @@ pub(crate) fn walk_with(
     on_entry: &mut dyn FnMut(u64, AuditRecord),
 ) -> Result<Walk, AuditError> {
     let segs = list_segments(dir)?;
-    let datas: Vec<Option<Vec<u8>>> = segs.iter().map(|(_, p)| read_segment(p).ok()).collect();
     let mut w = Walker {
         keys,
         anchor,
         anchor_state: None,
-        all: HashSet::new(),
+        late: HashSet::new(),
         expected: 1,
         h: keys.genesis(),
         first_problem: None,
+        first_absent: false,
         problems: 0,
         entries: 0,
         last_seq: 0,
     };
-    if open {
-        for data in datas.iter().flatten() {
-            let mut at = HEADER_LEN;
-            while let Next::Frame(f) = next_frame(data, at) {
-                w.all.insert(f.seq);
-                at = f.end;
-            }
-        }
-    }
     let genesis = w.h;
     w.anchor_at(0, &genesis);
-    let mut torn_tail = false;
+    let mut torn_bytes = None;
     let mut last = None;
-    for (i, ((name_seq, path), data)) in segs.iter().zip(&datas).enumerate() {
+    for (i, (name_seq, path)) in segs.iter().enumerate() {
         let is_last = i + 1 == segs.len();
-        let (clean, good_len, len, torn) = match data {
-            Some(data) => {
+        // One segment in memory at a time.
+        let (clean, good_len, len, torn) = match read_segment(path) {
+            Ok(data) => {
                 let (clean, good, torn) =
-                    walk_segment(&mut w, *name_seq, data, is_last, open, on_entry);
-                torn_tail |= torn;
+                    walk_segment(&mut w, *name_seq, &data, is_last, open, on_entry);
                 (clean, good as u64, data.len() as u64, torn)
             }
-            None => {
+            Err(_) => {
                 let at = w.expected;
                 w.flag(ProblemKind::SegmentDamaged, at);
                 (false, 0, 0, false)
             }
         };
+        if torn {
+            torn_bytes = Some(len - good_len);
+        }
         if is_last {
             last = Some(LastSegment {
                 path: path.clone(),
@@ -333,15 +393,26 @@ pub(crate) fn walk_with(
         AnchorCheck::Matched { seq } if w.last_seq > seq => Some((seq + 1, w.last_seq)),
         _ => None,
     };
+    let first_problem = w.first_problem.map(|p| {
+        if w.first_absent && w.late.contains(&p.seq) {
+            Problem {
+                kind: ProblemKind::Reordered,
+                ..p
+            }
+        } else {
+            p
+        }
+    });
     let report = VerifyReport {
         segments: segs.len(),
         entries: w.entries,
         last_seq: w.last_seq,
-        first_problem: w.first_problem,
+        first_problem,
         problems: w.problems,
         anchor: anchor_state,
         unanchored_tail,
-        torn_tail,
+        torn_tail: torn_bytes.is_some(),
+        torn_bytes: torn_bytes.unwrap_or(0),
         head: (w.expected - 1, w.h),
     };
     Ok(Walk {
@@ -353,7 +424,8 @@ pub(crate) fn walk_with(
 }
 
 /// Walks one segment. Returns whether it is clean, the offset past its
-/// last whole entry, and whether it ends in a torn entry.
+/// last whole entry (0 when its header is torn), and whether it ends in
+/// what a crash leaves (see [`VerifyReport::torn_tail`]).
 fn walk_segment(
     w: &mut Walker<'_>,
     name_seq: u64,
@@ -365,6 +437,7 @@ fn walk_segment(
     let mut clean = true;
     let mut at = HEADER_LEN.min(data.len());
     match parse_header(data, w.keys) {
+        None if is_last && w.torn_header(name_seq, data) => return (false, 0, true),
         None => {
             let seq = w.expected;
             w.flag(ProblemKind::SegmentDamaged, seq);
@@ -403,7 +476,7 @@ fn walk_segment(
     loop {
         match next_frame(data, at) {
             Next::End => return (clean, at, false),
-            Next::Torn if is_last => return (clean, at, true),
+            Next::Torn if is_last && w.crash_tail(&data[at..]) => return (clean, at, true),
             Next::Torn | Next::Unreadable => {
                 let seq = w.expected;
                 w.flag(ProblemKind::Unreadable, seq);
@@ -413,6 +486,7 @@ fn walk_segment(
                 w.entries += 1;
                 at = f.end;
                 if f.seq < w.expected {
+                    w.late.insert(f.seq);
                     w.flag(ProblemKind::Reordered, f.seq);
                     clean = false;
                     continue;

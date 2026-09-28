@@ -124,10 +124,17 @@ fn print_human(v: &AuditVerifyView) {
             );
         }
     }
-    if v.torn_tail {
+    if v.torn_tail && v.torn_bytes == 0 {
         println!(
-            "note: the last entry was cut short by a crash; it was never acknowledged, and is \
-             removed when the log is next opened"
+            "note: the log ends in an empty segment file, as a crash while a segment is made \
+             leaves it; it is removed when the log is next opened"
+        );
+    } else if v.torn_tail {
+        println!(
+            "note: the log ends in {} as a crash in the middle of a write leaves them (part of \
+             one entry, or of a segment's header): no whole entry is in them and the saved head \
+             does not cover them; they are removed when the log is next opened",
+            plural(v.torn_bytes, "byte", "bytes")
         );
     }
     if v.live_head_matches == Some(false) {

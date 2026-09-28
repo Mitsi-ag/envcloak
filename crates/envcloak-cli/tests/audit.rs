@@ -120,6 +120,26 @@ fn audit_verify_reports_the_chain_the_anchor_and_tampering() {
         "{}",
         stderr(&bad)
     );
+
+    // Entry 2 as it was, then the start of an entry after entry 3: what a
+    // crash in the middle of a write leaves. It is noted with its size,
+    // and the check passes.
+    b[second + 12 + 30] ^= 0x04;
+    let mut torn = 200u32.to_be_bytes().to_vec();
+    torn.extend_from_slice(&4u64.to_be_bytes());
+    torn.extend_from_slice(&[0; 8]);
+    std::fs::write(&seg, [b, torn].concat()).unwrap();
+    let noted = run(&home, &["audit", "verify"], &[]);
+    clean(&noted);
+    assert!(noted.status.success(), "{}", stderr(&noted));
+    assert!(
+        stdout(&noted).contains(
+            "note: the log ends in 20 bytes as a crash in the middle of a write leaves them"
+        ),
+        "{}",
+        stdout(&noted)
+    );
+
     let usage = run(&home, &["audit", "list"], &[]);
     assert_eq!(usage.status.code(), Some(2));
     assert_no_canary(&d.log_bytes(), &cs);

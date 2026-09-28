@@ -149,7 +149,7 @@ impl LogKeys {
 
     /// A segment header for entries from `first_seq` on, after the chain
     /// value `prev_mac`.
-    fn header(&self, first_seq: u64, prev_mac: &[u8; 32]) -> [u8; HEADER_LEN] {
+    pub(crate) fn header(&self, first_seq: u64, prev_mac: &[u8; 32]) -> [u8; HEADER_LEN] {
         let mut h = [0u8; HEADER_LEN];
         let mut at = 0;
         for part in [
@@ -341,10 +341,13 @@ impl AuditIo for OsIo {
 /// finding as a [`super::AuditKind::Log`] entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenReport {
-    /// The last segment ended in an entry cut short by a crash; the bytes
-    /// were removed. It was never acknowledged, so nothing was released
-    /// for it.
+    /// The last segment ended in what a crash in the middle of an append
+    /// leaves (see [`super::VerifyReport::torn_tail`]), and those bytes
+    /// were removed: part of one entry, or of a new segment's header. No
+    /// whole entry was in them and the saved head did not cover them.
     pub torn_tail_removed: bool,
+    /// How many bytes were removed.
+    pub torn_bytes: u64,
     /// The log has damage (it fails [`super::verify`]); new entries go to
     /// a new segment and chain on from what is there.
     pub damaged: bool,
@@ -464,14 +467,25 @@ impl AuditWriter {
             }
         }
         if let Some(last) = w.last {
-            if last.torn && last.good_len < last.len {
-                // A frame cut short by a crash, never acknowledged: remove
-                // it, whether or not the writer continues this segment.
-                // Damage is left as it is, for the check to report.
+            if last.torn && last.good_len < HEADER_LEN as u64 {
+                // A segment whose header a crash cut short: no entry was
+                // ever in it. Remove it; the next append makes it again.
+                std::fs::remove_file(&last.path)?;
+                writer.io.sync(&File::open(dir)?)?;
+                report.torn_tail_removed = true;
+                report.torn_bytes = last.len;
+            } else if last.torn && last.good_len < last.len {
+                // Part of one frame, as a crash in the middle of an append
+                // leaves it (the walk checked that no whole entry is in it
+                // and that the saved head does not cover it): remove it,
+                // whether or not the writer continues this segment.
+                // Anything else is damage, left as it is for the check to
+                // report.
                 let f = open_append(&last.path)?;
                 f.set_len(last.good_len)?;
                 writer.io.sync(&f)?;
                 report.torn_tail_removed = true;
+                report.torn_bytes = last.len - last.good_len;
             }
             let reusable = last.clean
                 && report.behind_anchor.is_none()

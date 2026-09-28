@@ -523,7 +523,7 @@ fn findings(r: &OpenReport) -> Vec<AuditRecord> {
         ..AuditRecord::new(AuditKind::Log, outcome)
     };
     if r.torn_tail_removed {
-        out.push(log("torn_tail_removed", None));
+        out.push(log("torn_tail_removed", Some(r.torn_bytes)));
     }
     if r.damaged {
         out.push(log("damaged", None));
