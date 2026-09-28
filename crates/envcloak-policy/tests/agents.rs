@@ -406,6 +406,63 @@ fn an_extension_cannot_take_anything_away() {
     assert_eq!(cat.agent_for_marker("X_MARK").unwrap().name, "Claude Code");
 }
 
+/// Review finding F-36: arguments read only because an extension names an
+/// interpreter are not builtin evidence. A match on them, even against a
+/// builtin pattern, is an extension match, whether on `argv[0]` or on a
+/// script under a builtin interpreter's name.
+#[test]
+fn arguments_read_for_an_extension_interpreter_are_extension_evidence() {
+    let (root, dir) = data_dir();
+    write(&dir, "holder.toml", "interpreters = [\"review-holder\"]\n");
+    let cat = AgentCatalog::load(root.path());
+    assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+    let builtin = AgentCatalog::builtin();
+    for (argv, id) in [
+        (&["codex", "serve"][..], "codex"),
+        (
+            &["node", "/opt/x/@anthropic-ai/claude-code/cli.js"][..],
+            "claude-code",
+        ),
+        (
+            &["/usr/bin/node", "/usr/local/bin/claude"][..],
+            "claude-code",
+        ),
+    ] {
+        let p = proc_with(
+            Some("/opt/tools/review-holder"),
+            "review-holder",
+            Some(argv),
+        );
+        // The builtin catalog neither reads nor uses these arguments.
+        assert!(!builtin.needs_argv(&p), "{argv:?}");
+        assert_eq!(builtin.classify(&p), None, "{argv:?}");
+        // With the extension, they are read, and what matches is labeled
+        // an extension match.
+        assert!(cat.needs_argv(&p), "{argv:?}");
+        let l = cat.classify(&p).unwrap();
+        assert_eq!(
+            (l.id.as_str(), l.source),
+            (id, CatalogSource::Extension),
+            "{argv:?}"
+        );
+    }
+    // The builtin reasons to read arguments still give builtin matches: a
+    // builtin interpreter, and a hidden executable.
+    let node = proc_with(
+        Some("/usr/bin/node"),
+        "node",
+        Some(&["node", "/opt/x/@anthropic-ai/claude-code/cli.js"]),
+    );
+    let l = cat.classify(&node).unwrap();
+    assert_eq!(
+        (l.id.as_str(), l.source),
+        ("claude-code", CatalogSource::Builtin)
+    );
+    let hidden = proc_with(None, "x", Some(&["/opt/vendor/codex"]));
+    let l = cat.classify(&hidden).unwrap();
+    assert_eq!((l.id.as_str(), l.source), ("codex", CatalogSource::Builtin));
+}
+
 #[test]
 fn malformed_extensions_are_skipped_and_reported_by_kind_and_line() {
     let (root, dir) = data_dir();

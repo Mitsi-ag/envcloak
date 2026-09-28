@@ -16,7 +16,10 @@
 //!   ([`CatalogSource`]): an agent matched only through an extension is a
 //!   grant root only at or below the caller's session leader
 //!   (`crate::SubjectEvidence`), so an extension that matches a terminal
-//!   emulator or `launchd` cannot widen a grant.
+//!   emulator or `launchd` cannot widen a grant. That includes a match on
+//!   arguments read only because an extension names an interpreter: the
+//!   builtin pass uses arguments only where the builtin catalog alone
+//!   would read them.
 //!
 //! Classification is evidence, and it only tightens: a process wrongly
 //! matched is handled as an agent (stricter), and a missed agent is the
@@ -435,19 +438,17 @@ impl AgentCatalog {
         })
     }
 
-    /// Whether `p` looks like an interpreter by its executable, `argv[0]` or
-    /// command name. Extension interpreters count only when `extensions` is
-    /// set.
-    fn interpreter(&self, p: &ProcInfo, extensions: bool) -> bool {
+    /// Whether `p` looks like an interpreter by its executable or command
+    /// name, or by `argv[0]` when `argv` is given. Extension interpreters
+    /// count only when `extensions` is set.
+    fn interpreter(&self, p: &ProcInfo, extensions: bool, argv: Option<&[OsString]>) -> bool {
         let names = [
             p.exe
                 .as_ref()
                 .and_then(|e| e.path.file_name())
                 .map(OsStr::as_bytes),
             Some(p.comm.as_bytes()),
-            p.argv
-                .as_ref()
-                .and_then(|a| a.first())
+            argv.and_then(|a| a.first())
                 .map(|a| last_component(a.as_bytes())),
         ];
         self.interpreters
@@ -456,31 +457,49 @@ impl AgentCatalog {
             .any(|(i, _)| names.iter().flatten().any(|n| *n == i.as_slice()))
     }
 
+    /// Whether the catalog reads `p`'s arguments: its executable is hidden
+    /// (so `argv[0]` stands in for it), or its executable or command name
+    /// is an interpreter (so its script decides). Extension interpreters
+    /// count only when `extensions` is set.
+    fn reads_argv(&self, p: &ProcInfo, extensions: bool) -> bool {
+        p.exe.is_none() || self.interpreter(p, extensions, None)
+    }
+
     /// Whether classifying `p` needs its arguments: its executable is
-    /// hidden (so `argv[0]` stands in for it), or it runs an interpreter
-    /// (so its script decides).
+    /// hidden (so `argv[0]` stands in for it), or it runs an interpreter,
+    /// builtin or from an extension (so its script decides).
     pub fn needs_argv(&self, p: &ProcInfo) -> bool {
-        p.exe.is_none() || self.interpreter(p, true)
+        self.reads_argv(p, true)
     }
 
     /// The agent `p` is, if any. Builtin entries are tried first; the
     /// label's [`AgentLabel::source`] says whether one matched.
+    ///
+    /// Each pass uses `p`'s arguments only where that pass's catalog would
+    /// read them itself ([`AgentCatalog::needs_argv`] reads them for either
+    /// pass). Arguments read only because an extension names an
+    /// interpreter are not builtin evidence: a match on them (its `argv[0]`
+    /// or its script, even against a builtin pattern) is an extension
+    /// match, which cannot root a grant above the caller's session
+    /// (review finding F-36).
     pub fn classify(&self, p: &ProcInfo) -> Option<AgentLabel> {
         for source in [CatalogSource::Builtin, CatalogSource::Extension] {
             let extensions = source == CatalogSource::Extension;
-            let interpreter = self.interpreter(p, extensions);
+            let argv = if self.reads_argv(p, extensions) {
+                p.argv.as_deref()
+            } else {
+                None
+            };
+            let interpreter = self.interpreter(p, extensions, argv);
             let scripts = if interpreter {
-                script_args(p)
+                script_args(argv)
             } else {
                 Vec::new()
             };
             let names: Vec<&[u8]> = [
                 p.exe.as_ref().map(|e| e.path.as_os_str().as_bytes()),
                 Some(p.comm.as_bytes()),
-                p.argv
-                    .as_ref()
-                    .and_then(|a| a.first())
-                    .map(|a| a.as_bytes()),
+                argv.and_then(|a| a.first()).map(|a| a.as_bytes()),
             ]
             .into_iter()
             .flatten()
@@ -568,8 +587,8 @@ fn last_component(path: &[u8]) -> &[u8] {
 /// The arguments of an interpreter that may name its script: the first
 /// [`SCRIPT_ARGS`] that are not options, among the first
 /// [`SCRIPT_ARGS_SCANNED`] after `argv[0]`.
-fn script_args(p: &ProcInfo) -> Vec<&[u8]> {
-    let Some(argv) = &p.argv else {
+fn script_args(argv: Option<&[OsString]>) -> Vec<&[u8]> {
+    let Some(argv) = argv else {
         return Vec::new();
     };
     argv.iter()

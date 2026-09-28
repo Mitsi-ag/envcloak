@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use envcloak_policy::{
-    AgentCatalog, AgentLabel, Ancestor, CatalogSource, ChainEnd, Claims, EvidenceError,
+    AGENTS_DIR, AgentCatalog, AgentLabel, Ancestor, CatalogSource, ChainEnd, Claims, EvidenceError,
     GATHER_ATTEMPTS, ProcessInstance, SubjectEvidence, SubjectKind, gather_in,
 };
 use envcloak_sys::{
@@ -507,6 +508,102 @@ fn an_agent_above_the_cut_is_not_forgotten() {
     let e = gather_in(&mut t, &peer(2000), Claims::none(), &cat).unwrap();
     assert!(!e.cut(), "{}", e.chain().len());
     assert_eq!(e.label().unwrap().id, "claude-code");
+}
+
+/// The builtin catalog plus one extension file holding `text`, in a
+/// private `agents.d`.
+fn catalog_with(text: &str) -> (tempfile::TempDir, AgentCatalog) {
+    let root = tempfile::Builder::new()
+        .prefix("ece")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let dir = root.path().join(AGENTS_DIR);
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = dir.join("x.toml");
+    std::fs::write(&file, text).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let cat = AgentCatalog::load(root.path());
+    assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+    (root, cat)
+}
+
+/// Review finding F-36: an ancestor above the caller's session (200, a
+/// `review-holder` whose arguments name an agent) is read and classified
+/// because an extension calls `review-holder` an interpreter. It is an
+/// extension match, so it roots no grant above the caller's session, and
+/// a grant rooted at it covers no caller in a sibling session.
+///
+/// envcloak (320) <- zsh (300, a session leader) <- review-holder (200) <-
+/// launchd, and beside it envcloak (330) <- zsh (310, another session
+/// leader) <- review-holder (200).
+#[test]
+fn an_extension_interpreter_does_not_widen_the_root() {
+    let (_dir, ext) = catalog_with("interpreters = [\"review-holder\"]\n");
+    let builtin = AgentCatalog::builtin();
+    for argv in [
+        vec!["codex", "serve"],
+        vec!["node", "/opt/x/@anthropic-ai/claude-code/cli.js"],
+    ] {
+        let table = || {
+            Table::default()
+                .add(vec![info(
+                    320,
+                    300,
+                    300,
+                    501,
+                    Some("/usr/local/bin/envcloak"),
+                )])
+                .add(vec![info(300, 200, 300, 501, Some("/bin/zsh"))])
+                .add(vec![info(
+                    330,
+                    310,
+                    310,
+                    501,
+                    Some("/usr/local/bin/envcloak"),
+                )])
+                .add(vec![info(310, 200, 310, 501, Some("/bin/zsh"))])
+                .add(vec![info(
+                    200,
+                    1,
+                    200,
+                    501,
+                    Some("/opt/tools/review-holder"),
+                )])
+                .add(vec![info(1, 0, 1, 0, Some("/sbin/launchd"))])
+                .with_argv(200, argv.clone())
+        };
+        // Without the extension its arguments are not read.
+        let mut t = table();
+        let e = gather_in(&mut t, &peer(320), Claims::none(), &builtin).unwrap();
+        assert!(t.argv_reads.is_empty());
+        assert!(e.nearest_agent().is_none());
+        assert_eq!(e.root().pid, 300);
+
+        // With it they are, and the match is an extension's.
+        let mut t = table();
+        let e = gather_in(&mut t, &peer(320), Claims::none(), &ext).unwrap();
+        assert_eq!(t.argv_reads, [200], "{argv:?}");
+        let (n, l) = e.nearest_agent().unwrap();
+        assert_eq!((n, l.source), (2, CatalogSource::Extension), "{argv:?}");
+        assert_eq!(e.kind(), SubjectKind::Agent);
+        assert_eq!(e.root().pid, 300, "{argv:?}");
+        let holder = e.chain()[2].instance.clone();
+        assert!(!e.covered_by(&holder, SubjectKind::Agent));
+
+        // A caller in the sibling session is not covered by a grant rooted
+        // at 200 either.
+        let mut t = table();
+        let sibling = gather_in(&mut t, &peer(330), Claims::none(), &ext).unwrap();
+        assert_eq!(sibling.root().pid, 310);
+        for kind in [
+            SubjectKind::Agent,
+            SubjectKind::Unknown,
+            SubjectKind::Terminal,
+        ] {
+            assert!(!sibling.covered_by(&holder, kind), "{argv:?} {kind:?}");
+        }
+    }
 }
 
 #[test]

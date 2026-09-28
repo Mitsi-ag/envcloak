@@ -55,7 +55,7 @@ Users add agents in `<data>/agents.d/*.toml`, where `<data>` is `~/Library/Appli
 - an existing `id`, builtin included, gets the extension's patterns, signatures and markers added to its own; its `name` stays;
 - `interpreters` are added to the list.
 
-Nothing in an extension removes or narrows a builtin entry. A match that needed an extension's entry is labeled as such (`CatalogSource::Extension`), which limits where it can root a grant (below).
+Nothing in an extension removes or narrows a builtin entry. A match that needed an extension's entry is labeled as such (`CatalogSource::Extension`), which limits where it can root a grant (below). That includes a match on arguments the daemon read only because an extension names an interpreter: builtin patterns are tried against a process's arguments only where the builtin catalog alone would read them (a hidden executable, or a builtin interpreter by executable or command name), so such a match, on `argv[0]` or on a script, is an extension match too.
 
 `agents.d` must be a real directory (not a symlink) owned by the user and not writable by group or others, or no extension is read. Each file is opened through that directory's handle with `O_NOFOLLOW` and must be a regular file owned by the user, not writable by group or others, and at most 64 KiB. Files are read in name order, at most 16; names starting with `.` and names not ending in `.toml` are ignored. A file that fails any check or rule is skipped as a whole and reported by kind and line (`AgentCatalog::problems`), never with its contents.
 
