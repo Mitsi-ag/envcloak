@@ -16,7 +16,8 @@
 //! Then three kinds of thread run:
 //! - the accept loop: each peer is identified at accept (uid, pid, start
 //!   time); another uid is closed at once and audited; at most
-//!   [`MAX_CONNECTIONS`] are served at a time;
+//!   [`MAX_CONNECTIONS`] are served at a time, and at most
+//!   [`MAX_PER_PROCESS`] for any one process;
 //! - one thread per connection: frames of at most 1 MiB, a body that must
 //!   arrive within [`FRAME_DEADLINE`] of its first byte, and an idle limit
 //!   between frames;
@@ -28,13 +29,13 @@
 //! one run at a time (the proof gate), so parallel unlock attempts cannot
 //! multiply its memory.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,6 +61,12 @@ use crate::state::{BeginUnlock, State, passphrase_error};
 /// Connections served at once. Each holds at most one frame (1 MiB) and a
 /// thread, so this bounds the daemon's memory.
 pub const MAX_CONNECTIONS: usize = 32;
+/// Connections one process may hold at once, so a process that keeps its
+/// connections open (an agent leaking them, say) cannot take every place
+/// and lock out the user's `envcloak lock` and `status`. Many processes
+/// together still can; per-agent limits come with the grant flood control
+/// (T9).
+pub const MAX_PER_PROCESS: usize = 8;
 /// A frame's body must arrive within this long of its first byte.
 pub const FRAME_DEADLINE: Duration = Duration::from_secs(10);
 /// A connection with no frame for this long is closed. Long enough for a
@@ -145,8 +152,51 @@ struct Shared {
     proof_gate: Mutex<()>,
     clocks: SystemClocks,
     audit: Audit,
-    connections: AtomicUsize,
+    places: Mutex<Places>,
     runtime_dir_fallback: bool,
+}
+
+/// Why a connection was not served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Full {
+    /// [`MAX_CONNECTIONS`] are being served.
+    All,
+    /// Its process holds [`MAX_PER_PROCESS`].
+    Process,
+}
+
+/// The connections being served: in all, and for each process by pid.
+#[derive(Debug, Default)]
+struct Places {
+    total: usize,
+    by_pid: HashMap<i32, usize>,
+}
+
+impl Places {
+    /// Takes a place for a connection from process `pid`.
+    fn take(&mut self, pid: i32) -> Result<(), Full> {
+        if self.total >= MAX_CONNECTIONS {
+            return Err(Full::All);
+        }
+        let held = self.by_pid.entry(pid).or_insert(0);
+        if *held >= MAX_PER_PROCESS {
+            return Err(Full::Process);
+        }
+        *held += 1;
+        self.total += 1;
+        Ok(())
+    }
+
+    /// Gives back a place [`Places::take`] gave `pid`.
+    fn give_back(&mut self, pid: i32) {
+        self.total = self.total.saturating_sub(1);
+        if let Some(held) = self.by_pid.get_mut(&pid) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                self.by_pid.remove(&pid);
+            }
+        }
+    }
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -199,7 +249,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         proof_gate: Mutex::new(()),
         clocks,
         audit: Audit,
-        connections: AtomicUsize::new(0),
+        places: Mutex::new(Places::default()),
         runtime_dir_fallback: run.fallback,
     });
 
@@ -299,11 +349,14 @@ fn observe(shared: &Shared) {
 
 /// Frees a connection's place when its thread ends, or when the thread
 /// could not be started.
-struct ConnectionSlot(Arc<Shared>);
+struct ConnectionSlot {
+    shared: Arc<Shared>,
+    pid: i32,
+}
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+        locked(&self.shared.places).give_back(self.pid);
     }
 }
 
@@ -332,16 +385,29 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
                 .record(AuditEvent::ForeignPeer { uid: peer.uid });
             continue;
         }
-        if shared.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            shared.connections.fetch_sub(1, Ordering::SeqCst);
-            eprintln!("envcloakd: connection limit reached; closed a connection");
-            continue;
+        let taken = locked(&shared.places).take(peer.pid);
+        match taken {
+            Ok(()) => {}
+            Err(Full::All) => {
+                eprintln!("envcloakd: connection limit reached; closed a connection");
+                continue;
+            }
+            Err(Full::Process) => {
+                eprintln!(
+                    "envcloakd: connection limit reached for pid {}; closed a connection",
+                    peer.pid
+                );
+                continue;
+            }
         }
-        let slot = ConnectionSlot(Arc::clone(shared));
+        let slot = ConnectionSlot {
+            shared: Arc::clone(shared),
+            pid: peer.pid,
+        };
         let started = thread::Builder::new()
             .name("connection".into())
             .spawn(move || {
-                serve(&stream, &peer, &slot.0);
+                serve(&stream, &peer, &slot.shared);
                 drop(slot);
             });
         if started.is_err() {
@@ -539,4 +605,38 @@ fn create(shared: &Shared, p: VaultCreateParams) -> Result<CreatedView, RpcError
         Err(_) => {}
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn places_are_limited_in_all_and_per_process() {
+        let mut p = Places::default();
+        for _ in 0..MAX_PER_PROCESS {
+            p.take(7).unwrap();
+        }
+        assert_eq!(p.take(7), Err(Full::Process));
+        let mut pid = 100;
+        while p.total < MAX_CONNECTIONS {
+            if p.take(pid).is_err() {
+                pid += 1;
+            }
+        }
+        assert_eq!(p.take(9999), Err(Full::All));
+        p.give_back(7);
+        assert_eq!(p.take(9999), Ok(()));
+        assert_eq!(p.take(7), Err(Full::All));
+        p.give_back(9999);
+        p.take(7).unwrap();
+        // Back at its own limit and at the total.
+        assert_eq!(p.by_pid[&7], MAX_PER_PROCESS);
+        assert_eq!(p.take(8), Err(Full::All));
+        // Giving every place back leaves nothing behind.
+        for _ in 0..MAX_PER_PROCESS {
+            p.give_back(7);
+        }
+        assert!(!p.by_pid.contains_key(&7));
+    }
 }

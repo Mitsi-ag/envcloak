@@ -38,7 +38,7 @@ Start-up errors print `envcloakd: <token>: <message>` and exit 1; usage errors e
 | Linux 6.5+ | `SO_PEERCRED` | `/proc/<pid>/stat`, read while `SO_PEERPIDFD` pins the process: it must still be alive after the read. Whether the kernel has `SO_PEERPIDFD` is found once; on one that has it, a peer it gives no pidfd for (one reaped before the accept gets `EINVAL`) is refused, never checked the way older kernels are |
 | Linux before 6.5 | `SO_PEERCRED` | `/proc/<pid>/stat`; a process that started after the accept is refused. A narrow race remains: the peer exits and its pid is reused between its `connect` and the `accept` |
 
-A peer running as another uid is closed at once, answered nothing, and audited. At most 32 connections are served at a time; more are closed at once.
+A peer running as another uid is closed at once, answered nothing, and audited. At most 32 connections are served at a time, and at most 8 for any one process (by pid), so one process that keeps connections open cannot lock the user's own `envcloak lock` and `status` out; more are closed at once. Many processes together can still fill the 32; per-agent limits come with T9's flood control.
 
 **Client, before it sends anything.** `Client::connect` checks the runtime directory as the daemon does (without changing it), checks that the socket is a socket of this uid, connects (the descriptor is close-on-exec), and checks with `getpeereid` (macOS) or `SO_PEERCRED` (Linux) that the process at the other end runs as this uid. A missing directory, socket or listener is `daemon_unavailable`; any failed check is `daemon_unverified`, and nothing is sent. A passphrase is read only after the daemon is verified, and sent on a connection verified again.
 
@@ -139,7 +139,7 @@ The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then remo
 | 20: directory 0700 and socket 0600; symlinked, foreign-owned, group- or world-writable directories refused; a second instance refused; another uid rejected at accept | `crates/envcloak-daemon/tests/socket.rs` |
 | 21: a server of another uid refused and sent nothing; the CLI never starts `envcloakd` from `PATH` | `crates/envcloak-cli/tests/squat.rs`, `crates/envcloak-ipc/tests/client.rs`, `crates/envcloak-cli/tests/daemon_commands.rs` |
 | 22: every `app`-role method rejected and audited | `crates/envcloak-daemon/tests/roles.rs` |
-| 32, frames: over 1 MiB rejected, memory bounded under a flood, a stalled frame dropped | `crates/envcloak-daemon/tests/frames.rs`, `crates/envcloak-ipc/tests/frame.rs` |
+| 32, frames: over 1 MiB rejected, memory bounded under a flood from many processes, one process held to 8 connections, a stalled frame dropped | `crates/envcloak-daemon/tests/frames.rs`, `crates/envcloak-ipc/tests/frame.rs` |
 | 11, for IPC frames: no freed block holds a value or its base64 | `crates/envcloak-ipc/tests/frame_probe.rs` |
 
 The other-uid checks need a second user and `sudo`; CI creates one on Linux (`ENVCLOAK_TEST_OTHER_USER`). The service-manager check runs where `ENVCLOAK_TEST_SERVICE_MANAGER=1`, which CI sets on both systems.

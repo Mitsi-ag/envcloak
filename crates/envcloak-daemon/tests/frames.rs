@@ -5,8 +5,9 @@
 
 mod common;
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
@@ -15,7 +16,7 @@ use common::{
 };
 use envcloak_ipc::MAX_FRAME;
 use envcloak_ipc::view::VaultState;
-use envcloak_testkit::TestHome;
+use envcloak_testkit::{TEST_PATH, TestHome};
 use serde_json::json;
 
 fn header(len: usize) -> [u8; 4] {
@@ -60,8 +61,93 @@ fn a_frame_over_the_limit_is_refused_and_the_connection_closed() {
     );
 }
 
+/// A `python3` process that opens `argv[2]` connections to the socket
+/// `argv[1]`, starts a frame of 1 MiB on each and sends `argv[3]` bytes of
+/// it, then prints `ready`. On a line from its stdin it prints how many of
+/// those connections the daemon closed, then waits for its stdin to close.
+const FLOODER: &str = r#"import socket, struct, sys, time
+path, n, half = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+socks = []
+for _ in range(n):
+    for _ in range(1000):
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.connect(path)
+            break
+        except (ConnectionRefusedError, BlockingIOError):
+            s.close()
+            time.sleep(0.005)
+    else:
+        sys.exit('the daemon stopped accepting connections')
+    try:
+        s.sendall(struct.pack('>I', 1 << 20))
+        s.sendall(b'x' * half)
+    except OSError:
+        pass
+    socks.append(s)
+print('ready', flush=True)
+sys.stdin.readline()
+closed = 0
+for s in socks:
+    s.settimeout(0.2)
+    try:
+        closed += s.recv(1) == b''
+    except ConnectionResetError:
+        closed += 1
+    except OSError:
+        pass
+print(closed, flush=True)
+sys.stdin.read()
+"#;
+
+/// One flooding process (see [`FLOODER`]). Killed and reaped on drop.
+struct Flooder {
+    child: Child,
+    out: BufReader<ChildStdout>,
+}
+
+impl Flooder {
+    fn start(home: &TestHome, connections: usize, bytes: usize) -> Self {
+        let mut child = Command::new("python3")
+            .args(["-c", FLOODER])
+            .arg(run_paths(home).socket)
+            .arg(connections.to_string())
+            .arg(bytes.to_string())
+            .env_clear()
+            .env("PATH", TEST_PATH)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        let mut f = Flooder { child, out };
+        assert_eq!(line.trim(), "ready", "the flooder failed");
+        f.child.stdin.as_mut().unwrap().flush().unwrap();
+        f
+    }
+
+    /// How many of its connections the daemon has closed.
+    fn closed(&mut self) -> usize {
+        writeln!(self.child.stdin.as_mut().unwrap(), "report").unwrap();
+        let mut line = String::new();
+        self.out.read_line(&mut line).unwrap();
+        line.trim().parse().unwrap()
+    }
+}
+
+impl Drop for Flooder {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Thousands of oversized headers, then more connections than the daemon
-/// serves, each holding half a megabyte of an unfinished frame: the
+/// serves, from 12 processes that each hold 8 (as many as one process may
+/// hold), each connection with half a megabyte of an unfinished frame: the
 /// daemon's resident memory stays within the bound its connection cap
 /// sets, connections past the cap are closed at once, and it keeps
 /// serving afterwards.
@@ -88,23 +174,15 @@ fn memory_stays_bounded_under_a_flood() {
     };
     for _ in 0..2000 {
         let mut s = connect();
+        // The daemon may already have closed a connection past its limits.
         let _ = s.write_all(&header(MAX_FRAME + 1));
     }
     // Served again once the flood has drained.
     status_when_free(&home);
 
-    let half = vec![b'x'; MAX_FRAME / 2];
-    let mut held = Vec::new();
-    for _ in 0..96 {
-        let mut s = connect();
-        s.set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
-        s.write_all(&header(MAX_FRAME)).unwrap();
-        // Past the cap the daemon closes the connection, so the write may
-        // fail; that is the point.
-        let _ = s.write_all(&half);
-        held.push(s);
-    }
+    let mut flooders: Vec<Flooder> = (0..12)
+        .map(|_| Flooder::start(&home, 8, MAX_FRAME / 2))
+        .collect();
     std::thread::sleep(Duration::from_millis(500));
     let during = rss_kib(d.pid());
     eprintln!("resident memory: {before} KiB before, {during} KiB during the flood");
@@ -116,16 +194,77 @@ fn memory_stays_bounded_under_a_flood() {
         during < before + 96 * 1024,
         "resident memory grew from {before} KiB to {during} KiB"
     );
-    let refused = held.iter_mut().map(closed).filter(|c| *c).count();
+    let refused: usize = flooders.iter_mut().map(Flooder::closed).sum();
     assert!(
         refused >= 96 - 32,
         "only {refused} connections were refused"
     );
 
-    drop(held);
+    drop(flooders);
     assert_eq!(status_when_free(&home).vault.state, VaultState::Absent);
     let log = d.log();
-    assert!(log.contains("connection limit reached"), "{log}");
+    assert!(
+        log.contains("connection limit reached; closed a connection"),
+        "{log}"
+    );
+}
+
+/// One process may hold at most 8 connections, so a process that keeps
+/// its connections open (an agent leaking them, say) cannot take every
+/// place and lock the user's own `envcloak lock` and `status` out. Its
+/// next connection is closed at once; another process is served; once it
+/// closes one of its own, it is served again.
+#[test]
+fn one_process_cannot_take_every_connection() {
+    let home = TestHome::new();
+    let d = start(&home);
+    let mut held: Vec<UnixStream> = (0..8).map(|_| raw(&home)).collect();
+    // The daemon accepts in order, so the eight are counted by now.
+    let mut ninth = raw(&home);
+    assert!(closed(&mut ninth), "a ninth connection was served");
+    let state = status_from_another_process(&home);
+    assert_eq!(state, "absent");
+    // Still at its limit: this process is refused again.
+    assert!(closed(&mut raw(&home)));
+
+    drop(held.pop());
+    assert_eq!(status_when_free(&home).vault.state, VaultState::Absent);
+    drop(held);
+    let log = d.log();
+    assert!(
+        log.contains(&format!(
+            "connection limit reached for pid {}",
+            std::process::id()
+        )),
+        "{log}"
+    );
+}
+
+/// `status` from a `python3` process: the vault's state.
+fn status_from_another_process(home: &TestHome) -> String {
+    let out = Command::new("python3")
+        .args([
+            "-c",
+            "import json, socket, struct, sys\n\
+             s = socket.socket(socket.AF_UNIX)\n\
+             s.connect(sys.argv[1])\n\
+             b = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'status'}).encode()\n\
+             s.sendall(struct.pack('>I', len(b)) + b)\n\
+             f = s.makefile('rb')\n\
+             n = struct.unpack('>I', f.read(4))[0]\n\
+             print(json.loads(f.read(n))['result']['vault']['state'])\n",
+        ])
+        .arg(run_paths(home).socket)
+        .env_clear()
+        .env("PATH", TEST_PATH)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 /// A frame whose body stops arriving is dropped once its deadline passes,
