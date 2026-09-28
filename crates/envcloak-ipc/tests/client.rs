@@ -246,3 +246,64 @@ fn the_socket_path_must_fit() {
         RunPathErrorKind::SocketPathTooLong
     );
 }
+
+/// The client checks the daemon's uid but, in M1, not its code identity,
+/// so a program running as the user can answer `status` in its place. The
+/// text fields it could fill are replaced with fixed text unless they have
+/// the shape a real daemon sends: a version of 1 to 32 characters from
+/// `[0-9A-Za-z.+-]`, and a reason from `proto::REASONS`. Nothing it sends
+/// can then put a terminal control sequence on the user's screen.
+#[test]
+fn status_text_from_the_daemon_is_checked_before_use() {
+    let status = |version: &str, unavailable: &str| {
+        serde_json::json!({
+            "daemon": {
+                "version": version,
+                "pid": 1,
+                "hardening": {"core_dumps_off": true, "non_dumpable": true, "hardened_runtime": null},
+                "runtime_dir_fallback": false
+            },
+            "vault": {
+                "state": "unavailable", "integrity": null, "read_only": false,
+                "unavailable": unavailable, "busy": false, "failed_unlocks": 0
+            },
+            "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": null}
+        })
+    };
+    let cases = [
+        ("0.1.0", "damaged", "0.1.0", "damaged"),
+        (
+            "1.2.3-rc.1+build.7",
+            "disk_full",
+            "1.2.3-rc.1+build.7",
+            "disk_full",
+        ),
+        (
+            "\u{1b}[2J\u{1b}]0;owned\u{7}",
+            "\u{1b}[31mdamaged",
+            "unrecognized",
+            "unknown",
+        ),
+        ("0.1.0\n", "damaged\r", "unrecognized", "unknown"),
+        ("", "", "unrecognized", "unknown"),
+        (&"9".repeat(33), "not_a_reason", "unrecognized", "unknown"),
+    ];
+    for (version, unavailable, want_version, want_reason) in cases {
+        let home = TestHome::new();
+        let p = run_paths(&home);
+        make_dir(&p);
+        let body = status(version, unavailable);
+        let srv = server(&p, move |f| {
+            let req = IncomingRequest::parse(f).unwrap();
+            wire(&proto::result_frame(req.id, &body).unwrap())
+        });
+        let got = Client::connect(&p).unwrap().status().unwrap();
+        assert_eq!(got.daemon.version, want_version, "{version:?}");
+        assert_eq!(
+            got.vault.unavailable.as_deref(),
+            Some(want_reason),
+            "{unavailable:?}"
+        );
+        srv.join().unwrap();
+    }
+}

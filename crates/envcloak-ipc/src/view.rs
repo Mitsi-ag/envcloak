@@ -1,8 +1,21 @@
 //! What the daemon tells a client (SPEC §4.4: metadata only). These types
 //! hold no [`crate::WireSecret`] and no free text from the vault: states,
 //! counts, versions and fixed tokens.
+//!
+//! The two strings in [`StatusView`] come from the daemon, whose code
+//! identity M1 clients cannot verify, so [`crate::Client::status`] passes
+//! them through [`StatusView::sanitize`] before anyone prints them.
 
 use serde::{Deserialize, Serialize};
+
+use crate::proto::REASONS;
+
+/// What [`StatusView::sanitize`] puts in place of a version that is not
+/// one a daemon would send.
+pub const UNRECOGNIZED_VERSION: &str = "unrecognized";
+/// What [`StatusView::sanitize`] puts in place of a reason that is not one
+/// of [`REASONS`].
+pub const UNKNOWN_REASON: &str = "unknown";
 
 /// `status`: the daemon, its vault and its lock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,10 +25,35 @@ pub struct StatusView {
     pub lock: LockView,
 }
 
+impl StatusView {
+    /// Replaces the daemon's strings with fixed text when they do not have
+    /// the shape a daemon sends: [`DaemonView::version`] must be 1 to 32
+    /// characters of `[0-9A-Za-z.+-]` (else [`UNRECOGNIZED_VERSION`]), and
+    /// [`VaultView::unavailable`] one of [`REASONS`] (else
+    /// [`UNKNOWN_REASON`]). A program running as the user can answer in
+    /// the daemon's place (SPEC §1.1), and must not put terminal control
+    /// sequences on the user's screen.
+    pub fn sanitize(&mut self) {
+        let v = &self.daemon.version;
+        let version_ok = (1..=32).contains(&v.len())
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'));
+        if !version_ok {
+            self.daemon.version = UNRECOGNIZED_VERSION.to_owned();
+        }
+        if let Some(r) = self.vault.unavailable.as_mut() {
+            if !REASONS.contains(&r.as_str()) {
+                UNKNOWN_REASON.clone_into(r);
+            }
+        }
+    }
+}
+
 /// The daemon process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonView {
-    /// Its version, `CARGO_PKG_VERSION`.
+    /// Its version, `CARGO_PKG_VERSION`. Checked by
+    /// [`StatusView::sanitize`].
     pub version: String,
     pub pid: u32,
     pub hardening: HardeningView,
@@ -71,7 +109,8 @@ pub struct VaultView {
     /// could not be migrated.
     pub read_only: bool,
     /// Why the vault could not be opened, when `state` is
-    /// [`VaultState::Unavailable`]: a fixed token.
+    /// [`VaultState::Unavailable`]: a fixed token, one of [`REASONS`].
+    /// Checked by [`StatusView::sanitize`].
     pub unavailable: Option<String>,
     /// An unlock or `vault create` is running.
     pub busy: bool,

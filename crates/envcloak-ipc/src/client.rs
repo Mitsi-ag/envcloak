@@ -228,12 +228,15 @@ impl Client {
         })
     }
 
-    /// `status`.
+    /// `status`, with the daemon's strings checked
+    /// ([`StatusView::sanitize`]).
     ///
     /// # Errors
     /// As [`Client::call`].
     pub fn status(&mut self) -> Result<StatusView, ClientError> {
-        self.call::<Status>(&NoParams {})
+        let mut s = self.call::<Status>(&NoParams {})?;
+        s.sanitize();
+        Ok(s)
     }
 
     /// `vault.create` with the passphrase and the kit's text.

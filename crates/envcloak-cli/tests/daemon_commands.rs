@@ -9,6 +9,7 @@
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -19,7 +20,8 @@ use common::{
 };
 use envcloak_core::vault::{LockedVault, VaultPaths};
 use envcloak_core::{RecoveryKit, SecretBytes};
-use envcloak_ipc::{Client, RunPaths};
+use envcloak_ipc::proto::{self, IncomingRequest};
+use envcloak_ipc::{Client, Frame, RunPaths};
 use envcloak_testkit::{
     Canary, TEST_PATH, TestHome, assert_no_canary, by_label, canaries, daemon_run_dir, fresh_seed,
     labels,
@@ -139,6 +141,61 @@ fn status_without_a_daemon_says_how_to_start_one() {
     let out = run(&home, &["status", "--json"], &[]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["daemon"]["state"], "not running");
+}
+
+/// A program running as the user can answer in the daemon's place (its
+/// code identity is unverified in M1). Whatever it puts in `status`'s
+/// strings, `envcloak status` prints no control character of its: the
+/// version and the reason come out as fixed placeholders.
+#[test]
+fn status_prints_no_control_sequence_a_stand_in_daemon_sends() {
+    let home = TestHome::new();
+    let paths = RunPaths::under(daemon_run_dir(&home)).unwrap();
+    paths.prepare_dir().unwrap();
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+    let body = serde_json::json!({
+        "daemon": {
+            "version": "\u{1b}]0;owned\u{7}\u{1b}[2J9.9",
+            "pid": 4242,
+            "hardening": {"core_dumps_off": true, "non_dumpable": true, "hardened_runtime": null},
+            "runtime_dir_fallback": false
+        },
+        "vault": {
+            "state": "unavailable", "integrity": null, "read_only": false,
+            "unavailable": "\u{1b}[31mdamaged\r\u{8}", "busy": false, "failed_unlocks": 0
+        },
+        "lock": {"last_reason": null, "idle_limit_secs": 28800, "idle_remaining_secs": null}
+    });
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let f = Frame::read_from(&mut s).unwrap();
+            let req = IncomingRequest::parse(&f).unwrap();
+            proto::result_frame(req.id, &body)
+                .unwrap()
+                .write_to(&mut s)
+                .unwrap();
+        }
+    });
+    let human = run(&home, &["status"], &[]);
+    let json = run(&home, &["status", "--json"], &[]);
+    server.join().unwrap();
+    for out in [&human, &json] {
+        assert!(out.status.success(), "{}", stderr(out));
+        for b in out.stdout.iter().chain(&out.stderr) {
+            assert!(
+                *b == b'\n' || !b.is_ascii_control(),
+                "a control byte {b:#04x} reached the terminal: {:?}",
+                stdout(out)
+            );
+        }
+    }
+    let said = stdout(&human);
+    assert!(said.contains("version unrecognized"), "{said}");
+    assert!(said.contains("vault: unavailable (unknown)"), "{said}");
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(v["daemon"]["version"], "unrecognized");
+    assert_eq!(v["vault"]["unavailable"], "unknown");
 }
 
 /// Story S1 and the lock cycle: `vault create --passphrase-fd 3 --kit-fd 4

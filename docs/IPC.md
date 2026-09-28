@@ -76,7 +76,7 @@ Response, one of:
 
 **Values.** A secret inside a message (a passphrase, the Recovery Kit's text, and from T12 the values a run receives) is a JSON string of standard padded base64. It is decoded where it lies in the frame straight into a wiped buffer; a string with JSON escapes cannot be read in place and is refused (`invalid_params`). Encoding writes the base64 into a wiped buffer from which the serializer copies it into the frame.
 
-**No text crosses back.** Errors on both sides are built from fixed tokens. A decode error never carries serde's message, which can quote the input. A method name is logged only when it is one of the names below; any other is logged as `(unknown)` or `app.(unknown)`, because a name a client sent can hold anything.
+**No text crosses back.** Errors on both sides are built from fixed tokens. A decode error never carries serde's message, which can quote the input. `status` carries two strings, the daemon's version and the reason the vault is unavailable; the client replaces a version that is not 1 to 32 characters of `[0-9A-Za-z.+-]` with `unrecognized`, and a reason that is not one of the tokens below with `unknown`, before anything prints them, because a program running as the user could answer in the daemon's place. A method name is logged only when it is one of the names below; any other is logged as `(unknown)` or `app.(unknown)`, because a name a client sent can hold anything.
 
 ## Methods (M1, client role)
 
