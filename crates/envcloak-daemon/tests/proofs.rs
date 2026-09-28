@@ -5,7 +5,8 @@
 //! forked out of an agent's tree and called `setsid`. Such a caller is no
 //! orphan and shows no agent, yet no person can type a proof there, so
 //! `unlock`, `approve` and `pending.get` are refused before the passphrase
-//! is looked at, and audited. That a request from such a caller is still
+//! is looked at, and audited; so are `items.target`, `items.rotate` and
+//! `items.remove` (T11). That a request from such a caller is still
 //! decided, and that its own `envcloak approve` gets no grant, is in
 //! `crates/envcloak-cli/tests/approve.rs`.
 //!
@@ -22,7 +23,7 @@ use common::{client, passphrase, seed_vault, start};
 use envcloak_core::SecretBytes;
 use envcloak_ipc::ClientError;
 use envcloak_ipc::proto::ErrorKind;
-use envcloak_ipc::view::VaultState;
+use envcloak_ipc::view::{ClassificationView, ItemClassView, ItemView, TargetView, VaultState};
 use envcloak_policy::ApprovalOptions;
 use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 
@@ -95,6 +96,51 @@ fn a_caller_without_a_terminal_gives_no_proof() {
     let log = d.log();
     assert!(refused_in_log(&log, "pending.get"), "{log}");
     assert!(refused_in_log(&log, "approve"), "{log}");
+
+    // Rotating and removing an item are proofs too, and the target a
+    // statement would show is not served here either.
+    let e = c.items_target("openai/acme-web", None, &[]).unwrap_err();
+    assert_eq!(rpc_kind(e), ErrorKind::ProofRefused);
+    let target = TargetView {
+        item: ItemView {
+            id: "01K00000000000000000000000".into(),
+            slug: "openai/acme-web".into(),
+            class: ItemClassView::Secret,
+            title: String::new(),
+            provider: None,
+            classification: ClassificationView::Unknown,
+            env_hint: None,
+            allow_short: false,
+            fields: Vec::new(),
+            created_secs: 0,
+            updated_secs: 0,
+            rotated_secs: None,
+            expires_secs: None,
+            account: None,
+            detail: None,
+        },
+        field: Some("value".into()),
+        grants: 0,
+    };
+    let rotated = c.items_rotate(
+        &target,
+        SecretBytes::copy_from(b"a new value, long enough"),
+        passphrase(&cs),
+        &[],
+    );
+    assert_eq!(rpc_kind(rotated.unwrap_err()), ErrorKind::ProofRefused);
+    let removed = c.items_remove(&target, passphrase(&cs), &[]);
+    assert_eq!(rpc_kind(removed.unwrap_err()), ErrorKind::ProofRefused);
+    assert_eq!(c.status().unwrap().approvals.proof_failures, 0);
+    assert!(
+        d.wait_for_log("proof refused method=items.remove", Duration::from_secs(5)),
+        "{}",
+        d.log()
+    );
+    let log = d.log();
+    for method in ["items.target", "items.rotate", "items.remove"] {
+        assert!(refused_in_log(&log, method), "{method}: {log}");
+    }
     assert_no_canary(&d.log_bytes(), &cs);
     home.assert_clean(&cs);
 }

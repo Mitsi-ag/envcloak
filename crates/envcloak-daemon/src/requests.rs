@@ -178,7 +178,7 @@ fn bind_request(
 }
 
 /// Who asked, as the audit log records it.
-fn subject_summary(peer: &PeerIdentity, e: &SubjectEvidence) -> SubjectSummary {
+pub(crate) fn subject_summary(peer: &PeerIdentity, e: &SubjectEvidence) -> SubjectSummary {
     let root = e.root();
     SubjectSummary {
         pid: peer.pid,

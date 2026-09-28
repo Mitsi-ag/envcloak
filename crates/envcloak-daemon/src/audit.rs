@@ -113,6 +113,39 @@ pub enum AuditEvent {
         approved_sha256: [u8; 32],
         sha256: [u8; 32],
     },
+    /// An item was added (`items.add`).
+    Added {
+        pid: i32,
+        subject: SubjectSummary,
+        item: ItemId,
+        slug: Slug,
+    },
+    /// A value was replaced, with a proof (`items.rotate`).
+    Rotated {
+        pid: i32,
+        subject: SubjectSummary,
+        item: ItemId,
+        slug: Slug,
+        /// Prior values kept now.
+        prior_count: u8,
+    },
+    /// An item was removed, with a proof, after a backup (`items.remove`).
+    Removed {
+        pid: i32,
+        subject: SubjectSummary,
+        item: ItemId,
+        slug: Slug,
+        /// Grants that bound it and ended.
+        grants: usize,
+    },
+    /// A rotation or removal failed its proof: the passphrase was wrong.
+    /// `write` is [`AuditKind::Rotate`] or [`AuditKind::Remove`].
+    ItemProofFailed {
+        pid: i32,
+        write: AuditKind,
+        item: ItemId,
+        slug: Slug,
+    },
 }
 
 impl AuditEvent {
@@ -186,6 +219,23 @@ impl AuditEvent {
                  pid={pid}",
                 hex(approved_sha256),
                 hex(sha256)
+            ),
+            AuditEvent::Added { pid, item, .. } => {
+                format!("envcloakd: audit: item added id={item} pid={pid}")
+            }
+            AuditEvent::Rotated { pid, item, .. } => {
+                format!("envcloakd: audit: item rotated id={item} pid={pid}")
+            }
+            AuditEvent::Removed {
+                pid, item, grants, ..
+            } => {
+                format!("envcloakd: audit: item removed id={item} grants_ended={grants} pid={pid}")
+            }
+            AuditEvent::ItemProofFailed {
+                pid, write, item, ..
+            } => format!(
+                "envcloakd: audit: {} failed reason=wrong_passphrase id={item} pid={pid}",
+                write.token()
             ),
         })
     }
@@ -304,6 +354,62 @@ impl AuditEvent {
                     approved_sha256: Some(*approved_sha256),
                 }),
                 ..AuditRecord::new(AuditKind::ManifestChanged, "covered")
+            },
+            AuditEvent::Added {
+                subject,
+                item,
+                slug,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: vec![(*item, slug.clone())],
+                decision: decision("added", None, Some("items.add"), None),
+                ..AuditRecord::new(AuditKind::Add, "added")
+            },
+            AuditEvent::Rotated {
+                subject,
+                item,
+                slug,
+                prior_count,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: vec![(*item, slug.clone())],
+                decision: decision(
+                    "rotated",
+                    None,
+                    Some("items.rotate"),
+                    Some(u64::from(*prior_count)),
+                ),
+                ..AuditRecord::new(AuditKind::Rotate, "rotated")
+            },
+            AuditEvent::Removed {
+                subject,
+                item,
+                slug,
+                grants,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: vec![(*item, slug.clone())],
+                decision: decision(
+                    "removed",
+                    None,
+                    Some("items.remove"),
+                    Some(u64::try_from(*grants).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::Remove, "removed")
+            },
+            AuditEvent::ItemProofFailed {
+                pid,
+                write,
+                item,
+                slug,
+            } => AuditRecord {
+                subject: subject(*pid),
+                items: vec![(*item, slug.clone())],
+                decision: decision("failed", Some("wrong_passphrase"), None, None),
+                ..AuditRecord::new(*write, "failed")
             },
         }
     }

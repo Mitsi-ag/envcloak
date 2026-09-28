@@ -48,7 +48,8 @@ use envcloak_core::crypto::KdfParams;
 use envcloak_core::vault::VaultPaths;
 use envcloak_core::{RecoveryKit, check_passphrase, create_vault_with_kit};
 use envcloak_ipc::proto::{
-    self, Approve, AuditVerify, Deny, ErrorKind, GrantsList, GrantsRevoke, IncomingRequest, Lock,
+    self, Approve, AuditVerify, Deny, ErrorKind, GrantsList, GrantsRevoke, IncomingRequest,
+    ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock,
     Method, PendingGet, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate,
     VaultCreateParams, loggable_method, required_role,
 };
@@ -62,6 +63,7 @@ use envcloak_sys::{PeerIdentity, TerminationSignals};
 
 use crate::audit::AuditEvent;
 use crate::clock::{SystemClocks, now_of};
+use crate::items;
 use crate::lock::Reading;
 use crate::requests;
 use crate::state::{BeginUnlock, State, passphrase_error};
@@ -578,6 +580,15 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         AuditVerify::NAME => {
             answer::<AuditVerify>(id, &req, |_| locked(&shared.state).audit_verify())
         }
+        ItemsList::NAME => answer::<ItemsList>(id, &req, |p| items::list(shared, p)),
+        ItemsShow::NAME => answer::<ItemsShow>(id, &req, |p| items::show(shared, p)),
+        ItemsCheck::NAME => answer::<ItemsCheck>(id, &req, |p| items::check(shared, p)),
+        ItemsAdd::NAME => answer::<ItemsAdd>(id, &req, |p| items::add(shared, peer, p)),
+        ItemsTarget::NAME => {
+            answer::<ItemsTarget>(id, &req, |p| items::target_view(shared, peer, p))
+        }
+        ItemsRotate::NAME => answer::<ItemsRotate>(id, &req, |p| items::rotate(shared, peer, p)),
+        ItemsRemove::NAME => answer::<ItemsRemove>(id, &req, |p| items::remove(shared, peer, p)),
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
 }

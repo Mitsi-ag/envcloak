@@ -169,6 +169,20 @@ impl State {
         }
     }
 
+    /// The unlocked vault, for a request that writes to it under the state
+    /// lock (`items.add`, and `items.rotate` and `items.remove` once their
+    /// proof has passed).
+    ///
+    /// # Errors
+    /// As [`State::unlocked`].
+    pub fn unlocked_mut(&mut self) -> Result<&mut Vault, RpcError> {
+        self.unlocked()?;
+        match &mut self.slot {
+            Slot::Unlocked(v) => Ok(v),
+            _ => Err(RpcError::new(ErrorKind::Internal)),
+        }
+    }
+
     /// Records activity at `now`: a covered request or an approval keeps
     /// the vault from locking idle.
     pub fn touch(&mut self, now: Reading) {
