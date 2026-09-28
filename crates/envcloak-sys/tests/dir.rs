@@ -195,6 +195,21 @@ fn holder(path: &std::path::Path) -> std::process::Child {
     c
 }
 
+/// `open_elsewhere`, looked at again for up to a second while it says
+/// open: a scanner or indexer may open a file for a moment after it is
+/// written (seen on the Linux CI runners), and a holder that exited may
+/// take a moment to be reaped.
+fn settled(f: &File, path: &std::path::Path) -> Option<bool> {
+    for _ in 0..20 {
+        let got = open_elsewhere(f, path);
+        if got != Some(true) {
+            return got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Some(true)
+}
+
 #[test]
 fn open_elsewhere_sees_another_process_holding_the_file() {
     let tmp = tempfile::tempdir_in("/tmp").unwrap();
@@ -203,7 +218,7 @@ fn open_elsewhere_sees_another_process_holding_the_file() {
     let f = File::open(&path).unwrap();
     // No one else has it open. A system that cannot tell says so, and
     // never claims the file is free when it is not (checked below).
-    let alone = open_elsewhere(&f, &path);
+    let alone = settled(&f, &path);
     if cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(alone, Some(false));
     }
@@ -211,7 +226,7 @@ fn open_elsewhere_sees_another_process_holding_the_file() {
     assert_eq!(open_elsewhere(&f, &path), Some(true));
     drop(child.stdin.take());
     child.wait().unwrap();
-    assert_eq!(open_elsewhere(&f, &path), Some(false));
+    assert_eq!(settled(&f, &path), Some(false));
     // The check leaves the descriptor usable.
     let mut s = String::new();
     (&f).read_to_string(&mut s).unwrap();

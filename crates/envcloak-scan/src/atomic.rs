@@ -18,10 +18,11 @@
 //! - [`remove_checked`] removes a file only when it is unchanged since it
 //!   was read, not modified within [`MIN_AGE`], and not open in another
 //!   process as far as the system can tell
-//!   ([`envcloak_sys::open_elsewhere`]). It first moves the file aside,
-//!   checks that what moved is the file it checked, and only then unlinks
-//!   it: a file saved over the name meanwhile (an editor's atomic save) is
-//!   put back, never removed.
+//!   ([`envcloak_sys::open_elsewhere`]; a file found open is looked at
+//!   again for half a second, since scanners open new files briefly). It
+//!   first moves the file aside, checks that what moved is the file it
+//!   checked, and only then unlinks it: a file saved over the name
+//!   meanwhile (an editor's atomic save) is put back, never removed.
 //!
 //! No temporary copy holds anything the caller did not write, and nothing
 //! here writes a backup: plaintext is never copied (SPEC §6.4 "Backups").
@@ -43,6 +44,12 @@ use crate::root::{FileStamp, ScanErrorKind, ScanRoot, io_kind, open_file};
 /// A file modified more recently than this is not removed: someone may be
 /// editing it.
 pub const MIN_AGE: Duration = Duration::from_secs(120);
+
+/// How often a file found open elsewhere is looked at again before it is
+/// kept, and how long apart: a virus scanner or an indexer opens a file
+/// for a moment after it is written.
+const OPEN_CHECKS: u32 = 10;
+const OPEN_CHECK_WAIT: Duration = Duration::from_millis(50);
 
 /// Why a file was not changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -260,8 +267,14 @@ pub fn remove_checked_at(
     if expect.age_at(now).is_none_or(|age| age < MIN_AGE.as_secs()) {
         return Err(fail(ModifyErrorKind::RecentlyChanged));
     }
-    if open_elsewhere(&f, &r.path().join(rel)) == Some(true) {
-        return Err(fail(ModifyErrorKind::OpenElsewhere));
+    let path = r.path().join(rel);
+    let mut checks = 1;
+    while open_elsewhere(&f, &path) == Some(true) {
+        if checks == OPEN_CHECKS {
+            return Err(fail(ModifyErrorKind::OpenElsewhere));
+        }
+        checks += 1;
+        std::thread::sleep(OPEN_CHECK_WAIT);
     }
     // Move it aside, and remove it only if what moved is the file checked.
     let aside = temp_name(&name, "del");
