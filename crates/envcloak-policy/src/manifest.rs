@@ -358,7 +358,7 @@ fn project(
 /// 1 to 128 bytes, with no control characters and none of the invisible
 /// ones an approval screen could be spoofed with (bidirectional controls,
 /// zero-width characters, the byte-order mark).
-fn valid_project_name(s: &str) -> bool {
+pub(crate) fn valid_project_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && !s.chars().any(|c| {

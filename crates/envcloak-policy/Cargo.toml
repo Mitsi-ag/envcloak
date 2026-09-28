@@ -21,3 +21,4 @@ toml_edit.workspace = true
 
 [dev-dependencies]
 envcloak-testkit.workspace = true
+tempfile.workspace = true

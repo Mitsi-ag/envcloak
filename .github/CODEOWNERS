@@ -14,3 +14,14 @@
 /crates/envcloak-providers/src/registry.rs   @Mitsi-ag
 /scripts/gen-providers.py                    @Mitsi-ag
 /.github/CODEOWNERS                          @Mitsi-ag
+
+# SPEC §10a: the agent catalog decides which ancestor is an agent, and so
+# the grant root and the agent barrier (§10b). A missed agent can ride a
+# terminal grant, so the catalog, its compiled copy, the generator and the
+# code that matches and roots with it need a code owner's review too.
+/integrations/agents.toml                    @Mitsi-ag
+/crates/envcloak-policy/src/agents_builtin.rs @Mitsi-ag
+/crates/envcloak-policy/src/agents.rs        @Mitsi-ag
+/crates/envcloak-policy/src/evidence.rs      @Mitsi-ag
+/crates/envcloak-sys/src/proc/               @Mitsi-ag
+/scripts/gen-agents.py                       @Mitsi-ag

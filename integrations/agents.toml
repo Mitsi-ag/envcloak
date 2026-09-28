@@ -1,0 +1,44 @@
+# Known AI coding agents, for caller evidence (SPEC §10a, §10b "Root
+# selection"). Format and rules: docs/AGENTS.md.
+#
+# A process in a caller's ancestry is an agent when its executable, its
+# script (under an interpreter) or its macOS code signature matches an entry
+# here. Matching only ever makes handling stricter, so a pattern that is too
+# broad costs prompts, never protection; a pattern that misses an agent lets
+# it ride a terminal grant. Compiled into the release by
+# scripts/gen-agents.py; users add entries under <data>/agents.d/.
+
+# Executables that run scripts. For these, the script arguments are matched
+# against each agent's `scripts`.
+interpreters = ["node", "nodejs", "bun", "deno"]
+
+[[agent]]
+id = "claude-code"
+name = "Claude Code"
+# The native build: ~/.local/share/claude/versions/<version>, or npm's
+# @anthropic-ai/claude-code/bin/claude.exe, run through a `claude` link.
+executables = ["claude", "claude.exe", "claude/versions/*"]
+# The older npm build: node .../@anthropic-ai/claude-code/cli.js, or a
+# `claude` script run through its shebang.
+scripts = ["claude", "@anthropic-ai/claude-code/cli.js"]
+signatures = [{ team = "Q6L2SF6YDW", identifier = "com.anthropic.claude-code" }]
+# Set in the environment of the commands it runs.
+markers = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]
+
+[[agent]]
+id = "codex"
+name = "Codex"
+# The native binary, also under npm's @openai/codex-<platform>/vendor/.
+executables = ["codex"]
+# npm's launcher, which starts the native binary.
+scripts = ["codex", "@openai/codex/bin/codex.js"]
+signatures = [{ team = "2DC432GLL2", identifier = "codex" }]
+markers = ["CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"]
+
+[[agent]]
+id = "fixture"
+name = "EnvCloak test fixture agent"
+# crates/envcloak-testkit/src/bin/fixture-agent.rs, which the acceptance
+# tests run as an agent. Only a program by this name matches.
+executables = ["fixture-agent"]
+markers = ["ENVCLOAK_FIXTURE_AGENT"]

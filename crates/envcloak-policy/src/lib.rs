@@ -1,7 +1,7 @@
 //! EnvCloak policy: project manifests, env files, bindings, project
-//! identity and the effective policy (SPEC §5 "Project manifest", §6.1
-//! steps 1 and 2, §10b). Caller evidence, grants and approvals join it in
-//! later M1 tasks.
+//! identity, caller evidence and the effective policy (SPEC §5 "Project
+//! manifest", §6.1 steps 1 to 3, §10a, §10b). Grants and approvals join it
+//! in later M1 tasks.
 //!
 //! - [`parse_manifest`]: `envcloak.toml`, whose `[policy]` can only tighten.
 //!   Errors are value-free: a [`ManifestErrorKind`] and an [`Origin`].
@@ -16,21 +16,37 @@
 //!   inode and its canonical path.
 //! - [`effective_policy`]: the vault's policy for the project tightened by
 //!   the manifest's.
+//! - [`AgentCatalog`]: the known agents, builtin (`integrations/agents.toml`)
+//!   and the user's add-only extensions; docs/AGENTS.md.
+//! - [`gather`]: a caller's evidence from the kernel's view of its
+//!   ancestry, its agents and its claims: the grant root, the subject's
+//!   kind, and whether a grant may cover it ([`SubjectEvidence`]).
 //!
 //! The formats are in docs/MANIFEST.md.
 
+mod agents;
+mod agents_builtin;
 mod bind;
 mod effective;
 mod envfile;
+mod evidence;
 mod manifest;
 mod names;
 mod project;
 
+pub use agents::{
+    AGENTS_DIR, AgentCatalog, AgentLabel, CatalogError, CatalogErrorKind, CatalogProblem,
+    CatalogSource, MAX_CATALOG_FILE, MAX_EXTENSION_FILES,
+};
 pub use bind::{BindError, BindErrorKind, BoundBinding, bind_items};
 pub use effective::{EffectivePolicy, SubjectKind, VaultProjectPolicy, effective_policy};
 pub use envfile::{
     EnvFileError, EnvFileErrorKind, EnvFileRef, EnvFileRefs, MAX_ENV_FILE, PlainVar,
     REFERENCE_SCHEME, parse_env_file_refs,
+};
+pub use evidence::{
+    Ancestor, Claims, ClaimsError, EvidenceError, GATHER_ATTEMPTS, ProcessInstance,
+    SubjectEvidence, gather, gather_in,
 };
 pub use manifest::{
     AgentsPolicy, Manifest, ManifestError, ManifestErrorKind, ManifestPolicy, Mode, Origin,

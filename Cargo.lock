@@ -298,6 +298,7 @@ dependencies = [
  "libc",
  "secrecy",
  "sha2",
+ "tempfile",
  "toml_edit",
 ]
 
