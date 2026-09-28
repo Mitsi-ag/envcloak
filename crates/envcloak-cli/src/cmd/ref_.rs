@@ -9,10 +9,13 @@
 //! comments, order, spacing and quoting stay, and a binding that is
 //! replaced keeps its comment. It is written atomically:
 //! 1. the manifest is opened through its directory's descriptor, never
-//!    through a symlink, and must be a regular file of this user, at most
-//!    64 KiB, that parses; its device, inode, size and modification time
-//!    are noted;
-//! 2. the new text must parse too, with the binding in place;
+//!    through a symlink, and must be a regular file of this user with no
+//!    other hard link, at most 64 KiB, that parses; its device, inode,
+//!    size and modification time are noted;
+//! 2. the new text must parse too, to the old manifest with the binding
+//!    set and nothing else changed: every other binding, in `[env]` and in
+//!    each profile, stays. A variable named like a profile in `[env]` is
+//!    refused, since writing it would replace the profile's table;
 //! 3. it is written to a new file beside the manifest (`O_EXCL`, mode 0600,
 //!    then the manifest's own mode), and flushed to disk;
 //! 4. the manifest is looked at again: when anything changed since step 1
@@ -65,6 +68,13 @@ pub enum EditError {
     NotOwned,
     /// A variable in `[env]` has the profile's name.
     ProfileClash,
+    /// `[env]` has a profile with the variable's name.
+    NameIsProfile,
+    /// The manifest has another hard link.
+    HardLinked,
+    /// The new manifest would differ from the old one in more than the
+    /// binding set.
+    OthersChanged,
     /// The manifest changed while it was edited.
     Changed,
     /// The new text is over 64 KiB.
@@ -91,6 +101,17 @@ impl From<EditError> for Failure {
             EditError::Changed => Failure::new(
                 "manifest_changed",
                 "envcloak.toml changed while it was edited, so nothing was written; run it again",
+            ),
+            EditError::NameIsProfile => invalid(
+                "[env] has a profile with the variable's name, so the variable cannot be \
+                 written there",
+            ),
+            EditError::HardLinked => invalid(
+                "envcloak.toml has another hard link, which replacing it would split from it, \
+                 so it is never replaced",
+            ),
+            EditError::OthersChanged => invalid(
+                "the edit would have changed more than the one binding, so nothing was written",
             ),
             EditError::TooLarge => invalid("the manifest would be larger than 64 KiB"),
             EditError::Io(_) => Failure::new(
@@ -129,7 +150,7 @@ impl Stamp {
 }
 
 /// Opens the manifest `name` in `dir` without following a symlink, and
-/// checks it is this user's regular file.
+/// checks it is this user's regular file, with no other hard link.
 fn open_manifest(dir: &File) -> Result<(File, std::fs::Metadata), EditError> {
     let f = envcloak_sys::open_beneath(dir, OsStr::new(MANIFEST_NAME)).map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) {
@@ -144,6 +165,11 @@ fn open_manifest(dir: &File) -> Result<(File, std::fs::Metadata), EditError> {
     }
     if m.uid() != envcloak_sys::effective_uid() {
         return Err(EditError::NotOwned);
+    }
+    // Replaced by a rename, a hard-linked file would split: its other name
+    // would keep the old bindings (SPEC §6.4: reported, never modified).
+    if m.nlink() > 1 {
+        return Err(EditError::HardLinked);
     }
     Ok((f, m))
 }
@@ -166,6 +192,34 @@ fn reference_of(item: &Item) -> Option<Reference> {
             })
         }
         _ => None,
+    }
+}
+
+/// Checks that `new_text` is the manifest `old` with `binding` set in
+/// `[env]`, or in `[env.<profile>]`, and nothing else changed: every other
+/// binding, in `[env]` and in every profile, the project name and the
+/// policy are as they were. A text edit that went wrong is refused here
+/// rather than written.
+fn check_edit(
+    old: &Manifest,
+    new_text: &str,
+    binding: &Binding,
+    profile: Option<&ProfileName>,
+) -> Result<(), EditError> {
+    let new = parse_manifest(new_text.as_bytes()).map_err(EditError::Manifest)?;
+    let mut expected = old.clone();
+    let list = match profile {
+        None => &mut expected.env,
+        Some(p) => expected.profiles.entry(p.clone()).or_default(),
+    };
+    list.retain(|b| b.env_name != binding.env_name);
+    list.push(binding.clone());
+    list.sort();
+    expected.sha256 = new.sha256;
+    if new == expected {
+        Ok(())
+    } else {
+        Err(EditError::OthersChanged)
     }
 }
 
@@ -202,6 +256,11 @@ fn edited_text(
     let new_text = binding.reference.to_string();
     let name = binding.env_name.as_str();
     let edit = match table.get_mut(name) {
+        // Under `[env]`, a standard or dotted table of that name is a
+        // profile, which a binding must never replace.
+        Some(item) if !matches!(item, Item::Value(Value::String(_) | Value::InlineTable(_))) => {
+            return Err(EditError::NameIsProfile);
+        }
         Some(item) => {
             let previous = reference_of(item);
             if previous.as_ref() == Some(&binding.reference) {
@@ -283,7 +342,7 @@ fn edit_with(
         .map_err(|e| io(&e))?;
     drop(file);
     // The manifest as it is must parse: an edit never hides a problem.
-    parse_manifest(&bytes).map_err(EditError::Manifest)?;
+    let old = parse_manifest(&bytes).map_err(EditError::Manifest)?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| EditError::Manifest(envcloak_policy::ManifestErrorKind::NotUtf8.into()))?;
     let (new_text, edit) = edited_text(text, binding, profile)?;
@@ -293,17 +352,9 @@ fn edit_with(
     if new_text.len() > Manifest::MAX_LEN {
         return Err(EditError::TooLarge);
     }
-    // The new manifest must parse, with the binding where it was put.
-    let parsed = parse_manifest(new_text.as_bytes()).map_err(EditError::Manifest)?;
-    let placed = match profile {
-        None => Some(&parsed.env),
-        Some(p) => parsed.profiles.get(p),
-    };
-    if !placed.is_some_and(|list| list.contains(binding)) {
-        return Err(EditError::Manifest(
-            envcloak_policy::ManifestErrorKind::WrongType.into(),
-        ));
-    }
+    // The new manifest must parse, with the binding where it was put and
+    // everything else as it was.
+    check_edit(&old, &new_text, binding, profile)?;
 
     let temp = temp_path(&dir_path);
     let result = write_and_replace(
@@ -663,6 +714,133 @@ agents = \"approve\" # never allow
             assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
             assert_eq!(std::fs::read_dir(q.path()).unwrap().count(), 1);
         }
+    }
+
+    /// A variable named like a profile never replaces the profile's table,
+    /// written as a table or with dotted keys: the edit is refused and the
+    /// manifest keeps every binding. (It once overwrote `[env.short]` with
+    /// `short = "x/y"`, dropping the profile's bindings, and said so as a
+    /// success.)
+    #[test]
+    fn a_variable_named_like_a_profile_never_replaces_it() {
+        for text in [
+            "[env]\nA = \"a/b\"\n\n[env.short]\nS = \"s/t\"\nT = \"u/v\"\n",
+            "[env]\nA = \"a/b\"\nshort.S = \"s/t\"\nshort.T = \"u/v\"\n",
+            "env.A = \"a/b\"\nenv.short.S = \"s/t\"\n",
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let p = manifest_in(d.path(), text);
+            let e = edit_manifest_ref(&p, &binding("short=x/y"), None).unwrap_err();
+            assert_eq!(e, EditError::NameIsProfile, "{text}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+            assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+            // The profile itself still takes new bindings.
+            let short = ProfileName::new("short").unwrap();
+            edit_manifest_ref(&p, &binding("U=x/y"), Some(&short)).unwrap();
+            let m = parse_manifest(&std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(m.env, vec![binding("A=a/b")], "{text}");
+            assert!(m.profiles[&short].contains(&binding("S=s/t")), "{text}");
+            assert!(m.profiles[&short].contains(&binding("U=x/y")), "{text}");
+        }
+    }
+
+    /// Whatever the text edit did, the new manifest must be the old one
+    /// with the one binding set: an edit that drops or changes any other
+    /// binding, in `[env]` or in a profile, the project name or the policy
+    /// is refused.
+    #[test]
+    fn an_edit_that_changes_anything_else_is_refused() {
+        let old = parse_manifest(
+            b"[project]\nname = \"p\"\n[env]\nA = \"a/b\"\n\n[env.short]\nS = \"s/t\"\n",
+        )
+        .unwrap();
+        let short = ProfileName::new("short").unwrap();
+        let ok = [
+            (
+                "[project]\nname = \"p\"\n[env]\nA = \"a/b\"\nB = \"c/d\"\n\n[env.short]\nS = \"s/t\"\n",
+                "B=c/d",
+                None,
+            ),
+            (
+                "[project]\nname = \"p\"\n[env]\nA = \"x/y\"\n\n[env.short]\nS = \"s/t\"\n",
+                "A=x/y",
+                None,
+            ),
+            (
+                "[project]\nname = \"p\"\n[env]\nA = \"a/b\"\n\n[env.short]\nS = \"x/y\"\n",
+                "S=x/y",
+                Some(&short),
+            ),
+        ];
+        for (new, b, profile) in ok {
+            assert_eq!(check_edit(&old, new, &binding(b), profile), Ok(()), "{new}");
+        }
+        let refused = [
+            // What the edit wrote when a variable was named like a profile.
+            (
+                "[project]\nname = \"p\"\n[env]\nA = \"a/b\"\nshort= \"x/y\"\n",
+                "short=x/y",
+                None,
+            ),
+            // Another binding dropped or changed, in [env] or a profile.
+            (
+                "[project]\nname = \"p\"\n[env]\nB = \"c/d\"\n\n[env.short]\nS = \"s/t\"\n",
+                "B=c/d",
+                None,
+            ),
+            (
+                "[project]\nname = \"p\"\n[env]\nA = \"a/b\"\nB = \"c/d\"\n\n[env.short]\nS = \"z/z\"\n",
+                "B=c/d",
+                None,
+            ),
+            // The binding put in the wrong table.
+            (
+                "[project]\nname = \"p\"\n[env]\nA = \"a/b\"\nS = \"x/y\"\n\n[env.short]\nS = \"s/t\"\n",
+                "S=x/y",
+                Some(&short),
+            ),
+            // The project name or the policy changed.
+            (
+                "[project]\nname = \"q\"\n[env]\nA = \"a/b\"\nB = \"c/d\"\n\n[env.short]\nS = \"s/t\"\n",
+                "B=c/d",
+                None,
+            ),
+            (
+                "[project]\nname = \"p\"\n[env]\nA = \"a/b\"\nB = \"c/d\"\n\n[env.short]\nS = \"s/t\"\n\
+                 [policy]\nagents = \"deny\"\n",
+                "B=c/d",
+                None,
+            ),
+        ];
+        for (new, b, profile) in refused {
+            assert_eq!(
+                check_edit(&old, new, &binding(b), profile),
+                Err(EditError::OthersChanged),
+                "{new}"
+            );
+        }
+    }
+
+    /// A manifest with another hard link is never replaced: a rename would
+    /// split the two names, and the other would keep the old bindings.
+    #[test]
+    fn a_hard_linked_manifest_is_left_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let p = manifest_in(d.path(), COMMENTED);
+        let other = d.path().join("other-link.toml");
+        std::fs::hard_link(&p, &other).unwrap();
+        let e = edit_manifest_ref(&p, &binding("C=d/e"), None).unwrap_err();
+        assert_eq!(e, EditError::HardLinked);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), COMMENTED);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), COMMENTED);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().ino(),
+            std::fs::metadata(&other).unwrap().ino()
+        );
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 2);
+        // Once the other name is gone, the edit goes ahead.
+        std::fs::remove_file(&other).unwrap();
+        edit_manifest_ref(&p, &binding("C=d/e"), None).unwrap();
     }
 
     #[test]

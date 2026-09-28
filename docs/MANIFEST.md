@@ -116,8 +116,8 @@ A `--env-file` is a dotenv-style file of at most 1 MiB. It can hold real values,
 
 The edit keeps the rest of the file as it was: comments, order, spacing and quoting stay, a new binding goes at the end of its table, and a replaced one keeps its comment. Setting a binding that is there already (in either form) writes nothing. The write is atomic:
 
-1. The manifest is opened as the daemon opens it (above): through its directory's descriptor, never through a symlink, a regular file of this user of at most 64 KiB. It must parse; its device, inode, size and modification time are noted.
-2. The new text must parse too, with the binding where it was put.
+1. The manifest is opened as the daemon opens it (above): through its directory's descriptor, never through a symlink, a regular file of this user of at most 64 KiB. It must have no other hard link (a rename would split the two names, and the other would keep the old bindings), and it must parse; its device, inode, size and modification time are noted.
+2. The new text must parse too, to the old manifest with the binding set and nothing else changed: every other binding, in `[env]` and in each profile, the project name and the policy stay as they were. A variable named like a profile (`envcloak ref short=...` when `[env.short]` exists) is refused, since it would replace the profile's table.
 3. It is written to `.envcloak.toml.<hex>.tmp` beside the manifest (`O_EXCL`, mode 0600, then the manifest's own mode) and flushed.
 4. The manifest is looked at again. When it changed (another program wrote it) or the directory's path names another directory, the new file is removed and nothing is replaced (`manifest_changed`).
 5. The new file is renamed over the manifest, and the directory flushed.
