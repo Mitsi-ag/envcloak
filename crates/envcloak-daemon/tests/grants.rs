@@ -81,7 +81,10 @@ impl Fixture {
     }
 
     fn request(&self, argv: &[&str]) -> DecisionView {
-        client(&self.home).run_request(&self.params(argv)).unwrap()
+        client(&self.home)
+            .run_request(&self.params(argv))
+            .unwrap()
+            .decision
     }
 
     /// Approves `id` with `opts`, computing the digest from what the
@@ -252,7 +255,7 @@ fn a_request_is_pending_until_approved_then_covered() {
     let mut fewer = f.params(&["true"]);
     fewer.refs = vec!["OPENAI_API_KEY=openai/acme-web".to_owned()];
     assert_eq!(
-        covered(&client(&f.home).run_request(&fewer).unwrap()),
+        covered(&client(&f.home).run_request(&fewer).unwrap().decision),
         grant
     );
 
@@ -308,7 +311,7 @@ fn a_request_is_pending_until_approved_then_covered() {
         (renamed, "OPENAI_KEY"),
         (profile, "SHORT_TOKEN"),
     ] {
-        match client(&f.home).run_request(&p).unwrap() {
+        match client(&f.home).run_request(&p).unwrap().decision {
             DecisionView::Pending { request } => {
                 let d = c.pending_get(&request, &[]).unwrap();
                 let asked: Vec<&str> = d
@@ -369,7 +372,7 @@ fn an_env_file_prompts_for_its_ungranted_references() {
         });
         p
     };
-    let ask = |p: &RunRequestParams| client(&f.home).run_request(p);
+    let ask = |p: &RunRequestParams| client(&f.home).run_request(p).map(|a| a.decision);
 
     // Granted references only, an ordinary variable in place of a bound
     // one, or an empty file: a subset, covered.
@@ -448,7 +451,7 @@ fn lock_and_restart_end_grants_and_pending_requests() {
     // Another binding set, so the grant does not cover it.
     let mut short = f.params(&["./emit"]);
     short.profile = Some("short".to_owned());
-    let other = pending(&client(&f.home).run_request(&short).unwrap());
+    let other = pending(&client(&f.home).run_request(&short).unwrap().decision);
     let st = c.status().unwrap();
     assert_eq!((st.approvals.grants, st.approvals.pending), (1, 1));
 
@@ -643,7 +646,7 @@ fn concurrent_requests_on_a_once_grant_cover_exactly_one() {
                     }
                 };
                 barrier.wait();
-                c.run_request(&params).unwrap()
+                c.run_request(&params).unwrap().decision
             })
         })
         .collect();
@@ -693,7 +696,7 @@ fn project_identity_and_manifest_errors() {
     let mut via_link = f.params(&["./emit"]);
     via_link.manifest = link.join("envcloak.toml").to_str().unwrap().to_owned();
     assert_eq!(
-        covered(&client(&f.home).run_request(&via_link).unwrap()),
+        covered(&client(&f.home).run_request(&via_link).unwrap().decision),
         grant
     );
 
@@ -701,7 +704,7 @@ fn project_identity_and_manifest_errors() {
     let mut via_copy = f.params(&["./emit"]);
     via_copy.manifest = copy.to_str().unwrap().to_owned();
     assert!(matches!(
-        client(&f.home).run_request(&via_copy).unwrap(),
+        client(&f.home).run_request(&via_copy).unwrap().decision,
         DecisionView::Pending { .. }
     ));
 

@@ -151,7 +151,7 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
     // Its ordinary variables' values stay here: the runner (T12) sets them
     // for the command.
     let env_file = a.env_file.as_deref().map(read_env_file).transpose()?;
-    let decision = client.run_request(&RunRequestParams {
+    let answer = client.run_request(&RunRequestParams {
         manifest,
         profile: a.profile,
         refs: a.refs,
@@ -160,6 +160,9 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
         claims: claims(),
     })?;
     drop(client);
+    // The values a covered answer carries are dropped, and wiped, unused
+    // until the runner starts the command with them.
+    let decision = answer.decision;
     match decision {
         DecisionView::Pending { request } => {
             // The id is printed only in its canonical form: a program

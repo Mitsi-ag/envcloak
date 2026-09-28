@@ -1022,13 +1022,13 @@ fn a_grant_for_the_terminal_does_not_cover_the_agent() {
         argv: vec!["./emit".to_owned()],
         claims: Vec::new(),
     };
-    let id = match c.run_request(&params).unwrap() {
+    let id = match c.run_request(&params).unwrap().decision {
         DecisionView::Pending { request } => request,
         other => panic!("{other:?}"),
     };
     f.approve(&id, &["--for", "1h"]);
     assert!(matches!(
-        c.run_request(&params).unwrap(),
+        c.run_request(&params).unwrap().decision,
         DecisionView::Covered { .. }
     ));
     // The agent, a child of this process, is not covered.

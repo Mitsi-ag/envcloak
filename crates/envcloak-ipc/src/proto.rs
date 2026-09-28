@@ -115,16 +115,77 @@ impl Method for Lock {
     type Output = LockedView;
 }
 
-/// `run.request`: the decision for a run (SPEC §6.1 steps 2 to 4, §10b):
-/// covered by a grant, pending an approval, or denied. No value crosses;
-/// the release path is T12's.
+/// `run.request`: the decision for a run (SPEC §6.1 steps 2 to 5, §10b):
+/// covered by a grant, pending an approval, or denied. A covered request
+/// is a delivery: its answer carries the value of each binding, sent only
+/// after the request's audit entry is on disk.
 #[derive(Debug)]
 pub struct RunRequest;
 
 impl Method for RunRequest {
     const NAME: &'static str = "run.request";
     type Params = RunRequestParams;
-    type Output = DecisionView;
+    type Output = RunAnswer;
+}
+
+/// What `run.request` answers: the decision, and with a covered one the
+/// values of the run's bindings, one per variable, in the order the daemon
+/// resolved them. Values cross only here, and only to a client that has
+/// verified the daemon (SPEC §4.4).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunAnswer {
+    pub decision: DecisionView,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<ReleasedValue>,
+}
+
+impl RunAnswer {
+    /// A decision that releases nothing.
+    pub fn decided(decision: DecisionView) -> Self {
+        RunAnswer {
+            decision,
+            values: Vec::new(),
+        }
+    }
+
+    /// Whether the answer has the shape a daemon sends: values only with a
+    /// covered decision, each under a variable name and a slug of the
+    /// right shape, no variable twice, and no value empty or holding a
+    /// NUL byte. A program answering in the daemon's place could send
+    /// anything (SPEC §1.1); a client uses no answer that fails this.
+    pub fn well_formed(&self) -> bool {
+        if !self.values.is_empty() && !matches!(self.decision, DecisionView::Covered { .. }) {
+            return false;
+        }
+        let mut names: Vec<&str> = Vec::with_capacity(self.values.len());
+        for v in &self.values {
+            let value = v.value.as_secret();
+            if EnvName::new(&v.env_name).is_err()
+                || envcloak_core::vault::Slug::new(&v.slug).is_err()
+                || value.is_empty()
+                || value.contains_byte(0)
+                || names.contains(&v.env_name.as_str())
+            {
+                return false;
+            }
+            names.push(&v.env_name);
+        }
+        true
+    }
+}
+
+/// One binding's value, released to a covered run.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleasedValue {
+    /// The variable the value is set in.
+    pub env_name: String,
+    /// The item's slug, which labels the value in redacted output.
+    pub slug: String,
+    /// The item takes values of 8 to 15 bytes (SPEC §6.1 step 6).
+    pub allow_short: bool,
+    pub value: WireSecret,
 }
 
 /// What `envcloak run` sends: the manifest it found, the bindings it asks

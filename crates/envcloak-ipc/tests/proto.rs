@@ -433,3 +433,104 @@ fn item_requests_carry_values_only_where_a_value_goes() {
     is_view::<envcloak_ipc::view::RefEditView>();
     is_view::<envcloak_ipc::view::RemovedView>();
 }
+
+/// `run.request`'s answer: a covered one carries the values through a
+/// frame intact, and a client takes only an answer of the shape a daemon
+/// sends. Values beside another decision, a variable or slug of the wrong
+/// shape, a variable twice, and an empty value or one with a NUL byte are
+/// refused; the frame and `Debug` output show no value.
+#[test]
+fn a_run_answer_carries_values_only_when_covered_and_well_formed() {
+    use envcloak_ipc::proto::{ReleasedValue, RunAnswer, RunRequest};
+    use envcloak_ipc::view::DecisionView;
+    use envcloak_policy::Mode;
+
+    let cs = canaries(fresh_seed());
+    let v = |label: &str| WireSecret::new(SecretBytes::copy_from(by_label(&cs, label).value()));
+    let released = |env: &str, slug: &str, value: WireSecret| ReleasedValue {
+        env_name: env.to_owned(),
+        slug: slug.to_owned(),
+        allow_short: false,
+        value,
+    };
+    let covered = || DecisionView::Covered {
+        grant: "0".repeat(26),
+        redact: true,
+        mode: Mode::Inject,
+        manifest_changed: false,
+    };
+    let good = RunAnswer {
+        decision: covered(),
+        values: vec![
+            released(
+                "OPENAI_API_KEY",
+                "openai/acme-web",
+                v(labels::OPENAI_API_KEY),
+            ),
+            released(
+                "STRIPE_SECRET_KEY",
+                "stripe/acme-web",
+                v(labels::STRIPE_SECRET_KEY),
+            ),
+        ],
+    };
+    assert!(good.well_formed());
+    let f = proto::result_frame(9, &good).unwrap();
+    assert_no_canary(format!("{f:?}{good:?}").as_bytes(), &cs);
+    let back: RunAnswer = proto::parse_response::<<RunRequest as Method>::Output>(&f, 9).unwrap();
+    assert!(back.well_formed());
+    assert!(
+        back.values[0]
+            .value
+            .as_secret()
+            .ct_eq(by_label(&cs, labels::OPENAI_API_KEY).value())
+    );
+    let pending = || DecisionView::Pending {
+        request: "ABCDEFGH".into(),
+    };
+    assert!(RunAnswer::decided(pending()).well_formed());
+
+    let one = |env: &str, slug: &str, value: WireSecret| vec![released(env, slug, value)];
+    let bad = [
+        RunAnswer {
+            decision: pending(),
+            values: one("A", "a/b", v(labels::OPENAI_API_KEY)),
+        },
+        RunAnswer {
+            decision: DecisionView::Denied {
+                reason: "repeated".into(),
+            },
+            values: one("A", "a/b", v(labels::OPENAI_API_KEY)),
+        },
+        RunAnswer {
+            decision: covered(),
+            values: one("NOT=A NAME", "a/b", v(labels::OPENAI_API_KEY)),
+        },
+        RunAnswer {
+            decision: covered(),
+            values: one("A", "Not A Slug", v(labels::OPENAI_API_KEY)),
+        },
+        RunAnswer {
+            decision: covered(),
+            values: vec![
+                released("A", "a/b", v(labels::OPENAI_API_KEY)),
+                released("A", "c/d", v(labels::STRIPE_SECRET_KEY)),
+            ],
+        },
+        RunAnswer {
+            decision: covered(),
+            values: one("A", "a/b", WireSecret::new(SecretBytes::copy_from(b""))),
+        },
+        RunAnswer {
+            decision: covered(),
+            values: one(
+                "A",
+                "a/b",
+                WireSecret::new(SecretBytes::copy_from(b"a value\0with a NUL")),
+            ),
+        },
+    ];
+    for (i, a) in bad.iter().enumerate() {
+        assert!(!a.well_formed(), "case {i}");
+    }
+}

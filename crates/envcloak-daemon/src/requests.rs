@@ -1,8 +1,8 @@
 //! The grant methods (SPEC §6.1 steps 2 to 4, §10a, §10b): `run.request`,
 //! `pending.get`, `approve`, `deny`, `grants.list` and `grants.revoke`.
 //!
-//! `run.request` decides only; no value crosses the socket in this build
-//! (the release path is T12's). For every request the daemon:
+//! `run.request` decides, and a covered request is a delivery: its answer
+//! carries the bindings' values. For every request the daemon:
 //! 1. reads the caller's evidence from the kernel ([`gather`]), with the
 //!    marker names the caller claims;
 //! 2. opens the manifest itself, from the path the caller sent, and
@@ -20,10 +20,14 @@
 //!    grant, consumes it under the same lock;
 //! 6. records the decision in the audit log, with the command line masked
 //!    for the request's values and the registry's key patterns
-//!    ([`crate::redact`]). A covered request is a delivery: its entry is
-//!    written and flushed before the answer, which T12's release follows,
-//!    and when it cannot be written the request is denied (`audit_failed`)
-//!    and a `once` grant is left unused (SPEC §6.1 step 5, gate 33).
+//!    ([`crate::redact`]). A covered request is a delivery
+//!    ([`crate::state::State::deliver`]): under a tracer nothing is read;
+//!    otherwise the values are read from the verified vault, the entry is
+//!    written and flushed, and only then do the values go into the answer.
+//!    When a value cannot be read (the vault changed on disk and turns
+//!    tampered) nothing is released; when the entry cannot be written the
+//!    request is denied (`audit_failed`), the values are dropped, and a
+//!    `once` grant is left unused (SPEC §6.1 step 5, gate 33).
 //!
 //! `approve` takes the passphrase as the proof. Before Argon2id runs, the
 //! approver must be a terminal subject with no agent by any evidence
@@ -41,15 +45,15 @@ use std::path::Path;
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::{ProjectSummary, SubjectSummary};
 use envcloak_core::crypto::CryptoErrorKind;
-use envcloak_core::vault::{ItemId, Slug, Vault, VaultErrorKind};
-use envcloak_ipc::RpcError;
+use envcloak_core::vault::{FieldId, ItemId, Slug, Vault, VaultErrorKind};
 use envcloak_ipc::proto::{
-    ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, RequestParams, RevokeParams,
-    RunRequestParams,
+    ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, ReleasedValue, RequestParams,
+    RevokeParams, RunAnswer, RunRequestParams,
 };
 use envcloak_ipc::view::{
     ApprovedView, DecisionView, DeniedView, GrantBindingView, GrantView, GrantsView, RevokedView,
 };
+use envcloak_ipc::{RpcError, WireSecret};
 use envcloak_policy::{
     AccessRequest, ApprovalProof, ApproveError, BindError, Binding, BoundRef, Claims, Decision,
     DenyReason, EvidenceError, GrantId, ManifestError, Mode, PendingDescriptor, PendingId,
@@ -62,7 +66,7 @@ use crate::audit::{AuditEvent, RequestAudit};
 use crate::clock::now_of;
 use crate::lock::Reading;
 use crate::server::{Shared, locked, refuse_if_traced};
-use crate::state::vault_reason;
+use crate::state::{Delivery, vault_reason};
 
 /// Refuses a proof, or the statement a proof would approve, from a caller
 /// that may not give one (SPEC §10b): an agent by any evidence, or no
@@ -219,12 +223,34 @@ fn masked_argv(shared: &Shared, vault: &Vault, bound: &[BoundRef], argv: &[Strin
     crate::redact::redact_argv(argv, &values, shared.registry.as_ref())
 }
 
+/// What a covered request releases, in the order of its bindings: each
+/// field to read, and the variable, slug and `allow_short` its value goes
+/// out with.
+type ReleasePlan = (Vec<FieldId>, Vec<(String, String, bool)>);
+
+fn release_plan(vault: &Vault, bound: &[BoundRef]) -> Result<ReleasePlan, RpcError> {
+    let mut fields = Vec::with_capacity(bound.len());
+    let mut meta = Vec::with_capacity(bound.len());
+    for b in bound {
+        let item = vault
+            .item(b.binding.item)
+            .ok_or(RpcError::new(ErrorKind::Internal))?;
+        fields.push(b.binding.field);
+        meta.push((
+            b.binding.env_name.as_str().to_owned(),
+            b.slug.as_str().to_owned(),
+            item.details.allow_short,
+        ));
+    }
+    Ok((fields, meta))
+}
+
 /// `run.request`. See the module documentation.
 pub fn run_request(
     shared: &Shared,
     peer: &PeerIdentity,
     p: RunRequestParams,
-) -> Result<DecisionView, RpcError> {
+) -> Result<RunAnswer, RpcError> {
     let subject = evidence(shared, peer, &p.claims)?;
     let profile = p
         .profile
@@ -360,19 +386,25 @@ pub fn run_request(
                 if let Some(p) = covered.project.as_mut() {
                     p.approved_sha256 = approved;
                 }
-                let delivered = s.audit_delivery(AuditEvent::Request(Box::new(covered)));
-                if !delivered {
-                    let reason = DenyReason::AuditFailed.token();
-                    s.audit(AuditEvent::Request(Box::new(RequestAudit {
-                        decision: "denied",
-                        grant_id: Some(g.to_string()),
-                        reason: Some(reason),
-                        ..entry
-                    })));
-                    break DecisionView::Denied {
-                        reason: reason.to_owned(),
-                    };
-                }
+                // The daemon hands out no value under a tracer.
+                refuse_if_traced()?;
+                let (fields, released) = release_plan(s.unlocked()?, &again.bindings)?;
+                let values = match s.deliver(AuditEvent::Request(Box::new(covered)), &fields) {
+                    Ok(values) => values,
+                    Err(Delivery::Refused(e)) => return Err(e),
+                    Err(Delivery::AuditFailed) => {
+                        let reason = DenyReason::AuditFailed.token();
+                        s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                            decision: "denied",
+                            grant_id: Some(g.to_string()),
+                            reason: Some(reason),
+                            ..entry
+                        })));
+                        break RunAnswer::decided(DecisionView::Denied {
+                            reason: reason.to_owned(),
+                        });
+                    }
+                };
                 if let Some(approved_sha256) = approved {
                     s.audit(AuditEvent::ManifestChanged {
                         pid: peer.pid,
@@ -387,11 +419,23 @@ pub fn run_request(
                     return Err(RpcError::new(ErrorKind::Internal));
                 }
                 s.touch(Reading::now(&shared.clocks));
-                break DecisionView::Covered {
-                    grant: g.to_string(),
-                    redact,
-                    mode: policy.mode,
-                    manifest_changed: changed,
+                break RunAnswer {
+                    decision: DecisionView::Covered {
+                        grant: g.to_string(),
+                        redact,
+                        mode: policy.mode,
+                        manifest_changed: changed,
+                    },
+                    values: released
+                        .into_iter()
+                        .zip(values)
+                        .map(|((env_name, slug, allow_short), value)| ReleasedValue {
+                            env_name,
+                            slug,
+                            allow_short,
+                            value: WireSecret::new(value),
+                        })
+                        .collect(),
                 };
             }
             Decision::Pending(id) => {
@@ -400,9 +444,9 @@ pub fn run_request(
                     request_id: Some(id.to_string()),
                     ..entry
                 })));
-                break DecisionView::Pending {
+                break RunAnswer::decided(DecisionView::Pending {
                     request: id.to_string(),
-                };
+                });
             }
             Decision::Denied(reason) => {
                 s.audit(AuditEvent::Request(Box::new(RequestAudit {
@@ -410,9 +454,9 @@ pub fn run_request(
                     reason: Some(reason.token()),
                     ..entry
                 })));
-                break DecisionView::Denied {
+                break RunAnswer::decided(DecisionView::Denied {
                     reason: reason.token().to_owned(),
-                };
+                });
             }
         }
     };

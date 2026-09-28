@@ -9,8 +9,9 @@
 //! adds up to a false sleep. The idle limit counts time awake since the
 //! last activity, and the machine sleeping locks anyway.
 //!
-//! Activity is a request that used the vault key: `unlock` and
-//! `vault create` in M1, and every value release from T12 on. `status` and
+//! Activity is a request that used the vault key: `unlock`, `vault
+//! create`, `approve`, and a covered `run.request`, which releases values.
+//! `status` and
 //! `lock` are not activity, so polling the daemon never keeps the vault
 //! open.
 

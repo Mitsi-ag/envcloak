@@ -41,11 +41,11 @@
 
 use std::time::Duration;
 
-use envcloak_core::PassphraseRejected;
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{
-    AuditHead, Integrity, LockedVault, Vault, VaultError, VaultErrorKind, VaultPaths,
+    AuditHead, FieldId, Integrity, LockedVault, Vault, VaultError, VaultErrorKind, VaultPaths,
 };
+use envcloak_core::{PassphraseRejected, SecretBytes};
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::{
@@ -78,6 +78,16 @@ impl core::fmt::Debug for Slot {
             Slot::Unavailable(_) => "Unavailable",
         })
     }
+}
+
+/// Why [`State::deliver`] released nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The vault is not unlocked and verified, or a value could not be
+    /// read.
+    Refused(RpcError),
+    /// The delivery's audit entry could not be written.
+    AuditFailed,
 }
 
 /// What `begin_unlock` found.
@@ -460,6 +470,43 @@ impl State {
                 false
             }
         }
+    }
+
+    /// A covered request's delivery (SPEC §6.1 step 5, gate 33): reads the
+    /// value of each field from the verified vault, then writes the
+    /// delivery's entry durably, and only then gives the values out. The
+    /// values are the only way to a release, so none leaves the daemon
+    /// before its entry is on disk.
+    ///
+    /// # Errors
+    /// [`Delivery::Refused`] when the vault is not unlocked and verified,
+    /// or a value cannot be read (a vault that turns out changed on disk
+    /// is marked tampered by the read, and releases nothing more). Nothing
+    /// is recorded then. [`Delivery::AuditFailed`] when the entry could
+    /// not be written; the values read are dropped, and wiped.
+    pub fn deliver(
+        &mut self,
+        e: AuditEvent,
+        fields: &[FieldId],
+    ) -> Result<Vec<SecretBytes>, Delivery> {
+        let vault = self.unlocked().map_err(Delivery::Refused)?;
+        let values = fields
+            .iter()
+            .map(|f| vault.read_value(*f))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                Delivery::Refused(match e.kind() {
+                    VaultErrorKind::Tampered => RpcError::new(ErrorKind::VaultTampered),
+                    k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
+                })
+            })?;
+        if vault.integrity() != Integrity::Ok {
+            return Err(Delivery::Refused(RpcError::new(ErrorKind::VaultTampered)));
+        }
+        if !self.audit_delivery(e) {
+            return Err(Delivery::AuditFailed);
+        }
+        Ok(values)
     }
 
     /// The tick's part: saves the head when 15 minutes passed awake with
@@ -1305,5 +1352,75 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Gate 33's release order, at the one place values are released
+    /// from: `deliver` gives values out only after the delivery's entry
+    /// reads back from the log on disk, and when the entry cannot be
+    /// written it gives none. On a locked vault it reads nothing.
+    #[test]
+    fn values_are_released_only_after_their_entry_is_on_disk() {
+        use envcloak_core::crypto::ItemClass;
+        use envcloak_core::vault::{FieldName, ItemDetails, NewItem, Slug};
+
+        const VALUE: &[u8] = b"a value of forty bytes, made for this..";
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        create(&f, &mut s);
+        let field = s
+            .unlocked_mut()
+            .unwrap()
+            .transact(|t| {
+                let id = t.create_item(NewItem {
+                    class: ItemClass::Secret,
+                    slug: Slug::new("a/b").unwrap(),
+                    details: ItemDetails::default(),
+                })?;
+                t.add_field(
+                    id,
+                    FieldName::new("value").unwrap(),
+                    SecretBytes::copy_from(VALUE),
+                )
+            })
+            .unwrap();
+        let delivery = |pid| {
+            AuditEvent::Request(Box::new(crate::audit::RequestAudit {
+                pid,
+                decision: "covered",
+                request_id: None,
+                grant_id: None,
+                reason: None,
+                subject: Default::default(),
+                project: None,
+                items: Vec::new(),
+                argv: Vec::new(),
+            }))
+        };
+
+        let values = s.deliver(delivery(1), &[field]).unwrap();
+        // The values exist: the entry is already in the log's files.
+        assert_eq!(
+            entries(&s).last().map(|e| e.2.clone()),
+            Some("covered".into())
+        );
+        assert!(values[0].ct_eq(VALUE));
+
+        // No entry can be written: no values.
+        let dir = &f.paths.audit_dir;
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::write(dir, b"in the way").unwrap();
+        assert_eq!(
+            s.deliver(delivery(2), &[field]).unwrap_err(),
+            Delivery::AuditFailed
+        );
+        std::fs::remove_file(dir).unwrap();
+        assert_eq!(s.deliver(delivery(3), &[field]).unwrap().len(), 1);
+
+        // Locked: refused before anything is read or written.
+        s.lock(LockReason::Request);
+        assert_eq!(
+            s.deliver(delivery(4), &[field]).unwrap_err(),
+            Delivery::Refused(RpcError::new(ErrorKind::VaultLocked))
+        );
     }
 }

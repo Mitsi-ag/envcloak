@@ -34,14 +34,14 @@ use crate::proto::{
     self, AddParams, Approve, ApproveParams, AuditVerify, CheckParams, Deny, GrantsList,
     GrantsRevoke, ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow,
     ItemsTarget, ListParams, Lock, Method, NoParams, PendingGet, PendingGetParams, RemoveParams,
-    RequestParams, ResponseError, RevokeParams, RotateParams, RpcError, RunRequest,
+    RequestParams, ResponseError, RevokeParams, RotateParams, RpcError, RunAnswer, RunRequest,
     RunRequestParams, SlugParams, Status, TargetParams, Unlock, UnlockParams, VaultCreate,
     VaultCreateParams,
 };
 use crate::view::{
-    AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DecisionView, DeniedView,
-    GrantsView, ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView,
-    TargetView, UnlockedView,
+    AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
+    ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
+    UnlockedView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -292,12 +292,20 @@ impl Client {
         self.call::<Lock>(&NoParams {})
     }
 
-    /// `run.request`: the decision for a run.
+    /// `run.request`: the decision for a run, and the values a covered
+    /// one releases.
     ///
     /// # Errors
-    /// As [`Client::call`].
-    pub fn run_request(&mut self, p: &RunRequestParams) -> Result<DecisionView, ClientError> {
-        self.call::<RunRequest>(p)
+    /// As [`Client::call`], and [`ClientError::Protocol`] for an answer
+    /// that is not [`RunAnswer::well_formed`]; its values are dropped, and
+    /// wiped, unused.
+    pub fn run_request(&mut self, p: &RunRequestParams) -> Result<RunAnswer, ClientError> {
+        let answer = self.call::<RunRequest>(p)?;
+        if answer.well_formed() {
+            Ok(answer)
+        } else {
+            Err(ClientError::Protocol)
+        }
     }
 
     /// `pending.get` for request `id`, with the caller's claims (the

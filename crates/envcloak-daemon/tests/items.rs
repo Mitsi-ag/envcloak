@@ -99,7 +99,8 @@ impl Fixture {
             argv: vec!["./emit".into()],
             claims: Vec::new(),
         };
-        let DecisionView::Pending { request } = client(&self.home).run_request(&params).unwrap()
+        let DecisionView::Pending { request } =
+            client(&self.home).run_request(&params).unwrap().decision
         else {
             panic!("expected a pending request");
         };
@@ -113,21 +114,23 @@ impl Fixture {
             .unwrap()
             .grant;
         assert!(matches!(
-            client(&self.home).run_request(&params).unwrap(),
+            client(&self.home).run_request(&params).unwrap().decision,
             DecisionView::Covered { .. }
         ));
         grant
     }
 
     fn run_decision(&self) -> Result<DecisionView, ClientError> {
-        client(&self.home).run_request(&RunRequestParams {
-            manifest: self.manifest.clone(),
-            profile: None,
-            refs: Vec::new(),
-            env_file: None,
-            argv: vec!["./emit".into()],
-            claims: Vec::new(),
-        })
+        client(&self.home)
+            .run_request(&RunRequestParams {
+                manifest: self.manifest.clone(),
+                profile: None,
+                refs: Vec::new(),
+                env_file: None,
+                argv: vec!["./emit".into()],
+                claims: Vec::new(),
+            })
+            .map(|a| a.decision)
     }
 
     fn target(&self, slug: &str) -> TargetView {

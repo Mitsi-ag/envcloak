@@ -84,6 +84,7 @@ impl Fixture {
                 claims: Vec::new(),
             })
             .unwrap()
+            .decision
     }
 
     fn approve(&self, id: &str, opts: ApprovalOptions, pass: &[u8]) -> Option<String> {
