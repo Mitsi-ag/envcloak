@@ -563,6 +563,36 @@ unsafe impl GlobalAlloc for ProbeAllocator {
     }
 }
 
+/// Linux: whether [`crate::peer_identity`] skips `SO_PEERPIDFD` and takes
+/// the `SO_PEERCRED` fallback, as on kernels before 6.5.
+static PEERCRED_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Linux: makes [`crate::peer_identity`] take the `SO_PEERCRED` fallback
+/// (true) or use `SO_PEERPIDFD` where the kernel has it (false, the
+/// default), so tests cover both paths on one kernel. Process-wide.
+pub fn force_peercred_fallback(on: bool) {
+    PEERCRED_FALLBACK.store(on, Ordering::SeqCst);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn peercred_fallback_forced() -> bool {
+    PEERCRED_FALLBACK.load(Ordering::SeqCst)
+}
+
+/// Sends `sig` to the calling thread only, with `pthread_kill`. A signal
+/// the thread blocks then stays pending for it, where
+/// [`crate::TerminationSignals::wait`] collects it, instead of reaching
+/// another thread.
+pub fn signal_this_thread(sig: i32) -> io::Result<()> {
+    // SAFETY: pthread_self is valid for the calling thread, and pthread_kill
+    // with a valid signal number only queues the signal.
+    let rc = unsafe { libc::pthread_kill(libc::pthread_self(), sig) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
 /// Asks the kernel to let the parent process trace this one
 /// (`PTRACE_TRACEME` on Linux, `PT_TRACE_ME` on macOS). Used to test
 /// [`crate::tracer_present`] from a child process. Never call it in a

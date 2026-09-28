@@ -11,6 +11,13 @@
 //!   the uid a trusted directory must belong to.
 //! - [`open_beneath`]: `openat` from a directory handle, never following a
 //!   symlink and never blocking on a FIFO.
+//! - The daemon's socket and lifecycle: [`peer_identity`] and [`peer_uid`]
+//!   (who is on the other end of a Unix socket), [`try_lock_exclusive`]
+//!   (`flock`), [`TerminationSignals`] (`sigwait` on SIGTERM, SIGINT and
+//!   SIGHUP), and [`awake_time`] and [`time_including_sleep`] (the clock
+//!   pair that shows the machine slept).
+//! - The CLI's secret input: [`SecretInput`] (a terminal with echo off)
+//!   and [`inherited_fd`] (a descriptor named by `--passphrase-fd`).
 //!
 //! Every other crate inherits the workspace's `unsafe_code = "forbid"`, so
 //! the compiler rejects unsafe code there and any `allow` of it. This crate
@@ -21,16 +28,31 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 mod alloc;
+mod clock;
+mod fd;
 mod fs;
 mod harden;
+mod lockfile;
+mod peer;
 mod perm;
+mod signal;
 #[cfg(feature = "testing")]
 pub mod testing;
+mod tty;
 
 pub use alloc::{SystemBacking, WipingAllocator, wiping_allocator_active};
+pub use clock::{awake_time, time_including_sleep};
+pub use fd::{cloexec_flag, inherited_fd};
 pub use fs::open_beneath;
 pub use harden::{
     Hardening, core_dump_limit, disable_core_dumps, harden_process, hardening_report,
     hardening_status, lock_memory, parse_tracer_pid, set_non_dumpable, tracer_present,
 };
+pub use lockfile::try_lock_exclusive;
+pub use peer::{
+    PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_identity, peer_uid,
+    process_start_time,
+};
 pub use perm::{PRIVATE_UMASK, effective_uid, restrict_umask};
+pub use signal::TerminationSignals;
+pub use tty::SecretInput;
