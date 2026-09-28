@@ -591,7 +591,9 @@ fn forged_approvals_approve_nothing() {
 
     // The request went with the lock; a new one, on a terminal of the
     // agent's own: `y` typed there approves nothing, and the request
-    // stays for a person.
+    // stays for a person. It is typed once the whole refusal line is out:
+    // the line is written in pieces, and the terminal's echo of a `y`
+    // typed after the first piece would split it.
     let fixture = testkit_bin("fixture-agent");
     let argv: Vec<&str> = vec![
         fixture.to_str().unwrap(),
@@ -601,7 +603,12 @@ fn forged_approvals_approve_nothing() {
         "--",
         "./emit",
     ];
-    let (out, code) = drive_from(&f.home, &f.project, &argv, &[("approval_required", "y\r")]);
+    let (out, code) = drive_from(
+        &f.home,
+        &f.project,
+        &argv,
+        &[("in a terminal you control", "y\r")],
+    );
     assert_eq!(code, 125, "{}", stdout(&out));
     let shown = stdout(&out);
     let id = request_id(&shown);
