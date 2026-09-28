@@ -65,4 +65,4 @@ pub use proc::{
     proc_info, reaches_top,
 };
 pub use signal::{TerminationSignals, TerminationWatch, exit_by_signal, termination_recorded};
-pub use tty::SecretInput;
+pub use tty::{SecretInput, wait_readable};

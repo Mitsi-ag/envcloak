@@ -16,9 +16,12 @@
 //!
 //! A `SIGTERM`, `SIGINT` or `SIGHUP` sent to the process while it reads is
 //! recorded by a [`envcloak_sys::TerminationWatch`] instead of ending the
-//! process on the spot: the read returns, the terminal's settings come
-//! back, and only then does the process end by that signal, as it would
-//! have without the watch. `SIGKILL` cannot be caught; a terminal left in
+//! process on the spot: the reader, which waits for input in short steps
+//! ([`envcloak_sys::wait_readable`]) and looks for a record between them,
+//! stops, the terminal's settings come back, and only then does the
+//! process end by that signal, as it would have without the watch. A
+//! signal that arrives just before a read would interrupt nothing, so the
+//! reader never blocks in `read` itself. `SIGKILL` cannot be caught; a terminal left in
 //! secret-input mode by it is restored by the next `reset` or `stty sane`.
 
 use std::fs::{File, OpenOptions};
@@ -39,6 +42,10 @@ pub const MAX_SECRET: usize = 1024;
 /// arrived for this long, and for at most [`DISCARD_LIMIT`].
 const DISCARD_QUIET: Duration = Duration::from_millis(200);
 const DISCARD_LIMIT: Duration = Duration::from_secs(3);
+
+/// How long the reader waits for a key before it looks for a recorded
+/// termination signal again.
+const SIGNAL_CHECK: Duration = Duration::from_millis(100);
 
 /// Why no secret was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +163,20 @@ fn read_keys(mut tty: &File) -> Result<SecretBytes, InputError> {
     let mut chars: Vec<u8> = Vec::new();
     let mut b = [0u8; 1];
     loop {
+        // A signal that arrives before `read` blocks interrupts nothing,
+        // so the read would wait for a key: wait for input in short steps
+        // instead, looking for a recorded signal between them.
+        loop {
+            if let Some(sig) = envcloak_sys::termination_recorded() {
+                return Err(InputError::Terminated(sig));
+            }
+            match envcloak_sys::wait_readable(tty.as_fd(), SIGNAL_CHECK) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(InputError::Io),
+            }
+        }
         match tty.read(&mut b) {
             // The terminal hung up.
             Ok(0) => return Err(InputError::Io),
@@ -227,4 +248,35 @@ pub fn read_secret_fd(fd: i32) -> Result<SecretBytes, InputError> {
         return Err(InputError::Empty);
     }
     Ok(buf.freeze())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A termination signal that arrives after the prompt and before the
+    /// read blocks still ends the entry, without a key being pressed: the
+    /// reader does not sit in a read the signal never interrupted.
+    #[test]
+    fn a_signal_before_the_read_still_ends_the_entry() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let input = File::from(OwnedFd::from(a));
+        let watch = envcloak_sys::TerminationWatch::install().unwrap();
+        envcloak_sys::testing::signal_this_thread(libc::SIGTERM).unwrap();
+        assert_eq!(watch.recorded(), Some(libc::SIGTERM));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_keys(&input).map(|_| ()));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        drop(watch);
+        assert_eq!(got, Ok(Err(InputError::Terminated(libc::SIGTERM))));
+        // The other end was open all along: only the signal ended the read.
+        drop(b);
+    }
 }

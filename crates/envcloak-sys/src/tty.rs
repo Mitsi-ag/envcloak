@@ -134,10 +134,61 @@ impl<'a> SecretInput<'a> {
     }
 }
 
+/// Waits at most `timeout` for `fd` to have input to read, or to have hung
+/// up. Returns whether it has. A signal handled meanwhile ends the wait
+/// with an error of kind [`io::ErrorKind::Interrupted`].
+///
+/// A reader that must notice a signal recorded by a handler waits in
+/// short steps with this rather than blocking in `read`: a signal that
+/// arrives after the reader last looked and before `read` blocks
+/// interrupts nothing, and the read would wait for a key.
+///
+/// # Errors
+/// When `poll` fails, `EINTR` included.
+pub fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `p` is one initialized pollfd, and the descriptor stays open
+    // for the call.
+    let rc = unsafe { libc::poll(&mut p, 1, ms) };
+    match rc {
+        0 => Ok(false),
+        n if n > 0 => Ok(true),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
 impl Drop for SecretInput<'_> {
     fn drop(&mut self) {
         // TCSAFLUSH: input not read yet is discarded, not left for the next
         // reader with echo back on.
         let _ = set(self.fd, libc::TCSAFLUSH, &self.saved);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    use super::wait_readable;
+
+    #[test]
+    fn waits_for_input_or_a_hang_up() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        assert!(!wait_readable(a.as_fd(), Duration::from_millis(50)).unwrap());
+        assert!(start.elapsed() >= Duration::from_millis(40));
+        b.write_all(b"x").unwrap();
+        assert!(wait_readable(a.as_fd(), Duration::from_secs(5)).unwrap());
+        let (c, d) = UnixStream::pair().unwrap();
+        drop(d);
+        assert!(wait_readable(c.as_fd(), Duration::from_secs(5)).unwrap());
     }
 }
