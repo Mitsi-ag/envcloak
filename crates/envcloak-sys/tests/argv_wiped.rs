@@ -19,11 +19,17 @@
 //! through `ctypes`, and `node`, whose `process.title` rewrites it over a
 //! short command line. Each runs with a cleared environment whose first
 //! variable holds a marker made at run time.
+//!
+//! The probe sees blocks freed by every thread, and the two tests' markers
+//! can share a 12-byte window, so one test's fixture teardown could count
+//! as the other's leak (review finding F-41). Each test holds [`FIXTURE`]
+//! for its whole fixture's life, from the marker to the child's reaping.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeSession};
 use envcloak_sys::{Argv, proc_argv, proc_info};
@@ -32,6 +38,13 @@ use envcloak_sys::{Argv, proc_argv, proc_info};
 static ALLOCATOR: ProbeAllocator = ProbeAllocator;
 
 const WINDOW: usize = 12;
+
+/// Held by each test for its fixture's whole life.
+static FIXTURE: Mutex<()> = Mutex::new(());
+
+fn fixture() -> MutexGuard<'static, ()> {
+    FIXTURE.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The marker's variable. Variables are passed in name order, so it is the
 /// first environment string (the fillers follow, then `PATH`).
@@ -153,6 +166,7 @@ sys.stdin.read()
 
 #[test]
 fn a_rewritten_argument_area_is_held_wiped_and_never_shown() {
+    let _fixture = fixture();
     for mode in ["separators", "all"] {
         let m = marker(&mode[..1]);
         let child = Ready::start(Command::new("python3").args(["-c", PY_REWRITE, mode]), &m);
@@ -198,6 +212,7 @@ fn node() -> Option<PathBuf> {
 /// environment.
 #[test]
 fn node_with_a_long_process_title() {
+    let _fixture = fixture();
     let Some(node) = node() else {
         return;
     };
