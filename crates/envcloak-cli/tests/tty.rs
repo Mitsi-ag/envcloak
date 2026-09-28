@@ -16,9 +16,12 @@ use envcloak_testkit::{TestHome, assert_no_canary, by_label, canaries, fresh_see
 
 /// Runs argv[2..] on a new pseudo-terminal. argv[1] is a JSON file of
 /// steps `[expect, send]`: wait until the terminal shows `expect`, then
-/// type `send`. `@SUGGESTED@` in `send` stands for the generated
-/// passphrase the terminal showed. Prints everything the terminal showed,
-/// then the exit code on stderr.
+/// type `send`, a piece at a time while the terminal's output is read, so
+/// a paste larger than the terminal's input queue arrives whole.
+/// `@SUGGESTED@` in `send` stands for the generated passphrase the
+/// terminal showed, and `@PAUSE@` for a pause of 50 ms, as between two
+/// pieces of a paste. Prints everything the terminal showed, then the exit
+/// code on stderr.
 const DRIVER: &str = r#"import json, os, pty, re, select, sys, time
 steps = json.load(open(sys.argv[1]))
 pid, fd = pty.fork()
@@ -47,7 +50,19 @@ for expect, send in steps:
     if '@SUGGESTED@' in send:
         words = re.search(rb'Write it down:\r?\n\r?\n    ([a-z -]+)\r?\n', out).group(1).decode()
         send = send.replace('@SUGGESTED@', words)
-    os.write(fd, send.encode())
+    for i, piece in enumerate(send.split('@PAUSE@')):
+        if i:
+            time.sleep(0.05)
+        data = piece.encode()
+        deadline = time.time() + 60
+        while data:
+            if time.time() > deadline:
+                sys.exit('could not type ' + repr(expect))
+            r, w, _ = select.select([fd], [fd], [], 1.0)
+            if r:
+                more(time.time())
+            if w:
+                data = data[os.write(fd, data[:256]):]
 while more(time.time() + 60):
     pass
 _, status = os.waitpid(pid, 0)
@@ -57,6 +72,13 @@ sys.stderr.write('exit=%d\n' % os.waitstatus_to_exitcode(status))
 
 /// Runs `envcloak <args>` on a pseudo-terminal, typing `steps`.
 fn on_terminal(home: &TestHome, args: &[&str], steps: &[(&str, &str)]) -> (Output, i32) {
+    let mut argv = vec![cli().to_str().unwrap()];
+    argv.extend_from_slice(args);
+    drive(home, &argv, steps)
+}
+
+/// Runs `argv` on a pseudo-terminal, typing `steps`.
+fn drive(home: &TestHome, argv: &[&str], steps: &[(&str, &str)]) -> (Output, i32) {
     let files = outside_dir();
     let script = files.path().join("steps.json");
     let json =
@@ -66,8 +88,7 @@ fn on_terminal(home: &TestHome, args: &[&str], steps: &[(&str, &str)]) -> (Outpu
     home.apply(&mut cmd)
         .args(["-c", DRIVER])
         .arg(&script)
-        .arg(cli())
-        .args(args)
+        .args(argv)
         .current_dir(home.home())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -195,4 +216,46 @@ fn vault_create_can_generate_the_passphrase() {
     assert_eq!(words.split(' ').count(), 6, "{words}");
     // The confirmation was not echoed: the words appear once, where shown.
     assert_eq!(shown.matches(&words).count(), 1, "{shown}");
+}
+
+/// Secret entry that ends before Enter (Ctrl-C, Ctrl-D on an empty line,
+/// a paste over the 1024-byte limit) discards what was typed after it,
+/// including the end of a paste that arrives a moment later: once echo is
+/// back on, none of it reaches the next program reading the terminal, here
+/// `head` in the same shell, or shows on the terminal. The driver types a
+/// line of its own after the CLI exits, which `head` must read instead.
+#[test]
+fn input_left_after_secret_entry_ends_never_reaches_the_next_reader() {
+    let home = TestHome::new();
+    let _d = start_daemon(&home);
+    let marker = format!("typeahead{:016x}", fresh_seed());
+    let script = "\"$0\" vault create --kdf-memory 64MiB; echo CLI_EXITED; exec head -n 1";
+    let long = "x".repeat(1100);
+    for (key, token) in [
+        ("\u{3}", "envcloak: cancelled"),
+        ("\u{4}", "envcloak: no_input"),
+        (long.as_str(), "envcloak: input_too_long"),
+    ] {
+        for typed in [
+            format!("{key}{marker}\n"),
+            format!("{key}@PAUSE@{marker}\n"),
+        ] {
+            let (out, code) = drive(
+                &home,
+                &["/bin/sh", "-c", script, cli().to_str().unwrap()],
+                &[
+                    ("New vault passphrase", &typed),
+                    ("CLI_EXITED", "the next line\n"),
+                ],
+            );
+            let shown = stdout(&out);
+            assert_eq!(code, 0, "{shown}");
+            assert!(shown.contains(token), "{shown}");
+            assert!(!shown.contains(&marker), "left input leaked: {shown}");
+            // Echoed as typed, then printed by `head`.
+            assert_eq!(shown.matches("the next line").count(), 2, "{shown}");
+        }
+    }
+    let status = stdout(&run(&home, &["status"], &[]));
+    assert!(status.contains("vault: none yet"), "{status}");
 }

@@ -7,10 +7,19 @@
 //! Backspace and Ctrl-C itself: with signal characters off, Ctrl-C is a
 //! byte rather than a signal that would kill the process and leave the
 //! terminal without echo. Input typed before the prompt is discarded. The
-//! saved settings come back when the [`SecretInput`] is dropped.
+//! saved settings come back when the [`SecretInput`] is dropped, and input
+//! still unread then is discarded too (`TCSAFLUSH`): it was typed with
+//! echo off, so it may be the rest of a secret, and once echo is back on it
+//! would show on the terminal and reach the next program to read it,
+//! usually the shell. An entry that ends before Enter (Ctrl-C, Ctrl-D, a
+//! secret too long) first calls [`SecretInput::discard_until_quiet`], so
+//! the rest of a paste still arriving is discarded as well.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::time::{Duration, Instant};
+
+use zeroize::Zeroize;
 
 /// A terminal in secret-input mode. Restores the previous settings on
 /// drop.
@@ -79,10 +88,56 @@ impl<'a> SecretInput<'a> {
     pub fn echo_off(&self) -> io::Result<bool> {
         Ok(get(self.fd)?.c_lflag & libc::ECHO == 0)
     }
+
+    /// Reads and discards input until none has arrived for `quiet`
+    /// (rounded up to tenths of a second, at most 25.5 seconds), or until
+    /// `limit` has passed. The bytes read are wiped. Returns how many were
+    /// discarded. For an entry that ends before Enter: what follows a
+    /// Ctrl-C, or the rest of a paste over the length limit, which may still
+    /// be arriving when the reader stops.
+    ///
+    /// # Errors
+    /// When the terminal's settings cannot be changed, or reading fails for
+    /// another reason than the terminal hanging up.
+    pub fn discard_until_quiet(&self, quiet: Duration, limit: Duration) -> io::Result<usize> {
+        let mut t = get(self.fd)?;
+        let tenths = quiet.as_millis().div_ceil(100).clamp(1, 255);
+        t.c_cc[libc::VMIN] = 0;
+        t.c_cc[libc::VTIME] = libc::cc_t::try_from(tenths).unwrap_or(libc::cc_t::MAX);
+        set(self.fd, libc::TCSANOW, &t)?;
+        let end = Instant::now() + limit;
+        let mut buf = [0u8; 256];
+        let mut discarded = 0usize;
+        let result = loop {
+            if Instant::now() >= end {
+                break Ok(discarded);
+            }
+            // SAFETY: `buf` is writable for its length; the descriptor stays
+            // open for the call.
+            let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            match usize::try_from(n) {
+                // Quiet for the whole timer, or the terminal hung up.
+                Ok(0) => break Ok(discarded),
+                Ok(n) => discarded = discarded.saturating_add(n),
+                Err(_) => {
+                    let err = io::Error::last_os_error();
+                    match err.kind() {
+                        io::ErrorKind::Interrupted => {}
+                        _ if err.raw_os_error() == Some(libc::EIO) => break Ok(discarded),
+                        _ => break Err(err),
+                    }
+                }
+            }
+        };
+        buf.zeroize();
+        result
+    }
 }
 
 impl Drop for SecretInput<'_> {
     fn drop(&mut self) {
-        let _ = set(self.fd, libc::TCSANOW, &self.saved);
+        // TCSAFLUSH: input not read yet is discarded, not left for the next
+        // reader with echo back on.
+        let _ = set(self.fd, libc::TCSAFLUSH, &self.saved);
     }
 }

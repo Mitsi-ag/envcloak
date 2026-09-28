@@ -9,12 +9,16 @@
 //! character), Ctrl-U clears it, Ctrl-C cancels, and Ctrl-D on an empty
 //! line ends input. Bytes go one at a time into a fixed-size
 //! [`SecretBuf`], wiped on drop. The terminal's settings come back when
-//! reading ends, however it ends.
+//! reading ends, however it ends, and input not read by then is discarded
+//! rather than left for the next program on the terminal (the shell, which
+//! would show and run it). When reading ends before Enter, the rest of a
+//! paste still arriving is read and discarded first.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::time::Duration;
 
 use envcloak_core::{SecretBuf, SecretBytes};
 use zeroize::Zeroize;
@@ -23,6 +27,11 @@ use crate::fail::Failure;
 
 /// The longest secret read, in bytes.
 pub const MAX_SECRET: usize = 1024;
+
+/// When secret entry ends before Enter, input is discarded until none has
+/// arrived for this long, and for at most [`DISCARD_LIMIT`].
+const DISCARD_QUIET: Duration = Duration::from_millis(200);
+const DISCARD_LIMIT: Duration = Duration::from_secs(3);
 
 /// Why no secret was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +108,12 @@ impl Terminal {
                 .write_all(prompt.as_bytes())
                 .map_err(|_| InputError::Io)
                 .and_then(|()| read_keys(&self.file));
+            if r.is_err() {
+                // What follows a Ctrl-C, or the rest of a long paste, never
+                // reaches the next reader. Dropping `mode` then discards
+                // anything left.
+                let _ = mode.discard_until_quiet(DISCARD_QUIET, DISCARD_LIMIT);
+            }
             drop(mode);
             r
         };
