@@ -17,6 +17,8 @@
 //! the control and the CLI under test are copies signed with it.
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
@@ -491,6 +493,117 @@ fn linux_a_traced_cli_refuses_to_request_values() {
     assert!(out.stdout.is_empty());
     assert!(!marker.exists(), "a traced run started the command");
     envcloak_testkit::assert_no_canary(&out.stderr, &cs);
+}
+
+/// Review finding F-34, gate 19: every command that reads a proof or makes
+/// a Recovery Kit refuses under a tracer before it reads anything. Traced
+/// from their first instruction, `vault create`, `unlock` and `approve`
+/// exit 1 with `traced`, leave the passphrase descriptor unread, write no
+/// kit, and create or unlock no vault. The control, untraced, reads the
+/// passphrase.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_traced_proof_commands_refuse_before_reading() {
+    use std::io::Seek;
+    use std::os::fd::AsFd;
+
+    use envcloak_testkit::assert_no_canary;
+
+    use envcloak_sys::testing::spawn_traced_with_fds;
+
+    let cs = canaries(fresh_seed());
+    let files = common::outside_dir();
+    let pass = common::secret_file(
+        files.path(),
+        "pass",
+        by_label(&cs, labels::VAULT_PASSPHRASE).value(),
+    );
+    let kit = files.path().join("kit");
+    std::fs::write(&kit, b"").unwrap();
+    // `args` traced, with the passphrase on descriptor 3 and the kit file
+    // on 4. Returns the output and how far fd 3 was read.
+    let traced = |home: &TestHome, args: &[&str]| -> (Output, u64) {
+        let mut p = std::fs::File::open(&pass).unwrap();
+        let k = std::fs::OpenOptions::new().write(true).open(&kit).unwrap();
+        let mut cmd = Command::new(cli());
+        home.apply(&mut cmd)
+            .args(args)
+            .current_dir(home.home())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = spawn_traced_with_fds(&mut cmd, &[(p.as_fd(), 3), (k.as_fd(), 4)]).unwrap();
+        let out = finish_within(child, Duration::from_secs(30));
+        assert_no_canary(&out.stdout, &cs);
+        assert_no_canary(&out.stderr, &cs);
+        (out, p.stream_position().unwrap())
+    };
+    let refused = |out: &Output, what: &str| {
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{what}: {err}");
+        assert!(err.starts_with("envcloak: traced:"), "{what}: {err}");
+    };
+
+    // No vault yet: a traced `vault create` makes none, and no kit.
+    let home = TestHome::new();
+    let d = common::start_daemon(&home);
+    let (out, read) = traced(
+        &home,
+        &[
+            "vault",
+            "create",
+            "--passphrase-fd",
+            "3",
+            "--kit-fd",
+            "4",
+            "--kdf-memory",
+            "64MiB",
+        ],
+    );
+    refused(&out, "vault create");
+    assert_eq!(read, 0, "vault create read the passphrase");
+    assert_eq!(std::fs::read(&kit).unwrap(), b"", "a kit was written");
+    let status = common::stdout(&common::run(&home, &["status"], &[]));
+    assert!(status.contains("vault: none yet"), "{status}");
+    assert_no_canary(&d.log_bytes(), &cs);
+    drop(d);
+
+    // A locked vault: a traced `unlock` leaves it locked, and a traced
+    // `approve` stops before it asks the daemon anything.
+    let home = TestHome::new();
+    let mut cs = cs.clone();
+    cs.push(common::seed_vault(&home, &cs));
+    let d = common::start_daemon(&home);
+    let (out, read) = traced(&home, &["unlock", "--passphrase-fd", "3"]);
+    refused(&out, "unlock");
+    assert_eq!(read, 0, "unlock read the passphrase");
+    let (out, read) = traced(&home, &["approve", "ABCDEFGH", "--passphrase-fd", "3"]);
+    refused(&out, "approve");
+    assert_eq!(read, 0, "approve read the passphrase");
+    let status = common::stdout(&common::run(&home, &["status"], &[]));
+    assert!(status.contains("vault: locked"), "{status}");
+    assert!(!status.contains("failed"), "{status}");
+
+    // The control: the same unlock, untraced, reads the passphrase (and,
+    // without a terminal session, the daemon refuses the proof).
+    let p = std::fs::File::open(&pass).unwrap();
+    let mut cmd = Command::new(cli());
+    home.apply(&mut cmd)
+        .args(["unlock", "--passphrase-fd", "0"])
+        .current_dir(home.home())
+        .stdin(Stdio::from(p.try_clone().unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = finish_within(cmd.spawn().unwrap(), Duration::from_secs(30));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("traced"), "{err}");
+    let mut p = p;
+    assert!(
+        p.stream_position().unwrap() > 0,
+        "the control read nothing: {err}"
+    );
+    assert_no_canary(&d.log_bytes(), &cs);
+    home.assert_clean(&cs);
 }
 
 #[cfg(target_os = "linux")]

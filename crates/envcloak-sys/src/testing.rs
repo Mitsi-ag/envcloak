@@ -713,11 +713,37 @@ pub fn try_attach(pid: i32) -> io::Result<()> {
 /// would continue. `SIGKILL` is fine.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn spawn_traced(cmd: &mut std::process::Command) -> io::Result<std::process::Child> {
+    spawn_traced_with_fds(cmd, &[])
+}
+
+/// Linux: [`spawn_traced`], with descriptors of this process given to the
+/// child at chosen numbers: each `(from, to)` becomes the child's
+/// descriptor `to`, open to what `from` is open to (the same offset), as
+/// a shell's `3<file` does. `from` stays close-on-exec here, so no other
+/// child gets it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn spawn_traced_with_fds(
+    cmd: &mut std::process::Command,
+    fds: &[(std::os::fd::BorrowedFd<'_>, i32)],
+) -> io::Result<std::process::Child> {
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
-    // SAFETY: the hook runs between fork and exec and only makes the
-    // ptrace system call, which is async-signal-safe and does not allocate.
-    unsafe { cmd.pre_exec(trace_me) };
+    let pairs: Vec<(i32, i32)> = fds.iter().map(|(f, to)| (f.as_raw_fd(), *to)).collect();
+    // SAFETY: the hook runs between fork and exec. It only calls dup2 and
+    // ptrace, which are async-signal-safe, reads `pairs` (allocated before
+    // the fork) and allocates nothing. A descriptor dup2 makes has no
+    // close-on-exec flag, so the program gets it.
+    unsafe {
+        cmd.pre_exec(move || {
+            for &(from, to) in &pairs {
+                if from != to && libc::dup2(from, to) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            trace_me()
+        });
+    }
     let mut child = cmd.spawn()?;
     let pid = i32::try_from(child.id()).map_err(io::Error::other)?;
     let started = wait_stop(pid).and_then(|status| {
