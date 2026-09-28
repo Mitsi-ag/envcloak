@@ -234,9 +234,17 @@ mod tests {
         let hex: String = (0..40)
             .map(|i| char::from(b"0123456789abcdef"[i * 7 % 16]))
             .collect();
+        // An access key id's shape, built here so that no key-shaped
+        // literal is in the source.
+        let akia: String = "AKIA"
+            .chars()
+            .chain(
+                (0..20).map(|i| char::from(b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i * 11 % 36])),
+            )
+            .collect();
         for v in [
             hex.as_str(),
-            "AKIA0123456789ABCDEFGHIJ",
+            akia.as_str(),
             "x=ab12cd34ef56ab12cd34ef56",
             "ab12cd34ef56ab12cd34ef56",
             "QmFzZTY0IGlzIG5vdCBhIG5hbWU",
