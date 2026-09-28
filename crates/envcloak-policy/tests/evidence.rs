@@ -382,6 +382,62 @@ fn a_root_in_pid_1s_session_covers_no_other_session() {
     assert!(e.covered_by(&e.root(), SubjectKind::Agent));
 }
 
+/// Review note: `==` and `Hash` are the per-root key. The executable's
+/// path (renamed, or removed on Linux) and whether the pid version is
+/// known do not change which process it is.
+#[test]
+fn a_process_instance_is_keyed_by_pid_and_start_time() {
+    use std::collections::HashSet;
+    use std::hash::BuildHasher;
+    let base = inst(80, 800);
+    let exe = |path: &str| {
+        Some(ExeIdentity {
+            path: PathBuf::from(path),
+            file: Some((1, 2)),
+            signature: None,
+        })
+    };
+    let variants = [
+        ProcessInstance {
+            exe: exe("/usr/local/bin/claude"),
+            ..base.clone()
+        },
+        ProcessInstance {
+            exe: exe("/usr/local/bin/claude (deleted)"),
+            ..base.clone()
+        },
+        ProcessInstance {
+            pidversion: Some(3),
+            exe: exe("/tmp/renamed"),
+            ..base.clone()
+        },
+    ];
+    let hasher = std::collections::hash_map::RandomState::new();
+    let mut keys = HashSet::new();
+    keys.insert(base.clone());
+    for v in &variants {
+        assert_eq!(*v, base);
+        assert_eq!(hasher.hash_one(v), hasher.hash_one(&base));
+        assert!(v.same(&base));
+        keys.insert(v.clone());
+    }
+    assert_eq!(keys.len(), 1);
+    // Another start time, or another pid, is another process.
+    assert_ne!(inst(80, 801), base);
+    assert_ne!(inst(81, 800), base);
+    // `same` also tells two known pid versions apart.
+    let v7 = ProcessInstance {
+        pidversion: Some(7),
+        ..base.clone()
+    };
+    let v8 = ProcessInstance {
+        pidversion: Some(8),
+        ..base.clone()
+    };
+    assert_eq!(v7, v8);
+    assert!(!v7.same(&v8));
+}
+
 #[test]
 fn an_extension_agent_above_the_session_does_not_widen_the_root() {
     // An extension matched the terminal emulator (50): the caller is an

@@ -103,7 +103,13 @@ pub const GATHER_ATTEMPTS: usize = 3;
 
 /// One process instance: a pid and the start time that tells it from any
 /// later process with that pid (SPEC §10b `ProcessInstance`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `==` and `Hash` compare the pid and the start time only, so a process
+/// is one key (for the per-root bounds of SPEC §10a) whatever its
+/// executable's path reads now (renamed, or removed on Linux) and whether
+/// its pid version is known. [`ProcessInstance::same`], which coverage
+/// uses, also compares pid versions when both are known.
+#[derive(Debug, Clone)]
 pub struct ProcessInstance {
     pub pid: i32,
     pub start_time: StartTime,
@@ -112,6 +118,21 @@ pub struct ProcessInstance {
     pub pidversion: Option<i32>,
     /// Display and audit only; matching never uses it.
     pub exe: Option<ExeIdentity>,
+}
+
+impl PartialEq for ProcessInstance {
+    fn eq(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start_time == other.start_time
+    }
+}
+
+impl Eq for ProcessInstance {}
+
+impl std::hash::Hash for ProcessInstance {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.pid.hash(state);
+        self.start_time.hash(state);
+    }
 }
 
 impl ProcessInstance {
