@@ -750,3 +750,65 @@ pub fn setsid() -> io::Result<()> {
     }
     Ok(())
 }
+
+/// The pseudo-terminal [`enter_terminal_session`] made this process's
+/// controlling terminal, both ends, held open for the life of the
+/// process; or the error of the one attempt.
+static TERMINAL: std::sync::OnceLock<Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd), i32>> =
+    std::sync::OnceLock::new();
+
+/// Makes the calling process the leader of a new session whose
+/// controlling terminal is a new pseudo-terminal, as a shell in a terminal
+/// window is. The daemon then sees the process (without an agent above
+/// it) as a terminal subject, the only kind that may give a proof (SPEC
+/// §10b), whatever terminal the tests were started from, or none as in
+/// CI. Both ends stay open for the life of the process, and nothing reads
+/// or writes them. Runs once; later calls give the first call's result.
+///
+/// # Errors
+/// When the process leads a process group but not its session
+/// (`setsid` fails), or no pseudo-terminal can be opened or made the
+/// controlling one.
+pub fn enter_terminal_session() -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let made = TERMINAL.get_or_init(|| {
+        let errno = || {
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        // SAFETY: getsid(0) and getpid have no preconditions.
+        let leads = unsafe { libc::getsid(0) == libc::getpid() };
+        if !leads {
+            setsid().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        }
+        let (mut m, mut s): (libc::c_int, libc::c_int) = (-1, -1);
+        // SAFETY: `m` and `s` are writable; a null name, termios and window
+        // size are allowed and leave the defaults.
+        let rc = unsafe {
+            libc::openpty(
+                &mut m,
+                &mut s,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == -1 {
+            return Err(errno());
+        }
+        // SAFETY: openpty returned two open descriptors that nothing else
+        // owns.
+        let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
+        // SAFETY: `slave` is an open terminal and this process leads a
+        // session without one; argument 0 steals no terminal.
+        if unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as _, 0) } == -1 {
+            return Err(errno());
+        }
+        Ok((master, slave))
+    });
+    made.as_ref()
+        .map(drop)
+        .map_err(|e| io::Error::from_raw_os_error(*e))
+}

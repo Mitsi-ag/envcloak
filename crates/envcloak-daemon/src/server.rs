@@ -538,7 +538,9 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         RunRequest::NAME => {
             answer::<RunRequest>(id, &req, |p| requests::run_request(shared, peer, p))
         }
-        PendingGet::NAME => answer::<PendingGet>(id, &req, |p| requests::pending_get(shared, p)),
+        PendingGet::NAME => {
+            answer::<PendingGet>(id, &req, |p| requests::pending_get(shared, peer, p))
+        }
         Approve::NAME => answer::<Approve>(id, &req, |p| requests::approve(shared, peer, p)),
         Deny::NAME => answer::<Deny>(id, &req, |p| requests::deny(shared, peer, p)),
         GrantsList::NAME => answer::<GrantsList>(id, &req, |_| requests::grants_list(shared)),
@@ -584,8 +586,9 @@ pub(crate) fn refuse_if_traced() -> Result<(), RpcError> {
     }
 }
 
-/// `unlock` is a proof (SPEC §10b): refused from a caller with an agent
-/// in its evidence, and subject to the attempt limiter. The evidence is
+/// `unlock` is a proof (SPEC §10b): refused from a caller that may not
+/// give one (an agent by any evidence, or no terminal session), and
+/// subject to the attempt limiter. The evidence is
 /// read before the vault is looked at, so an agent learns nothing from
 /// the order of the checks.
 fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<UnlockedView, RpcError> {
@@ -595,13 +598,7 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
         Claims::from_markers(&p.claims).map_err(|_| RpcError::new(ErrorKind::InvalidParams))?;
     let evidence = gather(peer, claims, &shared.catalog)
         .map_err(|e| RpcError::with_reason(ErrorKind::Evidence, e.token()))?;
-    if evidence.agent_involved() {
-        shared.audit.record(AuditEvent::ProofRefused {
-            pid: peer.pid,
-            method: "unlock",
-        });
-        return Err(RpcError::new(ErrorKind::ProofRefused));
-    }
+    requests::refuse_unless_prover(shared, peer, &evidence, "unlock")?;
     let _gate = locked(&shared.proof_gate);
     let begin = {
         let mut s = locked(&shared.state);

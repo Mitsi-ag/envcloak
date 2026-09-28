@@ -80,8 +80,8 @@ pub struct VaultCreateParams {
 }
 
 /// `unlock`: unlocks with the passphrase. A proof: refused from a caller
-/// with an agent in its evidence (SPEC §10b), and counted by the attempt
-/// limiter.
+/// that is not a terminal subject (an agent by any evidence, or no
+/// terminal session; SPEC §10b), and counted by the attempt limiter.
 #[derive(Debug)]
 pub struct Unlock;
 
@@ -144,14 +144,27 @@ pub struct RunRequestParams {
 }
 
 /// `pending.get`: what an approval surface shows for a pending request.
-/// Metadata only.
+/// Metadata only. Served only to a caller that may give a proof (SPEC
+/// §10b), so `envcloak approve` run where no proof is taken fails before
+/// it shows the statement or asks for the passphrase.
 #[derive(Debug)]
 pub struct PendingGet;
 
 impl Method for PendingGet {
     const NAME: &'static str = "pending.get";
-    type Params = RequestParams;
+    type Params = PendingGetParams;
     type Output = PendingDescriptor;
+}
+
+/// A pending request's id, and the caller's claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingGetParams {
+    /// 8 Crockford base32 characters.
+    pub request: String,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
 }
 
 /// A pending request's id.
@@ -488,9 +501,10 @@ impl ErrorKind {
                 "the statement approved is not the pending request's; nothing was approved"
             }
             ErrorKind::ProofRefused => {
-                "a proof is not taken from a process with an agent in its ancestry, agent \
-                 markers in its environment, or a lost ancestry; run this in a terminal you \
-                 control"
+                "a proof is taken only in a terminal session with no agent in it: not from a \
+                 process with an agent in its ancestry, agent markers in its environment or a \
+                 lost ancestry, nor from one without a controlling terminal (a service \
+                 manager's job, setsid); run this in a terminal you control"
             }
             ErrorKind::TooManyAttempts => {
                 "too many failed passphrase attempts; `envcloak status` shows the wait"

@@ -37,8 +37,13 @@ pub enum AuditEvent {
     },
     /// An `approve` failed its proof.
     ApproveFailed { pid: i32, reason: &'static str },
-    /// A proof was refused because of the caller's evidence.
-    ProofRefused { pid: i32, method: &'static str },
+    /// A proof was refused because of the caller's evidence, for the
+    /// reason's token (`envcloak_policy::ProofRefusal::token`).
+    ProofRefused {
+        pid: i32,
+        method: &'static str,
+        reason: &'static str,
+    },
     /// A pending request was denied.
     Denied {
         pid: i32,
@@ -79,9 +84,13 @@ impl Audit {
             AuditEvent::ApproveFailed { pid, reason } => {
                 eprintln!("envcloakd: audit: approve failed reason={reason} pid={pid}")
             }
-            AuditEvent::ProofRefused { pid, method } => {
+            AuditEvent::ProofRefused {
+                pid,
+                method,
+                reason,
+            } => {
                 eprintln!(
-                    "envcloakd: audit: proof refused method={method} reason=agent_involved pid={pid}"
+                    "envcloakd: audit: proof refused method={method} reason={reason} pid={pid}"
                 )
             }
             AuditEvent::Denied {

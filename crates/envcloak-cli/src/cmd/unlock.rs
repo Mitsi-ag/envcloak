@@ -7,7 +7,9 @@
 //! It is then sent once, on a new connection that is verified again, with
 //! the agent markers this process's environment holds (their names), and
 //! the daemon runs Argon2id. An unlock is a proof (SPEC §10b): the daemon
-//! refuses it from a process with an agent in its ancestry.
+//! refuses it from a process with an agent in its ancestry or without a
+//! terminal session, and this command refuses before it reads anything
+//! when its environment holds an agent's markers.
 
 use std::process::ExitCode;
 
@@ -15,7 +17,7 @@ use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::VaultState;
 use envcloak_ipc::{ClientError, RpcError};
 
-use super::{claims, fd_number};
+use super::{fd_number, refuse_if_claimed};
 use crate::connect::connect;
 use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use crate::tty::{Terminal, read_secret_fd};
@@ -55,11 +57,12 @@ fn unlock(fd: Option<i32>) -> Result<ExitCode, Failure> {
         VaultState::Locked => {}
     }
     refuse_if_traced()?;
+    let claims = refuse_if_claimed()?;
     let passphrase = match fd {
         Some(fd) => read_secret_fd(fd)?,
         None => Terminal::open()?.read_secret("Vault passphrase: ")?,
     };
-    let unlocked = connect()?.unlock(passphrase, &claims())?;
+    let unlocked = connect()?.unlock(passphrase, &claims)?;
     if unlocked.already {
         println!("The vault is already unlocked.");
     } else {

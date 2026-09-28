@@ -2,7 +2,9 @@
 //! flow", "Lock"): `vault.create`, `unlock`, `lock` and `status`, the
 //! rules checked before any key derivation, and a termination signal that
 //! locks and exits. Every test sweeps the home and the daemon's log for the
-//! passphrase and the Recovery Kit.
+//! passphrase and the Recovery Kit. A test that unlocks makes this process
+//! a terminal session first (`common::terminal_session`): only a terminal
+//! subject gives a proof.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -24,6 +26,7 @@ fn rpc_kind(e: ClientError) -> ErrorKind {
 
 #[test]
 fn create_lock_unlock_and_status() {
+    common::terminal_session();
     let cs = canaries(fresh_seed());
     let home = TestHome::new();
     let d = start(&home);
@@ -134,6 +137,7 @@ fn rules_and_bounds_are_checked_before_any_key_derivation() {
 /// again finds the vault locked.
 #[test]
 fn a_termination_signal_locks_and_exits() {
+    common::terminal_session();
     let cs = canaries(fresh_seed());
     let home = TestHome::new();
     let mut d = start(&home);
@@ -173,6 +177,7 @@ fn a_termination_signal_locks_and_exits() {
 /// second create is refused, and the passphrase unlocks the vault.
 #[test]
 fn a_lock_during_vault_create_leaves_it_created_and_locked() {
+    common::terminal_session();
     let cs = canaries(fresh_seed());
     let home = TestHome::new();
     let d = start(&home);

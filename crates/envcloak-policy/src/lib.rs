@@ -59,7 +59,7 @@ pub use envfile::{
 };
 pub use evidence::{
     Ancestor, ChainEnd, Claims, ClaimsError, EvidenceError, GATHER_ATTEMPTS, ProcessInstance,
-    SubjectEvidence, gather, gather_in,
+    ProofRefusal, SubjectEvidence, gather, gather_in,
 };
 pub use flood::{
     AUTO_DENY, DENIAL_WINDOW, DENIALS_TO_AUTO_DENY, MAX_DENIALS, MAX_PENDING, MAX_PENDING_PER_ROOT,

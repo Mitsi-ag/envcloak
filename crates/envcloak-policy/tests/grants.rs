@@ -17,8 +17,8 @@ use envcloak_policy::{
     AttemptLimiter, BoundBinding, BoundRef, CatalogSource, ChainEnd, Claims, DENIAL_WINDOW,
     Decision, DenyReason, EnvName, GrantId, MAX_AGENT_TTL, MAX_GRANTS, MAX_PENDING,
     MAX_PENDING_PER_ROOT, MAX_TERMINAL_TTL, MatchBasis, Mode, Now, OptionsError, PENDING_TTL,
-    PendingId, ProcessInstance, ProjectIdentity, ProofKind, RevokeSelector, SubjectEvidence,
-    SubjectKind, Uses, statement_digest,
+    PendingId, ProcessInstance, ProjectIdentity, ProofKind, ProofRefusal, RevokeSelector,
+    SubjectEvidence, SubjectKind, Uses, statement_digest,
 };
 use envcloak_policy::{AgentLabel, GrantStore};
 use envcloak_sys::StartTime;
@@ -278,13 +278,35 @@ fn a_proof_from_an_agent_descended_caller_is_refused() {
         claimed,
     ] {
         assert!(approver.agent_involved());
+        assert!(approver.proof_refusal().is_some());
         let e = s
             .approve(&id, proof(approver), opts.clone(), digest, &now)
             .unwrap_err();
         assert_eq!(e, ApproveError::ProofRefused);
         assert!(s.pending_descriptor(&id, &now).is_some());
     }
+    // No agent is seen, but there is no terminal session: a job a service
+    // manager started in a session of its own (`systemd-run --user`) or in
+    // pid 1's (`launchctl submit`), and a command that forked out and
+    // called `setsid`. No person could have typed their proof.
+    let own_session = ev(vec![p(96, 96, None), p(1, 1, None)], false, &[]);
+    let launchd_job = ev(vec![p(97, 1, None), p(1, 1, None)], false, &[]);
+    let setsid = ev(
+        vec![p(98, 98, None), p(70, 70, None), p(1, 1, None)],
+        false,
+        &[],
+    );
+    for approver in [own_session, launchd_job, setsid] {
+        assert!(!approver.agent_involved(), "{approver:?}");
+        assert_eq!(approver.proof_refusal(), Some(ProofRefusal::NoTerminal));
+        let e = s
+            .approve(&id, proof(approver), opts.clone(), digest, &now)
+            .unwrap_err();
+        assert_eq!(e, ApproveError::ProofRefused);
+    }
+    assert!(s.pending_descriptor(&id, &now).is_some());
     assert_eq!(s.grants().count(), 0);
+    assert_eq!(terminal().proof_refusal(), None);
 
     // A statement that differs from the pending request: another id,
     // other options, or one byte of the digest.

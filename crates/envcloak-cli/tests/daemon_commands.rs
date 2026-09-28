@@ -15,8 +15,8 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use common::{
-    cli, cli_command, daemon_exe, finish_within, outside_dir, run, secret_file, start_daemon,
-    stderr, stdout,
+    cli, cli_command, daemon_exe, finish_within, outside_dir, run, run_on_terminal, secret_file,
+    start_daemon, stderr, stdout,
 };
 use envcloak_core::vault::{LockedVault, VaultPaths};
 use envcloak_core::{RecoveryKit, SecretBytes};
@@ -254,7 +254,7 @@ fn vault_create_lock_and_unlock_through_descriptors() {
     assert!(stdout(&status).contains("last locked by: request"));
 
     let wrong = secret_file(files.path(), "wrong", b"a wrong passphrase, but long");
-    let bad = run(
+    let bad = run_on_terminal(
         &home,
         &["unlock", "--passphrase-fd", "3"],
         &[(3, &wrong, true)],
@@ -265,13 +265,13 @@ fn vault_create_lock_and_unlock_through_descriptors() {
         "{}",
         stderr(&bad)
     );
-    let good = run(
+    let good = run_on_terminal(
         &home,
         &["unlock", "--passphrase-fd", "3"],
         &[(3, &pass_file, true)],
     );
     assert_eq!(stdout(&good), "Vault unlocked.\n", "{}", stderr(&good));
-    let already = run(
+    let already = run_on_terminal(
         &home,
         &["unlock", "--passphrase-fd", "3"],
         &[(3, &pass_file, true)],
@@ -470,7 +470,7 @@ fn a_lock_during_vault_create_keeps_the_vault_and_the_kit() {
     let mut all = cs.clone();
     all.push(Canary::new("RECOVERY_KIT", kit_text));
     assert_clean_output(&out, &all);
-    let good = run(
+    let good = run_on_terminal(
         &home,
         &["unlock", "--passphrase-fd", "3"],
         &[(3, &pass_file, true)],

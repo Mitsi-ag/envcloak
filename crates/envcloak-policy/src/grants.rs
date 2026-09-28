@@ -167,7 +167,9 @@ pub enum ProofKind {
 }
 
 /// A verified proof, and who gave it. The store refuses one from an
-/// approver with an agent in its evidence, whatever the daemon checked.
+/// approver that may not give a proof
+/// ([`SubjectEvidence::proof_refusal`]: an agent by any evidence, or no
+/// terminal session), whatever the daemon checked.
 #[derive(Debug, Clone)]
 pub struct ApprovalProof {
     pub approver: SubjectEvidence,
@@ -338,7 +340,8 @@ pub enum ApproveError {
     NoSuchRequest,
     /// The digest is not that of this request with these options.
     StatementMismatch,
-    /// An agent is involved in the approver's evidence.
+    /// The approver may not give a proof
+    /// ([`SubjectEvidence::proof_refusal`]).
     ProofRefused,
     InvalidOptions(OptionsError),
     /// [`MAX_GRANTS`] exist already.
@@ -590,9 +593,10 @@ impl GrantStore {
     ///
     /// # Errors
     /// [`ApproveError::NoSuchRequest`] for an unknown or expired id,
-    /// [`ApproveError::ProofRefused`] when an agent is involved in the
-    /// approver's evidence, [`ApproveError::InvalidOptions`] for a length
-    /// beyond the subject's bound or a live name not bound,
+    /// [`ApproveError::ProofRefused`] when the approver may not give a
+    /// proof ([`SubjectEvidence::proof_refusal`]),
+    /// [`ApproveError::InvalidOptions`] for a length beyond the subject's
+    /// bound or a live name not bound,
     /// [`ApproveError::StatementMismatch`] when `digest` is not that of
     /// this request with `opts`, [`ApproveError::TooManyGrants`] at the
     /// bound. The request stays pending on every error.
@@ -608,7 +612,7 @@ impl GrantStore {
         if self.pending(id, now).is_none() {
             return Err(ApproveError::NoSuchRequest);
         }
-        if proof.approver.agent_involved() {
+        if proof.approver.proof_refusal().is_some() {
             return Err(ApproveError::ProofRefused);
         }
         self.check_approval(id, &opts, digest, now)?;

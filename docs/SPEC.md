@@ -729,9 +729,10 @@ A manifest change that leaves the bindings a subset does not prompt; the new has
 - Linux, and macOS without the app: the human runs `envcloak approve <request_id> [--once | --for <duration>] [--live <ENV_NAME>]...` in a terminal they control, reads the same statement, and enters the vault passphrase on `/dev/tty` (or `--passphrase-fd`). The daemon verifies the passphrase against the envelope.
 - **Approval signing key without a Secure Enclave.** On Linux, and on macOS without the app, each device has an Ed25519 `approve` key generated at vault creation or pairing. Its private key is stored only inside its own Argon2id envelope under the passphrase (not under the VMK), so it is usable only when the passphrase is presented. For each approval that must be recorded or replicated (policy, registry overrides, device add or remove, revocation), the daemon unwraps it with the presented passphrase, signs the canonical statement, and wipes it. The public key is pinned in the device record at pairing. This is weaker than a Secure Enclave key: the envelope can be guessed offline from a copy of the vault, and the key is briefly in daemon memory, so peers display which kind of key signed a record. Gates: Linux-to-macOS and Linux-to-Linux pairing, policy replication and revocation succeed with passphrase-signed records, and a record signed by any other key is rejected.
 - A y/n answer is never an approval. Approval input is never read from the requesting process's terminal.
-- The daemon refuses any proof (approve, unlock, rotate, remove, reveal, recover) submitted by a caller with a known agent in its ancestry, agent markers in its claims, an ancestry that no longer reaches its session leader (an orphan; docs/AGENTS.md), or a chain cut at the walk's depth limit (§10a). This only tightens.
+- The daemon takes a proof (approve, unlock, rotate, remove, reveal, recover) only from a terminal subject (Subject kind, above), and refuses it from every other caller: one with a known agent in its ancestry, agent markers in its claims, an ancestry that no longer reaches its session leader (an orphan; docs/AGENTS.md), a chain cut at the walk's depth limit (§10a), or no controlling terminal (a job a service manager starts, such as `launchctl submit` or `systemd-run --user`, and a process that forked out and called `setsid`: neither an agent's nor an orphan, yet started from anywhere, an agent's tree included). An approval surface does not show a pending request to a caller whose proof it would refuse, so no prompt appears where none is taken. This only tightens.
 - Honest limits:
   - A passphrase typed into a terminal that an agent controls can be captured by that agent.
+  - A captured passphrase is not made useless by the refusal. A program running as you can start a session with a pseudo-terminal of its own outside the agent's tree (`script` or `tmux` run through `launchd`, `systemd --user` or a double fork), where it is a terminal subject; and the passphrase opens a copy of the vault file anywhere. The refusal keeps an agent from getting an approval, or showing a prompt, in its own tree.
   - On Linux and unsigned builds, a program running as you can impersonate the daemon.
   - On macOS, `userPresence` accepts the login password.
 
@@ -887,7 +888,7 @@ M1:
     - A missing or wrong passphrase fails.
     - A statement that differs from the pending request is rejected.
     - Approval input is never read from the requester's terminal.
-    - Proofs from an agent-descended caller are refused.
+    - Proofs from an agent-descended caller are refused, and so are proofs from a caller without a terminal session (a service manager's job, `setsid`).
 24. Manifest self-authorization. A fixture repo with loosening policy plus a scripted agent still needs approval, and redaction stays on.
 25. Evidence forgery.
     - A known-agent fixture under `env -i` is still classified by ancestry.

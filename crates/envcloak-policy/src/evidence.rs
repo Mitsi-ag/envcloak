@@ -75,6 +75,11 @@
 //! double-forks out of an agent's tree keeps the terminal it had, and must
 //! not give a proof there that it may not give from inside.
 //!
+//! **Proofs** ([`SubjectEvidence::proof_refusal`]) are taken only from a
+//! terminal subject. A process that left an agent's tree through a service
+//! manager or `setsid` is neither an agent nor an orphan, but it has no
+//! terminal, so no person could have typed its proof.
+//!
 //! The Linux CLI makes itself non-dumpable, so its own `exe` is hidden
 //! from the daemon; its `stat` and `cmdline` are not, and the walk starts
 //! there. Arguments are read only for processes whose executable is hidden
@@ -269,6 +274,32 @@ impl Claims {
     /// Whether the caller claims to run under an agent.
     pub fn claims_agent(&self) -> bool {
         !self.markers.is_empty()
+    }
+}
+
+/// Why a caller may not give a proof ([`SubjectEvidence::proof_refusal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProofRefusal {
+    /// A known agent in the ancestry, or agent markers in the claims.
+    Agent,
+    /// The chain was cut at [`MAX_ANCESTRY`]: an agent may be above it.
+    ChainCut,
+    /// The caller lost its ancestry ([`SubjectEvidence::orphaned`]).
+    Orphaned,
+    /// Not a terminal session: no controlling terminal, or a session whose
+    /// leader is pid 1.
+    NoTerminal,
+}
+
+impl ProofRefusal {
+    /// The stable token, for the audit log.
+    pub fn token(self) -> &'static str {
+        match self {
+            ProofRefusal::Agent => "agent",
+            ProofRefusal::ChainCut => "chain_cut",
+            ProofRefusal::Orphaned => "orphaned",
+            ProofRefusal::NoTerminal => "no_terminal",
+        }
     }
 }
 
@@ -492,13 +523,42 @@ impl SubjectEvidence {
     /// Whether an agent is or may be involved by any evidence: one in the
     /// ancestry, markers in the claims, an orphan's lost ancestry
     /// ([`SubjectEvidence::orphaned`]) or a chain cut at [`MAX_ANCESTRY`]
-    /// (an agent may be above the cut). Proofs (approve, unlock, rotate,
-    /// remove, recover) from such a caller are refused (SPEC §10b). An
-    /// orphan that keeps its terminal could otherwise prompt on it for a
-    /// proof that the same command, run inside its agent's tree, may not
-    /// give.
+    /// (an agent may be above the cut). An orphan that keeps its terminal
+    /// could otherwise prompt on it for a proof that the same command, run
+    /// inside its agent's tree, may not give. Proofs are refused on this
+    /// and more: see [`SubjectEvidence::proof_refusal`].
     pub fn agent_involved(&self) -> bool {
         self.nearest_agent.is_some() || self.claims.claims_agent() || self.cut || self.orphaned()
+    }
+
+    /// Why this caller may not give a proof (approve, unlock, rotate,
+    /// remove, recover; SPEC §10b), or `None` when it may: only a terminal
+    /// subject may ([`SubjectKind::Terminal`]: no agent by any evidence,
+    /// its session leader alive in its chain, and a controlling terminal).
+    ///
+    /// Refusing only where an agent is involved
+    /// ([`SubjectEvidence::agent_involved`]) is not enough. A job a service
+    /// manager starts (`launchctl submit`, `systemd-run --user`), and a
+    /// process that forked out and called `setsid`, leads a session of its
+    /// own or runs in pid 1's: it is no orphan and no agent is seen above
+    /// it, yet it came from wherever it was started, an agent's tree
+    /// included. Without a terminal no person can type there, so its
+    /// proof could only be a passphrase read from a descriptor, and one
+    /// that an agent captured would work. A pseudo-terminal the escaped
+    /// process opens itself (`script`, `tmux`) still makes a terminal
+    /// subject: see docs/AGENTS.md "Limits".
+    pub fn proof_refusal(&self) -> Option<ProofRefusal> {
+        if self.nearest_agent.is_some() || self.claims.claims_agent() {
+            Some(ProofRefusal::Agent)
+        } else if self.cut {
+            Some(ProofRefusal::ChainCut)
+        } else if self.orphaned() {
+            Some(ProofRefusal::Orphaned)
+        } else if self.kind() != SubjectKind::Terminal {
+            Some(ProofRefusal::NoTerminal)
+        } else {
+            None
+        }
     }
 
     /// Whether a grant rooted at `root`, approved for a subject of kind

@@ -42,8 +42,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use envcloak_policy::{
-    AgentCatalog, CatalogSource, Claims, MatchBasis, ProcessInstance, SubjectEvidence, SubjectKind,
-    gather,
+    AgentCatalog, CatalogSource, Claims, MatchBasis, ProcessInstance, ProofRefusal,
+    SubjectEvidence, SubjectKind, gather,
 };
 use envcloak_sys::MAX_ANCESTRY;
 use envcloak_testkit::{TestHome, testkit_bin};
@@ -611,10 +611,16 @@ fn escape_case(escape: &str, extra: &[&str], own_session: Option<bool>) {
     }
     assert!(!out.root().same(&root));
     assert!(!out.terminal());
+    // No proof from it either (SPEC §10b): an orphan's ancestry is lost,
+    // and a process that leads a session of its own, or runs in pid 1's,
+    // has no terminal a person could type into. So a passphrase an agent
+    // captured does not work from an escape.
+    assert!(out.proof_refusal().is_some(), "{out:?}");
     match own_session {
         Some(true) => {
             assert!(out.session_leader().unwrap().same(out.caller()), "{out:?}");
             assert!(!out.orphaned());
+            assert_eq!(out.proof_refusal(), Some(ProofRefusal::NoTerminal));
         }
         Some(false) => {
             assert!(out.session_leader().is_none(), "{out:?}");

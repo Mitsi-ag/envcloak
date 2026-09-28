@@ -4,8 +4,12 @@
 //!
 //! `approve` is run by a person, in a terminal they control, after
 //! `envcloak run` printed `approval_required request=<id>`:
-//! 1. under a tracer it refuses at once (gate 19);
-//! 2. it fetches the pending request from a verified daemon and renders
+//! 1. under a tracer it refuses at once (gate 19), and so it does when
+//!    its environment holds an agent's markers (the daemon would refuse
+//!    the proof);
+//! 2. it fetches the pending request from a verified daemon, which serves
+//!    it only to a caller that may give a proof (a terminal session with
+//!    no agent in it, SPEC §10b), and renders
 //!    the statement ([`render_statement`]): the caller, the project, every
 //!    binding, the full command line as an escaped list (cut past 2 KB
 //!    with a marker), and the grant the options ask for;
@@ -32,7 +36,7 @@ use envcloak_policy::{
     escape_for_display, render_statement, statement_digest,
 };
 
-use super::{claims, fd_number};
+use super::{fd_number, refuse_if_claimed};
 use crate::connect::connect;
 use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use crate::tty::{Terminal, read_secret_fd};
@@ -112,8 +116,12 @@ pub fn approve(args: &[&str]) -> ExitCode {
 
 fn run_approve(a: ApproveArgs) -> Result<ExitCode, Failure> {
     refuse_if_traced()?;
+    let claims = refuse_if_claimed()?;
     let id = a.request.to_string();
-    let descriptor = connect()?.pending_get(&id)?;
+    // The daemon serves the request only to a caller that may give a
+    // proof, so where none is taken this stops before the statement is
+    // shown or the passphrase read.
+    let descriptor = connect()?.pending_get(&id, &claims)?;
     // The statement is rendered from what the daemon sent, escaped, and
     // its digest is computed over exactly that (gate 23: a statement that
     // differs from the pending request is rejected by the daemon).
@@ -130,7 +138,7 @@ fn run_approve(a: ApproveArgs) -> Result<ExitCode, Failure> {
             t.read_secret("Vault passphrase to approve this: ")?
         }
     };
-    let approved = connect()?.approve(&id, a.options.clone(), &digest, passphrase, &claims())?;
+    let approved = connect()?.approve(&id, a.options.clone(), &digest, passphrase, &claims)?;
     let grant = GrantId::parse(&approved.grant)
         .ok_or_else(|| Failure::new("protocol_error", "the daemon's answer was malformed"))?;
     match a.options.uses {

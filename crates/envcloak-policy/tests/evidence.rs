@@ -14,7 +14,8 @@ use std::path::PathBuf;
 
 use envcloak_policy::{
     AGENTS_DIR, AgentCatalog, AgentLabel, Ancestor, CatalogSource, ChainEnd, Claims, EvidenceError,
-    GATHER_ATTEMPTS, MatchBasis, ProcessInstance, SubjectEvidence, SubjectKind, gather_in,
+    GATHER_ATTEMPTS, MatchBasis, ProcessInstance, ProofRefusal, SubjectEvidence, SubjectKind,
+    gather_in,
 };
 use envcloak_sys::{
     Argv, CodeSignature, ExeIdentity, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo,
@@ -139,6 +140,94 @@ fn without_an_agent_the_session_leader_is_the_root() {
     assert_eq!(e.root().pid, 70);
     assert!(!e.orphaned());
     assert!(!e.agent_involved());
+}
+
+/// SPEC §10b: a proof is taken only from a terminal subject. Every other
+/// caller is refused, with the first reason that applies: an agent by any
+/// evidence, a cut chain, a lost ancestry, or no terminal session.
+#[test]
+fn only_a_terminal_subject_gives_a_proof() {
+    let e = ev(terminal_chain(None), true, &[]);
+    assert_eq!(e.kind(), SubjectKind::Terminal);
+    assert_eq!(e.proof_refusal(), None);
+
+    let cases: Vec<(&str, SubjectEvidence, ProofRefusal)> = vec![
+        (
+            "an agent in the ancestry",
+            ev(terminal_chain(builtin("claude-code")), true, &[]),
+            ProofRefusal::Agent,
+        ),
+        (
+            "an agent's marker",
+            ev(terminal_chain(None), true, &["CLAUDECODE"]),
+            ProofRefusal::Agent,
+        ),
+        (
+            "a chain cut at the depth limit",
+            ev_end(terminal_chain(None), ChainEnd::Cut, true, &[]),
+            ProofRefusal::ChainCut,
+        ),
+        (
+            "an orphan on its old terminal",
+            ev(vec![p(95, 70, None), p(1, 1, None)], true, &[]),
+            ProofRefusal::Orphaned,
+        ),
+        // A session without a terminal, whose leader is alive in the
+        // chain: `setsid` without the parent exiting.
+        (
+            "setsid under a terminal",
+            ev(
+                vec![
+                    p(95, 95, None),
+                    p(90, 70, None),
+                    p(70, 70, None),
+                    p(1, 1, None),
+                ],
+                false,
+                &[],
+            ),
+            ProofRefusal::NoTerminal,
+        ),
+        // A job `systemd-run --user` started: it leads its own session, a
+        // child of the user's service manager.
+        (
+            "a systemd --user job",
+            ev(
+                vec![p(95, 95, None), p(40, 40, None), p(1, 1, None)],
+                false,
+                &[],
+            ),
+            ProofRefusal::NoTerminal,
+        ),
+        // A `launchctl submit` job, or a GUI app's helper, in pid 1's
+        // session.
+        (
+            "a launchd job",
+            ev(vec![p(95, 1, None), p(1, 1, None)], false, &[]),
+            ProofRefusal::NoTerminal,
+        ),
+    ];
+    for (what, e, want) in cases {
+        assert_ne!(e.kind(), SubjectKind::Terminal, "{what}");
+        assert_eq!(e.proof_refusal(), Some(want), "{what}");
+    }
+    // The service-manager jobs and `setsid` show no agent and are no
+    // orphans: the refusal comes from the missing terminal alone.
+    let job = ev(
+        vec![p(95, 95, None), p(40, 40, None), p(1, 1, None)],
+        false,
+        &[],
+    );
+    assert!(!job.agent_involved());
+    assert!(!job.orphaned());
+    for r in [
+        ProofRefusal::Agent,
+        ProofRefusal::ChainCut,
+        ProofRefusal::Orphaned,
+        ProofRefusal::NoTerminal,
+    ] {
+        assert!(!r.token().is_empty());
+    }
 }
 
 #[test]

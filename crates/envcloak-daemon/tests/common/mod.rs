@@ -31,6 +31,17 @@ pub fn client(home: &TestHome) -> Client {
     Client::connect(&run_paths(home)).unwrap()
 }
 
+/// Makes this test process a terminal session (a new session with a
+/// pseudo-terminal as its controlling terminal), so the daemon takes its
+/// proofs: SPEC §10b takes a proof (`unlock`, `approve`) only from a
+/// terminal subject with no agent in its ancestry. Idempotent. CI has no
+/// agent above the tests; under a developer's agent the proofs are still
+/// refused, as they must be (run the tests outside its tree).
+pub fn terminal_session() {
+    envcloak_sys::testing::enter_terminal_session()
+        .expect("this test process could not become a terminal session");
+}
+
 pub fn passphrase(cs: &[Canary]) -> SecretBytes {
     SecretBytes::copy_from(by_label(cs, labels::VAULT_PASSPHRASE).value())
 }

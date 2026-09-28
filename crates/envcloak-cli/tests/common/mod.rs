@@ -3,8 +3,12 @@
 //! The CLI reads passphrases from `/dev/tty`, so every command here runs in
 //! a new session without a controlling terminal (a small `python3` wrapper
 //! calls `setsid` and then `exec`s the CLI), and descriptors such as
-//! `--passphrase-fd 3` are opened by that wrapper from files. A test that
-//! wants a terminal gives the CLI a pseudo-terminal of its own.
+//! `--passphrase-fd 3` are opened by that wrapper from files. A command
+//! that gives a proof (`unlock`, `approve`) runs as a person's does
+//! instead: leading a session whose controlling terminal is a new
+//! pseudo-terminal ([`run_on_terminal`]), since the daemon takes a proof
+//! only from a terminal subject (SPEC §10b). A test that types into a
+//! terminal drives one of its own ([`drive`]).
 #![allow(dead_code, clippy::unwrap_used)]
 
 use std::io::Read;
@@ -65,6 +69,53 @@ for item in [i for i in sys.argv[1].split(',') if i]:
 os.execv(sys.argv[2], sys.argv[2:])
 ";
 
+/// Runs argv[2..] as the leader of a new session whose controlling
+/// terminal is a new pseudo-terminal, as a shell in a terminal window is,
+/// with the descriptors named in argv[1] opened as [`DETACH`] opens them.
+/// Its stdout and stderr stay this wrapper's, so a test reads them apart;
+/// its stdin is the terminal, where nothing is typed (on macOS a session
+/// whose terminal no process holds open loses it). What it writes to the
+/// terminal is read and dropped. Exits with the command's code, or 128
+/// plus the signal that ended it.
+const ON_TERMINAL: &str = "import os, pty, select, sys
+out, err = os.dup(1), os.dup(2)
+pid, fd = pty.fork()
+if pid == 0:
+    os.dup2(out, 1)
+    os.dup2(err, 2)
+    for item in [i for i in sys.argv[1].split(',') if i]:
+        if '<' in item:
+            n, p = item.split('<', 1)
+            f = os.open(p, os.O_RDONLY)
+        else:
+            n, p = item.split('>', 1)
+            f = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        if f != int(n):
+            os.dup2(f, int(n))
+            os.close(f)
+        os.set_inheritable(int(n), True)
+    os.execv(sys.argv[2], sys.argv[2:])
+os.close(out)
+os.close(err)
+reading = True
+while True:
+    if reading:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try:
+                reading = bool(os.read(fd, 4096))
+            except OSError:
+                reading = False
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+    else:
+        _, status = os.waitpid(pid, 0)
+        break
+code = os.waitstatus_to_exitcode(status)
+sys.exit(code if code >= 0 else 128 - code)
+";
+
 /// A descriptor to open for the CLI: `(fd, path, for_reading)`.
 pub type Fd<'a> = (i32, &'a Path, bool);
 
@@ -91,6 +142,36 @@ pub fn cli_command(home: &TestHome, args: &[&str], fds: &[Fd<'_>]) -> Command {
 /// Runs `envcloak <args>` and waits up to a minute for it.
 pub fn run(home: &TestHome, args: &[&str], fds: &[Fd<'_>]) -> Output {
     finish_within(cli_command(home, args, fds), Duration::from_secs(60))
+}
+
+/// The CLI command `envcloak <args>` in `home`'s environment, leading a
+/// session on a pseudo-terminal of its own as a person's command in a
+/// terminal window does, with `fds` opened (see [`ON_TERMINAL`]).
+pub fn on_terminal_command(home: &TestHome, args: &[&str], fds: &[Fd<'_>]) -> Command {
+    let spec: Vec<String> = fds
+        .iter()
+        .map(|(n, p, read)| format!("{n}{}{}", if *read { '<' } else { '>' }, p.display()))
+        .collect();
+    let mut cmd = Command::new(python3());
+    home.apply(&mut cmd)
+        .args(["-c", ON_TERMINAL])
+        .arg(spec.join(","))
+        .arg(cli())
+        .args(args)
+        .current_dir(home.home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+/// Runs `envcloak <args>` on a terminal of its own, as a person does to
+/// give a proof, and waits up to a minute for it.
+pub fn run_on_terminal(home: &TestHome, args: &[&str], fds: &[Fd<'_>]) -> Output {
+    finish_within(
+        on_terminal_command(home, args, fds),
+        Duration::from_secs(60),
+    )
 }
 
 /// Spawns `cmd` and waits up to `limit` for it, then collects its output.

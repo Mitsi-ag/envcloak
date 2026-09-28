@@ -5,9 +5,11 @@
 //! chains in `crates/envcloak-policy/tests/grants.rs`.
 //!
 //! The caller here is this test process, so `unlock` and `approve` need
-//! it to have no agent in its ancestry: CI runs it that way. Under a
-//! developer's Claude Code the proofs are refused, as they must be; run
-//! the tests outside the agent's tree then (on macOS, `launchctl submit`).
+//! it to be a terminal subject with no agent in its ancestry: each test
+//! makes it a terminal session first (`common::terminal_session`), and CI
+//! has no agent above it. Under a developer's Claude Code the proofs are
+//! refused, as they must be; run the tests outside the agent's tree then
+//! (on macOS, `launchctl submit`).
 //! Every test sweeps the daemon's log for the passphrase, the kit and the
 //! values.
 #![allow(clippy::unwrap_used)]
@@ -48,6 +50,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        common::terminal_session();
         let cs = canaries(fresh_seed());
         let home = TestHome::new();
         let kit = seed_vault(&home, &cs);
@@ -84,7 +87,7 @@ impl Fixture {
     /// daemon shows, with `pass`.
     fn approve(&self, id: &str, opts: ApprovalOptions, pass: &[u8]) -> Result<String, ClientError> {
         let mut c = client(&self.home);
-        let d = c.pending_get(id)?;
+        let d = c.pending_get(id, &[])?;
         let digest = statement_digest(&d, &opts);
         c.approve(id, opts, &digest, SecretBytes::copy_from(pass), &[])
             .map(|a| a.grant)
@@ -141,7 +144,7 @@ fn a_request_is_pending_until_approved_then_covered() {
     let id = pending(&f.request(&["./emit", "--flag"]));
     let st = c.status().unwrap();
     assert_eq!((st.approvals.grants, st.approvals.pending), (0, 1));
-    let d = c.pending_get(&id).unwrap();
+    let d = c.pending_get(&id, &[]).unwrap();
     assert_eq!(d.request, id);
     assert!(d.project.new_project);
     assert!(d.project.dir.ends_with("acme-web"), "{}", d.project.dir);
@@ -184,14 +187,14 @@ fn a_request_is_pending_until_approved_then_covered() {
         (ErrorKind::InvalidOptions, Some("ttl_too_long"))
     );
     assert_eq!(c.status().unwrap().approvals.proof_failures, 1);
-    let e = c.pending_get("ZZZZZZZZ").unwrap_err();
+    let e = c.pending_get("ZZZZZZZZ", &[]).unwrap_err();
     assert_eq!(rpc_kind(e).0, ErrorKind::NoSuchRequest);
-    let e = c.pending_get("not an id").unwrap_err();
+    let e = c.pending_get("not an id", &[]).unwrap_err();
     assert_eq!(rpc_kind(e).0, ErrorKind::InvalidParams);
 
     let grant = f.approve_ok(&id, session(3600));
     assert_eq!(c.status().unwrap().approvals.proof_failures, 0);
-    let e = c.pending_get(&id).unwrap_err();
+    let e = c.pending_get(&id, &[]).unwrap_err();
     assert_eq!(rpc_kind(e).0, ErrorKind::NoSuchRequest);
     let list = c.grants_list().unwrap();
     assert_eq!(list.grants.len(), 1);
@@ -303,7 +306,7 @@ fn lock_and_restart_end_grants_and_pending_requests() {
     assert_eq!((st.approvals.grants, st.approvals.pending), (0, 0));
     assert!(c.grants_list().unwrap().grants.is_empty());
     assert_eq!(
-        rpc_kind(c.pending_get(&other).unwrap_err()).0,
+        rpc_kind(c.pending_get(&other, &[]).unwrap_err()).0,
         ErrorKind::NoSuchRequest
     );
     // While locked, a request is refused, not queued.
@@ -331,6 +334,56 @@ fn lock_and_restart_end_grants_and_pending_requests() {
         f.request(&["./emit"]),
         DecisionView::Pending { .. }
     ));
+    f.sweep();
+}
+
+/// Gate 23: a terminal session whose caller claims an agent's markers
+/// gives no proof. `pending.get`, `approve` and `unlock` are refused and
+/// audited before the passphrase is looked at: the failure count does not
+/// move. (A caller without a terminal is refused the same way: see
+/// `tests/proofs.rs`.)
+#[test]
+fn claimed_markers_refuse_every_proof() {
+    let f = Fixture::new();
+    let mut c = client(&f.home);
+    let id = pending(&f.request(&["./emit"]));
+    let claims = vec!["CLAUDECODE".to_owned()];
+    let e = c.pending_get(&id, &claims).unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::ProofRefused);
+    let d = c.pending_get(&id, &[]).unwrap();
+    let digest = statement_digest(&d, &session(60));
+    let e = c
+        .approve(&id, session(60), &digest, passphrase(&f.cs), &claims)
+        .unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::ProofRefused);
+    let e = c
+        .approve(
+            &id,
+            session(60),
+            &digest,
+            passphrase(&f.cs),
+            &["X_UNKNOWN_MARKER".to_owned()],
+        )
+        .unwrap_err();
+    assert_eq!(
+        rpc_kind(e).0,
+        ErrorKind::ProofRefused,
+        "any marker claims an agent"
+    );
+    assert!(c.grants_list().unwrap().grants.is_empty());
+    assert!(c.lock().unwrap().was_unlocked);
+    let e = c.unlock(passphrase(&f.cs), &claims).unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::ProofRefused);
+    let st = c.status().unwrap();
+    assert_eq!(st.vault.state, VaultState::Locked);
+    assert_eq!(st.approvals.proof_failures, 0);
+    let log = f.d.log();
+    for method in ["pending.get", "approve", "unlock"] {
+        assert!(
+            log.contains(&format!("proof refused method={method} reason=agent ")),
+            "{log}"
+        );
+    }
     f.sweep();
 }
 
@@ -540,6 +593,7 @@ fn project_identity_and_manifest_errors() {
 /// carried to the grant path).
 #[test]
 fn a_tampered_vault_gives_no_decision_and_takes_no_proof() {
+    common::terminal_session();
     let cs = canaries(fresh_seed());
     let home = TestHome::new();
     let kit = seed_vault(&home, &cs);

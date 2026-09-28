@@ -73,18 +73,27 @@ impl TestHome {
     /// `TMPDIR` into this tree. Call it before adding the command's own
     /// variables: it clears those too.
     pub fn apply<'c>(&self, cmd: &'c mut Command) -> &'c mut Command {
+        cmd.env_clear().envs(self.vars())
+    }
+
+    /// The variables [`TestHome::apply`] sets, in the order of
+    /// [`TEST_ENV_VARS`], for a child started some other way (a service
+    /// manager's job, `env -i`).
+    pub fn vars(&self) -> Vec<(&'static str, std::ffi::OsString)> {
         let r = self.root();
-        cmd.env_clear()
-            .env("PATH", TEST_PATH)
-            .env("LANG", "C")
-            .env("TERM", "dumb")
-            .env("HOME", r.join("home"))
-            .env("XDG_CONFIG_HOME", r.join("config"))
-            .env("XDG_DATA_HOME", r.join("data"))
-            .env("XDG_STATE_HOME", r.join("state"))
-            .env("XDG_CACHE_HOME", r.join("cache"))
-            .env("XDG_RUNTIME_DIR", r.join("run"))
-            .env("TMPDIR", r.join("tmp"))
+        let at = |sub: &str| r.join(sub).into_os_string();
+        vec![
+            ("PATH", TEST_PATH.into()),
+            ("LANG", "C".into()),
+            ("TERM", "dumb".into()),
+            ("HOME", at("home")),
+            ("XDG_CONFIG_HOME", at("config")),
+            ("XDG_DATA_HOME", at("data")),
+            ("XDG_STATE_HOME", at("state")),
+            ("XDG_CACHE_HOME", at("cache")),
+            ("XDG_RUNTIME_DIR", at("run")),
+            ("TMPDIR", at("tmp")),
+        ]
     }
 
     /// Sweeps the whole tree for canaries.

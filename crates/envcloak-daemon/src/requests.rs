@@ -18,8 +18,9 @@
 //!    grant, consumes it under the same lock.
 //!
 //! `approve` takes the passphrase as the proof. Before Argon2id runs, the
-//! approver's evidence must show no agent (SPEC §10b: proofs from such
-//! callers are refused), the pending request must exist, the statement
+//! approver must be a terminal subject with no agent by any evidence
+//! (SPEC §10b: proofs from every other caller are refused), the pending
+//! request must exist, the statement
 //! digest must be its own with the options sent, and the attempt limiter
 //! must admit the attempt. Argon2id then runs outside the state lock, with
 //! the vault taken out as an unlock takes it, one proof at a time.
@@ -33,7 +34,7 @@ use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{Vault, VaultErrorKind};
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{
-    ApproveParams, ErrorKind, RequestParams, RevokeParams, RunRequestParams,
+    ApproveParams, ErrorKind, PendingGetParams, RequestParams, RevokeParams, RunRequestParams,
 };
 use envcloak_ipc::view::{
     ApprovedView, DecisionView, DeniedView, GrantBindingView, GrantView, GrantsView, RevokedView,
@@ -52,8 +53,31 @@ use crate::lock::Reading;
 use crate::server::{Shared, locked, refuse_if_traced};
 use crate::state::vault_reason;
 
+/// Refuses a proof, or the statement a proof would approve, from a caller
+/// that may not give one (SPEC §10b): an agent by any evidence, or no
+/// terminal session ([`SubjectEvidence::proof_refusal`]). Audited with
+/// the reason.
+pub(crate) fn refuse_unless_prover(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    evidence: &SubjectEvidence,
+    method: &'static str,
+) -> Result<(), RpcError> {
+    match evidence.proof_refusal() {
+        None => Ok(()),
+        Some(r) => {
+            shared.audit.record(AuditEvent::ProofRefused {
+                pid: peer.pid,
+                method,
+                reason: r.token(),
+            });
+            Err(RpcError::new(ErrorKind::ProofRefused))
+        }
+    }
+}
+
 /// Reads the caller's evidence.
-fn evidence(
+pub(crate) fn evidence(
     shared: &Shared,
     peer: &PeerIdentity,
     claims: &[String],
@@ -271,9 +295,19 @@ fn request_id(p: &RequestParams) -> Result<PendingId, RpcError> {
     PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))
 }
 
-/// `pending.get`: the descriptor of a pending request.
-pub fn pending_get(shared: &Shared, p: RequestParams) -> Result<PendingDescriptor, RpcError> {
-    let id = request_id(&p)?;
+/// `pending.get`: the descriptor of a pending request, for a caller that
+/// may give a proof. Everyone else is refused before anything is looked
+/// up, so `envcloak approve` run where no proof is taken (an agent's
+/// tree, a service manager's job) stops before it shows the statement or
+/// asks for the passphrase.
+pub fn pending_get(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: PendingGetParams,
+) -> Result<PendingDescriptor, RpcError> {
+    let id = PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
+    let caller = evidence(shared, peer, &p.claims)?;
+    refuse_unless_prover(shared, peer, &caller, "pending.get")?;
     let now = now_of(&shared.clocks);
     locked(&shared.state)
         .grants()
@@ -305,13 +339,7 @@ pub fn approve(
     let digest = digest_of(&p.digest).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     refuse_if_traced()?;
     let approver = evidence(shared, peer, &p.claims)?;
-    if approver.agent_involved() {
-        shared.audit.record(AuditEvent::ProofRefused {
-            pid: peer.pid,
-            method: "approve",
-        });
-        return Err(RpcError::new(ErrorKind::ProofRefused));
-    }
+    refuse_unless_prover(shared, peer, &approver, "approve")?;
     let _gate = locked(&shared.proof_gate);
     let (vault, generation) = {
         let mut s = locked(&shared.state);

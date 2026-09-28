@@ -32,8 +32,8 @@ use crate::frame::{Frame, FrameError};
 use crate::paths::{RunPathError, RunPathErrorKind, RunPaths};
 use crate::proto::{
     self, Approve, ApproveParams, Deny, GrantsList, GrantsRevoke, Lock, Method, NoParams,
-    PendingGet, RequestParams, ResponseError, RevokeParams, RpcError, RunRequest, RunRequestParams,
-    Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
+    PendingGet, PendingGetParams, RequestParams, ResponseError, RevokeParams, RpcError, RunRequest,
+    RunRequestParams, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
 };
 use crate::view::{
     ApprovedView, CreatedView, DecisionView, DeniedView, GrantsView, LockedView, RevokedView,
@@ -296,13 +296,19 @@ impl Client {
         self.call::<RunRequest>(p)
     }
 
-    /// `pending.get` for request `id`.
+    /// `pending.get` for request `id`, with the caller's claims (the
+    /// daemon serves it only to a caller that may give a proof).
     ///
     /// # Errors
     /// As [`Client::call`].
-    pub fn pending_get(&mut self, id: &str) -> Result<PendingDescriptor, ClientError> {
-        self.call::<PendingGet>(&RequestParams {
+    pub fn pending_get(
+        &mut self,
+        id: &str,
+        claims: &[String],
+    ) -> Result<PendingDescriptor, ClientError> {
+        self.call::<PendingGet>(&PendingGetParams {
             request: id.to_owned(),
+            claims: claims.to_vec(),
         })
     }
 

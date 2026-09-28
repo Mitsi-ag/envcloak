@@ -26,6 +26,22 @@ pub fn claims() -> Vec<String> {
         .to_vec()
 }
 
+/// This process's claims ([`claims`]), for a command about to read a
+/// proof: with any marker set, the daemon refuses the proof (SPEC §10b),
+/// so the command refuses first, before it reads the passphrase or shows
+/// anything.
+pub fn refuse_if_claimed() -> Result<Vec<String>, crate::fail::Failure> {
+    let claims = claims();
+    if claims.is_empty() {
+        Ok(claims)
+    } else {
+        Err(envcloak_ipc::ClientError::Rpc(envcloak_ipc::RpcError::new(
+            envcloak_ipc::proto::ErrorKind::ProofRefused,
+        ))
+        .into())
+    }
+}
+
 /// A file descriptor number given on the command line: digits only.
 pub fn fd_number(v: &str) -> Option<i32> {
     if v.is_empty() || v.len() > 9 || !v.bytes().all(|b| b.is_ascii_digit()) {

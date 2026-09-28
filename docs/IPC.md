@@ -87,7 +87,7 @@ Response, one of:
 | `unlock` | `passphrase`, `claims` (optional: the names of the agent markers in the caller's environment) | `integrity`, `read_only`, `already` (true when it was unlocked already; nothing was checked) |
 | `lock` | none | `was_unlocked` |
 | `run.request` | `manifest` (the absolute path of `envcloak.toml`), `profile` (optional), `refs` (`NAME=<slug>[#field]` strings), `argv` (display text), `claims` | `decision`: `covered` with `grant`, `redact`, `mode` and `manifest_changed`; `pending` with `request`; or `denied` with `reason` (`repeated`, `root_denied`, `pending_per_root`, `pending_total`) |
-| `pending.get` | `request` | the pending request's descriptor (`envcloak_policy::PendingDescriptor`; docs/GRANTS.md "The statement") |
+| `pending.get` | `request`, `claims` | the pending request's descriptor (`envcloak_policy::PendingDescriptor`; docs/GRANTS.md "The statement"), for a caller that may give a proof |
 | `approve` | `request`, `options` (`uses`: `once` or `session`; `ttl_secs`; `live`: variable names), `digest` (SHA-256 of the canonical statement, 64 hex characters), `passphrase`, `claims` | `grant`, `expires_in_secs` |
 | `deny` | `request` | `root_auto_denied` |
 | `grants.list` | none | `grants`: each with `id`, `kind`, `label`, `root_pid`, `root_exe`, `project_dir`, `bindings` (`env_name`, `slug`, `live`), `mode`, `uses`, `created_secs`, `remaining_secs` |
@@ -96,8 +96,8 @@ Response, one of:
 - `vault.create` checks the Argon2id bounds, the passphrase rules and the kit's check symbols before any key derivation. The CLI generates the Recovery Kit and shows it (on the terminal, or the descriptor `--kit-fd` names, never stdout or stderr), so the kit crosses the socket only from the client to the daemon (SPEC §4.4: unlocker material is never sent to a client). Both envelopes use Argon2id with the given memory, 3 passes and 4 lanes.
 - A `vault.create` result means the vault exists under the passphrase and the kit sent, so the kit the CLI showed is valid, whether `locked` is true or not. The CLI calls a kit void only when no vault was created: the daemon refused before creating anything (`vault_exists`, `busy`, `passphrase_rejected`, `kdf_params`, `invalid_params`, `traced`), or the connection failed or the answer was unreadable and a new `status` then shows no vault and nothing in progress. Otherwise it says to keep the kit.
 - `unlock`, `vault.create` and `approve` run Argon2id on the connection's thread, outside the state lock, one at a time. All refuse (`traced`) while a tracer is attached to the daemon. A wrong passphrase and a damaged envelope give the one error `wrong_passphrase`, which is counted and audited.
-- `unlock` and `approve` are proofs (SPEC §10b): the daemon reads the caller's evidence first and refuses a caller with a known agent in its ancestry, agent markers in its claims, a lost ancestry or a chain cut at the walk's limit (`proof_refused`, audited as `proof refused method=<name>`). Both count against one attempt limiter: after 5 failures each further attempt waits, 30 seconds doubling to an hour, and an early attempt is refused (`too_many_attempts`) without a passphrase being checked. `status` reports the failures and the wait.
-- `run.request` decides only; the values a covered run receives are T12's. `pending.get`, `deny`, `grants.list` and `grants.revoke` carry metadata only and need no proof: denying and revoking only tighten. Ids are Crockford base32 (26 characters for a grant, 8 for a request); a malformed one is `invalid_params`, an unknown or expired one `no_such_request`. docs/GRANTS.md has the rules.
+- `unlock` and `approve` are proofs (SPEC §10b): the daemon reads the caller's evidence first and takes a proof only from a terminal subject, refusing a caller with a known agent in its ancestry or agent markers in its claims, a chain cut at the walk's limit, a lost ancestry, or no controlling terminal (`proof_refused`, audited as `proof refused method=<name> reason=<token>`). `pending.get` is refused to the same callers, before the id is looked up. Both count against one attempt limiter: after 5 failures each further attempt waits, 30 seconds doubling to an hour, and an early attempt is refused (`too_many_attempts`) without a passphrase being checked. `status` reports the failures and the wait.
+- `run.request` decides only; the values a covered run receives are T12's. `pending.get`, `deny`, `grants.list` and `grants.revoke` carry metadata only and need no proof (`pending.get` still needs a caller that may give one): denying and revoking only tighten. Ids are Crockford base32 (26 characters for a grant, 8 for a request); a malformed one is `invalid_params`, an unknown or expired one `no_such_request`. docs/GRANTS.md has the rules.
 - `lock` needs no proof: locking only tightens. It drops every grant and pending request.
 
 ## App-role methods
@@ -130,7 +130,7 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `mode_unsupported` | -32016 | The effective mode is proxy, which M1 does not have |
 | `no_such_request` | -32017 | No pending request has the id, or it expired |
 | `statement_mismatch` | -32018 | The digest is not the pending request's with the options sent |
-| `proof_refused` | -32019 | A proof from a caller with an agent in its evidence |
+| `proof_refused` | -32019 | A proof (or `pending.get`) from a caller that is not a terminal subject: an agent by any evidence, or no terminal session |
 | `too_many_attempts` | -32020 | The attempt limiter refused the attempt |
 | `vault_tampered` | -32021 | The vault failed its integrity check; no decision, no proof |
 | `too_many_grants` | -32022 | 256 grants are in force |
