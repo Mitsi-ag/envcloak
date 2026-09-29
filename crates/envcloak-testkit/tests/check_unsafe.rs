@@ -30,6 +30,16 @@ fn warnings_lint() -> String {
     ["warn", "ings"].concat()
 }
 
+/// `expose_secret`, the method clippy.toml forbids.
+fn expose_method() -> String {
+    ["expose", "_secret"].concat()
+}
+
+/// `ExposeSecret`, its trait.
+fn expose_trait() -> String {
+    ["Expose", "Secret"].concat()
+}
+
 /// The clean fixture's `[workspace.lints.clippy]` body.
 fn clippy_body() -> String {
     format!(
@@ -533,6 +543,117 @@ fn exposure_allowed_outside_the_allowlist_fails() {
         &format!("#![allow({}{})]\n", "clippy::", "style"),
     );
     assert_fails(&t, "crates/envcloak-core/src/broad.rs");
+}
+
+/// Review T1-1: clippy lints only the configurations CI compiles, so a call
+/// under another target's cfg needs no allow and passed every check. The
+/// text check refuses the names themselves outside the allowlist, in any
+/// configuration.
+#[test]
+fn exposure_names_outside_the_allowlist_fail_in_any_configuration() {
+    let m = expose_method();
+    let t = expose_trait();
+    let rel = "crates/envcloak-core/src/open.rs";
+    let cases = [
+        // A plain call under another target's cfg: no allow needed there.
+        format!(
+            "#[cfg(target_arch = \"x86\")]\npub fn open(s: &secrecy::SecretBox<[u8]>) -> &[u8] {{\n    s.{m}()\n}}\n"
+        ),
+        format!("#[cfg(target_env = \"musl\")]\nfn f(s: &S) -> u8 {{\n    s.{m}()[0]\n}}\n"),
+        // Calls by path (UFCS), and the mutable form.
+        format!("fn f(s: &S) -> &[u8] {{\n    secrecy::{t}::{m}(s)\n}}\n"),
+        format!("fn f(s: &S) -> &[u8] {{\n    <S as {t}<[u8]>>::{m}(s)\n}}\n"),
+        format!("fn f(s: &mut S) {{\n    s.{m}_mut()[0] = 1;\n}}\n"),
+        // Imports, renamed or not.
+        format!("use secrecy::{t};\n"),
+        format!("#[cfg(windows)]\nuse secrecy::{{SecretBox, {t}Mut as Peek}};\n"),
+        // A raw identifier, a call split over lines, and a function
+        // reference where a lint group would be.
+        format!("fn f(s: &S) -> &[u8] {{\n    s.r#{m}()\n}}\n"),
+        format!("fn f(s: &S) -> &[u8] {{\n    s\n        .{m}\n        ()\n}}\n"),
+        format!("fn f() {{\n    allow({t}::{m});\n}}\n"),
+    ];
+    // Every case is tried, and every one that got through is named.
+    let missed: Vec<&String> = cases
+        .iter()
+        .filter(|text| {
+            let tree = clean_tree();
+            write(&tree.home(), rel, text);
+            let out = run(&tree.home());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            out.status.success()
+                || !stderr.contains(&format!("{rel}:"))
+                || !stderr.contains("names expose_secret or ExposeSecret but is not listed")
+        })
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "{} of {} cases were not refused:\n{missed:#?}",
+        missed.len(),
+        cases.len()
+    );
+
+    // In a listed file, in comments and strings, and as part of longer
+    // names, they are fine; so is the lint canary, which opens secrets on
+    // purpose, and only it.
+    let tree = clean_tree();
+    let r = tree.home();
+    write(
+        &r,
+        "crates/envcloak-core/src/secret.rs",
+        &format!(
+            "#[allow({})]\npub fn open(s: &S) -> &[u8] {{\n    secrecy::{t}::{m}(s)\n}}\n",
+            exposure_lint()
+        ),
+    );
+    write(
+        &r,
+        "crates/envcloak-core/src/fine.rs",
+        &format!(
+            "// s.{m}() is allowed only in listed files.\n\
+             /// Never call `{t}::{m}` here.\n\
+             const A: &str = \"s.{m}()\";\n\
+             fn {m}s() {{}}\n\
+             fn my_{m}_helper() {{}}\n\
+             struct {t}ly;\n\
+             struct Not{t};\n"
+        ),
+    );
+    let canary = format!("use secrecy::{t};\npub fn f(s: &S) -> &[u8] {{\n    s.{m}()\n}}\n");
+    write(&r, "security/lint-canary/src/lib.rs", &canary);
+    assert_passes(&tree);
+    write(&r, "security/unsafe-canary/src/lib.rs", &canary);
+    assert_fails(
+        &tree,
+        "security/unsafe-canary/src/lib.rs:1: names expose_secret",
+    );
+}
+
+#[test]
+fn listed_files_may_not_define_macros() {
+    // A macro in a listed file would open a secret wherever it is used.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/secret.rs",
+        &format!(
+            "#[allow({})]\npub fn open() {{}}\n\nmacro_rules! peek {{ ($s:expr) => {{ $s }} }}\n",
+            exposure_lint()
+        ),
+    );
+    assert_fails(
+        &t,
+        "crates/envcloak-core/src/secret.rs:4: files listed in security/expose-allowlist.txt may not define macros",
+    );
+
+    // Elsewhere a macro is fine.
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/other.rs",
+        "macro_rules! twice { ($e:expr) => { $e + $e } }\n",
+    );
+    assert_passes(&t);
 }
 
 #[test]

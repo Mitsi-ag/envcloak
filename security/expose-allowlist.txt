@@ -3,9 +3,12 @@
 #
 # One repo-relative path per line, followed by `#` and the reason. Every
 # call site still needs `#[allow(clippy::disallowed_methods)]`, and
-# scripts/check-unsafe.sh fails on such an allow in any file not listed here
-# and on entries whose file no longer exists. Adding a line needs review:
-# each one is a place a plaintext value can escape.
+# scripts/check-unsafe.sh fails on such an allow in any file not listed here,
+# on the names expose_secret, expose_secret_mut, ExposeSecret and
+# ExposeSecretMut in any file not listed here (in any cfg, which clippy does
+# not lint for targets CI does not build), on a macro defined in a listed
+# file, and on entries whose file no longer exists. Adding a line needs
+# review: each one is a place a plaintext value can escape.
 
 crates/envcloak-core/src/secret.rs           # SecretBytes and SecretBuf themselves, and their unit tests
 crates/envcloak-core/src/crypto/aead.rs      # seal and open: read a subkey to encrypt or decrypt

@@ -276,7 +276,7 @@ A single vault per user under the platform data directory: `~/Library/Applicatio
 
 #### Memory hygiene
 
-- Sensitive values live in `SecretBytes` (a fixed-size boxed slice wrapped by `secrecy` and `zeroize`). It has no `Clone`, no `Serialize` and no `Display`, and its `Debug` is redacted. `expose_secret` is allowed only in modules on a reviewed allowlist, enforced by clippy `disallowed-methods`.
+- Sensitive values live in `SecretBytes` (a fixed-size boxed slice wrapped by `secrecy` and `zeroize`). It has no `Clone`, no `Serialize` and no `Display`, and its `Debug` is redacted. `expose_secret` is allowed only in modules on a reviewed allowlist, enforced by clippy `disallowed-methods` in the configurations CI compiles and, in every other configuration, by `scripts/check-unsafe.sh`, which refuses the method and trait names in any file not on the list.
 - Buffers holding plaintext are pre-sized. Growth allocates a new zeroizing buffer, copies, and wipes the old one; a populated secret buffer never grows in place.
 - `envcloakd` and `envcloak` install a global allocator that wipes every block on free and implements realloc as allocate, copy, wipe, free.
 - The key arena is `mlock`ed where the OS allows, and marked `MADV_DONTDUMP` on Linux (macOS has no equivalent). Both are best effort.

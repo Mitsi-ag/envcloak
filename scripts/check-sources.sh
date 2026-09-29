@@ -24,8 +24,11 @@
 #    review. check-unsafe.sh already forbids proc-macro crates in the
 #    workspace itself.
 #
-# Configurations CI does not build (other targets or features) are covered
-# only by check-unsafe.sh's text checks.
+# Code compiled only for other targets or features is not in this list,
+# and clippy does not lint it either. There check-unsafe.sh's text checks
+# stand alone: they refuse the expose_secret names outside the allowlist in
+# any cfg, and every lint attribute, #[path], include! and clippy cfg they
+# can see, but not what a macro assembles from pieces.
 #
 # Usage: scripts/check-sources.sh [workspace-root]
 # Runs $CARGO (default: cargo) with the caller's environment, so it checks

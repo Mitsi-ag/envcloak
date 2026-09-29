@@ -17,8 +17,16 @@
 # 2. clippy.toml forbids secrecy's expose_secret methods, and no other clippy
 #    config exists. `disallowed_methods` may be allowed only in files listed
 #    in security/expose-allowlist.txt (whose entries must exist), and those
-#    files may not declare out-of-line modules that would inherit an allow.
+#    files may not declare out-of-line modules that would inherit an allow,
+#    or macros that could carry a call into another file.
 #    Nothing may allow `warnings`, `clippy::all` or `clippy::style`.
+#    Clippy lints only the configurations CI compiles, so a call under
+#    another target's cfg (`#[cfg(target_arch = "x86")]`) needs no allow
+#    there. So no file outside the allowlist may name `expose_secret`,
+#    `expose_secret_mut`, `ExposeSecret` or `ExposeSecretMut` at all, in
+#    any configuration: not in a call, a path, an import or anywhere else.
+#    security/lint-canary is the one exception: it opens secrets on purpose
+#    so scripts/check-expose-lint.sh can prove clippy reports each call.
 # 3. No Rust file uses `include!` or a `#[path]` attribute, either of which
 #    compiles a file this check never reads, or names the `clippy` cfg,
 #    which compiles code clippy never lints (`cfg(not(clippy))`) or code
@@ -506,7 +514,8 @@ END {
       report(line_of(s), "names the clippy cfg, which hides code from clippy; only lint paths (clippy::name) may use the name")
     pos = s + l
   }
-  # An allow in a listed file would reach the modules it declares out of line.
+  # An allow in a listed file would reach the modules it declares out of
+  # line, and a macro it defines would put its calls in other files.
   if (allowlisted) {
     pos = 1
     while (match(substr(masked, pos), /mod[ \t\n]+[A-Za-z_][A-Za-z0-9_]*[ \t\n]*;/)) {
@@ -514,6 +523,23 @@ END {
       if (s == 1 || !ident(substr(masked, s - 1, 1)))
         report(line_of(s), "files listed in " allowlist " may not declare out-of-line modules")
       pos = s + RLENGTH
+    }
+    pos = 1
+    while (match(substr(masked, pos), /macro_rules[ \t\n]*!/)) {
+      s = pos + RSTART - 1
+      if (s == 1 || !ident(substr(masked, s - 1, 1)))
+        report(line_of(s), "files listed in " allowlist " may not define macros (one could open a secret in another file)")
+      pos = s + RLENGTH
+    }
+  }
+  # The exposure names, read from the text before lint attributes were
+  # blanked, so `allow(ExposeSecret::expose_secret)` (a call of a function
+  # named allow) is seen too.
+  if (!allowlisted && !canary) {
+    n = split(text, tlines, "\n")
+    for (q = 1; q <= n; q++) {
+      if (tlines[q] ~ /(^|[^A-Za-z0-9_])(expose_secret(_mut)?|ExposeSecret(Mut)?)([^A-Za-z0-9_]|$)/)
+        report(q, "names expose_secret or ExposeSecret but is not listed in " allowlist " (clippy lints only the configurations CI compiles; this check covers every cfg)")
     }
   }
   n = split(masked, lines, "\n")
@@ -538,10 +564,14 @@ while IFS= read -r file; do
   if printf '%s\n' "$allowed" | grep -qxF "$file"; then
     listed=1
   fi
+  canary=0
+  case "$file" in
+    security/lint-canary/*) canary=1 ;;
+  esac
   while IFS= read -r msg; do
     fail "$file:$msg"
   done < <(LC_ALL=C awk -v in_sys="$in_sys" -v allowlisted="$listed" -v allowlist="$allowlist" \
-    "$rust_lints_awk" "$file")
+    -v canary="$canary" "$rust_lints_awk" "$file")
 done < <(rust_files)
 
 if [ "$status" -eq 0 ]; then
