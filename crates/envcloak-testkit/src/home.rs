@@ -28,10 +28,13 @@ pub const TEST_ENV_VARS: [&str; 10] = [
 ];
 
 /// Diagnostic settings [`TestHome::apply`] passes on from this process
-/// when it has them. Gate 12 runs the whole suite at `RUST_LOG=trace` and
-/// `RUST_BACKTRACE=full`, and the programs the tests start must run at
-/// those settings too. They choose how much a program logs; they hold no
-/// secret.
+/// when it has them. CI runs the whole suite at `RUST_LOG=trace` and
+/// `RUST_BACKTRACE=full` (gate 12), and the programs the tests start run
+/// at those settings too. They choose how much a program logs; they hold
+/// no secret. No EnvCloak program reads `RUST_LOG` yet (there is no
+/// logger); it is passed on so that logging added later is swept at its
+/// most verbose. What gate 12 rests on is each test's own sweep of what it
+/// captured.
 pub const DIAGNOSTIC_VARS: [&str; 2] = ["RUST_LOG", "RUST_BACKTRACE"];
 
 /// A temporary directory under `/tmp` with a short name (`/tmp/ecXXXXXX`),

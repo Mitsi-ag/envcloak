@@ -133,9 +133,11 @@ jobs:
       - name: unsafe_code forbid canary
         run: scripts/check-unsafe-lint.sh
       # Gate 12: the whole suite at RUST_LOG=trace with full backtraces;
-      # TestHome passes both on to every process the tests start, and every
-      # test sweeps what it captured. crates/envcloak-e2e adds injected
-      # panics and malformed inputs holding fixtures, and the fixture story.
+      # TestHome passes both on to every process the tests start. Nothing
+      # reads RUST_LOG yet (no logger); it is set so logging added later is
+      # swept at its most verbose. The gate rests on each test's sweep of
+      # what it captured, and crates/envcloak-e2e's injected panics,
+      # malformed inputs holding fixtures, and the fixture story.
       - name: cargo test --workspace (RUST_LOG=trace)
         env:
           RUST_LOG: trace

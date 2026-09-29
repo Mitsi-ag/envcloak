@@ -23,9 +23,12 @@
 //!   header.
 //!
 //! The whole workspace's suite runs at `RUST_LOG=trace` and
-//! `RUST_BACKTRACE=full` in CI too (.github/workflows/ci.yml), and every
-//! test there sweeps the streams it captures; `TestHome` passes both
-//! settings on to the processes the tests start.
+//! `RUST_BACKTRACE=full` in CI too (.github/workflows/ci.yml), and
+//! `TestHome` passes both settings on to the processes the tests start.
+//! No EnvCloak program reads `RUST_LOG` yet (M1 has no logger); the setting
+//! is kept so that logging added later is swept at its most verbose. Gate
+//! 12 is enforced by this file, the fixture story (swept after every step)
+//! and the sweeps of each test that starts processes with fixtures.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{Read, Write};

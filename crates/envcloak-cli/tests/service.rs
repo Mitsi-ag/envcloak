@@ -10,6 +10,12 @@
 //! manager's runtime directory: CI names it in
 //! `ENVCLOAK_TEST_SERVICE_RUNTIME_DIR`, which the test passes on as
 //! `XDG_RUNTIME_DIR` (the daemon's socket goes there too).
+//!
+//! Gate 12: every stream the CLI printed is swept as soon as it is
+//! captured, before anything can show it, and so is the log the service
+//! manager kept of the daemon (launchd's log file in the test home on
+//! macOS, the user unit's journal on Linux), after the test has checked
+//! it holds the daemon's own lines.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -18,18 +24,31 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use common::{cli_command, finish_within, outside_dir, secret_file, stderr, stdout};
-use envcloak_testkit::{TestHome, by_label, canaries, fresh_seed, labels};
+use envcloak_testkit::{
+    Canary, TestHome, assert_no_canary, assert_sweep_clean, by_label, canaries, fresh_seed, labels,
+};
 
 struct Installed<'a> {
     home: &'a TestHome,
     label: String,
+    /// The fixture secrets, swept for in everything captured.
+    cs: Vec<Canary>,
 }
 
 impl Installed<'_> {
+    /// Runs `envcloak <args>`, and sweeps both streams before returning
+    /// them, so no failure message can show a value.
     fn cli(&self, args: &[&str], fds: &[common::Fd<'_>]) -> Output {
+        let out = self.run(args, fds);
+        assert_no_canary(&out.stdout, &self.cs);
+        assert_no_canary(&out.stderr, &self.cs);
+        out
+    }
+
+    /// Runs `envcloak <args>` with the service manager's runtime directory.
+    fn run(&self, args: &[&str], fds: &[common::Fd<'_>]) -> Output {
         let mut cmd = cli_command(self.home, args, fds);
-        if let Some(dir) = std::env::var_os("ENVCLOAK_TEST_SERVICE_RUNTIME_DIR") {
-            let dir = std::path::PathBuf::from(dir);
+        if let Some(dir) = runtime_dir() {
             cmd.env("XDG_RUNTIME_DIR", &dir);
             if dir.join("bus").exists() {
                 cmd.env(
@@ -40,12 +59,75 @@ impl Installed<'_> {
         }
         finish_within(cmd, Duration::from_secs(120))
     }
+
+    /// What the service manager kept of the daemon's standard output and
+    /// error: launchd's log file on macOS, the unit's journal on Linux.
+    /// Waits up to 20 seconds for it to hold the daemon's `listening`
+    /// line (the journal can lag), which shows it is the right log;
+    /// fails otherwise, since a log that cannot be read cannot be swept.
+    fn daemon_log(&self) -> Vec<u8> {
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            let log = self.read_daemon_log();
+            let found = log.windows(20).any(|w| w == b"envcloakd: listening");
+            if found || Instant::now() >= end {
+                assert_no_canary(&log, &self.cs);
+                assert!(
+                    found,
+                    "the service manager's log of the daemon ({} bytes) has no listening line",
+                    log.len()
+                );
+                return log;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_daemon_log(&self) -> Vec<u8> {
+        std::fs::read(self.home.home().join("Library/Logs/EnvCloak/envcloakd.log"))
+            .unwrap_or_default()
+    }
+
+    /// The user unit's journal: the user's own journal first, then the
+    /// system journal (readable to the `adm` and `systemd-journal`
+    /// groups), then the system journal through `sudo -n` (CI has it).
+    #[cfg(not(target_os = "macos"))]
+    fn read_daemon_log(&self) -> Vec<u8> {
+        let unit = format!("{}.service", self.label);
+        let user_unit = format!("_SYSTEMD_USER_UNIT={unit}");
+        let tries: [&[&str]; 3] = [
+            &["journalctl", "--user", "-u", &unit],
+            &["journalctl", &user_unit],
+            &["sudo", "-n", "journalctl", &user_unit],
+        ];
+        let mut best = Vec::new();
+        for argv in tries {
+            let mut cmd = Command::new(argv[0]);
+            cmd.args(&argv[1..]).args(["-o", "cat", "--no-pager"]);
+            if let Some(dir) = runtime_dir() {
+                cmd.env("XDG_RUNTIME_DIR", dir);
+            }
+            let Ok(out) = cmd.output() else { continue };
+            if out.stdout.len() > best.len() {
+                best = out.stdout;
+            }
+        }
+        best
+    }
 }
 
 impl Drop for Installed<'_> {
     fn drop(&mut self) {
-        let _ = self.cli(&["daemon", "uninstall", "--label", &self.label], &[]);
+        // Nothing is shown, so nothing is swept: a panic here, while a
+        // failed test unwinds, would abort the run.
+        let _ = self.run(&["daemon", "uninstall", "--label", &self.label], &[]);
     }
+}
+
+/// The user manager's runtime directory CI names.
+fn runtime_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("ENVCLOAK_TEST_SERVICE_RUNTIME_DIR").map(std::path::PathBuf::from)
 }
 
 fn parent_pid(pid: &str) -> String {
@@ -70,11 +152,11 @@ fn daemon_install_runs_envcloakd_under_the_service_manager() {
         eprintln!("skipped: set ENVCLOAK_TEST_SERVICE_MANAGER=1 to load a test service");
         return;
     }
-    let cs = canaries(fresh_seed());
     let home = TestHome::new();
-    let svc = Installed {
+    let mut svc = Installed {
         home: &home,
         label: format!("ai.envcloak.test-{}", std::process::id()),
+        cs: canaries(fresh_seed()),
     };
 
     let out = svc.cli(&["daemon", "install", "--label", &svc.label], &[]);
@@ -115,12 +197,12 @@ fn daemon_install_runs_envcloakd_under_the_service_manager() {
         stdout(&status)
     );
 
-    // It serves a vault.
+    // It serves a vault. The Recovery Kit is a secret too.
     let files = outside_dir();
     let pass = secret_file(
         files.path(),
         "pass",
-        by_label(&cs, labels::VAULT_PASSPHRASE).value(),
+        by_label(&svc.cs, labels::VAULT_PASSPHRASE).value(),
     );
     let kit = files.path().join("kit");
     let create = svc.cli(
@@ -137,6 +219,13 @@ fn daemon_install_runs_envcloakd_under_the_service_manager() {
         &[(3, &pass, true), (4, &kit, false)],
     );
     assert!(create.status.success(), "{}", stderr(&create));
+    let kit_text = std::fs::read_to_string(&kit).unwrap();
+    svc.cs
+        .push(Canary::new("RECOVERY_KIT", kit_text.trim_end().to_owned()));
+    for o in [&out, &status, &create] {
+        assert_no_canary(&o.stdout, &svc.cs);
+        assert_no_canary(&o.stderr, &svc.cs);
+    }
     assert!(stdout(&svc.cli(&["status"], &[])).contains("vault: unlocked"));
 
     // Uninstalling stops it; the vault stays.
@@ -163,4 +252,9 @@ fn daemon_install_runs_envcloakd_under_the_service_manager() {
                 .exists()
         );
     }
+
+    // The daemon's whole log, as the service manager kept it, and
+    // everything in the home.
+    svc.daemon_log();
+    assert_sweep_clean(home.root(), &svc.cs);
 }

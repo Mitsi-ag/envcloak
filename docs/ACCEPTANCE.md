@@ -35,7 +35,7 @@ Status: M1. This file says how the M1 acceptance story (SPEC §15.1) and every M
 - **Injected panics.** Both binaries print a panic's place in the source and never its message (`envcloak_sys::install_panic_hook`), and no backtrace. `envcloak internal panic` and `envcloakd internal panic` panic with what standard input holds, in every build. The test build also panics on request at places on a value path (`envcloak_sys::panic_point`, feature `testing`, which no release build has): the CLI holding a run's released values (`cli.run.released`), the CLI holding an env file's parsed values (`cli.import.parsed`), and the daemon about to send a run's values (`daemon.release`). Each message holds a fixture; none shows anywhere.
 - **Malformed inputs holding fixtures.** Values on the command line wherever a name or an id goes, and in an argument that is not UTF-8; a manifest with a value where a reference goes, one that is not TOML, and one with a value as a variable name; env files whose broken lines hold values, for `init`, `import --scan`, `check` and `run --env-file`; a value where the Recovery Kit or a passphrase goes, and a value with a NUL byte on standard input; frames sent straight to the daemon's socket with a value as the method, as an unknown field, JSON-escaped where base64 goes, as a slug, in a request's paths and names, as the whole body, and after an oversized header.
 
-CI also runs the whole workspace's suite at `RUST_LOG=trace` and `RUST_BACKTRACE=full`. `TestHome` passes both settings on to every process the tests start (they choose what a program logs and hold no secret), and every test sweeps what it captures.
+CI also runs the whole workspace's suite at `RUST_LOG=trace` and `RUST_BACKTRACE=full`, and `TestHome` passes both settings on to every process the tests start (they choose what a program logs and hold no secret). No EnvCloak program reads `RUST_LOG` yet: M1 has no logger, and the daemon's log is the fixed lines it writes to standard error. The setting is kept so that logging added later runs at its most verbose under the same sweeps. Gate 12 rests on `gate12.rs`, the fixture story (swept after every step), and the sweeps of the tests that start processes with fixtures, each of which sweeps the streams and logs it captures, among them the service-managed daemon's log in `crates/envcloak-cli/tests/service.rs`.
 
 ## The release artifacts
 
@@ -54,7 +54,7 @@ CI's `release` job builds the binaries as shipped (`cargo build --release`: `pan
 | 8, 9, 13, 14, 33 (release order) | RUN.md "Gates"; 8 through the whole of `run`, and 9's `--profile short`: the story (S6, S8) |
 | 10, 15, 16 | IMPORT.md "Gates"; the story (S2) |
 | 11 | `crates/envcloak-sys/tests/alloc_probe.rs` and the probes each doc's "Gates" names (IPC frames, dotenv, TOML and JSON parsing, seal and open, the child's environment, the redactor) |
-| 12 | `crates/envcloak-e2e/tests/gate12.rs`, `release.rs`, and the whole suite at `RUST_LOG=trace` |
+| 12 | `crates/envcloak-e2e/tests/gate12.rs`, `release.rs`, the fixture story, and every test's sweep of what it captures (the suite runs at `RUST_LOG=trace` for logging to come) |
 | 17 | MANIFEST.md "Gates" |
 | 18 | PROVIDERS.md "Gates" |
 | 19 | `crates/envcloak-cli/tests/hardening.rs`, `crates/envcloak-daemon/tests/hardening.rs`, `crates/envcloak-sys/tests/{harden,tracer,codesign}.rs`; for the release artifacts, `crates/envcloak-e2e/tests/release.rs` |
