@@ -1631,6 +1631,46 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
         }
     }
 
+    /// Gate 10 through the CLI: a value two items hold is reported with
+    /// both, in the text and in the JSON.
+    #[test]
+    fn duplicate_owners_are_named_each() {
+        let item = |holders: &[&str]| ImportItemView {
+            slug: "openai/acme-web".into(),
+            field: "value".into(),
+            reference: "openai/acme-web".into(),
+            existing: true,
+            provider: Some("openai".into()),
+            classification: ClassificationView::Live,
+            length: LengthClass::Ok,
+            holders: holders.iter().map(|h| (*h).to_owned()).collect(),
+            entries: 1,
+            projects: 1,
+        };
+        let one = item_line(&item(&["openai/acme-web"]));
+        assert!(!one.contains("duplicate owners"), "{one}");
+        let two = item_line(&item(&["openai/acme-web", "openai/copy"]));
+        assert!(
+            two.contains(
+                "the same value is held by 2 items: openai/acme-web, openai/copy (duplicate \
+                 owners)"
+            ),
+            "{two}"
+        );
+        let report = ImportReport {
+            root: "/x".into(),
+            committed: false,
+            projects: Vec::new(),
+            items: vec![item(&["openai/acme-web", "openai/copy"])],
+            skipped: Vec::new(),
+        };
+        assert!(report.human().contains("(duplicate owners)"));
+        assert_eq!(
+            report.json()["items"][0]["holders"],
+            serde_json::json!(["openai/acme-web", "openai/copy"])
+        );
+    }
+
     #[test]
     fn dates_are_civil_utc() {
         assert_eq!(date(0), "1970-01-01");

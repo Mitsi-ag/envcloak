@@ -47,9 +47,9 @@
 //! - Each subject root may have [`MAX_VALUE_CHECKS`] values compared in
 //!   [`CHECK_WINDOW`] of awake time (`import.plan`, `import.commit` and
 //!   `import.verify` count), and more are refused (`too_many_checks`).
-//! - Each `import.plan` and `import.verify` is audited with the count of
-//!   values compared (kind `import`, outcome `checked`), and a refusal
-//!   too.
+//! - Each `import.plan`, `import.commit` and `import.verify` is audited
+//!   with the count of values compared (kind `import`, outcome `checked`),
+//!   and a refusal too.
 //!
 //! `files.restore` and `recovery.confirm` are proofs, as `rotate` is: the
 //! caller must be a terminal subject with no agent by any evidence, the
