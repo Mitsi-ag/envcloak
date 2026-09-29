@@ -53,7 +53,7 @@ A value that is kept:
 
 - is grouped with every equal value, by keyed hash under the vault's `index` subkey, across files and projects: one value in two repos becomes one item both manifests reference;
 - binds to the item that holds it already, the first by slug when several do; every item that holds it is reported, since a value with duplicate owners should have one (gate 10);
-- otherwise becomes a new item, named after its provider (from the value's shape, as `envcloak add` detects it) or its variable, and its project: `openai/acme-web`, `database-url/acme-web`, with the profile added for a profile's file (`short-token/acme-web-short`), and `-2` up to `-99` when a slug is taken. Its provider, classification, links and allowed hosts are filled in from the registry, as `add` fills them.
+- otherwise becomes a new item, named after its provider (from the value's shape, as `envcloak add` detects it) or its variable, and its project: `openai/acme-web`, `database-url/acme-web`, with the profile added for a profile's file (`short-token/acme-web-short`), and `-2` up to `-99` when a slug is taken. A project or profile name shaped like a key (a directory named by a hash, as worktrees and CI checkouts are) is never kept, in a slug or in `envcloak.toml`, which is committed: the project is `project` instead, and such a profile is left out of the slug. Its provider, classification, links and allowed hosts are filled in from the registry, as `add` fills them.
 
 ### Who may compare values
 

@@ -108,7 +108,10 @@ pub(crate) fn dir_of(root: &ScanRoot, rel_dir: &Path) -> PathBuf {
 }
 
 /// A slug part from a directory's name: lowercase letters, digits, `.`,
-/// `_` and `-`, starting with a letter or digit.
+/// `_` and `-`, starting with a letter or digit. A name shaped like a key
+/// (a directory named by a hash: a worktree, a CI checkout) is never used,
+/// since it would be kept in item slugs and in `envcloak.toml`, which is
+/// committed: it is `project` instead.
 pub(crate) fn project_name(dir: &Path) -> String {
     let raw = dir
         .file_name()
@@ -129,7 +132,7 @@ pub(crate) fn project_name(dir: &Path) -> String {
     let mut s = s.to_owned();
     s.truncate(60);
     let s = s.trim_end_matches(['.', '_', '-']).to_owned();
-    if s.is_empty() {
+    if s.is_empty() || looks_like_value(&s) {
         "project".to_owned()
     } else {
         s
@@ -722,6 +725,11 @@ mod tests {
             ("/x/---", "project"),
             ("/", "project"),
             ("/x/api_v2.1", "api_v2.1"),
+            // A directory named by a hash, built here: 40 hex digits.
+            (
+                &format!("/x/{}", "0123456789abcdef".repeat(3)[..40].to_owned()),
+                "project",
+            ),
         ] {
             let got = project_name(Path::new(dir));
             assert_eq!(got, want, "{dir}");

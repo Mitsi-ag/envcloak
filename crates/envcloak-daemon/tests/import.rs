@@ -854,3 +854,67 @@ fn values_compared_are_limited_per_subject_root() {
     );
     f.sweep();
 }
+
+/// Review finding F-53 (Codex): a directory named like a key (a hash, as
+/// worktrees and CI checkouts are) never becomes part of a slug: the
+/// project is `project` instead, a profile shaped like a key is left out,
+/// and neither comes back in the plan, the commit or the item list. The
+/// control: `items.add` refuses the same name as a slug.
+#[test]
+fn a_project_named_like_a_key_is_not_kept_in_slugs() {
+    let mut f = Fixture::new(|_, _| {});
+    // Letters and digits, 40 and 31 long: shaped like keys.
+    let hash = format!("{}7{}", word(20), word(19));
+    let profile = format!("{}7{}", word(15), word(15));
+    f.cs.push(Canary::new("HASH_NAME", hash.clone()));
+    f.cs.push(Canary::new("HASH_PROFILE", profile.clone()));
+    let mut c = client(&f.home);
+    let e = c
+        .items_add(&envcloak_ipc::proto::AddParams {
+            slug: Some(format!("openai/{hash}")),
+            provider: None,
+            field: None,
+            account: None,
+            env_hint: None,
+            allow_short: false,
+            value: WireSecret::new(f.value(labels::OPENAI_API_KEY_ROTATED)),
+            claims: Vec::new(),
+        })
+        .unwrap_err();
+    assert_eq!(rpc(e), ErrorKind::InvalidItem);
+    let rotated = by_label(&f.cs, labels::OPENAI_API_KEY_ROTATED)
+        .value()
+        .to_vec();
+    let params = || ImportParams {
+        projects: vec![ImportProject {
+            dir: f.dir(&hash),
+            name: hash.clone(),
+        }],
+        entries: vec![
+            entry(0, ".env", None, "OPENAI_API_KEY", &rotated),
+            entry(
+                0,
+                ".env.x",
+                Some(&profile),
+                "SHORT_TOKEN",
+                f.short.as_bytes(),
+            ),
+        ],
+        claims: Vec::new(),
+    };
+    let plan = c.import_plan(&params()).unwrap();
+    let slugs: Vec<&str> = plan.items.iter().map(|i| i.slug.as_str()).collect();
+    assert_eq!(slugs, ["openai/project", "short-token/project"]);
+    let done = c
+        .import_commit(&ImportCommitParams {
+            import: params(),
+            digest: plan.digest.clone(),
+        })
+        .unwrap();
+    assert_eq!(done, plan);
+    let list = c.items_list(false).unwrap();
+    assert!(list.items.iter().any(|i| i.slug == "openai/project"));
+    assert_no_canary(&json(&plan), &f.cs);
+    assert_no_canary(&json(&list), &f.cs);
+    f.sweep();
+}

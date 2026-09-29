@@ -20,8 +20,11 @@
 //! - A new item is named after its provider, or its variable, and its
 //!   project: `openai/acme-web`, `database-url/acme-web`, with the profile
 //!   added for a profile's file (`short-token/acme-web-short`) and a
-//!   number when the slug is taken. Its provider, classification, links
-//!   and hosts are detected from the value, as `add` detects them.
+//!   number when the slug is taken. A project or profile name shaped like
+//!   a key (a directory named by a hash) is never kept: it is
+//!   [`SAFE_PROJECT`] instead, or left out, and no slug shaped like a key
+//!   is made. Its provider, classification, links and hosts are detected
+//!   from the value, as `add` detects them.
 //! - The plan's digest covers every entry's fate, every item and each
 //!   value's keyed hash; `import.commit` works the plan out again under
 //!   the same lock it writes under, and refuses unless the digest is the
@@ -137,6 +140,9 @@ pub const CHECK_WINDOW: Duration = Duration::from_secs(3600);
 /// Subject roots counted at once; a new root beyond it is refused until a
 /// window ends.
 pub const MAX_CHECKING_ROOTS: usize = 4096;
+/// The project part of new items' slugs when the project's name is shaped
+/// like a key.
+pub const SAFE_PROJECT: &str = "project";
 /// Numbered slugs tried for a new item (`<base>/<project>-2`, ...).
 const SLUG_TRIES: usize = 99;
 /// The longest project part of a new item's slug.
@@ -287,7 +293,7 @@ struct Input {
     entries: Vec<Entry>,
 }
 
-fn check_input(p: ImportParams) -> Result<(Input, Vec<String>), RpcError> {
+fn check_input(shared: &Shared, p: ImportParams) -> Result<(Input, Vec<String>), RpcError> {
     if p.projects.len() > MAX_PROJECTS || p.entries.len() > MAX_ENTRIES {
         return Err(invalid());
     }
@@ -297,7 +303,12 @@ fn check_input(p: ImportParams) -> Result<(Input, Vec<String>), RpcError> {
         if !Path::new(&pr.dir).is_absolute() || pr.name.contains('/') {
             return Err(invalid());
         }
-        projects.push(Slug::new(&pr.name).map_err(|_| invalid())?);
+        let name = if looks_like_value(shared, &pr.name) {
+            SAFE_PROJECT
+        } else {
+            pr.name.as_str()
+        };
+        projects.push(Slug::new(name).map_err(|_| invalid())?);
     }
     let mut entries = Vec::with_capacity(p.entries.len());
     for e in p.entries {
@@ -379,8 +390,10 @@ fn name_base(name: &EnvName) -> String {
     }
 }
 
-/// The first free slug of `base/project[-profile]`, then numbered.
+/// The first free slug of `base/project[-profile]`, then numbered, that is
+/// not shaped like a key. A profile shaped like a key is left out.
 fn new_slug(
+    shared: &Shared,
     v: &Vault,
     taken: &BTreeSet<Slug>,
     base: &str,
@@ -388,7 +401,7 @@ fn new_slug(
     profile: Option<&ProfileName>,
 ) -> Result<Slug, RpcError> {
     let mut part = project.as_str().to_owned();
-    if let Some(p) = profile {
+    if let Some(p) = profile.filter(|p| !looks_like_value(shared, p.as_str())) {
         part.push('-');
         part.push_str(p.as_str());
     }
@@ -410,6 +423,7 @@ fn new_slug(
             }
         })
         .filter_map(|s| Slug::new(&s).ok())
+        .filter(|s| !looks_like_value(shared, s.as_str()))
         .find(|s| v.find(s).is_none() && !taken.contains(s))
         .ok_or_else(|| RpcError::with_reason(ErrorKind::InvalidItem, "no_free_slug"))
 }
@@ -523,6 +537,7 @@ fn new_item(
     }
     let base = provider.clone().unwrap_or_else(|| name_base(&e.name));
     let slug = new_slug(
+        shared,
         v,
         taken,
         &base,
@@ -627,7 +642,7 @@ pub fn import_plan(
     peer: &PeerIdentity,
     p: ImportParams,
 ) -> Result<ImportPlanView, RpcError> {
-    let (input, claims) = check_input(p)?;
+    let (input, claims) = check_input(shared, p)?;
     refuse_if_traced()?;
     locked(&shared.state).unlocked()?;
     let asker = ask(shared, peer, &claims, "import.plan", |person| {
@@ -645,7 +660,7 @@ pub fn import_commit(
     p: ImportCommitParams,
 ) -> Result<ImportPlanView, RpcError> {
     let wanted = p.digest;
-    let (mut input, claims) = check_input(p.import)?;
+    let (mut input, claims) = check_input(shared, p.import)?;
     refuse_if_traced()?;
     locked(&shared.state).unlocked()?;
     let Asker {
