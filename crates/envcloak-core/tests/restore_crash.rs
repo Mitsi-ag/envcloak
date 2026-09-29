@@ -11,7 +11,10 @@
 //! kit confirmed. Up to the step that keeps the old vault aside it must be
 //! the old one, and from the step after the rename the new one. A few
 //! rounds restore where no vault exists: then there is no vault or the new
-//! one. Set `ENVCLOAK_RESTORE_CRASH_SEED` to replay a run.
+//! one. Then the child is held at each step in turn and killed there, so
+//! every step, the one that keeps the old vault among them, has a kill
+//! land on it however the random ones fell. Set
+//! `ENVCLOAK_RESTORE_CRASH_SEED` to replay a run.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -32,6 +35,8 @@ use envcloak_testkit::fresh_seed;
 const RESTORER: &str = "ENVCLOAK_RESTORE_CRASH_DATA";
 const BACKUP: &str = "ENVCLOAK_RESTORE_CRASH_BACKUP";
 const SEED: &str = "ENVCLOAK_RESTORE_CRASH_SEED";
+/// The step the child stops at, printed, until it is killed.
+const HOLD: &str = "ENVCLOAK_RESTORE_CRASH_HOLD";
 /// Steps 1 to 7, in the order a restore passes them.
 const STEPS: u64 = 7;
 const ROUNDS_PER_TARGET: u64 = 5;
@@ -65,14 +70,21 @@ fn restore_child() {
     let at = input.iter().position(|b| *b == b'\n').unwrap();
     let kit = RecoveryKit::parse(&SecretBytes::copy_from(&input[..at])).unwrap();
     let pass = SecretBytes::copy_from(&input[at + 1..]);
-    println!("@@step 0");
+    let hold: Option<u64> = std::env::var(HOLD).ok().and_then(|h| h.parse().ok());
+    let step = |n: u64| {
+        println!("@@step {n}");
+        if hold == Some(n) {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    };
+    step(0);
     let (v, _) = restore_backup_observed(
         &VaultPaths::under(data),
         std::path::Path::new(&backup),
         &kit,
         &pass,
         &KdfParams::minimum(),
-        &mut |s| println!("@@step {}", step_number(s)),
+        &mut |s| step(step_number(s)),
     )
     .unwrap();
     assert_eq!(v.integrity(), Integrity::Ok);
@@ -246,6 +258,28 @@ fn kill_9_during_restore_leaves_the_old_or_the_new_vault() {
         "restore kills: {old} left the old vault, {new} the new one, {nothing} no vault \
          (where none was); last step reached per kill: {landed:?}"
     );
+    // A kill at each step for certain: the child stops there until killed.
+    // The random kills above may all have missed a short step.
+    for (target, had_old) in (0..=STEPS).map(|k| (k, true)).chain([(0, false)]) {
+        reset(&f.paths.vault_dir, had_old.then_some(snapshot.as_path()));
+        let ctx = format!("seed {seed}: held at step {target}, old vault {had_old}");
+        let hold = target.to_string();
+        let mut held = env.to_vec();
+        held.push((HOLD, hold.as_str()));
+        let mut child = spawn_self(&f.home, "restore_child", &held, &input);
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        wait_for_step(&mut out, target, &ctx);
+        kill_child(&mut child, "held restorer");
+        let text = rest(&mut out);
+        let last = last_number(&text, "@@step ").or(Some(target));
+        assert_eq!(last, Some(target), "{ctx}");
+        landed[target as usize] += 1;
+        match check(&ctx, last, had_old) {
+            Found::Old => old += 1,
+            Found::New => new += 1,
+            Found::Nothing => nothing += 1,
+        }
+    }
     assert!(old > 0 && new > 0 && nothing > 0);
     // Kills landed between the step that keeps the old vault and the one
     // after the rename, where the files are swapped.

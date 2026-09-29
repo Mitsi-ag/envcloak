@@ -249,7 +249,10 @@ pub fn outside_dir() -> tempfile::TempDir {
 /// `@SUGGESTED@` in `send` stands for the generated passphrase the
 /// terminal showed, and `@PAUSE@` for a pause of 50 ms, as between two
 /// pieces of a paste. A `send` of `@SIGTERM@` or `@SIGINT@` sends that
-/// signal to the terminal's process group instead of typing. Prints
+/// signal to the terminal's process group instead of typing. A program
+/// that exits before it has read everything typed closes the terminal:
+/// writing to it then fails (`EIO`), which ends the typing, and what the
+/// terminal showed and the exit code are reported as ever. Prints
 /// everything the terminal showed, then the exit code on stderr.
 pub const DRIVER: &str = r#"import json, os, pty, re, select, signal, sys, time
 steps = json.load(open(sys.argv[1]))
@@ -270,6 +273,7 @@ def more(deadline):
         return False
     out += chunk
     return True
+closed = False
 for expect, send in steps:
     deadline = time.time() + 60
     while expect.encode() not in out:
@@ -287,14 +291,21 @@ for expect, send in steps:
             time.sleep(0.05)
         data = piece.encode()
         deadline = time.time() + 60
-        while data:
+        while data and not closed:
             if time.time() > deadline:
                 sys.exit('could not type ' + repr(expect))
             r, w, _ = select.select([fd], [fd], [], 1.0)
             if r:
                 more(time.time())
             if w:
-                data = data[os.write(fd, data[:256]):]
+                try:
+                    data = data[os.write(fd, data[:256]):]
+                except OSError:
+                    closed = True
+        if closed:
+            break
+    if closed:
+        break
 while more(time.time() + 60):
     pass
 _, status = os.waitpid(pid, 0)
