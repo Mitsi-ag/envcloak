@@ -199,7 +199,7 @@ Each record is `len(4)` followed by a sealed value (CRYPTO.md), with the associa
 
 A record that is altered, moved, taken from another backup, dropped or appended fails to open or breaks the manifest; a changed header breaks its digest; a backup of another vault or epoch is refused. Nothing opens without the vault key, which only the passphrase and the Recovery Kit unwrap: a backup is as safe as the vault. No plaintext copy is written: the file is built in `backups/.<name>.tmp` (created exclusively, not following symlinks), synced, hard-linked to its name, and the directory is synced.
 
-`purge_file_backups` removes file backups whose header's `created_at` is more than 7 days old; the daemon runs it after each unlock and whenever it writes one. It needs no key, and leaves vault backups alone.
+`purge_file_backups` removes file backups whose header's `created_at` is more than 7 days old, and the staging files interrupted writes left (`.files-*.ecfiles.tmp`, complete or partial, regular files unchanged for an hour; a symlink of that name is never followed or removed); the daemon runs it after each unlock and whenever it writes one. It needs no key, and leaves vault backups alone.
 
 ## Restore
 
@@ -285,5 +285,5 @@ entry  = len(4) | seq(8) | sealed(len) | mac(32)
 | 4: after the passphrase is lost, the kit restores identical items; a wrong kit fails | `tests/recovery.rs` |
 | Backups: unusable without the kit, any change refused, a changed vault never backed up, a restored digest verifies (also next to side files left without a vault, and a restore that cannot verify what it installed fails) | `tests/backup.rs` |
 | Restore is atomic: `kill -9` leaves the old or the new vault | `tests/restore_crash.rs` |
-| File backups: ciphertext only, given back byte for byte, any change or another vault's backup refused, purged after 7 days | `tests/file_backup.rs` |
+| File backups: ciphertext only, given back byte for byte, any change or another vault's backup refused, purged after 7 days, with the staging files interrupted writes left | `tests/file_backup.rs` |
 | 11, unlocker part: no passphrase, kit or fixture in freed memory | `tests/unlock_probe.rs` |

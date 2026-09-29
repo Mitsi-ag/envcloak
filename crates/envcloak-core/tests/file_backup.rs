@@ -1,7 +1,8 @@
 //! Encrypted backups of deleted files (SPEC §6.4 "Backups"; the format is
 //! in docs/VAULT.md "File backups"): a backup holds ciphertext only and
 //! gives the files back byte for byte; any change to it is refused, as is
-//! a backup of another vault; it is purged after 7 days. Also the vault
+//! a backup of another vault; it is purged after 7 days, and so is what an
+//! interrupted backup left under its staging name. Also the vault
 //! pieces import rests on: checking the Recovery Kit without a write, and
 //! the keys that compare values without holding them.
 #![allow(clippy::unwrap_used)]
@@ -12,7 +13,7 @@ use common::{KitFixture, dir_names};
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::file_backup::{
     BackupFile, FILE_BACKUP_RETENTION, FileBackupId, MAX_BACKUP_BYTES, MAX_BACKUP_FILES,
-    age_file_backup_for_testing, purge_file_backups,
+    STAGING_GRACE, age_file_backup_for_testing, purge_file_backups,
 };
 use envcloak_core::vault::VaultErrorKind;
 use envcloak_core::{RecoveryKit, SecretBytes};
@@ -222,4 +223,54 @@ fn value_keys_compare_values_without_holding_them() {
     // Keyed: another vault's key for the same value differs.
     let (_g, w) = KitFixture::create();
     assert_ne!(v.value_key(&a), w.value_key(&a));
+}
+
+/// Review finding F-52 (Codex): an interrupted backup leaves its staging
+/// file, `.files-<time>-<id>.ecfiles.tmp`, complete or partial. A purge
+/// removes one unchanged for an hour, keeps a fresh one (a backup being
+/// written) and never follows a symlink of that name; published backups
+/// keep their own rule.
+#[test]
+fn staging_files_an_interrupted_backup_left_are_purged() {
+    let (f, v) = KitFixture::create();
+    let (_, backup) = files(&f);
+    let kept = v.backup_files(&backup).unwrap();
+    let dir = kept.path.parent().unwrap().to_owned();
+    let bytes = std::fs::read(&kept.path).unwrap();
+    let now = std::time::SystemTime::now();
+    let secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let stage = |name: &str, body: &[u8], ago: std::time::Duration| {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(now - ago)
+            .unwrap();
+        p
+    };
+    let hour = STAGING_GRACE + std::time::Duration::from_secs(60);
+    // Complete (a whole backup, never linked into place) and partial.
+    let complete = stage(".files-20260901T000000Z-A.ecfiles.tmp", &bytes, hour);
+    let partial = stage(".files-20260901T000000Z-B.ecfiles.tmp", &bytes[..40], hour);
+    let fresh = stage(
+        ".files-20260901T000000Z-C.ecfiles.tmp",
+        &bytes[..40],
+        std::time::Duration::from_secs(5),
+    );
+    let target = stage("elsewhere", b"not a backup", hour);
+    let link = dir.join(".files-20260901T000000Z-D.ecfiles.tmp");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert_eq!(purge_file_backups(&f.paths, secs).unwrap(), 2);
+    assert!(!complete.exists() && !partial.exists());
+    assert!(fresh.exists());
+    assert!(link.symlink_metadata().is_ok() && target.exists());
+    assert!(kept.path.exists());
+    assert_eq!(v.open_file_backup(&kept.id).unwrap().len(), 2);
+    // A week on, the published backup goes too, and the fresh staging
+    // file is old by then.
+    let week = FILE_BACKUP_RETENTION.as_secs() + 2 * STAGING_GRACE.as_secs();
+    assert_eq!(purge_file_backups(&f.paths, secs + week).unwrap(), 2);
+    assert!(!kept.path.exists() && !fresh.exists());
 }

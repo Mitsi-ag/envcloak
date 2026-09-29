@@ -22,7 +22,9 @@
 //!
 //! [`Vault::open_file_backup`] returns the files as they were, byte for
 //! byte (`envcloak init --undo`). [`purge_file_backups`] removes backups
-//! older than [`FILE_BACKUP_RETENTION`], by the time in their header.
+//! older than [`FILE_BACKUP_RETENTION`], by the time in their header, and
+//! the staging files interrupted writes left
+//! (`.files-<time>-<id>.ecfiles.tmp`, unchanged for [`STAGING_GRACE`]).
 
 use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -47,6 +49,10 @@ use crate::vault::{
 pub const FILE_BACKUP_EXTENSION: &str = "ecfiles";
 /// How long a file backup is kept (SPEC §6.4: removed after 7 days).
 pub const FILE_BACKUP_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How long a file backup's staging file may stand unchanged before a
+/// purge takes it for one an interrupted write left: a backup is written
+/// in seconds.
+pub const STAGING_GRACE: Duration = Duration::from_secs(60 * 60);
 /// Files one backup holds at most.
 pub const MAX_BACKUP_FILES: usize = 64;
 /// Bytes of file contents one backup holds at most.
@@ -552,18 +558,58 @@ fn list_backups(p: &VaultPaths) -> Result<Vec<(PathBuf, u64)>, VaultError> {
     Ok(out)
 }
 
+/// The staging files of file backups in `p`'s backups directory that
+/// interrupted writes left: regular files (a symlink is never one) named
+/// `.files-*.ecfiles.tmp`, not modified for [`STAGING_GRACE`] before
+/// `now` (Unix seconds). Complete or partial, they hold ciphertext only,
+/// and no backup that is being written is this old.
+fn stale_staging(p: &VaultPaths, now: u64) -> Result<Vec<PathBuf>, VaultError> {
+    let dir = match std::fs::canonicalize(&p.backups_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    check_private_dir(&dir)?;
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let named = name.to_str().is_some_and(|n| {
+            n.starts_with(&format!(".{PREFIX}"))
+                && n.ends_with(&format!(".{FILE_BACKUP_EXTENSION}.tmp"))
+        });
+        // `DirEntry` reads the entry itself: a symlink is not followed.
+        if !named || !entry.file_type()?.is_file() {
+            continue;
+        }
+        let modified = entry
+            .metadata()?
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        if now.saturating_sub(modified) > STAGING_GRACE.as_secs() {
+            out.push(entry.path());
+        }
+    }
+    Ok(out)
+}
+
 /// Removes the file backups in `p` made more than
-/// [`FILE_BACKUP_RETENTION`] before `now` (Unix seconds), and returns how
-/// many it removed. Needs no key: the time is in the header.
+/// [`FILE_BACKUP_RETENTION`] before `now` (Unix seconds), and the staging
+/// files interrupted writes left, unchanged for [`STAGING_GRACE`]. Returns
+/// how many files it removed. Needs no key: the time is in the header.
 pub fn purge_file_backups(p: &VaultPaths, now: u64) -> Result<usize, VaultError> {
     let mut removed = 0;
-    for (path, created_at) in list_backups(p)? {
-        if now.saturating_sub(created_at) > FILE_BACKUP_RETENTION.as_secs() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => removed += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
+    let old = list_backups(p)?
+        .into_iter()
+        .filter(|(_, created_at)| now.saturating_sub(*created_at) > FILE_BACKUP_RETENTION.as_secs())
+        .map(|(path, _)| path);
+    for path in old.chain(stale_staging(p, now)?) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
     if removed > 0 {
