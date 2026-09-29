@@ -29,7 +29,7 @@ use std::time::Duration;
 use envcloak_e2e::{Harness, finish_within, target_dir, text};
 #[cfg(target_os = "macos")]
 use envcloak_testkit::crash::signed_copy;
-use envcloak_testkit::crash::{RAISE_CORE_LIMIT, StatusExt, core_dump_dir, core_files};
+use envcloak_testkit::crash::{CoreFiles, RAISE_CORE_LIMIT, StatusExt, core_dump_dir};
 use envcloak_testkit::{TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels};
 
 /// The release build's directory, or `None` (and a note) when it is not
@@ -142,12 +142,15 @@ fn release_artifacts_abort_on_a_panic_and_leave_no_core() {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let cores = CoreFiles::before(&tmp, Some(dir));
         let child = cmd.spawn().unwrap();
         let pid = child.id();
         let status = child.wait_with_output().unwrap().status;
-        let core = dir.join(format!("core.{pid}"));
-        let written = core.exists();
-        let _ = std::fs::remove_file(&core);
+        let left = cores.left(i32::try_from(pid).unwrap());
+        for p in &left {
+            let _ = std::fs::remove_file(p);
+        }
+        let written = left.contains(&dir.join(format!("core.{pid}")));
         assert!(
             status.core_dumped_flag() && written,
             "control: an ordinary process must dump core into {} ({status:?}, written: {written})",
@@ -166,6 +169,7 @@ fn release_artifacts_abort_on_a_panic_and_leave_no_core() {
         let program = release.join(name);
         #[cfg(target_os = "macos")]
         let program = signed_copy(&program, &tmp, name, false, true);
+        let cores = CoreFiles::before(&tmp, dumps.as_deref());
         let (status, pid, err) = panic_under_raised_limit(&home, &tmp, &program, &payload);
         assert_no_canary(&err, &cs);
         assert_eq!(
@@ -182,7 +186,7 @@ fn release_artifacts_abort_on_a_panic_and_leave_no_core() {
                 && err.lines().count() == 1,
             "{name}: {err}"
         );
-        let left = core_files(&tmp, dumps.as_deref(), pid);
+        let left = cores.left(pid);
         for p in &left {
             let _ = std::fs::remove_file(p);
         }

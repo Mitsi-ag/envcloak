@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{client, exe};
-use envcloak_testkit::crash::{RAISE_CORE_LIMIT, StatusExt, core_dump_dir, core_files};
+use envcloak_testkit::crash::{CoreFiles, RAISE_CORE_LIMIT, StatusExt, core_dump_dir};
 use envcloak_testkit::{Daemon, TestHome};
 
 fn report_of(program: &Path, home: &TestHome) -> String {
@@ -133,6 +133,7 @@ fn a_forced_abort_of_the_serving_daemon_leaves_no_core_file() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+            let cores = CoreFiles::before(&tmp, Some(dir));
             let mut control = cmd.spawn().unwrap();
             let mut lines = BufReader::new(control.stdout.take().unwrap()).lines();
             assert!(lines.any(|l| l.is_ok_and(|l| l == "ready")));
@@ -145,9 +146,11 @@ fn a_forced_abort_of_the_serving_daemon_leaves_no_core_file() {
                     .success()
             );
             let status = control.wait().unwrap();
-            let core = dir.join(format!("core.{pid}"));
-            let written = core.exists();
-            let _ = std::fs::remove_file(&core);
+            let left = cores.left(i32::try_from(pid).unwrap());
+            for path in &left {
+                let _ = std::fs::remove_file(path);
+            }
+            let written = left.contains(&dir.join(format!("core.{pid}")));
             assert!(
                 status.core_dumped_flag() && written,
                 "control: an ordinary process must dump core into {} ({status:?}, file written: {written})",
@@ -163,6 +166,7 @@ fn a_forced_abort_of_the_serving_daemon_leaves_no_core_file() {
     // The daemon lowers the limit its parent shell raised, serves, and does
     // not dump when it aborts.
     let cwd = home.home();
+    let cores = CoreFiles::before(&cwd, dumps.as_deref());
     let mut d = Daemon::start_command(with_raised_limit(&home, &cwd, &program), &[]);
     assert!(
         client(&home)
@@ -176,7 +180,7 @@ fn a_forced_abort_of_the_serving_daemon_leaves_no_core_file() {
     d.signal("-ABRT");
     let status = d.wait_exit(Duration::from_secs(20)).unwrap();
     assert_eq!(status.signal_number(), Some(6), "{status:?}");
-    let left = core_files(&cwd, dumps.as_deref(), pid);
+    let left = cores.left(pid);
     for path in &left {
         let _ = std::fs::remove_file(path);
     }

@@ -62,7 +62,10 @@ pub fn core_dump_dir() -> Option<PathBuf> {
 }
 
 /// Core files a crash of `pid` could have left: `core` or `core.*` in
-/// `cwd`, `/cores/core.<pid>` (macOS), and `core.<pid>` in `dumps`.
+/// `cwd`, `/cores/core.<pid>` (macOS), and `core.<pid>` in `dumps`. A file
+/// with that name can be older than the crash (an earlier process had the
+/// same pid): take a [`CoreFiles`] snapshot before the process starts to
+/// tell.
 pub fn core_files(cwd: &Path, dumps: Option<&Path>, pid: i32) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(cwd)
         .map(|rd| {
@@ -80,6 +83,70 @@ pub fn core_files(cwd: &Path, dumps: Option<&Path>, pid: i32) -> Vec<PathBuf> {
     elsewhere.extend(dumps.map(|d| d.join(format!("core.{pid}"))));
     found.extend(elsewhere.into_iter().filter(|p| p.exists()));
     found
+}
+
+/// What identifies a file's contents at one moment: device, inode, size
+/// and modification time.
+type Stamp = (u64, u64, u64, i64, i64);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some((m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec()))
+}
+
+/// Every file a crash could leave as a core ([`core_files`] of any pid),
+/// as it was at one moment. Take it before the process that is to crash
+/// is started; [`CoreFiles::left`] then names only the files of that pid
+/// made or changed since, so a `core.<pid>` an earlier process with the
+/// same pid left is not blamed on it (review finding F-60), while one the
+/// kernel wrote over is.
+#[derive(Debug)]
+pub struct CoreFiles {
+    cwd: PathBuf,
+    dumps: Option<PathBuf>,
+    before: Vec<(PathBuf, Stamp)>,
+}
+
+impl CoreFiles {
+    pub fn before(cwd: &Path, dumps: Option<&Path>) -> Self {
+        let mut dirs = vec![cwd.to_path_buf(), PathBuf::from("/cores")];
+        dirs.extend(dumps.map(Path::to_path_buf));
+        let before = dirs
+            .iter()
+            .filter_map(|d| std::fs::read_dir(d).ok())
+            .flat_map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n == "core" || n.starts_with("core."))
+            })
+            .filter_map(|p| stamp(&p).map(|s| (p, s)))
+            .collect();
+        CoreFiles {
+            cwd: cwd.to_path_buf(),
+            dumps: dumps.map(Path::to_path_buf),
+            before,
+        }
+    }
+
+    /// The files a crash of `pid` could have left ([`core_files`]) that
+    /// are new or changed since the snapshot.
+    pub fn left(&self, pid: i32) -> Vec<PathBuf> {
+        core_files(&self.cwd, self.dumps.as_deref(), pid)
+            .into_iter()
+            .filter(|p| {
+                let now = stamp(p);
+                now.is_none() || !self.before.iter().any(|(q, s)| q == p && Some(*s) == now)
+            })
+            .collect()
+    }
+
+    /// How many core files there were at the snapshot, which
+    /// [`CoreFiles::left`] does not count unless they changed.
+    pub fn stale(&self) -> usize {
+        self.before.len()
+    }
 }
 
 /// Signal number and core-dump flag of an exit status.
@@ -108,10 +175,12 @@ const GET_TASK_ALLOW: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 /// Copies `program` to `dir/name` and signs the copy ad hoc, with the
 /// hardened runtime if `runtime`, and with `get-task-allow` if
 /// `debuggable`. Checks with `codesign --display` that the signature says
-/// exactly that, and returns the copy.
+/// exactly that, starts the copy once (see [`FIRST_START_LIMIT`]), and
+/// returns it.
 ///
 /// # Panics
-/// When copying or signing fails, or the signature says otherwise.
+/// When copying or signing fails, the signature says otherwise, or the
+/// first start does not end in time.
 #[cfg(target_os = "macos")]
 pub fn signed_copy(
     program: &Path,
@@ -166,5 +235,151 @@ pub fn signed_copy(
         debuggable,
         "{text}"
     );
+    first_start(&copy, dir, FIRST_START_LIMIT);
     copy
+}
+
+/// How long the first start of a copy signed a moment ago may take.
+///
+/// Before a new executable first runs, macOS has the system's execution
+/// policy service look at it; until then the process waits at
+/// `_dyld_start` and runs none of its code. On a loaded machine that
+/// service can take minutes to get to it: behind a queue of new
+/// executables, one start of such a copy waited over seven minutes, and a
+/// review run whose held CLI had 30 seconds to say it was ready failed
+/// (review finding F-60). The bound only keeps a stalled service from
+/// hanging the suite.
+#[cfg(target_os = "macos")]
+pub const FIRST_START_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Starts `copy` once, with an argument no program here accepts, and waits
+/// for it to exit, so the system's check of the new executable happens in
+/// this step of its own and not inside a timed step of a test. Later
+/// starts of the same copy are not checked again.
+///
+/// # Panics
+/// When it has not exited within `limit`, naming the step. It is killed
+/// first.
+#[cfg(target_os = "macos")]
+fn first_start(copy: &Path, dir: &Path, limit: std::time::Duration) {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let mut child = Command::new(copy)
+        .arg("--envcloak-first-start")
+        .env_clear()
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("step `first start`: {}: {e}", copy.display()));
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "step `first start`: {} had not started and exited after {:?} ({other:?}): \
+                     the system's check of new executables is stalled",
+                    copy.display(),
+                    started.elapsed()
+                );
+            }
+        }
+    }
+    if started.elapsed() > std::time::Duration::from_secs(5) {
+        eprintln!(
+            "the first start of {} took {:?}",
+            copy.display(),
+            started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::CoreFiles;
+    use crate::home::TestHome;
+
+    /// Review finding F-60: a `core.<pid>` an earlier process with the same
+    /// pid left is not this crash's; one written over, or new, is.
+    #[test]
+    fn core_files_left_counts_only_files_made_or_changed_since() {
+        let home = TestHome::new();
+        let cwd = home.home();
+        let dumps = home.root().join("tmp");
+        let pid = 4242;
+        let stale = dumps.join(format!("core.{pid}"));
+        std::fs::write(&stale, b"an older process's core").unwrap();
+        let cores = CoreFiles::before(&cwd, Some(&dumps));
+        assert_eq!(cores.stale(), 1);
+        assert!(cores.left(pid).is_empty(), "{:?}", cores.left(pid));
+
+        // Written over by the crash: counted, like a new file.
+        std::fs::write(&stale, b"this crash's core, longer than before").unwrap();
+        std::fs::write(cwd.join("core"), b"x").unwrap();
+        let mut left = cores.left(pid);
+        left.sort();
+        assert_eq!(left, [cwd.join("core"), stale]);
+        // Another pid's file is not this crash's.
+        std::fs::write(dumps.join("core.4343"), b"y").unwrap();
+        assert_eq!(cores.left(pid).len(), 2);
+    }
+
+    /// A first start that never ends fails its own step, named, within its
+    /// bound, and leaves nothing running.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_first_start_that_never_ends_fails_its_step() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let home = TestHome::new();
+        let dir = home.root().join("tmp");
+        let marker = dir.join("pid");
+        let script = dir.join("stalls");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let (s, d) = (script.clone(), dir.clone());
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(|| {
+                super::first_start(&s, &d, Duration::from_secs(1));
+            });
+            let _ = tx.send(r.err().and_then(|e| e.downcast_ref::<String>().cloned()));
+        });
+        let message = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the first start step did not end within its bound")
+            .expect("a first start that never ends passed");
+        assert!(message.starts_with("step `first start`:"), "{message}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        // The start was killed and reaped before the step failed. If the
+        // script got as far as saying its pid, that process is gone; if
+        // not, it never will (it is new to the system too, so under load
+        // it may not have run a line within the bound).
+        if let Ok(pid) = std::fs::read_to_string(&marker) {
+            let pid: i32 = pid.trim().parse().unwrap();
+            assert!(
+                envcloak_sys::signal_process(pid, 0).is_err(),
+                "the stalled start is still running"
+            );
+        }
+    }
 }

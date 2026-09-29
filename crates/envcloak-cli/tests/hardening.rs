@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use envcloak_testkit::crash::signed_copy;
-use envcloak_testkit::crash::{RAISE_CORE_LIMIT, StatusExt, core_dump_dir, core_files};
+use envcloak_testkit::crash::{CoreFiles, RAISE_CORE_LIMIT, StatusExt, core_dump_dir};
 use envcloak_testkit::{TestHome, by_label, canaries, fresh_seed, labels};
 
 fn cli() -> &'static str {
@@ -66,8 +66,22 @@ impl Held {
         assert!(ok, "kill {sig} failed");
     }
 
-    fn wait(mut self) -> ExitStatus {
-        self.child.wait().unwrap()
+    /// Waits up to [`READY_LIMIT`] for the process to end after a signal,
+    /// naming the step if it does not (a crash can wait on the system's
+    /// crash reporter before the process is gone).
+    fn wait_ended(mut self, step: &str) -> ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                started.elapsed() < READY_LIMIT,
+                "step `{step}`: the process had not ended {:?} after the signal",
+                started.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Closes stdin, which lets the process exit, and waits for it.
@@ -101,9 +115,17 @@ fn hold(home: &TestHome, cwd: &Path, script: &str, arg0: &str, env: &[(&str, &st
     held(cmd.spawn().unwrap())
 }
 
-/// Waits up to 30 seconds for `child` to print the line `ready`. Earlier
-/// lines are kept as the report. A child that is not ready in time is
-/// killed and the test fails, so a regression cannot hang the suite.
+/// How long a held process may take to say it is ready, or to end after a
+/// signal. The first start of a copy signed a moment ago, which on a loaded
+/// machine can wait minutes for the system's check of new executables, is
+/// a step of its own in `signed_copy` (review finding F-60); this bound
+/// only keeps a regression from hanging the suite.
+const READY_LIMIT: Duration = Duration::from_secs(120);
+
+/// Waits up to [`READY_LIMIT`] for `child` to print the line `ready`.
+/// Earlier lines are kept as the report. A child that is not ready in time
+/// is killed and the test fails, naming the step, so a regression cannot
+/// hang the suite.
 fn held(mut child: Child) -> Held {
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -116,7 +138,8 @@ fn held(mut child: Child) -> Held {
             }
         }
     });
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let started = Instant::now();
+    let deadline = started + READY_LIMIT;
     let mut report = String::new();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -128,8 +151,12 @@ fn held(mut child: Child) -> Held {
             }
             Err(e) => {
                 let _ = child.kill();
-                let _ = child.wait();
-                panic!("process was not ready ({e}); output so far:\n{report}");
+                let status = child.wait();
+                panic!(
+                    "step `ready`: the process did not say it was ready ({e}) after {:?} \
+                     (exit: {status:?}); output so far:\n{report}",
+                    started.elapsed()
+                );
             }
         }
     }
@@ -234,8 +261,19 @@ fn unknown_arguments_are_never_echoed() {
     envcloak_testkit::assert_no_canary(&out.stderr, &cs);
 }
 
+/// The shell's core limits, soft and hard, as `ulimit` prints them.
+fn shell_core_limits(home: &TestHome) -> String {
+    let out = home
+        .apply(&mut Command::new("sh"))
+        .args(["-c", "echo \"$(ulimit -S -c)/$(ulimit -H -c)\""])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
 #[test]
 fn forced_abort_leaves_no_core_file() {
+    let started = Instant::now();
     let home = TestHome::new();
     let dumps = core_dump_dir();
     if std::env::var_os("GITHUB_ACTIONS").is_some() {
@@ -246,6 +284,9 @@ fn forced_abort_leaves_no_core_file() {
     }
     let tmp = home.root().join("tmp");
     let (control_program, program) = crash_subjects(&tmp);
+    // Each step's failure names the step and its facts, none of which can
+    // hold a value; `timeline` says how long each step took.
+    let mut timeline = format!("signed copies made at {:?}", started.elapsed());
 
     match &dumps {
         // Positive control: an ordinary process, signed like the CLI below
@@ -253,9 +294,16 @@ fn forced_abort_leaves_no_core_file() {
         // dumps core into the known directory. Without it, "no core file"
         // could mean only that this machine never writes any.
         Some(dir) => {
+            let limits = shell_core_limits(&home);
+            assert!(
+                !limits.ends_with("/0"),
+                "step `control limit`: the hard core limit here is {limits} (soft/hard), so \
+                 the positive control cannot dump core; raise it or unset ENVCLOAK_TEST_CORE_DIR"
+            );
             let script = format!(
                 "{RAISE_CORE_LIMIT}exec \"$0\" --exact abort_control_child --nocapture --test-threads=1"
             );
+            let cores = CoreFiles::before(&tmp, Some(dir));
             let control = hold(
                 &home,
                 &tmp,
@@ -263,15 +311,19 @@ fn forced_abort_leaves_no_core_file() {
                 control_program.to_str().unwrap(),
                 &[(CONTROL_ENV, "1")],
             );
+            timeline.push_str(&format!(", control ready at {:?}", started.elapsed()));
             let pid = control.pid();
             control.signal("-ABRT");
-            let status = control.wait();
-            let core = dir.join(format!("core.{pid}"));
-            let written = core.exists();
-            let _ = std::fs::remove_file(&core);
+            let status = control.wait_ended("control exit");
+            timeline.push_str(&format!(", control ended at {:?}", started.elapsed()));
+            let left = cores.left(pid);
+            for path in &left {
+                let _ = std::fs::remove_file(path);
+            }
             assert!(
-                status.core_dumped_flag() && written,
-                "control: an ordinary process must dump core into {} ({status:?}, file written: {written})",
+                status.core_dumped_flag() && left.contains(&dir.join(format!("core.{pid}"))),
+                "step `control`: an ordinary process must dump core into {} ({status:?}, \
+                 files left: {left:?}; {timeline})",
                 dir.display()
             );
         }
@@ -283,21 +335,38 @@ fn forced_abort_leaves_no_core_file() {
 
     // The CLI lowers the limit its parent shell raised, and does not dump.
     let cwd = home.home();
+    let cores = CoreFiles::before(&cwd, dumps.as_deref());
     let held = hold_program(&home, &cwd, RAISE_CORE_LIMIT, &program, &[]);
-    assert!(held.report.contains("rlimit_core=0/0\n"), "{}", held.report);
+    timeline.push_str(&format!(", CLI ready at {:?}", started.elapsed()));
+    assert!(
+        held.report.contains("rlimit_core=0/0\n"),
+        "step `limit`: the CLI did not lower its core limit ({timeline}):\n{}",
+        held.report
+    );
     let pid = held.pid();
     held.signal("-ABRT");
-    let status = held.wait();
-    assert_eq!(status.signal_number(), Some(6), "{status:?}");
-    let left = core_files(&cwd, dumps.as_deref(), pid);
+    let status = held.wait_ended("exit");
+    timeline.push_str(&format!(", CLI ended at {:?}", started.elapsed()));
+    let left = cores.left(pid);
     for path in &left {
         let _ = std::fs::remove_file(path);
     }
+    assert_eq!(
+        status.signal_number(),
+        Some(libc::SIGABRT),
+        "step `signal`: the CLI must end by SIGABRT ({status:?}; {timeline})"
+    );
     assert!(
         !status.core_dumped_flag(),
-        "the kernel reported a core dump"
+        "step `core flag`: the kernel reported a core dump ({status:?}; {timeline})"
     );
-    assert!(left.is_empty(), "{left:?}");
+    assert!(
+        left.is_empty(),
+        "step `core file`: the abort left {left:?} ({} older file(s) with those names were \
+         there before and are not counted; {timeline})",
+        cores.stale()
+    );
+    eprintln!("forced_abort_leaves_no_core_file: {timeline}");
 }
 
 #[cfg(target_os = "linux")]
