@@ -15,8 +15,12 @@
 //!   reports it: a dry run. With `--yes` the daemon commits that plan, and
 //!   the manifest, `.gitignore` and the dry run of the references follow,
 //!   as `envcloak import --yes` does.
-//! - `--delete-plaintext` takes the imported entries out of the env files,
-//!   only after all four conditions of SPEC §6.4 hold, in the order of
+//! - `--delete-plaintext` first makes the project's `.gitignore` ignore
+//!   the env files and every temporary name a change of one may leave
+//!   plaintext under ([`super::import::edit_gitignore`]), and deletes
+//!   nothing when it cannot (`gitignore_refused`). It takes the imported
+//!   entries out of the env files only after all four conditions of SPEC
+//!   §6.4 hold, in the order of
 //!   [`envcloak_scan::delete_plaintext`]: the daemon confirms each secret
 //!   in each file is committed where the manifest binds its variable,
 //!   every reference resolves, and the Recovery Kit is confirmed
@@ -66,7 +70,7 @@ use envcloak_scan::{
     restore_over, trimmed_from, without_entries,
 };
 
-use super::import::{ReadFile, import, project_name, report, scan};
+use super::import::{ReadFile, edit_gitignore, import, project_name, report, scan};
 use super::{claims, fd_number, refuse_if_claimed, require_unlocked};
 use crate::connect::connect;
 use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
@@ -497,6 +501,7 @@ fn delete(root: &ScanRoot) -> Result<(DeleteReport, Option<Failure>), Failure> {
     }
     let mut report = DeleteReport {
         project_dir: root.path().to_string_lossy().into_owned(),
+        gitignore: None,
         verify: VerifyView {
             recovery_confirmed: false,
             resolves: false,
@@ -511,6 +516,34 @@ fn delete(root: &ScanRoot) -> Result<(DeleteReport, Option<Failure>), Failure> {
     };
     if files.is_empty() {
         return Ok((report, None));
+    }
+    // A crash while a file changes leaves its plaintext under a temporary
+    // name: git must ignore every such name, whatever its random digits,
+    // before any file is looked at to change, or nothing is deleted. The
+    // import this may follow wrote the line, unless its edit was refused
+    // or the line was taken out since.
+    for p in &projects {
+        let names: Vec<&str> = files
+            .iter()
+            .filter(|c| c.file.rel.parent().unwrap_or(Path::new("")) == p.rel_dir)
+            .map(|c| c.file.file_name())
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        let change = edit_gitignore(root, &p.rel_dir, &names, &p.hidden);
+        report.gitignore = Some(change);
+        if change == FileChange::Refused {
+            return Ok((
+                report,
+                Some(Failure::new(
+                    "gitignore_refused",
+                    "the project's .gitignore could not be made to ignore the env files and the \
+                     temporary names a deletion may leave plaintext under (it is a symlink, has \
+                     another hard link, or changed while it was edited); nothing was deleted",
+                )),
+            ));
+        }
     }
     let stamps: Vec<(PathBuf, FileStamp)> = files
         .iter()

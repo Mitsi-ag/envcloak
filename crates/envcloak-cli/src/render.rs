@@ -949,6 +949,9 @@ impl Render for DeleteReport {
     fn human(&self) -> String {
         let mut o = String::new();
         let _ = writeln!(o, "Delete plaintext in {}", shown_path(&self.project_dir));
+        if let Some(c) = self.gitignore.filter(|c| *c != FileChange::Unchanged) {
+            let _ = writeln!(o, "  .gitignore: {}", change_text(c));
+        }
         let v = &self.verify;
         if !v.files.is_empty() {
             let _ = writeln!(

@@ -1230,6 +1230,11 @@ pub struct SkippedPath {
 #[serde(deny_unknown_fields)]
 pub struct DeleteReport {
     pub project_dir: String,
+    /// The project's `.gitignore`, made to ignore the env files and every
+    /// temporary name a change of one may leave plaintext under before
+    /// any file changes; `refused` stops the deletion. `None` when there
+    /// was no env file to delete.
+    pub gitignore: Option<FileChange>,
     /// The daemon's answer, each file's entries in order, with the
     /// interpolated and reference entries the CLI never sent added as
     /// [`EntryStatus::LeftOut`].

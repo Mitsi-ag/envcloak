@@ -25,26 +25,58 @@
 /// `name` in the `.gitignore`'s own directory. See the module
 /// documentation.
 pub fn ignores(text: &str, name: &str) -> bool {
+    let name: Vec<Pos> = name.bytes().map(Pos::Byte).collect();
+    ignores_every(text, &name)
+}
+
+/// One byte of a name, or one of a run of bytes a name may have anything
+/// in: a lowercase hex digit, as in the random part of a temporary name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pos {
+    Byte(u8),
+    Hex,
+}
+
+/// The sixteen bytes a [`Pos::Hex`] may be.
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// The name `prefix`, then `hex` lowercase hex digits of any value, then
+/// `suffix`: every name of that shape at once, for [`ignores_every`].
+pub fn shape(prefix: &str, hex: usize, suffix: &str) -> Vec<Pos> {
+    let mut out: Vec<Pos> = prefix.bytes().map(Pos::Byte).collect();
+    out.extend(std::iter::repeat_n(Pos::Hex, hex));
+    out.extend(suffix.bytes().map(Pos::Byte));
+    out
+}
+
+/// Whether the lines of `text` surely ignore every file whose name has
+/// the shape `name` ([`shape`]), whatever its hex digits are: the last
+/// line that matches, or may match, any of them must be a pattern that
+/// surely matches all of them, and has no `!`. A line that matches some
+/// of them and not others (`*f.tmp`, a sample's digits written out) is a
+/// doubt, and so is a `!` line that may match any one. See the module
+/// documentation.
+pub fn ignores_every(text: &str, name: &[Pos]) -> bool {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     text.lines().rev().find_map(|l| verdict(l, name)) == Some(true)
 }
 
-/// What one line says of `name`: `None` when it surely does not match,
-/// `Some(true)` when it surely ignores it, and `Some(false)` when it may
-/// take it back in, or may match and was not understood.
-fn verdict(line: &str, name: &str) -> Option<bool> {
+/// What one line says of the names of the shape `name`: `None` when it
+/// surely matches none of them, `Some(true)` when it surely ignores every
+/// one, and `Some(false)` when it may take one back in, may match some and
+/// not others, or may match and was not understood.
+fn verdict(line: &str, name: &[Pos]) -> Option<bool> {
     let (negated, pattern) = pattern_of(line)?;
+    let Some(t) = tokens(pattern.as_bytes()) else {
+        return Some(false);
+    };
     if negated {
-        match glob(pattern.as_bytes(), name.as_bytes(), true) {
-            Some(false) => None,
-            _ => Some(false),
-        }
+        return glob_tokens(&t, name, true, Mode::Any).then_some(false);
+    }
+    if glob_tokens(&t, name, false, Mode::Every) {
+        Some(true)
     } else {
-        match glob(pattern.as_bytes(), name.as_bytes(), false) {
-            Some(true) => Some(true),
-            Some(false) => None,
-            None => Some(false),
-        }
+        glob_tokens(&t, name, false, Mode::Any).then_some(false)
     }
 }
 
@@ -115,10 +147,32 @@ fn ends_with_unescaped_slash(p: &str) -> bool {
 /// Whether the wildcard pattern `p` matches all of `s`, one path component
 /// (no `/`): `Some(true)` or `Some(false)`, or `None` when `p` holds what
 /// is not understood here. `fold` compares ASCII letters without regard to
-/// case. Linear in `s` for each `*`, so no pattern a repository ships
-/// makes a scan slow.
+/// case.
+#[cfg(test)]
 fn glob(p: &[u8], s: &[u8], fold: bool) -> Option<bool> {
-    let t = tokens(p)?;
+    let s: Vec<Pos> = s.iter().copied().map(Pos::Byte).collect();
+    Some(glob_tokens(&tokens(p)?, &s, fold, Mode::Every))
+}
+
+/// How [`glob_tokens`] reads a [`Pos::Hex`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Whether the pattern matches some name of the shape: a token
+    /// matches a hex position when it matches one of its digits.
+    Any,
+    /// Whether the pattern surely matches every name of the shape: a token
+    /// matches a hex position only when it matches all its digits. Surely,
+    /// not exactly: a pattern that matches all of them only in ways this
+    /// cannot see (none a `.gitignore` has any reason to hold) is a doubt.
+    Every,
+}
+
+/// Whether the tokens `t` match all of the name `s`, in `mode`. Each
+/// position of a shape is chosen on its own, so a pattern matches some
+/// name exactly when it lines up with the shape with every token meeting
+/// a digit it matches. Linear in `s` for each `*`, so no pattern a
+/// repository ships makes a scan slow.
+fn glob_tokens(t: &[Token], s: &[Pos], fold: bool, mode: Mode) -> bool {
     let (mut ti, mut si) = (0, 0);
     // Where to go on from after the last `*`, and how much it took.
     let mut back: Option<(usize, usize)> = None;
@@ -129,7 +183,7 @@ fn glob(p: &[u8], s: &[u8], fold: bool) -> Option<bool> {
                 ti += 1;
                 continue;
             }
-            Some(one) if one.matches(s[si], fold) => {
+            Some(one) if one.matches_at(s[si], fold, mode) => {
                 ti += 1;
                 si += 1;
                 continue;
@@ -137,13 +191,13 @@ fn glob(p: &[u8], s: &[u8], fold: bool) -> Option<bool> {
             _ => {}
         }
         let Some((bt, bs)) = back else {
-            return Some(false);
+            return false;
         };
         back = Some((bt, bs + 1));
         ti = bt;
         si = bs + 1;
     }
-    Some(t[ti..].iter().all(|x| matches!(x, Token::Star)))
+    t[ti..].iter().all(|x| matches!(x, Token::Star))
 }
 
 /// One part of a wildcard pattern.
@@ -165,6 +219,14 @@ impl Token {
             Token::Set(set) => set.contains(c, fold),
             Token::Lit(l) if fold => l.eq_ignore_ascii_case(&c),
             Token::Lit(l) => *l == c,
+        }
+    }
+
+    fn matches_at(&self, at: Pos, fold: bool, mode: Mode) -> bool {
+        match (at, mode) {
+            (Pos::Byte(c), _) => self.matches(c, fold),
+            (Pos::Hex, Mode::Any) => HEX.iter().any(|&c| self.matches(c, fold)),
+            (Pos::Hex, Mode::Every) => HEX.iter().all(|&c| self.matches(c, fold)),
         }
     }
 }
@@ -350,6 +412,42 @@ mod tests {
         assert_eq!(glob(b"a*b?c", b"aXXbYc", false), Some(true));
         assert_eq!(glob(b"a*b?c", b"aXXbc", false), Some(false));
         assert_eq!(glob(b"**", b"", false), Some(true));
+    }
+
+    /// Every name of a shape, whatever its hex digits: a line that matches
+    /// only some of them (a sample's digits written out, `*f.tmp`), or a
+    /// later `!` line that may match one, leaves them in doubt.
+    #[test]
+    fn a_shape_is_ignored_only_when_every_name_of_it_is() {
+        let temp = shape("..env.envcloak-del-", 16, ".tmp");
+        for text in [
+            "*.tmp\n",
+            ".*.envcloak-*.tmp\n",
+            "*\n",
+            ".*\n",
+            "..env.envcloak-del-????????????????.tmp\n",
+            "..env.envcloak-del-[0-9a-f]*.tmp\n",
+            "*.tmp\n!*.TMP.bak\n",
+            // A later `!` line that matches none of them.
+            "*.tmp\n!..env.envcloak-del-*g.tmp\n",
+        ] {
+            assert!(ignores_every(text, &temp), "{text:?}");
+        }
+        for text in [
+            "",
+            "*f.tmp\n",
+            "/.env\n*f.tmp\n",
+            ".*.envcloak-*-0123456789abcdef.tmp\n",
+            "..env.envcloak-del-[0-9]*.tmp\n",
+            "*.tmp\n!*[0-9].tmp\n",
+            "*.tmp\n!*01*\n",
+            "*.tmp\n!..env.envcloak-del-*A.tmp\n",
+            "*.tmp\n![[:digit:]]*\n",
+        ] {
+            assert!(!ignores_every(text, &temp), "{text:?}");
+        }
+        // With no hex position, a shape is the one name.
+        assert!(ignores_every("/.env\n", &shape(".env", 0, "")));
     }
 
     /// A pattern built to make a backtracking matcher slow is matched in

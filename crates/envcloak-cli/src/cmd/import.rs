@@ -52,8 +52,8 @@ use envcloak_scan::{
 use super::{claims, require_unlocked};
 use crate::connect::connect;
 use crate::fail::{FAILURE, Failure, usage};
-use crate::gitignore::ignores;
-use crate::render::{looks_like_value, print};
+use crate::gitignore::{Pos, ignores, ignores_every, shape};
+use crate::render::{HIDDEN, looks_like_value, print};
 
 const USAGE: &str = "envcloak import --scan <dir> [--yes] [--json]";
 
@@ -96,6 +96,11 @@ pub(crate) struct Project {
     /// One slug part: new items are named `<base>/<name>`.
     pub name: String,
     pub files: Vec<ReadFile>,
+    /// The names of the `.env.<profile>` files here whose profile is shaped
+    /// like a key ([`key_shaped_profile`]): never read, and never printed
+    /// or written down by name. Their `.gitignore` line spells no
+    /// character of them ([`edit_gitignore`]).
+    pub hidden: Vec<String>,
 }
 
 /// The absolute path of `rel_dir` under `root`, without a trailing `/`
@@ -157,6 +162,32 @@ fn key_shaped_profile(rel: &Path, kind: &FileKind) -> bool {
     looks_like_value(p.as_str()) || looks_like_value(suffix)
 }
 
+/// `rel` as a report shows it: whole, or, when the part of its file name
+/// after `.env.` looks like a key as it is, lowercased or taken apart at
+/// its dots, with that part replaced by [`HIDDEN`]. A file whose name
+/// holds a value pasted into it is named in no output, whatever became of
+/// it (skipped for its name, unreadable, a symlink); its directory is.
+pub(crate) fn shown_rel(rel: &Path) -> String {
+    let whole = || rel.to_string_lossy().into_owned();
+    let Some(name) = rel.file_name().and_then(OsStr::to_str) else {
+        return whole();
+    };
+    let Some(at) = name.find(".env.").map(|i| i + ".env.".len()) else {
+        return whole();
+    };
+    let suffix = &name[at..];
+    let lower = suffix.to_ascii_lowercase();
+    let key = looks_like_value(suffix)
+        || looks_like_value(&lower.replace('.', "-"))
+        || suffix.split('.').any(looks_like_value);
+    if !key {
+        return whole();
+    }
+    rel.with_file_name(format!("{}{HIDDEN}", &name[..at]))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Scans `root` (and below it when `recursive`), reads every env file, and
 /// groups them by directory. Paths that were not read are listed with why:
 /// a profile shaped like a key among them ([`key_shaped_profile`]).
@@ -167,12 +198,13 @@ pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<Skipp
     };
     let mut skipped = Vec::new();
     let mut by_dir: BTreeMap<PathBuf, Vec<ReadFile>> = BTreeMap::new();
+    let mut hidden: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     for found in walk_dotenv(root, &options) {
         let f = match found {
             Ok(f) => f,
             Err(e) => {
                 skipped.push(SkippedPath {
-                    path: e.rel.to_string_lossy().into_owned(),
+                    path: shown_rel(&e.rel),
                     reason: e.kind.token().to_owned(),
                 });
                 continue;
@@ -180,23 +212,27 @@ pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<Skipp
         };
         if f.rel.to_str().is_none() {
             skipped.push(SkippedPath {
-                path: f.rel.to_string_lossy().into_owned(),
+                path: shown_rel(&f.rel),
                 reason: "not_utf8".to_owned(),
             });
             continue;
         }
         if key_shaped_profile(&f.rel, &f.kind) {
             skipped.push(SkippedPath {
-                path: f.rel.to_string_lossy().into_owned(),
+                path: shown_rel(&f.rel),
                 reason: envcloak_scan::ScanErrorKind::ProfileName.token().to_owned(),
             });
+            if let Some(name) = f.rel.file_name().and_then(OsStr::to_str) {
+                let dir = f.rel.parent().map(Path::to_path_buf).unwrap_or_default();
+                hidden.entry(dir).or_default().push(name.to_owned());
+            }
             continue;
         }
         let (bytes, stamp) = match read_capped(root, &f.rel, MAX_DOTENV) {
             Ok(x) => x,
             Err(e) => {
                 skipped.push(SkippedPath {
-                    path: e.rel.to_string_lossy().into_owned(),
+                    path: shown_rel(&e.rel),
                     reason: e.kind.token().to_owned(),
                 });
                 continue;
@@ -222,6 +258,7 @@ pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<Skipp
         .into_iter()
         .map(|(rel_dir, files)| Project {
             name: project_name(&root.path().join(&rel_dir)),
+            hidden: hidden.remove(&rel_dir).unwrap_or_default(),
             rel_dir,
             files,
         })
@@ -462,27 +499,38 @@ fn new_manifest(
 /// under one, which the lines for the env files do not cover.
 pub(crate) const TEMP_PATTERN: &str = ".*.envcloak-*.tmp";
 
-/// Names of the shapes a change of the env file `name` may leave behind
-/// ([`envcloak_scan::atomic`]'s temporary names, the name left out when
-/// long), to ask a `.gitignore` about.
-fn temp_names(name: &str) -> Vec<String> {
+/// The shapes of the names a change of the env file `name` may leave
+/// behind ([`envcloak_scan::atomic`]'s temporary names,
+/// `.<name>.envcloak-<del|new>-<16 hex digits>.tmp`, the name left out
+/// when long), to ask a `.gitignore` about: every name of them, whatever
+/// its random digits ([`crate::gitignore::ignores_every`]), not a sample.
+fn temp_shapes(name: &str) -> Vec<Vec<Pos>> {
     let mut out = Vec::new();
     for what in ["del", "new"] {
-        out.push(format!(".{name}.envcloak-{what}-0123456789abcdef.tmp"));
-        out.push(format!("..envcloak-{what}-0123456789abcdef.tmp"));
+        out.push(shape(&format!(".{name}.envcloak-{what}-"), 16, ".tmp"));
+        out.push(shape(&format!("..envcloak-{what}-"), 16, ".tmp"));
     }
     out
 }
 
 /// `.gitignore` in `rel_dir` with a line `/<name>` for each of `names` it
-/// does not ignore, and [`TEMP_PATTERN`] when it does not ignore every
-/// temporary name a change of them may leave ([`temp_names`]), whether
-/// the env files needed a line or not. Git's own reading decides, the
-/// last matching line winning, so a `!` line that takes a file back in
-/// gets a line after it ([`crate::gitignore`]). The file's own bytes are
-/// kept as they are, UTF-8 or not: lines are only added after them.
-fn edit_gitignore(root: &ScanRoot, rel_dir: &Path, names: &[&str]) -> FileChange {
-    if names.is_empty() {
+/// does not ignore, and [`TEMP_PATTERN`] when it does not surely ignore
+/// every temporary name a change of them may leave ([`temp_shapes`]),
+/// whatever its random digits, whether the env files needed a line or
+/// not. Each of `hidden`, an env file whose name must not be written down
+/// ([`Project::hidden`]), gets `/.env.` and a `?` for each character
+/// after it instead. Git's own reading decides, the last matching line
+/// winning, so a `!` line that takes a file back in gets a line after it,
+/// and so does a line that ignores only some temporary names
+/// ([`crate::gitignore`]). The file's own bytes are kept as they are,
+/// UTF-8 or not: lines are only added after them.
+pub(crate) fn edit_gitignore(
+    root: &ScanRoot,
+    rel_dir: &Path,
+    names: &[&str],
+    hidden: &[String],
+) -> FileChange {
+    if names.is_empty() && hidden.is_empty() {
         return FileChange::Unchanged;
     }
     let rel = rel_dir.join(".gitignore");
@@ -501,9 +549,15 @@ fn edit_gitignore(root: &ScanRoot, rel_dir: &Path, names: &[&str]) -> FileChange
         .collect();
     let temps = names
         .iter()
-        .flat_map(|n| temp_names(n))
-        .any(|t| !ignores(&text, &t));
-    if missing.is_empty() && !temps {
+        .flat_map(|n| temp_shapes(n))
+        .any(|t| !ignores_every(&text, &t));
+    let unnamed: Vec<usize> = hidden
+        .iter()
+        .filter(|n| !ignores(&text, n))
+        .filter_map(|n| n.strip_prefix(".env."))
+        .map(|suffix| suffix.chars().count())
+        .collect();
+    if missing.is_empty() && !temps && unnamed.is_empty() {
         return FileChange::Unchanged;
     }
     let mut new = bytes.clone();
@@ -519,6 +573,11 @@ fn edit_gitignore(root: &ScanRoot, rel_dir: &Path, names: &[&str]) -> FileChange
     for n in missing {
         new.push(b'/');
         new.extend_from_slice(n.as_bytes());
+        new.push(b'\n');
+    }
+    for len in unnamed {
+        new.extend_from_slice(b"/.env.");
+        new.extend(std::iter::repeat_n(b'?', len));
         new.push(b'\n');
     }
     if temps {
@@ -571,7 +630,7 @@ pub(crate) fn write_project(
         .filter(|f| !f.template && !f.references_only())
         .map(ReadFile::file_name)
         .collect();
-    out.gitignore = Some(edit_gitignore(root, &p.rel_dir, &names));
+    out.gitignore = Some(edit_gitignore(root, &p.rel_dir, &names, &p.hidden));
     if manifest_path.is_file() {
         out.resolves = connect()
             .ok()
@@ -801,6 +860,20 @@ mod tests {
         }
     }
 
+    /// Temporary names a change of the env file `name` may leave, with
+    /// the digits of a sample, their reverse, and random ones.
+    fn temp_names(name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let random = format!("{:016x}", envcloak_testkit::fresh_seed());
+        for hex in ["0123456789abcdef", "fedcba9876543210", random.as_str()] {
+            for what in ["del", "new"] {
+                out.push(format!(".{name}.envcloak-{what}-{hex}.tmp"));
+                out.push(format!("..envcloak-{what}-{hex}.tmp"));
+            }
+        }
+        out
+    }
+
     /// Git's own reading of the `.gitignore` decides, the last matching
     /// line winning: after the edit git ignores every env file and every
     /// temporary name a change of one may leave, and a second edit changes
@@ -842,12 +915,36 @@ mod tests {
                 FileChange::Updated,
                 vec![TEMP_PATTERN],
             ),
+            // F-57 follow-up (Codex): a line that ignores only some
+            // temporary names, or a `!` line for others, whatever the
+            // sample's digits are.
+            (
+                Some(".env*\n.*.envcloak-*-0123456789abcdef.tmp\n"),
+                FileChange::Updated,
+                vec![TEMP_PATTERN],
+            ),
+            (
+                Some(".env*\n*f.tmp\n"),
+                FileChange::Updated,
+                vec![TEMP_PATTERN],
+            ),
+            (
+                Some(".env*\n*.tmp\n!*[0-9].tmp\n"),
+                FileChange::Updated,
+                vec![TEMP_PATTERN],
+            ),
+            (
+                Some(".env*\n.*.envcloak-*.tmp\n!*01*\n"),
+                FileChange::Updated,
+                vec![TEMP_PATTERN],
+            ),
             // All there: nothing to add.
             (
                 Some(".env*\n!.env.example\n.*.envcloak-*.tmp\n"),
                 FileChange::Unchanged,
                 vec![],
             ),
+            (Some(".env*\n*.tmp\n"), FileChange::Unchanged, vec![]),
         ] {
             let d = tempfile::tempdir_in("/tmp").unwrap();
             let path = d.path().join(".gitignore");
@@ -856,7 +953,7 @@ mod tests {
             }
             let root = open_root(d.path()).unwrap();
             assert_eq!(
-                edit_gitignore(&root, Path::new(""), &names),
+                edit_gitignore(&root, Path::new(""), &names, &[]),
                 change,
                 "{before:?}"
             );
@@ -873,9 +970,15 @@ mod tests {
                 for t in temp_names(n) {
                     assert!(git_ignores(d.path(), &t), "{before:?}: {t}");
                 }
+                // A name ending in each digit, as `!*[0-9].tmp` or `*f.tmp`
+                // tell them apart.
+                for last in "0123456789abcdef".chars() {
+                    let t = format!(".{n}.envcloak-del-0123456789abcde{last}.tmp");
+                    assert!(git_ignores(d.path(), &t), "{before:?}: {t}");
+                }
             }
             assert_eq!(
-                edit_gitignore(&root, Path::new(""), &names),
+                edit_gitignore(&root, Path::new(""), &names, &[]),
                 FileChange::Unchanged
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
@@ -905,6 +1008,8 @@ mod tests {
             "\\#.env\n# .env.local\n",
             ".env.[a-z]*\n!.env.[!l]*\n",
             "*.tmp\n!.*\n",
+            "*f.tmp\n",
+            "*.tmp\n!*[0-9].tmp\n",
         ] {
             std::fs::write(d.path().join(".gitignore"), text).unwrap();
             for n in [".env", ".env.local", ".env.short", "#.env"]
@@ -929,7 +1034,7 @@ mod tests {
         let latin1 = b"caf\xe9/\n# \xff\xfe kept\nbuild";
         std::fs::write(d.path().join(".gitignore"), latin1).unwrap();
         let root = open_root(d.path()).unwrap();
-        let change = edit_gitignore(&root, Path::new(""), &[".env", ".env.short"]);
+        let change = edit_gitignore(&root, Path::new(""), &[".env", ".env.short"], &[]);
         assert_eq!(change, FileChange::Updated);
         let got = std::fs::read(d.path().join(".gitignore")).unwrap();
         let mut want = latin1.to_vec();
@@ -939,11 +1044,11 @@ mod tests {
         want.extend_from_slice(TEMP_PATTERN.as_bytes());
         want.push(b'\n');
         assert_eq!(got, want);
-        let again = edit_gitignore(&root, Path::new(""), &[".env", ".env.short"]);
+        let again = edit_gitignore(&root, Path::new(""), &[".env", ".env.short"], &[]);
         assert_eq!(again, FileChange::Unchanged);
         assert_eq!(std::fs::read(d.path().join(".gitignore")).unwrap(), want);
         // A new env file later: its line, and no second temporary-name line.
-        let more = edit_gitignore(&root, Path::new(""), &[".env", ".env.local"]);
+        let more = edit_gitignore(&root, Path::new(""), &[".env", ".env.local"], &[]);
         assert_eq!(more, FileChange::Updated);
         let text = String::from_utf8_lossy(&std::fs::read(d.path().join(".gitignore")).unwrap())
             .into_owned();

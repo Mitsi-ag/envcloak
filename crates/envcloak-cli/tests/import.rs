@@ -1116,6 +1116,71 @@ fn a_deletion_without_a_person_leaves_short_values_in_place() {
     g.sweep();
 }
 
+/// F-57 follow-up (Codex): `init --delete-plaintext` makes git ignore
+/// every temporary name before any file changes, run on its own too: a
+/// `.gitignore` that lost the line, or ignores only some of the names,
+/// gets it back; one that cannot be edited (here it has another hard
+/// link) stops the deletion (`gitignore_refused`), and nothing is deleted.
+#[test]
+fn a_deletion_makes_git_ignore_its_temporary_names_first() {
+    let g = Gate16::new(true);
+    ok(&g.import(), &g.cs);
+    let path = g.repo.join(".gitignore");
+    let partial = "/.env\n/.env.short\n*f.tmp\n";
+    std::fs::write(&path, partial).unwrap();
+    let other = g.home.root().join("gitignore-link");
+    std::fs::hard_link(&path, &other).unwrap();
+    let out = g.delete();
+    assert_no_canary(&out.stdout, &g.cs);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).starts_with("envcloak: gitignore_refused:"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(g.intact(), [true, true]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), partial);
+    std::fs::remove_file(&other).unwrap();
+    // As JSON: the refusal, and no file changed.
+    std::fs::hard_link(&path, &other).unwrap();
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--delete-plaintext", "--json"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let d = &json(&out)["delete"];
+    assert_eq!(d["gitignore"], "refused", "{d}");
+    assert_eq!(strings(&d["removed"]), Vec::<String>::new());
+    assert_eq!(strings(&d["rewritten"]), Vec::<String>::new());
+    assert_eq!(g.intact(), [true, true]);
+    std::fs::remove_file(&other).unwrap();
+
+    // Editable, it gets the line, and the deletion goes on.
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--delete-plaintext", "--json"],
+        &[],
+    );
+    ok(&out, &g.cs);
+    let d = &json(&out)["delete"];
+    assert_eq!(d["gitignore"], "updated", "{d}");
+    assert_eq!(strings(&d["removed"]), [".env.short"]);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with(partial), "{text}");
+    assert!(text.lines().any(|l| l == ".*.envcloak-*.tmp"), "{text}");
+    for last in "0123456789abcdef".chars() {
+        for what in ["del", "new"] {
+            let t = format!("..env.envcloak-{what}-{:015x}{last}.tmp", fresh_seed() >> 4);
+            assert!(git_ignores(&g.repo, &t), "{t}");
+        }
+    }
+    file_or_item(&g);
+    g.sweep();
+}
+
 /// A template named with its part anywhere (`.env.local.example`) gives
 /// names only, and a profile shaped like a key (`.env.<hash>`) is skipped
 /// whole: neither is imported, named in `envcloak.toml` or `.gitignore`,
@@ -1163,21 +1228,38 @@ fn compound_templates_and_key_shaped_profiles_are_never_imported_or_changed() {
         assert_eq!(f["profile"], serde_json::Value::Null, "{name}");
     }
     assert!(files.iter().all(|f| f["file"] != hashed.as_str()));
+    // F-59 (Codex): the skipped file is reported without its name, which
+    // appears in no output, JSON or text.
     assert!(
-        r["skipped"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|x| x["path"] == hashed.as_str() && x["reason"] == "not_a_profile_name"),
+        r["skipped"].as_array().unwrap().iter().any(|x| x["path"]
+            == ".env.[not shown: looks like a key or token]"
+            && x["reason"] == "not_a_profile_name"),
         "{}",
         r["skipped"]
     );
+    assert!(!stdout(&out).contains(&hash), "{}", stdout(&out));
+    for args in [&["init"][..], &["init", "--json"], &["init", "--import"]] {
+        let out = person_in(&g.home, &g.repo, args, &[]);
+        ok(&out, &g.cs);
+        assert!(!stdout(&out).contains(&hash), "{args:?}: {}", stdout(&out));
+        assert!(!stderr(&out).contains(&hash), "{args:?}: {}", stderr(&out));
+        assert!(
+            stdout(&out).contains(".env.[not shown: looks like a key or token]"),
+            "{args:?}: {}",
+            stdout(&out)
+        );
+    }
     for written in ["envcloak.toml", ".gitignore"] {
         let text = std::fs::read_to_string(g.repo.join(written)).unwrap();
         assert!(!text.contains(&hash), "{written}: {text}");
         assert!(!text.contains("example"), "{written}: {text}");
         assert!(!text.contains("local"), "{written}: {text}");
     }
+    // Git ignores it by a line that spells none of its name.
+    let gitignore = std::fs::read_to_string(g.repo.join(".gitignore")).unwrap();
+    let unnamed = format!("/.env.{}", "?".repeat(hash.len()));
+    assert!(gitignore.lines().any(|l| l == unnamed), "{gitignore}");
+    assert!(git_ignores(&g.repo, &hashed));
     // No item holds the key the templates and the skipped file hold.
     let ls = run_in(&g.home, &g.repo, &["ls", "--json"]);
     assert_eq!(
@@ -1443,11 +1525,13 @@ fn run_until(g: &Gate16, at: &str) -> Vec<String> {
 }
 
 /// Gate 16: `kill -9` of `envcloak init --import --yes --delete-plaintext`
-/// at every step, the moments inside each file's change included, leaves
-/// every entry in its file or committed where the manifest binds it. A
-/// file left under a temporary name is reported by the next scan, and git
+/// at every step, the moments inside each file's change included (the
+/// old file under its temporary name after the swap, too), leaves every
+/// entry in its file or committed where the manifest binds it. A file
+/// left under a temporary name is reported by the next scan, and git
 /// ignores it by the `.gitignore` the import edited, which ignored the env
-/// files already.
+/// files already, and one temporary name's digits (F-57 follow-up): not
+/// the random ones of the real leftover.
 #[test]
 fn gate_16_kill_9_at_every_step_leaves_the_file_or_the_item() {
     // Unstopped, the run passes every point, in order.
@@ -1462,9 +1546,13 @@ fn gate_16_kill_9_at_every_step_leaves_the_file_or_the_item() {
     g.sweep();
     for (k, step) in STEPS.iter().enumerate() {
         let g = Gate16::new(true);
-        // The env files are ignored already; the temporary names are not
-        // until the import adds their line.
-        std::fs::write(g.repo.join(".gitignore"), "/.env\n/.env.short\n").unwrap();
+        // The env files are ignored already; the temporary names are not,
+        // but for one sample's digits, until the import adds their line.
+        std::fs::write(
+            g.repo.join(".gitignore"),
+            "/.env\n/.env.short\n.*.envcloak-*-0123456789abcdef.tmp\n",
+        )
+        .unwrap();
         let seen = run_until(&g, step);
         assert_eq!(seen, STEPS[..=k], "the points came out of order");
         file_or_item(&g);
