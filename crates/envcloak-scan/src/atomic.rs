@@ -18,11 +18,15 @@
 //! - [`remove_checked`] removes a file only when it is unchanged since it
 //!   was read, not modified within [`MIN_AGE`], and not open in another
 //!   process as far as the system can tell
-//!   ([`envcloak_sys::open_elsewhere`]; a file found open is looked at
-//!   again for half a second, since scanners open new files briefly). It
-//!   first moves the file aside, checks that what moved is the file it
-//!   checked, and only then unlinks it: a file saved over the name
-//!   meanwhile (an editor's atomic save) is put back, never removed.
+//!   ([`envcloak_sys::open_elsewhere`], asked about the open file itself);
+//!   a file found open is kept, and the whole stamp, change time
+//!   included, is checked again after that question, right before the
+//!   file moves. It first moves the file aside, checks that what moved is
+//!   the file it checked, and only then unlinks it: a file saved over the
+//!   name meanwhile (an editor's atomic save) is put back, never removed.
+//! - [`rewrite_checked`] replaces a file as [`replace_atomically`] does,
+//!   under [`remove_checked`]'s rules: `envcloak init --delete-plaintext`
+//!   rewrites an env file to hold only the entries it did not import.
 //!
 //! No temporary copy holds anything the caller did not write, and nothing
 //! here writes a backup: plaintext is never copied (SPEC §6.4 "Backups").
@@ -36,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use envcloak_sys::{
-    create_beneath, link_beneath, open_elsewhere, rename_beneath, sync_file, unlink_beneath,
+    InUse, create_beneath, link_beneath, open_elsewhere, rename_beneath, sync_file, unlink_beneath,
 };
 
 use crate::root::{FileStamp, ScanErrorKind, ScanRoot, io_kind, open_file};
@@ -44,12 +48,6 @@ use crate::root::{FileStamp, ScanErrorKind, ScanRoot, io_kind, open_file};
 /// A file modified more recently than this is not removed: someone may be
 /// editing it.
 pub const MIN_AGE: Duration = Duration::from_secs(120);
-
-/// How often a file found open elsewhere is looked at again before it is
-/// kept, and how long apart: a virus scanner or an indexer opens a file
-/// for a moment after it is written.
-const OPEN_CHECKS: u32 = 10;
-const OPEN_CHECK_WAIT: Duration = Duration::from_millis(50);
 
 /// Why a file was not changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,6 +61,9 @@ pub enum ModifyErrorKind {
     RecentlyChanged,
     /// Another process has it open.
     OpenElsewhere,
+    /// Whether another process has it open could not be asked about this
+    /// file: its path names another file now ([`InUse::Unmatched`]).
+    Unchecked,
     /// A file to create exists already.
     Exists,
     /// It could not be opened or checked, for this reason.
@@ -81,6 +82,7 @@ impl ModifyErrorKind {
             ModifyErrorKind::HardLinked => "hard_linked",
             ModifyErrorKind::RecentlyChanged => "recently_changed",
             ModifyErrorKind::OpenElsewhere => "open_elsewhere",
+            ModifyErrorKind::Unchecked => "unchecked",
             ModifyErrorKind::Exists => "exists",
             ModifyErrorKind::Scan(k) => k.token(),
             ModifyErrorKind::MovedAside => "moved_aside",
@@ -98,6 +100,10 @@ impl ModifyErrorKind {
                 "it was modified in the last 2 minutes, so it may be in use"
             }
             ModifyErrorKind::OpenElsewhere => "another program has it open",
+            ModifyErrorKind::Unchecked => {
+                "whether another program has it open could not be checked (its path names \
+                 another file now), so it was kept"
+            }
             ModifyErrorKind::Exists => "a file of that name exists already",
             ModifyErrorKind::Scan(k) => k.message(),
             ModifyErrorKind::MovedAside => {
@@ -124,7 +130,7 @@ impl core::fmt::Display for ModifyError {
 
 impl std::error::Error for ModifyError {}
 
-/// A new name beside `name`: `.<name>.envcloak-<hex>.tmp`, from a randomly
+/// A new name beside `name`: `.<name>.envcloak-<what>-<hex>.tmp`, from a randomly
 /// keyed hash of the time and this process. Not secret; a clash only makes
 /// `O_EXCL` fail. Names too long for one leave the name out.
 fn temp_name(name: &OsStr, what: &str) -> OsString {
@@ -177,6 +183,44 @@ fn io(e: &std::io::Error) -> ModifyErrorKind {
     ModifyErrorKind::Scan(io_kind(e))
 }
 
+/// Where [`remove_checked`] or [`rewrite_checked`] leaves a file under a
+/// temporary name if the process ends there (gate 16's test stops it at
+/// each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Inside {
+    /// The file to remove was renamed aside, and is not unlinked yet.
+    MovedAside,
+    /// The new contents are written beside the file, and not renamed over
+    /// it yet.
+    Staged,
+}
+
+/// Writes `new` beside `name` in `dir`, checks the file there is still the
+/// one `expect` stamps, and renames the new file over it.
+fn replace_in(
+    dir: &File,
+    name: &OsStr,
+    new: &[u8],
+    expect: &FileStamp,
+    observe: &mut dyn FnMut(Inside),
+) -> Result<FileStamp, ModifyErrorKind> {
+    let temp = temp_name(name, "new");
+    let f = write_new(dir, &temp, new, expect.mode).map_err(|e| io(&e))?;
+    observe(Inside::Staged);
+    // Another program may have written the file while this one wrote its
+    // replacement: keep theirs.
+    let installed = check_same(dir, name, expect)
+        .map(drop)
+        .and_then(|()| rename_beneath(dir, &temp, name).map_err(|e| io(&e)));
+    if let Err(k) = installed {
+        let _ = unlink_beneath(dir, &temp);
+        return Err(k);
+    }
+    sync_file(dir).map_err(|e| io(&e))?;
+    let m = f.metadata().map_err(|e| io(&e))?;
+    Ok(FileStamp::of(&m))
+}
+
 /// Replaces the file at `rel`, which must still be the one `expect`
 /// stamps, with `new`, keeping its mode. See the module documentation.
 /// Returns the new file's stamp.
@@ -194,20 +238,7 @@ pub fn replace_atomically(
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
     drop(check_same(&dir, &name, expect).map_err(fail)?);
-    let temp = temp_name(&name, "new");
-    let f = write_new(&dir, &temp, new, expect.mode).map_err(|e| fail(io(&e)))?;
-    // Another program may have written the file while this one wrote its
-    // replacement: keep theirs.
-    let installed = check_same(&dir, &name, expect)
-        .map(drop)
-        .and_then(|()| rename_beneath(&dir, &temp, &name).map_err(|e| io(&e)));
-    if let Err(k) = installed {
-        let _ = unlink_beneath(&dir, &temp);
-        return Err(fail(k));
-    }
-    sync_file(&dir).map_err(|e| fail(io(&e)))?;
-    let m = f.metadata().map_err(|e| fail(io(&e)))?;
-    Ok(FileStamp::of(&m))
+    replace_in(&dir, &name, new, expect, &mut |_| {}).map_err(fail)
 }
 
 /// Creates the file at `rel` with `new` and `mode`, only if no file has
@@ -242,6 +273,30 @@ pub fn create_atomically(
     Ok(FileStamp::of(&m))
 }
 
+/// What must hold before plaintext is removed or rewritten: the file in
+/// `dir` is still the one `expect` stamps, was not modified within
+/// [`MIN_AGE`] of `now`, and is not open elsewhere; then the whole stamp
+/// again, change time included, since another program may have written it
+/// while that was asked.
+fn check_removable(
+    dir: &File,
+    name: &OsStr,
+    expect: &FileStamp,
+    now: SystemTime,
+) -> Result<(), ModifyErrorKind> {
+    let f = check_same(dir, name, expect)?;
+    if expect.age_at(now).is_none_or(|age| age < MIN_AGE.as_secs()) {
+        return Err(ModifyErrorKind::RecentlyChanged);
+    }
+    match open_elsewhere(&f) {
+        InUse::Yes => return Err(ModifyErrorKind::OpenElsewhere),
+        InUse::Unmatched => return Err(ModifyErrorKind::Unchecked),
+        InUse::No | InUse::Unknown => {}
+    }
+    drop(f);
+    check_same(dir, name, expect).map(drop)
+}
+
 /// Removes the file at `rel` when it is still the one `expect` stamps, was
 /// not modified within [`MIN_AGE`], and is not open elsewhere. See the
 /// module documentation.
@@ -256,6 +311,17 @@ pub fn remove_checked_at(
     expect: &FileStamp,
     now: SystemTime,
 ) -> Result<(), ModifyError> {
+    remove_checked_observed(r, rel, expect, now, &mut |_| {})
+}
+
+/// [`remove_checked_at`], telling `observe` when the file is aside.
+pub fn remove_checked_observed(
+    r: &ScanRoot,
+    rel: &Path,
+    expect: &FileStamp,
+    now: SystemTime,
+    observe: &mut dyn FnMut(Inside),
+) -> Result<(), ModifyError> {
     let fail = |kind| ModifyError {
         rel: rel.to_path_buf(),
         kind,
@@ -263,22 +329,11 @@ pub fn remove_checked_at(
     let (dir, name) = r
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
-    let f = check_same(&dir, &name, expect).map_err(fail)?;
-    if expect.age_at(now).is_none_or(|age| age < MIN_AGE.as_secs()) {
-        return Err(fail(ModifyErrorKind::RecentlyChanged));
-    }
-    let path = r.path().join(rel);
-    let mut checks = 1;
-    while open_elsewhere(&f, &path) == Some(true) {
-        if checks == OPEN_CHECKS {
-            return Err(fail(ModifyErrorKind::OpenElsewhere));
-        }
-        checks += 1;
-        std::thread::sleep(OPEN_CHECK_WAIT);
-    }
+    check_removable(&dir, &name, expect, now).map_err(fail)?;
     // Move it aside, and remove it only if what moved is the file checked.
     let aside = temp_name(&name, "del");
     rename_beneath(&dir, &name, &aside).map_err(|e| fail(io(&e)))?;
+    observe(Inside::MovedAside);
     let moved = open_file(&dir, &aside, usize::MAX).map(|(_, m)| m);
     let same = moved.as_ref().is_ok_and(|m| {
         // A rename may update the change time; the contents' identity is
@@ -309,4 +364,38 @@ pub fn remove_checked_at(
     unlink_beneath(&dir, &aside).map_err(|e| fail(io(&e)))?;
     sync_file(&dir).map_err(|e| fail(io(&e)))?;
     Ok(())
+}
+
+/// Replaces the file at `rel` with `new`, as [`replace_atomically`] does,
+/// only when [`remove_checked`] would remove it: still the one `expect`
+/// stamps, not modified within [`MIN_AGE`], and not open elsewhere.
+/// Returns the new file's stamp.
+pub fn rewrite_checked(
+    r: &ScanRoot,
+    rel: &Path,
+    new: &[u8],
+    expect: &FileStamp,
+) -> Result<FileStamp, ModifyError> {
+    rewrite_checked_observed(r, rel, new, expect, SystemTime::now(), &mut |_| {})
+}
+
+/// [`rewrite_checked`] at the time `now`, telling `observe` when the new
+/// contents are staged.
+pub fn rewrite_checked_observed(
+    r: &ScanRoot,
+    rel: &Path,
+    new: &[u8],
+    expect: &FileStamp,
+    now: SystemTime,
+    observe: &mut dyn FnMut(Inside),
+) -> Result<FileStamp, ModifyError> {
+    let fail = |kind| ModifyError {
+        rel: rel.to_path_buf(),
+        kind,
+    };
+    let (dir, name) = r
+        .open_parent(rel)
+        .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
+    check_removable(&dir, &name, expect, now).map_err(fail)?;
+    replace_in(&dir, &name, new, expect, observe).map_err(fail)
 }

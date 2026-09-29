@@ -1,28 +1,105 @@
 //! Replacing, creating and removing files under a scan root (SPEC §6.4):
 //! only the file that was read is changed, a crash leaves the old file or
-//! the new one, and a file is removed only when it is old enough and open
-//! nowhere else.
+//! the new one, and a file is removed or rewritten only when it is old
+//! enough and open nowhere else.
+//!
+//! A process forked while this one has a file open holds that file until
+//! it execs, and would count as having it open. The tests here write their
+//! files and start their children under [`FORKS`], so no child of one test
+//! holds another's file.
 #![allow(clippy::unwrap_used)]
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use envcloak_scan::{
     FileStamp, MAX_DOTENV, ModifyErrorKind, ScanErrorKind, create_atomically, open_root,
-    read_capped, remove_checked, remove_checked_at, replace_atomically,
+    read_capped, remove_checked, remove_checked_at, replace_atomically, rewrite_checked,
 };
 
+/// Held while a test has a file open for writing or starts a process.
+static FORKS: Mutex<()> = Mutex::new(());
+
+fn forks() -> std::sync::MutexGuard<'static, ()> {
+    FORKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write(p: &Path, b: &[u8]) {
+    let _g = forks();
+    std::fs::write(p, b).unwrap();
+}
+
 fn age(p: &Path, by: Duration) {
+    let _g = forks();
     File::options()
         .write(true)
         .open(p)
         .unwrap()
         .set_modified(SystemTime::now() - by)
         .unwrap();
+}
+
+/// A process holding `p` open (read and write) until it is told to go on:
+/// then, 300 ms later, it writes `edit` over the start of the file in
+/// place, restores the modification time, closes the file and says `done`.
+fn holder(p: &Path, edit: &str) -> Child {
+    let _g = forks();
+    let mut c = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import os, sys, time\n\
+             st = os.stat(sys.argv[1])\n\
+             f = open(sys.argv[1], 'r+b')\n\
+             print('ready', flush=True)\n\
+             sys.stdin.readline()\n\
+             time.sleep(0.3)\n\
+             if sys.argv[2]:\n\
+             \x20   f.write(sys.argv[2].encode())\n\
+             \x20   f.flush()\n\
+             \x20   os.utime(sys.argv[1], ns=(st.st_atime_ns, st.st_mtime_ns))\n\
+             f.close()\n\
+             print('done', flush=True)\n",
+        )
+        .arg(p)
+        .arg(edit)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(line_of(&mut c), "ready\n");
+    c
+}
+
+fn line_of(c: &mut Child) -> String {
+    let mut line = String::new();
+    BufReader::new(c.stdout.as_mut().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    line
+}
+
+/// Tells a [`holder`] to go on.
+fn go(c: &mut Child) {
+    c.stdin.as_mut().unwrap().write_all(b"go\n").unwrap();
+}
+
+/// Waits for a [`holder`] told to go on to finish.
+fn finished(mut c: Child) {
+    assert_eq!(line_of(&mut c), "done\n");
+    c.wait().unwrap();
+}
+
+/// Tells a [`holder`] to go on, and waits for it.
+fn release(mut c: Child) {
+    go(&mut c);
+    finished(c);
 }
 
 fn stamp(p: &Path) -> FileStamp {
@@ -41,7 +118,7 @@ fn no_temps(dir: &Path) {
 fn replace_writes_the_new_contents_and_keeps_the_mode() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".gitignore");
-    std::fs::write(&p, b"old\n").unwrap();
+    write(&p, b"old\n");
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
     let r = open_root(d.path()).unwrap();
     let before = stamp(&p);
@@ -63,11 +140,11 @@ fn replace_writes_the_new_contents_and_keeps_the_mode() {
 fn replace_refuses_a_file_another_program_wrote() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join("envcloak.toml");
-    std::fs::write(&p, b"[env]\n").unwrap();
+    write(&p, b"[env]\n");
     let r = open_root(d.path()).unwrap();
     let (_, s) = read_capped(&r, Path::new("envcloak.toml"), MAX_DOTENV).unwrap();
     // Same size, new contents, written after the read.
-    std::fs::write(&p, b"[xy]\n").unwrap();
+    write(&p, b"[xy]\n");
     let e = replace_atomically(&r, Path::new("envcloak.toml"), b"new", &s).unwrap_err();
     assert_eq!(e.kind, ModifyErrorKind::Changed);
     assert_eq!(std::fs::read(&p).unwrap(), b"[xy]\n");
@@ -119,7 +196,7 @@ fn create_makes_a_new_file_only() {
 fn remove_waits_two_minutes_after_the_last_change() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".env");
-    std::fs::write(&p, b"A=1\n").unwrap();
+    write(&p, b"A=1\n");
     let r = open_root(d.path()).unwrap();
     let e = remove_checked(&r, Path::new(".env"), &stamp(&p)).unwrap_err();
     assert_eq!(e.kind, ModifyErrorKind::RecentlyChanged);
@@ -143,13 +220,13 @@ fn remove_waits_two_minutes_after_the_last_change() {
 fn remove_takes_only_the_file_that_was_read() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".env");
-    std::fs::write(&p, b"A=1\n").unwrap();
+    write(&p, b"A=1\n");
     age(&p, Duration::from_secs(600));
     let r = open_root(d.path()).unwrap();
     let (_, s) = read_capped(&r, Path::new(".env"), MAX_DOTENV).unwrap();
     // Saved over (a new inode, as an editor's atomic save makes).
     let fresh = d.path().join("fresh");
-    std::fs::write(&fresh, b"A=2\n").unwrap();
+    write(&fresh, b"A=2\n");
     age(&fresh, Duration::from_secs(600));
     std::fs::rename(&fresh, &p).unwrap();
     let e = remove_checked(&r, Path::new(".env"), &s).unwrap_err();
@@ -176,29 +253,123 @@ fn remove_takes_only_the_file_that_was_read() {
 fn remove_refuses_a_file_open_in_another_process() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".env");
-    std::fs::write(&p, b"A=1\n").unwrap();
+    write(&p, b"A=1\n");
     age(&p, Duration::from_secs(600));
     let r = open_root(d.path()).unwrap();
     let s = stamp(&p);
-    let mut holder = Command::new("/bin/sh")
-        .arg("-c")
-        .arg("exec 3<\"$1\"; echo ready; read x")
-        .arg("sh")
-        .arg(&p)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(holder.stdout.as_mut().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    assert_eq!(line, "ready\n");
+    let h = holder(&p, "");
     let e = remove_checked(&r, Path::new(".env"), &s).unwrap_err();
     assert_eq!(e.kind, ModifyErrorKind::OpenElsewhere);
-    assert!(p.exists());
-    drop(holder.stdin.take());
-    holder.wait().unwrap();
+    let e = rewrite_checked(&r, Path::new(".env"), b"B=2\n", &s).unwrap_err();
+    assert_eq!(e.kind, ModifyErrorKind::OpenElsewhere);
+    assert_eq!(std::fs::read(&p).unwrap(), b"A=1\n");
+    release(h);
     remove_checked(&r, Path::new(".env"), &s).unwrap();
     assert!(!p.exists());
+    no_temps(d.path());
+}
+
+/// Review finding F-51: a file found open is kept at once, never waited
+/// for. Its holder, told to go on just before the removal, edits it in
+/// place 300 ms later, keeping its size and putting its modification time
+/// back, and closes it: its bytes stay on disk, and the stamp read before
+/// (whose change time no longer matches) removes nothing. (A removal that
+/// waited for the holder to close, as one did, removed the new bytes.)
+#[test]
+fn a_file_edited_in_place_by_its_holder_is_never_removed() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join(".env");
+    write(&p, b"A=1\n");
+    age(&p, Duration::from_secs(600));
+    let r = open_root(d.path()).unwrap();
+    let (_, s) = read_capped(&r, Path::new(".env"), MAX_DOTENV).unwrap();
+    let mut h = holder(&p, "A=2");
+    go(&mut h);
+    let e = remove_checked(&r, Path::new(".env"), &s).unwrap_err();
+    // Open when asked; changed, had the machine been slow enough to ask
+    // only after the edit.
+    assert!(
+        matches!(
+            e.kind,
+            ModifyErrorKind::OpenElsewhere | ModifyErrorKind::Changed
+        ),
+        "{e:?}"
+    );
+    finished(h);
+    assert_eq!(std::fs::read(&p).unwrap(), b"A=2\n");
+    let now = stamp(&p);
+    assert_eq!(
+        (now.size, now.mtime, now.mtime_nsec),
+        (s.size, s.mtime, s.mtime_nsec)
+    );
+    assert_ne!((now.ctime, now.ctime_nsec), (s.ctime, s.ctime_nsec));
+    for e in [
+        remove_checked(&r, Path::new(".env"), &s).unwrap_err(),
+        rewrite_checked(&r, Path::new(".env"), b"", &s)
+            .map(drop)
+            .unwrap_err(),
+    ] {
+        assert_eq!(e.kind, ModifyErrorKind::Changed);
+    }
+    assert_eq!(std::fs::read(&p).unwrap(), b"A=2\n");
+    no_temps(d.path());
+}
+
+/// Review finding F-50: the root's directory is renamed while another
+/// process holds the file open, and an empty file takes the old path. The
+/// file, reached through the root's handle, is still seen open, and kept.
+#[test]
+fn a_renamed_root_still_keeps_a_file_open_elsewhere() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let root = d.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let p = root.join(".env");
+    write(&p, b"A=1\n");
+    age(&p, Duration::from_secs(600));
+    let r = open_root(&root).unwrap();
+    let s = stamp(&p);
+    let h = holder(&p, "");
+    std::fs::rename(&root, d.path().join("moved")).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    write(&p, b"");
+    for e in [
+        remove_checked(&r, Path::new(".env"), &s).unwrap_err(),
+        rewrite_checked(&r, Path::new(".env"), b"", &s)
+            .map(drop)
+            .unwrap_err(),
+    ] {
+        assert_eq!(e.kind, ModifyErrorKind::OpenElsewhere);
+    }
+    assert_eq!(
+        std::fs::read(d.path().join("moved/.env")).unwrap(),
+        b"A=1\n"
+    );
+    release(h);
+    remove_checked(&r, Path::new(".env"), &s).unwrap();
+    assert!(!d.path().join("moved/.env").exists());
+    assert!(p.exists(), "the file at the old path is another one");
+}
+
+/// A rewrite follows the rules of a removal, then replaces the file whole
+/// with its mode kept.
+#[test]
+fn rewrite_replaces_only_an_old_file_no_one_holds() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join(".env");
+    write(&p, b"A=1\nPORT=8080\n");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let r = open_root(d.path()).unwrap();
+    let e = rewrite_checked(&r, Path::new(".env"), b"PORT=8080\n", &stamp(&p)).unwrap_err();
+    assert_eq!(e.kind, ModifyErrorKind::RecentlyChanged);
+    age(&p, Duration::from_secs(600));
+    let s = stamp(&p);
+    let after = rewrite_checked(&r, Path::new(".env"), b"PORT=8080\n", &s).unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), b"PORT=8080\n");
+    assert_eq!(after, stamp(&p));
+    assert_eq!(after.mode & 0o777, 0o600);
+    assert_ne!(after.ino, s.ino);
+    // The old stamp names nothing any more.
+    let e = rewrite_checked(&r, Path::new(".env"), b"", &s).unwrap_err();
+    assert_eq!(e.kind, ModifyErrorKind::Changed);
+    no_temps(d.path());
 }

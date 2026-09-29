@@ -14,8 +14,9 @@
 //!   through a symlink, across a mount point or into a FIFO.
 //! - [`dotenv`]: [`parse_dotenv`], a value-free-error parser that never
 //!   expands a variable.
-//! - [`atomic`]: [`replace_atomically`], [`create_atomically`] and
-//!   [`remove_checked`], which act only on the file that was read.
+//! - [`atomic`]: [`replace_atomically`], [`create_atomically`],
+//!   [`remove_checked`] and [`rewrite_checked`], which act only on the
+//!   file that was read.
 //! - [`delete`]: [`delete_plaintext`], removal after the four conditions
 //!   of gate 16; [`restore`]: [`restore_file`], a file written back from
 //!   its encrypted backup.
@@ -30,8 +31,9 @@ pub mod root;
 pub mod walk;
 
 pub use atomic::{
-    MIN_AGE, ModifyError, ModifyErrorKind, create_atomically, remove_checked, remove_checked_at,
-    replace_atomically,
+    Inside, MIN_AGE, ModifyError, ModifyErrorKind, create_atomically, remove_checked,
+    remove_checked_at, remove_checked_observed, replace_atomically, rewrite_checked,
+    rewrite_checked_observed,
 };
 pub use delete::{DeleteGate, DeleteOutcome, DeleteStep, delete_plaintext};
 pub use dotenv::{DotenvEntry, DotenvError, DotenvErrorKind, EntryKind, MAX_DOTENV, parse_dotenv};

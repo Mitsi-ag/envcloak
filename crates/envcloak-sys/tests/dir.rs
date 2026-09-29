@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::process::{Command, Stdio};
 
 use envcloak_sys::{
-    DirEntryKind, MAX_DIR_ENTRIES, Volume, create_beneath, link_beneath, list_dir,
+    DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, link_beneath, list_dir,
     open_dir_beneath, open_elsewhere, rename_beneath, unlink_beneath, volume_of,
 };
 
@@ -196,18 +196,18 @@ fn holder(path: &std::path::Path) -> std::process::Child {
 }
 
 /// `open_elsewhere`, looked at again for up to a second while it says
-/// open: a scanner or indexer may open a file for a moment after it is
-/// written (seen on the Linux CI runners), and a holder that exited may
-/// take a moment to be reaped.
-fn settled(f: &File, path: &std::path::Path) -> Option<bool> {
+/// open: a holder that exited may take a moment to be reaped, and a
+/// sibling test's child holds this binary's descriptors between its fork
+/// and its exec.
+fn settled(f: &File) -> InUse {
     for _ in 0..20 {
-        let got = open_elsewhere(f, path);
-        if got != Some(true) {
+        let got = open_elsewhere(f);
+        if got != InUse::Yes {
             return got;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    Some(true)
+    InUse::Yes
 }
 
 #[test]
@@ -218,17 +218,44 @@ fn open_elsewhere_sees_another_process_holding_the_file() {
     let f = File::open(&path).unwrap();
     // No one else has it open. A system that cannot tell says so, and
     // never claims the file is free when it is not (checked below).
-    let alone = settled(&f, &path);
+    let alone = settled(&f);
     if cfg!(any(target_os = "linux", target_os = "macos")) {
-        assert_eq!(alone, Some(false));
+        assert_eq!(alone, InUse::No);
     }
     let mut child = holder(&path);
-    assert_eq!(open_elsewhere(&f, &path), Some(true));
+    assert_eq!(open_elsewhere(&f), InUse::Yes);
     drop(child.stdin.take());
     child.wait().unwrap();
-    assert_eq!(settled(&f, &path), Some(false));
+    assert_eq!(settled(&f), InUse::No);
     // The check leaves the descriptor usable.
     let mut s = String::new();
     (&f).read_to_string(&mut s).unwrap();
     assert_eq!(s, "x");
+}
+
+/// Review finding F-50: the question is about the open file, not a path
+/// remembered for it. The directory holding a file another process has
+/// open is renamed, and an empty file takes the old path: the file is
+/// still seen open where it is now, and the file at the old path, which
+/// no one holds, is not.
+#[test]
+fn open_elsewhere_follows_the_file_when_its_directory_is_renamed() {
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = tmp.path().join("root");
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join(".env");
+    std::fs::write(&path, b"x").unwrap();
+    let f = File::open(&path).unwrap();
+    let mut child = holder(&path);
+    std::fs::rename(&dir, tmp.path().join("moved")).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(&path, b"").unwrap();
+    assert_eq!(open_elsewhere(&f), InUse::Yes);
+    let decoy = File::open(&path).unwrap();
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert_eq!(settled(&decoy), InUse::No);
+    }
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    assert_eq!(settled(&f), InUse::No);
 }

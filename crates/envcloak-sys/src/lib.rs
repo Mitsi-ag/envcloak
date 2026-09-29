@@ -72,7 +72,7 @@ pub use harden::{
     Hardening, core_dump_limit, disable_core_dumps, harden_process, hardening_report,
     hardening_status, lock_memory, parse_tracer_pid, set_non_dumpable, tracer_present,
 };
-pub use inuse::open_elsewhere;
+pub use inuse::{InUse, open_elsewhere};
 pub use lockfile::try_lock_exclusive;
 pub use peer::{
     PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_identity, peer_uid,

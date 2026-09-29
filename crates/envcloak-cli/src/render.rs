@@ -786,6 +786,7 @@ fn path_reason(token: &str) -> String {
         "invalid" => "it does not parse, so it cannot be checked",
         "recently_changed" => "modified in the last 2 minutes, so it may be in use",
         "open_elsewhere" => "another program has it open",
+        "unchecked" => "whether another program has it open could not be checked, so it was kept",
         "moved_aside" => "saved over while it was deleted; the checked file was kept",
         "exists" => "a file is there already, and is left as it is",
         "restored" => "restored",
