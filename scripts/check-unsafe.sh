@@ -25,8 +25,12 @@
 #    there. So no file outside the allowlist may name `expose_secret`,
 #    `expose_secret_mut`, `ExposeSecret` or `ExposeSecretMut` at all, in
 #    any configuration: not in a call, a path, an import or anywhere else.
-#    security/lint-canary is the one exception: it opens secrets on purpose
-#    so scripts/check-expose-lint.sh can prove clippy reports each call.
+#    security/lint-canary/src/lib.rs is the one exception: it opens secrets
+#    on purpose so scripts/check-expose-lint.sh can prove clippy reports
+#    each call. So it must start with `#![cfg(envcloak_lint_canary)]`, which
+#    leaves it empty in every build but that script's, and no manifest may
+#    depend on either canary crate (envcloak-lint-canary,
+#    envcloak-unsafe-canary): by name, by `package` or by path.
 # 3. No Rust file uses `include!` or a `#[path]` attribute, either of which
 #    compiles a file this check never reads, or names the `clippy` cfg,
 #    which compiles code clippy never lints (`cfg(not(clippy))`) or code
@@ -107,6 +111,8 @@ TOOLS = ("rust", "clippy", "rustdoc")
 LEVELS = ("allow", "warn", "deny", "forbid")
 EXPOSE = ("secrecy::ExposeSecret::expose_secret", "secrecy::ExposeSecretMut::expose_secret_mut")
 TARGETS = ("lib", "bin", "test", "bench", "example")
+CANARIES = {"envcloak-lint-canary": "security/lint-canary", "envcloak-unsafe-canary": "security/unsafe-canary"}
+DEPS = ("dependencies", "dev-dependencies", "dev_dependencies", "build-dependencies", "build_dependencies")
 
 def fail(path, msg):
     print(path + ": " + msg)
@@ -181,7 +187,46 @@ def keys_named(obj, name):
         for v in obj:
             yield from keys_named(v, name)
 
+def dependency_tables(doc):
+    """(where, table) for every dependency table of a manifest: those of
+    the package, of each target and of the workspace."""
+    for key in DEPS:
+        if isinstance(doc.get(key), dict):
+            yield key, doc[key]
+    target = doc.get("target")
+    if isinstance(target, dict):
+        for cfg, t in target.items():
+            if isinstance(t, dict):
+                for key in DEPS:
+                    if isinstance(t.get(key), dict):
+                        yield "target.%s.%s" % (cfg, key), t[key]
+    ws = doc.get("workspace")
+    if isinstance(ws, dict) and isinstance(ws.get("dependencies"), dict):
+        yield "workspace.dependencies", ws["dependencies"]
+
+def names_canary(name):
+    return isinstance(name, str) and name.replace("_", "-").lower() in CANARIES
+
+def canary_dependencies(path, doc):
+    """The code of a canary opens secrets or uses unsafe code on purpose,
+    kept out of every build by a cfg. A crate that depends on one could
+    build that code without the cfg this check relies on."""
+    here = os.path.dirname(path)
+    dirs = [os.path.realpath(d) for d in CANARIES.values()]
+    for where, table in dependency_tables(doc):
+        for name, spec in table.items():
+            hit = names_canary(name)
+            if isinstance(spec, dict):
+                hit = hit or names_canary(spec.get("package"))
+                p = spec.get("path")
+                if isinstance(p, str):
+                    real = os.path.realpath(os.path.join(here, p))
+                    hit = hit or any(real == d or real.startswith(d + os.sep) for d in dirs)
+            if hit:
+                fail(path, "%s.%s: no crate may depend on a canary crate (%s): it opens secrets or uses unsafe code on purpose" % (where, name, ", ".join(sorted(CANARIES))))
+
 def common(path, doc):
+    canary_dependencies(path, doc)
     for key in ("patch", "replace"):
         if key in doc:
             fail(path, "[%s] is not allowed: it can swap secrecy or zeroize for other code" % key)
@@ -463,6 +508,16 @@ END {
     exit
   }
   text = unraw(text)
+  # The lint canary opens secrets on purpose, so it must be compiled out of
+  # every build but the one scripts/check-expose-lint.sh makes: its first
+  # item is the crate-level cfg that script sets.
+  if (canary) {
+    lead = text
+    gsub(/[ \t\n]/, "", lead)
+    want = "#![cfg(envcloak_lint_canary)]"
+    if (substr(lead, 1, length(want)) != want)
+      report(1, "must start with #![cfg(envcloak_lint_canary)]: without it the calls this file makes on purpose are compiled in every build, and this check does not look for them here")
+  }
   masked = text
   re = "(allow|expect|warn|deny|forbid)[ \t\n]*\\([^()]*\\)"
   pos = 1
@@ -565,9 +620,9 @@ while IFS= read -r file; do
     listed=1
   fi
   canary=0
-  case "$file" in
-    security/lint-canary/*) canary=1 ;;
-  esac
+  if [ "$file" = security/lint-canary/src/lib.rs ]; then
+    canary=1
+  fi
   while IFS= read -r msg; do
     fail "$file:$msg"
   done < <(LC_ALL=C awk -v in_sys="$in_sys" -v allowlisted="$listed" -v allowlist="$allowlist" \

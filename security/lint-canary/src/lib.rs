@@ -5,7 +5,10 @@
 //! EXPECT-DISALLOWED markers. Never add this file to the expose allowlist.
 //!
 //! Compiled only with `--cfg envcloak_lint_canary`, so ordinary workspace
-//! builds, which deny warnings in CI, see an empty crate.
+//! builds, which deny warnings in CI, see an empty crate. The cfg must stay
+//! this file's first item and no crate may depend on this one:
+//! scripts/check-unsafe.sh exempts this file from its expose_secret rule
+//! only on those terms.
 #![cfg(envcloak_lint_canary)]
 
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox};

@@ -619,14 +619,180 @@ fn exposure_names_outside_the_allowlist_fail_in_any_configuration() {
              struct Not{t};\n"
         ),
     );
-    let canary = format!("use secrecy::{t};\npub fn f(s: &S) -> &[u8] {{\n    s.{m}()\n}}\n");
+    let canary = format!(
+        "#![cfg(envcloak_lint_canary)]\nuse secrecy::{t};\npub fn f(s: &S) -> &[u8] {{\n    s.{m}()\n}}\n"
+    );
     write(&r, "security/lint-canary/src/lib.rs", &canary);
     assert_passes(&tree);
     write(&r, "security/unsafe-canary/src/lib.rs", &canary);
     assert_fails(
         &tree,
-        "security/unsafe-canary/src/lib.rs:1: names expose_secret",
+        "security/unsafe-canary/src/lib.rs:2: names expose_secret",
     );
+}
+
+/// The lint canary's exemption holds only while it is compiled out of
+/// every build but check-expose-lint.sh's: its lib.rs must start with the
+/// crate-level cfg, and no other file of it is exempt (verification of
+/// review T1-1).
+#[test]
+fn the_lint_canary_is_exempt_only_while_compiled_out() {
+    let m = expose_method();
+    let t = expose_trait();
+    let rel = "security/lint-canary/src/lib.rs";
+    let body = format!("use secrecy::{t};\npub fn f(s: &S) -> &[u8] {{\n    s.{m}()\n}}\n");
+    for text in [
+        format!("#![cfg(envcloak_lint_canary)]\n{body}"),
+        format!("//! Docs first.\n/* a comment */\n#! [ cfg( envcloak_lint_canary ) ]\n{body}"),
+    ] {
+        let tree = clean_tree();
+        write(&tree.home(), rel, &text);
+        assert_passes(&tree);
+    }
+    let cases = [
+        // No cfg; one after another attribute; a widened or misspelled
+        // cfg; an outer attribute; the cfg only in a comment or a string.
+        body.clone(),
+        format!(
+            "#![cfg_attr(target_arch = \"x86\", cfg(all()))]\n#![cfg(envcloak_lint_canary)]\n{body}"
+        ),
+        format!("#![cfg(any(envcloak_lint_canary, target_env = \"musl\"))]\n{body}"),
+        format!("#![cfg(envcloak_lint_canary_x)]\n{body}"),
+        format!("#[cfg(envcloak_lint_canary)]\n{body}"),
+        format!("// #![cfg(envcloak_lint_canary)]\n{body}"),
+        format!("const A: &str = \"#![cfg(envcloak_lint_canary)]\";\n{body}"),
+    ];
+    let missed: Vec<&String> = cases
+        .iter()
+        .filter(|text| {
+            let tree = clean_tree();
+            write(&tree.home(), rel, text);
+            let out = run(&tree.home());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            out.status.success()
+                || !stderr.contains(&format!(
+                    "{rel}:1: must start with #![cfg(envcloak_lint_canary)]"
+                ))
+        })
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "{} of {} cases were not refused:\n{missed:#?}",
+        missed.len(),
+        cases.len()
+    );
+
+    // Any other file of the canary crate is checked like every file.
+    for other in [
+        "security/lint-canary/src/more.rs",
+        "security/lint-canary/tests/t.rs",
+        "security/lint-canary/src/bin/b.rs",
+    ] {
+        let tree = clean_tree();
+        write(
+            &tree.home(),
+            rel,
+            &format!("#![cfg(envcloak_lint_canary)]\n{body}"),
+        );
+        write(&tree.home(), other, &body);
+        assert_fails(&tree, &format!("{other}:1: names expose_secret"));
+    }
+}
+
+/// No crate may depend on a canary crate, however it names it: the
+/// canaries' code is kept out of builds only by their cfgs (verification of
+/// review T1-1).
+#[test]
+fn no_manifest_may_depend_on_a_canary() {
+    let member = |deps: &str| format!("{MEMBER}\n{deps}");
+    let core = "crates/envcloak-core/Cargo.toml";
+    let cases = [
+        (
+            core,
+            member(
+                "[dependencies]\nenvcloak-lint-canary = { path = \"../../security/lint-canary\" }\n",
+            ),
+        ),
+        (
+            core,
+            member(
+                "[dependencies]\nhelper = { package = \"envcloak-lint-canary\", version = \"0.1\" }\n",
+            ),
+        ),
+        (
+            core,
+            member("[dependencies]\nhelper = { path = \"../../security/lint-canary/\" }\n"),
+        ),
+        (
+            core,
+            member("[dependencies.helper]\npath = \"../../security/./unsafe-canary\"\n"),
+        ),
+        (
+            core,
+            member("[dependencies]\nenvcloak_unsafe_canary = \"0.1\"\n"),
+        ),
+        (
+            core,
+            member(
+                "[dev-dependencies]\nenvcloak-lint-canary = { path = \"../../security/lint-canary\" }\n",
+            ),
+        ),
+        (
+            core,
+            member(
+                "[build-dependencies]\nenvcloak-unsafe-canary = { path = \"../../security/unsafe-canary\" }\n",
+            ),
+        ),
+        (
+            core,
+            member(
+                "[target.'cfg(target_arch = \"x86\")'.dependencies]\nhelper = { path = \"../../security/lint-canary\" }\n",
+            ),
+        ),
+        (
+            core,
+            member("[dependencies]\nhelper = { workspace = true }\n"),
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (i, (rel, text)) in cases.iter().enumerate() {
+        let tree = clean_tree();
+        write(&tree.home(), rel, text);
+        if i == cases.len() - 1 {
+            // Inherited: the workspace table names the canary.
+            write(
+                &tree.home(),
+                "Cargo.toml",
+                &root_manifest(
+                    "",
+                    &clippy_body(),
+                    "[workspace.dependencies]\nhelper = { path = \"security/lint-canary\" }\n",
+                ),
+            );
+        }
+        let out = run(&tree.home());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() || !stderr.contains("no crate may depend on a canary crate") {
+            missed.push(text);
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "{} of {} cases were not refused:\n{missed:#?}",
+        missed.len(),
+        cases.len()
+    );
+
+    // Other path dependencies are fine.
+    let tree = clean_tree();
+    write(
+        &tree.home(),
+        core,
+        &member(
+            "[dependencies]\nhelper = { path = \"../../security/lint-canary-helper\" }\nother = { path = \"../other\" }\n",
+        ),
+    );
+    assert_passes(&tree);
 }
 
 #[test]
