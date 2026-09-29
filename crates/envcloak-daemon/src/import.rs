@@ -848,7 +848,20 @@ fn stored(v: &Vault, bindings: &[Binding], name: &EnvName, value: &SecretBytes) 
     }
 }
 
-/// `files.backup`.
+/// Whether `path` names an env file, `.env` or `.env.<suffix>`: the only
+/// files a deletion backs up. `envcloak init --undo` writes a backup's
+/// files back, so no client may stage another file (a launch agent, a
+/// shell profile) in one.
+fn env_file_path(path: &str) -> bool {
+    !path.ends_with('/')
+        && Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == ".env" || n.strip_prefix(".env.").is_some_and(|s| !s.is_empty()))
+}
+
+/// `files.backup`: the files of an env-file deletion, each an absolute
+/// path to an env file ([`env_file_path`]).
 pub fn files_backup(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -856,7 +869,7 @@ pub fn files_backup(
 ) -> Result<FileBackupView, RpcError> {
     let mut files = Vec::with_capacity(p.files.len());
     for f in p.files {
-        if !Path::new(&f.path).is_absolute() || f.path.contains('\0') {
+        if !Path::new(&f.path).is_absolute() || f.path.contains('\0') || !env_file_path(&f.path) {
             return Err(invalid());
         }
         files.push(BackupFile {

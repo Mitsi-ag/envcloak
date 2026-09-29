@@ -1152,8 +1152,9 @@ fn compound_templates_and_key_shaped_profiles_are_never_imported_or_changed() {
     g.sweep();
 }
 
-/// `init --undo` puts a rewritten file back only when it is what the
-/// deletion left: one edited since is left alone (`exists`).
+/// `init --undo` writes only into the project it runs for, which its
+/// statement names, and puts a rewritten file back only when it is what
+/// the deletion left: one edited since is left alone (`exists`).
 #[test]
 fn undo_replaces_only_what_the_deletion_left() {
     let g = Gate16::new(true);
@@ -1176,6 +1177,34 @@ fn undo_replaces_only_what_the_deletion_left() {
         format!("{}\n", by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str()),
     )
     .unwrap();
+    // Run in another directory, the undo names that one before the
+    // passphrase and writes nothing: the files are not in it.
+    let elsewhere = g.home.root().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let out = person_in(
+        &g.home,
+        &elsewhere,
+        &["init", "--undo", &backup, "--passphrase-fd", "3", "--json"],
+        &[(3, &pass, true)],
+    );
+    assert_no_canary(&out.stdout, &g.cs);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let named = std::fs::canonicalize(&elsewhere).unwrap();
+    assert!(
+        stderr(&out).contains(&format!("into {}.", named.display())),
+        "{}",
+        stderr(&out)
+    );
+    let r = json(&out);
+    let states: Vec<&str> = r["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["elsewhere", "elsewhere"]);
+    assert!(!g.repo.join(".env.short").exists());
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     let out = person_in(
         &g.home,
         &g.repo,

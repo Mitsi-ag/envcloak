@@ -531,18 +531,31 @@ fn a_file_backup_comes_back_only_with_a_proof() {
     assert_eq!(b.id.len(), 26);
     assert_eq!(b.files, 1);
     assert!(b.file_name.ends_with(".ecfiles"));
-    // A relative path is refused.
-    let e = c
-        .files_backup(&FilesBackupParams {
-            files: vec![BackupFileParams {
-                path: "relative/.env".into(),
-                mode: 0o600,
-                content: WireSecret::new(SecretBytes::copy_from(b"A=1")),
-            }],
-            claims: Vec::new(),
-        })
-        .unwrap_err();
-    assert_eq!(rpc(e), ErrorKind::InvalidParams);
+    // A relative path is refused, and so is a file that is not an env
+    // file: a backup is written back by `init --undo`, so none may stage
+    // another file there (a launch agent, a shell profile).
+    let home = f.home.home();
+    for path in [
+        "relative/.env".to_owned(),
+        home.join("Library/LaunchAgents/x.plist")
+            .to_string_lossy()
+            .into_owned(),
+        home.join(".zshrc").to_string_lossy().into_owned(),
+        home.join(".envrc").to_string_lossy().into_owned(),
+        home.join("dir/.env/").to_string_lossy().into_owned(),
+    ] {
+        let e = c
+            .files_backup(&FilesBackupParams {
+                files: vec![BackupFileParams {
+                    path: path.clone(),
+                    mode: 0o600,
+                    content: WireSecret::new(SecretBytes::copy_from(b"A=1")),
+                }],
+                claims: Vec::new(),
+            })
+            .unwrap_err();
+        assert_eq!(rpc(e), ErrorKind::InvalidParams, "{path}");
+    }
 
     let wrong = SecretBytes::copy_from(b"not the passphrase, not at all");
     let e = c.files_restore(&b.id, wrong, &[]).unwrap_err();

@@ -33,9 +33,12 @@
 //! - `--undo <ID>` writes the files of that backup back, byte for byte,
 //!   where they were. That hands plaintext back, so it is a proof: the
 //!   passphrase, from `/dev/tty` or `--passphrase-fd`, in a terminal
-//!   session with no agent in it. A file that exists is replaced only when
-//!   it is what the deletion left of it (the original with some entries
-//!   taken out, and nothing else changed); any other is left alone.
+//!   session with no agent in it. The statement before it names the
+//!   project directory, and only env files directly in it are written: a
+//!   backup names its paths, and any client can store one. A file that
+//!   exists is replaced only when it is what the deletion left of it (the
+//!   original with some entries taken out, and nothing else changed); any
+//!   other is left alone.
 //!
 //! Deletion removes the working copy only: a value that was committed to
 //! git, synced or backed up elsewhere is still there, and the report says
@@ -53,12 +56,12 @@ use envcloak_ipc::view::{
     DeleteReport, EntryStatus, FileChange, InitReport, SkipReason, SkippedPath, UndoFile,
     UndoReport, VerifyEntryView, VerifyView,
 };
-use envcloak_policy::{MANIFEST_NAME, find_manifest};
+use envcloak_policy::{MANIFEST_NAME, escape_for_display, find_manifest};
 use envcloak_scan::{
-    DeleteGate, DeleteStep, DotenvEntry, EntryKind, FileStamp, MAX_DOTENV, ModifyErrorKind,
-    Remains, ScanErrorKind, ScanRoot, create_atomically, delete_plaintext, open_root, parse_dotenv,
-    pause_point, read_capped, read_plain, restore_file, restore_over, trimmed_from,
-    without_entries,
+    DeleteGate, DeleteStep, DotenvEntry, EntryKind, FileKind, FileStamp, MAX_DOTENV,
+    ModifyErrorKind, Remains, ScanErrorKind, ScanRoot, create_atomically, delete_plaintext,
+    dotenv_kind, open_root, parse_dotenv, pause_point, read_capped, read_plain, restore_file,
+    restore_over, trimmed_from, without_entries,
 };
 
 use super::import::{ReadFile, import, project_name, report, scan};
@@ -556,10 +559,14 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
     }
     refuse_if_traced()?;
     let claims_now = refuse_if_claimed()?;
+    let dir = project_dir()?;
+    let project = open_root(&dir)
+        .map_err(|_| Failure::new("io", "the project directory could not be opened"))?;
     require_unlocked(&mut connect()?)?;
     let statement = format!(
-        "Write back the files of backup {id}. They hold plaintext secrets, and are written \
-         where they were; a file that exists there now is left alone.\n"
+        "Write back the env files of backup {id} into {}. They hold plaintext secrets; a file \
+         that exists there now is left alone, and nothing is written anywhere else.\n",
+        escape_for_display(&project.path().to_string_lossy())
     );
     let passphrase = match a.passphrase_fd {
         Some(fd) => {
@@ -584,7 +591,7 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
         files: Vec::new(),
     };
     for f in restored.files {
-        let state = write_back(&f.path, f.mode, f.content.into_inner());
+        let state = write_back(&project, &f.path, f.mode, f.content.into_inner());
         report.files.push(UndoFile {
             path: f.path,
             state: state.to_owned(),
@@ -605,11 +612,16 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
     }
 }
 
-/// Writes one restored file where it was. A file there already is
-/// `unchanged` when it holds the same bytes, replaced (`restored`) when it
-/// is what the deletion left of it (the original with some entries taken
-/// out, nothing else changed), and `exists` otherwise.
-fn write_back(path: &str, mode: u32, content: SecretBytes) -> &'static str {
+/// Writes one restored file where it was, only when that is an env file
+/// (`.env` or `.env.<profile>`, as a deletion takes out) directly in
+/// `project`, the directory `init --undo` runs for: a backup any client
+/// can store names any path, and the passphrase statement names only that
+/// directory. Another name is `not_env_file`, another directory
+/// `elsewhere`. A file there already is `unchanged` when it holds the same
+/// bytes, replaced (`restored`) when it is what the deletion left of it
+/// (the original with some entries taken out, nothing else changed), and
+/// `exists` otherwise.
+fn write_back(project: &ScanRoot, path: &str, mode: u32, content: SecretBytes) -> &'static str {
     let p = Path::new(path);
     let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else {
         return "invalid_path";
@@ -617,9 +629,15 @@ fn write_back(path: &str, mode: u32, content: SecretBytes) -> &'static str {
     if !p.is_absolute() || path.chars().any(char::is_control) {
         return "invalid_path";
     }
+    if !matches!(dotenv_kind(name), Some(Ok(FileKind::Dotenv { .. }))) {
+        return "not_env_file";
+    }
     let Ok(root) = open_root(dir) else {
         return "no_directory";
     };
+    if root.identity() != project.identity() {
+        return "elsewhere";
+    }
     let rel = Path::new(name);
     match read_capped(&root, rel, content.len().max(MAX_DOTENV)) {
         Ok((now, _)) if now.ct_eq_secret(&content) => return "unchanged",
@@ -662,6 +680,39 @@ mod tests {
         ] {
             assert!(parse(bad).is_none(), "{bad:?}");
         }
+    }
+
+    /// A backup can name any path: only an env file directly in the
+    /// project directory is written back.
+    #[test]
+    fn undo_writes_only_env_files_in_the_project() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let (project, other) = (d.path().join("project"), d.path().join("other"));
+        for dir in [&project, &other] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let root = open_root(&project).unwrap();
+        let body = || SecretBytes::copy_from(b"A=1\n");
+        let at = |dir: &Path, name: &str| dir.join(name).to_str().unwrap().to_owned();
+        for (path, want) in [
+            (at(&project, "run.plist"), "not_env_file"),
+            (at(&project, ".zshrc"), "not_env_file"),
+            (at(&project, ".env.example"), "not_env_file"),
+            (at(&project, ".envrc"), "not_env_file"),
+            (at(&other, ".env"), "elsewhere"),
+            (at(&project.join("sub"), ".env"), "no_directory"),
+            (".env".to_owned(), "invalid_path"),
+        ] {
+            assert_eq!(write_back(&root, &path, 0o600, body()), want, "{path}");
+        }
+        for dir in [&project, &other] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        assert_eq!(
+            write_back(&root, &at(&project, ".env.local"), 0o600, body()),
+            "restored"
+        );
+        assert_eq!(std::fs::read(project.join(".env.local")).unwrap(), b"A=1\n");
     }
 
     #[test]

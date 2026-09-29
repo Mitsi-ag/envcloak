@@ -801,6 +801,8 @@ fn path_reason(token: &str) -> String {
         "unchanged" => "there already, as it was",
         "no_directory" => "its directory is gone",
         "invalid_path" => "not a path it could be written to",
+        "not_env_file" => "not an env file's name, so it was not written",
+        "elsewhere" => "not in this project's directory: run `envcloak init --undo` in its own",
         other => return shown(other),
     };
     words.to_owned()
