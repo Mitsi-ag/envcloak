@@ -32,6 +32,7 @@ use envcloak_core::SecretBytes;
 use envcloak_core::vault::Slug;
 use envcloak_exec::{ExecError, IDLE_FLUSH, Label, RunSpec, ShortPolicy, build_redactor, run};
 use envcloak_policy::EnvName;
+use envcloak_sys::StartTime;
 use envcloak_testkit::{
     Canary, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
 };
@@ -231,6 +232,18 @@ const TESTS: &[Test] = &[
     (
         "harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session",
         harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session,
+    ),
+    (
+        "harness_cleanup_after_a_successful_finish_signals_nothing",
+        harness_cleanup_after_a_successful_finish_signals_nothing,
+    ),
+    (
+        "harness_cleanup_signals_a_live_tree_once",
+        harness_cleanup_signals_a_live_tree_once,
+    ),
+    (
+        "harness_a_leftover_is_killed_only_while_it_is_the_process_it_was",
+        harness_a_leftover_is_killed_only_while_it_is_the_process_it_was,
     ),
 ];
 
@@ -521,10 +534,20 @@ struct Proc {
     stdin: Option<ChildStdin>,
     cap: Arc<Captured>,
     readers: Vec<JoinHandle<()>>,
+    /// Where cleanup looks for processes and sends its signals.
+    host: Arc<dyn Host>,
+    /// The child has been reaped. Its pid can then be another process's,
+    /// so cleanup does nothing more (review F-62).
+    reaped: bool,
 }
 
 impl Proc {
-    fn spawn(mut cmd: Command) -> Proc {
+    fn spawn(cmd: Command) -> Proc {
+        Proc::spawn_on(cmd, Arc::new(Live))
+    }
+
+    /// [`Proc::spawn`], with cleanup looking at and signalling `host`.
+    fn spawn_on(mut cmd: Command, host: Arc<dyn Host>) -> Proc {
         let mut child = cmd.spawn().unwrap();
         let cap = Arc::new(Captured::default());
         let mut readers = Vec::new();
@@ -558,11 +581,34 @@ impl Proc {
             stdin,
             cap,
             readers,
+            host,
+            reaped: false,
+        }
+    }
+
+    /// A process whose output the test reads itself.
+    fn bare(child: Child) -> Proc {
+        Proc {
+            child,
+            stdin: None,
+            cap: Arc::default(),
+            readers: Vec::new(),
+            host: Arc::new(Live),
+            reaped: false,
         }
     }
 
     fn pid(&self) -> i32 {
         i32::try_from(self.child.id()).unwrap()
+    }
+
+    /// The exit status, once the process has exited. It is reaped then,
+    /// and cleanup is disarmed: its pid may be another process's from now
+    /// on (review F-62).
+    fn try_wait(&mut self) -> Option<ExitStatus> {
+        let status = self.child.try_wait().unwrap();
+        self.reaped |= status.is_some();
+        status
     }
 
     /// Waits until stream `i` (0 stdout, 1 stderr) holds `pat`.
@@ -592,12 +638,14 @@ impl Proc {
     }
 
     /// Waits up to `limit` for the process and its output. A process that
-    /// does not exit in time is killed and the test fails.
+    /// does not exit in time is killed with everything it started, and the
+    /// test fails. One that exits is reaped here, and nothing is signalled
+    /// after that.
     fn finish(mut self, limit: Duration) -> (ExitStatus, Vec<u8>, Vec<u8>) {
         self.stdin = None;
         let end = Instant::now() + limit;
         let status = loop {
-            if let Some(s) = self.child.try_wait().unwrap() {
+            if let Some(s) = self.try_wait() {
                 break s;
             }
             if Instant::now() > end {
@@ -612,9 +660,7 @@ impl Proc {
         let [out, err] = std::mem::take(&mut *self.cap.streams.lock().unwrap());
         (status, out, err)
     }
-}
 
-impl Proc {
     /// Kills the process and everything it started, as a failed test must
     /// (review T12-5): the runner leads a session and group of its own
     /// (`DETACH`, or `ON_PTY`'s terminal), and without a terminal its
@@ -622,31 +668,122 @@ impl Proc {
     /// running. So every descendant is found first (while it still is
     /// one: an orphan is reparented), then each of their process groups
     /// is killed, then each of them, then the process itself, which is
-    /// reaped.
+    /// reaped last.
+    ///
+    /// Only while the process is not reaped (review F-62): until then its
+    /// pid is still its own, even after it exits, so the tree found from
+    /// it is its tree. Once it is reaped, by [`Proc::finish`] or by an
+    /// earlier call of this, the pid can name another process, and this
+    /// does nothing, so it runs at most once.
     fn kill_all(&mut self) {
+        if self.reaped {
+            return;
+        }
         let root = self.pid();
-        let tree = descendants(root);
-        let own = process_table()
-            .into_iter()
-            .find(|p| p.pid == i32::try_from(std::process::id()).unwrap_or(0))
-            .map_or(0, |p| p.pgid);
+        let table = self.host.table();
+        let tree = descendants(&table, root);
+        let me = i32::try_from(std::process::id()).unwrap_or(0);
+        let own = table.iter().find(|p| p.pid == me).map_or(0, |p| p.pgid);
         let mut groups: Vec<i32> = tree.iter().map(|p| p.pgid).collect();
         groups.sort_unstable();
         groups.dedup();
         for g in groups.into_iter().filter(|g| *g > 1 && *g != own) {
-            let _ = envcloak_sys::signal_group(g, libc::SIGKILL);
+            self.host.kill(Target::Group(g));
         }
         for p in &tree {
-            let _ = envcloak_sys::signal_process(p.pid, libc::SIGKILL);
+            self.host.kill(Target::Process(p.pid));
         }
+        // std signals a child only while it is unreaped.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.reaped = true;
     }
 }
 
 impl Drop for Proc {
     fn drop(&mut self) {
         self.kill_all();
+    }
+}
+
+/// What cleanup sends SIGKILL to: a process group, or one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Group(i32),
+    Process(i32),
+}
+
+/// What the harness's cleanup reads about other processes and does to
+/// them: the live system ([`Live`]), or, in the harness's own tests, a
+/// model that only records what would be sent ([`Model`], review F-62).
+trait Host: Send + Sync {
+    /// Every process's pid, parent and process group.
+    fn table(&self) -> Vec<PsRow>;
+    /// When process `pid` started; `None` when there is no such process.
+    fn start_time(&self, pid: i32) -> Option<StartTime>;
+    /// Sends SIGKILL to `target`.
+    fn kill(&self, target: Target);
+}
+
+/// The live system: `ps`, the kernel's start times, and `kill`.
+struct Live;
+
+impl Host for Live {
+    fn table(&self) -> Vec<PsRow> {
+        process_table()
+    }
+
+    fn start_time(&self, pid: i32) -> Option<StartTime> {
+        envcloak_sys::process_start_time(pid).ok()
+    }
+
+    fn kill(&self, target: Target) {
+        let _ = match target {
+            Target::Group(g) => envcloak_sys::signal_group(g, libc::SIGKILL),
+            Target::Process(p) => envcloak_sys::signal_process(p, libc::SIGKILL),
+        };
+    }
+}
+
+/// A modeled system: the process table and start times a test sets, and a
+/// record of every signal, none of which is sent.
+#[derive(Default)]
+struct Model {
+    table: Mutex<Vec<PsRow>>,
+    started: Mutex<Vec<(i32, StartTime)>>,
+    sent: Mutex<Vec<Target>>,
+}
+
+impl Model {
+    fn set_table(&self, rows: &[PsRow]) {
+        *self.table.lock().unwrap() = rows.to_vec();
+    }
+
+    /// Process `pid` started at `at`, or (`None`) there is no such
+    /// process.
+    fn set_started(&self, pid: i32, at: Option<u64>) {
+        let mut started = self.started.lock().unwrap();
+        started.retain(|(p, _)| *p != pid);
+        started.extend(at.map(|t| (pid, StartTime::from_raw(t))));
+    }
+
+    fn sent(&self) -> Vec<Target> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+impl Host for Model {
+    fn table(&self) -> Vec<PsRow> {
+        self.table.lock().unwrap().clone()
+    }
+
+    fn start_time(&self, pid: i32) -> Option<StartTime> {
+        let started = self.started.lock().unwrap();
+        started.iter().find(|(p, _)| *p == pid).map(|(_, t)| *t)
+    }
+
+    fn kill(&self, target: Target) {
+        self.sent.lock().unwrap().push(target);
     }
 }
 
@@ -678,9 +815,8 @@ fn process_table() -> Vec<PsRow> {
         .collect()
 }
 
-/// `root` and every process below it.
-fn descendants(root: i32) -> Vec<PsRow> {
-    let table = process_table();
+/// `root` and every process below it in `table`.
+fn descendants(table: &[PsRow], root: i32) -> Vec<PsRow> {
     let mut found: Vec<PsRow> = table.iter().copied().filter(|p| p.pid == root).collect();
     let mut i = 0;
     while i < found.len() {
@@ -696,28 +832,65 @@ fn descendants(root: i32) -> Vec<PsRow> {
     found
 }
 
-/// Whether process `pid` still exists, waiting up to `limit` for it to
-/// be gone (a killed orphan is reaped by init in its own time).
-fn gone_within(pid: i32, limit: Duration) -> bool {
-    let end = Instant::now() + limit;
-    loop {
-        if envcloak_sys::signal_process(pid, 0).is_err() {
-            return true;
+/// A process a test started through another one and must not leave
+/// running, known by its pid and its start time (review F-62). Dropped
+/// before the test has seen it gone, it is killed; seen gone, it is
+/// disarmed. It is killed only while its pid still names the process that
+/// started then, never one that took the pid over.
+struct Leftover {
+    pid: i32,
+    /// The process's start time while it is armed; `None` once it has
+    /// been seen gone, or when it was gone already.
+    started: Option<StartTime>,
+    host: Arc<dyn Host>,
+}
+
+impl Leftover {
+    /// Process `pid`, as it is now. One already gone is never killed.
+    fn new(pid: i32, host: Arc<dyn Host>) -> Leftover {
+        let started = host.start_time(pid);
+        Leftover { pid, started, host }
+    }
+
+    /// Process `pid`, if it is in process group `pgid` now. A pid read
+    /// after its process may have ended could already name a process
+    /// started since, which is not in that group.
+    fn in_group(pid: i32, pgid: i32, host: Arc<dyn Host>) -> Leftover {
+        let there = host.table().iter().any(|p| p.pid == pid && p.pgid == pgid);
+        let mut l = Leftover::new(pid, host);
+        if !there {
+            l.started = None;
         }
-        if Instant::now() >= end {
-            return false;
+        l
+    }
+
+    /// Whether the pid still names the process this guards.
+    fn alive(&self) -> bool {
+        self.started.is_some() && self.host.start_time(self.pid) == self.started
+    }
+
+    /// Waits up to `limit` for the process to be gone (a killed orphan is
+    /// reaped by init in its own time). Once it is, the guard is disarmed,
+    /// whatever the pid names later.
+    fn gone_within(&mut self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        loop {
+            if !self.alive() {
+                self.started = None;
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// Kills `pid` on drop: a test's cleanup, whatever its assertions said.
-struct KillOnDrop(Vec<i32>);
-
-impl Drop for KillOnDrop {
+impl Drop for Leftover {
     fn drop(&mut self) {
-        for pid in &self.0 {
-            let _ = envcloak_sys::signal_process(*pid, libc::SIGKILL);
+        if self.alive() {
+            self.host.kill(Target::Process(self.pid));
         }
     }
 }
@@ -1252,12 +1425,7 @@ fn a_lost_reader_closes_the_childs_pipe() {
         cmd.stdin(Stdio::null());
         let mut child = cmd.spawn().unwrap();
         drop(child.stdout.take());
-        let mut p = Proc {
-            stdin: None,
-            cap: Arc::default(),
-            readers: Vec::new(),
-            child,
-        };
+        let mut p = Proc::bare(child);
         let mut err_pipe = p.child.stderr.take().unwrap();
         let reader = std::thread::spawn(move || {
             let mut e = Vec::new();
@@ -1267,7 +1435,7 @@ fn a_lost_reader_closes_the_childs_pipe() {
         let status = {
             let end = Instant::now() + Duration::from_secs(60);
             loop {
-                if let Some(s) = p.child.try_wait().unwrap() {
+                if let Some(s) = p.try_wait() {
                     break s;
                 }
                 assert!(
@@ -1431,17 +1599,19 @@ fn harness_a_dropped_runner_takes_its_childs_group_with_it() {
     };
     let p = Proc::spawn(detached(&home, &setup, &os(&sh(STUBBORN))));
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
-    let runner = p.pid();
+    // Both are running now, so each is known by its start time from here.
+    let live: Arc<dyn Host> = Arc::new(Live);
+    let mut runner = Leftover::new(p.pid(), Arc::clone(&live));
     let child = field(&p.cap.streams.lock().unwrap()[0], "pid");
-    let _cleanup = KillOnDrop(vec![child, runner]);
-    assert_ne!(child, runner);
+    let mut child = Leftover::new(child, live);
+    assert_ne!(child.pid, runner.pid);
     drop(p);
     assert!(
-        gone_within(runner, Duration::from_secs(10)),
+        runner.gone_within(Duration::from_secs(10)),
         "the runner is still running"
     );
     assert!(
-        gone_within(child, Duration::from_secs(10)),
+        child.gone_within(Duration::from_secs(10)),
         "the runner's child is still running after its Proc was dropped"
     );
 }
@@ -1461,20 +1631,181 @@ fn harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session() 
     };
     let started = Instant::now();
     let p = on_pty_within(&home, "sigterm", (1, 2), &setup, &os(&sh(STUBBORN)));
-    let child = field(&p.shown, "pid");
-    let _cleanup = KillOnDrop(vec![child, p.runner]);
+    // On a terminal the child stays in the runner's process group. Its pid
+    // is read after the driver killed that group, so it is taken to be the
+    // child only if it is still in the group: by now the pid could be a
+    // later process's.
+    let mut child = Leftover::in_group(field(&p.shown, "pid"), p.runner, Arc::new(Live));
     assert_eq!(p.end, PtyEnd::NoExit, "{}", lossy(&p.shown));
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );
+    // The driver says `NOEXIT` only after it has killed the group and
+    // reaped the runner, so the runner is gone; its pid, free since then,
+    // is not looked up.
     assert!(
-        gone_within(p.runner, Duration::from_secs(10)),
-        "the runner is still running"
-    );
-    assert!(
-        gone_within(child, Duration::from_secs(10)),
+        child.gone_within(Duration::from_secs(10)),
         "the runner's child is still running after the driver gave up"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The harness's cleanup signals only processes that are still its own
+// (review F-62), checked against a modeled system that records signals and
+// sends none. Each test runs a real short child, since reaping is what
+// frees its pid, and models what the pid names afterwards.
+
+/// A command with no input or output.
+fn quiet(program: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+/// A modeled pid and process group no real process is asked about: the
+/// model never sends a signal.
+const MODELED: i32 = 7_000_001;
+
+/// `finish` reaps the child, so its pid can be handed to another process
+/// at once. Modeled so: after the exit, the table shows an unrelated
+/// process with that pid, leading a group of its own with a child in it.
+/// Neither the drop at the end of `finish` nor anything else signals it.
+fn harness_cleanup_after_a_successful_finish_signals_nothing() {
+    let model = Arc::new(Model::default());
+    let p = Proc::spawn_on(quiet("/bin/sh", &["-c", "exit 0"]), model.clone());
+    let pid = p.pid();
+    model.set_table(&[
+        PsRow {
+            pid,
+            ppid: 1,
+            pgid: pid,
+        },
+        PsRow {
+            pid: MODELED,
+            ppid: pid,
+            pgid: pid,
+        },
+    ]);
+    let (status, _, _) = p.finish(Duration::from_secs(60));
+    assert!(status.success(), "{status:?}");
+    assert_eq!(
+        model.sent(),
+        [],
+        "cleanup signalled what the pid of a reaped child names"
+    );
+}
+
+/// A process still running is cleaned up once, however often cleanup is
+/// asked for: explicitly twice and then by its drop, or by a missed
+/// deadline in `finish` and then by the drop as the panic unwinds.
+fn harness_cleanup_signals_a_live_tree_once() {
+    let me = i32::try_from(std::process::id()).unwrap();
+    let tree = |pid: i32| {
+        [
+            PsRow {
+                pid,
+                ppid: me,
+                pgid: MODELED,
+            },
+            PsRow {
+                pid: MODELED + 1,
+                ppid: pid,
+                pgid: MODELED + 1,
+            },
+        ]
+    };
+    let once = [
+        Target::Group(MODELED),
+        Target::Group(MODELED + 1),
+        Target::Process(MODELED + 1),
+    ];
+
+    let model = Arc::new(Model::default());
+    let mut p = Proc::spawn_on(quiet("/bin/sleep", &["60"]), model.clone());
+    let pid = p.pid();
+    model.set_table(&tree(pid));
+    p.kill_all();
+    let first = model.sent();
+    assert_eq!(first.len(), 4, "{first:?}");
+    assert!(once.iter().all(|t| first.contains(t)), "{first:?}");
+    assert!(first.contains(&Target::Process(pid)), "{first:?}");
+    p.kill_all();
+    drop(p);
+    assert_eq!(model.sent(), first, "cleanup ran again after it reaped");
+
+    let model = Arc::new(Model::default());
+    let p = Proc::spawn_on(quiet("/bin/sleep", &["60"]), model.clone());
+    let pid = p.pid();
+    model.set_table(&tree(pid));
+    let t0 = Instant::now();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        p.finish(Duration::from_millis(300))
+    }));
+    assert!(r.is_err(), "a process running past its limit passed");
+    assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
+    let sent = model.sent();
+    assert_eq!(
+        sent.len(),
+        4,
+        "a missed deadline cleaned up other than once: {sent:?}"
+    );
+    assert!(once.iter().all(|t| sent.contains(t)), "{sent:?}");
+}
+
+/// A `Leftover` is killed only while it is the process it was: not once
+/// the test has seen it gone (whatever the pid names later), not when its
+/// pid names a process started since, and not when it was not in the
+/// group it had to be in. One still running is killed, once.
+fn harness_a_leftover_is_killed_only_while_it_is_the_process_it_was() {
+    let model = Arc::new(Model::default());
+    let host = || -> Arc<dyn Host> { model.clone() };
+    let (seen_gone, reused, still_there, elsewhere, in_group) =
+        (MODELED, MODELED + 1, MODELED + 2, MODELED + 3, MODELED + 4);
+    for (pid, at) in [
+        (seen_gone, 10),
+        (reused, 11),
+        (still_there, 12),
+        (elsewhere, 13),
+        (in_group, 14),
+    ] {
+        model.set_started(pid, Some(at));
+    }
+    model.set_table(&[
+        PsRow {
+            pid: elsewhere,
+            ppid: 1,
+            pgid: elsewhere,
+        },
+        PsRow {
+            pid: in_group,
+            ppid: 1,
+            pgid: MODELED,
+        },
+    ]);
+    {
+        let mut a = Leftover::new(seen_gone, host());
+        model.set_started(seen_gone, None);
+        assert!(a.gone_within(Duration::ZERO));
+        // Seen gone: disarmed, even if the model now shows the same
+        // process again.
+        model.set_started(seen_gone, Some(10));
+
+        let _b = Leftover::new(reused, host());
+        model.set_started(reused, Some(99));
+
+        let mut c = Leftover::new(still_there, host());
+        assert!(!c.gone_within(Duration::from_millis(60)));
+
+        let _d = Leftover::in_group(elsewhere, MODELED, host());
+        let _e = Leftover::in_group(in_group, MODELED, host());
+    }
+    assert_eq!(
+        model.sent(),
+        [Target::Process(in_group), Target::Process(still_there)]
     );
 }
