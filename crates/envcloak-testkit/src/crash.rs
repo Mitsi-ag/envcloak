@@ -67,22 +67,40 @@ pub fn core_dump_dir() -> Option<PathBuf> {
 /// same pid): take a [`CoreFiles`] snapshot before the process starts to
 /// tell.
 pub fn core_files(cwd: &Path, dumps: Option<&Path>, pid: i32) -> Vec<PathBuf> {
+    cores_of(cwd, &pid_dirs(dumps), pid)
+}
+
+/// The directories a kernel writes `core.<pid>` files into: macOS's
+/// `/cores`, and `dumps`.
+fn pid_dirs(dumps: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("/cores")];
+    dirs.extend(dumps.map(Path::to_path_buf));
+    dirs
+}
+
+/// `core` or `core.*` in `cwd`, and `core.<pid>` in each of `dirs`.
+fn cores_of(cwd: &Path, dirs: &[PathBuf], pid: i32) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(cwd)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
-                .filter(|e| {
-                    let name = e.file_name();
-                    let name = name.to_string_lossy();
-                    name == "core" || name.starts_with("core.")
-                })
+                .filter(|e| is_core_name(&e.path()))
                 .map(|e| e.path())
                 .collect()
         })
         .unwrap_or_default();
-    let mut elsewhere = vec![PathBuf::from(format!("/cores/core.{pid}"))];
-    elsewhere.extend(dumps.map(|d| d.join(format!("core.{pid}"))));
-    found.extend(elsewhere.into_iter().filter(|p| p.exists()));
+    found.extend(
+        dirs.iter()
+            .map(|d| d.join(format!("core.{pid}")))
+            .filter(|p| p.exists()),
+    );
     found
+}
+
+/// Whether a file's name is `core` or starts with `core.`.
+fn is_core_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "core" || n.starts_with("core."))
 }
 
 /// What identifies a file's contents at one moment: device, inode, size
@@ -104,28 +122,30 @@ fn stamp(path: &Path) -> Option<Stamp> {
 #[derive(Debug)]
 pub struct CoreFiles {
     cwd: PathBuf,
-    dumps: Option<PathBuf>,
+    /// Where `core.<pid>` files are looked for (see [`pid_dirs`]).
+    dirs: Vec<PathBuf>,
     before: Vec<(PathBuf, Stamp)>,
 }
 
 impl CoreFiles {
     pub fn before(cwd: &Path, dumps: Option<&Path>) -> Self {
-        let mut dirs = vec![cwd.to_path_buf(), PathBuf::from("/cores")];
-        dirs.extend(dumps.map(Path::to_path_buf));
-        let before = dirs
-            .iter()
+        Self::before_in(cwd, pid_dirs(dumps))
+    }
+
+    /// [`CoreFiles::before`], with `core.<pid>` files looked for in `dirs`
+    /// alone. The unit tests pass directories of their own, so what the
+    /// host's `/cores` holds is not counted (review finding F-63).
+    fn before_in(cwd: &Path, dirs: Vec<PathBuf>) -> Self {
+        let before = std::iter::once(cwd)
+            .chain(dirs.iter().map(PathBuf::as_path))
             .filter_map(|d| std::fs::read_dir(d).ok())
             .flat_map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == "core" || n.starts_with("core."))
-            })
+            .filter(|p| is_core_name(p))
             .filter_map(|p| stamp(&p).map(|s| (p, s)))
             .collect();
         CoreFiles {
             cwd: cwd.to_path_buf(),
-            dumps: dumps.map(Path::to_path_buf),
+            dirs,
             before,
         }
     }
@@ -133,7 +153,7 @@ impl CoreFiles {
     /// The files a crash of `pid` could have left ([`core_files`]) that
     /// are new or changed since the snapshot.
     pub fn left(&self, pid: i32) -> Vec<PathBuf> {
-        core_files(&self.cwd, self.dumps.as_deref(), pid)
+        cores_of(&self.cwd, &self.dirs, pid)
             .into_iter()
             .filter(|p| {
                 let now = stamp(p);
@@ -310,17 +330,33 @@ mod tests {
     use crate::home::TestHome;
 
     /// Review finding F-60: a `core.<pid>` an earlier process with the same
-    /// pid left is not this crash's; one written over, or new, is.
+    /// pid left is not this crash's; one written over, or new, is. The
+    /// snapshot looks only in the test's own directories (review finding
+    /// F-63: a Mac keeps old cores in `/cores`), one of which stands in for
+    /// `/cores` and already holds cores of other processes.
     #[test]
     fn core_files_left_counts_only_files_made_or_changed_since() {
         let home = TestHome::new();
         let cwd = home.home();
-        let dumps = home.root().join("tmp");
+        let tmp = home.root().join("tmp");
+        let (dumps, cores_dir) = (tmp.join("dumps"), tmp.join("cores"));
+        for d in [&dumps, &cores_dir] {
+            std::fs::create_dir(d).unwrap();
+        }
         let pid = 4242;
         let stale = dumps.join(format!("core.{pid}"));
         std::fs::write(&stale, b"an older process's core").unwrap();
-        let cores = CoreFiles::before(&cwd, Some(&dumps));
-        assert_eq!(cores.stale(), 1);
+        let unrelated = [
+            cores_dir.join("core"),
+            cores_dir.join("core.4343"),
+            cores_dir.join(format!("core.{pid}")),
+        ];
+        for u in &unrelated {
+            std::fs::write(u, b"another process's core").unwrap();
+        }
+        std::fs::write(cores_dir.join("not-a-core"), b"z").unwrap();
+        let cores = CoreFiles::before_in(&cwd, vec![cores_dir.clone(), dumps.clone()]);
+        assert_eq!(cores.stale(), 1 + unrelated.len(), "{cores:?}");
         assert!(cores.left(pid).is_empty(), "{:?}", cores.left(pid));
 
         // Written over by the crash: counted, like a new file.
@@ -328,10 +364,18 @@ mod tests {
         std::fs::write(cwd.join("core"), b"x").unwrap();
         let mut left = cores.left(pid);
         left.sort();
-        assert_eq!(left, [cwd.join("core"), stale]);
+        assert_eq!(left, [cwd.join("core"), stale.clone()]);
         // Another pid's file is not this crash's.
         std::fs::write(dumps.join("core.4343"), b"y").unwrap();
         assert_eq!(cores.left(pid).len(), 2);
+        // Nor is one in the stand-in for /cores that nothing changed.
+        std::fs::write(cores_dir.join("core.4343"), b"another crash").unwrap();
+        assert_eq!(cores.left(pid).len(), 2);
+        // One of this pid's written over there is.
+        std::fs::write(&unrelated[2], b"this crash's core, written over").unwrap();
+        let mut left = cores.left(pid);
+        left.sort();
+        assert_eq!(left, [cwd.join("core"), unrelated[2].clone(), stale]);
     }
 
     /// A first start that never ends fails its own step, named, within its
