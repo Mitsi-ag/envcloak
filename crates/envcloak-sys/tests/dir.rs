@@ -12,8 +12,9 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::process::{Command, Stdio};
 
 use envcloak_sys::{
-    DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, exchange_beneath, link_beneath,
-    list_dir, open_dir_beneath, open_elsewhere, rename_beneath, unlink_beneath, volume_of,
+    DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, exchange_beneath, kind_beneath,
+    link_beneath, list_dir, open_dir_beneath, open_elsewhere, read_link_beneath, rename_beneath,
+    unlink_beneath, volume_of,
 };
 
 fn names(dir: &File) -> Vec<(OsString, DirEntryKind)> {
@@ -94,6 +95,91 @@ fn open_dir_beneath_never_follows_a_symlink() {
         let e = open_dir_beneath(&dir, OsStr::new(name)).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput, "{name:?}");
     }
+}
+
+#[test]
+fn kind_and_link_target_beneath_never_follow_a_symlink() {
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let p = tmp.path();
+    std::fs::create_dir(p.join("sub")).unwrap();
+    std::fs::write(p.join("file"), b"").unwrap();
+    symlink("sub", p.join("dirlink")).unwrap();
+    symlink("file", p.join("filelink")).unwrap();
+    symlink("/nowhere/at/all", p.join("dangling")).unwrap();
+    symlink("loop", p.join("loop")).unwrap();
+    // A target longer than the first buffer, with a multi-byte character
+    // across its boundary.
+    let long: String = "é".repeat(500);
+    symlink(&long, p.join("long")).unwrap();
+    let fifo = p.join("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let dir = File::open(p).unwrap();
+    for (name, kind) in [
+        ("sub", DirEntryKind::Dir),
+        ("file", DirEntryKind::File),
+        ("dirlink", DirEntryKind::Symlink),
+        ("filelink", DirEntryKind::Symlink),
+        ("dangling", DirEntryKind::Symlink),
+        ("loop", DirEntryKind::Symlink),
+        ("fifo", DirEntryKind::Other),
+    ] {
+        assert_eq!(
+            kind_beneath(&dir, OsStr::new(name)).unwrap(),
+            kind,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        kind_beneath(&dir, OsStr::new("missing"))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+    for (name, target) in [
+        ("dirlink", "sub"),
+        ("dangling", "/nowhere/at/all"),
+        ("loop", "loop"),
+        ("long", long.as_str()),
+    ] {
+        assert_eq!(
+            read_link_beneath(&dir, OsStr::new(name)).unwrap(),
+            OsStr::new(target),
+            "{name}"
+        );
+    }
+    // Not a symlink: refused, not read through.
+    for name in ["file", "sub", "fifo"] {
+        let e = read_link_beneath(&dir, OsStr::new(name)).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "{name}: {e}");
+    }
+    for name in ["", ".", "..", "sub/x", "a\0b"] {
+        for e in [
+            kind_beneath(&dir, OsStr::new(name)).unwrap_err(),
+            read_link_beneath(&dir, OsStr::new(name)).unwrap_err(),
+        ] {
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{name:?}");
+        }
+    }
+    // Relative to the handle: after the directory moves, the names are
+    // still read in it, and its old path now leads nowhere.
+    let moved = tempfile::tempdir_in("/tmp").unwrap();
+    let new_home = moved.path().join("here");
+    std::fs::rename(p, &new_home).unwrap();
+    std::fs::create_dir(p).unwrap();
+    assert_eq!(
+        read_link_beneath(&dir, OsStr::new("dirlink")).unwrap(),
+        OsStr::new("sub")
+    );
+    assert_eq!(
+        kind_beneath(&dir, OsStr::new("sub")).unwrap(),
+        DirEntryKind::Dir
+    );
 }
 
 #[test]

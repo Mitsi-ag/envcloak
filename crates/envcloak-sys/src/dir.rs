@@ -6,7 +6,8 @@
 //! can be swapped before a name in it is used. Every function here works
 //! on one name inside a directory the caller already holds open
 //! ([`crate::open_beneath`] opens a file there): [`list_dir`] reads its
-//! entries, [`open_dir_beneath`] opens a subdirectory, and
+//! entries, [`kind_beneath`] says what one is, [`read_link_beneath`] reads
+//! a symlink's target, [`open_dir_beneath`] opens a subdirectory, and
 //! [`create_beneath`], [`link_beneath`], [`rename_beneath`],
 //! [`exchange_beneath`] and [`unlink_beneath`] make, link, move, swap and
 //! remove names in it. None of
@@ -101,6 +102,69 @@ pub fn open_dir_beneath(dir: &File, name: &OsStr) -> io::Result<File> {
     // NUL-terminated string that outlives it.
     let fd = retry(|| unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })?;
     owned(fd)
+}
+
+/// What `name` in `dir` is now, from `fstatat(2)` with
+/// `AT_SYMLINK_NOFOLLOW`: a symlink is [`DirEntryKind::Symlink`], never
+/// what it points at. For an entry [`list_dir`] reported as
+/// [`DirEntryKind::Unknown`]. It can change before it is opened, so
+/// callers still check what they open.
+pub fn kind_beneath(dir: &File, name: &OsStr) -> io::Result<DirEntryKind> {
+    let c = component(name)?;
+    // SAFETY: stat is plain data, for which all zeros is a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` keeps its descriptor open for the call, `c` is a
+    // NUL-terminated string that outlives it, and `st` is a writable stat.
+    retry(|| unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    })?;
+    Ok(match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG => DirEntryKind::File,
+        libc::S_IFDIR => DirEntryKind::Dir,
+        libc::S_IFLNK => DirEntryKind::Symlink,
+        _ => DirEntryKind::Other,
+    })
+}
+
+/// The longest symlink target [`read_link_beneath`] reads.
+const MAX_LINK: usize = 1 << 16;
+
+/// The target of the symlink `name` in `dir`, with `readlinkat(2)`: the
+/// link itself is read, never followed. Fails with `EINVAL` when `name`
+/// is not a symlink, and with [`io::ErrorKind::InvalidData`] when the
+/// target is longer than 64 KiB.
+pub fn read_link_beneath(dir: &File, name: &OsStr) -> io::Result<OsString> {
+    let c = component(name)?;
+    let mut cap = 256;
+    loop {
+        let mut buf = vec![0u8; cap];
+        // SAFETY: `dir` keeps its descriptor open for the call, `c` is
+        // NUL-terminated and outlives it, and `buf` is `cap` writable,
+        // initialized bytes, of which readlinkat writes at most `cap`.
+        let n =
+            unsafe { libc::readlinkat(dir.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), cap) };
+        let Ok(n) = usize::try_from(n) else {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        };
+        // A target that fills the buffer may have been cut short.
+        if n < cap {
+            buf.truncate(n);
+            return Ok(OsString::from_vec(buf));
+        }
+        if cap >= MAX_LINK {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        cap *= 4;
+    }
 }
 
 /// Creates `name` in `dir` and opens it for writing, with `O_CREAT |

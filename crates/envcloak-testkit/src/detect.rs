@@ -1,14 +1,20 @@
 //! Finding canaries and their encodings in bytes, files and directories.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
+use envcloak_sys::{
+    DirEntryKind, MAX_DIR_ENTRIES, kind_beneath, list_dir, open_beneath, open_dir_beneath,
+    read_link_beneath,
+};
 
 use crate::canary::Canary;
 use crate::encode::{self, PERCENT_STYLES};
@@ -371,20 +377,27 @@ pub fn assert_no_canary(haystack: &[u8], cs: &[Canary]) {
 /// Bytes [`sweep_dir`] reads from a file at a time.
 const SWEEP_CHUNK: usize = 64 * 1024;
 
-/// Opens `path` for reading only if it is a regular file: without
-/// following a symlink in its last component, without blocking on a FIFO,
-/// and with the type checked again on the open descriptor, so an entry
-/// replaced after the sweep looked at it is refused rather than followed
-/// or waited on.
-fn open_regular(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+/// `file`, if it is a regular file: its type is checked on the open
+/// descriptor, so an entry replaced after the sweep looked at it is
+/// refused rather than read.
+fn regular(file: File) -> io::Result<File> {
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("no longer a regular file"));
     }
     Ok(file)
+}
+
+/// Opens `path` for reading only if it is a regular file: without
+/// following a symlink in its last component and without blocking on a
+/// FIFO. For the sweep root only; below it, entries are opened relative
+/// to their directory's descriptor.
+fn open_regular(path: &Path) -> io::Result<File> {
+    regular(
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(path)?,
+    )
 }
 
 /// Every canary occurrence in the regular file at `path`, read in
@@ -394,121 +407,229 @@ fn scan_file(detector: &Detector, path: &Path) -> io::Result<Vec<Found>> {
     detector.find_streaming(&mut file, SWEEP_CHUNK)
 }
 
-/// Whether `path` is still the directory `before` described: same device
-/// and inode, not replaced by a symlink or anything else.
-fn same_dir(path: &Path, before: &std::fs::Metadata) -> bool {
-    std::fs::symlink_metadata(path)
-        .is_ok_and(|now| now.is_dir() && now.dev() == before.dev() && now.ino() == before.ino())
+/// An entry the sweep will look at: its name in the directory `parent`,
+/// held open, and its path for reports.
+struct Queued {
+    parent: Rc<File>,
+    name: OsString,
+    kind: DirEntryKind,
+    path: PathBuf,
+}
+
+/// What opening the sweep root found.
+enum Root {
+    Dir(File),
+    /// Not a directory (a symlink, a file or something else), or gone: it
+    /// is looked at by path, as the one entry of the sweep.
+    Other,
+}
+
+/// Opens `root` as a directory without following a symlink in its last
+/// component (the caller chose its path; the components above it are the
+/// caller's).
+fn open_root(root: &Path) -> io::Result<Root> {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+    {
+        Ok(dir) => Ok(Root::Dir(dir)),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => Ok(Root::Other),
+        Err(e) => Err(e),
+    }
 }
 
 /// Scans everything under `dir` for canaries: the contents of every regular
 /// file, the path of every entry below `dir` (so a canary in a name, or
 /// spread over nested names, is found), and the target of every symlink.
 /// Symlinks are not followed, and the contents of FIFOs, sockets and
-/// devices are not read, so a sweep never hangs or leaves the tree. That
-/// holds for entries that change while the sweep runs, as a daemon still
-/// writing might make them: a file is opened without following a symlink
-/// or blocking and must still be a regular file once open, and a directory
-/// counts only if it is the same directory after it was listed. Anything
-/// that fails those checks, or cannot be read, is reported as
-/// [`Hit::Unreadable`]. Files are read in fixed-size pieces, so a large
-/// file costs no more memory than a small one. Hits print without values;
-/// [`assert_sweep_clean`] panics with them.
+/// devices are not read, so a sweep never hangs or leaves the tree.
+///
+/// That holds for a tree that changes while the sweep runs, as a daemon
+/// still writing might change it. The sweep opens `dir` once, without
+/// following a symlink in its place, and from then on works through
+/// descriptors, never through paths: it lists each directory through its
+/// own descriptor, and opens each entry relative to its directory's
+/// descriptor without following a symlink or blocking (review finding
+/// F-19). So when `dir`, or any directory below it, is renamed or replaced
+/// by a symlink midway, what the sweep reads is still the tree it opened,
+/// and a symlink put where it had seen a file or directory is refused. A
+/// file must still be a regular file once open. Anything that fails those
+/// checks, or cannot be read, is reported as [`Hit::Unreadable`]. Files
+/// are read in fixed-size pieces, so a large file costs no more memory
+/// than a small one. Hits print without values; [`assert_sweep_clean`]
+/// panics with them.
 pub fn sweep_dir(dir: &Path, cs: &[Canary]) -> Vec<Hit> {
+    sweep(dir, cs, &mut |_| {})
+}
+
+/// [`sweep_dir`], calling `before` with each entry's path just before the
+/// entry is opened: the tests change the tree there.
+fn sweep(dir: &Path, cs: &[Canary], before: &mut dyn FnMut(&Path)) -> Vec<Hit> {
     let detector = Detector::new(cs);
     let shown = |p: &Path| detector.swept_path(dir, p);
     let mut hits = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(path) = stack.pop() {
+    let unreadable = |hits: &mut Vec<Hit>, p: &Path, e: &io::Error| {
+        hits.push(Hit::Unreadable {
+            path: shown(p),
+            kind: e.kind(),
+        });
+    };
+    let root = match open_root(dir) {
+        Ok(Root::Dir(d)) => d,
+        Ok(Root::Other) => {
+            sweep_root_entry(&detector, dir, &mut hits);
+            return hits;
+        }
+        Err(e) => {
+            unreadable(&mut hits, dir, &e);
+            return hits;
+        }
+    };
+    let mut stack: Vec<Queued> = Vec::new();
+    queue_children(root, dir, &mut stack, &mut hits, &shown);
+    while let Some(q) = stack.pop() {
         // The root's own name was chosen by the caller. Below it, each
         // occurrence is reported once, at the deepest entry it reaches.
-        if let (Ok(rel), Some(name)) = (path.strip_prefix(dir), path.file_name())
-            && path != dir
-        {
+        if let Ok(rel) = q.path.strip_prefix(dir) {
             let rel = rel.as_os_str().as_bytes();
-            let name_start = rel.len().saturating_sub(name.as_bytes().len());
+            let name_start = rel.len().saturating_sub(q.name.as_bytes().len());
             for (found, end) in detector.find_ending(rel) {
                 if end > name_start {
                     hits.push(Hit::Name {
-                        path: shown(&path),
+                        path: shown(&q.path),
                         found,
                     });
                 }
             }
         }
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(e) => {
-                hits.push(Hit::Unreadable {
-                    path: shown(&path),
-                    kind: e.kind(),
-                });
-                continue;
-            }
+        before(&q.path);
+        let kind = match q.kind {
+            DirEntryKind::Unknown => match kind_beneath(&q.parent, &q.name) {
+                Ok(k) => k,
+                Err(e) => {
+                    unreadable(&mut hits, &q.path, &e);
+                    continue;
+                }
+            },
+            k => k,
         };
-        if meta.is_dir() {
-            match std::fs::read_dir(&path) {
-                Ok(entries) => {
-                    let mut children = Vec::new();
-                    for entry in entries {
-                        match entry {
-                            Ok(e) => children.push(e.path()),
-                            Err(e) => hits.push(Hit::Unreadable {
-                                path: shown(&path),
-                                kind: e.kind(),
-                            }),
+        match kind {
+            DirEntryKind::Dir => match open_dir_beneath(&q.parent, &q.name) {
+                Ok(sub) => queue_children(sub, &q.path, &mut stack, &mut hits, &shown),
+                Err(e) => unreadable(&mut hits, &q.path, &e),
+            },
+            DirEntryKind::Symlink => match read_link_beneath(&q.parent, &q.name) {
+                Ok(target) => {
+                    for found in detector.find(target.as_bytes()) {
+                        hits.push(Hit::LinkTarget {
+                            path: shown(&q.path),
+                            found,
+                        });
+                    }
+                }
+                Err(e) => unreadable(&mut hits, &q.path, &e),
+            },
+            DirEntryKind::File => {
+                let found = open_beneath(&q.parent, &q.name)
+                    .and_then(regular)
+                    .and_then(|mut f| detector.find_streaming(&mut f, SWEEP_CHUNK));
+                match found {
+                    Ok(found) => {
+                        for found in found {
+                            hits.push(Hit::Canary {
+                                path: shown(&q.path),
+                                found,
+                            });
                         }
                     }
-                    // Listed through a symlink swapped in after the check
-                    // above: the names are not this tree's.
-                    if !same_dir(&path, &meta) {
-                        hits.push(Hit::Unreadable {
-                            path: shown(&path),
-                            kind: io::ErrorKind::Other,
-                        });
-                        continue;
-                    }
-                    children.sort();
-                    stack.extend(children.into_iter().rev());
+                    Err(e) => unreadable(&mut hits, &q.path, &e),
                 }
-                Err(e) => hits.push(Hit::Unreadable {
-                    path: shown(&path),
-                    kind: e.kind(),
-                }),
             }
-        } else if meta.file_type().is_symlink() {
-            match std::fs::read_link(&path) {
-                Ok(target) => {
-                    for found in detector.find(target.as_os_str().as_bytes()) {
-                        hits.push(Hit::LinkTarget {
-                            path: shown(&path),
-                            found,
-                        });
-                    }
-                }
-                Err(e) => hits.push(Hit::Unreadable {
-                    path: shown(&path),
-                    kind: e.kind(),
-                }),
-            }
-        } else if meta.is_file() {
-            match scan_file(&detector, &path) {
-                Ok(found) => {
-                    for found in found {
-                        hits.push(Hit::Canary {
-                            path: shown(&path),
-                            found,
-                        });
-                    }
-                }
-                Err(e) => hits.push(Hit::Unreadable {
-                    path: shown(&path),
-                    kind: e.kind(),
-                }),
-            }
+            DirEntryKind::Other | DirEntryKind::Unknown => {}
         }
     }
     hits
+}
+
+/// Lists `dir` through its descriptor and queues its entries, in name
+/// order, above everything already queued. The entries share the
+/// descriptor, which stays open until the last of them is looked at.
+fn queue_children(
+    dir: File,
+    path: &Path,
+    stack: &mut Vec<Queued>,
+    hits: &mut Vec<Hit>,
+    shown: &dyn Fn(&Path) -> SweptPath,
+) {
+    let mut entries = match list_dir(&dir, MAX_DIR_ENTRIES) {
+        Ok(e) => e,
+        Err(e) => {
+            hits.push(Hit::Unreadable {
+                path: shown(path),
+                kind: e.kind(),
+            });
+            return;
+        }
+    };
+    let parent = Rc::new(dir);
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    // Popped from the end: in name order.
+    for e in entries.into_iter().rev() {
+        stack.push(Queued {
+            parent: Rc::clone(&parent),
+            path: path.join(&e.name),
+            name: e.name,
+            kind: e.kind,
+        });
+    }
+}
+
+/// The sweep root when it is not a directory: a symlink's target, a
+/// regular file's contents, nothing for anything else.
+fn sweep_root_entry(detector: &Detector, root: &Path, hits: &mut Vec<Hit>) {
+    let shown = |p: &Path| detector.swept_path(root, p);
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(m) => m,
+        Err(e) => {
+            hits.push(Hit::Unreadable {
+                path: shown(root),
+                kind: e.kind(),
+            });
+            return;
+        }
+    };
+    let found = if meta.file_type().is_symlink() {
+        std::fs::read_link(root).map(|target| {
+            detector
+                .find(target.as_os_str().as_bytes())
+                .into_iter()
+                .map(|found| Hit::LinkTarget {
+                    path: shown(root),
+                    found,
+                })
+                .collect()
+        })
+    } else if meta.is_file() {
+        scan_file(detector, root).map(|found| {
+            found
+                .into_iter()
+                .map(|found| Hit::Canary {
+                    path: shown(root),
+                    found,
+                })
+                .collect()
+        })
+    } else {
+        Ok(Vec::new())
+    };
+    match found {
+        Ok(found) => hits.extend(found),
+        Err(e) => hits.push(Hit::Unreadable {
+            path: shown(root),
+            kind: e.kind(),
+        }),
+    }
 }
 
 /// Panics if [`sweep_dir`] finds anything under `dir`. The message lists
@@ -541,8 +662,10 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{Detector, Found, encodings, same_dir, scan_file};
-    use crate::canary::{canaries, fresh_seed};
+    use std::path::Path;
+
+    use super::{Detector, Found, Hit, encodings, scan_file, sweep};
+    use crate::canary::{by_label, canaries, fresh_seed, labels};
     use crate::home::TestHome;
 
     /// Hands out at most `step` bytes per read, and fails every third read
@@ -649,30 +772,142 @@ mod tests {
         );
     }
 
+    /// Where the sweep and the tree meet in the F-19 regressions: a tree
+    /// holding one canary in its later file, a separate tree outside it
+    /// holding another under the same name, and which of the two a sweep
+    /// found.
+    struct Swap {
+        cs: Vec<crate::canary::Canary>,
+        home: TestHome,
+        outside: TestHome,
+    }
+
+    impl Swap {
+        fn new() -> Swap {
+            let cs = canaries(fresh_seed());
+            let (home, outside) = (TestHome::new(), TestHome::new());
+            std::fs::write(
+                outside.home().join("later.txt"),
+                by_label(&cs, labels::GITHUB_TOKEN).value(),
+            )
+            .unwrap();
+            Swap { cs, home, outside }
+        }
+
+        /// Fills `dir` (under the sweep root) with a clean first file and a
+        /// later one holding the inside canary.
+        fn fill(&self, dir: &Path) {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("first.txt"), b"nothing here").unwrap();
+            std::fs::write(
+                dir.join("later.txt"),
+                by_label(&self.cs, labels::STRIPE_SECRET_KEY).value(),
+            )
+            .unwrap();
+        }
+
+        /// Renames `dir` aside and puts a symlink to the outside tree in its
+        /// place.
+        fn replace_with_link(&self, dir: &Path) {
+            let mut aside = dir.as_os_str().to_owned();
+            aside.push(".moved");
+            std::fs::rename(dir, &aside).unwrap();
+            std::os::unix::fs::symlink(self.outside.home(), dir).unwrap();
+        }
+
+        /// The labels of the canaries found in file contents.
+        fn contents(hits: &[Hit]) -> Vec<String> {
+            let mut v: Vec<String> = hits
+                .iter()
+                .filter_map(|h| match h {
+                    Hit::Canary { found, .. } => Some(found.label.clone()),
+                    _ => None,
+                })
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+    }
+
+    /// Review finding F-19 (Codex's regression): a directory below the
+    /// root is listed, and before its later child is opened it is renamed
+    /// and replaced by a symlink to another tree. The child is still read
+    /// in the directory the sweep listed, never through the new symlink.
     #[test]
-    fn a_directory_counts_only_while_it_is_the_same_directory() {
-        let home = TestHome::new();
-        let dir = home.home().join("d");
-        let moved = home.home().join("moved");
-        std::fs::create_dir(&dir).unwrap();
-        let before = std::fs::symlink_metadata(&dir).unwrap();
-        assert!(same_dir(&dir, &before));
+    fn queued_child_does_not_follow_replaced_ancestor() {
+        let s = Swap::new();
+        let root = s.home.home();
+        let sub = root.join("sub");
+        s.fill(&sub);
+        let later = sub.join("later.txt");
+        let mut swapped = false;
+        let hits = sweep(&root, &s.cs, &mut |p| {
+            if p == later && !swapped {
+                s.replace_with_link(&sub);
+                swapped = true;
+            }
+        });
+        assert!(swapped, "the sweep never reached the later file");
+        assert_eq!(
+            Swap::contents(&hits),
+            [labels::STRIPE_SECRET_KEY],
+            "{hits:?}"
+        );
+        assert_eq!(hits.len(), found_count(&hits), "{hits:?}");
+    }
 
-        // Moved away and replaced by a symlink to it: listing `dir` would
-        // follow the link.
-        std::fs::rename(&dir, &moved).unwrap();
-        std::os::unix::fs::symlink(&moved, &dir).unwrap();
-        assert!(!same_dir(&dir, &before));
+    /// The same with the sweep root itself swapped for a symlink after the
+    /// sweep opened it.
+    #[test]
+    fn queued_child_does_not_follow_a_replaced_root() {
+        let s = Swap::new();
+        let root = s.home.home();
+        s.fill(&root);
+        let later = root.join("later.txt");
+        let mut swapped = false;
+        let hits = sweep(&root, &s.cs, &mut |p| {
+            if p == later && !swapped {
+                s.replace_with_link(&root);
+                swapped = true;
+            }
+        });
+        assert!(swapped, "the sweep never reached the later file");
+        assert_eq!(
+            Swap::contents(&hits),
+            [labels::STRIPE_SECRET_KEY],
+            "{hits:?}"
+        );
+        assert_eq!(hits.len(), found_count(&hits), "{hits:?}");
+    }
 
-        // Replaced by another directory. The original still exists, so its
-        // inode cannot be handed out again.
-        std::fs::remove_file(&dir).unwrap();
-        std::fs::create_dir(&dir).unwrap();
-        assert!(!same_dir(&dir, &before));
+    /// A directory replaced by a symlink after its parent was listed and
+    /// before it is opened is refused, not listed through the link.
+    #[test]
+    fn a_directory_swapped_for_a_symlink_before_it_is_opened_is_refused() {
+        let s = Swap::new();
+        let root = s.home.home();
+        let sub = root.join("sub");
+        s.fill(&sub);
+        let mut swapped = false;
+        let hits = sweep(&root, &s.cs, &mut |p| {
+            if p == sub && !swapped {
+                s.replace_with_link(&sub);
+                swapped = true;
+            }
+        });
+        assert!(swapped, "the sweep never reached the directory");
+        assert!(Swap::contents(&hits).is_empty(), "{hits:?}");
+        assert!(
+            matches!(hits.as_slice(), [Hit::Unreadable { path, .. }] if path == &sub),
+            "{hits:?}"
+        );
+    }
 
-        // The original, back in place, is the same directory.
-        std::fs::remove_dir(&dir).unwrap();
-        std::fs::rename(&moved, &dir).unwrap();
-        assert!(same_dir(&dir, &before));
+    /// The number of hits that are canary finds.
+    fn found_count(hits: &[Hit]) -> usize {
+        hits.iter()
+            .filter(|h| matches!(h, Hit::Canary { .. }))
+            .count()
     }
 }

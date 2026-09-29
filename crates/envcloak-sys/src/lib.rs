@@ -70,7 +70,8 @@ pub use child::{SignalRelay, signal_group, signal_process, wait_for_exit};
 pub use clock::{awake_time, time_including_sleep};
 pub use dir::{
     DirEntryKind, DirEntryName, MAX_DIR_ENTRIES, Volume, create_beneath, exchange_beneath,
-    link_beneath, list_dir, open_dir_beneath, rename_beneath, unlink_beneath, volume_of,
+    kind_beneath, link_beneath, list_dir, open_dir_beneath, read_link_beneath, rename_beneath,
+    unlink_beneath, volume_of,
 };
 pub use fd::{cloexec_flag, inherited_fd};
 pub use fs::open_beneath;
