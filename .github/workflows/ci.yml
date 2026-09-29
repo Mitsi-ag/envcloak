@@ -85,23 +85,38 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
       # Gate 8 feeds the output of real serializers through the runner
-      # (crates/envcloak-exec/tests/runner.rs). Node and Go (set up here:
-      # the macOS image has none) and, on Linux, the image's PHP are
-      # required, so a missing one fails the gate instead of narrowing it.
+      # (crates/envcloak-exec/tests/runner.rs) and, in the fixture story,
+      # through the whole of `envcloak run` (crates/envcloak-e2e): Python,
+      # Node, Go, .NET and PHP are set up on both systems and required, so
+      # a missing one fails the gate instead of narrowing it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           cache: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: none
+          tools: none
       - name: Serializers gate 8 requires
         run: |
+          python3 --version
           node --version
           go version
-          if [ "$RUNNER_OS" = Linux ]; then
-            php --version
-            echo "ENVCLOAK_TEST_REQUIRE_SERIALIZERS=node,go,php" >> "$GITHUB_ENV"
-          else
-            echo "ENVCLOAK_TEST_REQUIRE_SERIALIZERS=node,go" >> "$GITHUB_ENV"
-          fi
+          dotnet --version
+          php --version
+          echo "ENVCLOAK_TEST_REQUIRE_SERIALIZERS=node,go,php" >> "$GITHUB_ENV"
+          echo "ENVCLOAK_TEST_REQUIRE_EMITTERS=python,node,go,dotnet,php,serde" >> "$GITHUB_ENV"
+          echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - name: Unsafe-code and secret-exposure boundaries
         run: |
@@ -117,7 +132,80 @@ jobs:
         run: scripts/check-expose-lint.sh
       - name: unsafe_code forbid canary
         run: scripts/check-unsafe-lint.sh
-      - run: cargo test --workspace --locked --no-fail-fast
+      # Gate 12: the whole suite at RUST_LOG=trace with full backtraces;
+      # TestHome passes both on to every process the tests start, and every
+      # test sweeps what it captured. crates/envcloak-e2e adds injected
+      # panics and malformed inputs holding fixtures, and the fixture story.
+      - name: cargo test --workspace (RUST_LOG=trace)
+        env:
+          RUST_LOG: trace
+          RUST_BACKTRACE: full
+        run: cargo test --workspace --locked --no-fail-fast
+
+  # The shipped binaries as `cargo build --release` makes them: panic =
+  # "abort" and no core file (gate 19), no test hook, a truthful `status`,
+  # and the fixture story and gate 12 run on them
+  # (crates/envcloak-e2e/tests/release.rs).
+  release:
+    name: release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Route core dumps to a known directory (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p /tmp/eccores
+          sudo sysctl -w kernel.core_pattern=/tmp/eccores/core.%p
+          echo "ENVCLOAK_TEST_CORE_DIR=/tmp/eccores" >> "$GITHUB_ENV"
+      - name: Route core dumps to a known directory (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo mkdir -p /cores
+          sudo chmod 1777 /cores
+          sudo sysctl -w kern.coredump=1
+          sudo sysctl -w kern.corefile=/cores/core.%P
+          echo "ENVCLOAK_TEST_CORE_DIR=/cores" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: none
+          tools: none
+      - name: Build the release binaries and the test build's controls
+        run: |
+          cargo build --release --locked
+          cargo build --locked -p envcloak -p envcloakd -p envcloak-testkit --bins
+      - name: Release checks, gate 12 and the fixture story on the release binaries
+        env:
+          RUST_LOG: trace
+          RUST_BACKTRACE: full
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+          ENVCLOAK_TEST_REQUIRE_EMITTERS: python,node,go,dotnet,php,serde
+          ENVCLOAK_TEST_REQUIRE_RELEASE: "1"
+        run: |
+          export ENVCLOAK_TEST_RELEASE_DIR="$PWD/target/release"
+          export ENVCLOAK_E2E_BIN_DIR="$PWD/target/release"
+          cargo test --locked -p envcloak-e2e --no-fail-fast
 
   deny:
     runs-on: ubuntu-latest
