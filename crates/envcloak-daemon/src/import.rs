@@ -129,9 +129,9 @@ pub const SECRET_WORDS: [&str; 21] = [
     "SESSION",
     "DSN",
 ];
-/// Values shorter than this that no provider's key pattern matches are
-/// short enough to guess (SPEC §6.5): compared with the vault only for a
-/// person.
+/// Values of fewer characters than this that no provider's key pattern
+/// matches are short enough to guess (SPEC §6.4, §6.5): compared with the
+/// vault only for a person.
 pub const GUESSABLE_BELOW: usize = 16;
 /// Values one subject root may have compared with the vault within
 /// [`CHECK_WINDOW`]: an `import --scan` of the largest request (plan,
@@ -139,8 +139,8 @@ pub const GUESSABLE_BELOW: usize = 16;
 pub const MAX_VALUE_CHECKS: usize = 100_000;
 /// The window [`MAX_VALUE_CHECKS`] counts in, in awake time.
 pub const CHECK_WINDOW: Duration = Duration::from_secs(3600);
-/// Subject roots counted at once; a new root beyond it is refused until a
-/// window ends.
+/// Subject roots counted at once; a new root beyond it takes the place of
+/// the one whose window started first.
 pub const MAX_CHECKING_ROOTS: usize = 4096;
 /// The project part of new items' slugs when the project's name is shaped
 /// like a key.
@@ -161,9 +161,16 @@ fn secret_name(name: &str) -> bool {
 }
 
 /// Whether `value` is short enough to guess: under [`GUESSABLE_BELOW`]
-/// bytes, and no provider's key pattern matches it.
+/// characters, and no provider's key pattern matches it. UTF-8 is counted
+/// in characters, not bytes, so an eight-letter password in a script of
+/// two-byte letters is short too; a value that is not UTF-8 is counted as
+/// short as any encoding could make it, four bytes a character.
 fn guessable(shared: &Shared, value: &SecretBytes) -> bool {
-    value.len() < GUESSABLE_BELOW
+    let short = match value.utf8_chars() {
+        Some(chars) => chars < GUESSABLE_BELOW,
+        None => value.len() < GUESSABLE_BELOW * 4,
+    };
+    short
         && !shared
             .registry
             .as_ref()
@@ -182,13 +189,26 @@ pub(crate) struct ValueChecks {
 impl ValueChecks {
     /// Counts `n` values compared for `root` at `awake`; false (and
     /// nothing counted) when that would pass [`MAX_VALUE_CHECKS`] in the
-    /// root's window, or when [`MAX_CHECKING_ROOTS`] other roots are
-    /// counted.
+    /// root's window. A call that compares nothing is admitted and not
+    /// counted, so it takes no place in the table. With
+    /// [`MAX_CHECKING_ROOTS`] roots counted, a new root takes the place of
+    /// the one whose window started first: that only forgets a count, so
+    /// no caller, however many roots it makes, can have another refused.
     pub(crate) fn admit(&mut self, root: &ProcessInstance, n: usize, awake: Duration) -> bool {
         self.by_root
             .retain(|_, (start, _)| awake.saturating_sub(*start) < CHECK_WINDOW);
+        if n == 0 {
+            return true;
+        }
         if !self.by_root.contains_key(root) && self.by_root.len() >= MAX_CHECKING_ROOTS {
-            return false;
+            let oldest = self
+                .by_root
+                .iter()
+                .min_by_key(|(_, (start, _))| *start)
+                .map(|(r, _)| r.clone());
+            if let Some(r) = oldest {
+                self.by_root.remove(&r);
+            }
         }
         let (_, count) = self.by_root.entry(root.clone()).or_insert((awake, 0));
         match count.checked_add(n) {
@@ -1088,14 +1108,41 @@ mod tests {
         // The window ends an hour of awake time after its first count.
         assert!(!b.admit(&one, 1, t0 + CHECK_WINDOW - Duration::from_secs(1)));
         assert!(b.admit(&one, 1, t0 + CHECK_WINDOW));
-        // At most MAX_CHECKING_ROOTS roots at once.
+        // At most MAX_CHECKING_ROOTS roots at once: a full table refuses
+        // no one, and forgets the root whose window started first.
         let mut b = ValueChecks::default();
-        for pid in 0..i32::try_from(MAX_CHECKING_ROOTS).unwrap() {
-            assert!(b.admit(&inst(pid + 100), 1, t0));
+        let roots = i32::try_from(MAX_CHECKING_ROOTS).unwrap();
+        assert!(b.admit(&inst(100), MAX_VALUE_CHECKS, t0));
+        for pid in 1..roots {
+            assert!(b.admit(&inst(pid + 100), 1, t0 + Duration::from_secs(1)));
         }
-        assert!(!b.admit(&inst(1), 1, t0));
-        assert!(b.admit(&inst(100), 1, t0));
-        assert!(b.admit(&inst(1), 1, t0 + CHECK_WINDOW));
+        assert_eq!(b.by_root.len(), MAX_CHECKING_ROOTS);
+        assert!(!b.admit(&inst(100), 1, t0 + Duration::from_secs(1)));
+        assert!(b.admit(&inst(1), 1, t0 + Duration::from_secs(2)));
+        assert_eq!(b.by_root.len(), MAX_CHECKING_ROOTS);
+        assert!(!b.by_root.contains_key(&inst(100)));
+        assert!(b.by_root.contains_key(&inst(101)));
+        // A root still counted keeps its count.
+        assert!(b.admit(
+            &inst(101),
+            MAX_VALUE_CHECKS - 1,
+            t0 + Duration::from_secs(2)
+        ));
+        assert!(!b.admit(&inst(101), 1, t0 + Duration::from_secs(2)));
+    }
+
+    /// Calls that compare nothing take no place: any number of roots
+    /// making them leaves every other root's calls admitted.
+    #[test]
+    fn calls_that_compare_nothing_take_no_place() {
+        let mut b = ValueChecks::default();
+        let t0 = Duration::from_secs(1000);
+        for pid in 0..i32::try_from(MAX_CHECKING_ROOTS * 2).unwrap() {
+            assert!(b.admit(&inst(pid + 100), 0, t0));
+        }
+        assert!(b.by_root.is_empty());
+        assert!(b.admit(&inst(1), 1, t0));
+        assert_eq!(b.by_root.len(), 1);
     }
 
     #[test]

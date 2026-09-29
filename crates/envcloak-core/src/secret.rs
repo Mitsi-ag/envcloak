@@ -67,6 +67,16 @@ impl SecretBytes {
         self.ct_eq(other.0.expose_secret())
     }
 
+    /// How many characters the value holds when it is UTF-8 text, `None`
+    /// when it is not: how short a value is for guessing (SPEC §6.4, §6.5
+    /// count characters, not bytes). Only a count leaves.
+    #[allow(clippy::disallowed_methods)] // Counts characters only.
+    pub fn utf8_chars(&self) -> Option<usize> {
+        std::str::from_utf8(self.0.expose_secret())
+            .ok()
+            .map(|s| s.chars().count())
+    }
+
     /// Whether the value holds the byte `b` anywhere: a NUL, say, which no
     /// environment variable can carry. One bit about the value, and never
     /// where the byte is.
@@ -285,6 +295,18 @@ mod tests {
             assert!(SecretBytes::copy_from(v).contains_byte(0), "{v:?}");
         }
         assert!(!SecretBytes::copy_from(b"").contains_byte(0));
+    }
+
+    #[test]
+    fn utf8_chars_counts_characters_not_bytes() {
+        assert_eq!(SecretBytes::copy_from(b"").utf8_chars(), Some(0));
+        assert_eq!(SecretBytes::copy_from(b"abc").utf8_chars(), Some(3));
+        for (c, bytes) in [('\u{e9}', 2), ('\u{20ac}', 3), ('\u{1f600}', 4)] {
+            let v: String = std::iter::repeat_n(c, 8).collect();
+            assert_eq!(v.len(), 8 * bytes);
+            assert_eq!(SecretBytes::copy_from(v.as_bytes()).utf8_chars(), Some(8));
+        }
+        assert_eq!(SecretBytes::copy_from(b"a\xffb").utf8_chars(), None);
     }
 
     #[test]

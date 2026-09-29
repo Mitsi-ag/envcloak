@@ -784,6 +784,109 @@ fn an_agent_guessing_a_short_value_learns_nothing() {
     f.sweep();
 }
 
+/// `n` characters drawn at random from `alphabet`.
+fn chars_of(alphabet: &[char], n: usize) -> String {
+    let mut out = String::new();
+    while out.chars().count() < n {
+        let seed = fresh_seed();
+        for i in 0..8 {
+            let k = usize::try_from((seed >> (i * 8)) % alphabet.len() as u64).unwrap();
+            out.push(alphabet[k]);
+        }
+    }
+    out.chars().take(n).collect()
+}
+
+/// Review finding F-58 (Codex): the cutoff counted bytes, so a short
+/// password of two-byte letters (8 characters, 16 bytes) was compared with
+/// the vault for an agent, which then told a right guess from a wrong one.
+/// Counted in characters, a value under 16 of them is left out for an
+/// agent, hit or miss, with two-, three- and four-byte characters; a
+/// person's guesses are still told apart, and 16 characters are compared
+/// for anyone.
+#[test]
+fn short_values_are_counted_in_characters() {
+    let mut f = Fixture::new(|_, _| {});
+    let mut c = client(&f.home);
+    for (width, alphabet) in [
+        (2, ['\u{e9}', '\u{fc}', '\u{f1}', '\u{f8}']),
+        (3, ['\u{20ac}', '\u{3042}', '\u{4e2d}', '\u{d55c}']),
+        (4, ['\u{1f600}', '\u{1d538}', '\u{1f980}', '\u{10348}']),
+    ] {
+        let (right, wrong, long) = (
+            chars_of(&alphabet, 8),
+            chars_of(&alphabet, 8),
+            chars_of(&alphabet, 16),
+        );
+        assert!(right.len() >= 16 && right != wrong);
+        for (label, v) in [("RIGHT", &right), ("WRONG", &wrong), ("LONG", &long)] {
+            f.cs.push(Canary::new(format!("{label}_{width}"), v.clone()));
+        }
+        for (slug, v) in [("right", &right), ("long", &long)] {
+            c.items_add(&envcloak_ipc::proto::AddParams {
+                slug: Some(format!("multibyte-{slug}/w{width}")),
+                provider: None,
+                field: None,
+                account: None,
+                env_hint: None,
+                allow_short: false,
+                value: WireSecret::new(SecretBytes::copy_from(v.as_bytes())),
+                claims: Vec::new(),
+            })
+            .unwrap();
+        }
+        let guess = |v: &str, claims: &[&str]| {
+            one_project(
+                &f,
+                vec![entry(0, ".env", None, "DB_PASSWORD", v.as_bytes())],
+                claims,
+            )
+        };
+        let hit = c.import_plan(&guess(&right, &[AGENT])).unwrap();
+        let miss = c.import_plan(&guess(&wrong, &[AGENT])).unwrap();
+        assert_eq!(hit, miss, "{width}-byte characters");
+        assert_eq!(hit.entries[0].skipped, Some(SkipReason::Guessable));
+        assert!(hit.items.is_empty());
+        // A person is told.
+        let plan = c.import_plan(&guess(&right, &[])).unwrap();
+        assert_eq!(
+            item_of(&plan, 0).holders,
+            [format!("multibyte-right/w{width}")]
+        );
+        let plan = c.import_plan(&guess(&wrong, &[])).unwrap();
+        assert!(!item_of(&plan, 0).existing);
+        // 16 characters cannot be guessed: compared for anyone.
+        let plan = c.import_plan(&guess(&long, &[AGENT])).unwrap();
+        assert_eq!(
+            item_of(&plan, 0).holders,
+            [format!("multibyte-long/w{width}")]
+        );
+    }
+    // A value that is not UTF-8 is counted four bytes a character: 60
+    // bytes are short, 64 are not.
+    let short = c
+        .import_plan(&one_project(
+            &f,
+            vec![entry(0, ".env", None, "DB_PASSWORD", &[0xff; 60])],
+            &[AGENT],
+        ))
+        .unwrap();
+    assert_eq!(short.entries[0].skipped, Some(SkipReason::Guessable));
+    let long = c
+        .import_plan(&one_project(
+            &f,
+            vec![entry(0, ".env", None, "DB_PASSWORD", &[0xff; 64])],
+            &[AGENT],
+        ))
+        .unwrap();
+    assert_eq!(long.entries[0].skipped, None);
+    let plans = [json(&short), json(&long)];
+    for p in &plans {
+        assert_no_canary(p, &f.cs);
+    }
+    f.sweep();
+}
+
 /// Values compared with the vault are limited per subject root: 20
 /// requests of 5,000 secrets reach the hour's 100,000, and the next
 /// comparison is refused (`too_many_checks`) and audited; a request that
