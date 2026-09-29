@@ -132,6 +132,7 @@ fn every_refusal_changes_nothing() {
                 | DeleteStep::Rewritten(_)
                 | DeleteStep::MovedAside(_)
                 | DeleteStep::Staged(_)
+                | DeleteStep::Swapped(_)
         )));
     }
 }
@@ -156,6 +157,7 @@ fn files_change_only_after_verify_backup_and_verify() {
             DeleteStep::BackedUp,
             DeleteStep::Reverified,
             DeleteStep::Staged(0),
+            DeleteStep::Swapped(0),
             DeleteStep::Rewritten(0),
             DeleteStep::MovedAside(2),
             DeleteStep::Removed(2),
@@ -210,5 +212,49 @@ fn a_file_changed_since_it_was_read_is_kept() {
     assert_eq!(
         std::fs::read(d.path().join(".env.short")).unwrap(),
         b"A=2\n"
+    );
+}
+
+/// Review finding (low): after the swap, the old file (the whole
+/// plaintext) is under a temporary name until it is unlinked. When that
+/// unlink fails, the file was still rewritten: it is reported rewritten,
+/// and the old copy is reported kept under its temporary name
+/// (`not_removed`), not the file as kept.
+#[test]
+fn an_old_file_that_cannot_be_unlinked_after_the_swap_is_reported() {
+    let (d, files) = setup(&[".env"]);
+    let r = open_root(d.path()).unwrap();
+    let mut g = gate(vec![true, true], true, vec![Keep::Some(b"PORT=8080\n")]);
+    let mut steps = Vec::new();
+    let mut temp = None;
+    let out = delete_plaintext(&r, &files, &mut g, &mut |s| {
+        steps.push(s);
+        if s != DeleteStep::Swapped(0) {
+            return;
+        }
+        // The old file is under the temporary name now: put a directory
+        // there, which no unlink removes, and keep the old file aside.
+        let name = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .find(|n| n.starts_with("..env.envcloak-new-"))
+            .unwrap();
+        assert_eq!(std::fs::read(d.path().join(&name)).unwrap(), BODY);
+        assert_eq!(
+            std::fs::read(d.path().join(".env")).unwrap(),
+            b"PORT=8080\n"
+        );
+        std::fs::rename(d.path().join(&name), d.path().join("old")).unwrap();
+        std::fs::create_dir(d.path().join(&name)).unwrap();
+        temp = Some(name);
+    })
+    .unwrap();
+    let temp = PathBuf::from(temp.expect("the swap was observed"));
+    assert_eq!(out.rewritten, [PathBuf::from(".env")]);
+    assert_eq!(out.kept, [(temp, ModifyErrorKind::NotRemoved)]);
+    assert!(!steps.contains(&DeleteStep::Rewritten(0)));
+    assert_eq!(
+        std::fs::read(d.path().join(".env")).unwrap(),
+        b"PORT=8080\n"
     );
 }

@@ -796,6 +796,10 @@ fn path_reason(token: &str) -> String {
         "open_elsewhere" => "another program has it open",
         "unchecked" => "whether another program has it open could not be checked, so it was kept",
         "moved_aside" => "saved over while it was deleted; the checked file was kept",
+        "not_removed" => {
+            "its file was changed, but this old copy, which may hold plaintext, could not be \
+             removed: look at it, then delete it"
+        }
         "exists" => "a file is there already, and is left as it is",
         "restored" => "restored",
         "unchanged" => "there already, as it was",

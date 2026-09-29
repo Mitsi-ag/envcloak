@@ -90,6 +90,9 @@ pub enum DeleteStep {
     /// The new contents of the file at this index are written beside it,
     /// not yet in its place.
     Staged(usize),
+    /// The new contents of the file at this index have its name, and the
+    /// old file is under a temporary name, not yet unlinked.
+    Swapped(usize),
     /// The file at this index was rewritten.
     Rewritten(usize),
 }
@@ -103,7 +106,9 @@ pub struct DeleteOutcome {
     pub rewritten: Vec<PathBuf>,
     /// Files the vault holds no entry of: left as they are.
     pub unchanged: Vec<PathBuf>,
-    /// Files left in place, and why.
+    /// Files left in place, and why; and plaintext left under a temporary
+    /// name after its file was changed, when it could not be unlinked
+    /// ([`ModifyErrorKind::NotRemoved`], the temporary name given).
     pub kept: Vec<(PathBuf, ModifyErrorKind)>,
 }
 
@@ -151,10 +156,10 @@ pub fn delete_plaintext<G: DeleteGate>(
                 observe(DeleteStep::MovedAside(i));
             })
             .map(|()| (&mut out.removed, DeleteStep::Removed(i))),
-            Remains::Bytes(b) => rewrite_observed(r, rel, b, stamp, now, &mut |at| {
-                if at == Inside::Staged {
-                    observe(DeleteStep::Staged(i));
-                }
+            Remains::Bytes(b) => rewrite_observed(r, rel, b, stamp, now, &mut |at| match at {
+                Inside::Staged => observe(DeleteStep::Staged(i)),
+                Inside::Swapped => observe(DeleteStep::Swapped(i)),
+                Inside::MovedAside | Inside::Checked => {}
             })
             .map(|_| (&mut out.rewritten, DeleteStep::Rewritten(i))),
             Remains::Everything => continue,
@@ -164,7 +169,14 @@ pub fn delete_plaintext<G: DeleteGate>(
                 list.push(rel.clone());
                 observe(step);
             }
-            Err(e) => out.kept.push((e.rel, e.kind)),
+            Err(e) => {
+                // Rewritten, with the old file left: both are said.
+                if e.kind == ModifyErrorKind::NotRemoved && matches!(remains[i], Remains::Bytes(_))
+                {
+                    out.rewritten.push(rel.clone());
+                }
+                out.kept.push((e.rel, e.kind));
+            }
         }
     }
     Ok(out)

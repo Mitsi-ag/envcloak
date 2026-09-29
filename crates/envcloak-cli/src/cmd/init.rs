@@ -428,6 +428,7 @@ fn step_name(s: DeleteStep) -> String {
         DeleteStep::MovedAside(i) => format!("moved_aside_{i}"),
         DeleteStep::Removed(i) => format!("removed_{i}"),
         DeleteStep::Staged(i) => format!("staged_{i}"),
+        DeleteStep::Swapped(i) => format!("swapped_{i}"),
         DeleteStep::Rewritten(i) => format!("rewritten_{i}"),
     }
 }

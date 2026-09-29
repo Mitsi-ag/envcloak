@@ -1374,7 +1374,7 @@ fn file_or_item(g: &Gate16) {
 /// The pause points of `envcloak init --import --yes --delete-plaintext`
 /// on the fixture, in order: `.env` (file 0) is rewritten, `.env.short`
 /// (file 1) removed.
-const STEPS: [&str; 10] = [
+const STEPS: [&str; 11] = [
     "planned",
     "committed",
     "written",
@@ -1382,6 +1382,7 @@ const STEPS: [&str; 10] = [
     "backed_up",
     "reverified",
     "staged_0",
+    "swapped_0",
     "rewritten_0",
     "moved_aside_1",
     "removed_1",
@@ -1476,7 +1477,7 @@ fn gate_16_kill_9_at_every_step_leaves_the_file_or_the_item() {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".envcloak-"))
             .collect();
-        let want_leftover = matches!(*step, "staged_0" | "moved_aside_1");
+        let want_leftover = matches!(*step, "staged_0" | "swapped_0" | "moved_aside_1");
         assert_eq!(
             !leftovers.is_empty(),
             want_leftover,

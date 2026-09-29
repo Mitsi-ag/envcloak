@@ -83,6 +83,10 @@ pub enum ModifyErrorKind {
     /// it could be put back: it was left under the name in
     /// [`ModifyError::rel`], and nothing was removed.
     MovedAside,
+    /// The change was made (the new contents have the file's name, or the
+    /// name is free), but the old file could not be unlinked: it is left
+    /// under the temporary name in [`ModifyError::rel`].
+    NotRemoved,
 }
 
 impl ModifyErrorKind {
@@ -97,6 +101,7 @@ impl ModifyErrorKind {
             ModifyErrorKind::Exists => "exists",
             ModifyErrorKind::Scan(k) => k.token(),
             ModifyErrorKind::MovedAside => "moved_aside",
+            ModifyErrorKind::NotRemoved => "not_removed",
         }
     }
 
@@ -120,6 +125,10 @@ impl ModifyErrorKind {
             ModifyErrorKind::MovedAside => {
                 "it was saved over while it was being removed; the checked file was kept under \
                  the name shown, and nothing was removed"
+            }
+            ModifyErrorKind::NotRemoved => {
+                "the change was made, but the old file could not be removed and is left under \
+                 the name shown: look at it, then delete it"
             }
         }
     }
@@ -207,6 +216,10 @@ pub enum Inside {
     /// The file was checked for the last time before the new contents take
     /// its name.
     Checked,
+    /// The names are swapped and what came out is the file checked: the
+    /// new contents have the file's name, and the old file is under the
+    /// temporary name, not unlinked yet.
+    Swapped,
 }
 
 /// Whether `m` is the file `expect` stamps, as a rename leaves it: a
@@ -231,9 +244,11 @@ fn is_checked(m: &std::fs::Metadata, expect: &FileStamp) -> bool {
 /// ([`exchange_beneath`]) and what came out is checked: when another
 /// program saved over the name after the check (an editor's atomic save),
 /// the names are swapped back, so its file is kept and nothing is
-/// replaced (`changed`). Where it cannot, the new file is renamed over
-/// the name right after the check, and a save landing between the two is
-/// replaced. `rel` is the file's path for errors.
+/// replaced (`changed`). Then the old file is unlinked; when it cannot be,
+/// the change stands and the old file is named where it is left
+/// (`not_removed`). Where the names cannot be swapped, the new file is
+/// renamed over the name right after the check, and a save landing
+/// between the two is replaced. `rel` is the file's path for errors.
 fn replace_in(
     dir: &File,
     rel: &Path,
@@ -262,7 +277,14 @@ fn replace_in(
             if !out.as_ref().is_ok_and(|m| is_checked(m, expect)) {
                 return Err(swap_back(dir, rel, name, &temp, &f));
             }
-            unlink_beneath(dir, &temp).map_err(|e| fail(io(&e)))?;
+            observe(Inside::Swapped);
+            if unlink_beneath(dir, &temp).is_err() {
+                let _ = sync_file(dir);
+                return Err(ModifyError {
+                    rel: rel.with_file_name(&temp),
+                    kind: ModifyErrorKind::NotRemoved,
+                });
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
             if let Err(e) = rename_beneath(dir, &temp, name) {
@@ -431,7 +453,13 @@ pub fn remove_checked_observed(
             },
         });
     }
-    unlink_beneath(&dir, &aside).map_err(|e| fail(io(&e)))?;
+    if unlink_beneath(&dir, &aside).is_err() {
+        let _ = sync_file(&dir);
+        return Err(ModifyError {
+            rel: rel.with_file_name(&aside),
+            kind: ModifyErrorKind::NotRemoved,
+        });
+    }
     sync_file(&dir).map_err(|e| fail(io(&e)))?;
     Ok(())
 }
@@ -450,7 +478,7 @@ pub fn rewrite_checked(
 }
 
 /// [`rewrite_checked`] at the time `now`, telling `observe` when the new
-/// contents are staged.
+/// contents are staged, checked and swapped in.
 pub fn rewrite_checked_observed(
     r: &ScanRoot,
     rel: &Path,
