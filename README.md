@@ -49,6 +49,7 @@ The vault's byte formats and key derivations are in [docs/CRYPTO.md](docs/CRYPTO
 Project manifests and env files are in [docs/MANIFEST.md](docs/MANIFEST.md), and the provider registry in [docs/PROVIDERS.md](docs/PROVIDERS.md).
 The daemon protocol, socket checks and lock rules are in [docs/IPC.md](docs/IPC.md), the caller evidence in [docs/AGENTS.md](docs/AGENTS.md), and grants and approvals in [docs/GRANTS.md](docs/GRANTS.md).
 How `envcloak run` releases, injects and redacts values, and handles signals and exit codes, is in [docs/RUN.md](docs/RUN.md).
+How `envcloak init` and `envcloak import` move `.env` files into the vault, and when they delete them, is in [docs/IMPORT.md](docs/IMPORT.md).
 
 ## Contributing
 

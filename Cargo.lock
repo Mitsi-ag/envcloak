@@ -227,6 +227,7 @@ dependencies = [
  "envcloak-ipc",
  "envcloak-policy",
  "envcloak-providers",
+ "envcloak-scan",
  "envcloak-sys",
  "envcloak-testkit",
  "libc",

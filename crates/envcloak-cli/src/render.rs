@@ -25,9 +25,10 @@
 use std::fmt::Write as _;
 
 use envcloak_ipc::view::{
-    AddedView, CheckReport, ClassificationView, EnvFileState, EnvFileView, ItemClassView, ItemView,
-    ItemsView, LengthClass, RefChange, RefEditView, RefStatus, RemovedView, RotatedView,
-    TargetView, View,
+    AddedView, CheckReport, ClassificationView, DeleteReport, EntryStatus, EnvFileState,
+    EnvFileView, FileChange, ImportItemView, ImportReport, InitReport, ItemClassView, ItemView,
+    ItemsView, LengthClass, RecoveryConfirmedView, RefChange, RefEditView, RefStatus, RemovedView,
+    RotatedView, SkipReason, TargetView, UndoReport, View,
 };
 use envcloak_policy::{escape_for_display, value_shaped};
 
@@ -47,7 +48,7 @@ pub trait Render: View {
 }
 
 /// The JSON keys whose strings are paths, shown whole ([`shown_path`]).
-const PATH_KEYS: [&str; 2] = ["manifest", "project_dir"];
+const PATH_KEYS: [&str; 5] = ["manifest", "project_dir", "root", "dir", "path"];
 
 /// Replaces with [`HIDDEN`] every string of `v` that the text would hide:
 /// a name that looks like a value, or an `id` that is not an id's shape.
@@ -57,7 +58,7 @@ fn hide_names(v: &mut serde_json::Value, key: Option<&str>) {
     match v {
         serde_json::Value::String(s) => {
             let keep = match key {
-                Some("id") => shown_id(s) == *s,
+                Some("id" | "backup") => shown_id(s) == *s,
                 Some(k) if PATH_KEYS.contains(&k) => true,
                 _ => !looks_like_value(s),
             };
@@ -735,6 +736,312 @@ pub fn remove_statement(t: &TargetView) -> String {
     );
     let _ = writeln!(o, "  Grants that bind this item end: {}.", t.grants);
     o
+}
+
+/// Why an env-file entry was left out, in words.
+fn skip_text(r: SkipReason) -> &'static str {
+    match r {
+        SkipReason::Empty => "left out: empty",
+        SkipReason::TooShort => "left out: under 8 bytes, so not a secret to inject",
+        SkipReason::NotSecret => "left out: configuration, not a secret",
+        SkipReason::Interpolated => "left out: it interpolates another variable",
+        SkipReason::Reference => "an envcloak:// reference already",
+        SkipReason::LooksLikeValue => "left out: its name is shaped like a key",
+        SkipReason::TooLarge => "left out: over 64 KiB",
+        SkipReason::NulByte => "left out: it holds a NUL byte",
+    }
+}
+
+fn change_text(c: FileChange) -> &'static str {
+    match c {
+        FileChange::Created => "created",
+        FileChange::Updated => "updated",
+        FileChange::Unchanged => "unchanged",
+        FileChange::Refused => {
+            "left alone: a symlink, a hard link, not valid, or it changed while it was edited"
+        }
+    }
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
+/// Words for a reason token of the scan, the deletion or an undo.
+fn path_reason(token: &str) -> String {
+    let words = match token {
+        "symlink" => "a symlink, which is never followed",
+        "not_regular" => "not a regular file (a FIFO, socket, device or directory)",
+        "not_owned" => "owned by another user",
+        "too_large" => "larger than 1 MiB, so it was not read",
+        "unreadable" => "permission denied",
+        "not_found" => "not found",
+        "changed" => "it changed since it was read",
+        "mount_point" => "on another volume, which a scan never enters",
+        "too_many_entries" => "a directory with too many entries to scan",
+        "too_deep" => "deeper than a scan goes",
+        "not_a_profile_name" => "the part after .env. makes no profile name",
+        "not_utf8" => "its path is not UTF-8",
+        "hard_linked" => "it has another hard link, so it is never deleted",
+        "invalid" => "it does not parse, so it cannot be checked",
+        "recently_changed" => "modified in the last 2 minutes, so it may be in use",
+        "open_elsewhere" => "another program has it open",
+        "moved_aside" => "saved over while it was deleted; the checked file was kept",
+        "exists" => "a file is there already, and is left as it is",
+        "restored" => "restored",
+        "unchanged" => "there already, as it was",
+        "no_directory" => "its directory is gone",
+        "invalid_path" => "not a path it could be written to",
+        other => return shown(other),
+    };
+    words.to_owned()
+}
+
+/// One item of an import, in a line.
+fn item_line(i: &ImportItemView) -> String {
+    let mut parts = vec![if i.existing {
+        "in the vault already".to_owned()
+    } else {
+        "new".to_owned()
+    }];
+    if let Some(p) = &i.provider {
+        parts.push(shown(p));
+    }
+    parts.push(kind_word(i.classification).to_owned());
+    match i.length {
+        LengthClass::Short => {
+            parts.push("8 to 15 bytes: injected only with allow_short".to_owned())
+        }
+        LengthClass::TooShort => parts.push("under 8 bytes".to_owned()),
+        LengthClass::Ok => {}
+    }
+    if i.projects > 1 {
+        parts.push(format!("shared by {} projects", i.projects));
+    }
+    let mut line = format!("{}  ({})", shown(&i.reference), parts.join(", "));
+    if i.holders.len() > 1 {
+        let all: Vec<String> = i.holders.iter().map(|h| shown(h)).collect();
+        let _ = write!(
+            line,
+            "\n      the same value is held by {} items: {} (duplicate owners)",
+            i.holders.len(),
+            all.join(", ")
+        );
+    }
+    line
+}
+
+impl Render for ImportReport {
+    fn human(&self) -> String {
+        let mut o = String::new();
+        let _ = writeln!(
+            o,
+            "Scanned {}{}",
+            shown_path(&self.root),
+            if self.committed {
+                ""
+            } else {
+                " (dry run: nothing was imported or written)"
+            }
+        );
+        if self.projects.iter().all(|p| p.files.is_empty()) {
+            let _ = writeln!(o, "No env files were found.");
+        }
+        for p in &self.projects {
+            let _ = writeln!(o, "\nproject {} ({})", shown(&p.name), shown_path(&p.dir));
+            for f in &p.files {
+                let mut about = Vec::new();
+                if let Some(pr) = &f.profile {
+                    about.push(format!("profile {}", shown(pr)));
+                }
+                if f.template {
+                    about.push("template: names only".to_owned());
+                }
+                if f.hard_linked {
+                    about.push("hard linked: never modified".to_owned());
+                }
+                let about = if about.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", about.join(", "))
+                };
+                let _ = writeln!(o, "  {}{about}", shown(&f.file));
+                if let (Some(line), Some(e)) = (f.error_line, &f.error) {
+                    let _ = writeln!(o, "    not read: line {line}: {}", shown(e));
+                }
+                let mut rows = Vec::new();
+                for e in &f.entries {
+                    let name = shown_or_dash(e.name.as_deref());
+                    let fate = if f.template {
+                        "name only".to_owned()
+                    } else if let Some(r) = e.skipped {
+                        skip_text(r).to_owned()
+                    } else if let Some(i) = e
+                        .item
+                        .and_then(|i| usize::try_from(i).ok())
+                        .and_then(|i| self.items.get(i))
+                    {
+                        format!("-> {}", shown(&i.reference))
+                    } else {
+                        "found".to_owned()
+                    };
+                    rows.push(vec![format!("    line {}", e.line), name, fate]);
+                }
+                o.push_str(&columns(&rows));
+            }
+            if let Some(c) = p.manifest {
+                let _ = writeln!(o, "  envcloak.toml: {}", change_text(c));
+            }
+            for c in &p.conflicts {
+                let _ = writeln!(
+                    o,
+                    "    {} is bound to another item there already, and was left as it is",
+                    shown(c)
+                );
+            }
+            if let Some(c) = p.gitignore {
+                let _ = writeln!(o, "  .gitignore: {}", change_text(c));
+            }
+            if let Some(ok) = p.resolves {
+                let _ = writeln!(
+                    o,
+                    "  references: {}",
+                    if ok {
+                        "every one resolves"
+                    } else {
+                        "some do not resolve; run `envcloak check`"
+                    }
+                );
+            }
+        }
+        if !self.items.is_empty() {
+            let _ = writeln!(o, "\nitems:");
+            for i in &self.items {
+                let _ = writeln!(o, "  {}", item_line(i));
+            }
+        }
+        if !self.skipped.is_empty() {
+            let _ = writeln!(o, "\nnot read:");
+            for s in &self.skipped {
+                let _ = writeln!(o, "  {}: {}", shown_path(&s.path), path_reason(&s.reason));
+            }
+        }
+        o
+    }
+}
+
+impl Render for DeleteReport {
+    fn human(&self) -> String {
+        let mut o = String::new();
+        let _ = writeln!(o, "Delete plaintext in {}", shown_path(&self.project_dir));
+        let v = &self.verify;
+        if !v.files.is_empty() {
+            let _ = writeln!(
+                o,
+                "  Recovery Kit confirmed: {}\n  every reference resolves: {}",
+                yes_no(v.recovery_confirmed),
+                yes_no(v.resolves)
+            );
+        }
+        for f in &v.files {
+            let _ = writeln!(
+                o,
+                "  {}: {}",
+                shown(&f.file),
+                if f.covered {
+                    "every secret it holds is in the vault"
+                } else {
+                    "NOT every secret it holds is in the vault"
+                }
+            );
+            for e in &f.entries {
+                let name = shown_or_dash(e.name.as_deref());
+                let text = match e.status {
+                    EntryStatus::Stored => continue,
+                    EntryStatus::LeftOut => format!(
+                        "{} ({}): goes with the file, and stays in its backup",
+                        name,
+                        e.skipped.map_or("left out", skip_text)
+                    ),
+                    EntryStatus::NotStored => {
+                        format!("{name}: not in the vault where envcloak.toml binds it")
+                    }
+                };
+                let _ = writeln!(o, "    line {}: {text}", e.line);
+            }
+        }
+        if let Some(b) = &self.backup {
+            let _ = writeln!(
+                o,
+                "  encrypted backup: {}\n  undo with `envcloak init --undo {}` (kept 7 days)",
+                shown_id(b),
+                shown_id(b)
+            );
+        }
+        if !self.removed.is_empty() {
+            let names: Vec<String> = self.removed.iter().map(|p| shown_path(p)).collect();
+            let _ = writeln!(o, "  deleted: {}", names.join(", "));
+            let _ = writeln!(
+                o,
+                "  If these files were ever committed to git, synced or copied, the keys they \
+                 held are exposed there: rotate them."
+            );
+        }
+        for k in &self.kept {
+            let _ = writeln!(
+                o,
+                "  kept {}: {}",
+                shown_path(&k.path),
+                path_reason(&k.reason)
+            );
+        }
+        for s in &self.skipped {
+            let _ = writeln!(
+                o,
+                "  not considered {}: {}",
+                shown_path(&s.path),
+                path_reason(&s.reason)
+            );
+        }
+        if v.files.is_empty() && self.removed.is_empty() {
+            let _ = writeln!(o, "  no env file to delete");
+        }
+        o
+    }
+}
+
+impl Render for InitReport {
+    fn human(&self) -> String {
+        let mut o = self.import.as_ref().map(Render::human).unwrap_or_default();
+        if let Some(d) = &self.delete {
+            if !o.is_empty() {
+                o.push('\n');
+            }
+            o.push_str(&d.human());
+        }
+        o
+    }
+}
+
+impl Render for UndoReport {
+    fn human(&self) -> String {
+        let mut o = String::new();
+        let _ = writeln!(o, "Backup {}", shown_id(&self.backup));
+        for f in &self.files {
+            let _ = writeln!(o, "  {}: {}", shown_path(&f.path), path_reason(&f.state));
+        }
+        o
+    }
+}
+
+impl Render for RecoveryConfirmedView {
+    fn human(&self) -> String {
+        if self.already {
+            "The Recovery Kit was confirmed already; it still opens the vault.\n".to_owned()
+        } else {
+            "Recovery Kit confirmed: it opens the vault. Keep it offline.\n".to_owned()
+        }
+    }
 }
 
 #[cfg(test)]

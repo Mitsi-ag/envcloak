@@ -1,0 +1,24 @@
+exit: 0
+--- stdout
+Scanned <ROOT>/acme-web (dry run: nothing was imported or written)
+
+project acme-web (<ROOT>/acme-web)
+  .env
+    line 1  OPENAI_API_KEY     -> openai/acme-web
+    line 2  STRIPE_SECRET_KEY  -> stripe/acme-web
+    line 3  DATABASE_URL       -> database-url/acme-web
+    line 4  PORT               left out: under 8 bytes, so not a secret to inject
+    line 5  NODE_ENV           left out: configuration, not a secret
+  .env.example (template: names only)
+    line 1  OPENAI_API_KEY     name only
+    line 2  STRIPE_SECRET_KEY  name only
+  .env.short (profile short)
+    line 1  SHORT_TOKEN  -> short-token/acme-web-short
+
+items:
+  openai/acme-web  (new, openai, live key)
+  stripe/acme-web  (new, stripe, test key)
+  database-url/acme-web  (new, not classified)
+  short-token/acme-web-short  (new, not classified, 8 to 15 bytes: injected only with allow_short)
+--- stderr
+envcloak: dry run: nothing was imported; run it again with --yes to import

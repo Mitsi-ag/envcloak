@@ -371,3 +371,107 @@ fn every_command_prints_its_value_free_snapshot() {
     assert_no_canary(&d.log_bytes(), &s.cs);
     s.home.assert_clean(&s.cs);
 }
+
+/// `envcloak init`, `import --scan` and `recovery confirm` (T13), on a new
+/// vault and the fixture repo: each command's output against its
+/// value-free snapshot.
+#[test]
+fn import_commands_print_their_value_free_snapshots() {
+    use envcloak_core::crypto::KdfParams;
+    use envcloak_core::vault::VaultPaths;
+    use envcloak_core::{RecoveryKit, SecretBytes, create_vault_with_kit};
+
+    let mut cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let kit = RecoveryKit::generate();
+    let paths = VaultPaths::under(common::data_dir(&home));
+    let secret = SecretBytes::copy_from(by_label(&cs, labels::VAULT_PASSPHRASE).value());
+    drop(create_vault_with_kit(&paths, &secret, &kit, KdfParams::minimum()).unwrap());
+    let kit_text = kit.to_display().to_string();
+    cs.push(Canary::new("RECOVERY_KIT", kit_text.clone()));
+    let d = start_daemon(&home);
+    let files = outside_dir();
+    let pass = secret_file(
+        files.path(),
+        "pass",
+        by_label(&cs, labels::VAULT_PASSPHRASE).value(),
+    );
+    let kit_file = secret_file(files.path(), "kit", kit_text.as_bytes());
+    let project = home.root().join("acme-web");
+    std::fs::create_dir_all(&project).unwrap();
+    let v = |l| by_label(&cs, l).as_str().to_owned();
+    let bodies = [
+        (
+            ".env",
+            format!(
+                "OPENAI_API_KEY={}\nSTRIPE_SECRET_KEY={}\nDATABASE_URL='{}'\nPORT=8080\n\
+                 NODE_ENV=production\n",
+                v(labels::OPENAI_API_KEY),
+                v(labels::STRIPE_SECRET_KEY),
+                v(labels::DATABASE_URL).replace('\'', ""),
+            ),
+        ),
+        (
+            ".env.short",
+            format!("SHORT_TOKEN={}\n", v(labels::SHORT_TOKEN)),
+        ),
+        (
+            ".env.example",
+            "OPENAI_API_KEY=\nSTRIPE_SECRET_KEY=\n".to_owned(),
+        ),
+    ];
+    for (name, body) in &bodies {
+        let p = project.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+            .unwrap();
+    }
+    let s = Story {
+        norm: Normalizer::new(&home),
+        cs,
+        home,
+        files,
+        pass,
+        project,
+        ids: Vec::new(),
+    };
+    let out = s.person(&["unlock", "--passphrase-fd", "3"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    s.snap("init-dry-run", &s.agent(&["init", "--import"], &[]));
+    s.snap("init-import", &s.agent(&["init", "--import", "--yes"], &[]));
+    s.snap(
+        "init-delete-unconfirmed",
+        &s.agent(&["init", "--delete-plaintext"], &[]),
+    );
+    s.snap(
+        "recovery-confirm",
+        &s.person(
+            &["recovery", "confirm", "--kit-fd", "4"],
+            &[(4, &kit_file, true)],
+        ),
+    );
+    let out = s.agent(&["init", "--delete-plaintext", "--json"], &[]);
+    let backup =
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["delete"]["backup"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    s.snap("init-delete-json", &out);
+    s.snap(
+        "init-undo",
+        &s.person(&["init", "--undo", &backup, "--passphrase-fd", "3"], &[]),
+    );
+    // The files are back, in plaintext, as the person asked.
+    for (name, _) in &bodies[..2] {
+        std::fs::remove_file(s.project.join(name)).unwrap();
+    }
+    let root = s.home.root().to_str().unwrap().to_owned();
+    s.snap("import-scan", &s.agent(&["import", "--scan", &root], &[]));
+    assert_no_canary(&d.log_bytes(), &s.cs);
+    s.home.assert_clean(&s.cs);
+}

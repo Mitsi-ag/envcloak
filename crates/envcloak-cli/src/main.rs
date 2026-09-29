@@ -21,11 +21,14 @@
 //!   vault's items and the project's references, metadata only (SPEC §6.3,
 //!   §7, §10b). Their output is `envcloak_ipc::view` types rendered by
 //!   [`render`], as text or with `--json`; `rotate` and `rm` need the
-//!   passphrase as a proof.
+//!   passphrase as a proof;
+//! - `envcloak init`, `import --scan` and `recovery confirm`: env files
+//!   imported into the vault with filesystem-safe scanning, and deleted
+//!   only after the four conditions of SPEC §6.4 (see [`cmd::init`]).
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
-//! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`) refuses
-//! under a tracer first.
+//! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`, `init
+//! --import`, `import`, `recovery confirm`) refuses under a tracer first.
 //!
 //! `envcloak internal hardening [--hold]` is a hidden, value-free diagnostic
 //! used by the gate 19 tests: it prints `key=value` hardening lines and, with
@@ -73,6 +76,10 @@ const HELP: &str = "usage:
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
+  envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+  envcloak init --undo <ID> [--passphrase-fd N] [--json]
+  envcloak import --scan <dir> [--yes] [--json]
+  envcloak recovery confirm [--kit-fd N] [--json]
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
 
 fn main() -> ExitCode {
@@ -119,6 +126,9 @@ fn main() -> ExitCode {
         ["check", rest @ ..] => cmd::check::run(rest),
         ["rotate", rest @ ..] => cmd::rotate::run(rest),
         ["rm", rest @ ..] => cmd::rm::run(rest),
+        ["init", rest @ ..] => cmd::init::run(rest),
+        ["import", rest @ ..] => cmd::import::run(rest),
+        ["recovery", rest @ ..] => cmd::recovery::run(rest),
         // Never echo arguments: one of them could be a pasted secret.
         _ => {
             eprintln!("envcloak: unknown command\n{HELP}");

@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+Recovery Kit confirmed: it opens the vault. Keep it offline.
+--- stderr

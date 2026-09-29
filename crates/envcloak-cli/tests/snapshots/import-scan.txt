@@ -1,0 +1,9 @@
+exit: 0
+--- stdout
+Scanned <ROOT> (dry run: nothing was imported or written)
+
+project acme-web (<ROOT>/acme-web)
+  .env.example (template: names only)
+    line 1  OPENAI_API_KEY     name only
+    line 2  STRIPE_SECRET_KEY  name only
+--- stderr

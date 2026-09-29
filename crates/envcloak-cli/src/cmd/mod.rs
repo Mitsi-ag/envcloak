@@ -2,7 +2,8 @@
 //! `lock`, `status` and `daemon install`; T9 adds `run`'s request step,
 //! `approve`, `deny` and `grants`; T10 adds `audit verify`; T11 adds
 //! `add`, `ls`, `show`, `ref`, `check`, `rotate` and `rm`; T12 adds `run`'s
-//! runner; later tasks add the rest.
+//! runner; T13 adds `init`, `import` and `recovery confirm`; later tasks
+//! add the rest.
 //!
 //! Argument errors never echo an argument: one could be a pasted secret.
 //! No command takes a value on the command line (gate 13): values come
@@ -16,8 +17,11 @@ pub mod audit;
 pub mod check;
 pub mod daemon;
 pub mod grants;
+pub mod import;
+pub mod init;
 pub mod lock;
 pub mod ls;
+pub mod recovery;
 pub mod ref_;
 pub mod rm;
 pub mod rotate;

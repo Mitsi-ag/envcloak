@@ -17,6 +17,7 @@ envcloak-exec.workspace = true
 envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
 envcloak-providers.workspace = true
+envcloak-scan.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
 serde_json.workspace = true

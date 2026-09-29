@@ -201,7 +201,7 @@ At accept, the daemon records:
 
 Roles:
 - The `app` role requires the peer's code signature to satisfy the app's pinned designated requirement. Its methods are: unlock with the Secure Enclave, approve with a signature, policy.set, reveal, paste-sheet ingest, device.add, device.remove and registry.override.
-- Every other same-uid peer gets the `client` role. Its methods are: request (run, helper, proxy session), list and show (metadata), check, status, lock, grants.list, grants.revoke, `add`, `import`, `request_new_secret`, and the passphrase-proven methods (unlock, approve, rotate, remove, recover, and terminal reveal on Linux from M2, §6.7).
+- Every other same-uid peer gets the `client` role. Its methods are: request (run, helper, proxy session), list and show (metadata), check, status, lock, grants.list, grants.revoke, `add`, `import`, `request_new_secret`, and the passphrase-proven methods (unlock, approve, rotate, remove, recover, the file restore of `init --undo`, and terminal reveal on Linux from M2, §6.7), and the Recovery Kit confirmation, proven with the kit.
 - Before M3 there is no `app` role; its methods are rejected and audited.
 - On Linux, and on macOS without the app, `policy.set`, `registry.override`, `device.add` and `device.remove` are client methods that need a passphrase proof (§10b), like `approve`. Secure Enclave unlock, signed approvals, paste-sheet ingest and in-app reveal exist only with the app.
 
@@ -210,8 +210,8 @@ Roles:
 This list is complete.
 - App to daemon: one HPKE-sealed VMK per unlock; signed approval, policy, device and reveal statements; values typed into the paste sheet, sealed to a daemon ephemeral key.
 - Daemon to app: envelopes (ciphertext); approval request descriptors (metadata only); reveal values sealed to an app ephemeral key after a signed reveal statement.
-- Client to daemon: request context and metadata; new values from `add`, `import` and `rotate`; the passphrase or Recovery Kit for passphrase-proven methods. Values and proofs are sent only after the client has verified the daemon (§4.2).
-- Daemon to client: metadata, and plaintext values only in the response to a granted inject-mode or native-helper request, or to a passphrase-proven terminal reveal on Linux (§6.7).
+- Client to daemon: request context and metadata; new values from `add`, `import` and `rotate`; the bytes of env files about to be deleted, for their encrypted backup (§6.4); the passphrase or Recovery Kit for passphrase-proven methods. Values and proofs are sent only after the client has verified the daemon (§4.2).
+- Daemon to client: metadata, and plaintext values only in the response to a granted inject-mode or native-helper request, to a passphrase-proven terminal reveal on Linux (§6.7), or to a passphrase-proven `envcloak init --undo`, which gets back the files it deleted (§6.4).
 - Never to a client: the VMK, subkeys, unlocker material or any grant token.
 
 ## 5. Data model
@@ -431,8 +431,8 @@ Requests with duplicate auth headers or ambiguous framing are rejected. Response
 
 `envcloak init` in a repo:
 
-1. Scans `.env*` files, matches values against the vault by keyed hash, and creates any missing items with provider detection.
-2. Writes `envcloak.toml`, adds `.env*` (except references-only files) to `.gitignore`.
+1. Scans `.env*` files, matches values against the vault by keyed hash, and creates any missing items with provider detection. Values that are not secrets stay in the file: under 8 bytes (never injected, §6.1), or configuration (no provider's key pattern matches, no word of the name says secret, and the value is neither a URL with a password nor shaped like a generated key); docs/IMPORT.md has the rules.
+2. Writes `envcloak.toml`, adds each `.env*` file it read (except templates and references-only files) to `.gitignore`.
 3. Verifies with a dry run that every reference resolves, then offers to delete the plaintext files, under the rules in "Deleting plaintext after import" below.
 4. Adds a short project-level agent note (AGENTS.md / CLAUDE.md managed block) if the user opts in.
 
@@ -449,7 +449,7 @@ Scanning and parsing run in the CLI. The CLI sends values to a verified daemon, 
 - Size cap: 1 MiB for dotenv and profile files. Transcripts are streamed.
 - Directory symlinks are not followed out of the scan root, mount points are not crossed, and network or cloud-provider volumes are skipped unless named explicitly.
 - Symlinked or hard-linked (`nlink > 1`) targets are reported, never modified.
-- Template files (`.env.example`, `.env.sample`, `.env.template`) contribute names only.
+- Template files (`.env.example`, `.env.sample`, `.env.template`, `.env.dist`) contribute names only.
 
 **Backups.**
 - Backups of modified or deleted files are encrypted with a per-backup key wrapped under `backup`, stored in `EnvCloak/backups/` (0700), and removed after 7 days.
@@ -462,7 +462,9 @@ Scanning and parsing run in the CLI. The CLI sends values to a verified daemon, 
 - an encrypted backup exists;
 - the Recovery Kit is confirmed (`envcloak recovery confirm`).
 
-Deletion removes the working copy only. Values that were in git history, synced folders, backups or transcripts are marked "exposed: rotate".
+A file modified in the last 2 minutes, open in another process as far as the system can tell, or with another hard link is kept. Entries that are not secrets go with the file and stay in its encrypted backup; the report names them.
+
+Deletion removes the working copy only. Values that were in git history, synced folders, backups or transcripts are marked "exposed: rotate" (in M1 the deletion report says to rotate them; marking items comes with `doctor`, §6.5).
 
 ### 6.5 Doctor and scrub
 
