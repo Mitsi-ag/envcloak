@@ -900,6 +900,162 @@ fn short_values_are_counted_in_characters() {
     f.sweep();
 }
 
+/// Review finding (medium): a URL with a password was measured whole,
+/// always 16 characters or more, so `import.plan` and `import.verify`
+/// told an agent's right guess of a short database password from a wrong
+/// one. In a URL only the password counts: with 8 characters, 10 with no
+/// user, or 6 written as `%XX` escapes (18 bytes), it is left out for an
+/// agent, hit or miss, from `import.plan`, `import.commit` and
+/// `import.verify`, and nothing is imported; a person is told; a URL
+/// whose password has 16 characters is compared for anyone.
+#[test]
+fn a_short_password_in_a_long_url_is_guessable() {
+    let mut f = Fixture::new(|_, _| {});
+    let escaped = |w: String| -> String { w.bytes().map(|b| format!("%{b:02X}")).collect() };
+    // Each shape: its name, the URL around a password, a right and a wrong
+    // password.
+    type UrlOf = fn(&str) -> String;
+    let shapes: [(&str, UrlOf, String, String); 3] = [
+        (
+            "postgres",
+            |pw| format!("postgres://app:{pw}@db.internal:5432/app"),
+            word(8),
+            word(8),
+        ),
+        (
+            "redis",
+            |pw| format!("redis://:{pw}@cache.internal:6379/0"),
+            word(10),
+            word(10),
+        ),
+        (
+            "escaped",
+            |pw| format!("mysql://app:{pw}@db.internal:3306/app"),
+            escaped(word(6)),
+            escaped(word(6)),
+        ),
+    ];
+    let mut c = client(&f.home);
+    let long_pw = word(16);
+    let long = format!("postgres://app:{long_pw}@db.internal:5432/app");
+    f.cs.push(Canary::new("URL_LONG", long.clone()));
+    f.cs.push(Canary::new("URL_LONG_PASSWORD", long_pw));
+    c.items_add(&envcloak_ipc::proto::AddParams {
+        slug: Some("url-long/acme-web".to_owned()),
+        provider: None,
+        field: None,
+        account: None,
+        env_hint: None,
+        allow_short: false,
+        value: WireSecret::new(SecretBytes::copy_from(long.as_bytes())),
+        claims: Vec::new(),
+    })
+    .unwrap();
+    for (shape, url, right_pw, wrong_pw) in &shapes {
+        let (right, wrong) = (url(right_pw), url(wrong_pw));
+        assert!(right.chars().count() >= 32 && right != wrong);
+        for (label, v) in [
+            ("RIGHT", &right),
+            ("WRONG", &wrong),
+            ("RIGHT_PASSWORD", right_pw),
+            ("WRONG_PASSWORD", wrong_pw),
+        ] {
+            f.cs.push(Canary::new(format!("{label}_{shape}"), v.clone()));
+        }
+        c.items_add(&envcloak_ipc::proto::AddParams {
+            slug: Some(format!("url-{shape}/acme-web")),
+            provider: None,
+            field: None,
+            account: None,
+            env_hint: None,
+            allow_short: false,
+            value: WireSecret::new(SecretBytes::copy_from(right.as_bytes())),
+            claims: Vec::new(),
+        })
+        .unwrap();
+        let guess = |v: &str, claims: &[&str]| {
+            one_project(
+                &f,
+                vec![entry(0, ".env", None, "DATABASE_URL", v.as_bytes())],
+                claims,
+            )
+        };
+        let hit = c.import_plan(&guess(&right, &[AGENT])).unwrap();
+        let miss = c.import_plan(&guess(&wrong, &[AGENT])).unwrap();
+        assert_eq!(hit, miss, "{shape}");
+        assert_eq!(hit.entries[0].skipped, Some(SkipReason::Guessable));
+        assert!(hit.items.is_empty());
+        // The commit of an agent's plan imports nothing.
+        let before = c.items_list(false).unwrap().items.len();
+        let done = c
+            .import_commit(&ImportCommitParams {
+                import: guess(&right, &[AGENT]),
+                digest: hit.digest.clone(),
+            })
+            .unwrap();
+        assert_eq!(done, hit);
+        assert_eq!(c.items_list(false).unwrap().items.len(), before);
+        // The delete gate, with the variable bound to the item that holds
+        // the right URL: the same answer for both guesses.
+        let manifest = project(
+            &f.home,
+            &format!("url-{shape}"),
+            &format!("[env]\nDATABASE_URL = \"url-{shape}/acme-web\"\n"),
+        );
+        let ask = |c: &mut envcloak_ipc::Client, v: &str, claims: &[&str]| {
+            c.import_verify(&VerifyParams {
+                manifest: manifest.to_str().unwrap().to_owned(),
+                files: vec![VerifyFile {
+                    file: ".env".into(),
+                    profile: None,
+                    entries: vec![VerifyEntry {
+                        line: 1,
+                        name: "DATABASE_URL".into(),
+                        value: WireSecret::new(SecretBytes::copy_from(v.as_bytes())),
+                    }],
+                }],
+                claims: claims.iter().map(|c| (*c).to_owned()).collect(),
+            })
+            .unwrap()
+        };
+        let hit = ask(&mut c, &right, &[AGENT]);
+        let miss = ask(&mut c, &wrong, &[AGENT]);
+        assert_eq!(hit, miss, "{shape}");
+        assert_eq!(
+            statuses(&hit),
+            [(EntryStatus::LeftOut, Some(SkipReason::Guessable))]
+        );
+        // A person is told.
+        let plan = c.import_plan(&guess(&right, &[])).unwrap();
+        assert_eq!(item_of(&plan, 0).holders, [format!("url-{shape}/acme-web")]);
+        let plan = c.import_plan(&guess(&wrong, &[])).unwrap();
+        assert!(!item_of(&plan, 0).existing);
+        assert_eq!(
+            statuses(&ask(&mut c, &right, &[])),
+            [(EntryStatus::Stored, None)]
+        );
+        assert_eq!(
+            statuses(&ask(&mut c, &wrong, &[])),
+            [(EntryStatus::NotStored, None)]
+        );
+        for p in [json(&hit), json(&plan)] {
+            assert_no_canary(&p, &f.cs);
+        }
+    }
+    // A password of 16 characters cannot be guessed: compared for anyone.
+    let plan = c
+        .import_plan(&one_project(
+            &f,
+            vec![entry(0, ".env", None, "DATABASE_URL", long.as_bytes())],
+            &[AGENT],
+        ))
+        .unwrap();
+    assert_eq!(item_of(&plan, 0).holders, ["url-long/acme-web"]);
+    assert_no_canary(&json(&plan), &f.cs);
+    drop(c);
+    f.sweep();
+}
+
 /// Values compared with the vault are limited per subject root: 20
 /// requests of 5,000 secrets reach the hour's 100,000, and the next
 /// comparison is refused (`too_many_checks`) and audited; a request that

@@ -164,18 +164,65 @@ pub fn shaped_like_secret(value: &SecretBytes) -> bool {
 }
 
 fn url_with_password(v: &[u8]) -> bool {
-    let Some(at) = v.windows(3).position(|w| w == b"://") else {
-        return false;
-    };
+    url_password(v).is_some()
+}
+
+/// The password of a URL with one: the user information after its first
+/// `:`, up to the last `@`. `None` when `v` is no URL, has no `@` after
+/// `://`, or its password is empty.
+fn url_password(v: &[u8]) -> Option<&[u8]> {
+    let at = v.windows(3).position(|w| w == b"://")?;
     let rest = &v[at + 3..];
-    let Some(last_at) = rest.iter().rposition(|&b| b == b'@') else {
-        return false;
-    };
+    let last_at = rest.iter().rposition(|&b| b == b'@')?;
     let userinfo = &rest[..last_at];
-    userinfo
-        .iter()
-        .position(|&b| b == b':')
-        .is_some_and(|colon| colon + 1 < userinfo.len())
+    let colon = userinfo.iter().position(|&b| b == b':')?;
+    let password = &userinfo[colon + 1..];
+    (!password.is_empty()).then_some(password)
+}
+
+/// When `value` is a URL with a password ([`shaped_like_secret`]'s first
+/// shape), how many characters its password has: all of the value a
+/// guesser must find, since a URL's scheme, user, host and database are
+/// no secret (SPEC §6.4: a short password in a long URL is short). A `%XX`
+/// escape counts as the byte it stands for, and the bytes are counted as
+/// [`SecretBytes::utf8_chars`] counts them, or, when they are not UTF-8,
+/// as four bytes a character. `None` for any other value.
+///
+/// Read in place, like [`Registry::detect`]: only a count leaves, and the
+/// decoded password is wiped.
+pub fn url_password_chars(value: &SecretBytes) -> Option<usize> {
+    #[allow(clippy::disallowed_methods)] // Read in place; only a count leaves.
+    let v: &[u8] = value.expose_secret();
+    let password = url_password(v)?;
+    let mut decoded = Vec::with_capacity(password.len());
+    let mut i = 0;
+    while i < password.len() {
+        let digit = |k: usize| {
+            password
+                .get(k)
+                .and_then(|&b| char::from(b).to_digit(16))
+                .and_then(|d| u8::try_from(d).ok())
+        };
+        let escaped = if password[i] == b'%' {
+            digit(i + 1)
+                .zip(digit(i + 2))
+                .map(|(hi, lo)| (hi << 4) | lo)
+        } else {
+            None
+        };
+        match escaped {
+            Some(b) => {
+                decoded.push(b);
+                i += 3;
+            }
+            None => {
+                decoded.push(password[i]);
+                i += 1;
+            }
+        }
+    }
+    let decoded = SecretBytes::from_vec(decoded);
+    Some(decoded.utf8_chars().unwrap_or_else(|| decoded.len() / 4))
 }
 
 fn key_shaped_run(v: &[u8]) -> bool {
@@ -206,6 +253,55 @@ mod shape_tests {
 
     fn shaped(s: &[u8]) -> bool {
         shaped_like_secret(&SecretBytes::copy_from(s))
+    }
+
+    fn password_chars(s: &[u8]) -> Option<usize> {
+        url_password_chars(&SecretBytes::copy_from(s))
+    }
+
+    /// Only the password of a URL counts, its `%XX` escapes decoded, in
+    /// characters; every URL [`shaped_like_secret`] takes for one with a
+    /// password has one, and no other value does.
+    #[test]
+    fn a_url_password_is_counted_alone() {
+        for (url, chars) in [
+            (&b"postgres://app:abcdefgh@db.internal:5432/app"[..], 8),
+            (b"redis://:only-a-password@cache:6379", 15),
+            (b"https://user:p@host/path@with-at", 11),
+            (b"mysql://u:%41%42%43%44%45@db/x", 5),
+            (b"mysql://u:%4@db/x", 2),
+            (b"mysql://u:%zz%@db/x", 4),
+            (b"amqp://u:caf%C3%A9-%E2%82%AC@mq/", 6),
+            (b"amqp://u:\xc3\xa9\xc3\xa9@mq/", 2),
+            (b"mysql://u:%+4@db/x", 3),
+            (b"x://u:%FF%FF%FF%FF%FF%FF%FF%FF@h", 2),
+            (
+                b"postgres://acme:pa/ss\"w+rd x\xc3\xa9y@db.acme.internal:5432/acme",
+                14,
+            ),
+        ] {
+            assert_eq!(
+                password_chars(url),
+                Some(chars),
+                "{:?}",
+                String::from_utf8_lossy(url)
+            );
+            assert!(shaped(url), "{:?}", String::from_utf8_lossy(url));
+        }
+        for no in [
+            &b"https://example.com/path"[..],
+            b"postgres://user@db/acme",
+            b"postgres://user:@db/acme",
+            b"0123456789abcdef0123456789abcdef",
+            b"",
+        ] {
+            assert_eq!(
+                password_chars(no),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(no)
+            );
+        }
     }
 
     #[test]

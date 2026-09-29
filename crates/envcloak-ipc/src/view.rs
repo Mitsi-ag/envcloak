@@ -999,9 +999,10 @@ pub enum SkipReason {
     TooLarge,
     /// It holds a NUL byte.
     NulByte,
-    /// 8 to 15 bytes with no provider's key shape: short enough to guess,
-    /// so it is imported and compared with the vault only for a person at
-    /// a terminal with no agent (SPEC §6.5), and this caller is not told
+    /// Under 16 characters with no provider's key shape, or a URL whose
+    /// password is under 16 characters: short enough to guess, so it is
+    /// imported and compared with the vault only for a person at a
+    /// terminal with no agent (SPEC §6.5), and this caller is not told
     /// whether the vault holds it.
     Guessable,
 }

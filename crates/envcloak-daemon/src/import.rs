@@ -38,10 +38,12 @@
 //!
 //! Comparing a value with the vault tells the caller whether the vault
 //! holds it, so it is guarded as SPEC §6.5 guards doctor's matching:
-//! - A value short enough to guess ([`guessable`]: under 16 bytes, and no
-//!   provider's key pattern matches it) is imported and compared only for
-//!   a person: a terminal subject with no agent by any evidence, as a
-//!   proof requires. For any other caller it is left where it is
+//! - A value short enough to guess ([`guessable`]: under 16 characters,
+//!   a value that is not UTF-8 counted as four bytes a character, and no
+//!   provider's key pattern matches it; or a URL whose password is under
+//!   16 characters, whatever the URL's length) is imported and compared
+//!   only for a person: a terminal subject with no agent by any evidence,
+//!   as a proof requires. For any other caller it is left where it is
 //!   ([`SkipReason::Guessable`]) by the plan and by `import.verify`,
 //!   whether the vault holds it or not.
 //! - Each subject root may have [`MAX_VALUE_CHECKS`] values compared in
@@ -90,7 +92,7 @@ use envcloak_policy::{
     Binding, EnvName, ManifestError, ProcessInstance, ProfileName, SubjectEvidence, bind_items,
     load_project, resolve,
 };
-use envcloak_providers::shaped_like_secret;
+use envcloak_providers::{shaped_like_secret, url_password_chars};
 use envcloak_sys::PeerIdentity;
 use sha2::{Digest, Sha256};
 
@@ -130,8 +132,8 @@ pub const SECRET_WORDS: [&str; 21] = [
     "DSN",
 ];
 /// Values of fewer characters than this that no provider's key pattern
-/// matches are short enough to guess (SPEC §6.4, §6.5): compared with the
-/// vault only for a person.
+/// matches, and URLs whose password has fewer, are short enough to guess
+/// (SPEC §6.4, §6.5): compared with the vault only for a person.
 pub const GUESSABLE_BELOW: usize = 16;
 /// Values one subject root may have compared with the vault within
 /// [`CHECK_WINDOW`]: an `import --scan` of the largest request (plan,
@@ -164,8 +166,15 @@ fn secret_name(name: &str) -> bool {
 /// characters, and no provider's key pattern matches it. UTF-8 is counted
 /// in characters, not bytes, so an eight-letter password in a script of
 /// two-byte letters is short too; a value that is not UTF-8 is counted as
-/// short as any encoding could make it, four bytes a character.
+/// short as any encoding could make it, four bytes a character. In a URL
+/// with a password only the password counts ([`url_password_chars`]):
+/// the scheme, user, host and database are no secret, so
+/// `postgres://app:<8 characters>@db:5432/app` is as short as its
+/// password, whatever pattern matches the whole URL.
 fn guessable(shared: &Shared, value: &SecretBytes) -> bool {
+    if let Some(chars) = url_password_chars(value) {
+        return chars < GUESSABLE_BELOW;
+    }
     let short = match value.utf8_chars() {
         Some(chars) => chars < GUESSABLE_BELOW,
         None => value.len() < GUESSABLE_BELOW * 4,
