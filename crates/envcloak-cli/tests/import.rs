@@ -1069,6 +1069,89 @@ fn a_deletion_without_a_person_leaves_short_values_in_place() {
     g.sweep();
 }
 
+/// A template named with its part anywhere (`.env.local.example`) gives
+/// names only, and a profile shaped like a key (`.env.<hash>`) is skipped
+/// whole: neither is imported, named in `envcloak.toml` or `.gitignore`,
+/// or changed by the deletion.
+#[test]
+fn compound_templates_and_key_shaped_profiles_are_never_imported_or_changed() {
+    let g = Gate16::new(true);
+    let hash = format!("{}7{}", word(15), word(15));
+    let key = by_label(&g.cs, labels::OPENAI_API_KEY_ROTATED).as_str();
+    let template = format!("OPENAI_API_KEY={key}\nPORT=\n");
+    let hashed = format!(".env.{hash}");
+    let kept = [
+        (".env.local.example".to_owned(), template.clone()),
+        (".env.example.local".to_owned(), template),
+        (hashed.clone(), format!("STRIPE_SECRET_KEY={key}\n")),
+    ];
+    for (name, body) in &kept {
+        std::fs::write(g.repo.join(name), body).unwrap();
+        age(&g.repo.join(name), Duration::from_secs(600));
+    }
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--import", "--yes", "--json"],
+        &[],
+    );
+    ok(&out, &g.cs);
+    let r = &json(&out)["import"];
+    let slugs: Vec<&str> = r["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["slug"].as_str().unwrap())
+        .collect();
+    assert!(
+        slugs
+            .iter()
+            .all(|s| !s.contains("example") && !s.contains("local")),
+        "{slugs:?}"
+    );
+    let files = r["projects"][0]["files"].as_array().unwrap();
+    for name in [".env.local.example", ".env.example.local"] {
+        let f = files.iter().find(|f| f["file"] == name).unwrap();
+        assert_eq!(f["template"], true, "{name}");
+        assert_eq!(f["profile"], serde_json::Value::Null, "{name}");
+    }
+    assert!(files.iter().all(|f| f["file"] != hashed.as_str()));
+    assert!(
+        r["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["path"] == hashed.as_str() && x["reason"] == "not_a_profile_name"),
+        "{}",
+        r["skipped"]
+    );
+    for written in ["envcloak.toml", ".gitignore"] {
+        let text = std::fs::read_to_string(g.repo.join(written)).unwrap();
+        assert!(!text.contains(&hash), "{written}: {text}");
+        assert!(!text.contains("example"), "{written}: {text}");
+        assert!(!text.contains("local"), "{written}: {text}");
+    }
+    // No item holds the key the templates and the skipped file hold.
+    let ls = run_in(&g.home, &g.repo, &["ls", "--json"]);
+    assert_eq!(
+        json(&ls)["items"].as_array().unwrap().len(),
+        slugs.len() + 1,
+        "the import's items and the fixture's other/item"
+    );
+    // The deletion changes only `.env` and `.env.short`.
+    let out = g.delete();
+    ok(&out, &g.cs);
+    assert!(!g.repo.join(".env.short").exists());
+    for (name, body) in &kept {
+        assert_eq!(
+            std::fs::read_to_string(g.repo.join(name)).unwrap(),
+            *body,
+            "{name}"
+        );
+    }
+    g.sweep();
+}
+
 /// `init --undo` puts a rewritten file back only when it is what the
 /// deletion left: one edited since is left alone (`exists`).
 #[test]

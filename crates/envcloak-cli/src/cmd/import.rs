@@ -140,8 +140,26 @@ pub(crate) fn project_name(dir: &Path) -> String {
     }
 }
 
+/// Whether the env file at `rel` is `.env.<profile>` with a profile shaped
+/// like a key (a value pasted into the name, a hash), as its name has it
+/// or lowercased: its profile would be kept in `envcloak.toml` and its
+/// name in `.gitignore`, both committed, so it is skipped as
+/// `not_a_profile_name`, never read, imported or changed.
+fn key_shaped_profile(rel: &Path, kind: &FileKind) -> bool {
+    let FileKind::Dotenv { profile: Some(p) } = kind else {
+        return false;
+    };
+    let suffix = rel
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|n| n.strip_prefix(".env."))
+        .unwrap_or_default();
+    looks_like_value(p.as_str()) || looks_like_value(suffix)
+}
+
 /// Scans `root` (and below it when `recursive`), reads every env file, and
-/// groups them by directory. Paths that were not read are listed with why.
+/// groups them by directory. Paths that were not read are listed with why:
+/// a profile shaped like a key among them ([`key_shaped_profile`]).
 pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<SkippedPath>) {
     let options = WalkOptions {
         recursive,
@@ -164,6 +182,13 @@ pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<Skipp
             skipped.push(SkippedPath {
                 path: f.rel.to_string_lossy().into_owned(),
                 reason: "not_utf8".to_owned(),
+            });
+            continue;
+        }
+        if key_shaped_profile(&f.rel, &f.kind) {
+            skipped.push(SkippedPath {
+                path: f.rel.to_string_lossy().into_owned(),
+                reason: envcloak_scan::ScanErrorKind::ProfileName.token().to_owned(),
             });
             continue;
         }

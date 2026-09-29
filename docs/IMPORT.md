@@ -26,7 +26,7 @@ The scan runs in the CLI, never in the daemon or the app, so a macOS privacy pro
 - A file is read whole into a wiped buffer sized from `fstat`, and refused if it changed while it was read. Its stamp (device, inode, size, modification and change times, mode, links and owner) is kept: every later change to the file checks it.
 - A file an interrupted change of an env file left under a temporary name (`..env.envcloak-del-<hex>.tmp`, `..env.envcloak-new-<hex>.tmp`, see "Deleting plaintext") is reported as `leftover` and never read: it may hold plaintext. Look at it, then delete it.
 
-`.env` is the default profile, `[env]`; `.env.<name>` is the profile `<name>`, lowercased, with `.` read as `-` (`.env.development.local` is `development-local`). `.env.example`, `.env.sample`, `.env.template` and `.env.dist` are templates: their names are reported, and their values never leave the CLI.
+`.env` is the default profile, `[env]`; `.env.<name>` is the profile `<name>`, lowercased, with `.` read as `-` (`.env.development.local` is `development-local`). `.env.example`, `.env.sample`, `.env.template` and `.env.dist` are templates, and so is a name with one of those words as any of its dot-separated parts (`.env.local.example`, `.env.example.local`): their names are reported, their values never leave the CLI, and they are never changed. A file whose profile is shaped like a key (`.env.<hash>`, a value pasted into the name) is skipped whole (`not_a_profile_name`): its profile would be kept in `envcloak.toml` and its name in `.gitignore`, both committed.
 
 ## Parsing
 
@@ -53,7 +53,7 @@ A value that is kept:
 
 - is grouped with every equal value, by keyed hash under the vault's `index` subkey, across files and projects: one value in two repos becomes one item both manifests reference;
 - binds to the item that holds it already, the first by slug when several do; every item that holds it is reported, since a value with duplicate owners should have one (gate 10);
-- otherwise becomes a new item, named after its provider (from the value's shape, as `envcloak add` detects it) or its variable, and its project: `openai/acme-web`, `database-url/acme-web`, with the profile added for a profile's file (`short-token/acme-web-short`), and `-2` up to `-99` when a slug is taken. A project or profile name shaped like a key (a directory named by a hash, as worktrees and CI checkouts are) is never kept, in a slug or in `envcloak.toml`, which is committed: the project is `project` instead, and such a profile is left out of the slug. Its provider, classification, links and allowed hosts are filled in from the registry, as `add` fills them.
+- otherwise becomes a new item, named after its provider (from the value's shape, as `envcloak add` detects it) or its variable, and its project: `openai/acme-web`, `database-url/acme-web`, with the profile added for a profile's file (`short-token/acme-web-short`), and `-2` up to `-99` when a slug is taken. A project or profile name shaped like a key (a directory named by a hash, as worktrees and CI checkouts are) is never kept, in a slug or in `envcloak.toml`, which is committed: the project is `project` instead; the CLI skips a file with such a profile (see "Scanning"), and the daemon leaves one another client sends out of the slug. Its provider, classification, links and allowed hosts are filled in from the registry, as `add` fills them.
 
 ### Who may compare values
 

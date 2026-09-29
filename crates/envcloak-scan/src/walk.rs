@@ -37,7 +37,8 @@
 //! (lowercased, with `.` read as `-`: `.env.development.local` is
 //! `development-local`). The template names `.env.example`,
 //! `.env.sample`, `.env.template` and `.env.dist` hold names, not values:
-//! [`FileKind::Template`].
+//! [`FileKind::Template`], and so does a name with one of those among its
+//! dot-separated parts (`.env.local.example`, `.env.example.local`).
 
 use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -137,7 +138,11 @@ pub fn dotenv_kind(name: &OsStr) -> Option<Result<FileKind, ()>> {
     let Some(suffix) = suffix.filter(|s| !s.is_empty()) else {
         return Some(Err(()));
     };
-    if TEMPLATE_SUFFIXES.contains(&suffix.as_str()) {
+    // `.env.local.example`, `.env.example.local`: a template too.
+    if suffix
+        .split('.')
+        .any(|part| TEMPLATE_SUFFIXES.contains(&part))
+    {
         return Some(Ok(FileKind::Template));
     }
     Some(

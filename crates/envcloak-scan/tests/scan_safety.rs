@@ -293,6 +293,10 @@ fn template_files_and_profiles_are_told_apart() {
         ".env.SAMPLE",
         ".env.template",
         ".env.dist",
+        ".env.local.example",
+        ".env.Example.Local",
+        ".env.development.sample",
+        ".env.examples",
         ".env.",
         ".env.bad name",
         ".envrc",
@@ -323,10 +327,16 @@ fn template_files_and_profiles_are_told_apart() {
                 ".env.Development.Local".to_owned(),
                 profile("development-local")
             ),
+            // A template part anywhere in the name: a template.
+            (".env.Example.Local".to_owned(), Ok(FileKind::Template)),
             (".env.SAMPLE".to_owned(), Ok(FileKind::Template)),
             (".env.bad name".to_owned(), Err(ScanErrorKind::ProfileName)),
+            (".env.development.sample".to_owned(), Ok(FileKind::Template)),
             (".env.dist".to_owned(), Ok(FileKind::Template)),
             (".env.example".to_owned(), Ok(FileKind::Template)),
+            // Only a whole part counts.
+            (".env.examples".to_owned(), profile("examples")),
+            (".env.local.example".to_owned(), Ok(FileKind::Template)),
             (".env.production".to_owned(), profile("production")),
             (".env.template".to_owned(), Ok(FileKind::Template)),
         ]
