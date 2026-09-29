@@ -268,10 +268,14 @@ fn panics_show_where_and_never_what() {
     let o = h.agent(&repo, &["run", "--", "./emit"]);
     assert_eq!(o.status.code(), Some(125), "{}", text(&o));
     assert!(o.stdout.is_empty(), "the command started: {}", text(&o));
-    let log = h.expect_log(
+    h.expect_log(
         "envcloakd: internal error: a panic at crates/envcloak-daemon/src/requests.rs:",
         Duration::from_secs(10),
     );
+    // What else the panic printed can come after that line, so the check
+    // that the default hook's message never came reads the whole log,
+    // once the daemon has stopped and its log is complete.
+    let log = h.stop_daemon();
     assert!(
         !log.contains("panicked at") && !log.contains("stack backtrace"),
         "{log}"

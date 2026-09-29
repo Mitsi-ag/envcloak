@@ -727,10 +727,13 @@ impl Harness {
     }
 
     /// Stops the daemon with SIGTERM (it locks first) and keeps its log.
+    /// Returns the log, swept: complete now, since the daemon has exited
+    /// and its log has been read to the end, so a test checks there that
+    /// a line never came.
     ///
     /// # Panics
     /// When it does not exit.
-    pub fn stop_daemon(&mut self) {
+    pub fn stop_daemon(&mut self) -> String {
         self.daemon.signal("-TERM");
         assert!(
             self.daemon.wait_exit(Duration::from_secs(60)).is_some(),
@@ -738,7 +741,9 @@ impl Harness {
         );
         let log = self.daemon.log_bytes();
         self.assert_clean("a stopped daemon's log", &log);
+        let text = String::from_utf8_lossy(&log).into_owned();
         self.old_logs.push(log);
+        text
     }
 
     /// Starts a new daemon, after [`Harness::stop_daemon`], with the
