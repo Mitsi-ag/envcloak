@@ -17,6 +17,7 @@
 mod common;
 
 use std::os::unix::fs::symlink;
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use common::{MANIFEST, SLUGS, client, data_dir, passphrase, project, seed_vault, start};
@@ -607,6 +608,164 @@ fn flood_control_and_the_attempt_limiter_hold() {
     f.sweep();
 }
 
+/// How long a race may take, start to finish, before the test fails
+/// instead of hanging the job.
+const RACE_LIMIT: Duration = Duration::from_secs(60);
+
+/// A start line for racing threads that cannot deadlock (review T12-5). A
+/// `Barrier` waits for ever for a thread that panicked before reaching it;
+/// here every racer holds a [`Ticket`], and one dropped without starting
+/// (as a panic drops it while unwinding) counts as having arrived, failed,
+/// so the others are released at once and told the race is off.
+struct StartGate {
+    racers: usize,
+    /// Racers arrived, and how many of them failed before they did.
+    state: Mutex<(usize, usize)>,
+    changed: Condvar,
+}
+
+/// One racer's place at a [`StartGate`].
+struct Ticket {
+    gate: Arc<StartGate>,
+    arrived: bool,
+}
+
+impl StartGate {
+    fn new(racers: usize) -> Arc<StartGate> {
+        Arc::new(StartGate {
+            racers,
+            state: Mutex::new((0, 0)),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn ticket(self: &Arc<Self>) -> Ticket {
+        Ticket {
+            gate: Arc::clone(self),
+            arrived: false,
+        }
+    }
+
+    fn arrive(&self, failed: bool) -> std::sync::MutexGuard<'_, (usize, usize)> {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.0 += 1;
+        s.1 += usize::from(failed);
+        self.changed.notify_all();
+        s
+    }
+}
+
+impl Ticket {
+    /// Arrives and waits until every racer has, or `limit` passes. True
+    /// when all arrived in time and none failed first.
+    fn start(mut self, limit: Duration) -> bool {
+        self.arrived = true;
+        let end = Instant::now() + limit;
+        let gate = Arc::clone(&self.gate);
+        let mut s = gate.arrive(false);
+        while s.0 < gate.racers && s.1 == 0 {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            s = gate
+                .changed
+                .wait_timeout(s, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        s.1 == 0
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if !self.arrived {
+            drop(self.gate.arrive(true));
+        }
+    }
+}
+
+/// Collects one result from each of `racers` threads within `limit` (the
+/// watchdog): a racer that reports an error, panics without reporting, or
+/// is still running at the limit fails the test.
+fn finish_race<T>(
+    rx: &mpsc::Receiver<(usize, Result<T, String>)>,
+    racers: usize,
+    limit: Duration,
+) -> Vec<T> {
+    let end = Instant::now() + limit;
+    let mut done = Vec::new();
+    while done.len() < racers {
+        match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok((_, Ok(v))) => done.push(v),
+            Ok((racer, Err(e))) => panic!("racer {racer}: {e}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "{} of {racers} racers still running after {limit:?}",
+                racers - done.len()
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "{} of {racers} racers ended without a result (they panicked)",
+                racers - done.len()
+            ),
+        }
+    }
+    done
+}
+
+/// The start gate and the watchdog, without a daemon: a racer that panics
+/// before the start releases the others at once, and the race then fails
+/// well within its limit, naming what went wrong, instead of hanging.
+#[test]
+fn a_racer_that_fails_before_the_start_fails_the_race_without_a_hang() {
+    const RACERS: usize = 4;
+    let limit = Duration::from_secs(30);
+    let started = Instant::now();
+    let gate = StartGate::new(RACERS);
+    let (tx, rx) = mpsc::channel::<(usize, Result<bool, String>)>();
+    for racer in 0..RACERS {
+        let (ticket, tx) = (gate.ticket(), tx.clone());
+        std::thread::spawn(move || {
+            if racer == 2 {
+                // Stands in for a failed connect: the ticket is dropped
+                // while this thread unwinds. (Its message goes to stderr.)
+                panic!("racer {racer} failed before the start (on purpose)");
+            }
+            let all = ticket.start(limit);
+            let _ = tx.send((racer, Ok(all)));
+        });
+    }
+    drop(tx);
+    let released: Vec<bool> = (0..RACERS - 1)
+        .map(|_| {
+            rx.recv_timeout(limit)
+                .expect("a racer was left waiting")
+                .1
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(released, [false; RACERS - 1], "told the race is off");
+    assert!(started.elapsed() < limit / 2, "{:?}", started.elapsed());
+    let why = std::panic::catch_unwind(|| finish_race(&rx, 1, limit)).unwrap_err();
+    assert!(
+        why.downcast_ref::<String>()
+            .is_some_and(|m| m.contains("ended without a result")),
+        "{why:?}"
+    );
+
+    // Control: with every racer there, all start together.
+    let gate = StartGate::new(RACERS);
+    let (tx, rx) = mpsc::channel();
+    for racer in 0..RACERS {
+        let (ticket, tx) = (gate.ticket(), tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((racer, Ok(ticket.start(limit))));
+        });
+    }
+    drop(tx);
+    assert_eq!(finish_race(&rx, RACERS, limit), [true; RACERS]);
+}
+
 /// Gate 30: of concurrent requests on a `once` grant, exactly one is
 /// covered; the others are pending.
 ///
@@ -623,35 +782,44 @@ fn concurrent_requests_on_a_once_grant_cover_exactly_one() {
     let grant = f.approve_ok(&id, ApprovalOptions::once(Duration::from_secs(600)));
     let params = f.params(&["./emit"]);
     let paths = common::run_paths(&f.home);
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
-    let handles: Vec<_> = (0..RACERS)
-        .map(|_| {
-            let (params, paths, barrier) = (params.clone(), paths.clone(), barrier.clone());
-            std::thread::spawn(move || {
-                // A connection is kept once it is served, so all are open
-                // at the barrier.
-                let end = Instant::now() + Duration::from_secs(10);
-                let served = loop {
-                    let tried = match Client::connect(&paths) {
-                        Ok(mut c) => c.status().map(|_| c).map_err(|e| format!("{e:?}")),
-                        Err(e) => Err(format!("{e:?}")),
-                    };
-                    match tried {
-                        Ok(c) => break Ok(c),
-                        Err(e) if Instant::now() >= end => break Err(e),
-                        Err(_) => std::thread::sleep(Duration::from_millis(50)),
-                    }
+    let gate = StartGate::new(RACERS);
+    let (tx, rx) = mpsc::channel();
+    for racer in 0..RACERS {
+        let (params, paths, ticket, tx) =
+            (params.clone(), paths.clone(), gate.ticket(), tx.clone());
+        std::thread::spawn(move || {
+            // A connection is kept once it is served, so all are open at
+            // the start.
+            let end = Instant::now() + Duration::from_secs(10);
+            let served = loop {
+                let tried = match Client::connect(&paths) {
+                    Ok(mut c) => c.status().map(|_| c).map_err(|e| format!("{e:?}")),
+                    Err(e) => Err(format!("{e:?}")),
                 };
-                // Every thread reaches the barrier, served or not: one that
-                // was never served fails the test instead of leaving the
-                // others waiting there for ever.
-                barrier.wait();
-                let mut c = served.unwrap_or_else(|e| panic!("never served: {e}"));
-                c.run_request(&params).unwrap().decision
-            })
-        })
-        .collect();
-    let decisions: Vec<DecisionView> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                match tried {
+                    Ok(c) => break Ok(c),
+                    Err(e) if Instant::now() >= end => break Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                }
+            };
+            // Every racer reaches the start, served or not; one that fails
+            // before it releases the others too (see StartGate).
+            let all_started = ticket.start(RACE_LIMIT);
+            let decision = served
+                .map_err(|e| format!("never served: {e}"))
+                .and_then(|mut c| {
+                    if !all_started {
+                        return Err("another racer never reached the start".to_owned());
+                    }
+                    c.run_request(&params)
+                        .map(|r| r.decision)
+                        .map_err(|e| format!("{e:?}"))
+                });
+            let _ = tx.send((racer, decision));
+        });
+    }
+    drop(tx);
+    let decisions = finish_race(&rx, RACERS, RACE_LIMIT);
     let covered: Vec<&DecisionView> = decisions
         .iter()
         .filter(|d| matches!(d, DecisionView::Covered { .. }))

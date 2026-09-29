@@ -224,6 +224,14 @@ const TESTS: &[Test] = &[
         "a_descendant_holding_the_pipes_is_cut_off_after_2_s",
         a_descendant_holding_the_pipes_is_cut_off_after_2_s,
     ),
+    (
+        "harness_a_dropped_runner_takes_its_childs_group_with_it",
+        harness_a_dropped_runner_takes_its_childs_group_with_it,
+    ),
+    (
+        "harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session",
+        harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session,
+    ),
 ];
 
 fn harness(args: &[OsString]) -> ExitCode {
@@ -298,15 +306,23 @@ fn emitter() -> PathBuf {
 /// Runs argv[1..] in a new session, without a controlling terminal.
 const DETACH: &str = "import os, sys\nos.setsid()\nos.execv(sys.argv[1], sys.argv[1:])\n";
 
-/// Runs argv[2..] leading a session on a new pseudo-terminal. Waits until
+/// Runs argv[4..] leading a session on a new pseudo-terminal. Waits until
 /// the terminal shows `ready`, then (argv[1]) types Ctrl-C, or sends
-/// SIGTERM to the process. Prints `EXIT <code>` and everything the
-/// terminal showed.
+/// SIGTERM to the process. Reads until the terminal has been quiet for
+/// argv[2] seconds, then waits up to argv[3] seconds for the process to
+/// exit. Prints `RUNNER <pid>`, then `EXIT <code>` and everything the
+/// terminal showed. A process that is not ready in time, or does not exit
+/// in time, is killed with its whole process group (it leads the
+/// terminal's session and group, and on a terminal its child stays in
+/// that group), reaped, and reported as `NOREADY` or `NOEXIT` in place of
+/// the `EXIT` line, with exit status 1: the driver never waits for ever,
+/// and never leaves the runner or its child behind (review T12-5).
 const ON_PTY: &str = r#"import os, pty, select, signal, sys, time
-send = sys.argv[1]
+send, quiet, patience = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 pid, fd = pty.fork()
 if pid == 0:
-    os.execv(sys.argv[2], sys.argv[2:])
+    os.execv(sys.argv[4], sys.argv[4:])
+sys.stdout.buffer.write(b'RUNNER %d\n' % pid)
 out = b''
 def more(deadline):
     global out
@@ -321,18 +337,35 @@ def more(deadline):
         return False
     out += chunk
     return True
+def give_up(why):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+    sys.stdout.buffer.write(why + b'\n' + out)
+    sys.exit(1)
 deadline = time.time() + 60
 while b'ready' not in out:
     if not more(deadline):
-        sys.stdout.buffer.write(b'NOREADY\n' + out)
-        sys.exit(1)
+        give_up(b'NOREADY')
 if send == 'ctrl-c':
     os.write(fd, b'\x03')
 else:
     os.kill(pid, signal.SIGTERM)
-while more(time.time() + 60):
+while more(time.time() + quiet):
     pass
-_, status = os.waitpid(pid, 0)
+end = time.time() + patience
+while True:
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done:
+        break
+    if time.time() > end:
+        give_up(b'NOEXIT')
+    time.sleep(0.02)
 sys.stdout.buffer.write(b'EXIT %d\n' % os.waitstatus_to_exitcode(status))
 sys.stdout.buffer.write(out)
 "#;
@@ -381,23 +414,86 @@ fn detached(home: &TestHome, s: &Setup<'_>, argv: &[&OsStr]) -> Command {
     cmd
 }
 
+/// How [`ON_PTY`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PtyEnd {
+    Exit(i32),
+    NoReady,
+    NoExit,
+}
+
+/// What [`on_pty_within`] saw: the runner's pid, how it ended, and what
+/// the terminal showed.
+struct Pty {
+    runner: i32,
+    end: PtyEnd,
+    shown: Vec<u8>,
+}
+
 /// The runner leading a session on a pseudo-terminal (see [`ON_PTY`]).
 /// Returns the exit code and what the terminal showed.
 fn on_pty(home: &TestHome, send: &str, s: &Setup<'_>, argv: &[&OsStr]) -> (i32, Vec<u8>) {
+    let p = on_pty_within(home, send, (60, 60), s, argv);
+    match p.end {
+        PtyEnd::Exit(code) => (code, p.shown),
+        other => panic!("the runner on a terminal ended as {other:?}"),
+    }
+}
+
+/// [`on_pty`], with the quiet time that ends the reading and the time
+/// then allowed for the exit, in seconds.
+fn on_pty_within(
+    home: &TestHome,
+    send: &str,
+    (quiet, patience): (u64, u64),
+    s: &Setup<'_>,
+    argv: &[&OsStr],
+) -> Pty {
     let mut cmd = Command::new(python3());
     home.apply(&mut cmd)
-        .args(["-c", ON_PTY, send])
+        .args([
+            "-c",
+            ON_PTY,
+            send,
+            &quiet.to_string(),
+            &patience.to_string(),
+        ])
         .args(runner_args(s, argv))
         .current_dir(home.home())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let (status, out, err) = Proc::spawn(cmd).finish(Duration::from_secs(120));
-    assert!(status.success(), "the pty driver failed: {}", lossy(&err));
-    let text = out.strip_prefix(b"EXIT ").expect("no EXIT line");
-    let nl = text.iter().position(|b| *b == b'\n').unwrap();
-    let code = std::str::from_utf8(&text[..nl]).unwrap().parse().unwrap();
-    (code, text[nl + 1..].to_vec())
+    let limit = Duration::from_secs(60 + quiet + patience + 30);
+    let (status, out, err) = Proc::spawn(cmd).finish(limit);
+    let (first, rest) = out.split_at(out.iter().position(|b| *b == b'\n').map_or(0, |n| n + 1));
+    let runner = std::str::from_utf8(first)
+        .ok()
+        .and_then(|l| l.trim_end().strip_prefix("RUNNER "))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the pty driver failed to start: {}", lossy(&err)));
+    let nl = rest.iter().position(|b| *b == b'\n').expect("no end line");
+    let end = match &rest[..nl] {
+        b"NOREADY" => PtyEnd::NoReady,
+        b"NOEXIT" => PtyEnd::NoExit,
+        line => PtyEnd::Exit(
+            std::str::from_utf8(line)
+                .ok()
+                .and_then(|l| l.strip_prefix("EXIT "))
+                .and_then(|c| c.parse().ok())
+                .expect("no EXIT line"),
+        ),
+    };
+    assert_eq!(
+        status.success(),
+        matches!(end, PtyEnd::Exit(_)),
+        "the pty driver: {status:?}, {}",
+        lossy(&err)
+    );
+    Pty {
+        runner,
+        end,
+        shown: rest[nl + 1..].to_vec(),
+    }
 }
 
 fn lossy(b: &[u8]) -> String {
@@ -505,8 +601,7 @@ impl Proc {
                 break s;
             }
             if Instant::now() > end {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                self.kill_all();
                 panic!("the process did not exit within {limit:?}");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -519,10 +614,111 @@ impl Proc {
     }
 }
 
-impl Drop for Proc {
-    fn drop(&mut self) {
+impl Proc {
+    /// Kills the process and everything it started, as a failed test must
+    /// (review T12-5): the runner leads a session and group of its own
+    /// (`DETACH`, or `ON_PTY`'s terminal), and without a terminal its
+    /// child leads another, which killing the runner alone would leave
+    /// running. So every descendant is found first (while it still is
+    /// one: an orphan is reparented), then each of their process groups
+    /// is killed, then each of them, then the process itself, which is
+    /// reaped.
+    fn kill_all(&mut self) {
+        let root = self.pid();
+        let tree = descendants(root);
+        let own = process_table()
+            .into_iter()
+            .find(|p| p.pid == i32::try_from(std::process::id()).unwrap_or(0))
+            .map_or(0, |p| p.pgid);
+        let mut groups: Vec<i32> = tree.iter().map(|p| p.pgid).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for g in groups.into_iter().filter(|g| *g > 1 && *g != own) {
+            let _ = envcloak_sys::signal_group(g, libc::SIGKILL);
+        }
+        for p in &tree {
+            let _ = envcloak_sys::signal_process(p.pid, libc::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        self.kill_all();
+    }
+}
+
+/// One row of `ps`.
+#[derive(Debug, Clone, Copy)]
+struct PsRow {
+    pid: i32,
+    ppid: i32,
+    pgid: i32,
+}
+
+/// Every process's pid, parent and process group, from `ps`.
+fn process_table() -> Vec<PsRow> {
+    let Ok(out) = Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace().map(str::parse::<i32>);
+            match (f.next(), f.next(), f.next()) {
+                (Some(Ok(pid)), Some(Ok(ppid)), Some(Ok(pgid))) => Some(PsRow { pid, ppid, pgid }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// `root` and every process below it.
+fn descendants(root: i32) -> Vec<PsRow> {
+    let table = process_table();
+    let mut found: Vec<PsRow> = table.iter().copied().filter(|p| p.pid == root).collect();
+    let mut i = 0;
+    while i < found.len() {
+        let parent = found[i].pid;
+        found.extend(
+            table
+                .iter()
+                .copied()
+                .filter(|p| p.ppid == parent && p.pid != parent),
+        );
+        i += 1;
+    }
+    found
+}
+
+/// Whether process `pid` still exists, waiting up to `limit` for it to
+/// be gone (a killed orphan is reaped by init in its own time).
+fn gone_within(pid: i32, limit: Duration) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        if envcloak_sys::signal_process(pid, 0).is_err() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Kills `pid` on drop: a test's cleanup, whatever its assertions said.
+struct KillOnDrop(Vec<i32>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        for pid in &self.0 {
+            let _ = envcloak_sys::signal_process(*pid, libc::SIGKILL);
+        }
     }
 }
 
@@ -1207,4 +1403,78 @@ exit 0"#;
     assert!(!contains(&out, b"too-late"));
     assert_no_canary(&out, &cs);
     assert_no_canary(&err, &cs);
+}
+
+// ---------------------------------------------------------------------------
+// The harness itself (review T12-5): a failed test leaves nothing running
+// and never waits for ever.
+
+/// A child that reports its pid, says `ready`, and then ignores every
+/// signal a runner passes on, so only SIGKILL ends it.
+const STUBBORN: &str = r#"trap '' INT TERM HUP
+echo "pid=$$"
+echo ready
+while :; do sleep 0.05; done"#;
+
+/// A test that fails with a runner running drops its `Proc`. Without a
+/// terminal the runner's child leads its own process group, so killing the
+/// runner alone would leave it running, reparented. Dropping the `Proc`
+/// kills the child's group too.
+fn harness_a_dropped_runner_takes_its_childs_group_with_it() {
+    let seed = fresh_seed();
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    let p = Proc::spawn(detached(&home, &setup, &os(&sh(STUBBORN))));
+    assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
+    let runner = p.pid();
+    let child = field(&p.cap.streams.lock().unwrap()[0], "pid");
+    let _cleanup = KillOnDrop(vec![child, runner]);
+    assert_ne!(child, runner);
+    drop(p);
+    assert!(
+        gone_within(runner, Duration::from_secs(10)),
+        "the runner is still running"
+    );
+    assert!(
+        gone_within(child, Duration::from_secs(10)),
+        "the runner's child is still running after its Proc was dropped"
+    );
+}
+
+/// A runner on a terminal that never exits (its child ignores the SIGTERM
+/// passed on): the pty driver gives up after its patience, kills the
+/// terminal's process group, which holds the runner and its child, and
+/// says `NOEXIT`, instead of waiting for ever.
+fn harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session() {
+    let seed = fresh_seed();
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    let started = Instant::now();
+    let p = on_pty_within(&home, "sigterm", (1, 2), &setup, &os(&sh(STUBBORN)));
+    let child = field(&p.shown, "pid");
+    let _cleanup = KillOnDrop(vec![child, p.runner]);
+    assert_eq!(p.end, PtyEnd::NoExit, "{}", lossy(&p.shown));
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        gone_within(p.runner, Duration::from_secs(10)),
+        "the runner is still running"
+    );
+    assert!(
+        gone_within(child, Duration::from_secs(10)),
+        "the runner's child is still running after the driver gave up"
+    );
 }
