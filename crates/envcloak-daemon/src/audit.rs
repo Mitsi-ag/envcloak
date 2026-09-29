@@ -620,7 +620,7 @@ impl AuditLog {
             }
             Err(e) => {
                 if !self.open_failed {
-                    eprintln!(
+                    log_line!(
                         "envcloakd: warning: the audit log could not be opened ({}); requests that \
                          would release values are denied until it can",
                         e.kind().token()

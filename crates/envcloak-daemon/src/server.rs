@@ -242,7 +242,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
     }
     let run = RunPaths::for_user().map_err(|e| DaemonError::RunDir(e.kind()))?;
     if run.fallback {
-        eprintln!(
+        log_line!(
             "envcloakd: warning: XDG_RUNTIME_DIR is not set, so the socket is in {} instead; \
              it is not cleared at logout",
             run.dir.display()
@@ -266,7 +266,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
     if !catalog.problems().is_empty() {
         // File names are not repeated: any program running as the user
         // can write agents.d (docs/AGENTS.md "Extensions").
-        eprintln!(
+        log_line!(
             "envcloakd: warning: {} agent extension file(s) in agents.d were skipped",
             catalog.problems().len()
         );
@@ -274,7 +274,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
     let registry = match envcloak_providers::load_embedded() {
         Ok(r) => Some(r),
         Err(_) => {
-            eprintln!(
+            log_line!(
                 "envcloakd: warning: the provider registry did not load; key-shaped words in \
                  command lines are not masked in the audit log"
             );
@@ -282,7 +282,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         }
     };
     let state = State::open(vault_paths, cfg.idle_limit, Reading::now(&clocks));
-    eprintln!(
+    log_line!(
         "envcloakd: listening on {} (pid {}, version {})",
         run.socket.display(),
         std::process::id(),
@@ -372,7 +372,7 @@ fn stop_on_signal(signals: &TerminationSignals, shared: &Shared, socket: &Path, 
     let sig = signals.wait().unwrap_or(0);
     let was_unlocked = locked(&shared.state).lock(LockReason::Signal);
     let _ = std::fs::remove_file(socket);
-    eprintln!(
+    log_line!(
         "envcloakd: stopping on signal {sig}; vault {}",
         if was_unlocked {
             "locked"
@@ -388,7 +388,7 @@ fn stop_on_signal(signals: &TerminationSignals, shared: &Shared, socket: &Path, 
 fn observe(shared: &Shared) {
     let now = Reading::now(&shared.clocks);
     if let Some(reason) = locked(&shared.state).observe(now) {
-        eprintln!("envcloakd: vault locked (reason: {})", reason.as_str());
+        log_line!("envcloakd: vault locked (reason: {})", reason.as_str());
     }
 }
 
@@ -431,7 +431,7 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
         let peer = match envcloak_sys::peer_identity(stream.as_fd()) {
             Ok(p) => p,
             Err(_) => {
-                eprintln!("envcloakd: closed a connection whose peer could not be identified");
+                log_line!("envcloakd: closed a connection whose peer could not be identified");
                 continue;
             }
         };
@@ -446,11 +446,11 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
         match taken {
             Ok(()) => {}
             Err(Full::All) => {
-                eprintln!("envcloakd: connection limit reached; closed a connection");
+                log_line!("envcloakd: connection limit reached; closed a connection");
                 continue;
             }
             Err(Full::Process) => {
-                eprintln!(
+                log_line!(
                     "envcloakd: connection limit reached for pid {}; closed a connection",
                     peer.pid
                 );
@@ -468,7 +468,7 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
                 drop(slot);
             });
         if started.is_err() {
-            eprintln!("envcloakd: could not start a connection thread");
+            log_line!("envcloakd: could not start a connection thread");
         }
     }
 }
@@ -561,7 +561,7 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         Lock::NAME => answer::<Lock>(id, &req, |_| {
             let was_unlocked = locked(&shared.state).lock(LockReason::Request);
             if was_unlocked {
-                eprintln!("envcloakd: vault locked (reason: request)");
+                log_line!("envcloakd: vault locked (reason: request)");
             }
             Ok(LockedView { was_unlocked })
         }),
@@ -681,7 +681,7 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
     match &r {
         Ok(_) => {
             s.limiter().succeeded();
-            eprintln!("envcloakd: vault unlocked");
+            log_line!("envcloakd: vault unlocked");
             // File backups over 7 days old go (SPEC §6.4); they are purged
             // when one is written, too.
             let secs = at
@@ -689,7 +689,7 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
             if envcloak_core::file_backup::purge_file_backups(s.paths(), secs).is_err() {
-                eprintln!("envcloakd: old file backups could not be removed");
+                log_line!("envcloakd: old file backups could not be removed");
             }
             s.audit(AuditEvent::Unlocked {
                 pid: peer.pid,
@@ -734,12 +734,12 @@ fn create(
     let r = s.finish_create(generation, now, result);
     match &r {
         Ok(v) if v.locked => {
-            eprintln!(
+            log_line!(
                 "envcloakd: vault created, then locked (a lock arrived while it was created)"
             );
         }
         Ok(_) => {
-            eprintln!("envcloakd: vault created and unlocked");
+            log_line!("envcloakd: vault created and unlocked");
             s.audit(AuditEvent::Unlocked {
                 pid: peer.pid,
                 created: true,

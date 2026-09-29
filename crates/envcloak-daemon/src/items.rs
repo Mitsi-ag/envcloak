@@ -623,7 +623,7 @@ pub fn remove(
     let t = resolve(v)?;
     // The backup keeps the item's values; without it nothing is removed.
     let backup = v.create_backup().map_err(|e| {
-        eprintln!(
+        log_line!(
             "envcloakd: the backup before a removal could not be written ({}); nothing was removed",
             vault_reason(e.kind())
         );

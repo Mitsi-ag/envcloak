@@ -675,7 +675,7 @@ pub fn files_backup(
             RpcError::new(ErrorKind::VaultTampered)
         }
         k => {
-            eprintln!(
+            log_line!(
                 "envcloakd: a file backup could not be written ({}); nothing was deleted",
                 vault_reason(k)
             );
@@ -688,7 +688,7 @@ pub fn files_backup(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     if let Err(e) = purge_file_backups(v.paths(), secs) {
-        eprintln!(
+        log_line!(
             "envcloakd: old file backups could not be removed ({})",
             vault_reason(e.kind())
         );

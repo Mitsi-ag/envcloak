@@ -14,6 +14,18 @@
 //! - `envcloakd internal hardening` is a hidden, value-free diagnostic that
 //!   prints `key=value` hardening lines.
 
+/// Writes a line to standard error, and goes on when the write fails: the
+/// terminal the daemon was started in may be closed, or the process
+/// reading its log gone. `eprintln!` panics then, and a panic in the
+/// signal thread left the daemon running after SIGTERM, holding its lock
+/// file.
+macro_rules! log_line {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod audit;
 mod clock;
 mod import;
@@ -64,7 +76,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("{USAGE}");
+    log_line!("{USAGE}");
     ExitCode::from(2)
 }
 
@@ -72,7 +84,7 @@ fn serve(cfg: DaemonConfig) -> ExitCode {
     match run_daemon(cfg) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("envcloakd: {}: {}", e.token(), e.message());
+            log_line!("envcloakd: {}: {}", e.token(), e.message());
             ExitCode::FAILURE
         }
     }

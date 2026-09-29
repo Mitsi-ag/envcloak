@@ -166,7 +166,7 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 
 ## Lock
 
-The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then removes the socket and exits 0), after the machine slept, and after the idle limit (8 hours by default, 1 minute to 24 hours with `--idle-lock`). Locking drops the unlocked vault, whose VMK, subkeys and decrypted metadata are wiped as they are freed, and keeps the file open and its lock held.
+The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then removes the socket and exits 0, also when its standard error is gone: a log line that cannot be written is dropped, never fatal), after the machine slept, and after the idle limit (8 hours by default, 1 minute to 24 hours with `--idle-lock`). Locking drops the unlocked vault, whose VMK, subkeys and decrypted metadata are wiped as they are freed, and keeps the file open and its lock held.
 
 - **Sleep.** On a one-second tick and before every request, the daemon compares how far two clocks moved since its last reading: time awake (macOS `CLOCK_UPTIME_RAW`, Linux `CLOCK_MONOTONIC`) and time including sleep (macOS `CLOCK_MONOTONIC_RAW`, Linux `CLOCK_BOOTTIME`). Each pair counts the same timebase from boot, so the difference is only the time asleep. When the second ran more than 5 seconds ahead, the machine slept. Deltas since the last reading, never totals, so drift does not add up.
 - **Idle.** Awake time since the last activity: a successful `unlock`, `vault.create` or `approve`, and a covered `run.request`, which releases values. `status`, `lock`, `grants.list` and `pending.get` are not activity, so polling never keeps the vault open.

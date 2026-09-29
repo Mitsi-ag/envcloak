@@ -441,7 +441,7 @@ impl State {
     /// [`crate::audit::AuditLog`]).
     pub fn audit(&mut self, e: AuditEvent) {
         if let Some(line) = e.line() {
-            eprintln!("{line}");
+            log_line!("{line}");
         }
         self.audit_open();
         self.audit.record(e.record());
@@ -456,13 +456,13 @@ impl State {
         match self.audit.write_now(&e.record()) {
             Ok(_) => {
                 if let Some(line) = e.line() {
-                    eprintln!("{line}");
+                    log_line!("{line}");
                 }
                 self.anchor_if_due(None);
                 true
             }
             Err(err) => {
-                eprintln!(
+                log_line!(
                     "envcloakd: audit: a delivery's entry could not be written ({}); the request \
                      is denied",
                     err.kind().token()
@@ -537,12 +537,12 @@ impl State {
         let saved = (self.save_head)(v, head);
         if self.audit.anchor_saved(saved.is_ok(), awake) {
             match saved {
-                Err(e) => eprintln!(
+                Err(e) => log_line!(
                     "envcloakd: warning: the audit log's head could not be saved in the vault \
                      ({}); it is tried again",
                     vault_reason(e.kind())
                 ),
-                Ok(()) => eprintln!("envcloakd: the audit log's head was saved in the vault again"),
+                Ok(()) => log_line!("envcloakd: the audit log's head was saved in the vault again"),
             }
         }
     }
@@ -582,7 +582,7 @@ impl State {
 /// saves the head when a save is due.
 fn save_at_lock(save: SaveHead, v: &mut Vault, head: AuditHead) {
     if let Err(e) = save(v, head) {
-        eprintln!(
+        log_line!(
             "envcloakd: warning: the audit log's head could not be saved in the vault ({}); it \
              is tried again after the next unlock",
             vault_reason(e.kind())

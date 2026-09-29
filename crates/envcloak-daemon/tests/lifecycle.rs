@@ -171,6 +171,59 @@ fn a_termination_signal_locks_and_exits() {
     home.assert_clean(&all);
 }
 
+/// A daemon whose standard error went away (the terminal it was started in
+/// closed, or the process reading its log exited) still locks, removes the
+/// socket and exits on a termination signal, so a new daemon can start: a
+/// failed log write never stops it.
+#[test]
+fn a_termination_signal_stops_a_daemon_whose_log_is_gone() {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let home = TestHome::new();
+    for sig in ["-TERM", "-HUP"] {
+        let mut cmd = Command::new(exe());
+        home.apply(&mut cmd)
+            .arg("--foreground")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let mut log = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("listening on") {
+            line.clear();
+            assert_ne!(log.read_line(&mut line).unwrap(), 0, "it never listened");
+        }
+        // The reader goes: every later write to standard error fails.
+        drop(log);
+        let status = Command::new("kill")
+            .arg(sig)
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        let exited = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if std::time::Instant::now() >= end {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if exited.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let exited = exited.expect("the daemon did not exit on the signal");
+        assert!(exited.success(), "{sig}: {exited:?}");
+        assert!(!run_paths(&home).socket.exists(), "the socket is removed");
+        // The lock file was released: a new daemon starts.
+        drop(start(&home));
+    }
+}
+
 /// A `lock` that arrives while `vault.create` runs Argon2id: the vault is
 /// still created, under the passphrase and kit sent, and then locked, and
 /// the answer says so (the client told the user to keep that kit). A
