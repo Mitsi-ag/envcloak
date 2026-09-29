@@ -948,12 +948,16 @@ pub enum ErrorKind {
     NoSuchBackup,
     /// A file backup could not be written, or could not be read back.
     FilesBackupFailed,
+    /// The caller's process tree had as many values compared with the
+    /// vault as an hour allows (`import.plan`, `import.commit`,
+    /// `import.verify`).
+    TooManyChecks,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 36] = [
+    pub const ALL: [ErrorKind; 37] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -989,6 +993,7 @@ impl ErrorKind {
         ErrorKind::PlanChanged,
         ErrorKind::NoSuchBackup,
         ErrorKind::FilesBackupFailed,
+        ErrorKind::TooManyChecks,
         ErrorKind::Internal,
     ];
 
@@ -1030,6 +1035,7 @@ impl ErrorKind {
             ErrorKind::PlanChanged => -32029,
             ErrorKind::NoSuchBackup => -32030,
             ErrorKind::FilesBackupFailed => -32031,
+            ErrorKind::TooManyChecks => -32032,
             ErrorKind::Internal => -32099,
         }
     }
@@ -1072,6 +1078,7 @@ impl ErrorKind {
             ErrorKind::PlanChanged => "plan_changed",
             ErrorKind::NoSuchBackup => "no_such_backup",
             ErrorKind::FilesBackupFailed => "files_backup_failed",
+            ErrorKind::TooManyChecks => "too_many_checks",
             ErrorKind::Internal => "internal",
         }
     }
@@ -1143,6 +1150,10 @@ impl ErrorKind {
             ErrorKind::FilesBackupFailed => {
                 "the encrypted backup of the files could not be written or read; nothing was \
                  deleted or restored"
+            }
+            ErrorKind::TooManyChecks => {
+                "this process tree has had as many values compared with the vault as an hour \
+                 allows; try again later"
             }
             ErrorKind::Internal => "the daemon failed",
         }

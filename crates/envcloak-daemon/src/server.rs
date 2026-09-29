@@ -171,6 +171,8 @@ pub(crate) struct Shared {
     /// The provider registry compiled into this build, whose key patterns
     /// mask keys in the command lines the audit log keeps.
     pub(crate) registry: Option<Registry>,
+    /// Values compared with the vault, per subject root.
+    pub(crate) value_checks: Mutex<crate::import::ValueChecks>,
 }
 
 impl Shared {
@@ -296,6 +298,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         runtime_dir_fallback: run.fallback,
         catalog,
         registry,
+        value_checks: Mutex::new(crate::import::ValueChecks::default()),
     });
 
     {
@@ -591,12 +594,14 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         }
         ItemsRotate::NAME => answer::<ItemsRotate>(id, &req, |p| items::rotate(shared, peer, p)),
         ItemsRemove::NAME => answer::<ItemsRemove>(id, &req, |p| items::remove(shared, peer, p)),
-        ImportPlan::NAME => answer::<ImportPlan>(id, &req, |p| import::import_plan(shared, p)),
+        ImportPlan::NAME => {
+            answer::<ImportPlan>(id, &req, |p| import::import_plan(shared, peer, p))
+        }
         ImportCommit::NAME => {
             answer::<ImportCommit>(id, &req, |p| import::import_commit(shared, peer, p))
         }
         ImportVerify::NAME => {
-            answer::<ImportVerify>(id, &req, |p| import::import_verify(shared, p))
+            answer::<ImportVerify>(id, &req, |p| import::import_verify(shared, peer, p))
         }
         FilesBackup::NAME => {
             answer::<FilesBackup>(id, &req, |p| import::files_backup(shared, peer, p))

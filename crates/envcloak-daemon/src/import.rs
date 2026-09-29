@@ -33,6 +33,21 @@
 //! Recovery Kit is confirmed. `files.backup` writes the encrypted backup
 //! a deletion needs first, and purges backups over 7 days old.
 //!
+//! Comparing a value with the vault tells the caller whether the vault
+//! holds it, so it is guarded as SPEC §6.5 guards doctor's matching:
+//! - A value short enough to guess ([`guessable`]: under 16 bytes, and no
+//!   provider's key pattern matches it) is imported and compared only for
+//!   a person: a terminal subject with no agent by any evidence, as a
+//!   proof requires. For any other caller it is left where it is
+//!   ([`SkipReason::Guessable`]) by the plan and by `import.verify`,
+//!   whether the vault holds it or not.
+//! - Each subject root may have [`MAX_VALUE_CHECKS`] values compared in
+//!   [`CHECK_WINDOW`] of awake time (`import.plan`, `import.commit` and
+//!   `import.verify` count), and more are refused (`too_many_checks`).
+//! - Each `import.plan` and `import.verify` is audited with the count of
+//!   values compared (kind `import`, outcome `checked`), and a refusal
+//!   too.
+//!
 //! `files.restore` and `recovery.confirm` are proofs, as `rotate` is: the
 //! caller must be a terminal subject with no agent by any evidence, the
 //! attempt limiter must admit the attempt, and the passphrase (or the
@@ -44,8 +59,9 @@
 //! Nothing here answers with a value except `files.restore`, and no error
 //! repeats text a client sent.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::time::Duration;
 
 use envcloak_core::audit::AuditKind;
 use envcloak_core::crypto::{CryptoErrorKind, ItemClass};
@@ -66,8 +82,8 @@ use envcloak_ipc::view::{
 };
 use envcloak_ipc::{RpcError, WireSecret};
 use envcloak_policy::{
-    Binding, EnvName, ManifestError, ProfileName, SubjectEvidence, bind_items, load_project,
-    resolve,
+    Binding, EnvName, ManifestError, ProcessInstance, ProfileName, SubjectEvidence, bind_items,
+    load_project, resolve,
 };
 use envcloak_providers::shaped_like_secret;
 use envcloak_sys::PeerIdentity;
@@ -108,6 +124,19 @@ pub const SECRET_WORDS: [&str; 21] = [
     "SESSION",
     "DSN",
 ];
+/// Values shorter than this that no provider's key pattern matches are
+/// short enough to guess (SPEC §6.5): compared with the vault only for a
+/// person.
+pub const GUESSABLE_BELOW: usize = 16;
+/// Values one subject root may have compared with the vault within
+/// [`CHECK_WINDOW`]: an `import --scan` of the largest request (plan,
+/// commit and a verify) three times over.
+pub const MAX_VALUE_CHECKS: usize = 100_000;
+/// The window [`MAX_VALUE_CHECKS`] counts in, in awake time.
+pub const CHECK_WINDOW: Duration = Duration::from_secs(3600);
+/// Subject roots counted at once; a new root beyond it is refused until a
+/// window ends.
+pub const MAX_CHECKING_ROOTS: usize = 4096;
 /// Numbered slugs tried for a new item (`<base>/<project>-2`, ...).
 const SLUG_TRIES: usize = 99;
 /// The longest project part of a new item's slug.
@@ -121,6 +150,98 @@ fn invalid() -> RpcError {
 fn secret_name(name: &str) -> bool {
     name.split('_')
         .any(|w| SECRET_WORDS.iter().any(|s| s.eq_ignore_ascii_case(w)))
+}
+
+/// Whether `value` is short enough to guess: under [`GUESSABLE_BELOW`]
+/// bytes, and no provider's key pattern matches it.
+fn guessable(shared: &Shared, value: &SecretBytes) -> bool {
+    value.len() < GUESSABLE_BELOW
+        && !shared
+            .registry
+            .as_ref()
+            .is_some_and(|r| !r.detect(value, None).candidates.is_empty())
+}
+
+/// Values compared with the vault, per subject root, in the current
+/// window of each.
+#[derive(Debug, Default)]
+pub(crate) struct ValueChecks {
+    /// Each root, when its window started (awake time) and how many values
+    /// it has had compared since.
+    by_root: HashMap<ProcessInstance, (Duration, usize)>,
+}
+
+impl ValueChecks {
+    /// Counts `n` values compared for `root` at `awake`; false (and
+    /// nothing counted) when that would pass [`MAX_VALUE_CHECKS`] in the
+    /// root's window, or when [`MAX_CHECKING_ROOTS`] other roots are
+    /// counted.
+    pub(crate) fn admit(&mut self, root: &ProcessInstance, n: usize, awake: Duration) -> bool {
+        self.by_root
+            .retain(|_, (start, _)| awake.saturating_sub(*start) < CHECK_WINDOW);
+        if !self.by_root.contains_key(root) && self.by_root.len() >= MAX_CHECKING_ROOTS {
+            return false;
+        }
+        let (_, count) = self.by_root.entry(root.clone()).or_insert((awake, 0));
+        match count.checked_add(n) {
+            Some(total) if total <= MAX_VALUE_CHECKS => {
+                *count = total;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Who asks to compare values: whether the caller is a person, to whom
+/// guessable values are compared too, and its evidence.
+struct Asker {
+    evidence: SubjectEvidence,
+    person: bool,
+}
+
+/// Reads who asks, admits the values `count` says are compared for them
+/// (given whether they are a person), and audits the call (`method`) with
+/// that count, or the refusal.
+fn ask(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    claims: &[String],
+    method: &'static str,
+    count: impl FnOnce(bool) -> usize,
+) -> Result<Asker, RpcError> {
+    let evidence = evidence(shared, peer, claims)?;
+    let person = evidence.proof_refusal().is_none();
+    let n = count(person);
+    let now = now_of(&shared.clocks);
+    let admitted = locked(&shared.value_checks).admit(&evidence.root(), n, now.awake);
+    shared.audit(AuditEvent::ValuesChecked {
+        pid: peer.pid,
+        subject: subject_summary(peer, &evidence),
+        method,
+        values: n,
+        refused: !admitted,
+    });
+    if !admitted {
+        return Err(RpcError::new(ErrorKind::TooManyChecks));
+    }
+    Ok(Asker { evidence, person })
+}
+
+/// Whether the value of the variable `name` is compared with the vault
+/// for this caller: a secret, and not short enough to guess unless the
+/// caller is a person. The reason it is left out otherwise.
+fn compare(
+    shared: &Shared,
+    name: &str,
+    value: &SecretBytes,
+    person: bool,
+) -> Result<(), SkipReason> {
+    classify(shared, name, value)?;
+    if !person && guessable(shared, value) {
+        return Err(SkipReason::Guessable);
+    }
+    Ok(())
 }
 
 /// Whether `value`, read from the variable `name`, is a secret an import
@@ -319,14 +440,25 @@ fn reference(m: &ItemMeta, field: &FieldName) -> String {
     }
 }
 
-/// Works out the plan. See the module documentation.
-fn plan(shared: &Shared, v: &Vault, input: &Input) -> Result<Plan, RpcError> {
+/// How many of `input`'s values are compared with the vault for a person
+/// or not.
+fn compared(shared: &Shared, input: &Input, person: bool) -> usize {
+    input
+        .entries
+        .iter()
+        .filter(|e| compare(shared, e.name.as_str(), &e.value, person).is_ok())
+        .count()
+}
+
+/// Works out the plan, for a person or not ([`Asker::person`]). See the
+/// module documentation.
+fn plan(shared: &Shared, v: &Vault, input: &Input, person: bool) -> Result<Plan, RpcError> {
     let mut fates = Vec::with_capacity(input.entries.len());
     let mut items: Vec<PlannedItem> = Vec::new();
     let mut by_key: BTreeMap<ValueKey, usize> = BTreeMap::new();
     let mut taken = BTreeSet::new();
     for (i, e) in input.entries.iter().enumerate() {
-        if let Err(r) = classify(shared, e.name.as_str(), &e.value) {
+        if let Err(r) = compare(shared, e.name.as_str(), &e.value, person) {
             fates.push(Fate::Skip(r));
             continue;
         }
@@ -490,12 +622,20 @@ fn view(p: &Plan) -> ImportPlanView {
 }
 
 /// `import.plan`.
-pub fn import_plan(shared: &Shared, p: ImportParams) -> Result<ImportPlanView, RpcError> {
-    let (input, _) = check_input(p)?;
+pub fn import_plan(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: ImportParams,
+) -> Result<ImportPlanView, RpcError> {
+    let (input, claims) = check_input(p)?;
     refuse_if_traced()?;
+    locked(&shared.state).unlocked()?;
+    let asker = ask(shared, peer, &claims, "import.plan", |person| {
+        compared(shared, &input, person)
+    })?;
     let s = locked(&shared.state);
     let v = s.unlocked()?;
-    Ok(view(&plan(shared, v, &input)?))
+    Ok(view(&plan(shared, v, &input, asker.person)?))
 }
 
 /// `import.commit`.
@@ -507,9 +647,15 @@ pub fn import_commit(
     let wanted = p.digest;
     let (mut input, claims) = check_input(p.import)?;
     refuse_if_traced()?;
-    let caller = evidence(shared, peer, &claims)?;
+    locked(&shared.state).unlocked()?;
+    let Asker {
+        evidence: caller,
+        person,
+    } = ask(shared, peer, &claims, "import.commit", |person| {
+        compared(shared, &input, person)
+    })?;
     let mut s = locked(&shared.state);
-    let plan = plan(shared, s.unlocked()?, &input)?;
+    let plan = plan(shared, s.unlocked()?, &input, person)?;
     if hex(&plan.digest) != wanted {
         return Err(RpcError::new(ErrorKind::PlanChanged));
     }
@@ -570,7 +716,11 @@ fn manifest_error(e: &ManifestError) -> RpcError {
 
 /// `import.verify`. The manifest is opened here, as `run.request` opens
 /// it; nothing the client sent about its contents is used.
-pub fn import_verify(shared: &Shared, p: VerifyParams) -> Result<VerifyView, RpcError> {
+pub fn import_verify(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: VerifyParams,
+) -> Result<VerifyView, RpcError> {
     let path = Path::new(&p.manifest);
     if !path.is_absolute() {
         return Err(RpcError::with_reason(
@@ -580,6 +730,19 @@ pub fn import_verify(shared: &Shared, p: VerifyParams) -> Result<VerifyView, Rpc
     }
     let project = load_project(path).map_err(|e| manifest_error(&e))?;
     let m = &project.manifest;
+    refuse_if_traced()?;
+    locked(&shared.state).unlocked()?;
+    let asker = ask(shared, peer, &p.claims, "import.verify", |person| {
+        p.files
+            .iter()
+            .flat_map(|f| f.entries.iter())
+            .filter(|e| {
+                EnvName::new(&e.name).is_ok_and(|name| {
+                    compare(shared, name.as_str(), e.value.as_secret(), person).is_ok()
+                })
+            })
+            .count()
+    })?;
     let s = locked(&shared.state);
     let v = s.unlocked()?;
     let items = v.items();
@@ -607,7 +770,7 @@ pub fn import_verify(shared: &Shared, p: VerifyParams) -> Result<VerifyView, Rpc
         for e in f.entries {
             let name = EnvName::new(&e.name).map_err(|_| invalid())?;
             let value = e.value.into_inner();
-            let (status, skipped) = match classify(shared, name.as_str(), &value) {
+            let (status, skipped) = match compare(shared, name.as_str(), &value, asker.person) {
                 Err(r) => (EntryStatus::LeftOut, Some(r)),
                 Ok(()) => (stored(v, &bindings, &name, &value), None),
             };
@@ -874,6 +1037,41 @@ mod tests {
         ] {
             assert!(!secret_name(no), "{no}");
         }
+    }
+
+    fn inst(pid: i32) -> ProcessInstance {
+        ProcessInstance {
+            pid,
+            start_time: envcloak_sys::StartTime::from_raw(7),
+            pidversion: None,
+            exe: None,
+        }
+    }
+
+    #[test]
+    fn value_checks_are_counted_per_root_in_a_window() {
+        let mut b = ValueChecks::default();
+        let (one, two) = (inst(10), inst(20));
+        let t0 = Duration::from_secs(1000);
+        assert!(b.admit(&one, MAX_VALUE_CHECKS - 1, t0));
+        assert!(b.admit(&one, 1, t0));
+        // Full: refused, and nothing counted.
+        assert!(!b.admit(&one, 1, t0));
+        assert!(!b.admit(&one, usize::MAX, t0));
+        assert!(b.admit(&one, 0, t0));
+        // Another root has its own count.
+        assert!(b.admit(&two, MAX_VALUE_CHECKS, t0));
+        // The window ends an hour of awake time after its first count.
+        assert!(!b.admit(&one, 1, t0 + CHECK_WINDOW - Duration::from_secs(1)));
+        assert!(b.admit(&one, 1, t0 + CHECK_WINDOW));
+        // At most MAX_CHECKING_ROOTS roots at once.
+        let mut b = ValueChecks::default();
+        for pid in 0..i32::try_from(MAX_CHECKING_ROOTS).unwrap() {
+            assert!(b.admit(&inst(pid + 100), 1, t0));
+        }
+        assert!(!b.admit(&inst(1), 1, t0));
+        assert!(b.admit(&inst(100), 1, t0));
+        assert!(b.admit(&inst(1), 1, t0 + CHECK_WINDOW));
     }
 
     #[test]

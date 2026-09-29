@@ -44,6 +44,7 @@ Each value goes to the daemon, which alone holds the key to compare values. An e
 | `too_large` | Over the vault's 64 KiB field cap |
 | `not_secret` | Configuration: no provider's key pattern matches, no word of the name says secret, and the value is neither a URL with a password nor shaped like a generated key |
 | `interpolated` | It holds `$NAME`, `${NAME}` or `$(...)`, which is never expanded |
+| `guessable` | 8 to 15 bytes with no provider's key shape, from a caller that is not a person (see "Who may compare values") |
 | `reference` | It is an `envcloak://` reference already |
 
 The words of a name (split at `_`) that say secret are `KEY`, `KEYS`, `APIKEY`, `TOKEN`, `TOKENS`, `SECRET`, `SECRETS`, `PASSWORD`, `PASSWORDS`, `PASSWD`, `PASS`, `PWD`, `PASSPHRASE`, `CREDENTIAL`, `CREDENTIALS`, `CREDS`, `PRIVATE`, `SALT`, `SIGNATURE`, `SESSION` and `DSN`, in any case. A URL with a password is `scheme://user:password@...` up to the last `@`. A value is shaped like a generated key when it holds a run of 24 or more ASCII letters and digits mixing two of lowercase, uppercase and digits.
@@ -53,6 +54,14 @@ A value that is kept:
 - is grouped with every equal value, by keyed hash under the vault's `index` subkey, across files and projects: one value in two repos becomes one item both manifests reference;
 - binds to the item that holds it already, the first by slug when several do; every item that holds it is reported, since a value with duplicate owners should have one (gate 10);
 - otherwise becomes a new item, named after its provider (from the value's shape, as `envcloak add` detects it) or its variable, and its project: `openai/acme-web`, `database-url/acme-web`, with the profile added for a profile's file (`short-token/acme-web-short`), and `-2` up to `-99` when a slug is taken. Its provider, classification, links and allowed hosts are filled in from the registry, as `add` fills them.
+
+### Who may compare values
+
+Comparing a value with the vault tells the caller whether the vault holds it, so the daemon guards it as it guards doctor's matching (SPEC §6.5):
+
+- A value short enough to guess, under 16 bytes with no provider's key pattern (a database password, a short token), is imported and compared with the vault only for a person: a terminal subject with no agent by any evidence, as a proof requires. For any other caller, an agent included, the plan and `import.verify` leave it where it is (`guessable`) whether the vault holds it or not; run `envcloak init --import --yes` yourself to import it. A value of 16 bytes or more, or with a provider's key shape, cannot be guessed, and is compared for anyone.
+- Each subject root may have 100,000 values compared per hour of awake time, by `import.plan`, `import.commit` and `import.verify` together (three runs of the largest `import --scan`); beyond that the call is refused (`too_many_checks`).
+- Each of those calls is audited with the count of values it compared (kind `import`, outcome `checked`), and a refusal too; never a value.
 
 The daemon's plan has a digest over every entry's fate, every item and each value's keyed hash. `--yes` commits that plan only: the daemon works it out again under the lock it writes under, and refuses (`plan_changed`) when the vault or the files changed since it was shown. Importing needs no proof, as `add` needs none: nothing is bound to a new item yet.
 
@@ -80,7 +89,7 @@ A symlinked or hard-linked `envcloak.toml` or `.gitignore`, or one another progr
 Only the entries the vault holds leave a file; nothing that was never committed is deleted:
 
 - A file whose every entry the vault holds is removed: renamed aside (`..env.envcloak-del-<hex>.tmp`), checked to be the file checked, then unlinked, so a file an editor saved over the name meanwhile is put back, never removed.
-- A file that also holds entries that are not imported (configuration such as `PORT`, an interpolated value, which may hold a literal password, an `envcloak://` reference, or a value the daemon takes for configuration) is rewritten to hold those, byte for byte as they were, with its comments and blank lines: the new contents are written beside it (`..env.envcloak-new-<hex>.tmp`, the original's mode) and renamed over it. The report names every entry that stays, and why.
+- A file that also holds entries that are not imported (configuration such as `PORT`, an interpolated value, which may hold a literal password, an `envcloak://` reference, a value the daemon takes for configuration, or a short value it compares only for a person, see "Who may compare values") is rewritten to hold those, byte for byte as they were, with its comments and blank lines: the new contents are written beside it (`..env.envcloak-new-<hex>.tmp`, the original's mode) and renamed over it. The report names every entry that stays, and why.
 - A file with no entry the vault holds is left as it is, and not backed up.
 
 The directory is flushed after each change. A crash at any point leaves each entry in its file or committed in the vault: nothing changes before step 3 has passed, and a crash inside a change leaves the file as it was, or its new contents, or the removed file under its temporary name, which the next scan reports (`leftover`) and the `.gitignore` line above keeps out of git. Templates, references-only files, files with another hard link and files that do not parse are never changed. Deletion removes the working copy only: a value that was committed to git, synced or copied elsewhere is still there, and the report says to rotate it.

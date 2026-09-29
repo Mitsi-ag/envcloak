@@ -442,8 +442,14 @@ fn import_commands_print_their_value_free_snapshots() {
     let out = s.person(&["unlock", "--passphrase-fd", "3"], &[]);
     assert!(out.status.success(), "{}", stderr(&out));
 
-    s.snap("init-dry-run", &s.agent(&["init", "--import"], &[]));
-    s.snap("init-import", &s.agent(&["init", "--import", "--yes"], &[]));
+    // The person imports: `SHORT_TOKEN`, short enough to guess, is
+    // imported only for them. The unconfirmed deletion below is an
+    // agent's, which leaves it where it is.
+    s.snap("init-dry-run", &s.person(&["init", "--import"], &[]));
+    s.snap(
+        "init-import",
+        &s.person(&["init", "--import", "--yes"], &[]),
+    );
     s.snap(
         "init-delete-unconfirmed",
         &s.agent(&["init", "--delete-plaintext"], &[]),
@@ -455,8 +461,6 @@ fn import_commands_print_their_value_free_snapshots() {
             &[(4, &kit_file, true)],
         ),
     );
-    // Deleting plaintext is the person's to do: a short value is matched
-    // against the vault only for them.
     let out = s.person(&["init", "--delete-plaintext", "--json"], &[]);
     let backup =
         serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["delete"]["backup"]

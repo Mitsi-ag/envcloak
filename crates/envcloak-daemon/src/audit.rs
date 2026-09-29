@@ -154,6 +154,16 @@ pub enum AuditEvent {
         created: Vec<(ItemId, Slug)>,
         reused: usize,
     },
+    /// Values were compared with the vault (`import.plan`,
+    /// `import.commit`, `import.verify`), or refused for too many: the
+    /// count of values, never one of them.
+    ValuesChecked {
+        pid: i32,
+        subject: SubjectSummary,
+        method: &'static str,
+        values: usize,
+        refused: bool,
+    },
     /// An encrypted backup of files was written (`files.backup`).
     FilesBackedUp {
         pid: i32,
@@ -277,6 +287,20 @@ impl AuditEvent {
             } => format!(
                 "envcloakd: audit: imported created={} reused={reused} pid={pid}",
                 created.len()
+            ),
+            AuditEvent::ValuesChecked {
+                pid,
+                method,
+                values,
+                refused,
+                ..
+            } => format!(
+                "envcloakd: audit: values {} method={method} values={values} pid={pid}",
+                if *refused {
+                    "refused reason=too_many_checks"
+                } else {
+                    "checked"
+                }
             ),
             AuditEvent::FilesBackedUp {
                 pid, backup, files, ..
@@ -481,6 +505,25 @@ impl AuditEvent {
                 ),
                 ..AuditRecord::new(AuditKind::Import, "imported")
             },
+            AuditEvent::ValuesChecked {
+                subject,
+                method,
+                values,
+                refused,
+                ..
+            } => {
+                let outcome = if *refused { "refused" } else { "checked" };
+                AuditRecord {
+                    subject: subject.clone(),
+                    decision: decision(
+                        outcome,
+                        refused.then_some("too_many_checks"),
+                        Some(method),
+                        Some(u64::try_from(*values).unwrap_or(u64::MAX)),
+                    ),
+                    ..AuditRecord::new(AuditKind::Import, outcome)
+                }
+            }
             AuditEvent::FilesBackedUp {
                 subject,
                 backup,

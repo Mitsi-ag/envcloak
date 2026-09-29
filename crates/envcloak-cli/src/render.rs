@@ -749,6 +749,10 @@ fn skip_text(r: SkipReason) -> &'static str {
         SkipReason::LooksLikeValue => "left out: its name is shaped like a key",
         SkipReason::TooLarge => "left out: over 64 KiB",
         SkipReason::NulByte => "left out: it holds a NUL byte",
+        SkipReason::Guessable => {
+            "left out: short enough to guess, so only a person at a terminal with no agent \
+             imports it or has it matched against the vault"
+        }
     }
 }
 

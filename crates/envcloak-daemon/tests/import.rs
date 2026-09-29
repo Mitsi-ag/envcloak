@@ -6,6 +6,9 @@
 //! - `import.commit` writes exactly the plan whose digest it is given;
 //! - `import.verify` answers the delete gate from the manifest the daemon
 //!   opens itself;
+//! - no caller but a person learns whether the vault holds a value short
+//!   enough to guess, and values compared are limited per subject root
+//!   and audited by count;
 //! - `files.restore` and `recovery.confirm` are proofs.
 //!
 //! Every response, the daemon's log, the audit entries and the home are
@@ -25,7 +28,7 @@ use envcloak_ipc::proto::{
     BackupFileParams, ErrorKind, FilesBackupParams, ImportCommitParams, ImportEntry, ImportParams,
     ImportProject, VerifyEntry, VerifyFile, VerifyParams,
 };
-use envcloak_ipc::view::{EntryStatus, ImportPlanView, LengthClass, SkipReason};
+use envcloak_ipc::view::{EntryStatus, ImportPlanView, LengthClass, SkipReason, VerifyView};
 use envcloak_ipc::{ClientError, WireSecret};
 use envcloak_testkit::{
     Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
@@ -266,11 +269,33 @@ fn a_plan_dedups_across_projects_and_the_commit_makes_it() {
     let (entries, _) = v.read_audit().unwrap();
     let imports: Vec<&AuditEntry> = entries
         .iter()
-        .filter(|e| e.record.kind == AuditKind::Import)
+        .filter(|e| e.record.kind == AuditKind::Import && e.record.decision.outcome == "imported")
         .collect();
     assert_eq!(imports.len(), 1);
     assert_eq!(imports[0].record.items.len(), 3);
     assert_eq!(imports[0].record.decision.count, Some(1));
+    // Every call that compared values is audited with their count (the
+    // five secrets of the nine entries), the refused commit too.
+    let checks: Vec<(&str, Option<u64>)> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::Import && e.record.decision.outcome == "checked")
+        .map(|e| {
+            (
+                e.record.decision.method.as_deref().unwrap(),
+                e.record.decision.count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            ("import.plan", Some(5)),
+            ("import.plan", Some(5)),
+            ("import.commit", Some(5)),
+            ("import.plan", Some(5)),
+            ("import.commit", Some(5)),
+        ]
+    );
     for e in &entries {
         assert_no_canary(format!("{:?}", e.record).as_bytes(), &f.cs);
     }
@@ -564,5 +589,268 @@ fn a_file_backup_comes_back_only_with_a_proof() {
     for e in &entries {
         assert_no_canary(format!("{:?}", e.record).as_bytes(), &f.cs);
     }
+    f.sweep();
+}
+
+/// The marker the fixture catalog knows as an agent's.
+const AGENT: &str = "ENVCLOAK_FIXTURE_AGENT";
+
+/// One project, `acme-web`, with `entries`, asked as `claims` says.
+fn one_project(f: &Fixture, entries: Vec<ImportEntry>, claims: &[&str]) -> ImportParams {
+    ImportParams {
+        projects: vec![ImportProject {
+            dir: f.dir("acme-web"),
+            name: "acme-web".into(),
+        }],
+        entries,
+        claims: claims.iter().map(|c| (*c).to_owned()).collect(),
+    }
+}
+
+/// `n` random lowercase letters and digits.
+fn word(n: usize) -> String {
+    let mut out = String::new();
+    while out.len() < n {
+        let seed = fresh_seed();
+        for i in 0..10 {
+            let k = usize::try_from((seed >> (i * 6)) % 36).unwrap();
+            out.push(char::from(b"abcdefghijklmnopqrstuvwxyz0123456789"[k]));
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// A verify answer as it reads for one entry.
+fn statuses(v: &VerifyView) -> Vec<(EntryStatus, Option<SkipReason>)> {
+    v.files[0]
+        .entries
+        .iter()
+        .map(|e| (e.status, e.skipped))
+        .collect()
+}
+
+/// Review finding (high): `import.plan` and `import.verify` confirmed
+/// guesses against the vault for any caller. A value short enough to
+/// guess (the vault's 10-byte `short/acme-web`) is imported and compared
+/// only for a person: an agent's right guess and wrong guess get the same
+/// answer, alone or among many, from `import.plan`, `import.commit` and
+/// `import.verify`, and nothing is imported; a person's are told apart. A
+/// value of 16 bytes or more, which cannot be guessed, is compared for
+/// anyone.
+#[test]
+fn an_agent_guessing_a_short_value_learns_nothing() {
+    let mut f = Fixture::new(|_, _| {});
+    let right = by_label(&f.cs, labels::SHORT_TOKEN).value().to_vec();
+    let wrong = f.short.as_bytes().to_vec();
+    let guess = |v: &[u8], claims: &[&str]| {
+        one_project(&f, vec![entry(0, ".env", None, "DB_PASSWORD", v)], claims)
+    };
+    let mut c = client(&f.home);
+    let hit = c.import_plan(&guess(&right, &[AGENT])).unwrap();
+    let miss = c.import_plan(&guess(&wrong, &[AGENT])).unwrap();
+    assert_eq!(hit, miss);
+    assert_eq!(hit.entries[0].skipped, Some(SkipReason::Guessable));
+    assert!(hit.items.is_empty());
+
+    // 200 guesses in one request, the right one among them.
+    let mut many: Vec<ImportEntry> = (0..200)
+        .map(|n| {
+            let w = word(10);
+            entry(
+                0,
+                ".env",
+                None,
+                &format!("GUESS_{n}_PASSWORD"),
+                w.as_bytes(),
+            )
+        })
+        .collect();
+    many[123] = entry(0, ".env", None, "GUESS_123_PASSWORD", &right);
+    let plan = c.import_plan(&one_project(&f, many, &[AGENT])).unwrap();
+    assert!(plan.items.is_empty());
+    assert!(
+        plan.entries
+            .iter()
+            .all(|e| e.skipped == Some(SkipReason::Guessable))
+    );
+
+    // The delete gate, with a manifest binding the variable to the item
+    // that holds the value: the same answer for both guesses.
+    let manifest = project(
+        &f.home,
+        "guessing",
+        "[env]\nDB_PASSWORD = \"short/acme-web\"\n",
+    );
+    let ask = |c: &mut envcloak_ipc::Client, v: &[u8], claims: &[&str]| {
+        c.import_verify(&VerifyParams {
+            manifest: manifest.to_str().unwrap().to_owned(),
+            files: vec![VerifyFile {
+                file: ".env".into(),
+                profile: None,
+                entries: vec![VerifyEntry {
+                    line: 1,
+                    name: "DB_PASSWORD".into(),
+                    value: WireSecret::new(SecretBytes::copy_from(v)),
+                }],
+            }],
+            claims: claims.iter().map(|c| (*c).to_owned()).collect(),
+        })
+        .unwrap()
+    };
+    let hit = ask(&mut c, &right, &[AGENT]);
+    let miss = ask(&mut c, &wrong, &[AGENT]);
+    assert_eq!(hit, miss);
+    assert_eq!(
+        statuses(&hit),
+        [(EntryStatus::LeftOut, Some(SkipReason::Guessable))]
+    );
+    // The file is still covered: an entry left out stays in its file.
+    assert!(hit.files[0].covered);
+
+    // The commit of an agent's plan imports nothing.
+    let before = c.items_list(false).unwrap().items.len();
+    let plan = c.import_plan(&guess(&right, &[AGENT])).unwrap();
+    let done = c
+        .import_commit(&ImportCommitParams {
+            import: guess(&right, &[AGENT]),
+            digest: plan.digest.clone(),
+        })
+        .unwrap();
+    assert_eq!(done, plan);
+    assert_eq!(c.items_list(false).unwrap().items.len(), before);
+
+    // A person (this test is a terminal session with no agent) is told.
+    let plan = c.import_plan(&guess(&right, &[])).unwrap();
+    assert!(item_of(&plan, 0).existing);
+    assert_eq!(item_of(&plan, 0).holders, ["short/acme-web"]);
+    let plan = c.import_plan(&guess(&wrong, &[])).unwrap();
+    assert!(!item_of(&plan, 0).existing);
+    assert_eq!(
+        statuses(&ask(&mut c, &right, &[])),
+        [(EntryStatus::Stored, None)]
+    );
+    assert_eq!(
+        statuses(&ask(&mut c, &wrong, &[])),
+        [(EntryStatus::NotStored, None)]
+    );
+
+    // 16 bytes or more is compared for anyone.
+    let key = by_label(&f.cs, labels::OPENAI_API_KEY).value().to_vec();
+    let plan = c
+        .import_plan(&one_project(
+            &f,
+            vec![entry(0, ".env", None, "OPENAI_API_KEY", &key)],
+            &[AGENT],
+        ))
+        .unwrap();
+    assert!(item_of(&plan, 0).existing);
+    drop(c);
+
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let agent_checks: Vec<(&str, Option<u64>)> = entries
+        .iter()
+        .filter(|e| {
+            e.record.kind == AuditKind::Import
+                && e.record.decision.outcome == "checked"
+                && e.record.subject.kind.as_deref() == Some("agent")
+        })
+        .map(|e| {
+            (
+                e.record.decision.method.as_deref().unwrap(),
+                e.record.decision.count,
+            )
+        })
+        .collect();
+    // An agent's guesses are never compared: counted as none.
+    assert_eq!(
+        agent_checks,
+        [
+            ("import.plan", Some(0)),
+            ("import.plan", Some(0)),
+            ("import.plan", Some(0)),
+            ("import.verify", Some(0)),
+            ("import.verify", Some(0)),
+            ("import.plan", Some(0)),
+            ("import.commit", Some(0)),
+            ("import.plan", Some(1)),
+        ]
+    );
+    for e in &entries {
+        assert_no_canary(format!("{:?}", e.record).as_bytes(), &f.cs);
+    }
+    f.sweep();
+}
+
+/// Values compared with the vault are limited per subject root: 20
+/// requests of 5,000 secrets reach the hour's 100,000, and the next
+/// comparison is refused (`too_many_checks`) and audited; a request that
+/// compares nothing (configuration only) still passes.
+#[test]
+fn values_compared_are_limited_per_subject_root() {
+    let mut f = Fixture::new(|_, _| {});
+    let value = word(24);
+    f.cs.push(Canary::new("BUDGET_VALUE", value.clone()));
+    let batch = |n: usize| {
+        one_project(
+            &f,
+            (0..n)
+                .map(|_| entry(0, ".env", None, "API_TOKEN", value.as_bytes()))
+                .collect(),
+            &[],
+        )
+    };
+    let mut c = client(&f.home);
+    for _ in 0..20 {
+        let plan = c.import_plan(&batch(5_000)).unwrap();
+        assert_eq!(plan.items.len(), 1);
+    }
+    let e = c.import_plan(&batch(1)).unwrap_err();
+    assert_eq!(rpc(e), ErrorKind::TooManyChecks);
+    let e = c
+        .import_verify(&VerifyParams {
+            manifest: project(&f.home, "budget", "[env]\n")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            files: vec![VerifyFile {
+                file: ".env".into(),
+                profile: None,
+                entries: vec![VerifyEntry {
+                    line: 1,
+                    name: "API_TOKEN".into(),
+                    value: WireSecret::new(SecretBytes::copy_from(value.as_bytes())),
+                }],
+            }],
+            claims: Vec::new(),
+        })
+        .unwrap_err();
+    assert_eq!(rpc(e), ErrorKind::TooManyChecks);
+    let config = one_project(&f, vec![entry(0, ".env", None, "PORT", b"8080")], &[]);
+    assert_eq!(
+        c.import_plan(&config).unwrap().entries[0].skipped,
+        Some(SkipReason::TooShort)
+    );
+    drop(c);
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let refused: Vec<(&str, Option<&str>)> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::Import && e.record.decision.outcome == "refused")
+        .map(|e| {
+            (
+                e.record.decision.method.as_deref().unwrap(),
+                e.record.decision.reason.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        [
+            ("import.plan", Some("too_many_checks")),
+            ("import.verify", Some("too_many_checks")),
+        ]
+    );
     f.sweep();
 }

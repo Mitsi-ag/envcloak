@@ -253,8 +253,9 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
     let s = Story::new();
     let (repo, files) = acme_web(&s.home, &s.cs);
 
-    // A dry run writes nothing and imports nothing.
-    let out = run_in(&s.home, &repo, &["init", "--import"]);
+    // A dry run writes nothing and imports nothing. (The person imports:
+    // `SHORT_TOKEN`, short enough to guess, is imported only for them.)
+    let out = person_in(&s.home, &repo, &["init", "--import"], &[]);
     let text = ok(&out, &s.cs);
     assert!(text.contains("dry run"), "{text}");
     assert!(text.contains("openai/acme-web"), "{text}");
@@ -264,7 +265,12 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
     assert_eq!(json(&ls)["items"].as_array().unwrap().len(), 0);
 
     // S2: the import.
-    let out = run_in(&s.home, &repo, &["init", "--import", "--yes", "--json"]);
+    let out = person_in(
+        &s.home,
+        &repo,
+        &["init", "--import", "--yes", "--json"],
+        &[],
+    );
     ok(&out, &s.cs);
     let r = json(&out);
     assert_eq!(r["import"]["committed"], true);
@@ -325,7 +331,12 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
     assert!(ok(&show, &s.cs).contains("openai"));
 
     // Run again: nothing new, and the files it wrote are as they were.
-    let out = run_in(&s.home, &repo, &["init", "--import", "--yes", "--json"]);
+    let out = person_in(
+        &s.home,
+        &repo,
+        &["init", "--import", "--yes", "--json"],
+        &[],
+    );
     ok(&out, &s.cs);
     let p = &json(&out)["import"]["projects"][0];
     assert_eq!(p["manifest"], "unchanged");
@@ -818,6 +829,11 @@ impl Gate16 {
             .collect()
     }
 
+    /// `envcloak init --import --yes`, as a person runs it.
+    fn import(&self) -> Output {
+        person_in(&self.home, &self.repo, &["init", "--import", "--yes"], &[])
+    }
+
     /// `envcloak init --delete-plaintext`, as a person runs it.
     fn delete(&self) -> Output {
         person_in(&self.home, &self.repo, &["init", "--delete-plaintext"], &[])
@@ -857,10 +873,7 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
     assert_no_canary(&out.stdout, &g.cs);
 
     // 2. A reference that does not resolve.
-    ok(
-        &run_in(&g.home, &g.repo, &["init", "--import", "--yes"]),
-        &g.cs,
-    );
+    ok(&g.import(), &g.cs);
     let manifest = g.repo.join("envcloak.toml");
     let good = std::fs::read_to_string(&manifest).unwrap();
     std::fs::write(
@@ -904,10 +917,7 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
 
     // 4. The Recovery Kit unconfirmed.
     let g = Gate16::new(false);
-    ok(
-        &run_in(&g.home, &g.repo, &["init", "--import", "--yes"]),
-        &g.cs,
-    );
+    ok(&g.import(), &g.cs);
     let out = g.delete();
     assert!(
         stderr(&out).starts_with("envcloak: recovery_kit_unconfirmed:"),
@@ -950,15 +960,38 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
     g.sweep();
 }
 
+/// A value short enough to guess is matched against the vault only for a
+/// person: a deletion run with no terminal, as an agent runs one, leaves
+/// `.env.short` as it is and says why; the person's takes the value out.
+#[test]
+fn a_deletion_without_a_person_leaves_short_values_in_place() {
+    let g = Gate16::new(true);
+    ok(&g.import(), &g.cs);
+    let out = run_in(&g.home, &g.repo, &["init", "--delete-plaintext", "--json"]);
+    ok(&out, &g.cs);
+    let d = &json(&out)["delete"];
+    assert_eq!(strings(&d["rewritten"]), [".env"]);
+    assert_eq!(strings(&d["unchanged"]), [".env.short"]);
+    assert_eq!(strings(&d["removed"]), Vec::<String>::new());
+    let short = &d["verify"]["files"][1]["entries"][0];
+    assert_eq!(short["name"], "SHORT_TOKEN");
+    assert_eq!(short["status"], "left_out");
+    assert_eq!(short["skipped"], "guessable");
+    assert_eq!(g.intact(), [false, true]);
+    file_or_item(&g);
+    let out = g.delete();
+    ok(&out, &g.cs);
+    assert!(!g.repo.join(".env.short").exists());
+    file_or_item(&g);
+    g.sweep();
+}
+
 /// `init --undo` puts a rewritten file back only when it is what the
 /// deletion left: one edited since is left alone (`exists`).
 #[test]
 fn undo_replaces_only_what_the_deletion_left() {
     let g = Gate16::new(true);
-    ok(
-        &run_in(&g.home, &g.repo, &["init", "--import", "--yes"]),
-        &g.cs,
-    );
+    ok(&g.import(), &g.cs);
     let out = person_in(
         &g.home,
         &g.repo,

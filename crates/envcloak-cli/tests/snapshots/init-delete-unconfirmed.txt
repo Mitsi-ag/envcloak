@@ -7,5 +7,6 @@ Delete plaintext in <ROOT>/acme-web
     line 4: PORT (left out: under 8 bytes, so not a secret to inject): stays in the file
     line 5: NODE_ENV (left out: configuration, not a secret): stays in the file
   .env.short: every secret it holds is in the vault
+    line 1: SHORT_TOKEN (left out: short enough to guess, so only a person at a terminal with no agent imports it or has it matched against the vault): stays in the file
 --- stderr
 envcloak: recovery_kit_unconfirmed: the Recovery Kit is not confirmed: run `envcloak recovery confirm` first, so a forgotten passphrase cannot lose what the files held. Nothing was deleted

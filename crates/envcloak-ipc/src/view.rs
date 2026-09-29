@@ -999,6 +999,11 @@ pub enum SkipReason {
     TooLarge,
     /// It holds a NUL byte.
     NulByte,
+    /// 8 to 15 bytes with no provider's key shape: short enough to guess,
+    /// so it is imported and compared with the vault only for a person at
+    /// a terminal with no agent (SPEC §6.5), and this caller is not told
+    /// whether the vault holds it.
+    Guessable,
 }
 
 impl SkipReason {
@@ -1012,6 +1017,7 @@ impl SkipReason {
             SkipReason::LooksLikeValue => "looks_like_value",
             SkipReason::TooLarge => "too_large",
             SkipReason::NulByte => "nul_byte",
+            SkipReason::Guessable => "guessable",
         }
     }
 }
