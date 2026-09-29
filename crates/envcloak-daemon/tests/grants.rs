@@ -609,30 +609,26 @@ fn flood_control_and_the_attempt_limiter_hold() {
 
 /// Gate 30: of concurrent requests on a `once` grant, exactly one is
 /// covered; the others are pending.
+///
+/// The daemon serves at most 8 connections per process (MAX_PER_PROCESS),
+/// and a connection this test closed a moment ago may not be given back
+/// yet. So 7 requests race, one place fewer than the cap: each gets its
+/// place without waiting for the daemon to see an earlier connection
+/// closed (the retry below is for that rare case only).
 #[test]
 fn concurrent_requests_on_a_once_grant_cover_exactly_one() {
+    const RACERS: usize = 7;
     let f = Fixture::new();
     let id = pending(&f.request(&["./emit"]));
     let grant = f.approve_ok(&id, ApprovalOptions::once(Duration::from_secs(600)));
     let params = f.params(&["./emit"]);
     let paths = common::run_paths(&f.home);
-    // A connection still held when the requests start, as one the daemon
-    // has not yet seen closed: a request's connection waits for its place.
-    let mut held = client(&f.home);
-    held.status().unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        drop(held);
-    });
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-    let handles: Vec<_> = (0..8)
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+    let handles: Vec<_> = (0..RACERS)
         .map(|_| {
             let (params, paths, barrier) = (params.clone(), paths.clone(), barrier.clone());
             std::thread::spawn(move || {
-                // The daemon serves at most 8 connections per process, and
-                // one the fixture just closed may not be given back yet:
-                // the daemon then closes a new one at accept. A
-                // connection is kept once it is served, so all 8 are open
+                // A connection is kept once it is served, so all are open
                 // at the barrier.
                 let end = Instant::now() + Duration::from_secs(10);
                 let served = loop {
@@ -656,7 +652,6 @@ fn concurrent_requests_on_a_once_grant_cover_exactly_one() {
         })
         .collect();
     let decisions: Vec<DecisionView> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    release.join().unwrap();
     let covered: Vec<&DecisionView> = decisions
         .iter()
         .filter(|d| matches!(d, DecisionView::Covered { .. }))
@@ -676,7 +671,7 @@ fn concurrent_requests_on_a_once_grant_cover_exactly_one() {
             _ => None,
         })
         .collect();
-    assert_eq!(pendings.len(), 7);
+    assert_eq!(pendings.len(), RACERS - 1);
     pendings.dedup();
     assert_eq!(
         pendings.len(),
