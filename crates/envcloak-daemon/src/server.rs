@@ -722,10 +722,9 @@ fn create(
 ) -> Result<CreatedView, RpcError> {
     let pass = p.passphrase.into_inner();
     let kit_text = p.recovery_kit.into_inner();
-    let mut kdf = KdfParams::current_defaults();
-    if let Some(m) = p.kdf_memory_kib {
-        kdf.m_kib = m;
-    }
+    let kdf = p
+        .kdf_memory_kib
+        .map_or_else(KdfParams::current_defaults, KdfParams::with_memory);
     kdf.check_bounds()
         .map_err(|_| RpcError::new(ErrorKind::KdfParams))?;
     check_passphrase(&pass).map_err(passphrase_error)?;

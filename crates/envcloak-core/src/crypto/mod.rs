@@ -8,8 +8,11 @@
 //!   HKDF-SHA256(ikm = VMK, salt = vault_id, info =
 //!   `envcloak/v1/<purpose>/e<epoch>`). [`keyed_hash`] is keyed BLAKE3 under
 //!   a subkey.
-//! - [`KdfParams`] and [`Kdf`]: Argon2id, with stored parameters checked
-//!   against fixed bounds before any key derivation work.
+//! - [`KdfParams`], [`StoredKdfParams`] and [`Kdf`]: Argon2id. A wrap
+//!   takes a [`KdfParams`] (no salt: it draws a fresh one per envelope);
+//!   an envelope's stored parameters and salt are a [`StoredKdfParams`],
+//!   which only unwrapping reads, checked against fixed bounds before any
+//!   key derivation work.
 //! - [`Envelope`]: the VMK wrapped under a passphrase or Recovery Kit. The
 //!   key-encryption key comes from Argon2id; a key-commitment tag over the
 //!   envelope header is checked in constant time before decryption.
@@ -33,7 +36,7 @@ pub use envelope::{
     Envelope, EnvelopeCtx, UnlockerKind, rewrap_vmk, unwrap_vmk, unwrap_vmk_with, wrap_vmk,
     wrap_vmk_with,
 };
-pub use kdf::{Argon2id, Kdf, KdfParams, Kek};
+pub use kdf::{Argon2id, Kdf, KdfParams, Kek, StoredKdfParams};
 pub use keys::{Keyring, Purpose, SubKey, UnlockerId, VaultId, Vmk, keyed_hash};
 pub(crate) use keys::{keyed_hash_parts, open_subkey, seal_subkey};
 

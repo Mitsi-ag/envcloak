@@ -41,13 +41,13 @@ fn create_vault_makes_a_passphrase_and_a_kit_envelope() {
     for e in [&pass, &kit] {
         let k = e.kdf();
         assert_eq!(
-            (k.m_kib, k.t, k.p),
+            (k.m_kib(), k.t(), k.p()),
             (KdfParams::MIN_M_KIB, KdfParams::MIN_T, KdfParams::MIN_P)
         );
     }
     assert_ne!(
-        pass.kdf().salt,
-        kit.kdf().salt,
+        pass.kdf().salt(),
+        kit.kdf().salt(),
         "each envelope has its own salt"
     );
     assert_ne!(pass.unlocker_id(), kit.unlocker_id());
@@ -121,10 +121,7 @@ fn create_vault_refuses_a_weak_passphrase_or_bad_parameters_before_writing() {
         assert_eq!(e.kind(), VaultErrorKind::Passphrase(want));
         assert!(!paths.data_dir.exists(), "nothing written");
     }
-    let low = KdfParams {
-        m_kib: KdfParams::MIN_M_KIB - 1,
-        ..KdfParams::minimum()
-    };
+    let low = KdfParams::with_memory(KdfParams::MIN_M_KIB - 1);
     let e = create_vault(&paths, &other_passphrase(1), low).unwrap_err();
     assert_eq!(e.kind(), VaultErrorKind::Crypto(CryptoErrorKind::KdfParams));
     assert!(!paths.data_dir.exists());
@@ -304,18 +301,18 @@ fn a_passphrase_change_rewraps_with_the_current_defaults() {
     let got = envelope(&v, UnlockerKind::Passphrase);
     let d = KdfParams::current_defaults();
     assert_eq!(
-        (got.kdf().m_kib, got.kdf().t, got.kdf().p),
-        (d.m_kib, d.t, d.p)
+        (got.kdf().m_kib(), got.kdf().t(), got.kdf().p()),
+        (d.m_kib(), d.t(), d.p())
     );
     assert_eq!(
-        (d.m_kib, d.t, d.p),
+        (d.m_kib(), d.t(), d.p()),
         (
             KdfParams::DEFAULT_M_KIB,
             KdfParams::DEFAULT_T,
             KdfParams::DEFAULT_P
         )
     );
-    assert_ne!(got.kdf().salt, old.kdf().salt);
+    assert_ne!(got.kdf().salt(), old.kdf().salt());
     assert_eq!(got.unlocker_id(), old.unlocker_id());
     assert!(
         envelope(&v, UnlockerKind::RecoveryKit) == kit,

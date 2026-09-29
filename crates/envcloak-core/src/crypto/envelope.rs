@@ -2,7 +2,10 @@
 //! (SPEC §5 "Key hierarchy"; byte layout in docs/CRYPTO.md).
 //!
 //! - KEK = Argon2id(secret, salt, params), through [`derive_kek`], which
-//!   checks the stored parameters against the bounds first.
+//!   checks the stored parameters against the bounds first. A wrap takes
+//!   its parameters as a [`KdfParams`] and draws the salt itself; an
+//!   envelope's stored parameters and salt are a [`StoredKdfParams`], which
+//!   only unwrapping reads, so no re-wrap can reuse them.
 //! - `wrap = HKDF-SHA256(KEK, "envcloak/v1/wrap")` and
 //!   `commit = HKDF-SHA256(KEK, "envcloak/v1/commit")`, with no salt.
 //! - The authenticated header is the envelope's bytes up to and including
@@ -23,7 +26,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use super::aead::{open_into, seal_with_nonce};
-use super::kdf::{Argon2id, Kdf, KdfParams, Kek, derive_kek};
+use super::kdf::{Argon2id, Kdf, KdfParams, Kek, StoredKdfParams, derive_kek};
 use super::keys::{UnlockerId, VaultId, Vmk, blake3_keyed, hkdf_expand};
 use super::{CryptoError, CryptoErrorKind, fill_random};
 use crate::secret::SecretBytes;
@@ -62,7 +65,7 @@ pub struct Envelope {
     kind: UnlockerKind,
     unlocker_id: UnlockerId,
     epoch: u32,
-    kdf: KdfParams,
+    kdf: StoredKdfParams,
     nonce: [u8; 24],
     commitment: [u8; 32],
     ciphertext: [u8; 48],
@@ -96,7 +99,9 @@ impl Envelope {
         self.epoch
     }
 
-    pub fn kdf(&self) -> &KdfParams {
+    /// The parameters and salt this envelope was wrapped with. Unwrapping
+    /// uses them; no wrap accepts them.
+    pub fn kdf(&self) -> &StoredKdfParams {
         &self.kdf
     }
 
@@ -110,10 +115,10 @@ impl Envelope {
         w.put(&self.unlocker_id.0);
         w.put(&self.epoch.to_be_bytes());
         w.put(&[KDF_ARGON2ID]);
-        w.put(&self.kdf.m_kib.to_be_bytes());
-        w.put(&self.kdf.t.to_be_bytes());
-        w.put(&self.kdf.p.to_be_bytes());
-        w.put(&self.kdf.salt);
+        w.put(&self.kdf.m_kib().to_be_bytes());
+        w.put(&self.kdf.t().to_be_bytes());
+        w.put(&self.kdf.p().to_be_bytes());
+        w.put(self.kdf.salt());
         w.put(&self.nonce);
         debug_assert_eq!(w.at, HEADER_LEN);
         h
@@ -155,12 +160,10 @@ impl Envelope {
         if r.take::<1>() != [KDF_ARGON2ID] {
             return Err(format());
         }
-        let kdf = KdfParams {
-            m_kib: u32::from_be_bytes(r.take()),
-            t: u32::from_be_bytes(r.take()),
-            p: u32::from_be_bytes(r.take()),
-            salt: r.take(),
-        };
+        let m_kib = u32::from_be_bytes(r.take());
+        let t = u32::from_be_bytes(r.take());
+        let p = u32::from_be_bytes(r.take());
+        let kdf = StoredKdfParams::parsed(m_kib, t, p, r.take());
         let env = Envelope {
             kind,
             unlocker_id,
@@ -205,9 +208,11 @@ pub fn wrap_vmk(
 }
 
 /// Wraps `vmk` under `secret` with explicit parameters, which must be in
-/// bounds and carry a fresh salt (take them from
-/// [`KdfParams::current_defaults`] or [`KdfParams::minimum`]), and an
-/// explicit KDF backend.
+/// bounds, and an explicit KDF backend. The salt is drawn here from the OS
+/// CSPRNG, fresh for every envelope, so two wraps with the same `params`
+/// never share one. `params` is a [`KdfParams`], made only by its
+/// constructors; an envelope's stored parameters ([`Envelope::kdf`]) are
+/// another type, which this does not accept.
 #[allow(clippy::disallowed_methods)] // Encrypts the VMK under keys from the KEK.
 pub fn wrap_vmk_with<K: Kdf + ?Sized>(
     vmk: &Vmk,
@@ -217,12 +222,16 @@ pub fn wrap_vmk_with<K: Kdf + ?Sized>(
     params: &KdfParams,
     kdf: &K,
 ) -> Result<Envelope, CryptoError> {
-    let kek = derive_kek(kdf, secret, params)?;
+    params.check_bounds()?;
+    let mut salt = [0u8; 16];
+    fill_random(&mut salt)?;
+    let stored = params.stored_with(salt);
+    let kek = derive_kek(kdf, secret, &stored)?;
     let mut env = Envelope {
         kind,
         unlocker_id: ctx.unlocker_id,
         epoch: ctx.epoch,
-        kdf: *params,
+        kdf: stored,
         nonce: [0; 24],
         commitment: [0; 32],
         ciphertext: [0; 48],
@@ -361,7 +370,11 @@ mod tests {
     struct Spy(Cell<usize>);
 
     impl Kdf for Spy {
-        fn derive(&self, secret: &SecretBytes, params: &KdfParams) -> Result<Kek, CryptoError> {
+        fn derive(
+            &self,
+            secret: &SecretBytes,
+            params: &StoredKdfParams,
+        ) -> Result<Kek, CryptoError> {
             self.0.set(self.0.get() + 1);
             Argon2id.derive(secret, params)
         }
@@ -419,7 +432,7 @@ mod tests {
     fn the_commitment_binds_the_kek() {
         let c = ctx();
         let vmk = Vmk::generate();
-        let params = KdfParams::minimum();
+        let params = KdfParams::minimum().stored_with([5; 16]);
         let pass_a = SecretBytes::copy_from(b"passphrase number one A");
         let pass_b = SecretBytes::copy_from(b"passphrase number two B");
         let keys_a = EnvelopeKeys::derive(&Argon2id.derive(&pass_a, &params).unwrap());
@@ -489,12 +502,7 @@ mod tests {
             (u32::MAX, 16, 16),
         ] {
             let mut env = good.clone();
-            env.kdf = KdfParams {
-                m_kib,
-                t,
-                p,
-                ..env.kdf
-            };
+            env.kdf = StoredKdfParams::parsed(m_kib, t, p, *env.kdf.salt());
             let e = unwrap_vmk_with(&env, &pass, &c, &spy).unwrap_err();
             assert_eq!(e.kind(), CryptoErrorKind::KdfParams);
         }

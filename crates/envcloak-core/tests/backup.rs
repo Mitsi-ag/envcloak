@@ -408,15 +408,15 @@ fn a_restore_wraps_the_new_passphrase_with_the_current_defaults() {
     };
     let k = pass.kdf();
     assert_eq!(
-        (k.m_kib, k.t, k.p),
+        (k.m_kib(), k.t(), k.p()),
         (
             KdfParams::DEFAULT_M_KIB,
             KdfParams::DEFAULT_T,
             KdfParams::DEFAULT_P
         )
     );
-    assert_eq!(old_pass.kdf().m_kib, KdfParams::MIN_M_KIB);
-    assert_ne!(k.salt, old_pass.kdf().salt);
+    assert_eq!(old_pass.kdf().m_kib(), KdfParams::MIN_M_KIB);
+    assert_ne!(k.salt(), old_pass.kdf().salt());
     assert_eq!(pass.unlocker_id(), old_pass.unlocker_id());
     let kits: Vec<&Envelope> = v
         .unlockers()

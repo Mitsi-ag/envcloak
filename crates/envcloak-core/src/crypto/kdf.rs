@@ -1,12 +1,23 @@
 //! Argon2id key derivation for unlockers (SPEC §5 "Envelope parameters").
 //!
 //! KEK = Argon2id (version 0x13) of the passphrase or Recovery Kit, with a
-//! 16-byte salt and a 32-byte output. Parameters are stored with each
-//! envelope and are untrusted when read back: [`KdfParams::check_bounds`]
-//! rejects anything outside 64 MiB to 4 GiB of memory, 2 to 16 passes and 1
-//! to 16 lanes, and [`derive_kek`] runs it before any key derivation work,
-//! so a doctored envelope can neither weaken the KDF nor make it exhaust
-//! memory.
+//! 16-byte salt and a 32-byte output. Two types carry the parameters:
+//!
+//! - [`KdfParams`] is what a new envelope is wrapped with: memory, passes
+//!   and lanes, and no salt. Only its constructors make one (the current
+//!   defaults, the minimum, or the defaults at a chosen memory), and
+//!   [`crate::crypto::wrap_vmk_with`] draws a fresh salt for every
+//!   envelope it wraps.
+//! - [`StoredKdfParams`] is what an envelope holds: the parameters and the
+//!   salt it was wrapped with. Only parsing an envelope and wrapping make
+//!   one, only unwrapping reads it, and no wrap accepts it, so a re-wrap
+//!   can never reuse an envelope's stored parameters or salt (gate 3).
+//!
+//! Stored parameters are untrusted when read back:
+//! [`StoredKdfParams::check_bounds`] rejects anything outside 64 MiB to
+//! 4 GiB of memory, 2 to 16 passes and 1 to 16 lanes, and [`derive_kek`]
+//! runs it before any key derivation work, so a doctored envelope can
+//! neither weaken the KDF nor make it exhaust memory.
 //!
 //! Argon2id takes most of a second at the defaults. The daemon must run it
 //! on a blocking thread.
@@ -14,19 +25,21 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use secrecy::{ExposeSecret, SecretBox};
 
-use super::{CryptoError, CryptoErrorKind, fill_random_or_panic};
+use super::{CryptoError, CryptoErrorKind};
 use crate::secret::SecretBytes;
 
-/// Argon2id parameters and salt, as stored in an envelope. Not secret.
+/// The Argon2id cost a new envelope is wrapped with. Not secret.
+///
+/// It holds no salt: [`crate::crypto::wrap_vmk_with`] draws a fresh one for
+/// every envelope, so two wraps with the same parameters never share a
+/// salt. The fields are private and nothing converts an envelope's
+/// [`StoredKdfParams`] into this type: a wrap takes its parameters from
+/// the constructors below and never from an envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfParams {
-    /// Memory in KiB.
-    pub m_kib: u32,
-    /// Passes.
-    pub t: u32,
-    /// Lanes.
-    pub p: u32,
-    pub salt: [u8; 16],
+    m_kib: u32,
+    t: u32,
+    p: u32,
 }
 
 impl KdfParams {
@@ -45,50 +58,120 @@ impl KdfParams {
     pub const DEFAULT_P: u32 = 4;
 
     /// The parameters every new envelope and every re-wrap uses: 256 MiB,
-    /// 3 passes, 4 lanes, and a fresh random salt.
-    ///
-    /// # Panics
-    /// When the OS random number generator fails.
-    pub fn current_defaults() -> Self {
-        Self::fresh(Self::DEFAULT_M_KIB, Self::DEFAULT_T, Self::DEFAULT_P)
+    /// 3 passes, 4 lanes.
+    pub const fn current_defaults() -> Self {
+        Self::with_memory(Self::DEFAULT_M_KIB)
     }
 
-    /// The cheapest parameters the bounds allow (64 MiB, 2 passes, 1 lane),
-    /// with a fresh random salt: for machines that cannot spare 256 MiB,
-    /// and for tests.
-    ///
-    /// # Panics
-    /// When the OS random number generator fails.
-    pub fn minimum() -> Self {
-        Self::fresh(Self::MIN_M_KIB, Self::MIN_T, Self::MIN_P)
+    /// The current defaults with `m_kib` KiB of memory: `vault create` on a
+    /// machine that cannot spare 256 MiB. Not checked here; a wrap refuses
+    /// memory outside the bounds, as [`KdfParams::check_bounds`] does.
+    pub const fn with_memory(m_kib: u32) -> Self {
+        KdfParams {
+            m_kib,
+            t: Self::DEFAULT_T,
+            p: Self::DEFAULT_P,
+        }
     }
 
-    /// The same parameters with a fresh random salt: each envelope draws
-    /// its own.
-    ///
-    /// # Panics
-    /// When the OS random number generator fails.
-    pub fn with_fresh_salt(&self) -> Self {
-        Self::fresh(self.m_kib, self.t, self.p)
+    /// The cheapest parameters the bounds allow (64 MiB, 2 passes, 1 lane):
+    /// for tests.
+    pub const fn minimum() -> Self {
+        KdfParams {
+            m_kib: Self::MIN_M_KIB,
+            t: Self::MIN_T,
+            p: Self::MIN_P,
+        }
     }
 
-    fn fresh(m_kib: u32, t: u32, p: u32) -> Self {
-        let mut salt = [0u8; 16];
-        fill_random_or_panic(&mut salt);
-        KdfParams { m_kib, t, p, salt }
+    /// Memory in KiB.
+    pub const fn m_kib(&self) -> u32 {
+        self.m_kib
+    }
+
+    /// Passes.
+    pub const fn t(&self) -> u32 {
+        self.t
+    }
+
+    /// Lanes.
+    pub const fn p(&self) -> u32 {
+        self.p
     }
 
     /// Fails unless every parameter is within the bounds. Cheap; runs
     /// before any Argon2 work.
     pub fn check_bounds(&self) -> Result<(), CryptoError> {
-        let ok = (Self::MIN_M_KIB..=Self::MAX_M_KIB).contains(&self.m_kib)
-            && (Self::MIN_T..=Self::MAX_T).contains(&self.t)
-            && (Self::MIN_P..=Self::MAX_P).contains(&self.p);
-        if ok {
-            Ok(())
-        } else {
-            Err(CryptoErrorKind::KdfParams.into())
+        check_bounds(self.m_kib, self.t, self.p)
+    }
+
+    /// The stored form of these parameters with `salt`: only a wrap, which
+    /// has just drawn the salt, calls this.
+    pub(crate) const fn stored_with(&self, salt: [u8; 16]) -> StoredKdfParams {
+        StoredKdfParams {
+            m_kib: self.m_kib,
+            t: self.t,
+            p: self.p,
+            salt,
         }
+    }
+}
+
+/// The Argon2id parameters and salt an envelope was wrapped with, as
+/// stored in it and returned by [`crate::crypto::Envelope::kdf`]. Not
+/// secret, and untrusted when parsed: see [`StoredKdfParams::check_bounds`].
+///
+/// Unwrapping derives the KEK with these. No wrap accepts them, and the
+/// fields are private: only parsing an envelope and wrapping make one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredKdfParams {
+    m_kib: u32,
+    t: u32,
+    p: u32,
+    salt: [u8; 16],
+}
+
+impl StoredKdfParams {
+    /// Parameters as read from an envelope's bytes, not yet checked.
+    pub(crate) const fn parsed(m_kib: u32, t: u32, p: u32, salt: [u8; 16]) -> Self {
+        StoredKdfParams { m_kib, t, p, salt }
+    }
+
+    /// Memory in KiB.
+    pub const fn m_kib(&self) -> u32 {
+        self.m_kib
+    }
+
+    /// Passes.
+    pub const fn t(&self) -> u32 {
+        self.t
+    }
+
+    /// Lanes.
+    pub const fn p(&self) -> u32 {
+        self.p
+    }
+
+    /// The envelope's salt.
+    pub const fn salt(&self) -> &[u8; 16] {
+        &self.salt
+    }
+
+    /// Fails unless every parameter is within the bounds in [`KdfParams`].
+    /// Cheap; runs before any Argon2 work.
+    pub fn check_bounds(&self) -> Result<(), CryptoError> {
+        check_bounds(self.m_kib, self.t, self.p)
+    }
+}
+
+fn check_bounds(m_kib: u32, t: u32, p: u32) -> Result<(), CryptoError> {
+    let ok = (KdfParams::MIN_M_KIB..=KdfParams::MAX_M_KIB).contains(&m_kib)
+        && (KdfParams::MIN_T..=KdfParams::MAX_T).contains(&t)
+        && (KdfParams::MIN_P..=KdfParams::MAX_P).contains(&p);
+    if ok {
+        Ok(())
+    } else {
+        Err(CryptoErrorKind::KdfParams.into())
     }
 }
 
@@ -107,7 +190,7 @@ impl core::fmt::Debug for Kek {
 /// runs. [`derive_kek`] checks the parameters before calling it.
 pub trait Kdf {
     /// Derives a KEK from `secret` under `params`, which are within bounds.
-    fn derive(&self, secret: &SecretBytes, params: &KdfParams) -> Result<Kek, CryptoError>;
+    fn derive(&self, secret: &SecretBytes, params: &StoredKdfParams) -> Result<Kek, CryptoError>;
 }
 
 /// Argon2id, version 0x13, 32-byte output, no secret key or associated
@@ -117,7 +200,7 @@ pub struct Argon2id;
 
 impl Kdf for Argon2id {
     #[allow(clippy::disallowed_methods)] // Hashes the passphrase or kit.
-    fn derive(&self, secret: &SecretBytes, params: &KdfParams) -> Result<Kek, CryptoError> {
+    fn derive(&self, secret: &SecretBytes, params: &StoredKdfParams) -> Result<Kek, CryptoError> {
         params.check_bounds()?;
         let mut result = Ok(());
         let kek = SecretBox::init_with_mut(|out: &mut [u8; 32]| {
@@ -139,7 +222,7 @@ impl Kdf for Argon2id {
 pub(crate) fn derive_kek<K: Kdf + ?Sized>(
     kdf: &K,
     secret: &SecretBytes,
-    params: &KdfParams,
+    params: &StoredKdfParams,
 ) -> Result<Kek, CryptoError> {
     params.check_bounds()?;
     kdf.derive(secret, params)
@@ -185,22 +268,16 @@ mod tests {
 
     #[test]
     fn bounds_are_inclusive_and_enforced() {
-        let base = KdfParams::minimum();
-        base.check_bounds().unwrap();
+        KdfParams::minimum().check_bounds().unwrap();
         KdfParams::current_defaults().check_bounds().unwrap();
         let edges_ok = [
             (KdfParams::MIN_M_KIB, KdfParams::MIN_T, KdfParams::MIN_P),
             (KdfParams::MAX_M_KIB, KdfParams::MAX_T, KdfParams::MAX_P),
         ];
         for (m_kib, t, p) in edges_ok {
-            KdfParams {
-                m_kib,
-                t,
-                p,
-                ..base
-            }
-            .check_bounds()
-            .unwrap();
+            StoredKdfParams::parsed(m_kib, t, p, [0; 16])
+                .check_bounds()
+                .unwrap();
         }
         let bad = [
             (KdfParams::MIN_M_KIB - 1, 2, 1),
@@ -214,32 +291,44 @@ mod tests {
             (KdfParams::MIN_M_KIB, 2, 17),
         ];
         for (m_kib, t, p) in bad {
-            let e = KdfParams {
-                m_kib,
-                t,
-                p,
-                ..base
-            }
-            .check_bounds()
-            .unwrap_err();
+            let e = StoredKdfParams::parsed(m_kib, t, p, [0; 16])
+                .check_bounds()
+                .unwrap_err();
+            assert_eq!(e.kind(), CryptoErrorKind::KdfParams);
+        }
+        for m_kib in [KdfParams::MIN_M_KIB - 1, KdfParams::MAX_M_KIB + 1] {
+            let e = KdfParams::with_memory(m_kib).check_bounds().unwrap_err();
             assert_eq!(e.kind(), CryptoErrorKind::KdfParams);
         }
     }
 
     #[test]
-    fn fresh_params_get_fresh_salts() {
-        let a = KdfParams::current_defaults();
-        let b = KdfParams::current_defaults();
-        assert_ne!(a.salt, b.salt);
-        assert_eq!((a.m_kib, a.t, a.p), (256 * 1024, 3, 4), "SPEC §5 defaults");
+    fn the_constructors_give_the_spec_parameters() {
+        let d = KdfParams::current_defaults();
+        assert_eq!(
+            (d.m_kib(), d.t(), d.p()),
+            (256 * 1024, 3, 4),
+            "SPEC §5 defaults"
+        );
         let m = KdfParams::minimum();
-        assert_eq!((m.m_kib, m.t, m.p), (64 * 1024, 2, 1));
+        assert_eq!((m.m_kib(), m.t(), m.p()), (64 * 1024, 2, 1));
+        let w = KdfParams::with_memory(100 * 1024);
+        assert_eq!((w.m_kib(), w.t(), w.p()), (100 * 1024, 3, 4));
+        let s = m.stored_with([7; 16]);
+        assert_eq!(
+            (s.m_kib(), s.t(), s.p(), *s.salt()),
+            (64 * 1024, 2, 1, [7; 16])
+        );
     }
 
     struct Spy(Cell<usize>);
 
     impl Kdf for Spy {
-        fn derive(&self, secret: &SecretBytes, params: &KdfParams) -> Result<Kek, CryptoError> {
+        fn derive(
+            &self,
+            secret: &SecretBytes,
+            params: &StoredKdfParams,
+        ) -> Result<Kek, CryptoError> {
             self.0.set(self.0.get() + 1);
             Argon2id.derive(secret, params)
         }
@@ -249,14 +338,11 @@ mod tests {
     fn derive_kek_checks_bounds_before_the_backend() {
         let spy = Spy(Cell::new(0));
         let pass = SecretBytes::copy_from(b"a passphrase for the spy test");
-        let bad = KdfParams {
-            t: 1,
-            ..KdfParams::minimum()
-        };
+        let bad = StoredKdfParams::parsed(KdfParams::MIN_M_KIB, 1, 1, [3; 16]);
         let e = derive_kek(&spy, &pass, &bad).unwrap_err();
         assert_eq!(e.kind(), CryptoErrorKind::KdfParams);
         assert_eq!(spy.0.get(), 0);
-        derive_kek(&spy, &pass, &KdfParams::minimum()).unwrap();
+        derive_kek(&spy, &pass, &KdfParams::minimum().stored_with([3; 16])).unwrap();
         assert_eq!(spy.0.get(), 1);
     }
 
@@ -264,16 +350,20 @@ mod tests {
     #[allow(clippy::disallowed_methods)] // Compares derived keys.
     fn argon2id_backend_depends_on_every_input() {
         let pass = SecretBytes::copy_from(b"correct horse battery staple");
-        let p = KdfParams::minimum();
-        let k = |s: &SecretBytes, p: &KdfParams| *Argon2id.derive(s, p).unwrap().0.expose_secret();
+        let salt = [0x42; 16];
+        let p = KdfParams::minimum().stored_with(salt);
+        let k = |s: &SecretBytes, p: &StoredKdfParams| {
+            *Argon2id.derive(s, p).unwrap().0.expose_secret()
+        };
         let base = k(&pass, &p);
         assert_eq!(base, k(&pass, &p));
         let other = SecretBytes::copy_from(b"correct horse battery stapla");
         assert_ne!(base, k(&other, &p));
-        let mut salted = p;
-        salted.salt[0] ^= 1;
-        assert_ne!(base, k(&pass, &salted));
-        assert_ne!(base, k(&pass, &KdfParams { t: 3, ..p }));
+        let mut salted = salt;
+        salted[0] ^= 1;
+        assert_ne!(base, k(&pass, &KdfParams::minimum().stored_with(salted)));
+        let more_passes = StoredKdfParams::parsed(KdfParams::MIN_M_KIB, 3, 1, salt);
+        assert_ne!(base, k(&pass, &more_passes));
         assert_eq!(
             format!("{:?}", Argon2id.derive(&pass, &p).unwrap()),
             "Kek(..)"

@@ -8,8 +8,10 @@
 //!   canonical tuple; sealed bytes hold no fixture in any encoding.
 //! - Gate 3: out-of-bounds Argon2id parameters are rejected before any
 //!   derivation (a spy KDF counts calls); re-wraps use the current
-//!   defaults; every wrong secret or damaged envelope gives one generic
-//!   error; the commitment rejects a wrong KEK.
+//!   defaults, and every wrap a fresh salt, never an envelope's stored
+//!   parameters or salt (by type, and at run time); every wrong secret or
+//!   damaged envelope gives one generic error; the commitment rejects a
+//!   wrong KEK.
 //!
 //! Argon2id runs at the minimum bounds (64 MiB, t = 2, p = 1), except where
 //! a test checks the defaults.
@@ -21,8 +23,9 @@ use std::collections::HashSet;
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
     Aad, Argon2id, CryptoError, CryptoErrorKind, Envelope, EnvelopeCtx, FieldTag, ItemClass, Kdf,
-    KdfParams, Kek, Keyring, Purpose, Sealed, TableTag, UnlockerId, UnlockerKind, VaultId, Vmk,
-    keyed_hash, open, rewrap_vmk, seal, unwrap_vmk, unwrap_vmk_with, wrap_vmk, wrap_vmk_with,
+    KdfParams, Kek, Keyring, Purpose, Sealed, StoredKdfParams, TableTag, UnlockerId, UnlockerKind,
+    VaultId, Vmk, keyed_hash, open, rewrap_vmk, seal, unwrap_vmk, unwrap_vmk_with, wrap_vmk,
+    wrap_vmk_with,
 };
 use envcloak_testkit::{Canary, Detector, by_label, canaries, fresh_seed, labels};
 
@@ -441,7 +444,7 @@ impl SpyKdf {
 }
 
 impl Kdf for SpyKdf {
-    fn derive(&self, secret: &SecretBytes, params: &KdfParams) -> Result<Kek, CryptoError> {
+    fn derive(&self, secret: &SecretBytes, params: &StoredKdfParams) -> Result<Kek, CryptoError> {
         self.0.set(self.0.get() + 1);
         Argon2id.derive(secret, params)
     }
@@ -491,14 +494,14 @@ fn out_of_bounds_params_are_rejected_before_any_kdf_work() {
     let vmk = Vmk::generate();
     let spy = SpyKdf::new();
 
-    // Wrapping with out-of-bounds parameters never reaches the KDF.
-    for (m_kib, t, p) in out_of_bounds() {
-        let params = KdfParams {
-            m_kib,
-            t,
-            p,
-            ..KdfParams::minimum()
-        };
+    // Wrapping with out-of-bounds memory never reaches the KDF. Passes and
+    // lanes are not a wrap's to choose: every KdfParams constructor sets
+    // them within the bounds.
+    for (m_kib, _, _) in out_of_bounds() {
+        let params = KdfParams::with_memory(m_kib);
+        if params.check_bounds().is_ok() {
+            continue;
+        }
         let e =
             wrap_vmk_with(&vmk, &pass, UnlockerKind::Passphrase, &c, &params, &spy).unwrap_err();
         assert_value_free(&e, CryptoErrorKind::KdfParams, &det);
@@ -745,9 +748,8 @@ fn wrap_vmk_uses_the_current_defaults() {
     let env = wrap_vmk(&vmk, &pass, UnlockerKind::Passphrase, &c).unwrap();
     let d = KdfParams::current_defaults();
     let k = env.kdf();
-    assert_eq!((k.m_kib, k.t, k.p), (d.m_kib, d.t, d.p));
-    assert_eq!((k.m_kib, k.t, k.p), (256 * 1024, 3, 4));
-    assert_ne!(k.salt, d.salt);
+    assert_eq!((k.m_kib(), k.t(), k.p()), (d.m_kib(), d.t(), d.p()));
+    assert_eq!((k.m_kib(), k.t(), k.p()), (256 * 1024, 3, 4));
     assert_eq!(
         fingerprint(&unwrap_vmk(&env, &pass, &c).unwrap()),
         fingerprint(&vmk)
@@ -761,7 +763,7 @@ fn a_rewrap_uses_the_current_defaults_not_the_stored_params() {
     let c = ctx(6);
     let vmk = Vmk::generate();
     let env = wrap_min(&vmk, &old, UnlockerKind::Passphrase, &c);
-    assert_eq!(env.kdf().m_kib, KdfParams::MIN_M_KIB);
+    assert_eq!(env.kdf().m_kib(), KdfParams::MIN_M_KIB);
 
     // The old secret is required.
     let e = rewrap_vmk(&env, &new, &new, &c).unwrap_err();
@@ -770,20 +772,67 @@ fn a_rewrap_uses_the_current_defaults_not_the_stored_params() {
     let re = rewrap_vmk(&env, &old, &new, &c).unwrap();
     let k = re.kdf();
     assert_eq!(
-        (k.m_kib, k.t, k.p),
+        (k.m_kib(), k.t(), k.p()),
         (
             KdfParams::DEFAULT_M_KIB,
             KdfParams::DEFAULT_T,
             KdfParams::DEFAULT_P
         )
     );
-    assert_ne!(k.salt, env.kdf().salt);
+    assert_ne!(k.salt(), env.kdf().salt());
     assert_eq!(re.kind(), env.kind());
     assert_eq!(re.unlocker_id(), env.unlocker_id());
     assert_eq!(
         fingerprint(&unwrap_vmk(&re, &new, &c).unwrap()),
         fingerprint(&vmk)
     );
+}
+
+// Gate 3's re-wrap rule by type: an envelope's stored parameters and salt
+// are a StoredKdfParams, a wrap takes a KdfParams, and nothing converts
+// one into the other, so no re-wrap can pass an envelope's own parameters
+// or salt back in. Each item fails to build if that changes.
+type WrapWith = fn(
+    &Vmk,
+    &SecretBytes,
+    UnlockerKind,
+    &EnvelopeCtx,
+    &KdfParams,
+    &Argon2id,
+) -> Result<Envelope, CryptoError>;
+const _: fn(&Envelope) -> &StoredKdfParams = Envelope::kdf;
+const _: WrapWith = wrap_vmk_with::<Argon2id>;
+static_assertions::assert_type_ne_all!(KdfParams, StoredKdfParams);
+static_assertions::assert_not_impl_any!(StoredKdfParams: Into<KdfParams>);
+static_assertions::assert_not_impl_any!(&'static StoredKdfParams: Into<KdfParams>);
+
+/// Every wrap draws its own salt: two wraps with the same parameters share
+/// none, and neither does a wrap at an envelope's own memory setting, the
+/// nearest a caller can come to its stored parameters.
+#[test]
+fn every_wrap_draws_a_fresh_salt_whatever_its_parameters() {
+    let pass = SecretBytes::copy_from(b"a passphrase for the salts");
+    let c = ctx(1);
+    let vmk = Vmk::generate();
+    let wrap = |params: &KdfParams| {
+        wrap_vmk_with(&vmk, &pass, UnlockerKind::Passphrase, &c, params, &Argon2id).unwrap()
+    };
+    let params = KdfParams::with_memory(KdfParams::MIN_M_KIB);
+    let a = wrap(&params);
+    let b = wrap(&params);
+    let (ka, kb) = (a.kdf(), b.kdf());
+    assert_eq!((ka.m_kib(), ka.t(), ka.p()), (kb.m_kib(), kb.t(), kb.p()));
+    assert_ne!(ka.salt(), kb.salt());
+
+    let again = wrap(&KdfParams::with_memory(ka.m_kib()));
+    assert_ne!(again.kdf().salt(), ka.salt());
+    assert_ne!(again.kdf().salt(), kb.salt());
+    for env in [&a, &b, &again] {
+        assert_eq!(
+            fingerprint(&unwrap_vmk(env, &pass, &c).unwrap()),
+            fingerprint(&vmk)
+        );
+    }
 }
 
 // ---------------------------------------------------------------- errors

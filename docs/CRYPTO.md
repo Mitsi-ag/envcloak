@@ -131,7 +131,7 @@ A failure in step 3 or 4 gives the same error, whatever the cause: a wrong passp
 
 XChaCha20-Poly1305 does not commit to its key: one ciphertext can be made to open under many keys. Checking the commitment before decryption stops a wrong KEK there, so unlock attempts cannot be used as a partitioning oracle over guessed passphrases.
 
-New envelopes, and every re-wrap, use the current defaults (m = 256 MiB, t = 3, p = 4) with a fresh salt, never the stored parameters. `vault create` may choose a lower memory setting for small machines, down to the 64 MiB bound. Every envelope has a salt of its own, including the two `vault create` makes. A passphrase change and a restore's new passphrase envelope are re-wraps: they use the current defaults whatever the old envelope used.
+New envelopes, and every re-wrap, use the current defaults (m = 256 MiB, t = 3, p = 4) with a fresh salt, never the stored parameters. `vault create` may choose a lower memory setting for small machines, down to the 64 MiB bound. Every envelope has a salt of its own, including the two `vault create` makes. A passphrase change and a restore's new passphrase envelope are re-wraps: they use the current defaults whatever the old envelope used. The code holds this by type: a wrap takes memory, passes and lanes from `KdfParams`, whose only constructors are the defaults, the minimum and the defaults at a chosen memory, and draws the salt itself for each envelope; an envelope's stored parameters and salt are a `StoredKdfParams`, which only unwrapping reads and no wrap accepts.
 
 ## Passphrases
 

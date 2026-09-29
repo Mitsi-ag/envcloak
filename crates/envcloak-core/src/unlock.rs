@@ -34,9 +34,9 @@ use crate::vault::{INITIAL_EPOCH, LockedVault, Vault, VaultError, VaultErrorKind
 
 /// Creates a vault at `p` with a passphrase unlocker and a new Recovery
 /// Kit, and returns it unlocked with the kit. Both envelopes use `kdf`'s
-/// Argon2id parameters, each with a salt of its own (`kdf`'s salt is not
-/// used); pass [`KdfParams::current_defaults`], or lower memory for a small
-/// machine, down to the 64 MiB bound.
+/// Argon2id parameters, each with a salt the wrap draws for it; pass
+/// [`KdfParams::current_defaults`], or [`KdfParams::with_memory`] for a
+/// small machine, down to the 64 MiB bound.
 ///
 /// Fails, before any key derivation, when the passphrase breaks the rules
 /// ([`VaultErrorKind::Passphrase`]), the parameters are out of bounds, or a
@@ -75,7 +75,7 @@ pub fn create_vault_with_kit(
             unlocker_id: UnlockerId::generate(),
             epoch: INITIAL_EPOCH,
         };
-        wrap_vmk_with(&vmk, secret, kind, &ctx, &kdf.with_fresh_salt(), &Argon2id)
+        wrap_vmk_with(&vmk, secret, kind, &ctx, &kdf, &Argon2id)
     };
     let envelopes = vec![
         wrap(pass, UnlockerKind::Passphrase)?,
@@ -200,7 +200,7 @@ pub(crate) fn passphrase_envelope(
         new,
         UnlockerKind::Passphrase,
         &ctx,
-        &params.with_fresh_salt(),
+        params,
         &Argon2id,
     )?)
 }
@@ -331,12 +331,16 @@ mod tests {
     use super::*;
     use core::cell::Cell;
 
-    use crate::crypto::{CryptoError, Kek};
+    use crate::crypto::{CryptoError, Kek, StoredKdfParams};
 
     struct Spy(Cell<usize>);
 
     impl Kdf for Spy {
-        fn derive(&self, secret: &SecretBytes, params: &KdfParams) -> Result<Kek, CryptoError> {
+        fn derive(
+            &self,
+            secret: &SecretBytes,
+            params: &StoredKdfParams,
+        ) -> Result<Kek, CryptoError> {
             self.0.set(self.0.get() + 1);
             Argon2id.derive(secret, params)
         }

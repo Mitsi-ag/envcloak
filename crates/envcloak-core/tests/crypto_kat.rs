@@ -307,8 +307,8 @@ fn an_envelope_built_elsewhere_parses_and_unwraps() {
     assert_eq!(env.unlocker_id(), UnlockerId(range(0x50)));
     assert_eq!(env.epoch(), EPOCH);
     let k = env.kdf();
-    assert_eq!((k.m_kib, k.t, k.p), (65536, 2, 1));
-    assert_eq!(k.salt, range::<16>(0x60));
+    assert_eq!((k.m_kib(), k.t(), k.p()), (65536, 2, 1));
+    assert_eq!(*k.salt(), range::<16>(0x60));
     assert_eq!(env.to_bytes().to_vec(), bytes);
 
     // Unwrapping gives the VMK whose subkeys hash as computed elsewhere.
