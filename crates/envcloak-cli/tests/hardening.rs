@@ -665,7 +665,7 @@ fn linux_traced_import_commands_refuse_before_the_scan() {
     }
     // The controls: untraced, the same commands report the template's
     // names without a daemon.
-    for args in [&commands[1][..], commands[3], commands[0]] {
+    for args in [commands[1], commands[3], commands[0]] {
         let out = run(args, false);
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(
