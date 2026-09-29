@@ -28,6 +28,11 @@
 //!   under [`remove_checked`]'s rules: `envcloak init --delete-plaintext`
 //!   rewrites an env file to hold only the entries it did not import.
 //!
+//! A crash between the steps leaves the file, or its replacement, under a
+//! temporary name `.<name>.envcloak-<new|del>-<hex>.tmp` ([`temp_name`]),
+//! which a scan reports ([`ScanErrorKind::Leftover`]) and `envcloak init`
+//! adds a `.gitignore` line for.
+//!
 //! No temporary copy holds anything the caller did not write, and nothing
 //! here writes a backup: plaintext is never copied (SPEC §6.4 "Backups").
 

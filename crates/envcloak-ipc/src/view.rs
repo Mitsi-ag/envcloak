@@ -975,8 +975,8 @@ pub enum RefChange {
 }
 
 /// Why an env-file entry is not imported (SPEC §6.4). It stays where it
-/// is; when its file is deleted, it goes with the file and stays in the
-/// file's encrypted backup.
+/// is: `envcloak init --delete-plaintext` takes only the entries the vault
+/// holds out of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
@@ -1109,7 +1109,7 @@ pub struct VerifyEntryView {
 pub enum EntryStatus {
     /// The item the manifest binds the variable to holds this value.
     Stored,
-    /// Not a secret an import keeps; deleting the file drops it.
+    /// Not imported: it stays in the file (the reason is in `skipped`).
     LeftOut,
     /// A secret the vault does not hold where the manifest binds it: the
     /// file is not deleted.
@@ -1218,15 +1218,24 @@ pub struct SkippedPath {
 }
 
 /// `envcloak init --delete-plaintext`: the gate's answer, and what was
-/// deleted.
+/// deleted. Only the entries the vault holds leave a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteReport {
     pub project_dir: String,
+    /// The daemon's answer, each file's entries in order, with the
+    /// interpolated and reference entries the CLI never sent added as
+    /// [`EntryStatus::LeftOut`].
     pub verify: VerifyView,
     /// The encrypted backup's id, once one was written.
     pub backup: Option<String>,
+    /// Files deleted: the vault holds every entry.
     pub removed: Vec<String>,
+    /// Files rewritten to hold only the entries the vault does not (the
+    /// entries in `verify` that are not stored), as they were.
+    pub rewritten: Vec<String>,
+    /// Files the vault holds none of the entries of: left as they are.
+    pub unchanged: Vec<String>,
     /// Files left in place, and why (a token).
     pub kept: Vec<SkippedPath>,
     /// Hard-linked, symlinked or unreadable env files never considered.

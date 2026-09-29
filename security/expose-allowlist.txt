@@ -17,7 +17,7 @@ crates/envcloak-core/src/passphrase.rs       # reads a new passphrase to check i
 crates/envcloak-core/src/recovery.rs         # encodes the Recovery Kit for display and decodes a typed kit
 crates/envcloak-policy/src/envfile.rs        # parses an --env-file in place; copies each value only into a SecretBuf
 crates/envcloak-scan/src/dotenv.rs           # parses a dotenv file in place for import; copies each value only into a SecretBuf
-crates/envcloak-scan/src/restore.rs          # writes a file back from its encrypted backup for init --undo, after a proof
+crates/envcloak-scan/src/restore.rs          # writes an env file: back from its encrypted backup for init --undo, after a proof; or with the entries the vault holds taken out, for init --delete-plaintext
 crates/envcloak-providers/src/detect.rs      # matches a value against the registry's key patterns in place; returns provider ids and a classification, never the value
 crates/envcloak-ipc/src/frame.rs             # frame bodies: parsed in place and written to a verified peer
 crates/envcloak-ipc/src/wire_secret.rs       # base64-encodes a value into a request or response

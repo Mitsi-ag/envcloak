@@ -17,9 +17,13 @@
 //! - [`atomic`]: [`replace_atomically`], [`create_atomically`],
 //!   [`remove_checked`] and [`rewrite_checked`], which act only on the
 //!   file that was read.
-//! - [`delete`]: [`delete_plaintext`], removal after the four conditions
-//!   of gate 16; [`restore`]: [`restore_file`], a file written back from
-//!   its encrypted backup.
+//! - [`delete`]: [`delete_plaintext`], the entries the vault holds taken
+//!   out of their files after the four conditions of gate 16; [`restore`]:
+//!   [`restore_file`] and [`restore_over`], a file written back from its
+//!   encrypted backup, and [`rewrite_observed`], a file rewritten to hold
+//!   what the vault does not.
+//! - [`pause_point`]: the points gate 16's test kills `envcloak init` at,
+//!   which do nothing outside a test build.
 //!
 //! Nothing here logs, and no error carries text from a file.
 
@@ -30,16 +34,35 @@ pub mod restore;
 pub mod root;
 pub mod walk;
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
 pub use atomic::{
     Inside, MIN_AGE, ModifyError, ModifyErrorKind, create_atomically, remove_checked,
     remove_checked_at, remove_checked_observed, replace_atomically, rewrite_checked,
     rewrite_checked_observed,
 };
-pub use delete::{DeleteGate, DeleteOutcome, DeleteStep, delete_plaintext};
-pub use dotenv::{DotenvEntry, DotenvError, DotenvErrorKind, EntryKind, MAX_DOTENV, parse_dotenv};
-pub use restore::restore_file;
+pub use delete::{DeleteGate, DeleteOutcome, DeleteStep, Remains, delete_plaintext};
+pub use dotenv::{
+    DotenvEntry, DotenvError, DotenvErrorKind, EntryKind, MAX_DOTENV, parse_dotenv, trimmed_from,
+    without_entries,
+};
+pub use restore::{restore_file, restore_over, rewrite_observed};
 pub use root::{FileStamp, ScanError, ScanErrorKind, ScanRoot, open_root, read_capped, read_plain};
 pub use walk::{
     DEFAULT_SKIP_DIRS, FileKind, FoundFile, TEMPLATE_SUFFIXES, Walk, WalkOptions, dotenv_kind,
-    walk_dotenv,
+    leftover_name, walk_dotenv,
 };
+
+/// A point `envcloak init` passes while it imports and deletes plaintext,
+/// named for gate 16's test, which kills the process at each. Nothing in a
+/// build without the `testing` feature, which only tests enable (release
+/// builds never have it: `crates/envcloak-cli/tests/release_features.rs`).
+/// With it, and `ENVCLOAK_TEST_PAUSE_DIR` set, the process says where it
+/// is in that directory and waits to be told to go on.
+pub fn pause_point(name: &str) {
+    #[cfg(feature = "testing")]
+    testing::pause(name);
+    #[cfg(not(feature = "testing"))]
+    let _ = name;
+}

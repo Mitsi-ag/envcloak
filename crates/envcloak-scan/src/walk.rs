@@ -20,6 +20,11 @@
 //!   when its turn comes, so a tree of hundreds of sibling projects never
 //!   runs the process out of descriptors (macOS allows 256 by default).
 //!
+//! A file an interrupted change of an env file left under a temporary name
+//! (`.<name>.envcloak-<new|del>-<hex>.tmp`, see [`crate::atomic`]) is
+//! reported as [`ScanErrorKind::Leftover`]: it may hold plaintext, and no
+//! `.gitignore` line for the env file covers it.
+//!
 //! Each file named `.env` or `.env.<suffix>` is opened as
 //! [`crate::read_capped`] opens one, never through a symlink and never
 //! waiting on a FIFO, and reported as a [`FoundFile`] when it is a regular
@@ -140,6 +145,13 @@ pub fn dotenv_kind(name: &OsStr) -> Option<Result<FileKind, ()>> {
             .map(|p| FileKind::Dotenv { profile: Some(p) })
             .map_err(|_| ()),
     )
+}
+
+/// Whether `name` is a temporary name a change of an env file uses
+/// (`.<name>.envcloak-<what>-<hex>.tmp`, the name left out when long).
+pub fn leftover_name(name: &OsStr) -> bool {
+    let b = name.as_bytes();
+    b.starts_with(b"..env") && b.ends_with(b".tmp") && b.windows(10).any(|w| w == b".envcloak-")
 }
 
 /// The dotenv files under `r`. See the module documentation.
@@ -267,6 +279,11 @@ impl Walk<'_> {
         let mut subdirs = Vec::new();
         for e in entries {
             let child = rel.join(&e.name);
+            if leftover_name(&e.name) {
+                self.pending
+                    .push_back(report(child, ScanErrorKind::Leftover));
+                continue;
+            }
             if let Some(kind) = dotenv_kind(&e.name) {
                 let Ok(kind) = kind else {
                     self.pending

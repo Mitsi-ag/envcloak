@@ -677,6 +677,10 @@ pub struct VerifyParams {
     /// The absolute path of `envcloak.toml`.
     pub manifest: String,
     pub files: Vec<VerifyFile>,
+    /// As [`UnlockParams::claims`]: who asks decides which values the
+    /// daemon compares (IMPORT.md "Who may compare values").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
 }
 
 /// One env file whose deletion is asked about: its entries with values.

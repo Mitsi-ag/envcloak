@@ -447,3 +447,44 @@ fn a_walk_over_many_sibling_projects_keeps_few_descriptors_open() {
     );
     assert!(text.contains(&format!("walked {SIBLINGS}")), "{text}");
 }
+
+/// A file an interrupted change of an env file left under a temporary name
+/// may hold plaintext that no `.gitignore` line for the env file covers:
+/// the scan reports it, and never reads it.
+#[test]
+fn leftovers_of_an_interrupted_change_are_reported() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    for name in [
+        "..env.envcloak-del-0123456789abcdef.tmp",
+        "..env.short.envcloak-new-0123456789abcdef.tmp",
+        "..envcloak-del-0123456789abcdef.tmp",
+        ".gitignore.envcloak-new-0123456789abcdef.tmp",
+        ".env",
+    ] {
+        std::fs::write(dir.path().join(name), b"A=1\n").unwrap();
+    }
+    let r = open_root(dir.path()).unwrap();
+    let mut got: Vec<(String, Option<ScanErrorKind>)> = walk_dotenv(&r, &WalkOptions::default())
+        .map(|x| match x {
+            Ok(f) => (f.rel.to_string_lossy().into_owned(), None),
+            Err(e) => (e.rel.to_string_lossy().into_owned(), Some(e.kind)),
+        })
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    let leftover = Some(ScanErrorKind::Leftover);
+    assert_eq!(
+        got,
+        [
+            (
+                "..env.envcloak-del-0123456789abcdef.tmp".to_owned(),
+                leftover
+            ),
+            (
+                "..env.short.envcloak-new-0123456789abcdef.tmp".to_owned(),
+                leftover
+            ),
+            ("..envcloak-del-0123456789abcdef.tmp".to_owned(), leftover),
+            (".env".to_owned(), None),
+        ]
+    );
+}

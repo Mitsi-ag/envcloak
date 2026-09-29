@@ -11,6 +11,11 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test support only: `pause_point` stops `envcloak init` where gate 16's
+# test kills it. Enabled by the CLI's dev-dependency, never in a release.
+testing = []
+
 [dependencies]
 envcloak-core.workspace = true
 envcloak-policy.workspace = true

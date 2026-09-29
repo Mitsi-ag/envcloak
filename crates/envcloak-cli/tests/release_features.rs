@@ -81,3 +81,37 @@ fn release_builds_never_let_a_client_accept_another_uid() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains(testing));
 }
+
+/// envcloak-scan's `testing` feature compiles the pause points gate 16's
+/// test kills `envcloak init` at; only the CLI's tests enable it, as a
+/// dev-dependency, so no build of the binary has it.
+#[test]
+fn release_builds_never_pause_for_a_test() {
+    let testing = "envcloak-scan feature \"testing\"";
+    for selection in [&[][..], &["-p", "envcloak"][..]] {
+        let tree = features_of("envcloak-scan", selection);
+        assert!(tree.contains("envcloak v0.1"), "{selection:?}: {tree}");
+        assert!(!tree.contains(testing), "{selection:?}: {tree}");
+    }
+    // Control: with dev-dependencies, the feature shows.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let out = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(["tree", "--offline", "--locked", "--prefix", "none"])
+        .args([
+            "-e",
+            "features,normal,dev",
+            "-i",
+            "envcloak-scan",
+            "-p",
+            "envcloak",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains(testing));
+}

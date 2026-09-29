@@ -781,6 +781,10 @@ fn path_reason(token: &str) -> String {
         "too_many_entries" => "a directory with too many entries to scan",
         "too_deep" => "deeper than a scan goes",
         "not_a_profile_name" => "the part after .env. makes no profile name",
+        "leftover" => {
+            "left by an interrupted change of an env file, and may hold plaintext: look at it, \
+             then delete it"
+        }
         "not_utf8" => "its path is not UTF-8",
         "hard_linked" => "it has another hard link, so it is never deleted",
         "invalid" => "it does not parse, so it cannot be checked",
@@ -960,7 +964,7 @@ impl Render for DeleteReport {
                 let text = match e.status {
                     EntryStatus::Stored => continue,
                     EntryStatus::LeftOut => format!(
-                        "{} ({}): goes with the file, and stays in its backup",
+                        "{} ({}): stays in the file",
                         name,
                         e.skipped.map_or("left out", skip_text)
                     ),
@@ -979,13 +983,29 @@ impl Render for DeleteReport {
                 shown_id(b)
             );
         }
+        let names = |v: &[String]| v.iter().map(|p| shown_path(p)).collect::<Vec<_>>();
         if !self.removed.is_empty() {
-            let names: Vec<String> = self.removed.iter().map(|p| shown_path(p)).collect();
-            let _ = writeln!(o, "  deleted: {}", names.join(", "));
+            let _ = writeln!(o, "  deleted: {}", names(&self.removed).join(", "));
+        }
+        if !self.rewritten.is_empty() {
+            let _ = writeln!(
+                o,
+                "  rewritten to hold only the entries not in the vault: {}",
+                names(&self.rewritten).join(", ")
+            );
+        }
+        if !self.removed.is_empty() || !self.rewritten.is_empty() {
             let _ = writeln!(
                 o,
                 "  If these files were ever committed to git, synced or copied, the keys they \
                  held are exposed there: rotate them."
+            );
+        }
+        if !self.unchanged.is_empty() {
+            let _ = writeln!(
+                o,
+                "  left as they are, since the vault holds none of their entries: {}",
+                names(&self.unchanged).join(", ")
             );
         }
         for k in &self.kept {
@@ -1004,7 +1024,7 @@ impl Render for DeleteReport {
                 path_reason(&s.reason)
             );
         }
-        if v.files.is_empty() && self.removed.is_empty() {
+        if v.files.is_empty() && self.removed.is_empty() && self.rewritten.is_empty() {
             let _ = writeln!(o, "  no env file to delete");
         }
         o

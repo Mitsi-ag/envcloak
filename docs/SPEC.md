@@ -433,7 +433,7 @@ Requests with duplicate auth headers or ambiguous framing are rejected. Response
 
 1. Scans `.env*` files, matches values against the vault by keyed hash, and creates any missing items with provider detection. Values that are not secrets stay in the file: under 8 bytes (never injected, §6.1), or configuration (no provider's key pattern matches, no word of the name says secret, and the value is neither a URL with a password nor shaped like a generated key); docs/IMPORT.md has the rules.
 2. Writes `envcloak.toml`, adds each `.env*` file it read (except templates and references-only files) to `.gitignore`.
-3. Verifies with a dry run that every reference resolves, then offers to delete the plaintext files, under the rules in "Deleting plaintext after import" below.
+3. Verifies with a dry run that every reference resolves, then offers to take the imported values out of the plaintext files, under the rules in "Deleting plaintext after import" below.
 4. Adds a short project-level agent note (AGENTS.md / CLAUDE.md managed block) if the user opts in.
 
 `envcloak import --scan ~/Dev` does the same across many repos with a dry-run report first, deduplicating identical values into one item referenced by many projects.
@@ -462,7 +462,7 @@ Scanning and parsing run in the CLI. The CLI sends values to a verified daemon, 
 - an encrypted backup exists;
 - the Recovery Kit is confirmed (`envcloak recovery confirm`).
 
-A file modified in the last 2 minutes, open in another process as far as the system can tell, or with another hard link is kept. Entries that are not secrets go with the file and stay in its encrypted backup; the report names them.
+A file modified in the last 2 minutes, open in another process as far as the system can tell, or with another hard link is kept. Only the entries the vault holds (committed, where the manifest binds their variables) leave a file, so nothing that was never committed is deleted: a file whose every entry the vault holds is deleted; one that also holds entries that are not imported (configuration, an interpolated value, a reference) is rewritten to hold those, as they were; the report names every entry that stays. `envcloak init --undo <id>` puts back a rewritten file only while it is what the deletion left.
 
 Deletion removes the working copy only. Values that were in git history, synced folders, backups or transcripts are marked "exposed: rotate" (in M1 the deletion report says to rotate them; marking items comes with `doctor`, §6.5).
 

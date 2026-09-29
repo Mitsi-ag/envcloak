@@ -2,9 +2,11 @@
 //! confirm` (SPEC §6.4; T13), with a real daemon:
 //! - story steps S2 and S3: a dry run first, then the import with
 //!   providers detected, `envcloak.toml` and `.gitignore` written, the
-//!   delete refused until the Recovery Kit is confirmed, then the files
-//!   deleted after an encrypted backup, metadata-only `ls`, `show` and
-//!   `check`, and `init --undo` putting the files back byte for byte;
+//!   delete refused until the Recovery Kit is confirmed, then the imported
+//!   entries taken out of the files after an encrypted backup (a file with
+//!   entries that are not imported is rewritten to hold them), metadata-only
+//!   `ls`, `show` and `check`, and `init --undo` putting the files back
+//!   byte for byte;
 //! - `.gitignore` edits are idempotent, and template files contribute
 //!   names only;
 //! - one value in two repos becomes one item both reference, found by
@@ -14,8 +16,13 @@
 //!   unreadable file: no hang, nothing followed or modified, no value in
 //!   the report;
 //! - gate 16: each of the four conditions refuses the deletion on its
-//!   own, and `kill -9` at every step leaves either the plaintext file or
-//!   the committed item.
+//!   own, and `kill -9` of `envcloak init --import --yes
+//!   --delete-plaintext` at every step (inside each file's change too)
+//!   leaves every entry of every file in its file or committed in the
+//!   vault where the manifest binds it. The fixture holds entries that are
+//!   not imported: configuration, an interpolated value with a literal
+//!   password in it (`${...}` and `$NAME`), a reference, and a secret the
+//!   daemon cannot tell from configuration.
 //!
 //! Every command's output, the daemon's log and the home are swept for
 //! the canaries.
@@ -24,11 +31,10 @@
 mod common;
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use common::{
     cli_command, data_dir, finish_within, on_terminal_command, outside_dir, secret_file,
@@ -37,15 +43,10 @@ use common::{
 use envcloak_core::crypto::{ItemClass, KdfParams};
 use envcloak_core::vault::{FieldName, ItemDetails, NewItem, Slug, VaultPaths};
 use envcloak_core::{RecoveryKit, SecretBytes, create_vault_with_kit};
-use envcloak_ipc::proto::{
-    BackupFileParams, FilesBackupParams, ImportCommitParams, VerifyEntry, VerifyFile, VerifyParams,
-};
+use envcloak_ipc::proto::{VerifyEntry, VerifyFile, VerifyParams};
 use envcloak_ipc::view::EntryStatus;
 use envcloak_ipc::{Client, RunPaths, WireSecret};
-use envcloak_scan::{
-    DeleteGate, DeleteStep, EntryKind, FileStamp, MAX_DOTENV, delete_plaintext, open_root,
-    parse_dotenv, read_capped,
-};
+use envcloak_scan::{EntryKind, parse_dotenv, trimmed_from};
 use envcloak_testkit::{
     Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
 };
@@ -58,7 +59,7 @@ fn run_in(home: &TestHome, dir: &Path, args: &[&str]) -> Output {
 }
 
 /// Runs `envcloak <args>` in `dir` on a terminal of its own, as a person
-/// gives a proof, with `fds` opened.
+/// runs it, with `fds` opened.
 fn person_in(home: &TestHome, dir: &Path, args: &[&str], fds: &[(i32, &Path, bool)]) -> Output {
     let mut cmd = on_terminal_command(home, args, fds);
     cmd.current_dir(dir);
@@ -81,6 +82,35 @@ fn dq(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// `n` random lowercase letters and digits, generated here.
+fn word(n: usize) -> String {
+    let mut out = String::new();
+    while out.len() < n {
+        let seed = fresh_seed();
+        for i in 0..10 {
+            let k = usize::try_from((seed >> (i * 6)) % 36).unwrap();
+            out.push(char::from(b"abcdefghijklmnopqrstuvwxyz0123456789"[k]));
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// The fixture's values that stay in `.env`: a password inside an
+/// interpolated URL (`${...}`), another inside one written `$NAME`, and a
+/// 14-character secret whose name says nothing of a secret, which the
+/// daemon takes for configuration.
+const REPLICA_PASSWORD: &str = "REPLICA_PASSWORD";
+const QUEUE_PASSWORD: &str = "QUEUE_PASSWORD";
+const APP_SEED: &str = "APP_SEED";
+
+fn with_kept_values(mut cs: Vec<Canary>) -> Vec<Canary> {
+    cs.push(Canary::new(REPLICA_PASSWORD, word(16)));
+    cs.push(Canary::new(QUEUE_PASSWORD, word(16)));
+    cs.push(Canary::new(APP_SEED, word(14)));
+    cs
+}
+
 /// The story's fixture repo `acme-web` (SPEC §15.1): `.env`, `.env.short`
 /// and `.env.example`. Returns the directory and the files' bytes.
 fn acme_web(home: &TestHome, cs: &[Canary]) -> (PathBuf, Vec<(&'static str, Vec<u8>)>) {
@@ -89,11 +119,16 @@ fn acme_web(home: &TestHome, cs: &[Canary]) -> (PathBuf, Vec<(&'static str, Vec<
     let v = |l| by_label(cs, l).as_str();
     let env = format!(
         "# acme-web\nOPENAI_API_KEY={}\nexport STRIPE_SECRET_KEY={}\nGITHUB_TOKEN='{}'\n\
-         DATABASE_URL={}\nPORT=8080\n",
+         DATABASE_URL={}\nPORT=8080\nREPLICA_URL=\"postgres://app:{}@${{DB_HOST}}/app\"\n\
+         QUEUE_URL=amqp://app:{}@$MQ_HOST/jobs\nLEGACY_KEY=envcloak://openai/acme-web\n\
+         APP_SEED={}\n",
         v(labels::OPENAI_API_KEY),
         v(labels::STRIPE_SECRET_KEY),
         v(labels::GITHUB_TOKEN),
         dq(v(labels::DATABASE_URL)),
+        v(REPLICA_PASSWORD),
+        v(QUEUE_PASSWORD),
+        v(APP_SEED),
     );
     let short = format!("SHORT_TOKEN={}\r\n", v(labels::SHORT_TOKEN));
     // A template's values never leave the CLI: this one is a real key's
@@ -114,6 +149,22 @@ fn acme_web(home: &TestHome, cs: &[Canary]) -> (PathBuf, Vec<(&'static str, Vec<
     (dir, files)
 }
 
+/// What the deletion leaves of the fixture's `.env`: every line but the
+/// four imported entries'.
+fn env_left(body: &[u8]) -> Vec<u8> {
+    let imported = [
+        "OPENAI_API_KEY=",
+        "export STRIPE_SECRET_KEY=",
+        "GITHUB_TOKEN=",
+        "DATABASE_URL=",
+    ];
+    body.split_inclusive(|&b| b == b'\n')
+        .filter(|l| !imported.iter().any(|p| l.starts_with(p.as_bytes())))
+        .flatten()
+        .copied()
+        .collect()
+}
+
 fn ok(out: &Output, cs: &[Canary]) -> String {
     assert_no_canary(&out.stdout, cs);
     assert_no_canary(&out.stderr, cs);
@@ -123,6 +174,17 @@ fn ok(out: &Output, cs: &[Canary]) -> String {
 
 fn json(out: &Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn strings(v: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_owned())
+        .collect();
+    out.sort();
+    out
 }
 
 /// A vault created through the CLI (story S1): the passphrase on
@@ -138,7 +200,7 @@ struct Story {
 
 impl Story {
     fn new() -> Self {
-        let cs = canaries(fresh_seed());
+        let cs = with_kept_values(canaries(fresh_seed()));
         let home = TestHome::new();
         let d = start_daemon(&home);
         let files = outside_dir();
@@ -231,6 +293,12 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
     let gitignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
     assert!(gitignore.lines().any(|l| l == "/.env"), "{gitignore}");
     assert!(gitignore.lines().any(|l| l == "/.env.short"), "{gitignore}");
+    // A crash while a file changes leaves it under a temporary name, which
+    // stays out of git too.
+    assert!(
+        gitignore.lines().any(|l| l == ".*.envcloak-*.tmp"),
+        "{gitignore}"
+    );
     assert!(!gitignore.contains(".env.example"), "{gitignore}");
 
     // S3: metadata only. (`check` passes once the plaintext is gone.)
@@ -274,7 +342,7 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
     assert_eq!(json(&ls)["items"].as_array().unwrap().len(), 5);
 
     // The deletion waits for the Recovery Kit.
-    let out = run_in(&s.home, &repo, &["init", "--delete-plaintext"]);
+    let out = person_in(&s.home, &repo, &["init", "--delete-plaintext"], &[]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
         stderr(&out).starts_with("envcloak: recovery_kit_unconfirmed:"),
@@ -293,35 +361,53 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
     );
     assert!(ok(&out, &s.cs).contains("Recovery Kit confirmed"));
 
-    // Now it deletes, after an encrypted backup.
-    let out = run_in(&s.home, &repo, &["init", "--delete-plaintext", "--json"]);
+    // Now it deletes, after an encrypted backup: the imported entries
+    // leave; `.env` keeps the ones that were not imported, as they were.
+    let out = person_in(
+        &s.home,
+        &repo,
+        &["init", "--delete-plaintext", "--json"],
+        &[],
+    );
     ok(&out, &s.cs);
     let d = &json(&out)["delete"];
-    let mut removed: Vec<&str> = d["removed"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|x| x.as_str().unwrap())
-        .collect();
-    removed.sort_unstable();
-    assert_eq!(removed, [".env", ".env.short"]);
+    assert_eq!(strings(&d["removed"]), [".env.short"]);
+    assert_eq!(strings(&d["rewritten"]), [".env"]);
+    assert_eq!(strings(&d["unchanged"]), Vec::<String>::new());
     let backup = d["backup"].as_str().unwrap().to_owned();
     assert_eq!(backup.len(), 26);
-    assert!(!repo.join(".env").exists());
+    assert_eq!(
+        std::fs::read(repo.join(".env")).unwrap(),
+        env_left(&files[0].1)
+    );
     assert!(!repo.join(".env.short").exists());
     assert!(repo.join(".env.example").exists());
-    // PORT went with the file, and the report says so.
-    let port = d["verify"]["files"]
+    // The report names each entry that stays, and why.
+    let left: Vec<(String, String)> = d["verify"]["files"][0]["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .flat_map(|f| f["entries"].as_array().unwrap())
-        .find(|e| e["name"] == "PORT")
-        .unwrap();
-    assert_eq!(port["status"], "left_out");
-    assert_eq!(port["skipped"], "too_short");
+        .filter(|e| e["status"] == "left_out")
+        .map(|e| {
+            (
+                e["name"].as_str().unwrap().to_owned(),
+                e["skipped"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        left,
+        [
+            ("PORT".to_owned(), "too_short".to_owned()),
+            ("REPLICA_URL".to_owned(), "interpolated".to_owned()),
+            ("QUEUE_URL".to_owned(), "interpolated".to_owned()),
+            ("LEGACY_KEY".to_owned(), "reference".to_owned()),
+            ("APP_SEED".to_owned(), "not_secret".to_owned()),
+        ]
+    );
     // The template holds a key's shape on purpose, which `check` reports
-    // as it should; it was never read for its values.
+    // as it should; it was never read for its values. What `.env` keeps
+    // holds no key's shape, and its reference resolves.
     std::fs::remove_file(repo.join(".env.example")).unwrap();
     ok(&run_in(&s.home, &repo, &["check"]), &s.cs);
     let backups = data_dir(&s.home).join("backups");
@@ -335,11 +421,16 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
             .any(|n| n.ends_with(&format!("-{backup}.ecfiles"))),
         "{names:?}"
     );
-    // Everything EnvCloak wrote is ciphertext or metadata.
+    // Everything EnvCloak wrote is ciphertext or metadata; `.env` still
+    // holds what was not imported, on purpose.
+    let kept_env = std::fs::read(repo.join(".env")).unwrap();
+    std::fs::remove_file(repo.join(".env")).unwrap();
     s.sweep();
+    std::fs::write(repo.join(".env"), &kept_env).unwrap();
     let files = &files[..2];
 
-    // The undo is a proof, and puts back the files byte for byte.
+    // The undo is a proof, and puts back the files byte for byte: the
+    // rewritten `.env` is replaced, since it is what the deletion left.
     let mut cmd = cli_command(
         &s.home,
         &["init", "--undo", &backup, "--passphrase-fd", "3"],
@@ -349,7 +440,7 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
     let out = finish_within(cmd, Duration::from_secs(120));
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("proof_refused"), "{}", stderr(&out));
-    assert!(!repo.join(".env").exists());
+    assert!(!repo.join(".env.short").exists());
     let out = person_in(
         &s.home,
         &repo,
@@ -357,6 +448,13 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
         &[(3, &s.pass, true)],
     );
     ok(&out, &s.cs);
+    let states: Vec<String> = json(&out)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["state"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(states, ["restored", "restored"]);
     for (name, body) in files {
         assert_eq!(&std::fs::read(repo.join(name)).unwrap(), body, "{name}");
     }
@@ -656,7 +754,7 @@ struct Gate16 {
 
 impl Gate16 {
     fn new(confirm_kit: bool) -> Self {
-        let cs = canaries(fresh_seed());
+        let cs = with_kept_values(canaries(fresh_seed()));
         let home = TestHome::new();
         let kit = RecoveryKit::generate();
         let paths = VaultPaths::under(data_dir(&home));
@@ -712,27 +810,37 @@ impl Gate16 {
         }
     }
 
-    fn present(&self) -> Vec<bool> {
+    /// Whether each file is there as it was.
+    fn intact(&self) -> Vec<bool> {
         self.files
             .iter()
-            .map(|(n, _)| self.repo.join(n).exists())
+            .map(|(n, body)| std::fs::read(self.repo.join(n)).is_ok_and(|b| b == *body))
             .collect()
     }
 
+    /// `envcloak init --delete-plaintext`, as a person runs it.
     fn delete(&self) -> Output {
-        run_in(&self.home, &self.repo, &["init", "--delete-plaintext"])
+        person_in(&self.home, &self.repo, &["init", "--delete-plaintext"], &[])
     }
 
     fn cleanup(&self) {
-        for (n, _) in &self.files {
-            let _ = std::fs::remove_file(self.repo.join(n));
+        for e in std::fs::read_dir(&self.repo).unwrap() {
+            let n = e.unwrap().file_name();
+            if n.to_string_lossy().contains(".env") {
+                std::fs::remove_file(self.repo.join(n)).unwrap();
+            }
         }
-        let _ = std::fs::remove_file(self.repo.join(".env.example"));
+    }
+
+    fn sweep(&self) {
+        self.cleanup();
+        assert_no_canary(&self.d.log_bytes(), &self.cs);
+        self.home.assert_clean(&self.cs);
     }
 }
 
 /// Gate 16: each condition, failing alone, refuses the deletion, and
-/// nothing is deleted; with all four, the files go.
+/// nothing is deleted; with all four, the imported entries leave.
 #[test]
 fn gate_16_each_condition_refuses_the_deletion_alone() {
     // 1. Not imported: the manifest exists, the values are not in the
@@ -745,7 +853,7 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(g.present(), [true, true]);
+    assert_eq!(g.intact(), [true, true]);
     assert_no_canary(&out.stdout, &g.cs);
 
     // 2. A reference that does not resolve.
@@ -766,7 +874,7 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(g.present(), [true, true]);
+    assert_eq!(g.intact(), [true, true]);
     std::fs::write(&manifest, &good).unwrap();
 
     // 3. No encrypted backup: a file stands where the backups directory
@@ -781,15 +889,18 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(g.present(), [true, true]);
+    assert_eq!(g.intact(), [true, true]);
 
-    // With the three that hold, the files go (the kit was confirmed).
+    // With the three that hold (the kit was confirmed), the imported
+    // entries leave: `.env` keeps the rest, `.env.short` goes.
     let out = g.delete();
     ok(&out, &g.cs);
-    assert_eq!(g.present(), [false, false]);
-    g.cleanup();
-    assert_no_canary(&g.d.log_bytes(), &g.cs);
-    g.home.assert_clean(&g.cs);
+    assert_eq!(
+        std::fs::read(g.repo.join(".env")).unwrap(),
+        env_left(&g.files[0].1)
+    );
+    assert!(!g.repo.join(".env.short").exists());
+    g.sweep();
 
     // 4. The Recovery Kit unconfirmed.
     let g = Gate16::new(false);
@@ -803,7 +914,7 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(g.present(), [true, true]);
+    assert_eq!(g.intact(), [true, true]);
     // And a file changed in the last two minutes is kept.
     let kit = g.home.root().join("kit");
     std::fs::write(
@@ -834,310 +945,281 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
         "{}",
         stdout(&out)
     );
-    assert_eq!(g.present(), [false, true]);
-    g.cleanup();
-    assert_no_canary(&g.d.log_bytes(), &g.cs);
-    g.home.assert_clean(&g.cs);
+    assert_eq!(g.intact(), [false, true]);
+    file_or_item(&g);
+    g.sweep();
 }
 
-/// The environment variable that makes [`gate_16_kill_child`] run.
-const KILL_CHILD: &str = "ENVCLOAK_T13_KILL_REPO";
-
-/// The steps the child passes, in order.
-const STEPS: [&str; 9] = [
-    "start",
-    "planned",
-    "committed",
-    "manifest",
-    "verified",
-    "backed_up",
-    "reverified",
-    "removed_0",
-    "removed_1",
-];
-
-/// The prefix of a step's line. The test harness prints the test's name
-/// before its output, on the same line, so the line starts afresh.
-const STEP: &str = "ENVCLOAK-STEP ";
-
-/// Says `step` on standard output and waits for a line on standard input:
-/// the parent kills this process at the step it chose.
-fn at_step(step: &str) {
-    println!("\n{STEP}{step}");
-    std::io::stdout().flush().unwrap();
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line).unwrap();
-}
-
-/// The delete gate as `envcloak init` answers it, through the daemon.
-struct ChildGate<'a> {
-    client: &'a mut Client,
-    root: &'a envcloak_scan::ScanRoot,
-    manifest: String,
-    files: Vec<(PathBuf, FileStamp, SecretBytes)>,
-}
-
-impl DeleteGate for ChildGate<'_> {
-    type Refusal = String;
-
-    fn verify(&mut self) -> Result<(), String> {
-        let p = VerifyParams {
-            manifest: self.manifest.clone(),
-            files: self
-                .files
-                .iter()
-                .map(|(rel, _, bytes)| VerifyFile {
-                    file: rel.to_string_lossy().into_owned(),
-                    profile: (rel.to_str() == Some(".env.short")).then(|| "short".to_owned()),
-                    entries: parse_dotenv(bytes)
-                        .unwrap()
-                        .into_iter()
-                        .filter(|e| e.kind == EntryKind::Plain)
-                        .map(|e| VerifyEntry {
-                            line: e.line,
-                            name: e.name.as_str().to_owned(),
-                            value: WireSecret::new(e.value),
-                        })
-                        .collect(),
-                })
-                .collect(),
-        };
-        let v = self.client.import_verify(&p).map_err(|e| e.to_string())?;
-        if v.deletable() {
-            Ok(())
-        } else {
-            Err("refused".into())
-        }
-    }
-
-    fn backup(&mut self) -> Result<String, String> {
-        let mut files = Vec::new();
-        for (rel, stamp, _) in &self.files {
-            let (bytes, now) =
-                read_capped(self.root, rel, MAX_DOTENV).map_err(|e| e.to_string())?;
-            assert_eq!(now, *stamp);
-            files.push(BackupFileParams {
-                path: self.root.path().join(rel).to_string_lossy().into_owned(),
-                mode: 0o600,
-                content: WireSecret::new(bytes),
-            });
-        }
-        self.client
-            .files_backup(&FilesBackupParams {
-                files,
-                claims: Vec::new(),
-            })
-            .map(|v| v.id)
-            .map_err(|e| e.to_string())
-    }
-}
-
-/// Gate 16's child: the whole of `init --import --yes --delete-plaintext`
-/// through the library and the daemon, stopping at each step until the
-/// parent says to go on. Does nothing unless the parent started it.
+/// `init --undo` puts a rewritten file back only when it is what the
+/// deletion left: one edited since is left alone (`exists`).
 #[test]
-fn gate_16_kill_child() {
-    let Some(repo) = std::env::var_os(KILL_CHILD) else {
-        return;
-    };
-    let root = open_root(Path::new(&repo)).unwrap();
-    let paths = RunPaths::for_user().unwrap();
-    let mut client = Client::connect(&paths).unwrap();
-    at_step("start");
-    let names = [".env", ".env.short"];
-    let mut files = Vec::new();
-    for n in names {
-        let (bytes, stamp) = read_capped(&root, Path::new(n), MAX_DOTENV).unwrap();
-        files.push((PathBuf::from(n), stamp, bytes));
-    }
-    let params = || {
-        let mut entries = Vec::new();
-        for (rel, _, bytes) in &files {
-            let profile = (rel.to_str() == Some(".env.short")).then(|| "short".to_owned());
-            for e in parse_dotenv(bytes).unwrap() {
-                entries.push(envcloak_ipc::proto::ImportEntry {
-                    project: 0,
-                    file: rel.to_string_lossy().into_owned(),
-                    line: e.line,
-                    profile: profile.clone(),
-                    name: e.name.as_str().to_owned(),
-                    value: WireSecret::new(e.value),
-                });
-            }
-        }
-        envcloak_ipc::proto::ImportParams {
-            projects: vec![envcloak_ipc::proto::ImportProject {
-                dir: root.path().to_string_lossy().into_owned(),
-                name: "acme-web".into(),
-            }],
-            entries,
-            claims: Vec::new(),
-        }
-    };
-    let plan = client.import_plan(&params()).unwrap();
-    at_step("planned");
-    let done = client
-        .import_commit(&ImportCommitParams {
-            import: params(),
-            digest: plan.digest,
-        })
-        .unwrap();
-    at_step("committed");
-    // The manifest, as `init` writes it: each entry's reference.
-    let mut env = String::from("[env]\n");
-    let mut short = String::from("\n[env.short]\n");
-    let mut i = 0;
-    for (rel, _, bytes) in &files {
-        for e in parse_dotenv(bytes).unwrap() {
-            if let Some(at) = done.entries[i].item {
-                let line = format!("{} = \"{}\"\n", e.name, done.items[at as usize].reference);
-                if rel.to_str() == Some(".env.short") {
-                    short.push_str(&line);
-                } else {
-                    env.push_str(&line);
-                }
-            }
-            i += 1;
-        }
-    }
-    std::fs::write(root.path().join("envcloak.toml"), env + &short).unwrap();
-    at_step("manifest");
-    let stamps: Vec<(PathBuf, FileStamp)> = files.iter().map(|(p, s, _)| (p.clone(), *s)).collect();
-    // The gate reads the files again, as `init` does.
-    let mut gate = ChildGate {
-        client: &mut client,
-        root: &root,
-        manifest: root
-            .path()
-            .join("envcloak.toml")
-            .to_string_lossy()
-            .into_owned(),
-        files: files
-            .iter()
-            .map(|(p, s, _)| {
-                let (bytes, now) = read_capped(&root, p, MAX_DOTENV).unwrap();
-                assert_eq!(now, *s);
-                (p.clone(), now, bytes)
-            })
-            .collect(),
-    };
-    let out = delete_plaintext(&root, &stamps, &mut gate, &mut |s| {
-        at_step(match s {
-            DeleteStep::Verified => "verified",
-            DeleteStep::BackedUp => "backed_up",
-            DeleteStep::Reverified => "reverified",
-            DeleteStep::Removed(0) => "removed_0",
-            DeleteStep::Removed(_) => "removed_1",
-        });
-    })
+fn undo_replaces_only_what_the_deletion_left() {
+    let g = Gate16::new(true);
+    ok(
+        &run_in(&g.home, &g.repo, &["init", "--import", "--yes"]),
+        &g.cs,
+    );
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--delete-plaintext", "--json"],
+        &[],
+    );
+    ok(&out, &g.cs);
+    let backup = json(&out)["delete"]["backup"].as_str().unwrap().to_owned();
+    let env = g.repo.join(".env");
+    let mut edited = std::fs::read(&env).unwrap();
+    edited.extend_from_slice(b"ADDED=later\n");
+    std::fs::write(&env, &edited).unwrap();
+    let pass = g.home.root().join("pass");
+    std::fs::write(
+        &pass,
+        format!("{}\n", by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str()),
+    )
     .unwrap();
-    assert!(out.kept.is_empty(), "{:?}", out.kept);
-    println!("\n{STEP}done");
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--undo", &backup, "--passphrase-fd", "3", "--json"],
+        &[(3, &pass, true)],
+    );
+    std::fs::remove_file(&pass).unwrap();
+    assert_no_canary(&out.stdout, &g.cs);
+    assert_no_canary(&out.stderr, &g.cs);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("undo_incomplete"), "{}", stderr(&out));
+    let states: Vec<(String, String)> = json(&out)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["path"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+                f["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            (".env".to_owned(), "exists".to_owned()),
+            (".env.short".to_owned(), "restored".to_owned()),
+        ]
+    );
+    assert_eq!(std::fs::read(&env).unwrap(), edited);
+    assert_eq!(g.intact(), [false, true]);
+    g.sweep();
 }
 
-/// After a kill: each file is there as it was, or its values are
-/// committed where the manifest binds them.
+/// After a kill: every entry of every file is in its file, or committed in
+/// the vault where the manifest binds it. A file that is there is the one
+/// read, or what the deletion leaves of it (some entries taken out whole,
+/// nothing else changed); an entry that left it is a value the vault
+/// holds, as the daemon answers a person at a terminal.
 fn file_or_item(g: &Gate16) {
+    envcloak_sys::testing::enter_terminal_session().unwrap();
     let manifest = g.repo.join("envcloak.toml");
     let mut c =
         Client::connect(&RunPaths::under(envcloak_testkit::daemon_run_dir(&g.home)).unwrap())
             .unwrap();
     for (name, body) in &g.files {
+        let original = SecretBytes::copy_from(body);
         let path = g.repo.join(name);
-        if path.exists() {
-            assert_eq!(&std::fs::read(&path).unwrap(), body, "{name} changed");
+        let kept: Vec<String> = match std::fs::read(&path) {
+            Ok(now) => {
+                let now = SecretBytes::copy_from(&now);
+                assert!(
+                    now.ct_eq(body) || trimmed_from(&original, &now),
+                    "{name} holds something else than it did"
+                );
+                parse_dotenv(&now)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.name.as_str().to_owned())
+                    .collect()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => panic!("{name}: {e}"),
+        };
+        let gone: Vec<_> = parse_dotenv(&original)
+            .unwrap()
+            .into_iter()
+            .filter(|e| !kept.iter().any(|k| k == e.name.as_str()))
+            .collect();
+        if gone.is_empty() {
             continue;
         }
         assert!(
             manifest.exists(),
-            "{name} is gone, and no manifest binds its values"
+            "entries of {name} are gone, and no manifest binds them"
         );
-        let entries = parse_dotenv(&SecretBytes::copy_from(body))
-            .unwrap()
-            .into_iter()
-            .map(|e| VerifyEntry {
-                line: e.line,
-                name: e.name.as_str().to_owned(),
-                value: WireSecret::new(e.value),
-            })
-            .collect();
+        for e in &gone {
+            assert_eq!(
+                e.kind,
+                EntryKind::Plain,
+                "{name}: {} left the file, and is no value the vault can hold",
+                e.name
+            );
+        }
         let v = c
             .import_verify(&VerifyParams {
                 manifest: manifest.to_str().unwrap().to_owned(),
                 files: vec![VerifyFile {
                     file: (*name).to_owned(),
                     profile: (*name == ".env.short").then(|| "short".to_owned()),
-                    entries,
+                    entries: gone
+                        .into_iter()
+                        .map(|e| VerifyEntry {
+                            line: e.line,
+                            name: e.name.as_str().to_owned(),
+                            value: WireSecret::new(e.value),
+                        })
+                        .collect(),
                 }],
+                claims: Vec::new(),
             })
             .unwrap();
-        assert!(
-            v.files[0].covered,
-            "{name} is gone and its values are not all committed"
-        );
-        assert!(
-            v.files[0]
-                .entries
-                .iter()
-                .any(|e| e.status == EntryStatus::Stored),
-            "{name}"
-        );
+        for e in &v.files[0].entries {
+            assert_eq!(
+                e.status,
+                EntryStatus::Stored,
+                "{name}: {:?} left the file and is not committed where the manifest binds it",
+                e.name
+            );
+        }
     }
 }
 
-/// Gate 16: `kill -9` at every step of `init --import --yes
-/// --delete-plaintext` leaves either the plaintext file or the committed
-/// item. The child ([`gate_16_kill_child`]) is this test binary, stopping
-/// at each step until told to go on; the parent kills it at one step per
-/// run, then checks every file.
+/// The pause points of `envcloak init --import --yes --delete-plaintext`
+/// on the fixture, in order: `.env` (file 0) is rewritten, `.env.short`
+/// (file 1) removed.
+const STEPS: [&str; 10] = [
+    "planned",
+    "committed",
+    "written",
+    "verified",
+    "backed_up",
+    "reverified",
+    "staged_0",
+    "rewritten_0",
+    "moved_aside_1",
+    "removed_1",
+];
+
+/// Runs `envcloak init --import --yes --delete-plaintext` on a terminal of
+/// its own, as a person does, stopping it at each pause point
+/// ([`envcloak_scan::pause_point`], compiled into test builds only) and
+/// sending `kill -9` to it at `at`. Returns the points it passed.
+fn run_until(g: &Gate16, at: &str) -> Vec<String> {
+    let pause = tempfile::Builder::new()
+        .prefix("ecp")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut cmd = on_terminal_command(
+        &g.home,
+        &["init", "--import", "--yes", "--delete-plaintext"],
+        &[],
+    );
+    cmd.current_dir(&g.repo)
+        .env(envcloak_scan::testing::PAUSE_DIR, pause.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut seen = Vec::new();
+    loop {
+        let prefix = format!("{:03}.", seen.len());
+        let point = std::fs::read_dir(pause.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with(&prefix) && !n.ends_with(".go"));
+        let Some(point) = point else {
+            if child.try_wait().unwrap().is_some() {
+                return seen;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("stuck after {seen:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        let step = point[prefix.len()..].to_owned();
+        seen.push(step.clone());
+        if step == at {
+            let pid = std::fs::read_to_string(pause.path().join(&point)).unwrap();
+            let killed = Command::new("/bin/kill")
+                .args(["-9", pid.trim()])
+                .status()
+                .unwrap();
+            assert!(killed.success());
+            child.wait().unwrap();
+            return seen;
+        }
+        File::create(pause.path().join(format!("{prefix}go"))).unwrap();
+    }
+}
+
+/// Gate 16: `kill -9` of `envcloak init --import --yes --delete-plaintext`
+/// at every step, the moments inside each file's change included, leaves
+/// every entry in its file or committed where the manifest binds it. A
+/// file left under a temporary name is reported by the next scan, and the
+/// `.gitignore` written before covers it.
 #[test]
 fn gate_16_kill_9_at_every_step_leaves_the_file_or_the_item() {
+    // Unstopped, the run passes every point, in order.
+    let g = Gate16::new(true);
+    assert_eq!(run_until(&g, "none"), STEPS);
+    file_or_item(&g);
+    assert_eq!(
+        std::fs::read(g.repo.join(".env")).unwrap(),
+        env_left(&g.files[0].1)
+    );
+    assert!(!g.repo.join(".env.short").exists());
+    g.sweep();
     for (k, step) in STEPS.iter().enumerate() {
         let g = Gate16::new(true);
-        let mut cmd = Command::new(std::env::current_exe().unwrap());
-        g.home
-            .apply(&mut cmd)
-            .env(KILL_CHILD, &g.repo)
-            .args([
-                "--exact",
-                "gate_16_kill_child",
-                "--nocapture",
-                "--test-threads",
-                "1",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = cmd.spawn().unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let mut out = BufReader::new(child.stdout.take().unwrap());
-        let mut seen = Vec::new();
-        let reached = loop {
-            let mut line = String::new();
-            if out.read_line(&mut line).unwrap() == 0 {
-                break false;
-            }
-            let Some(s) = line.trim_end().strip_prefix(STEP) else {
-                continue;
-            };
-            seen.push(s.to_owned());
-            if s == *step {
-                break true;
-            }
-            stdin.write_all(b"\n").unwrap();
-        };
-        // SIGKILL, at the step.
-        let _ = child.kill();
-        child.wait().unwrap();
-        assert!(reached, "the child ended before {step}; it passed {seen:?}");
-        assert_eq!(seen, STEPS[..=k], "the steps came out of order");
+        let seen = run_until(&g, step);
+        assert_eq!(seen, STEPS[..=k], "the points came out of order");
         file_or_item(&g);
-        // Nothing is removed before the gate has verified twice.
-        if k < STEPS.iter().position(|s| *s == "removed_0").unwrap() {
-            assert_eq!(g.present(), [true, true], "killed at {step}");
+        // Nothing changes before the gate has verified twice.
+        if k < STEPS.iter().position(|s| *s == "staged_0").unwrap() {
+            assert_eq!(g.intact(), [true, true], "killed at {step}");
         }
-        g.cleanup();
-        assert_no_canary(&g.d.log_bytes(), &g.cs);
-        g.home.assert_clean(&g.cs);
+        let leftovers: Vec<String> = std::fs::read_dir(&g.repo)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".envcloak-"))
+            .collect();
+        let want_leftover = matches!(*step, "staged_0" | "moved_aside_1");
+        assert_eq!(
+            !leftovers.is_empty(),
+            want_leftover,
+            "{step}: {leftovers:?}"
+        );
+        if want_leftover {
+            let out = run_in(&g.home, &g.repo, &["init", "--json"]);
+            ok(&out, &g.cs);
+            let skipped = &json(&out)["import"]["skipped"];
+            for l in &leftovers {
+                assert!(
+                    skipped
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|s| s["path"] == l.as_str() && s["reason"] == "leftover"),
+                    "{step}: {l} is not reported: {skipped}"
+                );
+            }
+            let gitignore = std::fs::read_to_string(g.repo.join(".gitignore")).unwrap();
+            assert!(gitignore.lines().any(|l| l == ".*.envcloak-*.tmp"));
+        }
+        g.sweep();
     }
 }

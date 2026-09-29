@@ -1,6 +1,7 @@
 //! Dotenv parsing for import (SPEC §6.4; T13): `export` prefixes, single,
 //! double and backtick quotes, multi-line values, CRLF and `#` comments,
-//! `${VAR}` never expanded, `envcloak://` references, and errors that carry
+//! `$VAR` and `${VAR}` never expanded, `envcloak://` references, entries
+//! taken out of a file by their spans, and errors that carry
 //! a line number and a kind only. Every input is hostile: bytes that are
 //! not UTF-8, multi-byte characters at every boundary, empty, oversized
 //! and control-character values are handled without a panic, and a
@@ -9,7 +10,8 @@
 
 use envcloak_core::SecretBytes;
 use envcloak_scan::{
-    DotenvEntry, DotenvError, DotenvErrorKind, EntryKind, MAX_DOTENV, parse_dotenv,
+    DotenvEntry, DotenvError, DotenvErrorKind, EntryKind, MAX_DOTENV, parse_dotenv, trimmed_from,
+    without_entries,
 };
 use envcloak_testkit::{assert_no_canary, by_label, canaries, fresh_seed, labels};
 
@@ -140,7 +142,13 @@ fn variables_are_never_expanded() {
           TICK=`${BASE}`\n\
           LITERAL='${BASE}'\n\
           DOLLAR=pa$$word$BASE\n\
-          ESCAPED=\"\\${BASE}\"\n",
+          ESCAPED=\"\\${BASE}\"\n\
+          COMMAND=$(cat /tmp/pw)\n\
+          POSITIONAL=\"a$1\"\n\
+          SINGLE='pa$word'\n\
+          PRICE=5$\n\
+          SPACED=$ 5\n\
+          MARKS=a$-b$@c$$\n",
     );
     expect(
         &got,
@@ -151,9 +159,17 @@ fn variables_are_never_expanded() {
             ("TICK", b"${BASE}", T, 4),
             // Single quotes are literal everywhere: no interpolation.
             ("LITERAL", b"${BASE}", P, 5),
-            // A `$` without braces is a character of the value.
-            ("DOLLAR", b"pa$$word$BASE", P, 6),
+            // `$NAME` without braces interpolates too (dotenv-expand,
+            // docker compose, godotenv), and `$(...)` runs a command.
+            ("DOLLAR", b"pa$$word$BASE", T, 6),
             ("ESCAPED", b"\\${BASE}", T, 7),
+            ("COMMAND", b"$(cat /tmp/pw)", T, 8),
+            ("POSITIONAL", b"a$1", T, 9),
+            ("SINGLE", b"pa$word", P, 10),
+            // A `$` before nothing a tool expands is a character.
+            ("PRICE", b"5$", P, 11),
+            ("SPACED", b"$ 5", P, 12),
+            ("MARKS", b"a$-b$@c$$", P, 13),
         ],
     );
 }
@@ -351,4 +367,60 @@ proptest::proptest! {
         let text: String = pieces.concat();
         let _ = parse_dotenv(&SecretBytes::copy_from(text.as_bytes()));
     }
+}
+
+/// Each entry's span is its whole lines, the line ending included, from
+/// the start of its first line: leading blanks, `export`, a comment after
+/// the value, a quoted value over several lines, CRLF, and a byte-order
+/// mark kept out of the first entry's span.
+#[test]
+fn spans_are_whole_lines() {
+    let text = b"\xef\xbb\xbfA=1\r\n# note\n  export B = \"x\ny\" # c\n\nC=3";
+    let got = parse(text);
+    let spans: Vec<&[u8]> = got.iter().map(|e| &text[e.span.clone()]).collect();
+    assert_eq!(
+        spans,
+        [&b"A=1\r\n"[..], b"  export B = \"x\ny\" # c\n", b"C=3",]
+    );
+}
+
+/// Entries leave a file whole by their spans; every other byte stays as
+/// it was. `trimmed_from` recognises exactly such a file.
+#[test]
+fn entries_leave_a_file_whole_and_a_trimmed_file_is_recognised() {
+    let text = b"# acme\nKEY=k1\nPORT=8080\n\nexport TOKEN=\"t\n2\"\nURL=${HOST}/x\n";
+    let file = SecretBytes::copy_from(text);
+    let got = parse(text);
+    let spans = |names: &[&str]| -> Vec<std::ops::Range<usize>> {
+        got.iter()
+            .filter(|e| names.contains(&e.name.as_str()))
+            .map(|e| e.span.clone())
+            .collect()
+    };
+    let left = without_entries(&file, &spans(&["KEY", "TOKEN"]));
+    assert!(left.ct_eq(b"# acme\nPORT=8080\n\nURL=${HOST}/x\n"));
+    assert!(trimmed_from(&file, &left));
+    // Every entry out: the comment and the blank line stay.
+    let none = without_entries(&file, &spans(&["KEY", "PORT", "TOKEN", "URL"]));
+    assert!(none.ct_eq(b"# acme\n\n"));
+    assert!(trimmed_from(&file, &none));
+    // Nothing taken out, or anything else changed, is not a trimmed file.
+    assert!(!trimmed_from(&file, &file));
+    for other in [
+        &b"# acme\nPORT=8081\n\nURL=${HOST}/x\n"[..],
+        b"# acme\nPORT=8080\n\nURL=${HOST}/x\nNEW=1\n",
+        b"PORT=8080\n\nURL=${HOST}/x\n",
+        b"# acme\nPORT=8080\n\nURL=${HOST}/x",
+        b"not a dotenv file\n",
+    ] {
+        assert!(
+            !trimmed_from(&file, &SecretBytes::copy_from(other)),
+            "{}",
+            String::from_utf8_lossy(other)
+        );
+    }
+    // Spans out of range are ignored.
+    #[allow(clippy::reversed_empty_ranges)]
+    let odd = without_entries(&file, &[3..1, 0..(text.len() + 1)]);
+    assert!(odd.ct_eq(text));
 }

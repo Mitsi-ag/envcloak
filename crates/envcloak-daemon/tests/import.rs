@@ -405,6 +405,7 @@ fn verify_answers_the_delete_gate_and_the_kit_is_confirmed_with_a_proof() {
                 }],
             },
         ],
+        claims: Vec::new(),
     };
     let mut c = client(&f.home);
     let v = c.import_verify(&verify(&f, &manifest)).unwrap();

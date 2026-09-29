@@ -45,8 +45,8 @@ use envcloak_ipc::view::{
 use envcloak_policy::{Binding, EnvName, MANIFEST_NAME, ProfileName, Reference, parse_manifest};
 use envcloak_scan::{
     DotenvEntry, DotenvError, EntryKind, FileKind, FileStamp, MAX_DOTENV, ScanRoot, WalkOptions,
-    create_atomically, open_root, parse_dotenv, read_capped, read_plain, replace_atomically,
-    walk_dotenv,
+    create_atomically, open_root, parse_dotenv, pause_point, read_capped, read_plain,
+    replace_atomically, walk_dotenv,
 };
 
 use super::{claims, require_unlocked};
@@ -442,18 +442,27 @@ fn ignored_by(line: &str, name: &str) -> bool {
     l == name || l == ".env*" || (l == ".env.*" && name.starts_with(".env."))
 }
 
-/// `.gitignore` in `rel_dir` with a line for each of `names` it lacks.
+/// The `.gitignore` line for the temporary names a change of an env file
+/// uses (`..env.envcloak-del-<hex>.tmp`): a crash can leave plaintext
+/// under one, which the lines for the env files do not cover.
+pub(crate) const TEMP_PATTERN: &str = ".*.envcloak-*.tmp";
+
+/// `.gitignore` in `rel_dir` with a line for each of `names` it lacks, and
+/// then [`TEMP_PATTERN`] too. The file's own bytes are kept as they are,
+/// UTF-8 or not: lines are only added after them.
 fn edit_gitignore(root: &ScanRoot, rel_dir: &Path, names: &[&str]) -> FileChange {
     if names.is_empty() {
         return FileChange::Unchanged;
     }
     let rel = rel_dir.join(".gitignore");
-    let (text, stamp) = match read_plain(root, &rel, MAX_DOTENV) {
-        // Not UTF-8: read lossily, which can only add a duplicate line.
-        Ok((bytes, stamp)) => (String::from_utf8_lossy(&bytes).into_owned(), Some(stamp)),
-        Err(e) if e.kind == envcloak_scan::ScanErrorKind::NotFound => (String::new(), None),
+    let (bytes, stamp) = match read_plain(root, &rel, MAX_DOTENV) {
+        Ok((bytes, stamp)) => (bytes, Some(stamp)),
+        Err(e) if e.kind == envcloak_scan::ScanErrorKind::NotFound => (Vec::new(), None),
         Err(_) => return FileChange::Refused,
     };
+    // Read lossily only to see which lines are there; a line it misreads
+    // can only make a duplicate.
+    let text = String::from_utf8_lossy(&bytes);
     let missing: Vec<&str> = names
         .iter()
         .copied()
@@ -462,22 +471,26 @@ fn edit_gitignore(root: &ScanRoot, rel_dir: &Path, names: &[&str]) -> FileChange
     if missing.is_empty() {
         return FileChange::Unchanged;
     }
-    let mut new = text.clone();
-    if !new.is_empty() && !new.ends_with('\n') {
-        new.push('\n');
+    let mut new = bytes.clone();
+    if !new.is_empty() && !new.ends_with(b"\n") {
+        new.push(b'\n');
     }
     if !new.is_empty() {
-        new.push('\n');
+        new.push(b'\n');
     }
-    new.push_str("# Plaintext env files stay out of git (envcloak init).\n");
+    new.extend_from_slice(b"# Plaintext env files stay out of git (envcloak init).\n");
     for n in missing {
-        new.push('/');
-        new.push_str(n);
-        new.push('\n');
+        new.push(b'/');
+        new.extend_from_slice(n.as_bytes());
+        new.push(b'\n');
+    }
+    if !text.lines().any(|l| l.trim() == TEMP_PATTERN) {
+        new.extend_from_slice(TEMP_PATTERN.as_bytes());
+        new.push(b'\n');
     }
     let written = match stamp {
-        Some(s) => replace_atomically(root, &rel, new.as_bytes(), &s).map(|_| FileChange::Updated),
-        None => create_atomically(root, &rel, new.as_bytes(), 0o644).map(|_| FileChange::Created),
+        Some(s) => replace_atomically(root, &rel, &new, &s).map(|_| FileChange::Updated),
+        None => create_atomically(root, &rel, &new, 0o644).map(|_| FileChange::Created),
     };
     written.unwrap_or(FileChange::Refused)
 }
@@ -596,6 +609,7 @@ pub(crate) fn import(
     crate::fail::refuse_if_traced()?;
     let plan = client.import_plan(&params).map_err(too_large)?;
     drop(params);
+    pause_point("planned");
     let mut r = report(root, projects, Some(&plan), &sent, skipped);
     if !yes {
         return Ok(r);
@@ -615,6 +629,7 @@ pub(crate) fn import(
             digest: plan.digest.clone(),
         })
         .map_err(too_large)?;
+    pause_point("committed");
     r = report(root, projects, Some(&done), &sent, r.skipped);
     r.committed = true;
     for pi in 0..projects.len() {
@@ -622,6 +637,7 @@ pub(crate) fn import(
         write_project(root, projects, pi, &done, &sent, &mut out);
         r.projects[pi] = out;
     }
+    pause_point("written");
     Ok(r)
 }
 
@@ -733,6 +749,36 @@ mod tests {
         ] {
             assert!(!ignored_by(line, name), "{line} {name}");
         }
+    }
+
+    /// A `.gitignore` that is not UTF-8 keeps its bytes: the lines are
+    /// added after them, once, with the temporary-name line.
+    #[test]
+    fn gitignore_bytes_are_kept_and_lines_added_once() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let latin1 = b"caf\xe9/\n# \xff\xfe kept\nbuild";
+        std::fs::write(d.path().join(".gitignore"), latin1).unwrap();
+        let root = open_root(d.path()).unwrap();
+        let change = edit_gitignore(&root, Path::new(""), &[".env", ".env.short"]);
+        assert_eq!(change, FileChange::Updated);
+        let got = std::fs::read(d.path().join(".gitignore")).unwrap();
+        let mut want = latin1.to_vec();
+        want.extend_from_slice(
+            b"\n\n# Plaintext env files stay out of git (envcloak init).\n/.env\n/.env.short\n",
+        );
+        want.extend_from_slice(TEMP_PATTERN.as_bytes());
+        want.push(b'\n');
+        assert_eq!(got, want);
+        let again = edit_gitignore(&root, Path::new(""), &[".env", ".env.short"]);
+        assert_eq!(again, FileChange::Unchanged);
+        assert_eq!(std::fs::read(d.path().join(".gitignore")).unwrap(), want);
+        // A new env file later: its line, and no second temporary-name line.
+        let more = edit_gitignore(&root, Path::new(""), &[".env", ".env.local"]);
+        assert_eq!(more, FileChange::Updated);
+        let text = String::from_utf8_lossy(&std::fs::read(d.path().join(".gitignore")).unwrap())
+            .into_owned();
+        assert_eq!(text.lines().filter(|l| *l == TEMP_PATTERN).count(), 1);
+        assert!(text.lines().any(|l| l == "/.env.local"));
     }
 
     #[test]

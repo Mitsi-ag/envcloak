@@ -208,6 +208,9 @@ pub enum ScanErrorKind {
     InvalidPath,
     /// `.env.<suffix>` whose suffix makes no profile name.
     ProfileName,
+    /// A file an interrupted change of an env file left under a temporary
+    /// name (`..env.envcloak-del-<hex>.tmp`): it may hold plaintext.
+    Leftover,
     /// Any other failure, by its kind.
     Io(std::io::ErrorKind),
 }
@@ -228,6 +231,7 @@ impl ScanErrorKind {
             ScanErrorKind::TooDeep => "too_deep",
             ScanErrorKind::InvalidPath => "invalid_path",
             ScanErrorKind::ProfileName => "not_a_profile_name",
+            ScanErrorKind::Leftover => "leftover",
             ScanErrorKind::Io(_) => "io",
         }
     }
@@ -248,6 +252,10 @@ impl ScanErrorKind {
             ScanErrorKind::InvalidPath => "not a relative path of plain names",
             ScanErrorKind::ProfileName => {
                 "the part after .env. makes no profile name (lowercase letters, digits, _, - or .)"
+            }
+            ScanErrorKind::Leftover => {
+                "left by an interrupted change of an env file, and may hold plaintext: look at \
+                 it, then delete it"
             }
             ScanErrorKind::Io(_) => "it could not be read",
         }

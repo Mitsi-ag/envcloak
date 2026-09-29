@@ -21,16 +21,27 @@
 //!   backslash as written. Quoted values may span lines (a CRLF inside
 //!   becomes LF); after the closing quote only blanks and a comment may
 //!   follow.
-//! - Nothing is expanded. A value that is not single-quoted and holds
-//!   `${` interpolates another variable in the tools that read it, so it
-//!   is an [`EntryKind::Template`]: its text is not the value a program
-//!   sees, and import leaves it where it is.
+//! - Nothing is expanded. A value that is not single-quoted and holds a
+//!   `$` followed by a letter, a digit, `_`, `{` or `(` interpolates
+//!   another variable (or runs a command) in the tools that read it:
+//!   dotenv-expand, docker compose, godotenv and Ruby's dotenv expand
+//!   `$NAME` as well as `${NAME}`. It is an [`EntryKind::Template`]: its
+//!   text is not the value a program sees, and import leaves it where it
+//!   is.
 //! - A value starting with `envcloak://` must be a whole reference,
 //!   [`EntryKind::Reference`].
 //! - A value may not hold a NUL byte, which no environment can carry.
 //! - Values are bytes: they need not be UTF-8.
+//!
+//! Each entry records its [`DotenvEntry::span`]: the bytes of its whole
+//! lines. [`without_entries`] takes entries out of a file by their spans,
+//! leaving every other byte as it was (`envcloak init --delete-plaintext`
+//! keeps the entries it did not import), and [`trimmed_from`] tells
+//! whether a file is another with some of its entries taken out that way
+//! (`envcloak init --undo` puts such a file back).
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 
 use envcloak_core::{SecretBuf, SecretBytes};
 use envcloak_policy::{EnvName, REFERENCE_SCHEME, Reference};
@@ -47,7 +58,8 @@ pub enum EntryKind {
     Plain,
     /// `envcloak://<slug>[#field]`: a reference, not a value.
     Reference(Reference),
-    /// Interpolates another variable (`${NAME}`), which is never expanded.
+    /// Interpolates another variable (`$NAME`, `${NAME}`) or runs a
+    /// command (`$(...)`), which is never done.
     Template,
 }
 
@@ -60,6 +72,9 @@ pub struct DotenvEntry {
     /// The value as decoded; the reference's text for a reference.
     pub value: SecretBytes,
     pub kind: EntryKind,
+    /// The bytes of the file the entry is written in: from the start of
+    /// its first line to the end of its last, the line ending included.
+    pub span: Range<usize>,
 }
 
 /// What is wrong with a dotenv file.
@@ -167,9 +182,15 @@ pub fn parse_dotenv(bytes: &SecretBytes) -> Result<Vec<DotenvEntry>, DotenvError
     if b.len() > MAX_DOTENV {
         return Err(err(0, DotenvErrorKind::TooLarge));
     }
-    let mut c = Cursor { b, pos: 0, line: 1 };
+    let mut c = Cursor {
+        b,
+        pos: 0,
+        line: 1,
+        line_start: 0,
+    };
     if b.starts_with(b"\xef\xbb\xbf") {
         c.pos = 3;
+        c.line_start = 3;
     }
     let mut out = Vec::new();
     let mut names = BTreeSet::new();
@@ -192,6 +213,7 @@ pub fn parse_dotenv(bytes: &SecretBytes) -> Result<Vec<DotenvEntry>, DotenvError
             Some(_) => {}
         }
         let line = c.line;
+        let start = c.line_start;
         let name = c.name(line)?;
         if !names.insert(name.clone()) {
             return Err(err(line, DotenvErrorKind::DuplicateName));
@@ -204,6 +226,7 @@ pub fn parse_dotenv(bytes: &SecretBytes) -> Result<Vec<DotenvEntry>, DotenvError
             name,
             value: value.freeze(),
             kind,
+            span: start..c.pos,
         });
     }
     Ok(out)
@@ -220,7 +243,10 @@ fn classify(value: &SecretBuf, quote: Option<u8>, line: u32) -> Result<EntryKind
             .ok_or(err(line, DotenvErrorKind::InvalidReference))?;
         return Ok(EntryKind::Reference(reference));
     }
-    if quote != Some(b'\'') && text.windows(2).any(|w| w == b"${") {
+    let expands = |w: &[u8]| {
+        w[0] == b'$' && (w[1].is_ascii_alphanumeric() || matches!(w[1], b'_' | b'{' | b'('))
+    };
+    if quote != Some(b'\'') && text.windows(2).any(expands) {
         return Ok(EntryKind::Template);
     }
     Ok(EntryKind::Plain)
@@ -230,6 +256,8 @@ struct Cursor<'a> {
     b: &'a [u8],
     pos: usize,
     line: u32,
+    /// Where the line being read starts.
+    line_start: usize,
 }
 
 impl Cursor<'_> {
@@ -251,6 +279,7 @@ impl Cursor<'_> {
     fn newline(&mut self) {
         self.pos += 1;
         self.line = self.line.saturating_add(1);
+        self.line_start = self.pos;
     }
 
     /// The index of the next line feed, or the end.
@@ -397,4 +426,47 @@ impl Cursor<'_> {
 fn push(v: &mut SecretBuf, b: &[u8], line: u32) -> Result<(), DotenvError> {
     v.extend(b)
         .map_err(|_| err(line, DotenvErrorKind::TooLarge))
+}
+
+/// `bytes` with the byte ranges `spans` taken out (entries' spans, from a
+/// parse of `bytes`), every other byte as it was, in a buffer that is
+/// wiped when dropped. A span outside `bytes` is ignored.
+pub fn without_entries(bytes: &SecretBytes, spans: &[Range<usize>]) -> SecretBytes {
+    #[allow(clippy::disallowed_methods)] // Copied only into a SecretBuf.
+    let b = bytes.expose_secret();
+    let mut cut: Vec<&Range<usize>> = spans
+        .iter()
+        .filter(|r| r.start <= r.end && r.end <= b.len())
+        .collect();
+    cut.sort_by_key(|r| r.start);
+    let mut out = SecretBuf::with_capacity(b.len());
+    let mut at = 0;
+    for r in cut {
+        if r.start > at {
+            // Sized for the whole file, which the pieces never outgrow.
+            let _ = out.extend(&b[at..r.start]);
+        }
+        at = at.max(r.end);
+    }
+    if at < b.len() {
+        let _ = out.extend(&b[at..]);
+    }
+    out.freeze()
+}
+
+/// Whether `now` is `original` with some of its entries taken out whole
+/// ([`without_entries`]) and nothing else changed: what `envcloak init
+/// --delete-plaintext` leaves of a file it rewrites. `false` when either
+/// does not parse, or when no entry is gone.
+pub fn trimmed_from(original: &SecretBytes, now: &SecretBytes) -> bool {
+    let (Ok(was), Ok(is)) = (parse_dotenv(original), parse_dotenv(now)) else {
+        return false;
+    };
+    let kept: BTreeSet<&EnvName> = is.iter().map(|e| &e.name).collect();
+    let gone: Vec<Range<usize>> = was
+        .iter()
+        .filter(|e| !kept.contains(&e.name))
+        .map(|e| e.span.clone())
+        .collect();
+    !gone.is_empty() && without_entries(original, &gone).ct_eq_secret(now)
 }

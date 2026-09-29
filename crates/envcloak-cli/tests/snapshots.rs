@@ -455,7 +455,9 @@ fn import_commands_print_their_value_free_snapshots() {
             &[(4, &kit_file, true)],
         ),
     );
-    let out = s.agent(&["init", "--delete-plaintext", "--json"], &[]);
+    // Deleting plaintext is the person's to do: a short value is matched
+    // against the vault only for them.
+    let out = s.person(&["init", "--delete-plaintext", "--json"], &[]);
     let backup =
         serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["delete"]["backup"]
             .as_str()
