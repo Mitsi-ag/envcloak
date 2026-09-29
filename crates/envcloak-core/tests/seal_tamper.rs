@@ -621,7 +621,9 @@ fn every_wrong_secret_or_damaged_envelope_gives_one_generic_error() {
         attempts.push((what, env.clone(), s, c));
     }
     // One flipped bit in each region the KDF, commitment or AEAD covers,
-    // with the right passphrase.
+    // with the right passphrase. Each damaged envelope must still parse:
+    // one that did not would never reach unwrap, and the case would be
+    // lost without a trace.
     let regions = [
         ("magic-free kind byte", 5usize),
         ("salt", 39),
@@ -640,9 +642,9 @@ fn every_wrong_secret_or_damaged_envelope_gives_one_generic_error() {
         } else {
             0x01
         };
-        if let Ok(e) = Envelope::from_bytes(&b) {
-            attempts.push((what, e, SecretBytes::copy_from(pass_value), c));
-        }
+        let e = Envelope::from_bytes(&b)
+            .unwrap_or_else(|e| panic!("the envelope with a damaged {what} does not parse: {e}"));
+        attempts.push((what, e, SecretBytes::copy_from(pass_value), c));
     }
     // An in-bounds change of the stored parameters: the KDF runs with them,
     // then the commitment fails.
@@ -666,7 +668,8 @@ fn every_wrong_secret_or_damaged_envelope_gives_one_generic_error() {
         moved,
     ));
 
-    assert!(attempts.len() >= 15);
+    // Six wrong secrets, nine damaged regions, the parameters and the vault.
+    assert_eq!(attempts.len(), 17);
     let mut messages = HashSet::new();
     for (what, e, s, ctx) in &attempts {
         let err = unwrap_vmk(e, s, ctx).map(|_| ()).unwrap_err();
