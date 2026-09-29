@@ -635,17 +635,22 @@ fn concurrent_requests_on_a_once_grant_cover_exactly_one() {
                 // connection is kept once it is served, so all 8 are open
                 // at the barrier.
                 let end = Instant::now() + Duration::from_secs(10);
-                let mut c = loop {
-                    let mut c = Client::connect(&paths).unwrap();
-                    match c.status() {
-                        Ok(_) => break c,
-                        Err(e) => {
-                            assert!(Instant::now() < end, "never served: {e:?}");
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
+                let served = loop {
+                    let tried = match Client::connect(&paths) {
+                        Ok(mut c) => c.status().map(|_| c).map_err(|e| format!("{e:?}")),
+                        Err(e) => Err(format!("{e:?}")),
+                    };
+                    match tried {
+                        Ok(c) => break Ok(c),
+                        Err(e) if Instant::now() >= end => break Err(e),
+                        Err(_) => std::thread::sleep(Duration::from_millis(50)),
                     }
                 };
+                // Every thread reaches the barrier, served or not: one that
+                // was never served fails the test instead of leaving the
+                // others waiting there for ever.
                 barrier.wait();
+                let mut c = served.unwrap_or_else(|e| panic!("never served: {e}"));
                 c.run_request(&params).unwrap().decision
             })
         })
