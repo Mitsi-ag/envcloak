@@ -730,6 +730,8 @@ pub fn run(args: &[&str]) -> ExitCode {
 }
 
 fn run_import(a: &ImportArgs) -> Result<ExitCode, Failure> {
+    // The scan reads the env files whole: not under a tracer (SPEC §5).
+    crate::fail::refuse_if_traced()?;
     let root = open_root(Path::new(&a.dir)).map_err(|_| {
         Failure::new(
             "scan_root",

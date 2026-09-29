@@ -606,6 +606,80 @@ fn linux_traced_proof_commands_refuse_before_reading() {
     home.assert_clean(&cs);
 }
 
+/// Review finding F-56 (Codex): `init` and `import --scan` read the env
+/// files whole before they checked for a tracer. Traced from their first
+/// instruction, each exits 1 with `traced` before the scan, writing
+/// nothing: with no daemon running and a project holding only a template,
+/// which the untraced controls get through without a daemon, so only the
+/// order of the check can refuse them.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_traced_import_commands_refuse_before_the_scan() {
+    use envcloak_sys::testing::spawn_traced;
+    use envcloak_testkit::assert_no_canary;
+
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let repo = home.root().join("acme-web");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".env.example"),
+        format!(
+            "OPENAI_API_KEY={}\n",
+            by_label(&cs, labels::OPENAI_API_KEY).as_str()
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str], traced: bool| -> Output {
+        let mut cmd = Command::new(cli());
+        home.apply(&mut cmd)
+            .args(args)
+            .current_dir(&repo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = if traced {
+            spawn_traced(&mut cmd).unwrap()
+        } else {
+            cmd.spawn().unwrap()
+        };
+        let out = finish_within(child, Duration::from_secs(30));
+        assert_no_canary(&out.stdout, &cs);
+        assert_no_canary(&out.stderr, &cs);
+        out
+    };
+    let root = home.root().to_str().unwrap().to_owned();
+    let commands: [&[&str]; 4] = [
+        &["init"],
+        &["init", "--import"],
+        &["init", "--import", "--yes"],
+        &["import", "--scan", root.as_str()],
+    ];
+    for args in commands {
+        let out = run(args, true);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.starts_with("envcloak: traced:"), "{args:?}: {err}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(!repo.join("envcloak.toml").exists(), "{args:?}");
+    }
+    // The controls: untraced, the same commands report the template's
+    // names without a daemon.
+    for args in [&commands[1][..], commands[3], commands[0]] {
+        let out = run(args, false);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.contains(".env.example"), "{args:?}: {text}");
+    }
+    assert!(repo.join("envcloak.toml").exists());
+    std::fs::remove_file(repo.join(".env.example")).unwrap();
+    home.assert_clean(&cs);
+}
+
 #[cfg(target_os = "linux")]
 fn libc_eperm() -> i32 {
     1

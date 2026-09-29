@@ -1043,6 +1043,53 @@ fn gate_16_each_condition_refuses_the_deletion_alone() {
     g.sweep();
 }
 
+/// `init --import --yes --delete-plaintext` whose deletion fails before
+/// any condition is checked (here the backup cannot be written) still
+/// reports the import it committed, then the failure.
+#[test]
+fn a_failed_deletion_still_reports_the_import_it_follows() {
+    let g = Gate16::new(true);
+    let backups = data_dir(&g.home).join("backups");
+    let _ = std::fs::remove_dir(&backups);
+    std::fs::write(&backups, b"not a directory").unwrap();
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--import", "--yes", "--delete-plaintext", "--json"],
+        &[],
+    );
+    assert_no_canary(&out.stdout, &g.cs);
+    assert_no_canary(&out.stderr, &g.cs);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).starts_with("envcloak: files_backup_failed:"),
+        "{}",
+        stderr(&out)
+    );
+    let r = json(&out);
+    assert_eq!(r["import"]["committed"], true, "{r}");
+    assert_eq!(r["import"]["projects"][0]["manifest"], "created", "{r}");
+    assert_eq!(r["delete"], serde_json::Value::Null, "{r}");
+    assert_eq!(g.intact(), [true, true]);
+    // As text too.
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--import", "--yes", "--delete-plaintext"],
+        &[],
+    );
+    std::fs::remove_file(&backups).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("project acme-web"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(g.intact(), [true, true]);
+    file_or_item(&g);
+    g.sweep();
+}
+
 /// A value short enough to guess is matched against the vault only for a
 /// person: a deletion run with no terminal, as an agent runs one, leaves
 /// `.env.short` as it is and says why; the person's takes the value out.

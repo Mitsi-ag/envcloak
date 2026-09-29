@@ -27,8 +27,9 @@
 //!   only after the four conditions of SPEC §6.4 (see [`cmd::init`]).
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
-//! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`, `init
-//! --import`, `import`, `recovery confirm`) refuses under a tracer first.
+//! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`, `init`,
+//! `import`, `recovery confirm`) refuses under a tracer first, before it
+//! reads a file, a descriptor or the terminal.
 //!
 //! `envcloak internal hardening [--hold]` is a hidden, value-free diagnostic
 //! used by the gate 19 tests: it prints `key=value` hardening lines and, with

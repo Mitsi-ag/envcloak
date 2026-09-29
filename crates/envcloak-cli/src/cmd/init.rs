@@ -8,7 +8,9 @@
 //! names) are scanned as `envcloak import` scans ([`super::import`]).
 //!
 //! - `init` alone writes a manifest with the project's name when there is
-//!   none, and reports the env files it found. It reads no value.
+//!   none, and reports the env files it found, by name. It sends no value
+//!   anywhere, but reads the files whole to parse them, so, like every
+//!   mode, it refuses under a tracer before it reads anything.
 //! - `--import` sends the files' values to the daemon for a plan and
 //!   reports it: a dry run. With `--yes` the daemon commits that plan, and
 //!   the manifest, `.gitignore` and the dry run of the references follow,
@@ -142,6 +144,9 @@ fn init(a: &InitArgs) -> Result<ExitCode, Failure> {
             "--delete-plaintext after --import needs --yes: a dry run imports nothing",
         ));
     }
+    // Every mode reads the env files whole, values and all, to report
+    // them: not under a tracer (SPEC §5).
+    refuse_if_traced()?;
     let dir = project_dir()?;
     let root = open_root(&dir)
         .map_err(|_| Failure::new("io", "the project directory could not be opened"))?;
@@ -183,7 +188,23 @@ fn init(a: &InitArgs) -> Result<ExitCode, Failure> {
         }
         Some(r)
     };
-    let delete = if a.delete { Some(delete(&root)?) } else { None };
+    let delete = match a.delete.then(|| delete(&root)).transpose() {
+        Ok(d) => d,
+        // The import was committed and its files written: its report
+        // still comes out, before the deletion's failure.
+        Err(f) => {
+            if out.is_some() {
+                print(
+                    &InitReport {
+                        import: out,
+                        delete: None,
+                    },
+                    a.json,
+                );
+            }
+            return Err(f);
+        }
+    };
     let refusal = delete.as_ref().and_then(|(_, r)| r.clone());
     let report = InitReport {
         import: out,
