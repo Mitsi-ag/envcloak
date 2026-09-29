@@ -779,6 +779,24 @@ impl Harness {
         leaks
     }
 
+    /// Waits up to `limit` for the running daemon's log to hold a line
+    /// with `text`. The client can have its answer before the daemon's
+    /// line reaches the log (testkit's reader thread collects it), so a
+    /// test reads the log only after this (review T14-3). On failure the
+    /// log is swept first and then shown, so a failure message never
+    /// prints a value.
+    pub fn expect_log(&mut self, text: &str, limit: Duration) -> String {
+        let seen = self.daemon.wait_for_log(text, limit);
+        let log = self.daemon.log_bytes();
+        self.assert_clean("the daemon's log", &log);
+        let log = String::from_utf8_lossy(&log).into_owned();
+        assert!(
+            seen,
+            "no line with {text:?} in the daemon's log after {limit:?}:\n{log}"
+        );
+        log
+    }
+
     /// Panics if [`Harness::sweep`] finds anything, listing it without
     /// values.
     pub fn assert_swept(&self, when: &str) {

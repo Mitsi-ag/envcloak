@@ -31,6 +31,9 @@ use envcloak_e2e::{
 };
 use envcloak_testkit::{Canary, labels};
 
+/// How long a line the daemon wrote may take to reach the collected log.
+const LOG_LIMIT: Duration = Duration::from_secs(10);
+
 /// The request id in `approval_required: request=<ID>: ...`.
 fn request_id(o: &Output) -> String {
     let err = String::from_utf8_lossy(&o.stderr).into_owned();
@@ -380,12 +383,9 @@ fn fixture_story_s1_to_s13() {
     assert_eq!(s4.status.code(), Some(125), "{}", text(&s4));
     assert!(s4.stdout.is_empty(), "{}", text(&s4));
     let id = request_id(&s4);
-    assert!(
-        h.daemon.log().contains(&format!(
-            "envcloakd: audit: request decision=pending id={id}"
-        )),
-        "{}",
-        h.daemon.log()
+    h.expect_log(
+        &format!("envcloakd: audit: request decision=pending id={id}"),
+        LOG_LIMIT,
     );
     h.assert_swept("S4");
 
