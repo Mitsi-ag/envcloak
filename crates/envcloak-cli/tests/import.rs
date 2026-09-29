@@ -187,6 +187,34 @@ fn strings(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Whether git ignores `name` in `dir` by `dir`'s `.gitignore`: `git
+/// check-ignore` in a repository there (made if there is none), with no
+/// global or system configuration and no excludes file.
+fn git_ignores(dir: &Path, name: &str) -> bool {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(["-c", "core.excludesFile=/dev/null"])
+            .args(args)
+            .current_dir(dir)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap()
+    };
+    if !dir.join(".git").exists() {
+        assert!(git(&["init", "-q"]).status.success());
+    }
+    let out = git(&["check-ignore", "-q", "--no-index", "--", name]);
+    match out.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        _ => panic!("git check-ignore: {}", stderr(&out)),
+    }
+}
+
 /// A vault created through the CLI (story S1): the passphrase on
 /// descriptor 3, the kit written to descriptor 4.
 struct Story {
@@ -554,14 +582,17 @@ fn import_scan_dedups_across_repos_and_its_dry_run_is_value_free() {
     s.sweep();
 }
 
-/// An existing `.gitignore` that covers the files is left as it is; one
-/// that does not gets the lines once, and a manifest binding to another
-/// item is kept and reported.
+/// An existing `.gitignore` keeps its lines: one that ignores the env
+/// files gets only the line for the temporary names a crash may leave,
+/// once; one whose `!` line takes an env file back in gets that file's
+/// line after it, as git reads it (the last matching line wins). A
+/// manifest binding to another item is kept and reported.
 #[test]
 fn gitignore_and_manifest_edits_keep_what_is_there() {
     let s = Story::new();
     let (repo, _) = acme_web(&s.home, &s.cs);
-    std::fs::write(repo.join(".gitignore"), "target/\n.env*\n!.env.example\n").unwrap();
+    let mine = "target/\n.env*\n!.env.example\n";
+    std::fs::write(repo.join(".gitignore"), mine).unwrap();
     std::fs::write(
         repo.join("envcloak.toml"),
         "# mine\n[project]\nname = \"acme-web\"\n\n[env]\nOPENAI_API_KEY = \"openai/elsewhere\" # kept\n",
@@ -570,13 +601,65 @@ fn gitignore_and_manifest_edits_keep_what_is_there() {
     let out = run_in(&s.home, &repo, &["init", "--import", "--yes", "--json"]);
     ok(&out, &s.cs);
     let p = &json(&out)["import"]["projects"][0];
-    assert_eq!(p["gitignore"], "unchanged");
+    assert_eq!(p["gitignore"], "updated");
     assert_eq!(p["manifest"], "updated");
     assert_eq!(p["conflicts"][0], "OPENAI_API_KEY");
+    let gitignore = format!(
+        "{mine}\n# Plaintext env files stay out of git (envcloak init).\n.*.envcloak-*.tmp\n"
+    );
     assert_eq!(
         std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
-        "target/\n.env*\n!.env.example\n"
+        gitignore
     );
+    for name in [
+        ".env",
+        ".env.short",
+        "..env.envcloak-del-0123456789abcdef.tmp",
+        "..env.short.envcloak-new-0123456789abcdef.tmp",
+    ] {
+        assert!(git_ignores(&repo, name), "{name}");
+    }
+    assert!(!git_ignores(&repo, ".env.example"));
+    let out = run_in(&s.home, &repo, &["init", "--import", "--yes", "--json"]);
+    ok(&out, &s.cs);
+    assert_eq!(
+        json(&out)["import"]["projects"][0]["gitignore"],
+        "unchanged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+        gitignore
+    );
+
+    // A `!` line takes `.env.local` back in: it gets a line after it.
+    let api = s.home.root().join("acme-api");
+    std::fs::create_dir_all(&api).unwrap();
+    let key = by_label(&s.cs, labels::GITHUB_TOKEN).as_str();
+    for f in [".env", ".env.local"] {
+        std::fs::write(api.join(f), format!("GITHUB_TOKEN={key}\n")).unwrap();
+    }
+    std::fs::write(api.join(".gitignore"), ".env*\n!.env.local\n").unwrap();
+    assert!(git_ignores(&api, ".env"));
+    assert!(!git_ignores(&api, ".env.local"));
+    let out = run_in(&s.home, &api, &["init", "--import", "--yes", "--json"]);
+    ok(&out, &s.cs);
+    assert_eq!(json(&out)["import"]["projects"][0]["gitignore"], "updated");
+    for name in [
+        ".env",
+        ".env.local",
+        "..env.local.envcloak-del-0123456789abcdef.tmp",
+    ] {
+        assert!(git_ignores(&api, name), "{name}");
+    }
+    let text = std::fs::read_to_string(api.join(".gitignore")).unwrap();
+    assert!(text.starts_with(".env*\n!.env.local\n"), "{text}");
+    assert!(
+        text.ends_with("\n/.env.local\n.*.envcloak-*.tmp\n"),
+        "{text}"
+    );
+    for f in [".env", ".env.local"] {
+        std::fs::remove_file(api.join(f)).unwrap();
+    }
     let m = std::fs::read_to_string(repo.join("envcloak.toml")).unwrap();
     assert!(m.starts_with("# mine\n"), "{m}");
     assert!(
@@ -1202,8 +1285,9 @@ fn run_until(g: &Gate16, at: &str) -> Vec<String> {
 /// Gate 16: `kill -9` of `envcloak init --import --yes --delete-plaintext`
 /// at every step, the moments inside each file's change included, leaves
 /// every entry in its file or committed where the manifest binds it. A
-/// file left under a temporary name is reported by the next scan, and the
-/// `.gitignore` written before covers it.
+/// file left under a temporary name is reported by the next scan, and git
+/// ignores it by the `.gitignore` the import edited, which ignored the env
+/// files already.
 #[test]
 fn gate_16_kill_9_at_every_step_leaves_the_file_or_the_item() {
     // Unstopped, the run passes every point, in order.
@@ -1218,6 +1302,9 @@ fn gate_16_kill_9_at_every_step_leaves_the_file_or_the_item() {
     g.sweep();
     for (k, step) in STEPS.iter().enumerate() {
         let g = Gate16::new(true);
+        // The env files are ignored already; the temporary names are not
+        // until the import adds their line.
+        std::fs::write(g.repo.join(".gitignore"), "/.env\n/.env.short\n").unwrap();
         let seen = run_until(&g, step);
         assert_eq!(seen, STEPS[..=k], "the points came out of order");
         file_or_item(&g);
@@ -1252,6 +1339,9 @@ fn gate_16_kill_9_at_every_step_leaves_the_file_or_the_item() {
             }
             let gitignore = std::fs::read_to_string(g.repo.join(".gitignore")).unwrap();
             assert!(gitignore.lines().any(|l| l == ".*.envcloak-*.tmp"));
+            for l in &leftovers {
+                assert!(git_ignores(&g.repo, l), "{step}: git would track {l}");
+            }
         }
         g.sweep();
     }

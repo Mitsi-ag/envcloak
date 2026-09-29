@@ -52,6 +52,7 @@ use envcloak_scan::{
 use super::{claims, require_unlocked};
 use crate::connect::connect;
 use crate::fail::{FAILURE, Failure, usage};
+use crate::gitignore::ignores;
 use crate::render::{looks_like_value, print};
 
 const USAGE: &str = "envcloak import --scan <dir> [--yes] [--json]";
@@ -431,28 +432,30 @@ fn new_manifest(
     t
 }
 
-/// Whether a line of a `.gitignore` already ignores the env file `name`
-/// in its directory: the name itself (anchored or not), or the usual
-/// `.env*` patterns. Not a full matcher: a line it misses only makes a
-/// duplicate.
-fn ignored_by(line: &str, name: &str) -> bool {
-    let l = line.trim();
-    if l.is_empty() || l.starts_with('#') || l.starts_with('!') {
-        return false;
-    }
-    let l = l.strip_prefix('/').unwrap_or(l);
-    let l = l.strip_prefix("**/").unwrap_or(l);
-    l == name || l == ".env*" || (l == ".env.*" && name.starts_with(".env."))
-}
-
 /// The `.gitignore` line for the temporary names a change of an env file
 /// uses (`..env.envcloak-del-<hex>.tmp`): a crash can leave plaintext
 /// under one, which the lines for the env files do not cover.
 pub(crate) const TEMP_PATTERN: &str = ".*.envcloak-*.tmp";
 
-/// `.gitignore` in `rel_dir` with a line for each of `names` it lacks, and
-/// then [`TEMP_PATTERN`] too. The file's own bytes are kept as they are,
-/// UTF-8 or not: lines are only added after them.
+/// Names of the shapes a change of the env file `name` may leave behind
+/// ([`envcloak_scan::atomic`]'s temporary names, the name left out when
+/// long), to ask a `.gitignore` about.
+fn temp_names(name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for what in ["del", "new"] {
+        out.push(format!(".{name}.envcloak-{what}-0123456789abcdef.tmp"));
+        out.push(format!("..envcloak-{what}-0123456789abcdef.tmp"));
+    }
+    out
+}
+
+/// `.gitignore` in `rel_dir` with a line `/<name>` for each of `names` it
+/// does not ignore, and [`TEMP_PATTERN`] when it does not ignore every
+/// temporary name a change of them may leave ([`temp_names`]), whether
+/// the env files needed a line or not. Git's own reading decides, the
+/// last matching line winning, so a `!` line that takes a file back in
+/// gets a line after it ([`crate::gitignore`]). The file's own bytes are
+/// kept as they are, UTF-8 or not: lines are only added after them.
 fn edit_gitignore(root: &ScanRoot, rel_dir: &Path, names: &[&str]) -> FileChange {
     if names.is_empty() {
         return FileChange::Unchanged;
@@ -469,9 +472,13 @@ fn edit_gitignore(root: &ScanRoot, rel_dir: &Path, names: &[&str]) -> FileChange
     let missing: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|n| !text.lines().any(|l| ignored_by(l, n)))
+        .filter(|n| !ignores(&text, n))
         .collect();
-    if missing.is_empty() {
+    let temps = names
+        .iter()
+        .flat_map(|n| temp_names(n))
+        .any(|t| !ignores(&text, &t));
+    if missing.is_empty() && !temps {
         return FileChange::Unchanged;
     }
     let mut new = bytes.clone();
@@ -482,12 +489,14 @@ fn edit_gitignore(root: &ScanRoot, rel_dir: &Path, names: &[&str]) -> FileChange
         new.push(b'\n');
     }
     new.extend_from_slice(b"# Plaintext env files stay out of git (envcloak init).\n");
+    // The names are `.env` and `.env.<profile>`: letters, digits, `.`,
+    // `_` and `-` (`envcloak_scan::dotenv_kind`), no wildcard among them.
     for n in missing {
         new.push(b'/');
         new.extend_from_slice(n.as_bytes());
         new.push(b'\n');
     }
-    if !text.lines().any(|l| l.trim() == TEMP_PATTERN) {
+    if temps {
         new.extend_from_slice(TEMP_PATTERN.as_bytes());
         new.push(b'\n');
     }
@@ -737,25 +746,151 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gitignore_lines_that_already_cover_a_file() {
-        for (line, name) in [
-            (".env", ".env"),
-            ("/.env", ".env"),
-            ("**/.env", ".env"),
-            (".env*", ".env.short"),
-            ("  /.env.* ", ".env.short"),
-        ] {
-            assert!(ignored_by(line, name), "{line} {name}");
+    /// Whether git ignores `name` in `dir` by `dir`'s `.gitignore`:
+    /// `git check-ignore` in a new repository there, with no global or
+    /// system configuration and no excludes file.
+    fn git_ignores(dir: &Path, name: &str) -> bool {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "core.excludesFile=/dev/null"])
+                .args(args)
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .expect("git runs")
+        };
+        if !dir.join(".git").exists() {
+            assert!(git(&["init", "-q"]).status.success());
         }
-        for (line, name) in [
-            ("# .env", ".env"),
-            ("!.env", ".env"),
-            (".env.*", ".env"),
-            (".envrc", ".env"),
-            ("", ".env"),
+        let out = git(&["check-ignore", "-q", "--no-index", "--", name]);
+        match out.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            _ => panic!("git check-ignore: {}", String::from_utf8_lossy(&out.stderr)),
+        }
+    }
+
+    /// Git's own reading of the `.gitignore` decides, the last matching
+    /// line winning: after the edit git ignores every env file and every
+    /// temporary name a change of one may leave, and a second edit changes
+    /// nothing. A `!` line that takes a file back in gets a line after it,
+    /// and the temporary-name line is added even when the env files are
+    /// ignored already.
+    #[test]
+    fn after_the_edit_git_ignores_every_env_file_and_temporary_name() {
+        let names = [".env", ".env.local"];
+        for (before, change, added) in [
+            // No .gitignore yet.
+            (
+                None,
+                FileChange::Created,
+                vec!["/.env", "/.env.local", TEMP_PATTERN],
+            ),
+            // `.env.local` is taken back in (F-55).
+            (
+                Some(".env*\n!.env.local\n"),
+                FileChange::Updated,
+                vec!["/.env.local", TEMP_PATTERN],
+            ),
+            (
+                Some(".env*\n!/.env.LOCAL\n"),
+                FileChange::Updated,
+                vec!["/.env.local", TEMP_PATTERN],
+            ),
+            // The env files are ignored already, the temporary names not
+            // (F-57).
+            (Some(".env*\n"), FileChange::Updated, vec![TEMP_PATTERN]),
+            (
+                Some("/.env\n/.env.local\n"),
+                FileChange::Updated,
+                vec![TEMP_PATTERN],
+            ),
+            // A later `!` line takes the temporary names back in.
+            (
+                Some(".env*\n.*.envcloak-*.tmp\n!*.tmp\n"),
+                FileChange::Updated,
+                vec![TEMP_PATTERN],
+            ),
+            // All there: nothing to add.
+            (
+                Some(".env*\n!.env.example\n.*.envcloak-*.tmp\n"),
+                FileChange::Unchanged,
+                vec![],
+            ),
         ] {
-            assert!(!ignored_by(line, name), "{line} {name}");
+            let d = tempfile::tempdir_in("/tmp").unwrap();
+            let path = d.path().join(".gitignore");
+            if let Some(b) = before {
+                std::fs::write(&path, b).unwrap();
+            }
+            let root = open_root(d.path()).unwrap();
+            assert_eq!(
+                edit_gitignore(&root, Path::new(""), &names),
+                change,
+                "{before:?}"
+            );
+            let after = std::fs::read_to_string(&path).unwrap();
+            let tail: Vec<&str> = after
+                .strip_prefix(before.unwrap_or(""))
+                .unwrap()
+                .lines()
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect();
+            assert_eq!(tail, added, "{before:?}");
+            for n in names {
+                assert!(git_ignores(d.path(), n), "{before:?}: {n}");
+                for t in temp_names(n) {
+                    assert!(git_ignores(d.path(), &t), "{before:?}: {t}");
+                }
+            }
+            assert_eq!(
+                edit_gitignore(&root, Path::new(""), &names),
+                FileChange::Unchanged
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        }
+    }
+
+    /// What the edit reads a `.gitignore` to say is what git says, for the
+    /// usual forms and the ones that trip a simple reading.
+    #[test]
+    fn the_edit_reads_a_gitignore_as_git_does() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        for text in [
+            ".env\n",
+            "/.env\n",
+            "**/.env\n",
+            ".env*\n",
+            ".env.*\n",
+            " .env\n",
+            ".env \n",
+            ".env/\n",
+            "sub/.env\n",
+            "*\n!.env*\n",
+            ".env*\n!.env.local\n",
+            ".env*\n!*.local\n",
+            ".env*\n!.env.local\n.env.local\n",
+            ".env*\n!.env.local/\n",
+            "\\#.env\n# .env.local\n",
+            ".env.[a-z]*\n!.env.[!l]*\n",
+            "*.tmp\n!.*\n",
+        ] {
+            std::fs::write(d.path().join(".gitignore"), text).unwrap();
+            for n in [".env", ".env.local", ".env.short", "#.env"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain(temp_names(".env"))
+            {
+                assert_eq!(
+                    ignores(text, &n),
+                    git_ignores(d.path(), &n),
+                    "{text:?}: {n}"
+                );
+            }
         }
     }
 

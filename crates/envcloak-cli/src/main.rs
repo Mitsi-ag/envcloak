@@ -45,6 +45,7 @@
 mod cmd;
 mod connect;
 mod fail;
+mod gitignore;
 mod render;
 mod tty;
 

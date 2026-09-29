@@ -31,7 +31,7 @@
 //! A crash between the steps leaves the file, or its replacement, under a
 //! temporary name `.<name>.envcloak-<new|del>-<hex>.tmp` ([`temp_name`]),
 //! which a scan reports ([`ScanErrorKind::Leftover`]) and `envcloak init`
-//! adds a `.gitignore` line for.
+//! makes sure its project's `.gitignore` ignores.
 //!
 //! No temporary copy holds anything the caller did not write, and nothing
 //! here writes a backup: plaintext is never copied (SPEC §6.4 "Backups").
