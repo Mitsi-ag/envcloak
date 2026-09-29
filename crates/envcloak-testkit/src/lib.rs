@@ -16,7 +16,8 @@
 //!   prints with `<LABEL>` in their place.
 //! - [`probe_canaries`]: arms the allocator probe (gate 11) with canaries.
 //! - [`TestHome`]: an isolated HOME and XDG tree under a short `/tmp` path,
-//!   and a cleared environment for the processes a test starts.
+//!   and a cleared environment for the processes a test starts, keeping
+//!   only the [`DIAGNOSTIC_VARS`] (`RUST_LOG`, `RUST_BACKTRACE`).
 //! - [`Daemon`]: an `envcloakd --foreground` child in a [`TestHome`], with
 //!   its log collected, killed on drop.
 //! - [`crash`]: gate 19's core-dump control and signed copies, shared by
@@ -40,7 +41,7 @@ pub use detect::{
     sweep_dir,
 };
 pub use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeReport, ProbeSession};
-pub use home::{TEST_ENV_VARS, TEST_PATH, TestHome};
+pub use home::{DIAGNOSTIC_VARS, TEST_ENV_VARS, TEST_PATH, TestHome};
 
 /// The path of `name`, one of this crate's programs (`fixture-agent`,
 /// `ec-probe`), built next to the running test binary: in the target

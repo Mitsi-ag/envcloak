@@ -239,6 +239,9 @@ pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<Skipp
             }
         };
         let parsed = parse_dotenv(&bytes);
+        // Gate 12: a test build panics here on request, holding a file's
+        // bytes and the values parsed from them.
+        envcloak_sys::panic_point("cli.import.parsed");
         let (profile, template) = match f.kind {
             FileKind::Dotenv { profile } => (profile, false),
             FileKind::Template => (None, true),

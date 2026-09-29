@@ -419,6 +419,9 @@ pub fn run_request(
                     return Err(RpcError::new(ErrorKind::Internal));
                 }
                 s.touch(Reading::now(&shared.clocks));
+                // Gate 12: a test build panics here on request, holding the
+                // values about to be sent and the state lock.
+                envcloak_sys::panic_point("daemon.release");
                 break RunAnswer {
                     decision: DecisionView::Covered {
                         grant: g.to_string(),

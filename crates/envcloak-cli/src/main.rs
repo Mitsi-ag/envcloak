@@ -36,6 +36,12 @@
 //! `--hold`, prints `ready` and waits for stdin to close, so a test can
 //! inspect the live process from outside.
 //!
+//! A panic prints where it happened and never its message, which could
+//! hold a value (`envcloak_sys::install_panic_hook`, gate 12); release
+//! builds then abort. `envcloak internal panic` is a hidden command that
+//! panics with its standard input in the message, so a test can show
+//! that on any build, the release artifact included.
+//!
 //! No argument is ever echoed: one could be a pasted secret. No command
 //! takes a value as an argument (gate 13): values come from a hidden
 //! prompt on `/dev/tty` or from standard input, and a name shaped like a
@@ -86,6 +92,7 @@ Values are never arguments: type them at the hidden prompt, or pipe them in with
 
 fn main() -> ExitCode {
     envcloak_sys::harden_process();
+    envcloak_sys::install_panic_hook("envcloak");
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     // An argument that is not UTF-8 is refused, never replaced: `run` sends
@@ -111,6 +118,7 @@ fn main() -> ExitCode {
         }
         ["internal", "hardening"] => internal_hardening(false),
         ["internal", "hardening", "--hold"] => internal_hardening(true),
+        ["internal", "panic"] => envcloak_sys::panic_with_input(),
         ["run", rest @ ..] => cmd::run::run(rest),
         ["vault", rest @ ..] => cmd::vault::run(rest),
         ["unlock", rest @ ..] => cmd::unlock::run(rest),

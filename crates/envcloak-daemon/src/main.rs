@@ -13,6 +13,11 @@
 //!   limit is 8 hours by default, at most 24 (`90m`, `8h`, `3600s`).
 //! - `envcloakd internal hardening` is a hidden, value-free diagnostic that
 //!   prints `key=value` hardening lines.
+//! - `envcloakd internal panic` is a hidden command that panics with its
+//!   standard input in the message. A panic prints where it happened and
+//!   never its message, which could hold a value
+//!   (`envcloak_sys::install_panic_hook`, gate 12); release builds then
+//!   abort.
 
 /// Writes a line to standard error, and goes on when the write fails: the
 /// terminal the daemon was started in may be closed, or the process
@@ -51,6 +56,7 @@ const USAGE: &str = "usage: envcloakd --foreground [--idle-lock <duration>]\n\
 
 fn main() -> ExitCode {
     envcloak_sys::harden_process();
+    envcloak_sys::install_panic_hook("envcloakd");
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
@@ -66,6 +72,7 @@ fn main() -> ExitCode {
                 Err(_) => ExitCode::FAILURE,
             }
         }
+        ["internal", "panic"] => envcloak_sys::panic_with_input(),
         ["--foreground", rest @ ..] => match parse_options(rest) {
             Some(cfg) => serve(cfg),
             None => usage(),

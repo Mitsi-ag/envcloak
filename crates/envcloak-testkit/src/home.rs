@@ -27,6 +27,13 @@ pub const TEST_ENV_VARS: [&str; 10] = [
     "TMPDIR",
 ];
 
+/// Diagnostic settings [`TestHome::apply`] passes on from this process
+/// when it has them. Gate 12 runs the whole suite at `RUST_LOG=trace` and
+/// `RUST_BACKTRACE=full`, and the programs the tests start must run at
+/// those settings too. They choose how much a program logs; they hold no
+/// secret.
+pub const DIAGNOSTIC_VARS: [&str; 2] = ["RUST_LOG", "RUST_BACKTRACE"];
+
 /// A temporary directory under `/tmp` with a short name (`/tmp/ecXXXXXX`),
 /// so socket paths below it stay well under the 104-byte macOS `sun_path`
 /// limit. It holds `home/`, `config/`, `data/`, `state/`, `cache/`, `tmp/`
@@ -69,20 +76,22 @@ impl TestHome {
     /// Clears the environment of `cmd`, so nothing exported in the
     /// developer's shell (tokens, cloud credentials) reaches the child or
     /// any core file it might leave. Then sets [`TEST_PATH`], `LANG=C` and
-    /// `TERM=dumb`, and points `HOME`, every `XDG_*` base directory and
-    /// `TMPDIR` into this tree. Call it before adding the command's own
-    /// variables: it clears those too.
+    /// `TERM=dumb`, points `HOME`, every `XDG_*` base directory and
+    /// `TMPDIR` into this tree, and passes on the [`DIAGNOSTIC_VARS`] this
+    /// process has. Call it before adding the command's own variables: it
+    /// clears those too.
     pub fn apply<'c>(&self, cmd: &'c mut Command) -> &'c mut Command {
         cmd.env_clear().envs(self.vars())
     }
 
     /// The variables [`TestHome::apply`] sets, in the order of
-    /// [`TEST_ENV_VARS`], for a child started some other way (a service
-    /// manager's job, `env -i`).
+    /// [`TEST_ENV_VARS`] and then of the [`DIAGNOSTIC_VARS`] this process
+    /// has, for a child started some other way (a service manager's job,
+    /// `env -i`).
     pub fn vars(&self) -> Vec<(&'static str, std::ffi::OsString)> {
         let r = self.root();
         let at = |sub: &str| r.join(sub).into_os_string();
-        vec![
+        let mut vars = vec![
             ("PATH", TEST_PATH.into()),
             ("LANG", "C".into()),
             ("TERM", "dumb".into()),
@@ -93,7 +102,13 @@ impl TestHome {
             ("XDG_CACHE_HOME", at("cache")),
             ("XDG_RUNTIME_DIR", at("run")),
             ("TMPDIR", at("tmp")),
-        ]
+        ];
+        vars.extend(
+            DIAGNOSTIC_VARS
+                .iter()
+                .filter_map(|name| std::env::var_os(name).map(|v| (*name, v))),
+        );
+        vars
     }
 
     /// Sweeps the whole tree for canaries.

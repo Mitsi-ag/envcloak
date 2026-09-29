@@ -247,6 +247,9 @@ fn start(
         Err(ExecError::ValueTooShort(r)) => return Err(too_short(&r)),
         Err(e) => return Ok(exec_failure(&e)),
     };
+    // Gate 12: a test build panics here on request, holding the values and
+    // the redactor built from them.
+    envcloak_sys::panic_point("cli.run.released");
     print_coverage(&report);
     let out = |fd: std::os::fd::BorrowedFd<'_>| {
         fd.try_clone_to_owned().map_err(|_| {

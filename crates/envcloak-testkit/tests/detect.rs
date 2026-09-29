@@ -10,8 +10,9 @@ use std::process::Command;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use envcloak_testkit::{
-    Canary, Detector, Hit, PROBE_WINDOW, TEST_ENV_VARS, TestHome, assert_no_canary,
-    assert_sweep_clean, by_label, canaries, encodings, find, fresh_seed, labels, sweep_dir,
+    Canary, DIAGNOSTIC_VARS, Detector, Hit, PROBE_WINDOW, TEST_ENV_VARS, TestHome,
+    assert_no_canary, assert_sweep_clean, by_label, canaries, encodings, find, fresh_seed, labels,
+    sweep_dir,
 };
 
 fn panic_message(f: impl FnOnce()) -> Option<String> {
@@ -325,10 +326,23 @@ fn isolation_child() {
         .lines()
         .filter_map(|l| l.split_once('=').map(|(k, _)| k))
         .collect();
+    // The diagnostic settings pass on only when this process has them.
+    let forwarded: Vec<&str> = DIAGNOSTIC_VARS
+        .iter()
+        .copied()
+        .filter(|n| std::env::var_os(n).is_some())
+        .collect();
     for name in &names {
-        assert!(TEST_ENV_VARS.contains(name), "unexpected variable {name}");
+        assert!(
+            TEST_ENV_VARS.contains(name) || forwarded.contains(name),
+            "unexpected variable {name}"
+        );
     }
-    assert_eq!(names.len(), TEST_ENV_VARS.len(), "{names:?}");
+    assert_eq!(
+        names.len(),
+        TEST_ENV_VARS.len() + forwarded.len(),
+        "{names:?}"
+    );
     println!("isolation: checked");
 }
 

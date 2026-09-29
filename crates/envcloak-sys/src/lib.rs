@@ -33,6 +33,10 @@
 //!   exit seen without reaping it, so its pid is not reused while it may
 //!   still be signalled), [`signal_process`] and [`signal_group`] (`kill`),
 //!   and [`wait_writable`] (an output descriptor ready for a write).
+//! - Panics (gate 12): [`install_panic_hook`], which both binaries call so
+//!   a panic shows its place and never its message; [`panic_point`], where
+//!   a test build panics on request; and [`panic_with_input`], behind the
+//!   binaries' hidden `internal panic`.
 //!
 //! Every other crate inherits the workspace's `unsafe_code = "forbid"`, so
 //! the compiler rejects unsafe code there and any `allow` of it. This crate
@@ -51,6 +55,7 @@ mod fs;
 mod harden;
 mod inuse;
 mod lockfile;
+mod panic;
 mod peer;
 mod perm;
 mod proc;
@@ -75,6 +80,7 @@ pub use harden::{
 };
 pub use inuse::{InUse, open_elsewhere};
 pub use lockfile::try_lock_exclusive;
+pub use panic::{install as install_panic_hook, panic_point, panic_with_input};
 pub use peer::{
     PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_identity, peer_uid,
     process_start_time,

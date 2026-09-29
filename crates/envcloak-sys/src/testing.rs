@@ -873,3 +873,26 @@ pub fn enter_terminal_session() -> io::Result<()> {
         .map(drop)
         .map_err(|e| io::Error::from_raw_os_error(*e))
 }
+
+/// Names the [`crate::panic_point`] a test build panics at.
+pub const PANIC_SITE: &str = "ENVCLOAK_TEST_PANIC";
+/// Names a file whose contents the injected panic's message holds.
+pub const PANIC_FILE: &str = "ENVCLOAK_TEST_PANIC_FILE";
+
+/// Panics when [`PANIC_SITE`] names `site`, with the contents of the file
+/// [`PANIC_FILE`] names (read as text, lossily) in the message: gate 12's
+/// injected panic, whose message holds a fixture the panic hook must not
+/// show. The panic's place is the caller's.
+#[track_caller]
+pub(crate) fn panic_point(site: &str) {
+    if std::env::var_os(PANIC_SITE).is_none_or(|s| s != site) {
+        return;
+    }
+    let payload = std::env::var_os(PANIC_FILE)
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or_default();
+    panic!(
+        "injected panic at {site}, holding: {}",
+        String::from_utf8_lossy(&payload)
+    );
+}
