@@ -268,6 +268,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "envcloak-e2e"
+version = "0.1.0"
+dependencies = [
+ "envcloak-testkit",
+ "libc",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "envcloak-exec"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,25 @@
+[package]
+name = "envcloak-e2e"
+description = "The M1 fixture acceptance story (SPEC §15.1) and gate 12, end to end through the built envcloak and envcloakd"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# The harness: a test home, the daemon started by absolute path, the
+# person's terminal, the agent's shell, the emitters and the sweep. Test
+# support only; never a dependency of a shipped crate.
+[dependencies]
+envcloak-testkit.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+# The emitters print SHA-256 digests of the values they were given, which
+# the story compares with the fixtures' (ec-emit-serde prints one too).
+sha2.workspace = true
+tempfile.workspace = true
