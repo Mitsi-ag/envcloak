@@ -14,7 +14,11 @@
 //!   macOS keeps cloud-provider files in);
 //! - a directory with more than [`envcloak_sys::MAX_DIR_ENTRIES`] entries
 //!   is reported and not listed, and the walk stops at
-//!   [`WalkOptions::max_depth`] and [`WalkOptions::max_files`].
+//!   [`WalkOptions::max_depth`] and [`WalkOptions::max_files`];
+//! - only the directories on the path down to the one being listed are
+//!   open: a subdirectory waits by name, and is opened beneath its parent
+//!   when its turn comes, so a tree of hundreds of sibling projects never
+//!   runs the process out of descriptors (macOS allows 256 by default).
 //!
 //! Each file named `.env` or `.env.<suffix>` is opened as
 //! [`crate::read_capped`] opens one, never through a symlink and never
@@ -140,35 +144,40 @@ pub fn dotenv_kind(name: &OsStr) -> Option<Result<FileKind, ()>> {
 
 /// The dotenv files under `r`. See the module documentation.
 pub fn walk_dotenv<'r>(r: &'r ScanRoot, o: &WalkOptions) -> Walk<'r> {
-    let mut stack = Vec::new();
-    let mut pending = VecDeque::new();
-    match r.dir().try_clone() {
-        Ok(d) => stack.push((d, PathBuf::new(), 0)),
-        Err(e) => pending.push_back(Err(ScanError {
-            rel: PathBuf::new(),
-            kind: crate::root::io_kind(&e),
-        })),
-    }
     let mut visited = HashSet::new();
     visited.insert(r.identity());
     Walk {
         root: r,
         options: o.clone(),
-        stack,
-        pending,
+        started: false,
+        path: Vec::new(),
+        pending: VecDeque::new(),
         visited,
         found: 0,
     }
 }
 
-/// The iterator [`walk_dotenv`] returns.
+/// A directory on the walk's path down from the root: its handle, its path
+/// from the root, its depth, and the subdirectories still to enter, by
+/// name (popped from the end, so in name order).
+#[derive(Debug)]
+struct Frame {
+    dir: File,
+    rel: PathBuf,
+    depth: usize,
+    subdirs: Vec<OsString>,
+}
+
+/// The iterator [`walk_dotenv`] returns. It holds one descriptor for
+/// each directory on its path, at most [`WalkOptions::max_depth`] and the
+/// root's.
 #[derive(Debug)]
 pub struct Walk<'r> {
     root: &'r ScanRoot,
     options: WalkOptions,
-    /// Directories still to list: the handle, the path from the root and
-    /// the depth.
-    stack: Vec<(File, PathBuf, usize)>,
+    /// Whether the root was listed.
+    started: bool,
+    path: Vec<Frame>,
     pending: VecDeque<Result<FoundFile, ScanError>>,
     visited: HashSet<(u64, u64)>,
     found: usize,
@@ -188,14 +197,59 @@ impl Iterator for Walk<'_> {
             if self.found >= self.options.max_files {
                 return None;
             }
-            let (dir, rel, depth) = self.stack.pop()?;
-            self.list(&dir, &rel, depth);
+            if !self.started {
+                self.started = true;
+                match self.root.dir().try_clone() {
+                    Ok(d) => self.enter(d, PathBuf::new(), 0),
+                    Err(e) => self.pending.push_back(Err(ScanError {
+                        rel: PathBuf::new(),
+                        kind: crate::root::io_kind(&e),
+                    })),
+                }
+                continue;
+            }
+            let top = self.path.last_mut()?;
+            let Some(name) = top.subdirs.pop() else {
+                // Every subdirectory was entered: close this one.
+                self.path.pop();
+                continue;
+            };
+            let child = top.rel.join(&name);
+            let depth = top.depth + 1;
+            match self.root.open_subdir(&top.dir, &name) {
+                Ok(sub) => {
+                    let Ok(m) = sub.metadata() else { continue };
+                    if self.visited.insert((m.dev(), m.ino())) {
+                        self.enter(sub, child, depth);
+                    }
+                }
+                // A symlink, or not a directory after all: not entered.
+                Err(ScanErrorKind::Symlink | ScanErrorKind::NotRegular) => {}
+                Err(k) => self.pending.push_back(Err(ScanError {
+                    rel: child,
+                    kind: k,
+                })),
+            }
         }
     }
 }
 
 impl Walk<'_> {
-    fn list(&mut self, dir: &File, rel: &std::path::Path, depth: usize) {
+    /// Lists `dir` and puts it on the path, with the subdirectories to
+    /// enter below it.
+    fn enter(&mut self, dir: File, rel: PathBuf, depth: usize) {
+        let subdirs = self.list(&dir, &rel, depth);
+        self.path.push(Frame {
+            dir,
+            rel,
+            depth,
+            subdirs,
+        });
+    }
+
+    /// Reports the dotenv files of `dir` and returns the names of the
+    /// subdirectories to enter, last first.
+    fn list(&mut self, dir: &File, rel: &std::path::Path, depth: usize) -> Vec<OsString> {
         let report = |rel: PathBuf, kind| Err(ScanError { rel, kind });
         let mut entries = match list_dir(dir, MAX_DIR_ENTRIES) {
             Ok(e) => e,
@@ -206,7 +260,7 @@ impl Walk<'_> {
                     crate::root::io_kind(&e)
                 };
                 self.pending.push_back(report(rel.to_path_buf(), kind));
-                return;
+                return Vec::new();
             }
         };
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -241,20 +295,10 @@ impl Walk<'_> {
                 }
                 continue;
             }
-            match self.root.open_subdir(dir, &e.name) {
-                Ok(sub) => {
-                    let Ok(m) = sub.metadata() else { continue };
-                    if self.visited.insert((m.dev(), m.ino())) {
-                        subdirs.push((sub, child, depth + 1));
-                    }
-                }
-                // A symlink, or not a directory after all: not entered.
-                Err(ScanErrorKind::Symlink | ScanErrorKind::NotRegular) => {}
-                Err(k) => self.pending.push_back(report(child, k)),
-            }
+            subdirs.push(e.name);
         }
-        // Popped in name order.
+        // Popped from the end: in name order.
         subdirs.reverse();
-        self.stack.extend(subdirs);
+        subdirs
     }
 }

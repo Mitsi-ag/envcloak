@@ -369,3 +369,81 @@ fn a_walk_skips_dependency_and_cache_directories_and_stops_at_depth() {
     // Without `recursive`, only the root is listed.
     assert_eq!(walk_dotenv(&r, &WalkOptions::default()).count(), 0);
 }
+
+/// The environment variable that makes
+/// [`a_walk_over_many_sibling_projects_keeps_few_descriptors_open`] run its
+/// child half, over the tree it names.
+const MANY_DIRS: &str = "ENVCLOAK_T13_MANY_DIRS";
+/// Sibling projects in that tree, each with a `.env` and a subdirectory.
+const SIBLINGS: usize = 300;
+
+/// `envcloak import --scan ~/Dev` over hundreds of repos: the walk keeps
+/// only its path open, so a process allowed 64 descriptors (macOS allows
+/// 256 by default) finds every project's file. The child half runs this
+/// test binary again under `ulimit -n 64`.
+#[test]
+fn a_walk_over_many_sibling_projects_keeps_few_descriptors_open() {
+    if let Some(root) = std::env::var_os(MANY_DIRS) {
+        // The limit is in force: holding 64 more descriptors fails.
+        let r = open_root(Path::new(&root)).unwrap();
+        let held: Vec<_> = (0..64).map(|_| r.dir().try_clone()).collect();
+        assert!(
+            held.iter().any(|h| h
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::EMFILE))),
+            "the descriptor limit is not in force"
+        );
+        drop(held);
+        let o = WalkOptions {
+            recursive: true,
+            ..WalkOptions::default()
+        };
+        let mut found = 0;
+        let mut failed = Vec::new();
+        for x in walk_dotenv(&r, &o) {
+            match x {
+                Ok(_) => found += 1,
+                Err(e) => failed.push(e),
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "{} not read, the first {:?}",
+            failed.len(),
+            failed.first()
+        );
+        assert_eq!(found, SIBLINGS);
+        println!("walked {found}");
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("ecw")
+        .tempdir_in("/tmp")
+        .unwrap();
+    for i in 0..SIBLINGS {
+        let p = dir.path().join(format!("repo-{i:03}"));
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        std::fs::write(p.join(".env"), b"# names only\n").unwrap();
+    }
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("ulimit -n 64 && exec \"$0\" \"$@\"")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_walk_over_many_sibling_projects_keeps_few_descriptors_open",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(MANY_DIRS, dir.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains(&format!("walked {SIBLINGS}")), "{text}");
+}
