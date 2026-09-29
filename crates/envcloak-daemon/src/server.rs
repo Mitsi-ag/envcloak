@@ -48,9 +48,10 @@ use envcloak_core::crypto::KdfParams;
 use envcloak_core::vault::VaultPaths;
 use envcloak_core::{RecoveryKit, check_passphrase, create_vault_with_kit};
 use envcloak_ipc::proto::{
-    self, Approve, AuditVerify, Deny, ErrorKind, GrantsList, GrantsRevoke, IncomingRequest,
-    ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock,
-    Method, PendingGet, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate,
+    self, Approve, AuditVerify, Deny, ErrorKind, FilesBackup, FilesRestore, GrantsList,
+    GrantsRevoke, ImportCommit, ImportPlan, ImportVerify, IncomingRequest, ItemsAdd, ItemsCheck,
+    ItemsList, ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock, Method, PendingGet,
+    RecoveryConfirm, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate,
     VaultCreateParams, loggable_method, required_role,
 };
 use envcloak_ipc::view::{
@@ -63,6 +64,7 @@ use envcloak_sys::{PeerIdentity, TerminationSignals};
 
 use crate::audit::AuditEvent;
 use crate::clock::{SystemClocks, now_of};
+use crate::import;
 use crate::items;
 use crate::lock::Reading;
 use crate::requests;
@@ -589,6 +591,22 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         }
         ItemsRotate::NAME => answer::<ItemsRotate>(id, &req, |p| items::rotate(shared, peer, p)),
         ItemsRemove::NAME => answer::<ItemsRemove>(id, &req, |p| items::remove(shared, peer, p)),
+        ImportPlan::NAME => answer::<ImportPlan>(id, &req, |p| import::import_plan(shared, p)),
+        ImportCommit::NAME => {
+            answer::<ImportCommit>(id, &req, |p| import::import_commit(shared, peer, p))
+        }
+        ImportVerify::NAME => {
+            answer::<ImportVerify>(id, &req, |p| import::import_verify(shared, p))
+        }
+        FilesBackup::NAME => {
+            answer::<FilesBackup>(id, &req, |p| import::files_backup(shared, peer, p))
+        }
+        FilesRestore::NAME => {
+            answer::<FilesRestore>(id, &req, |p| import::files_restore(shared, peer, p))
+        }
+        RecoveryConfirm::NAME => {
+            answer::<RecoveryConfirm>(id, &req, |p| import::recovery_confirm(shared, peer, p))
+        }
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
 }
@@ -664,6 +682,15 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
         Ok(_) => {
             s.limiter().succeeded();
             eprintln!("envcloakd: vault unlocked");
+            // File backups over 7 days old go (SPEC §6.4); they are purged
+            // when one is written, too.
+            let secs = at
+                .wall
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            if envcloak_core::file_backup::purge_file_backups(s.paths(), secs).is_err() {
+                eprintln!("envcloakd: old file backups could not be removed");
+            }
             s.audit(AuditEvent::Unlocked {
                 pid: peer.pid,
                 created: false,

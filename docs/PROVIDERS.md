@@ -148,6 +148,8 @@ The value is read in one place, `detect.rs`, and matched in place. A detection h
 
 `Registry::prefill(detection, item)` fills a new item's empty fields: the provider, its links, a snapshot of its allowed hosts (SPEC §5: widening them later needs approval), the classification, and a title and env hint. When the item already names another provider, nothing changes. An ambiguous detection fills the classification only.
 
+`shaped_like_secret(value)` says whether a value looks like a credential by its shape alone, whoever issued it: a URL with a password in its user information (`scheme://user:password@`, up to the last `@`), or a run of at least 24 ASCII letters and digits mixing two of lowercase, uppercase and digits. Import uses it, with the key patterns and the variable's name, to tell secrets from configuration (docs/IMPORT.md). It reads the value in place in `detect.rs` and answers yes or no.
+
 `Registry::by_env_hint(name)` suggests the one provider whose env hints name a variable, for a value no pattern matched, such as an AWS secret access key. It is a suggestion for display, not a detection, and pre-fill does not use it.
 
 ## Errors

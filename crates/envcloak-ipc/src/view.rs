@@ -52,6 +52,14 @@ views!(
     CheckView,
     CheckReport,
     RefEditView,
+    ImportPlanView,
+    VerifyView,
+    FileBackupView,
+    RecoveryConfirmedView,
+    ImportReport,
+    DeleteReport,
+    UndoReport,
+    InitReport,
 );
 
 /// What [`StatusView::sanitize`] puts in place of a version that is not
@@ -964,4 +972,290 @@ pub enum RefChange {
     Replaced,
     /// The binding was there already.
     Unchanged,
+}
+
+/// Why an env-file entry is not imported (SPEC §6.4). It stays where it
+/// is; when its file is deleted, it goes with the file and stays in the
+/// file's encrypted backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    Empty,
+    /// Under 8 bytes: never injected, so not a secret to keep (a port, a
+    /// flag).
+    TooShort,
+    /// Configuration, not a secret: no provider's key pattern matches, the
+    /// name says nothing of a secret, and the value is neither a URL with
+    /// a password nor shaped like a generated key.
+    NotSecret,
+    /// It interpolates another variable (`${NAME}`), which is never
+    /// expanded.
+    Interpolated,
+    /// An `envcloak://` reference already.
+    Reference,
+    /// The name is shaped like a key: a value pasted in its place.
+    LooksLikeValue,
+    /// Over the vault's 64 KiB field cap.
+    TooLarge,
+    /// It holds a NUL byte.
+    NulByte,
+}
+
+impl SkipReason {
+    pub fn token(self) -> &'static str {
+        match self {
+            SkipReason::Empty => "empty",
+            SkipReason::TooShort => "too_short",
+            SkipReason::NotSecret => "not_secret",
+            SkipReason::Interpolated => "interpolated",
+            SkipReason::Reference => "reference",
+            SkipReason::LooksLikeValue => "looks_like_value",
+            SkipReason::TooLarge => "too_large",
+            SkipReason::NulByte => "nul_byte",
+        }
+    }
+}
+
+/// `import.plan` and `import.commit`: what the import does, or did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportPlanView {
+    /// SHA-256 over the plan, as 64 hex characters: `import.commit` is
+    /// refused unless the plan worked out then has this digest.
+    pub digest: String,
+    /// One per entry sent, in order.
+    pub entries: Vec<ImportEntryView>,
+    /// The items the import makes or binds to, in the order entries first
+    /// use them.
+    pub items: Vec<ImportItemView>,
+}
+
+/// What becomes of one entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportEntryView {
+    /// Index into [`ImportPlanView::items`]; `None` when it is left out.
+    pub item: Option<u32>,
+    pub skipped: Option<SkipReason>,
+}
+
+/// One item an import makes, or finds holding the value already.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportItemView {
+    pub slug: String,
+    pub field: String,
+    /// What a manifest binds: `<slug>`, or `<slug>#<field>` when the item
+    /// has several fields.
+    pub reference: String,
+    /// The vault held the value before this import.
+    pub existing: bool,
+    pub provider: Option<String>,
+    pub classification: ClassificationView,
+    pub length: LengthClass,
+    /// Every item that held the value before this import, by slug, the one
+    /// bound first. More than one is a value with duplicate owners (gate
+    /// 10), reported for each.
+    pub holders: Vec<String>,
+    /// Entries that use it, and in how many projects.
+    pub entries: u32,
+    pub projects: u32,
+}
+
+/// `import.verify`: whether an import's env files may be deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyView {
+    /// The Recovery Kit is confirmed (`envcloak recovery confirm`).
+    pub recovery_confirmed: bool,
+    /// Every binding of the manifest, in `[env]` and each profile,
+    /// resolves.
+    pub resolves: bool,
+    pub files: Vec<VerifyFileView>,
+}
+
+impl VerifyView {
+    /// Whether every condition the daemon checks holds for every file.
+    pub fn deletable(&self) -> bool {
+        self.recovery_confirmed && self.resolves && self.files.iter().all(|f| f.covered)
+    }
+}
+
+/// One file's entries, as the vault holds them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyFileView {
+    pub file: String,
+    /// Every secret it holds is in the vault where the manifest binds its
+    /// variable.
+    pub covered: bool,
+    pub entries: Vec<VerifyEntryView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyEntryView {
+    pub line: u32,
+    /// `None` when it looks like a value.
+    pub name: Option<String>,
+    pub status: EntryStatus,
+    /// Why it is left out, for [`EntryStatus::LeftOut`].
+    pub skipped: Option<SkipReason>,
+}
+
+/// Where the vault stands on one entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryStatus {
+    /// The item the manifest binds the variable to holds this value.
+    Stored,
+    /// Not a secret an import keeps; deleting the file drops it.
+    LeftOut,
+    /// A secret the vault does not hold where the manifest binds it: the
+    /// file is not deleted.
+    NotStored,
+}
+
+/// `files.backup`: the backup written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileBackupView {
+    /// 26 Crockford base32 characters: `envcloak init --undo <id>`.
+    pub id: String,
+    pub files: u32,
+    /// The backup's file name in the vault's `backups` directory.
+    pub file_name: String,
+}
+
+/// `recovery.confirm`: the Recovery Kit is confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfirmedView {
+    /// It was confirmed before.
+    pub already: bool,
+}
+
+/// `envcloak init` and `envcloak import`: what was found, what the vault
+/// does with it, and what was written. Names, paths, lines and slugs only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportReport {
+    /// The directory scanned.
+    pub root: String,
+    /// The import was carried out; otherwise this is the dry run.
+    pub committed: bool,
+    pub projects: Vec<ProjectReport>,
+    /// As the daemon planned them; `None` when nothing was sent.
+    pub items: Vec<ImportItemView>,
+    /// Paths the scan did not read, and why.
+    pub skipped: Vec<SkippedPath>,
+}
+
+/// One directory with env files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectReport {
+    pub dir: String,
+    pub name: String,
+    pub files: Vec<FileReport>,
+    pub manifest: Option<FileChange>,
+    /// Variables the manifest binds to other items already: kept as they
+    /// are.
+    pub conflicts: Vec<String>,
+    pub gitignore: Option<FileChange>,
+    /// The dry run of the manifest's references after the import: every
+    /// one resolves.
+    pub resolves: Option<bool>,
+}
+
+/// What an import did to a file it writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    Created,
+    Updated,
+    Unchanged,
+    /// Left alone: a symlink, a hard link, or it changed while it was
+    /// edited.
+    Refused,
+}
+
+/// One env file read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileReport {
+    /// Relative to the project's directory.
+    pub file: String,
+    pub profile: Option<String>,
+    /// A template (`.env.example`): names only, no values read.
+    pub template: bool,
+    /// Another hard link names it: never modified or deleted.
+    pub hard_linked: bool,
+    /// A parse error: its line and kind.
+    pub error_line: Option<u32>,
+    pub error: Option<String>,
+    pub entries: Vec<EntryReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryReport {
+    pub line: u32,
+    /// `None` when it looks like a value.
+    pub name: Option<String>,
+    /// Index into [`ImportReport::items`].
+    pub item: Option<u32>,
+    pub skipped: Option<SkipReason>,
+}
+
+/// A path the scan did not read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkippedPath {
+    pub path: String,
+    /// A token: `symlink`, `not_regular`, `too_large`, `unreadable`, ...
+    pub reason: String,
+}
+
+/// `envcloak init --delete-plaintext`: the gate's answer, and what was
+/// deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteReport {
+    pub project_dir: String,
+    pub verify: VerifyView,
+    /// The encrypted backup's id, once one was written.
+    pub backup: Option<String>,
+    pub removed: Vec<String>,
+    /// Files left in place, and why (a token).
+    pub kept: Vec<SkippedPath>,
+    /// Hard-linked, symlinked or unreadable env files never considered.
+    pub skipped: Vec<SkippedPath>,
+}
+
+/// `envcloak init --undo`: the files written back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoReport {
+    pub backup: String,
+    pub files: Vec<UndoFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoFile {
+    pub path: String,
+    /// `restored`, `unchanged` (it is there as it was), or why it was not
+    /// written (`exists`, `symlink`, ...).
+    pub state: String,
+}
+
+/// `envcloak init`: the import, when there was one, and the deletion,
+/// when it was asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitReport {
+    /// What was found and imported; `None` for `--delete-plaintext` alone.
+    pub import: Option<ImportReport>,
+    pub delete: Option<DeleteReport>,
 }

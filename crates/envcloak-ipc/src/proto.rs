@@ -28,8 +28,9 @@ use envcloak_policy::{
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DecisionView, DeniedView,
-    GrantsView, ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView,
-    TargetView, UnlockedView,
+    FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView, LockedView,
+    RecoveryConfirmedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
+    UnlockedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -581,8 +582,218 @@ pub struct RemoveParams {
     pub claims: Vec<String>,
 }
 
+/// `import.plan`: what importing these env-file entries would do (SPEC
+/// §6.4, `envcloak init --import` and `envcloak import --scan`): which
+/// are secrets, which items the vault holds with the same value already,
+/// which new items would be made and under what slugs, and which values
+/// more than one item holds (gate 10). Nothing is written. The daemon
+/// compares values by keyed hash; the CLI has no key.
+#[derive(Debug)]
+pub struct ImportPlan;
+
+impl Method for ImportPlan {
+    const NAME: &'static str = "import.plan";
+    type Params = ImportParams;
+    type Output = ImportPlanView;
+}
+
+/// `import.commit`: the import `import.plan` described, in one vault
+/// transaction. Refused with [`ErrorKind::PlanChanged`] unless the plan,
+/// worked out again now, is the one with `digest`: the person approved
+/// that one. Importing needs no proof, as `items.add` needs none.
+#[derive(Debug)]
+pub struct ImportCommit;
+
+impl Method for ImportCommit {
+    const NAME: &'static str = "import.commit";
+    type Params = ImportCommitParams;
+    type Output = ImportPlanView;
+}
+
+/// The entries of the env files an import read: each with its value.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportParams {
+    /// The directories the entries come from.
+    pub projects: Vec<ImportProject>,
+    pub entries: Vec<ImportEntry>,
+    /// As [`UnlockParams::claims`], for the audit entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// A directory an import read env files in: where its manifest goes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportProject {
+    /// Its absolute path. Display text, and where the CLI writes.
+    pub dir: String,
+    /// The name new items are given under (`openai/<name>`): one slug
+    /// part.
+    pub name: String,
+}
+
+/// One `NAME=value` entry of an env file.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportEntry {
+    /// Index into [`ImportParams::projects`].
+    pub project: u32,
+    /// The file, relative to the project's directory.
+    pub file: String,
+    pub line: u32,
+    /// The profile the file is for; `None` for `[env]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub name: String,
+    pub value: WireSecret,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportCommitParams {
+    pub import: ImportParams,
+    /// [`ImportPlanView::digest`] of the plan shown.
+    pub digest: String,
+}
+
+/// `import.verify`: whether plaintext env files may be deleted (SPEC §6.4
+/// "Deleting plaintext after import", gate 16): whether every secret each
+/// file holds is in the vault where the manifest binds its variable,
+/// whether every reference of the manifest resolves, and whether the
+/// Recovery Kit is confirmed. The daemon opens the manifest itself.
+#[derive(Debug)]
+pub struct ImportVerify;
+
+impl Method for ImportVerify {
+    const NAME: &'static str = "import.verify";
+    type Params = VerifyParams;
+    type Output = VerifyView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyParams {
+    /// The absolute path of `envcloak.toml`.
+    pub manifest: String,
+    pub files: Vec<VerifyFile>,
+}
+
+/// One env file whose deletion is asked about: its entries with values.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyFile {
+    /// Relative to the manifest's directory.
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub entries: Vec<VerifyEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyEntry {
+    pub line: u32,
+    pub name: String,
+    pub value: WireSecret,
+}
+
+/// `files.backup`: an encrypted backup of files about to be deleted (SPEC
+/// §6.4 "Backups"), under a key of its own wrapped under the `backup`
+/// subkey. Answered once it is on disk.
+#[derive(Debug)]
+pub struct FilesBackup;
+
+impl Method for FilesBackup {
+    const NAME: &'static str = "files.backup";
+    type Params = FilesBackupParams;
+    type Output = FileBackupView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesBackupParams {
+    pub files: Vec<BackupFileParams>,
+    /// As [`UnlockParams::claims`], for the audit entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// One file's bytes, and where it was.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupFileParams {
+    /// Its absolute path.
+    pub path: String,
+    /// Its permission bits.
+    pub mode: u32,
+    pub content: WireSecret,
+}
+
+/// `files.restore`: the files of a backup, byte for byte, for `envcloak
+/// init --undo`, which writes them back. It hands plaintext to the
+/// client, so it is a proof: the passphrase, from a terminal subject
+/// (SPEC §10b), as `items.rotate` is.
+#[derive(Debug)]
+pub struct FilesRestore;
+
+impl Method for FilesRestore {
+    const NAME: &'static str = "files.restore";
+    type Params = FilesRestoreParams;
+    type Output = RestoredFiles;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesRestoreParams {
+    /// The backup's id: 26 Crockford base32 characters.
+    pub backup: String,
+    pub passphrase: WireSecret,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// What `files.restore` answers: each file with its bytes.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoredFiles {
+    pub files: Vec<RestoredFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoredFile {
+    pub path: String,
+    pub mode: u32,
+    pub content: WireSecret,
+}
+
+/// `recovery.confirm`: records that the person holds the Recovery Kit
+/// (SPEC §6.4: plaintext is deleted only once it is confirmed), after
+/// checking the kit they typed opens the vault. A proof, like `unlock`:
+/// taken only from a terminal subject and counted by the attempt limiter.
+#[derive(Debug)]
+pub struct RecoveryConfirm;
+
+impl Method for RecoveryConfirm {
+    const NAME: &'static str = "recovery.confirm";
+    type Params = RecoveryConfirmParams;
+    type Output = RecoveryConfirmedView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfirmParams {
+    /// The kit as the user wrote it down.
+    pub recovery_kit: WireSecret,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 18] = [
+pub const CLIENT_METHODS: [&str; 24] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -601,6 +812,12 @@ pub const CLIENT_METHODS: [&str; 18] = [
     ItemsTarget::NAME,
     ItemsRotate::NAME,
     ItemsRemove::NAME,
+    ImportPlan::NAME,
+    ImportCommit::NAME,
+    ImportVerify::NAME,
+    FilesBackup::NAME,
+    FilesRestore::NAME,
+    RecoveryConfirm::NAME,
 ];
 
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
@@ -721,12 +938,18 @@ pub enum ErrorKind {
     /// The encrypted backup `rm` writes first could not be written, so
     /// nothing was removed.
     BackupFailed,
+    /// The import worked out now is not the plan shown.
+    PlanChanged,
+    /// No file backup has the id, or it was purged.
+    NoSuchBackup,
+    /// A file backup could not be written, or could not be read back.
+    FilesBackupFailed,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 33] = [
+    pub const ALL: [ErrorKind; 36] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -759,6 +982,9 @@ impl ErrorKind {
         ErrorKind::ItemExists,
         ErrorKind::InvalidItem,
         ErrorKind::BackupFailed,
+        ErrorKind::PlanChanged,
+        ErrorKind::NoSuchBackup,
+        ErrorKind::FilesBackupFailed,
         ErrorKind::Internal,
     ];
 
@@ -797,6 +1023,9 @@ impl ErrorKind {
             ErrorKind::ItemExists => -32026,
             ErrorKind::InvalidItem => -32027,
             ErrorKind::BackupFailed => -32028,
+            ErrorKind::PlanChanged => -32029,
+            ErrorKind::NoSuchBackup => -32030,
+            ErrorKind::FilesBackupFailed => -32031,
             ErrorKind::Internal => -32099,
         }
     }
@@ -836,6 +1065,9 @@ impl ErrorKind {
             ErrorKind::ItemExists => "item_exists",
             ErrorKind::InvalidItem => "invalid_item",
             ErrorKind::BackupFailed => "backup_failed",
+            ErrorKind::PlanChanged => "plan_changed",
+            ErrorKind::NoSuchBackup => "no_such_backup",
+            ErrorKind::FilesBackupFailed => "files_backup_failed",
             ErrorKind::Internal => "internal",
         }
     }
@@ -896,6 +1128,17 @@ impl ErrorKind {
             ErrorKind::BackupFailed => {
                 "an encrypted backup of the vault could not be written first, so nothing was \
                  removed"
+            }
+            ErrorKind::PlanChanged => {
+                "what the import would do changed since it was shown (the vault or the files \
+                 changed); nothing was imported, run it again"
+            }
+            ErrorKind::NoSuchBackup => {
+                "no file backup has that id, or it is over 7 days old and was removed"
+            }
+            ErrorKind::FilesBackupFailed => {
+                "the encrypted backup of the files could not be written or read; nothing was \
+                 deleted or restored"
             }
             ErrorKind::Internal => "the daemon failed",
         }

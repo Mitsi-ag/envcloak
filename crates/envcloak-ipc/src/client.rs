@@ -38,11 +38,17 @@ use crate::proto::{
     RunRequestParams, SlugParams, Status, TargetParams, Unlock, UnlockParams, VaultCreate,
     VaultCreateParams,
 };
+use crate::proto::{
+    FilesBackup, FilesBackupParams, FilesRestore, FilesRestoreParams, ImportCommit,
+    ImportCommitParams, ImportParams, ImportPlan, ImportVerify, RecoveryConfirm,
+    RecoveryConfirmParams, RestoredFiles, VerifyParams,
+};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
     ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
     UnlockedView,
 };
+use crate::view::{FileBackupView, ImportPlanView, RecoveryConfirmedView, VerifyView};
 use crate::wire_secret::WireSecret;
 
 /// How long a call may wait for its response. `vault create` runs
@@ -479,6 +485,74 @@ impl Client {
             slug: target.item.slug.clone(),
             item: target.item.id.clone(),
             passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
+    }
+}
+
+impl Client {
+    /// `import.plan`: what importing `p`'s entries would do.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn import_plan(&mut self, p: &ImportParams) -> Result<ImportPlanView, ClientError> {
+        self.call::<ImportPlan>(p)
+    }
+
+    /// `import.commit`: the import `p` describes, if its plan is still the
+    /// one with `p.digest`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn import_commit(&mut self, p: &ImportCommitParams) -> Result<ImportPlanView, ClientError> {
+        self.call::<ImportCommit>(p)
+    }
+
+    /// `import.verify`: whether `p`'s files may be deleted.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn import_verify(&mut self, p: &VerifyParams) -> Result<VerifyView, ClientError> {
+        self.call::<ImportVerify>(p)
+    }
+
+    /// `files.backup`: an encrypted backup of `p`'s files.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn files_backup(&mut self, p: &FilesBackupParams) -> Result<FileBackupView, ClientError> {
+        self.call::<FilesBackup>(p)
+    }
+
+    /// `files.restore`: the files of backup `id`, with the passphrase as
+    /// the proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn files_restore(
+        &mut self,
+        id: &str,
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<RestoredFiles, ClientError> {
+        self.call::<FilesRestore>(&FilesRestoreParams {
+            backup: id.to_owned(),
+            passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `recovery.confirm` with the kit as typed.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn recovery_confirm(
+        &mut self,
+        kit: SecretBytes,
+        claims: &[String],
+    ) -> Result<RecoveryConfirmedView, ClientError> {
+        self.call::<RecoveryConfirm>(&RecoveryConfirmParams {
+            recovery_kit: WireSecret::new(kit),
             claims: claims.to_vec(),
         })
     }

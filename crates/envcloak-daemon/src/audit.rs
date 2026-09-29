@@ -146,6 +146,38 @@ pub enum AuditEvent {
         item: ItemId,
         slug: Slug,
     },
+    /// Env-file values were imported (`import.commit`): the items made,
+    /// and how many existing items were bound instead.
+    Imported {
+        pid: i32,
+        subject: SubjectSummary,
+        created: Vec<(ItemId, Slug)>,
+        reused: usize,
+    },
+    /// An encrypted backup of files was written (`files.backup`).
+    FilesBackedUp {
+        pid: i32,
+        subject: SubjectSummary,
+        backup: String,
+        files: usize,
+    },
+    /// A file backup was handed back, with a proof (`files.restore`).
+    FilesRestored {
+        pid: i32,
+        subject: SubjectSummary,
+        backup: String,
+        files: usize,
+    },
+    /// The Recovery Kit was confirmed (`recovery.confirm`).
+    RecoveryConfirmed {
+        pid: i32,
+        subject: SubjectSummary,
+        already: bool,
+    },
+    /// A `files.restore` or `recovery.confirm` failed its proof: the
+    /// passphrase or the kit was wrong. `kind` is
+    /// [`AuditKind::FilesRestore`] or [`AuditKind::RecoveryConfirm`].
+    ProofFailed { pid: i32, kind: AuditKind },
 }
 
 impl AuditEvent {
@@ -236,6 +268,28 @@ impl AuditEvent {
             } => format!(
                 "envcloakd: audit: {} failed reason=wrong_passphrase id={item} pid={pid}",
                 write.token()
+            ),
+            AuditEvent::Imported {
+                pid,
+                created,
+                reused,
+                ..
+            } => format!(
+                "envcloakd: audit: imported created={} reused={reused} pid={pid}",
+                created.len()
+            ),
+            AuditEvent::FilesBackedUp {
+                pid, backup, files, ..
+            } => format!("envcloakd: audit: files backed up id={backup} files={files} pid={pid}"),
+            AuditEvent::FilesRestored {
+                pid, backup, files, ..
+            } => format!("envcloakd: audit: files restored id={backup} files={files} pid={pid}"),
+            AuditEvent::RecoveryConfirmed { pid, already, .. } => {
+                format!("envcloakd: audit: recovery kit confirmed already={already} pid={pid}")
+            }
+            AuditEvent::ProofFailed { pid, kind } => format!(
+                "envcloakd: audit: {} failed reason=wrong_secret pid={pid}",
+                kind.token()
             ),
         })
     }
@@ -410,6 +464,71 @@ impl AuditEvent {
                 items: vec![(*item, slug.clone())],
                 decision: decision("failed", Some("wrong_passphrase"), None, None),
                 ..AuditRecord::new(*write, "failed")
+            },
+            AuditEvent::Imported {
+                subject,
+                created,
+                reused,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: created.clone(),
+                decision: decision(
+                    "imported",
+                    None,
+                    Some("import.commit"),
+                    Some(u64::try_from(*reused).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::Import, "imported")
+            },
+            AuditEvent::FilesBackedUp {
+                subject,
+                backup,
+                files,
+                ..
+            } => AuditRecord {
+                request_id: Some(backup.clone()),
+                subject: subject.clone(),
+                decision: decision(
+                    "backed_up",
+                    None,
+                    Some("files.backup"),
+                    Some(u64::try_from(*files).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::FilesBackup, "backed_up")
+            },
+            AuditEvent::FilesRestored {
+                subject,
+                backup,
+                files,
+                ..
+            } => AuditRecord {
+                request_id: Some(backup.clone()),
+                subject: subject.clone(),
+                decision: decision(
+                    "restored",
+                    None,
+                    Some("files.restore"),
+                    Some(u64::try_from(*files).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::FilesRestore, "restored")
+            },
+            AuditEvent::RecoveryConfirmed {
+                subject, already, ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                decision: decision(
+                    "confirmed",
+                    already.then_some("already"),
+                    Some("recovery.confirm"),
+                    None,
+                ),
+                ..AuditRecord::new(AuditKind::RecoveryConfirm, "confirmed")
+            },
+            AuditEvent::ProofFailed { pid, kind } => AuditRecord {
+                subject: subject(*pid),
+                decision: decision("failed", Some("wrong_secret"), None, None),
+                ..AuditRecord::new(*kind, "failed")
             },
         }
     }

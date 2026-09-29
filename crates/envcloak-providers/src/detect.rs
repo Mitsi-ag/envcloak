@@ -142,3 +142,95 @@ impl Registry {
         out
     }
 }
+
+/// The shortest run of ASCII letters and digits [`shaped_like_secret`]
+/// takes for a generated key or token.
+pub const SECRET_RUN: usize = 24;
+
+/// Whether `value` looks like a credential by its shape alone, whoever
+/// issued it (SPEC §6.4: an import keeps secrets, not configuration):
+/// - a URL with a password in its user information (`scheme://user:pass@`
+///   up to the last `@`, since real passwords hold `/` too); or
+/// - a run of at least [`SECRET_RUN`] ASCII letters and digits that mixes
+///   two of lowercase, uppercase and digits, as generated keys and tokens
+///   do.
+///
+/// Read in place, like [`Registry::detect`]: nothing of the value is
+/// copied, kept or returned.
+pub fn shaped_like_secret(value: &SecretBytes) -> bool {
+    #[allow(clippy::disallowed_methods)] // Read in place; only a yes or no leaves.
+    let v: &[u8] = value.expose_secret();
+    url_with_password(v) || key_shaped_run(v)
+}
+
+fn url_with_password(v: &[u8]) -> bool {
+    let Some(at) = v.windows(3).position(|w| w == b"://") else {
+        return false;
+    };
+    let rest = &v[at + 3..];
+    let Some(last_at) = rest.iter().rposition(|&b| b == b'@') else {
+        return false;
+    };
+    let userinfo = &rest[..last_at];
+    userinfo
+        .iter()
+        .position(|&b| b == b':')
+        .is_some_and(|colon| colon + 1 < userinfo.len())
+}
+
+fn key_shaped_run(v: &[u8]) -> bool {
+    let (mut run, mut classes) = (0usize, 0u8);
+    for &b in v {
+        let class = if b.is_ascii_lowercase() {
+            1
+        } else if b.is_ascii_uppercase() {
+            2
+        } else if b.is_ascii_digit() {
+            4
+        } else {
+            (run, classes) = (0, 0);
+            continue;
+        };
+        run += 1;
+        classes |= class;
+        if run >= SECRET_RUN && classes.count_ones() >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    fn shaped(s: &[u8]) -> bool {
+        shaped_like_secret(&SecretBytes::copy_from(s))
+    }
+
+    #[test]
+    fn urls_with_passwords_and_generated_keys_are_secrets() {
+        for yes in [
+            &b"postgres://acme:pa/ss\"w+rd x\xc3\xa9y@db.acme.internal:5432/acme"[..],
+            b"redis://:only-a-password@cache:6379",
+            b"https://user:p@host/path@with-at",
+            b"prefix-aB3dE5fG7hJ9kL1mN3pQ5rS7-suffix",
+            b"0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(shaped(yes), "{:?}", String::from_utf8_lossy(yes));
+        }
+        for no in [
+            &b"https://example.com/path"[..],
+            b"postgres://user@db/acme",
+            b"postgres://user:@db/acme",
+            b"production",
+            b"8080",
+            b"a-long-value-made-of-words-and-dashes-only",
+            b"ALLUPPERCASEBUTLONGERTHANTWENTYFOUR",
+            b"abcdefghijklmnopqrstuvwxyzabcdef",
+            b"",
+        ] {
+            assert!(!shaped(no), "{:?}", String::from_utf8_lossy(no));
+        }
+    }
+}

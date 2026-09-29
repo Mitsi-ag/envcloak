@@ -20,6 +20,8 @@ envcloak-redact.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
 secrecy.workspace = true
+# The import plan's digest (`import.plan`, `import.commit`).
+sha2.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

@@ -28,7 +28,7 @@ mod error;
 mod registry;
 mod safety;
 
-pub use detect::Detection;
+pub use detect::{Detection, SECRET_RUN, shaped_like_secret};
 pub use error::{RegistryError, RegistryErrorKind};
 #[cfg(feature = "testing")]
 pub use registry::load_from;
