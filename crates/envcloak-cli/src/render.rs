@@ -25,10 +25,10 @@
 use std::fmt::Write as _;
 
 use envcloak_ipc::view::{
-    AddedView, CheckReport, ClassificationView, DeleteReport, EntryStatus, EnvFileState,
-    EnvFileView, FileChange, ImportItemView, ImportReport, InitReport, ItemClassView, ItemView,
-    ItemsView, LengthClass, RecoveryConfirmedView, RefChange, RefEditView, RefStatus, RemovedView,
-    RotatedView, SkipReason, TargetView, UndoReport, View,
+    AddedView, BackupView, CheckReport, ClassificationView, DeleteReport, EntryStatus,
+    EnvFileState, EnvFileView, FileChange, ImportItemView, ImportReport, InitReport, ItemClassView,
+    ItemView, ItemsView, LengthClass, RecoveredView, RecoveryConfirmedView, RefChange, RefEditView,
+    RefStatus, RemovedView, RotatedView, SkipReason, TargetView, UndoReport, View,
 };
 use envcloak_policy::{escape_for_display, value_shaped};
 
@@ -48,7 +48,14 @@ pub trait Render: View {
 }
 
 /// The JSON keys whose strings are paths, shown whole ([`shown_path`]).
-const PATH_KEYS: [&str; 5] = ["manifest", "project_dir", "root", "dir", "path"];
+const PATH_KEYS: [&str; 6] = [
+    "manifest",
+    "project_dir",
+    "root",
+    "dir",
+    "path",
+    "file_name",
+];
 
 /// Replaces with [`HIDDEN`] every string of `v` that the text would hide:
 /// a name that looks like a value, or an `id` that is not an id's shape.
@@ -1064,6 +1071,56 @@ impl Render for UndoReport {
         for f in &self.files {
             let _ = writeln!(o, "  {}: {}", shown_path(&f.path), path_reason(&f.state));
         }
+        o
+    }
+}
+
+impl Render for BackupView {
+    fn human(&self) -> String {
+        let mut o = format!("Backup written: {}\n", shown_path(&self.path));
+        let _ = writeln!(
+            o,
+            "  items: {}; size: {} bytes; made {}",
+            self.items,
+            self.bytes,
+            time(self.created_secs)
+        );
+        let _ = writeln!(
+            o,
+            "  It opens only with the Recovery Kit: `envcloak recover --backup <file>` restores \
+             the vault from it."
+        );
+        o
+    }
+}
+
+impl Render for RecoveredView {
+    fn human(&self) -> String {
+        let mut o = if self.locked {
+            format!(
+                "Vault restored from the backup made {}, then locked: a lock request, sleep or \
+                 stop came while it was restored. Run `envcloak unlock` with the new passphrase.\n",
+                time(self.backup_created_secs)
+            )
+        } else {
+            format!(
+                "Vault restored from the backup made {} and unlocked.\n",
+                time(self.backup_created_secs)
+            )
+        };
+        let _ = writeln!(o, "  items: {}", self.items);
+        let _ = writeln!(
+            o,
+            "  passphrase: the new one you gave; the Recovery Kit is unchanged, and confirmed"
+        );
+        if self.replaced > 0 {
+            let _ = writeln!(
+                o,
+                "  the vault it replaced is kept beside it, as vault/replaced-<time>.db; delete \
+                 it once you no longer need it"
+            );
+        }
+        let _ = writeln!(o, "  grants: none; every run needs a new approval");
         o
     }
 }

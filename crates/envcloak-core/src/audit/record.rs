@@ -81,11 +81,20 @@ pub enum AuditKind {
     /// The Recovery Kit was confirmed, with the kit as the proof, or the
     /// proof failed.
     RecoveryConfirm = 19,
+    /// An encrypted backup of the vault was written (`envcloak backup
+    /// create`). The request id is the backup's; the count says how many
+    /// items it holds.
+    Backup = 20,
+    /// The vault was restored from an encrypted backup (`envcloak
+    /// recover`), with the Recovery Kit as the proof, or the proof failed.
+    /// The request id is the backup's; the count says how many items the
+    /// restored vault holds.
+    Recover = 21,
 }
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 19] = [
+    pub const ALL: [AuditKind; 21] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -105,6 +114,8 @@ impl AuditKind {
         AuditKind::FilesBackup,
         AuditKind::FilesRestore,
         AuditKind::RecoveryConfirm,
+        AuditKind::Backup,
+        AuditKind::Recover,
     ];
 
     /// The kind's stable token.
@@ -129,6 +140,8 @@ impl AuditKind {
             AuditKind::FilesBackup => "files_backup",
             AuditKind::FilesRestore => "files_restore",
             AuditKind::RecoveryConfirm => "recovery_confirm",
+            AuditKind::Backup => "backup",
+            AuditKind::Recover => "recover",
         }
     }
 
@@ -436,7 +449,7 @@ mod tests {
             assert_eq!(AuditKind::from_u8(k as u8), Some(k));
         }
         assert_eq!(AuditKind::from_u8(0), None);
-        assert_eq!(AuditKind::from_u8(20), None);
+        assert_eq!(AuditKind::from_u8(22), None);
     }
 
     /// 100 KB of command line (gate 31's size) and long strings everywhere

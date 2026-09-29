@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+Vault restored from the backup made <TIME> and unlocked.
+  items: 4
+  passphrase: the new one you gave; the Recovery Kit is unchanged, and confirmed
+  the vault it replaced is kept beside it, as vault/replaced-<time>.db; delete it once you no longer need it
+  grants: none; every run needs a new approval
+--- stderr

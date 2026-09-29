@@ -270,8 +270,9 @@ fn no_terminal(a: &CreateArgs) -> Failure {
     Failure::new("no_terminal", format!("there is no terminal to {what}"))
 }
 
-/// Asks for a new passphrase twice, or offers a generated one.
-fn new_passphrase(t: &mut Terminal) -> Result<SecretBytes, Failure> {
+/// Asks for a new passphrase twice, or offers a generated one. Also
+/// `envcloak recover`'s.
+pub(crate) fn new_passphrase(t: &mut Terminal) -> Result<SecretBytes, Failure> {
     let first = t.read_secret(
         "New vault passphrase (at least 12 characters; press Enter for a generated one): ",
     )?;

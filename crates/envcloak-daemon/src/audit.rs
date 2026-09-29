@@ -184,10 +184,27 @@ pub enum AuditEvent {
         subject: SubjectSummary,
         already: bool,
     },
-    /// A `files.restore` or `recovery.confirm` failed its proof: the
-    /// passphrase or the kit was wrong. `kind` is
-    /// [`AuditKind::FilesRestore`] or [`AuditKind::RecoveryConfirm`].
+    /// A `files.restore`, `recovery.confirm` or `vault.recover` failed its
+    /// proof: the passphrase or the kit was wrong. `kind` is
+    /// [`AuditKind::FilesRestore`], [`AuditKind::RecoveryConfirm`] or
+    /// [`AuditKind::Recover`].
     ProofFailed { pid: i32, kind: AuditKind },
+    /// An encrypted backup of the vault was written (`backup.create`):
+    /// the backup's id, in hex, and how many items it holds.
+    BackedUp {
+        pid: i32,
+        backup: String,
+        items: usize,
+    },
+    /// The vault was restored from an encrypted backup, with the kit as
+    /// the proof (`vault.recover`): the backup's id, in hex, as the
+    /// backup's own header says it, and how many items the vault holds.
+    Recovered {
+        pid: i32,
+        subject: SubjectSummary,
+        backup: String,
+        items: usize,
+    },
 }
 
 impl AuditEvent {
@@ -315,6 +332,12 @@ impl AuditEvent {
                 "envcloakd: audit: {} failed reason=wrong_secret pid={pid}",
                 kind.token()
             ),
+            AuditEvent::BackedUp { pid, backup, items } => {
+                format!("envcloakd: audit: vault backed up id={backup} items={items} pid={pid}")
+            }
+            AuditEvent::Recovered {
+                pid, backup, items, ..
+            } => format!("envcloakd: audit: vault recovered id={backup} items={items} pid={pid}"),
         })
     }
 
@@ -572,6 +595,33 @@ impl AuditEvent {
                 subject: subject(*pid),
                 decision: decision("failed", Some("wrong_secret"), None, None),
                 ..AuditRecord::new(*kind, "failed")
+            },
+            AuditEvent::BackedUp { pid, backup, items } => AuditRecord {
+                request_id: Some(backup.clone()),
+                subject: subject(*pid),
+                decision: decision(
+                    "backed_up",
+                    None,
+                    Some("backup.create"),
+                    Some(u64::try_from(*items).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::Backup, "backed_up")
+            },
+            AuditEvent::Recovered {
+                subject,
+                backup,
+                items,
+                ..
+            } => AuditRecord {
+                request_id: Some(backup.clone()),
+                subject: subject.clone(),
+                decision: decision(
+                    "recovered",
+                    None,
+                    Some("vault.recover"),
+                    Some(u64::try_from(*items).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::Recover, "recovered")
             },
         }
     }

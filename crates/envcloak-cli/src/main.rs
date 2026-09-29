@@ -24,12 +24,15 @@
 //!   passphrase as a proof;
 //! - `envcloak init`, `import --scan` and `recovery confirm`: env files
 //!   imported into the vault with filesystem-safe scanning, and deleted
-//!   only after the four conditions of SPEC §6.4 (see [`cmd::init`]).
+//!   only after the four conditions of SPEC §6.4 (see [`cmd::init`]);
+//! - `envcloak backup create` and `recover`: an encrypted backup of the
+//!   vault, and the vault restored from one with the Recovery Kit under a
+//!   new passphrase (see [`cmd::recover`]).
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
 //! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`, `init`,
-//! `import`, `recovery confirm`) refuses under a tracer first, before it
-//! reads a file, a descriptor or the terminal.
+//! `import`, `recovery confirm`, `recover`) refuses under a tracer first,
+//! before it reads a file, a descriptor or the terminal.
 //!
 //! `envcloak internal hardening [--hold]` is a hidden, value-free diagnostic
 //! used by the gate 19 tests: it prints `key=value` hardening lines and, with
@@ -88,6 +91,8 @@ const HELP: &str = "usage:
   envcloak init --undo <ID> [--passphrase-fd N] [--json]
   envcloak import --scan <dir> [--yes] [--json]
   envcloak recovery confirm [--kit-fd N] [--json]
+  envcloak backup create [--json]
+  envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
 
 fn main() -> ExitCode {
@@ -139,6 +144,8 @@ fn main() -> ExitCode {
         ["init", rest @ ..] => cmd::init::run(rest),
         ["import", rest @ ..] => cmd::import::run(rest),
         ["recovery", rest @ ..] => cmd::recovery::run(rest),
+        ["backup", rest @ ..] => cmd::backup::run(rest),
+        ["recover", rest @ ..] => cmd::recover::run(rest),
         // Never echo arguments: one of them could be a pasted secret.
         _ => {
             eprintln!("envcloak: unknown command\n{HELP}");

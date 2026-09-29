@@ -39,16 +39,18 @@ use crate::proto::{
     VaultCreateParams,
 };
 use crate::proto::{
-    FilesBackup, FilesBackupParams, FilesRestore, FilesRestoreParams, ImportCommit,
-    ImportCommitParams, ImportParams, ImportPlan, ImportVerify, RecoveryConfirm,
-    RecoveryConfirmParams, RestoredFiles, VerifyParams,
+    BackupCreate, FilesBackup, FilesBackupParams, FilesRestore, FilesRestoreParams, ImportCommit,
+    ImportCommitParams, ImportParams, ImportPlan, ImportVerify, RecoverParams, RecoveryConfirm,
+    RecoveryConfirmParams, RestoredFiles, VaultRecover, VerifyParams,
 };
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
     ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
     UnlockedView,
 };
-use crate::view::{FileBackupView, ImportPlanView, RecoveryConfirmedView, VerifyView};
+use crate::view::{
+    BackupView, FileBackupView, ImportPlanView, RecoveredView, RecoveryConfirmedView, VerifyView,
+};
 use crate::wire_secret::WireSecret;
 
 /// How long a call may wait for its response. `vault create` runs
@@ -553,6 +555,35 @@ impl Client {
     ) -> Result<RecoveryConfirmedView, ClientError> {
         self.call::<RecoveryConfirm>(&RecoveryConfirmParams {
             recovery_kit: WireSecret::new(kit),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `backup.create`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn backup_create(&mut self) -> Result<BackupView, ClientError> {
+        self.call::<BackupCreate>(&NoParams {})
+    }
+
+    /// `vault.recover` from the backup at `backup` (an absolute path), with
+    /// the kit as typed as the proof and `new_passphrase` as the vault's
+    /// passphrase from now on.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn vault_recover(
+        &mut self,
+        backup: &str,
+        kit: SecretBytes,
+        new_passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<RecoveredView, ClientError> {
+        self.call::<VaultRecover>(&RecoverParams {
+            backup: backup.to_owned(),
+            recovery_kit: WireSecret::new(kit),
+            new_passphrase: WireSecret::new(new_passphrase),
             claims: claims.to_vec(),
         })
     }

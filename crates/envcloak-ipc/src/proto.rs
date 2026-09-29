@@ -27,10 +27,10 @@ use envcloak_policy::{
 
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
-    AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DecisionView, DeniedView,
-    FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView, LockedView,
-    RecoveryConfirmedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
-    UnlockedView, VerifyView,
+    AddedView, ApprovedView, AuditVerifyView, BackupView, CheckView, CreatedView, DecisionView,
+    DeniedView, FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView, LockedView,
+    RecoveredView, RecoveryConfirmedView, RemovedView, RevokedView, RotatedView, StatusView,
+    TargetView, UnlockedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -796,8 +796,50 @@ pub struct RecoveryConfirmParams {
     pub claims: Vec<String>,
 }
 
+/// `backup.create`: writes an encrypted backup of the unlocked vault to
+/// its `backups` directory (VAULT.md "Backups"). No value crosses and none
+/// is written in the clear: the backup opens only with the Recovery Kit.
+/// It needs no proof.
+#[derive(Debug)]
+pub struct BackupCreate;
+
+impl Method for BackupCreate {
+    const NAME: &'static str = "backup.create";
+    type Params = NoParams;
+    type Output = BackupView;
+}
+
+/// `vault.recover`: replaces the vault with the one an encrypted backup
+/// holds, opened with the Recovery Kit, under a new passphrase, and leaves
+/// it unlocked (SPEC §15.1 step 11). A proof, like `unlock`, with the kit:
+/// taken only from a terminal subject and counted by the attempt limiter.
+/// A vault that was unlocked is locked first, which ends every grant.
+#[derive(Debug)]
+pub struct VaultRecover;
+
+impl Method for VaultRecover {
+    const NAME: &'static str = "vault.recover";
+    type Params = RecoverParams;
+    type Output = RecoveredView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverParams {
+    /// The backup file's absolute path. The daemon opens it itself, never
+    /// through a symlink in its last component, and only a regular file.
+    pub backup: String,
+    /// The kit as the user wrote it down.
+    pub recovery_kit: WireSecret,
+    /// The vault's passphrase from now on.
+    pub new_passphrase: WireSecret,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 24] = [
+pub const CLIENT_METHODS: [&str; 26] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -822,6 +864,8 @@ pub const CLIENT_METHODS: [&str; 24] = [
     FilesBackup::NAME,
     FilesRestore::NAME,
     RecoveryConfirm::NAME,
+    BackupCreate::NAME,
+    VaultRecover::NAME,
 ];
 
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
@@ -955,12 +999,16 @@ pub enum ErrorKind {
     /// A delivery's audit entry could not be written, so nothing was
     /// released (`files.restore`).
     AuditFailed,
+    /// The file named for `vault.recover` is not a readable vault backup:
+    /// missing, not a regular file, altered, cut short, or of a newer
+    /// format.
+    BackupUnusable,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 38] = [
+    pub const ALL: [ErrorKind; 39] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -998,6 +1046,7 @@ impl ErrorKind {
         ErrorKind::FilesBackupFailed,
         ErrorKind::TooManyChecks,
         ErrorKind::AuditFailed,
+        ErrorKind::BackupUnusable,
         ErrorKind::Internal,
     ];
 
@@ -1041,6 +1090,7 @@ impl ErrorKind {
             ErrorKind::FilesBackupFailed => -32031,
             ErrorKind::TooManyChecks => -32032,
             ErrorKind::AuditFailed => -32033,
+            ErrorKind::BackupUnusable => -32034,
             ErrorKind::Internal => -32099,
         }
     }
@@ -1085,6 +1135,7 @@ impl ErrorKind {
             ErrorKind::FilesBackupFailed => "files_backup_failed",
             ErrorKind::TooManyChecks => "too_many_checks",
             ErrorKind::AuditFailed => "audit_failed",
+            ErrorKind::BackupUnusable => "backup_unusable",
             ErrorKind::Internal => "internal",
         }
     }
@@ -1143,8 +1194,8 @@ impl ErrorKind {
             ErrorKind::ItemExists => "an item with that slug already exists",
             ErrorKind::InvalidItem => "the item's names or value are not accepted",
             ErrorKind::BackupFailed => {
-                "an encrypted backup of the vault could not be written first, so nothing was \
-                 removed"
+                "an encrypted backup of the vault could not be written (before a removal, \
+                 nothing was removed)"
             }
             ErrorKind::PlanChanged => {
                 "what the import would do changed since it was shown (the vault or the files \
@@ -1164,6 +1215,10 @@ impl ErrorKind {
             ErrorKind::AuditFailed => {
                 "the audit entry could not be written, so nothing was released; check the \
                  audit log's directory (`envcloak status`)"
+            }
+            ErrorKind::BackupUnusable => {
+                "that file is not a vault backup this build can read: it is missing, not a \
+                 regular file, altered or cut short, or of a newer format; nothing was restored"
             }
             ErrorKind::Internal => "the daemon failed",
         }

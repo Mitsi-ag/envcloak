@@ -45,13 +45,13 @@ use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{
     AuditHead, FieldId, Integrity, LockedVault, Vault, VaultError, VaultErrorKind, VaultPaths,
 };
-use envcloak_core::{PassphraseRejected, SecretBytes};
+use envcloak_core::{PassphraseRejected, RestoreReport, SecretBytes};
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::{
     ApprovalsView, AuditStatusView, AuditVerifyView, CreatedView, DaemonView,
-    Integrity as IntegrityView, LockReason, LockView, StatusView, UnlockedView, VaultState,
-    VaultView,
+    Integrity as IntegrityView, LockReason, LockView, RecoveredView, StatusView, UnlockedView,
+    VaultState, VaultView,
 };
 use envcloak_policy::{AttemptLimiter, GrantStore, Now};
 
@@ -392,6 +392,63 @@ impl State {
                 // Whatever the failure left on disk decides the slot.
                 self.slot = probe(&self.paths);
                 Err(create_error(e.kind()))
+            }
+        }
+    }
+
+    /// Starts `vault.recover`: closes the vault file, so the restore can
+    /// take its lock, and leaves the slot busy. A vault that was unlocked
+    /// is locked first, which ends every grant and pending request and
+    /// saves the audit log's head. Returns the generation to finish under,
+    /// and whether a vault was unlocked.
+    ///
+    /// # Errors
+    /// [`ErrorKind::Busy`] while an unlock, a creation, a proof or another
+    /// restore runs.
+    pub fn begin_recover(&mut self) -> Result<(u64, bool), RpcError> {
+        if matches!(self.slot, Slot::Busy) {
+            return Err(RpcError::new(ErrorKind::Busy));
+        }
+        let was_unlocked = self.lock(LockReason::Request);
+        // Dropping the locked file closes it and releases its lock.
+        self.slot = Slot::Busy;
+        Ok((self.generation, was_unlocked))
+    }
+
+    /// Finishes `vault.recover` begun under `generation` with the
+    /// restore's result. A restored vault is unlocked, or kept locked when
+    /// a lock arrived meanwhile: it is the vault on disk either way, under
+    /// the new passphrase, so the answer is a success that says so. After a
+    /// failure the slot holds whatever is on disk: the old vault (the
+    /// restore changes nothing before the new file is ready), or none.
+    pub fn finish_recover(
+        &mut self,
+        generation: u64,
+        now: Reading,
+        result: Result<(Vault, RestoreReport), VaultError>,
+    ) -> Result<RecoveredView, RpcError> {
+        match result {
+            Ok((v, report)) => {
+                let locked = generation != self.generation;
+                let view = RecoveredView {
+                    items: u64::try_from(report.items).unwrap_or(u64::MAX),
+                    backup_created_secs: report.backup_created_at,
+                    replaced: u64::try_from(report.replaced.len()).unwrap_or(u64::MAX),
+                    locked,
+                };
+                if locked {
+                    self.slot = Slot::Locked(v.lock());
+                } else {
+                    self.start_grants(&v);
+                    self.slot = Slot::Unlocked(Box::new(v));
+                    self.timer.touch(now);
+                    self.audit_open();
+                }
+                Ok(view)
+            }
+            Err(e) => {
+                self.slot = probe(&self.paths);
+                Err(crate::backup::recover_error(e.kind()))
             }
         }
     }
@@ -962,6 +1019,82 @@ mod tests {
                 "{reason:?}"
             );
         }
+    }
+
+    /// `vault.recover`'s slot handling: an unlocked vault is locked first
+    /// (its pending requests end) and its file closed, so the restore can
+    /// take the vault's lock; the slot is busy meanwhile. A restore that
+    /// succeeds is unlocked, or locked when a lock arrived meanwhile; one
+    /// that fails leaves the slot with what is on disk.
+    #[test]
+    fn a_restore_locks_first_and_leaves_what_is_on_disk() {
+        use envcloak_policy::Decision;
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        let generation = s.begin_create().unwrap();
+        let kit = RecoveryKit::generate();
+        let v = create_vault_with_kit(
+            &f.paths,
+            &SecretBytes::copy_from(PASS),
+            &kit,
+            KdfParams::minimum(),
+        );
+        s.finish_create(generation, now(&f.clocks), v).unwrap();
+        let backup = s.unlocked().unwrap().create_backup().unwrap().path;
+        let t = at(&f.clocks);
+        assert!(matches!(
+            s.grants().decide(request("OPENAI_API_KEY"), &t),
+            Decision::Pending(_)
+        ));
+        assert_eq!(s.approvals(&t).pending, 1);
+        let new_pass = SecretBytes::copy_from(b"another passphrase, long enough");
+
+        // A wrong kit: the vault was locked and closed first, and is the
+        // old one, locked, afterwards.
+        let (generation, was_unlocked) = s.begin_recover().unwrap();
+        assert!(was_unlocked);
+        assert!(matches!(s.slot(), Slot::Busy));
+        assert_eq!(s.approvals(&t).pending, 0);
+        assert_eq!(s.begin_recover().unwrap_err().kind, ErrorKind::Busy);
+        assert_eq!(s.begin_unlock().unwrap_err().kind, ErrorKind::Busy);
+        let r =
+            envcloak_core::restore_backup(&f.paths, &backup, &RecoveryKit::generate(), &new_pass);
+        let e = s.finish_recover(generation, now(&f.clocks), r).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::WrongPassphrase);
+        assert!(matches!(s.slot(), Slot::Locked(_)));
+
+        // The right kit: the restored vault is unlocked, under the new
+        // passphrase.
+        let (generation, was_unlocked) = s.begin_recover().unwrap();
+        assert!(!was_unlocked);
+        let r = envcloak_core::restore_backup(&f.paths, &backup, &kit, &new_pass);
+        let view = s.finish_recover(generation, now(&f.clocks), r).unwrap();
+        assert!(!view.locked);
+        assert_eq!(view.replaced, 1);
+        assert!(matches!(s.slot(), Slot::Unlocked(_)));
+        s.lock(LockReason::Request);
+        assert_eq!(
+            unlock(&f, &mut s, PASS).unwrap_err().kind,
+            ErrorKind::WrongPassphrase
+        );
+        unlock(&f, &mut s, b"another passphrase, long enough").unwrap();
+
+        // A lock while it ran: restored, and locked.
+        let (generation, _) = s.begin_recover().unwrap();
+        assert!(!s.lock(LockReason::Signal));
+        let r = envcloak_core::restore_backup(&f.paths, &backup, &kit, &new_pass);
+        let view = s.finish_recover(generation, now(&f.clocks), r).unwrap();
+        assert!(view.locked);
+        assert!(matches!(s.slot(), Slot::Locked(_)));
+
+        // A file that is not a backup: refused, and the vault is there.
+        let (generation, _) = s.begin_recover().unwrap();
+        let bogus = f.paths.data_dir.join("bogus.ecbackup");
+        std::fs::write(&bogus, b"not a backup").unwrap();
+        let r = envcloak_core::restore_backup(&f.paths, &bogus, &kit, &new_pass);
+        let e = s.finish_recover(generation, now(&f.clocks), r).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::BackupUnusable);
+        assert!(matches!(s.slot(), Slot::Locked(_)));
     }
 
     /// A lock that arrives while Argon2id runs wins: the unlock finishes

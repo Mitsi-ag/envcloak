@@ -48,11 +48,11 @@ use envcloak_core::crypto::KdfParams;
 use envcloak_core::vault::VaultPaths;
 use envcloak_core::{RecoveryKit, check_passphrase, create_vault_with_kit};
 use envcloak_ipc::proto::{
-    self, Approve, AuditVerify, Deny, ErrorKind, FilesBackup, FilesRestore, GrantsList,
-    GrantsRevoke, ImportCommit, ImportPlan, ImportVerify, IncomingRequest, ItemsAdd, ItemsCheck,
-    ItemsList, ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock, Method, PendingGet,
-    RecoveryConfirm, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate,
-    VaultCreateParams, loggable_method, required_role,
+    self, Approve, AuditVerify, BackupCreate, Deny, ErrorKind, FilesBackup, FilesRestore,
+    GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify, IncomingRequest, ItemsAdd,
+    ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock, Method,
+    PendingGet, RecoveryConfirm, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate,
+    VaultCreateParams, VaultRecover, loggable_method, required_role,
 };
 use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
@@ -63,6 +63,7 @@ use envcloak_providers::Registry;
 use envcloak_sys::{PeerIdentity, TerminationSignals};
 
 use crate::audit::AuditEvent;
+use crate::backup;
 use crate::clock::{SystemClocks, now_of};
 use crate::import;
 use crate::items;
@@ -611,6 +612,10 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         }
         RecoveryConfirm::NAME => {
             answer::<RecoveryConfirm>(id, &req, |p| import::recovery_confirm(shared, peer, p))
+        }
+        BackupCreate::NAME => answer::<BackupCreate>(id, &req, |p| backup::create(shared, peer, p)),
+        VaultRecover::NAME => {
+            answer::<VaultRecover>(id, &req, |p| backup::recover(shared, peer, p))
         }
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }

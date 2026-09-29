@@ -2,7 +2,8 @@
 //! value-free snapshot (T11 acceptance): `vault create`, `unlock`,
 //! `status`, `ls`, `show`, `check`, `ref`, `add`, `run`'s refusal,
 //! `approve`, `grants list`, `rotate`, `rm`, `deny`, `grants revoke`,
-//! `audit verify` and `lock`, in one story on the fixture vault. The
+//! `audit verify`, `backup create`, `recover` and `lock`, in one story on
+//! the fixture vault. The
 //! output of `daemon install` is tested with the service managers in
 //! tests/service.rs.
 //!
@@ -38,6 +39,16 @@ struct Normalizer {
 impl Normalizer {
     fn new(home: &TestHome) -> Self {
         let target = cli().parent().unwrap().to_str().unwrap().to_owned();
+        // The data directory differs between macOS and Linux; a backup's
+        // path is in it.
+        let data = common::data_dir(home);
+        std::fs::create_dir_all(&data).unwrap();
+        let real_data = std::fs::canonicalize(&data)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let data = data.to_str().unwrap().to_owned();
         let root = home.root().to_str().unwrap().to_owned();
         let real_root = std::fs::canonicalize(home.root())
             .unwrap()
@@ -47,6 +58,8 @@ impl Normalizer {
         let p = |re: &str| Regex::new(re).unwrap();
         Normalizer {
             replacements: vec![
+                (real_data, "<DATA>".into()),
+                (data, "<DATA>".into()),
                 (real_root, "<ROOT>".into()),
                 (root, "<ROOT>".into()),
                 (target, "<TARGET>".into()),
@@ -58,6 +71,7 @@ impl Normalizer {
                 ),
                 (p(r"[0-9]{4}-[0-9]{2}-[0-9]{2}"), "<DATE>"),
                 (p(r"vault-[0-9A-Za-z-]+\.ecbackup"), "<BACKUP>"),
+                (p(r"size: [0-9]+ bytes"), "size: <BYTES> bytes"),
                 (p(r"(?-u:\b)[0-9A-HJKMNP-TV-Z]{26}(?-u:\b)"), "<ULID>"),
                 (p(r"(?-u:\b)[0-9]+h( [0-9]+m)?( [0-9]+s)?(?-u:\b)"), "<DUR>"),
                 (p(r"(?-u:\b)[0-9]+m( [0-9]+s)?(?-u:\b)"), "<DUR>"),
@@ -364,6 +378,37 @@ fn every_command_prints_its_value_free_snapshot() {
         &s.agent(&["grants", "revoke", "--all"], &[]),
     );
     s.snap("audit-verify", &s.agent(&["audit", "verify"], &[]));
+    let out = s.agent(&["backup", "create", "--json"], &[]);
+    let backup = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    s.snap("backup-create", &s.agent(&["backup", "create"], &[]));
+    let kit = secret_file(
+        s.files.path(),
+        "kit",
+        by_label(&s.cs, "RECOVERY_KIT").value(),
+    );
+    let new_pass = secret_file(
+        s.files.path(),
+        "new-pass",
+        b"a new passphrase for the vault",
+    );
+    s.snap(
+        "recover",
+        &s.person(
+            &[
+                "recover",
+                "--backup",
+                &backup,
+                "--kit-fd",
+                "4",
+                "--new-passphrase-fd",
+                "5",
+            ],
+            &[(4, &kit, true), (5, &new_pass, true)],
+        ),
+    );
     s.snap("lock", &s.agent(&["lock"], &[]));
     s.snap("status-after-lock", &s.agent(&["status"], &[]));
     s.snap("check-locked", &s.agent(&["check"], &[]));

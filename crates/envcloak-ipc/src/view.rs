@@ -56,6 +56,8 @@ views!(
     VerifyView,
     FileBackupView,
     RecoveryConfirmedView,
+    BackupView,
+    RecoveredView,
     ImportReport,
     DeleteReport,
     UndoReport,
@@ -1140,6 +1142,40 @@ pub struct FileBackupView {
 pub struct RecoveryConfirmedView {
     /// It was confirmed before.
     pub already: bool,
+}
+
+/// `backup.create`: the encrypted backup of the vault written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupView {
+    /// The backup's absolute path, in the vault's `backups` directory:
+    /// `envcloak recover --backup <path>` restores the vault from it.
+    pub path: String,
+    /// Its file name there.
+    pub file_name: String,
+    pub items: u64,
+    /// The file's size in bytes.
+    pub bytes: u64,
+    /// When it was made, Unix seconds.
+    pub created_secs: u64,
+}
+
+/// `vault.recover`: the vault is the one the backup held, under the new
+/// passphrase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveredView {
+    /// The items the restored vault holds.
+    pub items: u64,
+    /// When the backup was made, Unix seconds.
+    pub backup_created_secs: u64,
+    /// The files moved out of its way (the replaced vault, kept as
+    /// `vault/replaced-<time>.db`, and its side files); 0 when there was
+    /// no vault.
+    pub replaced: u64,
+    /// A lock (a request, sleep or a signal) arrived while the backup was
+    /// restored: the vault is the restored one, locked.
+    pub locked: bool,
 }
 
 /// `envcloak init` and `envcloak import`: what was found, what the vault

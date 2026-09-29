@@ -182,6 +182,8 @@ The passphrase envelope is not in the header: a copied backup offers nothing to 
 
 A backup is written to `backups/.<name>.tmp` (created exclusively, not following symlinks), synced, hard-linked to its name, and the directory is synced. A leftover `.tmp` file is removed by the next backup.
 
+`envcloak backup create` asks the daemon for one (`backup.create`, IPC.md), and `envcloak rm` writes one before it removes an item. `envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N]` restores the vault from one (`vault.recover`): the Recovery Kit is the proof, typed on `/dev/tty` or read from a named descriptor, and the new passphrase is typed twice or read from a named descriptor. The daemon locks and closes the vault first, then runs `restore_backup` below.
+
 ## File backups
 
 `Vault::backup_files` writes the files `envcloak init --delete-plaintext` is about to delete to `backups/files-<YYYYMMDDTHHMMSSZ>-<id>.ecfiles`, mode 0600, where `<id>` is the backup's 16 random bytes as 26 Crockford base32 characters (what `envcloak init --undo` takes). The code is in `crates/envcloak-core/src/file_backup.rs`, and when it is written in [IMPORT.md](IMPORT.md).

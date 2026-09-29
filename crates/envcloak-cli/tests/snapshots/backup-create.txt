@@ -1,0 +1,6 @@
+exit: 0
+--- stdout
+Backup written: <DATA>/backups/<BACKUP>
+  items: 4; size: <BYTES> bytes; made <TIME>
+  It opens only with the Recovery Kit: `envcloak recover --backup <file>` restores the vault from it.
+--- stderr
