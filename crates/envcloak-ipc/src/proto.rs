@@ -952,12 +952,15 @@ pub enum ErrorKind {
     /// vault as an hour allows (`import.plan`, `import.commit`,
     /// `import.verify`).
     TooManyChecks,
+    /// A delivery's audit entry could not be written, so nothing was
+    /// released (`files.restore`).
+    AuditFailed,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 37] = [
+    pub const ALL: [ErrorKind; 38] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -994,6 +997,7 @@ impl ErrorKind {
         ErrorKind::NoSuchBackup,
         ErrorKind::FilesBackupFailed,
         ErrorKind::TooManyChecks,
+        ErrorKind::AuditFailed,
         ErrorKind::Internal,
     ];
 
@@ -1036,6 +1040,7 @@ impl ErrorKind {
             ErrorKind::NoSuchBackup => -32030,
             ErrorKind::FilesBackupFailed => -32031,
             ErrorKind::TooManyChecks => -32032,
+            ErrorKind::AuditFailed => -32033,
             ErrorKind::Internal => -32099,
         }
     }
@@ -1079,6 +1084,7 @@ impl ErrorKind {
             ErrorKind::NoSuchBackup => "no_such_backup",
             ErrorKind::FilesBackupFailed => "files_backup_failed",
             ErrorKind::TooManyChecks => "too_many_checks",
+            ErrorKind::AuditFailed => "audit_failed",
             ErrorKind::Internal => "internal",
         }
     }
@@ -1154,6 +1160,10 @@ impl ErrorKind {
             ErrorKind::TooManyChecks => {
                 "this process tree has had as many values compared with the vault as an hour \
                  allows; try again later"
+            }
+            ErrorKind::AuditFailed => {
+                "the audit entry could not be written, so nothing was released; check the \
+                 audit log's directory (`envcloak status`)"
             }
             ErrorKind::Internal => "the daemon failed",
         }

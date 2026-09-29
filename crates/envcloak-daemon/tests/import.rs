@@ -17,6 +17,7 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use common::{client, data_dir, passphrase, project, seed_vault, start};
@@ -916,5 +917,52 @@ fn a_project_named_like_a_key_is_not_kept_in_slugs() {
     assert!(list.items.iter().any(|i| i.slug == "openai/project"));
     assert_no_canary(&json(&plan), &f.cs);
     assert_no_canary(&json(&list), &f.cs);
+    f.sweep();
+}
+
+/// Review finding F-54 (Codex): `files.restore` hands plaintext back, so
+/// it is a delivery: when its audit entry cannot be written (another
+/// program put a file where the log's directory was), it is refused
+/// (`audit_failed`) and releases nothing; once the log can be written
+/// again, the same restore succeeds, and the log holds that one.
+#[test]
+fn a_restore_whose_audit_entry_cannot_be_written_releases_nothing() {
+    let mut f = Fixture::new(|_, _| {});
+    let key = by_label(&f.cs, labels::OPENAI_API_KEY).as_str();
+    let body = format!("OPENAI_API_KEY={key}\n");
+    let path = f.home.root().join("acme-web/.env");
+    let mut c = client(&f.home);
+    let b = c
+        .files_backup(&FilesBackupParams {
+            files: vec![BackupFileParams {
+                path: path.to_str().unwrap().to_owned(),
+                mode: 0o600,
+                content: WireSecret::new(SecretBytes::copy_from(body.as_bytes())),
+            }],
+            claims: Vec::new(),
+        })
+        .unwrap();
+    let audit = data_dir(&f.home).join("audit");
+    std::fs::remove_dir_all(&audit).unwrap();
+    std::fs::write(&audit, b"in the way").unwrap();
+    let e = c.files_restore(&b.id, passphrase(&f.cs), &[]).unwrap_err();
+    assert_eq!(rpc(e), ErrorKind::AuditFailed);
+    std::fs::remove_file(&audit).unwrap();
+    std::fs::create_dir(&audit).unwrap();
+    std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let back = c.files_restore(&b.id, passphrase(&f.cs), &[]).unwrap();
+    assert!(back.files[0].content.as_secret().ct_eq(body.as_bytes()));
+    drop((c, back));
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let restored = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::FilesRestore)
+        .filter(|e| e.record.decision.outcome == "restored")
+        .count();
+    assert_eq!(restored, 1);
+    for e in &entries {
+        assert_no_canary(format!("{:?}", e.record).as_bytes(), &f.cs);
+    }
     f.sweep();
 }

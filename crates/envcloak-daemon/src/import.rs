@@ -57,7 +57,9 @@
 //! kit) must open its envelope, checked with the vault taken out of the
 //! slot while Argon2id runs. `files.restore` is the one other method that
 //! hands plaintext to a client: it gives back the files the person asked
-//! to put back (`envcloak init --undo`).
+//! to put back (`envcloak init --undo`), and like a covered run's
+//! delivery, only after its audit entry is written durably
+//! (`audit_failed` otherwise).
 //!
 //! Nothing here answers with a value except `files.restore`, and no error
 //! repeats text a client sent.
@@ -968,12 +970,19 @@ pub fn files_restore(
             }
             _ => RpcError::new(ErrorKind::FilesBackupFailed),
         })?;
-    s.audit(AuditEvent::FilesRestored {
+    // A delivery: its entry is on disk before any byte is released (SPEC
+    // §3 principle 4, gate 33); when it cannot be written, the files read
+    // are dropped, and wiped, and the call is refused.
+    let entry = AuditEvent::FilesRestored {
         pid: peer.pid,
         subject: subject_summary(peer, &caller),
         backup: id.to_string(),
         files: files.len(),
-    });
+    };
+    if !s.audit_delivery(entry) {
+        drop(files);
+        return Err(RpcError::new(ErrorKind::AuditFailed));
+    }
     Ok(RestoredFiles {
         files: files
             .into_iter()
