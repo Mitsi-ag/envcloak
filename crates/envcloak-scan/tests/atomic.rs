@@ -4,9 +4,8 @@
 //! enough and open nowhere else.
 //!
 //! A process forked while this one has a file open holds that file until
-//! it execs, and would count as having it open. The tests here write their
-//! files and start their children under [`FORKS`], so no child of one test
-//! holds another's file.
+//! it execs, and would count as having it open. The tests here run one at
+//! a time ([`serial`]), so no child of one test holds another's file.
 #![allow(clippy::unwrap_used)]
 
 use std::fs::File;
@@ -22,22 +21,20 @@ use envcloak_scan::{
     read_capped, remove_checked, remove_checked_at, replace_atomically, rewrite_checked,
 };
 
-/// Held while a test has a file open for writing or starts a process.
-static FORKS: Mutex<()> = Mutex::new(());
+/// Held for the whole of each test.
+static SERIAL: Mutex<()> = Mutex::new(());
 
-fn forks() -> std::sync::MutexGuard<'static, ()> {
-    FORKS
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn write(p: &Path, b: &[u8]) {
-    let _g = forks();
     std::fs::write(p, b).unwrap();
 }
 
 fn age(p: &Path, by: Duration) {
-    let _g = forks();
     File::options()
         .write(true)
         .open(p)
@@ -50,7 +47,6 @@ fn age(p: &Path, by: Duration) {
 /// then, 300 ms later, it writes `edit` over the start of the file in
 /// place, restores the modification time, closes the file and says `done`.
 fn holder(p: &Path, edit: &str) -> Child {
-    let _g = forks();
     let mut c = Command::new("python3")
         .arg("-c")
         .arg(
@@ -116,6 +112,7 @@ fn no_temps(dir: &Path) {
 
 #[test]
 fn replace_writes_the_new_contents_and_keeps_the_mode() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".gitignore");
     write(&p, b"old\n");
@@ -138,6 +135,7 @@ fn replace_writes_the_new_contents_and_keeps_the_mode() {
 
 #[test]
 fn replace_refuses_a_file_another_program_wrote() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join("envcloak.toml");
     write(&p, b"[env]\n");
@@ -158,6 +156,7 @@ fn replace_refuses_a_file_another_program_wrote() {
 
 #[test]
 fn create_makes_a_new_file_only() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let r = open_root(d.path()).unwrap();
     let s = create_atomically(&r, Path::new("envcloak.toml"), b"[env]\n", 0o644).unwrap();
@@ -194,6 +193,7 @@ fn create_makes_a_new_file_only() {
 
 #[test]
 fn remove_waits_two_minutes_after_the_last_change() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".env");
     write(&p, b"A=1\n");
@@ -218,6 +218,7 @@ fn remove_waits_two_minutes_after_the_last_change() {
 
 #[test]
 fn remove_takes_only_the_file_that_was_read() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".env");
     write(&p, b"A=1\n");
@@ -251,6 +252,7 @@ fn remove_takes_only_the_file_that_was_read() {
 
 #[test]
 fn remove_refuses_a_file_open_in_another_process() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".env");
     write(&p, b"A=1\n");
@@ -277,6 +279,7 @@ fn remove_refuses_a_file_open_in_another_process() {
 /// waited for the holder to close, as one did, removed the new bytes.)
 #[test]
 fn a_file_edited_in_place_by_its_holder_is_never_removed() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".env");
     write(&p, b"A=1\n");
@@ -320,6 +323,7 @@ fn a_file_edited_in_place_by_its_holder_is_never_removed() {
 /// file, reached through the root's handle, is still seen open, and kept.
 #[test]
 fn a_renamed_root_still_keeps_a_file_open_elsewhere() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let root = d.path().join("root");
     std::fs::create_dir(&root).unwrap();
@@ -354,6 +358,7 @@ fn a_renamed_root_still_keeps_a_file_open_elsewhere() {
 /// with its mode kept.
 #[test]
 fn rewrite_replaces_only_an_old_file_no_one_holds() {
+    let _serial = serial();
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let p = d.path().join(".env");
     write(&p, b"A=1\nPORT=8080\n");
