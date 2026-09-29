@@ -12,8 +12,8 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::process::{Command, Stdio};
 
 use envcloak_sys::{
-    DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, link_beneath, list_dir,
-    open_dir_beneath, open_elsewhere, rename_beneath, unlink_beneath, volume_of,
+    DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, exchange_beneath, link_beneath,
+    list_dir, open_dir_beneath, open_elsewhere, rename_beneath, unlink_beneath, volume_of,
 };
 
 fn names(dir: &File) -> Vec<(OsString, DirEntryKind)> {
@@ -154,6 +154,43 @@ fn create_link_rename_and_unlink_work_on_names_in_the_handle() {
         let e = rename_beneath(&dir, OsStr::new(bad), OsStr::new("ok")).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput, "{bad:?}");
         let e = link_beneath(&dir, OsStr::new("ok"), OsStr::new(bad)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{bad:?}");
+    }
+}
+
+/// A swap exchanges two names in one step, keeps each file whole, needs
+/// both names, and never follows a symlink in either place. The file
+/// systems the tests run on (APFS, ext4, tmpfs) can swap.
+#[test]
+fn exchange_swaps_two_names_in_the_handle() {
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = File::open(tmp.path()).unwrap();
+    std::fs::write(tmp.path().join("a"), b"first").unwrap();
+    std::fs::write(tmp.path().join("b"), b"second").unwrap();
+    let ino = |n: &str| std::fs::metadata(tmp.path().join(n)).unwrap().ino();
+    let (a, b) = (ino("a"), ino("b"));
+    exchange_beneath(&dir, OsStr::new("a"), OsStr::new("b")).unwrap();
+    assert_eq!(std::fs::read(tmp.path().join("a")).unwrap(), b"second");
+    assert_eq!(std::fs::read(tmp.path().join("b")).unwrap(), b"first");
+    assert_eq!((ino("a"), ino("b")), (b, a));
+    // Both names must be there.
+    let e = exchange_beneath(&dir, OsStr::new("a"), OsStr::new("missing")).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    assert_eq!(std::fs::read(tmp.path().join("a")).unwrap(), b"second");
+    // A symlink is swapped as a name; its target is not touched.
+    std::fs::write(tmp.path().join("target"), b"t").unwrap();
+    symlink("target", tmp.path().join("link")).unwrap();
+    exchange_beneath(&dir, OsStr::new("a"), OsStr::new("link")).unwrap();
+    assert!(
+        std::fs::symlink_metadata(tmp.path().join("a"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(tmp.path().join("link")).unwrap(), b"second");
+    assert_eq!(std::fs::read(tmp.path().join("target")).unwrap(), b"t");
+    for bad in ["", ".", "..", "a/b", "x\0"] {
+        let e = exchange_beneath(&dir, OsStr::new(bad), OsStr::new("b")).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput, "{bad:?}");
     }
 }

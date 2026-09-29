@@ -7,8 +7,9 @@
 //! on one name inside a directory the caller already holds open
 //! ([`crate::open_beneath`] opens a file there): [`list_dir`] reads its
 //! entries, [`open_dir_beneath`] opens a subdirectory, and
-//! [`create_beneath`], [`link_beneath`], [`rename_beneath`] and
-//! [`unlink_beneath`] make, link, move and remove names in it. None of
+//! [`create_beneath`], [`link_beneath`], [`rename_beneath`],
+//! [`exchange_beneath`] and [`unlink_beneath`] make, link, move, swap and
+//! remove names in it. None of
 //! them follows a symlink in the name's place. [`volume_of`] says whether
 //! the directory is on a network volume.
 //!
@@ -138,6 +139,34 @@ pub fn rename_beneath(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
     // SAFETY: `dir` keeps its descriptor open for the call; both names are
     // NUL-terminated and outlive it.
     retry(|| unsafe { libc::renameat(fd, a.as_ptr(), fd, b.as_ptr()) }).map(drop)
+}
+
+/// Swaps the names `a` and `b` in `dir` in one step: each then names what
+/// the other named, and no moment passes with either missing. Linux
+/// `renameat2(2)` with `RENAME_EXCHANGE`, macOS `renameatx_np(2)` with
+/// `RENAME_SWAP`. Both names must exist. A file system that cannot swap
+/// (macOS HFS+, some network and FUSE ones, a kernel before 3.15) fails
+/// with [`io::ErrorKind::Unsupported`], having changed nothing.
+pub fn exchange_beneath(dir: &File, a: &OsStr, b: &OsStr) -> io::Result<()> {
+    let (x, y) = (component(a)?, component(b)?);
+    let fd = dir.as_raw_fd();
+    // SAFETY: as in `rename_beneath`; the flags are the constant the
+    // system defines for a swap.
+    #[cfg(target_os = "linux")]
+    let swapped =
+        retry(|| unsafe { libc::renameat2(fd, x.as_ptr(), fd, y.as_ptr(), libc::RENAME_EXCHANGE) });
+    // SAFETY: as above.
+    #[cfg(target_os = "macos")]
+    let swapped =
+        retry(|| unsafe { libc::renameatx_np(fd, x.as_ptr(), fd, y.as_ptr(), libc::RENAME_SWAP) });
+    swapped.map(drop).map_err(|e| {
+        let unsupported = [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP];
+        if e.raw_os_error().is_some_and(|c| unsupported.contains(&c)) {
+            io::ErrorKind::Unsupported.into()
+        } else {
+            e
+        }
+    })
 }
 
 /// Gives the file `from` in `dir` a second name `to` there, with

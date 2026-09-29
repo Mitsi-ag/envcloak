@@ -26,16 +26,16 @@
 //! The daemon answers the gate: it holds the vault, and the CLI has no key
 //! to check anything with. A crash at any point leaves each entry in its
 //! file or committed in the vault: nothing is changed before step 3 has
-//! passed, a rewrite renames a whole new file over the old one, and a
+//! passed, a rewrite swaps a whole new file in for the old one, and a
 //! removal renames the file aside before it unlinks it (a crash between
-//! the two leaves it under a temporary name the scan reports).
+//! the steps leaves one under a temporary name the scan reports).
 
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use envcloak_core::SecretBytes;
 
-use crate::atomic::{ModifyErrorKind, remove_checked_observed};
+use crate::atomic::{Inside, ModifyErrorKind, remove_checked_observed};
 use crate::restore::rewrite_observed;
 use crate::root::{FileStamp, ScanRoot};
 
@@ -88,7 +88,7 @@ pub enum DeleteStep {
     /// The file at this index was removed.
     Removed(usize),
     /// The new contents of the file at this index are written beside it,
-    /// not yet renamed over it.
+    /// not yet in its place.
     Staged(usize),
     /// The file at this index was rewritten.
     Rewritten(usize),
@@ -151,8 +151,10 @@ pub fn delete_plaintext<G: DeleteGate>(
                 observe(DeleteStep::MovedAside(i));
             })
             .map(|()| (&mut out.removed, DeleteStep::Removed(i))),
-            Remains::Bytes(b) => rewrite_observed(r, rel, b, stamp, now, &mut |_| {
-                observe(DeleteStep::Staged(i));
+            Remains::Bytes(b) => rewrite_observed(r, rel, b, stamp, now, &mut |at| {
+                if at == Inside::Staged {
+                    observe(DeleteStep::Staged(i));
+                }
             })
             .map(|_| (&mut out.rewritten, DeleteStep::Rewritten(i))),
             Remains::Everything => continue,

@@ -10,9 +10,14 @@
 //!
 //! - [`replace_atomically`] writes the new contents to a new file beside
 //!   the old one (`O_EXCL`, the old file's mode), flushes it, checks the
-//!   old file again, renames the new one over it and flushes the
+//!   old file again, swaps the two names in one step and checks that what
+//!   came out is the file checked (swapping back when another program
+//!   saved over the name meanwhile), then removes it and flushes the
 //!   directory. A crash leaves the old file or the new one, never part of
-//!   either; a leftover temporary file is never read by anyone.
+//!   either; a leftover temporary file is never read by anyone. On a file
+//!   system that cannot swap names (macOS HFS+, some network and FUSE
+//!   ones), the new file is renamed over the old one right after the
+//!   check, and a save landing between the two is replaced.
 //! - [`create_atomically`] writes a new file the same way and links it
 //!   into place only if the name is still free.
 //! - [`remove_checked`] removes a file only when it is unchanged since it
@@ -45,7 +50,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use envcloak_sys::{
-    InUse, create_beneath, link_beneath, open_elsewhere, rename_beneath, sync_file, unlink_beneath,
+    InUse, create_beneath, exchange_beneath, link_beneath, open_elsewhere, rename_beneath,
+    sync_file, unlink_beneath,
 };
 
 use crate::root::{FileStamp, ScanErrorKind, ScanRoot, io_kind, open_file};
@@ -190,40 +196,112 @@ fn io(e: &std::io::Error) -> ModifyErrorKind {
 
 /// Where [`remove_checked`] or [`rewrite_checked`] leaves a file under a
 /// temporary name if the process ends there (gate 16's test stops it at
-/// each).
+/// each), and where a test puts another program's save.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Inside {
     /// The file to remove was renamed aside, and is not unlinked yet.
     MovedAside,
-    /// The new contents are written beside the file, and not renamed over
-    /// it yet.
+    /// The new contents are written beside the file, and not in its place
+    /// yet.
     Staged,
+    /// The file was checked for the last time before the new contents take
+    /// its name.
+    Checked,
+}
+
+/// Whether `m` is the file `expect` stamps, as a rename leaves it: a
+/// rename may update the change time, so the contents' identity is the
+/// device, inode, size and modification time; and no other hard link.
+fn is_checked(m: &std::fs::Metadata, expect: &FileStamp) -> bool {
+    (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec())
+        == (
+            expect.dev,
+            expect.ino,
+            expect.size,
+            expect.mtime,
+            expect.mtime_nsec,
+        )
+        && m.nlink() == 1
 }
 
 /// Writes `new` beside `name` in `dir`, checks the file there is still the
-/// one `expect` stamps, and renames the new file over it.
+/// one `expect` stamps, and puts the new file in its place.
+///
+/// Where the file system can, the two names are swapped in one step
+/// ([`exchange_beneath`]) and what came out is checked: when another
+/// program saved over the name after the check (an editor's atomic save),
+/// the names are swapped back, so its file is kept and nothing is
+/// replaced (`changed`). Where it cannot, the new file is renamed over
+/// the name right after the check, and a save landing between the two is
+/// replaced. `rel` is the file's path for errors.
 fn replace_in(
     dir: &File,
+    rel: &Path,
     name: &OsStr,
     new: &[u8],
     expect: &FileStamp,
     observe: &mut dyn FnMut(Inside),
-) -> Result<FileStamp, ModifyErrorKind> {
+) -> Result<FileStamp, ModifyError> {
+    let fail = |kind| ModifyError {
+        rel: rel.to_path_buf(),
+        kind,
+    };
     let temp = temp_name(name, "new");
-    let f = write_new(dir, &temp, new, expect.mode).map_err(|e| io(&e))?;
+    let f = write_new(dir, &temp, new, expect.mode).map_err(|e| fail(io(&e)))?;
     observe(Inside::Staged);
     // Another program may have written the file while this one wrote its
     // replacement: keep theirs.
-    let installed = check_same(dir, name, expect)
-        .map(drop)
-        .and_then(|()| rename_beneath(dir, &temp, name).map_err(|e| io(&e)));
-    if let Err(k) = installed {
+    if let Err(k) = check_same(dir, name, expect) {
         let _ = unlink_beneath(dir, &temp);
-        return Err(k);
+        return Err(fail(k));
     }
-    sync_file(dir).map_err(|e| io(&e))?;
-    let m = f.metadata().map_err(|e| io(&e))?;
+    observe(Inside::Checked);
+    match exchange_beneath(dir, &temp, name) {
+        Ok(()) => {
+            let out = open_file(dir, &temp, usize::MAX).map(|(_, m)| m);
+            if !out.as_ref().is_ok_and(|m| is_checked(m, expect)) {
+                return Err(swap_back(dir, rel, name, &temp, &f));
+            }
+            unlink_beneath(dir, &temp).map_err(|e| fail(io(&e)))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            if let Err(e) = rename_beneath(dir, &temp, name) {
+                let _ = unlink_beneath(dir, &temp);
+                return Err(fail(io(&e)));
+            }
+        }
+        Err(e) => {
+            let _ = unlink_beneath(dir, &temp);
+            return Err(fail(io(&e)));
+        }
+    }
+    sync_file(dir).map_err(|e| fail(io(&e)))?;
+    let m = f.metadata().map_err(|e| fail(io(&e)))?;
     Ok(FileStamp::of(&m))
+}
+
+/// After a swap brought out a file that is not the one checked: swaps the
+/// names back, so `name` is that file again, and removes the new
+/// contents, `staged`, from `temp`. Returns `changed`; or, when the names
+/// could not be put back as they were, what is under `temp` is kept and
+/// named (`moved_aside`), and nothing is removed.
+fn swap_back(dir: &File, rel: &Path, name: &OsStr, temp: &OsStr, staged: &File) -> ModifyError {
+    let ours = staged.metadata().map(|m| (m.dev(), m.ino()));
+    let back = exchange_beneath(dir, temp, name).is_ok()
+        && open_file(dir, temp, usize::MAX)
+            .is_ok_and(|(_, m)| ours.as_ref().is_ok_and(|o| *o == (m.dev(), m.ino())));
+    if back && unlink_beneath(dir, temp).is_ok() {
+        let _ = sync_file(dir);
+        return ModifyError {
+            rel: rel.to_path_buf(),
+            kind: ModifyErrorKind::Changed,
+        };
+    }
+    let _ = sync_file(dir);
+    ModifyError {
+        rel: rel.with_file_name(temp),
+        kind: ModifyErrorKind::MovedAside,
+    }
 }
 
 /// Replaces the file at `rel`, which must still be the one `expect`
@@ -243,7 +321,7 @@ pub fn replace_atomically(
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
     drop(check_same(&dir, &name, expect).map_err(fail)?);
-    replace_in(&dir, &name, new, expect, &mut |_| {}).map_err(fail)
+    replace_in(&dir, rel, &name, new, expect, &mut |_| {})
 }
 
 /// Creates the file at `rel` with `new` and `mode`, only if no file has
@@ -340,20 +418,7 @@ pub fn remove_checked_observed(
     rename_beneath(&dir, &name, &aside).map_err(|e| fail(io(&e)))?;
     observe(Inside::MovedAside);
     let moved = open_file(&dir, &aside, usize::MAX).map(|(_, m)| m);
-    let same = moved.as_ref().is_ok_and(|m| {
-        // A rename may update the change time; the contents' identity is
-        // the device, inode, size and modification time.
-        (m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec())
-            == (
-                expect.dev,
-                expect.ino,
-                expect.size,
-                expect.mtime,
-                expect.mtime_nsec,
-            )
-            && m.nlink() == 1
-    });
-    if !same {
+    if !moved.as_ref().is_ok_and(|m| is_checked(m, expect)) {
         return Err(match link_beneath(&dir, &aside, &name) {
             Ok(()) => {
                 let _ = unlink_beneath(&dir, &aside);
@@ -402,5 +467,5 @@ pub fn rewrite_checked_observed(
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
     check_removable(&dir, &name, expect, now).map_err(fail)?;
-    replace_in(&dir, &name, new, expect, observe).map_err(fail)
+    replace_in(&dir, rel, &name, new, expect, observe)
 }

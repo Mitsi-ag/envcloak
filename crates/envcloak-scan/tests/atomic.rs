@@ -17,8 +17,9 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use envcloak_scan::{
-    FileStamp, MAX_DOTENV, ModifyErrorKind, ScanErrorKind, create_atomically, open_root,
+    FileStamp, Inside, MAX_DOTENV, ModifyErrorKind, ScanErrorKind, create_atomically, open_root,
     read_capped, remove_checked, remove_checked_at, replace_atomically, rewrite_checked,
+    rewrite_checked_observed,
 };
 
 /// Held for the whole of each test.
@@ -151,6 +152,50 @@ fn replace_refuses_a_file_another_program_wrote() {
     let e = replace_atomically(&r, Path::new("envcloak.toml"), b"new", &s).unwrap_err();
     assert_eq!(e.kind, ModifyErrorKind::Changed);
     assert!(!p.exists());
+    no_temps(d.path());
+}
+
+/// An editor's atomic save (a new file renamed over the name) that lands
+/// after the last check, right before the new contents take the name, is
+/// kept: the swap brings it out, it is not the file checked, and the
+/// names are swapped back. Nothing is replaced, and no temporary file is
+/// left.
+#[test]
+fn a_save_after_the_last_check_is_never_replaced() {
+    let _serial = serial();
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join(".env");
+    write(&p, b"A=1\nPORT=8080\n");
+    age(&p, Duration::from_secs(600));
+    let r = open_root(d.path()).unwrap();
+    let s = stamp(&p);
+    let mut saved = false;
+    let e = rewrite_checked_observed(
+        &r,
+        Path::new(".env"),
+        b"PORT=8080\n",
+        &s,
+        SystemTime::now(),
+        &mut |at| {
+            if at == Inside::Checked {
+                let t = d.path().join(".env.swp");
+                write(&t, b"A=2\nPORT=8080\n");
+                std::fs::rename(&t, &p).unwrap();
+                saved = true;
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(saved);
+    assert_eq!(e.kind, ModifyErrorKind::Changed);
+    assert_eq!(e.rel, Path::new(".env"));
+    assert_eq!(std::fs::read(&p).unwrap(), b"A=2\nPORT=8080\n");
+    no_temps(d.path());
+    // Unsaved over, the same rewrite goes through.
+    age(&p, Duration::from_secs(600));
+    let s = stamp(&p);
+    rewrite_checked(&r, Path::new(".env"), b"PORT=8080\n", &s).unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), b"PORT=8080\n");
     no_temps(d.path());
 }
 
