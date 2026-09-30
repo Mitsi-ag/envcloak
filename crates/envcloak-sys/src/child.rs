@@ -8,11 +8,14 @@
 //!   the code that acts on it is ordinary code on an ordinary thread.
 //!   [`SignalRelay::mark`] puts a mark in the same stream, so the reader
 //!   knows which signals were caught before a moment and which after. A
-//!   caught signal, unlike an ignored one, is reset to its default action
-//!   by `exec`, so the child the runner starts gets the usual
-//!   dispositions. A signal mask survives `exec`, so a program can start
-//!   the runner with a signal blocked, which would then never be caught:
-//!   the installing thread unblocks the relay's signals (review R-8).
+//!   signal that finds the pipe full (a flood of signals not read yet) is
+//!   kept aside instead, one of each signal and sender, and handed on all
+//!   the same, on its side of the marks (review F-71). A caught signal,
+//!   unlike an ignored one, is reset to its default action by `exec`, so
+//!   the child the runner starts gets the usual dispositions. A signal
+//!   mask survives `exec`, so a program can start the runner with a
+//!   signal blocked, which would then never be caught: the installing
+//!   thread unblocks the relay's signals (review R-8).
 //! - [`wait_for_exit`] waits until a child has exited and leaves it a
 //!   zombie (`waitid` with `WNOWAIT`), so its pid cannot be handed to
 //!   another process until the caller reaps it. A thread that sends the
@@ -24,7 +27,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 /// Sends `sig` to process `pid`.
 ///
@@ -106,6 +109,20 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// (macOS; see [`sent_by_process`]).
 #[cfg(target_os = "macos")]
 static SESSION: AtomicI32 = AtomicI32::new(-1);
+/// How many handlers are running now: a relay's drop waits for them, so
+/// none writes into the pipe, or keeps a signal, for the next relay.
+static IN_HANDLER: AtomicU32 = AtomicU32::new(0);
+/// How many marks the relay has written into the pipe.
+static MARKS: AtomicU32 = AtomicU32::new(0);
+/// The signals kept aside because the pipe was full (review F-71), by the
+/// byte the handler could not write: bit `m` is set for one caught when
+/// [`MARKS`] was `m` (marks from the 31st on share bit 31). So a kept
+/// signal is one of each signal, sender and stretch between two marks,
+/// whatever else fills the pipe, and never merges with one on the other
+/// side of a mark.
+static KEPT: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
+/// A signal was kept since the reader last looked at [`KEPT`].
+static KEPT_SINCE: AtomicBool = AtomicBool::new(false);
 
 /// A byte in the relay pipe: the signal's number in the low seven bits,
 /// and this bit when a process sent it. Alone, the bit is a
@@ -115,13 +132,37 @@ const BY_PROCESS: u8 = 0x80;
 const MARK: u8 = BY_PROCESS;
 /// The byte [`SignalRelay::stop`] writes.
 const STOP: u8 = 0;
+/// The byte a handler writes after keeping a signal aside, so a reader
+/// about to wait on an empty pipe looks at [`KEPT`] again. It carries
+/// nothing else.
+const WAKE: u8 = 0x7f;
 /// How long [`SignalRelay::mark`] and [`SignalRelay::stop`] wait for room
 /// in a full pipe (a flood of signals not read yet) before they fail, in
 /// milliseconds.
 const ROOM_WAIT_MS: libc::c_int = 100;
 /// The highest signal a relay catches: its number must leave
-/// [`BY_PROCESS`] free. Every signal on Linux and macOS is below it.
-const MAX_SIGNAL: i32 = 0x7f;
+/// [`BY_PROCESS`] and [`WAKE`] free. Every signal on Linux and macOS is
+/// below it.
+const MAX_SIGNAL: i32 = 0x7e;
+/// Set while [`SignalRelay::put`] waits for room: the unit tests drain
+/// the pipe once it does.
+#[cfg(test)]
+static PUT_WAITING: AtomicBool = AtomicBool::new(false);
+/// Set when [`SignalRelay::next`] is about to wait on an empty pipe: the
+/// unit tests keep a signal aside once it is.
+#[cfg(test)]
+static NEXT_WAITING: AtomicBool = AtomicBool::new(false);
+/// The unit tests' pause inside the handler, after it has read the write
+/// end: [`PAUSE_ARMED`] makes the next handler stop there
+/// ([`PAUSE_INSIDE`]) until the test sets [`PAUSE_OFF`].
+#[cfg(test)]
+static HANDLER_PAUSE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PAUSE_OFF);
+#[cfg(test)]
+const PAUSE_OFF: u8 = 0;
+#[cfg(test)]
+const PAUSE_ARMED: u8 = 1;
+#[cfg(test)]
+const PAUSE_INSIDE: u8 = 2;
 
 fn pipe() -> io::Result<&'static RelayPipe> {
     PIPE.get_or_init(|| {
@@ -209,36 +250,97 @@ extern "C" fn relay_handler(
     info: *mut libc::siginfo_t,
     _context: *mut libc::c_void,
 ) {
+    // Counted before the write end is read, so a relay's drop, which
+    // clears the write end and then waits for the count to reach 0, sees
+    // this handler or makes it find no write end.
+    IN_HANDLER.fetch_add(1, Ordering::SeqCst);
     let fd = WRITE_FD.load(Ordering::SeqCst);
-    if fd < 0 {
-        return;
+    #[cfg(test)]
+    if HANDLER_PAUSE
+        .compare_exchange(
+            PAUSE_ARMED,
+            PAUSE_INSIDE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        while HANDLER_PAUSE.load(Ordering::SeqCst) == PAUSE_INSIDE {
+            std::hint::spin_loop();
+        }
     }
     // Only signals 1 to MAX_SIGNAL are installed; the check keeps the byte
-    // from ever reading as a mark.
+    // from ever reading as a mark, the stop or a wake-up.
+    let number = u8::try_from(sig)
+        .ok()
+        .filter(|n| (1..=MAX_SIGNAL).contains(&i32::from(*n)));
+    if let (true, Some(number)) = (fd >= 0, number) {
+        let errno = errno_location();
+        // SAFETY: the handler may interrupt code between a failed call and
+        // its read of errno, so errno is put back after the calls. `errno`
+        // points at this thread's slot. `info` is the siginfo_t the kernel
+        // passes an SA_SIGINFO handler, valid for the call, or null.
+        // sent_by_process makes at most one system call; write is
+        // async-signal-safe. A full pipe (EAGAIN) takes no byte, and the
+        // signal is kept aside instead (review F-71): the pipe may be full
+        // of other signals, so this one is not known to be there already.
+        unsafe {
+            let saved = *errno;
+            let by_process = info.as_ref().is_some_and(sent_by_process);
+            let byte = if by_process {
+                number | BY_PROCESS
+            } else {
+                number
+            };
+            if libc::write(fd, (&raw const byte).cast(), 1) != 1 {
+                keep(fd, byte);
+            }
+            *errno = saved;
+        }
+    }
+    IN_HANDLER.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Keeps aside the signal whose `byte` did not fit in the pipe `fd`, for
+/// the stretch between marks it was caught in, and writes [`WAKE`]. Called
+/// from the signal handler: it only uses atomics, which Rust provides only
+/// where they are lock-free, and one non-blocking write.
+///
+/// The wake-up closes a gap: the reader may have looked at [`KEPT`] and
+/// found nothing just before this, and be about to wait on a pipe it has
+/// emptied since. When the wake-up does not fit either, the pipe is full,
+/// so the reader is not waiting: it reads, and looks again.
+fn keep(fd: libc::c_int, byte: u8) {
+    let marks = MARKS.load(Ordering::SeqCst).min(31);
+    KEPT[usize::from(byte)].fetch_or(1 << marks, Ordering::SeqCst);
+    KEPT_SINCE.store(true, Ordering::SeqCst);
+    let wake = WAKE;
+    // SAFETY: `wake` is one readable byte and `fd` the relay's write end,
+    // open for the life of the process; the result does not matter.
+    unsafe { libc::write(fd, (&raw const wake).cast(), 1) };
+}
+
+/// [`keep`], for a signal the tests say did not fit: `sig`, and whether a
+/// process sent it. Does nothing while no relay is installed or for a
+/// signal a relay cannot catch.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn keep_as_if_full(sig: i32, by_process: bool) {
+    let fd = WRITE_FD.load(Ordering::SeqCst);
     let Some(number) = u8::try_from(sig)
         .ok()
         .filter(|n| (1..=MAX_SIGNAL).contains(&i32::from(*n)))
     else {
         return;
     };
-    let errno = errno_location();
-    // SAFETY: the handler may interrupt code between a failed call and its
-    // read of errno, so errno is put back after the calls. `errno` points
-    // at this thread's slot. `info` is the siginfo_t the kernel passes an
-    // SA_SIGINFO handler, valid for the call, or null. sent_by_process
-    // makes at most one system call; write is async-signal-safe, and a
-    // full pipe (EAGAIN) drops the byte, since one of the same signal is
-    // pending.
-    unsafe {
-        let saved = *errno;
-        let by_process = info.as_ref().is_some_and(sent_by_process);
-        let byte = if by_process {
-            number | BY_PROCESS
-        } else {
-            number
-        };
-        libc::write(fd, (&raw const byte).cast(), 1);
-        *errno = saved;
+    if fd >= 0 {
+        keep(
+            fd,
+            if by_process {
+                number | BY_PROCESS
+            } else {
+                number
+            },
+        );
     }
 }
 
@@ -272,6 +374,9 @@ pub struct SignalRelay {
     /// there.
     thread: libc::pthread_t,
     reblock: Vec<i32>,
+    /// How many marks [`SignalRelay::next`] has handed out: a signal kept
+    /// aside is due once the reader is past the marks written before it.
+    marks_read: AtomicU32,
 }
 
 impl core::fmt::Debug for SignalRelay {
@@ -298,7 +403,7 @@ impl SignalRelay {
     ///
     /// # Errors
     /// [`io::ErrorKind::AlreadyExists`] while another relay is installed,
-    /// [`io::ErrorKind::InvalidInput`] for a signal outside 1 to 127, and
+    /// [`io::ErrorKind::InvalidInput`] for a signal outside 1 to 126, and
     /// the errors of `pipe`, `sigaction` and `pthread_sigmask`. Nothing
     /// stays installed after an error.
     pub fn install(signals: &[i32]) -> io::Result<SignalRelay> {
@@ -309,7 +414,9 @@ impl SignalRelay {
         if ACTIVE.swap(true, Ordering::SeqCst) {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
-        // Whatever an earlier relay left unread is not this one's.
+        // Whatever an earlier relay left unread, or kept aside, is not this
+        // one's. Its drop waited for its last handler, so nothing of it is
+        // still on its way.
         let mut stale = [0u8; 64];
         // SAFETY: `stale` is writable for its length; the read end is
         // non-blocking, so this stops at EAGAIN.
@@ -321,6 +428,11 @@ impl SignalRelay {
             )
         } > 0
         {}
+        for kept in &KEPT {
+            kept.store(0, Ordering::SeqCst);
+        }
+        KEPT_SINCE.store(false, Ordering::SeqCst);
+        MARKS.store(0, Ordering::SeqCst);
         #[cfg(target_os = "macos")]
         {
             // SAFETY: getsid(0) asks about this process and has no memory
@@ -335,6 +447,7 @@ impl SignalRelay {
             // SAFETY: pthread_self has no preconditions.
             thread: unsafe { libc::pthread_self() },
             reblock: Vec::new(),
+            marks_read: AtomicU32::new(0),
         };
         for &sig in signals {
             // SAFETY: sigaction is plain data; every field is set below or
@@ -364,29 +477,53 @@ impl SignalRelay {
     /// Waits for the next relayed signal or mark and returns it, or `None`
     /// once [`SignalRelay::stop`] was called. Meant for one reading thread.
     ///
+    /// A signal kept aside because the pipe was full (review F-71) is
+    /// handed out once, with its sender, as soon as this sees it: it may
+    /// come before signals caught before it, but never on the other side
+    /// of a mark than its handler (one caught while [`SignalRelay::mark`]
+    /// runs may come on either side, as through the pipe), and every one
+    /// kept before the stop comes before `None`.
+    ///
     /// # Errors
     /// When `poll` or `read` fails for another reason than a signal.
     pub fn next(&self) -> io::Result<Option<Relayed>> {
         let fd = self.pipe.read.as_raw_fd();
         loop {
+            // Before every byte: a signal kept since then goes first. One
+            // kept before a mark or the stop was written is seen here before
+            // that byte is read: its wake-up is ahead of it in the pipe, or,
+            // when the pipe was full, the byte read to make room for it was.
+            if let Some(kept) = self.take_kept() {
+                return Ok(Some(kept));
+            }
             let mut byte = 0u8;
             // SAFETY: `byte` is one writable byte; the descriptor is open for
             // the life of the process.
             let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
             if n == 1 {
-                return Ok(match byte {
-                    STOP => None,
-                    MARK => Some(Relayed::Mark),
-                    b => Some(Relayed::Signal {
-                        number: i32::from(b & !BY_PROCESS),
-                        by_process: b & BY_PROCESS != 0,
-                    }),
-                });
+                match byte {
+                    STOP => return Ok(None),
+                    MARK => {
+                        self.marks_read.fetch_add(1, Ordering::SeqCst);
+                        // Signals kept after this mark are due from now on.
+                        KEPT_SINCE.store(true, Ordering::SeqCst);
+                        return Ok(Some(Relayed::Mark));
+                    }
+                    WAKE => continue,
+                    b => {
+                        return Ok(Some(Relayed::Signal {
+                            number: i32::from(b & !BY_PROCESS),
+                            by_process: b & BY_PROCESS != 0,
+                        }));
+                    }
+                }
             }
             let err = io::Error::last_os_error();
             match err.kind() {
                 io::ErrorKind::Interrupted => {}
                 io::ErrorKind::WouldBlock => {
+                    #[cfg(test)]
+                    NEXT_WAITING.store(true, Ordering::SeqCst);
                     let mut p = libc::pollfd {
                         fd,
                         events: libc::POLLIN,
@@ -405,6 +542,47 @@ impl SignalRelay {
         }
     }
 
+    /// Takes one signal kept aside that is due: caught before the marks
+    /// handed out so far, or between the last of them and now. Looks only
+    /// when a handler has kept one, or a mark became due, since the last
+    /// look: a handler sets [`KEPT_SINCE`] after its bit, so a bit this
+    /// misses is looked for again at the next call.
+    fn take_kept(&self) -> Option<Relayed> {
+        if !KEPT_SINCE.swap(false, Ordering::SeqCst) {
+            return None;
+        }
+        let read = self.marks_read.load(Ordering::SeqCst);
+        // Bits 0 to `read`: the stretches up to the one after the last mark
+        // handed out.
+        let due = if read >= 31 {
+            u32::MAX
+        } else {
+            (2u32 << read) - 1
+        };
+        for &(sig, _) in &self.saved {
+            let Ok(number) = u8::try_from(sig) else {
+                continue;
+            };
+            for byte in [number, number | BY_PROCESS] {
+                let slot = &KEPT[usize::from(byte)];
+                let pending = slot.load(Ordering::SeqCst) & due;
+                if pending == 0 {
+                    continue;
+                }
+                let bit = pending & pending.wrapping_neg();
+                if slot.fetch_and(!bit, Ordering::SeqCst) & bit != 0 {
+                    // There may be more: look again at the next call.
+                    KEPT_SINCE.store(true, Ordering::SeqCst);
+                    return Some(Relayed::Signal {
+                        number: sig,
+                        by_process: byte & BY_PROCESS != 0,
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// Makes [`SignalRelay::next`] return `None` once it has handed out
     /// the signals that came before. Callable from any thread.
     ///
@@ -417,12 +595,18 @@ impl SignalRelay {
 
     /// Puts [`Relayed::Mark`] in the stream [`SignalRelay::next`] reads: a
     /// signal whose handler ran before this call comes before it, and one
-    /// caught after the call comes after it. Callable from any thread.
+    /// caught after the call comes after it, including one kept aside for
+    /// a full pipe. Callable from any thread.
     ///
     /// # Errors
     /// When the mark cannot be written: the pipe stayed full for 100 ms.
     pub fn mark(&self) -> io::Result<()> {
-        self.put(MARK)
+        self.put(MARK)?;
+        // Counted once the mark is in the pipe, so a signal kept from now
+        // on is due only after the reader has handed this mark out, and a
+        // mark that could not be written leaves nothing waiting for it.
+        MARKS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Writes one of the relay's own bytes to the pipe, waiting once, up
@@ -442,6 +626,8 @@ impl SignalRelay {
                 io::ErrorKind::Interrupted => {}
                 io::ErrorKind::WouldBlock if !waited => {
                     waited = true;
+                    #[cfg(test)]
+                    PUT_WAITING.store(true, Ordering::SeqCst);
                     let mut p = libc::pollfd {
                         fd,
                         events: libc::POLLOUT,
@@ -507,6 +693,13 @@ impl Drop for SignalRelay {
             unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
         }
         WRITE_FD.store(-1, Ordering::SeqCst);
+        // A handler that counted itself before the write end was cleared
+        // may still write or keep a signal: wait for it, so nothing of this
+        // relay reaches the next one. A handler never blocks, so this is
+        // short.
+        while IN_HANDLER.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
         ACTIVE.store(false, Ordering::SeqCst);
     }
 }
@@ -538,6 +731,301 @@ mod tests {
             number,
             by_process: true,
         })
+    }
+
+    /// Whether the relay has kept `sig`, sent by this process, aside.
+    fn kept(sig: i32) -> bool {
+        let byte = u8::try_from(sig).unwrap() | BY_PROCESS;
+        KEPT[usize::from(byte)].load(Ordering::SeqCst) != 0
+    }
+
+    /// Raises `sig` until the relay's pipe is full: the handler has just
+    /// kept one aside. What was kept for `sig` before is forgotten first,
+    /// so it is this flood that filled the pipe.
+    fn fill_with(sig: i32) {
+        let byte = u8::try_from(sig).unwrap() | BY_PROCESS;
+        KEPT[usize::from(byte)].store(0, Ordering::SeqCst);
+        for _ in 0..1 << 20 {
+            raise(sig);
+            if kept(sig) {
+                return;
+            }
+        }
+        panic!("the relay's pipe never filled");
+    }
+
+    /// Reads up to `n` bytes straight from the relay's pipe, as a reader
+    /// making room would, and returns them.
+    fn read_raw(relay: &SignalRelay, n: usize) -> Vec<u8> {
+        let mut got = vec![0u8; n];
+        let mut at = 0;
+        while at < n {
+            // SAFETY: `got[at..]` is writable for its length; the read end
+            // is non-blocking.
+            let r = unsafe {
+                libc::read(
+                    relay.pipe.read.as_raw_fd(),
+                    got[at..].as_mut_ptr().cast(),
+                    n - at,
+                )
+            };
+            match usize::try_from(r) {
+                Ok(0) | Err(_) => break,
+                Ok(r) => at += r,
+            }
+        }
+        got.truncate(at);
+        got
+    }
+
+    /// Everything `relay` hands out until the stop, which this thread
+    /// writes as soon as the reader makes room for it.
+    fn read_to_stop(relay: &SignalRelay) -> Vec<Relayed> {
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut got = Vec::new();
+                while let Some(r) = relay.next().unwrap() {
+                    got.push(r);
+                }
+                got
+            });
+            while relay.stop().is_err() && !reader.is_finished() {}
+            reader.join().unwrap()
+        })
+    }
+
+    /// Review R-13: a mark and the stop written into a pipe full of
+    /// signals not read yet wait for room rather than fail at once. The
+    /// room is made by another thread once the write is waiting (not
+    /// before, so the first try meets a full pipe); a drain that comes
+    /// only after the 100 ms is tried again, as it says nothing about the
+    /// wait. The mark reads after the signals caught before it, and the
+    /// stop after those caught after the mark.
+    #[test]
+    fn a_mark_and_the_stop_wait_for_room_in_a_full_pipe() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGUSR1]).unwrap();
+        let usr1 = u8::try_from(libc::SIGUSR1).unwrap() | BY_PROCESS;
+        type Put = fn(&SignalRelay) -> io::Result<()>;
+        let puts: [(&str, Put); 2] = [("mark", SignalRelay::mark), ("stop", SignalRelay::stop)];
+        for (name, put) in puts {
+            let mut late = 0;
+            loop {
+                fill_with(libc::SIGUSR1);
+                PUT_WAITING.store(false, Ordering::SeqCst);
+                let done = AtomicBool::new(false);
+                let (result, returned, drained) = std::thread::scope(|s| {
+                    let drainer = s.spawn(|| {
+                        while !PUT_WAITING.load(Ordering::SeqCst) && !done.load(Ordering::SeqCst) {
+                            std::thread::yield_now();
+                        }
+                        if !PUT_WAITING.load(Ordering::SeqCst) {
+                            return None;
+                        }
+                        let bytes = read_raw(&relay, 1 << 14);
+                        Some((bytes, std::time::Instant::now()))
+                    });
+                    let result = put(&relay);
+                    let returned = std::time::Instant::now();
+                    done.store(true, Ordering::SeqCst);
+                    (result, returned, drainer.join().unwrap())
+                });
+                let Some((bytes, at)) = drained else {
+                    panic!("the {name} gave up at once in a full pipe: {result:?}");
+                };
+                assert!(!bytes.is_empty(), "{name}: nothing to drain");
+                assert!(
+                    bytes.iter().all(|b| *b == usr1 || *b == WAKE),
+                    "{name}: the pipe held other bytes"
+                );
+                if result.is_ok() {
+                    break;
+                }
+                // The wait ended before the room came: the drainer was late.
+                assert!(at > returned, "{name} failed with room made in time");
+                late += 1;
+                assert!(late < 10, "{name}: the drainer was late {late} times");
+            }
+        }
+        // Everything left, in order: signals, the mark, signals, the stop.
+        let mut got = Vec::new();
+        while let Some(r) = relay.next().unwrap() {
+            got.push(r);
+        }
+        let mark = got.iter().position(|r| *r == Relayed::Mark).unwrap();
+        assert!(mark > 0, "no signal before the mark");
+        assert!(mark < got.len() - 1, "no signal after the mark");
+        for (i, r) in got.iter().enumerate() {
+            if i != mark {
+                assert_eq!(Some(*r), own(libc::SIGUSR1), "at {i}");
+            }
+        }
+    }
+
+    /// Review F-71: a pipe full of one signal (65,536 raised and not read
+    /// yet) still hands on a different one raised after it. The handler
+    /// cannot write it, so it keeps it aside; it used to drop it, as if
+    /// the pipe held another of the same. Every ordered pair of the
+    /// runner's four signals.
+    #[test]
+    fn a_different_signal_behind_a_full_pipe_is_handed_on() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let four = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+        for flood in four {
+            for then in four.into_iter().filter(|s| *s != flood) {
+                let relay = SignalRelay::install(&four).unwrap();
+                fill_with(flood);
+                raise(then);
+                assert!(kept(then), "{then} found room after {flood}");
+                let got = read_to_stop(&relay);
+                let count = |sig| got.iter().filter(|r| Some(**r) == own(sig)).count();
+                assert_eq!(count(then), 1, "{then} after a pipe full of {flood}");
+                assert!(count(flood) > 1 << 12, "{flood}: {}", count(flood));
+                assert_eq!(count(flood) + 1, got.len());
+                drop(relay);
+            }
+        }
+    }
+
+    /// Review F-71: a signal kept aside keeps its sender, so the
+    /// terminal's SIGINT and a process's SIGINT, both kept, are two
+    /// things to hand on (the runner treats them differently), and a
+    /// signal kept twice between the same marks is handed on once.
+    #[test]
+    fn kept_signals_keep_their_sender() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGINT]).unwrap();
+        keep_as_if_full(libc::SIGINT, false);
+        keep_as_if_full(libc::SIGINT, true);
+        keep_as_if_full(libc::SIGINT, true);
+        relay.stop().unwrap();
+        let mut got = Vec::new();
+        while let Some(r) = relay.next().unwrap() {
+            got.push(r);
+        }
+        got.sort_by_key(|r| {
+            matches!(
+                r,
+                Relayed::Signal {
+                    by_process: true,
+                    ..
+                }
+            )
+        });
+        assert_eq!(
+            got,
+            [
+                Relayed::Signal {
+                    number: libc::SIGINT,
+                    by_process: false
+                },
+                Relayed::Signal {
+                    number: libc::SIGINT,
+                    by_process: true
+                },
+            ]
+        );
+    }
+
+    /// Review F-71: a signal kept aside comes on its own side of a mark:
+    /// one kept before the mark before it, one kept after it after it,
+    /// though both are handed on only once the pipe is read.
+    #[test]
+    fn a_kept_signal_stays_on_its_side_of_a_mark() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGTERM, libc::SIGHUP]).unwrap();
+        keep_as_if_full(libc::SIGTERM, true);
+        relay.mark().unwrap();
+        keep_as_if_full(libc::SIGHUP, true);
+        relay.mark().unwrap();
+        keep_as_if_full(libc::SIGTERM, true);
+        relay.stop().unwrap();
+        assert_eq!(relay.next().unwrap(), own(libc::SIGTERM));
+        assert_eq!(relay.next().unwrap(), Some(Relayed::Mark));
+        assert_eq!(relay.next().unwrap(), own(libc::SIGHUP));
+        assert_eq!(relay.next().unwrap(), Some(Relayed::Mark));
+        assert_eq!(relay.next().unwrap(), own(libc::SIGTERM));
+        assert_eq!(relay.next().unwrap(), None);
+    }
+
+    /// Review F-71: a reader already waiting on an empty pipe wakes for a
+    /// signal kept aside after it looked (the handler writes a wake-up
+    /// once it has kept one), and one kept just before the stop comes
+    /// before `None`. A reader that is not woken is let go by the stop,
+    /// and the test fails.
+    #[test]
+    fn a_waiting_reader_wakes_for_a_kept_signal() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGTERM]).unwrap();
+        NEXT_WAITING.store(false, Ordering::SeqCst);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| relay.next().unwrap());
+            while !NEXT_WAITING.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            keep_as_if_full(libc::SIGTERM, true);
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !reader.is_finished() {
+                if std::time::Instant::now() > end {
+                    relay.stop().unwrap();
+                    panic!("the waiting reader was not woken");
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(reader.join().unwrap(), own(libc::SIGTERM));
+        });
+        keep_as_if_full(libc::SIGTERM, true);
+        relay.stop().unwrap();
+        assert_eq!(relay.next().unwrap(), own(libc::SIGTERM));
+        assert_eq!(relay.next().unwrap(), None);
+    }
+
+    /// Review F-71: a new relay starts empty, whatever the last one left:
+    /// signals in the pipe, signals kept aside, and a handler that was
+    /// still running when it was dropped (its drop waits for it, so its
+    /// byte never lands in the next relay's pipe).
+    #[test]
+    fn a_new_relay_gets_nothing_of_the_last_one() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGUSR1, libc::SIGUSR2]).unwrap();
+        raise(libc::SIGUSR1);
+        keep_as_if_full(libc::SIGUSR2, true);
+        drop(relay);
+        let relay = SignalRelay::install(&[libc::SIGUSR1, libc::SIGUSR2]).unwrap();
+        // The reader looks for kept signals at every mark.
+        relay.mark().unwrap();
+        relay.stop().unwrap();
+        assert_eq!(relay.next().unwrap(), Some(Relayed::Mark));
+        assert_eq!(relay.next().unwrap(), None);
+
+        // A handler paused after it read the write end, on another thread.
+        HANDLER_PAUSE.store(PAUSE_ARMED, Ordering::SeqCst);
+        let returned_while_inside = std::thread::scope(|s| {
+            let handler = s.spawn(|| raise(libc::SIGUSR1));
+            while HANDLER_PAUSE.load(Ordering::SeqCst) != PAUSE_INSIDE {
+                std::thread::yield_now();
+            }
+            let dropping = s.spawn(move || {
+                drop(relay);
+                HANDLER_PAUSE.load(Ordering::SeqCst) == PAUSE_INSIDE
+            });
+            // Long enough for a drop that does not wait to return; the
+            // drop that waits returns only after the handler goes on.
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            while !dropping.is_finished() && std::time::Instant::now() < end {
+                std::thread::yield_now();
+            }
+            HANDLER_PAUSE.store(PAUSE_OFF, Ordering::SeqCst);
+            handler.join().unwrap();
+            dropping.join().unwrap()
+        });
+        assert!(
+            !returned_while_inside,
+            "the drop returned while a handler was running"
+        );
+        let relay = SignalRelay::install(&[libc::SIGUSR1]).unwrap();
+        relay.stop().unwrap();
+        assert_eq!(relay.next().unwrap(), None);
     }
 
     #[test]
@@ -723,10 +1211,12 @@ mod tests {
         drop(relay);
     }
 
+    /// Signals outside 1 to 126 are refused: 127 would read as the
+    /// wake-up, and 128 on as a mark or a process's signal.
     #[test]
     fn out_of_range_signals_and_pids_are_refused() {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-        for sig in [0, 128, 256, -1] {
+        for sig in [0, 127, 128, 256, -1] {
             assert_eq!(
                 SignalRelay::install(&[sig]).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput,
