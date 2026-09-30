@@ -792,6 +792,14 @@ pub struct RotatedView {
     /// Prior values now kept, the replaced one first.
     pub prior_count: u8,
     pub length: LengthClass,
+    /// The item's classification now, detected from the new value as
+    /// `items.add` detects it.
+    pub classification: ClassificationView,
+    /// Its classification before, when the new value changed it (SPEC
+    /// §10b: a reclassification ends the grants that bind the item).
+    pub reclassified_from: Option<ClassificationView>,
+    /// Grants that bound it and ended: only a reclassification ends any.
+    pub grants_ended: u64,
 }
 
 /// `items.remove`: the item is gone from the vault.

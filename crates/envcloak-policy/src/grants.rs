@@ -783,6 +783,22 @@ impl GrantStore {
     /// is gone. Returns how many grants ended. An item created later under
     /// the same slug has another id, so nothing approved before covers it.
     pub fn on_item_removed(&mut self, item: ItemId) -> usize {
+        self.end_item(item)
+    }
+
+    /// Item `item` was reclassified (SPEC §10b "A grant ends on": a
+    /// rotation to a value the registry classifies otherwise, test to
+    /// live, say): every grant that binds it ends, since it was approved
+    /// for the old classification, and so does every pending request that
+    /// asks for it, whose statement shows the old one. Returns how many
+    /// grants ended.
+    pub fn on_item_reclassified(&mut self, item: ItemId) -> usize {
+        self.end_item(item)
+    }
+
+    /// Ends every grant and pending request that binds `item`. Returns how
+    /// many grants ended.
+    fn end_item(&mut self, item: ItemId) -> usize {
         let before = self.grants.len();
         self.grants
             .retain(|_, g| !g.bindings.iter().any(|b| b.item == item));

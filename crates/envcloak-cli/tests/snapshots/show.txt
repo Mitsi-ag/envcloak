@@ -4,7 +4,7 @@ openai/acme-web
   title: openai/acme-web
   id: <ULID>
   provider: -
-  kind: not classified
+  kind: live key
   short values: not allowed
   fields:
     value: set <TIME>, 0 prior values kept

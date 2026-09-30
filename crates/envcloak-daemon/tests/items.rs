@@ -829,3 +829,189 @@ fn a_rotation_that_proved_and_wrote_nothing_is_audited() {
     drop(v);
     f.sweep();
 }
+
+/// A Stripe secret key of `kind` (`test` or `live`), made at run time.
+fn stripe_key(kind: &str) -> String {
+    let seed = fresh_seed();
+    let tail: String = (0..32u32)
+        .map(|i| {
+            let n = u8::try_from((seed.rotate_left(7 * i) ^ u64::from(i) * 0x9e37) % 36).unwrap();
+            char::from(if n < 10 { b'0' + n } else { b'a' + n - 10 })
+        })
+        .collect();
+    format!("{}_{kind}_{tail}", concat!("s", "k"))
+}
+
+/// Review F-47 (SPEC §10b "A grant ends on": reclassification): a
+/// rotation takes the classification the registry gives the new value,
+/// as `items.add` does, in the same transaction as the value. A Stripe
+/// item detected as test and rotated to a live key becomes live, which
+/// ends the grant and the pending request that bind it; adding that same
+/// value as a new item classifies it live too (the control). A rotation
+/// that keeps the classification keeps its grant. Both are audited, the
+/// reclassification with its reason.
+#[test]
+fn a_rotation_reclassifies_the_item_and_only_then_ends_its_grants() {
+    let mut f = Fixture::new();
+    let keys = [
+        stripe_key("test"),
+        stripe_key("test"),
+        stripe_key("test"),
+        stripe_key("live"),
+    ];
+    for (i, k) in keys.iter().enumerate() {
+        f.cs.push(Canary::new(format!("STRIPE_KEY_{i}"), k.clone()));
+    }
+    let key = |i: usize| SecretBytes::copy_from(keys[i].as_bytes());
+    let mut c = client(&f.home);
+    let add = |c: &mut envcloak_ipc::Client, slug: &str, value: SecretBytes| {
+        let mut p = f.add_params(value);
+        p.slug = Some(slug.to_owned());
+        p.env_hint = Some("STRIPE_SECRET_KEY".to_owned());
+        c.items_add(&p).unwrap()
+    };
+    for (i, slug) in ["stripe/moving", "stripe/staying"].into_iter().enumerate() {
+        let added = add(&mut c, slug, key(i));
+        assert_eq!(
+            added.item.classification,
+            ClassificationView::Test,
+            "{slug}"
+        );
+    }
+    // One project per binding, and one that asks for both items.
+    let manifest = |name: &str, env: &str| {
+        let m = project(
+            &f.home,
+            name,
+            &format!("[project]\nname = \"{name}\"\n\n[env]\n{env}"),
+        );
+        m.to_str().unwrap().to_owned()
+    };
+    let moving_project = manifest("moving", "MOVING = \"stripe/moving\"\n");
+    let staying_project = manifest("staying", "STAYING = \"stripe/staying\"\n");
+    let both_project = manifest(
+        "both",
+        "MOVING = \"stripe/moving\"\nSTAYING = \"stripe/staying\"\n",
+    );
+    let decide = |manifest: &str| {
+        client(&f.home)
+            .run_request(&RunRequestParams {
+                manifest: manifest.to_owned(),
+                profile: None,
+                refs: Vec::new(),
+                env_file: None,
+                argv: vec!["./emit".into()],
+                claims: Vec::new(),
+            })
+            .unwrap()
+            .decision
+    };
+    let approve = |manifest: &str| {
+        let DecisionView::Pending { request } = decide(manifest) else {
+            panic!("expected a pending request");
+        };
+        let mut c = client(&f.home);
+        let d = c.pending_get(&request, &[]).unwrap();
+        let opts = ApprovalOptions::session(Duration::from_secs(3600));
+        let digest = statement_digest(&d, &opts);
+        c.approve(&request, opts, &digest, f.pass(), &[])
+            .unwrap()
+            .grant
+    };
+    let moving_grant = approve(&moving_project);
+    let staying_grant = approve(&staying_project);
+    // A request for both items waits for an approval.
+    let DecisionView::Pending { request: both } = decide(&both_project) else {
+        panic!("expected a pending request");
+    };
+
+    // Test to test: the classification and the grant stay.
+    let staying = f.target("stripe/staying");
+    let r = c.items_rotate(&staying, key(2), f.pass(), &[]).unwrap();
+    assert_eq!(
+        (r.classification, r.reclassified_from, r.grants_ended),
+        (ClassificationView::Test, None, 0)
+    );
+    let ids: Vec<String> = c
+        .grants_list()
+        .unwrap()
+        .grants
+        .into_iter()
+        .map(|g| g.id)
+        .collect();
+    assert_eq!(ids, [moving_grant.clone(), staying_grant.clone()]);
+    assert!(matches!(
+        decide(&staying_project),
+        DecisionView::Covered { .. }
+    ));
+    assert!(c.pending_get(&both, &[]).is_ok());
+
+    // Test to live: the item is live now, and its grant and the pending
+    // request that asks for it end; the other item's grant stays.
+    let moving = f.target("stripe/moving");
+    let r = c.items_rotate(&moving, key(3), f.pass(), &[]).unwrap();
+    assert_eq!(
+        (r.classification, r.reclassified_from, r.grants_ended),
+        (ClassificationView::Live, Some(ClassificationView::Test), 1)
+    );
+    assert_eq!(
+        c.items_show("stripe/moving").unwrap().classification,
+        ClassificationView::Live
+    );
+    let ids: Vec<String> = c
+        .grants_list()
+        .unwrap()
+        .grants
+        .into_iter()
+        .map(|g| g.id)
+        .collect();
+    assert_eq!(ids, [staying_grant]);
+    assert!(matches!(
+        decide(&moving_project),
+        DecisionView::Pending { .. }
+    ));
+    assert!(matches!(
+        decide(&staying_project),
+        DecisionView::Covered { .. }
+    ));
+    assert_eq!(
+        rpc(c.pending_get(&both, &[]).unwrap_err()),
+        (ErrorKind::NoSuchRequest, None)
+    );
+    // The control: the same value added as a new item is live.
+    let added = add(&mut c, "stripe/copy", key(3));
+    assert_eq!(added.item.classification, ClassificationView::Live);
+    drop(c);
+    let log = f.d.log();
+    assert!(
+        log.contains(&format!(
+            "envcloakd: audit: item rotated id={} reclassified=test_to_live grants_ended=1",
+            moving.item.id
+        )),
+        "{log}"
+    );
+
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let rotations: Vec<(Vec<(String, String)>, Option<&str>)> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::Rotate)
+        .map(|e| (named(&e.record.items), e.record.decision.reason.as_deref()))
+        .collect();
+    assert_eq!(
+        rotations,
+        [
+            (
+                vec![(staying.item.id.clone(), "stripe/staying".to_owned())],
+                None
+            ),
+            (
+                vec![(moving.item.id.clone(), "stripe/moving".to_owned())],
+                Some("reclassified_test_to_live")
+            ),
+        ]
+    );
+    sweep_entries(&entries, &f.cs);
+    drop(v);
+    f.sweep();
+}

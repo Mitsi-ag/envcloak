@@ -128,6 +128,12 @@ pub enum AuditEvent {
         slug: Slug,
         /// Prior values kept now.
         prior_count: u8,
+        /// The classification before and after, when the new value changed
+        /// it (`test`, `live`, `unknown`).
+        reclassified: Option<(&'static str, &'static str)>,
+        /// Grants that bound it and ended (only a reclassification ends
+        /// any).
+        grants: usize,
     },
     /// An item was removed, with a proof, after a backup (`items.remove`).
     Removed {
@@ -295,9 +301,19 @@ impl AuditEvent {
             AuditEvent::Added { pid, item, .. } => {
                 format!("envcloakd: audit: item added id={item} pid={pid}")
             }
-            AuditEvent::Rotated { pid, item, .. } => {
-                format!("envcloakd: audit: item rotated id={item} pid={pid}")
-            }
+            AuditEvent::Rotated {
+                pid,
+                item,
+                reclassified,
+                grants,
+                ..
+            } => match reclassified {
+                Some((from, to)) => format!(
+                    "envcloakd: audit: item rotated id={item} reclassified={from}_to_{to} \
+                     grants_ended={grants} pid={pid}"
+                ),
+                None => format!("envcloakd: audit: item rotated id={item} pid={pid}"),
+            },
             AuditEvent::Removed {
                 pid, item, grants, ..
             } => {
@@ -495,18 +511,23 @@ impl AuditEvent {
                 item,
                 slug,
                 prior_count,
+                reclassified,
                 ..
-            } => AuditRecord {
-                subject: subject.clone(),
-                items: vec![(*item, slug.clone())],
-                decision: decision(
-                    "rotated",
-                    None,
-                    Some("items.rotate"),
-                    Some(u64::from(*prior_count)),
-                ),
-                ..AuditRecord::new(AuditKind::Rotate, "rotated")
-            },
+            } => {
+                // The reason names a reclassification: `reclassified_test_to_live`.
+                let reason = reclassified.map(|(from, to)| format!("reclassified_{from}_to_{to}"));
+                AuditRecord {
+                    subject: subject.clone(),
+                    items: vec![(*item, slug.clone())],
+                    decision: decision(
+                        "rotated",
+                        reason.as_deref(),
+                        Some("items.rotate"),
+                        Some(u64::from(*prior_count)),
+                    ),
+                    ..AuditRecord::new(AuditKind::Rotate, "rotated")
+                }
+            }
             AuditEvent::Removed {
                 subject,
                 item,

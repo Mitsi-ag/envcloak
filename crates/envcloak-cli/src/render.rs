@@ -516,6 +516,16 @@ impl Render for RotatedView {
                 "prior values are"
             )
         );
+        if let Some(from) = self.reclassified_from {
+            let _ = writeln!(
+                o,
+                "Reclassified from {} to {} by the new value: {} that bound the item ended, so \
+                 its runs need a new approval.",
+                from.as_str(),
+                self.classification.as_str(),
+                plural(self.grants_ended, "grant", "grants")
+            );
+        }
         if let Some(n) = length_note(self.length, true) {
             let _ = writeln!(o, "note: {n}");
         }
@@ -799,7 +809,8 @@ pub fn rotate_statement(t: &TargetView) -> String {
     );
     let _ = writeln!(
         o,
-        "  Grants that bind this item stay in force: {}.",
+        "  Grants that bind this item stay in force: {}, unless the new value is classified \
+         otherwise (test, live), which ends them.",
         t.grants
     );
     o
@@ -1367,10 +1378,26 @@ Reference it in a project with: envcloak ref OPENAI_API_KEY=openai
             field: "value".into(),
             prior_count: 1,
             length: LengthClass::Ok,
+            classification: ClassificationView::Test,
+            reclassified_from: None,
+            grants_ended: 0,
         };
         snap(
             rotated.human(),
             r#"Rotated openai/acme-web#value: the new value is in place, and 1 prior value is kept.
+"#,
+        );
+        // Review F-47: the new value is classified otherwise.
+        let reclassified = RotatedView {
+            classification: ClassificationView::Live,
+            reclassified_from: Some(ClassificationView::Test),
+            grants_ended: 1,
+            ..rotated.clone()
+        };
+        snap(
+            reclassified.human(),
+            r#"Rotated openai/acme-web#value: the new value is in place, and 1 prior value is kept.
+Reclassified from test to live by the new value: 1 grant that bound the item ended, so its runs need a new approval.
 "#,
         );
         let removed = RemovedView {
@@ -1394,7 +1421,7 @@ Reference it in a project with: envcloak ref OPENAI_API_KEY=openai
             rotate_statement(&target),
             r#"Rotate openai/acme-web#value (OpenAI; openai, test key).
   The current value becomes the newest prior value; the vault keeps 3 at most (1 now).
-  Grants that bind this item stay in force: 1.
+  Grants that bind this item stay in force: 1, unless the new value is classified otherwise (test, live), which ends them.
 "#,
         );
         snap(
@@ -1700,6 +1727,9 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
                 field: v.to_owned(),
                 prior_count: 1,
                 length: LengthClass::Ok,
+                classification: ClassificationView::Live,
+                reclassified_from: Some(ClassificationView::Test),
+                grants_ended: 1,
             };
             let removed = RemovedView {
                 slug: v.to_owned(),
