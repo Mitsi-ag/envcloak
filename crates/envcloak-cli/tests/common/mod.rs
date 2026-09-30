@@ -26,14 +26,18 @@ pub fn cli() -> &'static Path {
 }
 
 /// `envcloakd`, built next to `envcloak` (`cargo test --workspace`, or
-/// `cargo build -p envcloakd` first).
+/// `cargo test -p envcloakd --no-run` first). `cargo test -p envcloak`
+/// does not build it, so one older than the sources it is built from is
+/// refused rather than tested (review G3-V2).
 pub fn daemon_exe() -> PathBuf {
     let p = cli().with_file_name("envcloakd");
     assert!(
         p.is_file(),
-        "{} is missing: run the tests with --workspace, or build envcloakd first",
+        "{} is missing: run the tests with --workspace, or cargo test -p envcloakd --no-run \
+         first",
         p.display()
     );
+    envcloak_testkit::assert_fresh(&p, "envcloakd");
     p
 }
 

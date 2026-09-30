@@ -24,6 +24,7 @@ The macOS app lives in `apps/macos/` and needs Xcode 16 or later.
 - `cargo clippy --release` with no warnings (the shipped configuration)
 - `scripts/check-unsafe.sh`, `scripts/check-sources.sh`, `scripts/check-unsafe-lint.sh` and `scripts/check-expose-lint.sh` (all but the last need `python3`, and the first needs 3.11 or later)
 - New behaviour has tests. Anything that touches secret handling has a test proving the value does not leak (to output, logs, errors or panics).
+- Prove each new test can fail: break the property it guards, watch it fail, then restore. The CLI's and the end-to-end tests run the `envcloakd` (and `envcloak`) built in the target directory, which a scoped `cargo test -p envcloak` does not rebuild, so after a change to a crate they are built from those tests refuse to run rather than test the old binary. Build it first with `cargo test -p envcloakd --no-run` (or `-p envcloak`), or run the tests with `--workspace`.
 - User-facing changes update the docs.
 
 ## Rules for code that handles secrets
