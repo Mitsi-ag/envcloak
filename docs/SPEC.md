@@ -1,6 +1,6 @@
 # EnvCloak: product and architecture spec
 
-Status: draft v0.2 (2026-09-27). Revised after an adversarial security review, a platform feasibility check on macOS 26 and Linux, and reviewer findings F-1 to F-10. This document is the source of truth for what EnvCloak is and how it is built. Changes go through a PR that edits this file.
+Status: draft v0.3 (2026-10-01). v0.2 (2026-09-27) was revised after an adversarial security review, a platform feasibility check on macOS 26 and Linux, and reviewer findings F-1 to F-10. v0.3 adds dev sign-in (§6.8, milestone M2b) after two independent designs and a harness-acceptance probe. This document is the source of truth for what EnvCloak is and how it is built. Changes go through a PR that edits this file.
 
 ## 1. One line
 
@@ -499,6 +499,30 @@ Deletion removes the working copy only. Values that were in git history, synced 
 - Reveal is never available over MCP.
 - Agent detection does not gate reveal; the proof does. A reveal from a caller with a known agent in its ancestry is refused anyway (§10b).
 
+### 6.8 Dev sign-in
+
+Agents that test a developer's app keep reaching its login page. Agent harnesses refuse to type passwords, and 2FA stops unattended runs. EnvCloak signs in for them: the agent asks for an outcome ("signed in to the fixture app as the editor"), never for a value.
+
+Scope in M2b: the developer's own apps on loopback or registered HTTPS staging origins, with dedicated test identities. Real third-party websites, native CLI logins, email or SMS codes and TOTP for live personal accounts come later (§14 M9 and after); until then they stay human sign-ins.
+
+- **Login items.** A `login` item holds a username, a password, an optional TOTP enrollment (from an `otpauth://` URI: seed, algorithm, digits, period) and metadata: test or live; the target's app origins, credential-entry origins, identity-provider and callback origins; the identity check; the tier; the session lifetime. Login fields are typed: `run`, `ref`, the helpers, the proxy and every MCP resolver refuse them. Only the sign-in worker opens them.
+- **Tools** (on the M2 MCP server): `request_sign_in(target, role?)`, `sign_in_status(request)`, `cancel_sign_in(request)` and `end_sign_in_session(session)`. Arguments name a registered target, never a URL to fill, a script, a callback or a CDP address. Results are allowlisted status and metadata. The description says plainly that the tool signs in with stored credentials after the person approves in EnvCloak, and that the resulting session acts as that account. `request_sign_in` waits for approval for a bounded time, shorter than the host's tool timeout, then returns `waiting_for_approval`; calling it again for the same target from the same root joins the pending request.
+- **Approval.** A typed sign-in grant (§10b) states the target, account alias, project, agent root, delivery, attempt limit and session lifetime. The approval screen shows the same facts as an access receipt. Tiers:
+  - `dev`: loopback and registered dev origins with a test identity. A standing project grant, one proof per day.
+  - `each`: one proof per sign-in. The default for everything else.
+  - `never-agent`: banks, primary email, identity and recovery accounts, password managers. Refused.
+  A once grant authorises one authentication attempt; the session's own lifetime is shown separately.
+- **Sign-in worker.** Chrome for Testing, started by the daemon with `--remote-debugging-pipe` (no port), with a fresh context per attempt, no extensions and no traces, HAR, video or screenshots. A pinned login state machine finds username, password, one-time-code, handoff and error states from autocomplete tokens, input types and per-target hints, and submits every step itself; the agent never clicks Login on a filled form.
+  - Every navigation, frame and form action is checked against the target's origins after URL parsing and IDNA normalisation: exact scheme, host and port; no suffix or substring matching; no userinfo. Anything else stops the attempt.
+  - At most one password submission and two one-time-code submissions per attempt. A failure stops and tells the person.
+  - CAPTCHAs, risk challenges, push or number matching, passkeys and unknown states pause for the person, with a live view of the worker. They are never bypassed.
+- **TOTP.** RFC 6238 in the daemon, only inside a bound attempt. Attempts on one account are serialised, a code already submitted for that account is not reused, and no code is generated in the last 3 s of a step. No tool returns a code or a seed.
+- **Identity check.** After login the worker runs the target's declared check: an app endpoint or page element that names the account, tenant and role. A mismatch or an unknown identity delivers nothing (`identity_unverified`).
+- **Delivery.** Only the target's declared cookies and storage keys for the app origin move, over the daemon's own CDP connection, into the agent browser context EnvCloak started for that grant (`envcloak browser`; Playwright MCP attaches with `--cdp-endpoint`). Identity-provider cookies, other origins and whole profiles never move. Session formats the adapter does not support, such as device-bound sessions, fail explicitly. At grant end, lock, revoke or root exit, the delivered cookies and storage are deleted from that context, and the status reads "broker access ended; server session expiry unknown" unless the target declares a revocation call and it succeeds.
+- **Test-session adapter** (optional; preferred for the developer's own apps). The app exposes a test-only, loopback, authenticated control endpoint that mints a short-lived session for a disposable identity and role. EnvCloak calls it instead of filling a form and delivers the session the same way. EnvCloak ships the protocol and a reference middleware. Projects keep a separate real-login test so login regressions stay covered.
+- **Audit.** An intent entry before any credential use and an outcome entry after it: item, target, subject evidence, adapter version and result class. Never values, page titles, URLs with queries or agent-supplied reasons.
+- **Hosts.** Installers (§7.2) add one instruction line naming `request_sign_in` as the person's approved credential tool, set the host's per-server tool timeout (Claude Code's default was 10 s when measured), and offer to set Codex's per-server MCP approval mode for EnvCloak only. Whether each host calls the tool is measured per host version before release, never assumed.
+
 ## 7. Agent integrations
 
 `envcloak agents install [--global] [--project]` detects installed agents and writes idempotent managed blocks (`<!-- envcloak:begin -->` / `<!-- envcloak:end -->`) that `envcloak agents uninstall` removes cleanly.
@@ -561,6 +585,7 @@ Documented capabilities as of 2026-09-27 (probes decide per machine):
 2. Before reporting protection as active, the installer runs synthetic activation and denial probes in an isolated HOME.
 3. Hook payloads are scanned locally and deterministically, never sent to a model. Block reasons and diagnostics never echo matched text. Hook input and output are bounded and time-limited.
 4. An agent with the user's shell can bypass advisory integrations; §1.1 and §10 say so.
+5. Where the product has sign-in tools (§6.8), the installer writes one instruction line naming them as the person's approved credential tool, raises the host's per-server tool timeout for EnvCloak, and only with the person's consent sets the host's approval mode for EnvCloak's server; it never changes approval settings for other servers.
 
 ## 8. Dashboard: balance, spend, expiry
 
@@ -815,13 +840,14 @@ XChaCha20-Poly1305 (`chacha20poly1305` 0.11), Argon2id (`argon2` 0.6), HKDF-SHA2
 | M0 | Repo, CI, spec, license, community files | CI green on an empty workspace |
 | M1 | Core vault and crypto (sealed rows, integrity digest, passphrase and Recovery Kit unlockers, encrypted backups); minimal daemon (socket hygiene, peer checks, lock and unlock, caller evidence, grants, passphrase approvals, audit); CLI (`vault create`, `unlock`, `lock`, `status`, `init`, `import`, `add`, `ls`, `show`, `ref`, `check`, `run`, `rotate`, `rm`, `approve`, `grants`, `backup`, `recover`, `recovery confirm`, `audit verify`, `daemon install`); redactor integration in pipe mode; provider detection | The fixture acceptance story (§15.1) and every M1 gate pass on macOS and Linux CI; release blocker: `main`'s branch protection requires a pull request, review from code owners and 2 approving reviews (§8 "Registry safety"), which a repository admin sets |
 | M2 | PTY run mode, full agent catalog, live-key guard, standing approvals, reveal on the terminal, MCP server, agent installers with activation probes and coverage reporting (§7.1), `doctor`, `scrub`, `migrate-mcp` with `mcp-bridge`, machine-wide first-run scan and import | Claude Code and Codex run the fixture project via EnvCloak with no value in any transcript; every M2 gate passes |
+| M2b | Dev sign-in (§6.8): login items and TOTP engine, sign-in worker and login state machine, identity check, session delivery into the agent browser, test-session adapter protocol and reference middleware, sign-in tools and grants, installer wiring | Claude Code and Codex, each with the installer's instruction line, sign in to the fixture app (password and TOTP) and through the test-session adapter, with no value in any transcript; every M2b gate passes |
 | M3 | macOS app: signed helper, Secure Enclave unlock and signed approvals, paste sheet, clipboard, first-run scan screen, keys, projects, activity, install CLI, login item, keychain rollback anchor | Manual QA script passes on a clean user account; every M3 gate passes |
 | M4 | Spend and money: key-attributed balance, spend and expiry adapters (CodexBar output as optional input), cards, subscriptions, budgets with separately labeled controls, alerts, forecasts | Adapters show live data for the fixture providers; every spend control is labeled with what it stops |
 | M5 | Pairing, transfer, sync over iroh; VMK epochs and revocation; new-machine bootstrap | Two machines pair with a code and converge after concurrent edits; every M5 gate passes |
 | M6 | Proxy mode | A placeholder-only child reaches a provider API; a non-allowlisted host gets the placeholder; every M6 gate passes |
 | M7 | Packaging and release: Developer ID certificate created by the Account Holder, app and helper profiles, signed and notarized app, Homebrew, cargo-dist binaries, docs site, landing page with Cloud waitlist | `brew install --cask envcloak` works on a clean Mac |
-| M8 | Launch (v0.1: Keys + Spend) | Public repo, launch posts, directory listings |
-| M9 | v0.2: MCP servers module, Auth module (inventory, AWS credential_process, git and Docker helpers, AWS multi-account IAM view), browser capture extension, rotation assistant | MCP set installed into four agents from one list; no static AWS keys left on disk |
+| M8 | Launch (v0.1: Keys + Spend + Dev sign-in) | Public repo, launch posts, directory listings |
+| M9 | v0.2: MCP servers module, Auth module (inventory, AWS credential_process, git and Docker helpers, AWS multi-account IAM view), browser capture extension, rotation assistant, sign-in beyond dev (real websites, native CLI login coordination starting with gh and Docker, email one-time codes) | MCP set installed into four agents from one list; no static AWS keys left on disk |
 | M10 | v0.3: Skills and instructions module with translation; Raycast and editor extensions | A skill compiles to five agents' formats with a loss report |
 | M11 | EnvCloak Cloud MVP on AWS: encrypted backup and sync mailbox, 24/7 spend watch and alerts, then the Nitro Enclave credential proxy and Teams | Paying users |
 
@@ -930,6 +956,20 @@ M2:
 39. migrate-mcp. No literal secret remains in any agent config. HTTP servers use `mcp-bridge`. Writes are atomic, with encrypted backups.
 40. Live-key guard. A live binding without a per-binding tick is refused. The test item is proposed first. A standing approval cannot include a live key.
 41. End-to-end story with Claude Code and Codex, on macOS and Linux. Afterwards, no fixture appears in `~/.claude/projects/**` or `~/.codex/sessions/**` in the isolated HOME.
+
+M2b:
+- Wrong target. An unregistered origin, an IDN lookalike, a userinfo URL, a changed port, a cross-origin iframe, a mid-login redirect and an off-origin form action each receive zero credential submissions, counted by the fixture server.
+- Observer exclusion. No process can attach to the sign-in worker (no debugging port; a second CDP client fails). The agent's browser never loads a filled credential form.
+- Output containment. No password, seed or code in tool results, errors, stdout, stderr, logs, audit or permitted artifacts, raw or in any §6.1 encoding.
+- Boundary honesty. A session delivered to the agent browser can be exported and reused (expected, and documented), and after `end_sign_in_session` it is gone from that context.
+- State allowlist. With extra identity-provider cookies, other origins and seeded storage in the worker, only the declared state reaches the agent context; an unsupported format fails.
+- Wrong identity. A login that lands in another test account or tenant delivers nothing.
+- Approval and concurrency. A changed target, adapter, role, subject or recipient cannot reuse a proof; concurrent once requests yield at most one attempt.
+- TOTP. RFC 6238 vectors (SHA-1, SHA-256, SHA-512; 6 and 8 digits), step boundaries, serialised concurrent attempts, and no reuse of a submitted code.
+- Attempt budget. A wrong password stops after one submission and wrong codes after two; nothing is resent in a loop.
+- Cancellation and lock. Lock, sleep, root exit, timeout, daemon restart and cancel during approval or handoff tear the attempt down and prevent any late delivery.
+- Typed fields. `run`, `ref`, the helpers, the proxy and the MCP resolvers refuse login fields.
+- Test-session adapter. The reference middleware is off outside test configuration and refuses unauthenticated and cross-origin requests; minted sessions expire on the server.
 
 M3:
 - Code-signature checks work in both directions.
