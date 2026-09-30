@@ -12,7 +12,9 @@
 //!    text only;
 //! 3. binds them to the vault's items ([`bind_items`]), and looks up
 //!    whether the project and the items are new to the vault (SPEC §6.4
-//!    "Adoption");
+//!    "Adoption"). This is where a reference to a card or an issuer
+//!    credential is rejected (`manifest_invalid`, gate 17), and the only
+//!    source of the item ids a request releases;
 //! 4. applies the effective policy (the vault's, tightened by the
 //!    manifest's, for the subject's kind), which can refuse agent requests
 //!    or require proxy mode (refused: M1 has none);

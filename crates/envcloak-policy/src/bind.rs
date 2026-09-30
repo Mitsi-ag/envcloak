@@ -1,8 +1,11 @@
 //! Binding resolved references to the vault's items: the step that turns
 //! `(variable, slug, field)` into `(variable, item id, field id)`, which is
 //! what grants compare (SPEC §10b "Match" rule 6), and that refuses a
-//! reference to anything but a secret (SPEC §5: a reference to a card or
-//! an issuer credential fails; gate 17).
+//! reference to anything but a secret (SPEC §5, gate 17). A slug does not
+//! say its item's class, so a reference to a card or an issuer credential
+//! parses, and this is where it is rejected (`manifest_invalid`). The
+//! daemon's `run.request` takes the item ids it releases only from
+//! [`bind_items`].
 
 use envcloak_core::crypto::ItemClass;
 use envcloak_core::vault::{Classification, FieldId, ItemId, ItemMeta};

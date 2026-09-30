@@ -934,6 +934,118 @@ fn project_identity_and_manifest_errors() {
     f.sweep();
 }
 
+/// Review T5 open 3 (gate 17, the card half): a slug does not say its
+/// item's class, so a reference to a card or an issuer credential parses,
+/// and `run.request` rejects it when it binds the references to the
+/// vault's items (`bind_items`, the only source of the item ids a request
+/// releases). A card and an issuer credential planted through the core
+/// API: a manifest naming either, beside a secret or alone, and a `--ref`
+/// to one, with or without a field, are `manifest_invalid` with the class
+/// in the reason; no request is pending, no grant made and no value sent,
+/// and the story's manifest still opens a request.
+#[test]
+fn a_reference_to_a_card_is_rejected_when_bound() {
+    common::terminal_session();
+    let mut cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let kit = seed_vault(&home, &cs);
+    cs.push(kit);
+    let digits = |seed: u64| -> String {
+        (0..16)
+            .map(|i| char::from(b'0' + u8::try_from((seed >> (i * 4)) % 10).unwrap()))
+            .collect()
+    };
+    let card = Canary::new("CARD_NUMBER", digits(fresh_seed()));
+    let issuer = Canary::new(
+        "ISSUER_CREDENTIAL",
+        format!("{}{}", digits(fresh_seed()), digits(fresh_seed())),
+    );
+    {
+        use envcloak_core::crypto::ItemClass;
+        use envcloak_core::vault::{FieldName, ItemDetails, LockedVault, NewItem, Slug};
+        let mut v = LockedVault::open(&VaultPaths::under(data_dir(&home)))
+            .unwrap()
+            .unlock_with_passphrase(&passphrase(&cs))
+            .map_err(|(_, e)| e)
+            .unwrap();
+        v.transact(|t| {
+            for (class, slug, c) in [
+                (ItemClass::Card, "card/acme-web", &card),
+                (ItemClass::IssuerCredential, "issuer/acme-web", &issuer),
+            ] {
+                let id = t.create_item(NewItem {
+                    class,
+                    slug: Slug::new(slug).unwrap(),
+                    details: ItemDetails {
+                        title: slug.to_owned(),
+                        ..ItemDetails::default()
+                    },
+                })?;
+                t.add_field(
+                    id,
+                    FieldName::new("value").unwrap(),
+                    SecretBytes::copy_from(c.value()),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    cs.push(card);
+    cs.push(issuer);
+    let d = start(&home);
+    let mut c = client(&home);
+    c.unlock(passphrase(&cs), &[]).unwrap();
+    let story = project(&home, "acme-web", MANIFEST);
+    let ask = |manifest: &std::path::Path, refs: &[&str]| {
+        client(&home).run_request(&RunRequestParams {
+            manifest: manifest.to_str().unwrap().to_owned(),
+            profile: None,
+            refs: refs.iter().map(|r| (*r).to_owned()).collect(),
+            env_file: None,
+            argv: vec!["./emit".to_owned()],
+            claims: Vec::new(),
+        })
+    };
+    let card_only = project(&home, "card-only", "[env]\nCARD = \"card/acme-web\"\n");
+    let beside = project(
+        &home,
+        "beside",
+        "[env]\nOPENAI_API_KEY = \"openai/acme-web\"\nISSUER = \"issuer/acme-web#value\"\n",
+    );
+    for (manifest, refs, reason) in [
+        (&card_only, &[][..], "card_reference"),
+        (&beside, &[], "issuer_credential_reference"),
+        (&story, &["CARD=card/acme-web"], "card_reference"),
+        (&story, &["CARD=card/acme-web#value"], "card_reference"),
+        (
+            &story,
+            &["ISSUER=issuer/acme-web"],
+            "issuer_credential_reference",
+        ),
+    ] {
+        let e = ask(manifest, refs).unwrap_err();
+        let shown = format!("{e:?}");
+        assert_eq!(
+            rpc_kind(e),
+            (ErrorKind::ManifestInvalid, Some(reason)),
+            "{refs:?}"
+        );
+        assert_no_canary(shown.as_bytes(), &cs);
+    }
+    let st = c.status().unwrap();
+    assert_eq!((st.approvals.grants, st.approvals.pending), (0, 0));
+    // The story's manifest, on the same vault, opens a request.
+    assert!(matches!(
+        ask(&story, &[]).unwrap().decision,
+        DecisionView::Pending { .. }
+    ));
+    assert_eq!(c.status().unwrap().approvals.pending, 1);
+    drop(c);
+    assert_no_canary(&d.log_bytes(), &cs);
+    home.assert_clean(&cs);
+}
+
 /// No grant is evaluated, and no proof taken, from a vault whose
 /// integrity check failed (T3's rule for `projects()` and `header()`,
 /// carried to the grant path).

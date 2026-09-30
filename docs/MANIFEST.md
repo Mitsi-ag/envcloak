@@ -99,7 +99,7 @@ A run names a profile, `--ref NAME=<slug>[#field]` arguments and an `--env-file`
 
 The result is sorted by variable name. A binding added or changed by any layer is a new binding to the grant check, which compares variable, item and field.
 
-Each binding is then tied to the vault's items. A reference names a secret item by slug, and a field by name; without a field it names the item's only field (an item with several fields needs `#field`). A reference to a card, an issuer credential or an item of any other class is refused, and the manifest is reported invalid.
+Each binding is then tied to the vault's items. A reference names a secret item by slug, and a field by name; without a field it names the item's only field (an item with several fields needs `#field`). A reference to a card, an issuer credential or an item of any other class is refused here, and the manifest is reported invalid: a slug does not say its item's class, so such a reference parses, and binding is where it is caught. The daemon's `run.request` takes the item ids it releases only from this binding (`bind_items`).
 
 ## Env files
 
@@ -148,7 +148,7 @@ Errors are value-free. A manifest error is a kind and a place (a manifest line, 
 |---|---|
 | 17: `agents = "allow"` fails to parse | `tests/manifest.rs` |
 | 17: `redact = false` and `mode = "inject"` do not loosen, over every combination of vault policy, manifest policy and subject | `tests/effective.rs` |
-| 17: references to a card, an issuer credential or an unknown item class are rejected | `tests/bind.rs` |
+| 17: references to a card, an issuer credential or an unknown item class are rejected | `tests/bind.rs`; through `run.request`, from a manifest or a `--ref`, with nothing pending: `crates/envcloak-daemon/tests/grants.rs` |
 | 28, identity part: a copy or a move is a new identity; a symlinked path, or a case alias on APFS, keeps it | `tests/project.rs` |
 | 11, parsing part: no fixture in freed memory while parsing env files and manifests | `tests/parse_probe.rs` |
 | Errors carry no value, for malformed env files, manifests and `--ref` arguments holding fixtures | `tests/envfile.rs` |
