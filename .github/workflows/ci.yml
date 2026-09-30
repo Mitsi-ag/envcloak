@@ -1,9 +1,16 @@
 name: CI
 
+# Two depths. Pull requests (working branches) run the fast suite: every
+# lint and boundary check and every test except the end-to-end fixture
+# story and the release-build job. Pushes to main, the nightly run and
+# manual runs keep the full suite, so nothing merged skips a gate.
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 16 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +22,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  FULL: ${{ github.event_name != 'pull_request' }}
 
 jobs:
   test:
@@ -89,25 +97,33 @@ jobs:
       # through the whole of `envcloak run` (crates/envcloak-e2e): Python,
       # Node, Go, .NET and PHP are set up on both systems and required, so
       # a missing one fails the gate instead of narrowing it.
+      # Full runs only: pull requests use the runner's preinstalled
+      # runtimes and do not require every serializer.
       - uses: actions/setup-python@v5
+        if: env.FULL == 'true'
         with:
           python-version: "3.12"
       - uses: actions/setup-node@v4
+        if: env.FULL == 'true'
         with:
           node-version: "22"
       - uses: actions/setup-go@v5
+        if: env.FULL == 'true'
         with:
           go-version: stable
           cache: false
       - uses: actions/setup-dotnet@v4
+        if: env.FULL == 'true'
         with:
           dotnet-version: "8.0.x"
       - uses: shivammathur/setup-php@v2
+        if: env.FULL == 'true'
         with:
           php-version: "8.3"
           coverage: none
           tools: none
       - name: Serializers gate 8 requires
+        if: env.FULL == 'true'
         run: |
           python3 --version
           node --version
@@ -142,7 +158,14 @@ jobs:
         env:
           RUST_LOG: trace
           RUST_BACKTRACE: full
-        run: cargo test --workspace --locked --no-fail-fast
+        run: |
+          if [ "$FULL" = "true" ]; then
+            cargo test --workspace --locked --no-fail-fast
+          else
+            # The fixture story and gate 12's release run are in
+            # envcloak-e2e; they run on main, nightly and on demand.
+            cargo test --workspace --locked --no-fail-fast --exclude envcloak-e2e
+          fi
 
   # The shipped binaries as `cargo build --release` makes them: panic =
   # "abort" and no core file (gate 19), no test hook, a truthful `status`,
@@ -150,6 +173,7 @@ jobs:
   # (crates/envcloak-e2e/tests/release.rs).
   release:
     name: release (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
