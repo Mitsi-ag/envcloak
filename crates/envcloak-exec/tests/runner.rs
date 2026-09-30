@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use envcloak_core::SecretBytes;
 use envcloak_core::vault::Slug;
-use envcloak_exec::{ExecError, IDLE_FLUSH, Label, RunSpec, ShortPolicy, build_redactor, run};
+use envcloak_exec::{ExecError, Label, RunSpec, ShortPolicy, build_redactor, run};
 use envcloak_policy::EnvName;
 use envcloak_sys::StartTime;
 use envcloak_testkit::{
@@ -87,7 +87,7 @@ fn slug_of(label: &str) -> String {
 fn runner(args: &[OsString]) -> ExitCode {
     let mut it = args.iter();
     let mut seed = None;
-    let mut idle = IDLE_FLUSH;
+    let mut idle = None;
     let mut values: Vec<String> = Vec::new();
     let mut files: Vec<String> = Vec::new();
     loop {
@@ -99,7 +99,7 @@ fn runner(args: &[OsString]) -> ExitCode {
         match a {
             "--" => break,
             "--seed" => seed = Some(next().parse::<u64>().unwrap()),
-            "--idle-ms" => idle = Duration::from_millis(next().parse().unwrap()),
+            "--idle-ms" => idle = Some(Duration::from_millis(next().parse().unwrap())),
             "--value" => values.push(next()),
             "--file" => files.push(next()),
             _ => {
@@ -164,15 +164,18 @@ fn runner(args: &[OsString]) -> ExitCode {
         eprintln!("envcloak: coverage: {s}: partial inside longer base64");
     }
     let injected = owned.into_iter().map(|(n, _, v, _)| (n, v)).collect();
-    let spec = RunSpec {
+    // As `envcloak run` builds it: the idle flush is IDLE_FLUSH unless
+    // --idle-ms names another.
+    let mut spec = RunSpec::new(
         argv,
         injected,
         redactor,
-        idle_flush: idle,
-        stdin: None,
-        stdout: std::io::stdout().as_fd().try_clone_to_owned().unwrap(),
-        stderr: std::io::stderr().as_fd().try_clone_to_owned().unwrap(),
-    };
+        std::io::stdout().as_fd().try_clone_to_owned().unwrap(),
+        std::io::stderr().as_fd().try_clone_to_owned().unwrap(),
+    );
+    if let Some(idle) = idle {
+        spec.idle_flush = idle;
+    }
     match run(spec) {
         Ok(exit) => ExitCode::from(exit.shell_code()),
         Err(e) => {
@@ -1356,9 +1359,14 @@ fn exit_codes_pass_through() {
 
 /// A prompt without a newline shows while the child waits for its
 /// answer (the answer is only typed once it has): the idle flush releases
-/// it. The first bytes of a value, written without a newline, are held
-/// while the pipe is quiet, and released as they were once what follows
-/// shows they are not the value.
+/// it. It is timed from a marker the child prints just before it, in the
+/// same write, followed by more than any value's longest encoding, so the
+/// redactor releases the marker at once and holds the prompt until the
+/// idle flush: the prompt shows within 400 ms of it, which a longer idle
+/// flush than SPEC's 40 ms fails (review T12-4). The first bytes of a
+/// value, written without a newline, are held while the pipe is quiet,
+/// and released as they were once what follows shows they are not the
+/// value.
 fn a_prompt_shows_and_the_start_of_a_value_waits() {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
@@ -1369,23 +1377,22 @@ fn a_prompt_shows_and_the_start_of_a_value_waits() {
         values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
         files: &[],
     };
-    let script = r#"printf 'before\n'
-sleep 0.3
-printf 'Password: '
+    let script = r#"printf 'mark%8192sPassword: ' ''
 read answer
 printf 'got %s\n' "$answer"
 printf '%.12s' "$OPENAI_API_KEY"
 read more
 printf '!\n'"#;
     let mut p = Proc::spawn(detached(&home, &setup, &os(&sh(script))));
-    assert!(p.wait_for(0, b"before\n", Duration::from_secs(60)));
+    assert!(p.wait_for(0, b"mark", Duration::from_secs(60)));
     let t0 = Instant::now();
     assert!(
         p.wait_for(0, b"Password: ", Duration::from_secs(10)),
         "the prompt did not show while the child waited"
     );
-    println!("prompt: shown {:?} after the line before it", t0.elapsed());
-    assert!(t0.elapsed() < Duration::from_secs(1));
+    let took = t0.elapsed();
+    println!("prompt: shown {took:?} after the marker before it");
+    assert!(took < Duration::from_millis(400), "{took:?}");
     p.write(b"yes\n");
     assert!(p.wait_for(0, b"got yes\n", Duration::from_secs(10)));
     let prefix = &by_label(&cs, labels::OPENAI_API_KEY).value()[..12];
