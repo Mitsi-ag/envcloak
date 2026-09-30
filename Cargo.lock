@@ -257,6 +257,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hkdf",
  "libc",
+ "poly1305",
  "rusqlite",
  "secrecy",
  "serde",
@@ -658,6 +659,7 @@ checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
 dependencies = [
  "cpufeatures",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]

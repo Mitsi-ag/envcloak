@@ -29,6 +29,7 @@ envcloak-sys.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
 libc.workspace = true
+poly1305.workspace = true
 rusqlite.workspace = true
 secrecy.workspace = true
 sha2.workspace = true

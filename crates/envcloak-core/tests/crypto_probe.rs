@@ -8,8 +8,10 @@
 //!
 //! Besides the canaries, the needles include key material: Argon2id's
 //! working memory, computed here with the argon2 crate and checked against
-//! the envelope it came from.
+//! the envelope it came from, and a Poly1305 state's key and pending block.
 #![allow(clippy::unwrap_used)]
+
+use std::mem::ManuallyDrop;
 
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use envcloak_core::SecretBytes;
@@ -23,6 +25,8 @@ use envcloak_testkit::{
     probe_canaries,
 };
 use hkdf::Hkdf;
+use poly1305::Poly1305;
+use poly1305::universal_hash::{KeyInit as _, UniversalHash as _};
 use sha2::Sha256;
 
 #[global_allocator]
@@ -222,6 +226,34 @@ fn a_derivation_wipes_the_argon2_memory() {
     let session = ProbeSession::start(&refs, 32, ProbeMode::Unwiped);
     drop(Argon2id.derive(&pass, &k).unwrap());
     drop(unwrap_vmk(&env, &pass, &ctx).unwrap());
+    let report = session.finish();
+    assert!(report.freed > 0, "{report:?}");
+    assert_eq!(report.released_with_needle, 0, "{report:?}");
+}
+
+/// The Poly1305 state is wiped when it is dropped. It holds the one-time
+/// key (r, and s as given in the portable backend) and, in the AVX2
+/// backend, blocks not yet processed. chacha20poly1305's `zeroize` feature
+/// does not reach poly1305, so the workspace turns poly1305's own on. The
+/// needles are s and a block; the control frees a state without dropping
+/// it, and the probe finds one of them.
+#[test]
+fn a_dropped_poly1305_state_is_wiped() {
+    let key: [u8; 32] = core::array::from_fn(|i| 0x81 ^ (i as u8).wrapping_mul(29));
+    let block: [u8; 16] = core::array::from_fn(|i| 0x5c ^ (i as u8).wrapping_mul(53));
+    let needles: [&[u8]; 2] = [&key[16..], &block];
+
+    let session = ProbeSession::start(&needles, 16, ProbeMode::Unwiped);
+    let mut kept = Box::new(ManuallyDrop::new(Poly1305::new(&key.into())));
+    kept.update(&[block.into()]);
+    drop(kept);
+    let report = session.finish();
+    assert!(report.released_with_needle >= 1, "{report:?}");
+
+    let session = ProbeSession::start(&needles, 16, ProbeMode::Unwiped);
+    let mut mac = Box::new(Poly1305::new(&key.into()));
+    mac.update(&[block.into()]);
+    drop(mac);
     let report = session.finish();
     assert!(report.freed > 0, "{report:?}");
     assert_eq!(report.released_with_needle, 0, "{report:?}");
