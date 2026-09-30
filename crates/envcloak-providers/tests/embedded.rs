@@ -177,6 +177,24 @@ fn the_embedded_registry_loads() {
     let stripe = r.get("stripe").unwrap();
     assert!(stripe.path_denied("/v1/ephemeral_keys"));
     assert!(!stripe.path_denied("/v1/charges"));
+    // Review T6 open 3: a format suffix reaches the same action on a
+    // Rails-style router.
+    for (p, path) in [
+        (github, "/repos/acme/web/keys.json"),
+        (github, "/repos/acme/web/keys.json/1"),
+        (stripe, "/v1/ephemeral_keys.json"),
+        (openai, "/v1/organization.json"),
+        (openai, "/v1/organization.json/admin_api_keys"),
+    ] {
+        assert!(p.path_denied(path), "{} {path}", p.id);
+    }
+    for (p, path) in [
+        (github, "/repos/acme/web/pulls.json"),
+        (stripe, "/v1/charges.json"),
+        (openai, "/v1/organizations.json"),
+    ] {
+        assert!(!p.path_denied(path), "{} {path}", p.id);
+    }
 }
 
 /// SPEC §8: a change to allowed hosts, auth slots or denied paths needs

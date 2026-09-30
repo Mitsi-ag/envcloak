@@ -437,6 +437,9 @@ fn a_balance_request_to_a_denied_path_fails_to_load() {
         "/v1/keys;x=1",
         "/v1/keys.",
         "/v1/balance;x",
+        // A format suffix, which a Rails-style router strips.
+        "/v1/keys.json",
+        "/orgs/acme/tokens.xml/t_1",
     ] {
         let url = format!("https://api.example.com{path}");
         assert_eq!(
@@ -448,6 +451,7 @@ fn a_balance_request_to_a_denied_path_fails_to_load() {
     // Near misses load.
     for path in [
         "/v1/keysx",
+        "/v1/keys_json",
         "/v1/balance/keys",
         "/orgs/acme",
         "",

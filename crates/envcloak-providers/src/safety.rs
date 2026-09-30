@@ -547,10 +547,13 @@ fn plain_path_byte(b: u8) -> bool {
 
 /// Whether the request path `path` (a query and fragment are ignored)
 /// falls under the denied path `pattern`. Segments compare without ASCII
-/// case. It fails closed: a path that is not normalized counts as denied,
-/// so a server that normalizes it cannot reach a denied endpoint. That is
-/// a path with an empty segment (other than a trailing `/`), a segment
-/// that ends in `.` (so `.` and `..` as well), or any byte
+/// case, and a request segment that is the pattern's segment followed by
+/// `.` and anything (`keys.json`, `organization.xml`) is that segment:
+/// Rails-style routing takes the rest for a response format and sends the
+/// request to the same action. It fails closed for any spelling a server
+/// could normalize to a denied path: a path that is not normalized counts
+/// as denied. That is a path with an empty segment (other than a trailing
+/// `/`), a segment that ends in `.` (so `.` and `..` as well), or any byte
 /// [`plain_path_byte`] refuses: a `%` escape, `;` path parameters, a
 /// backslash, whitespace, control or non-ASCII bytes. The proxy (M6)
 /// normalizes paths before asking.
@@ -570,8 +573,16 @@ pub(crate) fn path_under(pattern: &str, path: &str) -> bool {
     let mut segs = segs.into_iter();
     pattern[1..].split('/').all(|p| {
         segs.next()
-            .is_some_and(|s| !s.is_empty() && (p == "*" || s.eq_ignore_ascii_case(p)))
+            .is_some_and(|s| !s.is_empty() && (p == "*" || same_segment(s, p)))
     })
+}
+
+/// Whether request segment `s` is pattern segment `p`: equal without ASCII
+/// case, or `p` followed by `.` and anything, a format suffix.
+fn same_segment(s: &str, p: &str) -> bool {
+    let (s, p) = (s.as_bytes(), p.as_bytes());
+    s.eq_ignore_ascii_case(p)
+        || (s.len() > p.len() && s[p.len()] == b'.' && s[..p.len()].eq_ignore_ascii_case(p))
 }
 
 /// One step of a [`JsonPath`].
@@ -1066,6 +1077,32 @@ mod tests {
         assert!(path_under(g, "/repos/o/r/keys/1"));
         assert!(!path_under(g, "/repos/o/r/contents/keys"));
         assert!(!path_under(g, "/repos/o/keys"));
+        // Review T6 open 3: a format suffix on a denied segment reaches the
+        // same action on a Rails-style router, so it is that segment.
+        for suffixed in [
+            "/repos/o/r/keys.json",
+            "/repos/o/r/keys.json/1",
+            "/repos/o/r/KEYS.xml",
+            "/repos/o/r/keys.",
+            "/repos/o.git/r/keys.json",
+        ] {
+            assert!(path_under(g, suffixed), "{suffixed}");
+        }
+        assert!(path_under(p, "/v1/organization.json"));
+        assert!(path_under(p, "/v1/organization.json/admin_api_keys"));
+        assert!(path_under(p, "/v1.json/organization"));
+        assert!(path_under("/v1/ephemeral_keys", "/v1/ephemeral_keys.json"));
+        // Only the `.` form: another segment that starts the same is not.
+        for other in [
+            "/repos/o/r/keysjson",
+            "/repos/o/r/keys-json",
+            "/repos/o/r/keys_json",
+            "/repos/o/r/key.json",
+            "/repos/o/r/.keys",
+        ] {
+            assert!(!path_under(g, other), "{other}");
+        }
+        assert!(!path_under(p, "/v1/organizations.json"));
     }
 
     #[test]
