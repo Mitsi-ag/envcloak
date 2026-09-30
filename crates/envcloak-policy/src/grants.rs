@@ -570,18 +570,22 @@ impl GrantStore {
     }
 
     /// Decides `r` at `now`: covered, pending or denied. See the module
-    /// documentation. An identical request already pending gets the same
-    /// pending id.
+    /// documentation. A root auto-denied after repeated denials is denied
+    /// first, before any grant is looked at. An identical request already
+    /// pending gets the same pending id.
     pub fn decide(&mut self, r: AccessRequest, now: &Now) -> Decision {
         self.expire(now);
-        if let Some(g) = self.covering(&r, now) {
-            return Decision::Covered(g);
-        }
         let root = r.subject.root();
-        let fp = fingerprint(&r);
+        // An auto-denied root is denied whatever it asks (SPEC §10a), the
+        // requests a grant it already holds would cover included: the
+        // grants stay, and cover it again once the denial ends.
         if self.flood.root_denied(&root, now) {
             return Decision::Denied(DenyReason::RootDenied);
         }
+        if let Some(g) = self.covering(&r, now) {
+            return Decision::Covered(g);
+        }
+        let fp = fingerprint(&r);
         if self.flood.recently_denied(&fp, now) {
             return Decision::Denied(DenyReason::Repeated);
         }
