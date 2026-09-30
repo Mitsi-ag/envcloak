@@ -257,13 +257,21 @@ pub(crate) fn is_invisible(c: char) -> bool {
     )
 }
 
+/// Whether [`escape_for_display`] shows `c` as an escape because a
+/// terminal would act on it or not show it: a control character (`Cc`,
+/// the C1 controls and DEL included) or an invisible one
+/// ([`is_invisible`]). The backslash, which it escapes too, is not one.
+pub fn display_escaped(c: char) -> bool {
+    c.is_control() || is_invisible(c)
+}
+
 fn push_escaped(out: &mut String, c: char) {
     match c {
         '\\' => out.push_str("\\\\"),
         '\n' => out.push_str("\\n"),
         '\r' => out.push_str("\\r"),
         '\t' => out.push_str("\\t"),
-        c if c.is_control() || is_invisible(c) => {
+        c if display_escaped(c) => {
             // Cannot fail: writing to a String.
             let _ = write!(out, "\\u{{{:x}}}", c as u32);
         }

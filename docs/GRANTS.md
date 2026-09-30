@@ -68,7 +68,7 @@ The descriptor (`envcloak_policy::PendingDescriptor`) holds: the request id, the
 
 **Rendering** (`render_statement`): the text a person reads. Every string from the daemon goes through `escape_for_display`: backslash, `\n`, `\r` and `\t` as those escapes, and every other control character, bidirectional control, zero-width or other invisible character as `\u{...}`. The bindings no grant covers come first, under a line saying the request asks for them, and those a session grant already held follow under a line saying this grant holds them too. Argv is a list, one argument per line with its index; rendered argv beyond 2048 bytes is cut on a character boundary with `(N more bytes)` and a line saying that the passphrase approves the full command line. The rendering ends with "The passphrase you enter approves exactly this, and nothing else."
 
-`envcloak grants list` escapes what it prints the same way; its `--json` form prints the daemon's answer as JSON, whose own encoding escapes control characters.
+`envcloak grants list` escapes what it prints the same way. Its `--json` form, like every `--json` the CLI prints, is written by one JSON writer that escapes the same characters as `\uXXXX` (C1 controls, DEL, bidirectional controls, zero-width characters, tags), paths included; JSON's own encoding escapes only U+0000 to U+001F, the quote and the backslash.
 
 ## Bounds
 

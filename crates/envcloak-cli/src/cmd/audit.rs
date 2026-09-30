@@ -35,7 +35,7 @@ fn verify(json: bool) -> Result<ExitCode, Failure> {
     let v = connect()?.audit_verify()?;
     let problem = v.first_problem.is_some() || v.live_head_matches == Some(false);
     if json {
-        println!("{}", serde_json::to_value(&v).unwrap_or_default());
+        crate::render::print_json(&v);
     } else {
         print_human(&v);
     }

@@ -19,6 +19,7 @@ use envcloak_ipc::{ClientError, DaemonIdentity};
 
 use crate::connect::{connect, run_paths};
 use crate::fail::{FAILURE, Failure, START_DAEMON, usage};
+use crate::render;
 
 pub fn run(args: &[&str]) -> ExitCode {
     let json = match args {
@@ -40,9 +41,8 @@ pub fn run(args: &[&str]) -> ExitCode {
                 "not verified"
             };
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"daemon": {"state": running}, "cli": {"hardening": cli}})
+                render::print_json(
+                    &serde_json::json!({"daemon": {"state": running}, "cli": {"hardening": cli}}),
                 );
             } else {
                 println!("daemon: {running}");
@@ -197,5 +197,5 @@ fn print_json(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
     v["daemon"]["identity"] = identity_word(identity).into();
     v["daemon"]["hardened"] = s.daemon.hardening.hardened().into();
     v["cli"] = serde_json::json!({"hardening": cli, "hardened": cli.hardened()});
-    println!("{v}");
+    render::print_json(&v);
 }
