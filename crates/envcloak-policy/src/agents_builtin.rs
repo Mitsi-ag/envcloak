@@ -50,7 +50,9 @@ markers = ["CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"]
 id = "fixture"
 name = "EnvCloak test fixture agent"
 # crates/envcloak-testkit/src/bin/fixture-agent.rs, which the acceptance
-# tests run as an agent. Only a program by this name matches.
+# tests run as an agent, in CI from the release build. Only a program by
+# this name matches, and like every executable here it then roots its
+# grants above the caller's session (docs/AGENTS.md "Limits").
 executables = ["fixture-agent"]
 markers = ["ENVCLOAK_FIXTURE_AGENT"]
 "#;
