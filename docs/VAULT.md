@@ -239,7 +239,7 @@ The core library takes no lock across a restore or a create: a restore holds the
 
 ## Crash safety
 
-SQLite's WAL with `synchronous=FULL` (and `fullfsync` on macOS) makes each transaction atomic and durable, and the header is part of the same transaction as the rows it vouches for. `tests/vault_crash.rs` kills a writer with `kill -9` at 1,000 random points and checks, each time, that the vault reopens at the last reported commit (or the one after, when the kill landed between the commit and its report), that the digest verifies, and that every value and prior value matches a model of the seeded workload (gate 5). Some of those kills are followed by a second writer started on the WAL the first one left, killed while it recovers that WAL, before the check.
+SQLite's WAL with `synchronous=FULL` (and `fullfsync` on macOS) makes each transaction atomic and durable, and the header is part of the same transaction as the rows it vouches for. `tests/vault_crash.rs` kills a writer with `kill -9` at 1,000 random points and checks, each time, that the vault reopens at the last reported commit (or the one after, when the kill landed between the commit and its report), that the digest verifies, and that every value and prior value matches a model of the seeded workload (gate 5). Some of those kills are followed by a second writer started on the WAL the first one left, killed while it recovers that WAL, before the check. One in ten goes to a writer that closes the vault after a few commits and lands, at a random moment within a close's measured duration, mostly in the checkpoint that folds the WAL into `vault.db` (the writers never come near the 1,000-frame automatic checkpoint); the test requires at least one kill to land there.
 
 ## Migrations
 

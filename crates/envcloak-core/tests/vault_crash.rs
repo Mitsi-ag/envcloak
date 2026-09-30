@@ -16,7 +16,9 @@
 //! parent starts next opens a clean file. To kill during WAL recovery too,
 //! the parent sometimes starts another writer on the WAL the killed one
 //! left, before reopening the vault itself, and kills it while it opens,
-//! recovers and unlocks the vault.
+//! recovers and unlocks the vault. To kill during a checkpoint, some
+//! writers close the vault after a few commits, which folds the WAL into
+//! `vault.db` and removes it, and are killed while they close.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -42,6 +44,8 @@ use envcloak_testkit::{TestHome, fresh_seed};
 const WRITER: &str = "ENVCLOAK_VAULT_CRASH_WRITER";
 const CREATOR: &str = "ENVCLOAK_VAULT_CRASH_CREATOR";
 const SEED: &str = "ENVCLOAK_VAULT_CRASH_SEED";
+/// Set for a writer that closes the vault after this many commits.
+const CLOSE_AFTER: &str = "ENVCLOAK_VAULT_CRASH_CLOSE_AFTER";
 const WORKERS: u64 = 4;
 const KILLS_PER_WORKER: u32 = 250;
 
@@ -362,8 +366,19 @@ fn crash_writer() {
     let mut n = v.header().unwrap().write_counter;
     let mut model = Model::default();
     advance(seed, &mut model, 1, n);
+    let close_after: Option<u64> = std::env::var(CLOSE_AFTER).ok().map(|s| s.parse().unwrap());
     println!("@@ready {n}");
+    let ready = n;
     loop {
+        if close_after.is_some_and(|k| n - ready == k) {
+            // The last connection's close checkpoints the WAL into
+            // `vault.db` and removes it.
+            println!("@@closing {n}");
+            drop(v);
+            println!("@@closed");
+            std::thread::sleep(Duration::from_secs(60));
+            return;
+        }
         n += 1;
         let ops = plan(seed, n, &model);
         v.transact(|t| apply_txn(t, &ops)).unwrap();
@@ -388,6 +403,11 @@ struct Tally {
     /// Those that landed before that writer reported it was ready: while
     /// it opened the vault, recovered the WAL or unlocked.
     recoveries_before_ready: u32,
+    /// Kills of a writer closing the vault after its commits.
+    closes: u32,
+    /// Those that landed in the close's checkpoint: after the writer said
+    /// it was closing and before it said it had, with the WAL still there.
+    in_checkpoint: u32,
 }
 
 /// One worker: its own vault, `KILLS_PER_WORKER` kill points, each checked
@@ -396,10 +416,14 @@ struct Tally {
 /// Most kills wait for the child to report 0 to 3 commits and then land
 /// at a uniformly random moment within one more commit's duration (a
 /// moving average), so they fall inside writes on fast and slow disks
-/// alike. One in ten lands while the child is still starting. After one
-/// kill in four that left a non-empty WAL, a second writer is started on
-/// it and killed within a start-up's duration, mostly while it recovers
-/// the WAL, before the vault is reopened and checked.
+/// alike. One in ten lands while the child is still starting. One in ten
+/// goes to a writer that closes the vault after 2 to 8 commits, and lands
+/// at a random moment within a close's measured duration, mostly in the
+/// checkpoint the close runs (review T3 open 4: the writers are otherwise
+/// never near the 1,000-frame automatic checkpoint). After one kill in four
+/// that left a non-empty WAL, a second writer is started on it and killed
+/// within a start-up's duration, mostly while it recovers the WAL, before
+/// the vault is reopened and checked.
 fn crash_worker(seed: u64) -> Tally {
     let (f, v) = Fixture::create();
     drop(v);
@@ -410,22 +434,46 @@ fn crash_worker(seed: u64) -> Tally {
     let mut at = 1u64;
     let mut ready_time = Duration::from_millis(20);
     let mut commit_time = Duration::from_millis(5);
+    let mut close_time = None;
     let mut tally = Tally::default();
     for kill in 0..KILLS_PER_WORKER {
         let started = Instant::now();
-        let mut child = spawn_self(
-            &f.home,
-            "crash_writer",
-            &[(WRITER, &data), (SEED, &seed_text)],
-            // The VMK crosses on stdin, never in argv or the environment.
-            &f.vmk,
-        );
+        let mode = rng.below(10);
+        let close_after = (mode == 1).then(|| (2 + rng.below(7)).to_string());
+        let mut env = vec![(WRITER, data.as_str()), (SEED, seed_text.as_str())];
+        if let Some(k) = &close_after {
+            env.push((CLOSE_AFTER, k.as_str()));
+        }
+        // The VMK crosses on stdin, never in argv or the environment.
+        let mut child = spawn_self(&f.home, "crash_writer", &env, &f.vmk);
         let mut out = BufReader::new(child.stdout.take().unwrap());
         let mut reported = at;
-        if rng.below(10) == 0 {
+        // Whether the writer said it was closing, and whether it was seen
+        // to have closed before the kill.
+        let (mut closing, mut closed) = (false, false);
+        if mode == 0 {
             tally.early += 1;
             let us = rng.below(ready_time.as_micros() as u64 + 1);
             std::thread::sleep(Duration::from_micros(us));
+        } else if close_after.is_some() {
+            tally.closes += 1;
+            let n = wait_for(&mut out, "@@closing ")
+                .unwrap_or_else(|| panic!("seed {seed}: kill {kill}: the writer did not close"));
+            reported = n.parse().unwrap();
+            closing = true;
+            match close_time {
+                // The first close is measured, and killed once closed.
+                None => {
+                    let t = Instant::now();
+                    assert!(wait_for(&mut out, "@@closed").is_some());
+                    close_time = Some(t.elapsed());
+                    closed = true;
+                }
+                Some(d) => {
+                    let us = rng.below(d.as_micros() as u64 * 5 / 4 + 1);
+                    std::thread::sleep(Duration::from_micros(us));
+                }
+            }
         } else {
             let ready = wait_for(&mut out, "@@ready ");
             let ready: u64 = ready
@@ -458,6 +506,10 @@ fn crash_worker(seed: u64) -> Tally {
         let mut wal = f.db().into_os_string();
         wal.push("-wal");
         let hot = std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0);
+        closed |= tail.contains("@@closed");
+        if closing && !closed && hot {
+            tally.in_checkpoint += 1;
+        }
         if hot && rng.below(4) == 0 {
             tally.recoveries += 1;
             let mut child = spawn_self(
@@ -513,6 +565,7 @@ fn kill_9_at_a_thousand_points_leaves_the_last_commit() {
         .collect();
     let (mut commits, mut early, mut after) = (0, 0, 0);
     let (mut recoveries, mut in_recovery) = (0, 0);
+    let (mut closes, mut in_checkpoint) = (0, 0);
     for w in workers {
         let t = w.join().unwrap();
         commits += t.counter - 1;
@@ -520,10 +573,13 @@ fn kill_9_at_a_thousand_points_leaves_the_last_commit() {
         after += t.after_commits;
         recoveries += t.recoveries;
         in_recovery += t.recoveries_before_ready;
+        closes += t.closes;
+        in_checkpoint += t.in_checkpoint;
     }
     let kills = WORKERS * u64::from(KILLS_PER_WORKER);
     println!(
-        "gate 5: {kills} kills ({early} during start-up, {after} after one or more commits), \
+        "gate 5: {kills} kills ({early} during start-up, {after} after one or more commits, \
+         {closes} of a writer closing the vault, {in_checkpoint} of them in its checkpoint), \
          {commits} commits survived; {recoveries} more kills of a writer started on a \
          killed writer's WAL, {in_recovery} of them before it was ready"
     );
@@ -531,6 +587,7 @@ fn kill_9_at_a_thousand_points_leaves_the_last_commit() {
         in_recovery > 0,
         "no kill landed before a writer started on a killed writer's WAL was ready"
     );
+    assert!(in_checkpoint > 0, "no kill landed in a checkpoint");
     // The kills landed among writes: the vaults moved on by more than one
     // commit per kill that waited for commits.
     assert!(
