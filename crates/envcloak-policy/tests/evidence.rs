@@ -46,6 +46,7 @@ fn p(pid: i32, sid: i32, agent: Option<AgentLabel>) -> Ancestor {
     Ancestor {
         instance: inst(pid, 10 * u64::try_from(pid).unwrap()),
         sid: Some(sid),
+        terminal: None,
         agent,
     }
 }
@@ -91,6 +92,140 @@ fn terminal_chain(agent_at_80: Option<AgentLabel>) -> Vec<Ancestor> {
         p(50, 1, None),
         p(1, 1, None),
     ]
+}
+
+/// `a` on the terminal `tty`.
+fn on(tty: u64, a: Ancestor) -> Ancestor {
+    Ancestor {
+        terminal: Some(tty),
+        ..a
+    }
+}
+
+/// An agent's command, as Claude Code runs one: envcloak (95) <- sh (90,
+/// leading a session of its own without a terminal) <- the agent (80, in
+/// the person's terminal session 70 on terminal 7) <- zsh (70) <- login
+/// (60) <- Terminal (50) <- launchd.
+fn agent_command_chain() -> Vec<Ancestor> {
+    vec![
+        p(95, 90, None),
+        p(90, 90, None),
+        on(7, p(80, 70, builtin("claude-code"))),
+        on(7, p(70, 70, None)),
+        p(60, 60, None),
+        p(50, 1, None),
+        p(1, 1, None),
+    ]
+}
+
+/// A person's command on terminal `tty` in session `sid`: envcloak
+/// (`pid`) <- zsh (`sid`, the leader) <- login (60) <- Terminal (50) <-
+/// launchd.
+fn person_on(pid: i32, sid: i32, tty: u64) -> SubjectEvidence {
+    ev(
+        vec![
+            on(tty, p(pid, sid, None)),
+            on(tty, p(sid, sid, None)),
+            p(60, 60, None),
+            p(50, 1, None),
+            p(1, 1, None),
+        ],
+        true,
+        &[],
+    )
+}
+
+/// Review T9 open 3 (gate 23: approval input is never read from the
+/// requester's terminal): an approver that shares a session or a
+/// terminal with an agent's or an unknown requester's chain, up to its
+/// root, is refused `requester_terminal`, though it is a terminal subject
+/// that may give other proofs; one on another terminal is not, and a
+/// person approves their own terminal's request.
+#[test]
+fn an_approval_from_the_requesters_terminal_is_refused() {
+    let running = |_: &ProcessInstance| true;
+    let agent = ev(agent_command_chain(), false, &[]);
+    assert_eq!(agent.kind(), SubjectKind::Agent);
+    assert_eq!(agent.root().pid, 80);
+
+    // A shell the agent left in its session, or the person's own shell
+    // there once the agent is in the background: the agent's session and
+    // terminal.
+    let same = person_on(75, 70, 7);
+    assert_eq!(same.proof_refusal(), None);
+    assert!(same.shares_terminal_with(&agent, &running));
+    assert_eq!(
+        same.approval_refusal(&agent, &running),
+        Some(ProofRefusal::RequesterTerminal)
+    );
+    assert_eq!(
+        ProofRefusal::RequesterTerminal.token(),
+        "requester_terminal"
+    );
+    // Another session that made the agent's terminal its own.
+    let stolen = person_on(85, 84, 7);
+    assert_eq!(
+        stolen.approval_refusal(&agent, &running),
+        Some(ProofRefusal::RequesterTerminal)
+    );
+    // The session the agent ran the command in.
+    let command_session = person_on(99, 90, 8);
+    assert_eq!(
+        command_session.approval_refusal(&agent, &running),
+        Some(ProofRefusal::RequesterTerminal)
+    );
+    // Another terminal window: its own session and terminal.
+    let other = person_on(35, 30, 9);
+    assert!(!other.shares_terminal_with(&agent, &running));
+    assert_eq!(other.approval_refusal(&agent, &running), None);
+    // Only the chain up to the root counts: session 60 (login) is above
+    // the agent.
+    let above = person_on(65, 60, 9);
+    assert_eq!(above.approval_refusal(&agent, &running), None);
+
+    // An unknown requester (a job a service manager started) is compared
+    // the same way.
+    let job = ev(vec![p(97, 97, None), p(1, 1, None)], false, &[]);
+    assert_eq!(job.kind(), SubjectKind::Unknown);
+    assert_eq!(
+        person_on(98, 97, 9).approval_refusal(&job, &running),
+        Some(ProofRefusal::RequesterTerminal)
+    );
+    assert_eq!(other.approval_refusal(&job, &running), None);
+
+    // A person's own request, from their terminal, is theirs to approve
+    // there.
+    let mine = person_on(76, 70, 7);
+    assert_eq!(mine.kind(), SubjectKind::Terminal);
+    assert!(same.shares_terminal_with(&mine, &running));
+    assert_eq!(same.approval_refusal(&mine, &running), None);
+
+    // Only processes still running count: once the agent (80) and the
+    // command's session (90, 95) are gone, their session ids and the
+    // terminal's device can belong to a person's new terminal window.
+    let gone = |i: &ProcessInstance| ![80, 90, 95].contains(&i.pid);
+    assert_eq!(same.approval_refusal(&agent, &gone), None);
+    assert_eq!(stolen.approval_refusal(&agent, &gone), None);
+    let agent_left = |i: &ProcessInstance| ![90, 95].contains(&i.pid);
+    assert_eq!(
+        stolen.approval_refusal(&agent, &agent_left),
+        Some(ProofRefusal::RequesterTerminal)
+    );
+
+    // Every other refusal comes first.
+    let claimed = ev(
+        vec![
+            on(9, p(35, 30, None)),
+            on(9, p(30, 30, None)),
+            p(1, 1, None),
+        ],
+        true,
+        &["CLAUDECODE"],
+    );
+    assert_eq!(
+        claimed.approval_refusal(&agent, &running),
+        Some(ProofRefusal::Agent)
+    );
 }
 
 #[test]
@@ -948,7 +1083,7 @@ fn info(pid: i32, ppid: i32, sid: i32, uid: u32, exe: Option<&str>) -> ProcInfo 
         start_time: StartTime::from_raw(10 * u64::try_from(pid).unwrap()),
         uid,
         sid: Some(sid),
-        controlling_tty: true,
+        controlling_tty: Some(0x1_0003),
         comm: OsString::from(exe.and_then(|e| e.rsplit('/').next()).unwrap_or("hidden")),
         exe: exe.map(|e| ExeIdentity {
             path: PathBuf::from(e),

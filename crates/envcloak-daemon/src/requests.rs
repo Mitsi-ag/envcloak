@@ -33,8 +33,10 @@
 //!
 //! `approve` takes the passphrase as the proof. Before Argon2id runs, the
 //! approver must be a terminal subject with no agent by any evidence
-//! (SPEC §10b: proofs from every other caller are refused), the pending
-//! request must exist, the statement
+//! (SPEC §10b: proofs from every other caller are refused), sharing no
+//! session or terminal with an agent's or unknown requester's chain up to
+//! its root (`requester_terminal`; `pending.get` is refused so too), the
+//! pending request must exist, the statement
 //! digest must be its own with the options sent, and the attempt limiter
 //! must admit the attempt. Argon2id then runs outside the state lock, with
 //! the vault taken out as an unlock takes it, one proof at a time.
@@ -89,6 +91,38 @@ pub(crate) fn refuse_unless_prover(
                 reason: r.token(),
             });
             Err(RpcError::new(ErrorKind::ProofRefused))
+        }
+    }
+}
+
+/// Refuses `approver` for pending request `id` when it shares a session
+/// or a terminal with the requester's chain up to its root, for a
+/// requester that is not a terminal subject
+/// ([`SubjectEvidence::approval_refusal`]): approval input is never read
+/// from the requester's terminal (gate 23). Audited with the reason
+/// `requester_terminal`. Nothing is refused for a request that does not
+/// exist: the caller's next check says so.
+fn refuse_requester_terminal(
+    s: &mut crate::state::State,
+    peer: &PeerIdentity,
+    approver: &SubjectEvidence,
+    id: &PendingId,
+    now: &envcloak_policy::Now,
+    method: &'static str,
+) -> Result<(), RpcError> {
+    let refusal = s
+        .grants()
+        .pending(id, now)
+        .and_then(|p| approver.approval_refusal(&p.request.subject, &alive));
+    match refusal {
+        None => Ok(()),
+        Some(r) => {
+            s.audit(AuditEvent::ProofRefused {
+                pid: peer.pid,
+                method,
+                reason: r.token(),
+            });
+            Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()))
         }
     }
 }
@@ -491,6 +525,7 @@ pub fn pending_get(
     // No statement is shown from a vault that failed its integrity check:
     // `approve` would be refused before its proof (review T9 open 6).
     s.refuse_if_tampered()?;
+    refuse_requester_terminal(&mut s, peer, &caller, &id, &now, "pending.get")?;
     s.grants()
         .pending_descriptor(&id, &now)
         .cloned()
@@ -526,6 +561,7 @@ pub fn approve(
         let mut s = locked(&shared.state);
         let now = now_of(&shared.clocks);
         s.unlocked()?;
+        refuse_requester_terminal(&mut s, peer, &approver, &id, &now, "approve")?;
         // Everything but the passphrase is checked before Argon2id runs.
         s.grants()
             .check_approval(&id, &p.options, digest, &now)

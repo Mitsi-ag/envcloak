@@ -3,9 +3,10 @@
 //! chain into caller evidence.
 //!
 //! - [`proc_info`]: one process: its parent, start time, effective uid,
-//!   session, whether it has a controlling terminal, its command name and
-//!   its executable. [`proc_argv`] reads its arguments, which the evidence
-//!   walk asks for only where it needs them (see below).
+//!   session, its controlling terminal's device (if its session has one),
+//!   its command name and its executable. [`proc_argv`] reads its
+//!   arguments, which the evidence walk asks for only where it needs them
+//!   (see below).
 //!   - macOS: `sysctl(KERN_PROC_PID)` (`kinfo_proc`), which unlike
 //!     `proc_pidinfo(PROC_PIDTBSDINFO)` also answers for processes of other
 //!     users (`login`, `launchd`); `getsid`; `proc_pidpath`; and the code
@@ -148,8 +149,11 @@ pub struct ProcInfo {
     /// The session id: the pid of the session's leader. `None` when the
     /// kernel would not say.
     pub sid: Option<i32>,
-    /// Whether the process's session has a controlling terminal.
-    pub controlling_tty: bool,
+    /// The device of the process's controlling terminal (Linux `tty_nr`,
+    /// macOS `e_tdev`), `None` when its session has none. Processes on one
+    /// terminal have the same device: the daemon compares an approver's
+    /// with the requester's (docs/GRANTS.md "Approval").
+    pub controlling_tty: Option<u64>,
     /// The command name the kernel keeps (Linux `comm`, macOS `p_comm`):
     /// the start of the executed file's name, at most 16 bytes.
     pub comm: OsString,
@@ -868,7 +872,7 @@ mod tests {
             start_time: StartTime::from_raw(1),
             uid: 501,
             sid: Some(7),
-            controlling_tty: false,
+            controlling_tty: None,
             comm: OsString::from("node"),
             exe: None,
             argv: None,

@@ -238,16 +238,22 @@ fn sessions_and_terminals() {
     let detached = Py::start("setsid", None, &[]);
     let d = proc_info(detached.pid).unwrap();
     assert_eq!(d.sid, Some(detached.pid), "setsid makes it the leader");
-    assert!(!d.controlling_tty, "a new session has no terminal");
+    assert_eq!(d.controlling_tty, None, "a new session has no terminal");
 
     let term = Py::start("pty", None, &[]);
     let t = proc_info(term.pid).unwrap();
     assert_eq!(t.sid, Some(term.pid));
     assert!(
-        t.controlling_tty,
+        t.controlling_tty.is_some(),
         "pty.fork gives the child a controlling terminal"
     );
     assert_ne!(t.ppid, own_pid(), "its parent is the python3 driver");
+    // Each terminal is its own device: the daemon tells an approver's
+    // terminal from a requester's by it.
+    let other = Py::start("pty", None, &[]);
+    let o = proc_info(other.pid).unwrap();
+    assert!(o.controlling_tty.is_some());
+    assert_ne!(o.controlling_tty, t.controlling_tty, "two terminals");
 }
 
 #[test]
@@ -424,7 +430,7 @@ fn info(pid: i32, ppid: i32, start: u64) -> ProcInfo {
         start_time: StartTime::from_raw(start),
         uid: 501,
         sid: Some(10),
-        controlling_tty: true,
+        controlling_tty: Some(0x1_0003),
         comm: OsString::from("p"),
         exe: None,
         argv: None,
@@ -555,7 +561,7 @@ fn a_reparented_or_resessioned_link_fails_revalidation() {
     );
     // The peer's session loses its terminal.
     let mut lost = info(40, 30, 400);
-    lost.controlling_tty = false;
+    lost.controlling_tty = None;
     let mut t = steady().with(vec![Ok(info(40, 30, 400)), Ok(lost)]);
     assert_eq!(
         ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),

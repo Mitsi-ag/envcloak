@@ -150,7 +150,7 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `mode_unsupported` | -32016 | The effective mode is proxy, which M1 does not have |
 | `no_such_request` | -32017 | No pending request has the id, or it expired |
 | `statement_mismatch` | -32018 | The digest is not the pending request's with the options sent |
-| `proof_refused` | -32019 | A proof (or `pending.get`) from a caller that is not a terminal subject: an agent by any evidence, or no terminal session |
+| `proof_refused` | -32019 | A proof (or `pending.get`) from a caller that is not a terminal subject: an agent by any evidence, or no terminal session. With the reason `requester_terminal`: an approval (or `pending.get`) from a session or terminal of the chain of the agent's or unknown process's request it names |
 | `too_many_attempts` | -32020 | The attempt limiter refused the attempt |
 | `vault_tampered` | -32021 | The vault failed its integrity check; no decision, no proof |
 | `too_many_grants` | -32022 | 256 grants are in force |

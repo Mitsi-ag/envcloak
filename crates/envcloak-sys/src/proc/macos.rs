@@ -290,7 +290,8 @@ pub(super) fn proc_info(pid: i32) -> io::Result<ProcInfo> {
         start_time: StartTime::from_raw(secs.saturating_mul(1_000_000).saturating_add(micros)),
         uid: kp.kp_eproc.e_ucred.cr_uid,
         sid: (sid > 0).then_some(sid),
-        controlling_tty: kp.kp_proc.p_flag & P_CONTROLT != 0 && kp.kp_eproc.e_tdev != NODEV,
+        controlling_tty: (kp.kp_proc.p_flag & P_CONTROLT != 0 && kp.kp_eproc.e_tdev != NODEV)
+            .then(|| u64::from(u32::from_ne_bytes(kp.kp_eproc.e_tdev.to_ne_bytes()))),
         comm: OsString::from_vec(comm[..comm_len].to_vec()),
         exe: exe(pid),
         argv: None,

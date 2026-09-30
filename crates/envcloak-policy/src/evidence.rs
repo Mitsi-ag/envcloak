@@ -176,6 +176,8 @@ pub struct Ancestor {
     pub instance: ProcessInstance,
     /// Its session id.
     pub sid: Option<i32>,
+    /// Its controlling terminal's device, when its session has one.
+    pub terminal: Option<u64>,
     /// The agent it is, if the catalog knows it.
     pub agent: Option<AgentLabel>,
 }
@@ -294,6 +296,9 @@ pub enum ProofRefusal {
     /// Not a terminal session: no controlling terminal, or a session whose
     /// leader is pid 1.
     NoTerminal,
+    /// An approval from the session or the terminal of the request's own
+    /// chain ([`SubjectEvidence::approval_refusal`]).
+    RequesterTerminal,
 }
 
 impl ProofRefusal {
@@ -304,6 +309,7 @@ impl ProofRefusal {
             ProofRefusal::ChainCut => "chain_cut",
             ProofRefusal::Orphaned => "orphaned",
             ProofRefusal::NoTerminal => "no_terminal",
+            ProofRefusal::RequesterTerminal => "requester_terminal",
         }
     }
 }
@@ -580,6 +586,53 @@ impl SubjectEvidence {
         }
     }
 
+    /// Whether this caller shares a session or a controlling terminal with
+    /// `requester`'s chain, from its caller up to its root (the session
+    /// id, or the terminal's device, of any process there that `alive`
+    /// says still runs). An agent's command runs in a session of its own,
+    /// and the agent itself on a person's terminal: a process that shares
+    /// either (a shell the agent left in that session, one that took the
+    /// terminal's foreground) could read what is typed there, or be what
+    /// types it. Only processes still running count, as they are now:
+    /// a session id and a terminal's device are used again once every
+    /// process holding them is gone, and a person's new terminal window
+    /// can get the device an agent that exited had.
+    pub fn shares_terminal_with(
+        &self,
+        requester: &SubjectEvidence,
+        alive: &dyn Fn(&ProcessInstance) -> bool,
+    ) -> bool {
+        let me = &self.chain[0];
+        requester.chain[..=requester.root]
+            .iter()
+            .filter(|a| alive(&a.instance))
+            .any(|a| {
+                (me.sid.is_some() && a.sid == me.sid)
+                    || (me.terminal.is_some() && a.terminal == me.terminal)
+            })
+    }
+
+    /// Why this caller may not approve `requester`'s request, or `None`
+    /// when it may: every refusal of [`SubjectEvidence::proof_refusal`],
+    /// and for a requester that is not a terminal subject (an agent or an
+    /// unknown process), [`ProofRefusal::RequesterTerminal`] when the
+    /// approver shares a session or a terminal with the requester's chain
+    /// up to its root, among the processes `alive` says still run
+    /// ([`SubjectEvidence::shares_terminal_with`]): the approval's input
+    /// is never read from the requester's terminal (gate 23). A person
+    /// approves their own terminal's request there.
+    pub fn approval_refusal(
+        &self,
+        requester: &SubjectEvidence,
+        alive: &dyn Fn(&ProcessInstance) -> bool,
+    ) -> Option<ProofRefusal> {
+        self.proof_refusal().or_else(|| {
+            (requester.kind() != SubjectKind::Terminal
+                && self.shares_terminal_with(requester, alive))
+            .then_some(ProofRefusal::RequesterTerminal)
+        })
+    }
+
     /// Whether a grant rooted at `root`, approved for a subject of kind
     /// `grant_kind`, may cover this caller (SPEC §10b "Match" rules 3 and
     /// 4, and the tightening by kind):
@@ -674,7 +727,7 @@ pub fn gather_in(
     } else {
         ChainEnd::Cut
     };
-    let terminal = procs.first().is_some_and(|p| p.controlling_tty);
+    let terminal = procs.first().is_some_and(|p| p.controlling_tty.is_some());
     let chain: Vec<Ancestor> = procs
         .into_iter()
         .enumerate()
@@ -688,6 +741,7 @@ pub fn gather_in(
             Ancestor {
                 agent,
                 sid: p.sid,
+                terminal: p.controlling_tty,
                 instance: ProcessInstance {
                     pid: p.pid,
                     start_time: p.start_time,

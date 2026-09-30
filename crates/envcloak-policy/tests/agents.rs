@@ -22,7 +22,7 @@ fn proc_with(exe: Option<&str>, comm: &str, argv: Option<&[&str]>) -> ProcInfo {
         start_time: StartTime::from_raw(1),
         uid: 501,
         sid: Some(4242),
-        controlling_tty: true,
+        controlling_tty: Some(0x1_0003),
         comm: OsString::from(comm),
         exe: exe.map(|p| ExeIdentity {
             path: PathBuf::from(p),
