@@ -17,6 +17,9 @@ aho-corasick.workspace = true
 libc.workspace = true
 envcloak-sys = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+# assert_fresh reads the workspace's manifests to find what a binary is
+# built from.
+toml_edit.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

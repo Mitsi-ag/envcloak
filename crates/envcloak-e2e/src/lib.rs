@@ -63,18 +63,25 @@ static SERIAL: Mutex<()> = Mutex::new(());
 ///
 /// # Panics
 /// When they are not there: run the tests with `--workspace`, or build
-/// them first.
+/// them first. The target directory's are also refused when they are
+/// older than the sources they are built from, which `cargo test -p
+/// envcloak-e2e` does not rebuild them for (review G3-V2).
 pub fn bin_dir() -> PathBuf {
-    let dir = match std::env::var_os("ENVCLOAK_E2E_BIN_DIR") {
+    let given = std::env::var_os("ENVCLOAK_E2E_BIN_DIR");
+    let dir = match &given {
         Some(d) => PathBuf::from(d),
         None => target_dir(),
     };
     for name in ["envcloak", "envcloakd"] {
+        let bin = dir.join(name);
         assert!(
-            dir.join(name).is_file(),
+            bin.is_file(),
             "{} is missing: run the tests with --workspace, or build it first",
-            dir.join(name).display()
+            bin.display()
         );
+        if given.is_none() {
+            envcloak_testkit::assert_fresh(&bin, name);
+        }
     }
     dir
 }

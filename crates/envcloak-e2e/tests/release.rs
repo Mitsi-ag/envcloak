@@ -53,7 +53,7 @@ fn release_dir(test: &str) -> Option<PathBuf> {
 }
 
 /// The test build of `name`, the control: the binary `cargo test` built
-/// with the test-only features.
+/// with the test-only features, no older than its sources (review G3-V2).
 fn test_build(name: &str) -> PathBuf {
     let p = target_dir().join(name);
     assert!(
@@ -62,6 +62,7 @@ fn test_build(name: &str) -> PathBuf {
          -p envcloak-testkit --bins)",
         p.display()
     );
+    envcloak_testkit::assert_fresh(&p, name);
     p
 }
 

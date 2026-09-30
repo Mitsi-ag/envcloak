@@ -20,6 +20,9 @@
 //!   only the [`DIAGNOSTIC_VARS`] (`RUST_LOG`, `RUST_BACKTRACE`).
 //! - [`Daemon`]: an `envcloakd --foreground` child in a [`TestHome`], with
 //!   its log collected, killed on drop.
+//! - [`assert_fresh`]: refuses a binary of another package in the target
+//!   directory that is older than the sources it is built from, which a
+//!   scoped `cargo test -p` leaves as it was.
 //! - [`crash`]: gate 19's core-dump control and signed copies, shared by
 //!   the tests of both binaries.
 //! - [`testkit_bin`]: this crate's programs, for the tests of other crates:
@@ -32,6 +35,7 @@ pub mod crash;
 mod daemon;
 mod detect;
 mod encode;
+mod fresh;
 mod home;
 
 pub use canary::{Canary, by_label, canaries, fresh_seed, labels};
@@ -41,6 +45,7 @@ pub use detect::{
     sweep_dir,
 };
 pub use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeReport, ProbeSession};
+pub use fresh::{assert_fresh, stale_source};
 pub use home::{DIAGNOSTIC_VARS, TEST_ENV_VARS, TEST_PATH, TestHome};
 
 /// The path of `name`, one of this crate's programs (`fixture-agent`,
