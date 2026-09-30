@@ -1038,6 +1038,10 @@ fn a_changed_length_or_a_cut_the_anchor_covers_is_kept_as_damage() {
 ///   entries between them were deleted (Codex's F-46 follow-up), however
 ///   few of its own bytes are left before the whole one; one whose
 ///   chain value was changed still opens where it really ends.
+/// - An entry whole but for its length, stretched past the end, before
+///   bytes that hold no entry (or a gap, then a damaged entry): its chain
+///   value checks out where it really ends, which is neither the end of
+///   the file nor where the next number starts.
 ///
 /// Each is damage: flagged at its entry, not a torn tail, and kept by the
 /// writer (which goes on in a new segment), with or without a saved head.
@@ -1159,6 +1163,49 @@ fn bytes_after_damage_or_before_a_whole_entry_are_not_a_torn_tail() {
         None,
         10,
     ));
+    // Verification of 19e2e34: entry 2 whole and unchanged but for its
+    // length, stretched past the end, and bytes after it that hold no
+    // entry, or a gap and then a damaged entry 10. Entry 2 does not end at
+    // the end of the file or where an entry 3 starts, but its chain value
+    // checks out where it really ends. Every length of those bytes up to
+    // a few past the smallest entry, and some longer.
+    let noise = |n: usize, seed: u32| -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (x >> 16) as u8
+            })
+            .collect()
+    };
+    let mut damaged_ten = orig[fr[9].1.clone()].to_vec();
+    damaged_ten[12 + 40] ^= 0x01;
+    let mut after: Vec<(String, Vec<u8>)> = Vec::new();
+    for n in (1..=100).chain([255, 363, 1000, 4096]) {
+        after.push((format!("{n} bytes 0xff"), vec![0xff; n]));
+        after.push((format!("{n} bytes of noise"), noise(n, 7 + n as u32)));
+    }
+    after.push(("a damaged entry 10".into(), damaged_ten.clone()));
+    let mut noisy_ten = noise(30, 3);
+    noisy_ten.extend_from_slice(&damaged_ten);
+    after.push(("30 bytes of noise, a damaged entry 10".into(), noisy_ten));
+    for (what, tail) in after {
+        let mut b = orig[..fr[1].1.end].to_vec();
+        with_len(&mut b, 1, u32::try_from(MAX_ENTRY).unwrap());
+        b.extend_from_slice(&tail);
+        cases.push((
+            format!("entry 2 whole, stretched, then {what}"),
+            b.clone(),
+            None,
+            2,
+        ));
+        cases.push((
+            format!("entry 2 whole, stretched, then {what}, entry 1 anchored"),
+            b,
+            Some(first),
+            2,
+        ));
+    }
 
     for (what, bytes, anchor, seq) in &cases {
         reset(bytes);

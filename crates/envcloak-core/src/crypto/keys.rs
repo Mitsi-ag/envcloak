@@ -332,6 +332,46 @@ pub(crate) fn keyed_hash_parts(k: &SubKey, domain: &'static str, parts: &[&[u8]]
     blake3_keyed(k.key.expose_secret(), &all)
 }
 
+/// [`keyed_hash_parts`] of `parts` followed by each prefix of `tail` whose
+/// length is in `lens` (and at most `tail.len()`), shortest first, in one
+/// pass: `tail` is hashed once and the hash finalized at each length.
+/// Hands each hash to `take` with its length until `take` returns true,
+/// and returns whether it did. The layout must be unambiguous, as for
+/// [`keyed_hash_parts`], with `tail` the only variable part.
+#[allow(clippy::disallowed_methods)] // Reads the subkey to key the hash.
+pub(crate) fn keyed_hash_prefixes(
+    k: &SubKey,
+    domain: &'static str,
+    parts: &[&[u8]],
+    tail: &[u8],
+    lens: core::ops::RangeInclusive<usize>,
+    mut take: impl FnMut(usize, &[u8; 32]) -> bool,
+) -> bool {
+    let len = u32::try_from(domain.len()).expect("domain labels are short");
+    let mut h = blake3::Hasher::new_keyed(k.key.expose_secret());
+    h.update(&len.to_be_bytes());
+    h.update(domain.as_bytes());
+    for p in parts {
+        h.update(p);
+    }
+    let (first, last) = (*lens.start(), (*lens.end()).min(tail.len()));
+    let mut taken = false;
+    if first <= last {
+        h.update(&tail[..first]);
+        for n in first..=last {
+            if n > first {
+                h.update(&tail[n - 1..n]);
+            }
+            if take(n, h.finalize().as_bytes()) {
+                taken = true;
+                break;
+            }
+        }
+    }
+    h.zeroize();
+    taken
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +445,71 @@ mod tests {
         }
         assert_eq!(format!("{:?}", kr.key(Purpose::Index)), "SubKey(index, ..)");
         assert_eq!(format!("{:?}", Vmk::generate()), "Vmk(..)");
+    }
+
+    /// Each hash `keyed_hash_prefixes` hands on is [`keyed_hash_parts`] of
+    /// the parts and that prefix of the tail, for every length in range and
+    /// in order, and it stops at the first one the caller takes.
+    #[test]
+    fn keyed_hash_prefixes_hashes_every_prefix_in_one_pass() {
+        let k = SubKey::random(Purpose::Index);
+        let tail: Vec<u8> = (0..3000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        for (from, to) in [(0, 0), (0, 5), (40, 1100), (1023, 1025), (2990, 3000)] {
+            let mut seen = Vec::new();
+            let hit = keyed_hash_prefixes(
+                &k,
+                "envcloak/v1/test",
+                &[b"fixed", &7u64.to_be_bytes()],
+                &tail,
+                from..=to,
+                |n, h| {
+                    seen.push((n, *h));
+                    false
+                },
+            );
+            assert!(!hit);
+            let want: Vec<(usize, [u8; 32])> = (from..=to)
+                .map(|n| {
+                    let h = keyed_hash_parts(
+                        &k,
+                        "envcloak/v1/test",
+                        &[b"fixed", &7u64.to_be_bytes(), &tail[..n]],
+                    );
+                    (n, h)
+                })
+                .collect();
+            assert_eq!(seen, want, "{from}..={to}");
+        }
+        // Lengths past the tail are not tried; a range past it is empty.
+        let mut n_seen = Vec::new();
+        keyed_hash_prefixes(&k, "d", &[], &tail[..10], 8..=20, |n, _| {
+            n_seen.push(n);
+            false
+        });
+        assert_eq!(n_seen, [8, 9, 10]);
+        assert!(!keyed_hash_prefixes(
+            &k,
+            "d",
+            &[],
+            &tail[..10],
+            11..=20,
+            |_, _| true
+        ));
+        // The first length taken ends the pass.
+        let mut calls = 0;
+        let want = keyed_hash_parts(&k, "d", &[&tail[..600]]);
+        assert!(keyed_hash_prefixes(
+            &k,
+            "d",
+            &[],
+            &tail,
+            100..=2000,
+            |_, h| {
+                calls += 1;
+                *h == want
+            }
+        ));
+        assert_eq!(calls, 501);
     }
 
     #[test]

@@ -290,10 +290,11 @@ impl Walker<'_> {
     ///
     /// A crash leaves part of one frame and nothing after it. So a whole
     /// entry in `rest` means its bytes were changed: the expected entry
-    /// with its length changed (its chain value checks out, or its sealed
-    /// bytes open, where it really ends: at the end of the file or where
-    /// the next entry's number starts), or another entry further on that
-    /// opens under the number it carries. Entries, and part of the
+    /// with its length changed (its chain value checks out where it really
+    /// ends, which every length an entry can have is tried for, or its
+    /// sealed bytes open at the end of the file or where the next entry's
+    /// number starts), or another entry further on that opens under the
+    /// number it carries. Entries, and part of the
     /// expected one, can have been deleted in between, so neither that
     /// number nor the expected entry's smallest size says where such an
     /// entry can start: every offset after the first that frames is tried.
@@ -319,19 +320,30 @@ impl Walker<'_> {
             }
             None => false,
         };
+        // The expected entry with its length changed: its chain value
+        // checks out where it really ends, at any length an entry can have
+        // (in one pass: the bytes hashed once, the hash finalized at each
+        // length).
+        let longest = (rest.len() - FRAME_HEAD - MAC_LEN).min(MAX_SEALED);
+        if !spend(longest) {
+            return false;
+        }
+        if self.keys.chain_ends_in(
+            &self.h,
+            seq,
+            &rest[FRAME_HEAD..],
+            Sealed::OVERHEAD..=longest,
+        ) {
+            return false;
+        }
+        // Or its sealed bytes open where it ends: at the end of the file,
+        // or where the next entry's number starts.
         let next = seq.wrapping_add(1).to_be_bytes();
         let starts =
             (min..=rest.len() - FRAME_HEAD).filter(|&p| rest[p + 4..p + FRAME_HEAD] == next);
         for end in std::iter::once(rest.len()).chain(starts) {
             let sealed = &rest[FRAME_HEAD..end - MAC_LEN];
-            // Hashed for the chain value, and opened.
-            if !spend(2 * sealed.len()) {
-                return false;
-            }
-            let computed = self.keys.chain(&self.h, seq, sealed);
-            if bool::from(computed.ct_eq(&rest[end - MAC_LEN..end]))
-                || self.keys.open(seq, sealed).is_some()
-            {
+            if !spend(sealed.len()) || self.keys.open(seq, sealed).is_some() {
                 return false;
             }
         }

@@ -43,7 +43,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{
     Aad, FieldTag, ItemClass, Keyring, Purpose, Sealed, SubKey, TableTag, VaultId, keyed_hash,
-    keyed_hash_parts,
+    keyed_hash_parts, keyed_hash_prefixes,
 };
 use crate::vault::{
     AuditHead, check_private_dir, check_private_file, now_secs, open_record, seal_record, utc_stamp,
@@ -127,6 +127,32 @@ impl LogKeys {
     /// The chain value after the entry `seq` sealed as `sealed`.
     pub(crate) fn chain(&self, prev: &[u8; 32], seq: u64, sealed: &[u8]) -> [u8; 32] {
         keyed_hash_parts(&self.mac, CHAIN_DOMAIN, &[prev, &seq.to_be_bytes(), sealed])
+    }
+
+    /// Whether an entry `seq` after the chain value `prev` ends in `body`
+    /// at some sealed length in `lens`: whether, for such a length `n`,
+    /// the chain value of the first `n` bytes is the 32 bytes after them.
+    /// One pass over `body`: it is hashed once and the hash finalized at
+    /// each length (at most the largest entry's bytes).
+    pub(crate) fn chain_ends_in(
+        &self,
+        prev: &[u8; 32],
+        seq: u64,
+        body: &[u8],
+        lens: core::ops::RangeInclusive<usize>,
+    ) -> bool {
+        keyed_hash_prefixes(
+            &self.mac,
+            CHAIN_DOMAIN,
+            &[prev, &seq.to_be_bytes()],
+            body,
+            lens,
+            |n, mac| {
+                body.get(n..n + MAC_LEN).is_some_and(|stored| {
+                    bool::from(subtle::ConstantTimeEq::ct_eq(stored, &mac[..]))
+                })
+            },
+        )
     }
 
     fn header_mac(&self, body: &[u8]) -> [u8; 32] {
