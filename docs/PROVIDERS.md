@@ -78,7 +78,7 @@ A provider with no test mode lists its keys as live: they act on the real accoun
 
 ### Hosts
 
-An allowed host is an exact host, `api.openai.com`, or a wildcard, `*.example.com`, which covers every host under `example.com` but not `example.com` itself. A host is a lowercase DNS name of two or more labels, at most 253 bytes, whose labels are letters, digits and `-` (not first or last) and whose last label starts with a letter. That leaves out IP addresses, ports, user names, trailing dots, uppercase and non-ASCII spellings, so the host a reviewer reads is the host the key goes to.
+An allowed host is an exact host, `api.openai.com`, or, in the format, a wildcard, `*.example.com`, which covers every host under `example.com` but not `example.com` itself. M1 refuses every wildcard (below). A host is a lowercase DNS name of two or more labels, at most 253 bytes, whose labels are letters, digits and `-` (not first or last) and whose last label starts with a letter. That leaves out IP addresses, ports, user names, trailing dots, uppercase and non-ASCII spellings, so the host a reviewer reads is the host the key goes to.
 
 A wildcard is refused (`WildcardTooBroad`):
 
@@ -92,7 +92,9 @@ A wildcard is also refused when it overlaps the multi-tenant zone of a domain on
 
 Under a multi-tenant suffix anyone can create a host, so a wildcard there would send the key to hosts anyone controls. A tenant's own host, such as `acme.supabase.co`, is stored on the item instead (SPEC §8).
 
-`providers/multi-tenant-suffixes.txt` holds one domain per line, lowercase, two or more labels; `#` starts a comment. It lists application and function hosting (`vercel.app`, `workers.dev`, `supabase.co`, `amplifyapp.com`, ...), cloud platforms whose customers get subdomains (`amazonaws.com`, `azure.com`, `googleapis.com`, `aliyuncs.com`, ...), code and page hosting (`github.io`, `github.dev`, ...), and public suffixes of two labels under which anyone can register a domain (`co.uk`, `com.au`, ...). The list is kept by hand, so a wildcard over a platform it misses would load. No shipped provider has a wildcard host (the crate's `embedded` test checks this), and a change that adds one is checked against the Public Suffix List in review.
+Every other wildcard is refused too (`WildcardRefused`), after the checks above, so a case they catch keeps its own error. The list is kept by hand, and without a Public Suffix List the loader cannot tell a provider's own domain from one under which anyone gets a name: wildcard DNS (`*.nip.io`, `*.sslip.io`, which also get around the ban on IP-address hosts), tunnels (`*.lhr.life`, `*.devtunnels.ms`), dynamic DNS (`*.duckdns.org`) and free-subdomain registries (`*.eu.org`, `*.us.com`). No shipped provider needs a wildcard. Wildcards stay refused until a pinned snapshot of the Public Suffix List is embedded and checked in the loader; until then a provider lists each host.
+
+`providers/multi-tenant-suffixes.txt` holds one domain per line, lowercase, two or more labels; `#` starts a comment. It lists application and function hosting (`vercel.app`, `workers.dev`, `supabase.co`, `amplifyapp.com`, ...), cloud platforms whose customers get subdomains (`amazonaws.com`, `azure.com`, `googleapis.com`, `aliyuncs.com`, ...), code and page hosting (`github.io`, `github.dev`, ...), and public suffixes of two labels under which anyone can register a domain (`co.uk`, `com.au`, ...). The list is kept by hand, which is one reason M1 loads no wildcard at all. No shipped provider has a wildcard host (the loader refuses one, and the crate's `embedded` test checks it too).
 
 ### Auth slots
 
@@ -164,6 +166,7 @@ A registry error is a kind, the file and, where the parser recorded one, the lin
 | 18: an `http://` URL fails to load, in a request or any link | `tests/loader.rs` |
 | 18: a wildcard under each multi-tenant suffix fails to load, and the list is what refuses it | `tests/loader.rs` |
 | 18: a wildcard over a multi-tenant suffix, or over a public suffix of two labels, fails to load | `tests/loader.rs` |
+| Every other wildcard fails to load in M1 (`*.nip.io`, `*.duckdns.org`, `*.lhr.life`, `*.eu.org` and more), an exact host under the same domain loads | `tests/loader.rs` |
 | One bad provider fails the whole registry | `tests/loader.rs` |
 | The compiled registry is `providers/` byte for byte, and loads | `tests/embedded.rs` |
 | Detection over generated values, and the OpenAI and DeepSeek tie broken by the variable name | `tests/detect.rs` |

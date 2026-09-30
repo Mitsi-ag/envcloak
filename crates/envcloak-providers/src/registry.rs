@@ -697,6 +697,14 @@ fn parse_provider(
     let mut allowed_hosts: Vec<HostPattern> = Vec::new();
     for (s, at) in p.strings(p.need(r.allowed_hosts)?)? {
         let h = HostPattern::parse(s, suffixes).map_err(|kind| p.err(kind, at.clone()))?;
+        // After the multi-tenant and public-suffix checks, which name what
+        // is wrong: M1 has no Public Suffix List to tell a provider's own
+        // domain from a wildcard DNS, tunnel or free-subdomain service
+        // (`*.nip.io`, `*.lhr.life`, `*.duckdns.org`, `*.eu.org`), where
+        // anyone gets a name, and no shipped provider needs a wildcard.
+        if h.is_wildcard() {
+            return Err(p.err(K::WildcardRefused, at));
+        }
         if allowed_hosts.contains(&h) {
             return Err(p.err(K::DuplicateHost, at));
         }

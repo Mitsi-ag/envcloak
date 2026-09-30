@@ -1,6 +1,7 @@
 //! Gate 18 (SPEC §15.2): the registry loader refuses a request host outside
 //! `allowed_hosts`, an `http://` URL, and a wildcard under (or over) a
-//! multi-tenant suffix; and the loader's other rules (docs/PROVIDERS.md). Each case
+//! multi-tenant suffix, and in M1 every other wildcard host too; and the
+//! loader's other rules (docs/PROVIDERS.md). Each case
 //! changes one line of a provider file that loads, and checks the kind and
 //! the line of the error, so a case passes only for the reason it names.
 #![allow(clippy::unwrap_used)]
@@ -19,7 +20,7 @@ key_patterns = ['^ex_(?:live|test)_[a-z0-9]{24}$']
 live_patterns = ['^ex_live_']
 test_patterns = ['^ex_test_']
 env_hints = ["EXAMPLE_API_KEY"]
-allowed_hosts = ["api.example.com", "*.example.net"]
+allowed_hosts = ["api.example.com", "eu.example.net"]
 auth = [{ header = "authorization", scheme = "Bearer" }, { query = "key" }]
 denied_paths = ["/v1/keys", "/orgs/*/tokens"]
 
@@ -82,7 +83,7 @@ fn the_fixture_loads_with_every_key() {
     assert_eq!(pats(&p.test_patterns), ["^ex_test_"]);
     assert_eq!(p.env_hints, ["EXAMPLE_API_KEY"]);
     let hosts: Vec<&str> = p.allowed_hosts.iter().map(HostPattern::as_str).collect();
-    assert_eq!(hosts, ["api.example.com", "*.example.net"]);
+    assert_eq!(hosts, ["api.example.com", "eu.example.net"]);
     assert_eq!(
         p.auth_slots,
         [
@@ -98,6 +99,7 @@ fn the_fixture_loads_with_every_key() {
     assert!(!p.path_denied("/v1/balance"));
     assert!(p.host_allowed("api.example.com") && p.host_allowed("eu.example.net"));
     assert!(!p.host_allowed("example.net") && !p.host_allowed("docs.example.com"));
+    assert!(!p.host_allowed("a.eu.example.net") && !p.host_allowed("us.example.net"));
     assert_eq!(
         p.links.docs.as_deref(),
         Some("https://docs.example.com/api")
@@ -148,8 +150,11 @@ fn gate18_a_request_host_outside_allowed_hosts_fails_to_load() {
         // The parent of an exact host, and a name under it.
         "https://example.com/v1/balance",
         "https://www.api.example.com/v1/balance",
-        // The wildcard's own domain, which it does not cover.
+        // The parent of the other exact host, a name under it and a
+        // sibling.
         "https://example.net/v1/balance",
+        "https://a.eu.example.net/v1/balance",
+        "https://us.example.net/v1/balance",
     ] {
         assert_eq!(
             fails(&edit(REQUEST_URL, url)),
@@ -158,8 +163,8 @@ fn gate18_a_request_host_outside_allowed_hosts_fails_to_load() {
         );
     }
     // The request's host taken off the list, the request unchanged.
-    for hosts in [r#"["*.example.net"]"#, "[]"] {
-        let f = edit(r#"["api.example.com", "*.example.net"]"#, hosts);
+    for hosts in [r#"["eu.example.net"]"#, "[]"] {
+        let f = edit(r#"["api.example.com", "eu.example.net"]"#, hosts);
         assert_eq!(
             fails(&f),
             (K::RequestHostNotAllowed, Some(REQUEST_LINE)),
@@ -187,15 +192,11 @@ fn gate18_a_request_host_outside_allowed_hosts_fails_to_load() {
             "{url}"
         );
     }
-    // Hosts the wildcard covers load.
-    for url in [
-        "https://eu.example.net/v1/balance",
-        "https://a.b.example.net/v1/balance",
-    ] {
-        let r = load(&edit(REQUEST_URL, url)).unwrap();
-        let b = r.get("example").unwrap().balance.clone().unwrap();
-        assert_eq!(b.request.url.as_str(), url);
-    }
+    // The other allowed host loads.
+    let url = "https://eu.example.net/v1/balance";
+    let r = load(&edit(REQUEST_URL, url)).unwrap();
+    let b = r.get("example").unwrap().balance.clone().unwrap();
+    assert_eq!(b.request.url.as_str(), url);
 }
 
 #[test]
@@ -252,28 +253,31 @@ fn gate18_a_wildcard_under_a_multi_tenant_suffix_fails_to_load() {
     }
     assert!(list.len() >= 30, "the list has {} entries", list.len());
 
-    const WILDCARD: &str = "\"*.example.net\"";
+    const HOST: &str = "\"eu.example.net\"";
     for s in list {
         for host in [
             format!("*.{s}"),
             format!("*.acme.{s}"),
             format!("*.a.b.{s}"),
         ] {
-            let f = edit(WILDCARD, &format!("\"{host}\""));
+            let f = edit(HOST, &format!("\"{host}\""));
             assert_eq!(
                 fails(&f),
                 (K::WildcardUnderMultiTenantSuffix, Some(7)),
                 "{host}"
             );
         }
-        // Not wildcards under the suffix: an exact tenant host, and a
-        // wildcard under a domain that merely contains the suffix. The
-        // request line goes, since these hosts do not cover it.
-        for host in [format!("acme.{s}"), format!("*.{s}.example.com")] {
-            let f = edit(WILDCARD, &format!("\"{host}\""));
-            let f = f.replacen(REQUEST_URL, "https://api.example.com/", 1);
-            assert!(load(&f).is_ok(), "{host}");
-        }
+        // Not under the suffix: an exact tenant host loads, and a wildcard
+        // under a domain that merely contains the suffix passes this rule
+        // and is refused as every wildcard is in M1.
+        let f = edit(HOST, &format!("\"acme.{s}\""));
+        assert!(load(&f).is_ok(), "acme.{s}");
+        let f = edit(HOST, &format!("\"*.{s}.example.com\""));
+        assert_eq!(
+            fails(&f),
+            (K::WildcardRefused, Some(7)),
+            "*.{s}.example.com"
+        );
     }
     // A wildcard over a whole top-level domain, and malformed wildcards.
     for (host, kind) in [
@@ -285,14 +289,14 @@ fn gate18_a_wildcard_under_a_multi_tenant_suffix_fails_to_load() {
         ("*example.net", K::InvalidHost),
         ("**.example.net", K::InvalidHost),
     ] {
-        let f = edit(WILDCARD, &format!("\"{host}\""));
+        let f = edit(HOST, &format!("\"{host}\""));
         assert_eq!(fails(&f), (kind, Some(7)), "{host}");
     }
 
     // A wildcard over a whole public suffix of two labels, which the list
     // need not name, and multi-tenant platforms the list does name.
     for host in ["*.com.sg", "*.co.kr", "*.com.tw", "*.net.br", "*.org.il"] {
-        let f = edit(WILDCARD, &format!("\"{host}\""));
+        let f = edit(HOST, &format!("\"{host}\""));
         assert_eq!(fails(&f), (K::WildcardTooBroad, Some(7)), "{host}");
     }
     for s in [
@@ -310,12 +314,15 @@ fn gate18_a_wildcard_under_a_multi_tenant_suffix_fails_to_load() {
         assert!(list.iter().any(|x| x == s), "{s} is missing from the list");
     }
 
-    // The list is what refuses them: without an entry for vercel.app the same
-    // wildcard loads, and with an entry for example.net the fixture fails.
-    let f = edit(WILDCARD, "\"*.vercel.app\"");
-    assert!(load_from(&[("example.toml", f.as_bytes()), (SUFFIX_FILE, b"# none\n")]).is_ok());
+    // The list is what names the error: without an entry for vercel.app the
+    // same wildcard is refused only as every wildcard is in M1, and with an
+    // entry for example.net a wildcard under it is refused for the list.
+    let f = edit(HOST, "\"*.vercel.app\"");
+    let e = load_from(&[("example.toml", f.as_bytes()), (SUFFIX_FILE, b"# none\n")]).unwrap_err();
+    assert_eq!((e.kind(), e.line()), (K::WildcardRefused, Some(7)));
+    let f = edit(HOST, "\"*.example.net\"");
     let e = load_from(&[
-        ("example.toml", GOOD.as_bytes()),
+        ("example.toml", f.as_bytes()),
         (SUFFIX_FILE, b"example.net\n"),
     ])
     .unwrap_err();
@@ -331,16 +338,14 @@ fn gate18_a_wildcard_under_a_multi_tenant_suffix_fails_to_load() {
 /// these lists have deeper entries, as public-suffix private entries do.
 #[test]
 fn gate18_a_wildcard_over_a_multi_tenant_suffix_fails_to_load() {
-    const WILDCARD: &str = "\"*.example.net\"";
+    const HOST: &str = "\"eu.example.net\"";
     let list = b"tenants.example.net\napp.region.example.org\n";
     let with = |file: &str| load_from(&[("example.toml", file.as_bytes()), (SUFFIX_FILE, list)]);
-    let host = |h: &str| {
-        edit(WILDCARD, &format!("\"{h}\"")).replacen(REQUEST_URL, "https://api.example.com/", 1)
-    };
+    let host = |h: &str| edit(HOST, &format!("\"{h}\""));
 
-    // The fixture's *.example.net is over tenants.example.net: it would let a
-    // request reach evil.tenants.example.net.
-    let e = with(GOOD).unwrap_err();
+    // *.example.net is over tenants.example.net: it would let a request
+    // reach evil.tenants.example.net.
+    let e = with(&host("*.example.net")).unwrap_err();
     assert_eq!(
         (e.kind(), e.file(), e.line()),
         (K::WildcardOverMultiTenantSuffix, "example.toml", Some(7))
@@ -362,27 +367,54 @@ fn gate18_a_wildcard_over_a_multi_tenant_suffix_fails_to_load() {
             "{h}"
         );
     }
-    // A sibling of an entry loads, and covers no tenant host.
-    for (h, inside) in [
-        ("*.other.example.net", "a.other.example.net"),
-        ("*.other.region.example.org", "a.other.region.example.org"),
-    ] {
-        let r = with(&host(h)).unwrap();
-        let p = r.get("example").unwrap();
-        assert!(p.host_allowed(inside), "{h}");
-        assert!(!p.host_allowed("evil.tenants.example.net"), "{h}");
-        assert!(!p.host_allowed("evil.app.region.example.org"), "{h}");
+    // A sibling of an entry passes this rule, and is refused as every
+    // wildcard is in M1.
+    for h in ["*.other.example.net", "*.other.region.example.org"] {
+        let e = with(&host(h)).unwrap_err();
+        assert_eq!((e.kind(), e.line()), (K::WildcardRefused, Some(7)), "{h}");
     }
     // An exact tenant host is stored as it is.
     assert!(with(&host("acme.tenants.example.net")).is_ok());
-    // Without the deep entries the fixture loads: the list is what refuses it.
-    assert!(
-        load_from(&[
-            ("example.toml", GOOD.as_bytes()),
-            (SUFFIX_FILE, b"# none\n")
-        ])
-        .is_ok()
-    );
+    // Without the deep entries the list names nothing: the same wildcard is
+    // refused only as every wildcard is.
+    let f = host("*.example.net");
+    let e = load_from(&[("example.toml", f.as_bytes()), (SUFFIX_FILE, b"# none\n")]).unwrap_err();
+    assert_eq!((e.kind(), e.line()), (K::WildcardRefused, Some(7)));
+}
+
+/// Review T6 open 1: a wildcard that no multi-tenant entry and no public
+/// suffix rule catches loaded, over wildcard DNS (`*.nip.io`,
+/// `*.sslip.io`, which also gets around the ban on IP-address hosts),
+/// tunnels (`*.lhr.life`, `*.devtunnels.ms`), dynamic DNS
+/// (`*.duckdns.org`) and free-subdomain registries (`*.eu.org`,
+/// `*.us.com`), where anyone gets a name. M1 embeds no Public Suffix List
+/// to tell those from a provider's own domain, and no provider needs a
+/// wildcard: every one is refused, and an exact host under the same
+/// domains still loads.
+#[test]
+fn gate18_every_wildcard_is_refused_in_m1() {
+    const HOST: &str = "\"eu.example.net\"";
+    for domain in [
+        "nip.io",
+        "sslip.io",
+        "lhr.life",
+        "devtunnels.ms",
+        "duckdns.org",
+        "eu.org",
+        "us.com",
+        "example.com",
+        "a.b.example.com",
+    ] {
+        let f = edit(HOST, &format!("\"*.{domain}\""));
+        assert_eq!(fails(&f), (K::WildcardRefused, Some(7)), "*.{domain}");
+        // The exact host under the same domain loads.
+        let f = edit(HOST, &format!("\"acme.{domain}\""));
+        let r = load(&f).unwrap();
+        let p = r.get("example").unwrap();
+        assert!(p.host_allowed(&format!("acme.{domain}")), "{domain}");
+        assert!(!p.host_allowed(&format!("evil.{domain}")), "{domain}");
+        assert!(p.allowed_hosts.iter().all(|h| !h.is_wildcard()));
+    }
 }
 
 /// A balance request is sent with the key, so it may not go to one of the
@@ -536,7 +568,7 @@ fn identity_and_name_rules() {
         "id = \"example\"\n",
         "name = \"Example\"\n",
         "key_patterns = ['^ex_(?:live|test)_[a-z0-9]{24}$']\n",
-        "allowed_hosts = [\"api.example.com\", \"*.example.net\"]\n",
+        "allowed_hosts = [\"api.example.com\", \"eu.example.net\"]\n",
     ] {
         assert_eq!(fails(&edit(line, "")).0, K::MissingKey, "{line}");
     }
@@ -578,7 +610,7 @@ fn structure_rules() {
     assert_eq!(fails(&f), (K::MissingKey, Some(REQUEST_LINE)));
 
     let f = edit(
-        "allowed_hosts = [\"api.example.com\", \"*.example.net\"]",
+        "allowed_hosts = [\"api.example.com\", \"eu.example.net\"]",
         "allowed_hosts = \"api.example.com\"",
     );
     assert_eq!(fails(&f), (K::WrongType, Some(7)));
@@ -622,8 +654,8 @@ fn hint_host_and_path_rules() {
         assert_eq!(fails(&f), (K::InvalidEnvHint, Some(6)), "{bad}");
     }
     let f = edit(
-        "[\"api.example.com\", \"*.example.net\"]",
-        "[\"api.example.com\", \"*.example.net\", \"api.example.com\"]",
+        "[\"api.example.com\", \"eu.example.net\"]",
+        "[\"api.example.com\", \"eu.example.net\", \"api.example.com\"]",
     );
     assert_eq!(fails(&f), (K::DuplicateHost, Some(7)));
     for bad in [

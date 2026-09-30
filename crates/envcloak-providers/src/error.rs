@@ -54,6 +54,11 @@ pub enum RegistryErrorKind {
     /// A wildcard over a multi-tenant suffix: `*.example.net` when
     /// `tenants.example.net` is on the list. It matches every tenant host.
     WildcardOverMultiTenantSuffix,
+    /// Any other wildcard host. M1 embeds no Public Suffix List, so it
+    /// cannot tell a provider's own domain from one under which anyone
+    /// gets a name (`*.nip.io`, `*.duckdns.org`, `*.eu.org`); every
+    /// wildcard is refused until a pinned snapshot is embedded.
+    WildcardRefused,
     /// A URL that does not start with `https://`.
     NotHttps,
     InvalidUrl,
@@ -127,6 +132,10 @@ impl RegistryErrorKind {
             K::WildcardOverMultiTenantSuffix => {
                 "a wildcard host over a multi-tenant suffix is refused: it covers every tenant \
                  host under the suffix"
+            }
+            K::WildcardRefused => {
+                "wildcard hosts are refused until a public suffix list is embedded: list each \
+                 host"
             }
             K::NotHttps => "URLs must start with https://",
             K::InvalidUrl => {
