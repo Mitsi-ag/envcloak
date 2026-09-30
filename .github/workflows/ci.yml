@@ -1,8 +1,8 @@
 name: CI
 
-# Two depths. Pull requests (working branches) run the fast suite: every
-# lint and boundary check and every test except the end-to-end fixture
-# story and the release-build job. Pushes to main, the nightly run and
+# Two depths. Pull requests (working branches) run the fast suite on Linux:
+# every lint and boundary check and every test except the end-to-end
+# fixture story and the release-build job. Pushes to main, the nightly run and
 # manual runs keep the full suite, so nothing merged skips a gate.
 on:
   push:
@@ -31,7 +31,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Pull requests run Linux only: every change is tested on macOS
+        # locally before it is pushed, and Linux is what a Mac cannot run.
+        # Main, nightly and manual runs test both.
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
