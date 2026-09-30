@@ -3,11 +3,12 @@
 //!
 //! - [`SignalRelay`] catches a set of signals for as long as it lives and
 //!   hands each one to a thread that reads [`SignalRelay::next`]. The
-//!   handler only writes the signal's number to a pipe, which is
-//!   async-signal-safe; the code that acts on it is ordinary code on an
-//!   ordinary thread. A caught signal, unlike an ignored one, is reset to
-//!   its default action by `exec`, so the child the runner starts gets the
-//!   usual dispositions.
+//!   handler only writes the signal's number to a pipe, with whether a
+//!   process sent it ([`Relayed::Signal`]), which is async-signal-safe;
+//!   the code that acts on it is ordinary code on an ordinary thread. A
+//!   caught signal, unlike an ignored one, is reset to its default action
+//!   by `exec`, so the child the runner starts gets the usual
+//!   dispositions.
 //! - [`wait_for_exit`] waits until a child has exited and leaves it a
 //!   zombie (`waitid` with `WNOWAIT`), so its pid cannot be handed to
 //!   another process until the caller reaps it. A thread that sends the
@@ -97,6 +98,19 @@ static PIPE: OnceLock<io::Result<RelayPipe>> = OnceLock::new();
 static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 /// A relay is installed; there is at most one per process.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// This process's session when the relay was installed, for the handler
+/// (macOS; see [`sent_by_process`]).
+#[cfg(target_os = "macos")]
+static SESSION: AtomicI32 = AtomicI32::new(-1);
+
+/// A byte in the relay pipe: the signal's number in the low seven bits,
+/// and this bit when a process sent it; 0 is the stop mark.
+const BY_PROCESS: u8 = 0x80;
+/// The byte [`SignalRelay::stop`] writes.
+const STOP: u8 = 0;
+/// The highest signal a relay catches: its number must leave
+/// [`BY_PROCESS`] free. Every signal on Linux and macOS is below it.
+const MAX_SIGNAL: i32 = 0x7f;
 
 fn pipe() -> io::Result<&'static RelayPipe> {
     PIPE.get_or_init(|| {
@@ -137,26 +151,100 @@ fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__errno_location() }
 }
 
-extern "C" fn relay_handler(sig: libc::c_int) {
+/// Whether the signal `info` describes was sent by a process (`kill`,
+/// `sigqueue`, `tgkill`), as opposed to the kernel: a terminal's Ctrl-C and
+/// Ctrl-\ (sent to its foreground process group) or a hangup.
+///
+/// Linux says so in `si_code`: `SI_USER`, `SI_QUEUE` or `SI_TKILL` for a
+/// process, `SI_KERNEL` for a terminal. Called from the signal handler.
+#[cfg(target_os = "linux")]
+fn sent_by_process(info: &libc::siginfo_t) -> bool {
+    matches!(
+        info.si_code,
+        libc::SI_USER | libc::SI_QUEUE | libc::SI_TKILL
+    )
+}
+
+/// Whether the signal `info` describes was sent by a process, as far as
+/// macOS shows it.
+///
+/// macOS reports a terminal's Ctrl-C exactly as it reports `kill`:
+/// `si_code` 0, and `si_pid` the process that wrote the keystroke to the
+/// terminal (the terminal emulator, `sshd`, `tmux`, a pty driver). That
+/// process holds the terminal open, so it is still there, and it is
+/// outside the session the terminal controls. So a signal counts as sent
+/// by a process when its sender is in this process's session (a parent
+/// such as `timeout --foreground`, a harness started from the same
+/// terminal, the command itself), or is already gone (`kill(1)`, which
+/// exits once it has sent). A live sender in another session (`kill`
+/// typed in another terminal's shell) cannot be told from the terminal,
+/// and does not count. `getsid` is one system call with no lock; `errno`
+/// is put back by the caller. Called from the signal handler.
+#[cfg(target_os = "macos")]
+fn sent_by_process(info: &libc::siginfo_t) -> bool {
+    let own = SESSION.load(Ordering::SeqCst);
+    let pid = info.si_pid;
+    if own <= 0 || pid <= 0 {
+        return false;
+    }
+    // SAFETY: getsid has no memory effects; for a pid that is gone it
+    // fails with ESRCH, read from this thread's errno slot.
+    let (session, gone) = unsafe { (libc::getsid(pid), *errno_location() == libc::ESRCH) };
+    session == own || (session < 0 && gone)
+}
+
+extern "C" fn relay_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _context: *mut libc::c_void,
+) {
     let fd = WRITE_FD.load(Ordering::SeqCst);
     if fd < 0 {
         return;
     }
-    // Signal numbers fit in a byte; 0 is the stop mark and never a signal.
-    let byte = u8::try_from(sig).unwrap_or(0);
-    if byte == 0 {
+    // Only signals 1 to MAX_SIGNAL are installed; the check keeps the byte
+    // from ever reading as the stop mark or losing its number.
+    let Some(number) = u8::try_from(sig)
+        .ok()
+        .filter(|n| (1..=MAX_SIGNAL).contains(&i32::from(*n)))
+    else {
         return;
-    }
+    };
     let errno = errno_location();
     // SAFETY: the handler may interrupt code between a failed call and its
-    // read of errno, so errno is put back after the write. `errno` points
-    // at this thread's slot, and write is async-signal-safe; a full pipe
-    // (EAGAIN) drops the byte, since one of the same signal is pending.
+    // read of errno, so errno is put back after the calls. `errno` points
+    // at this thread's slot. `info` is the siginfo_t the kernel passes an
+    // SA_SIGINFO handler, valid for the call, or null. sent_by_process
+    // makes at most one system call; write is async-signal-safe, and a
+    // full pipe (EAGAIN) drops the byte, since one of the same signal is
+    // pending.
     unsafe {
         let saved = *errno;
+        let by_process = info.as_ref().is_some_and(sent_by_process);
+        let byte = if by_process {
+            number | BY_PROCESS
+        } else {
+            number
+        };
         libc::write(fd, (&raw const byte).cast(), 1);
         *errno = saved;
     }
+}
+
+/// What [`SignalRelay::next`] hands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relayed {
+    /// A caught signal: its number, and whether a process sent it
+    /// (`kill`, `sigqueue`) rather than the kernel (a terminal's Ctrl-C or
+    /// Ctrl-\, a hangup). On macOS, which reports both alike, a sender
+    /// counts as a process only when it is in this process's session or
+    /// already gone; any other signal reads as the kernel's.
+    Signal {
+        /// The signal's number.
+        number: i32,
+        /// A process sent it.
+        by_process: bool,
+    },
 }
 
 /// Signals caught and handed to a reading thread while the value lives.
@@ -177,18 +265,18 @@ impl core::fmt::Debug for SignalRelay {
 }
 
 impl SignalRelay {
-    /// Catches each of `signals` with a handler that records it for
-    /// [`SignalRelay::next`]. `SA_RESTART` is set, so a blocking read or
-    /// write on another thread is restarted rather than failing; `poll`
-    /// and `waitid` may still return `EINTR`.
+    /// Catches each of `signals` with a handler that records it, and
+    /// whether a process sent it, for [`SignalRelay::next`]. `SA_RESTART`
+    /// is set, so a blocking read or write on another thread is restarted
+    /// rather than failing; `poll` and `waitid` may still return `EINTR`.
     ///
     /// # Errors
     /// [`io::ErrorKind::AlreadyExists`] while another relay is installed,
-    /// [`io::ErrorKind::InvalidInput`] for a signal outside 1 to 255, and
+    /// [`io::ErrorKind::InvalidInput`] for a signal outside 1 to 127, and
     /// the errors of `pipe` and `sigaction`. Nothing stays installed after
     /// an error.
     pub fn install(signals: &[i32]) -> io::Result<SignalRelay> {
-        if signals.iter().any(|s| !(1..=255).contains(s)) {
+        if signals.iter().any(|s| !(1..=MAX_SIGNAL).contains(s)) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let pipe = pipe()?;
@@ -207,6 +295,13 @@ impl SignalRelay {
             )
         } > 0
         {}
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: getsid(0) asks about this process and has no memory
+            // effects.
+            let session = unsafe { libc::getsid(0) };
+            SESSION.store(session, Ordering::SeqCst);
+        }
         WRITE_FD.store(pipe.write.as_raw_fd(), Ordering::SeqCst);
         let mut relay = SignalRelay {
             saved: Vec::with_capacity(signals.len()),
@@ -216,8 +311,10 @@ impl SignalRelay {
             // SAFETY: sigaction is plain data; every field is set below or
             // stays zero, which is a valid empty value.
             let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
-            act.sa_sigaction = relay_handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
-            act.sa_flags = libc::SA_RESTART;
+            act.sa_sigaction = relay_handler
+                as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+                as libc::sighandler_t;
+            act.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
             // SAFETY: `act.sa_mask` is a writable sigset_t.
             if unsafe { libc::sigemptyset(&mut act.sa_mask) } != 0 {
                 return Err(io::Error::last_os_error());
@@ -234,12 +331,12 @@ impl SignalRelay {
         Ok(relay)
     }
 
-    /// Waits for the next relayed signal and returns its number, or `None`
+    /// Waits for the next relayed signal and returns it, or `None`
     /// once [`SignalRelay::stop`] was called. Meant for one reading thread.
     ///
     /// # Errors
     /// When `poll` or `read` fails for another reason than a signal.
-    pub fn next(&self) -> io::Result<Option<i32>> {
+    pub fn next(&self) -> io::Result<Option<Relayed>> {
         let fd = self.pipe.read.as_raw_fd();
         loop {
             let mut byte = 0u8;
@@ -247,7 +344,13 @@ impl SignalRelay {
             // the life of the process.
             let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
             if n == 1 {
-                return Ok((byte != 0).then_some(i32::from(byte)));
+                return Ok(match byte {
+                    STOP => None,
+                    b => Some(Relayed::Signal {
+                        number: i32::from(b & !BY_PROCESS),
+                        by_process: b & BY_PROCESS != 0,
+                    }),
+                });
             }
             let err = io::Error::last_os_error();
             match err.kind() {
@@ -277,7 +380,11 @@ impl SignalRelay {
     /// # Errors
     /// When the stop mark cannot be written.
     pub fn stop(&self) -> io::Result<()> {
-        let byte = 0u8;
+        self.put(STOP)
+    }
+
+    /// Writes one of the relay's own bytes to the pipe.
+    fn put(&self, byte: u8) -> io::Result<()> {
         loop {
             // SAFETY: `byte` is one readable byte; the descriptor is open for
             // the life of the process.
@@ -327,6 +434,14 @@ mod tests {
         old.sa_sigaction
     }
 
+    /// A signal this process sent itself.
+    fn own(number: i32) -> Option<Relayed> {
+        Some(Relayed::Signal {
+            number,
+            by_process: true,
+        })
+    }
+
     #[test]
     fn signals_are_handed_on_in_order_until_stopped() {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
@@ -340,9 +455,9 @@ mod tests {
         raise(libc::SIGUSR2);
         raise(libc::SIGUSR1);
         relay.stop().unwrap();
-        assert_eq!(relay.next().unwrap(), Some(libc::SIGUSR1));
-        assert_eq!(relay.next().unwrap(), Some(libc::SIGUSR2));
-        assert_eq!(relay.next().unwrap(), Some(libc::SIGUSR1));
+        assert_eq!(relay.next().unwrap(), own(libc::SIGUSR1));
+        assert_eq!(relay.next().unwrap(), own(libc::SIGUSR2));
+        assert_eq!(relay.next().unwrap(), own(libc::SIGUSR1));
         assert_eq!(relay.next().unwrap(), None);
         drop(relay);
         // The old disposition is back, and a new relay starts empty.
@@ -360,21 +475,122 @@ mod tests {
             let reader = s.spawn(|| relay.next().unwrap());
             // SAFETY: kill to this process's own pid.
             assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR2) }, 0);
-            assert_eq!(reader.join().unwrap(), Some(libc::SIGUSR2));
+            assert_eq!(reader.join().unwrap(), own(libc::SIGUSR2));
         });
+    }
+
+    /// Starts `sh -c 'kill -<sig> <this pid> && read _'`, in this process's
+    /// session or (`new_session`) in a session of its own. The sender stays
+    /// until its standard input is closed, so it is still there when the
+    /// handler asks about it.
+    fn sender(sig: &str, new_session: bool) -> std::process::Child {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "kill -\"$1\" \"$2\" && { read _ || :; }",
+            "sender",
+            sig,
+            &std::process::id().to_string(),
+        ])
+        .stdin(std::process::Stdio::piped());
+        if new_session {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: setsid is async-signal-safe and touches no memory of
+            // the parent.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        cmd.spawn().unwrap()
+    }
+
+    /// Lets a [`sender`] go, and reaps it.
+    fn release(mut child: std::process::Child) {
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+    }
+
+    /// A signal another process sends with `kill` is marked as sent by a
+    /// process: on Linux from anywhere (`si_code` is `SI_USER`); on macOS,
+    /// which reports a terminal's Ctrl-C the same way, from a live sender
+    /// only when it is in this process's session (see `sent_by_process`).
+    /// Each sender waits to be let go, so it is there when the handler
+    /// asks about it.
+    #[test]
+    fn a_signal_from_another_process_is_marked_by_its_sender() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGUSR1, libc::SIGUSR2]).unwrap();
+        let same = sender("USR1", false);
+        assert_eq!(relay.next().unwrap(), own(libc::SIGUSR1));
+        release(same);
+        let other = sender("USR2", true);
+        assert_eq!(
+            relay.next().unwrap(),
+            Some(Relayed::Signal {
+                number: libc::SIGUSR2,
+                by_process: cfg!(target_os = "linux"),
+            })
+        );
+        release(other);
+        relay.stop().unwrap();
+        assert_eq!(relay.next().unwrap(), None);
+    }
+
+    /// What the handler reads from a `siginfo_t`: Linux's `si_code` for a
+    /// process's `kill`, `sigqueue` and `tgkill` against the kernel's own
+    /// (a terminal's signals are `SI_KERNEL`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_process_sent_si_code_counts_as_sent_by_a_process() {
+        for (code, by_process) in [
+            (libc::SI_USER, true),
+            (libc::SI_QUEUE, true),
+            (libc::SI_TKILL, true),
+            (libc::SI_KERNEL, false),
+            (libc::SI_TIMER, false),
+            (1, false),
+        ] {
+            // SAFETY: siginfo_t is plain data; zero is a valid value.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            info.si_code = code;
+            assert_eq!(sent_by_process(&info), by_process, "si_code {code}");
+        }
+    }
+
+    /// What the handler reads from a `siginfo_t` on macOS: a sender in this
+    /// process's session, or one that is gone (a pid no process has), and
+    /// not a live sender elsewhere (`launchd`) or none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_sender_in_this_session_or_gone_counts_as_sent_by_a_process() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGUSR1]).unwrap();
+        // SAFETY: getpid has no preconditions.
+        let me = unsafe { libc::getpid() };
+        for (pid, by_process) in [(me, true), (i32::MAX, true), (0, false), (1, false)] {
+            // SAFETY: siginfo_t is plain data; zero is a valid value.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            info.si_pid = pid;
+            assert_eq!(sent_by_process(&info), by_process, "si_pid {pid}");
+        }
+        drop(relay);
     }
 
     #[test]
     fn out_of_range_signals_and_pids_are_refused() {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            SignalRelay::install(&[0]).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            SignalRelay::install(&[256]).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
+        for sig in [0, 128, 256, -1] {
+            assert_eq!(
+                SignalRelay::install(&[sig]).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{sig}"
+            );
+        }
         for pid in [0, -1, -5] {
             assert_eq!(
                 signal_process(pid, 0).unwrap_err().kind(),

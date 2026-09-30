@@ -29,10 +29,11 @@
 //!   kernel reports it) and [`ancestry`] (a peer's parent chain, checked
 //!   again after the walk).
 //! - The runner (`envcloak run`): [`SignalRelay`] (signals caught and
-//!   handed to a thread that passes them on), [`wait_for_exit`] (a child's
-//!   exit seen without reaping it, so its pid is not reused while it may
-//!   still be signalled), [`signal_process`] and [`signal_group`] (`kill`),
-//!   and [`wait_writable`] (an output descriptor ready for a write).
+//!   handed to a thread that passes them on, each with whether a process
+//!   sent it), [`wait_for_exit`] (a child's exit seen without reaping it,
+//!   so its pid is not reused while it may still be signalled),
+//!   [`signal_process`] and [`signal_group`] (`kill`), and
+//!   [`wait_writable`] (an output descriptor ready for a write).
 //! - Panics (gate 12): [`install_panic_hook`], which both binaries call so
 //!   a panic shows its place and never its message; [`panic_point`], where
 //!   a test build panics on request; and [`panic_with_input`], behind the
@@ -66,7 +67,7 @@ pub mod testing;
 mod tty;
 
 pub use alloc::{SystemBacking, WipingAllocator, wiping_allocator_active};
-pub use child::{SignalRelay, signal_group, signal_process, wait_for_exit};
+pub use child::{Relayed, SignalRelay, signal_group, signal_process, wait_for_exit};
 pub use clock::{awake_time, time_including_sleep};
 pub use dir::{
     DirEntryKind, DirEntryName, MAX_DIR_ENTRIES, Volume, create_beneath, exchange_beneath,
