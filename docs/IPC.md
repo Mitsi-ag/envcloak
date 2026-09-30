@@ -143,7 +143,7 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `traced` | -32009 | A tracer is attached to the daemon |
 | `vault_unavailable` | -32010 | The vault file could not be opened; `reason` is `busy`, `damaged`, `unsupported_version`, `permissions`, `disk_full`, `storage`, `io` or `migration` |
 | `frame_too_large` | -32011 | A frame over 1 MiB |
-| `evidence` | -32012 | The caller's ancestry could not be read; `reason` is `caller_gone`, `ancestry_changed`, `ancestry_hidden` or `ancestry_unreadable` |
+| `evidence` | -32012 | The caller's ancestry could not be read; `reason` is `caller_gone`, `ancestry_changed`, `ancestry_hidden`, `ancestry_unreadable` or `caller_is_init` (the caller is pid 1: docs/AGENTS.md "Root") |
 | `manifest_invalid` | -32013 | The manifest, or the path it was opened from; `reason` is a `ManifestErrorKind` token (`not_found`, `syntax`, `loose_policy`, `symlinked_manifest`, ...) or a binding kind that makes the manifest invalid (`card_reference`, ...) |
 | `binding_unresolved` | -32014 | A `--profile` or `--ref` the run asked for; `reason` is `unknown_profile`, `unknown_item`, `unknown_field`, `ambiguous_field`, `no_field`, `invalid_reference` or `duplicate_env_name` |
 | `policy_denied` | -32015 | The effective policy refuses agent requests for the project |

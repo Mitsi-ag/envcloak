@@ -307,6 +307,39 @@ fn pid_1_is_never_a_root() {
     assert!(e.agent_involved());
 }
 
+/// Review T8 open 3: a caller that is pid 1 itself (a container whose
+/// pid 1 is the shell or the CLI, with the daemon in the same pid
+/// namespace) was taken for its own session leader and root, against the
+/// contract (never pid 1), and `covered_by` then refused every grant
+/// rooted there: each request opened a pending request no approval could
+/// ever end. It has no evidence now, with or without a terminal or an
+/// agent label, and the walk refuses it as `caller_is_init`, not as a
+/// caller that exited. A child of pid 1 in its session is still rooted at
+/// itself.
+#[test]
+fn a_caller_that_is_pid_1_has_no_evidence() {
+    for terminal in [false, true] {
+        for agent in [None, builtin("claude-code")] {
+            let e = SubjectEvidence::from_chain(
+                vec![p(1, 1, agent)],
+                ChainEnd::Top,
+                terminal,
+                Claims::none(),
+                None,
+            );
+            assert!(e.is_none(), "{terminal}");
+        }
+    }
+    let mut t = Table::default().add(vec![info(1, 0, 1, 501, Some("/bin/sh"))]);
+    let err = gather_in(&mut t, &peer(1), Claims::none(), &AgentCatalog::builtin()).unwrap_err();
+    assert_eq!(err, EvidenceError::CallerIsInit);
+    assert_eq!(err.token(), "caller_is_init");
+    let e = ev(vec![p(2, 1, None), p(1, 1, None)], false, &[]);
+    assert!(e.session_leader().is_none());
+    assert_eq!(e.root().pid, 2);
+    assert!(e.covered_by(&e.root(), SubjectKind::Unknown));
+}
+
 /// A known agent that is pid 1 of the daemon's pid namespace (a container
 /// whose entrypoint ends in `exec claude`, with envcloakd started in it) is
 /// an agent all the same: the kind, the label, the barrier and refused
