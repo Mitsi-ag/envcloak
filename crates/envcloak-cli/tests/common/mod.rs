@@ -173,6 +173,27 @@ pub fn on_terminal_command(home: &TestHome, args: &[&str], fds: &[Fd<'_>]) -> Co
     cmd
 }
 
+/// The program `argv[0]` with the rest of `argv` in `home`'s environment,
+/// leading a session on a pseudo-terminal of its own, with `fds` opened
+/// (see [`ON_TERMINAL`]): `fixture-agent -- envcloak ...` there is an
+/// agent's command on a terminal of the agent's.
+pub fn on_terminal_program(home: &TestHome, argv: &[&Path], fds: &[Fd<'_>]) -> Command {
+    let spec: Vec<String> = fds
+        .iter()
+        .map(|(n, p, read)| format!("{n}{}{}", if *read { '<' } else { '>' }, p.display()))
+        .collect();
+    let mut cmd = Command::new(python3());
+    home.apply(&mut cmd)
+        .args(["-c", ON_TERMINAL])
+        .arg(spec.join(","))
+        .args(argv)
+        .current_dir(home.home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// Runs `envcloak <args>` on a terminal of its own, as a person does to
 /// give a proof, and waits up to a minute for it.
 pub fn run_on_terminal(home: &TestHome, args: &[&str], fds: &[Fd<'_>]) -> Output {

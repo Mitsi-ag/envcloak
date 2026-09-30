@@ -23,14 +23,14 @@ use std::process::Output;
 use std::time::Duration;
 
 use common::{
-    cli_command, data_dir, finish_within, on_terminal_command, outside_dir, secret_file,
-    start_daemon, stderr, stdout,
+    cli, cli_command, data_dir, finish_within, on_terminal_command, on_terminal_program,
+    outside_dir, secret_file, start_daemon, stderr, stdout,
 };
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::AuditKind;
 use envcloak_core::vault::{LockedVault, VaultPaths};
 use envcloak_testkit::{
-    Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
+    Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels, testkit_bin,
 };
 
 /// A vault created through the CLI, with the kit on a file, and one item.
@@ -179,6 +179,16 @@ impl Setup {
     fn sweep(&self) {
         assert_no_canary(&self.d.log_bytes(), &self.cs);
         self.home.assert_clean(&self.cs);
+    }
+
+    /// The names in the vault's directory that a recover which replaced
+    /// the vault leaves (`replaced-*`).
+    fn replaced(&self) -> Vec<String> {
+        std::fs::read_dir(data_dir(&self.home).join("vault"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("replaced-"))
+            .collect()
     }
 }
 
@@ -428,4 +438,86 @@ fn a_failed_recover_names_the_restore_as_the_lock_reason() {
         .map(|e| e.record.decision.reason.clone())
         .collect();
     assert_eq!(locks, [Some("restore".to_owned())]);
+}
+
+/// Review T14 open 4: `vault.recover` shares the attempt limiter. Five
+/// wrong kits are refused and counted; the next recover, with a wrong kit
+/// or the right one, is refused (`too_many_attempts`) before the backup is
+/// read: no attempt is counted, no kit is tried, and the vault the first
+/// failure locked is still there, locked and not replaced.
+#[test]
+fn recover_attempts_are_limited_before_the_backup_is_read() {
+    let s = Setup::new();
+    let b = s.json(&["backup", "create", "--json"]);
+    let path = PathBuf::from(b["path"].as_str().unwrap());
+    for n in 1..=5 {
+        let out = s.recover(&path, &s.wrong_kit);
+        assert_eq!(token(&out), "wrong_passphrase", "{}", stderr(&out));
+        let st = s.json(&["status", "--json"]);
+        assert_eq!(st["approvals"]["proof_failures"], n);
+    }
+    for kit in [&s.wrong_kit, &s.kit] {
+        let out = s.recover(&path, kit);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(token(&out), "too_many_attempts", "{}", stderr(&out));
+        let st = s.json(&["status", "--json"]);
+        assert_eq!(st["approvals"]["proof_failures"], 5);
+        assert_eq!(st["vault"]["state"], "locked");
+        assert!(st["approvals"]["proof_wait_secs"].as_u64().unwrap() > 0);
+        assert!(s.replaced().is_empty(), "{:?}", s.replaced());
+    }
+    let log = s.d.log();
+    assert_eq!(
+        log.matches("envcloakd: audit: recover failed reason=wrong_secret")
+            .count(),
+        5,
+        "{log}"
+    );
+    assert!(!log.contains("vault recovered"), "{log}");
+    s.sweep();
+}
+
+/// Review T14 open 4: an agent's `envcloak recover`, on a terminal of the
+/// agent's own and with the right kit and a new passphrase on
+/// descriptors, is refused (`proof_refused`, reason `agent`): a terminal
+/// is not enough for a proof. The vault is left unlocked, with its item,
+/// and nothing replaced it.
+#[test]
+fn an_agent_on_a_terminal_cannot_recover() {
+    let s = Setup::new();
+    let b = s.json(&["backup", "create", "--json"]);
+    let path = b["path"].as_str().unwrap().to_owned();
+    let agent = testkit_bin("fixture-agent");
+    let argv: Vec<&Path> = [
+        agent.as_path(),
+        Path::new("--"),
+        cli(),
+        Path::new("recover"),
+        Path::new("--backup"),
+        Path::new(&path),
+        Path::new("--kit-fd"),
+        Path::new("4"),
+        Path::new("--new-passphrase-fd"),
+        Path::new("3"),
+    ]
+    .to_vec();
+    let out = finish_within(
+        on_terminal_program(&s.home, &argv, &[(3, &s.new_pass, true), (4, &s.kit, true)]),
+        Duration::from_secs(120),
+    );
+    s.clean(&out);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(token(&out), "proof_refused", "{}", stderr(&out));
+    assert_eq!(s.state(), "unlocked");
+    assert_eq!(s.slugs(), ["openai/acme-web"]);
+    assert!(s.replaced().is_empty(), "{:?}", s.replaced());
+    let st = s.json(&["status", "--json"]);
+    assert_eq!(st["approvals"]["proof_failures"], 0);
+    let log = s.d.log();
+    assert!(
+        log.contains("proof refused method=vault.recover reason=agent "),
+        "{log}"
+    );
+    assert!(!log.contains("vault recovered"), "{log}");
+    s.sweep();
 }
