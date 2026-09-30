@@ -1196,6 +1196,52 @@ fn denials_are_remembered_and_three_auto_deny_the_root() {
     }
 }
 
+/// Review T9 open 2: a root auto-denied after three denials was still
+/// served by the grant it held: decide() answered `covered` before it
+/// looked at the auto-deny, although SPEC 10a and flood.rs deny the root
+/// whatever it asks. The auto-deny is checked first: the root's covered
+/// request is `root_denied` for the 30 minutes, another root's grant still
+/// covers its own, and the root's grant, kept, covers it again after.
+#[test]
+fn an_auto_denied_root_is_denied_what_its_grant_covers() {
+    let it = items();
+    let mut s = store();
+    let now = now_at(0);
+    let covered_request = || request(under_agent(), vec![bound("OPENAI_API_KEY", &it[0])], &["x"]);
+    let hours = |h: u64| session(h * 3600);
+    let g = approve(&mut s, covered_request(), hours(3), &now).unwrap();
+    assert_eq!(s.decide(covered_request(), &now), Decision::Covered(g));
+    // Another root, a terminal, with a grant of its own.
+    let theirs = || request(terminal(), vec![bound("OPENAI_API_KEY", &it[0])], &["y"]);
+    let t = approve(&mut s, theirs(), hours(3), &now).unwrap();
+    // Three requests the grant does not cover, from the same root, denied.
+    let mut auto = false;
+    for n in 0..3 {
+        let asks_more = request(
+            under_agent(),
+            vec![bound("STRIPE_SECRET_KEY", &it[1])],
+            &[&n.to_string()],
+        );
+        let id = pending_id(&s.decide(asks_more, &now));
+        auto = s.deny(&id, &now).unwrap().root_auto_denied;
+    }
+    assert!(auto);
+    assert_eq!(
+        s.decide(covered_request(), &now),
+        Decision::Denied(DenyReason::RootDenied)
+    );
+    let before = now_at(AUTO_DENY.as_secs() - 1);
+    assert_eq!(
+        s.decide(covered_request(), &before),
+        Decision::Denied(DenyReason::RootDenied)
+    );
+    assert_eq!(s.decide(theirs(), &before), Decision::Covered(t));
+    // The grant was kept: once the auto-deny ends it covers again.
+    let after = now_at(AUTO_DENY.as_secs());
+    assert!(s.grant(g).is_some());
+    assert_eq!(s.decide(covered_request(), &after), Decision::Covered(g));
+}
+
 /// Review finding F-39: denials from many other roots never make the
 /// store forget one early. With [`MAX_DENIALS`] denials remembered and no
 /// time passing, the first request is still denied as repeated, its

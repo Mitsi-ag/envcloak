@@ -680,7 +680,7 @@ The ancestry walk records pid and start time for each ancestor, then re-validate
 - Frames are limited to 1 MiB.
 - At most 3 pending approvals per subject root, and 20 per daemon.
 - A request identical to one denied in the last 10 minutes is denied without a prompt.
-- 3 denials for one root within 10 minutes auto-deny that root for 30 minutes and send a notification.
+- 3 denials for one root within 10 minutes auto-deny that root for 30 minutes, whatever it asks (requests a grant it holds would cover included), and send a notification.
 - Approval surfaces render argv as a list, with control characters, bidirectional overrides and zero-width characters shown as visible escapes. Text beyond 2 KB is truncated with a "(N more bytes)" marker. The approved statement always covers the full argv.
 
 ## 10b. Grants and approvals

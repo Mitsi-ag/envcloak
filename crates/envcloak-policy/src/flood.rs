@@ -8,7 +8,9 @@
 //!   denied without a prompt. Identity is a fingerprint of the root, the
 //!   project, the bindings, the mode and the command line.
 //! - [`DENIALS_TO_AUTO_DENY`] denials for one root within
-//!   [`DENIAL_WINDOW`] deny that root for [`AUTO_DENY`], whatever it asks.
+//!   [`DENIAL_WINDOW`] deny that root for [`AUTO_DENY`], whatever it asks:
+//!   the grant store checks it before any grant, so a grant the root holds
+//!   covers nothing meanwhile (and covers again after).
 //!
 //! Windows count time awake ([`crate::Now::awake`]): a machine asleep
 //! serves none of them. This state survives a lock; it only tightens.
