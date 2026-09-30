@@ -49,7 +49,7 @@ use std::process::ExitCode;
 
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
-use envcloak_exec::{CoverageReport, ExecError, IDLE_FLUSH, Label, RunSpec, ShortPolicy};
+use envcloak_exec::{CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
 use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
 use envcloak_policy::{
@@ -264,15 +264,14 @@ fn start(
     let mut injected: Vec<(EnvName, SecretBytes)> =
         plain.into_iter().map(|p| (p.name, p.value)).collect();
     injected.extend(bound.into_iter().map(|(name, _, value, _)| (name, value)));
-    let spec = RunSpec {
-        argv: argv.into_iter().map(OsString::from).collect(),
+    // The idle flush is IDLE_FLUSH, and standard input this process's own.
+    let spec = RunSpec::new(
+        argv.into_iter().map(OsString::from).collect(),
         injected,
         redactor,
-        idle_flush: IDLE_FLUSH,
-        stdin: None,
-        stdout: out(std::io::stdout().as_fd())?,
-        stderr: out(std::io::stderr().as_fd())?,
-    };
+        out(std::io::stdout().as_fd())?,
+        out(std::io::stderr().as_fd())?,
+    );
     match envcloak_exec::run(spec) {
         Ok(exit) => Ok(ExitCode::from(exit.shell_code())),
         Err(e) => Ok(exec_failure(&e)),

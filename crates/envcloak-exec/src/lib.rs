@@ -67,7 +67,8 @@ pub use coverage::{
 };
 
 /// How long a pipe must be quiet before the redactor releases what it held
-/// back that cannot be the start of a value.
+/// back that cannot be the start of a value: 40 ms (SPEC §6.1 step 7), so
+/// a prompt without a newline shows within 100 ms.
 pub const IDLE_FLUSH: Duration = Duration::from_millis(40);
 
 /// How long output is still read after the child exits, while a
@@ -85,7 +86,7 @@ pub struct RunSpec {
     pub injected: Vec<(EnvName, SecretBytes)>,
     /// Built by [`build_redactor`] from the bindings' values.
     pub redactor: Redactor,
-    /// [`IDLE_FLUSH`], or shorter in tests.
+    /// [`IDLE_FLUSH`] ([`RunSpec::new`]), or shorter in tests.
     pub idle_flush: Duration,
     /// The child's standard input; `None` shares this process's.
     pub stdin: Option<OwnedFd>,
@@ -93,6 +94,29 @@ pub struct RunSpec {
     pub stdout: OwnedFd,
     /// Where the redacted standard error goes.
     pub stderr: OwnedFd,
+}
+
+impl RunSpec {
+    /// A run of `argv` with `injected` in its environment, its output
+    /// through `redactor` to `stdout` and `stderr`: the idle flush is
+    /// [`IDLE_FLUSH`], and standard input this process's own.
+    pub fn new(
+        argv: Vec<OsString>,
+        injected: Vec<(EnvName, SecretBytes)>,
+        redactor: Redactor,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+    ) -> RunSpec {
+        RunSpec {
+            argv,
+            injected,
+            redactor,
+            idle_flush: IDLE_FLUSH,
+            stdin: None,
+            stdout,
+            stderr,
+        }
+    }
 }
 
 impl core::fmt::Debug for RunSpec {
@@ -304,4 +328,37 @@ fn abandon(mut child: std::process::Child, e: io::Error) -> ExecError {
     let _ = child.kill();
     let _ = child.wait();
     ExecError::Setup(e.kind())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use super::*;
+
+    fn dev_null() -> OwnedFd {
+        File::options()
+            .write(true)
+            .open("/dev/null")
+            .unwrap()
+            .into()
+    }
+
+    /// SPEC §6.1 step 7: the idle flush is 40 ms, and a run built with
+    /// [`RunSpec::new`] (as `envcloak run` builds it) uses it (review
+    /// T12-4). The runner tests measure the real delay.
+    #[test]
+    fn the_idle_flush_is_40_ms_and_a_new_run_uses_it() {
+        assert_eq!(IDLE_FLUSH, Duration::from_millis(40));
+        let (redactor, _) = envcloak_redact::RedactorBuilder::new().build();
+        let spec = RunSpec::new(
+            vec!["true".into()],
+            Vec::new(),
+            redactor,
+            dev_null(),
+            dev_null(),
+        );
+        assert_eq!(spec.idle_flush, IDLE_FLUSH);
+        assert!(spec.stdin.is_none());
+    }
 }
