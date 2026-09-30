@@ -7,7 +7,9 @@ a time with a pause after each byte, so the runner's redactor sees the value
 split at every byte boundary with an idle flush between the pieces. Then
 comes the tail: `eof` ends the output, `malformed` writes bytes that are not
 UTF-8 first, and `sigterm` writes the first half of a value and waits for
-the signal that ends it.
+the signal that ends it. So that it never outlives its test, that wait also
+ends when the file `--stop` names appears, or after `--deadline` seconds,
+and says which in the file `--ended` names (`stopped` or `deadline`).
 
 Serializers: Python's `json.dumps` (ASCII and UTF-8), `quote` and
 `quote_plus` (upper and lower hex), form encoding, standard and URL-safe
@@ -21,6 +23,7 @@ Usage:
   emit.py --names A,B [--pause-ms N] [--tail eof|malformed|sigterm]
           [--whole-only] [--node PATH] [--php PATH] [--go PATH]
           [--stdin] [--fixtures DIR]...
+          [--stop PATH --ended PATH --deadline SECONDS]
 
 Every line it writes starts with a frame naming the payload, so the test
 can tell that each one went through. It never writes a value on its own
@@ -157,8 +160,16 @@ def main():
     elif tail == "sigterm":
         os.write(1, b"H:" + first[: len(first) // 2])
         os.write(2, b"READY\n")
-        while True:
-            time.sleep(60)
+        end = time.monotonic() + float(opts["--deadline"])
+        while not os.path.exists(opts["--stop"]):
+            if time.monotonic() > end:
+                with open(opts["--ended"], "a") as f:
+                    f.write("deadline\n")
+                sys.exit(124)
+            time.sleep(0.05)
+        with open(opts["--ended"], "a") as f:
+            f.write("stopped\n")
+        sys.exit(0)
     os.write(2, b"DONE\n")
 
 
