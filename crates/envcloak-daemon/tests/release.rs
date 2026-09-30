@@ -13,7 +13,10 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use common::{MANIFEST, client, data_dir, passphrase, project, seed_vault, start};
+use common::{
+    MANIFEST, client, data_dir, flip_sealed_values, passphrase, project, sealed_values, seed_vault,
+    start,
+};
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::AuditKind;
 use envcloak_core::vault::{LockedVault, VaultPaths};
@@ -45,15 +48,7 @@ impl Fixture {
         let kit = seed_vault(&home, &cs);
         let mut cs = cs;
         cs.push(kit);
-        let raw = rusqlite::Connection::open(VaultPaths::under(data_dir(&home)).db).unwrap();
-        let sealed = raw
-            .prepare("SELECT sealed_value FROM fields ORDER BY rowid")
-            .unwrap()
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        drop(raw);
+        let sealed = sealed_values(&home);
         let d = start(&home);
         client(&home).unlock(passphrase(&cs), &[]).unwrap();
         let manifest = project(&home, "acme-web", MANIFEST);
@@ -268,33 +263,4 @@ fn an_audit_failure_or_a_changed_vault_releases_nothing() {
     let st = client(&f.home).status().unwrap();
     assert_eq!(st.vault.integrity, Some(Integrity::Tampered));
     f.sweep();
-}
-
-/// Flips one ciphertext bit (past the 24-byte nonce) in each of `sealed`
-/// wherever it is stored: the vault file and its write-ahead log. Returns
-/// how many values it found at least once.
-fn flip_sealed_values(db: &std::path::Path, sealed: &[Vec<u8>]) -> usize {
-    use std::os::unix::fs::FileExt;
-    let mut wal = db.as_os_str().to_owned();
-    wal.push("-wal");
-    let mut found = vec![false; sealed.len()];
-    for path in [db.to_path_buf(), std::path::PathBuf::from(wal)] {
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        for (i, s) in sealed.iter().enumerate() {
-            for (at, _) in bytes
-                .windows(s.len())
-                .enumerate()
-                .filter(|(_, w)| *w == s.as_slice())
-            {
-                let at = at + 30;
-                file.write_at(&[bytes[at] ^ 0x10], at as u64).unwrap();
-                found[i] = true;
-            }
-        }
-        file.sync_all().unwrap();
-    }
-    found.iter().filter(|f| **f).count()
 }

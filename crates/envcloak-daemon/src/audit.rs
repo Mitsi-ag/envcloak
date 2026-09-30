@@ -146,6 +146,19 @@ pub enum AuditEvent {
         item: ItemId,
         slug: Slug,
     },
+    /// A rotation or removal passed its proof and then changed nothing:
+    /// the vault locked meanwhile (`vault_locked`), the backup could not be
+    /// written (`backup_failed`), the target changed (`item_changed`), or
+    /// the write failed (the vault's error token). Never
+    /// `wrong_passphrase`, which is [`AuditEvent::ItemProofFailed`].
+    ItemWriteFailed {
+        pid: i32,
+        subject: SubjectSummary,
+        write: AuditKind,
+        item: ItemId,
+        slug: Slug,
+        reason: &'static str,
+    },
     /// Env-file values were imported (`import.commit`): the items made,
     /// and how many existing items were bound instead.
     Imported {
@@ -294,6 +307,16 @@ impl AuditEvent {
                 pid, write, item, ..
             } => format!(
                 "envcloakd: audit: {} failed reason=wrong_passphrase id={item} pid={pid}",
+                write.token()
+            ),
+            AuditEvent::ItemWriteFailed {
+                pid,
+                write,
+                item,
+                reason,
+                ..
+            } => format!(
+                "envcloakd: audit: {} failed reason={reason} id={item} pid={pid}",
                 write.token()
             ),
             AuditEvent::Imported {
@@ -510,6 +533,19 @@ impl AuditEvent {
                 subject: subject(*pid),
                 items: vec![(*item, slug.clone())],
                 decision: decision("failed", Some("wrong_passphrase"), None, None),
+                ..AuditRecord::new(*write, "failed")
+            },
+            AuditEvent::ItemWriteFailed {
+                subject,
+                write,
+                item,
+                slug,
+                reason,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: vec![(*item, slug.clone())],
+                decision: decision("failed", Some(reason), None, None),
                 ..AuditRecord::new(*write, "failed")
             },
             AuditEvent::Imported {
