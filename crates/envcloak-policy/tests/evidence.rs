@@ -228,6 +228,85 @@ fn an_approval_from_the_requesters_terminal_is_refused() {
     );
 }
 
+/// Review F-70: the approval refusal reaches the requester's nearest
+/// agent even where that agent may not be the grant's root. An agent
+/// known only by what it says about itself, or through a user extension,
+/// roots its command's grant at the command's own session (so the grant
+/// never widens), yet it runs on the person's terminal all the same: a
+/// sibling shell on that terminal is refused, as for a builtin agent
+/// known by its executable. The four ways an agent is known, on one
+/// chain: the agent (80) on terminal 7 in session 70, its command in a
+/// session of its own (90) without a terminal.
+#[test]
+fn an_approval_from_the_terminal_of_an_agent_that_is_not_the_root_is_refused() {
+    let running = |_: &ProcessInstance| true;
+    for (agent_label, root) in [
+        (builtin("claude-code"), 80),
+        (asserted("claude-code"), 90),
+        (extension("my-agent"), 90),
+        (
+            Some(label(
+                "my-agent",
+                CatalogSource::Extension,
+                MatchBasis::Asserted,
+            )),
+            90,
+        ),
+    ] {
+        let mut chain = agent_command_chain();
+        chain[2].agent = agent_label.clone();
+        let agent = ev(chain, false, &[]);
+        let what = format!("{agent_label:?}");
+        assert_eq!(agent.kind(), SubjectKind::Agent, "{what}");
+        // The grant's root is as before: the agent only for a builtin
+        // match on its executable, else the command's session, and a
+        // grant rooted at the agent covers the command only then.
+        assert_eq!(agent.root().pid, root, "{what}");
+        assert_eq!(
+            agent.covered_by(&inst(80, 800), SubjectKind::Agent),
+            root == 80,
+            "{what}"
+        );
+
+        // A shell on the agent's terminal, in its session or in one that
+        // took the terminal: refused.
+        for approver in [person_on(75, 70, 7), person_on(85, 84, 7)] {
+            assert_eq!(approver.proof_refusal(), None, "{what}");
+            assert_eq!(
+                approver.approval_refusal(&agent, &running),
+                Some(ProofRefusal::RequesterTerminal),
+                "{what}"
+            );
+        }
+        // The command's own session: refused.
+        assert_eq!(
+            person_on(99, 90, 8).approval_refusal(&agent, &running),
+            Some(ProofRefusal::RequesterTerminal),
+            "{what}"
+        );
+        // Another terminal window, and a session above the agent (login's,
+        // 60): allowed.
+        assert_eq!(
+            person_on(35, 30, 9).approval_refusal(&agent, &running),
+            None,
+            "{what}"
+        );
+        assert_eq!(
+            person_on(65, 60, 9).approval_refusal(&agent, &running),
+            None,
+            "{what}"
+        );
+        // Once the agent has exited, its terminal's device can be a
+        // person's new window.
+        let agent_gone = |i: &ProcessInstance| i.pid != 80;
+        assert_eq!(
+            person_on(85, 84, 7).approval_refusal(&agent, &agent_gone),
+            None,
+            "{what}"
+        );
+    }
+}
+
 #[test]
 fn the_nearest_agent_is_the_root() {
     let e = ev(terminal_chain(builtin("claude-code")), true, &[]);

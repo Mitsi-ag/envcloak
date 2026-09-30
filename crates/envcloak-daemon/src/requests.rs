@@ -35,8 +35,8 @@
 //! approver must be a terminal subject with no agent by any evidence
 //! (SPEC §10b: proofs from every other caller are refused), sharing no
 //! session or terminal with an agent's or unknown requester's chain up to
-//! its root (`requester_terminal`; `pending.get` is refused so too), the
-//! pending request must exist, the statement
+//! its root or its nearest agent (`requester_terminal`; `pending.get` is
+//! refused so too), the pending request must exist, the statement
 //! digest must be its own with the options sent, and the attempt limiter
 //! must admit the attempt. Argon2id then runs outside the state lock, with
 //! the vault taken out as an unlock takes it, one proof at a time.
@@ -96,8 +96,8 @@ pub(crate) fn refuse_unless_prover(
 }
 
 /// Refuses `approver` for pending request `id` when it shares a session
-/// or a terminal with the requester's chain up to its root, for a
-/// requester that is not a terminal subject
+/// or a terminal with the requester's chain up to its root or its nearest
+/// agent, for a requester that is not a terminal subject
 /// ([`SubjectEvidence::approval_refusal`]): approval input is never read
 /// from the requester's terminal (gate 23). Audited with the reason
 /// `requester_terminal`. Nothing is refused for a request that does not
