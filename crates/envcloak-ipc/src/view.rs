@@ -868,23 +868,52 @@ pub struct CheckBindingView {
 pub struct CheckReport {
     /// The manifest, when one was found.
     pub manifest: Option<String>,
-    /// The daemon's answer; `None` when it could not be asked.
+    /// The daemon's answer; `None` when it could not be asked, or when
+    /// there was nothing to ask ([`CheckReport::NOTHING_SENT`]).
     pub references: Option<CheckView>,
-    /// Why the references were not checked: an error token.
+    /// Why the references were not checked: the error token of the
+    /// connection or the daemon, or [`CheckReport::NOTHING_SENT`].
     pub unchecked: Option<String>,
+    /// The env files read, at most `MAX_ENV_FILES` (64), in name order.
     pub env_files: Vec<EnvFileView>,
+    /// Env files past that bound, which were not read: their plaintext
+    /// keys and references are unknown.
+    pub env_files_skipped: u64,
 }
 
 impl CheckReport {
-    /// Whether everything checked out: every reference resolves, nothing
-    /// went unchecked, and no env file holds a key-shaped value or could
-    /// not be read.
+    /// The `unchecked` token when nothing was sent to the daemon: no
+    /// manifest, and no reference in any env file.
+    pub const NOTHING_SENT: &'static str = "no_manifest";
+
+    /// Whether everything checked out (docs/MANIFEST.md): every reference
+    /// sent to the daemon resolves (none went unchecked, and a manifest's
+    /// bindings all resolve), no env file holds a key-shaped value, and
+    /// every env file was read, none left past the bound. With nothing to
+    /// send there is nothing unresolved; [`CheckReport::NOTHING_SENT`]
+    /// beside an answer or an env file's reference is not that case.
     pub fn clean(&self) -> bool {
-        self.unchecked.is_none()
+        !self.references_unchecked()
             && self.references.as_ref().is_none_or(|r| {
                 r.bindings.iter().all(|b| b.status.is_ok()) && r.refs.iter().all(|s| s.is_ok())
             })
             && self.env_files.iter().all(EnvFileView::clean)
+            && self.env_files_skipped == 0
+    }
+
+    /// Whether references were to be sent and the daemon did not answer
+    /// for them: `unchecked` holds an error token, or
+    /// [`CheckReport::NOTHING_SENT`] beside an answer or an env file's
+    /// reference, which is not the nothing-to-send case it names.
+    pub fn references_unchecked(&self) -> bool {
+        match self.unchecked.as_deref() {
+            None => false,
+            Some(token) => {
+                token != Self::NOTHING_SENT
+                    || self.references.is_some()
+                    || self.env_files.iter().any(|f| !f.references.is_empty())
+            }
+        }
     }
 }
 

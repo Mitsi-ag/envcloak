@@ -7,7 +7,9 @@
 //!    manifest itself and answers, binding by binding, in `[env]` and in
 //!    each profile, whether the vault has the item and field.
 //! 2. The project's env files (`.env` and `.env.*` in the manifest's
-//!    directory, or the working directory without one) are read here, as
+//!    directory, or the working directory without one; the first
+//!    [`MAX_ENV_FILES`] by name, the rest counted as not read) are read
+//!    here, as
 //!    `run --env-file` reads one: through the directory's descriptor, never
 //!    following a symlink, never blocking on a FIFO, regular files of this
 //!    user of at most 1 MiB, into wiped buffers. Their `envcloak://`
@@ -17,10 +19,14 @@
 //!    reported by line, variable and provider. The values are wiped when
 //!    the file's parse is dropped.
 //!
-//! Exit 0 when everything checks out; otherwise the report says what, and
-//! the exit is 1 with `check_failed`. When the daemon cannot be asked (not
-//! running, the vault locked), the env files are still checked and the
-//! report says the references were not.
+//! Exit 0 when everything checks out (docs/MANIFEST.md: every reference
+//! sent resolves, no env file holds a plaintext key, and every env file
+//! was read, none left past the bound); otherwise the report says what,
+//! and the exit is 1 with `check_failed`. With no manifest and no
+//! reference in any env file nothing is sent to the daemon. When the
+//! daemon cannot be asked (not running, the vault locked), the env files
+//! are still checked, and the report says the references were not and
+//! why, never that they do not resolve.
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -82,14 +88,14 @@ fn check(json: bool) -> Result<ExitCode, Failure> {
         None => std::fs::canonicalize(".")
             .map_err(|_| Failure::new("io", "the working directory could not be read"))?,
     };
-    let mut files = scan(&dir);
+    let (mut files, env_files_skipped) = scan(&dir);
     // Every env-file reference, in file order, for the daemon.
     let mut sent = Vec::new();
     for (_, refs) in &files {
         sent.extend(refs.iter().cloned());
     }
     let answer = if manifest_text.is_none() && sent.is_empty() {
-        Err("no_manifest".to_owned())
+        Err(CheckReport::NOTHING_SENT.to_owned())
     } else {
         connect()
             .and_then(|mut c| {
@@ -115,12 +121,9 @@ fn check(json: bool) -> Result<ExitCode, Failure> {
     let report = CheckReport {
         manifest: manifest_text,
         references,
-        unchecked: if manifest.is_none() {
-            Some("no_manifest".to_owned())
-        } else {
-            unchecked
-        },
+        unchecked,
         env_files: files.into_iter().map(|(v, _)| v).collect(),
+        env_files_skipped,
     };
     print(&report, json);
     if report.clean() {
@@ -133,15 +136,17 @@ fn check(json: bool) -> Result<ExitCode, Failure> {
     }
 }
 
-/// Reads every env file in `dir`: each file's view, and the references
-/// it holds as `NAME=<slug>[#field]` for the daemon.
-fn scan(dir: &Path) -> Vec<(EnvFileView, Vec<String>)> {
+/// Reads the env files in `dir`, the first [`MAX_ENV_FILES`] by name:
+/// each file's view, and the references it holds as
+/// `NAME=<slug>[#field]` for the daemon. Also returns how many env files
+/// there were past the bound, which were not read.
+fn scan(dir: &Path) -> (Vec<(EnvFileView, Vec<String>)>, u64) {
     let Ok(handle) = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(dir)
     else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
@@ -149,11 +154,13 @@ fn scan(dir: &Path) -> Vec<(EnvFileView, Vec<String>)> {
             .map(|e| e.file_name())
             .filter(|n| is_env_file(n))
             .collect(),
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), 0),
     };
     names.sort();
+    let skipped = u64::try_from(names.len().saturating_sub(MAX_ENV_FILES)).unwrap_or(u64::MAX);
     names.truncate(MAX_ENV_FILES);
-    names.iter().map(|name| read_one(&handle, name)).collect()
+    let read = names.iter().map(|name| read_one(&handle, name)).collect();
+    (read, skipped)
 }
 
 fn view(name: &OsStr, state: EnvFileState) -> EnvFileView {
@@ -288,7 +295,8 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let found = scan(dir);
+        let (found, skipped) = scan(dir);
+        assert_eq!(skipped, 0);
         let by_name = |n: &str| {
             found
                 .iter()
