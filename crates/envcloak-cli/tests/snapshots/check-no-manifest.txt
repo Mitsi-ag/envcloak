@@ -1,7 +1,6 @@
 exit: 0
 --- stdout
 manifest: none in this directory or above it
-references: none
 env files:
   .env: no key-shaped values
     line 1: ok       OPENAI_API_KEY = envcloak://openai/acme-web

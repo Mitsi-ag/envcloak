@@ -619,8 +619,14 @@ impl Render for CheckReport {
         }
         match (&self.references, &self.unchecked) {
             (Some(r), _) => {
+                // The header is the manifest's bindings: with no manifest
+                // there are none to list, and "none" would read as no
+                // reference at all above an env file's checked ones
+                // (review R-16).
                 if r.bindings.is_empty() {
-                    let _ = writeln!(o, "references: none");
+                    if self.manifest.is_some() {
+                        let _ = writeln!(o, "references: none");
+                    }
                 } else {
                     let _ = writeln!(o, "references:");
                 }
@@ -1616,10 +1622,11 @@ result: the references were not checked
             env_scan_error: None,
         };
         assert!(no_manifest.clean());
+        // Review R-16: no "references: none" there, which would read as
+        // no reference at all above the env file's checked one.
         snap(
             no_manifest.human(),
             r#"manifest: none in this directory or above it
-references: none
 env files:
   .env: no key-shaped values
     line 3: ok       OPENAI_API_KEY = envcloak://openai/acme-web
@@ -1677,7 +1684,6 @@ result: the env-file check is incomplete: the project directory could not be lis
         snap(
             broke_off.human(),
             r#"manifest: none in this directory or above it
-references: none
 env files:
   .env: no key-shaped values
     line 3: ok       OPENAI_API_KEY = envcloak://openai/acme-web
