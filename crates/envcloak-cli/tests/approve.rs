@@ -651,6 +651,43 @@ fn forged_approvals_approve_nothing() {
     f.sweep();
 }
 
+/// Review T9 open 5 (gate 23: a missing passphrase fails): `envcloak
+/// approve --passphrase-fd` whose descriptor gives an empty line, or
+/// nothing at all, is refused (`no_input`) before anything is sent: the
+/// daemon counts no attempt and grants nothing, and the request stays
+/// pending until a person approves it with the passphrase.
+#[test]
+fn an_empty_passphrase_line_sends_nothing() {
+    let f = Fixture::new();
+    let mut agent = f.agent();
+    let out = agent.run(&["--", "./emit"]);
+    let id = request_id(&stderr(&out));
+    let empty_line = secret_file(f.files.path(), "empty-line", b"");
+    let nothing = f.files.path().join("nothing");
+    std::fs::write(&nothing, b"").unwrap();
+    for input in [&empty_line, &nothing] {
+        let out = f.person(&["approve", &id, "--passphrase-fd", "3"], input);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert!(
+            stderr(&out).starts_with("envcloak: no_input:"),
+            "{}",
+            stderr(&out)
+        );
+        let status = stdout(&run(&f.home, &["status"], &[]));
+        assert!(
+            status.contains("grants: 0 in force, 1 waiting for approval"),
+            "{status}"
+        );
+        assert!(!status.contains("failed passphrase attempts"), "{status}");
+    }
+    let log = f.d.log();
+    assert!(!log.contains("approve failed"), "{log}");
+    let shown = f.approve(&id, &[]);
+    assert!(shown.contains("Approved request"), "{shown}");
+    drop(agent);
+    f.sweep();
+}
+
 /// Gate 23: a proof needs a terminal session. The same person's command
 /// without a controlling terminal, as a program that left an agent's
 /// tree runs it (forked out and `setsid`; a service manager's job below),
