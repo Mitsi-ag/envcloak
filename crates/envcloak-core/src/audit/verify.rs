@@ -131,12 +131,14 @@ pub struct VerifyReport {
     /// The last segment ends in what a crash in the middle of an append
     /// leaves: part of one entry, or of a new segment's header. These bytes
     /// are counted as that only when the segment checked out up to them,
-    /// no whole entry is in them (the expected one ending at the end of the
-    /// file or where the next entry's number starts, or any other one
-    /// further on under the number it carries, whatever that is), every
-    /// offset where one could be was checked within a fixed limit, and the
-    /// saved head does not cover them; anything else is flagged as a
-    /// problem. The writer removes them when it next opens the log.
+    /// the number in their frame head, as far as it is there, is the one
+    /// the next entry takes, no whole entry is in them (the expected one
+    /// ending at the end of the file or where the next entry's number
+    /// starts, or any other one further on under the number it carries,
+    /// whatever that is), every offset where one could be was checked
+    /// within a fixed limit, and the saved head does not cover them;
+    /// anything else is flagged as a problem. The writer removes them when
+    /// it next opens the log.
     pub torn_tail: bool,
     /// How many bytes that is.
     pub torn_bytes: u64,
@@ -288,6 +290,13 @@ impl Walker<'_> {
     /// while the segment has checked out up to `rest`, so the number and
     /// chain value the walk expects are the ones the writer used.
     ///
+    /// A crash leaves the start of the frame the writer was appending, and
+    /// that frame carries the expected number. So a frame head whose
+    /// number, as far as it is in `rest`, is not the start of that number
+    /// is not a crash's (an entry further on, its length stretched past
+    /// the end after the entries between were deleted, say). It is kept as
+    /// damage, however short.
+    ///
     /// A crash leaves part of one frame and nothing after it. So a whole
     /// entry in `rest` means its bytes were changed: the expected entry
     /// with its length changed (its chain value checks out where it really
@@ -307,6 +316,11 @@ impl Walker<'_> {
         let seq = self.expected;
         if self.anchored(seq) {
             return false;
+        }
+        if let Some(stored) = rest[..rest.len().min(FRAME_HEAD)].get(4..) {
+            if !seq.to_be_bytes().starts_with(stored) {
+                return false;
+            }
         }
         let min = FRAME_HEAD + Sealed::OVERHEAD + MAC_LEN;
         if rest.len() < min {
