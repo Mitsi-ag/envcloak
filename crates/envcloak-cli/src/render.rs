@@ -32,6 +32,8 @@ use envcloak_ipc::view::{
 };
 use envcloak_policy::{escape_for_display, value_shaped};
 
+use crate::cmd::check::MAX_ENV_FILES;
+
 /// What a command prints: text for a person, or JSON. Implemented only for
 /// `envcloak_ipc::view` types.
 pub trait Render: View {
@@ -536,7 +538,10 @@ fn env_file_state(f: &EnvFileView) -> String {
 impl Render for CheckReport {
     fn human(&self) -> String {
         let mut o = String::new();
+        // References the daemon answered do not resolve, and references
+        // it was not asked about: two different things to say.
         let mut missing = 0u64;
+        let mut not_checked = 0u64;
         match &self.manifest {
             Some(m) => {
                 let name = self
@@ -609,6 +614,9 @@ impl Render for CheckReport {
                 };
                 if r.status.is_ok() {
                     let _ = writeln!(o, "    line {}: ok       {binding}", r.line);
+                } else if r.status == RefStatus::Unchecked {
+                    not_checked += 1;
+                    let _ = writeln!(o, "    line {}: not checked  {binding}", r.line);
                 } else {
                     missing += 1;
                     let _ = writeln!(
@@ -619,6 +627,17 @@ impl Render for CheckReport {
                     );
                 }
             }
+        }
+        if self.env_files_skipped > 0 {
+            let _ = writeln!(
+                o,
+                "  {} not read: at most {MAX_ENV_FILES} are checked, the first by name",
+                plural(
+                    self.env_files_skipped,
+                    "more env file was",
+                    "more env files were"
+                )
+            );
         }
         if self.clean() {
             let _ = writeln!(o, "result: ok");
@@ -638,17 +657,26 @@ impl Render for CheckReport {
                     plural(plaintext, "plaintext key", "plaintext keys")
                 ));
             }
-            if self.unchecked.is_some() {
+            if self.references_unchecked() {
                 parts.push("the references were not checked".to_owned());
+            } else if not_checked > 0 {
+                parts.push(plural(
+                    not_checked,
+                    "reference was not checked",
+                    "references were not checked",
+                ));
             }
             let unread = self
                 .env_files
                 .iter()
                 .filter(|f| f.state != EnvFileState::Read)
                 .count();
+            let unread = u64::try_from(unread)
+                .unwrap_or(u64::MAX)
+                .saturating_add(self.env_files_skipped);
             if unread > 0 {
                 parts.push(plural(
-                    u64::try_from(unread).unwrap_or(u64::MAX),
+                    unread,
                     "env file was not read",
                     "env files were not read",
                 ));
@@ -1381,6 +1409,7 @@ Reference it in a project with: envcloak ref OPENAI_API_KEY=openai
                     references: vec![],
                 },
             ],
+            env_files_skipped: 0,
         };
         snap(
             check.human(),
@@ -1399,7 +1428,7 @@ result: 2 references do not resolve; 1 plaintext key in env files: move them int
         );
         snap(
             check.json().to_string(),
-            r#"{"env_files":[{"error":null,"error_line":null,"file":".env","plaintext":[{"env_name":"GITHUB_TOKEN","line":2,"provider":"github"}],"references":[{"env_name":"OPENAI_API_KEY","line":3,"reference":"openai/acme-web","status":"ok"}],"state":"read"},{"error":null,"error_line":null,"file":".env.link","plaintext":[],"references":[],"state":"symlink"}],"manifest":"/src/acme-web/envcloak.toml","references":{"bindings":[{"env_name":"OPENAI_API_KEY","profile":null,"reference":"openai/acme-web","status":"ok"},{"env_name":"SHORT_TOKEN","profile":"short","reference":"short/acme-web","status":"unknown_item"},{"env_name":null,"profile":null,"reference":null,"status":"looks_like_value"}],"project_dir":"/src/acme-web","project_name":"acme-web","refs":["ok"]},"unchecked":null}"#,
+            r#"{"env_files":[{"error":null,"error_line":null,"file":".env","plaintext":[{"env_name":"GITHUB_TOKEN","line":2,"provider":"github"}],"references":[{"env_name":"OPENAI_API_KEY","line":3,"reference":"openai/acme-web","status":"ok"}],"state":"read"},{"error":null,"error_line":null,"file":".env.link","plaintext":[],"references":[],"state":"symlink"}],"env_files_skipped":0,"manifest":"/src/acme-web/envcloak.toml","references":{"bindings":[{"env_name":"OPENAI_API_KEY","profile":null,"reference":"openai/acme-web","status":"ok"},{"env_name":"SHORT_TOKEN","profile":"short","reference":"short/acme-web","status":"unknown_item"},{"env_name":null,"profile":null,"reference":null,"status":"looks_like_value"}],"project_dir":"/src/acme-web","project_name":"acme-web","refs":["ok"]},"unchecked":null}"#,
         );
         let clean = CheckReport {
             references: Some(CheckView {
@@ -1423,7 +1452,7 @@ result: ok
             references: None,
             unchecked: Some("vault_locked".into()),
             env_files: vec![],
-            ..check
+            ..check.clone()
         };
         snap(
             unchecked.human(),
@@ -1432,6 +1461,98 @@ references: not checked: the vault is locked; run `envcloak unlock`
 env files: none
 result: the references were not checked
 "#,
+        );
+        // Review T11 open 1: the env files' references were not checked,
+        // which is not the same as not resolving.
+        let env_refs = |status| EnvFileView {
+            file: ".env".into(),
+            state: EnvFileState::Read,
+            error_line: None,
+            error: None,
+            plaintext: vec![],
+            references: vec![EnvRefView {
+                line: 3,
+                env_name: Some("OPENAI_API_KEY".into()),
+                reference: Some("openai/acme-web".into()),
+                status,
+            }],
+        };
+        let locked = CheckReport {
+            env_files: vec![env_refs(RefStatus::Unchecked)],
+            ..unchecked.clone()
+        };
+        assert!(!locked.clean());
+        snap(
+            locked.human(),
+            r#"manifest: /src/acme-web/envcloak.toml
+references: not checked: the vault is locked; run `envcloak unlock`
+env files:
+  .env: no key-shaped values
+    line 3: not checked  OPENAI_API_KEY = envcloak://openai/acme-web
+result: the references were not checked
+"#,
+        );
+        // No manifest: the env files' references were sent, and resolve.
+        let no_manifest = CheckReport {
+            manifest: None,
+            references: Some(CheckView {
+                project_dir: None,
+                project_name: None,
+                bindings: vec![],
+                refs: vec![RefStatus::Ok],
+            }),
+            unchecked: None,
+            env_files: vec![env_refs(RefStatus::Ok)],
+            env_files_skipped: 0,
+        };
+        assert!(no_manifest.clean());
+        snap(
+            no_manifest.human(),
+            r#"manifest: none in this directory or above it
+references: none
+env files:
+  .env: no key-shaped values
+    line 3: ok       OPENAI_API_KEY = envcloak://openai/acme-web
+result: ok
+"#,
+        );
+        // Nothing to send: no manifest, no reference.
+        let nothing = CheckReport {
+            manifest: None,
+            references: None,
+            unchecked: Some(CheckReport::NOTHING_SENT.into()),
+            env_files: vec![],
+            env_files_skipped: 0,
+        };
+        assert!(nothing.clean());
+        // F-48: env files past the bound were not read.
+        let over = CheckReport {
+            env_files_skipped: 2,
+            ..nothing.clone()
+        };
+        assert!(!over.clean());
+        snap(
+            over.human(),
+            r#"manifest: none in this directory or above it
+references: not checked: there is no envcloak.toml
+env files: none
+  2 more env files were not read: at most 64 are checked, the first by name
+result: 2 env files were not read
+"#,
+        );
+        assert_eq!(over.json()["env_files_skipped"], 2);
+        // A daemon that answered for fewer references than were sent.
+        let short_answer = CheckReport {
+            env_files: vec![env_refs(RefStatus::Unchecked)],
+            ..no_manifest
+        };
+        assert!(!short_answer.clean());
+        assert!(
+            short_answer
+                .human()
+                .ends_with("result: 1 reference was not checked\n"),
+            "{}",
+            short_answer.human()
         );
         let edit = RefEditView {
             manifest: "/src/acme-web/envcloak.toml".into(),
@@ -1628,6 +1749,7 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
                     references: vec![],
                 },
             ],
+            env_files_skipped: 0,
         }
     }
 
@@ -1668,6 +1790,7 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
             }),
             unchecked: None,
             env_files: vec![],
+            env_files_skipped: 0,
         };
         assert!(
             check

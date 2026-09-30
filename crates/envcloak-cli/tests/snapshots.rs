@@ -1,6 +1,7 @@
 //! Every M1 command's output, as a person and an agent see it, against a
 //! value-free snapshot (T11 acceptance): `vault create`, `unlock`,
-//! `status`, `ls`, `show`, `check`, `ref`, `add`, `run`'s refusal,
+//! `status`, `ls`, `show`, `check` (with and without a manifest, and on a
+//! locked vault), `ref`, `add`, `run`'s refusal,
 //! `approve`, `grants list`, `rotate`, `rm`, `deny`, `grants revoke`,
 //! `audit verify`, `backup create`, `recover` and `lock`, in one story on
 //! the fixture vault. The
@@ -161,8 +162,13 @@ impl Story {
 
     /// `envcloak <args>` in the project, as an agent runs it: no terminal.
     fn agent(&self, args: &[&str], fds: &[common::Fd<'_>]) -> Output {
+        self.agent_in(&self.project, args, fds)
+    }
+
+    /// `envcloak <args>` in `dir`, as an agent runs it.
+    fn agent_in(&self, dir: &Path, args: &[&str], fds: &[common::Fd<'_>]) -> Output {
         let mut cmd = cli_command(&self.home, args, fds);
-        cmd.current_dir(&self.project);
+        cmd.current_dir(dir);
         finish_within(cmd, std::time::Duration::from_secs(60))
     }
 
@@ -289,6 +295,16 @@ fn every_command_prints_its_value_free_snapshot() {
     );
     s.snap("check", &s.agent(&["check"], &[]));
     s.snap("check-json", &s.agent(&["check", "--json"], &[]));
+    // No manifest in this directory or above it: the env file's references
+    // are sent on their own, resolve, and the check passes.
+    let loose = s.home.root().join("loose");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::write(
+        loose.join(".env"),
+        "OPENAI_API_KEY=envcloak://openai/acme-web\nPORT=8080\n",
+    )
+    .unwrap();
+    s.snap("check-no-manifest", &s.agent_in(&loose, &["check"], &[]));
     // The plaintext key was put there for `check` to find; the sweep at the
     // end is about what EnvCloak wrote.
     std::fs::remove_file(s.project.join(".env")).unwrap();
@@ -412,6 +428,15 @@ fn every_command_prints_its_value_free_snapshot() {
     s.snap("lock", &s.agent(&["lock"], &[]));
     s.snap("status-after-lock", &s.agent(&["status"], &[]));
     s.snap("check-locked", &s.agent(&["check"], &[]));
+    // The env file's references were not checked, which is not the same
+    // as not resolving.
+    std::fs::write(
+        s.project.join(".env"),
+        "OPENAI_API_KEY=envcloak://openai/acme-web\nPORT=8080\n",
+    )
+    .unwrap();
+    s.snap("check-locked-env-refs", &s.agent(&["check"], &[]));
+    std::fs::remove_file(s.project.join(".env")).unwrap();
 
     assert_no_canary(&d.log_bytes(), &s.cs);
     s.home.assert_clean(&s.cs);
