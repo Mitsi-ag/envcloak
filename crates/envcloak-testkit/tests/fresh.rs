@@ -1,10 +1,12 @@
 //! `stale_source` (group 3 verification, G3-V2) against a fixture
 //! workspace that cargo really builds, shaped like this one: a daemon and
 //! a CLI binary over a core library, over a system library with a test
-//! feature, and a library neither uses. A scoped build of the CLI after a
-//! change to a library the daemon uses leaves the daemon as it was; the
-//! check names the changed file until the daemon is built again, and
-//! ignores changes the daemon is not built from.
+//! feature, a test-support library the daemon's tests use (as envcloakd's
+//! use envcloak-testkit), and a library neither uses. A scoped build of
+//! the CLI after a change to a library the daemon uses, or to a setting
+//! it is built with, leaves the daemon as it was; the check names the
+//! changed file until the daemon is built again, and ignores changes the
+//! daemon is not built from or with.
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -61,19 +63,24 @@ fn fixture() -> (TestHome, PathBuf) {
         "#[cfg(feature = \"testing\")]\npub mod testing;\npub fn sys() -> u32 {\n    1\n}\n",
     );
     write(&ws, "crates/sys/src/testing.rs", "pub fn hook() {}\n");
-    // The system library only for Unix targets, as a target table.
+    // The system library only for Unix targets, as a target table, and
+    // features that change what the core library computes: turning one on
+    // changes the daemon with no source file changing (Codex F-66).
     write(
         &ws,
         "crates/core/Cargo.toml",
         &format!(
-            "{}\n[target.'cfg(unix)'.dependencies]\nfx-sys = {{ path = \"../sys\" }}\n",
+            "{}\n[features]\nextra = []\nmore = []\n\n\
+             [target.'cfg(unix)'.dependencies]\nfx-sys = {{ path = \"../sys\" }}\n",
             package("fx-core")
         ),
     );
     write(
         &ws,
         "crates/core/src/lib.rs",
-        "#[cfg(test)]\nmod tests;\npub fn core() -> u32 {\n    fx_sys::sys() + 1\n}\n",
+        "#[cfg(test)]\nmod tests;\npub fn core() -> u32 {\n    \
+         fx_sys::sys() + 1 + if cfg!(feature = \"extra\") { 10 } else { 0 }\n    \
+         + if cfg!(feature = \"more\") { 100 } else { 0 }\n}\n",
     );
     write(&ws, "crates/core/src/tests.rs", "#[test]\nfn t() {}\n");
     // The daemon: a workspace dependency, and the test feature of the
@@ -83,7 +90,8 @@ fn fixture() -> (TestHome, PathBuf) {
         "crates/daemon/Cargo.toml",
         &format!(
             "{}\n[dependencies]\nfx-core.workspace = true\n\n\
-             [dev-dependencies]\nfx-sys = {{ path = \"../sys\", features = [\"testing\"] }}\n",
+             [dev-dependencies]\nfx-sys = {{ path = \"../sys\", features = [\"testing\"] }}\n\
+             fx-tk = {{ path = \"../tk\" }}\n",
             package("fxd")
         ),
     );
@@ -116,6 +124,18 @@ fn fixture() -> (TestHome, PathBuf) {
             &format!("#[test]\nfn runs() {{\n    let _ = env!(\"CARGO_BIN_EXE_{bin}\");\n}}\n"),
         );
     }
+    // The test-support library: a dev-dependency of the daemon, which
+    // links nothing of it into the binary but builds it with its features.
+    write(
+        &ws,
+        "crates/tk/Cargo.toml",
+        &format!(
+            "{}\n[dependencies]\nfx-core = {{ path = \"../core\" }}\n\
+             fx-sys = {{ path = \"../sys\", features = [\"testing\"] }}\n",
+            package("fx-tk")
+        ),
+    );
+    write(&ws, "crates/tk/src/lib.rs", "pub fn tk() {}\n");
     write(&ws, "crates/other/Cargo.toml", &package("fx-other"));
     write(&ws, "crates/other/src/lib.rs", "pub fn other() {}\n");
     (t, ws)
@@ -133,7 +153,20 @@ fn edit_with(ws: &Path, rel: &str, more: &str, bin: &Path) {
     let path = ws.join(rel);
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str(more);
+    replace(ws, rel, &text, bin);
+}
+
+/// Writes `text` to `rel`, its modification time after `bin`'s, as
+/// [`edit`] does.
+fn replace(ws: &Path, rel: &str, text: &str, bin: &Path) {
+    let path = ws.join(rel);
     std::fs::write(&path, text).unwrap();
+    touch(ws, rel, bin);
+}
+
+/// Gives `rel` a modification time after `bin`'s, its bytes unchanged.
+fn touch(ws: &Path, rel: &str, bin: &Path) {
+    let path = ws.join(rel);
     let after = std::fs::metadata(bin).unwrap().modified().unwrap() + Duration::from_millis(10);
     let at = SystemTime::now().max(after);
     std::fs::File::options()
@@ -198,19 +231,100 @@ fn a_binary_older_than_a_source_it_is_built_from_is_named() {
     }
     assert_eq!(stale(&fx, "fx"), None);
 
-    // What it does not read (review R-2, as CONTRIBUTING says): a
-    // manifest. A feature declared in the core library's manifest makes
-    // cargo rebuild the core library, and the daemon when it is built
-    // next, but no source file changed, so nothing is named. A check that
-    // also read manifests would change this, and CONTRIBUTING with it.
-    edit_with(
-        &ws,
-        "crates/core/Cargo.toml",
-        "\n[features]\nextra = []\n",
-        &fxd,
+    // Codex F-66: what it is built with. The daemon's manifest turns on
+    // the core library's feature, no Rust file changed: the daemon cargo
+    // built before prints what it did, and a scoped build of the CLI
+    // leaves it so; the check names the manifest until the daemon is
+    // built again, which then prints what the feature makes it print.
+    let runs = |bin: &Path| {
+        let out = Command::new(bin).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(runs(&fxd), "2\n");
+    let daemon = "crates/daemon/Cargo.toml";
+    let text = std::fs::read_to_string(ws.join(daemon)).unwrap();
+    let on = text.replace(
+        "fx-core.workspace = true",
+        "fx-core = { workspace = true, features = [\"extra\"] }",
     );
+    assert_ne!(on, text);
+    replace(&ws, daemon, &on, &fxd);
+    assert_eq!(stale(&fxd, "fxd"), named(daemon));
     cargo(&ws, &["test", "-p", "fx", "--no-run"]);
-    assert_eq!(stale(&fxd, "fxd"), None, "a manifest alone");
+    assert_eq!(stale(&fxd, "fxd"), named(daemon), "after a scoped build");
+    assert_eq!(runs(&fxd), "2\n", "the old build, which a test would run");
+    cargo(&ws, &["test", "-p", "fxd", "--no-run"]);
+    assert_eq!(stale(&fxd, "fxd"), None, "rebuilt");
+    assert_eq!(runs(&fxd), "12\n", "rebuilt with the feature");
+    assert_eq!(stale(&fx, "fx"), None);
+
+    // The test-support library, a dev-dependency, turns on another
+    // feature of the core library: the daemon's tests' build unifies it
+    // into the daemon, which links nothing of that library.
+    let tk = "crates/tk/Cargo.toml";
+    let text = std::fs::read_to_string(ws.join(tk)).unwrap();
+    let on = text.replace(
+        "fx-core = { path = \"../core\" }",
+        "fx-core = { path = \"../core\", features = [\"more\"] }",
+    );
+    assert_ne!(on, text);
+    replace(&ws, tk, &on, &fxd);
+    assert_eq!(stale(&fxd, "fxd"), named(tk));
+    cargo(&ws, &["test", "-p", "fx", "--no-run"]);
+    assert_eq!(stale(&fxd, "fxd"), named(tk), "after a scoped build");
+    assert_eq!(runs(&fxd), "12\n", "the old build");
+    cargo(&ws, &["test", "-p", "fxd", "--no-run"]);
+    assert_eq!(stale(&fxd, "fxd"), None, "rebuilt");
+    assert_eq!(runs(&fxd), "112\n", "rebuilt with the feature");
+
+    // The other settings it is built with: a library's manifest it links
+    // (a feature declared) and the workspace's (a profile setting); each
+    // is named until the daemon is built again.
+    for (rel, more) in [
+        ("crates/sys/Cargo.toml", "more = []\n"),
+        ("Cargo.toml", "\n[profile.dev]\noverflow-checks = false\n"),
+    ] {
+        edit_with(&ws, rel, more, &fxd);
+        assert_eq!(stale(&fxd, "fxd"), named(rel), "{rel}");
+        cargo(&ws, &["test", "-p", "fx", "--no-run"]);
+        assert_eq!(
+            stale(&fxd, "fxd"),
+            named(rel),
+            "{rel}, after a scoped build"
+        );
+        cargo(&ws, &["test", "-p", "fxd", "--no-run"]);
+        assert_eq!(stale(&fxd, "fxd"), None, "{rel}, rebuilt");
+    }
+
+    // What it is not built with: the CLI's and the unused library's
+    // manifests, and the test-support library's source.
+    for rel in [
+        "crates/cli/Cargo.toml",
+        "crates/other/Cargo.toml",
+        "crates/tk/src/lib.rs",
+    ] {
+        let more = if rel.ends_with(".rs") {
+            "// changed\n"
+        } else {
+            "# changed\n"
+        };
+        edit_with(&ws, rel, more, &fxd);
+        cargo(&ws, &["test", "-p", "fx", "--no-run"]);
+        assert_eq!(stale(&fxd, "fxd"), None, "{rel}");
+    }
+
+    // The cost of refusing (review R-2): a setting changed in a way cargo
+    // rebuilds nothing for, here Cargo.lock with its bytes unchanged,
+    // leaves the daemon older than it, so it is still named after the
+    // daemon's own build, until `cargo clean -p fxd` makes the next build
+    // link it again, as the refusal says.
+    touch(&ws, "Cargo.lock", &fxd);
+    cargo(&ws, &["test", "-p", "fxd", "--no-run"]);
+    assert_eq!(stale(&fxd, "fxd"), named("Cargo.lock"), "nothing rebuilt");
+    cargo(&ws, &["clean", "-p", "fxd"]);
+    cargo(&ws, &["test", "-p", "fxd", "--no-run"]);
+    assert_eq!(stale(&fxd, "fxd"), None, "cleaned and rebuilt");
 
     // Nothing says a binary is fresh when its build cannot be found: a
     // copy outside the target directory, one cargo did not build there, a
