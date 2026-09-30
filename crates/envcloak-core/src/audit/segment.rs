@@ -511,8 +511,9 @@ impl AuditWriter {
             } else if last.torn && last.clean && last.good_len < last.len {
                 // Part of one frame, as a crash in the middle of an append
                 // leaves it (the walk checked that the segment is clean up
-                // to it, that no whole entry is in it and that the saved
-                // head does not cover it): remove it, whether or not the
+                // to it, that it carries the number the next entry takes,
+                // that no whole entry is in it and that the saved head
+                // does not cover it): remove it, whether or not the
                 // writer continues this segment. Anything else is damage,
                 // left as it is for the check to report.
                 let f = open_append(&last.path)?;

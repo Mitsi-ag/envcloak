@@ -671,21 +671,22 @@ fn a_deleted_or_damaged_segment_is_flagged() {
     );
 }
 
-/// A crash in the middle of a write leaves a torn last entry. It was never
-/// acknowledged: the check reports it without flagging the log, and the
-/// writer removes it and goes on.
+/// A crash in the middle of a write leaves a torn last entry: the first
+/// bytes of the frame the writer was appending, entry 4's, which carries
+/// its number. It was never acknowledged: the check reports it without
+/// flagging the log, and the writer removes it and goes on.
 #[test]
 fn the_writer_removes_a_torn_entry_and_goes_on() {
     let log = Log::new();
     let mut w = log.writer(None);
-    fill(&mut w, 1, 3);
+    fill(&mut w, 1, 4);
     drop(w);
     let seg = log.segments().pop().unwrap();
     let mut bytes = std::fs::read(&seg).unwrap();
-    let whole = bytes.len();
-    let (_, last) = frames(&bytes)[2].clone();
-    let copy = bytes[last.start..last.start + 40].to_vec();
-    bytes.extend_from_slice(&copy);
+    let (seq, fourth) = frames(&bytes)[3].clone();
+    assert_eq!(seq, 4);
+    let whole = fourth.start;
+    bytes.truncate(fourth.start + 40);
     std::fs::write(&seg, &bytes).unwrap();
     let r = log.verify(None);
     assert!(r.ok(), "{r:?}");
@@ -1253,6 +1254,112 @@ fn bytes_after_damage_or_before_a_whole_entry_are_not_a_torn_tail() {
     let (_, report) = AuditWriter::open(&log.dir, &log.keys, Some(first)).unwrap();
     assert!(report.torn_tail_removed && !report.damaged, "{report:?}");
     assert_eq!(std::fs::read(&seg).unwrap(), &orig[..fr[9].1.start]);
+}
+
+/// Group 3 verification (G3-V1): a crash leaves the start of the frame the
+/// writer was appending, and that frame carries the number the walk
+/// expects. Bytes whose frame head carries another number are not a
+/// crash's, whatever else is in them. With entries 2 to 9 deleted, entry
+/// 10 whole but for its length, stretched past the end (with or without
+/// bytes after it), was taken for entry 2 cut short: it opens nowhere
+/// entry 2 could end, so the check passed and the writer removed an entry
+/// that opens under its own number. The same holds for no more than entry
+/// 10's frame head. Each is flagged where entry 2 should be and kept, with
+/// or without a saved head before it; the deletion alone is flagged there
+/// too, and the start of a real entry 2, cut anywhere, is still a torn
+/// tail.
+#[test]
+fn a_torn_frame_under_another_number_is_kept_as_damage() {
+    let log = Log::new();
+    let mut w = log.writer(None);
+    fill(&mut w, 1, 1);
+    let first = w.head_record();
+    fill(&mut w, 2, 9);
+    drop(w);
+    let seg = log.segments().pop().unwrap();
+    let orig = std::fs::read(&seg).unwrap();
+    let fr = frames(&orig);
+    assert_eq!((fr[1].0, fr[9].0), (2, 10));
+    let reset = |bytes: &[u8]| {
+        for s in log.segments() {
+            std::fs::remove_file(s).unwrap();
+        }
+        std::fs::write(&seg, bytes).unwrap();
+    };
+    let one = &orig[..fr[0].1.end];
+    let mut ten = orig[fr[9].1.clone()].to_vec();
+    ten[..4].copy_from_slice(&u32::try_from(MAX_ENTRY).unwrap().to_be_bytes());
+
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    for (what, after) in [("", 0), (", then 50 bytes 0xff", 50)] {
+        let mut b = one.to_vec();
+        b.extend_from_slice(&ten);
+        b.resize(b.len() + after, 0xff);
+        cases.push((
+            format!("entries 2 to 9 deleted, entry 10 stretched past the end{what}"),
+            b,
+        ));
+    }
+    for keep in [12, 40, 84, 200] {
+        let mut b = one.to_vec();
+        b.extend_from_slice(&ten[..keep]);
+        cases.push((
+            format!("entries 2 to 9 deleted, {keep} bytes of entry 10 left"),
+            b,
+        ));
+    }
+    for (what, bytes) in &cases {
+        for anchor in [None, Some(first)] {
+            reset(bytes);
+            let r = log.verify(anchor);
+            assert_eq!(
+                problem(&r),
+                Some((2, ProblemKind::Unreadable)),
+                "{what}, {anchor:?}: {r:?}"
+            );
+            assert!(!r.torn_tail && r.torn_bytes == 0, "{what}: {r:?}");
+            let (mut w, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+            assert!(
+                report.damaged && !report.torn_tail_removed && report.torn_bytes == 0,
+                "{what}, {anchor:?}: {report:?}"
+            );
+            assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{what}: kept");
+            w.append(&record(11)).unwrap();
+            assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{what}: still kept");
+            let r = log.verify(anchor);
+            assert_eq!(problem(&r), Some((2, ProblemKind::Unreadable)), "{what}");
+        }
+    }
+
+    // Controls. The deletion alone is flagged where entry 2 should be.
+    let mut gap = one.to_vec();
+    gap.extend_from_slice(&orig[fr[9].1.clone()]);
+    reset(&gap);
+    let r = log.verify(Some(first));
+    assert_eq!(problem(&r), Some((2, ProblemKind::Missing)), "{r:?}");
+    // Entry 2 cut anywhere, entries after it never written, is what a
+    // crash leaves: inside its length, inside its number, just after it,
+    // and further on.
+    let two = &orig[fr[1].1.clone()];
+    for keep in [1, 4, 7, 11, 12, 13, 84, two.len() - 1] {
+        let mut b = one.to_vec();
+        b.extend_from_slice(&two[..keep]);
+        for anchor in [None, Some(first)] {
+            reset(&b);
+            let r = log.verify(anchor);
+            assert!(r.ok() && r.torn_tail, "{keep} bytes, {anchor:?}: {r:?}");
+            assert_eq!(r.torn_bytes, keep as u64);
+            let (mut w, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+            assert!(
+                report.torn_tail_removed && !report.damaged,
+                "{keep} bytes, {anchor:?}: {report:?}"
+            );
+            assert_eq!(std::fs::read(&seg).unwrap(), one, "{keep} bytes");
+            assert_eq!(w.append(&record(2)).unwrap(), 2);
+            let r = log.verify(anchor);
+            assert!(r.ok() && !r.torn_tail, "{keep} bytes, {anchor:?}: {r:?}");
+        }
+    }
 }
 
 /// Codex F-46 follow-up: every framed candidate in bytes that look like a
