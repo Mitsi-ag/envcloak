@@ -219,15 +219,19 @@ fn dir_id(p: &Path) -> (u64, u64) {
 
 /// Gate 33, the flush half: every append writes its frame and flushes the
 /// segment before it returns, and the first also flushes the header and
-/// the directory. When the log's directory is missing (a new vault's first
-/// unlock, or the directory removed), the writer creates it and first
-/// flushes the data directory that names it (review T10 open 3); a failed
-/// flush of it fails the append, and the next one flushes it again. The
-/// flushes are `F_FULLFSYNC` on macOS and `fsync` on Linux, counted by
-/// envcloak-sys's shim.
+/// the directory. Before a writer's first append it flushes the data
+/// directory that names the log's directory, once per writer, whether or
+/// not it made the directory (review T10 open 3, Codex F-64): a new
+/// vault's directory was made by `ensure_dirs`, and an earlier writer may
+/// have made it and failed, or crashed, before its flush. A failed flush
+/// of it fails the append, and the next append, or the first of a writer
+/// opened again, flushes it again. The flushes are `F_FULLFSYNC` on macOS
+/// and `fsync` on Linux, counted by envcloak-sys's shim.
 #[test]
 fn every_append_is_flushed_before_it_returns() {
+    // A new vault's log: its directory is there, made with the vault.
     let log = Log::new();
+    let data = dir_id(log.dir.parent().unwrap());
     let shim = Shim::default();
     let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
     assert_eq!(shim.ops(), vec![], "opening writes nothing");
@@ -235,21 +239,25 @@ fn every_append_is_flushed_before_it_returns() {
     let before = envcloak_sys::testing::sync_counts();
     assert_eq!(w.append(&record(1)).unwrap(), 1);
     let first = shim.ops();
-    assert_eq!(first.len(), 5, "{first:?}");
-    assert_eq!(first[0], Op::Write(HEADER_LEN));
-    assert_eq!(&first[1..3], &[Op::SyncFile, Op::SyncDir]);
-    assert!(matches!(first[3], Op::Write(n) if n > 12 + 40 + 32));
-    assert_eq!(first[4], Op::SyncFile, "the frame is flushed last");
-    assert_eq!(shim.plan().synced_dirs, [dir_id(&log.dir)]);
+    assert_eq!(first.len(), 6, "{first:?}");
+    assert_eq!(first[0], Op::SyncDir, "the data directory, first");
+    assert_eq!(first[1], Op::Write(HEADER_LEN));
+    assert_eq!(&first[2..4], &[Op::SyncFile, Op::SyncDir]);
+    assert!(matches!(first[4], Op::Write(n) if n > 12 + 40 + 32));
+    assert_eq!(first[5], Op::SyncFile, "the frame is flushed last");
+    assert_eq!(
+        std::mem::take(&mut shim.plan().synced_dirs),
+        [data, dir_id(&log.dir)]
+    );
     let after = envcloak_sys::testing::sync_counts();
     let (full, plain) = (
         after.full_fsync - before.full_fsync,
         after.fsync - before.fsync,
     );
     if cfg!(target_os = "macos") {
-        assert_eq!((full, plain), (3, 0), "F_FULLFSYNC, never plain fsync");
+        assert_eq!((full, plain), (4, 0), "F_FULLFSYNC, never plain fsync");
     } else {
-        assert_eq!((full, plain), (0, 3));
+        assert_eq!((full, plain), (0, 4));
     }
 
     for i in 2..=4 {
@@ -266,6 +274,28 @@ fn every_append_is_flushed_before_it_returns() {
         );
     }
     assert_eq!(w.head().0, 4);
+    assert!(log.verify(None).ok());
+    assert!(shim.plan().synced_dirs.is_empty(), "only once");
+
+    // A writer opened again goes on in the same segment, and flushes the
+    // data directory before its first append all the same.
+    drop(w);
+    let shim = Shim::default();
+    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+    assert_eq!(w.append(&record(5)).unwrap(), 5);
+    let ops = shim.ops();
+    assert!(
+        matches!(ops[..], [Op::SyncDir, Op::Write(_), Op::SyncFile]),
+        "{ops:?}"
+    );
+    assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data]);
+    fill(&mut w, 6, 1);
+    let ops = shim.ops();
+    assert!(
+        matches!(ops[..], [Op::Write(_), Op::SyncFile]),
+        "only once: {ops:?}"
+    );
+    assert_eq!(log.segments().len(), 1);
     assert!(log.verify(None).ok());
 
     // A missing directory: created, then the data directory that names it
@@ -316,6 +346,51 @@ fn every_append_is_flushed_before_it_returns() {
     assert_eq!(ops.len(), 6, "{ops:?}");
     assert_eq!(ops[0], Op::SyncDir, "flushed again");
     assert!(log.verify(None).ok());
+}
+
+/// Codex F-64: a failed flush of the data directory, then the writer
+/// dropped and opened again. The log's directory is there now (the failed
+/// writer made it, or it was made with the vault), and the new writer
+/// still flushes the data directory before its first append; a new writer
+/// whose flush of it fails appends nothing either.
+#[test]
+fn a_writer_opened_again_after_a_failed_flush_flushes_the_data_directory() {
+    for dir_missing in [true, false] {
+        let log = Log::new();
+        let data = dir_id(log.dir.parent().unwrap());
+        if dir_missing {
+            std::fs::remove_dir(&log.dir).unwrap();
+        }
+        let shim = Shim::default();
+        let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+        shim.plan().fail_dir_sync = true;
+        assert!(w.append(&record(1)).is_err());
+        assert_eq!(shim.ops(), [Op::SyncDir]);
+        assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data]);
+        drop(w);
+        assert!(log.dir.is_dir() && log.segments().is_empty());
+
+        let shim = Shim::default();
+        let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+        shim.plan().fail_dir_sync = true;
+        assert!(w.append(&record(1)).is_err(), "missing {dir_missing}");
+        assert_eq!(shim.ops(), [Op::SyncDir]);
+        assert!(log.segments().is_empty());
+        drop(w);
+
+        let shim = Shim::default();
+        let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+        assert_eq!(w.append(&record(1)).unwrap(), 1);
+        let ops = shim.ops();
+        assert_eq!(ops.len(), 6, "missing {dir_missing}: {ops:?}");
+        assert_eq!(ops[0], Op::SyncDir, "flushed after the reopen");
+        assert_eq!(
+            shim.plan().synced_dirs,
+            [data, dir_id(&log.dir)],
+            "missing {dir_missing}"
+        );
+        assert!(log.verify(None).ok());
+    }
 }
 
 /// Gate 33, the failure half: a write that fails part way, or a flush that

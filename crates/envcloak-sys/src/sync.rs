@@ -10,7 +10,9 @@
 //!
 //! With the `testing` feature, each call is counted per thread
 //! ([`crate::testing::sync_counts`]), so a test can show which call a
-//! write path made and how often.
+//! write path made and how often; a test can also have the files it
+//! flushed named ([`crate::testing::record_syncs`]) and one call fail
+//! ([`crate::testing::fail_sync_after`]).
 
 use std::fs::File;
 use std::io;
@@ -35,12 +37,16 @@ pub enum SyncMethod {
 /// Any failure other than an unsupported `F_FULLFSYNC`. A caller that
 /// promised durability must treat a failure as data not written.
 pub fn sync_file(f: &File) -> io::Result<SyncMethod> {
+    #[cfg(feature = "testing")]
+    if crate::testing::sync_fails_now() {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
     #[cfg(target_os = "macos")]
     loop {
         // SAFETY: `f` keeps its descriptor open for the call; F_FULLFSYNC
         // takes no argument and only flushes.
         if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) } != -1 {
-            note(SyncMethod::FullFsync);
+            note(SyncMethod::FullFsync, f);
             return Ok(SyncMethod::FullFsync);
         }
         let err = io::Error::last_os_error();
@@ -53,7 +59,7 @@ pub fn sync_file(f: &File) -> io::Result<SyncMethod> {
     loop {
         // SAFETY: `f` keeps its descriptor open for the call.
         if unsafe { libc::fsync(f.as_raw_fd()) } == 0 {
-            note(SyncMethod::Fsync);
+            note(SyncMethod::Fsync, f);
             return Ok(SyncMethod::Fsync);
         }
         let err = io::Error::last_os_error();
@@ -64,9 +70,9 @@ pub fn sync_file(f: &File) -> io::Result<SyncMethod> {
 }
 
 #[cfg(feature = "testing")]
-fn note(m: SyncMethod) {
-    crate::testing::note_sync(m);
+fn note(m: SyncMethod, f: &File) {
+    crate::testing::note_sync(m, f);
 }
 
 #[cfg(not(feature = "testing"))]
-fn note(_: SyncMethod) {}
+fn note(_: SyncMethod, _: &File) {}

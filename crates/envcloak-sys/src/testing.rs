@@ -3,6 +3,8 @@
 //!
 //! [`sync_counts`] is the counting shim for durable writes: how many
 //! `F_FULLFSYNC` and `fsync` calls [`crate::sync_file`] made on this thread.
+//! [`record_syncs`] and [`take_synced`] name the files it flushed, and
+//! [`fail_sync_after`] makes one of its calls fail.
 //!
 //! [`ProbeAllocator`] is the inspection allocator for the allocator probe
 //! (SPEC §15.2 gate 11). A test binary installs it as its global allocator
@@ -587,7 +589,7 @@ pub fn sync_counts() -> SyncCounts {
     SYNCS.with(core::cell::Cell::get)
 }
 
-pub(crate) fn note_sync(m: crate::SyncMethod) {
+pub(crate) fn note_sync(m: crate::SyncMethod, f: &std::fs::File) {
     SYNCS.with(|c| {
         let mut n = c.get();
         match m {
@@ -596,6 +598,62 @@ pub(crate) fn note_sync(m: crate::SyncMethod) {
         }
         c.set(n);
     });
+    SYNCED.with(|r| {
+        if let Some(v) = r.borrow_mut().as_mut() {
+            use std::os::unix::fs::MetadataExt;
+            // A file that cannot be stat'ed is recorded as (0, 0), which
+            // names no file, so a test expecting it fails.
+            let id = f.metadata().map_or((0, 0), |m| (m.dev(), m.ino()));
+            v.push(id);
+        }
+    });
+}
+
+thread_local! {
+    /// The files [`crate::sync_file`] flushed on this thread since
+    /// [`record_syncs`], or `None` when it is not recording.
+    static SYNCED: core::cell::RefCell<Option<Vec<(u64, u64)>>> =
+        const { core::cell::RefCell::new(None) };
+    /// How many more [`crate::sync_file`] calls on this thread run before
+    /// one fails ([`fail_sync_after`]).
+    static FAIL_SYNC_AFTER: core::cell::Cell<Option<u32>> = const { core::cell::Cell::new(None) };
+}
+
+/// Starts recording, on this thread, the device and inode of every file
+/// and directory [`crate::sync_file`] flushes, so a test can show which
+/// directory entries a write path made durable. Starting again discards
+/// what was recorded.
+pub fn record_syncs() {
+    SYNCED.with(|r| *r.borrow_mut() = Some(Vec::new()));
+}
+
+/// What this thread recorded since [`record_syncs`], in order, as
+/// (device, inode); recording stops. Empty when it was not recording.
+pub fn take_synced() -> Vec<(u64, u64)> {
+    SYNCED.with(|r| r.borrow_mut().take().unwrap_or_default())
+}
+
+/// Lets this thread's next `n` [`crate::sync_file`] calls run and makes the
+/// one after fail with `EIO` without flushing, as a failing drive would.
+/// The failed call is neither counted nor recorded.
+pub fn fail_sync_after(n: u32) {
+    FAIL_SYNC_AFTER.with(|c| c.set(Some(n)));
+}
+
+/// Whether this [`crate::sync_file`] call is the one [`fail_sync_after`]
+/// asked to fail.
+pub(crate) fn sync_fails_now() -> bool {
+    FAIL_SYNC_AFTER.with(|c| match c.get() {
+        None => false,
+        Some(0) => {
+            c.set(None);
+            true
+        }
+        Some(n) => {
+            c.set(Some(n - 1));
+            false
+        }
+    })
 }
 
 /// Linux: whether [`crate::peer_identity`] skips `SO_PEERPIDFD` and takes

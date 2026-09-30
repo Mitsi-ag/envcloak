@@ -77,25 +77,71 @@ impl VaultPaths {
     /// `audit` and `backups` directories with mode 0700, then checks each
     /// one. Sets the process umask to 077 first, so SQLite's side files and
     /// anything else created later start private too.
+    ///
+    /// Every directory it makes is durable when it returns: flushed into
+    /// the directory that names it (`envcloak_sys::sync_file`), top down.
+    /// A missing ancestor is flushed into its parent as it is made, and
+    /// removed again when that flush fails, so the next call makes and
+    /// flushes it again. The data directory's parent and the data
+    /// directory, which names the other three, are flushed at every call,
+    /// so what an earlier call made and could not flush, or a crash left
+    /// unflushed, is flushed now.
+    ///
+    /// # Errors
+    /// A directory cannot be made or flushed, or fails the checks.
     pub fn ensure_dirs(&self) -> Result<(), PathError> {
         envcloak_sys::restrict_umask();
-        if !exists_no_follow(&self.data_dir)? {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&self.data_dir)?;
+        // The data directory's missing ancestors, nearest first.
+        let mut missing = Vec::new();
+        let mut up = self.data_dir.parent();
+        while let Some(dir) = up.filter(|d| !d.as_os_str().is_empty()) {
+            if exists_no_follow(dir)? {
+                break;
+            }
+            missing.push(dir);
+            up = dir.parent();
         }
+        for dir in missing.iter().rev() {
+            if make_dir(dir)? {
+                if let Err(e) = sync_dir(parent_of(dir)) {
+                    let _ = std::fs::remove_dir(dir);
+                    return Err(e);
+                }
+            }
+        }
+        make_dir(&self.data_dir)?;
         check_private_dir(&self.data_dir)?;
         for dir in [&self.vault_dir, &self.audit_dir, &self.backups_dir] {
-            match DirBuilder::new().mode(0o700).create(dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.into()),
-            }
+            make_dir(dir)?;
             check_private_dir(dir)?;
         }
-        Ok(())
+        sync_dir(parent_of(&self.data_dir))?;
+        sync_dir(&self.data_dir)
     }
+}
+
+/// Makes `dir` with mode 0700: whether this call made it (false when it
+/// was there already).
+fn make_dir(dir: &Path) -> Result<bool, PathError> {
+    match DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The directory that names `p`: its parent, or `.` for a bare name.
+fn parent_of(p: &Path) -> &Path {
+    match p.parent() {
+        Some(up) if !up.as_os_str().is_empty() => up,
+        _ => Path::new("."),
+    }
+}
+
+/// Makes `dir`'s entries durable.
+fn sync_dir(dir: &Path) -> Result<(), PathError> {
+    envcloak_sys::sync_file(&std::fs::File::open(dir)?)?;
+    Ok(())
 }
 
 /// The data directory for `platform`, given the values of `HOME` and
@@ -330,6 +376,79 @@ mod tests {
             p.ensure_dirs().unwrap_err().kind(),
             PathErrorKind::NotDirectory
         );
+    }
+
+    /// Review T10 open 3 (verification): every directory `ensure_dirs`
+    /// makes is flushed into the directory that names it before it
+    /// returns, top down. Each missing ancestor is flushed into its parent
+    /// as it is made, and removed again when that flush fails, so the next
+    /// call makes and flushes it again. The data directory's parent and
+    /// the data directory itself, which names `vault`, `audit` and
+    /// `backups`, are flushed at every call, so what an earlier call made
+    /// and could not flush, or a crash left unflushed, is flushed by the
+    /// next one.
+    #[test]
+    fn ensure_dirs_flushes_every_directory_it_makes() {
+        use envcloak_sys::testing::{fail_sync_after, record_syncs, take_synced};
+        let t = tempfile::tempdir().unwrap();
+        let id = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.dev(), m.ino())
+        };
+
+        // Missing ancestors: each flushed into its parent, then the data
+        // directory's parent and the data directory.
+        let p = VaultPaths::under(t.path().join("a/b/envcloak"));
+        let (a, b) = (t.path().join("a"), t.path().join("a/b"));
+        record_syncs();
+        p.ensure_dirs().unwrap();
+        assert_eq!(
+            take_synced(),
+            [id(t.path()), id(&a), id(&b), id(&p.data_dir)]
+        );
+        // All there: the two flushed at every call, and nothing else.
+        record_syncs();
+        p.ensure_dirs().unwrap();
+        assert_eq!(take_synced(), [id(&b), id(&p.data_dir)]);
+        // One of the three made again: the data directory names it.
+        std::fs::remove_dir(&p.audit_dir).unwrap();
+        record_syncs();
+        p.ensure_dirs().unwrap();
+        assert!(p.audit_dir.is_dir());
+        assert_eq!(take_synced(), [id(&b), id(&p.data_dir)]);
+
+        // A failed flush fails the call. An ancestor whose flush failed is
+        // removed, so the next call makes it and flushes it again.
+        let q = VaultPaths::under(t.path().join("c/d/envcloak"));
+        let (c, d) = (t.path().join("c"), t.path().join("c/d"));
+        fail_sync_after(0);
+        assert!(q.ensure_dirs().is_err());
+        assert!(!c.exists(), "c, whose flush failed, is removed");
+        record_syncs();
+        fail_sync_after(1);
+        assert!(q.ensure_dirs().is_err());
+        assert_eq!(take_synced(), [id(t.path())]);
+        assert!(c.is_dir() && !d.exists(), "c kept, flushed; d removed");
+        // The data directory's parent failing leaves every directory made;
+        // the next call flushes it and the data directory.
+        record_syncs();
+        fail_sync_after(1);
+        assert!(q.ensure_dirs().is_err());
+        assert_eq!(take_synced(), [id(&c)]);
+        for dir in [&q.data_dir, &q.vault_dir, &q.audit_dir, &q.backups_dir] {
+            assert!(dir.is_dir(), "{}", dir.display());
+        }
+        record_syncs();
+        q.ensure_dirs().unwrap();
+        assert_eq!(take_synced(), [id(&d), id(&q.data_dir)]);
+        // So does the data directory itself failing.
+        record_syncs();
+        fail_sync_after(1);
+        assert!(q.ensure_dirs().is_err());
+        assert_eq!(take_synced(), [id(&d)]);
+        record_syncs();
+        q.ensure_dirs().unwrap();
+        assert_eq!(take_synced(), [id(&d), id(&q.data_dir)]);
     }
 
     #[test]

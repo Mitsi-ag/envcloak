@@ -382,9 +382,13 @@ pub struct AuditWriter {
     current: Option<Current>,
     io: Box<dyn AuditIo>,
     max_segment: u64,
-    /// This writer created the log's directory and has not yet flushed the
-    /// directory that names it.
-    dir_unsynced: bool,
+    /// This writer has not yet flushed the directory that names the log's
+    /// directory. Every writer starts with it set and flushes that
+    /// directory once, before its first append, whether or not it made the
+    /// log's directory: `ensure_dirs` makes it for a new vault, and an
+    /// earlier writer may have made it and failed, or crashed, before its
+    /// flush (Codex F-64). Cleared only when the flush succeeds.
+    parent_unsynced: bool,
 }
 
 impl core::fmt::Debug for AuditWriter {
@@ -458,7 +462,7 @@ impl AuditWriter {
             current: None,
             io,
             max_segment,
-            dir_unsynced: false,
+            parent_unsynced: true,
         };
         if let Some(a) = anchor {
             if a.seq >= writer.next_seq {
@@ -586,6 +590,10 @@ impl AuditWriter {
         if let Some(cur) = self.current.take() {
             if let Ok(m) = cur.file.metadata() {
                 if !cur.broken && m.len() < self.max_segment && in_log(&self.dir, &cur) {
+                    if let Err(e) = self.sync_parent() {
+                        self.current = Some(cur);
+                        return Err(e);
+                    }
                     return Ok((cur, m.len()));
                 }
             }
@@ -593,12 +601,12 @@ impl AuditWriter {
         Ok((self.new_segment()?, HEADER_LEN as u64))
     }
 
-    fn new_segment(&mut self) -> Result<Current, AuditError> {
-        ensure_dir(&self.dir, &mut self.dir_unsynced)?;
-        if self.dir_unsynced {
-            // The directory is new: the entry naming it must be durable
-            // before any segment in it is. Until that flush succeeds, every
-            // new segment tries it again.
+    /// Flushes the directory that names the log's directory, unless this
+    /// writer already has: the entry naming the log's directory is durable
+    /// before any entry this writer appends is acknowledged. A failure
+    /// fails the append, and the next one tries again.
+    fn sync_parent(&mut self) -> Result<(), AuditError> {
+        if self.parent_unsynced {
             let parent = match self.dir.parent() {
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => Path::new("."),
@@ -607,8 +615,15 @@ impl AuditWriter {
             self.io
                 .sync(&parent)
                 .map_err(|_| AuditError::from(AuditErrorKind::Sync))?;
-            self.dir_unsynced = false;
+            self.parent_unsynced = false;
         }
+        Ok(())
+    }
+
+    fn new_segment(&mut self) -> Result<Current, AuditError> {
+        ensure_dir(&self.dir)?;
+        // Before any segment is made in the directory.
+        self.sync_parent()?;
         let path = self.dir.join(segment_name(self.next_seq));
         let file = OpenOptions::new()
             .append(true)
@@ -705,11 +720,10 @@ fn segment_exists(dir: &Path, first_seq: u64) -> bool {
     std::fs::symlink_metadata(dir.join(segment_name(first_seq))).is_ok()
 }
 
-/// Creates the log's directory 0700 when it is missing, setting `created`,
-/// then checks it.
-fn ensure_dir(dir: &Path, created: &mut bool) -> Result<(), AuditError> {
+/// Creates the log's directory 0700 when it is missing, then checks it.
+fn ensure_dir(dir: &Path) -> Result<(), AuditError> {
     match DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => *created = true,
+        Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }

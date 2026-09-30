@@ -4,8 +4,10 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
-use envcloak_sys::testing::sync_counts;
+use envcloak_sys::testing::{fail_sync_after, record_syncs, sync_counts, take_synced};
 use envcloak_sys::{SyncMethod, sync_file};
 
 #[test]
@@ -64,4 +66,58 @@ fn a_failure_is_reported() {
     let before = sync_counts();
     assert!(sync_file(&socket).is_err());
     assert_eq!(sync_counts(), before);
+}
+
+/// The device and inode of `p`.
+fn id(p: &Path) -> (u64, u64) {
+    let m = std::fs::metadata(p).unwrap();
+    (m.dev(), m.ino())
+}
+
+/// The recording shim names each file this thread flushed, by device and
+/// inode and in order, from `record_syncs` until `take_synced`, and
+/// nothing outside that span or from another thread.
+#[test]
+fn a_recording_names_the_files_this_thread_flushed() {
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let path = tmp.path().join("x");
+    let f = File::create(&path).unwrap();
+    let dir = File::open(tmp.path()).unwrap();
+    sync_file(&f).unwrap();
+    assert!(take_synced().is_empty(), "not recording");
+    record_syncs();
+    sync_file(&dir).unwrap();
+    sync_file(&f).unwrap();
+    std::thread::scope(|s| {
+        s.spawn(|| sync_file(&dir).unwrap());
+    });
+    assert_eq!(take_synced(), [id(tmp.path()), id(&path)]);
+    sync_file(&f).unwrap();
+    assert!(take_synced().is_empty(), "stopped");
+}
+
+/// `fail_sync_after(n)` lets this thread's next `n` flushes run and fails
+/// the one after with `EIO`, which is neither counted nor recorded; the
+/// flushes after it run again.
+#[test]
+fn an_injected_failure_fails_one_flush_only() {
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let path = tmp.path().join("x");
+    let f = File::create(&path).unwrap();
+    record_syncs();
+    fail_sync_after(1);
+    let before = sync_counts();
+    sync_file(&f).unwrap();
+    let e = sync_file(&f).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EIO));
+    let after = sync_counts();
+    assert_eq!(
+        (after.full_fsync - before.full_fsync) + (after.fsync - before.fsync),
+        1
+    );
+    sync_file(&f).unwrap();
+    assert_eq!(take_synced(), [id(&path), id(&path)]);
+    fail_sync_after(0);
+    assert!(sync_file(&f).is_err());
+    sync_file(&f).unwrap();
 }
