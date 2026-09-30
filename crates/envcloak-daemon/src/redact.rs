@@ -12,9 +12,12 @@
 //!
 //! The redactor does not look for values shorter than its floor (8 bytes),
 //! nor for their encodings: they are refused for injection (SPEC §6.1 step
-//! 6). When the request binds such a value (and it is not empty), nothing
-//! of the command line is kept, since it could hold the value, raw or
-//! encoded, in any form.
+//! 6). Nor does it find a value of 8 to 10 bytes inside a longer base64
+//! stream (`Authorization: Basic base64(user:<value>)`) at every one of
+//! the three alignments; it lists such a value as partial. When the
+//! request binds a value of either kind (and it is not empty), nothing of
+//! the command line is kept, since it could hold the value, raw or
+//! encoded, in a form that is not masked.
 //!
 //! This file is on security/expose-allowlist.txt: it hands the request's
 //! values to the redactor. They stay in the daemon, and the redactor,
@@ -33,7 +36,7 @@ pub const SHORT_VALUE_WITHHELD: &str =
 
 /// `argv` with every value in `values` (labelled by slug) and every
 /// key-shaped word masked; or only [`SHORT_VALUE_WITHHELD`] when a value
-/// is too short for the redactor.
+/// is too short for the redactor to mask in every encoding it covers.
 pub fn redact_argv(
     argv: &[String],
     values: &[(String, SecretBytes)],
@@ -46,9 +49,11 @@ pub fn redact_argv(
         builder = builder.secret(label.clone(), bytes);
     }
     let (redactor, report) = builder.build();
-    let short = values
-        .iter()
-        .any(|(label, v)| !v.is_empty() && report.skipped.contains(label));
+    // Skipped: not looked for at all. Partial: not found inside a longer
+    // base64 stream at every alignment.
+    let short = values.iter().any(|(label, v)| {
+        !v.is_empty() && (report.skipped.contains(label) || report.partial.contains(label))
+    });
     if short {
         return vec![SHORT_VALUE_WITHHELD.to_owned()];
     }
@@ -140,6 +145,25 @@ mod tests {
 
         let out = redact_argv(&argv, &[v("empty/acme", "")], None);
         assert_eq!(out, argv);
+    }
+
+    /// A value of 8 to 10 bytes is masked raw, but not inside a longer
+    /// base64 stream at every alignment: none of the command line is kept.
+    /// At 11 bytes every alignment is covered and the line is masked.
+    #[test]
+    fn a_value_masked_only_in_part_withholds_the_command_line() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        for len in 8..=10 {
+            let secret = "k".repeat(len);
+            let argv = strings(&[&format!("Basic {}", b64.encode(format!("user:{secret}")))]);
+            let out = redact_argv(&argv, &[v("basic/acme", &secret)], None);
+            assert_eq!(out, strings(&[SHORT_VALUE_WITHHELD]), "{len}");
+        }
+        let secret = "k".repeat(11);
+        let argv = strings(&["./emit", &secret]);
+        let out = redact_argv(&argv, &[v("basic/acme", &secret)], None);
+        assert_eq!(out, strings(&["./emit", "[envcloak:basic/acme]"]));
     }
 
     #[test]

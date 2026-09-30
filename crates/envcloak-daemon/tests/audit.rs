@@ -511,3 +511,76 @@ fn a_short_value_withholds_the_command_line_and_an_encoded_one_is_masked() {
     }
     f.sweep(&entries);
 }
+
+/// Gate 33: a value of 8 to 10 bytes is masked raw, but the redactor does
+/// not find it inside a longer base64 stream at every alignment (it lists
+/// the value as partial), so `Authorization: Basic base64(user:<value>)`
+/// would be sealed with the value recoverable. A request that binds one
+/// keeps none of its command line, as for a value under the floor.
+#[test]
+fn a_value_masked_only_in_part_withholds_the_command_line() {
+    // Eight letters, made at run time.
+    let seed = fresh_seed();
+    let token: String = (0..8u32)
+        .map(|i| char::from(b'a' + u8::try_from((seed >> (5 * i)) % 26).unwrap()))
+        .collect();
+    let value = token.clone();
+    let add_token = move |v: &mut envcloak_core::vault::Vault| {
+        v.transact(|t| {
+            let id = t.create_item(NewItem {
+                class: ItemClass::Secret,
+                slug: Slug::new("basic/acme-web").unwrap(),
+                details: ItemDetails {
+                    title: "basic".to_owned(),
+                    allow_short: true,
+                    ..ItemDetails::default()
+                },
+            })?;
+            t.add_field(
+                id,
+                FieldName::new("value").unwrap(),
+                SecretBytes::copy_from(value.as_bytes()),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    };
+    let manifest = format!("{MANIFEST}\n[env.basic]\nBASIC_TOKEN = \"basic/acme-web\"\n");
+    let mut f = Fixture::with(add_token, &manifest);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let header = format!(
+        "Authorization: Basic {}",
+        b64.encode(format!("user:{token}"))
+    );
+    pending(&f.request(
+        &[
+            "curl".to_owned(),
+            "-H".to_owned(),
+            header,
+            "--flag".to_owned(),
+        ],
+        Some("basic"),
+    ));
+
+    let (entries, report, _) = f.stop_and_read();
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(
+        outline(&entries)[1],
+        o(AuditKind::Run, "pending", None),
+        "{entries:?}"
+    );
+    // Neither the value nor any encoding the testkit knows (base64 at
+    // each alignment among them) is in any entry.
+    let canary = Canary::new("BASIC_TOKEN", token);
+    for e in &entries {
+        assert_no_canary(
+            format!("{:?}", e.record).as_bytes(),
+            std::slice::from_ref(&canary),
+        );
+    }
+    assert_eq!(
+        entries[1].record.argv_redacted,
+        vec!["[envcloak: command line not kept: the request binds a value too short to mask]"]
+    );
+    f.sweep(&entries);
+}
