@@ -15,7 +15,10 @@
 //!   starts with the default.
 //! - [`Interrupter::run`] runs a closure with the calling thread listed as
 //!   one that may be interrupted, and takes it off the list before it
-//!   returns or unwinds.
+//!   returns or unwinds. A thread that blocks `SIGURG` (a signal mask
+//!   survives `exec`, so a program can start the runner with it blocked)
+//!   could never be interrupted: the thread unblocks it for the call and
+//!   blocks it again after (review R-8).
 //! - [`Interrupter::interrupt`] sends `SIGURG` (`pthread_kill`) to each
 //!   listed thread. A `write`, `read` or `poll` it is blocked in returns
 //!   `EINTR`, or a short count when part of the write was done. A signal
@@ -101,18 +104,37 @@ impl Interrupter {
     }
 
     /// Runs `f` on the calling thread, which [`Interrupter::interrupt`]
-    /// may signal until `f` returns or unwinds.
-    pub fn run<R>(&self, f: impl FnOnce() -> R) -> R {
-        /// Takes the thread off the list, on return and on unwinding.
+    /// may signal until `f` returns or unwinds. The thread does not block
+    /// [`Interrupter::SIGNAL`] meanwhile: one that did (a mask inherited
+    /// through `exec`, or set by the caller) blocks it again when `f` has
+    /// returned or unwound (review R-8).
+    ///
+    /// # Errors
+    /// When the thread's signal mask cannot be changed; `f` is not run.
+    pub fn run<R>(&self, f: impl FnOnce() -> R) -> io::Result<R> {
+        /// Takes the thread off the list, then blocks the signal again if
+        /// it did before, on return and on unwinding.
         struct Leave<'a> {
             interrupter: &'a Interrupter,
             id: u64,
+            blocked: bool,
         }
         impl Drop for Leave<'_> {
             fn drop(&mut self) {
                 self.interrupter.list().retain(|(id, _)| *id != self.id);
+                if self.blocked {
+                    // Cannot fail: the same set was just unblocked. Were
+                    // it to, the thread would stay open to a signal that
+                    // no one sends it any more (it is off the list), and
+                    // whose handler does nothing.
+                    let _ = mask_signal(libc::SIG_BLOCK);
+                }
             }
         }
+        // Unblocked before the thread is listed, and blocked again only
+        // after it is off the list: a listed thread can always be
+        // interrupted.
+        let blocked = mask_signal(libc::SIG_UNBLOCK)?;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         // SAFETY: pthread_self has no preconditions.
         let me = unsafe { libc::pthread_self() };
@@ -120,8 +142,9 @@ impl Interrupter {
         let _leave = Leave {
             interrupter: self,
             id,
+            blocked,
         };
-        f()
+        Ok(f())
     }
 
     /// Sends [`Interrupter::SIGNAL`] to every thread inside
@@ -137,6 +160,30 @@ impl Interrupter {
         }
         threads.len()
     }
+}
+
+/// Blocks or unblocks (`how`: `SIG_BLOCK`, `SIG_UNBLOCK`)
+/// [`Interrupter::SIGNAL`] for the calling thread, and returns whether the
+/// thread blocked it before.
+fn mask_signal(how: libc::c_int) -> io::Result<bool> {
+    // SAFETY: sigset_t is plain data; sigemptyset initializes `set`, and
+    // pthread_sigmask fills in `old`.
+    let (mut set, mut old): (libc::sigset_t, libc::sigset_t) =
+        unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    // SAFETY: `set` is a writable sigset_t and the signal is valid.
+    if unsafe {
+        libc::sigemptyset(&mut set) != 0 || libc::sigaddset(&mut set, Interrupter::SIGNAL) != 0
+    } {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `set` is initialized and `old` writable; the call changes
+    // only the calling thread's mask.
+    let rc = unsafe { libc::pthread_sigmask(how, &set, &mut old) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    // SAFETY: `old` holds the mask pthread_sigmask returned.
+    Ok(unsafe { libc::sigismember(&old, Interrupter::SIGNAL) } == 1)
 }
 
 impl Drop for Interrupter {
@@ -177,7 +224,7 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 let block = vec![b'x'; 1 << 20];
-                let result = interrupter.run(|| writer.write(&block));
+                let result = interrupter.run(|| writer.write(&block)).unwrap();
                 done.send(result.map_err(|e| e.kind())).unwrap();
             });
             // Nothing is read: the write blocks once the buffers are full.
@@ -202,6 +249,59 @@ mod tests {
         assert!(reader.read(&mut b).unwrap() > 0);
     }
 
+    /// Review R-8: a thread that blocks the signal, as a mask inherited
+    /// through `exec` blocks it, is interrupted all the same inside `run`,
+    /// and blocks it again after; a thread that did not block it still
+    /// does not. A write that is never interrupted is let go by reading
+    /// the socket, so a failure ends the test rather than hanging it.
+    #[test]
+    fn a_thread_that_blocks_the_signal_is_interrupted_inside_run() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let interrupter = Interrupter::install().unwrap();
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let (done, finished) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                assert!(!mask_signal(libc::SIG_BLOCK).unwrap(), "blocked already");
+                let block = vec![b'x'; 1 << 20];
+                let result = interrupter.run(|| writer.write(&block)).unwrap();
+                // Whether it was blocked before this call: after `run`.
+                let blocked_after = mask_signal(libc::SIG_BLOCK).unwrap();
+                done.send((result.map_err(|e| e.kind()), blocked_after))
+                    .unwrap();
+            });
+            let end = Instant::now() + Duration::from_secs(10);
+            let got = loop {
+                interrupter.interrupt();
+                if let Ok(r) = finished.recv_timeout(Duration::from_millis(20)) {
+                    break Some(r);
+                }
+                if Instant::now() >= end {
+                    break None;
+                }
+            };
+            let Some((result, blocked_after)) = got else {
+                reader.set_nonblocking(true).unwrap();
+                let mut b = vec![0u8; 1 << 16];
+                while finished.try_recv().is_err() {
+                    let _ = reader.read(&mut b);
+                }
+                panic!("a thread that blocks the signal was never interrupted");
+            };
+            match result {
+                Ok(n) => assert!(n < 1 << 20, "the whole write went through: {n}"),
+                Err(kind) => assert_eq!(kind, io::ErrorKind::Interrupted),
+            }
+            assert!(blocked_after, "the signal was not blocked again after run");
+        });
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                interrupter.run(|| ()).unwrap();
+                assert!(!mask_signal(libc::SIG_UNBLOCK).unwrap());
+            });
+        });
+    }
+
     /// The previous disposition comes back when the interrupter goes, and
     /// the list holds only threads still inside `run`, also after a panic.
     #[test]
@@ -210,7 +310,7 @@ mod tests {
         let before = disposition();
         let interrupter = Interrupter::install().unwrap();
         assert_ne!(disposition(), before);
-        assert_eq!(interrupter.run(|| interrupter.list().len()), 1);
+        assert_eq!(interrupter.run(|| interrupter.list().len()).unwrap(), 1);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             interrupter.run(|| panic!("inside run"))
         }));

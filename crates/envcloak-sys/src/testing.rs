@@ -707,6 +707,13 @@ pub fn signal_this_thread(sig: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// Blocks `sig` for the calling thread, as a signal mask inherited
+/// through `exec` blocks it for the thread a program starts on (review
+/// R-8). Returns whether the thread blocked it already.
+pub fn block_on_this_thread(sig: i32) -> io::Result<bool> {
+    Ok(!crate::child::mask_signals(libc::SIG_BLOCK, &[sig])?.is_empty())
+}
+
 /// Asks the kernel to let the parent process trace this one
 /// (`PTRACE_TRACEME` on Linux, `PT_TRACE_ME` on macOS). Used to test
 /// [`crate::tracer_present`] from a child process. Never call it in a

@@ -10,7 +10,9 @@
 //!   knows which signals were caught before a moment and which after. A
 //!   caught signal, unlike an ignored one, is reset to its default action
 //!   by `exec`, so the child the runner starts gets the usual
-//!   dispositions.
+//!   dispositions. A signal mask survives `exec`, so a program can start
+//!   the runner with a signal blocked, which would then never be caught:
+//!   the installing thread unblocks the relay's signals (review R-8).
 //! - [`wait_for_exit`] waits until a child has exited and leaves it a
 //!   zombie (`waitid` with `WNOWAIT`), so its pid cannot be handed to
 //!   another process until the caller reaps it. A thread that sends the
@@ -261,6 +263,11 @@ pub enum Relayed {
 pub struct SignalRelay {
     saved: Vec<(i32, libc::sigaction)>,
     pipe: &'static RelayPipe,
+    /// The thread that installed the relay, and which of its signals that
+    /// thread blocked before: blocked again when the relay is dropped
+    /// there.
+    thread: libc::pthread_t,
+    reblock: Vec<i32>,
 }
 
 impl core::fmt::Debug for SignalRelay {
@@ -278,11 +285,18 @@ impl SignalRelay {
     /// is set, so a blocking read or write on another thread is restarted
     /// rather than failing; `poll` and `waitid` may still return `EINTR`.
     ///
+    /// The calling thread stops blocking `signals` (a mask inherited
+    /// through `exec` may block them), so a signal sent to the process
+    /// reaches the handler on it, or on a thread it starts afterwards,
+    /// which inherits its mask. Dropped on that thread, the relay blocks
+    /// again those the thread blocked before, ahead of the old
+    /// dispositions (review R-8).
+    ///
     /// # Errors
     /// [`io::ErrorKind::AlreadyExists`] while another relay is installed,
     /// [`io::ErrorKind::InvalidInput`] for a signal outside 1 to 127, and
-    /// the errors of `pipe` and `sigaction`. Nothing stays installed after
-    /// an error.
+    /// the errors of `pipe`, `sigaction` and `pthread_sigmask`. Nothing
+    /// stays installed after an error.
     pub fn install(signals: &[i32]) -> io::Result<SignalRelay> {
         if signals.iter().any(|s| !(1..=MAX_SIGNAL).contains(s)) {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -314,6 +328,9 @@ impl SignalRelay {
         let mut relay = SignalRelay {
             saved: Vec::with_capacity(signals.len()),
             pipe,
+            // SAFETY: pthread_self has no preconditions.
+            thread: unsafe { libc::pthread_self() },
+            reblock: Vec::new(),
         };
         for &sig in signals {
             // SAFETY: sigaction is plain data; every field is set below or
@@ -336,6 +353,7 @@ impl SignalRelay {
             }
             relay.saved.push((sig, old));
         }
+        relay.reblock = mask_signals(libc::SIG_UNBLOCK, signals)?;
         Ok(relay)
     }
 
@@ -420,8 +438,49 @@ impl SignalRelay {
     }
 }
 
+/// Blocks or unblocks (`how`: `SIG_BLOCK`, `SIG_UNBLOCK`) `signals` for
+/// the calling thread, and returns those of them it blocked before.
+pub(crate) fn mask_signals(how: libc::c_int, signals: &[i32]) -> io::Result<Vec<i32>> {
+    // SAFETY: sigset_t is plain data; sigemptyset initializes `set`, and
+    // pthread_sigmask fills in `old`.
+    let (mut set, mut old): (libc::sigset_t, libc::sigset_t) =
+        unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    // SAFETY: `set` is a writable sigset_t.
+    if unsafe { libc::sigemptyset(&mut set) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for &sig in signals {
+        // SAFETY: `set` is an initialized sigset_t; an invalid signal
+        // fails with EINVAL.
+        if unsafe { libc::sigaddset(&mut set, sig) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: `set` is initialized and `old` writable; the call changes
+    // only the calling thread's mask.
+    let rc = unsafe { libc::pthread_sigmask(how, &set, &mut old) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(signals
+        .iter()
+        .copied()
+        // SAFETY: `old` holds the mask pthread_sigmask returned.
+        .filter(|&sig| unsafe { libc::sigismember(&old, sig) } == 1)
+        .collect())
+}
+
 impl Drop for SignalRelay {
     fn drop(&mut self) {
+        // SAFETY: pthread_self has no preconditions; pthread_equal compares
+        // two thread ids.
+        let installer = unsafe { libc::pthread_equal(self.thread, libc::pthread_self()) } != 0;
+        if installer && !self.reblock.is_empty() {
+            // Before the old dispositions come back, so a signal arriving
+            // meanwhile waits, as it did before the relay. Cannot fail:
+            // the same signals were unblocked at install.
+            let _ = mask_signals(libc::SIG_BLOCK, &self.reblock);
+        }
         for (sig, old) in self.saved.drain(..).rev() {
             // SAFETY: `old` is the disposition sigaction returned for `sig`;
             // the previous one is not wanted.
@@ -502,6 +561,32 @@ mod tests {
         assert_eq!(relay.next().unwrap(), own(libc::SIGUSR2));
         assert_eq!(relay.next().unwrap(), Some(Relayed::Mark));
         assert_eq!(relay.next().unwrap(), None);
+    }
+
+    /// Review R-8: a signal the installing thread blocks, as a mask
+    /// inherited through `exec` blocks it, is caught all the same, and is
+    /// blocked again once the relay is gone. The stop is written first,
+    /// so a signal that was not caught makes `next` return `None` rather
+    /// than wait.
+    #[test]
+    fn a_signal_the_thread_blocks_is_caught_and_blocked_again_after() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            mask_signals(libc::SIG_BLOCK, &[libc::SIGUSR1])
+                .unwrap()
+                .is_empty()
+        );
+        let relay = SignalRelay::install(&[libc::SIGUSR1, libc::SIGUSR2]).unwrap();
+        raise(libc::SIGUSR1);
+        relay.stop().unwrap();
+        assert_eq!(relay.next().unwrap(), own(libc::SIGUSR1));
+        assert_eq!(relay.next().unwrap(), None);
+        drop(relay);
+        // SIGUSR1 is blocked again; SIGUSR2, which was not, is not.
+        assert_eq!(
+            mask_signals(libc::SIG_UNBLOCK, &[libc::SIGUSR1, libc::SIGUSR2]).unwrap(),
+            [libc::SIGUSR1]
+        );
     }
 
     #[test]

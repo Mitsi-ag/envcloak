@@ -17,7 +17,8 @@
 //!
 //! The four signals are caught (never ignored, since `exec` would pass an
 //! ignored disposition on to the child) from before the child starts until
-//! the run returns. A signal is passed on only while the child has not
+//! the run returns, and unblocked on the thread that installs the relay:
+//! a mask inherited through `exec` could block them (review R-8). A signal is passed on only while the child has not
 //! exited: [`ChildState`] is updated after `waitid` sees the exit and
 //! before the child is reaped, so its pid, and the group it leads, can
 //! never belong to another process when a signal is sent.

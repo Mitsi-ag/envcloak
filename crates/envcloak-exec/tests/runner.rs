@@ -237,8 +237,16 @@ const TESTS: &[Test] = &[
         a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff,
     ),
     (
+        "a_stalled_reader_is_given_up_with_the_signals_blocked",
+        a_stalled_reader_is_given_up_with_the_signals_blocked,
+    ),
+    (
         "a_signal_after_the_exit_stops_a_stalled_run",
         a_signal_after_the_exit_stops_a_stalled_run,
+    ),
+    (
+        "a_signal_after_the_exit_stops_a_stalled_run_with_the_signals_blocked",
+        a_signal_after_the_exit_stops_a_stalled_run_with_the_signals_blocked,
     ),
     (
         "harness_a_dropped_runner_takes_its_childs_group_with_it",
@@ -333,6 +341,14 @@ fn emitter() -> PathBuf {
 
 /// Runs argv[1..] in a new session, without a controlling terminal.
 const DETACH: &str = "import os, sys\nos.setsid()\nos.execv(sys.argv[1], sys.argv[1:])\n";
+
+/// [`DETACH`], with SIGURG and the four signals the runner catches blocked
+/// before the `exec`: a signal mask survives it, so a program can start
+/// the runner so (review R-8).
+const DETACH_MASKED: &str = "import os, signal, sys\n\
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGURG, signal.SIGINT, signal.SIGTERM, \
+signal.SIGHUP, signal.SIGQUIT})\n\
+os.setsid()\nos.execv(sys.argv[1], sys.argv[1:])\n";
 
 /// Runs argv[4..] leading a session on a new pseudo-terminal. Waits until
 /// the terminal shows `ready`, then (argv[1]) types Ctrl-C (`ctrl-c`),
@@ -435,9 +451,15 @@ fn runner_args(s: &Setup<'_>, argv: &[&OsStr]) -> Vec<OsString> {
 /// The runner in a new session without a controlling terminal, in
 /// `home`'s environment, with piped standard streams.
 fn detached(home: &TestHome, s: &Setup<'_>, argv: &[&OsStr]) -> Command {
+    detached_by(DETACH, home, s, argv)
+}
+
+/// [`detached`], started by the Python program `launcher` ([`DETACH`] or
+/// [`DETACH_MASKED`]).
+fn detached_by(launcher: &str, home: &TestHome, s: &Setup<'_>, argv: &[&OsStr]) -> Command {
     let mut cmd = Command::new(python3());
     home.apply(&mut cmd)
-        .args(["-c", DETACH])
+        .args(["-c", launcher])
         .args(runner_args(s, argv))
         .current_dir(home.home())
         .stdin(Stdio::piped())
@@ -1730,9 +1752,15 @@ struct LeftAWriter {
 }
 
 /// The runner with [`LEAVES_A_WRITER`], its standard output read as it
-/// comes (`drained`) or never.
-fn leaves_a_writer(home: &TestHome, setup: &Setup<'_>, drained: bool) -> LeftAWriter {
-    let mut cmd = detached(home, setup, &os(&sh(LEAVES_A_WRITER)));
+/// comes (`drained`) or never, started by `launcher` ([`DETACH`] or
+/// [`DETACH_MASKED`]).
+fn leaves_a_writer(
+    launcher: &str,
+    home: &TestHome,
+    setup: &Setup<'_>,
+    drained: bool,
+) -> LeftAWriter {
+    let mut cmd = detached_by(launcher, home, setup, &os(&sh(LEAVES_A_WRITER)));
     cmd.stdin(Stdio::null());
     let (p, stdout) = if drained {
         (Proc::spawn(cmd), None)
@@ -1786,6 +1814,19 @@ fn reaped_within((pid, started): (i32, Option<StartTime>), limit: Duration) -> b
 /// write), and returns the child's 0 within the cutoff plus a margin, as
 /// it does beside the control, whose output is read.
 fn a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff() {
+    stalled_reader_given_up(DETACH, &[true, false]);
+}
+
+/// Review R-8: the same, unread, with the runner started with SIGURG
+/// (and the signals it catches) blocked: the stuck write is given up at
+/// the cutoff all the same.
+fn a_stalled_reader_is_given_up_with_the_signals_blocked() {
+    stalled_reader_given_up(DETACH_MASKED, &[false]);
+}
+
+/// The two tests above: the runner started by `launcher`, its output read
+/// or not as each of `drains` says.
+fn stalled_reader_given_up(launcher: &str, drains: &[bool]) {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
     let home = TestHome::new();
@@ -1795,14 +1836,14 @@ fn a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff() {
         values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
         files: &[],
     };
-    for drained in [true, false] {
+    for &drained in drains {
         let LeftAWriter {
             p,
             stdout,
             mut gc,
             exiting,
             ..
-        } = leaves_a_writer(&home, &setup, drained);
+        } = leaves_a_writer(launcher, &home, &setup, drained);
         let (status, out, err) = p.finish(Duration::from_secs(30));
         let took = exiting.elapsed();
         println!("stalled reader ({drained}): the runner returned {took:?} after the exit");
@@ -1842,6 +1883,18 @@ fn a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff() {
 /// one, repeated, could land after the run returned and the default
 /// action was back).
 fn a_signal_after_the_exit_stops_a_stalled_run() {
+    signal_stops_a_stalled_run(DETACH);
+}
+
+/// Review R-8: the same with the runner started with SIGTERM (and SIGURG)
+/// blocked: the SIGTERM is caught and stops the run all the same, where a
+/// runner that left it blocked would run on to the cutoff and exit 0.
+fn a_signal_after_the_exit_stops_a_stalled_run_with_the_signals_blocked() {
+    signal_stops_a_stalled_run(DETACH_MASKED);
+}
+
+/// The two tests above, the runner started by `launcher`.
+fn signal_stops_a_stalled_run(launcher: &str) {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
     let home = TestHome::new();
@@ -1857,7 +1910,7 @@ fn a_signal_after_the_exit_stops_a_stalled_run() {
         mut gc,
         child,
         exiting,
-    } = leaves_a_writer(&home, &setup, false);
+    } = leaves_a_writer(launcher, &home, &setup, false);
     assert!(
         reaped_within(child, Duration::from_secs(10)),
         "the runner did not reap its child"
