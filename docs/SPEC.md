@@ -718,8 +718,8 @@ Grant {
 A manifest change that leaves the bindings a subset does not prompt; the new hash is recorded in the audit log. Any added or changed binding, env-name remapping, profile switch, `--ref` or `--env-file` reference prompts for the difference: the statement asks for the bindings no grant in force for the caller and project covers, and lists the ones a grant already covers apart, since the new grant holds the whole request.
 
 **Lifetimes.**
-- Agent grants: default 8 h, maximum 24 h.
-- Terminal grants: maximum 12 h. Unknown grants take the same maximum: missing evidence gets the tighter bound.
+- Agent grants: default 8 h, maximum 24 h when the root is a known agent process in the caller's ancestry.
+- Terminal grants: maximum 12 h. Unknown grants take the same maximum: missing evidence gets the tighter bound. So do agent grants whose root is not a known agent (an agent subject by its claims alone, such as `CLAUDECODE=1` set in a person's shell): claims only label and tighten.
 - A grant never outlives its root process.
 - Grants live only in daemon memory and are never persisted or synced.
 
