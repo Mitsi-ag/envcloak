@@ -41,9 +41,15 @@ use crate::vault::AuditHead;
 use super::AuditError;
 use super::record::AuditRecord;
 use super::segment::{
-    FRAME_HEAD, HEADER_LEN, LogKeys, MAC_LEN, Next, list_segments, next_frame, parse_header,
-    read_segment,
+    FRAME_HEAD, HEADER_LEN, LogKeys, MAC_LEN, MAX_SEALED, Next, list_segments, next_frame,
+    parse_header, read_segment,
 };
+
+/// How many sealed bytes the torn-tail check hashes or opens at most: 64
+/// of the largest entries. A torn tail is shorter than one frame, and the
+/// ciphertext a crash leaves frames at about one offset in 65,000, so a
+/// real one needs a small fraction of this.
+const TAIL_CHECK_BUDGET: usize = 64 * MAX_SEALED;
 
 /// What went wrong at a sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,8 +132,10 @@ pub struct VerifyReport {
     /// leaves: part of one entry, or of a new segment's header. These bytes
     /// are counted as that only when the segment checked out up to them,
     /// no whole entry is in them (the expected one ending at the end of the
-    /// file or where the next entry's number starts, or any later one) and
-    /// the saved head does not cover them; anything else is flagged as a
+    /// file or where the next entry's number starts, or any other one
+    /// further on under the number it carries, whatever that is), every
+    /// offset where one could be was checked within a fixed limit, and the
+    /// saved head does not cover them; anything else is flagged as a
     /// problem. The writer removes them when it next opens the log.
     pub torn_tail: bool,
     /// How many bytes that is.
@@ -284,8 +292,15 @@ impl Walker<'_> {
     /// entry in `rest` means its bytes were changed: the expected entry
     /// with its length changed (its chain value checks out, or its sealed
     /// bytes open, where it really ends: at the end of the file or where
-    /// the next entry's number starts), or a later entry that opens under
-    /// its own number.
+    /// the next entry's number starts), or another entry further on that
+    /// opens under the number it carries. Entries can have been deleted
+    /// in between, so that number says nothing about where the entry can
+    /// be: every offset that frames is tried.
+    ///
+    /// Bytes that frame at more offsets than [`TAIL_CHECK_BUDGET`] lets
+    /// the check open (a crash's random ciphertext almost never frames)
+    /// are not a crash's either: they are kept as damage, never removed
+    /// unchecked.
     fn crash_tail(&self, rest: &[u8]) -> bool {
         let seq = self.expected;
         if self.anchored(seq) {
@@ -295,37 +310,39 @@ impl Walker<'_> {
         if rest.len() < min {
             return true;
         }
+        let mut budget = TAIL_CHECK_BUDGET;
+        let mut spend = |n: usize| match budget.checked_sub(n) {
+            Some(left) => {
+                budget = left;
+                true
+            }
+            None => false,
+        };
         let next = seq.wrapping_add(1).to_be_bytes();
         let starts =
             (min..=rest.len() - FRAME_HEAD).filter(|&p| rest[p + 4..p + FRAME_HEAD] == next);
-        let whole = std::iter::once(rest.len()).chain(starts).any(|end| {
+        for end in std::iter::once(rest.len()).chain(starts) {
             let sealed = &rest[FRAME_HEAD..end - MAC_LEN];
-            let computed = self.keys.chain(&self.h, seq, sealed);
-            bool::from(computed.ct_eq(&rest[end - MAC_LEN..end]))
-                || self.keys.open(seq, sealed).is_some()
-        });
-        !whole && !self.later_entry(rest, min)
-    }
-
-    /// Whether a whole entry numbered after the expected one is in `rest`:
-    /// a frame at an offset past the first entry's smallest size whose
-    /// number is one `rest` has room for and whose sealed bytes open under
-    /// that number. Only such offsets are opened.
-    fn later_entry(&self, rest: &[u8], min: usize) -> bool {
-        let seq = self.expected;
-        let room = u64::try_from(rest.len() / min).unwrap_or(u64::MAX);
-        (min..=rest.len().saturating_sub(min)).any(|p| {
-            let mut n = [0u8; 8];
-            n.copy_from_slice(&rest[p + 4..p + FRAME_HEAD]);
-            let n = u64::from_be_bytes(n);
-            if n <= seq || n - seq > room {
+            // Hashed for the chain value, and opened.
+            if !spend(2 * sealed.len()) {
                 return false;
             }
-            match next_frame(rest, p) {
-                Next::Frame(f) => self.keys.open(f.seq, f.sealed).is_some(),
-                _ => false,
+            let computed = self.keys.chain(&self.h, seq, sealed);
+            if bool::from(computed.ct_eq(&rest[end - MAC_LEN..end]))
+                || self.keys.open(seq, sealed).is_some()
+            {
+                return false;
             }
-        })
+        }
+        // Any other whole frame, past the first entry's smallest size.
+        for p in min..=rest.len() - min {
+            if let Next::Frame(f) = next_frame(rest, p) {
+                if !spend(f.sealed.len()) || self.keys.open(f.seq, f.sealed).is_some() {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Whether `data`, the last segment, whose header does not

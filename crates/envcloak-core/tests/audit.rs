@@ -886,8 +886,9 @@ fn a_changed_length_or_a_cut_the_anchor_covers_is_kept_as_damage() {
 ///   walk's expected number and chain value then come from a frame it has
 ///   already flagged, so the bytes after it say nothing about a crash.
 /// - An entry whose length was stretched past the end and whose sealed
-///   bytes were changed hides the whole entries after it; one whose chain
-///   value was changed still opens where it really ends.
+///   bytes were changed hides the whole entries after it, also when
+///   entries between them were deleted (Codex's F-46 follow-up); one whose
+///   chain value was changed still opens where it really ends.
 ///
 /// Each is damage: flagged at its entry, not a torn tail, and kept by the
 /// writer (which goes on in a new segment), with or without a saved head.
@@ -955,6 +956,25 @@ fn bytes_after_damage_or_before_a_whole_entry_are_not_a_torn_tail() {
         2,
     ));
     cases.push(("the same, entry 1 anchored".into(), b, Some(first), 2));
+    // Codex F-46 follow-up: with entries 3 to 9 deleted, the whole entry
+    // after the damaged one carries a number the bytes left could not
+    // reach one entry at a time. It still opens under its own number.
+    let mut b = orig[..fr[1].1.end].to_vec();
+    b.extend_from_slice(&orig[fr[9].1.clone()]);
+    with_len(&mut b, 1, u32::try_from(MAX_ENTRY).unwrap());
+    b[fr[1].1.start + 12 + 40] ^= 0x01;
+    cases.push((
+        "entries 3 to 9 deleted, entry 2 stretched past the end, its sealed bytes changed".into(),
+        b.clone(),
+        None,
+        2,
+    ));
+    cases.push((
+        "the same after the gap, entry 1 anchored".into(),
+        b,
+        Some(first),
+        2,
+    ));
     let mut b = orig.clone();
     with_len(&mut b, 9, len_of(9) + 1);
     let end = fr[9].1.end;
@@ -998,6 +1018,13 @@ fn bytes_after_damage_or_before_a_whole_entry_are_not_a_torn_tail() {
         assert_eq!(problem(&r).map(|p| p.0), Some(2), "{what}: {r:?}");
         assert!(!r.torn_tail, "{what}: {r:?}");
     }
+    // The deletion alone is flagged where the numbers stop running.
+    let mut gap = orig[..fr[1].1.end].to_vec();
+    gap.extend_from_slice(&orig[fr[9].1.clone()]);
+    reset(&gap);
+    let r = log.verify(Some(first));
+    assert_eq!(problem(&r), Some((3, ProblemKind::Missing)), "{r:?}");
+    assert!(!r.torn_tail, "{r:?}");
     let cut = orig[..fr[9].1.end - 10].to_vec();
     reset(&cut);
     let r = log.verify(Some(first));
@@ -1005,6 +1032,42 @@ fn bytes_after_damage_or_before_a_whole_entry_are_not_a_torn_tail() {
     let (_, report) = AuditWriter::open(&log.dir, &log.keys, Some(first)).unwrap();
     assert!(report.torn_tail_removed && !report.damaged, "{report:?}");
     assert_eq!(std::fs::read(&seg).unwrap(), &orig[..fr[9].1.start]);
+}
+
+/// Codex F-46 follow-up: every framed candidate in bytes that look like a
+/// torn tail is opened under the number it carries, within a fixed amount
+/// of work. Bytes built to frame at every fourth offset, more than the
+/// check opens, are kept and flagged as damage rather than removed as a
+/// crash's, with or without a saved head before them.
+#[test]
+fn bytes_too_many_to_check_are_kept_as_damage() {
+    let log = Log::new();
+    let mut w = log.writer(None);
+    fill(&mut w, 1, 3);
+    let three = w.head_record();
+    drop(w);
+    let seg = log.segments().pop().unwrap();
+    let mut bytes = std::fs::read(&seg).unwrap();
+    // Entry 4's frame, longer than the bytes that follow it: a torn tail,
+    // unless something whole is in it.
+    bytes.extend_from_slice(&u32::try_from(MAX_ENTRY).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&4u64.to_be_bytes());
+    // Every fourth offset holds the length 1,024 and room for it.
+    for _ in 0..15_000 {
+        bytes.extend_from_slice(&[0, 0, 4, 0]);
+    }
+    for anchor in [None, Some(three)] {
+        std::fs::write(&seg, &bytes).unwrap();
+        let r = log.verify(anchor);
+        assert_eq!(problem(&r), Some((4, ProblemKind::Unreadable)), "{r:?}");
+        assert!(!r.torn_tail, "{r:?}");
+        let (_, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+        assert!(
+            report.damaged && !report.torn_tail_removed,
+            "{anchor:?}: {report:?}"
+        );
+        assert_eq!(std::fs::read(&seg).unwrap(), bytes, "{anchor:?}: kept");
+    }
 }
 
 /// Codex review: a crash while the writer makes a segment (the first
