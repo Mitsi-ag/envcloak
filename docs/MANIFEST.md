@@ -28,8 +28,11 @@ A project is identified by its canonical directory together with that directory'
 | The repo copied | New: another inode |
 | The repo moved or renamed | New: a rename keeps the inode but not the path |
 | The directory replaced by a new one at the same path | New inode, so new, unless the filesystem reuses the inode number |
+| The filesystem remounted with a new device number (btrfs subvolumes, removable and external volumes, some network filesystems) | New: the device is part of the identity |
 
 The device and inode say which directory it is; the path alone could alias. The path is what makes a moved repo a new project.
+
+The device number is not stable everywhere. Filesystems that number their devices at mount (btrfs subvolumes, removable and external volumes, some network filesystems) give the same repo a new device after a remount or a reboot, so its identity changes: bindings adopted for it and its last-seen record stop matching, and it shows as a new project whose first run asks for approval again. That is the strict side, kept on purpose: grants compare the device and inode (SPEC §10b "Match" rule 5), and without the device a different filesystem mounted at the same path, with a directory of the same inode number, would inherit the project's record.
 
 The vault's project index (VAULT.md, "Project" record) keys a project by 49 bytes: a format byte `1`, the device and the inode as big-endian u64s, and SHA-256 of the canonical path's bytes.
 

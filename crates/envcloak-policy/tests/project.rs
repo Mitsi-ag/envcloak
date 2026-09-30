@@ -102,6 +102,48 @@ fn gate28_moving_the_repo_gives_a_new_identity() {
     assert_ne!(fresh, before);
 }
 
+/// Review T5 open 4: the vault key holds the device number, so a
+/// filesystem that numbers its devices at mount (btrfs subvolumes,
+/// removable and external volumes, some network filesystems) gives the
+/// same repo a new key after a remount, and it shows as a new project.
+/// That is the strict side, kept on purpose: without the device, another
+/// filesystem mounted at the same path with a directory of the same inode
+/// would inherit the record. The key differs by the device alone; with
+/// the path, device and inode the same it is the same key.
+#[test]
+fn a_new_device_number_is_a_new_project() {
+    let at = |dev: u64, ino: u64, dir: &str| ProjectIdentity {
+        canonical_dir: PathBuf::from(dir),
+        dev,
+        ino,
+        manifest_path: PathBuf::from(dir).join(MANIFEST_NAME),
+    };
+    let before = at(0x0801, 4242, "/mnt/work/acme-web");
+    assert_eq!(
+        before.vault_key(),
+        at(0x0801, 4242, "/mnt/work/acme-web").vault_key()
+    );
+    // Remounted: the same path and inode on a new device number.
+    for dev in [0x0802, 0, u64::MAX, 0x0801 << 32] {
+        assert_ne!(
+            before.vault_key(),
+            at(dev, 4242, "/mnt/work/acme-web").vault_key(),
+            "{dev:#x}"
+        );
+    }
+    // The inode and the path count too.
+    assert_ne!(
+        before.vault_key(),
+        at(0x0801, 4243, "/mnt/work/acme-web").vault_key()
+    );
+    assert_ne!(
+        before.vault_key(),
+        at(0x0801, 4242, "/mnt/work/acme-web2").vault_key()
+    );
+    // The device and the inode are not interchangeable.
+    assert_ne!(at(1, 2, "/x").vault_key(), at(2, 1, "/x").vault_key());
+}
+
 #[test]
 fn gate28_a_symlinked_path_keeps_the_identity() {
     let home = TestHome::new();
