@@ -1707,24 +1707,31 @@ exit 0"#;
 }
 
 /// The child ignores SIGTERM (so does all it starts), starts a descendant
-/// that prints the value for ever, reports its pid, lets the output fill
+/// that prints the value for ever, reports both pids, lets the output fill
 /// for a second, says `exiting` and exits 0.
 const LEAVES_A_WRITER: &str = r#"trap '' TERM
 ( while :; do printf '%s\n' "$OPENAI_API_KEY"; done ) &
-echo "gc=$!" >&2
+echo "gc=$! child=$$" >&2
+echo pids >&2
 sleep 1
 echo exiting >&2
 exit 0"#;
 
+/// What [`leaves_a_writer`] started: the runner, its standard output when
+/// it is left unread, the descendant (seen gone or killed on drop), the
+/// child's pid and start time, and the moment the child said it was
+/// exiting.
+struct LeftAWriter {
+    p: Proc,
+    stdout: Option<ChildStdout>,
+    gc: Leftover,
+    child: (i32, Option<StartTime>),
+    exiting: Instant,
+}
+
 /// The runner with [`LEAVES_A_WRITER`], its standard output read as it
-/// comes (`drained`) or never. Returns the runner, its standard output when
-/// it is left unread, the descendant (seen gone or killed on drop), and
-/// the moment the child said it was exiting.
-fn leaves_a_writer(
-    home: &TestHome,
-    setup: &Setup<'_>,
-    drained: bool,
-) -> (Proc, Option<ChildStdout>, Leftover, Instant) {
+/// comes (`drained`) or never.
+fn leaves_a_writer(home: &TestHome, setup: &Setup<'_>, drained: bool) -> LeftAWriter {
     let mut cmd = detached(home, setup, &os(&sh(LEAVES_A_WRITER)));
     cmd.stdin(Stdio::null());
     let (p, stdout) = if drained {
@@ -1733,11 +1740,43 @@ fn leaves_a_writer(
         let (p, stdout) = Proc::spawn_holding_stdout(cmd);
         (p, Some(stdout))
     };
+    assert!(p.wait_for(1, b"pids\n", Duration::from_secs(60)));
+    // Both are running (the child sleeps, the descendant writes or is
+    // blocked writing): their start times are their own.
+    let (gc, child) = {
+        let err = &p.cap.streams.lock().unwrap()[1];
+        (field(err, "gc"), field(err, "child"))
+    };
+    let gc = Leftover::new(gc, Arc::new(Live));
+    let child = (child, envcloak_sys::process_start_time(child).ok());
     assert!(p.wait_for(1, b"exiting\n", Duration::from_secs(60)));
-    let exiting = Instant::now();
-    // Still writing, or blocked writing: its start time is its own.
-    let gc = field(&p.cap.streams.lock().unwrap()[1], "gc");
-    (p, stdout, Leftover::new(gc, Arc::new(Live)), exiting)
+    LeftAWriter {
+        p,
+        stdout,
+        gc,
+        child,
+        exiting: Instant::now(),
+    }
+}
+
+/// Waits up to `limit` until process `pid`, which started at `started`,
+/// has been reaped: no process has its pid (a zombie still has it), or a
+/// process started at another time does.
+fn reaped_within((pid, started): (i32, Option<StartTime>), limit: Duration) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        let reaped = match envcloak_sys::signal_process(pid, 0) {
+            Err(_) => true,
+            Ok(()) => matches!(envcloak_sys::process_start_time(pid), Ok(t) if Some(t) != started),
+        };
+        if reaped {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Review F-49: the child exits while a descendant keeps writing to the
@@ -1757,7 +1796,13 @@ fn a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff() {
         files: &[],
     };
     for drained in [true, false] {
-        let (p, stdout, mut gc, exiting) = leaves_a_writer(&home, &setup, drained);
+        let LeftAWriter {
+            p,
+            stdout,
+            mut gc,
+            exiting,
+            ..
+        } = leaves_a_writer(&home, &setup, drained);
         let (status, out, err) = p.finish(Duration::from_secs(30));
         let took = exiting.elapsed();
         println!("stalled reader ({drained}): the runner returned {took:?} after the exit");
@@ -1791,9 +1836,11 @@ fn a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff() {
 /// nobody reading the runner's standard output, SIGTERM to the runner
 /// stops the run at once: it exits 143 well before the cutoff would have
 /// ended it (with the child's 0), and the descendant's pipes are closed.
-/// SIGTERM is sent every 50 ms until the runner exits: one that lands
-/// before the runner has seen the exit is passed on to the child's group,
-/// which ignores it.
+/// One SIGTERM is sent, once the runner has reaped the child: the runner
+/// marks the exit before it reaps, so the signal is caught after the mark
+/// (an earlier one would be passed on to the child's group, and a later
+/// one, repeated, could land after the run returned and the default
+/// action was back).
 fn a_signal_after_the_exit_stops_a_stalled_run() {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
@@ -1804,16 +1851,19 @@ fn a_signal_after_the_exit_stops_a_stalled_run() {
         values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
         files: &[],
     };
-    let (mut p, stdout, mut gc, exiting) = leaves_a_writer(&home, &setup, false);
-    let end = exiting + Duration::from_secs(20);
-    let status = loop {
-        if let Some(s) = p.try_wait() {
-            break s;
-        }
-        assert!(Instant::now() < end, "the runner never exited");
-        let _ = envcloak_sys::signal_process(p.pid(), libc::SIGTERM);
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let LeftAWriter {
+        p,
+        stdout,
+        mut gc,
+        child,
+        exiting,
+    } = leaves_a_writer(&home, &setup, false);
+    assert!(
+        reaped_within(child, Duration::from_secs(10)),
+        "the runner did not reap its child"
+    );
+    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    let (status, _, err) = p.finish(Duration::from_secs(20));
     let took = exiting.elapsed();
     println!("stopped: the runner exited {took:?} after the child");
     assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
@@ -1822,7 +1872,6 @@ fn a_signal_after_the_exit_stops_a_stalled_run() {
         gc.gone_within(Duration::from_secs(10)),
         "the descendant still runs"
     );
-    let (_, _, err) = p.finish(Duration::from_secs(10));
     let mut held = Vec::new();
     stdout.unwrap().read_to_end(&mut held).unwrap();
     assert_no_canary(&held, &cs);
