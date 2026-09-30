@@ -476,7 +476,8 @@ fn request_id(p: &RequestParams) -> Result<PendingId, RpcError> {
 /// may give a proof. Everyone else is refused before anything is looked
 /// up, so `envcloak approve` run where no proof is taken (an agent's
 /// tree, a service manager's job) stops before it shows the statement or
-/// asks for the passphrase.
+/// asks for the passphrase. So does every caller while the vault has
+/// failed its integrity check (`vault_tampered`).
 pub fn pending_get(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -486,8 +487,11 @@ pub fn pending_get(
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "pending.get")?;
     let now = now_of(&shared.clocks);
-    locked(&shared.state)
-        .grants()
+    let mut s = locked(&shared.state);
+    // No statement is shown from a vault that failed its integrity check:
+    // `approve` would be refused before its proof (review T9 open 6).
+    s.refuse_if_tampered()?;
+    s.grants()
         .pending_descriptor(&id, &now)
         .cloned()
         .ok_or(RpcError::new(ErrorKind::NoSuchRequest))

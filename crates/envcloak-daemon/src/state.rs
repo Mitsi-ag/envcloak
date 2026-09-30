@@ -179,6 +179,21 @@ impl State {
         }
     }
 
+    /// Refuses (`vault_tampered`) while the open vault has failed its
+    /// integrity check, whatever else a request needs: nothing is shown
+    /// for a person to approve from a vault no proof can be taken for.
+    ///
+    /// # Errors
+    /// [`ErrorKind::VaultTampered`].
+    pub fn refuse_if_tampered(&self) -> Result<(), RpcError> {
+        match &self.slot {
+            Slot::Unlocked(v) if v.integrity() != Integrity::Ok => {
+                Err(RpcError::new(ErrorKind::VaultTampered))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The unlocked vault, for a request that writes to it under the state
     /// lock (`items.add`, and `items.rotate` and `items.remove` once their
     /// proof has passed).

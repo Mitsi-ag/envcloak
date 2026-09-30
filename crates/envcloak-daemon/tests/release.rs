@@ -264,3 +264,82 @@ fn an_audit_failure_or_a_changed_vault_releases_nothing() {
     assert_eq!(st.vault.integrity, Some(Integrity::Tampered));
     f.sweep();
 }
+
+/// Review T9 open 6: with a grant and a pending request open, a row
+/// changed on disk that a read then meets turns the vault tampered, and
+/// neither `pending.get` nor `approve` goes on from it. Both are refused
+/// `vault_tampered` before any key derivation: a wrong passphrase is not
+/// counted, the right one grants nothing, and the grant in force is the
+/// only one.
+#[test]
+fn a_changed_vault_shows_no_statement_and_takes_no_approval() {
+    let f = Fixture::new();
+    let grant = f.approve(&f.ask(&[]).unwrap());
+    let more = ["GITHUB_TOKEN=github/acme-web"];
+    let DecisionView::Pending { request } = f.ask(&more).unwrap().decision else {
+        panic!("expected a pending request");
+    };
+    let mut c = client(&f.home);
+    let opts = ApprovalOptions::session(Duration::from_secs(60));
+    let d = c.pending_get(&request, &[]).unwrap();
+    let digest = statement_digest(&d, &opts);
+
+    // The GitHub item's sealed value, one bit flipped in the file while the
+    // daemon has it open; a write transaction (adding an item) drops the
+    // pages SQLite cached, and the same request reads the row again.
+    let db = VaultPaths::under(data_dir(&f.home)).db;
+    assert_eq!(flip_sealed_values(&db, &f.sealed[2..3]), 1);
+    c.items_add(&AddParams {
+        slug: Some("other/item".to_owned()),
+        provider: None,
+        field: None,
+        account: None,
+        env_hint: None,
+        allow_short: false,
+        value: WireSecret::new(SecretBytes::copy_from(
+            f.value(labels::OPENAI_API_KEY_ROTATED),
+        )),
+        claims: Vec::new(),
+    })
+    .unwrap();
+    match f.ask(&more) {
+        Ok(a) => assert!(a.values.is_empty(), "{:?}", a.decision),
+        Err(e) => assert_eq!(rpc_kind(e), ErrorKind::VaultTampered),
+    }
+    let st = c.status().unwrap();
+    assert_eq!(st.vault.integrity, Some(Integrity::Tampered));
+
+    let e = c.pending_get(&request, &[]).unwrap_err();
+    assert_eq!(rpc_kind(e), ErrorKind::VaultTampered);
+    let e = c
+        .approve(
+            &request,
+            opts.clone(),
+            &digest,
+            SecretBytes::copy_from(b"not the passphrase, not at all"),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(rpc_kind(e), ErrorKind::VaultTampered);
+    let pass = f.value(labels::VAULT_PASSPHRASE);
+    let e = c
+        .approve(&request, opts, &digest, SecretBytes::copy_from(pass), &[])
+        .unwrap_err();
+    assert_eq!(rpc_kind(e), ErrorKind::VaultTampered);
+    let st = c.status().unwrap();
+    assert_eq!(st.approvals.proof_failures, 0);
+    let grants = c.grants_list().unwrap().grants;
+    assert_eq!(
+        grants.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(),
+        [grant.as_str()]
+    );
+    let log = f.d.log();
+    assert!(!log.contains("approve failed"), "{log}");
+    assert_eq!(
+        log.matches("envcloakd: audit: approved ").count(),
+        1,
+        "{log}"
+    );
+    drop(c);
+    f.sweep();
+}
