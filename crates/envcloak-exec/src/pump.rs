@@ -518,14 +518,18 @@ mod tests {
 
     /// A pump whose output nobody reads: its socket is filled before the
     /// pump starts, so the pump's first write finds no room (blocking, or
-    /// `nonblocking`). The pump runs inside `interrupter`, and `cutoff`
-    /// counts it by the time this returns. Returns the child's side of the
-    /// pipe, the output's reader (kept open, never read unless a test
-    /// drains it), the pump, and how many bytes filled the output.
+    /// `nonblocking`). The pump runs inside `interrupter`, on a thread
+    /// that blocks the interrupter's signal first when `masked` (as the
+    /// runner's threads do when the program that started it blocked it),
+    /// and `cutoff` counts it by the time this returns. Returns the
+    /// child's side of the pipe, the output's reader (kept open, never
+    /// read unless a test drains it), the pump, and how many bytes filled
+    /// the output.
     fn start_stalled(
         cutoff: &Arc<Cutoff>,
         interrupter: &Arc<Interrupter>,
         nonblocking: bool,
+        masked: bool,
     ) -> (
         UnixStream,
         UnixStream,
@@ -554,17 +558,22 @@ mod tests {
         let (counted, ready) = mpsc::channel();
         let (cutoff, interrupter) = (Arc::clone(cutoff), Arc::clone(interrupter));
         let pump = std::thread::spawn(move || {
+            if masked {
+                assert!(!envcloak_sys::testing::block_on_this_thread(Interrupter::SIGNAL).unwrap());
+            }
             let token = cutoff.pump_token();
             counted.send(()).unwrap();
-            interrupter.run(|| {
-                pump(
-                    source,
-                    OwnedFd::from(sink),
-                    &r,
-                    Duration::from_millis(40),
-                    token,
-                )
-            })
+            interrupter
+                .run(|| {
+                    pump(
+                        source,
+                        OwnedFd::from(sink),
+                        &r,
+                        Duration::from_millis(40),
+                        token,
+                    )
+                })
+                .unwrap()
         });
         ready.recv().unwrap();
         (child_side, reader, pump, filled)
@@ -591,11 +600,27 @@ mod tests {
     /// the stuck write is ordinary backpressure and nothing is given up.
     #[test]
     fn a_stalled_output_is_given_up_at_the_cutoff_while_the_pipe_is_open() {
+        given_up_at_the_cutoff(false);
+    }
+
+    /// Review R-8: the same with the pump's thread blocking SIGURG, as a
+    /// runner started with it blocked has it (a signal mask survives
+    /// `exec`): the stuck write is given up at the cutoff all the same.
+    #[test]
+    fn a_stalled_output_is_given_up_at_the_cutoff_with_the_signal_blocked() {
+        given_up_at_the_cutoff(true);
+    }
+
+    /// The two tests above, the pump's thread blocking the interrupter's
+    /// signal when `masked`. A write that is never given up is let go by
+    /// reading the output, so a failure ends rather than hangs.
+    fn given_up_at_the_cutoff(masked: bool) {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         let interrupter = Arc::new(Interrupter::install().unwrap());
         for nonblocking in [false, true] {
             let cutoff = Arc::new(Cutoff::default());
-            let (mut child, _reader, pump, _) = start_stalled(&cutoff, &interrupter, nonblocking);
+            let (mut child, mut reader, pump, _) =
+                start_stalled(&cutoff, &interrupter, nonblocking, masked);
             // Released after the idle flush, then stuck: no room.
             child.write_all(b"hello\n").unwrap();
             let ended = waiting(&cutoff, &interrupter);
@@ -605,9 +630,14 @@ mod tests {
             );
             let started = Instant::now();
             cutoff.start(Duration::from_millis(300));
-            ended
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap_or_else(|_| panic!("the stuck write was never given up ({nonblocking})"));
+            if ended.recv_timeout(Duration::from_secs(10)).is_err() {
+                reader.set_nonblocking(true).unwrap();
+                let mut b = [0u8; 4096];
+                while ended.try_recv().is_err() {
+                    let _ = reader.read(&mut b);
+                }
+                panic!("the stuck write was never given up ({nonblocking}, {masked})");
+            }
             let took = started.elapsed();
             assert!(took >= Duration::from_millis(290), "{took:?}");
             assert!(took < Duration::from_secs(3), "{took:?}");
@@ -632,7 +662,8 @@ mod tests {
         let interrupter = Arc::new(Interrupter::install().unwrap());
         for nonblocking in [false, true] {
             let cutoff = Arc::new(Cutoff::default());
-            let (mut child, _reader, pump, _) = start_stalled(&cutoff, &interrupter, nonblocking);
+            let (mut child, _reader, pump, _) =
+                start_stalled(&cutoff, &interrupter, nonblocking, false);
             child.write_all(b"the last line\n").unwrap();
             drop(child);
             cutoff.start(Duration::from_millis(50));
@@ -660,7 +691,8 @@ mod tests {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         let interrupter = Arc::new(Interrupter::install().unwrap());
         let cutoff = Arc::new(Cutoff::default());
-        let (mut child, mut reader, pump, filled) = start_stalled(&cutoff, &interrupter, false);
+        let (mut child, mut reader, pump, filled) =
+            start_stalled(&cutoff, &interrupter, false, false);
         // Small enough for the pipe to take it all while the output is
         // stalled, so the writer can close it before the deadline.
         let body: Vec<u8> = (0..6000u32)

@@ -325,6 +325,9 @@ fn follow(
     std::thread::scope(|s| {
         // Each pump is counted before its thread starts; a thread that
         // cannot start drops its closure, and the count with it.
+        // A pump whose thread cannot be made interruptible (its signal
+        // mask cannot be changed) does not run: its pipe closes, so the
+        // child's next write to it fails, and the run reports the failure.
         let token = cutoff.pump_token();
         let a = std::thread::Builder::new()
             .name("envcloak-stdout".into())
@@ -363,8 +366,11 @@ fn follow(
         // Bounded by the cutoff while a descendant holds a pipe, and by a
         // signal that stops the run (review F-49).
         cutoff.wait_for_pumps(interrupter);
+        let mut pumped = Ok(());
         for pump in [a, b].into_iter().flatten() {
-            let _ = pump.join();
+            if let Ok(Err(e)) = pump.join() {
+                pumped = Err(e.kind());
+            }
         }
         forwarder.stop();
         if let Ok(f) = f {
@@ -373,6 +379,7 @@ fn follow(
         if let Some(kind) = failed {
             return Err(ExecError::Setup(kind));
         }
+        pumped.map_err(ExecError::Setup)?;
         waited.map_err(setup)?;
         let status = status.map_err(setup)?;
         Ok(match cutoff.stopped_by() {
