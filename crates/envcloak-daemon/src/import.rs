@@ -40,8 +40,9 @@
 //! holds it, so it is guarded as SPEC §6.5 guards doctor's matching:
 //! - A value short enough to guess ([`guessable`]: under 16 characters,
 //!   a value that is not UTF-8 counted as four bytes a character, and no
-//!   provider's key pattern matches it; or a URL whose password is under
-//!   16 characters, whatever the URL's length) is imported and compared
+//!   provider's key pattern matches it; or a URL, a Go MySQL DSN or a
+//!   connection string whose `password=` field holds a password under 16
+//!   characters, whatever the value's length) is imported and compared
 //!   only for a person: a terminal subject with no agent by any evidence,
 //!   as a proof requires. For any other caller it is left where it is
 //!   ([`SkipReason::Guessable`]) by the plan and by `import.verify`,
@@ -92,7 +93,7 @@ use envcloak_policy::{
     Binding, EnvName, ManifestError, ProcessInstance, ProfileName, SubjectEvidence, bind_items,
     load_project, resolve,
 };
-use envcloak_providers::{shaped_like_secret, url_password_chars};
+use envcloak_providers::{password_chars, shaped_like_secret};
 use envcloak_sys::PeerIdentity;
 use sha2::{Digest, Sha256};
 
@@ -166,15 +167,19 @@ fn secret_name(name: &str) -> bool {
 /// characters, and no provider's key pattern matches it. UTF-8 is counted
 /// in characters, not bytes, so an eight-letter password in a script of
 /// two-byte letters is short too; a value that is not UTF-8 is counted as
-/// short as any encoding could make it, four bytes a character. In a URL
-/// with a password only the password counts ([`url_password_chars`]):
-/// the scheme, user, host and database are no secret, so
-/// `postgres://app:<8 characters>@db:5432/app` is as short as its
-/// password, whatever pattern matches the whole URL. Where the password
+/// short as any encoding could make it, four bytes a character. In a
+/// value that holds a password in a form [`password_chars`] knows (a URL,
+/// Go's MySQL DSN, a `password=` field of a connection string) only the
+/// password counts: the scheme, user, host and database are no secret,
+/// so `postgres://app:<8 characters>@db:5432/app` and
+/// `host=db user=app password=<8 characters>` are as short as their
+/// passwords, whatever pattern matches the whole value. Where a password
 /// ends is read every way a server could read it, and the shortest
-/// reading counts, so an `@` in the path or query does not lengthen it.
+/// reading counts, so an `@` in a URL's path or query does not lengthen
+/// it. A password in any other form is measured with the whole value
+/// (docs/IMPORT.md "Who may compare values").
 fn guessable(shared: &Shared, value: &SecretBytes) -> bool {
-    if let Some(chars) = url_password_chars(value) {
+    if let Some(chars) = password_chars(value) {
         return chars < GUESSABLE_BELOW;
     }
     let short = match value.utf8_chars() {

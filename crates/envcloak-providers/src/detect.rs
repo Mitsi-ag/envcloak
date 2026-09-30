@@ -252,22 +252,125 @@ fn password_len(password: &[u8]) -> usize {
     decoded.utf8_chars().unwrap_or_else(|| decoded.len() / 4)
 }
 
-/// When `value` is a URL with a password ([`shaped_like_secret`]'s first
-/// shape), how many characters its password has: all of the value a
-/// guesser must find, since a URL's scheme, user, host and database are
-/// no secret (SPEC §6.4: a short password in a long URL is short). Where
-/// the password ends is read every way a server could read it
-/// ([`url_passwords`]), and the fewest characters any reading gives are
-/// returned, so that a short password counts as short however the rest of
-/// the URL is written. Each is counted as [`password_len`] counts. `None`
-/// for any other value.
+/// Go's MySQL DSN, `user:password@tcp(host:3306)/db`, has no scheme: its
+/// user information is the value up to an `@` that a protocol name and `(`
+/// follow (`@tcp(`, `@unix(`, `@tcp6(`), or that `/` follows (`@/db`, the
+/// default address), and the password is what follows its first `:`. Each
+/// such `@` is a reading, since the password may hold an `@` too.
+fn dsn_passwords<'a>(v: &'a [u8], out: &mut Vec<&'a [u8]>) {
+    let Some(colon) = v.iter().position(|&b| b == b':') else {
+        return;
+    };
+    let protocol = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
+    for (at, _) in v
+        .iter()
+        .enumerate()
+        .skip(colon + 1)
+        .filter(|(_, b)| **b == b'@')
+    {
+        let rest = &v[at + 1..];
+        let name = rest.iter().take_while(|b| protocol(b)).count();
+        let address = if name == 0 {
+            rest.first() == Some(&b'/')
+        } else {
+            rest.get(name) == Some(&b'(')
+        };
+        let password = &v[colon + 1..at];
+        if address && !password.is_empty() {
+            out.push(password);
+        }
+    }
+}
+
+/// The names a password field goes by in connection strings, in any case.
+const PASSWORD_FIELDS: [&[u8]; 3] = [b"password", b"passwd", b"pwd"];
+
+/// Password fields of connection strings made of `name=value` fields: the
+/// libpq keyword form (`host=db user=app password=...`), ADO.NET and ODBC
+/// (`Server=db;Password=...;`, `PWD=...`) and JDBC's query (`...?user=app&
+/// password=...`). A field is one of [`PASSWORD_FIELDS`] at the start of
+/// the value or after a byte that is not a letter, digit or `_`, then `=`,
+/// with spaces or tabs around it. Its value runs to the first `;`, `&` or
+/// whitespace; when it starts with `'`, `"` or `{`, what the quotes hold
+/// up to the first closing `'`, `"` or `}` is a reading too, since libpq,
+/// ADO.NET and ODBC quote a value that holds a separator.
+fn field_passwords<'a>(v: &'a [u8], out: &mut Vec<&'a [u8]>) {
+    let blank = |b: &u8| matches!(b, b' ' | b'\t');
+    for start in 0..v.len() {
+        if start > 0 && (v[start - 1].is_ascii_alphanumeric() || v[start - 1] == b'_') {
+            continue;
+        }
+        let Some(name) = PASSWORD_FIELDS.iter().find(|f| {
+            v.get(start..start + f.len())
+                .is_some_and(|w| w.eq_ignore_ascii_case(f))
+        }) else {
+            continue;
+        };
+        let mut i = start + name.len();
+        i += v[i..].iter().take_while(|b| blank(b)).count();
+        if v.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        i += v[i..].iter().take_while(|b| blank(b)).count();
+        let value = &v[i..];
+        let plain = value
+            .iter()
+            .position(|&b| matches!(b, b';' | b'&') || b.is_ascii_whitespace())
+            .unwrap_or(value.len());
+        out.push(&value[..plain]);
+        let close = match value.first() {
+            Some(b'\'') => Some(b'\''),
+            Some(b'"') => Some(b'"'),
+            Some(b'{') => Some(b'}'),
+            _ => None,
+        };
+        if let Some(close) = close {
+            let inner = &value[1..];
+            let end = inner
+                .iter()
+                .position(|&b| b == close)
+                .unwrap_or(inner.len());
+            out.push(&inner[..end]);
+        }
+    }
+    out.retain(|p| !p.is_empty());
+}
+
+/// The most password readings [`password_chars`] counts. A value with
+/// more is counted as short, which fails closed (compared only for a
+/// person) and keeps the work linear in the value's length.
+pub const MAX_PASSWORD_READINGS: usize = 64;
+
+/// When `value` holds a password in a form this knows, how many
+/// characters it has: all of the value a guesser must find, since the
+/// rest (scheme, user, host, port, database, options) is no secret (SPEC
+/// §6.4: a short password in a long value is short). The forms:
+/// - a URL with a password ([`shaped_like_secret`]'s first shape), where
+///   the password is read at every `@` a server could end it at
+///   (`url_passwords`);
+/// - Go's MySQL DSN, `user:password@tcp(host)/db` (`dsn_passwords`);
+/// - a `password=`, `passwd=` or `pwd=` field of a libpq, ADO.NET, ODBC or
+///   JDBC connection string (`field_passwords`).
+///
+/// Every reading counts, and the fewest characters any gives are returned,
+/// so a short password counts as short however the rest is written. Each
+/// is counted as `password_len` counts; more than
+/// [`MAX_PASSWORD_READINGS`] readings count as 0. `None` when no form
+/// finds a password.
 ///
 /// Read in place, like [`Registry::detect`]: only a count leaves, and each
 /// decoded password is wiped.
-pub fn url_password_chars(value: &SecretBytes) -> Option<usize> {
+pub fn password_chars(value: &SecretBytes) -> Option<usize> {
     #[allow(clippy::disallowed_methods)] // Read in place; only a count leaves.
     let v: &[u8] = value.expose_secret();
-    url_passwords(v).into_iter().map(password_len).min()
+    let mut readings = url_passwords(v);
+    dsn_passwords(v, &mut readings);
+    field_passwords(v, &mut readings);
+    if readings.len() > MAX_PASSWORD_READINGS {
+        return Some(0);
+    }
+    readings.into_iter().map(password_len).min()
 }
 
 fn key_shaped_run(v: &[u8]) -> bool {
@@ -301,7 +404,7 @@ mod shape_tests {
     }
 
     fn password_chars(s: &[u8]) -> Option<usize> {
-        url_password_chars(&SecretBytes::copy_from(s))
+        super::password_chars(&SecretBytes::copy_from(s))
     }
 
     /// Only the password of a URL counts, its `%XX` escapes decoded, in
@@ -415,6 +518,103 @@ mod shape_tests {
                 String::from_utf8_lossy(no)
             );
         }
+    }
+
+    /// Review T13 open 2: only `scheme://user:password@` was known, so a
+    /// short password in Go's MySQL DSN, the libpq keyword form or a JDBC
+    /// query was measured with the whole value. Each form's password is
+    /// counted alone, every reading of it, the fewest characters winning.
+    #[test]
+    fn connection_string_passwords_are_counted_alone() {
+        for (value, chars) in [
+            // Go's MySQL DSN.
+            (
+                &b"app:abcdefgh@tcp(db.internal:3306)/app?parseTime=true"[..],
+                8,
+            ),
+            (b"app:abcdefgh@unix(/var/run/mysqld/mysqld.sock)/app", 8),
+            (b"app:abcdefgh@tcp6([::1]:3306)/app", 8),
+            (b"app:abcdefgh@/app", 8),
+            (b"app:p@ssword1@tcp(db.internal:3306)/app", 9),
+            // libpq's keyword form, spaces around `=`, and quoted.
+            (
+                b"host=db.internal port=5432 dbname=app user=app password=abcdefgh sslmode=require",
+                8,
+            ),
+            (b"host=db.internal password = abcdefgh dbname=app", 8),
+            (b"host=db.internal password='abc def ghij' dbname=app", 4),
+            // Quoted: the quotes are no part of it.
+            (b"host=db.internal password='abcdefghijklmn' dbname=app", 14),
+            (b"Driver=x;Server=db.internal;PWD={abcdefghijklmn};", 14),
+            // ADO.NET and ODBC, `;`-separated, in any case, braced.
+            (
+                b"Server=db.internal;Database=app;User Id=app;Password=abcdefgh;",
+                8,
+            ),
+            (
+                b"Driver={PostgreSQL};Server=db.internal;UID=app;PWD=abcdefgh;",
+                8,
+            ),
+            (b"Server=db.internal;PASSWD=abcdefgh", 8),
+            // Braced, holding `;`: up to the `;` with its brace (18), or
+            // what the braces hold (20).
+            (
+                b"Driver=x;Server=db.internal;UID=app;PWD={abcdefghijklmnopq;rs};",
+                18,
+            ),
+            // JDBC's query, escaped too.
+            (
+                b"jdbc:postgresql://db.internal:5432/app?user=app&password=abcdefgh&ssl=true",
+                8,
+            ),
+            (
+                b"jdbc:sqlserver://db.internal:1433;databaseName=app;user=app;password=abcdefgh;",
+                8,
+            ),
+            (
+                b"jdbc:mysql://db.internal:3306/app?password=%61%62%63%64%65%66&user=app",
+                6,
+            ),
+            // Controls: 16 characters in each form.
+            (
+                b"app:abcdefghijklmnop@tcp(db.internal:3306)/app?parseTime=true",
+                16,
+            ),
+            (b"host=db.internal user=app password=abcdefghijklmnop", 16),
+            (
+                b"jdbc:postgresql://db.internal:5432/app?user=app&password=abcdefghijklmnop",
+                16,
+            ),
+        ] {
+            assert_eq!(
+                password_chars(value),
+                Some(chars),
+                "{:?}",
+                String::from_utf8_lossy(value)
+            );
+        }
+        for no in [
+            // Not a field: the name runs on, no `=`, or nothing after it.
+            &b"mypassword=abcdefgh"[..],
+            b"db_password=abcdefgh",
+            b"the password is abcdefgh",
+            b"host=db.internal dbname=app password=",
+            b"host=db.internal password=;",
+            // Not a DSN: no `:` before the `@`, or no address after it.
+            b"app@tcp(db.internal:3306)/app",
+            b"app:abcdefgh@db.internal",
+        ] {
+            assert_eq!(
+                password_chars(no),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(no)
+            );
+        }
+        // More readings than are counted: short, whatever they hold.
+        let many = |n: usize| "password=abcdefghijklmnopq ".repeat(n).into_bytes();
+        assert_eq!(password_chars(&many(MAX_PASSWORD_READINGS)), Some(17));
+        assert_eq!(password_chars(&many(MAX_PASSWORD_READINGS + 1)), Some(0));
     }
 
     #[test]
