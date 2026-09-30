@@ -302,40 +302,50 @@ fn a_request_is_pending_until_approved_then_covered() {
     renamed.refs = vec!["OPENAI_KEY=openai/acme-web".to_owned()];
     let mut profile = f.params(&["./emit"]);
     profile.profile = Some("short".to_owned());
-    let mut ids = Vec::new();
-    let mut denied = 0;
-    // Each prompts for the difference: the statement asks for the
-    // bindings the grant does not hold and marks the ones it does.
+    // Review T9 open 4: a profile that retargets a granted variable to
+    // another item. The manifest gains it; the default bindings are
+    // unchanged, so the grant still covers them.
+    let with_profile = format!("{rewritten}\n[env.other]\nOPENAI_API_KEY = \"github/acme-web\"\n");
+    std::fs::write(&f.manifest, &with_profile).unwrap();
+    assert!(matches!(
+        f.request(&["./emit"]),
+        DecisionView::Covered { .. }
+    ));
+    let mut profile_retargets = f.params(&["./emit"]);
+    profile_retargets.profile = Some("other".to_owned());
+    // Each prompts for the difference: the statement asks for exactly the
+    // bindings the grant does not hold and marks the ones it does. Each
+    // is approved and its grant revoked before the next, so every one is
+    // a pending request of this root's (review T9 open 4: the fourth used
+    // to meet the per-root cap and never reached these checks).
+    let mut asked_for = Vec::new();
     for (p, new) in [
         (added, "GITHUB_TOKEN"),
         (retargeted, "OPENAI_API_KEY"),
         (renamed, "OPENAI_KEY"),
         (profile, "SHORT_TOKEN"),
+        (profile_retargets, "OPENAI_API_KEY"),
     ] {
-        match client(&f.home).run_request(&p).unwrap().decision {
-            DecisionView::Pending { request } => {
-                let d = c.pending_get(&request, &[]).unwrap();
-                let asked: Vec<&str> = d
-                    .bindings
-                    .iter()
-                    .filter(|b| !b.granted)
-                    .map(|b| b.env_name.as_str())
-                    .collect();
-                assert_eq!(asked, vec![new], "{d:?}");
-                assert!(d.bindings.iter().any(|b| b.granted), "{d:?}");
-                ids.push(request);
-            }
-            DecisionView::Denied { reason } => {
-                assert_eq!(reason, DenyReason::PendingPerRoot.token());
-                denied += 1;
-            }
-            other => panic!("{other:?}"),
-        }
+        let request = match client(&f.home).run_request(&p).unwrap().decision {
+            DecisionView::Pending { request } => request,
+            other => panic!("{new}: expected a pending request, got {other:?}"),
+        };
+        let d = c.pending_get(&request, &[]).unwrap();
+        let asked: Vec<&str> = d
+            .bindings
+            .iter()
+            .filter(|b| !b.granted)
+            .map(|b| b.env_name.as_str())
+            .collect();
+        assert_eq!(asked, vec![new], "{d:?}");
+        assert!(d.bindings.iter().any(|b| b.granted), "{d:?}");
+        let extra = f.approve_ok(&request, session(60));
+        assert_eq!(c.grants_revoke(Some(&extra)).unwrap().revoked, 1);
+        assert_eq!(c.status().unwrap().approvals.pending, 0);
+        asked_for.push(new);
     }
-    ids.sort();
-    ids.dedup();
-    assert_eq!(ids.len(), MAX_PENDING_PER_ROOT);
-    assert_eq!(denied, 1, "the fourth is denied by the per-root cap");
+    assert_eq!(asked_for.len(), 5);
+    std::fs::write(&f.manifest, &rewritten).unwrap();
 
     // Gate 29: revocation needs no proof and ends the grant.
     assert_eq!(c.grants_revoke(Some(&grant)).unwrap().revoked, 1);
@@ -539,6 +549,65 @@ fn claimed_markers_refuse_every_proof() {
             "{log}"
         );
     }
+    f.sweep();
+}
+
+/// Review T9 open 5 (gate 23: a missing passphrase fails): `approve`
+/// with an empty passphrase is a wrong passphrase, counted by the attempt
+/// limiter, and grants nothing; a frame that has no passphrase at all is
+/// a malformed request (`invalid_params`), refused before anything is
+/// looked at: nothing counted, nothing granted. The request stays
+/// pending, and the right passphrase approves it.
+#[test]
+fn an_empty_or_missing_passphrase_approves_nothing() {
+    let f = Fixture::new();
+    let mut c = client(&f.home);
+    let id = pending(&f.request(&["./emit"]));
+    let d = c.pending_get(&id, &[]).unwrap();
+    let digest = statement_digest(&d, &session(60));
+
+    let e = c
+        .approve(&id, session(60), &digest, SecretBytes::copy_from(b""), &[])
+        .unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::WrongPassphrase);
+    let st = c.status().unwrap();
+    assert_eq!((st.approvals.proof_failures, st.approvals.grants), (1, 0));
+    assert!(c.grants_list().unwrap().grants.is_empty());
+
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let options = serde_json::to_value(session(60)).unwrap();
+    let mut s = common::raw(&f.home);
+    common::send_json(
+        &mut s,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "approve",
+            "params": {"request": id, "options": options, "digest": hex},
+        }),
+    );
+    let r = common::read_json(&mut s).unwrap();
+    assert_eq!(common::error_kind(&r), "invalid_params", "{r}");
+    drop(s);
+    let st = c.status().unwrap();
+    assert_eq!(
+        (
+            st.approvals.proof_failures,
+            st.approvals.grants,
+            st.approvals.pending
+        ),
+        (1, 0, 1)
+    );
+
+    f.approve_ok(&id, session(60));
+    assert_eq!(c.status().unwrap().approvals.proof_failures, 0);
+    let log = f.d.log();
+    assert_eq!(
+        log.matches("approve failed reason=wrong_passphrase")
+            .count(),
+        1,
+        "{log}"
+    );
     f.sweep();
 }
 
