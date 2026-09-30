@@ -111,7 +111,7 @@ Header names are lowercase letters, digits and `-`, at most 64 bytes, and not a 
 
 ### Denied paths
 
-Key-management, admin and credential-minting endpoints (SPEC §6.2 step 4). A denied path is `/`, then segments of letters, digits and `._~-`, where a segment `*` stands for any one segment, at most 256 bytes, with no empty, `.` or `..` segment. It covers each request path it is a prefix of, segment by segment and without ASCII case: `/v1/organization` covers `/v1/organization/admin_api_keys` but not `/v1/organizations`, and `/repos/*/*/keys` covers `/repos/acme/web/keys/1`.
+Key-management, admin and credential-minting endpoints (SPEC §6.2 step 4). A denied path is `/`, then segments of letters, digits and `._~-`, where a segment `*` stands for any one segment, at most 256 bytes, with no empty, `.` or `..` segment. It covers each request path it is a prefix of, segment by segment and without ASCII case: `/v1/organization` covers `/v1/organization/admin_api_keys` but not `/v1/organizations`, and `/repos/*/*/keys` covers `/repos/acme/web/keys/1`. A request segment that is a denied segment followed by `.` and anything is that segment: a Rails-style router takes the rest for a response format and runs the same action, so `/repos/*/*/keys` covers `/repos/acme/web/keys.json`, and `/v1/organization` covers `/v1/organization.json` (never `/v1/organizations.json`).
 
 A request path that is not normalized counts as denied, since a server that normalizes it could reach a denied endpoint:
 
@@ -173,5 +173,5 @@ A registry error is a kind, the file and, where the parser recorded one, the lin
 | 11, detection part: no fixture in freed memory, even with the allocator's wipe off | `tests/detect_probe.rs` |
 | Errors carry no value | `tests/loader.rs` |
 | A key pattern without a literal prefix fails to load | `tests/loader.rs` |
-| A balance request to a denied path, in any spelling a server could normalize to one, fails to load | `tests/loader.rs` |
+| A balance request to a denied path, in any spelling a server could normalize to one or route to it (a format suffix such as `.json`), fails to load | `tests/loader.rs` |
 | CODEOWNERS covers the provider files, their compiled copy, the generator and the loader rules | `tests/embedded.rs` |
