@@ -211,6 +211,10 @@ const TESTS: &[Test] = &[
         "on_a_terminal_sigterm_is_passed_to_the_child",
         on_a_terminal_sigterm_is_passed_to_the_child,
     ),
+    (
+        "on_a_terminal_sigint_and_sigquit_from_a_process_reach_the_child",
+        on_a_terminal_sigint_and_sigquit_from_a_process_reach_the_child,
+    ),
     ("exit_codes_pass_through", exit_codes_pass_through),
     (
         "a_prompt_shows_and_the_start_of_a_value_waits",
@@ -323,8 +327,11 @@ fn emitter() -> PathBuf {
 const DETACH: &str = "import os, sys\nos.setsid()\nos.execv(sys.argv[1], sys.argv[1:])\n";
 
 /// Runs argv[4..] leading a session on a new pseudo-terminal. Waits until
-/// the terminal shows `ready`, then (argv[1]) types Ctrl-C, or sends
-/// SIGTERM to the process. Reads until the terminal has been quiet for
+/// the terminal shows `ready`, then (argv[1]) types Ctrl-C (`ctrl-c`),
+/// sends the process SIGTERM, SIGINT or SIGQUIT from this driver, in
+/// another session (`sigterm`, `sigint`, `sigquit`), or does nothing
+/// (`none`: the command signals the process itself). Reads until the
+/// terminal has been quiet for
 /// argv[2] seconds, then waits up to argv[3] seconds for the process to
 /// exit. Prints `RUNNER <pid>`, then `EXIT <code>` and everything the
 /// terminal showed. A process that is not ready in time, or does not exit
@@ -370,8 +377,9 @@ while b'ready' not in out:
         give_up(b'NOREADY')
 if send == 'ctrl-c':
     os.write(fd, b'\x03')
-else:
-    os.kill(pid, signal.SIGTERM)
+elif send != 'none':
+    sig = {'sigterm': signal.SIGTERM, 'sigint': signal.SIGINT, 'sigquit': signal.SIGQUIT}[send]
+    os.kill(pid, sig)
 while more(time.time() + quiet):
     pass
 end = time.time() + patience
@@ -1253,7 +1261,40 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
     envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
     let (status, _, err) = p.finish(Duration::from_secs(60));
     assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{}", lossy(&err));
+
+    // SIGHUP and SIGQUIT are passed on the same way (review T12-1).
+    for (sig, name) in [(libc::SIGHUP, "HUP"), (libc::SIGQUIT, "QUIT")] {
+        let p = Proc::spawn(detached(&home, &setup, &os(&sh(&traps(name, sig)))));
+        assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
+        envcloak_sys::signal_process(p.pid(), sig).unwrap();
+        let (status, out, err) = p.finish(Duration::from_secs(60));
+        assert_eq!(status.code(), Some(128 + sig), "{name}: {}", lossy(&err));
+        let want = format!("[envcloak:openai_api_key/t]\ngot-{name}\n");
+        assert!(contains(&out, want.as_bytes()), "{name}: {}", lossy(&out));
+        assert_no_canary(&out, &cs);
+        assert_no_canary(&err, &cs);
+    }
     home.assert_clean(&cs);
+}
+
+/// A child that traps `name` (signal `sig`): it reports its pid, says
+/// `ready` and waits; on the signal it prints the value, says
+/// `got-<name>` and exits 128 plus the signal's number. `then` runs after
+/// `ready`, before the wait.
+fn traps_then(name: &str, sig: i32, then: &str) -> String {
+    format!(
+        "trap 'printf \"%s\\n\" \"$OPENAI_API_KEY\"; echo got-{name}; exit {code}' {name}\n\
+         echo \"pid=$$\"\n\
+         echo ready\n\
+         {then}\n\
+         while :; do sleep 0.05; done",
+        code = 128 + sig
+    )
+}
+
+/// [`traps_then`], waiting as soon as it is ready.
+fn traps(name: &str, sig: i32) -> String {
+    traps_then(name, sig, ":")
 }
 
 /// On a terminal the child stays in the runner's group: Ctrl-C reaches
@@ -1307,6 +1348,70 @@ while :; do sleep 0.05; done"#;
     );
     assert!(contains(&shown, b"got-term"), "{}", lossy(&shown));
     assert_no_canary(&shown, &cs);
+    home.assert_clean(&cs);
+}
+
+/// Review T12-1: on a terminal, a SIGINT or SIGQUIT that a process sends
+/// the runner by pid (not the terminal's Ctrl-C or Ctrl-\, which reach
+/// the child themselves) is passed on to the child: its trap runs, its
+/// output redacted, and the runner exits with its code. Sent by the
+/// command itself, in the runner's session, on both systems. Sent by the
+/// pty driver, in another session: passed on on Linux, whose `si_code`
+/// tells `kill` from the terminal; on macOS, which reports both alike and
+/// then takes the terminal's side, left to the child, which never gets it
+/// (docs/RUN.md), and the driver gives up.
+fn on_a_terminal_sigint_and_sigquit_from_a_process_reach_the_child() {
+    let seed = fresh_seed();
+    let cs = all_canaries(seed);
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    for (sig, name, send) in [
+        (libc::SIGINT, "INT", "sigint"),
+        (libc::SIGQUIT, "QUIT", "sigquit"),
+    ] {
+        let want = format!("got-{name}");
+        // The command signals the runner, its parent.
+        let own = traps_then(name, sig, &format!("kill -{name} $PPID"));
+        let p = on_pty_within(&home, "none", (2, 30), &setup, &os(&sh(&own)));
+        assert_eq!(
+            p.end,
+            PtyEnd::Exit(128 + sig),
+            "{name}: {}",
+            lossy(&p.shown)
+        );
+        assert!(contains(&p.shown, want.as_bytes()), "{}", lossy(&p.shown));
+        assert!(
+            contains(&p.shown, b"[envcloak:openai_api_key/t]"),
+            "{}",
+            lossy(&p.shown)
+        );
+        assert_no_canary(&p.shown, &cs);
+
+        // The driver, in another session, signals the runner.
+        if cfg!(target_os = "linux") {
+            let p = on_pty_within(&home, send, (2, 30), &setup, &os(&sh(&traps(name, sig))));
+            assert_eq!(
+                p.end,
+                PtyEnd::Exit(128 + sig),
+                "{name}: {}",
+                lossy(&p.shown)
+            );
+            assert!(contains(&p.shown, want.as_bytes()), "{}", lossy(&p.shown));
+            assert_no_canary(&p.shown, &cs);
+        } else {
+            let p = on_pty_within(&home, send, (1, 2), &setup, &os(&sh(&traps(name, sig))));
+            let mut child = Leftover::in_group(field(&p.shown, "pid"), p.runner, Arc::new(Live));
+            assert_eq!(p.end, PtyEnd::NoExit, "{name}: {}", lossy(&p.shown));
+            assert!(!contains(&p.shown, want.as_bytes()), "{}", lossy(&p.shown));
+            assert_no_canary(&p.shown, &cs);
+            assert!(child.gone_within(Duration::from_secs(10)));
+        }
+    }
     home.assert_clean(&cs);
 }
 

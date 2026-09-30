@@ -4,7 +4,13 @@
 //!   the terminal sends its SIGINT and SIGQUIT (Ctrl-C, Ctrl-\) to both,
 //!   and this process, which catches them, stays to redact what the child
 //!   prints on its way out. SIGTERM and SIGHUP, which are sent to this
-//!   process alone, are passed on to the child.
+//!   process alone, are passed on to the child, and so are a SIGINT or
+//!   SIGQUIT that a process sent to this one (`kill`, `timeout
+//!   --foreground -s INT`, a harness's `send_signal`): the terminal did not
+//!   send those to the child (review T12-1). Which process sent a signal
+//!   is what [`envcloak_sys::Relayed`] says: exactly on Linux, and on macOS
+//!   for a sender in this session or already gone (see
+//!   `envcloak_sys::SignalRelay`).
 //! - Without one, the child leads a group of its own, so a signal meant
 //!   for this process does not reach it by itself: SIGINT, SIGTERM, SIGHUP
 //!   and SIGQUIT are passed on to the child's whole group.
@@ -19,7 +25,7 @@
 use std::io;
 use std::sync::Mutex;
 
-use envcloak_sys::SignalRelay;
+use envcloak_sys::{Relayed, SignalRelay};
 
 /// The signals the runner catches.
 pub(crate) const CAUGHT: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
@@ -28,6 +34,17 @@ pub(crate) const CAUGHT: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, 
 /// then.
 pub(crate) fn controlling_terminal() -> bool {
     std::fs::File::open("/dev/tty").is_ok()
+}
+
+/// Whether, with a controlling terminal, a caught signal is passed on to
+/// the child: SIGTERM and SIGHUP always, SIGINT and SIGQUIT only when a
+/// process sent them, since the terminal sends its own to the child too.
+pub(crate) fn passed_on_with_terminal(sig: i32, by_process: bool) -> bool {
+    match sig {
+        libc::SIGTERM | libc::SIGHUP => true,
+        libc::SIGINT | libc::SIGQUIT => by_process,
+        _ => false,
+    }
 }
 
 /// The child's pid while it may be signalled.
@@ -67,20 +84,21 @@ impl Forwarder {
 
     /// Passes signals on until [`Forwarder::stop`]. Run on its own thread.
     pub(crate) fn forward(&self, child: &ChildState) {
-        while let Ok(Some(sig)) = self.relay.next() {
+        while let Ok(Some(caught)) = self.relay.next() {
+            let Relayed::Signal {
+                number: sig,
+                by_process,
+            } = caught;
             let pid = child.pid.lock().unwrap_or_else(|e| e.into_inner());
             let Some(pid) = *pid else { continue };
             // A child that is gone by now, or a group already empty, is
             // not an error: there is nothing left to tell.
-            let _ = if self.terminal {
-                // The terminal sent SIGINT and SIGQUIT to the child itself.
-                if sig == libc::SIGTERM || sig == libc::SIGHUP {
-                    envcloak_sys::signal_process(pid, sig)
-                } else {
-                    Ok(())
-                }
-            } else {
+            let _ = if !self.terminal {
                 envcloak_sys::signal_group(pid, sig)
+            } else if passed_on_with_terminal(sig, by_process) {
+                envcloak_sys::signal_process(pid, sig)
+            } else {
+                Ok(())
             };
         }
     }
@@ -88,5 +106,34 @@ impl Forwarder {
     /// Ends [`Forwarder::forward`].
     pub(crate) fn stop(&self) {
         let _ = self.relay.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With a terminal: SIGTERM and SIGHUP are passed on whoever sent
+    /// them; SIGINT and SIGQUIT only when a process sent them, never the
+    /// terminal's own (which reached the child already).
+    #[test]
+    fn with_a_terminal_only_what_the_terminal_did_not_send_the_child_is_passed_on() {
+        for (sig, by_process, passed) in [
+            (libc::SIGTERM, true, true),
+            (libc::SIGTERM, false, true),
+            (libc::SIGHUP, true, true),
+            (libc::SIGHUP, false, true),
+            (libc::SIGINT, true, true),
+            (libc::SIGINT, false, false),
+            (libc::SIGQUIT, true, true),
+            (libc::SIGQUIT, false, false),
+            (libc::SIGUSR1, true, false),
+        ] {
+            assert_eq!(
+                passed_on_with_terminal(sig, by_process),
+                passed,
+                "{sig} {by_process}"
+            );
+        }
     }
 }

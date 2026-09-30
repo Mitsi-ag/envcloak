@@ -25,10 +25,11 @@
 //!    (`--pty`) is M2's.
 //! 4. Signals ([`signals`]): with a controlling terminal the child stays in
 //!    this process's group, so the terminal's SIGINT and SIGQUIT reach it
-//!    directly, and SIGTERM and SIGHUP are passed on. Without one the child
-//!    leads a group of its own, and SIGINT, SIGTERM, SIGHUP and SIGQUIT are
-//!    passed on to that group. This process outlives them all, so every
-//!    byte the child writes goes through the redactor.
+//!    directly; SIGTERM and SIGHUP are passed on, and so are a SIGINT or
+//!    SIGQUIT another process sent. Without one the child leads a group of
+//!    its own, and SIGINT, SIGTERM, SIGHUP and SIGQUIT are passed on to
+//!    that group. This process outlives them all, so every byte the child
+//!    writes goes through the redactor.
 //! 5. The exit: [`ChildExit`], the child's code or the signal that ended
 //!    it, which a shell reports as 128 plus its number
 //!    ([`ChildExit::shell_code`]). After the child exits, output is read
