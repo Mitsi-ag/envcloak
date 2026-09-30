@@ -41,9 +41,7 @@ pub fn run(args: &[&str]) -> ExitCode {
                 "not verified"
             };
             if json {
-                render::print_json(
-                    &serde_json::json!({"daemon": {"state": running}, "cli": {"hardening": cli}}),
-                );
+                print!("{}", not_running_json(running, &cli));
             } else {
                 println!("daemon: {running}");
                 if running == "not running" {
@@ -55,7 +53,7 @@ pub fn run(args: &[&str]) -> ExitCode {
         }
     };
     if json {
-        print_json(&status, identity, &cli);
+        print!("{}", status_json(&status, identity, &cli));
     } else {
         print_human(&status, identity, &cli);
     }
@@ -191,11 +189,103 @@ fn print_human(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
     }
 }
 
-fn print_json(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
+/// What `status --json` prints without a verified daemon: JSON through
+/// the CLI's one writer ([`render::json_text`]), and a newline.
+fn not_running_json(running: &str, cli: &HardeningView) -> String {
+    let v = serde_json::json!({"daemon": {"state": running}, "cli": {"hardening": cli}});
+    format!("{}\n", render::json_text(&v))
+}
+
+/// What `status --json` prints for the daemon's answer: JSON through the
+/// CLI's one writer ([`render::json_text`]), and a newline.
+fn status_json(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) -> String {
     let mut v = serde_json::to_value(s).unwrap_or_default();
     v["daemon"]["state"] = "running".into();
     v["daemon"]["identity"] = identity_word(identity).into();
     v["daemon"]["hardened"] = s.daemon.hardening.hardened().into();
     v["cli"] = serde_json::json!({"hardening": cli, "hardened": cli.hardened()});
-    render::print_json(&v);
+    format!("{}\n", render::json_text(&v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use envcloak_ipc::view::{
+        ApprovalsView, AuditStatusView, DaemonView, LockView, VaultState, VaultView,
+    };
+    use envcloak_policy::display_escaped;
+
+    fn hardening() -> HardeningView {
+        HardeningView {
+            core_dumps_off: true,
+            non_dumpable: false,
+            hardened_runtime: Some(false),
+        }
+    }
+
+    /// Review T11 open 2 (verification): `status --json` goes through the
+    /// CLI's one JSON writer. A program answering in the daemon's place
+    /// can put a C1 control (U+009B, CSI) or a bidirectional override
+    /// (U+202E) in a string that JSON's own encoding leaves as it is; the
+    /// text printed escapes them as `\uXXXX` and reads back unchanged.
+    #[test]
+    fn status_json_escapes_what_a_terminal_would_act_on() {
+        let version = "0.1.0\u{202e}\u{9b}31m";
+        let s = StatusView {
+            daemon: DaemonView {
+                version: version.to_owned(),
+                pid: 4242,
+                hardening: hardening(),
+                runtime_dir_fallback: false,
+            },
+            vault: VaultView {
+                state: VaultState::Unavailable,
+                integrity: None,
+                read_only: false,
+                unavailable: Some("damaged\u{9b}2J".to_owned()),
+                busy: false,
+                failed_unlocks: 0,
+            },
+            lock: LockView {
+                last_reason: None,
+                idle_limit_secs: 900,
+                idle_remaining_secs: None,
+            },
+            approvals: ApprovalsView {
+                grants: 0,
+                pending: 0,
+                proof_failures: 0,
+                proof_wait_secs: 0,
+            },
+            audit: AuditStatusView {
+                open: false,
+                head_seq: None,
+                unanchored: 0,
+                anchor_failed: false,
+                queued: 0,
+                dropped: 0,
+            },
+        };
+        let text = status_json(&s, DaemonIdentity::Unverified, &hardening());
+        assert!(text.ends_with('\n'), "{text:?}");
+        assert!(!text.trim_end().chars().any(display_escaped), "{text:?}");
+        assert!(
+            text.contains(r#""version":"0.1.0\u202e\u009b31m""#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""unavailable":"damaged\u009b2J""#),
+            "{text}"
+        );
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["daemon"]["version"], version);
+        assert_eq!(back["daemon"]["state"], "running");
+        assert_eq!(back["daemon"]["identity"], "unverified");
+
+        let text = not_running_json("not running", &hardening());
+        assert!(text.ends_with('\n'), "{text:?}");
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["daemon"]["state"], "not running");
+        assert_eq!(back["cli"]["hardening"]["core_dumps_off"], true);
+    }
 }

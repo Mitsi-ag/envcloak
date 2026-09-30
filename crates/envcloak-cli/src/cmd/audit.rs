@@ -35,7 +35,7 @@ fn verify(json: bool) -> Result<ExitCode, Failure> {
     let v = connect()?.audit_verify()?;
     let problem = v.first_problem.is_some() || v.live_head_matches == Some(false);
     if json {
-        crate::render::print_json(&v);
+        print!("{}", verify_json(&v));
     } else {
         print_human(&v);
     }
@@ -52,6 +52,12 @@ fn verify(json: bool) -> Result<ExitCode, Failure> {
             None => "the audit log no longer ends where the daemon last wrote it".to_owned(),
         },
     ))
+}
+
+/// What `audit verify --json` prints: JSON through the CLI's one writer
+/// ([`crate::render::json_text`]), and a newline.
+fn verify_json(v: &AuditVerifyView) -> String {
+    format!("{}\n", crate::render::json_text(v))
 }
 
 fn plural(n: u64, one: &str, many: &str) -> String {
@@ -149,5 +155,62 @@ fn print_human(v: &AuditVerifyView) {
             plural(v.queued, "event", "events"),
             v.dropped
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use envcloak_ipc::view::{AnchorView, AuditProblemView, SeqRange};
+    use envcloak_policy::display_escaped;
+
+    /// Every string in `v`, at any depth.
+    fn strings(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|x| strings(x, out)),
+            _ => {}
+        }
+    }
+
+    /// Review T11 open 2 (verification): `audit verify --json` prints the
+    /// CLI's one JSON form, and a newline. The view holds counts, sequence
+    /// numbers and fixed tokens only, so a daemon (or a program answering
+    /// in its place) has no free text to put on the screen: every string
+    /// printed is one of the protocol's tokens, and it reads back as the
+    /// view.
+    #[test]
+    fn audit_verify_json_is_the_terminal_safe_form_of_fixed_tokens() {
+        let v = AuditVerifyView {
+            segments: 2,
+            entries: 17,
+            last_seq: 17,
+            first_problem: Some(AuditProblemView {
+                seq: 9,
+                kind: AuditProblemKind::ChainBroken,
+            }),
+            problems: 1,
+            anchor: AnchorView {
+                state: AnchorState::Matched,
+                seq: Some(8),
+            },
+            unanchored_tail: Some(SeqRange { first: 9, last: 17 }),
+            torn_tail: false,
+            torn_bytes: 0,
+            live_head_matches: Some(true),
+            queued: 0,
+            dropped: 0,
+        };
+        let text = verify_json(&v);
+        assert!(text.ends_with('\n'), "{text:?}");
+        assert_eq!(text, format!("{}\n", crate::render::json_text(&v)));
+        assert!(!text.trim_end().chars().any(display_escaped), "{text:?}");
+        let back: AuditVerifyView = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, v);
+        let mut found = Vec::new();
+        strings(&serde_json::from_str(&text).unwrap(), &mut found);
+        found.sort();
+        assert_eq!(found, ["chain_broken", "matched"]);
     }
 }
