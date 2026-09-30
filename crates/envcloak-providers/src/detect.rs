@@ -180,12 +180,32 @@ fn url_password(v: &[u8]) -> Option<&[u8]> {
     (!password.is_empty()).then_some(password)
 }
 
+/// Which escapes a reading's syntax has, so its password is counted as
+/// the program that reads it would decode it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Escapes {
+    /// A URL's `%XX` (a DSN's driver takes the bytes as they are, and
+    /// decoding them anyway only shortens the count).
+    Percent,
+    /// A connection string's field: `%XX` in a JDBC query, and libpq's
+    /// backslash, which makes `\x` stand for `x` in its keyword form
+    /// (review F-65). Counted both ways, the fewer characters winning.
+    Field,
+}
+
+/// One password reading: the bytes as the value holds them, and how they
+/// may be escaped.
+struct Reading<'a> {
+    bytes: &'a [u8],
+    escapes: Escapes,
+}
+
 /// Password readings of a value ([`password_chars`]), and how many bytes
 /// the searches read to find them. No `Debug`: the readings are parts of
 /// the value.
 #[derive(Default)]
 struct Readings<'a> {
-    found: Vec<&'a [u8]>,
+    found: Vec<Reading<'a>>,
     /// Every byte a search read, counted each time one read it. The tests
     /// hold it linear in the value's length, and see it stop growing once
     /// the searches stop at [`MAX_PASSWORD_READINGS`] (review R-5): the
@@ -194,10 +214,11 @@ struct Readings<'a> {
 }
 
 impl<'a> Readings<'a> {
-    /// Keeps `reading`, and says whether the search goes on: not once
-    /// there are more readings than [`MAX_PASSWORD_READINGS`].
-    fn push(&mut self, reading: &'a [u8]) -> bool {
-        self.found.push(reading);
+    /// Keeps `bytes`, escaped as `escapes` says, and says whether the
+    /// search goes on: not once there are more readings than
+    /// [`MAX_PASSWORD_READINGS`].
+    fn push(&mut self, bytes: &'a [u8], escapes: Escapes) -> bool {
+        self.found.push(Reading { bytes, escapes });
         !self.over()
     }
 
@@ -287,18 +308,37 @@ fn url_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
             if ends[..k].contains(&Some(end)) || end <= colon + 1 {
                 continue;
             }
-            if !out.push(&v[colon + 1..end]) {
+            if !out.push(&v[colon + 1..end], Escapes::Percent) {
                 return;
             }
         }
     }
 }
 
-/// How many characters `password` has: a `%XX` escape counts as the byte
-/// it stands for, and the bytes are counted as [`SecretBytes::utf8_chars`]
-/// counts them, or, when they are not UTF-8, as four bytes a character.
-/// The decoded copy is wiped.
-fn password_len(password: &[u8]) -> usize {
+/// How many characters a reading's password has, as its syntax decodes
+/// it: a `%XX` escape counts as the byte it stands for, and in a field
+/// libpq's `\x` counts as `x` too (taken the other way, the fewer
+/// characters winning). The bytes are counted as
+/// [`SecretBytes::utf8_chars`] counts them, or, when they are not UTF-8,
+/// as four bytes a character. Each decoded copy is wiped.
+fn password_len(reading: &Reading<'_>) -> usize {
+    let percent = decoded_chars(percent_decoded(reading.bytes));
+    match reading.escapes {
+        Escapes::Percent => percent,
+        Escapes::Field => percent.min(decoded_chars(backslash_decoded(reading.bytes))),
+    }
+}
+
+/// The characters of `decoded`, which is then wiped.
+fn decoded_chars(decoded: Vec<u8>) -> usize {
+    let decoded = SecretBytes::from_vec(decoded);
+    decoded.utf8_chars().unwrap_or_else(|| decoded.len() / 4)
+}
+
+/// `password` with each `%XX` escape made the byte it stands for. Never
+/// longer than `password`, so the vector never grows past its capacity
+/// (no copy is left unwiped).
+fn percent_decoded(password: &[u8]) -> Vec<u8> {
     let mut decoded = Vec::with_capacity(password.len());
     let mut i = 0;
     while i < password.len() {
@@ -326,8 +366,26 @@ fn password_len(password: &[u8]) -> usize {
             }
         }
     }
-    let decoded = SecretBytes::from_vec(decoded);
-    decoded.utf8_chars().unwrap_or_else(|| decoded.len() / 4)
+    decoded
+}
+
+/// `password` as libpq's keyword form decodes a value (review F-65): a
+/// backslash makes the byte after it stand for itself, and one with no
+/// byte after it is dropped, as libpq drops it. A reading that stops
+/// before libpq's value does (at a `;`, or at the first quote) then counts
+/// no more characters than the whole value decodes to.
+fn backslash_decoded(password: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(password.len());
+    let mut escaped = false;
+    for &b in password {
+        if b == b'\\' && !escaped {
+            escaped = true;
+        } else {
+            decoded.push(b);
+            escaped = false;
+        }
+    }
+    decoded
 }
 
 /// Go's MySQL DSN, `user:password@tcp(host:3306)/db`, has no scheme: its
@@ -365,7 +423,7 @@ fn dsn_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
             _ => false,
         };
         let password = &v[colon + 1..at];
-        if address && !password.is_empty() && !out.push(password) {
+        if address && !password.is_empty() && !out.push(password, Escapes::Percent) {
             return;
         }
         at += 1;
@@ -375,22 +433,48 @@ fn dsn_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
 /// The names a password field goes by in connection strings, in any case.
 const PASSWORD_FIELDS: [&[u8]; 3] = [b"password", b"passwd", b"pwd"];
 
+/// How long an unquoted value of libpq's keyword form at the start of
+/// `value` is: up to the first whitespace that no backslash escapes.
+fn libpq_value_len(value: &[u8], out: &mut Readings<'_>) -> usize {
+    let mut escaped = false;
+    for (i, &b) in value.iter().enumerate() {
+        out.scanned += 1;
+        if !escaped && c_space(b) {
+            return i;
+        }
+        escaped = !escaped && b == b'\\';
+    }
+    value.len()
+}
+
+/// Whitespace as C's `isspace` takes it, which libpq reads a keyword form
+/// with: space, tab, line feed, vertical tab, form feed and carriage
+/// return.
+fn c_space(b: u8) -> bool {
+    b.is_ascii_whitespace() || b == 0x0b
+}
+
 /// Password fields of connection strings made of `name=value` fields: the
 /// libpq keyword form (`host=db user=app password=...`), ADO.NET and ODBC
 /// (`Server=db;Password=...;`, `PWD=...`) and JDBC's query (`...?user=app&
 /// password=...`). A field is one of [`PASSWORD_FIELDS`] at the start of
 /// the value or after a byte that is not a letter, digit or `_`, then `=`,
-/// with spaces or tabs around it. Its value runs to the first `;`, `&` or
-/// whitespace; when it starts with `'`, `"` or `{`, what the quotes hold
-/// up to the first closing `'`, `"` or `}` is a reading too, since libpq,
-/// ADO.NET and ODBC quote a value that holds a separator.
+/// with whitespace around it (as libpq takes it: [`c_space`]). Its value
+/// runs to the first `;`, `&` or whitespace; when it starts with `'`, `"`
+/// or `{`, what the quotes hold up to the first closing `'`, `"` or `}` is
+/// a reading too, since libpq, ADO.NET and ODBC quote a value that holds
+/// a separator. Each reading is counted with libpq's backslash escapes
+/// decoded as well as `%XX` ([`password_len`]). A reading ends no later
+/// than the value its program reads (libpq's ends at whitespace no
+/// backslash escapes, or at a quote none does; ADO.NET's and ODBC's at
+/// a `;`, or at a quote that is not doubled), so it counts no more
+/// characters than that value decodes to.
 ///
 /// Only a field that gives a reading can read far (to the value's end);
 /// the search stops after more than [`MAX_PASSWORD_READINGS`] readings, so
 /// it reads each byte at most twice for each of those and a bounded
 /// number of times otherwise.
 fn field_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
-    let blank = |b: u8| matches!(b, b' ' | b'\t');
     for start in 0..v.len() {
         out.scanned += 1;
         if start > 0 && (v[start - 1].is_ascii_alphanumeric() || v[start - 1] == b'_') {
@@ -410,20 +494,27 @@ fn field_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
             continue;
         };
         let mut i = start + name.len();
-        i += out.run(&v[i..], blank);
+        i += out.run(&v[i..], c_space);
         if v.get(i) != Some(&b'=') {
             continue;
         }
         i += 1;
-        i += out.run(&v[i..], blank);
+        i += out.run(&v[i..], c_space);
         let value = &v[i..];
         let plain = out
-            .position(value, |b| {
-                matches!(b, b';' | b'&') || b.is_ascii_whitespace()
-            })
+            .position(value, |b| matches!(b, b';' | b'&') || c_space(b))
             .unwrap_or(value.len());
-        if plain > 0 && !out.push(&value[..plain]) {
+        if plain > 0 && !out.push(&value[..plain], Escapes::Field) {
             return;
+        }
+        if plain == 0 {
+            // libpq's value starting with `;` or `&`, which libpq does
+            // not end a value at: to the first whitespace no backslash
+            // escapes. (A non-empty reading above is the start of it.)
+            let libpq = libpq_value_len(value, out);
+            if libpq > 0 && !out.push(&value[..libpq], Escapes::Field) {
+                return;
+            }
         }
         let close = match value.first() {
             Some(b'\'') => Some(b'\''),
@@ -434,7 +525,7 @@ fn field_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
         if let Some(close) = close {
             let inner = &value[1..];
             let end = out.position(inner, |b| b == close).unwrap_or(inner.len());
-            if end > 0 && !out.push(&inner[..end]) {
+            if end > 0 && !out.push(&inner[..end], Escapes::Field) {
                 return;
             }
         }
@@ -489,7 +580,7 @@ pub fn password_chars(value: &SecretBytes) -> Option<usize> {
     if readings.over() {
         return Some(0);
     }
-    readings.found.into_iter().map(password_len).min()
+    readings.found.iter().map(password_len).min()
 }
 
 fn key_shaped_run(v: &[u8]) -> bool {
@@ -718,7 +809,6 @@ mod shape_tests {
             b"db_password=abcdefgh",
             b"the password is abcdefgh",
             b"host=db.internal dbname=app password=",
-            b"host=db.internal password=;",
             // Not a DSN: no `:` before the `@`, or no address after it.
             b"app@tcp(db.internal:3306)/app",
             b"app:abcdefgh@db.internal",
@@ -742,8 +832,9 @@ mod shape_tests {
         assert_eq!(password_chars(&run("pwd='{\"")), Some(0));
         let dsn = [b"app:".to_vec(), run("x@tcp(")].concat();
         assert_eq!(password_chars(&dsn), Some(0));
-        // Empty fields are no readings, however many.
-        assert_eq!(password_chars(&run("password=;")), None);
+        // A value that starts with `;` is empty to ADO.NET, and libpq's
+        // up to the first whitespace: more readings than are counted.
+        assert_eq!(password_chars(&run("password=;")), Some(0));
     }
 
     /// Review R-3: Go's MySQL DSN with a protocol and no address
@@ -884,10 +975,10 @@ mod shape_tests {
     }
 
     /// Where each reading is in `v`: its offset and length.
-    fn spans(v: &[u8], found: &[&[u8]]) -> Vec<(usize, usize)> {
+    fn spans(v: &[u8], found: &[Reading<'_>]) -> Vec<(usize, usize)> {
         found
             .iter()
-            .map(|r| (r.as_ptr().addr() - v.as_ptr().addr(), r.len()))
+            .map(|r| (r.bytes.as_ptr().addr() - v.as_ptr().addr(), r.bytes.len()))
             .collect()
     }
 
@@ -976,9 +1067,10 @@ mod shape_tests {
         // Each search on its own, since the others read such a value to
         // its end looking for their forms.
         type Search = for<'a> fn(&'a [u8], &mut Readings<'a>);
-        let past_cap: [(Search, &str, &str); 4] = [
+        let past_cap: [(Search, &str, &str); 5] = [
             (field_passwords, "", "password=abcdefghijklmnopq "),
             (field_passwords, "", "pwd={abcdefghijklmnop};"),
+            (field_passwords, "", "password=;abcdefghijklmnopq "),
             (url_passwords, "", "a://u:abcdefghijklmnop@h/ "),
             (dsn_passwords, "app:", "x@tcp("),
         ];
@@ -996,6 +1088,7 @@ mod shape_tests {
 
         for unit in [
             "password=",
+            "password=;",
             "pwd='{\"",
             "password  ",
             "passwor",
