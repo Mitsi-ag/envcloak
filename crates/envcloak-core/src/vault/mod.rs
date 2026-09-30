@@ -103,7 +103,9 @@ pub struct LockedVault {
     schema_version: u16,
     epoch: u32,
     created_at: u64,
-    plan: MigrationPlan,
+    /// Boxed, as `paths` is: a failed unlock hands the locked vault back in
+    /// its error.
+    plan: Box<MigrationPlan>,
     /// Boxed: a failed unlock hands the locked vault back in its error.
     paths: Box<VaultPaths>,
 }
@@ -179,7 +181,7 @@ impl LockedVault {
             epoch: id.epoch,
             created_at: id.created_at,
             conn,
-            plan,
+            plan: Box::new(plan),
             paths: Box::new(paths),
         })
     }
@@ -277,6 +279,9 @@ impl LockedVault {
     /// the vault opens read-only at its old version, with
     /// [`Vault::migration_error`] set, so its owner can still read and back
     /// up what it holds (SPEC §15.2 gate 7). The next unlock tries again.
+    /// When the rows are no longer the ones the check verified (another
+    /// program wrote the file in between), nothing is migrated and the
+    /// vault opens read-only, [`TamperKind::ChangedWhileOpen`].
     ///
     /// When the file names more than one schema version (an altered or
     /// restored `meta` or header row), the vault opens under the first one
@@ -342,8 +347,20 @@ impl LockedVault {
         self.schema_version = ctx.schema_version;
         let mut migration_error = None;
         if migrate && loaded.integrity == Integrity::Ok && ctx.schema_version < self.plan.target() {
+            #[cfg(feature = "testing")]
+            if let Some(f) = self.plan.before_migration() {
+                f(&self.paths);
+            }
             let header = loaded.state.header;
-            match migrate::run(&mut self.conn, &keys, &ctx, &header, &self.plan) {
+            let run = migrate::run(
+                &mut self.conn,
+                &keys,
+                &ctx,
+                &header,
+                &loaded.state.stamps,
+                &self.plan,
+            );
+            match run {
                 Ok(()) => {
                     self.schema_version = self.plan.target();
                     ctx.schema_version = self.schema_version;
@@ -351,6 +368,11 @@ impl LockedVault {
                         Ok(l) => l,
                         Err(e) => return Err((self, e)),
                     };
+                }
+                // A row changed on disk after unlock verified it: nothing
+                // was migrated, and the vault opens read-only.
+                Err(e) if e.kind() == VaultErrorKind::Tampered => {
+                    loaded.integrity = Integrity::Tampered(TamperKind::ChangedWhileOpen);
                 }
                 // Rolled back: the file, and so `loaded`, are as they were.
                 Err(e) => migration_error = Some(e.kind()),

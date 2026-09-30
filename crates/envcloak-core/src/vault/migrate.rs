@@ -20,15 +20,27 @@
 //! the header, with its copy of the schema version, is written, and the
 //! transaction commits.
 //!
+//! Unlock's check and the migration are separate transactions, and another
+//! program can write the file between them. So the page cache is dropped
+//! before the migration's transaction begins, and inside it, before
+//! anything is written, every row's stamp is read again and must equal the
+//! stamps unlock verified. A row deleted, added or changed in between is
+//! never re-sealed into a state the new header vouches for: the migration
+//! stops with [`VaultErrorKind::Tampered`], nothing is written, and the
+//! vault opens read-only at its old version, reporting
+//! [`TamperKind::ChangedWhileOpen`](super::TamperKind::ChangedWhileOpen).
+//!
 //! Version 1 is the first format, so the shipped plan has no steps.
+
+use std::collections::BTreeMap;
 
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use crate::crypto::{FieldTag, ItemClass, Keyring, Purpose, TableTag};
 
 use super::error::{VaultError, VaultErrorKind};
-use super::integrity::HeaderState;
-use super::schema::{CURRENT_SCHEMA, verify_schema};
+use super::integrity::{HeaderState, RowKey, Stamp};
+use super::schema::{CURRENT_SCHEMA, drop_page_cache, verify_schema};
 use super::state::{VaultCtx, item_class_from, item_key, scan_stamps};
 use super::values::{reseal, seal_record};
 
@@ -55,6 +67,10 @@ impl core::fmt::Debug for Migration {
 pub struct MigrationPlan {
     target: u16,
     steps: Vec<Migration>,
+    /// Test support only: called with the vault's paths after unlock
+    /// verified the vault and before its migration begins.
+    #[cfg(feature = "testing")]
+    before_migration: Option<fn(&super::VaultPaths)>,
 }
 
 impl MigrationPlan {
@@ -63,6 +79,8 @@ impl MigrationPlan {
         MigrationPlan {
             target: CURRENT_SCHEMA,
             steps: Vec::new(),
+            #[cfg(feature = "testing")]
+            before_migration: None,
         }
     }
 
@@ -76,7 +94,27 @@ impl MigrationPlan {
             }
             target = target.checked_add(1).ok_or(VaultErrorKind::Migration)?;
         }
-        Ok(MigrationPlan { target, steps })
+        Ok(MigrationPlan {
+            target,
+            steps,
+            #[cfg(feature = "testing")]
+            before_migration: None,
+        })
+    }
+
+    /// Test support only: calls `f` with the vault's paths after unlock
+    /// has verified the vault and before the migration begins, as another
+    /// program writing the file between the two would.
+    #[cfg(feature = "testing")]
+    pub fn with_hook_before_migration(mut self, f: fn(&super::VaultPaths)) -> Self {
+        self.before_migration = Some(f);
+        self
+    }
+
+    /// The hook [`MigrationPlan::with_hook_before_migration`] set.
+    #[cfg(feature = "testing")]
+    pub(crate) fn before_migration(&self) -> Option<fn(&super::VaultPaths)> {
+        self.before_migration
     }
 
     pub fn target(&self) -> u16 {
@@ -117,25 +155,30 @@ impl core::fmt::Debug for MigrationTx<'_> {
 }
 
 /// Migrates the vault at `ctx` (its on-disk version, integrity verified,
-/// `header` its opened header) to `plan.target()`. Every failure rolls
-/// back and becomes [`VaultErrorKind::Migration`], except a busy or full
-/// disk, which keep their kinds.
+/// `header` its opened header, `verified` the stamps of the rows unlock
+/// verified) to `plan.target()`. Every failure rolls back and becomes
+/// [`VaultErrorKind::Migration`], except a busy or full disk, which keep
+/// their kinds, and rows that are no longer the ones verified
+/// ([`VaultErrorKind::Tampered`]; see the module documentation).
 pub(crate) fn run(
     conn: &mut Connection,
     keys: &Keyring,
     ctx: &VaultCtx,
     header: &HeaderState,
+    verified: &BTreeMap<RowKey, Stamp>,
     plan: &MigrationPlan,
 ) -> Result<(), VaultError> {
     let as_migration = |e: VaultError| match e.kind() {
-        VaultErrorKind::Busy | VaultErrorKind::DiskFull => e,
+        VaultErrorKind::Busy | VaultErrorKind::DiskFull | VaultErrorKind::Tampered => e,
         _ => VaultErrorKind::Migration.into(),
     };
+    // Read the file as it is now, not pages cached while unlock read it.
+    drop_page_cache(conn).map_err(as_migration)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(VaultError::from)
         .map_err(as_migration)?;
-    migrate_in(&tx, keys, ctx, header, plan).map_err(as_migration)?;
+    migrate_in(&tx, keys, ctx, header, verified, plan).map_err(as_migration)?;
     tx.commit().map_err(VaultError::from).map_err(as_migration)
 }
 
@@ -144,8 +187,18 @@ fn migrate_in(
     keys: &Keyring,
     ctx: &VaultCtx,
     header: &HeaderState,
+    verified: &BTreeMap<RowKey, Stamp>,
     plan: &MigrationPlan,
 ) -> Result<(), VaultError> {
+    // Nothing is re-sealed unless every row is the one unlock verified. A
+    // malformed row cannot have verified either.
+    let now = scan_stamps(tx).map_err(|e| match e.kind() {
+        VaultErrorKind::Damaged => VaultErrorKind::Tampered.into(),
+        _ => e,
+    })?;
+    if now != *verified {
+        return Err(VaultErrorKind::Tampered.into());
+    }
     let mut version = ctx.schema_version;
     for step in plan.steps.iter().filter(|s| s.from >= ctx.schema_version) {
         if step.from != version {

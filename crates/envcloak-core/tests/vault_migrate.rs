@@ -4,7 +4,9 @@
 //! column under the new schema version and verifies; an older build refuses
 //! the newer file; `kill -9` during a migration leaves the old or the new
 //! vault, never a mix: the old one when the child is held inside the
-//! migration's transaction, the new one when it is held after the commit.
+//! migration's transaction, the new one when it is held after the commit;
+//! a row changed between unlock's check and the migration is tampering,
+//! never migrated.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -308,6 +310,87 @@ fn a_tampered_vault_is_not_migrated() {
     assert_eq!(dump(&f), before);
 }
 
+/// Runs `sql` on `vault.db` behind the open vault, as another program can
+/// (the vault's lock is advisory): on a copy, through a plain connection,
+/// whose bytes then replace the file's. The vault has not written, so
+/// every page it reads comes from `vault.db`.
+fn rewrite_behind(p: &VaultPaths, sql: &str) {
+    let db = std::fs::canonicalize(&p.vault_dir)
+        .unwrap()
+        .join("vault.db");
+    let copy = p.data_dir.join("rewrite.db");
+    std::fs::copy(&db, &copy).unwrap();
+    let raw = rusqlite::Connection::open(&copy).unwrap();
+    raw.execute_batch(sql).unwrap();
+    drop(raw);
+    let bytes = std::fs::read(&copy).unwrap();
+    std::fs::remove_file(&copy).unwrap();
+    assert_ne!(bytes, std::fs::read(&db).unwrap(), "no change: {sql}");
+    std::fs::write(&db, bytes).unwrap();
+}
+
+fn delete_a_policy_behind(p: &VaultPaths) {
+    rewrite_behind(p, "DELETE FROM policies;");
+}
+
+fn add_a_policy_behind(p: &VaultPaths) {
+    rewrite_behind(
+        p,
+        "INSERT INTO policies SELECT randomblob(16), row_version, sealed FROM policies;",
+    );
+}
+
+/// Review T3 open 2: unlock's check and the migration are separate
+/// transactions. A row deleted or added between them (here through the
+/// test-only hook between the two) is not re-sealed into a state the new
+/// header vouches for: the vault opens read-only at version 1, "changed
+/// while open", nothing is migrated, and a build without the migration
+/// then reports the change too.
+#[test]
+fn a_row_changed_between_the_check_and_the_migration_is_tampering() {
+    for (case, hook, later) in [
+        (
+            "a policy deleted",
+            delete_a_policy_behind as fn(&VaultPaths),
+            TamperKind::DigestMismatch,
+        ),
+        // Sealed for the row it was copied from, it does not open.
+        (
+            "a policy added",
+            add_a_policy_behind,
+            TamperKind::RowUnreadable,
+        ),
+    ] {
+        let (f, values) = populated(3);
+        let plan = to_v2(set_tier).with_hook_before_migration(hook);
+        let mut v = open_with(&f, plan).map_err(|(_, e)| e).unwrap();
+        assert_eq!(
+            v.integrity(),
+            Integrity::Tampered(TamperKind::ChangedWhileOpen),
+            "{case}"
+        );
+        assert_eq!(v.schema_version(), 1, "{case}: not migrated");
+        assert_values(&v, &values);
+        let e = v
+            .transact(|t| t.set_value(values[1].0, SecretBytes::copy_from(b"refused")))
+            .unwrap_err();
+        assert_eq!(e.kind(), VaultErrorKind::ReadOnly, "{case}");
+        drop(v);
+        let raw = f.raw();
+        let versions: (i64, i64) = raw
+            .query_row(
+                "SELECT (SELECT schema_version FROM meta), (SELECT schema_version FROM header)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(versions, (1, 1), "{case}");
+        drop(raw);
+        let v = f.unlock();
+        assert_eq!(v.integrity(), Integrity::Tampered(later), "{case}");
+    }
+}
+
 /// Gate 6 across a migration: `meta` restored from the copy taken before
 /// the vault moved to version 2, or the header's copy of the version
 /// lowered, opens read-only at the version the header and rows were sealed
@@ -398,6 +481,48 @@ fn migration_child() {
     std::thread::sleep(Duration::from_secs(60));
 }
 
+/// Which vault a killed migration left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Left {
+    Old,
+    New,
+}
+
+/// Opens the vault a killed migration left and checks that it is exactly
+/// the old vault, byte for byte, or the migrated one, whole.
+fn left_by_kill(
+    f: &Fixture,
+    values: &[(FieldId, Vec<u8>)],
+    before: &[(String, Vec<Vec<Value>>)],
+    ctx: &str,
+) -> Left {
+    match LockedVault::open(&f.paths) {
+        Ok(locked) => {
+            let v = locked.unlock(f.vmk()).map_err(|(_, e)| e).unwrap();
+            assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
+            assert_eq!(v.schema_version(), 1, "{ctx}");
+            assert_values(&v, values);
+            drop(v);
+            assert_eq!(dump(f), before, "{ctx}: the old vault changed");
+            Left::Old
+        }
+        Err(e) => {
+            assert_eq!(e.kind(), VaultErrorKind::UnsupportedVersion, "{ctx}");
+            let v = open_with(f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap();
+            assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
+            assert_eq!(v.schema_version(), 2, "{ctx}");
+            assert_values(&v, values);
+            Left::New
+        }
+    }
+}
+
+/// Gate 7's crash half (Codex F-25): the child is held inside the
+/// migration transaction, after the rows were re-sealed and before the
+/// commit, and killed there: the old vault is left. Held after the commit
+/// and killed: the migrated one. Neither depends on when the kill lands.
+/// Then kills at random moments within a measured migration add coverage,
+/// each leaving one vault or the other, however they fall.
 #[test]
 fn kill_9_during_a_migration_leaves_the_old_or_the_new_vault() {
     let seed = fresh_seed();
@@ -459,48 +584,6 @@ fn kill_9_during_a_migration_leaves_the_old_or_the_new_vault() {
     println!("random migration kills (seed {seed}): {old} left version 1, {new} left version 2");
 }
 
-/// Which vault a killed migration left.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Left {
-    Old,
-    New,
-}
-
-/// Opens the vault a killed migration left and checks that it is exactly
-/// the old vault, byte for byte, or the migrated one, whole.
-fn left_by_kill(
-    f: &Fixture,
-    values: &[(FieldId, Vec<u8>)],
-    before: &[(String, Vec<Vec<Value>>)],
-    ctx: &str,
-) -> Left {
-    match LockedVault::open(&f.paths) {
-        Ok(locked) => {
-            let v = locked.unlock(f.vmk()).map_err(|(_, e)| e).unwrap();
-            assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
-            assert_eq!(v.schema_version(), 1, "{ctx}");
-            assert_values(&v, values);
-            drop(v);
-            assert_eq!(dump(f), before, "{ctx}: the old vault changed");
-            Left::Old
-        }
-        Err(e) => {
-            assert_eq!(e.kind(), VaultErrorKind::UnsupportedVersion, "{ctx}");
-            let v = open_with(f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap();
-            assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
-            assert_eq!(v.schema_version(), 2, "{ctx}");
-            assert_values(&v, values);
-            Left::New
-        }
-    }
-}
-
-/// Gate 7's crash half (Codex F-25): the child is held inside the
-/// migration transaction, after the rows were re-sealed and before the
-/// commit, and killed there: the old vault is left. Held after the commit
-/// and killed: the migrated one. Neither depends on when the kill lands.
-/// Then kills at random moments within a measured migration add coverage,
-/// each leaving one vault or the other, however they fall.
 #[test]
 fn plans_must_be_contiguous() {
     let e = MigrationPlan::new(vec![Migration {
