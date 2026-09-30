@@ -897,6 +897,7 @@ mod tests {
                 exe: None,
             },
             sid: Some(sid),
+            terminal: None,
             agent: None,
         }
     }

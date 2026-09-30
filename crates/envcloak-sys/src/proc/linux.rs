@@ -91,7 +91,7 @@ pub(super) fn proc_info(pid: i32) -> io::Result<ProcInfo> {
         start_time: f.start_time,
         uid,
         sid: (f.session > 0).then_some(f.session),
-        controlling_tty: f.tty_nr != 0,
+        controlling_tty: (f.tty_nr != 0).then(|| u64::from_ne_bytes(f.tty_nr.to_ne_bytes())),
         comm: OsString::from_vec(f.comm),
         exe: exe(pid),
         argv: None,

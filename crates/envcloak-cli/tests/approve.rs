@@ -688,6 +688,123 @@ fn an_empty_passphrase_line_sends_nothing() {
     f.sweep();
 }
 
+/// Review T9 open 3 (gate 23: approval input is never read from the
+/// requester's terminal). A shell on a pseudo-terminal runs the fixture
+/// agent in the background, and the agent's `envcloak run` is pending. A
+/// sibling of the agent on that terminal, a terminal subject with no
+/// agent in its ancestry, runs `envcloak approve`: refused
+/// (`proof_refused`, reason `requester_terminal`) before the statement is
+/// shown or the passphrase read. From another terminal the same approval
+/// goes through, and the agent's next run is covered.
+#[test]
+fn an_approval_from_the_agents_terminal_is_refused() {
+    let f = Fixture::new();
+    let dir = f.home.root().join("sibling");
+    std::fs::create_dir_all(&dir).unwrap();
+    let at = |name: &str| quoted(dir.join(name).to_str().unwrap());
+    let agent = testkit_bin("fixture-agent");
+    let cli = quoted(cli().to_str().unwrap());
+    let script = format!(
+        "set -u\n\
+         mkfifo {fifo}\n\
+         {agent} -- /bin/sh <{fifo} >/dev/null 2>&1 &\n\
+         exec 4>{fifo}\n\
+         echo \"cd {project}; {cli} run -- ./emit 2>{run_err}; echo \\$? >{run_code}\" >&4\n\
+         while [ ! -s {run_code} ]; do sleep 0.05; done\n\
+         id=$(sed -n 's/.*request=\\([0-9A-Z]*\\).*/\\1/p' {run_err} | head -n 1)\n\
+         exec 3<{pass}\n\
+         {cli} approve \"$id\" --passphrase-fd 3 >{out} 2>{err}\n\
+         echo $? >{code}\n\
+         cat <&3 | wc -c >{left}\n\
+         exec 3<&-\n\
+         while [ ! -e {go} ]; do sleep 0.05; done\n\
+         echo \"{cli} run -- /bin/sh -c true >/dev/null 2>{rerun_err}; echo \\$? >{rerun_code}\" >&4\n\
+         while [ ! -s {rerun_code} ]; do sleep 0.05; done\n\
+         exec 4>&-\n\
+         wait\n",
+        fifo = at("agent.in"),
+        agent = quoted(agent.to_str().unwrap()),
+        project = quoted(f.project.to_str().unwrap()),
+        cli = cli,
+        run_err = at("run.err"),
+        run_code = at("run.code"),
+        pass = quoted(f.pass.to_str().unwrap()),
+        out = at("approve.out"),
+        err = at("approve.err"),
+        code = at("approve.code"),
+        left = at("left"),
+        go = at("go"),
+        rerun_err = at("rerun.err"),
+        rerun_code = at("rerun.code"),
+    );
+    let mut child = common::on_terminal_program(
+        &f.home,
+        &[Path::new("/bin/sh"), Path::new("-c"), Path::new(&script)],
+        &[],
+    )
+    .spawn()
+    .unwrap();
+    let read = |name: &str| {
+        let end = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(dir.join(name)) {
+                if s.ends_with('\n') {
+                    return s;
+                }
+            }
+            assert!(Instant::now() < end, "{name} was not written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert_eq!(read("run.code").trim(), "125");
+    let id = request_id(&read("run.err"));
+    assert_eq!(read("approve.code").trim(), "1");
+    let err = std::fs::read_to_string(dir.join("approve.err")).unwrap();
+    assert!(err.starts_with("envcloak: proof_refused:"), "{err}");
+    assert!(err.contains("approve it from another terminal"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("approve.out")).unwrap(),
+        "",
+        "the statement was shown"
+    );
+    let pass_len = std::fs::metadata(&f.pass).unwrap().len();
+    assert_eq!(
+        read("left").trim().parse::<u64>().unwrap(),
+        pass_len,
+        "the passphrase was read"
+    );
+    let status = stdout(&run(&f.home, &["status"], &[]));
+    assert!(
+        status.contains("grants: 0 in force, 1 waiting for approval"),
+        "{status}"
+    );
+    let log = f.d.log();
+    assert!(
+        log.contains("proof refused method=pending.get reason=requester_terminal "),
+        "{log}"
+    );
+
+    // From a terminal of its own, a person approves it.
+    f.approve(&id, &[]);
+    std::fs::write(dir.join("go"), b"").unwrap();
+    assert_eq!(
+        read("rerun.code").trim(),
+        "0",
+        "{}",
+        std::fs::read_to_string(dir.join("rerun.err")).unwrap_or_default()
+    );
+    let end = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < end, "the terminal's shell did not end");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for name in ["run.err", "approve.err", "rerun.err"] {
+        let bytes = std::fs::read(dir.join(name)).unwrap_or_default();
+        assert_no_canary(&bytes, &f.cs);
+    }
+    f.sweep();
+}
+
 /// Gate 23: a proof needs a terminal session. The same person's command
 /// without a controlling terminal, as a program that left an agent's
 /// tree runs it (forked out and `setsid`; a service manager's job below),

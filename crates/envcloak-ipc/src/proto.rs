@@ -1234,7 +1234,7 @@ impl ErrorKind {
 /// was rejected, why the vault could not be opened, why the caller's
 /// ancestry could not be read, what is wrong with a manifest or a binding,
 /// what is wrong with approval options, and what is wrong with an item.
-pub const REASONS: [&str; 64] = [
+pub const REASONS: [&str; 65] = [
     // Passphrase rules (envcloak_core::PassphraseRejected).
     "not_text",
     "control_character",
@@ -1310,6 +1310,9 @@ pub const REASONS: [&str; 64] = [
     "nul_byte",
     "value_too_large",
     "no_free_slug",
+    // A proof refused (`proof_refused`) because the approver shares a
+    // session or a terminal with the request's own chain.
+    "requester_terminal",
 ];
 
 /// An error response. Built from fixed tokens only.
@@ -1319,8 +1322,9 @@ pub struct RpcError {
     /// One of [`REASONS`], for [`ErrorKind::PassphraseRejected`],
     /// [`ErrorKind::VaultUnavailable`], [`ErrorKind::Evidence`],
     /// [`ErrorKind::ManifestInvalid`], [`ErrorKind::BindingUnresolved`],
-    /// [`ErrorKind::InvalidOptions`], [`ErrorKind::NoSuchItem`] and
-    /// [`ErrorKind::InvalidItem`].
+    /// [`ErrorKind::InvalidOptions`], [`ErrorKind::NoSuchItem`],
+    /// [`ErrorKind::InvalidItem`] and [`ErrorKind::ProofRefused`]
+    /// (`requester_terminal` only).
     pub reason: Option<&'static str>,
 }
 

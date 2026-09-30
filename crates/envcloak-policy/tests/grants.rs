@@ -48,6 +48,7 @@ fn p(pid: i32, sid: i32, agent: Option<&str>) -> Ancestor {
     Ancestor {
         instance: inst(pid, 10 * u64::try_from(pid).unwrap()),
         sid: Some(sid),
+        terminal: None,
         agent: agent.map(label),
     }
 }

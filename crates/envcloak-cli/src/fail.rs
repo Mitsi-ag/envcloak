@@ -143,6 +143,10 @@ fn reason_text(reason: &str) -> &'static str {
         "nul_byte" => "the value holds a NUL byte, which no environment variable can carry",
         "value_too_large" => "the value is larger than 64 KiB",
         "no_free_slug" => "every numbered slug for it is taken; give one with --slug",
+        "requester_terminal" => {
+            "this terminal or its session is where the request came from; approve it from another \
+             terminal window"
+        }
         _ => "no detail",
     }
 }
