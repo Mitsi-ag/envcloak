@@ -184,6 +184,24 @@ fn the_embedded_registry_loads() {
     ] {
         assert!(github.path_denied(path), "{path}");
     }
+    // Review R-6: the rest of that kind. A repository transferred to
+    // another owner, added to an app installation or given to a team; an
+    // email address that can receive password resets; organization roles
+    // for users and teams, and the older security manager role.
+    for path in [
+        "/repos/acme/web/transfer",
+        "/user/installations/1/repositories/2",
+        "/user/installations/1/repositories",
+        "/user/emails",
+        "/orgs/acme/organization-roles/users/octocat/1",
+        "/orgs/acme/organization-roles/teams/core/1",
+        "/orgs/acme/organization-roles/1",
+        "/orgs/acme/security-managers/teams/core",
+        "/orgs/acme/teams/core/repos/acme/web",
+        "/teams/1/repos/acme/web",
+    ] {
+        assert!(github.path_denied(path), "{path}");
+    }
     for path in [
         "/repos/acme/web/pulls",
         "/repos/acme/web/codespaces",
@@ -194,6 +212,15 @@ fn the_embedded_registry_loads() {
         "/orgs/acme/teams/core/repos",
         "/repos/acme/web/issues/1/comments",
         "/user/memberships/orgs",
+        // R-6 controls: what is next to those, and gives nothing lasting.
+        "/repos/acme/web/topics",
+        "/repos/acme/web/transfers",
+        "/user/installations",
+        "/user/repos",
+        "/user",
+        "/orgs/acme/teams",
+        "/teams/1/repos",
+        "/teams/1",
     ] {
         assert!(!github.path_denied(path), "{path}");
     }
