@@ -21,16 +21,19 @@
 //!
 //! Exit 0 when everything checks out (docs/MANIFEST.md: every reference
 //! sent resolves, no env file holds a plaintext key, and every env file
-//! was read, none left past the bound); otherwise the report says what,
-//! and the exit is 1 with `check_failed`. With no manifest and no
+//! was read: none left past the bound, and the directory listed in full);
+//! otherwise the report says what, and the exit is 1 with `check_failed`.
+//! A directory that cannot be opened or listed, or whose listing breaks
+//! off, is reported as such (`env_scan_error`), never as holding no env
+//! files. With no manifest and no
 //! reference in any env file nothing is sent to the daemon. When the
 //! daemon cannot be asked (not running, the vault locked), the env files
 //! are still checked, and the report says the references were not and
 //! why, never that they do not resolve.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
@@ -88,7 +91,11 @@ fn check(json: bool) -> Result<ExitCode, Failure> {
         None => std::fs::canonicalize(".")
             .map_err(|_| Failure::new("io", "the working directory could not be read"))?,
     };
-    let (mut files, env_files_skipped) = scan(&dir);
+    let Scan {
+        mut files,
+        skipped: env_files_skipped,
+        error: env_scan_error,
+    } = scan(&dir);
     // Every env-file reference, in file order, for the daemon.
     let mut sent = Vec::new();
     for (_, refs) in &files {
@@ -124,6 +131,7 @@ fn check(json: bool) -> Result<ExitCode, Failure> {
         unchecked,
         env_files: files.into_iter().map(|(v, _)| v).collect(),
         env_files_skipped,
+        env_scan_error: env_scan_error.map(str::to_owned),
     };
     print(&report, json);
     if report.clean() {
@@ -136,31 +144,66 @@ fn check(json: bool) -> Result<ExitCode, Failure> {
     }
 }
 
-/// Reads the env files in `dir`, the first [`MAX_ENV_FILES`] by name:
-/// each file's view, and the references it holds as
-/// `NAME=<slug>[#field]` for the daemon. Also returns how many env files
-/// there were past the bound, which were not read.
-fn scan(dir: &Path) -> (Vec<(EnvFileView, Vec<String>)>, u64) {
+/// What [`scan`] found in a directory.
+struct Scan {
+    /// Each env file read: its view, and the references it holds as
+    /// `NAME=<slug>[#field]` for the daemon.
+    files: Vec<(EnvFileView, Vec<String>)>,
+    /// How many env files there were past the bound, which were not read.
+    skipped: u64,
+    /// Why the directory could not be listed in full
+    /// ([`CheckReport::DIRECTORY_UNREADABLE`],
+    /// [`CheckReport::LISTING_FAILED`]); `None` when it was.
+    error: Option<&'static str>,
+}
+
+/// Reads the env files in `dir`, the first [`MAX_ENV_FILES`] by name. A
+/// directory that cannot be opened or listed is an error, never an empty
+/// directory; after a listing that broke off, the env files named before
+/// the break are read, and the error says more may remain.
+fn scan(dir: &Path) -> Scan {
+    let unreadable = Scan {
+        files: Vec::new(),
+        skipped: 0,
+        error: Some(CheckReport::DIRECTORY_UNREADABLE),
+    };
     let Ok(handle) = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(dir)
     else {
-        return (Vec::new(), 0);
+        return unreadable;
     };
-    let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|e| e.file_name())
-            .filter(|n| is_env_file(n))
-            .collect(),
-        Err(_) => return (Vec::new(), 0),
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return unreadable;
     };
+    let (mut names, error) = env_file_names(entries.map(|e| e.map(|e| e.file_name())));
     names.sort();
     let skipped = u64::try_from(names.len().saturating_sub(MAX_ENV_FILES)).unwrap_or(u64::MAX);
     names.truncate(MAX_ENV_FILES);
-    let read = names.iter().map(|name| read_one(&handle, name)).collect();
-    (read, skipped)
+    let files = names.iter().map(|name| read_one(&handle, name)).collect();
+    Scan {
+        files,
+        skipped,
+        error,
+    }
+}
+
+/// The env files' names in a directory listing, and
+/// [`CheckReport::LISTING_FAILED`] when the listing broke off: the names
+/// before the error are kept, and the rest are unknown.
+fn env_file_names(
+    entries: impl Iterator<Item = io::Result<OsString>>,
+) -> (Vec<OsString>, Option<&'static str>) {
+    let mut names = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(name) if is_env_file(&name) => names.push(name),
+            Ok(_) => {}
+            Err(_) => return (names, Some(CheckReport::LISTING_FAILED)),
+        }
+    }
+    (names, None)
 }
 
 fn view(name: &OsStr, state: EnvFileState) -> EnvFileView {
@@ -254,6 +297,63 @@ fn read_one(dir: &std::fs::File, name: &OsStr) -> (EnvFileView, Vec<String>) {
 mod tests {
     use super::*;
 
+    /// The F-48 follow-up (Codex, cycle 152): a listing that breaks off is
+    /// an error, with the env files named before it kept; one that ends is
+    /// not.
+    #[test]
+    fn a_listing_that_breaks_off_is_an_error() {
+        let name = |n: &str| Ok(OsString::from(n));
+        let whole = vec![name(".env"), name("README"), name(".env.local")];
+        assert_eq!(
+            env_file_names(whole.into_iter()),
+            (
+                vec![OsString::from(".env"), OsString::from(".env.local")],
+                None
+            )
+        );
+        let broken = vec![
+            name(".env"),
+            name("src"),
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            name(".env.local"),
+        ];
+        assert_eq!(
+            env_file_names(broken.into_iter()),
+            (
+                vec![OsString::from(".env")],
+                Some(CheckReport::LISTING_FAILED)
+            )
+        );
+        assert_eq!(
+            env_file_names(std::iter::once(Err(io::Error::from(io::ErrorKind::Other)))),
+            (vec![], Some(CheckReport::LISTING_FAILED))
+        );
+    }
+
+    /// A directory this process may search but not list (mode 0100) is
+    /// unreadable, not empty.
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("project");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "PORT=8080\n").unwrap();
+        let listed = scan(&dir);
+        assert_eq!(listed.error, None);
+        assert_eq!(listed.files.len(), 1);
+        if std::fs::metadata(d.path()).unwrap().uid() == 0 {
+            eprintln!("root lists any directory: the unlistable case did not run");
+            return;
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let unlisted = scan(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(unlisted.error, Some(CheckReport::DIRECTORY_UNREADABLE));
+        assert!(unlisted.files.is_empty());
+        assert_eq!(unlisted.skipped, 0);
+    }
+
     #[test]
     fn env_files_are_dot_env_and_its_variants() {
         for yes in [".env", ".env.local", ".env.example", ".env.production"] {
@@ -295,8 +395,13 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let (found, skipped) = scan(dir);
+        let Scan {
+            files: found,
+            skipped,
+            error,
+        } = scan(dir);
         assert_eq!(skipped, 0);
+        assert_eq!(error, None);
         let by_name = |n: &str| {
             found
                 .iter()

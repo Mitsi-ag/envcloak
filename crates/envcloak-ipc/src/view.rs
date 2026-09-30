@@ -887,6 +887,14 @@ pub struct CheckReport {
     /// Env files past that bound, which were not read: their plaintext
     /// keys and references are unknown.
     pub env_files_skipped: u64,
+    /// Why the project directory's env files could not all be listed:
+    /// [`CheckReport::DIRECTORY_UNREADABLE`] or
+    /// [`CheckReport::LISTING_FAILED`]; `None` when the listing completed.
+    /// After a failure `env_files` and `env_files_skipped` hold only what
+    /// was seen before it, and how many more env files there are is
+    /// unknown.
+    #[serde(default)]
+    pub env_scan_error: Option<String>,
 }
 
 impl CheckReport {
@@ -894,10 +902,18 @@ impl CheckReport {
     /// manifest, and no reference in any env file.
     pub const NOTHING_SENT: &'static str = "no_manifest";
 
+    /// `env_scan_error` when the project directory could not be opened or
+    /// listed at all.
+    pub const DIRECTORY_UNREADABLE: &'static str = "directory_unreadable";
+
+    /// `env_scan_error` when the directory's listing broke off part way.
+    pub const LISTING_FAILED: &'static str = "listing_failed";
+
     /// Whether everything checked out (docs/MANIFEST.md): every reference
     /// sent to the daemon resolves (none went unchecked, and a manifest's
     /// bindings all resolve), no env file holds a key-shaped value, and
-    /// every env file was read, none left past the bound. With nothing to
+    /// every env file was read: none left past the bound, and the
+    /// directory listed in full (no `env_scan_error`). With nothing to
     /// send there is nothing unresolved; [`CheckReport::NOTHING_SENT`]
     /// beside an answer or an env file's reference is not that case.
     pub fn clean(&self) -> bool {
@@ -907,6 +923,7 @@ impl CheckReport {
             })
             && self.env_files.iter().all(EnvFileView::clean)
             && self.env_files_skipped == 0
+            && self.env_scan_error.is_none()
     }
 
     /// Whether references were to be sent and the daemon did not answer
