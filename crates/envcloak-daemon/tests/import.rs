@@ -1228,7 +1228,10 @@ fn a_short_password_in_a_later_url_is_guessable() {
 /// agent's guesses get one answer from plan, commit and verify, a
 /// person's are told apart, and 16 characters in each form are compared
 /// for anyone. The DSN is read with an address and, since review R-3,
-/// with a protocol and no address (`app:<8>@tcp/app`, 20 characters).
+/// with a protocol and no address (`app:<8>@tcp/app`, 20 characters);
+/// since review R-11, also when its password starts with `//`
+/// (`app://<8>@tcp(db.internal:3306)/app`, a password of 10 characters in
+/// 40), whose control has 16 characters, `//` included.
 #[test]
 fn a_short_password_in_a_connection_string_is_guessable() {
     let mut f = Fixture::new(|_, _| {});
@@ -1236,6 +1239,9 @@ fn a_short_password_in_a_connection_string_is_guessable() {
     let go: ValueOf = |pw| format!("app:{pw}@tcp(db.internal:3306)/app?parseTime=true");
     // Review R-3: a protocol and no address, `@tcp/`, the default address.
     let go_default: ValueOf = |pw| format!("app:{pw}@tcp/app");
+    // Review R-11: a password starting with `//`, so the first `:` starts
+    // `://`.
+    let go_slashes: ValueOf = |pw| format!("app://{pw}@tcp(db.internal:3306)/app");
     let libpq: ValueOf = |pw| {
         format!("host=db.internal port=5432 dbname=app user=app password={pw} sslmode=require")
     };
@@ -1245,6 +1251,7 @@ fn a_short_password_in_a_connection_string_is_guessable() {
     let shapes = [
         ("go-dsn", go),
         ("go-dsn-default", go_default),
+        ("go-dsn-slashes", go_slashes),
         ("libpq", libpq),
         ("jdbc", jdbc),
         ("ado", ado),
@@ -1263,6 +1270,7 @@ fn a_short_password_in_a_connection_string_is_guessable() {
         &[
             ("go-dsn", "DATABASE_DSN", go, word(16)),
             ("go-dsn-default", "DATABASE_DSN", go_default, word(16)),
+            ("go-dsn-slashes", "DATABASE_DSN", go_slashes, word(14)),
             ("libpq", "DATABASE_DSN", libpq, word(16)),
             ("jdbc", "DATABASE_DSN", jdbc, word(16)),
             ("ado", "DATABASE_DSN", ado, word(16)),

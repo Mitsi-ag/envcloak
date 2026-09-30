@@ -337,17 +337,22 @@ fn password_len(password: &[u8]) -> usize {
 /// and `/` (`@tcp/db`, the protocol's default address, which the driver's
 /// README shows: review R-3), or `/` alone (`@/db`, the default protocol
 /// and address). Each such `@` is a reading, since the password may hold
-/// an `@` too. A value whose first `:` starts `://` is a URL, which
-/// [`url_passwords`] reads: what follows is `//` and a user, no password
-/// (`postgres://app@db/app`), so a DSN whose password starts with `//` is
-/// measured whole.
+/// an `@` too.
+///
+/// When the first `:` starts `://`, the value may be a URL with a user and
+/// no password (`postgres://app@db/app`), whose `@` before a host and `/`
+/// ends the user: the `/` forms are not read there, since they would
+/// measure `//app` as a password. The `(` form is (review R-11): a URL's
+/// host never holds `(`, so `app://<password>@tcp(db:3306)/app` is a DSN
+/// whose password starts with `//`, and a reading the value does not hold
+/// only makes it count as shorter, never longer. A DSN whose password
+/// starts with `//` and whose address is `@tcp/` or `@/` is measured with
+/// the whole value (SPEC §6.4).
 fn dsn_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
     let Some(colon) = out.position(v, |b| b == b':') else {
         return;
     };
-    if v[colon..].starts_with(b"://") {
-        return;
-    }
+    let url = v[colon..].starts_with(b"://");
     let protocol = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
     let mut at = colon + 1;
     while let Some(p) = out.position(&v[at..], |b| b == b'@') {
@@ -355,7 +360,7 @@ fn dsn_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
         let rest = &v[at + 1..];
         let name = out.run(rest, protocol);
         let address = match rest.get(name) {
-            Some(b'/') => true,
+            Some(b'/') => !url,
             Some(b'(') => name > 0,
             _ => false,
         };
@@ -781,6 +786,51 @@ mod shape_tests {
                 String::from_utf8_lossy(no)
             );
         }
+    }
+
+    /// Review R-11: after R-3 a value whose first `:` starts `://` got no
+    /// DSN reading at all, so a Go DSN whose password starts with `//`
+    /// (`app://abcdefgh@tcp(db:3306)/app`) was measured whole, 40
+    /// characters, and an agent could confirm guesses of its 10. An `@`
+    /// followed by a protocol name and `(` is read there too; only the `/`
+    /// forms, which a URL's user and host look like, are not.
+    #[test]
+    fn a_dsn_password_starting_with_slashes_is_read_before_a_protocol() {
+        for (value, chars) in [
+            (&b"app://abcdefgh@tcp(db.internal:3306)/app"[..], 10),
+            (b"app://abcdefgh@unix(/tmp/mysql.sock)/app", 10),
+            (b"app://abcdefgh@tcp6([::1]:3306)/app?parseTime=true", 10),
+            (b"app://p@ssword@tcp(db.internal:3306)/app", 10),
+            // Control: 16 characters, `//` included.
+            (b"app://abcdefghijklmn@tcp(db.internal:3306)/app", 16),
+        ] {
+            assert_eq!(
+                password_chars(value),
+                Some(chars),
+                "{:?}",
+                String::from_utf8_lossy(value)
+            );
+        }
+        // Still no DSN reading before a `/` address after `://`: a URL's
+        // user, host and path. A URL whose path holds `@v(` gets a DSN
+        // reading, which runs through its host and so is longer than the
+        // URL's password.
+        for no in [
+            &b"app://abcdefgh@tcp/app"[..],
+            b"app://abcdefgh@/app",
+            b"postgres://app@db.internal/app",
+        ] {
+            assert_eq!(
+                password_chars(no),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(no)
+            );
+        }
+        assert_eq!(
+            password_chars(b"postgres://app:abcdefghijklmnop@db.internal/app@v(2)"),
+            Some(16)
+        );
     }
 
     /// Review R-4: only the first `://` was read, so in a value listing
