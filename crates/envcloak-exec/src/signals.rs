@@ -284,7 +284,9 @@ mod tests {
     /// read from then on stops the run: here signals read while the pid
     /// is still the child's (between the mark and `ChildState::exited`)
     /// stop the run rather than reach the exited child, which is a live
-    /// process here and must not get them.
+    /// process here and must not get them. A SIGTERM caught after the
+    /// lost mark, kept aside by the relay as the pipe is full (review
+    /// F-71), stops the run the same way and never reaches the child.
     #[test]
     fn a_lost_mark_makes_every_later_signal_stop_the_run() {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
@@ -299,6 +301,7 @@ mod tests {
         flood(libc::SIGHUP);
         forwarder.child_exited();
         let lost = forwarder.mark_lost.load(Ordering::SeqCst);
+        envcloak_sys::testing::signal_this_thread(libc::SIGTERM).unwrap();
         std::thread::scope(|s| {
             let forwarding = s.spawn(|| forwarder.forward(&state, &cutoff));
             forwarder.stop(|| !forwarding.is_finished());
@@ -307,7 +310,11 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(lost, "the mark went into a full pipe");
-        assert_eq!(cutoff.stopped_by(), Some(libc::SIGHUP));
+        assert!(
+            matches!(cutoff.stopped_by(), Some(libc::SIGHUP | libc::SIGTERM)),
+            "{:?}",
+            cutoff.stopped_by()
+        );
         assert!(alive, "a signal after the lost mark reached the child");
     }
 
