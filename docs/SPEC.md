@@ -591,7 +591,8 @@ currency = "$.balance_infos[0].currency"
 - The loader rejects:
   - any request URL whose host is not in the provider's `allowed_hosts`;
   - non-HTTPS URLs;
-  - wildcards under a multi-tenant suffix, from a list kept in-repo (`supabase.co`, `workers.dev`, `vercel.app`, `herokuapp.com`, `netlify.app`, `amazonaws.com` and others).
+  - wildcards under a multi-tenant suffix, from a list kept in-repo (`supabase.co`, `workers.dev`, `vercel.app`, `herokuapp.com`, `netlify.app`, `amazonaws.com` and others);
+  - in M1, every other wildcard host: without a pinned Public Suffix List the loader cannot tell a provider's domain from wildcard DNS, tunnel or free-subdomain services (`*.nip.io`, `*.lhr.life`, `*.eu.org`), so each host is listed until a snapshot is embedded.
 - Tenant hosts are stored per item (for example `acme.supabase.co`).
 - Each item snapshots its allowed hosts at creation. A registry update that widens them requires approval.
 - Local registry overrides require an approval proof and show the hosts.

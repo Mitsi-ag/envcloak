@@ -11,7 +11,10 @@
 //! - a wildcard allowed host under a multi-tenant suffix
 //!   ([`RegistryErrorKind::WildcardUnderMultiTenantSuffix`]) or over one
 //!   ([`RegistryErrorKind::WildcardOverMultiTenantSuffix`]), and one over a
-//!   whole top-level domain or public suffix of two labels (`*.co.kr`);
+//!   whole top-level domain or public suffix of two labels (`*.co.kr`).
+//!   These rules are kept for the Public Suffix List to come; in M1 the
+//!   loader refuses every wildcard that passes them as well
+//!   ([`RegistryErrorKind::WildcardRefused`]);
 //! - hosts and URLs in any but one canonical spelling: lowercase DNS names,
 //!   no user name, port, IP address, trailing dot or backslash, so what a
 //!   reviewer reads is the host the key goes to;
@@ -32,6 +35,7 @@
 //! [`RegistryErrorKind::NotHttps`]: crate::RegistryErrorKind::NotHttps
 //! [`RegistryErrorKind::WildcardUnderMultiTenantSuffix`]: crate::RegistryErrorKind::WildcardUnderMultiTenantSuffix
 //! [`RegistryErrorKind::WildcardOverMultiTenantSuffix`]: crate::RegistryErrorKind::WildcardOverMultiTenantSuffix
+//! [`RegistryErrorKind::WildcardRefused`]: crate::RegistryErrorKind::WildcardRefused
 
 use regex::bytes::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use regex_syntax::hir::literal::{ExtractKind, Extractor};
