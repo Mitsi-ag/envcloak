@@ -830,12 +830,15 @@ fn a_rotation_that_proved_and_wrote_nothing_is_audited() {
     f.sweep();
 }
 
+/// One `Rotate` audit entry: the items it names and its reason.
+type RotationRow<'a> = (Vec<(String, String)>, Option<&'a str>);
+
 /// A Stripe secret key of `kind` (`test` or `live`), made at run time.
 fn stripe_key(kind: &str) -> String {
     let seed = fresh_seed();
     let tail: String = (0..32u32)
         .map(|i| {
-            let n = u8::try_from((seed.rotate_left(7 * i) ^ u64::from(i) * 0x9e37) % 36).unwrap();
+            let n = u8::try_from((seed.rotate_left(7 * i) ^ (u64::from(i) * 0x9e37)) % 36).unwrap();
             char::from(if n < 10 { b'0' + n } else { b'a' + n - 10 })
         })
         .collect();
@@ -993,7 +996,7 @@ fn a_rotation_reclassifies_the_item_and_only_then_ends_its_grants() {
 
     let v = f.stop_and_open();
     let (entries, _) = v.read_audit().unwrap();
-    let rotations: Vec<(Vec<(String, String)>, Option<&str>)> = entries
+    let rotations: Vec<RotationRow<'_>> = entries
         .iter()
         .filter(|e| e.record.kind == AuditKind::Rotate)
         .map(|e| (named(&e.record.items), e.record.decision.reason.as_deref()))
