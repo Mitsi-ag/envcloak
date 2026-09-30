@@ -115,6 +115,10 @@ const BY_PROCESS: u8 = 0x80;
 const MARK: u8 = BY_PROCESS;
 /// The byte [`SignalRelay::stop`] writes.
 const STOP: u8 = 0;
+/// How long [`SignalRelay::mark`] and [`SignalRelay::stop`] wait for room
+/// in a full pipe (a flood of signals not read yet) before they fail, in
+/// milliseconds.
+const ROOM_WAIT_MS: libc::c_int = 100;
 /// The highest signal a relay catches: its number must leave
 /// [`BY_PROCESS`] free. Every signal on Linux and macOS is below it.
 const MAX_SIGNAL: i32 = 0x7f;
@@ -405,7 +409,8 @@ impl SignalRelay {
     /// the signals that came before. Callable from any thread.
     ///
     /// # Errors
-    /// When the stop mark cannot be written.
+    /// When the stop mark cannot be written: the pipe stayed full (of
+    /// signals the reader has not read yet) for 100 ms.
     pub fn stop(&self) -> io::Result<()> {
         self.put(STOP)
     }
@@ -415,24 +420,39 @@ impl SignalRelay {
     /// caught after the call comes after it. Callable from any thread.
     ///
     /// # Errors
-    /// When the mark cannot be written.
+    /// When the mark cannot be written: the pipe stayed full for 100 ms.
     pub fn mark(&self) -> io::Result<()> {
         self.put(MARK)
     }
 
-    /// Writes one of the relay's own bytes to the pipe.
+    /// Writes one of the relay's own bytes to the pipe, waiting once, up
+    /// to [`ROOM_WAIT_MS`], for room.
     fn put(&self, byte: u8) -> io::Result<()> {
+        let fd = self.pipe.write.as_raw_fd();
+        let mut waited = false;
         loop {
             // SAFETY: `byte` is one readable byte; the descriptor is open for
             // the life of the process.
-            let n =
-                unsafe { libc::write(self.pipe.write.as_raw_fd(), (&raw const byte).cast(), 1) };
+            let n = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
             if n == 1 {
                 return Ok(());
             }
             let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
+            match err.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock if !waited => {
+                    waited = true;
+                    let mut p = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: `p` is one initialized pollfd. Whatever poll
+                    // returns (room, the timeout, EINTR), the write is tried
+                    // once more.
+                    unsafe { libc::poll(&mut p, 1, ROOM_WAIT_MS) };
+                }
+                _ => return Err(err),
             }
         }
     }

@@ -352,10 +352,11 @@ fn follow(
             .flatten()
             .map(io::Error::kind)
             .next();
+        let forwarding = || f.as_ref().is_ok_and(|f| !f.is_finished());
         if failed.is_some() {
             state.exited();
             let _ = child.kill();
-            forwarder.stop();
+            forwarder.stop(forwarding);
         }
         let waited = envcloak_sys::wait_for_exit(pid);
         // Signals caught from here on stop the run (review T12-2).
@@ -372,7 +373,7 @@ fn follow(
                 pumped = Err(e.kind());
             }
         }
-        forwarder.stop();
+        forwarder.stop(forwarding);
         if let Ok(f) = f {
             let _ = f.join();
         }

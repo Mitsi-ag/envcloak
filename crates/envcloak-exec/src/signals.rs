@@ -28,9 +28,18 @@
 //! may still be waiting for a descendant or a reader: a signal caught
 //! after the mark stops the run at once ([`Cutoff::stop_now`]), and the run
 //! ends as the signal asks, with 128 plus its number (review T12-2).
+//!
+//! The mark refines, and is not the only way to, that stop (review R-9). A
+//! signal caught before the mark but read once the child has exited, which
+//! would have been passed on, has nobody to go to either, and stops the
+//! run too; only the terminal's own SIGINT or SIGQUIT, which reached the
+//! child as well, is then left alone. When the mark cannot be written
+//! (the relay's pipe full of signals not read yet), every signal read from
+//! then on stops the run.
 
 use std::io;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use envcloak_sys::{Relayed, SignalRelay};
 
@@ -75,12 +84,49 @@ impl ChildState {
     }
 }
 
+/// What [`Forwarder::forward`] does with a caught signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Act {
+    /// Send it to the child, or (`group`) to the group the child leads.
+    PassOn { pid: i32, group: bool },
+    /// Stop the run: the child has exited, and the signal has nobody to
+    /// go to.
+    Stop,
+    /// Nothing: the terminal sent it to the child as well.
+    Nothing,
+}
+
+/// What to do with signal `sig` (sent by a process when `by_process`),
+/// read after the mark of the child's exit when `after_exit`, while the
+/// child's pid is `pid` (`None` once it has exited), with or without a
+/// controlling `terminal`.
+fn act(sig: i32, by_process: bool, terminal: bool, after_exit: bool, pid: Option<i32>) -> Act {
+    if after_exit {
+        return Act::Stop;
+    }
+    let passed = !terminal || passed_on_with_terminal(sig, by_process);
+    match (pid, passed) {
+        (Some(pid), true) => Act::PassOn {
+            pid,
+            group: !terminal,
+        },
+        // Caught before the mark, read after the exit: nobody to pass it
+        // on to, so it stops the run as one caught after the mark does
+        // (review R-9).
+        (None, true) => Act::Stop,
+        (_, false) => Act::Nothing,
+    }
+}
+
 /// The caught signals, and whether the child shares this process's
 /// terminal.
 #[derive(Debug)]
 pub(crate) struct Forwarder {
     relay: SignalRelay,
     terminal: bool,
+    /// [`Forwarder::child_exited`] could not write its mark: every signal
+    /// read from then on counts as caught after the exit.
+    mark_lost: AtomicBool,
 }
 
 impl Forwarder {
@@ -88,58 +134,211 @@ impl Forwarder {
         Ok(Forwarder {
             relay: SignalRelay::install(&CAUGHT)?,
             terminal,
+            mark_lost: AtomicBool::new(false),
         })
     }
 
     /// Passes signals on until [`Forwarder::stop`], and stops the run
-    /// (`cutoff`) for one caught after [`Forwarder::child_exited`]. Run on
-    /// its own thread.
+    /// (`cutoff`) for one caught after [`Forwarder::child_exited`], or read
+    /// once the child has exited when it would have been passed on (see
+    /// [`act`]). Run on its own thread.
     pub(crate) fn forward(&self, child: &ChildState, cutoff: &Cutoff) {
-        let mut exited = false;
+        let mut marked = false;
         while let Ok(Some(caught)) = self.relay.next() {
             let (sig, by_process) = match caught {
                 Relayed::Mark => {
-                    exited = true;
+                    marked = true;
                     continue;
                 }
                 Relayed::Signal { number, by_process } => (number, by_process),
             };
-            if exited {
-                cutoff.stop_now(sig);
-                continue;
-            }
+            let after_exit = marked || self.mark_lost.load(Ordering::SeqCst);
             let pid = child.pid.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(pid) = *pid else { continue };
-            // A child that is gone by now, or a group already empty, is
-            // not an error: there is nothing left to tell.
-            let _ = if !self.terminal {
-                envcloak_sys::signal_group(pid, sig)
-            } else if passed_on_with_terminal(sig, by_process) {
-                envcloak_sys::signal_process(pid, sig)
-            } else {
-                Ok(())
-            };
+            match act(sig, by_process, self.terminal, after_exit, *pid) {
+                // Sent under the lock `ChildState::exited` takes, so the
+                // pid is still the child's. A child that is gone by now,
+                // or a group already empty, is not an error: there is
+                // nothing left to tell.
+                Act::PassOn { pid, group: true } => {
+                    let _ = envcloak_sys::signal_group(pid, sig);
+                }
+                Act::PassOn { pid, group: false } => {
+                    let _ = envcloak_sys::signal_process(pid, sig);
+                }
+                Act::Stop => {
+                    drop(pid);
+                    cutoff.stop_now(sig);
+                }
+                Act::Nothing => {}
+            }
         }
     }
 
     /// Marks where the child's exit was seen: a signal caught after this
-    /// stops the run rather than being passed on, and one caught before it
-    /// is passed on while the child is not marked exited. Called before
+    /// stops the run rather than being passed on. Called before
     /// [`ChildState::exited`], so a signal caught between the two stops the
-    /// run instead of being dropped.
+    /// run instead of being passed to the exited child. When the mark
+    /// cannot be written (the relay's pipe stayed full), every signal read
+    /// from then on stops the run, so none caught after the exit is lost.
     pub(crate) fn child_exited(&self) {
-        let _ = self.relay.mark();
+        if self.relay.mark().is_err() {
+            self.mark_lost.store(true, Ordering::SeqCst);
+        }
     }
 
-    /// Ends [`Forwarder::forward`].
-    pub(crate) fn stop(&self) {
-        let _ = self.relay.stop();
+    /// Ends [`Forwarder::forward`]. While the relay's pipe is full (of
+    /// signals the forwarding thread has not read yet) the stop cannot be
+    /// written, and is tried again as long as `running` says that thread
+    /// still runs: it makes the room. Once the thread has ended, or never
+    /// started, nothing needs the stop.
+    pub(crate) fn stop(&self, mut running: impl FnMut() -> bool) {
+        while self.relay.stop().is_err() && running() {}
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    /// The relay is process-wide, so the tests that install one take
+    /// turns.
+    static TURN: Mutex<()> = Mutex::new(());
+
+    /// Raises `sig` on this thread more times than a pipe holds bytes, so
+    /// the relay's pipe is full after (the handler drops what does not
+    /// fit).
+    fn flood(sig: i32) {
+        for _ in 0..1 << 17 {
+            envcloak_sys::testing::signal_this_thread(sig).unwrap();
+        }
+    }
+
+    /// A child state whose child has exited.
+    fn exited() -> ChildState {
+        ChildState {
+            pid: Mutex::new(None),
+        }
+    }
+
+    /// Review R-9: what the forwarder does with each signal. Before the
+    /// mark with the child running: passed on (to its group without a
+    /// terminal), except the terminal's own SIGINT and SIGQUIT. Before the
+    /// mark with the child exited: a signal that would have been passed
+    /// on stops the run, where it used to be dropped; the terminal's own
+    /// is left alone. After the mark: every signal stops the run.
+    #[test]
+    fn a_signal_the_exited_child_cannot_get_stops_the_run() {
+        let (term, int, quit, hup) = (libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP);
+        let pass = |pid, group| Act::PassOn { pid, group };
+        for (sig, by_process, terminal, after_exit, pid, want) in [
+            // Running, no terminal: to the child's group, whoever sent it.
+            (int, false, false, false, Some(7), pass(7, true)),
+            (term, true, false, false, Some(7), pass(7, true)),
+            // Running, on a terminal.
+            (term, false, true, false, Some(7), pass(7, false)),
+            (hup, false, true, false, Some(7), pass(7, false)),
+            (int, true, true, false, Some(7), pass(7, false)),
+            (int, false, true, false, Some(7), Act::Nothing),
+            (quit, false, true, false, Some(7), Act::Nothing),
+            // Exited, not marked yet: what would have been passed on stops.
+            (term, true, false, false, None, Act::Stop),
+            (int, false, false, false, None, Act::Stop),
+            (term, false, true, false, None, Act::Stop),
+            (quit, true, true, false, None, Act::Stop),
+            (int, false, true, false, None, Act::Nothing),
+            // After the mark, whatever the pid says.
+            (int, false, true, true, None, Act::Stop),
+            (int, false, true, true, Some(7), Act::Stop),
+            (term, true, false, true, Some(7), Act::Stop),
+        ] {
+            assert_eq!(
+                act(sig, by_process, terminal, after_exit, pid),
+                want,
+                "{sig} {by_process} {terminal} {after_exit} {pid:?}"
+            );
+        }
+    }
+
+    /// Review R-9, through a real relay: a SIGTERM caught before any mark
+    /// and read once the child has exited stops the run.
+    #[test]
+    fn a_signal_read_after_the_exit_before_the_mark_stops_the_run() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let forwarder = Forwarder::install(false).unwrap();
+        let cutoff = Cutoff::default();
+        envcloak_sys::testing::signal_this_thread(libc::SIGTERM).unwrap();
+        forwarder.stop(|| false);
+        forwarder.forward(&exited(), &cutoff);
+        assert_eq!(cutoff.stopped_by(), Some(libc::SIGTERM));
+    }
+
+    /// Review R-9: the mark is written into a pipe full of signals not
+    /// read yet, so it cannot be. The loss is recorded, and every signal
+    /// read from then on stops the run: here signals read while the pid
+    /// is still the child's (between the mark and `ChildState::exited`)
+    /// stop the run rather than reach the exited child, which is a live
+    /// process here and must not get them.
+    #[test]
+    fn a_lost_mark_makes_every_later_signal_stop_the_run() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let forwarder = Forwarder::install(false).unwrap();
+        let cutoff = Cutoff::default();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let state = ChildState::running(i32::try_from(child.id()).unwrap());
+        flood(libc::SIGHUP);
+        forwarder.child_exited();
+        let lost = forwarder.mark_lost.load(Ordering::SeqCst);
+        std::thread::scope(|s| {
+            let forwarding = s.spawn(|| forwarder.forward(&state, &cutoff));
+            forwarder.stop(|| !forwarding.is_finished());
+        });
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(lost, "the mark went into a full pipe");
+        assert_eq!(cutoff.stopped_by(), Some(libc::SIGHUP));
+        assert!(alive, "a signal after the lost mark reached the child");
+    }
+
+    /// Review R-9 (the stop, as the mark): the stop is written into a
+    /// pipe full of signals not read yet, so the first try fails. It is
+    /// tried again while the forwarding thread runs, which reads the pipe
+    /// and makes room, and that thread then ends. It is started only when
+    /// the first try has failed, so that try meets a full pipe.
+    #[test]
+    fn a_stop_into_a_full_pipe_is_tried_again_while_the_forwarder_reads() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let forwarder = Forwarder::install(false).unwrap();
+        let (cutoff, state) = (Cutoff::default(), exited());
+        flood(libc::SIGHUP);
+        std::thread::scope(|s| {
+            let mut forwarding = None;
+            forwarder.stop(|| {
+                let f = forwarding
+                    .get_or_insert_with(|| s.spawn(|| forwarder.forward(&state, &cutoff)));
+                !f.is_finished()
+            });
+            let Some(f) = forwarding else {
+                panic!("the stop was given up at the first try");
+            };
+            let end = Instant::now() + Duration::from_secs(10);
+            while !f.is_finished() {
+                if Instant::now() > end {
+                    // Let the forwarder go, then fail.
+                    while forwarder.relay.stop().is_err() {}
+                    panic!("the forwarder never saw the stop");
+                }
+                std::thread::yield_now();
+            }
+        });
+    }
 
     /// With a terminal: SIGTERM and SIGHUP are passed on whoever sent
     /// them; SIGINT and SIGQUIT only when a process sent them, never the
