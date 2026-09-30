@@ -26,6 +26,9 @@ use common::{
     cli_command, data_dir, finish_within, on_terminal_command, outside_dir, secret_file,
     start_daemon, stderr, stdout,
 };
+use envcloak_core::SecretBytes;
+use envcloak_core::audit::AuditKind;
+use envcloak_core::vault::{LockedVault, VaultPaths};
 use envcloak_testkit::{
     Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
 };
@@ -391,4 +394,38 @@ fn recover_takes_the_kit_and_the_new_passphrase_on_the_terminal() {
     );
     assert_eq!(s.slugs(), ["openai/acme-web"]);
     s.sweep();
+}
+
+/// Review T14 open 5: `vault.recover` locks an unlocked vault to put the
+/// backup's in its place, and says so. After a recover that failed (a
+/// wrong kit), `status` and the sealed `locked` entry name `restore`, not
+/// a `request` nobody made.
+#[test]
+fn a_failed_recover_names_the_restore_as_the_lock_reason() {
+    let mut s = Setup::new();
+    let b = s.json(&["backup", "create", "--json"]);
+    let path = PathBuf::from(b["path"].as_str().unwrap());
+    let out = s.recover(&path, &s.wrong_kit);
+    assert_eq!(token(&out), "wrong_passphrase", "{}", stderr(&out));
+    let st = s.json(&["status", "--json"]);
+    assert_eq!(st["vault"]["state"], "locked");
+    assert_eq!(st["lock"]["last_reason"], "restore", "{st}");
+
+    // The log, read back with the passphrase once the daemon stopped.
+    s.sweep();
+    s.d.signal("-TERM");
+    assert!(s.d.wait_exit(Duration::from_secs(30)).is_some());
+    let pass = SecretBytes::copy_from(by_label(&s.cs, labels::VAULT_PASSPHRASE).value());
+    let v = LockedVault::open(&VaultPaths::under(data_dir(&s.home)))
+        .unwrap()
+        .unlock_with_passphrase(&pass)
+        .map_err(|(_, e)| e)
+        .unwrap();
+    let (entries, _) = v.read_audit().unwrap();
+    let locks: Vec<Option<String>> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::Lock)
+        .map(|e| e.record.decision.reason.clone())
+        .collect();
+    assert_eq!(locks, [Some("restore".to_owned())]);
 }

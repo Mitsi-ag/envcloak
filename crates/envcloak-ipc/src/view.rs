@@ -215,6 +215,8 @@ pub enum LockReason {
     Sleep,
     /// The daemon was asked to stop.
     Signal,
+    /// `vault.recover` closed the vault to put a backup's in its place.
+    Restore,
 }
 
 impl LockReason {
@@ -225,6 +227,7 @@ impl LockReason {
             LockReason::Idle => "idle",
             LockReason::Sleep => "sleep",
             LockReason::Signal => "signal",
+            LockReason::Restore => "restore",
         }
     }
 }

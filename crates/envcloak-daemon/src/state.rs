@@ -409,7 +409,7 @@ impl State {
         if matches!(self.slot, Slot::Busy) {
             return Err(RpcError::new(ErrorKind::Busy));
         }
-        let was_unlocked = self.lock(LockReason::Request);
+        let was_unlocked = self.lock(LockReason::Restore);
         // Dropping the locked file closes it and releases its lock.
         self.slot = Slot::Busy;
         Ok((self.generation, was_unlocked))
@@ -1000,7 +1000,10 @@ mod tests {
                     f.clocks.sleep(Duration::from_secs(3600));
                     assert_eq!(s.observe(now(&f.clocks)), Some(LockReason::Sleep));
                 }
-                LockReason::Signal | LockReason::Request => assert!(s.lock(reason)),
+                // A restore locks through `begin_recover`, tested below.
+                LockReason::Signal | LockReason::Request | LockReason::Restore => {
+                    assert!(s.lock(reason));
+                }
             }
             let t = at(&f.clocks);
             assert!(matches!(s.slot(), Slot::Locked(_)), "{reason:?}");
@@ -1062,6 +1065,8 @@ mod tests {
         let e = s.finish_recover(generation, now(&f.clocks), r).unwrap_err();
         assert_eq!(e.kind, ErrorKind::WrongPassphrase);
         assert!(matches!(s.slot(), Slot::Locked(_)));
+        // The lock was the restore's, not a request nobody made.
+        assert_eq!(s.last_reason, Some(LockReason::Restore));
 
         // The right kit: the restored vault is unlocked, under the new
         // passphrase.
