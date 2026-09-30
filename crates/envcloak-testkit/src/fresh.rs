@@ -19,12 +19,27 @@
 //! A listed file that no longer exists is left out: the file that named
 //! it changed as well.
 //!
-//! Only those files count (review R-2). A change to a manifest (features,
-//! dependency versions), to `Cargo.lock`, to build flags or to a variable
-//! a crate reads with `env!` is not seen: cargo rebuilds for some of those
-//! and not for others (a comment, a dev-dependency, another package's
-//! lock entry), and counting them would refuse a binary that no rebuild
-//! makes newer. CONTRIBUTING says to build the binaries after such a
+//! The build settings those files are compiled with count too (Codex
+//! F-66): a feature turned on in a manifest changes what is built with no
+//! source file changing, so a binary older than a setting may be one
+//! cargo would build differently now. They are the manifests of the
+//! binary's package, of each workspace member it depends on (normal
+//! dependencies, directly or not) and of each member among the package's
+//! own dev-dependencies with theirs (`cargo test -p <package>` turns their
+//! features on too); the workspace's `Cargo.toml` and `Cargo.lock`; and,
+//! when there, `rust-toolchain.toml` (or `rust-toolchain`) and
+//! `.cargo/config.toml` (or `.cargo/config`) at its root. Cargo rebuilds
+//! for some changes to those and not for others (a comment, a library's
+//! dev-dependency, another package's lock entry), and then the binary
+//! stays older than the setting: it is refused all the same, since the
+//! check cannot tell which (review R-2 left settings out for that), and
+//! the message says to `cargo clean -p <package>` before building it
+//! again. Refusing costs one package's rebuild; accepting tested the old
+//! build.
+//!
+//! Not seen: build flags from the environment (`RUSTFLAGS`) or from a
+//! cargo configuration outside the workspace, and variables a crate reads
+//! with `env!`. CONTRIBUTING says to build the binaries after such a
 //! change.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -38,13 +53,29 @@ use toml_edit::{Document, Item, TableLike};
 /// A workspace member, as its manifest gives it.
 #[derive(Debug)]
 struct Member {
+    /// Its `Cargo.toml`.
+    manifest: PathBuf,
     /// The library's crate name, when the package has one.
     lib: Option<String>,
     /// The packages it depends on (normal dependencies, for any target).
     deps: Vec<String>,
+    /// Its dev-dependencies, for any target.
+    dev_deps: Vec<String>,
 }
 
-/// The first of the sources `bin` was built from, in path order, that
+/// The build settings at the workspace's root that every build reads,
+/// when they are there (see the module documentation).
+const ROOT_SETTINGS: [&str; 6] = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "rust-toolchain",
+    ".cargo/config.toml",
+    ".cargo/config",
+];
+
+/// The first of the sources `bin` was built from and of the build settings
+/// it was built with (see the module documentation), in path order, that
 /// changed after it was linked: `None` when none did. `bin` is a binary
 /// of the workspace package `package` in a cargo target directory
 /// (`<profile>/<name>`, beside that profile's `deps/`), and `root` the
@@ -67,7 +98,11 @@ pub fn stale_source(bin: &Path, package: &str, root: &Path) -> Result<Option<Pat
         .and_then(OsStr::to_str)
         .ok_or_else(|| format!("{} has no usable file name", bin.display()))?;
     let members = members(root)?;
-    let libs = closure(&members, package)?;
+    let linked_members = closure(&members, package)?;
+    let libs: Vec<&String> = linked_members
+        .iter()
+        .filter_map(|m| members.get(m).and_then(|m| m.lib.as_ref()))
+        .collect();
     let entries = deps_entries(&deps)?;
 
     let mut infos = bin_dep_infos(&deps, &entries, &name.replace('-', "_"), &meta, linked)?;
@@ -88,6 +123,20 @@ pub fn stale_source(bin: &Path, package: &str, root: &Path) -> Result<Option<Pat
         for dep in dep_info_sources(&bytes) {
             sources.insert(root.join(dep));
         }
+    }
+    // The build settings: the manifests of the members linked in and of
+    // the package's dev-dependencies with theirs, and the root's files.
+    let mut built_with = linked_members;
+    for dev in &members[package].dev_deps {
+        if members.contains_key(dev) {
+            built_with.extend(closure(&members, dev)?);
+        }
+    }
+    for m in &built_with {
+        sources.insert(members[m].manifest.clone());
+    }
+    for rel in ROOT_SETTINGS {
+        sources.insert(root.join(rel));
     }
     for source in sources {
         match std::fs::metadata(&source) {
@@ -120,10 +169,12 @@ pub(crate) fn assert_fresh_or(bin: &Path, package: &str, rebuild: &str) {
     match stale_source(bin, package, root) {
         Ok(None) => {}
         Ok(Some(source)) => panic!(
-            "{} is older than {}, which it is built from: cargo did not rebuild it for this \
-             run, and a test of it would test the old code (cargo test -p <another package> \
-             leaves it as it is). Build it first with {rebuild}, or run the tests with \
-             --workspace.",
+            "{} is older than {}, which it is built from or with: cargo did not rebuild it \
+             for this run, and a test of it would test the old code or build (cargo test -p \
+             <another package> leaves it as it is). Build it first with {rebuild}, or run the \
+             tests with --workspace. When cargo then builds nothing for it (a change to a \
+             manifest or Cargo.lock that does not reach it), run cargo clean -p {package} \
+             first.",
             bin.display(),
             source.display()
         ),
@@ -309,6 +360,10 @@ fn member(dir: &Path) -> Result<(String, Member), String> {
         .ok_or_else(|| format!("{}: no package.name", manifest.display()))?
         .to_owned();
     let lib_table = top.get("lib").and_then(Item::as_table_like);
+    let (deps, dev_deps) = (
+        dependencies(top, "dependencies"),
+        dependencies(top, "dev-dependencies"),
+    );
     let lib = match lib_table.and_then(|l| l.get("name")).and_then(Item::as_str) {
         Some(n) => Some(n.to_owned()),
         None if lib_table.is_some() || dir.join("src/lib.rs").is_file() => {
@@ -316,16 +371,30 @@ fn member(dir: &Path) -> Result<(String, Member), String> {
         }
         None => None,
     };
+    Ok((
+        name,
+        Member {
+            manifest,
+            lib,
+            deps,
+            dev_deps,
+        },
+    ))
+}
+
+/// The packages a manifest's `kind` tables name (`dependencies` or
+/// `dev-dependencies`), for any target.
+fn dependencies(top: &toml_edit::Table, kind: &str) -> Vec<String> {
     let mut deps = Vec::new();
     let mut tables: Vec<&dyn TableLike> = Vec::new();
-    if let Some(t) = top.get("dependencies").and_then(Item::as_table_like) {
+    if let Some(t) = top.get(kind).and_then(Item::as_table_like) {
         tables.push(t);
     }
     if let Some(targets) = top.get("target").and_then(Item::as_table_like) {
         for (_, target) in targets.iter() {
             if let Some(t) = target
                 .as_table_like()
-                .and_then(|t| t.get("dependencies"))
+                .and_then(|t| t.get(kind))
                 .and_then(Item::as_table_like)
             {
                 tables.push(t);
@@ -345,30 +414,28 @@ fn member(dir: &Path) -> Result<(String, Member), String> {
             });
         }
     }
-    Ok((name, Member { lib, deps }))
+    deps
 }
 
-/// The libraries of `package` and of every workspace member it depends
-/// on, directly or not.
+/// `package` and every workspace member it depends on (normal
+/// dependencies), directly or not.
 fn closure(members: &HashMap<String, Member>, package: &str) -> Result<Vec<String>, String> {
     if !members.contains_key(package) {
         return Err(format!("{package} is not a workspace member"));
     }
     let mut seen = BTreeSet::from([package.to_owned()]);
     let mut queue = VecDeque::from([package.to_owned()]);
-    let mut libs = Vec::new();
+    let mut out = Vec::new();
     while let Some(p) = queue.pop_front() {
         let Some(m) = members.get(&p) else { continue };
-        if let Some(lib) = &m.lib {
-            libs.push(lib.clone());
-        }
         for d in &m.deps {
             if members.contains_key(d) && seen.insert(d.clone()) {
                 queue.push_back(d.clone());
             }
         }
+        out.push(p);
     }
-    Ok(libs)
+    Ok(out)
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
