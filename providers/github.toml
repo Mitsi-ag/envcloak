@@ -32,9 +32,13 @@ auth = [
 # installation, an email address added to the account (it can receive
 # password resets), organization roles given to users and teams (and the
 # older security manager role), and a repository given to a team (by
-# slug, or by team id on the older route). Webhooks, which keep sending a
-# repository's or organization's events to a URL, are left to the proxy's
-# review (M6): denied paths only gate balance requests before it.
+# slug, or by team id on the older route). GitHub also serves each
+# repository by its id, at `/repositories/<id>/` (where its redirects for
+# a renamed repository point), each organization at `/organizations/<id>/`,
+# and a team at `/organizations/<org id>/team/<team id>/`: every route above
+# is denied there too. Webhooks, which keep sending a repository's or
+# organization's events to a URL, are left to the proxy's review (M6):
+# denied paths only gate balance requests before it.
 denied_paths = [
   "/authorizations",
   "/applications",
@@ -74,6 +78,32 @@ denied_paths = [
   "/orgs/*/security-managers",
   "/orgs/*/teams/*/repos/*/*",
   "/teams/*/repos/*/*",
+  "/repositories/*/keys",
+  "/repositories/*/actions/secrets",
+  "/repositories/*/actions/runners",
+  "/repositories/*/codespaces/secrets",
+  "/repositories/*/dependabot/secrets",
+  "/repositories/*/environments/*/secrets",
+  "/repositories/*/collaborators",
+  "/repositories/*/invitations",
+  "/repositories/*/transfer",
+  "/organizations/*/actions/secrets",
+  "/organizations/*/actions/runners",
+  "/organizations/*/codespaces/secrets",
+  "/organizations/*/dependabot/secrets",
+  "/organizations/*/private-registries",
+  "/organizations/*/credential-authorizations",
+  "/organizations/*/personal-access-tokens",
+  "/organizations/*/personal-access-token-requests",
+  "/organizations/*/invitations",
+  "/organizations/*/memberships",
+  "/organizations/*/outside_collaborators",
+  "/organizations/*/teams/*/memberships",
+  "/organizations/*/organization-roles",
+  "/organizations/*/security-managers",
+  "/organizations/*/teams/*/repos/*/*",
+  "/organizations/*/team/*/memberships",
+  "/organizations/*/team/*/repos/*/*",
 ]
 
 [links]

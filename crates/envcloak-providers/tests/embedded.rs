@@ -202,6 +202,62 @@ fn the_embedded_registry_loads() {
     ] {
         assert!(github.path_denied(path), "{path}");
     }
+    // Review R-12: the same routes by id. GitHub serves a repository at
+    // `/repositories/<id>/` (its redirects for a renamed repository point
+    // there), an organization at `/organizations/<id>/`, and a team at
+    // `/organizations/<org id>/team/<team id>/`: every `/repos/*/*/...` and
+    // `/orgs/*/...` entry has its twin, and each is denied there.
+    let twins: Vec<&str> = github
+        .denied_paths
+        .iter()
+        .filter_map(|p| {
+            p.strip_prefix("/repos/*/*/")
+                .or_else(|| p.strip_prefix("/orgs/*/"))
+        })
+        .collect();
+    assert_eq!(twins.len(), 24);
+    for suffix in twins {
+        let by_id = [
+            format!("/repositories/*/{suffix}"),
+            format!("/organizations/*/{suffix}"),
+        ];
+        assert!(
+            by_id.iter().any(|t| github.denied_paths.contains(t)),
+            "{suffix}"
+        );
+    }
+    for path in [
+        "/repositories/1/keys",
+        "/repositories/1/keys/2",
+        "/repositories/1/actions/secrets/X",
+        "/repositories/1/actions/runners/registration-token",
+        "/repositories/1/codespaces/secrets/public-key",
+        "/repositories/1/dependabot/secrets/X",
+        "/repositories/1/environments/prod/secrets/X",
+        "/repositories/1/collaborators/octocat",
+        "/repositories/1/invitations/1",
+        "/repositories/1/transfer",
+        "/repositories/1/keys.json",
+        "/organizations/1/actions/secrets/X",
+        "/organizations/1/actions/runners/remove-token",
+        "/organizations/1/codespaces/secrets",
+        "/organizations/1/dependabot/secrets/X",
+        "/organizations/1/private-registries",
+        "/organizations/1/credential-authorizations/1",
+        "/organizations/1/personal-access-tokens/1",
+        "/organizations/1/personal-access-token-requests",
+        "/organizations/1/invitations",
+        "/organizations/1/memberships/octocat",
+        "/organizations/1/outside_collaborators/octocat",
+        "/organizations/1/teams/core/memberships/octocat",
+        "/organizations/1/organization-roles/users/octocat/1",
+        "/organizations/1/security-managers/teams/core",
+        "/organizations/1/teams/core/repos/acme/web",
+        "/organizations/1/team/2/memberships/octocat",
+        "/organizations/1/team/2/repos/acme/web",
+    ] {
+        assert!(github.path_denied(path), "{path}");
+    }
     for path in [
         "/repos/acme/web/pulls",
         "/repos/acme/web/codespaces",
@@ -221,6 +277,18 @@ fn the_embedded_registry_loads() {
         "/orgs/acme/teams",
         "/teams/1/repos",
         "/teams/1",
+        // R-12 controls: what a repository and an organization serve by
+        // id that gives nothing lasting.
+        "/repositories",
+        "/repositories/1",
+        "/repositories/1/pulls",
+        "/repositories/1/issues/1/comments",
+        "/repositories/1/environments/prod",
+        "/organizations",
+        "/organizations/1",
+        "/organizations/1/members",
+        "/organizations/1/team/2",
+        "/organizations/1/team/2/repos",
     ] {
         assert!(!github.path_denied(path), "{path}");
     }
