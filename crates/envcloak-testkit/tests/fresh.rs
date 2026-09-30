@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use envcloak_testkit::{TestHome, stale_source};
+use envcloak_testkit::{TESTKIT_BINS, TestHome, stale_source, testkit_bin_beside};
 
 fn write(root: &Path, rel: &str, text: &str) {
     let path = root.join(rel);
@@ -125,9 +125,14 @@ fn fixture() -> (TestHome, PathBuf) {
 /// just after the binary's when the clock has not moved on since it was
 /// linked (file times can be coarser than the clock).
 fn edit(ws: &Path, rel: &str, bin: &Path) {
+    edit_with(ws, rel, "// changed\n", bin);
+}
+
+/// [`edit`], appending `more`.
+fn edit_with(ws: &Path, rel: &str, more: &str, bin: &Path) {
     let path = ws.join(rel);
     let mut text = std::fs::read_to_string(&path).unwrap();
-    text.push_str("// changed\n");
+    text.push_str(more);
     std::fs::write(&path, text).unwrap();
     let after = std::fs::metadata(bin).unwrap().modified().unwrap() + Duration::from_millis(10);
     let at = SystemTime::now().max(after);
@@ -193,6 +198,20 @@ fn a_binary_older_than_a_source_it_is_built_from_is_named() {
     }
     assert_eq!(stale(&fx, "fx"), None);
 
+    // What it does not read (review R-2, as CONTRIBUTING says): a
+    // manifest. A feature declared in the core library's manifest makes
+    // cargo rebuild the core library, and the daemon when it is built
+    // next, but no source file changed, so nothing is named. A check that
+    // also read manifests would change this, and CONTRIBUTING with it.
+    edit_with(
+        &ws,
+        "crates/core/Cargo.toml",
+        "\n[features]\nextra = []\n",
+        &fxd,
+    );
+    cargo(&ws, &["test", "-p", "fx", "--no-run"]);
+    assert_eq!(stale(&fxd, "fxd"), None, "a manifest alone");
+
     // Nothing says a binary is fresh when its build cannot be found: a
     // copy outside the target directory, one cargo did not build there, a
     // package that is not a member, or a library build that is gone.
@@ -214,4 +233,45 @@ fn a_binary_older_than_a_source_it_is_built_from_is_named() {
     }
     let err = stale_source(&fxd, "fxd", &ws).unwrap_err();
     assert!(err.contains("fx_sys"), "{err}");
+}
+
+/// Review R-1: the testkit's own programs ran from the target directory
+/// unchecked, so a scoped run after a change to envcloak-sys (which
+/// `ec-probe` links) ran the old `ec-probe`. `testkit_bin` takes a program
+/// as new as its sources and refuses one older than them, naming the
+/// command that builds it. The program here is a copy of the real
+/// `ec-probe` in a profile directory of its own whose `deps/` is the real
+/// one, so the real build's dep-info is read and the real program is left
+/// as it is.
+#[test]
+fn testkit_bin_refuses_a_program_older_than_its_sources() {
+    let real = Path::new(env!("CARGO_BIN_EXE_ec-probe"));
+    let t = TestHome::new();
+    let profile = t.home().join("profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::os::unix::fs::symlink(real.parent().unwrap().join("deps"), profile.join("deps")).unwrap();
+    // The test binary asking: only its directory counts.
+    let exe = profile.join("deps").join("a-test");
+    let copy = profile.join("ec-probe");
+    std::fs::copy(real, &copy).unwrap();
+    let modified = |at: SystemTime| {
+        std::fs::File::options()
+            .write(true)
+            .open(&copy)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+
+    modified(SystemTime::now());
+    assert_eq!(testkit_bin_beside(&exe, "ec-probe"), copy);
+
+    modified(SystemTime::UNIX_EPOCH + Duration::from_secs(86_400));
+    let refused = std::panic::catch_unwind(|| testkit_bin_beside(&exe, "ec-probe"))
+        .expect_err("an ec-probe older than its sources was taken");
+    let message = refused.downcast_ref::<String>().map_or("", String::as_str);
+    assert!(
+        message.contains("is older than") && message.contains(TESTKIT_BINS),
+        "{message}"
+    );
 }

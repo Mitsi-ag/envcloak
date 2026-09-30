@@ -28,7 +28,8 @@
 //! - [`testkit_bin`]: this crate's programs, for the tests of other crates:
 //!   `fixture-agent`, the stand-in agent the builtin agent catalog knows,
 //!   and `ec-probe`, a caller that connects to a socket after escaping its
-//!   process tree in the ways gate 26 lists.
+//!   process tree in the ways gate 26 lists; refused, as [`assert_fresh`]
+//!   refuses, when older than their sources.
 
 mod canary;
 pub mod crash;
@@ -48,15 +49,33 @@ pub use envcloak_sys::testing::{ProbeAllocator, ProbeMode, ProbeReport, ProbeSes
 pub use fresh::{assert_fresh, stale_source};
 pub use home::{DIAGNOSTIC_VARS, TEST_ENV_VARS, TEST_PATH, TestHome};
 
+/// How to build this crate's programs, which a scoped `cargo test -p` of
+/// another package does not rebuild.
+pub const TESTKIT_BINS: &str = "cargo build -p envcloak-testkit --bins";
+
 /// The path of `name`, one of this crate's programs (`fixture-agent`,
 /// `ec-probe`), built next to the running test binary: in the target
 /// directory above its `deps/`.
 ///
 /// # Panics
-/// When it is not there: `cargo test --workspace` builds it, as does
-/// `cargo build -p envcloak-testkit --bins`.
+/// When it is not there, or older than a source it is built from (see
+/// [`testkit_bin_beside`]).
 pub fn testkit_bin(name: &str) -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|e| panic!("no current exe: {e}"));
+    testkit_bin_beside(&exe, name)
+}
+
+/// [`testkit_bin`] for a test binary at `exe`: `name` in the target
+/// directory above `exe`'s `deps/`. It must be as new as every source it
+/// is built from ([`assert_fresh`]): `ec-probe` links envcloak-sys, and a
+/// scoped run such as `cargo test -p envcloak-policy --test
+/// evidence_gates` builds this crate's library but not its programs, so
+/// after a change to envcloak-sys it would run the old one (review R-1).
+///
+/// # Panics
+/// When it is not there or is older than a source: `cargo test
+/// --workspace` builds it, as does [`TESTKIT_BINS`].
+pub fn testkit_bin_beside(exe: &std::path::Path, name: &str) -> std::path::PathBuf {
     let dir = exe
         .parent()
         .and_then(|deps| deps.parent())
@@ -64,9 +83,10 @@ pub fn testkit_bin(name: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     assert!(
         path.is_file(),
-        "{} is missing: run the tests with --workspace, or cargo build -p envcloak-testkit --bins",
+        "{} is missing: run the tests with --workspace, or {TESTKIT_BINS}",
         path.display()
     );
+    fresh::assert_fresh_or(&path, "envcloak-testkit", TESTKIT_BINS);
     path
 }
 
