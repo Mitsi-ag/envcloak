@@ -20,6 +20,7 @@ envcloak-providers.workspace = true
 envcloak-scan.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 # `envcloak ref` edits envcloak.toml in place: comments, order and layout
 # are kept, so it needs the writer as well as the parser.

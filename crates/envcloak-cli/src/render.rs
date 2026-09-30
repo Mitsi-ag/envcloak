@@ -14,8 +14,13 @@
 //! overrides and invisible characters become visible escapes), and a name
 //! shaped like a key rather than a name is not printed at all, in the text
 //! or in the JSON ([`HIDDEN`] takes its place), since it is most likely a
-//! value pasted in its place. JSON escapes control characters by its own
-//! rules. Two kinds of string are not names: the ids the daemon makes,
+//! value pasted in its place. JSON is written through one writer
+//! ([`json_text`]) that escapes, as `\uXXXX`, every character the text
+//! escapes (C1 controls such as U+009B, DEL, bidirectional controls such
+//! as U+202E, zero-width characters, tags), in paths too: serde_json alone
+//! escapes only U+0000 to U+001F, the quote and the backslash, and an
+//! agent chooses these characters through file and directory names. Two
+//! kinds of string are not names: the ids the daemon makes,
 //! which are shaped like tokens and kept when they have an id's shape
 //! ([`shown_id`]), and paths, which are only escaped ([`shown_path`]).
 //!
@@ -30,7 +35,7 @@ use envcloak_ipc::view::{
     ItemView, ItemsView, LengthClass, RecoveredView, RecoveryConfirmedView, RefChange, RefEditView,
     RefStatus, RemovedView, RotatedView, SkipReason, TargetView, UndoReport, View,
 };
-use envcloak_policy::{escape_for_display, value_shaped};
+use envcloak_policy::{display_escaped, escape_for_display, value_shaped};
 
 use crate::cmd::check::MAX_ENV_FILES;
 
@@ -89,13 +94,59 @@ fn hide_names(v: &mut serde_json::Value, key: Option<&str>) {
     }
 }
 
-/// Prints `v` on standard output, as JSON when `json`.
+/// Prints `v` on standard output, as JSON when `json` ([`json_text`]).
 pub fn print(v: &impl Render, json: bool) {
     if json {
-        println!("{}", v.json());
+        print_json(&v.json());
     } else {
         print!("{}", v.human());
     }
+}
+
+/// serde_json's compact form, with every character a terminal would act
+/// on or not show ([`display_escaped`]: C1 controls, DEL, bidirectional
+/// controls, zero-width characters, tags) written as a `\uXXXX` escape (a
+/// surrogate pair above U+FFFF), as serde_json writes U+0000 to U+001F.
+/// Parsed back, the JSON is unchanged.
+#[derive(Debug)]
+struct TerminalSafe;
+
+impl serde_json::ser::Formatter for TerminalSafe {
+    fn write_string_fragment<W>(&mut self, w: &mut W, fragment: &str) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut start = 0;
+        for (i, c) in fragment.char_indices() {
+            if !display_escaped(c) {
+                continue;
+            }
+            w.write_all(fragment[start..i].as_bytes())?;
+            let mut units = [0u16; 2];
+            for u in c.encode_utf16(&mut units) {
+                write!(w, "\\u{u:04x}")?;
+            }
+            start = i + c.len_utf8();
+        }
+        w.write_all(fragment[start..].as_bytes())
+    }
+}
+
+/// `v` as the JSON every `--json` prints: compact, with
+/// [`TerminalSafe`]'s escapes. `null` if it cannot be written, which a
+/// view never causes.
+pub fn json_text<T: serde::Serialize + ?Sized>(v: &T) -> String {
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, TerminalSafe);
+    if v.serialize(&mut ser).is_err() {
+        return "null".to_owned();
+    }
+    String::from_utf8(out).unwrap_or_else(|_| "null".to_owned())
+}
+
+/// Prints `v` on standard output as [`json_text`], and a newline.
+pub fn print_json<T: serde::Serialize + ?Sized>(v: &T) {
+    println!("{}", json_text(v));
 }
 
 /// What is printed in place of a name that looks like a value.
@@ -1621,7 +1672,9 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
             i.fields[0].name = v.to_owned();
             if let Some(a) = i.account.as_mut() {
                 a.email = Some(v.to_owned());
-                a.label = Some("rtl\u{202e}txet".to_owned());
+                // A bidirectional override and a C1 control (CSI), which
+                // JSON's own encoding leaves as they are.
+                a.label = Some("rtl\u{202e}txet\u{9b}31m".to_owned());
             }
             if let Some(d) = i.detail.as_mut() {
                 d.tags = vec![v.to_owned()];
@@ -1676,10 +1729,14 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
             ];
             for t in &texts {
                 envcloak_testkit::assert_no_canary(t.as_bytes(), &cs);
-                assert!(!t.contains('\u{1b}') && !t.contains('\u{202e}'), "{t}");
+                assert!(!t.chars().any(|c| c != '\n' && display_escaped(c)), "{t}");
                 assert!(t.contains(HIDDEN), "{t}");
             }
-            assert!(texts[0].contains("rtl\\u{202e}txet"), "{}", texts[0]);
+            assert!(
+                texts[0].contains("rtl\\u{202e}txet\\u{9b}31m"),
+                "{}",
+                texts[0]
+            );
             // The JSON of every view hides the same names.
             let jsons = [
                 i.json(),
@@ -1691,10 +1748,19 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
                 edit.json(),
             ];
             for j in &jsons {
-                let t = j.to_string();
+                // As `--json` prints it: every character the text escapes
+                // is a \u escape, and the JSON reads back unchanged.
+                let t = json_text(j);
                 envcloak_testkit::assert_no_canary(t.as_bytes(), &cs);
                 assert!(t.contains(HIDDEN), "{t}");
+                assert!(!t.chars().any(display_escaped), "{t:?}");
+                assert_eq!(&serde_json::from_str::<serde_json::Value>(&t).unwrap(), j);
             }
+            let item_json = json_text(&jsons[0]);
+            assert!(
+                item_json.contains(r#""rtl\u202etxet\u009b31m""#),
+                "{item_json}"
+            );
             assert_eq!(jsons[6]["previous"], HIDDEN);
             assert_eq!(jsons[5]["env_files"][0]["file"], HIDDEN);
             assert_eq!(jsons[5]["references"]["project_name"], HIDDEN);
@@ -1802,13 +1868,37 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
         let j = check.json();
         assert_eq!(j["manifest"], manifest.as_str());
         assert_eq!(j["references"]["project_dir"], dir.as_str());
-        // A path is still escaped.
+        // A path is still escaped, in the text and in the JSON: an agent
+        // names directories, and JSON's own encoding leaves a C1 control
+        // (U+009B, CSI) or a bidirectional override (U+202E) as it is.
+        let odd_dir = format!("/tmp/ecrv/{hash}/a\u{1b}[31m\u{202e}b\u{9b}31m");
         let odd = RefEditView {
-            manifest: "/tmp/a\u{1b}[31m\u{202e}/envcloak.toml".into(),
+            manifest: format!("{odd_dir}/envcloak.toml"),
             ..edit
         };
         let t = odd.human();
-        assert!(!t.contains('\u{1b}') && !t.contains('\u{202e}'), "{t}");
+        assert!(!t.chars().any(|c| c != '\n' && display_escaped(c)), "{t:?}");
+        assert!(t.contains("\\u{202e}b\\u{9b}31m"), "{t}");
+        let odd_check = CheckReport {
+            manifest: Some(odd.manifest.clone()),
+            references: Some(CheckView {
+                project_dir: Some(odd_dir.clone()),
+                project_name: None,
+                bindings: vec![],
+                refs: vec![],
+            }),
+            ..check
+        };
+        for j in [odd.json(), odd_check.json()] {
+            let t = json_text(&j);
+            assert!(!t.chars().any(display_escaped), "{t:?}");
+            assert!(t.contains(r"\u001b[31m\u202eb\u009b31m"), "{t}");
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&t).unwrap(), j);
+        }
+        assert_eq!(
+            odd_check.json()["references"]["project_dir"],
+            odd_dir.as_str()
+        );
 
         let i = item("openai/acme-web", 0);
         assert_eq!(i.json()["id"], "01K5TESTTESTTESTTESTTESTTE");

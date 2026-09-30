@@ -81,5 +81,6 @@ pub use project::{
 };
 pub use statement::{
     BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, RENDER_LIMIT,
-    SubjectSummary, canonical_statement, escape_for_display, render_statement, statement_digest,
+    SubjectSummary, canonical_statement, display_escaped, escape_for_display, render_statement,
+    statement_digest,
 };
