@@ -84,6 +84,9 @@ fn reason_text(reason: &str) -> &'static str {
              mounted with hidepid; see docs/AGENTS.md)"
         }
         "ancestry_unreadable" => "this process's ancestry could not be read",
+        "caller_is_init" => {
+            "this process is pid 1, which no grant is rooted at; run it under a shell or an init"
+        }
         // The manifest.
         "too_large" => "the manifest is larger than 64 KiB",
         "not_utf8" => "the manifest is not UTF-8",

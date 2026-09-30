@@ -1234,7 +1234,7 @@ impl ErrorKind {
 /// was rejected, why the vault could not be opened, why the caller's
 /// ancestry could not be read, what is wrong with a manifest or a binding,
 /// what is wrong with approval options, and what is wrong with an item.
-pub const REASONS: [&str; 63] = [
+pub const REASONS: [&str; 64] = [
     // Passphrase rules (envcloak_core::PassphraseRejected).
     "not_text",
     "control_character",
@@ -1254,6 +1254,7 @@ pub const REASONS: [&str; 63] = [
     "ancestry_changed",
     "ancestry_hidden",
     "ancestry_unreadable",
+    "caller_is_init",
     // The manifest (envcloak_policy::ManifestErrorKind).
     "too_large",
     "not_utf8",

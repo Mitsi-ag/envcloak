@@ -20,7 +20,11 @@
 //!   leader for this purpose: every process descends from it, and GUI apps
 //!   on macOS run in its session. A known agent that is pid 1 (a container
 //!   whose entrypoint execs one) is still an agent for the kind, the
-//!   barrier and proofs, and rules 2 and 3 pick the root.
+//!   barrier and proofs, and rules 2 and 3 pick the root. A caller that is
+//!   pid 1 itself (a container whose pid 1 is the shell or the CLI, with
+//!   the daemon in the same pid namespace) has nothing to root a grant at,
+//!   so its evidence is refused ([`EvidenceError::CallerIsInit`]) rather
+//!   than rooted where no grant could ever cover it.
 //!
 //!   Rule 1 may pick an agent above the caller's session, as it must:
 //!   Claude Code and Codex run each command in a session of its own. Only
@@ -317,6 +321,11 @@ pub enum EvidenceError {
     Hidden,
     /// The kernel refused a read.
     Io(std::io::ErrorKind),
+    /// The caller is pid 1 of the daemon's pid namespace (a container
+    /// whose pid 1 is the shell or the CLI): every process descends from
+    /// it, so no grant could be rooted for it (see the module
+    /// documentation).
+    CallerIsInit,
 }
 
 impl EvidenceError {
@@ -327,6 +336,7 @@ impl EvidenceError {
             EvidenceError::Changed => "ancestry_changed",
             EvidenceError::Hidden => "ancestry_hidden",
             EvidenceError::Io(_) => "ancestry_unreadable",
+            EvidenceError::CallerIsInit => "caller_is_init",
         }
     }
 
@@ -340,6 +350,9 @@ impl EvidenceError {
                  mounted with hidepid)"
             }
             EvidenceError::Io(_) => "the caller's ancestry could not be read",
+            EvidenceError::CallerIsInit => {
+                "the caller is pid 1, which no grant is rooted at; run it under a shell or an init"
+            }
         }
     }
 }
@@ -391,7 +404,9 @@ impl SubjectEvidence {
     /// knows one of their markers. `None` for an empty chain.
     ///
     /// [`gather`] builds evidence from the kernel; tests build it from
-    /// synthetic chains. pid 1 is never the root, whatever its label.
+    /// synthetic chains. pid 1 is never the root, whatever its label, and
+    /// never the session leader: `None` too for a chain whose caller is pid
+    /// 1, which has no root ([`EvidenceError::CallerIsInit`]).
     pub fn from_chain(
         chain: Vec<Ancestor>,
         end: ChainEnd,
@@ -400,6 +415,9 @@ impl SubjectEvidence {
         claimed: Option<AgentLabel>,
     ) -> Option<SubjectEvidence> {
         let first = chain.first()?;
+        if first.instance.pid == 1 {
+            return None;
+        }
         let sid = first.sid;
         // The leading run of the chain in the caller's session, stopping
         // below pid 1.
@@ -630,7 +648,8 @@ fn classifiable(p: &ProcInfo, uid: u32) -> bool {
 /// [`EvidenceError::CallerGone`] when the peer is no longer the process
 /// that connected, [`EvidenceError::Changed`] when every walk saw a
 /// change, [`EvidenceError::Hidden`] when the kernel hides an ancestor,
-/// [`EvidenceError::Io`] when a read failed.
+/// [`EvidenceError::Io`] when a read failed,
+/// [`EvidenceError::CallerIsInit`] when the caller is pid 1.
 pub fn gather_in(
     table: &mut dyn ProcessTable,
     peer: &PeerIdentity,
@@ -678,6 +697,9 @@ pub fn gather_in(
             }
         })
         .collect();
+    if chain.first().is_some_and(|a| a.instance.pid == 1) {
+        return Err(EvidenceError::CallerIsInit);
+    }
     let claimed = claims
         .markers()
         .iter()
