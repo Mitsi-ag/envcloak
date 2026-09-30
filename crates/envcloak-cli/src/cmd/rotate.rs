@@ -2,7 +2,8 @@
 //! (SPEC §10b "Writes that need a proof"; story S7): replaces a secret's
 //! value. The old one is kept as the newest of three prior values, and
 //! grants that bind the item stay (a rotated key keeps working for the
-//! runs already approved).
+//! runs already approved), unless the new value is classified otherwise
+//! (test to live, say), which ends them: the daemon says so.
 //!
 //! Replacing a value is a proof, so an agent cannot swap a key for one it
 //! controls (SPEC §10):

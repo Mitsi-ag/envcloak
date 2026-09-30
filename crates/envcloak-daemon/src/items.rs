@@ -20,7 +20,10 @@
 //!   the vault's passphrase envelope, checked with the vault taken out of
 //!   the slot while Argon2id runs. A rotation keeps the old value as the
 //!   newest of three prior values, and grants that bind the item stay
-//!   (SPEC §10b). A removal writes an encrypted backup of the vault first,
+//!   (SPEC §10b), unless the new value changes the item's classification:
+//!   it is detected as `items.add` detects it, stored in the same
+//!   transaction as the value, and a change (test to live, say) ends the
+//!   grants and pending requests that bind the item. A removal writes an encrypted backup of the vault first,
 //!   which keeps the item's values (`envcloak recover` restores it), then
 //!   deletes the item and ends the grants and pending requests that bind
 //!   it. When the backup cannot be written, nothing is removed. A write
@@ -38,8 +41,8 @@ use envcloak_core::SecretBytes;
 use envcloak_core::audit::AuditKind;
 use envcloak_core::crypto::{CryptoErrorKind, ItemClass};
 use envcloak_core::vault::{
-    Account, FieldId, FieldName, ItemDetails, ItemId, ItemMeta, MAX_FIELD, NewItem, Slug, Vault,
-    VaultError, VaultErrorKind,
+    Account, Classification, FieldId, FieldName, ItemDetails, ItemId, ItemMeta, MAX_FIELD, NewItem,
+    Slug, Vault, VaultError, VaultErrorKind,
 };
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{
@@ -47,8 +50,8 @@ use envcloak_ipc::proto::{
     TargetParams,
 };
 use envcloak_ipc::view::{
-    AddedView, CheckBindingView, CheckView, ItemDetail, ItemView, ItemsView, LengthClass,
-    RefStatus, RemovedView, RotatedView, TargetView,
+    AddedView, CheckBindingView, CheckView, ClassificationView, ItemDetail, ItemView, ItemsView,
+    LengthClass, RefStatus, RemovedView, RotatedView, TargetView,
 };
 use envcloak_policy::{
     BindErrorKind, Binding, EnvName, ManifestError, SubjectEvidence, bind_items, load_project,
@@ -622,19 +625,47 @@ pub fn rotate(
         let v = proven.s.unlocked_mut()?;
         let t = resolve(v)?;
         let (field, name) = t.field.clone().ok_or(RpcError::new(ErrorKind::Internal))?;
-        v.transact(|txn| txn.set_value(field, value))
-            .map_err(|e| write_error(&e))?;
+        let meta = v.item(t.item).ok_or(RpcError::new(ErrorKind::Internal))?;
+        let before = meta.details.classification;
+        // The item's only value decides its classification, as it did at
+        // `items.add`; an item of several fields keeps its own.
+        let after = match meta.fields.as_slice() {
+            [_] => detected_class(shared, &meta.details, &value).unwrap_or(before),
+            _ => before,
+        };
+        let details = (after != before).then(|| ItemDetails {
+            classification: after,
+            ..meta.details.clone()
+        });
+        // The value and the classification change together, or neither.
+        v.transact(|txn| {
+            txn.set_value(field, value)?;
+            if let Some(details) = details {
+                txn.update_item(t.item, details)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| write_error(&e))?;
         let prior_count = v
             .item(t.item)
             .and_then(|m| m.fields.iter().find(|f| f.id == field))
             .map(|f| f.prior_count)
             .ok_or(RpcError::new(ErrorKind::Internal))?;
-        Ok((t, name, prior_count))
+        Ok((t, name, prior_count, before, after))
     })();
-    let (t, name, prior_count) = match written {
+    let (t, name, prior_count, before, after) = match written {
         Ok(w) => w,
         Err(e) => return Err(proven.aborted(peer, Write::Rotate, e)),
     };
+    // A reclassification ends the grants and pending requests that bind
+    // the item (SPEC §10b); an ordinary rotation keeps them.
+    let reclassified = after != before;
+    let grants = if reclassified {
+        proven.s.grants().on_item_reclassified(t.item)
+    } else {
+        0
+    };
+    let token = |c| ClassificationView::from(c).as_str();
     let subject = subject_summary(peer, &proven.caller);
     proven.s.audit(AuditEvent::Rotated {
         pid: peer.pid,
@@ -642,13 +673,40 @@ pub fn rotate(
         item: t.item,
         slug: t.slug.clone(),
         prior_count,
+        reclassified: reclassified.then(|| (token(before), token(after))),
+        grants,
     });
     Ok(RotatedView {
         slug: t.slug.as_str().to_owned(),
         field: name.as_str().to_owned(),
         prior_count,
         length,
+        classification: ClassificationView::from(after),
+        reclassified_from: reclassified.then(|| ClassificationView::from(before)),
+        grants_ended: u64::try_from(grants).unwrap_or(u64::MAX),
     })
+}
+
+/// The classification the registry gives `value` in an item with
+/// `details`, as `items.add` gives a new item's (SPEC §6.3): detected with
+/// the item's variable to break ties, and taken only when the item names
+/// no provider or the provider detected; otherwise unknown. `None` with
+/// no registry, when nothing can be detected. In M1 every classification
+/// comes from a detection (no command sets one by hand), so the item's
+/// classification follows its value.
+fn detected_class(
+    shared: &Shared,
+    details: &ItemDetails,
+    value: &SecretBytes,
+) -> Option<Classification> {
+    let r = shared.registry.as_ref()?;
+    let d = r.detect(value, details.env_hint.as_deref());
+    let mut probe = ItemDetails {
+        provider: details.provider.clone(),
+        ..ItemDetails::default()
+    };
+    r.prefill(&d, &mut probe);
+    Some(probe.classification)
 }
 
 /// `items.remove`. See the module documentation.

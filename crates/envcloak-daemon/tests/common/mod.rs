@@ -152,8 +152,11 @@ pub const SLUGS: [&str; 4] = [
 /// Creates the vault in `home` with the canary passphrase, before any
 /// daemon runs, and seeds it with one secret item per canary of the
 /// story: `openai/acme-web`, `stripe/acme-web`, `github/acme-web` and
-/// `short/acme-web`, each with a `value` field. The vault is left locked
-/// on disk; the daemon opens it. Returns the kit's text as a canary.
+/// `short/acme-web`, each with a `value` field and the classification the
+/// provider registry gives its value (as `items.add` and an import give
+/// it, and a rotation keeps it up to date: test, live or unknown). The
+/// vault is left locked on disk; the daemon opens it. Returns the kit's
+/// text as a canary.
 pub fn seed_vault(home: &TestHome, cs: &[Canary]) -> Canary {
     let kit = RecoveryKit::generate();
     let text = kit.to_display();
@@ -165,21 +168,20 @@ pub fn seed_vault(home: &TestHome, cs: &[Canary]) -> Canary {
         labels::GITHUB_TOKEN,
         labels::SHORT_TOKEN,
     ];
+    let registry = envcloak_providers::load_embedded().unwrap();
     v.transact(|t| {
         for (slug, label) in SLUGS.iter().zip(values) {
+            let value = SecretBytes::copy_from(by_label(cs, label).value());
             let id = t.create_item(NewItem {
                 class: ItemClass::Secret,
                 slug: Slug::new(slug).unwrap(),
                 details: ItemDetails {
                     title: (*slug).to_owned(),
+                    classification: registry.detect(&value, None).classification,
                     ..ItemDetails::default()
                 },
             })?;
-            t.add_field(
-                id,
-                FieldName::new("value").unwrap(),
-                SecretBytes::copy_from(by_label(cs, label).value()),
-            )?;
+            t.add_field(id, FieldName::new("value").unwrap(), value)?;
         }
         Ok(())
     })
