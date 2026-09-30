@@ -278,6 +278,9 @@ fn dsn_passwords<'a>(v: &'a [u8], out: &mut Vec<&'a [u8]>) {
         let password = &v[colon + 1..at];
         if address && !password.is_empty() {
             out.push(password);
+            if out.len() > MAX_PASSWORD_READINGS {
+                return;
+            }
         }
     }
 }
@@ -318,7 +321,9 @@ fn field_passwords<'a>(v: &'a [u8], out: &mut Vec<&'a [u8]>) {
             .iter()
             .position(|&b| matches!(b, b';' | b'&') || b.is_ascii_whitespace())
             .unwrap_or(value.len());
-        out.push(&value[..plain]);
+        if plain > 0 {
+            out.push(&value[..plain]);
+        }
         let close = match value.first() {
             Some(b'\'') => Some(b'\''),
             Some(b'"') => Some(b'"'),
@@ -331,15 +336,20 @@ fn field_passwords<'a>(v: &'a [u8], out: &mut Vec<&'a [u8]>) {
                 .iter()
                 .position(|&b| b == close)
                 .unwrap_or(inner.len());
-            out.push(&inner[..end]);
+            if end > 0 {
+                out.push(&inner[..end]);
+            }
+        }
+        if out.len() > MAX_PASSWORD_READINGS {
+            return;
         }
     }
-    out.retain(|p| !p.is_empty());
 }
 
 /// The most password readings [`password_chars`] counts. A value with
 /// more is counted as short, which fails closed (compared only for a
-/// person) and keeps the work linear in the value's length.
+/// person), and the search stops there, so the work stays linear in the
+/// value's length.
 pub const MAX_PASSWORD_READINGS: usize = 64;
 
 /// When `value` holds a password in a form this knows, how many
@@ -615,6 +625,16 @@ mod shape_tests {
         let many = |n: usize| "password=abcdefghijklmnopq ".repeat(n).into_bytes();
         assert_eq!(password_chars(&many(MAX_PASSWORD_READINGS)), Some(17));
         assert_eq!(password_chars(&many(MAX_PASSWORD_READINGS + 1)), Some(0));
+        // Hostile runs the size of the field cap, fields with no separator
+        // and DSN addresses: the search stops at the cap, so each is
+        // counted short at once rather than read at every field.
+        let run = |unit: &str| unit.repeat(65_536 / unit.len()).into_bytes();
+        assert_eq!(password_chars(&run("password=")), Some(0));
+        assert_eq!(password_chars(&run("pwd='{\"")), Some(0));
+        let dsn = [b"app:".to_vec(), run("x@tcp(")].concat();
+        assert_eq!(password_chars(&dsn), Some(0));
+        // Empty fields are no readings, however many.
+        assert_eq!(password_chars(&run("password=;")), None);
     }
 
     #[test]
