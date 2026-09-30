@@ -222,7 +222,9 @@ fn the_embedded_registry_loads() {
 
 /// SPEC §8: a change to allowed hosts, auth slots or denied paths needs
 /// code-owner review. CODEOWNERS must name an owner for the provider files,
-/// the compiled copy and the loader rules that check them.
+/// the compiled copy, the loader rules that check them, detection (which
+/// picks the provider whose hosts a new item gets) and this crate's tests,
+/// which pin them (review T6 open 4).
 #[test]
 fn codeowners_cover_the_registry() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/CODEOWNERS");
@@ -242,6 +244,8 @@ fn codeowners_cover_the_registry() {
         "/crates/envcloak-providers/src/embedded.rs",
         "/crates/envcloak-providers/src/safety.rs",
         "/crates/envcloak-providers/src/registry.rs",
+        "/crates/envcloak-providers/src/detect.rs",
+        "/crates/envcloak-providers/tests/",
         "/scripts/gen-providers.py",
         "/.github/CODEOWNERS",
     ] {
