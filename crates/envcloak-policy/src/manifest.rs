@@ -390,15 +390,17 @@ fn project(
 }
 
 /// 1 to 128 bytes, with no control characters and none of the invisible
-/// ones an approval screen could be spoofed with (bidirectional controls,
-/// zero-width characters, the byte-order mark).
+/// ones an approval screen could be spoofed with: the class display
+/// escapes ([`crate::statement::is_invisible`]), every format character
+/// (bidirectional controls, zero-width characters, the byte-order mark,
+/// the soft hyphen, tags), line and paragraph separators and variation
+/// selectors.
 pub(crate) fn valid_project_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
-        && !s.chars().any(|c| {
-            c.is_control()
-                || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
-        })
+        && !s
+            .chars()
+            .any(|c| c.is_control() || crate::statement::is_invisible(c))
 }
 
 fn env(

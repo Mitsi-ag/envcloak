@@ -55,7 +55,7 @@ redact = true
 mode = "proxy"                         # proxy | inject
 ```
 
-- `[project]` holds `name` only: 1 to 128 bytes, with no control characters and none of the invisible ones (bidirectional controls, zero-width characters, the byte-order mark).
+- `[project]` holds `name` only: 1 to 128 bytes, with no control characters and none of the invisible ones an approval surface escapes (GRANTS.md "Rendering"): every format character (Unicode `Cf`: bidirectional controls such as U+061C and U+202E, zero-width characters, the byte-order mark, the soft hyphen, tags), line and paragraph separators (U+2028, U+2029), variation selectors, and fillers that show as blank.
 - Under `[env]`, each key is an environment variable and each value a reference: a string `"<slug>[#field]"`, or an inline table with `ref` (a slug, without `#`) and an optional `field`.
 - A standard or dotted table under `env` (`[env.production]`, `production.KEY = ...`) is a profile. An inline table is always a binding, and an inline `env = { ... }` holds bindings only. A profile holds bindings only: profiles do not nest.
 - TOML itself refuses a key defined twice, including two spellings of one key (`A` and `"A"`).

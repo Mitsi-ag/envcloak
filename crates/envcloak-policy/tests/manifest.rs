@@ -401,6 +401,35 @@ fn the_project_name_is_display_text() {
         "\"a\\u202eb\"",
         "\"a\\u200bb\"",
         &format!("\"{long}\""),
+        // Review T5 open 1: the whole Bidi_Control set, line and paragraph
+        // separators, every format character and variation selectors.
+        "\"a\\u061cb\"",
+        "\"a\\u200eb\"",
+        "\"a\\u200fb\"",
+        "\"a\\u202ab\"",
+        "\"a\\u2066b\"",
+        "\"a\\u2069b\"",
+        "\"a\\u2028b\"",
+        "\"a\\u2029b\"",
+        "\"a\\u00adb\"",
+        "\"a\\u180eb\"",
+        "\"a\\u0600b\"",
+        "\"a\\u06ddb\"",
+        "\"a\\u070fb\"",
+        "\"a\\u08e2b\"",
+        "\"a\\u2064b\"",
+        "\"a\\ufff9b\"",
+        "\"a\\U000110bdb\"",
+        "\"a\\U00013430b\"",
+        "\"a\\U0001d173b\"",
+        "\"a\\U000e0001b\"",
+        "\"a\\U000e0041b\"",
+        "\"a\\U000e007fb\"",
+        "\"a\\u180bb\"",
+        "\"a\\ufe00b\"",
+        "\"a\\ufe0fb\"",
+        "\"a\\U000e0100b\"",
+        "\"a\\U000e01efb\"",
     ] {
         let s = format!("[project]\nname = {bad}\n");
         assert_eq!(
@@ -408,6 +437,17 @@ fn the_project_name_is_display_text() {
             (ManifestErrorKind::InvalidProjectName, Some(2)),
             "{bad}"
         );
+    }
+    // Visible text from the same scripts stays a name: Arabic, Mongolian,
+    // an emoji with its presentation selector left out, a hyphen.
+    for good in [
+        "\u{627}\u{644}\u{645}\u{634}\u{631}\u{648}\u{639}",
+        "\u{1820}\u{1821}",
+        "acme \u{1f680}",
+        "acme-web \u{2010} 2",
+    ] {
+        let s = format!("[project]\nname = \"{good}\"\n");
+        assert_eq!(parse(&s).project_name.as_deref(), Some(good), "{good:?}");
     }
     assert_eq!(err("[project]\nname = 1").0, ManifestErrorKind::WrongType);
     assert_eq!(err("project = 1").0, ManifestErrorKind::WrongType);

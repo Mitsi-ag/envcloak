@@ -220,14 +220,23 @@ pub fn statement_digest(p: &PendingDescriptor, o: &ApprovalOptions) -> [u8; 32] 
 }
 
 /// Whether `c` is invisible or changes the direction or layout of what
-/// follows: bidirectional controls, zero-width and joining characters,
-/// line and paragraph separators, tags and other format characters.
-fn is_invisible(c: char) -> bool {
+/// follows: every format character (Unicode's `Cf`: bidirectional
+/// controls, zero-width and joining characters, the soft hyphen, tags,
+/// Arabic and Egyptian format marks), line and paragraph separators
+/// (`Zl`, `Zp`), variation selectors, and fillers that show as blank.
+/// Control characters (`Cc`) are `char::is_control`. Display escapes these
+/// ([`escape_for_display`]), and a manifest's project name refuses them.
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c as u32,
         0x00AD
             | 0x034F
+            | 0x0600..=0x0605
             | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
             | 0x115F..=0x1160
             | 0x17B4..=0x17B5
             | 0x180B..=0x180F
@@ -239,6 +248,9 @@ fn is_invisible(c: char) -> bool {
             | 0xFEFF
             | 0xFFA0
             | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
             | 0x1BCA0..=0x1BCA3
             | 0x1D173..=0x1D17A
             | 0xE0000..=0xE0FFF
