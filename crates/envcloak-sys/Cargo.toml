@@ -44,6 +44,12 @@ harness = false
 name = "freed_memory"
 harness = false
 
+# Its own main: a copy of this binary leads a session on a
+# pseudo-terminal and reports the signals its relay catches (see the file).
+[[test]]
+name = "relay_terminal"
+harness = false
+
 [dev-dependencies]
 # Enables the `testing` feature for this crate's own tests.
 envcloak-sys = { path = ".", features = ["testing"] }
