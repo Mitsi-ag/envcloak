@@ -707,6 +707,16 @@ pub fn signal_this_thread(sig: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// Does what the installed [`crate::SignalRelay`]'s handler does with a
+/// signal that finds the relay's pipe full (review F-71): keeps `sig`,
+/// sent by a process or not (`by_process`), aside for the reader, and
+/// wakes it. Nothing is signalled, so a test chooses exactly which signal
+/// was kept and between which marks. Does nothing while no relay is
+/// installed.
+pub fn keep_as_if_the_relay_was_full(sig: i32, by_process: bool) {
+    crate::child::keep_as_if_full(sig, by_process);
+}
+
 /// Blocks `sig` for the calling thread, as a signal mask inherited
 /// through `exec` blocks it for the thread a program starts on (review
 /// R-8). Returns whether the thread blocked it already.

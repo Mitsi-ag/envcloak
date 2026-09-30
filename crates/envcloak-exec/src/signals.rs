@@ -36,7 +36,10 @@
 //! run too; only the terminal's own SIGINT or SIGQUIT, which reached the
 //! child as well, is then left alone. When the mark cannot be written
 //! (the relay's pipe full of signals not read yet), every signal read from
-//! then on stops the run.
+//! then on stops the run. A signal that itself finds the pipe full is kept
+//! aside by the relay and read here like the others, on its side of the
+//! mark (review F-71), so a SIGTERM behind a flood of another signal is
+//! not lost.
 
 use std::io;
 use std::sync::Mutex;
@@ -306,6 +309,91 @@ mod tests {
         assert!(lost, "the mark went into a full pipe");
         assert_eq!(cutoff.stopped_by(), Some(libc::SIGHUP));
         assert!(alive, "a signal after the lost mark reached the child");
+    }
+
+    /// Waits up to 10 seconds for `child` to exit, and returns how it
+    /// ended; kills and reaps one still running, and returns `None`.
+    fn ended(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::yield_now();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    }
+
+    /// A child in a group of its own that ignores SIGHUP, so a flood of it
+    /// passed on leaves it running, and dies of anything else. Returned
+    /// once it says it ignores it.
+    fn ignoring_hup() -> std::process::Child {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' HUP; echo ready; exec /bin/sleep 60"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "ready\n");
+        child
+    }
+
+    /// Review F-71, through the forwarder: a SIGTERM caught behind a relay
+    /// pipe full of SIGHUP (passed on and ignored), with the child still
+    /// running, is kept aside by the relay and still reaches the child.
+    /// The relay used to drop it, and the child would run on.
+    #[test]
+    fn a_signal_behind_a_full_pipe_still_reaches_the_running_child() {
+        use std::os::unix::process::ExitStatusExt;
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let forwarder = Forwarder::install(false).unwrap();
+        let cutoff = Cutoff::default();
+        let mut child = ignoring_hup();
+        let state = ChildState::running(i32::try_from(child.id()).unwrap());
+        flood(libc::SIGHUP);
+        envcloak_sys::testing::signal_this_thread(libc::SIGTERM).unwrap();
+        std::thread::scope(|s| {
+            let forwarding = s.spawn(|| forwarder.forward(&state, &cutoff));
+            forwarder.stop(|| !forwarding.is_finished());
+        });
+        let status = ended(&mut child);
+        assert_eq!(cutoff.stopped_by(), None);
+        assert_eq!(
+            status.and_then(|s| s.signal()),
+            Some(libc::SIGTERM),
+            "the SIGTERM behind the full pipe did not reach the child"
+        );
+    }
+
+    /// Review F-71: a signal kept aside after the mark of the child's
+    /// exit (written, not lost) stops the run like any signal after the
+    /// mark, and is never passed on, though the pid is still the child's
+    /// (between the mark and `ChildState::exited`): it comes after the
+    /// mark, as it was caught.
+    #[test]
+    fn a_signal_kept_after_the_mark_stops_the_run_and_never_reaches_the_child() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let forwarder = Forwarder::install(false).unwrap();
+        let cutoff = Cutoff::default();
+        let mut child = ignoring_hup();
+        let state = ChildState::running(i32::try_from(child.id()).unwrap());
+        forwarder.child_exited();
+        assert!(!forwarder.mark_lost.load(Ordering::SeqCst));
+        envcloak_sys::testing::keep_as_if_the_relay_was_full(libc::SIGTERM, true);
+        forwarder.stop(|| false);
+        forwarder.forward(&state, &cutoff);
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(cutoff.stopped_by(), Some(libc::SIGTERM));
+        assert!(alive, "a signal kept after the mark reached the child");
     }
 
     /// Review R-9 (the stop, as the mark): the stop is written into a
