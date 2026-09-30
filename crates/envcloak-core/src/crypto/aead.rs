@@ -7,10 +7,14 @@
 //! exact-size buffer that becomes the returned [`SecretBytes`] without
 //! moving.
 
+use chacha20::XChaCha20;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20poly1305::aead::inout::InOutBuf;
 use chacha20poly1305::{AeadInOut, KeyInit, Tag, XChaCha20Poly1305, XNonce};
+use poly1305::Poly1305;
+use poly1305::universal_hash::UniversalHash;
 use secrecy::ExposeSecret;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::aad::Aad;
 use super::keys::SubKey;
@@ -135,6 +139,81 @@ pub(crate) fn open_into(
         .map_err(|_| open_err())
 }
 
+/// Whether `body`, read as `nonce || ciphertext || tag` (the stored form
+/// of a [`Sealed`]), authenticates under `k` and `aad` when cut to some
+/// length in `lens`: for each length `n` in order, whether its first `n`
+/// bytes would open. `take(n)` is asked about each length that does, and
+/// the search ends when it answers `true`.
+///
+/// One pass, as XChaCha20-Poly1305 checks a tag (the `chacha20poly1305`
+/// crate's construction): the one-time Poly1305 key is the first 32 bytes
+/// of the keystream under the nonce, and the tag covers the associated
+/// data and the ciphertext, each padded to 16 bytes, then both lengths.
+/// The hash of the whole 16-byte blocks is carried from one length to the
+/// next, and only the last partial block and the lengths are hashed for
+/// each, so every length a stored entry can have is checked in time
+/// linear in `body` where opening each would take the square (the audit
+/// log's torn-tail check, review F-46). Nothing is decrypted; the
+/// one-time key and the hash states are wiped.
+#[allow(clippy::disallowed_methods)] // Reads the subkey to derive the one-time key.
+pub(crate) fn authenticates_at(
+    k: &SubKey,
+    aad: &Aad,
+    body: &[u8],
+    lens: core::ops::RangeInclusive<usize>,
+    take: impl FnMut(usize) -> bool,
+) -> bool {
+    authenticates_at_with(k.key.expose_secret(), &aad.encode(), body, lens, take)
+}
+
+/// [`authenticates_at`] with the key and the associated data as bytes.
+fn authenticates_at_with(
+    key: &[u8; 32],
+    aad: &[u8],
+    body: &[u8],
+    lens: core::ops::RangeInclusive<usize>,
+    mut take: impl FnMut(usize) -> bool,
+) -> bool {
+    let first = (*lens.start()).max(Sealed::OVERHEAD);
+    let last = (*lens.end()).min(body.len());
+    if first > last {
+        return false;
+    }
+    let mut nonce = [0u8; Sealed::NONCE_LEN];
+    nonce.copy_from_slice(&body[..Sealed::NONCE_LEN]);
+    let mut cipher = XChaCha20::new(key.into(), &XNonce::from(nonce));
+    let mut mac_key = poly1305::Key::default();
+    cipher.apply_keystream(&mut mac_key);
+    let mut mac = Poly1305::new(&mac_key);
+    mac_key.as_mut_slice().zeroize();
+    mac.update_padded(aad);
+    let aad_len = u64::try_from(aad.len()).unwrap_or(u64::MAX).to_le_bytes();
+    let ciphertext = &body[Sealed::NONCE_LEN..];
+    // The whole 16-byte blocks of the ciphertext hashed into `mac`.
+    let mut hashed = 0;
+    for n in first..=last {
+        let len = n - Sealed::OVERHEAD;
+        while (hashed + 1) * 16 <= len {
+            let mut block = poly1305::Block::default();
+            block.copy_from_slice(&ciphertext[hashed * 16..(hashed + 1) * 16]);
+            mac.update(&[block]);
+            hashed += 1;
+        }
+        let mut at = mac.clone();
+        at.update_padded(&ciphertext[hashed * 16..len]);
+        let mut lengths = poly1305::Block::default();
+        lengths[..8].copy_from_slice(&aad_len);
+        lengths[8..].copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+        at.update(&[lengths]);
+        let mut tag = poly1305::Block::default();
+        tag.copy_from_slice(&body[n - Sealed::TAG_LEN..n]);
+        if at.verify(&tag).is_ok() && take(n) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 thread_local! {
     /// Calls to [`open_into`] on this thread, so tests can show that a
@@ -167,6 +246,113 @@ only one tip for the future, sunscreen would be it.";
 
     fn arr<const N: usize>(hex: &str) -> [u8; N] {
         unhex(hex).try_into().unwrap()
+    }
+
+    /// Every length at which `body` opens, by opening each alone.
+    fn opening_each(key: &[u8; 32], aad: &[u8], body: &[u8]) -> Vec<usize> {
+        (Sealed::OVERHEAD..=body.len())
+            .filter(|&n| {
+                let mut nonce = [0u8; Sealed::NONCE_LEN];
+                nonce.copy_from_slice(&body[..Sealed::NONCE_LEN]);
+                let ct = &body[Sealed::NONCE_LEN..n];
+                let mut out = vec![0u8; ct.len() - Sealed::TAG_LEN];
+                open_into(key, &nonce, aad, ct, &mut out).is_ok()
+            })
+            .collect()
+    }
+
+    /// Every length at which `body` opens, in one pass.
+    fn in_one_pass(key: &[u8; 32], aad: &[u8], body: &[u8]) -> Vec<usize> {
+        let mut found = Vec::new();
+        assert!(!authenticates_at_with(
+            key,
+            aad,
+            body,
+            0..=usize::MAX,
+            |n| {
+                found.push(n);
+                false
+            }
+        ));
+        found
+    }
+
+    /// Review F-46: the one-pass check agrees with the crate's own open at
+    /// every length: the draft's vector with bytes after its tag, and
+    /// entries sealed here of every length up to three blocks and beyond,
+    /// before bytes that are no entry, with the associated data empty or
+    /// not a multiple of 16. `take` ends the search where it says.
+    #[test]
+    fn every_length_that_opens_is_found_in_one_pass() {
+        let (key, aad) = (arr::<32>(KEY), unhex(AAD));
+        let mut body = unhex(NONCE);
+        body.extend(unhex(CT));
+        body.extend(unhex(TAG));
+        let whole = body.len();
+        body.extend([0x5a; 37]);
+        assert_eq!(in_one_pass(&key, &aad, &body), [whole]);
+        assert_eq!(opening_each(&key, &aad, &body), [whole]);
+        // One byte of the tag or the ciphertext changed: no length.
+        for at in [whole - 1, Sealed::NONCE_LEN + 3] {
+            let mut changed = body.clone();
+            changed[at] ^= 0x01;
+            assert!(in_one_pass(&key, &aad, &changed).is_empty(), "{at}");
+        }
+
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for aad_len in [0usize, 12, 16, 61] {
+            let aad: Vec<u8> = (0..aad_len).map(|_| next() as u8).collect();
+            for pt_len in (0..=50).chain([63, 64, 65, 200]) {
+                let mut key = [0u8; 32];
+                key.iter_mut().for_each(|b| *b = next() as u8);
+                let mut nonce = [0u8; Sealed::NONCE_LEN];
+                nonce.iter_mut().for_each(|b| *b = next() as u8);
+                let pt: Vec<u8> = (0..pt_len).map(|_| next() as u8).collect();
+                let mut body = nonce.to_vec();
+                body.extend(seal_with_nonce(&key, &nonce, &aad, &pt).unwrap());
+                let end = body.len();
+                let tail = usize::try_from(next() % 50).unwrap();
+                body.extend((0..tail).map(|_| next() as u8));
+                let found = in_one_pass(&key, &aad, &body);
+                assert_eq!(found, [end], "{aad_len} {pt_len}");
+                assert_eq!(found, opening_each(&key, &aad, &body), "{aad_len} {pt_len}");
+                // Each length alone, and a range that leaves it out.
+                assert!(authenticates_at_with(&key, &aad, &body, end..=end, |_| {
+                    true
+                }));
+                assert!(!authenticates_at_with(
+                    &key,
+                    &aad,
+                    &body,
+                    0..=end - 1,
+                    |_| true
+                ));
+                assert!(!authenticates_at_with(
+                    &key,
+                    &aad,
+                    &body,
+                    end + 1..=usize::MAX,
+                    |_| true
+                ));
+                // The wrong key, or other associated data: none.
+                key[0] ^= 1;
+                assert!(in_one_pass(&key, &aad, &body).is_empty());
+            }
+        }
+        // Too short to hold a nonce and a tag: nothing is read.
+        assert!(!authenticates_at_with(
+            &key,
+            &aad,
+            &body[..39],
+            0..=usize::MAX,
+            |_| true
+        ));
     }
 
     #[test]

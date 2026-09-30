@@ -1365,8 +1365,10 @@ fn a_torn_frame_under_another_number_is_kept_as_damage() {
 /// Codex F-46 follow-up: every framed candidate in bytes that look like a
 /// torn tail is opened under the number it carries, within a fixed amount
 /// of work. Bytes built to frame at every fourth offset, more than the
-/// check opens, are kept and flagged as damage rather than removed as a
-/// crash's, with or without a saved head before them.
+/// check opens, or to carry a number close to the expected one at every
+/// twelfth, each of which is tried at every length (cycle 150), are kept
+/// and flagged as damage rather than removed as a crash's, with or without
+/// a saved head before them.
 #[test]
 fn bytes_too_many_to_check_are_kept_as_damage() {
     let log = Log::new();
@@ -1381,11 +1383,24 @@ fn bytes_too_many_to_check_are_kept_as_damage() {
     bytes.extend_from_slice(&u32::try_from(MAX_ENTRY).unwrap().to_be_bytes());
     bytes.extend_from_slice(&4u64.to_be_bytes());
     // Every fourth offset holds the length 1,024 and room for it.
+    let mut framing = bytes.clone();
     for _ in 0..15_000 {
-        bytes.extend_from_slice(&[0, 0, 4, 0]);
+        framing.extend_from_slice(&[0, 0, 4, 0]);
     }
-    for anchor in [None, Some(three)] {
-        std::fs::write(&seg, &bytes).unwrap();
+    // Every twelfth offset holds the number entry 5 would carry, which the
+    // check opens at every length (Codex F-46, cycle 150).
+    let mut numbered = bytes.clone();
+    for _ in 0..5_000 {
+        numbered.extend_from_slice(&[0, 0, 0, 0]);
+        numbered.extend_from_slice(&5u64.to_be_bytes());
+    }
+    for (anchor, bytes) in [
+        (None, &framing),
+        (Some(three), &framing),
+        (None, &numbered),
+        (Some(three), &numbered),
+    ] {
+        std::fs::write(&seg, bytes).unwrap();
         let r = log.verify(anchor);
         assert_eq!(problem(&r), Some((4, ProblemKind::Unreadable)), "{r:?}");
         assert!(!r.torn_tail, "{r:?}");
@@ -1394,7 +1409,167 @@ fn bytes_too_many_to_check_are_kept_as_damage() {
             report.damaged && !report.torn_tail_removed,
             "{anchor:?}: {report:?}"
         );
-        assert_eq!(std::fs::read(&seg).unwrap(), bytes, "{anchor:?}: kept");
+        assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{anchor:?}: kept");
+    }
+}
+
+/// Codex F-46, cycle 150 replay: an entry whose sealed bytes are whole
+/// but whose length was stretched past the end and whose chain value was
+/// changed, with a byte after it, was taken for a crash's torn tail, since
+/// only its chain value was tried at every length, and the writer removed
+/// it (122 bytes). Its sealed bytes open where it really ends, which the
+/// check now tries at every length in one pass:
+/// - entry 2 so, with 0 to 40 bytes after it and more, with its chain
+///   value changed, cut short and changed, or gone;
+/// - entry 2 with its chain value cut short and right but its length
+///   changed, which is no crash's either (a crash's frame says where its
+///   entry ends);
+/// - with entry 2 damaged past opening, or only part of it left, and
+///   entries 3 to 9 deleted, entry 10 changed the same way: it opens under
+///   its own number at its real length.
+///
+/// Each is damage, flagged at entry 2 and kept by the writer, with and
+/// without entry 1 anchored. The controls: entry 2 cut anywhere in its
+/// chain value (its sealed bytes whole, what is left of its chain value
+/// right) or in its sealed bytes is what a crash leaves, and is removed;
+/// its chain value changed alone, and its length stretched alone before a
+/// byte, are flagged.
+#[test]
+fn an_entry_that_opens_whatever_its_length_and_chain_value_is_kept() {
+    let log = Log::new();
+    let mut w = log.writer(None);
+    fill(&mut w, 1, 1);
+    let first = w.head_record();
+    fill(&mut w, 2, 9);
+    drop(w);
+    let seg = log.segments().pop().unwrap();
+    let orig = std::fs::read(&seg).unwrap();
+    let fr = frames(&orig);
+    let reset = |bytes: &[u8]| {
+        for s in log.segments() {
+            std::fs::remove_file(s).unwrap();
+        }
+        std::fs::write(&seg, bytes).unwrap();
+    };
+    let one = &orig[..fr[0].1.end];
+    let two = &orig[fr[1].1.clone()];
+    let ten = &orig[fr[9].1.clone()];
+    let max = u32::try_from(MAX_ENTRY).unwrap().to_be_bytes();
+    // A frame's length, sealed bytes and chain value, changed as asked:
+    // the length stretched, the chain value kept for `mac` bytes, and its
+    // last kept byte flipped when `flip`.
+    let changed = |frame: &[u8], len: [u8; 4], mac: usize, flip: bool| {
+        let mut f = frame[..frame.len() - 32 + mac].to_vec();
+        f[..4].copy_from_slice(&len);
+        if flip && mac > 0 {
+            let at = f.len() - 1;
+            f[at] ^= 0x01;
+        }
+        f
+    };
+    let noise = |n: usize| -> Vec<u8> { (0..n).map(|i| (i * 37 + 11) as u8).collect() };
+
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    for after in (0..=40).chain([100, 1000]) {
+        let mut b = one.to_vec();
+        b.extend(changed(two, max, 32, true));
+        b.extend(noise(after));
+        cases.push((
+            format!("entry 2 stretched, its chain value changed, {after} bytes after"),
+            b,
+        ));
+    }
+    for (mac, flip, after) in [(0, false, 0), (0, false, 1), (0, false, 33), (20, true, 1)] {
+        let mut b = one.to_vec();
+        b.extend(changed(two, max, mac, flip));
+        b.extend(noise(after));
+        cases.push((
+            format!("entry 2 stretched, {mac} bytes of its chain value, {after} after"),
+            b,
+        ));
+    }
+    let real = u32::try_from(two.len() - 44).unwrap();
+    for (len, mac) in [(real + 5, 10), (real + 1, 31), (real + 40, 0)] {
+        let mut b = one.to_vec();
+        b.extend(changed(two, len.to_be_bytes(), mac, false));
+        cases.push((
+            format!("entry 2's length {len} for {real}, {mac} right bytes of its chain value"),
+            b,
+        ));
+    }
+    let mut spoiled = two.to_vec();
+    spoiled[12 + 40] ^= 0x01;
+    for (what, head) in [
+        ("damaged", spoiled.clone()),
+        ("its first 30 bytes left", two[..30].to_vec()),
+        ("its first 90 bytes left", two[..90].to_vec()),
+    ] {
+        let mut b = one.to_vec();
+        b.extend_from_slice(&max);
+        b.extend_from_slice(&head[4..]);
+        b.extend(changed(ten, max, 32, true));
+        b.extend(noise(1));
+        cases.push((
+            format!("entry 2 {what}, entries 3 to 9 deleted, entry 10 changed so"),
+            b,
+        ));
+    }
+    for (what, bytes) in &cases {
+        for anchor in [None, Some(first)] {
+            reset(bytes);
+            let r = log.verify(anchor);
+            assert_eq!(
+                problem(&r).map(|p| p.0),
+                Some(2),
+                "{what}, {anchor:?}: {r:?}"
+            );
+            assert!(
+                !r.torn_tail && r.torn_bytes == 0,
+                "{what}, {anchor:?}: {r:?}"
+            );
+            let (mut w, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+            assert!(
+                report.damaged && !report.torn_tail_removed && report.torn_bytes == 0,
+                "{what}, {anchor:?}: {report:?}"
+            );
+            assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{what}: kept");
+            w.append(&record(11)).unwrap();
+            assert_eq!(&std::fs::read(&seg).unwrap(), bytes, "{what}: still kept");
+        }
+    }
+
+    // Controls. Entry 2 cut in its chain value or its sealed bytes, with
+    // nothing after it: a crash's, removed.
+    for keep in (two.len() - 32..two.len()).chain([13, 60, two.len() - 33]) {
+        let mut b = one.to_vec();
+        b.extend_from_slice(&two[..keep]);
+        for anchor in [None, Some(first)] {
+            reset(&b);
+            let r = log.verify(anchor);
+            assert!(r.ok() && r.torn_tail, "{keep} bytes, {anchor:?}: {r:?}");
+            let (mut w, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+            assert!(
+                report.torn_tail_removed && !report.damaged,
+                "{keep} bytes, {anchor:?}: {report:?}"
+            );
+            assert_eq!(std::fs::read(&seg).unwrap(), one, "{keep} bytes");
+            assert_eq!(w.append(&record(2)).unwrap(), 2);
+        }
+    }
+    // Each change alone: the chain value (the frame whole), and the length
+    // stretched before a byte (its chain value checks out).
+    let mut mac_only = one.to_vec();
+    mac_only.extend(changed(two, two[..4].try_into().unwrap(), 32, true));
+    let mut stretched = one.to_vec();
+    stretched.extend(changed(two, max, 32, false));
+    stretched.push(0xff);
+    for (what, b) in [("chain value", mac_only), ("stretched", stretched)] {
+        for anchor in [None, Some(first)] {
+            reset(&b);
+            let r = log.verify(anchor);
+            assert_eq!(problem(&r).map(|p| p.0), Some(2), "{what}: {r:?}");
+            assert!(!r.torn_tail, "{what}: {r:?}");
+        }
     }
 }
 

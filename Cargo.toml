@@ -54,16 +54,20 @@ zeroize = "=1.9.0"
 
 # Crypto (SPEC §11). The 2026 RustCrypto majors are adopted together.
 # The `zeroize` features make the ciphers, hashers, MACs and HMAC states
-# wipe themselves on drop. blake2 and poly1305 are listed only to turn
+# wipe themselves on drop. blake2 and poly1305 are listed to turn
 # theirs on: Argon2id hashes the passphrase with blake2, and
 # chacha20poly1305's own feature reaches chacha20 but not poly1305, whose
-# state holds each seal's one-time key. argon2's feature covers its small
+# state holds each seal's one-time key. chacha20 and poly1305 are also
+# used directly, by the audit log's torn-tail check, which authenticates
+# a sealed entry at every length it can have in one pass (review F-46).
+# argon2's feature covers its small
 # buffers, not its working memory (64 MiB to 4 GiB), which it frees
 # unwiped: envcloak-core allocates that memory itself and wipes it
 # (crates/envcloak-core/src/crypto/kdf.rs).
 argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "zeroize"] }
 blake2 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
 blake3 = { version = "=1.8.7", default-features = false, features = ["std", "zeroize"] }
+chacha20 = { version = "=0.10.2", default-features = false, features = ["xchacha", "zeroize"] }
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
 getrandom = "=0.4.3"
 hkdf = "=0.13.0"
