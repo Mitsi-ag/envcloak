@@ -133,6 +133,8 @@ XChaCha20-Poly1305 does not commit to its key: one ciphertext can be made to ope
 
 New envelopes, and every re-wrap, use the current defaults (m = 256 MiB, t = 3, p = 4) with a fresh salt, never the stored parameters. `vault create` may choose a lower memory setting for small machines, down to the 64 MiB bound. Every envelope has a salt of its own, including the two `vault create` makes. A passphrase change and a restore's new passphrase envelope are re-wraps: they use the current defaults whatever the old envelope used. The code holds this by type: a wrap takes memory, passes and lanes from `KdfParams`, whose only constructors are the defaults, the minimum and the defaults at a chosen memory, and draws the salt itself for each envelope; an envelope's stored parameters and salt are a `StoredKdfParams`, which only unwrapping reads and no wrap accepts.
 
+Argon2id's working memory, m KiB, holds the last block of each lane, from which the KEK follows at once. The `argon2` crate frees the memory it allocates itself without wiping it, whatever its `zeroize` feature, so EnvCloak allocates the memory and passes it in (`hash_password_into_with_memory`), and wipes it when the derivation ends, whether or not the program's allocator wipes freed memory.
+
 ## Passphrases
 
 A new passphrase (at `vault create`, a passphrase change, or a restore) must:

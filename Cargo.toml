@@ -55,7 +55,10 @@ zeroize = "=1.9.0"
 # Crypto (SPEC §11). The 2026 RustCrypto majors are adopted together.
 # The `zeroize` features make the ciphers, hashers and HMAC states wipe
 # themselves on drop. blake2 is listed only to turn its feature on: Argon2id
-# hashes the passphrase with it.
+# hashes the passphrase with it. argon2's feature covers its small buffers,
+# not its working memory (64 MiB to 4 GiB), which it frees unwiped:
+# envcloak-core allocates that memory itself and wipes it
+# (crates/envcloak-core/src/crypto/kdf.rs).
 argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "zeroize"] }
 blake2 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
 blake3 = { version = "=1.8.7", default-features = false, features = ["std", "zeroize"] }

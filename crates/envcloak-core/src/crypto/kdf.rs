@@ -19,11 +19,21 @@
 //! runs it before any key derivation work, so a doctored envelope can
 //! neither weaken the KDF nor make it exhaust memory.
 //!
+//! Argon2id's working memory, 64 MiB to 4 GiB, holds the last block of
+//! each lane, from which the KEK follows at once: it is as secret as the
+//! KEK. argon2 frees the memory it allocates itself unwiped, whatever its
+//! `zeroize` feature (that wipes only its small buffers), and only a
+//! wiping global allocator would clear it. So [`argon2id`] allocates the
+//! memory here, in a [`Zeroizing`] vector, and hands it to argon2: it is
+//! wiped when dropped in every program that embeds this crate, tests
+//! included.
+//!
 //! Argon2id takes most of a second at the defaults. The daemon must run it
 //! on a blocking thread.
 
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use secrecy::{ExposeSecret, SecretBox};
+use zeroize::Zeroizing;
 
 use super::{CryptoError, CryptoErrorKind};
 use crate::secret::SecretBytes;
@@ -228,8 +238,9 @@ pub(crate) fn derive_kek<K: Kdf + ?Sized>(
     kdf.derive(secret, params)
 }
 
-/// Raw Argon2id into `out`. The salt is a slice so the reference vectors,
-/// whose salts are not 16 bytes, can run through it.
+/// Raw Argon2id into `out`, in working memory from [`argon2_memory`],
+/// which is wiped when this returns. The salt is a slice so the reference
+/// vectors, whose salts are not 16 bytes, can run through it.
 fn argon2id(
     pwd: &[u8],
     salt: &[u8],
@@ -240,9 +251,22 @@ fn argon2id(
 ) -> Result<(), CryptoError> {
     let kdf_err = |_| CryptoError::new(CryptoErrorKind::Kdf);
     let params = Params::new(m_kib, t, p, Some(out.len())).map_err(kdf_err)?;
+    let mut memory = argon2_memory(params.block_count())?;
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(pwd, salt, out)
+        .hash_password_into_with_memory(pwd, salt, out, memory.as_mut_slice())
         .map_err(kdf_err)
+}
+
+/// Argon2id's working memory: `blocks` zeroed 1 KiB blocks, wiped when
+/// dropped. A failed allocation is [`CryptoErrorKind::Kdf`], as argon2's
+/// own would be, never an abort.
+fn argon2_memory(blocks: usize) -> Result<Zeroizing<Vec<Block>>, CryptoError> {
+    let mut memory = Zeroizing::new(Vec::new());
+    memory
+        .try_reserve_exact(blocks)
+        .map_err(|_| CryptoError::new(CryptoErrorKind::Kdf))?;
+    memory.resize(blocks, Block::default());
+    Ok(memory)
 }
 
 #[cfg(test)]
