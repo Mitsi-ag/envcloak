@@ -33,7 +33,7 @@ use envcloak_core::vault::VaultErrorKind;
 use envcloak_core::{RecoveryKit, check_passphrase, restore_backup};
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{ErrorKind, NoParams, RecoverParams};
-use envcloak_ipc::view::{BackupView, RecoveredView};
+use envcloak_ipc::view::{BackupView, LockReason, RecoveredView};
 use envcloak_sys::PeerIdentity;
 
 use crate::audit::AuditEvent;
@@ -111,7 +111,10 @@ pub fn recover(
             .map_err(|_| RpcError::new(ErrorKind::TooManyAttempts))?;
         let (generation, was_unlocked) = s.begin_recover()?;
         if was_unlocked {
-            log_line!("envcloakd: vault locked (reason: restore)");
+            log_line!(
+                "envcloakd: vault locked (reason: {})",
+                LockReason::Restore.as_str()
+            );
         }
         (generation, s.paths().clone())
     };
