@@ -1,11 +1,11 @@
 //! Gate 6 (SPEC §15.2): deleting a row, or restoring one row from an older
 //! copy, makes unlock report tampering and open read-only. Every table is
 //! covered, `meta` and the header included, on a fresh open and on the
-//! handle `lock` keeps. Also: altered plaintext columns, moved ciphertext,
-//! an altered schema, an empty vault without its header, a row or prior
-//! list changed in the file while the vault is open, the documented
-//! whole-file rollback limit, file modes, and the digest's cost at 10,000
-//! rows.
+//! handle `lock` keeps, also with a session's pages in the WAL. Also:
+//! altered plaintext columns, moved ciphertext, an altered schema, an
+//! empty vault without its header, a row or prior list changed in the file
+//! while the vault is open, the documented whole-file rollback limit, file
+//! modes, and the digest's cost at 10,000 rows.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -706,8 +706,10 @@ fn page_of(f: &Fixture, sealed: &[u8]) -> usize {
 /// Writes `sql`'s changes over `vault.db` while a vault holds it: copies
 /// the file, runs `sql` on the copy through a plain connection, and writes
 /// the result back into the same file, as another program can (the vault's
-/// lock is advisory). The vault must not have written since it was opened,
-/// so its WAL is empty and every page it reads comes from `vault.db`.
+/// lock is advisory). Only `vault.db` is copied and rewritten: a page whose
+/// newer copy is in the WAL is read from there, so a change shows only on
+/// a page with no copy in the WAL (every page, when the vault has not
+/// written since it was opened).
 fn rewrite_on_disk(f: &Fixture, sql: &str) {
     let copy = f.home.root().join("rewrite.db");
     std::fs::copy(f.db(), &copy).unwrap();
@@ -801,6 +803,92 @@ fn unlocking_the_handle_kept_by_lock_reads_the_file_again() {
         Some(p.keep),
         "a column altered while locked",
     );
+}
+
+/// The database pages (numbered from 0, as [`page_of`] gives them) whose
+/// newer copies are in the WAL beside `vault.db`: after its 32-byte header
+/// come frames of a 24-byte header, starting with the page's number
+/// (counted from 1), and the page.
+fn wal_pages(f: &Fixture) -> Vec<usize> {
+    let wal = std::fs::read(f.db().with_file_name("vault.db-wal")).unwrap();
+    let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
+    wal[32..]
+        .chunks_exact(24 + page_size)
+        .map(|frame| u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize - 1)
+        .collect()
+}
+
+/// Review T3 open 3: the gate 6 case above on the daemon's own path, where
+/// the WAL is never empty at unlock (SPEC stories S7 to S10). The vault has
+/// enough items to span pages; a session rotates a value, which puts that
+/// field's page and the header's in the WAL, and is locked, unlocked with
+/// no write between (so the kept handle has every page cached) and locked
+/// again. Then a policy row, on a page with no copy in the WAL, is deleted
+/// or restored from an older copy in `vault.db`. The next unlock through
+/// the kept handle reads some pages from the WAL and that one from
+/// `vault.db`, and reports the change.
+#[test]
+fn the_kept_handle_reads_the_file_again_with_session_frames_in_the_wal() {
+    let _serial = alone();
+    let p = pristine();
+    let unlock = |locked: LockedVault| locked.unlock(p.f.vmk()).map_err(|(_, e)| e).unwrap();
+    let older_copy = format!(
+        "ATTACH DATABASE '{}' AS old; DELETE FROM main.policies; \
+         INSERT INTO main.policies SELECT * FROM old.policies; DETACH DATABASE old;",
+        p.snapshot.join("vault.db").display()
+    );
+    for (case, sql) in [
+        ("a policy row deleted", "DELETE FROM policies;"),
+        (
+            "a policy row restored from an older copy",
+            older_copy.as_str(),
+        ),
+    ] {
+        // Items spanning pages and the policy at version 2 (the snapshot
+        // holds version 1), all in `vault.db`.
+        p.restore();
+        let mut v = p.f.unlock();
+        let policy = v.policies().unwrap().next().unwrap().0;
+        v.transact(|t| {
+            for i in 0..60 {
+                let item = t.create_item(secret_item(&format!("span/item-{i:02}")))?;
+                let value = SecretBytes::copy_from(b"a value that fills the pages");
+                t.add_field(item, name("value"), value)?;
+            }
+            t.put_policy(policy, b"policy v2")
+        })
+        .unwrap();
+        drop(v);
+        assert_closed(&p.f);
+        let sealed_policy: Vec<u8> =
+            p.f.raw()
+                .query_row("SELECT sealed FROM policies", [], |r| r.get(0))
+                .unwrap();
+        let policy_page = page_of(&p.f, &sealed_policy);
+        let field_page = page_of(&p.f, &sealed_value_of(&p.f, p.other));
+
+        // The session.
+        let mut v = p.f.unlock();
+        v.transact(|t| t.set_value(p.other, SecretBytes::copy_from(b"rotated in session")))
+            .unwrap();
+        let v = unlock(v.lock());
+        assert_eq!(v.integrity(), Integrity::Ok, "{case}");
+        let locked = v.lock();
+        let in_wal = wal_pages(&p.f);
+        assert!(in_wal.contains(&field_page), "{case}: {in_wal:?}");
+        assert!(
+            !in_wal.contains(&policy_page),
+            "{case}: the policy's page {policy_page} is in the WAL: {in_wal:?}"
+        );
+
+        rewrite_on_disk(&p.f, sql);
+        let v = unlock(locked);
+        assert!(
+            v.read_value(p.other).unwrap().ct_eq(b"rotated in session"),
+            "{case}: the session's write, read from the WAL"
+        );
+        assert_read_only(v, Some(TamperKind::DigestMismatch), Some(p.keep), case);
+    }
 }
 
 /// Review finding F-21: a field's prior list removed on disk while the vault is
