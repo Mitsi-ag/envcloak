@@ -17,6 +17,22 @@
 //!
 //! The runner's output is read through pipes, and every byte of it, and of
 //! the test home, is swept for every canary and its encodings.
+//!
+//! Cleanup signals only processes the harness owns (review F-62): a
+//! process it spawned and has not reaped, whose pid therefore cannot name
+//! any other process ([`Proc`]). It never looks for the processes those
+//! start in the process table, and never signals a pid it read: once a
+//! process is reaped elsewhere its pid can be another's. So every fixture
+//! the runner starts that would otherwise run on (a loop waiting for a
+//! signal, a descendant writing) has a [`Lifetime`]: it ends when the test
+//! asks it to, as the test ends (passed, failed or timed out), or by
+//! itself at a deadline longer than any test waits, should the test
+//! process die first. It records how it ended; that record is an
+//! acknowledgment written just before it exits, not proof that it has been
+//! reaped, which only its parent could give. The pty driver kills the
+//! terminal's process group only while it has not reaped the group's
+//! leader, and then waits on a pipe every process of the tree holds, so
+//! its report that the tree is gone rests on the kernel, not on pids.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::ffi::{OsStr, OsString};
@@ -249,24 +265,44 @@ const TESTS: &[Test] = &[
         a_signal_after_the_exit_stops_a_stalled_run_with_the_signals_blocked,
     ),
     (
-        "harness_a_dropped_runner_takes_its_childs_group_with_it",
-        harness_a_dropped_runner_takes_its_childs_group_with_it,
+        "harness_a_dropped_runner_is_reaped_and_its_child_ends_when_asked",
+        harness_a_dropped_runner_is_reaped_and_its_child_ends_when_asked,
     ),
     (
         "harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session",
         harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session,
     ),
     (
+        "harness_the_pty_driver_says_when_a_process_outlives_the_kill",
+        harness_the_pty_driver_says_when_a_process_outlives_the_kill,
+    ),
+    (
         "harness_cleanup_after_a_successful_finish_signals_nothing",
         harness_cleanup_after_a_successful_finish_signals_nothing,
     ),
     (
-        "harness_cleanup_signals_a_live_tree_once",
-        harness_cleanup_signals_a_live_tree_once,
+        "harness_cleanup_kills_only_its_own_process_once",
+        harness_cleanup_kills_only_its_own_process_once,
     ),
     (
-        "harness_a_leftover_is_killed_only_while_it_is_the_process_it_was",
-        harness_a_leftover_is_killed_only_while_it_is_the_process_it_was,
+        "harness_a_fixture_ends_when_its_test_fails_before_or_after_readiness",
+        harness_a_fixture_ends_when_its_test_fails_before_or_after_readiness,
+    ),
+    (
+        "harness_finish_gives_up_on_output_a_survivor_holds",
+        harness_finish_gives_up_on_output_a_survivor_holds,
+    ),
+    (
+        "harness_a_writer_blocked_on_a_full_pipe_ends_at_its_deadline",
+        harness_a_writer_blocked_on_a_full_pipe_ends_at_its_deadline,
+    ),
+    (
+        "harness_a_writer_whose_reader_is_lost_ends",
+        harness_a_writer_whose_reader_is_lost_ends,
+    ),
+    (
+        "harness_a_fixture_whose_test_died_ends_at_its_deadline",
+        harness_a_fixture_whose_test_died_ends_at_its_deadline,
     ),
 ];
 
@@ -361,14 +397,29 @@ os.setsid()\nos.execv(sys.argv[1], sys.argv[1:])\n";
 /// terminal showed. A process that is not ready in time, or does not exit
 /// in time, is killed with its whole process group (it leads the
 /// terminal's session and group, and on a terminal its child stays in
-/// that group), reaped, and reported as `NOREADY` or `NOEXIT` in place of
-/// the `EXIT` line, with exit status 1: the driver never waits for ever,
-/// and never leaves the runner or its child behind (review T12-5).
+/// that group), while this driver has not reaped it, so the group cannot
+/// be another's; then reported as `NOREADY` or `NOEXIT` in place of the
+/// `EXIT` line, with exit status 1: the driver never waits for ever, and
+/// never leaves the runner or its child behind (review T12-5).
+///
+/// Whether they are gone rests on a lifeline, not on pids (review F-62):
+/// the process inherits the write end of a pipe, which the runner passes
+/// on to its child and that to everything it starts, and the driver keeps
+/// only the read end. The read end ends when every process holding the
+/// write end has exited. After a kill the driver waits up to 10 seconds
+/// for that, reading the terminal meanwhile (macOS holds a process's exit
+/// while the terminal has output nobody reads), reaps the process, and
+/// adds `gone` or `left` to the line. A process that closed the
+/// descriptor itself would not be seen; the fixtures here do not.
 const ON_PTY: &str = r#"import os, pty, select, signal, sys, time
 send, quiet, patience = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+life_r, life_w = os.pipe()
+os.set_inheritable(life_w, True)
 pid, fd = pty.fork()
 if pid == 0:
+    os.close(life_r)
     os.execv(sys.argv[4], sys.argv[4:])
+os.close(life_w)
 sys.stdout.buffer.write(b'RUNNER %d\n' % pid)
 out = b''
 def more(deadline):
@@ -384,16 +435,36 @@ def more(deadline):
         return False
     out += chunk
     return True
+def tree_gone(limit):
+    global out
+    end = time.time() + limit
+    watched = [fd, life_r]
+    while True:
+        r, _, _ = select.select(watched, [], [], max(0.0, end - time.time()))
+        if not r:
+            return False
+        if life_r in r and not os.read(life_r, 4096):
+            return True
+        if fd in r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                chunk = b''
+            if chunk:
+                out += chunk
+            else:
+                watched = [life_r]
 def give_up(why):
     try:
         os.killpg(pid, signal.SIGKILL)
     except OSError:
         pass
+    gone = tree_gone(10)
     try:
         os.waitpid(pid, 0)
     except OSError:
         pass
-    sys.stdout.buffer.write(why + b'\n' + out)
+    sys.stdout.buffer.write(why + (b' gone' if gone else b' left') + b'\n' + out)
     sys.exit(1)
 deadline = time.time() + 60
 while b'ready' not in out:
@@ -468,18 +539,19 @@ fn detached_by(launcher: &str, home: &TestHome, s: &Setup<'_>, argv: &[&OsStr]) 
     cmd
 }
 
-/// How [`ON_PTY`] ended.
+/// How [`ON_PTY`] ended. A process it gave up on was killed with its
+/// group; `gone` says whether every process of its tree had then exited
+/// (the lifeline pipe ended) within 10 seconds.
 #[derive(Debug, PartialEq, Eq)]
 enum PtyEnd {
     Exit(i32),
-    NoReady,
-    NoExit,
+    NoReady { gone: bool },
+    NoExit { gone: bool },
 }
 
-/// What [`on_pty_within`] saw: the runner's pid, how it ended, and what
-/// the terminal showed.
+/// What [`on_pty_within`] saw: how it ended, and what the terminal
+/// showed.
 struct Pty {
-    runner: i32,
     end: PtyEnd,
     shown: Vec<u8>,
 }
@@ -520,15 +592,17 @@ fn on_pty_within(
     let limit = Duration::from_secs(60 + quiet + patience + 30);
     let (status, out, err) = Proc::spawn(cmd).finish(limit);
     let (first, rest) = out.split_at(out.iter().position(|b| *b == b'\n').map_or(0, |n| n + 1));
-    let runner = std::str::from_utf8(first)
+    let _runner: i32 = std::str::from_utf8(first)
         .ok()
         .and_then(|l| l.trim_end().strip_prefix("RUNNER "))
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("the pty driver failed to start: {}", lossy(&err)));
     let nl = rest.iter().position(|b| *b == b'\n').expect("no end line");
     let end = match &rest[..nl] {
-        b"NOREADY" => PtyEnd::NoReady,
-        b"NOEXIT" => PtyEnd::NoExit,
+        b"NOREADY gone" => PtyEnd::NoReady { gone: true },
+        b"NOREADY left" => PtyEnd::NoReady { gone: false },
+        b"NOEXIT gone" => PtyEnd::NoExit { gone: true },
+        b"NOEXIT left" => PtyEnd::NoExit { gone: false },
         line => PtyEnd::Exit(
             std::str::from_utf8(line)
                 .ok()
@@ -544,7 +618,6 @@ fn on_pty_within(
         lossy(&err)
     );
     Pty {
-        runner,
         end,
         shown: rest[nl + 1..].to_vec(),
     }
@@ -562,20 +635,24 @@ fn count(hay: &[u8], needle: &[u8]) -> usize {
     hay.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
-/// What a process wrote, collected by two reader threads.
+/// What a process wrote, collected by two reader threads, and how many of
+/// them have reached the end of their stream.
 #[derive(Default)]
 struct Captured {
-    streams: Mutex<[Vec<u8>; 2]>,
+    streams: Mutex<([Vec<u8>; 2], usize)>,
     changed: Condvar,
 }
 
-/// A running process with its output collected as it comes.
+/// A running process the harness spawned, with its output collected as it
+/// comes. The harness owns it until it reaps it, and its cleanup signals
+/// nothing else (review F-62): see [`Proc::kill_owned`].
 struct Proc {
     child: Child,
     stdin: Option<ChildStdin>,
     cap: Arc<Captured>,
     readers: Vec<JoinHandle<()>>,
-    /// Where cleanup looks for processes and sends its signals.
+    /// How cleanup kills the process ([`Live`], or a recording [`Model`]
+    /// in the harness's own tests).
     host: Arc<dyn Host>,
     /// The child has been reaped. Its pid can then be another process's,
     /// so cleanup does nothing more (review F-62).
@@ -587,7 +664,7 @@ impl Proc {
         Proc::spawn_on(cmd, Arc::new(Live))
     }
 
-    /// [`Proc::spawn`], with cleanup looking at and signalling `host`.
+    /// [`Proc::spawn`], with cleanup killing through `host`.
     fn spawn_on(mut cmd: Command, host: Arc<dyn Host>) -> Proc {
         Proc::collect(cmd.spawn().unwrap(), host)
     }
@@ -624,9 +701,11 @@ impl Proc {
                     if n == 0 {
                         break;
                     }
-                    cap.streams.lock().unwrap()[i].extend_from_slice(&b[..n]);
+                    cap.streams.lock().unwrap().0[i].extend_from_slice(&b[..n]);
                     cap.changed.notify_all();
                 }
+                cap.streams.lock().unwrap().1 += 1;
+                cap.changed.notify_all();
             }));
         }
         let stdin = child.stdin.take();
@@ -670,7 +749,7 @@ impl Proc {
         let end = Instant::now() + limit;
         let mut s = self.cap.streams.lock().unwrap();
         loop {
-            if contains(&s[i], pat) {
+            if contains(&s.0[i], pat) {
                 return true;
             }
             let now = Instant::now();
@@ -679,6 +758,11 @@ impl Proc {
             }
             s = self.cap.changed.wait_timeout(s, end - now).unwrap().0;
         }
+    }
+
+    /// What stream `i` (0 stdout, 1 stderr) holds so far.
+    fn captured(&self, i: usize) -> Vec<u8> {
+        self.cap.streams.lock().unwrap().0[i].clone()
     }
 
     fn write(&mut self, b: &[u8]) {
@@ -692,9 +776,14 @@ impl Proc {
     }
 
     /// Waits up to `limit` for the process and its output. A process that
-    /// does not exit in time is killed with everything it started, and the
-    /// test fails. One that exits is reaped here, and nothing is signalled
-    /// after that.
+    /// does not exit in time is killed, and the test fails. One that exits
+    /// is reaped here, and nothing is signalled after that.
+    ///
+    /// Its exit does not end its output: a process it started can hold the
+    /// pipes open. The output is collected until both streams end within
+    /// the same `limit`, never waited for without one (review F-62); a
+    /// stream still open then fails the test, which asks its fixtures to
+    /// stop as it unwinds ([`Lifetime`]).
     fn finish(mut self, limit: Duration) -> (ExitStatus, Vec<u8>, Vec<u8>) {
         self.stdin = None;
         let end = Instant::now() + limit;
@@ -703,52 +792,48 @@ impl Proc {
                 break s;
             }
             if Instant::now() > end {
-                self.kill_all();
+                self.kill_owned();
                 panic!("the process did not exit within {limit:?}");
             }
             std::thread::sleep(Duration::from_millis(10));
         };
+        let readers = self.readers.len();
+        let mut s = self.cap.streams.lock().unwrap();
+        while s.1 < readers {
+            let now = Instant::now();
+            if now >= end {
+                let ended = s.1;
+                drop(s);
+                panic!(
+                    "the process exited, but {} of its {readers} output streams were still \
+                     open {limit:?} after it started",
+                    readers - ended
+                );
+            }
+            s = self.cap.changed.wait_timeout(s, end - now).unwrap().0;
+        }
+        let [out, err] = std::mem::take(&mut s.0);
+        drop(s);
         for r in self.readers.drain(..) {
             r.join().unwrap();
         }
-        let [out, err] = std::mem::take(&mut *self.cap.streams.lock().unwrap());
         (status, out, err)
     }
 
-    /// Kills the process and everything it started, as a failed test must
-    /// (review T12-5): the runner leads a session and group of its own
-    /// (`DETACH`, or `ON_PTY`'s terminal), and without a terminal its
-    /// child leads another, which killing the runner alone would leave
-    /// running. So every descendant is found first (while it still is
-    /// one: an orphan is reparented), then each of their process groups
-    /// is killed, then each of them, then the process itself, which is
-    /// reaped last.
-    ///
-    /// Only while the process is not reaped (review F-62): until then its
-    /// pid is still its own, even after it exits, so the tree found from
-    /// it is its tree. Once it is reaped, by [`Proc::finish`] or by an
-    /// earlier call of this, the pid can name another process, and this
-    /// does nothing, so it runs at most once.
-    fn kill_all(&mut self) {
+    /// Kills the process and reaps it, as a failed test must (review
+    /// T12-5), once, and only while it is not reaped (review F-62): until
+    /// then its pid is still its own, even after it exits. Nothing else is
+    /// signalled. The processes it started are its own business: without
+    /// a terminal the runner's child leads a group of its own, and it and
+    /// anything it started end on their own ([`Lifetime`]), or when the
+    /// pipes to the killed runner close. Earlier versions found them in
+    /// the process table and killed them by pid, which could reach a
+    /// process that took over a pid in between.
+    fn kill_owned(&mut self) {
         if self.reaped {
             return;
         }
-        let root = self.pid();
-        let table = self.host.table();
-        let tree = descendants(&table, root);
-        let me = i32::try_from(std::process::id()).unwrap_or(0);
-        let own = table.iter().find(|p| p.pid == me).map_or(0, |p| p.pgid);
-        let mut groups: Vec<i32> = tree.iter().map(|p| p.pgid).collect();
-        groups.sort_unstable();
-        groups.dedup();
-        for g in groups.into_iter().filter(|g| *g > 1 && *g != own) {
-            self.host.kill(Target::Group(g));
-        }
-        for p in &tree {
-            self.host.kill(Target::Process(p.pid));
-        }
-        // std signals a child only while it is unreaped.
-        let _ = self.child.kill();
+        self.host.kill(&mut self.child);
         let _ = self.child.wait();
         self.reaped = true;
     }
@@ -756,198 +841,220 @@ impl Proc {
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        self.kill_all();
+        self.kill_owned();
     }
 }
 
-/// What cleanup sends SIGKILL to: a process group, or one process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Target {
-    Group(i32),
-    Process(i32),
-}
-
-/// What the harness's cleanup reads about other processes and does to
-/// them: the live system ([`Live`]), or, in the harness's own tests, a
-/// model that only records what would be sent ([`Model`], review F-62).
+/// How the harness's cleanup kills a process it owns: on the live system
+/// ([`Live`]), or, in the harness's own tests, recording what it kills
+/// ([`Model`], review F-62).
 trait Host: Send + Sync {
-    /// Every process's pid, parent and process group.
-    fn table(&self) -> Vec<PsRow>;
-    /// When process `pid` started; `None` when there is no such process.
-    fn start_time(&self, pid: i32) -> Option<StartTime>;
-    /// Sends SIGKILL to `target`.
-    fn kill(&self, target: Target);
+    /// Sends SIGKILL to `child`, which the harness spawned and has not
+    /// reaped.
+    fn kill(&self, child: &mut Child);
 }
 
-/// The live system: `ps`, the kernel's start times, and `kill`.
+/// The live system: `Child::kill`, which signals only an unreaped child.
 struct Live;
 
 impl Host for Live {
-    fn table(&self) -> Vec<PsRow> {
-        process_table()
-    }
-
-    fn start_time(&self, pid: i32) -> Option<StartTime> {
-        envcloak_sys::process_start_time(pid).ok()
-    }
-
-    fn kill(&self, target: Target) {
-        let _ = match target {
-            Target::Group(g) => envcloak_sys::signal_group(g, libc::SIGKILL),
-            Target::Process(p) => envcloak_sys::signal_process(p, libc::SIGKILL),
-        };
+    fn kill(&self, child: &mut Child) {
+        let _ = child.kill();
     }
 }
 
-/// A modeled system: the process table and start times a test sets, and a
-/// record of every signal, none of which is sent.
+/// Records the pid of every process cleanup kills, then kills it as
+/// [`Live`] does: the harness's tests run real short children, and end
+/// them.
 #[derive(Default)]
 struct Model {
-    table: Mutex<Vec<PsRow>>,
-    started: Mutex<Vec<(i32, StartTime)>>,
-    sent: Mutex<Vec<Target>>,
+    killed: Mutex<Vec<i32>>,
 }
 
 impl Model {
-    fn set_table(&self, rows: &[PsRow]) {
-        *self.table.lock().unwrap() = rows.to_vec();
-    }
-
-    /// Process `pid` started at `at`, or (`None`) there is no such
-    /// process.
-    fn set_started(&self, pid: i32, at: Option<u64>) {
-        let mut started = self.started.lock().unwrap();
-        started.retain(|(p, _)| *p != pid);
-        started.extend(at.map(|t| (pid, StartTime::from_raw(t))));
-    }
-
-    fn sent(&self) -> Vec<Target> {
-        self.sent.lock().unwrap().clone()
+    fn killed(&self) -> Vec<i32> {
+        self.killed.lock().unwrap().clone()
     }
 }
 
 impl Host for Model {
-    fn table(&self) -> Vec<PsRow> {
-        self.table.lock().unwrap().clone()
-    }
-
-    fn start_time(&self, pid: i32) -> Option<StartTime> {
-        let started = self.started.lock().unwrap();
-        started.iter().find(|(p, _)| *p == pid).map(|(_, t)| *t)
-    }
-
-    fn kill(&self, target: Target) {
-        self.sent.lock().unwrap().push(target);
+    fn kill(&self, child: &mut Child) {
+        self.killed
+            .lock()
+            .unwrap()
+            .push(i32::try_from(child.id()).unwrap());
+        let _ = child.kill();
     }
 }
 
-/// One row of `ps`.
-#[derive(Debug, Clone, Copy)]
-struct PsRow {
-    pid: i32,
-    ppid: i32,
-    pgid: i32,
+/// How long a fixture waits for its stop request before it ends by
+/// itself: longer than any test here waits for anything, so it never
+/// decides a test's outcome.
+const FIXTURE_DEADLINE_SECS: u64 = 300;
+
+/// The lifetime of the fixture processes a test has the runner start
+/// (review F-62). The harness kills only what it spawned itself
+/// ([`Proc::kill_owned`]); a fixture that would otherwise run on (a loop
+/// waiting for a signal, a descendant writing) waits for this stop
+/// request instead, which the test makes when it drops this: as it
+/// passes, fails an assertion or times out. It ends by itself at its
+/// deadline should that never come (the test process died first). Each
+/// fixture appends how it ended to [`Lifetime::ended_path`]: `stopped`,
+/// `deadline`, or, for a writer, `pipe_closed` when its output was closed.
+/// That is an acknowledgment written just before it exits, not proof that
+/// it has been reaped (only its parent could give that); a fixture that
+/// reached its deadline, where a test expected it to be stopped, is a
+/// failure.
+struct Lifetime {
+    dir: PathBuf,
+    deadline_secs: u64,
 }
 
-/// Every process's pid, parent and process group, from `ps`.
-fn process_table() -> Vec<PsRow> {
-    let Ok(out) = Command::new("ps")
-        .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    lossy(&out.stdout)
+impl Lifetime {
+    /// A lifetime in `home`, named `name`, with the long deadline.
+    fn new(home: &TestHome, name: &str) -> Lifetime {
+        Lifetime::with_deadline(home, name, FIXTURE_DEADLINE_SECS)
+    }
+
+    fn with_deadline(home: &TestHome, name: &str, deadline_secs: u64) -> Lifetime {
+        let dir = home.root().join(format!("life-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        Lifetime { dir, deadline_secs }
+    }
+
+    fn stop_path(&self) -> PathBuf {
+        self.dir.join("stop")
+    }
+
+    fn ended_path(&self) -> PathBuf {
+        self.dir.join("ended")
+    }
+
+    /// Asks the fixtures to stop.
+    fn stop(&self) {
+        let _ = std::fs::write(self.stop_path(), b"");
+    }
+
+    /// Shell text that waits for the stop request, checking every 50 ms,
+    /// until the deadline, then records how it ended and exits: 0 when
+    /// asked to stop, 124 at the deadline. A trap set before it still runs
+    /// on its signal, between two checks. `exit` ends a subshell only.
+    fn sh_wait(&self) -> String {
+        format!(
+            "n=0; while [ ! -e {stop} ]; do if [ $n -ge {max} ]; then echo deadline >>{ended}; \
+             exit 124; fi; sleep 0.05; n=$((n+1)); done; echo stopped >>{ended}; exit 0",
+            stop = quoted_path(&self.stop_path()),
+            ended = quoted_path(&self.ended_path()),
+            max = self.deadline_secs * 20,
+        )
+    }
+
+    /// Shell text that records `what` (`started`, `ready`) in the record.
+    fn sh_note(&self, what: &str) -> String {
+        format!("echo {what} >>{}", quoted_path(&self.ended_path()))
+    }
+
+    /// The shell command line of [`WRITER`]: a descendant that writes the
+    /// value on standard output until its output is closed, it is asked
+    /// to stop, or its deadline.
+    fn sh_writer(&self) -> String {
+        format!(
+            "{} -c {} {} {} {}",
+            quoted_path(&python3()),
+            quoted(WRITER),
+            quoted_path(&self.stop_path()),
+            quoted_path(&self.ended_path()),
+            self.deadline_secs
+        )
+    }
+
+    /// The record's lines so far.
+    fn record(&self) -> Vec<String> {
+        record_at(&self.ended_path())
+    }
+
+    /// [`ended_within`] this lifetime's record.
+    fn ended_within(&self, n: usize, limit: Duration) -> Option<Vec<String>> {
+        ended_within(&self.ended_path(), n, limit)
+    }
+}
+
+/// The lines of the record at `path` so far.
+fn record_at(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
         .lines()
-        .filter_map(|l| {
-            let mut f = l.split_whitespace().map(str::parse::<i32>);
-            match (f.next(), f.next(), f.next()) {
-                (Some(Ok(pid)), Some(Ok(ppid)), Some(Ok(pgid))) => Some(PsRow { pid, ppid, pgid }),
-                _ => None,
-            }
-        })
+        .map(str::to_owned)
         .collect()
 }
 
-/// `root` and every process below it in `table`.
-fn descendants(table: &[PsRow], root: i32) -> Vec<PsRow> {
-    let mut found: Vec<PsRow> = table.iter().copied().filter(|p| p.pid == root).collect();
-    let mut i = 0;
-    while i < found.len() {
-        let parent = found[i].pid;
-        found.extend(
-            table
-                .iter()
-                .copied()
-                .filter(|p| p.ppid == parent && p.pid != parent),
-        );
-        i += 1;
-    }
-    found
-}
-
-/// A process a test started through another one and must not leave
-/// running, known by its pid and its start time (review F-62). Dropped
-/// before the test has seen it gone, it is killed; seen gone, it is
-/// disarmed. It is killed only while its pid still names the process that
-/// started then, never one that took the pid over.
-struct Leftover {
-    pid: i32,
-    /// The process's start time while it is armed; `None` once it has
-    /// been seen gone, or when it was gone already.
-    started: Option<StartTime>,
-    host: Arc<dyn Host>,
-}
-
-impl Leftover {
-    /// Process `pid`, as it is now. One already gone is never killed.
-    fn new(pid: i32, host: Arc<dyn Host>) -> Leftover {
-        let started = host.start_time(pid);
-        Leftover { pid, started, host }
-    }
-
-    /// Process `pid`, if it is in process group `pgid` now. A pid read
-    /// after its process may have ended could already name a process
-    /// started since, which is not in that group.
-    fn in_group(pid: i32, pgid: i32, host: Arc<dyn Host>) -> Leftover {
-        let there = host.table().iter().any(|p| p.pid == pid && p.pgid == pgid);
-        let mut l = Leftover::new(pid, host);
-        if !there {
-            l.started = None;
+/// Waits up to `limit` until the record at `path` holds `n` lines that
+/// say how a fixture ended (not `started` or `ready`), and returns the
+/// record; `None` if it does not by then.
+fn ended_within(path: &Path, n: usize, limit: Duration) -> Option<Vec<String>> {
+    let end = Instant::now() + limit;
+    loop {
+        let lines = record_at(path);
+        let ends = lines
+            .iter()
+            .filter(|l| !matches!(l.as_str(), "started" | "ready"))
+            .count();
+        if ends >= n {
+            return Some(lines);
         }
-        l
-    }
-
-    /// Whether the pid still names the process this guards.
-    fn alive(&self) -> bool {
-        self.started.is_some() && self.host.start_time(self.pid) == self.started
-    }
-
-    /// Waits up to `limit` for the process to be gone (a killed orphan is
-    /// reaped by init in its own time). Once it is, the guard is disarmed,
-    /// whatever the pid names later.
-    fn gone_within(&mut self, limit: Duration) -> bool {
-        let end = Instant::now() + limit;
-        loop {
-            if !self.alive() {
-                self.started = None;
-                return true;
-            }
-            if Instant::now() >= end {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if Instant::now() >= end {
+            return None;
         }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-impl Drop for Leftover {
+impl Drop for Lifetime {
     fn drop(&mut self) {
-        if self.alive() {
-            self.host.kill(Target::Process(self.pid));
-        }
+        self.stop();
     }
 }
+
+/// `s` as one shell word.
+fn quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `p` as one shell word.
+fn quoted_path(p: &Path) -> String {
+    quoted(p.to_str().unwrap())
+}
+
+/// A descendant fixture, run by `python3 -c WRITER <stop> <ended> <secs>`:
+/// writes `$OPENAI_API_KEY` and a newline on standard output for ever. It
+/// ends when its output is closed (it records `pipe_closed`: Python
+/// ignores SIGPIPE, so the write fails with EPIPE), when it is asked to
+/// stop (`stopped`, checked after every 256 writes), or at its deadline
+/// (`deadline`): SIGALRM, whose handler runs even while a write is blocked
+/// on a full pipe, where it could never see the stop request. It inherits
+/// an ignored SIGTERM from a shell that ignores it.
+const WRITER: &str = r#"import os, signal, sys
+stop, ended = sys.argv[1], sys.argv[2]
+def record(how):
+    with open(ended, 'a') as f:
+        f.write(how + '\n')
+def deadline(*_):
+    record('deadline')
+    os._exit(124)
+signal.signal(signal.SIGALRM, deadline)
+signal.alarm(int(sys.argv[3]))
+line = (os.environ['OPENAI_API_KEY'] + '\n').encode()
+n = 0
+try:
+    while True:
+        os.write(1, line)
+        n += 1
+        if n % 256 == 0 and os.path.exists(stop):
+            break
+    record('stopped')
+except BrokenPipeError:
+    record('pipe_closed')
+"#;
 
 fn sh(script: &str) -> Vec<OsString> {
     vec!["/bin/sh".into(), "-c".into(), script.into()]
@@ -1085,6 +1192,8 @@ fn gate8_real_serializers_split_at_every_byte_are_redacted() {
                 (&cs, &runtimes, &files, &value_refs, &fixtures);
             s.spawn(move || {
                 let home = TestHome::new();
+                // The `sigterm` tail waits for the signal, or for this.
+                let life = Lifetime::new(&home, "emitter");
                 let mut argv: Vec<OsString> = vec![
                     python3().into(),
                     emitter().into(),
@@ -1095,6 +1204,12 @@ fn gate8_real_serializers_split_at_every_byte_are_redacted() {
                     "--pause-ms".into(),
                     "2".into(),
                     "--stdin".into(),
+                    "--stop".into(),
+                    life.stop_path().into(),
+                    "--ended".into(),
+                    life.ended_path().into(),
+                    "--deadline".into(),
+                    life.deadline_secs.to_string().into(),
                 ];
                 argv.extend(runtimes.args());
                 if with_fixtures {
@@ -1255,12 +1370,17 @@ fn gate9_short_values_are_refused_or_warned() {
 // ---------------------------------------------------------------------------
 // Signals.
 
-/// The child reports its group and pid, says `ready`, and waits; on
-/// SIGINT it prints a value and exits 130.
-const TRAPS_INT: &str = r#"trap 'printf "%s\n" "$OPENAI_API_KEY"; echo got-int; exit 130' INT
-echo "pgid=$(ps -o pgid= -p $$ | tr -d ' ') pid=$$ ppid=$PPID"
-echo ready
-while :; do sleep 0.05; done"#;
+/// The child reports its group and pid, says `ready`, and waits (until
+/// `life` asks it to stop); on SIGINT it prints a value and exits 130.
+fn traps_int(life: &Lifetime) -> String {
+    format!(
+        "trap 'printf \"%s\\n\" \"$OPENAI_API_KEY\"; echo got-int; exit 130' INT\n\
+         echo \"pgid=$(ps -o pgid= -p $$ | tr -d ' ') pid=$$ ppid=$PPID\"\n\
+         echo ready\n\
+         {}",
+        life.sh_wait()
+    )
+}
 
 /// Without a controlling terminal the child leads its own group, and
 /// SIGINT and SIGTERM sent to the runner are passed on to that group: the
@@ -1276,7 +1396,8 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
         values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
         files: &[],
     };
-    let p = Proc::spawn(detached(&home, &setup, &os(&sh(TRAPS_INT))));
+    let life = Lifetime::new(&home, "signals");
+    let p = Proc::spawn(detached(&home, &setup, &os(&sh(&traps_int(&life)))));
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
     let runner = p.pid();
     envcloak_sys::signal_process(runner, libc::SIGINT).unwrap();
@@ -1298,7 +1419,7 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
     let p = Proc::spawn(detached(
         &home,
         &setup,
-        &os(&sh("echo ready; while :; do sleep 0.05; done")),
+        &os(&sh(&format!("echo ready; {}", life.sh_wait()))),
     ));
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
     envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
@@ -1307,7 +1428,7 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
 
     // SIGHUP and SIGQUIT are passed on the same way (review T12-1).
     for (sig, name) in [(libc::SIGHUP, "HUP"), (libc::SIGQUIT, "QUIT")] {
-        let p = Proc::spawn(detached(&home, &setup, &os(&sh(&traps(name, sig)))));
+        let p = Proc::spawn(detached(&home, &setup, &os(&sh(&traps(name, sig, &life)))));
         assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
         envcloak_sys::signal_process(p.pid(), sig).unwrap();
         let (status, out, err) = p.finish(Duration::from_secs(60));
@@ -1321,23 +1442,24 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
 }
 
 /// A child that traps `name` (signal `sig`): it reports its pid, says
-/// `ready` and waits; on the signal it prints the value, says
-/// `got-<name>` and exits 128 plus the signal's number. `then` runs after
-/// `ready`, before the wait.
-fn traps_then(name: &str, sig: i32, then: &str) -> String {
+/// `ready` and waits (until `life` asks it to stop); on the signal it
+/// prints the value, says `got-<name>` and exits 128 plus the signal's
+/// number. `then` runs after `ready`, before the wait.
+fn traps_then(name: &str, sig: i32, then: &str, life: &Lifetime) -> String {
     format!(
         "trap 'printf \"%s\\n\" \"$OPENAI_API_KEY\"; echo got-{name}; exit {code}' {name}\n\
          echo \"pid=$$\"\n\
          echo ready\n\
          {then}\n\
-         while :; do sleep 0.05; done",
-        code = 128 + sig
+         {wait}",
+        code = 128 + sig,
+        wait = life.sh_wait()
     )
 }
 
 /// [`traps_then`], waiting as soon as it is ready.
-fn traps(name: &str, sig: i32) -> String {
-    traps_then(name, sig, ":")
+fn traps(name: &str, sig: i32, life: &Lifetime) -> String {
+    traps_then(name, sig, ":", life)
 }
 
 /// On a terminal the child stays in the runner's group: Ctrl-C reaches
@@ -1353,7 +1475,8 @@ fn on_a_terminal_ctrl_c_reaches_the_child_and_the_runner_stays() {
         values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
         files: &[],
     };
-    let (code, shown) = on_pty(&home, "ctrl-c", &setup, &os(&sh(TRAPS_INT)));
+    let life = Lifetime::new(&home, "ctrl-c");
+    let (code, shown) = on_pty(&home, "ctrl-c", &setup, &os(&sh(&traps_int(&life))));
     assert_eq!(code, 130, "{}", lossy(&shown));
     assert!(
         contains(&shown, b"[envcloak:openai_api_key/t]"),
@@ -1379,10 +1502,14 @@ fn on_a_terminal_sigterm_is_passed_to_the_child() {
         values: &["STRIPE_SECRET_KEY:STRIPE_SECRET_KEY"],
         files: &[],
     };
-    let script = r#"trap 'printf "%s\n" "$STRIPE_SECRET_KEY"; echo got-term; exit 143' TERM
-echo ready
-while :; do sleep 0.05; done"#;
-    let (code, shown) = on_pty(&home, "sigterm", &setup, &os(&sh(script)));
+    let life = Lifetime::new(&home, "sigterm");
+    let script = format!(
+        "trap 'printf \"%s\\n\" \"$STRIPE_SECRET_KEY\"; echo got-term; exit 143' TERM\n\
+         echo ready\n\
+         {}",
+        life.sh_wait()
+    );
+    let (code, shown) = on_pty(&home, "sigterm", &setup, &os(&sh(&script)));
     assert_eq!(code, 143, "{}", lossy(&shown));
     assert!(
         contains(&shown, b"[envcloak:stripe_secret_key/t]"),
@@ -1402,7 +1529,8 @@ while :; do sleep 0.05; done"#;
 /// pty driver, in another session: passed on on Linux, whose `si_code`
 /// tells `kill` from the terminal; on macOS, which reports both alike and
 /// then takes the terminal's side, left to the child, which never gets it
-/// (docs/RUN.md), and the driver gives up.
+/// (docs/RUN.md), and the driver gives up, killing the terminal's group
+/// with the child in it: the whole tree is gone.
 fn on_a_terminal_sigint_and_sigquit_from_a_process_reach_the_child() {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
@@ -1413,13 +1541,14 @@ fn on_a_terminal_sigint_and_sigquit_from_a_process_reach_the_child() {
         values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
         files: &[],
     };
+    let life = Lifetime::new(&home, "from-a-process");
     for (sig, name, send) in [
         (libc::SIGINT, "INT", "sigint"),
         (libc::SIGQUIT, "QUIT", "sigquit"),
     ] {
         let want = format!("got-{name}");
         // The command signals the runner, its parent.
-        let own = traps_then(name, sig, &format!("kill -{name} $PPID"));
+        let own = traps_then(name, sig, &format!("kill -{name} $PPID"), &life);
         let p = on_pty_within(&home, "none", (2, 30), &setup, &os(&sh(&own)));
         assert_eq!(
             p.end,
@@ -1436,8 +1565,9 @@ fn on_a_terminal_sigint_and_sigquit_from_a_process_reach_the_child() {
         assert_no_canary(&p.shown, &cs);
 
         // The driver, in another session, signals the runner.
+        let traps = traps(name, sig, &life);
         if cfg!(target_os = "linux") {
-            let p = on_pty_within(&home, send, (2, 30), &setup, &os(&sh(&traps(name, sig))));
+            let p = on_pty_within(&home, send, (2, 30), &setup, &os(&sh(&traps)));
             assert_eq!(
                 p.end,
                 PtyEnd::Exit(128 + sig),
@@ -1447,12 +1577,15 @@ fn on_a_terminal_sigint_and_sigquit_from_a_process_reach_the_child() {
             assert!(contains(&p.shown, want.as_bytes()), "{}", lossy(&p.shown));
             assert_no_canary(&p.shown, &cs);
         } else {
-            let p = on_pty_within(&home, send, (1, 2), &setup, &os(&sh(&traps(name, sig))));
-            let mut child = Leftover::in_group(field(&p.shown, "pid"), p.runner, Arc::new(Live));
-            assert_eq!(p.end, PtyEnd::NoExit, "{name}: {}", lossy(&p.shown));
+            let p = on_pty_within(&home, send, (1, 2), &setup, &os(&sh(&traps)));
+            assert_eq!(
+                p.end,
+                PtyEnd::NoExit { gone: true },
+                "{name}: {}",
+                lossy(&p.shown)
+            );
             assert!(!contains(&p.shown, want.as_bytes()), "{}", lossy(&p.shown));
             assert_no_canary(&p.shown, &cs);
-            assert!(child.gone_within(Duration::from_secs(10)));
         }
     }
     home.assert_clean(&cs);
@@ -1639,6 +1772,8 @@ fn backpressure_holds_the_child_through_100_mb() {
     cmd.stdin(Stdio::null());
     let mut child = cmd.spawn().unwrap();
     let mut out = child.stdout.take().unwrap();
+    // Owned, so a failure below kills and reaps the runner.
+    let mut p = Proc::bare(child);
     let written = || -> usize {
         std::fs::read_to_string(&progress)
             .ok()
@@ -1674,7 +1809,14 @@ fn backpressure_holds_the_child_through_100_mb() {
         assert!(b[..n] == pattern[at..at + n], "bytes changed after {total}");
         total += n;
     }
-    let status = child.wait().unwrap();
+    let end = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = p.try_wait() {
+            break status;
+        }
+        assert!(Instant::now() < end, "the runner did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    };
     println!(
         "backpressure: {total} bytes read in {:?}",
         started.elapsed()
@@ -1685,7 +1827,10 @@ fn backpressure_holds_the_child_through_100_mb() {
 
 /// A descendant that keeps the pipes open after the child exits: its
 /// output in the first 2 seconds is still read and redacted, then the
-/// pipes are closed and the runner returns; what it writes later is lost.
+/// pipes are closed and the runner returns; what it writes later is lost
+/// (its next write, at 4 seconds, kills it with SIGPIPE; should the pipes
+/// still be open, it waits for its lifetime's stop request, which comes
+/// as the test ends).
 fn a_descendant_holding_the_pipes_is_cut_off_after_2_s() {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
@@ -1699,16 +1844,17 @@ fn a_descendant_holding_the_pipes_is_cut_off_after_2_s() {
         ],
         files: &[],
     };
-    let script = r#"printf 'first %s\n' "$OPENAI_API_KEY"
-( sleep 0.5; printf 'late-ok %s\n' "$STRIPE_SECRET_KEY"; sleep 3.5; echo too-late; exec sleep 30 ) &
-echo "gc=$!"
-exit 0"#;
+    let life = Lifetime::new(&home, "late-writer");
+    let script = format!(
+        "printf 'first %s\\n' \"$OPENAI_API_KEY\"\n\
+         ( sleep 0.5; printf 'late-ok %s\\n' \"$STRIPE_SECRET_KEY\"; sleep 3.5; echo too-late; {} ) &\n\
+         exit 0",
+        life.sh_wait()
+    );
     let started = Instant::now();
     let (status, out, err) =
-        Proc::spawn(detached(&home, &setup, &os(&sh(script)))).finish(Duration::from_secs(30));
+        Proc::spawn(detached(&home, &setup, &os(&sh(&script)))).finish(Duration::from_secs(30));
     let took = started.elapsed();
-    let gc = field(&out, "gc");
-    let _ = envcloak_sys::signal_process(gc, libc::SIGKILL);
     assert_eq!(status.code(), Some(0), "{}", lossy(&err));
     println!("cutoff: the runner returned after {took:?}");
     assert!(took >= Duration::from_secs(2), "{took:?}");
@@ -1729,30 +1875,35 @@ exit 0"#;
 }
 
 /// The child ignores SIGTERM (so does all it starts), starts a descendant
-/// that prints the value for ever, reports both pids, lets the output fill
-/// for a second, says `exiting` and exits 0.
-const LEAVES_A_WRITER: &str = r#"trap '' TERM
-( while :; do printf '%s\n' "$OPENAI_API_KEY"; done ) &
-echo "gc=$! child=$$" >&2
-echo pids >&2
-sleep 1
-echo exiting >&2
-exit 0"#;
+/// that prints the value for ever ([`WRITER`], with `life`), reports its
+/// own pid, lets the output fill for a second, says `exiting` and exits 0.
+fn leaves_a_writer_script(life: &Lifetime) -> String {
+    format!(
+        "trap '' TERM\n\
+         {} &\n\
+         echo \"child=$$\" >&2\n\
+         echo pids >&2\n\
+         sleep 1\n\
+         echo exiting >&2\n\
+         exit 0",
+        life.sh_writer()
+    )
+}
 
 /// What [`leaves_a_writer`] started: the runner, its standard output when
-/// it is left unread, the descendant (seen gone or killed on drop), the
-/// child's pid and start time, and the moment the child said it was
+/// it is left unread, the descendant's lifetime (which says how it ended),
+/// the child's pid and start time, and the moment the child said it was
 /// exiting.
 struct LeftAWriter {
     p: Proc,
     stdout: Option<ChildStdout>,
-    gc: Leftover,
+    writer: Lifetime,
     child: (i32, Option<StartTime>),
     exiting: Instant,
 }
 
-/// The runner with [`LEAVES_A_WRITER`], its standard output read as it
-/// comes (`drained`) or never, started by `launcher` ([`DETACH`] or
+/// The runner with [`leaves_a_writer_script`], its standard output read as
+/// it comes (`drained`) or never, started by `launcher` ([`DETACH`] or
 /// [`DETACH_MASKED`]).
 fn leaves_a_writer(
     launcher: &str,
@@ -1760,7 +1911,9 @@ fn leaves_a_writer(
     setup: &Setup<'_>,
     drained: bool,
 ) -> LeftAWriter {
-    let mut cmd = detached_by(launcher, home, setup, &os(&sh(LEAVES_A_WRITER)));
+    let writer = Lifetime::new(home, &format!("writer-{drained}"));
+    let script = leaves_a_writer_script(&writer);
+    let mut cmd = detached_by(launcher, home, setup, &os(&sh(&script)));
     cmd.stdin(Stdio::null());
     let (p, stdout) = if drained {
         (Proc::spawn(cmd), None)
@@ -1769,22 +1922,24 @@ fn leaves_a_writer(
         (p, Some(stdout))
     };
     assert!(p.wait_for(1, b"pids\n", Duration::from_secs(60)));
-    // Both are running (the child sleeps, the descendant writes or is
-    // blocked writing): their start times are their own.
-    let (gc, child) = {
-        let err = &p.cap.streams.lock().unwrap()[1];
-        (field(err, "gc"), field(err, "child"))
-    };
-    let gc = Leftover::new(gc, Arc::new(Live));
+    // The child sleeps: its start time is its own.
+    let child = field(&p.captured(1), "child");
     let child = (child, envcloak_sys::process_start_time(child).ok());
     assert!(p.wait_for(1, b"exiting\n", Duration::from_secs(60)));
     LeftAWriter {
         p,
         stdout,
-        gc,
+        writer,
         child,
         exiting: Instant::now(),
     }
+}
+
+/// Whether `writer`'s descendant saw its output closed within 10 seconds:
+/// its next write failed (review F-62: it says so itself, and is never
+/// signalled by pid).
+fn writer_saw_its_pipe_closed(writer: &Lifetime) -> bool {
+    writer.ended_within(1, Duration::from_secs(10)) == Some(vec!["pipe_closed".to_owned()])
 }
 
 /// Waits up to `limit` until process `pid`, which started at `started`,
@@ -1810,8 +1965,8 @@ fn reaped_within((pid, started): (i32, Option<StartTime>), limit: Duration) -> b
 /// Review F-49: the child exits while a descendant keeps writing to the
 /// pipes, and nobody reads the runner's standard output, so the runner is
 /// stuck writing what it released when the cutoff passes. It gives the
-/// write up, closes the pipes (the descendant dies of SIGPIPE on its next
-/// write), and returns the child's 0 within the cutoff plus a margin, as
+/// write up, closes the pipes (the descendant's next write fails), and
+/// returns the child's 0 within the cutoff plus a margin, as
 /// it does beside the control, whose output is read.
 fn a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff() {
     stalled_reader_given_up(DETACH, &[true, false]);
@@ -1840,7 +1995,7 @@ fn stalled_reader_given_up(launcher: &str, drains: &[bool]) {
         let LeftAWriter {
             p,
             stdout,
-            mut gc,
+            writer,
             exiting,
             ..
         } = leaves_a_writer(launcher, &home, &setup, drained);
@@ -1851,8 +2006,9 @@ fn stalled_reader_given_up(launcher: &str, drains: &[bool]) {
         assert!(took >= Duration::from_millis(1500), "{drained}: {took:?}");
         assert!(took < Duration::from_millis(3500), "{drained}: {took:?}");
         assert!(
-            gc.gone_within(Duration::from_secs(10)),
-            "{drained}: the descendant still runs"
+            writer_saw_its_pipe_closed(&writer),
+            "{drained}: the descendant's pipe was not closed: {:?}",
+            writer.record()
         );
         let out = match stdout {
             Some(mut unread) => {
@@ -1907,7 +2063,7 @@ fn signal_stops_a_stalled_run(launcher: &str) {
     let LeftAWriter {
         p,
         stdout,
-        mut gc,
+        writer,
         child,
         exiting,
     } = leaves_a_writer(launcher, &home, &setup, false);
@@ -1922,8 +2078,9 @@ fn signal_stops_a_stalled_run(launcher: &str) {
     assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
     assert!(took < Duration::from_millis(1500), "{took:?}");
     assert!(
-        gc.gone_within(Duration::from_secs(10)),
-        "the descendant still runs"
+        writer_saw_its_pipe_closed(&writer),
+        "the descendant's pipe was not closed: {:?}",
+        writer.record()
     );
     let mut held = Vec::new();
     stdout.unwrap().read_to_end(&mut held).unwrap();
@@ -1934,87 +2091,121 @@ fn signal_stops_a_stalled_run(launcher: &str) {
 
 // ---------------------------------------------------------------------------
 // The harness itself (review T12-5): a failed test leaves nothing running
-// and never waits for ever.
+// and never waits for ever; and (review F-62) its cleanup signals only the
+// processes it owns, while the fixtures it does not own end by themselves.
 
-/// A child that reports its pid, says `ready`, and then ignores every
-/// signal a runner passes on, so only SIGKILL ends it.
-const STUBBORN: &str = r#"trap '' INT TERM HUP
-echo "pid=$$"
-echo ready
-while :; do sleep 0.05; done"#;
+/// A child that says it started, reports its pid, says `ready`, and then
+/// ignores every signal a runner passes on, so only SIGKILL or `life`
+/// ends it.
+fn stubborn(life: &Lifetime) -> String {
+    format!(
+        "trap '' INT TERM HUP\n\
+         {started}\n\
+         echo \"pid=$$\"\n\
+         echo ready\n\
+         {wait}",
+        started = life.sh_note("started"),
+        wait = life.sh_wait()
+    )
+}
 
-/// A test that fails with a runner running drops its `Proc`. Without a
-/// terminal the runner's child leads its own process group, so killing the
-/// runner alone would leave it running, reparented. Dropping the `Proc`
-/// kills the child's group too.
-fn harness_a_dropped_runner_takes_its_childs_group_with_it() {
-    let seed = fresh_seed();
-    let home = TestHome::new();
-    let setup = Setup {
+/// The setup the harness's own tests give the runner.
+fn harness_setup(seed: u64) -> Setup<'static> {
+    Setup {
         seed,
         idle_ms: None,
         values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
         files: &[],
-    };
-    let p = Proc::spawn(detached(&home, &setup, &os(&sh(STUBBORN))));
+    }
+}
+
+/// A test that fails with a runner running drops its `Proc`, which kills
+/// and reaps the runner, the one process it owns. Without a terminal the
+/// runner's child leads a group of its own and ignores the signals a
+/// runner passes on; the harness does not look for it or signal it
+/// (review F-62), and it runs on until its lifetime asks it to stop, as
+/// the test ends, and then says it stopped.
+fn harness_a_dropped_runner_is_reaped_and_its_child_ends_when_asked() {
+    let home = TestHome::new();
+    let life = Lifetime::new(&home, "stubborn");
+    let p = Proc::spawn(detached(
+        &home,
+        &harness_setup(fresh_seed()),
+        &os(&sh(&stubborn(&life))),
+    ));
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
-    // Both are running now, so each is known by its start time from here.
-    let live: Arc<dyn Host> = Arc::new(Live);
-    let mut runner = Leftover::new(p.pid(), Arc::clone(&live));
-    let child = field(&p.cap.streams.lock().unwrap()[0], "pid");
-    let mut child = Leftover::new(child, live);
-    assert_ne!(child.pid, runner.pid);
+    let runner = (p.pid(), envcloak_sys::process_start_time(p.pid()).ok());
     drop(p);
     assert!(
-        runner.gone_within(Duration::from_secs(10)),
-        "the runner is still running"
+        reaped_within(runner, Duration::ZERO),
+        "the dropped runner was not reaped"
     );
-    assert!(
-        child.gone_within(Duration::from_secs(10)),
-        "the runner's child is still running after its Proc was dropped"
+    assert_eq!(life.record(), ["started"], "the child did not run on");
+    life.stop();
+    assert_eq!(
+        life.ended_within(1, Duration::from_secs(10)),
+        Some(vec!["started".to_owned(), "stopped".to_owned()]),
+        "the runner's child did not end when asked"
     );
 }
 
 /// A runner on a terminal that never exits (its child ignores the SIGTERM
 /// passed on): the pty driver gives up after its patience, kills the
 /// terminal's process group, which holds the runner and its child, and
-/// says `NOEXIT`, instead of waiting for ever.
+/// says `NOEXIT`, instead of waiting for ever; and every process of the
+/// tree is gone, as the lifeline says (see [`ON_PTY`]).
 fn harness_a_runner_that_never_exits_on_a_terminal_is_killed_with_its_session() {
-    let seed = fresh_seed();
     let home = TestHome::new();
-    let setup = Setup {
-        seed,
-        idle_ms: None,
-        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
-        files: &[],
-    };
+    let life = Lifetime::new(&home, "stubborn");
     let started = Instant::now();
-    let p = on_pty_within(&home, "sigterm", (1, 2), &setup, &os(&sh(STUBBORN)));
-    // On a terminal the child stays in the runner's process group. Its pid
-    // is read after the driver killed that group, so it is taken to be the
-    // child only if it is still in the group: by now the pid could be a
-    // later process's.
-    let mut child = Leftover::in_group(field(&p.shown, "pid"), p.runner, Arc::new(Live));
-    assert_eq!(p.end, PtyEnd::NoExit, "{}", lossy(&p.shown));
+    let p = on_pty_within(
+        &home,
+        "sigterm",
+        (1, 2),
+        &harness_setup(fresh_seed()),
+        &os(&sh(&stubborn(&life))),
+    );
+    assert_eq!(p.end, PtyEnd::NoExit { gone: true }, "{}", lossy(&p.shown));
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );
-    // The driver says `NOEXIT` only after it has killed the group and
-    // reaped the runner, so the runner is gone; its pid, free since then,
-    // is not looked up.
-    assert!(
-        child.gone_within(Duration::from_secs(10)),
-        "the runner's child is still running after the driver gave up"
-    );
+    // Killed with the group: it never got to its stop request.
+    assert_eq!(life.record(), ["started"]);
 }
 
-// ---------------------------------------------------------------------------
-// The harness's cleanup signals only processes that are still its own
-// (review F-62), checked against a modeled system that records signals and
-// sends none. Each test runs a real short child, since reaping is what
-// frees its pid, and models what the pid names afterwards.
+/// The pty driver's `gone` rests on the lifeline, not on the kill: a
+/// process of the tree in a process group of its own survives the kill
+/// of the terminal's group, keeps the lifeline, and the driver says
+/// `left`. The survivor ends when its lifetime asks it to.
+fn harness_the_pty_driver_says_when_a_process_outlives_the_kill() {
+    let home = TestHome::new();
+    let life = Lifetime::new(&home, "survivor");
+    let survivor = format!(
+        "{} -c {} {} &",
+        quoted_path(&python3()),
+        quoted(
+            "import os, sys\nos.setpgid(0, 0)\nos.execv('/bin/sh', ['/bin/sh', '-c', sys.argv[1]])\n"
+        ),
+        quoted(&life.sh_wait())
+    );
+    let script = format!("trap '' TERM\n{survivor}\necho ready\nexec sleep 30");
+    let p = on_pty_within(
+        &home,
+        "sigterm",
+        (1, 2),
+        &harness_setup(fresh_seed()),
+        &os(&sh(&script)),
+    );
+    assert_eq!(p.end, PtyEnd::NoExit { gone: false }, "{}", lossy(&p.shown));
+    life.stop();
+    assert_eq!(
+        life.ended_within(1, Duration::from_secs(10)),
+        Some(vec!["stopped".to_owned()]),
+        "the survivor did not end when asked"
+    );
+}
 
 /// A command with no input or output.
 fn quiet(program: &str, args: &[&str]) -> Command {
@@ -2026,145 +2217,190 @@ fn quiet(program: &str, args: &[&str]) -> Command {
     cmd
 }
 
-/// A modeled pid and process group no real process is asked about: the
-/// model never sends a signal.
-const MODELED: i32 = 7_000_001;
-
-/// `finish` reaps the child, so its pid can be handed to another process
-/// at once. Modeled so: after the exit, the table shows an unrelated
-/// process with that pid, leading a group of its own with a child in it.
-/// Neither the drop at the end of `finish` nor anything else signals it.
+/// Review F-62: `finish` reaps the child, so its pid can be handed to
+/// another process at once. Neither the drop at the end of `finish` nor
+/// anything else kills anything then: the model records every kill.
 fn harness_cleanup_after_a_successful_finish_signals_nothing() {
     let model = Arc::new(Model::default());
     let p = Proc::spawn_on(quiet("/bin/sh", &["-c", "exit 0"]), model.clone());
-    let pid = p.pid();
-    model.set_table(&[
-        PsRow {
-            pid,
-            ppid: 1,
-            pgid: pid,
-        },
-        PsRow {
-            pid: MODELED,
-            ppid: pid,
-            pgid: pid,
-        },
-    ]);
     let (status, _, _) = p.finish(Duration::from_secs(60));
     assert!(status.success(), "{status:?}");
-    assert_eq!(
-        model.sent(),
-        [],
-        "cleanup signalled what the pid of a reaped child names"
+    assert!(
+        model.killed().is_empty(),
+        "cleanup ran after the child was reaped"
     );
 }
 
-/// A process still running is cleaned up once, however often cleanup is
-/// asked for: explicitly twice and then by its drop, or by a missed
-/// deadline in `finish` and then by the drop as the panic unwinds.
-fn harness_cleanup_signals_a_live_tree_once() {
-    let me = i32::try_from(std::process::id()).unwrap();
-    let tree = |pid: i32| {
-        [
-            PsRow {
-                pid,
-                ppid: me,
-                pgid: MODELED,
-            },
-            PsRow {
-                pid: MODELED + 1,
-                ppid: pid,
-                pgid: MODELED + 1,
-            },
-        ]
-    };
-    let once = [
-        Target::Group(MODELED),
-        Target::Group(MODELED + 1),
-        Target::Process(MODELED + 1),
-    ];
-
+/// Review F-62: a process still running is killed once, however often
+/// cleanup is asked for (explicitly twice and then by its drop, or by a
+/// missed deadline in `finish` and then by the drop as the panic
+/// unwinds), and cleanup kills that process only: it never finds others
+/// to kill, so a pid reused between two steps of a cleanup is never one
+/// of its targets.
+fn harness_cleanup_kills_only_its_own_process_once() {
     let model = Arc::new(Model::default());
     let mut p = Proc::spawn_on(quiet("/bin/sleep", &["60"]), model.clone());
     let pid = p.pid();
-    model.set_table(&tree(pid));
-    p.kill_all();
-    let first = model.sent();
-    assert_eq!(first.len(), 4, "{first:?}");
-    assert!(once.iter().all(|t| first.contains(t)), "{first:?}");
-    assert!(first.contains(&Target::Process(pid)), "{first:?}");
-    p.kill_all();
+    p.kill_owned();
+    p.kill_owned();
     drop(p);
-    assert_eq!(model.sent(), first, "cleanup ran again after it reaped");
+    assert_eq!(model.killed(), [pid], "cleanup ran again after it reaped");
 
     let model = Arc::new(Model::default());
     let p = Proc::spawn_on(quiet("/bin/sleep", &["60"]), model.clone());
     let pid = p.pid();
-    model.set_table(&tree(pid));
     let t0 = Instant::now();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         p.finish(Duration::from_millis(300))
     }));
     assert!(r.is_err(), "a process running past its limit passed");
     assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
-    let sent = model.sent();
     assert_eq!(
-        sent.len(),
-        4,
-        "a missed deadline cleaned up other than once: {sent:?}"
+        model.killed(),
+        [pid],
+        "a missed deadline killed other than once"
     );
-    assert!(once.iter().all(|t| sent.contains(t)), "{sent:?}");
 }
 
-/// A `Leftover` is killed only while it is the process it was: not once
-/// the test has seen it gone (whatever the pid names later), not when its
-/// pid names a process started since, and not when it was not in the
-/// group it had to be in. One still running is killed, once.
-fn harness_a_leftover_is_killed_only_while_it_is_the_process_it_was() {
-    let model = Arc::new(Model::default());
-    let host = || -> Arc<dyn Host> { model.clone() };
-    let (seen_gone, reused, still_there, elsewhere, in_group) =
-        (MODELED, MODELED + 1, MODELED + 2, MODELED + 3, MODELED + 4);
-    for (pid, at) in [
-        (seen_gone, 10),
-        (reused, 11),
-        (still_there, 12),
-        (elsewhere, 13),
-        (in_group, 14),
-    ] {
-        model.set_started(pid, Some(at));
+/// Review F-62: a test that fails before its fixture is ready, or after,
+/// leaves nothing running: the unwinding kills and reaps the runner (its
+/// `Proc`) and asks the fixture to stop (its [`Lifetime`]), and the
+/// fixture, which the harness never signals, says it stopped. The fixture
+/// is ready once it has read a line from its standard input, which the
+/// test writes, or which ends when the runner's `Proc` goes.
+fn harness_a_fixture_ends_when_its_test_fails_before_or_after_readiness() {
+    for ready_first in [false, true] {
+        let home = TestHome::new();
+        let life = Lifetime::new(&home, "fixture");
+        let record = life.ended_path();
+        let script = format!(
+            "trap '' INT TERM HUP\n{}\nread go\n{}\n{}",
+            life.sh_note("started"),
+            life.sh_note("ready"),
+            life.sh_wait()
+        );
+        let setup = harness_setup(fresh_seed());
+        let t0 = Instant::now();
+        let home_ref = &home;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let life = life;
+            let mut p = Proc::spawn(detached(home_ref, &setup, &os(&sh(&script))));
+            let want: &[&str] = if ready_first {
+                p.write(b"go\n");
+                &["started", "ready"]
+            } else {
+                &["started"]
+            };
+            let end = Instant::now() + Duration::from_secs(60);
+            while life.record() != want {
+                assert!(Instant::now() < end, "{:?}", life.record());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the test fails here, with its fixture running");
+        }));
+        assert!(failed.is_err());
+        assert_eq!(
+            ended_within(&record, 1, Duration::from_secs(10)),
+            Some(vec![
+                "started".to_owned(),
+                "ready".to_owned(),
+                "stopped".to_owned()
+            ]),
+            "ready first: {ready_first}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(60), "{:?}", t0.elapsed());
     }
-    model.set_table(&[
-        PsRow {
-            pid: elsewhere,
-            ppid: 1,
-            pgid: elsewhere,
-        },
-        PsRow {
-            pid: in_group,
-            ppid: 1,
-            pgid: MODELED,
-        },
-    ]);
-    {
-        let mut a = Leftover::new(seen_gone, host());
-        model.set_started(seen_gone, None);
-        assert!(a.gone_within(Duration::ZERO));
-        // Seen gone: disarmed, even if the model now shows the same
-        // process again.
-        model.set_started(seen_gone, Some(10));
+}
 
-        let _b = Leftover::new(reused, host());
-        model.set_started(reused, Some(99));
+/// [`WRITER`] as a direct child of the harness, writing `line` (not a
+/// value), with its standard output piped.
+fn writer_command(home: &TestHome, life: &Lifetime, line: &str) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    home.apply(&mut cmd)
+        .args(["-c", &format!("exec {}", life.sh_writer())])
+        .env("OPENAI_API_KEY", line)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
 
-        let mut c = Leftover::new(still_there, host());
-        assert!(!c.gone_within(Duration::from_millis(60)));
-
-        let _d = Leftover::in_group(elsewhere, MODELED, host());
-        let _e = Leftover::in_group(in_group, MODELED, host());
-    }
+/// Review F-62: a process that exits while something it started still
+/// holds its output (a subshell waiting for its lifetime): `finish` gives
+/// the output up at its limit and fails, rather than wait for the streams
+/// to end, and the survivor, asked to stop as the test fails, says it
+/// stopped.
+fn harness_finish_gives_up_on_output_a_survivor_holds() {
+    let home = TestHome::new();
+    let life = Lifetime::new(&home, "survivor");
+    let mut cmd = Command::new("/bin/sh");
+    home.apply(&mut cmd)
+        .args(["-c", &format!("( {} ) & exit 0", life.sh_wait())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let t0 = Instant::now();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Proc::spawn(cmd).finish(Duration::from_secs(2))
+    }));
+    assert!(r.is_err(), "finish returned with its output still open");
+    assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
+    life.stop();
     assert_eq!(
-        model.sent(),
-        [Target::Process(in_group), Target::Process(still_there)]
+        life.ended_within(1, Duration::from_secs(10)),
+        Some(vec!["stopped".to_owned()])
+    );
+}
+
+/// Review F-62: a writer blocked on a full pipe nobody reads cannot see
+/// its stop request; its deadline (SIGALRM) ends it all the same. Its
+/// first write, longer than a pipe holds, blocks before it ever looks
+/// for the request.
+fn harness_a_writer_blocked_on_a_full_pipe_ends_at_its_deadline() {
+    let home = TestHome::new();
+    let life = Lifetime::with_deadline(&home, "blocked", 2);
+    let line = "x".repeat(200_000);
+    let (p, unread) = Proc::spawn_holding_stdout(writer_command(&home, &life, &line));
+    life.stop();
+    assert_eq!(
+        life.ended_within(1, Duration::from_secs(30)),
+        Some(vec!["deadline".to_owned()])
+    );
+    let (status, _, _) = p.finish(Duration::from_secs(30));
+    assert_eq!(status.code(), Some(124));
+    drop(unread);
+}
+
+/// Review F-62: a writer whose reader goes away sees its pipe closed and
+/// ends.
+fn harness_a_writer_whose_reader_is_lost_ends() {
+    let home = TestHome::new();
+    let life = Lifetime::new(&home, "lost-reader");
+    let (p, unread) =
+        Proc::spawn_holding_stdout(writer_command(&home, &life, "a line nobody reads"));
+    drop(unread);
+    assert_eq!(
+        life.ended_within(1, Duration::from_secs(10)),
+        Some(vec!["pipe_closed".to_owned()])
+    );
+    let (status, _, _) = p.finish(Duration::from_secs(30));
+    assert!(status.success(), "{status:?}");
+}
+
+/// Review F-62: a fixture whose test died before it could ask it to stop
+/// (its `Lifetime` never dropped) ends at its deadline and says so.
+fn harness_a_fixture_whose_test_died_ends_at_its_deadline() {
+    let home = TestHome::new();
+    let life = Lifetime::with_deadline(&home, "orphaned", 1);
+    let record = life.ended_path();
+    let script = life.sh_wait();
+    std::mem::forget(life);
+    let mut cmd = quiet("/bin/sh", &["-c", &script]);
+    home.apply(&mut cmd);
+    let (status, _, _) = Proc::spawn(cmd).finish(Duration::from_secs(60));
+    assert_eq!(status.code(), Some(124));
+    assert_eq!(
+        ended_within(&record, 1, Duration::ZERO),
+        Some(vec!["deadline".to_owned()])
     );
 }
