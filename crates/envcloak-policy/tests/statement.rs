@@ -125,6 +125,11 @@ fn control_and_invisible_characters_render_as_escapes() {
         escape_for_display("\u{ad}\u{2066}\u{e0001}"),
         "\\u{ad}\\u{2066}\\u{e0001}"
     );
+    // Every format character, as a manifest's project name refuses them.
+    assert_eq!(
+        escape_for_display("\u{600}\u{6dd}\u{70f}\u{8e2}\u{110bd}\u{13430}"),
+        "\\u{600}\\u{6dd}\\u{70f}\\u{8e2}\\u{110bd}\\u{13430}"
+    );
     assert_eq!(escape_for_display("ok"), "ok");
 }
 
