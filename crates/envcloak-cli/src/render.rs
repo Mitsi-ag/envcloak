@@ -648,10 +648,17 @@ impl Render for CheckReport {
             (None, None) => {}
         }
         let mut plaintext = 0u64;
-        if self.env_files.is_empty() {
-            let _ = writeln!(o, "env files: none");
-        } else {
-            let _ = writeln!(o, "env files:");
+        let scan_error = self.env_scan_error.as_deref().map(scan_error_text);
+        match (self.env_files.is_empty(), scan_error) {
+            (true, Some(why)) => {
+                let _ = writeln!(o, "env files: {why}");
+            }
+            (true, None) => {
+                let _ = writeln!(o, "env files: none");
+            }
+            (false, _) => {
+                let _ = writeln!(o, "env files:");
+            }
         }
         for f in &self.env_files {
             let _ = writeln!(o, "  {}: {}", shown(&f.file), env_file_state(f));
@@ -700,6 +707,9 @@ impl Render for CheckReport {
                 )
             );
         }
+        if let (false, Some(why)) = (self.env_files.is_empty(), scan_error) {
+            let _ = writeln!(o, "  {why}");
+        }
         if self.clean() {
             let _ = writeln!(o, "result: ok");
         } else {
@@ -742,9 +752,29 @@ impl Render for CheckReport {
                     "env files were not read",
                 ));
             }
+            if self.env_scan_error.is_some() {
+                parts.push(
+                    "the env-file check is incomplete: the project directory could not be \
+                     listed in full; make it readable and run the check again"
+                        .to_owned(),
+                );
+            }
             let _ = writeln!(o, "result: {}", parts.join("; "));
         }
         o
+    }
+}
+
+/// Words for a [`CheckReport`]'s `env_scan_error`.
+fn scan_error_text(token: &str) -> &'static str {
+    match token {
+        CheckReport::DIRECTORY_UNREADABLE => {
+            "the project directory could not be listed, so its env files were not read"
+        }
+        CheckReport::LISTING_FAILED => {
+            "the listing of the project directory broke off; more env files may not have been read"
+        }
+        _ => "the project directory could not be listed in full",
     }
 }
 
@@ -1488,6 +1518,7 @@ Reclassified from test to live by the new value: 1 grant that bound the item end
                 },
             ],
             env_files_skipped: 0,
+            env_scan_error: None,
         };
         snap(
             check.human(),
@@ -1506,7 +1537,7 @@ result: 2 references do not resolve; 1 plaintext key in env files: move them int
         );
         snap(
             check.json().to_string(),
-            r#"{"env_files":[{"error":null,"error_line":null,"file":".env","plaintext":[{"env_name":"GITHUB_TOKEN","line":2,"provider":"github"}],"references":[{"env_name":"OPENAI_API_KEY","line":3,"reference":"openai/acme-web","status":"ok"}],"state":"read"},{"error":null,"error_line":null,"file":".env.link","plaintext":[],"references":[],"state":"symlink"}],"env_files_skipped":0,"manifest":"/src/acme-web/envcloak.toml","references":{"bindings":[{"env_name":"OPENAI_API_KEY","profile":null,"reference":"openai/acme-web","status":"ok"},{"env_name":"SHORT_TOKEN","profile":"short","reference":"short/acme-web","status":"unknown_item"},{"env_name":null,"profile":null,"reference":null,"status":"looks_like_value"}],"project_dir":"/src/acme-web","project_name":"acme-web","refs":["ok"]},"unchecked":null}"#,
+            r#"{"env_files":[{"error":null,"error_line":null,"file":".env","plaintext":[{"env_name":"GITHUB_TOKEN","line":2,"provider":"github"}],"references":[{"env_name":"OPENAI_API_KEY","line":3,"reference":"openai/acme-web","status":"ok"}],"state":"read"},{"error":null,"error_line":null,"file":".env.link","plaintext":[],"references":[],"state":"symlink"}],"env_files_skipped":0,"env_scan_error":null,"manifest":"/src/acme-web/envcloak.toml","references":{"bindings":[{"env_name":"OPENAI_API_KEY","profile":null,"reference":"openai/acme-web","status":"ok"},{"env_name":"SHORT_TOKEN","profile":"short","reference":"short/acme-web","status":"unknown_item"},{"env_name":null,"profile":null,"reference":null,"status":"looks_like_value"}],"project_dir":"/src/acme-web","project_name":"acme-web","refs":["ok"]},"unchecked":null}"#,
         );
         let clean = CheckReport {
             references: Some(CheckView {
@@ -1582,6 +1613,7 @@ result: the references were not checked
             unchecked: None,
             env_files: vec![env_refs(RefStatus::Ok)],
             env_files_skipped: 0,
+            env_scan_error: None,
         };
         assert!(no_manifest.clean());
         snap(
@@ -1601,6 +1633,7 @@ result: ok
             unchecked: Some(CheckReport::NOTHING_SENT.into()),
             env_files: vec![],
             env_files_skipped: 0,
+            env_scan_error: None,
         };
         assert!(nothing.clean());
         // F-48: env files past the bound were not read.
@@ -1619,6 +1652,39 @@ result: 2 env files were not read
 "#,
         );
         assert_eq!(over.json()["env_files_skipped"], 2);
+        // The F-48 follow-up: a directory that could not be listed is not
+        // an empty one, and a listing that broke off leaves files unread.
+        let unlisted = CheckReport {
+            env_scan_error: Some(CheckReport::DIRECTORY_UNREADABLE.into()),
+            ..nothing.clone()
+        };
+        assert!(!unlisted.clean());
+        snap(
+            unlisted.human(),
+            r#"manifest: none in this directory or above it
+references: not checked: there is no envcloak.toml
+env files: the project directory could not be listed, so its env files were not read
+result: the env-file check is incomplete: the project directory could not be listed in full; make it readable and run the check again
+"#,
+        );
+        assert_eq!(unlisted.json()["env_scan_error"], "directory_unreadable");
+        let broke_off = CheckReport {
+            env_scan_error: Some(CheckReport::LISTING_FAILED.into()),
+            env_files: vec![env_refs(RefStatus::Ok)],
+            ..no_manifest.clone()
+        };
+        assert!(!broke_off.clean());
+        snap(
+            broke_off.human(),
+            r#"manifest: none in this directory or above it
+references: none
+env files:
+  .env: no key-shaped values
+    line 3: ok       OPENAI_API_KEY = envcloak://openai/acme-web
+  the listing of the project directory broke off; more env files may not have been read
+result: the env-file check is incomplete: the project directory could not be listed in full; make it readable and run the check again
+"#,
+        );
         // A daemon that answered for fewer references than were sent.
         let short_answer = CheckReport {
             env_files: vec![env_refs(RefStatus::Unchecked)],
@@ -1846,6 +1912,7 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
                 },
             ],
             env_files_skipped: 0,
+            env_scan_error: None,
         }
     }
 
@@ -1887,6 +1954,7 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
             unchecked: None,
             env_files: vec![],
             env_files_skipped: 0,
+            env_scan_error: None,
         };
         assert!(
             check

@@ -2,11 +2,13 @@
 //! F-48), with a real daemon and an unlocked vault: at most 64 env files
 //! are read, the first by name, and the ones past the bound are counted,
 //! shown and fail the check, so a plaintext key in the 65th file is never
-//! passed over as a clean result.
+//! passed over as a clean result. A project directory that cannot be
+//! listed fails the check too (the F-48 follow-up).
 #![allow(clippy::unwrap_used)]
 
 mod common;
 
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
@@ -133,4 +135,93 @@ fn env_files_past_the_bound_are_counted_and_fail_the_check() {
     assert_no_canary(&d.log_bytes(), &cs);
     home.assert_clean(&cs);
     drop(files);
+}
+
+/// Gives a directory back its mode 0700 when dropped, whatever the test
+/// did meanwhile.
+struct ModeBack<'a>(&'a Path);
+
+impl Drop for ModeBack<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// The F-48 follow-up (Codex, cycle 152): a project directory that
+/// cannot be listed is not a clean check. The same directory, without a
+/// manifest (so nothing goes to a daemon, and none runs): empty, it
+/// passes; with a plaintext key, the key is reported; searchable but not
+/// listable, the check fails with `env_scan_error` and reports no files
+/// as if there were none; listable again, the key is reported again.
+#[test]
+fn a_directory_that_cannot_be_listed_fails_the_check() {
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let dir = home.root().join("plain");
+    std::fs::create_dir(&dir).unwrap();
+
+    let out = check(&home, &dir, &cs, true);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r["env_files"].as_array().unwrap().len(), 0);
+    assert!(r["env_scan_error"].is_null());
+    assert_eq!(r["unchecked"], "no_manifest");
+
+    env_files(&dir, 0, ".env", &cs);
+    let found = |out: &Output| {
+        assert_eq!(out.status.code(), Some(1), "{}", stdout(out));
+        let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(r["env_scan_error"].is_null());
+        assert_eq!(
+            r["env_files"][0]["plaintext"][0]["env_name"],
+            "GITHUB_TOKEN"
+        );
+    };
+    found(&check(&home, &dir, &cs, true));
+
+    if std::fs::metadata(home.root()).unwrap().uid() == 0 {
+        eprintln!("root lists any directory: the unlistable case did not run");
+    } else {
+        let back = ModeBack(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o100)).unwrap();
+        assert!(std::fs::read_dir(&dir).is_err());
+        let out = check(&home, &dir, &cs, true);
+        assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+        assert!(stderr(&out).contains("check_failed"), "{}", stderr(&out));
+        let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(r["env_scan_error"], "directory_unreadable");
+        assert_eq!(r["env_files"].as_array().unwrap().len(), 0);
+        assert_eq!(r["env_files_skipped"], 0);
+        let out = check(&home, &dir, &cs, false);
+        assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+        let text = stdout(&out);
+        assert!(
+            text.contains(
+                "env files: the project directory could not be listed, so its env files were \
+                 not read\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("env files: none"), "{text}");
+        assert!(
+            text.ends_with(
+                "result: the env-file check is incomplete: the project directory could not be \
+                 listed in full; make it readable and run the check again\n"
+            ),
+            "{text}"
+        );
+        drop(back);
+    }
+
+    found(&check(&home, &dir, &cs, true));
+    // The key was put there for `check` to find; the sweep is about what
+    // EnvCloak wrote.
+    std::fs::remove_file(dir.join(".env")).unwrap();
+    home.assert_clean(&cs);
 }
