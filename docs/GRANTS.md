@@ -14,7 +14,7 @@ Status: M1. This file fixes how SPEC §10a "Bounds and display" and §10b are ca
 
 A covered request is a delivery: its answer carries the bindings' values, and `envcloak run` starts the command with them (docs/RUN.md). A pending run exits 125 with `approval_required request=<id>: run "envcloak approve <id>" in a terminal you control`, and reads nothing from its own terminal: that terminal may be an agent's, and a `y` typed there approves nothing.
 
-No decision is made, and no proof taken, from a vault that failed its integrity check (`vault_tampered`): its project index and policy cannot be trusted.
+No decision is made, no statement shown and no proof taken from a vault that failed its integrity check (`vault_tampered`): its project index and policy cannot be trusted. `pending.get` and `approve` are refused so before any key derivation, including for a request that was pending when a read met the change.
 
 ## The grant store
 
