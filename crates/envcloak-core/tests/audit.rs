@@ -960,7 +960,8 @@ fn a_changed_length_or_a_cut_the_anchor_covers_is_kept_as_damage() {
 ///   already flagged, so the bytes after it say nothing about a crash.
 /// - An entry whose length was stretched past the end and whose sealed
 ///   bytes were changed hides the whole entries after it, also when
-///   entries between them were deleted (Codex's F-46 follow-up); one whose
+///   entries between them were deleted (Codex's F-46 follow-up), however
+///   few of its own bytes are left before the whole one; one whose
 ///   chain value was changed still opens where it really ends.
 ///
 /// Each is damage: flagged at its entry, not a torn tail, and kept by the
@@ -1048,6 +1049,31 @@ fn bytes_after_damage_or_before_a_whole_entry_are_not_a_torn_tail() {
         Some(first),
         2,
     ));
+    // Verification of 640640c: only the first `keep` bytes of entry 2
+    // left, its length stretched, before the whole entry 10. Entry 10 then
+    // starts inside the smallest size an entry can have (84 bytes), or
+    // inside the frame head itself; it opens there all the same. Every
+    // such offset, and a few past it.
+    let mut stretched = orig[fr[1].1.clone()].to_vec();
+    stretched[..4].copy_from_slice(&u32::try_from(MAX_ENTRY).unwrap().to_be_bytes());
+    assert!(stretched.len() > 96);
+    for keep in 1..96 {
+        let mut b = orig[..fr[1].1.start].to_vec();
+        b.extend_from_slice(&stretched[..keep]);
+        b.extend_from_slice(&orig[fr[9].1.clone()]);
+        cases.push((
+            format!("entries 3 to 9 deleted, {keep} bytes of entry 2 left, stretched"),
+            b.clone(),
+            None,
+            2,
+        ));
+        cases.push((
+            format!("the same with {keep} bytes, entry 1 anchored"),
+            b,
+            Some(first),
+            2,
+        ));
+    }
     let mut b = orig.clone();
     with_len(&mut b, 9, len_of(9) + 1);
     let end = fr[9].1.end;

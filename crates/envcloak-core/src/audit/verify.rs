@@ -293,9 +293,10 @@ impl Walker<'_> {
     /// with its length changed (its chain value checks out, or its sealed
     /// bytes open, where it really ends: at the end of the file or where
     /// the next entry's number starts), or another entry further on that
-    /// opens under the number it carries. Entries can have been deleted
-    /// in between, so that number says nothing about where the entry can
-    /// be: every offset that frames is tried.
+    /// opens under the number it carries. Entries, and part of the
+    /// expected one, can have been deleted in between, so neither that
+    /// number nor the expected entry's smallest size says where such an
+    /// entry can start: every offset after the first that frames is tried.
     ///
     /// Bytes that frame at more offsets than [`TAIL_CHECK_BUDGET`] lets
     /// the check open (a crash's random ciphertext almost never frames)
@@ -334,8 +335,11 @@ impl Walker<'_> {
                 return false;
             }
         }
-        // Any other whole frame, past the first entry's smallest size.
-        for p in min..=rest.len() - min {
+        // Any other whole frame, at every offset after the first: with
+        // part of the expected entry deleted, one can start anywhere,
+        // inside its frame head too. The first does not frame (the walk
+        // found it torn).
+        for p in 1..=rest.len() - min {
             if let Next::Frame(f) = next_frame(rest, p) {
                 if !spend(f.sealed.len()) || self.keys.open(f.seq, f.sealed).is_some() {
                     return false;
