@@ -18,6 +18,14 @@
 //! changed after the binary was linked is one cargo would rebuild it for.
 //! A listed file that no longer exists is left out: the file that named
 //! it changed as well.
+//!
+//! Only those files count (review R-2). A change to a manifest (features,
+//! dependency versions), to `Cargo.lock`, to build flags or to a variable
+//! a crate reads with `env!` is not seen: cargo rebuilds for some of those
+//! and not for others (a comment, a dev-dependency, another package's
+//! lock entry), and counting them would refuse a binary that no rebuild
+//! makes newer. CONTRIBUTING says to build the binaries after such a
+//! change.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -100,6 +108,11 @@ pub fn stale_source(bin: &Path, package: &str, root: &Path) -> Result<Option<Pat
 /// When it is older, naming the source and how to rebuild it, or when
 /// that cannot be told.
 pub fn assert_fresh(bin: &Path, package: &str) {
+    assert_fresh_or(bin, package, &format!("cargo test -p {package} --no-run"));
+}
+
+/// [`assert_fresh`], naming `rebuild` as the command that builds `bin`.
+pub(crate) fn assert_fresh_or(bin: &Path, package: &str, rebuild: &str) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -109,8 +122,8 @@ pub fn assert_fresh(bin: &Path, package: &str) {
         Ok(Some(source)) => panic!(
             "{} is older than {}, which it is built from: cargo did not rebuild it for this \
              run, and a test of it would test the old code (cargo test -p <another package> \
-             leaves it as it is). Build it first with cargo test -p {package} --no-run, or \
-             run the tests with --workspace.",
+             leaves it as it is). Build it first with {rebuild}, or run the tests with \
+             --workspace.",
             bin.display(),
             source.display()
         ),
