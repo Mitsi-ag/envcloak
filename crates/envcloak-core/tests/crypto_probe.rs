@@ -6,19 +6,24 @@
 //! `ProbeMode::Wiping` runs are the gate as written: with the wiping
 //! allocator, no freed block holds a fixture.
 //!
-//! Besides the canaries, the needles include key material: Argon2id's
-//! working memory, computed here with the argon2 crate and checked against
-//! the envelope it came from, and a Poly1305 state's key and pending block.
+//! Besides the canaries, the needles include key material, each computed
+//! here without EnvCloak and checked before it is used: Argon2id's working
+//! memory, a Poly1305 state's key and pending block, and the known-answer
+//! envelope's VMK, KEK, wrap and commit keys and subkeys.
 #![allow(clippy::unwrap_used)]
+
+mod kat;
 
 use std::mem::ManuallyDrop;
 
 use argon2::{Algorithm, Argon2, Block, Params, Version};
+use chacha20poly1305::aead::inout::InOutBuf;
+use chacha20poly1305::{AeadInOut, KeyInit, Tag, XChaCha20Poly1305, XNonce};
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
     Aad, Argon2id, Envelope, EnvelopeCtx, FieldTag, ItemClass, Kdf, KdfParams, Keyring, Purpose,
-    StoredKdfParams, TableTag, UnlockerId, UnlockerKind, VaultId, Vmk, open, seal, unwrap_vmk,
-    wrap_vmk_with,
+    StoredKdfParams, TableTag, UnlockerId, UnlockerKind, VaultId, Vmk, keyed_hash, open,
+    rewrap_vmk, seal, unwrap_vmk, wrap_vmk_with,
 };
 use envcloak_testkit::{
     Canary, ProbeAllocator, ProbeMode, ProbeSession, by_label, canaries, fresh_seed, labels,
@@ -26,7 +31,7 @@ use envcloak_testkit::{
 };
 use hkdf::Hkdf;
 use poly1305::Poly1305;
-use poly1305::universal_hash::{KeyInit as _, UniversalHash as _};
+use poly1305::universal_hash::UniversalHash as _;
 use sha2::Sha256;
 
 #[global_allocator]
@@ -257,4 +262,101 @@ fn a_dropped_poly1305_state_is_wiped() {
     let report = session.finish();
     assert!(report.freed > 0, "{report:?}");
     assert_eq!(report.released_with_needle, 0, "{report:?}");
+}
+
+/// The known-answer envelope's key material (tests/kat), computed with the
+/// argon2, hkdf, chacha20poly1305 and blake3 crates, never through
+/// EnvCloak, and each checked against the envelope or the vault's own
+/// output: the VMK, the KEK, the wrap and commit keys, then the subkey of
+/// each purpose in `Purpose::ALL` order.
+fn kat_key_material(env: &Envelope) -> Vec<[u8; 32]> {
+    let k = env.kdf();
+    let vault_id = VaultId(kat::VAULT_ID);
+    let mut memory = vec![Block::default(); argon2_blocks(k)];
+    let kek = argon2_reference(kat::PASSPHRASE, k, &mut memory);
+    drop(memory);
+    assert!(is_the_kek(env, &vault_id, &kek), "KEK");
+    let wrap = hkdf32(&kek, None, b"envcloak/v1/wrap");
+    let commit = hkdf32(&kek, None, b"envcloak/v1/commit");
+
+    // The wrap key opens the sealed VMK: XChaCha20-Poly1305 with the
+    // authenticated header as associated data.
+    let bytes = env.to_bytes();
+    let mut auth = bytes[..79].to_vec();
+    auth.extend_from_slice(&kat::VAULT_ID);
+    let nonce: [u8; 24] = bytes[55..79].try_into().unwrap();
+    let mut vmk = [0u8; 32];
+    XChaCha20Poly1305::new(&wrap.into())
+        .decrypt_inout_detached(
+            &XNonce::from(nonce),
+            &auth,
+            InOutBuf::new(&bytes[111..143], &mut vmk).unwrap(),
+            &Tag::try_from(&bytes[143..]).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(vmk, kat::vmk(), "VMK");
+
+    // Each subkey keys BLAKE3 as the vault's keyed_hash does.
+    let pass = SecretBytes::copy_from(kat::PASSPHRASE);
+    let kr = Keyring::derive(
+        &unwrap_vmk(env, &pass, &kat::kat_ctx()).unwrap(),
+        &vault_id,
+        kat::EPOCH,
+    );
+    let mut keys = vec![vmk, kek, wrap, commit];
+    for p in Purpose::ALL {
+        let info = format!("envcloak/v1/{}/e{}", p.label(), kat::EPOCH);
+        let subkey = hkdf32(&vmk, Some(&kat::VAULT_ID), info.as_bytes());
+        let domain = "envcloak/v1/kat";
+        let mut input = u32::try_from(domain.len()).unwrap().to_be_bytes().to_vec();
+        input.extend_from_slice(domain.as_bytes());
+        input.extend_from_slice(b"abc");
+        assert_eq!(
+            blake3::keyed_hash(&subkey, &input).as_bytes(),
+            &keyed_hash(kr.key(p), domain, b"abc"),
+            "{p:?}"
+        );
+        keys.push(subkey);
+    }
+    keys
+}
+
+/// Gate 11 for key material, on the known-answer envelope: unwrapping it,
+/// deriving the keyring, sealing, opening and hashing under every subkey,
+/// and re-wrapping the VMK under a new passphrase free no block holding a
+/// 16-byte window of the VMK, the KEK, the wrap or commit key or any
+/// subkey, with the allocator's own wipe off. The control frees a plain
+/// copy of each, and the probe finds every one.
+#[test]
+fn unwrap_derive_seal_and_rewrap_leave_no_key_material() {
+    let env = Envelope::from_bytes(&kat::unhex(kat::ENVELOPE)).unwrap();
+    let ctx = kat::kat_ctx();
+    let keys = kat_key_material(&env);
+    let refs: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
+
+    let session = ProbeSession::start(&refs, 16, ProbeMode::Unwiped);
+    let pass = SecretBytes::copy_from(kat::PASSPHRASE);
+    let vmk = unwrap_vmk(&env, &pass, &ctx).unwrap();
+    let kr = Keyring::derive(&vmk, &VaultId(kat::VAULT_ID), kat::EPOCH);
+    let a = aad(&kr);
+    for p in Purpose::ALL {
+        let k = kr.key(p);
+        let sealed = seal(k, &a, b"a value sealed under each subkey").unwrap();
+        drop(open(k, &a, &sealed).unwrap());
+        std::hint::black_box(keyed_hash(k, "envcloak/v1/probe", b"a hashed value"));
+    }
+    let new_pass = SecretBytes::copy_from(b"a new passphrase for the probe");
+    let re = rewrap_vmk(&env, &pass, &new_pass, &ctx).unwrap();
+    drop((vmk, kr, pass, new_pass, re));
+    let report = session.finish();
+    assert!(report.freed > 0, "{report:?}");
+    assert_eq!(report.released_with_needle, 0, "{report:?}");
+
+    // Control: every needle is armed.
+    let session = ProbeSession::start(&refs, 16, ProbeMode::Unwiped);
+    for k in &keys {
+        drop(std::hint::black_box(k.to_vec()));
+    }
+    let report = session.finish();
+    assert_eq!(report.released_with_needle, keys.len(), "{report:?}");
 }

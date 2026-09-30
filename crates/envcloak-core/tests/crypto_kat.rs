@@ -11,35 +11,25 @@
 //!    XChaCha20-Poly1305, Python's HMAC and a from-the-spec BLAKE3): the
 //!    associated data encoding, subkey derivation and keyed hashing for
 //!    every purpose, opening a value sealed elsewhere, and unwrapping an
-//!    envelope built elsewhere.
+//!    envelope built elsewhere (tests/kat, which crypto_probe.rs shares).
 #![allow(clippy::unwrap_used)]
+
+mod kat;
 
 use argon2::{Algorithm, Argon2, AssociatedData, ParamsBuilder, Version};
 use chacha20poly1305::aead::inout::InOutBuf;
 use chacha20poly1305::{AeadInOut, KeyInit, Tag, XChaCha20Poly1305, XNonce};
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
-    Aad, CryptoErrorKind, Envelope, EnvelopeCtx, FieldTag, ItemClass, Keyring, Purpose, Sealed,
-    TableTag, UnlockerId, UnlockerKind, VaultId, keyed_hash, open, unwrap_vmk,
+    Aad, CryptoErrorKind, Envelope, FieldTag, ItemClass, Keyring, Purpose, Sealed, TableTag,
+    UnlockerId, UnlockerKind, VaultId, keyed_hash, open, unwrap_vmk,
 };
 use hkdf::Hkdf;
+use kat::{ENVELOPE, EPOCH, PASSPHRASE, VAULT_ID, kat_ctx, range, unhex};
 use sha2::Sha256;
-
-fn unhex(s: &str) -> Vec<u8> {
-    let s: String = s.split_whitespace().collect();
-    assert_eq!(s.len() % 2, 0);
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
-}
 
 fn arr<const N: usize>(hex: &str) -> [u8; N] {
     unhex(hex).try_into().unwrap()
-}
-
-fn range<const N: usize>(start: u8) -> [u8; N] {
-    core::array::from_fn(|i| start + i as u8)
 }
 
 // ------------------------------------------------------------ standards
@@ -226,12 +216,6 @@ fn blake3_matches_its_test_vectors() {
 
 // -------------------------------------------------------- EnvCloak formats
 
-const VAULT_ID: [u8; 16] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-];
-const EPOCH: u32 = 7;
-const PASSPHRASE: &[u8] = b"envcloak envelope known answer";
-
 /// Fields table, field value, secret item, schema 1, row version 42, row id
 /// 0x10..0x1f.
 fn kat_aad() -> Aad {
@@ -246,14 +230,6 @@ fn kat_aad() -> Aad {
         row_version: 42,
     }
 }
-
-/// A passphrase envelope of the VMK 0x20..0x3f for unlocker 0x50..0x5f,
-/// with m = 64 MiB, t = 2, p = 1, salt 0x60..0x6f and nonce 0x70..0x87.
-const ENVELOPE: &str = "
-    454345560101505152535455565758595a5b5c5d5e5f0000000701000100000000000200000001606162
-    636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868763ac42c70c
-    d503f7143f1e9be31decd03c3474a4710ae7eead62516b570e51c93c8850368b913e272860cbc632620a
-    a71154c6cee7aaaec003d486265fc4b66963e53b8afa5c52d7e4b245ad22da0a84";
 
 /// keyed_hash(subkey, "envcloak/v1/kat", "abc") for each purpose of the
 /// VMK above, in `Purpose::ALL` order.
@@ -273,14 +249,6 @@ const KEYED_HASHES: [&str; 8] = [
 const SEALED: &str = "
     404142434445464748494a4b4c4d4e4f50515253545556573ac8244678c2bf3f1ac8b6f38400d10f2891
     861ab6665811c619294953eb8e62e6748a1f495bf20a6276";
-
-fn kat_ctx() -> EnvelopeCtx {
-    EnvelopeCtx {
-        vault_id: VaultId(VAULT_ID),
-        unlocker_id: UnlockerId(range(0x50)),
-        epoch: EPOCH,
-    }
-}
 
 fn kat_keyring() -> Keyring {
     let env = Envelope::from_bytes(&unhex(ENVELOPE)).unwrap();

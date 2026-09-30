@@ -10,7 +10,7 @@ with implementations independent of the Rust crates the vault uses:
 
 The formats are documented in docs/CRYPTO.md. Every input is a fixed test
 pattern, never a real secret. Run it and compare the output with the
-constants in crypto_kat.rs:
+constants in crypto_kat.rs and, for ENVELOPE, tests/kat/mod.rs beside it:
 
     python3 -m pip install cryptography pycryptodome
     python3 scripts/crypto-kat-vectors.py
