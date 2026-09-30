@@ -166,11 +166,34 @@ fn the_embedded_registry_loads() {
     ] {
         assert!(github.path_denied(path), "{path}");
     }
+    // Review T6 open 2: the endpoints that give an account lasting access,
+    // which a key rotation does not end, as OpenAI's and Anthropic's users
+    // and invites are denied.
+    for path in [
+        "/repos/acme/web/collaborators/octocat",
+        "/repos/acme/web/collaborators/octocat/permission",
+        "/repos/acme/web/invitations/1",
+        "/orgs/acme/invitations",
+        "/orgs/acme/invitations/1/teams",
+        "/orgs/acme/memberships/octocat",
+        "/orgs/acme/outside_collaborators/octocat",
+        "/orgs/acme/teams/core/memberships/octocat",
+        "/teams/1/memberships/octocat",
+        "/scim/v2/organizations/acme/Users",
+        "/scim/v2/enterprises/big/Users/1",
+    ] {
+        assert!(github.path_denied(path), "{path}");
+    }
     for path in [
         "/repos/acme/web/pulls",
         "/repos/acme/web/codespaces",
         "/repos/acme/web/dependabot/alerts",
         "/orgs/acme/members",
+        "/orgs/acme/members/octocat",
+        "/orgs/acme/teams/core",
+        "/orgs/acme/teams/core/repos",
+        "/repos/acme/web/issues/1/comments",
+        "/user/memberships/orgs",
     ] {
         assert!(!github.path_denied(path), "{path}");
     }
