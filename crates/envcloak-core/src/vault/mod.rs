@@ -549,8 +549,9 @@ fn layout_damaged(e: VaultError) -> VaultError {
 /// metadata.
 ///
 /// When [`Vault::integrity`] is not [`Integrity::Ok`], rows may be missing
-/// or restored from an older copy. The vault then serves items and values
-/// only for its owner to recover them; [`Vault::policies`],
+/// or restored from an older copy, and the item a field is listed under is
+/// not verified. The vault then serves items and values only for its owner
+/// to recover them; [`Vault::policies`],
 /// [`Vault::projects`], [`Vault::find_project`] and [`Vault::header`] fail
 /// with [`VaultErrorKind::Tampered`]. Callers must not evaluate a grant,
 /// release a value to an agent, or trust an item's allowed hosts or

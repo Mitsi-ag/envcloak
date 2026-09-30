@@ -127,7 +127,7 @@ Unlocker envelopes of that epoch can then be listed without the key and unwrappe
 2. compares `sqlite_schema` with the objects the schema version defines;
 3. checks that `meta` is one row naming that vault id and schema version, and opens every header row, checking its plaintext columns;
 4. reads every row, computes its stamp, and decrypts the item, field, project and policy records. It never opens `sealed_value` or `sealed_prior`: values are decrypted one at a time, on request;
-5. checks each row's plaintext columns against its sealed contents (the slug and project hashes, the item a field belongs to, unique slugs and field names, an unlocker's id, vault id, kind and epoch);
+5. checks each row's plaintext columns against its sealed contents (the slug and project hashes, unique slugs and field names, an unlocker's id, vault id, kind and epoch). A field's item must exist and give the field its class, the one its record must open under; which item a field belongs to is not in the field's record or its associated data, so it is covered by the state digest (step 6), not by a check of the row;
 6. recomputes the state digest and compares it with the header's.
 
 Unlock first drops SQLite's page cache (see Writes), so it checks the file as it is at that moment, also when it goes through the handle that `lock` kept open.
@@ -144,7 +144,7 @@ When the header and the rows name different schema versions, unlock uses the fir
 | schema altered | A table, index, trigger or view was added or changed |
 | changed while open | A row on disk no longer matches what this process wrote |
 
-A read-only vault refuses every write and still serves the items and values that open, so their owner can recover them. It serves no policies, project records or header (those calls fail as tampered): a deleted or rolled-back row must never loosen a decision. No grant is evaluated, no value is released to an agent, and no item's allowed hosts or classification is trusted from a vault whose integrity is not `Ok`, which can change while it is open.
+A read-only vault refuses every write and still serves the items and values that open, so their owner can recover them. The item a field is listed under there is not verified: a field moved to another item of the same class opens under it, and only the digest, which then fails, shows the move. It serves no policies, project records or header (those calls fail as tampered): a deleted or rolled-back row must never loosen a decision. No grant is evaluated, no value is released to an agent, and no item's allowed hosts or classification is trusted from a vault whose integrity is not `Ok`, which can change while it is open.
 
 Without an anchor (Linux, and macOS before M3), restoring the whole file together with its header is not detected locally (SPEC §5). `tests/vault_integrity.rs` pins this limit.
 

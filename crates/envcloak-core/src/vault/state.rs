@@ -7,6 +7,12 @@
 //! recomputes the state digest from the rows' stamps. Anything wrong is
 //! recorded as a [`TamperKind`] and the vault opens read-only; rows that do
 //! not open are left out.
+//!
+//! A field's record and its associated data do not name its item: the
+//! `item_id` column decides it, which only the digest covers. A field moved
+//! to another item of the same class still opens, under that item, and
+//! fails the digest; in a vault that failed its check, the item a field is
+//! listed under is not verified.
 
 use std::collections::BTreeMap;
 
@@ -549,6 +555,9 @@ pub(crate) fn load(
 
     for f in &raw.fields {
         note_stamp(&mut st, &mut found, f.stamp());
+        // The item must exist and give the class the record opens under;
+        // which item it is, only the digest vouches for (see the module
+        // documentation).
         let item = id16(&f.item_id).map(ItemId::from_bytes);
         let class = item.and_then(|i| st.items.get(&i)).map(|r| r.class);
         let (Some(id), Some(item), Some(class), Ok(rv), Ok(value_hash)) = (
