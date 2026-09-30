@@ -3,7 +3,8 @@
 //! migration failed. Also: a migration that succeeds re-seals every sealed
 //! column under the new schema version and verifies; an older build refuses
 //! the newer file; `kill -9` during a migration leaves the old or the new
-//! vault, never a mix.
+//! vault, never a mix: the old one when the child is held inside the
+//! migration's transaction, the new one when it is held after the commit.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -362,6 +363,21 @@ fn a_meta_row_from_before_a_migration_opens_read_only() {
 }
 
 const MIGRATOR: &str = "ENVCLOAK_VAULT_MIGRATOR";
+/// Set for the child: its migration stops inside the migration
+/// transaction, after every row was re-sealed and the transform ran and
+/// before the commit, prints `@@in-migration` and waits to be killed.
+const HOLD: &str = "ENVCLOAK_VAULT_MIGRATOR_HOLD";
+
+/// The child's transform: [`set_tier`], then, when [`HOLD`] is set, the
+/// stop inside the transaction.
+fn set_tier_or_hold(tx: &MigrationTx<'_>) -> Result<(), VaultError> {
+    set_tier(tx)?;
+    if std::env::var_os(HOLD).is_some() {
+        println!("@@in-migration");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+    Ok(())
+}
 
 /// Runs only as the child of the test below: opens with the v2 plan, which
 /// migrates.
@@ -372,7 +388,7 @@ fn migration_child() {
     };
     let vmk = Vmk::import_for_testing(&read_stdin()).unwrap();
     println!("@@start");
-    let v = LockedVault::open_with_plan(&VaultPaths::under(dir), to_v2(set_tier))
+    let v = LockedVault::open_with_plan(&VaultPaths::under(dir), to_v2(set_tier_or_hold))
         .unwrap()
         .unlock(vmk)
         .map_err(|(_, e)| e)
@@ -390,53 +406,101 @@ fn kill_9_during_a_migration_leaves_the_old_or_the_new_vault() {
     let v1 = f.home.root().join("v1.db");
     std::fs::copy(f.db(), &v1).unwrap();
     let before = dump(&f);
-
-    let mut window = Duration::from_millis(50);
-    let (mut old, mut new) = (0, 0);
-    for round in 0..30 {
+    let start = |hold: bool| {
         std::fs::copy(&v1, f.db()).unwrap();
-        let mut child = spawn_self(&f.home, "migration_child", &[(MIGRATOR, &f.data())], &f.vmk);
-        let mut out = BufReader::new(child.stdout.take().unwrap());
-        assert!(wait_for(&mut out, "@@start").is_some(), "round {round}");
-        let started = Instant::now();
-        if round == 0 {
-            assert!(
-                wait_for(&mut out, "@@migrated").is_some(),
-                "the migration did not finish"
-            );
-            window = started.elapsed();
-        } else {
-            let us = rng.below(window.as_micros() as u64 * 5 / 4 + 1);
-            std::thread::sleep(Duration::from_micros(us));
+        let data = f.data();
+        let mut env = vec![(MIGRATOR, data.as_str())];
+        if hold {
+            env.push((HOLD, "1"));
         }
-        kill_child(&mut child, "migration");
+        let mut child = spawn_self(&f.home, "migration_child", &env, &f.vmk);
+        let out = BufReader::new(child.stdout.take().unwrap());
+        (child, out)
+    };
 
-        let ctx = format!("seed {seed}: round {round}");
-        match LockedVault::open(&f.paths) {
-            Ok(locked) => {
-                old += 1;
-                let v = locked.unlock(f.vmk()).map_err(|(_, e)| e).unwrap();
-                assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
-                assert_eq!(v.schema_version(), 1, "{ctx}");
-                assert_values(&v, &values);
-                drop(v);
-                assert_eq!(dump(&f), before, "{ctx}: the old vault changed");
-            }
-            Err(e) => {
-                assert_eq!(e.kind(), VaultErrorKind::UnsupportedVersion, "{ctx}");
-                new += 1;
-                let v = open_with(&f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap();
-                assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
-                assert_eq!(v.schema_version(), 2, "{ctx}");
-                assert_values(&v, &values);
-            }
+    // Held before the commit.
+    for round in 0..3 {
+        let (mut child, mut out) = start(true);
+        assert!(
+            wait_for(&mut out, "@@in-migration").is_some(),
+            "held round {round}: the child did not reach the migration"
+        );
+        kill_child(&mut child, "migration");
+        let ctx = format!("killed inside the migration, round {round}");
+        assert_eq!(left_by_kill(&f, &values, &before, &ctx), Left::Old, "{ctx}");
+    }
+
+    // Held after the commit; this also measures a whole migration.
+    let (mut child, mut out) = start(false);
+    assert!(wait_for(&mut out, "@@start").is_some());
+    let started = Instant::now();
+    assert!(
+        wait_for(&mut out, "@@migrated").is_some(),
+        "the migration did not finish"
+    );
+    let window = started.elapsed();
+    kill_child(&mut child, "migration");
+    let ctx = "killed after the commit";
+    assert_eq!(left_by_kill(&f, &values, &before, ctx), Left::New, "{ctx}");
+
+    // Random moments: either vault, never a mix.
+    let (mut old, mut new) = (0, 0);
+    for round in 0..20 {
+        let (mut child, mut out) = start(false);
+        assert!(wait_for(&mut out, "@@start").is_some(), "round {round}");
+        let us = rng.below(window.as_micros() as u64 * 5 / 4 + 1);
+        std::thread::sleep(Duration::from_micros(us));
+        kill_child(&mut child, "migration");
+        match left_by_kill(&f, &values, &before, &format!("seed {seed}: round {round}")) {
+            Left::Old => old += 1,
+            Left::New => new += 1,
         }
     }
-    println!("migration kills (seed {seed}): {old} left version 1, {new} left version 2");
-    assert!(old > 0, "no kill landed before the migration committed");
-    assert!(new > 0);
+    println!("random migration kills (seed {seed}): {old} left version 1, {new} left version 2");
 }
 
+/// Which vault a killed migration left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Left {
+    Old,
+    New,
+}
+
+/// Opens the vault a killed migration left and checks that it is exactly
+/// the old vault, byte for byte, or the migrated one, whole.
+fn left_by_kill(
+    f: &Fixture,
+    values: &[(FieldId, Vec<u8>)],
+    before: &[(String, Vec<Vec<Value>>)],
+    ctx: &str,
+) -> Left {
+    match LockedVault::open(&f.paths) {
+        Ok(locked) => {
+            let v = locked.unlock(f.vmk()).map_err(|(_, e)| e).unwrap();
+            assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
+            assert_eq!(v.schema_version(), 1, "{ctx}");
+            assert_values(&v, values);
+            drop(v);
+            assert_eq!(dump(f), before, "{ctx}: the old vault changed");
+            Left::Old
+        }
+        Err(e) => {
+            assert_eq!(e.kind(), VaultErrorKind::UnsupportedVersion, "{ctx}");
+            let v = open_with(f, to_v2(set_tier)).map_err(|(_, e)| e).unwrap();
+            assert_eq!(v.integrity(), Integrity::Ok, "{ctx}");
+            assert_eq!(v.schema_version(), 2, "{ctx}");
+            assert_values(&v, values);
+            Left::New
+        }
+    }
+}
+
+/// Gate 7's crash half (Codex F-25): the child is held inside the
+/// migration transaction, after the rows were re-sealed and before the
+/// commit, and killed there: the old vault is left. Held after the commit
+/// and killed: the migrated one. Neither depends on when the kill lands.
+/// Then kills at random moments within a measured migration add coverage,
+/// each leaving one vault or the other, however they fall.
 #[test]
 fn plans_must_be_contiguous() {
     let e = MigrationPlan::new(vec![Migration {
