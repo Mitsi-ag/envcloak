@@ -1280,6 +1280,51 @@ fn a_short_password_in_a_connection_string_is_guessable() {
     f.sweep();
 }
 
+/// `l` and `r` random letters and digits either side of one backslash,
+/// written as libpq's keyword form escapes it (`\\`): `l + r + 1`
+/// characters to libpq, one byte more as written.
+fn backslashed(l: usize, r: usize) -> String {
+    format!("{}\\\\{}", word(l), word(r))
+}
+
+/// Review finding F-65 (Codex): a password in libpq's keyword form was
+/// counted as written, but libpq decodes a backslash before any byte, so
+/// a 15-character password holding one backslash, written with it
+/// escaped, counted 16, and an agent's right guess was told from a wrong
+/// one. Each field's password is also counted as libpq decodes it: 15
+/// characters, unquoted or quoted, get one answer for an agent and are
+/// told apart for a person; 16 characters, escaped the same way, are
+/// compared for anyone (tests/fixtures/libpq in envcloak-providers holds
+/// libpq's own counts of these forms).
+#[test]
+fn a_short_libpq_password_with_escapes_is_guessable() {
+    let mut f = Fixture::new(|_, _| {});
+    let mut c = client(&f.home);
+    let unquoted: ValueOf = |pw| {
+        format!("host=db.internal port=5432 dbname=app user=app password={pw} sslmode=require")
+    };
+    let quoted: ValueOf = |pw| format!("host=db.internal password='{pw}' dbname=app");
+    let shapes =
+        [("libpq-escaped", unquoted), ("libpq-quoted", quoted)].map(|(name, value)| Shape {
+            name,
+            var: "DATABASE_DSN",
+            value,
+            right: backslashed(7, 7),
+            wrong: backslashed(7, 7),
+        });
+    guesses_are_hidden(&mut f, &mut c, &shapes);
+    compared_for_anyone(
+        &mut f,
+        &mut c,
+        &[
+            ("libpq-escaped", "DATABASE_DSN", unquoted, backslashed(7, 8)),
+            ("libpq-quoted", "DATABASE_DSN", quoted, backslashed(7, 8)),
+        ],
+    );
+    drop(c);
+    f.sweep();
+}
+
 /// Values compared with the vault are limited per subject root: 20
 /// requests of 5,000 secrets reach the hour's 100,000, and the next
 /// comparison is refused (`too_many_checks`) and audited; a request that
