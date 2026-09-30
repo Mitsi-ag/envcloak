@@ -180,10 +180,63 @@ fn url_password(v: &[u8]) -> Option<&[u8]> {
     (!password.is_empty()).then_some(password)
 }
 
-/// Every reading of a URL's password a server could take, each non-empty.
-/// The user information ends at an `@` after `://`, and the password is
-/// what follows its first `:`. Which `@` ends it is not certain, so each
-/// of these is a reading:
+/// Password readings of a value ([`password_chars`]), and how many bytes
+/// the searches read to find them. No `Debug`: the readings are parts of
+/// the value.
+#[derive(Default)]
+struct Readings<'a> {
+    found: Vec<&'a [u8]>,
+    /// Every byte a search read, counted each time one read it. The tests
+    /// hold it linear in the value's length, and see it stop growing once
+    /// the searches stop at [`MAX_PASSWORD_READINGS`] (review R-5): the
+    /// bound is checked by what is read, not by how long it took.
+    scanned: usize,
+}
+
+impl<'a> Readings<'a> {
+    /// Keeps `reading`, and says whether the search goes on: not once
+    /// there are more readings than [`MAX_PASSWORD_READINGS`].
+    fn push(&mut self, reading: &'a [u8]) -> bool {
+        self.found.push(reading);
+        !self.over()
+    }
+
+    /// More readings than are counted: the value counts as short.
+    fn over(&self) -> bool {
+        self.found.len() > MAX_PASSWORD_READINGS
+    }
+
+    /// The first position in `hay` whose byte `pred` takes, counting each
+    /// byte looked at.
+    fn position(&mut self, hay: &[u8], pred: impl Fn(u8) -> bool) -> Option<usize> {
+        let found = hay.iter().position(|&b| pred(b));
+        self.scanned += found.map_or(hay.len(), |p| p + 1);
+        found
+    }
+
+    /// Where `needle` first starts in `hay`, counting each byte up to its
+    /// end (or `hay`'s) once.
+    fn find(&mut self, hay: &[u8], needle: &[u8]) -> Option<usize> {
+        let found = hay.windows(needle.len()).position(|w| w == needle);
+        self.scanned += found.map_or(hay.len(), |p| p + needle.len());
+        found
+    }
+
+    /// How many bytes at the start of `hay` `pred` takes, counting each
+    /// byte looked at.
+    fn run(&mut self, hay: &[u8], pred: impl Fn(u8) -> bool) -> usize {
+        self.position(hay, |b| !pred(b)).unwrap_or(hay.len())
+    }
+}
+
+/// Every reading of a URL's password a server could take, each non-empty,
+/// in every URL the value holds: each `://` starts one, since a value may
+/// list several (`redis://a:26379,redis://:<password>@b:26379`, a proxy's
+/// URL before a database's), and a password in a later URL would
+/// otherwise be measured from the first one's host (review R-4). From
+/// each `://`, the user information ends at an `@` after it, and the
+/// password is what follows its first `:`. Which `@` ends it is not
+/// certain, so each of these is a reading:
 /// - the last `@` in the authority, which ends at the first `/`, `?` or
 ///   `#` (RFC 3986): an `@` in the path, query or fragment
 ///   (`?application_name=api@prod`) is none of the password's;
@@ -191,29 +244,54 @@ fn url_password(v: &[u8]) -> Option<&[u8]> {
 ///   unescaped, with an `@` further on;
 /// - the last `@` of all ([`url_password`]): a password holding `/` and
 ///   `@`.
-fn url_passwords(v: &[u8]) -> Vec<&[u8]> {
-    let Some(at) = v.windows(3).position(|w| w == b"://") else {
-        return Vec::new();
-    };
-    let rest = &v[at + 3..];
-    let authority = rest
-        .iter()
-        .position(|&b| matches!(b, b'/' | b'?' | b'#'))
-        .unwrap_or(rest.len());
-    let first_colon = rest.iter().position(|&b| b == b':');
-    let ends = [
-        rest[..authority].iter().rposition(|&b| b == b'@'),
-        first_colon.and_then(|c| rest[c..].iter().position(|&b| b == b'@').map(|p| c + p)),
-        rest.iter().rposition(|&b| b == b'@'),
-    ];
-    ends.into_iter()
-        .flatten()
-        .filter_map(|end| {
-            let colon = rest[..end].iter().position(|&b| b == b':')?;
-            let password = &rest[colon + 1..end];
-            (!password.is_empty()).then_some(password)
-        })
-        .collect()
+///
+/// Each position these need is found by a cursor that only moves forward
+/// as the URLs do, so every byte is read a bounded number of times
+/// however many URLs the value lists.
+fn url_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
+    let is_at = |b: u8| b == b'@';
+    let last_at = v.iter().rposition(|&b| is_at(b));
+    out.scanned += last_at.map_or(v.len(), |p| v.len() - p);
+    // The authority's end; the scan for the last `@` before it, and that
+    // `@`; the first `:`; the first `@` at or after that `:`.
+    let (mut authority, mut seen, mut seen_at) = (0, 0, None);
+    let (mut colon, mut after) = (0, 0);
+    let mut from = 0;
+    while let Some(p) = out.find(&v[from..], b"://") {
+        let start = from + p + 3;
+        from = start;
+        authority = authority.max(start);
+        authority += out.run(&v[authority..], |b| !matches!(b, b'/' | b'?' | b'#'));
+        while seen < authority {
+            if is_at(v[seen]) {
+                seen_at = Some(seen);
+            }
+            seen += 1;
+            out.scanned += 1;
+        }
+        colon = colon.max(start);
+        colon += out.run(&v[colon..], |b| b != b':');
+        if colon == v.len() {
+            // No `:` from here on: no password in this URL or any after.
+            return;
+        }
+        after = after.max(colon);
+        after += out.run(&v[after..], |b| !is_at(b));
+        let ends = [
+            seen_at.filter(|&a| a >= start),
+            Some(after).filter(|&a| a < v.len()),
+            last_at.filter(|&a| a >= start),
+        ];
+        for (k, end) in ends.iter().enumerate() {
+            let Some(end) = *end else { continue };
+            if ends[..k].contains(&Some(end)) || end <= colon + 1 {
+                continue;
+            }
+            if !out.push(&v[colon + 1..end]) {
+                return;
+            }
+        }
+    }
 }
 
 /// How many characters `password` has: a `%XX` escape counts as the byte
@@ -253,35 +331,39 @@ fn password_len(password: &[u8]) -> usize {
 }
 
 /// Go's MySQL DSN, `user:password@tcp(host:3306)/db`, has no scheme: its
-/// user information is the value up to an `@` that a protocol name and `(`
-/// follow (`@tcp(`, `@unix(`, `@tcp6(`), or that `/` follows (`@/db`, the
-/// default address), and the password is what follows its first `:`. Each
-/// such `@` is a reading, since the password may hold an `@` too.
-fn dsn_passwords<'a>(v: &'a [u8], out: &mut Vec<&'a [u8]>) {
-    let Some(colon) = v.iter().position(|&b| b == b':') else {
+/// user information is the value up to an `@` that an address follows,
+/// and the password is what follows its first `:`. An address is a
+/// protocol name and `(` (`@tcp(`, `@unix(`, `@tcp6(`), a protocol name
+/// and `/` (`@tcp/db`, the protocol's default address, which the driver's
+/// README shows: review R-3), or `/` alone (`@/db`, the default protocol
+/// and address). Each such `@` is a reading, since the password may hold
+/// an `@` too. A value whose first `:` starts `://` is a URL, which
+/// [`url_passwords`] reads: what follows is `//` and a user, no password
+/// (`postgres://app@db/app`), so a DSN whose password starts with `//` is
+/// measured whole.
+fn dsn_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
+    let Some(colon) = out.position(v, |b| b == b':') else {
         return;
     };
-    let protocol = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
-    for (at, _) in v
-        .iter()
-        .enumerate()
-        .skip(colon + 1)
-        .filter(|(_, b)| **b == b'@')
-    {
+    if v[colon..].starts_with(b"://") {
+        return;
+    }
+    let protocol = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
+    let mut at = colon + 1;
+    while let Some(p) = out.position(&v[at..], |b| b == b'@') {
+        at += p;
         let rest = &v[at + 1..];
-        let name = rest.iter().take_while(|b| protocol(b)).count();
-        let address = if name == 0 {
-            rest.first() == Some(&b'/')
-        } else {
-            rest.get(name) == Some(&b'(')
+        let name = out.run(rest, protocol);
+        let address = match rest.get(name) {
+            Some(b'/') => true,
+            Some(b'(') => name > 0,
+            _ => false,
         };
         let password = &v[colon + 1..at];
-        if address && !password.is_empty() {
-            out.push(password);
-            if out.len() > MAX_PASSWORD_READINGS {
-                return;
-            }
+        if address && !password.is_empty() && !out.push(password) {
+            return;
         }
+        at += 1;
     }
 }
 
@@ -297,32 +379,46 @@ const PASSWORD_FIELDS: [&[u8]; 3] = [b"password", b"passwd", b"pwd"];
 /// whitespace; when it starts with `'`, `"` or `{`, what the quotes hold
 /// up to the first closing `'`, `"` or `}` is a reading too, since libpq,
 /// ADO.NET and ODBC quote a value that holds a separator.
-fn field_passwords<'a>(v: &'a [u8], out: &mut Vec<&'a [u8]>) {
-    let blank = |b: &u8| matches!(b, b' ' | b'\t');
+///
+/// Only a field that gives a reading can read far (to the value's end);
+/// the search stops after more than [`MAX_PASSWORD_READINGS`] readings, so
+/// it reads each byte at most twice for each of those and a bounded
+/// number of times otherwise.
+fn field_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
+    let blank = |b: u8| matches!(b, b' ' | b'\t');
     for start in 0..v.len() {
+        out.scanned += 1;
         if start > 0 && (v[start - 1].is_ascii_alphanumeric() || v[start - 1] == b'_') {
             continue;
         }
-        let Some(name) = PASSWORD_FIELDS.iter().find(|f| {
-            v.get(start..start + f.len())
-                .is_some_and(|w| w.eq_ignore_ascii_case(f))
-        }) else {
+        let mut name = None;
+        for field in PASSWORD_FIELDS {
+            out.scanned += field.len();
+            if v.get(start..start + field.len())
+                .is_some_and(|w| w.eq_ignore_ascii_case(field))
+            {
+                name = Some(field);
+                break;
+            }
+        }
+        let Some(name) = name else {
             continue;
         };
         let mut i = start + name.len();
-        i += v[i..].iter().take_while(|b| blank(b)).count();
+        i += out.run(&v[i..], blank);
         if v.get(i) != Some(&b'=') {
             continue;
         }
         i += 1;
-        i += v[i..].iter().take_while(|b| blank(b)).count();
+        i += out.run(&v[i..], blank);
         let value = &v[i..];
-        let plain = value
-            .iter()
-            .position(|&b| matches!(b, b';' | b'&') || b.is_ascii_whitespace())
+        let plain = out
+            .position(value, |b| {
+                matches!(b, b';' | b'&') || b.is_ascii_whitespace()
+            })
             .unwrap_or(value.len());
-        if plain > 0 {
-            out.push(&value[..plain]);
+        if plain > 0 && !out.push(&value[..plain]) {
+            return;
         }
         let close = match value.first() {
             Some(b'\'') => Some(b'\''),
@@ -332,34 +428,44 @@ fn field_passwords<'a>(v: &'a [u8], out: &mut Vec<&'a [u8]>) {
         };
         if let Some(close) = close {
             let inner = &value[1..];
-            let end = inner
-                .iter()
-                .position(|&b| b == close)
-                .unwrap_or(inner.len());
-            if end > 0 {
-                out.push(&inner[..end]);
+            let end = out.position(inner, |b| b == close).unwrap_or(inner.len());
+            if end > 0 && !out.push(&inner[..end]) {
+                return;
             }
-        }
-        if out.len() > MAX_PASSWORD_READINGS {
-            return;
         }
     }
 }
 
 /// The most password readings [`password_chars`] counts. A value with
 /// more is counted as short, which fails closed (compared only for a
-/// person), and the search stops there, so the work stays linear in the
-/// value's length.
+/// person), and every search stops there, so the work stays linear in the
+/// value's length: the tests count the bytes read ([`Readings`]).
 pub const MAX_PASSWORD_READINGS: usize = 64;
+
+/// Every password reading of `v` in the forms [`password_chars`] knows,
+/// the searches stopping once there are more than
+/// [`MAX_PASSWORD_READINGS`].
+fn readings(v: &[u8]) -> Readings<'_> {
+    let mut out = Readings::default();
+    url_passwords(v, &mut out);
+    if !out.over() {
+        dsn_passwords(v, &mut out);
+    }
+    if !out.over() {
+        field_passwords(v, &mut out);
+    }
+    out
+}
 
 /// When `value` holds a password in a form this knows, how many
 /// characters it has: all of the value a guesser must find, since the
 /// rest (scheme, user, host, port, database, options) is no secret (SPEC
 /// §6.4: a short password in a long value is short). The forms:
 /// - a URL with a password ([`shaped_like_secret`]'s first shape), where
-///   the password is read at every `@` a server could end it at
-///   (`url_passwords`);
-/// - Go's MySQL DSN, `user:password@tcp(host)/db` (`dsn_passwords`);
+///   the password is read at every `@` a server could end it at, in every
+///   URL the value lists (`url_passwords`);
+/// - Go's MySQL DSN, `user:password@tcp(host)/db`, `@tcp/db` or `@/db`
+///   (`dsn_passwords`);
 /// - a `password=`, `passwd=` or `pwd=` field of a libpq, ADO.NET, ODBC or
 ///   JDBC connection string (`field_passwords`).
 ///
@@ -374,13 +480,11 @@ pub const MAX_PASSWORD_READINGS: usize = 64;
 pub fn password_chars(value: &SecretBytes) -> Option<usize> {
     #[allow(clippy::disallowed_methods)] // Read in place; only a count leaves.
     let v: &[u8] = value.expose_secret();
-    let mut readings = url_passwords(v);
-    dsn_passwords(v, &mut readings);
-    field_passwords(v, &mut readings);
-    if readings.len() > MAX_PASSWORD_READINGS {
+    let readings = readings(v);
+    if readings.over() {
         return Some(0);
     }
-    readings.into_iter().map(password_len).min()
+    readings.found.into_iter().map(password_len).min()
 }
 
 fn key_shaped_run(v: &[u8]) -> bool {
@@ -635,6 +739,242 @@ mod shape_tests {
         assert_eq!(password_chars(&dsn), Some(0));
         // Empty fields are no readings, however many.
         assert_eq!(password_chars(&run("password=;")), None);
+    }
+
+    /// Review R-3: Go's MySQL DSN with a protocol and no address
+    /// (`user:pw@tcp/dbname`, the protocol's default address, a form the
+    /// go-sql-driver README shows) was not read, since a protocol name had
+    /// to be followed by `(`, so an 8-character password was measured
+    /// with the whole value. A protocol name followed by `/` is an address
+    /// too.
+    #[test]
+    fn a_dsn_with_a_protocol_and_no_address_is_read() {
+        for (value, chars) in [
+            (&b"app:abcdefgh@tcp/app"[..], 8),
+            (b"app:abcdefgh@unix/app?parseTime=true", 8),
+            (b"app:abcdefgh@tcp6/", 8),
+            (b"app:p@ssword1@tcp/app", 9),
+            // Control: 16 characters.
+            (b"app:abcdefghijklmnop@tcp/app", 16),
+        ] {
+            assert_eq!(
+                password_chars(value),
+                Some(chars),
+                "{:?}",
+                String::from_utf8_lossy(value)
+            );
+        }
+        // No address: a protocol name with nothing after it, or `(` with
+        // no protocol name. A URL with a user and no password, whose host
+        // and path look like a protocol and its address, is no DSN.
+        for no in [
+            &b"app:abcdefgh@tcp"[..],
+            b"app:abcdefgh@(db)/app",
+            b"postgres://app@db/app",
+            b"redis://cache@localhost/0",
+            b"mysql://app@/app",
+        ] {
+            assert_eq!(
+                password_chars(no),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(no)
+            );
+        }
+    }
+
+    /// Review R-4: only the first `://` was read, so in a value listing
+    /// several URLs a password in a later one was measured from the first
+    /// one's port, and an 8-character password counted 23 or 30. Every
+    /// `://` starts a URL whose password is read; 16 characters there
+    /// stay 16.
+    #[test]
+    fn a_password_in_a_later_url_is_counted_alone() {
+        for (value, chars) in [
+            (
+                &b"redis://s1.internal:26379,redis://:abcdefgh@s2.internal:26379"[..],
+                8,
+            ),
+            (
+                b"https://proxy.internal:8443/x postgres://app:abcdefgh@db.internal/app",
+                8,
+            ),
+            (
+                b"amqp://mq1.internal amqp://mq2.internal amqp://app:%61%62%63%64@mq3.internal/",
+                4,
+            ),
+            // Controls: 16 characters in the later URL.
+            (
+                b"redis://s1.internal:26379,redis://:abcdefghijklmnop@s2.internal:26379",
+                16,
+            ),
+            (
+                b"https://proxy.internal:8443/x postgres://app:abcdefghijklmnop@db.internal/app",
+                16,
+            ),
+        ] {
+            assert_eq!(
+                password_chars(value),
+                Some(chars),
+                "{:?}",
+                String::from_utf8_lossy(value)
+            );
+        }
+        for no in [
+            &b"https://a.internal/x https://b.internal/y"[..],
+            b"x://x://x://",
+        ] {
+            assert_eq!(
+                password_chars(no),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(no)
+            );
+        }
+    }
+
+    /// Where each reading is in `v`: its offset and length.
+    fn spans(v: &[u8], found: &[&[u8]]) -> Vec<(usize, usize)> {
+        found
+            .iter()
+            .map(|r| (r.as_ptr().addr() - v.as_ptr().addr(), r.len()))
+            .collect()
+    }
+
+    /// The URL readings as the one-URL search made them before review
+    /// R-4, repeated from every `://`: the reference the cursors must
+    /// agree with.
+    fn url_spans_by_restarting(v: &[u8]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for start in (0..v.len().saturating_sub(2))
+            .filter(|&p| &v[p..p + 3] == b"://")
+            .map(|p| p + 3)
+        {
+            let rest = &v[start..];
+            let authority = rest
+                .iter()
+                .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+                .unwrap_or(rest.len());
+            let first_colon = rest.iter().position(|&b| b == b':');
+            let ends = [
+                rest[..authority].iter().rposition(|&b| b == b'@'),
+                first_colon.and_then(|c| rest[c..].iter().position(|&b| b == b'@').map(|p| c + p)),
+                rest.iter().rposition(|&b| b == b'@'),
+            ];
+            for (k, end) in ends.iter().enumerate() {
+                let Some(end) = *end else { continue };
+                if ends[..k].contains(&Some(end)) {
+                    continue;
+                }
+                let Some(colon) = rest[..end].iter().position(|&b| b == b':') else {
+                    continue;
+                };
+                if colon + 1 < end {
+                    out.push((start + colon + 1, end - colon - 1));
+                }
+            }
+        }
+        out
+    }
+
+    /// The cursors of `url_passwords` give exactly the readings a search
+    /// restarted at every `://` gives, on values made of the bytes that
+    /// matter to it.
+    #[test]
+    fn url_readings_agree_with_a_search_from_every_scheme() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..50_000 {
+            let len = usize::try_from(next() % 40).unwrap();
+            let v: Vec<u8> = (0..len)
+                .map(|_| b"a:/@?#"[usize::try_from(next() % 6).unwrap()])
+                .collect();
+            let mut r = Readings::default();
+            url_passwords(&v, &mut r);
+            assert!(!r.over());
+            assert_eq!(
+                spans(&v, &r.found),
+                url_spans_by_restarting(&v),
+                "{:?}",
+                String::from_utf8_lossy(&v)
+            );
+        }
+    }
+
+    /// At most how many times the searches read each byte of a value:
+    /// twice for each counted reading that runs to the value's end, and a
+    /// bounded number of passes besides (URLs 6, the DSN 4, the fields' 18
+    /// at each start and 2 for blanks), with room to spare.
+    const READS_PER_BYTE: usize = 2 * (MAX_PASSWORD_READINGS + 1) + 40;
+
+    /// Review R-5: removing the searches' stop at the reading cap left
+    /// every result the same and only made them slower, so no test failed.
+    /// The bytes read are counted. A value with more readings than are
+    /// counted is read only up to the reading past the cap: the same bytes
+    /// however long it runs on. Any value is read at most
+    /// [`READS_PER_BYTE`] times a byte, and twice as long a value at most
+    /// twice as much, including values that read to their end at every
+    /// counted reading and values with no reading at all.
+    #[test]
+    fn the_searches_stop_at_the_cap_and_stay_linear() {
+        let run = |unit: &str, len: usize| unit.repeat(len / unit.len()).into_bytes();
+        // Each search on its own, since the others read such a value to
+        // its end looking for their forms.
+        type Search = for<'a> fn(&'a [u8], &mut Readings<'a>);
+        let past_cap: [(Search, &str, &str); 4] = [
+            (field_passwords, "", "password=abcdefghijklmnopq "),
+            (field_passwords, "", "pwd={abcdefghijklmnop};"),
+            (url_passwords, "", "a://u:abcdefghijklmnop@h/ "),
+            (dsn_passwords, "app:", "x@tcp("),
+        ];
+        for (search, head, unit) in past_cap {
+            let read = |len: usize| {
+                let v = [head.as_bytes(), &run(unit, len)].concat();
+                let mut r = Readings::default();
+                search(&v, &mut r);
+                (r.over(), r.scanned)
+            };
+            let ((over, a), (over_long, b)) = (read(1 << 16), read(1 << 17));
+            assert!(over && over_long, "{unit:?}");
+            assert_eq!(a, b, "{unit:?}");
+        }
+
+        for unit in [
+            "password=",
+            "pwd='{\"",
+            "password  ",
+            "passwor",
+            "x://",
+            "://a:",
+            "a:@",
+            "@tcp(",
+            "a",
+        ] {
+            let (short, long) = (run(unit, 1 << 15), run(unit, 1 << 16));
+            let (a, b) = (readings(&short).scanned, readings(&long).scanned);
+            assert!(a <= READS_PER_BYTE * short.len(), "{unit:?}: {a}");
+            assert!(b <= READS_PER_BYTE * long.len(), "{unit:?}: {b}");
+            // Twice as long, at most a little over twice as much (four
+            // times for a search that reads the rest at every field).
+            assert!(4 * b <= 9 * a, "{unit:?}: {a} then {b}");
+        }
+        // Just under the cap, each reading running to the end: the most a
+        // value is read.
+        let mut v = run("password=", 9 * MAX_PASSWORD_READINGS);
+        v.extend(run("x", 1 << 16));
+        let r = readings(&v);
+        assert!(!r.over());
+        assert!(r.scanned <= READS_PER_BYTE * v.len(), "{}", r.scanned);
+        assert!(
+            r.scanned >= MAX_PASSWORD_READINGS * (1 << 16),
+            "{}",
+            r.scanned
+        );
     }
 
     #[test]
