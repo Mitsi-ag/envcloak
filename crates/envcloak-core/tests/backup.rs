@@ -13,9 +13,9 @@
 //!   another state installed, valid or not, fails;
 //! - a restore refuses an open vault, a weak new passphrase, a backup path
 //!   that is a symlink, a FIFO or a directory, and a backup of another
-//!   vault than the one in place; it moves aside a file that is not a vault
-//!   or is a damaged one, and never a WAL away from the vault it belongs
-//!   to.
+//!   vault than the one in place, also one that opens as damaged; it moves
+//!   aside a file that is not a vault or is a damaged one, and never a WAL
+//!   away from the vault it belongs to.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -724,6 +724,69 @@ fn a_backup_of_another_vault_is_refused_over_a_vault() {
     assert_eq!(v.integrity(), Integrity::Ok);
     assert_eq!(v.vault_id(), other_id);
     assert!(report.replaced.is_empty());
+}
+
+/// Verification of 5ff68c7: a vault in place that opens as damaged is
+/// compared by the vault ids its `meta`, `header` and `unlockers` rows
+/// still hold. With any one of those tables gone, the others name the
+/// vault, and another vault's valid backup is refused before anything is
+/// moved, the file byte for byte as it was. A file whose rows hold no id
+/// (all three tables gone) names no vault: it is moved aside byte for byte,
+/// as a file that is not a vault is, and the backup restores. The vault's
+/// own backup over it restores in `a_restore_moves_aside_a_vault_missing_a_table`.
+#[test]
+fn a_backup_of_another_vault_is_refused_over_a_damaged_vault() {
+    let (f, v) = KitFixture::create();
+    drop(v);
+    let (g, w) = KitFixture::create();
+    let other = w.create_backup().unwrap();
+    let other_id = w.vault_id();
+    drop(w);
+    let intact = std::fs::read(f.db()).unwrap();
+    assert_eq!(dir_names(&f.paths.vault_dir), ["vault.db"]);
+    let without = |tables: &[&str]| {
+        std::fs::write(f.db(), &intact).unwrap();
+        let raw = rusqlite::Connection::open(f.db()).unwrap();
+        for table in tables {
+            raw.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        }
+        raw.close().unwrap();
+        assert_eq!(
+            LockedVault::open(&f.paths).unwrap_err().kind(),
+            VaultErrorKind::Damaged,
+            "{tables:?}"
+        );
+        std::fs::read(f.db()).unwrap()
+    };
+    let restore = || {
+        restore_backup_observed(
+            &f.paths,
+            &other.path,
+            &g.kit(),
+            &other_passphrase(8),
+            &KdfParams::minimum(),
+            &mut |_| {},
+        )
+    };
+
+    for table in ["meta", "header", "unlockers"] {
+        let damaged = without(&[table]);
+        let e = restore().unwrap_err();
+        assert_eq!(e.kind(), VaultErrorKind::BackupOfAnotherVault, "{table}");
+        assert_eq!(dir_names(&f.paths.vault_dir), ["vault.db"], "{table}");
+        assert_eq!(std::fs::read(f.db()).unwrap(), damaged, "{table}");
+    }
+
+    let nameless = without(&["meta", "header", "unlockers"]);
+    let (v, report) = restore().unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.vault_id(), other_id);
+    drop(v);
+    let [kept] = &report.replaced[..] else {
+        panic!("{:?}", report.replaced);
+    };
+    assert_eq!(std::fs::read(kept).unwrap(), nameless);
+    remove_replaced_files(&f.paths).unwrap();
 }
 
 /// Opens the vault with `pass`: Ok, or the generic unlock error.

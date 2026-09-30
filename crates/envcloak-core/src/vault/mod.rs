@@ -153,6 +153,53 @@ impl LockedVault {
     }
 
     pub(crate) fn open_with(p: &VaultPaths, plan: MigrationPlan) -> Result<Self, VaultError> {
+        let conn = Self::open_file(p)?;
+        Self::from_conn(conn, plan, p.clone())
+    }
+
+    /// The vault ids that the plaintext rows of a vault file which opens as
+    /// [`VaultErrorKind::Damaged`] still hold, for a restore to compare
+    /// with a backup's (backup.rs): the `meta`, `header` and `unlockers`
+    /// rows, each table read on its own. A table that is missing or cannot
+    /// be read, a value that is not an id, and a file SQLite does not read
+    /// as a vault hold none. The file is opened as [`LockedVault::open`]
+    /// opens it, which takes its lock while the rows are read; any other
+    /// failure is returned.
+    pub(crate) fn ids_left_in(p: &VaultPaths) -> Result<Vec<VaultId>, VaultError> {
+        let conn = match Self::open_file(p) {
+            Ok(c) => c,
+            Err(e) if e.kind() == VaultErrorKind::Damaged => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut ids = Vec::new();
+        for sql in [
+            "SELECT vault_id FROM meta",
+            "SELECT vault_id FROM header",
+            "SELECT vault_id FROM unlockers",
+        ] {
+            let rows = state::query(&conn, sql, |r| {
+                Ok(<[u8; 16]>::try_from(r.get_ref(0)?.as_blob().unwrap_or_default()).ok())
+            })
+            .map_err(layout_damaged);
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(e) if e.kind() == VaultErrorKind::Damaged => continue,
+                Err(e) => return Err(e),
+            };
+            for id in rows.into_iter().flatten().map(VaultId) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Opens `vault.db` as [`LockedVault::open`] does: checks the
+    /// directories and files, takes the vault's lock, applies the
+    /// durability settings, requires the application id, and removes a
+    /// stale temporary link.
+    fn open_file(p: &VaultPaths) -> Result<Connection, VaultError> {
         envcloak_sys::restrict_umask();
         check_private_dir(&p.data_dir)?;
         check_private_dir(&p.vault_dir)?;
@@ -181,7 +228,7 @@ impl LockedVault {
         // link to this vault; nothing else uses these names once `vault.db`
         // exists.
         remove_stale_temps(&dir)?;
-        Self::from_conn(conn, plan, p.clone())
+        Ok(conn)
     }
 
     fn from_conn(

@@ -40,7 +40,9 @@
 //! installed file) is refused too.
 //!
 //! A backup restores only its own vault: a vault in place whose id is not
-//! the backup's is refused before anything is written.
+//! the backup's is refused before anything is written. For one that opens
+//! as damaged, the vault ids its rows still hold are compared: when there
+//! are some and none is the backup's, it is refused the same way.
 //!
 //! Restore takes the vault's lock through [`LockedVault::open`], so it
 //! fails with [`VaultErrorKind::Busy`] while the vault is open. It takes no
@@ -231,15 +233,17 @@ impl Vault {
 ///   ([`VaultErrorKind::BackupDamaged`]), or its vault does not verify
 ///   ([`VaultErrorKind::Tampered`]);
 /// - a vault is in place and the backup is of another vault
-///   ([`VaultErrorKind::BackupOfAnotherVault`]);
+///   ([`VaultErrorKind::BackupOfAnotherVault`]), also when that vault
+///   opens as damaged and its rows still hold vault ids, none of them the
+///   backup's;
 /// - the current vault is open ([`VaultErrorKind::Busy`]);
 /// - the current vault's WAL could not be folded into it as it closed
 ///   ([`VaultErrorKind::Storage`]): moving that WAL aside would separate
 ///   transactions from their database.
 ///
 /// A current file that is not an EnvCloak vault at all, or opens as
-/// [`VaultErrorKind::Damaged`] (its plaintext tables altered, say), is
-/// moved aside too. See the module documentation for the order of the
+/// [`VaultErrorKind::Damaged`] (its plaintext tables altered, say) and is
+/// not another vault's, is moved aside too. See the module documentation for the order of the
 /// steps.
 ///
 /// Fails with [`VaultErrorKind::RestoreUnverified`] when the backup was
@@ -327,17 +331,27 @@ fn restore(
     // they are: SQLite would delete a WAL next to a file it cannot read.
     // So is one that opens as damaged; a busy vault, a path or permission
     // failure, or a newer format stops the restore.
+    //
+    // A backup restores its own vault only: another vault in place is
+    // left as it is (its audit log beside it names it, too). One that
+    // opens as damaged is another vault's when its rows still hold vault
+    // ids and none is the backup's; one whose rows hold none names no
+    // vault, and goes aside as a file that is not a vault does.
     let old = if looks_like_a_vault(&p.db)? {
         match LockedVault::open(p) {
             Ok(v) => Some(v),
-            Err(e) if e.kind() == VaultErrorKind::Damaged => None,
+            Err(e) if e.kind() == VaultErrorKind::Damaged => {
+                let ids = LockedVault::ids_left_in(p)?;
+                if !ids.is_empty() && !ids.contains(&head.ctx.vault_id) {
+                    return Err(VaultErrorKind::BackupOfAnotherVault.into());
+                }
+                None
+            }
             Err(e) => return Err(e),
         }
     } else {
         None
     };
-    // A backup restores its own vault only: another vault in place is
-    // left as it is (its audit log beside it names it, too).
     if old
         .as_ref()
         .is_some_and(|o| o.vault_id() != head.ctx.vault_id)
