@@ -92,7 +92,7 @@ pub use panic::{
 };
 pub use peer::{
     PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_identity, peer_uid,
-    process_start_time,
+    peer_unchanged, process_start_time,
 };
 pub use perm::{PRIVATE_UMASK, effective_uid, restrict_umask};
 pub use proc::{

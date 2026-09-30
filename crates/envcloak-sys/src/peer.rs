@@ -1,10 +1,18 @@
 //! Who is on the other end of a Unix socket (SPEC §4.2, §4.3).
 //!
 //! - [`peer_identity`]: the daemon's view of a client at accept: its uid,
-//!   pid and start time, read from handles the kernel ties to the process
-//!   that connected.
+//!   pid and start time, read from the kernel's record of the client's end
+//!   of the socket.
 //!   - macOS: the audit token (`LOCAL_PEERTOKEN`), which carries the uid,
-//!     the pid and the pid version of the connecting process.
+//!     the pid and the pid version of the last process to use the client's
+//!     socket (to connect, send or receive on it; the socket's
+//!     `last_pid`), not of the one that connected. A process the
+//!     descriptor passed to (across `fork`, or sent over another socket)
+//!     becomes the peer by using it, and the peer can change after the
+//!     accept: [`peer_unchanged`] reads it again. A descriptor held only
+//!     by a process that never used it, after the one that connected
+//!     exited, names no process: the token cannot be read and the peer is
+//!     refused.
 //!   - Linux 6.5 and later: `SO_PEERCRED` for the uid and pid, and
 //!     `SO_PEERPIDFD`, a pidfd for the connecting process. The pidfd keeps
 //!     the pid from being reused while the process lives, so a start time
@@ -21,6 +29,12 @@
 //!     its `connect` and the daemon's `accept`.
 //!   - macOS reads the start time with `proc_pidinfo` and refuses a
 //!     process that started after the accept, as the Linux fallback does.
+//! - [`peer_unchanged`]: whether the kernel still names the process
+//!   [`peer_identity`] reported. On macOS the daemon asks before each
+//!   request and closes a connection another process is now using. Linux
+//!   keeps the connecting process for the socket's life, whoever holds the
+//!   descriptor; a process it was passed to acts as the one that
+//!   connected, which can do the same itself.
 //! - [`peer_uid`]: the client's view of the server, before it sends
 //!   anything (SPEC §4.2): `getpeereid` on macOS, `SO_PEERCRED` on Linux.
 //! - [`process_start_time`]: when a process started, as the kernel records
@@ -68,8 +82,9 @@ pub enum PeerSource {
     PeerCred,
 }
 
-/// The process that connected to a socket, as the kernel saw it at
-/// `connect`.
+/// The process at the client's end of a socket, as the kernel reported it
+/// when the daemon asked (at accept): on Linux the one that connected, on
+/// macOS the last one to use the socket (see the module documentation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PeerIdentity {
     /// Its effective uid.
@@ -111,6 +126,33 @@ pub fn peer_identity(fd: BorrowedFd<'_>) -> io::Result<PeerIdentity> {
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         let _ = fd;
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Whether the kernel still names `peer` at the other end of the socket
+/// `fd`, as [`peer_identity`] reported it at accept: macOS reads the audit
+/// token again (the last process to use the client's socket) and compares
+/// its uid, pid and pid version; Linux compares `SO_PEERCRED`, which names
+/// the connecting process for the socket's life.
+///
+/// # Errors
+/// When the kernel does not report the peer: its end is closed, or the
+/// last process to use it has exited.
+pub fn peer_unchanged(fd: BorrowedFd<'_>, peer: &PeerIdentity) -> io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        linux::peer_cred(fd).map(|c| c.pid == peer.pid && c.uid == peer.uid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::audit_token(fd).map(|(uid, pid, pidversion)| {
+            pid == peer.pid && uid == peer.uid && Some(pidversion) == peer.pidversion
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = (fd, peer);
         Err(io::ErrorKind::Unsupported.into())
     }
 }
@@ -463,8 +505,9 @@ mod macos {
         Ok(StartTime(micros))
     }
 
-    pub(super) fn peer_identity(fd: BorrowedFd<'_>) -> io::Result<PeerIdentity> {
-        let accepted = wall_micros();
+    /// The uid, pid and pid version in the socket's audit token: the last
+    /// process to use the client's end (see the module documentation).
+    pub(super) fn audit_token(fd: BorrowedFd<'_>) -> io::Result<(u32, i32, i32)> {
         let mut token = AuditToken { val: [0; 8] };
         let mut len = size_of::<AuditToken>() as libc::socklen_t;
         // SAFETY: `token` is writable for `len` bytes; the socket stays
@@ -505,6 +548,12 @@ mod macos {
         if pid <= 0 {
             return Err(peer_gone());
         }
+        Ok((uid, pid, pidversion))
+    }
+
+    pub(super) fn peer_identity(fd: BorrowedFd<'_>) -> io::Result<PeerIdentity> {
+        let accepted = wall_micros();
+        let (uid, pid, pidversion) = audit_token(fd)?;
         let start = start_time(pid)?;
         if start.raw() > accepted.saturating_add(SLACK_MICROS) {
             return Err(peer_gone());

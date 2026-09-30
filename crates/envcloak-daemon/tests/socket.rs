@@ -2,7 +2,7 @@
 //! the socket 0600; a symlinked, foreign-owned, or group- or
 //! world-writable directory is refused; a second instance is refused; a
 //! stale socket is replaced only under the lock; another uid is rejected at
-//! accept.
+//! accept; a connection another process uses after the accept is closed.
 //!
 //! The other-uid checks need a second user and `sudo`: CI creates one on
 //! Linux and names it in `ENVCLOAK_TEST_OTHER_USER`. Elsewhere they say
@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use common::{client, exe, run_paths, start};
 use envcloak_ipc::view::VaultState;
-use envcloak_testkit::{Daemon, TestHome, daemon_run_dir};
+use envcloak_testkit::{Daemon, TEST_PATH, TestHome, daemon_run_dir};
 
 fn mode(p: &Path) -> u32 {
     std::fs::symlink_metadata(p).unwrap().mode() & 0o7777
@@ -175,6 +175,98 @@ fn linux_without_a_runtime_dir_the_daemon_falls_back_and_warns() {
         .status()
         .unwrap();
     assert!(st.daemon.runtime_dir_fallback);
+}
+
+/// A `python3` connector that sends `status` on the daemon's socket
+/// `argv[1]`, then forks a holder of the connection that sends `status`
+/// on it, then sends another itself. Each line it prints is `<who> <pid>
+/// answered <id>`, or `closed` for a request the daemon did not answer.
+const PASSED_ON: &str = r#"import json, os, socket, struct, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(30)
+s.connect(sys.argv[1])
+def ask(i):
+    try:
+        b = json.dumps({'jsonrpc': '2.0', 'id': i, 'method': 'status'}).encode()
+        s.sendall(struct.pack('>I', len(b)) + b)
+        h = s.recv(4, socket.MSG_WAITALL)
+        if len(h) < 4:
+            return 'closed'
+        n = struct.unpack('>I', h)[0]
+        return 'answered %d' % json.loads(s.recv(n, socket.MSG_WAITALL))['id']
+    except OSError:
+        return 'closed'
+print('connector', os.getpid(), ask(1), flush=True)
+pid = os.fork()
+if pid == 0:
+    try:
+        print('holder', os.getpid(), ask(2), flush=True)
+    finally:
+        os._exit(0)
+os.waitpid(pid, 0)
+print('connector', os.getpid(), ask(3), flush=True)
+"#;
+
+/// Review T7 open 1: a connection is served only for the process
+/// identified at accept. The daemon reads the peer again before each
+/// request: on macOS the kernel names the last process to use the
+/// client's socket, so a process the connection was passed to (here
+/// across `fork`) that sends a request is not answered as the connector
+/// (its evidence, its proofs, its place in the per-process count and the
+/// pid in the audit log), and the connection is closed. Linux keeps the
+/// connecting process for the socket's life: the holder acts as the
+/// connector there, as the connector could itself.
+#[test]
+fn a_connection_used_by_another_process_is_closed() {
+    let home = TestHome::new();
+    let d = start(&home);
+    let out = Command::new("python3")
+        .args(["-c", PASSED_ON])
+        .arg(run_paths(&home).socket)
+        .env_clear()
+        .env("PATH", TEST_PATH)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<Vec<&str>> = text
+        .lines()
+        .map(|l| l.split(' ').collect::<Vec<_>>())
+        .collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    let connector = lines[0][1];
+    assert_eq!(
+        lines[0],
+        ["connector", connector, "answered", "1"],
+        "{text}"
+    );
+    assert_eq!(lines[1][0], "holder", "{text}");
+    assert_ne!(lines[1][1], connector, "{text}");
+    let log = d.log();
+    let closed =
+        format!("envcloakd: closed a connection now used by another process than pid {connector},");
+    if cfg!(target_os = "macos") {
+        assert_eq!(lines[1][2..], ["closed"], "{text}");
+        assert_eq!(lines[2], ["connector", connector, "closed"], "{text}");
+        assert!(log.contains(&closed), "{log}");
+    } else {
+        assert_eq!(lines[1][2..], ["answered", "2"], "{text}");
+        assert_eq!(
+            lines[2],
+            ["connector", connector, "answered", "3"],
+            "{text}"
+        );
+        assert!(!log.contains(&closed), "{log}");
+    }
+    // The daemon serves new connections as before.
+    assert_eq!(
+        client(&home).status().unwrap().vault.state,
+        VaultState::Absent
+    );
 }
 
 // ------------------------------------------------ another uid (Linux CI)

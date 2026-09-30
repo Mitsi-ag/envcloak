@@ -20,7 +20,12 @@
 //!   [`MAX_PER_PROCESS`] for any one process;
 //! - one thread per connection: frames of at most 1 MiB, a body that must
 //!   arrive within [`FRAME_DEADLINE`] of its first byte, and an idle limit
-//!   between frames;
+//!   between frames. Before each request the peer is read again
+//!   ([`envcloak_sys::peer_unchanged`]): on macOS the kernel names the
+//!   last process to use the client's socket, so another process sending
+//!   on a descriptor passed to it would otherwise act as the one
+//!   identified at accept (its evidence, grants and proofs); such a
+//!   connection is closed, unanswered;
 //! - a tick every second for the sleep and idle checks, which also run
 //!   before every request; and the signal thread, which locks, removes the
 //!   socket and exits.
@@ -547,6 +552,16 @@ fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
             }
             Err(_) => return,
         };
+        // The process that sent this frame must be the one identified at
+        // accept, for proofs above all (review T7 open 1).
+        if !matches!(envcloak_sys::peer_unchanged(stream.as_fd(), peer), Ok(true)) {
+            log_line!(
+                "envcloakd: closed a connection now used by another process than pid {}, the \
+                 one identified when it was accepted",
+                peer.pid
+            );
+            return;
+        }
         let response = dispatch(&frame, peer, shared);
         drop(frame);
         match response {

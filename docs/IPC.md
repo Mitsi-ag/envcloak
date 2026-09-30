@@ -30,13 +30,15 @@ Start-up errors print `envcloakd: <token>: <message>` and exit 1; usage errors e
 
 ## Peer checks
 
-**Daemon, at accept.** Every connection's peer is identified from kernel handles tied to the process that connected, before any byte is read:
+**Daemon, at accept and before each request.** Every connection's peer is identified from the kernel's record of the client's end of the socket, before any byte is read:
 
 | | uid, pid | start time |
 |---|---|---|
-| macOS | the audit token (`LOCAL_PEERTOKEN`), which also carries the pid version | `proc_pidinfo(PROC_PIDTBSDINFO)`; a process that started after the accept is refused |
+| macOS | the audit token (`LOCAL_PEERTOKEN`), which also carries the pid version. It names the last process to use the client's socket (to connect, send or receive on it), not necessarily the one that connected: a process the descriptor was passed to (across `fork`, or over another socket) becomes the peer by using it, and a descriptor held only by processes that never used it, once the connector exited, names no process and is refused | `proc_pidinfo(PROC_PIDTBSDINFO)`; a process that started after the accept is refused |
 | Linux 6.5+ | `SO_PEERCRED` | `/proc/<pid>/stat`, read while `SO_PEERPIDFD` pins the process: it must still be alive after the read. Whether the kernel has `SO_PEERPIDFD` is found once; on one that has it, a peer it gives no pidfd for (one reaped before the accept gets `EINVAL`) is refused, never checked the way older kernels are |
 | Linux before 6.5 | `SO_PEERCRED` | `/proc/<pid>/stat`; a process that started after the accept is refused. A narrow race remains: the peer exits and its pid is reused between its `connect` and the `accept` |
+
+Before each request, once its frame is read, the daemon reads the peer again (`envcloak_sys::peer_unchanged`). On macOS a request that another process sent on the connection (another pid, or the same pid with another pid version, than at accept) is not answered: the connection is closed and logged. The evidence and proofs of every request (`approve`, `unlock`, `vault.recover`, the item writes, `vault.create`), the per-process count and the pid in the audit log therefore belong to the process identified at accept. The connector itself could make the kernel name it again by using the socket after another process sent, but it could as well have sent that request itself. Linux keeps the connecting process for the socket's life, whoever holds the descriptor: a process it was passed to acts as the connector, which could do the same itself.
 
 A peer running as another uid is closed at once, answered nothing, and audited. At most 32 connections are served at a time, and at most 8 for any one process (by pid), so one process that keeps connections open cannot lock the user's own `envcloak lock` and `status` out; more are closed at once. Many processes together can still fill the 32; the pending-request caps and the denial rules (docs/GRANTS.md "Bounds") limit what an agent can ask for.
 
