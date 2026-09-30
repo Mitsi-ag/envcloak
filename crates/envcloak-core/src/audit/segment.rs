@@ -42,8 +42,8 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
-    Aad, FieldTag, ItemClass, Keyring, Purpose, Sealed, SubKey, TableTag, VaultId, keyed_hash,
-    keyed_hash_parts, keyed_hash_prefixes,
+    Aad, FieldTag, ItemClass, Keyring, Purpose, Sealed, SubKey, TableTag, VaultId,
+    authenticates_at, keyed_hash, keyed_hash_parts, keyed_hash_prefixes,
 };
 use crate::vault::{
     AuditHead, check_private_dir, check_private_file, now_secs, open_record, seal_record, utc_stamp,
@@ -153,6 +153,21 @@ impl LogKeys {
                 })
             },
         )
+    }
+
+    /// Whether entry `seq`'s sealed bytes, starting `body`, open at some
+    /// length in `lens`, whatever the frame says its length is: one pass
+    /// ([`authenticates_at`]), where `take(n)` is asked about each length
+    /// `n` that opens and ends the search with `true`. Nothing is
+    /// decrypted.
+    pub(crate) fn sealed_ends_in(
+        &self,
+        seq: u64,
+        body: &[u8],
+        lens: core::ops::RangeInclusive<usize>,
+        take: impl FnMut(usize) -> bool,
+    ) -> bool {
+        authenticates_at(&self.seal, &self.aad(seq), body, lens, take)
     }
 
     fn header_mac(&self, body: &[u8]) -> [u8; 32] {

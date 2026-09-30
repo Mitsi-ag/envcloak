@@ -41,8 +41,8 @@ use crate::vault::AuditHead;
 use super::AuditError;
 use super::record::AuditRecord;
 use super::segment::{
-    FRAME_HEAD, HEADER_LEN, LogKeys, MAC_LEN, MAX_SEALED, Next, list_segments, next_frame,
-    parse_header, read_segment,
+    FRAME_HEAD, HEADER_LEN, LogKeys, MAC_LEN, MAX_SEALED, MAX_SEGMENT_READ, Next, list_segments,
+    next_frame, parse_header, read_segment,
 };
 
 /// How many sealed bytes the torn-tail check hashes or opens at most: 64
@@ -50,6 +50,14 @@ use super::segment::{
 /// ciphertext a crash leaves frames at about one offset in 65,000, so a
 /// real one needs a small fraction of this.
 const TAIL_CHECK_BUDGET: usize = 64 * MAX_SEALED;
+
+/// The most entries a segment can hold: as many of the smallest frames as
+/// the largest segment read takes. The writer numbers a segment's entries
+/// one after another from its first, so an entry of the segment the walk
+/// is in carries a number less than this past the one it expects,
+/// whichever entries between were deleted.
+const MAX_SEGMENT_ENTRIES: u64 =
+    MAX_SEGMENT_READ / (FRAME_HEAD + Sealed::OVERHEAD + MAC_LEN) as u64;
 
 /// What went wrong at a sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,10 +141,11 @@ pub struct VerifyReport {
     /// are counted as that only when the segment checked out up to them,
     /// the number in their frame head, as far as it is there, is the one
     /// the next entry takes, no whole entry is in them (the expected one
-    /// ending at the end of the file or where the next entry's number
-    /// starts, or any other one further on under the number it carries,
-    /// whatever that is), every offset where one could be was checked
-    /// within a fixed limit, and the saved head does not cover them;
+    /// at any length its chain value checks out or its sealed bytes open,
+    /// unless all that was cut is its chain value, or any other one
+    /// further on under the number it carries, whatever that is), every
+    /// offset where one could be was checked within a fixed limit, and the
+    /// saved head does not cover them;
     /// anything else is flagged as a problem. The writer removes them when
     /// it next opens the log.
     pub torn_tail: bool,
@@ -298,20 +307,29 @@ impl Walker<'_> {
     /// damage, however short.
     ///
     /// A crash leaves part of one frame and nothing after it. So a whole
-    /// entry in `rest` means its bytes were changed: the expected entry
-    /// with its length changed (its chain value checks out where it really
-    /// ends, which every length an entry can have is tried for, or its
-    /// sealed bytes open at the end of the file or where the next entry's
-    /// number starts), or another entry further on that opens under the
-    /// number it carries. Entries, and part of the
-    /// expected one, can have been deleted in between, so neither that
-    /// number nor the expected entry's smallest size says where such an
-    /// entry can start: every offset after the first that frames is tried.
+    /// entry in `rest` means its bytes were changed:
+    /// - the expected entry with its length changed, whose chain value
+    ///   checks out where it really ends (every length an entry can have
+    ///   is tried);
+    /// - the expected entry whose sealed bytes open at some length, its
+    ///   length and chain value changed too, with or without bytes after
+    ///   it (Codex F-46, cycle 150): every length is tried, in one pass.
+    ///   The one such entry a crash leaves is one cut in its chain value:
+    ///   its frame's length is where it opens, and the bytes after it are
+    ///   the start of the chain value the writer computed for it;
+    /// - another entry further on that opens under the number it carries:
+    ///   at every length when that number is one an entry of this segment
+    ///   can carry ([`MAX_SEGMENT_ENTRIES`] past the expected one), its
+    ///   length and chain value changed or not, and at the length its
+    ///   frame says otherwise. Entries, and part of the expected one, can
+    ///   have been deleted in between, so neither that number nor the
+    ///   expected entry's smallest size says where such an entry can
+    ///   start: every offset after the first is tried.
     ///
-    /// Bytes that frame at more offsets than [`TAIL_CHECK_BUDGET`] lets
-    /// the check open (a crash's random ciphertext almost never frames)
-    /// are not a crash's either: they are kept as damage, never removed
-    /// unchecked.
+    /// Bytes that take more work to check than [`TAIL_CHECK_BUDGET`] lets
+    /// the check do (a crash's random ciphertext almost never frames, or
+    /// holds a number so close to the expected one) are not a crash's
+    /// either: they are kept as damage, never removed unchecked.
     fn crash_tail(&self, rest: &[u8]) -> bool {
         let seq = self.expected;
         if self.anchored(seq) {
@@ -322,8 +340,11 @@ impl Walker<'_> {
                 return false;
             }
         }
-        let min = FRAME_HEAD + Sealed::OVERHEAD + MAC_LEN;
-        if rest.len() < min {
+        // The fewest bytes that hold an entry's sealed bytes, and those
+        // with its chain value.
+        let sealed_min = FRAME_HEAD + Sealed::OVERHEAD;
+        let min = sealed_min + MAC_LEN;
+        if rest.len() < sealed_min {
             return true;
         }
         let mut budget = TAIL_CHECK_BUDGET;
@@ -338,35 +359,67 @@ impl Walker<'_> {
         // checks out where it really ends, at any length an entry can have
         // (in one pass: the bytes hashed once, the hash finalized at each
         // length).
-        let longest = (rest.len() - FRAME_HEAD - MAC_LEN).min(MAX_SEALED);
-        if !spend(longest) {
-            return false;
-        }
-        if self.keys.chain_ends_in(
-            &self.h,
-            seq,
-            &rest[FRAME_HEAD..],
-            Sealed::OVERHEAD..=longest,
-        ) {
-            return false;
-        }
-        // Or its sealed bytes open where it ends: at the end of the file,
-        // or where the next entry's number starts.
-        let next = seq.wrapping_add(1).to_be_bytes();
-        let starts =
-            (min..=rest.len() - FRAME_HEAD).filter(|&p| rest[p + 4..p + FRAME_HEAD] == next);
-        for end in std::iter::once(rest.len()).chain(starts) {
-            let sealed = &rest[FRAME_HEAD..end - MAC_LEN];
-            if !spend(sealed.len()) || self.keys.open(seq, sealed).is_some() {
+        if rest.len() >= min {
+            let longest = (rest.len() - FRAME_HEAD - MAC_LEN).min(MAX_SEALED);
+            if !spend(longest) {
+                return false;
+            }
+            if self.keys.chain_ends_in(
+                &self.h,
+                seq,
+                &rest[FRAME_HEAD..],
+                Sealed::OVERHEAD..=longest,
+            ) {
                 return false;
             }
         }
-        // Any other whole frame, at every offset after the first: with
+        // Or its sealed bytes open at some length, whatever its length
+        // and chain value say: a whole entry, unless it is the one a crash
+        // leaves, its chain value cut short.
+        let stored_len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        let body = &rest[FRAME_HEAD..];
+        let longest = body.len().min(MAX_SEALED);
+        if !spend(longest) {
+            return false;
+        }
+        let whole = self
+            .keys
+            .sealed_ends_in(seq, body, Sealed::OVERHEAD..=longest, |n| {
+                let after = &body[n..];
+                let cut = n == stored_len
+                    && after.len() < MAC_LEN
+                    && self.keys.chain(&self.h, seq, &body[..n]).starts_with(after);
+                !cut
+            });
+        if whole {
+            return false;
+        }
+        // Any other whole entry, at every offset after the first: with
         // part of the expected entry deleted, one can start anywhere,
         // inside its frame head too. The first does not frame (the walk
         // found it torn).
-        for p in 1..=rest.len() - min {
-            if let Next::Frame(f) = next_frame(rest, p) {
+        for p in 1..=rest.len() - sealed_min {
+            let n = u64::from_be_bytes([
+                rest[p + 4],
+                rest[p + 5],
+                rest[p + 6],
+                rest[p + 7],
+                rest[p + 8],
+                rest[p + 9],
+                rest[p + 10],
+                rest[p + 11],
+            ]);
+            if n.checked_sub(seq).is_some_and(|d| d <= MAX_SEGMENT_ENTRIES) {
+                let body = &rest[p + FRAME_HEAD..];
+                let longest = body.len().min(MAX_SEALED);
+                if !spend(longest)
+                    || self
+                        .keys
+                        .sealed_ends_in(n, body, Sealed::OVERHEAD..=longest, |_| true)
+                {
+                    return false;
+                }
+            } else if let Next::Frame(f) = next_frame(rest, p) {
                 if !spend(f.sealed.len()) || self.keys.open(f.seq, f.sealed).is_some() {
                     return false;
                 }
