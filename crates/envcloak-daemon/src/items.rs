@@ -23,7 +23,10 @@
 //!   (SPEC §10b). A removal writes an encrypted backup of the vault first,
 //!   which keeps the item's values (`envcloak recover` restores it), then
 //!   deletes the item and ends the grants and pending requests that bind
-//!   it. When the backup cannot be written, nothing is removed.
+//!   it. When the backup cannot be written, nothing is removed. A write
+//!   that passed its proof and then changed nothing (the vault locked
+//!   while Argon2id ran, the backup or the write failed) is audited as
+//!   failed, with that reason, as a wrong passphrase is.
 //! - `items.target` shows what a rotation or removal would change, and is
 //!   served only to a caller that may give a proof, like `pending.get`.
 //!
@@ -503,9 +506,38 @@ impl Write {
     }
 }
 
+/// A proof that passed, for the write it allows: the state lock, held
+/// since the vault came back to its slot, the caller's evidence, and the
+/// target as it was resolved before Argon2id ran (the write resolves it
+/// again under this lock).
+struct Proven<'s> {
+    s: std::sync::MutexGuard<'s, crate::state::State>,
+    caller: SubjectEvidence,
+    target: Target,
+}
+
+impl Proven<'_> {
+    /// Records that the write this proof allowed changed nothing, for
+    /// `e`'s reason (SPEC §3 principle 4: a proof that passed is audited
+    /// whatever follows), and returns `e`.
+    fn aborted(&mut self, peer: &PeerIdentity, write: Write, e: RpcError) -> RpcError {
+        self.s.audit(AuditEvent::ItemWriteFailed {
+            pid: peer.pid,
+            subject: subject_summary(peer, &self.caller),
+            write: write.kind(),
+            item: self.target.item,
+            slug: self.target.slug.clone(),
+            reason: e.reason.unwrap_or_else(|| e.kind.token()),
+        });
+        e
+    }
+}
+
 /// The proof for a rotation or removal (see the module documentation).
-/// On success, returns the caller's evidence with the state lock held and
-/// the vault back in its slot; the target is resolved again then.
+/// On success, returns the [`Proven`] write with the state lock held and
+/// the vault back in its slot. A proof that passes when the vault cannot
+/// come back (a lock arrived while Argon2id ran) is audited as an aborted
+/// write.
 fn prove<'s>(
     shared: &'s Shared,
     peer: &PeerIdentity,
@@ -513,13 +545,7 @@ fn prove<'s>(
     claims: &[String],
     pass: SecretBytes,
     resolve: &dyn Fn(&Vault) -> Result<Target, RpcError>,
-) -> Result<
-    (
-        std::sync::MutexGuard<'s, crate::state::State>,
-        SubjectEvidence,
-    ),
-    RpcError,
-> {
+) -> Result<Proven<'s>, RpcError> {
     refuse_if_traced()?;
     let caller = evidence(shared, peer, claims)?;
     refuse_unless_prover(shared, peer, &caller, write.method())?;
@@ -543,8 +569,15 @@ fn prove<'s>(
     match verified {
         Ok(()) => {
             s.limiter().succeeded();
-            back?;
-            Ok((s, caller))
+            let mut proven = Proven {
+                s,
+                caller,
+                target: t,
+            };
+            match back {
+                Ok(()) => Ok(proven),
+                Err(e) => Err(proven.aborted(peer, write, e)),
+            }
         }
         Err(e) if e.kind() == VaultErrorKind::Crypto(CryptoErrorKind::Unlock) => {
             s.limiter().failed(&now);
@@ -583,21 +616,29 @@ pub fn rotate(
         }
         Ok(t)
     };
-    let (mut s, caller) = prove(shared, peer, Write::Rotate, &p.claims, pass, &resolve)?;
-    let v = s.unlocked_mut()?;
-    let t = resolve(v)?;
-    let (field, name) = t.field.ok_or(RpcError::new(ErrorKind::Internal))?;
+    let mut proven = prove(shared, peer, Write::Rotate, &p.claims, pass, &resolve)?;
     let length = LengthClass::of(value.len());
-    v.transact(|txn| txn.set_value(field, value))
-        .map_err(|e| write_error(&e))?;
-    let prior_count = v
-        .item(t.item)
-        .and_then(|m| m.fields.iter().find(|f| f.id == field))
-        .map(|f| f.prior_count)
-        .ok_or(RpcError::new(ErrorKind::Internal))?;
-    s.audit(AuditEvent::Rotated {
+    let written = (|| {
+        let v = proven.s.unlocked_mut()?;
+        let t = resolve(v)?;
+        let (field, name) = t.field.clone().ok_or(RpcError::new(ErrorKind::Internal))?;
+        v.transact(|txn| txn.set_value(field, value))
+            .map_err(|e| write_error(&e))?;
+        let prior_count = v
+            .item(t.item)
+            .and_then(|m| m.fields.iter().find(|f| f.id == field))
+            .map(|f| f.prior_count)
+            .ok_or(RpcError::new(ErrorKind::Internal))?;
+        Ok((t, name, prior_count))
+    })();
+    let (t, name, prior_count) = match written {
+        Ok(w) => w,
+        Err(e) => return Err(proven.aborted(peer, Write::Rotate, e)),
+    };
+    let subject = subject_summary(peer, &proven.caller);
+    proven.s.audit(AuditEvent::Rotated {
         pid: peer.pid,
-        subject: subject_summary(peer, &caller),
+        subject,
         item: t.item,
         slug: t.slug.clone(),
         prior_count,
@@ -618,23 +659,32 @@ pub fn remove(
 ) -> Result<RemovedView, RpcError> {
     let pass = p.passphrase.into_inner();
     let resolve = |v: &Vault| target(v, &p.slug, None, Some(&p.item));
-    let (mut s, caller) = prove(shared, peer, Write::Remove, &p.claims, pass, &resolve)?;
-    let v = s.unlocked_mut()?;
-    let t = resolve(v)?;
-    // The backup keeps the item's values; without it nothing is removed.
-    let backup = v.create_backup().map_err(|e| {
-        log_line!(
-            "envcloakd: the backup before a removal could not be written ({}); nothing was removed",
-            vault_reason(e.kind())
-        );
-        RpcError::new(ErrorKind::BackupFailed)
-    })?;
-    v.transact(|txn| txn.delete_item(t.item))
-        .map_err(|e| write_error(&e))?;
-    let grants = s.grants().on_item_removed(t.item);
-    s.audit(AuditEvent::Removed {
+    let mut proven = prove(shared, peer, Write::Remove, &p.claims, pass, &resolve)?;
+    let written = (|| {
+        let v = proven.s.unlocked_mut()?;
+        let t = resolve(v)?;
+        // The backup keeps the item's values; without it nothing is removed.
+        let backup = v.create_backup().map_err(|e| {
+            log_line!(
+                "envcloakd: the backup before a removal could not be written ({}); nothing was \
+                 removed",
+                vault_reason(e.kind())
+            );
+            RpcError::new(ErrorKind::BackupFailed)
+        })?;
+        v.transact(|txn| txn.delete_item(t.item))
+            .map_err(|e| write_error(&e))?;
+        Ok((t, backup))
+    })();
+    let (t, backup) = match written {
+        Ok(w) => w,
+        Err(e) => return Err(proven.aborted(peer, Write::Remove, e)),
+    };
+    let grants = proven.s.grants().on_item_removed(t.item);
+    let subject = subject_summary(peer, &proven.caller);
+    proven.s.audit(AuditEvent::Removed {
         pid: peer.pid,
-        subject: subject_summary(peer, &caller),
+        subject,
         item: t.item,
         slug: t.slug.clone(),
         grants,

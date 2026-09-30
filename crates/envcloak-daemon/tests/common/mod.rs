@@ -210,3 +210,48 @@ pub fn project(home: &TestHome, name: &str, manifest: &str) -> std::path::PathBu
     std::fs::write(&path, manifest).unwrap();
     path
 }
+
+/// Every sealed field value in `home`'s vault file, in the order the
+/// items were seeded ([`SLUGS`]). Read before the daemon opens the file,
+/// which it then holds exclusively.
+pub fn sealed_values(home: &TestHome) -> Vec<Vec<u8>> {
+    let raw = rusqlite::Connection::open(VaultPaths::under(data_dir(home)).db).unwrap();
+    let sealed = raw
+        .prepare("SELECT sealed_value FROM fields ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(raw);
+    sealed
+}
+
+/// Flips one ciphertext bit (past the 24-byte nonce) in each of `sealed`
+/// wherever it is stored: the vault file and its write-ahead log. Returns
+/// how many values it found at least once.
+pub fn flip_sealed_values(db: &std::path::Path, sealed: &[Vec<u8>]) -> usize {
+    use std::os::unix::fs::FileExt;
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let mut found = vec![false; sealed.len()];
+    for path in [db.to_path_buf(), std::path::PathBuf::from(wal)] {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        for (i, s) in sealed.iter().enumerate() {
+            for (at, _) in bytes
+                .windows(s.len())
+                .enumerate()
+                .filter(|(_, w)| *w == s.as_slice())
+            {
+                let at = at + 30;
+                file.write_at(&[bytes[at] ^ 0x10], at as u64).unwrap();
+                found[i] = true;
+            }
+        }
+        file.sync_all().unwrap();
+    }
+    found.iter().filter(|f| **f).count()
+}

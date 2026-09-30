@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use common::{MANIFEST, SLUGS, client, data_dir, passphrase, project, seed_vault, start};
 use envcloak_core::audit::{AuditEntry, AuditKind};
-use envcloak_core::vault::{LockedVault, Slug, Vault, VaultPaths};
+use envcloak_core::vault::{ItemId, LockedVault, Slug, Vault, VaultPaths};
 use envcloak_core::{RecoveryKit, SecretBytes, restore_backup};
 use envcloak_ipc::proto::{AddParams, ErrorKind, RunRequestParams};
 use envcloak_ipc::view::{ClassificationView, DecisionView, LengthClass, RefStatus, TargetView};
@@ -162,6 +162,14 @@ fn sweep_entries(entries: &[AuditEntry], cs: &[Canary]) {
     for e in entries {
         assert_no_canary(format!("{:?}", e.record).as_bytes(), cs);
     }
+}
+
+/// An entry's items as (id, slug) text.
+fn named(items: &[(ItemId, Slug)]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|(id, slug)| (id.to_string(), slug.as_str().to_owned()))
+        .collect()
 }
 
 fn json(v: &impl envcloak_ipc::view::View) -> Vec<u8> {
@@ -573,12 +581,33 @@ fn remove_removes_nothing_when_the_backup_cannot_be_written() {
 
     let v = f.stop_and_open();
     let (entries, _) = v.read_audit().unwrap();
-    let removals: Vec<&str> = entries
+    // Review T11 open 3: the proof passed and nothing was removed, so the
+    // first try is recorded as a failed removal with the backup's reason
+    // (never a wrong passphrase), naming the item; only the second
+    // removed it.
+    let removals: Vec<(&str, Option<&str>)> = entries
         .iter()
         .filter(|e| e.record.kind == AuditKind::Remove)
-        .map(|e| e.record.decision.outcome.as_str())
+        .map(|e| {
+            (
+                e.record.decision.outcome.as_str(),
+                e.record.decision.reason.as_deref(),
+            )
+        })
         .collect();
-    assert_eq!(removals, ["removed"]);
+    assert_eq!(
+        removals,
+        [("failed", Some("backup_failed")), ("removed", None)]
+    );
+    let failed = entries
+        .iter()
+        .find(|e| e.record.kind == AuditKind::Remove)
+        .unwrap();
+    assert_eq!(
+        named(&failed.record.items),
+        [(target.item.id.clone(), "openai/acme-web".to_owned())]
+    );
+    assert_eq!(failed.record.subject.kind.as_deref(), Some("terminal"));
     sweep_entries(&entries, &f.cs);
     drop(v);
     f.sweep();
@@ -720,5 +749,83 @@ fn check_reports_each_binding_and_hides_value_shaped_ones() {
         rpc(c.items_check(None, &refs).unwrap_err()),
         (ErrorKind::VaultLocked, None)
     );
+    f.sweep();
+}
+
+/// Review T11 open 3: a rotation whose proof passed and whose write then
+/// failed (here the item's row was changed on disk while the daemon had
+/// the vault open, which the write finds) is audited as a failed rotation
+/// with the vault's reason, never as a wrong passphrase, and nothing was
+/// rotated. The daemon's log says so too.
+#[test]
+fn a_rotation_that_proved_and_wrote_nothing_is_audited() {
+    common::terminal_session();
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let kit = seed_vault(&home, &cs);
+    let mut cs = cs;
+    cs.push(kit.clone());
+    let sealed = common::sealed_values(&home);
+    let mut f = Fixture {
+        d: start(&home),
+        cs,
+        kit,
+        manifest: String::new(),
+        home,
+    };
+    client(&f.home).unlock(f.pass(), &[]).unwrap();
+    let target = f.target("openai/acme-web");
+
+    // The OpenAI item's sealed value, one bit flipped in the file; a write
+    // transaction (adding an item) drops the pages SQLite cached, so the
+    // rotation's read of the old value meets the change.
+    let db = VaultPaths::under(data_dir(&f.home)).db;
+    assert_eq!(common::flip_sealed_values(&db, &sealed[0..1]), 1);
+    let mut c = client(&f.home);
+    c.items_add(&f.add_params(f.value(labels::OPENAI_API_KEY_ROTATED)))
+        .unwrap();
+    let e = c
+        .items_rotate(
+            &target,
+            f.value(labels::OPENAI_API_KEY_ROTATED),
+            f.pass(),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(rpc(e), (ErrorKind::VaultTampered, None));
+    assert_eq!(c.status().unwrap().approvals.proof_failures, 0);
+    drop(c);
+    let log = f.d.log();
+    assert!(
+        log.contains(&format!(
+            "envcloakd: audit: rotate failed reason=vault_tampered id={}",
+            target.item.id
+        )),
+        "{log}"
+    );
+
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let rotations: Vec<(&str, Option<&str>)> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::Rotate)
+        .map(|e| {
+            (
+                e.record.decision.outcome.as_str(),
+                e.record.decision.reason.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(rotations, [("failed", Some("vault_tampered"))]);
+    let failed = entries
+        .iter()
+        .find(|e| e.record.kind == AuditKind::Rotate)
+        .unwrap();
+    assert_eq!(
+        named(&failed.record.items),
+        [(target.item.id.clone(), "openai/acme-web".to_owned())]
+    );
+    sweep_entries(&entries, &f.cs);
+    drop(v);
     f.sweep();
 }
