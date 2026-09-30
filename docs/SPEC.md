@@ -710,7 +710,7 @@ Grant {
 1. G is not expired, revoked or used up.
 2. The vault is unlocked at G's epoch.
 3. R's kernel-verified ancestry contains G's root instance, with both pid and start time matching. A recycled pid never matches.
-4. Agent barrier: no known agent sits strictly between G's root and the caller, unless the root is that agent. A grant approved for a terminal subject covers only terminal subjects. A root above the caller's session is an agent the builtin catalog recognizes by its executable path or code signature, or a process that is no agent and is not in pid 1's session: a grant rooted at a GUI app or `launchd` job covers only callers in pid 1's session.
+4. Agent barrier: no known agent sits strictly between G's root and the caller, unless the root is that agent. A grant approved for a terminal subject covers only terminal subjects. A root above the caller's session is an agent the builtin catalog recognizes by its executable path or code signature; any other root covers only callers in its own session, on every system: a grant rooted at a GUI app, a desktop shell, a `launchd` job or a `tmux` server never covers the sessions it starts.
 5. R's canonical project directory, and its device and inode, equal G's.
 6. R's bindings are a subset of G's bindings, compared by (env_name, item_id, field).
 7. R's effective mode is at least as strict as G's.

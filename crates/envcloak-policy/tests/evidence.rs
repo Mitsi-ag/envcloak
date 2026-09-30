@@ -452,10 +452,17 @@ fn a_root_in_pid_1s_session_covers_no_other_session() {
         // Its own grant covers it.
         assert!(e.covered_by(&e.root(), SubjectKind::Unknown));
     }
-    // A root above the session outside pid 1's session still covers:
-    // `login` (60, a session of its own) over the shell's session.
+    // A process above the session outside pid 1's session covers no more
+    // (review T8 open 1): `login` (60, a session of its own) over the
+    // shell's session.
     let e = ev(terminal_chain(None), true, &[]);
-    assert!(e.covered_by(&e.chain()[3].instance, SubjectKind::Unknown));
+    for kind in [
+        SubjectKind::Agent,
+        SubjectKind::Unknown,
+        SubjectKind::Terminal,
+    ] {
+        assert!(!e.covered_by(&e.chain()[3].instance, kind), "{kind:?}");
+    }
     // So does a builtin agent in pid 1's session, known by its
     // executable: it runs each command in a session of its own.
     let e = ev(
@@ -469,6 +476,171 @@ fn a_root_in_pid_1s_session_covers_no_other_session() {
     );
     assert_eq!(e.root().pid, 70);
     assert!(e.covered_by(&e.root(), SubjectKind::Agent));
+}
+
+/// Review T8 open 1: a root above the caller's session that is no agent
+/// was kept from covering sibling sessions only in session 1, where
+/// macOS runs GUI apps; on Linux only pid 1 has session 1
+/// (systemd gives each unit a session of its own), and a `tmux` server
+/// leads a session of its own on both systems. So an IDE's grant, rooted
+/// at the desktop shell leading its session, and a `tmux` server's own
+/// job's grant covered every terminal below them. Coverage is the same on
+/// every system: only a builtin agent known by its executable roots above
+/// a session, and any other root covers its own session run.
+#[test]
+fn a_root_above_the_session_covers_no_other_session_on_any_system() {
+    let kinds = [
+        SubjectKind::Agent,
+        SubjectKind::Unknown,
+        SubjectKind::Terminal,
+    ];
+    // Linux: extension host (90) <- IDE (50) <- gnome-shell (40, leading
+    // the desktop session, not pid 1) <- systemd --user (30) <- systemd.
+    let helper = ev(
+        vec![
+            p(90, 40, None),
+            p(50, 40, None),
+            p(40, 40, None),
+            p(30, 30, None),
+            p(1, 1, None),
+        ],
+        false,
+        &[],
+    );
+    assert_eq!(helper.session_leader().unwrap().pid, 40);
+    let desktop = helper.root();
+    assert_eq!(desktop.pid, 40);
+    assert!(helper.covered_by(&desktop, SubjectKind::Unknown));
+    // Another of the IDE's processes in that session is covered.
+    let sibling = ev(
+        vec![
+            p(85, 40, None),
+            p(50, 40, None),
+            p(40, 40, None),
+            p(30, 30, None),
+            p(1, 1, None),
+        ],
+        false,
+        &[],
+    );
+    assert!(sibling.covered_by(&desktop, SubjectKind::Unknown));
+    // The IDE's integrated terminal: bash (96) leads a session of its own
+    // under the pty host (60); and a command an unknown agent (70) in the
+    // IDE runs in a session of its own.
+    let terminal = ev(
+        vec![
+            p(97, 96, None),
+            p(96, 96, None),
+            p(60, 40, None),
+            p(50, 40, None),
+            p(40, 40, None),
+            p(30, 30, None),
+            p(1, 1, None),
+        ],
+        true,
+        &[],
+    );
+    assert_eq!(terminal.kind(), SubjectKind::Terminal);
+    let command = ev(
+        vec![
+            p(98, 98, None),
+            p(70, 40, None),
+            p(50, 40, None),
+            p(40, 40, None),
+            p(30, 30, None),
+            p(1, 1, None),
+        ],
+        false,
+        &[],
+    );
+    for e in [&terminal, &command] {
+        for kind in kinds {
+            assert!(!e.covered_by(&desktop, kind), "{kind:?}");
+            for above in &e.chain()[2..e.chain().len() - 1] {
+                assert!(!e.covered_by(&above.instance, kind), "{kind:?}");
+            }
+        }
+        assert!(e.covered_by(&e.root(), SubjectKind::Unknown));
+    }
+
+    // tmux on either system: a job the server runs itself (`run-shell`,
+    // 61, in the server's session without a terminal) is rooted at the
+    // server (60, leading its own session); a pane's shell (96) leads a
+    // session of its own under it.
+    for above_server in [vec![p(1, 1, None)], vec![p(30, 30, None), p(1, 1, None)]] {
+        let chain = |caller: Vec<Ancestor>| {
+            let mut c = caller;
+            c.push(p(60, 60, None));
+            c.extend(above_server.iter().cloned());
+            c
+        };
+        let job = ev(chain(vec![p(61, 60, None)]), false, &[]);
+        let server = job.root();
+        assert_eq!(server.pid, 60);
+        assert!(job.covered_by(&server, SubjectKind::Unknown));
+        let pane = ev(chain(vec![p(97, 96, None), p(96, 96, None)]), true, &[]);
+        assert_eq!(pane.kind(), SubjectKind::Terminal);
+        for kind in kinds {
+            assert!(!pane.covered_by(&server, kind), "{kind:?}");
+        }
+        assert!(pane.covered_by(&pane.root(), SubjectKind::Terminal));
+    }
+
+    // Ordinary chains are still covered by their own grants. A second
+    // command in a Terminal.app shell (macOS), and over ssh: bash (70)
+    // leads the session under the connection's sshd (60) and the
+    // listener (50).
+    let first = ev(terminal_chain(None), true, &[]);
+    assert_eq!(first.root().pid, 70);
+    let again = ev(
+        vec![
+            p(95, 70, None),
+            p(70, 70, None),
+            p(60, 60, None),
+            p(50, 1, None),
+            p(1, 1, None),
+        ],
+        true,
+        &[],
+    );
+    assert!(again.covered_by(&first.root(), SubjectKind::Terminal));
+    let ssh = |caller: i32| {
+        ev(
+            vec![
+                p(caller, 70, None),
+                p(80, 70, None),
+                p(70, 70, None),
+                p(60, 60, None),
+                p(50, 50, None),
+                p(1, 1, None),
+            ],
+            true,
+            &[],
+        )
+    };
+    let (a, b) = (ssh(90), ssh(91));
+    assert_eq!((a.kind(), a.root().pid), (SubjectKind::Terminal, 70));
+    assert!(b.covered_by(&a.root(), SubjectKind::Terminal));
+    // A builtin agent known by its executable still roots above the
+    // session, in the desktop's session on Linux as in pid 1's on macOS:
+    // it runs each command in a session of its own.
+    for agent_sid in [40, 1] {
+        let run = |caller: i32| {
+            ev(
+                vec![
+                    p(caller, caller, None),
+                    p(70, agent_sid, builtin("claude-code")),
+                    p(40, 40, None),
+                    p(1, 1, None),
+                ],
+                false,
+                &[],
+            )
+        };
+        let (a, b) = (run(98), run(99));
+        assert_eq!(a.root().pid, 70);
+        assert!(b.covered_by(&a.root(), SubjectKind::Agent), "{agent_sid}");
+    }
 }
 
 /// Review note: `==` and `Hash` are the per-root key. The executable's
