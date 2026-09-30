@@ -11,7 +11,8 @@
 //!
 //! Rejections ([`PassphraseRejected`]) carry no part of the passphrase.
 //! Suggested passphrases are built in a [`Zeroizing`] string of exact
-//! capacity. This file is on security/expose-allowlist.txt: it reads a
+//! capacity, from words read out of the list by index, which takes the
+//! same time whichever words are drawn. This file is on security/expose-allowlist.txt: it reads a
 //! passphrase to check it.
 
 use secrecy::ExposeSecret;

@@ -10,9 +10,15 @@ pub(crate) use eff_large::EFF_LARGE;
 /// The number of words in [`EFF_LARGE`].
 pub(crate) const EFF_WORDS: usize = 7776;
 
-/// The `i`th word of the EFF list, `i` below [`EFF_WORDS`].
+/// The `i`th word of the EFF list, `i` below [`EFF_WORDS`]. The index is
+/// secret when it picks a word of a suggested passphrase, so the list is an
+/// array read at `i`, which takes the same time whatever `i` is (scanning
+/// a text for its `i`th line takes time in proportion to `i`). The typed
+/// binding fails to build unless the generated list is an array of
+/// [`EFF_WORDS`] words.
 pub(crate) fn eff_word(i: usize) -> Option<&'static str> {
-    EFF_LARGE.lines().nth(i)
+    let words: &'static [&'static str; EFF_WORDS] = &EFF_LARGE;
+    words.get(i).copied()
 }
 
 #[cfg(test)]
@@ -21,11 +27,19 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     /// The compiled list is the upstream file word for word: rebuilding the
-    /// file, dice numbers included, gives the digest the generator checked.
+    /// file from the array, one line per entry with its dice numbers, gives
+    /// the digest the generator checked. So entry `n` is the upstream
+    /// file's line `n`.
     #[test]
     fn the_eff_list_is_the_upstream_file() {
-        let words: Vec<&str> = EFF_LARGE.lines().collect();
+        let words: &[&str] = &EFF_LARGE;
         assert_eq!(words.len(), EFF_WORDS);
+        for w in words {
+            assert!(
+                !w.is_empty() && !w.contains(['\n', '\t']),
+                "one word per line"
+            );
+        }
         let mut h = Sha256::new();
         for (n, w) in words.iter().enumerate() {
             let dice: String = (0..5)
@@ -40,9 +54,19 @@ mod tests {
         );
         let distinct: std::collections::BTreeSet<&str> = words.iter().copied().collect();
         assert_eq!(distinct.len(), EFF_WORDS);
+    }
+
+    /// `eff_word(i)` is entry `i` of the array for every index, and nothing
+    /// past the end.
+    #[test]
+    fn eff_word_reads_the_array_at_the_index() {
+        for (i, w) in EFF_LARGE.iter().enumerate() {
+            assert_eq!(eff_word(i), Some(*w), "{i}");
+        }
         assert_eq!(eff_word(0), Some("abacus"));
         assert_eq!(eff_word(EFF_WORDS - 1), Some("zoom"));
         assert_eq!(eff_word(EFF_WORDS), None);
+        assert_eq!(eff_word(usize::MAX), None);
     }
 
     #[test]
