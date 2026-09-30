@@ -39,6 +39,9 @@
 //! another valid state of the same vault (a WAL it wrote, replayed onto the
 //! installed file) is refused too.
 //!
+//! A backup restores only its own vault: a vault in place whose id is not
+//! the backup's is refused before anything is written.
+//!
 //! Restore takes the vault's lock through [`LockedVault::open`], so it
 //! fails with [`VaultErrorKind::Busy`] while the vault is open. It takes no
 //! lock when there is no vault, and it releases the old vault's lock before
@@ -227,6 +230,8 @@ impl Vault {
 /// - the file is not a backup, or was altered, truncated or extended
 ///   ([`VaultErrorKind::BackupDamaged`]), or its vault does not verify
 ///   ([`VaultErrorKind::Tampered`]);
+/// - a vault is in place and the backup is of another vault
+///   ([`VaultErrorKind::BackupOfAnotherVault`]);
 /// - the current vault is open ([`VaultErrorKind::Busy`]);
 /// - the current vault's WAL could not be folded into it as it closed
 ///   ([`VaultErrorKind::Storage`]): moving that WAL aside would separate
@@ -331,6 +336,14 @@ fn restore(
     } else {
         None
     };
+    // A backup restores its own vault only: another vault in place is
+    // left as it is (its audit log beside it names it, too).
+    if old
+        .as_ref()
+        .is_some_and(|o| o.vault_id() != head.ctx.vault_id)
+    {
+        return Err(VaultErrorKind::BackupOfAnotherVault.into());
+    }
     observe(RestoreStep::OldVaultOpened);
 
     let dir = std::fs::canonicalize(&p.vault_dir)?;

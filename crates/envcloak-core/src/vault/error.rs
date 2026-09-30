@@ -75,6 +75,9 @@ pub enum VaultErrorKind {
     /// EnvCloak vault backup. (A wrong Recovery Kit is
     /// [`CryptoErrorKind::Unlock`].)
     BackupDamaged,
+    /// A restore found a vault in place whose id is not the backup's: a
+    /// backup restores only its own vault. Nothing was changed.
+    BackupOfAnotherVault,
     /// A restore installed the backup as `vault.db`, but the installed
     /// vault then failed to open or verify, or verified as another state
     /// than the one the restore prepared: something changed the vault
@@ -133,6 +136,9 @@ impl VaultErrorKind {
             VaultErrorKind::NoRecoveryKit => "the vault has no Recovery Kit unlocker",
             VaultErrorKind::BackupDamaged => {
                 "the backup file is damaged or truncated, or is not an EnvCloak vault backup"
+            }
+            VaultErrorKind::BackupOfAnotherVault => {
+                "the backup is of another vault than the one at this location"
             }
             VaultErrorKind::RestoreUnverified => {
                 "the backup was installed as the vault, but the installed vault did not open or verify as the restored one"
@@ -234,6 +240,7 @@ mod tests {
             VaultErrorKind::Passphrase(PassphraseRejected::Common),
             VaultErrorKind::NoRecoveryKit,
             VaultErrorKind::BackupDamaged,
+            VaultErrorKind::BackupOfAnotherVault,
             VaultErrorKind::RestoreUnverified,
         ] {
             let e = VaultError::from(k);

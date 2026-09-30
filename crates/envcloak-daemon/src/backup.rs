@@ -13,15 +13,17 @@
 //!   must be a terminal subject with no agent by any evidence, and the
 //!   attempt limiter must admit the attempt. Everything that needs no key
 //!   is checked first: the kit's shape, the new passphrase's rules, and
-//!   that the backup is a regular file at an absolute path, not reached
-//!   through a symlink. Then the vault file is closed so the restore can
-//!   take its lock; a vault that was unlocked is locked first, which ends
-//!   every grant and pending request and saves the audit log's head. The
-//!   restore runs outside the state lock, under the proof gate (Argon2id
-//!   runs twice: for the kit, and for the new passphrase). It leaves the
-//!   old vault or the restored one in place, never neither. A wrong kit is
-//!   counted and audited as a failed proof (kind `recover`); whatever the
-//!   outcome, the slot then holds what is on disk.
+//!   that the backup is a regular file at an absolute path whose last
+//!   component is not a symlink. Then the vault file is closed so the
+//!   restore can take its lock; a vault that was unlocked is locked first,
+//!   which ends every grant and pending request and saves the audit log's
+//!   head. The restore runs outside the state lock, under the proof gate
+//!   (Argon2id runs twice: for the kit, and for the new passphrase). It
+//!   leaves the old vault or the restored one in place, never neither, and
+//!   refuses a backup of another vault than the one in place
+//!   (`backup_unusable`) before it moves anything. A wrong kit is counted
+//!   and audited as a failed proof (kind `recover`); whatever the outcome,
+//!   the slot then holds what is on disk.
 
 use std::path::Path;
 
@@ -93,9 +95,10 @@ pub fn recover(
     refuse_if_traced()?;
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "vault.recover")?;
-    // Checked before the vault is touched; the restore opens the file
-    // again without following a symlink, and refuses anything but a
-    // regular file, so a swap after this check gains nothing.
+    // Checked before the vault is touched: the last component only. The
+    // restore opens the file again without following a symlink there, and
+    // refuses anything but a regular file, so a swap after this check
+    // gains nothing.
     if !std::fs::symlink_metadata(backup).is_ok_and(|m| m.file_type().is_file()) {
         return Err(RpcError::new(ErrorKind::BackupUnusable));
     }
@@ -160,9 +163,10 @@ pub fn recover_error(k: VaultErrorKind) -> RpcError {
             RpcError::new(ErrorKind::WrongPassphrase)
         }
         VaultErrorKind::Passphrase(r) => passphrase_error(r),
-        VaultErrorKind::BackupDamaged | VaultErrorKind::Tampered | VaultErrorKind::NotFound => {
-            RpcError::new(ErrorKind::BackupUnusable)
-        }
+        VaultErrorKind::BackupDamaged
+        | VaultErrorKind::BackupOfAnotherVault
+        | VaultErrorKind::Tampered
+        | VaultErrorKind::NotFound => RpcError::new(ErrorKind::BackupUnusable),
         VaultErrorKind::Busy => RpcError::new(ErrorKind::Busy),
         k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
     }
@@ -195,6 +199,10 @@ mod tests {
             ErrorKind::BackupUnusable
         );
         assert_eq!(kind(VaultErrorKind::Tampered), ErrorKind::BackupUnusable);
+        assert_eq!(
+            kind(VaultErrorKind::BackupOfAnotherVault),
+            ErrorKind::BackupUnusable
+        );
         assert_eq!(kind(VaultErrorKind::NotFound), ErrorKind::BackupUnusable);
         assert_eq!(kind(VaultErrorKind::Busy), ErrorKind::Busy);
         assert_eq!(

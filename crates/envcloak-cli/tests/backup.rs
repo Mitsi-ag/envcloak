@@ -5,7 +5,8 @@
 //! - the Recovery Kit is a proof: without a terminal session it is refused
 //!   before the vault is touched; a wrong kit is refused and counted; a
 //!   file that is not a backup (missing, a symlink, altered) is refused,
-//!   and each leaves the vault it had;
+//!   and so is another vault's backup with its own kit, and each leaves
+//!   the vault it had;
 //! - after the vault directory is lost, `recover` puts the backed-up vault
 //!   back, unlocked, under the new passphrase: its items are there, the
 //!   old passphrase no longer opens it and the new one does.
@@ -322,6 +323,39 @@ fn backup_then_recover_after_the_vault_is_lost() {
         "{log}"
     );
     s.sweep();
+}
+
+/// Review T14 open 1: a valid backup of another vault, with that vault's
+/// own kit, is refused as `backup_unusable` while a vault is in place,
+/// before anything is moved: the vault it had is there, locked, opens with
+/// its own passphrase and holds its item, and nothing was set aside.
+#[test]
+fn recover_refuses_a_backup_of_another_vault() {
+    let s = Setup::new();
+    let t = Setup::new();
+    let b = t.json(&["backup", "create", "--json"]);
+    let other = PathBuf::from(b["path"].as_str().unwrap());
+
+    let out = s.recover(&other, &t.kit);
+    t.clean(&out);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(token(&out), "backup_unusable", "{}", stderr(&out));
+    assert_eq!(s.state(), "locked");
+    let names: Vec<String> = std::fs::read_dir(data_dir(&s.home).join("vault"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.starts_with("replaced-")),
+        "{names:?}"
+    );
+    s.ok(&s.person(&["unlock", "--passphrase-fd", "3"], &[(3, &s.pass, true)]));
+    assert_eq!(s.slugs(), ["openai/acme-web"]);
+    let (s_log, t_log) = (s.d.log_bytes(), t.d.log_bytes());
+    assert_no_canary(&s_log, &t.cs);
+    assert_no_canary(&t_log, &s.cs);
+    s.sweep();
+    t.sweep();
 }
 
 #[test]

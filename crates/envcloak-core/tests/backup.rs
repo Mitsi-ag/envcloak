@@ -11,10 +11,11 @@
 //!   uses the current default parameters (gate 3);
 //! - a restore hands back only the state it prepared: one that finds
 //!   another state installed, valid or not, fails;
-//! - a restore refuses an open vault, a weak new passphrase, and a backup
-//!   path that is a symlink, a FIFO or a directory; it moves aside a file
-//!   that is not a vault or is a damaged one, and never a WAL away from the
-//!   vault it belongs to.
+//! - a restore refuses an open vault, a weak new passphrase, a backup path
+//!   that is a symlink, a FIFO or a directory, and a backup of another
+//!   vault than the one in place; it moves aside a file that is not a vault
+//!   or is a damaged one, and never a WAL away from the vault it belongs
+//!   to.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -690,6 +691,39 @@ fn a_restore_never_sets_a_wal_aside_from_its_vault() {
     assert_eq!(v.items(), &latest[..], "the kept file alone holds them");
     drop(v);
     f.home.assert_clean(&f.cs);
+}
+
+/// Review T14 open 1: a backup restores only its own vault. Over a vault
+/// with another id, a valid backup that opens with its own kit is refused
+/// before anything is written or moved, and the vault in place is as it
+/// was. Where no vault exists (story S11) the same backup restores.
+#[test]
+fn a_backup_of_another_vault_is_refused_over_a_vault() {
+    let (f, v) = KitFixture::create();
+    let items: Vec<ItemMeta> = v.items().to_vec();
+    drop(v);
+    let (g, w) = KitFixture::create();
+    let other = w.create_backup().unwrap();
+    let other_id = w.vault_id();
+    drop(w);
+    let before = std::fs::read(f.db()).unwrap();
+
+    let e = restore_backup(&f.paths, &other.path, &g.kit(), &other_passphrase(8)).unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::BackupOfAnotherVault);
+    assert_eq!(dir_names(&f.paths.vault_dir), ["vault.db"]);
+    assert_eq!(std::fs::read(f.db()).unwrap(), before);
+    let v = f.unlock();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items(), &items[..]);
+    assert_holds_canaries(&v, &f.cs);
+    drop(v);
+
+    std::fs::remove_file(f.db()).unwrap();
+    let (v, report) =
+        restore_backup(&f.paths, &other.path, &g.kit(), &other_passphrase(8)).unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.vault_id(), other_id);
+    assert!(report.replaced.is_empty());
 }
 
 /// Opens the vault with `pass`: Ok, or the generic unlock error.
