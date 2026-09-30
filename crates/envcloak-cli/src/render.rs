@@ -121,14 +121,14 @@ impl serde_json::ser::Formatter for TerminalSafe {
             if !display_escaped(c) {
                 continue;
             }
-            w.write_all(fragment[start..i].as_bytes())?;
+            w.write_all(&fragment.as_bytes()[start..i])?;
             let mut units = [0u16; 2];
             for u in c.encode_utf16(&mut units) {
                 write!(w, "\\u{u:04x}")?;
             }
             start = i + c.len_utf8();
         }
-        w.write_all(fragment[start..].as_bytes())
+        w.write_all(&fragment.as_bytes()[start..])
     }
 }
 
