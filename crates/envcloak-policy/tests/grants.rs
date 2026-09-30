@@ -473,6 +473,73 @@ fn approval_options_are_bounded() {
     assert_eq!(e, ApproveError::TooManyGrants);
 }
 
+/// Review T9 open 1: agent markers set in a person's shell (claims only,
+/// `CLAUDECODE=1`) made the subject an agent rooted at the session
+/// leader, so its approval could run 24 hours instead of 12. The agent
+/// bound needs the root to be a known agent process: the terminal chain
+/// with a claim is refused 24 hours (`ttl_too_long`) and given 12, and so
+/// is a caller whose only agent says so about itself above its session;
+/// a grant rooted at a known agent still gets 24 hours.
+#[test]
+fn only_a_grant_rooted_at_a_known_agent_gets_the_agent_bound() {
+    let it = items();
+    let now = now_at(0);
+    let shell = |claims: &[&str]| {
+        ev(
+            vec![
+                p(90, 70, None),
+                p(70, 70, None),
+                p(60, 60, None),
+                p(50, 1, None),
+                p(1, 1, None),
+            ],
+            true,
+            claims,
+        )
+    };
+    let claimed = shell(&["CLAUDECODE"]);
+    assert_eq!(claimed.kind(), SubjectKind::Agent);
+    assert_eq!(claimed.root().pid, 70);
+    // An agent known only by what it says about itself, above the
+    // caller's session: an agent subject, rooted at the session leader.
+    let asserted = {
+        let mut chain = vec![
+            p(95, 95, None),
+            p(80, 70, None),
+            p(70, 70, None),
+            p(1, 1, None),
+        ];
+        chain[1].agent = Some(AgentLabel {
+            basis: MatchBasis::Asserted,
+            ..label("claude-code")
+        });
+        ev(chain, false, &[])
+    };
+    assert_eq!(asserted.kind(), SubjectKind::Agent);
+    assert_eq!(asserted.root().pid, 95);
+    for subject in [claimed, asserted] {
+        let r = || {
+            request(
+                subject.clone(),
+                vec![bound("OPENAI_API_KEY", &it[0])],
+                &["x"],
+            )
+        };
+        let mut s = store();
+        let e = approve(&mut s, r(), session(MAX_AGENT_TTL.as_secs()), &now).unwrap_err();
+        assert_eq!(e, ApproveError::InvalidOptions(OptionsError::TtlTooLong));
+        let e = approve(&mut s, r(), session(MAX_TERMINAL_TTL.as_secs() + 1), &now).unwrap_err();
+        assert_eq!(e, ApproveError::InvalidOptions(OptionsError::TtlTooLong));
+        let g = approve(&mut s, r(), session(MAX_TERMINAL_TTL.as_secs()), &now).unwrap();
+        assert_eq!(s.grant(g).unwrap().kind, SubjectKind::Agent);
+    }
+    // Rooted at a known agent: the agent bound.
+    let mut s = store();
+    let r = request(under_agent(), vec![bound("OPENAI_API_KEY", &it[0])], &["x"]);
+    assert_eq!(r.subject.root().pid, 80);
+    approve(&mut s, r, session(MAX_AGENT_TTL.as_secs()), &now).unwrap();
+}
+
 // ------------------------------------------------------------- coverage
 
 /// Gate 27: after the root exits and its pid is reused, the new process

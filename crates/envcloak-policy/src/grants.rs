@@ -29,10 +29,11 @@
 //! grant already covers apart, since the new grant holds the whole
 //! request.
 //!
-//! **Lifetimes.** Grants last [`DEFAULT_TTL`] by default; agent grants
-//! [`MAX_AGENT_TTL`] at most, and terminal and unknown ones
-//! [`MAX_TERMINAL_TTL`] at most: missing evidence takes the tighter
-//! bound. Both a wall-clock and an awake-time
+//! **Lifetimes.** Grants last [`DEFAULT_TTL`] by default; grants rooted
+//! at a known agent process [`MAX_AGENT_TTL`] at most, and all others
+//! (terminal and unknown subjects, and agent subjects by their claims
+//! alone) [`MAX_TERMINAL_TTL`] at most: missing evidence takes the tighter
+//! bound, and claims only tighten. Both a wall-clock and an awake-time
 //! deadline are set at approval and either ends the grant, so a clock
 //! stepped either way cannot lengthen one. A grant never outlives its root
 //! process: [`GrantStore::sweep`] drops grants whose root is gone. Lock
@@ -67,7 +68,8 @@ use crate::statement::{PendingDescriptor, statement_digest};
 
 /// A session grant's length when the approver names none.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(8 * 3600);
-/// The longest grant for an agent subject.
+/// The longest grant for an agent subject rooted at a known agent
+/// process.
 pub const MAX_AGENT_TTL: Duration = Duration::from_secs(24 * 3600);
 /// The longest grant for a terminal or unknown subject. An unknown subject
 /// is one whose evidence is missing (an orphan, a service manager's job, a
@@ -437,6 +439,20 @@ impl Default for GrantStore {
     }
 }
 
+/// The longest grant `subject` may be given: [`MAX_AGENT_TTL`] only when
+/// its root is a known agent process in its ancestry (SPEC §10b
+/// "Lifetimes"). An agent subject by its claims alone (markers such as
+/// `CLAUDECODE=1` set in a person's shell), or by an agent the root could
+/// not be (one matched only on what it says about itself, above the
+/// session), is rooted at a session like a terminal's and gets
+/// [`MAX_TERMINAL_TTL`]: claims only label and tighten (gate 25).
+fn max_ttl(subject: &SubjectEvidence) -> Duration {
+    match subject.nearest_agent() {
+        Some((n, _)) if n == subject.root_index() => MAX_AGENT_TTL,
+        _ => MAX_TERMINAL_TTL,
+    }
+}
+
 /// The identity of a request for flood control: SHA-256 over the root,
 /// the project, the bindings (sorted), the mode and the command line.
 fn fingerprint(r: &AccessRequest) -> [u8; 32] {
@@ -625,10 +641,7 @@ impl GrantStore {
         now: &Now,
     ) -> Result<(), ApproveError> {
         let p = self.pending(id, now).ok_or(ApproveError::NoSuchRequest)?;
-        let max = match p.request.subject.kind() {
-            SubjectKind::Agent => MAX_AGENT_TTL,
-            SubjectKind::Terminal | SubjectKind::Unknown => MAX_TERMINAL_TTL,
-        };
+        let max = max_ttl(&p.request.subject);
         if opts.ttl_secs == 0 {
             return Err(ApproveError::InvalidOptions(OptionsError::TtlZero));
         }
