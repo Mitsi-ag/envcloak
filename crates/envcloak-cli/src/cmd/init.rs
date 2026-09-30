@@ -470,8 +470,10 @@ fn delete(root: &ScanRoot) -> Result<(DeleteReport, Option<Failure>), Failure> {
              --import --yes` first. Nothing was deleted",
         ));
     }
-    let mut client = connect()?;
-    require_unlocked(&mut client)?;
+    // Checked on a connection of its own: the scan and the gate's steps
+    // take local time, and each step connects again (docs/IPC.md: an idle
+    // connection is closed after 30 seconds).
+    require_unlocked(&mut connect()?)?;
     refuse_if_traced()?;
     let (projects, mut skipped) = scan(root, false);
     let mut files: Vec<Candidate<'_>> = Vec::new();

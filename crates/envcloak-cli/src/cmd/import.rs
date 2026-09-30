@@ -707,7 +707,9 @@ pub(crate) fn import(
     require_unlocked(&mut client)?;
     crate::fail::refuse_if_traced()?;
     let plan = client.import_plan(&params).map_err(too_large)?;
-    drop(params);
+    // The commit connects again: the report and the second parse are
+    // local work, and the daemon closes a connection idle for 30 seconds.
+    drop((client, params));
     pause_point("planned");
     let mut r = report(root, projects, Some(&plan), &sent, skipped);
     if !yes {

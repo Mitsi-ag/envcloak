@@ -60,6 +60,21 @@ pub fn panic_point(site: &str) {
     let _ = site;
 }
 
+/// A test build's replacement for the daemon's wait for a frame to start
+/// on an open connection (`ENVCLOAK_TEST_IDLE_CONNECTION_MS`), so a test
+/// sees the bound work without waiting for it. `None` in a build without
+/// the `testing` feature, which only tests enable.
+pub fn idle_connection_override() -> Option<std::time::Duration> {
+    #[cfg(feature = "testing")]
+    {
+        crate::testing::idle_connection()
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        None
+    }
+}
+
 /// Panics with what standard input holds (at most 64 KiB) in the message:
 /// `envcloak internal panic` and `envcloakd internal panic`. With the hook
 /// [`install`] sets, the message is never shown; a release build then

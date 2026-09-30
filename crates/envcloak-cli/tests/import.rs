@@ -37,8 +37,8 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use common::{
-    cli_command, data_dir, finish_within, on_terminal_command, outside_dir, secret_file,
-    start_daemon, stderr, stdout,
+    cli_command, daemon_exe, data_dir, finish_within, on_terminal_command, outside_dir,
+    secret_file, start_daemon, stderr, stdout,
 };
 use envcloak_core::crypto::{ItemClass, KdfParams};
 use envcloak_core::vault::{FieldName, ItemDetails, NewItem, Slug, VaultPaths};
@@ -848,6 +848,11 @@ struct Gate16 {
 
 impl Gate16 {
     fn new(confirm_kit: bool) -> Self {
+        Self::with_daemon_env(confirm_kit, &[])
+    }
+
+    /// As [`Gate16::new`], with `env` added to the daemon's environment.
+    fn with_daemon_env(confirm_kit: bool, env: &[(&str, &str)]) -> Self {
         let cs = with_kept_values(canaries(fresh_seed()));
         let home = TestHome::new();
         let kit = RecoveryKit::generate();
@@ -875,7 +880,9 @@ impl Gate16 {
         drop(v);
         let mut cs = cs;
         cs.push(Canary::new("RECOVERY_KIT", kit.to_display().to_string()));
-        let d = start_daemon(&home);
+        let mut cmd = Command::new(daemon_exe());
+        home.apply(&mut cmd).envs(env.iter().copied());
+        let d = Daemon::start_command(cmd, &[]);
         let dir = outside_dir();
         let pass = secret_file(
             dir.path(),
@@ -1475,6 +1482,12 @@ const STEPS: [&str; 11] = [
 /// ([`envcloak_scan::pause_point`], compiled into test builds only) and
 /// sending `kill -9` to it at `at`. Returns the points it passed.
 fn run_until(g: &Gate16, at: &str) -> Vec<String> {
+    run_steps(g, at, Duration::ZERO)
+}
+
+/// As [`run_until`], waiting `linger` at each pause point before letting
+/// the run go on.
+fn run_steps(g: &Gate16, at: &str, linger: Duration) -> Vec<String> {
     let pause = tempfile::Builder::new()
         .prefix("ecp")
         .tempdir_in("/tmp")
@@ -1520,8 +1533,38 @@ fn run_until(g: &Gate16, at: &str) -> Vec<String> {
             child.wait().unwrap();
             return seen;
         }
+        std::thread::sleep(linger);
         File::create(pause.path().join(format!("{prefix}go"))).unwrap();
     }
+}
+
+/// Review T7 open 2: the daemon closes a connection on which no frame
+/// starts within its bound (30 seconds; here a test build's override of
+/// 300 ms, which a quiet connection is seen to meet). `envcloak init
+/// --import --yes --delete-plaintext` stopped for 900 ms at every step
+/// still goes through as an unstopped run does: no step holds a
+/// connection across local work, each connects again.
+#[test]
+fn a_short_idle_bound_breaks_no_step_of_init() {
+    let g = Gate16::with_daemon_env(true, &[(envcloak_sys::testing::IDLE_CONNECTION_MS, "300")]);
+    let mut quiet =
+        std::os::unix::net::UnixStream::connect(envcloak_testkit::daemon_socket(&g.home)).unwrap();
+    quiet
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let t = Instant::now();
+    let mut b = [0u8; 1];
+    assert_eq!(std::io::Read::read(&mut quiet, &mut b).unwrap(), 0);
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+
+    assert_eq!(run_steps(&g, "none", Duration::from_millis(900)), STEPS);
+    file_or_item(&g);
+    assert_eq!(
+        std::fs::read(g.repo.join(".env")).unwrap(),
+        env_left(&g.files[0].1)
+    );
+    assert!(!g.repo.join(".env.short").exists());
+    g.sweep();
 }
 
 /// Gate 16: `kill -9` of `envcloak init --import --yes --delete-plaintext`

@@ -285,3 +285,61 @@ fn a_frame_that_stalls_is_dropped_at_its_deadline() {
         "{waited:?}"
     );
 }
+
+/// Review T7 open 2: a connection on which no frame starts is closed after
+/// 30 seconds (the daemon's `IDLE_CONNECTION`), not 10 minutes, so
+/// processes holding connections idle cannot keep the places for long.
+#[test]
+fn an_idle_connection_is_closed_after_30_seconds() {
+    let home = TestHome::new();
+    let _d = start(&home);
+    let mut s = raw(&home);
+    s.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
+    let t = Instant::now();
+    assert!(closed(&mut s), "still open after {:?}", t.elapsed());
+    let waited = t.elapsed();
+    assert!(
+        waited >= Duration::from_secs(28) && waited < Duration::from_secs(60),
+        "{waited:?}"
+    );
+}
+
+/// The idle bound counts from the end of each answer to the start of the
+/// next frame: with a test build's override of 1 second, a connection
+/// whose requests come every 400 ms stays open well past it, one that
+/// goes quiet is closed after it, and a new connection is served.
+#[test]
+fn the_idle_bound_is_per_frame_and_closes_only_a_quiet_connection() {
+    let home = TestHome::new();
+    let mut cmd = Command::new(common::exe());
+    home.apply(&mut cmd)
+        .env(envcloak_sys::testing::IDLE_CONNECTION_MS, "1000");
+    let _d = envcloak_testkit::Daemon::start_command(cmd, &[]);
+    let mut live = raw(&home);
+    let t = Instant::now();
+    let mut id = 0;
+    let mut answered = Instant::now();
+    while t.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(400));
+        id += 1;
+        send_json(
+            &mut live,
+            &json!({"jsonrpc": "2.0", "id": id, "method": "status"}),
+        );
+        assert_eq!(read_json(&mut live).unwrap()["id"], id);
+        answered = Instant::now();
+    }
+    assert!(id >= 3, "{id}");
+    // The daemon's wait began as it wrote the last answer, just before it
+    // was read here.
+    assert!(closed(&mut live));
+    let waited = answered.elapsed();
+    assert!(
+        waited >= Duration::from_millis(700) && waited < Duration::from_secs(10),
+        "{waited:?}"
+    );
+    assert_eq!(
+        client(&home).status().unwrap().vault.state,
+        VaultState::Absent
+    );
+}
