@@ -1123,6 +1123,63 @@ mod tests {
         );
     }
 
+    /// Review T11 open 3: a rotation or removal whose proof passed and
+    /// whose write then changed nothing is a failed entry of its own kind,
+    /// naming the item, the caller and the write's reason; only a wrong
+    /// passphrase says `wrong_passphrase`, so the two are never confused.
+    #[test]
+    fn an_aborted_write_is_a_failed_entry_with_its_own_reason() {
+        let item = ItemId::generate();
+        let slug = Slug::new("openai/acme-web").unwrap();
+        for (write, reason) in [
+            (AuditKind::Rotate, "vault_tampered"),
+            (AuditKind::Rotate, "vault_locked"),
+            (AuditKind::Remove, "backup_failed"),
+            (AuditKind::Remove, "item_changed"),
+        ] {
+            let e = AuditEvent::ItemWriteFailed {
+                pid: 41,
+                subject: SubjectSummary {
+                    pid: 41,
+                    kind: Some("terminal".to_owned()),
+                    ..SubjectSummary::default()
+                },
+                write,
+                item,
+                slug: slug.clone(),
+                reason,
+            };
+            let r = e.record();
+            assert_eq!(r.kind, write);
+            assert_eq!(r.decision.outcome, "failed");
+            assert_eq!(r.decision.reason.as_deref(), Some(reason));
+            assert_eq!(r.items, vec![(item, slug.clone())]);
+            assert_eq!(r.subject.pid, 41);
+            assert_eq!(r.subject.kind.as_deref(), Some("terminal"));
+            assert_eq!(
+                e.line().unwrap(),
+                format!(
+                    "envcloakd: audit: {} failed reason={reason} id={item} pid=41",
+                    write.token()
+                )
+            );
+        }
+        let wrong = AuditEvent::ItemProofFailed {
+            pid: 41,
+            write: AuditKind::Rotate,
+            item,
+            slug,
+        }
+        .record();
+        assert_eq!(
+            (
+                wrong.decision.outcome.as_str(),
+                wrong.decision.reason.as_deref()
+            ),
+            ("failed", Some("wrong_passphrase"))
+        );
+    }
+
     #[test]
     fn hashes_are_lower_case_hex() {
         assert_eq!(hex(&[0x00, 0xab, 0x7f, 0xff]), "00ab7fff");
