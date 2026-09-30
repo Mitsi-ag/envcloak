@@ -1183,6 +1183,53 @@ fn an_at_sign_after_the_authority_leaves_a_short_password_short() {
     f.sweep();
 }
 
+/// Review T13 open 2: only `scheme://user:password@` was known, so under a
+/// DSN-named variable a short password in Go's MySQL DSN, the libpq
+/// keyword form, a JDBC query or an ADO.NET string was measured with the
+/// whole value, and an agent's right guess of an 8-character password
+/// was told from a wrong one. Each form's password counts alone: an
+/// agent's guesses get one answer from plan, commit and verify, a
+/// person's are told apart, and 16 characters in each form are compared
+/// for anyone.
+#[test]
+fn a_short_password_in_a_connection_string_is_guessable() {
+    let mut f = Fixture::new(|_, _| {});
+    let mut c = client(&f.home);
+    let go: ValueOf = |pw| format!("app:{pw}@tcp(db.internal:3306)/app?parseTime=true");
+    let libpq: ValueOf = |pw| {
+        format!("host=db.internal port=5432 dbname=app user=app password={pw} sslmode=require")
+    };
+    let jdbc: ValueOf =
+        |pw| format!("jdbc:postgresql://db.internal:5432/app?user=app&password={pw}&ssl=true");
+    let ado: ValueOf = |pw| format!("Server=db.internal;Database=app;User Id=app;Password={pw};");
+    let shapes = [
+        ("go-dsn", go),
+        ("libpq", libpq),
+        ("jdbc", jdbc),
+        ("ado", ado),
+    ]
+    .map(|(name, value)| Shape {
+        name,
+        var: "DATABASE_DSN",
+        value,
+        right: word(8),
+        wrong: word(8),
+    });
+    guesses_are_hidden(&mut f, &mut c, &shapes);
+    compared_for_anyone(
+        &mut f,
+        &mut c,
+        &[
+            ("go-dsn", "DATABASE_DSN", go, word(16)),
+            ("libpq", "DATABASE_DSN", libpq, word(16)),
+            ("jdbc", "DATABASE_DSN", jdbc, word(16)),
+            ("ado", "DATABASE_DSN", ado, word(16)),
+        ],
+    );
+    drop(c);
+    f.sweep();
+}
+
 /// Values compared with the vault are limited per subject root: 20
 /// requests of 5,000 secrets reach the hour's 100,000, and the next
 /// comparison is refused (`too_many_checks`) and audited; a request that

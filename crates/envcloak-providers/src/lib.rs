@@ -28,7 +28,9 @@ mod error;
 mod registry;
 mod safety;
 
-pub use detect::{Detection, SECRET_RUN, shaped_like_secret, url_password_chars};
+pub use detect::{
+    Detection, MAX_PASSWORD_READINGS, SECRET_RUN, password_chars, shaped_like_secret,
+};
 pub use error::{RegistryError, RegistryErrorKind};
 #[cfg(feature = "testing")]
 pub use registry::load_from;
