@@ -32,8 +32,11 @@
 //!   handed to a thread that passes them on, each with whether a process
 //!   sent it), [`wait_for_exit`] (a child's exit seen without reaping it,
 //!   so its pid is not reused while it may still be signalled),
-//!   [`signal_process`] and [`signal_group`] (`kill`), and
-//!   [`wait_writable`] (an output descriptor ready for a write).
+//!   [`signal_process`] and [`signal_group`] (`kill`), [`wait_writable`]
+//!   (an output descriptor ready for a write), [`hung_up`] (a pipe no
+//!   process can write to any more), and [`Interrupter`] (a thread
+//!   blocked writing to an output nobody reads, broken out of the write
+//!   once the runner gives up on it).
 //! - Panics (gate 12): [`install_panic_hook`], which both binaries call so
 //!   a panic shows its place and never its message; [`panic_point`], where
 //!   a test build panics on request; and [`panic_with_input`], behind the
@@ -54,6 +57,7 @@ mod dir;
 mod fd;
 mod fs;
 mod harden;
+mod interrupt;
 mod inuse;
 mod lockfile;
 mod panic;
@@ -80,6 +84,7 @@ pub use harden::{
     Hardening, core_dump_limit, disable_core_dumps, harden_process, hardening_report,
     hardening_status, lock_memory, parse_tracer_pid, set_non_dumpable, tracer_present,
 };
+pub use interrupt::Interrupter;
 pub use inuse::{InUse, open_elsewhere};
 pub use lockfile::try_lock_exclusive;
 pub use panic::{install as install_panic_hook, panic_point, panic_with_input};
@@ -96,4 +101,4 @@ pub use proc::{
 };
 pub use signal::{TerminationSignals, TerminationWatch, exit_by_signal, termination_recorded};
 pub use sync::{SyncMethod, sync_file};
-pub use tty::{SecretInput, wait_readable, wait_writable};
+pub use tty::{SecretInput, hung_up, wait_readable, wait_writable};

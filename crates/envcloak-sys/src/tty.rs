@@ -162,6 +162,28 @@ pub fn wait_readable(fd: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> 
     }
 }
 
+/// Whether nothing can write to `fd` any more: every write end of the
+/// pipe, or the socket's peer, is closed (`POLLHUP`), even while data
+/// written before is still unread. The runner uses it to tell a pipe that
+/// only has output left to deliver from one a descendant still holds.
+///
+/// # Errors
+/// When `poll` fails, `EINTR` included.
+pub fn hung_up(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `p` is one initialized pollfd, and the descriptor stays open
+    // for the call; a zero timeout only looks.
+    let rc = unsafe { libc::poll(&mut p, 1, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(p.revents & libc::POLLHUP != 0)
+}
+
 /// Waits at most `timeout` for `fd` to accept a write without blocking, or
 /// to have failed (the reader gone). Returns whether it has: the runner
 /// uses it when its output descriptor was left non-blocking by whoever
@@ -202,7 +224,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    use super::wait_readable;
+    use super::{hung_up, wait_readable};
 
     #[test]
     fn waits_for_input_or_a_hang_up() {
@@ -215,5 +237,38 @@ mod tests {
         let (c, d) = UnixStream::pair().unwrap();
         drop(d);
         assert!(wait_readable(c.as_fd(), Duration::from_secs(5)).unwrap());
+    }
+
+    #[test]
+    fn a_closed_writer_is_seen_while_data_is_unread() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        assert!(!hung_up(a.as_fd()).unwrap());
+        b.write_all(b"x").unwrap();
+        assert!(!hung_up(a.as_fd()).unwrap());
+        drop(b);
+        assert!(hung_up(a.as_fd()).unwrap());
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe returns.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe just created both descriptors, and nothing else owns
+        // them.
+        let (r, w) = unsafe {
+            use std::os::fd::FromRawFd;
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        (&w).write_all(b"x").unwrap();
+        assert!(!hung_up(r.as_fd()).unwrap());
+        let w2 = w.try_clone().unwrap();
+        drop(w);
+        assert!(
+            !hung_up(r.as_fd()).unwrap(),
+            "a second writer holds the pipe"
+        );
+        drop(w2);
+        assert!(hung_up(r.as_fd()).unwrap());
     }
 }
