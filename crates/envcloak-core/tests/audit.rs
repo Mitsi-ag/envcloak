@@ -13,6 +13,7 @@ mod common;
 
 use std::fs::File;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -47,6 +48,10 @@ struct Plan {
     fail_frame_write: bool,
     /// Fail the next flush of a segment.
     fail_file_sync: bool,
+    /// Fail the next flush of a directory.
+    fail_dir_sync: bool,
+    /// The directories flushed, by device and inode.
+    synced_dirs: Vec<(u64, u64)>,
     /// Rename this file to that one just before the next frame is written,
     /// as another program racing the writer would.
     move_before_frame: Option<(PathBuf, PathBuf)>,
@@ -87,10 +92,18 @@ impl AuditIo for Shim {
 
     fn sync(&mut self, f: &File) -> io::Result<()> {
         let mut p = self.0.lock().unwrap();
-        let dir = f.metadata()?.is_dir();
+        let m = f.metadata()?;
+        let dir = m.is_dir();
         p.ops.push(if dir { Op::SyncDir } else { Op::SyncFile });
+        if dir {
+            p.synced_dirs.push((m.dev(), m.ino()));
+        }
         if !dir && p.fail_file_sync {
             p.fail_file_sync = false;
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        if dir && p.fail_dir_sync {
+            p.fail_dir_sync = false;
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         OsIo.sync(f)
@@ -198,10 +211,20 @@ fn problem(r: &VerifyReport) -> Option<(u64, ProblemKind)> {
     r.first_problem.map(|Problem { seq, kind }| (seq, kind))
 }
 
+/// The device and inode of a directory.
+fn dir_id(p: &Path) -> (u64, u64) {
+    let m = std::fs::metadata(p).unwrap();
+    (m.dev(), m.ino())
+}
+
 /// Gate 33, the flush half: every append writes its frame and flushes the
 /// segment before it returns, and the first also flushes the header and
-/// the directory. The flushes are `F_FULLFSYNC` on macOS and `fsync` on
-/// Linux, counted by envcloak-sys's shim.
+/// the directory. When the log's directory is missing (a new vault's first
+/// unlock, or the directory removed), the writer creates it and first
+/// flushes the data directory that names it (review T10 open 3); a failed
+/// flush of it fails the append, and the next one flushes it again. The
+/// flushes are `F_FULLFSYNC` on macOS and `fsync` on Linux, counted by
+/// envcloak-sys's shim.
 #[test]
 fn every_append_is_flushed_before_it_returns() {
     let log = Log::new();
@@ -217,6 +240,7 @@ fn every_append_is_flushed_before_it_returns() {
     assert_eq!(&first[1..3], &[Op::SyncFile, Op::SyncDir]);
     assert!(matches!(first[3], Op::Write(n) if n > 12 + 40 + 32));
     assert_eq!(first[4], Op::SyncFile, "the frame is flushed last");
+    assert_eq!(shim.plan().synced_dirs, [dir_id(&log.dir)]);
     let after = envcloak_sys::testing::sync_counts();
     let (full, plain) = (
         after.full_fsync - before.full_fsync,
@@ -242,6 +266,55 @@ fn every_append_is_flushed_before_it_returns() {
         );
     }
     assert_eq!(w.head().0, 4);
+    assert!(log.verify(None).ok());
+
+    // A missing directory: created, then the data directory that names it
+    // is flushed before the first segment is made in it.
+    let log = Log::new();
+    std::fs::remove_dir(&log.dir).unwrap();
+    let data = dir_id(log.dir.parent().unwrap());
+    let shim = Shim::default();
+    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+    let before = envcloak_sys::testing::sync_counts();
+    assert_eq!(w.append(&record(1)).unwrap(), 1);
+    let first = shim.ops();
+    assert_eq!(first.len(), 6, "{first:?}");
+    assert_eq!(first[0], Op::SyncDir, "the data directory, first");
+    assert_eq!(first[1], Op::Write(HEADER_LEN));
+    assert_eq!(&first[2..4], &[Op::SyncFile, Op::SyncDir]);
+    assert!(matches!(first[4], Op::Write(n) if n > 12 + 40 + 32));
+    assert_eq!(first[5], Op::SyncFile);
+    assert_eq!(
+        std::mem::take(&mut shim.plan().synced_dirs),
+        [data, dir_id(&log.dir)]
+    );
+    let after = envcloak_sys::testing::sync_counts();
+    assert_eq!(
+        (after.full_fsync - before.full_fsync) + (after.fsync - before.fsync),
+        4
+    );
+    fill(&mut w, 2, 1);
+    let ops = shim.ops();
+    assert!(
+        matches!(ops[..], [Op::Write(_), Op::SyncFile]),
+        "only once: {ops:?}"
+    );
+
+    // That flush failing fails the append, which leaves no segment; the
+    // next append flushes the data directory again.
+    let log = Log::new();
+    std::fs::remove_dir(&log.dir).unwrap();
+    let shim = Shim::default();
+    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+    shim.plan().fail_dir_sync = true;
+    assert!(w.append(&record(1)).is_err());
+    assert_eq!(shim.ops(), [Op::SyncDir]);
+    assert!(log.segments().is_empty());
+    assert_eq!(w.head().0, 0);
+    assert_eq!(w.append(&record(1)).unwrap(), 1);
+    let ops = shim.ops();
+    assert_eq!(ops.len(), 6, "{ops:?}");
+    assert_eq!(ops[0], Op::SyncDir, "flushed again");
     assert!(log.verify(None).ok());
 }
 

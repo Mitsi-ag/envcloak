@@ -382,6 +382,9 @@ pub struct AuditWriter {
     current: Option<Current>,
     io: Box<dyn AuditIo>,
     max_segment: u64,
+    /// This writer created the log's directory and has not yet flushed the
+    /// directory that names it.
+    dir_unsynced: bool,
 }
 
 impl core::fmt::Debug for AuditWriter {
@@ -455,6 +458,7 @@ impl AuditWriter {
             current: None,
             io,
             max_segment,
+            dir_unsynced: false,
         };
         if let Some(a) = anchor {
             if a.seq >= writer.next_seq {
@@ -590,7 +594,21 @@ impl AuditWriter {
     }
 
     fn new_segment(&mut self) -> Result<Current, AuditError> {
-        ensure_dir(&self.dir)?;
+        ensure_dir(&self.dir, &mut self.dir_unsynced)?;
+        if self.dir_unsynced {
+            // The directory is new: the entry naming it must be durable
+            // before any segment in it is. Until that flush succeeds, every
+            // new segment tries it again.
+            let parent = match self.dir.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            let parent = File::open(parent)?;
+            self.io
+                .sync(&parent)
+                .map_err(|_| AuditError::from(AuditErrorKind::Sync))?;
+            self.dir_unsynced = false;
+        }
         let path = self.dir.join(segment_name(self.next_seq));
         let file = OpenOptions::new()
             .append(true)
@@ -687,10 +705,11 @@ fn segment_exists(dir: &Path, first_seq: u64) -> bool {
     std::fs::symlink_metadata(dir.join(segment_name(first_seq))).is_ok()
 }
 
-/// Creates the log's directory 0700 when it is missing, then checks it.
-fn ensure_dir(dir: &Path) -> Result<(), AuditError> {
+/// Creates the log's directory 0700 when it is missing, setting `created`,
+/// then checks it.
+fn ensure_dir(dir: &Path, created: &mut bool) -> Result<(), AuditError> {
     match DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => {}
+        Ok(()) => *created = true,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
