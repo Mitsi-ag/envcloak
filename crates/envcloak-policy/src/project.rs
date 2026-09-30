@@ -52,7 +52,10 @@ impl ProjectIdentity {
     /// The key of this project in the vault's project index
     /// (`envcloak_core::vault::ProjectRecord`): a format byte (1), the
     /// device and inode as big-endian u64s, and SHA-256 of the canonical
-    /// path's bytes. 49 bytes; equal exactly when the identities are.
+    /// path's bytes. 49 bytes; equal exactly when the identities are. A
+    /// filesystem that numbers its devices at mount gives a remounted repo
+    /// a new key, so it shows as a new project: the strict side, kept on
+    /// purpose (docs/MANIFEST.md "Project identity").
     pub fn vault_key(&self) -> ProjectKey {
         let mut b = Vec::with_capacity(49);
         b.push(1u8);
