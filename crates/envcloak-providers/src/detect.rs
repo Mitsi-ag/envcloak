@@ -180,20 +180,47 @@ fn url_password(v: &[u8]) -> Option<&[u8]> {
     (!password.is_empty()).then_some(password)
 }
 
-/// When `value` is a URL with a password ([`shaped_like_secret`]'s first
-/// shape), how many characters its password has: all of the value a
-/// guesser must find, since a URL's scheme, user, host and database are
-/// no secret (SPEC §6.4: a short password in a long URL is short). A `%XX`
-/// escape counts as the byte it stands for, and the bytes are counted as
-/// [`SecretBytes::utf8_chars`] counts them, or, when they are not UTF-8,
-/// as four bytes a character. `None` for any other value.
-///
-/// Read in place, like [`Registry::detect`]: only a count leaves, and the
-/// decoded password is wiped.
-pub fn url_password_chars(value: &SecretBytes) -> Option<usize> {
-    #[allow(clippy::disallowed_methods)] // Read in place; only a count leaves.
-    let v: &[u8] = value.expose_secret();
-    let password = url_password(v)?;
+/// Every reading of a URL's password a server could take, each non-empty.
+/// The user information ends at an `@` after `://`, and the password is
+/// what follows its first `:`. Which `@` ends it is not certain, so each
+/// of these is a reading:
+/// - the last `@` in the authority, which ends at the first `/`, `?` or
+///   `#` (RFC 3986): an `@` in the path, query or fragment
+///   (`?application_name=api@prod`) is none of the password's;
+/// - the first `@` after the `:`: a password holding `/`, `?` or `#`
+///   unescaped, with an `@` further on;
+/// - the last `@` of all ([`url_password`]): a password holding `/` and
+///   `@`.
+fn url_passwords(v: &[u8]) -> Vec<&[u8]> {
+    let Some(at) = v.windows(3).position(|w| w == b"://") else {
+        return Vec::new();
+    };
+    let rest = &v[at + 3..];
+    let authority = rest
+        .iter()
+        .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+    let first_colon = rest.iter().position(|&b| b == b':');
+    let ends = [
+        rest[..authority].iter().rposition(|&b| b == b'@'),
+        first_colon.and_then(|c| rest[c..].iter().position(|&b| b == b'@').map(|p| c + p)),
+        rest.iter().rposition(|&b| b == b'@'),
+    ];
+    ends.into_iter()
+        .flatten()
+        .filter_map(|end| {
+            let colon = rest[..end].iter().position(|&b| b == b':')?;
+            let password = &rest[colon + 1..end];
+            (!password.is_empty()).then_some(password)
+        })
+        .collect()
+}
+
+/// How many characters `password` has: a `%XX` escape counts as the byte
+/// it stands for, and the bytes are counted as [`SecretBytes::utf8_chars`]
+/// counts them, or, when they are not UTF-8, as four bytes a character.
+/// The decoded copy is wiped.
+fn password_len(password: &[u8]) -> usize {
     let mut decoded = Vec::with_capacity(password.len());
     let mut i = 0;
     while i < password.len() {
@@ -222,7 +249,25 @@ pub fn url_password_chars(value: &SecretBytes) -> Option<usize> {
         }
     }
     let decoded = SecretBytes::from_vec(decoded);
-    Some(decoded.utf8_chars().unwrap_or_else(|| decoded.len() / 4))
+    decoded.utf8_chars().unwrap_or_else(|| decoded.len() / 4)
+}
+
+/// When `value` is a URL with a password ([`shaped_like_secret`]'s first
+/// shape), how many characters its password has: all of the value a
+/// guesser must find, since a URL's scheme, user, host and database are
+/// no secret (SPEC §6.4: a short password in a long URL is short). Where
+/// the password ends is read every way a server could read it
+/// ([`url_passwords`]), and the fewest characters any reading gives are
+/// returned, so that a short password counts as short however the rest of
+/// the URL is written. Each is counted as [`password_len`] counts. `None`
+/// for any other value.
+///
+/// Read in place, like [`Registry::detect`]: only a count leaves, and each
+/// decoded password is wiped.
+pub fn url_password_chars(value: &SecretBytes) -> Option<usize> {
+    #[allow(clippy::disallowed_methods)] // Read in place; only a count leaves.
+    let v: &[u8] = value.expose_secret();
+    url_passwords(v).into_iter().map(password_len).min()
 }
 
 fn key_shaped_run(v: &[u8]) -> bool {
@@ -267,7 +312,7 @@ mod shape_tests {
         for (url, chars) in [
             (&b"postgres://app:abcdefgh@db.internal:5432/app"[..], 8),
             (b"redis://:only-a-password@cache:6379", 15),
-            (b"https://user:p@host/path@with-at", 11),
+            (b"https://user:p@host/path@with-at", 1),
             (b"mysql://u:%41%42%43%44%45@db/x", 5),
             (b"mysql://u:%4@db/x", 2),
             (b"mysql://u:%zz%@db/x", 4),
@@ -294,6 +339,74 @@ mod shape_tests {
             b"postgres://user:@db/acme",
             b"0123456789abcdef0123456789abcdef",
             b"",
+        ] {
+            assert_eq!(
+                password_chars(no),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(no)
+            );
+        }
+    }
+
+    /// Review finding F-61 (Codex): the password ran to the last `@` of
+    /// the URL, so an `@` in its path, query or fragment made the host and
+    /// what followed count as password, and an 8-character password in
+    /// `...?application_name=api@prod` counted 69. Every reading a server
+    /// could take counts, and the fewest characters any gives are the
+    /// count: the authority's last `@` (RFC 3986), the first `@` after the
+    /// `:` (a password with `/`, `?` or `#` in it, and an `@` further on),
+    /// and the last `@` of all.
+    #[test]
+    fn an_at_sign_after_the_authority_is_not_the_passwords() {
+        for (url, chars) in [
+            // An `@` in the query, the path and the fragment.
+            (
+                &b"postgres://app:abcdefgh@db.internal:5432/app?application_name=api@prod"[..],
+                8,
+            ),
+            (b"postgres://app:abcdefgh@db.internal:5432/app@v2/data", 8),
+            (b"https://app:abcdefgh@api.internal/v1#section@anchor", 8),
+            (
+                b"redis://:abcdefghij@cache.internal:6379/0?client=a@b@c",
+                10,
+            ),
+            // Escaped, with an `@` in the query.
+            (
+                b"mysql://app:%61%62%63%64%65%66@db.internal:3306/app?tag=x@y",
+                6,
+            ),
+            // A password with `/` or `#` in it, and an `@` in the query:
+            // only the first `@` after the `:` ends it there.
+            (
+                b"postgres://app:pa/ss@db.internal:5432/app?application_name=api@prod",
+                5,
+            ),
+            (b"postgres://app:pa#ss@db.internal:5432/app?x=a@b", 5),
+            // A password with an `@` in it: its part before that `@` is a
+            // reading too.
+            (b"postgres://app:p@ss@db.internal:5432/app", 1),
+            // Controls: 16 characters, with and without an `@` after the
+            // authority, and a password holding `/` and `@` (the last `@`).
+            (b"postgres://app:abcdefghijklmnop@db.internal:5432/app", 16),
+            (
+                b"postgres://app:abcdefghijklmnop@db.internal:5432/app?application_name=api@prod",
+                16,
+            ),
+        ] {
+            assert_eq!(
+                password_chars(url),
+                Some(chars),
+                "{:?}",
+                String::from_utf8_lossy(url)
+            );
+            assert!(shaped(url), "{:?}", String::from_utf8_lossy(url));
+        }
+        // An `@` only after the authority, and no `:` before it: no
+        // password in any reading.
+        for no in [
+            &b"https://example.com/users/@me"[..],
+            b"https://example.com/path?user=a@b",
         ] {
             assert_eq!(
                 password_chars(no),

@@ -170,7 +170,9 @@ fn secret_name(name: &str) -> bool {
 /// with a password only the password counts ([`url_password_chars`]):
 /// the scheme, user, host and database are no secret, so
 /// `postgres://app:<8 characters>@db:5432/app` is as short as its
-/// password, whatever pattern matches the whole URL.
+/// password, whatever pattern matches the whole URL. Where the password
+/// ends is read every way a server could read it, and the shortest
+/// reading counts, so an `@` in the path or query does not lengthen it.
 fn guessable(shared: &Shared, value: &SecretBytes) -> bool {
     if let Some(chars) = url_password_chars(value) {
         return chars < GUESSABLE_BELOW;
