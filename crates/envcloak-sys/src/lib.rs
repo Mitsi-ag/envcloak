@@ -30,13 +30,13 @@
 //!   again after the walk).
 //! - The runner (`envcloak run`): [`SignalRelay`] (signals caught and
 //!   handed to a thread that passes them on, each with whether a process
-//!   sent it), [`wait_for_exit`] (a child's exit seen without reaping it,
-//!   so its pid is not reused while it may still be signalled),
-//!   [`signal_process`] and [`signal_group`] (`kill`), [`wait_writable`]
-//!   (an output descriptor ready for a write), [`hung_up`] (a pipe no
-//!   process can write to any more), and [`Interrupter`] (a thread
-//!   blocked writing to an output nobody reads, broken out of the write
-//!   once the runner gives up on it).
+//!   sent it, and marks between them), [`wait_for_exit`] (a child's exit
+//!   seen without reaping it, so its pid is not reused while it may still
+//!   be signalled), [`signal_process`] and [`signal_group`] (`kill`),
+//!   [`wait_writable`] (an output descriptor ready for a write),
+//!   [`hung_up`] (a pipe no process can write to any more), and
+//!   [`Interrupter`] (a thread blocked writing to an output nobody reads,
+//!   broken out of the write once the runner gives up on it).
 //! - Panics (gate 12): [`install_panic_hook`], which both binaries call so
 //!   a panic shows its place and never its message; [`panic_point`], where
 //!   a test build panics on request; and [`panic_with_input`], behind the

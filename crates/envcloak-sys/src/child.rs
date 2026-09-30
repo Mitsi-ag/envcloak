@@ -5,7 +5,9 @@
 //!   hands each one to a thread that reads [`SignalRelay::next`]. The
 //!   handler only writes the signal's number to a pipe, with whether a
 //!   process sent it ([`Relayed::Signal`]), which is async-signal-safe;
-//!   the code that acts on it is ordinary code on an ordinary thread. A
+//!   the code that acts on it is ordinary code on an ordinary thread.
+//!   [`SignalRelay::mark`] puts a mark in the same stream, so the reader
+//!   knows which signals were caught before a moment and which after. A
 //!   caught signal, unlike an ignored one, is reset to its default action
 //!   by `exec`, so the child the runner starts gets the usual
 //!   dispositions.
@@ -104,8 +106,11 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION: AtomicI32 = AtomicI32::new(-1);
 
 /// A byte in the relay pipe: the signal's number in the low seven bits,
-/// and this bit when a process sent it; 0 is the stop mark.
+/// and this bit when a process sent it. Alone, the bit is a
+/// [`SignalRelay::mark`]; 0 is the stop mark.
 const BY_PROCESS: u8 = 0x80;
+/// The byte [`SignalRelay::mark`] writes.
+const MARK: u8 = BY_PROCESS;
 /// The byte [`SignalRelay::stop`] writes.
 const STOP: u8 = 0;
 /// The highest signal a relay catches: its number must leave
@@ -203,7 +208,7 @@ extern "C" fn relay_handler(
         return;
     }
     // Only signals 1 to MAX_SIGNAL are installed; the check keeps the byte
-    // from ever reading as the stop mark or losing its number.
+    // from ever reading as a mark.
     let Some(number) = u8::try_from(sig)
         .ok()
         .filter(|n| (1..=MAX_SIGNAL).contains(&i32::from(*n)))
@@ -245,6 +250,9 @@ pub enum Relayed {
         /// A process sent it.
         by_process: bool,
     },
+    /// Where [`SignalRelay::mark`] was called: the signals before it were
+    /// caught before the call, and those after it after.
+    Mark,
 }
 
 /// Signals caught and handed to a reading thread while the value lives.
@@ -331,7 +339,7 @@ impl SignalRelay {
         Ok(relay)
     }
 
-    /// Waits for the next relayed signal and returns it, or `None`
+    /// Waits for the next relayed signal or mark and returns it, or `None`
     /// once [`SignalRelay::stop`] was called. Meant for one reading thread.
     ///
     /// # Errors
@@ -346,6 +354,7 @@ impl SignalRelay {
             if n == 1 {
                 return Ok(match byte {
                     STOP => None,
+                    MARK => Some(Relayed::Mark),
                     b => Some(Relayed::Signal {
                         number: i32::from(b & !BY_PROCESS),
                         by_process: b & BY_PROCESS != 0,
@@ -381,6 +390,16 @@ impl SignalRelay {
     /// When the stop mark cannot be written.
     pub fn stop(&self) -> io::Result<()> {
         self.put(STOP)
+    }
+
+    /// Puts [`Relayed::Mark`] in the stream [`SignalRelay::next`] reads: a
+    /// signal whose handler ran before this call comes before it, and one
+    /// caught after the call comes after it. Callable from any thread.
+    ///
+    /// # Errors
+    /// When the mark cannot be written.
+    pub fn mark(&self) -> io::Result<()> {
+        self.put(MARK)
     }
 
     /// Writes one of the relay's own bytes to the pipe.
@@ -464,6 +483,24 @@ mod tests {
         assert_eq!(disposition(libc::SIGUSR1), before);
         let relay = SignalRelay::install(&[libc::SIGUSR2]).unwrap();
         relay.stop().unwrap();
+        assert_eq!(relay.next().unwrap(), None);
+    }
+
+    /// A mark sits between the signals caught before it and those caught
+    /// after it.
+    #[test]
+    fn a_mark_divides_the_signals_caught_before_it_from_those_after() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGUSR1, libc::SIGUSR2]).unwrap();
+        raise(libc::SIGUSR1);
+        relay.mark().unwrap();
+        raise(libc::SIGUSR2);
+        relay.mark().unwrap();
+        relay.stop().unwrap();
+        assert_eq!(relay.next().unwrap(), own(libc::SIGUSR1));
+        assert_eq!(relay.next().unwrap(), Some(Relayed::Mark));
+        assert_eq!(relay.next().unwrap(), own(libc::SIGUSR2));
+        assert_eq!(relay.next().unwrap(), Some(Relayed::Mark));
         assert_eq!(relay.next().unwrap(), None);
     }
 

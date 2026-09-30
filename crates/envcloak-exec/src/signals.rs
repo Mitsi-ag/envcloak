@@ -1,4 +1,4 @@
-//! Signals while the child runs (SPEC §6.1 step 8).
+//! Signals while the child runs, and after (SPEC §6.1 step 8).
 //!
 //! - With a controlling terminal, the child stays in this process's group:
 //!   the terminal sends its SIGINT and SIGQUIT (Ctrl-C, Ctrl-\) to both,
@@ -21,11 +21,19 @@
 //! exited: [`ChildState`] is updated after `waitid` sees the exit and
 //! before the child is reaped, so its pid, and the group it leads, can
 //! never belong to another process when a signal is sent.
+//!
+//! Once the exit is seen ([`Forwarder::child_exited`] puts a mark among the
+//! caught signals), there is nobody to pass a signal on to, and the output
+//! may still be waiting for a descendant or a reader: a signal caught
+//! after the mark stops the run at once ([`Cutoff::stop_now`]), and the run
+//! ends as the signal asks, with 128 plus its number (review T12-2).
 
 use std::io;
 use std::sync::Mutex;
 
 use envcloak_sys::{Relayed, SignalRelay};
+
+use crate::pump::Cutoff;
 
 /// The signals the runner catches.
 pub(crate) const CAUGHT: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
@@ -82,13 +90,23 @@ impl Forwarder {
         })
     }
 
-    /// Passes signals on until [`Forwarder::stop`]. Run on its own thread.
-    pub(crate) fn forward(&self, child: &ChildState) {
+    /// Passes signals on until [`Forwarder::stop`], and stops the run
+    /// (`cutoff`) for one caught after [`Forwarder::child_exited`]. Run on
+    /// its own thread.
+    pub(crate) fn forward(&self, child: &ChildState, cutoff: &Cutoff) {
+        let mut exited = false;
         while let Ok(Some(caught)) = self.relay.next() {
-            let Relayed::Signal {
-                number: sig,
-                by_process,
-            } = caught;
+            let (sig, by_process) = match caught {
+                Relayed::Mark => {
+                    exited = true;
+                    continue;
+                }
+                Relayed::Signal { number, by_process } => (number, by_process),
+            };
+            if exited {
+                cutoff.stop_now(sig);
+                continue;
+            }
             let pid = child.pid.lock().unwrap_or_else(|e| e.into_inner());
             let Some(pid) = *pid else { continue };
             // A child that is gone by now, or a group already empty, is
@@ -101,6 +119,15 @@ impl Forwarder {
                 Ok(())
             };
         }
+    }
+
+    /// Marks where the child's exit was seen: a signal caught after this
+    /// stops the run rather than being passed on, and one caught before it
+    /// is passed on while the child is not marked exited. Called before
+    /// [`ChildState::exited`], so a signal caught between the two stops the
+    /// run instead of being dropped.
+    pub(crate) fn child_exited(&self) {
+        let _ = self.relay.mark();
     }
 
     /// Ends [`Forwarder::forward`].

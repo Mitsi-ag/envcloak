@@ -30,11 +30,11 @@
 //!    error; then the command starts with the values and the env file's
 //!    ordinary variables in its environment only, its standard output and
 //!    standard error each through the redactor, and this command exits
-//!    with its code, or 128 plus the signal that ended it. A command that
-//!    is not found exits 127, and one that cannot be run 126, as with
-//!    `env(1)`. The command sees pipes rather than a terminal, so programs
-//!    that color their output only on a terminal print plain text; PTY
-//!    mode is M2's (`--pty`, docs/RUN.md).
+//!    with its code, or 128 plus the signal that ended it (or that stopped
+//!    the run after it exited). A command that is not found exits 127, and
+//!    one that cannot be run 126, as with `env(1)`. The command sees pipes
+//!    rather than a terminal, so programs that color their output only on
+//!    a terminal print plain text; PTY mode is M2's (`--pty`, docs/RUN.md).
 //!
 //! No argument is ever echoed, and no value is ever accepted on the
 //! command line (gate 13): `--ref` names an item, never a value. The

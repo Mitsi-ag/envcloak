@@ -237,6 +237,10 @@ const TESTS: &[Test] = &[
         a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff,
     ),
     (
+        "a_signal_after_the_exit_stops_a_stalled_run",
+        a_signal_after_the_exit_stops_a_stalled_run,
+    ),
+    (
         "harness_a_dropped_runner_takes_its_childs_group_with_it",
         harness_a_dropped_runner_takes_its_childs_group_with_it,
     ),
@@ -1780,6 +1784,49 @@ fn a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff() {
         assert_no_canary(&out, &cs);
         assert_no_canary(&err, &cs);
     }
+    home.assert_clean(&cs);
+}
+
+/// Review T12-2: after the child exits, with a descendant writing and
+/// nobody reading the runner's standard output, SIGTERM to the runner
+/// stops the run at once: it exits 143 well before the cutoff would have
+/// ended it (with the child's 0), and the descendant's pipes are closed.
+/// SIGTERM is sent every 50 ms until the runner exits: one that lands
+/// before the runner has seen the exit is passed on to the child's group,
+/// which ignores it.
+fn a_signal_after_the_exit_stops_a_stalled_run() {
+    let seed = fresh_seed();
+    let cs = all_canaries(seed);
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    let (mut p, stdout, mut gc, exiting) = leaves_a_writer(&home, &setup, false);
+    let end = exiting + Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = p.try_wait() {
+            break s;
+        }
+        assert!(Instant::now() < end, "the runner never exited");
+        let _ = envcloak_sys::signal_process(p.pid(), libc::SIGTERM);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let took = exiting.elapsed();
+    println!("stopped: the runner exited {took:?} after the child");
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+    assert!(
+        gc.gone_within(Duration::from_secs(10)),
+        "the descendant still runs"
+    );
+    let (_, _, err) = p.finish(Duration::from_secs(10));
+    let mut held = Vec::new();
+    stdout.unwrap().read_to_end(&mut held).unwrap();
+    assert_no_canary(&held, &cs);
+    assert_no_canary(&err, &cs);
     home.assert_clean(&cs);
 }
 
