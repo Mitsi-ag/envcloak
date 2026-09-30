@@ -597,7 +597,7 @@ currency = "$.balance_infos[0].currency"
 - Each item snapshots its allowed hosts at creation. A registry update that widens them requires approval.
 - Local registry overrides require an approval proof and show the hosts.
 - Adapters never follow redirects.
-- CODEOWNERS requires two maintainer reviews for any change to `allowed_hosts`, `auth` slots or `denied_paths`.
+- Any change to `allowed_hosts`, `auth` slots or `denied_paths` needs two maintainer reviews: CODEOWNERS names the owners of the registry, its loader, detection and their tests, and `main`'s branch protection requires code-owner review and 2 approvals (an M1 release blocker, §14).
 
 **Scope and CodexBar.**
 - Spend in EnvCloak is about attribution and control: which key, account, card and project a cost belongs to; budgets, alerts and forecasts; expiry, leak status, subscriptions and card health.
@@ -813,7 +813,7 @@ XChaCha20-Poly1305 (`chacha20poly1305` 0.11), Argon2id (`argon2` 0.6), HKDF-SHA2
 | # | Milestone | Done when |
 |---|---|---|
 | M0 | Repo, CI, spec, license, community files | CI green on an empty workspace |
-| M1 | Core vault and crypto (sealed rows, integrity digest, passphrase and Recovery Kit unlockers, encrypted backups); minimal daemon (socket hygiene, peer checks, lock and unlock, caller evidence, grants, passphrase approvals, audit); CLI (`vault create`, `unlock`, `lock`, `status`, `init`, `import`, `add`, `ls`, `show`, `ref`, `check`, `run`, `rotate`, `rm`, `approve`, `grants`, `backup`, `recover`, `recovery confirm`, `audit verify`, `daemon install`); redactor integration in pipe mode; provider detection | The fixture acceptance story (§15.1) and every M1 gate pass on macOS and Linux CI |
+| M1 | Core vault and crypto (sealed rows, integrity digest, passphrase and Recovery Kit unlockers, encrypted backups); minimal daemon (socket hygiene, peer checks, lock and unlock, caller evidence, grants, passphrase approvals, audit); CLI (`vault create`, `unlock`, `lock`, `status`, `init`, `import`, `add`, `ls`, `show`, `ref`, `check`, `run`, `rotate`, `rm`, `approve`, `grants`, `backup`, `recover`, `recovery confirm`, `audit verify`, `daemon install`); redactor integration in pipe mode; provider detection | The fixture acceptance story (§15.1) and every M1 gate pass on macOS and Linux CI; release blocker: `main`'s branch protection requires a pull request, review from code owners and 2 approving reviews (§8 "Registry safety"), which a repository admin sets |
 | M2 | PTY run mode, full agent catalog, live-key guard, standing approvals, reveal on the terminal, MCP server, agent installers with activation probes and coverage reporting (§7.1), `doctor`, `scrub`, `migrate-mcp` with `mcp-bridge`, machine-wide first-run scan and import | Claude Code and Codex run the fixture project via EnvCloak with no value in any transcript; every M2 gate passes |
 | M3 | macOS app: signed helper, Secure Enclave unlock and signed approvals, paste sheet, clipboard, first-run scan screen, keys, projects, activity, install CLI, login item, keychain rollback anchor | Manual QA script passes on a clean user account; every M3 gate passes |
 | M4 | Spend and money: key-attributed balance, spend and expiry adapters (CodexBar output as optional input), cards, subscriptions, budgets with separately labeled controls, alerts, forecasts | Adapters show live data for the fixture providers; every spend control is labeled with what it stops |

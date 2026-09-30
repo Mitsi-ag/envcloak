@@ -19,7 +19,7 @@ The crate's `embedded` test compares the compiled copy with `providers/` and fai
 
 ## Review
 
-A change to `providers/`, to `embedded.rs`, to the generator or to the loader rules (`safety.rs`, `registry.rs`) needs a code owner's review: `.github/CODEOWNERS` names the owners, and the crate's `embedded` test fails if it stops covering those files. SPEC §8 asks for two maintainer reviews of any change to `allowed_hosts`, `auth` or `denied_paths`. CODEOWNERS cannot enforce that alone: it is the branch protection on `main` (require a pull request, review from code owners and 2 approving reviews), which a repository admin sets.
+A change to `providers/`, to `embedded.rs`, to the generator, to the loader rules (`safety.rs`, `registry.rs`), to detection (`detect.rs`, which picks the provider whose hosts a new item gets) or to the crate's tests (`tests/`, which pin all of these) needs a code owner's review: `.github/CODEOWNERS` names the owners, and the crate's `embedded` test fails if it stops covering those files. SPEC §8 asks for two maintainer reviews of any change to `allowed_hosts`, `auth` or `denied_paths`. CODEOWNERS cannot enforce that alone: it is the branch protection on `main` (require a pull request, review from code owners and 2 approving reviews), which a repository admin sets. Setting it is an M1 release blocker (SPEC §14): until it is set, the review rule is only a convention.
 
 ## Provider file format
 

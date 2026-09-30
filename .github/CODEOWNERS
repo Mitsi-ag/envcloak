@@ -1,17 +1,21 @@
 # SPEC §8 "Registry safety": a change to a provider's allowed hosts, auth
 # slots or denied paths decides where a key may be sent, so it needs a code
 # owner's review. That covers the provider files and the multi-tenant suffix
-# list, their compiled copy, the generator that writes it, and the loader
-# rules that check them.
+# list, their compiled copy, the generator that writes it, the loader rules
+# that check them, detection (which picks the provider whose hosts are
+# copied into a new item), and the crate's tests that pin all of it.
 #
 # CODEOWNERS only names the reviewers. The two maintainer reviews SPEC §8
 # asks for are branch protection settings on main, set by a repository
 # admin: require a pull request, require review from code owners, and
-# require 2 approving reviews.
+# require 2 approving reviews. Setting them is an M1 release blocker
+# (SPEC §14).
 /providers/                                  @Mitsi-ag
 /crates/envcloak-providers/src/embedded.rs   @Mitsi-ag
 /crates/envcloak-providers/src/safety.rs     @Mitsi-ag
 /crates/envcloak-providers/src/registry.rs   @Mitsi-ag
+/crates/envcloak-providers/src/detect.rs     @Mitsi-ag
+/crates/envcloak-providers/tests/            @Mitsi-ag
 /scripts/gen-providers.py                    @Mitsi-ag
 /.github/CODEOWNERS                          @Mitsi-ag
 
