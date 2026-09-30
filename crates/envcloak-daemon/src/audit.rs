@@ -14,7 +14,10 @@
 //! log's keys come from the vault key. Events that cannot be written (the
 //! vault is locked, or the log's directory is unusable) wait in a bounded
 //! queue, with a count of the ones it had no room for, and are written
-//! first at the next chance. A delivery is different: its entry must be
+//! first at the next chance, followed by an entry with that count. What
+//! the writer finds when it opens the log (a torn tail removed, damage, a
+//! log behind its saved head, another vault's log moved aside) is written
+//! before them, never dropped for room. A delivery is different: its entry must be
 //! on disk before anything is released, so it is written at once or the
 //! request is denied ([`crate::state::State::audit_delivery`]).
 
@@ -760,8 +763,20 @@ impl AuditLog {
                 self.open_failed = false;
                 self.window_start = None;
                 self.retry_wait = None;
-                for r in findings(&report).into_iter().rev() {
-                    self.queue_front(r);
+                // What the writer found is written first, outside the
+                // capped queue: a flood of events while locked must not
+                // push out the only record of a damaged or cut log.
+                let mut found = findings(&report).into_iter();
+                while let Some(r) = found.next() {
+                    if self.write_first(&r).is_err() {
+                        // Kept ahead of the queue for the next chance, the
+                        // rest in order, each in place of the newest event.
+                        let rest: Vec<AuditRecord> = found.collect();
+                        for r in core::iter::once(r).chain(rest).rev() {
+                            self.queue_front(r);
+                        }
+                        break;
+                    }
                 }
                 // What waited while the log was closed is written now; on
                 // a failure it keeps waiting.
@@ -826,12 +841,24 @@ impl AuditLog {
         }
     }
 
+    /// Puts `r` (a writer's finding) ahead of the queue. A full queue
+    /// gives up its newest event for it, counted as dropped: a finding is
+    /// never the one dropped.
     fn queue_front(&mut self, r: AuditRecord) {
-        if self.queue.len() >= QUEUE_MAX {
+        if self.queue.len() >= QUEUE_MAX && self.queue.pop_back().is_some() {
             self.dropped = self.dropped.saturating_add(1);
-        } else {
-            self.queue.push_front(r);
         }
+        self.queue.push_front(r);
+    }
+
+    /// Writes `r` now, ahead of the queue, with no flush of it first.
+    fn write_first(&mut self, r: &AuditRecord) -> Result<(), AuditError> {
+        let w = self.writer.as_mut().ok_or_else(|| {
+            AuditError::from(std::io::Error::from(std::io::ErrorKind::NotConnected))
+        })?;
+        w.append(r)?;
+        self.since_anchor += 1;
+        Ok(())
     }
 
     /// Writes the queue, and the count of dropped events.
@@ -962,6 +989,139 @@ fn findings(r: &OpenReport) -> Vec<AuditRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envcloak_core::crypto::KdfParams;
+    use envcloak_core::vault::VaultPaths;
+    use envcloak_core::{RecoveryKit, SecretBytes, create_vault_with_kit};
+
+    /// A new vault, unlocked, in a temporary directory.
+    fn vault() -> (tempfile::TempDir, VaultPaths, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = VaultPaths::under(dir.path().join("data"));
+        let v = create_vault_with_kit(
+            &paths,
+            &SecretBytes::copy_from(b"a passphrase long enough to pass"),
+            &RecoveryKit::generate(),
+            KdfParams::minimum(),
+        )
+        .unwrap();
+        (dir, paths, v)
+    }
+
+    /// An event told apart from the others by its pid.
+    fn event(pid: usize) -> AuditRecord {
+        AuditEvent::Revoked {
+            pid: i32::try_from(pid).unwrap(),
+            count: 0,
+        }
+        .record()
+    }
+
+    /// The entries' (kind, outcome, pid), in order.
+    fn outline(v: &Vault) -> Vec<(AuditKind, String, i32)> {
+        let (entries, _) = v.read_audit().unwrap();
+        entries
+            .into_iter()
+            .map(|e| {
+                (
+                    e.record.kind,
+                    e.record.decision.outcome,
+                    e.record.subject.pid,
+                )
+            })
+            .collect()
+    }
+
+    /// Review T10 open 2: the events that came while the log was closed
+    /// are written at the next open, in order, and after them one entry
+    /// counts, exactly, those the queue had no room for.
+    #[test]
+    fn events_dropped_while_closed_are_counted_at_the_next_open() {
+        let (_dir, _paths, v) = vault();
+        let mut log = AuditLog::default();
+        for i in 0..QUEUE_MAX + 9 {
+            assert!(!log.record(event(i)));
+        }
+        assert_eq!(log.backlog(), (QUEUE_MAX as u64, 9));
+        assert!(log.open(&v));
+        assert_eq!(log.backlog(), (0, 0));
+        let _ = log.close();
+
+        let (entries, report) = v.read_audit().unwrap();
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(entries.len(), QUEUE_MAX + 1);
+        for (i, e) in entries[..QUEUE_MAX].iter().enumerate() {
+            assert_eq!(e.record.kind, AuditKind::Revoke);
+            assert_eq!(e.record.subject.pid, i32::try_from(i).unwrap());
+        }
+        let last = &entries[QUEUE_MAX].record;
+        assert_eq!(
+            (
+                last.kind,
+                last.decision.outcome.as_str(),
+                last.decision.count
+            ),
+            (AuditKind::Dropped, "dropped", Some(9))
+        );
+    }
+
+    /// Review T10 open 2: what the writer finds when it opens the log is
+    /// written first, even when events that came while it was closed
+    /// filled the queue: a flood cannot erase the only record of damage.
+    #[test]
+    fn a_finding_at_open_is_written_whatever_the_queue_holds() {
+        let (_dir, paths, v) = vault();
+        let mut log = AuditLog::default();
+        assert!(log.open(&v));
+        for i in 0..3 {
+            assert!(log.record(event(i)));
+        }
+        let _ = log.close();
+        // One byte of the middle entry changed on disk: damage.
+        let seg = paths.audit_dir.join(format!("{:020}.seg", 1));
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 0x40;
+        std::fs::write(&seg, &bytes).unwrap();
+
+        for i in 0..QUEUE_MAX + 2 {
+            assert!(!log.record(event(100 + i)));
+        }
+        assert!(log.open(&v));
+        let _ = log.close();
+        let after: Vec<(AuditKind, String, i32)> = outline(&v)
+            .into_iter()
+            .skip_while(|(kind, _, _)| *kind != AuditKind::Log)
+            .collect();
+        assert_eq!(after.len(), 1 + QUEUE_MAX + 1, "{after:?}");
+        assert_eq!(after[0], (AuditKind::Log, "damaged".to_owned(), 0));
+        for (i, e) in after[1..=QUEUE_MAX].iter().enumerate() {
+            assert_eq!(
+                (e.0, e.2),
+                (AuditKind::Revoke, i32::try_from(100 + i).unwrap())
+            );
+        }
+        assert_eq!(after[QUEUE_MAX + 1].0, AuditKind::Dropped);
+        let (entries, _) = v.read_audit().unwrap();
+        assert_eq!(entries.last().unwrap().record.decision.count, Some(2));
+    }
+
+    /// A finding that must wait goes ahead of a full queue, which gives up
+    /// its newest event for it (counted as dropped), never the finding.
+    #[test]
+    fn a_full_queue_gives_up_its_newest_event_for_a_finding() {
+        let mut log = AuditLog::default();
+        for i in 0..QUEUE_MAX {
+            assert!(!log.record(event(i)));
+        }
+        let finding = AuditRecord::new(AuditKind::Log, "damaged");
+        log.queue_front(finding.clone());
+        assert_eq!(log.backlog(), (QUEUE_MAX as u64, 1));
+        assert_eq!(log.queue.front(), Some(&finding));
+        assert_eq!(
+            log.queue.back().map(|r| r.subject.pid),
+            Some(i32::try_from(QUEUE_MAX - 2).unwrap())
+        );
+    }
 
     #[test]
     fn hashes_are_lower_case_hex() {
