@@ -27,7 +27,14 @@ auth = [
 # authorizations; site administration; and the endpoints that give an
 # account lasting access, which a key rotation does not end: repository
 # collaborators and invitations, organization invitations, memberships
-# and outside collaborators, team memberships, and SCIM provisioning.
+# and outside collaborators, team memberships, and SCIM provisioning;
+# a repository's transfer to another owner, a repository added to an app
+# installation, an email address added to the account (it can receive
+# password resets), organization roles given to users and teams (and the
+# older security manager role), and a repository given to a team (by
+# slug, or by team id on the older route). Webhooks, which keep sending a
+# repository's or organization's events to a URL, are left to the proxy's
+# review (M6): denied paths only gate balance requests before it.
 denied_paths = [
   "/authorizations",
   "/applications",
@@ -60,6 +67,13 @@ denied_paths = [
   "/orgs/*/teams/*/memberships",
   "/teams/*/memberships",
   "/scim",
+  "/repos/*/*/transfer",
+  "/user/installations/*/repositories",
+  "/user/emails",
+  "/orgs/*/organization-roles",
+  "/orgs/*/security-managers",
+  "/orgs/*/teams/*/repos/*/*",
+  "/teams/*/repos/*/*",
 ]
 
 [links]
