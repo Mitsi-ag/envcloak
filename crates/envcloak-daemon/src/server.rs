@@ -82,9 +82,15 @@ pub const MAX_CONNECTIONS: usize = 32;
 pub const MAX_PER_PROCESS: usize = 8;
 /// A frame's body must arrive within this long of its first byte.
 pub const FRAME_DEADLINE: Duration = Duration::from_secs(10);
-/// A connection with no frame for this long is closed. Long enough for a
-/// person to type a passphrase between connecting and sending it.
-pub const IDLE_CONNECTION: Duration = Duration::from_secs(600);
+/// A connection with no frame for this long is closed. No client waits
+/// for a person on an open connection: every CLI prompt is answered
+/// before the CLI connects, and each step of a flow that does local work
+/// between requests (`init --delete-plaintext`'s scans and file changes,
+/// `import`'s plan and commit) opens a connection of its own. Only a
+/// process that holds connections idle gains from a longer wait, and four
+/// of them holding [`MAX_PER_PROCESS`] each could keep every place taken,
+/// and `envcloak lock` and `status` out, for that long (review T7 open 2).
+pub const IDLE_CONNECTION: Duration = Duration::from_secs(30);
 /// A response must be written within this long.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -477,6 +483,13 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
     }
 }
 
+/// The wait for a frame to start: [`IDLE_CONNECTION`], or a test build's
+/// override ([`envcloak_sys::idle_connection_override`]).
+fn idle_connection() -> Duration {
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| envcloak_sys::idle_connection_override().unwrap_or(IDLE_CONNECTION))
+}
+
 /// Reads with a deadline: [`IDLE_CONNECTION`] until the first byte of a
 /// frame, then [`FRAME_DEADLINE`] for the rest of it.
 struct FrameReader<'a> {
@@ -489,7 +502,7 @@ impl<'a> FrameReader<'a> {
     fn new(stream: &'a UnixStream) -> Self {
         FrameReader {
             stream,
-            deadline: Instant::now() + IDLE_CONNECTION,
+            deadline: Instant::now() + idle_connection(),
             started: false,
         }
     }

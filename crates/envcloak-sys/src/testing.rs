@@ -961,3 +961,22 @@ pub(crate) fn panic_point(site: &str) {
         String::from_utf8_lossy(&payload)
     );
 }
+
+/// Names the time, in milliseconds, a test build of `envcloakd` waits for
+/// a frame to start on an open connection, in place of its bound
+/// ([`crate::idle_connection_override`]).
+pub const IDLE_CONNECTION_MS: &str = "ENVCLOAK_TEST_IDLE_CONNECTION_MS";
+
+/// [`IDLE_CONNECTION_MS`] as a duration: 1 to 600000 milliseconds, in
+/// ASCII digits; anything else is no override.
+pub(crate) fn idle_connection() -> Option<std::time::Duration> {
+    let v = std::env::var_os(IDLE_CONNECTION_MS)?;
+    let v = v.to_str()?;
+    if v.is_empty() || v.len() > 6 || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ms: u64 = v.parse().ok()?;
+    (1..=600_000)
+        .contains(&ms)
+        .then(|| std::time::Duration::from_millis(ms))
+}

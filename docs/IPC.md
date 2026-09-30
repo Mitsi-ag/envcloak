@@ -50,7 +50,7 @@ A frame is a 4-byte big-endian length `N`, then `N` bytes of UTF-8 JSON holding 
 
 - `1 ≤ N ≤ 1 MiB`. A header announcing 0 or more than 1 MiB is answered with an error (`invalid_request` or `frame_too_large`, `id` null) and the connection is closed; nothing after the header is read.
 - A frame's body may hold a value, so both sides keep it in a buffer wiped on drop. An incoming body starts in a 16 KiB buffer that doubles as bytes arrive, up to the announced length; each growth copies into a new buffer and wipes the old one.
-- The daemon waits up to 10 minutes for a frame to start, then up to 10 seconds from its first byte for the rest of it. A connection that misses either is closed.
+- The daemon waits up to 30 seconds for a frame to start, then up to 10 seconds from its first byte for the rest of it. A connection that misses either is closed. No client waits for a person on an open connection: a prompt is answered before the CLI connects, and each step of a flow that does local work between requests (`init --delete-plaintext`, `import`) connects again. A longer wait would only help a process that holds connections idle: four such processes, 8 connections each, could keep all 32 places, and `envcloak lock` and `status` out, for as long as it lasts.
 - One request gets exactly one response, in order. A connection may carry any number of requests.
 
 ## Messages
