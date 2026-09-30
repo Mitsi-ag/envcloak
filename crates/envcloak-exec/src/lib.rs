@@ -39,7 +39,9 @@
 //!    output nobody reads is given up then too, so a stalled reader cannot
 //!    hold such a pipe open past the cutoff (review F-49); what is left in
 //!    a pipe that no process holds any more is delivered at the reader's
-//!    pace.
+//!    pace. SIGINT, SIGTERM, SIGHUP or SIGQUIT caught after the exit stops
+//!    the run at once, whatever is left: [`ChildExit::Stopped`], 128 plus
+//!    its number (review T12-2).
 //!
 //! When the reader of this process's output goes away (`EPIPE`), the
 //! child's end of that pipe is closed too, so the child gets `SIGPIPE` or
@@ -140,22 +142,28 @@ impl core::fmt::Debug for RunSpec {
     }
 }
 
-/// How the child ended.
+/// How the child ended, or how the run was stopped after it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChildExit {
     /// It exited with this code.
     Code(u8),
     /// This signal ended it.
     Signal(i32),
+    /// It exited, and this signal, caught after its exit was seen, stopped
+    /// the run before its output was all read or delivered: what was left
+    /// is lost, never passed through (review T12-2).
+    Stopped(i32),
 }
 
 impl ChildExit {
-    /// The code a shell reports: the exit code, or 128 plus the signal's
-    /// number.
+    /// The code a shell reports: the exit code, or 128 plus the number of
+    /// the signal that ended the child or stopped the run.
     pub fn shell_code(&self) -> u8 {
         match *self {
             ChildExit::Code(c) => c,
-            ChildExit::Signal(s) => u8::try_from(128 + s.clamp(0, 127)).unwrap_or(u8::MAX),
+            ChildExit::Signal(s) | ChildExit::Stopped(s) => {
+                u8::try_from(128 + s.clamp(0, 127)).unwrap_or(u8::MAX)
+            }
         }
     }
 }
@@ -331,7 +339,7 @@ fn follow(
             });
         let f = std::thread::Builder::new()
             .name("envcloak-signals".into())
-            .spawn_scoped(s, || forwarder.forward(&state));
+            .spawn_scoped(s, || forwarder.forward(&state, &cutoff));
         // Without its threads the child would block on a full pipe, or run
         // with no one to pass signals on: it is killed. The threads that
         // did start end with its pipes, the cutoff and the forwarder's
@@ -347,11 +355,13 @@ fn follow(
             forwarder.stop();
         }
         let waited = envcloak_sys::wait_for_exit(pid);
+        // Signals caught from here on stop the run (review T12-2).
+        forwarder.child_exited();
         state.exited();
         let status = child.wait();
         cutoff.start(DRAIN_LIMIT);
-        // Bounded by the cutoff while a descendant holds a pipe (review
-        // F-49).
+        // Bounded by the cutoff while a descendant holds a pipe, and by a
+        // signal that stops the run (review F-49).
         cutoff.wait_for_pumps(interrupter);
         for pump in [a, b].into_iter().flatten() {
             let _ = pump.join();
@@ -364,7 +374,11 @@ fn follow(
             return Err(ExecError::Setup(kind));
         }
         waited.map_err(setup)?;
-        Ok(ChildExit::from(status.map_err(setup)?))
+        let status = status.map_err(setup)?;
+        Ok(match cutoff.stopped_by() {
+            Some(sig) => ChildExit::Stopped(sig),
+            None => ChildExit::from(status),
+        })
     })
 }
 
@@ -405,5 +419,15 @@ mod tests {
         );
         assert_eq!(spec.idle_flush, IDLE_FLUSH);
         assert!(spec.stdin.is_none());
+    }
+
+    /// A run stopped by a signal after the child's exit reports 128 plus
+    /// the signal, as a death by that signal would.
+    #[test]
+    fn a_stopped_run_reports_128_plus_its_signal() {
+        assert_eq!(ChildExit::Stopped(libc::SIGTERM).shell_code(), 143);
+        assert_eq!(ChildExit::Stopped(libc::SIGINT).shell_code(), 130);
+        assert_eq!(ChildExit::Signal(libc::SIGTERM).shell_code(), 143);
+        assert_eq!(ChildExit::Code(3).shell_code(), 3);
     }
 }

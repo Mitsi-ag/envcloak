@@ -27,7 +27,8 @@
 //! - once no writer holds it (the child and every descendant closed it:
 //!   [`envcloak_sys::hung_up`]), what is left in it is read to the end and
 //!   delivered as fast as the reader takes it, as it would be from any
-//!   program writing there.
+//!   program writing there, until a signal stops the run
+//!   ([`Cutoff::stop_now`]).
 //!
 //! A write to a non-blocking output waits for room with `poll`, until the
 //! deadline. A blocking write that must be given up is broken off by
@@ -52,10 +53,11 @@ const CHUNK: usize = 64 * 1024;
 /// write is lost, and the next one ends the write.
 const NUDGE: Duration = Duration::from_millis(20);
 
-/// When the pumps must stop: set once the child has exited. Also counts
-/// the pumps still running, and those whose pipe no writer holds any
-/// more, so the thread that waits for them knows when to break off their
-/// writes.
+/// When the pumps must stop: set once the child has exited, or moved to
+/// now by a signal that asks the run to stop ([`Cutoff::stop_now`]). Also
+/// counts the pumps still running, and those whose pipe no writer holds
+/// any more, so the thread that waits for them knows when to break off
+/// their writes.
 #[derive(Debug, Default)]
 pub(crate) struct Cutoff {
     state: Mutex<CutState>,
@@ -65,6 +67,8 @@ pub(crate) struct Cutoff {
 #[derive(Debug, Default)]
 struct CutState {
     deadline: Option<Instant>,
+    /// The signal that moved the deadline to now, if one did.
+    stopped_by: Option<i32>,
     /// Pumps started and not yet ended ([`PumpToken`]).
     pumps: usize,
     /// Of those, the ones whose pipe no writer holds ([`PumpToken::settle`]).
@@ -91,16 +95,17 @@ pub(crate) struct PumpToken<'a> {
 enum Phase<'f> {
     /// Reading its pipe, `fd`.
     Reading(BorrowedFd<'f>),
-    /// Its pipe reached its end: what is left waits for the reader.
+    /// Its pipe reached its end: what is left waits for the reader until
+    /// the run is stopped.
     Ended,
-    /// It closed its pipe at the cutoff: only what the output takes at
-    /// once.
+    /// It closed its pipe at the cutoff or a stop: only what the output
+    /// takes at once.
     Cut,
 }
 
 impl PumpToken<'_> {
     /// No writer holds the pump's pipe any more: what it still writes
-    /// waits for the reader, deadline or not.
+    /// waits for the reader, deadline or not, until the run is stopped.
     fn settle(&mut self) {
         if !self.settled {
             self.settled = true;
@@ -123,14 +128,18 @@ impl PumpToken<'_> {
     }
 
     /// Whether the pump, in `phase`, must stop reading or give up a write
-    /// that has not finished: after a cut always, and while reading, once
-    /// the deadline has passed with a writer still holding the pipe.
+    /// that has not finished: after a cut always; once the run is stopped
+    /// always; and while reading, once the deadline has passed with a
+    /// writer still holding the pipe.
     fn must_give_up(&mut self, phase: Phase<'_>) -> bool {
-        let passed = self.cutoff.lock().passed();
+        let (stopped, passed) = {
+            let st = self.cutoff.lock();
+            (st.stopped_by.is_some(), st.passed())
+        };
         match phase {
             Phase::Cut => true,
-            Phase::Ended => false,
-            Phase::Reading(fd) => passed && self.held(fd),
+            Phase::Ended => stopped,
+            Phase::Reading(fd) => stopped || (passed && self.held(fd)),
         }
     }
 
@@ -164,13 +173,29 @@ impl Cutoff {
     }
 
     /// Starts the clock: the pumps stop `limit` from now. A deadline set
-    /// already stays.
+    /// already (by an earlier start or by [`Cutoff::stop_now`]) stays.
     pub(crate) fn start(&self, limit: Duration) {
         let mut st = self.lock();
         if st.deadline.is_none() {
             st.deadline = Some(Instant::now() + limit);
             self.changed.notify_all();
         }
+    }
+
+    /// Stops the run for signal `sig` (the first one is kept): the
+    /// deadline moves to now, and every pump closes its pipe and gives up
+    /// its write, whether a writer holds the pipe or not.
+    pub(crate) fn stop_now(&self, sig: i32) {
+        let mut st = self.lock();
+        let now = Instant::now();
+        st.deadline = Some(st.deadline.map_or(now, |d| d.min(now)));
+        st.stopped_by.get_or_insert(sig);
+        self.changed.notify_all();
+    }
+
+    /// The signal that stopped the run, if one did.
+    pub(crate) fn stopped_by(&self) -> Option<i32> {
+        self.lock().stopped_by
     }
 
     /// The time left, or `None` while the child runs.
@@ -191,8 +216,8 @@ impl Cutoff {
     }
 
     /// Waits until every counted pump has ended. While one may have to give
-    /// up its write (the deadline has passed and a pump has not seen its
-    /// pipe released by every writer), the pumps'
+    /// up its write (the run was stopped, or the deadline has passed and a
+    /// pump has not seen its pipe released by every writer), the pumps'
     /// threads are interrupted every [`NUDGE`]: a write blocked on an
     /// output nobody reads returns then, and the pump that must give it up
     /// does. Otherwise nothing is interrupted, so ordinary backpressure
@@ -200,7 +225,7 @@ impl Cutoff {
     pub(crate) fn wait_for_pumps(&self, threads: &Interrupter) {
         let mut st = self.lock();
         while st.pumps > 0 {
-            let nudge = st.passed() && st.pumps > st.settled;
+            let nudge = st.stopped_by.is_some() || (st.passed() && st.pumps > st.settled);
             if nudge {
                 drop(st);
                 threads.interrupt();
@@ -233,7 +258,8 @@ impl Cutoff {
 pub(crate) enum PumpEnd {
     /// The pipe reached end of stream, or could not be read.
     Eof,
-    /// The cutoff passed with a writer still holding the pipe.
+    /// The cutoff passed with a writer still holding the pipe, or the run
+    /// was stopped.
     Cut,
     /// The output could not be written.
     OutputClosed,
@@ -592,6 +618,37 @@ mod tests {
                     .is_err(),
                 "the pipe stayed open ({nonblocking})"
             );
+            assert_eq!(cutoff.stopped_by(), None);
+        }
+    }
+
+    /// A pipe no writer holds, and an output nobody reads for now: the
+    /// deadline does not cut what is left of it (a slow reader gets all of
+    /// it, as from any program), but a signal that stops the run does
+    /// (review T12-2), whether the write blocks or waits for room.
+    #[test]
+    fn an_ended_pipe_waits_for_its_reader_until_the_run_is_stopped() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let interrupter = Arc::new(Interrupter::install().unwrap());
+        for nonblocking in [false, true] {
+            let cutoff = Arc::new(Cutoff::default());
+            let (mut child, _reader, pump, _) = start_stalled(&cutoff, &interrupter, nonblocking);
+            child.write_all(b"the last line\n").unwrap();
+            drop(child);
+            cutoff.start(Duration::from_millis(50));
+            let ended = waiting(&cutoff, &interrupter);
+            assert!(
+                ended.recv_timeout(Duration::from_millis(600)).is_err(),
+                "an ended pipe's output was cut at the deadline ({nonblocking})"
+            );
+            let started = Instant::now();
+            cutoff.stop_now(libc::SIGTERM);
+            ended
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("a stop did not end the write ({nonblocking})"));
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert_eq!(pump.join().unwrap(), PumpEnd::Eof);
+            assert_eq!(cutoff.stopped_by(), Some(libc::SIGTERM));
         }
     }
 
