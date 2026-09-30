@@ -1174,3 +1174,160 @@ fn grants_survive_ticks_while_their_root_lives() {
     }
     f.sweep();
 }
+
+/// Set in the environment of [`permitted_caller_child`]: `digest` or
+/// `approve`, the daemon's run directory and the request's id, a line
+/// each.
+const PERMITTED_ENV: &str = "ENVCLOAK_TEST_PERMITTED_CALLER";
+
+/// Runs only as the permitted caller of
+/// [`an_approve_from_the_requesters_session_is_refused_at_approve`]: this
+/// test binary again, a child of that test's process that leads a session
+/// on a pseudo-terminal of its own, as a person's command in another
+/// terminal window does. `digest`: prints the digest of the request's
+/// statement with the options that test approves with. `approve`:
+/// approves it with the passphrase read from standard input, and prints
+/// the grant.
+#[test]
+fn permitted_caller_child() {
+    use std::io::Read;
+    let Some(spec) = std::env::var_os(PERMITTED_ENV) else {
+        return;
+    };
+    let spec = spec.into_string().unwrap();
+    let mut lines = spec.lines();
+    let (mode, run_dir, id) = (
+        lines.next().unwrap(),
+        lines.next().unwrap(),
+        lines.next().unwrap(),
+    );
+    common::terminal_session();
+    let paths = envcloak_ipc::RunPaths::under(std::path::PathBuf::from(run_dir)).unwrap();
+    let mut c = Client::connect(&paths).unwrap();
+    let d = c.pending_get(id, &[]).unwrap();
+    let digest = statement_digest(&d, &session(60));
+    match mode {
+        "digest" => {
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            println!("\ndigest={hex}");
+        }
+        "approve" => {
+            let mut pass = Vec::new();
+            std::io::stdin().read_to_end(&mut pass).unwrap();
+            let grant = c
+                .approve(id, session(60), &digest, SecretBytes::from_vec(pass), &[])
+                .unwrap();
+            println!("\ngrant={}", grant.grant);
+        }
+        other => panic!("unknown mode {other}"),
+    }
+}
+
+/// Runs [`permitted_caller_child`] in `mode` for request `id`, with
+/// `input` on its standard input, and returns the value it printed.
+fn permitted_caller(f: &Fixture, mode: &str, id: &str, input: &[u8]) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let run_dir = envcloak_testkit::daemon_run_dir(&f.home);
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    f.home
+        .apply(&mut cmd)
+        .args([
+            "--exact",
+            "permitted_caller_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            PERMITTED_ENV,
+            format!("{mode}\n{}\n{id}", run_dir.to_str().unwrap()),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input).unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let key = if mode == "approve" {
+        "grant="
+    } else {
+        "digest="
+    };
+    text.lines()
+        .find_map(|l| l.strip_prefix(key))
+        .unwrap_or_else(|| panic!("no {key} line: {text}"))
+        .to_owned()
+}
+
+/// Review R-15 (gate 23, the approve side of `requester_terminal`): the
+/// request comes from this test process claiming an agent's marker, so
+/// its chain's root is this process, which leads the session. A permitted
+/// caller in a session and on a terminal of its own reads the statement
+/// and gives the digest; this process, in the requester's session, then
+/// calls `approve` directly with that digest, never having been shown
+/// the statement itself (`pending.get` refuses it). Refused
+/// `proof_refused` with the reason `requester_terminal` and audited,
+/// with a wrong passphrase and with the right one: no attempt is
+/// counted, the limiter does not move, no grant is made, and the request
+/// still waits, as the permitted caller's approval with the same digest
+/// then shows.
+#[test]
+fn an_approve_from_the_requesters_session_is_refused_at_approve() {
+    let f = Fixture::new();
+    let mut c = client(&f.home);
+    let mut params = f.params(&["./emit"]);
+    params.claims = vec!["CLAUDECODE".to_owned()];
+    let id = pending(&c.run_request(&params).unwrap().decision);
+    let refused = (ErrorKind::ProofRefused, Some("requester_terminal"));
+    assert_eq!(rpc_kind(c.pending_get(&id, &[]).unwrap_err()), refused);
+
+    let hex = permitted_caller(&f, "digest", &id, b"");
+    let digest: [u8; 32] = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    let before = c.status().unwrap().approvals;
+    for pass in [b"not the passphrase at all, no".as_slice(), f.pass()] {
+        let e = c
+            .approve(&id, session(60), &digest, SecretBytes::copy_from(pass), &[])
+            .unwrap_err();
+        assert_eq!(rpc_kind(e), refused);
+    }
+    let after = c.status().unwrap().approvals;
+    assert_eq!(
+        (
+            after.proof_failures,
+            after.proof_wait_secs,
+            after.grants,
+            after.pending
+        ),
+        (before.proof_failures, before.proof_wait_secs, 0, 1)
+    );
+    assert_eq!(after.proof_failures, 0);
+    assert!(c.grants_list().unwrap().grants.is_empty());
+    let log = f.d.log();
+    assert_eq!(
+        log.matches("proof refused method=approve reason=requester_terminal ")
+            .count(),
+        2,
+        "{log}"
+    );
+    assert!(!log.contains("approve failed"), "{log}");
+
+    // The request still waits, and the digest was the statement's: the
+    // permitted caller approves it with the same one.
+    let grant = permitted_caller(&f, "approve", &id, f.pass());
+    GrantId::parse(&grant).unwrap();
+    assert_eq!(c.grants_list().unwrap().grants.len(), 1);
+    f.sweep();
+}
