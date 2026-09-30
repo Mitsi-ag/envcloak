@@ -113,7 +113,10 @@ auth = [
 # environment and organization), organization private registries,
 # runner registration and removal tokens (repository, organization and
 # enterprise), organization token policies and SSO credential
-# authorizations; and site administration.
+# authorizations; site administration; and the endpoints that give an
+# account lasting access, which a key rotation does not end: repository
+# collaborators and invitations, organization invitations, memberships
+# and outside collaborators, team memberships, and SCIM provisioning.
 denied_paths = [
   "/authorizations",
   "/applications",
@@ -138,6 +141,14 @@ denied_paths = [
   "/orgs/*/personal-access-tokens",
   "/orgs/*/personal-access-token-requests",
   "/enterprises/*/actions/runners",
+  "/repos/*/*/collaborators",
+  "/repos/*/*/invitations",
+  "/orgs/*/invitations",
+  "/orgs/*/memberships",
+  "/orgs/*/outside_collaborators",
+  "/orgs/*/teams/*/memberships",
+  "/teams/*/memberships",
+  "/scim",
 ]
 
 [links]
