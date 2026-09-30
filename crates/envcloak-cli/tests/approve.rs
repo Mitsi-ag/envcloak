@@ -58,11 +58,35 @@ impl Fixture {
     }
 
     fn with_manifest(manifest: &str) -> Self {
+        Self::build(manifest, None)
+    }
+
+    /// The fixture with `extension` as the one file of the user's agent
+    /// catalog extensions (`<data>/agents.d/test.toml`), written before
+    /// the daemon starts and reads them.
+    fn with_extension(extension: &str) -> Self {
+        Self::build(MANIFEST, Some(extension))
+    }
+
+    fn build(manifest: &str, extension: Option<&str>) -> Self {
         let cs = canaries(fresh_seed());
         let home = TestHome::new();
         let kit = seed_vault(&home, &cs);
         let mut cs = cs;
         cs.push(kit);
+        if let Some(text) = extension {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            let dir = common::data_dir(&home).join(envcloak_policy::AGENTS_DIR);
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(dir.join("test.toml"))
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        }
         let d = start_daemon(&home);
         let files = outside_dir();
         let pass = secret_file(
@@ -688,28 +712,31 @@ fn an_empty_passphrase_line_sends_nothing() {
     f.sweep();
 }
 
-/// Review T9 open 3 (gate 23: approval input is never read from the
-/// requester's terminal). A shell on a pseudo-terminal runs the fixture
-/// agent in the background, and the agent's `envcloak run` is pending. A
-/// sibling of the agent on that terminal, a terminal subject with no
-/// agent in its ancestry, runs `envcloak approve`: refused
-/// (`proof_refused`, reason `requester_terminal`) before the statement is
-/// shown or the passphrase read. From another terminal the same approval
-/// goes through, and the agent's next run is covered.
-#[test]
-fn an_approval_from_the_agents_terminal_is_refused() {
-    let f = Fixture::new();
+/// A shell on a pseudo-terminal of its own, as a person's terminal
+/// window, runs `agent -- /bin/sh <fifo` in the background, as a person
+/// starts an agent there, and has the agent's shell run `envcloak run --
+/// ./emit` in the project, through `through` when given (`ec-probe
+/// --session`: in a session of its own, without a terminal, as Claude
+/// Code runs each command). The request is pending. A sibling of the
+/// agent on that terminal, a terminal subject with no agent in its
+/// ancestry, then runs `envcloak approve` for it, with the passphrase on
+/// descriptor 3. Once `go` is written, the agent's shell runs `envcloak
+/// run` once more, the same way. Each step writes its files in the
+/// returned directory.
+fn on_the_agents_terminal(f: &Fixture, agent: &Path, through: Option<&Path>) -> (Child, PathBuf) {
     let dir = f.home.root().join("sibling");
     std::fs::create_dir_all(&dir).unwrap();
     let at = |name: &str| quoted(dir.join(name).to_str().unwrap());
-    let agent = testkit_bin("fixture-agent");
     let cli = quoted(cli().to_str().unwrap());
+    let through = through.map_or_else(String::new, |p| {
+        format!("{} --session -- ", quoted(p.to_str().unwrap()))
+    });
     let script = format!(
         "set -u\n\
          mkfifo {fifo}\n\
          {agent} -- /bin/sh <{fifo} >/dev/null 2>&1 &\n\
          exec 4>{fifo}\n\
-         echo \"cd {project}; {cli} run -- ./emit 2>{run_err}; echo \\$? >{run_code}\" >&4\n\
+         echo \"cd {project}; {through}{cli} run -- ./emit 2>{run_err}; echo \\$? >{run_code}\" >&4\n\
          while [ ! -s {run_code} ]; do sleep 0.05; done\n\
          id=$(sed -n 's/.*request=\\([0-9A-Z]*\\).*/\\1/p' {run_err} | head -n 1)\n\
          exec 3<{pass}\n\
@@ -718,14 +745,13 @@ fn an_approval_from_the_agents_terminal_is_refused() {
          cat <&3 | wc -c >{left}\n\
          exec 3<&-\n\
          while [ ! -e {go} ]; do sleep 0.05; done\n\
-         echo \"{cli} run -- /bin/sh -c true >/dev/null 2>{rerun_err}; echo \\$? >{rerun_code}\" >&4\n\
+         echo \"{through}{cli} run -- /bin/sh -c true >/dev/null 2>{rerun_err}; echo \\$? >{rerun_code}\" >&4\n\
          while [ ! -s {rerun_code} ]; do sleep 0.05; done\n\
          exec 4>&-\n\
          wait\n",
         fifo = at("agent.in"),
         agent = quoted(agent.to_str().unwrap()),
         project = quoted(f.project.to_str().unwrap()),
-        cli = cli,
         run_err = at("run.err"),
         run_code = at("run.code"),
         pass = quoted(f.pass.to_str().unwrap()),
@@ -737,28 +763,39 @@ fn an_approval_from_the_agents_terminal_is_refused() {
         rerun_err = at("rerun.err"),
         rerun_code = at("rerun.code"),
     );
-    let mut child = common::on_terminal_program(
+    let child = common::on_terminal_program(
         &f.home,
         &[Path::new("/bin/sh"), Path::new("-c"), Path::new(&script)],
         &[],
     )
     .spawn()
     .unwrap();
-    let read = |name: &str| {
-        let end = Instant::now() + Duration::from_secs(60);
-        loop {
-            if let Ok(s) = std::fs::read_to_string(dir.join(name)) {
-                if s.ends_with('\n') {
-                    return s;
-                }
+    (child, dir)
+}
+
+/// A file [`on_the_agents_terminal`] writes, once it ends with a newline;
+/// the test fails after a minute.
+fn read_line_file(dir: &Path, name: &str) -> String {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join(name)) {
+            if s.ends_with('\n') {
+                return s;
             }
-            assert!(Instant::now() < end, "{name} was not written");
-            std::thread::sleep(Duration::from_millis(20));
         }
-    };
-    assert_eq!(read("run.code").trim(), "125");
-    let id = request_id(&read("run.err"));
-    assert_eq!(read("approve.code").trim(), "1");
+        assert!(Instant::now() < end, "{name} was not written");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What [`on_the_agents_terminal`]'s sibling saw: its `envcloak approve`
+/// was refused (`proof_refused`, reason `requester_terminal`) before the
+/// statement was shown or the passphrase read, and the request is still
+/// waiting. Returns the request's id.
+fn sibling_was_refused(f: &Fixture, dir: &Path) -> String {
+    assert_eq!(read_line_file(dir, "run.code").trim(), "125");
+    let id = request_id(&read_line_file(dir, "run.err"));
+    assert_eq!(read_line_file(dir, "approve.code").trim(), "1");
     let err = std::fs::read_to_string(dir.join("approve.err")).unwrap();
     assert!(err.starts_with("envcloak: proof_refused:"), "{err}");
     assert!(err.contains("approve it from another terminal"), "{err}");
@@ -769,7 +806,7 @@ fn an_approval_from_the_agents_terminal_is_refused() {
     );
     let pass_len = std::fs::metadata(&f.pass).unwrap().len();
     assert_eq!(
-        read("left").trim().parse::<u64>().unwrap(),
+        read_line_file(dir, "left").trim().parse::<u64>().unwrap(),
         pass_len,
         "the passphrase was read"
     );
@@ -783,16 +820,14 @@ fn an_approval_from_the_agents_terminal_is_refused() {
         log.contains("proof refused method=pending.get reason=requester_terminal "),
         "{log}"
     );
+    id
+}
 
-    // From a terminal of its own, a person approves it.
-    f.approve(&id, &[]);
+/// Lets [`on_the_agents_terminal`]'s agent run its second command, and
+/// returns that run's exit code once the terminal's shell has ended.
+fn run_again_and_end(f: &Fixture, mut child: Child, dir: &Path) -> String {
     std::fs::write(dir.join("go"), b"").unwrap();
-    assert_eq!(
-        read("rerun.code").trim(),
-        "0",
-        "{}",
-        std::fs::read_to_string(dir.join("rerun.err")).unwrap_or_default()
-    );
+    let code = read_line_file(dir, "rerun.code");
     let end = Instant::now() + Duration::from_secs(30);
     while child.try_wait().unwrap().is_none() {
         assert!(Instant::now() < end, "the terminal's shell did not end");
@@ -802,6 +837,65 @@ fn an_approval_from_the_agents_terminal_is_refused() {
         let bytes = std::fs::read(dir.join(name)).unwrap_or_default();
         assert_no_canary(&bytes, &f.cs);
     }
+    code.trim().to_owned()
+}
+
+/// Review T9 open 3 (gate 23: approval input is never read from the
+/// requester's terminal). A shell on a pseudo-terminal runs the fixture
+/// agent in the background, and the agent's `envcloak run` is pending. A
+/// sibling of the agent on that terminal, a terminal subject with no
+/// agent in its ancestry, runs `envcloak approve`: refused
+/// (`proof_refused`, reason `requester_terminal`) before the statement is
+/// shown or the passphrase read. From another terminal the same approval
+/// goes through, and the agent's next run is covered.
+#[test]
+fn an_approval_from_the_agents_terminal_is_refused() {
+    let f = Fixture::new();
+    let (child, dir) = on_the_agents_terminal(&f, &testkit_bin("fixture-agent"), None);
+    let id = sibling_was_refused(&f, &dir);
+
+    // From a terminal of its own, a person approves it.
+    f.approve(&id, &[]);
+    assert_eq!(
+        run_again_and_end(&f, child, &dir),
+        "0",
+        "{}",
+        std::fs::read_to_string(dir.join("rerun.err")).unwrap_or_default()
+    );
+    f.sweep();
+}
+
+/// Review F-70: the same refusal for an agent known only through a user
+/// extension (`agents.d`), which roots its command's grant at the
+/// command's own session, below itself (docs/AGENTS.md "Root"). Its
+/// command runs in a session of its own without a terminal (`ec-probe
+/// --session`, as Claude Code runs each command), so the chain up to that
+/// root holds no terminal: the refusal reaches the agent all the same,
+/// and the sibling on the agent's terminal is refused. From another
+/// terminal the approval goes through and names the agent; the grant
+/// stays rooted at that command's session, so the agent's next command,
+/// in a new session, asks again.
+#[test]
+fn an_approval_from_the_terminal_of_an_extension_agent_is_refused() {
+    let f = Fixture::with_extension(
+        "[[agent]]\nid = \"ext-agent\"\nname = \"Extension test agent\"\nexecutables = [\"ext-agent\"]\n",
+    );
+    // The fixture agent under a name only the extension knows.
+    let bin = f.home.root().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let agent = bin.join("ext-agent");
+    std::fs::copy(testkit_bin("fixture-agent"), &agent).unwrap();
+    let (child, dir) = on_the_agents_terminal(&f, &agent, Some(&testkit_bin("ec-probe")));
+    let id = sibling_was_refused(&f, &dir);
+
+    let shown = f.approve(&id, &[]);
+    assert!(shown.contains("Extension test agent"), "{shown}");
+    assert_eq!(
+        run_again_and_end(&f, child, &dir),
+        "125",
+        "{}",
+        std::fs::read_to_string(dir.join("rerun.err")).unwrap_or_default()
+    );
     f.sweep();
 }
 

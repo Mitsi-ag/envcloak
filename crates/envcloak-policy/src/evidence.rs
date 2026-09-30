@@ -587,23 +587,33 @@ impl SubjectEvidence {
     }
 
     /// Whether this caller shares a session or a controlling terminal with
-    /// `requester`'s chain, from its caller up to its root (the session
-    /// id, or the terminal's device, of any process there that `alive`
-    /// says still runs). An agent's command runs in a session of its own,
-    /// and the agent itself on a person's terminal: a process that shares
-    /// either (a shell the agent left in that session, one that took the
+    /// `requester`'s chain, from its caller up to its root or up to its
+    /// nearest known agent, whichever is further (the session id, or the
+    /// terminal's device, of any process there that `alive` says still
+    /// runs). An agent's command runs in a session of its own, and the
+    /// agent itself on a person's terminal: a process that shares either
+    /// (a shell the agent left in that session, one that took the
     /// terminal's foreground) could read what is typed there, or be what
     /// types it. Only processes still running count, as they are now:
     /// a session id and a terminal's device are used again once every
     /// process holding them is gone, and a person's new terminal window
     /// can get the device an agent that exited had.
+    ///
+    /// The root alone is not enough (review F-70): an agent matched only
+    /// on what it says about itself, or through a user extension, roots
+    /// a grant no higher than its command's session, below the agent, yet
+    /// its terminal is the agent's all the same. The weak match that may
+    /// not widen a grant still adds this refusal; the root is unchanged.
     pub fn shares_terminal_with(
         &self,
         requester: &SubjectEvidence,
         alive: &dyn Fn(&ProcessInstance) -> bool,
     ) -> bool {
         let me = &self.chain[0];
-        requester.chain[..=requester.root]
+        let end = requester
+            .nearest_agent
+            .map_or(requester.root, |n| n.max(requester.root));
+        requester.chain[..=end]
             .iter()
             .filter(|a| alive(&a.instance))
             .any(|a| {
@@ -617,7 +627,8 @@ impl SubjectEvidence {
     /// and for a requester that is not a terminal subject (an agent or an
     /// unknown process), [`ProofRefusal::RequesterTerminal`] when the
     /// approver shares a session or a terminal with the requester's chain
-    /// up to its root, among the processes `alive` says still run
+    /// up to its root or its nearest agent, among the processes `alive`
+    /// says still run
     /// ([`SubjectEvidence::shares_terminal_with`]): the approval's input
     /// is never read from the requester's terminal (gate 23). A person
     /// approves their own terminal's request there.
