@@ -24,11 +24,12 @@
 //! does, verifies it again, wraps the VMK under the new passphrase
 //! (current default parameters), makes that the only passphrase envelope,
 //! records the kit as confirmed (it was just used), and closes the file.
-//! Only then does it touch the current
-//! vault: it closes it, keeps it as `vault/replaced-<UTC time>.db` (a hard
-//! link, so `vault.db` never goes missing), moves aside any side file
-//! beside `vault.db` (also one left without a database, which SQLite would
-//! otherwise replay onto the new file), renames the new file over
+//! Only then does it touch the current vault: it folds the vault's WAL in
+//! and closes it, checking both (a WAL still beside it stops the restore
+//! there, with nothing moved), keeps it as `vault/replaced-<UTC time>.db`
+//! (a hard link, so `vault.db` never goes missing), moves aside any side
+//! file beside `vault.db` (also one left without a database, which SQLite
+//! would otherwise replay onto the new file), renames the new file over
 //! `vault.db`, and syncs the directory. A crash at any point leaves the
 //! old vault or the new one in place, never neither; leftovers are removed
 //! by the next open. The installed vault is then opened again: it must
@@ -226,7 +227,10 @@ impl Vault {
 /// - the file is not a backup, or was altered, truncated or extended
 ///   ([`VaultErrorKind::BackupDamaged`]), or its vault does not verify
 ///   ([`VaultErrorKind::Tampered`]);
-/// - the current vault is open ([`VaultErrorKind::Busy`]).
+/// - the current vault is open ([`VaultErrorKind::Busy`]);
+/// - the current vault's WAL could not be folded into it as it closed
+///   ([`VaultErrorKind::Storage`]): moving that WAL aside would separate
+///   transactions from their database.
 ///
 /// A current file that is not an EnvCloak vault at all, or opens as
 /// [`VaultErrorKind::Damaged`] (its plaintext tables altered, say), is
@@ -344,10 +348,20 @@ fn restore(
     staging.finish()?;
     observe(RestoreStep::StagingReady);
 
-    drop(old);
+    let opened = old.is_some();
+    if let Some(old) = old {
+        old.close()?;
+    }
     observe(RestoreStep::OldVaultClosed);
-    // Closing the old vault folded in and removed its WAL. Anything still
-    // beside `vault.db`, or left there without it, goes too.
+    // Closing a vault that opened folded its WAL into `vault.db` and
+    // removed it. A WAL with frames still beside it holds transactions
+    // `vault.db` lacks: set aside, it would leave `vault.db` without them
+    // until the new file is renamed over it, and a crash in between would
+    // leave the old vault at an older state that still verifies. Nothing
+    // has been moved yet. Side files beside anything else go aside with it.
+    if opened && holds_frames(&with_suffix(&dir.join(DB_NAME), "-wal"))? {
+        return Err(VaultErrorKind::Storage(rusqlite::ffi::SQLITE_BUSY).into());
+    }
     let replaced = set_aside(&dir)?;
     observe(RestoreStep::OldVaultKept);
     std::fs::rename(&staging.path, dir.join(DB_NAME))?;
@@ -488,6 +502,15 @@ impl Staged<'_> {
         let (locked, vmk) = vault.lock_keeping_key();
         drop(locked);
         Ok(Prepared { vmk, committed })
+    }
+}
+
+/// Whether a file is at `p` and is not empty.
+fn holds_frames(p: &Path) -> Result<bool, VaultError> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) => Ok(m.len() > 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 

@@ -96,6 +96,21 @@ pub(crate) const TEMP_PREFIX: &str = ".vault.db.new-";
 /// SQLite's side files of a database, by suffix.
 pub(crate) const SIDE_FILES: [&str; 3] = ["-wal", "-shm", "-journal"];
 
+#[cfg(feature = "testing")]
+thread_local! {
+    /// Test support only: see [`skip_next_close_checkpoint_for_testing`].
+    static SKIP_CLOSE_CHECKPOINT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Test support only: the next [`LockedVault::close`] on this thread
+/// neither checkpoints nor lets SQLite checkpoint as the connection closes,
+/// as when that checkpoint fails: the WAL stays beside the database with
+/// its frames.
+#[cfg(feature = "testing")]
+pub fn skip_next_close_checkpoint_for_testing() {
+    SKIP_CLOSE_CHECKPOINT.with(|s| s.set(true));
+}
+
 /// An open vault file without its key.
 pub struct LockedVault {
     conn: Connection,
@@ -209,6 +224,32 @@ impl LockedVault {
     /// Where the vault lives.
     pub fn paths(&self) -> &VaultPaths {
         &self.paths
+    }
+
+    /// Closes the file with its WAL folded in: a `TRUNCATE` checkpoint,
+    /// which must not be blocked and must copy every frame, then the
+    /// connection's close, whose failure is reported (dropping the handle
+    /// ignores it, and SQLite keeps the WAL when its own checkpoint at
+    /// close fails). For a restore, which moves side files away from
+    /// `vault.db` next.
+    pub(crate) fn close(self) -> Result<(), VaultError> {
+        let LockedVault { conn, .. } = self;
+        #[cfg(feature = "testing")]
+        if SKIP_CLOSE_CHECKPOINT.with(|s| s.replace(false)) {
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+            return conn.close().map_err(|(_, e)| e.into());
+        }
+        let (busy, log, copied): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        if busy != 0 || log != copied {
+            return Err(VaultErrorKind::Storage(rusqlite::ffi::SQLITE_BUSY).into());
+        }
+        conn.close().map_err(|(_, e)| e.into())
     }
 
     pub fn vault_id(&self) -> VaultId {

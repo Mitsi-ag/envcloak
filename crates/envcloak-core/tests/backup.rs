@@ -12,8 +12,9 @@
 //! - a restore hands back only the state it prepared: one that finds
 //!   another state installed, valid or not, fails;
 //! - a restore refuses an open vault, a weak new passphrase, and a backup
-//!   path that is a symlink, a FIFO or a directory, and moves aside a file
-//!   that is not a vault or is a damaged one.
+//!   path that is a symlink, a FIFO or a directory; it moves aside a file
+//!   that is not a vault or is a damaged one, and never a WAL away from the
+//!   vault it belongs to.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -31,7 +32,7 @@ use envcloak_core::backup::{
 use envcloak_core::crypto::{CryptoErrorKind, Envelope, KdfParams, UnlockerKind};
 use envcloak_core::vault::{
     Integrity, ItemMeta, LockedVault, Migration, MigrationPlan, MigrationTx, PathErrorKind,
-    TamperKind, VaultError, VaultErrorKind, VaultPaths,
+    TamperKind, VaultError, VaultErrorKind, VaultPaths, skip_next_close_checkpoint_for_testing,
 };
 use envcloak_core::{PassphraseRejected, SecretBytes, restore_backup};
 use envcloak_testkit::assert_no_canary;
@@ -629,6 +630,66 @@ fn a_restore_fails_when_the_installed_vault_does_not_verify() {
     assert_eq!(report.replaced.len(), 1, "{:?}", report.replaced);
     drop(v);
     assert_eq!(f.unlock().integrity(), Integrity::Ok);
+}
+
+/// Review T4 open 1: a restore closes the vault it replaces with that
+/// vault's WAL folded in, and checks it. The vault here is what a daemon
+/// killed before a checkpoint leaves: `vault.db` and a WAL whose frames
+/// hold its newest items. When the close leaves that WAL beside
+/// `vault.db` (its checkpoint skipped, as when SQLite's own fails), the
+/// restore stops before anything is moved: set aside, the WAL would leave
+/// `vault.db` without those items until the new file is in place, and a
+/// crash in between would leave an older state that still verifies. The
+/// vault is then as it was, WAL and all. Without the fault, the replaced
+/// vault is folded in before it is kept aside, whole, with no WAL beside
+/// it.
+#[test]
+fn a_restore_never_sets_a_wal_aside_from_its_vault() {
+    let (f, mut v) = KitFixture::create();
+    let info = v.create_backup().unwrap();
+    let wal = later_wal(&mut v, &f.db());
+    let db = std::fs::read(f.db()).unwrap();
+    let latest: Vec<ItemMeta> = v.items().to_vec();
+    drop(v);
+    let wal_path = f.db().with_file_name("vault.db-wal");
+    let crashed = || {
+        std::fs::write(f.db(), &db).unwrap();
+        std::fs::write(&wal_path, &wal).unwrap();
+    };
+
+    crashed();
+    skip_next_close_checkpoint_for_testing();
+    let e = restore_backup(&f.paths, &info.path, &f.kit(), &other_passphrase(6)).unwrap_err();
+    assert_eq!(e.kind(), VaultErrorKind::Storage(5), "SQLITE_BUSY");
+    assert_eq!(
+        dir_names(&f.paths.vault_dir),
+        ["vault.db", "vault.db-wal"],
+        "nothing moved"
+    );
+    let v = f.unlock();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items(), &latest[..], "the newest items are there");
+    drop(v);
+
+    crashed();
+    let (v, report) = restore_backup(&f.paths, &info.path, &f.kit(), &other_passphrase(7)).unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    drop(v);
+    let [kept] = &report.replaced[..] else {
+        panic!("{:?}", report.replaced);
+    };
+    let aside = VaultPaths::under(f.home.root().join("aside"));
+    aside.ensure_dirs().unwrap();
+    std::fs::copy(kept, aside.vault_dir.join("vault.db")).unwrap();
+    let v = LockedVault::open(&aside)
+        .unwrap()
+        .unlock(f.vmk())
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.items(), &latest[..], "the kept file alone holds them");
+    drop(v);
+    f.home.assert_clean(&f.cs);
 }
 
 /// Opens the vault with `pass`: Ok, or the generic unlock error.
