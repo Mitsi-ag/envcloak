@@ -23,7 +23,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitCode, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -231,6 +231,10 @@ const TESTS: &[Test] = &[
     (
         "a_descendant_holding_the_pipes_is_cut_off_after_2_s",
         a_descendant_holding_the_pipes_is_cut_off_after_2_s,
+    ),
+    (
+        "a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff",
+        a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff,
     ),
     (
         "harness_a_dropped_runner_takes_its_childs_group_with_it",
@@ -559,7 +563,20 @@ impl Proc {
 
     /// [`Proc::spawn`], with cleanup looking at and signalling `host`.
     fn spawn_on(mut cmd: Command, host: Arc<dyn Host>) -> Proc {
+        Proc::collect(cmd.spawn().unwrap(), host)
+    }
+
+    /// [`Proc::spawn`], with standard output left unread: it is returned,
+    /// open, for the test to read when it chooses. Standard error is
+    /// collected.
+    fn spawn_holding_stdout(mut cmd: Command) -> (Proc, ChildStdout) {
         let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        (Proc::collect(child, Arc::new(Live)), stdout)
+    }
+
+    /// Collects what `child` writes on the streams it still has.
+    fn collect(mut child: Child, host: Arc<dyn Host>) -> Proc {
         let cap = Arc::new(Captured::default());
         let mut readers = Vec::new();
         let sources: [Option<Box<dyn Read + Send>>; 2] = [
@@ -1683,6 +1700,87 @@ exit 0"#;
     assert!(!contains(&out, b"too-late"));
     assert_no_canary(&out, &cs);
     assert_no_canary(&err, &cs);
+}
+
+/// The child ignores SIGTERM (so does all it starts), starts a descendant
+/// that prints the value for ever, reports its pid, lets the output fill
+/// for a second, says `exiting` and exits 0.
+const LEAVES_A_WRITER: &str = r#"trap '' TERM
+( while :; do printf '%s\n' "$OPENAI_API_KEY"; done ) &
+echo "gc=$!" >&2
+sleep 1
+echo exiting >&2
+exit 0"#;
+
+/// The runner with [`LEAVES_A_WRITER`], its standard output read as it
+/// comes (`drained`) or never. Returns the runner, its standard output when
+/// it is left unread, the descendant (seen gone or killed on drop), and
+/// the moment the child said it was exiting.
+fn leaves_a_writer(
+    home: &TestHome,
+    setup: &Setup<'_>,
+    drained: bool,
+) -> (Proc, Option<ChildStdout>, Leftover, Instant) {
+    let mut cmd = detached(home, setup, &os(&sh(LEAVES_A_WRITER)));
+    cmd.stdin(Stdio::null());
+    let (p, stdout) = if drained {
+        (Proc::spawn(cmd), None)
+    } else {
+        let (p, stdout) = Proc::spawn_holding_stdout(cmd);
+        (p, Some(stdout))
+    };
+    assert!(p.wait_for(1, b"exiting\n", Duration::from_secs(60)));
+    let exiting = Instant::now();
+    // Still writing, or blocked writing: its start time is its own.
+    let gc = field(&p.cap.streams.lock().unwrap()[1], "gc");
+    (p, stdout, Leftover::new(gc, Arc::new(Live)), exiting)
+}
+
+/// Review F-49: the child exits while a descendant keeps writing to the
+/// pipes, and nobody reads the runner's standard output, so the runner is
+/// stuck writing what it released when the cutoff passes. It gives the
+/// write up, closes the pipes (the descendant dies of SIGPIPE on its next
+/// write), and returns the child's 0 within the cutoff plus a margin, as
+/// it does beside the control, whose output is read.
+fn a_stalled_reader_does_not_hold_a_descendants_pipe_past_the_cutoff() {
+    let seed = fresh_seed();
+    let cs = all_canaries(seed);
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    for drained in [true, false] {
+        let (p, stdout, mut gc, exiting) = leaves_a_writer(&home, &setup, drained);
+        let (status, out, err) = p.finish(Duration::from_secs(30));
+        let took = exiting.elapsed();
+        println!("stalled reader ({drained}): the runner returned {took:?} after the exit");
+        assert_eq!(status.code(), Some(0), "{drained}: {}", lossy(&err));
+        assert!(took >= Duration::from_millis(1500), "{drained}: {took:?}");
+        assert!(took < Duration::from_millis(3500), "{drained}: {took:?}");
+        assert!(
+            gc.gone_within(Duration::from_secs(10)),
+            "{drained}: the descendant still runs"
+        );
+        let out = match stdout {
+            Some(mut unread) => {
+                let mut held = Vec::new();
+                unread.read_to_end(&mut held).unwrap();
+                held
+            }
+            None => out,
+        };
+        assert!(
+            contains(&out, b"[envcloak:openai_api_key/t]\n"),
+            "{drained}: {} bytes",
+            out.len()
+        );
+        assert_no_canary(&out, &cs);
+        assert_no_canary(&err, &cs);
+    }
+    home.assert_clean(&cs);
 }
 
 // ---------------------------------------------------------------------------

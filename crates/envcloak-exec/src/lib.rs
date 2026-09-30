@@ -35,7 +35,11 @@
 //!    ([`ChildExit::shell_code`]). After the child exits, output is read
 //!    until end of stream; when a descendant still holds the pipes
 //!    [`DRAIN_LIMIT`] (2 seconds) later, they are closed, and what it
-//!    writes after that is lost, never passed through.
+//!    writes after that is lost, never passed through. A write to an
+//!    output nobody reads is given up then too, so a stalled reader cannot
+//!    hold such a pipe open past the cutoff (review F-49); what is left in
+//!    a pipe that no process holds any more is delivered at the reader's
+//!    pace.
 //!
 //! When the reader of this process's output goes away (`EPIPE`), the
 //! child's end of that pipe is closed too, so the child gets `SIGPIPE` or
@@ -45,7 +49,10 @@
 //!
 //! The command is never `exec`ed in this process's place: that would end
 //! redaction. [`run`] takes over SIGINT, SIGTERM, SIGHUP and SIGQUIT for
-//! the process while it runs, so there is one run at a time per process.
+//! the process while it runs, and `SIGURG`, with which it breaks its own
+//! output threads out of a write they must give up
+//! ([`envcloak_sys::Interrupter`]), so there is one run at a time per
+//! process.
 
 mod coverage;
 mod pump;
@@ -62,6 +69,7 @@ use std::time::Duration;
 use envcloak_core::SecretBytes;
 use envcloak_policy::EnvName;
 pub use envcloak_redact::Redactor;
+use envcloak_sys::Interrupter;
 
 pub use coverage::{
     COMFORT_LEN, CoverageReport, Label, MIN_VALUE_LEN, ShortPolicy, build_redactor,
@@ -262,24 +270,41 @@ pub fn run(spec: RunSpec) -> Result<ChildExit, ExecError> {
     // it starts is passed on rather than ending this process mid-output.
     let forwarder =
         signals::Forwarder::install(terminal).map_err(|e| ExecError::Setup(e.kind()))?;
+    let interrupter = Interrupter::install().map_err(|e| ExecError::Setup(e.kind()))?;
     let spawned = spawn::spawn(&argv, &injected, stdin, !terminal);
     // The values are in the child's environment now; the redactor holds
     // the only other copies.
     drop(injected);
     let child = spawned?;
-    follow(child, &forwarder, &redactor, idle_flush, stdout, stderr)
+    let threads = Threads {
+        forwarder: &forwarder,
+        interrupter: &interrupter,
+    };
+    follow(child, threads, &redactor, idle_flush, stdout, stderr)
+}
+
+/// What [`follow`] needs of this process for the run: its caught signals
+/// and the means to break its output threads out of a write.
+#[derive(Clone, Copy)]
+struct Threads<'a> {
+    forwarder: &'a signals::Forwarder,
+    interrupter: &'a Interrupter,
 }
 
 /// Pumps the child's output, passes signals on and waits for it: see the
 /// crate documentation.
 fn follow(
     mut child: std::process::Child,
-    forwarder: &signals::Forwarder,
+    threads: Threads<'_>,
     redactor: &Redactor,
     idle: Duration,
     stdout: OwnedFd,
     stderr: OwnedFd,
 ) -> Result<ChildExit, ExecError> {
+    let Threads {
+        forwarder,
+        interrupter,
+    } = threads;
     let setup = |e: io::Error| ExecError::Setup(e.kind());
     let Ok(pid) = i32::try_from(child.id()) else {
         return Err(abandon(child, io::ErrorKind::InvalidData.into()));
@@ -290,35 +315,54 @@ fn follow(
     let state = signals::ChildState::running(pid);
     let cutoff = pump::Cutoff::default();
     std::thread::scope(|s| {
-        let started = (|| {
-            let a = std::thread::Builder::new()
-                .name("envcloak-stdout".into())
-                .spawn_scoped(s, || pump::pump(out, stdout, redactor, idle, &cutoff))?;
-            let b = std::thread::Builder::new()
-                .name("envcloak-stderr".into())
-                .spawn_scoped(s, || pump::pump(err, stderr, redactor, idle, &cutoff))?;
-            let f = std::thread::Builder::new()
-                .name("envcloak-signals".into())
-                .spawn_scoped(s, || forwarder.forward(&state))?;
-            Ok::<_, io::Error>((a, b, f))
-        })();
+        // Each pump is counted before its thread starts; a thread that
+        // cannot start drops its closure, and the count with it.
+        let token = cutoff.pump_token();
+        let a = std::thread::Builder::new()
+            .name("envcloak-stdout".into())
+            .spawn_scoped(s, move || {
+                interrupter.run(|| pump::pump(out, stdout, redactor, idle, token))
+            });
+        let token = cutoff.pump_token();
+        let b = std::thread::Builder::new()
+            .name("envcloak-stderr".into())
+            .spawn_scoped(s, move || {
+                interrupter.run(|| pump::pump(err, stderr, redactor, idle, token))
+            });
+        let f = std::thread::Builder::new()
+            .name("envcloak-signals".into())
+            .spawn_scoped(s, || forwarder.forward(&state));
         // Without its threads the child would block on a full pipe, or run
         // with no one to pass signals on: it is killed. The threads that
-        // did start end with its pipes and the forwarder's stop.
-        let threads = started.inspect_err(|_| {
+        // did start end with its pipes, the cutoff and the forwarder's
+        // stop.
+        let failed = [a.as_ref().err(), b.as_ref().err(), f.as_ref().err()]
+            .into_iter()
+            .flatten()
+            .map(io::Error::kind)
+            .next();
+        if failed.is_some() {
             state.exited();
             let _ = child.kill();
             forwarder.stop();
-        });
+        }
         let waited = envcloak_sys::wait_for_exit(pid);
         state.exited();
         let status = child.wait();
         cutoff.start(DRAIN_LIMIT);
-        let threads = threads.map_err(setup)?;
-        let _ = threads.0.join();
-        let _ = threads.1.join();
+        // Bounded by the cutoff while a descendant holds a pipe (review
+        // F-49).
+        cutoff.wait_for_pumps(interrupter);
+        for pump in [a, b].into_iter().flatten() {
+            let _ = pump.join();
+        }
         forwarder.stop();
-        let _ = threads.2.join();
+        if let Ok(f) = f {
+            let _ = f.join();
+        }
+        if let Some(kind) = failed {
+            return Err(ExecError::Setup(kind));
+        }
         waited.map_err(setup)?;
         Ok(ChildExit::from(status.map_err(setup)?))
     })

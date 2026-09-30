@@ -376,7 +376,7 @@ The manifest contains no secret values and is safe for agents to read. The manif
    - With a controlling terminal, the child stays in the CLI's process group, terminal-generated signals reach it directly, and the CLI forwards SIGTERM and SIGHUP, and SIGINT and SIGQUIT sent by another process rather than by the terminal (Linux reads the sender from `si_code`; macOS, which reports both alike, counts a sender in the CLI's session or already gone; docs/RUN.md). Without one, the child gets its own process group and the CLI forwards SIGINT, SIGTERM, SIGHUP and SIGQUIT to it.
    - The CLI exits with the child's code, or 128 + signal number.
    - It never execs the child in its own place, because that would end redaction.
-   - After the child exits, output is drained until EOF. If a descendant keeps the pipes open, the CLI closes them after 2 seconds; further output is lost, never passed through unredacted.
+   - After the child exits, output is drained until EOF. If a descendant keeps the pipes open, the CLI closes them after 2 seconds, giving up any write its own reader has not taken by then; further output is lost, never passed through unredacted. A pipe no process holds any more is delivered at the reader's pace.
 9. **Failures.** EnvCloak's own failures exit 125, with one stable token on stderr: `approval_required`, `vault_locked`, `daemon_unavailable`, `daemon_unverified`, `manifest_invalid`, `binding_unresolved`, `value_too_short` or `traced`. Exit codes 126 and 127 keep their `env(1)` meanings.
 
 **Redaction coverage.** The redactor matches:
