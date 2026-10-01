@@ -241,7 +241,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `managed_command_mismatch` | -32039 | M2-27 | reserved | a request against a managed project that does not name its registered launch, or its registered origin and header names (SPEC §6.6) |
 | `managed_launch_changed` | -32040 | M2-27 | reserved | a registered launch whose executable, entry file or working directory changed, refused before any pending request |
 | `code_selecting_env` | -32041 | M2-27 | reserved | a launch declaration with a code-selecting variable or interpreter option, refused at registration and reported as manual |
-| `runner_unavailable` | -32042 | M2-27 | reserved | the daemon cannot start its runner, relay or browser supervisor from its anchor (the `envcloak` beside it changed since it started) |
+| `runner_unavailable` | -32042 | M2-27 | reserved | the daemon cannot start its runner, relay or browser supervisor (on Linux, the sealed copy of the `envcloak` beside it, made at daemon start, cannot be made or executed) |
 | `identity_not_standing_capable` | -32043 | M2-15 | reserved | `--standing` for an agent matched other than by a builtin executable path or code signature |
 | `identity_outside_install_tree` | -32044 | M2-15 | reserved | `--standing` for a Linux executable outside its agent's documented install trees |
 | `launch_not_standing_capable` | -32045 | M2-15 | reserved | `--standing` for a managed launch that is not `bound` |
@@ -314,7 +314,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 <!-- reservations:exit_token -->
 | Token | Task | Status | Use |
 |---|---|---|---|
-| `not_in_this_build` | M2-02 | reserved | a command or option whose milestone has not shipped; exit 125, and no argument is echoed |
+| `not_in_this_build` | M2-02 | landed | a command or option whose milestone has not shipped; exit 125, and no argument is echoed |
 | `incomplete` | M2-14 | reserved | doctor, import, scrub or `migrate-mcp` did not finish the whole job (a cap, a budget, an item reported as manual); a non-zero exit with the reason |
 | `value_on_argv` | M2-18 | reuse | a value given as a command-line argument; `mcp-bridge` takes slugs only |
 | `not_started_by_daemon` | M2-27 | reserved | `envcloak run --launch`, `mcp-bridge --relay` or `mcp --browser-supervisor` started by anything but the daemon; exit 125, and nothing is received (SPEC §4); distinct from the error kind `runner_unavailable`, the daemon unable to start one |
@@ -357,7 +357,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 <!-- reservations:control_message -->
 | Channel | Message | Task | Status | Use |
 |---|---|---|---|---|
-| `runner` | `Release` | M2-27 | reserved | daemon to runner: the binding values, the launch description and the checked stamp; daemon to relay: the header value and its origin |
+| `runner` | `Release` | M2-27 | reserved | daemon to runner: the binding values, the launch description and, for a launch that runs from its file rather than a sealed copy, the checked stamp; daemon to relay: the header value and its origin |
 | `runner` | `ConfirmSpawn` | M2-27 | reserved | runner to daemon (macOS): the suspended child's pid, for the daemon's code check |
 | `runner` | `Confirmed` | M2-27 | reserved | daemon to runner: the child may run |
 | `runner` | `Refused` | M2-27 | reserved | daemon to runner: kill the child and exit with `managed_launch_changed` |
