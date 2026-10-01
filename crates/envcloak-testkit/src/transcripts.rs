@@ -7,11 +7,12 @@
 //! ([`sweep_stores`]) reads the host's whole directory once with
 //! [`crate::sweep_dir`], for every canary and every listed encoding, and
 //! files each hit in the host's files under the store that holds it; a
-//! hit in none of them is kept under [`OTHER`], never dropped. Counts are raw: nothing is
-//! filtered, the harness's own canaries included, so a positive control
-//! (a canary a scripted turn prints) is counted like anything else. The
-//! scripted model's request bodies are swept too ([`sweep_model`]): what a
-//! host sent its model is what a real model would have seen.
+//! hit in none of them is kept under [`OTHER`], never dropped. Counts are
+//! raw: nothing is filtered, the harness's own canaries included, so a
+//! positive control (a canary a scripted turn prints) is counted like
+//! anything else. The scripted model's request bodies are swept too
+//! ([`sweep_model`]): what a host sent its model is what a real model
+//! would have seen.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

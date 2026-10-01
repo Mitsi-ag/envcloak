@@ -151,8 +151,55 @@ In each case the process's new request gets a root of its own, and a person appr
 - On macOS a process that removed the NULs between its arguments (node with a `process.title` longer than its command line) has up to 16 of its environment strings read as arguments: the kernel keeps nothing that marks where its arguments end. They can include values `envcloak run` injected. They are held in wiped storage, compared against the catalog's patterns and dropped; nothing prints, logs or sends them. On Linux the kernel's record of the argument area bounds the read, except for a process the daemon may not trace (a non-dumpable one): when it also overwrote the NUL that ends its arguments, its environment up to the next NUL is read, into the same wiped storage.
 - Any program running as the user can write `agents.d`. An extension that matches the user's shell makes every request from it an agent request and refuses its proofs: a denial of service, never a way to widen a grant.
 
+## Host behaviour
+
+What the pinned hosts were measured to do, against the scripted model in an isolated home (M2 plan task M2-04; docs/ACCEPTANCE.md, "M2"). `crates/envcloak-e2e/tests/agent_hosts.rs` and `m2_story` re-measure every row in CI's `agents-e2e` job and print it as a `measurement:` line; a host version outside this table is not qualified (`probe::model::QUALIFIED`). Measured 2026-10-01 on macOS 26.4 (arm64); rows marked (macOS) hold for macOS only, and Linux's values come from CI's `agents-e2e` job (x64, loopback only).
+
+**Claude Code 2.1.280** (`-p`, `--permission-mode default`, tools allowed by `--allowedTools`):
+
+| What | Measured | For |
+|---|---|---|
+| MCP tool call of 15 s, server added with `claude mcp add-json` and no `timeout` | Answered after 15.0 s: no 10 s cutoff under `-p` (SI-17's 10 s was not seen) | M2-06 `--wait-ms`, K-08 |
+| The same with `"timeout": 60000` in the entry | Answered after 15.0 s | M2-06, M2-08 |
+| MCP server's ancestry; marker variables it gets | Its parent is `claude`; `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PROJECT_DIR`, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, and `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` | M2-06, M2-10 |
+| Bash tool: terminal | Standard input, output and error are not terminals; no controlling terminal | M2-17, M2-19 |
+| Bash tool: marker variables | `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_EFFORT`, `CLAUDE_PID`. The model credential (`ANTHROPIC_API_KEY`) reaches commands | M2-10 markers; the inject-mode limit |
+| A prompt a `UserPromptSubmit` hook blocks (exit 2) | Exit 0; never sent to the model; not in `history.jsonl`; **kept in the transcript** (`~/.claude/projects/`) | K-14: transcript surface `unsupported (persists_blocked_prompt)` |
+| `@README.md` in a `-p` prompt | Expanded: the file's content reaches the model | M2-09's `@.env` probe runs under `-p` |
+| Interactive: a prompt typed and entered at the workspace trust dialog | Never reaches the model; Enter answers the dialog's default, "No, exit" (exit 1) | M2-26's interactive variant |
+| Interactive: a one-line and a 40-line bracketed paste | Each kept in `history.jsonl` and the transcript; neither in `paste-cache/` | Gate 41's sweep; scrub (M2-22) |
+| `envcloak status` from the Bash tool, sandbox off | Reaches the daemon | K-01 |
+| The same, `sandbox.enabled` (`failIfUnavailable`, `allowUnsandboxedCommands: false`), no socket allowance | Does not: `daemon_unverified` (macOS) | K-01 |
+| The same with `network.allowUnixSockets` naming the socket as the daemon names it (`/tmp/...`) | Does not (macOS): the sandbox compares the resolved path | M2-08 writes the resolved path |
+| The same with the socket's resolved path (`/private/tmp/...`) | Reaches the daemon (macOS) | M2-08 |
+| The subject the daemon records for `envcloak run` from the Bash tool | `agent Claude Code` (S0's statement) | Gate 41 |
+| Blocked prompt and tool payloads | `crates/envcloak-e2e/tests/fixtures/hook-payloads/claude-code-2.1.280/` | M2-08's parsers |
+| Candidates of 16 or more characters in what S0 wrote | About 12,400 per MiB, 2,000 distinct per MiB | D-32's budget, K-21 |
+
+**Codex 0.159.2** (`exec`, `--sandbox` and `approval_policy` pinned per run):
+
+| What | Measured | For |
+|---|---|---|
+| How an MCP server's tools are offered | As a Responses `namespace` tool, `mcp__<server>` | The scripted model; M2-06 |
+| An MCP call under approval policy `never`, by the server's `default_tools_approval_mode` | Refused when unset, `auto` or `prompt`; runs only with `approve` | D-22: Codex's MCP surface reads `degraded (needs_host_approval)` under `exec` |
+| MCP tool call of 15 s with `tool_timeout_sec = 5` | Cut off after 5.0 s: the setting is the cutoff | M2-06 `--wait-ms`, M2-08 |
+| MCP server's ancestry | Its parent is `codex` | M2-10 |
+| Shell tool (`exec_command`): terminal | Standard input, output and error are not terminals; no controlling terminal | M2-17, M2-19 |
+| Shell tool: marker variables | `CODEX_CI`, `CODEX_HOME`, `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_VERSION`. The provider's key variable (`env_key`) reaches commands | M2-10 markers |
+| Hooks in `config.toml`, not trusted | Do not run | `degraded (hooks_untrusted)` |
+| A prompt a trusted `UserPromptSubmit` hook blocks (exit 2) | Exit 0; never sent to the model; in no store (`sessions/`, `history.jsonl`, SQLite) | Codex's transcript surface |
+| A hook that outlives its `timeout` on a prompt it would block | The prompt goes on: hooks fail open | `fails_open_on_timeout` |
+| `permission_mode` hooks get under `exec`, approval policy `never` | `bypassPermissions` | M2-08's parsers |
+| `envcloak status` from the shell tool, `read-only` (the `exec` default) or `workspace-write` | Does not: `daemon_unverified` | K-01 |
+| The same, `sandbox_workspace_write.network_access = true` | Reaches the daemon, **and** a loopback TCP listener and another Unix socket | Never written alone |
+| The same plus `[features.network_proxy] enabled = true`, no `domains`, and one `[features.network_proxy.unix_sockets]` rule for EnvCloak's socket | Reaches the daemon; a loopback TCP listener and another Unix socket are refused (asserted) | M2-08's bounded allowance; K-01 kill criterion not met |
+| The subject the daemon records for `envcloak run` under that setting | `agent Codex` (S0's statement) | Gate 41 |
+| Blocked prompt and tool payloads | `crates/envcloak-e2e/tests/fixtures/hook-payloads/codex-0.159.2/` (the shell tool is `Bash` there, with `tool_input.command`) | M2-08's parsers |
+| Candidates of 16 or more characters in what S0 wrote | About 4,400 per MiB, 500 distinct per MiB | D-32, K-21 |
+
 ## Tests
 
+- `crates/envcloak-e2e/tests/agent_hosts.rs` and `tests/m2_story/`: the pinned hosts against the scripted model, and the host behaviour above (docs/ACCEPTANCE.md, "M2").
 - `crates/envcloak-sys/tests/proc.rs`: this process, pid 1 and real children (a new session, a pseudo-terminal) as the kernel reports them; the walk and its re-validation against a table whose answers change; the `KERN_PROCARGS2`, `cmdline` and `stat` parsers against arbitrary bytes.
 - `crates/envcloak-sys/tests/argv_wiped.rs`: a `python3` child that removes the NULs in its own argument area, and `node` with a long `process.title`, each with an environment marker. macOS reads the marker as an argument, Linux does not; neither `Debug` nor an error shows it, and no block freed after the read holds it (the allocator probe, with the global allocator's wipe turned off).
 - `crates/envcloak-policy/tests/agents.rs`: the builtin catalog, installs of Claude Code and Codex, ordinary programs, what each match rests on, extensions and their checks, claims.

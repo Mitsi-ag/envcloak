@@ -1166,16 +1166,20 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
 }
 
 /// Drives a program on a pseudo-terminal of its own (40 rows, 120
-/// columns), as a person in a terminal window: argv[1] is a JSON spec
-/// (`argv`, `env`, `cwd`, `limit`, `steps`: `["wait", text, n]` waits
-/// until the screen has shown `text` `n` times, `["wait_raw", bytes, n]`
-/// until the program has written `bytes` `n` times, `["idle", ms]` until
-/// it has written nothing for `ms` milliseconds, `["send", text]` types
-/// it), answering the queries a terminal answers, and the program's exit code (or 128 plus its signal) is printed
-/// last as `EXIT <n>`; `TIMEOUT <step>` when a wait runs out, and `STILL
-/// RUNNING` when the program has not exited `limit` seconds after the
-/// last step (it is killed in both cases). The screen is never printed: it can hold what was
-/// pasted.
+/// columns), as a person in a terminal window. argv[1] is a JSON spec:
+/// `argv`, `env`, `cwd`, `limit` and `steps`, each one of
+/// - `["wait", text, n]`: until the screen has shown `text` `n` times;
+/// - `["wait_raw", bytes, n]`: until the program has written `bytes` `n`
+///   times;
+/// - `["idle", ms]`: until it has written nothing for `ms` milliseconds;
+/// - `["send", text]`: types `text`.
+///
+/// It answers the queries a terminal answers. The program's exit code (or
+/// 128 plus its signal) is printed last as `EXIT <n>`; `TIMEOUT <step>`
+/// when a wait runs out, and `STILL RUNNING` when the program has not
+/// exited `limit` seconds after the last step (it is killed in both
+/// cases). The screen is never printed: it can hold what was pasted. On a
+/// timeout it is written to `screen`, for diagnosis.
 const PTY_DRIVER: &str = r#"import fcntl, json, os, pty, re, select, struct, sys, termios, time
 spec = json.load(open(sys.argv[1]))
 pid, fd = pty.fork()
