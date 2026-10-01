@@ -8,7 +8,8 @@ usage:
   envcloak status [--json]
   envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
   envcloak daemon uninstall
-  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] -- <cmd...>
+  envcloak pending [--json]
   envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
@@ -28,8 +29,7 @@ usage:
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak run --pty | --wait | --manifest
-  envcloak pending
+  envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
@@ -60,7 +60,8 @@ usage:
   envcloak status [--json]
   envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
   envcloak daemon uninstall
-  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] -- <cmd...>
+  envcloak pending [--json]
   envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
@@ -80,8 +81,7 @@ usage:
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak run --pty | --wait | --manifest
-  envcloak pending
+  envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
@@ -134,20 +134,42 @@ envcloak: usage: envcloak daemon install [--daemon /absolute/path/to/envcloakd] 
 $ envcloak run --help
 exit: 0
 --- stdout
-usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m)] -- <cmd...>
 --- stderr
 $ envcloak run
 exit: 2
 --- stdout
 --- stderr
 envcloak: run needs a command: envcloak run ... -- <cmd...>
-envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m)] -- <cmd...>
 $ envcloak run --bogus -- true
 exit: 2
 --- stdout
 --- stderr
 envcloak: unknown option; see envcloak run --help
-envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m)] -- <cmd...>
+$ envcloak run --wait 11m -- true
+exit: 2
+--- stdout
+--- stderr
+envcloak: --wait needs a duration from 1s to 10m, such as 30s or 5m
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m)] -- <cmd...>
+$ envcloak run --manifest envcloak.toml -- true
+exit: 2
+--- stdout
+--- stderr
+envcloak: --manifest needs the absolute path of an envcloak.toml
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m)] -- <cmd...>
+$ envcloak pending --help
+exit: 0
+--- stdout
+usage: envcloak pending [--json]
+--- stderr
+$ envcloak pending --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak pending [--json]
 $ envcloak approve
 exit: 2
 --- stdout
