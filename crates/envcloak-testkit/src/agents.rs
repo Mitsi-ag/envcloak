@@ -345,7 +345,9 @@ pub fn probe_model_exe() -> PathBuf {
     path
 }
 
-/// One request the scripted model recorded. `Debug` leaves the body out.
+/// One request the scripted model recorded. `Debug` leaves the body out,
+/// and shows the path only when it is an endpoint the model serves (else
+/// its length): a path is whatever a host sent.
 #[derive(Clone)]
 pub struct ModelRequest {
     pub seq: u64,
@@ -356,7 +358,8 @@ pub struct ModelRequest {
     /// Whether the reply was sent whole (a reply held on a barrier is
     /// recorded first, unanswered).
     pub answered: bool,
-    /// `messages`, `responses`, `hello` or `connect`.
+    /// `messages`, `responses`, `hello`, `connect` (a tunnel) or `proxy` (a
+    /// request to forward; `path` is then the `host:port` it names).
     pub api: Option<String>,
     /// `step <n>`, `side`, `exhausted` or `mismatch`.
     pub pick: Option<String>,
@@ -369,7 +372,13 @@ impl std::fmt::Debug for ModelRequest {
             .field("seq", &self.seq)
             .field("at_ms", &self.at_ms)
             .field("method", &self.method)
-            .field("path", &self.path)
+            .field(
+                "path",
+                &match self.path.as_str() {
+                    p @ ("/v1/messages" | "/v1/responses" | "/api/hello") => p.to_owned(),
+                    p => format!("<{} bytes>", p.len()),
+                },
+            )
             .field("status", &self.status)
             .field("answered", &self.answered)
             .field("api", &self.api)
@@ -431,11 +440,12 @@ impl ModelReport {
     }
 
     /// Where the host tried to reach besides the model (`host:port`), in
-    /// order, refused.
+    /// order, refused: tunnels and requests to forward, through the proxy
+    /// the harness names.
     pub fn connects(&self) -> Vec<&str> {
         self.requests
             .iter()
-            .filter(|r| r.api.as_deref() == Some("connect"))
+            .filter(|r| matches!(r.api.as_deref(), Some("connect" | "proxy")))
             .map(|r| r.path.as_str())
             .collect()
     }
@@ -444,6 +454,16 @@ impl ModelReport {
     pub fn endpoints(&self) -> Vec<String> {
         self.requests
             .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect()
+    }
+
+    /// The method and path of every request made to the model itself:
+    /// none of [`ModelReport::connects`].
+    pub fn model_endpoints(&self) -> Vec<String> {
+        self.requests
+            .iter()
+            .filter(|r| !matches!(r.api.as_deref(), Some("connect" | "proxy")))
             .map(|r| format!("{} {}", r.method, r.path))
             .collect()
     }

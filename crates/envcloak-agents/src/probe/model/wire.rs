@@ -68,11 +68,21 @@ impl Pick {
     }
 }
 
-/// A reply body and its media type.
-#[derive(Debug)]
+/// A reply body and its media type. `Debug` shows the media type and the
+/// body's length, never the body: a script's text, which a probe can fill
+/// with a canary on purpose.
 pub struct Reply {
     pub content_type: &'static str,
     pub body: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Reply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reply")
+            .field("content_type", &self.content_type)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// A request body that is not the shape its API requires. Fixed text.
@@ -459,6 +469,19 @@ pub fn responses(body: &Value, script: &Script, id: u64) -> Result<(Pick, Reply)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply's `Debug` shows its media type and length, never its body
+    /// (the script's text, which a probe fills with a canary on purpose).
+    #[test]
+    fn a_reply_s_debug_holds_no_body() {
+        let reply = Reply {
+            content_type: "text/event-stream",
+            body: Zeroizing::new(b"data: MARK-BODY".to_vec()),
+        };
+        let shown = format!("{reply:?}");
+        assert!(!shown.contains("MARK"), "{shown}");
+        assert!(shown.contains("body_len: 15"), "{shown}");
+    }
 
     fn script() -> Script {
         Script::parse(

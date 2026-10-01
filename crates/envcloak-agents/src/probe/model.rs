@@ -22,9 +22,11 @@
 //!   /v1/responses` (OpenAI Responses) from a [`Script`] ([`wire`]), and any
 //!   other path `404`, recording it, so a host that calls something new
 //!   fails the run loudly instead of being half served;
-//! - refuses a proxy tunnel request (`CONNECT host:port`) and records its
-//!   target, so with `HTTPS_PROXY` pointed at it a run shows every other
-//!   place a host tried to reach;
+//! - refuses a request meant for a proxy, a tunnel (`CONNECT host:port`)
+//!   or a request to forward (an absolute `http://` or `https://` target),
+//!   in HTTP/1.1 or 1.0, and records the `host:port` it names, so with a
+//!   host's proxy variables pointed at it a run shows every other place
+//!   the host tried to reach;
 //! - records every request it accepts with its whole body, held in wiping
 //!   buffers and wiped when the run ends.
 //!
@@ -251,8 +253,9 @@ pub struct Outcome {
     pub exhausted: u64,
     /// Connections refused because the cap on open ones was reached.
     pub busy: u64,
-    /// Proxy tunnel requests (`CONNECT host:port`), refused: what a host
-    /// tried to reach besides the model. Not a failure of the run.
+    /// Requests meant for a proxy (a `CONNECT host:port` tunnel, or an
+    /// absolute target to forward), refused: what a host tried to reach
+    /// besides the model. Not a failure of the run.
     pub connect: u64,
     /// Recorded requests whose reply was never sent whole: held on a
     /// barrier when the run ended, or the connection failed first.
@@ -292,7 +295,8 @@ impl Outcome {
     }
 }
 
-/// One request the stub accepted. `Debug` leaves the body out.
+/// One request the stub accepted. `Debug` leaves the body out, and shows
+/// the target only as the endpoint it names or by its length.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Recorded {
@@ -314,7 +318,10 @@ pub struct Recorded {
     /// recorded before it is sent, unanswered, so a run that ends while it
     /// is held says so.
     pub answered: bool,
-    /// `messages` or `responses`, for a request to one of the two APIs.
+    /// `messages` or `responses`, for a request to one of the two APIs;
+    /// `hello` for Claude Code's connectivity check; `connect` for a
+    /// tunnel and `proxy` for a request to forward, whose `path` is the
+    /// `host:port` it names.
     pub api: Option<String>,
     /// What the script gave it: `step <n>`, `side`, `exhausted` or
     /// `mismatch`.
@@ -331,7 +338,10 @@ impl fmt::Debug for Recorded {
             .field("seq", &self.seq)
             .field("at_ms", &self.at_ms)
             .field("method", &self.method)
-            .field("path", &self.path)
+            .field(
+                "target",
+                &http::shown_target(&self.path, self.query.as_deref()),
+            )
             .field("status", &self.status)
             .field("answered", &self.answered)
             .field("api", &self.api)
