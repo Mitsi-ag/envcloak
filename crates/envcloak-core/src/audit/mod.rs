@@ -35,6 +35,22 @@ pub use verify::{
 
 use crate::vault::{AuditHead, PathError, Vault, VaultError};
 
+/// Test support only: the torn-tail check's work budget and the work done
+/// (review R-17).
+#[cfg(feature = "testing")]
+pub mod testing {
+    /// The most work the torn-tail check of one [`super::verify`], or one
+    /// [`super::AuditWriter::open`], does (see `TAIL_CHECK_BUDGET` in
+    /// `verify.rs`).
+    pub const TAIL_CHECK_BUDGET: usize = super::verify::TAIL_CHECK_BUDGET;
+
+    /// How many lengths the scans of every length have tried on this
+    /// thread so far, each one chain value or tag computed in full.
+    pub fn lengths_tried() -> usize {
+        crate::crypto::lengths_tried()
+    }
+}
+
 /// An audit log failure. Carries its kind only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditError {

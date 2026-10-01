@@ -207,6 +207,8 @@ fn authenticates_at_with(
         at.update(&[lengths]);
         let mut tag = poly1305::Block::default();
         tag.copy_from_slice(&body[n - Sealed::TAG_LEN..n]);
+        #[cfg(feature = "testing")]
+        LENGTHS_TRIED.with(|t| t.set(t.get() + 1));
         if at.verify(&tag).is_ok() && take(n) {
             return true;
         }
@@ -219,6 +221,21 @@ thread_local! {
     /// Calls to [`open_into`] on this thread, so tests can show that a
     /// check ran before any decryption was attempted.
     pub(crate) static OPEN_ATTEMPTS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "testing")]
+thread_local! {
+    /// Test support only: the lengths [`authenticates_at`] and
+    /// [`super::keyed_hash_prefixes`] have tried on this thread, each one
+    /// tag or hash computed to its end, so a test can see the audit log's
+    /// torn-tail check stay within its budget (review R-17).
+    pub(crate) static LENGTHS_TRIED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Test support only: [`LENGTHS_TRIED`] on this thread so far.
+#[cfg(feature = "testing")]
+pub(crate) fn lengths_tried() -> usize {
+    LENGTHS_TRIED.with(core::cell::Cell::get)
 }
 
 #[cfg(test)]

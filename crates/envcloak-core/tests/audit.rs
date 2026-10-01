@@ -23,7 +23,7 @@ use envcloak_core::SecretBytes;
 use envcloak_core::audit::{
     AnchorCheck, AuditIo, AuditKind, AuditRecord, AuditWriter, DecisionSummary, HEADER_LEN,
     MAX_ENTRY, MAX_SEGMENT, OsIo, Problem, ProblemKind, ProjectSummary, SubjectSummary,
-    VerifyReport, read_entries, verify,
+    VerifyReport, read_entries, testing, verify,
 };
 use envcloak_core::crypto::Keyring;
 use envcloak_core::vault::{AuditHead, INITIAL_EPOCH, ItemId, Slug};
@@ -1442,6 +1442,12 @@ fn a_torn_frame_under_another_number_is_kept_as_damage() {
 /// twelfth, each of which is tried at every length (cycle 150), are kept
 /// and flagged as damage rather than removed as a crash's, with or without
 /// a saved head before them.
+///
+/// Review R-17: the numbered bytes also frame at every twelfth offset (a
+/// length of 1,280), and opening those used up the budget whether or not
+/// the scans at every length were charged to it. So the lengths those
+/// scans try are counted, and stay within the budget for each check and
+/// each writer's open.
 #[test]
 fn bytes_too_many_to_check_are_kept_as_damage() {
     let log = Log::new();
@@ -1474,10 +1480,22 @@ fn bytes_too_many_to_check_are_kept_as_damage() {
         (Some(three), &numbered),
     ] {
         std::fs::write(&seg, bytes).unwrap();
+        let before = testing::lengths_tried();
         let r = log.verify(anchor);
+        let tried = testing::lengths_tried() - before;
+        assert!(
+            (MAX_ENTRY..=testing::TAIL_CHECK_BUDGET).contains(&tried),
+            "{anchor:?}: {tried} lengths tried by the check"
+        );
         assert_eq!(problem(&r), Some((4, ProblemKind::Unreadable)), "{r:?}");
         assert!(!r.torn_tail, "{r:?}");
+        let before = testing::lengths_tried();
         let (_, report) = AuditWriter::open(&log.dir, &log.keys, anchor).unwrap();
+        let tried = testing::lengths_tried() - before;
+        assert!(
+            (MAX_ENTRY..=testing::TAIL_CHECK_BUDGET).contains(&tried),
+            "{anchor:?}: {tried} lengths tried by the open"
+        );
         assert!(
             report.damaged && !report.torn_tail_removed,
             "{anchor:?}: {report:?}"
