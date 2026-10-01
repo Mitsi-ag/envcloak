@@ -1003,12 +1003,16 @@ pub enum ErrorKind {
     /// missing, not a regular file, altered, cut short, or of a newer
     /// format.
     BackupUnusable,
+    /// A `run.request` over a pending cap (SPEC §10a): no request was
+    /// opened and nothing refused; `reason` names the cap. A waiter asks
+    /// again with backoff.
+    TooManyPending,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 39] = [
+    pub const ALL: [ErrorKind; 40] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -1047,6 +1051,7 @@ impl ErrorKind {
         ErrorKind::TooManyChecks,
         ErrorKind::AuditFailed,
         ErrorKind::BackupUnusable,
+        ErrorKind::TooManyPending,
         ErrorKind::Internal,
     ];
 
@@ -1091,6 +1096,7 @@ impl ErrorKind {
             ErrorKind::TooManyChecks => -32032,
             ErrorKind::AuditFailed => -32033,
             ErrorKind::BackupUnusable => -32034,
+            ErrorKind::TooManyPending => -32035,
             ErrorKind::Internal => -32099,
         }
     }
@@ -1136,6 +1142,7 @@ impl ErrorKind {
             ErrorKind::TooManyChecks => "too_many_checks",
             ErrorKind::AuditFailed => "audit_failed",
             ErrorKind::BackupUnusable => "backup_unusable",
+            ErrorKind::TooManyPending => "too_many_pending",
             ErrorKind::Internal => "internal",
         }
     }
@@ -1220,6 +1227,10 @@ impl ErrorKind {
                 "that file is not a vault backup this build can read: it is missing, not a \
                  regular file, altered or cut short, or of a newer format; nothing was restored"
             }
+            ErrorKind::TooManyPending => {
+                "too many requests are waiting for approval, so this one was not opened; approve \
+                 or deny one (`envcloak pending` lists them), or ask again later"
+            }
             ErrorKind::Internal => "the daemon failed",
         }
     }
@@ -1296,10 +1307,12 @@ pub const REASONS: &[&str] = &[
     // Denied decisions (envcloak_policy::DenyReason), in results.
     "repeated",
     "root_denied",
-    "pending_per_root",
-    "pending_total",
     "denials_full",
     "audit_failed",
+    // The pending cap a `run.request` met (envcloak_policy::PendingCap),
+    // for `too_many_pending`.
+    "pending_per_root",
+    "pending_total",
     // Items (`items.*`): what is wrong with a name or a value, and a
     // target that changed. `unknown_item`, `unknown_field`,
     // `ambiguous_field`, `no_field`, `unknown_item_class` and
@@ -1327,8 +1340,8 @@ pub struct RpcError {
     /// [`ErrorKind::VaultUnavailable`], [`ErrorKind::Evidence`],
     /// [`ErrorKind::ManifestInvalid`], [`ErrorKind::BindingUnresolved`],
     /// [`ErrorKind::InvalidOptions`], [`ErrorKind::NoSuchItem`],
-    /// [`ErrorKind::InvalidItem`] and [`ErrorKind::ProofRefused`]
-    /// (`requester_terminal` only).
+    /// [`ErrorKind::InvalidItem`], [`ErrorKind::ProofRefused`]
+    /// (`requester_terminal` only) and [`ErrorKind::TooManyPending`].
     pub reason: Option<&'static str>,
 }
 

@@ -187,6 +187,15 @@ const REASON_TEXTS: &[(&str, &str)] = &[
         "live_not_bound",
         "a --live name is not one of the request's variables",
     ),
+    // The pending cap a request met (`too_many_pending`).
+    (
+        "pending_per_root",
+        "this process tree already has 3 requests waiting for approval",
+    ),
+    (
+        "pending_total",
+        "20 requests are already waiting for approval",
+    ),
     // Items.
     (
         "item_changed",

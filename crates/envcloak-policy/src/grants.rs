@@ -46,7 +46,9 @@
 //! request, it is preferred and the once grant is kept.
 //!
 //! **Bounds.** [`crate::flood`] holds the pending caps and the denial
-//! rules; at most [`MAX_GRANTS`] grants exist at a time.
+//! rules; at most [`MAX_GRANTS`] grants exist at a time. A request over a
+//! pending cap is not denied: it is answered [`Decision::TooManyPending`],
+//! which a waiter asks again later (M2 plan D-04).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -293,8 +295,31 @@ pub enum Decision {
     Covered(GrantId),
     /// No grant covers it; a person must approve this pending request.
     Pending(PendingId),
+    /// No grant covers it, and no request was opened: a pending cap is
+    /// full. Nothing was refused; the caller may ask again once a place
+    /// is free (M2 plan D-04).
+    TooManyPending(PendingCap),
     /// Refused without a prompt.
     Denied(DenyReason),
+}
+
+/// The pending cap a request met (SPEC §10a "Bounds").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PendingCap {
+    /// The root has 3 pending requests already.
+    PerRoot,
+    /// The daemon has 20 pending requests already.
+    Total,
+}
+
+impl PendingCap {
+    /// The stable token, the reason `too_many_pending` carries.
+    pub fn token(self) -> &'static str {
+        match self {
+            PendingCap::PerRoot => "pending_per_root",
+            PendingCap::Total => "pending_total",
+        }
+    }
 }
 
 /// Why a request was denied without a prompt (SPEC §10a "Bounds").
@@ -304,10 +329,6 @@ pub enum DenyReason {
     Repeated,
     /// The root was denied 3 times in 10 minutes and is denied for 30.
     RootDenied,
-    /// The root has 3 pending requests already.
-    PendingPerRoot,
-    /// The daemon has 20 pending requests already.
-    PendingTotal,
     /// 64 requests were denied within their windows: no new request is
     /// opened until the oldest window ends, so none is forgotten early.
     DenialsFull,
@@ -323,8 +344,6 @@ impl DenyReason {
         match self {
             DenyReason::Repeated => "repeated",
             DenyReason::RootDenied => "root_denied",
-            DenyReason::PendingPerRoot => "pending_per_root",
-            DenyReason::PendingTotal => "pending_total",
             DenyReason::DenialsFull => "denials_full",
             DenyReason::AuditFailed => "audit_failed",
         }
@@ -335,8 +354,6 @@ impl DenyReason {
         [
             DenyReason::Repeated,
             DenyReason::RootDenied,
-            DenyReason::PendingPerRoot,
-            DenyReason::PendingTotal,
             DenyReason::DenialsFull,
             DenyReason::AuditFailed,
         ]
@@ -351,10 +368,6 @@ impl DenyReason {
             DenyReason::RootDenied => {
                 "this process tree was denied three times in 10 minutes and is denied for 30"
             }
-            DenyReason::PendingPerRoot => {
-                "this process tree already has 3 requests waiting for approval"
-            }
-            DenyReason::PendingTotal => "20 requests are already waiting for approval",
             DenyReason::DenialsFull => {
                 "64 requests were denied in the last 10 minutes; new requests wait until the \
                  oldest of those denials is 10 minutes old"
@@ -598,10 +611,10 @@ impl GrantStore {
             .filter(|p| p.request.subject.root() == root)
             .count();
         if per_root >= MAX_PENDING_PER_ROOT {
-            return Decision::Denied(DenyReason::PendingPerRoot);
+            return Decision::TooManyPending(PendingCap::PerRoot);
         }
         if self.pending.len() >= MAX_PENDING {
-            return Decision::Denied(DenyReason::PendingTotal);
+            return Decision::TooManyPending(PendingCap::Total);
         }
         // Every denial is kept for its whole window: with the list full,
         // no request is opened that a person could deny.

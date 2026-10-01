@@ -10,7 +10,7 @@ Status: M1. This file fixes how SPEC §10a "Bounds and display" and §10b are ca
 2. opens the manifest itself from the path sent (a symlinked manifest is refused, SPEC §5) and resolves the bindings from the file it read, the profile, the `--ref` bindings and the env file's references and names (docs/MANIFEST.md "Resolving a run's bindings"); the caller's argv is never used for anything but display;
 3. binds each reference to a field of a secret item in the vault, and looks up whether the vault has a record of the project ("new project") and whether any adopted project's bindings name each item ("first use", SPEC §6.4 "Adoption");
 4. applies the effective policy: the vault's policy for the project (approve, redact, inject in M1), tightened by the manifest's `[policy]`, for the subject's kind. `agents = "deny"` refuses an agent or unknown subject (`policy_denied`); a required proxy mode is refused in M1 (`mode_unsupported`), never injected;
-5. asks the grant store for the decision: `covered` (with the grant id, whether output is redacted, the mode, and whether the manifest's hash differs from the one at approval), `pending` (with the request id) or `denied` (with the reason).
+5. asks the grant store for the decision: `covered` (with the grant id, whether output is redacted, the mode, and whether the manifest's hash differs from the one at approval), `pending` (with the request id) or `denied` (with the reason). A request over a pending cap opens nothing and is not denied: it is answered `too_many_pending` (below, "Bounds").
 
 A covered request is a delivery: its answer carries the bindings' values, and `envcloak run` starts the command with them (docs/RUN.md). A pending run exits 125 with `approval_required request=<id>: run "envcloak approve <id>" in a terminal you control`, and reads nothing from its own terminal: that terminal may be an agent's, and a `y` typed there approves nothing.
 
@@ -72,7 +72,7 @@ The descriptor (`envcloak_policy::PendingDescriptor`) holds: the request id, the
 
 ## Bounds
 
-- At most 3 pending requests per root and 20 per daemon; a request beyond either is denied (`pending_per_root`, `pending_total`).
+- At most 3 pending requests per root and 20 per daemon. A request beyond either opens nothing and is not denied: it is answered `too_many_pending`, with the reason `pending_per_root` or `pending_total`, and audited so (`request decision=too_many_pending`). Nothing was refused and nothing asked of a person, so a waiter asks again with backoff and a run that does not wait exits 125.
 - A request identical to one denied in the last 10 minutes is denied without a prompt (`repeated`).
 - Three denials for one root within 10 minutes deny that root for 30 minutes (`root_denied`), whatever it asks: the store checks this before it looks for a grant, so a grant the root already holds covers none of its requests meanwhile. The grant is kept (revoke it with `envcloak grants revoke` to end it) and covers again when the 30 minutes end. The daemon logs a notice, until there is a surface for a notification (M3).
 - Denials are remembered for their whole 10 minutes, and this state outlives a lock, since it only tightens. None is forgotten early to make room: while 64 are remembered, no new pending request is opened (`denials_full`) until the oldest is 10 minutes old, so a denied request never prompts again inside its window and a root's count toward the auto-deny is never reset. Only a pending request can be denied, so at most 64 plus the 20 pending requests are held.
