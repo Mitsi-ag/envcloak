@@ -1,0 +1,72 @@
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:15:4
+   │
+15 │   "BSD-2-Clause",
+   │    ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:22:4
+   │
+22 │   "CDLA-Permissive-2.0",
+   │    ━━━━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:17:4
+   │
+17 │   "ISC",
+   │    ━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:21:4
+   │
+21 │   "MPL-2.0",
+   │    ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:18:4
+   │
+18 │   "Zlib",
+   │    ━━━━ unmatched license allowance
+
+warning[duplicate]: found 2 duplicate entries for crate 'syn'
+    ┌─ /private/tmp/ec-m2-m2-01/Cargo.lock:105:1
+    │  
+105 │ ╭ syn 2.0.119 registry+https://github.com/rust-lang/crates.io-index
+106 │ │ syn 3.0.6 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰───────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ syn v2.0.119
+      └── curve25519-dalek-derive v0.1.1
+          └── curve25519-dalek v5.0.0
+              └── ed25519-dalek v3.0.0
+                  └── envcloak-deptrial v0.1.0
+    ├ syn v3.0.6
+      └── serde_derive v1.0.229
+          └── serde v1.0.229
+              ├── envcloak v0.1.0
+              ├── (dev) envcloak-core v0.1.0
+              │   ├── envcloak v0.1.0 (*)
+              │   ├── (dev) envcloak-core v0.1.0 (*)
+              │   ├── envcloak-exec v0.1.0
+              │   │   └── envcloak v0.1.0 (*)
+              │   ├── envcloak-ipc v0.1.0
+              │   │   ├── envcloak v0.1.0 (*)
+              │   │   ├── (dev) envcloak-ipc v0.1.0 (*)
+              │   │   └── envcloakd v0.1.0
+              │   ├── envcloak-policy v0.1.0
+              │   │   ├── envcloak v0.1.0 (*)
+              │   │   ├── envcloak-exec v0.1.0 (*)
+              │   │   ├── envcloak-ipc v0.1.0 (*)
+              │   │   ├── envcloak-scan v0.1.0
+              │   │   │   └── envcloak v0.1.0 (*)
+              │   │   └── envcloakd v0.1.0 (*)
+              │   ├── envcloak-providers v0.1.0
+              │   │   ├── envcloak v0.1.0 (*)
+              │   │   ├── (dev) envcloak-providers v0.1.0 (*)
+              │   │   └── envcloakd v0.1.0 (*)
+              │   ├── envcloak-scan v0.1.0 (*)
+              │   └── envcloakd v0.1.0 (*)
+              ├── envcloak-ipc v0.1.0 (*)
+              └── envcloak-policy v0.1.0 (*)
+
+advisories ok, bans ok, licenses ok, sources ok

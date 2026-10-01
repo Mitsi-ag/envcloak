@@ -1,0 +1,2 @@
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+rustls-platform-verifier = "=0.7.1"

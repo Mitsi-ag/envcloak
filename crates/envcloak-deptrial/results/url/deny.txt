@@ -1,0 +1,31 @@
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:15:4
+   │
+15 │   "BSD-2-Clause",
+   │    ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:22:4
+   │
+22 │   "CDLA-Permissive-2.0",
+   │    ━━━━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:17:4
+   │
+17 │   "ISC",
+   │    ━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:21:4
+   │
+21 │   "MPL-2.0",
+   │    ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /private/tmp/ec-m2-m2-01/deny.toml:18:4
+   │
+18 │   "Zlib",
+   │    ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok

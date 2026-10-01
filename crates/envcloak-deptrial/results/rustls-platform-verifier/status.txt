@@ -1,0 +1,3 @@
+tree exit 0
+deny exit 0
+check-sources exit 0

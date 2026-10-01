@@ -1,0 +1,4 @@
+check-sources: the proc-macro crate displaydoc is compiled for the workspace but not listed in security/proc-macro-allowlist.txt (a proc-macro can generate lint attributes and includes no source check sees)
+check-sources: the proc-macro crate yoke-derive is compiled for the workspace but not listed in security/proc-macro-allowlist.txt (a proc-macro can generate lint attributes and includes no source check sees)
+check-sources: the proc-macro crate zerofrom-derive is compiled for the workspace but not listed in security/proc-macro-allowlist.txt (a proc-macro can generate lint attributes and includes no source check sees)
+check-sources: the proc-macro crate zerovec-derive is compiled for the workspace but not listed in security/proc-macro-allowlist.txt (a proc-macro can generate lint attributes and includes no source check sees)

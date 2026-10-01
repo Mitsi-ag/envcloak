@@ -1,0 +1,74 @@
+envcloak-deptrial v0.1.0 (/private/tmp/ec-m2-m2-01/crates/envcloak-deptrial)
+└── url v2.5.8
+    ├── form_urlencoded v1.2.2
+    │   └── percent-encoding v2.3.2
+    ├── idna v1.1.0
+    │   ├── idna_adapter v1.2.1
+    │   │   ├── icu_normalizer v2.1.1
+    │   │   │   ├── icu_collections v2.1.1
+    │   │   │   │   ├── displaydoc v0.2.7 (proc-macro)
+    │   │   │   │   │   ├── proc-macro2 v1.0.107
+    │   │   │   │   │   │   └── unicode-ident v1.0.26
+    │   │   │   │   │   ├── quote v1.0.47
+    │   │   │   │   │   │   └── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │   └── syn v3.0.6
+    │   │   │   │   │       ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │       ├── quote v1.0.47 (*)
+    │   │   │   │   │       └── unicode-ident v1.0.26
+    │   │   │   │   ├── potential_utf v0.1.6
+    │   │   │   │   │   └── zerovec v0.11.8
+    │   │   │   │   │       ├── yoke v0.8.3
+    │   │   │   │   │       │   ├── stable_deref_trait v1.2.1
+    │   │   │   │   │       │   ├── yoke-derive v0.8.4 (proc-macro)
+    │   │   │   │   │       │   │   ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │       │   │   ├── quote v1.0.47 (*)
+    │   │   │   │   │       │   │   ├── syn v3.0.6 (*)
+    │   │   │   │   │       │   │   └── synstructure v0.14.0
+    │   │   │   │   │       │   │       ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │       │   │       ├── quote v1.0.47 (*)
+    │   │   │   │   │       │   │       └── syn v3.0.6 (*)
+    │   │   │   │   │       │   └── zerofrom v0.1.8
+    │   │   │   │   │       │       └── zerofrom-derive v0.1.8 (proc-macro)
+    │   │   │   │   │       │           ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │       │           ├── quote v1.0.47 (*)
+    │   │   │   │   │       │           ├── syn v3.0.6 (*)
+    │   │   │   │   │       │           └── synstructure v0.14.0 (*)
+    │   │   │   │   │       ├── zerofrom v0.1.8 (*)
+    │   │   │   │   │       └── zerovec-derive v0.11.6 (proc-macro)
+    │   │   │   │   │           ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │           ├── quote v1.0.47 (*)
+    │   │   │   │   │           └── syn v3.0.6 (*)
+    │   │   │   │   ├── yoke v0.8.3 (*)
+    │   │   │   │   ├── zerofrom v0.1.8 (*)
+    │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   ├── icu_normalizer_data v2.1.1
+    │   │   │   ├── icu_provider v2.1.1
+    │   │   │   │   ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │   │   ├── icu_locale_core v2.1.1
+    │   │   │   │   │   ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │   │   │   ├── litemap v0.8.3
+    │   │   │   │   │   ├── tinystr v0.8.4
+    │   │   │   │   │   │   ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   │   │   ├── writeable v0.6.4
+    │   │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   │   ├── writeable v0.6.4
+    │   │   │   │   ├── yoke v0.8.3 (*)
+    │   │   │   │   ├── zerofrom v0.1.8 (*)
+    │   │   │   │   ├── zerotrie v0.2.5
+    │   │   │   │   │   ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │   │   │   ├── yoke v0.8.3 (*)
+    │   │   │   │   │   └── zerofrom v0.1.8 (*)
+    │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   ├── smallvec v1.16.2
+    │   │   │   └── zerovec v0.11.8 (*)
+    │   │   └── icu_properties v2.1.2
+    │   │       ├── icu_collections v2.1.1 (*)
+    │   │       ├── icu_locale_core v2.1.1 (*)
+    │   │       ├── icu_properties_data v2.1.2
+    │   │       ├── icu_provider v2.1.1 (*)
+    │   │       ├── zerotrie v0.2.5 (*)
+    │   │       └── zerovec v0.11.8 (*)
+    │   ├── smallvec v1.16.2
+    │   └── utf8_iter v1.0.4
+    └── percent-encoding v2.3.2

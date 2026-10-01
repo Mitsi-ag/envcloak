@@ -1,0 +1,39 @@
+envcloak-deptrial v0.1.0 (/private/tmp/ec-m2-m2-01/crates/envcloak-deptrial)
+├── rustls v0.23.45
+│   ├── log v0.4.34
+│   ├── once_cell v1.21.4
+│   ├── ring v0.17.14
+│   │   ├── cfg-if v1.0.5
+│   │   ├── getrandom v0.2.17
+│   │   │   ├── cfg-if v1.0.5
+│   │   │   └── libc v0.2.189
+│   │   ├── libc v0.2.189
+│   │   └── untrusted v0.9.0
+│   │   [build-dependencies]
+│   │   └── cc v1.5.1
+│   │       ├── find-msvc-tools v0.1.14
+│   │       └── shlex v2.0.1
+│   ├── rustls-pki-types v1.15.1
+│   │   └── zeroize v1.9.0
+│   ├── rustls-webpki v0.103.15
+│   │   ├── ring v0.17.14 (*)
+│   │   ├── rustls-pki-types v1.15.1 (*)
+│   │   └── untrusted v0.9.0
+│   ├── subtle v2.6.1
+│   └── zeroize v1.9.0
+└── rustls-platform-verifier v0.7.1
+    ├── core-foundation v0.10.1
+    │   ├── core-foundation-sys v0.8.7
+    │   └── libc v0.2.189
+    ├── core-foundation-sys v0.8.7
+    ├── log v0.4.34
+    ├── rustls v0.23.45 (*)
+    ├── security-framework v3.7.0
+    │   ├── bitflags v2.13.2
+    │   ├── core-foundation v0.10.1 (*)
+    │   ├── core-foundation-sys v0.8.7
+    │   ├── libc v0.2.189
+    │   └── security-framework-sys v2.17.0
+    │       ├── core-foundation-sys v0.8.7
+    │       └── libc v0.2.189
+    └── security-framework-sys v2.17.0 (*)

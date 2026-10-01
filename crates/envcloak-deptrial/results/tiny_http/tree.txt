@@ -1,0 +1,6 @@
+envcloak-deptrial v0.1.0 (/private/tmp/ec-m2-m2-01/crates/envcloak-deptrial)
+└── tiny_http v0.12.0
+    ├── ascii v1.1.0
+    ├── chunked_transfer v1.5.0
+    ├── httpdate v1.0.3
+    └── log v0.4.34

@@ -1,0 +1,14 @@
+ed25519-dalek              mac   crates= 19 proc-macros=none; build-scripts=curve25519-dalek, libc
+ed25519-dalek              linux crates= 23 proc-macros=curve25519-dalek-derive 0.1.1; build-scripts=curve25519-dalek, proc-macro2, quote
+rustls-native-certs        mac   crates= 20 proc-macros=none; build-scripts=libc, ring, rustls
+rustls-native-certs        linux crates= 16 proc-macros=none; build-scripts=libc, ring, rustls
+rustls-platform-verifier   mac   crates= 21 proc-macros=none; build-scripts=libc, ring, rustls
+rustls-platform-verifier   linux crates= 18 proc-macros=none; build-scripts=libc, ring, rustls
+sha1                       mac   crates= 12 proc-macros=none; build-scripts=libc
+sha1                       linux crates= 11 proc-macros=none; build-scripts=none
+tiny_http                  mac   crates=  5 proc-macros=none; build-scripts=none
+tiny_http                  linux crates=  5 proc-macros=none; build-scripts=none
+ureq                       mac   crates= 30 proc-macros=none; build-scripts=httparse, libc, ring, rustls
+ureq                       linux crates= 27 proc-macros=none; build-scripts=httparse, libc, ring, rustls
+url                        mac   crates= 35 proc-macros=displaydoc 0.2.7, serde_derive 1.0.229, yoke-derive 0.8.4, zerofrom-derive 0.1.8, zerovec-derive 0.11.6; build-scripts=icu_normalizer_data, icu_properties_data, proc-macro2, quote, serde, serde_core
+url                        linux crates= 35 proc-macros=displaydoc 0.2.7, serde_derive 1.0.229, yoke-derive 0.8.4, zerofrom-derive 0.1.8, zerovec-derive 0.11.6; build-scripts=icu_normalizer_data, icu_properties_data, proc-macro2, quote, serde, serde_core

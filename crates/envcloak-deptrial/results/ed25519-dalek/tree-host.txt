@@ -1,0 +1,24 @@
+envcloak-deptrial v0.1.0 (/private/tmp/ec-m2-m2-01/crates/envcloak-deptrial)
+└── ed25519-dalek v3.0.0
+    ├── curve25519-dalek v5.0.0
+    │   ├── cfg-if v1.0.5
+    │   ├── digest v0.11.3
+    │   │   ├── block-buffer v0.12.1
+    │   │   │   └── hybrid-array v0.4.15
+    │   │   │       └── typenum v1.20.1
+    │   │   └── crypto-common v0.2.2
+    │   │       └── hybrid-array v0.4.15 (*)
+    │   ├── subtle v2.6.1
+    │   └── zeroize v1.9.0
+    │   [build-dependencies]
+    │   └── rustc_version v0.4.1
+    │       └── semver v1.0.28
+    ├── ed25519 v3.0.0
+    │   └── signature v3.0.0
+    ├── sha2 v0.11.0
+    │   ├── cfg-if v1.0.5
+    │   ├── cpufeatures v0.3.1
+    │   │   └── libc v0.2.189
+    │   └── digest v0.11.3 (*)
+    ├── subtle v2.6.1
+    └── zeroize v1.9.0
