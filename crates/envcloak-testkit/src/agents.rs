@@ -122,7 +122,7 @@ pub struct Pin {
     /// The entry file's SHA-256, lower-case hex.
     pub sha256: String,
     /// The program that runs the entry file, when it is a script
-    /// (`node`): found on `PATH` when the host starts.
+    /// (`node`: the pinned Node.js in the cache, [`node_pin`]).
     pub interpreter: Option<String>,
     /// The program the entry starts in its turn, relative to the host's
     /// directory, and its SHA-256: checked like the entry.
@@ -178,6 +178,34 @@ pub fn pins(versions: &Path) -> Vec<Pin> {
         .collect()
 }
 
+/// The Node.js versions.toml pins (its `[node]` table) for this platform:
+/// the version and the SHA-256 of its `bin/node`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePin {
+    pub version: String,
+    pub sha256: String,
+}
+
+/// The `[node]` pin for this platform, if versions.toml has one.
+///
+/// # Panics
+/// When the file cannot be read, or the pin lacks a field.
+pub fn node_pin(versions: &Path) -> Option<NodePin> {
+    let text = std::fs::read_to_string(versions)
+        .unwrap_or_else(|e| panic!("read {}: {e}", versions.display()));
+    let doc: toml_edit::Document<String> = text
+        .parse()
+        .unwrap_or_else(|e| panic!("{} is not TOML: {e}", versions.display()));
+    let node = doc.get("node")?.as_table_like()?;
+    let plat = platform()?;
+    let version = node.get("version")?.as_str()?.to_owned();
+    let sha256 = node
+        .get("sha256")
+        .and_then(|t| t.as_table_like()?.get(plat)?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| panic!("the [node] pin has no sha256 for {plat}"));
+    Some(NodePin { version, sha256 })
+}
+
 /// A pinned host found installed and verified.
 #[derive(Debug, Clone)]
 pub struct Installed {
@@ -186,6 +214,9 @@ pub struct Installed {
     pub dir: PathBuf,
     /// Its entry file.
     pub exe: PathBuf,
+    /// The interpreter that runs the entry, when it is a script: the
+    /// pinned Node.js in the cache, and its pinned SHA-256.
+    pub interpreter: Option<(PathBuf, String)>,
 }
 
 /// The SHA-256 of a file, lower-case hex.
@@ -228,20 +259,45 @@ impl Installed {
         };
         let dir = cache_dir().join(format!("{id}-{variant}-{}-{plat}", pin.version));
         let exe = dir.join(&pin.entry);
-        let host = Installed { pin, dir, exe };
+        let interpreter = match pin.interpreter.as_deref() {
+            None => None,
+            Some("node") => {
+                let Some(node) = node_pin(versions) else {
+                    return Err(format!(
+                        "{id}/{variant} runs under node, which is not pinned"
+                    ));
+                };
+                let path = cache_dir()
+                    .join(format!("node-{}-{plat}", node.version))
+                    .join("bin")
+                    .join("node");
+                Some((path, node.sha256))
+            }
+            Some(other) => return Err(format!("{id}/{variant}: no pinned interpreter {other}")),
+        };
+        let host = Installed {
+            pin,
+            dir,
+            exe,
+            interpreter,
+        };
         host.verify()?;
         Ok(host)
     }
 
-    /// Checks the entry file's SHA-256 against the pin again, and that of
-    /// the program it starts, when the pin names one.
+    /// Checks the entry file's SHA-256 against the pin again, and those of
+    /// the program it starts and of its interpreter, when the pin names
+    /// them.
     ///
     /// # Errors
-    /// When either is missing or differs.
+    /// When any is missing or differs.
     pub fn verify(&self) -> Result<(), String> {
         let mut files = vec![(self.exe.clone(), self.pin.sha256.as_str())];
         if let Some((path, sum)) = &self.pin.starts {
             files.push((self.dir.join(path), sum.as_str()));
+        }
+        if let Some((path, sum)) = &self.interpreter {
+            files.push((path.clone(), sum.as_str()));
         }
         for (file, want) in files {
             let got = sha256_file(&file).map_err(|e| {
@@ -262,23 +318,13 @@ impl Installed {
         Ok(())
     }
 
-    /// The command that starts the host: its entry, or its interpreter
-    /// (found on this process's `PATH`) with the entry as the script.
-    ///
-    /// # Panics
-    /// When the interpreter is not on `PATH`.
+    /// The command that starts the host: its entry, or its pinned
+    /// interpreter with the entry as the script.
     pub fn command(&self) -> Command {
-        match &self.pin.interpreter {
+        match &self.interpreter {
             None => Command::new(&self.exe),
-            Some(name) => {
-                let found = std::env::var_os("PATH")
-                    .and_then(|p| {
-                        std::env::split_paths(&p)
-                            .map(|d| d.join(name))
-                            .find(|p| p.is_file())
-                    })
-                    .unwrap_or_else(|| panic!("{name} is needed on PATH for {}", self.pin.id));
-                let mut cmd = Command::new(found);
+            Some((node, _)) => {
+                let mut cmd = Command::new(node);
                 cmd.arg(&self.exe);
                 cmd
             }
@@ -1557,7 +1603,33 @@ mod tests {
             pin,
             dir: PathBuf::from("/nonexistent"),
             exe: PathBuf::from("/nonexistent/codex"),
+            interpreter: None,
         }
+    }
+
+    /// A host whose entry is a script runs only under the pinned
+    /// interpreter: a node whose SHA-256 is not the pin's fails the check
+    /// every run makes, like a changed entry.
+    #[test]
+    fn a_host_s_interpreter_is_checked_like_its_entry() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let entry = dir.path().join("cli.js");
+        let node = dir.path().join("node");
+        std::fs::write(&entry, b"console.log(1)").unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&node, b"a node").unwrap_or_else(|e| panic!("{e}"));
+        let sum = |p: &Path| sha256_file(p).unwrap_or_else(|e| panic!("{e}"));
+        let mut host = installed();
+        host.exe = entry.clone();
+        host.pin.sha256 = sum(&entry);
+        host.interpreter = Some((node.clone(), sum(&node)));
+        assert_eq!(host.verify(), Ok(()));
+        std::fs::write(&node, b"another node").unwrap_or_else(|e| panic!("{e}"));
+        let why = host.verify().err().unwrap_or_default();
+        assert!(why.contains("is not the pinned build"), "{why}");
+        let mut cmd = host.command();
+        assert_eq!(cmd.get_program(), node.as_os_str());
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), [entry.as_os_str()]);
+        let _ = cmd.env_clear();
     }
 
     /// The person's settings are merged into what Codex's own CLI wrote,

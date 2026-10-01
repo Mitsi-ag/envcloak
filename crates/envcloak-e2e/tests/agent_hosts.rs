@@ -2106,7 +2106,7 @@ fn claude_code_interactive_trust_and_paste() {
 /// built at run time, so the command's own text never holds them whole.
 const ANCESTRY_PROBE: &str = "printf '%s%s\\n' 'MARK' 'ER-ran'; p=$$; i=0; \
      while [ \"$p\" -gt 1 ] && [ $i -lt 4 ]; do \
-     printf '%s %s | %s\\n' 'AN''C' \"$(ps -o comm= -p \"$p\")\" \"$(ps -o args= -p \"$p\" | cut -c1-160)\"; \
+     printf '%s %s | %s\\n' 'AN''C' \"$(ps -o comm= -p \"$p\")\" \"$(ps -o args= -p \"$p\" | cut -c1-400)\"; \
      p=$(ps -o ppid= -p \"$p\" | tr -d ' '); i=$((i+1)); done";
 
 /// One tier-2 host run: the scripted model's report, the host's output

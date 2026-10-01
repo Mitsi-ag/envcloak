@@ -26,6 +26,13 @@ A host whose entry is a script names its `interpreter` (`node`); one whose
 entry starts another program names it in `starts` (relative to the host's
 directory) with its SHA-256 in `starts_sha256`, checked like the entry's.
 
+Node.js itself is pinned in versions.toml's [node] table, by version, by
+the SHA-256 of the official archive and by that of its bin/node, and
+installed first into node-<version>-<platform>/ in the same cache, the
+same way (verified, then renamed into place). Every npm install runs that
+Node's own npm, and the test harness runs every `interpreter = "node"`
+host with that node: nothing depends on a Node found on PATH.
+
 `url` may name {version}, {platform} (darwin-arm64, linux-x64), {os}
 (darwin, linux) and {arch} (arm64, x64).
 
@@ -108,12 +115,22 @@ def extract(archive, dest, strip):
             parts = [p for p in m.name.split("/") if p not in ("", ".")]
             if any(p == ".." for p in parts) or m.name.startswith("/"):
                 raise ValueError("an archive member leaves the directory")
-            if m.issym() or m.islnk():
-                target = m.linkname
-                if target.startswith("/") or ".." in target.split("/"):
-                    raise ValueError("an archive link leaves the directory")
             if len(parts) <= strip:
                 continue
+            if m.issym() or m.islnk():
+                target = m.linkname
+                if target.startswith("/"):
+                    raise ValueError("an archive link leaves the directory")
+                # A symlink is relative to its own directory (Node's
+                # bin/npm -> ../lib/...), a hard link to the archive's root;
+                # either must land inside what is extracted.
+                base = "/".join(parts[strip:-1]) if m.issym() else ""
+                landed = os.path.normpath(os.path.join(base, target))
+                if m.islnk():
+                    landed = os.path.normpath("/".join(
+                        [p for p in target.split("/") if p not in ("", ".")][strip:]))
+                if landed == ".." or landed.startswith("../") or landed.startswith("/"):
+                    raise ValueError("an archive link leaves the directory")
             m.name = "/".join(parts[strip:])
             if m.islnk():
                 m.linkname = "/".join([p for p in m.linkname.split("/") if p][strip:])
@@ -124,7 +141,53 @@ def label(host):
     return "%s/%s %s" % (host["id"], host["variant"], host["version"])
 
 
-def install(host, plat, cache, print_hashes):
+def node_dir(cache, node, plat):
+    return os.path.join(cache, "node-%s-%s" % (node["version"], plat))
+
+
+def install_node(node, plat, cache, print_hashes):
+    """Installs the pinned Node.js into the cache: its archive checked
+    against `archive_sha256`, then its bin/node against `sha256`."""
+    want_archive = per_platform(node, "archive_sha256", plat)
+    want = per_platform(node, "sha256", plat)
+    url = per_platform(node, "url", plat)
+    if url is None or ((want is None or want_archive is None) and not print_hashes):
+        return False, "Node.js is not pinned for %s" % plat
+    final = node_dir(cache, node, plat)
+    binary = os.path.join("bin", "node")
+    if not print_hashes and os.path.isdir(final):
+        if sha256_file(os.path.join(final, binary)) == want:
+            return True, "already installed, verified"
+        return False, "installed copy does not match its pin; remove %s and run again" % final
+    os.makedirs(cache, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=".tmp-node-", dir=cache)
+    try:
+        archive = os.path.join(tmp, ".archive")
+        fetch(url.format(version=node["version"]), archive)
+        got = sha256_file(archive)
+        if print_hashes:
+            print("  node archive_sha256 %s = %s" % (plat, got))
+        elif got != want_archive:
+            return False, "download SHA-256 %s, pinned %s" % (got, want_archive)
+        extract(archive, tmp, 1)
+        os.unlink(archive)
+        got = sha256_file(os.path.join(tmp, binary))
+        if print_hashes:
+            print("  node sha256 %s = %s" % (plat, got))
+            return True, "hashes printed, nothing installed"
+        if got != want:
+            return False, "bin/node SHA-256 %s, pinned %s" % (got, want)
+        os.rename(tmp, final)
+        tmp = None
+        return True, "installed, verified"
+    except (OSError, ValueError, tarfile.TarError) as e:
+        return False, "%s" % e
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def install(host, plat, cache, print_hashes, node):
     entry = per_platform(host, "entry", plat)
     want = per_platform(host, "sha256", plat)
     if entry is None:
@@ -190,12 +253,18 @@ def install(host, plat, cache, print_hashes):
             for name in ("package.json", "package-lock.json"):
                 shutil.copyfile(os.path.join(locks, name), os.path.join(tmp, name))
             # By its real path: npm reads a prefix reached through a link
-            # (macOS's /tmp, a `..`) as a link to a package of its own.
-            cmd = ["npm", "ci", "--prefix", os.path.realpath(tmp), "--no-audit", "--no-fund",
-                   "--loglevel=error"]
+            # (macOS's /tmp, a `..`) as a link to a package of its own. The
+            # pinned Node's own npm, with that Node first on PATH for any
+            # install script.
+            if node is None:
+                return False, "Node.js is not installed for npm hosts"
+            npm = os.path.join(node, "lib", "node_modules", "npm", "bin", "npm-cli.js")
+            cmd = [os.path.join(node, "bin", "node"), npm, "ci", "--prefix",
+                   os.path.realpath(tmp), "--no-audit", "--no-fund", "--loglevel=error"]
             if not host.get("scripts", False):
-                cmd.insert(2, "--ignore-scripts")
+                cmd.insert(3, "--ignore-scripts")
             env = dict(os.environ)
+            env["PATH"] = os.path.join(node, "bin") + os.pathsep + env.get("PATH", "")
             env["npm_config_update_notifier"] = "false"
             r = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if r.returncode != 0:
@@ -269,13 +338,23 @@ def main(argv):
         doc = tomllib.load(f)
     cache = cache_dir()
     ok = True
+    hosts = []
     for host in doc.get("host", []):
         key = "%s/%s" % (host["id"], host["variant"])
         if only and host["id"] not in only and key not in only:
             continue
         if not only and tier != "all" and str(host.get("tier")) != tier:
             continue
-        good, why = install(host, plat, cache, print_hashes)
+        hosts.append(host)
+    node = None
+    if any(h["method"] == "npm" or h.get("interpreter") == "node" for h in hosts):
+        good, why = install_node(doc["node"], plat, cache, print_hashes)
+        print("install-agent-hosts: node %s (%s): %s" % (doc["node"]["version"], plat, why))
+        ok = ok and good
+        if os.path.isdir(node_dir(cache, doc["node"], plat)):
+            node = node_dir(cache, doc["node"], plat)
+    for host in hosts:
+        good, why = install(host, plat, cache, print_hashes, node)
         print("install-agent-hosts: %s (%s): %s" % (label(host), plat, why))
         ok = ok and good
     return 0 if ok else 1
