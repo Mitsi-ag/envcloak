@@ -17,6 +17,11 @@ which a task uses again for a new case). This script refuses:
   name cell that is not one backticked name, a number that is not one);
 - a name, or a number in a numbered table, used twice in one table; the
   coverage tokens (states, reasons and probe outcomes) share one namespace;
+- a name in two of the tables whose tokens reach the person as
+  `envcloak: <token>` (error kinds, reasons, the CLI's own failure tokens
+  and sign-in tokens), unless SHARED below names it with both tables, and a
+  `reserved` row in one of them whose name the code already uses in
+  another;
 - a malformed name, an unknown task or status, a spare row that is not
   `reserved`, or a number outside the table's reserved range;
 - against the code, where the registry has a source the script reads: a
@@ -24,7 +29,18 @@ which a task uses again for a new case). This script refuses:
   row the code does not hold exactly so, a `reuse` row the code does not
   hold, and, in a numbered table, a code entry in the reserved range with
   no `landed` row. A code source that yields nothing is an error, never an
-  empty registry.
+  empty registry, and so is a code source that gives one number or token
+  to two entries, or two tokens or codes to one.
+
+The CLI's failure tokens are read from every crate's `src/` (comments and
+`#[cfg(test)]` modules left out): the first argument of `Failure::new` and
+of every function whose first parameter is `token: &'static str` (or
+`ExitToken`), every `token: <value>` field, and every string in the body of
+a `fn token`, whatever crate it is in. A value written as a `&str`
+constant counts by the constant's string. The reader over-counts rather
+than under-counts: a string it takes for a token that is not printed only
+makes a `reserved` row with that name fail, which is a name to avoid
+anyway.
 
 Usage: scripts/check-reservations.py [--root <repository root>]
 Prints "check-reservations: ok" and exits 0, or names every problem on
@@ -53,12 +69,19 @@ TASKS = (
 STATUSES = ("reserved", "landed", "reuse")
 COVERAGE_KINDS = ("state", "reason", "outcome")
 
+# The tables whose tokens the person reads as `envcloak: <token>`: one
+# namespace, so one name never means two things there (R-7).
+PRINTED = ("error_kind", "reason", "exit_token", "signin_token")
+
+# A name meant to be the same token in two of the PRINTED tables, with the
+# tables it may be in. Empty: no reserved name is shared today. An entry
+# needs a reviewer's agreement that both rows mean one thing.
+SHARED = {}
+
 # Code sources, relative to the root.
 AUDIT_RS = "crates/envcloak-core/src/audit/record.rs"
 AAD_RS = "crates/envcloak-core/src/crypto/aad.rs"
 PROTO_RS = "crates/envcloak-ipc/src/proto.rs"
-CLIENT_RS = "crates/envcloak-ipc/src/client.rs"
-CLI_SRC = "crates/envcloak-cli/src"
 CRATES = "crates"
 
 problems = []
@@ -68,62 +91,265 @@ def fail(msg):
     problems.append(msg)
 
 
-def read(root, rel):
-    try:
-        with open(os.path.join(root, rel), encoding="utf-8") as f:
-            return f.read()
-    except OSError as e:
-        raise SourceError("%s could not be read (%s)" % (rel, e.strerror))
-
-
 class SourceError(Exception):
     pass
 
 
-def strip_line_comments(text):
-    return re.sub(r"//[^\n]*", "", text)
+def read(root, rel):
+    try:
+        with open(os.path.join(root, rel), encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise SourceError("%s could not be read (%s)" % (rel, getattr(e, "strerror", None) or e))
 
 
-def enum_body(text, name, rel):
-    m = re.search(r"pub enum %s\s*\{(.*?)\n\}" % re.escape(name), text, re.S)
+# --- Reading Rust source ---------------------------------------------------
+
+SCAN = re.compile(r"//|/\*|\bb?r#*\"|\"|'")
+BLOCK_COMMENT = re.compile(r"/\*|\*/")
+STRING_END = re.compile(r"\\.|\"", re.S)
+CHAR = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|.)|[^\\'\n])'")
+BRACE = re.compile(r"[{}]")
+BODY_OR_END = re.compile(r"[{;]")
+TEST_MOD = re.compile(
+    r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{"
+)
+NOT_NEWLINE = re.compile(r"[^\n]")
+
+
+def _blanked(s):
+    return NOT_NEWLINE.sub(" ", s)
+
+
+def _blank_spans(text, spans):
+    out, last = [], 0
+    for a, b in sorted(spans):
+        out.append(text[last:a])
+        out.append(_blanked(text[a:b]))
+        last = b
+    out.append(text[last:])
+    return "".join(out)
+
+
+class Source:
+    """One Rust file as two views of the same length: `code`, with comments
+    blanked, and `skel`, also with the inside of every string and character
+    literal blanked, so that structure (braces, commas, `token:`) is found
+    in `skel` and literals are read from `code` at the same offsets.
+    `#[cfg(test)]` modules are blanked in both."""
+
+    def __init__(self, rel, text):
+        self.rel = rel
+        comments, contents = [], []
+        n, i = len(text), 0
+        while True:
+            m = SCAN.search(text, i)
+            if not m:
+                break
+            s, tok = m.start(), m.group(0)
+            if tok == "//":
+                j = text.find("\n", s)
+                j = n if j < 0 else j
+                comments.append((s, j))
+                i = j
+            elif tok == "/*":
+                depth, j = 1, s + 2
+                while depth:
+                    k = BLOCK_COMMENT.search(text, j)
+                    if not k:
+                        j = n
+                        break
+                    depth += 1 if k.group(0) == "/*" else -1
+                    j = k.end()
+                comments.append((s, j))
+                i = j
+            elif tok == "'":
+                c = CHAR.match(text, s)
+                if c:
+                    contents.append((s + 1, c.end() - 1))
+                    i = c.end()
+                else:
+                    i = s + 1
+            elif tok == '"':
+                j = s + 1
+                while True:
+                    k = STRING_END.search(text, j)
+                    if not k:
+                        j = n
+                        break
+                    if k.group(0) == '"':
+                        j = k.start()
+                        break
+                    j = k.end()
+                contents.append((s + 1, j))
+                i = j + 1
+            else:
+                close = '"' + tok[tok.index("r") + 1: -1]
+                j = text.find(close, m.end())
+                j = n if j < 0 else j
+                contents.append((m.end(), j))
+                i = j + len(close)
+        self.code = _blank_spans(text, comments)
+        self.skel = _blank_spans(text, comments + contents)
+        tests = []
+        for m in TEST_MOD.finditer(self.skel):
+            if not tests or m.start() >= tests[-1][1]:
+                tests.append((m.start(), self.block_end(m.end() - 1)))
+        if tests:
+            self.code = _blank_spans(self.code, tests)
+            self.skel = _blank_spans(self.skel, tests)
+
+    def block_end(self, open_brace):
+        """The offset just after the `}` that closes the `{` at `open_brace`."""
+        depth = 0
+        for m in BRACE.finditer(self.skel, open_brace):
+            depth += 1 if m.group(0) == "{" else -1
+            if depth == 0:
+                return m.end()
+        return len(self.skel)
+
+    def fn_bodies(self, name):
+        """Spans of the bodies of every `fn <name>`."""
+        spans = []
+        for m in re.finditer(r"\bfn\s+%s\s*[<(]" % re.escape(name), self.skel):
+            k = BODY_OR_END.search(self.skel, m.end())
+            if k and k.group(0) == "{":
+                spans.append((k.start(), self.block_end(k.start())))
+        return spans
+
+    def literal_at(self, quote):
+        """The string literal whose opening quote is at `quote`."""
+        close = self.skel.find('"', quote + 1)
+        return self.code[quote + 1: close if close >= 0 else len(self.code)]
+
+    def literals(self, start, end):
+        """Every string literal that opens inside [start, end)."""
+        out, k = [], start
+        while True:
+            q = self.skel.find('"', k, end)
+            if q < 0:
+                return out
+            close = self.skel.find('"', q + 1)
+            if close < 0:
+                return out
+            out.append(self.code[q + 1: close])
+            k = close + 1
+
+    def first_arg(self, open_paren):
+        """The text of the first argument of the call whose `(` is at
+        `open_paren`, from `code`."""
+        depth, k = 0, open_paren + 1
+        while k < len(self.skel):
+            ch = self.skel[k]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch == "," and depth == 0:
+                break
+            k += 1
+        return self.code[open_paren + 1: k].strip()
+
+
+def rust_sources(root):
+    """Every Rust file under `crates/<crate>/src/`, as `Source`s."""
+    out = []
+    base = os.path.join(root, CRATES)
+    try:
+        crates = sorted(os.listdir(base))
+    except OSError as e:
+        raise SourceError("%s could not be listed (%s)" % (CRATES, e.strerror))
+    for crate in crates:
+        src = os.path.join(base, crate, "src")
+        for dirpath, dirnames, names in os.walk(src):
+            dirnames.sort()
+            for name in sorted(names):
+                if name.endswith(".rs"):
+                    rel = os.path.relpath(os.path.join(dirpath, name), root)
+                    out.append(Source(rel, read(root, rel)))
+    if not out:
+        raise SourceError("no Rust source under crates/*/src")
+    return out
+
+
+# --- Code registries ---------------------------------------------------------
+
+
+def enum_body(src, name):
+    m = re.search(r"pub enum %s\s*\{" % re.escape(name), src.skel)
     if not m:
-        raise SourceError("%s has no `pub enum %s`" % (rel, name))
-    return strip_line_comments(m.group(1))
+        raise SourceError("%s has no `pub enum %s`" % (src.rel, name))
+    return src.code[m.end(): src.block_end(m.end() - 1) - 1]
 
 
 def snake(name):
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
 
-def numbered_variants(text, enum, rel):
-    body = enum_body(text, enum, rel)
-    found = re.findall(r"^\s*([A-Z][A-Za-z0-9]*)\s*=\s*(-?\d+)\s*,", body, re.M)
+def numbered_variants(src, enum):
+    body = enum_body(src, enum)
+    found = [(v, int(n)) for v, n in re.findall(r"^\s*([A-Z][A-Za-z0-9]*)\s*=\s*(-?\d+)\s*,", body, re.M)]
     if not found:
-        raise SourceError("%s: `%s` has no numbered variants" % (rel, enum))
-    return [(v, int(n)) for v, n in found]
+        raise SourceError("%s: `%s` has no numbered variants" % (src.rel, enum))
+    unique_or_fail(src, "`%s` variant" % enum, [v for v, _ in found])
+    by_number = {}
+    for v, n in found:
+        by_number.setdefault(n, []).append(v)
+    for n, vs in sorted(by_number.items()):
+        if len(vs) > 1:
+            raise SourceError("%s: `%s` gives %d to more than one variant (%s)" % (src.rel, enum, n, ", ".join(vs)))
+    return found
 
 
-def match_arms(text, enum, rel, value):
-    arms = re.findall(r"%s::([A-Z][A-Za-z0-9]*)\s*=>\s*%s" % (enum, value), text)
-    if not arms:
-        raise SourceError("%s: no `%s::<variant> => ...` arms" % (rel, enum))
-    return arms
+def unique_or_fail(src, what, items):
+    seen = set()
+    for item in items:
+        if item in seen:
+            raise SourceError("%s: %s `%s` appears twice" % (src.rel, what, item))
+        seen.add(item)
+
+
+def enum_arms(src, enum, fn, value):
+    """(variant, value) for every arm `Enum::A | Enum::B => <value>` in the
+    bodies of `fn <fn>` that match on `enum`, refusing a variant with two
+    arms and a value given to two variants."""
+    arm = re.compile(r"((?:%s::[A-Z][A-Za-z0-9]*\s*\|\s*)*%s::[A-Z][A-Za-z0-9]*)\s*=>\s*%s" % (enum, enum, value))
+    pairs = []
+    for start, end in src.fn_bodies(fn):
+        for m in arm.finditer(src.code, start, end):
+            for v in re.findall(r"%s::([A-Z][A-Za-z0-9]*)" % enum, m.group(1)):
+                pairs.append((v, m.group(2)))
+    if not pairs:
+        raise SourceError("%s: no `%s::<variant> => ...` arms in `fn %s`" % (src.rel, enum, fn))
+    by_variant, by_value = {}, {}
+    for v, x in pairs:
+        by_variant.setdefault(v, []).append(x)
+        by_value.setdefault(x, []).append(v)
+    for v, xs in sorted(by_variant.items()):
+        if len(xs) > 1:
+            raise SourceError("%s: `%s::%s` has more than one arm in `fn %s` (%s)" % (src.rel, enum, v, fn, ", ".join(xs)))
+    for x, vs in sorted(by_value.items()):
+        if len(vs) > 1:
+            raise SourceError("%s: `fn %s` gives `%s` to more than one `%s` variant (%s)" % (src.rel, fn, x, enum, ", ".join(vs)))
+    return {v: xs[0] for v, xs in by_variant.items()}
 
 
 def code_audit_kinds(root):
-    text = read(root, AUDIT_RS)
-    numbers = dict(numbered_variants(text, "AuditKind", AUDIT_RS))
-    tokens = dict(match_arms(text, "AuditKind", AUDIT_RS, r'"([a-z][a-z0-9_]*)"'))
-    missing = sorted(set(numbers) - set(tokens))
+    src = Source(AUDIT_RS, read(root, AUDIT_RS))
+    numbers = dict(numbered_variants(src, "AuditKind"))
+    tokens = enum_arms(src, "AuditKind", "token", r'"([a-z][a-z0-9_]*)"')
+    missing = sorted(set(numbers) ^ set(tokens))
     if missing:
-        raise SourceError("%s: AuditKind variants without a token: %s" % (AUDIT_RS, ", ".join(missing)))
+        raise SourceError("%s: AuditKind variants without both a number and a token: %s" % (AUDIT_RS, ", ".join(missing)))
     return {tokens[v]: n for v, n in numbers.items()}
 
 
 def code_error_kinds(root):
-    text = read(root, PROTO_RS)
-    codes = dict(match_arms(text, "ErrorKind", PROTO_RS, r"(-\d+)\s*,"))
-    tokens = dict(match_arms(text, "ErrorKind", PROTO_RS, r'"([a-z][a-z0-9_]*)"\s*,'))
+    src = Source(PROTO_RS, read(root, PROTO_RS))
+    codes = enum_arms(src, "ErrorKind", "code", r"(-\d+)\b")
+    tokens = enum_arms(src, "ErrorKind", "token", r'"([a-z][a-z0-9_]*)"')
     missing = sorted(set(codes) ^ set(tokens))
     if missing:
         raise SourceError("%s: ErrorKind variants without both a code and a token: %s" % (PROTO_RS, ", ".join(missing)))
@@ -131,57 +357,86 @@ def code_error_kinds(root):
 
 
 def code_reasons(root):
-    text = read(root, PROTO_RS)
-    m = re.search(r"pub const REASONS: &\[&str\] = &\[(.*?)\];", text, re.S)
+    src = Source(PROTO_RS, read(root, PROTO_RS))
+    m = re.search(r"pub const REASONS: &\[&str\] = &\[", src.skel)
     if not m:
         raise SourceError("%s has no `pub const REASONS`" % PROTO_RS)
-    found = re.findall(r'"([^"]*)"', strip_line_comments(m.group(1)))
+    end = src.skel.find("];", m.end())
+    found = src.literals(m.end(), end if end >= 0 else len(src.skel))
     if not found:
         raise SourceError("%s: REASONS is empty" % PROTO_RS)
-    return set(found)
+    unique_or_fail(src, "reason", found)
+    return {r: PROTO_RS for r in found}
 
 
 def code_methods(root):
-    text = read(root, PROTO_RS)
-    found = re.findall(r"const NAME: &'static str = \"([^\"]+)\";", text)
+    src = Source(PROTO_RS, read(root, PROTO_RS))
+    found = [src.literal_at(m.end() - 1) for m in re.finditer(r"const NAME: &'static str = \"", src.skel)]
     if not found:
         raise SourceError("%s: no method `NAME` constants" % PROTO_RS)
-    return set(found)
+    unique_or_fail(src, "method name", found)
+    return {name: PROTO_RS for name in found}
 
 
 def tags(enum):
     def reader(root):
-        text = read(root, AAD_RS)
-        return {snake(v): n for v, n in numbered_variants(text, enum, AAD_RS)}
+        src = Source(AAD_RS, read(root, AAD_RS))
+        return {snake(v): n for v, n in numbered_variants(src, enum)}
 
     return reader
 
 
+STR_TYPE = r"(?:&\s*(?:'static\s+)?str|ExitToken)"
+CONST_DEF = re.compile(r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*%s\s*=\s*\"" % STR_TYPE)
+HELPER_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)\s*(?:<[^>]*>)?\s*\(\s*token\s*:\s*(?:&\s*'static\s+str|ExitToken)\b")
+CONST_REF = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)$")
+
+
 def code_exit_tokens(root):
-    """Tokens the CLI prints for its own failures: the first argument of
-    every `Failure::new`, every `token: "..."` field, and the connection
-    tokens of `ClientError::token`."""
-    found = set()
-    base = os.path.join(root, CLI_SRC)
-    files = 0
-    for dirpath, _, names in os.walk(base):
-        for name in sorted(names):
-            if not name.endswith(".rs"):
-                continue
-            files += 1
-            with open(os.path.join(dirpath, name), encoding="utf-8") as f:
-                text = f.read()
-            found.update(re.findall(r'Failure::new\(\s*"([a-z][a-z0-9_]*)"', text))
-            found.update(re.findall(r'\btoken:\s*"([a-z][a-z0-9_]*)"', text))
-    if files == 0:
-        raise SourceError("%s holds no Rust files" % CLI_SRC)
-    text = read(root, CLIENT_RS)
-    m = re.search(r"pub fn token\(self\) -> &'static str \{(.*?)\n    \}", text, re.S)
-    if not m:
-        raise SourceError("%s has no `ClientError::token`" % CLIENT_RS)
-    found.update(re.findall(r'"([a-z][a-z0-9_]*)"', m.group(1)))
+    """Tokens the CLI can print for its own failures, with the first file
+    each is found in (see the module comment for what is read)."""
+    sources = rust_sources(root)
+    consts = {}
+    helpers = set()
+    for src in sources:
+        for m in CONST_DEF.finditer(src.skel):
+            consts.setdefault(m.group(1), set()).add(src.literal_at(m.end() - 1))
+        for m in HELPER_DEF.finditer(src.skel):
+            if m.group(1) != "new":
+                helpers.add(m.group(1))
+    found = {}
+
+    def take(value, src):
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            values = {value[1:-1]}
+        else:
+            m = CONST_REF.match(value)
+            values = consts.get(m.group(1), set()) if m else set()
+        for v in values:
+            if TOKEN.match(v):
+                found.setdefault(v, src.rel)
+
+    calls = [r"\bFailure::new\s*\("] + [r"(?<!\w)(?<!fn )%s\s*\(" % re.escape(h) for h in sorted(helpers)]
+    call = re.compile("|".join(calls))
+    for src in sources:
+        for m in call.finditer(src.skel):
+            take(src.first_arg(m.end() - 1), src)
+        for m in re.finditer(r"\btoken\s*:\s*", src.skel):
+            k = m.end()
+            if src.skel.startswith('"', k):
+                take('"%s"' % src.literal_at(k), src)
+            else:
+                ident = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Z0-9_]*\b", src.skel[k:])
+                if ident:
+                    take(ident.group(0), src)
+        for start, end in src.fn_bodies("token"):
+            for lit in src.literals(start, end):
+                take('"%s"' % lit, src)
+            for ident in re.findall(r"\b[A-Z][A-Z0-9_]*\b", src.skel[start:end]):
+                if ident in consts:
+                    take(ident, src)
     if not found:
-        raise SourceError("no CLI failure tokens found under %s" % CLI_SRC)
+        raise SourceError("no CLI failure tokens found under crates/*/src")
     return found
 
 
@@ -189,14 +444,18 @@ def code_statement_domains(root):
     """Statement domains written as string literals in the workspace's Rust
     files (`b"envcloak-statement/1\n"`); a domain named in a comment is
     not one the code uses."""
-    found = set()
+    found = {}
     for dirpath, dirnames, names in os.walk(os.path.join(root, CRATES)):
-        dirnames[:] = [d for d in dirnames if d != "target"]
-        for name in names:
+        dirnames[:] = sorted(d for d in dirnames if d != "target")
+        for name in sorted(names):
             if not name.endswith(".rs"):
                 continue
-            with open(os.path.join(dirpath, name), encoding="utf-8") as f:
-                found.update(re.findall(r"b?\"(envcloak-[a-z0-9-]*statement/[0-9]+)", f.read()))
+            rel = os.path.relpath(os.path.join(dirpath, name), root)
+            src = Source(rel, read(root, rel))
+            for lit in src.literals(0, len(src.skel)):
+                m = re.match(r"(envcloak-[a-z0-9-]*statement/[0-9]+)", lit)
+                if m:
+                    found.setdefault(m.group(1), rel)
     if not found:
         raise SourceError("no statement domain (`envcloak-...statement/N`) found under crates/")
     return found
@@ -366,26 +625,41 @@ def check_rows(reg, rows):
     return out
 
 
-def check_code(root, reg, rows):
+def read_code(root):
+    """Each registry's code entries (name to number in a numbered table,
+    name to the file it is in otherwise), or the SourceError reading it
+    raised; None where the registry has no code source yet."""
+    out = {}
+    for reg, spec in REGISTRIES.items():
+        if spec["code"] is None:
+            out[reg] = None
+            continue
+        try:
+            out[reg] = spec["code"](root)
+        except SourceError as e:
+            out[reg] = e
+    return out
+
+
+def check_code(reg, rows, code):
     spec = REGISTRIES[reg]
     where = "%s `%s`" % (spec["doc"], reg)
-    if spec["code"] is None:
+    if code is None:
         for key, _, status, _ in rows:
             if status == "reuse":
                 fail("%s: `%s` is `reuse`, but this table has no code source to check it against" % (where, key))
         return
-    try:
-        code = spec["code"](root)
-    except SourceError as e:
-        fail("%s: %s" % (where, e))
+    if isinstance(code, SourceError):
+        fail("%s: %s" % (where, code))
         return
-    numbered = isinstance(code, dict)
+    numbered = "num" in spec
     by_number = {n: k for k, n in code.items()} if numbered else {}
     for key, number, status, _ in rows:
         present = key in code
         if status == "reserved":
             if present:
-                fail("%s: `%s` is reserved, but the code already has it: mark it `landed` if its task added it, `reuse` if it is older, or pick another name" % (where, key))
+                found = "" if numbered else " (%s)" % code[key]
+                fail("%s: `%s` is reserved, but the code already has it%s: mark it `landed` if its task added it, `reuse` if it is older, or pick another name" % (where, key, found))
             if numbered and number in by_number:
                 fail("%s: `%s` reserves %d, which the code gives to `%s`" % (where, key, number, by_number[number]))
         else:
@@ -399,6 +673,35 @@ def check_code(root, reg, rows):
         for key, number in sorted(code.items(), key=lambda kv: kv[1]):
             if lo <= number <= hi and (key, number) not in landed:
                 fail("%s: the code has `%s` = %d in the reserved range with no `landed` row for it" % (where, key, number))
+
+
+def check_printed_namespace(checked, codes):
+    """Error kinds, reasons, the CLI's failure tokens and sign-in tokens all
+    reach the person as `envcloak: <token>`: a name is in at most one of
+    those tables, and a `reserved` name is not one the code already uses
+    in another, unless SHARED names it with both tables."""
+    in_tables = {}
+    for reg in PRINTED:
+        for key, _, _, _ in checked.get(reg, []):
+            in_tables.setdefault(key, []).append(reg)
+
+    def shared(name, regs):
+        return set(regs) <= set(SHARED.get(name, ()))
+
+    for name, regs in sorted(in_tables.items()):
+        if len(regs) > 1 and not shared(name, regs):
+            fail("docs/IPC.md: `%s` is reserved in both `%s`: error kinds, reasons, the CLI's failure tokens and sign-in tokens are printed as `envcloak: <token>` and share one namespace" % (name, "` and `".join(regs)))
+    for reg in PRINTED:
+        for key, _, status, _ in checked.get(reg, []):
+            if status != "reserved":
+                continue
+            for other in PRINTED:
+                code = codes.get(other)
+                if other == reg or not isinstance(code, dict) or key not in code:
+                    continue
+                if not shared(key, (reg, other)):
+                    found = "code %d" % code[key] if "num" in REGISTRIES[other] else code[key]
+                    fail("docs/IPC.md `%s`: `%s` is reserved here, but the code already uses it in `%s` (%s)" % (reg, key, other, found))
 
 
 def main(argv):
@@ -415,8 +718,10 @@ def main(argv):
     checked = {}
     for reg, rows in tables.items():
         checked[reg] = check_rows(reg, rows)
+    codes = read_code(root)
     for reg, rows in checked.items():
-        check_code(root, reg, rows)
+        check_code(reg, rows, codes[reg])
+    check_printed_namespace(checked, codes)
     if problems:
         for p in problems:
             print("check-reservations: " + p, file=sys.stderr)

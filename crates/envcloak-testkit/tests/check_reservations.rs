@@ -1,9 +1,11 @@
 //! `scripts/check-reservations.py` (plan decision D-23, task M2-01) on the
 //! real tree and on copies of the files it reads, each changed one way: it
 //! accepts the tree as it is and an entry landed as reserved, and refuses a
-//! number or name taken twice, a malformed row, an unknown task or status, a
-//! missing table, a code source it cannot read, and each disagreement
-//! between a table and the code.
+//! number or name taken twice (in one table, across the tables printed as
+//! `envcloak: <token>`, and in the code itself), a malformed row, an
+//! unknown task or status, a missing table, a code source it cannot read,
+//! and each disagreement between a table and the code, wherever in the
+//! workspace's sources the code holds the entry.
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -15,18 +17,7 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Every file the script reads, relative to the root, apart from the CLI's
-/// source directory.
-const FILES: [&str; 7] = [
-    "docs/IPC.md",
-    "docs/VAULT.md",
-    "crates/envcloak-core/src/audit/record.rs",
-    "crates/envcloak-core/src/crypto/aad.rs",
-    "crates/envcloak-ipc/src/proto.rs",
-    "crates/envcloak-ipc/src/client.rs",
-    "crates/envcloak-policy/src/statement.rs",
-];
-const CLI_SRC: &str = "crates/envcloak-cli/src";
+const SCRIPT: &str = "scripts/check-reservations.py";
 
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
@@ -42,17 +33,35 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// A copy of the files the script reads, under a fresh test home.
+/// A copy of what the script reads (the two documents and every crate's
+/// `src/`), under a fresh test home.
 fn fixture() -> TestHome {
     let t = TestHome::new();
     let root = t.home();
-    for rel in FILES {
+    for rel in ["docs/IPC.md", "docs/VAULT.md"] {
         let dest = root.join(rel);
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::copy(repo_root().join(rel), dest).unwrap();
     }
-    copy_dir(&repo_root().join(CLI_SRC), &root.join(CLI_SRC));
+    for entry in std::fs::read_dir(repo_root().join("crates")).unwrap() {
+        let entry = entry.unwrap();
+        let src = entry.path().join("src");
+        if src.is_dir() {
+            copy_dir(
+                &src,
+                &root.join("crates").join(entry.file_name()).join("src"),
+            );
+        }
+    }
     t
+}
+
+/// Writes `text` as a new Rust file at `rel` in the copy.
+fn add_file(t: &TestHome, rel: &str, text: &str) {
+    let path = t.home().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    assert!(!path.exists(), "{rel} exists");
+    std::fs::write(path, text).unwrap();
 }
 
 /// Replaces the one occurrence of `from` in `rel` with `to`.
@@ -63,15 +72,19 @@ fn edit(t: &TestHome, rel: &str, from: &str, to: &str) {
     std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
 }
 
-fn run(root: &Path) -> Output {
+fn run_script(script: &Path, root: &Path) -> Output {
     let t = TestHome::new();
     let mut cmd = Command::new("python3");
     t.apply(&mut cmd)
-        .arg(repo_root().join("scripts/check-reservations.py"))
+        .arg(script)
         .arg("--root")
         .arg(root)
         .output()
         .unwrap()
+}
+
+fn run(root: &Path) -> Output {
+    run_script(&repo_root().join(SCRIPT), root)
 }
 
 fn assert_passes(root: &Path) {
@@ -103,8 +116,8 @@ fn add_audit_kind(t: &TestHome, variant: &str, number: u32, token: &str) {
     edit(
         t,
         RECORD,
-        "    Recover = 21,\n}",
-        &format!("    Recover = 21,\n    {variant} = {number},\n}}"),
+        "    Recover = 21,\n",
+        &format!("    Recover = 21,\n    {variant} = {number},\n"),
     );
     edit(
         t,
@@ -338,4 +351,245 @@ fn a_code_source_it_cannot_read_fails() {
     let t = fixture();
     edit(&t, RECORD, "pub enum AuditKind {", "pub enum AuditKinds {");
     assert_fails(&t, "has no `pub enum AuditKind`");
+}
+
+const PROTO: &str = "crates/envcloak-ipc/src/proto.rs";
+
+/// Points the `incomplete` row of the failure-token table at `token`.
+fn reserve_exit_token(t: &TestHome, token: &str) {
+    edit(
+        t,
+        IPC,
+        "| `incomplete` | M2-14 | reserved |",
+        &format!("| `{token}` | M2-14 | reserved |"),
+    );
+}
+
+#[test]
+fn a_failure_token_returned_by_another_crates_token_method_counts() {
+    // envcloak-exec's `ExecError::token`, which `run` prints through
+    // `Failure::new(e.token(), ...)`.
+    let t = fixture();
+    reserve_exit_token(&t, "command_not_executable");
+    assert_fails(
+        &t,
+        "`command_not_executable` is reserved, but the code already has it (crates/envcloak-exec/src/lib.rs)",
+    );
+}
+
+#[test]
+fn a_failure_token_through_a_helper_function_counts() {
+    // `envcloak daemon` reports through `failure(token, message)`.
+    let t = fixture();
+    reserve_exit_token(&t, "service_manager");
+    assert_fails(
+        &t,
+        "`service_manager` is reserved, but the code already has it (crates/envcloak-cli/src/cmd/daemon.rs)",
+    );
+}
+
+/// A file outside the CLI that reports a failure through a `&str`
+/// constant, as M2-02's `envcloak-client` and its `NOT_IN_THIS_BUILD` do.
+const CLIENT_STUB: &str = "crates/envcloak-client/src/stub.rs";
+
+#[test]
+fn a_failure_token_written_as_a_constant_in_another_crate_counts() {
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "/// The token of a command this build does not have.\n\
+         pub const NOT_IN_THIS_BUILD: &str = \"not_in_this_build\";\n\
+         \n\
+         pub fn stub() -> Failure {\n    \
+             Failure::new(\n        \
+                 crate::stub::NOT_IN_THIS_BUILD,\n        \
+                 \"not in this build\",\n    \
+             )\n\
+         }\n",
+    );
+    assert_fails(
+        &t,
+        &format!("`not_in_this_build` is reserved, but the code already has it ({CLIENT_STUB})"),
+    );
+    // The task that lands it marks the row `landed`, and then it passes.
+    edit(
+        &t,
+        IPC,
+        "| `not_in_this_build` | M2-02 | reserved |",
+        "| `not_in_this_build` | M2-02 | landed |",
+    );
+    assert_passes(&t.home());
+}
+
+#[test]
+fn a_failure_token_in_a_field_or_a_token_method_counts() {
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "const APP: &'static str = \"app_required\";\n\
+         pub fn a() -> Failure { Failure { token: \"pty_unavailable\", message: \"\".into() } }\n\
+         impl E { pub fn token(&self) -> &'static str { match self { E::A => APP, E::B => \"pty_monitor_lost\" } } }\n",
+    );
+    for token in ["pty_unavailable", "pty_monitor_lost", "app_required"] {
+        assert_fails(
+            &t,
+            &format!("`{token}` is reserved, but the code already has it ({CLIENT_STUB})"),
+        );
+    }
+}
+
+#[test]
+fn a_token_in_a_comment_a_string_or_a_test_module_does_not_count() {
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "// Failure::new(\"app_required\", \"\")\n\
+         /* token: \"pty_unavailable\" */\n\
+         const TEXT: &str = \"Failure::new(\\\"pty_monitor_lost\\\", x)\";\n\
+         #[cfg(test)]\n\
+         mod tests {\n    \
+             fn t() { let _ = Failure::new(\"not_in_this_build\", \"\"); }\n\
+         }\n",
+    );
+    assert_passes(&t.home());
+}
+
+#[test]
+fn a_name_reserved_in_two_printed_tables_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `limited` | M2-11 | reserved |",
+        "| `incomplete` | M2-11 | reserved |",
+    );
+    assert_fails(
+        &t,
+        "`incomplete` is reserved in both `reason` and `exit_token`",
+    );
+}
+
+#[test]
+fn a_reserved_name_the_code_uses_in_another_printed_table_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `waiting_for_approval` | M2b-10 | reserved |",
+        "| `vault_locked` | M2b-10 | reserved |",
+    );
+    assert_fails(
+        &t,
+        "`signin_token`: `vault_locked` is reserved here, but the code already uses it in `error_kind` (code -32002)",
+    );
+}
+
+#[test]
+fn a_name_the_shared_list_names_with_both_tables_passes() {
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `limited` | M2-11 | reserved |",
+        "| `incomplete` | M2-11 | reserved |",
+    );
+    let script = t.home().join("check.py");
+    let text = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
+    assert_eq!(text.matches("\nSHARED = {}\n").count(), 1);
+    std::fs::write(
+        &script,
+        text.replacen(
+            "\nSHARED = {}\n",
+            "\nSHARED = {\"incomplete\": (\"reason\", \"exit_token\")}\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let out = run_script(&script, &t.home());
+    assert!(
+        out.status.success(),
+        "expected a pass: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn two_audit_kinds_with_one_token_fail() {
+    // Codex's case: 22 and 46 both `reveal`, only 22 registered.
+    let t = fixture();
+    add_audit_kind(&t, "Reveal", 22, "reveal");
+    add_audit_kind(&t, "RevealAgain", 46, "reveal");
+    edit(
+        &t,
+        VAULT,
+        "| 22 | `reveal` | M2-21 | reserved |",
+        "| 22 | `reveal` | M2-21 | landed |",
+    );
+    assert_fails(
+        &t,
+        "`fn token` gives `reveal` to more than one `AuditKind` variant (RevealAgain, Reveal)",
+    );
+}
+
+#[test]
+fn two_audit_kinds_with_one_number_fail() {
+    let t = fixture();
+    add_audit_kind(&t, "Probe", 21, "probe");
+    assert_fails(
+        &t,
+        "`AuditKind` gives 21 to more than one variant (Recover, Probe)",
+    );
+}
+
+#[test]
+fn two_error_kinds_with_one_code_fail() {
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "ErrorKind::Internal => -32099,",
+        "ErrorKind::Internal => -32034,",
+    );
+    assert_fails(
+        &t,
+        "`fn code` gives `-32034` to more than one `ErrorKind` variant (BackupUnusable, Internal)",
+    );
+}
+
+#[test]
+fn two_error_kinds_with_one_token_fail() {
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "ErrorKind::Internal => \"internal\",",
+        "ErrorKind::Internal => \"busy\",",
+    );
+    assert_fails(
+        &t,
+        "`fn token` gives `busy` to more than one `ErrorKind` variant (Busy, Internal)",
+    );
+}
+
+#[test]
+fn a_reason_or_a_method_twice_in_the_code_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "    \"not_text\",\n",
+        "    \"not_text\",\n    \"common\",\n",
+    );
+    assert_fails(&t, "reason `common` appears twice");
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "const NAME: &'static str = \"lock\";",
+        "const NAME: &'static str = \"unlock\";",
+    );
+    assert_fails(&t, "method name `unlock` appears twice");
 }
