@@ -8,48 +8,44 @@
 //! wait on the daemon past its deadline, so [`connect_unix`] sets the
 //! socket's send and receive timeouts before it connects: Linux bounds
 //! that wait by the send timeout and then answers `EAGAIN`
-//! ([`io::ErrorKind::WouldBlock`]).
+//! ([`io::ErrorKind::WouldBlock`]). A connect retried after a signal is
+//! given only the time left, never the whole timeout again.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Connects a stream socket, close-on-exec, to the Unix socket at `path`,
-/// with `timeout` as its send and receive timeouts from before the connect
-/// (see the module documentation). A `timeout` under a microsecond is
-/// taken as one.
+/// within `timeout` (see the module documentation): before each attempt,
+/// the first and any after a signal, the socket's send and receive
+/// timeouts are set to the time left of `timeout`, so they stay that when
+/// it is connected. A `timeout` under a microsecond is taken as one.
 ///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] for a path that does not fit in
 /// `sun_path` or holds a NUL byte; [`io::ErrorKind::WouldBlock`] when the
-/// listener's backlog stayed full for `timeout` (Linux); otherwise the
-/// error `connect` gave, such as [`io::ErrorKind::NotFound`] or
-/// [`io::ErrorKind::ConnectionRefused`] when nothing listens there.
+/// listener's backlog stayed full for `timeout` (Linux), and
+/// [`io::ErrorKind::TimedOut`] when no time is left for an attempt after a
+/// signal; otherwise the error `connect` gave, such as
+/// [`io::ErrorKind::NotFound`] or [`io::ErrorKind::ConnectionRefused`]
+/// when nothing listens there.
 pub fn connect_unix(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let by = Instant::now().checked_add(timeout);
     let (addr, len) = sockaddr(path)?;
     let fd = stream_socket()?;
-    let tv = to_timeval(timeout);
-    for option in [libc::SO_SNDTIMEO, libc::SO_RCVTIMEO] {
-        // SAFETY: `fd` is an open socket this function owns; `tv` is a
-        // valid `timeval` that outlives the call, and its size is passed.
-        let r = unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                option,
-                (&raw const tv).cast::<libc::c_void>(),
-                socklen(size_of::<libc::timeval>()),
-            )
-        };
-        if r != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
     let mut interrupted = false;
     loop {
+        let left = match by {
+            Some(by) if interrupted => by
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or(io::ErrorKind::TimedOut)?,
+            _ => timeout,
+        };
+        set_timeouts(&fd, left)?;
         // SAFETY: `addr` is an initialized `sockaddr_un` that outlives the
         // call, and `len` does not exceed its size.
         let r = unsafe {
@@ -72,6 +68,28 @@ pub fn connect_unix(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
         }
     }
     Ok(UnixStream::from(fd))
+}
+
+/// Sets `fd`'s send and receive timeouts to `d`.
+fn set_timeouts(fd: &OwnedFd, d: Duration) -> io::Result<()> {
+    let tv = to_timeval(d);
+    for option in [libc::SO_SNDTIMEO, libc::SO_RCVTIMEO] {
+        // SAFETY: `fd` is an open socket the caller owns; `tv` is a valid
+        // `timeval` that outlives the call, and its size is passed.
+        let r = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw const tv).cast::<libc::c_void>(),
+                socklen(size_of::<libc::timeval>()),
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// A new `AF_UNIX` stream socket, close-on-exec.
@@ -148,7 +166,6 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::mpsc;
-    use std::time::Instant;
 
     /// A directory under /tmp for one test, short enough for `sun_path`,
     /// removed with its contents when dropped.

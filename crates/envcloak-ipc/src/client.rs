@@ -16,11 +16,15 @@
 //! does not inherit the connection.
 //!
 //! Every connection is bounded in time from before it connects
-//! ([`envcloak_sys::connect_unix`]): a call waits at most 300 seconds for
-//! its answer (`vault create` runs Argon2id twice), and a waiter's call
-//! ([`Client::connect_within`]) no longer than the time its wait has
-//! left, so a daemon that stalls cannot hold `envcloak run --wait` past
-//! its deadline.
+//! ([`envcloak_sys::connect_unix`]). An ordinary call waits at most 300
+//! seconds for each read and each write (`vault create` runs Argon2id
+//! twice). A waiter's connection ([`Client::connect_by`]) is bounded by
+//! one instant instead, for the whole call: the connect is given the time
+//! left to it, and then, before each read and each write, the socket is
+//! waited on (`poll`) for at most the time left, and only what it holds
+//! or takes then is read or written, without blocking. So a daemon that
+//! stalls, sends its answer a byte at a time, or reads the request slowly
+//! cannot hold `envcloak run --wait` past that instant.
 //!
 //! On signed macOS builds the client will also check the daemon's code
 //! signature from its audit token (M3). Builds that pin no signing
@@ -28,9 +32,10 @@
 //! [`DaemonIdentity::Unverified`]. On them a program running as the same
 //! user can impersonate the daemon (SPEC §1.1).
 
+use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use envcloak_core::SecretBytes;
 use envcloak_policy::{ApprovalOptions, PendingDescriptor, PendingId, PendingState};
@@ -167,6 +172,79 @@ impl From<RunPathError> for ClientError {
 pub struct Client {
     stream: UnixStream,
     next_id: u64,
+    /// For a waiter's connection ([`Client::connect_by`]): the instant by
+    /// which every call on it must be answered.
+    by: Option<Instant>,
+}
+
+/// How long a connection may take.
+#[derive(Debug, Clone, Copy)]
+enum Limit {
+    /// Each read and each write, and the connect, at most this long.
+    Each(Duration),
+    /// Everything done on it, connect included, by this instant.
+    By(Instant),
+}
+
+/// The time left to `by`, or a timeout when less than a millisecond is.
+fn left(by: Instant) -> io::Result<Duration> {
+    by.checked_duration_since(Instant::now())
+        .filter(|d| *d >= Duration::from_millis(1))
+        .ok_or_else(|| io::ErrorKind::TimedOut.into())
+}
+
+/// A non-blocking stream read and written only until `by`: before each
+/// read or write the socket is waited on for at most the time left, and
+/// past `by` the read or write fails with [`io::ErrorKind::TimedOut`].
+/// However the peer paces its bytes, nothing here waits beyond `by`.
+struct Bounded<'a> {
+    stream: &'a UnixStream,
+    by: Instant,
+}
+
+impl Bounded<'_> {
+    /// Runs `op` once the socket is ready, as `ready` says, retrying while
+    /// it would block, until `by`.
+    fn when_ready<T>(
+        &mut self,
+        ready: fn(BorrowedFd<'_>, Duration) -> io::Result<bool>,
+        mut op: impl FnMut(&UnixStream) -> io::Result<T>,
+    ) -> io::Result<T> {
+        loop {
+            match ready(self.stream.as_fd(), left(self.by)?) {
+                // Not ready in the time left: looked at again, and past
+                // `by` that is the timeout.
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+            match op(self.stream) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                r => return r,
+            }
+        }
+    }
+}
+
+impl Read for Bounded<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.when_ready(envcloak_sys::wait_readable, |mut s| s.read(buf))
+    }
+}
+
+impl Write for Bounded<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.when_ready(envcloak_sys::wait_writable, |mut s| s.write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Client {
@@ -177,20 +255,25 @@ impl Client {
     /// [`ClientError::Unavailable`] when no daemon is running,
     /// [`ClientError::Unverified`] when a check fails.
     pub fn connect(p: &RunPaths) -> Result<Client, ClientError> {
-        Self::connect_as(p, envcloak_sys::effective_uid(), CALL_TIMEOUT)
+        Self::connect_as(p, envcloak_sys::effective_uid(), Limit::Each(CALL_TIMEOUT))
     }
 
-    /// Connects as [`Client::connect`] does, for calls that must be
-    /// answered within `within` (at most 300 seconds, at least a
-    /// millisecond): the connect, each write and each read of an answer
-    /// give up after that long. A waiter passes the time its wait has
-    /// left ([`crate::wait`]).
+    /// Connects as [`Client::connect`] does, for calls that must all be
+    /// answered by `by` (taken as 300 seconds away when it is further, as
+    /// an ordinary call's timeout): the connect is given
+    /// the time left to it, and every call after waits for the socket,
+    /// before each write and each read, only for the time then left (see
+    /// the module documentation). A waiter passes the limit of its wait
+    /// ([`crate::wait`]).
     ///
     /// # Errors
-    /// As [`Client::connect`]; [`ClientError::Frame`] when the daemon did
-    /// not take the connection within `within`.
-    pub fn connect_within(p: &RunPaths, within: Duration) -> Result<Client, ClientError> {
-        Self::connect_as(p, envcloak_sys::effective_uid(), within)
+    /// As [`Client::connect`]; [`ClientError::Frame`] with
+    /// [`std::io::ErrorKind::TimedOut`] or
+    /// [`std::io::ErrorKind::WouldBlock`] when the daemon did not take the
+    /// connection by `by`. A call on it fails the same way, with
+    /// [`FrameError::Truncated`] inside an answer, when `by` passes.
+    pub fn connect_by(p: &RunPaths, by: Instant) -> Result<Client, ClientError> {
+        Self::connect_as(p, envcloak_sys::effective_uid(), Limit::By(by))
     }
 
     /// Test support only (feature `testing`): connects as
@@ -198,11 +281,10 @@ impl Client {
     /// so a test can present a same-uid server as a foreign one.
     #[cfg(feature = "testing")]
     pub fn connect_expecting_uid(p: &RunPaths, uid: u32) -> Result<Client, ClientError> {
-        Self::connect_as(p, uid, CALL_TIMEOUT)
+        Self::connect_as(p, uid, Limit::Each(CALL_TIMEOUT))
     }
 
-    fn connect_as(p: &RunPaths, uid: u32, within: Duration) -> Result<Client, ClientError> {
-        let within = within.clamp(Duration::from_millis(1), CALL_TIMEOUT);
+    fn connect_as(p: &RunPaths, uid: u32, limit: Limit) -> Result<Client, ClientError> {
         match p.check_dir() {
             Ok(()) => {}
             Err(e) if e.kind() == RunPathErrorKind::Missing => {
@@ -217,6 +299,17 @@ impl Client {
             }
             Err(e) => return Err(ClientError::Unverified(Unverified::Socket(e.kind()))),
         }
+        let (within, by) = match limit {
+            Limit::Each(d) => (d, None),
+            Limit::By(by) => {
+                // Never further away than an ordinary call's timeout.
+                let by = Instant::now()
+                    .checked_add(CALL_TIMEOUT)
+                    .map_or(by, |most| by.min(most));
+                let d = left(by).map_err(|e| ClientError::Frame(FrameError::Io(e.kind())))?;
+                (d, Some(by))
+            }
+        };
         // Close-on-exec, with its timeouts set before it connects.
         let stream = match envcloak_sys::connect_unix(&p.socket, within) {
             Ok(s) => s,
@@ -240,7 +333,18 @@ impl Client {
         if server != uid {
             return Err(ClientError::Unverified(Unverified::ForeignServer));
         }
-        Ok(Client { stream, next_id: 1 })
+        // A waiter's calls never block on the socket: each read and write
+        // waits for it only for the time left (`Bounded`).
+        if by.is_some() {
+            stream
+                .set_nonblocking(true)
+                .map_err(|e| ClientError::Frame(FrameError::Io(e.kind())))?;
+        }
+        Ok(Client {
+            stream,
+            next_id: 1,
+            by,
+        })
     }
 
     /// Whether the daemon's code identity was verified. Always
@@ -260,9 +364,22 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let request = proto::request_frame::<M>(id, params)?;
-        request.write_to(&mut self.stream)?;
-        drop(request);
-        let response = Frame::read_from(&mut self.stream)?;
+        let response = match self.by {
+            None => {
+                request.write_to(&mut self.stream)?;
+                drop(request);
+                Frame::read_from(&mut self.stream)?
+            }
+            Some(by) => {
+                let mut s = Bounded {
+                    stream: &self.stream,
+                    by,
+                };
+                request.write_to(&mut s)?;
+                drop(request);
+                Frame::read_from(&mut s)?
+            }
+        };
         proto::parse_response::<M::Output>(&response, id).map_err(|e| match e {
             ResponseError::Rpc(e) => ClientError::Rpc(e),
             ResponseError::Protocol => ClientError::Protocol,
