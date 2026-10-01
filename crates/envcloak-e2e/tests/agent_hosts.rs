@@ -1679,7 +1679,8 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
 /// itself, whenever the program exits, is killed or outlives the driver's
 /// limit, and on a `SIGTERM` to the driver (the harness's limit). The
 /// group is killed while the program that leads it is still unreaped (its
-/// exit is seen with `waitid(WNOWAIT)`), so its id cannot have been reused,
+/// exit is seen with `waitid(WNOWAIT)`, or a kqueue exit note where Python
+/// has no `waitid`: macOS before 3.13), so its id cannot have been reused,
 /// and then the program is reaped (D-34); what the program left running
 /// in its group (a process that ignores the hangup when the terminal
 /// closes) goes with it.
@@ -1699,6 +1700,27 @@ def end_group():
         os.killpg(pid, 9)
     except OSError:
         pass
+# Whether the child has exited, seen without reaping it: waitid(WNOWAIT),
+# or where Python lacks it (macOS before 3.13), a kqueue exit note.
+if hasattr(os, "waitid"):
+    def exited():
+        return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+else:
+    import errno
+    kq = select.kqueue()
+    gone = [False]
+    try:
+        kq.control([select.kevent(pid, select.KQ_FILTER_PROC,
+                                  select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                  select.KQ_NOTE_EXIT)], 0, 0)
+    except OSError as e:
+        if e.errno != errno.ESRCH:
+            raise
+        gone[0] = True
+    def exited():
+        if not gone[0]:
+            gone[0] = bool(kq.control(None, 1, 0))
+        return gone[0]
 def stop(*_):
     signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
     end_group()
@@ -1764,7 +1786,7 @@ end = time.time() + spec["limit"]
 while time.time() < end:
     signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
     # Seen without reaping: the group is ended first.
-    if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+    if exited():
         end_group()
         _, status = os.waitpid(pid, 0)
         print("EXIT %d" % os.waitstatus_to_exitcode(status))
