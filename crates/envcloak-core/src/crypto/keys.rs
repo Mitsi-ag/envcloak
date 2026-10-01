@@ -362,6 +362,8 @@ pub(crate) fn keyed_hash_prefixes(
             if n > first {
                 h.update(&tail[n - 1..n]);
             }
+            #[cfg(feature = "testing")]
+            super::aead::LENGTHS_TRIED.with(|t| t.set(t.get() + 1));
             if take(n, h.finalize().as_bytes()) {
                 taken = true;
                 break;

@@ -45,11 +45,17 @@ use super::segment::{
     next_frame, parse_header, read_segment,
 };
 
-/// How many sealed bytes the torn-tail check hashes or opens at most: 64
-/// of the largest entries. A torn tail is shorter than one frame, and the
-/// ciphertext a crash leaves frames at about one offset in 65,000, so a
-/// real one needs a small fraction of this.
-const TAIL_CHECK_BUDGET: usize = 64 * MAX_SEALED;
+/// How much work the torn-tail check does at most, in units of 64 of the
+/// largest entries. A unit is one sealed byte of a candidate opened at
+/// the length its frame says, or one length tried by a scan of every
+/// length (an entry's chain value, or its sealed bytes): the scan hashes
+/// one byte more for each length, then computes that length's chain
+/// value or Poly1305 tag in full, so one unit of a scan costs a whole tag
+/// computation, not one hashed byte (review R-17). Every scan is charged
+/// before it runs, for every length it may try. A torn tail is shorter
+/// than one frame, and the ciphertext a crash leaves frames at about one
+/// offset in 65,000, so a real one needs a small fraction of this.
+pub(crate) const TAIL_CHECK_BUDGET: usize = 64 * MAX_SEALED;
 
 /// The most entries a segment can hold: as many of the smallest frames as
 /// the largest segment read takes. The writer numbers a segment's entries
