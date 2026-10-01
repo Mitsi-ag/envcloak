@@ -25,14 +25,15 @@
 //! process is reaped elsewhere its pid can be another's. So every fixture
 //! the runner starts that would otherwise run on (a loop waiting for a
 //! signal, a descendant writing) has a [`Lifetime`]: it ends when the test
-//! asks it to, as the test ends (passed, failed or timed out), or by
-//! itself at a deadline longer than any test waits, should the test
-//! process die first. It records how it ended; that record is an
-//! acknowledgment written just before it exits, not proof that it has been
-//! reaped, which only its parent could give. The pty driver kills the
-//! terminal's process group only while it has not reaped the group's
-//! leader, and then waits on a pipe every process of the tree holds, so
-//! its report that the tree is gone rests on the kernel, not on pids.
+//! asks it to, or removes the home the request is in, as the test ends
+//! (passed, failed or timed out), or by itself at a deadline longer than
+//! any test waits, should the test process die first. It records how it
+//! ended; that record is an acknowledgment written just before it exits,
+//! not proof that it has been reaped, which only its parent could give.
+//! The pty driver kills the terminal's process group only while it has
+//! not reaped the group's leader, and then waits on a pipe every process
+//! of the tree holds, so its report that the tree is gone rests on the
+//! kernel, not on pids.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::ffi::{OsStr, OsString};
@@ -287,6 +288,10 @@ const TESTS: &[Test] = &[
     (
         "harness_a_fixture_ends_when_its_test_fails_before_or_after_readiness",
         harness_a_fixture_ends_when_its_test_fails_before_or_after_readiness,
+    ),
+    (
+        "harness_a_fixture_whose_lifetime_is_gone_ends",
+        harness_a_fixture_whose_lifetime_is_gone_ends,
     ),
     (
         "harness_finish_gives_up_on_output_a_survivor_holds",
@@ -898,15 +903,25 @@ const FIXTURE_DEADLINE_SECS: u64 = 300;
 /// waiting for a signal, a descendant writing) waits for this stop
 /// request instead, which the test makes when it drops this: as it
 /// passes, fails an assertion or times out. It ends by itself at its
-/// deadline should that never come (the test process died first). Each
-/// fixture appends how it ended to [`Lifetime::ended_path`]: `stopped`,
-/// `deadline`, or, for a writer, `pipe_closed` when its output was closed.
-/// That is an acknowledgment written just before it exits, not proof that
-/// it has been reaped (only its parent could give that); a fixture that
-/// reached its deadline, where a test expected it to be stopped, is a
-/// failure.
+/// deadline should that never come (the test process died first).
+///
+/// The request is a file in a directory of the test's home, and the
+/// home, made before this, is dropped right after it, taking the request
+/// with it within microseconds: a fixture that looks every 50 ms would
+/// mostly miss it, and run on to its deadline. So the directory being
+/// gone is a stop request too, and every fixture looks for both.
+///
+/// Each fixture appends how it ended to [`Lifetime::ended_path`]:
+/// `stopped`, `gone` (the directory was), `deadline`, or, for a writer,
+/// `pipe_closed` when its output was closed. That is an acknowledgment
+/// written just before it exits, not proof that it has been reaped (only
+/// its parent could give that); a fixture that reached its deadline,
+/// where a test expected it to be stopped, is a failure. The record is
+/// in the directory, and goes with it, unless a harness test keeps it
+/// elsewhere ([`Lifetime::recording_at`]) to read once the home is gone.
 struct Lifetime {
     dir: PathBuf,
+    record: PathBuf,
     deadline_secs: u64,
 }
 
@@ -917,17 +932,32 @@ impl Lifetime {
     }
 
     fn with_deadline(home: &TestHome, name: &str, deadline_secs: u64) -> Lifetime {
-        let dir = home.root().join(format!("life-{name}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        Lifetime { dir, deadline_secs }
+        Lifetime::made(home, name, deadline_secs, None)
     }
 
+    /// [`Lifetime::with_deadline`], with the record at `record`, outside
+    /// `home`, where it outlives it.
+    fn recording_at(home: &TestHome, name: &str, deadline_secs: u64, record: PathBuf) -> Lifetime {
+        Lifetime::made(home, name, deadline_secs, Some(record))
+    }
+
+    fn made(home: &TestHome, name: &str, deadline_secs: u64, record: Option<PathBuf>) -> Lifetime {
+        let dir = home.root().join(format!("life-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        Lifetime {
+            record: record.unwrap_or_else(|| dir.join("ended")),
+            dir,
+            deadline_secs,
+        }
+    }
+
+    /// The stop request. The directory it is in being gone is one too.
     fn stop_path(&self) -> PathBuf {
         self.dir.join("stop")
     }
 
     fn ended_path(&self) -> PathBuf {
-        self.dir.join("ended")
+        self.record.clone()
     }
 
     /// Asks the fixtures to stop.
@@ -935,14 +965,19 @@ impl Lifetime {
         let _ = std::fs::write(self.stop_path(), b"");
     }
 
-    /// Shell text that waits for the stop request, checking every 50 ms,
-    /// until the deadline, then records how it ended and exits: 0 when
-    /// asked to stop, 124 at the deadline. A trap set before it still runs
-    /// on its signal, between two checks. `exit` ends a subshell only.
+    /// Shell text that waits for the stop request or for its directory to
+    /// be gone, checking every 50 ms, until the deadline, then records how
+    /// it ended (a record in a directory that is gone is not written) and
+    /// exits: 0 when asked to stop, 124 at the deadline. A trap set before
+    /// it still runs on its signal, between two checks. `exit` ends a
+    /// subshell only.
     fn sh_wait(&self) -> String {
         format!(
-            "n=0; while [ ! -e {stop} ]; do if [ $n -ge {max} ]; then echo deadline >>{ended}; \
-             exit 124; fi; sleep 0.05; n=$((n+1)); done; echo stopped >>{ended}; exit 0",
+            "n=0; while [ -d {dir} ] && [ ! -e {stop} ]; do if [ $n -ge {max} ]; then \
+             echo deadline >>{ended}; exit 124; fi; sleep 0.05; n=$((n+1)); done; \
+             if [ -e {stop} ]; then how=stopped; else how=gone; fi; \
+             {{ echo $how >>{ended}; }} 2>/dev/null; exit 0",
+            dir = quoted_path(&self.dir),
             stop = quoted_path(&self.stop_path()),
             ended = quoted_path(&self.ended_path()),
             max = self.deadline_secs * 20,
@@ -1029,15 +1064,21 @@ fn quoted_path(p: &Path) -> String {
 /// writes `$OPENAI_API_KEY` and a newline on standard output for ever. It
 /// ends when its output is closed (it records `pipe_closed`: Python
 /// ignores SIGPIPE, so the write fails with EPIPE), when it is asked to
-/// stop (`stopped`, checked after every 256 writes), or at its deadline
-/// (`deadline`): SIGALRM, whose handler runs even while a write is blocked
-/// on a full pipe, where it could never see the stop request. It inherits
-/// an ignored SIGTERM from a shell that ignores it.
+/// stop or the stop request's directory is gone (`stopped`, `gone`,
+/// checked after every 256 writes), or at its deadline (`deadline`):
+/// SIGALRM, whose handler runs even while a write is blocked on a full
+/// pipe, where it could never see the stop request. A record in a
+/// directory that is gone is not written. It inherits an ignored SIGTERM
+/// from a shell that ignores it.
 const WRITER: &str = r#"import os, signal, sys
 stop, ended = sys.argv[1], sys.argv[2]
+life = os.path.dirname(stop)
 def record(how):
-    with open(ended, 'a') as f:
-        f.write(how + '\n')
+    try:
+        with open(ended, 'a') as f:
+            f.write(how + '\n')
+    except OSError:
+        pass
 def deadline(*_):
     record('deadline')
     os._exit(124)
@@ -1049,9 +1090,9 @@ try:
     while True:
         os.write(1, line)
         n += 1
-        if n % 256 == 0 and os.path.exists(stop):
+        if n % 256 == 0 and (os.path.exists(stop) or not os.path.isdir(life)):
             break
-    record('stopped')
+    record('stopped' if os.path.exists(stop) else 'gone')
 except BrokenPipeError:
     record('pipe_closed')
 "#;
@@ -2264,27 +2305,30 @@ fn harness_cleanup_kills_only_its_own_process_once() {
 
 /// Review F-62: a test that fails before its fixture is ready, or after,
 /// leaves nothing running: the unwinding kills and reaps the runner (its
-/// `Proc`) and asks the fixture to stop (its [`Lifetime`]), and the
-/// fixture, which the harness never signals, says it stopped. The fixture
-/// is ready once it has read a line from its standard input, which the
-/// test writes, or which ends when the runner's `Proc` goes.
+/// `Proc`), asks the fixture to stop (its [`Lifetime`]) and removes the
+/// test's home, as every test here declares them, and the fixture, which
+/// the harness never signals, ends at once, saying it was asked to stop
+/// or found its lifetime gone with the home. The home is made and dropped
+/// inside the failing test, as in the real ones; only the record is kept
+/// outside it, to be read afterwards. The fixture is ready once it has
+/// read a line from its standard input, which the test writes, or which
+/// ends when the runner's `Proc` goes.
 fn harness_a_fixture_ends_when_its_test_fails_before_or_after_readiness() {
+    let kept = TestHome::new();
     for ready_first in [false, true] {
-        let home = TestHome::new();
-        let life = Lifetime::new(&home, "fixture");
-        let record = life.ended_path();
-        let script = format!(
-            "trap '' INT TERM HUP\n{}\nread go\n{}\n{}",
-            life.sh_note("started"),
-            life.sh_note("ready"),
-            life.sh_wait()
-        );
+        let record = kept.root().join(format!("ended-{ready_first}"));
         let setup = harness_setup(fresh_seed());
         let t0 = Instant::now();
-        let home_ref = &home;
-        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let life = life;
-            let mut p = Proc::spawn(detached(home_ref, &setup, &os(&sh(&script))));
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let home = TestHome::new();
+            let life = Lifetime::recording_at(&home, "fixture", 20, record.clone());
+            let script = format!(
+                "trap '' INT TERM HUP\n{}\nread go\n{}\n{}",
+                life.sh_note("started"),
+                life.sh_note("ready"),
+                life.sh_wait()
+            );
+            let mut p = Proc::spawn(detached(&home, &setup, &os(&sh(&script))));
             let want: &[&str] = if ready_first {
                 p.write(b"go\n");
                 &["started", "ready"]
@@ -2299,16 +2343,81 @@ fn harness_a_fixture_ends_when_its_test_fails_before_or_after_readiness() {
             panic!("the test fails here, with its fixture running");
         }));
         assert!(failed.is_err());
-        assert_eq!(
-            ended_within(&record, 1, Duration::from_secs(10)),
-            Some(vec![
-                "started".to_owned(),
-                "ready".to_owned(),
-                "stopped".to_owned()
-            ]),
-            "ready first: {ready_first}"
+        let lines = ended_within(&record, 1, Duration::from_secs(30));
+        let ends = ["stopped", "gone"];
+        assert!(
+            lines.as_ref().is_some_and(|l| l.len() == 3
+                && l[..2] == ["started", "ready"]
+                && ends.contains(&l[2].as_str())),
+            "ready first: {ready_first}: {lines:?}"
         );
         assert!(t0.elapsed() < Duration::from_secs(60), "{:?}", t0.elapsed());
+    }
+}
+
+/// Review F-62: the directory a fixture's stop request would be in being
+/// gone is a stop request too, for each kind of fixture: the shell's wait
+/// ([`Lifetime::sh_wait`]), the writer ([`WRITER`]) and the gate 8
+/// emitter's wait for SIGTERM. A failing test asks its fixtures to stop
+/// and removes its home microseconds later, request and all, so a fixture
+/// that looked only for the request would run on to its deadline. Here
+/// the request is never made (the lifetime is not dropped): once the
+/// fixture is running, its home is removed, and it ends at once, says
+/// `gone` in a record kept outside the home, and exits 0. Each is a child
+/// of the test itself, so a fixture that does not end is killed when its
+/// `finish` gives up.
+fn harness_a_fixture_whose_lifetime_is_gone_ends() {
+    let kept = TestHome::new();
+    for kind in ["wait", "writer", "emitter"] {
+        let record = kept.root().join(format!("ended-{kind}"));
+        let home = TestHome::new();
+        let life = Lifetime::recording_at(&home, kind, 20, record.clone());
+        let (cmd, ready): (Command, &[u8]) = match kind {
+            "wait" => {
+                let script = format!("echo ready; {}", life.sh_wait());
+                let mut cmd = quiet("/bin/sh", &["-c", &script]);
+                home.apply(&mut cmd).stdout(Stdio::piped());
+                (cmd, b"ready\n")
+            }
+            "writer" => (writer_command(&home, &life, "x"), b"x\nx\n"),
+            _ => {
+                let mut cmd = Command::new(python3());
+                home.apply(&mut cmd)
+                    .arg(emitter())
+                    .args(["--names", "FIXTURE_LINE", "--tail", "sigterm"])
+                    .args(["--whole-only", "--pause-ms", "0", "--stop"])
+                    .arg(life.stop_path())
+                    .arg("--ended")
+                    .arg(life.ended_path())
+                    .args(["--deadline", &life.deadline_secs.to_string()])
+                    .env("FIXTURE_LINE", "a line of the harness, not a value")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                (cmd, b"READY\n")
+            }
+        };
+        let stream = usize::from(kind == "emitter");
+        let p = Proc::spawn(cmd);
+        assert!(
+            p.wait_for(stream, ready, Duration::from_secs(60)),
+            "{kind} did not start"
+        );
+        std::mem::forget(life);
+        drop(home);
+        let t0 = Instant::now();
+        let (status, _, err) = p.finish(Duration::from_secs(60));
+        assert_eq!(
+            (record_at(&record), status.code()),
+            (vec!["gone".to_owned()], Some(0)),
+            "{kind}: {}",
+            lossy(&err[err.len().saturating_sub(300)..])
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "{kind}: {:?}",
+            t0.elapsed()
+        );
     }
 }
 
