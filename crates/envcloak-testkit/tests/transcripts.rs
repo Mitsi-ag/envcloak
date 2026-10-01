@@ -490,6 +490,104 @@ fn a_hit_outside_every_listed_store_is_kept_under_other() {
     assert!(home.sweep(&cs).len() >= 3 * cases.len());
 }
 
+/// `path`'s mode set to `mode` until dropped, then restored.
+struct Mode {
+    path: PathBuf,
+    was: u32,
+}
+
+impl Mode {
+    fn set(path: &Path, mode: u32) -> Mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        let was = std::fs::metadata(path).unwrap().permissions().mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Mode {
+            path: path.to_path_buf(),
+            was,
+        }
+    }
+}
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.was));
+    }
+}
+
+/// Whether permissions can keep this process out (not for root).
+fn permissions_apply() -> bool {
+    if envcloak_sys::effective_uid() == 0 {
+        eprintln!("skipped: permissions do not keep root out");
+        return false;
+    }
+    true
+}
+
+/// What the sweep cannot look at is reported, never taken for absent
+/// (review: `Path::exists` read an error as "not there", so an
+/// inaccessible root was skipped and the sweep came back clean; review
+/// F-88: Claude Code's file filter dropped an unreadable HOME, so nothing
+/// was reported either). Each case has its canary found once access is
+/// back, so the same tree is what was hidden.
+#[test]
+fn what_the_sweep_cannot_read_is_reported_not_skipped() {
+    if !permissions_apply() {
+        return;
+    }
+    let cs = canaries(fresh_seed());
+    let c = url_canary(&cs);
+    let one = std::slice::from_ref(&c);
+    let found = |host: Host, home: &TestHome| sweep(host, home, one);
+    let plant_raw = |path: &Path| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, c.as_str()).unwrap();
+    };
+
+    // Codex: $CODEX_HOME itself, and a directory above it that cannot be
+    // searched (the root then cannot even be looked at: EACCES, not
+    // "not found").
+    let home = TestHome::new();
+    plant_raw(&home.home().join(".codex/sessions/1.jsonl"));
+    for locked in [home.home().join(".codex"), home.home()] {
+        let guard = Mode::set(&locked, 0o000);
+        let hits = found(Host::Codex, &home);
+        assert!(hits.unreadable() >= 1, "{}: {hits}", locked.display());
+        drop(guard);
+    }
+    assert_eq!(
+        found(Host::Codex, &home).in_store("codex/sessions", &c.label),
+        1
+    );
+
+    // Claude Code: HOME (the root), `~/.claude`, and one store.
+    let home = TestHome::new();
+    plant_raw(&home.home().join(".claude/projects/-tmp/1.jsonl"));
+    for locked in [
+        home.home(),
+        home.home().join(".claude"),
+        home.home().join(".claude/projects"),
+    ] {
+        let guard = Mode::set(&locked, 0o000);
+        let hits = found(Host::ClaudeCode, &home);
+        assert!(hits.unreadable() >= 1, "{}: {hits}", locked.display());
+        assert_eq!(hits.in_store("claude/projects", &c.label), 0);
+        drop(guard);
+    }
+    let hits = found(Host::ClaudeCode, &home);
+    assert_eq!(hits.in_store("claude/projects", &c.label), 1, "{hits}");
+    assert_eq!(hits.unreadable(), 0, "{hits}");
+
+    // Not the host's: an unreadable project beside it in HOME, which the
+    // tests sweep with the whole home instead, is not a host store's.
+    let project = home.home().join("acme-web");
+    std::fs::create_dir_all(&project).unwrap();
+    let guard = Mode::set(&project, 0o000);
+    let hits = found(Host::ClaudeCode, &home);
+    assert_eq!(hits.unreadable(), 0, "{hits}");
+    drop(guard);
+}
+
 #[test]
 fn the_negative_control_is_clean() {
     let cs = canaries(fresh_seed());

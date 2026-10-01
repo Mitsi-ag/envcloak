@@ -7,7 +7,11 @@
 //! ([`sweep_stores`]) reads the host's whole directory once with
 //! [`crate::sweep_dir`], for every canary and every listed encoding, and
 //! files each hit in the host's files under the store that holds it; a
-//! hit in none of them is kept under [`OTHER`], never dropped. Counts are
+//! hit in none of them is kept under [`OTHER`], never dropped. What the
+//! sweep could not read and that may hold a host file (a root it cannot
+//! look at, a directory above a store, a store or a file in one) is kept
+//! as [`Hit::Unreadable`] ([`Hits::unreadable`]), never skipped as if it
+//! were absent: a sweep that could not look is not clean. Counts are
 //! raw: nothing is filtered, the harness's own canaries included, so a
 //! positive control (a canary a scripted turn prints) is counted like
 //! anything else. The scripted model's request bodies are swept too
@@ -143,6 +147,16 @@ pub enum HostFiles {
 }
 
 impl HostFiles {
+    /// Whether what could not be read at `path` may be or hold one of the
+    /// host's files: the host's file itself, or a directory above where
+    /// they are (the root included).
+    fn may_hold(&self, path: &Path) -> bool {
+        match self {
+            HostFiles::All => true,
+            HostFiles::Claude { home } => self.has(path) || home.join(".claude").starts_with(path),
+        }
+    }
+
     fn has(&self, file: &Path) -> bool {
         match self {
             HostFiles::All => true,
@@ -409,6 +423,17 @@ impl Hits {
         self.model.iter().filter(|h| h.found.label == label).count()
     }
 
+    /// What the sweep could not read and that may hold a host file
+    /// ([`Hit::Unreadable`]), in every store and under [`OTHER`]: a
+    /// sweep with any is incomplete, and no clean result.
+    pub fn unreadable(&self) -> usize {
+        self.stores
+            .iter()
+            .flat_map(|s| &s.hits)
+            .filter(|h| matches!(h, Hit::Unreadable { .. }))
+            .count()
+    }
+
     /// Every hit, unreadable files included, in stores and bodies.
     pub fn total(&self) -> usize {
         self.stores.iter().map(|s| s.hits.len()).sum::<usize>() + self.model.len()
@@ -450,7 +475,10 @@ impl fmt::Display for Hits {
 
 /// Sweeps each of `roots` whole for `cs` and files every hit in one of
 /// the host's files under the first of `stores` that holds it, or under
-/// [`OTHER`].
+/// [`OTHER`]. A root that is not there is a store the host never made;
+/// one the sweep cannot look at (an error other than its absence, such as
+/// a directory above it that cannot be searched) is filed as unreadable,
+/// like anything below it that cannot be read and may hold a host file.
 pub fn sweep_stores(
     roots: &[(PathBuf, HostFiles)],
     stores: &[Store],
@@ -468,12 +496,20 @@ pub fn sweep_stores(
         hits: Vec::new(),
     });
     for (root, files) in roots {
-        if !root.exists() {
+        // Only a root that is not there is skipped: `Path::exists` would
+        // read an error that hides it the same way.
+        if matches!(std::fs::symlink_metadata(root),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
             continue;
         }
         for hit in sweep_dir(root, cs) {
             let path = path_of(&hit);
-            if !files.has(path) {
+            let kept = match hit {
+                Hit::Unreadable { .. } => files.may_hold(path),
+                _ => files.has(path),
+            };
+            if !kept {
                 continue;
             }
             let at = stores
