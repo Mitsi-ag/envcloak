@@ -29,8 +29,8 @@ use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, BackupView, CheckView, CreatedView, DecisionView,
     DeniedView, FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView, LockedView,
-    RecoveredView, RecoveryConfirmedView, RemovedView, RevokedView, RotatedView, StatusView,
-    TargetView, UnlockedView, VerifyView,
+    PendingListView, PendingStateView, RecoveredView, RecoveryConfirmedView, RemovedView,
+    RevokedView, RotatedView, StatusView, TargetView, UnlockedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -322,6 +322,56 @@ pub struct PendingGetParams {
 pub struct RequestParams {
     /// 8 Crockford base32 characters.
     pub request: String,
+}
+
+/// `pending.state`: how a pending request stands (SPEC §6.1 step 4, M2
+/// plan D-04), answered at once: `pending`, `approved`, `denied`,
+/// `expired` or `unknown`. Told only to a caller whose kernel-verified
+/// chain holds the request's root instance; anyone else gets `unknown`, as
+/// for an id no request has. Each poll counts against the caller's root's
+/// limit ([`ErrorKind::Busy`] beyond it). It opens no pending request and
+/// writes no audit entry; `envcloak run --wait` asks it on fresh
+/// connections and never holds one open while it waits.
+#[derive(Debug)]
+pub struct PendingPoll;
+
+impl Method for PendingPoll {
+    const NAME: &'static str = "pending.state";
+    type Params = PendingStateParams;
+    type Output = PendingStateView;
+}
+
+/// A pending request's id. No claims: the answer goes by the caller's
+/// kernel-verified chain alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingStateParams {
+    /// 8 Crockford base32 characters.
+    pub request: String,
+}
+
+/// `pending.list`: the requests waiting for approval that the caller may
+/// approve (`envcloak pending`). Metadata only. A caller whose proof the
+/// daemon would refuse (SPEC §10b) gets an empty list, without being told
+/// why, and a request is left out for a caller in its requester's session
+/// or on its terminal: an approval surface does not show a request to a
+/// caller whose proof it would refuse.
+#[derive(Debug)]
+pub struct PendingList;
+
+impl Method for PendingList {
+    const NAME: &'static str = "pending.list";
+    type Params = PendingListParams;
+    type Output = PendingListView;
+}
+
+/// The caller's claims.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingListParams {
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
 }
 
 /// `approve`: creates a grant from a pending request with the passphrase
@@ -839,13 +889,15 @@ pub struct RecoverParams {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 26] = [
+pub const CLIENT_METHODS: [&str; 28] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
     Lock::NAME,
     RunRequest::NAME,
     PendingGet::NAME,
+    PendingPoll::NAME,
+    PendingList::NAME,
     Approve::NAME,
     Deny::NAME,
     GrantsList::NAME,
@@ -1165,7 +1217,10 @@ impl ErrorKind {
             }
             ErrorKind::PassphraseRejected => "the passphrase does not meet the rules",
             ErrorKind::KdfParams => "key derivation memory must be between 64 MiB and 4 GiB",
-            ErrorKind::Busy => "another unlock or vault creation is in progress; try again",
+            ErrorKind::Busy => {
+                "the daemon is busy (an unlock or a vault creation is in progress, or this process \
+                 tree asked too often); try again"
+            }
             ErrorKind::Traced => {
                 "a debugger or tracer is attached to the daemon, so it will not handle secrets"
             }

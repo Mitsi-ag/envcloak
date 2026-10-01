@@ -15,7 +15,7 @@
 
 use envcloak_core::crypto::ItemClass;
 use envcloak_core::vault::{Classification, ItemMeta};
-use envcloak_policy::{DenyReason, Mode, SubjectKind, Uses};
+use envcloak_policy::{DenyReason, Mode, PendingId, PendingState, SubjectKind, Uses};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +62,8 @@ views!(
     DeleteReport,
     UndoReport,
     InitReport,
+    PendingStateView,
+    PendingListView,
 );
 
 /// What [`StatusView::sanitize`] puts in place of a version that is not
@@ -300,6 +302,70 @@ impl DecisionView {
             _ => None,
         }
     }
+}
+
+/// `pending.state`: how a request stands (SPEC §6.1 step 4), told only to
+/// the request's own process tree; anyone else is told
+/// [`PendingState::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingStateView {
+    pub state: PendingState,
+}
+
+/// `pending.list`: the requests waiting for approval that the caller may
+/// approve, oldest first; an empty list to a caller that may approve none
+/// (SPEC §6.1 step 4, §10b).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingListView {
+    pub requests: Vec<PendingView>,
+}
+
+impl PendingListView {
+    /// Whether every request has the shape a daemon sends: a request id in
+    /// its canonical form, once, and slugs for bindings. A program
+    /// answering in the daemon's place could send anything (SPEC §1.1);
+    /// the strings are still escaped before they are printed.
+    pub fn well_formed(&self) -> bool {
+        let mut seen: Vec<PendingId> = Vec::with_capacity(self.requests.len());
+        for r in &self.requests {
+            let Some(id) = PendingId::parse(&r.request) else {
+                return false;
+            };
+            if id.to_string() != r.request
+                || seen.contains(&id)
+                || r.bindings
+                    .iter()
+                    .any(|b| envcloak_core::vault::Slug::new(b).is_err())
+            {
+                return false;
+            }
+            seen.push(id);
+        }
+        true
+    }
+}
+
+/// One request waiting for approval, as `envcloak pending` shows it.
+/// Metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingView {
+    /// 8 Crockford base32 characters.
+    pub request: String,
+    /// How long it has waited, in seconds of awake time.
+    pub age_secs: u64,
+    /// How long it may still wait before it expires.
+    pub expires_in_secs: u64,
+    /// The requester's kind.
+    pub kind: SubjectKind,
+    /// The agent's display name, when one is involved.
+    pub agent: Option<String>,
+    /// The project's canonical directory.
+    pub project: String,
+    /// The slugs of the items its bindings name, in the request's order.
+    pub bindings: Vec<String>,
 }
 
 /// `approve`: the grant created.

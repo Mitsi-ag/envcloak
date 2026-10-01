@@ -52,7 +52,7 @@ A frame is a 4-byte big-endian length `N`, then `N` bytes of UTF-8 JSON holding 
 
 - `1 ≤ N ≤ 1 MiB`. A header announcing 0 or more than 1 MiB is answered with an error (`invalid_request` or `frame_too_large`, `id` null) and the connection is closed; nothing after the header is read.
 - A frame's body may hold a value, so both sides keep it in a buffer wiped on drop. An incoming body starts in a 16 KiB buffer that doubles as bytes arrive, up to the announced length; each growth copies into a new buffer and wipes the old one.
-- The daemon waits up to 30 seconds for a frame to start, then up to 10 seconds from its first byte for the rest of it. A connection that misses either is closed. No client waits for a person on an open connection: a prompt is answered before the CLI connects, and each step of a flow that does local work between requests (`init --delete-plaintext`, `import`) connects again. A longer wait would only help a process that holds connections idle: four such processes, 8 connections each, could keep all 32 places, and `envcloak lock` and `status` out, for as long as it lasts.
+- The daemon waits up to 30 seconds for a frame to start, then up to 10 seconds from its first byte for the rest of it. A connection that misses either is closed. No client waits for a person on an open connection: a prompt is answered before the CLI connects, each step of a flow that does local work between requests (`init --delete-plaintext`, `import`) connects again, and a client waiting for an approval (`envcloak run --wait`) asks `pending.state` on a fresh connection each time and holds none between (`crates/envcloak-ipc/src/wait.rs`). A longer wait would only help a process that holds connections idle: four such processes, 8 connections each, could keep all 32 places, and `envcloak lock` and `status` out, for as long as it lasts.
 - One request gets exactly one response, in order. A connection may carry any number of requests.
 
 ## Messages
@@ -90,6 +90,8 @@ Response, one of:
 | `lock` | none | `was_unlocked` |
 | `run.request` | `manifest` (the absolute path of `envcloak.toml`), `profile` (optional), `refs` (`NAME=<slug>[#field]` strings), `env_file` (optional: `refs`, each `{line, text}` with `text` as `NAME=<slug>[#field]`, and `plain`, each `{line, text}` with `text` the name of an ordinary variable; never a value), `argv` (display text), `claims` | `decision`: `covered` with `grant`, `redact`, `mode` and `manifest_changed`; `pending` with `request`; or `denied` with `reason` (`repeated`, `root_denied`, `denials_full`, or `audit_failed` when a grant covers the request but its audit entry could not be written). With `covered` only, `values`: for each binding, `env_name`, `slug`, `allow_short` and `value`. A request over a pending cap is the error `too_many_pending` instead, with the reason `pending_per_root` or `pending_total` |
 | `pending.get` | `request`, `claims` | the pending request's descriptor (`envcloak_policy::PendingDescriptor`; docs/GRANTS.md "The statement"), for a caller that may give a proof |
+| `pending.state` | `request` (no claims) | `state`: `pending`, `approved`, `denied`, `expired` or `unknown`, answered at once; told only to a caller whose kernel-verified chain holds the request's root instance, and `unknown` to any other, as for an id no request has |
+| `pending.list` | `claims` | `requests`, oldest first: each `request`, `age_secs`, `expires_in_secs`, `kind` (`agent`, `terminal` or `unknown`), `agent` (the agent's name, or null), `project` (the canonical directory) and `bindings` (the items' slugs); only those the caller may approve, so an empty list to a caller whose proof would be refused |
 | `approve` | `request`, `options` (`uses`: `once` or `session`; `ttl_secs`; `live`: variable names), `digest` (SHA-256 of the canonical statement, 64 hex characters), `passphrase`, `claims` | `grant`, `expires_in_secs` |
 | `deny` | `request` | `root_auto_denied` |
 | `grants.list` | none | `grants`: each with `id`, `kind`, `label`, `root_pid`, `root_exe`, `project_dir`, `bindings` (`env_name`, `slug`, `live`), `mode`, `uses`, `created_secs`, `remaining_secs` |
@@ -141,7 +143,7 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `wrong_passphrase` | -32005 | Wrong passphrase or Recovery Kit, or a damaged envelope |
 | `passphrase_rejected` | -32006 | A new passphrase breaks the rules; `reason` is `not_text`, `control_character`, `too_short` or `common` |
 | `kdf_params` | -32007 | Argon2id memory outside 64 MiB to 4 GiB |
-| `busy` | -32008 | An unlock or vault creation is in progress |
+| `busy` | -32008 | An unlock, an approval or a vault creation is running Argon2id with the vault out of its slot; or `pending.state` polls over the subject root's limit. Either way, try again later |
 | `traced` | -32009 | A tracer is attached to the daemon |
 | `vault_unavailable` | -32010 | The vault file could not be opened; `reason` is `busy`, `damaged`, `unsupported_version`, `permissions`, `disk_full`, `storage`, `io` or `migration` |
 | `frame_too_large` | -32011 | A frame over 1 MiB |
@@ -266,8 +268,8 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 <!-- reservations:method -->
 | Method | Task | Status | Use |
 |---|---|---|---|
-| `pending.state` | M2-03 | reserved | a pending request's state, only to its own process tree, without holding the connection |
-| `pending.list` | M2-03 | reserved | pending requests, only to a caller whose proof the daemon would accept (`envcloak pending`) |
+| `pending.state` | M2-03 | landed | a pending request's state, only to its own process tree, without holding the connection |
+| `pending.list` | M2-03 | landed | pending requests, only to a caller whose proof the daemon would accept (`envcloak pending`) |
 | `backup.v2.begin` | M2-05 | reserved | starts a file backup v2 and records its creator |
 | `backup.v2.put` | M2-05 | reserved | one chunk, from the creator only |
 | `backup.v2.commit` | M2-05 | reserved | freezes the backup's contents |

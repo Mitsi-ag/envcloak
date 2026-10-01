@@ -26,7 +26,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use envcloak_core::SecretBytes;
-use envcloak_policy::{ApprovalOptions, PendingDescriptor};
+use envcloak_policy::{ApprovalOptions, PendingDescriptor, PendingId, PendingState};
 
 use crate::frame::{Frame, FrameError};
 use crate::paths::{RunPathError, RunPathErrorKind, RunPaths};
@@ -40,8 +40,9 @@ use crate::proto::{
 };
 use crate::proto::{
     BackupCreate, FilesBackup, FilesBackupParams, FilesRestore, FilesRestoreParams, ImportCommit,
-    ImportCommitParams, ImportParams, ImportPlan, ImportVerify, RecoverParams, RecoveryConfirm,
-    RecoveryConfirmParams, RestoredFiles, VaultRecover, VerifyParams,
+    ImportCommitParams, ImportParams, ImportPlan, ImportVerify, PendingList, PendingListParams,
+    PendingPoll, PendingStateParams, RecoverParams, RecoveryConfirm, RecoveryConfirmParams,
+    RestoredFiles, VaultRecover, VerifyParams,
 };
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
@@ -49,7 +50,8 @@ use crate::view::{
     UnlockedView,
 };
 use crate::view::{
-    BackupView, FileBackupView, ImportPlanView, RecoveredView, RecoveryConfirmedView, VerifyView,
+    BackupView, FileBackupView, ImportPlanView, PendingListView, RecoveredView,
+    RecoveryConfirmedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -330,6 +332,37 @@ impl Client {
             request: id.to_owned(),
             claims: claims.to_vec(),
         })
+    }
+
+    /// `pending.state` for request `id`: how it stands, told only to the
+    /// request's own process tree (`unknown` to anyone else). One call on
+    /// this connection; a waiter connects afresh for each.
+    ///
+    /// # Errors
+    /// As [`Client::call`]; [`crate::ErrorKind::Busy`] when the caller's
+    /// root asks too often.
+    pub fn pending_state(&mut self, id: &PendingId) -> Result<PendingState, ClientError> {
+        self.call::<PendingPoll>(&PendingStateParams {
+            request: id.to_string(),
+        })
+        .map(|v| v.state)
+    }
+
+    /// `pending.list`, with the caller's claims: the requests waiting for
+    /// approval that this caller may approve.
+    ///
+    /// # Errors
+    /// As [`Client::call`], and [`ClientError::Protocol`] for an answer
+    /// that is not [`PendingListView::well_formed`].
+    pub fn pending_list(&mut self, claims: &[String]) -> Result<PendingListView, ClientError> {
+        let list = self.call::<PendingList>(&PendingListParams {
+            claims: claims.to_vec(),
+        })?;
+        if list.well_formed() {
+            Ok(list)
+        } else {
+            Err(ClientError::Protocol)
+        }
     }
 
     /// `approve` request `id` with `options`, the `digest` of the
