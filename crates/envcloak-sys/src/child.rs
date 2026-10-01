@@ -963,6 +963,29 @@ mod tests {
         assert_eq!(relay.next().unwrap(), None);
     }
 
+    /// Review R-22: a mark that could not be written (the pipe stayed full
+    /// of signals not read yet) leaves nothing waiting for it. A signal
+    /// kept aside after it is handed on once the pipe is read, before the
+    /// stop, and no mark comes. Had the lost mark been counted, that
+    /// signal would wait for a mark that never comes, and be lost.
+    #[test]
+    fn a_lost_mark_leaves_no_kept_signal_waiting_for_it() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let relay = SignalRelay::install(&[libc::SIGUSR1, libc::SIGTERM]).unwrap();
+        fill_with(&relay, libc::SIGUSR1);
+        assert!(relay.mark().is_err(), "the mark found room in a full pipe");
+        keep_as_if_full(libc::SIGTERM, true);
+        let got = read_to_stop(&relay);
+        assert!(!got.contains(&Relayed::Mark), "a lost mark was read");
+        let count = |sig| got.iter().filter(|r| Some(**r) == own(sig)).count();
+        assert_eq!(
+            count(libc::SIGTERM),
+            1,
+            "the signal kept after the lost mark"
+        );
+        assert_eq!(count(libc::SIGUSR1) + 1, got.len());
+    }
+
     /// Review F-71: a reader already waiting on an empty pipe wakes for a
     /// signal kept aside after it looked (the handler writes a wake-up
     /// once it has kept one), and one kept just before the stop comes
