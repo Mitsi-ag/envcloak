@@ -166,10 +166,13 @@ fn s0(host: Host, name: &str) {
         "{} run -- ./emit --quick; echo \"EXIT=$?\"",
         quoted(h.cli().to_str().unwrap())
     );
+    // Named in two pieces: whole, it can only be what the command printed.
+    let (head, tail) = control.as_str().split_at(control.as_str().len() / 2);
+    let print_control = format!("printf '%s%s\\n' {} {}", quoted(head), quoted(tail));
     let script = json!({"steps": [
         {"say": "I'll run emit through EnvCloak.", "shell": run_emit},
         {"say": "Approved; running it again.", "shell": run_emit, "after": "approved"},
-        {"shell": format!("echo {}", control.as_str())},
+        {"shell": print_control},
         {"say": "done"},
     ]});
     let requests_before = audit_requests(&h);
@@ -217,8 +220,12 @@ fn s0(host: Host, name: &str) {
             "{}",
             approved.all()
         );
+        // What the daemon recorded for the request: the subject, and the
+        // process its grant is rooted at, by its executable.
+        let root = rooted_at(&approved.shown(), &agent.installed);
         println!(
-            "measurement: S0 subject host={} os={}: requested by: agent {agent_name}",
+            "measurement: S0 subject host={} os={}: requested by: agent {agent_name}, \
+             rooted at {root}",
             host.id(),
             std::env::consts::OS
         );
@@ -288,6 +295,19 @@ fn s0(host: Host, name: &str) {
         );
     }
 
+    // The control is in the tool result the host sent its model.
+    let third = run
+        .model
+        .requests
+        .iter()
+        .find(|r| r.pick.as_deref() == Some("step 3"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .unwrap();
+    assert!(
+        tool_outputs(&third).contains(control.as_str()),
+        "the printed control is not in the tool result the host sent its model"
+    );
+
     // The sweep: every capture, every daemon log, the whole home, raw.
     h.assert_swept("S0");
     let mut cs = h.canaries.clone();
@@ -314,6 +334,61 @@ fn s0(host: Host, name: &str) {
         .sum();
     assert_eq!(leaks, 0, "{hits}");
     candidate_density(&agent);
+}
+
+/// The executable the approval statement's `rooted at` names, as the
+/// host's entry (`<the host's entry>`, the pinned file itself) or by its
+/// file name; pids and start times left out.
+fn rooted_at(statement: &str, installed: &Installed) -> String {
+    let Some(line) = statement.lines().find(|l| l.contains("requested by:")) else {
+        return "?".to_owned();
+    };
+    let Some(exe) = line.rsplit_once(", ").map(|(_, e)| e.trim()) else {
+        return "?".to_owned();
+    };
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut pinned = vec![canonical(&installed.exe)];
+    if let Some((starts, _)) = &installed.pin.starts {
+        pinned.push(canonical(&installed.dir.join(starts)));
+    }
+    if pinned.contains(&canonical(Path::new(exe))) {
+        "<the host's entry>".to_owned()
+    } else {
+        Path::new(exe)
+            .file_name()
+            .map_or("?".to_owned(), |n| n.to_string_lossy().into_owned())
+    }
+}
+
+/// Every tool result's text in a request body (Anthropic Messages or
+/// OpenAI Responses), joined.
+fn tool_outputs(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    let text = |c: &serde_json::Value| match c {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    let mut out = Vec::new();
+    for m in v["messages"].as_array().into_iter().flatten() {
+        for c in m["content"].as_array().into_iter().flatten() {
+            if c["type"] == "tool_result" {
+                out.push(text(&c["content"]));
+            }
+        }
+    }
+    for item in v["input"].as_array().into_iter().flatten() {
+        if item["type"] == "function_call_output" {
+            out.push(text(&item["output"]));
+        }
+    }
+    out.join("\n")
 }
 
 /// Whether `host`'s sandbox, with the settings §4 pins, is measured to

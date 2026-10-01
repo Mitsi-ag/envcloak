@@ -1,9 +1,11 @@
 //! The pinned agent hosts against the scripted model (M2 plan task M2-04,
 //! D-13, R-M2-66, R-M2-78, R-M2-88): the stub answers scripted turns to
 //! Claude Code and Codex; a canary a scripted turn prints with plain
-//! `echo` is found in that host's transcript (the positive control) and
-//! in what it sent its model; a run with no canary leaves none anywhere
-//! (the negative control).
+//! `printf` is found in the tool result the host sent its model and in
+//! that host's transcript (the positive control); a run with no canary
+//! leaves none anywhere (the negative control). A command that prints a
+//! canary names it in two pieces, so only what it printed can hold it
+//! whole.
 //!
 //! Each host runs in an isolated home with a cleared environment, its
 //! flags pinned per run (D-13), and `HTTPS_PROXY` pointed at the model,
@@ -61,6 +63,45 @@ fn measure(a: &AgentHome, what: &str, value: impl std::fmt::Display) {
     );
 }
 
+/// A command that prints each of `values` on a line of its own, each
+/// named in two pieces: the command's own text never holds one whole, so
+/// a whole one anywhere is what the command printed.
+fn print_split(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|v| {
+            let mid = v.len() / 2;
+            let (a, b) = v.split_at(
+                v.char_indices()
+                    .map(|(i, _)| i)
+                    .find(|&i| i >= mid)
+                    .unwrap_or(mid),
+            );
+            format!(
+                "printf '%s%s\\n' {} {}",
+                envcloak_e2e::quoted(a),
+                envcloak_e2e::quoted(b)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Linux: whether this process runs in a user namespace (CI's
+/// `unshare -rn`) or outside one; empty elsewhere. Sandbox rows say which.
+fn namespace() -> &'static str {
+    if !cfg!(target_os = "linux") {
+        return "";
+    }
+    match std::fs::read_to_string("/proc/self/uid_map") {
+        Ok(map) if map.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"] => {
+            " (outside a user namespace)"
+        }
+        Ok(_) => " (in a user namespace)",
+        Err(_) => " (user namespace unknown)",
+    }
+}
+
 /// The body of the request the script answered with `pick`.
 fn body_of(run: &HostRun, pick: &str) -> String {
     let r = run
@@ -113,7 +154,7 @@ fn scripted_turns(h: Host, variant: &str) {
     };
     let marker = format!("ecturn-{:016x}", fresh_seed());
     let script = json!({"steps": [
-        {"say": "running the step", "shell": format!("echo {marker}")},
+        {"say": "running the step", "shell": print_split(&[&marker])},
         {"say": "done"},
     ]});
     let run = a.run(&script, "Run the scripted step.", &flags(h), &a.home_dir());
@@ -132,7 +173,11 @@ fn scripted_turns(h: Host, variant: &str) {
         .collect();
     assert_eq!(picks, ["step 0", "step 1"], "{:?}", run.model.requests);
     // The host ran the command and sent its output back.
-    assert!(body_of(&run, "step 1").contains(&marker), "{}", run.text());
+    assert!(
+        last_tool_output(&body_of(&run, "step 1")).contains(&marker),
+        "{}",
+        run.text()
+    );
     let mut endpoints = run.model.endpoints();
     endpoints.retain(|e| !e.starts_with("CONNECT "));
     endpoints.dedup();
@@ -159,6 +204,48 @@ fn codex_is_served_scripted_turns() {
     scripted_turns(Host::Codex, "native");
 }
 
+/// Claude Code from npm with install scripts off: `node cli-wrapper.cjs`
+/// is the entry, and the native binary its child (F-37's
+/// interpreter-launched layout, which M2-10 classifies on an asserted
+/// basis). Served like the native build, and the shell tool's ancestry,
+/// nearest first up to the test, is recorded: the command's shell, the
+/// native binary, Node.
+#[test]
+fn claude_code_through_node_is_served_scripted_turns_and_its_layout_recorded() {
+    scripted_turns(Host::ClaudeCode, "npm-wrapper");
+    let Some(a) = host(Host::ClaudeCode, "npm-wrapper", "npm_wrapper_layout") else {
+        return;
+    };
+    let probe = format!(
+        "p=$$; printf '%s%s' 'ANC' 'ESTRY['; while [ \"$p\" != {test} ] && [ \"$p\" -gt 1 ]; do \
+         printf '%s,' \"$(basename \"$(ps -o comm= -p \"$p\")\")\"; \
+         p=$(ps -o ppid= -p \"$p\" | tr -d ' '); done; printf '%s%s' ']' 'END'",
+        test = std::process::id()
+    );
+    let script = json!({"steps": [{"shell": probe}, {"say": "done"}]});
+    let run = a.run(
+        &script,
+        "Show the ancestry.",
+        &flags(Host::ClaudeCode),
+        &a.home_dir(),
+    );
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
+    let text = last_tool_output(&body_of(&run, "step 1"));
+    let start = text.rfind("ANCESTRY[").map(|i| i + 9).unwrap_or(0);
+    let end = text[start..].find("]END").map_or(start, |i| start + i);
+    let chain: Vec<&str> = text[start..end]
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    measure(&a, "shell tool ancestry, nearest first", chain.join(" <- "));
+    let node = chain.iter().position(|n| *n == "node");
+    let native = chain.iter().position(|n| *n == "claude");
+    assert!(
+        matches!((native, node), (Some(c), Some(n)) if c < n),
+        "the native binary is not a child of node: {chain:?}"
+    );
+}
+
 /// A canary printed by a scripted turn with plain `echo` must be found in
 /// the host's transcript store and in the model's request bodies: the
 /// sweep's positive control (L-01, SI-18). Raw counts per store are
@@ -176,12 +263,18 @@ fn positive_control(h: Host) {
     let cs = canaries(fresh_seed());
     let key = by_label(&cs, labels::OPENAI_API_KEY).clone();
     let script = json!({"steps": [
-        {"shell": format!("echo {}; echo {}", control.as_str(), key.as_str())},
+        {"shell": print_split(&[control.as_str(), key.as_str()])},
         {"say": "done"},
     ]});
     let run = a.run(&script, "Print the two lines.", &flags(h), &a.home_dir());
     assert_eq!(run.output.status.code(), Some(0), "exit code");
     assert!(run.model.clean(), "{:?}", run.model.outcome);
+    // The command named it in two pieces: whole, it is what the command
+    // printed, and the tool result the host sent holds it.
+    assert!(
+        last_tool_output(&body_of(&run, "step 1")).contains(control.as_str()),
+        "the printed control is not in the tool result the host sent its model"
+    );
     let all = [control.clone(), key.clone()];
     let hits = Sweep::host_stores(&a, &all, &[&run.model]);
     print!(
@@ -454,8 +547,10 @@ fn waited(run: &HostRun, call: &str, next: &str) -> u64 {
 /// Claude Code and an MCP server it starts (registered with its own CLI,
 /// `claude mcp add-json`, as the installer will): the server's ancestry
 /// and environment names, and the tool-call cutoff under `-p` without and
-/// with a per-server `timeout` (Map C §8 item 1, K-08, SI-17), which sets
-/// M2-06's `--wait-ms` default.
+/// with a per-server `timeout` of 60 s (Map C §8 item 1, K-08, SI-17),
+/// which sets M2-06's `--wait-ms` default: calls of 30 s and 70 s, so the
+/// cutoff is seen where it falls inside 70 s, and otherwise 70 s is the
+/// lower bound recorded.
 #[test]
 fn claude_code_mcp_server_and_tool_cutoff() {
     let Some(a) = host(Host::ClaudeCode, "native", "claude_code_mcp") else {
@@ -486,20 +581,39 @@ fn claude_code_mcp_server_and_tool_cutoff() {
 
     register(None);
     let whoami = json!({"steps": [{"tool": "mcp__fixture__whoami", "input": {}}, {"say": "done"}]});
-    let run = a.run(&whoami, "Who is the server?", &tools, &a.home_dir());
-    assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
-    let text = after_call(&run, "step 1");
-    let ancestry = printed(&text, "ancestry=")
-        .map(|_| {
-            let at = text.rfind("ancestry=").unwrap_or(0) + 9;
-            text[at..]
-                .split(['"', '\\'])
-                .next()
-                .unwrap_or("")
-                .to_owned()
-        })
-        .unwrap_or_else(|| "?".to_owned());
+    // A call made before Claude Code has connected the new server gets an
+    // error instead of an answer: tried up to three times, and what the
+    // earlier tries got is recorded with the answer.
+    let mut earlier = Vec::new();
+    let text = loop {
+        let run = a.run(&whoami, "Who is the server?", &tools, &a.home_dir());
+        assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
+        let text = after_call(&run, "step 1");
+        if text.contains("ancestry=") {
+            break text;
+        }
+        // The fixture's answers hold names only; an error is the host's.
+        let got: String = last_tool_output(&text).chars().take(160).collect();
+        earlier.push(got);
+        assert!(
+            earlier.len() < 3,
+            "the whoami call was never answered: {earlier:?}"
+        );
+    };
+    let at = text.rfind("ancestry=").unwrap_or(0) + 9;
+    let ancestry = text[at..]
+        .split(['"', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_owned();
     measure(&a, "MCP server ancestry", &ancestry);
+    if !earlier.is_empty() {
+        measure(
+            &a,
+            "MCP call before the answer, tries",
+            format!("{earlier:?}"),
+        );
+    }
     let env = printed(&text, "env=").unwrap_or_default();
     let markers: Vec<&str> = env
         .split(',')
@@ -513,52 +627,65 @@ fn claude_code_mcp_server_and_tool_cutoff() {
 
     for timeout in [None, Some(60_000)] {
         register(timeout);
-        let wait = json!({"steps": [
-            {"tool": "mcp__fixture__wait", "input": {"ms": 15000}},
-            {"say": "done"},
-        ]});
-        let run = a.run(&wait, "Wait.", &tools, &a.home_dir());
-        assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
-        let after = after_call(&run, "step 1");
-        let answered = after.contains("waited 15000");
-        let ms = waited(&run, "step 0", "step 1");
-        let setting = match timeout {
-            None => "no per-server timeout".to_owned(),
-            Some(t) => format!("per-server timeout {t} ms"),
-        };
-        measure(
-            &a,
-            &format!("MCP tool call of 15 s under -p, {setting}"),
-            format!(
-                "{} after {:.1} s",
-                if answered { "answered" } else { "cut off" },
-                ms as f64 / 1000.0
-            ),
-        );
-        if timeout.is_some() {
-            assert!(answered, "a per-server timeout did not lift the cutoff");
+        for call_ms in [30_000u64, 70_000] {
+            let wait = json!({"steps": [
+                {"tool": "mcp__fixture__wait", "input": {"ms": call_ms}},
+                {"say": "done"},
+            ]});
+            let run = a.run(&wait, "Wait.", &tools, &a.home_dir());
+            assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
+            let after = after_call(&run, "step 1");
+            let answered = after.contains(&format!("waited {call_ms}"));
+            let ms = waited(&run, "step 0", "step 1");
+            let setting = match timeout {
+                None => "no per-server timeout".to_owned(),
+                Some(t) => format!("per-server timeout {t} ms"),
+            };
+            measure(
+                &a,
+                &format!("MCP tool call of {} s under -p, {setting}", call_ms / 1000),
+                format!(
+                    "{} after {:.1} s",
+                    if answered { "answered" } else { "cut off" },
+                    ms as f64 / 1000.0
+                ),
+            );
+            if timeout.is_some() && call_ms < 60_000 {
+                assert!(answered, "a per-server timeout of 60 s cut off a 30 s call");
+            }
         }
     }
 }
 
-/// Codex and an MCP server in `[mcp_servers.fixture]` (no host CLI
-/// writes Codex's servers; the person's config is what the installer
-/// will write, M2-08): how its tools are offered (a `mcp__fixture`
-/// namespace in 0.159.2), whether a call runs under `exec` with approval
-/// policy `never` for each per-server `default_tools_approval_mode`
-/// (SI-17; the meaning of `auto`), the server's ancestry, and the cutoff
-/// `tool_timeout_sec` sets.
+/// Codex and an MCP server registered with its own CLI (`codex mcp add
+/// fixture -- <command>`, which writes `[mcp_servers.fixture]` with the
+/// command), plus the two keys that CLI cannot set, as the person's
+/// settings (M2-08's installer writes the same): how its tools are
+/// offered (a `mcp__fixture` namespace in 0.159.2), whether a call runs
+/// under `exec` with approval policy `never` for each per-server
+/// `default_tools_approval_mode` (SI-17; the meaning of `auto`), the
+/// server's ancestry, and the cutoff `tool_timeout_sec` sets.
 #[test]
 fn codex_mcp_server_approval_modes_and_tool_cutoff() {
     let Some(mut a) = host(Host::Codex, "native", "codex_mcp") else {
         return;
     };
     let server = fixture_mcp();
+    let added = a.host_cli(&["mcp", "add", "fixture", "--", server.to_str().unwrap()]);
+    assert!(
+        added.status.success(),
+        "codex mcp add: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    // What the CLI wrote (a path is the same string in TOML and JSON).
+    let written = std::fs::read_to_string(a.codex_home().join("config.toml")).unwrap();
+    assert!(
+        written.contains("[mcp_servers.fixture]")
+            && written.contains(&format!("command = {}", json!(server.to_str().unwrap()))),
+        "{written}"
+    );
     let config = |mode: Option<&str>, timeout: u64| {
-        let mut t = format!(
-            "[mcp_servers.fixture]\ncommand = {}\ntool_timeout_sec = {timeout}\n",
-            json!(server.to_str().unwrap())
-        );
+        let mut t = format!("[mcp_servers.fixture]\ntool_timeout_sec = {timeout}\n");
         if let Some(m) = mode {
             t.push_str(&format!("default_tools_approval_mode = \"{m}\"\n"));
         }
@@ -1133,18 +1260,71 @@ fn claude_code_sandbox_reaches_the_socket() {
         } else {
             format!("the host did not run (exit {:?})", run.output.status.code())
         };
-        measure(&a, &format!("envcloak status, {name}"), result);
+        measure(
+            &a,
+            &format!("envcloak status, {name}{}", namespace()),
+            result,
+        );
     }
 }
 
+/// What a sandboxed command tries besides EnvCloak's socket, as a Python
+/// program (keys built at run time, so the command's text never matches
+/// them). `raw`: a loopback TCP listener, another Unix socket and a raw
+/// connection to a non-loopback address (TEST-NET-1, which nothing
+/// answers: a sandbox that let it out shows `timeout`). `https` and
+/// `http`: a request through whatever proxy the command's environment
+/// names (Codex's own, under its network proxy), each in a command of its
+/// own, since Codex fails a whole command whose request its proxy blocks.
+/// Each prints `<KEY>OK` or `<KEY>NO <why>`, one word; `PXY` names the
+/// proxy's port, or `none`.
+const EGRESS: &str = r#"import errno, os, re, socket, sys, urllib.error, urllib.request
+mode, port, other = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def say(key, verdict, why=""):
+    print(key + "%s" % verdict, re.sub(r"[^A-Za-z0-9._-]", "_", str(why))[:80])
+def raw(key, family, addr):
+    s = socket.socket(family)
+    s.settimeout(5)
+    try:
+        s.connect(addr)
+        say(key, "OK")
+    except socket.timeout:
+        say(key, "NO", "timeout")
+    except OSError as e:
+        say(key, "NO", errno.errorcode.get(e.errno, e.errno))
+    finally:
+        s.close()
+if mode == "raw":
+    raw("TCP", socket.AF_INET, ("127.0.0.1", port))
+    raw("UNIX", socket.AF_UNIX, other)
+    raw("EXT", socket.AF_INET, ("192.0.2.1", 443))
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    m = re.search(r":(\d+)/?$", proxy)
+    say("PXY", "", m.group(1) if m else ("none" if not proxy else "unparsed"))
+for key, url in (("PRXS", "https://example.com/"), ("PRXH", "http://example.com/")):
+    if mode != url.split(":")[0]:
+        continue
+    try:
+        r = urllib.request.urlopen(url, timeout=15)
+        say(key, "OK", r.status)
+    except urllib.error.HTTPError as e:
+        say(key, "NO", "http-%d" % e.code)
+    except Exception as e:
+        t = re.search(r"Tunnel connection failed: (\d+)", str(e))
+        say(key, "NO", "tunnel-" + t.group(1) if t else type(getattr(e, "reason", e)).__name__ + "-" + str(getattr(e, "reason", e))[:60])
+"#;
+
 /// Whether `envcloak status` reaches the daemon from Codex's sandbox
-/// (K-01) in `read-only` (the `exec` default) and `workspace-write`, with
-/// no network setting, with `sandbox_workspace_write.network_access`, and
-/// with that plus the network proxy on, no domain rule and one
-/// `unix_sockets` allow rule for EnvCloak's socket; and, under that
-/// bounded setting, whether a command can open a TCP connection to a
-/// loopback listener or another Unix socket (it must not, or M2-08 does
-/// not write it).
+/// (K-01) in `read-only` (the `exec` default) and `workspace-write`, each
+/// with no network setting and with the bounded setting (network access,
+/// the network proxy on, no domain rule and one `unix_sockets` allow rule
+/// for EnvCloak's socket), and `workspace-write` with network access
+/// alone; and what else a command can reach there ([`EGRESS`]). Under the
+/// bounded setting in `workspace-write` (what M2-08 would write) nothing
+/// else may be reachable: on macOS a raw connection anywhere is refused by
+/// the sandbox itself (`EPERM`), and on both systems both proxied
+/// requests are refused by Codex's own proxy (an HTTP 403), never by a
+/// network that is not there, and never reach the scripted model's proxy.
 #[test]
 fn codex_sandbox_reaches_the_socket_and_nothing_else() {
     let Some(mut a) = host(Host::Codex, "native", "codex_sandbox") else {
@@ -1157,12 +1337,15 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
     let port = tcp.local_addr().unwrap().port();
     let other = a.root().join("other.sock");
     let _unix = std::os::unix::net::UnixListener::bind(&other).unwrap();
-    // A socket that cannot even be made counts as refused; the errno
-    // says which.
-    let egress = format!(
-        "python3 -c \"import errno,socket\nfor fam,addr,key in ((socket.AF_INET,('127.0.0.1',{port}),'TCP'),(socket.AF_UNIX,'{}','UNIX')):\n try:\n  s=socket.socket(fam); s.connect(addr); print(key+'%s' % 'OK')\n except OSError as e:\n  print(key+'%s' % 'NO', errno.errorcode.get(e.errno, e.errno))\"",
-        other.display()
-    );
+    let probe = a.root().join("egress.py");
+    std::fs::write(&probe, EGRESS).unwrap();
+    let egress = |mode: &str| {
+        format!(
+            "python3 {} {mode} {port} {}",
+            envcloak_e2e::quoted(probe.to_str().unwrap()),
+            envcloak_e2e::quoted(other.to_str().unwrap())
+        )
+    };
     let bounded = format!(
         "[sandbox_workspace_write]\nnetwork_access = true\n\
          [features.network_proxy]\nenabled = true\n\
@@ -1171,6 +1354,11 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
     );
     for (name, sandbox, config) in [
         ("read-only", "read-only", String::new()),
+        (
+            "read-only, network_access, proxy with one unix_sockets rule",
+            "read-only",
+            bounded.clone(),
+        ),
         ("workspace-write", "workspace-write", String::new()),
         (
             "workspace-write, network_access",
@@ -1185,7 +1373,9 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
     ] {
         a.codex_config(&config);
         let script = json!({"steps": [
-            {"shell": format!("{}; {egress}", status_probe())},
+            {"shell": format!("{}; {}", status_probe(), egress("raw"))},
+            {"shell": egress("https")},
+            {"shell": egress("http")},
             {"say": "done"},
         ]});
         let run = a.run(
@@ -1196,33 +1386,80 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
         );
         assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
         let text = after_call(&run, "step 1");
-        measure(&a, &format!("envcloak status, {name}"), reach(&text));
+        let label = format!("{name}{}", namespace());
+        measure(&a, &format!("envcloak status, {label}"), reach(&text));
+        // Each proxied request's result is in the next turn's request.
+        let proxied = [
+            ("PRXS", last_tool_output(&after_call(&run, "step 2"))),
+            ("PRXH", last_tool_output(&after_call(&run, "step 3"))),
+        ];
         let seen = |key: &str| {
-            if text.contains(&format!("{key}OK")) {
-                "reached".to_owned()
-            } else if let Some(e) = printed(&text, &format!("{key}NO ")) {
+            let text = proxied
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map_or(text.as_str(), |(_, t)| t.as_str());
+            if let Some(e) = printed(text, &format!("{key}OK ")) {
+                format!("reached ({e})")
+            } else if let Some(e) = printed(text, &format!("{key}NO ")) {
                 format!("refused ({e})")
+            } else if text.contains("domain is not on the allowlist") {
+                // Codex failed the whole command: its proxy blocked the
+                // request's domain.
+                "refused (codex-proxy-allowlist)".to_owned()
             } else {
                 "not tried (no output)".to_owned()
             }
         };
+        let proxy_port = printed(&text, "PXY ").unwrap_or_else(|| "?".to_owned());
         measure(
             &a,
-            &format!("other egress, {name}"),
+            &format!("other egress, {label}"),
             format!(
-                "loopback TCP {}, another Unix socket {}",
+                "loopback TCP {}, another Unix socket {}, a non-loopback address {}, \
+                 HTTPS through the command's proxy (port {proxy_port}) {}, HTTP {}",
                 seen("TCP"),
-                seen("UNIX")
+                seen("UNIX"),
+                seen("EXT"),
+                seen("PRXS"),
+                seen("PRXH")
             ),
         );
-        if name.contains("unix_sockets") {
+        if sandbox == "workspace-write" && name.contains("unix_sockets") {
+            for key in ["TCP", "UNIX", "EXT", "PRXS", "PRXH"] {
+                assert!(
+                    seen(key).starts_with("refused"),
+                    "the bounded setting lets a command reach {key}: {}",
+                    seen(key)
+                );
+            }
+            if cfg!(target_os = "macos") {
+                assert!(
+                    matches!(seen("EXT").as_str(), "refused (EPERM)" | "refused (EACCES)"),
+                    "a non-loopback connection was not refused by the sandbox: {}",
+                    seen("EXT")
+                );
+            }
+            // Refused by Codex's proxy, by its rules (no domain is
+            // allowed), not by a network that is missing: CI's Linux
+            // namespace has none.
+            for key in ["PRXS", "PRXH"] {
+                assert!(
+                    matches!(
+                        seen(key).as_str(),
+                        "refused (codex-proxy-allowlist)"
+                            | "refused (tunnel-403)"
+                            | "refused (http-403)"
+                    ),
+                    "{key} was not refused by Codex's proxy: {}",
+                    seen(key)
+                );
+            }
             assert!(
-                seen("TCP").starts_with("refused"),
-                "the bounded setting lets a command reach TCP"
-            );
-            assert!(
-                seen("UNIX").starts_with("refused"),
-                "the bounded setting lets a command reach another Unix socket"
+                !run.model
+                    .connects()
+                    .iter()
+                    .any(|c| c.starts_with("example.com")),
+                "a sandboxed command reached the scripted model's proxy"
             );
         }
     }
@@ -1242,13 +1479,25 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
 /// when a wait runs out, and `STILL RUNNING` when the program has not
 /// exited `limit` seconds after the last step (it is killed in both
 /// cases). The screen is never printed: it can hold what was pasted. On a
-/// timeout it is written to `screen`, for diagnosis.
-const PTY_DRIVER: &str = r#"import fcntl, json, os, pty, re, select, struct, sys, termios, time
+/// timeout it is written to `screen`, for diagnosis. The program leads a
+/// session of its own, outside the driver's process group, so a `SIGTERM`
+/// to the driver (the harness's limit) kills it first: the driver's own,
+/// unreaped child.
+const PTY_DRIVER: &str = r#"import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
 spec = json.load(open(sys.argv[1]))
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(spec["cwd"])
     os.execve(spec["argv"][0], spec["argv"], dict(spec["env"]))
+# SIGTERM is blocked around every reap, so the handler only ever runs
+# while the child is unreaped.
+TERM = {signal.SIGTERM}
+def stop(*_):
+    signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    sys.exit(1)
+signal.signal(signal.SIGTERM, stop)
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
 shown = b""
 def more(until):
@@ -1299,6 +1548,7 @@ for i, step in enumerate(spec["steps"]):
             if spec.get("screen"):
                 open(spec["screen"], "wb").write(screen())
             print("TIMEOUT %d" % i)
+            signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
             try:
                 os.kill(pid, 9)
             except OSError:
@@ -1308,12 +1558,15 @@ for i, step in enumerate(spec["steps"]):
         alive = more(min(end, time.time() + 0.5))
 end = time.time() + spec["limit"]
 while time.time() < end:
+    signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
     done, status = os.waitpid(pid, os.WNOHANG)
     if done:
         print("EXIT %d" % os.waitstatus_to_exitcode(status))
         sys.exit(0)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, TERM)
     more(min(end, time.time() + 0.2))
 # Still running after the last step: killed, its own unreaped child.
+signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
 os.kill(pid, 9)
 os.waitpid(pid, 0)
 print("STILL RUNNING")
