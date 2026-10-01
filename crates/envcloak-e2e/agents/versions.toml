@@ -13,8 +13,12 @@
 # (ubuntu-latest).
 #
 # Tier 1 (decision D-14) are driven end to end. Tier 2 are installed here
-# so M2-10 can observe their real install layouts; docs/ACCEPTANCE.md
-# says which of them the scripted model can drive.
+# so M2-10 can observe their real install layouts; M2-04 ran each against
+# the scripted model (agent_hosts' tier-2 tests): which protocol it speaks,
+# and for the drivable ones the shell command it starts and that
+# command's ancestry, recorded in docs/ACCEPTANCE.md. An npm host's entry
+# is a script its `interpreter` runs; one whose entry starts another
+# program names it in `starts`, hashed too.
 #
 # npm-installed hosts are installed with `npm ci` from the lockfile in
 # npm/<id>/, which pins every package in the tree by its integrity hash.
@@ -109,6 +113,7 @@ tier = 2
 version = "0.62.0"
 method = "npm"
 package = "@google/gemini-cli"
+interpreter = "node"
 entry = "node_modules/@google/gemini-cli/bundle/gemini.js"
 
 [host.sha256]
@@ -122,11 +127,22 @@ tier = 2
 version = "1.0.90"
 method = "npm"
 package = "@github/copilot"
+interpreter = "node"
 entry = "node_modules/@github/copilot/npm-loader.js"
 
 [host.sha256]
 darwin-arm64 = "0ea824a86be5757533fdb092eff7050871bd7a711a46babde0ffe0e44ac5ad88"
 linux-x64 = "0ea824a86be5757533fdb092eff7050871bd7a711a46babde0ffe0e44ac5ad88"
+
+# `node npm-loader.js` starts the platform package's native binary, which
+# runs the shell tool's commands (measured by M2-04).
+[host.starts]
+darwin-arm64 = "node_modules/@github/copilot-darwin-arm64/copilot"
+linux-x64 = "node_modules/@github/copilot-linux-x64/copilot"
+
+[host.starts_sha256]
+darwin-arm64 = "3ae21a3f00fcc216faaa1f062ee98451c7807066ee26f0fe1c85c6ed315e5458"
+linux-x64 = "be17b42705ca17490098d7b87f293300d72a094d125b6bb2b2557dc4a0a4f8a8"
 
 [[host]]
 id = "opencode"
@@ -153,6 +169,7 @@ tier = 2
 version = "2.1.1"
 method = "npm"
 package = "@moonshot-ai/kimi-code"
+interpreter = "node"
 entry = "node_modules/@moonshot-ai/kimi-code/dist/main.mjs"
 
 [host.sha256]
@@ -184,6 +201,7 @@ tier = 2
 version = "0.24.7"
 method = "npm"
 package = "@qwen-code/qwen-code"
+interpreter = "node"
 entry = "node_modules/@qwen-code/qwen-code/cli-entry.js"
 
 [host.sha256]

@@ -1244,6 +1244,15 @@ fn status_probe() -> String {
 /// The text of the last tool result in a request body (Anthropic
 /// Messages or OpenAI Responses), on one line.
 fn last_tool_output(body: &str) -> String {
+    last_tool_text(body)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The text of the last tool result in a request body, as the host sent
+/// it (parts joined by line breaks).
+fn last_tool_text(body: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return String::new();
     };
@@ -1255,7 +1264,7 @@ fn last_tool_output(body: &str) -> String {
             .iter()
             .filter_map(|p| p["text"].as_str())
             .collect::<Vec<_>>()
-            .join(" "),
+            .join("\n"),
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     };
@@ -1271,7 +1280,7 @@ fn last_tool_output(body: &str) -> String {
             out = text(&item["output"]);
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    out
 }
 
 /// Whether the status probe reached the daemon, and if not, why: the
@@ -2079,5 +2088,340 @@ fn claude_code_interactive_trust_and_paste() {
         &a,
         "interactive: shell tool terminal, the host on a terminal (T=tty, N=not)",
         shown,
+    );
+}
+
+// ---------------------------------------------------------------------
+// Tier 2 (M2-04's spike, Codex review: drivability was read from the
+// documentation only). Each tier-2 host, with its documented base-URL
+// setting pointed at the scripted model in an isolated home: which
+// endpoints it calls; for the drivable ones, whether the scripted model's
+// call to its shell tool starts a command, and what that command's
+// ancestry is (the executable, interpreter and script layout M2-10
+// classifies). Flags are pinned per host; no host runs in a bypass mode.
+// ---------------------------------------------------------------------
+
+/// What the probe command prints: a marker, then each ancestor up to four
+/// levels, nearest first, as `ANC <comm> | <args, cut>`. The keys are
+/// built at run time, so the command's own text never holds them whole.
+const ANCESTRY_PROBE: &str = "printf '%s%s\\n' 'MARK' 'ER-ran'; p=$$; i=0; \
+     while [ \"$p\" -gt 1 ] && [ $i -lt 4 ]; do \
+     printf '%s %s | %s\\n' 'AN''C' \"$(ps -o comm= -p \"$p\")\" \"$(ps -o args= -p \"$p\" | cut -c1-160)\"; \
+     p=$(ps -o ppid= -p \"$p\" | tr -d ' '); i=$((i+1)); done";
+
+/// One tier-2 host run: the scripted model's report, the host's output
+/// and the host as installed.
+struct Tier2Run {
+    report: envcloak_testkit::agents::ModelReport,
+    output: std::process::Output,
+}
+
+/// Runs the tier-2 host `id`/`variant` in a fresh home against a scripted
+/// model: the probe through its shell tool `shell` (the tool's name and
+/// the rest of its input), or one plain reply when it has none. `setup`
+/// writes the host's settings into the home and adds its arguments and
+/// variables. Every proxy variable points at the model, which refuses and
+/// records every tunnel.
+fn tier_2(
+    id: &str,
+    variant: &str,
+    shell: Option<(&str, serde_json::Value)>,
+    setup: impl FnOnce(
+        &envcloak_testkit::TestHome,
+        &envcloak_testkit::agents::Model,
+        &mut std::process::Command,
+    ),
+) -> Option<Tier2Run> {
+    let found = Installed::find(&versions_toml(), id, variant);
+    let installed = require(found, &format!("tier 2 ({id})"))?;
+    let home = envcloak_testkit::TestHome::new();
+    let project = home.root().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let script = match &shell {
+        Some((tool, extra)) => {
+            let mut input = extra.clone();
+            input["command"] = json!(ANCESTRY_PROBE);
+            json!({"steps": [{"tool": tool, "input": input}, {"say": "probe done"}], "side": "ok"})
+        }
+        None => json!({"steps": [{"say": "scripted reply"}], "side": "ok"}),
+    };
+    let model = envcloak_testkit::agents::Model::start(&script);
+    let mut cmd = installed.command();
+    cmd.env_clear().envs(home.vars());
+    for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        cmd.env(k, model.base_url());
+    }
+    for k in ["NO_PROXY", "no_proxy"] {
+        cmd.env(k, "127.0.0.1,localhost");
+    }
+    setup(&home, &model, &mut cmd);
+    cmd.current_dir(&project)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = envcloak_testkit::agents::finish_within(cmd, envcloak_testkit::agents::RUN_LIMIT);
+    let report = model.finish();
+    if let Err(why) = installed.verify() {
+        panic!("the host changed during the run: {why}");
+    }
+    let label = format!("{id}/{variant} {}", installed.pin.version);
+    let mut tunnels = report.connects();
+    tunnels.sort_unstable();
+    tunnels.dedup();
+    println!(
+        "measurement: tier 2 host={label} os={}: endpoints {}; tunnels refused {}; outcome {}",
+        os(),
+        report.model_endpoints().join(", "),
+        tunnels.join(", "),
+        report.outcome
+    );
+    Some(Tier2Run { report, output })
+}
+
+/// The probe's answer in the request after the shell call: the marker,
+/// and the ancestry as `comm (args)` entries, nearest first, the shell
+/// itself left out (its arguments are the probe).
+fn tier_2_probe(run: &Tier2Run) -> (bool, Vec<String>) {
+    let Some(r) = run
+        .report
+        .requests
+        .iter()
+        .find(|r| r.pick.as_deref() == Some("step 1"))
+    else {
+        return (false, Vec::new());
+    };
+    let text = last_tool_text(&String::from_utf8_lossy(&r.body));
+    let ran = text.contains("MARKER-ran");
+    let lines: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("ANC "))
+        .collect();
+    let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_owned();
+    // The shell, by name; then its ancestors up to this test.
+    let shell = lines
+        .first()
+        .map(|l| base(l.split_once(" | ").map_or(*l, |(c, _)| c)));
+    let chain = shell
+        .into_iter()
+        .chain(lines.iter().skip(1).map(|l| {
+            let (comm, args) = l.split_once(" | ").unwrap_or((l, ""));
+            // The program and, when it is an interpreter, its script.
+            let mut words = args.split_whitespace();
+            let program = words.next().map(base).unwrap_or_default();
+            let script = words
+                .next()
+                .filter(|w| w.ends_with(".js") || w.ends_with(".mjs") || w.ends_with(".cjs"))
+                .map(base);
+            match script {
+                Some(script) => format!("{} ({program} {script})", base(comm)),
+                None => format!("{} ({program})", base(comm)),
+            }
+        }))
+        .take_while(|c| !c.starts_with("agent_hosts"))
+        .collect();
+    (ran, chain)
+}
+
+/// A drivable tier-2 host: it spoke Anthropic Messages to the scripted
+/// model, its shell tool ran the probe, and the command's shell and its
+/// nearest ancestors are `expected`, by name, in order (the shell first).
+fn tier_2_drivable(id: &str, run: &Tier2Run, expected: &[&str]) {
+    assert!(
+        run.report
+            .model_endpoints()
+            .iter()
+            .any(|e| e == "POST /v1/messages"),
+        "{id} did not speak Anthropic Messages to the scripted model: {:?}",
+        run.report.requests
+    );
+    let (ran, chain) = tier_2_probe(run);
+    println!(
+        "measurement: tier 2 host={id} os={}: shell tool ran the command: {ran}; its ancestry, \
+         nearest first: {}",
+        os(),
+        chain.join(" <- ")
+    );
+    assert!(
+        ran,
+        "{id}'s shell tool did not run the command; stdout {:?}",
+        String::from_utf8_lossy(&run.output.stdout)
+    );
+    for (i, want) in expected.iter().enumerate() {
+        assert!(
+            chain.get(i).is_some_and(|c| c.contains(want)),
+            "{id}: ancestor {i} is not {want}: {chain:?}"
+        );
+    }
+}
+
+/// Qwen Code: `modelProviders.anthropic` in `~/.qwen/settings.json`, the
+/// key by `envKey`; `-p`'s positional prompt in the default approval mode
+/// with the shell tool allowed by name (headless runs deny it otherwise).
+#[test]
+fn tier_2_qwen_code_against_the_scripted_model() {
+    let Some(run) = tier_2(
+        "qwen-code",
+        "npm",
+        Some(("run_shell_command", json!({"description": "probe"}))),
+        |home, model, cmd| {
+            let dir = home.home().join(".qwen");
+            std::fs::create_dir_all(&dir).unwrap();
+            let settings = json!({
+                "modelProviders": {"anthropic": [{"id": "ec-scripted", "name": "ec",
+                    "envKey": "EC_MODEL_TOKEN", "baseUrl": model.base_url()}]},
+                "model": {"name": "ec-scripted"},
+                "security": {"auth": {"selectedType": "anthropic"}},
+            });
+            std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+            cmd.env("EC_MODEL_TOKEN", model.token()).args([
+                "Run the probe.",
+                "--approval-mode",
+                "default",
+                "--allowed-tools",
+                "run_shell_command",
+            ]);
+        },
+    ) else {
+        return;
+    };
+    tier_2_drivable("qwen-code", &run, &["sh", "node (node cli-entry.js)"]);
+}
+
+/// Kimi Code: an `anthropic` provider in `$KIMI_CODE_HOME/config.toml`
+/// (`~/.kimi-code`), the key by `api_key_env`; `-p`.
+#[test]
+fn tier_2_kimi_code_against_the_scripted_model() {
+    let Some(run) = tier_2(
+        "kimi-code",
+        "npm",
+        Some(("Bash", json!({}))),
+        |home, model, cmd| {
+            let dir = home.home().join(".kimi-code");
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = format!(
+                "default_model = \"ec\"\n\n[providers.ec]\ntype = \"anthropic\"\n\
+                 base_url = {}\napi_key_env = \"EC_MODEL_TOKEN\"\n\n[models.ec]\n\
+                 provider = \"ec\"\nmodel = \"ec-scripted\"\nmax_context_size = 200000\n",
+                json!(model.base_url())
+            );
+            std::fs::write(dir.join("config.toml"), config).unwrap();
+            cmd.env("EC_MODEL_TOKEN", model.token())
+                .env("KIMI_CODE_HOME", &dir)
+                .args(["-p", "Run the probe."]);
+        },
+    ) else {
+        return;
+    };
+    // Node, which names its process `kimi-code` (its arguments too).
+    tier_2_drivable("kimi-code", &run, &["sh", "kimi-code"]);
+}
+
+/// OpenCode: a provider in `~/.config/opencode/opencode.json` on the
+/// bundled `@ai-sdk/anthropic`, the key from the environment; `run`.
+#[test]
+fn tier_2_opencode_against_the_scripted_model() {
+    let Some(run) = tier_2(
+        "opencode",
+        "native",
+        Some(("bash", json!({"description": "probe"}))),
+        |home, model, cmd| {
+            let dir = home.root().join("config").join("opencode");
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = json!({
+                "provider": {"ec": {"npm": "@ai-sdk/anthropic", "name": "ec",
+                    "options": {"baseURL": format!("{}/v1", model.base_url()),
+                                "apiKey": "{env:EC_MODEL_TOKEN}"},
+                    "models": {"ec-scripted": {"name": "ec-scripted"}}}},
+                "model": "ec/ec-scripted",
+                "autoupdate": false,
+                "share": "disabled",
+            });
+            std::fs::write(dir.join("opencode.json"), config.to_string()).unwrap();
+            cmd.env("EC_MODEL_TOKEN", model.token())
+                .args(["run", "Run the probe."]);
+        },
+    ) else {
+        return;
+    };
+    tier_2_drivable("opencode", &run, &["sh", "opencode (opencode)"]);
+}
+
+/// Copilot CLI: `COPILOT_PROVIDER_BASE_URL` with
+/// `COPILOT_PROVIDER_TYPE=anthropic`, offline, updates off; `-p` with the
+/// shell tool allowed (`--allow-tool=shell`, not every tool).
+#[test]
+fn tier_2_copilot_cli_against_the_scripted_model() {
+    let Some(run) = tier_2(
+        "copilot-cli",
+        "npm",
+        Some(("bash", json!({"description": "probe", "mode": "sync"}))),
+        |_, model, cmd| {
+            cmd.env("COPILOT_OFFLINE", "true")
+                .env("COPILOT_AUTO_UPDATE", "false")
+                .env("COPILOT_PROVIDER_BASE_URL", model.base_url())
+                .env("COPILOT_PROVIDER_TYPE", "anthropic")
+                .env("COPILOT_PROVIDER_API_KEY", model.token())
+                .env("COPILOT_MODEL", "ec-scripted")
+                .args(["-p", "Run the probe.", "--allow-tool=shell"]);
+        },
+    ) else {
+        return;
+    };
+    // `node npm-loader.js` starts the platform package's binary (pinned
+    // as `starts`), which runs the command.
+    tier_2_drivable(
+        "copilot-cli",
+        &run,
+        &["sh", "copilot (copilot)", "node (node npm-loader.js)"],
+    );
+}
+
+/// Gemini CLI: `GOOGLE_GEMINI_BASE_URL` with a Gemini API key. It speaks
+/// the Gemini API, not one of the scripted model's two protocols: not
+/// drivable, measured.
+#[test]
+fn tier_2_gemini_cli_speaks_neither_protocol() {
+    let Some(run) = tier_2("gemini-cli", "npm", None, |home, model, cmd| {
+        let dir = home.home().join(".gemini");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = json!({"security": {"auth": {"selectedType": "gemini-api-key"}},
+                              "general": {"disableAutoUpdate": true}});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        cmd.env("GOOGLE_GEMINI_BASE_URL", model.base_url())
+            .env("GEMINI_API_KEY", model.token())
+            .args(["-p", "Say hello.", "--skip-trust"]);
+    }) else {
+        return;
+    };
+    assert!(
+        run.report.model_calls().is_empty(),
+        "Gemini CLI spoke a protocol the scripted model serves: {:?}",
+        run.report.requests
+    );
+    assert!(
+        run.report
+            .requests
+            .iter()
+            .any(|r| r.path.starts_with("/v1beta/models/")),
+        "Gemini CLI did not reach the base URL: {:?}",
+        run.report.requests
+    );
+}
+
+/// Cursor CLI: no documented base-URL setting; with every proxy variable
+/// at the scripted model, all it tries is a tunnel to its own servers.
+/// Not drivable, measured.
+#[test]
+fn tier_2_cursor_cli_has_no_base_url() {
+    let Some(run) = tier_2("cursor-cli", "native", None, |_, model, cmd| {
+        cmd.env("CURSOR_API_KEY", model.token())
+            .args(["-p", "Say hello."]);
+    }) else {
+        return;
+    };
+    assert!(
+        run.report.model_endpoints().is_empty(),
+        "Cursor CLI reached the scripted model itself: {:?}",
+        run.report.requests
     );
 }
