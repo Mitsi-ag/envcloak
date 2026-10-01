@@ -35,6 +35,21 @@ which a task uses again for a new case). This script refuses:
   registry, and so is a code source that gives one number or token to two
   entries, or two tokens or codes to one.
 
+Each code reader reads every declaration of its registry or refuses it, so
+no entry is skipped unread (Codex review of PR #14): every variant of a
+numbered enum is written `Name = <integer literal>` (decimal, hexadecimal,
+octal or binary, with `_` separators and a type suffix), and a variant
+without a number, with a number that is not an integer literal, or that is
+not a unit variant is an error; every `AuditKind` and `ErrorKind` variant
+has exactly one arm `Enum::Name => <value>` (or, in the enum's own `impl`,
+`Self::Name`) in `fn token` and `fn code`, and a variant without one the
+reader can read is an error; every `impl Method for` block in the
+`envcloak-ipc` crate holds exactly one `const NAME` whose value is one
+string literal, and a `const NAME` of another form or elsewhere is an
+error; every entry of `REASONS` is one string literal. String literals are
+read in every form Rust has (plain, raw, byte and C strings), with their
+escapes decoded.
+
 The CLI's failure tokens are read from every crate's `src/` (comments and
 `#[cfg(test)]` modules left out): the first argument of `Failure::new` and
 of every function whose first parameter is `token: &'static str` (or
@@ -114,7 +129,7 @@ def read(root, rel):
 
 # --- Reading Rust source ---------------------------------------------------
 
-SCAN = re.compile(r"//|/\*|\bb?r#*\"|\"|'")
+SCAN = re.compile(r"//|/\*|\b[bc]?r#*\"|\b[bc]\"|\"|'")
 BLOCK_COMMENT = re.compile(r"/\*|\*/")
 STRING_END = re.compile(r"\\.|\"", re.S)
 CHAR = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|.)|[^\\'\n])'")
@@ -124,6 +139,8 @@ TEST_MOD = re.compile(
     r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{"
 )
 NOT_NEWLINE = re.compile(r"[^\n]")
+ESCAPE = re.compile(r"\\(?:([nrt0\\'\"])|x([0-9a-fA-F]{2})|u\{([0-9a-fA-F_]{1,8})\}|(\r?\n[ \t\r\n]*)|(.))", re.S)
+SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", "'": "'", '"': '"'}
 
 
 def _blanked(s):
@@ -140,16 +157,40 @@ def _blank_spans(text, spans):
     return "".join(out)
 
 
+def unescape(rel, s):
+    """The value of a non-raw Rust string literal's contents `s`."""
+
+    def one(m):
+        simple, byte, uni, continuation, other = m.groups()
+        if simple is not None:
+            return SIMPLE_ESCAPES[simple]
+        if byte is not None:
+            return chr(int(byte, 16))
+        if uni is not None:
+            digits = uni.replace("_", "")
+            try:
+                return chr(int(digits, 16))
+            except ValueError:
+                raise SourceError("%s: a string literal holds the escape `\\u{%s}`, which is no character" % (rel, uni))
+        if continuation is not None:
+            return ""
+        raise SourceError("%s: a string literal holds the escape `\\%s`, which the reader does not know" % (rel, other))
+
+    return ESCAPE.sub(one, s)
+
+
 class Source:
     """One Rust file as two views of the same length: `code`, with comments
     blanked, and `skel`, also with the inside of every string and character
     literal blanked, so that structure (braces, commas, `token:`) is found
     in `skel` and literals are read from `code` at the same offsets.
-    `#[cfg(test)]` modules are blanked in both."""
+    `#[cfg(test)]` modules are blanked in both. Every string literal, raw
+    (`r"..."`, `r#"..."#`), byte or C string or not, is kept by where it
+    starts, with its value: escapes decoded, raw contents as written."""
 
     def __init__(self, rel, text):
         self.rel = rel
-        comments, contents = [], []
+        comments, contents, strings = [], [], []
         n, i = len(text), 0
         while True:
             m = SCAN.search(text, i)
@@ -179,8 +220,9 @@ class Source:
                     i = c.end()
                 else:
                     i = s + 1
-            elif tok == '"':
-                j = s + 1
+            elif "r" not in tok:
+                quote = m.end() - 1
+                j = quote + 1
                 while True:
                     k = STRING_END.search(text, j)
                     if not k:
@@ -190,13 +232,15 @@ class Source:
                         j = k.start()
                         break
                     j = k.end()
-                contents.append((s + 1, j))
+                contents.append((quote + 1, j))
+                strings.append((s, quote, j, min(j + 1, n), False))
                 i = j + 1
             else:
                 close = '"' + tok[tok.index("r") + 1: -1]
                 j = text.find(close, m.end())
                 j = n if j < 0 else j
                 contents.append((m.end(), j))
+                strings.append((s, m.end() - 1, j, min(j + len(close), n), True))
                 i = j + len(close)
         self.code = _blank_spans(text, comments)
         self.skel = _blank_spans(text, comments + contents)
@@ -207,6 +251,14 @@ class Source:
         if tests:
             self.code = _blank_spans(self.code, tests)
             self.skel = _blank_spans(self.skel, tests)
+        # start -> (end, value); and the starts in order.
+        self.strings = {}
+        for start, quote, close, end, raw in strings:
+            if any(a <= start < b for a, b in tests):
+                continue
+            body = text[quote + 1: close]
+            self.strings[start] = (end, body if raw else unescape(rel, body))
+        self.starts = sorted(self.strings)
 
     def block_end(self, open_brace):
         """The offset just after the `}` that closes the `{` at `open_brace`."""
@@ -217,6 +269,51 @@ class Source:
                 return m.end()
         return len(self.skel)
 
+    def close_of(self, open_at):
+        """The offset of the bracket that closes the `(`, `[` or `{` at
+        `open_at`, counting all three kinds."""
+        depth = 0
+        for k in range(open_at, len(self.skel)):
+            ch = self.skel[k]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth == 0:
+                    return k
+        return len(self.skel)
+
+    def split_top(self, start, end):
+        """The parts of [start, end) between commas at bracket depth 0, as
+        (start, end, text), with attributes (`#[...]`) blanked in `text`;
+        empty parts are left out."""
+        view = list(self.skel[start:end])
+        parts, depth, a, k = [], 0, start, start
+        while k < end:
+            ch = self.skel[k]
+            if ch == "#" and depth == 0 and re.match(r"#!?\[", self.skel[k:k + 3]):
+                close = self.close_of(self.skel.index("[", k))
+                for x in range(k, min(close + 1, end)):
+                    view[x - start] = " "
+                k = close + 1
+                continue
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append((a, k))
+                a = k + 1
+            k += 1
+        parts.append((a, end))
+        text = "".join(view)
+        out = []
+        for x, y in parts:
+            part = text[x - start:y - start]
+            if part.strip():
+                out.append((x, y, part))
+        return out
+
     def fn_bodies(self, name):
         """Spans of the bodies of every `fn <name>`."""
         spans = []
@@ -226,27 +323,28 @@ class Source:
                 spans.append((k.start(), self.block_end(k.start())))
         return spans
 
-    def literal_at(self, quote):
-        """The string literal whose opening quote is at `quote`."""
-        close = self.skel.find('"', quote + 1)
-        return self.code[quote + 1: close if close >= 0 else len(self.code)]
+    def string_at(self, pos):
+        """(value, end) of the string literal that starts at `pos`, after
+        any whitespace; None if none starts there."""
+        while pos < len(self.skel) and self.skel[pos].isspace():
+            pos += 1
+        return self.strings.get(pos)
+
+    def only_string(self, start, end):
+        """The value of [start, end) if it is exactly one string literal,
+        else None."""
+        lit = self.string_at(start)
+        if lit is None or self.skel[lit[0]:end].strip():
+            return None
+        return lit[1]
 
     def literals(self, start, end):
-        """Every string literal that opens inside [start, end)."""
-        out, k = [], start
-        while True:
-            q = self.skel.find('"', k, end)
-            if q < 0:
-                return out
-            close = self.skel.find('"', q + 1)
-            if close < 0:
-                return out
-            out.append(self.code[q + 1: close])
-            k = close + 1
+        """The value of every string literal that starts inside [start, end)."""
+        return [self.strings[s][1] for s in self.starts if start <= s < end]
 
     def first_arg(self, open_paren):
-        """The text of the first argument of the call whose `(` is at
-        `open_paren`, from `code`."""
+        """The span of the first argument of the call whose `(` is at
+        `open_paren`."""
         depth, k = 0, open_paren + 1
         while k < len(self.skel):
             ch = self.skel[k]
@@ -259,38 +357,71 @@ class Source:
             elif ch == "," and depth == 0:
                 break
             k += 1
-        return self.code[open_paren + 1: k].strip()
+        return open_paren + 1, k
 
 
-def rust_sources(root):
-    """Every Rust file under `crates/<crate>/src/`, as `Source`s."""
+def rust_sources(root, crate=None):
+    """Every Rust file under `crates/<crate>/src/` (every crate's, or the
+    one named), as `Source`s."""
     out = []
     base = os.path.join(root, CRATES)
     try:
-        crates = sorted(os.listdir(base))
+        crates = sorted(os.listdir(base)) if crate is None else [crate]
     except OSError as e:
         raise SourceError("%s could not be listed (%s)" % (CRATES, e.strerror))
-    for crate in crates:
-        src = os.path.join(base, crate, "src")
+    for name in crates:
+        src = os.path.join(base, name, "src")
         for dirpath, dirnames, names in os.walk(src):
             dirnames.sort()
-            for name in sorted(names):
-                if name.endswith(".rs"):
-                    rel = os.path.relpath(os.path.join(dirpath, name), root)
+            for file in sorted(names):
+                if file.endswith(".rs"):
+                    rel = os.path.relpath(os.path.join(dirpath, file), root)
                     out.append(Source(rel, read(root, rel)))
     if not out:
-        raise SourceError("no Rust source under crates/*/src")
+        raise SourceError("no Rust source under crates/%s/src" % (crate or "*"))
     return out
 
 
 # --- Code registries ---------------------------------------------------------
 
+# An integer literal as a discriminant or a code: decimal, hexadecimal,
+# octal or binary, with `_` separators and an optional type suffix.
+INT = re.compile(r"(-?)\s*(?:0x([0-9A-Fa-f_]+)|0o([0-7_]+)|0b([01_]+)|([0-9][0-9_]*))(?:[iu](?:8|16|32|64|128|size))?")
 
-def enum_body(src, name):
-    m = re.search(r"pub enum %s\s*\{" % re.escape(name), src.skel)
+
+def int_value(text):
+    m = INT.fullmatch(text.strip())
+    if not m:
+        return None
+    for digits, base in zip(m.group(2, 3, 4, 5), (16, 8, 2, 10)):
+        if digits is not None:
+            digits = digits.replace("_", "")
+            if not digits:
+                return None
+            value = int(digits, base)
+            return -value if m.group(1) else value
+    return None
+
+
+def enum_variants(src, name):
+    """(variant, discriminant text or None) for every variant of `pub enum
+    <name>`. Only unit variants are read; any other form is an error, so a
+    variant is never skipped unread."""
+    m = re.search(r"\bpub enum %s\s*\{" % re.escape(name), src.skel)
     if not m:
         raise SourceError("%s has no `pub enum %s`" % (src.rel, name))
-    return src.code[m.end(): src.block_end(m.end() - 1) - 1]
+    start, end = m.end(), src.block_end(m.end() - 1) - 1
+    out = []
+    for _, _, text in src.split_top(start, end):
+        item = " ".join(text.split())
+        v = re.fullmatch(r"([A-Z][A-Za-z0-9]*)(?: ?= ?(.+))?", item)
+        if not v:
+            raise SourceError("%s: `%s` has a variant the reader cannot read (`%s`): it reads `Name` or `Name = <integer>`" % (src.rel, name, item[:60]))
+        out.append((v.group(1), v.group(2)))
+    if not out:
+        raise SourceError("%s: `%s` has no variants" % (src.rel, name))
+    unique_or_fail(src, "`%s` variant" % name, [v for v, _ in out])
+    return out
 
 
 def snake(name):
@@ -298,11 +429,16 @@ def snake(name):
 
 
 def numbered_variants(src, enum):
-    body = enum_body(src, enum)
-    found = [(v, int(n)) for v, n in re.findall(r"^\s*([A-Z][A-Za-z0-9]*)\s*=\s*(-?\d+)\s*,", body, re.M)]
-    if not found:
-        raise SourceError("%s: `%s` has no numbered variants" % (src.rel, enum))
-    unique_or_fail(src, "`%s` variant" % enum, [v for v, _ in found])
+    """(variant, number) for every variant of `enum`, each of which must
+    have an explicit integer discriminant."""
+    found = []
+    for v, d in enum_variants(src, enum):
+        if d is None:
+            raise SourceError("%s: `%s::%s` has no explicit number: every `%s` variant is written `%s = <number>`" % (src.rel, enum, v, enum, v))
+        n = int_value(d)
+        if n is None:
+            raise SourceError("%s: `%s::%s = %s` is not an integer literal the reader can read" % (src.rel, enum, v, d))
+        found.append((v, n))
     by_number = {}
     for v, n in found:
         by_number.setdefault(n, []).append(v)
@@ -320,71 +456,124 @@ def unique_or_fail(src, what, items):
         seen.add(item)
 
 
-def enum_arms(src, enum, fn, value):
-    """(variant, value) for every arm `Enum::A | Enum::B => <value>` in the
-    bodies of `fn <fn>` that match on `enum`, refusing a variant with two
-    arms and a value given to two variants."""
-    arm = re.compile(r"((?:%s::[A-Z][A-Za-z0-9]*\s*\|\s*)*%s::[A-Z][A-Za-z0-9]*)\s*=>\s*%s" % (enum, enum, value))
+def enum_arms(src, enum, fn, value, convert=lambda x: x):
+    """{variant: value} from every arm `Enum::A | Enum::B => <value>` (or
+    `Self::A`) in the bodies of `fn <fn>`, for every variant of `enum`:
+    a variant with no such arm, or with two, a value given to two variants
+    and an arm naming no variant are errors. `convert` turns the matched
+    text into the value, or None if it cannot."""
+    variants = [v for v, _ in enum_variants(src, enum)]
+    impls = [(m.end() - 1, src.block_end(m.end() - 1)) for m in re.finditer(r"\bimpl\s+%s\s*\{" % enum, src.skel)]
     pairs = []
     for start, end in src.fn_bodies(fn):
+        # `Self::` names the enum only in its own `impl` block.
+        names = "(?:%s|Self)" % enum if any(a < start < b for a, b in impls) else enum
+        path = r"%s::[A-Z][A-Za-z0-9]*" % names
+        arm = re.compile(r"((?:%s\s*\|\s*)*%s)\s*=>\s*%s" % (path, path, value))
         for m in arm.finditer(src.code, start, end):
-            for v in re.findall(r"%s::([A-Z][A-Za-z0-9]*)" % enum, m.group(1)):
-                pairs.append((v, m.group(2)))
-    if not pairs:
-        raise SourceError("%s: no `%s::<variant> => ...` arms in `fn %s`" % (src.rel, enum, fn))
+            x = convert(m.group(2))
+            if x is None:
+                raise SourceError("%s: `fn %s` gives `%s` a value the reader cannot read (`%s`)" % (src.rel, fn, m.group(1), m.group(2)))
+            for v in re.findall(r"(?:%s|Self)::([A-Z][A-Za-z0-9]*)" % enum, m.group(1)):
+                pairs.append((v, x))
     by_variant, by_value = {}, {}
     for v, x in pairs:
         by_variant.setdefault(v, []).append(x)
         by_value.setdefault(x, []).append(v)
     for v, xs in sorted(by_variant.items()):
+        if v not in variants:
+            raise SourceError("%s: `fn %s` has an arm for `%s::%s`, which is not a variant" % (src.rel, fn, enum, v))
         if len(xs) > 1:
-            raise SourceError("%s: `%s::%s` has more than one arm in `fn %s` (%s)" % (src.rel, enum, v, fn, ", ".join(xs)))
+            raise SourceError("%s: `%s::%s` has more than one arm in `fn %s` (%s)" % (src.rel, enum, v, fn, ", ".join(map(str, xs))))
     for x, vs in sorted(by_value.items()):
         if len(vs) > 1:
             raise SourceError("%s: `fn %s` gives `%s` to more than one `%s` variant (%s)" % (src.rel, fn, x, enum, ", ".join(vs)))
+    missing = [v for v in variants if v not in by_variant]
+    if missing:
+        raise SourceError("%s: `fn %s` has no `%s::<variant> => <value>` arm the reader can read for %s" % (src.rel, fn, enum, ", ".join(missing)))
     return {v: xs[0] for v, xs in by_variant.items()}
+
+
+TOKEN_VALUE = r"(?:r#*)?\"([a-z][a-z0-9_]*)\""
+CODE_VALUE = r"(-?\s*[0-9][0-9A-Za-z_]*)"
 
 
 def code_audit_kinds(root):
     src = Source(AUDIT_RS, read(root, AUDIT_RS))
     numbers = dict(numbered_variants(src, "AuditKind"))
-    tokens = enum_arms(src, "AuditKind", "token", r'"([a-z][a-z0-9_]*)"')
-    missing = sorted(set(numbers) ^ set(tokens))
-    if missing:
-        raise SourceError("%s: AuditKind variants without both a number and a token: %s" % (AUDIT_RS, ", ".join(missing)))
+    tokens = enum_arms(src, "AuditKind", "token", TOKEN_VALUE)
     return {tokens[v]: n for v, n in numbers.items()}
 
 
 def code_error_kinds(root):
     src = Source(PROTO_RS, read(root, PROTO_RS))
-    codes = enum_arms(src, "ErrorKind", "code", r"(-\d+)\b")
-    tokens = enum_arms(src, "ErrorKind", "token", r'"([a-z][a-z0-9_]*)"')
-    missing = sorted(set(codes) ^ set(tokens))
-    if missing:
-        raise SourceError("%s: ErrorKind variants without both a code and a token: %s" % (PROTO_RS, ", ".join(missing)))
-    return {tokens[v]: int(c) for v, c in codes.items()}
+    codes = enum_arms(src, "ErrorKind", "code", CODE_VALUE, int_value)
+    tokens = enum_arms(src, "ErrorKind", "token", TOKEN_VALUE)
+    return {tokens[v]: c for v, c in codes.items()}
 
 
 def code_reasons(root):
     src = Source(PROTO_RS, read(root, PROTO_RS))
-    m = re.search(r"pub const REASONS: &\[&str\] = &\[", src.skel)
+    m = re.search(r"\bpub const REASONS\s*:\s*&\s*\[\s*&\s*(?:'static\s+)?str\s*\]\s*=\s*&\s*\[", src.skel)
     if not m:
-        raise SourceError("%s has no `pub const REASONS`" % PROTO_RS)
-    end = src.skel.find("];", m.end())
-    found = src.literals(m.end(), end if end >= 0 else len(src.skel))
+        raise SourceError("%s has no `pub const REASONS: &[&str] = &[...]`" % PROTO_RS)
+    found = []
+    for a, b, _ in src.split_top(m.end(), src.close_of(m.end() - 1)):
+        value = src.only_string(a, b)
+        if value is None:
+            raise SourceError("%s: REASONS holds an entry that is not one string literal (`%s`)" % (PROTO_RS, " ".join(src.code[a:b].split())[:60]))
+        found.append(value)
     if not found:
         raise SourceError("%s: REASONS is empty" % PROTO_RS)
     unique_or_fail(src, "reason", found)
     return {r: PROTO_RS for r in found}
 
 
+IMPL_METHOD = re.compile(r"\bimpl\b[^{;]*?\bMethod\s+for\b[^{;]*\{")
+TRAIT_METHOD = re.compile(r"\btrait\s+Method\b[^{;]*\{")
+CONST_NAME = re.compile(r"\bconst\s+NAME\b")
+NAME_TYPE = re.compile(r"\s*:\s*&\s*(?:'static\s+)?str\s*([=;])")
+
+
 def code_methods(root):
-    src = Source(PROTO_RS, read(root, PROTO_RS))
-    found = [src.literal_at(m.end() - 1) for m in re.finditer(r"const NAME: &'static str = \"", src.skel)]
+    """Method names: the `const NAME` of every `impl Method for` block in
+    `envcloak-ipc`'s sources. A `const NAME` the reader cannot read (another
+    type, a value that is not one string literal, a malformed name), one
+    outside such a block (other than the trait's own declaration) and a
+    block without exactly one are errors, never skipped."""
+    found = {}
+    for src in rust_sources(root, "envcloak-ipc"):
+        impls = [(m.end() - 1, src.block_end(m.end() - 1)) for m in IMPL_METHOD.finditer(src.skel)]
+        traits = [(m.end() - 1, src.block_end(m.end() - 1)) for m in TRAIT_METHOD.finditer(src.skel)]
+        per_impl = {span: 0 for span in impls}
+        for m in CONST_NAME.finditer(src.skel):
+            t = NAME_TYPE.match(src.skel, m.end())
+            if not t:
+                raise SourceError("%s: a `const NAME` the reader cannot read: it reads `const NAME: &'static str = \"<method>\";`" % src.rel)
+            if t.group(1) == ";":
+                if any(a < m.start() < b for a, b in traits):
+                    continue
+                raise SourceError("%s: a `const NAME` without a value outside `trait Method`" % src.rel)
+            inside = [span for span in impls if span[0] < m.start() < span[1]]
+            if not inside:
+                raise SourceError("%s: a `const NAME` outside an `impl Method for` block" % src.rel)
+            lit = src.string_at(t.end())
+            if lit is None or not re.match(r"\s*;", src.skel[lit[0]:]):
+                raise SourceError("%s: a method's `const NAME` whose value is not one string literal" % src.rel)
+            name = lit[1]
+            if not METHOD.fullmatch(name):
+                raise SourceError("%s: method name %r is not a well-formed method name" % (src.rel, name))
+            if name in found:
+                raise SourceError("%s: method name `%s` appears twice" % (src.rel, name))
+            found[name] = src.rel
+            per_impl[inside[-1]] += 1
+        for span, count in sorted(per_impl.items()):
+            if count != 1:
+                line = src.skel.count("\n", 0, span[0]) + 1
+                raise SourceError("%s line %d: an `impl Method for` block with %d `const NAME` the reader can read, not one" % (src.rel, line, count))
     if not found:
-        raise SourceError("%s: no method `NAME` constants" % PROTO_RS)
-    unique_or_fail(src, "method name", found)
-    return {name: PROTO_RS for name in found}
+        raise SourceError("no `impl Method for` with a `const NAME` under crates/envcloak-ipc/src")
+    return found
 
 
 def tags(enum):
@@ -396,7 +585,7 @@ def tags(enum):
 
 
 STR_TYPE = r"(?:&\s*(?:'static\s+)?str|ExitToken)"
-CONST_DEF = re.compile(r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*%s\s*=\s*\"" % STR_TYPE)
+CONST_DEF = re.compile(r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*%s\s*=" % STR_TYPE)
 HELPER_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)\s*(?:<[^>]*>)?\s*\(\s*token\s*:\s*(?:&\s*'static\s+str|ExitToken)\b")
 CONST_REF = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)$")
 PRINTED_PREFIX = re.compile(r"envcloak: ([a-z][a-z0-9_]*):")
@@ -410,45 +599,53 @@ def code_exit_tokens(root):
     helpers = set()
     for src in sources:
         for m in CONST_DEF.finditer(src.skel):
-            consts.setdefault(m.group(1), set()).add(src.literal_at(m.end() - 1))
+            lit = src.string_at(m.end())
+            if lit is not None:
+                consts.setdefault(m.group(1), set()).add(lit[1])
         for m in HELPER_DEF.finditer(src.skel):
             if m.group(1) != "new":
                 helpers.add(m.group(1))
     found = {}
 
-    def take(value, src):
-        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
-            values = {value[1:-1]}
-        else:
-            m = CONST_REF.match(value)
-            values = consts.get(m.group(1), set()) if m else set()
-        for v in values:
-            if TOKEN.match(v):
-                found.setdefault(v, src.rel)
+    def take_value(value, src):
+        if TOKEN.match(value):
+            found.setdefault(value, src.rel)
+
+    def take(src, a, b):
+        """The argument or field value at [a, b): a string literal of any
+        form, or a constant by name."""
+        value = src.only_string(a, b)
+        if value is not None:
+            take_value(value, src)
+            return
+        m = CONST_REF.match(src.skel[a:b].strip())
+        for v in consts.get(m.group(1), ()) if m else ():
+            take_value(v, src)
 
     calls = [r"\bFailure::new\s*\("] + [r"(?<!\w)(?<!fn )%s\s*\(" % re.escape(h) for h in sorted(helpers)]
     call = re.compile("|".join(calls))
     for src in sources:
         for m in call.finditer(src.skel):
-            take(src.first_arg(m.end() - 1), src)
+            take(src, *src.first_arg(m.end() - 1))
         for m in re.finditer(r"\btoken\s*:\s*", src.skel):
             k = m.end()
-            if src.skel.startswith('"', k):
-                take('"%s"' % src.literal_at(k), src)
+            lit = src.string_at(k)
+            if lit is not None:
+                take_value(lit[1], src)
             else:
                 ident = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Z0-9_]*\b", src.skel[k:])
                 if ident:
-                    take(ident.group(0), src)
+                    take(src, k, k + ident.end())
         for start, end in src.fn_bodies("token"):
             for lit in src.literals(start, end):
-                take('"%s"' % lit, src)
+                take_value(lit, src)
             for ident in re.findall(r"\b[A-Z][A-Z0-9_]*\b", src.skel[start:end]):
-                if ident in consts:
-                    take(ident, src)
+                for v in consts.get(ident, ()):
+                    take_value(v, src)
         for lit in src.literals(0, len(src.skel)):
             m = PRINTED_PREFIX.match(lit)
             if m:
-                take('"%s"' % m.group(1), src)
+                take_value(m.group(1), src)
     if not found:
         raise SourceError("no CLI failure tokens found under crates/*/src")
     return found

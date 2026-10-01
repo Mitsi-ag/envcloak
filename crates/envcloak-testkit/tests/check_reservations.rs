@@ -8,6 +8,12 @@
 //! workspace's sources the code holds the entry, a code entry that neither
 //! a `landed` row nor the baseline of M1's entries accounts for, and a
 //! baseline that is missing, malformed or no longer what the code holds.
+//! Its readers take every form Rust gives a declaration (hexadecimal and
+//! other integer literals, `Self::` arms, raw strings, escapes, `&str`
+//! with or without `'static`, a method in any file of the protocol crate)
+//! and refuse any they cannot read (an implicit or computed discriminant,
+//! a tuple variant, a variant without an arm, a `const NAME` or a reason
+//! that is not one string literal), never skipping one.
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -749,6 +755,12 @@ fn an_unreserved_error_kind_outside_the_reserved_range_fails() {
     edit(
         &t,
         PROTO,
+        "    Internal,\n}",
+        "    Internal,\n    Fresh,\n}",
+    );
+    edit(
+        &t,
+        PROTO,
         "ErrorKind::Internal => -32099,",
         "ErrorKind::Internal => -32099,\n            ErrorKind::Fresh => -32000,",
     );
@@ -840,4 +852,309 @@ fn a_missing_or_malformed_baseline_fails() {
         &t,
         "`coverage` is not a registry whose code this script reads",
     );
+}
+
+// --- Readers that read every declaration or refuse it (Codex, PR #14) -----
+
+const AAD: &str = "crates/envcloak-core/src/crypto/aad.rs";
+
+/// Adds the line `variant` (as written, with its comma) to `AuditKind` and,
+/// when `token` is given, its arm in `fn token`.
+fn add_audit_variant(t: &TestHome, variant: &str, token: Option<(&str, &str)>) {
+    edit(
+        t,
+        RECORD,
+        "    Recover = 21,\n",
+        &format!("    Recover = 21,\n    {variant}\n"),
+    );
+    if let Some((name, token)) = token {
+        edit(
+            t,
+            RECORD,
+            "AuditKind::Run => \"run\",",
+            &format!("AuditKind::Run => \"run\",\n            AuditKind::{name} => \"{token}\","),
+        );
+    }
+}
+
+#[test]
+fn an_audit_kind_with_a_hexadecimal_number_is_read() {
+    // Codex's case: `Login = 0x04` was skipped, so neither the number it
+    // shares with `Revoke` nor its missing row was seen.
+    let t = fixture();
+    add_audit_variant(&t, "Login = 0x04,", Some(("Login", "login")));
+    assert_fails(
+        &t,
+        "`AuditKind` gives 4 to more than one variant (Revoke, Login)",
+    );
+    let t = fixture();
+    add_audit_variant(&t, "Login = 0x16,", Some(("Login", "login")));
+    assert_fails(
+        &t,
+        "the code has `login` = 22 in the reserved range with no `landed` row",
+    );
+    // Read as the number it is: 22 in any of Rust's forms lands `reveal`.
+    for number in ["0x16", "0o26", "0b1_0110", "2_2", "22u8"] {
+        let t = fixture();
+        add_audit_variant(
+            &t,
+            &format!("Reveal = {number},"),
+            Some(("Reveal", "reveal")),
+        );
+        edit(
+            &t,
+            VAULT,
+            "| 22 | `reveal` | M2-21 | reserved |",
+            "| 22 | `reveal` | M2-21 | landed |",
+        );
+        assert_passes(&t.home());
+    }
+}
+
+#[test]
+fn a_numbered_variant_without_its_number_fails() {
+    // Codex's case: an implicit `Login` was skipped. Every variant of a
+    // numbered registry is written with its number.
+    let t = fixture();
+    add_audit_variant(&t, "Login,", Some(("Login", "login")));
+    assert_fails(
+        &t,
+        "`AuditKind::Login` has no explicit number: every `AuditKind` variant is written `Login = <number>`",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        AAD,
+        "    FileBackup = 9,\n}",
+        "    FileBackup = 9,\n    Login,\n}",
+    );
+    assert_fails(&t, "`TableTag::Login` has no explicit number");
+}
+
+#[test]
+fn a_variant_the_reader_cannot_read_fails() {
+    let t = fixture();
+    add_audit_variant(&t, "Login = 21 + 1,", Some(("Login", "login")));
+    assert_fails(
+        &t,
+        "`AuditKind::Login = 21 + 1` is not an integer literal the reader can read",
+    );
+    let t = fixture();
+    add_audit_variant(&t, "Login(u8),", Some(("Login", "login")));
+    assert_fails(
+        &t,
+        "`AuditKind` has a variant the reader cannot read (`Login(u8)`)",
+    );
+    // Attributes and doc comments on a variant are not part of it.
+    let t = fixture();
+    add_audit_variant(
+        &t,
+        "/// Revealed.\n    #[doc = \"x, y\"]\n    Reveal = 22,",
+        Some(("Reveal", "reveal")),
+    );
+    edit(
+        &t,
+        VAULT,
+        "| 22 | `reveal` | M2-21 | reserved |",
+        "| 22 | `reveal` | M2-21 | landed |",
+    );
+    assert_passes(&t.home());
+}
+
+#[test]
+fn a_variant_without_a_token_arm_the_reader_can_read_fails() {
+    // A variant whose arm is missing, or written in a form the reader does
+    // not take, is named, never left out of the registry.
+    let t = fixture();
+    add_audit_variant(&t, "Login = 46,", None);
+    assert_fails(
+        &t,
+        "`fn token` has no `AuditKind::<variant> => <value>` arm the reader can read for Login",
+    );
+    let t = fixture();
+    add_audit_variant(&t, "Login = 46,", Some(("Login", "Login")));
+    assert_fails(&t, "the reader can read for Login");
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "    Internal,\n}",
+        "    Internal,\n    Fresh,\n}",
+    );
+    assert_fails(
+        &t,
+        "`fn code` has no `ErrorKind::<variant> => <value>` arm the reader can read for Fresh",
+    );
+}
+
+#[test]
+fn an_error_kind_arm_written_with_self_counts() {
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "    Internal,\n}",
+        "    Internal,\n    Fresh,\n}",
+    );
+    edit(
+        &t,
+        PROTO,
+        "ErrorKind::Internal => -32099,",
+        "ErrorKind::Internal => -32099,\n            Self::Fresh => -32_000,",
+    );
+    edit(
+        &t,
+        PROTO,
+        "ErrorKind::Internal => \"internal\",",
+        "ErrorKind::Internal => \"internal\",\n            Self::Fresh => \"fresh\",",
+    );
+    assert_fails(
+        &t,
+        "`error_kind`: the code has `fresh` = -32000, which no `landed` row reserves",
+    );
+}
+
+/// Appends a method to the copy of proto.rs, its `NAME` written `decl`.
+fn add_method_decl(t: &TestHome, decl: &str) {
+    let path = t.home().join(PROTO);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{text}\npub struct Added;\n\nimpl Method for Added {{\n    {decl}\n    type Params = NoParams;\n    type Output = LockedView;\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_method_named_by_a_raw_string_counts() {
+    // Codex's case: `const NAME: &'static str = r"pending.state";` was
+    // skipped. A raw string, `&str` without `'static` and an escape are
+    // each read as the name they hold.
+    for decl in [
+        "const NAME: &'static str = r\"pending.peek\";",
+        "const NAME: &'static str = r#\"pending.peek\"#;",
+        "const NAME: &str = \"pending.peek\";",
+        "const NAME : & 'static str=\"pending\\x2epeek\";",
+    ] {
+        let t = fixture();
+        add_method_decl(&t, decl);
+        assert_fails(
+            &t,
+            &format!(
+                "`method`: the code has `pending.peek` ({PROTO}), which no `landed` row reserves"
+            ),
+        );
+    }
+    let t = fixture();
+    add_method_decl(&t, "const NAME: &'static str = r\"pending.state\";");
+    edit(
+        &t,
+        IPC,
+        "| `pending.state` | M2-03 | reserved |",
+        "| `pending.state` | M2-03 | landed |",
+    );
+    assert_passes(&t.home());
+}
+
+#[test]
+fn a_method_name_the_reader_cannot_read_fails() {
+    for (decl, message) in [
+        (
+            "const NAME: &'static str = concat!(\"pending\", \".peek\");",
+            "a method's `const NAME` whose value is not one string literal",
+        ),
+        (
+            "const NAME: &'static str = Lock::NAME;",
+            "a method's `const NAME` whose value is not one string literal",
+        ),
+        (
+            "const NAME: &'static [u8] = b\"pending.peek\";",
+            "a `const NAME` the reader cannot read",
+        ),
+        (
+            "const NAME: &'static str = \"Pending.Peek\";",
+            "method name 'Pending.Peek' is not a well-formed method name",
+        ),
+    ] {
+        let t = fixture();
+        add_method_decl(&t, decl);
+        assert_fails(&t, message);
+    }
+    // A method in another file of the protocol crate is read too.
+    let t = fixture();
+    add_file(
+        &t,
+        "crates/envcloak-ipc/src/added.rs",
+        "impl crate::proto::Method for Added {\n    const NAME: &'static str = r\"pending.peek\";\n}\n",
+    );
+    assert_fails(
+        &t,
+        "`method`: the code has `pending.peek` (crates/envcloak-ipc/src/added.rs)",
+    );
+    // A `const NAME` outside an `impl Method for` block, or a block with
+    // none the reader can read, is named.
+    let t = fixture();
+    add_file(
+        &t,
+        "crates/envcloak-ipc/src/added.rs",
+        "impl Added {\n    const NAME: &'static str = \"pending.peek\";\n}\n",
+    );
+    assert_fails(&t, "a `const NAME` outside an `impl Method for` block");
+    let t = fixture();
+    add_file(
+        &t,
+        "crates/envcloak-ipc/src/added.rs",
+        "impl Method for Added {\n    type Params = NoParams;\n}\n",
+    );
+    assert_fails(
+        &t,
+        "an `impl Method for` block with 0 `const NAME` the reader can read, not one",
+    );
+}
+
+#[test]
+fn a_reason_in_a_raw_string_counts_and_one_the_reader_cannot_read_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "    \"not_text\",\n",
+        "    \"not_text\",\n    r\"new_m2_reason\",\n",
+    );
+    assert_fails(
+        &t,
+        "`reason`: the code has `new_m2_reason` (crates/envcloak-ipc/src/proto.rs), which no `landed` row reserves",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "    \"not_text\",\n",
+        "    \"not_text\",\n    NEW_REASON,\n",
+    );
+    assert_fails(
+        &t,
+        "REASONS holds an entry that is not one string literal (`NEW_REASON`)",
+    );
+}
+
+#[test]
+fn a_failure_token_in_a_raw_string_or_with_an_escape_counts() {
+    for text in [
+        "pub fn gone() -> Failure { Failure::new(r\"brand_new_failure\", \"gone\") }\n",
+        "const GONE: &'static str = r#\"brand_new_failure\"#;\npub fn gone() -> Failure { Failure::new(GONE, \"gone\") }\n",
+        "pub fn gone() -> Failure { Failure::new(\"brand\\x5fnew\\u{5f}failure\", \"gone\") }\n",
+        "pub fn gone() -> Report { Report { token: r\"brand_new_failure\" } }\n",
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, text);
+        assert_fails(
+            &t,
+            &format!(
+                "`exit_token`: the code has `brand_new_failure` ({CLIENT_STUB}), which no `landed` row reserves"
+            ),
+        );
+    }
 }
