@@ -712,6 +712,11 @@ fn an_empty_passphrase_line_sends_nothing() {
     f.sweep();
 }
 
+/// How long [`on_the_agents_terminal`]'s shell waits at any one step
+/// before it ends by itself, should the test process die first: longer
+/// than any test waits.
+const SCENE_DEADLINE_SECS: u64 = 300;
+
 /// A shell on a pseudo-terminal of its own, as a person's terminal
 /// window, runs `agent -- /bin/sh <fifo` in the background, as a person
 /// starts an agent there, and has the agent's shell run `envcloak run --
@@ -722,8 +727,13 @@ fn an_empty_passphrase_line_sends_nothing() {
 /// ancestry, then runs `envcloak approve` for it, with the passphrase on
 /// descriptor 3. Once `go` is written, the agent's shell runs `envcloak
 /// run` once more, the same way. Each step writes its files in the
-/// returned directory.
-fn on_the_agents_terminal(f: &Fixture, agent: &Path, through: Option<&Path>) -> (Child, PathBuf) {
+/// scene's directory.
+///
+/// The shell never waits for ever: each wait also ends when the test
+/// asks it to stop ([`Scene`]'s drop) or at its deadline. It then closes
+/// the agent's input, waits for the agent, appends how it ended to
+/// `ended` (`done`, `stopped` or `deadline`) and exits.
+fn on_the_agents_terminal(f: &Fixture, agent: &Path, through: Option<&Path>) -> Scene {
     let dir = f.home.root().join("sibling");
     std::fs::create_dir_all(&dir).unwrap();
     let at = |name: &str| quoted(dir.join(name).to_str().unwrap());
@@ -733,22 +743,29 @@ fn on_the_agents_terminal(f: &Fixture, agent: &Path, through: Option<&Path>) -> 
     });
     let script = format!(
         "set -u\n\
+         end() {{ exec 4>&-; wait; echo \"$1\" >>{ended}; exit 0; }}\n\
+         upto() {{ n=0; while [ ! \"$1\" \"$2\" ]; do \
+         if [ -e {stop} ]; then end stopped; fi; \
+         if [ $n -ge {max} ]; then end deadline; fi; \
+         sleep 0.05; n=$((n+1)); done; }}\n\
          mkfifo {fifo}\n\
          {agent} -- /bin/sh <{fifo} >/dev/null 2>&1 &\n\
          exec 4>{fifo}\n\
          echo \"cd {project}; {through}{cli} run -- ./emit 2>{run_err}; echo \\$? >{run_code}\" >&4\n\
-         while [ ! -s {run_code} ]; do sleep 0.05; done\n\
+         upto -s {run_code}\n\
          id=$(sed -n 's/.*request=\\([0-9A-Z]*\\).*/\\1/p' {run_err} | head -n 1)\n\
          exec 3<{pass}\n\
          {cli} approve \"$id\" --passphrase-fd 3 >{out} 2>{err}\n\
          echo $? >{code}\n\
          cat <&3 | wc -c >{left}\n\
          exec 3<&-\n\
-         while [ ! -e {go} ]; do sleep 0.05; done\n\
+         upto -e {go}\n\
          echo \"{through}{cli} run -- /bin/sh -c true >/dev/null 2>{rerun_err}; echo \\$? >{rerun_code}\" >&4\n\
-         while [ ! -s {rerun_code} ]; do sleep 0.05; done\n\
-         exec 4>&-\n\
-         wait\n",
+         upto -s {rerun_code}\n\
+         end done\n",
+        ended = at("ended"),
+        stop = at("stop"),
+        max = SCENE_DEADLINE_SECS * 20,
         fifo = at("agent.in"),
         agent = quoted(agent.to_str().unwrap()),
         project = quoted(f.project.to_str().unwrap()),
@@ -763,14 +780,91 @@ fn on_the_agents_terminal(f: &Fixture, agent: &Path, through: Option<&Path>) -> 
         rerun_err = at("rerun.err"),
         rerun_code = at("rerun.code"),
     );
-    let child = common::on_terminal_program(
+    let mut cmd = common::on_terminal_program(
         &f.home,
         &[Path::new("/bin/sh"), Path::new("-c"), Path::new(&script)],
         &[],
-    )
-    .spawn()
-    .unwrap();
-    (child, dir)
+    );
+    // Nothing reads the driver's output while the scene runs, so it goes
+    // to a file, where a full pipe cannot stop the shell.
+    let shell_err = std::fs::File::create(dir.join("shell.err")).unwrap();
+    cmd.stdout(Stdio::null()).stderr(shell_err);
+    Scene {
+        child: cmd.spawn().unwrap(),
+        dir,
+        reaped: false,
+    }
+}
+
+/// [`on_the_agents_terminal`]'s scene: its directory, and the terminal's
+/// pseudo-terminal driver, the one process the test spawned for it,
+/// which exits once the shell has. Dropped before the test lets the
+/// shell end (a failed assertion, a timeout), it asks the shell to stop
+/// and waits a minute for the driver; only a driver still running then,
+/// unreaped and so still the test's own, is killed.
+struct Scene {
+    child: Child,
+    dir: PathBuf,
+    reaped: bool,
+}
+
+impl Scene {
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// What the shell recorded of how it ended, so far.
+    fn ended(&self) -> String {
+        std::fs::read_to_string(self.dir.join("ended")).unwrap_or_default()
+    }
+
+    /// Waits up to `limit` for the driver to exit, and reaps it. Returns
+    /// whether it did.
+    fn exited_within(&mut self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.reaped = true;
+                    return true;
+                }
+                Ok(None) if Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Lets the agent run its second command, and returns that run's exit
+    /// code once the terminal's shell has ended.
+    fn run_again_and_end(mut self, f: &Fixture) -> String {
+        std::fs::write(self.dir.join("go"), b"").unwrap();
+        let code = read_line_file(&self.dir, "rerun.code");
+        assert!(
+            self.exited_within(Duration::from_secs(30)),
+            "the terminal's shell did not end"
+        );
+        assert_eq!(self.ended(), "done\n");
+        for name in ["run.err", "approve.err", "rerun.err", "shell.err"] {
+            let bytes = std::fs::read(self.dir.join(name)).unwrap_or_default();
+            assert_no_canary(&bytes, &f.cs);
+        }
+        code.trim().to_owned()
+    }
+}
+
+impl Drop for Scene {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = std::fs::write(self.dir.join("stop"), b"");
+        if !self.exited_within(Duration::from_secs(60)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 /// A file [`on_the_agents_terminal`] writes, once it ends with a newline;
@@ -823,23 +917,6 @@ fn sibling_was_refused(f: &Fixture, dir: &Path) -> String {
     id
 }
 
-/// Lets [`on_the_agents_terminal`]'s agent run its second command, and
-/// returns that run's exit code once the terminal's shell has ended.
-fn run_again_and_end(f: &Fixture, mut child: Child, dir: &Path) -> String {
-    std::fs::write(dir.join("go"), b"").unwrap();
-    let code = read_line_file(dir, "rerun.code");
-    let end = Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < end, "the terminal's shell did not end");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    for name in ["run.err", "approve.err", "rerun.err"] {
-        let bytes = std::fs::read(dir.join(name)).unwrap_or_default();
-        assert_no_canary(&bytes, &f.cs);
-    }
-    code.trim().to_owned()
-}
-
 /// Review T9 open 3 (gate 23: approval input is never read from the
 /// requester's terminal). A shell on a pseudo-terminal runs the fixture
 /// agent in the background, and the agent's `envcloak run` is pending. A
@@ -851,16 +928,17 @@ fn run_again_and_end(f: &Fixture, mut child: Child, dir: &Path) -> String {
 #[test]
 fn an_approval_from_the_agents_terminal_is_refused() {
     let f = Fixture::new();
-    let (child, dir) = on_the_agents_terminal(&f, &testkit_bin("fixture-agent"), None);
-    let id = sibling_was_refused(&f, &dir);
+    let scene = on_the_agents_terminal(&f, &testkit_bin("fixture-agent"), None);
+    let id = sibling_was_refused(&f, scene.dir());
 
     // From a terminal of its own, a person approves it.
     f.approve(&id, &[]);
+    let rerun_err = scene.dir().join("rerun.err");
     assert_eq!(
-        run_again_and_end(&f, child, &dir),
+        scene.run_again_and_end(&f),
         "0",
         "{}",
-        std::fs::read_to_string(dir.join("rerun.err")).unwrap_or_default()
+        std::fs::read_to_string(rerun_err).unwrap_or_default()
     );
     f.sweep();
 }
@@ -885,16 +963,45 @@ fn an_approval_from_the_terminal_of_an_extension_agent_is_refused() {
     std::fs::create_dir_all(&bin).unwrap();
     let agent = bin.join("ext-agent");
     std::fs::copy(testkit_bin("fixture-agent"), &agent).unwrap();
-    let (child, dir) = on_the_agents_terminal(&f, &agent, Some(&testkit_bin("ec-probe")));
-    let id = sibling_was_refused(&f, &dir);
+    let scene = on_the_agents_terminal(&f, &agent, Some(&testkit_bin("ec-probe")));
+    let id = sibling_was_refused(&f, scene.dir());
 
     let shown = f.approve(&id, &[]);
     assert!(shown.contains("Extension test agent"), "{shown}");
+    let rerun_err = scene.dir().join("rerun.err");
     assert_eq!(
-        run_again_and_end(&f, child, &dir),
+        scene.run_again_and_end(&f),
         "125",
         "{}",
-        std::fs::read_to_string(dir.join("rerun.err")).unwrap_or_default()
+        std::fs::read_to_string(rerun_err).unwrap_or_default()
+    );
+    f.sweep();
+}
+
+/// The harness of the two tests above leaves nothing running when a test
+/// fails before it lets the agent run again (an assertion on what the
+/// sibling saw, as under review F-70's mutation): before, the terminal's
+/// shell waited for `go` for ever, with the agent and the pseudo-terminal
+/// driver, after the test and its home were gone. Dropping the scene
+/// where such a test fails asks the shell to stop: it closes the agent's
+/// input, waits for the agent, records `stopped` and exits, and the
+/// driver exits with it, unkilled.
+#[test]
+fn a_terminal_scene_dropped_by_a_failing_test_ends() {
+    let f = Fixture::new();
+    let scene = on_the_agents_terminal(&f, &testkit_bin("fixture-agent"), None);
+    // The sibling's approval is over: the shell now waits for `go`.
+    read_line_file(scene.dir(), "left");
+    let ended = scene.dir().join("ended");
+    let start = Instant::now();
+    drop(scene);
+    // Recorded once the agent was waited for; and the driver was reaped
+    // before the drop's minute was up, so it was never killed.
+    assert_eq!(std::fs::read_to_string(ended).unwrap(), "stopped\n");
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        start.elapsed()
     );
     f.sweep();
 }
