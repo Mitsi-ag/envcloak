@@ -4,6 +4,24 @@ name: CI
 # every lint and boundary check and every test except the end-to-end
 # fixture story and the release-build job. Pushes to main, the nightly run and
 # manual runs keep the full suite, so nothing merged skips a gate.
+#
+# The M2 trigger table (M2 plan §6, landed by task M2-04):
+#
+# | Trigger      | Linux                                       | macOS                  |
+# |--------------|---------------------------------------------|------------------------|
+# | Pull request | lint, unit and integration as above; the    | none automatically; a  |
+# |              | path-filtered `gates` job (the story steps  | task on macOS-specific |
+# |              | in crates/envcloak-e2e/tests/m2_story/ with | paths links a green    |
+# |              | the pinned hosts); `agents-e2e` when        | manual run of its gate |
+# |              | envcloak-agents, envcloak-mcp, the agent    | modules on its branch  |
+# |              | harness or integrations/ change             |                        |
+# | Push to main | everything, `agents-e2e` with the stories   | the same               |
+# | Nightly      | everything, `release-check-models`          | the same               |
+# | Manual       | everything                                  | the same               |
+#
+# On Linux the agent hosts run with loopback only (`unshare -rn`). A main
+# run is never cancelled by the next merge: only pull-request runs cancel
+# their predecessors.
 on:
   push:
     branches: [main]
@@ -17,7 +35,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -268,3 +286,164 @@ jobs:
           python3 scripts/check-crate-graph.py
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check --workspace --all-targets --all-features --locked
+
+  # Which of the M2 agent jobs a pull request needs, from the paths it
+  # changes. Every other event runs them all.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      gates: ${{ steps.paths.outputs.gates }}
+      agents: ${{ steps.paths.outputs.agents }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "gates=true" >> "$GITHUB_OUTPUT"
+            echo "agents=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE"...HEAD)"
+          printf '%s\n' "$changed"
+          harness='^(crates/envcloak-e2e/agents/|crates/envcloak-testkit/src/(agents|transcripts)\.rs|crates/envcloak-testkit/src/bin/ec-model\.rs|scripts/install-agent-hosts\.py|\.github/workflows/ci\.yml)'
+          gates="$harness|^crates/envcloak-e2e/tests/m2b?_story/"
+          agents="$harness|^crates/envcloak-agents/|^crates/envcloak-mcp/|^integrations/"
+          if printf '%s\n' "$changed" | grep -Eq "$gates"; then
+            echo "gates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gates=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$changed" | grep -Eq "$agents"; then
+            echo "agents=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "agents=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The story steps the task being landed adds (M2 plan §6): the m2_story
+  # target, with the pinned Claude Code and Codex from the host cache, on
+  # Linux with loopback only. Pull requests only; main runs them in
+  # `agents-e2e` on both systems.
+  gates:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.gates == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
+      ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: agents
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Agent hosts from the cache, keyed by their pins
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../agent-hosts
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/versions.toml', 'scripts/install-agent-hosts.py') }}
+      - name: Install and verify the pinned tier-1 hosts
+        run: python3 scripts/install-agent-hosts.py --tier 1
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Build
+        run: |
+          cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
+          cargo test --locked -p envcloak-e2e --test m2_story --no-run
+      - name: Story steps, loopback only
+        run: |
+          unshare --user --map-root-user --net -- sh -ec \
+            'ip link set lo up; exec cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1'
+
+  # The pinned agent hosts against the scripted model (M2-04's harness,
+  # probes and measurements; later tasks add theirs). Linux on pull
+  # requests that touch envcloak-agents, envcloak-mcp, the harness or
+  # integrations/; both systems, with the story steps, on main, nightly
+  # and manual runs. `measurement:` lines feed docs/AGENTS.md.
+  agents-e2e:
+    needs: changes
+    if: needs.changes.outputs.agents == 'true'
+    name: agents-e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+    env:
+      ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
+      ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
+      TESTS: ${{ github.event_name == 'pull_request' && '--test agent_hosts' || '--test agent_hosts --test m2_story' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: agents
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Agent hosts from the cache, keyed by their pins
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../agent-hosts
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/versions.toml', 'scripts/install-agent-hosts.py') }}
+      - name: Install and verify the pinned hosts (tier 1 and tier 2)
+        run: python3 scripts/install-agent-hosts.py --tier all
+      - name: Allow unprivileged user namespaces (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Build
+        run: |
+          cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
+          cargo test --locked -p envcloak-e2e $TESTS --no-run
+      - name: Agent hosts, loopback only (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          unshare --user --map-root-user --net -- sh -ec \
+            "ip link set lo up; exec cargo test --locked --offline -p envcloak-e2e $TESTS -- --nocapture --test-threads=1"
+      - name: Agent hosts (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p envcloak-e2e $TESTS -- --nocapture --test-threads=1
+
+  # The real-model release check (M2 plan D-13, Q-01): manual and nightly
+  # only, with dedicated low-limit keys from Actions secrets, which pull
+  # requests from forks never get. From V1 (M2-08's instruction block) it
+  # runs the M2 instruction-block prompts against real Claude Code and
+  # Codex models, n = 5 per host and system per night, and records use
+  # rates in docs/COMPAT.md. Until then, and whenever its keys are not
+  # configured, it says so and runs nothing: it never reads as a pass.
+  release-check-models:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: release-check-models (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: What runs
+        env:
+          ANTHROPIC_KEY_SET: ${{ secrets.ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY != '' }}
+          OPENAI_KEY_SET: ${{ secrets.ENVCLOAK_RELEASE_CHECK_OPENAI_KEY != '' }}
+        run: |
+          if [ "$ANTHROPIC_KEY_SET" != "true" ] || [ "$OPENAI_KEY_SET" != "true" ]; then
+            msg="not run: ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY and ENVCLOAK_RELEASE_CHECK_OPENAI_KEY are not both configured"
+          else
+            msg="not run: the M2 instruction-block prompts land with M2-08 (V1); nothing to measure before them"
+          fi
+          echo "::warning title=release-check-models::$msg"
+          echo "release-check-models: $msg" >> "$GITHUB_STEP_SUMMARY"
