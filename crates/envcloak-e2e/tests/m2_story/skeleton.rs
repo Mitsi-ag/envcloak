@@ -318,6 +318,8 @@ fn s0(host: Host, name: &str) {
     let mut cs = h.canaries.clone();
     cs.push(control.clone());
     let hits = Sweep::host_stores(&agent, &cs, &[&run.model]);
+    // A store the sweep could not read is no clean result.
+    assert_eq!(hits.unreadable(), 0, "{hits}");
     let store = match host {
         Host::ClaudeCode => "claude/projects",
         Host::Codex => "codex/sessions",
