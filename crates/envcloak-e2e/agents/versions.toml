@@ -25,10 +25,13 @@
 
 # Node.js, which runs every npm host's entry script (`interpreter =
 # "node"`) and their `npm ci`: the official build, pinned by version, by
-# the SHA-256 of its archive (as nodejs.org's SHASUMS256.txt lists it) and
-# by that of its bin/node. The installer puts it in the cache beside the
-# hosts; the harness runs node hosts with it and checks its hash with the
-# host's, so no Node found on PATH is ever used.
+# the SHA-256 of its archive (as nodejs.org's SHASUMS256.txt lists it), by
+# that of its bin/node, and by the installer's digest of its whole
+# extracted tree (`tree_sha256`: every path, file and link, its npm
+# included). The installer puts it in the cache beside the hosts, checks
+# the whole tree again before each use, and runs npm only with a Node it
+# verified that run; the harness runs node hosts with it and checks its
+# bin/node hash with the host's, so no Node found on PATH is ever used.
 [node]
 version = "22.23.3"
 
@@ -43,6 +46,10 @@ linux-x64 = "df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de"
 [node.sha256]
 darwin-arm64 = "68f4d07ca49e0500cc135c7e0a445093e228e42e126ac22306d045f0a8c2636b"
 linux-x64 = "fde6a4bf8d0562f7751d1a2d6cb9b417c4cfe107bbcb0aa3e9a24e125e348f48"
+
+[node.tree_sha256]
+darwin-arm64 = "50c7196e2751a2336079f05f50a4bd220dca035cfa9f3bb8fb8acaa43b985f9e"
+linux-x64 = "9480f03571438d3e0c800174f657e2f529ce647d443d7dc040034ae675e8febf"
 
 # Claude Code, the native build (the documented install).
 [[host]]
