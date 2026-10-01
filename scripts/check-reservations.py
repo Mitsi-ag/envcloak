@@ -27,10 +27,13 @@ which a task uses again for a new case). This script refuses:
 - against the code, where the registry has a source the script reads: a
   `reserved` row whose name or number the code already uses, a `landed`
   row the code does not hold exactly so, a `reuse` row the code does not
-  hold, and, in a numbered table, a code entry in the reserved range with
-  no `landed` row. A code source that yields nothing is an error, never an
-  empty registry, and so is a code source that gives one number or token
-  to two entries, or two tokens or codes to one.
+  hold, and a code entry that no `landed` or `reuse` row accounts for and
+  that is not in the baseline, scripts/check-reservations-baseline.txt:
+  the entries the code held before the reservations (M1), which only
+  shrinks. A baseline line the code no longer holds exactly so is refused
+  too. A code source that yields nothing is an error, never an empty
+  registry, and so is a code source that gives one number or token to two
+  entries, or two tokens or codes to one.
 
 The CLI's failure tokens are read from every crate's `src/` (comments and
 `#[cfg(test)]` modules left out): the first argument of `Failure::new` and
@@ -39,10 +42,12 @@ of every function whose first parameter is `token: &'static str` (or
 `fn token`, and the `<token>` of every string literal that starts
 `envcloak: <token>:` (a line printed directly, as `eprintln!` does for
 `coverage`, `warning` and `usage`), whatever crate it is in. A value
-written as a `&str` constant counts by the constant's string. The reader over-counts rather
-than under-counts: a string it takes for a token that is not printed only
-makes a `reserved` row with that name fail, which is a name to avoid
-anyway.
+written as a `&str` constant counts by the constant's string. The reader
+over-counts rather than under-counts: a string it takes for a token that
+is not printed makes a `reserved` row with that name fail, which is a
+name to avoid anyway, and a new one needs a `landed` row like any token.
+It also takes the tokens of audit kinds, error kinds and reasons, so a
+`landed` or `reuse` row in any table accounts for a failure token.
 
 Usage: scripts/check-reservations.py [--root <repository root>]
 Prints "check-reservations: ok" and exits 0, or names every problem on
@@ -85,6 +90,7 @@ AUDIT_RS = "crates/envcloak-core/src/audit/record.rs"
 AAD_RS = "crates/envcloak-core/src/crypto/aad.rs"
 PROTO_RS = "crates/envcloak-ipc/src/proto.rs"
 CRATES = "crates"
+BASELINE = "scripts/check-reservations-baseline.txt"
 
 problems = []
 
@@ -648,7 +654,39 @@ def read_code(root):
     return out
 
 
-def check_code(reg, rows, code):
+def read_baseline(root):
+    """The entries each registry with a code source held before the
+    reservations, as {registry: {name: number, or None if unnumbered}}."""
+    out = {reg: {} for reg, spec in REGISTRIES.items() if spec["code"] is not None}
+    text = read(root, BASELINE)
+    for lineno, line in enumerate(text.split("\n"), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        where = "%s line %d" % (BASELINE, lineno)
+        reg = parts[0]
+        if reg not in out:
+            fail("%s: `%s` is not a registry whose code this script reads" % (where, reg))
+            continue
+        numbered = "num" in REGISTRIES[reg]
+        if len(parts) != (3 if numbered else 2) or (numbered and not re.fullmatch(r"-?[0-9]+", parts[2])):
+            fail("%s: not `%s <name>%s`" % (where, reg, " <number>" if numbered else ""))
+            continue
+        if parts[1] in out[reg]:
+            fail("%s: `%s %s` is listed twice" % (where, reg, parts[1]))
+            continue
+        out[reg][parts[1]] = int(parts[2]) if numbered else None
+    return out
+
+
+def check_code(reg, rows, code, base, elsewhere):
+    """Checks one table against the code: each row as its status says, and,
+    with `base` (the registry's baseline), each code entry as one the code
+    held before the reservations or one a `landed` or `reuse` row accounts
+    for. `elsewhere` holds the names a `landed` or `reuse` row of any table
+    accounts for, which also account for a failure token, since that reader
+    also takes the tokens of audit kinds, error kinds and reasons."""
     spec = REGISTRIES[reg]
     where = "%s `%s`" % (spec["doc"], reg)
     if code is None:
@@ -674,12 +712,27 @@ def check_code(reg, rows, code):
                 fail("%s: `%s` is `%s`, but the code has no such entry" % (where, key, status))
             elif numbered and code[key] != number:
                 fail("%s: `%s` is %d here and %d in the code" % (where, key, number, code[key]))
-    if numbered:
-        lo, hi = spec["range"]
-        landed = {(k, n) for k, n, s, _ in rows if s in ("landed", "reuse")}
-        for key, number in sorted(code.items(), key=lambda kv: kv[1]):
-            if lo <= number <= hi and (key, number) not in landed:
-                fail("%s: the code has `%s` = %d in the reserved range with no `landed` row for it" % (where, key, number))
+    if base is None:
+        return
+    accounted = {k for k, _, s, _ in rows if s in ("landed", "reuse")}
+    if reg == "exit_token":
+        accounted |= elsewhere
+    for key, value in sorted(code.items()):
+        if key in accounted or (key in base and (not numbered or base[key] == value)):
+            continue
+        if numbered:
+            lo, hi = spec["range"]
+            if lo <= value <= hi:
+                fail("%s: the code has `%s` = %d in the reserved range with no `landed` row for it" % (where, key, value))
+            else:
+                fail("%s: the code has `%s` = %d, which no `landed` row reserves and %s does not hold: reserve a number in the range %d to %d and mark it `landed`" % (where, key, value, BASELINE, lo, hi))
+        else:
+            fail("%s: the code has `%s` (%s), which no `landed` row reserves and %s does not hold: reserve it in this table and mark it `landed`" % (where, key, value, BASELINE))
+    for key, number in sorted(base.items()):
+        if key not in code or (numbered and code[key] != number):
+            held = "" if not numbered else " = %d" % number
+            now = "no such entry" if key not in code else "it as %d" % code[key]
+            fail("%s holds `%s %s`%s, but the code has %s: an entry before the reservations is never renumbered or kept once gone, so remove the line" % (BASELINE, reg, key, held, now))
 
 
 def check_printed_namespace(checked, codes):
@@ -725,9 +778,15 @@ def main(argv):
     checked = {}
     for reg, rows in tables.items():
         checked[reg] = check_rows(reg, rows)
+    try:
+        baseline = read_baseline(root)
+    except SourceError as e:
+        fail(str(e))
+        baseline = {}
+    elsewhere = {k for rows in checked.values() for k, _, s, _ in rows if s in ("landed", "reuse")}
     codes = read_code(root)
     for reg, rows in checked.items():
-        check_code(reg, rows, codes[reg])
+        check_code(reg, rows, codes[reg], baseline.get(reg), elsewhere)
     check_printed_namespace(checked, codes)
     if problems:
         for p in problems:
