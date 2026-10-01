@@ -19,7 +19,9 @@
 //!   open.
 //! - [`sync_file`]: durable writes, with `F_FULLFSYNC` on macOS.
 //! - The daemon's socket and lifecycle: [`peer_identity`] and [`peer_uid`]
-//!   (who is on the other end of a Unix socket), [`try_lock_exclusive`]
+//!   (who is on the other end of a Unix socket), [`connect_unix`] (a
+//!   client's connection, bounded in time from before the connect),
+//!   [`try_lock_exclusive`]
 //!   (`flock`), [`TerminationSignals`] (`sigwait` on SIGTERM, SIGINT and
 //!   SIGHUP), and [`awake_time`] and [`time_including_sleep`] (the clock
 //!   pair that shows the machine slept).
@@ -65,6 +67,7 @@ mod peer;
 mod perm;
 mod proc;
 mod signal;
+mod sock;
 mod sync;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -103,5 +106,6 @@ pub use proc::{
     proc_info, reaches_top,
 };
 pub use signal::{TerminationSignals, TerminationWatch, exit_by_signal, termination_recorded};
+pub use sock::connect_unix;
 pub use sync::{SyncMethod, sync_file};
 pub use tty::{SecretInput, hung_up, wait_readable, wait_writable};

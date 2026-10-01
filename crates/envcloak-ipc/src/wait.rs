@@ -26,9 +26,26 @@
 //!
 //! The wait ends at its deadline, at most [`MAX_WAIT`] (the pending
 //! request's lifetime): the last poll is made at the deadline itself, and a
-//! request still pending then is [`Finish::TimedOut`]. Nothing here reads
-//! a terminal or any input: approval input is never read from the
-//! requesting process's terminal.
+//! request still pending then is [`Finish::TimedOut`]; so is one told
+//! `unknown` at or after the deadline, which is not asked again. Only
+//! `approved` is still asked again then, once: the approval came within the
+//! wait. Nothing here reads a terminal or any input: approval input is
+//! never read from the requesting process's terminal.
+//!
+//! **Bounded.** No call of a wait is answered later than its limit, the
+//! deadline plus [`CALL_GRACE`] ([`Wait::limit`]), whatever the daemon
+//! does: each call is given only the time left to the limit, for its
+//! connect, its writes and each read ([`Client::connect_within`]); none is
+//! made once the limit has passed; and an answer read after it is dropped
+//! unused, a covered one's values wiped with it, and the wait ends
+//! [`Waited::Unanswered`], so nothing is started late.
+//!
+//! **Traced.** Before each `run.request`, whose answer may carry values,
+//! the driver asks whether a tracer is now attached to this process
+//! ([`Transport::traced`]); if one is, the wait ends [`Waited::Traced`]
+//! without asking. `envcloak run` checks once before its first request
+//! (gate 19); a wait can last minutes, so the check is made again before
+//! every request that could release values (SPEC §5 "Process hardening").
 //!
 //! [`Wait`] is the decision alone, a state machine fed the answers and the
 //! time, so it can be driven by a test's clock as well as by
@@ -40,6 +57,7 @@ use std::time::{Duration, Instant};
 use envcloak_policy::{PENDING_TTL, PendingId, PendingState};
 
 use crate::client::{Client, ClientError};
+use crate::frame::FrameError;
 use crate::paths::RunPaths;
 use crate::proto::{ErrorKind, RpcError, RunAnswer, RunRequestParams};
 use crate::view::DecisionView;
@@ -55,6 +73,12 @@ pub const FAST_POLLS: u32 = 4;
 pub const SLOW_POLL: Duration = Duration::from_secs(1);
 /// The longest pause `busy` and `too_many_pending` grow it to.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// How long after the deadline a call may still be answered: the last
+/// poll is made at the deadline itself, and a request approved by then is
+/// asked again once, which the daemon answers after writing its audit
+/// entry durably. Nothing of a wait is answered later than the deadline
+/// plus this ([`Wait::limit`]).
+pub const CALL_GRACE: Duration = Duration::from_secs(5);
 
 /// The pause before the next poll or retry. It never shrinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +191,8 @@ pub enum Finish {
 #[derive(Debug, Clone)]
 pub struct Wait {
     deadline: Duration,
+    /// The deadline plus [`CALL_GRACE`].
+    limit: Duration,
     backoff: Backoff,
     /// The request waited on, once `run.request` named one.
     request: Option<PendingId>,
@@ -187,14 +213,37 @@ impl Wait {
     /// A wait of `wait` (at most [`MAX_WAIT`]) from `now`, on any clock
     /// that only moves forward.
     pub fn new(now: Duration, wait: Duration) -> Wait {
+        let deadline = now.saturating_add(wait.min(MAX_WAIT));
         Wait {
-            deadline: now.saturating_add(wait.min(MAX_WAIT)),
+            deadline,
+            limit: deadline.saturating_add(CALL_GRACE),
             backoff: Backoff::new(),
             request: None,
             ask_again: true,
             announced: None,
             crowded: false,
         }
+    }
+
+    /// When the last poll is made: a request still pending then has timed
+    /// out.
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    /// The latest time any call of this wait may be answered: the
+    /// deadline plus [`CALL_GRACE`].
+    pub fn limit(&self) -> Duration {
+        self.limit
+    }
+
+    /// How long a call made at `now` may take, connect to answer: the
+    /// time left to [`Wait::limit`], or `None` when less than a
+    /// millisecond is left and no call is made.
+    pub fn time_left(&self, now: Duration) -> Option<Duration> {
+        self.limit
+            .checked_sub(now)
+            .filter(|d| *d >= Duration::from_millis(1))
     }
 
     /// The pause asked for at `now`: the backoff's, cut at the deadline.
@@ -267,7 +316,18 @@ impl Wait {
                         self.backoff.after_pending();
                         (self.pause(now), None)
                     }
-                    Ok(PendingState::Approved | PendingState::Unknown) => {
+                    // Approved within the wait: asked again, even at the
+                    // deadline, once.
+                    Ok(PendingState::Approved) => {
+                        self.ask_again = true;
+                        (Action::Request, None)
+                    }
+                    // Ended in a way this tree is not told: asked again
+                    // while the wait lasts, never after it.
+                    Ok(PendingState::Unknown) => {
+                        if now >= self.deadline {
+                            return (Action::Finish(Finish::TimedOut(id)), None);
+                        }
                         self.ask_again = true;
                         (Action::Request, None)
                     }
@@ -302,21 +362,33 @@ pub enum Waited {
     TimedOut(PendingId),
     /// The deadline came while every place for a request was taken.
     TooManyPending(RpcError),
+    /// A tracer was attached to this process before a `run.request`: the
+    /// wait stopped without asking (see the module documentation).
+    Traced,
+    /// The daemon did not answer a call by the wait's limit, the deadline
+    /// plus [`CALL_GRACE`]: the call was given up, or its answer, read
+    /// too late, dropped unused with any values it carried. Nothing was
+    /// started.
+    Unanswered,
 }
 
-/// The two calls a wait makes.
+/// The calls a wait makes, and the check before a `run.request`.
 pub trait Transport {
-    /// `run.request`.
+    /// Whether a tracer is attached to this process now (an error reading
+    /// it counts as one). Asked before each `run.request`.
+    fn traced(&mut self) -> bool;
+
+    /// `run.request`, answered within `within` or given up.
     ///
     /// # Errors
     /// As [`Client::run_request`].
-    fn request(&mut self) -> Result<RunAnswer, ClientError>;
+    fn request(&mut self, within: Duration) -> Result<RunAnswer, ClientError>;
 
-    /// `pending.state` for `id`.
+    /// `pending.state` for `id`, answered within `within` or given up.
     ///
     /// # Errors
     /// As [`Client::pending_state`].
-    fn poll(&mut self, id: &PendingId) -> Result<PendingState, ClientError>;
+    fn poll(&mut self, id: &PendingId, within: Duration) -> Result<PendingState, ClientError>;
 }
 
 /// The time a wait reads, and how it pauses.
@@ -328,8 +400,10 @@ pub trait Clock {
 }
 
 /// Each call on a connection of its own, verified as
-/// [`Client::connect`] verifies it and closed when the answer is read: no
-/// connection stays open between two calls.
+/// [`Client::connect`] verifies it, bounded by the time the wait has left
+/// ([`Client::connect_within`]) and closed when the answer is read: no
+/// connection stays open between two calls. Whether this process is
+/// traced is read from the kernel ([`envcloak_sys::tracer_present`]).
 #[derive(Debug)]
 pub struct Fresh<'a> {
     pub paths: &'a RunPaths,
@@ -337,12 +411,16 @@ pub struct Fresh<'a> {
 }
 
 impl Transport for Fresh<'_> {
-    fn request(&mut self) -> Result<RunAnswer, ClientError> {
-        Client::connect(self.paths)?.run_request(self.params)
+    fn traced(&mut self) -> bool {
+        !matches!(envcloak_sys::tracer_present(), Ok(false))
     }
 
-    fn poll(&mut self, id: &PendingId) -> Result<PendingState, ClientError> {
-        Client::connect(self.paths)?.pending_state(id)
+    fn request(&mut self, within: Duration) -> Result<RunAnswer, ClientError> {
+        Client::connect_within(self.paths, within)?.run_request(self.params)
+    }
+
+    fn poll(&mut self, id: &PendingId, within: Duration) -> Result<PendingState, ClientError> {
+        Client::connect_within(self.paths, within)?.pending_state(id)
     }
 }
 
@@ -376,13 +454,29 @@ impl Clock for SystemClock {
     }
 }
 
+/// Whether a call that ended at `now` with `r` was not answered in time:
+/// read after the wait's limit, whatever it says, or given up at its
+/// timeout. A call's timeout is the time left to the limit when it was
+/// made, so one that timed out did so after the deadline.
+fn too_late<T>(w: &Wait, now: Duration, r: &Result<T, ClientError>) -> bool {
+    let timed_out = matches!(
+        r,
+        Err(ClientError::Frame(
+            FrameError::Truncated
+                | FrameError::Io(std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+        ))
+    );
+    now > w.limit() || (timed_out && now >= w.deadline())
+}
+
 /// Runs a [`Wait`] of `wait` over `t` on clock `c`, telling `notice` what
 /// to show. See the module documentation.
 ///
 /// # Errors
 /// Any failure of either call other than `busy` and `too_many_pending`,
 /// which are waited out (`busy` from `run.request` too, unless the wait
-/// ends before any request was named).
+/// ends before any request was named), and other than a call the daemon
+/// did not answer by the wait's limit ([`Waited::Unanswered`]).
 pub fn wait_for_run(
     t: &mut dyn Transport,
     c: &mut dyn Clock,
@@ -397,9 +491,23 @@ pub fn wait_for_run(
         }
         let (next, n) = match action {
             Action::Request => {
-                let answer = t.request();
+                // The answer may carry values: never asked under a tracer.
+                if t.traced() {
+                    return Ok(Waited::Traced);
+                }
+                let Some(within) = w.time_left(c.now()) else {
+                    return Ok(Waited::Unanswered);
+                };
+                let answer = t.request(within);
+                let now = c.now();
+                if too_late(&w, now, &answer) {
+                    // Dropped unused: a covered answer's values are wiped
+                    // with it, and nothing is started.
+                    drop(answer);
+                    return Ok(Waited::Unanswered);
+                }
                 let (next, n) = w.next(
-                    c.now(),
+                    now,
                     Event::Answered(answer.as_ref().map(|a| &a.decision).map_err(|e| *e)),
                 );
                 if next == Action::Finish(Finish::Decided) {
@@ -411,8 +519,15 @@ pub fn wait_for_run(
                 (next, n)
             }
             Action::Poll(id) => {
-                let state = t.poll(&id);
-                w.next(c.now(), Event::Polled(state))
+                let Some(within) = w.time_left(c.now()) else {
+                    return Ok(Waited::Unanswered);
+                };
+                let state = t.poll(&id, within);
+                let now = c.now();
+                if too_late(&w, now, &state) {
+                    return Ok(Waited::Unanswered);
+                }
+                w.next(now, Event::Polled(state))
             }
             Action::Sleep(d) => {
                 c.sleep(d);
