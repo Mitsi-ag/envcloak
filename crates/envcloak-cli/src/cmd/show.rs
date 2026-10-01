@@ -4,10 +4,11 @@
 
 use std::process::ExitCode;
 
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, USAGE, usage};
+use envcloak_client::render::print;
+
 use super::refuse_value_like;
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, USAGE, usage};
-use crate::render::print;
 
 const USAGE_TEXT: &str = "envcloak show <slug> [--json]";
 

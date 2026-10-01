@@ -31,15 +31,16 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use envcloak_client::claims::refuse_if_claimed;
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
+use envcloak_client::tty::{Terminal, read_secret_fd};
 use envcloak_policy::{
     ApprovalOptions, DEFAULT_TTL, EnvName, GrantId, MAX_AGENT_TTL, PendingId, Uses,
     escape_for_display, render_statement, statement_digest,
 };
 
-use super::{fd_number, refuse_if_claimed};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
-use crate::tty::{Terminal, read_secret_fd};
+use super::fd_number;
 
 const APPROVE_USAGE: &str = "envcloak approve <REQUEST> [--once | --for DURATION (30s to 24h)] [--live NAME]... \
      [--passphrase-fd N]";

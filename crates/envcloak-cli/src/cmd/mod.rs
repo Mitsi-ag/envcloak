@@ -33,43 +33,17 @@ pub mod status;
 pub mod unlock;
 pub mod vault;
 
-/// The names of the agent markers set in this process's environment
-/// (SPEC §10a "caller-asserted"; they only tighten), from the builtin
-/// catalog and the user's extensions.
-pub fn claims() -> Vec<String> {
-    let catalog = match envcloak_core::vault::VaultPaths::for_user() {
-        Ok(p) => envcloak_policy::AgentCatalog::load(&p.data_dir),
-        Err(_) => envcloak_policy::AgentCatalog::builtin(),
-    };
-    envcloak_policy::Claims::from_env(&catalog)
-        .markers()
-        .to_vec()
-}
-
-/// This process's claims ([`claims`]), for a command about to read a
-/// proof: with any marker set, the daemon refuses the proof (SPEC §10b),
-/// so the command refuses first, before it reads the passphrase or shows
-/// anything.
-pub fn refuse_if_claimed() -> Result<Vec<String>, crate::fail::Failure> {
-    let claims = claims();
-    if claims.is_empty() {
-        Ok(claims)
-    } else {
-        Err(envcloak_ipc::ClientError::Rpc(envcloak_ipc::RpcError::new(
-            envcloak_ipc::proto::ErrorKind::ProofRefused,
-        ))
-        .into())
-    }
-}
+use envcloak_client::fail::Failure;
+use envcloak_client::render::looks_like_value;
 
 /// Refuses names given on the command line (a slug, a provider, an
 /// account, a variable) that are shaped like a key or token rather than a
-/// name ([`crate::render::looks_like_value`]): values are never taken on
-/// the command line (gate 13), so one there was most likely pasted by
-/// mistake. The argument is not echoed.
-pub fn refuse_value_like(names: &[&str]) -> Result<(), crate::fail::Failure> {
-    if names.iter().any(|n| crate::render::looks_like_value(n)) {
-        return Err(crate::fail::Failure::new(
+/// name ([`looks_like_value`]): values are never taken on the command line
+/// (gate 13), so one there was most likely pasted by mistake. The argument
+/// is not echoed.
+pub fn refuse_value_like(names: &[&str]) -> Result<(), Failure> {
+    if names.iter().any(|n| looks_like_value(n)) {
+        return Err(Failure::new(
             "value_on_argv",
             "an argument is shaped like a key or token, and values are never taken on the \
              command line: type the value at the hidden prompt, or pipe it in with --stdin; if \
@@ -81,7 +55,7 @@ pub fn refuse_value_like(names: &[&str]) -> Result<(), crate::fail::Failure> {
 
 /// Fails unless the daemon's vault is unlocked: checked before a command
 /// asks for a value or a passphrase, so nothing is typed for nothing.
-pub fn require_unlocked(c: &mut envcloak_ipc::Client) -> Result<(), crate::fail::Failure> {
+pub fn require_unlocked(c: &mut envcloak_ipc::Client) -> Result<(), Failure> {
     use envcloak_ipc::proto::ErrorKind;
     use envcloak_ipc::view::VaultState;
     use envcloak_ipc::{ClientError, RpcError};

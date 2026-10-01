@@ -53,6 +53,11 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use envcloak_client::claims::{claims, refuse_if_claimed};
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
+use envcloak_client::render::{looks_like_value, print};
+use envcloak_client::tty::{Terminal, read_secret_fd};
 use envcloak_core::SecretBytes;
 use envcloak_ipc::WireSecret;
 use envcloak_ipc::proto::{
@@ -71,11 +76,7 @@ use envcloak_scan::{
 };
 
 use super::import::{ReadFile, edit_gitignore, import, project_name, report, scan};
-use super::{claims, fd_number, refuse_if_claimed, require_unlocked};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
-use crate::render::{looks_like_value, print};
-use crate::tty::{Terminal, read_secret_fd};
+use super::{fd_number, require_unlocked};
 
 const USAGE_TEXT: &str = "envcloak init [--import] [--yes] [--delete-plaintext] [--json]
        envcloak init --undo <ID> [--passphrase-fd N] [--json]";

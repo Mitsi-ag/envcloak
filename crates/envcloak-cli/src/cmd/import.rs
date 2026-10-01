@@ -35,6 +35,11 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use envcloak_client::claims::claims;
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, usage};
+use envcloak_client::gitignore::{Pos, ignores, ignores_every, shape};
+use envcloak_client::render::{HIDDEN, looks_like_value, print};
 use envcloak_core::SecretBytes;
 use envcloak_ipc::WireSecret;
 use envcloak_ipc::proto::{ImportCommitParams, ImportEntry, ImportParams, ImportProject};
@@ -49,11 +54,7 @@ use envcloak_scan::{
     replace_atomically, walk_dotenv,
 };
 
-use super::{claims, require_unlocked};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, usage};
-use crate::gitignore::{Pos, ignores, ignores_every, shape};
-use crate::render::{HIDDEN, looks_like_value, print};
+use super::require_unlocked;
 
 const USAGE: &str = "envcloak import --scan <dir> [--yes] [--json]";
 
@@ -506,7 +507,7 @@ pub(crate) const TEMP_PATTERN: &str = ".*.envcloak-*.tmp";
 /// behind ([`envcloak_scan::atomic`]'s temporary names,
 /// `.<name>.envcloak-<del|new>-<16 hex digits>.tmp`, the name left out
 /// when long), to ask a `.gitignore` about: every name of them, whatever
-/// its random digits ([`crate::gitignore::ignores_every`]), not a sample.
+/// its random digits ([`envcloak_client::gitignore::ignores_every`]), not a sample.
 fn temp_shapes(name: &str) -> Vec<Vec<Pos>> {
     let mut out = Vec::new();
     for what in ["del", "new"] {
@@ -525,7 +526,7 @@ fn temp_shapes(name: &str) -> Vec<Vec<Pos>> {
 /// after it instead. Git's own reading decides, the last matching line
 /// winning, so a `!` line that takes a file back in gets a line after it,
 /// and so does a line that ignores only some temporary names
-/// ([`crate::gitignore`]). The file's own bytes are kept as they are,
+/// ([`envcloak_client::gitignore`]). The file's own bytes are kept as they are,
 /// UTF-8 or not: lines are only added after them.
 pub(crate) fn edit_gitignore(
     root: &ScanRoot,
@@ -643,8 +644,9 @@ pub(crate) fn write_project(
 }
 
 /// Adds the bindings an existing manifest lacks, one atomic edit each
-/// ([`super::ref_::edit_manifest_ref`]). A variable bound to another
-/// reference already is left alone and named in `conflicts`.
+/// ([`envcloak_client::manifest_edit::edit_manifest_ref`]). A variable
+/// bound to another reference already is left alone and named in
+/// `conflicts`.
 fn update_manifest(
     path: &Path,
     bindings: &BTreeMap<Option<ProfileName>, BTreeMap<EnvName, String>>,
@@ -678,7 +680,11 @@ fn update_manifest(
                 env_name: name.clone(),
                 reference: r,
             };
-            match super::ref_::edit_manifest_ref(path, &binding, profile.as_ref()) {
+            match envcloak_client::manifest_edit::edit_manifest_ref(
+                path,
+                &binding,
+                profile.as_ref(),
+            ) {
                 Ok(_) => changed = true,
                 Err(_) => return FileChange::Refused,
             }
@@ -705,7 +711,7 @@ pub(crate) fn import(
     }
     let mut client = connect()?;
     require_unlocked(&mut client)?;
-    crate::fail::refuse_if_traced()?;
+    envcloak_client::fail::refuse_if_traced()?;
     let plan = client.import_plan(&params).map_err(too_large)?;
     // The commit connects again: the report and the second parse are
     // local work, and the daemon closes a connection idle for 30 seconds.
@@ -795,7 +801,7 @@ pub fn run(args: &[&str]) -> ExitCode {
 
 fn run_import(a: &ImportArgs) -> Result<ExitCode, Failure> {
     // The scan reads the env files whole: not under a tracer (SPEC §5).
-    crate::fail::refuse_if_traced()?;
+    envcloak_client::fail::refuse_if_traced()?;
     let root = open_root(Path::new(&a.dir)).map_err(|_| {
         Failure::new(
             "scan_root",

@@ -15,10 +15,9 @@
 
 use std::process::ExitCode;
 
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, usage};
 use envcloak_ipc::view::{AnchorState, AuditProblemKind, AuditVerifyView};
-
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, usage};
 
 const USAGE: &str = "envcloak audit verify [--json]";
 
@@ -55,9 +54,9 @@ fn verify(json: bool) -> Result<ExitCode, Failure> {
 }
 
 /// What `audit verify --json` prints: JSON through the CLI's one writer
-/// ([`crate::render::json_text`]), and a newline.
+/// ([`envcloak_client::render::json_text`]), and a newline.
 fn verify_json(v: &AuditVerifyView) -> String {
-    format!("{}\n", crate::render::json_text(v))
+    format!("{}\n", envcloak_client::render::json_text(v))
 }
 
 fn plural(n: u64, one: &str, many: &str) -> String {
@@ -204,7 +203,10 @@ mod tests {
         };
         let text = verify_json(&v);
         assert!(text.ends_with('\n'), "{text:?}");
-        assert_eq!(text, format!("{}\n", crate::render::json_text(&v)));
+        assert_eq!(
+            text,
+            format!("{}\n", envcloak_client::render::json_text(&v))
+        );
         assert!(!text.trim_end().chars().any(display_escaped), "{text:?}");
         let back: AuditVerifyView = serde_json::from_str(&text).unwrap();
         assert_eq!(back, v);

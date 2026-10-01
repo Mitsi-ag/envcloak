@@ -37,7 +37,9 @@ use envcloak_ipc::view::{
 };
 use envcloak_policy::{display_escaped, escape_for_display, value_shaped};
 
-use crate::cmd::check::MAX_ENV_FILES;
+/// The most env files `envcloak check` reads in a directory, the first by
+/// name; the rest are counted as not read, and the report says so.
+pub const MAX_ENV_FILES: usize = 64;
 
 /// What a command prints: text for a person, or JSON. Implemented only for
 /// `envcloak_ipc::view` types.

@@ -22,11 +22,13 @@
 
 use std::process::ExitCode;
 
-use super::{claims, fd_number, refuse_if_claimed, refuse_value_like};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, USAGE, refuse_if_traced, usage};
-use crate::render::{print, rotate_statement};
-use crate::tty::{InputError, Terminal, read_secret_fd, read_stdin_value};
+use envcloak_client::claims::{claims, refuse_if_claimed};
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, USAGE, refuse_if_traced, usage};
+use envcloak_client::render::{print, rotate_statement};
+use envcloak_client::tty::{InputError, Terminal, read_secret_fd, read_stdin_value};
+
+use super::{fd_number, refuse_value_like};
 
 const USAGE_TEXT: &str = "envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
        the new value is typed at a hidden prompt, or piped in with --stdin; never an argument";

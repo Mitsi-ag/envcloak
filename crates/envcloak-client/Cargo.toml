@@ -1,0 +1,37 @@
+[package]
+name = "envcloak-client"
+description = "The reusable parts of the EnvCloak command-line client: the verified daemon connection, failures, rendering, secret prompts and the manifest editor"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# Normal dependencies stay within the edges scripts/check-crate-graph.py
+# allows for this crate (D-02): no agents, mcp or scan, which build on it.
+[dependencies]
+envcloak-core.workspace = true
+envcloak-ipc.workspace = true
+envcloak-policy.workspace = true
+# The provider registry's key patterns: a name shaped like a key is never
+# printed (render::looks_like_value).
+envcloak-providers.workspace = true
+envcloak-sys.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `envcloak ref` edits envcloak.toml in place: comments, order and layout
+# are kept, so it needs the writer as well as the parser.
+toml_edit = { workspace = true, features = ["display"] }
+zeroize.workspace = true
+
+[dev-dependencies]
+# The terminal reader's test signals its own thread.
+envcloak-sys = { workspace = true, features = ["testing"] }
+envcloak-testkit.workspace = true
+tempfile.workspace = true

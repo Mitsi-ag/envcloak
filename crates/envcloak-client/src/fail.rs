@@ -15,15 +15,19 @@ pub const RUN_FAILURE: u8 = 125;
 /// Exit code of every other command's failures.
 pub const FAILURE: u8 = 1;
 
+/// A failure's stable token (SPEC §6.1 "Failures"): fixed text, never an
+/// argument or a value.
+pub type ExitToken = &'static str;
+
 /// A failure to report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
-    pub token: &'static str,
+    pub token: ExitToken,
     pub message: Cow<'static, str>,
 }
 
 impl Failure {
-    pub fn new(token: &'static str, message: impl Into<Cow<'static, str>>) -> Self {
+    pub fn new(token: ExitToken, message: impl Into<Cow<'static, str>>) -> Self {
         Failure {
             token,
             message: message.into(),

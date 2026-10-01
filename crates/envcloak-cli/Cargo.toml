@@ -12,23 +12,23 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+# The connection, failures, rendering, prompts and the manifest editor,
+# shared with envcloak-mcp and envcloak-agents (D-02).
+envcloak-client.workspace = true
 envcloak-core.workspace = true
 envcloak-exec.workspace = true
 envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
-envcloak-providers.workspace = true
 envcloak-scan.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-# `envcloak ref` edits envcloak.toml in place: comments, order and layout
-# are kept, so it needs the writer as well as the parser.
-toml_edit = { workspace = true, features = ["display"] }
 zeroize.workspace = true
 
 [dev-dependencies]
 envcloak-ipc = { workspace = true, features = ["testing"] }
+# The fixture vault's items are classified with the provider registry.
+envcloak-providers.workspace = true
 # Gate 16's test kills `envcloak init` at each of its pause points.
 envcloak-scan = { workspace = true, features = ["testing"] }
 envcloak-sys = { workspace = true, features = ["testing"] }

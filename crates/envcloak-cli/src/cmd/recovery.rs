@@ -14,13 +14,14 @@
 
 use std::process::ExitCode;
 
+use envcloak_client::claims::refuse_if_claimed;
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
+use envcloak_client::render::print;
+use envcloak_client::tty::{InputError, Terminal, read_secret_fd};
 use envcloak_core::RecoveryKit;
 
-use super::{fd_number, refuse_if_claimed, require_unlocked};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
-use crate::render::print;
-use crate::tty::{InputError, Terminal, read_secret_fd};
+use super::{fd_number, require_unlocked};
 
 const USAGE_TEXT: &str = "envcloak recovery confirm [--kit-fd N] [--json]";
 

@@ -20,14 +20,15 @@
 
 use std::process::ExitCode;
 
+use envcloak_client::claims::claims;
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, USAGE, refuse_if_traced, usage};
+use envcloak_client::render::{print, registry};
+use envcloak_client::tty::{InputError, Terminal, read_stdin_value};
 use envcloak_ipc::WireSecret;
 use envcloak_ipc::proto::AddParams;
 
-use super::{claims, refuse_value_like, require_unlocked};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, USAGE, refuse_if_traced, usage};
-use crate::render::{print, registry};
-use crate::tty::{InputError, Terminal, read_stdin_value};
+use super::{refuse_value_like, require_unlocked};
 
 const USAGE_TEXT: &str =
     "envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] \
