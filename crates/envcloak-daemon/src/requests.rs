@@ -1,5 +1,6 @@
 //! The grant methods (SPEC §6.1 steps 2 to 4, §10a, §10b): `run.request`,
-//! `pending.get`, `approve`, `deny`, `grants.list` and `grants.revoke`.
+//! `pending.get`, `pending.state`, `pending.list`, `approve`, `deny`,
+//! `grants.list` and `grants.revoke`.
 //!
 //! `run.request` decides, and a covered request is a delivery: its answer
 //! carries the bindings' values. For every request the daemon:
@@ -47,6 +48,16 @@
 //! A request over a pending cap is answered `too_many_pending` with the
 //! cap as its reason, and audited so: nothing was opened or refused, and a
 //! waiter asks again later (M2 plan D-04).
+//!
+//! `pending.state` and `pending.list` are for waiting and finding a
+//! request (M2 plan D-04). `pending.state` reads the caller's evidence
+//! from the kernel and answers how a request stands only to the
+//! request's own process tree (`unknown` to anyone else), within the
+//! caller's root's poll limit (`busy` beyond it); it opens nothing and
+//! writes no audit entry. `pending.list` lists the requests the caller
+//! may approve: none to a caller whose proof would be refused, and for
+//! one that may give a proof, none whose requester's session or terminal
+//! it shares. Neither is activity: polling never keeps the vault open.
 
 use std::path::Path;
 
@@ -55,18 +66,20 @@ use envcloak_core::audit::{ProjectSummary, SubjectSummary};
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{FieldId, ItemId, Slug, Vault, VaultErrorKind};
 use envcloak_ipc::proto::{
-    ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, ReleasedValue, RequestParams,
-    RevokeParams, RunAnswer, RunRequestParams,
+    ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, PendingListParams,
+    PendingStateParams, ReleasedValue, RequestParams, RevokeParams, RunAnswer, RunRequestParams,
 };
 use envcloak_ipc::view::{
-    ApprovedView, DecisionView, DeniedView, GrantBindingView, GrantView, GrantsView, RevokedView,
+    ApprovedView, DecisionView, DeniedView, GrantBindingView, GrantView, GrantsView,
+    PendingListView, PendingStateView, PendingView, RevokedView,
 };
 use envcloak_ipc::{RpcError, WireSecret};
 use envcloak_policy::{
     AccessRequest, ApprovalProof, ApproveError, BindError, Binding, BoundRef, Claims, Decision,
-    DenyReason, EvidenceError, GrantId, ManifestError, Mode, PendingDescriptor, PendingId,
-    ProcessInstance, ProfileName, ProofKind, RevokeSelector, SubjectEvidence, SubjectKind, Uses,
-    VaultProjectPolicy, bind_items, effective_policy, gather, load_project, resolve,
+    DenyReason, EvidenceError, GrantId, ManifestError, Mode, PENDING_TTL, Pending,
+    PendingDescriptor, PendingId, PendingState, ProcessInstance, ProfileName, ProofKind,
+    RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy, bind_items,
+    effective_policy, gather, load_project, resolve,
 };
 use envcloak_sys::PeerIdentity;
 
@@ -545,6 +558,98 @@ pub fn pending_get(
         .pending_descriptor(&id, &now)
         .cloned()
         .ok_or(RpcError::new(ErrorKind::NoSuchRequest))
+}
+
+/// `pending.state`: how a request stands, for the caller's own process
+/// tree only, within its root's poll limit (`busy` beyond it). See the
+/// module documentation. A malformed id is `invalid_params`, as for every
+/// method; one no request has is `unknown`, as for another tree's.
+pub fn pending_state(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: PendingStateParams,
+) -> Result<PendingStateView, RpcError> {
+    let id = PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
+    let caller = evidence(shared, peer, &[])?;
+    let now = now_of(&shared.clocks);
+    let mut s = locked(&shared.state);
+    let answer = s.grants().poll(&id, &caller, &now);
+    // A test build's trace, written under the state lock so that its order
+    // in the log is the order of the decisions (an approval's audit line
+    // comes before every poll it answers).
+    if envcloak_sys::test_trace() {
+        log_line!(
+            "envcloakd: test: pending.state pid={} request={id} answer={}",
+            peer.pid,
+            answer.map_or("busy", PendingState::word)
+        );
+    }
+    drop(s);
+    answer
+        .map(|state| PendingStateView { state })
+        .map_err(|_| RpcError::new(ErrorKind::Busy))
+}
+
+/// `pending.list`: the requests waiting for approval that the caller may
+/// approve, oldest first. A caller whose proof would be refused gets an
+/// empty list, without being told why; a request whose requester shares a
+/// session or a terminal with the caller is left out (SPEC §10b: an
+/// approval surface does not show a request to a caller whose proof it
+/// would refuse). Nothing is shown from a vault that failed its integrity
+/// check.
+pub fn pending_list(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: PendingListParams,
+) -> Result<PendingListView, RpcError> {
+    let caller = evidence(shared, peer, &p.claims)?;
+    if caller.proof_refusal().is_some() {
+        return Ok(PendingListView {
+            requests: Vec::new(),
+        });
+    }
+    let now = now_of(&shared.clocks);
+    let mut s = locked(&shared.state);
+    s.refuse_if_tampered()?;
+    let requests = s
+        .grants()
+        .pending_all(&now)
+        .filter(|p| {
+            caller
+                .approval_refusal(&p.request.subject, &alive)
+                .is_none()
+        })
+        .map(|p| pending_view(p, &now))
+        .collect();
+    Ok(PendingListView { requests })
+}
+
+/// What `envcloak pending` shows of one request.
+fn pending_view(p: &Pending, now: &envcloak_policy::Now) -> PendingView {
+    let kind = p.request.subject.kind();
+    let age = p.age(now);
+    PendingView {
+        request: p.id.to_string(),
+        age_secs: age.as_secs(),
+        expires_in_secs: PENDING_TTL.saturating_sub(age).as_secs(),
+        kind,
+        agent: match kind {
+            SubjectKind::Agent => p.request.subject.label().map(|l| l.name.clone()),
+            SubjectKind::Terminal | SubjectKind::Unknown => None,
+        },
+        project: p
+            .request
+            .project
+            .canonical_dir
+            .to_string_lossy()
+            .into_owned(),
+        bindings: p
+            .request
+            .bindings
+            .iter()
+            .map(|b| b.slug.as_str().to_owned())
+            .collect(),
+    }
 }
 
 /// Decodes 64 hex characters.
