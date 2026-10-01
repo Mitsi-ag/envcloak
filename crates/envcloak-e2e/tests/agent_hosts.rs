@@ -1048,7 +1048,8 @@ fn reach(text: &str) -> String {
         let why: String = line
             .split("envcloak: ")
             .nth(1)
-            .map_or("?", str::trim)
+            // `cut` ends the line, which the request body escapes.
+            .map_or("?", |r| r.trim().trim_end_matches("\\n").trim_end())
             .chars()
             .take(200)
             .collect();
