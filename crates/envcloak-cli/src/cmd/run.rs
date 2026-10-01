@@ -7,7 +7,10 @@
 //! 1. Under a tracer the CLI refuses at once, with exit 125 and `traced`
 //!    (gate 19), before any contact with the daemon. Only a verified
 //!    daemon is then asked; with none, run says how to start one and
-//!    starts nothing.
+//!    starts nothing. Without `--wait` the CLI connects first and asks on
+//!    that connection once the request is built; with `--wait`, its first
+//!    contact is the wait's first request, so that no call outlasts the
+//!    wait (step 4).
 //! 2. It finds the nearest `envcloak.toml` upward from the working
 //!    directory, or takes the absolute path `--manifest` names, and sends
 //!    that path. The daemon opens and canonicalizes the manifest itself
@@ -33,9 +36,11 @@
 //!    `approval_denied`; still pending at the deadline, or expired, it
 //!    exits 125, the `approval_required` line being its failure
 //!    ([`envcloak_ipc::wait`]). The wait never outlasts its deadline by
-//!    more than 5 seconds whatever the daemon does: each call is given
-//!    only the time left, and an answer read later is dropped, its values
-//!    wiped, with exit 125 and `daemon_unavailable`. Before each request
+//!    more than 5 seconds: every call, from its connect to the
+//!    last byte of its answer, is given only the time left to that limit,
+//!    however the daemon paces what it sends or reads, and an answer read
+//!    later is dropped, its values wiped, with exit 125 and
+//!    `daemon_unavailable`. Before each request
 //!    that could carry values, the CLI looks for a tracer again, and stops
 //!    with `traced` if one is attached now. SIGINT ends the wait as it
 //!    ends any program (a shell reports 130); nothing is held open then.
@@ -78,10 +83,10 @@ use envcloak_client::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, trace
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
 use envcloak_exec::{CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
-use envcloak_ipc::ClientError;
 use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunAnswer, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
 use envcloak_ipc::wait::{CALL_GRACE, Fresh, MAX_WAIT, Notice, SystemClock, Waited, wait_for_run};
+use envcloak_ipc::{Client, ClientError};
 use envcloak_policy::{
     Binding, EnvFileRefs, EnvName, GrantId, MAX_ENV_FILE, Mode, PendingId, PlainVar, find_manifest,
     parse_env_file_refs,
@@ -241,11 +246,25 @@ pub fn run(args: &[&str]) -> ExitCode {
     }
 }
 
+/// How the request is asked.
+enum Ask {
+    /// Once, on this verified connection.
+    Now(Client),
+    /// Waiting up to this long for an approval, each call on a connection
+    /// of its own.
+    Waiting(Duration),
+}
+
 fn request(a: RunArgs) -> Result<ExitCode, Failure> {
     refuse_if_traced()?;
     // Only a verified daemon is ever asked; with none, run says how to
-    // start one and starts nothing.
-    let mut client = connect()?;
+    // start one and starts nothing. A waiting run connects only within its
+    // wait, for each call (`wait_for`): a connection made here, with the
+    // ordinary call timeout, could hold it past its deadline.
+    let ask = match a.wait {
+        None => Ask::Now(connect()?),
+        Some(wait) => Ask::Waiting(wait),
+    };
     let manifest = match a.manifest {
         Some(p) => p,
         None => found_manifest()?,
@@ -261,20 +280,17 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
         argv: a.argv.clone(),
         claims: claims(),
     };
-    let answer = match a.wait {
-        None => {
+    let answer = match ask {
+        Ask::Now(mut client) => {
             let answer = client.run_request(&params)?;
             drop(client);
             answer
         }
-        Some(wait) => {
-            // No connection is held while waiting: each step opens its own.
-            drop(client);
-            match wait_for(&params, wait)? {
-                Some(answer) => answer,
-                None => return Ok(ExitCode::from(RUN_FAILURE)),
-            }
-        }
+        // No connection is held while waiting: each step opens its own.
+        Ask::Waiting(wait) => match wait_for(&params, wait)? {
+            Some(answer) => answer,
+            None => return Ok(ExitCode::from(RUN_FAILURE)),
+        },
     };
     let decision = answer.decision;
     match decision {
