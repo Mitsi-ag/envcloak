@@ -55,7 +55,8 @@ use envcloak_ipc::view::{
 };
 use envcloak_policy::{AttemptLimiter, GrantStore, Now};
 
-use crate::audit::{AuditEvent, AuditLog};
+use crate::audit::{AuditEvent, AuditLog, RequestAudit};
+use crate::crowded::Crowded;
 use crate::lock::{LockTimer, Reading};
 
 /// The vault as the daemon holds it.
@@ -120,6 +121,9 @@ pub struct State {
     unsaved_head: Option<AuditHead>,
     /// [`Vault::save_audit_head`]; tests put a failing one in its place.
     save_head: SaveHead,
+    /// `too_many_pending` answers counted, not yet written
+    /// ([`crate::crowded`]).
+    crowded: Crowded,
 }
 
 impl State {
@@ -137,6 +141,7 @@ impl State {
             audit: AuditLog::default(),
             unsaved_head: None,
             save_head: Vault::save_audit_head,
+            crowded: Crowded::default(),
         }
     }
 
@@ -263,6 +268,11 @@ impl State {
     /// Locks for `reason`. Returns whether a vault was unlocked. An unlock
     /// in progress finishes locked, unless the reason is idle time.
     pub fn lock(&mut self, reason: LockReason) -> bool {
+        // The `too_many_pending` answers still counted are written while
+        // the log is open (crate::crowded).
+        for e in self.crowded.drain() {
+            self.audit(AuditEvent::Request(Box::new(e)));
+        }
         // Whatever the slot holds, a lock ends every grant and pending
         // request (SPEC §5 "Lock").
         self.grants.on_lock();
@@ -581,9 +591,23 @@ impl State {
         Ok(values)
     }
 
-    /// The tick's part: saves the head when 15 minutes passed awake with
-    /// entries not yet anchored, or tries again after a save that failed.
+    /// A `too_many_pending` answer to the request with fingerprint `key`
+    /// at awake time `awake`: written now, with the answers it stands for,
+    /// or counted toward a later entry ([`crate::crowded`]).
+    pub fn audit_crowded(&mut self, key: [u8; 32], e: RequestAudit, awake: Duration) {
+        if let Some(e) = self.crowded.answer(key, e, awake) {
+            self.audit(AuditEvent::Request(Box::new(e)));
+        }
+    }
+
+    /// The tick's part: writes the `too_many_pending` answers counted for
+    /// a minute ([`crate::crowded`]); saves the head when 15 minutes
+    /// passed awake with entries not yet anchored, or tries again after a
+    /// save that failed.
     pub fn audit_tick(&mut self, now: Reading) {
+        for e in self.crowded.due(now.awake) {
+            self.audit(AuditEvent::Request(Box::new(e)));
+        }
         self.anchor_if_due(Some(now.awake));
     }
 
@@ -1484,6 +1508,7 @@ mod tests {
                 project: None,
                 items: Vec::new(),
                 argv: Vec::new(),
+                count: None,
             }))
         };
         // The segment is gone and no new one can be made.
@@ -1548,6 +1573,7 @@ mod tests {
                 project: None,
                 items: Vec::new(),
                 argv: Vec::new(),
+                count: None,
             }))
         };
 
