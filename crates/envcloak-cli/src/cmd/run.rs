@@ -32,10 +32,15 @@
 //!    Approved, it asks again and runs; denied, it exits 125 with
 //!    `approval_denied`; still pending at the deadline, or expired, it
 //!    exits 125, the `approval_required` line being its failure
-//!    ([`envcloak_ipc::wait`]). SIGINT ends the wait as it ends any
-//!    program (a shell reports 130); nothing is held open then. Approval
-//!    input is never read here: the terminal this command runs in may be
-//!    an agent's.
+//!    ([`envcloak_ipc::wait`]). The wait never outlasts its deadline by
+//!    more than 5 seconds whatever the daemon does: each call is given
+//!    only the time left, and an answer read later is dropped, its values
+//!    wiped, with exit 125 and `daemon_unavailable`. Before each request
+//!    that could carry values, the CLI looks for a tracer again, and stops
+//!    with `traced` if one is attached now. SIGINT ends the wait as it
+//!    ends any program (a shell reports 130); nothing is held open then.
+//!    Approval input is never read here: the terminal this command runs
+//!    in may be an agent's.
 //! 5. A covered answer carries the bindings' values, which the daemon
 //!    sent after their audit entry was on disk. The connection is closed,
 //!    and the runner ([`envcloak_exec`]) takes over: values under 8 bytes,
@@ -69,14 +74,14 @@ use std::time::Duration;
 
 use envcloak_client::claims::claims;
 use envcloak_client::connect::{connect, run_paths};
-use envcloak_client::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, usage};
+use envcloak_client::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, traced, usage};
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
 use envcloak_exec::{CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
 use envcloak_ipc::ClientError;
 use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunAnswer, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
-use envcloak_ipc::wait::{Fresh, MAX_WAIT, Notice, SystemClock, Waited, wait_for_run};
+use envcloak_ipc::wait::{CALL_GRACE, Fresh, MAX_WAIT, Notice, SystemClock, Waited, wait_for_run};
 use envcloak_policy::{
     Binding, EnvFileRefs, EnvName, GrantId, MAX_ENV_FILE, Mode, PendingId, PlainVar, find_manifest,
     parse_env_file_refs,
@@ -362,6 +367,17 @@ fn wait_for(params: &RunRequestParams, wait: Duration) -> Result<Option<RunAnswe
             format!("request={id} was denied; nothing was started"),
         )),
         Waited::Expired(_) | Waited::TimedOut(_) | Waited::TooManyPending(_) => Ok(None),
+        // A tracer attached while it waited: no request that could carry
+        // values was sent.
+        Waited::Traced => Err(traced()),
+        Waited::Unanswered => Err(Failure::new(
+            "daemon_unavailable",
+            format!(
+                "the daemon did not answer within the wait ({shown}, and {}s for a last \
+                 answer); nothing was started",
+                CALL_GRACE.as_secs()
+            ),
+        )),
     }
 }
 

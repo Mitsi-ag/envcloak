@@ -252,11 +252,17 @@ fn reason_text(reason: &str) -> &'static str {
 pub fn refuse_if_traced() -> Result<(), Failure> {
     match envcloak_sys::tracer_present() {
         Ok(false) => Ok(()),
-        Ok(true) | Err(_) => Err(Failure::new(
-            "traced",
-            "a debugger or tracer is attached to this process, so it will not handle secrets",
-        )),
+        Ok(true) | Err(_) => Err(traced()),
     }
+}
+
+/// The `traced` failure: a tracer is attached to this process (or whether
+/// one is could not be read).
+pub fn traced() -> Failure {
+    Failure::new(
+        "traced",
+        "a debugger or tracer is attached to this process, so it will not handle secrets",
+    )
 }
 
 /// A usage error: never echoes the arguments, one of which could be a

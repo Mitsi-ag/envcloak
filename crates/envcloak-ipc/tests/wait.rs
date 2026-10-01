@@ -9,18 +9,20 @@
 //! `crates/envcloak-cli/tests/wait.rs`.
 #![allow(clippy::unwrap_used)]
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, Slug};
 use envcloak_ipc::proto::{ErrorKind, RpcError, RunAnswer};
 use envcloak_ipc::view::DecisionView;
 use envcloak_ipc::wait::{
-    Action, Clock, Event, FAST_POLL, Finish, MAX_BACKOFF, MAX_WAIT, Notice, SLOW_POLL, Transport,
-    Wait, Waited, wait_for_run,
+    Action, CALL_GRACE, Clock, Event, FAST_POLL, Finish, MAX_BACKOFF, MAX_WAIT, Notice, SLOW_POLL,
+    Transport, Wait, Waited, wait_for_run,
 };
-use envcloak_ipc::{ClientError, WireSecret};
+use envcloak_ipc::{ClientError, FrameError, WireSecret};
 use envcloak_policy::{
     AccessRequest, AgentLabel, Ancestor, ApprovalOptions, ApprovalProof, BoundBinding, BoundRef,
     CatalogSource, ChainEnd, Claims, Decision, EnvName, GrantStore, MatchBasis, Mode, Now,
@@ -326,41 +328,94 @@ fn the_deadline_denied_expired_and_unknown() {
     }
 }
 
-/// A transport that answers from scripts, and counts the calls.
+/// A transport that answers from scripts, and counts the calls. Each
+/// call takes the time its script says (none unless `delays` has one),
+/// on the clock it shares with a [`TestClock`]; `traced` says, check by
+/// check, whether a tracer is attached (never, once it runs out).
+#[derive(Default)]
 struct Scripted {
     requests: VecDeque<Result<RunAnswer, ClientError>>,
     polls: VecDeque<Result<PendingState, ClientError>>,
     asked: Vec<&'static str>,
+    /// How long each call takes, in the order of the calls.
+    delays: VecDeque<Duration>,
+    /// Each call's time left, and when it was made.
+    within: Vec<(Duration, Duration)>,
+    traced: VecDeque<bool>,
+    clock: Rc<Cell<Duration>>,
+}
+
+impl Scripted {
+    fn new(
+        requests: impl IntoIterator<Item = Result<RunAnswer, ClientError>>,
+        polls: impl IntoIterator<Item = Result<PendingState, ClientError>>,
+    ) -> Scripted {
+        Scripted {
+            requests: requests.into_iter().collect(),
+            polls: polls.into_iter().collect(),
+            ..Scripted::default()
+        }
+    }
+
+    fn call(&mut self, what: &'static str, within: Duration) {
+        self.asked.push(what);
+        self.within.push((self.clock.get(), within));
+        let d = self.delays.pop_front().unwrap_or_default();
+        self.clock.set(self.clock.get() + d);
+    }
+
+    /// A clock on this transport's time.
+    fn clock(&self) -> TestClock {
+        TestClock {
+            now: Rc::clone(&self.clock),
+            pauses: Vec::new(),
+        }
+    }
 }
 
 impl Transport for Scripted {
-    fn request(&mut self) -> Result<RunAnswer, ClientError> {
-        self.asked.push("request");
+    fn traced(&mut self) -> bool {
+        self.asked.push("traced?");
+        self.traced.pop_front().unwrap_or(false)
+    }
+
+    fn request(&mut self, within: Duration) -> Result<RunAnswer, ClientError> {
+        self.call("request", within);
         self.requests.pop_front().unwrap()
     }
 
-    fn poll(&mut self, _: &PendingId) -> Result<PendingState, ClientError> {
-        self.asked.push("poll");
+    fn poll(&mut self, _: &PendingId, within: Duration) -> Result<PendingState, ClientError> {
+        self.call("poll", within);
         self.polls.pop_front().unwrap()
     }
 }
 
-/// A clock that moves only when the wait pauses.
+/// A clock that moves when the wait pauses, and when a scripted call
+/// takes time.
 #[derive(Default)]
 struct TestClock {
-    now: Duration,
+    now: Rc<Cell<Duration>>,
     pauses: Vec<Duration>,
 }
 
 impl Clock for TestClock {
     fn now(&self) -> Duration {
-        self.now
+        self.now.get()
     }
 
     fn sleep(&mut self, d: Duration) {
         self.pauses.push(d);
-        self.now += d;
+        self.now.set(self.now.get() + d);
     }
+}
+
+/// The calls a scripted transport saw, without the tracer checks.
+fn calls(t: &Scripted) -> Vec<&'static str> {
+    t.asked
+        .iter()
+        .copied()
+        .filter(|a| *a != "traced?")
+        .collect()
 }
 
 /// The driver: the covered answer comes back whole, with its value; the
@@ -377,20 +432,19 @@ fn the_driver_returns_the_deciding_answer_and_tells_each_notice_once() {
             value: WireSecret::new(value),
         }],
     };
-    let mut t = Scripted {
-        requests: VecDeque::from([
+    let mut t = Scripted::new(
+        [
             Err(crowded()),
             Ok(RunAnswer::decided(pending("ABCDEFGH"))),
             Ok(answer),
-        ]),
-        polls: VecDeque::from([
+        ],
+        [
             Ok(PendingState::Pending),
             Err(busy()),
             Ok(PendingState::Approved),
-        ]),
-        asked: Vec::new(),
-    };
-    let mut c = TestClock::default();
+        ],
+    );
+    let mut c = t.clock();
     let mut told = Vec::new();
     let got = wait_for_run(&mut t, &mut c, MAX_WAIT, &mut |n| told.push(n)).unwrap();
     let Waited::Answer(a) = got else {
@@ -399,8 +453,16 @@ fn the_driver_returns_the_deciding_answer_and_tells_each_notice_once() {
     assert_eq!(a.decision, covered());
     assert_eq!(a.values.len(), 1);
     assert_eq!(
-        t.asked,
+        calls(&t),
         ["request", "request", "poll", "poll", "poll", "request"]
+    );
+    // The tracer is looked for before each `run.request`, and only then.
+    assert_eq!(
+        t.asked,
+        [
+            "traced?", "request", "traced?", "request", "poll", "poll", "poll", "traced?",
+            "request"
+        ]
     );
     let ms: Vec<u128> = c.pauses.iter().map(Duration::as_millis).collect();
     assert_eq!(ms, [500, 500, 500, 1000]);
@@ -408,15 +470,267 @@ fn the_driver_returns_the_deciding_answer_and_tells_each_notice_once() {
     assert!(matches!(told[0], Notice::TooManyPending(_)));
     assert_eq!(told[1], Notice::Pending(id("ABCDEFGH")));
 
-    let mut t = Scripted {
-        requests: VecDeque::from([Ok(RunAnswer::decided(pending("ABCDEFGH")))]),
-        polls: VecDeque::from([Ok(PendingState::Denied)]),
-        asked: Vec::new(),
-    };
-    let got = wait_for_run(&mut t, &mut TestClock::default(), MAX_WAIT, &mut |_| {}).unwrap();
+    let mut t = Scripted::new(
+        [Ok(RunAnswer::decided(pending("ABCDEFGH")))],
+        [Ok(PendingState::Denied)],
+    );
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, MAX_WAIT, &mut |_| {}).unwrap();
     assert!(
         matches!(got, Waited::Denied(i) if i == id("ABCDEFGH")),
         "{got:?}"
+    );
+}
+
+fn covered_with_a_value() -> RunAnswer {
+    RunAnswer {
+        decision: covered(),
+        values: vec![envcloak_ipc::proto::ReleasedValue {
+            env_name: "OPENAI_API_KEY".to_owned(),
+            slug: "openai/acme-web".to_owned(),
+            allow_short: false,
+            value: WireSecret::new(envcloak_core::SecretBytes::copy_from(
+                b"a value of the test, not a key",
+            )),
+        }],
+    }
+}
+
+/// Each call of a wait is given only the time left to the wait's limit
+/// (the deadline plus CALL_GRACE), for its connect, writes and reads; the
+/// last poll, made at the deadline itself, CALL_GRACE.
+///
+/// Mutation: pass each call a fixed time (the client's 300 seconds)
+/// instead of the time left: the times recorded differ and this fails.
+#[test]
+fn every_call_is_given_only_the_time_left_to_the_limit() {
+    let wait = ms(1100);
+    let mut t = Scripted::new(
+        [Ok(RunAnswer::decided(pending("ABCDEFGH")))],
+        (0..5).map(|_| Ok(PendingState::Pending)),
+    );
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, wait, &mut |_| {}).unwrap();
+    assert!(
+        matches!(got, Waited::TimedOut(i) if i == id("ABCDEFGH")),
+        "{got:?}"
+    );
+    let limit = wait + CALL_GRACE;
+    assert_eq!(t.within.len(), 6, "{:?}", t.within);
+    for (at, within) in &t.within {
+        assert_eq!(*within, limit - *at, "{:?}", t.within);
+    }
+    assert_eq!(t.within.last(), Some(&(wait, CALL_GRACE)));
+    let w = Wait::new(ms(500), wait);
+    assert_eq!(w.deadline(), ms(1600));
+    assert_eq!(w.limit(), ms(1600) + CALL_GRACE);
+    assert_eq!(w.time_left(ms(1600)), Some(CALL_GRACE));
+    assert_eq!(w.time_left(w.limit()), None);
+    assert_eq!(w.time_left(w.limit() - Duration::from_micros(999)), None);
+}
+
+/// `unknown` at or after the deadline ends the wait as timed out and is
+/// not asked again; before it, `run.request` is asked again. `approved`
+/// after the deadline is asked again once (the approval came within the
+/// wait), its answer due by the limit.
+///
+/// Mutation: ask `run.request` again on `unknown` whenever it comes: the
+/// late poll is followed by another request and this fails.
+#[test]
+fn unknown_after_the_deadline_is_not_asked_again() {
+    let mut w = Wait::new(Duration::ZERO, ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    let mut early = w.clone();
+    assert_eq!(
+        early
+            .next(ms(999), Event::Polled(Ok(PendingState::Unknown)))
+            .0,
+        Action::Request
+    );
+    assert_eq!(
+        w.next(ms(1000), Event::Polled(Ok(PendingState::Unknown))).0,
+        Action::Finish(Finish::TimedOut(id("ABCDEFGH")))
+    );
+
+    // The driver: a poll made before the deadline, answered `unknown`
+    // after it.
+    let mut t = Scripted::new(
+        [Ok(RunAnswer::decided(pending("ABCDEFGH")))],
+        [Ok(PendingState::Unknown)],
+    );
+    t.delays = VecDeque::from([Duration::ZERO, ms(1500)]);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, ms(1000), &mut |_| {}).unwrap();
+    assert!(
+        matches!(got, Waited::TimedOut(i) if i == id("ABCDEFGH")),
+        "{got:?}"
+    );
+    assert_eq!(calls(&t), ["request", "poll"]);
+
+    // `approved` answered after the deadline: asked again, once, with the
+    // time left to the limit.
+    let mut t = Scripted::new(
+        [
+            Ok(RunAnswer::decided(pending("ABCDEFGH"))),
+            Ok(covered_with_a_value()),
+        ],
+        [Ok(PendingState::Approved)],
+    );
+    t.delays = VecDeque::from([Duration::ZERO, ms(1500)]);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, ms(1000), &mut |_| {}).unwrap();
+    assert!(matches!(got, Waited::Answer(_)), "{got:?}");
+    assert_eq!(calls(&t), ["request", "poll", "request"]);
+    assert_eq!(
+        t.within.last(),
+        Some(&(ms(1750), ms(1000) + CALL_GRACE - ms(1750)))
+    );
+}
+
+/// An answer read after the limit is dropped unused and the wait ends
+/// `Unanswered`: a covered one's values never reach the caller, so nothing
+/// is started late. A call given up at its timeout (the time left to the
+/// limit) ends the wait the same way; a connection that fails before the
+/// deadline is that failure.
+///
+/// Mutation: keep an answer read after the limit (drop the check after
+/// the call): the covered answer comes back and this fails.
+#[test]
+fn an_answer_after_the_limit_starts_nothing() {
+    // Approved at 250 ms; asked again, the covered answer is read 6 s
+    // later, past the limit of 1 s plus CALL_GRACE.
+    let mut t = Scripted::new(
+        [
+            Ok(RunAnswer::decided(pending("ABCDEFGH"))),
+            Ok(covered_with_a_value()),
+        ],
+        [Ok(PendingState::Approved)],
+    );
+    t.delays = VecDeque::from([Duration::ZERO, Duration::ZERO, ms(6000)]);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, ms(1000), &mut |_| {}).unwrap();
+    assert!(matches!(got, Waited::Unanswered), "{got:?}");
+    assert_eq!(calls(&t), ["request", "poll", "request"]);
+
+    // A poll given up at its timeout, at the limit.
+    let timeout = ClientError::Frame(FrameError::Io(std::io::ErrorKind::WouldBlock));
+    let mut t = Scripted::new(
+        [Ok(RunAnswer::decided(pending("ABCDEFGH")))],
+        [Err(timeout)],
+    );
+    t.delays = VecDeque::from([Duration::ZERO, ms(1000) + CALL_GRACE - FAST_POLL]);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, ms(1000), &mut |_| {}).unwrap();
+    assert!(matches!(got, Waited::Unanswered), "{got:?}");
+
+    // A connection that fails before the deadline is that failure.
+    let cut = ClientError::Frame(FrameError::Truncated);
+    let mut t = Scripted::new([Ok(RunAnswer::decided(pending("ABCDEFGH")))], [Err(cut)]);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, ms(1000), &mut |_| {});
+    assert_eq!(got.unwrap_err(), cut);
+}
+
+/// Before each `run.request`, whose answer may carry values, the driver
+/// looks for a tracer: one attached while the wait went on stops it
+/// before the request after the approval is sent.
+///
+/// Mutation: skip the check (send `run.request` whatever `traced` says):
+/// the covered answer comes back and this fails.
+#[test]
+fn a_tracer_attached_while_waiting_stops_the_wait_before_a_request() {
+    let mut t = Scripted::new(
+        [
+            Ok(RunAnswer::decided(pending("ABCDEFGH"))),
+            Ok(covered_with_a_value()),
+        ],
+        [Ok(PendingState::Pending), Ok(PendingState::Approved)],
+    );
+    t.traced = VecDeque::from([false, true]);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, MAX_WAIT, &mut |_| {}).unwrap();
+    assert!(matches!(got, Waited::Traced), "{got:?}");
+    assert_eq!(calls(&t), ["request", "poll", "poll"]);
+    assert_eq!(
+        t.requests.len(),
+        1,
+        "the request after the approval was sent"
+    );
+    // Traced from the start: nothing is asked at all.
+    let mut t = Scripted::new([], []);
+    t.traced = VecDeque::from([true]);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, MAX_WAIT, &mut |_| {}).unwrap();
+    assert!(matches!(got, Waited::Traced), "{got:?}");
+    assert!(calls(&t).is_empty());
+}
+
+/// Over a real socket, a daemon that takes the connection and then never
+/// answers holds a wait of one second no longer than its limit (the
+/// deadline plus CALL_GRACE), not the client's 300-second call timeout:
+/// the wait ends `Unanswered`.
+///
+/// Mutation: connect each call of `Fresh` with `Client::connect` (its
+/// 300-second timeout): the wait is still blocked at this test's
+/// 60-second bound and this fails.
+#[test]
+fn a_silent_daemon_holds_a_wait_no_longer_than_its_limit() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use envcloak_ipc::RunPaths;
+    use envcloak_ipc::proto::RunRequestParams;
+    use envcloak_ipc::wait::{Fresh, SystemClock};
+
+    let home = envcloak_testkit::TestHome::new();
+    let p = RunPaths::under(home.root().join("run").join("envcloak")).unwrap();
+    std::fs::create_dir_all(&p.dir).unwrap();
+    std::fs::set_permissions(&p.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let l = UnixListener::bind(&p.socket).unwrap();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        // Takes the one connection and holds it, unanswered.
+        let held = l.accept().unwrap();
+        let _ = done_rx.recv();
+        drop(held);
+    });
+    let (tx, rx) = mpsc::channel();
+    let paths = p.clone();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let params = RunRequestParams {
+            manifest: "/nowhere/envcloak.toml".to_owned(),
+            profile: None,
+            refs: Vec::new(),
+            env_file: None,
+            argv: vec!["./emit".to_owned()],
+            claims: Vec::new(),
+        };
+        let mut t = Fresh {
+            paths: &paths,
+            params: &params,
+        };
+        let got = wait_for_run(
+            &mut t,
+            &mut SystemClock::new(),
+            Duration::from_secs(1),
+            &mut |_| {},
+        );
+        let _ = tx.send(format!("{got:?}"));
+    });
+    let got = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait outlasted its limit by far");
+    let took = started.elapsed();
+    let _ = done_tx.send(());
+    server.join().unwrap();
+    assert_eq!(got, "Ok(Unanswered)");
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_secs(1) + CALL_GRACE * 2,
+        "{took:?}"
     );
 }
 

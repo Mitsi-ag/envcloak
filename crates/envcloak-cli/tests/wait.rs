@@ -483,6 +483,74 @@ fn finish_within_child(mut child: Child, limit: Duration) -> Output {
     }
 }
 
+/// A daemon that takes each connection and never answers holds `run
+/// --wait 1s` no longer than its limit, the deadline and 5 seconds for a
+/// last answer: the run exits 125 with `daemon_unavailable`, saying the
+/// daemon did not answer within the wait, and starts nothing.
+///
+/// Mutation: give each call of the wait the client's 300-second timeout
+/// (`Fresh` connecting with `Client::connect`): the run is still waiting
+/// at this test's 60-second bound and this fails.
+#[test]
+fn a_wait_on_a_silent_daemon_ends_by_its_limit() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = TestHome::new();
+    let dir = envcloak_testkit::daemon_run_dir(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = envcloak_testkit::daemon_socket(&home);
+    let l = UnixListener::bind(&socket).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
+    // Takes every connection and holds it, unanswered, until told to stop.
+    let server = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept() {
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            held.push(s);
+        }
+        held.len()
+    });
+    let files = outside_dir();
+    let marker = files.path().join("started");
+    let mut cmd = cli_command(
+        &home,
+        &[
+            "run",
+            "--wait",
+            "1s",
+            "--manifest",
+            "/nowhere/envcloak.toml",
+            "--",
+            "touch",
+            marker.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let started = Instant::now();
+    let out = finish_within_child(cmd.spawn().unwrap(), Duration::from_secs(60));
+    let took = started.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    drop(std::os::unix::net::UnixStream::connect(&socket));
+    let held = server.join().unwrap();
+    let e = stderr(&out);
+    assert_eq!(out.status.code(), Some(125), "{e}");
+    assert_eq!(
+        e,
+        "envcloak: daemon_unavailable: the daemon did not answer within the wait (1s, and 5s \
+         for a last answer); nothing was started\n"
+    );
+    assert!(took < Duration::from_secs(20), "{took:?}");
+    assert!(held >= 2, "{held}");
+    assert!(!marker.exists(), "the command was started");
+}
+
 /// The wait ends on SIGINT, as any program does (a shell reports 130),
 /// with nothing held open; and on a denial, which exits 125 with
 /// `approval_denied` naming the request.

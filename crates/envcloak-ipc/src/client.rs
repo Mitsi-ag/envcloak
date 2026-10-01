@@ -15,6 +15,13 @@
 //! sent. The socket is opened close-on-exec, so a child the CLI starts
 //! does not inherit the connection.
 //!
+//! Every connection is bounded in time from before it connects
+//! ([`envcloak_sys::connect_unix`]): a call waits at most 300 seconds for
+//! its answer (`vault create` runs Argon2id twice), and a waiter's call
+//! ([`Client::connect_within`]) no longer than the time its wait has
+//! left, so a daemon that stalls cannot hold `envcloak run --wait` past
+//! its deadline.
+//!
 //! On signed macOS builds the client will also check the daemon's code
 //! signature from its audit token (M3). Builds that pin no signing
 //! identity, which is every M1 build, cannot, and say so:
@@ -170,7 +177,20 @@ impl Client {
     /// [`ClientError::Unavailable`] when no daemon is running,
     /// [`ClientError::Unverified`] when a check fails.
     pub fn connect(p: &RunPaths) -> Result<Client, ClientError> {
-        Self::connect_as(p, envcloak_sys::effective_uid())
+        Self::connect_as(p, envcloak_sys::effective_uid(), CALL_TIMEOUT)
+    }
+
+    /// Connects as [`Client::connect`] does, for calls that must be
+    /// answered within `within` (at most 300 seconds, at least a
+    /// millisecond): the connect, each write and each read of an answer
+    /// give up after that long. A waiter passes the time its wait has
+    /// left ([`crate::wait`]).
+    ///
+    /// # Errors
+    /// As [`Client::connect`]; [`ClientError::Frame`] when the daemon did
+    /// not take the connection within `within`.
+    pub fn connect_within(p: &RunPaths, within: Duration) -> Result<Client, ClientError> {
+        Self::connect_as(p, envcloak_sys::effective_uid(), within)
     }
 
     /// Test support only (feature `testing`): connects as
@@ -178,10 +198,11 @@ impl Client {
     /// so a test can present a same-uid server as a foreign one.
     #[cfg(feature = "testing")]
     pub fn connect_expecting_uid(p: &RunPaths, uid: u32) -> Result<Client, ClientError> {
-        Self::connect_as(p, uid)
+        Self::connect_as(p, uid, CALL_TIMEOUT)
     }
 
-    fn connect_as(p: &RunPaths, uid: u32) -> Result<Client, ClientError> {
+    fn connect_as(p: &RunPaths, uid: u32, within: Duration) -> Result<Client, ClientError> {
+        let within = within.clamp(Duration::from_millis(1), CALL_TIMEOUT);
         match p.check_dir() {
             Ok(()) => {}
             Err(e) if e.kind() == RunPathErrorKind::Missing => {
@@ -196,13 +217,18 @@ impl Client {
             }
             Err(e) => return Err(ClientError::Unverified(Unverified::Socket(e.kind()))),
         }
-        // std opens Unix sockets close-on-exec.
-        let stream = match UnixStream::connect(&p.socket) {
+        // Close-on-exec, with its timeouts set before it connects.
+        let stream = match envcloak_sys::connect_unix(&p.socket, within) {
             Ok(s) => s,
             Err(e) => {
                 return Err(match e.kind() {
                     std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound => {
                         ClientError::Unavailable
+                    }
+                    // A listener there that did not take the connection in
+                    // time: a daemon too busy or stalled.
+                    k @ (std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                        ClientError::Frame(FrameError::Io(k))
                     }
                     k => ClientError::Unverified(Unverified::Socket(RunPathErrorKind::Io(k))),
                 });
@@ -214,10 +240,6 @@ impl Client {
         if server != uid {
             return Err(ClientError::Unverified(Unverified::ForeignServer));
         }
-        let timeouts = stream
-            .set_read_timeout(Some(CALL_TIMEOUT))
-            .and_then(|()| stream.set_write_timeout(Some(CALL_TIMEOUT)));
-        timeouts.map_err(|e| ClientError::Frame(FrameError::Io(e.kind())))?;
         Ok(Client { stream, next_id: 1 })
     }
 
