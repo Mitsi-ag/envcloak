@@ -105,7 +105,10 @@ pub use proc::{
     ancestry_in, parse_cmdline, parse_proc_stat, parse_procargs2, parse_status_euid, proc_argv,
     proc_info, reaches_top,
 };
-pub use signal::{TerminationSignals, TerminationWatch, exit_by_signal, termination_recorded};
+pub use signal::{
+    TerminationSignals, TerminationWatch, exit_by_signal, interrupt_ends_process,
+    termination_recorded,
+};
 pub use sock::connect_unix;
 pub use sync::{SyncMethod, sync_file};
 pub use tty::{SecretInput, hung_up, wait_readable, wait_writable};
