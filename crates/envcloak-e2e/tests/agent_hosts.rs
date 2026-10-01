@@ -1117,6 +1117,7 @@ fn last_tool_output(body: &str) -> String {
         return String::new();
     };
     let mut out = String::new();
+    // A string, a list of text parts, or anything else whole, as JSON.
     let text = |c: &serde_json::Value| match c {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(parts) => parts
@@ -1124,7 +1125,8 @@ fn last_tool_output(body: &str) -> String {
             .filter_map(|p| p["text"].as_str())
             .collect::<Vec<_>>()
             .join(" "),
-        _ => String::new(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
     };
     for m in v["messages"].as_array().into_iter().flatten() {
         for c in m["content"].as_array().into_iter().flatten() {
@@ -1378,8 +1380,9 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
         a.codex_config(&config);
         let script = json!({"steps": [
             {"shell": format!("{}; {}", status_probe(), egress("raw"))},
-            {"shell": egress("https")},
-            {"shell": egress("http")},
+            // With the probe's exit status, as `RC<n>`, built at run time.
+            {"shell": format!("{}; printf '%s%s\\n' 'R' \"C$?\"", egress("https"))},
+            {"shell": format!("{}; printf '%s%s\\n' 'R' \"C$?\"", egress("http"))},
             {"say": "done"},
         ]});
         let run = a.run(
@@ -1418,7 +1421,34 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
                     .filter(|c| c.is_ascii_graphic() || *c == ' ')
                     .take(200)
                     .collect();
-                format!("not tried (no output: {said:?})")
+                // And the shape of the last tool result, when it says
+                // nothing: its keys and their kinds, no values.
+                let shape = serde_json::from_str::<serde_json::Value>(text)
+                    .ok()
+                    .and_then(|v| {
+                        v["input"].as_array().and_then(|items| {
+                            items
+                                .iter()
+                                .rev()
+                                .find(|i| i["type"] == "function_call_output")
+                                .map(|i| {
+                                    i.as_object()
+                                        .map(|o| {
+                                            o.iter()
+                                                .map(|(k, v)| {
+                                                    let n = v.to_string().len();
+                                                    format!("{k}:{n}")
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(",")
+                                        })
+                                        .unwrap_or_default()
+                                })
+                        })
+                    })
+                    .unwrap_or_default();
+                let rc = printed(text, "RC").unwrap_or_else(|| "?".to_owned());
+                format!("not tried (no output: {said:?}; exit {rc}; result {shape})")
             }
         };
         let proxies = printed(&text, "PXY ").unwrap_or_else(|| "?".to_owned());
