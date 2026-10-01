@@ -118,6 +118,19 @@ impl Emitters {
         }
     }
 
+    /// Python's serializers (`emit.py` itself) and `ec-emit-serde`
+    /// (`serde`) only: nothing to find or build, so a story step that is
+    /// about something other than gate 8's serializers runs the same on
+    /// every machine, and with loopback only (the M2 agent jobs).
+    pub fn python_and_serde(serde: &Path) -> Emitters {
+        let path_of = |p: &Path| p.to_str().unwrap_or("").to_owned();
+        Emitters {
+            python: python3(),
+            runtimes: vec![("serde".to_owned(), vec![path_of(serde)])],
+            missing: vec!["node", "go", "dotnet", "php"],
+        }
+    }
+
     /// The serializers `emit` reports, in its order: `python` first.
     pub fn tags(&self) -> Vec<String> {
         let mut t = vec!["python".to_owned()];

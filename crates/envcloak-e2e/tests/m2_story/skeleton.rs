@@ -118,10 +118,9 @@ fn s0(host: Host, name: &str) {
         return;
     };
     let mut h = Harness::start();
-    let emitters = Emitters::prepare(
-        &Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e-emitters"),
-        Path::new(env!("CARGO_BIN_EXE_ec-emit-serde")),
-    );
+    // Gate 8's serializers are the M1 story's; S0 needs output that holds
+    // the values, and Python's and serde's are enough.
+    let emitters = Emitters::python_and_serde(Path::new(env!("CARGO_BIN_EXE_ec-emit-serde")));
     let repo = write_repo(&mut h, &emitters);
     // What every serializer makes of each value, made outside EnvCloak,
     // looked for as it is.
