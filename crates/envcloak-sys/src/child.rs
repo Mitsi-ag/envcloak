@@ -733,21 +733,33 @@ mod tests {
         })
     }
 
-    /// Whether the relay has kept `sig`, sent by this process, aside.
-    fn kept(sig: i32) -> bool {
+    /// Whether the relay's pipe has room for one more byte, found by
+    /// writing one, without blocking, as the handler does: `sig` sent by
+    /// this process, so a byte that fits reads as one more of it. It looks
+    /// at the pipe itself, not at what the handler kept aside.
+    fn room_for(relay: &SignalRelay, sig: i32) -> bool {
         let byte = u8::try_from(sig).unwrap() | BY_PROCESS;
-        KEPT[usize::from(byte)].load(Ordering::SeqCst) != 0
+        // SAFETY: `byte` is one readable byte; the write end is open for
+        // the life of the process, and non-blocking.
+        let n = unsafe { libc::write(relay.pipe.write.as_raw_fd(), (&raw const byte).cast(), 1) };
+        if n == 1 {
+            return true;
+        }
+        let err = io::Error::last_os_error();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        false
     }
 
-    /// Raises `sig` until the relay's pipe is full: the handler has just
-    /// kept one aside. What was kept for `sig` before is forgotten first,
-    /// so it is this flood that filled the pipe.
-    fn fill_with(sig: i32) {
-        let byte = u8::try_from(sig).unwrap() | BY_PROCESS;
-        KEPT[usize::from(byte)].store(0, Ordering::SeqCst);
+    /// Raises `sig` until the relay's pipe is full: a write of the same
+    /// byte finds no room. Nothing reads the pipe meanwhile, so it stays
+    /// full until the test reads it. Fullness is seen in the pipe, not in
+    /// what the handler kept (review F-71), so a handler that loses the
+    /// signals it cannot write still fills it, and the test fails where a
+    /// signal goes missing.
+    fn fill_with(relay: &SignalRelay, sig: i32) {
         for _ in 0..1 << 20 {
             raise(sig);
-            if kept(sig) {
+            if !room_for(relay, sig) {
                 return;
             }
         }
@@ -811,7 +823,7 @@ mod tests {
         for (name, put) in puts {
             let mut late = 0;
             loop {
-                fill_with(libc::SIGUSR1);
+                fill_with(&relay, libc::SIGUSR1);
                 PUT_WAITING.store(false, Ordering::SeqCst);
                 let done = AtomicBool::new(false);
                 let (result, returned, drained) = std::thread::scope(|s| {
@@ -874,9 +886,12 @@ mod tests {
         for flood in four {
             for then in four.into_iter().filter(|s| *s != flood) {
                 let relay = SignalRelay::install(&four).unwrap();
-                fill_with(flood);
+                fill_with(&relay, flood);
                 raise(then);
-                assert!(kept(then), "{then} found room after {flood}");
+                assert!(
+                    !room_for(&relay, flood),
+                    "the pipe full of {flood} had room again"
+                );
                 let got = read_to_stop(&relay);
                 let count = |sig| got.iter().filter(|r| Some(**r) == own(sig)).count();
                 assert_eq!(count(then), 1, "{then} after a pipe full of {flood}");
