@@ -46,7 +46,8 @@ impl core::fmt::Debug for Frame {
 pub enum FrameError {
     /// The peer closed the connection between frames.
     Closed,
-    /// The connection closed, or its deadline passed, inside a frame.
+    /// The connection closed or failed (a reset, an abort), or its
+    /// deadline passed, inside a frame.
     Truncated,
     /// The header announced more than [`MAX_FRAME`] bytes, or a message
     /// does not fit in one frame.
@@ -198,7 +199,9 @@ impl Frame {
     ///
     /// # Errors
     /// [`FrameError::Closed`] when the stream ends before a header starts,
-    /// [`FrameError::Truncated`] when it ends (or times out) inside one,
+    /// and [`FrameError::Io`] when reading fails or times out before one
+    /// starts; [`FrameError::Truncated`] when the stream ends, fails (a
+    /// reset, an abort) or times out once part of a frame was read;
     /// [`FrameError::Empty`] and [`FrameError::TooLarge`] for a refused
     /// header.
     pub fn read_from(r: &mut impl Read) -> Result<Frame, FrameError> {
@@ -210,7 +213,9 @@ impl Frame {
                 Ok(0) => return Err(FrameError::Truncated),
                 Ok(n) => got += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if got > 0 && timed_out(&e) => return Err(FrameError::Truncated),
+                // Inside a frame, however the stream failed: a caller
+                // must never take it for a frame that was not sent.
+                Err(_) if got > 0 => return Err(FrameError::Truncated),
                 Err(e) => return Err(FrameError::Io(e.kind())),
             }
         }
@@ -227,12 +232,9 @@ impl Frame {
                 body.grow(body.capacity().saturating_mul(2).min(len));
             }
             let n = (len - body.len()).min(body.capacity() - body.len());
-            if let Err(e) = body.read_exact_from(r, n) {
-                return Err(match e.kind() {
-                    io::ErrorKind::UnexpectedEof => FrameError::Truncated,
-                    _ if timed_out(&e) => FrameError::Truncated,
-                    k => FrameError::Io(k),
-                });
+            // The header was read: any failure now is inside the frame.
+            if body.read_exact_from(r, n).is_err() {
+                return Err(FrameError::Truncated);
             }
         }
         Ok(Frame { body })
@@ -250,11 +252,4 @@ impl Frame {
         w.write_all(self.body.expose_secret()).map_err(io)?;
         w.flush().map_err(io)
     }
-}
-
-fn timed_out(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
 }

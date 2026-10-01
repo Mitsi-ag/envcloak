@@ -24,15 +24,16 @@
 //!    root asked too often) doubles the pause, up to 2 seconds, and is
 //!    never taken as a refusal. A pause never gets shorter.
 //!
-//! A call the daemon did not take, its connection closed or reset before
-//! any answer (the daemon closes a connection at once, unanswered, when 32
-//! are open or 8 of one process), or, once the daemon has answered this
-//! wait, refused or with no socket there (a daemon restarting, or a
-//! listener whose backlog is full on macOS), is asked again after the
-//! busy backoff, as `busy` is, until the deadline. Before any answer, no
-//! daemon there is the failure at once, as it is without waiting; a
-//! socket or daemon that fails a check, and a connection that ends inside
-//! an answer, are never asked again.
+//! A call the daemon did not take, its connection closed, reset or no
+//! longer connected before any answer (the daemon closes a connection at
+//! once, unanswered, when 32 are open or 8 of one process), or, once the
+//! daemon has answered this wait, refused or with no socket there (a
+//! daemon restarting, or a listener whose backlog is full on macOS), is
+//! asked again after the busy backoff, as `busy` is, until the deadline.
+//! Before any answer, no daemon there is the failure at once, as it is
+//! without waiting; a socket or daemon that fails a check, and a
+//! connection that ends, fails or times out once part of an answer has
+//! come ([`FrameError::Truncated`]), are never asked again.
 //!
 //! The wait ends at its deadline, at most [`MAX_WAIT`] (the pending
 //! request's lifetime): the last poll is made at the deadline itself, and a
@@ -234,16 +235,19 @@ fn is_kind(e: &ClientError, kind: ErrorKind) -> bool {
 /// Whether `e` says the daemon did not take the call, so that it is asked
 /// again (see the module documentation): its connection closed before any
 /// answer, or reset (as a close with the request unread shows on Linux),
-/// at once or on the request; or, once the daemon has `answered` this
-/// wait, nothing listening there. A connection that ends inside an answer
-/// ([`FrameError::Truncated`]), a timeout, a socket or daemon that failed
-/// a check, and a malformed answer are not.
+/// at once or on the request, or no longer connected (as macOS sometimes
+/// reports a close that races the request); or, once the daemon has
+/// `answered` this wait, nothing listening there. A connection that ends
+/// or fails inside an answer ([`FrameError::Truncated`]), a timeout, a
+/// socket or daemon that failed a check, and a malformed answer are not.
 fn not_taken(e: &ClientError, answered: bool) -> bool {
     use std::io::ErrorKind as Io;
     match e {
         ClientError::Frame(
             FrameError::Closed
-            | FrameError::Io(Io::BrokenPipe | Io::ConnectionReset | Io::ConnectionAborted),
+            | FrameError::Io(
+                Io::BrokenPipe | Io::ConnectionReset | Io::ConnectionAborted | Io::NotConnected,
+            ),
         ) => true,
         ClientError::Unavailable => answered,
         _ => false,
