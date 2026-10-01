@@ -490,31 +490,103 @@ fn printed(text: &str, key: &str) -> Option<String> {
     Some(value)
 }
 
-/// Whether the shell tool's standard streams and controlling terminal
-/// are terminals (M2-17 and the interactive variant depend on it).
+/// What a command run by the shell tool has for a terminal: whether each
+/// standard stream is one (`[ -t fd ]`), whether it has a controlling
+/// terminal (it can open `/dev/tty`, which only a process with one can),
+/// and that terminal's name as `ps` gives it. Not `tty`, which reports on
+/// standard input alone (verifier, medium: a command whose input is
+/// redirected has a controlling terminal `tty` cannot see). The keys are
+/// built at run time, so the command's own text never matches them.
+const TTY_PROBE: &str = "for fd in 0 1 2; do if [ -t $fd ]; then t=T; else t=N; fi; \
+     printf '%s%s%s ' FD $fd $t; done; \
+     if (: </dev/tty) 2>/dev/null; then t=Y; else t=N; fi; printf '%s%s ' CTTY $t; \
+     t=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' '); printf '%s%s ' TTYNAME \"${t:-none}\"";
+
+/// [`TTY_PROBE`]'s answer in `output`, as `stdin=.. stdout=.. stderr=..
+/// controlling-terminal=.. (name)`; `None` when a part of it is missing.
+fn tty_shown(output: &str) -> Option<String> {
+    let get = |k: &str| printed(output, k).filter(|v| !v.is_empty());
+    Some(format!(
+        "stdin={} stdout={} stderr={} controlling-terminal={} ({})",
+        get("FD0")?,
+        get("FD1")?,
+        get("FD2")?,
+        get("CTTY")?,
+        get("TTYNAME")?
+    ))
+}
+
+/// The probe itself, with no host: under a pseudo-terminal of its own with
+/// standard input from `/dev/null`, it reports a controlling terminal and
+/// a standard input that is not a terminal; in a new session with no
+/// terminal, no controlling terminal. A probe that read the controlling
+/// terminal from standard input (`tty`) fails the first.
+#[test]
+fn the_terminal_probe_reads_the_controlling_terminal_not_standard_input() {
+    let driver = "import os, pty, sys\n\
+        probe = sys.argv[2]\n\
+        if sys.argv[1] == 'pty':\n\
+        \x20   pid, fd = pty.fork()\n\
+        \x20   if pid == 0:\n\
+        \x20       null = os.open('/dev/null', os.O_RDONLY)\n\
+        \x20       os.dup2(null, 0)\n\
+        \x20       os.execv('/bin/sh', ['/bin/sh', '-c', probe])\n\
+        \x20   out = b''\n\
+        \x20   while True:\n\
+        \x20       try:\n\
+        \x20           c = os.read(fd, 4096)\n\
+        \x20       except OSError:\n\
+        \x20           break\n\
+        \x20       if not c:\n\
+        \x20           break\n\
+        \x20       out += c\n\
+        \x20   os.waitpid(pid, 0)\n\
+        \x20   sys.stdout.write(out.decode())\n\
+        else:\n\
+        \x20   os.setsid()\n\
+        \x20   os.execv('/bin/sh', ['/bin/sh', '-c', probe])\n";
+    let run = |mode: &str| {
+        let out = std::process::Command::new(envcloak_e2e::python3())
+            .args(["-c", driver, mode, TTY_PROBE])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        tty_shown(&text).unwrap_or_else(|| panic!("the probe printed {text:?}"))
+    };
+    let in_terminal = run("pty");
+    assert!(
+        in_terminal.starts_with("stdin=N stdout=T stderr=T controlling-terminal=Y"),
+        "{in_terminal}"
+    );
+    let detached = run("setsid");
+    assert!(
+        detached.starts_with("stdin=N stdout=N stderr=N controlling-terminal=N"),
+        "{detached}"
+    );
+}
+
+/// Whether the shell tool's standard streams are terminals and whether it
+/// has a controlling terminal ([`TTY_PROBE`]), as the harness runs a host
+/// here: `-p` or `exec`, standard input from `/dev/null`, in a session of
+/// its own with no terminal (M2-17 and M2-19 depend on it; the interactive
+/// case is in [`claude_code_interactive_trust_and_paste`]).
 fn tty_in_the_shell_tool(h: Host) {
     let Some(a) = host(h, "native", "tty_in_the_shell_tool") else {
         return;
     };
-    // The printed keys are built at run time, so the command's own text
-    // never matches them.
-    let probe = "for fd in 0 1 2; do if [ -t $fd ]; then t=T; else t=N; fi; \
-                 printf '%s%s%s ' FD $fd $t; done; \
-                 if tty >/dev/null 2>&1; then t=Y; else t=N; fi; printf '%s%s ' CTTY $t";
-    let script = json!({"steps": [{"shell": probe}, {"say": "done"}]});
+    let script = json!({"steps": [{"shell": TTY_PROBE}, {"say": "done"}]});
     let run = a.run(&script, "Check the terminal.", &flags(h), &a.home_dir());
     assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
-    let text = after_call(&run, "step 1");
-    let get = |k: &str| printed(&text, k).unwrap_or_else(|| "?".to_owned());
-    let shown = format!(
-        "stdin={} stdout={} stderr={} controlling-terminal={}",
-        get("FD0"),
-        get("FD1"),
-        get("FD2"),
-        get("CTTY")
+    let output = last_tool_output(&after_call(&run, "step 1"));
+    let shown = tty_shown(&output).unwrap_or_else(|| panic!("the probe printed {output:?}"));
+    measure(
+        &a,
+        "shell tool terminal, no terminal for the host (T=tty, N=not)",
+        shown,
     );
-    assert!(!shown.contains('?'), "{shown}");
-    measure(&a, "shell tool terminal (T=tty, N=not)", shown);
 }
 
 #[test]
@@ -1593,9 +1665,15 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
 /// exited `limit` seconds after the last step (it is killed in both
 /// cases). The screen is never printed: it can hold what was pasted. On a
 /// timeout it is written to `screen`, for diagnosis. The program leads a
-/// session of its own, outside the driver's process group, so a `SIGTERM`
-/// to the driver (the harness's limit) kills it first: the driver's own,
-/// unreaped child.
+/// session and a process group of its own, outside the driver's, so the
+/// harness's group kill does not reach it: the driver ends that group
+/// itself, whenever the program exits, is killed or outlives the driver's
+/// limit, and on a `SIGTERM` to the driver (the harness's limit). The
+/// group is killed while the program that leads it is still unreaped (its
+/// exit is seen with `waitid(WNOWAIT)`), so its id cannot have been reused,
+/// and then the program is reaped (D-34); what the program left running
+/// in its group (a process that ignores the hangup when the terminal
+/// closes) goes with it.
 const PTY_DRIVER: &str = r#"import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
 spec = json.load(open(sys.argv[1]))
 pid, fd = pty.fork()
@@ -1605,9 +1683,16 @@ if pid == 0:
 # SIGTERM is blocked around every reap, so the handler only ever runs
 # while the child is unreaped.
 TERM = {signal.SIGTERM}
+def end_group():
+    # The child leads the group (pty.fork made it a session leader) and is
+    # unreaped: the group's id is still its.
+    try:
+        os.killpg(pid, 9)
+    except OSError:
+        pass
 def stop(*_):
     signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
-    os.kill(pid, 9)
+    end_group()
     os.waitpid(pid, 0)
     sys.exit(1)
 signal.signal(signal.SIGTERM, stop)
@@ -1662,25 +1747,25 @@ for i, step in enumerate(spec["steps"]):
                 open(spec["screen"], "wb").write(screen())
             print("TIMEOUT %d" % i)
             signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
-            try:
-                os.kill(pid, 9)
-            except OSError:
-                pass
+            end_group()
             os.waitpid(pid, 0)
             sys.exit(0)
         alive = more(min(end, time.time() + 0.5))
 end = time.time() + spec["limit"]
 while time.time() < end:
     signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
-    done, status = os.waitpid(pid, os.WNOHANG)
-    if done:
+    # Seen without reaping: the group is ended first.
+    if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+        end_group()
+        _, status = os.waitpid(pid, 0)
         print("EXIT %d" % os.waitstatus_to_exitcode(status))
         sys.exit(0)
     signal.pthread_sigmask(signal.SIG_UNBLOCK, TERM)
     more(min(end, time.time() + 0.2))
-# Still running after the last step: killed, its own unreaped child.
+# Still running after the last step: killed with its group, its own
+# unreaped child.
 signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
-os.kill(pid, 9)
+end_group()
 os.waitpid(pid, 0)
 print("STILL RUNNING")
 "#;
@@ -1691,12 +1776,14 @@ print("STILL RUNNING")
 /// unchanged for this long is when the dialog has been seen to take them.
 const SETTLED_MS: u64 = 3000;
 
-/// Runs Claude Code interactively in `a`'s home against `model`, driven
-/// by `steps`; the driver's last line.
+/// Runs Claude Code interactively in `a`'s home against `model`, with
+/// `args` (its flags, pinned per run), driven by `steps`; the driver's
+/// last line.
 fn interactive_claude(
     a: &AgentHome,
     model: &envcloak_testkit::agents::Model,
     cwd: &Path,
+    args: &[&str],
     limit: u64,
     steps: serde_json::Value,
 ) -> String {
@@ -1717,8 +1804,10 @@ fn interactive_claude(
             }
         })
         .collect();
+    let mut argv = vec![a.installed.exe.to_str().unwrap()];
+    argv.extend_from_slice(args);
     let spec = json!({
-        "argv": [a.installed.exe.to_str().unwrap()],
+        "argv": argv,
         "env": env,
         "cwd": cwd.to_str().unwrap(),
         "limit": limit,
@@ -1742,6 +1831,82 @@ fn interactive_claude(
         .last()
         .unwrap_or("")
         .to_owned()
+}
+
+/// The pseudo-terminal driver ends what its program leaves behind (Codex
+/// review, medium: the program leads a session of its own, the harness's
+/// group kill does not reach it, and the driver reaped it at once and
+/// never killed its group). The program starts a process that ignores the
+/// hangup and holds a FIFO's write end open, then exits; once the driver
+/// has returned, the FIFO reads to its end: nothing holds it any more.
+#[test]
+fn the_pty_driver_ends_what_its_program_leaves_running() {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let home = envcloak_testkit::TestHome::new();
+    let fifo = home.root().join("held");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    let program = home.root().join("leaves-one.sh");
+    std::fs::write(
+        &program,
+        format!(
+            "exec 3>{}\nprintf x >&3\n(trap '' HUP; exec sleep 600) &\nexit 0\n",
+            envcloak_e2e::quoted(fifo.to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    let spec = json!({
+        "argv": ["/bin/sh", program.to_str().unwrap()],
+        "env": [["PATH", "/usr/bin:/bin"]],
+        "cwd": home.root().to_str().unwrap(),
+        "limit": 30,
+        "steps": [],
+    });
+    let spec_path = home.root().join("pty-spec.json");
+    std::fs::write(&spec_path, spec.to_string()).unwrap();
+    let mut cmd = std::process::Command::new(envcloak_e2e::python3());
+    cmd.arg("-c")
+        .arg(PTY_DRIVER)
+        .arg(&spec_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = envcloak_testkit::agents::finish_within(cmd, std::time::Duration::from_secs(60));
+    let last = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()
+        .unwrap_or("")
+        .to_owned();
+    assert_eq!(last, "EXIT 0");
+    let mut got = Vec::new();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut chunk = [0u8; 16];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < end,
+                    "a process the program left running still holds the FIFO"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("read the FIFO: {e}"),
+        }
+    }
+    assert_eq!(got, b"x", "the program never started what it leaves behind");
 }
 
 /// One interactive Claude Code session through a pseudo-terminal (D-13,
@@ -1775,6 +1940,7 @@ fn claude_code_interactive_trust_and_paste() {
         &a,
         &model,
         &project,
+        &[],
         30,
         json!([
             ["wait", "trust this folder", 1],
@@ -1826,6 +1992,7 @@ fn claude_code_interactive_trust_and_paste() {
         &a,
         &model,
         &project,
+        &[],
         120,
         json!([
             ["wait", "trust this folder", 1],
@@ -1872,4 +2039,45 @@ fn claude_code_interactive_trust_and_paste() {
             stores.join(", "),
         );
     }
+
+    // The Bash tool in an interactive session, the host on a terminal of
+    // its own (the flags pinned: default permission mode, Bash allowed):
+    // what a command it runs has for a terminal (TTY_PROBE).
+    let project = a.root().join("project-3");
+    std::fs::create_dir_all(&project).unwrap();
+    let script = json!({"steps": [{"shell": TTY_PROBE}, {"say": "probe done"}], "side": "ok"});
+    let model = envcloak_testkit::agents::Model::start(&script);
+    approve_key(&model);
+    let end = interactive_claude(
+        &a,
+        &model,
+        &project,
+        &["--permission-mode", "default", "--allowedTools", "Bash"],
+        120,
+        json!([
+            ["wait", "trust this folder", 1],
+            ["idle", SETTLED_MS],
+            ["send", "\u{1b}[B\r"],
+            ["wait", "for shortcuts", 1],
+            ["send", "Check the terminal.\r"],
+            ["wait", "probe done", 1],
+            ["send", "/exit\r"],
+        ]),
+    );
+    let report = model.finish();
+    a.check_pinned();
+    a.check_isolated();
+    assert!(end.starts_with("EXIT"), "the session did not end: {end}");
+    let after = report
+        .requests
+        .iter()
+        .find(|r| r.pick.as_deref() == Some("step 1"))
+        .map(|r| last_tool_output(&String::from_utf8_lossy(&r.body)))
+        .unwrap_or_else(|| panic!("no request after the probe: {:?}", report.requests));
+    let shown = tty_shown(&after).unwrap_or_else(|| panic!("the probe printed {after:?}"));
+    measure(
+        &a,
+        "interactive: shell tool terminal, the host on a terminal (T=tty, N=not)",
+        shown,
+    );
 }
