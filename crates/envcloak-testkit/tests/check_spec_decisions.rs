@@ -4,12 +4,15 @@
 //! worker sentence, F-74; the real-model release rule; the descriptor exec
 //! of a bound Linux launch), wrapped or not and in any letter case, a
 //! release that rests on EnvCloak's own `envcloak` executable or binary or
-//! on any other reading of the requester's code (CR-1), a missing or
-//! weakened tool allowlist or per-call grant check (D-30, D-31), a missing
-//! or weakened standing-approval clause (D-10, D-11) or launch-binding
-//! clause (D-33, D-36, gate 39), a decision whose edit is gone, a decided
-//! sentence twice, an em dash and an older version. With `--pr-files` it
-//! refuses a SPEC pull request that changes any file but docs/SPEC.md.
+//! on any other reading of the requester's code, in the reviewers' other
+//! words too (CR-1), a missing or weakened tool allowlist or per-call grant
+//! check (D-30, D-31), a missing or weakened standing-approval clause
+//! (D-10, D-11) or launch-binding clause (D-33, D-36, gate 39), including
+//! what a bound launch does not bind, where a sealed copy cannot run and
+//! where the sign-in driver starts from, a decision whose edit is gone, a
+//! decided sentence twice, an em dash and an older version. With
+//! `--pr-files` it refuses a SPEC pull request that changes any file but
+//! docs/SPEC.md.
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -532,5 +535,106 @@ fn gate_39_without_its_launch_binding_fails() {
             "runs the checked image, never the rewritten one",
             "is refused when the change is seen",
         )],
+    );
+}
+
+// --- Review of PR #14, round 3 --------------------------------------------
+
+#[test]
+fn a_release_resting_on_the_requesters_code_in_other_words_fails() {
+    // The verifier's paraphrases, each outside rule 6: EnvCloak's own
+    // `envcloak` without backticks, the bridge's code signature, the peer
+    // being the `envcloak` binary, and the requester's executable SHA-256;
+    // and `envcloak mcp`'s cdhash.
+    for (wording, name) in [
+        (
+            "The bridge's executable must be EnvCloak's own envcloak executable.",
+            "a release that rests on EnvCloak's own `envcloak` executable or binary (CR-1)",
+        ),
+        (
+            "The values go to the bridge only when the bridge's code signature equals the one EnvCloak ships.",
+            "a release that rests on the requester's code (CR-1)",
+        ),
+        (
+            "The values go only if the peer process is the envcloak binary installed beside envcloakd.",
+            "a release that rests on the requester being EnvCloak's `envcloak` (CR-1)",
+        ),
+        (
+            "The values go only to a requester whose executable SHA-256 equals the anchor.",
+            "a release that rests on the requester's code (CR-1)",
+        ),
+        (
+            "The values go only when `envcloak mcp`'s cdhash matches the anchor's.",
+            "a release that rests on the requester's code (CR-1)",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, DAEMON_STARTED, &format!("{DAEMON_STARTED} {wording}"));
+        assert_fails(&t.home(), &[], &format!("the SPEC still holds {name}"));
+    }
+}
+
+/// §6.6: what a `bound` launch does not bind (D-33).
+const MAIN_EXECUTABLE_ONLY: &str = "A `bound` launch binds the server's main executable only, not the dynamic loader, the shared libraries it loads or anything they load, so a program running as you that can write those files (as in a Homebrew or Linuxbrew prefix) can change what the server runs; the launch receipt says so.";
+/// §6.6: a program that cannot run from the copy is not run from its file.
+const NEVER_FROM_FILE: &str = "A program that reads its own path only while it runs (through `/proc/self/exe`) cannot be recognised before it starts: from the copy it may fail to start, and it is then never started from its file instead.";
+/// §6.6: where a sealed memfd cannot be executed, no managed servers.
+const NO_SEALED_EXEC: &str = "On a system whose kernel or security policy refuses to execute a sealed memfd (for example `vm.memfd_noexec=2`), the daemon cannot start its own runner or relay either (below), so managed servers are unavailable there: a request for one is refused with `runner_unavailable`, and the server is reported as manual.";
+/// §6.8: where the sign-in reaper and driver are started from.
+const DRIVER_START: &str = "The daemon starts the reaper and the driver from its own executable as it was when the daemon started, never from a path it reads again: on Linux from a sealed in-memory copy of `envcloakd` made then, as it starts its own modes of `envcloak` (§6.6); on macOS from a suspended start whose code directory hash must equal its own.";
+
+#[test]
+fn a_bound_launch_claimed_to_bind_its_libraries_fails() {
+    assert_each_change_fails(
+        "§6.6 a bound launch binds the main executable only (D-33)",
+        MAIN_EXECUTABLE_ONLY,
+        &[
+            (
+                " only, not the dynamic loader, the shared libraries it loads or anything they load",
+                "",
+            ),
+            ("; the launch receipt says so", ""),
+        ],
+    );
+}
+
+#[test]
+fn a_launch_that_fails_from_the_copy_run_from_its_file_fails() {
+    assert_each_change_fails(
+        "§6.6 never started from its file instead (D-33)",
+        NEVER_FROM_FILE,
+        &[(
+            "it is then never started from its file instead",
+            "it is then started from its file instead",
+        )],
+    );
+}
+
+#[test]
+fn a_fallback_where_a_sealed_copy_cannot_run_fails() {
+    // The verifier's case: the old text promised a `checked_at_rest`
+    // fallback on such a system, where the runner itself cannot start.
+    assert_each_change_fails(
+        "§6.6 no sealed copy, no managed servers (D-36)",
+        NO_SEALED_EXEC,
+        &[(
+            "so managed servers are unavailable there: a request for one is refused with `runner_unavailable`, and the server is reported as manual",
+            "so its launches are `checked_at_rest`",
+        )],
+    );
+}
+
+#[test]
+fn a_sign_in_driver_started_from_a_path_read_again_fails() {
+    assert_each_change_fails(
+        "§6.8 the reaper and driver start from the daemon's own executable (D-25, D-36)",
+        DRIVER_START,
+        &[
+            (", never from a path it reads again", ""),
+            (
+                "from a sealed in-memory copy of `envcloakd` made then",
+                "from the `envcloakd` file",
+            ),
+        ],
     );
 }

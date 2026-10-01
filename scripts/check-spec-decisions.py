@@ -17,12 +17,21 @@ SPEC v0.4 pull request wrote them (plan task M2-01).
   standing approval can cover (D-10, D-11); how a bound launch runs what
   was checked, from a sealed copy on Linux and after a code directory
   check on macOS, and that nothing else is bound or standing-capable
-  (D-33); the sealed copy the daemon starts its own modes from (D-36); and
-  gate 39's launch binding.
+  (D-33); what a bound launch does not bind (its libraries), and that a
+  program that cannot run from the sealed copy is never run from its file
+  instead (D-33); the sealed copy the daemon starts its own modes from,
+  and that managed servers are unavailable where it cannot be executed
+  (D-36); the daemon's own executable as the only source of the sign-in
+  reaper and driver (D-25, D-36); and gate 39's launch binding.
 - The wording they replaced is gone, in any letter case, and nothing makes
-  a release depend on the requesting process's code, such as EnvCloak's
-  own `envcloak` executable or binary: the daemon cannot identify a
-  hardened client's code on Linux (CR-1).
+  a release depend on the requesting process's code: not on EnvCloak's own
+  `envcloak` (backticked or not), not on the requester, caller, client,
+  peer, bridge or `envcloak mcp` being the `envcloak` binary, and not on
+  their executable, binary, code, signature, hash, SHA-256, cdhash, Team
+  ID or signing identifier matching anything. The daemon cannot identify a
+  hardened client's code on Linux (CR-1). These patterns catch the
+  wordings reviewers wrote; a paraphrase they miss is left to code-owner
+  review of SPEC edits.
 - The status line says v0.4, and the file holds no em dash.
 
 Runs of whitespace, line breaks included, count as one space in the SPEC
@@ -204,7 +213,43 @@ REQUIRED = {
         "takes effect when the daemon restarts; on macOS from a suspended start whose code "
         "directory hash must equal the one the daemon read when it started."
     ),
+    "§6.6 a bound launch binds the main executable only (D-33)": (
+        "A `bound` launch binds the server's main executable only, not the dynamic loader, the "
+        "shared libraries it loads or anything they load, so a program running as you that can "
+        "write those files (as in a Homebrew or Linuxbrew prefix) can change what the server "
+        "runs; the launch receipt says so."
+    ),
+    "§6.6 never started from its file instead (D-33)": (
+        "A program that reads its own path only while it runs (through `/proc/self/exe`) cannot "
+        "be recognised before it starts: from the copy it may fail to start, and it is then "
+        "never started from its file instead."
+    ),
+    "§6.6 no sealed copy, no managed servers (D-36)": (
+        "On a system whose kernel or security policy refuses to execute a sealed memfd (for "
+        "example `vm.memfd_noexec=2`), the daemon cannot start its own runner or relay either "
+        "(below), so managed servers are unavailable there: a request for one is refused with "
+        "`runner_unavailable`, and the server is reported as manual."
+    ),
+    "§6.8 the reaper and driver start from the daemon's own executable (D-25, D-36)": (
+        "The daemon starts the reaper and the driver from its own executable as it was when the "
+        "daemon started, never from a path it reads again: on Linux from a sealed in-memory copy "
+        "of `envcloakd` made then, as it starts its own modes of `envcloak` (§6.6); on macOS from "
+        "a suspended start whose code directory hash must equal its own."
+    ),
 }
+
+# The parts of the CR-1 patterns below: who asks for a release, what of its
+# code a check would read, and the verbs that make a release rest on it.
+REQUESTER = (
+    r"(?:requester|requesting (?:process|client)|caller|calling process|client|"
+    r"connecting process|peer(?: process)?|bridge|`?mcp-bridge`?|`?envcloak mcp`?)"
+)
+CODE = (
+    r"(?:(?:executable|binary|program|code)"
+    r"(?: (?:identity|signature|hash|sha-256|cdhash|code directory hash|team id|signing identifier))?"
+    r"|code directory hash|signature|hash|sha-256|cdhash|team id|signing identifier)"
+)
+RESTS_ON = r"(?:is|are|must|matches|match|equals|equal|comes from|come from|has to)"
 
 # What v0.4 replaced, as regular expressions over the SPEC with its
 # whitespace collapsed, matched in any letter case; a plain phrase is
@@ -213,10 +258,14 @@ FORBIDDEN = {
     "the old gate b12": re.escape("no trust, refresh or session state from the worker remains usable"),
     "the old §6.8 worker sentence": re.escape("no trust, refresh or session state from the worker outlives the attempt"),
     "the file's own descriptor as the binding of a bound Linux launch (D-33)": re.escape("the runner executes the very descriptor the daemon checked"),
-    "a release that rests on EnvCloak's own `envcloak` executable or binary (CR-1)": r"\bown `envcloak`",
+    "a release that rests on EnvCloak's own `envcloak` executable or binary (CR-1)": r"\bown `?envcloak\b",
     "a release that rests on the requester's code (CR-1)": (
-        r"\b(?:requester|requesting process|caller|client|peer)(?:'s)? "
-        r"(?:executable|binary|code)(?: identity)? (?:is|must|matches|equals|comes from)\b"
+        r"\b%s(?:'s|\u2019s| whose)?(?: own)? %s %s\b" % (REQUESTER, CODE, RESTS_ON)
+    ),
+    "a release that rests on the requester being EnvCloak's `envcloak` (CR-1)": (
+        r"\b%s (?:is|must be|matches|equals|has to be|comes from) "
+        r"(?:the |an? |envcloak's |envcloak\u2019s )?(?:own )?`?envcloak`?(?:'s)? "
+        r"(?:binary|executable|program|code|command)\b" % REQUESTER
     ),
     "a release that rests on the requester's executable identity (CR-1)": re.escape("executable identity is EnvCloak's"),
     "the old §1.1 inject-mode claim": re.escape("keeps keys out of files, prompts, configs and transcripts"),
