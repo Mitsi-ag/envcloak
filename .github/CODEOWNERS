@@ -41,3 +41,12 @@
 # (plan task M2-01).
 /crates/envcloak-signin/                     @Mitsi-ag
 /crates/envcloak-browser/                    @Mitsi-ag
+
+# M2 plan D-23 and task M2-01: the reservation check's SHARED allowlist and
+# its baseline of M1's entries decide which names may enter the code
+# unreserved, and the SPEC check decides which decided sentences and
+# security clauses must stay; like the crate-graph table, each needs a
+# code owner's review.
+/scripts/check-reservations.py               @Mitsi-ag
+/scripts/check-reservations-baseline.txt     @Mitsi-ag
+/scripts/check-spec-decisions.py             @Mitsi-ag
