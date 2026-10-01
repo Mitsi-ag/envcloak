@@ -14,12 +14,11 @@
 
 use std::process::ExitCode;
 
+use envcloak_client::connect::{connect, run_paths};
+use envcloak_client::fail::{FAILURE, Failure, START_DAEMON, usage};
+use envcloak_client::render;
 use envcloak_ipc::view::{HardeningView, Integrity, StatusView, VaultState};
 use envcloak_ipc::{ClientError, DaemonIdentity};
-
-use crate::connect::{connect, run_paths};
-use crate::fail::{FAILURE, Failure, START_DAEMON, usage};
-use crate::render;
 
 pub fn run(args: &[&str]) -> ExitCode {
     let json = match args {

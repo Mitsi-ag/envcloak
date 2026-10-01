@@ -26,13 +26,14 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use envcloak_client::claims::refuse_if_claimed;
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
+use envcloak_client::render::print;
+use envcloak_client::tty::{InputError, Terminal, read_secret_fd};
 use envcloak_core::{RecoveryKit, SecretBytes, check_passphrase};
 
-use super::{fd_number, refuse_if_claimed};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
-use crate::render::print;
-use crate::tty::{InputError, Terminal, read_secret_fd};
+use super::fd_number;
 
 const USAGE_TEXT: &str =
     "envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]";

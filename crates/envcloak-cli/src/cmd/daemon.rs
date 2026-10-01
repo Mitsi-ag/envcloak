@@ -29,10 +29,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 use std::time::{Duration, Instant};
 
+use envcloak_client::connect::run_paths;
+use envcloak_client::fail::{FAILURE, Failure, usage};
 use envcloak_ipc::Client;
-
-use crate::connect::run_paths;
-use crate::fail::{FAILURE, Failure, usage};
 
 const USAGE: &str = "envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]\n       envcloak daemon uninstall";
 

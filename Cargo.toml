@@ -10,6 +10,7 @@ members = ["crates/*", "security/lint-canary", "security/unsafe-canary"]
 default-members = [
   "crates/envcloak-agents",
   "crates/envcloak-cli",
+  "crates/envcloak-client",
   "crates/envcloak-core",
   "crates/envcloak-daemon",
   "crates/envcloak-exec",
@@ -37,6 +38,7 @@ authors = ["EnvCloak contributors"]
 # pinned to exact versions and bumped deliberately. Others use caret
 # requirements; Cargo.lock pins them and CI builds with --locked.
 [workspace.dependencies]
+envcloak-client = { path = "crates/envcloak-client", version = "0.1.0" }
 envcloak-core = { path = "crates/envcloak-core", version = "0.1.0" }
 envcloak-exec = { path = "crates/envcloak-exec", version = "0.1.0" }
 envcloak-ipc = { path = "crates/envcloak-ipc", version = "0.1.0" }

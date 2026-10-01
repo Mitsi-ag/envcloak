@@ -222,6 +222,7 @@ dependencies = [
 name = "envcloak"
 version = "0.1.0"
 dependencies = [
+ "envcloak-client",
  "envcloak-core",
  "envcloak-exec",
  "envcloak-ipc",
@@ -232,17 +233,33 @@ dependencies = [
  "envcloak-testkit",
  "libc",
  "regex",
- "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "toml_edit",
  "zeroize",
 ]
 
 [[package]]
 name = "envcloak-agents"
 version = "0.1.0"
+
+[[package]]
+name = "envcloak-client"
+version = "0.1.0"
+dependencies = [
+ "envcloak-core",
+ "envcloak-ipc",
+ "envcloak-policy",
+ "envcloak-providers",
+ "envcloak-sys",
+ "envcloak-testkit",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml_edit",
+ "zeroize",
+]
 
 [[package]]
 name = "envcloak-core"

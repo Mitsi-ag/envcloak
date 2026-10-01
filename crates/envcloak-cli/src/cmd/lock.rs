@@ -3,8 +3,8 @@
 
 use std::process::ExitCode;
 
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, usage};
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, usage};
 
 pub fn run(args: &[&str]) -> ExitCode {
     if !args.is_empty() {

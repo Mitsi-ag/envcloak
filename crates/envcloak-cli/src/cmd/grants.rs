@@ -8,16 +8,15 @@
 //! running as the user could answer in the daemon's place, and an agent
 //! names the directories a grant's project is in. The `--json` form
 //! prints the daemon's answer through the CLI's one JSON writer
-//! ([`crate::render::json_text`]), which escapes the same characters.
+//! ([`envcloak_client::render::json_text`]), which escapes the same characters.
 
 use std::process::ExitCode;
 
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, usage};
+use envcloak_client::render::json_text;
 use envcloak_ipc::view::{GrantView, GrantsView};
 use envcloak_policy::{GrantId, SubjectKind, Uses, escape_for_display};
-
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, usage};
-use crate::render::json_text;
 
 const USAGE: &str = "envcloak grants list [--json]\n       envcloak grants revoke <GRANT> | --all";
 

@@ -13,14 +13,15 @@
 
 use std::process::ExitCode;
 
+use envcloak_client::claims::refuse_if_claimed;
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
+use envcloak_client::tty::{Terminal, read_secret_fd};
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::VaultState;
 use envcloak_ipc::{ClientError, RpcError};
 
-use super::{fd_number, refuse_if_claimed};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
-use crate::tty::{Terminal, read_secret_fd};
+use super::fd_number;
 
 const USAGE: &str = "envcloak unlock [--passphrase-fd N]";
 

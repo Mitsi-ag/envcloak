@@ -13,11 +13,13 @@
 
 use std::process::ExitCode;
 
-use super::{claims, fd_number, refuse_if_claimed, refuse_value_like};
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, USAGE, refuse_if_traced, usage};
-use crate::render::{print, remove_statement};
-use crate::tty::{Terminal, read_secret_fd};
+use envcloak_client::claims::{claims, refuse_if_claimed};
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, USAGE, refuse_if_traced, usage};
+use envcloak_client::render::{print, remove_statement};
+use envcloak_client::tty::{Terminal, read_secret_fd};
+
+use super::{fd_number, refuse_value_like};
 
 const USAGE_TEXT: &str = "envcloak rm <slug> [--passphrase-fd N] [--json]";
 

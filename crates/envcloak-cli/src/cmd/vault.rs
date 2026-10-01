@@ -25,15 +25,15 @@ use std::fs::File;
 use std::io::Write;
 use std::process::ExitCode;
 
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
+use envcloak_client::tty::{InputError, Terminal, read_secret_fd};
 use envcloak_core::{RecoveryKit, SecretBytes, check_passphrase, suggest_passphrase};
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::VaultState;
 use envcloak_ipc::{ClientError, RpcError};
 
 use super::fd_number;
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, refuse_if_traced, usage};
-use crate::tty::{InputError, Terminal, read_secret_fd};
 
 const USAGE: &str =
     "envcloak vault create [--passphrase-fd N] [--kit-fd N] [--kdf-memory SIZE (64MiB to 4GiB)]";

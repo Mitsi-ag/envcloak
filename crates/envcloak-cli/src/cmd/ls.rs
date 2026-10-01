@@ -5,9 +5,9 @@
 
 use std::process::ExitCode;
 
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, usage};
-use crate::render::print;
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, usage};
+use envcloak_client::render::print;
 
 const USAGE: &str = "envcloak ls [--long] [--json]";
 

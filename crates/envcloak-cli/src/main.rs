@@ -20,8 +20,8 @@
 //! - `envcloak add`, `ls`, `show`, `ref`, `check`, `rotate` and `rm`: the
 //!   vault's items and the project's references, metadata only (SPEC §6.3,
 //!   §7, §10b). Their output is `envcloak_ipc::view` types rendered by
-//!   [`render`], as text or with `--json`; `rotate` and `rm` need the
-//!   passphrase as a proof;
+//!   [`envcloak_client::render`], as text or with `--json`; `rotate` and
+//!   `rm` need the passphrase as a proof;
 //! - `envcloak init`, `import --scan` and `recovery confirm`: env files
 //!   imported into the vault with filesystem-safe scanning, and deleted
 //!   only after the four conditions of SPEC §6.4 (see [`cmd::init`]);
@@ -53,16 +53,11 @@
 //! the command line `run` sends for approval must be the one it was given.
 
 mod cmd;
-mod connect;
-mod fail;
-mod gitignore;
-mod render;
-mod tty;
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use fail::USAGE;
+use envcloak_client::fail::USAGE;
 
 #[global_allocator]
 static ALLOCATOR: envcloak_sys::WipingAllocator = envcloak_sys::WipingAllocator;

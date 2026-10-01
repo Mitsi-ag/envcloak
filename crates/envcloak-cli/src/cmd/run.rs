@@ -47,6 +47,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::ExitCode;
 
+use envcloak_client::claims::claims;
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, usage};
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
 use envcloak_exec::{CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
@@ -57,10 +60,6 @@ use envcloak_policy::{
     parse_env_file_refs,
 };
 use zeroize::Zeroize;
-
-use super::claims;
-use crate::connect::connect;
-use crate::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, usage};
 
 const USAGE_TEXT: &str =
     "envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>";

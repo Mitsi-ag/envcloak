@@ -39,6 +39,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::ExitCode;
 
+use envcloak_client::connect::connect;
+use envcloak_client::fail::{FAILURE, Failure, usage};
+use envcloak_client::render::{MAX_ENV_FILES, looks_like_value, print, registry};
 use envcloak_core::SecretBuf;
 use envcloak_ipc::view::{
     CheckReport, EnvFileState, EnvFileView, EnvRefView, PlaintextView, RefStatus,
@@ -46,14 +49,7 @@ use envcloak_ipc::view::{
 use envcloak_policy::{MAX_ENV_FILE, find_manifest, parse_env_file_refs};
 use zeroize::Zeroize;
 
-use crate::connect::connect;
-use crate::fail::{FAILURE, Failure, usage};
-use crate::render::{looks_like_value, print, registry};
-
 const USAGE: &str = "envcloak check [--json]";
-
-/// Env files looked at in one directory, at most.
-pub const MAX_ENV_FILES: usize = 64;
 
 pub fn run(args: &[&str]) -> ExitCode {
     let json = match args {
