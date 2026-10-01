@@ -1,0 +1,14 @@
+{
+  "cwd": "<home>",
+  "hook_event_name": "PreToolUse",
+  "model": "ec-scripted",
+  "permission_mode": "bypassPermissions",
+  "session_id": "<id>",
+  "tool_input": {
+    "command": "echo hook-check"
+  },
+  "tool_name": "Bash",
+  "tool_use_id": "<id>",
+  "transcript_path": "<home>/.codex/sessions/<n>/<n>/<n>/<id>",
+  "turn_id": "<id>"
+}

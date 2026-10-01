@@ -266,6 +266,76 @@ fn s0(host: Host, name: &str) {
         })
         .sum();
     assert_eq!(leaks, 0, "{hits}");
+    candidate_density(&agent);
+}
+
+/// Candidates of 16 or more characters per MiB in what the host wrote to
+/// its stores during the step, before and after de-duplication (K-21;
+/// D-32 sizes the comparison budget from it). A candidate here is a run
+/// of 16 or more bytes between whitespace, quotes, and JSON and shell
+/// punctuation; the scanner's tokenizer (M2-12) is narrower, so this is an
+/// upper bound, and each candidate may add up to three decoded forms.
+fn candidate_density(agent: &AgentHome) {
+    use std::collections::HashSet;
+    let home = agent.home_dir();
+    let codex = agent.codex_home();
+    let stores = envcloak_testkit::transcripts::transcript_roots(agent.host, &home, &codex);
+    let mut files = Vec::new();
+    for store in &stores {
+        match store.shape {
+            envcloak_testkit::transcripts::Shape::Named(part) => {
+                for e in std::fs::read_dir(&store.path)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    if e.file_name().to_string_lossy().contains(part) {
+                        collect(&e.path(), &mut files);
+                    }
+                }
+            }
+            _ => collect(&store.path, &mut files),
+        }
+    }
+    files.sort();
+    files.dedup();
+    let (mut bytes, mut total) = (0usize, 0usize);
+    let mut distinct: HashSet<Vec<u8>> = HashSet::new();
+    for f in &files {
+        let Ok(data) = std::fs::read(f) else { continue };
+        bytes += data.len();
+        for token in data.split(|b| b.is_ascii_whitespace() || b"\"'`,;(){}[]<>|&\\".contains(b)) {
+            if token.len() >= 16 {
+                total += 1;
+                distinct.insert(token.to_vec());
+            }
+        }
+    }
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        "measurement: candidates of 16+ characters host={} os={}: {bytes} bytes in {} files, \
+         {total} candidates ({:.0} per MiB), {} distinct ({:.0} per MiB)",
+        agent.host.id(),
+        std::env::consts::OS,
+        files.len(),
+        total as f64 / mib.max(f64::MIN_POSITIVE),
+        distinct.len(),
+        distinct.len() as f64 / mib.max(f64::MIN_POSITIVE),
+    );
+}
+
+/// Every regular file at or below `path`.
+fn collect(path: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.is_file() {
+        out.push(path.to_path_buf());
+    } else if meta.is_dir() {
+        for e in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            collect(&e.path(), out);
+        }
+    }
 }
 
 #[test]
