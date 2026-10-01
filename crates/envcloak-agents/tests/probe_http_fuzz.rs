@@ -45,7 +45,7 @@ fn check(out: &[u8], recorded: u64) -> Result<(), TestCaseError> {
         let head = std::str::from_utf8(&rest[..end]).unwrap_or("");
         let status: u16 = head.get(9..12).and_then(|s| s.parse().ok()).unwrap_or(0);
         prop_assert!(
-            [200, 400, 401, 404, 413, 431, 503].contains(&status),
+            [200, 400, 401, 403, 404, 413, 431, 503].contains(&status),
             "status {status}"
         );
         let len: usize = head

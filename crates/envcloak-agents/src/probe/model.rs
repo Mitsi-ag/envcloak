@@ -18,6 +18,9 @@
 //!   /v1/responses` (OpenAI Responses) from a [`Script`] ([`wire`]), and any
 //!   other path `404`, recording it, so a host that calls something new
 //!   fails the run loudly instead of being half served;
+//! - refuses a proxy tunnel request (`CONNECT host:port`) and records its
+//!   target, so with `HTTPS_PROXY` pointed at it a run shows every other
+//!   place a host tried to reach;
 //! - records every request it accepts with its whole body, held in wiping
 //!   buffers and wiped when the run ends.
 //!
@@ -25,7 +28,8 @@
 //! the network: the first line in is the script as JSON; the first line
 //! out is `{"addr": "127.0.0.1:<port>", "token": "<token>"}`. Then each
 //! input line `requests` is answered with one line `{"final": false,
-//! "requests": [...], "outcome": {...}}`, and the line `stop`, or the end
+//! "requests": [...], "outcome": {...}}`, the line `release <name>`
+//! releases a barrier (a step's `after`), and the line `stop`, or the end
 //! of input, ends the run with a last line whose `final` is true. The
 //! program exits 0 when the run was complete, 3 when it was not and 2 on
 //! a usage error. A request's body is base64 in `body`; its headers are
@@ -219,6 +223,9 @@ pub struct Outcome {
     pub exhausted: u64,
     /// Connections refused because the cap on open ones was reached.
     pub busy: u64,
+    /// Proxy tunnel requests (`CONNECT host:port`), refused: what a host
+    /// tried to reach besides the model. Not a failure of the run.
+    pub connect: u64,
     /// Body bytes recorded.
     pub recorded_bytes: u64,
 }

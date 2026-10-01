@@ -1,7 +1,7 @@
 //! The scripted model's server: loopback only, a random port, a per-run
 //! token, a time limit, and caps on every request and on the run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +48,9 @@ struct Shared {
     stopped_cv: Condvar,
     conns: Mutex<Conns>,
     conns_cv: Condvar,
+    /// Barriers released so far ([`Handle::release`]).
+    released: Mutex<HashSet<String>>,
+    released_cv: Condvar,
 }
 
 impl std::fmt::Debug for Shared {
@@ -97,6 +100,8 @@ impl Server {
             stopped_cv: Condvar::new(),
             conns: Mutex::new(Conns::default()),
             conns_cv: Condvar::new(),
+            released: Mutex::new(HashSet::new()),
+            released_cv: Condvar::new(),
         });
         Ok(Server { listener, shared })
     }
@@ -183,6 +188,9 @@ fn stop(shared: &Shared) {
     }
     *lock(&shared.stopped) = true;
     shared.stopped_cv.notify_all();
+    // Held replies give up.
+    drop(lock(&shared.released));
+    shared.released_cv.notify_all();
     // Wakes the accept loop, which sees the flag and returns.
     let _ = TcpStream::connect_timeout(&shared.addr, Duration::from_secs(1));
 }
@@ -336,6 +344,22 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         // The head's bytes, credentials included, leave the buffer; what
         // follows is this request's body, then any next request.
         buf.drain(..end);
+        if head.method == "CONNECT" {
+            // A host reaching for anywhere else through the proxy the
+            // harness names: refused, and recorded by its target.
+            let mut state = lock(&shared.state);
+            state.outcome.connect += 1;
+            let seq = next_seq(&mut state);
+            let mut rec = Recorded::without_body(seq, shared.started.elapsed(), &head, 403);
+            rec.api = Some("connect".to_owned());
+            state.requests.push(rec);
+            drop(state);
+            respond(
+                stream,
+                &Response::error(403, "the scripted model reaches nothing else"),
+            );
+            return;
+        }
         if is_hello(&head) {
             let mut state = lock(&shared.state);
             let seq = next_seq(&mut state);
@@ -413,6 +437,10 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
                 Err(_) => (400, Response::error(400, "malformed request body"), None),
             },
         };
+        let barrier = match pick {
+            Some(Pick::Step(n)) => shared.script.step(n).and_then(|s| s.after.clone()),
+            _ => None,
+        };
         let keep = status == 200 || status == 404;
         {
             let mut state = lock(&shared.state);
@@ -436,9 +464,33 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
                 body,
             });
         }
+        if let Some(name) = barrier {
+            if !wait_released(shared, &name) {
+                return;
+            }
+        }
         if !respond_keep(stream, &response, keep && !head.close) || !keep || head.close {
             return;
         }
+    }
+}
+
+/// Waits until the barrier `name` is released; false when the run stops
+/// first.
+fn wait_released(shared: &Shared, name: &str) -> bool {
+    let mut released = lock(&shared.released);
+    loop {
+        if released.contains(name) {
+            return true;
+        }
+        if shared.stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        released = shared
+            .released_cv
+            .wait_timeout(released, Duration::from_secs(1))
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
     }
 }
 
@@ -545,6 +597,7 @@ impl Response {
     fn error(status: u16, message: &'static str) -> Response {
         let kind = match status {
             401 => "authentication_error",
+            403 => "permission_error",
             404 => "not_found_error",
             413 | 431 => "request_too_large",
             503 => "overloaded_error",
@@ -567,6 +620,7 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         413 => "Content Too Large",
         431 => "Request Header Fields Too Large",
@@ -606,6 +660,13 @@ impl Handle {
     /// closed. [`Server::serve`] then returns.
     pub fn stop(&self) {
         stop(&self.shared);
+    }
+
+    /// Releases the barrier `name`: a reply held for a step with `after:
+    /// name` is sent, and later ones are not held.
+    pub fn release(&self, name: &str) {
+        lock(&self.shared.released).insert(name.to_owned());
+        self.shared.released_cv.notify_all();
     }
 
     /// Whether the run has stopped (by [`Handle::stop`] or its limit).

@@ -14,7 +14,8 @@ use std::io::{self, BufRead, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use envcloak_agents::probe::model::{Limits, Script, Server, script::MAX_SCRIPT};
+use envcloak_agents::probe::model::script::{MAX_SCRIPT, barrier_name};
+use envcloak_agents::probe::model::{Limits, Script, Server};
 use zeroize::Zeroizing;
 
 #[global_allocator]
@@ -118,7 +119,10 @@ fn main() -> ExitCode {
                     }
                 }
                 "stop" => break,
-                _ => eprintln!("{NAME}: an unknown control line was ignored"),
+                line => match line.strip_prefix("release ") {
+                    Some(name) if barrier_name(name) => control.release(name),
+                    _ => eprintln!("{NAME}: an unknown control line was ignored"),
+                },
             }
         }
         control.stop();
