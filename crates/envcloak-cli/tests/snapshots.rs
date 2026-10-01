@@ -749,7 +749,8 @@ fn every_command_prints_its_value_free_json_snapshot() {
 }
 
 /// What `help-and-usage` runs: the top-level help and version, an unknown
-/// command, and each M1 command's `--help` or a usage error of it. (`-h`
+/// command, and each command's `--help` or a usage error of it (M1's, and
+/// those M2-03 landed: `run --wait`, `run --manifest`, `pending`). (`-h`
 /// and `help` take the arm of `--help`, and `-V` that of `--version`.)
 const HELP_AND_USAGE: &[&[&str]] = &[
     &["--help"],
@@ -765,6 +766,10 @@ const HELP_AND_USAGE: &[&[&str]] = &[
     &["run", "--help"],
     &["run"],
     &["run", "--bogus", "--", "true"],
+    &["run", "--wait", "11m", "--", "true"],
+    &["run", "--manifest", "envcloak.toml", "--", "true"],
+    &["pending", "--help"],
+    &["pending", "--bogus"],
     &["approve"],
     &["deny"],
     &["grants"],

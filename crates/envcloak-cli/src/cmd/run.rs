@@ -1,14 +1,19 @@
 //! `envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file
-//! FILE] -- <cmd...>` (SPEC §6.1): the request for a run's values, the
-//! decision, and, when a grant covers it, the command with the values in
-//! its environment and its output redacted.
+//! FILE] [--manifest PATH] [--wait DURATION] -- <cmd...>` (SPEC §6.1): the
+//! request for a run's values, the decision, and, when a grant covers it,
+//! the command with the values in its environment and its output
+//! redacted.
 //!
 //! 1. Under a tracer the CLI refuses at once, with exit 125 and `traced`
 //!    (gate 19), before any contact with the daemon. Only a verified
 //!    daemon is then asked; with none, run says how to start one and
 //!    starts nothing.
 //! 2. It finds the nearest `envcloak.toml` upward from the working
-//!    directory, and sends its path. The daemon opens the manifest itself.
+//!    directory, or takes the absolute path `--manifest` names, and sends
+//!    that path. The daemon opens and canonicalizes the manifest itself
+//!    either way, with every identity rule (a symlinked manifest is
+//!    refused), so the same directory is the same project however it was
+//!    named.
 //! 3. It sends the profile and `--ref` bindings, the `--env-file`'s
 //!    references and the names of its ordinary variables (never their
 //!    values, which the runner sets for the command), the command line as
@@ -18,9 +23,19 @@
 //!    never text from the file (docs/MANIFEST.md "Env files").
 //! 4. The daemon answers with the decision. When no grant covers the
 //!    request, it is pending: exit 125 with `approval_required
-//!    request=<id>`, naming `envcloak approve <id>`. Approval input is
-//!    never read here: the terminal this command runs in may be an
-//!    agent's.
+//!    request=<id>`, naming `envcloak approve <id>`. With `--wait`, the
+//!    line is printed once and the CLI waits up to that long (at most the
+//!    request's 10-minute lifetime) without holding a connection: it asks
+//!    the request's state on fresh connections, backing off from 250 ms
+//!    to 1 s, and longer when the daemon answers `busy`; a request over a
+//!    pending cap (`too_many_pending`) is asked again the same way.
+//!    Approved, it asks again and runs; denied, it exits 125 with
+//!    `approval_denied`; still pending at the deadline, or expired, it
+//!    exits 125, the `approval_required` line being its failure
+//!    ([`envcloak_ipc::wait`]). SIGINT ends the wait as it ends any
+//!    program (a shell reports 130); nothing is held open then. Approval
+//!    input is never read here: the terminal this command runs in may be
+//!    an agent's.
 //! 5. A covered answer carries the bindings' values, which the daemon
 //!    sent after their audit entry was on disk. The connection is closed,
 //!    and the runner ([`envcloak_exec`]) takes over: values under 8 bytes,
@@ -36,9 +51,9 @@
 //!    rather than a terminal, so programs that color their output only on
 //!    a terminal print plain text; PTY mode is M2's (`--pty`, docs/RUN.md).
 //!
-//! `--pty`, `--wait` and `--manifest` (M2) are parsed and refused with
-//! exit 125 and `not_in_this_build` until their tasks land (M2-19 and
-//! M2-03), before anything is sent; after `--` they are the command's.
+//! `--pty` (M2) is parsed and refused with exit 125 and
+//! `not_in_this_build` until its task lands (M2-19), before anything is
+//! sent; after `--` it is the command's.
 //!
 //! No argument is ever echoed, and no value is ever accepted on the
 //! command line (gate 13): `--ref` names an item, never a value. The
@@ -50,23 +65,26 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use envcloak_client::claims::claims;
-use envcloak_client::connect::connect;
+use envcloak_client::connect::{connect, run_paths};
 use envcloak_client::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, usage};
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
 use envcloak_exec::{CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
-use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunRequestParams};
+use envcloak_ipc::ClientError;
+use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunAnswer, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
+use envcloak_ipc::wait::{Fresh, MAX_WAIT, Notice, SystemClock, Waited, wait_for_run};
 use envcloak_policy::{
     Binding, EnvFileRefs, EnvName, GrantId, MAX_ENV_FILE, Mode, PendingId, PlainVar, find_manifest,
     parse_env_file_refs,
 };
 use zeroize::Zeroize;
 
-const USAGE_TEXT: &str =
-    "envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>";
+const USAGE_TEXT: &str = "envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] \
+     [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m)] -- <cmd...>";
 
 /// The parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -74,7 +92,39 @@ struct RunArgs {
     profile: Option<String>,
     refs: Vec<String>,
     env_file: Option<String>,
+    /// `--manifest`: an absolute path, sent as it is.
+    manifest: Option<String>,
+    /// `--wait`: how long to wait for an approval.
+    wait: Option<Duration>,
     argv: Vec<String>,
+}
+
+/// `<n>s` or `<n>m`, from 1 second to the pending request's lifetime
+/// ([`MAX_WAIT`], 10 minutes).
+fn parse_wait(s: &str) -> Option<Duration> {
+    // The unit is matched as a suffix, never split off at a byte offset.
+    let (digits, per_unit) = if let Some(d) = s.strip_suffix('s') {
+        (d, 1)
+    } else {
+        (s.strip_suffix('m')?, 60)
+    };
+    if digits.is_empty() || digits.len() > 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let d = Duration::from_secs(digits.parse::<u64>().ok()?.checked_mul(per_unit)?);
+    (Duration::from_secs(1)..=MAX_WAIT)
+        .contains(&d)
+        .then_some(d)
+}
+
+/// A duration in words.
+fn words(d: Duration) -> String {
+    let (m, s) = (d.as_secs() / 60, d.as_secs() % 60);
+    match (m, s) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m {s}s"),
+    }
 }
 
 /// Why a command line was not taken.
@@ -122,12 +172,33 @@ fn parse(args: &[&str]) -> Result<RunArgs, ParseError> {
                 }
                 a.env_file = Some((*it.next().ok_or("--env-file needs a file")?).to_owned());
             }
-            // M2's options, refused before their values are read.
-            Some(&"--pty") => return Err(ParseError::NotInThisBuild("`envcloak run --pty`")),
-            Some(&"--wait") => return Err(ParseError::NotInThisBuild("`envcloak run --wait`")),
             Some(&"--manifest") => {
-                return Err(ParseError::NotInThisBuild("`envcloak run --manifest`"));
+                if a.manifest.is_some() {
+                    return Err("--manifest is given twice".into());
+                }
+                let p = *it
+                    .next()
+                    .ok_or("--manifest needs the absolute path of an envcloak.toml")?;
+                // The daemon opens it and checks the rest (its name, a
+                // symlink, its owner); a relative path is refused here, as
+                // it would be there, without being echoed.
+                if !Path::new(p).is_absolute() {
+                    return Err("--manifest needs the absolute path of an envcloak.toml".into());
+                }
+                a.manifest = Some(p.to_owned());
             }
+            Some(&"--wait") => {
+                if a.wait.is_some() {
+                    return Err("--wait is given twice".into());
+                }
+                let d = it
+                    .next()
+                    .and_then(|v| parse_wait(v))
+                    .ok_or("--wait needs a duration from 1s to 10m, such as 30s or 5m")?;
+                a.wait = Some(d);
+            }
+            // M2's PTY mode, refused before anything is read.
+            Some(&"--pty") => return Err(ParseError::NotInThisBuild("`envcloak run --pty`")),
             Some(_) => return Err("unknown option; see envcloak run --help".into()),
         }
     }
@@ -170,39 +241,36 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
     // Only a verified daemon is ever asked; with none, run says how to
     // start one and starts nothing.
     let mut client = connect()?;
-    let manifest = match find_manifest(Path::new(".")) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Err(Failure::new(
-                "manifest_invalid",
-                "no envcloak.toml in this directory or above it; run `envcloak init` first",
-            ));
-        }
-        Err(_) => {
-            return Err(Failure::new(
-                "manifest_invalid",
-                "the working directory could not be read while looking for envcloak.toml",
-            ));
-        }
-    };
-    let Some(manifest) = manifest.to_str().map(str::to_owned) else {
-        return Err(Failure::new(
-            "manifest_invalid",
-            "the manifest's path is not valid UTF-8, which this build cannot send",
-        ));
+    let manifest = match a.manifest {
+        Some(p) => p,
+        None => found_manifest()?,
     };
     // Its ordinary variables' values stay here: the runner sets them for
     // the command.
     let env_file = a.env_file.as_deref().map(read_env_file).transpose()?;
-    let answer = client.run_request(&RunRequestParams {
+    let params = RunRequestParams {
         manifest,
         profile: a.profile,
         refs: a.refs,
         env_file: env_file.as_ref().map(|f| EnvFileParams::from(&f.names())),
         argv: a.argv.clone(),
         claims: claims(),
-    })?;
-    drop(client);
+    };
+    let answer = match a.wait {
+        None => {
+            let answer = client.run_request(&params)?;
+            drop(client);
+            answer
+        }
+        Some(wait) => {
+            // No connection is held while waiting: each step opens its own.
+            drop(client);
+            match wait_for(&params, wait)? {
+                Some(answer) => answer,
+                None => return Ok(ExitCode::from(RUN_FAILURE)),
+            }
+        }
+    };
     let decision = answer.decision;
     match decision {
         DecisionView::Pending { request } => {
@@ -232,6 +300,68 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
             let plain = env_file.map(|f| f.plain).unwrap_or_default();
             start(answer.values, plain, a.argv)
         }
+    }
+}
+
+/// The nearest `envcloak.toml` at or above the working directory.
+fn found_manifest() -> Result<String, Failure> {
+    let manifest = match find_manifest(Path::new(".")) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(Failure::new(
+                "manifest_invalid",
+                "no envcloak.toml in this directory or above it; run `envcloak init` first",
+            ));
+        }
+        Err(_) => {
+            return Err(Failure::new(
+                "manifest_invalid",
+                "the working directory could not be read while looking for envcloak.toml",
+            ));
+        }
+    };
+    manifest.to_str().map(str::to_owned).ok_or_else(|| {
+        Failure::new(
+            "manifest_invalid",
+            "the manifest's path is not valid UTF-8, which this build cannot send",
+        )
+    })
+}
+
+/// Waits up to `wait` for the request `params` to be covered or denied,
+/// on fresh connections ([`wait_for_run`]), printing the
+/// `approval_required` line once per request and the `too_many_pending`
+/// line once. Returns the deciding answer, or `None` when the wait ended
+/// with nothing decided (still pending at the deadline, expired, or every
+/// place taken): the line already printed is then the failure, and the
+/// run exits 125.
+fn wait_for(params: &RunRequestParams, wait: Duration) -> Result<Option<RunAnswer>, Failure> {
+    let paths = run_paths()?;
+    let mut fresh = Fresh {
+        paths: &paths,
+        params,
+    };
+    let shown = words(wait);
+    let mut notice = |n: Notice| match n {
+        Notice::Pending(id) => eprintln!(
+            "envcloak: approval_required: request={id}: run \"envcloak approve {id}\" in a \
+             terminal you control; waiting up to {shown} for it"
+        ),
+        Notice::TooManyPending(e) => {
+            let f = Failure::from(ClientError::Rpc(e));
+            eprintln!(
+                "envcloak: {}: {}; waiting up to {shown} for a place",
+                f.token, f.message
+            );
+        }
+    };
+    match wait_for_run(&mut fresh, &mut SystemClock::new(), wait, &mut notice)? {
+        Waited::Answer(answer) => Ok(Some(answer)),
+        Waited::Denied(id) => Err(Failure::new(
+            "approval_denied",
+            format!("request={id} was denied; nothing was started"),
+        )),
+        Waited::Expired(_) | Waited::TimedOut(_) | Waited::TooManyPending(_) => Ok(None),
     }
 }
 
@@ -393,10 +523,8 @@ mod tests {
         assert_eq!(
             parse(&["--", "./emit", "-x"]).unwrap(),
             RunArgs {
-                profile: None,
-                refs: vec![],
-                env_file: None,
                 argv: vec!["./emit".into(), "-x".into()],
+                ..RunArgs::default()
             }
         );
         assert_eq!(
@@ -418,6 +546,24 @@ mod tests {
                 refs: vec!["A=openai/x".into(), "B=stripe/x#value".into()],
                 env_file: Some(".env.refs".into()),
                 argv: vec!["true".into()],
+                ..RunArgs::default()
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "--manifest",
+                "/p/acme/envcloak.toml",
+                "--wait",
+                "90s",
+                "--",
+                "true"
+            ])
+            .unwrap(),
+            RunArgs {
+                manifest: Some("/p/acme/envcloak.toml".into()),
+                wait: Some(Duration::from_secs(90)),
+                argv: vec!["true".into()],
+                ..RunArgs::default()
             }
         );
         // Options after `--` belong to the command.
@@ -437,23 +583,55 @@ mod tests {
             &["--env-file"],
             &["--env-file", "a", "--env-file", "b", "--", "true"],
             &["--bogus", "--", "true"],
+            // A relative or missing --manifest, or one given twice.
+            &["--manifest"],
+            &["--manifest", "envcloak.toml", "--", "true"],
+            &["--manifest", "./acme/envcloak.toml", "--", "true"],
+            &["--manifest", "", "--", "true"],
+            &[
+                "--manifest",
+                "/a/envcloak.toml",
+                "--manifest",
+                "/b/envcloak.toml",
+                "--",
+                "true",
+            ],
+            // A --wait outside 1s to 10m, malformed, missing or twice.
+            &["--wait"],
+            &["--wait", "--", "true"],
+            &["--wait", "0s", "--", "true"],
+            &["--wait", "11m", "--", "true"],
+            &["--wait", "601s", "--", "true"],
+            &["--wait", "1h", "--", "true"],
+            &["--wait", "5", "--", "true"],
+            &["--wait", "-5s", "--", "true"],
+            &["--wait", "1.5m", "--", "true"],
+            &["--wait", "5\u{e9}", "--", "true"],
+            &["--wait", "1m", "--wait", "2m", "--", "true"],
         ] {
             assert!(matches!(parse(bad), Err(ParseError::Usage(_))), "{bad:?}");
         }
-        // M2's options are refused as not in this build, wherever they
-        // come before `--` and whatever follows them; after `--` they are
-        // the command's.
+        for (ok, secs) in [
+            ("1s", 1),
+            ("59s", 59),
+            ("600s", 600),
+            ("10m", 600),
+            ("2m", 120),
+        ] {
+            assert_eq!(parse_wait(ok), Some(Duration::from_secs(secs)), "{ok}");
+        }
+        assert_eq!(words(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(words(Duration::from_secs(600)), "10m");
+        assert_eq!(words(Duration::from_secs(45)), "45s");
+        // M2's PTY mode is refused as not in this build, wherever it comes
+        // before `--` and whatever follows it; after `--` it is the
+        // command's.
         for (bad, what) in [
             (&["--pty", "--", "true"][..], "`envcloak run --pty`"),
-            (&["--wait", "1m", "--", "true"], "`envcloak run --wait`"),
-            (&["--wait"], "`envcloak run --wait`"),
+            (&["--profile", "a", "--pty"], "`envcloak run --pty`"),
             (
-                &["--manifest", "/p/envcloak.toml", "--", "true"],
-                "`envcloak run --manifest`",
-            ),
-            (
-                &["--profile", "a", "--manifest"],
-                "`envcloak run --manifest`",
+                &["--manifest", "/p/envcloak.toml", "--pty", "--", "true"],
+                "`envcloak run --pty`",
             ),
         ] {
             assert_eq!(parse(bad), Err(ParseError::NotInThisBuild(what)), "{bad:?}");

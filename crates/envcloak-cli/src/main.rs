@@ -9,13 +9,15 @@
 //! - `envcloak vault create`, `unlock`, `lock`, `status` and `daemon
 //!   install` / `daemon uninstall` (see [`cmd`]);
 //! - `envcloak run [--profile p] [--ref NAME=slug[#field]]... [--env-file
-//!   f] -- <cmd...>` (SPEC §6.1), whose first step refuses to go on under
-//!   a tracer, with exit 125 and `traced` (gate 19), before any contact
-//!   with the daemon. It asks a verified daemon for the decision and, when
-//!   a grant covers it, starts the command with the released values in its
-//!   environment and its output redacted (`envcloak_exec`; docs/RUN.md);
-//! - `envcloak approve`, `deny` and `grants list` / `grants revoke` (SPEC
-//!   §10b);
+//!   f] [--manifest PATH] [--wait DURATION] -- <cmd...>` (SPEC §6.1), whose
+//!   first step refuses to go on under a tracer, with exit 125 and `traced`
+//!   (gate 19), before any contact with the daemon. It asks a verified
+//!   daemon for the decision (waiting for an approval with `--wait`,
+//!   without holding a connection) and, when a grant covers it, starts the
+//!   command with the released values in its environment and its output
+//!   redacted (`envcloak_exec`; docs/RUN.md);
+//! - `envcloak pending`, `approve`, `deny` and `grants list` / `grants
+//!   revoke` (SPEC §6.1 step 4, §10b);
 //! - `envcloak audit verify`: the audit log's check (SPEC §15.2 gate 33);
 //! - `envcloak add`, `ls`, `show`, `ref`, `check`, `rotate` and `rm`: the
 //!   vault's items and the project's references, metadata only (SPEC §6.3,
@@ -73,7 +75,8 @@ const HELP: &str = "usage:
   envcloak status [--json]
   envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
   envcloak daemon uninstall
-  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] -- <cmd...>
+  envcloak pending [--json]
   envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
@@ -93,8 +96,7 @@ const HELP: &str = "usage:
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak run --pty | --wait | --manifest
-  envcloak pending
+  envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub

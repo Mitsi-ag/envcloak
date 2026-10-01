@@ -16,7 +16,6 @@ use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 /// Each registered command or option (the words that select it) and how
 /// its refusal names it.
 const STUBS: &[(&[&str], &str)] = &[
-    (&["pending"], "`envcloak pending`"),
     (&["reveal"], "`envcloak reveal`"),
     (&["doctor"], "`envcloak doctor`"),
     (&["scrub"], "`envcloak scrub`"),
@@ -32,8 +31,6 @@ const STUBS: &[(&[&str], &str)] = &[
     (&["login"], "`envcloak login`"),
     (&["signin"], "`envcloak signin`"),
     (&["run", "--pty"], "`envcloak run --pty`"),
-    (&["run", "--wait"], "`envcloak run --wait`"),
-    (&["run", "--manifest"], "`envcloak run --manifest`"),
 ];
 
 /// Exit code of a stub, as of `run`'s own failures.
@@ -160,8 +157,15 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
             "{what} is listed as available: {help}"
         );
     }
-    // The check sees the commands this build has.
+    // The check sees the commands this build has, those M2-03 landed
+    // among them.
     assert!(lists(available, &["run"]));
+    assert!(lists(available, &["pending"]));
+    let run = available
+        .lines()
+        .find(|l| l.trim_start().starts_with("envcloak run "))
+        .unwrap();
+    assert!(run.contains("[--manifest PATH] [--wait DURATION]"), "{run}");
     assert!(lists(available, &["grants", "list"]));
     assert!(lists(available, &["daemon", "uninstall"]));
 }

@@ -6,12 +6,12 @@
 //! `backup create` and `recover`; later tasks add the rest.
 //!
 //! Every M2 and M2b command is registered here, each in its own module,
-//! ahead of the task that lands it (M2 plan D-23): `pending`, `reveal`,
-//! `doctor`, `scrub`, `agents`, `hook`, `mcp`, `mcp-bridge`, `standing`,
-//! `items`, `login` and `signin`, and `run`'s `--pty`, `--wait` and
-//! `--manifest`. Until then each exits 125 with `not_in_this_build`
-//! ([`not_in_this_build`]), reads and echoes no argument, and asks no
-//! daemon.
+//! ahead of the task that lands it (M2 plan D-23): `reveal`, `doctor`,
+//! `scrub`, `agents`, `hook`, `mcp`, `mcp-bridge`, `standing`, `items`,
+//! `login` and `signin`, and `run`'s `--pty`. Until then each exits 125
+//! with `not_in_this_build` ([`not_in_this_build`]), reads and echoes no
+//! argument, and asks no daemon. M2-03 landed `pending` and `run`'s
+//! `--wait` and `--manifest`.
 //!
 //! Argument errors never echo an argument: one could be a pasted secret.
 //! No command takes a value on the command line (gate 13): values come
