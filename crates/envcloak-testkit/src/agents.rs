@@ -735,6 +735,9 @@ pub struct AgentHome {
     /// The keys [`AgentHome::codex_config`] last set, to take out when it
     /// sets others.
     codex_extra: Vec<Vec<String>>,
+    /// Every directory a host was started in, for
+    /// [`AgentHome::check_isolated`].
+    cwds: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl AgentHome {
@@ -764,6 +767,7 @@ impl AgentHome {
             installed,
             env: Vec::new(),
             codex_extra: Vec::new(),
+            cwds: std::sync::Mutex::new(Vec::new()),
         };
         if host == Host::Codex {
             std::fs::create_dir_all(a.codex_home())
@@ -790,6 +794,79 @@ impl AgentHome {
     /// `$CODEX_HOME`: `~/.codex` in the home.
     pub fn codex_home(&self) -> PathBuf {
         self.home_dir().join(".codex")
+    }
+
+    /// Where Claude Code makes its per-user temporary directory: the
+    /// home's `tmp/`, by `CLAUDE_CODE_TMPDIR`. Without it, 2.1.280 makes
+    /// it in `/tmp` whatever `TMPDIR` says, outside the home, where a
+    /// running command's output then lands.
+    pub fn claude_tmp(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+
+    /// Where this home's host stores are (see
+    /// [`crate::transcripts::transcript_roots`]).
+    pub fn host_dirs(&self) -> crate::transcripts::HostDirs {
+        crate::transcripts::HostDirs {
+            home: self.home_dir(),
+            codex_home: self.codex_home(),
+            claude_tmp: self.claude_tmp(),
+        }
+    }
+
+    fn note_cwd(&self, cwd: &Path) {
+        let mut cwds = self
+            .cwds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cwds.iter().any(|c| c == cwd) {
+            cwds.push(cwd.to_path_buf());
+        }
+    }
+
+    /// Where Claude Code would have kept a run's temporary files for each
+    /// directory a host was started in, had it ignored
+    /// `CLAUDE_CODE_TMPDIR`: `/tmp/claude-<uid>/<the directory's real
+    /// path, with every character but a letter or digit as ->`.
+    fn default_claude_tmp_dirs(&self) -> Vec<PathBuf> {
+        if self.host != Host::ClaudeCode {
+            return Vec::new();
+        }
+        let base = crate::transcripts::claude_tmp_dir(Path::new("/tmp"));
+        let mut cwds = self
+            .cwds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        cwds.push(self.home_dir());
+        cwds.iter()
+            .map(|c| {
+                let real = std::fs::canonicalize(c).unwrap_or_else(|_| c.clone());
+                let slug: String = real
+                    .to_string_lossy()
+                    .chars()
+                    .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                    .collect();
+                base.join(slug)
+            })
+            .collect()
+    }
+
+    /// Checks that the host kept nothing outside this home: no Claude Code
+    /// temporary directory for any directory it was started in under
+    /// `/tmp/claude-<uid>/` (the harness points `CLAUDE_CODE_TMPDIR` into
+    /// the home; this is that the host honoured it).
+    ///
+    /// # Panics
+    /// When one is there.
+    pub fn check_isolated(&self) {
+        for dir in self.default_claude_tmp_dirs() {
+            assert!(
+                !dir.exists(),
+                "the host kept files outside its home, in {}",
+                dir.display()
+            );
+        }
     }
 
     /// Sets a variable for every later host run, after the home's own
@@ -870,7 +947,8 @@ impl AgentHome {
         }
         match self.host {
             Host::ClaudeCode => {
-                cmd.env("DISABLE_AUTOUPDATER", "1");
+                cmd.env("DISABLE_AUTOUPDATER", "1")
+                    .env("CLAUDE_CODE_TMPDIR", self.claude_tmp());
             }
             Host::Codex => {
                 cmd.env("CODEX_HOME", self.codex_home());
@@ -880,10 +958,11 @@ impl AgentHome {
         cmd
     }
 
-    /// The environment a run against `model` gets (see the module
-    /// documentation), for a test that starts the host some other way,
-    /// such as on a pseudo-terminal of its own.
-    pub fn env_for(&self, model: &Model) -> Vec<(OsString, OsString)> {
+    /// The environment a run against `model` in `cwd` gets (see the
+    /// module documentation), for a test that starts the host some other
+    /// way, such as on a pseudo-terminal of its own.
+    pub fn env_for(&self, model: &Model, cwd: &Path) -> Vec<(OsString, OsString)> {
+        self.note_cwd(cwd);
         let cmd = self.command(Some(model));
         cmd.get_envs()
             .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
@@ -920,6 +999,7 @@ impl AgentHome {
     /// # Panics
     /// When the model or the host cannot start.
     pub fn spawn(&self, script: &Value, prompt: &str, flags: &HostFlags, cwd: &Path) -> Running {
+        self.note_cwd(cwd);
         let model = Model::start(script);
         if self.host == Host::Codex {
             self.write_codex_config(&model);
@@ -952,13 +1032,16 @@ impl AgentHome {
     }
 
     /// [`AgentHome::spawn`], then [`Running::wait`]; then checks that the
-    /// host is still the pinned build at the pinned version.
+    /// host is still the pinned build at the pinned version, and kept
+    /// nothing outside the home ([`AgentHome::check_isolated`]).
     ///
     /// # Panics
-    /// When the host does not finish within [`RUN_LIMIT`], or changed.
+    /// When the host does not finish within [`RUN_LIMIT`], changed, or
+    /// kept files elsewhere.
     pub fn run(&self, script: &Value, prompt: &str, flags: &HostFlags, cwd: &Path) -> HostRun {
         let run = self.spawn(script, prompt, flags, cwd).wait();
         self.check_pinned();
+        self.check_isolated();
         run
     }
 
@@ -1006,6 +1089,19 @@ impl AgentHome {
             self.installed.pin.id,
             self.installed.pin.version
         );
+    }
+}
+
+impl Drop for AgentHome {
+    /// Removes what Claude Code kept outside the home for the directories
+    /// a host was started in, had it ignored `CLAUDE_CODE_TMPDIR`
+    /// ([`AgentHome::check_isolated`] fails the test first): directories
+    /// named for this home's own paths only, so nothing another home or
+    /// a person's own session made.
+    fn drop(&mut self) {
+        for dir in self.default_claude_tmp_dirs() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 

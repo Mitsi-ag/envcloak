@@ -249,6 +249,7 @@ fn s0(host: Host, name: &str) {
     running.model.release("approved");
     let run = running.wait();
     agent.check_pinned();
+    agent.check_isolated();
     h.record("the host's stdout (S0)", &run.output.stdout);
     h.record("the host's stderr (S0)", &run.output.stderr);
     for r in &run.model.requests {
@@ -440,9 +441,7 @@ fn audit_requests(h: &Harness) -> usize {
 /// upper bound, and each candidate may add up to three decoded forms.
 fn candidate_density(agent: &AgentHome) {
     use std::collections::HashSet;
-    let home = agent.home_dir();
-    let codex = agent.codex_home();
-    let stores = envcloak_testkit::transcripts::transcript_roots(agent.host, &home, &codex);
+    let stores = envcloak_testkit::transcripts::transcript_roots(agent.host, &agent.host_dirs());
     let mut files = Vec::new();
     for store in &stores {
         match store.shape {
