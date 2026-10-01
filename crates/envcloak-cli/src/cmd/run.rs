@@ -36,6 +36,10 @@
 //!    rather than a terminal, so programs that color their output only on
 //!    a terminal print plain text; PTY mode is M2's (`--pty`, docs/RUN.md).
 //!
+//! `--pty`, `--wait` and `--manifest` (M2) are parsed and refused with
+//! exit 125 and `not_in_this_build` until their tasks land (M2-19 and
+//! M2-03), before anything is sent; after `--` they are the command's.
+//!
 //! No argument is ever echoed, and no value is ever accepted on the
 //! command line (gate 13): `--ref` names an item, never a value. The
 //! values never enter this process's environment or argv, or a file.
@@ -73,18 +77,33 @@ struct RunArgs {
     argv: Vec<String>,
 }
 
+/// Why a command line was not taken.
+#[derive(Debug, PartialEq, Eq)]
+enum ParseError {
+    /// A usage error: what was wrong, as fixed text.
+    Usage(&'static str),
+    /// An option of a later task (M2 plan D-23), named as fixed text.
+    NotInThisBuild(&'static str),
+}
+
+impl From<&'static str> for ParseError {
+    fn from(why: &'static str) -> Self {
+        ParseError::Usage(why)
+    }
+}
+
 /// Parses the options up to `--` and the command after it. Values are
 /// never accepted here: a `--ref` is a name and a reference.
-fn parse(args: &[&str]) -> Result<RunArgs, &'static str> {
+fn parse(args: &[&str]) -> Result<RunArgs, ParseError> {
     let mut a = RunArgs::default();
     let mut it = args.iter();
     loop {
         match it.next() {
-            None => return Err("run needs a command: envcloak run ... -- <cmd...>"),
+            None => return Err("run needs a command: envcloak run ... -- <cmd...>".into()),
             Some(&"--") => break,
             Some(&"--profile") => {
                 if a.profile.is_some() {
-                    return Err("--profile is given twice");
+                    return Err("--profile is given twice".into());
                 }
                 a.profile = Some((*it.next().ok_or("--profile needs a name")?).to_owned());
             }
@@ -93,23 +112,28 @@ fn parse(args: &[&str]) -> Result<RunArgs, &'static str> {
                 // Checked here, so a malformed one (a pasted value, say)
                 // is refused before anything is sent, and never echoed.
                 if Binding::parse_arg(r).is_err() {
-                    return Err("--ref needs NAME=<slug>[#field]");
+                    return Err("--ref needs NAME=<slug>[#field]".into());
                 }
                 a.refs.push(r.to_owned());
             }
             Some(&"--env-file") => {
                 if a.env_file.is_some() {
-                    return Err("--env-file is given twice");
+                    return Err("--env-file is given twice".into());
                 }
                 a.env_file = Some((*it.next().ok_or("--env-file needs a file")?).to_owned());
             }
-            Some(&"--wait") => return Err("--wait is not in this build yet"),
-            Some(_) => return Err("unknown option; see envcloak run --help"),
+            // M2's options, refused before their values are read.
+            Some(&"--pty") => return Err(ParseError::NotInThisBuild("`envcloak run --pty`")),
+            Some(&"--wait") => return Err(ParseError::NotInThisBuild("`envcloak run --wait`")),
+            Some(&"--manifest") => {
+                return Err(ParseError::NotInThisBuild("`envcloak run --manifest`"));
+            }
+            Some(_) => return Err("unknown option; see envcloak run --help".into()),
         }
     }
     a.argv = it.map(|s| (*s).to_owned()).collect();
     if a.argv.is_empty() {
-        return Err("run needs a command after --");
+        return Err("run needs a command after --".into());
     }
     Ok(a)
 }
@@ -121,7 +145,8 @@ pub fn run(args: &[&str]) -> ExitCode {
     }
     let a = match parse(args) {
         Ok(a) => a,
-        Err(why) => {
+        Err(ParseError::NotInThisBuild(what)) => return super::not_in_this_build(what),
+        Err(ParseError::Usage(why)) => {
             eprintln!("envcloak: {why}");
             return usage(USAGE_TEXT);
         }
@@ -411,11 +436,34 @@ mod tests {
             &["--ref", "A=", "--", "true"],
             &["--env-file"],
             &["--env-file", "a", "--env-file", "b", "--", "true"],
-            &["--wait", "1m", "--", "true"],
             &["--bogus", "--", "true"],
         ] {
-            assert!(parse(bad).is_err(), "{bad:?}");
+            assert!(matches!(parse(bad), Err(ParseError::Usage(_))), "{bad:?}");
         }
+        // M2's options are refused as not in this build, wherever they
+        // come before `--` and whatever follows them; after `--` they are
+        // the command's.
+        for (bad, what) in [
+            (&["--pty", "--", "true"][..], "`envcloak run --pty`"),
+            (&["--wait", "1m", "--", "true"], "`envcloak run --wait`"),
+            (&["--wait"], "`envcloak run --wait`"),
+            (
+                &["--manifest", "/p/envcloak.toml", "--", "true"],
+                "`envcloak run --manifest`",
+            ),
+            (
+                &["--profile", "a", "--manifest"],
+                "`envcloak run --manifest`",
+            ),
+        ] {
+            assert_eq!(parse(bad), Err(ParseError::NotInThisBuild(what)), "{bad:?}");
+        }
+        assert_eq!(
+            parse(&["--", "sh", "--pty", "--wait", "--manifest"])
+                .unwrap()
+                .argv,
+            vec!["sh", "--pty", "--wait", "--manifest"]
+        );
     }
 
     /// `--env-file` is read only from a regular file of at most 1 MiB, a

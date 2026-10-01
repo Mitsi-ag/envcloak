@@ -5,6 +5,14 @@
 //! runner; T13 adds `init`, `import` and `recovery confirm`; T14 adds
 //! `backup create` and `recover`; later tasks add the rest.
 //!
+//! Every M2 and M2b command is registered here, each in its own module,
+//! ahead of the task that lands it (M2 plan D-23): `pending`, `reveal`,
+//! `doctor`, `scrub`, `agents`, `hook`, `mcp`, `mcp-bridge`, `standing`,
+//! `items`, `login` and `signin`, and `run`'s `--pty`, `--wait` and
+//! `--manifest`. Until then each exits 125 with `not_in_this_build`
+//! ([`not_in_this_build`]), reads and echoes no argument, and asks no
+//! daemon.
+//!
 //! Argument errors never echo an argument: one could be a pasted secret.
 //! No command takes a value on the command line (gate 13): values come
 //! from a hidden prompt on `/dev/tty` or from standard input (`--stdin`),
@@ -12,29 +20,59 @@
 //! ([`refuse_value_like`]).
 
 pub mod add;
+pub mod agents;
 pub mod approve;
 pub mod audit;
 pub mod backup;
 pub mod check;
 pub mod daemon;
+pub mod doctor;
 pub mod grants;
+pub mod hook;
 pub mod import;
 pub mod init;
+pub mod items;
 pub mod lock;
+pub mod login;
 pub mod ls;
+pub mod mcp;
+pub mod mcp_bridge;
+pub mod pending;
 pub mod recover;
 pub mod recovery;
 pub mod ref_;
+pub mod reveal;
 pub mod rm;
 pub mod rotate;
 pub mod run;
+pub mod scrub;
 pub mod show;
+pub mod signin;
+pub mod standing;
 pub mod status;
 pub mod unlock;
 pub mod vault;
 
-use envcloak_client::fail::Failure;
+use std::process::ExitCode;
+
+use envcloak_client::fail::{Failure, RUN_FAILURE};
 use envcloak_client::render::looks_like_value;
+
+/// The token of a command or option that this build registers but does
+/// not have yet (M2 plan D-23).
+pub const NOT_IN_THIS_BUILD: &str = "not_in_this_build";
+
+/// Reports that `what`, fixed text naming a command or an option, is not
+/// in this build, and returns exit 125 (as `run`'s own failures). Nothing
+/// else is done: the caller has read no argument, so none can be echoed,
+/// and no daemon is asked.
+pub fn not_in_this_build(what: &'static str) -> ExitCode {
+    Failure::new(
+        NOT_IN_THIS_BUILD,
+        format!("{what} is not in this build of EnvCloak; nothing was done"),
+    )
+    .report(RUN_FAILURE)
+}
 
 /// Refuses names given on the command line (a slug, a provider, an
 /// account, a variable) that are shaped like a key or token rather than a
