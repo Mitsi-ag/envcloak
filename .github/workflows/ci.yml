@@ -137,6 +137,13 @@ jobs:
           echo "ENVCLOAK_TEST_REQUIRE_EMITTERS=python,node,go,dotnet,php,serde" >> "$GITHUB_ENV"
           echo "DOTNET_CLI_TELEMETRY_OPTOUT=1" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
+      # M2 plan task M2-01: the names and numbers reserved for the M2 and
+      # M2b tasks (decision D-23), checked against each other and against
+      # the code, and the build decisions SPEC v0.4 wrote down.
+      - name: Reserved registries and SPEC decisions
+        run: |
+          python3 scripts/check-reservations.py
+          python3 scripts/check-spec-decisions.py
       - name: Unsafe-code and secret-exposure boundaries
         run: |
           python3 --version
