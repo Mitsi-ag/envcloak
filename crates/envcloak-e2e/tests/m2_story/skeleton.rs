@@ -192,15 +192,19 @@ fn s0(host: Host, name: &str) {
         .rev()
         .nth(3000)
         .map_or(first.as_str(), |(at, _)| &first[at..]);
-    let held_for_approval = first.contains("approval_required");
+    // What the first run printed: the last tool result in the request
+    // (the one for the call the model made last).
+    let first_run = last_tool_output(&first);
+    let held_for_approval = first_run.contains("approval_required");
     let refused = !held_for_approval && sandbox_refuses_the_socket(host);
     assert!(
         held_for_approval || refused,
         "the first run was not held for approval; the request ends:\n{tail}"
     );
     if held_for_approval {
-        assert!(
-            first.contains("EXIT=125"),
+        assert_eq!(
+            exits(&first_run),
+            ["125"],
             "the first run did not exit 125; the request ends:\n{tail}"
         );
         let id = request_id(&first);
@@ -233,12 +237,8 @@ fn s0(host: Host, name: &str) {
         // K-01 on this system: the CLI cannot open the socket from the
         // host's sandbox, so it fails closed before it sends a byte, and
         // the daemon never sees a request.
-        let refusal = refusal(&first)
-            .unwrap_or_else(|| panic!("no refusal in the first run; the request ends:\n{tail}"));
-        assert!(
-            !first.contains("EXIT=0"),
-            "the first run exited 0; the request ends:\n{tail}"
-        );
+        let refusal = refused_once(&first_run)
+            .unwrap_or_else(|why| panic!("the first run: {why}; the request ends:\n{tail}"));
         println!(
             "measurement: S0 host={} os={}: unsupported under its sandbox with the bounded \
              setting (K-01): {refusal}",
@@ -268,27 +268,31 @@ fn s0(host: Host, name: &str) {
         .collect();
     assert_eq!(picks, ["step 0", "step 1", "step 2", "step 3"]);
 
+    // What the rerun printed: the last tool result in the request after
+    // it. The earlier results in the same conversation (the first run's)
+    // say nothing about the rerun.
     let second = run
         .model
         .requests
         .iter()
         .find(|r| r.pick.as_deref() == Some("step 2"))
-        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .map(|r| last_tool_output(&String::from_utf8_lossy(&r.body)))
         .unwrap();
     if held_for_approval {
         // The rerun got its values: exit 0, and redaction markers where
         // the values were.
-        assert!(second.contains("EXIT=0"), "the rerun did not exit 0");
+        assert_eq!(exits(&second), ["0"], "the rerun did not exit 0");
         assert!(
             second.contains("[envcloak:openai/acme-web]"),
             "no redaction marker in the rerun's output"
         );
     } else {
-        // Refused again, and nothing reached the daemon.
-        assert!(
-            refusal(&second).is_some() && second.matches("EXIT=0").count() == 0,
-            "the rerun was not refused"
-        );
+        // Refused again, by the CLI, before it sent a byte: one refusal
+        // line and exit 125 in the rerun's own result; and nothing
+        // reached the daemon.
+        if let Err(why) = refused_once(&second) {
+            panic!("the rerun was not refused: {why}");
+        }
         assert_eq!(
             audit_requests(&h),
             requests_before,
@@ -305,7 +309,7 @@ fn s0(host: Host, name: &str) {
         .map(|r| String::from_utf8_lossy(&r.body).into_owned())
         .unwrap();
     assert!(
-        tool_outputs(&third).contains(control.as_str()),
+        last_tool_output(&third).contains(control.as_str()),
         "the printed control is not in the tool result the host sent its model"
     );
 
@@ -361,37 +365,6 @@ fn rooted_at(statement: &str, installed: &Installed) -> String {
     }
 }
 
-/// Every tool result's text in a request body (Anthropic Messages or
-/// OpenAI Responses), joined.
-fn tool_outputs(body: &str) -> String {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return String::new();
-    };
-    let text = |c: &serde_json::Value| match c {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p["text"].as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
-    };
-    let mut out = Vec::new();
-    for m in v["messages"].as_array().into_iter().flatten() {
-        for c in m["content"].as_array().into_iter().flatten() {
-            if c["type"] == "tool_result" {
-                out.push(text(&c["content"]));
-            }
-        }
-    }
-    for item in v["input"].as_array().into_iter().flatten() {
-        if item["type"] == "function_call_output" {
-            out.push(text(&item["output"]));
-        }
-    }
-    out.join("\n")
-}
-
 /// Whether `host`'s sandbox, with the settings §4 pins, is measured to
 /// refuse the daemon's socket on this system (K-01), so that S0 checks the
 /// refusal instead of the approval. Codex 0.159.2 honours `unix_sockets`
@@ -404,21 +377,67 @@ fn sandbox_refuses_the_socket(host: Host) -> bool {
     host == Host::Codex && cfg!(target_os = "linux")
 }
 
-/// The CLI's refusal (`envcloak: daemon_unverified: ...` or
-/// `daemon_unavailable`) in what the host sent its model, if any.
-fn refusal(text: &str) -> Option<String> {
-    [
-        "envcloak: daemon_unverified",
-        "envcloak: daemon_unavailable",
-    ]
-    .iter()
-    .find_map(|t| text.rfind(t))
-    .map(|at| {
-        text[at..]
-            .chars()
-            .take_while(|c| !matches!(c, '\\' | '"' | '\n'))
-            .collect()
-    })
+/// The text of the last tool result in a request body (Anthropic
+/// Messages or OpenAI Responses): what the call the model made last
+/// printed, as the host sent it.
+fn last_tool_output(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    let text = |c: &serde_json::Value| match c {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    let mut out = String::new();
+    for m in v["messages"].as_array().into_iter().flatten() {
+        for c in m["content"].as_array().into_iter().flatten() {
+            if c["type"] == "tool_result" {
+                out = text(&c["content"]);
+            }
+        }
+    }
+    for item in v["input"].as_array().into_iter().flatten() {
+        if item["type"] == "function_call_output" {
+            out = text(&item["output"]);
+        }
+    }
+    out
+}
+
+/// The exit codes `echo "EXIT=$?"` printed in one command's output.
+fn exits(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("EXIT="))
+        .collect()
+}
+
+/// The CLI's refusal in one command's output (K-01's fail-closed half):
+/// exactly one `envcloak: daemon_unverified: ...` or `envcloak:
+/// daemon_unavailable: ...` line and `EXIT=125`, the exit of `run`'s own
+/// failures. The refusal line, or why the output is not that.
+fn refused_once(output: &str) -> Result<String, String> {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            l.starts_with("envcloak: daemon_unverified: ")
+                || l.starts_with("envcloak: daemon_unavailable: ")
+        })
+        .collect();
+    let codes = exits(output);
+    match (lines.as_slice(), codes.as_slice()) {
+        ([line], ["125"]) => Ok((*line).to_owned()),
+        (lines, codes) => Err(format!(
+            "{} refusal line(s), exit codes {codes:?}",
+            lines.len()
+        )),
+    }
 }
 
 /// The number of `request` lines in the daemons' audit log so far.
