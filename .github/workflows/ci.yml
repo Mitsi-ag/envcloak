@@ -248,7 +248,9 @@ jobs:
       - name: Build the release binaries and the test build's controls
         run: |
           cargo build --release --locked
-          cargo build --locked -p envcloak -p envcloakd -p envcloak-testkit --bins
+          # envcloak-agents: agent_hosts checks that the scripted model's
+          # sentinel is in it and in neither release binary.
+          cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit --bins
       - name: Release checks, gate 12 and the fixture story on the release binaries
         env:
           RUST_LOG: trace
