@@ -13,9 +13,9 @@ use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, Slug};
 use envcloak_policy::{
     AccessRequest, AgentLabel, Ancestor, ApprovalOptions, ApprovalProof, BoundBinding, BoundRef,
     Busy, CatalogSource, ChainEnd, Claims, Decision, EnvName, GrantStore, MAX_OUTCOMES,
-    MAX_POLL_ROOTS, MatchBasis, Mode, Now, OUTCOME_TTL, PENDING_TTL, POLLS_PER_REQUEST, PendingId,
-    PendingState, ProcessInstance, ProjectIdentity, ProofKind, RevokeSelector, SubjectEvidence,
-    Uses, statement_digest,
+    MAX_PENDING, MAX_POLL_ROOTS, MatchBasis, Mode, Now, OUTCOME_TTL, PENDING_TTL,
+    POLLS_PER_REQUEST, PendingId, PendingState, ProcessInstance, ProjectIdentity, ProofKind,
+    RevokeSelector, SubjectEvidence, Uses, statement_digest,
 };
 use envcloak_sys::StartTime;
 
@@ -390,6 +390,70 @@ fn polls_are_limited_per_root_by_its_live_requests() {
         );
     }
     assert_eq!(s.poll(&one, &me, &at_ms(1000)), Err(Busy));
+}
+
+/// Polls that reach the limiter out of order (the daemon read each one's
+/// time before taking the store's lock, so concurrent polls can arrive
+/// with times that go backwards) refill no interval twice: the bucket's
+/// clock never moves back.
+///
+/// Mutation: take each poll's time as the bucket's (`b.at = now`): the
+/// late poll stamped 250 ms moves it back, the next one at 500 ms refills
+/// those 250 ms again, and a poll the budget does not allow is admitted.
+#[test]
+fn polls_out_of_order_refill_no_interval_twice() {
+    let it = item();
+    let mut s = store();
+    let me = under(80, 81);
+    let one = opened(&mut s, request(me.clone(), "one", &it), &at_ms(0));
+    let per = usize::try_from(POLLS_PER_REQUEST).unwrap();
+    // Four at once, then none.
+    for n in 0..per {
+        assert!(s.poll(&one, &me, &at_ms(0)).is_ok(), "poll {n}");
+    }
+    assert_eq!(s.poll(&one, &me, &at_ms(0)), Err(Busy));
+    // Half a second later, two.
+    for n in 0..2 {
+        assert!(s.poll(&one, &me, &at_ms(500)).is_ok(), "poll {n}");
+    }
+    assert_eq!(s.poll(&one, &me, &at_ms(500)), Err(Busy));
+    // A poll stamped earlier arrives late: refused, and the bucket's clock
+    // stays where it was.
+    assert_eq!(s.poll(&one, &me, &at_ms(250)), Err(Busy));
+    assert_eq!(s.poll(&one, &me, &at_ms(500)), Err(Busy));
+    // The next poll is due 250 ms after 500 ms, not after 250 ms.
+    assert_eq!(s.poll(&one, &me, &at_ms(749)), Err(Busy));
+    assert_eq!(s.poll(&one, &me, &at_ms(750)), Ok(PendingState::Pending));
+}
+
+/// `pending_all` lists the requests oldest first, by when each was opened
+/// and then by id, whatever their random ids: the order `pending.list` and
+/// `envcloak pending` promise.
+///
+/// Mutation: list them in the store's order (by id): twenty requests
+/// opened one after another come back shuffled and this fails.
+#[test]
+fn pending_requests_are_listed_oldest_first() {
+    let it = item();
+    let mut s = store();
+    let mut opened_in_order = Vec::new();
+    for n in 0..MAX_PENDING {
+        // Each from an agent of its own: 3 per root at most.
+        let agent = 3000 + 2 * i32::try_from(n).unwrap();
+        let me = under(agent, agent + 1);
+        let at = at_ms(10 * u64::try_from(n).unwrap());
+        opened_in_order.push(opened(&mut s, request(me, "x", &it), &at));
+    }
+    let listed: Vec<PendingId> = s.pending_all(&at_ms(1000)).map(|p| p.id).collect();
+    assert_eq!(listed, opened_in_order);
+    // Opened at the same moment: by id.
+    let mut s = store();
+    let a = opened(&mut s, request(under(4000, 4001), "a", &it), &at_ms(0));
+    let b = opened(&mut s, request(under(4002, 4003), "b", &it), &at_ms(0));
+    let mut by_id = vec![a, b];
+    by_id.sort_unstable();
+    let listed: Vec<PendingId> = s.pending_all(&at_ms(1)).map(|p| p.id).collect();
+    assert_eq!(listed, by_id);
 }
 
 /// Both stores a poll adds to are bounded: past MAX_POLL_ROOTS roots that

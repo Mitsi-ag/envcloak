@@ -30,7 +30,8 @@
 //! request of the root (at least one's worth, so a root whose request just
 //! ended can still read its outcome), and holds one second's worth. A poll
 //! over the limit is refused ([`Busy`]), which a waiter answers by backing
-//! off, never as a refusal.
+//! off, never as a refusal. A bucket's clock only moves forward, so polls
+//! that reach it out of order never refill an interval twice.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -218,12 +219,15 @@ impl PollLimiter {
             milli: cap,
             at: now,
         });
+        // The bucket's clock never moves back: polls whose times were read
+        // before the store's lock can arrive out of order, and an earlier
+        // time taken as the bucket's would refill the same interval twice.
         let elapsed = u64::try_from(now.saturating_sub(b.at).as_millis()).unwrap_or(u64::MAX);
         b.milli = b
             .milli
             .saturating_add(elapsed.saturating_mul(per_second))
             .min(cap);
-        b.at = now;
+        b.at = b.at.max(now);
         if b.milli < 1000 {
             return Err(Busy);
         }
