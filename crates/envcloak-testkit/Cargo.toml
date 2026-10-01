@@ -23,8 +23,10 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 # assert_fresh reads the workspace's manifests to find what a binary is
-# built from.
-toml_edit.workspace = true
+# built from; the agent harness edits Codex's config.toml key by key, keeping
+# what Codex's own CLI wrote there (`display` writes it back; envcloak-client
+# enables it already).
+toml_edit = { workspace = true, features = ["display"] }
 zeroize.workspace = true
 
 [dev-dependencies]

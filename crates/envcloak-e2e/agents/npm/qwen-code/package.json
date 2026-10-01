@@ -1,0 +1,7 @@
+{
+  "name": "envcloak-agent-host-qwen-code",
+  "private": true,
+  "dependencies": {
+    "@qwen-code/qwen-code": "0.24.7"
+  }
+}

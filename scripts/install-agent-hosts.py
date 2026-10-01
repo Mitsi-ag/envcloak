@@ -16,17 +16,26 @@ Methods:
 - tarball: an archive from `url`, its first path component stripped,
   members with absolute paths, `..` or links leaving the directory
   refused;
-- npm: `npm install --prefix <dir> <package>@<version>`, with the
-  package's install scripts only when `scripts = true`.
+- npm: `npm ci --prefix <dir>` against the committed lockfile in
+  crates/envcloak-e2e/agents/npm/<id>/ (package.json naming exactly
+  `<package>` at `<version>`, and package-lock.json with an integrity hash
+  for every package in the tree), with install scripts only when
+  `scripts = true`.
+
+A host whose entry is a script names its `interpreter` (`node`); one whose
+entry starts another program names it in `starts` (relative to the host's
+directory) with its SHA-256 in `starts_sha256`, checked like the entry's.
 
 `url` may name {version}, {platform} (darwin-arm64, linux-x64), {os}
 (darwin, linux) and {arch} (arm64, x64).
 
 usage: install-agent-hosts.py [--tier 1|2|all] [--host ID[/VARIANT]]...
                               [--platform P] [--print-hashes]
+       install-agent-hosts.py --print-cache-dir
 --print-hashes downloads and prints the SHA-256 values for the platform
 instead of checking them, for a maintainer pinning a new version; it
-installs nothing.
+installs nothing. --print-cache-dir prints the cache directory and exits
+(envcloak-testkit checks that its own default is the same one).
 
 Prints one line per host and exits 0 when every host asked for is
 installed and verified, 1 otherwise.
@@ -47,6 +56,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 VERSIONS = os.path.join(ROOT, "crates", "envcloak-e2e", "agents", "versions.toml")
+NPM_LOCKS = os.path.join(ROOT, "crates", "envcloak-e2e", "agents", "npm")
 
 
 def this_platform():
@@ -124,9 +134,22 @@ def install(host, plat, cache, print_hashes):
         return False, "no pinned SHA-256 for %s" % plat
     name = "%s-%s-%s-%s" % (host["id"], host["variant"], host["version"], plat)
     final = os.path.join(cache, name)
+    starts = per_platform(host, "starts", plat)
+    starts_want = per_platform(host, "starts_sha256", plat)
+    if starts is not None and starts_want is None and not print_hashes:
+        return False, "no pinned starts_sha256 for %s" % plat
+
+    def verified(base):
+        for rel, pinned in ((entry, want), (starts, starts_want)):
+            if rel is None:
+                continue
+            path = os.path.join(base, rel)
+            if not os.path.isfile(path) or sha256_file(path) != pinned:
+                return False
+        return True
+
     if not print_hashes and os.path.isdir(final):
-        got = sha256_file(os.path.join(final, entry)) if os.path.isfile(os.path.join(final, entry)) else None
-        if got == want:
+        if verified(final):
             return True, "already installed, verified"
         return False, "installed copy does not match its pin; remove %s and run again" % final
     os.makedirs(cache, exist_ok=True)
@@ -150,8 +173,27 @@ def install(host, plat, cache, print_hashes):
             extract(archive, tmp, int(host.get("strip", 0)))
             os.unlink(archive)
         elif method == "npm":
-            cmd = ["npm", "install", "--prefix", tmp, "--no-audit", "--no-fund", "--no-save",
-                   "--loglevel=error", "%s@%s" % (host["package"], host["version"])]
+            locks = os.path.join(NPM_LOCKS, host["id"])
+            try:
+                with open(os.path.join(locks, "package.json"), "rb") as f:
+                    manifest = json.load(f)
+                with open(os.path.join(locks, "package-lock.json"), "rb") as f:
+                    lock = json.load(f)
+            except (OSError, ValueError) as e:
+                return False, "no lockfile for %s: %s" % (host["id"], e)
+            if manifest.get("dependencies") != {host["package"]: host["version"]}:
+                return False, "%s/package.json does not name %s@%s alone" % (
+                    locks, host["package"], host["version"])
+            unpinned = [k for k, v in lock.get("packages", {}).items()
+                        if k and not v.get("link") and not v.get("integrity")]
+            if unpinned:
+                return False, "the lockfile pins no integrity for %s" % ", ".join(unpinned[:3])
+            for name in ("package.json", "package-lock.json"):
+                shutil.copyfile(os.path.join(locks, name), os.path.join(tmp, name))
+            # By its real path: npm reads a prefix reached through a link
+            # (macOS's /tmp, a `..`) as a link to a package of its own.
+            cmd = ["npm", "ci", "--prefix", os.path.realpath(tmp), "--no-audit", "--no-fund",
+                   "--loglevel=error"]
             if not host.get("scripts", False):
                 cmd.insert(2, "--ignore-scripts")
             env = dict(os.environ)
@@ -165,14 +207,24 @@ def install(host, plat, cache, print_hashes):
         if not os.path.isfile(path):
             return False, "the entry %s is missing after install" % entry
         got = sha256_file(path)
+        started = None
+        if starts is not None:
+            if not os.path.isfile(os.path.join(tmp, starts)):
+                return False, "the program the entry starts, %s, is missing after install" % starts
+            started = sha256_file(os.path.join(tmp, starts))
         if print_hashes:
             print("  %s sha256 %s = %s" % (label(host), plat, got))
+            if started is not None:
+                print("  %s starts_sha256 %s = %s" % (label(host), plat, started))
             return True, "hashes printed, nothing installed"
         if got != want:
             return False, "entry SHA-256 %s, pinned %s" % (got, want)
+        if started is not None and started != starts_want:
+            return False, "SHA-256 of %s %s, pinned %s" % (starts, started, starts_want)
         with open(os.path.join(tmp, "installed.json"), "w") as f:
             json.dump({"id": host["id"], "variant": host["variant"], "version": host["version"],
-                       "platform": plat, "entry": entry, "sha256": got}, f)
+                       "platform": plat, "entry": entry, "sha256": got,
+                       "starts": starts, "starts_sha256": started}, f)
         os.rename(tmp, final)
         tmp = None
         return True, "installed, verified"
@@ -203,6 +255,9 @@ def main(argv):
         elif a == "--print-hashes":
             print_hashes = True
             i += 1
+        elif a == "--print-cache-dir" and len(argv) == 2:
+            print(cache_dir())
+            return 0
         else:
             print(__doc__, file=sys.stderr)
             return 2
