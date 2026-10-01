@@ -37,8 +37,9 @@
 //! "requests": [...], "outcome": {...}}`, the line `release <name>`
 //! releases a barrier (a step's `after`), and the line `stop`, or the end
 //! of input, ends the run with a last line whose `final` is true. The
-//! program exits 0 when the run was complete, 3 when it was not and 2 on
-//! a usage error. A request's body is base64 in `body`; its headers are
+//! program exits 0 when the run was complete, 3 when it was not or its
+//! last line was not read within 10 s (the records are wiped either way),
+//! and 2 on a usage error. A request's body is base64 in `body`; its headers are
 //! listed by name, never by value. [`ModelStub`] is the client side.
 //!
 //! The pinned hosts the wire protocols are qualified against are in

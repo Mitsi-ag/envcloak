@@ -682,6 +682,60 @@ fn a_record_s_debug_shows_no_target() {
     assert!(shown.contains("<16 bytes>"), "{shown}");
 }
 
+/// An owner that stops reading cannot keep the program alive: once the
+/// run ends (here by its time limit), the last report waits at most 10 s
+/// for its reader, then the program wipes its records and exits 3
+/// (verifier, low, F-84: with a report larger than the pipe holds and
+/// nobody reading, it blocked forever). The program is started by hand:
+/// its standard output is read for the address line only.
+#[test]
+fn a_last_report_nobody_reads_does_not_keep_the_program_alive() {
+    use std::io::BufRead as _;
+    let mut child = Command::new(EXE)
+        .args(["--time-limit", "1"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(&script()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    let ready: Value = serde_json::from_str(&ready).unwrap();
+    let addr: SocketAddr = ready["addr"].as_str().unwrap().parse().unwrap();
+    let auth = format!("x-api-key: {}\r\n", ready["token"].as_str().unwrap());
+    // 300 KB of body, recorded: a last report of 400 KB of base64, far
+    // more than a pipe holds.
+    let got = send(addr, &post("/v1/other", &auth, &vec![b'a'; 300 * 1024])).unwrap();
+    assert_eq!(got.status, 404);
+    // Standard output stays open and unread; standard input stays open,
+    // so only the time limit ends the run.
+    let end = std::time::Instant::now() + Duration::from_secs(40);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if std::time::Instant::now() > end {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    drop((stdin, stdout));
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(3),
+        "the program was still running 40 s after a 1 s run, its report unread"
+    );
+}
+
 fn held_script() -> Vec<u8> {
     json!({"steps": [{"say": "held", "after": "approved"}]})
         .to_string()

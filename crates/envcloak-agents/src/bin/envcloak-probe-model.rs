@@ -12,10 +12,11 @@
 
 use std::io::{self, BufRead, Read, Write};
 use std::process::ExitCode;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use envcloak_agents::probe::model::script::{MAX_SCRIPT, barrier_name};
-use envcloak_agents::probe::model::{Limits, Script, Server};
+use envcloak_agents::probe::model::{Handle, Limits, Script, Server};
 use zeroize::Zeroizing;
 
 #[global_allocator]
@@ -27,6 +28,11 @@ The script is the first line of standard input (JSON); see the crate
 documentation of envcloak-agents for the lines that follow.";
 /// The longest run anyone may ask for: one hour.
 const MAX_TIME: u64 = 3600;
+/// How long the last report may wait for its reader once the run has
+/// ended, by a `stop` or its time limit: past it the run's records are
+/// wiped and the program exits 3, so an owner that stopped reading cannot
+/// keep it, and what it recorded, alive.
+const REPORT_LIMIT: Duration = Duration::from_secs(10);
 
 fn main() -> ExitCode {
     envcloak_sys::harden_process();
@@ -130,16 +136,31 @@ fn main() -> ExitCode {
 
     server.serve();
     let complete = handle.outcome().complete();
-    {
-        let mut stdout = io::stdout().lock();
-        let _ = handle.write_report(&mut stdout, true);
-    }
+    let delivered = deliver_last_report(&handle);
     handle.wipe();
+    if !delivered {
+        eprintln!("{NAME}: the last report was not read in time; the run's records are wiped");
+        // The writer may still be blocked on standard output; exiting
+        // does not wait for it.
+        std::process::exit(3);
+    }
     if complete {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(3)
     }
+}
+
+/// Writes the last report on a thread of its own and waits at most
+/// [`REPORT_LIMIT`] for it to be written whole; whether it was.
+fn deliver_last_report(handle: &Handle) -> bool {
+    let (tx, rx) = mpsc::channel();
+    let writer = handle.clone();
+    let spawned = std::thread::Builder::new().spawn(move || {
+        let mut stdout = io::stdout().lock();
+        let _ = tx.send(writer.write_report(&mut stdout, true).is_ok());
+    });
+    spawned.is_ok() && matches!(rx.recv_timeout(REPORT_LIMIT), Ok(true))
 }
 
 fn usage() -> ExitCode {
