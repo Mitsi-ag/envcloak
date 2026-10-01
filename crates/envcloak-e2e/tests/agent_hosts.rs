@@ -1276,8 +1276,8 @@ fn claude_code_sandbox_reaches_the_socket() {
 /// `http`: a request through whatever proxy the command's environment
 /// names (Codex's own, under its network proxy), each in a command of its
 /// own, since Codex fails a whole command whose request its proxy blocks.
-/// Each prints `<KEY>OK` or `<KEY>NO <why>`, one word; `PXY` names the
-/// proxy's port, or `none`.
+/// Each prints `<KEY>OK` or `<KEY>NO <why>`, one word; `PXY` lists the
+/// command's proxy variables with the host and port each names.
 const EGRESS: &str = r#"import errno, os, re, socket, sys, urllib.error, urllib.request
 mode, port, other = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 def say(key, verdict, why=""):
@@ -1301,14 +1301,15 @@ if mode == "raw":
     raw("TCP", socket.AF_INET, ("127.0.0.1", port))
     raw("UNIX", socket.AF_UNIX, other)
     raw("EXT", socket.AF_INET, ("192.0.2.1", 443))
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
-    m = re.search(r":(\d+)/?$", proxy)
-    say("PXY", "", m.group(1) if m else ("none" if not proxy else "unparsed"))
+    proxies = sorted("%s=%s" % (k, re.sub(r"^[a-z0-9]+://", "", v)) for k, v in os.environ.items() if "proxy" in k.lower())
+    print("PXY", re.sub(r"[^A-Za-z0-9._:=,-]", "_", ",".join(proxies) or "none")[:400])
 for key, url in (("PRXS", "https://example.com/"), ("PRXH", "http://example.com/")):
     if mode != url.split(":")[0]:
         continue
     try:
-        r = urllib.request.urlopen(url, timeout=15)
+        # Within the 10 s Codex waits before it returns a command's
+        # output so far.
+        r = urllib.request.urlopen(url, timeout=5)
         say(key, "OK", r.status)
     except urllib.error.HTTPError as e:
         say(key, "NO", "http-%d" % e.code)
@@ -1420,18 +1421,20 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
                 format!("not tried (no output: {said:?})")
             }
         };
-        let proxy_port = printed(&text, "PXY ").unwrap_or_else(|| "?".to_owned());
+        let proxies = printed(&text, "PXY ").unwrap_or_else(|| "?".to_owned());
         measure(
             &a,
             &format!("other egress, {label}"),
             format!(
                 "loopback TCP {}, another Unix socket {}, a non-loopback address {}, \
-                 HTTPS through the command's proxy (port {proxy_port}) {}, HTTP {}",
+                 HTTPS through the command's proxy {}, HTTP {}; the command's proxy \
+                 variables {proxies}, the scripted model at {}",
                 seen("TCP"),
                 seen("UNIX"),
                 seen("EXT"),
                 seen("PRXS"),
-                seen("PRXH")
+                seen("PRXH"),
+                run.model_url.trim_start_matches("http://")
             ),
         );
         if sandbox == "workspace-write" && name.contains("unix_sockets") {

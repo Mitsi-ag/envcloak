@@ -421,7 +421,9 @@ jobs:
       # namespace above. Root makes a network namespace with loopback only,
       # and the tests run in it as the runner's own user.
       - name: Agent host sandboxes outside a user namespace, loopback only (Linux)
-        if: runner.os == 'Linux'
+        # Measured even when a step above failed, so a failing run still
+        # records these rows.
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: |
           sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \

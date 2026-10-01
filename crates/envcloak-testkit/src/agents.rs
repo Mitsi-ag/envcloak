@@ -676,6 +676,8 @@ impl HostFlags {
 pub struct HostRun {
     pub output: Output,
     pub model: ModelReport,
+    /// Where the run's scripted model listened (`http://127.0.0.1:<port>`).
+    pub model_url: String,
     pub elapsed: Duration,
 }
 
@@ -1002,9 +1004,11 @@ impl Running {
         let left = RUN_LIMIT.saturating_sub(self.start.elapsed());
         let output = self.collector.wait(&mut self.child, left);
         let elapsed = self.start.elapsed();
+        let model_url = self.model.base_url();
         HostRun {
             output,
             model: self.model.finish(),
+            model_url,
             elapsed,
         }
     }
