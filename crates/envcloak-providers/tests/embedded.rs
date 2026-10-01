@@ -206,25 +206,25 @@ fn the_embedded_registry_loads() {
     // `/repositories/<id>/` (its redirects for a renamed repository point
     // there), an organization at `/organizations/<id>/`, and a team at
     // `/organizations/<org id>/team/<team id>/`: every `/repos/*/*/...` and
-    // `/orgs/*/...` entry has its twin, and each is denied there.
-    let twins: Vec<&str> = github
+    // `/orgs/*/...` entry has its twin, and each is denied there. A
+    // repository's twin is under `/repositories/` and an organization's
+    // under `/organizations/` only (review R-20): a suffix both have, such
+    // as `actions/secrets`, does not pass on the other's twin.
+    let twins: Vec<String> = github
         .denied_paths
         .iter()
         .filter_map(|p| {
             p.strip_prefix("/repos/*/*/")
-                .or_else(|| p.strip_prefix("/orgs/*/"))
+                .map(|s| format!("/repositories/*/{s}"))
+                .or_else(|| {
+                    p.strip_prefix("/orgs/*/")
+                        .map(|s| format!("/organizations/*/{s}"))
+                })
         })
         .collect();
     assert_eq!(twins.len(), 24);
-    for suffix in twins {
-        let by_id = [
-            format!("/repositories/*/{suffix}"),
-            format!("/organizations/*/{suffix}"),
-        ];
-        assert!(
-            by_id.iter().any(|t| github.denied_paths.contains(t)),
-            "{suffix}"
-        );
+    for twin in &twins {
+        assert!(github.denied_paths.contains(twin), "{twin}");
     }
     for path in [
         "/repositories/1/keys",
