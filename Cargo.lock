@@ -242,6 +242,16 @@ dependencies = [
 [[package]]
 name = "envcloak-agents"
 version = "0.1.0"
+dependencies = [
+ "base64",
+ "envcloak-sys",
+ "getrandom 0.4.3",
+ "proptest",
+ "serde",
+ "serde_json",
+ "subtle",
+ "zeroize",
+]
 
 [[package]]
 name = "envcloak-browser"
