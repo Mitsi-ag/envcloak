@@ -178,8 +178,7 @@ fn scripted_turns(h: Host, variant: &str) {
         "{}",
         run.text()
     );
-    let mut endpoints = run.model.endpoints();
-    endpoints.retain(|e| !e.starts_with("CONNECT "));
+    let mut endpoints = run.model.model_endpoints();
     endpoints.dedup();
     measure(&a, "model endpoints", endpoints.join(", "));
     let mut tunnels: Vec<&str> = run.model.connects();
@@ -1499,6 +1498,15 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
                     "{key} was not refused by Codex: {got}"
                 );
             }
+            // Every request that reached the scripted model was read: a
+            // proxy request in any form is recorded (an HTTP/1.0 tunnel, a
+            // request to forward), so the check below can fail.
+            assert_eq!(
+                run.model.outcome["malformed"].as_u64(),
+                Some(0),
+                "{:?}",
+                run.model.outcome
+            );
             assert!(
                 !run.model
                     .connects()

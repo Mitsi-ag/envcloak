@@ -4,6 +4,11 @@
 //!
 //! Only what the stub needs is accepted: an origin-form target, version
 //! `HTTP/1.1`, a `Host` header, a body framed by `Content-Length` alone.
+//! A request meant for a proxy (the harness points a host's proxy
+//! variables here) is also read, by its target alone, so that it can be
+//! refused and recorded: a tunnel (`CONNECT host:port`) or a forwarded
+//! request (an absolute `http://` or `https://` target), in HTTP/1.1 or
+//! 1.0, with or without `Host`, as Python's and other clients send them.
 //! `Transfer-Encoding`, `Expect`, a `Content-Encoding` other than
 //! `identity`, obsolete line folding, a bare CR or LF, a byte outside
 //! visible ASCII in a header, and a framing or credential header given
@@ -42,12 +47,29 @@ impl fmt::Display for HttpError {
     }
 }
 
+/// What a request's target is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    /// A path on this server (origin-form).
+    Origin,
+    /// A tunnel through a proxy: `CONNECT host:port` (authority-form).
+    Tunnel,
+    /// A request a proxy is to forward: an absolute `http://` or
+    /// `https://` target (absolute-form).
+    Forward,
+}
+
 /// A parsed request head. The credential headers are kept only to be
-/// compared with the run's token; `Debug` shows neither.
+/// compared with the run's token; `Debug` shows neither, and shows the
+/// target only by the name of the endpoint it is, or by its length.
 pub struct Head {
     /// The method, upper-case letters only.
     pub method: String,
-    /// The target's path, before any `?`.
+    /// What the target is for.
+    pub form: Form,
+    /// The target's path, before any `?`; for a tunnel or a forwarded
+    /// request, the `host:port` it names (a forwarded request's own path
+    /// and query are not kept).
     pub path: String,
     /// The target's query, after the first `?`.
     pub query: Option<String>,
@@ -61,12 +83,25 @@ pub struct Head {
     pub(crate) authorization: Option<Zeroizing<Vec<u8>>>,
 }
 
+/// How `Debug` shows a request target: the endpoint it names when it is
+/// one the scripted model serves, else only its length. A target is
+/// whatever a client sent, and can hold anything (L-12).
+pub fn shown_target(path: &str, query: Option<&str>) -> String {
+    match path {
+        "/v1/messages" | "/v1/responses" | "/api/hello" => match query {
+            None => path.to_owned(),
+            Some(q) => format!("{path}?<{} bytes>", q.len()),
+        },
+        _ => format!("<{} bytes>", path.len() + query.map_or(0, |q| q.len() + 1)),
+    }
+}
+
 impl fmt::Debug for Head {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Head")
             .field("method", &self.method)
-            .field("path", &self.path)
-            .field("query", &self.query)
+            .field("form", &self.form)
+            .field("target", &shown_target(&self.path, self.query.as_deref()))
             .field("content_length", &self.content_length)
             .field("close", &self.close)
             .field("header_names", &self.header_names)
@@ -100,9 +135,10 @@ pub fn parse_head(head: &[u8], body_cap: usize) -> Result<Head, HttpError> {
     let Some(request_line) = lines.next() else {
         return Err(HttpError::Malformed("request line"));
     };
-    let (method, path, query) = request_line_parts(request_line)?;
+    let (method, form, path, query) = request_line_parts(request_line)?;
     let mut head = Head {
         method,
+        form,
         path,
         query,
         content_length: 0,
@@ -119,7 +155,9 @@ pub fn parse_head(head: &[u8], body_cap: usize) -> Result<Head, HttpError> {
         }
         header(line, &mut head, &mut content_length, &mut host)?;
     }
-    if !host {
+    // A proxy's client names where it goes in the target; HTTP/1.0 ones
+    // send no `Host`.
+    if !host && form == Form::Origin {
         return Err(HttpError::Malformed("host header"));
     }
     let length = content_length.unwrap_or(0);
@@ -156,7 +194,11 @@ fn split_crlf(text: &[u8]) -> Result<impl Iterator<Item = &[u8]>, HttpError> {
     }))
 }
 
-fn request_line_parts(line: &[u8]) -> Result<(String, String, Option<String>), HttpError> {
+/// The parts of a request line: method, form, path (or `host:port`) and
+/// query.
+type RequestLine = (String, Form, String, Option<String>);
+
+fn request_line_parts(line: &[u8]) -> Result<RequestLine, HttpError> {
     let mut parts = line.split(|&b| b == b' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -166,21 +208,32 @@ fn request_line_parts(line: &[u8]) -> Result<(String, String, Option<String>), H
     if method.is_empty() || method.len() > 16 || !method.iter().all(u8::is_ascii_uppercase) {
         return Err(HttpError::Malformed("method"));
     }
-    if version != b"HTTP/1.1" {
+    if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
         return Err(HttpError::Malformed("version"));
     }
+    let method_text = String::from_utf8_lossy(method).into_owned();
     if method == b"CONNECT" {
         // A proxy tunnel request (the harness points HTTPS_PROXY here, so
         // a host's traffic to anywhere else is seen and refused): the
         // authority-form target `host:port`, kept as the path.
         return match authority(target) {
             true => Ok((
-                "CONNECT".to_owned(),
+                method_text,
+                Form::Tunnel,
                 String::from_utf8_lossy(target).into_owned(),
                 None,
             )),
             false => Err(HttpError::Malformed("target")),
         };
+    }
+    if let Some(at) = forwarded(target) {
+        // A request a proxy is to forward (HTTP_PROXY pointed here): kept
+        // by the `host:port` it goes to.
+        return Ok((method_text, Form::Forward, at, None));
+    }
+    // Only a request for this server is held to HTTP/1.1.
+    if version != b"HTTP/1.1" {
+        return Err(HttpError::Malformed("version"));
     }
     if target.first() != Some(&b'/')
         || target.len() > MAX_TARGET
@@ -196,7 +249,36 @@ fn request_line_parts(line: &[u8]) -> Result<(String, String, Option<String>), H
     if path.contains('#') || query.as_deref().is_some_and(|q| q.contains('#')) {
         return Err(HttpError::Malformed("target"));
     }
-    Ok((text(method), path, query))
+    Ok((method_text, Form::Origin, path, query))
+}
+
+/// The `host:port` an absolute-form target (`http://host[:port]/...` or
+/// `https://...`, scheme in any case) goes to, the port the scheme's
+/// default when none is given; `None` for any other target. Its own path
+/// and query are not kept.
+fn forwarded(target: &[u8]) -> Option<String> {
+    let lower = |n: usize| target.get(..n).map(<[u8]>::to_ascii_lowercase);
+    let (rest, port) = if lower(7).as_deref() == Some(b"http://") {
+        (&target[7..], "80")
+    } else if lower(8).as_deref() == Some(b"https://") {
+        (&target[8..], "443")
+    } else {
+        return None;
+    };
+    if target.len() > MAX_TARGET {
+        return None;
+    }
+    let end = rest
+        .iter()
+        .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+    let at = &rest[..end];
+    let named = if at.contains(&b':') {
+        String::from_utf8_lossy(at).into_owned()
+    } else {
+        format!("{}:{port}", String::from_utf8_lossy(at))
+    };
+    authority(named.as_bytes()).then_some(named)
 }
 
 /// RFC 9112 authority-form as a host sends it to a proxy: a DNS name or
@@ -353,8 +435,24 @@ mod tests {
                 HttpError::Malformed("request line"),
             ),
             (
-                "GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n",
+                "GET http:///x HTTP/1.1\r\nHost: x\r\n\r\n",
                 HttpError::Malformed("target"),
+            ),
+            (
+                "GET ftp://x/ HTTP/1.1\r\nHost: x\r\n\r\n",
+                HttpError::Malformed("target"),
+            ),
+            (
+                "GET http://a b/ HTTP/1.1\r\nHost: x\r\n\r\n",
+                HttpError::Malformed("request line"),
+            ),
+            (
+                "GET http://x:99999999/ HTTP/1.1\r\nHost: x\r\n\r\n",
+                HttpError::Malformed("target"),
+            ),
+            (
+                "CONNECT x:443 HTTP/2.0\r\n\r\n",
+                HttpError::Malformed("version"),
             ),
             (
                 "CONNECT /x HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -446,9 +544,88 @@ mod tests {
         let h = parse("CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
-            (h.method.as_str(), h.path.as_str()),
-            ("CONNECT", "api.example.com:443")
+            (h.method.as_str(), h.form, h.path.as_str()),
+            ("CONNECT", Form::Tunnel, "api.example.com:443")
         );
+    }
+
+    /// What clients send a proxy, whichever HTTP version and with or
+    /// without `Host`, is read by the `host:port` it names, so the stub
+    /// can refuse and record it (verifier, low: an HTTP/1.0 tunnel and an
+    /// absolute-form request were refused as malformed, unrecorded). A
+    /// forwarded request's own path and query are not kept.
+    #[test]
+    fn requests_meant_for_a_proxy_are_read_by_where_they_go() {
+        for (input, form, method, at) in [
+            (
+                "CONNECT example.com:443 HTTP/1.0\r\n\r\n",
+                Form::Tunnel,
+                "CONNECT",
+                "example.com:443",
+            ),
+            (
+                "CONNECT example.com:443 HTTP/1.1\r\n\r\n",
+                Form::Tunnel,
+                "CONNECT",
+                "example.com:443",
+            ),
+            (
+                "GET http://example.com/a?MARK HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                Form::Forward,
+                "GET",
+                "example.com:80",
+            ),
+            (
+                "GET http://example.com HTTP/1.0\r\n\r\n",
+                Form::Forward,
+                "GET",
+                "example.com:80",
+            ),
+            (
+                "POST HTTPS://Example.com:8443/x HTTP/1.0\r\nContent-Length: 3\r\n\r\n",
+                Form::Forward,
+                "POST",
+                "Example.com:8443",
+            ),
+        ] {
+            let h = parse(input).unwrap_or_else(|e| panic!("{input:?}: {e}"));
+            assert_eq!(
+                (
+                    h.form,
+                    h.method.as_str(),
+                    h.path.as_str(),
+                    h.query.as_deref()
+                ),
+                (form, method, at, None),
+                "{input:?}"
+            );
+        }
+        // A request for this server is still held to HTTP/1.1 and `Host`.
+        assert_eq!(
+            parse("GET / HTTP/1.0\r\n\r\n").err(),
+            Some(HttpError::Malformed("version"))
+        );
+    }
+
+    /// `Debug` never shows what a target holds: an endpoint the stub
+    /// serves by name, anything else by its length (L-12).
+    #[test]
+    fn debug_shows_a_target_only_by_its_endpoint_or_length() {
+        for input in [
+            "POST /v1/messages?MARK-Q HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /MARK-P/x?MARK-Q HTTP/1.1\r\nHost: x\r\n\r\n",
+            "CONNECT MARK-H.example:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET http://MARK-H.example/MARK-P HTTP/1.1\r\n\r\n",
+        ] {
+            let shown = format!("{:?}", parse(input).unwrap_or_else(|e| panic!("{e}")));
+            assert!(!shown.contains("MARK"), "{shown}");
+        }
+        let shown = format!(
+            "{:?}",
+            parse("POST /v1/messages?beta=true HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert!(shown.contains("/v1/messages?<9 bytes>"), "{shown}");
     }
 
     #[test]

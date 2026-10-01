@@ -581,6 +581,107 @@ fn a_proxy_tunnel_request_is_refused_and_recorded_by_its_target() {
     assert_eq!(r.api.as_deref(), Some("connect"));
 }
 
+/// A tunnel in HTTP/1.0 with no `Host`, and a request to forward (an
+/// absolute target), each refused and recorded by where it goes: what a
+/// client of the proxy the harness names sends, whatever its HTTP version
+/// (verifier, low: these were refused as malformed and never recorded, so
+/// a test that no request reached the proxy could not fail).
+#[test]
+fn every_request_meant_for_a_proxy_is_refused_and_recorded() {
+    let stub = start();
+    for request in [
+        &b"CONNECT a.example:443 HTTP/1.0\r\n\r\n"[..],
+        b"GET http://b.example/MARK?MARK HTTP/1.1\r\nHost: b.example\r\n\r\n",
+        b"GET http://c.example:8080/ HTTP/1.0\r\n\r\n",
+    ] {
+        assert_eq!(send(stub.addr(), request).unwrap().status, 403);
+    }
+    let report = stub.finish().unwrap();
+    assert!(report.outcome.clean(), "{:?}", report.outcome);
+    assert_eq!(report.outcome.connect, 3);
+    let seen: Vec<(&str, &str, &str)> = report
+        .requests
+        .iter()
+        .map(|r| {
+            (
+                r.api.as_deref().unwrap_or(""),
+                r.method.as_str(),
+                r.path.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("connect", "CONNECT", "a.example:443"),
+            ("proxy", "GET", "b.example:80"),
+            ("proxy", "GET", "c.example:8080"),
+        ]
+    );
+    assert!(
+        report
+            .requests
+            .iter()
+            .all(|r| r.query.is_none() && r.answered)
+    );
+}
+
+/// Python's own `urllib`, pointed at the stub by its proxy variables, for
+/// an `https://` and an `http://` URL: both refused by the stub, both
+/// recorded, nothing malformed. The independent client the egress probe
+/// in agent_hosts uses.
+#[test]
+fn python_s_proxied_requests_are_refused_and_recorded() {
+    let stub = start();
+    let probe = "import sys, urllib.error, urllib.request\n\
+        for url in ('https://example.com/', 'http://example.com/x'):\n\
+        \x20   try:\n\
+        \x20       urllib.request.urlopen(url, timeout=10)\n\
+        \x20       print('reached', url)\n\
+        \x20   except urllib.error.HTTPError as e:\n\
+        \x20       print('refused', e.code)\n\
+        \x20   except Exception as e:\n\
+        \x20       print('refused', type(e).__name__, '403' in str(e))\n";
+    let proxy = format!("http://{}", stub.addr());
+    let out = Command::new("python3")
+        .args(["-c", probe])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .env("HTTPS_PROXY", &proxy)
+        .env("HTTP_PROXY", &proxy)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("reached"), "{text}");
+    assert_eq!(text.matches("refused").count(), 2, "{text}");
+    let report = stub.finish().unwrap();
+    assert_eq!(report.outcome.malformed, 0, "{:?}", report.outcome);
+    let seen: Vec<(&str, &str)> = report
+        .requests
+        .iter()
+        .map(|r| (r.api.as_deref().unwrap_or(""), r.path.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [("connect", "example.com:443"), ("proxy", "example.com:80")],
+        "{text}"
+    );
+}
+
+/// What `Debug` shows of a recorded request: the endpoint by name or its
+/// target by length, never the target itself (L-12).
+#[test]
+fn a_record_s_debug_shows_no_target() {
+    let stub = start();
+    let got = send(stub.addr(), &post("/MARK-P/x?MARK-Q", &key(&stub), b"{}")).unwrap();
+    assert_eq!(got.status, 404);
+    let report = stub.finish().unwrap();
+    let shown = format!("{:?}", report.requests);
+    assert!(!shown.contains("MARK"), "{shown}");
+    assert!(shown.contains("<16 bytes>"), "{shown}");
+}
+
 fn held_script() -> Vec<u8> {
     json!({"steps": [{"say": "held", "after": "approved"}]})
         .to_string()

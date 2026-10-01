@@ -68,7 +68,10 @@ fn main() -> ExitCode {
         .env("EC_MODEL_TOKEN", model.token())
         .status();
     let report = model.finish();
-    eprintln!("ec-model: endpoints: {}", report.endpoints().join(", "));
+    eprintln!(
+        "ec-model: endpoints: {}",
+        report.model_endpoints().join(", ")
+    );
     eprintln!(
         "ec-model: tunnels refused: {}",
         report.connects().join(", ")

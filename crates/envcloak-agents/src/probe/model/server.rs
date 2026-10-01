@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::http::{self, HttpError, MAX_HEAD};
+use super::http::{self, Form, HttpError, MAX_HEAD};
 use super::script::Script;
 use super::wire::{self, Api, BodyError, Pick};
 use super::{Incomplete, Limits, Outcome, Recorded, Token};
@@ -345,9 +345,10 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         // The head's bytes, credentials included, leave the buffer; what
         // follows is this request's body, then any next request.
         buf.drain(..end);
-        if head.method == "CONNECT" {
+        if head.form != Form::Origin {
             // A host reaching for anywhere else through the proxy the
-            // harness names: refused, and recorded by its target.
+            // harness names, by a tunnel or a forwarded request: refused,
+            // and recorded by the `host:port` it names.
             let mut state = lock(&shared.state);
             state.outcome.connect += 1;
             let Some(seq) = reserve(&mut state, &shared.limits, &head, 0) else {
@@ -356,7 +357,14 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
                 return;
             };
             let mut rec = Recorded::without_body(seq, shared.started.elapsed(), &head, 403);
-            rec.api = Some("connect".to_owned());
+            rec.api = Some(
+                if head.form == Form::Tunnel {
+                    "connect"
+                } else {
+                    "proxy"
+                }
+                .to_owned(),
+            );
             state.requests.push(rec);
             drop(state);
             let sent = respond_keep(
