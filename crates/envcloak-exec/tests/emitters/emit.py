@@ -8,8 +8,10 @@ split at every byte boundary with an idle flush between the pieces. Then
 comes the tail: `eof` ends the output, `malformed` writes bytes that are not
 UTF-8 first, and `sigterm` writes the first half of a value and waits for
 the signal that ends it. So that it never outlives its test, that wait also
-ends when the file `--stop` names appears, or after `--deadline` seconds,
-and says which in the file `--ended` names (`stopped` or `deadline`).
+ends when the file `--stop` names appears, when the directory that file
+would be in is gone (the test's home, removed as the test ended), or after
+`--deadline` seconds, and says which in the file `--ended` names
+(`stopped`, `gone` or `deadline`), unless that file's directory is gone too.
 
 Serializers: Python's `json.dumps` (ASCII and UTF-8), `quote` and
 `quote_plus` (upper and lower hex), form encoding, standard and URL-safe
@@ -103,6 +105,15 @@ def emit(fd, payloads, pause):
         os.write(fd, b"\n")
 
 
+def record(path, how):
+    """Appends `how` to the record at `path`, if its directory is there."""
+    try:
+        with open(path, "a") as f:
+            f.write(how + "\n")
+    except OSError:
+        pass
+
+
 def main():
     args = sys.argv[1:]
     opts = {"--pause-ms": "2", "--tail": "eof"}
@@ -160,15 +171,15 @@ def main():
     elif tail == "sigterm":
         os.write(1, b"H:" + first[: len(first) // 2])
         os.write(2, b"READY\n")
+        stop = opts["--stop"]
+        life = os.path.dirname(stop)
         end = time.monotonic() + float(opts["--deadline"])
-        while not os.path.exists(opts["--stop"]):
+        while os.path.isdir(life) and not os.path.exists(stop):
             if time.monotonic() > end:
-                with open(opts["--ended"], "a") as f:
-                    f.write("deadline\n")
+                record(opts["--ended"], "deadline")
                 sys.exit(124)
             time.sleep(0.05)
-        with open(opts["--ended"], "a") as f:
-            f.write("stopped\n")
+        record(opts["--ended"], "stopped" if os.path.exists(stop) else "gone")
         sys.exit(0)
     os.write(2, b"DONE\n")
 
