@@ -48,6 +48,11 @@ pub struct Step {
     /// The arguments of [`Step::tool`], a JSON object.
     #[serde(default)]
     pub input: Option<Value>,
+    /// A barrier: the reply to this step is held until the run is told
+    /// `release <name>` (see [`super::Handle::release`]), so a test can act
+    /// between two turns (a person approving a request) without timing.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 impl fmt::Debug for Script {
@@ -69,6 +74,7 @@ impl fmt::Debug for Step {
         f.debug_struct("Step")
             .field("kind", &kind)
             .field("says", &self.say.is_some())
+            .field("after", &self.after)
             .finish()
     }
 }
@@ -88,6 +94,8 @@ pub enum ScriptError {
     /// A named tool's input that is not a JSON object, or input without a
     /// named tool.
     Input,
+    /// A barrier name that is not 1 to 64 letters, digits, `-` or `_`.
+    Barrier,
 }
 
 impl fmt::Display for ScriptError {
@@ -98,6 +106,7 @@ impl fmt::Display for ScriptError {
             ScriptError::Steps => "the script needs 1 to 256 steps",
             ScriptError::Step => "a step needs text or one call, and at most one call",
             ScriptError::Input => "a tool's input must be a JSON object, and only a tool has one",
+            ScriptError::Barrier => "a barrier is named with 1 to 64 letters, digits, - or _",
         })
     }
 }
@@ -124,6 +133,9 @@ impl Script {
                 (Some(_), Some(Value::Object(_))) | (Some(_), None) | (None, None) => {}
                 _ => return Err(ScriptError::Input),
             }
+            if step.after.as_deref().is_some_and(|b| !barrier_name(b)) {
+                return Err(ScriptError::Barrier);
+            }
         }
         Ok(script)
     }
@@ -132,6 +144,15 @@ impl Script {
     pub fn step(&self, calls: usize) -> Option<&Step> {
         self.steps.get(calls)
     }
+}
+
+/// Whether `name` can name a barrier: 1 to 64 ASCII letters, digits, `-`
+/// or `_`.
+pub fn barrier_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 impl Step {
@@ -173,6 +194,14 @@ mod tests {
             (br#"{"steps":[{"say":"a","input":{}}]}"#, ScriptError::Input),
             (br#"{"steps":[{"say":"a","extra":1}]}"#, ScriptError::Shape),
             (br#"{"steps":[{"say":"a"}],"more":1}"#, ScriptError::Shape),
+            (
+                br#"{"steps":[{"say":"a","after":"no space"}]}"#,
+                ScriptError::Barrier,
+            ),
+            (
+                br#"{"steps":[{"say":"a","after":""}]}"#,
+                ScriptError::Barrier,
+            ),
             (b"\xff", ScriptError::Shape),
         ];
         for (input, want) in refused {

@@ -126,6 +126,21 @@ impl ModelStub {
         serde_json::from_slice(&line).map_err(|_| invalid("an unreadable report"))
     }
 
+    /// Releases the barrier `name` (see [`super::Step::after`]).
+    ///
+    /// # Errors
+    /// When the name is not a barrier's, or the program has gone.
+    pub fn release(&mut self, name: &str) -> io::Result<()> {
+        if !super::script::barrier_name(name) {
+            return Err(invalid("not a barrier name"));
+        }
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(invalid("the run has ended"));
+        };
+        stdin.write_all(format!("release {name}\n").as_bytes())?;
+        stdin.flush()
+    }
+
     /// Ends the run and returns its last report.
     ///
     /// # Errors

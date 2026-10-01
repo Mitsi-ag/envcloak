@@ -119,9 +119,13 @@ fn turn(step: &Step, api: Api, tools: &[&str]) -> Result<Turn, Pick> {
                 "Bash".to_owned(),
                 json!({"command": cmd, "description": "scripted step"}),
             ),
-            Api::Responses if tools.contains(&"exec_command") => {
-                ("exec_command".to_owned(), json!({"cmd": cmd}))
-            }
+            // Codex returns what a command printed so far after
+            // `yield_time_ms` (10 s by default, 30 s at most) and expects the
+            // model to poll; the longest wait keeps a scripted command whole.
+            Api::Responses if tools.contains(&"exec_command") => (
+                "exec_command".to_owned(),
+                json!({"cmd": cmd, "yield_time_ms": 30000}),
+            ),
             Api::Responses if tools.contains(&"shell") => {
                 ("shell".to_owned(), json!({"command": ["bash", "-lc", cmd]}))
             }

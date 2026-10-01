@@ -425,3 +425,82 @@ fn a_bad_script_or_argument_is_refused_without_echo() {
         assert!(!err.contains("MARK"), "{err}");
     }
 }
+
+#[test]
+fn a_proxy_tunnel_request_is_refused_and_recorded_by_its_target() {
+    let stub = start();
+    let got = send(
+        stub.addr(),
+        b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(got.status, 403);
+    let report = stub.finish().unwrap();
+    assert_eq!(report.outcome.connect, 1);
+    assert!(report.outcome.clean());
+    let r = &report.requests[0];
+    assert_eq!(
+        (r.method.as_str(), r.path.as_str()),
+        ("CONNECT", "api.example.com:443")
+    );
+    assert_eq!(r.api.as_deref(), Some("connect"));
+}
+
+fn held_script() -> Vec<u8> {
+    json!({"steps": [{"say": "held", "after": "approved"}]})
+        .to_string()
+        .into_bytes()
+}
+
+/// Sends a Messages request from another thread; its response, if any.
+fn send_in_thread(stub: &ModelStub) -> std::thread::JoinHandle<Option<Got>> {
+    let (addr, req) = (
+        stub.addr(),
+        post("/v1/messages", &key(stub), &messages_body("x")),
+    );
+    std::thread::spawn(move || send(addr, &req))
+}
+
+/// Waits until the run has recorded `n` requests (each poll a round trip
+/// to the program, so no timing is assumed).
+fn wait_recorded(stub: &mut ModelStub, n: usize) {
+    for _ in 0..10_000 {
+        if stub.requests().unwrap().requests.len() >= n {
+            return;
+        }
+    }
+    panic!("the request was never recorded");
+}
+
+#[test]
+fn a_held_step_is_answered_only_once_released() {
+    let mut stub =
+        ModelStub::start(Path::new(EXE), &held_script(), Duration::from_secs(120)).unwrap();
+    let pending = send_in_thread(&stub);
+    wait_recorded(&mut stub, 1);
+    stub.release("approved").unwrap();
+    let got = pending.join().unwrap().unwrap();
+    assert_eq!(got.status, 200);
+    assert!(String::from_utf8(got.body).unwrap().contains("held"));
+    // Released stays released.
+    let again = send(
+        stub.addr(),
+        &post("/v1/messages", &key(&stub), &messages_body("y")),
+    )
+    .unwrap();
+    assert_eq!(again.status, 200);
+    assert!(stub.finish().unwrap().outcome.clean());
+}
+
+#[test]
+fn a_held_step_never_released_is_never_answered() {
+    let mut stub =
+        ModelStub::start(Path::new(EXE), &held_script(), Duration::from_secs(120)).unwrap();
+    let pending = send_in_thread(&stub);
+    wait_recorded(&mut stub, 1);
+    // The run ends with the reply still held: the connection closes
+    // unanswered.
+    let report = stub.finish().unwrap();
+    assert_eq!(report.requests.len(), 1);
+    assert!(pending.join().unwrap().is_none(), "a held reply was sent");
+}

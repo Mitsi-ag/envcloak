@@ -169,6 +169,19 @@ fn request_line_parts(line: &[u8]) -> Result<(String, String, Option<String>), H
     if version != b"HTTP/1.1" {
         return Err(HttpError::Malformed("version"));
     }
+    if method == b"CONNECT" {
+        // A proxy tunnel request (the harness points HTTPS_PROXY here, so
+        // a host's traffic to anywhere else is seen and refused): the
+        // authority-form target `host:port`, kept as the path.
+        return match authority(target) {
+            true => Ok((
+                "CONNECT".to_owned(),
+                String::from_utf8_lossy(target).into_owned(),
+                None,
+            )),
+            false => Err(HttpError::Malformed("target")),
+        };
+    }
     if target.first() != Some(&b'/')
         || target.len() > MAX_TARGET
         || !target.iter().all(|&b| (0x21..=0x7e).contains(&b))
@@ -184,6 +197,22 @@ fn request_line_parts(line: &[u8]) -> Result<(String, String, Option<String>), H
         return Err(HttpError::Malformed("target"));
     }
     Ok((text(method), path, query))
+}
+
+/// RFC 9112 authority-form as a host sends it to a proxy: a DNS name or
+/// IPv4 address of letters, digits, `-` and `.`, a colon and a port.
+fn authority(target: &[u8]) -> bool {
+    let Some(colon) = target.iter().rposition(|&b| b == b':') else {
+        return false;
+    };
+    let (host, port) = (&target[..colon], &target[colon + 1..]);
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        && (1..=5).contains(&port.len())
+        && port.iter().all(u8::is_ascii_digit)
 }
 
 fn header(
@@ -328,7 +357,15 @@ mod tests {
                 HttpError::Malformed("target"),
             ),
             (
-                "CONNECT x:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                "CONNECT /x HTTP/1.1\r\nHost: x\r\n\r\n",
+                HttpError::Malformed("target"),
+            ),
+            (
+                "CONNECT a/b:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                HttpError::Malformed("target"),
+            ),
+            (
+                "CONNECT x HTTP/1.1\r\nHost: x\r\n\r\n",
                 HttpError::Malformed("target"),
             ),
             (
@@ -402,6 +439,16 @@ mod tests {
                 Err(e) => assert_eq!(e, *want, "{input:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_proxy_tunnel_request_keeps_its_authority() {
+        let h = parse("CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (h.method.as_str(), h.path.as_str()),
+            ("CONNECT", "api.example.com:443")
+        );
     }
 
     #[test]
