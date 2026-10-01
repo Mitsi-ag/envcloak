@@ -535,16 +535,42 @@ fn a_run_answer_carries_values_only_when_covered_and_well_formed() {
     }
 }
 
+/// The tokens in the first column of docs/IPC.md's "Reasons" table, in
+/// order, each as often as it is listed there.
+fn documented_reasons(ipc: &str) -> Vec<&str> {
+    let section = ipc
+        .split("\n## ")
+        .find(|s| s.starts_with("Reasons\n"))
+        .expect("IPC.md has a Reasons section");
+    let mut out = Vec::new();
+    for row in section.lines().filter(|l| l.starts_with("| `")) {
+        let cell = row.split('|').nth(1).unwrap();
+        out.extend(cell.split('`').skip(1).step_by(2));
+    }
+    out
+}
+
 /// Review R-7: a reason token added by one lane and another by a second
 /// could collide or go undocumented at merge. Each token of `REASONS` is
 /// a lowercase word of letters, digits and `_`, is there once, and is
 /// documented in docs/IPC.md; `RpcError::with_reason` keeps each one and
-/// drops any other.
+/// drops any other. Review R-21: documented means listed in the first
+/// column of IPC.md's "Reasons" table, not in backticks anywhere in the
+/// file (where every error token is too), and the table lists each
+/// token once and nothing that is not one.
 #[test]
 fn reason_tokens_are_unique_and_documented() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/IPC.md");
     let ipc = std::fs::read_to_string(path).unwrap();
+    let documented = documented_reasons(&ipc);
     let reasons = envcloak_ipc::proto::REASONS;
+    for (i, token) in documented.iter().enumerate() {
+        assert!(!documented[..i].contains(token), "{token} listed twice");
+        assert!(
+            reasons.contains(token),
+            "{token} is listed but not a reason"
+        );
+    }
     for (i, token) in reasons.iter().enumerate() {
         assert!(
             !token.is_empty()
@@ -554,7 +580,10 @@ fn reason_tokens_are_unique_and_documented() {
             "{token}"
         );
         assert!(!reasons[..i].contains(token), "{token} twice");
-        assert!(ipc.contains(&format!("`{token}`")), "{token} not in IPC.md");
+        assert!(
+            documented.contains(token),
+            "{token} not in IPC.md's Reasons table"
+        );
         assert_eq!(
             RpcError::with_reason(ErrorKind::ManifestInvalid, token).reason,
             Some(*token)
