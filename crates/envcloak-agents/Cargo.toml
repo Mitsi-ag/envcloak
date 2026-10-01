@@ -11,6 +11,12 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test hooks of the scripted model (`probe::model::admit_as`, `serve_bytes`):
+# only this crate's own tests enable it, as a dev-dependency, so no build of
+# `envcloak-probe-model` has them (tests/release_features.rs).
+testing = []
+
 [dependencies]
 base64.workspace = true
 envcloak-sys.workspace = true
@@ -28,4 +34,6 @@ name = "envcloak-probe-model"
 path = "src/bin/envcloak-probe-model.rs"
 
 [dev-dependencies]
+# Enables the `testing` feature for this crate's own tests.
+envcloak-agents = { path = ".", features = ["testing"] }
 proptest.workspace = true

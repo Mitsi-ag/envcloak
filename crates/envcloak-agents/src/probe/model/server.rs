@@ -263,7 +263,8 @@ fn linger(stream: &mut TcpStream) {
 
 /// Feeds one connection's bytes to the server and returns what it wrote
 /// back: the request handling of a real connection, over memory. For the
-/// fuzz target and the hostile-input tests.
+/// hostile-input tests (and M2-25's fuzz target); `testing` only.
+#[cfg(feature = "testing")]
 pub fn serve_bytes(handle: &Handle, input: &[u8]) -> Vec<u8> {
     struct Mem<'a> {
         input: &'a [u8],
@@ -349,7 +350,11 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
             // harness names: refused, and recorded by its target.
             let mut state = lock(&shared.state);
             state.outcome.connect += 1;
-            let seq = next_seq(&mut state);
+            let Some(seq) = reserve(&mut state, &shared.limits, &head, 0) else {
+                drop(state);
+                respond(stream, &full());
+                return;
+            };
             let mut rec = Recorded::without_body(seq, shared.started.elapsed(), &head, 403);
             rec.api = Some("connect".to_owned());
             state.requests.push(rec);
@@ -362,7 +367,11 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         }
         if is_hello(&head) {
             let mut state = lock(&shared.state);
-            let seq = next_seq(&mut state);
+            let Some(seq) = reserve(&mut state, &shared.limits, &head, 0) else {
+                drop(state);
+                respond(stream, &full());
+                return;
+            };
             let mut rec = Recorded::without_body(seq, shared.started.elapsed(), &head, 200);
             rec.api = Some("hello".to_owned());
             state.requests.push(rec);
@@ -380,7 +389,11 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         if !shared.token.admits(&head) {
             let mut state = lock(&shared.state);
             state.outcome.bad_token += 1;
-            let seq = next_seq(&mut state);
+            let Some(seq) = reserve(&mut state, &shared.limits, &head, 0) else {
+                drop(state);
+                respond(stream, &full());
+                return;
+            };
             state.requests.push(Recorded::without_body(
                 seq,
                 shared.started.elapsed(),
@@ -401,18 +414,12 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         };
         let seq = {
             let mut state = lock(&shared.state);
-            let len = head.content_length as u64;
-            if state.outcome.recorded_bytes + len > shared.limits.total as u64 {
-                state.outcome.mark(Incomplete::TotalCap);
+            let Some(seq) = reserve(&mut state, &shared.limits, &head, head.content_length) else {
                 drop(state);
-                respond(
-                    stream,
-                    &Response::error(503, "the run has recorded all it may"),
-                );
+                respond(stream, &full());
                 return;
-            }
-            state.outcome.recorded_bytes += len;
-            next_seq(&mut state)
+            };
+            seq
         };
         let Some(body) = read_body(stream, &mut buf, head.content_length) else {
             lock(&shared.state).outcome.malformed += 1;
@@ -501,9 +508,38 @@ fn is_hello(head: &http::Head) -> bool {
     head.method == "HEAD" && head.path == "/api/hello" && head.content_length == 0
 }
 
-fn next_seq(state: &mut State) -> u64 {
+/// Room in the run for one more record of `head` with a body of `body`
+/// bytes: the next sequence number, with the record, its metadata and its
+/// body counted; or `None`, with the run marked incomplete, when any of
+/// the three caps would be passed. Every path that records a request
+/// comes through here first, so nothing a request sends grows the run
+/// past its caps.
+fn reserve(state: &mut State, limits: &Limits, head: &http::Head, body: usize) -> Option<u64> {
+    let meta = super::meta_len(
+        &head.method,
+        &head.path,
+        head.query.as_deref(),
+        &head.header_names,
+    ) as u64;
+    if state.requests.len() >= limits.records
+        || state.outcome.recorded_meta + meta > limits.meta as u64
+    {
+        state.outcome.mark(Incomplete::RecordCap);
+        return None;
+    }
+    if state.outcome.recorded_bytes + body as u64 > limits.total as u64 {
+        state.outcome.mark(Incomplete::TotalCap);
+        return None;
+    }
+    state.outcome.recorded_meta += meta;
+    state.outcome.recorded_bytes += body as u64;
     state.seq += 1;
-    state.seq
+    Some(state.seq)
+}
+
+/// The refusal once the run has recorded all it may.
+fn full() -> Response {
+    Response::error(503, "the run has recorded all it may")
 }
 
 fn millis(d: Duration) -> u64 {
@@ -713,7 +749,8 @@ impl Handle {
 }
 
 /// Lets a test hand the server a connection as if it came from `peer`:
-/// the accept path's peer check, over a real socket.
+/// the accept path's peer check, over a real socket. `testing` only.
+#[cfg(feature = "testing")]
 pub fn admit_as(handle: &Handle, stream: TcpStream, peer: SocketAddr) {
     admit(&handle.shared, stream, peer);
 }

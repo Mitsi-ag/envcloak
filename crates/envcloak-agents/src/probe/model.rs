@@ -14,6 +14,10 @@
 //! - reads requests with a hand-written HTTP/1.1 parser ([`http`]):
 //!   `Content-Length` bodies only, at most 4 MiB a body and 16 MiB recorded
 //!   in all, after which the run is *incomplete* and says why ([`Outcome`]);
+//! - records at most 1,024 requests and 1 MiB of what describes them
+//!   (method, target, header names), whatever path a request takes (a
+//!   refused token, a tunnel, Claude Code's connectivity check), then
+//!   refuses the rest and is incomplete;
 //! - answers `POST /v1/messages` (Anthropic Messages) and `POST
 //!   /v1/responses` (OpenAI Responses) from a [`Script`] ([`wire`]), and any
 //!   other path `404`, recording it, so a host that calls something new
@@ -54,11 +58,16 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub use script::{Script, ScriptError, Step};
-pub use server::{Handle, SERVER, Server, serve_bytes};
+pub use server::{Handle, SERVER, Server};
 pub use stub::ModelStub;
 
-#[doc(hidden)]
-pub use server::admit_as;
+/// Test hooks, with the `testing` feature only: a connection handed to the
+/// server as if from any peer ([`admit_as`]), and one connection's bytes
+/// served from memory ([`serve_bytes`], the hostile-input tests). No build
+/// of `envcloak-probe-model` has them
+/// (crates/envcloak-agents/tests/release_features.rs).
+#[cfg(feature = "testing")]
+pub use server::{admit_as, serve_bytes};
 
 /// A host version the scripted model was qualified against: its requests
 /// were recorded and served end to end in CI (M2-04).
@@ -107,7 +116,17 @@ pub struct Limits {
     pub idle: Duration,
     /// The most connections open at once.
     pub connections: usize,
+    /// The most requests the run records, whatever their path (1,024).
+    pub records: usize,
+    /// The most bytes of request metadata the run records in all (1 MiB):
+    /// each record's method, path, query and header names, and
+    /// [`RECORD_OVERHEAD`] for the record itself.
+    pub meta: usize,
 }
+
+/// What each recorded request counts against [`Limits::meta`] besides its
+/// own text, so that requests with nothing in them are bounded too.
+pub const RECORD_OVERHEAD: usize = 64;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -117,6 +136,8 @@ impl Default for Limits {
             time: Duration::from_secs(600),
             idle: Duration::from_secs(30),
             connections: 32,
+            records: 1024,
+            meta: 1024 * 1024,
         }
     }
 }
@@ -189,6 +210,8 @@ pub enum Incomplete {
     TotalCap,
     /// The run reached its time limit.
     TimeLimit,
+    /// The run reached the cap on recorded requests or on their metadata.
+    RecordCap,
 }
 
 impl Incomplete {
@@ -198,6 +221,7 @@ impl Incomplete {
             Incomplete::BodyCap => "body_cap",
             Incomplete::TotalCap => "total_cap",
             Incomplete::TimeLimit => "time_limit",
+            Incomplete::RecordCap => "record_cap",
         }
     }
 }
@@ -228,6 +252,8 @@ pub struct Outcome {
     pub connect: u64,
     /// Body bytes recorded.
     pub recorded_bytes: u64,
+    /// Metadata bytes recorded ([`Limits::meta`]).
+    pub recorded_meta: u64,
 }
 
 impl Outcome {
@@ -318,10 +344,30 @@ impl Recorded {
         }
     }
 
+    /// What this record counts against [`Limits::meta`].
+    pub fn meta_len(&self) -> usize {
+        meta_len(
+            &self.method,
+            &self.path,
+            self.query.as_deref(),
+            &self.headers,
+        )
+    }
+
     /// The body parsed as JSON, when it is JSON.
     pub fn json(&self) -> Option<serde_json::Value> {
         serde_json::from_slice(&self.body).ok()
     }
+}
+
+/// What a request with this method, path, query and header names counts
+/// against [`Limits::meta`].
+fn meta_len(method: &str, path: &str, query: Option<&str>, headers: &[String]) -> usize {
+    RECORD_OVERHEAD
+        + method.len()
+        + path.len()
+        + query.map_or(0, str::len)
+        + headers.iter().map(String::len).sum::<usize>()
 }
 
 /// A run's report, as the program writes it.
