@@ -148,3 +148,48 @@ fn a_stall_inside_a_frame_is_a_truncation() {
         FrameError::Io(io::ErrorKind::WouldBlock)
     );
 }
+
+/// A connection that fails inside a frame (reset, aborted, a broken pipe)
+/// is a truncated frame, as one that ends there is: a caller must never
+/// take an answer cut short by a reset for a call the daemon did not take
+/// (`envcloak_ipc::wait` asks such a call again). One that fails before a
+/// header starts is that I/O error.
+///
+/// Mutation: report a failure inside a frame as its I/O error (as before
+/// for anything but a timeout): the reset after part of the header and
+/// after part of the body come back as `Io(ConnectionReset)` and this
+/// fails.
+#[test]
+fn a_reset_inside_a_frame_is_a_truncation() {
+    struct Reset<'a>(&'a [u8], io::ErrorKind);
+    impl Read for Reset<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(self.1.into());
+            }
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+    let wire = framed(b"{\"partial\":true}");
+    for kind in [
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::BrokenPipe,
+        io::ErrorKind::Other,
+    ] {
+        for cut in [1, 2, 4, 5, 10, wire.len() - 1] {
+            assert_eq!(
+                Frame::read_from(&mut Reset(&wire[..cut], kind)).unwrap_err(),
+                FrameError::Truncated,
+                "{kind:?} after {cut} bytes"
+            );
+        }
+        assert_eq!(
+            Frame::read_from(&mut Reset(&[], kind)).unwrap_err(),
+            FrameError::Io(kind)
+        );
+    }
+}

@@ -735,9 +735,11 @@ fn a_silent_daemon_holds_a_wait_no_longer_than_its_limit() {
 }
 
 /// A call the daemon did not take is asked again after the busy pause,
-/// until the deadline: a connection closed before any answer (as the
-/// daemon closes one at its connection limit), at once or on the request,
-/// and, once the daemon has answered this wait, nothing listening there.
+/// until the deadline: a connection closed, reset or no longer connected
+/// before any answer (as the daemon closes one at its connection limit;
+/// macOS sometimes reports that close, racing the request, as not
+/// connected), at once or on the request, and, once the daemon has
+/// answered this wait, nothing listening there.
 /// Before any answer, nothing listening is the failure at once, as it is
 /// without waiting; a socket or daemon that fails a check, and an answer
 /// cut short, are never asked again; and a call not taken at the deadline
@@ -745,22 +747,27 @@ fn a_silent_daemon_holds_a_wait_no_longer_than_its_limit() {
 ///
 /// Mutation: end the wait on a connection closed before any answer
 /// (`not_taken` always false): the first call ends it and this fails.
+/// Mutation: leave `NotConnected` out of `not_taken`: the third request
+/// ends the wait and this fails.
 #[test]
 fn a_call_the_daemon_did_not_take_is_asked_again_until_the_deadline() {
     use std::io::ErrorKind as Io;
     let closed = ClientError::Frame(FrameError::Closed);
     let pipe = ClientError::Frame(FrameError::Io(Io::BrokenPipe));
     let reset = ClientError::Frame(FrameError::Io(Io::ConnectionReset));
+    let gone = ClientError::Frame(FrameError::Io(Io::NotConnected));
     let mut t = Scripted::new(
         [
             Err(closed),
             Err(pipe),
+            Err(gone),
             Ok(RunAnswer::decided(pending("ABCDEFGH"))),
             Ok(covered_with_a_value()),
         ],
         [
             Err(ClientError::Unavailable),
             Err(reset),
+            Err(gone),
             Ok(PendingState::Approved),
         ],
     );
@@ -770,12 +777,12 @@ fn a_call_the_daemon_did_not_take_is_asked_again_until_the_deadline() {
     assert_eq!(
         calls(&t),
         [
-            "request", "request", "request", "poll", "poll", "poll", "request"
+            "request", "request", "request", "request", "poll", "poll", "poll", "poll", "request"
         ]
     );
     // The busy pause: doubled each time, and never shorter after.
     let paused: Vec<u128> = c.pauses.iter().map(Duration::as_millis).collect();
-    assert_eq!(paused, [500, 1000, 1000, 2000, 2000]);
+    assert_eq!(paused, [500, 1000, 2000, 2000, 2000, 2000, 2000]);
 
     // Before any answer, nothing listening is the failure, at once.
     let mut t = Scripted::new([Err(ClientError::Unavailable)], []);
@@ -1054,6 +1061,54 @@ fn connections_closed_unanswered_are_asked_again() {
         took >= ms(1400) && took < Duration::from_secs(10),
         "{took:?}"
     );
+}
+
+/// Over a real connection, a daemon that resets the connection part way
+/// through its answer ends the wait with that answer cut short, never
+/// asked again: the daemon sees one connection. It reads the request but
+/// its last byte and closes after half its answer, a close with a byte
+/// unread, which Linux reports to the reader as a reset once the bytes
+/// sent are read; macOS reports it as the end of the stream, cut short
+/// alike.
+///
+/// Mutation: report a failure inside a frame as its I/O error
+/// (`Frame::read_from` as before, for anything but a timeout): on Linux
+/// the wait takes the reset for a call the daemon did not take, connects
+/// again until its deadline and ends with the closed connection, and this
+/// fails.
+#[test]
+fn an_answer_cut_short_by_a_reset_is_never_asked_again() {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&seen);
+    let answer = answer_bytes(&RunAnswer::decided(pending("ABCDEFGH")));
+    let (got, took) = wait_on_peer(
+        Duration::from_secs(3),
+        run_params(vec!["./emit".to_owned()]),
+        move |l| {
+            let (mut s, _) = l.accept().unwrap();
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut header = [0u8; 4];
+            s.read_exact(&mut header).unwrap();
+            let len = usize::try_from(u32::from_be_bytes(header)).unwrap();
+            // All of the body but its last byte: the client has written
+            // the whole request, and one byte of it stays unread.
+            let mut body = vec![0u8; len - 1];
+            s.read_exact(&mut body).unwrap();
+            s.write_all(&answer[..answer.len() / 2]).unwrap();
+            drop(s);
+            // Any connection after it is counted and closed unanswered.
+            for c in l.incoming() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(c);
+            }
+        },
+    );
+    assert_eq!(got, "Err(Frame(Truncated))");
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert!(took < Duration::from_secs(3), "{took:?}");
 }
 
 // ---------------------------------------------- five waiters, one root
