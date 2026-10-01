@@ -308,18 +308,18 @@ fn an_unknown_task_or_status_fails() {
     edit(
         &t,
         IPC,
-        "| `pending.state` | M2-03 |",
-        "| `pending.state` | M2-29 |",
+        "| `signin.status` | M2b-05 |",
+        "| `signin.status` | M2-29 |",
     );
     assert_fails(&t, "names 'M2-29', which is not an M2 or M2b task");
     let t = fixture();
     edit(
         &t,
         IPC,
-        "| `pending.state` | M2-03 | reserved |",
-        "| `pending.state` | M2-03 | taken |",
+        "| `signin.status` | M2b-05 | reserved |",
+        "| `signin.status` | M2b-05 | taken |",
     );
-    assert_fails(&t, "`pending.state` has status 'taken'");
+    assert_fails(&t, "`signin.status` has status 'taken'");
 }
 
 #[test]
@@ -705,12 +705,12 @@ fn an_unreserved_method_in_the_code_fails() {
 #[test]
 fn a_method_landed_as_reserved_passes() {
     let t = fixture();
-    add_method(&t, "pending.state");
+    add_method(&t, "signin.status");
     edit(
         &t,
         IPC,
-        "| `pending.state` | M2-03 | reserved |",
-        "| `pending.state` | M2-03 | landed |",
+        "| `signin.status` | M2b-05 | reserved |",
+        "| `signin.status` | M2b-05 | landed |",
     );
     assert_passes(&t.home());
 }
@@ -1048,12 +1048,12 @@ fn a_method_named_by_a_raw_string_counts() {
         );
     }
     let t = fixture();
-    add_method_decl(&t, "const NAME: &'static str = r\"pending.state\";");
+    add_method_decl(&t, "const NAME: &'static str = r\"signin.status\";");
     edit(
         &t,
         IPC,
-        "| `pending.state` | M2-03 | reserved |",
-        "| `pending.state` | M2-03 | landed |",
+        "| `signin.status` | M2b-05 | reserved |",
+        "| `signin.status` | M2b-05 | landed |",
     );
     assert_passes(&t.home());
 }

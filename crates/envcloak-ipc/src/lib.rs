@@ -13,6 +13,8 @@
 //! - [`client`]: a connection that verifies the daemon before it sends
 //!   anything, and never starts one.
 //! - [`view`]: what the daemon tells a client. Metadata only.
+//! - [`wait`]: waiting for a person's approval on fresh connections, never
+//!   on one held open (`envcloak run --wait`).
 //!
 //! The `testing` feature adds [`Client::connect_expecting_uid`], for tests
 //! that present a same-uid server as a foreign one. Release binaries never
@@ -23,6 +25,7 @@ pub mod frame;
 pub mod paths;
 pub mod proto;
 pub mod view;
+pub mod wait;
 mod wire_secret;
 
 pub use client::{Client, ClientError, DaemonIdentity, Unverified};
