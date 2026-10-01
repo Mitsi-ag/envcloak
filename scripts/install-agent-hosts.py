@@ -50,7 +50,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -264,6 +263,8 @@ def main(argv):
     if plat not in ("darwin-arm64", "linux-x64"):
         print("install-agent-hosts: platform %r is not pinned" % plat, file=sys.stderr)
         return 1
+    import tomllib  # Python 3.11; --print-cache-dir needs nothing from it
+
     with open(VERSIONS, "rb") as f:
         doc = tomllib.load(f)
     cache = cache_dir()
