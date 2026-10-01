@@ -314,6 +314,66 @@ fn codex_keeps_what_a_scripted_turn_prints() {
     positive_control(Host::Codex);
 }
 
+/// Claude Code 2.1.280 writes what a Bash command prints, while it runs,
+/// to `claude-<uid>/<project>/<session>/tasks/<id>.output` in its per-user
+/// temporary directory, outside `HOME`, and deletes the file when the
+/// command ends (verifier, medium: in no store list, so the sweep never
+/// looked there; a host killed mid-command leaves it). A control the
+/// command prints is found there while the command waits on a barrier
+/// file, and the directory is the one `CLAUDE_CODE_TMPDIR` names in the
+/// home: nothing is kept in `/tmp/claude-<uid>/` (checked after the run).
+#[test]
+fn claude_code_keeps_a_running_command_s_output_in_its_temporary_store() {
+    let Some(a) = host(Host::ClaudeCode, "native", "claude_code_temporary_store") else {
+        return;
+    };
+    let control = Canary::new(
+        "POSITIVE_CONTROL",
+        format!("ecrun-{:016x}{:016x}", fresh_seed(), fresh_seed()),
+    );
+    let release = a.root().join("release");
+    let shell = format!(
+        "{}; while [ ! -e {} ]; do sleep 0.1; done; echo released",
+        print_split(&[control.as_str()]),
+        envcloak_e2e::quoted(release.to_str().unwrap())
+    );
+    let script = json!({"steps": [{"shell": shell}, {"say": "done"}]});
+    let running = a.spawn(
+        &script,
+        "Run the step.",
+        &flags(Host::ClaudeCode),
+        &a.home_dir(),
+    );
+    let cs = [control.clone()];
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let while_running = loop {
+        let hits = Sweep::host_stores(&a, &cs, &[]);
+        if hits.in_store("claude/tmp", &control.label) > 0 {
+            break hits;
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "the running command's output never reached claude/tmp:\n{hits}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    std::fs::write(&release, b"").unwrap();
+    let run = running.wait();
+    a.check_pinned();
+    a.check_isolated();
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
+    let after = Sweep::host_stores(&a, &cs, &[&run.model]);
+    measure(
+        &a,
+        "a running Bash command's printed output in claude/tmp",
+        format!(
+            "while it runs: {} hit(s); after it ended: {}",
+            while_running.in_store("claude/tmp", &control.label),
+            after.in_store("claude/tmp", &control.label)
+        ),
+    );
+}
+
 /// A run that never sees a canary leaves none anywhere: not in the host's
 /// stores, not in the rest of the home, not in what it sent its model.
 fn negative_control(h: Host) {
@@ -1641,7 +1701,7 @@ fn interactive_claude(
     steps: serde_json::Value,
 ) -> String {
     let env: Vec<(String, String)> = a
-        .env_for(model)
+        .env_for(model, cwd)
         .into_iter()
         .map(|(k, v)| {
             (

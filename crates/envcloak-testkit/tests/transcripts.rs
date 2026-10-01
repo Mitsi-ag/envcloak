@@ -27,7 +27,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use envcloak_testkit::agents::{Host, ModelReport, ModelRequest};
 use envcloak_testkit::transcripts::{
-    Hits, OTHER, host_root, sweep_model, sweep_stores, transcript_roots,
+    Hits, HostDirs, OTHER, claude_tmp_dir, host_roots, sweep_model, sweep_stores, transcript_roots,
 };
 use envcloak_testkit::{Canary, Hit, TestHome, by_label, canaries, fresh_seed, labels};
 use zeroize::Zeroizing;
@@ -61,6 +61,17 @@ const CLAUDE: &[(&str, &str)] = &[
     ("claude/debug", ".claude/debug/4f0c.txt"),
     ("claude.json", ".claude.json"),
     ("claude.json backups", ".claude.json.backup.1790853962065"),
+];
+
+/// The same for Claude Code's per-user temporary directory
+/// (`claude-<uid>` in `CLAUDE_CODE_TMPDIR`, or `/tmp`): a running Bash
+/// command's output so far, and an empty task directory.
+const CLAUDE_TMP: &[(&str, &str)] = &[
+    (
+        "claude/tmp",
+        "-private-tmp-acme/4f0c-77/tasks/bul83y2dp.output",
+    ),
+    ("claude/tmp", "-tmp-acme/9a/tasks/b2.output"),
 ];
 
 /// The same for Codex, relative to `$CODEX_HOME` (`~/.codex`).
@@ -361,12 +372,20 @@ fn plant(path: &Path, cases: &[Case]) -> Vec<usize> {
     starts
 }
 
+/// Where the stores are in `home`: as an agent home lays them out, with
+/// Claude Code's temporary directory in the home's `tmp/`.
+fn dirs(home: &TestHome) -> HostDirs {
+    HostDirs {
+        home: home.home(),
+        codex_home: home.home().join(".codex"),
+        claude_tmp: home.root().join("tmp"),
+    }
+}
+
 fn sweep(host: Host, home: &TestHome, cs: &[Canary]) -> Hits {
-    let h = home.home();
-    let codex = h.join(".codex");
-    let (root, files) = host_root(host, &h, &codex);
+    let d = dirs(home);
     Hits {
-        stores: sweep_stores(&root, &files, &transcript_roots(host, &h, &codex), cs),
+        stores: sweep_stores(&host_roots(host, &d), &transcript_roots(host, &d), cs),
         model: Vec::new(),
     }
 }
@@ -438,6 +457,16 @@ fn every_canary_planted_in_every_claude_store_is_found_there_in_every_encoding()
     every_store(Host::ClaudeCode, CLAUDE, TestHome::home);
 }
 
+/// Claude Code 2.1.280 streams a Bash command's output to a file under
+/// its per-user temporary directory while the command runs (verifier,
+/// medium: outside HOME, and in no store list): its control.
+#[test]
+fn every_canary_planted_in_claude_code_s_temporary_store_is_found_there_in_every_encoding() {
+    every_store(Host::ClaudeCode, CLAUDE_TMP, |h| {
+        claude_tmp_dir(&h.root().join("tmp"))
+    });
+}
+
 #[test]
 fn every_canary_planted_in_every_codex_store_is_found_there_in_every_encoding() {
     every_store(Host::Codex, CODEX, |h| h.home().join(".codex"));
@@ -473,6 +502,9 @@ fn the_negative_control_is_clean() {
     }
     for (_, rel) in CODEX {
         plant(&home.home().join(".codex").join(rel), &others);
+    }
+    for (_, rel) in CLAUDE_TMP {
+        plant(&claude_tmp_dir(&home.root().join("tmp")).join(rel), &others);
     }
     for host in [Host::ClaudeCode, Host::Codex] {
         let hits = sweep(host, &home, &cs);

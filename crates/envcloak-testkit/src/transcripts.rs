@@ -49,6 +49,9 @@ pub enum StoreKind {
     Session,
     /// The host's own configuration.
     Config,
+    /// Files the host deletes once it is done with them (what a running
+    /// command printed so far); a host stopped half way leaves them.
+    Transient,
 }
 
 /// How a store's files are recognised under its root.
@@ -92,20 +95,41 @@ impl Store {
     }
 }
 
-/// What a sweep of `host` reads: the directory, and which files under it
-/// are the host's. Claude Code keeps `~/.claude/` and, beside it in
-/// `HOME`, `.claude.json` and its backups; Codex keeps `$CODEX_HOME`.
-/// Anything else in `HOME` (a project, a fixture) is not a host store;
-/// the tests sweep the whole home separately.
-pub fn host_root(host: Host, home: &Path, codex_home: &Path) -> (PathBuf, HostFiles) {
+/// Where a host's stores are in one home: `HOME`, `$CODEX_HOME`, and the
+/// directory Claude Code makes its per-user temporary directory in
+/// (`CLAUDE_CODE_TMPDIR`, `/tmp` when unset).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirs {
+    pub home: PathBuf,
+    pub codex_home: PathBuf,
+    pub claude_tmp: PathBuf,
+}
+
+/// Claude Code's per-user temporary directory under `tmp`:
+/// `claude-<uid>`, which 2.1.280 makes in `CLAUDE_CODE_TMPDIR`, or in
+/// `/tmp` without it (it does not read `TMPDIR` for this).
+pub fn claude_tmp_dir(tmp: &Path) -> PathBuf {
+    tmp.join(format!("claude-{}", envcloak_sys::effective_uid()))
+}
+
+/// What a sweep of `host` reads: each directory, and which files under
+/// it are the host's. Claude Code keeps `~/.claude/` and, beside it in
+/// `HOME`, `.claude.json` and its backups, and its per-user temporary
+/// directory ([`claude_tmp_dir`]); Codex keeps `$CODEX_HOME`. Anything
+/// else in `HOME` (a project, a fixture) is not a host store; the tests
+/// sweep the whole home separately.
+pub fn host_roots(host: Host, dirs: &HostDirs) -> Vec<(PathBuf, HostFiles)> {
     match host {
-        Host::ClaudeCode => (
-            home.to_path_buf(),
-            HostFiles::Claude {
-                home: home.to_path_buf(),
-            },
-        ),
-        Host::Codex => (codex_home.to_path_buf(), HostFiles::All),
+        Host::ClaudeCode => vec![
+            (
+                dirs.home.clone(),
+                HostFiles::Claude {
+                    home: dirs.home.clone(),
+                },
+            ),
+            (claude_tmp_dir(&dirs.claude_tmp), HostFiles::All),
+        ],
+        Host::Codex => vec![(dirs.codex_home.clone(), HostFiles::All)],
     }
 }
 
@@ -133,13 +157,14 @@ impl HostFiles {
     }
 }
 
-/// Every store of `host` in a home whose `HOME` is `home` and Codex home
-/// `codex_home`.
-pub fn transcript_roots(host: Host, home: &Path, codex_home: &Path) -> Vec<Store> {
+/// Every store of `host` in the home `dirs` names.
+pub fn transcript_roots(host: Host, dirs: &HostDirs) -> Vec<Store> {
     use Shape::{Dir, File, Named};
     use StoreKind::{
         Backup, Config, Database, FileHistory, History, Log, PasteCache, Session, Transcript,
+        Transient,
     };
+    let (home, codex_home) = (dirs.home.as_path(), dirs.codex_home.as_path());
     let claude = home.join(".claude");
     let s = |name, path: PathBuf, shape, kind, source| Store {
         host: host.id(),
@@ -238,6 +263,16 @@ pub fn transcript_roots(host: Host, home: &Path, codex_home: &Path) -> Vec<Store
                 home.to_path_buf(),
                 Named(".claude.json.backup"),
                 Backup,
+                "observed",
+            ),
+            // Outside HOME: what a Bash command has printed so far, in
+            // `claude-<uid>/<project>/<session>/tasks/<id>.output`, deleted
+            // when the command ends; the directories stay.
+            s(
+                "claude/tmp",
+                claude_tmp_dir(&dirs.claude_tmp),
+                Dir,
+                Transient,
                 "observed",
             ),
         ],
@@ -413,11 +448,11 @@ impl fmt::Display for Hits {
     }
 }
 
-/// Sweeps `root` whole for `cs` and files every hit in one of the host's
-/// files under the first of `stores` that holds it, or under [`OTHER`].
+/// Sweeps each of `roots` whole for `cs` and files every hit in one of
+/// the host's files under the first of `stores` that holds it, or under
+/// [`OTHER`].
 pub fn sweep_stores(
-    root: &Path,
-    files: &HostFiles,
+    roots: &[(PathBuf, HostFiles)],
     stores: &[Store],
     cs: &[Canary],
 ) -> Vec<StoreHits> {
@@ -432,19 +467,21 @@ pub fn sweep_stores(
         store: OTHER.to_owned(),
         hits: Vec::new(),
     });
-    if !root.exists() {
-        return out;
-    }
-    for hit in sweep_dir(root, cs) {
-        let path = path_of(&hit);
-        if !files.has(path) {
+    for (root, files) in roots {
+        if !root.exists() {
             continue;
         }
-        let at = stores
-            .iter()
-            .position(|s| s.holds(path))
-            .unwrap_or(stores.len());
-        out[at].hits.push(hit);
+        for hit in sweep_dir(root, cs) {
+            let path = path_of(&hit);
+            if !files.has(path) {
+                continue;
+            }
+            let at = stores
+                .iter()
+                .position(|s| s.holds(path))
+                .unwrap_or(stores.len());
+            out[at].hits.push(hit);
+        }
     }
     out
 }
@@ -472,12 +509,13 @@ impl Sweep {
     /// Sweeps `home`'s host stores (and the rest of the host's
     /// directories) for `cs`, and the bodies of `models`.
     pub fn host_stores(home: &AgentHome, cs: &[Canary], models: &[&ModelReport]) -> Hits {
-        let h = home.home_dir();
-        let codex = home.codex_home();
-        let stores = transcript_roots(home.host, &h, &codex);
-        let (root, files) = host_root(home.host, &h, &codex);
+        let dirs = home.host_dirs();
         Hits {
-            stores: sweep_stores(&root, &files, &stores, cs),
+            stores: sweep_stores(
+                &host_roots(home.host, &dirs),
+                &transcript_roots(home.host, &dirs),
+                cs,
+            ),
             model: models.iter().flat_map(|m| sweep_model(m, cs)).collect(),
         }
     }
