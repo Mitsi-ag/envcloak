@@ -1,6 +1,6 @@
 [package]
 name = "envcloak-e2e"
-description = "The M1 fixture acceptance story (SPEC §15.1) and gate 12, end to end through the built envcloak and envcloakd"
+description = "The M1 fixture acceptance story (SPEC §15.1), gate 12, and the M2 agent-host harness and story steps, end to end through the built envcloak and envcloakd"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -23,3 +23,8 @@ serde_json.workspace = true
 # the story compares with the fixtures' (ec-emit-serde prints one too).
 sha2.workspace = true
 tempfile.workspace = true
+
+# The agent-host tests (M2 plan task M2-04) check the scripted model's
+# qualified-version table against agents/versions.toml.
+[dev-dependencies]
+envcloak-agents.workspace = true

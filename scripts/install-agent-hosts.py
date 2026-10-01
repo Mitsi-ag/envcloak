@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Installs the agent hosts the M2 tests drive, pinned (M2 plan task M2-04).
+
+Reads crates/envcloak-e2e/agents/versions.toml and installs each host it
+lists into a cache outside every HOME: ENVCLOAK_AGENT_HOSTS, else
+<target>/agent-hosts, where <target> is CARGO_TARGET_DIR or the
+workspace's target/. Each host goes into its own directory,
+<id>-<variant>-<version>-<platform>/, made in a temporary directory first
+and renamed into place only once the SHA-256 of its entry file (and of its
+download, where versions.toml gives one) equals the pinned value. Nothing
+unverified is left in the cache. A host already installed is checked
+again and kept.
+
+Methods:
+- download: one file from `url`, which is the entry itself;
+- tarball: an archive from `url`, its first path component stripped,
+  members with absolute paths, `..` or links leaving the directory
+  refused;
+- npm: `npm install --prefix <dir> <package>@<version>`, with the
+  package's install scripts only when `scripts = true`.
+
+`url` may name {version}, {platform} (darwin-arm64, linux-x64), {os}
+(darwin, linux) and {arch} (arm64, x64).
+
+usage: install-agent-hosts.py [--tier 1|2|all] [--host ID[/VARIANT]]...
+                              [--platform P] [--print-hashes]
+--print-hashes downloads and prints the SHA-256 values for the platform
+instead of checking them, for a maintainer pinning a new version; it
+installs nothing.
+
+Prints one line per host and exits 0 when every host asked for is
+installed and verified, 1 otherwise.
+"""
+
+import hashlib
+import json
+import os
+import platform as pyplatform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+VERSIONS = os.path.join(ROOT, "crates", "envcloak-e2e", "agents", "versions.toml")
+
+
+def this_platform():
+    system = {"Darwin": "darwin", "Linux": "linux"}.get(pyplatform.system())
+    machine = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x64", "amd64": "x64"}.get(
+        pyplatform.machine().lower()
+    )
+    if not system or not machine:
+        return None
+    return "%s-%s" % (system, machine)
+
+
+def cache_dir():
+    given = os.environ.get("ENVCLOAK_AGENT_HOSTS")
+    if given:
+        return given
+    target = os.environ.get("CARGO_TARGET_DIR") or os.path.join(ROOT, "target")
+    return os.path.join(target, "agent-hosts")
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def expand(template, host, plat):
+    os_name, arch = plat.split("-", 1)
+    return template.format(version=host["version"], platform=plat, os=os_name, arch=arch)
+
+
+def per_platform(host, key, plat):
+    value = host.get(key)
+    if isinstance(value, dict):
+        return value.get(plat)
+    return value
+
+
+def fetch(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "envcloak-install-agent-hosts"})
+    with urllib.request.urlopen(req, timeout=600) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+
+
+def extract(archive, dest, strip):
+    with tarfile.open(archive, "r:*") as tar:
+        for m in tar.getmembers():
+            parts = [p for p in m.name.split("/") if p not in ("", ".")]
+            if any(p == ".." for p in parts) or m.name.startswith("/"):
+                raise ValueError("an archive member leaves the directory")
+            if m.issym() or m.islnk():
+                target = m.linkname
+                if target.startswith("/") or ".." in target.split("/"):
+                    raise ValueError("an archive link leaves the directory")
+            if len(parts) <= strip:
+                continue
+            m.name = "/".join(parts[strip:])
+            if m.islnk():
+                m.linkname = "/".join([p for p in m.linkname.split("/") if p][strip:])
+            tar.extract(m, dest, filter="data")
+
+
+def label(host):
+    return "%s/%s %s" % (host["id"], host["variant"], host["version"])
+
+
+def install(host, plat, cache, print_hashes):
+    entry = per_platform(host, "entry", plat)
+    want = per_platform(host, "sha256", plat)
+    if entry is None:
+        return False, "no entry for %s" % plat
+    if want is None and not print_hashes:
+        return False, "no pinned SHA-256 for %s" % plat
+    name = "%s-%s-%s-%s" % (host["id"], host["variant"], host["version"], plat)
+    final = os.path.join(cache, name)
+    if not print_hashes and os.path.isdir(final):
+        got = sha256_file(os.path.join(final, entry)) if os.path.isfile(os.path.join(final, entry)) else None
+        if got == want:
+            return True, "already installed, verified"
+        return False, "installed copy does not match its pin; remove %s and run again" % final
+    os.makedirs(cache, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=".tmp-" + name + "-", dir=cache)
+    try:
+        method = host["method"]
+        if method == "download":
+            dest = os.path.join(tmp, entry)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            fetch(expand(host["url"], host, plat), dest)
+            os.chmod(dest, 0o755)
+        elif method == "tarball":
+            archive = os.path.join(tmp, ".archive")
+            fetch(expand(host["url"], host, plat), archive)
+            got = sha256_file(archive)
+            pinned = per_platform(host, "archive_sha256", plat)
+            if print_hashes:
+                print("  %s archive_sha256 %s = %s" % (label(host), plat, got))
+            elif got != pinned:
+                return False, "download SHA-256 %s, pinned %s" % (got, pinned)
+            extract(archive, tmp, int(host.get("strip", 0)))
+            os.unlink(archive)
+        elif method == "npm":
+            cmd = ["npm", "install", "--prefix", tmp, "--no-audit", "--no-fund", "--no-save",
+                   "--loglevel=error", "%s@%s" % (host["package"], host["version"])]
+            if not host.get("scripts", False):
+                cmd.insert(2, "--ignore-scripts")
+            env = dict(os.environ)
+            env["npm_config_update_notifier"] = "false"
+            r = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if r.returncode != 0:
+                return False, "npm install failed: %s" % r.stderr.decode("utf-8", "replace")[-400:]
+        else:
+            return False, "unknown method %r" % method
+        path = os.path.join(tmp, entry)
+        if not os.path.isfile(path):
+            return False, "the entry %s is missing after install" % entry
+        got = sha256_file(path)
+        if print_hashes:
+            print("  %s sha256 %s = %s" % (label(host), plat, got))
+            return True, "hashes printed, nothing installed"
+        if got != want:
+            return False, "entry SHA-256 %s, pinned %s" % (got, want)
+        with open(os.path.join(tmp, "installed.json"), "w") as f:
+            json.dump({"id": host["id"], "variant": host["variant"], "version": host["version"],
+                       "platform": plat, "entry": entry, "sha256": got}, f)
+        os.rename(tmp, final)
+        tmp = None
+        return True, "installed, verified"
+    except (OSError, ValueError, tarfile.TarError) as e:
+        return False, "%s" % e
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def main(argv):
+    tier = "1"
+    only = []
+    plat = this_platform()
+    print_hashes = False
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--tier" and i + 1 < len(argv):
+            tier = argv[i + 1]
+            i += 2
+        elif a == "--host" and i + 1 < len(argv):
+            only.append(argv[i + 1])
+            i += 2
+        elif a == "--platform" and i + 1 < len(argv):
+            plat = argv[i + 1]
+            i += 2
+        elif a == "--print-hashes":
+            print_hashes = True
+            i += 1
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    if plat not in ("darwin-arm64", "linux-x64"):
+        print("install-agent-hosts: platform %r is not pinned" % plat, file=sys.stderr)
+        return 1
+    with open(VERSIONS, "rb") as f:
+        doc = tomllib.load(f)
+    cache = cache_dir()
+    ok = True
+    for host in doc.get("host", []):
+        key = "%s/%s" % (host["id"], host["variant"])
+        if only and host["id"] not in only and key not in only:
+            continue
+        if not only and tier != "all" and str(host.get("tier")) != tier:
+            continue
+        good, why = install(host, plat, cache, print_hashes)
+        print("install-agent-hosts: %s (%s): %s" % (label(host), plat, why))
+        ok = ok and good
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -14,8 +14,13 @@ workspace = true
 
 [dependencies]
 aho-corasick.workspace = true
+# The agent harness (src/agents.rs): the scripted model's reports carry
+# request bodies as base64 JSON, and pinned hosts are checked by SHA-256.
+base64.workspace = true
 libc.workspace = true
 envcloak-sys = { workspace = true, features = ["testing"] }
+serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 # assert_fresh reads the workspace's manifests to find what a binary is
 # built from.
@@ -23,6 +28,4 @@ toml_edit.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 form_urlencoded.workspace = true
-serde_json.workspace = true

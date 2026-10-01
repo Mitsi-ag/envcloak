@@ -1,0 +1,160 @@
+# The agent hosts the M2 tests drive, pinned (M2 plan task M2-04).
+#
+# scripts/install-agent-hosts.py installs each one into a cache outside
+# every HOME and keeps it only when the SHA-256 of its entry file equals
+# the value here; envcloak-testkit's agent harness checks it again before
+# every run, and after the run checks `--version` and the hash once more,
+# so a host that updated itself fails the test. Bumping a version is a
+# change to this file and to the qualified table in
+# crates/envcloak-agents/src/probe/model.rs (a test keeps the two equal),
+# with the stub re-qualified against the new version.
+#
+# Platforms: darwin-arm64 (macos-latest, a developer's Mac) and linux-x64
+# (ubuntu-latest).
+#
+# Tier 1 (decision D-14) are driven end to end. Tier 2 are installed here
+# so M2-10 can observe their real install layouts; docs/ACCEPTANCE.md
+# says which of them the scripted model can drive.
+
+# Claude Code, the native build (the documented install).
+[[host]]
+id = "claude-code"
+variant = "native"
+tier = 1
+version = "2.1.280"
+method = "download"
+url = "https://downloads.claude.ai/claude-code-releases/{version}/{platform}/claude"
+entry = "claude"
+
+[host.sha256]
+darwin-arm64 = "387a5c5dcdbb815085edf0baf79591f9d8894efe922bceaf3d75b1b08055229d"
+linux-x64 = "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
+
+# Claude Code from npm. From 2.x its install script copies the same native
+# binary over bin/claude.exe (the hashes equal the native build's); only
+# with install scripts off does `node cli-wrapper.cjs` start it instead.
+[[host]]
+id = "claude-code"
+variant = "npm"
+tier = 1
+version = "2.1.280"
+method = "npm"
+package = "@anthropic-ai/claude-code"
+scripts = true
+entry = "node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+
+[host.sha256]
+darwin-arm64 = "387a5c5dcdbb815085edf0baf79591f9d8894efe922bceaf3d75b1b08055229d"
+linux-x64 = "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
+
+# Codex CLI: the native binary and its resources, from npm's platform
+# package (what `npm install -g @openai/codex` runs; its codex.js only
+# starts this binary).
+[[host]]
+id = "codex"
+variant = "native"
+tier = 1
+version = "0.159.2"
+method = "tarball"
+url = "https://registry.npmjs.org/@openai/codex/-/codex-{version}-{platform}.tgz"
+strip = 1
+
+[host.entry]
+darwin-arm64 = "vendor/aarch64-apple-darwin/bin/codex"
+linux-x64 = "vendor/x86_64-unknown-linux-musl/bin/codex"
+
+[host.archive_sha256]
+darwin-arm64 = "4e491428fef0a676f8ed1c6b392183c24793940c958fa1e7bd99dbcb982d7cc6"
+linux-x64 = "84a6b35fb45bdcb94cef9fcb329438045a8911f53876cc9a9a7e6f9bb1382eba"
+
+[host.sha256]
+darwin-arm64 = "16593cc2f422d5f398a8e40f550ebbaf1245392528957be342c295920a300704"
+linux-x64 = "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e"
+
+[[host]]
+id = "gemini-cli"
+variant = "npm"
+tier = 2
+version = "0.62.0"
+method = "npm"
+package = "@google/gemini-cli"
+entry = "node_modules/@google/gemini-cli/bundle/gemini.js"
+
+[host.sha256]
+darwin-arm64 = "ef1d1bd9ee5aaae37ebcfb601b56659e3b16c5b258b21c138109c541e487ade7"
+linux-x64 = "ef1d1bd9ee5aaae37ebcfb601b56659e3b16c5b258b21c138109c541e487ade7"
+
+[[host]]
+id = "copilot-cli"
+variant = "npm"
+tier = 2
+version = "1.0.90"
+method = "npm"
+package = "@github/copilot"
+entry = "node_modules/@github/copilot/npm-loader.js"
+
+[host.sha256]
+darwin-arm64 = "0ea824a86be5757533fdb092eff7050871bd7a711a46babde0ffe0e44ac5ad88"
+linux-x64 = "0ea824a86be5757533fdb092eff7050871bd7a711a46babde0ffe0e44ac5ad88"
+
+[[host]]
+id = "opencode"
+variant = "native"
+tier = 2
+version = "1.18.34"
+method = "tarball"
+url = "https://registry.npmjs.org/opencode-{platform}/-/opencode-{platform}-{version}.tgz"
+strip = 1
+entry = "bin/opencode"
+
+[host.archive_sha256]
+darwin-arm64 = "9a336191ee84c8f54364b5d1990ec87abb2acbb00dea189f11dda5e968d7bf05"
+linux-x64 = "b83e8ac66d752d05ead4b6a439d3a2cfa32bcd9817c708825a389b5d5cba4f19"
+
+[host.sha256]
+darwin-arm64 = "7b63b34fafabded7d9231f6a9032755d0cdeaf8b9d2b70df8e25535471469eea"
+linux-x64 = "9ca0b9953d49997601655e54f846a3efa464f237e47c6f1b04716d0f2e64c4c2"
+
+[[host]]
+id = "kimi-code"
+variant = "npm"
+tier = 2
+version = "2.1.1"
+method = "npm"
+package = "@moonshot-ai/kimi-code"
+entry = "node_modules/@moonshot-ai/kimi-code/dist/main.mjs"
+
+[host.sha256]
+darwin-arm64 = "2563a338c94868a34e1bfd2e5579067d5a472acf4cb0bf350a3bfe1092bbe59d"
+linux-x64 = "2563a338c94868a34e1bfd2e5579067d5a472acf4cb0bf350a3bfe1092bbe59d"
+
+[[host]]
+id = "cursor-cli"
+variant = "native"
+tier = 2
+version = "2026.09.28-64d2043"
+method = "tarball"
+url = "https://downloads.cursor.com/lab/{version}/{os}/{arch}/agent-cli-package.tar.gz"
+strip = 1
+entry = "cursor-agent"
+
+[host.archive_sha256]
+darwin-arm64 = "c0d7e9cd2e62438610b886d3439907dc1f98c2923b07b3a41416cc919aaf53c7"
+linux-x64 = "6e4cd936a4866b8a77c50ff51a564460d715772fabc477a01aa0f0455d9559f0"
+
+[host.sha256]
+darwin-arm64 = "2ccc9a8e167797641448b5e5c936f006ba137a2555f117f38c5eb76a5238a233"
+linux-x64 = "2ccc9a8e167797641448b5e5c936f006ba137a2555f117f38c5eb76a5238a233"
+
+[[host]]
+id = "qwen-code"
+variant = "npm"
+tier = 2
+version = "0.24.7"
+method = "npm"
+package = "@qwen-code/qwen-code"
+entry = "node_modules/@qwen-code/qwen-code/cli-entry.js"
+
+[host.sha256]
+darwin-arm64 = "06c2be3fcb1b451931d3e100acc7edd3ff748c74189f6fcc70300b5cd758f8e6"
+linux-x64 = "06c2be3fcb1b451931d3e100acc7edd3ff748c74189f6fcc70300b5cd758f8e6"
