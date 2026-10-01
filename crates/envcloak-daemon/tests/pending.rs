@@ -473,6 +473,56 @@ fn a_long_listing_fits_one_frame_oldest_first() {
     f.sweep();
 }
 
+/// A request over the per-root cap, asked again and again, is audited
+/// once at first (`count=1`); the answers after it are counted and
+/// written together, here when the vault locks (`count=3`), not one
+/// entry each.
+///
+/// Mutation: audit every `too_many_pending` answer (write each in
+/// `State::audit_crowded`): four entries are written and this fails.
+/// Mutation: drop the counted answers at the lock (no drain in
+/// `State::lock`): no `count=3` entry comes and this fails.
+#[test]
+fn a_crowded_request_is_audited_once_with_its_count() {
+    let f = Fixture::new();
+    for n in 0..3 {
+        pending(
+            &client(&f.home)
+                .run_request(&f.params(&[&format!("./job-{n}")]))
+                .unwrap()
+                .decision,
+        );
+    }
+    for _ in 0..4 {
+        let e = client(&f.home)
+            .run_request(&f.params(&["./crowded"]))
+            .unwrap_err();
+        assert_eq!(
+            rpc_kind(e),
+            (ErrorKind::TooManyPending, Some("pending_per_root"))
+        );
+    }
+    assert!(client(&f.home).lock().unwrap().was_unlocked);
+    // The barrier: the entry the lock writes for the counted answers,
+    // after every earlier one.
+    let crowded = |log: &str| -> Vec<String> {
+        log.lines()
+            .filter(|l| l.starts_with("envcloakd: audit: request decision=too_many_pending "))
+            .map(str::to_owned)
+            .collect()
+    };
+    let end = Instant::now() + Duration::from_secs(30);
+    while !crowded(&f.d.log()).iter().any(|l| l.ends_with(" count=3")) {
+        assert!(Instant::now() < end, "{}", f.d.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let lines = crowded(&f.d.log());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].ends_with(" count=1"), "{lines:?}");
+    assert!(lines[0].contains(" id=pending_per_root "), "{lines:?}");
+    f.sweep();
+}
+
 /// A waiter on fresh connections sees an approval at its next poll: this
 /// test approves once the trace shows the request polled (the barrier),
 /// and the first `pending.state` the daemon answers after the approval is

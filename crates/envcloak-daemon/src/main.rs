@@ -34,6 +34,7 @@ macro_rules! log_line {
 mod audit;
 mod backup;
 mod clock;
+mod crowded;
 mod import;
 mod items;
 mod lock;

@@ -47,7 +47,10 @@
 //!
 //! A request over a pending cap is answered `too_many_pending` with the
 //! cap as its reason, and audited so: nothing was opened or refused, and a
-//! waiter asks again later (M2 plan D-04).
+//! waiter asks again later (M2 plan D-04). The first such answer to a
+//! request is written at once, and the ones after it are counted and
+//! written once a minute ([`crate::crowded`]), so waiting does not grow
+//! the log.
 //!
 //! `pending.state` and `pending.list` are for waiting and finding a
 //! request (M2 plan D-04). `pending.state` reads the caller's evidence
@@ -367,6 +370,7 @@ pub fn run_request(
             }),
             items: Vec::new(),
             argv: Vec::new(),
+            count: None,
         })));
         return Err(RpcError::new(ErrorKind::PolicyDenied));
     }
@@ -400,6 +404,7 @@ pub fn run_request(
             .map(|b| (b.binding.item, b.slug.clone()))
             .collect::<Vec<(ItemId, Slug)>>(),
         argv: masked_argv(shared, vault, &bound, &p.argv),
+        count: None,
     };
     let request = AccessRequest {
         subject,
@@ -505,11 +510,15 @@ pub fn run_request(
                 });
             }
             Decision::TooManyPending(cap) => {
-                s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                // Written at once the first time, then counted and written
+                // once a minute while the request is asked again
+                // (crate::crowded).
+                let e = RequestAudit {
                     decision: "too_many_pending",
                     reason: Some(cap.token()),
                     ..entry
-                })));
+                };
+                s.audit_crowded(again.fingerprint(), e, now.awake);
                 return Err(RpcError::with_reason(
                     ErrorKind::TooManyPending,
                     cap.token(),

@@ -45,17 +45,22 @@ pub const ANCHOR_RETRY_FIRST: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestAudit {
     pub pid: i32,
-    /// `covered`, `pending`, `denied` or `policy_denied`.
+    /// `covered`, `pending`, `denied`, `policy_denied` or
+    /// `too_many_pending`.
     pub decision: &'static str,
     pub request_id: Option<String>,
     pub grant_id: Option<String>,
-    /// A `DenyReason` token, for `denied`.
+    /// A `DenyReason` token, for `denied`; a `PendingCap` token, for
+    /// `too_many_pending`.
     pub reason: Option<&'static str>,
     pub subject: SubjectSummary,
     pub project: Option<ProjectSummary>,
     pub items: Vec<(ItemId, Slug)>,
     /// The command line, masked (`crate::redact::redact_argv`).
     pub argv: Vec<String>,
+    /// For `too_many_pending`: how many answers to the same request this
+    /// entry stands for ([`crate::crowded`]).
+    pub count: Option<u64>,
 }
 
 /// An event worth recording. The ids in it are the daemon's own
@@ -244,16 +249,22 @@ impl AuditEvent {
                 format!("envcloakd: audit: unlock failed reason=wrong_passphrase pid={pid}")
             }
             AuditEvent::Unlocked { .. } | AuditEvent::Locked { .. } => return None,
-            AuditEvent::Request(r) => format!(
-                "envcloakd: audit: request decision={} id={} pid={}",
-                r.decision,
-                r.grant_id
-                    .as_deref()
-                    .or(r.request_id.as_deref())
-                    .or(r.reason)
-                    .unwrap_or(""),
-                r.pid
-            ),
+            AuditEvent::Request(r) => {
+                let mut l = format!(
+                    "envcloakd: audit: request decision={} id={} pid={}",
+                    r.decision,
+                    r.grant_id
+                        .as_deref()
+                        .or(r.request_id.as_deref())
+                        .or(r.reason)
+                        .unwrap_or(""),
+                    r.pid
+                );
+                if let Some(n) = r.count {
+                    l.push_str(&format!(" count={n}"));
+                }
+                l
+            }
             AuditEvent::Approved {
                 pid,
                 request,
@@ -426,7 +437,7 @@ impl AuditEvent {
                 subject: r.subject.clone(),
                 project: r.project.clone(),
                 items: r.items.clone(),
-                decision: decision(r.decision, r.reason, Some("run.request"), None),
+                decision: decision(r.decision, r.reason, Some("run.request"), r.count),
                 argv_redacted: r.argv.clone(),
                 ..AuditRecord::new(AuditKind::Run, r.decision)
             },
@@ -1227,6 +1238,7 @@ mod tests {
                 project: None,
                 items: Vec::new(),
                 argv: vec!["a command line argument".into()],
+                count: None,
             })),
             AuditEvent::Revoked { pid: 11, count: 2 },
         ];
