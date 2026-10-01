@@ -460,6 +460,58 @@ fn a_failure_token_in_a_field_or_a_token_method_counts() {
 }
 
 #[test]
+fn a_token_printed_directly_as_envcloak_token_counts() {
+    // `envcloak run` prints its coverage gaps with `eprintln!("envcloak:
+    // coverage: ...")`, and `envcloak unlock` a warning the same way.
+    let t = fixture();
+    reserve_exit_token(&t, "coverage");
+    assert_fails(
+        &t,
+        "`coverage` is reserved, but the code already has it (crates/envcloak-cli/src/cmd/run.rs)",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `limited` | M2-11 | reserved |",
+        "| `warning` | M2-11 | reserved |",
+    );
+    assert_fails(
+        &t,
+        "`reason`: `warning` is reserved here, but the code already uses it in `exit_token` (crates/envcloak-cli/src/cmd/unlock.rs)",
+    );
+    // A new line in another crate, through `format!`.
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn stopped() -> String {\n    \
+             format!(\"envcloak: incomplete: {} files not read\", 3)\n\
+         }\n",
+    );
+    assert_fails(
+        &t,
+        &format!("`incomplete` is reserved, but the code already has it ({CLIENT_STUB})"),
+    );
+}
+
+#[test]
+fn text_that_only_mentions_envcloak_is_not_a_printed_token() {
+    // Not a `envcloak: <token>:` prefix: two words, no colon after the
+    // word, the prefix inside the text, or a placeholder.
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn a() { eprintln!(\"envcloak: pty unavailable: no terminal\"); }\n\
+         pub fn b() { eprintln!(\"envcloak: app_required because\"); }\n\
+         pub fn c() -> String { format!(\"[envcloak: incomplete: cut]\") }\n\
+         pub fn d(t: &str) { eprintln!(\"envcloak: {t}: x\"); }\n",
+    );
+    assert_passes(&t.home());
+}
+
+#[test]
 fn a_token_in_a_comment_a_string_or_a_test_module_does_not_count() {
     let t = fixture();
     add_file(

@@ -35,9 +35,11 @@ which a task uses again for a new case). This script refuses:
 The CLI's failure tokens are read from every crate's `src/` (comments and
 `#[cfg(test)]` modules left out): the first argument of `Failure::new` and
 of every function whose first parameter is `token: &'static str` (or
-`ExitToken`), every `token: <value>` field, and every string in the body of
-a `fn token`, whatever crate it is in. A value written as a `&str`
-constant counts by the constant's string. The reader over-counts rather
+`ExitToken`), every `token: <value>` field, every string in the body of a
+`fn token`, and the `<token>` of every string literal that starts
+`envcloak: <token>:` (a line printed directly, as `eprintln!` does for
+`coverage`, `warning` and `usage`), whatever crate it is in. A value
+written as a `&str` constant counts by the constant's string. The reader over-counts rather
 than under-counts: a string it takes for a token that is not printed only
 makes a `reserved` row with that name fail, which is a name to avoid
 anyway.
@@ -390,6 +392,7 @@ STR_TYPE = r"(?:&\s*(?:'static\s+)?str|ExitToken)"
 CONST_DEF = re.compile(r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*%s\s*=\s*\"" % STR_TYPE)
 HELPER_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)\s*(?:<[^>]*>)?\s*\(\s*token\s*:\s*(?:&\s*'static\s+str|ExitToken)\b")
 CONST_REF = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)$")
+PRINTED_PREFIX = re.compile(r"envcloak: ([a-z][a-z0-9_]*):")
 
 
 def code_exit_tokens(root):
@@ -435,6 +438,10 @@ def code_exit_tokens(root):
             for ident in re.findall(r"\b[A-Z][A-Z0-9_]*\b", src.skel[start:end]):
                 if ident in consts:
                     take(ident, src)
+        for lit in src.literals(0, len(src.skel)):
+            m = PRINTED_PREFIX.match(lit)
+            if m:
+                take('"%s"' % m.group(1), src)
     if not found:
         raise SourceError("no CLI failure tokens found under crates/*/src")
     return found
