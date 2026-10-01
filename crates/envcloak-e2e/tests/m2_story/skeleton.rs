@@ -12,7 +12,11 @@
 //! Codex runs in its `workspace-write` sandbox with the settings §4 says
 //! the person makes (M2-08's installer will write them): command
 //! networking on, the network proxy on with no domain rule, and one
-//! `unix_sockets` allow rule for EnvCloak's socket.
+//! `unix_sockets` allow rule for EnvCloak's socket. Codex honours that rule
+//! on macOS only; on Linux its sandbox refuses the socket (K-01, measured
+//! by `agent_hosts`), so there S0 checks the other half of K-01: the CLI
+//! fails closed in the sandbox, twice, the daemon sees no request, and the
+//! sweep is as clean, with the positive control found.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -168,6 +172,7 @@ fn s0(host: Host, name: &str) {
         {"shell": format!("echo {}", control.as_str())},
         {"say": "done"},
     ]});
+    let requests_before = audit_requests(&h);
     let mut running = agent.spawn(&script, "Run ./emit through envcloak.", &flags, &repo);
 
     // The host sent the first run's output to its model: approval needed,
@@ -178,33 +183,62 @@ fn s0(host: Host, name: &str) {
         &held.body,
     );
     let first = String::from_utf8_lossy(&held.body).into_owned();
+    // Swept clean just above, so its end can be shown.
+    let tail = first
+        .char_indices()
+        .rev()
+        .nth(3000)
+        .map_or(first.as_str(), |(at, _)| &first[at..]);
+    let held_for_approval = first.contains("approval_required");
+    let refused = !held_for_approval && sandbox_refuses_the_socket(host);
     assert!(
-        first.contains("approval_required"),
-        "the first run was not held for approval"
+        held_for_approval || refused,
+        "the first run was not held for approval; the request ends:\n{tail}"
     );
-    assert!(first.contains("EXIT=125"), "the first run did not exit 125");
-    let id = request_id(&first);
+    if held_for_approval {
+        assert!(
+            first.contains("EXIT=125"),
+            "the first run did not exit 125; the request ends:\n{tail}"
+        );
+        let id = request_id(&first);
 
-    // The person approves from a terminal of their own; the statement
-    // names the host.
-    let approved = approve(&mut h, &repo, &id);
-    assert_eq!(approved.code, 0, "{}", approved.all());
-    let agent_name = match host {
-        Host::ClaudeCode => "Claude Code",
-        Host::Codex => "Codex",
-    };
-    assert!(
-        approved
-            .shown()
-            .contains(&format!("requested by: agent {agent_name}")),
-        "{}",
-        approved.all()
-    );
-    println!(
-        "measurement: S0 subject host={} os={}: requested by: agent {agent_name}",
-        host.id(),
-        std::env::consts::OS
-    );
+        // The person approves from a terminal of their own; the statement
+        // names the host.
+        let approved = approve(&mut h, &repo, &id);
+        assert_eq!(approved.code, 0, "{}", approved.all());
+        let agent_name = match host {
+            Host::ClaudeCode => "Claude Code",
+            Host::Codex => "Codex",
+        };
+        assert!(
+            approved
+                .shown()
+                .contains(&format!("requested by: agent {agent_name}")),
+            "{}",
+            approved.all()
+        );
+        println!(
+            "measurement: S0 subject host={} os={}: requested by: agent {agent_name}",
+            host.id(),
+            std::env::consts::OS
+        );
+    } else {
+        // K-01 on this system: the CLI cannot open the socket from the
+        // host's sandbox, so it fails closed before it sends a byte, and
+        // the daemon never sees a request.
+        let refusal = refusal(&first)
+            .unwrap_or_else(|| panic!("no refusal in the first run; the request ends:\n{tail}"));
+        assert!(
+            !first.contains("EXIT=0"),
+            "the first run exited 0; the request ends:\n{tail}"
+        );
+        println!(
+            "measurement: S0 host={} os={}: unsupported under its sandbox with the bounded \
+             setting (K-01): {refusal}",
+            host.id(),
+            std::env::consts::OS
+        );
+    }
     running.model.release("approved");
     let run = running.wait();
     agent.check_pinned();
@@ -226,8 +260,6 @@ fn s0(host: Host, name: &str) {
         .collect();
     assert_eq!(picks, ["step 0", "step 1", "step 2", "step 3"]);
 
-    // The rerun got its values: exit 0, and redaction markers where the
-    // values were.
     let second = run
         .model
         .requests
@@ -235,11 +267,26 @@ fn s0(host: Host, name: &str) {
         .find(|r| r.pick.as_deref() == Some("step 2"))
         .map(|r| String::from_utf8_lossy(&r.body).into_owned())
         .unwrap();
-    assert!(second.contains("EXIT=0"), "the rerun did not exit 0");
-    assert!(
-        second.contains("[envcloak:openai/acme-web]"),
-        "no redaction marker in the rerun's output"
-    );
+    if held_for_approval {
+        // The rerun got its values: exit 0, and redaction markers where
+        // the values were.
+        assert!(second.contains("EXIT=0"), "the rerun did not exit 0");
+        assert!(
+            second.contains("[envcloak:openai/acme-web]"),
+            "no redaction marker in the rerun's output"
+        );
+    } else {
+        // Refused again, and nothing reached the daemon.
+        assert!(
+            refusal(&second).is_some() && second.matches("EXIT=0").count() == 0,
+            "the rerun was not refused"
+        );
+        assert_eq!(
+            audit_requests(&h),
+            requests_before,
+            "the daemon saw a request from the sandbox"
+        );
+    }
 
     // The sweep: every capture, every daemon log, the whole home, raw.
     h.assert_swept("S0");
@@ -267,6 +314,47 @@ fn s0(host: Host, name: &str) {
         .sum();
     assert_eq!(leaks, 0, "{hits}");
     candidate_density(&agent);
+}
+
+/// Whether `host`'s sandbox, with the settings §4 pins, is measured to
+/// refuse the daemon's socket on this system (K-01), so that S0 checks the
+/// refusal instead of the approval. Codex 0.159.2 honours `unix_sockets`
+/// rules on macOS only (`unix_socket_permissions_supported` in its
+/// `network-proxy/src/runtime.rs` is `cfg!(target_os = "macos")`); on
+/// Linux its network seccomp filter in proxy-routed mode refuses every
+/// Unix socket unless all are allowed (`linux-sandbox/src/landlock.rs`),
+/// which K-01 rules out. `agent_hosts` measures both systems.
+fn sandbox_refuses_the_socket(host: Host) -> bool {
+    host == Host::Codex && cfg!(target_os = "linux")
+}
+
+/// The CLI's refusal (`envcloak: daemon_unverified: ...` or
+/// `daemon_unavailable`) in what the host sent its model, if any.
+fn refusal(text: &str) -> Option<String> {
+    [
+        "envcloak: daemon_unverified",
+        "envcloak: daemon_unavailable",
+    ]
+    .iter()
+    .find_map(|t| text.rfind(t))
+    .map(|at| {
+        text[at..]
+            .chars()
+            .take_while(|c| !matches!(c, '\\' | '"' | '\n'))
+            .collect()
+    })
+}
+
+/// The number of `request` lines in the daemons' audit log so far.
+fn audit_requests(h: &Harness) -> usize {
+    h.daemon_logs()
+        .iter()
+        .map(|l| {
+            String::from_utf8_lossy(l)
+                .matches("envcloakd: audit: request ")
+                .count()
+        })
+        .sum()
 }
 
 /// Candidates of 16 or more characters per MiB in what the host wrote to
