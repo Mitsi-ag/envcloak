@@ -11,7 +11,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use envcloak_agents::probe::model::{Limits, ModelStub, Report, SERVER, Script, Server, admit_as};
+use envcloak_agents::probe::model::{
+    Limits, ModelStub, RECORD_OVERHEAD, Report, SERVER, Script, Server, admit_as, serve_bytes,
+};
 use serde_json::{Value, json};
 
 const EXE: &str = env!("CARGO_BIN_EXE_envcloak-probe-model");
@@ -305,6 +307,139 @@ fn the_run_records_at_most_16_mib_then_refuses_and_is_incomplete() {
     assert_eq!(report.outcome.incomplete, ["total_cap"]);
     assert_eq!(report.requests.len(), 4);
     assert_eq!(report.outcome.recorded_bytes, 16 * MIB as u64);
+}
+
+/// Every path that records a request counts it: Claude Code's
+/// connectivity check (no token, no body), a refused token and a tunnel
+/// request all stop being recorded at the record cap, are answered 503
+/// after it, and leave the run incomplete. The program as it ships, with
+/// its default cap of 1,024, pipelined on one connection.
+#[test]
+fn requests_without_a_body_are_recorded_up_to_the_record_cap_then_refused() {
+    assert_eq!(Limits::default().records, 1024);
+    assert_eq!(Limits::default().meta, MIB);
+    let stub = start();
+    let mut s = TcpStream::connect(stub.addr()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let hello = b"HEAD /api/hello HTTP/1.1\r\nHost: x\r\n\r\n";
+    let mut w = s.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..1025 {
+            if w.write_all(hello).is_err() {
+                break;
+            }
+        }
+    });
+    // Pipelined responses arrive several to a read: split them here.
+    let mut statuses = Vec::new();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 65536];
+    'read: loop {
+        while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8(buf[..end + 4].to_vec()).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // HEAD responses carry no body; the 503 carries its own.
+            let body = if head.starts_with("HTTP/1.1 200 ") {
+                0
+            } else {
+                len
+            };
+            if buf.len() < end + 4 + body {
+                break;
+            }
+            let status: u16 = head[9..12].parse().unwrap();
+            statuses.push(status);
+            buf.drain(..end + 4 + body);
+            if status != 200 {
+                break 'read;
+            }
+        }
+        match s.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(statuses.len(), 1025, "{statuses:?}");
+    assert!(statuses[..1024].iter().all(|&st| st == 200));
+    assert_eq!(statuses[1024], 503);
+    // After the cap, a refused token and a tunnel are not recorded either.
+    let wrong = "x-api-key: ecp_0000000000000000000000000000000000000000\r\n";
+    let got = send(stub.addr(), &post("/v1/messages", wrong, b"{}")).unwrap();
+    assert_eq!(got.status, 503);
+    let got = send(
+        stub.addr(),
+        b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(got.status, 503);
+    let report = stub.finish().unwrap();
+    assert_eq!(report.requests.len(), 1024);
+    assert_eq!(report.outcome.incomplete, ["record_cap"]);
+    assert_eq!(report.outcome.bad_token, 1);
+    assert_eq!(report.outcome.connect, 1);
+    assert_eq!(report.outcome.recorded_bytes, 0);
+    let meta: u64 = report.requests.iter().map(|r| r.meta_len() as u64).sum();
+    assert_eq!(report.outcome.recorded_meta, meta);
+}
+
+/// The same caps on each recording path on its own, with small limits:
+/// the record count, then the metadata a request's target and header
+/// names add, which a request with no body at all still counts.
+#[test]
+fn each_recording_path_stops_at_the_record_and_metadata_caps() {
+    let script = Script::parse(&script()).unwrap();
+    let hello = b"HEAD /api/hello HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+    let wrong = post(
+        "/v1/messages",
+        "x-api-key: ecp_0000000000000000000000000000000000000000\r\n",
+        b"{}",
+    );
+    let tunnel = b"CONNECT a.example:443 HTTP/1.1\r\nHost: a.example:443\r\n\r\n".to_vec();
+    for (name, request) in [
+        ("hello", &hello),
+        ("bad token", &wrong),
+        ("tunnel", &tunnel),
+    ] {
+        let limits = Limits {
+            records: 8,
+            ..Limits::default()
+        };
+        let server = Server::bind(script.clone(), limits).unwrap();
+        let handle = server.handle();
+        let mut refused = 0;
+        for _ in 0..20 {
+            let out = serve_bytes(&handle, request);
+            if out.starts_with(b"HTTP/1.1 503 ") {
+                refused += 1;
+            }
+        }
+        assert_eq!(handle.requests().len(), 8, "{name}");
+        assert_eq!(refused, 12, "{name}");
+        assert_eq!(handle.outcome().incomplete, ["record_cap"], "{name}");
+    }
+    // Long targets, no body: the metadata cap ends it first.
+    let limits = Limits {
+        meta: 4 * 1024,
+        ..Limits::default()
+    };
+    let server = Server::bind(script, limits).unwrap();
+    let handle = server.handle();
+    let long = format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "p".repeat(1500));
+    for _ in 0..20 {
+        let _ = serve_bytes(&handle, long.as_bytes());
+    }
+    let outcome = handle.outcome();
+    assert!(outcome.recorded_meta <= 4 * 1024, "{outcome:?}");
+    assert!(outcome.recorded_meta >= 2 * (1500 + RECORD_OVERHEAD) as u64);
+    assert_eq!(handle.requests().len(), 2);
+    assert_eq!(outcome.incomplete, ["record_cap"]);
 }
 
 #[test]

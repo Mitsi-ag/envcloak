@@ -4,10 +4,12 @@
 //! with whole responses of the statuses it knows, or nothing; never
 //! panics; never records more than its caps; and never sends back a byte
 //! the request held. The libFuzzer target over the same entry point
-//! (`fuzz/`) is M2-25's.
+//! (`fuzz/`) is M2-25's: libfuzzer-sys's `fuzz_target!` expands to
+//! `#[no_mangle]` functions, which the workspace's `unsafe_code` rule
+//! forbids outside envcloak-sys.
 #![allow(clippy::unwrap_used)]
 
-use envcloak_agents::probe::model::{Limits, Script, Server, serve_bytes};
+use envcloak_agents::probe::model::{Handle, Limits, Script, Server, serve_bytes};
 use proptest::prelude::*;
 use serde_json::json;
 
@@ -22,6 +24,8 @@ fn server() -> Server {
     let limits = Limits {
         body: 2048,
         total: 8192,
+        records: 6,
+        meta: 4096,
         ..Limits::default()
     };
     Server::bind(
@@ -31,8 +35,8 @@ fn server() -> Server {
     .unwrap()
 }
 
-/// Splits `out` into responses and checks each.
-fn check(out: &[u8], recorded: u64) -> Result<(), TestCaseError> {
+/// Splits `out` into responses and checks each, then the run's caps.
+fn check(out: &[u8], handle: &Handle) -> Result<(), TestCaseError> {
     let mut rest = out;
     while !rest.is_empty() {
         prop_assert!(rest.starts_with(b"HTTP/1.1 "), "not a response");
@@ -63,7 +67,10 @@ fn check(out: &[u8], recorded: u64) -> Result<(), TestCaseError> {
         }
         rest = &rest[end + len..];
     }
-    prop_assert!(recorded <= 8192, "recorded past the cap");
+    let outcome = handle.outcome();
+    prop_assert!(outcome.recorded_bytes <= 8192, "recorded past the cap");
+    prop_assert!(outcome.recorded_meta <= 4096, "metadata past its cap");
+    prop_assert!(handle.requests().len() <= 6, "records past their cap");
     Ok(())
 }
 
@@ -149,7 +156,7 @@ proptest! {
         let mut input = input;
         input.extend_from_slice(MARK);
         let out = serve_bytes(&handle, &input);
-        check(&out, handle.outcome().recorded_bytes)?;
+        check(&out, &handle)?;
     }
 
     #[test]
@@ -168,7 +175,7 @@ proptest! {
         }
         let input = apply(input, &damage);
         let out = serve_bytes(&handle, &input);
-        check(&out, handle.outcome().recorded_bytes)?;
+        check(&out, &handle)?;
         if damage.is_empty() {
             let report = handle.requests();
             prop_assert_eq!(report.len(), if twice { 2 } else { 1 });
@@ -193,7 +200,7 @@ fn oversized_and_capped_input_through_the_same_path() {
         many.extend(valid(&token, &one, "/v1/other"));
     }
     let out = serve_bytes(&handle, &many);
-    check(&out, handle.outcome().recorded_bytes).unwrap();
+    check(&out, &handle).unwrap();
     assert!(
         handle
             .outcome()
