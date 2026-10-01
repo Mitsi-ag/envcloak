@@ -221,3 +221,207 @@ The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then remo
 | 4 through the daemon (story S11): `backup create` writes a backup of ciphertext only; `recover` takes the kit only from a terminal subject, refuses a wrong kit (counted and audited) and a file that is not a backup, leaving the vault it had, and after the vault directory is lost restores it unlocked under the new passphrase, which alone opens it then | `crates/envcloak-cli/tests/backup.rs`, `crates/envcloak-daemon/src/state.rs` and `src/backup.rs` (tests), `crates/envcloak-cli/tests/snapshots.rs` |
 
 The other-uid checks need a second user and `sudo`; CI creates one on Linux (`ENVCLOAK_TEST_OTHER_USER`). The service-manager check runs where `ENVCLOAK_TEST_SERVICE_MANAGER=1`, which CI sets on both systems.
+
+## Reserved for M2 and M2b
+
+Status: M2 plan decision D-23, written by task M2-01. Every name and number the M2 and M2b tasks will add to the protocol, the CLI's own failure tokens, coverage reporting and the MCP tools is assigned to its task here before any code uses it, so two lanes that append to one fixed table never take the same entry (review R-7). The vault's numbers (audit kinds, item classes, associated-data tags, policy record kinds) are in VAULT.md under the same heading.
+
+A task takes the rows it is named in. To take another row, or a new one, it changes the table in its own pull request; it never picks a number or name that is not here. Each row has a status: `reserved` (not in the code yet), `landed` (in the code exactly as the row says; the task that adds it changes the status in the same commit) or `reuse` (an entry the code already has, which a task uses again for its new case, unchanged). `scripts/check-reservations.py`, which CI runs, reads every table below and in VAULT.md and refuses a name or number taken twice, a malformed name, a task that is not an M2 or M2b task (or a later milestone, or `spare`), a `reserved` row the code already uses, a `landed` or `reuse` row the code does not hold exactly so, and, in a numbered table, a code entry in the reserved range with no `landed` row. Where a table has no code to read yet (coverage tokens, control messages, MCP tools, sign-in tokens, method fields), the check covers the table alone; the task that lands the first entry of such a table adds its reader to the script.
+
+**Error kinds** (`data.kind`; codes go on from -32034):
+
+<!-- reservations:error_kind -->
+| Token | Code | Task | Status | Use |
+|---|---|---|---|---|
+| `busy` | -32008 | M2-03 | reuse | `pending.state` polls over the subject root's limit, which a waiter answers by backing off (SPEC §6.1); M2-06 uses it again for the MCP server's full call queue |
+| `too_many_pending` | -32035 | M2-03 | reserved | a `run.request` over a pending cap (§10a), which a waiter retries with backoff and never takes as a refusal; M2-03 decides, in this table, whether `denied` with `pending_per_root` and `pending_total` stays for callers that do not wait |
+| `not_backup_owner` | -32036 | M2-05 | reserved | a backup v2 call from a process instance other than the one that began the backup; nothing is changed and no metadata returned |
+| `login_reference` | -32037 | M2-07 | reserved | a reference to a login item's field, which `run`, `ref` and every resolver refuse (SPEC §6.8) |
+| `live_not_ticked` | -32038 | M2-13 | reserved | an approval whose statement leaves a live binding unticked creates no grant (SPEC §10b) |
+| `managed_command_mismatch` | -32039 | M2-27 | reserved | a request against a managed project that does not name its registered launch, or its registered origin and header names (SPEC §6.6) |
+| `managed_launch_changed` | -32040 | M2-27 | reserved | a registered launch whose executable, entry file or working directory changed, refused before any pending request |
+| `code_selecting_env` | -32041 | M2-27 | reserved | a launch declaration with a code-selecting variable or interpreter option, refused at registration and reported as manual |
+| `runner_unavailable` | -32042 | M2-27 | reserved | the daemon cannot start its runner, relay or browser supervisor from its anchor (the `envcloak` beside it changed since it started) |
+| `identity_not_standing_capable` | -32043 | M2-15 | reserved | `--standing` for an agent matched other than by a builtin executable path or code signature |
+| `identity_outside_install_tree` | -32044 | M2-15 | reserved | `--standing` for a Linux executable outside its agent's documented install trees |
+| `launch_not_standing_capable` | -32045 | M2-15 | reserved | `--standing` for a managed launch that is not `bound` |
+| `policy_epoch_unverified` | -32046 | M2-15 | reserved | standing records refused until `envcloak standing confirm`, because the vault is behind its policy record |
+| `request_conflict` | -32047 | M2b-05 | reserved | a sign-in request with a known `operation_key` and any scope field changed; the existing request is untouched |
+<!-- /reservations -->
+
+**Reasons** (`data.reason`; each joins `envcloak_ipc::proto::REASONS` and its words in the CLI when it lands):
+
+<!-- reservations:reason -->
+| Token | Task | Status | Use |
+|---|---|---|---|
+| `too_large` | M2-05 | reuse | a file or a backup v2 over its caps (256 MiB a file, 1 GiB a backup, 4,096 files), refused rather than cut |
+| `result_unrecorded` | M2-05 | reserved | a backup whose creator exited before recording what the change left; it restores only with `--unrecorded` |
+| `limited` | M2-11 | reserved | a comparison budget stopped `scan.match`, so the run reports `incomplete (limited)` |
+<!-- /reservations -->
+
+**Methods** (client role):
+
+<!-- reservations:method -->
+| Method | Task | Status | Use |
+|---|---|---|---|
+| `pending.state` | M2-03 | reserved | a pending request's state, only to its own process tree, without holding the connection |
+| `pending.list` | M2-03 | reserved | pending requests, only to a caller whose proof the daemon would accept (`envcloak pending`) |
+| `backup.v2.begin` | M2-05 | reserved | starts a file backup v2 and records its creator |
+| `backup.v2.put` | M2-05 | reserved | one chunk, from the creator only |
+| `backup.v2.commit` | M2-05 | reserved | freezes the backup's contents |
+| `backup.v2.record_result` | M2-05 | reserved | the SHA-256 of what the change left, once per file, from the creator while it lives |
+| `backup.v2.open_restore` | M2-05 | reserved | one passphrase proof opens a restore lease |
+| `backup.v2.read` | M2-05 | reserved | one chunk under a restore lease |
+| `backup.v2.list` | M2-05 | reserved | backups with creator, purpose and state |
+| `scan.match` | M2-11 | reserved | candidate tokens compared by keyed hash, under the import rules and the two comparison budgets |
+| `items.mark_exposed` | M2-11 | reserved | marks items "exposed: rotate"; tightening, no proof |
+| `items.reclassify` | M2-13 | reserved | test, live or unknown; towards test or unknown with a proof |
+| `managed.register` | M2-27 | reserved | registers a managed MCP server and its launch or origin, with a proof |
+| `managed.unregister` | M2-27 | reserved | removes a managed server's record, with a proof |
+| `managed.update_plan` | M2-27 | reserved | the update statement for a registered launch, built from its stored declaration |
+| `managed.update` | M2-27 | reserved | commits a launch update as its next revision, with a proof |
+| `standing.list` | M2-15 | reserved | standing approvals, metadata only |
+| `standing.revoke` | M2-15 | reserved | revokes standing approvals; tightening, no proof |
+| `standing.confirm` | M2-15 | reserved | re-seals the policy record over every standing record, with a proof |
+| `items.reveal` | M2-21 | reserved | terminal reveal on Linux, with a proof |
+| `login.add` | M2b-03 | reserved | adds a login item; its fields cross only from the client |
+| `signin.target.add` | M2b-05 | reserved | registers a sign-in target, with a proof |
+| `signin.target.edit` | M2b-05 | reserved | edits a sign-in target, with a proof; bumps its authorization revision |
+| `signin.target.remove` | M2b-05 | reserved | removes a sign-in target |
+| `signin.request` | M2b-05 | reserved | a sign-in request, which hands over the tool pipe ends for the browser supervisor |
+| `signin.status` | M2b-05 | reserved | an operation's allowlisted status, to its owner root only |
+| `signin.cancel` | M2b-05 | reserved | ends an operation, to its owner root only |
+| `signin.end` | M2b-05 | reserved | ends a delivered session, to its owner root only |
+<!-- /reservations -->
+
+**Fields and answers** added to existing methods:
+
+<!-- reservations:field -->
+| Method | Field | Task | Status | Use |
+|---|---|---|---|---|
+| `run.request` | `launch` | M2-27 | reserved | a managed stdio launch's id; the server-side pipe ends and a lifeline go as descriptors |
+| `run.request` | `bridge` | M2-27 | reserved | a bridged HTTP server's origin and header names; the relay's pipe ends and a lifeline go as descriptors |
+| `run.request` | `decision=started` | M2-27 | reserved | the answer to a covered managed request: the daemon started EnvCloak's runner or relay, and no value is returned |
+| `import.plan` | `scope` | M2-11 | reserved | `project`, or `machine` with its source and label |
+| `scan.match` | `purpose` | M2-11 | reserved | `import`, `doctor` or `scrub`; required, recorded in the audit entry, and constrained by the daemon |
+| `pending.get` | `proposals` | M2-13 | reserved | the test items proposed before live ones |
+| `approve` | `standing` | M2-15 | reserved | `options.standing`: a standing approval's duration, at most 30 days |
+| `approve` | `dev` | M2b-05 | reserved | `options.dev`: a sign-in `dev` authorization's window and attempt budget |
+<!-- /reservations -->
+
+**The CLI's own failure tokens** (`envcloak: <token>:` lines that are not error kinds):
+
+<!-- reservations:exit_token -->
+| Token | Task | Status | Use |
+|---|---|---|---|
+| `not_in_this_build` | M2-02 | reserved | a command or option whose milestone has not shipped; exit 125, and no argument is echoed |
+| `incomplete` | M2-14 | reserved | doctor, import, scrub or `migrate-mcp` did not finish the whole job (a cap, a budget, an item reported as manual); a non-zero exit with the reason |
+| `value_on_argv` | M2-18 | reuse | a value given as a command-line argument; `mcp-bridge` takes slugs only |
+| `runner_unavailable` | M2-27 | reserved | `envcloak run --launch`, `mcp-bridge --relay` or `mcp --browser-supervisor` started by anything but the daemon; exit 125 |
+| `pty_unavailable` | M2-19 | reserved | `run --pty` without a terminal on stdin and stdout; exit 125, never a fallback |
+| `pty_monitor_lost` | M2-19 | reserved | the PTY monitor died without reporting the command's status; exit 125 |
+| `app_required` | M2-21 | reserved | `envcloak reveal` on macOS before the app; exit 125, no value requested |
+<!-- /reservations -->
+
+**Coverage tokens** (`envcloak agents status`; states, reasons and probe outcomes share one namespace):
+
+<!-- reservations:coverage -->
+| Token | Kind | Task | Status | Use |
+|---|---|---|---|---|
+| `active` | state | M2-09 | reserved | a probe passed on this machine for this host version and configuration, and nothing degrades it |
+| `degraded` | state | M2-09 | reserved | installed, but needs trust, can be switched off or fails open; always with reasons |
+| `unsupported` | state | M2-09 | reserved | the host offers no contract for the surface |
+| `unverified` | state | M2-09 | reserved | not established on this machine; always with a reason |
+| `hooks_untrusted` | reason | M2-09 | reserved | Codex hooks the person has not trusted |
+| `workspace_untrusted` | reason | M2-09 | reserved | Claude Code holds back settings-file hooks until the folder's workspace trust is accepted |
+| `switched_off_user` | reason | M2-09 | reserved | a user setting switches the hooks off |
+| `switched_off_project` | reason | M2-09 | reserved | a project setting switches the hooks off |
+| `switched_off_local` | reason | M2-09 | reserved | a local setting switches the hooks off |
+| `managed_only` | reason | M2-09 | reserved | a managed setting allows managed hooks only |
+| `fails_open_on_timeout` | reason | M2-09 | reserved | a hook that times out lets the action through |
+| `override_file` | reason | M2-08 | reserved | Codex's `AGENTS.override.md` shadows the instructions |
+| `needs_host_approval` | reason | M2-09 | reserved | the host asks before each call of EnvCloak's tool, or refuses it (`codex exec` with approval policy "never") |
+| `outside_host_sandbox` | reason | M2-09 | reserved | commands `run_with_secrets` starts run outside the host's sandbox, as a qualification result |
+| `persists_blocked_prompt` | reason | M2-09 | reserved | the host keeps a blocked prompt in its local history |
+| `not_drivable` | reason | M2-04 | reserved | no documented setting lets the scripted model drive the host |
+| `sandbox_blocks_socket` | reason | M2-04 | reserved | the host's sandbox cannot reach EnvCloak's socket with any documented allowance |
+| `probe_needs_terminal` | reason | M2-28 | reserved | the output probe needs an approval only a terminal subject can give |
+| `passed` | outcome | M2-09 | reserved | the probe and its control passed |
+| `failed` | outcome | M2-09 | reserved | the probe or its control failed; listed first |
+| `skipped` | outcome | M2-09 | reserved | the probe did not run, with the reason |
+| `not_qualified` | outcome | M2-28 | reserved | the probe is not qualified for this host version, which is not a failure |
+<!-- /reservations -->
+
+**Control-pipe messages** of the processes EnvCloak starts (never socket methods):
+
+<!-- reservations:control_message -->
+| Channel | Message | Task | Status | Use |
+|---|---|---|---|---|
+| `runner` | `Release` | M2-27 | reserved | daemon to runner: the binding values, the launch description and the checked stamp; daemon to relay: the header value and its origin |
+| `runner` | `ConfirmSpawn` | M2-27 | reserved | runner to daemon (macOS): the suspended child's pid, for the daemon's code check |
+| `runner` | `Confirmed` | M2-27 | reserved | daemon to runner: the child may run |
+| `runner` | `Refused` | M2-27 | reserved | daemon to runner: kill the child and exit with `managed_launch_changed` |
+| `supervisor` | `Claim` | M2b-05 | reserved | daemon to browser supervisor: the declared state of its generation, once, after capture |
+| `supervisor` | `InjectState` | spare | reserved | named by plan D-36 for the hand-over of the declared state, which `Claim` carries; kept so the name stays free |
+| `supervisor` | `IdentityResponse` | M2b-05 | reserved | supervisor to daemon: the bounded identity response read in the recipient context |
+| `supervisor` | `Publish` | M2b-05 | reserved | daemon to supervisor: the serialized publication decision |
+| `supervisor` | `Check` | M2b-05 | reserved | supervisor to daemon: the grant check before each browser tool call |
+| `supervisor` | `Close` | M2b-05 | reserved | daemon to supervisor: the generation ends |
+| `pty_monitor` | `Stopped` | M2-17 | reserved | the command stopped, with the signal |
+| `pty_monitor` | `Continued` | M2-17 | reserved | the command continued |
+| `pty_monitor` | `Exited` | M2-17 | reserved | the command's status |
+| `pty_monitor` | `Resume` | M2-17 | reserved | the CLI is back in raw mode: hand the terminal back and continue the command |
+| `pty_monitor` | `Suspend` | M2-17 | reserved | stop the command first (a SIGTSTP from another process) |
+| `pty_monitor` | `Signal` | M2-17 | reserved | a signal narrowed to the command's own process group |
+| `signin_driver` | `NeedUsername` | M2b-07 | reserved | the login state machine reached the username step |
+| `signin_driver` | `NeedPassword` | M2b-07 | reserved | the password step |
+| `signin_driver` | `NeedCode` | M2b-07 | reserved | a one-time-code step, with its time step |
+| `signin_driver` | `Captured` | M2b-07 | reserved | the declared state after login |
+| `signin_driver` | `Stopped` | M2b-07 | reserved | the attempt stopped, with its reason |
+| `signin_reaper` | `Stop` | M2b-07 | reserved | daemon to reaper: tear the worker down |
+| `signin_reaper` | `Status` | M2b-07 | reserved | reaper to daemon: teardown progress |
+<!-- /reservations -->
+
+**Statement domains** (the first line of a canonical statement, under its digest):
+
+<!-- reservations:statement_domain -->
+| Domain | Task | Status | Use |
+|---|---|---|---|
+| `envcloak-statement/2` | M2-13 | reserved | approval statements with classifications, live ticks and test-item proposals; version 1 digests are refused after the upgrade |
+| `envcloak-signin-statement/1` | M2b-01 | reserved | sign-in approval statements (SPEC §6.8) |
+<!-- /reservations -->
+
+**MCP tools** (`envcloak mcp`):
+
+<!-- reservations:mcp_tool -->
+| Tool | Task | Status | Use |
+|---|---|---|---|
+| `list_secrets` | M2-06 | reserved | slugs and metadata, never a value |
+| `project_status` | M2-06 | reserved | manifest, bindings, pending requests, grants, coverage and unavailable features |
+| `add_reference` | M2-06 | reserved | adds a binding to a manifest |
+| `run_with_secrets` | M2-06 | reserved | runs a command through a child `envcloak run` |
+| `request_new_secret` | M2-06 | reserved | the terminal instruction to add a key; takes no value |
+| `usage_summary` | M4 | reserved | spend and usage, listed from M4 |
+| `request_sign_in` | M2b-06 | reserved | a sign-in outcome for a registered target and role |
+| `sign_in_status` | M2b-06 | reserved | an operation's status |
+| `cancel_sign_in` | M2b-06 | reserved | ends an operation |
+| `end_sign_in_session` | M2b-06 | reserved | ends a delivered session |
+| `browser_*` | M2b-08 | reserved | the hosted browser tools of the supervisor's allowlist (SPEC §6.8); no other EnvCloak tool name starts with `browser_` |
+<!-- /reservations -->
+
+**Sign-in and browser tokens** (operation outcomes and tool results, M2b):
+
+<!-- reservations:signin_token -->
+| Token | Task | Status | Use |
+|---|---|---|---|
+| `waiting_for_approval` | M2b-10 | reserved | `request_sign_in` waited its bounded time and the request is still pending |
+| `handoff_required` | M2b-07 | reserved | a CAPTCHA, risk challenge, push or number matching, passkey or unknown state ended the attempt |
+| `credentials_rejected` | M2b-07 | reserved | the app refused the password after its one submission |
+| `code_rejected` | M2b-07 | reserved | the app refused the one-time codes (at most two) |
+| `identity_unverified` | M2b-08 | reserved | the identity check did not name the expected account, tenant and role; nothing is delivered |
+| `unsupported_session_scope` | M2b-08 | reserved | the state is broader than declared, or in a format the adapter does not support |
+| `tool_not_allowed` | M2b-08 | reserved | a browser tool call outside the supervisor's allowlist, or with a refused argument |
+| `cleanup_failed` | M2b-08 | reserved | a delivered context could not be closed |
+| `cleanup_unconfirmed` | M2b-09 | reserved | no reaper confirmed an attempt's teardown |
+| `ended_by_reboot` | M2b-09 | reserved | an unconfirmed attempt's tombstone, cleared because the boot id changed |
+<!-- /reservations -->
