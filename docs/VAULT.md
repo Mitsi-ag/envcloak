@@ -268,7 +268,7 @@ entry  = len(4) | seq(8) | sealed(len) | mac(32)
 - `mac` chains the entries: `keyed_hash(index, "envcloak/v1/audit-chain", previous mac || u64(seq) || sealed)`. The first entry's predecessor is the genesis value `keyed_hash(index, "envcloak/v1/audit-genesis", vault_id)`. A segment's `prev_mac` is the chain value before its first entry, and `header_mac = keyed_hash(index, "envcloak/v1/audit-segment", the header's first 69 bytes)`.
 - Sequence numbers start at 1 and go up by one per entry.
 
-**Records.** `version(1) at_ms(8) kind(1) request_id? grant_id? pid(4) uid(4)? subject_kind? agent? root_pid(4)? root_exe? project? count(4) (item_id(16) slug)... outcome reason? method? count(8)? argv[]`, where `project` is `dir manifest_sha256(32) approved_sha256(32)?`. Kinds: 1 run, 2 approve, 3 deny, 4 revoke, 5 manifest changed, 6 role denied, 7 foreign peer, 8 unlock, 9 lock, 10 proof refused, 11 dropped, 12 log, 13 add, 14 rotate, 15 remove. A record is metadata only. The daemon masks the command line before it builds the record: every value the request binds, with the redactor, then every word a registry key pattern matches (`[envcloak:<slug>]`, `[envcloak:key:<provider>]`). A value under the redactor's 8-byte floor is not looked for, raw or encoded, and one of 8 to 10 bytes is not found inside a longer base64 stream at every alignment (the redactor reports it as partial), so when the request binds either (not empty) the record keeps a fixed placeholder instead of the command line. Strings are capped at 4 KiB, the command line at 16 KiB and 256 arguments, and items at 256, each with a marker saying what was cut; an entry is at most 64 KiB.
+**Records.** `version(1) at_ms(8) kind(1) request_id? grant_id? pid(4) uid(4)? subject_kind? agent? root_pid(4)? root_exe? project? count(4) (item_id(16) slug)... outcome reason? method? count(8)? argv[]`, where `project` is `dir manifest_sha256(32) approved_sha256(32)?`. Kinds: 1 run, 2 approve, 3 deny, 4 revoke, 5 manifest changed, 6 role denied, 7 foreign peer, 8 unlock, 9 lock, 10 proof refused, 11 dropped, 12 log, 13 add, 14 rotate, 15 remove, 16 import, 17 files backup, 18 files restore, 19 recovery confirm, 20 backup, 21 recover; 22 and up are reserved for M2 and M2b ("Reserved for M2 and M2b" below). A record is metadata only. The daemon masks the command line before it builds the record: every value the request binds, with the redactor, then every word a registry key pattern matches (`[envcloak:<slug>]`, `[envcloak:key:<provider>]`). A value under the redactor's 8-byte floor is not looked for, raw or encoded, and one of 8 to 10 bytes is not found inside a longer base64 stream at every alignment (the redactor reports it as partial), so when the request binds either (not empty) the record keeps a fixed placeholder instead of the command line. Strings are capped at 4 KiB, the command line at 16 KiB and 256 arguments, and items at 256, each with a marker saying what was cut; an entry is at most 64 KiB.
 
 **Durability.** An append writes the entry and flushes the segment (`fcntl(F_FULLFSYNC)` on macOS, `fsync` on Linux; `envcloak_sys::sync_file`), then the log's directory, which names the segment, and then the data directory, which names the log's directory, before it returns; a new segment's header is written and flushed before its first entry, and the writer makes the log's directory when it is missing. Both directories are flushed after every entry, never trusted from an earlier flush: a name moved away and back, a directory made anew (ext4 can give it the inode of the one removed), or a directory the vault's creation or an earlier writer made and did not get to flush, is durable only once the directory holding it is flushed after it. That is two more flushes per entry; on an APFS Mac with other builds running, an append's median stayed at about 5 ms and its mean went from about 5 ms to between 5.5 and 9.5 ms. After the flushes the writer checks that the log's directory is still the one it flushed and that the segment's name in it is still the file it wrote; a directory swapped in, even one holding the segment, fails the append. A program that moves the log's directory or a segment away while the directories are flushed, and back before that check, can still leave the entry under a name a crash loses, as it could by deleting the log. Should a flush or the check fail, the append fails and the next one flushes both directories again. A failed write or flush is cut back off the file, so nothing is acknowledged and the next append takes the same sequence number. The daemon writes a covered request's entry this way before it answers; when it cannot, the request is denied (`audit_failed`), nothing is released, and a `once` grant is left unused. Other events that cannot be written (the vault is locked, so there is no key; or the directory is unusable) wait in memory, at most 256 with a count of the ones dropped, and are written at the next unlock or the next write that succeeds.
 
@@ -292,3 +292,75 @@ entry  = len(4) | seq(8) | sealed(len) | mac(32)
 | Restore is atomic: `kill -9` leaves the old or the new vault | `tests/restore_crash.rs` |
 | File backups: ciphertext only, given back byte for byte, any change or another vault's backup refused, purged after 7 days, with the staging files interrupted writes left | `tests/file_backup.rs` |
 | 11, unlocker part: no passphrase, kit or fixture in freed memory | `tests/unlock_probe.rs` |
+
+## Reserved for M2 and M2b
+
+Status: M2 plan decision D-23, written by task M2-01. The vault's numbers that M2 and M2b tasks will add are assigned here before any code uses them, under the rules and statuses of IPC.md's "Reserved for M2 and M2b", which `scripts/check-reservations.py` checks against the code (`AuditKind` in `crates/envcloak-core/src/audit/record.rs`; `ItemClass`, `TableTag` and `FieldTag` in `crates/envcloak-core/src/crypto/aad.rs`). Numbers are never reused.
+
+M2 and M2b change the vault format once: schema version 2, written by M2-07, holds item record v2 (exposure, the rotation flag and the classification's `changed_at`), the `login` item class with typed fields, and the typed, versioned policy records below (plan decision D-08). Every later change to one of those records is a new version of that record, not a schema migration.
+
+**Audit kinds** (go on from 21; 46 to 50 are kept spare, and a task that needs one adds its row):
+
+<!-- reservations:audit_kind -->
+| Number | Token | Task | Status | Use |
+|---|---|---|---|---|
+| 22 | `reveal` | M2-21 | reserved | a terminal reveal on Linux, before the value is written |
+| 23 | `scan_match` | M2-11 | reserved | a `scan.match` call: its purpose and counts, never a candidate |
+| 24 | `mark_exposed` | M2-11 | reserved | items marked "exposed: rotate" |
+| 25 | `backup_v2` | M2-05 | reserved | a file backup v2 committed, with its creator and purpose |
+| 26 | `restore_v2` | M2-05 | reserved | a restore lease opened, before the first chunk |
+| 27 | `agents_config` | M2-08 | reserved | an agent config EnvCloak changed, with its backup |
+| 28 | `migrate_mcp` | M2-20 | reserved | a `migrate-mcp` run and what it rewrote |
+| 29 | `managed_register` | M2-27 | reserved | a managed server registered, updated (a new revision) or removed |
+| 30 | `reclassify` | M2-13 | reserved | an item's classification changed |
+| 31 | `live_refused` | M2-13 | reserved | an approval refused for an unticked live binding |
+| 32 | `standing_create` | M2-15 | reserved | a standing approval created |
+| 33 | `standing_revoke` | M2-15 | reserved | standing approvals revoked |
+| 34 | `standing_grant` | M2-15 | reserved | a session grant minted from a standing approval, before any value leaves |
+| 35 | `login_add` | M2b-03 | reserved | a login item added |
+| 36 | `login_replace` | M2b-03 | reserved | a login field replaced, with a proof |
+| 37 | `signin_target` | M2b-05 | reserved | a sign-in target added, edited or removed |
+| 38 | `signin_approve` | M2b-05 | reserved | a sign-in approval and its authorization |
+| 39 | `signin_intent` | M2b-09 | reserved | before any credential use in an attempt |
+| 40 | `signin_outcome` | M2b-09 | reserved | after an attempt, with its result class |
+| 41 | `signin_publish` | M2b-05 | reserved | the publication decision for an operation |
+| 42 | `signin_end` | M2b-05 | reserved | an operation cancelled or its session ended |
+| 43 | `managed_launch` | M2-27 | reserved | a managed launch check that refused, with the old and new identity metadata |
+| 44 | `standing_confirm` | M2-15 | reserved | `envcloak standing confirm`, with a proof |
+| 45 | `signin_cleanup` | M2b-09 | reserved | a worker teardown confirmed, left unconfirmed, or cleared by a reboot |
+<!-- /reservations -->
+
+**Item classes** (`items.class` and the associated data's `item_class`):
+
+<!-- reservations:item_class -->
+| Number | Class | Task | Status | Use |
+|---|---|---|---|---|
+| 4 | `login` | M2-07 | reserved | login items: username, password, TOTP enrollment and adapter key, which only the sign-in worker's lease opens |
+<!-- /reservations -->
+
+**Associated-data tags** (CRYPTO.md "Associated data"):
+
+<!-- reservations:table_tag -->
+| Number | Table | Task | Status | Use |
+|---|---|---|---|---|
+| 10 | `file_backup_v2` | M2-05 | reserved | the records of a file backup v2 |
+<!-- /reservations -->
+
+<!-- reservations:field_tag -->
+| Number | Field | Task | Status | Use |
+|---|---|---|---|---|
+| 14 | `file_backup_v2_key` | M2-05 | reserved | a file backup v2's own key, sealed under `backup` |
+| 15 | `file_backup_v2_metadata` | M2-05 | reserved | its sealed metadata: per file the display path, mode, size and SHA-256, and the creator, purpose and results the daemon records |
+| 16 | `file_backup_v2_chunk` | M2-05 | reserved | one chunk of at most 1 MiB, bound to the file index, chunk index and final flag |
+<!-- /reservations -->
+
+**Policy record kinds** (`policies.sealed`; each record also carries its own version):
+
+<!-- reservations:policy_kind -->
+| Number | Kind | Task | Status | Use |
+|---|---|---|---|---|
+| 1 | `standing_approval` | M2-07 | reserved | a standing approval (M2-15), with a slot for the signature M5 adds |
+| 2 | `signin_target` | M2-07 | reserved | a sign-in target (M2b-05) |
+| 3 | `managed_server` | M2-07 | reserved | a managed MCP server with its registered launch or origin (M2-27) |
+| 4 | `standing_set` | M2-07 | reserved | the standing set's generation and digest, if M2-07 keeps it as a policy row |
+<!-- /reservations -->
