@@ -378,6 +378,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `signin_driver` | `NeedCode` | M2b-07 | reserved | a one-time-code step, with its time step |
 | `signin_driver` | `Captured` | M2b-07 | reserved | the declared state after login |
 | `signin_driver` | `Stopped` | M2b-07 | reserved | the attempt stopped, with its reason |
+| `signin_driver` | `Fill` | M2b-07 | reserved | daemon to driver: the username, the password or a one-time code for the step the driver reported, one at a time (SPEC §4.4, §6.8) |
 | `signin_reaper` | `Stop` | M2b-07 | reserved | daemon to reaper: tear the worker down |
 | `signin_reaper` | `Status` | M2b-07 | reserved | reaper to daemon: teardown progress |
 <!-- /reservations -->
