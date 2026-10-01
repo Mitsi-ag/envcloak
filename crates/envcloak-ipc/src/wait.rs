@@ -33,9 +33,12 @@
 //! never read from the requesting process's terminal.
 //!
 //! **Bounded.** No call of a wait is answered later than its limit, the
-//! deadline plus [`CALL_GRACE`] ([`Wait::limit`]), whatever the daemon
-//! does: each call is given only the time left to the limit, for its
-//! connect, its writes and each read ([`Client::connect_within`]); none is
+//! deadline plus [`CALL_GRACE`] ([`Wait::limit`]): each call is given
+//! only the time left to the limit, one instant for the whole call
+//! ([`Client::connect_by`]): the connect gets the time left, and each
+//! write and each read waits for the socket for at most the time then
+//! left, so a daemon that answers nothing, sends its answer a byte at a
+//! time, or reads the request slowly holds the call no longer; none is
 //! made once the limit has passed; and an answer read after it is dropped
 //! unused, a covered one's values wiped with it, and the wait ends
 //! [`Waited::Unanswered`], so nothing is started late.
@@ -400,10 +403,11 @@ pub trait Clock {
 }
 
 /// Each call on a connection of its own, verified as
-/// [`Client::connect`] verifies it, bounded by the time the wait has left
-/// ([`Client::connect_within`]) and closed when the answer is read: no
-/// connection stays open between two calls. Whether this process is
-/// traced is read from the kernel ([`envcloak_sys::tracer_present`]).
+/// [`Client::connect`] verifies it, bounded as a whole by the instant the
+/// time the wait has left ends ([`Client::connect_by`]), and closed when
+/// the answer is read: no connection stays open between two calls.
+/// Whether this process is traced is read from the kernel
+/// ([`envcloak_sys::tracer_present`]).
 #[derive(Debug)]
 pub struct Fresh<'a> {
     pub paths: &'a RunPaths,
@@ -416,12 +420,21 @@ impl Transport for Fresh<'_> {
     }
 
     fn request(&mut self, within: Duration) -> Result<RunAnswer, ClientError> {
-        Client::connect_within(self.paths, within)?.run_request(self.params)
+        Client::connect_by(self.paths, by(within)?)?.run_request(self.params)
     }
 
     fn poll(&mut self, id: &PendingId, within: Duration) -> Result<PendingState, ClientError> {
-        Client::connect_within(self.paths, within)?.pending_state(id)
+        Client::connect_by(self.paths, by(within)?)?.pending_state(id)
     }
+}
+
+/// The instant `within` from now.
+fn by(within: Duration) -> Result<Instant, ClientError> {
+    Instant::now()
+        .checked_add(within)
+        .ok_or(ClientError::Frame(FrameError::Io(
+            std::io::ErrorKind::InvalidInput,
+        )))
 }
 
 /// The monotonic clock, and `std::thread::sleep`.

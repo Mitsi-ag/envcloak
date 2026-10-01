@@ -734,6 +734,145 @@ fn a_silent_daemon_holds_a_wait_no_longer_than_its_limit() {
     );
 }
 
+// ------------------------------------------- waits on real connections
+
+/// A run directory under a test home with a listener on its socket, where
+/// `serve` takes the connections on a thread of its own; and the wait of
+/// `wait` a waiter makes there over real connections ([`Fresh`]), on the
+/// system's clock, asking `params`. Returns how the wait ended (as text)
+/// and how long it took; a wait still going after 60 seconds fails the
+/// test. The server thread is left to end with the test.
+fn wait_on_peer(
+    wait: Duration,
+    params: envcloak_ipc::proto::RunRequestParams,
+    serve: impl FnOnce(std::os::unix::net::UnixListener) + Send + 'static,
+) -> (String, Duration) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use envcloak_ipc::RunPaths;
+    use envcloak_ipc::wait::{Fresh, SystemClock};
+
+    let home = envcloak_testkit::TestHome::new();
+    let p = RunPaths::under(home.root().join("run").join("envcloak")).unwrap();
+    std::fs::create_dir_all(&p.dir).unwrap();
+    std::fs::set_permissions(&p.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let l = UnixListener::bind(&p.socket).unwrap();
+    std::thread::spawn(move || serve(l));
+    let (tx, rx) = mpsc::channel();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let mut t = Fresh {
+            paths: &p,
+            params: &params,
+        };
+        let got = wait_for_run(&mut t, &mut SystemClock::new(), wait, &mut |_| {});
+        let _ = tx.send(format!("{got:?}"));
+    });
+    let got = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait outlasted its limit by far");
+    let took = started.elapsed();
+    drop(home);
+    (got, took)
+}
+
+fn run_params(argv: Vec<String>) -> envcloak_ipc::proto::RunRequestParams {
+    envcloak_ipc::proto::RunRequestParams {
+        manifest: "/nowhere/envcloak.toml".to_owned(),
+        profile: None,
+        refs: Vec::new(),
+        env_file: None,
+        argv,
+        claims: Vec::new(),
+    }
+}
+
+/// The bytes of the response to request 1 that answers `a`.
+fn answer_bytes(a: &RunAnswer) -> Vec<u8> {
+    let f = envcloak_ipc::proto::result_frame(1, a).unwrap();
+    let mut out = Vec::new();
+    f.write_to(&mut out).unwrap();
+    out
+}
+
+/// The slack a loaded test machine may add to a wait's limit.
+const SLACK: Duration = Duration::from_secs(3);
+
+/// A daemon that reads the request and then sends a well-formed answer
+/// one byte at a time, header and body alike, a byte every 250 ms, holds a
+/// wait of one second no longer than its limit (the deadline plus
+/// CALL_GRACE): every read waits only for the time left to the limit, not
+/// a whole timeout again for each byte, and the wait ends `Unanswered`.
+///
+/// Mutation: set the call's timeouts once at connect and read and write
+/// blocking (`Client::call` on the stream itself, as before): each byte
+/// arrives within the timeout, the answer is read whole about 20 seconds
+/// in, and this fails on the time taken.
+#[test]
+fn a_daemon_sending_a_byte_at_a_time_holds_a_wait_no_longer_than_its_limit() {
+    use std::io::Write;
+    let answer = answer_bytes(&RunAnswer::decided(pending("ABCDEFGH")));
+    assert!(answer.len() > 60, "{}", answer.len());
+    let (got, took) = wait_on_peer(
+        Duration::from_secs(1),
+        run_params(vec!["./emit".to_owned()]),
+        move |l| {
+            let (mut s, _) = l.accept().unwrap();
+            // The request, whole, then the answer a byte at a time.
+            drop(envcloak_ipc::Frame::read_from(&mut s).unwrap());
+            for b in &answer {
+                if s.write_all(&[*b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(ms(250));
+            }
+            std::thread::sleep(Duration::from_secs(60));
+        },
+    );
+    assert_eq!(got, "Ok(Unanswered)");
+    let limit = Duration::from_secs(1) + CALL_GRACE;
+    assert!(took >= limit - ms(100), "{took:?}");
+    assert!(took < limit + SLACK, "{took:?}");
+}
+
+/// A daemon that reads the request slowly, 4 KiB every 100 ms, and never
+/// answers, holds a wait of one second no longer than its limit when the
+/// request is too large for the socket's buffers (an argv of 900,000
+/// bytes): every write waits only for the time left to the limit, and the
+/// wait ends `Unanswered`.
+///
+/// Mutation: set the call's timeouts once at connect and read and write
+/// blocking (`Client::call` on the stream itself, as before): each write
+/// makes progress within the timeout, the request is sent whole about 20
+/// seconds in and its answer then waited for, and this fails on the time
+/// taken.
+#[test]
+fn a_daemon_reading_slowly_holds_a_wait_no_longer_than_its_limit() {
+    use std::io::Read;
+    let (got, took) = wait_on_peer(
+        Duration::from_secs(1),
+        run_params(vec!["a".repeat(900_000)]),
+        |l| {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => std::thread::sleep(ms(100)),
+                }
+            }
+            std::thread::sleep(Duration::from_secs(60));
+        },
+    );
+    assert_eq!(got, "Ok(Unanswered)");
+    let limit = Duration::from_secs(1) + CALL_GRACE;
+    assert!(took >= limit - ms(100), "{took:?}");
+    assert!(took < limit + SLACK, "{took:?}");
+}
+
 // ---------------------------------------------- five waiters, one root
 
 fn inst(pid: i32) -> ProcessInstance {

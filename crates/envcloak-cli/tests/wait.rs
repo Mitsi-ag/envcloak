@@ -551,6 +551,105 @@ fn a_wait_on_a_silent_daemon_ends_by_its_limit() {
     assert!(!marker.exists(), "the command was started");
 }
 
+/// The daemon's runtime directory under `home`, made as the daemon makes
+/// it (0700), and the socket path in it, for a peer standing in for the
+/// daemon.
+fn stand_in_socket(home: &TestHome) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = envcloak_testkit::daemon_run_dir(home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    envcloak_testkit::daemon_socket(home)
+}
+
+/// `envcloak run --wait 1s` of a project that does not exist, whose
+/// command would create `marker`; its output, and how long it took (given
+/// up at 90 seconds).
+fn wait_one_second(home: &TestHome, marker: &std::path::Path) -> (Output, Duration) {
+    let mut cmd = cli_command(
+        home,
+        &[
+            "run",
+            "--wait",
+            "1s",
+            "--manifest",
+            "/nowhere/envcloak.toml",
+            "--",
+            "touch",
+            marker.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let started = Instant::now();
+    let out = finish_within_child(cmd.spawn().unwrap(), Duration::from_secs(90));
+    (out, started.elapsed())
+}
+
+/// The longest `run --wait 1s` may take: its deadline, 5 seconds for a
+/// last answer, and slack for starting the process on a loaded machine.
+const ONE_SECOND_WAIT_BOUND: Duration = Duration::from_secs(10);
+
+/// A daemon that reads the request and then sends a well-formed answer a
+/// byte at a time, header and body alike, a byte every 500 ms, holds `run
+/// --wait 1s` no longer than its limit (the deadline and 5 seconds for a
+/// last answer): each read of the run's call waits only for the time left
+/// to that limit, not a whole timeout again for each byte. The run exits
+/// 125 with `daemon_unavailable` and starts nothing.
+///
+/// Mutation: set the call's timeouts once at connect and read and write
+/// blocking (`Client::call` on the stream itself): each byte arrives
+/// within the timeout, the answer is read whole about 45 seconds in, and
+/// this fails on the time taken.
+#[test]
+fn a_wait_on_a_daemon_sending_a_byte_at_a_time_ends_by_its_limit() {
+    use std::os::unix::net::UnixListener;
+
+    use envcloak_ipc::proto::{RunAnswer, result_frame};
+    use envcloak_ipc::view::DecisionView;
+
+    let home = TestHome::new();
+    let l = UnixListener::bind(stand_in_socket(&home)).unwrap();
+    let mut answer = Vec::new();
+    result_frame(
+        1,
+        &RunAnswer::decided(DecisionView::Pending {
+            request: "ABCDEFGH".to_owned(),
+        }),
+    )
+    .unwrap()
+    .write_to(&mut answer)
+    .unwrap();
+    assert!(answer.len() > 60, "{}", answer.len());
+    std::thread::spawn(move || {
+        while let Ok((mut s, _)) = l.accept() {
+            let answer = answer.clone();
+            std::thread::spawn(move || {
+                if envcloak_ipc::Frame::read_from(&mut s).is_err() {
+                    return;
+                }
+                for b in answer {
+                    if s.write_all(&[b]).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            });
+        }
+    });
+    let files = outside_dir();
+    let marker = files.path().join("started");
+    let (out, took) = wait_one_second(&home, &marker);
+    let e = stderr(&out);
+    assert_eq!(out.status.code(), Some(125), "{e}");
+    assert_eq!(
+        e,
+        "envcloak: daemon_unavailable: the daemon did not answer within the wait (1s, and 5s \
+         for a last answer); nothing was started\n"
+    );
+    assert!(took < ONE_SECOND_WAIT_BOUND, "{took:?}");
+    assert!(!marker.exists(), "the command was started");
+}
+
 /// The wait ends on SIGINT, as any program does (a shell reports 130),
 /// with nothing held open; and on a denial, which exits 125 with
 /// `approval_denied` naming the request.
