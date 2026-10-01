@@ -1114,15 +1114,23 @@ mod tests {
     /// until its standard input is closed, so it is still there when the
     /// handler asks about it.
     fn sender(sig: &str, new_session: bool) -> std::process::Child {
+        sh(
+            &[
+                "-c",
+                "kill -\"$1\" \"$2\" && { read _ || :; }",
+                "sender",
+                sig,
+                &std::process::id().to_string(),
+            ],
+            new_session,
+        )
+    }
+
+    /// `/bin/sh <args>` with a pipe for its standard input, in this
+    /// process's session or (`new_session`) in a session of its own.
+    fn sh(args: &[&str], new_session: bool) -> std::process::Child {
         let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args([
-            "-c",
-            "kill -\"$1\" \"$2\" && { read _ || :; }",
-            "sender",
-            sig,
-            &std::process::id().to_string(),
-        ])
-        .stdin(std::process::Stdio::piped());
+        cmd.args(args).stdin(std::process::Stdio::piped());
         if new_session {
             use std::os::unix::process::CommandExt;
             // SAFETY: setsid is async-signal-safe and touches no memory of
@@ -1192,9 +1200,21 @@ mod tests {
         }
     }
 
+    /// Starts `sh -c 'read _'`, in this process's session or
+    /// (`new_session`) in a session of its own: a live process, there until
+    /// its standard input is closed ([`release`]).
+    #[cfg(target_os = "macos")]
+    fn idle(new_session: bool) -> std::process::Child {
+        sh(&["-c", "read _ || :"], new_session)
+    }
+
     /// What the handler reads from a `siginfo_t` on macOS: a sender in this
-    /// process's session, or one that is gone (a pid no process has), and
-    /// not a live sender elsewhere (`launchd`) or none.
+    /// process's session (itself, or a child that stayed there), or one
+    /// that is gone (a pid no process has), and not a live sender in a
+    /// session of its own or none. The live sender elsewhere is a child
+    /// that left this session, not `launchd`: a test started by `launchd`
+    /// (`launchctl submit`, a CI runner's service) is in its session,
+    /// where pid 1 counts as a sender in this session, as it should.
     #[cfg(target_os = "macos")]
     #[test]
     fn only_a_sender_in_this_session_or_gone_counts_as_sent_by_a_process() {
@@ -1202,12 +1222,23 @@ mod tests {
         let relay = SignalRelay::install(&[libc::SIGUSR1]).unwrap();
         // SAFETY: getpid has no preconditions.
         let me = unsafe { libc::getpid() };
-        for (pid, by_process) in [(me, true), (i32::MAX, true), (0, false), (1, false)] {
+        let here = idle(false);
+        let elsewhere = idle(true);
+        let pid_of = |c: &std::process::Child| i32::try_from(c.id()).unwrap();
+        for (pid, by_process) in [
+            (me, true),
+            (pid_of(&here), true),
+            (i32::MAX, true),
+            (pid_of(&elsewhere), false),
+            (0, false),
+        ] {
             // SAFETY: siginfo_t is plain data; zero is a valid value.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             info.si_pid = pid;
             assert_eq!(sent_by_process(&info), by_process, "si_pid {pid}");
         }
+        release(here);
+        release(elsewhere);
         drop(relay);
     }
 
