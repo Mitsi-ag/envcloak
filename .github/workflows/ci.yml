@@ -20,8 +20,10 @@ name: CI
 # | Manual       | everything                                  | the same               |
 #
 # On Linux the agent hosts run with loopback only (`unshare -rn`). A main
-# run is never cancelled by the next merge: only pull-request runs cancel
-# their predecessors.
+# run is never cancelled by the next merge, nor replaced while it waits:
+# runs other than a pull request's each get a concurrency group of their
+# own (GitHub cancels a pending run when another joins its group), and
+# only pull-request runs cancel their predecessors.
 on:
   push:
     branches: [main]
@@ -34,7 +36,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -290,7 +292,8 @@ jobs:
       - run: cargo check --workspace --all-targets --all-features --locked
 
   # Which of the M2 agent jobs a pull request needs, from the paths it
-  # changes. Every other event runs them all.
+  # changes (scripts/ci-paths.py, which checks its own table of paths
+  # first). Every other event runs them all.
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -305,6 +308,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
+          python3 scripts/ci-paths.py --self-test
           if [ "$EVENT" != "pull_request" ]; then
             echo "gates=true" >> "$GITHUB_OUTPUT"
             echo "agents=true" >> "$GITHUB_OUTPUT"
@@ -312,19 +316,7 @@ jobs:
           fi
           changed="$(git diff --name-only "$BASE"...HEAD)"
           printf '%s\n' "$changed"
-          harness='^(crates/envcloak-e2e/agents/|crates/envcloak-testkit/src/(agents|transcripts)\.rs|crates/envcloak-testkit/src/bin/ec-model\.rs|scripts/install-agent-hosts\.py|\.github/workflows/ci\.yml)'
-          gates="$harness|^crates/envcloak-e2e/tests/m2b?_story/"
-          agents="$harness|^crates/envcloak-agents/|^crates/envcloak-mcp/|^integrations/"
-          if printf '%s\n' "$changed" | grep -Eq "$gates"; then
-            echo "gates=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "gates=false" >> "$GITHUB_OUTPUT"
-          fi
-          if printf '%s\n' "$changed" | grep -Eq "$agents"; then
-            echo "agents=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "agents=false" >> "$GITHUB_OUTPUT"
-          fi
+          printf '%s\n' "$changed" | python3 scripts/ci-paths.py | tee -a "$GITHUB_OUTPUT"
 
   # The story steps the task being landed adds (M2 plan §6): the m2_story
   # target, with the pinned Claude Code and Codex from the host cache, on
@@ -350,7 +342,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../agent-hosts
-          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/versions.toml', 'scripts/install-agent-hosts.py') }}
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'scripts/install-agent-hosts.py') }}
       - name: Install and verify the pinned tier-1 hosts
         run: python3 scripts/install-agent-hosts.py --tier 1
       - name: Allow unprivileged user namespaces
@@ -398,7 +390,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../agent-hosts
-          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/versions.toml', 'scripts/install-agent-hosts.py') }}
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'scripts/install-agent-hosts.py') }}
       - name: Install and verify the pinned hosts (tier 1 and tier 2)
         run: python3 scripts/install-agent-hosts.py --tier all
       # Claude Code's Bash sandbox needs bubblewrap and socat on Linux
@@ -422,6 +414,19 @@ jobs:
         run: |
           unshare --user --map-root-user --net -- sh -ec \
             "ip link set lo up; exec cargo test --locked --offline -p envcloak-e2e $TESTS -- --nocapture --test-threads=1"
+      # The sandbox rows of K-01 again outside a user namespace, as a
+      # person's machine runs them: Claude Code's Linux sandbox applies its
+      # seccomp filter (the one that blocks Unix sockets) through a helper
+      # that writes /proc/self/uid_map, which it cannot do inside the user
+      # namespace above. Root makes a network namespace with loopback only,
+      # and the tests run in it as the runner's own user.
+      - name: Agent host sandboxes outside a user namespace, loopback only (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
+            "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
+             cargo test --locked --offline -p envcloak-e2e --test agent_hosts -- --nocapture --test-threads=1 \
+             --exact claude_code_sandbox_reaches_the_socket codex_sandbox_reaches_the_socket_and_nothing_else"
       - name: Agent hosts (macOS)
         if: runner.os == 'macOS'
         run: cargo test --locked -p envcloak-e2e $TESTS -- --nocapture --test-threads=1
