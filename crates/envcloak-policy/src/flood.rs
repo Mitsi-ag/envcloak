@@ -3,7 +3,10 @@
 //! are denied outright after repeated denials.
 //!
 //! - At most [`MAX_PENDING_PER_ROOT`] pending requests per subject root
-//!   and [`MAX_PENDING`] per daemon; a request beyond a cap is denied.
+//!   and [`MAX_PENDING`] per daemon. A request beyond a cap opens nothing
+//!   and is not denied: the grant store answers it
+//!   [`crate::Decision::TooManyPending`] (reason `pending_per_root` or
+//!   `pending_total`), which a waiter asks again after a pause.
 //! - A request identical to one denied in the last [`DENIAL_WINDOW`] is
 //!   denied without a prompt. Identity is a fingerprint of the root, the
 //!   project, the bindings, the mode and the command line.
