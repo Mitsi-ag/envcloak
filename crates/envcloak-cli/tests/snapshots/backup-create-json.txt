@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+{"bytes":"<BYTES>","created_secs":"<SECS>","file_name":"<BACKUP>","items":4,"path":"<DATA>/backups/<BACKUP>"}
+--- stderr

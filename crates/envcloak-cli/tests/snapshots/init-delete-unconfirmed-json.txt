@@ -1,0 +1,5 @@
+exit: 1
+--- stdout
+{"delete":{"backup":null,"gitignore":"unchanged","kept":[],"project_dir":"<ROOT>/acme-web","removed":[],"rewritten":[],"skipped":[],"unchanged":[],"verify":{"files":[{"covered":true,"entries":[{"line":1,"name":"OPENAI_API_KEY","skipped":null,"status":"stored"},{"line":2,"name":"STRIPE_SECRET_KEY","skipped":null,"status":"stored"},{"line":3,"name":"DATABASE_URL","skipped":null,"status":"stored"},{"line":4,"name":"PORT","skipped":"too_short","status":"left_out"},{"line":5,"name":"NODE_ENV","skipped":"not_secret","status":"left_out"}],"file":".env"},{"covered":true,"entries":[{"line":1,"name":"SHORT_TOKEN","skipped":"guessable","status":"left_out"}],"file":".env.short"}],"recovery_confirmed":false,"resolves":true}},"import":null}
+--- stderr
+envcloak: recovery_kit_unconfirmed: the Recovery Kit is not confirmed: run `envcloak recovery confirm` first, so a forgotten passphrase cannot lose what the files held. Nothing was deleted

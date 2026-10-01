@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+{"approvals":{"grants":0,"pending":0,"proof_failures":0,"proof_wait_secs":0},"audit":{"anchor_failed":false,"dropped":0,"head_seq":1,"open":true,"queued":0,"unanchored":1},"cli":{"hardened":"<H>","hardening":"<HARDENING>"},"daemon":{"hardened":"<H>","hardening":"<HARDENING>","identity":"unverified","pid":"<PID>","runtime_dir_fallback":false,"state":"running","version":"<VER>"},"lock":{"idle_limit_secs":28800,"idle_remaining_secs":"<SECS>","last_reason":null},"vault":{"busy":false,"failed_unlocks":0,"integrity":"ok","read_only":false,"state":"unlocked","unavailable":null}}
+--- stderr

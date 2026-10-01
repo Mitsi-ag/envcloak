@@ -1,0 +1,7 @@
+exit: 0
+--- stdout
+{"classification":"live","field":"value","grants_ended":0,"length":"ok","prior_count":1,"reclassified_from":null,"slug":"openai/acme-web"}
+--- stderr
+Rotate openai/acme-web#value (openai/acme-web; live key).
+  The current value becomes the newest prior value; the vault keeps 3 at most (0 now).
+  Grants that bind this item stay in force: 0, unless the new value is classified otherwise (test, live), which ends them.

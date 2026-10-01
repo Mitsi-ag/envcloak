@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+{"committed":false,"items":[],"projects":[{"conflicts":[],"dir":"<ROOT>/acme-web","files":[{"entries":[{"item":null,"line":1,"name":"OPENAI_API_KEY","skipped":null},{"item":null,"line":2,"name":"STRIPE_SECRET_KEY","skipped":null}],"error":null,"error_line":null,"file":".env.example","hard_linked":false,"profile":null,"template":true}],"gitignore":null,"manifest":null,"name":"acme-web","resolves":null}],"root":"<ROOT>","skipped":[]}
+--- stderr

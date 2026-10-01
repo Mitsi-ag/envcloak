@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+{"ambiguous":false,"detected":null,"field":"value","item":{"account":{"email":"dev@acme.example","label":null,"org_id":null},"allow_short":false,"class":"secret","classification":"unknown","created_secs":"<SECS>","env_hint":"DATABASE_URL","expires_secs":null,"fields":[{"created_secs":"<SECS>","name":"value","prior_count":0,"updated_secs":"<SECS>"}],"id":"<ULID>","provider":null,"rotated_secs":null,"slug":"misc/extra","title":"misc/extra","updated_secs":"<SECS>"},"length":"ok"}
+--- stderr

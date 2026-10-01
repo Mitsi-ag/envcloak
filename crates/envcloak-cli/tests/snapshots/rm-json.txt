@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+{"backup":"[not shown: looks like a key or token]","grants_ended":0,"slug":"misc/extra"}
+--- stderr
+Remove misc/extra (misc/extra; not classified) and its values from the vault.
+  fields: value
+  An encrypted backup of the vault is written first, so `envcloak recover --backup <file>` can bring it back.
+  Grants that bind this item end: 0.

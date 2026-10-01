@@ -1,0 +1,246 @@
+$ envcloak --help
+exit: 0
+--- stdout
+usage:
+  envcloak vault create [--passphrase-fd N] [--kit-fd N] [--kdf-memory SIZE]
+  envcloak unlock [--passphrase-fd N]
+  envcloak lock
+  envcloak status [--json]
+  envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
+  envcloak daemon uninstall
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+  envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
+  envcloak deny <REQUEST>
+  envcloak grants list [--json]
+  envcloak grants revoke <GRANT> | --all
+  envcloak audit verify [--json]
+  envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
+  envcloak ls [--long] [--json]
+  envcloak show <slug> [--json]
+  envcloak ref NAME=<slug>[#field] [--profile NAME] [--json]
+  envcloak check [--json]
+  envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
+  envcloak rm <slug> [--passphrase-fd N] [--json]
+  envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+  envcloak init --undo <ID> [--passphrase-fd N] [--json]
+  envcloak import --scan <dir> [--yes] [--json]
+  envcloak recovery confirm [--kit-fd N] [--json]
+  envcloak backup create [--json]
+  envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
+--- stderr
+$ envcloak --version
+exit: 0
+--- stdout
+envcloak <VER>
+--- stderr
+$ envcloak no-such-command
+exit: 2
+--- stdout
+--- stderr
+envcloak: unknown command
+usage:
+  envcloak vault create [--passphrase-fd N] [--kit-fd N] [--kdf-memory SIZE]
+  envcloak unlock [--passphrase-fd N]
+  envcloak lock
+  envcloak status [--json]
+  envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
+  envcloak daemon uninstall
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+  envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
+  envcloak deny <REQUEST>
+  envcloak grants list [--json]
+  envcloak grants revoke <GRANT> | --all
+  envcloak audit verify [--json]
+  envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
+  envcloak ls [--long] [--json]
+  envcloak show <slug> [--json]
+  envcloak ref NAME=<slug>[#field] [--profile NAME] [--json]
+  envcloak check [--json]
+  envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
+  envcloak rm <slug> [--passphrase-fd N] [--json]
+  envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+  envcloak init --undo <ID> [--passphrase-fd N] [--json]
+  envcloak import --scan <dir> [--yes] [--json]
+  envcloak recovery confirm [--kit-fd N] [--json]
+  envcloak backup create [--json]
+  envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
+$ envcloak vault
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak vault create [--passphrase-fd N] [--kit-fd N] [--kdf-memory SIZE (64MiB to 4GiB)]
+$ envcloak vault create --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak vault create [--passphrase-fd N] [--kit-fd N] [--kdf-memory SIZE (64MiB to 4GiB)]
+$ envcloak unlock --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak unlock [--passphrase-fd N]
+$ envcloak lock --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak lock
+$ envcloak status --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak status [--json]
+$ envcloak daemon
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
+       envcloak daemon uninstall
+$ envcloak daemon install --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
+       envcloak daemon uninstall
+$ envcloak run --help
+exit: 0
+--- stdout
+usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+--- stderr
+$ envcloak run
+exit: 2
+--- stdout
+--- stderr
+envcloak: run needs a command: envcloak run ... -- <cmd...>
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+$ envcloak run --bogus -- true
+exit: 2
+--- stdout
+--- stderr
+envcloak: unknown option; see envcloak run --help
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] -- <cmd...>
+$ envcloak approve
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak approve <REQUEST> [--once | --for DURATION (30s to 24h)] [--live NAME]... [--passphrase-fd N]
+$ envcloak deny
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak deny <REQUEST>
+$ envcloak grants
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak grants list [--json]
+       envcloak grants revoke <GRANT> | --all
+$ envcloak grants revoke
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak grants list [--json]
+       envcloak grants revoke <GRANT> | --all
+$ envcloak audit
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak audit verify [--json]
+$ envcloak add --help
+exit: 0
+--- stdout
+usage: envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
+       the value is typed at a hidden prompt, or piped in with --stdin; never an argument
+--- stderr
+$ envcloak add --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: unknown or repeated option
+envcloak: usage: envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
+       the value is typed at a hidden prompt, or piped in with --stdin; never an argument
+$ envcloak ls --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak ls [--long] [--json]
+$ envcloak show
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak show <slug> [--json]
+$ envcloak ref --help
+exit: 0
+--- stdout
+usage: envcloak ref NAME=<slug>[#field] [--profile NAME] [--json]
+--- stderr
+$ envcloak ref
+exit: 2
+--- stdout
+--- stderr
+envcloak: ref needs NAME=<slug>[#field]
+envcloak: usage: envcloak ref NAME=<slug>[#field] [--profile NAME] [--json]
+$ envcloak check --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak check [--json]
+$ envcloak rotate
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
+       the new value is typed at a hidden prompt, or piped in with --stdin; never an argument
+$ envcloak rm
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak rm <slug> [--passphrase-fd N] [--json]
+$ envcloak init --help
+exit: 0
+--- stdout
+usage: envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+       envcloak init --undo <ID> [--passphrase-fd N] [--json]
+--- stderr
+$ envcloak init --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+       envcloak init --undo <ID> [--passphrase-fd N] [--json]
+$ envcloak import --help
+exit: 0
+--- stdout
+usage: envcloak import --scan <dir> [--yes] [--json]
+--- stderr
+$ envcloak import
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak import --scan <dir> [--yes] [--json]
+$ envcloak recovery --help
+exit: 0
+--- stdout
+usage: envcloak recovery confirm [--kit-fd N] [--json]
+--- stderr
+$ envcloak recovery
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak recovery confirm [--kit-fd N] [--json]
+$ envcloak backup
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak backup create [--json]
+$ envcloak recover --help
+exit: 0
+--- stdout
+usage: envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+--- stderr
+$ envcloak recover
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
