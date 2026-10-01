@@ -403,9 +403,12 @@ fn a_y_typed_into_the_waiting_terminal_approves_nothing() {
 ///
 /// Mutation: hold the connection while waiting (poll on one connection
 /// kept open): the waiter's connections are not opened and closed per
-/// poll and this fails. Mutation: connect once more before the wait (with
-/// the ordinary call timeout, as `run` without `--wait` does): one
-/// connection more than the steps is opened and this fails.
+/// poll and this fails. Mutation: connect once more before the wait, with
+/// the ordinary call timeout, and hold that connection while the request
+/// is built, as the run did: one connection more than the steps is opened
+/// and this fails. (A connection closed at once can be gone before the
+/// daemon identifies its peer, and is then not in the trace;
+/// `a_wait_on_a_silent_daemon_ends_by_its_limit` counts it.)
 #[test]
 fn a_waiting_run_holds_no_connection_between_polls() {
     let f = Fixture::with_env(&[(envcloak_sys::testing::IDLE_CONNECTION_MS, "2000")]);
