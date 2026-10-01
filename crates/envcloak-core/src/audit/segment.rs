@@ -28,10 +28,11 @@
 //!   noticing; entries after it are the unanchored tail.
 //!
 //! [`AuditWriter::append`] writes one frame and flushes it with
-//! [`envcloak_sys::sync_file`] (`F_FULLFSYNC` on macOS) before it returns:
-//! the entry is durable, in a segment the log's directory still names,
-//! when the call succeeds, and a failed call leaves the segment as it was,
-//! so the caller can deny what the entry was for.
+//! [`envcloak_sys::sync_file`] (`F_FULLFSYNC` on macOS), then the log's
+//! directory and the data directory that names it, before it returns: the
+//! entry is durable, in a segment the log's directory still names, when
+//! the call succeeds, and a failed call leaves the segment as it was, so
+//! the caller can deny what the entry was for.
 
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -423,16 +424,6 @@ pub struct AuditWriter {
     current: Option<Current>,
     io: Box<dyn AuditIo>,
     max_segment: u64,
-    /// The log's directory (device and inode) this writer last flushed the
-    /// directory that names it for. Every writer starts with none and
-    /// flushes that directory before its first append, whether or not it
-    /// made the log's directory: `ensure_dirs` makes it for a new vault,
-    /// and an earlier writer may have made it and failed, or crashed,
-    /// before its flush (Codex F-64). It flushes it again before an append
-    /// whenever the log's directory is another one than this: moved away
-    /// and made anew, by this writer or by another program (Codex F-64
-    /// follow-up). Set only when the flush succeeds.
-    parent_synced: Option<(u64, u64)>,
 }
 
 impl core::fmt::Debug for AuditWriter {
@@ -506,7 +497,6 @@ impl AuditWriter {
             current: None,
             io,
             max_segment,
-            parent_synced: None,
         };
         if let Some(a) = anchor {
             if a.seq >= writer.next_seq {
@@ -561,7 +551,9 @@ impl AuditWriter {
 
     /// Appends `r` as the next entry and returns its sequence number. The
     /// entry is durable when this returns: written and flushed with
-    /// `F_FULLFSYNC` on macOS, `fsync` on Linux.
+    /// `F_FULLFSYNC` on macOS, `fsync` on Linux, and after it the log's
+    /// directory, which names its segment, and the data directory, which
+    /// names the log's directory, both flushed on every append.
     ///
     /// # Errors
     /// Nothing was acknowledged: the segment is as it was (a failed write
@@ -583,15 +575,7 @@ impl AuditWriter {
                     .sync(&cur.file)
                     .map_err(|_| AuditErrorKind::Sync.into())
             })
-            .and_then(|()| {
-                // The segment was moved out of the log while the entry was
-                // written: the entry is not where the check reads.
-                if in_log(&self.dir, &cur) {
-                    Ok(())
-                } else {
-                    Err(io::Error::from(io::ErrorKind::NotFound).into())
-                }
-            });
+            .and_then(|()| self.settle(&cur));
         match written {
             Ok(()) => {
                 self.current = Some(cur);
@@ -635,10 +619,6 @@ impl AuditWriter {
         if let Some(cur) = self.current.take() {
             if let Ok(m) = cur.file.metadata() {
                 if !cur.broken && m.len() < self.max_segment && in_log(&self.dir, &cur) {
-                    if let Err(e) = self.sync_parent() {
-                        self.current = Some(cur);
-                        return Err(e);
-                    }
                     return Ok((cur, m.len()));
                 }
             }
@@ -646,33 +626,42 @@ impl AuditWriter {
         Ok((self.new_segment()?, HEADER_LEN as u64))
     }
 
-    /// Flushes the directory that names the log's directory, unless this
-    /// writer already has for the directory there now (read each time,
-    /// never trusted from before: it may have been moved away and made
-    /// anew): the entry naming the log's directory is durable before any
-    /// entry this writer appends is acknowledged. A failure fails the
-    /// append, and the next one tries again.
-    fn sync_parent(&mut self) -> Result<(), AuditError> {
-        let m = std::fs::symlink_metadata(&self.dir)?;
-        let now = (m.dev(), m.ino());
-        if self.parent_synced != Some(now) {
-            let parent = match self.dir.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
-            };
-            let parent = File::open(parent)?;
-            self.io
-                .sync(&parent)
-                .map_err(|_| AuditError::from(AuditErrorKind::Sync))?;
-            self.parent_synced = Some(now);
+    /// Makes the names the check reaches the entry by durable, after the
+    /// entry itself, then checks that they still reach it. On every
+    /// append, never trusting an earlier flush, it flushes the log's
+    /// directory there now, which names the segment, and then the data
+    /// directory, which names the log's directory: a name moved away and
+    /// back, or a directory made anew (by this writer or another program,
+    /// on a file system that can give it the device and inode of the one
+    /// before), is not durable until the directory holding it is flushed
+    /// again (Codex F-64). Then the directory there must still be the one
+    /// it flushed, and the segment's name in it must be the file the entry
+    /// was written to ([`in_log`]): a directory swapped in, even one
+    /// holding the segment, was not flushed. A failed flush or check fails
+    /// the append.
+    fn settle(&mut self, cur: &Current) -> Result<(), AuditError> {
+        let log = open_dir(&self.dir, true)?;
+        let data = match self.dir.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let data = open_dir(data, false)?;
+        self.io
+            .sync(&log)
+            .and_then(|()| self.io.sync(&data))
+            .map_err(|_| AuditError::from(AuditErrorKind::Sync))?;
+        let flushed = log.metadata()?;
+        let there = std::fs::symlink_metadata(&self.dir)
+            .is_ok_and(|m| m.dev() == flushed.dev() && m.ino() == flushed.ino());
+        if there && in_log(&self.dir, cur) {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::NotFound).into())
         }
-        Ok(())
     }
 
     fn new_segment(&mut self) -> Result<Current, AuditError> {
         ensure_dir(&self.dir)?;
-        // Before any segment is made in the directory.
-        self.sync_parent()?;
         let path = self.dir.join(segment_name(self.next_seq));
         let file = OpenOptions::new()
             .append(true)
@@ -685,13 +674,7 @@ impl AuditWriter {
             .io
             .write(&file, &header)
             .map_err(AuditError::from)
-            .and_then(|()| {
-                let dir = File::open(&self.dir)?;
-                self.io
-                    .sync(&file)
-                    .and_then(|()| self.io.sync(&dir))
-                    .map_err(|_| AuditErrorKind::Sync.into())
-            });
+            .and_then(|()| self.io.sync(&file).map_err(|_| AuditErrorKind::Sync.into()));
         if let Err(e) = made {
             let _ = std::fs::remove_file(&path);
             return Err(e);
@@ -716,6 +699,15 @@ fn in_log(dir: &Path, cur: &Current) -> bool {
     check_private_dir(dir).is_ok()
         && std::fs::symlink_metadata(&cur.path)
             .is_ok_and(|m| m.is_file() && m.dev() == open.dev() && m.ino() == open.ino())
+}
+
+/// Opens a directory to flush it, with `O_DIRECTORY`: anything else in its
+/// place (a file, a FIFO another program put there) fails rather than
+/// being flushed instead, or blocking the open. With `nofollow`, a symlink
+/// in its place fails too.
+fn open_dir(path: &Path, nofollow: bool) -> io::Result<File> {
+    let flags = libc::O_DIRECTORY | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
+    OpenOptions::new().read(true).custom_flags(flags).open(path)
 }
 
 fn open_append(path: &Path) -> Result<File, AuditError> {
