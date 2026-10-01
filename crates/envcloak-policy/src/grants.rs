@@ -473,6 +473,16 @@ fn max_ttl(subject: &SubjectEvidence) -> Duration {
     }
 }
 
+impl AccessRequest {
+    /// The request's identity for flood control: SHA-256 over the root,
+    /// the project, the bindings (sorted), the mode and the command line.
+    /// Two requests with the same fingerprint are the same request asked
+    /// again.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        fingerprint(self)
+    }
+}
+
 /// The identity of a request for flood control: SHA-256 over the root,
 /// the project, the bindings (sorted), the mode and the command line.
 fn fingerprint(r: &AccessRequest) -> [u8; 32] {
@@ -935,8 +945,12 @@ impl GrantStore {
         )
     }
 
-    /// The pending requests, oldest first, unexpired.
+    /// The pending requests, unexpired, oldest first: by when they were
+    /// opened, then by id (the store keys them by their random ids, so
+    /// its own order says nothing of their age).
     pub fn pending_all(&self, now: &Now) -> impl Iterator<Item = &Pending> {
-        self.pending.values().filter(move |p| !p.expired(now))
+        let mut all: Vec<&Pending> = self.pending.values().filter(|p| !p.expired(now)).collect();
+        all.sort_by_key(|p| (p.opened, p.id));
+        all.into_iter()
     }
 }
