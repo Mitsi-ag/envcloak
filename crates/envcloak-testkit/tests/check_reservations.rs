@@ -388,38 +388,57 @@ fn a_failure_token_through_a_helper_function_counts() {
     );
 }
 
-/// A file outside the CLI that reports a failure through a `&str`
-/// constant, as M2-02's `envcloak-client` and its `NOT_IN_THIS_BUILD` do.
+/// A new file in a crate other than the CLI's (`envcloak-client`, which
+/// holds the CLI's reusable modules since M2-02).
 const CLIENT_STUB: &str = "crates/envcloak-client/src/stub.rs";
 
 #[test]
 fn a_failure_token_written_as_a_constant_in_another_crate_counts() {
+    // `incomplete` is still `reserved` (M2-14), so a constant that holds it
+    // in another crate is a clash until its task marks the row `landed`.
     let t = fixture();
     add_file(
         &t,
         CLIENT_STUB,
-        "/// The token of a command this build does not have.\n\
-         pub const NOT_IN_THIS_BUILD: &str = \"not_in_this_build\";\n\
+        "/// The token of a job that did not finish.\n\
+         pub const INCOMPLETE: &str = \"incomplete\";\n\
          \n\
-         pub fn stub() -> Failure {\n    \
+         pub fn stopped() -> Failure {\n    \
              Failure::new(\n        \
-                 crate::stub::NOT_IN_THIS_BUILD,\n        \
-                 \"not in this build\",\n    \
+                 crate::stub::INCOMPLETE,\n        \
+                 \"the job did not finish\",\n    \
              )\n\
          }\n",
     );
     assert_fails(
         &t,
-        &format!("`not_in_this_build` is reserved, but the code already has it ({CLIENT_STUB})"),
+        &format!("`incomplete` is reserved, but the code already has it ({CLIENT_STUB})"),
     );
     // The task that lands it marks the row `landed`, and then it passes.
     edit(
         &t,
         IPC,
-        "| `not_in_this_build` | M2-02 | reserved |",
-        "| `not_in_this_build` | M2-02 | landed |",
+        "| `incomplete` | M2-14 | reserved |",
+        "| `incomplete` | M2-14 | landed |",
     );
     assert_passes(&t.home());
+}
+
+#[test]
+fn the_failure_token_m2_02_landed_is_marked_landed() {
+    // M2-02 prints `not_in_this_build` through a constant in the CLI's
+    // `cmd` module; a `reserved` row for it is a clash.
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `not_in_this_build` | M2-02 | landed |",
+        "| `not_in_this_build` | M2-02 | reserved |",
+    );
+    assert_fails(
+        &t,
+        "`not_in_this_build` is reserved, but the code already has it (crates/envcloak-cli/src/cmd/mod.rs)",
+    );
 }
 
 #[test]
