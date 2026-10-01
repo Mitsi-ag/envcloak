@@ -1283,9 +1283,11 @@ mode, port, other = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 def say(key, verdict, why=""):
     print(key + "%s" % verdict, re.sub(r"[^A-Za-z0-9._-]", "_", str(why))[:80])
 def raw(key, family, addr):
-    s = socket.socket(family)
-    s.settimeout(5)
+    # A socket the sandbox will not even let be made counts as refused.
+    s = None
     try:
+        s = socket.socket(family)
+        s.settimeout(5)
         s.connect(addr)
         say(key, "OK")
     except socket.timeout:
@@ -1293,7 +1295,8 @@ def raw(key, family, addr):
     except OSError as e:
         say(key, "NO", errno.errorcode.get(e.errno, e.errno))
     finally:
-        s.close()
+        if s is not None:
+            s.close()
 if mode == "raw":
     raw("TCP", socket.AF_INET, ("127.0.0.1", port))
     raw("UNIX", socket.AF_UNIX, other)
@@ -1407,7 +1410,14 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
                 // request's domain.
                 "refused (codex-proxy-allowlist)".to_owned()
             } else {
-                "not tried (no output)".to_owned()
+                // What the command printed instead (Python's own error, or
+                // the host's), for the record.
+                let said: String = last_tool_output(text)
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                    .take(200)
+                    .collect();
+                format!("not tried (no output: {said:?})")
             }
         };
         let proxy_port = printed(&text, "PXY ").unwrap_or_else(|| "?".to_owned());
@@ -1439,19 +1449,21 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
                     seen("EXT")
                 );
             }
-            // Refused by Codex's proxy, by its rules (no domain is
-            // allowed), not by a network that is missing: CI's Linux
-            // namespace has none.
+            // Refused by Codex itself: its proxy, by its rules (no domain
+            // is allowed), or its sandbox, which will not let the socket
+            // be made (EPERM); never by a network that is missing (CI's
+            // Linux namespace has none, so ECONNREFUSED, ENETUNREACH or a
+            // timeout prove nothing there).
             for key in ["PRXS", "PRXH"] {
+                let got = seen(key);
                 assert!(
                     matches!(
-                        seen(key).as_str(),
+                        got.as_str(),
                         "refused (codex-proxy-allowlist)"
                             | "refused (tunnel-403)"
                             | "refused (http-403)"
-                    ),
-                    "{key} was not refused by Codex's proxy: {}",
-                    seen(key)
+                    ) || (got.starts_with("refused (PermissionError")),
+                    "{key} was not refused by Codex: {got}"
                 );
             }
             assert!(
