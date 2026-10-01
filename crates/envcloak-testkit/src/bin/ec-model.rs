@@ -81,7 +81,7 @@ fn main() -> ExitCode {
             .map(|r| {
                 serde_json::json!({
                     "seq": r.seq, "at_ms": r.at_ms, "method": r.method, "path": r.path,
-                    "status": r.status, "api": r.api, "pick": r.pick,
+                    "status": r.status, "answered": r.answered, "api": r.api, "pick": r.pick,
                     "body": String::from_utf8_lossy(&r.body),
                 })
             })

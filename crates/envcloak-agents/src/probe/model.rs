@@ -212,6 +212,9 @@ pub enum Incomplete {
     TimeLimit,
     /// The run reached the cap on recorded requests or on their metadata.
     RecordCap,
+    /// The run ended while a reply was held on a barrier: it was never
+    /// sent.
+    HeldReply,
 }
 
 impl Incomplete {
@@ -222,6 +225,7 @@ impl Incomplete {
             Incomplete::TotalCap => "total_cap",
             Incomplete::TimeLimit => "time_limit",
             Incomplete::RecordCap => "record_cap",
+            Incomplete::HeldReply => "held_reply",
         }
     }
 }
@@ -250,6 +254,9 @@ pub struct Outcome {
     /// Proxy tunnel requests (`CONNECT host:port`), refused: what a host
     /// tried to reach besides the model. Not a failure of the run.
     pub connect: u64,
+    /// Recorded requests whose reply was never sent whole: held on a
+    /// barrier when the run ended, or the connection failed first.
+    pub unanswered: u64,
     /// Body bytes recorded.
     pub recorded_bytes: u64,
     /// Metadata bytes recorded ([`Limits::meta`]).
@@ -281,6 +288,7 @@ impl Outcome {
             && self.mismatch == 0
             && self.exhausted == 0
             && self.busy == 0
+            && self.unanswered == 0
     }
 }
 
@@ -300,8 +308,12 @@ pub struct Recorded {
     pub query: Option<String>,
     /// Its header names, lower-cased, in order; never their values.
     pub headers: Vec<String>,
-    /// The status it was answered with.
+    /// The status it is answered with.
     pub status: u16,
+    /// Whether that answer was sent whole. A reply held on a barrier is
+    /// recorded before it is sent, unanswered, so a run that ends while it
+    /// is held says so.
+    pub answered: bool,
     /// `messages` or `responses`, for a request to one of the two APIs.
     pub api: Option<String>,
     /// What the script gave it: `step <n>`, `side`, `exhausted` or
@@ -321,6 +333,7 @@ impl fmt::Debug for Recorded {
             .field("method", &self.method)
             .field("path", &self.path)
             .field("status", &self.status)
+            .field("answered", &self.answered)
             .field("api", &self.api)
             .field("pick", &self.pick)
             .field("body_len", &self.body.len())
@@ -338,6 +351,7 @@ impl Recorded {
             query: head.query.clone(),
             headers: head.header_names.clone(),
             status,
+            answered: false,
             api: None,
             pick: None,
             body: Zeroizing::new(Vec::new()),

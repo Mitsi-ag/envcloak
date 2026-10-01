@@ -359,10 +359,12 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
             rec.api = Some("connect".to_owned());
             state.requests.push(rec);
             drop(state);
-            respond(
+            let sent = respond_keep(
                 stream,
                 &Response::error(403, "the scripted model reaches nothing else"),
+                false,
             );
+            answered(shared, seq, sent);
             return;
         }
         if is_hello(&head) {
@@ -381,7 +383,9 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
                 content_type: "text/plain",
                 body: Zeroizing::new(Vec::new()),
             };
-            if !respond_keep(stream, &empty, !head.close) || head.close {
+            let sent = respond_keep(stream, &empty, !head.close);
+            answered(shared, seq, sent);
+            if !sent || head.close {
                 return;
             }
             continue;
@@ -401,10 +405,12 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
                 401,
             ));
             drop(state);
-            respond(
+            let sent = respond_keep(
                 stream,
                 &Response::error(401, "the token is wrong or missing"),
+                false,
             );
+            answered(shared, seq, sent);
             return;
         }
         let api = match (head.method.as_str(), head.path.as_str()) {
@@ -466,6 +472,7 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
                 query: head.query.clone(),
                 headers: head.header_names.clone(),
                 status,
+                answered: false,
                 api: api.map(|a| a.name().to_owned()),
                 pick: pick.map(Pick::name),
                 body,
@@ -473,12 +480,30 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         }
         if let Some(name) = barrier {
             if !wait_released(shared, &name) {
+                // The run ended with the reply held: never sent.
+                let mut state = lock(&shared.state);
+                state.outcome.mark(Incomplete::HeldReply);
+                state.outcome.unanswered += 1;
                 return;
             }
         }
-        if !respond_keep(stream, &response, keep && !head.close) || !keep || head.close {
+        let sent = respond_keep(stream, &response, keep && !head.close);
+        answered(shared, seq, sent);
+        if !sent || !keep || head.close {
             return;
         }
+    }
+}
+
+/// Records whether the reply to request `seq` was sent whole.
+fn answered(shared: &Shared, seq: u64, sent: bool) {
+    let mut state = lock(&shared.state);
+    if sent {
+        if let Some(r) = state.requests.iter_mut().rev().find(|r| r.seq == seq) {
+            r.answered = true;
+        }
+    } else {
+        state.outcome.unanswered += 1;
     }
 }
 
@@ -521,8 +546,10 @@ fn reserve(state: &mut State, limits: &Limits, head: &http::Head, body: usize) -
         head.query.as_deref(),
         &head.header_names,
     ) as u64;
-    if state.requests.len() >= limits.records
-        || state.outcome.recorded_meta + meta > limits.meta as u64
+    // Reservations, not records: a request holds its place from here,
+    // while its body is still being read, so connections that reserve at
+    // the same time cannot pass the cap between them.
+    if state.seq >= limits.records as u64 || state.outcome.recorded_meta + meta > limits.meta as u64
     {
         state.outcome.mark(Incomplete::RecordCap);
         return None;

@@ -353,6 +353,9 @@ pub struct ModelRequest {
     pub method: String,
     pub path: String,
     pub status: u64,
+    /// Whether the reply was sent whole (a reply held on a barrier is
+    /// recorded first, unanswered).
+    pub answered: bool,
     /// `messages`, `responses`, `hello` or `connect`.
     pub api: Option<String>,
     /// `step <n>`, `side`, `exhausted` or `mismatch`.
@@ -368,6 +371,7 @@ impl std::fmt::Debug for ModelRequest {
             .field("method", &self.method)
             .field("path", &self.path)
             .field("status", &self.status)
+            .field("answered", &self.answered)
             .field("api", &self.api)
             .field("pick", &self.pick)
             .field("body_len", &self.body.len())
@@ -396,9 +400,10 @@ impl ModelReport {
         self.outcome[field].as_u64().unwrap_or(u64::MAX)
     }
 
-    /// Complete, and every request one the script served: nothing
-    /// unknown, refused, malformed or unscripted. Tunnels refused by the
-    /// model ([`ModelReport::connects`]) do not count against it.
+    /// Complete, and every request one the script served and answered:
+    /// nothing unknown, refused, malformed, unscripted or unanswered.
+    /// Tunnels refused by the model ([`ModelReport::connects`]) do not
+    /// count against it.
     pub fn clean(&self) -> bool {
         self.outcome["incomplete"]
             .as_array()
@@ -411,6 +416,7 @@ impl ModelReport {
                 "mismatch",
                 "exhausted",
                 "busy",
+                "unanswered",
             ]
             .iter()
             .all(|f| self.count(f) == 0)
@@ -617,6 +623,7 @@ fn parse_report(v: &Value) -> ModelReport {
                     method: text(r, "method").unwrap_or_default(),
                     path: text(r, "path").unwrap_or_default(),
                     status: r["status"].as_u64().unwrap_or(0),
+                    answered: r["answered"].as_bool().unwrap_or(false),
                     api: text(r, "api"),
                     pick: text(r, "pick"),
                     body: Zeroizing::new(
