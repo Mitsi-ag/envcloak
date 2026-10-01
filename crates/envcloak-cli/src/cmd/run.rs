@@ -45,7 +45,10 @@
 //!    `daemon_unavailable`. Before each request
 //!    that could carry values, the CLI looks for a tracer again, and stops
 //!    with `traced` if one is attached now. SIGINT ends the wait as it
-//!    ends any program (a shell reports 130); nothing is held open then.
+//!    ends any program (a shell reports 130), also when the run was
+//!    started with it ignored or blocked: its default action is restored
+//!    and it is unblocked before the wait begins; nothing is held open
+//!    then, and nothing starts.
 //!    Approval input is never read here: the terminal this command runs
 //!    in may be an agent's.
 //! 5. A covered answer carries the bindings' values, which the daemon
@@ -359,6 +362,15 @@ fn found_manifest() -> Result<String, Failure> {
 /// place taken): the line already printed is then the failure, and the
 /// run exits 125.
 fn wait_for(params: &RunRequestParams, wait: Duration) -> Result<Option<RunAnswer>, Failure> {
+    // SIGINT ends the wait whatever this process was started with: an
+    // ignored or blocked SIGINT survives `exec`, and a wait it could not
+    // end would start the command on an approval that comes later.
+    envcloak_sys::interrupt_ends_process().map_err(|_| {
+        Failure::new(
+            "run_failed",
+            "SIGINT could not be made to end the wait; nothing was sent",
+        )
+    })?;
     let paths = run_paths()?;
     let mut fresh = Fresh {
         paths: &paths,

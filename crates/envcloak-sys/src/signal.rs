@@ -165,6 +165,47 @@ impl Drop for TerminationWatch {
     }
 }
 
+/// Lets `SIGINT` end the process: gives it its default action and stops
+/// the calling thread blocking it. An ignored disposition and a blocked
+/// mask both survive `exec`, so a program can start this one with
+/// `SIGINT` ignored (as a shell starts a background job) or blocked. A
+/// wait that a person must be able to end, and that holds nothing a
+/// signal could leave behind (`envcloak run --wait`), calls this first:
+/// a `SIGINT` sent to the process then reaches the calling thread, if no
+/// other, and ends the process as its default action does (a shell
+/// reports 130).
+///
+/// # Errors
+/// When the disposition or the mask cannot be changed; either may have
+/// been changed then.
+pub fn interrupt_ends_process() -> io::Result<()> {
+    // SAFETY: sigaction is plain data; SIG_DFL with an empty mask is valid.
+    let mut dfl: libc::sigaction = unsafe { std::mem::zeroed() };
+    dfl.sa_sigaction = libc::SIG_DFL;
+    // SAFETY: `dfl.sa_mask` is a writable sigset_t.
+    if unsafe { libc::sigemptyset(&mut dfl.sa_mask) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: SIGINT is a valid signal; `dfl` is initialized and the old
+    // action is not wanted.
+    if unsafe { libc::sigaction(libc::SIGINT, &dfl, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: sigset_t is plain data; sigemptyset initializes it.
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is a writable sigset_t and SIGINT a valid signal.
+    if unsafe { libc::sigemptyset(&mut set) != 0 || libc::sigaddset(&mut set, libc::SIGINT) != 0 } {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `set` is initialized; the old mask is not wanted. The call
+    // changes only the calling thread's mask.
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    Ok(())
+}
+
 /// Ends the process by `sig` with its default action, as if the signal had
 /// never been caught: the parent sees a death by that signal. Falls back to
 /// exit status 128 + `sig` if the signal does not end the process.

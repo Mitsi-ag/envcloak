@@ -789,6 +789,84 @@ fn a_waiting_run_ends_on_sigint_and_on_a_denial() {
     f.sweep();
 }
 
+/// Runs argv[2..] in a new session, without a controlling terminal, with
+/// SIGINT ignored, blocked or both as argv[1] says: both survive `exec`,
+/// so a program can start the CLI so (a shell starts a background job
+/// with SIGINT ignored).
+const INHERITED_SIGINT: &str = "import os, signal, sys
+os.setsid()
+if sys.argv[1] in ('ignored', 'both'):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+if sys.argv[1] in ('blocked', 'both'):
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+os.execv(sys.argv[2], sys.argv[2:])
+";
+
+/// The wait ends on SIGINT however the run inherited it, ignored, blocked
+/// or both: ended by the signal (a shell reports 130) with nothing more
+/// said, and the command is never started, also when the request is
+/// approved afterwards.
+///
+/// Mutation: leave SIGINT as the run inherited it (no
+/// `interrupt_ends_process` before the wait): the run waits on after
+/// SIGINT and this fails for each of the three.
+#[test]
+fn a_waiting_run_ends_on_sigint_however_it_inherited_it() {
+    let f = Fixture::new();
+    let files = outside_dir();
+    for how in ["ignored", "blocked", "both"] {
+        let marker = files.path().join(how);
+        let mut cmd = Command::new(python3());
+        f.home
+            .apply(&mut cmd)
+            .args(["-c", INHERITED_SIGINT, how])
+            .arg(cli())
+            .args(["run", "--wait", "60s", "--", "/bin/sh", "-c"])
+            .arg(format!("touch {}", quoted(marker.to_str().unwrap())))
+            .current_dir(&f.project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let mut err = BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        err.read_line(&mut line).unwrap();
+        assert!(
+            line.starts_with("envcloak: approval_required: request="),
+            "{how}: {line}"
+        );
+        let id = required(&line).pop().unwrap();
+        // SIGINT to this test's own child, which it has not reaped.
+        let ok = Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let end = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if Instant::now() >= end {
+                // Still the test's own unreaped child: ended here.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{how}: SIGINT did not end the wait");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGINT), "{how}: {status:?}");
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut err, &mut rest).unwrap();
+        assert_eq!(rest, "", "{how}");
+        // Approved now, it starts nothing: no run waits for it.
+        f.approve(&id, &["--once"]);
+        assert!(!marker.exists(), "{how}: the command was started");
+    }
+    f.sweep();
+}
+
 /// `envcloak pending` lists nothing where no proof would be taken: to the
 /// agent's command, to a command without a terminal, and to a person's
 /// terminal whose shell carries an agent's marker; each prints the same
