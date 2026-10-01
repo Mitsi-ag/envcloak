@@ -460,10 +460,12 @@ fn c_space(b: u8) -> bool {
 /// password=...`). A field is one of [`PASSWORD_FIELDS`] at the start of
 /// the value or after a byte that is not a letter, digit or `_`, then `=`,
 /// with whitespace around it (as libpq takes it: [`c_space`]). Its value
-/// runs to the first `;`, `&` or whitespace; when it starts with `'`, `"`
-/// or `{`, what the quotes hold up to the first closing `'`, `"` or `}` is
-/// a reading too, since libpq, ADO.NET and ODBC quote a value that holds
-/// a separator. Each reading is counted with libpq's backslash escapes
+/// runs to the first `;`, `&` or whitespace, or, when it starts with `;`
+/// or `&` (where libpq's value does not end), to the first whitespace no
+/// backslash escapes; when it starts with `'`, `"` or `{`, what the
+/// quotes hold up to the first closing `'`, `"` or `}` is a reading too,
+/// since libpq, ADO.NET and ODBC quote a value that holds a separator.
+/// Each reading is counted with libpq's backslash escapes
 /// decoded as well as `%XX` ([`password_len`]). A reading ends no later
 /// than the value its program reads (libpq's ends at whitespace no
 /// backslash escapes, or at a quote none does; ADO.NET's and ODBC's at
