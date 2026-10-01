@@ -13,7 +13,7 @@ mod common;
 
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -390,6 +390,79 @@ fn a_writer_opened_again_after_a_failed_flush_flushes_the_data_directory() {
             "missing {dir_missing}"
         );
         assert!(log.verify(None).ok());
+    }
+}
+
+/// Codex F-64 follow-up: a writer that had flushed the data directory
+/// once went on without flushing it again after the log's directory was
+/// moved away and made anew, so it acknowledged entries in a directory
+/// whose name might not be durable. Here the directory is moved away
+/// after the first acknowledged append, and the new one is made by the
+/// writer, or by another program before the writer's next append. The
+/// writer flushes the data directory again before it appends there; that
+/// flush failing fails the append (nothing acknowledged, the head
+/// unmoved), the next append flushes it again, and the one after that
+/// does not. The entries in the new directory open, chained on from the
+/// moved one.
+#[test]
+fn a_log_directory_made_anew_is_flushed_into_the_data_directory() {
+    for made_by_writer in [true, false] {
+        let log = Log::new();
+        let data = dir_id(log.dir.parent().unwrap());
+        let shim = Shim::default();
+        let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+        let mut kept = fill(&mut w, 1, 1);
+        assert_eq!(shim.ops()[0], Op::SyncDir);
+        let old = dir_id(&log.dir);
+        assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data, old]);
+
+        let aside = log.f.home.root().join("audit.aside");
+        std::fs::rename(&log.dir, &aside).unwrap();
+        if !made_by_writer {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&log.dir)
+                .unwrap();
+        }
+        shim.plan().fail_dir_sync = true;
+        let e = w.append(&record(2)).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "the audit entry could not be flushed to disk",
+            "made by the writer {made_by_writer}"
+        );
+        assert_eq!(
+            shim.ops(),
+            [Op::SyncDir],
+            "made by the writer {made_by_writer}"
+        );
+        assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data]);
+        assert!(log.segments().is_empty());
+        assert_eq!(w.head().0, 1);
+
+        let two = record(2);
+        assert_eq!(w.append(&two).unwrap(), 2);
+        kept.push(two);
+        let ops = shim.ops();
+        assert_eq!(ops.len(), 6, "made by the writer {made_by_writer}: {ops:?}");
+        assert_eq!(ops[0], Op::SyncDir, "flushed again");
+        let new = dir_id(&log.dir);
+        assert_ne!(new, old);
+        assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data, new]);
+        kept.extend(fill(&mut w, 3, 1));
+        let ops = shim.ops();
+        assert!(
+            matches!(ops[..], [Op::Write(_), Op::SyncFile]),
+            "only once: {ops:?}"
+        );
+
+        let (entries, _) = read_entries(&log.dir, &log.keys, None).unwrap();
+        let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [2, 3]);
+        let records: Vec<AuditRecord> = entries.into_iter().map(|e| e.record).collect();
+        assert_eq!(records, kept[1..]);
+        let (entries, _) = read_entries(&aside, &log.keys, None).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }
 
