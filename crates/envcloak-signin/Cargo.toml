@@ -1,0 +1,14 @@
+[package]
+name = "envcloak-signin"
+description = "EnvCloak's dev sign-in contract (SPEC §6.8, M2b): the sign-in scope and its encoding, the statement, the operation store, authorizations and credits, the publication decision and TOTP, as pure code with an injected clock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

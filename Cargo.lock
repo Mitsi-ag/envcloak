@@ -244,6 +244,10 @@ name = "envcloak-agents"
 version = "0.1.0"
 
 [[package]]
+name = "envcloak-browser"
+version = "0.1.0"
+
+[[package]]
 name = "envcloak-client"
 version = "0.1.0"
 dependencies = [
@@ -405,6 +409,10 @@ dependencies = [
  "tempfile",
  "zeroize",
 ]
+
+[[package]]
+name = "envcloak-signin"
+version = "0.1.0"
 
 [[package]]
 name = "envcloak-sync"

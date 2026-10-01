@@ -9,6 +9,7 @@ members = ["crates/*", "security/lint-canary", "security/unsafe-canary"]
 # and the canaries. CI builds and tests with --workspace.
 default-members = [
   "crates/envcloak-agents",
+  "crates/envcloak-browser",
   "crates/envcloak-cli",
   "crates/envcloak-client",
   "crates/envcloak-core",
@@ -21,6 +22,7 @@ default-members = [
   "crates/envcloak-proxy",
   "crates/envcloak-redact",
   "crates/envcloak-scan",
+  "crates/envcloak-signin",
   "crates/envcloak-sync",
   "crates/envcloak-sys",
 ]

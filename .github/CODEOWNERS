@@ -34,3 +34,10 @@
 # workspace crates is a plan change, never a table edit inside a feature
 # task, so the allowed-edge table needs a code owner's review.
 /scripts/check-crate-graph.py                @Mitsi-ag
+
+# SPEC §6.8: the sign-in contract decides when a password is typed, where,
+# and what session reaches the agent, and the driver parses every page the
+# worker loads. Both crates need a code owner's review from the start
+# (plan task M2-01).
+/crates/envcloak-signin/                     @Mitsi-ag
+/crates/envcloak-browser/                    @Mitsi-ag
