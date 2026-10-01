@@ -34,6 +34,10 @@
 //! `import`, `recovery confirm`, `recover`) refuses under a tracer first,
 //! before it reads a file, a descriptor or the terminal.
 //!
+//! The commands of M2 and M2b are registered ahead of their tasks and
+//! listed in the help as not in this build: each exits 125 with
+//! `not_in_this_build` and reads no argument (see [`cmd`]).
+//!
 //! `envcloak internal hardening [--hold]` is a hidden, value-free diagnostic
 //! used by the gate 19 tests: it prints `key=value` hardening lines and, with
 //! `--hold`, prints `ready` and waits for stdin to close, so a test can
@@ -88,6 +92,20 @@ const HELP: &str = "usage:
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+Not in this build (each exits 125 with not_in_this_build):
+  envcloak run --pty | --wait | --manifest
+  envcloak pending
+  envcloak reveal
+  envcloak doctor
+  envcloak scrub
+  envcloak agents install | uninstall | status | migrate-mcp
+  envcloak hook
+  envcloak mcp
+  envcloak mcp-bridge
+  envcloak standing
+  envcloak items reclassify
+  envcloak login
+  envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
 
 fn main() -> ExitCode {
@@ -141,6 +159,19 @@ fn main() -> ExitCode {
         ["recovery", rest @ ..] => cmd::recovery::run(rest),
         ["backup", rest @ ..] => cmd::backup::run(rest),
         ["recover", rest @ ..] => cmd::recover::run(rest),
+        // M2 and M2b, registered ahead of their tasks.
+        ["pending", rest @ ..] => cmd::pending::run(rest),
+        ["reveal", rest @ ..] => cmd::reveal::run(rest),
+        ["doctor", rest @ ..] => cmd::doctor::run(rest),
+        ["scrub", rest @ ..] => cmd::scrub::run(rest),
+        ["agents", rest @ ..] => cmd::agents::run(rest),
+        ["hook", rest @ ..] => cmd::hook::run(rest),
+        ["mcp", rest @ ..] => cmd::mcp::run(rest),
+        ["mcp-bridge", rest @ ..] => cmd::mcp_bridge::run(rest),
+        ["standing", rest @ ..] => cmd::standing::run(rest),
+        ["items", rest @ ..] => cmd::items::run(rest),
+        ["login", rest @ ..] => cmd::login::run(rest),
+        ["signin", rest @ ..] => cmd::signin::run(rest),
         // Never echo arguments: one of them could be a pasted secret.
         _ => {
             eprintln!("envcloak: unknown command\n{HELP}");

@@ -27,6 +27,20 @@ usage:
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+Not in this build (each exits 125 with not_in_this_build):
+  envcloak run --pty | --wait | --manifest
+  envcloak pending
+  envcloak reveal
+  envcloak doctor
+  envcloak scrub
+  envcloak agents install | uninstall | status | migrate-mcp
+  envcloak hook
+  envcloak mcp
+  envcloak mcp-bridge
+  envcloak standing
+  envcloak items reclassify
+  envcloak login
+  envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
 --- stderr
 $ envcloak --version
@@ -65,6 +79,20 @@ usage:
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+Not in this build (each exits 125 with not_in_this_build):
+  envcloak run --pty | --wait | --manifest
+  envcloak pending
+  envcloak reveal
+  envcloak doctor
+  envcloak scrub
+  envcloak agents install | uninstall | status | migrate-mcp
+  envcloak hook
+  envcloak mcp
+  envcloak mcp-bridge
+  envcloak standing
+  envcloak items reclassify
+  envcloak login
+  envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
 $ envcloak vault
 exit: 2
