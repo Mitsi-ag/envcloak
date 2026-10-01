@@ -241,3 +241,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The crate graph is one-way (M2 plan D-02, F-75): every normal edge
+  # between workspace crates is in scripts/check-crate-graph.py's
+  # allowed-edge table, no forbidden edge and no cycle, checked before
+  # anything is built; then the workspace checks with its default features
+  # and with every feature.
+  crate-graph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: crate-graph
+      - name: Crate graph
+        run: |
+          python3 --version
+          python3 scripts/check-crate-graph.py
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo check --workspace --all-targets --all-features --locked

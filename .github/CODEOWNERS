@@ -29,3 +29,8 @@
 /crates/envcloak-policy/src/evidence.rs      @Mitsi-ag
 /crates/envcloak-sys/src/proc/               @Mitsi-ag
 /scripts/gen-agents.py                       @Mitsi-ag
+
+# M2 plan D-02 (F-75): the crate graph is one-way, and a new edge between
+# workspace crates is a plan change, never a table edit inside a feature
+# task, so the allowed-edge table needs a code owner's review.
+/scripts/check-crate-graph.py                @Mitsi-ag
