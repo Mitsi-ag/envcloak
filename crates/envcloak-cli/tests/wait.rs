@@ -403,7 +403,9 @@ fn a_y_typed_into_the_waiting_terminal_approves_nothing() {
 ///
 /// Mutation: hold the connection while waiting (poll on one connection
 /// kept open): the waiter's connections are not opened and closed per
-/// poll and this fails.
+/// poll and this fails. Mutation: connect once more before the wait (with
+/// the ordinary call timeout, as `run` without `--wait` does): one
+/// connection more than the steps is opened and this fails.
 #[test]
 fn a_waiting_run_holds_no_connection_between_polls() {
     let f = Fixture::with_env(&[(envcloak_sys::testing::IDLE_CONNECTION_MS, "2000")]);
@@ -426,9 +428,10 @@ fn a_waiting_run_holds_no_connection_between_polls() {
         !mine.iter().any(|l| l.contains("idle connection closed")),
         "{log}"
     );
-    // Every step on a connection of its own: the daemon check before the
-    // request, the request, and each poll; when a poll is answered, it is
-    // the waiter's only connection, and none is left open at the end.
+    // Every step on a connection of its own: the request and each poll,
+    // and nothing before them (a waiting run makes no connection outside
+    // its wait); when a poll is answered, it is the waiter's only
+    // connection, and none is left open at the end.
     let opened = mine
         .iter()
         .filter(|l| l.contains("connection opened"))
@@ -446,7 +449,7 @@ fn a_waiting_run_holds_no_connection_between_polls() {
     }
     assert_eq!(open, 0, "{log}");
     assert!(polls >= 9, "{polls} polls in 8 s:\n{log}");
-    assert_eq!(opened, polls + 2, "{log}");
+    assert_eq!(opened, polls + 1, "{log}");
     assert_eq!(f.listed().len(), 1);
     f.sweep();
 }
@@ -490,7 +493,9 @@ fn finish_within_child(mut child: Child, limit: Duration) -> Output {
 ///
 /// Mutation: give each call of the wait the client's 300-second timeout
 /// (`Fresh` connecting with `Client::connect`): the run is still waiting
-/// at this test's 60-second bound and this fails.
+/// at this test's 60-second bound and this fails. Mutation: connect before
+/// the wait with the ordinary call timeout, as the run did: the stand-in
+/// sees two connections, not the wait's one, and this fails.
 #[test]
 fn a_wait_on_a_silent_daemon_ends_by_its_limit() {
     use std::os::unix::fs::PermissionsExt;
@@ -547,7 +552,9 @@ fn a_wait_on_a_silent_daemon_ends_by_its_limit() {
          for a last answer); nothing was started\n"
     );
     assert!(took < Duration::from_secs(20), "{took:?}");
-    assert!(held >= 2, "{held}");
+    // The run's one connection: the wait's request, held unanswered to
+    // the limit.
+    assert_eq!(held, 1);
     assert!(!marker.exists(), "the command was started");
 }
 
@@ -645,6 +652,78 @@ fn a_wait_on_a_daemon_sending_a_byte_at_a_time_ends_by_its_limit() {
         e,
         "envcloak: daemon_unavailable: the daemon did not answer within the wait (1s, and 5s \
          for a last answer); nothing was started\n"
+    );
+    assert!(took < ONE_SECOND_WAIT_BOUND, "{took:?}");
+    assert!(!marker.exists(), "the command was started");
+}
+
+/// A listener whose backlog is full (a backlog of one, its places taken,
+/// and it never accepts) holds `run --wait 1s` no longer than its limit. On Linux the
+/// run's first contact is the wait's first call, whose connect waits for
+/// a place only for the time left to the deadline and 5 seconds: the run
+/// exits 125 with `daemon_unavailable`, saying the daemon did not answer
+/// within the wait. macOS refuses such a connect at once, which before
+/// any answer is a daemon not running, said at once. Nothing is started
+/// either way.
+///
+/// Mutation: connect before the wait with the ordinary 300-second call
+/// timeout, as the run did: on Linux it is still waiting for a place at
+/// this test's bound and this fails (macOS refuses that connect at once
+/// too, and the connection-count test catches the extra connection
+/// there).
+#[test]
+fn a_wait_on_a_full_backlog_ends_by_its_limit() {
+    const LISTEN: &str = "import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+s.listen(1)
+print('ready', flush=True)
+sys.stdin.read()
+";
+    let home = TestHome::new();
+    let socket = stand_in_socket(&home);
+    let mut listener = Command::new(common::python3())
+        .args(["-c", LISTEN])
+        .arg(&socket)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(listener.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready, "ready\n");
+    // Fill the backlog: connect, each waiting at most 300 ms, until one
+    // is not taken.
+    let mut held = Vec::new();
+    while let Ok(s) = envcloak_sys::connect_unix(&socket, Duration::from_millis(300)) {
+        held.push(s);
+        assert!(held.len() < 64, "the backlog never filled");
+    }
+    assert!(!held.is_empty());
+    let files = outside_dir();
+    let marker = files.path().join("started");
+    let (out, took) = wait_one_second(&home, &marker);
+    drop(held);
+    drop(listener.stdin.take());
+    let _ = listener.wait();
+    let e = stderr(&out);
+    assert_eq!(out.status.code(), Some(125), "{e}");
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        assert_eq!(
+            e,
+            "envcloak: daemon_unavailable: the daemon did not answer within the wait (1s, and \
+             5s for a last answer); nothing was started\n"
+        );
+        assert!(took >= Duration::from_secs(5), "{took:?}");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    assert!(
+        e.starts_with("envcloak: daemon_unavailable: the EnvCloak daemon is not running"),
+        "{e}"
     );
     assert!(took < ONE_SECOND_WAIT_BOUND, "{took:?}");
     assert!(!marker.exists(), "the command was started");
