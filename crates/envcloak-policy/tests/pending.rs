@@ -426,6 +426,48 @@ fn polls_out_of_order_refill_no_interval_twice() {
     assert_eq!(s.poll(&one, &me, &at_ms(750)), Ok(PendingState::Pending));
 }
 
+/// A bucket refills for every moment that passes, however close together
+/// the polls come: a root whose bucket is empty, polling every 500
+/// microseconds for a second (every poll but those the refill allows
+/// refused), still gets its four polls in that second, one each 250 ms,
+/// and with three live requests its twelve.
+///
+/// Mutation: count the time since the bucket's last poll in whole
+/// milliseconds while moving its clock to the poll's time (as before):
+/// each refused poll drops the half millisecond it refilled, no poll is
+/// ever admitted again and this fails.
+#[test]
+fn polls_closer_than_a_millisecond_lose_no_refill() {
+    let it = item();
+    let me = under(80, 81);
+    let per = usize::try_from(POLLS_PER_REQUEST).unwrap();
+    for live in [1, 3] {
+        let mut s = store();
+        let ids: Vec<PendingId> = (0..live)
+            .map(|n| opened(&mut s, request(me.clone(), &n.to_string(), &it), &at_ms(0)))
+            .collect();
+        for n in 0..live * per {
+            assert!(s.poll(&ids[0], &me, &at_ms(0)).is_ok(), "poll {n}");
+        }
+        assert_eq!(s.poll(&ids[0], &me, &at_ms(0)), Err(Busy));
+        let mut admitted = Vec::new();
+        for k in 1..=2000u64 {
+            let mut now = at_ms(0);
+            now.awake += Duration::from_micros(500 * k);
+            if s.poll(&ids[0], &me, &now).is_ok() {
+                admitted.push(500 * k);
+            }
+        }
+        // The n-th poll after the bucket ran out is due n / (4 x live)
+        // seconds later: the first poll made then or after is admitted.
+        let rate = u64::try_from(live * per).unwrap();
+        let due: Vec<u64> = (1..=rate)
+            .map(|n| (n * 1_000_000).div_ceil(rate * 500) * 500)
+            .collect();
+        assert_eq!(admitted, due, "{live} live");
+    }
+}
+
 /// `pending_all` lists the requests oldest first, by when each was opened
 /// and then by id, whatever their random ids: the order `pending.list` and
 /// `envcloak pending` promise.
