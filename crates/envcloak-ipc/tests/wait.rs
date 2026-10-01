@@ -734,6 +734,98 @@ fn a_silent_daemon_holds_a_wait_no_longer_than_its_limit() {
     );
 }
 
+/// A call the daemon did not take is asked again after the busy pause,
+/// until the deadline: a connection closed before any answer (as the
+/// daemon closes one at its connection limit), at once or on the request,
+/// and, once the daemon has answered this wait, nothing listening there.
+/// Before any answer, nothing listening is the failure at once, as it is
+/// without waiting; a socket or daemon that fails a check, and an answer
+/// cut short, are never asked again; and a call not taken at the deadline
+/// ends the wait with that failure.
+///
+/// Mutation: end the wait on a connection closed before any answer
+/// (`not_taken` always false): the first call ends it and this fails.
+#[test]
+fn a_call_the_daemon_did_not_take_is_asked_again_until_the_deadline() {
+    use std::io::ErrorKind as Io;
+    let closed = ClientError::Frame(FrameError::Closed);
+    let pipe = ClientError::Frame(FrameError::Io(Io::BrokenPipe));
+    let reset = ClientError::Frame(FrameError::Io(Io::ConnectionReset));
+    let mut t = Scripted::new(
+        [
+            Err(closed),
+            Err(pipe),
+            Ok(RunAnswer::decided(pending("ABCDEFGH"))),
+            Ok(covered_with_a_value()),
+        ],
+        [
+            Err(ClientError::Unavailable),
+            Err(reset),
+            Ok(PendingState::Approved),
+        ],
+    );
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, MAX_WAIT, &mut |_| {}).unwrap();
+    assert!(matches!(got, Waited::Answer(_)), "{got:?}");
+    assert_eq!(
+        calls(&t),
+        [
+            "request", "request", "request", "poll", "poll", "poll", "request"
+        ]
+    );
+    // The busy pause: doubled each time, and never shorter after.
+    let paused: Vec<u128> = c.pauses.iter().map(Duration::as_millis).collect();
+    assert_eq!(paused, [500, 1000, 1000, 2000, 2000]);
+
+    // Before any answer, nothing listening is the failure, at once.
+    let mut t = Scripted::new([Err(ClientError::Unavailable)], []);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, MAX_WAIT, &mut |_| {});
+    assert_eq!(got.unwrap_err(), ClientError::Unavailable);
+    assert_eq!(calls(&t), ["request"]);
+
+    // A socket or daemon that fails a check, and an answer cut short, are
+    // never asked again, before an answer or after.
+    for e in [
+        ClientError::Unverified(envcloak_ipc::Unverified::ForeignServer),
+        ClientError::Frame(FrameError::Truncated),
+        ClientError::Protocol,
+    ] {
+        let mut t = Scripted::new([Err(e)], []);
+        let mut c = t.clock();
+        assert_eq!(
+            wait_for_run(&mut t, &mut c, MAX_WAIT, &mut |_| {}).unwrap_err(),
+            e
+        );
+        let mut t = Scripted::new([Ok(RunAnswer::decided(pending("ABCDEFGH")))], [Err(e)]);
+        let mut c = t.clock();
+        assert_eq!(
+            wait_for_run(&mut t, &mut c, MAX_WAIT, &mut |_| {}).unwrap_err(),
+            e
+        );
+    }
+
+    // Not taken at the deadline: that failure ends the wait, for a poll
+    // and for the request asked after an approval.
+    let mut w = Wait::new(Duration::ZERO, ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    let mut early = w.clone();
+    assert_eq!(
+        early.next(ms(999), Event::Polled(Err(closed))).0,
+        Action::Sleep(ms(1))
+    );
+    assert_eq!(
+        w.clone().next(ms(1000), Event::Polled(Err(closed))).0,
+        Action::Finish(Finish::Failed(closed))
+    );
+    assert_eq!(
+        w.next(ms(1200), Event::Answered(Err(ClientError::Unavailable)))
+            .0,
+        Action::Finish(Finish::Failed(ClientError::Unavailable))
+    );
+}
+
 // ------------------------------------------- waits on real connections
 
 /// A run directory under a test home with a listener on its socket, where
@@ -871,6 +963,47 @@ fn a_daemon_reading_slowly_holds_a_wait_no_longer_than_its_limit() {
     let limit = Duration::from_secs(1) + CALL_GRACE;
     assert!(took >= limit - ms(100), "{took:?}");
     assert!(took < limit + SLACK, "{took:?}");
+}
+
+/// Over real connections, a daemon that closes the first two connections
+/// unanswered (as it does at its connection limit) and answers the third:
+/// the waiter asks again after the busy pause and gets the answer.
+///
+/// Mutation: end the wait on a connection closed before any answer: the
+/// wait fails with the first close and this fails.
+#[test]
+fn connections_closed_unanswered_are_asked_again() {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&seen);
+    let answer = answer_bytes(&RunAnswer::decided(DecisionView::Denied {
+        reason: "repeated".to_owned(),
+    }));
+    let (got, took) = wait_on_peer(
+        Duration::from_secs(20),
+        run_params(vec!["./emit".to_owned()]),
+        move |l| {
+            for _ in 0..2 {
+                drop(l.accept().unwrap());
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            let (mut s, _) = l.accept().unwrap();
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(envcloak_ipc::Frame::read_from(&mut s).unwrap());
+            s.write_all(&answer).unwrap();
+            std::thread::sleep(Duration::from_secs(60));
+        },
+    );
+    assert!(got.starts_with("Ok(Answer("), "{got}");
+    assert!(got.contains("repeated"), "{got}");
+    assert_eq!(seen.load(Ordering::SeqCst), 3);
+    // Two busy pauses, 500 ms and 1 s.
+    assert!(
+        took >= ms(1400) && took < Duration::from_secs(10),
+        "{took:?}"
+    );
 }
 
 // ---------------------------------------------- five waiters, one root
