@@ -37,6 +37,18 @@
 //! again. Refusing costs one package's rebuild; accepting tested the old
 //! build.
 //!
+//! That cost holds under `cargo test --workspace` too, which builds
+//! nothing for such a change (review R-19): after a pull that changed
+//! `Cargo.lock` or a manifest in a way that does not reach the binary (a
+//! lock bump in an unrelated crate, a comment), every test that runs
+//! `envcloakd`, `envcloak` or the testkit's programs panics until
+//! `cargo clean -p envcloakd -p envcloak -p envcloak-testkit`. CI builds
+//! the workspace's packages afresh on every run (its cache keeps only
+//! dependencies) and is not affected. Accepted: telling such a change
+//! from one that matters would take cargo's own answer (a build that
+//! reports the binary fresh), that is, a build run from inside the
+//! tests.
+//!
 //! Not seen: build flags from the environment (`RUSTFLAGS`) or from a
 //! cargo configuration outside the workspace, and variables a crate reads
 //! with `env!`. CONTRIBUTING says to build the binaries after such a
