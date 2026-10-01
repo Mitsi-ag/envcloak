@@ -13,11 +13,16 @@ SPEC v0.4 pull request wrote them (plan task M2-01).
   (F-76, CR-4), and gates 38 and 39 as narrowed.
 - So are the sentences that carry a decision's security property on their
   own: the browser supervisor's tool allowlist (D-30) and its grant check
-  on every tool call (D-31).
-- The wording they replaced is gone, and nothing makes a release depend on
-  the requesting process's code, such as EnvCloak's own `envcloak`
-  executable or binary: the daemon cannot identify a hardened client's
-  code on Linux (CR-1).
+  on every tool call (D-31); which identities, keys and subjects a
+  standing approval can cover (D-10, D-11); how a bound launch runs what
+  was checked, from a sealed copy on Linux and after a code directory
+  check on macOS, and that nothing else is bound or standing-capable
+  (D-33); the sealed copy the daemon starts its own modes from (D-36); and
+  gate 39's launch binding.
+- The wording they replaced is gone, in any letter case, and nothing makes
+  a release depend on the requesting process's code, such as EnvCloak's
+  own `envcloak` executable or binary: the daemon cannot identify a
+  hardened client's code on Linux (CR-1).
 - The status line says v0.4, and the file holds no em dash.
 
 Runs of whitespace, line breaks included, count as one space in the SPEC
@@ -73,10 +78,10 @@ DECISIONS = [
     ("D-30", "edit", ["The supervisor serves a fixed tool allowlist"]),
     ("D-31", "edit", ["`envcloak mcp --browser-supervisor`", "the requesting process instance that is to receive the browser tools"]),
     ("D-32", "edit", ["a short value is neither found nor removed"]),
-    ("D-33", "edit", ["registered launch", "`code_selecting_env`", "`checked_at_rest`", "`envcloak agents migrate-mcp --update <agent>/<server> [--cwd <dir>]"]),
+    ("D-33", "edit", ["registered launch", "`code_selecting_env`", "`checked_at_rest`", "`envcloak agents migrate-mcp --update <agent>/<server> [--cwd <dir>]", "a sealed in-memory file"]),
     ("D-34", "edit", ["`cleanup_unconfirmed`", "EnvCloak signals only processes it owns"]),
     ("D-35", "edit", ["whose leader is EnvCloak's PTY monitor", "`pty_monitor_lost`"]),
-    ("D-36", "edit", ["Daemon-started modes of `envcloak`", "no release depends on identifying the requesting process's code"]),
+    ("D-36", "edit", ["Daemon-started modes of `envcloak`", "no release depends on identifying the requesting process's code", "a sealed in-memory copy of that `envcloak`"]),
 ]
 
 REQUIRED = {
@@ -153,13 +158,61 @@ REQUIRED = {
         "YAML configs, key-shaped `args` literals and stores that hold an agent's own "
         "credentials are reported as manual and the command exits non-zero."
     ),
+    "gate 39 launch binding (D-33)": (
+        "Only a managed server's registered launch receives its key: a launch whose executable "
+        "was replaced is refused, and a `bound` launch whose executable is rewritten in place "
+        "after the daemon's last check runs the checked image, never the rewritten one."
+    ),
+    "§10b standing identity (D-10)": (
+        "The identity is the kernel's view of that request's nearest agent, never a path or "
+        "name a program can copy: on macOS its code signature (Team ID and signing "
+        "identifier), on Linux the SHA-256 of its executable. Only a builtin catalog match on "
+        "the executable path or code signature qualifies; an agent launched by an interpreter, "
+        "recognized only by a user extension, or asserted by its name or markers is refused "
+        "(`identity_not_standing_capable`)."
+    ),
+    "§10b standing keys (D-10, D-11)": (
+        "It covers test-classified keys only; live keys, and keys classified `unknown`, are "
+        "never standing."
+    ),
+    "§10b standing subjects (D-10)": (
+        "A standing approval never covers a terminal or unknown subject."
+    ),
+    "§6.6 Linux runs the sealed copy it checked (D-33)": (
+        "A file can be rewritten in place after any check of it, so on Linux a `bound` launch "
+        "never runs from its file: the daemon copies the executable, through the descriptor it "
+        "checked, into a sealed in-memory file (a memfd sealed against writing, growing and "
+        "shrinking), computes the identity over that sealed copy and compares it with the "
+        "record, and the runner executes the copy (`execveat`), so the bytes that run are the "
+        "bytes that were hashed, whatever happens to the file afterwards."
+    ),
+    "§6.6 macOS checks the suspended child (D-33)": (
+        "On macOS the runner starts the checked path suspended, the daemon compares the "
+        "suspended child's code directory hash with the record, and the child runs only if "
+        "they match."
+    ),
+    "§6.6 nothing else is bound (D-33)": (
+        "A launch that cannot run this way is not `bound`."
+    ),
+    "§6.6 only bound launches are standing (D-33)": (
+        "Only `bound` launches can have standing approvals (§10b)."
+    ),
+    "§6.6 the daemon's own modes run from a sealed copy (D-36)": (
+        "On Linux the daemon starts them from a sealed in-memory copy of that `envcloak`, made "
+        "and hashed once when the daemon starts, so a change to the file after the daemon "
+        "started never reaches a process that receives a value, and an upgraded `envcloak` "
+        "takes effect when the daemon restarts; on macOS from a suspended start whose code "
+        "directory hash must equal the one the daemon read when it started."
+    ),
 }
 
 # What v0.4 replaced, as regular expressions over the SPEC with its
-# whitespace collapsed; a plain phrase is escaped.
+# whitespace collapsed, matched in any letter case; a plain phrase is
+# escaped.
 FORBIDDEN = {
     "the old gate b12": re.escape("no trust, refresh or session state from the worker remains usable"),
-    "the old §6.8 worker sentence": re.escape("In M2b no trust, refresh or session state from the worker outlives the attempt"),
+    "the old §6.8 worker sentence": re.escape("no trust, refresh or session state from the worker outlives the attempt"),
+    "the file's own descriptor as the binding of a bound Linux launch (D-33)": re.escape("the runner executes the very descriptor the daemon checked"),
     "a release that rests on EnvCloak's own `envcloak` executable or binary (CR-1)": r"\bown `envcloak`",
     "a release that rests on the requester's code (CR-1)": (
         r"\b(?:requester|requesting process|caller|client|peer)(?:'s)? "
@@ -219,7 +272,7 @@ def check_spec(text):
         if n != 1:
             fail("%s: found %d times, not once word for word" % (name, n))
     for name, pattern in FORBIDDEN.items():
-        if re.search(pattern, text):
+        if re.search(pattern, text, re.IGNORECASE):
             fail("the SPEC still holds %s" % name)
 
 
