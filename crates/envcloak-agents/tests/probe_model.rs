@@ -634,8 +634,76 @@ fn a_held_step_never_released_is_never_answered() {
     let pending = send_in_thread(&stub);
     wait_recorded(&mut stub, 1);
     // The run ends with the reply still held: the connection closes
-    // unanswered.
+    // unanswered, the record says so, and the run is incomplete.
     let report = stub.finish().unwrap();
     assert_eq!(report.requests.len(), 1);
     assert!(pending.join().unwrap().is_none(), "a held reply was sent");
+    let r = &report.requests[0];
+    assert_eq!((r.status, r.answered), (200, false), "{r:?}");
+    assert_eq!(report.outcome.incomplete, ["held_reply"]);
+    assert_eq!(report.outcome.unanswered, 1);
+    assert!(!report.outcome.clean());
+}
+
+/// A reply sent whole is recorded as answered, and only then: while it is
+/// held, the record says it has not been.
+#[test]
+fn a_held_reply_is_recorded_unanswered_until_it_is_sent() {
+    let mut stub =
+        ModelStub::start(Path::new(EXE), &held_script(), Duration::from_secs(120)).unwrap();
+    let pending = send_in_thread(&stub);
+    wait_recorded(&mut stub, 1);
+    assert!(!stub.requests().unwrap().requests[0].answered);
+    stub.release("approved").unwrap();
+    assert_eq!(pending.join().unwrap().unwrap().status, 200);
+    let report = stub.finish().unwrap();
+    assert!(report.requests[0].answered, "{:?}", report.requests);
+    assert!(report.outcome.clean(), "{:?}", report.outcome);
+}
+
+/// Two connections that each reserve a record while the other's request
+/// is still being read cannot pass the record cap between them (Codex
+/// review): the reservation counts from the moment it is made, not once
+/// the body has been read and the record kept. With room for one record,
+/// the first request's body is held back after its head; the second
+/// request, sent whole meanwhile, is refused, and the run keeps one record
+/// and is incomplete.
+#[test]
+fn concurrent_requests_cannot_pass_the_record_cap_while_bodies_are_read() {
+    let script = Script::parse(&script()).unwrap();
+    let limits = Limits {
+        records: 1,
+        ..Limits::default()
+    };
+    let server = Server::bind(script, limits).unwrap();
+    let (addr, handle) = (server.addr(), server.handle());
+    let auth = format!("x-api-key: {}\r\n", server.token().as_str());
+    let serving = std::thread::spawn(move || server.serve());
+    let body = messages_body("first");
+    let request = post("/v1/messages", &auth, &body);
+    let head_len = request.len() - body.len();
+    let mut first = TcpStream::connect(addr).unwrap();
+    first
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    first.write_all(&request[..head_len]).unwrap();
+    // The barrier: the first request has reserved its record (its
+    // metadata is counted) and is reading its body.
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while handle.outcome().recorded_meta == 0 {
+        assert!(
+            std::time::Instant::now() < end,
+            "the first request never reserved"
+        );
+        std::thread::yield_now();
+    }
+    let second = send(addr, &post("/v1/messages", &auth, &messages_body("second"))).unwrap();
+    assert_eq!(second.status, 503, "a second record passed the cap");
+    first.write_all(&body).unwrap();
+    assert_eq!(read_response(&mut first).unwrap().status, 200);
+    drop(first);
+    handle.stop();
+    serving.join().unwrap();
+    assert_eq!(handle.requests().len(), 1);
+    assert_eq!(handle.outcome().incomplete, ["record_cap"]);
 }
