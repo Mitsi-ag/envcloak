@@ -65,9 +65,31 @@ pub struct Found {
     pub label: String,
     /// Which encoding matched, as named by [`encodings`].
     pub encoding: &'static str,
-    /// Byte offset of the match.
+    /// Byte offset of the match: in the bytes as stored when `unescaped`
+    /// is 0, else in those bytes with that many levels of JSON string
+    /// escaping read through.
     pub offset: usize,
+    /// How many levels of JSON string escaping were read through to find
+    /// it (see [`JSON_LEVELS`]): 0 for the bytes as stored.
+    pub unescaped: u8,
 }
+
+/// How many levels of JSON string escaping the detector reads through, on
+/// top of the encodings [`encodings`] lists. A host keeps what a command
+/// printed as a JSON string (a transcript line, a request body), and
+/// output that was JSON already, or a JSON string that holds JSON (Codex
+/// keeps a command's result as one), is escaped again at each level: a
+/// value with a `"`, a `\` or a non-ASCII character in it then matches
+/// none of its listed encodings byte for byte. So every haystack is also
+/// read with one level of escaping undone, then two, up to this many, and
+/// an occurrence counts at a level only where it covers a character that
+/// level decoded (one that covers none was there, and was counted, a
+/// level up). Undoing a level decodes each `\"`, `\\`, `\/`, `\b`, `\f`,
+/// `\n`, `\r`, `\t` and `\uXXXX` (a surrogate pair as one character)
+/// wherever it is, and leaves any other backslash as it is: bytes outside
+/// JSON strings hold no escapes, so string boundaries need not be known,
+/// and an escape in a file that is not JSON is read the conservative way.
+pub const JSON_LEVELS: u8 = 4;
 
 /// A path reported by [`sweep_dir`]. Its `Debug` and `Display` show the
 /// path with every component below the sweep root that holds a canary
@@ -139,11 +161,25 @@ pub enum Hit {
     },
 }
 
+impl fmt::Display for Found {
+    /// `LABEL as ENCODING at offset N`, and how many levels of JSON
+    /// escaping were read through, when any; never a value.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} as {} at offset {}",
+            self.label, self.encoding, self.offset
+        )?;
+        if self.unescaped > 0 {
+            write!(f, " (JSON-unescaped {}x)", self.unescaped)?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for Hit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let found = |f: &mut fmt::Formatter<'_>, x: &Found| {
-            write!(f, "{} as {} at offset {}", x.label, x.encoding, x.offset)
-        };
+        let found = |f: &mut fmt::Formatter<'_>, x: &Found| write!(f, "{x}");
         match self {
             Hit::Canary { path, found: x } => {
                 found(f, x)?;
@@ -214,27 +250,28 @@ impl Detector {
     }
 
     /// Every occurrence of every canary encoding in `haystack`, including
-    /// overlapping ones, in order of their end offset.
+    /// overlapping ones: those in the bytes as they are, in order of their
+    /// end offset, then those found with one level of JSON string escaping
+    /// read through, and so on up to [`JSON_LEVELS`].
     pub fn find(&self, haystack: &[u8]) -> Vec<Found> {
-        self.find_ending(haystack)
-            .into_iter()
-            .map(|(f, _)| f)
-            .collect()
+        let mut reader = haystack;
+        self.find_streaming(&mut reader, haystack.len())
+            .unwrap_or_else(|_| unreachable!("reading a slice cannot fail"))
     }
 
     /// As [`Detector::find`] over everything `reader` yields, reading at
     /// most `chunk` bytes at a time. Only the last chunk and the tail of the
-    /// one before it (one byte short of the longest pattern) are held, so a
-    /// file of any size costs a fixed amount of memory. Occurrences come out
-    /// exactly as [`Detector::find`] would report them for the whole input:
-    /// each once, in order of end offset, with offsets from the start.
+    /// one before it (one byte short of the longest pattern) are held, at
+    /// each level of unescaping, so a file of any size costs a fixed amount
+    /// of memory. Occurrences come out exactly as [`Detector::find`] would
+    /// report them for the whole input: each once, by level and then in
+    /// order of end offset, with offsets from the start of their level.
     fn find_streaming(&self, reader: &mut dyn Read, chunk: usize) -> io::Result<Vec<Found>> {
         let keep = self.longest.saturating_sub(1);
         let mut piece = vec![0u8; chunk.max(1)];
-        let mut window: Vec<u8> = Vec::with_capacity(keep + piece.len());
-        // The input offset of window[0].
-        let mut base = 0usize;
-        let mut found = Vec::new();
+        let mut levels: Vec<Level> = (0..=JSON_LEVELS).map(Level::new).collect();
+        let mut decoded = Vec::new();
+        let mut escaped = Vec::new();
         loop {
             let n = match reader.read(&mut piece) {
                 Ok(0) => break,
@@ -242,25 +279,43 @@ impl Detector {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
-            // Occurrences that end in the carried tail were reported with
-            // the chunk they end in; one that ends in the new bytes starts
-            // no earlier than the tail, which is one byte short of the
-            // longest pattern.
-            let carried = window.len();
-            window.extend_from_slice(&piece[..n]);
-            for (mut f, end) in self.find_ending(&window) {
-                if end > carried {
-                    f.offset += base;
-                    found.push(f);
+            let mut input = piece[..n].to_vec();
+            let mut from_escape = vec![false; n];
+            for at in 0..levels.len() {
+                levels[at].push(self, &input, &from_escape, keep);
+                if at + 1 < levels.len() {
+                    decoded.clear();
+                    escaped.clear();
+                    levels[at + 1]
+                        .unescape
+                        .feed(&input, false, &mut decoded, &mut escaped);
+                    std::mem::swap(&mut input, &mut decoded);
+                    std::mem::swap(&mut from_escape, &mut escaped);
                 }
             }
-            if window.len() > keep {
-                let drop = window.len() - keep;
-                window.drain(..drop);
-                base += drop;
+        }
+        // An escape cut off by the end of the input is no escape: what each
+        // level still holds is read as it is, through the levels below it.
+        for at in 1..levels.len() {
+            let mut input = Vec::new();
+            let mut from_escape = Vec::new();
+            levels[at]
+                .unescape
+                .feed(&[], true, &mut input, &mut from_escape);
+            for below in at..levels.len() {
+                levels[below].push(self, &input, &from_escape, keep);
+                if below + 1 < levels.len() {
+                    decoded.clear();
+                    escaped.clear();
+                    levels[below + 1]
+                        .unescape
+                        .feed(&input, false, &mut decoded, &mut escaped);
+                    std::mem::swap(&mut input, &mut decoded);
+                    std::mem::swap(&mut from_escape, &mut escaped);
+                }
             }
         }
-        Ok(found)
+        Ok(levels.into_iter().flat_map(|l| l.found).collect())
     }
 
     /// As [`Detector::find`], with the end offset of each occurrence.
@@ -273,6 +328,7 @@ impl Detector {
                     label: self.labels[canary].clone(),
                     encoding,
                     offset: m.start(),
+                    unescaped: 0,
                 };
                 (found, m.end())
             })
@@ -312,11 +368,7 @@ impl Detector {
         if found.is_empty() {
             return;
         }
-        let shown: Vec<String> = found
-            .iter()
-            .take(8)
-            .map(|f| format!("{} as {} at offset {}", f.label, f.encoding, f.offset))
-            .collect();
+        let shown: Vec<String> = found.iter().take(8).map(ToString::to_string).collect();
         panic!(
             "canary leak: {} occurrence(s): {}{}",
             found.len(),
@@ -360,6 +412,195 @@ impl Detector {
         }
         out.push_str(&String::from_utf8_lossy(&name[at..]));
         out
+    }
+}
+
+/// One level of a streamed search: the bytes with `level` levels of JSON
+/// string escaping read through, as they arrive.
+struct Level {
+    level: u8,
+    /// Undoes one more level of escaping: from the level above to this
+    /// one (unused at level 0).
+    unescape: Unescape,
+    /// The tail carried from earlier pieces, then the new bytes.
+    window: Vec<u8>,
+    /// Per byte of `window`: whether an escape at this level made it.
+    escaped: Vec<bool>,
+    /// The offset in this level's stream of `window[0]`.
+    base: usize,
+    found: Vec<Found>,
+}
+
+impl Level {
+    fn new(level: u8) -> Level {
+        Level {
+            level,
+            unescape: Unescape::default(),
+            window: Vec::new(),
+            escaped: Vec::new(),
+            base: 0,
+            found: Vec::new(),
+        }
+    }
+
+    /// Takes the next bytes of this level's stream and records the
+    /// occurrences that end in them. Above level 0, only an occurrence
+    /// that covers a byte an escape made counts: one that covers none is
+    /// the same bytes, in the same order, as one level up, where it was
+    /// counted.
+    fn push(&mut self, detector: &Detector, bytes: &[u8], from_escape: &[bool], keep: usize) {
+        // Occurrences that end in the carried tail were reported with the
+        // piece they end in; one that ends in the new bytes starts no
+        // earlier than the tail, which is one byte short of the longest
+        // pattern.
+        let carried = self.window.len();
+        self.window.extend_from_slice(bytes);
+        self.escaped.extend_from_slice(from_escape);
+        if self.level == 0 || self.escaped.contains(&true) {
+            for (mut f, end) in detector.find_ending(&self.window) {
+                let start = f.offset;
+                if end > carried && (self.level == 0 || self.escaped[start..end].contains(&true)) {
+                    f.offset += self.base;
+                    f.unescaped = self.level;
+                    self.found.push(f);
+                }
+            }
+        }
+        if self.window.len() > keep {
+            let drop = self.window.len() - keep;
+            self.window.drain(..drop);
+            self.escaped.drain(..drop);
+            self.base += drop;
+        }
+    }
+}
+
+/// One level of JSON string unescaping over a stream that arrives in
+/// pieces (see [`JSON_LEVELS`]). An escape cut off at the end of a piece
+/// is held until the next one completes it, so the output does not depend
+/// on where the pieces end.
+#[derive(Default)]
+struct Unescape {
+    held: Vec<u8>,
+}
+
+/// What a backslash starts.
+enum Escape {
+    /// A whole escape: the UTF-8 bytes it stands for, and its length.
+    Whole([u8; 4], usize, usize),
+    /// Possibly an escape, cut off by the end of the input.
+    Short,
+    /// Not an escape: the backslash stands for itself.
+    Not,
+}
+
+fn hex4(s: &[u8]) -> Option<u32> {
+    if s.len() != 4 || !s.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    std::str::from_utf8(s)
+        .ok()
+        .and_then(|t| u32::from_str_radix(t, 16).ok())
+}
+
+/// The escape at the start of `s`, which starts with a backslash.
+fn escape_at(s: &[u8]) -> Escape {
+    let one = |b: u8| Escape::Whole([b, 0, 0, 0], 1, 2);
+    let Some(&kind) = s.get(1) else {
+        return Escape::Short;
+    };
+    match kind {
+        b'"' | b'\\' | b'/' => return one(kind),
+        b'b' => return one(0x08),
+        b'f' => return one(0x0c),
+        b'n' => return one(b'\n'),
+        b'r' => return one(b'\r'),
+        b't' => return one(b'\t'),
+        b'u' => {}
+        _ => return Escape::Not,
+    }
+    // `\uXXXX`, or a high surrogate's and a low one's: 6 or 12 bytes.
+    let digits = &s[2..s.len().min(6)];
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Escape::Not;
+    }
+    let Some(unit) = hex4(digits) else {
+        return Escape::Short;
+    };
+    let (ch, len) = match unit {
+        0xd800..=0xdbff => {
+            let rest = &s[6..s.len().min(12)];
+            let expected = rest.iter().enumerate().all(|(i, &b)| match i {
+                0 => b == b'\\',
+                1 => b == b'u',
+                _ => b.is_ascii_hexdigit(),
+            });
+            if !expected {
+                return Escape::Not;
+            }
+            match hex4(rest.get(2..).unwrap_or(&[])) {
+                None => return Escape::Short,
+                Some(low @ 0xdc00..=0xdfff) => (
+                    char::from_u32(0x10000 + ((unit - 0xd800) << 10) + (low - 0xdc00)),
+                    12,
+                ),
+                Some(_) => return Escape::Not,
+            }
+        }
+        _ => (char::from_u32(unit), 6),
+    };
+    let Some(ch) = ch else {
+        // A lone low surrogate.
+        return Escape::Not;
+    };
+    let mut bytes = [0u8; 4];
+    let n = ch.encode_utf8(&mut bytes).len();
+    Escape::Whole(bytes, n, len)
+}
+
+impl Unescape {
+    /// Appends `input` (after what was held) to `out` with one level of
+    /// escaping undone, and to `from_escape` whether an escape made each
+    /// byte. An escape cut off at the end is held, unless `last`, when it
+    /// is read as no escape.
+    fn feed(&mut self, input: &[u8], last: bool, out: &mut Vec<u8>, from_escape: &mut Vec<bool>) {
+        let data: Vec<u8> = if self.held.is_empty() {
+            input.to_vec()
+        } else {
+            let mut d = std::mem::take(&mut self.held);
+            d.extend_from_slice(input);
+            d
+        };
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] != b'\\' {
+                // Up to the next backslash, as it is.
+                let run = data[i..]
+                    .iter()
+                    .position(|&b| b == b'\\')
+                    .unwrap_or(data.len() - i);
+                out.extend_from_slice(&data[i..i + run]);
+                from_escape.extend(std::iter::repeat_n(false, run));
+                i += run;
+                continue;
+            }
+            match escape_at(&data[i..]) {
+                Escape::Whole(bytes, n, len) => {
+                    out.extend_from_slice(&bytes[..n]);
+                    from_escape.extend(std::iter::repeat_n(true, n));
+                    i += len;
+                }
+                Escape::Short if !last => {
+                    self.held = data[i..].to_vec();
+                    return;
+                }
+                Escape::Short | Escape::Not => {
+                    out.push(b'\\');
+                    from_escape.push(false);
+                    i += 1;
+                }
+            }
+        }
     }
 }
 
@@ -724,6 +965,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One level of unescaping, the input handed over `piece` bytes at a
+    /// time.
+    fn unescaped(input: &[u8], piece: usize) -> (Vec<u8>, Vec<bool>) {
+        let mut u = super::Unescape::default();
+        let (mut out, mut flags) = (Vec::new(), Vec::new());
+        for p in input.chunks(piece.max(1)) {
+            u.feed(p, false, &mut out, &mut flags);
+        }
+        u.feed(&[], true, &mut out, &mut flags);
+        (out, flags)
+    }
+
+    /// Each JSON escape is undone, a surrogate pair as one character, and
+    /// anything that is not an escape (a lone surrogate, an unknown letter,
+    /// an escape cut off by the end) is left as it is; the result does not
+    /// depend on where the pieces end.
+    #[test]
+    fn one_level_of_json_escaping_is_undone_whatever_the_pieces() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (br#"a\"b\\c\/d\b\f\n\r\t"#, b"a\"b\\c/d\x08\x0c\n\r\t"),
+            (br"\u00e9\u00C9\u0022", "\u{e9}\u{c9}\"".as_bytes()),
+            (br"\ud83d\ude00!", "\u{1f600}!".as_bytes()),
+            (br"\ue000", "\u{e000}".as_bytes()),
+            (br"\ud83dx \ude00 \ud83d\u0041", br"\ud83dx \ude00 \ud83dA"),
+            (br"\x \u12g4 \", br"\x \u12g4 \"),
+            (br"\u00", br"\u00"),
+            (br"\ud83d\ude0", br"\ud83d\ude0"),
+            (br"\\\\u0041", br"\\u0041"),
+        ];
+        for (input, want) in cases {
+            for piece in [1, 2, 3, 5, 7, input.len()] {
+                let (out, flags) = unescaped(input, piece);
+                assert_eq!(
+                    out,
+                    *want,
+                    "{:?} in pieces of {piece}",
+                    String::from_utf8_lossy(input)
+                );
+                assert_eq!(flags.len(), out.len());
+            }
+        }
+        // Which bytes an escape made.
+        let (out, flags) = unescaped(br#"x\"y\u00e9"#, 2);
+        assert_eq!(out, "x\"y\u{e9}".as_bytes());
+        assert_eq!(flags, [false, true, false, true, true]);
+    }
+
+    /// A value a command printed as JSON, kept by a host as a JSON string,
+    /// inside a JSON string that holds JSON (Codex keeps a command's result
+    /// as one): none of its listed encodings is in the bytes as stored, and
+    /// each level of escaping read through finds the value again.
+    #[test]
+    fn a_value_escaped_again_by_each_envelope_is_found_through_them() {
+        let cs = canaries(fresh_seed());
+        let c = by_label(&cs, labels::DATABASE_URL);
+        let detector = Detector::new(&cs);
+        let printed = serde_json::json!({ "DATABASE_URL": c.as_str() }).to_string();
+        let kept = serde_json::json!({ "type": "tool_result", "content": printed }).to_string();
+        let output = serde_json::json!({ "output": kept }).to_string();
+        let line =
+            serde_json::json!({ "type": "function_call_output", "output": output }).to_string();
+        for (level, hay) in [(0u8, &printed), (1, &kept), (2, &output), (3, &line)] {
+            let found = detector.find(hay.as_bytes());
+            let mut at: Vec<(u8, &str)> = found
+                .iter()
+                .filter(|f| f.label == c.label)
+                .map(|f| (f.unescaped, f.encoding))
+                .collect();
+            at.sort_unstable();
+            at.dedup();
+            // The JSON encoding at this level, and the raw value one level
+            // further in.
+            assert!(
+                at.iter()
+                    .any(|(l, e)| *l == level && e.starts_with("json/")),
+                "level {level}: {at:?}"
+            );
+            assert!(
+                at.iter().any(|(l, e)| *l == level + 1 && *e == "raw"),
+                "level {level}: {at:?}"
+            );
+            assert!(
+                at.iter().all(|(l, _)| *l >= level),
+                "found less escaped than it is: {at:?}"
+            );
+        }
+        // Past the last level read through, it is not found: the limit is
+        // real, and stated.
+        let mut deeper = line;
+        for _ in 0..super::JSON_LEVELS {
+            deeper = serde_json::Value::String(deeper).to_string();
+        }
+        assert!(
+            !detector
+                .find(deeper.as_bytes())
+                .iter()
+                .any(|f| f.label == c.label),
+            "found past JSON_LEVELS"
+        );
+    }
+
+    /// An occurrence that covers no byte an escape made is counted once, at
+    /// the level where it is: a clean JSON line does not count again.
+    #[test]
+    fn an_occurrence_with_no_escape_in_it_is_counted_once() {
+        let cs = canaries(fresh_seed());
+        let c = by_label(&cs, labels::GITHUB_TOKEN);
+        let detector = Detector::new(&cs);
+        let line = format!(
+            "{{\"note\":\"a \\\"quoted\\\" word\",\"t\":\"{}\"}}",
+            c.as_str()
+        );
+        let found: Vec<Found> = detector
+            .find(line.as_bytes())
+            .into_iter()
+            .filter(|f| f.label == c.label)
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].encoding, found[0].unescaped), ("raw", 0));
     }
 
     /// Runs `f` on another thread and gives up after ten seconds, so a
