@@ -1,13 +1,15 @@
 //! `scripts/check-spec-decisions.py` (plan task M2-01) on the real SPEC and
 //! on copies of it, each changed one way: it accepts SPEC v0.4, rewrapped
 //! or not, and refuses the wording v0.4 replaced (gate b12 and the §6.8
-//! worker sentence, F-74; the real-model release rule), wrapped or not, a
+//! worker sentence, F-74; the real-model release rule; the descriptor exec
+//! of a bound Linux launch), wrapped or not and in any letter case, a
 //! release that rests on EnvCloak's own `envcloak` executable or binary or
 //! on any other reading of the requester's code (CR-1), a missing or
-//! weakened tool allowlist or per-call grant check (D-30, D-31), a decision
-//! whose edit is gone, a decided sentence twice, an em dash and an older
-//! version. With `--pr-files` it refuses a SPEC pull request that changes
-//! any file but docs/SPEC.md.
+//! weakened tool allowlist or per-call grant check (D-30, D-31), a missing
+//! or weakened standing-approval clause (D-10, D-11) or launch-binding
+//! clause (D-33, D-36, gate 39), a decision whose edit is gone, a decided
+//! sentence twice, an em dash and an older version. With `--pr-files` it
+//! refuses a SPEC pull request that changes any file but docs/SPEC.md.
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -351,5 +353,184 @@ fn a_spec_pull_request_that_changes_another_file_fails() {
         &t.home(),
         &["--pr-files", "base", "no-such-branch"],
         "git diff base...no-such-branch failed",
+    );
+}
+
+// --- Replaced wording in any letter case ----------------------------------
+
+#[test]
+fn the_old_b12_sentence_capitalized_as_a_new_bullet_fails() {
+    // The verifier's case: the old gate as a bullet of its own, its first
+    // word capitalized, beside the new b12.
+    let t = fixture();
+    let text = spec(&t);
+    let start = text.find(NEW_B12).unwrap();
+    let end = start + text[start..].find('\n').unwrap();
+    let changed = format!(
+        "{}\n- No trust, refresh or session state from the worker remains usable.{}",
+        &text[..end],
+        &text[end..]
+    );
+    std::fs::write(t.home().join(SPEC), changed).unwrap();
+    assert_fails(&t.home(), &[], "the SPEC still holds the old gate b12");
+}
+
+#[test]
+fn the_old_worker_sentence_without_its_lead_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        NEW_WORKER,
+        &format!(
+            "{NEW_WORKER} No trust, refresh or session state from the worker outlives the attempt."
+        ),
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the old §6.8 worker sentence",
+    );
+}
+
+// --- Security clauses (Codex review of PR #14) ----------------------------
+
+/// §10b: which agent identities a standing approval can name (D-10).
+const STANDING_IDENTITY: &str = "Only a builtin catalog match on the executable path or code signature qualifies; an agent launched by an interpreter, recognized only by a user extension, or asserted by its name or markers is refused (`identity_not_standing_capable`).";
+/// §10b: which keys a standing approval can cover (D-10, D-11).
+const STANDING_KEYS: &str = "It covers test-classified keys only; live keys, and keys classified `unknown`, are never standing.";
+/// §6.6: a bound Linux launch runs the sealed copy it checked (D-33).
+const LINUX_SEALED: &str = "A file can be rewritten in place after any check of it, so on Linux a `bound` launch never runs from its file: the daemon copies the executable, through the descriptor it checked, into a sealed in-memory file (a memfd sealed against writing, growing and shrinking), computes the identity over that sealed copy and compares it with the record, and the runner executes the copy (`execveat`), so the bytes that run are the bytes that were hashed, whatever happens to the file afterwards.";
+/// §6.6: macOS checks the suspended child before it runs (D-33).
+const MACOS_SUSPENDED: &str = "On macOS the runner starts the checked path suspended, the daemon compares the suspended child's code directory hash with the record, and the child runs only if they match.";
+/// §6.6: the daemon's own modes run from a sealed copy (D-36).
+const DAEMON_COPY: &str = "On Linux the daemon starts them from a sealed in-memory copy of that `envcloak`, made and hashed once when the daemon starts, so a change to the file after the daemon started never reaches a process that receives a value, and an upgraded `envcloak` takes effect when the daemon restarts;";
+/// Gate 39: only the registered launch, as checked, receives the key.
+const GATE_39_LAUNCH: &str = "Only a managed server's registered launch receives its key: a launch whose executable was replaced is refused, and a `bound` launch whose executable is rewritten in place after the daemon's last check runs the checked image, never the rewritten one.";
+
+/// Each clause removed, then each weakened one way, fails with its name.
+fn assert_each_change_fails(name: &str, clause: &str, weakened: &[(&str, &str)]) {
+    let t = fixture();
+    edit(&t, &format!(" {clause}"), "");
+    assert_fails(&t.home(), &[], &format!("{name}: found 0 times"));
+    for (from, to) in weakened {
+        assert_eq!(clause.matches(from).count(), 1, "{from:?}");
+        let t = fixture();
+        edit(&t, clause, &clause.replacen(from, to, 1));
+        assert_fails(&t.home(), &[], &format!("{name}: found 0 times"));
+    }
+}
+
+#[test]
+fn a_standing_approval_for_interpreter_extension_or_asserted_agents_fails() {
+    // Codex's case: the identity rule removed; and each excluded kind of
+    // match let back in.
+    assert_each_change_fails(
+        "§10b standing identity (D-10)",
+        STANDING_IDENTITY,
+        &[
+            ("an agent launched by an interpreter, ", ""),
+            (" recognized only by a user extension, or", ""),
+            (", or asserted by its name or markers", ""),
+            (
+                "executable path or code signature",
+                "executable path, name or code signature",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_standing_approval_for_live_or_unknown_keys_or_other_subjects_fails() {
+    assert_each_change_fails(
+        "§10b standing keys (D-10, D-11)",
+        STANDING_KEYS,
+        &[(
+            "live keys, and keys classified `unknown`, are",
+            "live keys are",
+        )],
+    );
+    assert_each_change_fails(
+        "§10b standing subjects (D-10)",
+        "A standing approval never covers a terminal or unknown subject.",
+        &[(" or unknown", "")],
+    );
+}
+
+#[test]
+fn a_bound_linux_launch_that_runs_from_its_file_fails() {
+    // Codex's case: Linux's binding of what runs to what was checked
+    // removed; and the descriptor exec that a rewrite in place can beat.
+    assert_each_change_fails(
+        "§6.6 Linux runs the sealed copy it checked (D-33)",
+        LINUX_SEALED,
+        &[
+            ("never runs from its file", "runs from its file"),
+            (
+                " (a memfd sealed against writing, growing and shrinking)",
+                "",
+            ),
+            (
+                "computes the identity over that sealed copy",
+                "computes the identity over the file",
+            ),
+        ],
+    );
+    let t = fixture();
+    edit(
+        &t,
+        LINUX_SEALED,
+        "What runs is the file: on Linux the runner executes the very descriptor the daemon checked (`execveat`), after re-reading its stamp.",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the file's own descriptor as the binding of a bound Linux launch (D-33)",
+    );
+}
+
+#[test]
+fn a_macos_launch_that_runs_unchecked_fails() {
+    assert_each_change_fails(
+        "§6.6 macOS checks the suspended child (D-33)",
+        MACOS_SUSPENDED,
+        &[
+            (", and the child runs only if they match", ""),
+            (" suspended,", ","),
+        ],
+    );
+}
+
+#[test]
+fn a_launch_bound_or_standing_without_the_check_fails() {
+    assert_each_change_fails(
+        "§6.6 nothing else is bound (D-33)",
+        "A launch that cannot run this way is not `bound`.",
+        &[("is not `bound`", "is `bound`")],
+    );
+    assert_each_change_fails(
+        "§6.6 only bound launches are standing (D-33)",
+        "Only `bound` launches can have standing approvals (§10b).",
+        &[("Only `bound` launches", "Launches")],
+    );
+}
+
+#[test]
+fn the_daemons_own_modes_run_from_the_file_fails() {
+    assert_each_change_fails(
+        "§6.6 the daemon's own modes run from a sealed copy (D-36)",
+        DAEMON_COPY,
+        &[("never reaches", "reaches")],
+    );
+}
+
+#[test]
+fn gate_39_without_its_launch_binding_fails() {
+    assert_each_change_fails(
+        "gate 39 launch binding (D-33)",
+        GATE_39_LAUNCH,
+        &[(
+            "runs the checked image, never the rewritten one",
+            "is refused when the change is seen",
+        )],
     );
 }
