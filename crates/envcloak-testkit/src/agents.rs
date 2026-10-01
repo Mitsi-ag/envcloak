@@ -781,9 +781,14 @@ pub struct AgentHome {
     /// The keys [`AgentHome::codex_config`] last set, to take out when it
     /// sets others.
     codex_extra: Vec<Vec<String>>,
-    /// Every directory a host was started in, for
+    /// Every directory a host was started in, by its real path, for
     /// [`AgentHome::check_isolated`].
     cwds: std::sync::Mutex<Vec<PathBuf>>,
+    /// Where Claude Code makes its per-user temporary directory when it
+    /// ignores `CLAUDE_CODE_TMPDIR`: `/tmp` (a test points it elsewhere).
+    /// Shared with every other run and with the person's own sessions, so
+    /// the harness only looks there, never removes anything.
+    shared_tmp: PathBuf,
 }
 
 impl AgentHome {
@@ -814,6 +819,7 @@ impl AgentHome {
             env: Vec::new(),
             codex_extra: Vec::new(),
             cwds: std::sync::Mutex::new(Vec::new()),
+            shared_tmp: PathBuf::from("/tmp"),
         };
         if host == Host::Codex {
             std::fs::create_dir_all(a.codex_home())
@@ -860,35 +866,63 @@ impl AgentHome {
         }
     }
 
+    /// Notes `cwd` as a directory a host is started in, before it starts.
+    ///
+    /// # Panics
+    /// When `cwd` is not inside the test root (the harness checks, and
+    /// would name, only the test root's own paths), or when Claude Code's
+    /// shared temporary directory for it or for `HOME` is already there:
+    /// what the run makes there could then not be told from what was
+    /// there before (another run's, a person's own session, a path whose
+    /// name collapses to the same one), so the run is refused before the
+    /// host starts.
     fn note_cwd(&self, cwd: &Path) {
+        let root = std::fs::canonicalize(&self.root)
+            .unwrap_or_else(|e| panic!("the test root {}: {e}", self.root.display()));
+        let real = std::fs::canonicalize(cwd)
+            .unwrap_or_else(|e| panic!("a host's directory {}: {e}", cwd.display()));
+        assert!(
+            real.starts_with(&root),
+            "a host may start only inside its test root {}, not in {}",
+            root.display(),
+            real.display()
+        );
+        for dir in self.shared_tmp_dirs(&real) {
+            match std::fs::symlink_metadata(&dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => panic!(
+                    "{} is there before the host starts: what the run keeps outside its \
+                     home could not be told from it",
+                    dir.display()
+                ),
+                Err(e) => panic!("cannot tell whether {} is there: {e}", dir.display()),
+            }
+        }
         let mut cwds = self
             .cwds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !cwds.iter().any(|c| c == cwd) {
-            cwds.push(cwd.to_path_buf());
+        if !cwds.contains(&real) {
+            cwds.push(real);
         }
     }
 
-    /// Where Claude Code would have kept a run's temporary files for each
-    /// directory a host was started in, had it ignored
-    /// `CLAUDE_CODE_TMPDIR`: `/tmp/claude-<uid>/<the directory's real
-    /// path, with every character but a letter or digit as ->`.
-    fn default_claude_tmp_dirs(&self) -> Vec<PathBuf> {
+    /// Where Claude Code would keep a run's temporary files for a host
+    /// started in `cwd` (a real path), and for `HOME`, had it ignored
+    /// `CLAUDE_CODE_TMPDIR`: `<shared tmp>/claude-<uid>/<the directory's
+    /// real path, with every character but a letter or digit as ->`. None
+    /// for Codex.
+    fn shared_tmp_dirs(&self, cwd: &Path) -> Vec<PathBuf> {
         if self.host != Host::ClaudeCode {
             return Vec::new();
         }
-        let base = crate::transcripts::claude_tmp_dir(Path::new("/tmp"));
-        let mut cwds = self
-            .cwds
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        cwds.push(self.home_dir());
-        cwds.iter()
+        let base = crate::transcripts::claude_tmp_dir(&self.shared_tmp);
+        let home = self.home_dir();
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        [cwd.to_path_buf(), home]
+            .iter()
             .map(|c| {
-                let real = std::fs::canonicalize(c).unwrap_or_else(|_| c.clone());
-                let slug: String = real
+                let slug: String = c
                     .to_string_lossy()
                     .chars()
                     .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
@@ -899,19 +933,30 @@ impl AgentHome {
     }
 
     /// Checks that the host kept nothing outside this home: no Claude Code
-    /// temporary directory for any directory it was started in under
-    /// `/tmp/claude-<uid>/` (the harness points `CLAUDE_CODE_TMPDIR` into
-    /// the home; this is that the host honoured it).
+    /// temporary directory for any directory it was started in, or for
+    /// `HOME`, under the shared `/tmp/claude-<uid>/` (the harness points
+    /// `CLAUDE_CODE_TMPDIR` into the home; this is that the host honoured
+    /// it). Each was absent when its run started
+    /// ([`AgentHome::spawn`] refuses to start otherwise). What is found
+    /// is left where it is, as evidence: the harness removes nothing
+    /// outside the test root.
     ///
     /// # Panics
     /// When one is there.
     pub fn check_isolated(&self) {
-        for dir in self.default_claude_tmp_dirs() {
-            assert!(
-                !dir.exists(),
-                "the host kept files outside its home, in {}",
-                dir.display()
-            );
+        let cwds = self
+            .cwds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for cwd in &cwds {
+            for dir in self.shared_tmp_dirs(cwd) {
+                assert!(
+                    std::fs::symlink_metadata(&dir).is_err(),
+                    "the host kept files outside its home, in {} (left there)",
+                    dir.display()
+                );
+            }
         }
     }
 
@@ -1135,19 +1180,6 @@ impl AgentHome {
             self.installed.pin.id,
             self.installed.pin.version
         );
-    }
-}
-
-impl Drop for AgentHome {
-    /// Removes what Claude Code kept outside the home for the directories
-    /// a host was started in, had it ignored `CLAUDE_CODE_TMPDIR`
-    /// ([`AgentHome::check_isolated`] fails the test first): directories
-    /// named for this home's own paths only, so nothing another home or
-    /// a person's own session made.
-    fn drop(&mut self) {
-        for dir in self.default_claude_tmp_dirs() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
     }
 }
 
@@ -1677,6 +1709,117 @@ mod tests {
             doc["sandbox_workspace_write"]["network_access"].as_bool(),
             Some(true)
         );
+    }
+
+    /// A Claude Code home whose shared temporary directory is `shared`
+    /// (standing in for `/tmp`), in `home`, which the test keeps.
+    fn claude_home(home: &TestHome) -> (AgentHome, PathBuf) {
+        let mut host = installed();
+        host.pin.id = "claude-code".to_owned();
+        let mut a = AgentHome::within(home, Host::ClaudeCode, host);
+        let shared = home.root().join("shared");
+        std::fs::create_dir_all(&shared).unwrap_or_else(|e| panic!("{e}"));
+        a.shared_tmp = shared.clone();
+        (a, shared)
+    }
+
+    /// Claude Code's temporary directory for `dir` under `shared`.
+    fn slug_dir(shared: &Path, dir: &Path) -> PathBuf {
+        let real = std::fs::canonicalize(dir).unwrap_or_else(|e| panic!("{e}"));
+        let slug: String = real
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        crate::transcripts::claude_tmp_dir(shared).join(slug)
+    }
+
+    fn refused(f: impl FnOnce()) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+    }
+
+    /// A host is started only inside its test root (review F-99): a
+    /// directory outside it, or a link inside it to one outside, is
+    /// refused before the host starts; one inside is taken.
+    #[test]
+    fn a_host_is_started_only_inside_its_test_root() {
+        let home = TestHome::new();
+        let (a, _) = claude_home(&home);
+        let inside = home.root().join("project");
+        std::fs::create_dir_all(&inside).unwrap_or_else(|e| panic!("{e}"));
+        let outside = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let link = home.root().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap_or_else(|e| panic!("{e}"));
+        assert!(refused(|| a.note_cwd(outside.path())));
+        assert!(refused(|| a.note_cwd(&link)));
+        assert!(refused(|| a.note_cwd(Path::new("/"))));
+        assert!(!refused(|| a.note_cwd(&inside)));
+        a.check_isolated();
+    }
+
+    /// The harness never removes anything from the shared temporary
+    /// directory (review F-99): a directory there before the host starts
+    /// (another run's, a person's own session's) refuses the run, and is
+    /// kept when the home is dropped.
+    #[test]
+    fn a_temporary_directory_there_before_the_run_refuses_it_and_is_kept() {
+        let home = TestHome::new();
+        let (a, shared) = claude_home(&home);
+        let project = home.root().join("project");
+        std::fs::create_dir_all(&project).unwrap_or_else(|e| panic!("{e}"));
+        let theirs = slug_dir(&shared, &project);
+        std::fs::create_dir_all(theirs.join("tasks")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(refused(|| a.note_cwd(&project)));
+        drop(a);
+        assert!(
+            theirs.join("tasks").is_dir(),
+            "a directory not the run's was removed"
+        );
+    }
+
+    /// Paths whose names collapse to the same directory name (`a-b` and
+    /// `a/b`) are not told apart: another owner's directory for one
+    /// refuses a run in the other, and is kept (review F-99).
+    #[test]
+    fn a_colliding_temporary_directory_refuses_the_run_and_is_kept() {
+        let home = TestHome::new();
+        let (a, shared) = claude_home(&home);
+        let mine = home.root().join("a-b");
+        let other = home.root().join("a").join("b");
+        for d in [&mine, &other] {
+            std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("{e}"));
+        }
+        assert_eq!(slug_dir(&shared, &mine), slug_dir(&shared, &other));
+        let theirs = slug_dir(&shared, &other);
+        std::fs::create_dir_all(&theirs).unwrap_or_else(|e| panic!("{e}"));
+        assert!(refused(|| a.note_cwd(&mine)));
+        drop(a);
+        assert!(theirs.is_dir(), "another owner's directory was removed");
+    }
+
+    /// What a host kept in the shared temporary directory fails the run
+    /// and is left there as evidence: dropping the home removes nothing
+    /// outside the test root (review F-99). Nothing there passes.
+    #[test]
+    fn what_a_host_kept_outside_its_home_fails_the_run_and_is_left() {
+        let home = TestHome::new();
+        let (a, shared) = claude_home(&home);
+        let project = home.root().join("project");
+        std::fs::create_dir_all(&project).unwrap_or_else(|e| panic!("{e}"));
+        a.note_cwd(&project);
+        a.check_isolated();
+        let kept = slug_dir(&shared, &project);
+        std::fs::create_dir_all(kept.join("tasks")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(refused(|| a.check_isolated()));
+        drop(a);
+        assert!(kept.join("tasks").is_dir(), "the evidence was removed");
+        // The same for HOME's own directory.
+        let (b, shared) = claude_home(&home);
+        let _ = std::fs::remove_dir_all(crate::transcripts::claude_tmp_dir(&shared));
+        b.note_cwd(&project);
+        std::fs::create_dir_all(slug_dir(&shared, &home.root().join("home")))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(refused(|| b.check_isolated()));
     }
 
     #[test]
