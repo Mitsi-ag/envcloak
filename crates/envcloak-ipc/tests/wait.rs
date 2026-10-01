@@ -826,6 +826,56 @@ fn a_call_the_daemon_did_not_take_is_asked_again_until_the_deadline() {
     );
 }
 
+/// A waiter may pass a smaller grace than CALL_GRACE, so that its wait
+/// and its grace together stay under a host's timeout: the limit is the
+/// deadline plus that grace, never more than CALL_GRACE, and each call is
+/// given only the time left to it.
+///
+/// Mutation: ignore the grace passed (always CALL_GRACE): the limit and
+/// the times given to the calls are 5 seconds after the deadline and this
+/// fails.
+#[test]
+fn a_smaller_grace_ends_the_wait_sooner() {
+    use envcloak_ipc::wait::wait_for_run_with_grace;
+    let w = Wait::with_grace(ms(500), ms(1000), ms(1500));
+    assert_eq!(w.deadline(), ms(1500));
+    assert_eq!(w.limit(), ms(3000));
+    assert_eq!(w.time_left(ms(1500)), Some(ms(1500)));
+    // Never more than CALL_GRACE.
+    let w = Wait::with_grace(Duration::ZERO, ms(1000), Duration::from_secs(60));
+    assert_eq!(w.limit(), ms(1000) + CALL_GRACE);
+
+    let mut t = Scripted::new(
+        [Ok(RunAnswer::decided(pending("ABCDEFGH")))],
+        (0..5).map(|_| Ok(PendingState::Pending)),
+    );
+    let mut c = t.clock();
+    let got = wait_for_run_with_grace(&mut t, &mut c, ms(1100), ms(700), &mut |_| {}).unwrap();
+    assert!(
+        matches!(got, Waited::TimedOut(i) if i == id("ABCDEFGH")),
+        "{got:?}"
+    );
+    for (at, within) in &t.within {
+        assert_eq!(*within, ms(1800) - *at, "{:?}", t.within);
+    }
+    assert_eq!(t.within.last(), Some(&(ms(1100), ms(700))));
+
+    // Approved at the deadline, the request after it answered only after
+    // the smaller limit: dropped, and nothing starts.
+    let mut t = Scripted::new(
+        [
+            Ok(RunAnswer::decided(pending("ABCDEFGH"))),
+            Ok(covered_with_a_value()),
+        ],
+        [Ok(PendingState::Approved)],
+    );
+    t.delays = VecDeque::from([Duration::ZERO, ms(1000), ms(800)]);
+    let mut c = t.clock();
+    let got = wait_for_run_with_grace(&mut t, &mut c, ms(1000), ms(500), &mut |_| {}).unwrap();
+    assert!(matches!(got, Waited::Unanswered), "{got:?}");
+    assert_eq!(calls(&t), ["request", "poll", "request"]);
+}
+
 // ------------------------------------------- waits on real connections
 
 /// A run directory under a test home with a listener on its socket, where

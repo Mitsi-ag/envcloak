@@ -44,15 +44,19 @@
 //! input is never read from the requesting process's terminal.
 //!
 //! **Bounded.** No call of a wait is answered later than its limit, the
-//! deadline plus [`CALL_GRACE`] ([`Wait::limit`]): each call is given
-//! only the time left to the limit, one instant for the whole call
-//! ([`Client::connect_by`]): the connect gets the time left, and each
-//! write and each read waits for the socket for at most the time then
-//! left, so a daemon that answers nothing, sends its answer a byte at a
-//! time, or reads the request slowly holds the call no longer; none is
-//! made once the limit has passed; and an answer read after it is dropped
-//! unused, a covered one's values wiped with it, and the wait ends
-//! [`Waited::Unanswered`], so nothing is started late.
+//! deadline plus its grace ([`CALL_GRACE`] unless the waiter passes less,
+//! [`Wait::limit`]): each call is given only the time left to the limit,
+//! one instant for the whole call ([`Client::connect_by`]): the connect
+//! gets the time left, and each write and each read waits for the socket
+//! for at most the time then left, so a daemon that answers nothing,
+//! sends its answer a byte at a time, or reads the request slowly holds
+//! the call no longer; none is made once the limit has passed; and an
+//! answer read after it is dropped unused, a covered one's values wiped
+//! with it, and the wait ends [`Waited::Unanswered`], so nothing is
+//! started late. A waiter's whole wait therefore lasts at most its
+//! duration plus its grace, and a waiter that must finish within a host's
+//! tool timeout (the MCP server and `mcp-bridge`) keeps the two together
+//! under it ([`wait_for_run_with_grace`]).
 //!
 //! **Traced.** Before each `run.request`, whose answer may carry values,
 //! the driver asks whether a tracer is now attached to this process
@@ -91,7 +95,8 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// poll is made at the deadline itself, and a request approved by then is
 /// asked again once, which the daemon answers after writing its audit
 /// entry durably. Nothing of a wait is answered later than the deadline
-/// plus this ([`Wait::limit`]).
+/// plus this ([`Wait::limit`]), or the smaller grace a waiter passes
+/// ([`Wait::with_grace`]).
 pub const CALL_GRACE: Duration = Duration::from_secs(5);
 
 /// The pause before the next poll or retry. It never shrinks.
@@ -206,7 +211,7 @@ pub enum Finish {
 #[derive(Debug, Clone)]
 pub struct Wait {
     deadline: Duration,
-    /// The deadline plus [`CALL_GRACE`].
+    /// The deadline plus the grace.
     limit: Duration,
     backoff: Backoff,
     /// The request waited on, once `run.request` named one.
@@ -247,12 +252,24 @@ fn not_taken(e: &ClientError, answered: bool) -> bool {
 
 impl Wait {
     /// A wait of `wait` (at most [`MAX_WAIT`]) from `now`, on any clock
-    /// that only moves forward.
+    /// that only moves forward, with [`CALL_GRACE`] after its deadline for
+    /// a last answer.
     pub fn new(now: Duration, wait: Duration) -> Wait {
+        Self::with_grace(now, wait, CALL_GRACE)
+    }
+
+    /// A wait as [`Wait::new`] makes, with `grace` (at most
+    /// [`CALL_GRACE`]) after its deadline for a last answer: a waiter that
+    /// must be done within a host's timeout passes less, so that its wait
+    /// and its grace together stay under it. A shorter grace leaves less
+    /// time for the request asked after an approval seen at the deadline,
+    /// which then ends the wait [`Waited::Unanswered`] if the daemon is
+    /// slow to answer it.
+    pub fn with_grace(now: Duration, wait: Duration, grace: Duration) -> Wait {
         let deadline = now.saturating_add(wait.min(MAX_WAIT));
         Wait {
             deadline,
-            limit: deadline.saturating_add(CALL_GRACE),
+            limit: deadline.saturating_add(grace.min(CALL_GRACE)),
             backoff: Backoff::new(),
             request: None,
             ask_again: true,
@@ -269,7 +286,7 @@ impl Wait {
     }
 
     /// The latest time any call of this wait may be answered: the
-    /// deadline plus [`CALL_GRACE`].
+    /// deadline plus its grace.
     pub fn limit(&self) -> Duration {
         self.limit
     }
@@ -543,8 +560,9 @@ fn too_late<T>(w: &Wait, now: Duration, r: &Result<T, ClientError>) -> bool {
     now > w.limit() || (timed_out && now >= w.deadline())
 }
 
-/// Runs a [`Wait`] of `wait` over `t` on clock `c`, telling `notice` what
-/// to show. See the module documentation.
+/// Runs a [`Wait`] of `wait` over `t` on clock `c`, with [`CALL_GRACE`]
+/// for a last answer, telling `notice` what to show. See the module
+/// documentation.
 ///
 /// # Errors
 /// Any failure of either call other than `busy` and `too_many_pending`,
@@ -559,7 +577,23 @@ pub fn wait_for_run(
     wait: Duration,
     notice: &mut dyn FnMut(Notice),
 ) -> Result<Waited, ClientError> {
-    let mut w = Wait::new(c.now(), wait);
+    wait_for_run_with_grace(t, c, wait, CALL_GRACE, notice)
+}
+
+/// [`wait_for_run`] with `grace` (at most [`CALL_GRACE`]) after the
+/// deadline for a last answer ([`Wait::with_grace`]): the whole wait ends
+/// by `wait` plus `grace`.
+///
+/// # Errors
+/// As [`wait_for_run`].
+pub fn wait_for_run_with_grace(
+    t: &mut dyn Transport,
+    c: &mut dyn Clock,
+    wait: Duration,
+    grace: Duration,
+    notice: &mut dyn FnMut(Notice),
+) -> Result<Waited, ClientError> {
+    let mut w = Wait::with_grace(c.now(), wait, grace);
     let (mut action, mut told) = w.next(c.now(), Event::Start);
     loop {
         if let Some(n) = told.take() {
