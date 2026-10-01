@@ -399,6 +399,12 @@ jobs:
           key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/versions.toml', 'scripts/install-agent-hosts.py') }}
       - name: Install and verify the pinned hosts (tier 1 and tier 2)
         run: python3 scripts/install-agent-hosts.py --tier all
+      # Claude Code's Bash sandbox needs bubblewrap and socat on Linux
+      # (https://code.claude.com/docs/en/sandboxing); without them the
+      # sandbox measurements read "the host did not run".
+      - name: Claude Code's sandbox dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends bubblewrap socat
       - name: Allow unprivileged user namespaces (Linux)
         if: runner.os == 'Linux'
         run: |
