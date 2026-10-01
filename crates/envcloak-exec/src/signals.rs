@@ -212,8 +212,8 @@ mod tests {
     static TURN: Mutex<()> = Mutex::new(());
 
     /// Raises `sig` on this thread more times than a pipe holds bytes, so
-    /// the relay's pipe is full after (the handler drops what does not
-    /// fit).
+    /// the relay's pipe is full after (the handler keeps one that does not
+    /// fit aside and merges the repeats).
     fn flood(sig: i32) {
         for _ in 0..1 << 17 {
             envcloak_sys::testing::signal_this_thread(sig).unwrap();
