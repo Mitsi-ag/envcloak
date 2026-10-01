@@ -82,7 +82,14 @@ pub struct BodyError(pub &'static str);
 /// What the step amounts to for one request, once the shell is resolved.
 struct Turn {
     say: Option<String>,
-    call: Option<(String, Value)>,
+    call: Option<Call>,
+}
+
+/// One tool call: its name, arguments and, for Responses, namespace.
+struct Call {
+    name: String,
+    input: Value,
+    namespace: Option<String>,
 }
 
 const EXHAUSTED: &str = "envcloak-probe-model: the script has no step for this request";
@@ -113,28 +120,38 @@ fn offers_tools(body: &Value) -> bool {
 
 /// The turn a step makes for `api`, given the tools the request offers.
 fn turn(step: &Step, api: Api, tools: &[&str]) -> Result<Turn, Pick> {
+    let call = |name: &str, input: Value| Call {
+        name: name.to_owned(),
+        input,
+        namespace: None,
+    };
     let call = match (&step.shell, &step.tool) {
         (Some(cmd), _) => Some(match api {
-            Api::Messages if tools.contains(&"Bash") => (
-                "Bash".to_owned(),
+            Api::Messages if tools.contains(&"Bash") => call(
+                "Bash",
                 json!({"command": cmd, "description": "scripted step"}),
             ),
             // Codex returns what a command printed so far after
             // `yield_time_ms` (10 s by default, 30 s at most) and expects the
             // model to poll; the longest wait keeps a scripted command whole.
-            Api::Responses if tools.contains(&"exec_command") => (
-                "exec_command".to_owned(),
-                json!({"cmd": cmd, "yield_time_ms": 30000}),
-            ),
+            Api::Responses if tools.contains(&"exec_command") => {
+                call("exec_command", json!({"cmd": cmd, "yield_time_ms": 30000}))
+            }
             Api::Responses if tools.contains(&"shell") => {
-                ("shell".to_owned(), json!({"command": ["bash", "-lc", cmd]}))
+                call("shell", json!({"command": ["bash", "-lc", cmd]}))
             }
             _ => return Err(Pick::Mismatch),
         }),
-        (None, Some(name)) => Some((
-            name.clone(),
-            step.input.clone().unwrap_or_else(|| json!({})),
-        )),
+        (None, Some(name)) => {
+            if api == Api::Messages && step.namespace.is_some() {
+                return Err(Pick::Mismatch);
+            }
+            Some(Call {
+                name: name.clone(),
+                input: step.input.clone().unwrap_or_else(|| json!({})),
+                namespace: step.namespace.clone(),
+            })
+        }
         (None, None) => None,
     };
     Ok(Turn {
@@ -230,12 +247,12 @@ pub fn messages(body: &Value, script: &Script, id: u64) -> Result<(Pick, Reply),
     if let Some(text) = &turn.say {
         content.push(json!({"type": "text", "text": text}));
     }
-    if let Some((name, input)) = &turn.call {
+    if let Some(call) = &turn.call {
         content.push(json!({
             "type": "tool_use",
             "id": format!("toolu_ecprobe{id:08}"),
-            "name": name,
-            "input": input,
+            "name": call.name,
+            "input": call.input,
         }));
     }
     let stop = if turn.call.is_some() {
@@ -327,12 +344,16 @@ pub fn responses(body: &Value, script: &Script, id: u64) -> Result<(Pick, Reply)
             "content": [{"type": "output_text", "text": text, "annotations": []}],
         }));
     }
-    if let Some((name, input)) = &turn.call {
-        let arguments = serde_json::to_string(input).unwrap_or_default();
-        items.push(json!({
+    if let Some(call) = &turn.call {
+        let arguments = serde_json::to_string(&call.input).unwrap_or_default();
+        let mut item = json!({
             "type": "function_call", "id": format!("fc_ecprobe{id:08}"), "status": "completed",
-            "call_id": format!("call_ecprobe{id:08}"), "name": name, "arguments": arguments,
-        }));
+            "call_id": format!("call_ecprobe{id:08}"), "name": call.name, "arguments": arguments,
+        });
+        if let Some(ns) = &call.namespace {
+            item["namespace"] = json!(ns);
+        }
+        items.push(item);
     }
     let usage = json!({
         "input_tokens": 1, "input_tokens_details": {"cached_tokens": 0},
@@ -521,6 +542,23 @@ mod tests {
             messages(&json!([1]), &s, 7).err(),
             Some(BodyError("not an object"))
         );
+    }
+
+    #[test]
+    fn a_namespaced_tool_is_called_in_its_namespace_under_responses_only() {
+        let s = Script::parse(
+            br#"{"steps":[{"tool":"whoami","namespace":"mcp__fixture","input":{}}]}"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let body = json!({"stream": false, "tools": [{"type": "namespace", "name": "mcp__fixture"}],
+                          "input": []});
+        let (pick, reply) = responses(&body, &s, 1).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(pick, Pick::Step(0));
+        let out: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+        assert_eq!(out["output"][0]["name"], "whoami");
+        assert_eq!(out["output"][0]["namespace"], "mcp__fixture");
+        let body = json!({"tools": [{"name": "Bash"}], "messages": []});
+        assert_eq!(messages(&body, &s, 2).map(|r| r.0), Ok(Pick::Mismatch));
     }
 
     #[test]
