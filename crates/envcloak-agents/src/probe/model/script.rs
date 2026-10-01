@@ -48,6 +48,12 @@ pub struct Step {
     /// The arguments of [`Step::tool`], a JSON object.
     #[serde(default)]
     pub input: Option<Value>,
+    /// The namespace of [`Step::tool`], for OpenAI Responses hosts that
+    /// offer tools in one (Codex 0.159.2 offers an MCP server's tools as
+    /// the namespace `mcp__<server>`). Anthropic Messages has none: such a
+    /// step is a mismatch there.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// A barrier: the reply to this step is held until the run is told
     /// `release <name>` (see [`super::Handle::release`]), so a test can act
     /// between two turns (a person approving a request) without timing.
@@ -91,8 +97,8 @@ pub enum ScriptError {
     /// A step with neither text nor a call, or with both a shell command
     /// and a named tool.
     Step,
-    /// A named tool's input that is not a JSON object, or input without a
-    /// named tool.
+    /// A named tool's input that is not a JSON object, or an input or a
+    /// namespace without a named tool.
     Input,
     /// A barrier name that is not 1 to 64 letters, digits, `-` or `_`.
     Barrier,
@@ -105,7 +111,9 @@ impl fmt::Display for ScriptError {
             ScriptError::Shape => "the script is not a JSON object of steps and side",
             ScriptError::Steps => "the script needs 1 to 256 steps",
             ScriptError::Step => "a step needs text or one call, and at most one call",
-            ScriptError::Input => "a tool's input must be a JSON object, and only a tool has one",
+            ScriptError::Input => {
+                "a tool's input must be a JSON object, and only a tool has an input or a namespace"
+            }
             ScriptError::Barrier => "a barrier is named with 1 to 64 letters, digits, - or _",
         })
     }
@@ -132,6 +140,9 @@ impl Script {
             match (&step.tool, &step.input) {
                 (Some(_), Some(Value::Object(_))) | (Some(_), None) | (None, None) => {}
                 _ => return Err(ScriptError::Input),
+            }
+            if step.namespace.is_some() && step.tool.is_none() {
+                return Err(ScriptError::Input);
             }
             if step.after.as_deref().is_some_and(|b| !barrier_name(b)) {
                 return Err(ScriptError::Barrier);
@@ -192,6 +203,10 @@ mod tests {
                 ScriptError::Input,
             ),
             (br#"{"steps":[{"say":"a","input":{}}]}"#, ScriptError::Input),
+            (
+                br#"{"steps":[{"say":"a","namespace":"x"}]}"#,
+                ScriptError::Input,
+            ),
             (br#"{"steps":[{"say":"a","extra":1}]}"#, ScriptError::Shape),
             (br#"{"steps":[{"say":"a"}],"more":1}"#, ScriptError::Shape),
             (
