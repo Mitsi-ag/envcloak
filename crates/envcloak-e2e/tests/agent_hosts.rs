@@ -2368,11 +2368,12 @@ fn tier_2_copilot_cli_against_the_scripted_model() {
         return;
     };
     // `node npm-loader.js` starts the platform package's binary (pinned
-    // as `starts`), which runs the command.
+    // as `starts`), which runs the command. Matched by its program: on
+    // Linux its process name is its main thread's (`MainThread`).
     tier_2_drivable(
         "copilot-cli",
         &run,
-        &["sh", "copilot (copilot)", "node (node npm-loader.js)"],
+        &["sh", "(copilot)", "node (node npm-loader.js)"],
     );
 }
 
