@@ -335,9 +335,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: agents
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+      # No setup-node: the installer puts the Node.js versions.toml pins
+      # (version, archive and binary SHA-256) in the host cache, runs npm
+      # with it, and the harness runs every node host with it.
       - name: Agent hosts from the cache, keyed by their pins
         uses: actions/cache@v4
         with:
@@ -383,9 +383,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: agents
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+      # No setup-node: the installer puts the Node.js versions.toml pins
+      # (version, archive and binary SHA-256) in the host cache, runs npm
+      # with it, and the harness runs every node host with it.
       - name: Agent hosts from the cache, keyed by their pins
         uses: actions/cache@v4
         with:
@@ -438,10 +438,12 @@ jobs:
   # requests from forks never get. From V1 (M2-08's instruction block) it
   # runs the M2 instruction-block prompts against real Claude Code and
   # Codex models, n = 5 per host and system per night, and records use
-  # rates in docs/COMPAT.md. Until then, and whenever its keys are not
-  # configured, it says so and runs nothing: it never reads as a pass.
+  # rates in docs/COMPAT.md. Until the repository variable
+  # ENVCLOAK_RELEASE_CHECK_MODELS is "on" (set once V1 and the keys
+  # exist), the job is skipped, which no run reads as a pass; once on, a
+  # missing key or a prompt set that is not there yet fails it.
   release-check-models:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.ENVCLOAK_RELEASE_CHECK_MODELS == 'on'
     name: release-check-models (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -456,9 +458,10 @@ jobs:
           OPENAI_KEY_SET: ${{ secrets.ENVCLOAK_RELEASE_CHECK_OPENAI_KEY != '' }}
         run: |
           if [ "$ANTHROPIC_KEY_SET" != "true" ] || [ "$OPENAI_KEY_SET" != "true" ]; then
-            msg="not run: ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY and ENVCLOAK_RELEASE_CHECK_OPENAI_KEY are not both configured"
+            msg="ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY and ENVCLOAK_RELEASE_CHECK_OPENAI_KEY are not both configured"
           else
-            msg="not run: the M2 instruction-block prompts land with M2-08 (V1); nothing to measure before them"
+            msg="the M2 instruction-block prompts land with M2-08 (V1); there is nothing to measure before them"
           fi
-          echo "::warning title=release-check-models::$msg"
-          echo "release-check-models: $msg" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=release-check-models::$msg"
+          echo "release-check-models failed: $msg" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
