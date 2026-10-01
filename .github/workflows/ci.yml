@@ -344,7 +344,9 @@ jobs:
           path: ${{ github.workspace }}/../agent-hosts
           key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'scripts/install-agent-hosts.py') }}
       - name: Install and verify the pinned tier-1 hosts
-        run: python3 scripts/install-agent-hosts.py --tier 1
+        run: |
+          python3 scripts/install-agent-hosts.py --self-test
+          python3 scripts/install-agent-hosts.py --tier 1
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
@@ -392,7 +394,9 @@ jobs:
           path: ${{ github.workspace }}/../agent-hosts
           key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'scripts/install-agent-hosts.py') }}
       - name: Install and verify the pinned hosts (tier 1 and tier 2)
-        run: python3 scripts/install-agent-hosts.py --tier all
+        run: |
+          python3 scripts/install-agent-hosts.py --self-test
+          python3 scripts/install-agent-hosts.py --tier all
       # Claude Code's Bash sandbox needs bubblewrap and socat on Linux
       # (https://code.claude.com/docs/en/sandboxing); without them the
       # sandbox measurements read "the host did not run".
