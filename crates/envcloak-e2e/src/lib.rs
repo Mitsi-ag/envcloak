@@ -95,6 +95,12 @@ pub fn target_dir() -> PathBuf {
         .unwrap_or_else(|| panic!("the test binary is not in a target directory"))
 }
 
+/// crates/envcloak-e2e/agents/versions.toml: the agent hosts the M2 tests
+/// drive, pinned (envcloak-testkit's `agents` module reads it).
+pub fn versions_toml() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("agents/versions.toml")
+}
+
 /// An executable on this process's `PATH`.
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;

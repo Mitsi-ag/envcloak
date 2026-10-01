@@ -305,6 +305,7 @@ dependencies = [
 name = "envcloak-e2e"
 version = "0.1.0"
 dependencies = [
+ "envcloak-agents",
  "envcloak-testkit",
  "libc",
  "serde_json",
@@ -449,6 +450,7 @@ dependencies = [
  "form_urlencoded",
  "libc",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml_edit",
  "zeroize",

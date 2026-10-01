@@ -25,12 +25,18 @@
 //!   scoped `cargo test -p` leaves as it was.
 //! - [`crash`]: gate 19's core-dump control and signed copies, shared by
 //!   the tests of both binaries.
+//! - [`agents`]: the pinned agent hosts (Claude Code, Codex) in isolated
+//!   homes ([`agents::AgentHome`]), driven by the scripted model
+//!   `envcloak-probe-model` ([`agents::Model`]), and
+//!   [`transcripts`]: the stores they write into and their sweep, with raw
+//!   counts per store (M2 plan task M2-04).
 //! - [`testkit_bin`]: this crate's programs, for the tests of other crates:
 //!   `fixture-agent`, the stand-in agent the builtin agent catalog knows,
 //!   and `ec-probe`, a caller that connects to a socket after escaping its
 //!   process tree in the ways gate 26 lists; refused, as [`assert_fresh`]
 //!   refuses, when older than their sources.
 
+pub mod agents;
 mod canary;
 pub mod crash;
 mod daemon;
@@ -38,6 +44,7 @@ mod detect;
 mod encode;
 mod fresh;
 mod home;
+pub mod transcripts;
 
 pub use canary::{Canary, by_label, canaries, fresh_seed, labels};
 pub use daemon::{Daemon, daemon_run_dir, daemon_socket};
