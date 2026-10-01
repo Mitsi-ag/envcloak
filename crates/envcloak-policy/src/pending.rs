@@ -7,13 +7,39 @@
 //! an approval surface receives, made once at creation so that what the
 //! approver sees is what the daemon's digest covers. The daemon nonce is
 //! 32 random bytes; the id is 8 Crockford base32 characters, unique among
-//! the pending requests (the store draws again on a clash).
+//! the pending requests and the outcomes remembered (the store draws again
+//! on a clash).
+//!
+//! **Waiting** (SPEC §6.1 step 4, M2 plan D-04). No client waits for a
+//! person on an open connection: `envcloak run --wait` asks for its
+//! request's [`PendingState`] on fresh connections. So that a waiter whose
+//! request was approved, denied or expired a moment ago is told so, the
+//! store remembers each ended request's outcome and its root for
+//! [`OUTCOME_TTL`], at most [`MAX_OUTCOMES`] of them (`Outcomes`). A
+//! state is answered only to a caller whose kernel-verified chain holds
+//! the request's root instance; anyone else, and anyone asking about an
+//! id the store does not know, is told [`PendingState::Unknown`], so the
+//! answer says nothing about another tree's requests. Forgetting an
+//! outcome early (the oldest goes when the list is full) only makes its
+//! waiter ask `run.request` again, which the grant store answers as the
+//! outcome would have: a grant covers it, a denial is remembered for 10
+//! minutes (`repeated`), and an expired request is opened anew.
+//!
+//! Polls are limited per subject root by a token bucket (`PollLimiter`)
+//! that refills [`POLLS_PER_REQUEST`] per second for each live pending
+//! request of the root (at least one's worth, so a root whose request just
+//! ended can still read its outcome), and holds one second's worth. A poll
+//! over the limit is refused ([`Busy`]), which a waiter answers by backing
+//! off, never as a refusal.
 
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use envcloak_core::vault::Classification;
+use serde::{Deserialize, Serialize};
 
 use crate::effective::SubjectKind;
+use crate::evidence::ProcessInstance;
 use crate::grants::{AccessRequest, Now};
 use crate::ids;
 use crate::statement::{
@@ -22,6 +48,198 @@ use crate::statement::{
 
 /// How long a pending request waits for an approval.
 pub const PENDING_TTL: Duration = Duration::from_secs(600);
+
+/// How long an ended request's outcome is remembered: as long as a
+/// request waits, so a waiter that asks at any point of its wait (at most
+/// [`PENDING_TTL`]) is told how its request ended.
+pub const OUTCOME_TTL: Duration = PENDING_TTL;
+
+/// Outcomes remembered at once; the oldest is forgotten to make room (see
+/// the module documentation for why that is safe).
+pub const MAX_OUTCOMES: usize = 256;
+
+/// Polls one root may make each second for each of its live pending
+/// requests (SPEC §10a allows 3 per root, so at most 12 a second).
+pub const POLLS_PER_REQUEST: u32 = 4;
+
+/// Roots whose poll budget is kept at once. A root whose bucket has
+/// been left alone for a second is full again and needs no entry; past
+/// this many busy ones, a new root's poll is refused ([`Busy`]) rather
+/// than another root's budget forgotten.
+pub const MAX_POLL_ROOTS: usize = 1024;
+
+/// How a request stands, as `pending.state` answers it (SPEC §6.1 step 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingState {
+    /// Waiting for a person's approval.
+    Pending,
+    /// A person approved it: the request asked again is covered.
+    Approved,
+    /// A person denied it.
+    Denied,
+    /// It was neither approved nor denied within [`PENDING_TTL`].
+    Expired,
+    /// No request with this id belongs to the caller's process tree: none
+    /// has the id, it belongs to another tree, or its outcome is no longer
+    /// remembered. Asking `run.request` again tells the caller where it
+    /// stands.
+    Unknown,
+}
+
+impl PendingState {
+    /// The word on the wire and in output.
+    pub fn word(self) -> &'static str {
+        match self {
+            PendingState::Pending => "pending",
+            PendingState::Approved => "approved",
+            PendingState::Denied => "denied",
+            PendingState::Expired => "expired",
+            PendingState::Unknown => "unknown",
+        }
+    }
+}
+
+/// A poll over its root's limit: the caller backs off and asks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Busy;
+
+/// How a request ended, and whose it was.
+#[derive(Debug, Clone)]
+struct Ended {
+    root: ProcessInstance,
+    state: PendingState,
+    /// Awake time when it ended.
+    at: Duration,
+}
+
+/// The outcomes of requests that ended, for their waiters.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Outcomes {
+    ended: BTreeMap<PendingId, Ended>,
+}
+
+impl Outcomes {
+    /// Records that request `id` of `root` ended in `state` at `now`.
+    pub(crate) fn record(
+        &mut self,
+        id: PendingId,
+        root: ProcessInstance,
+        state: PendingState,
+        now: &Now,
+    ) {
+        self.expire(now);
+        if self.ended.len() >= MAX_OUTCOMES && !self.ended.contains_key(&id) {
+            let oldest = self
+                .ended
+                .iter()
+                .min_by_key(|(_, e)| e.at)
+                .map(|(id, _)| *id);
+            if let Some(oldest) = oldest {
+                self.ended.remove(&oldest);
+            }
+        }
+        self.ended.insert(
+            id,
+            Ended {
+                root,
+                state,
+                at: now.awake,
+            },
+        );
+    }
+
+    /// Forgets outcomes older than [`OUTCOME_TTL`].
+    pub(crate) fn expire(&mut self, now: &Now) {
+        self.ended
+            .retain(|_, e| now.awake.saturating_sub(e.at) < OUTCOME_TTL);
+    }
+
+    /// The outcome of `id`, and the root it belongs to.
+    pub(crate) fn get(&self, id: &PendingId) -> Option<(&ProcessInstance, PendingState)> {
+        self.ended.get(id).map(|e| (&e.root, e.state))
+    }
+
+    pub(crate) fn contains(&self, id: &PendingId) -> bool {
+        self.ended.contains_key(id)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ended.len()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ended.clear();
+    }
+}
+
+/// One root's poll budget, in thousandths of a poll so that a refill of a
+/// few milliseconds counts.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    milli: u64,
+    /// Awake time of the last poll.
+    at: Duration,
+}
+
+/// The per-root poll limit of `pending.state` (see the module
+/// documentation).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PollLimiter {
+    buckets: HashMap<ProcessInstance, Bucket>,
+}
+
+impl PollLimiter {
+    /// Takes one poll for `root`, which has `live` pending requests, at
+    /// awake time `now`.
+    ///
+    /// # Errors
+    /// [`Busy`] when the root's bucket is empty, or when
+    /// [`MAX_POLL_ROOTS`] other roots have polled within the last second.
+    pub(crate) fn take(
+        &mut self,
+        root: &ProcessInstance,
+        live: usize,
+        now: Duration,
+    ) -> Result<(), Busy> {
+        // One second's worth, refilled in one second.
+        let per_second =
+            u64::from(POLLS_PER_REQUEST) * u64::try_from(live.max(1)).unwrap_or(u64::MAX);
+        let cap = per_second.saturating_mul(1000);
+        if !self.buckets.contains_key(root) && self.buckets.len() >= MAX_POLL_ROOTS {
+            // A bucket left alone for a second is full again: forget it.
+            self.buckets
+                .retain(|_, b| now.saturating_sub(b.at) < Duration::from_secs(1));
+            if self.buckets.len() >= MAX_POLL_ROOTS {
+                return Err(Busy);
+            }
+        }
+        let b = self.buckets.entry(root.clone()).or_insert(Bucket {
+            milli: cap,
+            at: now,
+        });
+        let elapsed = u64::try_from(now.saturating_sub(b.at).as_millis()).unwrap_or(u64::MAX);
+        b.milli = b
+            .milli
+            .saturating_add(elapsed.saturating_mul(per_second))
+            .min(cap);
+        b.at = now;
+        if b.milli < 1000 {
+            return Err(Busy);
+        }
+        b.milli -= 1000;
+        Ok(())
+    }
+
+    /// How many roots' buckets are kept.
+    pub(crate) fn roots(&self) -> usize {
+        self.buckets.len()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.buckets.clear();
+    }
+}
 
 /// A request id: 40 random bits, shown as 8 Crockford base32 characters.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -95,6 +313,11 @@ impl Pending {
     /// Whether the request has expired at `now`.
     pub fn expired(&self, now: &Now) -> bool {
         now.awake.saturating_sub(self.opened) >= PENDING_TTL
+    }
+
+    /// How long it has waited at `now`, in awake time.
+    pub fn age(&self, now: &Now) -> Duration {
+        now.awake.saturating_sub(self.opened)
     }
 }
 
