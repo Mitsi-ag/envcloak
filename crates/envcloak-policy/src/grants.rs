@@ -49,6 +49,10 @@
 //! rules; at most [`MAX_GRANTS`] grants exist at a time. A request over a
 //! pending cap is not denied: it is answered [`Decision::TooManyPending`],
 //! which a waiter asks again later (M2 plan D-04).
+//!
+//! **Waiting.** [`GrantStore::poll`] answers how a request stands, only to
+//! its own process tree and within its root's poll limit; see
+//! [`crate::pending`].
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -64,7 +68,7 @@ use crate::flood::{FloodControl, MAX_PENDING, MAX_PENDING_PER_ROOT};
 use crate::ids;
 use crate::manifest::Mode;
 use crate::names::EnvName;
-use crate::pending::{Pending, PendingId};
+use crate::pending::{Busy, Outcomes, Pending, PendingId, PendingState, PollLimiter};
 use crate::project::ProjectIdentity;
 use crate::statement::{PendingDescriptor, statement_digest};
 
@@ -441,6 +445,9 @@ pub struct NoSuchRequest;
 pub struct GrantStore {
     grants: BTreeMap<GrantId, Grant>,
     pending: BTreeMap<PendingId, Pending>,
+    /// How requests that left `pending` ended, for their waiters.
+    ended: Outcomes,
+    polls: PollLimiter,
     flood: FloodControl,
     vault_epoch: u32,
     policy_epoch: u64,
@@ -507,6 +514,8 @@ impl GrantStore {
         GrantStore {
             grants: BTreeMap::new(),
             pending: BTreeMap::new(),
+            ended: Outcomes::default(),
+            polls: PollLimiter::default(),
             flood: FloodControl::new(),
             vault_epoch: 0,
             policy_epoch: 0,
@@ -533,10 +542,23 @@ impl GrantStore {
             .retain(|_, g| g.vault_epoch == v && g.policy_epoch == p);
     }
 
-    /// Drops what has expired at `now`.
+    /// Drops what has expired at `now`. A pending request that expired is
+    /// remembered as [`PendingState::Expired`] for its waiter.
     fn expire(&mut self, now: &Now) {
         self.grants.retain(|_, g| !g.expired(now));
-        self.pending.retain(|_, p| !p.expired(now));
+        let expired: Vec<PendingId> = self
+            .pending
+            .values()
+            .filter(|p| p.expired(now))
+            .map(|p| p.id)
+            .collect();
+        for id in expired {
+            if let Some(p) = self.pending.remove(&id) {
+                self.ended
+                    .record(id, p.request.subject.root(), PendingState::Expired, now);
+            }
+        }
+        self.ended.expire(now);
         self.flood.expire(now);
     }
 
@@ -621,9 +643,11 @@ impl GrantStore {
         if self.flood.full(now) {
             return Decision::Denied(DenyReason::DenialsFull);
         }
+        // Unique among the outcomes too, so a waiter of an ended request
+        // is never told another request's state.
         let id = loop {
             let id = PendingId::generate();
-            if !self.pending.contains_key(&id) {
+            if !self.pending.contains_key(&id) && !self.ended.contains(&id) {
                 break id;
             }
         };
@@ -711,6 +735,8 @@ impl GrantStore {
         }
         self.check_approval(id, &opts, digest, now)?;
         let p = self.pending.remove(id).ok_or(ApproveError::NoSuchRequest)?;
+        self.ended
+            .record(*id, p.request.subject.root(), PendingState::Approved, now);
         let kind = p.request.subject.kind();
         let r = p.request;
         let ttl = Duration::from_secs(opts.ttl_secs);
@@ -784,10 +810,48 @@ impl GrantStore {
     pub fn deny(&mut self, id: &PendingId, now: &Now) -> Result<DenyOutcome, NoSuchRequest> {
         self.expire(now);
         let p = self.pending.remove(id).ok_or(NoSuchRequest)?;
-        let root_auto_denied =
-            self.flood
-                .record_denial(p.request.subject.root(), p.fingerprint, now);
+        let root = p.request.subject.root();
+        self.ended
+            .record(*id, root.clone(), PendingState::Denied, now);
+        let root_auto_denied = self.flood.record_denial(root, p.fingerprint, now);
         Ok(DenyOutcome { root_auto_denied })
+    }
+
+    /// How pending request `id` stands, for `caller` at `now`
+    /// (`pending.state`, SPEC §6.1 step 4): [`PendingState::Pending`]
+    /// while it waits, or how it ended while that is remembered, but only
+    /// when `caller`'s verified chain holds the request's root instance;
+    /// [`PendingState::Unknown`] to anyone else and for an id the store
+    /// does not know. Every poll counts against the caller's root's limit
+    /// first, whatever the id, so a refusal says nothing about the id.
+    /// Opens nothing and approves nothing.
+    ///
+    /// # Errors
+    /// [`Busy`] when the caller's root is over its poll limit.
+    pub fn poll(
+        &mut self,
+        id: &PendingId,
+        caller: &SubjectEvidence,
+        now: &Now,
+    ) -> Result<PendingState, Busy> {
+        self.expire(now);
+        let root = caller.root();
+        let live = self
+            .pending
+            .values()
+            .filter(|p| p.request.subject.root() == root)
+            .count();
+        self.polls.take(&root, live, now.awake)?;
+        let state = if let Some(p) = self.pending.get(id) {
+            caller
+                .descends_from(&p.request.subject.root())
+                .then_some(PendingState::Pending)
+        } else {
+            self.ended
+                .get(id)
+                .and_then(|(root, state)| caller.descends_from(root).then_some(state))
+        };
+        Ok(state.unwrap_or(PendingState::Unknown))
     }
 
     /// Item `item` was deleted (SPEC §10b "A grant ends on"): every grant
@@ -828,11 +892,22 @@ impl GrantStore {
             .count()
     }
 
-    /// The vault locked: every grant and pending request ends. Denials
-    /// and auto-denied roots stay.
+    /// The vault locked: every grant and pending request ends, and the
+    /// outcomes remembered go with them (a waiter is told `unknown`, asks
+    /// `run.request` again and is told the vault is locked). Denials and
+    /// auto-denied roots stay.
     pub fn on_lock(&mut self) {
         self.grants.clear();
         self.pending.clear();
+        self.ended.clear();
+        self.polls.clear();
+    }
+
+    /// How many ended requests' outcomes are remembered, and how many
+    /// roots' poll budgets are kept: both bounded ([`crate::MAX_OUTCOMES`],
+    /// [`crate::MAX_POLL_ROOTS`]).
+    pub fn waiting_counts(&self) -> (usize, usize) {
+        (self.ended.len(), self.polls.roots())
     }
 
     /// Drops what has expired, and every grant whose root `alive` says is

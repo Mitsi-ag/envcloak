@@ -23,8 +23,9 @@
 //! - [`GrantStore`]: grants, pending requests and the decision for a
 //!   request (SPEC §10b), with the pending caps and denial rules of
 //!   SPEC §10a "Bounds" ([`flood`]) and the passphrase attempt limiter
-//!   ([`AttemptLimiter`]). The store holds no value and is never written
-//!   to disk.
+//!   ([`AttemptLimiter`]), and how a request stands for the process tree
+//!   that waits on it ([`PendingState`], `GrantStore::poll`). The store
+//!   holds no value and is never written to disk.
 //! - [`PendingDescriptor`], [`canonical_statement`] and
 //!   [`render_statement`]: what an approval surface shows for a pending
 //!   request, and the bytes the proof approves.
@@ -76,7 +77,10 @@ pub use manifest::{
     parse_manifest, resolve,
 };
 pub use names::{Binding, EnvName, ProfileName, Reference, VALUE_RUN, value_shaped};
-pub use pending::{PENDING_TTL, Pending, PendingId};
+pub use pending::{
+    Busy, MAX_OUTCOMES, MAX_POLL_ROOTS, OUTCOME_TTL, PENDING_TTL, POLLS_PER_REQUEST, Pending,
+    PendingId, PendingState,
+};
 pub use project::{
     MANIFEST_NAME, Project, ProjectIdentity, find_manifest, load_project, project_identity,
 };

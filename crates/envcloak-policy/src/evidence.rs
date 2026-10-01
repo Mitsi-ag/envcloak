@@ -644,6 +644,14 @@ impl SubjectEvidence {
         })
     }
 
+    /// Whether `root` is in this caller's verified chain, pid and start
+    /// time alike (and pid version when both know one), the caller
+    /// included: the process tree a request's state is told to (SPEC §6.1
+    /// step 4, `pending.state`). pid 1 is never a root, so never in it.
+    pub fn descends_from(&self, root: &ProcessInstance) -> bool {
+        root.pid != 1 && self.chain.iter().any(|a| a.instance.same(root))
+    }
+
     /// Whether a grant rooted at `root`, approved for a subject of kind
     /// `grant_kind`, may cover this caller (SPEC §10b "Match" rules 3 and
     /// 4, and the tightening by kind):
