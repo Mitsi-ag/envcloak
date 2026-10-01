@@ -1397,58 +1397,49 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
         measure(&a, &format!("envcloak status, {label}"), reach(&text));
         // Each proxied request's result is in the next turn's request.
         let proxied = [
-            ("PRXS", last_tool_output(&after_call(&run, "step 2"))),
-            ("PRXH", last_tool_output(&after_call(&run, "step 3"))),
+            ("PRXS", after_call(&run, "step 2")),
+            ("PRXH", after_call(&run, "step 3")),
         ];
         let seen = |key: &str| {
-            let text = proxied
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map_or(text.as_str(), |(_, t)| t.as_str());
-            if let Some(e) = printed(text, &format!("{key}OK ")) {
+            // The raw probe's keys are in the request after its command;
+            // each proxied one's in the request after its own, read from
+            // that command's tool result.
+            let (body, out) = match proxied.iter().find(|(k, _)| *k == key) {
+                Some((_, body)) => (body.as_str(), last_tool_output(body)),
+                None => (text.as_str(), text.clone()),
+            };
+            if let Some(e) = printed(&out, &format!("{key}OK ")) {
                 format!("reached ({e})")
-            } else if let Some(e) = printed(text, &format!("{key}NO ")) {
+            } else if let Some(e) = printed(&out, &format!("{key}NO ")) {
                 format!("refused ({e})")
-            } else if text.contains("domain is not on the allowlist") {
+            } else if out.contains("domain is not on the allowlist") {
                 // Codex failed the whole command: its proxy blocked the
                 // request's domain.
                 "refused (codex-proxy-allowlist)".to_owned()
             } else {
-                // What the command printed instead (Python's own error, or
-                // the host's), for the record.
-                let said: String = last_tool_output(text)
+                // What the command's tool result said instead (Python's own
+                // error, or the host's words), and the types of the last
+                // items the request ends with, for the record: no value.
+                let said: String = out
                     .chars()
                     .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                    .take(200)
+                    .take(300)
                     .collect();
-                // And the shape of the last tool result, when it says
-                // nothing: its keys and their kinds, no values.
-                let shape = serde_json::from_str::<serde_json::Value>(text)
+                let types = serde_json::from_str::<serde_json::Value>(body)
                     .ok()
-                    .and_then(|v| {
-                        v["input"].as_array().and_then(|items| {
-                            items
-                                .iter()
-                                .rev()
-                                .find(|i| i["type"] == "function_call_output")
-                                .map(|i| {
-                                    i.as_object()
-                                        .map(|o| {
-                                            o.iter()
-                                                .map(|(k, v)| {
-                                                    let n = v.to_string().len();
-                                                    format!("{k}:{n}")
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(",")
-                                        })
-                                        .unwrap_or_default()
-                                })
-                        })
+                    .and_then(|v| v["input"].as_array().cloned())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .rev()
+                            .take(4)
+                            .map(|i| i["type"].as_str().unwrap_or("?").to_owned())
+                            .collect::<Vec<_>>()
+                            .join(",")
                     })
                     .unwrap_or_default();
-                let rc = printed(text, "RC").unwrap_or_else(|| "?".to_owned());
-                format!("not tried (no output: {said:?}; exit {rc}; result {shape})")
+                let rc = printed(&out, "RC").unwrap_or_else(|| "?".to_owned());
+                format!("not tried (tool result {said:?}; exit {rc}; last items {types})")
             }
         };
         let proxies = printed(&text, "PXY ").unwrap_or_else(|| "?".to_owned());
