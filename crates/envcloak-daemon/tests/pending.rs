@@ -410,6 +410,69 @@ fn pending_list_shows_a_request_only_where_a_proof_would_be_taken() {
     f.sweep();
 }
 
+/// `pending.list` names its requests oldest first, whatever their random
+/// ids, and fits in one frame however many bindings each has: three
+/// requests of this session, each binding 3,002 items (3,000 `--ref`s to
+/// an item with a 128-byte slug, as a long env file would), then three
+/// of other sessions. Every binding listed in full would be about 1.2 MB,
+/// over the 1 MiB frame: each request names its first
+/// MAX_LISTED_BINDINGS and counts the rest.
+///
+/// Mutation: list every binding (no `take` in `pending_view`): the answer
+/// exceeds the frame, the call fails and this fails. Mutation: list them
+/// in the store's order (no sort in `pending_all`): the six come back
+/// shuffled (in 719 orders of 720) and this fails.
+#[test]
+fn a_long_listing_fits_one_frame_oldest_first() {
+    use envcloak_ipc::view::MAX_LISTED_BINDINGS;
+    let f = Fixture::new();
+    let slug = format!("long/{}", "a".repeat(123));
+    assert_eq!(slug.len(), 128);
+    client(&f.home)
+        .items_add(&envcloak_ipc::proto::AddParams {
+            slug: Some(slug.clone()),
+            provider: None,
+            field: None,
+            account: None,
+            env_hint: None,
+            allow_short: false,
+            value: envcloak_ipc::WireSecret::new(SecretBytes::copy_from(
+                by_label(&f.cs, labels::DATABASE_URL).value(),
+            )),
+            claims: Vec::new(),
+        })
+        .unwrap();
+    let mut opened = Vec::new();
+    for n in 0..3 {
+        let mut p = f.params(&[&format!("./job-{n}")]);
+        p.refs = (0..3000).map(|i| format!("V{i}={slug}")).collect();
+        opened.push(pending(&client(&f.home).run_request(&p).unwrap().decision));
+    }
+    let mut others = Vec::new();
+    for _ in 0..3 {
+        let (other, id) = Other::start(&f, "requester");
+        opened.push(id.unwrap());
+        others.push(other);
+    }
+    let list = client(&f.home).pending_list(&[]).unwrap();
+    let ids: Vec<&str> = list.requests.iter().map(|r| r.request.as_str()).collect();
+    assert_eq!(ids, opened);
+    for r in &list.requests[..3] {
+        assert_eq!(r.bindings.len(), MAX_LISTED_BINDINGS);
+        assert_eq!(
+            r.more_bindings,
+            u64::try_from(3002 - MAX_LISTED_BINDINGS).unwrap()
+        );
+        assert!(r.bindings.contains(&slug), "{:?}", r.bindings);
+    }
+    for r in &list.requests[3..] {
+        assert_eq!(r.bindings, ["openai/acme-web", "stripe/acme-web"]);
+        assert_eq!(r.more_bindings, 0);
+    }
+    drop(others);
+    f.sweep();
+}
+
 /// A waiter on fresh connections sees an approval at its next poll: this
 /// test approves once the trace shows the request polled (the barrier),
 /// and the first `pending.state` the daemon answers after the approval is
