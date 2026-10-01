@@ -1235,8 +1235,9 @@ impl ErrorKind {
 /// ancestry could not be read, what is wrong with a manifest or a binding,
 /// what is wrong with approval options, and what is wrong with an item.
 /// A slice, so a lane that adds a token changes no count (review R-7):
-/// each token is unique and documented in docs/IPC.md, and each an error
-/// carries has its words in the CLI (tests in both crates check it).
+/// each token is unique and listed in docs/IPC.md's "Reasons" table,
+/// which lists nothing else (review R-21), and each an error carries has
+/// its words in the CLI (tests in both crates check it).
 pub const REASONS: &[&str] = &[
     // Passphrase rules (envcloak_core::PassphraseRejected).
     "not_text",

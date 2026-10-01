@@ -172,6 +172,24 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 
 The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daemon_unavailable`, `daemon_unverified` and `protocol_error` for the connection, `approval_required request=<id>` and `approval_denied` for a run's decision, `audit_problem` when `envcloak audit verify` finds the log changed or damaged, `not_imported`, `unresolved_reference`, `recovery_kit_unconfirmed`, `not_deleted` and `import_too_large` for `envcloak init` and `envcloak import` (IMPORT.md), and `traced` when a tracer is attached to it. `envcloak run` exits 125 on them (SPEC §6.1); the other commands exit 1, and 2 on a usage error.
 
+## Reasons
+
+`data.reason`, and the reason `status` gives for a vault that is unavailable, is one of these tokens and nothing else: any other is dropped from an error, and shown as `unknown` in `status`. Each token is listed once, with the error kinds or results that carry it. A test checks the list both sides keep (`envcloak_ipc::proto::REASONS`) against this table, both ways.
+
+| Reason | Carried by |
+|---|---|
+| `not_text`, `control_character`, `too_short`, `common` | `passphrase_rejected` |
+| `busy`, `damaged`, `unsupported_version`, `permissions`, `disk_full`, `storage`, `io`, `migration` | `vault_unavailable` and `status` (`io` also `manifest_invalid`) |
+| `caller_gone`, `ancestry_changed`, `ancestry_hidden`, `ancestry_unreadable`, `caller_is_init` | `evidence` |
+| `too_large`, `not_utf8`, `syntax`, `duplicate_key`, `unknown_key`, `wrong_type`, `invalid_env_name`, `invalid_profile_name`, `nested_profile`, `invalid_reference`, `invalid_project_name`, `loose_policy`, `invalid_policy`, `unknown_profile`, `duplicate_env_name`, `invalid_path`, `not_found`, `symlinked_manifest`, `not_regular_file`, `not_owned`, `directory_changed` | `manifest_invalid` (`unknown_profile`, `invalid_reference` and `duplicate_env_name` also `binding_unresolved`; `invalid_env_name` also `invalid_item`) |
+| `unknown_item`, `unknown_field`, `ambiguous_field`, `no_field` | `binding_unresolved` and `no_such_item` |
+| `card_reference`, `issuer_credential_reference`, `unknown_item_class` | `manifest_invalid` (`unknown_item_class` also `no_such_item`) |
+| `ttl_zero`, `ttl_too_long`, `live_not_bound` | `invalid_options` |
+| `repeated`, `root_denied`, `pending_per_root`, `pending_total`, `denials_full`, `audit_failed` | `run.request`'s `denied` decision |
+| `item_changed` | `no_such_item` |
+| `invalid_slug`, `invalid_field`, `unknown_provider`, `invalid_account`, `looks_like_value`, `empty_value`, `nul_byte`, `value_too_large`, `no_free_slug` | `invalid_item` |
+| `requester_terminal` | `proof_refused` |
+
 ## Lock
 
 The daemon locks on a `lock` request, on SIGTERM, SIGINT or SIGHUP (it then removes the socket and exits 0, also when its standard error is gone: a log line that cannot be written is dropped, never fatal), after the machine slept, after the idle limit (8 hours by default, 1 minute to 24 hours with `--idle-lock`), and when `vault.recover` closes the vault to restore a backup in its place. `status` and the audit log's `locked` entry name the reason: `request`, `signal`, `sleep`, `idle` or `restore`. Locking drops the unlocked vault, whose VMK, subkeys and decrypted metadata are wiped as they are freed, and keeps the file open and its lock held.
