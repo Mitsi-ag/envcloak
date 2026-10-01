@@ -75,6 +75,23 @@ pub fn idle_connection_override() -> Option<std::time::Duration> {
     }
 }
 
+/// Whether a test build of `envcloakd` writes its test trace
+/// (`ENVCLOAK_TEST_TRACE=1`): a line on standard error for each connection
+/// opened and closed, and for each `pending.state` answer, so a test can
+/// see that a waiter holds no connection between polls and how its polls
+/// were answered. Always false in a build without the `testing` feature,
+/// which only tests enable.
+pub fn test_trace() -> bool {
+    #[cfg(feature = "testing")]
+    {
+        crate::testing::trace()
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        false
+    }
+}
+
 /// Panics with what standard input holds (at most 64 KiB) in the message:
 /// `envcloak internal panic` and `envcloakd internal panic`. With the hook
 /// [`install`] sets, the message is never shown; a release build then

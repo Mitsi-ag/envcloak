@@ -990,3 +990,13 @@ pub(crate) fn idle_connection() -> Option<std::time::Duration> {
         .contains(&ms)
         .then(|| std::time::Duration::from_millis(ms))
 }
+
+/// Names the switch of a test build's trace ([`crate::test_trace`]): `1`
+/// turns it on, anything else leaves it off.
+pub const TRACE: &str = "ENVCLOAK_TEST_TRACE";
+
+/// Whether [`TRACE`] is `1`.
+pub(crate) fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(TRACE).is_some_and(|v| v == "1"))
+}

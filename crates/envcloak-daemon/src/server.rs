@@ -56,8 +56,8 @@ use envcloak_ipc::proto::{
     self, Approve, AuditVerify, BackupCreate, Deny, ErrorKind, FilesBackup, FilesRestore,
     GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify, IncomingRequest, ItemsAdd,
     ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock, Method,
-    PendingGet, RecoveryConfirm, Role, RunRequest, Status, Unlock, UnlockParams, VaultCreate,
-    VaultCreateParams, VaultRecover, loggable_method, required_role,
+    PendingGet, PendingList, PendingPoll, RecoveryConfirm, Role, RunRequest, Status, Unlock,
+    UnlockParams, VaultCreate, VaultCreateParams, VaultRecover, loggable_method, required_role,
 };
 use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
@@ -427,7 +427,15 @@ struct ConnectionSlot {
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        locked(&self.shared.places).give_back(self.pid);
+        let mut places = locked(&self.shared.places);
+        places.give_back(self.pid);
+        if envcloak_sys::test_trace() {
+            log_line!(
+                "envcloakd: test: connection closed pid={} open={}",
+                self.pid,
+                places.total
+            );
+        }
     }
 }
 
@@ -471,6 +479,13 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
                 );
                 continue;
             }
+        }
+        if envcloak_sys::test_trace() {
+            let open = locked(&shared.places).total;
+            log_line!(
+                "envcloakd: test: connection opened pid={} open={open}",
+                peer.pid
+            );
         }
         let slot = ConnectionSlot {
             shared: Arc::clone(shared),
@@ -550,7 +565,18 @@ fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
                 }
                 return;
             }
-            Err(_) => return,
+            Err(e) => {
+                // A test build's trace says when the idle bound closed a
+                // connection: a waiter must never leave one open long.
+                let idle = matches!(
+                    e,
+                    FrameError::Io(io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+                );
+                if envcloak_sys::test_trace() && idle {
+                    log_line!("envcloakd: test: idle connection closed pid={}", peer.pid);
+                }
+                return;
+            }
         };
         // The process that sent this frame must be the one identified at
         // accept, for proofs above all (review T7 open 1).
@@ -604,6 +630,12 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         }
         PendingGet::NAME => {
             answer::<PendingGet>(id, &req, |p| requests::pending_get(shared, peer, p))
+        }
+        PendingPoll::NAME => {
+            answer::<PendingPoll>(id, &req, |p| requests::pending_state(shared, peer, p))
+        }
+        PendingList::NAME => {
+            answer::<PendingList>(id, &req, |p| requests::pending_list(shared, peer, p))
         }
         Approve::NAME => answer::<Approve>(id, &req, |p| requests::approve(shared, peer, p)),
         Deny::NAME => answer::<Deny>(id, &req, |p| requests::deny(shared, peer, p)),

@@ -89,6 +89,7 @@ pub use inuse::{InUse, open_elsewhere};
 pub use lockfile::try_lock_exclusive;
 pub use panic::{
     idle_connection_override, install as install_panic_hook, panic_point, panic_with_input,
+    test_trace,
 };
 pub use peer::{
     PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_identity, peer_uid,
