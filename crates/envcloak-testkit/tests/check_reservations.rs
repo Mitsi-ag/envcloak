@@ -4,8 +4,10 @@
 //! number or name taken twice (in one table, across the tables printed as
 //! `envcloak: <token>`, and in the code itself), a malformed row, an
 //! unknown task or status, a missing table, a code source it cannot read,
-//! and each disagreement between a table and the code, wherever in the
-//! workspace's sources the code holds the entry.
+//! each disagreement between a table and the code, wherever in the
+//! workspace's sources the code holds the entry, a code entry that neither
+//! a `landed` row nor the baseline of M1's entries accounts for, and a
+//! baseline that is missing, malformed or no longer what the code holds.
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -33,12 +35,12 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// A copy of what the script reads (the two documents and every crate's
-/// `src/`), under a fresh test home.
+/// A copy of what the script reads (the two documents, the baseline and
+/// every crate's `src/`), under a fresh test home.
 fn fixture() -> TestHome {
     let t = TestHome::new();
     let root = t.home();
-    for rel in ["docs/IPC.md", "docs/VAULT.md"] {
+    for rel in ["docs/IPC.md", "docs/VAULT.md", BASELINE] {
         let dest = root.join(rel);
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::copy(repo_root().join(rel), dest).unwrap();
@@ -109,6 +111,7 @@ fn assert_fails(t: &TestHome, expect_in_message: &str) {
 
 const VAULT: &str = "docs/VAULT.md";
 const IPC: &str = "docs/IPC.md";
+const BASELINE: &str = "scripts/check-reservations-baseline.txt";
 const RECORD: &str = "crates/envcloak-core/src/audit/record.rs";
 
 /// Adds an `AuditKind` variant and its token to the copy of record.rs.
@@ -663,4 +666,178 @@ fn a_reason_or_a_method_twice_in_the_code_fails() {
         "const NAME: &'static str = \"unlock\";",
     );
     assert_fails(&t, "method name `unlock` appears twice");
+}
+
+// --- Code entries no row accounts for (D-23: reserved before use) ---------
+
+/// Appends a method `name` to the copy of proto.rs.
+fn add_method(t: &TestHome, name: &str) {
+    let path = t.home().join(PROTO);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{text}\npub struct Added;\n\nimpl Method for Added {{\n    const NAME: &'static str = \"{name}\";\n    type Params = NoParams;\n    type Output = LockedView;\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_unreserved_method_in_the_code_fails() {
+    // Codex's case: a method no row reserves.
+    let t = fixture();
+    add_method(&t, "pending.peek");
+    assert_fails(
+        &t,
+        &format!(
+            "`method`: the code has `pending.peek` ({PROTO}), which no `landed` row reserves and {BASELINE} does not hold"
+        ),
+    );
+}
+
+#[test]
+fn a_method_landed_as_reserved_passes() {
+    let t = fixture();
+    add_method(&t, "pending.state");
+    edit(
+        &t,
+        IPC,
+        "| `pending.state` | M2-03 | reserved |",
+        "| `pending.state` | M2-03 | landed |",
+    );
+    assert_passes(&t.home());
+}
+
+#[test]
+fn an_unreserved_reason_in_the_code_fails() {
+    // Codex's case: a reason no row reserves.
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "    \"not_text\",\n",
+        "    \"not_text\",\n    \"new_m2_reason\",\n",
+    );
+    assert_fails(
+        &t,
+        &format!(
+            "`reason`: the code has `new_m2_reason` ({PROTO}), which no `landed` row reserves and {BASELINE} does not hold"
+        ),
+    );
+}
+
+#[test]
+fn an_unreserved_failure_token_in_the_code_fails() {
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn gone() -> Failure { Failure::new(\"brand_new_failure\", \"gone\") }\n",
+    );
+    assert_fails(
+        &t,
+        &format!(
+            "`exit_token`: the code has `brand_new_failure` ({CLIENT_STUB}), which no `landed` row reserves"
+        ),
+    );
+}
+
+#[test]
+fn an_unreserved_error_kind_outside_the_reserved_range_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "ErrorKind::Internal => -32099,",
+        "ErrorKind::Internal => -32099,\n            ErrorKind::Fresh => -32000,",
+    );
+    edit(
+        &t,
+        PROTO,
+        "ErrorKind::Internal => \"internal\",",
+        "ErrorKind::Internal => \"internal\",\n            ErrorKind::Fresh => \"fresh\",",
+    );
+    assert_fails(
+        &t,
+        &format!(
+            "`error_kind`: the code has `fresh` = -32000, which no `landed` row reserves and {BASELINE} does not hold"
+        ),
+    );
+}
+
+#[test]
+fn an_unreserved_statement_domain_in_the_code_fails() {
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub const DOMAIN: &[u8] = b\"envcloak-probe-statement/1\\n\";\n",
+    );
+    assert_fails(
+        &t,
+        &format!(
+            "`statement_domain`: the code has `envcloak-probe-statement/1` ({CLIENT_STUB}), which no `landed` row reserves"
+        ),
+    );
+}
+
+#[test]
+fn a_baseline_entry_the_code_no_longer_holds_fails() {
+    // Gone from the code.
+    let t = fixture();
+    edit(&t, BASELINE, "\nmethod lock\n", "\nmethod lock_all\n");
+    assert_fails(
+        &t,
+        &format!("{BASELINE} holds `method lock_all`, but the code has no such entry"),
+    );
+    assert_fails(&t, "`method`: the code has `lock` (");
+    // Renumbered in the code.
+    let t = fixture();
+    edit(&t, RECORD, "    Recover = 21,\n", "    Recover = 99,\n");
+    assert_fails(
+        &t,
+        &format!("{BASELINE} holds `audit_kind recover` = 21, but the code has it as 99"),
+    );
+    assert_fails(
+        &t,
+        "the code has `recover` = 99 in the reserved range with no `landed` row",
+    );
+}
+
+#[test]
+fn a_missing_or_malformed_baseline_fails() {
+    let t = fixture();
+    std::fs::remove_file(t.home().join(BASELINE)).unwrap();
+    assert_fails(&t, &format!("{BASELINE} could not be read"));
+    let t = fixture();
+    edit(&t, BASELINE, "\nmethod lock\n", "\nmethod\n");
+    assert_fails(&t, "not `method <name>`");
+    let t = fixture();
+    edit(
+        &t,
+        BASELINE,
+        "\naudit_kind run 1\n",
+        "\naudit_kind run one\n",
+    );
+    assert_fails(&t, "not `audit_kind <name> <number>`");
+    let t = fixture();
+    edit(
+        &t,
+        BASELINE,
+        "\nmethod lock\n",
+        "\nmethod lock\nmethod lock\n",
+    );
+    assert_fails(&t, "`method lock` is listed twice");
+    let t = fixture();
+    edit(
+        &t,
+        BASELINE,
+        "\nmethod lock\n",
+        "\nmethod lock\ncoverage active\n",
+    );
+    assert_fails(
+        &t,
+        "`coverage` is not a registry whose code this script reads",
+    );
 }

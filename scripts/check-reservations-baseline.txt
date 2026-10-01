@@ -1,0 +1,390 @@
+# The entries each code registry held before the M2 and M2b reservations:
+# M1 as merged (main at 5f61447), read by scripts/check-reservations.py's
+# own code readers. One entry per line: `<registry> <name>`, and for a
+# numbered registry `<registry> <name> <number>`. check-reservations.py
+# refuses a code entry that is neither here nor in a `landed` or `reuse`
+# row (decision D-23: names and numbers are reserved before use), and a
+# line here the code no longer holds exactly so. The list only shrinks:
+# an entry added from M2 on gets a reservation row, never a line here.
+
+audit_kind run 1
+audit_kind approve 2
+audit_kind deny 3
+audit_kind revoke 4
+audit_kind manifest_changed 5
+audit_kind role_denied 6
+audit_kind foreign_peer 7
+audit_kind unlock 8
+audit_kind lock 9
+audit_kind proof_refused 10
+audit_kind dropped 11
+audit_kind log 12
+audit_kind add 13
+audit_kind rotate 14
+audit_kind remove 15
+audit_kind import 16
+audit_kind files_backup 17
+audit_kind files_restore 18
+audit_kind recovery_confirm 19
+audit_kind backup 20
+audit_kind recover 21
+
+error_kind parse_error -32700
+error_kind invalid_params -32602
+error_kind method_not_found -32601
+error_kind invalid_request -32600
+error_kind internal -32099
+error_kind backup_unusable -32034
+error_kind audit_failed -32033
+error_kind too_many_checks -32032
+error_kind files_backup_failed -32031
+error_kind no_such_backup -32030
+error_kind plan_changed -32029
+error_kind backup_failed -32028
+error_kind invalid_item -32027
+error_kind item_exists -32026
+error_kind no_such_item -32025
+error_kind audit_unavailable -32024
+error_kind invalid_options -32023
+error_kind too_many_grants -32022
+error_kind vault_tampered -32021
+error_kind too_many_attempts -32020
+error_kind proof_refused -32019
+error_kind statement_mismatch -32018
+error_kind no_such_request -32017
+error_kind mode_unsupported -32016
+error_kind policy_denied -32015
+error_kind binding_unresolved -32014
+error_kind manifest_invalid -32013
+error_kind evidence -32012
+error_kind frame_too_large -32011
+error_kind vault_unavailable -32010
+error_kind traced -32009
+error_kind busy -32008
+error_kind kdf_params -32007
+error_kind passphrase_rejected -32006
+error_kind wrong_passphrase -32005
+error_kind vault_exists -32004
+error_kind no_vault -32003
+error_kind vault_locked -32002
+error_kind role_denied -32001
+
+exit_token add
+exit_token agent
+exit_token already_running
+exit_token altered
+exit_token ambiguous_field
+exit_token ancestry_changed
+exit_token ancestry_hidden
+exit_token ancestry_unreadable
+exit_token anchor_mismatch
+exit_token approval_denied
+exit_token approval_required
+exit_token approve
+exit_token audit_failed
+exit_token audit_problem
+exit_token audit_unavailable
+exit_token backup
+exit_token backup_failed
+exit_token backup_unusable
+exit_token bad_fd
+exit_token bind
+exit_token binding_unresolved
+exit_token busy
+exit_token caller_gone
+exit_token caller_is_init
+exit_token cancelled
+exit_token card_reference
+exit_token chain_broken
+exit_token chain_cut
+exit_token changed
+exit_token check_failed
+exit_token command_not_executable
+exit_token command_not_found
+exit_token confirmation_required
+exit_token coverage
+exit_token crypto
+exit_token daemon_not_found
+exit_token daemon_not_started
+exit_token daemon_path
+exit_token daemon_unavailable
+exit_token daemon_unverified
+exit_token data_dir
+exit_token denials_full
+exit_token deny
+exit_token directory_changed
+exit_token dropped
+exit_token duplicate_env_name
+exit_token duplicate_key
+exit_token duplicate_name
+exit_token empty
+exit_token evidence
+exit_token exists
+exit_token files_backup
+exit_token files_backup_failed
+exit_token files_restore
+exit_token foreign_peer
+exit_token frame_too_large
+exit_token full
+exit_token gitignore_refused
+exit_token guessable
+exit_token hard_linked
+exit_token import
+exit_token import_too_large
+exit_token input_too_long
+exit_token internal
+exit_token interpolated
+exit_token invalid_env_name
+exit_token invalid_item
+exit_token invalid_kit
+exit_token invalid_name
+exit_token invalid_options
+exit_token invalid_params
+exit_token invalid_path
+exit_token invalid_policy
+exit_token invalid_profile_name
+exit_token invalid_project_name
+exit_token invalid_reference
+exit_token invalid_request
+exit_token invalid_value
+exit_token io
+exit_token issuer_credential_reference
+exit_token item_exists
+exit_token kdf_params
+exit_token kit_fd
+exit_token kit_not_written
+exit_token leftover
+exit_token live_not_bound
+exit_token lock
+exit_token lock_file
+exit_token log
+exit_token looks_like_value
+exit_token loose_policy
+exit_token manifest_changed
+exit_token manifest_invalid
+exit_token method_not_found
+exit_token missing
+exit_token missing_equals
+exit_token mode_unsupported
+exit_token mount_point
+exit_token moved_aside
+exit_token nested_profile
+exit_token no_field
+exit_token no_home
+exit_token no_input
+exit_token no_manifest
+exit_token no_such_backup
+exit_token no_such_item
+exit_token no_such_request
+exit_token no_terminal
+exit_token no_vault
+exit_token not_a_profile_name
+exit_token not_deleted
+exit_token not_found
+exit_token not_imported
+exit_token not_owned
+exit_token not_regular
+exit_token not_regular_file
+exit_token not_removed
+exit_token not_secret
+exit_token not_utf8
+exit_token nul_byte
+exit_token open_elsewhere
+exit_token orphaned
+exit_token parse_error
+exit_token passphrase_mismatch
+exit_token passphrase_rejected
+exit_token path_unsupported
+exit_token pending_per_root
+exit_token pending_total
+exit_token plan_changed
+exit_token policy_denied
+exit_token proof_refused
+exit_token protocol_error
+exit_token recently_changed
+exit_token recover
+exit_token recovery_confirm
+exit_token recovery_kit_unconfirmed
+exit_token reference
+exit_token remove
+exit_token reordered
+exit_token repeated
+exit_token requester_terminal
+exit_token revoke
+exit_token role_denied
+exit_token root_denied
+exit_token rotate
+exit_token run
+exit_token run_failed
+exit_token runtime_dir
+exit_token scan_root
+exit_token secret_fd
+exit_token segment_damaged
+exit_token service_manager
+exit_token signals
+exit_token socket_taken
+exit_token statement_mismatch
+exit_token stdin_is_terminal
+exit_token symlink
+exit_token symlinked_manifest
+exit_token sync
+exit_token syntax
+exit_token terminated
+exit_token too_deep
+exit_token too_large
+exit_token too_many_attempts
+exit_token too_many_checks
+exit_token too_many_entries
+exit_token too_many_grants
+exit_token too_short
+exit_token traced
+exit_token trailing_characters
+exit_token ttl_too_long
+exit_token ttl_zero
+exit_token unchecked
+exit_token undo_incomplete
+exit_token unknown_field
+exit_token unknown_item
+exit_token unknown_item_class
+exit_token unknown_key
+exit_token unknown_profile
+exit_token unlock
+exit_token unreadable
+exit_token unresolved_reference
+exit_token unsafe
+exit_token unterminated_quote
+exit_token usage
+exit_token value_on_argv
+exit_token value_too_short
+exit_token vault_exists
+exit_token vault_locked
+exit_token vault_tampered
+exit_token vault_unavailable
+exit_token warning
+exit_token write_failed
+exit_token wrong_passphrase
+exit_token wrong_type
+
+field_tag header 1
+field_tag item_meta 2
+field_tag field_name 3
+field_tag field_value 4
+field_tag field_prior 5
+field_tag project 6
+field_tag policy 7
+field_tag audit_entry 8
+field_tag backup_manifest 9
+field_tag backup_chunk 10
+field_tag file_backup_key 11
+field_tag file_backup_manifest 12
+field_tag file_backup_content 13
+
+item_class none 0
+item_class secret 1
+item_class card 2
+item_class issuer_credential 3
+
+method approve
+method audit.verify
+method backup.create
+method deny
+method files.backup
+method files.restore
+method grants.list
+method grants.revoke
+method import.commit
+method import.plan
+method import.verify
+method items.add
+method items.check
+method items.list
+method items.remove
+method items.rotate
+method items.show
+method items.target
+method lock
+method pending.get
+method recovery.confirm
+method run.request
+method status
+method unlock
+method vault.create
+method vault.recover
+
+reason ambiguous_field
+reason ancestry_changed
+reason ancestry_hidden
+reason ancestry_unreadable
+reason audit_failed
+reason busy
+reason caller_gone
+reason caller_is_init
+reason card_reference
+reason common
+reason control_character
+reason damaged
+reason denials_full
+reason directory_changed
+reason disk_full
+reason duplicate_env_name
+reason duplicate_key
+reason empty_value
+reason invalid_account
+reason invalid_env_name
+reason invalid_field
+reason invalid_path
+reason invalid_policy
+reason invalid_profile_name
+reason invalid_project_name
+reason invalid_reference
+reason invalid_slug
+reason io
+reason issuer_credential_reference
+reason item_changed
+reason live_not_bound
+reason looks_like_value
+reason loose_policy
+reason migration
+reason nested_profile
+reason no_field
+reason no_free_slug
+reason not_found
+reason not_owned
+reason not_regular_file
+reason not_text
+reason not_utf8
+reason nul_byte
+reason pending_per_root
+reason pending_total
+reason permissions
+reason repeated
+reason requester_terminal
+reason root_denied
+reason storage
+reason symlinked_manifest
+reason syntax
+reason too_large
+reason too_short
+reason ttl_too_long
+reason ttl_zero
+reason unknown_field
+reason unknown_item
+reason unknown_item_class
+reason unknown_key
+reason unknown_profile
+reason unknown_provider
+reason unsupported_version
+reason value_too_large
+reason wrong_type
+
+statement_domain envcloak-statement/1
+
+table_tag header 1
+table_tag items 2
+table_tag fields 3
+table_tag projects 4
+table_tag policies 5
+table_tag audit 6
+table_tag unlockers 7
+table_tag backup 8
+table_tag file_backup 9
