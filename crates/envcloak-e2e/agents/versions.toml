@@ -15,6 +15,9 @@
 # Tier 1 (decision D-14) are driven end to end. Tier 2 are installed here
 # so M2-10 can observe their real install layouts; docs/ACCEPTANCE.md
 # says which of them the scripted model can drive.
+#
+# npm-installed hosts are installed with `npm ci` from the lockfile in
+# npm/<id>/, which pins every package in the tree by its integrity hash.
 
 # Claude Code, the native build (the documented install).
 [[host]]
@@ -30,9 +33,11 @@ entry = "claude"
 darwin-arm64 = "387a5c5dcdbb815085edf0baf79591f9d8894efe922bceaf3d75b1b08055229d"
 linux-x64 = "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
 
-# Claude Code from npm. From 2.x its install script copies the same native
-# binary over bin/claude.exe (the hashes equal the native build's); only
-# with install scripts off does `node cli-wrapper.cjs` start it instead.
+# Claude Code from npm, as `npm install -g` leaves it: its install script
+# copies the same native binary over bin/claude.exe (the hashes equal the
+# native build's), so this variant differs from the native one only in
+# where the binary lives (node_modules/.../bin/claude.exe), which M2-10's
+# path catalog reads.
 [[host]]
 id = "claude-code"
 variant = "npm"
@@ -44,6 +49,32 @@ scripts = true
 entry = "node_modules/@anthropic-ai/claude-code/bin/claude.exe"
 
 [host.sha256]
+darwin-arm64 = "387a5c5dcdbb815085edf0baf79591f9d8894efe922bceaf3d75b1b08055229d"
+linux-x64 = "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
+
+# Claude Code from npm with install scripts off (`npm install
+# --ignore-scripts`): bin/claude.exe stays a placeholder and the package's
+# fallback launcher, `node cli-wrapper.cjs`, starts the native binary from
+# the platform package. The interpreter-launched layout (F-37: Node as the
+# entry executable, cli-wrapper.cjs as the script, the native binary its
+# child), which M2-10 classifies on an asserted basis.
+[[host]]
+id = "claude-code"
+variant = "npm-wrapper"
+tier = 1
+version = "2.1.280"
+method = "npm"
+package = "@anthropic-ai/claude-code"
+scripts = false
+interpreter = "node"
+entry = "node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs"
+sha256 = "61ad63033d9c8155d5e60a29f45dc4665afa07631c0b108e62cc83bf45ba490e"
+
+[host.starts]
+darwin-arm64 = "node_modules/@anthropic-ai/claude-code-darwin-arm64/claude"
+linux-x64 = "node_modules/@anthropic-ai/claude-code-linux-x64/claude"
+
+[host.starts_sha256]
 darwin-arm64 = "387a5c5dcdbb815085edf0baf79591f9d8894efe922bceaf3d75b1b08055229d"
 linux-x64 = "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
 

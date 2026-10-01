@@ -19,14 +19,25 @@
 //!   CI credential ever enters the home: the environment is cleared
 //!   first.
 //!
-//! When a host is not installed, [`require`] skips the test with a line
-//! on standard error, unless `ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS` is set
-//! (CI's agent jobs set it), in which case the test fails.
+//! When no host has been installed on this machine (no cache directory),
+//! [`require`] skips the test with a line on standard error, unless
+//! `ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS` is set (CI's agent jobs set it). A
+//! cache that exists but lacks the pinned build fails the test: the
+//! installer ran, so a host it should have put there is missing.
+//!
+//! Every process the harness starts for a host leads a process group of
+//! its own ([`GroupChild`]). When it exits, or outlives its limit, what is
+//! left of the group is killed while the leader is still unreaped, so its
+//! descendants (MCP servers, commands) go with it; its output is then read
+//! to the end, and output that a process outside the group still holds
+//! open fails the run as incomplete instead of being cut short.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -74,17 +85,29 @@ pub fn platform() -> Option<&'static str> {
     }
 }
 
-/// The cache: `ENVCLOAK_AGENT_HOSTS`, else `agent-hosts` in the target
-/// directory of the running test binary.
+/// The cache: `ENVCLOAK_AGENT_HOSTS`, else [`default_cache_dir`] of the
+/// running binary, which is where scripts/install-agent-hosts.py installs
+/// by default (`<target>/agent-hosts`).
 pub fn cache_dir() -> PathBuf {
     if let Some(d) = std::env::var_os(CACHE_VAR) {
         return PathBuf::from(d);
     }
     let exe = std::env::current_exe().unwrap_or_else(|e| panic!("no current exe: {e}"));
-    exe.parent()
-        .and_then(Path::parent)
-        .map(|t| t.join("agent-hosts"))
-        .unwrap_or_else(|| panic!("the test binary is not in a target directory"))
+    default_cache_dir(&exe)
+        .unwrap_or_else(|| panic!("the running binary is not in a target directory"))
+}
+
+/// `agent-hosts` in the target directory of the binary `exe`: a test
+/// binary is in `<target>/<profile>/deps`, a program such as `ec-model` in
+/// `<target>/<profile>`. The installer's default is the same directory
+/// (`CARGO_TARGET_DIR`, else the workspace's `target/`), checked by
+/// crates/envcloak-testkit/tests/agent_cache.rs.
+pub fn default_cache_dir(exe: &Path) -> Option<PathBuf> {
+    let mut profile = exe.parent()?;
+    if profile.file_name().is_some_and(|n| n == "deps") {
+        profile = profile.parent()?;
+    }
+    Some(profile.parent()?.join("agent-hosts"))
 }
 
 /// One host as versions.toml pins it, for this platform.
@@ -98,6 +121,12 @@ pub struct Pin {
     pub entry: String,
     /// The entry file's SHA-256, lower-case hex.
     pub sha256: String,
+    /// The program that runs the entry file, when it is a script
+    /// (`node`): found on `PATH` when the host starts.
+    pub interpreter: Option<String>,
+    /// The program the entry starts in its turn, relative to the host's
+    /// directory, and its SHA-256: checked like the entry.
+    pub starts: Option<(String, String)>,
 }
 
 /// Every host versions.toml pins for this platform.
@@ -127,6 +156,11 @@ pub fn pins(versions: &Path) -> Vec<Pin> {
         .iter()
         .map(|t| {
             let need = |k: &str| field(t, k).unwrap_or_else(|| panic!("a host without {k}"));
+            let starts = field(t, "starts").map(|path| {
+                let sum = field(t, "starts_sha256")
+                    .unwrap_or_else(|| panic!("a host whose `starts` has no starts_sha256"));
+                (path, sum)
+            });
             Pin {
                 id: need("id"),
                 variant: need("variant"),
@@ -137,6 +171,8 @@ pub fn pins(versions: &Path) -> Vec<Pin> {
                     .unwrap_or(0),
                 entry: need("entry"),
                 sha256: need("sha256"),
+                interpreter: field(t, "interpreter"),
+                starts,
             }
         })
         .collect()
@@ -197,31 +233,63 @@ impl Installed {
         Ok(host)
     }
 
-    /// Checks the entry file's SHA-256 against the pin again.
+    /// Checks the entry file's SHA-256 against the pin again, and that of
+    /// the program it starts, when the pin names one.
     ///
     /// # Errors
-    /// When it is missing or differs.
+    /// When either is missing or differs.
     pub fn verify(&self) -> Result<(), String> {
-        let got = sha256_file(&self.exe).map_err(|e| {
-            format!(
-                "{} {} is not installed ({e}); run {INSTALL}",
-                self.pin.id, self.pin.version
-            )
-        })?;
-        if got != self.pin.sha256 {
-            return Err(format!(
-                "{} at {} is not the pinned build (SHA-256 {got}); remove {} and run {INSTALL}",
-                self.pin.id,
-                self.exe.display(),
-                self.dir.display()
-            ));
+        let mut files = vec![(self.exe.clone(), self.pin.sha256.as_str())];
+        if let Some((path, sum)) = &self.pin.starts {
+            files.push((self.dir.join(path), sum.as_str()));
+        }
+        for (file, want) in files {
+            let got = sha256_file(&file).map_err(|e| {
+                format!(
+                    "{} {} is not installed ({e}); run {INSTALL}",
+                    self.pin.id, self.pin.version
+                )
+            })?;
+            if got != want {
+                return Err(format!(
+                    "{} at {} is not the pinned build (SHA-256 {got}); remove {} and run {INSTALL}",
+                    self.pin.id,
+                    file.display(),
+                    self.dir.display()
+                ));
+            }
         }
         Ok(())
     }
+
+    /// The command that starts the host: its entry, or its interpreter
+    /// (found on this process's `PATH`) with the entry as the script.
+    ///
+    /// # Panics
+    /// When the interpreter is not on `PATH`.
+    pub fn command(&self) -> Command {
+        match &self.pin.interpreter {
+            None => Command::new(&self.exe),
+            Some(name) => {
+                let found = std::env::var_os("PATH")
+                    .and_then(|p| {
+                        std::env::split_paths(&p)
+                            .map(|d| d.join(name))
+                            .find(|p| p.is_file())
+                    })
+                    .unwrap_or_else(|| panic!("{name} is needed on PATH for {}", self.pin.id));
+                let mut cmd = Command::new(found);
+                cmd.arg(&self.exe);
+                cmd
+            }
+        }
+    }
 }
 
-/// `found`, or `None` after saying why on standard error, unless
-/// [`REQUIRE_VAR`] is set: then a host that is not there fails the test.
+/// `found`, or `None` after saying why on standard error when no host has
+/// been installed on this machine ([`cache_dir`] does not exist) and
+/// [`REQUIRE_VAR`] is not set. Otherwise a host that is not there fails
+/// the test: the installer ran, or CI requires the hosts.
 ///
 /// # Panics
 /// As above.
@@ -231,8 +299,17 @@ pub fn require(found: Result<Installed, String>, test: &str) -> Option<Installed
         Err(why) if std::env::var_os(REQUIRE_VAR).is_some() => {
             panic!("{test}: {why} ({REQUIRE_VAR} is set)")
         }
+        Err(why) if platform().is_some() && cache_dir().exists() => {
+            panic!(
+                "{test}: {why} (the cache {} exists, so the installer ran)",
+                cache_dir().display()
+            )
+        }
         Err(why) => {
-            eprintln!("{test}: skipped: {why}");
+            eprintln!(
+                "{test}: skipped: {why}; no host is installed in {} ({INSTALL})",
+                cache_dir().display()
+            );
             None
         }
     }
@@ -465,7 +542,7 @@ impl Model {
     ///
     /// # Panics
     /// When the host exits first, or [`RUN_LIMIT`] passes.
-    pub fn wait_for(&mut self, pick: &str, child: &mut Child) -> ModelRequest {
+    pub fn wait_for(&mut self, pick: &str, child: &mut GroupChild) -> ModelRequest {
         let end = Instant::now() + RUN_LIMIT;
         loop {
             if let Some(r) = self
@@ -476,8 +553,8 @@ impl Model {
             {
                 return r;
             }
-            if let Ok(Some(status)) = child.try_wait() {
-                panic!("the host exited ({status}) before the model was asked for {pick}");
+            if child.has_exited() {
+                panic!("the host exited before the model was asked for {pick}");
             }
             assert!(
                 Instant::now() < end,
@@ -626,7 +703,9 @@ pub struct AgentHome {
     pub host: Host,
     pub installed: Installed,
     env: Vec<(String, OsString)>,
-    codex_extra: String,
+    /// The keys [`AgentHome::codex_config`] last set, to take out when it
+    /// sets others.
+    codex_extra: Vec<Vec<String>>,
 }
 
 impl AgentHome {
@@ -655,7 +734,7 @@ impl AgentHome {
             host,
             installed,
             env: Vec::new(),
-            codex_extra: String::new(),
+            codex_extra: Vec::new(),
         };
         if host == Host::Codex {
             std::fs::create_dir_all(a.codex_home())
@@ -691,16 +770,56 @@ impl AgentHome {
         self.env.push((name.to_owned(), value.into()));
     }
 
-    /// TOML added to Codex's `config.toml` after the harness's own keys,
-    /// for settings a test says the person made.
+    /// Settings a test says the person made, merged into Codex's
+    /// `config.toml` key by key, after taking out the ones the last call
+    /// set. What Codex's own CLI wrote there (`codex mcp add`) and the
+    /// harness's keys stay as they are.
+    ///
+    /// # Panics
+    /// When `toml` is not TOML, sets one of the harness's keys, or the
+    /// file cannot be read or written.
     pub fn codex_config(&mut self, toml: &str) {
-        self.codex_extra = toml.to_owned();
+        let extra: toml_edit::DocumentMut = toml
+            .parse()
+            .unwrap_or_else(|e| panic!("the person's Codex settings are not TOML: {e}"));
+        let leaves = leaves(extra.as_table());
+        for leaf in &leaves {
+            assert!(
+                !HARNESS_KEYS.contains(&leaf[0].as_str()),
+                "the harness owns Codex's {}",
+                leaf[0]
+            );
+        }
+        let mut doc = self.read_codex_config();
+        for leaf in &self.codex_extra {
+            remove_leaf(doc.as_table_mut(), leaf);
+        }
+        for leaf in &leaves {
+            set_leaf(doc.as_table_mut(), extra.as_table(), leaf);
+        }
+        self.codex_extra = leaves;
+        self.write_codex_doc(&doc);
+    }
+
+    fn read_codex_config(&self) -> toml_edit::DocumentMut {
+        match std::fs::read_to_string(self.codex_home().join("config.toml")) {
+            Ok(text) => text
+                .parse()
+                .unwrap_or_else(|e| panic!("Codex's config.toml is not TOML: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+            Err(e) => panic!("read Codex's config.toml: {e}"),
+        }
+    }
+
+    fn write_codex_doc(&self, doc: &toml_edit::DocumentMut) {
+        std::fs::write(self.codex_home().join("config.toml"), doc.to_string())
+            .unwrap_or_else(|e| panic!("write Codex's config.toml: {e}"));
     }
 
     /// The environment of a run against `model`: the home's cleared one,
     /// the host's model settings, the proxy, then the test's own.
-    fn command(&self, exe: &Path, model: Option<&Model>) -> Command {
-        let mut cmd = Command::new(exe);
+    fn command(&self, model: Option<&Model>) -> Command {
+        let mut cmd = self.installed.command();
         cmd.env_clear().envs(self.vars.iter().map(|(k, v)| (k, v)));
         if let Some(m) = model {
             let proxy = m.base_url();
@@ -736,29 +855,34 @@ impl AgentHome {
     /// documentation), for a test that starts the host some other way,
     /// such as on a pseudo-terminal of its own.
     pub fn env_for(&self, model: &Model) -> Vec<(OsString, OsString)> {
-        let cmd = self.command(&self.installed.exe, Some(model));
+        let cmd = self.command(Some(model));
         cmd.get_envs()
             .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
             .collect()
     }
 
+    /// The harness's keys in Codex's `config.toml`: the scripted model as
+    /// the only provider, the update check off. Everything else in the
+    /// file (the person's settings, what Codex's CLI wrote) is kept.
     fn write_codex_config(&self, model: &Model) {
-        let text = format!(
-            "# Written by the EnvCloak test harness (M2-04): the scripted model is the\n\
-             # only provider, and the update check is off.\n\
-             model = \"ec-scripted\"\n\
-             model_provider = \"ec\"\n\
-             check_for_update_on_startup = false\n\
-             model_providers.ec.name = \"EnvCloak scripted model\"\n\
-             model_providers.ec.base_url = \"{}/v1\"\n\
-             model_providers.ec.env_key = \"EC_MODEL_TOKEN\"\n\
-             model_providers.ec.wire_api = \"responses\"\n\
-             {}\n",
-            model.base_url(),
-            self.codex_extra
+        let mut doc = self.read_codex_config();
+        let t = doc.as_table_mut();
+        t.insert("model", toml_edit::value("ec-scripted"));
+        t.insert("model_provider", toml_edit::value("ec"));
+        t.insert("check_for_update_on_startup", toml_edit::value(false));
+        let mut ec = toml_edit::Table::new();
+        ec.insert("name", toml_edit::value("EnvCloak scripted model"));
+        ec.insert(
+            "base_url",
+            toml_edit::value(format!("{}/v1", model.base_url())),
         );
-        std::fs::write(self.codex_home().join("config.toml"), text)
-            .unwrap_or_else(|e| panic!("write Codex's config.toml: {e}"));
+        ec.insert("env_key", toml_edit::value("EC_MODEL_TOKEN"));
+        ec.insert("wire_api", toml_edit::value("responses"));
+        let mut providers = toml_edit::Table::new();
+        providers.set_implicit(true);
+        providers.insert("ec", toml_edit::Item::Table(ec));
+        t.insert("model_providers", toml_edit::Item::Table(providers));
+        self.write_codex_doc(&doc);
     }
 
     /// Starts the host in `cwd` with `prompt` and `flags`, against a fresh
@@ -771,7 +895,7 @@ impl AgentHome {
         if self.host == Host::Codex {
             self.write_codex_config(&model);
         }
-        let mut cmd = self.command(&self.installed.exe, Some(&model));
+        let mut cmd = self.command(Some(&model));
         match self.host {
             Host::ClaudeCode => {
                 cmd.arg("-p").arg(prompt).args(&flags.args);
@@ -787,10 +911,9 @@ impl AgentHome {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let start = Instant::now();
-        let mut child = cmd
-            .spawn()
+        let mut child = GroupChild::spawn(&mut cmd)
             .unwrap_or_else(|e| panic!("start {}: {e}", self.installed.pin.id));
-        let collector = Collector::start(&mut child);
+        let collector = Collector::start(&mut child.child);
         Running {
             child,
             collector,
@@ -828,7 +951,7 @@ impl AgentHome {
     /// # Panics
     /// When it does not finish.
     pub fn host_cli(&self, args: &[&str]) -> Output {
-        let mut cmd = self.command(&self.installed.exe, None);
+        let mut cmd = self.command(None);
         cmd.args(args)
             .current_dir(self.home_dir())
             .stdin(Stdio::null())
@@ -857,10 +980,12 @@ impl AgentHome {
     }
 }
 
-/// A host run in progress ([`AgentHome::spawn`]).
+/// A host run in progress ([`AgentHome::spawn`]). Dropped without
+/// [`Running::wait`] (a test that failed half way), what is left of the
+/// host's group is killed.
 #[derive(Debug)]
 pub struct Running {
-    pub child: Child,
+    pub child: GroupChild,
     collector: Collector,
     pub model: Model,
     start: Instant,
@@ -868,10 +993,11 @@ pub struct Running {
 
 impl Running {
     /// Waits for the host to exit (at most [`RUN_LIMIT`] from its start),
-    /// then ends the model's run.
+    /// kills what is left of its group, reads its output to the end, then
+    /// ends the model's run.
     ///
     /// # Panics
-    /// When the host does not exit in time.
+    /// When the host does not exit in time, or its output is incomplete.
     pub fn wait(mut self) -> HostRun {
         let left = RUN_LIMIT.saturating_sub(self.start.elapsed());
         let output = self.collector.wait(&mut self.child, left);
@@ -884,9 +1010,109 @@ impl Running {
     }
 }
 
-/// The output of a child, collected as it comes. What a descendant still
-/// holds open after the child exits is collected for 5 more seconds, then
-/// taken as it is.
+/// A child that leads a process group of its own, as the harness starts
+/// every host (M2 plan §6 rule 3, D-34). Its exit is seen without reaping
+/// it (`waitid` with `WNOWAIT`, on a thread of its own), so the group is
+/// signalled only while the child that leads it is unreaped and its id
+/// cannot have been reused; it is reaped last. Dropped before then, its
+/// group is killed and it is reaped.
+#[derive(Debug)]
+pub struct GroupChild {
+    child: Child,
+    pid: i32,
+    exited: mpsc::Receiver<()>,
+    seen_exit: bool,
+    status: Option<ExitStatus>,
+}
+
+impl GroupChild {
+    /// Starts `cmd` as the leader of a new process group.
+    ///
+    /// # Errors
+    /// When it cannot start.
+    pub fn spawn(cmd: &mut Command) -> std::io::Result<GroupChild> {
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+        let (tx, exited) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = envcloak_sys::wait_for_exit(pid);
+            let _ = tx.send(());
+        });
+        Ok(GroupChild {
+            child,
+            pid,
+            exited,
+            seen_exit: false,
+            status: None,
+        })
+    }
+
+    /// Its process id, which is also its group's.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether it has exited (it stays unreaped).
+    pub fn has_exited(&mut self) -> bool {
+        if !self.seen_exit && self.exited.try_recv().is_ok() {
+            self.seen_exit = true;
+        }
+        self.seen_exit
+    }
+
+    /// Waits up to `limit` for it to exit; whether it did.
+    fn wait_exit(&mut self, limit: Duration) -> bool {
+        if !self.seen_exit {
+            match self.exited.recv_timeout(limit) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => self.seen_exit = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        self.seen_exit
+    }
+
+    /// Sends `sig` to every process in its group, only while it is
+    /// unreaped.
+    fn signal_group(&self, sig: i32) {
+        if self.status.is_none() {
+            let _ = envcloak_sys::signal_group(self.pid, sig);
+        }
+    }
+
+    /// Kills what is left of its group, waits for it to exit and reaps it.
+    fn finish(&mut self) -> ExitStatus {
+        if let Some(s) = self.status {
+            return s;
+        }
+        self.signal_group(libc::SIGKILL);
+        if !self.seen_exit {
+            let _ = self.exited.recv();
+            self.seen_exit = true;
+        }
+        let status = self
+            .child
+            .wait()
+            .unwrap_or_else(|e| panic!("reap a child: {e}"));
+        self.status = Some(status);
+        status
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        if self.status.is_none() {
+            let _ = self.finish();
+        }
+    }
+}
+
+/// How long output may stay open after a child exited and its group was
+/// killed before the run is incomplete: only a process outside the group
+/// can still hold it then.
+const OUTPUT_GRACE: Duration = Duration::from_secs(10);
+
+/// The output of a child, collected as it comes, to its end.
 #[derive(Debug)]
 struct Collector {
     out: Collected,
@@ -935,32 +1161,41 @@ impl Collector {
         }
     }
 
-    /// Waits up to `limit` for `child` (this process's own, unreaped
-    /// child, killed if it is still running then) and returns its output.
-    fn wait(&self, child: &mut Child, limit: Duration) -> Output {
-        let start = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(s)) => break s,
-                Ok(None) => {}
-                Err(e) => panic!("wait: {e}"),
-            }
-            if start.elapsed() > limit {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("a process did not exit within {limit:?}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+    /// Waits up to `limit` for `child` to exit (past it: `SIGTERM` to its
+    /// group, then `SIGKILL` 2 s later), kills what is left of its group,
+    /// reaps it, and returns its output read to the end.
+    ///
+    /// # Panics
+    /// When it did not exit within `limit`, or a process outside its
+    /// group still holds its output open [`OUTPUT_GRACE`] later (the
+    /// output would be cut short: the run is incomplete).
+    fn wait(&self, child: &mut GroupChild, limit: Duration) -> Output {
+        self.wait_grace(child, limit, OUTPUT_GRACE)
+    }
+
+    fn wait_grace(&self, child: &mut GroupChild, limit: Duration, grace: Duration) -> Output {
+        let in_time = child.wait_exit(limit);
+        if !in_time {
+            child.signal_group(libc::SIGTERM);
+            child.wait_exit(Duration::from_secs(2));
+        }
+        let status = child.finish();
         let done = |c: &Collected| {
             c.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .1
         };
-        let end = Instant::now() + Duration::from_secs(5);
+        let end = Instant::now() + grace;
         while !(done(&self.out) && done(&self.err)) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
         }
+        let complete = done(&self.out) && done(&self.err);
+        assert!(in_time, "a process did not exit within {limit:?}");
+        assert!(
+            complete,
+            "incomplete output: {grace:?} after the process exited and its group was killed, \
+             a process outside the group still held its output open"
+        );
         let take = |c: &Collected| {
             std::mem::take(
                 &mut c
@@ -977,16 +1212,289 @@ impl Collector {
     }
 }
 
-/// Spawns `cmd` and waits up to `limit`, collecting its output as it
-/// comes (see [`Collector`]). A process still running then is killed (it
-/// is this function's own, unreaped child), and the test fails.
+/// Spawns `cmd` as the leader of a process group of its own and waits up
+/// to `limit`, collecting its output to the end (see [`Collector`] and
+/// [`GroupChild`]). A process still running then is stopped with its
+/// group, and the test fails.
 ///
 /// # Panics
 /// As above, and when the process cannot start.
 pub fn finish_within(mut cmd: Command, limit: Duration) -> Output {
-    let mut child = cmd
-        .spawn()
-        .unwrap_or_else(|e| panic!("cannot start a process: {e}"));
-    let collector = Collector::start(&mut child);
+    let mut child =
+        GroupChild::spawn(&mut cmd).unwrap_or_else(|e| panic!("cannot start a process: {e}"));
+    let collector = Collector::start(&mut child.child);
     collector.wait(&mut child, limit)
+}
+
+/// The harness's own top-level keys in Codex's `config.toml`.
+const HARNESS_KEYS: [&str; 4] = [
+    "model",
+    "model_provider",
+    "check_for_update_on_startup",
+    "model_providers",
+];
+
+/// The paths of the values `table` sets: through its tables, down to a
+/// value or an array of tables, which count whole.
+fn leaves(table: &toml_edit::Table) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for (k, item) in table {
+        match item {
+            toml_edit::Item::Table(t) => {
+                for mut leaf in leaves(t) {
+                    leaf.insert(0, k.to_owned());
+                    out.push(leaf);
+                }
+            }
+            _ => out.push(vec![k.to_owned()]),
+        }
+    }
+    out
+}
+
+/// Sets the value at `leaf` in `doc` to the one in `from`, making the
+/// tables on the way.
+fn set_leaf(doc: &mut toml_edit::Table, from: &toml_edit::Table, leaf: &[String]) {
+    let (Some(first), rest) = (leaf.first(), leaf.get(1..).unwrap_or(&[])) else {
+        return;
+    };
+    let Some(item) = from.get(first) else { return };
+    if rest.is_empty() {
+        doc.insert(first, item.clone());
+        return;
+    }
+    let Some(sub_from) = item.as_table() else {
+        return;
+    };
+    let entry = doc.entry(first).or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        toml_edit::Item::Table(t)
+    });
+    let Some(sub) = entry.as_table_mut() else {
+        panic!("Codex's config.toml has {first} as a value, not a table");
+    };
+    set_leaf(sub, sub_from, rest);
+}
+
+/// Takes the value at `leaf` out of `doc`, and the tables it leaves empty.
+fn remove_leaf(doc: &mut toml_edit::Table, leaf: &[String]) {
+    let (Some(first), rest) = (leaf.first(), leaf.get(1..).unwrap_or(&[])) else {
+        return;
+    };
+    if rest.is_empty() {
+        doc.remove(first);
+        return;
+    }
+    let empty = match doc.get_mut(first).and_then(toml_edit::Item::as_table_mut) {
+        Some(sub) => {
+            remove_leaf(sub, rest);
+            sub.is_empty()
+        }
+        None => false,
+    };
+    if empty {
+        doc.remove(first);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    }
+
+    /// A descendant in the group still holding the output when the child
+    /// exits is killed with the group, so the output ends at once.
+    #[test]
+    fn what_is_left_of_the_group_is_killed_and_the_output_read_to_its_end() {
+        let start = Instant::now();
+        let out = finish_within(
+            sh("sleep 600 & echo started; echo to-stderr >&2"),
+            Duration::from_secs(60),
+        );
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(out.stdout, b"started\n");
+        assert_eq!(out.stderr, b"to-stderr\n");
+        assert!(start.elapsed() < OUTPUT_GRACE, "{:?}", start.elapsed());
+    }
+
+    /// Output a process outside the group still holds is not cut short
+    /// in silence: the run fails as incomplete. The escaped process ends on
+    /// its own two seconds later.
+    #[test]
+    fn output_held_open_from_outside_the_group_fails_the_run() {
+        let python = [
+            "/usr/bin/python3",
+            "/usr/local/bin/python3",
+            "/opt/homebrew/bin/python3",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or_else(|| panic!("python3 is needed"));
+        // The shell exits only once the process has left its group: a
+        // FIFO is the barrier.
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let fifo = dir.path().join("left");
+        let mut cmd = sh(&format!(
+            "mkfifo '{f}'; {python} -c 'import os, time; os.setsid(); os.write(3, b\"x\"); \
+             os.close(3); time.sleep(3)' 3>'{f}' & read x < '{f}'; echo started",
+            f = fifo.display()
+        ));
+        let mut child = GroupChild::spawn(&mut cmd).unwrap_or_else(|e| panic!("{e}"));
+        let collector = Collector::start(&mut child.child);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            collector.wait_grace(&mut child, Duration::from_secs(60), Duration::from_secs(1))
+        }));
+        let message = failed
+            .err()
+            .and_then(|p| p.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(message.starts_with("incomplete output"), "{message:?}");
+    }
+
+    /// Past its limit the child and its group are stopped, and the test
+    /// fails.
+    #[test]
+    fn a_child_past_its_limit_is_stopped_with_its_group() {
+        let start = Instant::now();
+        let failed = std::panic::catch_unwind(|| {
+            finish_within(sh("sleep 600 & sleep 600"), Duration::from_secs(1))
+        });
+        let message = failed
+            .err()
+            .and_then(|p| p.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(message.contains("did not exit within"), "{message:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Dropped while it runs (a test that failed half way), the child's
+    /// group is killed: its output, held by both processes, ends.
+    #[test]
+    fn a_child_dropped_while_running_takes_its_group_with_it() {
+        let mut cmd = sh("sleep 600 & sleep 600");
+        let mut child = GroupChild::spawn(&mut cmd).unwrap_or_else(|e| panic!("{e}"));
+        let mut stdout = child
+            .child
+            .stdout
+            .take()
+            .unwrap_or_else(|| panic!("no stdout"));
+        // The drop and the end of the output, each on a thread of its own,
+        // both within 10 s: a drop that waited for the child instead of
+        // killing its group would take 600.
+        let (tx, rx) = mpsc::channel();
+        let dropped = tx.clone();
+        std::thread::spawn(move || {
+            drop(child);
+            let _ = dropped.send("dropped");
+        });
+        std::thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = stdout.read_to_end(&mut rest);
+            let _ = tx.send("output ended");
+        });
+        for _ in 0..2 {
+            assert!(
+                rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "the drop did not stop the child and its group"
+            );
+        }
+    }
+
+    fn installed() -> Installed {
+        let pin = Pin {
+            id: "codex".to_owned(),
+            variant: "native".to_owned(),
+            version: "0".to_owned(),
+            tier: 1,
+            entry: "codex".to_owned(),
+            sha256: String::new(),
+            interpreter: None,
+            starts: None,
+        };
+        Installed {
+            pin,
+            dir: PathBuf::from("/nonexistent"),
+            exe: PathBuf::from("/nonexistent/codex"),
+        }
+    }
+
+    /// The person's settings are merged into what Codex's own CLI wrote,
+    /// and the next call takes out the last one's keys and nothing else.
+    #[test]
+    fn codex_settings_merge_key_by_key_and_keep_what_the_cli_wrote() {
+        let home = TestHome::new();
+        let mut a = AgentHome::within(&home, Host::Codex, installed());
+        let file = a.codex_home().join("config.toml");
+        let cli = "[mcp_servers.fixture]\ncommand = \"/bin/echo\"\nargs = [\"a\"]\n";
+        std::fs::write(&file, cli).unwrap_or_else(|e| panic!("{e}"));
+        a.codex_config(
+            "[mcp_servers.fixture]\ntool_timeout_sec = 60\n\
+             [[hooks.PreToolUse]]\nhooks = [{ type = \"command\", command = \"x\" }]\n",
+        );
+        let read = |f: &Path| -> toml_edit::DocumentMut {
+            std::fs::read_to_string(f)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .parse()
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        let doc = read(&file);
+        assert_eq!(
+            doc["mcp_servers"]["fixture"]["command"].as_str(),
+            Some("/bin/echo")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["fixture"]["tool_timeout_sec"].as_integer(),
+            Some(60)
+        );
+        assert!(doc["hooks"]["PreToolUse"].is_array_of_tables());
+        a.codex_config("[sandbox_workspace_write]\nnetwork_access = true\n");
+        let doc = read(&file);
+        assert_eq!(
+            doc["mcp_servers"]["fixture"]["command"].as_str(),
+            Some("/bin/echo")
+        );
+        assert!(
+            doc["mcp_servers"]["fixture"]
+                .get("tool_timeout_sec")
+                .is_none()
+        );
+        assert!(doc.get("hooks").is_none(), "{doc}");
+        assert_eq!(
+            doc["sandbox_workspace_write"]["network_access"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn the_cache_is_in_the_target_directory_of_the_running_binary() {
+        for (exe, want) in [
+            (
+                "/w/target/debug/deps/agent_hosts-0123",
+                "/w/target/agent-hosts",
+            ),
+            ("/w/target/debug/ec-model", "/w/target/agent-hosts"),
+            ("/t/release/deps/m2_story-9", "/t/agent-hosts"),
+        ] {
+            assert_eq!(
+                default_cache_dir(Path::new(exe)),
+                Some(PathBuf::from(want)),
+                "{exe}"
+            );
+        }
+    }
 }

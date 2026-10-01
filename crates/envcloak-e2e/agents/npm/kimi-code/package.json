@@ -1,0 +1,7 @@
+{
+  "name": "envcloak-agent-host-kimi-code",
+  "private": true,
+  "dependencies": {
+    "@moonshot-ai/kimi-code": "2.1.1"
+  }
+}
