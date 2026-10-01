@@ -1,0 +1,14 @@
+[package]
+name = "envcloak-browser"
+description = "EnvCloak's dev sign-in driver (SPEC §6.8, M2b): DevTools over a pipe, the origin guard, the login state machine, the identity check, state extraction and the test-session adapter client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
