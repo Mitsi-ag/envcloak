@@ -423,13 +423,16 @@ pub struct AuditWriter {
     current: Option<Current>,
     io: Box<dyn AuditIo>,
     max_segment: u64,
-    /// This writer has not yet flushed the directory that names the log's
-    /// directory. Every writer starts with it set and flushes that
-    /// directory once, before its first append, whether or not it made the
-    /// log's directory: `ensure_dirs` makes it for a new vault, and an
-    /// earlier writer may have made it and failed, or crashed, before its
-    /// flush (Codex F-64). Cleared only when the flush succeeds.
-    parent_unsynced: bool,
+    /// The log's directory (device and inode) this writer last flushed the
+    /// directory that names it for. Every writer starts with none and
+    /// flushes that directory before its first append, whether or not it
+    /// made the log's directory: `ensure_dirs` makes it for a new vault,
+    /// and an earlier writer may have made it and failed, or crashed,
+    /// before its flush (Codex F-64). It flushes it again before an append
+    /// whenever the log's directory is another one than this: moved away
+    /// and made anew, by this writer or by another program (Codex F-64
+    /// follow-up). Set only when the flush succeeds.
+    parent_synced: Option<(u64, u64)>,
 }
 
 impl core::fmt::Debug for AuditWriter {
@@ -503,7 +506,7 @@ impl AuditWriter {
             current: None,
             io,
             max_segment,
-            parent_unsynced: true,
+            parent_synced: None,
         };
         if let Some(a) = anchor {
             if a.seq >= writer.next_seq {
@@ -644,11 +647,15 @@ impl AuditWriter {
     }
 
     /// Flushes the directory that names the log's directory, unless this
-    /// writer already has: the entry naming the log's directory is durable
-    /// before any entry this writer appends is acknowledged. A failure
-    /// fails the append, and the next one tries again.
+    /// writer already has for the directory there now (read each time,
+    /// never trusted from before: it may have been moved away and made
+    /// anew): the entry naming the log's directory is durable before any
+    /// entry this writer appends is acknowledged. A failure fails the
+    /// append, and the next one tries again.
     fn sync_parent(&mut self) -> Result<(), AuditError> {
-        if self.parent_unsynced {
+        let m = std::fs::symlink_metadata(&self.dir)?;
+        let now = (m.dev(), m.ino());
+        if self.parent_synced != Some(now) {
             let parent = match self.dir.parent() {
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => Path::new("."),
@@ -657,7 +664,7 @@ impl AuditWriter {
             self.io
                 .sync(&parent)
                 .map_err(|_| AuditError::from(AuditErrorKind::Sync))?;
-            self.parent_unsynced = false;
+            self.parent_synced = Some(now);
         }
         Ok(())
     }
