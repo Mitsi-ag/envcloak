@@ -2354,12 +2354,13 @@ fn harness_finish_gives_up_on_output_a_survivor_holds() {
 
 /// Review F-62: a writer blocked on a full pipe nobody reads cannot see
 /// its stop request; its deadline (SIGALRM) ends it all the same. Its
-/// first write, longer than a pipe holds, blocks before it ever looks
-/// for the request.
+/// first write, longer than a pipe holds (64 KiB on Linux and macOS),
+/// blocks before it ever looks for the request. The line stays under
+/// Linux's 128 KiB limit on one environment string.
 fn harness_a_writer_blocked_on_a_full_pipe_ends_at_its_deadline() {
     let home = TestHome::new();
     let life = Lifetime::with_deadline(&home, "blocked", 2);
-    let line = "x".repeat(200_000);
+    let line = "x".repeat(100_000);
     let (p, unread) = Proc::spawn_holding_stdout(writer_command(&home, &life, &line));
     life.stop();
     assert_eq!(
