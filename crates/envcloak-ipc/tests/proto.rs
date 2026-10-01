@@ -594,3 +594,71 @@ fn reason_tokens_are_unique_and_documented() {
         None
     );
 }
+
+/// The largest `pending.list` a daemon can send fits in one frame: 20
+/// requests pending (SPEC §10a), each with a 4096-byte project path (the
+/// longest `canonicalize` returns) and a 64-byte agent name, every byte
+/// a control character JSON escapes to six, and MAX_LISTED_BINDINGS slugs
+/// of the longest kind, however many bindings are counted past them.
+///
+/// Mutation: list many more bindings per request (MAX_LISTED_BINDINGS
+/// raised to 256): the listing exceeds the 1 MiB frame and this fails.
+#[test]
+fn the_largest_pending_listing_fits_in_one_frame() {
+    use envcloak_core::vault::Slug;
+    use envcloak_ipc::view::{MAX_LISTED_BINDINGS, PendingListView, PendingView};
+    use envcloak_policy::{MAX_PENDING, SubjectKind};
+
+    let slug = format!("{}/{}", "a".repeat(63), "b".repeat(Slug::MAX_LEN - 64));
+    assert!(Slug::new(&slug).is_ok());
+    assert_eq!(slug.len(), Slug::MAX_LEN);
+    let view = PendingView {
+        request: "ABCDEFGH".to_owned(),
+        age_secs: u64::MAX,
+        expires_in_secs: u64::MAX,
+        kind: SubjectKind::Agent,
+        agent: Some("\u{1}".repeat(64)),
+        project: "\u{1}".repeat(4096),
+        bindings: vec![slug; MAX_LISTED_BINDINGS],
+        more_bindings: u64::MAX,
+    };
+    let list = PendingListView {
+        requests: (0..MAX_PENDING)
+            .map(|n| PendingView {
+                request: format!("ABCDEF{n:02}"),
+                ..view.clone()
+            })
+            .collect(),
+    };
+    let f = proto::result_frame(u64::MAX, &list).expect("the listing does not fit in a frame");
+    let mut wire = Vec::new();
+    f.write_to(&mut wire).unwrap();
+    assert!(wire.len() <= envcloak_ipc::MAX_FRAME + 4, "{}", wire.len());
+    assert!(list.well_formed());
+
+    // A program answering in the daemon's place: more bindings named than
+    // a daemon names, or more counted while fewer are named, is refused.
+    let mut one = list.requests[0].clone();
+    one.bindings.push(one.bindings[0].clone());
+    assert!(
+        !PendingListView {
+            requests: vec![one]
+        }
+        .well_formed()
+    );
+    let mut one = list.requests[0].clone();
+    one.bindings.pop();
+    assert!(
+        !PendingListView {
+            requests: vec![one.clone()]
+        }
+        .well_formed()
+    );
+    one.more_bindings = 0;
+    assert!(
+        PendingListView {
+            requests: vec![one]
+        }
+        .well_formed()
+    );
+}

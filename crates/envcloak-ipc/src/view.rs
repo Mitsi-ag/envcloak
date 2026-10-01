@@ -313,6 +313,14 @@ pub struct PendingStateView {
     pub state: PendingState,
 }
 
+/// The bindings `pending.list` names for one request; the rest are
+/// counted ([`PendingView::more_bindings`]). With at most 20 requests
+/// pending (SPEC §10a), each project path at most 4096 bytes and each
+/// agent name at most 64, the whole listing then fits in one frame
+/// however many bindings a request has (a request's env file may name
+/// thousands): `envcloak approve` shows every binding in its statement.
+pub const MAX_LISTED_BINDINGS: usize = 32;
+
 /// `pending.list`: the requests waiting for approval that the caller may
 /// approve, oldest first; an empty list to a caller that may approve none
 /// (SPEC §6.1 step 4, §10b).
@@ -324,9 +332,11 @@ pub struct PendingListView {
 
 impl PendingListView {
     /// Whether every request has the shape a daemon sends: a request id in
-    /// its canonical form, once, and slugs for bindings. A program
-    /// answering in the daemon's place could send anything (SPEC §1.1);
-    /// the strings are still escaped before they are printed.
+    /// its canonical form, once, and slugs for bindings, at most
+    /// [`MAX_LISTED_BINDINGS`] of them, with no more counted unless that
+    /// many are named. A program answering in the daemon's place could
+    /// send anything (SPEC §1.1); the strings are still escaped before
+    /// they are printed.
     pub fn well_formed(&self) -> bool {
         let mut seen: Vec<PendingId> = Vec::with_capacity(self.requests.len());
         for r in &self.requests {
@@ -335,6 +345,8 @@ impl PendingListView {
             };
             if id.to_string() != r.request
                 || seen.contains(&id)
+                || r.bindings.len() > MAX_LISTED_BINDINGS
+                || (r.more_bindings > 0 && r.bindings.len() < MAX_LISTED_BINDINGS)
                 || r.bindings
                     .iter()
                     .any(|b| envcloak_core::vault::Slug::new(b).is_err())
@@ -364,8 +376,11 @@ pub struct PendingView {
     pub agent: Option<String>,
     /// The project's canonical directory.
     pub project: String,
-    /// The slugs of the items its bindings name, in the request's order.
+    /// The slugs of the items its first [`MAX_LISTED_BINDINGS`] bindings
+    /// name, in the request's order.
     pub bindings: Vec<String>,
+    /// How many of its bindings are not in `bindings`.
+    pub more_bindings: u64,
 }
 
 /// `approve`: the grant created.

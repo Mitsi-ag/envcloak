@@ -71,7 +71,7 @@ use envcloak_ipc::proto::{
 };
 use envcloak_ipc::view::{
     ApprovedView, DecisionView, DeniedView, GrantBindingView, GrantView, GrantsView,
-    PendingListView, PendingStateView, PendingView, RevokedView,
+    MAX_LISTED_BINDINGS, PendingListView, PendingStateView, PendingView, RevokedView,
 };
 use envcloak_ipc::{RpcError, WireSecret};
 use envcloak_policy::{
@@ -571,8 +571,10 @@ pub fn pending_state(
 ) -> Result<PendingStateView, RpcError> {
     let id = PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     let caller = evidence(shared, peer, &[])?;
-    let now = now_of(&shared.clocks);
     let mut s = locked(&shared.state);
+    // Read under the lock, so polls reach the limiter in the order of
+    // their times.
+    let now = now_of(&shared.clocks);
     let answer = s.grants().poll(&id, &caller, &now);
     // A test build's trace, written under the state lock so that its order
     // in the log is the order of the decisions (an approval's audit line
@@ -596,7 +598,8 @@ pub fn pending_state(
 /// session or a terminal with the caller is left out (SPEC §10b: an
 /// approval surface does not show a request to a caller whose proof it
 /// would refuse). Nothing is shown from a vault that failed its integrity
-/// check.
+/// check. Each request names at most [`MAX_LISTED_BINDINGS`] bindings and
+/// counts the rest, so the listing fits in one frame.
 pub fn pending_list(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -608,9 +611,9 @@ pub fn pending_list(
             requests: Vec::new(),
         });
     }
-    let now = now_of(&shared.clocks);
     let mut s = locked(&shared.state);
     s.refuse_if_tampered()?;
+    let now = now_of(&shared.clocks);
     let requests = s
         .grants()
         .pending_all(&now)
@@ -647,8 +650,11 @@ fn pending_view(p: &Pending, now: &envcloak_policy::Now) -> PendingView {
             .request
             .bindings
             .iter()
+            .take(MAX_LISTED_BINDINGS)
             .map(|b| b.slug.as_str().to_owned())
             .collect(),
+        more_bindings: u64::try_from(p.request.bindings.len().saturating_sub(MAX_LISTED_BINDINGS))
+            .unwrap_or(u64::MAX),
     }
 }
 

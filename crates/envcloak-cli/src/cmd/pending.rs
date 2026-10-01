@@ -1,7 +1,8 @@
 //! `envcloak pending [--json]` (SPEC §6.1 step 4, §10b; M2 plan D-04): the
-//! requests waiting for approval that this terminal may approve, with id,
-//! age, agent label, project and the bindings' slugs, so a person can find
-//! a request whose id went to an agent host's log.
+//! requests waiting for approval that this terminal may approve, oldest
+//! first, with id, age, agent label, project and the bindings' slugs (the
+//! first 32, and how many more), so a person can find a request whose id
+//! went to an agent host's log. `envcloak approve` shows every binding.
 //!
 //! The daemon lists them only to a caller whose proof it would accept (a
 //! terminal session with no agent in it), and leaves out a request whose
@@ -75,14 +76,17 @@ fn request_text(r: &PendingView) -> String {
         (SubjectKind::Unknown, _) => "a process of unknown origin".to_owned(),
     };
     let bindings: Vec<String> = r.bindings.iter().map(|b| e(b)).collect();
+    let mut shown = if bindings.is_empty() {
+        "none".to_owned()
+    } else {
+        bindings.join(", ")
+    };
+    if r.more_bindings > 0 {
+        shown.push_str(&format!(", and {} more", r.more_bindings));
+    }
     format!(
-        "{id}\n  from: {who}\n  project: {}\n  bindings: {}\n  waiting: {} (expires in {})\n",
+        "{id}\n  from: {who}\n  project: {}\n  bindings: {shown}\n  waiting: {} (expires in {})\n",
         e(&r.project),
-        if bindings.is_empty() {
-            "none".to_owned()
-        } else {
-            bindings.join(", ")
-        },
         words(r.age_secs),
         words(r.expires_in_secs),
     )
@@ -116,6 +120,7 @@ mod tests {
             agent: agent.map(str::to_owned),
             project: project.to_owned(),
             bindings: vec!["openai/acme-web".to_owned(), "stripe/acme-web".to_owned()],
+            more_bindings: 0,
         }
     }
 
@@ -144,6 +149,19 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("from: a process of unknown origin"), "{text}");
+        // Bindings past the ones listed are counted.
+        let mut long = view(None, "/src/other");
+        long.more_bindings = 1468;
+        let text = listing(
+            &PendingListView {
+                requests: vec![long],
+            },
+            false,
+        );
+        assert!(
+            text.contains("  bindings: openai/acme-web, stripe/acme-web, and 1468 more\n"),
+            "{text}"
+        );
         assert!(!text.contains('\u{202e}'), "{text:?}");
         let empty = PendingListView {
             requests: Vec::new(),
