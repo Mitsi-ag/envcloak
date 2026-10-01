@@ -11,10 +11,17 @@ SPEC v0.4 pull request wrote them (plan task M2-01).
   (review F-74), §10b rule 6 for managed projects and §4.4's sentence on
   daemon-started recipients (review CR-1), the §6.1 PTY signals paragraph
   (F-76, CR-4), and gates 38 and 39 as narrowed.
+- So are the sentences that carry a decision's security property on their
+  own: the browser supervisor's tool allowlist (D-30) and its grant check
+  on every tool call (D-31).
 - The wording they replaced is gone, and nothing makes a release depend on
-  EnvCloak's own `envcloak` executable: the daemon cannot identify a
-  hardened client's code on Linux (CR-1).
+  the requesting process's code, such as EnvCloak's own `envcloak`
+  executable or binary: the daemon cannot identify a hardened client's
+  code on Linux (CR-1).
 - The status line says v0.4, and the file holds no em dash.
+
+Runs of whitespace, line breaks included, count as one space in the SPEC
+and in every phrase, so rewrapping a sentence neither hides nor breaks it.
 
 With `--pr-files BASE HEAD`, it also checks that the SPEC pull request
 (`git diff --name-only BASE...HEAD`) changes docs/SPEC.md and nothing else.
@@ -25,6 +32,7 @@ stderr and exits 1.
 """
 
 import os
+import re
 import subprocess
 import sys
 
@@ -45,7 +53,7 @@ DECISIONS = [
     ("D-10", "edit", ["Approval signing key without a Secure Enclave (M5)", "`identity_outside_install_tree`", "`policy_epoch_unverified`"]),
     ("D-11", "edit", ["`live_not_ticked`", "`envcloak-statement/2`"]),
     ("D-12", "no edit", "SPEC §7.2 rule 3 already keeps hook decisions local and deterministic"),
-    ("D-13", "edit", ["run against a local scripted model"]),
+    ("D-13", "edit", ["run against a local scripted model", "A fixture found in any of those runs holds the release"]),
     ("D-14", "edit", ["`fails_open_on_timeout`", "**Tier 2,", "Documented capabilities as of 2026-10-01"]),
     ("D-15", "edit", ["`paste-cache/`, `file-history/` and `~/.claude/backups/`"]),
     ("D-16", "no edit", "installer practice, in docs/INSTALLERS.md (M2-08)"),
@@ -57,7 +65,7 @@ DECISIONS = [
     ("D-22", "edit", ["Host approval is set per tool, never per server", "`destructiveHint`"]),
     ("D-23", "no edit", "docs/IPC.md and docs/VAULT.md hold the reservations (M2-01)"),
     ("D-24", "edit", ["envcloak-signin     pure sign-in contract", "envcloak-browser    sign-in driver"]),
-    ("D-25", "edit", ["`envcloakd --signin-driver`"]),
+    ("D-25", "edit", ["`envcloakd --signin-driver`", "each attempt's sign-in driver (`envcloakd --signin-driver`) receives a login's username and password from the daemon, one step at a time"]),
     ("D-26", "edit", ["Origins are registered in ASCII only", "no `url` or `idna` crate"]),
     ("D-27", "edit", ["`handoff_required`", "A CAPTCHA or other handoff state stops the attempt"]),
     ("D-28", "no edit", "docs/SIGNIN-ADAPTER.md (M2b-06)"),
@@ -128,6 +136,17 @@ REQUIRED = {
         "drivability check of §7.1 qualifies); every other agent reports each surface "
         "`unverified` with a reason token and never `active`."
     ),
+    "§6.8 tool allowlist (D-30)": (
+        "The supervisor serves a fixed tool allowlist, the same for listing and calling: the "
+        "page-interaction tools, with every `filename` or output-path argument removed from their "
+        "schemas and refused if sent; no tool that runs code in the helper process, uploads a "
+        "local file, installs a browser or belongs to an optional capability group; and "
+        "navigation to any scheme other than `http` and `https` refused."
+    ),
+    "§6.8 grant check on every tool call (D-31)": (
+        "The supervisor checks the grant with the daemon on every tool call, not only when a "
+        "context is first handed over."
+    ),
     "gate 39": (
         "No literal secret remains in the MCP server entries of the covered agents' JSON and "
         "TOML configs (Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, Kimi, OpenCode); "
@@ -136,21 +155,28 @@ REQUIRED = {
     ),
 }
 
+# What v0.4 replaced, as regular expressions over the SPEC with its
+# whitespace collapsed; a plain phrase is escaped.
 FORBIDDEN = {
-    "the old gate b12": "no trust, refresh or session state from the worker remains usable",
-    "the old §6.8 worker sentence": "In M2b no trust, refresh or session state from the worker outlives the attempt",
-    "a release that rests on EnvCloak's own `envcloak` executable (CR-1)": "own `envcloak` executable",
-    "a release that rests on the requester's executable identity (CR-1)": "executable identity is EnvCloak's",
-    "the old §1.1 inject-mode claim": "keeps keys out of files, prompts, configs and transcripts",
-    "`rmcp` as the MCP library": "`rmcp` 3.x (pinned)",
-    "the old stdio rewrite form": "`args: [\"run\", \"--ref\"",
-    "the old instruction 3": "`envcloak add <provider> --ask` so the user pastes it into the app",
-    "the server-wide Codex approval offer": "offer to set Codex's per-server MCP approval mode for EnvCloak only",
-    "IDNA normalisation of origins": "after URL parsing and IDNA normalisation",
-    "the M2b handoff pause": "(the app, or a terminal the person controls)",
-    "the old gate 38 bullet": "Activation and denial probes run for each agent in an isolated HOME, and coverage",
-    "the old gate 39": "No literal secret remains in any agent config.",
-    "an em dash": "—",
+    "the old gate b12": re.escape("no trust, refresh or session state from the worker remains usable"),
+    "the old §6.8 worker sentence": re.escape("In M2b no trust, refresh or session state from the worker outlives the attempt"),
+    "a release that rests on EnvCloak's own `envcloak` executable or binary (CR-1)": r"\bown `envcloak`",
+    "a release that rests on the requester's code (CR-1)": (
+        r"\b(?:requester|requesting process|caller|client|peer)(?:'s)? "
+        r"(?:executable|binary|code)(?: identity)? (?:is|must|matches|equals|comes from)\b"
+    ),
+    "a release that rests on the requester's executable identity (CR-1)": re.escape("executable identity is EnvCloak's"),
+    "the old §1.1 inject-mode claim": re.escape("keeps keys out of files, prompts, configs and transcripts"),
+    "`rmcp` as the MCP library": re.escape("`rmcp` 3.x (pinned)"),
+    "the old stdio rewrite form": re.escape("`args: [\"run\", \"--ref\""),
+    "the old instruction 3": re.escape("`envcloak add <provider> --ask` so the user pastes it into the app"),
+    "the server-wide Codex approval offer": re.escape("offer to set Codex's per-server MCP approval mode for EnvCloak only"),
+    "IDNA normalisation of origins": re.escape("after URL parsing and IDNA normalisation"),
+    "the M2b handoff pause": re.escape("(the app, or a terminal the person controls)"),
+    "the old gate 38 bullet": re.escape("Activation and denial probes run for each agent in an isolated HOME, and coverage"),
+    "the old gate 39": re.escape("No literal secret remains in any agent config."),
+    "the old gate 41 release rule": re.escape("a host below that is published as"),
+    "an em dash": "\u2014",
 }
 
 STATUS = "Status: draft v0.4 "
@@ -162,9 +188,16 @@ def fail(msg):
     problems.append(msg)
 
 
+def flat(text):
+    """`text` with every run of whitespace, line breaks included, as one
+    space."""
+    return re.sub(r"\s+", " ", text)
+
+
 def check_spec(text):
     if not text.startswith("# EnvCloak: product and architecture spec\n\n" + STATUS):
         fail("the status line does not say draft v0.4")
+    text = flat(text)
     ids = [d[0] for d in DECISIONS]
     expected = ["D-%02d" % n for n in range(1, 37)]
     if ids != expected:
@@ -174,7 +207,7 @@ def check_spec(text):
             if not what:
                 fail("%s is an edit with no phrase to check" % did)
             for phrase in what:
-                if phrase not in text:
+                if flat(phrase) not in text:
                     fail("%s: the SPEC lacks %r" % (did, phrase))
         elif kind == "no edit":
             if not isinstance(what, str) or not what.strip():
@@ -182,11 +215,11 @@ def check_spec(text):
         else:
             fail("%s: %r is neither \"edit\" nor \"no edit\"" % (did, kind))
     for name, sentence in REQUIRED.items():
-        n = text.count(sentence)
+        n = text.count(flat(sentence))
         if n != 1:
             fail("%s: found %d times, not once word for word" % (name, n))
-    for name, phrase in FORBIDDEN.items():
-        if phrase in text:
+    for name, pattern in FORBIDDEN.items():
+        if re.search(pattern, text):
             fail("the SPEC still holds %s" % name)
 
 
