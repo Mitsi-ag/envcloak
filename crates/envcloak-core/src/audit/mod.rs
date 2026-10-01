@@ -7,7 +7,8 @@
 //!   masks the command line before building it ([`record`] caps the rest).
 //! - [`AuditWriter`]: appends entries to segment files under
 //!   `<data>/audit/`, each sealed under the `audit` subkey and chained with
-//!   a keyed MAC; an entry is flushed (`F_FULLFSYNC` on macOS) before
+//!   a keyed MAC; an entry is flushed (`F_FULLFSYNC` on macOS), and the
+//!   directories that name its segment after it, before
 //!   [`AuditWriter::append`] returns, and a failed append leaves the log
 //!   as it was, so the daemon can deny the request it was for. The file
 //!   format is in `segment.rs` and docs/VAULT.md "Audit log".

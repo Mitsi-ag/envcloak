@@ -13,7 +13,7 @@ mod common;
 
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
@@ -36,25 +36,32 @@ enum Op {
     Write(usize),
     /// A segment flushed.
     SyncFile,
-    /// The directory flushed.
+    /// A directory flushed.
     SyncDir,
 }
 
+/// Something another program running as the user does, at a moment the
+/// test picks.
+type Race = Box<dyn FnOnce() + Send>;
+
 /// What the shim is told to do.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Plan {
     ops: Vec<Op>,
     /// Fail the next write of a frame (not a header).
     fail_frame_write: bool,
     /// Fail the next flush of a segment.
     fail_file_sync: bool,
-    /// Fail the next flush of a directory.
-    fail_dir_sync: bool,
+    /// Fail the next flush of the directory with this device and inode.
+    fail_dir_sync: Option<(u64, u64)>,
     /// The directories flushed, by device and inode.
     synced_dirs: Vec<(u64, u64)>,
-    /// Rename this file to that one just before the next frame is written,
-    /// as another program racing the writer would.
-    move_before_frame: Option<(PathBuf, PathBuf)>,
+    /// Run just before the next header is written, as a segment is made.
+    before_header: Option<Race>,
+    /// Run just before the next frame is written.
+    before_frame: Option<Race>,
+    /// Run just before the next directory is flushed.
+    before_dir_sync: Option<Race>,
 }
 
 /// The counting shim: records every call, then runs the real one, or fails
@@ -67,6 +74,11 @@ impl Shim {
         std::mem::take(&mut self.0.lock().unwrap().ops)
     }
 
+    /// The directories flushed since the last call, in order.
+    fn dirs(&self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.0.lock().unwrap().synced_dirs)
+    }
+
     fn plan(&self) -> std::sync::MutexGuard<'_, Plan> {
         self.0.lock().unwrap()
     }
@@ -76,10 +88,13 @@ impl AuditIo for Shim {
     fn write(&mut self, f: &File, bytes: &[u8]) -> io::Result<()> {
         let mut p = self.0.lock().unwrap();
         p.ops.push(Op::Write(bytes.len()));
-        if bytes.len() != HEADER_LEN {
-            if let Some((from, to)) = p.move_before_frame.take() {
-                std::fs::rename(from, to)?;
-            }
+        let race = if bytes.len() == HEADER_LEN {
+            p.before_header.take()
+        } else {
+            p.before_frame.take()
+        };
+        if let Some(race) = race {
+            race();
         }
         if bytes.len() != HEADER_LEN && p.fail_frame_write {
             p.fail_frame_write = false;
@@ -94,6 +109,11 @@ impl AuditIo for Shim {
         let mut p = self.0.lock().unwrap();
         let m = f.metadata()?;
         let dir = m.is_dir();
+        if dir {
+            if let Some(race) = p.before_dir_sync.take() {
+                race();
+            }
+        }
         p.ops.push(if dir { Op::SyncDir } else { Op::SyncFile });
         if dir {
             p.synced_dirs.push((m.dev(), m.ino()));
@@ -102,8 +122,8 @@ impl AuditIo for Shim {
             p.fail_file_sync = false;
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
-        if dir && p.fail_dir_sync {
-            p.fail_dir_sync = false;
+        if dir && p.fail_dir_sync == Some((m.dev(), m.ino())) {
+            p.fail_dir_sync = None;
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         OsIo.sync(f)
@@ -218,15 +238,16 @@ fn dir_id(p: &Path) -> (u64, u64) {
 }
 
 /// Gate 33, the flush half: every append writes its frame and flushes the
-/// segment before it returns, and the first also flushes the header and
-/// the directory. Before a writer's first append it flushes the data
-/// directory that names the log's directory, once per writer, whether or
-/// not it made the directory (review T10 open 3, Codex F-64): a new
-/// vault's directory was made by `ensure_dirs`, and an earlier writer may
-/// have made it and failed, or crashed, before its flush. A failed flush
-/// of it fails the append, and the next append, or the first of a writer
-/// opened again, flushes it again. The flushes are `F_FULLFSYNC` on macOS
-/// and `fsync` on Linux, counted by envcloak-sys's shim.
+/// segment, then the log's directory, which names the segment, and then
+/// the data directory, which names the log's directory, before it
+/// returns. The directories are flushed after every entry, never trusted
+/// from an earlier flush (Codex F-64): a name moved away and back, or a
+/// directory made anew, is not durable until the directory holding it is
+/// flushed again. A new segment's header is written and flushed before its
+/// first entry. A failed flush of either directory fails the append (the
+/// frame cut back off, the head unmoved), and the next append flushes both
+/// again. The flushes are `F_FULLFSYNC` on macOS and `fsync` on Linux,
+/// counted by envcloak-sys's shim.
 #[test]
 fn every_append_is_flushed_before_it_returns() {
     // A new vault's log: its directory is there, made with the vault.
@@ -240,15 +261,18 @@ fn every_append_is_flushed_before_it_returns() {
     assert_eq!(w.append(&record(1)).unwrap(), 1);
     let first = shim.ops();
     assert_eq!(first.len(), 6, "{first:?}");
-    assert_eq!(first[0], Op::SyncDir, "the data directory, first");
-    assert_eq!(first[1], Op::Write(HEADER_LEN));
-    assert_eq!(&first[2..4], &[Op::SyncFile, Op::SyncDir]);
-    assert!(matches!(first[4], Op::Write(n) if n > 12 + 40 + 32));
-    assert_eq!(first[5], Op::SyncFile, "the frame is flushed last");
     assert_eq!(
-        std::mem::take(&mut shim.plan().synced_dirs),
-        [data, dir_id(&log.dir)]
+        &first[..2],
+        &[Op::Write(HEADER_LEN), Op::SyncFile],
+        "the header, first"
     );
+    assert!(matches!(first[2], Op::Write(n) if n > 12 + 40 + 32));
+    assert_eq!(
+        &first[3..],
+        &[Op::SyncFile, Op::SyncDir, Op::SyncDir],
+        "the frame, then the directories"
+    );
+    assert_eq!(shim.dirs(), [dir_id(&log.dir), data]);
     let after = envcloak_sys::testing::sync_counts();
     let (full, plain) = (
         after.full_fsync - before.full_fsync,
@@ -264,95 +288,108 @@ fn every_append_is_flushed_before_it_returns() {
         let before = envcloak_sys::testing::sync_counts();
         assert_eq!(w.append(&record(i)).unwrap(), i);
         let ops = shim.ops();
-        assert_eq!(ops.len(), 2, "{ops:?}");
-        assert!(matches!(ops[0], Op::Write(_)));
-        assert_eq!(ops[1], Op::SyncFile);
-        let after = envcloak_sys::testing::sync_counts();
-        assert_eq!(
-            (after.full_fsync - before.full_fsync) + (after.fsync - before.fsync),
-            1
+        assert!(
+            matches!(
+                ops[..],
+                [Op::Write(_), Op::SyncFile, Op::SyncDir, Op::SyncDir]
+            ),
+            "{ops:?}"
         );
+        assert_eq!(shim.dirs(), [dir_id(&log.dir), data], "every time");
+        let after = envcloak_sys::testing::sync_counts();
+        let (full, plain) = (
+            after.full_fsync - before.full_fsync,
+            after.fsync - before.fsync,
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!((full, plain), (3, 0));
+        } else {
+            assert_eq!((full, plain), (0, 3));
+        }
     }
     assert_eq!(w.head().0, 4);
     assert!(log.verify(None).ok());
-    assert!(shim.plan().synced_dirs.is_empty(), "only once");
 
-    // A writer opened again goes on in the same segment, and flushes the
-    // data directory before its first append all the same.
+    // A writer opened again goes on in the same segment and flushes the
+    // same way.
     drop(w);
     let shim = Shim::default();
     let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
     assert_eq!(w.append(&record(5)).unwrap(), 5);
     let ops = shim.ops();
     assert!(
-        matches!(ops[..], [Op::SyncDir, Op::Write(_), Op::SyncFile]),
+        matches!(
+            ops[..],
+            [Op::Write(_), Op::SyncFile, Op::SyncDir, Op::SyncDir]
+        ),
         "{ops:?}"
     );
-    assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data]);
-    fill(&mut w, 6, 1);
-    let ops = shim.ops();
-    assert!(
-        matches!(ops[..], [Op::Write(_), Op::SyncFile]),
-        "only once: {ops:?}"
-    );
+    assert_eq!(shim.dirs(), [dir_id(&log.dir), data]);
     assert_eq!(log.segments().len(), 1);
     assert!(log.verify(None).ok());
 
-    // A missing directory: created, then the data directory that names it
-    // is flushed before the first segment is made in it.
+    // A missing directory: made, and flushed into the data directory after
+    // the first entry is written to it.
     let log = Log::new();
     std::fs::remove_dir(&log.dir).unwrap();
     let data = dir_id(log.dir.parent().unwrap());
     let shim = Shim::default();
     let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
-    let before = envcloak_sys::testing::sync_counts();
     assert_eq!(w.append(&record(1)).unwrap(), 1);
-    let first = shim.ops();
-    assert_eq!(first.len(), 6, "{first:?}");
-    assert_eq!(first[0], Op::SyncDir, "the data directory, first");
-    assert_eq!(first[1], Op::Write(HEADER_LEN));
-    assert_eq!(&first[2..4], &[Op::SyncFile, Op::SyncDir]);
-    assert!(matches!(first[4], Op::Write(n) if n > 12 + 40 + 32));
-    assert_eq!(first[5], Op::SyncFile);
-    assert_eq!(
-        std::mem::take(&mut shim.plan().synced_dirs),
-        [data, dir_id(&log.dir)]
-    );
-    let after = envcloak_sys::testing::sync_counts();
-    assert_eq!(
-        (after.full_fsync - before.full_fsync) + (after.fsync - before.fsync),
-        4
-    );
-    fill(&mut w, 2, 1);
     let ops = shim.ops();
     assert!(
-        matches!(ops[..], [Op::Write(_), Op::SyncFile]),
-        "only once: {ops:?}"
+        matches!(
+            ops[..],
+            [
+                Op::Write(HEADER_LEN),
+                Op::SyncFile,
+                Op::Write(_),
+                Op::SyncFile,
+                Op::SyncDir,
+                Op::SyncDir
+            ]
+        ),
+        "{ops:?}"
     );
+    assert_eq!(shim.dirs(), [dir_id(&log.dir), data]);
 
-    // That flush failing fails the append, which leaves no segment; the
-    // next append flushes the data directory again.
-    let log = Log::new();
-    std::fs::remove_dir(&log.dir).unwrap();
-    let shim = Shim::default();
-    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
-    shim.plan().fail_dir_sync = true;
-    assert!(w.append(&record(1)).is_err());
-    assert_eq!(shim.ops(), [Op::SyncDir]);
-    assert!(log.segments().is_empty());
-    assert_eq!(w.head().0, 0);
-    assert_eq!(w.append(&record(1)).unwrap(), 1);
-    let ops = shim.ops();
-    assert_eq!(ops.len(), 6, "{ops:?}");
-    assert_eq!(ops[0], Op::SyncDir, "flushed again");
-    assert!(log.verify(None).ok());
+    // Either directory's flush failing fails the append: the frame is cut
+    // back off and the head stays. The next append flushes both again.
+    for (which, failing) in [("the log's", dir_id(&log.dir)), ("the data", data)] {
+        let seg = log.segments().pop().unwrap();
+        let len = std::fs::metadata(&seg).unwrap().len();
+        let head = w.head();
+        shim.plan().fail_dir_sync = Some(failing);
+        let e = w.append(&record(head.0 + 1)).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "the audit entry could not be flushed to disk",
+            "{which}"
+        );
+        assert_eq!(
+            std::fs::metadata(&seg).unwrap().len(),
+            len,
+            "{which}: cut back"
+        );
+        assert_eq!(w.head(), head, "{which}");
+        assert_eq!(shim.dirs().last(), Some(&failing), "{which}");
+        assert_eq!(w.append(&record(head.0 + 1)).unwrap(), head.0 + 1);
+        assert_eq!(
+            shim.dirs(),
+            [dir_id(&log.dir), data],
+            "{which}: flushed again"
+        );
+    }
+    let r = log.verify(None);
+    assert!(r.ok(), "{r:?}");
+    assert_eq!(r.last_seq, 3);
 }
 
 /// Codex F-64: a failed flush of the data directory, then the writer
 /// dropped and opened again. The log's directory is there now (the failed
-/// writer made it, or it was made with the vault), and the new writer
-/// still flushes the data directory before its first append; a new writer
-/// whose flush of it fails appends nothing either.
+/// writer made it, or it was made with the vault), and a new writer still
+/// flushes the data directory before it acknowledges an entry; a new
+/// writer whose flush of it fails acknowledges nothing either.
 #[test]
 fn a_writer_opened_again_after_a_failed_flush_flushes_the_data_directory() {
     for dir_missing in [true, false] {
@@ -361,108 +398,296 @@ fn a_writer_opened_again_after_a_failed_flush_flushes_the_data_directory() {
         if dir_missing {
             std::fs::remove_dir(&log.dir).unwrap();
         }
-        let shim = Shim::default();
-        let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
-        shim.plan().fail_dir_sync = true;
-        assert!(w.append(&record(1)).is_err());
-        assert_eq!(shim.ops(), [Op::SyncDir]);
-        assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data]);
-        drop(w);
-        assert!(log.dir.is_dir() && log.segments().is_empty());
-
-        let shim = Shim::default();
-        let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
-        shim.plan().fail_dir_sync = true;
-        assert!(w.append(&record(1)).is_err(), "missing {dir_missing}");
-        assert_eq!(shim.ops(), [Op::SyncDir]);
-        assert!(log.segments().is_empty());
-        drop(w);
+        for _ in 0..2 {
+            let shim = Shim::default();
+            let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+            shim.plan().fail_dir_sync = Some(data);
+            let e = w.append(&record(1)).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "the audit entry could not be flushed to disk",
+                "missing {dir_missing}"
+            );
+            assert_eq!(shim.dirs(), [dir_id(&log.dir), data]);
+            assert_eq!(w.head().0, 0);
+            drop(w);
+            let (entries, _) = read_entries(&log.dir, &log.keys, None).unwrap();
+            assert!(entries.is_empty(), "missing {dir_missing}");
+        }
 
         let shim = Shim::default();
         let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
         assert_eq!(w.append(&record(1)).unwrap(), 1);
-        let ops = shim.ops();
-        assert_eq!(ops.len(), 6, "missing {dir_missing}: {ops:?}");
-        assert_eq!(ops[0], Op::SyncDir, "flushed after the reopen");
         assert_eq!(
-            shim.plan().synced_dirs,
-            [data, dir_id(&log.dir)],
+            shim.dirs(),
+            [dir_id(&log.dir), data],
             "missing {dir_missing}"
         );
         assert!(log.verify(None).ok());
     }
 }
 
-/// Codex F-64 follow-up: a writer that had flushed the data directory
-/// once went on without flushing it again after the log's directory was
-/// moved away and made anew, so it acknowledged entries in a directory
-/// whose name might not be durable. Here the directory is moved away
-/// after the first acknowledged append, and the new one is made by the
-/// writer, or by another program before the writer's next append. The
-/// writer flushes the data directory again before it appends there; that
-/// flush failing fails the append (nothing acknowledged, the head
-/// unmoved), the next append flushes it again, and the one after that
-/// does not. The entries in the new directory open, chained on from the
-/// moved one.
+/// Codex F-64 follow-ups: a writer that had flushed the data directory
+/// went on without flushing it again while the log's directory had the
+/// device and inode it flushed it for, though its name there was not
+/// durable: the directory moved away, that move flushed, and moved back;
+/// or made anew where the file system gives a new directory the inode of
+/// a removed one (ext4 does). Here, after the first acknowledged entry,
+/// the log's directory is left as it is, moved away and back after a
+/// durable rename, removed or moved away and made anew by the writer, or
+/// moved away and made anew by another program. In every case the next
+/// append flushes the log's directory and then the data directory after
+/// its entry, and the data directory's flush failing fails it (nothing
+/// acknowledged or readable, the head unmoved); the retry flushes both
+/// again, and so does the append after it. The entries open where the
+/// check reads them.
 #[test]
-fn a_log_directory_made_anew_is_flushed_into_the_data_directory() {
-    for made_by_writer in [true, false] {
+fn the_data_directory_is_flushed_after_every_entry_whatever_became_of_the_log_directory() {
+    for case in [
+        "unchanged",
+        "moved back",
+        "removed",
+        "moved away",
+        "made by another program",
+    ] {
         let log = Log::new();
-        let data = dir_id(log.dir.parent().unwrap());
+        let parent = log.dir.parent().unwrap().to_owned();
+        let data = dir_id(&parent);
         let shim = Shim::default();
         let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
         let mut kept = fill(&mut w, 1, 1);
-        assert_eq!(shim.ops()[0], Op::SyncDir);
         let old = dir_id(&log.dir);
-        assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data, old]);
+        assert_eq!(shim.dirs(), [old, data], "{case}");
 
-        let aside = log.f.home.root().join("audit.aside");
-        std::fs::rename(&log.dir, &aside).unwrap();
-        if !made_by_writer {
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&log.dir)
-                .unwrap();
+        let aside = parent.join("audit.aside");
+        match case {
+            "unchanged" => {}
+            "moved back" => {
+                std::fs::rename(&log.dir, &aside).unwrap();
+                envcloak_sys::sync_file(&File::open(&parent).unwrap()).unwrap();
+                std::fs::rename(&aside, &log.dir).unwrap();
+                assert_eq!(dir_id(&log.dir), old, "the same directory");
+            }
+            "removed" => std::fs::remove_dir_all(&log.dir).unwrap(),
+            "moved away" => std::fs::rename(&log.dir, &aside).unwrap(),
+            _ => {
+                std::fs::rename(&log.dir, &aside).unwrap();
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&log.dir)
+                    .unwrap();
+            }
         }
-        shim.plan().fail_dir_sync = true;
+
+        shim.plan().fail_dir_sync = Some(data);
         let e = w.append(&record(2)).unwrap_err();
         assert_eq!(
             e.to_string(),
             "the audit entry could not be flushed to disk",
-            "made by the writer {made_by_writer}"
+            "{case}"
         );
-        assert_eq!(
-            shim.ops(),
-            [Op::SyncDir],
-            "made by the writer {made_by_writer}"
-        );
-        assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data]);
-        assert!(log.segments().is_empty());
-        assert_eq!(w.head().0, 1);
-
-        let two = record(2);
-        assert_eq!(w.append(&two).unwrap(), 2);
-        kept.push(two);
-        let ops = shim.ops();
-        assert_eq!(ops.len(), 6, "made by the writer {made_by_writer}: {ops:?}");
-        assert_eq!(ops[0], Op::SyncDir, "flushed again");
-        let new = dir_id(&log.dir);
-        assert_ne!(new, old);
-        assert_eq!(std::mem::take(&mut shim.plan().synced_dirs), [data, new]);
-        kept.extend(fill(&mut w, 3, 1));
-        let ops = shim.ops();
+        let now = dir_id(&log.dir);
+        assert_eq!(shim.dirs(), [now, data], "{case}: both, after the entry");
+        assert_eq!(w.head().0, 1, "{case}");
+        let (entries, _) = read_entries(&log.dir, &log.keys, None).unwrap();
         assert!(
-            matches!(ops[..], [Op::Write(_), Op::SyncFile]),
-            "only once: {ops:?}"
+            entries.iter().all(|e| e.seq == 1),
+            "{case}: nothing acknowledged"
         );
+
+        kept.extend(fill(&mut w, 2, 1));
+        assert_eq!(shim.dirs(), [now, data], "{case}: flushed again");
+        kept.extend(fill(&mut w, 3, 1));
+        assert_eq!(shim.dirs(), [now, data], "{case}: and again");
 
         let (entries, _) = read_entries(&log.dir, &log.keys, None).unwrap();
         let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
-        assert_eq!(seqs, [2, 3]);
         let records: Vec<AuditRecord> = entries.into_iter().map(|e| e.record).collect();
-        assert_eq!(records, kept[1..]);
-        let (entries, _) = read_entries(&aside, &log.keys, None).unwrap();
-        assert_eq!(entries.len(), 1);
+        if matches!(case, "unchanged" | "moved back") {
+            assert_eq!(seqs, [1, 2, 3], "{case}");
+            assert_eq!(records, kept, "{case}");
+        } else {
+            assert_eq!(seqs, [2, 3], "{case}");
+            assert_eq!(records, kept[1..], "{case}");
+        }
+        if matches!(case, "moved away" | "made by another program") {
+            let (entries, _) = read_entries(&aside, &log.keys, None).unwrap();
+            assert_eq!(entries.len(), 1, "{case}");
+        }
+    }
+}
+
+/// A log directory swapped in while an append flushes the directories,
+/// even one holding the segment the entry was written to (moved there
+/// from the old one), is not the directory that was flushed: the append
+/// fails, with nothing acknowledged and the head unmoved. The retry writes
+/// to the segment where it is now and flushes the directory that holds
+/// it, and the log checks out.
+#[test]
+fn a_log_directory_swapped_in_during_the_flush_takes_no_acknowledged_entry() {
+    let log = Log::new();
+    let parent = log.dir.parent().unwrap().to_owned();
+    let data = dir_id(&parent);
+    let shim = Shim::default();
+    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+    let mut kept = fill(&mut w, 1, 1);
+    let old = dir_id(&log.dir);
+    assert_eq!(shim.dirs(), [old, data]);
+
+    let seg = log.segments().pop().unwrap();
+    let len = std::fs::metadata(&seg).unwrap().len();
+    let name = seg.file_name().unwrap().to_owned();
+    let (dir, aside) = (log.dir.clone(), parent.join("audit.aside"));
+    shim.plan().before_dir_sync = Some(Box::new(move || {
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        std::fs::rename(aside.join(&name), dir.join(&name)).unwrap();
+    }));
+    let e = w.append(&record(2)).unwrap_err();
+    assert_eq!(e.to_string(), "the audit log could not be read or written");
+    assert_eq!(w.head().0, 1);
+    let new = dir_id(&log.dir);
+    assert_ne!(new, old);
+    assert_eq!(shim.dirs(), [old, data], "the old directory was flushed");
+    assert_eq!(std::fs::metadata(&seg).unwrap().len(), len, "cut back");
+
+    kept.extend(fill(&mut w, 2, 1));
+    assert_eq!(shim.dirs(), [new, data]);
+    let (entries, report) = read_entries(&log.dir, &log.keys, None).unwrap();
+    assert!(report.ok(), "{report:?}");
+    let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, [1, 2]);
+    let records: Vec<AuditRecord> = entries.into_iter().map(|e| e.record).collect();
+    assert_eq!(records, kept);
+}
+
+/// A FIFO another program puts in place of the log's directory while an
+/// entry is written fails the append at once: the directories are opened
+/// with `O_DIRECTORY`, so the open neither waits for a writer to the FIFO
+/// nor flushes it in the directory's place. Nothing is acknowledged, and
+/// once the directory is back the next append goes on.
+#[test]
+fn a_fifo_in_place_of_the_log_directory_fails_the_append_without_blocking() {
+    let log = Log::new();
+    let shim = Shim::default();
+    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+    let mut kept = fill(&mut w, 1, 1);
+    let aside = log.dir.parent().unwrap().join("audit.aside");
+    let (dir, moved) = (log.dir.clone(), aside.clone());
+    shim.plan().before_frame = Some(Box::new(move || {
+        std::fs::rename(&dir, &moved).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&dir).status();
+        assert!(made.unwrap().success());
+    }));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = w.append(&record(2)).map_err(|e| e.to_string());
+        tx.send((r, w)).ok();
+    });
+    let Ok((r, mut w)) = rx.recv_timeout(Duration::from_secs(10)) else {
+        // Let the blocked open go before failing.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&log.dir);
+        panic!("the append waited on the FIFO");
+    };
+    assert_eq!(r.unwrap_err(), "the audit log could not be read or written");
+    assert_eq!(w.head().0, 1);
+
+    std::fs::remove_file(&log.dir).unwrap();
+    std::fs::rename(&aside, &log.dir).unwrap();
+    kept.extend(fill(&mut w, 2, 1));
+    let (entries, report) = read_entries(&log.dir, &log.keys, None).unwrap();
+    assert!(report.ok(), "{report:?}");
+    let records: Vec<AuditRecord> = entries.into_iter().map(|e| e.record).collect();
+    assert_eq!(records, kept);
+}
+
+/// Codex F-64, the last window: the log's directory can be swapped for
+/// another one after a new segment is made in it and before the segment's
+/// first entry is acknowledged, the segment moved into the new directory
+/// with it. The directories flushed for that entry are the ones there
+/// after it was written, the new log directory and then the data
+/// directory, never one flushed before the swap, so the entry is
+/// acknowledged where the check reads it. When the new directory does
+/// not hold the segment, the append fails and the retry makes a new
+/// segment there.
+#[test]
+fn a_log_directory_swapped_in_as_a_segment_is_made_is_flushed_into_the_data_directory() {
+    for carried in [true, false] {
+        let log = Log::new();
+        let parent = log.dir.parent().unwrap().to_owned();
+        let data = dir_id(&parent);
+        let shim = Shim::default();
+        let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+        let (dir, aside) = (log.dir.clone(), parent.join("audit.aside"));
+        shim.plan().before_header = Some(Box::new(move || {
+            std::fs::rename(&dir, &aside).unwrap();
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            if carried {
+                let name = std::fs::read_dir(&aside)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .file_name();
+                std::fs::rename(aside.join(&name), dir.join(&name)).unwrap();
+            }
+        }));
+        let one = record(1);
+        let got = w.append(&one);
+        let new = dir_id(&log.dir);
+        let ops = shim.ops();
+        assert!(
+            matches!(
+                ops[..],
+                [
+                    Op::Write(HEADER_LEN),
+                    Op::SyncFile,
+                    Op::Write(_),
+                    Op::SyncFile,
+                    Op::SyncDir,
+                    Op::SyncDir,
+                    ..
+                ]
+            ),
+            "carried {carried}: {ops:?}"
+        );
+        assert_eq!(
+            shim.dirs(),
+            [new, data],
+            "carried {carried}: after the swap, both"
+        );
+        if carried {
+            assert_eq!(got.unwrap(), 1);
+        } else {
+            assert_eq!(
+                got.unwrap_err().to_string(),
+                "the audit log could not be read or written"
+            );
+            assert_eq!(w.head().0, 0);
+            assert_eq!(w.append(&one).unwrap(), 1);
+            assert_eq!(shim.dirs(), [new, data]);
+        }
+        let (entries, report) = read_entries(&log.dir, &log.keys, None).unwrap();
+        assert!(report.ok(), "carried {carried}: {report:?}");
+        assert_eq!(entries.len(), 1, "carried {carried}");
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].record, one);
+        // The swap happened: the old directory holds the segment only
+        // when it was not carried over.
+        let left = std::fs::read_dir(parent.join("audit.aside"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "seg")
+            })
+            .count();
+        assert_eq!(left, usize::from(!carried), "carried {carried}");
     }
 }
 
@@ -1005,7 +1230,8 @@ fn a_renamed_segment_or_directory_takes_no_entry_with_it() {
     let current = log.segments().pop().unwrap();
     let current_len = std::fs::metadata(&current).unwrap().len();
     let raced = outside.join("raced");
-    shim.plan().move_before_frame = Some((current, raced.clone()));
+    let to = raced.clone();
+    shim.plan().before_frame = Some(Box::new(move || std::fs::rename(&current, &to).unwrap()));
     let head = w.head();
     assert!(w.append(&record(6)).is_err());
     assert_eq!(w.head(), head);
