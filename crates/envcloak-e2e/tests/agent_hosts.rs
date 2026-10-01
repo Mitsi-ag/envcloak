@@ -1329,8 +1329,10 @@ for key, url in (("PRXS", "https://example.com/"), ("PRXH", "http://example.com/
 /// bounded setting in `workspace-write` (what M2-08 would write) nothing
 /// else may be reachable: on macOS a raw connection anywhere is refused by
 /// the sandbox itself (`EPERM`), and on both systems both proxied
-/// requests are refused by Codex's own proxy (an HTTP 403), never by a
-/// network that is not there, and never reach the scripted model's proxy.
+/// requests are refused by Codex itself (its proxy's "Network access to
+/// ... was blocked", naming its rule, a 403 from it, or `EPERM` for the
+/// socket), never by a network that is not there, and never reach the
+/// scripted model's proxy.
 #[test]
 fn codex_sandbox_reaches_the_socket_and_nothing_else() {
     let Some(mut a) = host(Host::Codex, "native", "codex_sandbox") else {
@@ -1412,10 +1414,20 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
                 format!("reached ({e})")
             } else if let Some(e) = printed(&out, &format!("{key}NO ")) {
                 format!("refused ({e})")
-            } else if out.contains("domain is not on the allowlist") {
+            } else if let Some(why) = out
+                .split_once("was blocked: ")
+                .filter(|(before, _)| before.contains("Network access to"))
+                .map(|(_, why)| why)
+            {
                 // Codex failed the whole command: its proxy blocked the
-                // request's domain.
-                "refused (codex-proxy-allowlist)".to_owned()
+                // request, and says by which rule (macOS: the domain is
+                // not on the allowlist; Linux CI, whose namespaces resolve
+                // no name: local or private addresses).
+                let why: String = why
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '/'))
+                    .collect();
+                format!("refused (codex-proxy: {})", why.trim())
             } else {
                 // What the command's tool result said instead (Python's own
                 // error, or the host's words), and the types of the last
@@ -1481,12 +1493,9 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
             for key in ["PRXS", "PRXH"] {
                 let got = seen(key);
                 assert!(
-                    matches!(
-                        got.as_str(),
-                        "refused (codex-proxy-allowlist)"
-                            | "refused (tunnel-403)"
-                            | "refused (http-403)"
-                    ) || (got.starts_with("refused (PermissionError")),
+                    matches!(got.as_str(), "refused (tunnel-403)" | "refused (http-403)")
+                        || got.starts_with("refused (codex-proxy: ")
+                        || got.starts_with("refused (PermissionError"),
                     "{key} was not refused by Codex: {got}"
                 );
             }
