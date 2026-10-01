@@ -17,8 +17,8 @@ use envcloak_policy::{
     AttemptLimiter, BoundBinding, BoundRef, CatalogSource, ChainEnd, Claims, DENIAL_WINDOW,
     Decision, DenyReason, EnvName, GrantId, MAX_AGENT_TTL, MAX_DENIALS, MAX_GRANTS, MAX_PENDING,
     MAX_PENDING_PER_ROOT, MAX_TERMINAL_TTL, MatchBasis, Mode, Now, OptionsError, PENDING_TTL,
-    PendingId, ProcessInstance, ProjectIdentity, ProofKind, ProofRefusal, RevokeSelector,
-    SubjectEvidence, SubjectKind, Uses, statement_digest,
+    PendingCap, PendingId, ProcessInstance, ProjectIdentity, ProofKind, ProofRefusal,
+    RevokeSelector, SubjectEvidence, SubjectKind, Uses, statement_digest,
 };
 use envcloak_policy::{AgentLabel, GrantStore};
 use envcloak_sys::StartTime;
@@ -1062,9 +1062,10 @@ fn a_once_grant_is_consumed_exactly_once() {
 
 // -------------------------------------------------------- flood control
 
-/// Gate 32's store part: the pending caps hold, an identical request
-/// after a denial is denied without a prompt, and three denials for one
-/// root auto-deny it for 30 minutes.
+/// Gate 32's store part: the pending caps hold (a request over one is
+/// answered `too_many_pending`, never denied), an identical request after
+/// a denial is denied without a prompt, and three denials for one root
+/// auto-deny it for 30 minutes.
 #[test]
 fn pending_caps_hold_per_root_and_per_daemon() {
     let it = items();
@@ -1081,8 +1082,10 @@ fn pending_caps_hold_per_root_and_per_daemon() {
     for n in 0..MAX_PENDING_PER_ROOT {
         ids.push(pending_id(&s.decide(r(u32::try_from(n).unwrap()), &now)));
     }
+    // Over a cap, nothing is refused and nothing opened: the caller may
+    // ask again once a place is free (M2 plan D-04).
     let d = s.decide(r(99), &now);
-    assert_eq!(d, Decision::Denied(DenyReason::PendingPerRoot));
+    assert_eq!(d, Decision::TooManyPending(PendingCap::PerRoot));
     // The existing ones are still returned as they are.
     assert_eq!(pending_id(&s.decide(r(0), &now)), ids[0]);
     // Another root (another agent instance) has a cap of its own, and
@@ -1103,7 +1106,7 @@ fn pending_caps_hold_per_root_and_per_daemon() {
             &now,
         );
         if full {
-            assert_eq!(d, Decision::Denied(DenyReason::PendingTotal));
+            assert_eq!(d, Decision::TooManyPending(PendingCap::Total));
             break;
         }
         assert!(matches!(d, Decision::Pending(_)), "{d:?}");

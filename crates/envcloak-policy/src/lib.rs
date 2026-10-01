@@ -67,7 +67,8 @@ pub use flood::{
 pub use grants::{
     AccessRequest, ApprovalOptions, ApprovalProof, ApproveError, BoundRef, DEFAULT_TTL, Decision,
     DenyOutcome, DenyReason, Grant, GrantBinding, GrantId, GrantStore, MAX_AGENT_TTL, MAX_GRANTS,
-    MAX_TERMINAL_TTL, NoSuchRequest, Now, OptionsError, ProofKind, RevokeSelector, Uses,
+    MAX_TERMINAL_TTL, NoSuchRequest, Now, OptionsError, PendingCap, ProofKind, RevokeSelector,
+    Uses,
 };
 pub use limiter::{AttemptLimiter, FIRST_WAIT, FREE_ATTEMPTS, MAX_WAIT};
 pub use manifest::{

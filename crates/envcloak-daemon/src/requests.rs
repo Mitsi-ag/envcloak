@@ -43,6 +43,10 @@
 //!
 //! No grant is evaluated, and no proof taken, from a vault whose
 //! integrity check failed ([`crate::state::State::unlocked`]).
+//!
+//! A request over a pending cap is answered `too_many_pending` with the
+//! cap as its reason, and audited so: nothing was opened or refused, and a
+//! waiter asks again later (M2 plan D-04).
 
 use std::path::Path;
 
@@ -486,6 +490,17 @@ pub fn run_request(
                 break RunAnswer::decided(DecisionView::Pending {
                     request: id.to_string(),
                 });
+            }
+            Decision::TooManyPending(cap) => {
+                s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                    decision: "too_many_pending",
+                    reason: Some(cap.token()),
+                    ..entry
+                })));
+                return Err(RpcError::with_reason(
+                    ErrorKind::TooManyPending,
+                    cap.token(),
+                ));
             }
             Decision::Denied(reason) => {
                 s.audit(AuditEvent::Request(Box::new(RequestAudit {

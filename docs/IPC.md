@@ -88,7 +88,7 @@ Response, one of:
 | `vault.create` | `passphrase`, `recovery_kit` (the kit's text as the user wrote it down), `kdf_memory_kib` (optional, 65536 to 4194304) | `locked` (true when a lock arrived while Argon2id ran: the vault was created, then locked), `integrity`, `read_only` |
 | `unlock` | `passphrase`, `claims` (optional: the names of the agent markers in the caller's environment) | `integrity`, `read_only`, `already` (true when it was unlocked already; nothing was checked) |
 | `lock` | none | `was_unlocked` |
-| `run.request` | `manifest` (the absolute path of `envcloak.toml`), `profile` (optional), `refs` (`NAME=<slug>[#field]` strings), `env_file` (optional: `refs`, each `{line, text}` with `text` as `NAME=<slug>[#field]`, and `plain`, each `{line, text}` with `text` the name of an ordinary variable; never a value), `argv` (display text), `claims` | `decision`: `covered` with `grant`, `redact`, `mode` and `manifest_changed`; `pending` with `request`; or `denied` with `reason` (`repeated`, `root_denied`, `pending_per_root`, `pending_total`, `denials_full`, or `audit_failed` when a grant covers the request but its audit entry could not be written). With `covered` only, `values`: for each binding, `env_name`, `slug`, `allow_short` and `value` |
+| `run.request` | `manifest` (the absolute path of `envcloak.toml`), `profile` (optional), `refs` (`NAME=<slug>[#field]` strings), `env_file` (optional: `refs`, each `{line, text}` with `text` as `NAME=<slug>[#field]`, and `plain`, each `{line, text}` with `text` the name of an ordinary variable; never a value), `argv` (display text), `claims` | `decision`: `covered` with `grant`, `redact`, `mode` and `manifest_changed`; `pending` with `request`; or `denied` with `reason` (`repeated`, `root_denied`, `denials_full`, or `audit_failed` when a grant covers the request but its audit entry could not be written). With `covered` only, `values`: for each binding, `env_name`, `slug`, `allow_short` and `value`. A request over a pending cap is the error `too_many_pending` instead, with the reason `pending_per_root` or `pending_total` |
 | `pending.get` | `request`, `claims` | the pending request's descriptor (`envcloak_policy::PendingDescriptor`; docs/GRANTS.md "The statement"), for a caller that may give a proof |
 | `approve` | `request`, `options` (`uses`: `once` or `session`; `ttl_secs`; `live`: variable names), `digest` (SHA-256 of the canonical statement, 64 hex characters), `passphrase`, `claims` | `grant`, `expires_in_secs` |
 | `deny` | `request` | `root_auto_denied` |
@@ -168,6 +168,7 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `too_many_checks` | -32032 | The caller's subject root had 100,000 values compared with the vault in the last hour (`import.plan`, `import.commit`, `import.verify`) |
 | `audit_failed` | -32033 | A delivery's audit entry could not be written (`files.restore`): nothing was released |
 | `backup_unusable` | -32034 | The file named for `vault.recover` is not a vault backup this build can read (missing, not a regular file, a symlink as its last component, altered or cut short), or is a backup of another vault than the one in place; nothing was restored |
+| `too_many_pending` | -32035 | A `run.request` over a pending cap (SPEC §10a: 3 per subject root, 20 per daemon): no request was opened and nothing refused; `reason` is `pending_per_root` or `pending_total`. A waiter asks again with backoff; a run that does not wait exits 125 with it |
 | `internal` | -32099 | The daemon failed |
 
 The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daemon_unavailable`, `daemon_unverified` and `protocol_error` for the connection, `approval_required request=<id>` and `approval_denied` for a run's decision, `audit_problem` when `envcloak audit verify` finds the log changed or damaged, `not_imported`, `unresolved_reference`, `recovery_kit_unconfirmed`, `not_deleted` and `import_too_large` for `envcloak init` and `envcloak import` (IMPORT.md), and `traced` when a tracer is attached to it. `envcloak run` exits 125 on them (SPEC §6.1); the other commands exit 1, and 2 on a usage error.
@@ -185,7 +186,8 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `unknown_item`, `unknown_field`, `ambiguous_field`, `no_field` | `binding_unresolved` and `no_such_item` |
 | `card_reference`, `issuer_credential_reference`, `unknown_item_class` | `manifest_invalid` (`unknown_item_class` also `no_such_item`) |
 | `ttl_zero`, `ttl_too_long`, `live_not_bound` | `invalid_options` |
-| `repeated`, `root_denied`, `pending_per_root`, `pending_total`, `denials_full`, `audit_failed` | `run.request`'s `denied` decision |
+| `repeated`, `root_denied`, `denials_full`, `audit_failed` | `run.request`'s `denied` decision |
+| `pending_per_root`, `pending_total` | `too_many_pending` |
 | `item_changed` | `no_such_item` |
 | `invalid_slug`, `invalid_field`, `unknown_provider`, `invalid_account`, `looks_like_value`, `empty_value`, `nul_byte`, `value_too_large`, `no_free_slug` | `invalid_item` |
 | `requester_terminal` | `proof_refused` |
@@ -234,7 +236,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | Token | Code | Task | Status | Use |
 |---|---|---|---|---|
 | `busy` | -32008 | M2-03 | reuse | `pending.state` polls over the subject root's limit, which a waiter answers by backing off (SPEC §6.1); M2-06 uses it again for the MCP server's full call queue |
-| `too_many_pending` | -32035 | M2-03 | reserved | a `run.request` over a pending cap (§10a), which a waiter retries with backoff and never takes as a refusal; M2-03 decides, in this table, whether `denied` with `pending_per_root` and `pending_total` stays for callers that do not wait |
+| `too_many_pending` | -32035 | M2-03 | landed | a `run.request` over a pending cap (§10a), which a waiter retries with backoff and never takes as a refusal. M2-03's decision: it replaces `denied` with `pending_per_root` and `pending_total` for every caller, waiting or not (those two now ride on it as its reasons): a cap is not a refusal, nothing was asked of a person, so one meaning per token; a run that does not wait exits 125 with it |
 | `not_backup_owner` | -32036 | M2-05 | reserved | a backup v2 call from a process instance other than the one that began the backup; nothing is changed and no metadata returned |
 | `login_reference` | -32037 | M2-07 | reserved | a reference to a login item's field, which `run`, `ref` and every resolver refuse (SPEC §6.8) |
 | `live_not_ticked` | -32038 | M2-13 | reserved | an approval whose statement leaves a live binding unticked creates no grant (SPEC §10b) |

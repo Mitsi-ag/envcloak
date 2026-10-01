@@ -611,7 +611,8 @@ fn an_empty_or_missing_passphrase_approves_nothing() {
     f.sweep();
 }
 
-/// Gate 32: the pending caps hold, an identical request after a denial
+/// Gate 32: the pending caps hold (a request over one is answered
+/// `too_many_pending`, never denied), an identical request after a denial
 /// is denied without a prompt, three denials auto-deny the root, and the
 /// attempt limiter, shared with `unlock`, holds.
 #[test]
@@ -619,15 +620,32 @@ fn flood_control_and_the_attempt_limiter_hold() {
     let mut f = Fixture::new();
     let mut c = client(&f.home);
 
-    // The per-root cap: this process's root holds at most 3.
+    // The per-root cap: this process's root holds at most 3. One more is
+    // not denied but answered `too_many_pending`, naming the cap: nothing
+    // was opened, and a waiter asks again later (M2 plan D-04).
     let mut ids = Vec::new();
     for n in 0..MAX_PENDING_PER_ROOT {
         ids.push(pending(&f.request(&[&n.to_string()])));
     }
-    match f.request(&["one more"]) {
-        DecisionView::Denied { reason } => assert_eq!(reason, DenyReason::PendingPerRoot.token()),
-        other => panic!("{other:?}"),
-    }
+    let e = client(&f.home)
+        .run_request(&f.params(&["one more"]))
+        .unwrap_err();
+    assert_eq!(
+        rpc_kind(e),
+        (ErrorKind::TooManyPending, Some("pending_per_root"))
+    );
+    assert!(
+        f.d.wait_for_log(
+            "audit: request decision=too_many_pending id=pending_per_root",
+            Duration::from_secs(5)
+        ),
+        "{}",
+        f.d.log()
+    );
+    assert_eq!(
+        c.status().unwrap().approvals.pending as usize,
+        MAX_PENDING_PER_ROOT
+    );
     // Denying frees a place; an identical request is then denied at once.
     let denied = c.deny(&ids[0]).unwrap();
     assert!(!denied.root_auto_denied);
