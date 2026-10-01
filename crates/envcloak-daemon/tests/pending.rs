@@ -355,8 +355,11 @@ fn polls_over_the_roots_limit_are_busy() {
 /// with its id, kind, project and bindings. This session lists its own
 /// terminal request: a person approves their own terminal's request.
 ///
-/// Mutation: list pending requests to an agent subject (skip the proof
-/// check): the claimed caller lists the request and this fails.
+/// Mutation: no proof check in `pending.list` (no early return, and the
+/// per-request filter only the requester's session and terminal): the
+/// caller without a terminal lists the request and this fails. Removing
+/// the early return alone changes nothing, since the per-request filter
+/// (`approval_refusal`) begins with the same check.
 #[test]
 fn pending_list_shows_a_request_only_where_a_proof_would_be_taken() {
     let f = Fixture::new();

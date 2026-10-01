@@ -23,13 +23,14 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::symlink;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
     MANIFEST, cli, cli_command, daemon_exe, drive_from, finish_within, on_terminal_command,
-    outside_dir, project, python3, run, run_on_terminal, secret_file, seed_vault, stderr, stdout,
+    on_terminal_program, outside_dir, project, python3, run, run_on_terminal, secret_file,
+    seed_vault, stderr, stdout,
 };
 use envcloak_testkit::{
     Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels, testkit_bin,
@@ -872,9 +873,12 @@ fn a_waiting_run_ends_on_sigint_however_it_inherited_it() {
 /// terminal whose shell carries an agent's marker; each prints the same
 /// line as when nothing waits. The person's own terminal lists it.
 ///
-/// Mutation: list pending requests to an agent subject (skip the proof
-/// check in `pending.list`): the agent's `envcloak pending` lists the
-/// request and this fails.
+/// Mutation: no proof check in `pending.list` (no early return, and the
+/// per-request filter only the requester's session and terminal): the
+/// command without a terminal lists the request and this fails. Removing
+/// the early return alone changes nothing, since the per-request filter
+/// (`approval_refusal`) begins with the same check. An agent refused only
+/// as an agent is the next test's.
 #[test]
 fn pending_lists_nothing_where_no_proof_is_taken() {
     let f = Fixture::new();
@@ -905,6 +909,61 @@ fn pending_lists_nothing_where_no_proof_is_taken() {
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(stderr(&out), "envcloak: usage: envcloak pending [--json]\n");
     drop(agent);
+    f.sweep();
+}
+
+/// A known agent on a terminal of its own, outside the requester's tree,
+/// session and terminal, is listed nothing, in text and in JSON: the
+/// request is another agent's, so its being an agent is the only reason.
+/// A shell in the agent's place on such a terminal lists the request, as
+/// a person's terminal does.
+///
+/// Mutation: list to a caller refused only as an agent (an `Agent` proof
+/// refusal ignored in `pending.list`, the requester's session and
+/// terminal still filtered out): the fixture agent's `envcloak pending`
+/// lists the other agent's request and this fails.
+#[test]
+fn a_known_agent_on_its_own_terminal_is_listed_nothing() {
+    let f = Fixture::new();
+    let mut requester = f.agent();
+    let out = requester.cli(&["run", "--", "./emit"]);
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    let id = required(&stderr(&out)).pop().unwrap();
+    let on_own_terminal = |argv: &[&Path]| {
+        let out = finish_within(
+            on_terminal_program(&f.home, argv, &[]),
+            Duration::from_secs(60),
+        );
+        assert_no_canary(&out.stdout, &f.cs);
+        assert_no_canary(&out.stderr, &f.cs);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        out
+    };
+    let fixture_agent = testkit_bin("fixture-agent");
+    let agent = |args: &[&'static str]| {
+        let mut argv: Vec<&Path> = vec![&fixture_agent, Path::new("--"), cli()];
+        argv.extend(args.iter().map(Path::new));
+        on_own_terminal(&argv)
+    };
+    let none = "No requests are waiting for approval that this terminal may approve.\n";
+    assert_eq!(stdout(&agent(&["pending"])), none);
+    assert_eq!(
+        stdout(&agent(&["pending", "--json"])),
+        "{\"requests\":[]}\n"
+    );
+    // The same command with a shell in the agent's place lists it.
+    let line = format!("{} pending --json", quoted(cli().to_str().unwrap()));
+    let out = on_own_terminal(&[Path::new("/bin/sh"), Path::new("-c"), Path::new(&line)]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed: Vec<&str> = v["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["request"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, [id.as_str()]);
+    assert_eq!(f.listed(), [id]);
+    drop(requester);
     f.sweep();
 }
 
