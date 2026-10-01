@@ -24,13 +24,24 @@
 //!    root asked too often) doubles the pause, up to 2 seconds, and is
 //!    never taken as a refusal. A pause never gets shorter.
 //!
+//! A call the daemon did not take, its connection closed or reset before
+//! any answer (the daemon closes a connection at once, unanswered, when 32
+//! are open or 8 of one process), or, once the daemon has answered this
+//! wait, refused or with no socket there (a daemon restarting, or a
+//! listener whose backlog is full on macOS), is asked again after the
+//! busy backoff, as `busy` is, until the deadline. Before any answer, no
+//! daemon there is the failure at once, as it is without waiting; a
+//! socket or daemon that fails a check, and a connection that ends inside
+//! an answer, are never asked again.
+//!
 //! The wait ends at its deadline, at most [`MAX_WAIT`] (the pending
 //! request's lifetime): the last poll is made at the deadline itself, and a
 //! request still pending then is [`Finish::TimedOut`]; so is one told
 //! `unknown` at or after the deadline, which is not asked again. Only
 //! `approved` is still asked again then, once: the approval came within the
-//! wait. Nothing here reads a terminal or any input: approval input is
-//! never read from the requesting process's terminal.
+//! wait. A call the daemon did not take at the deadline ends the wait with
+//! that failure. Nothing here reads a terminal or any input: approval
+//! input is never read from the requesting process's terminal.
 //!
 //! **Bounded.** No call of a wait is answered later than its limit, the
 //! deadline plus [`CALL_GRACE`] ([`Wait::limit`]): each call is given
@@ -186,7 +197,8 @@ pub enum Finish {
     TimedOut(PendingId),
     /// The deadline came while every place for a request was taken.
     TooManyPending(RpcError),
-    /// Any other failure of either call.
+    /// Any other failure of either call, and a call the daemon did not
+    /// take at the deadline.
     Failed(ClientError),
 }
 
@@ -205,11 +217,32 @@ pub struct Wait {
     announced: Option<PendingId>,
     /// `too_many_pending` was announced.
     crowded: bool,
+    /// The daemon has answered a call of this wait.
+    answered: bool,
 }
 
 /// Whether `e` is the daemon's `kind`.
 fn is_kind(e: &ClientError, kind: ErrorKind) -> bool {
     matches!(e, ClientError::Rpc(r) if r.kind == kind)
+}
+
+/// Whether `e` says the daemon did not take the call, so that it is asked
+/// again (see the module documentation): its connection closed before any
+/// answer, or reset (as a close with the request unread shows on Linux),
+/// at once or on the request; or, once the daemon has `answered` this
+/// wait, nothing listening there. A connection that ends inside an answer
+/// ([`FrameError::Truncated`]), a timeout, a socket or daemon that failed
+/// a check, and a malformed answer are not.
+fn not_taken(e: &ClientError, answered: bool) -> bool {
+    use std::io::ErrorKind as Io;
+    match e {
+        ClientError::Frame(
+            FrameError::Closed
+            | FrameError::Io(Io::BrokenPipe | Io::ConnectionReset | Io::ConnectionAborted),
+        ) => true,
+        ClientError::Unavailable => answered,
+        _ => false,
+    }
 }
 
 impl Wait {
@@ -225,6 +258,7 @@ impl Wait {
             ask_again: true,
             announced: None,
             crowded: false,
+            answered: false,
         }
     }
 
@@ -260,6 +294,15 @@ impl Wait {
 
     /// The next action, at `now`, after `e`; and a notice to show, if any.
     pub fn next(&mut self, now: Duration, e: Event<'_>) -> (Action, Option<Notice>) {
+        let answer = match &e {
+            Event::Answered(r) => Some(r.as_ref().map(|_| ())),
+            Event::Polled(r) => Some(r.as_ref().map(|_| ())),
+            Event::Start | Event::Woke => None,
+        };
+        let answered_before = self.answered;
+        if let Some(Ok(()) | Err(ClientError::Rpc(_))) = answer {
+            self.answered = true;
+        }
         match e {
             Event::Start => (Action::Request, None),
             Event::Answered(Ok(DecisionView::Pending { request })) => {
@@ -302,6 +345,16 @@ impl Wait {
                 self.backoff.after_busy();
                 (self.pause(now), None)
             }
+            // Not taken: asked again after the busy pause, until the
+            // deadline, where it is the failure.
+            Event::Answered(Err(e)) if not_taken(&e, answered_before) => {
+                self.ask_again = true;
+                if now >= self.deadline {
+                    return (Action::Finish(Finish::Failed(e)), None);
+                }
+                self.backoff.after_busy();
+                (self.pause(now), None)
+            }
             Event::Answered(Err(e)) => (Action::Finish(Finish::Failed(e)), None),
             Event::Woke => match self.request {
                 Some(id) if !self.ask_again => (Action::Poll(id), None),
@@ -340,6 +393,14 @@ impl Wait {
                         self.ask_again = false;
                         if now >= self.deadline {
                             return (Action::Finish(Finish::TimedOut(id)), None);
+                        }
+                        self.backoff.after_busy();
+                        (self.pause(now), None)
+                    }
+                    Err(e) if not_taken(&e, answered_before) => {
+                        self.ask_again = false;
+                        if now >= self.deadline {
+                            return (Action::Finish(Finish::Failed(e)), None);
                         }
                         self.backoff.after_busy();
                         (self.pause(now), None)
@@ -488,8 +549,10 @@ fn too_late<T>(w: &Wait, now: Duration, r: &Result<T, ClientError>) -> bool {
 /// # Errors
 /// Any failure of either call other than `busy` and `too_many_pending`,
 /// which are waited out (`busy` from `run.request` too, unless the wait
-/// ends before any request was named), and other than a call the daemon
-/// did not answer by the wait's limit ([`Waited::Unanswered`]).
+/// ends before any request was named), other than a call the daemon did
+/// not take before the deadline, which is asked again, and other than a
+/// call the daemon did not answer by the wait's limit
+/// ([`Waited::Unanswered`]).
 pub fn wait_for_run(
     t: &mut dyn Transport,
     c: &mut dyn Clock,

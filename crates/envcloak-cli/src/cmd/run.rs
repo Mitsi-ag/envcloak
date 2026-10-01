@@ -35,8 +35,10 @@
 //!    Approved, it asks again and runs; denied, it exits 125 with
 //!    `approval_denied`; still pending at the deadline, or expired, it
 //!    exits 125, the `approval_required` line being its failure
-//!    ([`envcloak_ipc::wait`]). The wait never outlasts its deadline by
-//!    more than 5 seconds: every call, from its connect to the
+//!    ([`envcloak_ipc::wait`]). A call the daemon did not take (its
+//!    connection closed unanswered, as at its connection limit) is asked
+//!    again the same way until the deadline. The wait never outlasts its
+//!    deadline by more than 5 seconds: every call, from its connect to the
 //!    last byte of its answer, is given only the time left to that limit,
 //!    however the daemon paces what it sends or reads, and an answer read
 //!    later is dropped, its values wiped, with exit 125 and
