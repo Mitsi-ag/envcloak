@@ -12,7 +12,11 @@
 //! positive control (a canary a scripted turn prints) is counted like
 //! anything else. The scripted model's request bodies are swept too
 //! ([`sweep_model`]): what a host sent its model is what a real model
-//! would have seen.
+//! would have seen. Both read through up to
+//! [`crate::detect::JSON_LEVELS`] levels of JSON string escaping, since a
+//! host keeps what a command printed as a JSON string, sometimes inside
+//! another, and a value escaped again matches none of its listed
+//! encodings as stored.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -312,6 +316,16 @@ pub struct Hits {
     pub model: Vec<ModelHit>,
 }
 
+/// An encoding's name as a count shows it: with the levels of JSON
+/// escaping read through to find it, when any.
+fn shown_encoding(f: &Found) -> String {
+    if f.unescaped == 0 {
+        f.encoding.to_owned()
+    } else {
+        format!("{} (JSON-unescaped {}x)", f.encoding, f.unescaped)
+    }
+}
+
 fn found(hit: &Hit) -> Option<&Found> {
     match hit {
         Hit::Canary { found, .. } | Hit::Name { found, .. } | Hit::LinkTarget { found, .. } => {
@@ -374,7 +388,7 @@ impl fmt::Display for Hits {
         for s in &self.stores {
             for h in &s.hits {
                 let (label, enc) = match found(h) {
-                    Some(x) => (x.label.clone(), x.encoding.to_owned()),
+                    Some(x) => (x.label.clone(), shown_encoding(x)),
                     None => ("<unreadable>".to_owned(), String::new()),
                 };
                 *counts.entry((s.store.clone(), label, enc)).or_default() += 1;
@@ -385,7 +399,7 @@ impl fmt::Display for Hits {
                 .entry((
                     "model request bodies".to_owned(),
                     h.found.label.clone(),
-                    h.found.encoding.to_owned(),
+                    shown_encoding(&h.found),
                 ))
                 .or_default() += 1;
         }

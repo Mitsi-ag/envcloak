@@ -520,7 +520,177 @@ fn the_model_s_request_bodies_are_swept() {
         outcome: serde_json::json!({}),
     };
     let hits = sweep_model(&report, &cs);
-    assert_eq!(hits.len(), 1, "{hits:?}");
-    assert_eq!(hits[0].seq, 3);
-    assert!(hits[0].found.encoding.starts_with("json/"), "{hits:?}");
+    // Its JSON encoding as the body holds it, and the value itself with
+    // the body's escaping read through.
+    let mut at: Vec<(u64, u8, &str)> = hits
+        .iter()
+        .map(|h| (h.seq, h.found.unescaped, h.found.encoding))
+        .collect();
+    at.sort_unstable();
+    assert_eq!(at.len(), 2, "{hits:?}");
+    assert!(
+        at[0].0 == 3 && at[0].1 == 0 && at[0].2.starts_with("json/"),
+        "{hits:?}"
+    );
+    assert_eq!(at[1], (3, 1, "raw"), "{hits:?}");
+}
+
+/// What a host does with a line a command printed: it keeps it as a JSON
+/// string, and Codex keeps a command's result as a JSON string that holds
+/// JSON, so each listed encoding is escaped again on its way to a store or
+/// to the model (Codex review: a JSON-encoded value escaped a second time
+/// matched none of the 131 patterns). Every case of the matrix, printed
+/// alone, in each envelope a pinned host writes, built by serde_json and
+/// by Python's `json.dumps` (ASCII only, as Python writes JSON by
+/// default), is found under its own encoding name: in the stores by the
+/// sweep, in the bodies by the model sweep.
+#[test]
+fn every_encoding_is_found_inside_each_host_and_model_envelope() {
+    let cs = canaries(fresh_seed());
+    let cases = matrix(&cs);
+    let printed: Vec<String> = cases
+        .iter()
+        .map(|c| String::from_utf8(c.bytes.clone()).unwrap())
+        .collect();
+    let python = python_history_lines(&printed);
+    let home = TestHome::new();
+    let h = home.home();
+    // (envelope, the host whose stores hold it, file for case i, the
+    // file's text)
+    type Envelope<'a> = (
+        &'a str,
+        Host,
+        Box<dyn Fn(usize) -> PathBuf + 'a>,
+        Box<dyn Fn(usize) -> String + 'a>,
+    );
+    let envelopes: Vec<Envelope<'_>> = vec![
+        (
+            "a Claude Code tool result",
+            Host::ClaudeCode,
+            Box::new(|i| h.join(format!(".claude/projects/-tmp-acme/s/{i}.jsonl"))),
+            Box::new(|i| {
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": printed[i]}]},
+                    "toolUseResult": {"stdout": printed[i], "stderr": "", "interrupted": false}})
+                .to_string()
+            }),
+        ),
+        (
+            "a Codex command result",
+            Host::Codex,
+            Box::new(|i| h.join(format!(".codex/sessions/2026/10/02/rollout-{i}.jsonl"))),
+            Box::new(|i| {
+                let output = serde_json::json!({"output": printed[i],
+                    "metadata": {"exit_code": 0, "duration_seconds": 0.1}})
+                .to_string();
+                serde_json::json!({"type": "response_item", "payload":
+                    {"type": "function_call_output", "call_id": "call_1", "output": output}})
+                .to_string()
+            }),
+        ),
+        (
+            "a line Python wrote",
+            Host::ClaudeCode,
+            Box::new(|i| h.join(format!(".claude/paste-cache/{i}.json"))),
+            Box::new(|i| python[i].clone()),
+        ),
+    ];
+    let mut missing = Vec::new();
+    for (what, host, file, text) in &envelopes {
+        for i in 0..cases.len() {
+            let path = file(i);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text(i)).unwrap();
+        }
+        let hits = sweep(*host, &home, &cs);
+        for (i, case) in cases.iter().enumerate() {
+            let path = file(i);
+            let found = hits
+                .stores
+                .iter()
+                .flat_map(|s| &s.hits)
+                .any(|hit| match hit {
+                    Hit::Canary { path: p, found } => {
+                        p.raw() == path.as_path()
+                            && found.label == case.label
+                            && found.encoding == case.name
+                    }
+                    _ => false,
+                });
+            if !found {
+                missing.push(format!("{what}: {} as {}", case.label, case.name));
+            }
+        }
+    }
+    // The bodies a host sends its model: Anthropic Messages with the
+    // printed line as a tool result, OpenAI Responses with Codex's command
+    // result (JSON in a JSON string).
+    let bodies = |i: usize| -> [String; 2] {
+        let output =
+            serde_json::json!({"output": printed[i], "metadata": {"exit_code": 0}}).to_string();
+        [
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": printed[i]}]}]})
+            .to_string(),
+            serde_json::json!({"model": "m", "input": [
+                {"type": "function_call_output", "call_id": "call_1", "output": output}]})
+            .to_string(),
+        ]
+    };
+    for (kind, what) in ["an Anthropic Messages body", "an OpenAI Responses body"]
+        .into_iter()
+        .enumerate()
+    {
+        let report = ModelReport {
+            requests: (0..cases.len())
+                .map(|i| ModelRequest {
+                    seq: i as u64,
+                    at_ms: 0,
+                    method: "POST".to_owned(),
+                    path: "/v1/x".to_owned(),
+                    status: 200,
+                    api: None,
+                    pick: None,
+                    body: Zeroizing::new(bodies(i)[kind].clone().into_bytes()),
+                })
+                .collect(),
+            outcome: serde_json::json!({}),
+        };
+        let hits = sweep_model(&report, &cs);
+        for (i, case) in cases.iter().enumerate() {
+            if !hits.iter().any(|h| {
+                h.seq == i as u64 && h.found.label == case.label && h.found.encoding == case.name
+            }) {
+                missing.push(format!("{what}: {} as {}", case.label, case.name));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} of {} cases not found, first: {:?}",
+        missing.len(),
+        5 * cases.len(),
+        &missing[..missing.len().min(10)]
+    );
+}
+
+/// What Python's `json.dumps` makes of a Claude Code history line holding
+/// each text: ASCII only, every other character as `\u` escapes.
+fn python_history_lines(texts: &[String]) -> Vec<String> {
+    let script = "import json, sys\n\
+        out = [json.dumps({'display': t, 'pastedContents': {}, 'timestamp': 1,\n\
+        \x20                  'project': '/tmp/acme'}) for t in json.load(sys.stdin)]\n\
+        json.dump(out, sys.stdout)\n";
+    let mut child = Command::new("python3")
+        .args(["-c", script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("python3 is needed for the envelope oracle: {e}"));
+    let input = serde_json::to_vec(texts).unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), &input).unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "python3 failed");
+    serde_json::from_slice(&out.stdout).unwrap()
 }
