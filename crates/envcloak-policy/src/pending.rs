@@ -174,12 +174,16 @@ impl Outcomes {
     }
 }
 
-/// One root's poll budget, in thousandths of a poll so that a refill of a
-/// few milliseconds counts.
+/// Units of a bucket's budget in one poll: a bucket counts in billionths
+/// of a poll, so that every nanosecond of refill counts, however close
+/// together the polls come.
+const NANO: u128 = 1_000_000_000;
+
+/// One root's poll budget, in billionths of a poll ([`NANO`]).
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
-    milli: u64,
-    /// Awake time of the last poll.
+    nano: u128,
+    /// Awake time of the latest poll: what is refilled up to.
     at: Duration,
 }
 
@@ -203,10 +207,11 @@ impl PollLimiter {
         live: usize,
         now: Duration,
     ) -> Result<(), Busy> {
-        // One second's worth, refilled in one second.
+        // One second's worth, refilled in one second: `per_second` units
+        // for each nanosecond.
         let per_second =
-            u64::from(POLLS_PER_REQUEST) * u64::try_from(live.max(1)).unwrap_or(u64::MAX);
-        let cap = per_second.saturating_mul(1000);
+            u128::from(POLLS_PER_REQUEST) * u128::try_from(live.max(1)).unwrap_or(u128::MAX);
+        let cap = per_second.saturating_mul(NANO);
         if !self.buckets.contains_key(root) && self.buckets.len() >= MAX_POLL_ROOTS {
             // A bucket left alone for a second is full again: forget it.
             self.buckets
@@ -215,23 +220,25 @@ impl PollLimiter {
                 return Err(Busy);
             }
         }
-        let b = self.buckets.entry(root.clone()).or_insert(Bucket {
-            milli: cap,
-            at: now,
-        });
+        let b = self
+            .buckets
+            .entry(root.clone())
+            .or_insert(Bucket { nano: cap, at: now });
         // The bucket's clock never moves back: polls whose times were read
         // before the store's lock can arrive out of order, and an earlier
         // time taken as the bucket's would refill the same interval twice.
-        let elapsed = u64::try_from(now.saturating_sub(b.at).as_millis()).unwrap_or(u64::MAX);
-        b.milli = b
-            .milli
+        // Every nanosecond it moves is refilled, refused polls' included:
+        // none is dropped, however close together the polls come.
+        let elapsed = now.saturating_sub(b.at).as_nanos();
+        b.nano = b
+            .nano
             .saturating_add(elapsed.saturating_mul(per_second))
             .min(cap);
         b.at = b.at.max(now);
-        if b.milli < 1000 {
+        if b.nano < NANO {
             return Err(Busy);
         }
-        b.milli -= 1000;
+        b.nano -= NANO;
         Ok(())
     }
 
