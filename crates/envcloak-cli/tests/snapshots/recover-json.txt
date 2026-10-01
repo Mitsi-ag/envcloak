@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+{"backup_created_secs":"<SECS>","items":4,"locked":false,"replaced":1}
+--- stderr

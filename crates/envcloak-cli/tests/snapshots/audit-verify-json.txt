@@ -1,0 +1,4 @@
+exit: 0
+--- stdout
+{"segments":1,"entries":6,"last_seq":6,"first_problem":null,"problems":0,"anchor":{"state":"none","seq":null},"unanchored_tail":{"first":1,"last":6},"torn_tail":false,"torn_bytes":0,"live_head_matches":true,"queued":0,"dropped":0}
+--- stderr
