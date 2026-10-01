@@ -391,16 +391,17 @@ fn backslash_decoded(password: &[u8]) -> Vec<u8> {
 /// Go's MySQL DSN, `user:password@tcp(host:3306)/db`, has no scheme: its
 /// user information is the value up to an `@` that an address follows,
 /// and the password is what follows its first `:`. An address is a
-/// protocol name and `(` (`@tcp(`, `@unix(`, `@tcp6(`), a protocol name
-/// and `/` (`@tcp/db`, the protocol's default address, which the driver's
-/// README shows: review R-3), or `/` alone (`@/db`, the default protocol
-/// and address). Each such `@` is a reading, since the password may hold
-/// an `@` too.
+/// protocol name and `(` (`@tcp(`, `@unix(`, `@tcp6(`), `(` alone
+/// (`@(host:3306)/db`, which the driver reads with the default protocol:
+/// review R-18), a protocol name and `/` (`@tcp/db`, the protocol's
+/// default address, which the driver's README shows: review R-3), or `/`
+/// alone (`@/db`, the default protocol and address). Each such `@` is a
+/// reading, since the password may hold an `@` too.
 ///
 /// When the first `:` starts `://`, the value may be a URL with a user and
 /// no password (`postgres://app@db/app`), whose `@` before a host and `/`
 /// ends the user: the `/` forms are not read there, since they would
-/// measure `//app` as a password. The `(` form is (review R-11): a URL's
+/// measure `//app` as a password. The `(` forms are (review R-11): a URL's
 /// host never holds `(`, so `app://<password>@tcp(db:3306)/app` is a DSN
 /// whose password starts with `//`, and a reading the value does not hold
 /// only makes it count as shorter, never longer. A DSN whose password
@@ -419,7 +420,7 @@ fn dsn_passwords<'a>(v: &'a [u8], out: &mut Readings<'a>) {
         let name = out.run(rest, protocol);
         let address = match rest.get(name) {
             Some(b'/') => !url,
-            Some(b'(') => name > 0,
+            Some(b'(') => true,
             _ => false,
         };
         let password = &v[colon + 1..at];
@@ -562,8 +563,8 @@ fn readings(v: &[u8]) -> Readings<'_> {
 /// - a URL with a password ([`shaped_like_secret`]'s first shape), where
 ///   the password is read at every `@` a server could end it at, in every
 ///   URL the value lists (`url_passwords`);
-/// - Go's MySQL DSN, `user:password@tcp(host)/db`, `@tcp/db` or `@/db`
-///   (`dsn_passwords`);
+/// - Go's MySQL DSN, `user:password@tcp(host)/db`, `@(host)/db`,
+///   `@tcp/db` or `@/db` (`dsn_passwords`);
 /// - a `password=`, `passwd=` or `pwd=` field of a libpq, ADO.NET, ODBC or
 ///   JDBC connection string (`field_passwords`).
 ///
@@ -862,16 +863,50 @@ mod shape_tests {
                 String::from_utf8_lossy(value)
             );
         }
-        // No address: a protocol name with nothing after it, or `(` with
-        // no protocol name. A URL with a user and no password, whose host
-        // and path look like a protocol and its address, is no DSN.
+        // No address: a protocol name with nothing after it. A URL with a
+        // user and no password, whose host and path look like a protocol
+        // and its address, is no DSN.
         for no in [
             &b"app:abcdefgh@tcp"[..],
-            b"app:abcdefgh@(db)/app",
             b"postgres://app@db/app",
             b"redis://cache@localhost/0",
             b"mysql://app@/app",
         ] {
+            assert_eq!(
+                password_chars(no),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(no)
+            );
+        }
+    }
+
+    /// Review R-18: Go's MySQL DSN with an address and no protocol name
+    /// (`user:pw@(host:3306)/dbname`, which go-sql-driver's ParseDSN reads
+    /// with an empty protocol, then tcp) was not read, since `(` had to
+    /// follow a protocol name, so an 8-character password was measured
+    /// with the whole value, 36 characters. `(` alone is an address too,
+    /// also when the password starts with `//`.
+    #[test]
+    fn a_dsn_with_an_address_and_no_protocol_is_read() {
+        for (value, chars) in [
+            (&b"app:abcdefgh@(db.internal:3306)/app"[..], 8),
+            (b"app:abcdefgh@(db)/app?parseTime=true", 8),
+            (b"app:abcdefgh@([::1]:3306)/", 8),
+            (b"app:p@ssword1@(db.internal:3306)/app", 9),
+            (b"app://abcdefgh@(db.internal:3306)/app", 10),
+            // Control: 16 characters.
+            (b"app:abcdefghijklmnop@(db.internal:3306)/app", 16),
+        ] {
+            assert_eq!(
+                password_chars(value),
+                Some(chars),
+                "{:?}",
+                String::from_utf8_lossy(value)
+            );
+        }
+        // No `:` before the `@`, or no address after it: no DSN.
+        for no in [&b"app@(db.internal:3306)/app"[..], b"app:abcdefgh@)db/app"] {
             assert_eq!(
                 password_chars(no),
                 None,
@@ -1069,12 +1104,13 @@ mod shape_tests {
         // Each search on its own, since the others read such a value to
         // its end looking for their forms.
         type Search = for<'a> fn(&'a [u8], &mut Readings<'a>);
-        let past_cap: [(Search, &str, &str); 5] = [
+        let past_cap: [(Search, &str, &str); 6] = [
             (field_passwords, "", "password=abcdefghijklmnopq "),
             (field_passwords, "", "pwd={abcdefghijklmnop};"),
             (field_passwords, "", "password=;abcdefghijklmnopq "),
             (url_passwords, "", "a://u:abcdefghijklmnop@h/ "),
             (dsn_passwords, "app:", "x@tcp("),
+            (dsn_passwords, "app:", "x@("),
         ];
         for (search, head, unit) in past_cap {
             let read = |len: usize| {
@@ -1098,6 +1134,7 @@ mod shape_tests {
             "://a:",
             "a:@",
             "@tcp(",
+            "@(",
             "a",
         ] {
             let (short, long) = (run(unit, 1 << 15), run(unit, 1 << 16));
