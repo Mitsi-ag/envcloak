@@ -972,18 +972,65 @@ fn daemon_in(a: &AgentHome) -> envcloak_testkit::Daemon {
     envcloak_testkit::Daemon::start_command(cmd, &[])
 }
 
-/// The first line `envcloak status` printed inside the host's shell tool,
-/// with keys built at run time so the command's text never matches.
+/// What `envcloak status` printed inside the host's shell tool, and the
+/// uid the command ran as there, with keys built at run time so the
+/// command's text never matches.
 fn status_probe() -> String {
     format!(
-        "printf '%s%s' 'REA' 'CH['; {} status 2>&1 | tr '\\n' ' ' | cut -c1-600; printf '%s%s' ']' 'END'",
+        "printf '%s%s%s%s' 'UI' 'D[' \"$(id -u)\" ']'; \
+         printf '%s%s' 'REA' 'CH['; {} status 2>&1 | tr '\\n' ' ' | cut -c1-600; printf '%s%s' ']' 'END'",
         envcloak_e2e::quoted(bin_dir().join("envcloak").to_str().unwrap())
     )
 }
 
+/// The text of the last tool result in a request body (Anthropic
+/// Messages or OpenAI Responses), on one line.
+fn last_tool_output(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let text = |c: &serde_json::Value| match c {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    for m in v["messages"].as_array().into_iter().flatten() {
+        for c in m["content"].as_array().into_iter().flatten() {
+            if c["type"] == "tool_result" {
+                out = text(&c["content"]);
+            }
+        }
+    }
+    for item in v["input"].as_array().into_iter().flatten() {
+        if item["type"] == "function_call_output" {
+            out = text(&item["output"]);
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether the status probe reached the daemon, and if not, why: the
+/// failure token and its fixed message, the uid inside the sandbox and
+/// the test's own; when the probe printed nothing, the start of what the
+/// command printed instead.
 fn reach(text: &str) -> String {
+    let inside: String = text
+        .rfind("UID[")
+        .map(|i| {
+            text[i + 4..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect()
+        })
+        .unwrap_or_else(|| "?".to_owned());
     let Some(start) = text.rfind("REACH[").map(|i| i + 6) else {
-        return "no output (the command did not run)".to_owned();
+        let said: String = last_tool_output(text).chars().take(300).collect();
+        return format!("no output (the command did not run: {said:?})");
     };
     let end = text[start..]
         .find("]END")
@@ -995,15 +1042,30 @@ fn reach(text: &str) -> String {
     } else if line.is_empty() {
         "no output".to_owned()
     } else {
-        // `daemon: not running` or `not verified`, and the failure token.
+        // `daemon: not running` or `not verified`, and the failure token
+        // with its fixed message.
         let first = line.split("cli hardening").next().unwrap_or(line).trim();
-        let token = line
+        let why: String = line
             .split("envcloak: ")
             .nth(1)
-            .and_then(|r| r.split(':').next())
-            .unwrap_or("?");
-        format!("does not ({first}; {token})")
+            .map_or("?", str::trim)
+            .chars()
+            .take(200)
+            .collect();
+        format!(
+            "does not ({first}; {why}; uid {inside} inside, {} outside)",
+            own_uid()
+        )
     }
+}
+
+/// The test's own uid, from `id -u`.
+fn own_uid() -> String {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_else(|_| "?".to_owned())
 }
 
 /// Whether `envcloak status` reaches the daemon from Claude Code's Bash
@@ -1094,8 +1156,10 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
     let port = tcp.local_addr().unwrap().port();
     let other = a.root().join("other.sock");
     let _unix = std::os::unix::net::UnixListener::bind(&other).unwrap();
+    // A socket that cannot even be made counts as refused; the errno
+    // says which.
     let egress = format!(
-        "python3 -c \"import socket\nfor fam,addr,key in ((socket.AF_INET,('127.0.0.1',{port}),'TCP'),(socket.AF_UNIX,'{}','UNIX')):\n s=socket.socket(fam)\n try:\n  s.connect(addr); print(key+'%s' % 'OK')\n except OSError as e:\n  print(key+'%s' % 'NO')\"",
+        "python3 -c \"import errno,socket\nfor fam,addr,key in ((socket.AF_INET,('127.0.0.1',{port}),'TCP'),(socket.AF_UNIX,'{}','UNIX')):\n try:\n  s=socket.socket(fam); s.connect(addr); print(key+'%s' % 'OK')\n except OSError as e:\n  print(key+'%s' % 'NO', errno.errorcode.get(e.errno, e.errno))\"",
         other.display()
     );
     let bounded = format!(
@@ -1134,11 +1198,11 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
         measure(&a, &format!("envcloak status, {name}"), reach(&text));
         let seen = |key: &str| {
             if text.contains(&format!("{key}OK")) {
-                "reached"
-            } else if text.contains(&format!("{key}NO")) {
-                "refused"
+                "reached".to_owned()
+            } else if let Some(e) = printed(&text, &format!("{key}NO ")) {
+                format!("refused ({e})")
             } else {
-                "not tried (no output)"
+                "not tried (no output)".to_owned()
             }
         };
         measure(
@@ -1151,14 +1215,12 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
             ),
         );
         if name.contains("unix_sockets") {
-            assert_eq!(
-                seen("TCP"),
-                "refused",
+            assert!(
+                seen("TCP").starts_with("refused"),
                 "the bounded setting lets a command reach TCP"
             );
-            assert_eq!(
-                seen("UNIX"),
-                "refused",
+            assert!(
+                seen("UNIX").starts_with("refused"),
                 "the bounded setting lets a command reach another Unix socket"
             );
         }
