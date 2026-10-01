@@ -135,7 +135,10 @@ fn to_timeval(d: Duration) -> libc::timeval {
     let d = d.max(Duration::from_micros(1));
     libc::timeval {
         tv_sec: libc::time_t::try_from(d.as_secs()).unwrap_or(libc::time_t::MAX),
-        tv_usec: libc::suseconds_t::try_from(d.subsec_micros()).unwrap_or(0),
+        // Under a million, which fits `suseconds_t` everywhere (`i32` on
+        // macOS, `i64` on Linux), where a conversion is fallible on one
+        // and not the other.
+        tv_usec: d.subsec_micros() as libc::suseconds_t,
     }
 }
 
