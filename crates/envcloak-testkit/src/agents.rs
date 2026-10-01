@@ -732,6 +732,16 @@ impl AgentHome {
         cmd
     }
 
+    /// The environment a run against `model` gets (see the module
+    /// documentation), for a test that starts the host some other way,
+    /// such as on a pseudo-terminal of its own.
+    pub fn env_for(&self, model: &Model) -> Vec<(OsString, OsString)> {
+        let cmd = self.command(&self.installed.exe, Some(model));
+        cmd.get_envs()
+            .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
+            .collect()
+    }
+
     fn write_codex_config(&self, model: &Model) {
         let text = format!(
             "# Written by the EnvCloak test harness (M2-04): the scripted model is the\n\

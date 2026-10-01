@@ -1,0 +1,17 @@
+{
+  "cwd": "<home>",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "prompt_id": "<id>",
+  "session_id": "<id>",
+  "tool_input": {
+    "command": "echo hook-check",
+    "description": "scripted step"
+  },
+  "tool_name": "Bash",
+  "tool_use_id": "<id>",
+  "transcript_path": "<home>/.claude/projects/<home-as-directory-name>/<id>"
+}

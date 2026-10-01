@@ -1,0 +1,10 @@
+{
+  "cwd": "<home>",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "ec-scripted",
+  "permission_mode": "bypassPermissions",
+  "prompt": "List the files here.",
+  "session_id": "<id>",
+  "transcript_path": "<home>/.codex/sessions/<n>/<n>/<n>/<id>",
+  "turn_id": "<id>"
+}

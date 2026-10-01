@@ -1,0 +1,9 @@
+{
+  "cwd": "<home>",
+  "hook_event_name": "UserPromptSubmit",
+  "permission_mode": "default",
+  "prompt": "List the files here.",
+  "prompt_id": "<id>",
+  "session_id": "<id>",
+  "transcript_path": "<home>/.claude/projects/<home-as-directory-name>/<id>"
+}
