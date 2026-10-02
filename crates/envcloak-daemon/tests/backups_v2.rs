@@ -490,6 +490,8 @@ const CHILD_RUN: &str = "ENVCLOAK_TEST_BACKUP_RUN";
 const CHILD_SEED: &str = "ENVCLOAK_TEST_BACKUP_SEED";
 const CHILD_AGENT_BIN: &str = "ENVCLOAK_TEST_BACKUP_AGENT_BIN";
 const CHILD_HELD: &str = "ENVCLOAK_TEST_BACKUP_HELD";
+const CHILD_HELD_CALL: &str = "ENVCLOAK_TEST_BACKUP_HELD_CALL";
+const CHILD_HELD_LEASE: &str = "ENVCLOAK_TEST_BACKUP_HELD_LEASE";
 const CHILD_MAKER: &str = "ENVCLOAK_TEST_BACKUP_MAKER";
 
 fn reply(v: &Value) {
@@ -505,8 +507,9 @@ fn err_json(e: ClientError) -> Value {
 }
 
 /// Runs only as a child of a test here. `worker` answers one JSON command
-/// per line (`begin`, `put_next`, `put`, `commit`, `result`, `list`,
-/// `open`, `read`, `exit`) with one `@@ `-prefixed JSON line; `notty`
+/// per line (`pid`, `move`, `hand_over`, `begin`, `put_next`, `put`,
+/// `commit`, `result`, `list`, `open`, `read`, `read_bg` then `join`,
+/// `exit`) with one `@@ `-prefixed JSON line; `notty`
 /// first leaves its session for one without a terminal, then works the
 /// same way; `pair` runs two workers and passes each command to the one
 /// its `to` names; `host` makes a session of its own on a pseudo-terminal
@@ -586,9 +589,12 @@ fn backup_v2_child() {
 }
 
 /// A process holding a connection another process made (its standard
-/// input), which it uses only once that process has exited: it records
-/// a result for file 0 of the backup [`CHILD_HELD`] names, and says what
-/// came back, or that the daemon closed the connection.
+/// input), which it uses only once that process has exited (it is then
+/// reparented, whether or not its maker was reaped): as [`CHILD_HELD_CALL`]
+/// says, it records a result for file 0 of the backup [`CHILD_HELD`]
+/// names (`result`), reads chunk 0 of file 0 under the lease
+/// [`CHILD_HELD_LEASE`] names (`read`) or begins a backup (`begin`), and
+/// says what came back, or that the daemon closed the connection.
 fn holder() {
     use std::os::fd::AsFd;
     let maker: u32 = std::env::var(CHILD_MAKER).unwrap().parse().unwrap();
@@ -603,11 +609,16 @@ fn holder() {
         std::thread::sleep(Duration::from_millis(10));
     }
     let id = std::env::var(CHILD_HELD).unwrap();
-    common::send_json(
-        &mut conn,
-        &json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.record_result",
+    let call = match std::env::var(CHILD_HELD_CALL).unwrap().as_str() {
+        "read" => json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.read",
+            "params": {"lease": std::env::var(CHILD_HELD_LEASE).unwrap(), "file": 0, "chunk": 0}}),
+        "begin" => json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.begin",
+            "params": {"purpose": "scrub", "files": [{"path": "/held/.env", "size": 1, "mode": 384}],
+                "claims": []}}),
+        _ => json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.record_result",
             "params": {"id": id, "file": 0, "sha256_after": hex(&[7; 32])}}),
-    );
+    };
+    common::send_json(&mut conn, &call);
     let answer = match common::read_json(&mut conn) {
         None => json!({"closed": true}),
         Some(v) if v.get("error").is_some() => json!({"err": common::error_kind(&v)}),
@@ -621,6 +632,7 @@ fn worker() {
     let cs = canaries(std::env::var(CHILD_SEED).unwrap().parse().unwrap());
     let mut plans: std::collections::HashMap<String, (Vec<Spec>, usize, u64)> =
         std::collections::HashMap::new();
+    let mut in_flight: Option<std::thread::JoinHandle<Value>> = None;
     reply(&json!({"ready": true}));
     for line in std::io::stdin().lock().lines() {
         let cmd: Value = serde_json::from_str(&line.unwrap()).unwrap();
@@ -650,8 +662,8 @@ fn worker() {
                     &json!({"jsonrpc": "2.0", "id": 1, "method": "backup.v2.list", "params": {}}),
                 );
                 assert!(common::read_json(&mut conn).unwrap()["result"].is_object());
-                #[allow(clippy::zombie_processes)]
-                Command::new(std::env::current_exe().unwrap())
+                let mut holder = Command::new(std::env::current_exe().unwrap());
+                holder
                     .args([
                         "--exact",
                         "backup_v2_child",
@@ -660,10 +672,14 @@ fn worker() {
                     ])
                     .env(CHILD_MODE, "holder")
                     .env(CHILD_HELD, &id)
+                    .env(CHILD_HELD_CALL, cmd["call"].as_str().unwrap())
                     .env(CHILD_MAKER, std::process::id().to_string())
-                    .stdin(Stdio::from(std::os::fd::OwnedFd::from(conn)))
-                    .spawn()
-                    .unwrap();
+                    .stdin(Stdio::from(std::os::fd::OwnedFd::from(conn)));
+                if let Some(lease) = cmd["lease"].as_str() {
+                    holder.env(CHILD_HELD_LEASE, lease);
+                }
+                #[allow(clippy::zombie_processes)]
+                holder.spawn().unwrap();
                 json!({"handed": true})
             }
             "begin" => {
@@ -750,6 +766,20 @@ fn worker() {
                     .backup_v2_open_restore(&id, pass, true, true, &[])
                     .map_or_else(err_json, |l| json!({"lease": l.lease}))
             }
+            "read_bg" => {
+                // A read on a thread of its own, answered at `join`, so
+                // this process can move meanwhile.
+                let lease = cmd["lease"].as_str().unwrap().to_owned();
+                let mut conn = connect();
+                in_flight = Some(std::thread::spawn(move || {
+                    conn.backup_v2_read(&lease, 0, 0).map_or_else(
+                        err_json,
+                        |c| json!({"len": c.data.as_secret().len(), "final": c.last}),
+                    )
+                }));
+                json!({"started": true})
+            }
+            "join" => in_flight.take().unwrap().join().unwrap(),
             "read" => connect()
                 .backup_v2_read(
                     cmd["lease"].as_str().unwrap(),
@@ -1481,34 +1511,78 @@ fn a_restore_is_refused_to_an_agent_and_to_a_process_without_a_terminal() {
 }
 
 /// A connection outlives the process that made it when the descriptor is
-/// handed on: the creator of a committed backup passes one of its
-/// connections to a child and exits before recording a result. The child
-/// then records one on it, and is refused: on Linux the daemon still
-/// names the creator on that connection, which has exited
+/// handed on, and a process that exited keeps its pid and start time
+/// until its parent reaps it. The creator of a committed backup passes
+/// one of its connections to a child and exits before recording a
+/// result; this test, its parent, does not reap it yet. The child then
+/// records a result on that connection, and is refused: on Linux the
+/// daemon still names the creator there, which has exited, zombie or not
 /// (`not_backup_owner`); on macOS it closes the connection, whose peer
-/// changed. The backup stays `result_unrecorded`.
+/// changed. While the creator is still unreaped the backup lists
+/// `result_unrecorded`. The same with a lease: its process opens one,
+/// hands a connection on and exits, the child's read under it is refused
+/// and the lease ends, before the process is reaped. And a `begin` on
+/// such a connection begins nothing (`evidence`, `caller_gone`, on
+/// Linux).
 #[test]
 fn a_connection_handed_on_does_not_act_for_a_creator_that_exited() {
     let f = Fixture::new();
     let files = [Spec::made(&f.home.home().join("acme/.env"), 20, 15)];
-    let mut w = f.child("worker", false);
-    let id = w.ask(json!({"op": "begin", "purpose": "scrub",
-        "files": files.iter().map(Spec::to_json).collect::<Vec<_>>()}))["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(w.ask(json!({"op": "put_next", "id": id}))["final"], true);
-    assert_eq!(w.ask(json!({"op": "commit", "id": id}))["files"], 1);
-    assert_eq!(w.ask(json!({"op": "hand_over", "id": id}))["handed"], true);
-    let _ = writeln!(w.stdin, "{}", json!({"op": "exit"}));
-    w.child.wait().unwrap();
-    let held = read_reply(&mut w.out)["held"].clone();
-    let refused = held["err"] == "not_backup_owner" || held["closed"] == true;
-    assert!(refused, "the handed-on connection acted: {held}");
-    let l = f.list();
-    assert_eq!(l.backups[0].state, BackupStateView::ResultUnrecorded);
-    let lease = f.open(&id, false, true).unwrap();
-    assert_eq!(lease.statement.files[0].sha256_after, None);
+    for what in ["result", "read", "begin"] {
+        let mut w = f.child("worker", false);
+        let pid = i32::try_from(w.child.id()).unwrap();
+        let start = envcloak_sys::proc_info(pid).unwrap().start_time;
+        let id = w.ask(json!({"op": "begin", "purpose": "scrub",
+            "files": files.iter().map(Spec::to_json).collect::<Vec<_>>()}))["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(w.ask(json!({"op": "put_next", "id": id}))["final"], true);
+        assert_eq!(w.ask(json!({"op": "commit", "id": id}))["files"], 1);
+        let mut hand = json!({"op": "hand_over", "id": id, "call": what});
+        let leases = f.list().open_leases;
+        if what == "read" {
+            let r = w.ask(json!({"op": "open", "id": id, "pass": f.pass()}));
+            hand["lease"] = r["lease"].clone();
+            assert!(hand["lease"].is_string(), "{r}");
+            assert_eq!(f.list().open_leases, leases + 1);
+        }
+        assert_eq!(w.ask(hand)["handed"], true);
+        let _ = writeln!(w.stdin, "{}", json!({"op": "exit"}));
+        let held = read_reply(&mut w.out)["held"].clone();
+        let refused = held["err"]
+            == match what {
+                "result" => "not_backup_owner",
+                "read" => "no_such_lease",
+                _ => "evidence",
+            }
+            || held["closed"] == true;
+        assert!(refused, "{what}: the handed-on connection acted: {held}");
+        // Still not reaped: the creator is a zombie, and has exited.
+        let unreaped = || envcloak_sys::proc_info(pid).is_ok_and(|i| i.start_time == start);
+        assert!(unreaped(), "{what}: the creator was reaped");
+        if what != "read" {
+            let l = f.list();
+            assert_eq!(
+                l.backups.iter().find(|b| b.id == id).unwrap().state,
+                BackupStateView::ResultUnrecorded,
+                "an exited, unreaped creator counts as running"
+            );
+        } else {
+            let end = Instant::now() + Duration::from_secs(10);
+            while f.list().open_leases != leases {
+                assert!(
+                    Instant::now() < end,
+                    "the lease of an exited, unreaped process is still open"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        assert!(unreaped(), "{what}: the creator was reaped");
+        w.child.wait().unwrap();
+        let lease = f.open(&id, false, true).unwrap();
+        assert_eq!(lease.statement.files[0].sha256_after, None);
+    }
     f.sweep();
 }
 
@@ -1615,6 +1689,41 @@ fn a_lease_serves_only_the_terminal_of_its_proof() {
         w.end();
     }
     f.sweep();
+}
+
+/// The lease's terminal is checked again just before a chunk goes out
+/// (D-07): stopped by a barrier in `read` after the chunk was decrypted,
+/// the reading process moves to another terminal (a new session on a
+/// pseudo-terminal of its own), or to none, and the read then delivers
+/// nothing (`no_such_lease`).
+#[test]
+fn a_lease_serves_only_the_terminal_it_is_on_when_the_chunk_goes_out() {
+    for to in ["pty", "none"] {
+        let mut f = Fixture::pausing(Some("backup.v2.read"));
+        let files = [Spec::made(&f.claude("projects/p/n.jsonl"), 100, 21)];
+        let id = f.backup("scrub", &files);
+        let mut w = f.child("worker", false);
+        let r = w.ask(json!({"op": "open", "id": id, "pass": f.pass()}));
+        let lease = r["lease"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"))
+            .to_owned();
+        assert_eq!(
+            w.ask(json!({"op": "read_bg", "lease": lease}))["started"],
+            true
+        );
+        f.wait_paused("backup.v2.read");
+        assert_eq!(w.ask(json!({"op": "move", "to": to}))["moved"], true);
+        f.release();
+        let r = w.ask(json!({"op": "join"}));
+        assert_eq!(
+            r.get("err").and_then(Value::as_str),
+            Some("no_such_lease"),
+            "{to}: the chunk went out to another terminal: {r}"
+        );
+        w.end();
+        f.sweep();
+    }
 }
 
 /// A backup keeps a file's permission bits only: the set-user-id,
