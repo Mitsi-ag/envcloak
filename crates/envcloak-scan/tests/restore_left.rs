@@ -177,6 +177,58 @@ fn a_file_changed_while_it_is_hashed_is_kept_and_no_chunk_is_read() {
     no_temps(d.path());
 }
 
+/// An edit made in place after the last check is kept (`changed`), never
+/// deleted: the edit has the same length as what the change left and its
+/// modification time is put back, so the file's device, inode, size and
+/// modification time are what was checked, and only its contents (and
+/// change time) tell. It is made after the last check, before the names
+/// are swapped, and through a descriptor held open, after the swap and
+/// before what came out is read. Each time the names are swapped back,
+/// the edit has the file's name again, and no temporary file is left.
+#[test]
+fn an_edit_in_place_after_the_last_check_is_kept() {
+    for when in [Inside::Checked, Inside::Exchanged] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let p = d.path().join(".mcp.json");
+        let body = original();
+        let file = backed_up(&body);
+        let r = open_root(d.path()).unwrap();
+        std::fs::write(&p, LEFT).unwrap();
+        let mut edit = LEFT.to_vec();
+        let at = edit.len() - 2;
+        edit[at] ^= 0x20;
+        let mut held: Option<std::fs::File> = None;
+        let mut did = false;
+        let e = restore_over_left_observed(
+            &r,
+            Path::new(".mcp.json"),
+            &file,
+            &mut |c| Some(chunk_of(&body, c)),
+            &mut |now| {
+                if now == Inside::Hashed {
+                    held = Some(std::fs::OpenOptions::new().write(true).open(&p).unwrap());
+                }
+                if now == when {
+                    let w = held.as_mut().unwrap();
+                    let modified = w.metadata().unwrap().modified().unwrap();
+                    std::os::unix::fs::FileExt::write_all_at(w, &edit, 0).unwrap();
+                    w.set_modified(modified).unwrap();
+                    did = true;
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(did, "{when:?}");
+        assert_eq!(e.kind, ModifyErrorKind::Changed, "{when:?}");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            edit,
+            "{when:?}: an edit after the last check was written over"
+        );
+        no_temps(d.path());
+    }
+}
+
 /// Contents that do not come whole are never written in the file's place
 /// (`backup_unread`): a chunk that does not come, one of another length,
 /// and chunks of the right lengths whose whole is not the backed-up

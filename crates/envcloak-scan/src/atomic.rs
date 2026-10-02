@@ -43,7 +43,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -53,6 +53,8 @@ use envcloak_sys::{
     InUse, create_beneath, exchange_beneath, link_beneath, open_elsewhere, rename_beneath,
     sync_file, unlink_beneath,
 };
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::root::{FileStamp, ScanErrorKind, ScanRoot, io_kind, open_file};
 
@@ -96,6 +98,10 @@ pub enum ModifyErrorKind {
     /// not have the backed-up SHA-256. Nothing was written in the file's
     /// place.
     BackupUnread,
+    /// A restore from a backup v2 found a file system that cannot swap
+    /// two names in one step: the file it writes over could not be
+    /// checked once it moved out, so nothing was written in its place.
+    SwapUnsupported,
 }
 
 impl ModifyErrorKind {
@@ -113,6 +119,7 @@ impl ModifyErrorKind {
             ModifyErrorKind::NotRemoved => "not_removed",
             ModifyErrorKind::EditedSince => "edited_since",
             ModifyErrorKind::BackupUnread => "backup_unread",
+            ModifyErrorKind::SwapUnsupported => "swap_unsupported",
         }
     }
 
@@ -146,6 +153,10 @@ impl ModifyErrorKind {
             }
             ModifyErrorKind::BackupUnread => {
                 "the backup's contents could not be read whole, so nothing was written"
+            }
+            ModifyErrorKind::SwapUnsupported => {
+                "this file system cannot swap two names in one step, so the file could not be \
+                 checked as it was replaced, and nothing was written"
             }
         }
     }
@@ -258,7 +269,11 @@ pub enum Inside {
     /// The file was checked for the last time before the new contents take
     /// its name.
     Checked,
-    /// The names are swapped and what came out is the file checked: the
+    /// The names are swapped: the new contents have the file's name, and
+    /// what came out is under the temporary name, not checked yet.
+    Exchanged,
+    /// The names are swapped and what came out is the file checked (for a
+    /// restore from a backup v2, with the contents the change left): the
     /// new contents have the file's name, and the old file is under the
     /// temporary name, not unlinked yet.
     Swapped,
@@ -306,17 +321,55 @@ fn replace_in(
     observe: &mut dyn FnMut(Inside),
 ) -> Result<FileStamp, ModifyError> {
     let mut fill = |f: &mut File| f.write_all(new).map_err(|e| io(&e));
-    replace_in_with(dir, rel, name, &mut fill, expect, observe)
+    replace_in_with(dir, rel, name, &mut fill, expect, None, observe)
 }
 
+/// What swaps two names in a directory in one step: [`exchange_beneath`],
+/// or a unit test's file system that cannot.
+type Swap = fn(&File, &OsStr, &OsStr) -> std::io::Result<()>;
+
 /// [`replace_in`], with the new contents written by `fill`, so they can
-/// be written a part at a time.
+/// be written a part at a time; and, when `left` is given, only over a
+/// file that still holds the contents of that SHA-256 when it moves out.
+///
+/// With `left`, the file that came out of the swap is read whole, its
+/// stamp checked again after the read, and its SHA-256 compared with
+/// `left`: an edit made in place after the last check (the same length,
+/// its modification time put back, which the stamp alone does not tell)
+/// swaps the names back and keeps the edit (`changed`). A file system
+/// that cannot swap names then writes nothing (`swap_unsupported`), never
+/// renaming over a file it could not check. What it cannot see is a write
+/// to the old file, by a program that still has it open, after that read.
 pub(crate) fn replace_in_with(
     dir: &File,
     rel: &Path,
     name: &OsStr,
     fill: Fill<'_>,
     expect: &FileStamp,
+    left: Option<&[u8; 32]>,
+    observe: &mut dyn FnMut(Inside),
+) -> Result<FileStamp, ModifyError> {
+    replace_in_using(
+        exchange_beneath,
+        dir,
+        rel,
+        name,
+        fill,
+        expect,
+        left,
+        observe,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // replace_in_with's, and the swap.
+fn replace_in_using(
+    swap: Swap,
+    dir: &File,
+    rel: &Path,
+    name: &OsStr,
+    fill: Fill<'_>,
+    expect: &FileStamp,
+    left: Option<&[u8; 32]>,
     observe: &mut dyn FnMut(Inside),
 ) -> Result<FileStamp, ModifyError> {
     let fail = |kind| ModifyError {
@@ -333,11 +386,17 @@ pub(crate) fn replace_in_with(
         return Err(fail(k));
     }
     observe(Inside::Checked);
-    match exchange_beneath(dir, &temp, name) {
+    match swap(dir, &temp, name) {
         Ok(()) => {
-            let out = open_file(dir, &temp, usize::MAX).map(|(_, m)| m);
-            if !out.as_ref().is_ok_and(|m| is_checked(m, expect)) {
-                return Err(swap_back(dir, rel, name, &temp, &f));
+            observe(Inside::Exchanged);
+            let checked = match open_file(dir, &temp, usize::MAX) {
+                Ok((mut out, m)) if is_checked(&m, expect) => left.is_none_or(|want| {
+                    digest_of(&mut out, &FileStamp::of(&m)).is_ok_and(|got| got == *want)
+                }),
+                _ => false,
+            };
+            if !checked {
+                return Err(swap_back(swap, dir, rel, name, &temp, &f));
             }
             observe(Inside::Swapped);
             if unlink_beneath(dir, &temp).is_err() {
@@ -347,6 +406,10 @@ pub(crate) fn replace_in_with(
                     kind: ModifyErrorKind::NotRemoved,
                 });
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported && left.is_some() => {
+            let _ = unlink_beneath(dir, &temp);
+            return Err(fail(ModifyErrorKind::SwapUnsupported));
         }
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
             if let Err(e) = rename_beneath(dir, &temp, name) {
@@ -364,14 +427,49 @@ pub(crate) fn replace_in_with(
     Ok(FileStamp::of(&m))
 }
 
+/// The SHA-256 of `f`, which must hold exactly the bytes `stamp` says and
+/// still have that stamp once read, its change time included (else
+/// [`ModifyErrorKind::Changed`]): a file written while it was hashed is
+/// never taken for the one hashed. The bytes pass through a buffer wiped
+/// after.
+pub(crate) fn digest_of(f: &mut File, stamp: &FileStamp) -> Result<[u8; 32], ModifyErrorKind> {
+    let size = stamp.size;
+    let mut buf = Zeroizing::new(vec![0u8; 64 * 1024]);
+    let mut h = Sha256::new();
+    let mut read: u64 = 0;
+    loop {
+        let n = f.read(&mut buf[..]).map_err(|e| io(&e))?;
+        if n == 0 {
+            break;
+        }
+        read += n as u64;
+        if read > size {
+            return Err(ModifyErrorKind::Changed);
+        }
+        h.update(&buf[..n]);
+    }
+    let after = f.metadata().map_err(|e| io(&e))?;
+    if read != size || FileStamp::of(&after) != *stamp {
+        return Err(ModifyErrorKind::Changed);
+    }
+    Ok(h.finalize().into())
+}
+
 /// After a swap brought out a file that is not the one checked: swaps the
 /// names back, so `name` is that file again, and removes the new
 /// contents, `staged`, from `temp`. Returns `changed`; or, when the names
 /// could not be put back as they were, what is under `temp` is kept and
 /// named (`moved_aside`), and nothing is removed.
-fn swap_back(dir: &File, rel: &Path, name: &OsStr, temp: &OsStr, staged: &File) -> ModifyError {
+fn swap_back(
+    swap: Swap,
+    dir: &File,
+    rel: &Path,
+    name: &OsStr,
+    temp: &OsStr,
+    staged: &File,
+) -> ModifyError {
     let ours = staged.metadata().map(|m| (m.dev(), m.ino()));
-    let back = exchange_beneath(dir, temp, name).is_ok()
+    let back = swap(dir, temp, name).is_ok()
         && open_file(dir, temp, usize::MAX)
             .is_ok_and(|(_, m)| ours.as_ref().is_ok_and(|o| *o == (m.dev(), m.ino())));
     if back && unlink_beneath(dir, temp).is_ok() {
@@ -558,4 +656,66 @@ pub fn rewrite_checked_observed(
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
     check_removable(&dir, &name, expect, now).map_err(fail)?;
     replace_in(&dir, rel, &name, new, expect, observe)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// A file system that cannot swap two names in one step.
+    fn cannot_swap(_: &File, _: &OsStr, _: &OsStr) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// Where the names cannot be swapped, a restore from a backup v2 (a
+    /// replacement given the contents the file must still hold) writes
+    /// nothing (`swap_unsupported`): the file stays as it is and no
+    /// temporary file is left, since a rename over it could replace a save
+    /// made after the last check. A replacement without such contents
+    /// (`init`'s rewrite) keeps the documented fallback and renames.
+    #[test]
+    fn a_restore_writes_nothing_where_names_cannot_be_swapped() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let p = d.path().join("settings.json");
+        std::fs::write(&p, b"what the change left").unwrap();
+        let dir = File::open(d.path()).unwrap();
+        let stamp = FileStamp::of(&std::fs::symlink_metadata(&p).unwrap());
+        let left: [u8; 32] = Sha256::digest(b"what the change left").into();
+        let name = OsStr::new("settings.json");
+        let rel = Path::new("settings.json");
+        let mut fill = |f: &mut File| f.write_all(b"backed up").map_err(|e| io(&e));
+        let e = replace_in_using(
+            cannot_swap,
+            &dir,
+            rel,
+            name,
+            &mut fill,
+            &stamp,
+            Some(&left),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, ModifyErrorKind::SwapUnsupported);
+        assert_eq!(e.kind.token(), "swap_unsupported");
+        assert_eq!(std::fs::read(&p).unwrap(), b"what the change left");
+        let names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [name]);
+        let mut fill = |f: &mut File| f.write_all(b"rewritten").map_err(|e| io(&e));
+        replace_in_using(
+            cannot_swap,
+            &dir,
+            rel,
+            name,
+            &mut fill,
+            &stamp,
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"rewritten");
+    }
 }
