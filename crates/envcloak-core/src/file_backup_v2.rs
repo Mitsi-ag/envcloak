@@ -1094,11 +1094,16 @@ impl Drop for FileBackupV2Writer {
             return;
         }
         // Not committed: the staging directory goes, with its `data`, both
-        // through the handles opened when it was made. It holds sealed
-        // records only, and a purge removes what is left.
+        // through the handles opened when it was made, its name only while
+        // it still names that directory (an empty directory put in its
+        // place stays). It holds sealed records only, and a purge removes
+        // what is left.
         drop(self.out.take());
         let _ = unlink_beneath(&self.staging, OsStr::new(DATA));
-        let _ = remove_dir_beneath(&self.backups, OsStr::new(&self.staging_name));
+        let name = OsStr::new(&self.staging_name);
+        if still_named(&self.backups, name, &self.staging).unwrap_or(false) {
+            let _ = remove_dir_beneath(&self.backups, name);
+        }
     }
 }
 
@@ -1338,7 +1343,9 @@ impl Vault {
     ///
     /// # Errors
     /// As [`Vault::open_file_backup_v2`]; [`VaultErrorKind::InvalidRecord`]
-    /// for a file index the backup does not have;
+    /// for a file index the backup does not have, and when the result's
+    /// name, once linked, does not hold the file written (another file put
+    /// under its temporary name meanwhile);
     /// [`VaultErrorKind::AlreadyExists`] when the file's result is
     /// recorded already.
     pub fn record_file_backup_v2_result(
@@ -1509,8 +1516,12 @@ impl FileBackupV2Reader {
     /// linked to its name `result-<index>`, which fails when that name
     /// exists: a reader sees a result absent or whole, never in part, and
     /// a crash at any step leaves the file unrecorded or recorded, never
-    /// damaged. The temporary name then goes, and the directory is
-    /// flushed.
+    /// damaged. A link takes whatever has the temporary name at that
+    /// moment, so the result's name is then opened (never through a
+    /// symlink) and compared, by device and inode, with the file written:
+    /// another file put under the temporary name meanwhile fails the call
+    /// ([`VaultErrorKind::InvalidRecord`]), never answered as recorded.
+    /// The temporary name then goes, and the directory is flushed.
     fn record(
         &self,
         file: usize,
@@ -1545,6 +1556,11 @@ impl FileBackupV2Reader {
                     return Err(VaultErrorKind::AlreadyExists.into());
                 }
                 Err(e) => return Err(e.into()),
+            }
+            // A link takes whatever has the temporary name then: the result
+            // is recorded only if its name holds the file written.
+            if !same_file(&open_beneath(&self.dir, path)?, &out)? {
+                return Err(VaultErrorKind::InvalidRecord.into());
             }
             observe(ResultStepV2::Published);
             Ok(())
@@ -1771,6 +1787,13 @@ fn made_at(dir: &File) -> u64 {
             || dir.metadata().map_or(0, |m| modified_secs(&m)),
             |h| h.created_at,
         )
+}
+
+/// Whether `a` and `b` are open on one file: the same device and inode.
+fn same_file(a: &File, b: &File) -> Result<bool, VaultError> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (a.metadata()?, b.metadata()?);
+    Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
 /// Whether `name` in `backups` still names the directory `dir` is.
