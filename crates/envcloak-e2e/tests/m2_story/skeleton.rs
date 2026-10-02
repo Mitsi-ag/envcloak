@@ -230,20 +230,9 @@ fn s0(host: Host, shell: Shell, name: &str) {
     match expected {
         Reach::Reaches => {
             // Approval needed, nothing released.
-            assert_eq!(
-                invocation(&first_run, &first_nonce),
-                Some(1),
-                "the first run's own output is not there:\n{shown}"
-            );
-            assert!(
-                first_run.contains("approval_required"),
-                "the first run was not held for approval:\n{shown}"
-            );
-            assert_eq!(
-                exits(&first_run),
-                ["125"],
-                "the first run did not exit 125:\n{shown}"
-            );
+            if let Err(why) = held_for_approval(&first_run, &first_nonce) {
+                panic!("the first run: {why}:\n{shown}");
+            }
             let id = request_id(&first);
             // The person approves from a terminal of their own; the
             // statement names the host.
@@ -534,6 +523,39 @@ fn foreign_invocation(output: &str, nonce: &str) -> bool {
 /// What only a command that got its values prints: a serializer's frame,
 /// a digest, the serializer list, a redaction marker.
 const DELIVERY_TRACES: [&str; 5] = ["<W|", "<B|", "sha256 ", "SERIALIZERS ", "[envcloak:"];
+
+/// Whether `output` is the invocation `nonce` held for approval, and
+/// nothing else: its marker once and no other invocation's, after it the
+/// `approval_required` line and exit 125, and no trace of a delivery (no
+/// frame, digest, serializer list or redaction marker: verifier, low,
+/// only the refusal and the delivery were checked for them). Why not,
+/// when it is not.
+fn held_for_approval(output: &str, nonce: &str) -> Result<(), String> {
+    if let Some(trace) = DELIVERY_TRACES.iter().find(|t| output.contains(*t)) {
+        return Err(format!("a trace of a delivery ({trace:?})"));
+    }
+    if foreign_invocation(output, nonce) {
+        return Err("another invocation's output".to_owned());
+    }
+    if invocation(output, nonce) != Some(1) {
+        return Err(format!("not invocation {nonce}'s own output"));
+    }
+    let after = output
+        .split(&format!("ecinv-{nonce}"))
+        .nth(1)
+        .unwrap_or_default();
+    let pending = after
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("envcloak: approval_required: request="))
+        .count();
+    match (pending, exits(after).as_slice()) {
+        (1, ["125"]) => Ok(()),
+        (n, codes) => Err(format!(
+            "not held for approval: {n} `approval_required` line(s), exit codes {codes:?}"
+        )),
+    }
+}
 
 /// Whether `output` is the invocation `nonce`'s refusal as K-01's table
 /// gives it, and nothing else: for a CLI refusal, the marker once, then
@@ -997,6 +1019,36 @@ fn a_refusal_is_this_invocation_s_and_the_table_s() {
             refused(&bad, "n1", Reach::NotRun(k01::SECCOMP_HELPER)).is_err(),
             "{bad:?}"
         );
+    }
+}
+
+/// The first run on a qualified path is taken as held only when it is
+/// this invocation's, held once with exit 125, and nothing of a delivery
+/// came with it (verifier, low: a frame, digest, serializer list or
+/// marker beside `approval_required` passed, as did another
+/// invocation's marker).
+#[test]
+fn a_held_run_is_this_invocation_s_and_released_nothing() {
+    let line = "envcloak: approval_required: request=ab12cd34: run \"envcloak approve \
+                ab12cd34\" in a terminal you control";
+    let ok = format!("ecinv-n1\nEXIT=125\n{line}\n");
+    assert_eq!(held_for_approval(&ok, "n1"), Ok(()));
+    let mut bad: Vec<String> = DELIVERY_TRACES
+        .iter()
+        .map(|t| format!("{ok}{t}x\n"))
+        .collect();
+    bad.extend([
+        format!("ecinv-n0\n{ok}"),
+        ok.replace("n1", "n0"),
+        format!("{ok}{ok}"),
+        ok.replace("EXIT=125", "EXIT=0"),
+        ok.replace(line, "envcloak: approval_denied: no"),
+        format!("{line}\necinv-n1\nEXIT=125\n"),
+        format!("{ok}{line}\n"),
+        String::new(),
+    ]);
+    for b in &bad {
+        assert!(held_for_approval(b, "n1").is_err(), "{b:?}");
     }
 }
 
