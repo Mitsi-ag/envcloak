@@ -1485,6 +1485,7 @@ fn codex_hooks_trust_blocked_prompt_and_timeout() {
     a.codex_config(&hooks(2));
     let slow = format!("SLOW-HOOK BLOCK-ME-NOW {}", control.as_str());
     let script = json!({"steps": [{"say": "the prompt went on"}]});
+    let before = payloads(&dir, "UserPromptSubmit").len();
     let run = a.run(&script, &slow, &trusted, &a.home_dir());
     measure(
         &a,
@@ -1505,6 +1506,28 @@ fn codex_hooks_trust_blocked_prompt_and_timeout() {
     assert!(
         !run.model.model_calls().is_empty(),
         "a hook past its timeout blocked the prompt: Codex no longer fails open"
+    );
+    // And it went on because the hook ran past its timeout, not because
+    // the hook let it through or never ran (verifier, low: a hook that
+    // exited at once passed): this prompt's own payload is new in the
+    // hook's directory, and the run took at least the 2 s timeout and
+    // ended well before the hook's 10 s sleep would have.
+    let fresh = payloads(&dir, "UserPromptSubmit");
+    assert!(
+        fresh[before.min(fresh.len())..]
+            .iter()
+            .any(|p| p.to_string().contains("SLOW-HOOK")),
+        "the hook never got the slow prompt"
+    );
+    assert!(
+        run.elapsed >= std::time::Duration::from_secs(2),
+        "the run took {:?}, less than the hook's timeout: the hook did not run past it",
+        run.elapsed
+    );
+    assert!(
+        run.elapsed < std::time::Duration::from_secs(8),
+        "the run took {:?}: Codex waited for the hook beyond its timeout",
+        run.elapsed
     );
 }
 
