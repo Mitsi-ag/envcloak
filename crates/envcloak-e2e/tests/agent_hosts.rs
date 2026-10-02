@@ -32,6 +32,15 @@ fn host(h: Host, variant: &str, test: &str) -> Option<AgentHome> {
     require(found, test).map(|i| AgentHome::start(h, i))
 }
 
+/// The hosts run with the network CI says (`ENVCLOAK_TEST_NETWORK`):
+/// loopback only, on both systems, so a host's direct connection
+/// anywhere, past the proxy the scripted model records, fails; and open
+/// in the step before, so that failure is the isolation's (review).
+#[test]
+fn the_network_is_what_ci_says() {
+    envcloak_e2e::check_network();
+}
+
 /// The flags every run here pins (D-13): Claude Code `-p` in the default
 /// permission mode with Bash allowed; Codex `exec` in its workspace-write
 /// sandbox with approval policy `never`. Never a bypass mode.

@@ -39,8 +39,10 @@ use std::time::{Duration, Instant, SystemTime};
 use envcloak_testkit::{Canary, Daemon, Detector, TestHome, canaries, fresh_seed, sweep_dir};
 
 mod emitters;
+mod network;
 
 pub use emitters::{Emitters, NAMES, sha256_hex};
+pub use network::{NETWORK_VAR, check_network};
 
 /// How long one command may take before the test fails.
 pub const COMMAND_LIMIT: Duration = Duration::from_secs(300);
