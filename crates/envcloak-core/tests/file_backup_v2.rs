@@ -6,7 +6,8 @@
 //! never opens, so a restore is never partial; the creator and purpose
 //! are sealed with it; a result is recorded once per file; caps refuse
 //! rather than cut; backups go after 7 days, and so do the staging
-//! directories interrupted backups left.
+//! directories interrupted backups left, never one still being written;
+//! a backup the purge cannot remove stops no other.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -20,6 +21,7 @@ use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
     FileBackupV2Writer, HEADER_LEN_V2, MAX_FILE_V2, MAX_FILES_V2, MAX_LABEL_V2, MAX_PATH_V2,
     PlannedFile, chunk_len, chunks_of, list_file_backups_v2, purge_file_backups_v2,
+    purge_file_backups_v2_except,
 };
 use envcloak_core::vault::{Vault, VaultErrorKind};
 use envcloak_testkit::{assert_no_canary, by_label, labels};
@@ -687,5 +689,140 @@ fn backups_are_purged_after_7_days_and_staging_after_an_hour() {
     // A week on, the young one goes too.
     assert_eq!(purge_file_backups_v2(v.paths(), t + week).unwrap(), 2);
     assert!(list_file_backups_v2(v.paths()).unwrap().is_empty());
+    drop(f);
+}
+
+/// Sets the modification time of `p` (a directory) to `at` (Unix seconds).
+fn set_time(p: &Path, at: u64) {
+    std::fs::File::open(p)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at))
+        .unwrap();
+}
+
+/// A committed backup of one 4-byte file, made at `at`.
+fn small(v: &Vault, at: u64) -> FileBackupId {
+    let plan = vec![PlannedFile {
+        path: "/h/.env".into(),
+        mode: 0o600,
+        size: 4,
+    }];
+    let mut w = v
+        .begin_file_backup_v2(
+            BackupPurpose::Init,
+            creator(CreatorKind::Terminal),
+            plan,
+            at,
+        )
+        .unwrap();
+    w.put(0, 0, &SecretBytes::copy_from(b"A=1\n")).unwrap();
+    w.commit().unwrap().id
+}
+
+/// Whether this process may write into a directory whose owner has only
+/// read and search permission on it (it may as root).
+fn writes_past_permissions(scratch: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let d = scratch.join("permission-probe");
+    std::fs::create_dir(&d).unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let wrote = std::fs::write(d.join("probe"), b"").is_ok();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(&d).unwrap();
+    wrote
+}
+
+/// A purge goes on past a backup it cannot remove. Three expired backups,
+/// in the order the purge meets them: the first's directory holds a file
+/// the purge does not own (a `.DS_Store`), which stays with its directory
+/// while its `data` goes, deliberately and not as a failure; the second's
+/// directory is made read-only, so its files cannot be removed (skipped
+/// as root, which removes them anyway); the third is removed. The purge
+/// then reports the second's failure, after the third went; once the
+/// second can be removed, it goes too and the first is still kept.
+#[test]
+fn a_backup_the_purge_cannot_remove_stops_no_other() {
+    use std::os::unix::fs::PermissionsExt;
+    let (f, v) = KitFixture::create();
+    let t = now();
+    let expired = t - FILE_BACKUP_RETENTION.as_secs() - 1;
+    for _ in 0..3 {
+        small(&v, expired);
+    }
+    let listed = list_file_backups_v2(v.paths()).unwrap();
+    let (kept, stuck, plain) = (&listed[0], &listed[1], &listed[2]);
+    std::fs::write(kept.dir.join(".DS_Store"), b"finder").unwrap();
+    let guarded = !writes_past_permissions(f.home.root());
+    if guarded {
+        std::fs::set_permissions(&stuck.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let e = purge_file_backups_v2(v.paths(), t).unwrap_err();
+        assert_eq!(
+            e.kind(),
+            VaultErrorKind::Io(std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(!plain.dir.exists(), "a failure stopped the purge");
+        assert!(stuck.dir.join("data").exists());
+        std::fs::set_permissions(&stuck.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let removed = purge_file_backups_v2(v.paths(), t).unwrap();
+    assert_eq!(removed, if guarded { 1 } else { 2 });
+    assert!(!stuck.dir.exists() && !plain.dir.exists());
+    assert_eq!(dir_names(&kept.dir), [".DS_Store"]);
+    // Kept again, and never counted as a failure.
+    assert_eq!(purge_file_backups_v2(v.paths(), t).unwrap(), 0);
+    assert_eq!(dir_names(&kept.dir), [".DS_Store"]);
+    drop(f);
+}
+
+/// A purge keeps the staging directory of a backup still being written,
+/// however long ago the directory last changed (the chunks go to its
+/// `data` file, which leaves the directory's time as it was), and removes
+/// an interrupted one as old: it asks about each due staging directory,
+/// and the backup in progress is then committed and reads back whole.
+#[test]
+fn a_purge_keeps_a_backup_in_progress() {
+    let (f, v) = KitFixture::create();
+    let t = now();
+    let body = content(&f, CHUNK_V2 + 9, 3);
+    let plan = vec![PlannedFile {
+        path: "/h/.claude/projects/p/s.jsonl".into(),
+        mode: 0o600,
+        size: body.len() as u64,
+    }];
+    let mut w = v
+        .begin_file_backup_v2(BackupPurpose::Scrub, creator(CreatorKind::Agent), plan, t)
+        .unwrap();
+    w.put(0, 0, &SecretBytes::copy_from(&body[..CHUNK_V2]))
+        .unwrap();
+    let dir = v.paths().backups_dir.clone();
+    let staging: Vec<PathBuf> = dir_names(&dir)
+        .into_iter()
+        .filter(|n| n.starts_with(".files2-"))
+        .map(|n| dir.join(n))
+        .collect();
+    assert_eq!(staging.len(), 1);
+    let aged = t - STAGING_GRACE.as_secs() - 60;
+    set_time(&staging[0], aged);
+    let orphan_id = FileBackupId::generate();
+    let orphan = dir.join(format!(".files2-20260901T000000Z-{orphan_id}.tmp"));
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::write(orphan.join("data"), b"sealed bytes only").unwrap();
+    set_time(&orphan, aged);
+    let mut asked = Vec::new();
+    let removed = purge_file_backups_v2_except(v.paths(), t, |id| {
+        asked.push(*id);
+        *id == w.id()
+    })
+    .unwrap();
+    assert_eq!(removed, 1);
+    asked.sort_by_key(ToString::to_string);
+    let mut due = vec![w.id(), orphan_id];
+    due.sort_by_key(ToString::to_string);
+    assert_eq!(asked, due);
+    assert!(staging[0].exists() && !orphan.exists());
+    w.put(0, 1, &SecretBytes::copy_from(&body[CHUNK_V2..]))
+        .unwrap();
+    let id = w.commit().unwrap().id;
+    assert_reads_back(&v, &id, &[&body]);
     drop(f);
 }

@@ -772,14 +772,16 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
             s.limiter().succeeded();
             log_line!("envcloakd: vault unlocked");
             // File backups over 7 days old go (SPEC §6.4); they are purged
-            // when one is written, too.
+            // when one is written, too. Both kinds are purged, whatever the
+            // other's purge did; no backup v2 is in progress at an unlock,
+            // since a lock ended every one.
             let secs = at
                 .wall
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            if envcloak_core::file_backup::purge_file_backups(s.paths(), secs).is_err()
-                || envcloak_core::file_backup_v2::purge_file_backups_v2(s.paths(), secs).is_err()
-            {
+            let v1 = envcloak_core::file_backup::purge_file_backups(s.paths(), secs);
+            let v2 = envcloak_core::file_backup_v2::purge_file_backups_v2(s.paths(), secs);
+            if v1.is_err() || v2.is_err() {
                 log_line!("envcloakd: old file backups could not be removed");
             }
             s.audit(AuditEvent::Unlocked {

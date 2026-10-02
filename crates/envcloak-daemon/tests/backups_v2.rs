@@ -23,6 +23,9 @@
 //!   backup that does not open whole releases nothing; list holds no lock
 //!   while it opens backups; a lock from the moment a restore opens its
 //!   backup, before the proof or after it, issues no lease;
+//! - a `begin`'s purge keeps every backup in progress, however old its
+//!   staging directory, and a lock while it purges ends the backup it
+//!   began;
 //! - a killed client or daemon leaves no listed partial backup.
 //!
 //! The caller is this test process, made a terminal session first. Other
@@ -2172,6 +2175,111 @@ fn a_purge_holds_no_lock() {
     put_all(&f.paths(), f.files_cs(), &id, &files).unwrap();
     client(&f.home).backup_v2_commit(&id).unwrap();
     assert_eq!(f.list().backups.len(), 1);
+    f.sweep();
+}
+
+/// The staging directories (`.files2-*.tmp`) in the vault's `backups/`.
+fn staging_dirs(home: &TestHome) -> Vec<PathBuf> {
+    let dir = VaultPaths::under(data_dir(home)).backups_dir;
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".files2-") && n.ends_with(".tmp"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Sets a directory's modification time to `ago` before now.
+fn age_dir(p: &Path, ago: Duration) {
+    std::fs::File::open(p)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - ago)
+        .unwrap();
+}
+
+/// A `begin`'s purge keeps every backup in progress, however long its
+/// staging directory has been unchanged (its chunks go to its `data`
+/// file, which leaves the directory's time as it was): the daemon is
+/// stopped by a barrier in the purge, after the backup is registered,
+/// and its staging directory is aged past the hour an interrupted one is
+/// kept, beside an interrupted one as old. Once released, the purge has
+/// removed the interrupted one only, and the backup is filled, committed
+/// and read back byte for byte.
+#[test]
+fn a_purge_keeps_every_backup_in_progress() {
+    let mut f = Fixture::pausing(Some("backup.v2.purge"));
+    let files = [Spec::made(&f.claude("projects/p/long.jsonl"), MIB + 7, 72)];
+    let paths = f.paths();
+    let params = begin_params("scrub", &files, &[]);
+    let begun = std::thread::spawn(move || {
+        Client::connect(&paths)?
+            .backup_v2_begin(&params)
+            .map(|b| b.id)
+    });
+    f.wait_paused("backup.v2.purge");
+    let ours = staging_dirs(&f.home);
+    assert_eq!(
+        ours.len(),
+        1,
+        "the backup in progress has no staging directory"
+    );
+    let hours = Duration::from_secs(2 * 60 * 60);
+    age_dir(&ours[0], hours);
+    let backups = VaultPaths::under(data_dir(&f.home)).backups_dir;
+    let orphan = backups.join(".files2-20260901T000000Z-00112233445566778899aabbccddeeff.tmp");
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::write(orphan.join("data"), b"sealed bytes only").unwrap();
+    age_dir(&orphan, hours);
+    f.release();
+    let id = begun.join().unwrap().unwrap();
+    assert!(!orphan.exists(), "the purge did not run");
+    assert_eq!(
+        staging_dirs(&f.home),
+        ours,
+        "the purge removed a backup in progress"
+    );
+    put_all(&f.paths(), f.files_cs(), &id, &files).unwrap();
+    client(&f.home).backup_v2_commit(&id).unwrap();
+    client(&f.home)
+        .backup_v2_record_result(&id, 0, &files[0].sha(f.files_cs()))
+        .unwrap();
+    let lease = f.open(&id, false, false).unwrap();
+    read_back(&f.paths(), f.files_cs(), &lease, &files);
+    f.sweep();
+}
+
+/// A lock while a `begin` purges ends the backup it began: the daemon is
+/// stopped by a barrier in the purge, after the backup is registered, and
+/// the vault is locked meanwhile. The `begin` then answers `vault_locked`,
+/// never an id, and once unlocked nothing is listed and no staging
+/// directory is left.
+#[test]
+fn a_lock_while_a_begin_purges_ends_its_backup() {
+    let mut f = Fixture::pausing(Some("backup.v2.purge"));
+    let files = [Spec::made(&f.claude("projects/p/locked.jsonl"), 40, 73)];
+    let paths = f.paths();
+    let params = begin_params("scrub", &files, &[]);
+    let begun = std::thread::spawn(move || {
+        Client::connect(&paths)?
+            .backup_v2_begin(&params)
+            .map(|b| b.id)
+    });
+    f.wait_paused("backup.v2.purge");
+    client(&f.home).lock().unwrap();
+    f.release();
+    let e = begun
+        .join()
+        .unwrap()
+        .expect_err("a begin ended by a lock answered its id");
+    assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
+    client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
+    assert!(f.list().backups.is_empty());
+    assert!(staging_dirs(&f.home).is_empty());
     f.sweep();
 }
 
