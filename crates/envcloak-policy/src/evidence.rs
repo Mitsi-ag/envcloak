@@ -609,17 +609,33 @@ impl SubjectEvidence {
         requester: &SubjectEvidence,
         alive: &dyn Fn(&ProcessInstance) -> bool,
     ) -> bool {
+        self.shares_session_or_terminal(requester.terminal_scope(), alive)
+    }
+
+    /// The processes [`SubjectEvidence::shares_terminal_with`] looks at in
+    /// this evidence as a requester's: its chain from the caller up to its
+    /// root or up to its nearest known agent, whichever is further.
+    pub fn terminal_scope(&self) -> &[Ancestor] {
+        let end = self.nearest_agent.map_or(self.root, |n| n.max(self.root));
+        &self.chain[..=end]
+    }
+
+    /// Whether this caller shares a session id or a controlling terminal's
+    /// device with a process of `scope` that `alive` says still runs: the
+    /// test of [`SubjectEvidence::shares_terminal_with`], for a requester's
+    /// [`SubjectEvidence::terminal_scope`] kept apart from its evidence (a
+    /// backup's creator, sealed with the backup, M2 plan D-07). Only a
+    /// scope process's instance, session and terminal are read.
+    pub fn shares_session_or_terminal(
+        &self,
+        scope: &[Ancestor],
+        alive: &dyn Fn(&ProcessInstance) -> bool,
+    ) -> bool {
         let me = &self.chain[0];
-        let end = requester
-            .nearest_agent
-            .map_or(requester.root, |n| n.max(requester.root));
-        requester.chain[..=end]
-            .iter()
-            .filter(|a| alive(&a.instance))
-            .any(|a| {
-                (me.sid.is_some() && a.sid == me.sid)
-                    || (me.terminal.is_some() && a.terminal == me.terminal)
-            })
+        scope.iter().filter(|a| alive(&a.instance)).any(|a| {
+            (me.sid.is_some() && a.sid == me.sid)
+                || (me.terminal.is_some() && a.terminal == me.terminal)
+        })
     }
 
     /// Why this caller may not approve `requester`'s request, or `None`

@@ -98,8 +98,8 @@ pub use panic::{
     test_trace,
 };
 pub use peer::{
-    PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_identity, peer_uid,
-    peer_unchanged, process_start_time,
+    PeerIdentity, PeerSource, StartTime, boot_id, parse_boot_id, parse_stat_start_time,
+    peer_identity, peer_uid, peer_unchanged, process_start_time,
 };
 pub use perm::{PRIVATE_UMASK, effective_uid, restrict_umask};
 pub use proc::{

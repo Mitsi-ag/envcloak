@@ -86,7 +86,9 @@ fn backup_chunks_leave_no_fixture_in_freed_memory() {
                     pid: 7,
                     start_time: 8,
                     token: None,
+                    boot: None,
                 },
+                chain: Vec::new(),
             };
             let mut w = v
                 .begin_file_backup_v2(BackupPurpose::Scrub, creator, plan, 1_790_000_000)

@@ -205,6 +205,54 @@ pub fn process_start_time(pid: i32) -> io::Result<StartTime> {
     }
 }
 
+/// The id of the running boot, so a process instance recorded in one boot
+/// is never taken for a process of a later one. Linux: the UUID the kernel
+/// makes at each boot (`/proc/sys/kernel/random/boot_id`), as 16 bytes; a
+/// start time there counts clock ticks since boot, which a process of a
+/// later boot can have again under the same pid. `None` elsewhere: on
+/// macOS a start time is the wall clock's, in microseconds, and so tells
+/// boots apart itself.
+///
+/// # Errors
+/// Linux: when the file cannot be read or does not hold a UUID.
+pub fn boot_id() -> io::Result<Option<[u8; 16]>> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let text = std::fs::read("/proc/sys/kernel/random/boot_id")?;
+        parse_boot_id(&text)
+            .map(Some)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a malformed boot id"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Ok(None)
+    }
+}
+
+/// Parses a boot id as Linux writes it: 32 hex digits in the UUID's
+/// groups (`8-4-4-4-12`), then a newline or nothing. `None` for anything
+/// else.
+pub fn parse_boot_id(text: &[u8]) -> Option<[u8; 16]> {
+    let text = text.strip_suffix(b"\n").unwrap_or(text);
+    if text.len() != 36 || [8, 13, 18, 23].iter().any(|&i| text[i] != b'-') {
+        return None;
+    }
+    let digit = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let mut nibbles = text.iter().filter(|b| **b != b'-');
+    let mut out = [0u8; 16];
+    for byte in &mut out {
+        let hi = digit(*nibbles.next()?)?;
+        let lo = digit(*nibbles.next()?)?;
+        *byte = hi << 4 | lo;
+    }
+    Some(out)
+}
+
 /// Parses the start time (field 22, in clock ticks since boot) from the
 /// contents of a Linux `/proc/<pid>/stat` file. The command name in field
 /// 2 is in parentheses and may itself hold spaces and parentheses, so the
@@ -570,7 +618,7 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartTime, parse_stat_start_time};
+    use super::{StartTime, boot_id, parse_boot_id, parse_stat_start_time};
 
     fn stat_line(comm: &str, start: &str) -> Vec<u8> {
         // pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt
@@ -610,5 +658,40 @@ mod tests {
             None
         );
         assert_eq!(parse_stat_start_time(b"no parenthesis at all 1 2 3"), None);
+    }
+
+    #[test]
+    fn boot_ids_parse_only_as_linux_writes_them() {
+        let want = [
+            0x5c, 0x0f, 0x2a, 0x91, 0x7e, 0x34, 0x4b, 0x1d, 0x9a, 0x02, 0xc4, 0x8e, 0x61, 0x3f,
+            0xd0, 0x7b,
+        ];
+        for text in [
+            &b"5c0f2a91-7e34-4b1d-9a02-c48e613fd07b\n"[..],
+            b"5c0f2a91-7e34-4b1d-9a02-c48e613fd07b",
+            b"5C0F2A91-7E34-4B1D-9A02-C48E613FD07B\n",
+        ] {
+            assert_eq!(parse_boot_id(text), Some(want));
+        }
+        for text in [
+            &b""[..],
+            b"\n",
+            b"5c0f2a917e344b1d9a02c48e613fd07b",
+            b"5c0f2a91-7e34-4b1d-9a02-c48e613fd07",
+            b"5c0f2a91-7e34-4b1d-9a02-c48e613fd07bb",
+            b"5c0f2a91-7e34-4b1d-9a02-c48e613fd07g",
+            b"5c0f2a91+7e34-4b1d-9a02-c48e613fd07b",
+            b"5c0f2a91-7e34-4b1d-9a02-c48e613fd07b\n\n",
+            b"\xff\xfe",
+        ] {
+            assert_eq!(parse_boot_id(text), None, "{text:?}");
+        }
+        // The running boot's id reads, and twice the same.
+        let now = boot_id().unwrap();
+        assert_eq!(now, boot_id().unwrap());
+        assert_eq!(
+            now.is_some(),
+            cfg!(any(target_os = "linux", target_os = "android"))
+        );
     }
 }

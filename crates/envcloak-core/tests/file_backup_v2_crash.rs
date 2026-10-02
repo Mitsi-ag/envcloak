@@ -75,7 +75,9 @@ fn creator() -> BackupCreator {
             pid: 1234,
             start_time: 1,
             token: None,
+            boot: None,
         },
+        chain: Vec::new(),
     }
 }
 
