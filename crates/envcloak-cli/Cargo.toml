@@ -12,12 +12,16 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+# Each host's MCP tool cutoff, which sets `envcloak mcp --host`'s wait.
+envcloak-agents.workspace = true
 # The connection, failures, rendering, prompts and the manifest editor,
 # shared with envcloak-mcp and envcloak-agents (D-02).
 envcloak-client.workspace = true
 envcloak-core.workspace = true
 envcloak-exec.workspace = true
 envcloak-ipc.workspace = true
+# `envcloak mcp`: the MCP server (M2-06).
+envcloak-mcp.workspace = true
 envcloak-policy.workspace = true
 envcloak-scan.workspace = true
 envcloak-sys.workspace = true

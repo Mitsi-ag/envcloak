@@ -11,7 +11,7 @@
 //! `login` and `signin`, and `run`'s `--pty`. Until then each exits 125
 //! with `not_in_this_build` ([`not_in_this_build`]), reads and echoes no
 //! argument, and asks no daemon. M2-03 landed `pending` and `run`'s
-//! `--wait` and `--manifest`.
+//! `--wait` and `--manifest`; M2-06 landed `mcp`.
 //!
 //! Argument errors never echo an argument: one could be a pasted secret.
 //! No command takes a value on the command line (gate 13): values come

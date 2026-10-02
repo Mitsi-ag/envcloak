@@ -45,6 +45,7 @@ envcloak-client = { path = "crates/envcloak-client", version = "0.1.0" }
 envcloak-core = { path = "crates/envcloak-core", version = "0.1.0" }
 envcloak-exec = { path = "crates/envcloak-exec", version = "0.1.0" }
 envcloak-ipc = { path = "crates/envcloak-ipc", version = "0.1.0" }
+envcloak-mcp = { path = "crates/envcloak-mcp", version = "0.1.0" }
 envcloak-policy = { path = "crates/envcloak-policy", version = "0.1.0" }
 envcloak-providers = { path = "crates/envcloak-providers", version = "0.1.0" }
 envcloak-redact = { path = "crates/envcloak-redact", version = "0.1.0" }

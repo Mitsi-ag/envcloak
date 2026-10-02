@@ -1,0 +1,417 @@
+{
+  "tools": [
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Lists the keys in the person's EnvCloak vault by name (slug), with each one's provider and whether it is a test or live key. Never returns a value. With project_dir, also shows which variables that project's envcloak.toml binds to which keys, and whether each binding resolves. Use run_with_secrets to run a command with them; use add_reference to bind one to a variable.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "project_dir": {
+            "description": "Absolute path of a project directory: its envcloak.toml (there or above) is read for its bindings.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "list_secrets",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "class": {
+                  "type": "string"
+                },
+                "classification": {
+                  "type": "string"
+                },
+                "exposed": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "fields": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "provider": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "slug": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "slug",
+                "class",
+                "provider",
+                "classification",
+                "fields",
+                "exposed"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "note": {
+            "type": "string"
+          },
+          "project": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "project",
+          "note"
+        ],
+        "type": "object"
+      },
+      "title": "List the keys EnvCloak holds"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Shows where a project stands with EnvCloak, metadata only: its envcloak.toml and whether each binding resolves, how many plaintext keys its .env files still hold, the requests this server's run_with_secrets calls left waiting for the person's approval, the grants for this agent, and which EnvCloak features are unavailable in this version. Never returns a value.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "project_dir": {
+            "description": "Absolute path of the project directory.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_dir"
+        ],
+        "type": "object"
+      },
+      "name": "project_status",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "bindings": {
+            "type": "array"
+          },
+          "bindings_resolved": {
+            "type": "integer"
+          },
+          "bindings_unresolved": {
+            "type": "integer"
+          },
+          "coverage": {
+            "type": "null"
+          },
+          "env_files": {
+            "type": "array"
+          },
+          "env_files_skipped": {
+            "type": "integer"
+          },
+          "env_scan_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "grants": {
+            "type": "array"
+          },
+          "manifest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_requests": {
+            "type": "array"
+          },
+          "pending_untracked": {
+            "type": "boolean"
+          },
+          "plaintext_env_lines": {
+            "type": "integer"
+          },
+          "project_dir": {
+            "type": "string"
+          },
+          "project_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "references_unchecked": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unavailable": {
+            "type": "array"
+          },
+          "vault": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_dir",
+          "manifest",
+          "bindings",
+          "plaintext_env_lines",
+          "vault",
+          "pending_requests",
+          "grants",
+          "coverage",
+          "unavailable"
+        ],
+        "type": "object"
+      },
+      "title": "Show a project's EnvCloak status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Adds a binding to the project's envcloak.toml: the variable env_name will get the key the slug names when a command runs through EnvCloak. Takes names only, never a value; only keys of the secret class can be bound (find them with list_secrets). The binding is a request, not an approval: the next run that uses it asks the person.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "env_name": {
+            "description": "The environment variable, such as OPENAI_API_KEY.",
+            "type": "string"
+          },
+          "profile": {
+            "description": "A profile ([env.<profile>]) instead of [env].",
+            "type": "string"
+          },
+          "project_dir": {
+            "description": "Absolute path of the project directory; its envcloak.toml (there or above) is edited.",
+            "type": "string"
+          },
+          "slug": {
+            "description": "The key's slug as list_secrets shows it, optionally with #<field>.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_dir",
+          "env_name",
+          "slug"
+        ],
+        "type": "object"
+      },
+      "name": "add_reference",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "change": {
+            "type": "string"
+          },
+          "env_name": {
+            "type": "string"
+          },
+          "manifest": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "previous": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reference": {
+            "type": "string"
+          },
+          "resolves": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "manifest",
+          "env_name",
+          "reference",
+          "change",
+          "note"
+        ],
+        "type": "object"
+      },
+      "title": "Bind a variable to a key in envcloak.toml"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "openWorldHint": true
+      },
+      "description": "Runs a command with the keys the project's envcloak.toml names in its environment, through `envcloak run`: the same approval, policy and redaction as running `envcloak run -- <argv>` in a shell. Values never come back: each key and its common encodings are masked in the output. A command needs the person's approval in EnvCloak, given from a terminal of their own; until then the result names the pending request, and the call can be made again once it is approved. The command runs outside this host's sandbox, and holds the injected keys in its environment and memory while it runs: what it does with them (files, network, its own child processes) is up to the command. argv runs without a shell; output is cut to its first and last 64 KiB per stream.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "argv": {
+            "description": "The command and its arguments, run without a shell. Never put a key here.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "type": "array"
+          },
+          "profile": {
+            "description": "A profile of envcloak.toml ([env.<profile>]).",
+            "type": "string"
+          },
+          "project_dir": {
+            "description": "Absolute path of the project directory: the command runs there, and its envcloak.toml (there or above) names the keys.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_dir",
+          "argv"
+        ],
+        "type": "object"
+      },
+      "name": "run_with_secrets",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "output_cut": {
+            "type": "boolean"
+          },
+          "request": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signal": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "completed",
+              "approval_required",
+              "denied",
+              "refused"
+            ],
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          },
+          "stderr_left_out": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string"
+          },
+          "stdout_left_out": {
+            "type": "integer"
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "status",
+          "exit_code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "title": "Run a command with the project's keys"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Use when a key the project needs is not in EnvCloak (list_secrets does not show it). Takes the provider's name only, never a key, and returns what to ask the person: to run `envcloak add <provider>` in a terminal of their own and enter the key at its hidden prompt. Never ask the person to paste a key into this conversation. In this version EnvCloak has no app to paste into.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "description": "The provider's name in EnvCloak's registry, such as openai, stripe or github.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider"
+        ],
+        "type": "object"
+      },
+      "name": "request_new_secret",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "instruction": {
+            "type": "string"
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "provider",
+          "command",
+          "instruction"
+        ],
+        "type": "object"
+      },
+      "title": "Ask the person to add a key"
+    }
+  ]
+}
