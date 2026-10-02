@@ -623,6 +623,16 @@ fn worker() {
         let answer = match cmd["op"].as_str().unwrap() {
             "exit" => break,
             "pid" => json!({"pid": std::process::id()}),
+            "move" => {
+                // Leaves this terminal for a new session: with a
+                // pseudo-terminal of its own, or with none.
+                if cmd["to"] == "pty" {
+                    envcloak_sys::testing::enter_terminal_session().unwrap();
+                } else {
+                    envcloak_sys::testing::setsid().unwrap();
+                }
+                json!({"moved": true})
+            }
             "hand_over" => {
                 // A connection of this worker's, used once (so the daemon
                 // has taken it as this process's), handed to a child of
@@ -1563,4 +1573,30 @@ fn a_lock_stops_a_call_in_flight() {
         }
         f.sweep();
     }
+}
+
+/// A lease is bound to the terminal its proof came from (D-07): a process
+/// that opened one and then moved to another terminal (a new session on a
+/// pseudo-terminal of its own), or to none, is the same process instance
+/// but gets `no_such_lease` with it, whatever chunk it asks for.
+#[test]
+fn a_lease_serves_only_the_terminal_of_its_proof() {
+    let f = Fixture::new();
+    let files = [Spec::made(&f.claude("projects/p/m.jsonl"), 100, 17)];
+    let id = f.backup("scrub", &files);
+    for to in ["pty", "none"] {
+        let mut w = f.child("worker", false);
+        let r = w.ask(json!({"op": "open", "id": id, "pass": f.pass()}));
+        let lease = r["lease"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"))
+            .to_owned();
+        let r = w.ask(json!({"op": "read", "lease": lease, "file": 0, "chunk": 0}));
+        assert_eq!(r["len"], 100, "{to}: {r}");
+        assert_eq!(w.ask(json!({"op": "move", "to": to}))["moved"], true);
+        let r = w.ask(json!({"op": "read", "lease": lease, "file": 0, "chunk": 0}));
+        assert_eq!(err(&r), "no_such_lease", "{to}: {r}");
+        w.end();
+    }
+    f.sweep();
 }
