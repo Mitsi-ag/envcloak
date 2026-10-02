@@ -1803,6 +1803,44 @@ fn a_lock_waits_for_a_chunk_on_its_way_out() {
     f.sweep();
 }
 
+/// A chunk goes out under a lease that stands while another proof runs:
+/// a proof takes the vault out of its slot, which other requests see as
+/// `busy`, but every lock ends the leases, so a lease that stands is
+/// still good. Stopped by a barrier inside a second restore's proof, this
+/// process reads a chunk under the lease its first restore opened, and
+/// gets it, byte for byte; the second restore then goes through too.
+#[test]
+fn a_chunk_goes_out_while_another_proof_runs() {
+    let mut f = Fixture::pausing(Some("proof.verifying"));
+    // The proofs before the one held go through.
+    f.release();
+    let files = [Spec::made(&f.claude("projects/p/b.jsonl"), 300, 25)];
+    let id = f.backup("scrub", &files);
+    let lease = f.open(&id, false, true).unwrap().lease;
+    std::fs::remove_file(&f.release).unwrap();
+    let proving = {
+        let (paths, id, pass) = (f.paths(), id.clone(), passphrase(&f.cs));
+        std::thread::spawn(move || {
+            Client::connect(&paths)?.backup_v2_open_restore(&id, pass, false, true, &[])
+        })
+    };
+    f.wait_paused("proof.verifying");
+    assert!(
+        client(&f.home).status().unwrap().vault.busy,
+        "the vault is not out of its slot while the proof runs"
+    );
+    let got = Client::connect(&f.paths())
+        .unwrap()
+        .backup_v2_read(&lease, 0, 0);
+    f.release();
+    let got = got.unwrap_or_else(|e| {
+        panic!("a chunk under a standing lease was refused while another proof ran: {e:?}")
+    });
+    assert!(got.data.as_secret().ct_eq(&files[0].chunk(f.files_cs(), 0)));
+    proving.join().unwrap().unwrap();
+    f.sweep();
+}
+
 /// A lock stops the check of a whole backup that an `open_restore` makes
 /// after its proof before the next chunk: the backup's key and chunks do
 /// not outlive the lock while the rest of it is decrypted. A backup of

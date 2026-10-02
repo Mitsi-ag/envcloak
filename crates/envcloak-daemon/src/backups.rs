@@ -1296,9 +1296,14 @@ pub fn read<'s>(
         let terminal = terminal_now(peer);
         let awake = shared.clocks.awake();
         let mut s = locked(&shared.state);
-        let standing =
-            s.unlocked().is_ok() && s.backups().lease_stands(&lease, peer, terminal, awake);
-        if !standing {
+        // A proof running (an approval, another restore's) has the vault
+        // out of its slot, which reads `busy`; the lease still stands then,
+        // since every lock ends the leases, so the chunk goes out.
+        let open = match s.unlocked() {
+            Ok(_) => true,
+            Err(e) => e.kind == ErrorKind::Busy,
+        };
+        if !open || !s.backups().lease_stands(&lease, peer, terminal, awake) {
             return Err(none());
         }
         shared.deliveries.start(s.backups().locks)
