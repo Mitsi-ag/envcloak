@@ -28,7 +28,8 @@
 //!    its display path, mode, size and SHA-256. It flushes the file and the
 //!    staging directory, renames the directory to `files2-<UTC time>-<id>/`
 //!    and flushes `backups/`, each with [`envcloak_sys::sync_file`]
-//!    (`F_FULLFSYNC` on macOS, and a flush that fails fails the step).
+//!    (`F_FULLFSYNC` on macOS, and a flush that fails fails the step), and
+//!    answers only once the backup's name opens as the directory it sealed.
 //!    Only then is the backup listed: an interrupted backup is a staging
 //!    directory, never listed, which a purge removes once it is
 //!    [`STAGING_GRACE`] old.
@@ -722,7 +723,10 @@ pub struct FileBackupV2Writer {
     digests: Vec<[u8; 32]>,
     /// The size of `data` once [`FileBackupV2Writer::seal`] wrote it all.
     sealed_len: Option<u64>,
-    done: bool,
+    /// Whether the staging directory's name was renamed to the backup's:
+    /// from then on, whatever the checks after it found, the writer
+    /// neither installs again nor removes anything when dropped.
+    installed: bool,
     observe: Option<Observer>,
 }
 
@@ -849,7 +853,7 @@ impl Vault {
             hasher: Sha256::new(),
             digests: Vec::new(),
             sealed_len: None,
-            done: false,
+            installed: false,
             observe,
         };
         let file = create_beneath(&w.staging, OsStr::new(DATA), 0o600)?;
@@ -982,7 +986,7 @@ impl FileBackupV2Writer {
     pub fn seal(&mut self) -> Result<(), VaultError> {
         if self.next().is_some()
             || self.digests.len() != self.plan.len()
-            || self.done
+            || self.installed
             || self.sealed_len.is_some()
         {
             return Err(VaultErrorKind::InvalidRecord.into());
@@ -1024,13 +1028,27 @@ impl FileBackupV2Writer {
     /// backup's name and flushes `backups/`. From the rename on the backup
     /// is listed.
     ///
+    /// A rename moves whatever has the staging directory's name at that
+    /// moment, which need not be the directory this writer made and
+    /// sealed (another directory, or a symlink, put in its place). So the
+    /// backup's name is opened again through `backups/` (never through a
+    /// symlink) once the rename is flushed, and its device and inode
+    /// compared with the staging directory held open: a commit answers
+    /// that the backup is in place only for the directory sealed, whatever
+    /// took either name before that check. It cannot keep the name from
+    /// being replaced later.
+    ///
     /// # Errors
     /// [`VaultErrorKind::InvalidRecord`] unless sealed and not yet in
-    /// place; an I/O error when the rename fails (nothing is listed) or
+    /// place, and when the backup's name does not open as the directory
+    /// sealed; an I/O error when the rename fails (nothing is listed),
     /// `backups/` cannot be flushed (the backup is in place, but may not
-    /// last a crash).
+    /// last a crash), or a directory's metadata cannot be read. From the
+    /// rename on a failure is final: the writer installs nothing again,
+    /// and dropped, it keeps the sealed directory, wherever it is, and
+    /// removes nothing that took its name.
     pub fn install(&mut self) -> Result<CommittedV2, VaultError> {
-        let Some(bytes) = self.sealed_len.filter(|_| !self.done) else {
+        let Some(bytes) = self.sealed_len.filter(|_| !self.installed) else {
             return Err(VaultErrorKind::InvalidRecord.into());
         };
         rename_beneath(
@@ -1038,9 +1056,10 @@ impl FileBackupV2Writer {
             OsStr::new(&self.staging_name),
             OsStr::new(&self.final_name),
         )?;
-        self.done = true;
+        self.installed = true;
         self.step(StepV2::Installed);
         sync_file(&self.backups)?;
+        self.check_installed()?;
         self.step(StepV2::Done);
         Ok(CommittedV2 {
             id: self.ctx.id,
@@ -1052,9 +1071,26 @@ impl FileBackupV2Writer {
     }
 }
 
+impl FileBackupV2Writer {
+    /// Whether the backup's name in `backups/` opens (never through a
+    /// symlink) as the staging directory this writer made and sealed:
+    /// the same device and inode as the handle it holds on it.
+    fn check_installed(&self) -> Result<(), VaultError> {
+        use std::os::unix::fs::MetadataExt;
+        let named = open_dir_beneath(&self.backups, OsStr::new(&self.final_name))
+            .map_err(|_| VaultError::from(VaultErrorKind::InvalidRecord))?
+            .metadata()?;
+        let sealed = self.staging.metadata()?;
+        if (named.dev(), named.ino()) != (sealed.dev(), sealed.ino()) {
+            return Err(VaultErrorKind::InvalidRecord.into());
+        }
+        Ok(())
+    }
+}
+
 impl Drop for FileBackupV2Writer {
     fn drop(&mut self) {
-        if self.done {
+        if self.installed {
             return;
         }
         // Not committed: the staging directory goes, with its `data`, both
