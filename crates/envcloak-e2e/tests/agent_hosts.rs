@@ -343,9 +343,9 @@ fn claude_code_keeps_a_running_command_s_output_in_its_temporary_store() {
     );
     let release = a.root().join("release");
     let shell = format!(
-        "{}; while [ ! -e {} ]; do sleep 0.1; done; echo released",
+        "{}; {}",
         print_split(&[control.as_str()]),
-        envcloak_e2e::quoted(release.to_str().unwrap())
+        barrier(&release, a.root(), 1200)
     );
     let script = json!({"steps": [{"shell": shell}, {"say": "done"}]});
     let running = a.spawn(
@@ -372,6 +372,12 @@ fn claude_code_keeps_a_running_command_s_output_in_its_temporary_store() {
     a.check_pinned();
     a.check_isolated();
     assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
+    assert!(
+        last_tool_output(&body_of(&run, "step 1"))
+            .split_whitespace()
+            .any(|w| w == "released"),
+        "the command did not end by its release"
+    );
     let after = Sweep::host_stores(&a, &cs, &[&run.model]);
     measure(
         &a,
@@ -382,6 +388,68 @@ fn claude_code_keeps_a_running_command_s_output_in_its_temporary_store() {
             after.in_store("claude/tmp", &control.label)
         ),
     );
+}
+
+/// A command that waits until `release` exists, and prints `released`;
+/// it also ends on its own, printing `unreleased`, once `root` is gone or
+/// after `ticks` tenths of a second (verifier, low: Claude Code 2.1.280
+/// runs a Bash command in a process group of its own, which the harness's
+/// group kill does not reach and D-34 forbids signalling by number, so a
+/// wait with no end of its own outlived a failed test, polling forever).
+fn barrier(release: &Path, root: &Path, ticks: u32) -> String {
+    let q = |p: &Path| envcloak_e2e::quoted(p.to_str().unwrap());
+    format!(
+        "i=0; while [ ! -e {r} ] && [ -d {d} ] && [ $i -lt {ticks} ]; do sleep 0.1; i=$((i+1)); \
+         done; if [ -e {r} ]; then echo released; else echo unreleased; fi",
+        r = q(release),
+        d = q(root),
+    )
+}
+
+/// The barrier ends on its own: when released, when its root is gone,
+/// and at its bound, each well within the time a wait without an end
+/// would take (here 600 tenths of a second).
+#[test]
+fn the_barrier_a_host_s_command_waits_on_ends_on_its_own() {
+    let run = |setup: &dyn Fn(&Path, &Path), ticks: u32| {
+        let home = envcloak_testkit::TestHome::new();
+        let root = home.root().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let release = root.join("release");
+        let start = std::time::Instant::now();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(barrier(&release, &root, ticks))
+            .env_clear()
+            .env("PATH", envcloak_testkit::TEST_PATH)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        setup(&release, &root);
+        let end = start + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                let mut out = String::new();
+                std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
+                return out;
+            }
+            if std::time::Instant::now() > end {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the barrier did not end within 30 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    let released = run(&|release, _| std::fs::write(release, b"").unwrap(), 600);
+    assert_eq!(released, "released\n");
+    let gone = run(&|_, root| std::fs::remove_dir(root).unwrap(), 600);
+    assert_eq!(gone, "unreleased\n");
+    let bounded = run(&|_, _| {}, 10);
+    assert_eq!(bounded, "unreleased\n");
 }
 
 /// A run that never sees a canary leaves none anywhere: not in the host's
