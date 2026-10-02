@@ -64,14 +64,15 @@ impl Tool for RunWithSecrets {
             title: "Run a command with the project's keys",
             description: "Runs a command with the keys the project's envcloak.toml names in its \
                  environment, through `envcloak run`: the same approval, policy and redaction as \
-                 running `envcloak run -- <argv>` in a shell. Values never come back: each key and \
-                 its common encodings are masked in the output. A command needs the person's \
-                 approval in EnvCloak, given from a terminal of their own; until then the result \
-                 names the pending request, and the call can be made again once it is approved. \
-                 The command runs outside this host's sandbox, and holds the injected keys in its \
-                 environment and memory while it runs: what it does with them (files, network, \
-                 its own child processes) is up to the command. argv runs without a shell; \
-                 output is cut to its first and last 64 KiB per stream.",
+                 running `envcloak run -- <argv>` in a shell. In the command's output each key, \
+                 and its common encodings, are masked; output the command transforms (part of a \
+                 key, a re-encoding, compression or encryption) is not. A command needs the \
+                 person's approval in EnvCloak, given from a terminal of their own; until then \
+                 the result names the pending request, and the call can be made again once it is \
+                 approved. The command runs outside this host's sandbox, and holds the injected \
+                 keys in its environment and memory while it runs: what it does with them (files, \
+                 network, its own child processes) is up to the command. argv runs without a \
+                 shell; output is cut to its first and last 64 KiB per stream.",
             input: object(
                 json!({
                     "project_dir": {

@@ -16,13 +16,14 @@ pub const PROTOCOL_VERSIONS: [&str; 2] = ["2025-11-25", "2025-06-18"];
 
 /// What the server tells the host about itself in `initialize`.
 pub const INSTRUCTIONS: &str = "EnvCloak keeps API keys out of this conversation: no tool \
-     ever returns a key's value. To run a command that needs the project's keys, call \
-     run_with_secrets (or run `envcloak run -- <command>` in your shell); its output comes back \
-     with every key masked. The first run of a command needs the person's approval in EnvCloak, \
-     from a terminal of their own: say so, and never ask them to approve from this session or to \
-     paste a key here. list_secrets and project_status show what exists; add_reference binds a \
-     key to a variable in envcloak.toml; for a key that does not exist, request_new_secret says \
-     what to ask the person to run.";
+     returns a key's value. To run a command that needs the project's keys, call run_with_secrets \
+     (or run `envcloak run -- <command>` in your shell); in its output each key, and its common \
+     encodings, are masked, but output the command transforms (part of a key, a re-encoding, \
+     compression or encryption) is not, so never have a command print a key. The first run of a \
+     command needs the person's approval in EnvCloak, from a terminal of their own: say so, and \
+     never ask them to approve from this session or to paste a key here. list_secrets and \
+     project_status show what exists; add_reference binds a key to a variable in envcloak.toml; \
+     for a key that does not exist, request_new_secret says what to ask the person to run.";
 
 /// The version to answer for a client that asked for `asked`.
 pub fn negotiate(asked: &str) -> &'static str {
@@ -73,5 +74,20 @@ mod tests {
         assert_eq!(r["protocolVersion"], "2025-06-18");
         assert_eq!(r["capabilities"], json!({"tools": {"listChanged": false}}));
         assert_eq!(r["serverInfo"]["name"], "envcloak");
+    }
+
+    /// The instructions claim what SPEC §1.1 and §6.1 establish and no
+    /// more (L-15): the value and its common encodings are masked in the
+    /// command's output, and output the command transforms is not.
+    ///
+    /// Mutation checked: the round-2 text ("its output comes back with
+    /// every key masked"): this fails.
+    #[test]
+    fn the_instructions_claim_no_more_than_masking_does() {
+        let t = INSTRUCTIONS;
+        assert!(t.contains("common encodings"), "{t}");
+        assert!(t.contains("output the command transforms"), "{t}");
+        assert!(!t.contains("every key masked"), "{t}");
+        assert!(!t.contains("ever returns"), "{t}");
     }
 }
