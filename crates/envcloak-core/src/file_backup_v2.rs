@@ -1848,11 +1848,24 @@ pub fn purge_file_backups_v2_except(
     purge_v2(p, now, in_progress, &mut |_| {})
 }
 
-/// [`purge_file_backups_v2_except`], telling `observe` the name each
-/// directory it removes has right before the files in it are removed:
-/// once it is opened and found due and, for a committed backup's, renamed
-/// out of the listing. Test support only (feature `testing`): a test
-/// replaces the directory there.
+/// Where a purge is with one directory, as
+/// [`purge_file_backups_v2_observed`] reports it, by the directory's name
+/// in `backups/` then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeStepV2<'a> {
+    /// A committed backup's directory is opened and found due; the purge
+    /// has not yet checked that its name still names the directory opened,
+    /// nor renamed it out of the listing.
+    Due(&'a str),
+    /// The files in it are about to be removed: once it is opened and
+    /// found due and, for a committed backup's, renamed out of the
+    /// listing.
+    Removing(&'a str),
+}
+
+/// [`purge_file_backups_v2_except`], telling `observe` where it is with
+/// each directory ([`PurgeStepV2`]). Test support only (feature
+/// `testing`): a test replaces the directory there.
 ///
 /// # Errors
 /// As [`purge_file_backups_v2_except`].
@@ -1861,7 +1874,7 @@ pub fn purge_file_backups_v2_observed(
     p: &VaultPaths,
     now: u64,
     in_progress: impl FnMut(&FileBackupId) -> bool,
-    mut observe: impl FnMut(&str),
+    mut observe: impl FnMut(PurgeStepV2<'_>),
 ) -> Result<usize, VaultError> {
     purge_v2(p, now, in_progress, &mut observe)
 }
@@ -1870,7 +1883,7 @@ fn purge_v2(
     p: &VaultPaths,
     now: u64,
     mut in_progress: impl FnMut(&FileBackupId) -> bool,
-    observe: &mut dyn FnMut(&str),
+    observe: &mut dyn FnMut(PurgeStepV2<'_>),
 ) -> Result<usize, VaultError> {
     let Some(backups) = open_backups(p)? else {
         return Ok(0);
@@ -1889,7 +1902,7 @@ fn purge_v2(
         } else if purged_name(name) {
             open_member(&backups, &entry.name).and_then(|d| match d {
                 Some(dir) => {
-                    observe(name);
+                    observe(PurgeStepV2::Removing(name));
                     empty_and_remove(&backups, &entry.name, &dir)
                 }
                 None => Ok(false),
@@ -1913,7 +1926,7 @@ fn purge_committed(
     backups: &File,
     name: &str,
     now: u64,
-    observe: &mut dyn FnMut(&str),
+    observe: &mut dyn FnMut(PurgeStepV2<'_>),
 ) -> Result<bool, VaultError> {
     let os = OsStr::new(name);
     let Some(dir) = open_member(backups, os)? else {
@@ -1922,12 +1935,13 @@ fn purge_committed(
     if now.saturating_sub(made_at(&dir)) <= FILE_BACKUP_RETENTION.as_secs() {
         return Ok(false);
     }
+    observe(PurgeStepV2::Due(name));
     if !still_named(backups, os, &dir)? {
         return Ok(false);
     }
     let hidden = format!(".{name}{PURGE_SUFFIX}");
     rename_beneath(backups, os, OsStr::new(&hidden))?;
-    observe(&hidden);
+    observe(PurgeStepV2::Removing(&hidden));
     empty_and_remove(backups, OsStr::new(&hidden), &dir)
 }
 
@@ -1939,7 +1953,7 @@ fn purge_staging(
     name: &str,
     now: u64,
     in_progress: &mut impl FnMut(&FileBackupId) -> bool,
-    observe: &mut dyn FnMut(&str),
+    observe: &mut dyn FnMut(PurgeStepV2<'_>),
 ) -> Result<bool, VaultError> {
     let os = OsStr::new(name);
     let Some(dir) = open_member(backups, os)? else {
@@ -1951,7 +1965,7 @@ fn purge_staging(
     {
         return Ok(false);
     }
-    observe(name);
+    observe(PurgeStepV2::Removing(name));
     empty_and_remove(backups, os, &dir)
 }
 

@@ -21,8 +21,8 @@ use envcloak_core::file_backup::{FILE_BACKUP_RETENTION, FileBackupId, STAGING_GR
 use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
     FileBackupV2Writer, HEADER_LEN_V2, MAX_FILE_V2, MAX_FILES_V2, MAX_LABEL_V2, MAX_PATH_V2,
-    PlannedFile, StepV2, chunk_len, chunks_of, list_file_backups_v2, purge_file_backups_v2,
-    purge_file_backups_v2_except, purge_file_backups_v2_observed,
+    PlannedFile, PurgeStepV2, StepV2, chunk_len, chunks_of, list_file_backups_v2,
+    purge_file_backups_v2, purge_file_backups_v2_except, purge_file_backups_v2_observed,
 };
 use envcloak_core::vault::{Vault, VaultErrorKind};
 use envcloak_testkit::{assert_no_canary, by_label, labels};
@@ -892,7 +892,10 @@ fn a_purge_removes_nothing_outside_the_directory_it_opened() {
         v.paths(),
         t,
         |_| false,
-        |name| {
+        |step| {
+            let PurgeStepV2::Removing(name) = step else {
+                return;
+            };
             let away = f.home.root().join(format!("moved-{}", moved.len()));
             std::fs::rename(backups.join(name), &away).unwrap();
             std::os::unix::fs::symlink(&victim, backups.join(name)).unwrap();
@@ -969,6 +972,56 @@ fn a_purge_keeps_a_backup_in_progress() {
         .unwrap();
     let id = w.commit().unwrap().id;
     assert_reads_back(&v, &id, &[&body]);
+    drop(f);
+}
+
+/// A purge renames a committed backup out of the listing only while its
+/// name still names the directory it opened (L-11): once an expired
+/// backup's directory is opened and found due, a test moves it away and
+/// puts another directory of that name in its place, holding a `data` of
+/// its own. That directory keeps its name, is still listed and keeps its
+/// file; the one opened, moved away, keeps its files too; nothing is
+/// renamed for the purge, and nothing is counted as removed.
+#[test]
+fn a_purge_renames_only_the_directory_it_opened() {
+    let (f, v) = KitFixture::create();
+    let t = now();
+    let id = small(&v, t - FILE_BACKUP_RETENTION.as_secs() - 1);
+    let backups = v.paths().backups_dir.clone();
+    let dir = list_file_backups_v2(v.paths()).unwrap().remove(0).dir;
+    let name = dir.file_name().unwrap().to_owned();
+    let moved = f.home.root().join("opened-moved");
+    let mut swapped = 0;
+    let removed = purge_file_backups_v2_observed(
+        v.paths(),
+        t,
+        |_| false,
+        |step| {
+            if let PurgeStepV2::Due(n) = step {
+                std::fs::rename(backups.join(n), &moved).unwrap();
+                std::fs::create_dir(backups.join(n)).unwrap();
+                std::fs::write(backups.join(n).join("data"), b"not the purge's").unwrap();
+                swapped += 1;
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!((swapped, removed), (1, 0));
+    assert_eq!(
+        std::fs::read(backups.join(&name).join("data"))
+            .ok()
+            .as_deref(),
+        Some(&b"not the purge's"[..]),
+        "the directory put in the backup's place was renamed or emptied"
+    );
+    assert!(!purging(&dir).exists());
+    let listed: Vec<FileBackupId> = list_file_backups_v2(v.paths())
+        .unwrap()
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(listed, [id]);
+    assert_eq!(dir_names(&moved), ["data"]);
     drop(f);
 }
 
