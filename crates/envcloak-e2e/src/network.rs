@@ -3,13 +3,17 @@
 //! the proxy the scripted model records). CI's agent jobs run the hosts
 //! with loopback only: on Linux in a network namespace with nothing but
 //! `lo` (`unshare --net`), on macOS with a group of their own whose every
-//! TCP and UDP packet to anywhere but `lo0` a `pf` rule refuses. Each job
-//! says which it set up in [`NETWORK_VAR`], and first, outside it, that
-//! the network is open, so a refusal inside is the isolation's and not a
-//! network that is down.
+//! TCP and UDP packet to anywhere but `lo0` a `pf` rule refuses, and to
+//! which an access control entry denies the system resolver's socket
+//! (`/var/run/mDNSResponder`), so a name lookup fails too and no query
+//! leaves for one (Codex review, medium: lookups went through the
+//! resolver, outside the group, and a value in a name could reach
+//! external DNS unrecorded). Each job says which it set up in
+//! [`NETWORK_VAR`], and first, outside it, that the network is open, so a
+//! refusal inside is the isolation's and not a network that is down.
 
 use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -22,11 +26,24 @@ pub const NETWORK_VAR: &str = "ENVCLOAK_TEST_NETWORK";
 /// (Cloudflare's resolver, on HTTPS).
 const OUTSIDE: &str = "1.1.1.1:443";
 
-/// What a program started from the tests gets for each address it is
-/// given: `OPEN` or `NO <errno name>`, one line each.
+/// A name any open network resolves (the CI service's own), looked up
+/// as a host looks one up (`getaddrinfo`).
+const NAME: &str = "github.com";
+
+/// What a program started from the tests gets for each argument: for
+/// `connect:<host>:<port>`, `OPEN` or `NO <errno name>`; for
+/// `lookup:<name>`, `RESOLVED` or `NO <error>`; one line each.
 const PROBE: &str = "import errno, socket, sys
 for a in sys.argv[1:]:
-    host, port = a.rsplit(':', 1)
+    kind, target = a.split(':', 1)
+    if kind == 'lookup':
+        try:
+            socket.getaddrinfo(target, 443, proto=socket.IPPROTO_TCP)
+            print('RESOLVED')
+        except OSError as e:
+            print('NO', type(e).__name__, e.errno)
+        continue
+    host, port = target.rsplit(':', 1)
     s = socket.socket()
     s.settimeout(10)
     try:
@@ -48,11 +65,22 @@ fn connects(addr: SocketAddr) -> Result<(), ErrorKind> {
         .map_err(|e| e.kind())
 }
 
+/// Whether this process can look `name` up (`getaddrinfo`): `Ok(())`
+/// when it gets an address, or why not.
+fn resolves(name: &str) -> Result<(), String> {
+    match (name, 443).to_socket_addrs().map(|mut a| a.next()) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err("no address".to_owned()),
+        Err(e) => Err(format!("{:?}", e.kind())),
+    }
+}
+
 /// Checks that the tests' network is what [`NETWORK_VAR`] says, from this
 /// process and from a program it starts (as a host is): with
-/// `loopback-only`, a direct connection outside the machine fails and one
-/// to a loopback listener succeeds; with `open`, the connection outside
-/// succeeds too.
+/// `loopback-only`, a name lookup fails, a direct connection outside the
+/// machine fails, and one to a loopback listener succeeds; with `open`,
+/// the lookup and the connection outside succeed too (the positive
+/// control that the checks inside can see a network).
 ///
 /// # Panics
 /// When it is not, or the variable names neither.
@@ -64,18 +92,25 @@ pub fn check_network() {
     let outside: SocketAddr = OUTSIDE.parse().unwrap_or_else(|e| panic!("{e}"));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
     let local = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+    let lookup = resolves(NAME);
     let direct = connects(outside);
     let out = Command::new(crate::python3())
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .args(["-c", PROBE, OUTSIDE, &local.to_string()])
+        .args([
+            "-c",
+            PROBE,
+            &format!("lookup:{NAME}"),
+            &format!("connect:{OUTSIDE}"),
+            &format!("connect:{local}"),
+        ])
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("start python3: {e}"));
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     let lines: Vec<&str> = said.lines().collect();
-    let (child_outside, child_local) = match lines.as_slice() {
-        [a, b] => (*a, *b),
+    let (child_lookup, child_outside, child_local) = match lines.as_slice() {
+        [a, b, c] => (*a, *b, *c),
         _ => panic!(
             "the probe printed {said:?} ({})",
             String::from_utf8_lossy(&out.stderr)
@@ -93,6 +128,14 @@ pub fn check_network() {
     match want.to_str() {
         Some("loopback-only") => {
             assert!(
+                lookup.is_err(),
+                "this process looked {NAME} up with loopback only"
+            );
+            assert!(
+                child_lookup.starts_with("NO "),
+                "a program it starts looked {NAME} up with loopback only: {child_lookup}"
+            );
+            assert!(
                 direct.is_err(),
                 "this process connected to {OUTSIDE} with loopback only"
             );
@@ -101,11 +144,17 @@ pub fn check_network() {
                 "a program it starts connected to {OUTSIDE} with loopback only: {child_outside}"
             );
             println!(
-                "measurement: direct connection to {OUTSIDE} with loopback only: this process \
-                 {direct:?}, a program it starts {child_outside}"
+                "measurement: with loopback only, a lookup of {NAME}: this process {lookup:?}, a \
+                 program it starts {child_lookup}; a direct connection to {OUTSIDE}: this \
+                 process {direct:?}, a program it starts {child_outside}"
             );
         }
         Some("open") => {
+            assert_eq!(lookup, Ok(()), "this process cannot look {NAME} up");
+            assert_eq!(
+                child_lookup, "RESOLVED",
+                "a program it starts cannot look {NAME} up"
+            );
             assert_eq!(direct, Ok(()), "this process cannot reach {OUTSIDE}");
             assert_eq!(
                 child_outside, "OPEN",

@@ -21,9 +21,10 @@ name: CI
 #
 # The agent hosts run with loopback only: on Linux in a network namespace
 # (`unshare -rn`), on macOS with a group of their own whose packets to
-# anywhere but lo0 a pf rule refuses. Each job first checks that the
-# network is open outside that, and then that it is not inside
-# (ENVCLOAK_TEST_NETWORK, `the_network_is_what_ci_says`). A main
+# anywhere but lo0 a pf rule refuses and which the system resolver's
+# socket refuses. Each job first checks that the network is open outside
+# that (a name resolves, an outside address answers), and then that it is
+# not inside (ENVCLOAK_TEST_NETWORK, `the_network_is_what_ci_says`). A main
 # run is never cancelled by the next merge, nor replaced while it waits:
 # runs other than a pull request's each get a concurrency group of their
 # own (GitHub cancels a pending run when another joins its group), and
@@ -338,7 +339,7 @@ jobs:
           grep -qx 'running 3 tests' "$RUNNER_TEMP/s0-outside.log"
           grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
       # As agents-e2e: the tests' own group, whose packets to anywhere but
-      # lo0 a pf rule refuses.
+      # lo0 a pf rule refuses, and which the resolver's socket refuses.
       - name: Loopback only for the tests' group (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -349,6 +350,12 @@ jobs:
             | sudo pfctl -a com.apple/ecnonet -f -
           sudo pfctl -E
           sudo pfctl -a com.apple/ecnonet -s rules
+          # Name lookups too: the system's resolver takes them on its socket
+          # and sends the queries itself, outside the group; an access
+          # control entry denies the group that socket, so a lookup fails
+          # before any query is made for it.
+          sudo chmod +a "group:ecnonet deny write,append" /var/run/mDNSResponder
+          /bin/ls -le /var/run/mDNSResponder
       - name: S0 on the release binaries, loopback only (macOS)
         if: runner.os == 'macOS'
         env:
@@ -618,7 +625,10 @@ jobs:
       # packet a socket of that group sends anywhere but lo0 (a refusal at
       # once, ECONNREFUSED). The runner's own traffic, in its own groups,
       # is untouched. Name lookups go through the system's resolver, which
-      # is not in the group, so a host can resolve a name but not connect.
+      # sends the queries itself, outside the group: an access control entry
+      # denies the group the resolver's socket, so a lookup from the tests
+      # fails and no query leaves for it (Codex review, medium: a value in a
+      # name could reach external DNS unrecorded).
       - name: Loopback only for the tests' group (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -629,6 +639,12 @@ jobs:
             | sudo pfctl -a com.apple/ecnonet -f -
           sudo pfctl -E
           sudo pfctl -a com.apple/ecnonet -s rules
+          # Name lookups too: the system's resolver takes them on its socket
+          # and sends the queries itself, outside the group; an access
+          # control entry denies the group that socket, so a lookup fails
+          # before any query is made for it.
+          sudo chmod +a "group:ecnonet deny write,append" /var/run/mDNSResponder
+          /bin/ls -le /var/run/mDNSResponder
       - name: Agent hosts, loopback only (macOS)
         if: runner.os == 'macOS'
         env:
