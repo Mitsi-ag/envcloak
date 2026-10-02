@@ -225,11 +225,33 @@ fn s0(host: Host, name: &str) {
             approved.all()
         );
         // What the daemon recorded for the request: the subject, and the
-        // process its grant is rooted at, by its executable.
-        let root = rooted_at(&approved.shown(), &agent.installed);
+        // process its grant is rooted at, which must be the host this test
+        // started, that very process (its pid, still unreaped, and its
+        // start time), running the pinned entry: a grant rooted above the
+        // host, or at another process, fails the step (review: it
+        // was only printed).
+        let root = rooted_at(&approved.shown())
+            .unwrap_or_else(|why| panic!("the statement's root: {why}\n{}", approved.all()));
+        let host_pid = running.child.id();
+        assert_eq!(
+            root.pid, host_pid,
+            "the grant is rooted at pid {}, not at the host (pid {host_pid})",
+            root.pid
+        );
+        assert_eq!(
+            Some(root.start),
+            envcloak_testkit::agents::start_time(host_pid),
+            "the grant's root is another process instance than the running host"
+        );
+        assert!(
+            is_entry(&root.exe, &agent.installed),
+            "the grant's root runs {}, not the host's pinned entry",
+            root.exe.display()
+        );
         println!(
             "measurement: S0 subject host={} os={}: requested by: agent {agent_name}, \
-             rooted at {root}",
+             rooted at the host process itself (its pid and start time), running the \
+             pinned entry",
             host.id(),
             std::env::consts::OS
         );
@@ -343,28 +365,50 @@ fn s0(host: Host, name: &str) {
     candidate_density(&agent);
 }
 
-/// The executable the approval statement's `rooted at` names, as the
-/// host's entry (`<the host's entry>`, the pinned file itself) or by its
-/// file name; pids and start times left out.
-fn rooted_at(statement: &str, installed: &Installed) -> String {
-    let Some(line) = statement.lines().find(|l| l.contains("requested by:")) else {
-        return "?".to_owned();
-    };
-    let Some(exe) = line.rsplit_once(", ").map(|(_, e)| e.trim()) else {
-        return "?".to_owned();
-    };
-    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+/// The process an approval statement says the grant is rooted at.
+#[derive(Debug)]
+struct Root {
+    pid: u32,
+    /// In the kernel's units, as the daemon records it.
+    start: u64,
+    exe: PathBuf,
+}
+
+/// The root in the statement's `requested by: ... rooted at pid <pid>
+/// started at <start>, <executable>` line, or why there is none: a line
+/// missing, or any part of it missing or not a number, is refused, never
+/// guessed.
+fn rooted_at(statement: &str) -> Result<Root, String> {
+    let line = statement
+        .lines()
+        .find(|l| l.contains("requested by:"))
+        .ok_or("no `requested by:` line")?;
+    let (_, rest) = line
+        .split_once(", rooted at pid ")
+        .ok_or("no `rooted at pid`")?;
+    let (pid, rest) = rest.split_once(" started at ").ok_or("no `started at`")?;
+    let (start, exe) = rest.split_once(", ").ok_or("no executable for the root")?;
+    let exe = exe.trim();
+    if exe.is_empty() {
+        return Err("an empty executable for the root".to_owned());
+    }
+    Ok(Root {
+        pid: pid.parse().map_err(|_| "a pid that is not a number")?,
+        start: start
+            .parse()
+            .map_err(|_| "a start time that is not a number")?,
+        exe: PathBuf::from(exe),
+    })
+}
+
+/// Whether `exe` is the host's pinned entry (or the program it starts).
+fn is_entry(exe: &Path, installed: &Installed) -> bool {
+    let canonical = |p: &Path| std::fs::canonicalize(p).ok();
     let mut pinned = vec![canonical(&installed.exe)];
     if let Some((starts, _)) = &installed.pin.starts {
         pinned.push(canonical(&installed.dir.join(starts)));
     }
-    if pinned.contains(&canonical(Path::new(exe))) {
-        "<the host's entry>".to_owned()
-    } else {
-        Path::new(exe)
-            .file_name()
-            .map_or("?".to_owned(), |n| n.to_string_lossy().into_owned())
-    }
+    canonical(exe).is_some_and(|e| pinned.contains(&Some(e)))
 }
 
 /// Whether `host`'s sandbox, with the settings §4 pins, is measured to
@@ -518,6 +562,32 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(path).into_iter().flatten().flatten() {
             collect(&e.path(), out);
         }
+    }
+}
+
+/// The statement's root is read whole or refused: a statement with no
+/// root, or a root with a part missing or not a number, is never taken
+/// for one.
+#[test]
+fn the_statement_s_root_is_read_whole_or_refused() {
+    let good = "Approval request ab12cd34\n  requested by: agent Codex (caller pid 7), \
+                rooted at pid 42 started at 1700000000123, /opt/x/codex\n  project: /p\n";
+    let root = rooted_at(good).unwrap();
+    assert_eq!(
+        (root.pid, root.start, root.exe.as_path()),
+        (42, 1_700_000_000_123, Path::new("/opt/x/codex"))
+    );
+    for bad in [
+        "",
+        "  project: /p\n",
+        "  requested by: agent Codex (caller pid 7)\n",
+        "  requested by: agent Codex (caller pid 7), rooted at pid  started at 1, /x\n",
+        "  requested by: agent Codex (caller pid 7), rooted at pid 4x2 started at 1, /x\n",
+        "  requested by: agent Codex (caller pid 7), rooted at pid 42 started at -1, /x\n",
+        "  requested by: agent Codex (caller pid 7), rooted at pid 42 started at 1\n",
+        "  requested by: agent Codex (caller pid 7), rooted at pid 42 started at 1, \n",
+    ] {
+        assert!(rooted_at(bad).is_err(), "{bad:?}");
     }
 }
 
