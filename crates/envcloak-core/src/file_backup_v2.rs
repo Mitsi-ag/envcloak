@@ -1544,12 +1544,7 @@ mod tests {
         assert!(decode_metadata(&longer).is_err());
     }
 
-    /// A backup made under an older schema (before a migration) opens and
-    /// reads back, bound to its own schema; a header claiming another
-    /// schema than the one its records were sealed under does not, nor one
-    /// newer than the vault's.
-    #[test]
-    fn a_backup_of_an_older_schema_still_opens() {
+    fn test_vault() -> (tempfile::TempDir, Vault) {
         let dir = tempfile::tempdir().unwrap();
         let paths = VaultPaths::under(dir.path().join("data"));
         let (v, _) = crate::create_vault(
@@ -1558,8 +1553,11 @@ mod tests {
             crate::crypto::KdfParams::minimum(),
         )
         .unwrap();
-        let body = b"KEY=not a secret, a test body\n";
-        let creator = BackupCreator {
+        (dir, v)
+    }
+
+    fn test_creator() -> BackupCreator {
+        BackupCreator {
             kind: CreatorKind::Terminal,
             evidence_digest: [1; 32],
             agent: None,
@@ -1568,7 +1566,75 @@ mod tests {
                 start_time: 8,
                 token: None,
             },
-        };
+        }
+    }
+
+    /// The final flag in a chunk's associated data is what tells a file's
+    /// last chunk from another: a file of two chunks whose metadata, sealed
+    /// with the backup's own key, is replaced by one that says the file is
+    /// one full chunk long, with its second chunk dropped. The layout, the
+    /// chunk index and the length all agree with the metadata; only the
+    /// flag the first chunk was sealed with (not the last) does not, and
+    /// it does not open as the file's last.
+    #[test]
+    fn only_the_final_flag_tells_a_files_last_chunk_from_another() {
+        let (_dir, v) = test_vault();
+        let body: Vec<u8> = (0..=CHUNK_V2).map(|i| (i % 251) as u8).collect();
+        let path = "/h/.claude/projects/p/f.jsonl".to_owned();
+        let mut w = v
+            .begin_file_backup_v2(
+                BackupPurpose::Scrub,
+                test_creator(),
+                vec![PlannedFile {
+                    path: path.clone(),
+                    mode: 0o600,
+                    size: body.len() as u64,
+                }],
+                1_790_000_000,
+            )
+            .unwrap();
+        w.put(0, 0, &SecretBytes::copy_from(&body[..CHUNK_V2]))
+            .unwrap();
+        w.put(0, 1, &SecretBytes::copy_from(&body[CHUNK_V2..]))
+            .unwrap();
+        let done = w.commit().unwrap();
+        let data = done.dir.join(DATA);
+        let bytes = std::fs::read(&data).unwrap();
+        let first_end = HEADER_LEN_V2 + 4 + 32 + Sealed::OVERHEAD + 4 + MAX_CHUNK_RECORD;
+        let files = [FileMetaV2 {
+            path,
+            mode: 0o600,
+            size: CHUNK_V2 as u64,
+            sha256: Sha256::digest(&body[..CHUNK_V2]).into(),
+        }];
+        let meta = encode_metadata(&w.ctx.header(), BackupPurpose::Scrub, &w.creator, &files);
+        let sealed = seal_record(&w.key, &w.ctx.aad(Rec::Metadata), &meta).unwrap();
+        let mut forged = bytes[..first_end].to_vec();
+        let at = forged.len() as u64;
+        write_record(&mut forged, &sealed).unwrap();
+        forged.extend_from_slice(&at.to_be_bytes());
+        std::fs::write(&data, &forged).unwrap();
+        let r = v.open_file_backup_v2(&done.id).unwrap();
+        assert_eq!(r.meta().files[0].size, CHUNK_V2 as u64);
+        assert_eq!(
+            r.chunk(0, 0).unwrap_err().kind(),
+            VaultErrorKind::BackupDamaged
+        );
+        assert_eq!(
+            r.verify().unwrap_err().kind(),
+            VaultErrorKind::BackupDamaged
+        );
+    }
+
+    /// A backup made under an older schema (before a migration) opens and
+    /// reads back, bound to its own schema; a header claiming another
+    /// schema than the one its records were sealed under does not, nor one
+    /// newer than the vault's.
+    #[test]
+    fn a_backup_of_an_older_schema_still_opens() {
+        let (_dir, v) = test_vault();
+        let body = b"KEY=not a secret, a test body\n";
+        let creator = test_creator();
         let plan = || {
             vec![PlannedFile {
                 path: "/h/.env".into(),
