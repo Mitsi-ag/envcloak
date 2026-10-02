@@ -46,9 +46,11 @@ has exactly one arm `Enum::Name => <value>` (or, in the enum's own `impl`,
 reader can read is an error; every `impl Method for` block in the
 `envcloak-ipc` crate holds exactly one `const NAME` whose value is one
 string literal, and a `const NAME` of another form or elsewhere is an
-error; every entry of `REASONS` is one string literal. String literals are
-read in every form Rust has (plain, raw, byte and C strings), with their
-escapes decoded.
+error; every entry of `REASONS` is one string literal; every MCP tool is
+a `const TOOL: &str = "<name>";` in the `envcloak-mcp` crate, and a
+`const TOOL` of another form, or one name declared twice, is an error.
+String literals are read in every form Rust has (plain, raw, byte and C
+strings), with their escapes decoded.
 
 The CLI's failure tokens are read from every crate's `src/` (comments and
 `#[cfg(test)]` modules left out): the first argument of `Failure::new` and
@@ -651,6 +653,34 @@ def code_exit_tokens(root):
     return found
 
 
+TOOL_CONST = re.compile(r"\bconst\s+TOOL\s*:\s*%s\s*=" % STR_TYPE)
+TOOL_ELSEWHERE = re.compile(r"\bconst\s+TOOL\b")
+
+
+def code_mcp_tools(root):
+    """The MCP tools the server registers: each tool's module in the
+    `envcloak-mcp` crate declares its name as `const TOOL: &str =
+    "<name>";` (M2-06). A `const TOOL` of any other form is an error, never
+    skipped, and one name declared twice is an error."""
+    found = {}
+    for src in rust_sources(root, "envcloak-mcp"):
+        typed = [m.start() for m in TOOL_CONST.finditer(src.skel)]
+        for m in TOOL_ELSEWHERE.finditer(src.skel):
+            if m.start() not in typed:
+                raise SourceError("%s: a `const TOOL` that is not `&str` = one string literal" % src.rel)
+        for m in TOOL_CONST.finditer(src.skel):
+            lit = src.string_at(m.end())
+            if lit is None:
+                raise SourceError("%s: `const TOOL` is not one string literal" % src.rel)
+            name = lit[1]
+            if name in found:
+                raise SourceError("%s: the tool `%s` is declared twice" % (src.rel, name))
+            found[name] = src.rel
+    if not found:
+        raise SourceError("no `const TOOL` found under crates/envcloak-mcp/src")
+    return found
+
+
 def code_statement_domains(root):
     """Statement domains written as string literals in the workspace's Rust
     files (`b"envcloak-statement/1\n"`); a domain named in a comment is
@@ -711,7 +741,7 @@ REGISTRIES = {
     "statement_domain": dict(doc="docs/IPC.md", cols=["Domain", "Task", "Status", "Use"],
                              name="Domain", grammar=DOMAIN, code=code_statement_domains),
     "mcp_tool": dict(doc="docs/IPC.md", cols=["Tool", "Task", "Status", "Use"],
-                     name="Tool", grammar=TOOL, code=None),
+                     name="Tool", grammar=TOOL, code=code_mcp_tools),
     "signin_token": dict(doc="docs/IPC.md", cols=["Token", "Task", "Status", "Use"],
                          name="Token", grammar=TOKEN, code=None),
 }
