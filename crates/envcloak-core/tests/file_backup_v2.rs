@@ -1489,3 +1489,127 @@ fn a_failed_last_flush_of_backups_fails_the_purge() {
     assert!(dir_names(&backups).is_empty());
     drop(f);
 }
+
+/// A commit answers that the backup is in place only for the directory it
+/// sealed (L-11; a rename moves whatever has the staging directory's name
+/// then). Before the rename (the staging directory moved away and a
+/// symlink to another directory, or another directory, put under its
+/// name) or right after it (the same done to the backup's name), the
+/// commit fails (`InvalidRecord`) and reports no `Done` step, and a second
+/// try fails too. Dropped, the writer removes nothing: the sealed `data`
+/// is whole where the directory was moved, and the other directory, the
+/// symlink and what it points at are as they were. With the sealed
+/// directory put back under the backup's name, the backup reads back.
+fn refuses_a_substituted_publication(after_rename: bool, symlink: bool) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (f, v) = KitFixture::create();
+    let body = content(&f, CHUNK_V2 + 17, 7);
+    let files: [(&str, u32, &[u8]); 1] = [("/h/.claude/settings.json", 0o600, &body)];
+    let backups = v.paths().backups_dir.clone();
+    let held = f.home.root().join("held-sealed");
+    let victim = f.home.root().join("foreign");
+    std::fs::create_dir(&victim).unwrap();
+    std::fs::write(victim.join("keep"), []).unwrap();
+    let replace = move |p: &Path, victim: &Path| {
+        if symlink {
+            std::os::unix::fs::symlink(victim, p).unwrap();
+        } else {
+            std::fs::create_dir(p).unwrap();
+            std::fs::write(p.join("keep"), []).unwrap();
+        }
+    };
+    let installed = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+    let (seen_installed, seen_done) = (installed.clone(), done.clone());
+    let (parent, moved, outside) = (backups.clone(), held.clone(), victim.clone());
+    let mut w = v
+        .begin_file_backup_v2_observed(
+            BackupPurpose::Scrub,
+            creator(CreatorKind::Agent),
+            vec![PlannedFile {
+                path: files[0].0.into(),
+                mode: 0o600,
+                size: body.len() as u64,
+            }],
+            now(),
+            move |step| {
+                if step == StepV2::Installed {
+                    seen_installed.fetch_add(1, Ordering::SeqCst);
+                    if after_rename {
+                        let names = dir_names(&parent);
+                        assert_eq!(names.len(), 1);
+                        let named = parent.join(&names[0]);
+                        std::fs::rename(&named, &moved).unwrap();
+                        replace(&named, &outside);
+                    }
+                } else if step == StepV2::Done {
+                    seen_done.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .unwrap();
+    let id = w.id();
+    put_all(&mut w, &files);
+    w.seal().unwrap();
+    let names = dir_names(&backups);
+    assert_eq!(names.len(), 1);
+    let staging = backups.join(&names[0]);
+    assert_eq!(dir_names(&staging), ["data"]);
+    let sealed = std::fs::read(staging.join("data")).unwrap();
+    assert_no_canary(&sealed, &f.cs);
+    if !after_rename {
+        std::fs::rename(&staging, &held).unwrap();
+        replace(&staging, &victim);
+    }
+    assert_eq!(
+        w.install().unwrap_err().kind(),
+        VaultErrorKind::InvalidRecord,
+        "a commit answered for a directory it did not seal"
+    );
+    assert_eq!(installed.load(Ordering::SeqCst), 1);
+    assert_eq!(done.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        w.install().unwrap_err().kind(),
+        VaultErrorKind::InvalidRecord
+    );
+    drop(w);
+    let names = dir_names(&backups);
+    assert_eq!(names.len(), 1);
+    let published = backups.join(&names[0]);
+    assert!(std::fs::read(held.join("data")).unwrap() == sealed);
+    assert_eq!(dir_names(&victim), ["keep"]);
+    if symlink {
+        assert!(published.symlink_metadata().unwrap().is_symlink());
+        assert_eq!(std::fs::read_link(&published).unwrap(), victim);
+        std::fs::remove_file(&published).unwrap();
+    } else {
+        assert!(published.symlink_metadata().unwrap().is_dir());
+        assert_eq!(dir_names(&published), ["keep"]);
+        std::fs::remove_dir_all(&published).unwrap();
+    }
+    std::fs::rename(&held, &published).unwrap();
+    assert_reads_back(&v, &id, &[&body]);
+    assert_no_canary(&backup_bytes(&v), &f.cs);
+    drop(f);
+}
+
+#[test]
+fn a_commit_refuses_a_symlink_put_under_the_staging_name() {
+    refuses_a_substituted_publication(false, true);
+}
+
+#[test]
+fn a_commit_refuses_a_directory_put_under_the_staging_name() {
+    refuses_a_substituted_publication(false, false);
+}
+
+#[test]
+fn a_commit_refuses_a_symlink_put_under_the_backup_name() {
+    refuses_a_substituted_publication(true, true);
+}
+
+#[test]
+fn a_commit_refuses_a_directory_put_under_the_backup_name() {
+    refuses_a_substituted_publication(true, false);
+}
