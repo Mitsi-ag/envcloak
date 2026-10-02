@@ -75,10 +75,7 @@ struct Story {
 
 fn story() -> Story {
     let mut h = Harness::start();
-    // Python's serializers and serde_json: nothing to build, so the step
-    // runs the same with loopback only (the M2 agent jobs). The other
-    // runtimes go through the same `envcloak run` in the fixture story.
-    let emitters = Emitters::python_and_serde(Path::new(env!("CARGO_BIN_EXE_ec-emit-serde")));
+    let emitters = story_emitters();
     let repo = write_repo(&mut h, &emitters);
     let values: BTreeMap<&str, Vec<u8>> = NAMES.iter().map(|n| (*n, h.value(n).to_vec())).collect();
     let pairs: Vec<(&str, &[u8])> = values.iter().map(|(n, v)| (*n, v.as_slice())).collect();
@@ -91,6 +88,33 @@ fn story() -> Story {
         repo,
         emitters,
         values,
+    }
+}
+
+/// The serializers `./emit` runs through `run_with_secrets`. Where
+/// `ENVCLOAK_TEST_REQUIRE_EMITTERS` asks for them (the release job, both
+/// systems), every gate-8 runtime: Python, Node, Go, .NET, PHP and
+/// serde_json, each required, the Go and .NET emitters taken from the
+/// build the fixture story made in the same target directory, earlier in
+/// that job with the network open (verifier, M2-06 round 2: gate 8 through
+/// the tool covered two serializers only). Elsewhere (the pull-request
+/// `gates` job and `agents-e2e`, which have the runner's own runtimes or
+/// none, and loopback only) Python's serializers and serde_json, which
+/// need nothing found or built.
+fn story_emitters() -> Emitters {
+    let serde = Path::new(env!("CARGO_BIN_EXE_ec-emit-serde"));
+    let all = std::env::var("ENVCLOAK_TEST_REQUIRE_EMITTERS").is_ok_and(|v| !v.is_empty());
+    if all {
+        let build = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e-emitters");
+        let emitters = Emitters::prepare(&build, serde);
+        eprintln!(
+            "S7 and S8 serializers: {}; not installed here: {}",
+            emitters.tags().join(", "),
+            emitters.missing.join(", ")
+        );
+        emitters
+    } else {
+        Emitters::python_and_serde(serde)
     }
 }
 

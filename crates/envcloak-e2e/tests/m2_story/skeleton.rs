@@ -1474,7 +1474,11 @@ fn ci_fails_every_exact_step_whose_tests_did_not_all_run() {
 /// And S0 runs on the release binaries (Codex review, medium: the release
 /// job installed no host, so S0 skipped there): the release job installs
 /// the pinned tier-1 hosts and runs `m2_story` on `target/release` with
-/// the hosts required, at trace, loopback only, on both systems.
+/// the hosts required, at trace, loopback only, on both systems; and there
+/// S7 and S8 require every gate-8 serializer.
+///
+/// Mutation checked (M2-06): `ENVCLOAK_TEST_REQUIRE_EMITTERS` dropped from
+/// the macOS story step: this fails.
 #[test]
 fn ci_runs_the_hosts_at_trace_and_s0_on_the_release_binaries() {
     let ci = ci_file();
@@ -1548,6 +1552,22 @@ fn ci_runs_the_hosts_at_trace_and_s0_on_the_release_binaries() {
         runs += 1;
     }
     assert_eq!(runs, 3);
+    // S7 and S8 run gate 8 through `run_with_secrets` with every serializer
+    // there, each required (M2-06, verifier round 2): the two steps that
+    // run all of `m2_story` say so.
+    for prefix in [
+        "S0 on the release binaries, loopback only (Linux)",
+        "S0 on the release binaries, loopback only (macOS)",
+    ] {
+        let env = yaml_env(ci_steps(release, prefix)[0], 8);
+        assert_eq!(
+            env.iter()
+                .find(|(n, _)| n == "ENVCLOAK_TEST_REQUIRE_EMITTERS")
+                .map(|(_, v)| v.as_str()),
+            Some("python,node,go,dotnet,php,serde"),
+            "{prefix}: S7 and S8 do not require every serializer"
+        );
+    }
 }
 
 fn ci_file() -> String {

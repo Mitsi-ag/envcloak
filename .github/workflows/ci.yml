@@ -308,11 +308,17 @@ jobs:
             the_network_is_what_ci_says 2>&1 | tee "$RUNNER_TEMP/network-open.log"
           grep -qx 'running 1 test' "$RUNNER_TEMP/network-open.log"
           grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/network-open.log"
+      # S7 and S8 run here too: every gate-8 serializer through
+      # run_with_secrets, required, with the Go and .NET emitters the
+      # fixture story built above (crates/envcloak-e2e/tests/m2_story/mcp.rs,
+      # story_emitters).
       - name: S0 on the release binaries, loopback only (Linux)
         if: runner.os == 'Linux'
         env:
           ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
           ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
+          ENVCLOAK_TEST_REQUIRE_EMITTERS: python,node,go,dotnet,php,serde
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
           ENVCLOAK_E2E_BIN_DIR: ${{ github.workspace }}/target/release
           ENVCLOAK_TEST_NETWORK: loopback-only
           RUST_LOG: trace
@@ -361,6 +367,8 @@ jobs:
         env:
           ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
           ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
+          ENVCLOAK_TEST_REQUIRE_EMITTERS: python,node,go,dotnet,php,serde
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
           ENVCLOAK_E2E_BIN_DIR: ${{ github.workspace }}/target/release
           ENVCLOAK_TEST_NETWORK: loopback-only
           RUST_LOG: trace
