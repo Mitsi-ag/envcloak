@@ -187,13 +187,14 @@ fn scripted_turns(h: Host, variant: &str) {
         "{}",
         run.text()
     );
-    let mut endpoints = run.model.model_endpoints();
-    endpoints.dedup();
-    measure(&a, "model endpoints", endpoints.join(", "));
-    let mut tunnels: Vec<&str> = run.model.connects();
-    tunnels.sort_unstable();
-    tunnels.dedup();
-    measure(&a, "tunnels refused", tunnels.join(", "));
+    // As a diagnostic shows a request a host sent (no value, whatever it
+    // put in a request line): endpoints and host names, else lengths.
+    measure(
+        &a,
+        "model endpoints",
+        run.model.shown_model_endpoints().join(", "),
+    );
+    measure(&a, "tunnels refused", run.model.shown_connects().join(", "));
     measure(&a, "seconds", run.elapsed.as_secs_f32());
 }
 
@@ -2395,14 +2396,11 @@ fn tier_2(
         panic!("the host changed during the run: {why}");
     }
     let label = format!("{id}/{variant} {}", installed.pin.version);
-    let mut tunnels = report.connects();
-    tunnels.sort_unstable();
-    tunnels.dedup();
     println!(
         "measurement: tier 2 host={label} os={}: endpoints {}; tunnels refused {}; outcome {}",
         os(),
-        report.model_endpoints().join(", "),
-        tunnels.join(", "),
+        report.shown_model_endpoints().join(", "),
+        report.shown_connects().join(", "),
         report.outcome
     );
     Some(Tier2Run { report, output })

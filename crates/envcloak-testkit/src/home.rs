@@ -114,6 +114,12 @@ impl TestHome {
         vars
     }
 
+    /// Keeps the tree instead of removing it, and returns its root: for a
+    /// measurement made by hand, whose author looks at what was written.
+    pub fn keep(self) -> PathBuf {
+        self.dir.keep()
+    }
+
     /// Sweeps the whole tree for canaries.
     pub fn sweep(&self, cs: &[Canary]) -> Vec<Hit> {
         sweep_dir(self.root(), cs)
