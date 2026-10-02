@@ -925,8 +925,8 @@ fn a_numbered_variant_without_its_number_fails() {
     edit(
         &t,
         AAD,
-        "    FileBackup = 9,\n}",
-        "    FileBackup = 9,\n    Login,\n}",
+        "    FileBackupV2 = 10,\n}",
+        "    FileBackupV2 = 10,\n    Login,\n}",
     );
     assert_fails(&t, "`TableTag::Login` has no explicit number");
 }

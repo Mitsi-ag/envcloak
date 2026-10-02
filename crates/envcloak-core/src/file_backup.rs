@@ -78,7 +78,8 @@ pub struct FileBackupId(pub [u8; 16]);
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 impl FileBackupId {
-    fn generate() -> Self {
+    /// A fresh random id (the daemon also names restore leases with one).
+    pub fn generate() -> Self {
         let mut id = [0u8; 16];
         fill_random_or_panic(&mut id);
         FileBackupId(id)

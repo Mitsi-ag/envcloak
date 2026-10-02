@@ -90,11 +90,20 @@ pub enum AuditKind {
     /// The request id is the backup's; the count says how many items the
     /// restored vault holds.
     Recover = 21,
+    // M2 and M2b: each kind joins `ALL`, which `verify` reads, with the task
+    // that writes it (docs/VAULT.md "Reserved for M2 and M2b").
+    /// A file backup v2 committed, with its creator and purpose. The request id
+    /// is the backup's; the count says how many files.
+    BackupV2 = 25,
+    /// A restore lease opened on a file backup v2, with a proof, before its
+    /// first chunk is read; or the proof failed. The request id is the
+    /// backup's; the count says how many files.
+    RestoreV2 = 26,
 }
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 21] = [
+    pub const ALL: [AuditKind; 23] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -116,6 +125,8 @@ impl AuditKind {
         AuditKind::RecoveryConfirm,
         AuditKind::Backup,
         AuditKind::Recover,
+        AuditKind::BackupV2,
+        AuditKind::RestoreV2,
     ];
 
     /// The kind's stable token.
@@ -142,6 +153,8 @@ impl AuditKind {
             AuditKind::RecoveryConfirm => "recovery_confirm",
             AuditKind::Backup => "backup",
             AuditKind::Recover => "recover",
+            AuditKind::BackupV2 => "backup_v2",
+            AuditKind::RestoreV2 => "restore_v2",
         }
     }
 
@@ -200,7 +213,8 @@ pub struct AuditRecord {
     pub at: SystemTime,
     pub kind: AuditKind,
     /// The pending request's id (8 Crockford base32 characters), or for
-    /// [`AuditKind::FilesBackup`] and [`AuditKind::FilesRestore`] the file
+    /// [`AuditKind::FilesBackup`], [`AuditKind::FilesRestore`],
+    /// [`AuditKind::BackupV2`] and [`AuditKind::RestoreV2`] the file
     /// backup's (26).
     pub request_id: Option<String>,
     /// The grant's id (26 Crockford base32 characters).
@@ -449,7 +463,25 @@ mod tests {
             assert_eq!(AuditKind::from_u8(k as u8), Some(k));
         }
         assert_eq!(AuditKind::from_u8(0), None);
-        assert_eq!(AuditKind::from_u8(22), None);
+        // Kinds 22 to 24 and from 27 on are reserved for later tasks, not
+        // written by this build.
+        for n in [22, 23, 24, 27, 46] {
+            assert_eq!(AuditKind::from_u8(n), None, "{n}");
+        }
+        // Numbers in order, each token its own.
+        for (i, k) in AuditKind::ALL.iter().enumerate() {
+            assert!(i == 0 || (AuditKind::ALL[i - 1] as u8) < (*k as u8));
+            assert_eq!(
+                AuditKind::ALL
+                    .iter()
+                    .filter(|o| o.token() == k.token())
+                    .count(),
+                1
+            );
+        }
+        // The backup v2 kinds are read back: `verify` takes their entries.
+        assert_eq!(AuditKind::from_u8(25), Some(AuditKind::BackupV2));
+        assert_eq!(AuditKind::from_u8(26), Some(AuditKind::RestoreV2));
     }
 
     /// 100 KB of command line (gate 31's size) and long strings everywhere
