@@ -872,14 +872,29 @@ impl HostFlags {
     }
 }
 
-/// What one host run did.
-#[derive(Debug)]
+/// What one host run did. `Debug` shows the exit status, the output's
+/// lengths and the model's report (itself value-free), never what the
+/// host printed (L-12): a failure message prints [`HostRun::text`] only
+/// once the output has been swept.
 pub struct HostRun {
     pub output: Output,
     pub model: ModelReport,
     /// Where the run's scripted model listened (`http://127.0.0.1:<port>`).
     pub model_url: String,
     pub elapsed: Duration,
+}
+
+impl std::fmt::Debug for HostRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostRun")
+            .field("status", &self.output.status)
+            .field("stdout_len", &self.output.stdout.len())
+            .field("stderr_len", &self.output.stderr.len())
+            .field("model", &self.model)
+            .field("model_url", &self.model_url)
+            .field("elapsed", &self.elapsed)
+            .finish()
+    }
 }
 
 impl HostRun {
@@ -1578,8 +1593,9 @@ impl Collector {
     }
 }
 
-/// How a run [`run_within`] bounded ended.
-#[derive(Debug)]
+/// How a run [`run_within`] bounded ended. `Debug` shows the exit
+/// status, the two flags and the output's lengths, never the output
+/// (L-12: it is whatever the command wrote).
 pub struct Bounded {
     /// Its exit status and its output, as far as it was read.
     pub output: Output,
@@ -1590,6 +1606,18 @@ pub struct Bounded {
     /// still held it open [`OUTPUT_GRACE`] after it exited and its group
     /// was killed. Such a process escaped the group and may still run.
     pub complete: bool,
+}
+
+impl std::fmt::Debug for Bounded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bounded")
+            .field("status", &self.output.status)
+            .field("in_time", &self.in_time)
+            .field("complete", &self.complete)
+            .field("stdout_len", &self.output.stdout.len())
+            .field("stderr_len", &self.output.stderr.len())
+            .finish()
+    }
 }
 
 /// Spawns `cmd` (its standard output and error piped) as the leader of a
@@ -1722,6 +1750,42 @@ mod tests {
         assert_eq!(out.stdout, b"started\n");
         assert_eq!(out.stderr, b"to-stderr\n");
         assert!(start.elapsed() < OUTPUT_GRACE, "{:?}", start.elapsed());
+    }
+
+    /// `Debug` of a bounded run and of a host run shows what they hold
+    /// only by length (SPEC §6 rule 10; verifier, low: both derived it
+    /// over the raw output); the lengths and the exit status are there.
+    #[test]
+    fn a_run_s_debug_holds_nothing_it_printed() {
+        let marker = format!("ecdebug-{:016x}", crate::fresh_seed());
+        let b = run_within(
+            sh(&format!("printf '%s' {marker}; printf '%s' {marker} >&2")),
+            Duration::from_secs(60),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(b.output.stdout, marker.as_bytes(), "the control");
+        let shown = format!("{b:?}");
+        assert!(!shown.contains(&marker), "{shown}");
+        let len = marker.len();
+        assert!(
+            shown.contains(&format!("stdout_len: {len}"))
+                && shown.contains(&format!("stderr_len: {len}"))
+                && shown.contains("in_time: true"),
+            "{shown}"
+        );
+        let run = HostRun {
+            output: b.output,
+            model: ModelReport {
+                requests: Vec::new(),
+                outcome: Value::Null,
+            },
+            model_url: "http://127.0.0.1:1".to_owned(),
+            elapsed: Duration::from_secs(1),
+        };
+        let shown = format!("{run:?}");
+        assert!(!shown.contains(&marker), "{shown}");
+        assert!(shown.contains(&format!("stdout_len: {len}")), "{shown}");
+        assert!(run.text().contains(&marker), "the control");
     }
 
     /// Output a process outside the group still holds is not cut short
