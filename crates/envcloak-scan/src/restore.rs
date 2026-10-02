@@ -39,8 +39,8 @@ use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 
 use crate::atomic::{
-    Inside, ModifyError, ModifyErrorKind, create_atomically, digest_of, io, remove_leftovers,
-    replace_atomically, replace_in_with, rewrite_checked_observed,
+    Inside, ModifyError, ModifyErrorKind, create_atomically, digest_of, io, replace_atomically,
+    replace_in_with, rewrite_checked_observed,
 };
 use crate::root::{FileStamp, ScanRoot, open_file};
 
@@ -139,10 +139,17 @@ pub struct BackedUpFile {
 /// killed while it writes leaves the file at `rel` as it was, or the
 /// restored one, and may leave the new file so far beside it under its
 /// temporary name (`.<name>.envcloak-new-<hex>.tmp`, 0600), which nothing
-/// reads; once a later restore of the same file has written it back, it
-/// removes those it finds: the file then holds their bytes whole. A
-/// restore of the same file running in another process at that moment
-/// may then fail, and reports it.
+/// reads. Every later restore of the same file that gets the contents
+/// whole beside it, whether or not it then takes the file's place,
+/// removes each file of that file's temporary names holding nothing but
+/// those contents' first bytes (a regular file with one link, compared
+/// byte for byte), so nothing is lost with it; it keeps any other, whose
+/// origin it cannot know: another program's save a swap brought out and
+/// could not put back ([`ModifyErrorKind::MovedAside`] names it), or the
+/// file a restore stopped after its swap took out. A restore that stops
+/// earlier (`edited_since`, `backup_unread`) removes nothing. A restore
+/// of the same file running in another process at that moment may then
+/// fail, and reports it.
 ///
 /// # Errors
 /// As above, and as [`crate::replace_atomically`].
@@ -195,7 +202,7 @@ pub fn restore_over_left_observed(
     // its name: the stamp is the one it had before it was read, and what
     // comes out of the swap must still hold what the change left.
     let mut fill = |out: &mut File| write_chunks(out, file, chunk);
-    let written = replace_in_with(
+    replace_in_with(
         &dir,
         rel,
         &name,
@@ -203,11 +210,7 @@ pub fn restore_over_left_observed(
         &stamp,
         Some(&file.sha256_after),
         observe,
-    )?;
-    // A restore of this file killed while it wrote left its new contents
-    // so far beside it; the file now holds them whole, so they go.
-    remove_leftovers(&dir, &name, "new");
-    Ok(written)
+    )
 }
 
 /// Writes the chunks of `file` to `out`, in order, each at its length,

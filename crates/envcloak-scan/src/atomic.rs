@@ -196,26 +196,44 @@ fn temp_name(name: &OsStr, what: &str) -> OsString {
     t
 }
 
-/// Removes from `dir` the files a write of `name` left under its
-/// temporary names (`.<name>.envcloak-<what>-<16 hex>.tmp`, [`temp_name`])
-/// when it was stopped before it ended: regular files only, each by its
-/// name, a symlink of such a name never followed. A name too long to be
-/// carried in one ([`temp_name`] leaves it out) says nothing of whose it
-/// is, so nothing is removed then. Best effort: returns how many went,
-/// and flushes `dir` when any did. Nothing is read from them.
-pub(crate) fn remove_leftovers(dir: &File, name: &OsStr, what: &str) -> usize {
+/// Removes from `dir` what earlier writes back of `name` left beside it
+/// under their temporary names (`.<name>.envcloak-new-<16 hex>.tmp`,
+/// [`temp_name`]) when they were stopped before they ended, once `staged`,
+/// the new file `ours` in `dir`, holds the whole contents being written
+/// back. A file of such a name goes only when it is shown to hold nothing
+/// but those contents' first bytes: a regular file of this user with one
+/// link, no longer than `ours`, every byte of it equal to the byte of
+/// `ours` at its place, unchanged while it was read and still under that
+/// name when it is unlinked. Whatever else has such a name stays, since
+/// its origin is not known: another program's save a swap brought out
+/// and could not put back ([`ModifyErrorKind::MovedAside`]), the file a
+/// stopped write swapped out, the contents of another backup. A name too
+/// long to be carried in one ([`temp_name`] leaves it out) says nothing
+/// of whose it is, so nothing is removed then. Never through a symlink.
+/// Best effort: returns how many went, and flushes `dir` when any did.
+/// The bytes read pass through buffers wiped after.
+pub(crate) fn remove_leftovers(dir: &File, name: &OsStr, ours: &OsStr, staged: &File) -> usize {
     if name.as_bytes().len() > 128 {
         return 0;
     }
     let mut prefix = b".".to_vec();
     prefix.extend_from_slice(name.as_bytes());
-    prefix.extend_from_slice(format!(".envcloak-{what}-").as_bytes());
+    prefix.extend_from_slice(b".envcloak-new-");
     let Ok(entries) = list_dir(dir, MAX_DIR_ENTRIES) else {
         return 0;
     };
+    // The contents written back, read from the new file itself: `staged`
+    // was opened to write only.
+    let Ok(want) = staged.metadata() else {
+        return 0;
+    };
+    let whole = match open_file(dir, ours, usize::MAX) {
+        Ok((f, m)) if (m.dev(), m.ino()) == (want.dev(), want.ino()) => f,
+        _ => return 0,
+    };
     let mut removed = 0;
     for e in entries {
-        let ours = e
+        let of_this_name = e
             .name
             .as_bytes()
             .strip_prefix(prefix.as_slice())
@@ -225,8 +243,10 @@ pub(crate) fn remove_leftovers(dir: &File, name: &OsStr, what: &str) -> usize {
                     && h.iter()
                         .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
             });
-        if ours
+        if of_this_name
+            && e.name != ours
             && kind_beneath(dir, &e.name).is_ok_and(|k| k == DirEntryKind::File)
+            && holds_first_bytes_of(dir, &e.name, &whole, want.len())
             && unlink_beneath(dir, &e.name).is_ok()
         {
             removed += 1;
@@ -236,6 +256,44 @@ pub(crate) fn remove_leftovers(dir: &File, name: &OsStr, what: &str) -> usize {
         let _ = sync_file(dir);
     }
     removed
+}
+
+/// Whether the file `leftover` in `dir` holds nothing but the first bytes
+/// of `whole`, which is `len` bytes long: a regular file of this user,
+/// never through a symlink, with one link, no longer than `whole`, each of
+/// its bytes the byte of `whole` at its place; unchanged while it was
+/// read, its change time included, and still the file of that name.
+fn holds_first_bytes_of(dir: &File, leftover: &OsStr, whole: &File, len: u64) -> bool {
+    use std::os::unix::fs::FileExt;
+    let Ok((mut f, m)) = open_file(dir, leftover, usize::MAX) else {
+        return false;
+    };
+    let stamp = FileStamp::of(&m);
+    if stamp.nlink != 1 || stamp.size > len {
+        return false;
+    }
+    let mut theirs = Zeroizing::new(vec![0u8; 64 * 1024]);
+    let mut ours = Zeroizing::new(vec![0u8; 64 * 1024]);
+    let mut at: u64 = 0;
+    loop {
+        let n = match f.read(&mut theirs[..]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let end = at + n as u64;
+        if end > stamp.size
+            || whole.read_exact_at(&mut ours[..n], at).is_err()
+            || theirs[..n] != ours[..n]
+        {
+            return false;
+        }
+        at = end;
+    }
+    at == stamp.size
+        && f.metadata()
+            .is_ok_and(|after| FileStamp::of(&after) == stamp)
+        && open_file(dir, leftover, usize::MAX).is_ok_and(|(_, now)| FileStamp::of(&now) == stamp)
 }
 
 /// Writes `bytes` to a new file `temp` in `dir` with `mode`, flushed.
@@ -382,6 +440,9 @@ type Swap = fn(&File, &OsStr, &OsStr) -> std::io::Result<()>;
 /// that cannot swap names then writes nothing (`swap_unsupported`), never
 /// renaming over a file it could not check. What it cannot see is a write
 /// to the old file, by a program that still has it open, after that read.
+/// Also with `left`, once the new file is whole and before the last
+/// check, the files earlier restores of `name` stopped while writing left
+/// beside it, holding only its first bytes, go ([`remove_leftovers`]).
 pub(crate) fn replace_in_with(
     dir: &File,
     rel: &Path,
@@ -420,6 +481,12 @@ fn replace_in_using(
     };
     let temp = temp_name(name, "new");
     let f = write_new_with(dir, &temp, expect.mode, fill).map_err(fail)?;
+    if left.is_some() {
+        // A restore, its contents now whole beside the file: what earlier
+        // restores of the file left of those contents goes, whatever this
+        // one comes to (`remove_leftovers`).
+        remove_leftovers(dir, name, &temp, &f);
+    }
     observe(Inside::Staged);
     // Another program may have written the file while this one wrote its
     // replacement: keep theirs.
