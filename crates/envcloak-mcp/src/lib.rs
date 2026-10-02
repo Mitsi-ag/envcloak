@@ -23,7 +23,9 @@
 //! waiting is dropped, and one running has its child stopped
 //! ([`child::Call::cancel`]). At the end of input every call in hand is
 //! stopped the same way, and the server waits for them, at most
-//! [`SHUTDOWN_WAIT`], before it returns.
+//! [`SHUTDOWN_WAIT`], before it returns. Answers waiting to be written are
+//! bounded ([`stdio::Outbox`]): a host that stops reading them while it
+//! goes on sending ends the session ([`Stalled`]).
 
 pub mod child;
 pub mod lifecycle;
@@ -56,7 +58,36 @@ pub const WORKERS: usize = 4;
 /// How many more may wait for one; a call beyond is answered `busy`.
 pub const QUEUE: usize = 32;
 /// How long the end of input waits for the calls in hand to stop.
-pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(6);
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
+/// How long the end waits for the answers queued to be written.
+pub const WRITER_WAIT: Duration = Duration::from_secs(5);
+
+/// Why [`Server::run`] ended the session: the host went on sending but
+/// stopped reading the answers, and the queue of answers filled
+/// ([`stdio::Outbox::stalled`]). The calls in hand were stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stalled;
+
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the host stopped reading the answers")
+    }
+}
+
+impl std::error::Error for Stalled {}
+
+/// Waits up to `limit` for every one of `threads` to finish. Whether all
+/// did.
+fn finished_within<T>(threads: &[std::thread::JoinHandle<T>], limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while !threads.iter().all(std::thread::JoinHandle::is_finished) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -213,7 +244,9 @@ impl Server {
     /// `stdout`; then stops every call in hand and returns.
     ///
     /// # Errors
-    /// When reading `stdin` fails.
+    /// When reading `stdin` fails; [`Stalled`] (inside an
+    /// [`io::ErrorKind::Other`] error) when the host stopped reading the
+    /// answers while it went on sending.
     pub fn run<R: Read, W: Write + Send + 'static>(
         self,
         stdin: R,
@@ -257,21 +290,23 @@ impl Server {
         self.inflight.stop_all(SHUTDOWN_WAIT);
         drop(jobs);
         // Each worker ends once its queue is closed and its call done. One
-        // still in a tool a second later is left to the process's exit,
-        // and so is the writer then, which it could still send to.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline && !workers.iter().all(|w| w.is_finished()) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let all_done = workers.iter().all(|w| w.is_finished());
+        // still in a tool a second later is left to the process's exit.
+        finished_within(&workers, Duration::from_secs(1));
         for w in workers {
             if w.is_finished() {
                 let _ = w.join();
             }
         }
+        // The writer ends once what was queued is written; a host that
+        // reads nothing more holds its write for ever, and it is left to
+        // the process's exit then.
+        let stalled = outbox.stalled();
         drop(outbox);
-        if all_done {
+        if finished_within(std::slice::from_ref(&writer), WRITER_WAIT) {
             let _ = writer.join();
+        }
+        if stalled {
+            return Err(io::Error::other(Stalled));
         }
         read
     }
@@ -379,11 +414,7 @@ impl Server {
             }
         };
         if self.router.route(&name).is_none() {
-            return Err(rpc::error(
-                Some(id),
-                rpc::INVALID_PARAMS,
-                "unknown tool: tools/list shows the tools",
-            ));
+            return Err(rpc::error(Some(id), rpc::INVALID_PARAMS, rpc::UNKNOWN_TOOL));
         }
         let Some(slot) = self.inflight.open(id) else {
             return Err(rpc::error(
@@ -427,16 +458,16 @@ fn worker(
             continue;
         }
         let call = &job.slot.call;
-        let result = match router.route(&job.name) {
-            Some(Target::Tool(t)) => t.call(&job.args, ctx, call),
-            Some(Target::Backend(b)) => b.call(&job.name, &job.args, ctx, call),
-            // Listed when queued, so still listed: the router does not change.
-            None => ToolResult::Err(envcloak_client::fail::Failure::new(
-                "method_not_found",
-                "unknown tool",
-            )),
+        let answer = match router.route(&job.name) {
+            Some(Target::Tool(t)) => rpc::result(&job.id, t.call(&job.args, ctx, call).to_json()),
+            Some(Target::Backend(b)) => {
+                rpc::result(&job.id, b.call(&job.name, &job.args, ctx, call).to_json())
+            }
+            // Not reached: a call is queued only for a listed tool, and the
+            // router does not change. Answered as `tools/call` answers a
+            // tool that is not listed, all the same.
+            None => rpc::error(Some(&job.id), rpc::INVALID_PARAMS, rpc::UNKNOWN_TOOL),
         };
-        let answer = rpc::result(&job.id, result.to_json());
         inflight.answer(&job.id, &job.slot, outbox, Some(answer));
     }
 }
