@@ -1668,137 +1668,172 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
 /// - `["idle", ms]`: until it has written nothing for `ms` milliseconds;
 /// - `["send", text]`: types `text`.
 ///
-/// It answers the queries a terminal answers. The program's exit code (or
-/// 128 plus its signal) is printed last as `EXIT <n>`; `TIMEOUT <step>`
-/// when a wait runs out, and `STILL RUNNING` when the program has not
-/// exited `limit` seconds after the last step (it is killed in both
-/// cases). The screen is never printed: it can hold what was pasted. On a
-/// timeout it is written to `screen`, for diagnosis. The program leads a
-/// session and a process group of its own, outside the driver's, so the
-/// harness's group kill does not reach it: the driver ends that group
-/// itself, whenever the program exits, is killed or outlives the driver's
-/// limit, and on a `SIGTERM` to the driver (the harness's limit). The
-/// group is killed while the program that leads it is still unreaped (its
-/// exit is seen with `waitid(WNOWAIT)`, or a kqueue exit note where Python
-/// has no `waitid`: macOS before 3.13), so its id cannot have been reused,
-/// and then the program is reaped (D-34); what the program left running
-/// in its group (a process that ignores the hangup when the terminal
-/// closes) goes with it.
+/// It answers the queries a terminal answers. Its last line is the
+/// outcome: `EXIT <n>`, the program's exit code (or 128 plus its signal);
+/// `TIMEOUT <step>` when a wait runs out; `STILL RUNNING` when the program
+/// has not exited `limit` seconds after the last step; `GONE <step>: `
+/// and one of those when the program's terminal had closed by the time a
+/// `send` step typed into it. The screen is never printed: it can hold
+/// what was pasted. On a timeout it is written to `screen`, for
+/// diagnosis, once the program has been ended; a write that fails is
+/// noted on standard error and changes nothing else.
+///
+/// The program leads a session and a process group of its own, outside
+/// the driver's, so the harness's group kill does not reach it: the
+/// driver ends that group itself, with one cleanup set up as soon as the
+/// program is forked and run on every way out of the driver (the outcomes
+/// above, a `SIGTERM` to the driver, which is the harness's limit, and any
+/// error, such as a write to a terminal the program has closed). It kills
+/// the group while the program that leads it is still unreaped, so the
+/// group's id cannot have been reused, and then reaps the program (D-34);
+/// what the program left running in its group (a process that ignores the
+/// hangup when the terminal closes) goes with it. The program's exit is
+/// seen without reaping it, with `waitid(WNOWAIT)`, or a kqueue exit note
+/// where Python has no `waitid` (macOS before 3.13). `SIGTERM` stays
+/// blocked in the driver and is read between waits (every 0.2 s at most),
+/// so it never interrupts the cleanup; the driver then exits 1. Only a
+/// `SIGKILL` to the driver itself skips the cleanup.
 const PTY_DRIVER: &str = r#"import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
+TERM = {signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
 spec = json.load(open(sys.argv[1]))
 pid, fd = pty.fork()
 if pid == 0:
-    os.chdir(spec["cwd"])
-    os.execve(spec["argv"][0], spec["argv"], dict(spec["env"]))
-# SIGTERM is blocked around every reap, so the handler only ever runs
-# while the child is unreaped.
-TERM = {signal.SIGTERM}
-def end_group():
-    # The child leads the group (pty.fork made it a session leader) and is
-    # unreaped: the group's id is still its.
     try:
-        os.killpg(pid, 9)
-    except OSError:
-        pass
-# Whether the child has exited, seen without reaping it: waitid(WNOWAIT),
-# or where Python lacks it (macOS before 3.13), a kqueue exit note.
-if hasattr(os, "waitid"):
-    def exited():
-        return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-else:
-    import errno
-    kq = select.kqueue()
-    gone = [False]
-    try:
-        kq.control([select.kevent(pid, select.KQ_FILTER_PROC,
-                                  select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                                  select.KQ_NOTE_EXIT)], 0, 0)
-    except OSError as e:
-        if e.errno != errno.ESRCH:
-            raise
-        gone[0] = True
-    def exited():
-        if not gone[0]:
-            gone[0] = bool(kq.control(None, 1, 0))
-        return gone[0]
-def stop(*_):
-    signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
-    end_group()
-    os.waitpid(pid, 0)
-    sys.exit(1)
-signal.signal(signal.SIGTERM, stop)
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-shown = b""
-def more(until):
-    global shown
-    r, _, _ = select.select([fd], [], [], max(0.0, until - time.time()))
-    if not r:
-        return True
-    try:
-        c = os.read(fd, 65536)
-    except OSError:
-        return False
-    if not c:
-        return False
-    shown += c
-    # Answer the queries a terminal answers: the version (XTVERSION), the
-    # keyboard protocol, the device attributes, the cursor position.
-    for q, a in ((b"\x1b[>0q", b"\x1bP>|xterm(388)\x1b\\"), (b"\x1b[?u", b"\x1b[?0u"),
-                 (b"\x1b[c", b"\x1b[?1;2c"), (b"\x1b[6n", b"\x1b[1;1R")):
-        for _ in range(c.count(q)):
-            os.write(fd, a)
-    return True
-def screen():
-    # What a person reads: escape sequences (cursor moves stand in for
-    # spaces) as spaces, runs of white space as one.
-    t = re.sub(rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]", b" ", shown)
-    t = re.sub(rb"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", b" ", t)
-    return re.sub(rb"\s+", b" ", t)
-alive = True
-for i, step in enumerate(spec["steps"]):
-    if step[0] == "send":
-        os.write(fd, step[1].encode())
-        continue
-    if step[0] == "idle":
-        # Until the program has written nothing for step[1] ms.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, TERM)
+        os.chdir(spec["cwd"])
+        os.execve(spec["argv"][0], spec["argv"], dict(spec["env"]))
+    finally:
+        os._exit(127)
+status = []
+def finish():
+    # The one cleanup, run once. The program leads its group (pty.fork made
+    # it a session leader) and is unreaped until here, so the group's id is
+    # still its own: the group is killed, then the program reaped. Its exit
+    # code, or 128 plus its signal.
+    if not status:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+        status.append(code if code >= 0 else 128 - code)
+    return status[0]
+class Ended(Exception):
+    pass
+def drive():
+    # Whether the program has exited, seen without reaping it.
+    if hasattr(os, "waitid"):
+        def exited():
+            return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    else:
+        import errno
+        kq = select.kqueue()
+        gone = [False]
+        try:
+            kq.control([select.kevent(pid, select.KQ_FILTER_PROC,
+                                      select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                      select.KQ_NOTE_EXIT)], 0, 0)
+        except OSError as e:
+            if e.errno != errno.ESRCH:
+                raise
+            gone[0] = True
+        def exited():
+            if not gone[0]:
+                gone[0] = bool(kq.control(None, 1, 0))
+            return gone[0]
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+    shown = [b""]
+    alive = [True]
+    def more(until):
+        # What the program writes until `until`, 0.2 s at most, so a
+        # SIGTERM is seen soon; once its terminal has closed, a pause.
+        if signal.SIGTERM in signal.sigpending():
+            raise Ended()
+        until = min(until, time.time() + 0.2)
+        if not alive[0]:
+            time.sleep(max(0.0, min(until, time.time() + 0.05) - time.time()))
+            return
+        r, _, _ = select.select([fd], [], [], max(0.0, until - time.time()))
+        if not r:
+            return
+        try:
+            c = os.read(fd, 65536)
+        except OSError:
+            c = b""
+        if not c:
+            alive[0] = False
+            return
+        shown[0] += c
+        # Answer the queries a terminal answers: the version (XTVERSION),
+        # the keyboard protocol, the device attributes, the cursor position.
+        for q, a in ((b"\x1b[>0q", b"\x1bP>|xterm(388)\x1b\\"), (b"\x1b[?u", b"\x1b[?0u"),
+                     (b"\x1b[c", b"\x1b[?1;2c"), (b"\x1b[6n", b"\x1b[1;1R")):
+            for _ in range(c.count(q)):
+                try:
+                    os.write(fd, a)
+                except OSError:
+                    alive[0] = False
+    def screen():
+        # What a person reads: escape sequences (cursor moves stand in for
+        # spaces) as spaces, runs of white space as one.
+        t = re.sub(rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]", b" ", shown[0])
+        t = re.sub(rb"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", b" ", t)
+        return re.sub(rb"\s+", b" ", t)
+    def ending():
+        # The program's exit within the limit, or it is still running (and
+        # then ended with its group).
         end = time.time() + spec["limit"]
-        while time.time() < end and alive:
-            before = len(shown)
-            quiet_until = time.time() + step[1] / 1000.0
-            while time.time() < quiet_until and len(shown) == before and alive:
-                alive = more(quiet_until)
-            if len(shown) == before:
-                break
-        continue
-    end = time.time() + spec["limit"]
-    seen = (lambda: shown.count(step[1].encode())) if step[0] == "wait_raw" else (lambda: screen().count(step[1].encode()))
-    while seen() < step[2]:
-        if time.time() > end or not alive:
-            if spec.get("screen"):
-                open(spec["screen"], "wb").write(screen())
-            print("TIMEOUT %d" % i)
-            signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
-            end_group()
-            os.waitpid(pid, 0)
-            sys.exit(0)
-        alive = more(min(end, time.time() + 0.5))
-end = time.time() + spec["limit"]
-while time.time() < end:
-    signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
-    # Seen without reaping: the group is ended first.
-    if exited():
-        end_group()
-        _, status = os.waitpid(pid, 0)
-        print("EXIT %d" % os.waitstatus_to_exitcode(status))
-        sys.exit(0)
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, TERM)
-    more(min(end, time.time() + 0.2))
-# Still running after the last step: killed with its group, its own
-# unreaped child.
-signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
-end_group()
-os.waitpid(pid, 0)
-print("STILL RUNNING")
+        while time.time() < end:
+            if exited():
+                return "EXIT %d" % finish()
+            more(end)
+        finish()
+        return "STILL RUNNING"
+    for i, step in enumerate(spec["steps"]):
+        if step[0] == "send":
+            try:
+                os.write(fd, step[1].encode())
+            except OSError:
+                # Its terminal has closed: the program is gone, or going.
+                return "GONE %d: %s" % (i, ending())
+            continue
+        if step[0] == "idle":
+            # Until the program has written nothing for step[1] ms.
+            end = time.time() + spec["limit"]
+            while time.time() < end and alive[0]:
+                before = len(shown[0])
+                quiet_until = time.time() + step[1] / 1000.0
+                while time.time() < quiet_until and len(shown[0]) == before and alive[0]:
+                    more(quiet_until)
+                if len(shown[0]) == before:
+                    break
+            continue
+        end = time.time() + spec["limit"]
+        text = step[1].encode()
+        seen = (lambda: shown[0].count(text)) if step[0] == "wait_raw" else (lambda: screen().count(text))
+        while seen() < step[2]:
+            if time.time() > end or not alive[0]:
+                finish()
+                if spec.get("screen"):
+                    try:
+                        with open(spec["screen"], "wb") as f:
+                            f.write(screen())
+                    except OSError as e:
+                        print("the screen was not written: %s" % e.strerror, file=sys.stderr)
+                return "TIMEOUT %d" % i
+            more(end)
+    return ending()
+line = None
+try:
+    line = drive()
+except Ended:
+    pass
+finally:
+    finish()
+if line is None:
+    sys.exit(1)
+print(line)
 "#;
 
 /// Claude Code 2.1.280 draws the trust dialog before it takes keys, and
@@ -1864,14 +1899,23 @@ fn interactive_claude(
         .to_owned()
 }
 
-/// The pseudo-terminal driver ends what its program leaves behind (Codex
-/// review, medium: the program leads a session of its own, the harness's
-/// group kill does not reach it, and the driver reaped it at once and
-/// never killed its group). The program starts a process that ignores the
-/// hangup and holds a FIFO's write end open, then exits; once the driver
-/// has returned, the FIFO reads to its end: nothing holds it any more.
-#[test]
-fn the_pty_driver_ends_what_its_program_leaves_running() {
+/// What the pseudo-terminal driver returned for a program, once nothing
+/// the program started is left: the program is `/bin/sh` running
+/// `body`, with descriptor 3 open on a FIFO the test reads, which reads to
+/// its end only when every process holding it has gone. Each body leaves
+/// a process that ignores the hangup the closing terminal sends and holds
+/// the FIFO for 90 s. `None` when the harness had to stop the driver at
+/// `harness_limit` (a SIGTERM to its group, then SIGKILL 2 s later).
+///
+/// # Panics
+/// When something still holds the FIFO 10 s after the driver returned.
+fn pty_driver_leaves_nothing(
+    body: &str,
+    steps: serde_json::Value,
+    limit: u64,
+    screen: Option<&str>,
+    harness_limit: std::time::Duration,
+) -> Option<std::process::Output> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let home = envcloak_testkit::TestHome::new();
@@ -1888,22 +1932,25 @@ fn the_pty_driver_ends_what_its_program_leaves_running() {
         .custom_flags(libc::O_NONBLOCK)
         .open(&fifo)
         .unwrap();
-    let program = home.root().join("leaves-one.sh");
+    let program = home.root().join("program.sh");
     std::fs::write(
         &program,
         format!(
-            "exec 3>{}\nprintf x >&3\n(trap '' HUP; exec sleep 600) &\nexit 0\n",
+            "exec 3>{}\nprintf x >&3\n{body}",
             envcloak_e2e::quoted(fifo.to_str().unwrap())
         ),
     )
     .unwrap();
-    let spec = json!({
+    let mut spec = json!({
         "argv": ["/bin/sh", program.to_str().unwrap()],
         "env": [["PATH", "/usr/bin:/bin"]],
         "cwd": home.root().to_str().unwrap(),
-        "limit": 30,
-        "steps": [],
+        "limit": limit,
+        "steps": steps,
     });
+    if let Some(name) = screen {
+        spec["screen"] = json!(home.root().join(name).to_str().unwrap());
+    }
     let spec_path = home.root().join("pty-spec.json");
     std::fs::write(&spec_path, spec.to_string()).unwrap();
     let mut cmd = std::process::Command::new(envcloak_e2e::python3());
@@ -1913,13 +1960,10 @@ fn the_pty_driver_ends_what_its_program_leaves_running() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let out = envcloak_testkit::agents::finish_within(cmd, std::time::Duration::from_secs(60));
-    let last = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .last()
-        .unwrap_or("")
-        .to_owned();
-    assert_eq!(last, "EXIT 0");
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        envcloak_testkit::agents::finish_within(cmd, harness_limit)
+    }))
+    .ok();
     let mut got = Vec::new();
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut chunk = [0u8; 16];
@@ -1930,7 +1974,10 @@ fn the_pty_driver_ends_what_its_program_leaves_running() {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
                     std::time::Instant::now() < end,
-                    "a process the program left running still holds the FIFO"
+                    "a process the program started still holds the FIFO after the driver \
+                     returned ({:?})",
+                    out.as_ref()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 );
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -1938,6 +1985,115 @@ fn the_pty_driver_ends_what_its_program_leaves_running() {
         }
     }
     assert_eq!(got, b"x", "the program never started what it leaves behind");
+    out
+}
+
+/// The driver's last line.
+fn last_line(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// A program that keeps running, with a process it started that ignores
+/// the hangup; `ready` once it has started it.
+const RUNS_ON: &str = "(trap '' HUP; exec sleep 90) &\nprintf 'ready\\n'\nexec sleep 90\n";
+
+/// The pseudo-terminal driver ends what its program leaves behind (Codex
+/// review, medium: the program leads a session of its own, the harness's
+/// group kill does not reach it, and the driver reaped it at once and
+/// never killed its group). The program starts a process that ignores the
+/// hangup, then exits.
+#[test]
+fn the_pty_driver_ends_what_its_program_leaves_running() {
+    let out = pty_driver_leaves_nothing(
+        "(trap '' HUP; exec sleep 90) &\nexit 0\n",
+        json!([]),
+        30,
+        None,
+        std::time::Duration::from_secs(60),
+    )
+    .expect("the driver did not finish");
+    assert_eq!(last_line(&out), "EXIT 0");
+}
+
+/// A wait that runs out ends the program and what it started first, and
+/// only then writes the screen for diagnosis: a write that fails (its
+/// directory is missing) changes nothing else (review F-87: the write came
+/// before the cleanup, and its error skipped it).
+#[test]
+fn the_pty_driver_ends_the_program_before_a_diagnostic_write_that_fails() {
+    let out = pty_driver_leaves_nothing(
+        RUNS_ON,
+        json!([["wait", "ready", 1], ["wait", "never shown", 1]]),
+        2,
+        Some("missing/screen.txt"),
+        std::time::Duration::from_secs(60),
+    )
+    .expect("the driver did not finish");
+    assert_eq!(last_line(&out), "TIMEOUT 1");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("the screen was not written"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Keys typed after the program has exited (as when a host quits at its
+/// trust dialog) go to a terminal that is closed, which the write reports
+/// (`EIO`): the driver says so, with the program's exit, and ends what the
+/// program left running (review F-87: the error ended the driver with a
+/// traceback before any cleanup). The process left behind holds no
+/// terminal, so the terminal closes when the program exits.
+#[test]
+fn the_pty_driver_ends_what_is_left_when_a_key_is_sent_after_the_program_exited() {
+    let out = pty_driver_leaves_nothing(
+        "(trap '' HUP; exec sleep 90 <&- >&- 2>&-) &\nprintf 'bye\\n'\nexit 0\n",
+        json!([["wait", "bye", 1], ["idle", 2000], ["send", "y\r"]]),
+        30,
+        None,
+        std::time::Duration::from_secs(60),
+    )
+    .expect("the driver did not finish");
+    assert_eq!(last_line(&out), "GONE 2: EXIT 0");
+}
+
+/// Any error in the driver (here a malformed step) still ends the
+/// program's group and reaps the program before the driver exits (review
+/// F-87: no cleanup surrounded the driver as a whole).
+#[test]
+fn the_pty_driver_ends_the_program_on_an_error_of_its_own() {
+    let out = pty_driver_leaves_nothing(
+        RUNS_ON,
+        json!([["wait", "ready", 1], ["wait"]]),
+        30,
+        None,
+        std::time::Duration::from_secs(60),
+    )
+    .expect("the driver did not finish");
+    assert_eq!(out.status.code(), Some(1));
+    let last = last_line(&out);
+    assert!(
+        !last.starts_with("EXIT") && !last.starts_with("TIMEOUT"),
+        "{last}"
+    );
+}
+
+/// The harness's limit (a SIGTERM to the driver's group) ends the program
+/// and what it started too, before the harness's SIGKILL 2 s later.
+#[test]
+fn the_pty_driver_ends_the_program_on_the_harness_s_limit() {
+    let out = pty_driver_leaves_nothing(
+        RUNS_ON,
+        json!([["wait", "ready", 1], ["wait", "never shown", 1]]),
+        60,
+        None,
+        std::time::Duration::from_secs(3),
+    );
+    assert!(out.is_none(), "the driver finished before its limit");
 }
 
 /// One interactive Claude Code session through a pseudo-terminal (D-13,
