@@ -64,7 +64,7 @@ use envcloak_core::file_backup::FileBackupId;
 use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
     FileBackupV2Reader, FileBackupV2Writer, FileBackupsV2, ListedV2, MAX_CHAIN_V2, MAX_LABEL_V2,
-    PlannedFile, check_plan, chunks_of, list_file_backups_v2, purge_file_backups_v2,
+    PlannedFile, check_plan, chunks_of, list_file_backups_v2, purge_file_backups_v2_except,
 };
 use envcloak_core::vault::{VaultError, VaultErrorKind};
 use envcloak_ipc::proto::{
@@ -749,23 +749,6 @@ pub fn begin(
         chain: chain_of(&caller),
     };
     let now = wall_secs(shared);
-    // Backups over 7 days old go, at most every [`PURGE_EVERY`] and
-    // outside the state lock: a purge reads every backup's header.
-    let purge = {
-        let mut s = locked(&shared.state);
-        s.unlocked()?;
-        let due = s.backups().purge_due(shared.clocks.awake());
-        due.then(|| s.paths().clone())
-    };
-    if let Some(paths) = purge {
-        envcloak_sys::pause_point("backup.v2.purge");
-        if let Err(e) = purge_file_backups_v2(&paths, now) {
-            log_line!(
-                "envcloakd: old file backups v2 could not be removed ({})",
-                vault_reason(e.kind())
-            );
-        }
-    }
     let mut s = locked(&shared.state);
     s.unlocked()?;
     s.backups().sweep(shared.clocks.awake());
@@ -794,6 +777,35 @@ pub fn begin(
         last_used: shared.clocks.awake(),
     };
     s.backups().uploads.insert(id, upload);
+    // Backups over 7 days old go, at most every [`PURGE_EVERY`] and
+    // outside the state lock: a purge reads every backup's header.
+    let purge = s
+        .backups()
+        .purge_due(shared.clocks.awake())
+        .then(|| s.paths().clone());
+    drop(s);
+    if let Some(paths) = purge {
+        envcloak_sys::pause_point("backup.v2.purge");
+        // A staging directory goes only once its backup is no longer in
+        // progress, asked under the state lock, under which a backup's
+        // directory is made and its upload registered at once: this one
+        // and any other client's stay, however long they have run.
+        let in_progress =
+            |b: &FileBackupId| locked(&shared.state).backups().uploads.contains_key(b);
+        if let Err(e) = purge_file_backups_v2_except(&paths, now, in_progress) {
+            log_line!(
+                "envcloakd: old file backups v2 could not be removed ({})",
+                vault_reason(e.kind())
+            );
+        }
+        // A lock while the purge ran ended this backup: the answer says
+        // so, never that it began.
+        let mut s = locked(&shared.state);
+        s.unlocked()?;
+        if !s.backups().uploads.contains_key(&id) {
+            return Err(RpcError::new(ErrorKind::NoSuchBackup));
+        }
+    }
     Ok(BackupBegunView {
         id: id.to_string(),
         chunk_size: u32::try_from(CHUNK_V2).unwrap_or(u32::MAX),

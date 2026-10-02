@@ -52,7 +52,9 @@
 //! the staging file holds only the header and sealed records.
 //! [`purge_file_backups_v2`] removes backups older than
 //! [`FILE_BACKUP_RETENTION`] (7 days) by the time in their header, and
-//! staging directories interrupted backups left.
+//! staging directories interrupted backups left;
+//! [`purge_file_backups_v2_except`] keeps those of backups still being
+//! written, however old.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
@@ -1589,11 +1591,39 @@ pub fn list_file_backups_v2(p: &VaultPaths) -> Result<Vec<ListedV2>, VaultError>
     Ok(out)
 }
 
+/// The id a staging directory is named for: `.files2-<time>-<id>.tmp`.
+/// `None` for any other name.
+fn staging_id(name: &str) -> Option<FileBackupId> {
+    name.strip_prefix('.')
+        .and_then(|n| n.strip_suffix(STAGING_SUFFIX))
+        .and_then(|n| listed_id(std::ffi::OsStr::new(n)))
+}
+
+/// Whether `name` is a staging directory's: `.files2-<...>.tmp`.
+fn staging_name(name: &str) -> bool {
+    name.strip_prefix('.')
+        .is_some_and(|n| n.starts_with(PREFIX) && n.ends_with(STAGING_SUFFIX))
+}
+
+/// Whether removing a directory failed because something is left in it.
+fn not_empty(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || e.raw_os_error()
+            .is_some_and(|c| c == libc::ENOTEMPTY || c == libc::EEXIST)
+}
+
 /// Removes a backup's directory: its `data` and result files, the
 /// temporary names a result left when its writer stopped, then the
 /// directory. Anything else in it stays, and so does the directory.
+/// Returns whether the directory went: `false` when it was gone already
+/// or something else is left in it.
 fn remove_backup_dir(dir: &Path) -> Result<bool, VaultError> {
-    for entry in std::fs::read_dir(dir)? {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let ours = entry.file_name().to_str().is_some_and(|n| {
             n == DATA
@@ -1611,8 +1641,27 @@ fn remove_backup_dir(dir: &Path) -> Result<bool, VaultError> {
     }
     match std::fs::remove_dir(dir) {
         Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || not_empty(&e) => Ok(false),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// What a purge removed, and the first thing it could not.
+#[derive(Default)]
+struct Purged {
+    removed: usize,
+    failed: Option<VaultError>,
+}
+
+impl Purged {
+    fn count(&mut self, r: Result<bool, VaultError>) {
+        match r {
+            Ok(true) => self.removed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                self.failed.get_or_insert(e);
+            }
+        }
     }
 }
 
@@ -1620,43 +1669,83 @@ fn remove_backup_dir(dir: &Path) -> Result<bool, VaultError> {
 /// before `now` (Unix seconds), and the staging directories interrupted
 /// backups left, unchanged for [`STAGING_GRACE`]. Returns how many
 /// directories it removed. Needs no key: the time is in the header.
+/// [`purge_file_backups_v2_except`] with no backup in progress.
 ///
 /// # Errors
-/// When the directory cannot be read, or a backup cannot be removed.
+/// As [`purge_file_backups_v2_except`].
 pub fn purge_file_backups_v2(p: &VaultPaths, now: u64) -> Result<usize, VaultError> {
-    let mut removed = 0;
+    purge_file_backups_v2_except(p, now, |_| false)
+}
+
+/// [`purge_file_backups_v2`], keeping the staging directory of every
+/// backup `in_progress` says is still being written, however long it has
+/// been unchanged: a backup's chunks go to its `data` file, which leaves
+/// the directory's time as it was, and a writer may buffer them. A
+/// directory is asked about once it is due, just before it would go, so
+/// a caller whose backups in progress are made and registered under one
+/// lock, which `in_progress` takes, never loses one: a directory seen
+/// before its backup was registered is asked about after.
+///
+/// One backup it cannot remove does not stop it: a directory something
+/// else is left in stays, deliberately (counted as not removed), and
+/// after any other failure the others are still removed. The removals are
+/// flushed to disk before it returns, also when it then reports a failure.
+///
+/// # Errors
+/// When the directory cannot be read or flushed, or the first backup or
+/// staging directory that could not be removed, after the rest went.
+pub fn purge_file_backups_v2_except(
+    p: &VaultPaths,
+    now: u64,
+    mut in_progress: impl FnMut(&FileBackupId) -> bool,
+) -> Result<usize, VaultError> {
+    let mut purged = Purged::default();
     for b in list_file_backups_v2(p)? {
-        if now.saturating_sub(b.created_at) > FILE_BACKUP_RETENTION.as_secs()
-            && remove_backup_dir(&b.dir)?
-        {
-            removed += 1;
+        if now.saturating_sub(b.created_at) > FILE_BACKUP_RETENTION.as_secs() {
+            purged.count(remove_backup_dir(&b.dir));
         }
     }
     let dir = match std::fs::canonicalize(&p.backups_dir) {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return purged.failed.map_or(Ok(purged.removed), Err);
+        }
         Err(e) => return Err(e.into()),
     };
     for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let staging = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with(&format!(".{PREFIX}")) && n.ends_with(STAGING_SUFFIX));
-        if !staging || !entry.file_type()?.is_dir() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                purged.count(Err(e.into()));
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|n| staging_name(n)) else {
             continue;
+        };
+        // `DirEntry` reads the entry itself: a symlink is not followed.
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                purged.count(Err(e.into()));
+                continue;
+            }
         }
         let modified = entry.metadata().map_or(0, |m| modified_secs(&m));
-        if now.saturating_sub(modified) > STAGING_GRACE.as_secs()
-            && remove_backup_dir(&entry.path())?
+        if now.saturating_sub(modified) <= STAGING_GRACE.as_secs()
+            || staging_id(name).is_some_and(|id| in_progress(&id))
         {
-            removed += 1;
+            continue;
         }
+        purged.count(remove_backup_dir(&entry.path()));
     }
-    if removed > 0 {
+    if purged.removed > 0 {
         sync_dir(&dir)?;
     }
-    Ok(removed)
+    purged.failed.map_or(Ok(purged.removed), Err)
 }
 
 /// Rewrites the creation time in a backup's header. Test support only
