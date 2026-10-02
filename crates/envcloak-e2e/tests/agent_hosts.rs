@@ -781,8 +781,24 @@ fn claude_code_mcp_server_and_tool_cutoff() {
                     ms as f64 / 1000.0
                 ),
             );
-            if timeout.is_some() && call_ms < 60_000 {
-                assert!(answered, "a per-server timeout of 60 s cut off a 30 s call");
+            // What docs/AGENTS.md records, asserted (review: a
+            // measurement only printed cannot fail): with no per-server
+            // timeout both calls are answered, each after its own length;
+            // with one of 60 s the 30 s call is answered and the 70 s call
+            // cut off after 60 s, give or take the host's own turn.
+            match (timeout, answered) {
+                (Some(t), false) if call_ms > t => assert!(
+                    (t.saturating_sub(500)..t + 6_000).contains(&ms),
+                    "the {call_ms} ms call was cut off after {ms} ms, not at the {t} ms timeout"
+                ),
+                (_, true) if timeout.is_none_or(|t| call_ms < t) => assert!(
+                    ms + 500 >= call_ms,
+                    "the {call_ms} ms call was answered after {ms} ms"
+                ),
+                _ => panic!(
+                    "the {call_ms} ms call under {setting} was {} after {ms} ms",
+                    if answered { "answered" } else { "cut off" }
+                ),
             }
         }
     }
@@ -872,9 +888,14 @@ fn codex_mcp_server_approval_modes_and_tool_cutoff() {
             measure(&a, "MCP server ancestry", ancestry);
         }
     }
-    assert!(
-        ran_with.contains(&Some("approve")),
-        "no approval mode let the call run"
+    // Under `exec` with approval policy `never`, only `approve` lets the
+    // call run: unset, `auto` and `prompt` are refused (review: a
+    // test that only required `approve` to run passed whatever the others
+    // did).
+    assert_eq!(
+        ran_with,
+        [Some("approve")],
+        "the approval modes that let the call run"
     );
     // The cutoff: a 15 s call under tool_timeout_sec = 5.
     a.codex_config(&config(Some("approve"), 5));
@@ -885,14 +906,26 @@ fn codex_mcp_server_approval_modes_and_tool_cutoff() {
     let run = a.run(&wait, "Wait.", &flags(Host::Codex), &a.home_dir());
     assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
     let answered = after_call(&run, "step 1").contains("waited 15000");
+    let ms = waited(&run, "step 0", "step 1");
     measure(
         &a,
         "MCP tool call of 15 s, tool_timeout_sec = 5",
         format!(
             "{} after {:.1} s",
             if answered { "answered" } else { "cut off" },
-            waited(&run, "step 0", "step 1") as f64 / 1000.0
+            ms as f64 / 1000.0
         ),
+    );
+    // The setting is the cutoff: cut off after 5 s, give or take the
+    // host's own turn, never answered after 15 s (review: printed
+    // only, it could not fail).
+    assert!(
+        !answered,
+        "a 15 s call was answered under tool_timeout_sec = 5"
+    );
+    assert!(
+        (4_500..10_000).contains(&ms),
+        "the 15 s call was cut off after {ms} ms, not at tool_timeout_sec = 5"
     );
 }
 
