@@ -20,8 +20,10 @@
 //! Calls run on [`WORKERS`] threads, with at most [`QUEUE`] more waiting;
 //! a call beyond that is answered `busy` at once. A call the host cancels
 //! (`notifications/cancelled`) is answered nothing further: one still
-//! waiting is dropped, and one running has its child stopped
-//! ([`child::Call::cancel`]). At the end of input every call in hand is
+//! waiting is dropped, one running has its child stopped
+//! ([`child::Call::cancel`]), and an answer still waiting to be written
+//! (behind writes a slow host has not read) is withdrawn; only one the
+//! writer has begun to write goes out. At the end of input every call in hand is
 //! stopped the same way, and the server waits for them, at most
 //! [`SHUTDOWN_WAIT`], before it returns. Answers waiting to be written are
 //! bounded ([`stdio::Outbox`]): a host that stops reading them while it
@@ -96,20 +98,34 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One call in hand.
+/// One call in hand: from its arrival until its answer is written, or
+/// until it is known that none will be.
 #[derive(Debug, Default)]
 struct Slot {
     call: Call,
-    /// Set when its answer was sent or it was cancelled: from then on
-    /// nothing more is sent for it.
-    settled: Mutex<bool>,
+    answer: Mutex<Answer>,
+}
+
+/// Where a call's answer is.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    /// The call runs, or waits for a worker.
+    #[default]
+    Pending,
+    /// Its answer waits for the writer: a cancellation still withdraws it.
+    Queued,
+    /// Its answer is being written, or none will be: nothing more is sent
+    /// for it, and a cancellation changes nothing.
+    Settled,
 }
 
 /// The calls in hand, by id.
 #[derive(Debug, Default)]
 struct InFlight {
     calls: Mutex<HashMap<Id, Arc<Slot>>>,
-    emptied: Condvar,
+    /// Told when a call's answer leaves [`Answer::Pending`], and when a
+    /// call leaves.
+    changed: Condvar,
     stopping: AtomicBool,
 }
 
@@ -125,55 +141,107 @@ impl InFlight {
         Some(slot)
     }
 
-    fn close(&self, id: &Id) {
+    /// Closes the call `id`, when `slot` is still its slot.
+    fn close(&self, id: &Id, slot: &Arc<Slot>) {
         let mut calls = lock(&self.calls);
-        calls.remove(id);
-        if calls.is_empty() {
-            self.emptied.notify_all();
+        if calls.get(id).is_some_and(|s| Arc::ptr_eq(s, slot)) {
+            calls.remove(id);
         }
+        self.changed.notify_all();
     }
 
-    /// Cancels the call `id`, if it is in hand and not answered.
+    /// Cancels the call `id`, if it is in hand: a running call is
+    /// stopped, and an answer still waiting for the writer is withdrawn.
+    /// One whose answer is being written goes on.
     fn cancel(&self, id: &Id) {
         let slot = lock(&self.calls).get(id).cloned();
         if let Some(slot) = slot {
-            let settled = lock(&slot.settled);
-            if !*settled {
+            let answer = lock(&slot.answer);
+            if *answer != Answer::Settled {
                 slot.call.cancel();
             }
         }
     }
 
-    /// Sends `answer` for `id` unless the call was cancelled (or, with
-    /// `None`, sends nothing), and closes it.
-    fn answer(&self, id: &Id, slot: &Slot, outbox: &Outbox, answer: Option<Vec<u8>>) {
-        {
-            let mut settled = lock(&slot.settled);
-            if let Some(answer) = answer {
-                if !*settled && !slot.call.cancelled() {
-                    outbox.send(answer);
+    /// Queues `answer` for `id` unless the call was cancelled (or, with
+    /// `None`, sends nothing). The call stays in hand while the answer
+    /// waits, so a cancellation can still withdraw it; it is closed once
+    /// the writer is done with it.
+    fn answer(
+        self: &Arc<Self>,
+        id: &Id,
+        slot: &Arc<Slot>,
+        outbox: &Outbox,
+        answer: Option<Vec<u8>>,
+    ) {
+        let queued = {
+            let mut state = lock(&slot.answer);
+            match answer {
+                Some(a) if !slot.call.cancelled() => {
+                    *state = Answer::Queued;
+                    Some(a)
+                }
+                _ => {
+                    *state = Answer::Settled;
+                    None
                 }
             }
-            *settled = true;
+        };
+        match queued {
+            Some(a) => {
+                let delivery = Delivery {
+                    inflight: Arc::clone(self),
+                    id: id.clone(),
+                    slot: Arc::clone(slot),
+                };
+                outbox.send_withdrawable(a, Arc::new(delivery));
+                let _calls = lock(&self.calls);
+                self.changed.notify_all();
+            }
+            None => self.close(id, slot),
         }
-        self.close(id);
     }
 
-    /// Cancels every call in hand, and waits up to `limit` for all to end.
+    /// Cancels every call still running or waiting for a worker, and waits
+    /// up to `limit` for all of them to end. Answers already waiting for
+    /// the writer are left to it.
     fn stop_all(&self, limit: Duration) {
         self.stopping.store(true, Ordering::SeqCst);
         let slots: Vec<Arc<Slot>> = lock(&self.calls).values().cloned().collect();
         for slot in slots {
-            let settled = lock(&slot.settled);
-            if !*settled {
+            let answer = lock(&slot.answer);
+            if *answer == Answer::Pending {
                 slot.call.cancel();
             }
         }
         let calls = lock(&self.calls);
         let _ = self
-            .emptied
-            .wait_timeout_while(calls, limit, |c| !c.is_empty())
+            .changed
+            .wait_timeout_while(calls, limit, |c| {
+                c.values().any(|s| *lock(&s.answer) == Answer::Pending)
+            })
             .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// A call's answer on its way to the writer ([`stdio::Ticket`]): written
+/// only if the call was not cancelled meanwhile, and the call closed once
+/// the writer is done with it.
+struct Delivery {
+    inflight: Arc<InFlight>,
+    id: Id,
+    slot: Arc<Slot>,
+}
+
+impl stdio::Ticket for Delivery {
+    fn take(&self) -> bool {
+        let mut answer = lock(&self.slot.answer);
+        *answer = Answer::Settled;
+        !self.slot.call.cancelled()
+    }
+
+    fn done(&self) {
+        self.inflight.close(&self.id, &self.slot);
     }
 }
 
@@ -464,7 +532,7 @@ impl Server {
         match jobs.try_send(job) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
-                self.inflight.close(&job.id);
+                self.inflight.close(&job.id, &job.slot);
                 Err(rpc::error(
                     Some(id),
                     rpc::BUSY,
@@ -478,7 +546,7 @@ impl Server {
 fn worker(
     queue: &Mutex<mpsc::Receiver<Job>>,
     router: &Router,
-    inflight: &InFlight,
+    inflight: &Arc<InFlight>,
     outbox: &Outbox,
     ctx: &Ctx,
 ) {
@@ -501,5 +569,127 @@ fn worker(
             None => rpc::error(Some(&job.id), rpc::INVALID_PARAMS, rpc::UNKNOWN_TOOL),
         };
         inflight.answer(&job.id, &job.slot, outbox, Some(answer));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer that holds its first write until told to, says when that
+    /// write began, and keeps everything it is given.
+    struct Held {
+        entered: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+        first: bool,
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for Held {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            if std::mem::take(&mut self.first) {
+                let _ = self.entered.send(());
+                if self.go.recv_timeout(Duration::from_secs(30)).is_err() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+            }
+            lock(&self.out).extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer held on a first message: its outbox, its thread, the
+    /// sender that releases it, and what it writes.
+    struct HeldWriter {
+        outbox: Outbox,
+        thread: std::thread::JoinHandle<()>,
+        go: mpsc::Sender<()>,
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl HeldWriter {
+        fn new() -> HeldWriter {
+            let (entered_tx, entered) = mpsc::channel();
+            let (go, go_rx) = mpsc::channel();
+            let out = Arc::new(Mutex::new(Vec::new()));
+            let (outbox, thread) = stdio::spawn_writer(
+                Held {
+                    entered: entered_tx,
+                    go: go_rx,
+                    first: true,
+                    out: Arc::clone(&out),
+                },
+                || {},
+            );
+            assert!(outbox.send(b"first\n".to_vec()));
+            entered
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the writer took the first message");
+            HeldWriter {
+                outbox,
+                thread,
+                go,
+                out,
+            }
+        }
+
+        /// Releases the writer, joins it, and returns what it wrote.
+        fn finish(self) -> Vec<u8> {
+            self.go.send(()).unwrap();
+            drop(self.outbox);
+            self.thread.join().unwrap();
+            lock(&self.out).clone()
+        }
+    }
+
+    /// A call's answer waiting behind a write the host does not read is
+    /// withdrawn by the call's cancellation: it is never written, and the
+    /// call leaves once the writer is done with it. The call stays in hand
+    /// while its answer waits, so its id is not taken twice meanwhile. An
+    /// answer not cancelled is written, and its call then leaves. (Codex
+    /// review of M2-06, medium: the call was closed as soon as its answer
+    /// was queued, and a cancellation could no longer reach it.)
+    ///
+    /// Mutation checked: the writer not asking a message's ticket (every
+    /// queued answer written): the cancelled answer is written and this
+    /// fails.
+    #[test]
+    fn a_cancellation_withdraws_an_answer_waiting_to_be_written() {
+        let w = HeldWriter::new();
+        let inflight = Arc::new(InFlight::default());
+        let (cancelled, kept) = (Id::Unsigned(7), Id::Unsigned(8));
+        for id in [&cancelled, &kept] {
+            let slot = inflight.open(id).unwrap();
+            let answer = format!("answer-{id:?}\n").into_bytes();
+            inflight.answer(id, &slot, &w.outbox, Some(answer));
+            assert!(
+                inflight.open(id).is_none(),
+                "{id:?} left while its answer waits"
+            );
+        }
+        inflight.cancel(&cancelled);
+        let written = String::from_utf8(w.finish()).unwrap();
+        assert_eq!(written, format!("first\nanswer-{kept:?}\n"));
+        assert!(lock(&inflight.calls).is_empty(), "a call is still in hand");
+    }
+
+    /// The end of the session stops what runs and leaves the answers
+    /// waiting to be written to the writer: it does not wait for them.
+    #[test]
+    fn stopping_all_leaves_queued_answers_to_the_writer() {
+        let w = HeldWriter::new();
+        let inflight = Arc::new(InFlight::default());
+        let id = Id::Unsigned(9);
+        let slot = inflight.open(&id).unwrap();
+        inflight.answer(&id, &slot, &w.outbox, Some(b"answer\n".to_vec()));
+        let start = Instant::now();
+        inflight.stop_all(Duration::from_secs(20));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(!slot.call.cancelled());
+        assert_eq!(w.finish(), b"first\nanswer\n");
+        assert!(lock(&inflight.calls).is_empty());
     }
 }
