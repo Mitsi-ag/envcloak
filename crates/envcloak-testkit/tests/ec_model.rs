@@ -1,13 +1,19 @@
 //! `ec-model` (M2 plan task M2-04): the command it wraps runs in an
 //! isolated home with a cleared environment, so no credential or
 //! configuration of whoever runs it reaches the command (Codex review,
-//! high); and its diagnostics name no request target a host controls
-//! (Codex review, medium: a request to `/<value>` put the value on
-//! standard error).
+//! high); its diagnostics name no request target a host controls (Codex
+//! review, medium: a request to `/<value>` put the value on standard
+//! error, then a destination of letters only did); its record is a new
+//! file of mode 0600 (Codex review and verifier: an existing file kept its
+//! mode, a link was followed); and the command is bounded, its group
+//! stopped before its home goes (Codex review, medium).
 #![allow(clippy::unwrap_used)]
 
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use envcloak_testkit::{
     Canary, TestHome, by_label, canaries, find, fresh_seed, labels, testkit_bin,
@@ -17,7 +23,22 @@ use envcloak_testkit::{
 /// under `/bin/sh -c`, with `parent` as the variables of its own
 /// environment (nothing else of this process's).
 fn ec_model(record: &Path, parent: &[(&str, &str)], command: &str) -> Output {
-    let script = record.with_extension("script.json");
+    run_ec_model(record, &[], parent, command, Duration::from_secs(120))
+}
+
+/// The same with `extra` options, given `outer` to end. `ec-model` runs
+/// as a plain child here, not as the leader of a group this test kills
+/// when it exits (`finish_within`): that kill would also stop whatever
+/// `ec-model` left running and hide it. Past `outer` it is killed itself
+/// and the test fails.
+fn run_ec_model(
+    record: &Path,
+    extra: &[&str],
+    parent: &[(&str, &str)],
+    command: &str,
+    outer: Duration,
+) -> Output {
+    let script = PathBuf::from(format!("{}.script.json", record.display()));
     std::fs::write(&script, r#"{"steps": [{"say": "done"}]}"#).unwrap();
     let mut cmd = Command::new(testkit_bin("ec-model"));
     cmd.env_clear()
@@ -26,11 +47,50 @@ fn ec_model(record: &Path, parent: &[(&str, &str)], command: &str) -> Output {
         .arg(&script)
         .arg("--record")
         .arg(record)
+        .args(extra)
         .args(["--", "/bin/sh", "-c", command])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    envcloak_testkit::agents::finish_within(cmd, std::time::Duration::from_secs(120))
+    let mut child = cmd.spawn().unwrap();
+    let read = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = read(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = read(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let end = Instant::now() + outer;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ec-model did not end within {outer:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
 }
 
 /// A command that prints `c` on a line of its own, named in two pieces,
@@ -281,7 +341,6 @@ fn diagnostics_name_no_request_target_a_host_controls() {
             c.label
         );
     }
-    use std::os::unix::fs::PermissionsExt as _;
     assert_eq!(
         std::fs::metadata(&record).unwrap().permissions().mode() & 0o777,
         0o600
@@ -302,4 +361,174 @@ fn diagnostics_name_no_request_target_a_host_controls() {
     );
     // Not clean: the paths are not served. The run says so.
     assert_eq!(out.status.code(), Some(3), "{stderr}");
+}
+
+/// The record is a new file, made with mode 0600 before the command
+/// starts. A path that is already there is refused before anything runs
+/// and left as it was: a file of another mode (whose mode `open` would
+/// have kept), a link to another file (which it would have followed and
+/// truncated), and a link to nothing (which it would have made).
+#[test]
+fn the_record_is_a_new_file_of_mode_0600_and_never_one_already_there() {
+    let files = TestHome::new();
+    let dir = files.root();
+    let ran = dir.join("ran");
+    let command = format!("touch '{}'", ran.display());
+    let parent = [("PATH", "/usr/bin:/bin")];
+    // An existing file, 0644.
+    let existing = dir.join("existing.json");
+    std::fs::write(&existing, "before").unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // A link to another file, and a link to nothing.
+    let target = dir.join("target");
+    std::fs::write(&target, "target").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let link = dir.join("link.json");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let dangling = dir.join("dangling.json");
+    let nowhere = dir.join("nowhere");
+    std::os::unix::fs::symlink(&nowhere, &dangling).unwrap();
+    for path in [&existing, &link, &dangling] {
+        let out = ec_model(path, &parent, &command);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{}: {stderr}", path.display());
+        assert!(stderr.contains("must be a new file"), "{stderr}");
+        assert!(
+            std::fs::symlink_metadata(&ran).is_err(),
+            "the command ran with the record refused"
+        );
+    }
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "before");
+    assert_eq!(mode(&existing), 0o644);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "target");
+    assert_eq!(mode(&target), 0o644);
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert!(std::fs::symlink_metadata(&nowhere).is_err());
+    // The control: a new path gets the record, 0600, and the command ran.
+    let fresh = dir.join("fresh.json");
+    let out = ec_model(&fresh, &parent, &command);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(std::fs::symlink_metadata(&ran).is_ok());
+    assert_eq!(mode(&fresh), 0o600);
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&fresh).unwrap()).unwrap();
+    assert!(doc["outcome"].is_object(), "{doc}");
+}
+
+/// A command in the background that writes a beat to `beat` every 0.2 s
+/// for 30 s and then ends on its own (so a failing test leaves nothing
+/// running for long), its output away from the command's.
+fn heartbeat(beat: &Path) -> String {
+    format!(
+        "(i=0; while [ $i -lt 150 ]; do echo $i >'{b}'; i=$((i+1)); sleep 0.2; done) \
+         >/dev/null 2>&1 </dev/null &",
+        b = beat.display()
+    )
+}
+
+/// Whether the beat stopped: unchanged over a second, once it began.
+fn stopped(beat: &Path) -> bool {
+    let read = || std::fs::read_to_string(beat).unwrap_or_default();
+    let before = read();
+    std::thread::sleep(Duration::from_secs(1));
+    !before.is_empty() && read() == before
+}
+
+/// A command past `--limit` is stopped with its whole group (its
+/// background beat included), and `ec-model` says so and exits 3, well
+/// before the command would have ended (Codex review, medium: the
+/// command was waited for without a limit).
+#[test]
+fn a_command_past_its_limit_is_stopped_with_its_group() {
+    let files = TestHome::new();
+    let beat = files.root().join("beat");
+    let command = format!(
+        "{} while [ ! -s '{b}' ]; do sleep 0.1; done; sleep 30",
+        heartbeat(&beat),
+        b = beat.display()
+    );
+    let start = Instant::now();
+    let out = run_ec_model(
+        &files.root().join("record.json"),
+        &["--limit", "2"],
+        &[("PATH", "/usr/bin:/bin")],
+        &command,
+        Duration::from_secs(90),
+    );
+    let took = start.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains("the command did not end within 2 s"),
+        "{stderr}"
+    );
+    assert!(took < Duration::from_secs(20), "it took {took:?}");
+    assert!(stopped(&beat), "the command's background beat goes on");
+}
+
+/// When the command ends, what is left of its group (here a beat it
+/// started in the background) is stopped before its home is removed,
+/// and the run is what the command made of it (Codex review, medium: a
+/// background descendant outlived the wrapper and its home).
+#[test]
+fn what_is_left_of_the_command_s_group_is_stopped_when_it_ends() {
+    let files = TestHome::new();
+    let beat = files.root().join("beat");
+    let command = format!(
+        "{} while [ ! -s '{b}' ]; do sleep 0.1; done; exit 0",
+        heartbeat(&beat),
+        b = beat.display()
+    );
+    let out = ec_model(
+        &files.root().join("record.json"),
+        &[("PATH", "/usr/bin:/bin")],
+        &command,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stopped(&beat), "the command's background beat outlived it");
+}
+
+/// A descendant that left the command's group and still holds its output
+/// cannot be stopped with the group: `ec-model` waits 10 s for the output
+/// to close, then says so and exits 3, never reporting the run as one
+/// that ended. (The descendant ends on its own 20 s after it started.)
+#[test]
+fn a_descendant_outside_the_group_holding_the_output_fails_the_run() {
+    let python = [
+        "/usr/bin/python3",
+        "/usr/local/bin/python3",
+        "/opt/homebrew/bin/python3",
+    ]
+    .into_iter()
+    .find(|p| Path::new(p).is_file())
+    .unwrap_or_else(|| panic!("python3 is needed"));
+    let files = TestHome::new();
+    let started = files.root().join("left");
+    let command = format!(
+        "{python} -c 'import os, time; os.setsid(); open(\"{s}\", \"w\").close(); \
+         time.sleep(20)' & while [ ! -e '{s}' ]; do sleep 0.1; done; echo done",
+        s = started.display()
+    );
+    let out = ec_model(
+        &files.root().join("record.json"),
+        &[("PATH", "/usr/bin:/bin")],
+        &command,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains("a process outside the command's group still held its output"),
+        "{stderr}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
 }
