@@ -26,6 +26,13 @@
 //! the queue fills. Either way the writer's owner is told at once (the
 //! `on_close` of [`spawn_writer`]), so a server waiting for input that may
 //! never come stops waiting.
+//!
+//! A message may carry a [`Ticket`] ([`Outbox::send_withdrawable`]): the
+//! writer asks it, just before the write, whether the message is still to
+//! be sent, and tells it when it is done with the message. A call's answer
+//! waits so, and the host's cancellation of the call withdraws it while it
+//! waits behind a write the host does not read (Codex review of M2-06,
+//! medium).
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -178,6 +185,34 @@ struct Queued {
     bytes: usize,
 }
 
+/// What the writer asks of a message before it writes it.
+pub trait Ticket: Send + Sync {
+    /// Whether the message is still to be written. Asked once, by the
+    /// writer, just before it writes it; from a true answer on the message
+    /// is being sent, and it can no longer be withdrawn.
+    fn take(&self) -> bool;
+
+    /// The writer is done with the message: it was written, withdrawn, or
+    /// will never be written (the output closed, or the queue refused it).
+    /// Called once, from the thread that drops it.
+    fn done(&self);
+}
+
+/// A message on its way to the writer. Dropped, it tells its ticket it is
+/// done with, wherever that happens.
+struct Outgoing {
+    bytes: Vec<u8>,
+    ticket: Option<Arc<dyn Ticket>>,
+}
+
+impl Drop for Outgoing {
+    fn drop(&mut self) {
+        if let Some(t) = self.ticket.take() {
+            t.done();
+        }
+    }
+}
+
 /// The state an [`Outbox`] and its writer share.
 struct Shared {
     /// No more is sent: a write failed, or the queue was full.
@@ -213,10 +248,18 @@ impl Shared {
 }
 
 /// Where finished messages go: the writer thread ([`spawn_writer`]).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Outbox {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Outgoing>,
     shared: Arc<Shared>,
+}
+
+impl std::fmt::Debug for Outbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outbox")
+            .field("shared", &self.shared)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Outbox {
@@ -225,12 +268,31 @@ impl Outbox {
     /// pass [`MAX_QUEUED`] or [`MAX_QUEUED_BYTES`] closes it: it is not
     /// sent, nor is anything after it ([`Outbox::stalled`]).
     pub fn send(&self, message: Vec<u8>) -> bool {
+        self.queue(Outgoing {
+            bytes: message,
+            ticket: None,
+        })
+    }
+
+    /// [`Outbox::send`], for a message that `ticket` may withdraw until
+    /// the writer takes it ([`Ticket::take`]). The ticket is told when the
+    /// message is done with ([`Ticket::done`]), also when it is refused
+    /// here.
+    pub fn send_withdrawable(&self, message: Vec<u8>, ticket: Arc<dyn Ticket>) -> bool {
+        self.queue(Outgoing {
+            bytes: message,
+            ticket: Some(ticket),
+        })
+    }
+
+    fn queue(&self, message: Outgoing) -> bool {
         if self.closed() {
             return false;
         }
         {
             let mut q = self.shared.queued();
-            let over = q.messages + 1 > MAX_QUEUED || q.bytes + message.len() > MAX_QUEUED_BYTES;
+            let len = message.bytes.len();
+            let over = q.messages + 1 > MAX_QUEUED || q.bytes + len > MAX_QUEUED_BYTES;
             if q.messages > 0 && over {
                 drop(q);
                 self.shared.stalled.store(true, Ordering::SeqCst);
@@ -238,7 +300,7 @@ impl Outbox {
                 return false;
             }
             q.messages += 1;
-            q.bytes += message.len();
+            q.bytes += len;
         }
         self.tx.send(message).is_ok()
     }
@@ -267,7 +329,7 @@ where
     W: Write + Send + 'static,
     F: Fn() + Send + Sync + 'static,
 {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::channel::<Outgoing>();
     let shared = Arc::new(Shared {
         closed: AtomicBool::new(false),
         stalled: AtomicBool::new(false),
@@ -277,13 +339,22 @@ where
     let state = Arc::clone(&shared);
     let handle = std::thread::spawn(move || {
         for message in rx {
-            if out.write_all(&message).and_then(|()| out.flush()).is_err() {
+            // A message withdrawn while it waited is dropped unwritten.
+            let wanted = message.ticket.as_ref().is_none_or(|t| t.take());
+            let failed = wanted
+                && out
+                    .write_all(&message.bytes)
+                    .and_then(|()| out.flush())
+                    .is_err();
+            let len = message.bytes.len();
+            drop(message);
+            if failed {
                 state.close();
                 break;
             }
             let mut q = state.queued();
             q.messages -= 1;
-            q.bytes -= message.len();
+            q.bytes -= len;
         }
     });
     (Outbox { tx, shared }, handle)
@@ -445,15 +516,17 @@ mod tests {
     /// While the host reads nothing, the answers waiting are bounded in
     /// count and in bytes: the one past either bound is refused, and so is
     /// everything after it. One message larger than the byte bound is
-    /// taken when nothing waits.
+    /// taken when nothing waits. Each writer is released and joined at the
+    /// end (the held write returns once its sender is dropped), so none is
+    /// left blocked behind the test.
     ///
     /// Mutation checked: no bound (every message queued): the refusals do
     /// not come and this fails.
     #[test]
     fn answers_waiting_for_a_host_that_does_not_read_are_bounded() {
         let told = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (_go, held) = mpsc::channel();
-        let (outbox, _) = spawn_writer(Held(held, Vec::new()), closing(&told));
+        let (go, held) = mpsc::channel();
+        let (outbox, writer) = spawn_writer(Held(held, Vec::new()), closing(&told));
         let mut sent = 0;
         while outbox.send(b"{}\n".to_vec()) {
             sent += 1;
@@ -467,15 +540,22 @@ mod tests {
             1,
             "the stall was not told once"
         );
+        let release = |go: mpsc::Sender<()>, outbox: Outbox, writer: JoinHandle<()>| {
+            drop(go);
+            drop(outbox);
+            writer.join().unwrap();
+        };
+        release(go, outbox, writer);
 
-        let (_go, held) = mpsc::channel();
-        let (outbox, _) = spawn_writer(Held(held, Vec::new()), || {});
+        let (go, held) = mpsc::channel();
+        let (outbox, writer) = spawn_writer(Held(held, Vec::new()), || {});
         assert!(outbox.send(vec![b'x'; MAX_QUEUED_BYTES + 1]));
         assert!(!outbox.send(b"{}\n".to_vec()));
         assert!(outbox.stalled());
+        release(go, outbox, writer);
 
-        let (_go, held) = mpsc::channel();
-        let (outbox, _) = spawn_writer(Held(held, Vec::new()), || {});
+        let (go, held) = mpsc::channel();
+        let (outbox, writer) = spawn_writer(Held(held, Vec::new()), || {});
         let piece = MAX_QUEUED_BYTES / 4;
         let mut sent = 0;
         while outbox.send(vec![b'x'; piece]) {
@@ -484,6 +564,7 @@ mod tests {
         }
         assert_eq!(sent, 4);
         assert!(outbox.stalled());
+        release(go, outbox, writer);
     }
 
     /// Answers written leave the queue: a host that reads takes any number.

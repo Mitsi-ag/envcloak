@@ -4,27 +4,40 @@
 //! - Each child is EnvCloak's own executable, started with standard input
 //!   from `/dev/null` and its output on pipes this server reads: nothing
 //!   it writes reaches the protocol stream, and a command that reads its
-//!   input gets end of file at once.
+//!   input gets end of file at once. It starts with `SIGTERM`, `SIGINT`
+//!   and `SIGHUP` unblocked, though every thread here blocks them (they
+//!   are taken on one thread, `envcloak mcp`): a child that kept that mask
+//!   would not stop when asked to, and an `envcloak run` waiting for an
+//!   approval would start its command once the approval came, after its
+//!   call was cancelled (Codex review of M2-06, high).
 //! - Each leads a process group of its own. The group is signalled only
 //!   while its leader is this server's unreaped child ([`Group`]): the
 //!   leader is marked reaped, under the same lock as every signal, before
 //!   it is reaped, so a signal can never reach a reused process number (M2
 //!   plan §6, rule 3; D-34). No signal goes to a number read from anywhere
-//!   else.
+//!   else. The leader is reaped only once its output has been read, so its
+//!   group stays its own until then.
 //! - A host's cancellation ([`Call::cancel`]) sends the group `SIGTERM`,
 //!   which `envcloak run` passes on to its command; if the leader has not
 //!   exited within [`TERM_GRACE`], a second `SIGTERM`, on which `envcloak
 //!   run` kills its command (`SIGKILL`, through the handle it owns: the
 //!   command is its unreaped child); and `SIGKILL` if the leader has still
 //!   not exited [`KILL_GRACE`] later. Once the leader of a stopped call has
-//!   exited, and before it is reaped, its whole group gets `SIGKILL`: what
-//!   is left there (on a controlling terminal `envcloak run` keeps its
-//!   command, and what the command starts, in this group) ends with the
-//!   call, however soon `envcloak run` exited. Without a controlling
-//!   terminal the command leads a group of its own, which only `envcloak
-//!   run` owns, and `envcloak run` ends what is left of it in turn before
-//!   it reaps the command (docs/RUN.md); never by a signal from here to a
-//!   group this server did not start.
+//!   exited, the whole group gets `SIGKILL`: what is left there (on a
+//!   controlling terminal `envcloak run` keeps its command, and what the
+//!   command starts, in this group) ends with the call, however soon
+//!   `envcloak run` exited. A call cancelled after its leader exited, while
+//!   its output is still read, has its group killed at once: there is no
+//!   leader left to pass a `SIGTERM` on (Codex review of M2-06, high).
+//!   Without a controlling terminal the command leads a group of its own,
+//!   which only `envcloak run` owns, and `envcloak run` ends what is left of
+//!   it in turn before it reaps the command (docs/RUN.md); never by a
+//!   signal from here to a group this server did not start.
+//! - Children are started one at a time ([`SPAWNING`]). On macOS a pipe
+//!   gets its close-on-exec flag only after it is made, so a child started
+//!   by another worker in between would inherit the pipes of another
+//!   call's child: it could hold that call's output open, or write into
+//!   it what its own `envcloak run` never redacted.
 //! - Output is kept as its first and last [`OUTPUT_HEAD`] and
 //!   [`OUTPUT_TAIL`] bytes, with a count of what was left out between them
 //!   ([`HeadTail`]); it is read until end of stream, or for [`DRAIN`] after
@@ -50,6 +63,10 @@ pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// How long output is still read after the child exits.
 pub const DRAIN: Duration = Duration::from_secs(2);
 
+/// Held while a child is started, pipes made, forked and its program
+/// started: see the module documentation.
+static SPAWNING: Mutex<()> = Mutex::new(());
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -58,14 +75,36 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// the leader is unreaped (see the module documentation).
 #[derive(Debug)]
 pub(crate) struct Group {
-    leader: Mutex<Option<i32>>,
+    leader: Mutex<Leader>,
     reaped: Condvar,
+}
+
+/// The leader of a [`Group`], as far as the signals sent to it go.
+#[derive(Debug)]
+struct Leader {
+    /// Its process number, while it is unreaped.
+    pid: Option<i32>,
+    /// Its exit was seen; it is not reaped yet.
+    exited: bool,
+}
+
+/// What [`Group::first_stop`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstStop {
+    /// `SIGTERM`, to a leader still running: the rest of the stop follows.
+    Asked,
+    /// `SIGKILL`, to a group whose leader has exited, or nothing, to one
+    /// reaped already: there is nothing more to do.
+    Done,
 }
 
 impl Group {
     fn new(pid: i32) -> Arc<Group> {
         Arc::new(Group {
-            leader: Mutex::new(Some(pid)),
+            leader: Mutex::new(Leader {
+                pid: Some(pid),
+                exited: false,
+            }),
             reaped: Condvar::new(),
         })
     }
@@ -74,21 +113,54 @@ impl Group {
     /// was sent.
     pub(crate) fn signal(&self, sig: i32) -> bool {
         let leader = lock(&self.leader);
-        leader.is_some_and(|pid| envcloak_sys::signal_group(pid, sig).is_ok())
+        leader
+            .pid
+            .is_some_and(|pid| envcloak_sys::signal_group(pid, sig).is_ok())
     }
 
-    /// The leader has exited and is about to be reaped: from here on
-    /// nothing is signalled. When `stopped` says, under the same lock, that
-    /// its call was stopped, what is left of its group is killed first,
-    /// while the group is still the exited leader's.
-    fn reaping(&self, stopped: impl FnOnce() -> bool) {
+    /// The first step of a stop: `SIGTERM` while the leader runs; `SIGKILL`
+    /// once it has exited and before it is reaped, when its output is still
+    /// read and nothing is left to pass a `SIGTERM` on; nothing once it is
+    /// reaped.
+    fn first_stop(&self) -> FirstStop {
+        let leader = lock(&self.leader);
+        match (leader.pid, leader.exited) {
+            (Some(pid), false) if envcloak_sys::signal_group(pid, libc::SIGTERM).is_ok() => {
+                FirstStop::Asked
+            }
+            (Some(pid), true) => {
+                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+                FirstStop::Done
+            }
+            _ => FirstStop::Done,
+        }
+    }
+
+    /// The leader has exited, and stays unreaped while its output is read.
+    /// When `stopped` says, under the same lock, that its call was stopped,
+    /// what is left of its group is killed now.
+    fn exited(&self, stopped: impl FnOnce() -> bool) {
         let mut leader = lock(&self.leader);
-        if let Some(pid) = *leader {
+        leader.exited = true;
+        if let Some(pid) = leader.pid {
             if stopped() {
                 let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
             }
         }
-        *leader = None;
+    }
+
+    /// The leader is about to be reaped: from here on nothing is
+    /// signalled. When `stopped` says, under the same lock, that its call
+    /// was stopped, what is left of its group is killed first, while the
+    /// group is still the exited leader's.
+    fn reaping(&self, stopped: impl FnOnce() -> bool) {
+        let mut leader = lock(&self.leader);
+        if let Some(pid) = leader.pid {
+            if stopped() {
+                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+            }
+        }
+        leader.pid = None;
         self.reaped.notify_all();
     }
 
@@ -97,17 +169,18 @@ impl Group {
         let guard = lock(&self.leader);
         let (guard, _) = self
             .reaped
-            .wait_timeout_while(guard, limit, |l| l.is_some())
+            .wait_timeout_while(guard, limit, |l| l.pid.is_some())
             .unwrap_or_else(PoisonError::into_inner);
-        guard.is_none()
+        guard.pid.is_none()
     }
 }
 
 /// Stops `group`: `SIGTERM`; again once [`TERM_GRACE`] has passed with the
 /// leader not reaped (`envcloak run` then kills its command); then
-/// `SIGKILL` once [`KILL_GRACE`] more has passed.
+/// `SIGKILL` once [`KILL_GRACE`] more has passed. A group whose leader has
+/// exited already gets `SIGKILL` at once ([`Group::first_stop`]).
 fn stop(group: Arc<Group>) {
-    if group.signal(libc::SIGTERM) {
+    if group.first_stop() == FirstStop::Asked {
         std::thread::spawn(move || {
             if !group.wait_reaped(TERM_GRACE)
                 && group.signal(libc::SIGTERM)
@@ -289,10 +362,15 @@ pub fn run(mut cmd: Command, call: &Call, limit: Option<Duration>) -> Result<Cap
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    envcloak_sys::unblock_termination_on_spawn(&mut cmd).map_err(|_| NotRun::Spawn)?;
     if call.cancelled() {
         return Err(NotRun::Cancelled);
     }
-    let mut child = cmd.spawn().map_err(|_| NotRun::Spawn)?;
+    let spawned = {
+        let _one_at_a_time = lock(&SPAWNING);
+        cmd.spawn()
+    };
+    let mut child = spawned.map_err(|_| NotRun::Spawn)?;
     let Ok(pid) = i32::try_from(child.id()) else {
         // A pid that does not fit an i32 cannot be signalled as a group;
         // it is reaped and refused.
@@ -322,16 +400,18 @@ pub fn run(mut cmd: Command, call: &Call, limit: Option<Duration>) -> Result<Cap
     }
     // A cancellation that signalled the group did so before this takes
     // the lock, after it marked the call cancelled: the call is seen
-    // stopped here, and what is left of its group goes with it.
-    group.reaping(|| timed_out || call.cancelled());
-    let status = child.wait();
-    call.detach();
+    // stopped here, and what is left of its group goes with it. One that
+    // comes while the output is read kills the group itself.
+    group.exited(|| timed_out || call.cancelled());
     let deadline = Instant::now() + DRAIN;
     let mut cut = false;
     for done in [&out_done, &err_done] {
         let left = deadline.saturating_duration_since(Instant::now());
         cut |= done.recv_timeout(left).is_err();
     }
+    group.reaping(|| timed_out || call.cancelled());
+    let status = child.wait();
+    call.detach();
     let (code, signal) = match status {
         Ok(s) => (s.code(), s.signal()),
         Err(_) => (None, None),
@@ -480,6 +560,106 @@ mod tests {
             "a process left in the cancelled call's group held its output"
         );
         assert!(start.elapsed() < DRAIN, "{:?}", start.elapsed());
+    }
+
+    /// A child starts with `SIGTERM`, `SIGINT` and `SIGHUP` unblocked,
+    /// though the thread that starts it blocks them, as every thread of
+    /// `envcloak mcp` does: a shell that sends itself each one ends by it
+    /// (Codex review of M2-06, high: a waiting `envcloak run` that kept the
+    /// mask went on waiting after its call was cancelled, and started its
+    /// command when the approval came).
+    ///
+    /// Mutation checked: `run` not calling `unblock_termination_on_spawn`:
+    /// the shell goes on past its own signal and this fails.
+    #[test]
+    fn a_child_starts_with_the_termination_signals_unblocked() {
+        // On a thread of its own, whose mask ends with it.
+        std::thread::spawn(|| {
+            let _blocked = envcloak_sys::TerminationSignals::block().unwrap();
+            for (sig, name) in [
+                (libc::SIGTERM, "TERM"),
+                (libc::SIGINT, "INT"),
+                (libc::SIGHUP, "HUP"),
+            ] {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c")
+                    .arg(format!("kill -{name} $$; echo went-on"))
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin");
+                let c = run(cmd, &Call::new(), Some(Duration::from_secs(60))).unwrap();
+                assert_eq!(c.signal, Some(sig), "{name}: {c:?}");
+                assert!(c.stdout.head().is_empty(), "{name}: the shell went on");
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A call cancelled after its child exited, while what the child left
+    /// in its group still holds the output: that process is killed at
+    /// once, with the group, which is still the unreaped child's (Codex
+    /// review of M2-06, high). The fixture's leader exits as soon as its
+    /// descendant, which ignores `SIGTERM` and keeps the output pipes, is
+    /// set up; a lifeline only the leader holds says when it has exited,
+    /// and one both hold, when both have. The call returns well before the
+    /// drain's end, its output read to its end.
+    ///
+    /// Mutation checked: the child reaped before its output is read, as it
+    /// was (`reaping` before the drain): the cancellation finds the group
+    /// no longer signalled, the descendant runs on holding the output, the
+    /// group's lifeline does not end and this fails.
+    #[test]
+    fn a_call_cancelled_while_its_output_is_read_ends_its_group_at_once() {
+        use envcloak_testkit::lifeline::{self, Lifeline};
+        let group = Lifeline::new();
+        let leader = Lifeline::new();
+        let cmd = lifeline::fixture("leader-exits", &group, Some(&leader), None);
+        let call = Arc::new(Call::new());
+        let running = Arc::clone(&call);
+        let t = std::thread::spawn(move || run(cmd, &running, Some(Duration::from_secs(120))));
+        let mut both = group
+            .accept(Duration::from_secs(30))
+            .expect("the fixture connected");
+        let mut alone = leader
+            .accept(Duration::from_secs(30))
+            .expect("the leader connected");
+        assert!(
+            both.ready(Duration::from_secs(30)),
+            "the fixture is not ready"
+        );
+        assert!(
+            alone.ended_within(Duration::from_secs(30)),
+            "the leader did not exit"
+        );
+        // The run has seen the exit too (and, before this fix, reaped the
+        // leader): the cancellation comes after that, never before.
+        let end = Instant::now() + Duration::from_secs(30);
+        while !exit_seen(&call) {
+            assert!(Instant::now() < end, "the run did not see the exit");
+            std::thread::yield_now();
+        }
+        let start = Instant::now();
+        call.cancel();
+        assert!(
+            both.ended_within(DRAIN),
+            "what the child left in its group outlived the cancellation"
+        );
+        let done = t.join().unwrap().unwrap();
+        assert_eq!(done.code, Some(0));
+        assert!(
+            !done.cut,
+            "the output was cut: a holder outlived the cancellation"
+        );
+        assert!(start.elapsed() < DRAIN, "{:?}", start.elapsed());
+    }
+
+    /// Whether the run of `call` has seen its child's exit: the leader is
+    /// marked exited, or reaped already.
+    fn exit_seen(call: &Call) -> bool {
+        lock(&call.group).as_ref().is_some_and(|g| {
+            let leader = lock(&g.leader);
+            leader.exited || leader.pid.is_none()
+        })
     }
 
     #[test]
