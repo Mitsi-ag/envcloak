@@ -1081,10 +1081,15 @@ fn quoted_path(p: &Path) -> String {
 /// SIGALRM, whose handler runs even while a write is blocked on a full
 /// pipe, where it could never see the stop request. A record in a
 /// directory that is gone is not written. It inherits an ignored SIGTERM
-/// from a shell that ignores it.
-const WRITER: &str = r#"import os, signal, sys
+/// from a shell that ignores it. It holds an exclusive lock on the record's
+/// path plus `.lock` for its whole life, the file named so only once the
+/// lock is taken ([`writer_gone`]).
+const WRITER: &str = r#"import fcntl, os, signal, sys
 stop, ended = sys.argv[1], sys.argv[2]
 life = os.path.dirname(stop)
+held = open(ended + '.lock.new', 'a')
+fcntl.flock(held, fcntl.LOCK_EX)
+os.rename(ended + '.lock.new', ended + '.lock')
 def record(how):
     try:
         with open(ended, 'a') as f:
@@ -2262,6 +2267,57 @@ fn writer_saw_its_pipe_closed(writer: &Lifetime) -> bool {
     writer.ended_within(1, Duration::from_secs(10)) == Some(vec!["pipe_closed".to_owned()])
 }
 
+/// Whether `writer`'s descendant ([`WRITER`]) is gone within `limit`: the
+/// lock it holds for its whole life is free again. It is gone whether it
+/// ended by itself or was killed (review F-62: never asked of a pid).
+fn writer_gone(writer: &Lifetime, limit: Duration) -> bool {
+    let path = PathBuf::from(format!("{}.lock", writer.ended_path().display()));
+    let end = Instant::now() + limit;
+    let lock = loop {
+        if let Ok(f) = std::fs::File::open(&path) {
+            break f;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    loop {
+        if envcloak_sys::try_lock_exclusive(&lock).unwrap_or(false) {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Waits up to `limit` until process `pid`, which started at `started`,
+/// has exited: a zombie (`ps` shows it `Z`), or reaped already (as
+/// [`reaped_within`]). The runner reaps its child only once the child's
+/// output has been read, so this, not the reap, says the child is gone.
+fn exited_within((pid, started): (i32, Option<StartTime>), limit: Duration) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        let zombie = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim_start()
+                    .starts_with('Z')
+            });
+        if zombie || reaped_within((pid, started), Duration::ZERO) {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Waits up to `limit` until process `pid`, which started at `started`,
 /// has been reaped: no process has its pid (a zombie still has it), or a
 /// process started at another time does.
@@ -2352,12 +2408,14 @@ fn stalled_reader_given_up(launcher: &str, drains: &[bool]) {
 /// Review T12-2: after the child exits, with a descendant writing and
 /// nobody reading the runner's standard output, SIGTERM to the runner
 /// stops the run at once: it exits 143 well before the cutoff would have
-/// ended it (with the child's 0), and the descendant's pipes are closed.
-/// One SIGTERM is sent, once the runner has reaped the child: the runner
-/// marks the exit before it reaps, so the signal is caught after the mark
-/// (an earlier one would be passed on to the child's group, and a later
-/// one, repeated, could land after the run returned and the default
-/// action was back).
+/// ended it (with the child's 0), the descendant's pipes are closed, and,
+/// without a terminal, the descendant left in the child's group is ended
+/// with the run (M2-06): it is gone, having seen its pipe closed or been
+/// killed first. One SIGTERM is sent, once the child has exited (a
+/// zombie: the runner reaps it only after its output): a signal that comes
+/// after the exit stops the run however soon the runner sees the exit
+/// (the forwarder asks the kernel), and a later one, repeated, could land
+/// after the run returned and the default action was back.
 fn a_signal_after_the_exit_stops_a_stalled_run() {
     signal_stops_a_stalled_run(DETACH);
 }
@@ -2388,8 +2446,8 @@ fn signal_stops_a_stalled_run(launcher: &str) {
         exiting,
     } = leaves_a_writer(launcher, &home, &setup, false);
     assert!(
-        reaped_within(child, Duration::from_secs(10)),
-        "the runner did not reap its child"
+        exited_within(child, Duration::from_secs(10)),
+        "the child did not exit"
     );
     envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
     let (status, _, err) = p.finish(Duration::from_secs(20));
@@ -2398,10 +2456,14 @@ fn signal_stops_a_stalled_run(launcher: &str) {
     assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
     assert!(took < Duration::from_millis(1500), "{took:?}");
     assert!(
-        writer_saw_its_pipe_closed(&writer),
-        "the descendant's pipe was not closed: {:?}",
+        writer_gone(&writer, Duration::from_secs(10)),
+        "the descendant outlived the run: {:?}",
         writer.record()
     );
+    // It saw its pipe closed, or was killed before it could say so; it
+    // never ran on to its deadline or to a stop request.
+    let record = writer.record();
+    assert!(record.is_empty() || record == ["pipe_closed"], "{record:?}");
     let mut held = Vec::new();
     stdout.unwrap().read_to_end(&mut held).unwrap();
     assert_no_canary(&held, &cs);

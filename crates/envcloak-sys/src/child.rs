@@ -21,6 +21,7 @@
 //!   another process until the caller reaps it. A thread that sends the
 //!   child signals checks, under the same lock, that it has not exited
 //!   yet, and so never signals a pid that has been reused.
+//!   [`has_exited`] asks the same without waiting.
 //! - [`signal_process`] and [`signal_group`]: `kill` for one process, or
 //!   for every process in a group.
 
@@ -83,6 +84,46 @@ pub fn wait_for_exit(pid: i32) -> io::Result<()> {
         let rc = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
         if rc == 0 {
             return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// Whether child `pid` has exited (or been killed), without waiting and
+/// without reaping it: `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`.
+/// The runner asks it before it passes a signal on, so a signal that comes
+/// once the child is gone is never passed to what it left behind as if the
+/// child still ran. Restarts after a signal.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidInput`] for a pid below 1, and `waitid`'s own
+/// errors: `ECHILD` when `pid` is not a child of this process.
+pub fn has_exited(pid: i32) -> io::Result<bool> {
+    let id = libc::id_t::try_from(pid)
+        .ok()
+        .filter(|_| pid >= 1)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    loop {
+        // SAFETY: siginfo_t is plain data; waitid fills it in, and leaves
+        // si_pid 0 when no child has changed state.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a writable siginfo_t; WNOWAIT leaves the child
+        // as it is and WNOHANG returns at once.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: waitid filled `info` in for an exited child, or left
+            // it zeroed; si_pid is set in both cases.
+            return Ok(unsafe { info.si_pid() } != 0);
         }
         let err = io::Error::last_os_error();
         if err.kind() != io::ErrorKind::Interrupted {

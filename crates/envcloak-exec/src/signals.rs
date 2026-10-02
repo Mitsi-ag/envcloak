@@ -39,7 +39,11 @@
 //! is passed on only while the child has not exited: [`ChildState`] is
 //! updated after `waitid` sees the exit and before the child is reaped, so
 //! its pid, and the group it leads, can never belong to another process
-//! when a signal is sent.
+//! when a signal is sent; and before passing one on, the forwarder asks
+//! the kernel whether the child has exited already
+//! ([`envcloak_sys::has_exited`]), so a signal that comes after the exit,
+//! before the run has seen it, is never passed to what the child left in
+//! its group as if the child still ran: it stops the run (below).
 //!
 //! Once the exit is seen ([`Forwarder::child_exited`] puts a mark among the
 //! caught signals), there is nobody to pass a signal on to, and the output
@@ -203,7 +207,11 @@ impl Forwarder {
             }
             let after_exit = marked || self.mark_lost.load(Ordering::SeqCst);
             let pid = child.pid.lock().unwrap_or_else(|e| e.into_inner());
-            match act(sig, by_process, self.terminal, after_exit, *pid) {
+            // A child that has exited, though the run has not marked it yet,
+            // is gone all the same: the signal has nobody to go to (review
+            // R-9), and is never passed on to what the child left behind.
+            let running = pid.filter(|p| !envcloak_sys::has_exited(*p).unwrap_or(false));
+            match act(sig, by_process, self.terminal, after_exit, running) {
                 // Sent under the lock `ChildState::exited` takes, so the
                 // pid is still the child's. A child that is gone by now,
                 // or a group already empty, is not an error: there is
@@ -421,7 +429,14 @@ mod tests {
             forwarder.stop(|| !forwarding.is_finished());
         });
         let status = ended(&mut child);
-        assert_eq!(cutoff.stopped_by(), None);
+        // The SIGHUPs read once the SIGTERM has ended the child have nobody
+        // to go to and stop the run (review R-9); the SIGTERM itself went
+        // to the child, and never stops it.
+        assert!(
+            matches!(cutoff.stopped_by(), None | Some(libc::SIGHUP)),
+            "{:?}",
+            cutoff.stopped_by()
+        );
         assert_eq!(
             status.and_then(|s| s.signal()),
             Some(libc::SIGTERM),
@@ -484,6 +499,58 @@ mod tests {
                 std::thread::yield_now();
             }
         });
+    }
+
+    /// Review R-9, for a child that has exited before the run saw it: a
+    /// SIGTERM read with no mark yet and the pid still the child's (the
+    /// child a zombie, not reaped) has nobody to go to. It stops the run,
+    /// as one read after the mark does, and is not passed on to what the
+    /// child left in its group (M2-06, round 4: a test that signals once
+    /// the child has exited must not depend on how soon the run sees it).
+    ///
+    /// Mutation checked: the forwarder not asking whether the child has
+    /// exited (`has_exited` left out): the SIGTERM is passed on to the
+    /// exited child's group, nothing stops the run, and this fails.
+    #[test]
+    fn a_signal_read_once_the_child_exited_but_before_the_mark_stops_the_run() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let forwarder = Forwarder::install(false).unwrap();
+        let cutoff = Cutoff::default();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        envcloak_sys::wait_for_exit(pid).unwrap();
+        assert!(envcloak_sys::has_exited(pid).unwrap());
+        let state = ChildState::running(pid);
+        envcloak_sys::testing::signal_this_thread(libc::SIGTERM).unwrap();
+        forwarder.stop(|| false);
+        forwarder.forward(&state, &cutoff);
+        let _ = child.wait();
+        assert_eq!(cutoff.stopped_by(), Some(libc::SIGTERM));
+        assert!(forwarder.ends_childs_group());
+    }
+
+    /// `has_exited` tells a running child from one that exited, and leaves
+    /// the exited one unreaped.
+    #[test]
+    fn has_exited_does_not_wait_or_reap() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        assert!(!envcloak_sys::has_exited(pid).unwrap());
+        drop(child.stdin.take());
+        envcloak_sys::wait_for_exit(pid).unwrap();
+        assert!(envcloak_sys::has_exited(pid).unwrap());
+        assert!(envcloak_sys::has_exited(pid).unwrap(), "it was reaped");
+        let status = child.wait().unwrap();
+        assert_eq!((status.code(), status.signal()), (Some(0), None));
     }
 
     /// The first SIGTERM is passed on as it is; every one after it is
