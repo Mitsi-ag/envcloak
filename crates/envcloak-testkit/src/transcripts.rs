@@ -14,9 +14,9 @@
 //! were absent: a sweep that could not look is not clean. Counts are
 //! raw: nothing is filtered, the harness's own canaries included, so a
 //! positive control (a canary a scripted turn prints) is counted like
-//! anything else. The scripted model's request bodies are swept too
-//! ([`sweep_model`]): what a host sent its model is what a real model
-//! would have seen. Both read through up to
+//! anything else. The scripted model's requests are swept too, bodies,
+//! request lines and header names ([`sweep_model`]): what a host sent its
+//! model is what a real model would have seen. Both read through up to
 //! [`crate::detect::JSON_LEVELS`] levels of JSON string escaping, since a
 //! host keeps what a command printed as a JSON string, sometimes inside
 //! another, and a value escaped again matches none of its listed
@@ -391,15 +391,19 @@ pub struct StoreHits {
     pub hits: Vec<Hit>,
 }
 
-/// One canary occurrence in a body the scripted model recorded.
+/// One canary occurrence in a request the scripted model recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelHit {
     /// The request's number in the run.
     pub seq: u64,
+    /// Where in the request: `body`, `method`, `target` (the path and
+    /// query, or the `host:port` of a tunnel or a request to forward) or
+    /// `header names`.
+    pub part: &'static str,
     pub found: Found,
 }
 
-/// A whole sweep: the host's stores, and the model's request bodies.
+/// A whole sweep: the host's stores, and the model's requests.
 #[derive(Debug, Clone, Default)]
 pub struct Hits {
     pub stores: Vec<StoreHits>,
@@ -459,7 +463,7 @@ impl Hits {
             .count()
     }
 
-    /// Hits of `label` in the model's request bodies.
+    /// Hits of `label` in the model's requests, every part of them.
     pub fn in_model(&self, label: &str) -> usize {
         self.model.iter().filter(|h| h.found.label == label).count()
     }
@@ -498,7 +502,7 @@ impl fmt::Display for Hits {
         for h in &self.model {
             *counts
                 .entry((
-                    "model request bodies".to_owned(),
+                    format!("model requests ({})", h.part),
                     h.found.label.clone(),
                     shown_encoding(&h.found),
                 ))
@@ -563,19 +567,33 @@ pub fn sweep_stores(
     out
 }
 
-/// Every canary occurrence in the bodies the model recorded.
+/// Every canary occurrence in the requests the model recorded: each
+/// body, and each request line and header name, which a host (or a
+/// command, through the proxy variables that point at the model) can put
+/// a value in as well as a body (verifier, low: only bodies were swept).
 pub fn sweep_model(report: &ModelReport, cs: &[Canary]) -> Vec<ModelHit> {
     let detector = Detector::new(cs);
-    report
-        .requests
-        .iter()
-        .flat_map(|r| {
-            detector
-                .find(&r.body)
-                .into_iter()
-                .map(move |found| ModelHit { seq: r.seq, found })
-        })
-        .collect()
+    let mut hits = Vec::new();
+    for r in &report.requests {
+        let target = match &r.query {
+            Some(q) => format!("{}?{q}", r.path),
+            None => r.path.clone(),
+        };
+        let headers = r.headers.join("\n");
+        for (part, bytes) in [
+            ("method", r.method.as_bytes()),
+            ("target", target.as_bytes()),
+            ("header names", headers.as_bytes()),
+            ("body", r.body.as_slice()),
+        ] {
+            hits.extend(detector.find(bytes).into_iter().map(|found| ModelHit {
+                seq: r.seq,
+                part,
+                found,
+            }));
+        }
+    }
+    hits
 }
 
 /// The sweeps of one agent home.
@@ -584,7 +602,7 @@ pub struct Sweep;
 
 impl Sweep {
     /// Sweeps `home`'s host stores (and the rest of the host's
-    /// directories) for `cs`, and the bodies of `models`.
+    /// directories) for `cs`, and the requests of `models`.
     pub fn host_stores(home: &AgentHome, cs: &[Canary], models: &[&ModelReport]) -> Hits {
         let dirs = home.host_dirs();
         Hits {

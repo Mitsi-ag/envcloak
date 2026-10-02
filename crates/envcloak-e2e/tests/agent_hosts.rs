@@ -23,7 +23,9 @@ use std::path::Path;
 use envcloak_agents::probe::model::{QUALIFIED, SERVER};
 use envcloak_e2e::k01::{self, Reach, Shell};
 use envcloak_e2e::{bin_dir, versions_toml};
-use envcloak_testkit::agents::{AgentHome, Host, HostFlags, HostRun, Installed, pins, require};
+use envcloak_testkit::agents::{
+    AgentHome, Host, HostFlags, HostRun, Installed, pins, reports_version, require,
+};
 use envcloak_testkit::transcripts::{OTHER, Sweep};
 use envcloak_testkit::{Canary, by_label, canaries, fresh_seed, labels};
 use serde_json::json;
@@ -2822,35 +2824,6 @@ fn tier_2(
         report.outcome
     );
     Some(Tier2Run { report, output })
-}
-
-/// Whether `--version`'s output names `version` as a whole word: `1.0.9`
-/// is not `1.0.90`.
-fn reports_version(said: &str, version: &str) -> bool {
-    said.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
-        .map(|w| w.trim_start_matches('v').trim_end_matches('.'))
-        .any(|w| w == version)
-}
-
-#[test]
-fn a_version_is_reported_only_as_a_whole_word() {
-    for said in [
-        "1.0.90\n",
-        "GitHub Copilot CLI 1.0.90.\nRun 'copilot update' to check for updates.\n",
-        "v1.0.90",
-        "2026.09.28-64d2043\n",
-    ] {
-        let want = if said.starts_with("2026") {
-            "2026.09.28-64d2043"
-        } else {
-            "1.0.90"
-        };
-        assert!(reports_version(said, want), "{said:?}");
-    }
-    for said in ["1.0.9\n", "1.0.901\n", "", "11.0.90", "2026.09.28\n"] {
-        assert!(!reports_version(said, "1.0.90"), "{said:?}");
-        assert!(!reports_version(said, "2026.09.28-64d2043"), "{said:?}");
-    }
 }
 
 /// The probe's answer in the request after the shell call: the marker,

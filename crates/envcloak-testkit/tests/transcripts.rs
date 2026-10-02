@@ -25,7 +25,7 @@ use std::process::{Command, Stdio};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-use envcloak_testkit::agents::{Host, ModelReport, ModelRequest};
+use envcloak_testkit::agents::{Host, Model, ModelReport, ModelRequest};
 use envcloak_testkit::transcripts::{
     Hits, HostDirs, OTHER, claude_tmp_dir, host_roots, is_claude_cwd_file, sweep_model,
     sweep_stores, transcript_roots,
@@ -669,6 +669,8 @@ fn the_model_s_request_bodies_are_swept() {
             at_ms: 0,
             method: "POST".to_owned(),
             path: "/v1/messages".to_owned(),
+            query: None,
+            headers: Vec::new(),
             status: 200,
             answered: true,
             api: Some("messages".to_owned()),
@@ -691,6 +693,107 @@ fn the_model_s_request_bodies_are_swept() {
         "{hits:?}"
     );
     assert_eq!(at[1], (3, 1, "raw"), "{hits:?}");
+}
+
+/// A host, or a command through the proxy variables that point at the
+/// scripted model, can put a value in a request line as well as a body:
+/// the path, the query, a method of its own, a header name, the host of a
+/// tunnel or of a request to forward. Each is swept, as the model
+/// recorded it, and filed by the part it was in (verifier, low: only
+/// bodies were swept, so S0's check that nothing sent to the model holds
+/// a value missed these). A control in a body is found too.
+#[test]
+fn the_model_s_request_lines_are_swept() {
+    let curl = ["/usr/bin/curl", "/bin/curl"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or_else(|| panic!("curl is needed"));
+    let hex = || format!("{:016x}{:016x}", fresh_seed(), fresh_seed());
+    let path = Canary::new("PATH_VALUE", format!("ecpath{}", hex()));
+    let query = Canary::new("QUERY_VALUE", format!("ecquery{}", hex()));
+    let tunnel = Canary::new("TUNNEL_VALUE", format!("ectunnel{}", hex()));
+    let forward = Canary::new("FORWARD_VALUE", format!("ecfwd{}", hex()));
+    let header = Canary::new("HEADER_VALUE", format!("echdr{}", hex()));
+    let body = Canary::new("BODY_VALUE", format!("ecbody{}", hex()));
+    // A method is 16 upper-case letters at most.
+    let letters: String = hex()
+        .bytes()
+        .take(14)
+        .map(|b| char::from(b'A' + (b % 26)))
+        .collect();
+    let method = Canary::new("METHOD_VALUE", format!("EC{letters}"));
+    let model = Model::start(&serde_json::json!({"steps": [{"say": "done"}]}));
+    let (base, key) = (model.base_url(), format!("x-api-key: {}", model.token()));
+    let run = |args: &[&str]| {
+        let out = Command::new(curl)
+            .args(["-s", "-o", "/dev/null", "--max-time", "20"])
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("curl: {e}"));
+        drop(out);
+    };
+    run(&[
+        "--path-as-is",
+        "-H",
+        &key,
+        "-H",
+        &format!("x-{}: 1", header.as_str()),
+        &format!("{base}/{}?{}", path.as_str(), query.as_str()),
+    ]);
+    run(&["-X", method.as_str(), "-H", &key, &format!("{base}/v1/x")]);
+    run(&[
+        "-p",
+        "-x",
+        &base,
+        &format!("https://{}.example/", tunnel.as_str()),
+    ]);
+    run(&[
+        "-x",
+        &base,
+        &format!("http://{}.example/", forward.as_str()),
+    ]);
+    run(&[
+        "-H",
+        &key,
+        "-H",
+        "content-type: application/json",
+        "--data-binary",
+        &format!("{{\"note\": \"{}\"}}", body.as_str()),
+        &format!("{base}/v1/x"),
+    ]);
+    let report = model.finish();
+    let cs = [
+        path.clone(),
+        query.clone(),
+        tunnel.clone(),
+        forward.clone(),
+        header.clone(),
+        body.clone(),
+        method.clone(),
+    ];
+    let hits = sweep_model(&report, &cs);
+    let parts = |c: &Canary| -> Vec<&str> {
+        let mut p: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.found.label == c.label && h.found.encoding == "raw")
+            .map(|h| h.part)
+            .collect();
+        p.dedup();
+        p
+    };
+    for (c, part) in [
+        (&path, "target"),
+        (&query, "target"),
+        (&tunnel, "target"),
+        (&forward, "target"),
+        (&header, "header names"),
+        (&method, "method"),
+        (&body, "body"),
+    ] {
+        assert_eq!(parts(c), [part], "{} in {:?}", c.label, report.requests);
+    }
 }
 
 /// What a host does with a line a command printed: it keeps it as a JSON
@@ -806,6 +909,8 @@ fn every_encoding_is_found_inside_each_host_and_model_envelope() {
                     at_ms: 0,
                     method: "POST".to_owned(),
                     path: "/v1/x".to_owned(),
+                    query: None,
+                    headers: Vec::new(),
                     status: 200,
                     answered: true,
                     api: None,

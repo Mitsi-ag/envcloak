@@ -402,14 +402,21 @@ pub fn probe_model_exe() -> PathBuf {
 }
 
 /// One request the scripted model recorded. `Debug` leaves the body out,
-/// and shows the path only when it is an endpoint the model serves (else
-/// its length): a path is whatever a host sent.
+/// shows the method and the path only when they are HTTP's and an
+/// endpoint the model serves (else their lengths), the query by its
+/// length and the header names by their number: a request line is
+/// whatever a host sent.
 #[derive(Clone)]
 pub struct ModelRequest {
     pub seq: u64,
     pub at_ms: u64,
     pub method: String,
     pub path: String,
+    /// The target's query, after the first `?` (a request to forward
+    /// keeps none).
+    pub query: Option<String>,
+    /// The header names, lower-cased, in order (never their values).
+    pub headers: Vec<String>,
     pub status: u64,
     /// Whether the reply was sent whole (a reply held on a barrier is
     /// recorded first, unanswered).
@@ -427,7 +434,7 @@ impl std::fmt::Debug for ModelRequest {
         f.debug_struct("ModelRequest")
             .field("seq", &self.seq)
             .field("at_ms", &self.at_ms)
-            .field("method", &self.method)
+            .field("method", &shown_method(&self.method))
             .field(
                 "path",
                 &match self.path.as_str() {
@@ -435,6 +442,11 @@ impl std::fmt::Debug for ModelRequest {
                     p => format!("<{} bytes>", p.len()),
                 },
             )
+            .field(
+                "query",
+                &self.query.as_ref().map(|q| format!("<{} bytes>", q.len())),
+            )
+            .field("headers", &self.headers.len())
             .field("status", &self.status)
             .field("answered", &self.answered)
             .field("api", &self.api)
@@ -458,11 +470,7 @@ impl ModelRequest {
     /// shows it; anything else only by its length. The record keeps both
     /// whole.
     pub fn shown(&self) -> String {
-        let method = if METHODS.contains(&self.method.as_str()) {
-            self.method.clone()
-        } else {
-            format!("<method of {} bytes>", self.method.len())
-        };
+        let method = shown_method(&self.method);
         let target = match self.api.as_deref() {
             Some("connect" | "proxy") => shown_destination(&self.path),
             _ if ENDPOINTS.contains(&self.path.as_str()) => self.path.clone(),
@@ -477,39 +485,52 @@ const METHODS: [&str; 9] = [
     "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE",
 ];
 
+/// How a diagnostic shows a method: by name when it is one of HTTP's,
+/// else only by its length (a host can send up to 16 upper-case letters
+/// of its own there).
+fn shown_method(method: &str) -> String {
+    if METHODS.contains(&method) {
+        method.to_owned()
+    } else {
+        format!("<method of {} bytes>", method.len())
+    }
+}
+
 /// The endpoints the scripted model serves, which a diagnostic names.
 const ENDPOINTS: [&str; 3] = ["/v1/messages", "/v1/responses", "/api/hello"];
 
+/// The destinations a diagnostic names ([`shown_destination`]): the
+/// hosts the pinned agent hosts were measured trying to reach
+/// (docs/ACCEPTANCE.md, "M2"), and the one the sandbox probes ask for.
+/// A new one shows by its length until it is added here.
+const DESTINATIONS: [&str; 15] = [
+    "api.anthropic.com",
+    "downloads.claude.ai",
+    "raw.githubusercontent.com",
+    "chatgpt.com",
+    "ab.chatgpt.com",
+    "github.com",
+    "api.github.com",
+    "play.googleapis.com",
+    "generativelanguage.googleapis.com",
+    "models.opencode.ai",
+    "registry.npmjs.org",
+    "code.kimi.com",
+    "telemetry-logs.kimi.com",
+    "api2.cursor.sh",
+    "example.com",
+];
+
 /// How a diagnostic shows where a tunnel or a request to forward was
-/// going (`host:port`): whole when the host reads as a DNS name, else only
-/// by its length. A DNS name here is two to eight labels of lower-case
-/// letters, digits and inner hyphens, each at most 32 bytes, none of 16 or
-/// more that holds a digit (a random token would), the last of letters
-/// only, with a port of digits; `api.anthropic.com:443`, say. Anything
-/// else a host named, a value included, is shown as `<N bytes>`.
+/// going (`host:port`): whole only when the host is one of
+/// [`DESTINATIONS`] and the port is 443 or 80, else only by its length.
+/// Nothing in a name's syntax shows that it holds no value (a secret can
+/// be a valid DNS label, letters only), so only a fixed list is named
+/// (Codex review, medium).
 pub fn shown_destination(target: &str) -> String {
-    let hidden = || format!("<{} bytes>", target.len());
-    let Some((host, port)) = target.rsplit_once(':') else {
-        return hidden();
-    };
-    let labels: Vec<&str> = host.split('.').collect();
-    let label_ok = |l: &&str| {
-        !l.is_empty()
-            && l.len() <= 32
-            && l.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-            && !(l.len() >= 16 && l.bytes().any(|b| b.is_ascii_digit()))
-    };
-    let port_ok = !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit());
-    let last_ok = labels
-        .last()
-        .is_some_and(|l| l.bytes().all(|b| b.is_ascii_lowercase()));
-    if (2..=8).contains(&labels.len()) && labels.iter().all(label_ok) && last_ok && port_ok {
-        target.to_owned()
-    } else {
-        hidden()
+    match target.rsplit_once(':') {
+        Some((host, "443" | "80")) if DESTINATIONS.contains(&host) => target.to_owned(),
+        _ => format!("<{} bytes>", target.len()),
     }
 }
 
@@ -786,6 +807,15 @@ fn parse_report(v: &Value) -> ModelReport {
                     at_ms: r["at_ms"].as_u64().unwrap_or(0),
                     method: text(r, "method").unwrap_or_default(),
                     path: text(r, "path").unwrap_or_default(),
+                    query: text(r, "query"),
+                    headers: r["headers"]
+                        .as_array()
+                        .map(|hs| {
+                            hs.iter()
+                                .filter_map(|h| h.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     status: r["status"].as_u64().unwrap_or(0),
                     answered: r["answered"].as_bool().unwrap_or(false),
                     api: text(r, "api"),
@@ -1277,12 +1307,21 @@ impl AgentHome {
         let out = self.host_cli(&["--version"]);
         let shown = String::from_utf8_lossy(&out.stdout);
         assert!(
-            shown.contains(&self.installed.pin.version),
+            reports_version(&shown, &self.installed.pin.version),
             "{} --version says {shown:?}, pinned {}",
             self.installed.pin.id,
             self.installed.pin.version
         );
     }
+}
+
+/// Whether `--version`'s output names `version` as a whole word: `1.0.9`
+/// is not `1.0.90`, nor is `2.1.2801` `2.1.280` (verifier, low: the tier-1
+/// check matched a substring).
+pub fn reports_version(said: &str, version: &str) -> bool {
+    said.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
+        .map(|w| w.trim_start_matches('v').trim_end_matches('.'))
+        .any(|w| w == version)
 }
 
 /// A host run in progress ([`AgentHome::spawn`]). Dropped without
@@ -1924,36 +1963,34 @@ mod tests {
         assert!(refused(|| b.check_isolated()));
     }
 
-    /// A tunnel's destination is named only when it reads as a host name;
-    /// anything else a host put there, a value included, by its length
-    /// (Codex review, medium).
+    /// A tunnel's destination is named only when it is one the pinned
+    /// hosts were measured reaching for; anything else a host put there,
+    /// a value included, by its length, however much it reads like a host
+    /// name (Codex review, medium, twice: a secret of letters only is a
+    /// valid DNS label).
     #[test]
-    fn a_destination_is_named_only_when_it_reads_as_a_host_name() {
-        for named in [
-            "api.anthropic.com:443",
-            "telemetry-logs.kimi.com:443",
-            "generativelanguage.googleapis.com:443",
-            "api2.cursor.sh:443",
-            "a.bc:80",
-        ] {
-            assert_eq!(shown_destination(named), named);
+    fn a_destination_is_named_only_when_it_is_a_listed_one() {
+        for host in DESTINATIONS {
+            for port in ["443", "80"] {
+                let named = format!("{host}:{port}");
+                assert_eq!(shown_destination(&named), named);
+            }
         }
-        let long = format!("{}.example:443", "x".repeat(33));
         for hidden in [
             "",
             "api.anthropic.com",
+            "api.anthropic.com:8443",
+            "api.anthropic.com:",
+            "API.anthropic.com:443",
+            "api.anthropic.com.:443",
+            "x.api.anthropic.com:443",
+            "correcthorsebatterystaple.example:443",
+            "correcthorsebatterystaple.com:443",
+            "api.correcthorsebatterystaple.com:80",
+            "a.bc:80",
             "localhost:443",
-            "API.example.com:443",
             "ecctl-0123456789abcdef.example:443",
-            "sk-proj-abcdefghijklmnop1.example:443",
-            "a.b1:443",
-            "-a.example:443",
-            "a-.example:443",
-            "user@host.example:443",
-            "host.example:44a",
-            "host.example:443443",
-            "a.b.c.d.e.f.g.h.i:1",
-            long.as_str(),
+            "user@api.anthropic.com:443",
             "[::1]:443",
             "127.0.0.1:443",
         ] {
@@ -1965,21 +2002,26 @@ mod tests {
         }
     }
 
-    /// A request line as a diagnostic shows it: a served endpoint and an
-    /// HTTP method by name, anything else by its length.
-    #[test]
-    fn a_request_line_is_shown_by_endpoint_or_length() {
-        let request = |method: &str, path: &str, api: Option<&str>| ModelRequest {
+    fn request(method: &str, path: &str, api: Option<&str>) -> ModelRequest {
+        ModelRequest {
             seq: 0,
             at_ms: 0,
             method: method.to_owned(),
             path: path.to_owned(),
+            query: None,
+            headers: Vec::new(),
             status: 200,
             answered: true,
             api: api.map(str::to_owned),
             pick: None,
             body: Zeroizing::new(Vec::new()),
-        };
+        }
+    }
+
+    /// A request line as a diagnostic shows it: a served endpoint and an
+    /// HTTP method by name, anything else by its length.
+    #[test]
+    fn a_request_line_is_shown_by_endpoint_or_length() {
         let shown = |r: ModelRequest| r.shown();
         assert_eq!(
             shown(request("POST", "/v1/messages", Some("messages"))),
@@ -1997,11 +2039,89 @@ mod tests {
         assert_eq!(
             shown(request(
                 "CONNECT",
-                "ecpath0123456789abcdef.x:443",
+                "correcthorsebatterystaple.example:443",
                 Some("connect")
             )),
-            "CONNECT <28 bytes>"
+            "CONNECT <37 bytes>"
         );
+    }
+
+    /// `Debug`, which failure messages print (`{:?}` of a report's
+    /// requests), shows a request as [`ModelRequest::shown`] does: no
+    /// method, path, query or header name a host made up (verifier, low:
+    /// the method was printed raw).
+    #[test]
+    fn a_request_s_debug_holds_nothing_a_host_sent() {
+        let mut r = request("ECMARKMETHOD", "/ecmark-path", None);
+        r.query = Some("ecmark-query".to_owned());
+        r.headers = vec!["x-ecmark-header".to_owned()];
+        r.body = Zeroizing::new(b"ecmark-body".to_vec());
+        let shown = format!("{r:?}");
+        assert!(!shown.to_ascii_lowercase().contains("mark"), "{shown}");
+        assert!(shown.contains("<method of 12 bytes>"), "{shown}");
+        let r = request("POST", "/v1/messages", Some("messages"));
+        let shown = format!("{r:?}");
+        assert!(
+            shown.contains("\"POST\"") && shown.contains("/v1/messages"),
+            "{shown}"
+        );
+    }
+
+    /// A tier-1 host's check after a run takes the pinned version only as
+    /// a whole word of what `--version` says: a host reporting `2.1.2801`
+    /// is not the pinned `2.1.280` (verifier, low: the check matched a
+    /// substring). The pinned build reporting its own version is the
+    /// control.
+    #[test]
+    fn a_tier_1_host_reporting_a_longer_version_is_not_the_pinned_one() {
+        let home = TestHome::new();
+        for (said, pinned) in [
+            ("2.1.2801 (Claude Code)", false),
+            ("2.1.280 (Claude Code)", true),
+        ] {
+            let dir = home.root().join(if pinned { "same" } else { "longer" });
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+            let exe = dir.join("claude");
+            std::fs::write(&exe, format!("#!/bin/sh\necho '{said}'\n"))
+                .unwrap_or_else(|e| panic!("{e}"));
+            std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let mut host = installed();
+            host.pin.id = "claude-code".to_owned();
+            host.pin.version = "2.1.280".to_owned();
+            host.pin.sha256 = sha256_file(&exe).unwrap_or_else(|e| panic!("{e}"));
+            host.dir = dir;
+            host.exe = exe;
+            let a = AgentHome::within(&home, Host::ClaudeCode, host);
+            assert_eq!(refused(|| a.check_pinned()), !pinned, "{said}");
+        }
+    }
+
+    /// Both tiers' checks after a run (`AgentHome::check_pinned`, and
+    /// the tier-2 runner in `agent_hosts`) take a version only as a whole
+    /// word.
+    #[test]
+    fn a_version_is_reported_only_as_a_whole_word() {
+        for (said, want) in [
+            ("1.0.90\n", "1.0.90"),
+            (
+                "GitHub Copilot CLI 1.0.90.\nRun 'copilot update' to check for updates.\n",
+                "1.0.90",
+            ),
+            ("v1.0.90", "1.0.90"),
+            ("2.1.280 (Claude Code)\n", "2.1.280"),
+            ("codex-cli 0.159.2\n", "0.159.2"),
+            ("2026.09.28-64d2043\n", "2026.09.28-64d2043"),
+        ] {
+            assert!(reports_version(said, want), "{said:?}");
+        }
+        for said in ["1.0.9\n", "1.0.901\n", "", "11.0.90", "2026.09.28\n"] {
+            assert!(!reports_version(said, "1.0.90"), "{said:?}");
+            assert!(!reports_version(said, "2026.09.28-64d2043"), "{said:?}");
+        }
+        for said in ["2.1.2801 (Claude Code)\n", "12.1.280\n", "2.1.28\n"] {
+            assert!(!reports_version(said, "2.1.280"), "{said:?}");
+        }
     }
 
     #[test]

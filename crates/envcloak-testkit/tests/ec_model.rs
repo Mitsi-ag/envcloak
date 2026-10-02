@@ -224,11 +224,12 @@ fn the_command_runs_in_a_home_of_its_own_with_nothing_of_the_callers_environment
 
 /// A request a host sends can put anything in its request line: a path,
 /// a method, a tunnel's destination. `ec-model`'s diagnostics show an
-/// endpoint the model serves and a destination that reads as a host name
-/// by name, and anything else only by its length, so values placed in
-/// every part of a request line (here by `curl`) never reach its standard
-/// error. Its record, mode 0600, keeps them whole: the positive control
-/// that the requests carried them.
+/// endpoint the model serves and a destination the pinned hosts were
+/// measured reaching for by name, and anything else only by its length,
+/// so values placed in every part of a request line (here by `curl`),
+/// a destination of letters only that reads as any host name included,
+/// never reach its standard error. Its record, mode 0600, keeps them
+/// whole: the positive control that the requests carried them.
 #[test]
 fn diagnostics_name_no_request_target_a_host_controls() {
     let curl = ["/usr/bin/curl", "/bin/curl"]
@@ -238,29 +239,39 @@ fn diagnostics_name_no_request_target_a_host_controls() {
     let hex = || format!("{:016x}{:016x}", fresh_seed(), fresh_seed());
     let path = Canary::new("PATH_VALUE", format!("ecpath{}", hex()));
     let host = Canary::new("HOST_VALUE", format!("echost{}", hex()));
+    let letters = |n: usize| -> String {
+        hex()
+            .bytes()
+            .chain(hex().bytes())
+            .take(n)
+            .map(|b| char::from(b'a' + (b % 26)))
+            .collect()
+    };
     // A method is 16 upper-case letters at most.
-    let letters: String = hex()
-        .bytes()
-        .take(14)
-        .map(|b| char::from(b'A' + (b % 26)))
-        .collect();
-    let method = Canary::new("METHOD_VALUE", format!("EC{letters}"));
+    let method = Canary::new(
+        "METHOD_VALUE",
+        format!("EC{}", letters(14).to_ascii_uppercase()),
+    );
+    // A secret that is a valid DNS label: letters only.
+    let word = Canary::new("WORD_VALUE", format!("ec{}", letters(30)));
     let command = format!(
         "c={curl}; t=\"x-api-key: $EC_MODEL_TOKEN\"; \
          $c -s -o /dev/null --path-as-is -H \"$t\" \"$EC_MODEL_BASE_URL/{p}?{p}\"; \
          $c -s -o /dev/null -X {m} -H \"$t\" \"$EC_MODEL_BASE_URL/v1/messages\"; \
          $c -s -o /dev/null -p -x \"$EC_MODEL_BASE_URL\" \"https://{h}.example/\"; \
          $c -s -o /dev/null -x \"$EC_MODEL_BASE_URL\" \"http://{h}.example/{p}\"; \
-         $c -s -o /dev/null -p -x \"$EC_MODEL_BASE_URL\" \"https://api.example.com/\"; true",
+         $c -s -o /dev/null -p -x \"$EC_MODEL_BASE_URL\" \"https://{w}.com/\"; \
+         $c -s -o /dev/null -p -x \"$EC_MODEL_BASE_URL\" \"https://api.anthropic.com/\"; true",
         p = path.as_str(),
         m = method.as_str(),
         h = host.as_str(),
+        w = word.as_str(),
     );
     let files = TestHome::new();
     let record = files.root().join("record.json");
     let out = ec_model(&record, &[("PATH", "/usr/bin:/bin")], &command);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let cs = [path.clone(), host.clone(), method.clone()];
+    let cs = [path.clone(), host.clone(), method.clone(), word.clone()];
     // The requests carried every value: the record has each.
     let kept = std::fs::read(&record).unwrap();
     for c in &cs {
@@ -286,8 +297,8 @@ fn diagnostics_name_no_request_target_a_host_controls() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("api.example.com:443"),
-        "a host name is not named: {stderr}"
+        stderr.contains("api.anthropic.com:443"),
+        "a listed destination is not named: {stderr}"
     );
     // Not clean: the paths are not served. The run says so.
     assert_eq!(out.status.code(), Some(3), "{stderr}");
