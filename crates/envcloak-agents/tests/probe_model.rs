@@ -670,16 +670,33 @@ fn python_s_proxied_requests_are_refused_and_recorded() {
 }
 
 /// What `Debug` shows of a recorded request: the endpoint by name or its
-/// target by length, never the target itself (L-12).
+/// target by length, never the target itself (L-12); and a method or a
+/// header name a client made up only by its length (Codex review,
+/// medium: both were shown verbatim). The record keeps them whole: the
+/// control that the requests carried them.
 #[test]
 fn a_record_s_debug_shows_no_target() {
     let stub = start();
-    let got = send(stub.addr(), &post("/MARK-P/x?MARK-Q", &key(&stub), b"{}")).unwrap();
+    let auth = format!("{}X-Markheader: 1\r\n", key(&stub));
+    let got = send(stub.addr(), &post("/MARK-P/x?MARK-Q", &auth, b"{}")).unwrap();
     assert_eq!(got.status, 404);
+    let mut odd = post("/v1/messages", &key(&stub), b"{}");
+    odd.splice(..4, b"MARKMETHOD".iter().copied());
+    let got = send(stub.addr(), &odd).unwrap();
+    assert_ne!(got.status, 200);
     let report = stub.finish().unwrap();
+    assert_eq!(report.requests.len(), 2, "{:?}", report.requests);
+    assert_eq!(report.requests[1].method, "MARKMETHOD");
+    assert!(
+        report.requests[0]
+            .headers
+            .contains(&"x-markheader".to_owned())
+    );
     let shown = format!("{:?}", report.requests);
-    assert!(!shown.contains("MARK"), "{shown}");
+    assert!(!shown.to_ascii_lowercase().contains("mark"), "{shown}");
     assert!(shown.contains("<16 bytes>"), "{shown}");
+    assert!(shown.contains("<method of 10 bytes>"), "{shown}");
+    assert!(shown.contains("\"<12 bytes>\""), "{shown}");
 }
 
 /// An owner that stops reading cannot keep the program alive: once the

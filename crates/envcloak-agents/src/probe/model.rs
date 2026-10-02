@@ -297,7 +297,9 @@ impl Outcome {
 }
 
 /// One request the stub accepted. `Debug` leaves the body out, and shows
-/// the target only as the endpoint it names or by its length.
+/// the target only as the endpoint it names or by its length, the method
+/// and each header name by name only when it is a known one, else by its
+/// length.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Recorded {
@@ -335,10 +337,15 @@ pub struct Recorded {
 
 impl fmt::Debug for Recorded {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers: Vec<String> = self
+            .headers
+            .iter()
+            .map(|n| http::shown_header_name(n))
+            .collect();
         f.debug_struct("Recorded")
             .field("seq", &self.seq)
             .field("at_ms", &self.at_ms)
-            .field("method", &self.method)
+            .field("method", &http::shown_method(&self.method))
             .field(
                 "target",
                 &http::shown_target(&self.path, self.query.as_deref()),
@@ -347,6 +354,7 @@ impl fmt::Debug for Recorded {
             .field("answered", &self.answered)
             .field("api", &self.api)
             .field("pick", &self.pick)
+            .field("headers", &headers)
             .field("body_len", &self.body.len())
             .finish_non_exhaustive()
     }
