@@ -541,9 +541,11 @@ pub fn begin(
         if !allowed_path(&f.path, home.as_deref(), &data_dir) {
             return Err(invalid());
         }
+        // The permission bits only: a set-user-id, set-group-id or sticky
+        // bit an agent declared is never handed back for a restore to set.
         plan.push(PlannedFile {
             path: f.path,
-            mode: f.mode & 0o7777,
+            mode: f.mode & 0o777,
             size: f.size,
         });
     }
