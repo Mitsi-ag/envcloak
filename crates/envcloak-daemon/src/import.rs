@@ -976,6 +976,9 @@ pub(crate) fn prove_as<'s>(
             .map_err(|_| RpcError::new(ErrorKind::TooManyAttempts))?;
         s.begin_proof()?
     };
+    // The vault is out of its slot (`busy` to other requests) while the
+    // proof runs: a test stops here.
+    envcloak_sys::pause_point("proof.verifying");
     let verified = check(&vault);
     let mut s = locked(&shared.state);
     let now = now_of(&shared.clocks);
