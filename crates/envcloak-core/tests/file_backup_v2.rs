@@ -1026,3 +1026,117 @@ fn a_backup_makes_its_staging_directory_in_the_directory_it_opened() {
     assert_reads_back(&v, &only, &[b"A=1\n"]);
     drop(f);
 }
+
+/// A backup is made durable through `envcloak_sys::sync_file`
+/// (`F_FULLFSYNC` on macOS), in order, and a flush that fails fails the
+/// step it belongs to. Its commit flushes the `data` file, then the
+/// staging directory, then, once renamed, `backups/` (the counting shim
+/// records each by device and inode). A failed flush of `data` or of the
+/// staging directory fails the commit and lists nothing, and the writer
+/// dropped leaves nothing behind; a failed flush of `backups/` after the
+/// rename fails the commit too, with the whole backup in place. A result
+/// flushes its file, then the backup's directory: a failed flush of the
+/// file records nothing, and one of the directory fails the call. A purge
+/// flushes `backups/` after its removals, and a failed flush fails it.
+#[test]
+fn a_backup_is_flushed_in_order_and_a_failed_flush_fails_its_step() {
+    use envcloak_sys::testing::{fail_sync_after, record_syncs, take_synced};
+    use std::os::unix::fs::MetadataExt;
+    let id_of = |p: &Path| {
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    let (f, v) = KitFixture::create();
+    let body = content(&f, CHUNK_V2 + 5, 9);
+    let files: [(&str, u32, &[u8]); 1] = [("/h/.claude/settings.json", 0o600, &body)];
+    let begin = || {
+        let plan = files
+            .iter()
+            .map(|(p, m, b)| PlannedFile {
+                path: (*p).to_owned(),
+                mode: *m,
+                size: b.len() as u64,
+            })
+            .collect();
+        let mut w = v
+            .begin_file_backup_v2(
+                BackupPurpose::Agents,
+                creator(CreatorKind::Agent),
+                plan,
+                now(),
+            )
+            .unwrap();
+        put_all(&mut w, &files);
+        w
+    };
+    let backups = v.paths().backups_dir.clone();
+
+    let mut w = begin();
+    record_syncs();
+    let c = w.commit().unwrap();
+    let flushed = take_synced();
+    assert_eq!(
+        flushed,
+        [id_of(&c.dir.join("data")), id_of(&c.dir), id_of(&backups)],
+        "a commit's flushes: data, the staging directory, backups/"
+    );
+    assert_reads_back(&v, &c.id, &[&body]);
+
+    for n in 0..2 {
+        let mut w = begin();
+        fail_sync_after(n);
+        assert!(
+            w.commit().is_err(),
+            "flush {n} failed and the commit went on"
+        );
+        assert!(
+            list_file_backups_v2(v.paths()).unwrap().len() == 1,
+            "flush {n} failed and a backup was listed"
+        );
+        drop(w);
+        assert_eq!(dir_names(&backups).len(), 1, "flush {n}: staging left");
+    }
+    let mut w = begin();
+    fail_sync_after(2);
+    assert!(
+        w.commit().is_err(),
+        "the flush of backups/ failed unreported"
+    );
+    drop(w);
+    let listed = list_file_backups_v2(v.paths()).unwrap();
+    assert_eq!(listed.len(), 2, "the backup renamed before the flush");
+    let late = listed.iter().find(|b| b.id != c.id).unwrap().id;
+    assert_reads_back(&v, &late, &[&body]);
+
+    let r = v.open_file_backup_v2(&c.id).unwrap();
+    let after: [u8; 32] = Sha256::digest(b"what the change left").into();
+    fail_sync_after(0);
+    assert!(r.record_result(0, &after).is_err());
+    assert_eq!(r.results().unwrap(), [None], "a result whose flush failed");
+    record_syncs();
+    r.record_result(0, &after).unwrap();
+    assert_eq!(
+        take_synced(),
+        [id_of(&c.dir.join("result-0")), id_of(&c.dir)],
+        "a result's flushes: its file, then the backup's directory"
+    );
+    let r2 = v.open_file_backup_v2(&late).unwrap();
+    fail_sync_after(1);
+    assert!(
+        r2.record_result(0, &after).is_err(),
+        "the flush of a backup's directory failed unreported"
+    );
+
+    let t = now() + FILE_BACKUP_RETENTION.as_secs() + 10;
+    fail_sync_after(0);
+    assert!(
+        purge_file_backups_v2(v.paths(), t).is_err(),
+        "the purge's flush failed unreported"
+    );
+    assert!(list_file_backups_v2(v.paths()).unwrap().is_empty());
+    small(&v, now() - FILE_BACKUP_RETENTION.as_secs() - 1);
+    record_syncs();
+    assert_eq!(purge_file_backups_v2(v.paths(), now()).unwrap(), 1);
+    assert_eq!(take_synced(), [id_of(&backups)]);
+    drop(f);
+}
