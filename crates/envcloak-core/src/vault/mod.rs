@@ -64,7 +64,7 @@ use integrity::{state_digest, unlocker_body};
 pub(crate) use paths::{check_private_dir, check_private_file};
 use state::{State, VaultCtx, item_key};
 use values::open_priors;
-pub(crate) use values::{open_record, open_value, seal_record, seal_value};
+pub(crate) use values::{open_record, open_value, seal_record, seal_value, sha256_update};
 
 /// The key epoch of a new vault.
 pub const INITIAL_EPOCH: u32 = 1;

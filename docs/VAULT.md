@@ -204,6 +204,41 @@ A record that is altered, moved, taken from another backup, dropped or appended 
 
 `purge_file_backups` removes file backups whose header's `created_at` is more than 7 days old, and the staging files interrupted writes left (`.files-*.ecfiles.tmp`, complete or partial, regular files unchanged for an hour; a symlink of that name is never followed or removed); the daemon runs it after each unlock and whenever it writes one. It needs no key, and leaves vault backups alone.
 
+## File backups v2
+
+Status: M2 (plan decision D-07, task M2-05). Backups v2 hold any regular file under an allowed root (IPC.md "Backups v2") that `scrub`, `agents install`, `migrate-mcp` or `init` is about to change, of up to 256 MiB, built and read a chunk at a time so no process holds more than one chunk of a file. `files.backup` v1 above stays for `init` in M2. The code is in `crates/envcloak-core/src/file_backup_v2.rs`; the daemon's side, the upload ownership and the restore lease are in IPC.md.
+
+**Layout.** A backup is a directory `backups/files2-<YYYYMMDDTHHMMSSZ>-<id>/` (0700), `<id>` as for v1, holding `data` (0600) and one `result-<index>` (0600) per file whose result is recorded. While it is built it is `backups/.files2-<time>-<id>.tmp/`, which is never listed; only the rename to its name makes it a backup.
+
+**`data`**, all integers big-endian:
+
+```
+magic "ECF2"(4) version 2(1) vault_id(16) schema_version(2) epoch(4) backup_id(16) created_at(8)
+record: this backup's own key
+records: each file's chunks, file by file, chunk by chunk
+record: the metadata
+metadata_offset(8)
+```
+
+Each record is `len(4)` followed by a sealed value (CRYPTO.md) with the associated data `(vault_id, schema_version, epoch, table 10, row_id = backup_id, field, item_class 0, row_version)`:
+
+| Record | Field | Sealed under | `row_version` |
+|---|---|---|---|
+| the key: a fresh random 256-bit key | 14 | the `backup` subkey of the vault's epoch | 0 |
+| a chunk | 16 | the backup's key | `file_index << 32 \| chunk_index << 1 \| final` |
+| the metadata | 15 | the backup's key | 0 |
+| a result (in `result-<index>`) | 15 | the backup's key | `1 << 63 \| file_index` |
+
+A chunk holds 512 KiB of its file (every chunk but a file's last is full; a file of 0 bytes has one empty chunk), so a chunk record is 512 KiB plus 44 bytes: a chunk crosses the socket base64-encoded within one 1 MiB frame. The metadata: `version 1(1) header_sha256(32) chunk_size(4) purpose(1) creator_kind(1) evidence_digest(32) agent(optional text) owner_pid(4) owner_start_time(8) owner_token(optional 4) count(4)`, then per file `path(text) mode(4) size(8) sha256(32)`; text is `len(4)` and UTF-8, an optional value a `0` byte or a `1` byte and the value. `purpose` is 1 `init`, 2 `scrub`, 3 `agents`, 4 `migrate`; `creator_kind` 1 `terminal`, 2 `agent`, 3 `unknown`; `sha256` is each file's contents as the chunks gave them. A result: `version 1(1) file_index(4) sha256_after(32)`.
+
+**Caps.** A file over 256 MiB, a backup over 1 GiB or over 4,096 files is refused (`too_large`) before anything is written, never cut. A path is 1 to 4096 bytes without a NUL, an agent label at most 256.
+
+**What is refused.** Opening a backup checks the header against the vault (its id, epoch and schema), the key, the metadata (and the header's hash in it) and the layout every chunk must have: the chunks fill the space between the key and the metadata exactly, each at its length, so a backup missing a chunk (its final one included), with one too many, cut or extended never opens, and no restore is partial. A chunk is opened with the associated data of the place it is read for: swapped within a file or across files, duplicated over another, or moved, it does not open there. Each file's SHA-256 is compared with the metadata's. A result is written once (`O_EXCL`), bound to its file, and a changed or moved one does not open. Every failure is `BackupDamaged`, which says nothing of the contents.
+
+**Writing.** `Vault::begin_file_backup_v2` makes the staging directory and starts `data` (created exclusively, not following symlinks); `FileBackupV2Writer::put` takes each chunk in order at its exact length (another one, or another length, is refused and nothing is written), seals it and adds it to its file's SHA-256 (a hasher that wipes its state); `commit` refuses while a chunk is missing, then writes the metadata and the offset, syncs `data` and the staging directory, renames it and syncs `backups/`. A writer dropped before its commit removes its staging directory; a process killed before the rename leaves one, never listed. No plaintext copy is written anywhere.
+
+`purge_file_backups_v2` removes v2 backups whose header's `created_at` is more than 7 days old (their `data` and result files, then the directory; anything else in it keeps it) and staging directories unchanged for an hour (a symlink of that name is never followed or removed). The daemon runs it after each unlock and whenever a backup v2 begins. It needs no key.
+
 ## Restore
 
 `restore_backup` takes the paths, the backup file, the Recovery Kit and a new passphrase, and returns the restored vault unlocked. In order:
@@ -291,6 +326,9 @@ entry  = len(4) | seq(8) | sealed(len) | mac(32)
 | Backups: unusable without the kit, any change refused, a changed vault never backed up, a restored digest verifies (also next to side files left without a vault, and a restore that cannot verify what it installed fails), and another vault's backup refused over a vault in place, also one that opens as damaged | `tests/backup.rs` |
 | Restore is atomic: `kill -9` leaves the old or the new vault | `tests/restore_crash.rs` |
 | File backups: ciphertext only, given back byte for byte, any change or another vault's backup refused, purged after 7 days, with the staging files interrupted writes left | `tests/file_backup.rs` |
+| File backups v2 (M2-05): ciphertext only; byte for byte at 0 and 1 byte and at every chunk and 1 MiB boundary; a chunk swapped, reordered, duplicated or cut refused where it is read, and a backup missing its final chunk, or with one too many, never opens; creator and purpose sealed; a result recorded once per file; caps refuse before anything is written; purged after 7 days (injected clock), with the staging directories interrupted backups left | `tests/file_backup_v2.rs` |
+| File backups v2: `kill -9` at each step of begin, put and commit leaves no listed partial backup, and no plaintext | `tests/file_backup_v2_crash.rs` |
+| 11, backups v2: writing, checking and reading chunks and recording a result leave no fixture in freed memory | `tests/file_backup_v2_probe.rs` |
 | 11, unlocker part: no passphrase, kit or fixture in freed memory | `tests/unlock_probe.rs` |
 
 ## Reserved for M2 and M2b
@@ -307,8 +345,8 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 | 22 | `reveal` | M2-21 | reserved | a terminal reveal on Linux, before the value is written |
 | 23 | `scan_match` | M2-11 | reserved | a `scan.match` call: its purpose and counts, never a candidate |
 | 24 | `mark_exposed` | M2-11 | reserved | items marked "exposed: rotate" |
-| 25 | `backup_v2` | M2-05 | reserved | a file backup v2 committed, with its creator and purpose |
-| 26 | `restore_v2` | M2-05 | reserved | a restore lease opened, before the first chunk |
+| 25 | `backup_v2` | M2-05 | landed | a file backup v2 committed, with its creator and purpose |
+| 26 | `restore_v2` | M2-05 | landed | a restore lease opened, before the first chunk |
 | 27 | `agents_config` | M2-08 | reserved | an agent config EnvCloak changed, with its backup |
 | 28 | `migrate_mcp` | M2-20 | reserved | a `migrate-mcp` run and what it rewrote |
 | 29 | `managed_register` | M2-27 | reserved | a managed server registered, updated (a new revision) or removed |
@@ -343,15 +381,15 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 <!-- reservations:table_tag -->
 | Number | Table | Task | Status | Use |
 |---|---|---|---|---|
-| 10 | `file_backup_v2` | M2-05 | reserved | the records of a file backup v2 |
+| 10 | `file_backup_v2` | M2-05 | landed | the records of a file backup v2 |
 <!-- /reservations -->
 
 <!-- reservations:field_tag -->
 | Number | Field | Task | Status | Use |
 |---|---|---|---|---|
-| 14 | `file_backup_v2_key` | M2-05 | reserved | a file backup v2's own key, sealed under `backup` |
-| 15 | `file_backup_v2_metadata` | M2-05 | reserved | its sealed metadata: per file the display path, mode, size and SHA-256, and the creator, purpose and results the daemon records |
-| 16 | `file_backup_v2_chunk` | M2-05 | reserved | one chunk of at most 1 MiB, bound to the file index, chunk index and final flag |
+| 14 | `file_backup_v2_key` | M2-05 | landed | a file backup v2's own key, sealed under `backup` |
+| 15 | `file_backup_v2_metadata` | M2-05 | landed | its sealed metadata: per file the display path, mode, size and SHA-256, and the creator, purpose and results the daemon records |
+| 16 | `file_backup_v2_chunk` | M2-05 | landed | one chunk of at most 1 MiB, bound to the file index, chunk index and final flag |
 <!-- /reservations -->
 
 **Policy record kinds** (`policies.sealed`; each record also carries its own version):

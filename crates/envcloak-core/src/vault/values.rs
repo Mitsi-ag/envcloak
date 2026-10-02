@@ -72,6 +72,15 @@ pub(crate) fn open_value(k: &SubKey, aad: &Aad, stored: &[u8]) -> Result<SecretB
     open_stored(k, aad, stored)
 }
 
+/// Adds a value's bytes to a SHA-256 in progress: a file backup v2's
+/// digest of a file, chunk by chunk (`crate::file_backup_v2`). The hasher
+/// wipes its state when dropped (sha2's `zeroize` feature).
+#[allow(clippy::disallowed_methods)] // Hashes a file's contents for its backup.
+pub(crate) fn sha256_update(h: &mut sha2::Sha256, v: &SecretBytes) {
+    use sha2::Digest as _;
+    h.update(v.expose_secret());
+}
+
 /// Keyed BLAKE3 of a value under the `index` subkey.
 #[allow(clippy::disallowed_methods)] // Hashes the value for lookups.
 pub(crate) fn value_hash(index: &SubKey, v: &SecretBytes) -> [u8; 32] {
