@@ -2062,25 +2062,40 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
 /// the driver's, so the harness's group kill does not reach it: the
 /// driver ends that group itself, with one cleanup set up as soon as the
 /// program is forked and run on every way out of the driver (the outcomes
-/// above, a `SIGTERM` to the driver, which is the harness's limit, and any
-/// error, such as a write to a terminal the program has closed). It kills
+/// above, a signal to the driver that would end it, such as the harness's
+/// limit (`SIGTERM`) or a hangup, and any error, such as a write to a
+/// terminal the program has closed). It kills
 /// the group while the program that leads it is still unreaped, so the
 /// group's id cannot have been reused, and then reaps the program (D-34);
 /// what the program left running in its group (a process that ignores the
 /// hangup when the terminal closes) goes with it. The program's exit is
 /// seen without reaping it, with `waitid(WNOWAIT)`, or a kqueue exit note
-/// where Python has no `waitid` (macOS before 3.13). `SIGTERM` stays
-/// blocked in the driver and is read between waits (every 0.2 s at most),
-/// so it never interrupts the cleanup; the driver then exits 1. Only a
-/// `SIGKILL` to the driver itself skips the cleanup.
+/// where Python has no `waitid` (macOS before 3.13). Every signal whose
+/// default action ends a process (`SIGTERM`, the harness's, and `SIGHUP`,
+/// `SIGINT`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGALRM` and the rest)
+/// stays blocked in the driver and is read between waits (every 0.2 s at
+/// most), so none interrupts the cleanup or skips it; the driver then
+/// exits 1. The program gets the signal mask the driver started with.
+/// Only `SIGKILL`, or a signal a fault raises (`SIGSEGV`, `SIGBUS`,
+/// `SIGFPE`, `SIGILL`, `SIGTRAP`, `SIGSYS`, `SIGABRT`, and `SIGEMT` where
+/// there is one), to the driver itself skips the cleanup (verifier, low:
+/// only `SIGTERM` was blocked, and a `SIGHUP` left the program's group
+/// running).
 const PTY_DRIVER: &str = r#"import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
-TERM = {signal.SIGTERM}
-signal.pthread_sigmask(signal.SIG_BLOCK, TERM)
+def named(*names):
+    return {getattr(signal, n) for n in names if hasattr(signal, n)}
+# Signals that do not end a process, and those a fault raises.
+KEEP = named("SIGKILL", "SIGSTOP", "SIGCHLD", "SIGCONT", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG",
+             "SIGWINCH", "SIGINFO", "SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGTRAP", "SIGSYS",
+             "SIGABRT", "SIGEMT")
+ENDS = set(signal.valid_signals()) - KEEP
+assert named("SIGTERM", "SIGHUP", "SIGINT", "SIGQUIT", "SIGUSR1", "SIGALRM") <= ENDS
+MASK = signal.pthread_sigmask(signal.SIG_BLOCK, ENDS)
 spec = json.load(open(sys.argv[1]))
 pid, fd = pty.fork()
 if pid == 0:
     try:
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, TERM)
+        signal.pthread_sigmask(signal.SIG_SETMASK, MASK)
         os.chdir(spec["cwd"])
         os.execve(spec["argv"][0], spec["argv"], dict(spec["env"]))
     finally:
@@ -2127,8 +2142,9 @@ def drive():
     alive = [True]
     def more(until):
         # What the program writes until `until`, 0.2 s at most, so a
-        # SIGTERM is seen soon; once its terminal has closed, a pause.
-        if signal.SIGTERM in signal.sigpending():
+        # signal that would end the driver is seen soon; once its terminal
+        # has closed, a pause.
+        if ENDS & set(signal.sigpending()):
             raise Ended()
         until = min(until, time.time() + 0.2)
         if not alive[0]:
@@ -2484,6 +2500,105 @@ fn the_pty_driver_ends_the_program_on_the_harness_s_limit() {
         std::time::Duration::from_secs(3),
     );
     assert!(out.is_none(), "the driver finished before its limit");
+}
+
+/// Each signal that would end the driver, not only the harness's
+/// `SIGTERM`, ends the program and what it started before the driver
+/// exits 1 (verifier, low: a `SIGHUP` to the driver ended it with the
+/// program's group still running). The program starts a process that
+/// ignores the hangup and holds the FIFO, says so on the FIFO, and waits;
+/// then the driver, the test's own unreaped child, gets the signal.
+#[test]
+fn the_pty_driver_ends_the_program_on_any_signal_that_would_end_it() {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    for sig in [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGALRM,
+        libc::SIGTERM,
+    ] {
+        let home = envcloak_testkit::TestHome::new();
+        let fifo = home.root().join("held");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let program = home.root().join("program.sh");
+        std::fs::write(
+            &program,
+            format!(
+                "exec 3>{}\nprintf x >&3\n(trap '' HUP; printf r >&3; exec sleep 90) &\n\
+                 exec sleep 90\n",
+                envcloak_e2e::quoted(fifo.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        let spec = json!({
+            "argv": ["/bin/sh", program.to_str().unwrap()],
+            "env": [["PATH", "/usr/bin:/bin"]],
+            "cwd": home.root().to_str().unwrap(),
+            "limit": 120,
+            "steps": [["wait", "never shown", 1]],
+        });
+        let spec_path = home.root().join("pty-spec.json");
+        std::fs::write(&spec_path, spec.to_string()).unwrap();
+        let mut cmd = std::process::Command::new(envcloak_e2e::python3());
+        cmd.arg("-c")
+            .arg(PTY_DRIVER)
+            .arg(&spec_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut driver = envcloak_testkit::agents::GroupChild::spawn(&mut cmd).unwrap();
+        // The FIFO, read until the program has started what it leaves
+        // behind (`x`, then `r`; before the program opens it, a read finds
+        // no writer and ends at once, which says nothing yet), then to its
+        // end once the driver has gone, which it reaches only when nothing
+        // holds it any more.
+        let mut got = Vec::new();
+        let mut read_until = |started: bool, what: &str| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut chunk = [0u8; 16];
+            loop {
+                if !started && got == b"xr" {
+                    return;
+                }
+                match reader.read(&mut chunk) {
+                    Ok(0) if started => return,
+                    Ok(n) => got.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("read the FIFO: {e}"),
+                }
+                assert!(std::time::Instant::now() < end, "signal {sig}: {what}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        read_until(false, "the program did not start what it leaves behind");
+        driver.signal(sig);
+        let status = driver.end_within(std::time::Duration::from_secs(30));
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(1),
+            "signal {sig}: the driver did not end through its cleanup ({status:?})"
+        );
+        read_until(
+            true,
+            "a process the program started still holds the FIFO after the driver exited",
+        );
+        assert_eq!(got, b"xr", "signal {sig}");
+    }
 }
 
 /// One interactive Claude Code session through a pseudo-terminal (D-13,
