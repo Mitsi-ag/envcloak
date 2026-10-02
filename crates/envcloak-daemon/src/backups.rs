@@ -1197,8 +1197,20 @@ pub fn open_restore(
     drop(pass);
     drop(s);
     // The whole backup is checked before a lease exists: a backup that
-    // does not open whole is never restored in part.
-    reader.verify().map_err(|e| backup_error(&e))?;
+    // does not open whole is never restored in part. A lock meanwhile
+    // stops the check before the next chunk: the backup's key and its
+    // chunks go at once, never after decrypting the rest of it.
+    let whole = reader
+        .verify_unless(&mut |opened| {
+            if opened == 1 {
+                envcloak_sys::pause_point("backup.v2.verify");
+            }
+            locked(&shared.state).backups().locks != locks
+        })
+        .map_err(|e| backup_error(&e))?;
+    if !whole {
+        return Err(RpcError::new(ErrorKind::VaultLocked));
+    }
     envcloak_sys::pause_point("backup.v2.open_restore");
     // A lock since the backup was opened, the vault unlocked again or
     // not, issues no lease.

@@ -1359,10 +1359,29 @@ impl FileBackupV2Reader {
     /// [`VaultErrorKind::BackupDamaged`] at the first chunk that does not
     /// open, or file whose contents are not the ones backed up.
     pub fn verify(&self) -> Result<(), VaultError> {
+        self.verify_unless(&mut |_| false).map(drop)
+    }
+
+    /// [`FileBackupV2Reader::verify`], asking `stop` before each chunk,
+    /// with the count of chunks opened so far, whether to go on: once it
+    /// says stop, no other chunk is opened. Returns whether the whole
+    /// backup was checked (`false` when `stop` stopped it). For a caller
+    /// that must not go on decrypting once its reason to went away (the
+    /// daemon, at a lock).
+    ///
+    /// # Errors
+    /// As [`FileBackupV2Reader::verify`].
+    pub fn verify_unless(&self, stop: &mut dyn FnMut(u64) -> bool) -> Result<bool, VaultError> {
+        let mut opened = 0u64;
         for (i, (l, f)) in self.layout.iter().zip(&self.meta.files).enumerate() {
             let mut h = Sha256::new();
             for c in 0..l.chunks {
+                if stop(opened) {
+                    return Ok(false);
+                }
                 let (data, _) = self.chunk(i, c)?;
+                envcloak_sys::test_event("file backup v2 chunk verified");
+                opened += 1;
                 sha256_update(&mut h, &data);
             }
             let got: [u8; 32] = h.finalize().into();
@@ -1370,7 +1389,7 @@ impl FileBackupV2Reader {
                 return Err(damaged());
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// What the change left in each file, as recorded: one entry per file,

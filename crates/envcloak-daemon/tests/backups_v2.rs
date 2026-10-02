@@ -1803,6 +1803,46 @@ fn a_lock_waits_for_a_chunk_on_its_way_out() {
     f.sweep();
 }
 
+/// A lock stops the check of a whole backup that an `open_restore` makes
+/// after its proof before the next chunk: the backup's key and chunks do
+/// not outlive the lock while the rest of it is decrypted. A backup of
+/// four chunks; a barrier after the check opened the first; the vault is
+/// locked; the call then ends `vault_locked`, and the daemon's trace,
+/// read once it stopped, shows that one chunk was opened, not four.
+#[test]
+fn a_lock_stops_the_check_of_a_backup_before_its_next_chunk() {
+    let mut f = Fixture::pausing(Some("backup.v2.verify"));
+    let size = 3 * CHUNK_V2 as u64 + 10;
+    let files = [Spec::made(&f.claude("projects/p/v.jsonl"), size, 26)];
+    let id = f.backup("scrub", &files);
+    let opening = {
+        let (paths, id, pass) = (f.paths(), id.clone(), passphrase(&f.cs));
+        std::thread::spawn(move || {
+            Client::connect(&paths)?.backup_v2_open_restore(&id, pass, false, true, &[])
+        })
+    };
+    f.wait_paused("backup.v2.verify");
+    client(&f.home).lock().unwrap();
+    f.release();
+    let e = opening
+        .join()
+        .unwrap()
+        .err()
+        .unwrap_or_else(|| panic!("a restore checked after a lock issued a lease"));
+    assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
+    f.d.signal("-TERM");
+    assert!(f.d.wait_exit(Duration::from_secs(30)).is_some());
+    let opened = String::from_utf8_lossy(&f.d.log_bytes())
+        .lines()
+        .filter(|l| l.contains("envcloak test: file backup v2 chunk verified"))
+        .count();
+    assert_eq!(
+        opened, 1,
+        "the check went on decrypting the backup after a lock"
+    );
+    f.sweep();
+}
+
 /// A lease is bound to the terminal its proof came from (D-07): a process
 /// that opened one and then moved to another terminal (a new session on a
 /// pseudo-terminal of its own), or to none, is the same process instance
