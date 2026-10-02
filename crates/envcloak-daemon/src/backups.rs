@@ -47,8 +47,10 @@
 //! written issues no lease, so no chunk.
 //!
 //! **Locks.** A lock while a call is in flight stops it: a `read`
-//! delivers nothing, a `put` or `commit` reports the backup ended, and a
-//! backup is put in place only under the state lock. Backups are opened
+//! delivers nothing, a `put` or `commit` reports the backup ended, an
+//! `open_restore` issues no lease, a `record_result` records nothing and
+//! a `list` stops before the next backup it would open; a backup and a
+//! result are put in place only under the state lock. Backups are opened
 //! (their metadata read and opened) outside the state lock.
 
 use std::collections::HashMap;
@@ -375,8 +377,8 @@ pub struct Registry {
     /// [`MAX_CREATOR_WATCHES`], each dropped once its process exited or
     /// its backup's results are all in.
     creators: HashMap<FileBackupId, ProcessWatch>,
-    /// Bumped at every lock: a restore that began before one gets no
-    /// lease.
+    /// Bumped at every lock: a call that began before one (a restore, a
+    /// result, a listing) ends without its effect.
     locks: u64,
 }
 
@@ -843,7 +845,11 @@ pub fn commit(
     })
 }
 
-/// `backup.v2.record_result`.
+/// `backup.v2.record_result`. The result is put in place under the state
+/// lock, only while the vault is unlocked under the lock count the backup
+/// was opened at and the creator still runs: a lock meanwhile records
+/// nothing (`vault_locked`), and a lock after that waits until it is in
+/// place.
 pub fn record_result(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -864,7 +870,10 @@ pub fn record_result(
             });
         }
     }
-    let reader = open_reader(shared, &id)?;
+    let (b, locks) = backups_of(shared)?;
+    let reader = b.open(&id).map_err(|e| backup_error(&e));
+    drop(b);
+    let reader = reader?;
     // From the creator, while it lives (D-07): once it has exited, reaped
     // or not, the backup stays `result_unrecorded`, whoever holds its
     // connection.
@@ -878,12 +887,23 @@ pub fn record_result(
     if !creator_may_act(&mut locked(&shared.state)) {
         return Err(RpcError::new(ErrorKind::NotBackupOwner));
     }
-    reader
-        .record_result(file, &after)
-        .map_err(|e| match e.kind() {
-            VaultErrorKind::AlreadyExists => RpcError::new(ErrorKind::BackupFrozen),
-            _ => backup_error(&e),
-        })?;
+    envcloak_sys::pause_point("backup.v2.record_result");
+    {
+        let mut s = locked(&shared.state);
+        s.unlocked()?;
+        if s.backups().locks != locks {
+            return Err(RpcError::new(ErrorKind::VaultLocked));
+        }
+        if !creator_may_act(&mut s) {
+            return Err(RpcError::new(ErrorKind::NotBackupOwner));
+        }
+        reader
+            .record_result(file, &after)
+            .map_err(|e| match e.kind() {
+                VaultErrorKind::AlreadyExists => RpcError::new(ErrorKind::BackupFrozen),
+                _ => backup_error(&e),
+            })?;
+    }
     let results = reader.results().map_err(|e| backup_error(&e))?;
     let recorded = results.iter().filter(|r| r.is_some()).count();
     let complete = recorded == results.len();
@@ -1034,6 +1054,9 @@ pub fn open_restore(
     // The whole backup is checked before a lease exists: a backup that
     // does not open whole is never restored in part.
     reader.verify().map_err(|e| backup_error(&e))?;
+    envcloak_sys::pause_point("backup.v2.open_restore");
+    // A lock since the proof, the vault unlocked again or not, issues no
+    // lease.
     let mut s = locked(&shared.state);
     s.unlocked()?;
     if s.backups().locks != locks {
@@ -1131,7 +1154,8 @@ pub fn read(
 }
 
 /// `backup.v2.list`. The backups are opened outside the state lock; a
-/// lock while they are read ends the call (`vault_locked`).
+/// lock while they are read ends the call (`vault_locked`) before the next
+/// one is opened, and the copy of the `backup` subkey goes with it.
 pub fn list(shared: &Shared, _p: NoParams) -> Result<BackupListView, RpcError> {
     let open_leases = {
         let mut s = locked(&shared.state);
@@ -1144,12 +1168,20 @@ pub fn list(shared: &Shared, _p: NoParams) -> Result<BackupListView, RpcError> {
     let truncated = found.len() > MAX_LISTED;
     found.truncate(MAX_LISTED);
     let mut backups = Vec::with_capacity(found.len());
+    let still_unlocked = || {
+        let mut s = locked(&shared.state);
+        s.unlocked().is_ok() && s.backups().locks == locks
+    };
     for listed in found {
+        if !still_unlocked() {
+            return Err(RpcError::new(ErrorKind::VaultLocked));
+        }
         backups.push(entry(&b, &listed.id, listed.created_at));
+        envcloak_sys::test_event("backup.v2.list opened a backup");
         envcloak_sys::pause_point("backup.v2.list");
     }
     drop(b);
-    if locked(&shared.state).backups().locks != locks {
+    if !still_unlocked() {
         return Err(RpcError::new(ErrorKind::VaultLocked));
     }
     Ok(BackupListView {
