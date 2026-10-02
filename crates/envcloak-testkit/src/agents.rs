@@ -1520,6 +1520,18 @@ impl Collector {
     }
 
     fn wait_grace(&self, child: &mut GroupChild, limit: Duration, grace: Duration) -> Output {
+        let ended = self.end(child, limit, grace);
+        assert!(ended.in_time, "a process did not exit within {limit:?}");
+        assert!(
+            ended.complete,
+            "incomplete output: {grace:?} after the process exited and its group was killed, \
+             a process outside the group still held its output open"
+        );
+        ended.output
+    }
+
+    /// [`Collector::wait`] without its panics: how the run ended.
+    fn end(&self, child: &mut GroupChild, limit: Duration, grace: Duration) -> Bounded {
         let in_time = child.wait_exit(limit);
         if !in_time {
             child.signal_group(libc::SIGTERM);
@@ -1536,12 +1548,6 @@ impl Collector {
             std::thread::sleep(Duration::from_millis(20));
         }
         let complete = done(&self.out) && done(&self.err);
-        assert!(in_time, "a process did not exit within {limit:?}");
-        assert!(
-            complete,
-            "incomplete output: {grace:?} after the process exited and its group was killed, \
-             a process outside the group still held its output open"
-        );
         let take = |c: &Collected| {
             std::mem::take(
                 &mut c
@@ -1550,12 +1556,46 @@ impl Collector {
                     .0,
             )
         };
-        Output {
-            status,
-            stdout: take(&self.out),
-            stderr: take(&self.err),
+        Bounded {
+            output: Output {
+                status,
+                stdout: take(&self.out),
+                stderr: take(&self.err),
+            },
+            in_time,
+            complete,
         }
     }
+}
+
+/// How a run [`run_within`] bounded ended.
+#[derive(Debug)]
+pub struct Bounded {
+    /// Its exit status and its output, as far as it was read.
+    pub output: Output,
+    /// It exited within its limit; else its group was sent `SIGTERM`,
+    /// then `SIGKILL` 2 s later.
+    pub in_time: bool,
+    /// Its output was read to the end: no process outside its group
+    /// still held it open [`OUTPUT_GRACE`] after it exited and its group
+    /// was killed. Such a process escaped the group and may still run.
+    pub complete: bool,
+}
+
+/// Spawns `cmd` (its standard output and error piped) as the leader of a
+/// process group of its own, waits up to `limit` for it to exit (past it:
+/// `SIGTERM` to its group, then `SIGKILL`), kills what is left of its
+/// group either way, reaps it, and reads its output to the end, or for
+/// [`OUTPUT_GRACE`] more when a process outside the group holds it open.
+/// For a program that reports a run past its limit, or a descendant
+/// outside its group, instead of failing a test: `ec-model`.
+///
+/// # Errors
+/// When the process cannot start.
+pub fn run_within(mut cmd: Command, limit: Duration) -> std::io::Result<Bounded> {
+    let mut child = GroupChild::spawn(&mut cmd)?;
+    let collector = Collector::start(&mut child.child);
+    Ok(collector.end(&mut child, limit, OUTPUT_GRACE))
 }
 
 /// Spawns `cmd` as the leader of a process group of its own and waits up
