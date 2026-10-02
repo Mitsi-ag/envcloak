@@ -230,9 +230,16 @@ impl Vault {
         let bytes = linked?;
         removed?;
         envcloak_sys::sync_file(&dir)?;
+        // The path shown to the person, with the data directory's
+        // ancestors resolved as before (macOS `/tmp` is `/private/tmp`):
+        // for display only, after the backup was written through the
+        // handle; nothing is opened by it.
+        let shown = std::fs::canonicalize(&paths.backups_dir)
+            .unwrap_or_else(|_| paths.backups_dir.clone())
+            .join(&name);
         Ok(BackupInfo {
             bytes,
-            path: paths.backups_dir.join(&name),
+            path: shown,
             backup_id,
             created_at,
             write_counter: header.write_counter,
