@@ -1535,78 +1535,90 @@ fn a_restore_is_refused_to_an_agent_and_to_a_process_without_a_terminal() {
 
 /// A connection outlives the process that made it when the descriptor is
 /// handed on, and a process that exited keeps its pid and start time
-/// until its parent reaps it. The creator of a committed backup passes
-/// one of its connections to a child and exits before recording a
-/// result; this test, its parent, does not reap it yet. The child then
-/// records a result on that connection, and is refused: on Linux the
-/// daemon still names the creator there, which has exited, zombie or not
-/// (`not_backup_owner`); on macOS it closes the connection, whose peer
-/// changed. While the creator is still unreaped the backup lists
-/// `result_unrecorded`. The same with a lease: its process opens one,
-/// hands a connection on and exits, the child's read under it is refused
-/// and the lease ends, before the process is reaped. And a `begin` on
-/// such a connection begins nothing (`evidence`, `caller_gone`, on
-/// Linux).
-#[test]
-fn a_connection_handed_on_does_not_act_for_a_creator_that_exited() {
+/// until its parent reaps it. A worker begins and commits a backup (and
+/// for `read` opens a lease on it), passes one of its connections to a
+/// child and exits; this test, its parent, does not reap it yet. The
+/// child then makes the call `what` on that connection, and is refused:
+/// on Linux the daemon still names the worker there, which has exited
+/// (`not_backup_owner`, `no_such_lease` or `evidence`); on macOS it
+/// closes the connection, whose peer changed. While the worker is still
+/// unreaped its backup lists `result_unrecorded`, and its lease ends.
+fn handed_on_after_exit(what: &str) {
     let f = Fixture::new();
     let files = [Spec::made(&f.home.home().join("acme/.env"), 20, 15)];
-    for what in ["result", "read", "begin"] {
-        let mut w = f.child("worker", false);
-        let pid = i32::try_from(w.child.id()).unwrap();
-        let start = envcloak_sys::proc_info(pid).unwrap().start_time;
-        let id = w.ask(json!({"op": "begin", "purpose": "scrub",
-            "files": files.iter().map(Spec::to_json).collect::<Vec<_>>()}))["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert_eq!(w.ask(json!({"op": "put_next", "id": id}))["final"], true);
-        assert_eq!(w.ask(json!({"op": "commit", "id": id}))["files"], 1);
-        let mut hand = json!({"op": "hand_over", "id": id, "call": what});
-        let leases = f.list().open_leases;
-        if what == "read" {
-            let r = w.ask(json!({"op": "open", "id": id, "pass": f.pass()}));
-            hand["lease"] = r["lease"].clone();
-            assert!(hand["lease"].is_string(), "{r}");
-            assert_eq!(f.list().open_leases, leases + 1);
-        }
-        assert_eq!(w.ask(hand)["handed"], true);
-        let _ = writeln!(w.stdin, "{}", json!({"op": "exit"}));
-        let held = read_reply(&mut w.out)["held"].clone();
-        let refused = held["err"]
-            == match what {
-                "result" => "not_backup_owner",
-                "read" => "no_such_lease",
-                _ => "evidence",
-            }
-            || held["closed"] == true;
-        assert!(refused, "{what}: the handed-on connection acted: {held}");
-        // Still not reaped: the creator is a zombie, and has exited.
-        let unreaped = || envcloak_sys::proc_info(pid).is_ok_and(|i| i.start_time == start);
-        assert!(unreaped(), "{what}: the creator was reaped");
-        if what != "read" {
-            let l = f.list();
-            assert_eq!(
-                l.backups.iter().find(|b| b.id == id).unwrap().state,
-                BackupStateView::ResultUnrecorded,
-                "an exited, unreaped creator counts as running"
-            );
-        } else {
-            let end = Instant::now() + Duration::from_secs(10);
-            while f.list().open_leases != leases {
-                assert!(
-                    Instant::now() < end,
-                    "the lease of an exited, unreaped process is still open"
-                );
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        assert!(unreaped(), "{what}: the creator was reaped");
-        w.child.wait().unwrap();
-        let lease = f.open(&id, false, true).unwrap();
-        assert_eq!(lease.statement.files[0].sha256_after, None);
+    let mut w = f.child("worker", false);
+    let pid = i32::try_from(w.child.id()).unwrap();
+    let start = envcloak_sys::proc_info(pid).unwrap().start_time;
+    let id = w.ask(json!({"op": "begin", "purpose": "scrub",
+        "files": files.iter().map(Spec::to_json).collect::<Vec<_>>()}))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(w.ask(json!({"op": "put_next", "id": id}))["final"], true);
+    assert_eq!(w.ask(json!({"op": "commit", "id": id}))["files"], 1);
+    let mut hand = json!({"op": "hand_over", "id": id, "call": what});
+    if what == "read" {
+        let r = w.ask(json!({"op": "open", "id": id, "pass": f.pass()}));
+        hand["lease"] = r["lease"].clone();
+        assert!(hand["lease"].is_string(), "{r}");
+        assert_eq!(f.list().open_leases, 1);
     }
+    assert_eq!(w.ask(hand)["handed"], true);
+    let _ = writeln!(w.stdin, "{}", json!({"op": "exit"}));
+    let held = read_reply(&mut w.out)["held"].clone();
+    let refused = held["err"]
+        == match what {
+            "result" => "not_backup_owner",
+            "read" => "no_such_lease",
+            _ => "evidence",
+        }
+        || held["closed"] == true;
+    assert!(refused, "{what}: the handed-on connection acted: {held}");
+    // Still not reaped: the worker is a zombie, and has exited.
+    let unreaped = || envcloak_sys::proc_info(pid).is_ok_and(|i| i.start_time == start);
+    assert!(unreaped(), "{what}: the worker was reaped");
+    if what == "read" {
+        let end = Instant::now() + Duration::from_secs(10);
+        while f.list().open_leases != 0 {
+            assert!(
+                Instant::now() < end,
+                "the lease of an exited, unreaped process is still open"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    } else {
+        assert_eq!(
+            f.list().backups[0].state,
+            BackupStateView::ResultUnrecorded,
+            "an exited, unreaped creator counts as running"
+        );
+    }
+    assert!(unreaped(), "{what}: the worker was reaped");
+    w.child.wait().unwrap();
+    let lease = f.open(&id, false, true).unwrap();
+    assert_eq!(lease.statement.files[0].sha256_after, None);
     f.sweep();
+}
+
+/// [`handed_on_after_exit`] with `record_result`: the result of a creator
+/// that exited is never recorded, reaped or not.
+#[test]
+fn a_connection_handed_on_records_no_result_for_a_creator_that_exited() {
+    handed_on_after_exit("result");
+}
+
+/// [`handed_on_after_exit`] with `read`: a lease of a process that exited
+/// serves no chunk, reaped or not, and ends.
+#[test]
+fn a_connection_handed_on_reads_nothing_under_the_lease_of_a_process_that_exited() {
+    handed_on_after_exit("read");
+}
+
+/// [`handed_on_after_exit`] with `begin`: nothing is begun for a process
+/// that exited, reaped or not.
+#[test]
+fn a_connection_handed_on_begins_nothing_for_a_process_that_exited() {
+    handed_on_after_exit("begin");
 }
 
 /// A lock stops a call already in flight (SPEC "Lock"; D-07): the daemon
