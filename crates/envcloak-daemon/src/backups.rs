@@ -661,10 +661,13 @@ fn backups_of(shared: &Shared) -> Result<(FileBackupsV2, u64), RpcError> {
     Ok((b, s.backups().locks))
 }
 
-/// Opens backup `id`, outside the state lock.
-fn open_reader(shared: &Shared, id: &FileBackupId) -> Result<FileBackupV2Reader, RpcError> {
-    let (b, _) = backups_of(shared)?;
-    b.open(id).map_err(|e| backup_error(&e))
+/// Opens backup `id`, outside the state lock, with the count of locks
+/// the copy of the `backup` subkey it was opened with was taken at: a
+/// call that goes on with the reader compares it before any effect.
+fn open_reader(shared: &Shared, id: &FileBackupId) -> Result<(FileBackupV2Reader, u64), RpcError> {
+    let (b, locks) = backups_of(shared)?;
+    let r = b.open(id).map_err(|e| backup_error(&e))?;
+    Ok((r, locks))
 }
 
 /// A committed backup's answer to a caller that may not change it, or to
@@ -672,7 +675,7 @@ fn open_reader(shared: &Shared, id: &FileBackupId) -> Result<FileBackupV2Reader,
 /// anyone else, `no_such_backup` when there is none.
 fn not_in_progress(shared: &Shared, id: &FileBackupId, peer: &PeerIdentity) -> RpcError {
     match open_reader(shared, id) {
-        Ok(r) if owner_may_act(&r.meta().creator.owner, None, peer) => {
+        Ok((r, _)) if owner_may_act(&r.meta().creator.owner, None, peer) => {
             RpcError::new(ErrorKind::BackupFrozen)
         }
         Ok(_) => RpcError::new(ErrorKind::NotBackupOwner),
@@ -1056,9 +1059,12 @@ pub fn open_restore(
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, METHOD)?;
     let watch = watch_of(peer)?;
-    // What the backup is, before the passphrase is looked at.
-    let (reader, results) = {
-        let r = open_reader(shared, &id)?;
+    // What the backup is, before the passphrase is looked at, and the
+    // count of locks its key was taken at: a lock from then on, before
+    // the proof or after it, the vault unlocked again or not, issues no
+    // lease.
+    let (reader, results, locks) = {
+        let (r, locks) = open_reader(shared, &id)?;
         let results = r.results().map_err(|e| backup_error(&e))?;
         // The approval-origin boundary, as for a pending request: not from
         // a session or terminal of the chain of the agent or unknown process
@@ -1073,7 +1079,7 @@ pub fn open_restore(
             });
             return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
         }
-        (Arc::new(r), Arc::new(results))
+        (Arc::new(r), Arc::new(results), locks)
     };
     let state = state_of(&reader, &results);
     let by_agent = reader.meta().creator.kind != CreatorKind::Terminal;
@@ -1090,19 +1096,19 @@ pub fn open_restore(
             "created_by_agent",
         ));
     }
+    envcloak_sys::pause_point("backup.v2.restore_opened");
     // One proof: one Argon2id run.
-    let (mut s, caller) = prove_as(shared, peer, caller, AuditKind::RestoreV2, |v| {
+    let (s, caller) = prove_as(shared, peer, caller, AuditKind::RestoreV2, |v| {
         v.verify_passphrase(&pass)
     })?;
     drop(pass);
-    let locks = s.backups().locks;
     drop(s);
     // The whole backup is checked before a lease exists: a backup that
     // does not open whole is never restored in part.
     reader.verify().map_err(|e| backup_error(&e))?;
     envcloak_sys::pause_point("backup.v2.open_restore");
-    // A lock since the proof, the vault unlocked again or not, issues no
-    // lease.
+    // A lock since the backup was opened, the vault unlocked again or
+    // not, issues no lease.
     let mut s = locked(&shared.state);
     s.unlocked()?;
     if s.backups().locks != locks {

@@ -21,7 +21,8 @@
 //!   in flight stops it; an audit entry that cannot be written issues no
 //!   lease, and a lease's entry is on disk before its first chunk; a
 //!   backup that does not open whole releases nothing; list holds no lock
-//!   while it opens backups;
+//!   while it opens backups; a lock from the moment a restore opens its
+//!   backup, before the proof or after it, issues no lease;
 //! - a killed client or daemon leaves no listed partial backup.
 //!
 //! The caller is this test process, made a terminal session first. Other
@@ -1803,14 +1804,19 @@ fn a_lease_serves_only_the_terminal_it_is_on_when_the_chunk_goes_out() {
 
 /// A lock stops a restore or a result in flight, also when the vault is
 /// unlocked again before the call goes on: the daemon is stopped by a
-/// barrier in `open_restore` after the proof and the check of the whole
-/// backup, before the lease, and in `record_result` before the result is
-/// put in place, and the vault is locked (and, the second time, unlocked
-/// again) meanwhile. The call then ends `vault_locked`: no lease is open
-/// and no result recorded, and both go through once asked again.
+/// barrier in `open_restore` once the backup is opened, before the proof,
+/// and again after the proof and the check of the whole backup, before
+/// the lease, and in `record_result` before the result is put in place,
+/// and the vault is locked (and, the second time, unlocked again)
+/// meanwhile. The call then ends `vault_locked`: no lease is open and no
+/// result recorded, and both go through once asked again.
 #[test]
 fn a_lock_stops_a_restore_or_a_result_in_flight() {
-    for site in ["backup.v2.open_restore", "backup.v2.record_result"] {
+    for site in [
+        "backup.v2.restore_opened",
+        "backup.v2.open_restore",
+        "backup.v2.record_result",
+    ] {
         for relock in [false, true] {
             let what = format!("{site}, unlocked again: {relock}");
             let mut f = Fixture::pausing(Some(site));
@@ -1821,7 +1827,7 @@ fn a_lock_stops_a_restore_or_a_result_in_flight() {
             let pass = passphrase(&f.cs);
             let in_flight: std::thread::JoinHandle<Result<(), ClientError>> = {
                 let id = id.clone();
-                if site == "backup.v2.open_restore" {
+                if site != "backup.v2.record_result" {
                     std::thread::spawn(move || {
                         Client::connect(&paths)?
                             .backup_v2_open_restore(&id, pass, false, true, &[])
