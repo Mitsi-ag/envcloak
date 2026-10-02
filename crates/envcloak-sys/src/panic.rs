@@ -60,6 +60,20 @@ pub fn panic_point(site: &str) {
     let _ = site;
 }
 
+/// A place on a value path where a test build can be made to stop until a
+/// test lets it go on: a barrier, so a test can lock the vault while a
+/// call is in flight. Nothing in a build without the `testing` feature,
+/// which only tests enable. With it, when `ENVCLOAK_TEST_PAUSE` names
+/// `site` and the file `ENVCLOAK_TEST_PAUSE_RELEASE` names does not exist
+/// yet, the thread writes `envcloak test: paused at <site>` on standard
+/// error and waits (at most a minute) until that file exists.
+pub fn pause_point(site: &str) {
+    #[cfg(feature = "testing")]
+    crate::testing::pause_point(site);
+    #[cfg(not(feature = "testing"))]
+    let _ = site;
+}
+
 /// A test build's replacement for the daemon's wait for a frame to start
 /// on an open connection (`ENVCLOAK_TEST_IDLE_CONNECTION_MS`), so a test
 /// sees the bound work without waiting for it. `None` in a build without

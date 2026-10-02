@@ -690,6 +690,8 @@ pub struct FileBackupV2Writer {
     next_chunk: u64,
     hasher: Sha256,
     digests: Vec<[u8; 32]>,
+    /// The size of `data` once [`FileBackupV2Writer::seal`] wrote it all.
+    sealed_len: Option<u64>,
     done: bool,
     observe: Option<Observer>,
 }
@@ -801,6 +803,7 @@ impl Vault {
             next_chunk: 0,
             hasher: Sha256::new(),
             digests: Vec::new(),
+            sealed_len: None,
             done: false,
             observe,
         };
@@ -914,13 +917,34 @@ impl FileBackupV2Writer {
 
     /// Seals the metadata after the chunks and puts the backup in place:
     /// from then on it is listed, and its contents never change.
+    /// [`FileBackupV2Writer::seal`], then [`FileBackupV2Writer::install`].
     ///
     /// # Errors
     /// [`VaultErrorKind::InvalidRecord`] while a chunk is missing (the
     /// writer is kept; nothing is written); an I/O error when the backup
     /// could not be put in place, in which case nothing is listed.
     pub fn commit(&mut self) -> Result<CommittedV2, VaultError> {
-        if self.next().is_some() || self.digests.len() != self.plan.len() || self.done {
+        self.seal()?;
+        self.install()
+    }
+
+    /// The first half of [`FileBackupV2Writer::commit`]: writes the sealed
+    /// metadata and the trailer, and flushes `data` and the staging
+    /// directory. Nothing is listed yet, and a writer dropped now still
+    /// removes its staging directory: whoever puts the backup in place
+    /// ([`FileBackupV2Writer::install`]) can check first that it still
+    /// may.
+    ///
+    /// # Errors
+    /// [`VaultErrorKind::InvalidRecord`] while a chunk is missing, or once
+    /// sealed (nothing is written then); an I/O error, after which the
+    /// backup cannot be put in place.
+    pub fn seal(&mut self) -> Result<(), VaultError> {
+        if self.next().is_some()
+            || self.digests.len() != self.plan.len()
+            || self.done
+            || self.sealed_len.is_some()
+        {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
         let files: Vec<FileMetaV2> = self
@@ -950,7 +974,25 @@ impl FileBackupV2Writer {
         file.sync_all()?;
         drop(file);
         sync_dir(&self.staging)?;
+        self.sealed_len = Some(at + n + TRAILER_LEN as u64);
         self.step(StepV2::Synced);
+        Ok(())
+    }
+
+    /// The second half of [`FileBackupV2Writer::commit`], after
+    /// [`FileBackupV2Writer::seal`]: renames the staging directory to the
+    /// backup's name and flushes `backups/`. From the rename on the backup
+    /// is listed.
+    ///
+    /// # Errors
+    /// [`VaultErrorKind::InvalidRecord`] unless sealed and not yet in
+    /// place; an I/O error when the rename fails (nothing is listed) or
+    /// `backups/` cannot be flushed (the backup is in place, but may not
+    /// last a crash).
+    pub fn install(&mut self) -> Result<CommittedV2, VaultError> {
+        let Some(bytes) = self.sealed_len.filter(|_| !self.done) else {
+            return Err(VaultErrorKind::InvalidRecord.into());
+        };
         std::fs::rename(&self.staging, &self.final_dir)?;
         self.done = true;
         self.step(StepV2::Installed);
@@ -961,7 +1003,7 @@ impl FileBackupV2Writer {
             dir: self.final_dir.clone(),
             created_at: self.ctx.created_at,
             files: self.plan.len(),
-            bytes: at + n + TRAILER_LEN as u64,
+            bytes,
         })
     }
 }
