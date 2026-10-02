@@ -296,10 +296,17 @@ jobs:
           fi
       - name: Build S0 for the release binaries
         run: cargo test --locked -p envcloak-e2e --test m2_story --no-run
+      # The positive control: --exact runs nothing for a name no test has,
+      # and passes, so the step also requires that the one test ran and passed.
       - name: The network outside the isolation is open
         env:
           ENVCLOAK_TEST_NETWORK: open
-        run: cargo test --locked --offline -p envcloak-e2e --test m2_story -- --exact the_network_is_what_ci_says
+        run: |
+          set -o pipefail
+          cargo test --locked --offline -p envcloak-e2e --test m2_story -- --exact \
+            the_network_is_what_ci_says 2>&1 | tee "$RUNNER_TEMP/network-open.log"
+          grep -qx 'running 1 test' "$RUNNER_TEMP/network-open.log"
+          grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/network-open.log"
       - name: S0 on the release binaries, loopback only (Linux)
         if: runner.os == 'Linux'
         env:
@@ -457,10 +464,17 @@ jobs:
         run: |
           cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
           cargo test --locked -p envcloak-e2e --test m2_story --no-run
+      # The positive control: --exact runs nothing for a name no test has,
+      # and passes, so the step also requires that the one test ran and passed.
       - name: The network outside the namespace is open
         env:
           ENVCLOAK_TEST_NETWORK: open
-        run: cargo test --locked --offline -p envcloak-e2e --test m2_story -- --exact the_network_is_what_ci_says
+        run: |
+          set -o pipefail
+          cargo test --locked --offline -p envcloak-e2e --test m2_story -- --exact \
+            the_network_is_what_ci_says 2>&1 | tee "$RUNNER_TEMP/network-open.log"
+          grep -qx 'running 1 test' "$RUNNER_TEMP/network-open.log"
+          grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/network-open.log"
       - name: Story steps, loopback only
         env:
           ENVCLOAK_TEST_NETWORK: loopback-only
@@ -544,10 +558,17 @@ jobs:
         run: |
           cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
           cargo test --locked -p envcloak-e2e $TESTS --no-run
+      # The positive control: --exact runs nothing for a name no test has,
+      # and passes, so the step also requires that the one test ran and passed.
       - name: The network outside the isolation is open
         env:
           ENVCLOAK_TEST_NETWORK: open
-        run: cargo test --locked --offline -p envcloak-e2e --test agent_hosts -- --exact the_network_is_what_ci_says
+        run: |
+          set -o pipefail
+          cargo test --locked --offline -p envcloak-e2e --test agent_hosts -- --exact \
+            the_network_is_what_ci_says 2>&1 | tee "$RUNNER_TEMP/network-open.log"
+          grep -qx 'running 1 test' "$RUNNER_TEMP/network-open.log"
+          grep -q '^test result: ok. 1 passed; 0 failed' "$RUNNER_TEMP/network-open.log"
       - name: Agent hosts, loopback only (Linux)
         if: runner.os == 'Linux'
         env:
