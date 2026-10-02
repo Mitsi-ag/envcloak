@@ -51,12 +51,15 @@
 //! delivers nothing, a `put` or `commit` reports the backup ended, an
 //! `open_restore` issues no lease, a `record_result` records nothing and
 //! a `list` stops before the next backup it would open; a backup and a
-//! result are put in place only under the state lock. Backups are opened
-//! (their metadata read and opened) outside the state lock.
+//! result are put in place only under the state lock. A chunk that passed
+//! its last check before a lock is written to its socket before the lock
+//! answers: the lock waits for it ([`Deliveries`]), within the server's
+//! limit for writing an answer. Backups are opened (their metadata read
+//! and opened) outside the state lock.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use envcloak_core::audit::{AuditKind, SubjectSummary};
@@ -493,6 +496,84 @@ impl Registry {
                 && awake.saturating_sub(l.last_used) <= LEASE_IDLE
         })
     }
+}
+
+/// The restore chunks on their way out (SPEC §5 "Lock": a lock stops
+/// deliveries). Each is counted from its last check under the state lock,
+/// at the count of locks then, until its answer is written to the socket
+/// or the write fails, within the server's limit for writing an answer.
+/// A lock waits for those counted before it ([`wait_for_deliveries`]), so
+/// once a lock has answered, no chunk that passed its check before it is
+/// still going out, and none passes its check after it.
+#[derive(Default)]
+pub struct Deliveries {
+    /// How many are out, by the count of locks they were checked at.
+    out: Mutex<BTreeMap<u64, usize>>,
+    done: Condvar,
+}
+
+impl core::fmt::Debug for Deliveries {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Deliveries")
+            .field("out", &locked(&self.out).values().sum::<usize>())
+            .finish()
+    }
+}
+
+impl Deliveries {
+    /// Counts a chunk that passed its last check at lock count `locks`,
+    /// under the state lock, until the [`Delivering`] is dropped.
+    fn start(&self, locks: u64) -> Delivering<'_> {
+        *locked(&self.out).entry(locks).or_insert(0) += 1;
+        Delivering { of: self, locks }
+    }
+
+    /// Waits until no chunk checked at a count of locks below `locks` is
+    /// still going out.
+    fn wait_before(&self, locks: u64) {
+        let mut out = locked(&self.out);
+        if out.range(..locks).next().is_none() {
+            return;
+        }
+        envcloak_sys::test_event("a lock waits for a chunk on its way out");
+        while out.range(..locks).next().is_some() {
+            out = self
+                .done
+                .wait(out)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// A restore chunk on its way out: held until its answer is written, or
+/// its write failed. Its `Debug` shows the count of locks it was checked
+/// at only.
+#[derive(Debug)]
+pub struct Delivering<'a> {
+    of: &'a Deliveries,
+    locks: u64,
+}
+
+impl Drop for Delivering<'_> {
+    fn drop(&mut self) {
+        let mut out = locked(&self.of.out);
+        if let Some(n) = out.get_mut(&self.locks) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                out.remove(&self.locks);
+            }
+        }
+        drop(out);
+        self.of.done.notify_all();
+    }
+}
+
+/// After a lock: waits until no restore chunk that passed its last check
+/// before it is still going out (each is bounded by the server's limit
+/// for writing an answer). Called without the state lock held.
+pub(crate) fn wait_for_deliveries(shared: &Shared) {
+    let locks = locked(&shared.state).backups().locks;
+    shared.deliveries.wait_before(locks);
 }
 
 /// The controlling terminal of `peer`'s process now, read for its pid
@@ -1169,12 +1250,13 @@ pub fn open_restore(
     })
 }
 
-/// `backup.v2.read`.
-pub fn read(
-    shared: &Shared,
+/// `backup.v2.read`: the chunk, and its delivery, which the caller holds
+/// until the answer is written ([`Deliveries`]).
+pub fn read<'s>(
+    shared: &'s Shared,
     peer: &PeerIdentity,
     p: BackupReadParams,
-) -> Result<BackupChunk, RpcError> {
+) -> Result<(BackupChunk, Delivering<'s>), RpcError> {
     let none = || RpcError::new(ErrorKind::NoSuchLease);
     let lease = FileBackupId::parse(&p.lease).ok_or_else(none)?;
     refuse_if_traced()?;
@@ -1195,8 +1277,10 @@ pub fn read(
     // still stands, checked under the state lock after it was read, with
     // the caller's terminal and the clocks read again. A lock, the lease's
     // end, its owner's exit, a move to another terminal or a read that
-    // outlasted the idle limit meanwhile delivers nothing.
-    {
+    // outlasted the idle limit meanwhile delivers nothing. Once checked,
+    // the chunk is counted as on its way out until its answer is written,
+    // and a lock waits for it before it answers.
+    let delivering = {
         let terminal = terminal_now(peer);
         let awake = shared.clocks.awake();
         let mut s = locked(&shared.state);
@@ -1205,8 +1289,10 @@ pub fn read(
         if !standing {
             return Err(none());
         }
-    }
-    Ok(BackupChunk {
+        shared.deliveries.start(s.backups().locks)
+    };
+    envcloak_sys::pause_point("backup.v2.deliver");
+    let chunk = BackupChunk {
         data: WireSecret::new(data),
         last,
         file: if p.chunk == 0 {
@@ -1214,7 +1300,8 @@ pub fn read(
         } else {
             None
         },
-    })
+    };
+    Ok((chunk, delivering))
 }
 
 /// `backup.v2.list`. The backups are opened outside the state lock; a

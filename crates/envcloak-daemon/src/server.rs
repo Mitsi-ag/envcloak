@@ -40,7 +40,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -99,7 +99,7 @@ pub const FRAME_DEADLINE: Duration = Duration::from_secs(10);
 /// of them holding [`MAX_PER_PROCESS`] each could keep every place taken,
 /// and `envcloak lock` and `status` out, for that long (review T7 open 2).
 pub const IDLE_CONNECTION: Duration = Duration::from_secs(30);
-/// A response must be written within this long.
+/// A response must be written within this long, as a whole.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How the daemon runs.
@@ -188,6 +188,8 @@ pub(crate) struct Shared {
     pub(crate) registry: Option<Registry>,
     /// Values compared with the vault, per subject root.
     pub(crate) value_checks: Mutex<crate::import::ValueChecks>,
+    /// The restore chunks on their way out, which a lock waits for.
+    pub(crate) deliveries: backups::Deliveries,
 }
 
 impl Shared {
@@ -314,6 +316,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         catalog,
         registry,
         value_checks: Mutex::new(crate::import::ValueChecks::default()),
+        deliveries: backups::Deliveries::default(),
     });
 
     {
@@ -389,6 +392,7 @@ fn bind(socket: &Path) -> Result<UnixListener, DaemonError> {
 fn stop_on_signal(signals: &TerminationSignals, shared: &Shared, socket: &Path, lock_file: File) {
     let sig = signals.wait().unwrap_or(0);
     let was_unlocked = locked(&shared.state).lock(LockReason::Signal);
+    backups::wait_for_deliveries(shared);
     let _ = std::fs::remove_file(socket);
     log_line!(
         "envcloakd: stopping on signal {sig}; vault {}",
@@ -402,11 +406,14 @@ fn stop_on_signal(signals: &TerminationSignals, shared: &Shared, socket: &Path, 
     std::process::exit(0);
 }
 
-/// The sleep and idle checks.
+/// The sleep and idle checks. A lock they make waits for the restore
+/// chunks on their way out, as every lock does.
 fn observe(shared: &Shared) {
     let now = Reading::now(&shared.clocks);
-    if let Some(reason) = locked(&shared.state).observe(now) {
+    let reason = locked(&shared.state).observe(now);
+    if let Some(reason) = reason {
         log_line!("envcloakd: vault locked (reason: {})", reason.as_str());
+        backups::wait_for_deliveries(shared);
     }
 }
 
@@ -551,11 +558,43 @@ impl Read for FrameReader<'_> {
     }
 }
 
+/// Writes an answer within one deadline, [`WRITE_TIMEOUT`] from its
+/// first byte, however slowly the client reads it: a lock waits for a
+/// restore chunk's answer to be written ([`backups::Deliveries`]), so the
+/// whole write is bounded, not each part of it.
+struct FrameWriter<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl<'a> FrameWriter<'a> {
+    fn new(stream: &'a UnixStream) -> Self {
+        FrameWriter {
+            stream,
+            deadline: Instant::now() + WRITE_TIMEOUT,
+        }
+    }
+}
+
+impl Write for FrameWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let left = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        self.stream.set_write_timeout(Some(left))?;
+        let mut stream: &UnixStream = self.stream;
+        stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Serves one connection until it closes, stalls or breaks the framing.
 fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
-    if stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
-        return;
-    }
     loop {
         let frame = match Frame::read_from(&mut FrameReader::new(stream)) {
             Ok(f) => f,
@@ -567,7 +606,7 @@ fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
                     ErrorKind::InvalidRequest
                 };
                 if let Ok(f) = proto::error_frame(None, &RpcError::new(kind)) {
-                    let _ = f.write_to(&mut &*stream);
+                    let _ = f.write_to(&mut FrameWriter::new(stream));
                 }
                 return;
             }
@@ -594,17 +633,41 @@ fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
             );
             return;
         }
-        let response = dispatch(&frame, peer, shared);
+        let (response, delivering) = dispatch(&frame, peer, shared);
         drop(frame);
-        match response {
-            Some(r) if r.write_to(&mut &*stream).is_ok() => {}
-            _ => return,
+        let written = response.is_some_and(|r| r.write_to(&mut FrameWriter::new(stream)).is_ok());
+        // A restore chunk's delivery ends once its answer is written, or
+        // its write failed: a lock waiting for it goes on.
+        if let Some(d) = delivering {
+            envcloak_sys::test_event("backup.v2 chunk written");
+            drop(d);
+        }
+        if !written {
+            return;
         }
     }
 }
 
-/// Answers one request frame.
-fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame> {
+/// Answers one request frame: the answer and, for a restore chunk, its
+/// delivery, which the caller holds until the answer is written.
+fn dispatch<'s>(
+    frame: &Frame,
+    peer: &PeerIdentity,
+    shared: &'s Shared,
+) -> (Option<Frame>, Option<backups::Delivering<'s>>) {
+    let mut delivering = None;
+    let answer = respond(frame, peer, shared, &mut delivering);
+    (answer, delivering)
+}
+
+/// Answers one request frame, putting a restore chunk's delivery in
+/// `delivering`.
+fn respond<'s>(
+    frame: &Frame,
+    peer: &PeerIdentity,
+    shared: &'s Shared,
+    delivering: &mut Option<backups::Delivering<'s>>,
+) -> Option<Frame> {
     let req = match IncomingRequest::parse(frame) {
         Ok(r) => r,
         Err(e) => return proto::error_frame(None, &e).ok(),
@@ -627,6 +690,10 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
             if was_unlocked {
                 log_line!("envcloakd: vault locked (reason: request)");
             }
+            // Answered once no restore chunk checked before it is still
+            // going out.
+            backups::wait_for_deliveries(shared);
+            envcloak_sys::test_event("lock answered");
             Ok(LockedView { was_unlocked })
         }),
         Unlock::NAME => answer::<Unlock>(id, &req, |p| unlock(shared, peer, p)),
@@ -694,7 +761,12 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         BackupOpenRestore::NAME => {
             answer::<BackupOpenRestore>(id, &req, |p| backups::open_restore(shared, peer, p))
         }
-        BackupRead::NAME => answer::<BackupRead>(id, &req, |p| backups::read(shared, peer, p)),
+        BackupRead::NAME => answer::<BackupRead>(id, &req, |p| {
+            backups::read(shared, peer, p).map(|(chunk, d)| {
+                *delivering = Some(d);
+                chunk
+            })
+        }),
         BackupList::NAME => answer::<BackupList>(id, &req, |p| backups::list(shared, p)),
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
