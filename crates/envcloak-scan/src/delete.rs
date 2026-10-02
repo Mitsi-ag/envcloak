@@ -159,7 +159,7 @@ pub fn delete_plaintext<G: DeleteGate>(
             Remains::Bytes(b) => rewrite_observed(r, rel, b, stamp, now, &mut |at| match at {
                 Inside::Staged => observe(DeleteStep::Staged(i)),
                 Inside::Swapped => observe(DeleteStep::Swapped(i)),
-                Inside::MovedAside | Inside::Checked | Inside::Hashed => {}
+                Inside::MovedAside | Inside::Checked | Inside::Opened | Inside::Hashed => {}
             })
             .map(|_| (&mut out.rewritten, DeleteStep::Rewritten(i))),
             Remains::Everything => continue,

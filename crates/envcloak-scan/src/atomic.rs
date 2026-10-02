@@ -262,6 +262,9 @@ pub enum Inside {
     /// new contents have the file's name, and the old file is under the
     /// temporary name, not unlinked yet.
     Swapped,
+    /// The file to write back over is open and its stamp read, and it is
+    /// not read yet ([`crate::restore_over_left`]).
+    Opened,
     /// The file to write back over was hashed and is what the change left
     /// ([`crate::restore_over_left`]); its replacement is not written yet.
     Hashed,
