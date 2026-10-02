@@ -1427,3 +1427,65 @@ fn a_purge_flushes_every_change_also_when_no_backup_goes() {
     assert_eq!(dir_names(&purging(&dir)), [".DS_Store"]);
     drop(f);
 }
+
+/// A purge's last flush of `backups/`, after its removals, is the step
+/// that makes them durable, and a failure of it fails the purge, whatever
+/// went (Codex and verifier, M2-05 round 8: the earlier test's injected
+/// failure had moved onto the rename's flush). An expired backup: the
+/// first flush (`backups/` once it is out of the listing) runs, the second
+/// (`backups/` once it went) fails, and the purge fails, with its
+/// directory gone (the rename out of the listing was flushed, so a crash
+/// could bring it back only as a `.purge` directory, never listed, which
+/// the next purge removes). An interrupted staging directory and a
+/// directory an earlier purge left (`.purge`) are flushed only by that
+/// last flush: with it failing, the purge fails too.
+#[test]
+fn a_failed_last_flush_of_backups_fails_the_purge() {
+    use envcloak_sys::testing::{fail_sync_after, record_syncs, take_synced};
+    use std::os::unix::fs::MetadataExt;
+    let (f, v) = KitFixture::create();
+    let t = now();
+    let backups = v.paths().backups_dir.clone();
+    let id_of = |p: &Path| {
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+
+    small(&v, t - FILE_BACKUP_RETENTION.as_secs() - 1);
+    let dir = list_file_backups_v2(v.paths()).unwrap().remove(0).dir;
+    record_syncs();
+    fail_sync_after(1);
+    assert!(
+        purge_file_backups_v2(v.paths(), t).is_err(),
+        "the failed flush of backups/ after the removal was unreported"
+    );
+    assert_eq!(
+        take_synced(),
+        [id_of(&backups)],
+        "the flush before the removal did not run"
+    );
+    assert!(!dir.exists() && !purging(&dir).exists());
+    assert!(list_file_backups_v2(v.paths()).unwrap().is_empty());
+    assert_eq!(purge_file_backups_v2(v.paths(), t).unwrap(), 0);
+
+    for name in [
+        format!(".files2-20260901T000000Z-{}.tmp", FileBackupId::generate()),
+        format!(
+            ".files2-20260901T000000Z-{}.purge",
+            FileBackupId::generate()
+        ),
+    ] {
+        let d = backups.join(&name);
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("data"), b"sealed bytes only").unwrap();
+        set_time(&d, t - STAGING_GRACE.as_secs() - 60);
+        fail_sync_after(0);
+        assert!(
+            purge_file_backups_v2(v.paths(), t).is_err(),
+            "{name}: the failed flush of its removal was unreported"
+        );
+        assert!(!d.exists(), "{name}");
+    }
+    assert!(dir_names(&backups).is_empty());
+    drop(f);
+}
