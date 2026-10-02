@@ -32,7 +32,8 @@
 //!
 //! When COMMAND has ended, the run is stopped and its report (every
 //! request with its header values, a forwarded request's whole target and
-//! its body, and the outcome) is written to the `--record`
+//! its body, each of these three as the bytes came, in standard base64,
+//! and the outcome) is written to the `--record`
 //! file as JSON: a new file, made with mode 0600 before COMMAND starts; a
 //! path that already exists, a symbolic link included, is refused (L-12:
 //! the record holds every body whole). Give it a path outside any home a
@@ -54,6 +55,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use envcloak_testkit::TestHome;
 use envcloak_testkit::agents::{Model, RUN_LIMIT, run_within};
 
@@ -214,14 +217,17 @@ fn main() -> ExitCode {
             .requests
             .iter()
             .map(|r| {
-                let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-                let values: Vec<String> = r.header_values.iter().map(|v| lossy(v)).collect();
+                // Bytes as they came, in base64, as the scripted model
+                // reports them (Codex review, low: decoded as lossy UTF-8,
+                // a body's other bytes were replaced for good).
+                let b64 = |b: &[u8]| STANDARD.encode(b);
+                let values: Vec<String> = r.header_values.iter().map(|v| b64(v)).collect();
                 serde_json::json!({
                     "seq": r.seq, "at_ms": r.at_ms, "method": r.method, "path": r.path,
                     "query": r.query, "headers": r.headers, "values": values,
-                    "forward": lossy(&r.forward), "status": r.status,
+                    "forward": b64(&r.forward), "status": r.status,
                     "answered": r.answered, "api": r.api, "pick": r.pick,
-                    "body": lossy(&r.body),
+                    "body": b64(&r.body),
                 })
             })
             .collect();
