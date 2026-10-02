@@ -25,7 +25,10 @@
 //! stopped the same way, and the server waits for them, at most
 //! [`SHUTDOWN_WAIT`], before it returns. Answers waiting to be written are
 //! bounded ([`stdio::Outbox`]): a host that stops reading them while it
-//! goes on sending ends the session ([`Stalled`]).
+//! goes on sending ends the session ([`Stalled`]). Input is read on a
+//! thread of its own, so the output's closing (a failed write, or that
+//! bound) ends the session at once, while the host keeps its input open
+//! and sends nothing: the calls in hand are stopped then too.
 
 pub mod child;
 pub mod lifecycle;
@@ -174,6 +177,26 @@ impl InFlight {
     }
 }
 
+/// What the session waits for: a line of input, or the output's closing.
+enum Event {
+    Input(io::Result<Line>),
+    OutputClosed,
+}
+
+/// Reads lines from `stdin` and hands each to the session, until the end
+/// of input, a failed read, or the session's end (its receiver dropped).
+/// The channel holds one line, so no more than one is read ahead.
+fn read_lines<R: Read>(stdin: R, events: &mpsc::SyncSender<Event>) {
+    let mut reader = LineReader::new(stdin);
+    loop {
+        let line = reader.next_line();
+        let more = matches!(line, Ok(Line::Message(_) | Line::Oversized));
+        if events.send(Event::Input(line)).is_err() || !more {
+            return;
+        }
+    }
+}
+
 /// A call waiting for a worker.
 struct Job {
     id: Id,
@@ -241,20 +264,29 @@ impl Server {
     }
 
     /// Serves `stdin` until it ends or `stdout` closes, answering on
-    /// `stdout`; then stops every call in hand and returns.
+    /// `stdout`; then stops every call in hand and returns. `stdin` is read
+    /// on a thread of its own, which a read the host never answers may
+    /// leave blocked after this returns.
     ///
     /// # Errors
     /// When reading `stdin` fails; [`Stalled`] (inside an
     /// [`io::ErrorKind::Other`] error) when the host stopped reading the
     /// answers while it went on sending.
-    pub fn run<R: Read, W: Write + Send + 'static>(
+    pub fn run<R: Read + Send + 'static, W: Write + Send + 'static>(
         self,
         stdin: R,
         stdout: W,
         ctx: Ctx,
     ) -> io::Result<()> {
         let ctx = Arc::new(ctx);
-        let (outbox, writer) = stdio::spawn_writer(stdout);
+        let (events_tx, events) = mpsc::sync_channel::<Event>(1);
+        let wake = events_tx.clone();
+        // A full channel holds a line the loop takes next, after which it
+        // sees the output closed: the closing is never missed.
+        let (outbox, writer) = stdio::spawn_writer(stdout, move || {
+            let _ = wake.try_send(Event::OutputClosed);
+        });
+        std::thread::spawn(move || read_lines(stdin, &events_tx));
         let (jobs, queue) = mpsc::sync_channel::<Job>(QUEUE);
         let queue = Arc::new(Mutex::new(queue));
         let workers: Vec<_> = (0..WORKERS)
@@ -267,25 +299,25 @@ impl Server {
                 std::thread::spawn(move || worker(&queue, &router, &inflight, &outbox, &ctx))
             })
             .collect();
-        let mut reader = LineReader::new(stdin);
         let mut phase = Phase::New;
         let read = loop {
             if outbox.closed() {
                 break Ok(());
             }
-            match reader.next_line() {
-                Ok(Line::End) => break Ok(()),
-                Err(e) => break Err(e),
-                Ok(Line::Oversized) => {
+            match events.recv() {
+                Ok(Event::OutputClosed | Event::Input(Ok(Line::End))) | Err(_) => break Ok(()),
+                Ok(Event::Input(Err(e))) => break Err(e),
+                Ok(Event::Input(Ok(Line::Oversized))) => {
                     outbox.send(rpc::error(None, rpc::PARSE_ERROR, rpc::PARSE_MESSAGE));
                 }
-                Ok(Line::Message(bytes)) => {
+                Ok(Event::Input(Ok(Line::Message(bytes)))) => {
                     let incoming = rpc::parse(&bytes);
                     drop(bytes);
                     self.handle(incoming, &mut phase, &outbox, &jobs);
                 }
             }
         };
+        drop(events);
         // The end: what is in hand is stopped and waited for.
         self.inflight.stop_all(SHUTDOWN_WAIT);
         drop(jobs);

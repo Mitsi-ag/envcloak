@@ -130,7 +130,7 @@ fn serve(a: McpArgs) -> Result<ExitCode, Failure> {
         }
     });
     let ctx = envcloak_mcp::Ctx::new(exe, a.host, a.wait);
-    match server.run(std::io::stdin().lock(), std::io::stdout(), ctx) {
+    match server.run(std::io::stdin(), std::io::stdout(), ctx) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(e)
             if e.get_ref()
