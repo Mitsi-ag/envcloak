@@ -1071,10 +1071,13 @@ impl AgentHome {
     /// it). Each was absent when its run started
     /// ([`AgentHome::spawn`] refuses to start otherwise). What is found
     /// is left where it is, as evidence: the harness removes nothing
-    /// outside the test root.
+    /// outside the test root. Only "not found" counts as absent: a lookup
+    /// that fails any other way (a directory above it that cannot be
+    /// searched, a path that is not a directory, a loop) cannot tell, and
+    /// fails the run too (verifier, medium: any error read as absent).
     ///
     /// # Panics
-    /// When one is there.
+    /// When one is there, or whether it is cannot be told.
     pub fn check_isolated(&self) {
         let cwds = self
             .cwds
@@ -1083,11 +1086,18 @@ impl AgentHome {
             .clone();
         for cwd in &cwds {
             for dir in self.shared_tmp_dirs(cwd) {
-                assert!(
-                    std::fs::symlink_metadata(&dir).is_err(),
-                    "the host kept files outside its home, in {} (left there)",
-                    dir.display()
-                );
+                match std::fs::symlink_metadata(&dir) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => panic!(
+                        "the host kept files outside its home, in {} (left there)",
+                        dir.display()
+                    ),
+                    Err(e) => panic!(
+                        "cannot tell whether the host kept files outside its home, in {}: {e} \
+                         (nothing removed)",
+                        dir.display()
+                    ),
+                }
             }
         }
     }
@@ -2001,6 +2011,44 @@ mod tests {
         std::fs::create_dir_all(slug_dir(&shared, &home.root().join("home")))
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(refused(|| b.check_isolated()));
+    }
+
+    /// Only "not found" reads as nothing kept outside the home (verifier,
+    /// medium: any lookup error passed). A kept directory below a
+    /// `claude-<uid>` that cannot be searched fails the run, and is still
+    /// there afterwards; once it can be searched again, the kept
+    /// directory itself fails it; a `claude-<uid>` with nothing in it
+    /// passes, and so does one that is not there at all.
+    #[test]
+    fn a_kept_directory_that_cannot_be_looked_up_fails_the_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = TestHome::new();
+        let (a, shared) = claude_home(&home);
+        let project = home.root().join("project");
+        std::fs::create_dir_all(&project).unwrap_or_else(|e| panic!("{e}"));
+        a.note_cwd(&project);
+        a.check_isolated();
+        let base = crate::transcripts::claude_tmp_dir(&shared);
+        let kept = slug_dir(&shared, &project);
+        std::fs::create_dir_all(kept.join("tasks")).unwrap_or_else(|e| panic!("{e}"));
+        let mode = |m: u32| {
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(m))
+                .unwrap_or_else(|e| panic!("{e}"));
+        };
+        mode(0o000);
+        // Root can search any directory: the case cannot be set up.
+        let blind = std::fs::symlink_metadata(&kept).is_err();
+        let unsearchable = refused(|| a.check_isolated());
+        mode(0o700);
+        if blind {
+            assert!(unsearchable, "an unsearchable directory read as empty");
+        }
+        assert!(kept.join("tasks").is_dir(), "the evidence was removed");
+        assert!(refused(|| a.check_isolated()));
+        std::fs::remove_dir_all(&kept).unwrap_or_else(|e| panic!("{e}"));
+        a.check_isolated();
+        std::fs::remove_dir_all(&base).unwrap_or_else(|e| panic!("{e}"));
+        a.check_isolated();
     }
 
     /// A tunnel's destination is named only when it is one the pinned
