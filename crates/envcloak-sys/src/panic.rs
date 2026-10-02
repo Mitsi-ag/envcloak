@@ -106,6 +106,16 @@ pub fn test_trace() -> bool {
     }
 }
 
+/// Writes `envcloak test: <what>` on standard error when the test trace
+/// is on ([`test_trace`]), so a test can count what a process does that it
+/// cannot otherwise see, such as each Argon2id run. Nothing in a build
+/// without the `testing` feature, which only tests enable.
+pub fn test_event(what: &str) {
+    if test_trace() {
+        let _ = writeln!(std::io::stderr(), "envcloak test: {what}");
+    }
+}
+
 /// Panics with what standard input holds (at most 64 KiB) in the message:
 /// `envcloak internal panic` and `envcloakd internal panic`. With the hook
 /// [`install`] sets, the message is never shown; a release build then

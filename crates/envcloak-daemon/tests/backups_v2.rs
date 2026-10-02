@@ -869,9 +869,10 @@ fn a_backup_comes_back_byte_for_byte() {
 }
 
 /// A 200 MiB file: uploaded and read back byte for byte with one proof
-/// (`open_restore` is the only call that carries the passphrase) and one
-/// audit entry of kind `restore_v2`, while the daemon's resident memory
-/// grows by far less than the file: it holds one chunk at a time.
+/// (`open_restore` is the only call that carries the passphrase), one
+/// Argon2id run (the daemon's test trace counts them) and one audit entry
+/// of kind `restore_v2`, while the daemon's resident memory grows by far
+/// less than the file: it holds one chunk at a time.
 #[test]
 fn a_200_mib_file_takes_one_proof_and_one_audit_entry_in_bounded_memory() {
     let mut f = Fixture::new();
@@ -886,6 +887,13 @@ fn a_200_mib_file_takes_one_proof_and_one_audit_entry_in_bounded_memory() {
     let grew = common::rss_kib(f.d.pid()).saturating_sub(before);
     assert!(grew < 64 * 1024, "the daemon grew by {grew} KiB");
     let entries = f.audit_after_stop();
+    // The daemon's whole log, read once it has exited: the unlock's run
+    // and the restore's, no more.
+    let runs = String::from_utf8_lossy(&f.d.log_bytes())
+        .lines()
+        .filter(|l| l.contains("envcloak test: argon2id run"))
+        .count();
+    assert_eq!(runs, 2, "Argon2id runs: the unlock's and one restore's");
     let restores: Vec<_> = entries
         .iter()
         .filter(|e| e.record.kind == AuditKind::RestoreV2)
