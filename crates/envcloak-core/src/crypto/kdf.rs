@@ -212,6 +212,9 @@ impl Kdf for Argon2id {
     #[allow(clippy::disallowed_methods)] // Hashes the passphrase or kit.
     fn derive(&self, secret: &SecretBytes, params: &StoredKdfParams) -> Result<Kek, CryptoError> {
         params.check_bounds()?;
+        // A test build with its trace on counts the runs (gate: one
+        // Argon2id run per proof).
+        envcloak_sys::test_event("argon2id run");
         let mut result = Ok(());
         let kek = SecretBox::init_with_mut(|out: &mut [u8; 32]| {
             result = argon2id(
