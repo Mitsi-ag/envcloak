@@ -374,8 +374,9 @@ fn s0(host: Host, shell: Shell, name: &str) {
             );
             // The receipt: where the host's sandboxed shell is
             // unsupported, what this run found is what docs/AGENTS.md
-            // records for it.
-            if k01::unsupported(os) {
+            // records for it. A sandbox that ran no command gives none
+            // (an environment limitation, `Reach::receipt`).
+            if k01::unsupported(os) && matches!(expected, Reach::Refused(_)) {
                 k01::check_documented();
             }
         }
@@ -386,7 +387,10 @@ fn s0(host: Host, shell: Shell, name: &str) {
         expected.receipt(os),
         match expected {
             Reach::Reaches => "executed: approved and delivered",
-            _ => "expected refusal, verified for both invocations (not a delivery)",
+            Reach::Refused(_) => "expected refusal, verified for both invocations (not a delivery)",
+            Reach::NotRun(_) => {
+                "the sandbox ran neither invocation, verified (neither a delivery nor the refusal)"
+            }
         }
     );
 
@@ -886,6 +890,70 @@ fn a_refusal_is_this_invocation_s_and_the_table_s() {
             "{bad:?}"
         );
     }
+}
+
+/// K-01's receipt for a sandboxed shell rests on a run outside a user
+/// namespace (inside one, Claude Code's Linux sandbox runs no command,
+/// an environment limitation): CI runs S0's sandboxed cases there, in the
+/// pull-request `gates` job and in `agents-e2e`, as required steps, never
+/// allowed to fail (verifier, low).
+#[test]
+fn ci_runs_the_sandboxed_cases_outside_a_user_namespace_as_required_steps() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml");
+    let ci =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let jobs = ci_jobs(&ci);
+    for job in ["gates", "agents-e2e"] {
+        let Some(body) = jobs.iter().find(|(name, _)| name == job).map(|(_, b)| b) else {
+            panic!("ci.yml has no {job} job");
+        };
+        assert!(
+            !body.contains("continue-on-error"),
+            "the {job} job may fail without failing CI"
+        );
+        let steps: Vec<&str> = body
+            .split("\n      - name: ")
+            .skip(1)
+            .filter(|s| s.starts_with("Story steps, sandboxed cases outside a user namespace"))
+            .collect();
+        assert_eq!(steps.len(), 1, "{job}: no single outside-namespace S0 step");
+        let step = steps[0];
+        for needed in [
+            "unshare --net --",
+            "skeleton::s0_claude_code_sandboxed",
+            "skeleton::s0_codex_workspace_write",
+            "--exact",
+        ] {
+            assert!(step.contains(needed), "{job}'s step lacks {needed:?}");
+        }
+        assert!(
+            !step.contains("--user") && !step.contains("continue-on-error"),
+            "{job}'s step is not a required run outside a user namespace"
+        );
+    }
+}
+
+/// The jobs of a workflow file, by name, each with its text.
+fn ci_jobs(ci: &str) -> Vec<(String, String)> {
+    let jobs = ci
+        .split("\njobs:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("ci.yml has no jobs"));
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in jobs.lines() {
+        let top = line.len() > 2
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim_start().starts_with('#');
+        if top {
+            out.push((line.trim().trim_end_matches(':').to_owned(), String::new()));
+        } else if let Some((_, body)) = out.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    out
 }
 
 /// K-01's table and docs/AGENTS.md agree: every refusal the table gives
