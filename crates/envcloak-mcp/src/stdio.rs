@@ -44,8 +44,9 @@ pub const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 /// How much is read from standard input at a time.
 const CHUNK: usize = 64 * 1024;
 
-/// What [`LineReader::next_line`] read.
-#[derive(Debug, PartialEq, Eq)]
+/// What [`LineReader::next_line`] read. Its `Debug` shows a line's length,
+/// never its bytes, which could hold a pasted key (L-12).
+#[derive(PartialEq, Eq)]
 pub enum Line {
     /// One line, without its newline (and without one `\r` before it).
     Message(Vec<u8>),
@@ -54,6 +55,16 @@ pub enum Line {
     Oversized,
     /// The end of input.
     End,
+}
+
+impl std::fmt::Debug for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Line::Message(m) => write!(f, "Message(<{} bytes>)", m.len()),
+            Line::Oversized => f.write_str("Oversized"),
+            Line::End => f.write_str("End"),
+        }
+    }
 }
 
 /// Lines from `R`, bounded (see the module documentation).
@@ -305,6 +316,20 @@ mod tests {
                 Line::End => return out,
                 l => out.push(l),
             }
+        }
+    }
+
+    /// A line's `Debug` is its length (L-12).
+    ///
+    /// Mutation checked: `Line` deriving `Debug`: the line's bytes show and
+    /// this fails.
+    #[test]
+    fn a_lines_debug_is_its_length() {
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        for c in &cs {
+            let shown = format!("{:?}", Line::Message(c.as_str().as_bytes().to_vec()));
+            envcloak_testkit::assert_no_canary(shown.as_bytes(), &cs);
+            assert_eq!(shown, format!("Message(<{} bytes>)", c.as_str().len()));
         }
     }
 
