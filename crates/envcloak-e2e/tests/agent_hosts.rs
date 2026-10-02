@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use envcloak_agents::probe::model::{QUALIFIED, SERVER};
+use envcloak_e2e::k01::{self, Reach, Shell};
 use envcloak_e2e::{bin_dir, versions_toml};
 use envcloak_testkit::agents::{AgentHome, Host, HostFlags, HostRun, Installed, pins, require};
 use envcloak_testkit::transcripts::{OTHER, Sweep};
@@ -706,7 +707,14 @@ fn tty_in_the_shell_tool(h: Host) {
     measure(
         &a,
         "shell tool terminal, no terminal for the host (T=tty, N=not)",
-        shown,
+        &shown,
+    );
+    // docs/AGENTS.md, both hosts and systems (Codex review, medium: only
+    // printed). The probe's control is
+    // the_terminal_probe_reads_the_controlling_terminal_not_standard_input.
+    assert!(
+        shown.starts_with(NO_TERMINAL),
+        "the shell tool's command has a terminal: {shown}"
     );
 }
 
@@ -765,6 +773,50 @@ fn environment_in_the_shell_tool(h: Host) {
         &a,
         &format!("shell tool gets the model credential ({credential})"),
         names.contains(&credential),
+    );
+    // docs/AGENTS.md (Codex review, medium: only printed): every marker
+    // it lists for this host and system is there (M2-10 matches on them),
+    // and the model credential reaches commands (the inject-mode limit).
+    let documented: &[&str] = match h {
+        Host::ClaudeCode => &[
+            "AI_AGENT",
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_EXECPATH",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_SESSION_ATTENDED",
+            "CLAUDE_EFFORT",
+            "CLAUDE_PID",
+        ],
+        Host::Codex if cfg!(target_os = "macos") => &[
+            "CODEX_CI",
+            "CODEX_HOME",
+            "CODEX_SANDBOX",
+            "CODEX_SANDBOX_NETWORK_DISABLED",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_VERSION",
+        ],
+        Host::Codex => &[
+            "CODEX_CI",
+            "CODEX_HOME",
+            "CODEX_SANDBOX_NETWORK_DISABLED",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_VERSION",
+        ],
+    };
+    let missing: Vec<&&str> = documented.iter().filter(|m| !names.contains(m)).collect();
+    assert!(
+        missing.is_empty(),
+        "documented markers missing: {missing:?}"
+    );
+    assert!(
+        names.contains(&credential),
+        "{credential} no longer reaches commands"
     );
 }
 
@@ -1240,10 +1292,59 @@ fn claude_code_hooks_and_blocked_prompt_persistence() {
         "blocked prompt: in transcripts",
         hits.in_store("claude/projects", &control.label),
     );
+    // The positive control: a prompt the same hook lets through, with a
+    // canary of its own, in the same home.
+    let passed = Canary::new(
+        "PASSED_PROMPT",
+        format!("ecok-{:016x}{:016x}", fresh_seed(), fresh_seed()),
+    );
+    let script = json!({"steps": [{"say": "the prompt went through"}]});
+    let ok = a.run(
+        &script,
+        &format!("Echo {}", passed.as_str()),
+        &flags(Host::ClaudeCode),
+        &a.home_dir(),
+    );
+    assert_eq!(ok.output.status.code(), Some(0), "{}", ok.text());
+    let both = [control.clone(), passed.clone()];
+    let hits = Sweep::host_stores(&a, &both, &[&run.model, &ok.model]);
+    measure(
+        &a,
+        "a prompt the hook lets through: kept in",
+        stores_holding(&hits, &passed.label),
+    );
+    // docs/AGENTS.md (Codex review, medium: only printed): exit 0, never
+    // sent to the model, kept in the transcript; and not in
+    // history.jsonl, which `-p` does not write at all (the prompt let
+    // through is not there either: that absence says nothing about the
+    // hook). By a sweep that read everything, and that finds the prompt
+    // let through in the model's requests and the transcript.
+    assert_eq!(hits.unreadable(), 0, "{hits}");
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
     assert_eq!(
         hits.in_model(&control.label),
         0,
         "a blocked prompt reached the model"
+    );
+    assert!(
+        run.model.model_calls().is_empty(),
+        "the model was called for a blocked prompt"
+    );
+    assert!(hits.in_model(&passed.label) > 0, "{hits}");
+    assert!(
+        hits.in_store("claude/projects", &passed.label) > 0,
+        "the prompt let through is not in the transcript:\n{hits}"
+    );
+    for label in [&passed.label, &control.label] {
+        assert_eq!(
+            hits.in_store("claude/history.jsonl", label),
+            0,
+            "{label} is in history.jsonl, which -p was measured not to write:\n{hits}"
+        );
+    }
+    assert!(
+        hits.in_store("claude/projects", &control.label) > 0,
+        "a blocked prompt is no longer kept in the transcript (K-14):\n{hits}"
     );
 }
 
@@ -1276,11 +1377,11 @@ fn codex_hooks_trust_blocked_prompt_and_timeout() {
         &a.home_dir(),
     );
     assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
-    measure(
-        &a,
-        "hooks run without trust (no bypass)",
-        !payloads(&dir, "UserPromptSubmit").is_empty(),
-    );
+    let untrusted_ran = !payloads(&dir, "UserPromptSubmit").is_empty();
+    measure(&a, "hooks run without trust (no bypass)", untrusted_ran);
+    // docs/AGENTS.md: untrusted hooks do not run (`hooks_untrusted`); the
+    // trusted run below, whose payloads are asserted, is the control.
+    assert!(!untrusted_ran, "Codex ran hooks it was never told to trust");
     // Trust bypassed, in this probe home only (D-13).
     let trusted = flags(Host::Codex).with(&["--dangerously-bypass-hook-trust"]);
     let run = a.run(&script, "List the files here.", &trusted, &a.home_dir());
@@ -1328,10 +1429,54 @@ fn codex_hooks_trust_blocked_prompt_and_timeout() {
         "blocked prompt: in SQLite stores",
         hits.in_store("codex/sqlite", &control.label),
     );
+    // The positive control: a prompt the same trusted hook lets through,
+    // with a canary of its own.
+    let passed = Canary::new(
+        "PASSED_PROMPT",
+        format!("ecok-{:016x}{:016x}", fresh_seed(), fresh_seed()),
+    );
+    let ok_script = json!({"steps": [{"say": "the prompt went through"}]});
+    let ok = a.run(
+        &ok_script,
+        &format!("Echo {}", passed.as_str()),
+        &trusted,
+        &a.home_dir(),
+    );
+    assert_eq!(ok.output.status.code(), Some(0), "{}", ok.text());
+    let both = [control.clone(), passed.clone()];
+    let hits = Sweep::host_stores(&a, &both, &[&run.model, &ok.model]);
+    measure(
+        &a,
+        "a prompt the hook lets through: kept in",
+        stores_holding(&hits, &passed.label),
+    );
+    // docs/AGENTS.md (Codex review, medium: only printed): exit 0, never
+    // sent to the model, in no store; by a sweep that read everything and
+    // finds the prompt let through in the model's requests and the
+    // session transcript (`exec` writes no history.jsonl for either).
+    assert_eq!(hits.unreadable(), 0, "{hits}");
+    assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
     assert_eq!(
         hits.in_model(&control.label),
         0,
         "a blocked prompt reached the model"
+    );
+    assert!(
+        run.model.model_calls().is_empty(),
+        "the model was called for a blocked prompt"
+    );
+    assert!(hits.in_model(&passed.label) > 0, "{hits}");
+    assert!(
+        hits.in_store("codex/sessions", &passed.label) > 0,
+        "the prompt let through is not in codex/sessions:\n{hits}"
+    );
+    assert_eq!(
+        hits.stores
+            .iter()
+            .map(|s| hits.in_store(&s.store, &control.label))
+            .sum::<usize>(),
+        0,
+        "a blocked prompt was kept:\n{hits}"
     );
 
     // A hook slower than its timeout: does the prompt go on (fail open)?
@@ -1352,6 +1497,12 @@ fn codex_hooks_trust_blocked_prompt_and_timeout() {
             run.output.status.code(),
             run.elapsed.as_secs_f32()
         ),
+    );
+    // docs/AGENTS.md: the prompt goes on (`fails_open_on_timeout`); the
+    // same hook within its timeout blocked it above.
+    assert!(
+        !run.model.model_calls().is_empty(),
+        "a hook past its timeout blocked the prompt: Codex no longer fails open"
     );
 }
 
@@ -1374,6 +1525,11 @@ fn claude_code_at_mentions_under_print() {
     assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
     let first = after_call(&run, "step 0");
     measure(&a, "@ mention expanded under -p", first.contains(&marker));
+    // docs/AGENTS.md: expanded, so M2-09's `@.env` probe runs under -p.
+    assert!(
+        first.contains(&marker),
+        "@README.md was not expanded under -p"
+    );
 }
 
 /// `envcloakd --foreground` in `a`'s home, by absolute path.
@@ -1519,22 +1675,32 @@ fn claude_code_sandbox_reaches_the_socket() {
     }
     let script = json!({"steps": [{"shell": status_probe()}, {"say": "done"}]});
     let mut cases = vec![
-        ("sandbox off", None),
-        ("sandbox on, no socket allowance", Some(base)),
+        ("sandbox off", Shell::ClaudeUnsandboxed, None),
+        (
+            "sandbox on, no socket allowance",
+            Shell::ClaudeSandboxNoAllowance,
+            Some(base),
+        ),
     ];
     if cfg!(target_os = "macos") {
         cases.push((
             "sandbox on, allowUnixSockets [the socket's path as given]",
+            Shell::ClaudeSandboxAllowGiven,
             Some(given),
         ));
         cases.push((
             "sandbox on, allowUnixSockets [the socket's resolved path]",
+            Shell::ClaudeSandboxAllowResolved,
             Some(allowed),
         ));
     } else {
-        cases.push(("sandbox on, allowAllUnixSockets", Some(allowed)));
+        cases.push((
+            "sandbox on, allowAllUnixSockets",
+            Shell::ClaudeSandboxAllowAll,
+            Some(allowed),
+        ));
     }
-    for (name, sandbox) in cases {
+    for (name, shell, sandbox) in cases {
         let settings = match sandbox {
             Some(s) => json!({"sandbox": s}),
             None => json!({}),
@@ -1559,9 +1725,29 @@ fn claude_code_sandbox_reaches_the_socket() {
         measure(
             &a,
             &format!("envcloak status, {name}{}", namespace()),
-            result,
+            &result,
         );
+        assert_reach(shell, &result);
     }
+}
+
+/// Checks a status probe's result ([`reach`]) against K-01's table
+/// (`envcloak_e2e::k01`, which docs/AGENTS.md records): the measurement
+/// is asserted, not only printed (Codex review, medium).
+fn assert_reach(shell: Shell, result: &str) {
+    let want = k01::expected(shell, os(), k01::user_namespace())
+        .unwrap_or_else(|| panic!("{shell:?} is not a setting on {}", os()));
+    let ok = match want {
+        Reach::Reaches => result == "reaches the daemon",
+        Reach::Refused(why) => result.starts_with("does not (") && result.contains(why),
+        Reach::NotRun(why) => result.contains("the command did not run") && result.contains(why),
+    };
+    assert!(
+        ok,
+        "{shell:?}{}: measured {result:?}, K-01's table says {}",
+        namespace(),
+        want.receipt(os())
+    );
 }
 
 /// What a sandboxed command tries besides EnvCloak's socket, as a Python
@@ -1654,21 +1840,34 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
          [features.network_proxy.unix_sockets]\n{} = \"allow\"\n",
         json!(socket.to_str().unwrap())
     );
-    for (name, sandbox, config) in [
-        ("read-only", "read-only", String::new()),
+    for (name, shell, sandbox, config) in [
+        (
+            "read-only",
+            Shell::CodexReadOnly,
+            "read-only",
+            String::new(),
+        ),
         (
             "read-only, network_access, proxy with one unix_sockets rule",
+            Shell::CodexReadOnlyBounded,
             "read-only",
             bounded.clone(),
         ),
-        ("workspace-write", "workspace-write", String::new()),
+        (
+            "workspace-write",
+            Shell::CodexWorkspaceWrite,
+            "workspace-write",
+            String::new(),
+        ),
         (
             "workspace-write, network_access",
+            Shell::CodexWorkspaceWriteNetwork,
             "workspace-write",
             "[sandbox_workspace_write]\nnetwork_access = true\n".to_owned(),
         ),
         (
             "workspace-write, network_access, proxy with one unix_sockets rule",
+            Shell::CodexWorkspaceWriteBounded,
             "workspace-write",
             bounded.clone(),
         ),
@@ -1690,7 +1889,9 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
         assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
         let text = after_call(&run, "step 1");
         let label = format!("{name}{}", namespace());
-        measure(&a, &format!("envcloak status, {label}"), reach(&text));
+        let reached = reach(&text);
+        measure(&a, &format!("envcloak status, {label}"), &reached);
+        assert_reach(shell, &reached);
         // Each proxied request's result is in the next turn's request.
         let proxied = [
             ("PRXS", after_call(&run, "step 2")),
@@ -2300,22 +2501,42 @@ fn claude_code_interactive_trust_and_paste() {
         ]),
     );
     let report = model.finish();
-    let reached = report.requests.iter().any(|r| {
-        r.body
-            .windows(before.as_str().len())
-            .any(|w| w == before.as_str().as_bytes())
-    });
+    let early = Sweep::host_stores(&a, std::slice::from_ref(&before), &[&report]);
+    let reached = early.in_model(&before.label) > 0;
     measure(
         &a,
         "interactive: prompt typed before the trust dialog is answered",
         format!(
-            "{} ({end})",
+            "{} ({end}); model requests {}; kept in {}",
             if reached {
                 "reached the model"
             } else {
                 "never reached the model"
-            }
+            },
+            report.model_calls().len(),
+            stores_holding(&early, &before.label)
         ),
+    );
+    // As docs/AGENTS.md records for the pinned version (Codex review,
+    // medium: only printed): Enter at the dialog answers its default, "No,
+    // exit", and the prompt reaches neither the model nor any store. The
+    // sweep is complete, and the pastes below, which do reach the model
+    // and the stores, are its positive control.
+    assert!(!reached, "a prompt typed before trust reached the model");
+    assert!(
+        report.model_calls().is_empty(),
+        "the model was called before trust: {:?}",
+        report.requests
+    );
+    assert_eq!(
+        end, "EXIT 1",
+        "the trust dialog did not end the session on Enter"
+    );
+    assert_eq!(early.unreadable(), 0, "{early}");
+    assert_eq!(
+        early.stores.iter().map(|s| s.hits.len()).sum::<usize>(),
+        0,
+        "a prompt typed before trust was kept:\n{early}"
     );
 
     // Trust accepted with the documented keys, then two pastes.
@@ -2371,12 +2592,6 @@ fn claude_code_interactive_trust_and_paste() {
         os()
     );
     for c in &cs {
-        let stores: Vec<String> = hits
-            .stores
-            .iter()
-            .filter(|s| hits.in_store(&s.store, &c.label) > 0)
-            .map(|s| s.store.clone())
-            .collect();
         measure(
             &a,
             &format!(
@@ -2387,9 +2602,43 @@ fn claude_code_interactive_trust_and_paste() {
                     "40-line"
                 }
             ),
-            stores.join(", "),
+            stores_holding(&hits, &c.label),
         );
     }
+    // As docs/AGENTS.md records (Codex review, medium: only printed):
+    // each paste reaches the model, and is kept in history.jsonl and the
+    // transcript, and not in paste-cache/, by a sweep that read
+    // everything; a control planted in paste-cache/ afterwards is found
+    // there, so "not in paste-cache/" is the sweep's finding.
+    assert_eq!(hits.unreadable(), 0, "{hits}");
+    for c in &cs {
+        assert!(
+            hits.in_model(&c.label) > 0,
+            "{} never reached the model",
+            c.label
+        );
+        for store in ["claude/history.jsonl", "claude/projects"] {
+            assert!(
+                hits.in_store(store, &c.label) > 0,
+                "{} is not in {store}:\n{hits}",
+                c.label
+            );
+        }
+        assert_eq!(hits.in_store("claude/paste-cache", &c.label), 0, "{hits}");
+    }
+    let planted = Canary::new(
+        "PASTE_CACHE_CONTROL",
+        format!("eccache-{:016x}{:016x}", fresh_seed(), fresh_seed()),
+    );
+    let cache = a.home_dir().join(".claude/paste-cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("ec-control.txt"), planted.as_str()).unwrap();
+    let control = Sweep::host_stores(&a, std::slice::from_ref(&planted), &[]);
+    assert!(
+        control.in_store("claude/paste-cache", &planted.label) > 0,
+        "a control planted in paste-cache/ was not found there:\n{control}"
+    );
+    std::fs::remove_file(cache.join("ec-control.txt")).unwrap();
 
     // The Bash tool in an interactive session, the host on a terminal of
     // its own (the flags pinned: default permission mode, Bash allowed):
@@ -2429,8 +2678,34 @@ fn claude_code_interactive_trust_and_paste() {
     measure(
         &a,
         "interactive: shell tool terminal, the host on a terminal (T=tty, N=not)",
-        shown,
+        &shown,
     );
+    // docs/AGENTS.md: no terminal on any stream and no controlling one,
+    // though the host has one (the probe's control:
+    // the_terminal_probe_reads_the_controlling_terminal_not_standard_input).
+    assert!(
+        shown.starts_with(NO_TERMINAL),
+        "the Bash tool's command has a terminal: {shown}"
+    );
+}
+
+/// [`TTY_PROBE`] in a command with no terminal on any stream and no
+/// controlling terminal.
+const NO_TERMINAL: &str = "stdin=N stdout=N stderr=N controlling-terminal=N";
+
+/// The stores in `hits` holding `label`, by name, or `none`.
+fn stores_holding(hits: &envcloak_testkit::transcripts::Hits, label: &str) -> String {
+    let stores: Vec<&str> = hits
+        .stores
+        .iter()
+        .filter(|s| hits.in_store(&s.store, label) > 0)
+        .map(|s| s.store.as_str())
+        .collect();
+    if stores.is_empty() {
+        "none".to_owned()
+    } else {
+        stores.join(", ")
+    }
 }
 
 // ---------------------------------------------------------------------
