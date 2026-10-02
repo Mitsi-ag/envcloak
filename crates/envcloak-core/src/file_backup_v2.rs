@@ -642,7 +642,14 @@ impl Vault {
         files: Vec<PlannedFile>,
         created_at: u64,
     ) -> Result<FileBackupV2Writer, VaultError> {
-        self.begin_v2(purpose, creator, files, created_at, None)
+        self.begin_v2(
+            purpose,
+            creator,
+            files,
+            created_at,
+            self.schema_version(),
+            None,
+        )
     }
 
     /// [`Vault::begin_file_backup_v2`], reporting each step to `observe`
@@ -657,15 +664,25 @@ impl Vault {
         created_at: u64,
         observe: impl FnMut(StepV2) + Send + 'static,
     ) -> Result<FileBackupV2Writer, VaultError> {
-        self.begin_v2(purpose, creator, files, created_at, Some(Box::new(observe)))
+        self.begin_v2(
+            purpose,
+            creator,
+            files,
+            created_at,
+            self.schema_version(),
+            Some(Box::new(observe)),
+        )
     }
 
+    /// `schema_version` is the vault's own but in the tests of a backup a
+    /// vault of an older schema made.
     fn begin_v2(
         &self,
         purpose: BackupPurpose,
         creator: BackupCreator,
         files: Vec<PlannedFile>,
         created_at: u64,
+        schema_version: u16,
         observe: Option<Observer>,
     ) -> Result<FileBackupV2Writer, VaultError> {
         self.header()?;
@@ -679,7 +696,10 @@ impl Vault {
         }
         let backups = backups_dir(self.paths())?;
         let id = FileBackupId::generate();
-        let ctx = Ctx::of(self, id, created_at);
+        let ctx = Ctx {
+            schema_version,
+            ..Ctx::of(self, id, created_at)
+        };
         let name = dir_name(&id, created_at);
         let staging = backups.join(format!(".{name}{STAGING_SUFFIX}"));
         let final_dir = backups.join(&name);
@@ -942,14 +962,22 @@ impl Vault {
         let mut head = [0u8; HEADER_LEN_V2];
         read_at(&file, &mut head, 0)?;
         let h = parse_header(&head)?;
+        // A backup a vault of an older schema made still opens, bound to
+        // the schema it was made under (its header's, which the metadata
+        // authenticates): a migration keeps the undo of the changes made
+        // before it, for their 7 days. A newer schema's is not this
+        // build's to read.
         if h.id != *id
             || h.vault_id != self.vault_id().0
             || h.epoch != self.epoch()
-            || h.schema_version != self.schema_version()
+            || h.schema_version > self.schema_version()
         {
             return Err(damaged());
         }
-        let ctx = Ctx::of(self, h.id, h.created_at);
+        let ctx = Ctx {
+            schema_version: h.schema_version,
+            ..Ctx::of(self, h.id, h.created_at)
+        };
         let (wrapped, chunks_at) = read_record_at(
             &file,
             HEADER_LEN_V2 as u64,
@@ -1514,6 +1542,76 @@ mod tests {
         let mut longer = m.clone();
         longer.push(0);
         assert!(decode_metadata(&longer).is_err());
+    }
+
+    /// A backup made under an older schema (before a migration) opens and
+    /// reads back, bound to its own schema; a header claiming another
+    /// schema than the one its records were sealed under does not, nor one
+    /// newer than the vault's.
+    #[test]
+    fn a_backup_of_an_older_schema_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = VaultPaths::under(dir.path().join("data"));
+        let (v, _) = crate::create_vault(
+            &paths,
+            &SecretBytes::copy_from(b"a test passphrase, not a fixture"),
+            crate::crypto::KdfParams::minimum(),
+        )
+        .unwrap();
+        let body = b"KEY=not a secret, a test body\n";
+        let creator = BackupCreator {
+            kind: CreatorKind::Terminal,
+            evidence_digest: [1; 32],
+            agent: None,
+            owner: BackupOwner {
+                pid: 7,
+                start_time: 8,
+                token: None,
+            },
+        };
+        let plan = || {
+            vec![PlannedFile {
+                path: "/h/.env".into(),
+                mode: 0o600,
+                size: body.len() as u64,
+            }]
+        };
+        let now = v.schema_version();
+        let make = |schema: u16| {
+            let mut w = v
+                .begin_v2(
+                    BackupPurpose::Migrate,
+                    creator.clone(),
+                    plan(),
+                    1_790_000_000,
+                    schema,
+                    None,
+                )
+                .unwrap();
+            w.put(0, 0, &SecretBytes::copy_from(body)).unwrap();
+            w.commit().unwrap()
+        };
+        let older = make(now - 1);
+        let r = v.open_file_backup_v2(&older.id).unwrap();
+        r.verify().unwrap();
+        assert!(r.chunk(0, 0).unwrap().0.ct_eq(body));
+        r.record_result(0, &[4; 32]).unwrap();
+        assert_eq!(r.results().unwrap(), vec![Some([4; 32])]);
+        // The header changed to the vault's schema: the records were sealed
+        // under the older one.
+        let data = older.dir.join(DATA);
+        let mut bytes = std::fs::read(&data).unwrap();
+        bytes[21..23].copy_from_slice(&now.to_be_bytes());
+        std::fs::write(&data, &bytes).unwrap();
+        assert_eq!(
+            v.open_file_backup_v2(&older.id).unwrap_err().kind(),
+            VaultErrorKind::BackupDamaged
+        );
+        let newer = make(now + 1);
+        assert_eq!(
+            v.open_file_backup_v2(&newer.id).unwrap_err().kind(),
+            VaultErrorKind::BackupDamaged
+        );
     }
 
     /// The bound the reader takes metadata up to is the encoding's own:
