@@ -64,6 +64,16 @@ views!(
     InitReport,
     PendingStateView,
     PendingListView,
+    BackupBegunView,
+    BackupPutView,
+    BackupCommittedView,
+    BackupResultView,
+    RestoreLeaseView,
+    RestoreStatementView,
+    RestoreFileView,
+    BackupCreatorView,
+    BackupListView,
+    BackupEntryView,
 );
 
 /// What [`StatusView::sanitize`] puts in place of a version that is not
@@ -1453,4 +1463,229 @@ pub struct InitReport {
     /// What was found and imported; `None` for `--delete-plaintext` alone.
     pub import: Option<ImportReport>,
     pub delete: Option<DeleteReport>,
+}
+
+/// `backup.v2.begin`: the backup started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupBegunView {
+    /// 26 Crockford base32 characters.
+    pub id: String,
+    /// The bytes each chunk holds, but a file's last.
+    pub chunk_size: u32,
+}
+
+/// `backup.v2.put`: the chunk was taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPutView {
+    /// It was its file's last.
+    #[serde(rename = "final")]
+    pub last: bool,
+}
+
+/// `backup.v2.commit`: the backup is in place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupCommittedView {
+    pub id: String,
+    pub files: u32,
+    /// The size of its data file.
+    pub bytes: u64,
+    /// Unix seconds.
+    pub created_secs: u64,
+}
+
+/// `backup.v2.record_result`: the result is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupResultView {
+    /// How many of the backup's files have their result recorded now.
+    pub recorded: u32,
+    /// Every file has.
+    pub complete: bool,
+}
+
+/// Who made a backup v2, as the daemon sealed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupCreatorView {
+    /// `terminal`, `agent` or `unknown`.
+    pub kind: String,
+    /// The agent's display name, when one was involved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The process that began it.
+    pub pid: i32,
+}
+
+/// Where a backup v2 stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupStateView {
+    /// Every file's result is recorded.
+    Complete,
+    /// Some file's result is not recorded yet, and the process that made
+    /// the backup still runs.
+    AwaitingResult,
+    /// Some file's result was never recorded: the process that made the
+    /// backup exited first. EnvCloak does not know what the change left,
+    /// so it restores only with `--unrecorded`.
+    ResultUnrecorded,
+    /// It does not open: altered, cut, or not this vault's.
+    Damaged,
+}
+
+impl BackupStateView {
+    /// `complete`, `awaiting_result`, `result_unrecorded` or `damaged`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BackupStateView::Complete => "complete",
+            BackupStateView::AwaitingResult => "awaiting_result",
+            BackupStateView::ResultUnrecorded => "result_unrecorded",
+            BackupStateView::Damaged => "damaged",
+        }
+    }
+}
+
+/// One file of a backup v2, as a restore shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreFileView {
+    /// Its index in the backup.
+    pub file: u32,
+    /// Where it was, as backed up.
+    pub path: String,
+    pub mode: u32,
+    pub size: u64,
+    /// How many chunks it has.
+    pub chunks: u64,
+    /// SHA-256 of what the backup holds, 64 lowercase hex characters.
+    pub sha256: String,
+    /// SHA-256 of what the change left, as recorded: a restore writes the
+    /// file back only while it still is that. `None` when not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256_after: Option<String>,
+}
+
+/// What a person reads about a backup v2 they restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreStatementView {
+    pub id: String,
+    /// When it was made, Unix seconds.
+    pub created_secs: u64,
+    /// `init`, `scrub`, `agents` or `migrate`.
+    pub purpose: String,
+    pub creator: BackupCreatorView,
+    pub state: BackupStateView,
+    /// Every file's, as many as fit in one answer (`files_total` says how
+    /// many there are; a file's first chunk carries its own).
+    pub files: Vec<RestoreFileView>,
+    pub files_total: u32,
+    /// The bytes of every file.
+    pub bytes: u64,
+}
+
+impl RestoreStatementView {
+    /// The statement as lines of text: the backup, its purpose and date,
+    /// who made it, and what EnvCloak does not know. Names are shown with
+    /// control characters replaced.
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = vec![format!(
+            "backup {} made {} UTC for {}: {} file(s), {} bytes",
+            clean(&self.id),
+            utc_date(self.created_secs),
+            clean(&self.purpose),
+            self.files_total,
+            self.bytes
+        )];
+        out.push(match (self.creator.kind.as_str(), &self.creator.agent) {
+            ("terminal", _) => "created by you (terminal)".to_owned(),
+            (_, Some(agent)) => {
+                format!("this backup was created by {}, not by you", clean(agent))
+            }
+            _ => "this backup was created by an unknown process, not by you".to_owned(),
+        });
+        match self.state {
+            BackupStateView::Complete | BackupStateView::Damaged => {}
+            BackupStateView::AwaitingResult => out.push(
+                "the process that made it has not yet recorded what its change left".to_owned(),
+            ),
+            BackupStateView::ResultUnrecorded => out.push(
+                "EnvCloak does not know what the change left: the process that made this backup \
+                 exited before recording it"
+                    .to_owned(),
+            ),
+        }
+        out
+    }
+}
+
+/// `s` with every control character replaced by `?`.
+fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// `YYYY-MM-DD HH:MM` for Unix seconds `secs`, in UTC.
+fn utc_date(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60
+    )
+}
+
+/// `backup.v2.open_restore`: the lease and the statement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreLeaseView {
+    /// 26 Crockford base32 characters: `backup.v2.read` takes it, from
+    /// this process on this terminal only, until it is idle for 60
+    /// seconds, the process exits, the vault locks or the daemon restarts.
+    pub lease: String,
+    pub statement: RestoreStatementView,
+}
+
+/// One backup v2 in `backup.v2.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupEntryView {
+    pub id: String,
+    /// When it was made, Unix seconds.
+    pub created_secs: u64,
+    /// `None` for a backup that does not open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<BackupCreatorView>,
+    pub state: BackupStateView,
+    pub files: u32,
+    pub bytes: u64,
+}
+
+/// `backup.v2.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupListView {
+    /// Newest first.
+    pub backups: Vec<BackupEntryView>,
+    /// More backups exist than are listed.
+    pub truncated: bool,
+    /// Restore leases open now, for any process.
+    pub open_leases: u32,
 }

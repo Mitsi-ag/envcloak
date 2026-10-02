@@ -27,10 +27,11 @@ use envcloak_policy::{
 
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
-    AddedView, ApprovedView, AuditVerifyView, BackupView, CheckView, CreatedView, DecisionView,
-    DeniedView, FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView, LockedView,
-    PendingListView, PendingStateView, RecoveredView, RecoveryConfirmedView, RemovedView,
-    RevokedView, RotatedView, StatusView, TargetView, UnlockedView, VerifyView,
+    AddedView, ApprovedView, AuditVerifyView, BackupBegunView, BackupCommittedView, BackupListView,
+    BackupPutView, BackupResultView, BackupView, CheckView, CreatedView, DecisionView, DeniedView,
+    FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView, LockedView, PendingListView,
+    PendingStateView, RecoveredView, RecoveryConfirmedView, RemovedView, RestoreFileView,
+    RestoreLeaseView, RevokedView, RotatedView, StatusView, TargetView, UnlockedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -888,8 +889,189 @@ pub struct RecoverParams {
     pub claims: Vec<String>,
 }
 
+/// `backup.v2.begin`: starts a file backup v2 (M2 plan D-07; docs/IPC.md
+/// "Backups v2") of files under the allowed roots, and records the
+/// caller's process instance as its creator. Only that instance may add
+/// chunks, commit and record results. Who made the backup (the subject's
+/// kind, evidence and agent) is read from the kernel and sealed by the
+/// daemon: there is no field for it, and a request that sends one is
+/// `invalid_params`.
+#[derive(Debug)]
+pub struct BackupBegin;
+
+impl Method for BackupBegin {
+    const NAME: &'static str = "backup.v2.begin";
+    type Params = BackupBeginParams;
+    type Output = BackupBegunView;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupBeginParams {
+    /// `init`, `scrub`, `agents` or `migrate`.
+    pub purpose: String,
+    pub files: Vec<BackupPlanFile>,
+    /// As [`UnlockParams::claims`]: they only tighten the creator's kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// One file a backup v2 will hold, as declared at its start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPlanFile {
+    /// Its absolute path, under an allowed root. Display text, and where a
+    /// restore writes it back.
+    pub path: String,
+    pub size: u64,
+    /// Its permission bits.
+    pub mode: u32,
+}
+
+/// `backup.v2.put`: the next chunk of the next file, from the backup's
+/// creator only.
+#[derive(Debug)]
+pub struct BackupPut;
+
+impl Method for BackupPut {
+    const NAME: &'static str = "backup.v2.put";
+    type Params = BackupPutParams;
+    type Output = BackupPutView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPutParams {
+    /// The backup's id from `backup.v2.begin`.
+    pub id: String,
+    /// The file's index in the begin's `files`.
+    pub file: u32,
+    /// The chunk's index in its file.
+    pub chunk: u32,
+    /// Exactly the chunk's bytes: [`BackupBegunView::chunk_size`] for
+    /// every chunk but a file's last, the rest for its last.
+    pub data: WireSecret,
+}
+
+/// `backup.v2.commit`: seals the backup's metadata and puts it in place;
+/// from then on its contents never change. From the creator only.
+#[derive(Debug)]
+pub struct BackupCommit;
+
+impl Method for BackupCommit {
+    const NAME: &'static str = "backup.v2.commit";
+    type Params = BackupIdParams;
+    type Output = BackupCommittedView;
+}
+
+/// A backup v2's id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupIdParams {
+    /// 26 Crockford base32 characters.
+    pub id: String,
+}
+
+/// `backup.v2.record_result`: what the change left in one file (its
+/// SHA-256), once per file, from the creator only, while it lives.
+#[derive(Debug)]
+pub struct BackupRecordResult;
+
+impl Method for BackupRecordResult {
+    const NAME: &'static str = "backup.v2.record_result";
+    type Params = BackupResultParams;
+    type Output = BackupResultView;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupResultParams {
+    pub id: String,
+    pub file: u32,
+    /// 64 lowercase hex characters.
+    pub sha256_after: String,
+}
+
+/// `backup.v2.open_restore`: one passphrase proof, from a terminal
+/// subject, opens a restore lease on a committed backup v2, bound to the
+/// backup, the caller's process instance and its terminal. A backup an
+/// agent or an unknown process made opens only with
+/// `created_by_agent_ticked`, and one whose results are not all recorded
+/// only with `unrecorded`; both are refused before the passphrase is
+/// looked at. The lease's audit entry is on disk before the lease is
+/// issued, so before the first chunk.
+#[derive(Debug)]
+pub struct BackupOpenRestore;
+
+impl Method for BackupOpenRestore {
+    const NAME: &'static str = "backup.v2.open_restore";
+    type Params = OpenRestoreParams;
+    type Output = RestoreLeaseView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRestoreParams {
+    pub id: String,
+    pub passphrase: WireSecret,
+    /// The person ticked `--created-by-agent`.
+    #[serde(default)]
+    pub created_by_agent_ticked: bool,
+    /// The recovery-only form `--unrecorded`.
+    #[serde(default)]
+    pub unrecorded: bool,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `backup.v2.read`: one chunk of a backup under its restore lease, on
+/// any connection of the lease's process. A delivery: plaintext goes only
+/// to the process instance the lease is bound to, on its terminal.
+#[derive(Debug)]
+pub struct BackupRead;
+
+impl Method for BackupRead {
+    const NAME: &'static str = "backup.v2.read";
+    type Params = BackupReadParams;
+    type Output = BackupChunk;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupReadParams {
+    /// 26 Crockford base32 characters, from `backup.v2.open_restore`.
+    pub lease: String,
+    pub file: u32,
+    pub chunk: u32,
+}
+
+/// One chunk of a file, read under a restore lease.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupChunk {
+    pub data: WireSecret,
+    /// The file's last chunk.
+    #[serde(rename = "final")]
+    pub last: bool,
+    /// With a file's first chunk: where the file goes and what it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<RestoreFileView>,
+}
+
+/// `backup.v2.list`: the committed backups v2, newest first, with their
+/// creator, purpose and state. Metadata only, to any caller.
+#[derive(Debug)]
+pub struct BackupList;
+
+impl Method for BackupList {
+    const NAME: &'static str = "backup.v2.list";
+    type Params = NoParams;
+    type Output = BackupListView;
+}
+
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 28] = [
+pub const CLIENT_METHODS: [&str; 35] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -918,6 +1100,13 @@ pub const CLIENT_METHODS: [&str; 28] = [
     RecoveryConfirm::NAME,
     BackupCreate::NAME,
     VaultRecover::NAME,
+    BackupBegin::NAME,
+    BackupPut::NAME,
+    BackupCommit::NAME,
+    BackupRecordResult::NAME,
+    BackupOpenRestore::NAME,
+    BackupRead::NAME,
+    BackupList::NAME,
 ];
 
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
@@ -1059,12 +1248,27 @@ pub enum ErrorKind {
     /// opened and nothing refused; `reason` names the cap. A waiter asks
     /// again with backoff.
     TooManyPending,
+    /// A backup v2 call from another process instance than the one that
+    /// began the backup: nothing changed, and no metadata is returned.
+    NotBackupOwner,
+    /// A backup v2 restore refused before the passphrase was looked at;
+    /// `reason` is `created_by_agent` (an agent or unknown process made it
+    /// and `--created-by-agent` was not ticked) or `result_unrecorded`
+    /// (EnvCloak does not know what the change left, and `--unrecorded`
+    /// was not given).
+    RestoreRefused,
+    /// No restore lease has the id for this process on this terminal: it
+    /// never did, or it ended.
+    NoSuchLease,
+    /// The backup v2 is committed: it takes no more chunks, and each
+    /// file's result is recorded once.
+    BackupFrozen,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 40] = [
+    pub const ALL: [ErrorKind; 44] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -1104,6 +1308,10 @@ impl ErrorKind {
         ErrorKind::AuditFailed,
         ErrorKind::BackupUnusable,
         ErrorKind::TooManyPending,
+        ErrorKind::NotBackupOwner,
+        ErrorKind::RestoreRefused,
+        ErrorKind::NoSuchLease,
+        ErrorKind::BackupFrozen,
         ErrorKind::Internal,
     ];
 
@@ -1149,6 +1357,10 @@ impl ErrorKind {
             ErrorKind::AuditFailed => -32033,
             ErrorKind::BackupUnusable => -32034,
             ErrorKind::TooManyPending => -32035,
+            ErrorKind::NotBackupOwner => -32036,
+            ErrorKind::RestoreRefused => -32048,
+            ErrorKind::NoSuchLease => -32049,
+            ErrorKind::BackupFrozen => -32050,
             ErrorKind::Internal => -32099,
         }
     }
@@ -1195,6 +1407,10 @@ impl ErrorKind {
             ErrorKind::AuditFailed => "audit_failed",
             ErrorKind::BackupUnusable => "backup_unusable",
             ErrorKind::TooManyPending => "too_many_pending",
+            ErrorKind::NotBackupOwner => "not_backup_owner",
+            ErrorKind::RestoreRefused => "restore_refused",
+            ErrorKind::NoSuchLease => "no_such_lease",
+            ErrorKind::BackupFrozen => "backup_frozen",
             ErrorKind::Internal => "internal",
         }
     }
@@ -1285,6 +1501,22 @@ impl ErrorKind {
             ErrorKind::TooManyPending => {
                 "too many requests are waiting for approval, so this one was not opened; approve \
                  or deny one (`envcloak pending` lists them), or ask again later"
+            }
+            ErrorKind::NotBackupOwner => {
+                "only the process that began this backup may add to it, commit it or record its \
+                 result; nothing was changed"
+            }
+            ErrorKind::RestoreRefused => {
+                "this backup is restored only with an explicit option; nothing was restored"
+            }
+            ErrorKind::NoSuchLease => {
+                "no restore lease is open for this process and terminal (it ended when its process \
+                 exited, the vault locked, it sat idle for 60 seconds or the daemon restarted); \
+                 open the restore again"
+            }
+            ErrorKind::BackupFrozen => {
+                "the backup is committed: it takes no more chunks, and each file's result is \
+                 recorded once; nothing was changed"
             }
             ErrorKind::Internal => "the daemon failed",
         }
@@ -1385,6 +1617,9 @@ pub const REASONS: &[&str] = &[
     // A proof refused (`proof_refused`) because the approver shares a
     // session or a terminal with the request's own chain.
     "requester_terminal",
+    // A backup v2 restore refused before the proof (`restore_refused`).
+    "result_unrecorded",
+    "created_by_agent",
 ];
 
 /// An error response. Built from fixed tokens only.
@@ -1396,7 +1631,9 @@ pub struct RpcError {
     /// [`ErrorKind::ManifestInvalid`], [`ErrorKind::BindingUnresolved`],
     /// [`ErrorKind::InvalidOptions`], [`ErrorKind::NoSuchItem`],
     /// [`ErrorKind::InvalidItem`], [`ErrorKind::ProofRefused`]
-    /// (`requester_terminal` only) and [`ErrorKind::TooManyPending`].
+    /// (`requester_terminal` only), [`ErrorKind::TooManyPending`],
+    /// [`ErrorKind::RestoreRefused`] and [`ErrorKind::FilesBackupFailed`]
+    /// (`too_large` only: a backup v2 over its caps).
     pub reason: Option<&'static str>,
 }
 

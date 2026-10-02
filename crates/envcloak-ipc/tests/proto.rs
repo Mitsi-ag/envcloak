@@ -662,3 +662,36 @@ fn the_largest_pending_listing_fits_in_one_frame() {
         .well_formed()
     );
 }
+
+/// A backup v2 chunk crosses in one frame both ways (M2-05): a full chunk
+/// in `backup.v2.put` with the largest indexes, and in `backup.v2.read`'s
+/// answer with the first chunk's file view at the longest path, written
+/// as escaped JSON as it can be.
+#[test]
+fn a_full_backup_chunk_fits_in_one_frame() {
+    use envcloak_core::file_backup_v2::{CHUNK_V2, MAX_PATH_V2};
+    use envcloak_ipc::proto::{BackupChunk, BackupPut, BackupPutParams};
+    use envcloak_ipc::view::RestoreFileView;
+    let data = || WireSecret::new(SecretBytes::from_vec(vec![0xff; CHUNK_V2]));
+    let put = BackupPutParams {
+        id: "Z".repeat(26),
+        file: u32::MAX,
+        chunk: u32::MAX,
+        data: data(),
+    };
+    assert!(proto::request_frame::<BackupPut>(u64::MAX, &put).is_ok());
+    let answer = BackupChunk {
+        data: data(),
+        last: true,
+        file: Some(RestoreFileView {
+            file: u32::MAX,
+            path: "\u{1}".repeat(MAX_PATH_V2),
+            mode: u32::MAX,
+            size: u64::MAX,
+            chunks: u64::MAX,
+            sha256: "a".repeat(64),
+            sha256_after: Some("b".repeat(64)),
+        }),
+    };
+    assert!(proto::result_frame(u64::MAX, &answer).is_ok());
+}

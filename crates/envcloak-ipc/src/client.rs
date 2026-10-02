@@ -51,6 +51,11 @@ use crate::proto::{
     VaultCreateParams,
 };
 use crate::proto::{
+    BackupBegin, BackupBeginParams, BackupChunk, BackupCommit, BackupIdParams, BackupList,
+    BackupOpenRestore, BackupPut, BackupPutParams, BackupRead, BackupReadParams,
+    BackupRecordResult, BackupResultParams, OpenRestoreParams,
+};
+use crate::proto::{
     BackupCreate, FilesBackup, FilesBackupParams, FilesRestore, FilesRestoreParams, ImportCommit,
     ImportCommitParams, ImportParams, ImportPlan, ImportVerify, PendingList, PendingListParams,
     PendingPoll, PendingStateParams, RecoverParams, RecoveryConfirm, RecoveryConfirmParams,
@@ -60,6 +65,10 @@ use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
     ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
     UnlockedView,
+};
+use crate::view::{
+    BackupBegunView, BackupCommittedView, BackupListView, BackupPutView, BackupResultView,
+    RestoreLeaseView,
 };
 use crate::view::{
     BackupView, FileBackupView, ImportPlanView, PendingListView, RecoveredView,
@@ -758,6 +767,117 @@ impl Client {
             new_passphrase: WireSecret::new(new_passphrase),
             claims: claims.to_vec(),
         })
+    }
+}
+
+impl Client {
+    /// `backup.v2.begin`: starts a backup v2 of `p`'s files; this process
+    /// is its creator.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn backup_v2_begin(
+        &mut self,
+        p: &BackupBeginParams,
+    ) -> Result<BackupBegunView, ClientError> {
+        self.call::<BackupBegin>(p)
+    }
+
+    /// `backup.v2.put`: chunk `chunk` of file `file` of backup `id`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn backup_v2_put(
+        &mut self,
+        id: &str,
+        file: u32,
+        chunk: u32,
+        data: SecretBytes,
+    ) -> Result<BackupPutView, ClientError> {
+        self.call::<BackupPut>(&BackupPutParams {
+            id: id.to_owned(),
+            file,
+            chunk,
+            data: WireSecret::new(data),
+        })
+    }
+
+    /// `backup.v2.commit`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn backup_v2_commit(&mut self, id: &str) -> Result<BackupCommittedView, ClientError> {
+        self.call::<BackupCommit>(&BackupIdParams { id: id.to_owned() })
+    }
+
+    /// `backup.v2.record_result`: what the change left in file `file`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn backup_v2_record_result(
+        &mut self,
+        id: &str,
+        file: u32,
+        sha256_after: &[u8; 32],
+    ) -> Result<BackupResultView, ClientError> {
+        use core::fmt::Write as _;
+        let hex = sha256_after
+            .iter()
+            .fold(String::with_capacity(64), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+        self.call::<BackupRecordResult>(&BackupResultParams {
+            id: id.to_owned(),
+            file,
+            sha256_after: hex,
+        })
+    }
+
+    /// `backup.v2.open_restore`, with the passphrase as the proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn backup_v2_open_restore(
+        &mut self,
+        id: &str,
+        passphrase: SecretBytes,
+        created_by_agent_ticked: bool,
+        unrecorded: bool,
+        claims: &[String],
+    ) -> Result<RestoreLeaseView, ClientError> {
+        self.call::<BackupOpenRestore>(&OpenRestoreParams {
+            id: id.to_owned(),
+            passphrase: WireSecret::new(passphrase),
+            created_by_agent_ticked,
+            unrecorded,
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `backup.v2.read`: one chunk under lease `lease`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn backup_v2_read(
+        &mut self,
+        lease: &str,
+        file: u32,
+        chunk: u32,
+    ) -> Result<BackupChunk, ClientError> {
+        self.call::<BackupRead>(&BackupReadParams {
+            lease: lease.to_owned(),
+            file,
+            chunk,
+        })
+    }
+
+    /// `backup.v2.list`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn backup_v2_list(&mut self) -> Result<BackupListView, ClientError> {
+        self.call::<BackupList>(&NoParams {})
     }
 }
 
