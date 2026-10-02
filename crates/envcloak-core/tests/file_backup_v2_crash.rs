@@ -42,7 +42,8 @@ const RESULT_ID: &str = "ENVCLOAK_BACKUP_V2_RESULT_ID";
 
 /// The steps in the order a backup passes them; a chunk step is reported
 /// once per chunk (the hold is at the second one).
-const STEPS: [&str; 7] = [
+const STEPS: [&str; 8] = [
+    "opened",
     "staged",
     "started",
     "chunk",
@@ -52,10 +53,11 @@ const STEPS: [&str; 7] = [
     "done",
 ];
 /// From this step on, the backup is in place.
-const INSTALLED: usize = 5;
+const INSTALLED: usize = 6;
 
 fn step_name(s: StepV2) -> &'static str {
     match s {
+        StepV2::Opened => "opened",
         StepV2::Staged => "staged",
         StepV2::Started => "started",
         StepV2::Chunk => "chunk",

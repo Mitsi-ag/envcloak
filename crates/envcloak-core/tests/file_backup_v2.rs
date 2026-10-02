@@ -21,7 +21,7 @@ use envcloak_core::file_backup::{FILE_BACKUP_RETENTION, FileBackupId, STAGING_GR
 use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
     FileBackupV2Writer, HEADER_LEN_V2, MAX_FILE_V2, MAX_FILES_V2, MAX_LABEL_V2, MAX_PATH_V2,
-    PlannedFile, chunk_len, chunks_of, list_file_backups_v2, purge_file_backups_v2,
+    PlannedFile, StepV2, chunk_len, chunks_of, list_file_backups_v2, purge_file_backups_v2,
     purge_file_backups_v2_except, purge_file_backups_v2_observed,
 };
 use envcloak_core::vault::{Vault, VaultErrorKind};
@@ -969,5 +969,60 @@ fn a_purge_keeps_a_backup_in_progress() {
         .unwrap();
     let id = w.commit().unwrap().id;
     assert_reads_back(&v, &id, &[&body]);
+    drop(f);
+}
+
+/// A backup makes its staging directory in the `backups/` it opened, never
+/// by its path again (L-11): right after `backups/` is opened, a test
+/// moves it away and puts a symlink to another directory in its place.
+/// The staging directory is made in the directory opened, nothing is made
+/// in the other one, and the backup is committed where it was begun and
+/// reads back.
+#[test]
+fn a_backup_makes_its_staging_directory_in_the_directory_it_opened() {
+    let (f, v) = KitFixture::create();
+    let backups = v.paths().backups_dir.clone();
+    std::fs::create_dir_all(&backups).unwrap();
+    let decoy = f.home.root().join("decoy");
+    let held = f.home.root().join("backups-held");
+    std::fs::create_dir(&decoy).unwrap();
+    let plan = vec![PlannedFile {
+        path: "/h/.env".into(),
+        mode: 0o600,
+        size: 4,
+    }];
+    let (from, to, link) = (backups.clone(), held.clone(), decoy.clone());
+    let mut w = v
+        .begin_file_backup_v2_observed(
+            BackupPurpose::Init,
+            creator(CreatorKind::Terminal),
+            plan,
+            now(),
+            move |s| {
+                if s == StepV2::Opened {
+                    std::fs::rename(&from, &to).unwrap();
+                    std::os::unix::fs::symlink(&link, &from).unwrap();
+                }
+            },
+        )
+        .unwrap();
+    assert!(
+        dir_names(&decoy).is_empty(),
+        "a staging directory was made through the path: {:?}",
+        dir_names(&decoy)
+    );
+    let staged = dir_names(&held);
+    assert_eq!(staged.len(), 1, "{staged:?}");
+    assert!(staged[0].starts_with(".files2-"), "{staged:?}");
+    w.put(0, 0, &SecretBytes::copy_from(b"A=1\n")).unwrap();
+    w.commit().unwrap();
+    assert!(dir_names(&decoy).is_empty());
+    let committed = dir_names(&held);
+    assert_eq!(committed.len(), 1);
+    assert!(committed[0].starts_with("files2-"), "{committed:?}");
+    std::fs::remove_file(&backups).unwrap();
+    std::fs::rename(&held, &backups).unwrap();
+    let only = list_file_backups_v2(v.paths()).unwrap().remove(0).id;
+    assert_reads_back(&v, &only, &[b"A=1\n"]);
     drop(f);
 }

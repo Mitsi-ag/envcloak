@@ -8,9 +8,10 @@
 //! ([`crate::open_beneath`] opens a file there): [`list_dir`] reads its
 //! entries, [`kind_beneath`] says what one is, [`read_link_beneath`] reads
 //! a symlink's target, [`open_dir_beneath`] opens a subdirectory, and
-//! [`create_beneath`], [`link_beneath`], [`rename_beneath`],
-//! [`exchange_beneath`], [`unlink_beneath`] and [`remove_dir_beneath`]
-//! make, link, move, swap and remove names in it. None of
+//! [`create_beneath`], [`create_dir_beneath`], [`link_beneath`],
+//! [`rename_beneath`], [`exchange_beneath`], [`unlink_beneath`] and
+//! [`remove_dir_beneath`] make, link, move, swap and remove names in it.
+//! None of
 //! them follows a symlink in the name's place. [`volume_of`] says whether
 //! the directory is on a network volume.
 //!
@@ -184,6 +185,19 @@ pub fn create_beneath(dir: &File, name: &OsStr, mode: u32) -> io::Result<File> {
     // argument openat reads when O_CREAT is set.
     let fd = retry(|| unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode) })?;
     owned(fd)
+}
+
+/// Makes the directory `name` in `dir` with `mkdirat(2)`, with `mode`
+/// less the umask. An existing name, a symlink (even a dangling one)
+/// included, fails with [`io::ErrorKind::AlreadyExists`]: nothing is made
+/// where it points. The new directory is in `dir` itself, whatever names
+/// `dir`'s path by then.
+pub fn create_dir_beneath(dir: &File, name: &OsStr, mode: u32) -> io::Result<()> {
+    let c = component(name)?;
+    let mode = libc::mode_t::from(u16::try_from(mode & 0o7777).unwrap_or(0o700));
+    // SAFETY: `dir` keeps its descriptor open for the call, and `c` is a
+    // NUL-terminated string that outlives it.
+    retry(|| unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode) }).map(drop)
 }
 
 /// Removes the name `name` from `dir` with `unlinkat(2)`. A symlink is
