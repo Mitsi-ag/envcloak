@@ -2312,34 +2312,47 @@ fn a_purge_keeps_every_backup_in_progress() {
     f.sweep();
 }
 
-/// A lock while a `begin` purges ends the backup it began: the daemon is
+/// A lock while a `begin` purges ends the backup it began, whether or not
+/// the vault is unlocked again before the purge ends: the daemon is
 /// stopped by a barrier in the purge, after the backup is registered, and
-/// the vault is locked meanwhile. The `begin` then answers `vault_locked`,
-/// never an id, and once unlocked nothing is listed and no staging
-/// directory is left.
+/// the vault is locked (and, the second time, unlocked again) meanwhile.
+/// The `begin` then answers `vault_locked` (or, unlocked again,
+/// `no_such_backup`: the backup it began is gone), never an id, and once
+/// unlocked nothing is listed and no staging directory is left.
 #[test]
 fn a_lock_while_a_begin_purges_ends_its_backup() {
-    let mut f = Fixture::pausing(Some("backup.v2.purge"));
-    let files = [Spec::made(&f.claude("projects/p/locked.jsonl"), 40, 73)];
-    let paths = f.paths();
-    let params = begin_params("scrub", &files, &[]);
-    let begun = std::thread::spawn(move || {
-        Client::connect(&paths)?
-            .backup_v2_begin(&params)
-            .map(|b| b.id)
-    });
-    f.wait_paused("backup.v2.purge");
-    client(&f.home).lock().unwrap();
-    f.release();
-    let e = begun
-        .join()
-        .unwrap()
-        .expect_err("a begin ended by a lock answered its id");
-    assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
-    client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
-    assert!(f.list().backups.is_empty());
-    assert!(staging_dirs(&f.home).is_empty());
-    f.sweep();
+    for relock in [false, true] {
+        let mut f = Fixture::pausing(Some("backup.v2.purge"));
+        let files = [Spec::made(&f.claude("projects/p/locked.jsonl"), 40, 73)];
+        let paths = f.paths();
+        let params = begin_params("scrub", &files, &[]);
+        let begun = std::thread::spawn(move || {
+            Client::connect(&paths)?
+                .backup_v2_begin(&params)
+                .map(|b| b.id)
+        });
+        f.wait_paused("backup.v2.purge");
+        client(&f.home).lock().unwrap();
+        if relock {
+            client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
+        }
+        f.release();
+        let e = begun.join().unwrap().err().unwrap_or_else(|| {
+            panic!("unlocked again: {relock}: a begin ended by a lock answered its id")
+        });
+        let want = if relock {
+            ErrorKind::NoSuchBackup
+        } else {
+            ErrorKind::VaultLocked
+        };
+        assert_eq!(rpc(e).0, want, "unlocked again: {relock}");
+        if !relock {
+            client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
+        }
+        assert!(f.list().backups.is_empty(), "unlocked again: {relock}");
+        assert!(staging_dirs(&f.home).is_empty(), "unlocked again: {relock}");
+        f.sweep();
+    }
 }
 
 /// A creator that exits while its `record_result` is in flight records
