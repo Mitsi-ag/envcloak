@@ -8,14 +8,20 @@
 //!   `backups/` and the temporary directories hold no plaintext;
 //! - only the process instance that began a backup may add to it, commit
 //!   it and record its results, even against another process in the same
-//!   agent root; a committed backup is frozen and a result recorded once;
-//!   a creator that exits first leaves `result_unrecorded`;
-//! - restore takes a proof from a terminal subject only, names an agent
-//!   creator on its statement and needs `--created-by-agent` for it;
-//! - a lease serves only its own process, ends at lock and when its
-//!   process exits; an audit entry that cannot be written issues no lease,
-//!   and a lease's entry is on disk before its first chunk; a backup that
-//!   does not open whole releases nothing;
+//!   agent root, and only while it runs (a connection it handed on is
+//!   refused once it exited); a committed backup is frozen and a result
+//!   recorded once; a creator that exits first leaves
+//!   `result_unrecorded`; one root holds at most four uploads;
+//! - restore takes a proof from a terminal subject only (also after a
+//!   restart), names an agent creator on its statement, needs
+//!   `--created-by-agent` for it, and is refused from the agent's own
+//!   terminal while it runs, also after a restart;
+//! - a lease serves only its own process on its own terminal, ends at
+//!   lock and when its process exits; a lock during a read, put or commit
+//!   in flight stops it; an audit entry that cannot be written issues no
+//!   lease, and a lease's entry is on disk before its first chunk; a
+//!   backup that does not open whole releases nothing; list holds no lock
+//!   while it opens backups;
 //! - a killed client or daemon leaves no listed partial backup.
 //!
 //! The caller is this test process, made a terminal session first. Other
