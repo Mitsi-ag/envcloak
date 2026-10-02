@@ -35,9 +35,9 @@
 //!   again after the walk).
 //! - The runner (`envcloak run`): [`SignalRelay`] (signals caught and
 //!   handed to a thread that passes them on, each with whether a process
-//!   sent it, and marks between them), [`wait_for_exit`] (a child's exit
-//!   seen without reaping it, so its pid is not reused while it may still
-//!   be signalled), [`signal_process`] and [`signal_group`] (`kill`),
+//!   sent it, and marks between them), [`wait_for_exit`] and
+//!   [`has_exited`] (a child's exit seen without reaping it, so its pid is
+//!   not reused while it may still be signalled), [`signal_process`] and [`signal_group`] (`kill`),
 //!   [`wait_writable`] (an output descriptor ready for a write),
 //!   [`hung_up`] (a pipe no process can write to any more), and
 //!   [`Interrupter`] (a thread blocked writing to an output nobody reads,
@@ -77,7 +77,7 @@ pub mod testing;
 mod tty;
 
 pub use alloc::{SystemBacking, WipingAllocator, wiping_allocator_active};
-pub use child::{Relayed, SignalRelay, signal_group, signal_process, wait_for_exit};
+pub use child::{Relayed, SignalRelay, has_exited, signal_group, signal_process, wait_for_exit};
 pub use clock::{awake_time, time_including_sleep};
 pub use dir::{
     DirEntryKind, DirEntryName, MAX_DIR_ENTRIES, Volume, create_beneath, exchange_beneath,
