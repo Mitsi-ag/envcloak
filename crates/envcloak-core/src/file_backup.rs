@@ -29,6 +29,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -370,6 +371,23 @@ impl Vault {
     /// [`VaultErrorKind::TooLarge`] beyond [`MAX_BACKUP_FILES`] or
     /// [`MAX_BACKUP_BYTES`].
     pub fn backup_files(&self, files: &[BackupFile]) -> Result<FileBackupInfo, VaultError> {
+        self.backup_files_observed(files, &mut || {})
+    }
+
+    /// [`Vault::backup_files`], calling `written` once the new file is
+    /// written and flushed, before it is linked to its name: a unit test
+    /// puts another file under its temporary name there.
+    ///
+    /// A link takes whatever has the temporary name at that moment, so the
+    /// backup's name is then opened (never through a symlink) and compared
+    /// by device and inode with the file written: another file put under
+    /// the temporary name fails the backup (`InvalidRecord`), never
+    /// answered as written, so nothing is deleted on the strength of it.
+    fn backup_files_observed(
+        &self,
+        files: &[BackupFile],
+        written: &mut dyn FnMut(),
+    ) -> Result<FileBackupInfo, VaultError> {
         self.header()?;
         if files.is_empty()
             || files
@@ -395,10 +413,15 @@ impl Vault {
         let name = file_name(&id, created_at);
         let tmp = format!(".{name}.tmp");
         let (name_os, tmp_os) = (OsStr::new(&name), OsStr::new(&tmp));
-        let written = self.write_files(&dir, tmp_os, &head, &ctx, &key, files);
-        let linked = written.and_then(|bytes| match link_beneath(&dir, tmp_os, name_os) {
-            Ok(()) => Ok(bytes),
-            Err(e) => Err(e.into()),
+        let made = self.write_files(&dir, tmp_os, &head, &ctx, &key, files);
+        let linked = made.and_then(|file| {
+            written();
+            link_beneath(&dir, tmp_os, name_os)?;
+            let (ours, named) = (file.metadata()?, open_beneath(&dir, name_os)?.metadata()?);
+            if (ours.dev(), ours.ino()) != (named.dev(), named.ino()) {
+                return Err(VaultError::from(VaultErrorKind::InvalidRecord));
+            }
+            Ok(ours.len())
         });
         let removed = match unlink_beneath(&dir, tmp_os) {
             Ok(()) => Ok(()),
@@ -418,7 +441,7 @@ impl Vault {
     }
 
     /// Writes the backup to the new file `tmp` in `dir` (`O_EXCL`, never
-    /// through a symlink, 0600) and flushes it. Returns its size.
+    /// through a symlink, 0600) and flushes it. Returns it, open.
     fn write_files(
         &self,
         dir: &File,
@@ -427,7 +450,7 @@ impl Vault {
         ctx: &Ctx,
         key: &SubKey,
         files: &[BackupFile],
-    ) -> Result<u64, VaultError> {
+    ) -> Result<File, VaultError> {
         let file = create_beneath(dir, tmp, 0o600)?;
         let mut w = BufWriter::new(file);
         w.write_all(head)?;
@@ -443,7 +466,7 @@ impl Vault {
             .into_inner()
             .map_err(|e| VaultError::from(e.into_error()))?;
         sync_file(&file)?;
-        Ok(file.metadata()?.len())
+        Ok(file)
     }
 
     /// The files of backup `id`, byte for byte, with their paths and
@@ -714,5 +737,67 @@ mod tests {
         let mut longer = m.clone();
         longer.push(0);
         assert!(decode_manifest(&longer).is_err());
+    }
+
+    /// A backup is answered as written only when its name holds the file
+    /// written (a link takes whatever has the temporary name at that
+    /// moment, and `init` deletes plaintext on the strength of the
+    /// answer): once the new file is flushed, another file, or a symlink
+    /// to a file elsewhere, is put under its temporary name. The backup
+    /// fails, the symlink's target is as it was, and nothing named for
+    /// the backup opens as one.
+    #[test]
+    fn a_backup_is_answered_only_for_the_file_written() {
+        for symlink in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = VaultPaths::under(dir.path().join("data"));
+            let (v, _) = crate::create_vault(
+                &paths,
+                &SecretBytes::copy_from(b"a test passphrase, not a fixture"),
+                crate::crypto::KdfParams::minimum(),
+            )
+            .unwrap();
+            let outside = dir.path().join("outside");
+            std::fs::write(&outside, b"not a backup").unwrap();
+            let files = [BackupFile {
+                path: "/p/.env".into(),
+                mode: 0o600,
+                content: SecretBytes::copy_from(b"A=1\n"),
+            }];
+            let backups = paths.backups_dir.clone();
+            let mut did = 0;
+            let e = v.backup_files_observed(&files, &mut || {
+                let temp = std::fs::read_dir(&backups)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .find(|n| n.starts_with(".files-") && n.ends_with(".tmp"))
+                    .unwrap();
+                let other = backups.join("other");
+                if symlink {
+                    std::os::unix::fs::symlink(&outside, &other).unwrap();
+                } else {
+                    std::fs::write(&other, b"not a backup either").unwrap();
+                }
+                std::fs::rename(&other, backups.join(temp)).unwrap();
+                did += 1;
+            });
+            assert_eq!(did, 1);
+            assert!(
+                e.is_err(),
+                "symlink {symlink}: a backup answered as written for a file it did not write"
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), b"not a backup");
+            let named: Vec<_> =
+                list_backups(&open_private_child(&backups).unwrap().unwrap(), &backups).unwrap();
+            for (name, _) in named {
+                let id = name
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".ecfiles"))
+                    .and_then(|n| n.rsplit('-').next())
+                    .and_then(FileBackupId::parse)
+                    .unwrap();
+                assert!(v.open_file_backup(&id).is_err());
+            }
+        }
     }
 }
