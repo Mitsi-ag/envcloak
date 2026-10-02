@@ -39,7 +39,7 @@ use envcloak_e2e::{
     Emitters, Harness, NAMES, WRONG_PASSPHRASE, sha256_hex, text, token, versions_toml,
 };
 use envcloak_testkit::agents::{
-    AgentHome, Host, HostFlags, Installed, mcp_client, require, require_mcp_client,
+    AgentHome, GroupChild, Host, HostFlags, Installed, mcp_client, require, require_mcp_client,
 };
 use envcloak_testkit::transcripts::Sweep;
 use envcloak_testkit::{Canary, fresh_seed, labels, testkit_bin};
@@ -232,10 +232,13 @@ fn s7_s8_the_sdk_client_drives_every_tool() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let stdout = BufReader::new(child.stdout.take().unwrap());
-    let mut stderr = child.stderr.take().unwrap();
+    // The agent leads a group of its own, with the client and the server
+    // in it: a failure anywhere below (a panic at the barrier, say) kills
+    // the group when `child` drops, while the agent is unreaped (L-03).
+    let mut child = GroupChild::spawn(&mut cmd).unwrap();
+    let mut stdin = child.take_stdin().unwrap();
+    let stdout = BufReader::new(child.take_stdout().unwrap());
+    let mut stderr = child.take_stderr().unwrap();
     let (tx, lines) = mpsc::channel();
     std::thread::spawn(move || {
         for line in stdout.split(b'\n').map_while(Result::ok) {
@@ -280,7 +283,9 @@ fn s7_s8_the_sdk_client_drives_every_tool() {
         }
     }
     drop(stdin);
-    let status = child.wait().unwrap();
+    let status = child
+        .end_within(Duration::from_secs(120))
+        .expect("the SDK client did not exit after its plan");
     let err = err.join().unwrap();
     h.record("the SDK client's stderr (the server's own)", &err);
     assert!(status.success(), "{}", String::from_utf8_lossy(&err));
@@ -560,10 +565,10 @@ fn s7_s8_claude_code_calls_the_tools_and_the_person_approves() {
             .unwrap()
     };
     let took = Duration::from_millis(at("step 2").saturating_sub(at("step 1")));
-    let wait = tool_timeouts::default_wait(Some("claude-code"));
+    let wait = tool_timeouts::person_wait(tool_timeouts::default_wait(Some("claude-code")));
     assert!(
-        took + Duration::from_secs(1) >= wait && took < host.tool_timeout,
-        "the pending answer came after {took:?} (wait {wait:?}, cutoff {:?})",
+        took >= wait && took < host.tool_timeout,
+        "the pending answer came after {took:?} (waiting {wait:?} for the person, cutoff {:?})",
         host.tool_timeout
     );
     println!(
