@@ -61,7 +61,7 @@ pub(crate) use txn::now_secs;
 
 pub(crate) use aside::{REPLACED_PREFIX, set_aside, utc_stamp, with_suffix};
 use integrity::{state_digest, unlocker_body};
-pub(crate) use paths::{check_private_dir, check_private_file};
+pub(crate) use paths::{check_private_dir, check_private_file, open_private_child};
 use state::{State, VaultCtx, item_key};
 use values::open_priors;
 pub(crate) use values::{open_record, open_value, seal_record, seal_value, sha256_update};
