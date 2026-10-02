@@ -23,8 +23,11 @@
 //!   client's connection, bounded in time from before the connect),
 //!   [`try_lock_exclusive`]
 //!   (`flock`), [`TerminationSignals`] (`sigwait` on SIGTERM, SIGINT and
-//!   SIGHUP), and [`awake_time`] and [`time_including_sleep`] (the clock
-//!   pair that shows the machine slept).
+//!   SIGHUP; [`unblock_termination_on_spawn`] keeps that mask from the
+//!   children such a process starts, and [`termination_ends_process`] lets
+//!   them end a process started with them blocked or ignored), and
+//!   [`awake_time`] and [`time_including_sleep`] (the clock pair that shows
+//!   the machine slept).
 //! - The CLI's secret input: [`SecretInput`] (a terminal with echo off)
 //!   and [`inherited_fd`] (a descriptor named by `--passphrase-fd`).
 //! - Caller evidence: [`proc_info`] and [`proc_argv`] (one process as the
@@ -107,7 +110,7 @@ pub use proc::{
 };
 pub use signal::{
     TerminationSignals, TerminationWatch, exit_by_signal, interrupt_ends_process,
-    termination_recorded,
+    termination_ends_process, termination_recorded, unblock_termination_on_spawn,
 };
 pub use sock::connect_unix;
 pub use sync::{SyncMethod, sync_file};

@@ -4,7 +4,8 @@
 //! the person finds the request with `envcloak pending` (never from the
 //! agent's output) and approves it from a terminal of their own, and the
 //! run goes on; a `y` typed into the waiting run's terminal approves
-//! nothing; the wait ends at its deadline, on SIGINT and on a denial; five
+//! nothing; the wait ends at its deadline, on SIGINT, SIGTERM and SIGHUP,
+//! however inherited (an ignored SIGHUP stays ignored), and on a denial; five
 //! waiters under one agent all run as each is approved; `envcloak pending`
 //! lists nothing where no proof is taken; and `--manifest` names a project
 //! as the search upward does, with the same refusals.
@@ -847,74 +848,96 @@ fn a_waiting_run_ends_on_sigint_and_on_a_denial() {
     f.sweep();
 }
 
-/// Runs argv[2..] in a new session, without a controlling terminal, with
-/// SIGINT ignored, blocked or both as argv[1] says: both survive `exec`,
-/// so a program can start the CLI so (a shell starts a background job
-/// with SIGINT ignored).
-const INHERITED_SIGINT: &str = "import os, signal, sys
+/// Runs argv[3..] in a new session, without a controlling terminal, with
+/// the signal argv[2] names (`SIGINT`, `SIGTERM`, `SIGHUP`) ignored,
+/// blocked or both as argv[1] says: both survive `exec`, so a program can
+/// start the CLI so (a shell starts a background job with SIGINT ignored;
+/// `envcloak mcp` blocks SIGTERM, SIGINT and SIGHUP in every thread).
+const INHERITED_SIGNAL: &str = "import os, signal, sys
 os.setsid()
+sig = getattr(signal, sys.argv[2])
 if sys.argv[1] in ('ignored', 'both'):
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(sig, signal.SIG_IGN)
 if sys.argv[1] in ('blocked', 'both'):
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-os.execv(sys.argv[2], sys.argv[2:])
+    signal.pthread_sigmask(signal.SIG_BLOCK, {sig})
+os.execv(sys.argv[3], sys.argv[3:])
 ";
 
-/// The wait ends on SIGINT however the run inherited it, ignored, blocked
-/// or both: ended by the signal (a shell reports 130) with nothing more
-/// said, and the command is never started, also when the request is
-/// approved afterwards.
-///
-/// Mutation: leave SIGINT as the run inherited it (no
-/// `interrupt_ends_process` before the wait): the run waits on after
-/// SIGINT and this fails for each of the three.
-#[test]
-fn a_waiting_run_ends_on_sigint_however_it_inherited_it() {
+/// A run waiting for an approval: `envcloak run --wait 60s` of a command
+/// that would create `marker`, started with `sig` inherited as `how` says
+/// ([`INHERITED_SIGNAL`]). Returned once it said it waits, with its
+/// standard error and the request it waits for.
+fn waiting_with(
+    f: &Fixture,
+    how: &str,
+    sig: &str,
+    marker: &Path,
+) -> (Child, BufReader<std::process::ChildStderr>, String) {
+    let mut cmd = Command::new(python3());
+    f.home
+        .apply(&mut cmd)
+        .args(["-c", INHERITED_SIGNAL, how, sig])
+        .arg(cli())
+        .args(["run", "--wait", "60s", "--", "/bin/sh", "-c"])
+        .arg(format!("touch {}", quoted(marker.to_str().unwrap())))
+        .current_dir(&f.project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut err = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    err.read_line(&mut line).unwrap();
+    assert!(
+        line.starts_with("envcloak: approval_required: request="),
+        "{how} {sig}: {line}"
+    );
+    let id = required(&line).pop().unwrap();
+    (child, err, id)
+}
+
+/// Sends `sig` (`INT`, `TERM`, `HUP`) to `child`, this test's own child,
+/// which it has not reaped.
+fn send(child: &Child, sig: &str) {
+    let ok = Command::new("kill")
+        .args([&format!("-{sig}"), &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "kill -{sig}");
+}
+
+/// How `child` ended, waited for up to 20 seconds; `None` when it was
+/// still running then (it is killed and reaped: still the test's own
+/// unreaped child).
+fn ended(child: &mut Child) -> Option<ExitStatus> {
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return Some(s);
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `sig` ends a waiting run started with it ignored, blocked or both:
+/// ended by the signal with nothing more said, and the command is never
+/// started, also when the request is approved afterwards.
+fn ends_the_wait_however_inherited(sig: &str, number: i32) {
     let f = Fixture::new();
     let files = outside_dir();
     for how in ["ignored", "blocked", "both"] {
         let marker = files.path().join(how);
-        let mut cmd = Command::new(python3());
-        f.home
-            .apply(&mut cmd)
-            .args(["-c", INHERITED_SIGINT, how])
-            .arg(cli())
-            .args(["run", "--wait", "60s", "--", "/bin/sh", "-c"])
-            .arg(format!("touch {}", quoted(marker.to_str().unwrap())))
-            .current_dir(&f.project)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        let mut err = BufReader::new(child.stderr.take().unwrap());
-        let mut line = String::new();
-        err.read_line(&mut line).unwrap();
-        assert!(
-            line.starts_with("envcloak: approval_required: request="),
-            "{how}: {line}"
-        );
-        let id = required(&line).pop().unwrap();
-        // SIGINT to this test's own child, which it has not reaped.
-        let ok = Command::new("kill")
-            .args(["-INT", &child.id().to_string()])
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok);
-        let end = Instant::now() + Duration::from_secs(20);
-        let status = loop {
-            if let Some(s) = child.try_wait().unwrap() {
-                break s;
-            }
-            if Instant::now() >= end {
-                // Still the test's own unreaped child: ended here.
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{how}: SIGINT did not end the wait");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(status.signal(), Some(libc::SIGINT), "{how}: {status:?}");
+        let (mut child, mut err, id) = waiting_with(&f, how, &format!("SIG{sig}"), &marker);
+        send(&child, sig);
+        let status =
+            ended(&mut child).unwrap_or_else(|| panic!("{how}: SIG{sig} did not end the wait"));
+        assert_eq!(status.signal(), Some(number), "{how}: {status:?}");
         let mut rest = String::new();
         std::io::Read::read_to_string(&mut err, &mut rest).unwrap();
         assert_eq!(rest, "", "{how}");
@@ -922,6 +945,71 @@ fn a_waiting_run_ends_on_sigint_however_it_inherited_it() {
         f.approve(&id, &["--once"]);
         assert!(!marker.exists(), "{how}: the command was started");
     }
+    f.sweep();
+}
+
+/// The wait ends on SIGINT however the run inherited it, ignored, blocked
+/// or both: ended by the signal (a shell reports 130) with nothing more
+/// said, and the command is never started, also when the request is
+/// approved afterwards.
+///
+/// Mutation: leave SIGINT as the run inherited it (no
+/// `termination_ends_process` before the wait): the run waits on after
+/// SIGINT and this fails for each of the three.
+#[test]
+fn a_waiting_run_ends_on_sigint_however_it_inherited_it() {
+    ends_the_wait_however_inherited("INT", libc::SIGINT);
+}
+
+/// The wait ends on SIGTERM however the run inherited it, ignored,
+/// blocked or both: `envcloak mcp` blocks SIGTERM in every thread, and
+/// stops a cancelled call's `envcloak run` with it. Ended by the signal
+/// (143), the command is never started, also when the request is approved
+/// afterwards (Codex review of M2-06, high: a run that inherited SIGTERM
+/// blocked kept waiting, and started the command once the approval came).
+///
+/// Mutation checked: the wait making only SIGINT end it (`run --wait`
+/// calling `interrupt_ends_process`, as it did): the run waits on after
+/// SIGTERM and this fails for each of the three.
+#[test]
+fn a_waiting_run_ends_on_sigterm_however_it_inherited_it() {
+    ends_the_wait_however_inherited("TERM", libc::SIGTERM);
+}
+
+/// SIGHUP inherited blocked ends the wait once it comes, as SIGTERM does;
+/// SIGHUP inherited ignored (`nohup`) is kept ignored: the run waits on
+/// after it, and ends on the SIGINT sent next. Neither run starts its
+/// command, also when the request is approved afterwards.
+///
+/// Mutation checked: SIGHUP left blocked (not in what
+/// `termination_ends_process` unblocks): the blocked run waits on after
+/// SIGHUP and this fails. Its disposition reset as SIGTERM's is: the
+/// ignored run ends by SIGHUP and this fails.
+#[test]
+fn a_waiting_run_ends_on_a_blocked_sighup_and_keeps_an_ignored_one() {
+    let f = Fixture::new();
+    let files = outside_dir();
+    let marker = files.path().join("blocked");
+    let (mut child, _err, id) = waiting_with(&f, "blocked", "SIGHUP", &marker);
+    send(&child, "HUP");
+    let status = ended(&mut child).expect("a blocked SIGHUP did not end the wait");
+    assert_eq!(status.signal(), Some(libc::SIGHUP), "{status:?}");
+    f.approve(&id, &["--once"]);
+    assert!(!marker.exists(), "blocked: the command was started");
+
+    let marker = files.path().join("ignored");
+    let (mut child, _err, id) = waiting_with(&f, "ignored", "SIGHUP", &marker);
+    send(&child, "HUP");
+    // The SIGHUP was delivered (or the run is gone) before the SIGINT is.
+    send(&child, "INT");
+    let status = ended(&mut child).expect("SIGINT did not end the wait");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "an ignored SIGHUP ended the wait: {status:?}"
+    );
+    f.approve(&id, &["--once"]);
+    assert!(!marker.exists(), "ignored: the command was started");
     f.sweep();
 }
 
