@@ -21,15 +21,16 @@
 //!   killed in turn (as `envcloak mcp` does after two SIGTERMs and a
 //!   grace), still holding the injected values, in a group nothing else
 //!   owns.
-//! - Without a terminal, a run that passed a SIGTERM on leaves nothing of
-//!   the child's group behind ([`Forwarder::ends_childs_group`]): a child
-//!   that exits on it may leave a descendant in its group that ignores it,
-//!   and once the child has exited the runner kills that group (SIGKILL)
-//!   before it reaps the child, which leads the group until then. A
-//!   SIGTERM that comes only after the exit stops the run instead (below).
-//!   With a terminal the child is in this process's own group, which this
-//!   process does not signal: whoever started this process in a group of
-//!   its own (as `envcloak mcp` does) ends that group.
+//! - Without a terminal, a run that got a SIGTERM leaves nothing of the
+//!   child's group behind ([`Forwarder::ends_childs_group`]): a child that
+//!   exits on it may leave a descendant in its group that ignores it, and
+//!   once the child has exited the runner kills that group (SIGKILL). The
+//!   child is reaped only after its output has been read, so it leads the
+//!   group until then, and a SIGTERM that comes while that output is read
+//!   (it stops the run, below) ends the group the same way, before the
+//!   reap. With a terminal the child is in this process's own group, which
+//!   this process does not signal: whoever started this process in a
+//!   group of its own (as `envcloak mcp` does) ends that group.
 //!
 //! The four signals are caught (never ignored, since `exec` would pass an
 //! ignored disposition on to the child) from before the child starts until
@@ -175,7 +176,9 @@ impl Forwarder {
     /// Whether the run must end what is left of the child's group before
     /// it reaps the child: without a terminal (the child leads a group of
     /// its own), once a SIGTERM was read. Asked when the child's exit is
-    /// seen: a SIGTERM the child died of was read before it was passed on.
+    /// seen (a SIGTERM the child died of was read before it was passed on)
+    /// and again once the forwarder has stopped, after the output was read
+    /// (every SIGTERM caught before the stop has been read by then).
     pub(crate) fn ends_childs_group(&self) -> bool {
         !self.terminal && self.term_seen.load(Ordering::SeqCst)
     }
