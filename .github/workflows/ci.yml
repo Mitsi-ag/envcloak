@@ -19,7 +19,11 @@ name: CI
 # | Nightly      | everything, `release-check-models`          | the same               |
 # | Manual       | everything                                  | the same               |
 #
-# On Linux the agent hosts run with loopback only (`unshare -rn`). A main
+# The agent hosts run with loopback only: on Linux in a network namespace
+# (`unshare -rn`), on macOS with a group of their own whose packets to
+# anywhere but lo0 a pf rule refuses. Each job first checks that the
+# network is open outside that, and then that it is not inside
+# (ENVCLOAK_TEST_NETWORK, `the_network_is_what_ci_says`). A main
 # run is never cancelled by the next merge, nor replaced while it waits:
 # runs other than a pull request's each get a concurrency group of their
 # own (GitHub cancels a pending run when another joins its group), and
@@ -356,7 +360,13 @@ jobs:
         run: |
           cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
           cargo test --locked -p envcloak-e2e --test m2_story --no-run
+      - name: The network outside the namespace is open
+        env:
+          ENVCLOAK_TEST_NETWORK: open
+        run: cargo test --locked --offline -p envcloak-e2e --test m2_story -- --exact the_network_is_what_ci_says
       - name: Story steps, loopback only
+        env:
+          ENVCLOAK_TEST_NETWORK: loopback-only
         run: |
           unshare --user --map-root-user --net -- sh -ec \
             'ip link set lo up; exec cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1'
@@ -413,8 +423,14 @@ jobs:
         run: |
           cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
           cargo test --locked -p envcloak-e2e $TESTS --no-run
+      - name: The network outside the isolation is open
+        env:
+          ENVCLOAK_TEST_NETWORK: open
+        run: cargo test --locked --offline -p envcloak-e2e --test agent_hosts -- --exact the_network_is_what_ci_says
       - name: Agent hosts, loopback only (Linux)
         if: runner.os == 'Linux'
+        env:
+          ENVCLOAK_TEST_NETWORK: loopback-only
         run: |
           unshare --user --map-root-user --net -- sh -ec \
             "ip link set lo up; exec cargo test --locked --offline -p envcloak-e2e $TESTS -- --nocapture --test-threads=1"
@@ -428,14 +444,40 @@ jobs:
         # Measured even when a step above failed, so a failing run still
         # records these rows.
         if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          ENVCLOAK_TEST_NETWORK: loopback-only
         run: |
           sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test agent_hosts -- --nocapture --test-threads=1 \
-             --exact claude_code_sandbox_reaches_the_socket codex_sandbox_reaches_the_socket_and_nothing_else"
-      - name: Agent hosts (macOS)
+             --exact claude_code_sandbox_reaches_the_socket codex_sandbox_reaches_the_socket_and_nothing_else \
+             the_network_is_what_ci_says"
+      # macOS has no network namespaces: the tests run as the runner's user
+      # with one group of their own (ecnonet, gid 4242, made here), and a pf
+      # rule in an anchor of the default ruleset refuses every TCP and UDP
+      # packet a socket of that group sends anywhere but lo0 (a refusal at
+      # once, ECONNREFUSED). The runner's own traffic, in its own groups,
+      # is untouched. Name lookups go through the system's resolver, which
+      # is not in the group, so a host can resolve a name but not connect.
+      - name: Loopback only for the tests' group (macOS)
         if: runner.os == 'macOS'
-        run: cargo test --locked -p envcloak-e2e $TESTS -- --nocapture --test-threads=1
+        run: |
+          sudo dscl . -create /Groups/ecnonet
+          sudo dscl . -create /Groups/ecnonet PrimaryGroupID 4242
+          printf '%s\n' 'pass quick on lo0 all flags any no state' \
+            'block return out quick proto { tcp udp } all group 4242' \
+            | sudo pfctl -a com.apple/ecnonet -f -
+          sudo pfctl -E
+          sudo pfctl -a com.apple/ecnonet -s rules
+      - name: Agent hosts, loopback only (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ENVCLOAK_TEST_NETWORK: loopback-only
+        run: |
+          sudo -E env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID \
+            "PATH=$PATH" "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" \
+            "$(command -v python3)" -c 'import os, sys; os.setgroups([4242]); os.setgid(4242); os.setuid(int(sys.argv[1])); os.execvp(sys.argv[2], sys.argv[2:])' \
+            "$(id -u)" cargo test --locked --offline -p envcloak-e2e $TESTS -- --nocapture --test-threads=1
 
   # The real-model release check (M2 plan D-13, Q-01): manual and nightly
   # only, with dedicated low-limit keys from Actions secrets, which pull

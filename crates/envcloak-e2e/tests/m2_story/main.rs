@@ -8,3 +8,11 @@
 #![allow(clippy::unwrap_used)]
 
 mod skeleton;
+
+/// The story runs with the network CI says (`ENVCLOAK_TEST_NETWORK`):
+/// loopback only in the `gates` and `agents-e2e` jobs, so the hosts reach
+/// nothing but the scripted model and the daemon.
+#[test]
+fn the_network_is_what_ci_says() {
+    envcloak_e2e::check_network();
+}
