@@ -57,6 +57,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use envcloak_sys::{link_beneath, open_beneath, unlink_beneath};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -71,8 +72,8 @@ use crate::secret::SecretBytes;
 use crate::unlock::{install_passphrase, passphrase_envelope, passphrase_unlockers};
 use crate::vault::{
     DB_NAME, HeaderState, Integrity, LockedVault, MigrationPlan, REPLACED_PREFIX, TEMP_PREFIX,
-    Vault, VaultError, VaultErrorKind, VaultPaths, check_private_dir, open_record, remove_temp,
-    seal_record, set_aside, sync_dir, utc_stamp, with_suffix,
+    Vault, VaultError, VaultErrorKind, VaultPaths, check_private_dir, open_private_child,
+    open_record, remove_temp, seal_record, set_aside, sync_dir, utc_stamp, with_suffix,
 };
 
 /// The extension of backup files.
@@ -173,7 +174,11 @@ impl Vault {
 
         let paths = self.paths();
         paths.ensure_dirs()?;
-        let dir = std::fs::canonicalize(&paths.backups_dir)?;
+        // `backups/` opened once, through the data directory, never through
+        // a symlink in place of either, and everything made, linked and
+        // removed through it, never by its path again.
+        envcloak_sys::pause_point("backups.open");
+        let dir = open_private_child(&paths.backups_dir)?.ok_or(VaultErrorKind::NotFound)?;
         remove_stale_backup_temps(&dir)?;
         let created_at = now_secs();
         let mut backup_id = [0u8; 16];
@@ -183,8 +188,8 @@ impl Vault {
             utc_stamp(created_at),
             hex(&backup_id[..4])
         );
-        let path = dir.join(&name);
-        let tmp = dir.join(format!(".{name}.tmp"));
+        let tmp = format!(".{name}.tmp");
+        let (name_os, tmp_os) = (std::ffi::OsStr::new(&name), std::ffi::OsStr::new(&tmp));
 
         let ctx = BackupCtx {
             vault_id: self.vault_id(),
@@ -204,15 +209,30 @@ impl Vault {
             chunk_count,
         };
         let k = self.keys().key(Purpose::Backup);
-        let written = write_backup(&tmp, &head, &manifest, &image, k, &ctx);
-        let linked = written.and_then(|()| Ok(std::fs::hard_link(&tmp, &path)?));
-        let removed = remove_file_if_present(&tmp);
-        linked?;
+        let written = write_backup(&dir, tmp_os, &head, &manifest, &image, k, &ctx);
+        // A link takes whatever has the temporary name at that moment: the
+        // backup is answered as written only when its name holds the file
+        // written.
+        let linked = written.and_then(|file| {
+            use std::os::unix::fs::MetadataExt;
+            link_beneath(&dir, tmp_os, name_os)?;
+            let (ours, named) = (file.metadata()?, open_beneath(&dir, name_os)?.metadata()?);
+            if (ours.dev(), ours.ino()) != (named.dev(), named.ino()) {
+                return Err(VaultError::from(VaultErrorKind::InvalidRecord));
+            }
+            Ok(ours.len())
+        });
+        let removed = match unlink_beneath(&dir, tmp_os) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(VaultError::from(e)),
+        };
+        let bytes = linked?;
         removed?;
-        sync_dir(&dir)?;
+        envcloak_sys::sync_file(&dir)?;
         Ok(BackupInfo {
-            bytes: std::fs::metadata(&path)?.len(),
-            path,
+            bytes,
+            path: paths.backups_dir.join(&name),
             backup_id,
             created_at,
             write_counter: header.write_counter,
@@ -744,20 +764,18 @@ impl Cursor<'_> {
     }
 }
 
+/// Writes the backup to the new file `tmp` in `dir` (`O_EXCL`, never
+/// through a symlink, 0600) and flushes it. Returns it, open.
 fn write_backup(
-    tmp: &Path,
+    dir: &File,
+    tmp: &std::ffi::OsStr,
     head: &[u8],
     manifest: &Manifest,
     image: &[u8],
     k: &SubKey,
     ctx: &BackupCtx,
-) -> Result<(), VaultError> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(tmp)?;
+) -> Result<File, VaultError> {
+    let file = envcloak_sys::create_beneath(dir, tmp, 0o600)?;
     let mut w = BufWriter::new(file);
     w.write_all(head)?;
     write_record(&mut w, &seal_record(k, &ctx.aad(0), &manifest.encode())?)?;
@@ -768,7 +786,8 @@ fn write_backup(
     let file = w
         .into_inner()
         .map_err(|e| VaultError::from(e.into_error()))?;
-    Ok(file.sync_all()?)
+    envcloak_sys::sync_file(&file)?;
+    Ok(file)
 }
 
 fn write_record(w: &mut impl Write, sealed: &[u8]) -> Result<(), VaultError> {
@@ -976,15 +995,18 @@ fn write_image(
     Ok(())
 }
 
-/// Removes what an interrupted `create_backup` left.
-fn remove_stale_backup_temps(dir: &Path) -> Result<(), VaultError> {
-    check_private_dir(dir)?;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
+/// Removes what an interrupted `create_backup` left in `dir` (`backups/`,
+/// opened): each name `.vault-*.tmp`, through `dir` (`unlinkat(2)`, which
+/// removes a symlink itself, never what it points at).
+fn remove_stale_backup_temps(dir: &File) -> Result<(), VaultError> {
+    for entry in envcloak_sys::list_dir(dir, envcloak_sys::MAX_DIR_ENTRIES)? {
+        let name = entry.name.to_string_lossy();
         if name.starts_with(&format!(".{BACKUP_PREFIX}")) && name.ends_with(".tmp") {
-            remove_file_if_present(&entry.path())?;
+            match unlink_beneath(dir, &entry.name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
     }
     Ok(())

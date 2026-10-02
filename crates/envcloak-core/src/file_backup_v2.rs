@@ -812,6 +812,9 @@ impl Vault {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
         self.paths().ensure_dirs()?;
+        // A test build can stop here (`ENVCLOAK_TEST_PAUSE=backups.open`),
+        // after the path checks and before `backups/` is opened.
+        envcloak_sys::pause_point("backups.open");
         let backups = open_backups(self.paths())?.ok_or(VaultErrorKind::NotFound)?;
         let mut observe = observe;
         if let Some(f) = observe.as_mut() {
