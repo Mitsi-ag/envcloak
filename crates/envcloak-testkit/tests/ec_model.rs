@@ -420,6 +420,54 @@ fn the_record_is_a_new_file_of_mode_0600_and_never_one_already_there() {
     assert!(doc["outcome"].is_object(), "{doc}");
 }
 
+/// The record keeps a body as the bytes came (Codex review, low: it was
+/// decoded as lossy UTF-8, so bytes that are not UTF-8 were replaced for
+/// good): a body of bytes that are not UTF-8 (a NUL among them) around a
+/// canary comes back from the record byte for byte, and so does the
+/// request's header value.
+#[test]
+fn the_record_keeps_a_body_byte_for_byte() {
+    use base64::Engine as _;
+    let curl = ["/usr/bin/curl", "/bin/curl"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or_else(|| panic!("curl is needed"));
+    let canary = format!("ecbody{:016x}", fresh_seed());
+    let command = format!(
+        "printf '\\377\\376%s\\303(\\000\\200' '{canary}' >body && \
+         {curl} -s -o /dev/null -H 'x-ec-probe: hello' -H \"x-api-key: $EC_MODEL_TOKEN\" \
+         --data-binary @body \"$EC_MODEL_BASE_URL/ec-binary\"; true"
+    );
+    let files = TestHome::new();
+    let record = files.root().join("record.json");
+    let out = ec_model(&record, &[("PATH", "/usr/bin:/bin")], &command);
+    // Not clean: the path is not served, which the run says.
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    let request = doc["requests"]
+        .as_array()
+        .and_then(|rs| rs.iter().find(|r| r["path"] == "/ec-binary"))
+        .unwrap_or_else(|| panic!("the request is not in the record: {doc}"));
+    let bytes = |v: &serde_json::Value| {
+        base64::engine::general_purpose::STANDARD
+            .decode(v.as_str().unwrap_or_else(|| panic!("not base64 text: {v}")))
+            .unwrap_or_else(|e| panic!("not base64: {e}"))
+    };
+    let want = [&b"\xff\xfe"[..], canary.as_bytes(), b"\xc3(\x00\x80"].concat();
+    assert_eq!(bytes(&request["body"]), want);
+    let names = request["headers"].as_array().unwrap();
+    let at = names
+        .iter()
+        .position(|n| n == "x-ec-probe")
+        .unwrap_or_else(|| panic!("no x-ec-probe header: {request}"));
+    assert_eq!(bytes(&request["values"][at]), b"hello");
+}
+
 /// A command in the background that writes a beat to `beat` every 0.2 s
 /// for 30 s and then ends on its own (so a failing test leaves nothing
 /// running for long), its output away from the command's.
