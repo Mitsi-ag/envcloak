@@ -7,32 +7,41 @@
 //! ([`allowed_path`]): a scrub an agent runs must back up first. So the
 //! daemon, never the client, says who made a backup: `begin` reads the
 //! caller's evidence from the kernel and seals the subject's kind, a digest
-//! of its evidence, the agent's label and the caller's process instance
-//! (pid, start time and, on macOS, the audit token's pid version) with the
-//! backup. Only that instance may `put`, `commit` and `record_result`:
-//! another process, one in the same agent root that knows or lists the id
-//! included, gets `not_backup_owner`, changes nothing and learns nothing
-//! more. A committed backup's contents are frozen (`backup_frozen`), and
-//! each file's result is recorded once, by the creator, which is alive by
-//! being the caller. A backup in progress is dropped (its staging
-//! directory removed) when its creator exits, at lock and at a restart;
-//! it is never listed.
+//! of its evidence, the agent's label, the caller's process instance (pid,
+//! start time and, on macOS, the audit token's pid version) with the boot
+//! it runs in, and the creator's chain as the restore's session and
+//! terminal check reads it. Only that instance may `put`, `commit` and
+//! `record_result`, and only while it runs: another process, one in the
+//! same agent root that knows or lists the id included, gets
+//! `not_backup_owner`, changes nothing and learns nothing more, and so
+//! does a call on the creator's connection after the creator exited. A
+//! committed backup's contents are frozen (`backup_frozen`), and each
+//! file's result is recorded once. A backup in progress is dropped (its
+//! staging directory removed) when its creator exits, after
+//! [`UPLOAD_IDLE`] without a call, at lock and at a restart; it is never
+//! listed. One root holds at most [`MAX_UPLOADS_PER_ROOT`] of them.
 //!
 //! **Restore.** `open_restore` takes one passphrase proof from a terminal
 //! subject, after the caller's evidence was read and before the
 //! passphrase is looked at, refuses a backup an agent or an unknown
 //! process made unless `created_by_agent_ticked`, one whose results are
-//! not all recorded unless `unrecorded`, and, while the creator's chain
-//! is known (the daemon that took the backup still runs), a caller that
-//! shares a session or a terminal with it (`requester_terminal`, as for
-//! approvals). Argon2id runs once. The whole backup is then opened and
-//! checked (every chunk, every file's SHA-256), so no restore is ever
-//! partial; the audit entry is written durably; and only then is a lease
-//! issued, bound to the backup, the caller's process instance and its
-//! terminal. `read` hands out one chunk under the lease, on fresh
-//! connections, only to that process on that terminal. A lease ends when
-//! its process exits, after 60 seconds idle, at lock and at a restart; an
+//! not all recorded unless `unrecorded`, and a caller that shares a
+//! session or a terminal with a process of the creator's sealed chain
+//! that still runs (`requester_terminal`, as for approvals), whether or
+//! not this daemon took the backup. Argon2id runs once. The whole backup
+//! is then opened and checked (every chunk, every file's SHA-256), so no
+//! restore is ever partial; the audit entry is written durably; and only
+//! then is a lease issued, bound to the backup, the caller's process
+//! instance and its terminal. `read` hands out one chunk under the lease,
+//! on fresh connections, only to that process on that terminal, and only
+//! if the lease still stands once the chunk is read. A lease ends when its
+//! process exits, after 60 seconds idle, at lock and at a restart; an
 //! audit entry that cannot be written issues no lease, so no chunk.
+//!
+//! **Locks.** A lock while a call is in flight stops it: a `read`
+//! delivers nothing, a `put` or `commit` reports the backup ended, and a
+//! backup is put in place only under the state lock. Backups are opened
+//! (their metadata read and opened) outside the state lock.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
