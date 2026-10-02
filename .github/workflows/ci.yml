@@ -351,6 +351,10 @@ jobs:
         run: |
           python3 scripts/install-agent-hosts.py --self-test
           python3 scripts/install-agent-hosts.py --tier 1
+      # S0's sandboxed Claude Code case: its Bash sandbox needs bubblewrap
+      # and socat on Linux (https://code.claude.com/docs/en/sandboxing).
+      - name: Claude Code's sandbox dependencies
+        run: sudo apt-get install -y --no-install-recommends bubblewrap socat
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
@@ -370,6 +374,19 @@ jobs:
         run: |
           unshare --user --map-root-user --net -- sh -ec \
             'ip link set lo up; exec cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1'
+      # S0's sandboxed cases again outside a user namespace, as a person's
+      # machine runs them (K-01: the CLI's own refusal, where Claude Code's
+      # sandbox applies its seccomp filter).
+      - name: Story steps, sandboxed cases outside a user namespace, loopback only
+        if: ${{ !cancelled() }}
+        env:
+          ENVCLOAK_TEST_NETWORK: loopback-only
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
+            "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
+             cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1 \
+             --exact skeleton::s0_claude_code_sandboxed skeleton::s0_codex_workspace_write \
+             the_network_is_what_ci_says"
 
   # The pinned agent hosts against the scripted model (M2-04's harness,
   # probes and measurements; later tasks add theirs). Linux on pull
@@ -451,6 +468,18 @@ jobs:
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test agent_hosts -- --nocapture --test-threads=1 \
              --exact claude_code_sandbox_reaches_the_socket codex_sandbox_reaches_the_socket_and_nothing_else \
+             the_network_is_what_ci_says"
+      # S0's sandboxed cases the same way (the gates job runs them on pull
+      # requests), on main, nightly and manual runs.
+      - name: Story steps, sandboxed cases outside a user namespace, loopback only (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' && github.event_name != 'pull_request' }}
+        env:
+          ENVCLOAK_TEST_NETWORK: loopback-only
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
+            "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
+             cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1 \
+             --exact skeleton::s0_claude_code_sandboxed skeleton::s0_codex_workspace_write \
              the_network_is_what_ci_says"
       # macOS has no network namespaces: the tests run as the runner's user
       # with one group of their own (ecnonet, gid 4242, made here), and a pf
