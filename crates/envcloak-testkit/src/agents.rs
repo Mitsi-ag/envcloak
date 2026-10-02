@@ -449,6 +449,68 @@ impl ModelRequest {
     pub fn json(&self) -> Option<Value> {
         serde_json::from_slice(&self.body).ok()
     }
+
+    /// How a diagnostic shows this request's method and target (L-12): a
+    /// request line is whatever a host sent, and can hold anything, a
+    /// value included. The method by name when it is one of HTTP's; the
+    /// target by name when it is an endpoint the scripted model serves,
+    /// or, for a tunnel or a request to forward, as [`shown_destination`]
+    /// shows it; anything else only by its length. The record keeps both
+    /// whole.
+    pub fn shown(&self) -> String {
+        let method = if METHODS.contains(&self.method.as_str()) {
+            self.method.clone()
+        } else {
+            format!("<method of {} bytes>", self.method.len())
+        };
+        let target = match self.api.as_deref() {
+            Some("connect" | "proxy") => shown_destination(&self.path),
+            _ if ENDPOINTS.contains(&self.path.as_str()) => self.path.clone(),
+            _ => format!("<{} bytes>", self.path.len()),
+        };
+        format!("{method} {target}")
+    }
+}
+
+/// The methods a diagnostic names ([`ModelRequest::shown`]).
+const METHODS: [&str; 9] = [
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE",
+];
+
+/// The endpoints the scripted model serves, which a diagnostic names.
+const ENDPOINTS: [&str; 3] = ["/v1/messages", "/v1/responses", "/api/hello"];
+
+/// How a diagnostic shows where a tunnel or a request to forward was
+/// going (`host:port`): whole when the host reads as a DNS name, else only
+/// by its length. A DNS name here is two to eight labels of lower-case
+/// letters, digits and inner hyphens, each at most 32 bytes, none of 16 or
+/// more that holds a digit (a random token would), the last of letters
+/// only, with a port of digits; `api.anthropic.com:443`, say. Anything
+/// else a host named, a value included, is shown as `<N bytes>`.
+pub fn shown_destination(target: &str) -> String {
+    let hidden = || format!("<{} bytes>", target.len());
+    let Some((host, port)) = target.rsplit_once(':') else {
+        return hidden();
+    };
+    let labels: Vec<&str> = host.split('.').collect();
+    let label_ok = |l: &&str| {
+        !l.is_empty()
+            && l.len() <= 32
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && !(l.len() >= 16 && l.bytes().any(|b| b.is_ascii_digit()))
+    };
+    let port_ok = !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit());
+    let last_ok = labels
+        .last()
+        .is_some_and(|l| l.bytes().all(|b| b.is_ascii_lowercase()));
+    if (2..=8).contains(&labels.len()) && labels.iter().all(label_ok) && last_ok && port_ok {
+        target.to_owned()
+    } else {
+        hidden()
+    }
 }
 
 /// A finished run of the scripted model.
@@ -515,13 +577,39 @@ impl ModelReport {
     }
 
     /// The method and path of every request made to the model itself:
-    /// none of [`ModelReport::connects`].
+    /// none of [`ModelReport::connects`]. For a test to compare; a
+    /// diagnostic prints [`ModelReport::shown_model_endpoints`].
     pub fn model_endpoints(&self) -> Vec<String> {
         self.requests
             .iter()
             .filter(|r| !matches!(r.api.as_deref(), Some("connect" | "proxy")))
             .map(|r| format!("{} {}", r.method, r.path))
             .collect()
+    }
+
+    /// [`ModelReport::model_endpoints`] as a diagnostic shows them
+    /// ([`ModelRequest::shown`]), in order, each once.
+    pub fn shown_model_endpoints(&self) -> Vec<String> {
+        let mut shown: Vec<String> = Vec::new();
+        for r in &self.requests {
+            if matches!(r.api.as_deref(), Some("connect" | "proxy")) {
+                continue;
+            }
+            let s = r.shown();
+            if !shown.contains(&s) {
+                shown.push(s);
+            }
+        }
+        shown
+    }
+
+    /// [`ModelReport::connects`] as a diagnostic shows them
+    /// ([`shown_destination`]), sorted, each once.
+    pub fn shown_connects(&self) -> Vec<String> {
+        let mut shown: Vec<String> = self.connects().into_iter().map(shown_destination).collect();
+        shown.sort_unstable();
+        shown.dedup();
+        shown
     }
 }
 
@@ -1830,6 +1918,86 @@ mod tests {
         std::fs::create_dir_all(slug_dir(&shared, &home.root().join("home")))
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(refused(|| b.check_isolated()));
+    }
+
+    /// A tunnel's destination is named only when it reads as a host name;
+    /// anything else a host put there, a value included, by its length
+    /// (Codex review, medium).
+    #[test]
+    fn a_destination_is_named_only_when_it_reads_as_a_host_name() {
+        for named in [
+            "api.anthropic.com:443",
+            "telemetry-logs.kimi.com:443",
+            "generativelanguage.googleapis.com:443",
+            "api2.cursor.sh:443",
+            "a.bc:80",
+        ] {
+            assert_eq!(shown_destination(named), named);
+        }
+        let long = format!("{}.example:443", "x".repeat(33));
+        for hidden in [
+            "",
+            "api.anthropic.com",
+            "localhost:443",
+            "API.example.com:443",
+            "ecctl-0123456789abcdef.example:443",
+            "sk-proj-abcdefghijklmnop1.example:443",
+            "a.b1:443",
+            "-a.example:443",
+            "a-.example:443",
+            "user@host.example:443",
+            "host.example:44a",
+            "host.example:443443",
+            "a.b.c.d.e.f.g.h.i:1",
+            long.as_str(),
+            "[::1]:443",
+            "127.0.0.1:443",
+        ] {
+            assert_eq!(
+                shown_destination(hidden),
+                format!("<{} bytes>", hidden.len()),
+                "{hidden}"
+            );
+        }
+    }
+
+    /// A request line as a diagnostic shows it: a served endpoint and an
+    /// HTTP method by name, anything else by its length.
+    #[test]
+    fn a_request_line_is_shown_by_endpoint_or_length() {
+        let request = |method: &str, path: &str, api: Option<&str>| ModelRequest {
+            seq: 0,
+            at_ms: 0,
+            method: method.to_owned(),
+            path: path.to_owned(),
+            status: 200,
+            answered: true,
+            api: api.map(str::to_owned),
+            pick: None,
+            body: Zeroizing::new(Vec::new()),
+        };
+        let shown = |r: ModelRequest| r.shown();
+        assert_eq!(
+            shown(request("POST", "/v1/messages", Some("messages"))),
+            "POST /v1/messages"
+        );
+        assert_eq!(shown(request("GET", "/ecpath-x", None)), "GET <9 bytes>");
+        assert_eq!(
+            shown(request("ECMETHODX", "/v1/messages", None)),
+            "<method of 9 bytes> /v1/messages"
+        );
+        assert_eq!(
+            shown(request("CONNECT", "api.anthropic.com:443", Some("connect"))),
+            "CONNECT api.anthropic.com:443"
+        );
+        assert_eq!(
+            shown(request(
+                "CONNECT",
+                "ecpath0123456789abcdef.x:443",
+                Some("connect")
+            )),
+            "CONNECT <28 bytes>"
+        );
     }
 
     #[test]
