@@ -50,8 +50,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use envcloak_sys::{
-    DirEntryKind, InUse, MAX_DIR_ENTRIES, create_beneath, exchange_beneath, kind_beneath,
-    link_beneath, list_dir, open_elsewhere, rename_beneath, sync_file, unlink_beneath,
+    DirEntryKind, InUse, MAX_DIR_ENTRIES, create_beneath, create_rw_beneath, exchange_beneath,
+    kind_beneath, link_beneath, list_dir, open_elsewhere, rename_beneath, sync_file,
+    unlink_beneath,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -196,60 +197,108 @@ fn temp_name(name: &OsStr, what: &str) -> OsString {
     t
 }
 
-/// Removes from `dir` what earlier writes back of `name` left beside it
-/// under their temporary names (`.<name>.envcloak-new-<16 hex>.tmp`,
-/// [`temp_name`]) when they were stopped before they ended, once `staged`,
-/// the new file `ours` in `dir`, holds the whole contents being written
-/// back. A file of such a name goes only when it is shown to hold nothing
-/// but those contents' first bytes: a regular file of this user with one
-/// link, no longer than `ours`, every byte of it equal to the byte of
-/// `ours` at its place, unchanged while it was read and still under that
-/// name when it is unlinked. Whatever else has such a name stays, since
-/// its origin is not known: another program's save a swap brought out
-/// and could not put back ([`ModifyErrorKind::MovedAside`]), the file a
-/// stopped write swapped out, the contents of another backup. A name too
-/// long to be carried in one ([`temp_name`] leaves it out) says nothing
-/// of whose it is, so nothing is removed then. Never through a symlink.
-/// Best effort: returns how many went, and flushes `dir` when any did.
-/// The bytes read pass through buffers wiped after.
-pub(crate) fn remove_leftovers(dir: &File, name: &OsStr, ours: &OsStr, staged: &File) -> usize {
-    if name.as_bytes().len() > 128 {
-        return 0;
-    }
+/// Whether `n` is one of `name`'s temporary names for a new file:
+/// `.<name>.envcloak-new-<16 lowercase hex>.tmp` ([`temp_name`]).
+fn new_name_of(name: &OsStr, n: &OsStr) -> bool {
     let mut prefix = b".".to_vec();
     prefix.extend_from_slice(name.as_bytes());
     prefix.extend_from_slice(b".envcloak-new-");
+    n.as_bytes()
+        .strip_prefix(prefix.as_slice())
+        .and_then(|rest| rest.strip_suffix(b".tmp"))
+        .is_some_and(|h| {
+            h.len() == 16
+                && h.iter()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        })
+}
+
+/// Removes from `dir` what earlier writes back of `name` left beside it
+/// under their temporary names (`.<name>.envcloak-new-<16 hex>.tmp`,
+/// [`temp_name`]) when they were stopped before they ended, once `staged`,
+/// the new file `ours` in `dir` (open for reading as well), holds the whole
+/// contents being written back. A file of such a name goes only when it is
+/// shown to hold nothing but those contents' first bytes: a regular file
+/// of this user with one link, no longer than `staged`, every byte of it
+/// equal to the byte of `staged` at its place ([`holds_first_bytes_of`]).
+/// Whatever else has such a name stays, since its origin is not known:
+/// another program's save a swap brought out and could not put back
+/// ([`ModifyErrorKind::MovedAside`]), the file a stopped write swapped
+/// out, the contents of another backup. A name too long to be carried in
+/// one ([`temp_name`] leaves it out) says nothing of whose it is, so
+/// nothing is removed then. Never through a symlink.
+///
+/// The check that decides reads the very file that is then unlinked, not
+/// whatever has its name by then (a name checked, then removed by that
+/// name again, removes what took the name meanwhile): a file that passes
+/// a first look by its name is first moved aside, in one `rename(2)` in
+/// `dir`, to a fresh name of the same shape, then checked there again,
+/// whole, and unlinked there only while that name still holds the file
+/// checked, unchanged since before it was read. A file that fails the
+/// check there is put back under its name with a link that never replaces
+/// one (whatever took the name meanwhile keeps it), or, when that name is
+/// taken, left under the fresh name, where a later restore or a report of
+/// leftovers finds it. A process killed between the move and the end
+/// leaves the file under the fresh name, of the same shape. What this
+/// cannot exclude is a process that renames another file onto that fresh
+/// name between the last check and the unlink: only one that reads this
+/// directory for that name, as another restore of the same file running
+/// at that moment does, and then only a file that one checked too.
+///
+/// `observe` hears [`Inside::LeftoverMoved`] once a file is moved aside
+/// and [`Inside::LeftoverRead`] once its bytes there are compared, before
+/// the last check of its name. Best effort: returns how many went, and
+/// flushes `dir` when any did. The bytes read pass through buffers wiped
+/// after.
+pub(crate) fn remove_leftovers(
+    dir: &File,
+    name: &OsStr,
+    ours: &OsStr,
+    staged: &File,
+    observe: &mut dyn FnMut(Inside),
+) -> usize {
+    if name.as_bytes().len() > 128 {
+        return 0;
+    }
     let Ok(entries) = list_dir(dir, MAX_DIR_ENTRIES) else {
         return 0;
     };
-    // The contents written back, read from the new file itself: `staged`
-    // was opened to write only.
     let Ok(want) = staged.metadata() else {
         return 0;
     };
-    let whole = match open_file(dir, ours, usize::MAX) {
-        Ok((f, m)) if (m.dev(), m.ino()) == (want.dev(), want.ino()) => f,
-        _ => return 0,
-    };
+    let len = want.len();
     let mut removed = 0;
     for e in entries {
-        let of_this_name = e
-            .name
-            .as_bytes()
-            .strip_prefix(prefix.as_slice())
-            .and_then(|rest| rest.strip_suffix(b".tmp"))
-            .is_some_and(|h| {
-                h.len() == 16
-                    && h.iter()
-                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
-            });
-        if of_this_name
-            && e.name != ours
-            && kind_beneath(dir, &e.name).is_ok_and(|k| k == DirEntryKind::File)
-            && holds_first_bytes_of(dir, &e.name, &whole, want.len())
-            && unlink_beneath(dir, &e.name).is_ok()
+        // A first look, by the name: a file that is not a restore's
+        // leftover (another program's save, say) is never moved.
+        if !new_name_of(name, &e.name)
+            || e.name == ours
+            || !kind_beneath(dir, &e.name).is_ok_and(|k| k == DirEntryKind::File)
+            || !holds_first_bytes_of(dir, &e.name, staged, len, &mut || {})
         {
-            removed += 1;
+            continue;
+        }
+        let aside = temp_name(name, "new");
+        if kind_beneath(dir, &aside)
+            .map_or_else(|e| e.kind() != std::io::ErrorKind::NotFound, |_| true)
+            || rename_beneath(dir, &e.name, &aside).is_err()
+        {
+            continue;
+        }
+        observe(Inside::LeftoverMoved);
+        if holds_first_bytes_of(dir, &aside, staged, len, &mut || {
+            observe(Inside::LeftoverRead);
+        }) {
+            if unlink_beneath(dir, &aside).is_ok() {
+                removed += 1;
+            }
+        } else if link_beneath(dir, &aside, &e.name).is_ok() {
+            // Back under its name; the fresh name goes only while it still
+            // names the same file.
+            let same = |n: &OsStr| open_file(dir, n, usize::MAX).map(|(_, m)| (m.dev(), m.ino()));
+            if same(&aside).is_ok_and(|a| same(&e.name).is_ok_and(|b| a == b)) {
+                let _ = unlink_beneath(dir, &aside);
+            }
         }
     }
     if removed > 0 {
@@ -261,9 +310,17 @@ pub(crate) fn remove_leftovers(dir: &File, name: &OsStr, ours: &OsStr, staged: &
 /// Whether the file `leftover` in `dir` holds nothing but the first bytes
 /// of `whole`, which is `len` bytes long: a regular file of this user,
 /// never through a symlink, with one link, no longer than `whole`, each of
-/// its bytes the byte of `whole` at its place; unchanged while it was
-/// read, its change time included, and still the file of that name.
-fn holds_first_bytes_of(dir: &File, leftover: &OsStr, whole: &File, len: u64) -> bool {
+/// its bytes the byte of `whole` at its place; and, once read (`read` is
+/// called then), still the file of that name with the stamp it had before
+/// the read, its change time included: a file written while it was read,
+/// or another file put under that name, is not taken for it.
+fn holds_first_bytes_of(
+    dir: &File,
+    leftover: &OsStr,
+    whole: &File,
+    len: u64,
+    read: &mut dyn FnMut(),
+) -> bool {
     use std::os::unix::fs::FileExt;
     let Ok((mut f, m)) = open_file(dir, leftover, usize::MAX) else {
         return false;
@@ -290,9 +347,8 @@ fn holds_first_bytes_of(dir: &File, leftover: &OsStr, whole: &File, len: u64) ->
         }
         at = end;
     }
+    read();
     at == stamp.size
-        && f.metadata()
-            .is_ok_and(|after| FileStamp::of(&after) == stamp)
         && open_file(dir, leftover, usize::MAX).is_ok_and(|(_, now)| FileStamp::of(&now) == stamp)
 }
 
@@ -311,7 +367,7 @@ fn write_new(dir: &File, temp: &OsStr, bytes: &[u8], mode: u32) -> std::io::Resu
 }
 
 /// What writes a new file's contents: called once with the new file, open
-/// for writing and empty. A failure leaves no new file.
+/// for reading and writing and empty. A failure leaves no new file.
 pub(crate) type Fill<'a> = &'a mut dyn FnMut(&mut File) -> Result<(), ModifyErrorKind>;
 
 /// Writes what `fill` writes to a new file `temp` in `dir`, then gives it
@@ -322,7 +378,9 @@ fn write_new_with(
     mode: u32,
     fill: Fill<'_>,
 ) -> Result<File, ModifyErrorKind> {
-    let mut f = create_beneath(dir, temp, 0o600).map_err(|e| io(&e))?;
+    // Open for reading as well: what it holds is read back through this
+    // descriptor (`remove_leftovers`), never by its name again.
+    let mut f = create_rw_beneath(dir, temp, 0o600).map_err(|e| io(&e))?;
     let written = fill(&mut f).and_then(|()| {
         f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
             .and_then(|()| sync_file(&f).map(drop))
@@ -383,6 +441,14 @@ pub enum Inside {
     /// The file to write back over was hashed and is what the change left
     /// ([`crate::restore_over_left`]); its replacement is not written yet.
     Hashed,
+    /// A file an earlier restore of the same file left beside it, which a
+    /// first look took for its leftover, was moved aside to a fresh name
+    /// of the same shape and is not checked there yet
+    /// ([`crate::restore_over_left`]).
+    LeftoverMoved,
+    /// That file's bytes were compared where it was moved, and its name
+    /// there is not checked again yet, nor the file unlinked.
+    LeftoverRead,
 }
 
 /// Whether `m` is the file `expect` stamps, as a rename leaves it: a
@@ -442,7 +508,9 @@ type Swap = fn(&File, &OsStr, &OsStr) -> std::io::Result<()>;
 /// to the old file, by a program that still has it open, after that read.
 /// Also with `left`, once the new file is whole and before the last
 /// check, the files earlier restores of `name` stopped while writing left
-/// beside it, holding only its first bytes, go ([`remove_leftovers`]).
+/// beside it, holding only its first bytes, go, each moved aside and
+/// checked where it moved before it is unlinked there
+/// ([`remove_leftovers`]).
 pub(crate) fn replace_in_with(
     dir: &File,
     rel: &Path,
@@ -485,7 +553,7 @@ fn replace_in_using(
         // A restore, its contents now whole beside the file: what earlier
         // restores of the file left of those contents goes, whatever this
         // one comes to (`remove_leftovers`).
-        remove_leftovers(dir, name, &temp, &f);
+        remove_leftovers(dir, name, &temp, &f, observe);
     }
     observe(Inside::Staged);
     // Another program may have written the file while this one wrote its

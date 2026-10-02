@@ -8,11 +8,11 @@
 //! ([`crate::open_beneath`] opens a file there): [`list_dir`] reads its
 //! entries, [`kind_beneath`] says what one is, [`read_link_beneath`] reads
 //! a symlink's target, [`open_dir_beneath`] opens a subdirectory, and
-//! [`create_beneath`], [`create_dir_beneath`], [`link_beneath`],
-//! [`rename_beneath`], [`exchange_beneath`], [`unlink_beneath`] and
-//! [`remove_dir_beneath`] make, link, move, swap and remove names in it.
-//! None of
-//! them follows a symlink in the name's place. [`volume_of`] says whether
+//! [`create_beneath`], [`create_rw_beneath`], [`create_dir_beneath`],
+//! [`link_beneath`], [`rename_beneath`], [`exchange_beneath`],
+//! [`unlink_beneath`] and [`remove_dir_beneath`] make, link, move, swap
+//! and remove names in it. None of them follows a symlink in the name's
+//! place. [`volume_of`] says whether
 //! the directory is on a network volume.
 //!
 //! Every name must be one path component: not empty, not `.` or `..`, and
@@ -173,13 +173,21 @@ pub fn read_link_beneath(dir: &File, name: &OsStr) -> io::Result<OsString> {
 /// included, fails with [`io::ErrorKind::AlreadyExists`] and is never
 /// opened or truncated. The file gets `mode`, less the umask.
 pub fn create_beneath(dir: &File, name: &OsStr, mode: u32) -> io::Result<File> {
+    create_with(dir, name, mode, libc::O_WRONLY)
+}
+
+/// [`create_beneath`], with the new file open for reading as well: what
+/// was written can be read back through this descriptor, never by the
+/// file's name again (another file may have taken it meanwhile).
+pub fn create_rw_beneath(dir: &File, name: &OsStr, mode: u32) -> io::Result<File> {
+    create_with(dir, name, mode, libc::O_RDWR)
+}
+
+/// [`create_beneath`] with `access` (`O_WRONLY` or `O_RDWR`).
+fn create_with(dir: &File, name: &OsStr, mode: u32, access: libc::c_int) -> io::Result<File> {
     let c = component(name)?;
-    let flags = libc::O_WRONLY
-        | libc::O_CREAT
-        | libc::O_EXCL
-        | libc::O_NOFOLLOW
-        | libc::O_NOCTTY
-        | libc::O_CLOEXEC;
+    let flags =
+        access | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC;
     let mode = libc::c_uint::from(u16::try_from(mode & 0o7777).unwrap_or(0o600));
     // SAFETY: as in `open_dir_beneath`; the mode is passed as the variadic
     // argument openat reads when O_CREAT is set.

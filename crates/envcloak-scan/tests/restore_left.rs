@@ -6,7 +6,8 @@
 //! backed-up SHA-256. Nothing else is ever written in its place, and no
 //! temporary file is left; one a restore killed while it wrote left
 //! beside the file goes once a later restore has the contents whole, and
-//! only when it holds nothing but their first bytes.
+//! only when it holds nothing but their first bytes, checked where it was
+//! moved aside before it is unlinked there.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -514,7 +515,9 @@ fn a_save_left_aside_when_the_names_cannot_be_put_back_survives_the_next_restore
 /// swap takes out), the first chunk with a second hard link, a symlink to
 /// a file holding the first chunk (and that file), a FIFO, and the first
 /// chunk under another file's temporary name, under a name of another
-/// shape (upper-case hex) and under a removal's temporary name.
+/// shape (upper-case hex) and under a removal's temporary name. Only the
+/// four that go are ever moved aside to be checked: a first look by their
+/// names leaves every other file where it is.
 #[test]
 fn a_restore_removes_only_leftovers_holding_the_first_bytes_it_writes_back() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
@@ -572,11 +575,21 @@ fn a_restore_removes_only_leftovers_holding_the_first_bytes_it_writes_back() {
             .success()
     );
 
-    restore_over_left(&r, Path::new(".mcp.json"), &file, &mut |c| {
-        Some(chunk_of(&body, c))
-    })
+    let mut moved = 0;
+    restore_over_left_observed(
+        &r,
+        Path::new(".mcp.json"),
+        &file,
+        &mut |c| Some(chunk_of(&body, c)),
+        &mut |at| moved += usize::from(at == Inside::LeftoverMoved),
+    )
     .unwrap();
     assert!(std::fs::read(&p).unwrap() == body, "not byte for byte");
+    assert_eq!(
+        moved,
+        go.len(),
+        "a file a first look did not take was moved"
+    );
     for (q, _) in &go {
         assert!(!q.exists(), "{q:?}: a restore's leftover stayed");
     }
@@ -652,4 +665,178 @@ fn every_restore_with_the_contents_whole_removes_what_earlier_ones_left() {
         "a restore that had the contents whole left an earlier one's leftover"
     );
     no_temps(d.path());
+}
+
+/// The files of `.mcp.json`'s temporary names in `dir`, with their bytes,
+/// sorted by name.
+fn new_names(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|q| {
+            q.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("..mcp.json.envcloak-new-")
+        })
+        .map(|q| {
+            let b = std::fs::read(&q).unwrap();
+            (q.file_name().unwrap().to_string_lossy().into_owned(), b)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A leftover is moved aside before the check that decides, and the file
+/// unlinked is the one checked there (Codex, M2-05 round 8: the name was
+/// checked, then unlinked by that name again, so a file that took the
+/// name in between went unchecked). Once the leftover a killed restore
+/// left (the first 1000 bytes) is moved aside, another program saves a
+/// file under its name: the restore removes the leftover, which it
+/// checked where it moved it, and the save keeps the name, as saved; no
+/// other file of the temporary names is left.
+#[test]
+fn a_file_that_takes_a_leftover_name_once_it_moved_aside_stays() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join(".mcp.json");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(d.path()).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    let left_over = new_name_in(d.path(), "0000000000000001");
+    std::fs::write(&left_over, body_prefix(1000)).unwrap();
+    let saved: &[u8] = b"{\"saved\": \"under the leftover's name\"}\n";
+    let mut did = 0;
+    restore_over_left_observed(
+        &r,
+        Path::new(".mcp.json"),
+        &file,
+        &mut |c| Some(chunk_of(&body, c)),
+        &mut |at| {
+            if at == Inside::LeftoverMoved {
+                assert!(!left_over.exists(), "not moved aside");
+                std::fs::write(&left_over, saved).unwrap();
+                did += 1;
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(did, 1);
+    assert!(std::fs::read(&p).unwrap() == body, "not byte for byte");
+    let name = left_over
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        new_names(d.path()),
+        [(name, saved.to_vec())],
+        "the save under the leftover's name was removed, or the leftover stayed"
+    );
+}
+
+/// A leftover moved aside is unlinked only while its name there still
+/// holds the file checked, unchanged since before it was read: right
+/// after its bytes are compared there, (a) another program writes into
+/// it in place, or (b) renames another file onto its name there. Either
+/// way nothing is removed: the file there goes back under the leftover's
+/// name (a link, which never replaces a name), and the fresh name goes.
+/// (c) When a file took the leftover's name meanwhile too, that file
+/// keeps it, and the changed one stays under the fresh name, of the same
+/// shape. In each case the restore itself writes the file back.
+#[test]
+fn a_leftover_changed_or_replaced_while_it_is_checked_is_kept() {
+    for case in ["written in place", "replaced", "name taken too"] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = d.path();
+        let p = dir.join(".mcp.json");
+        let body = original();
+        let file = backed_up(&body);
+        let r = open_root(dir).unwrap();
+        std::fs::write(&p, LEFT).unwrap();
+        let left_over = new_name_in(dir, "0000000000000001");
+        std::fs::write(&left_over, body_prefix(1000)).unwrap();
+        let mut changed = body_prefix(1000);
+        changed[999] ^= 1;
+        let other: &[u8] = b"another program's file";
+        let took: &[u8] = b"took the leftover's name";
+        let mut did = 0;
+        restore_over_left_observed(
+            &r,
+            Path::new(".mcp.json"),
+            &file,
+            &mut |c| Some(chunk_of(&body, c)),
+            &mut |at| {
+                if at != Inside::LeftoverRead {
+                    return;
+                }
+                // Where it was moved: the file of the temporary names that
+                // is 1000 bytes long (the restore's own holds the whole).
+                let aside = new_names(dir)
+                    .into_iter()
+                    .find(|(_, b)| b.len() == 1000)
+                    .map(|(n, _)| dir.join(n))
+                    .unwrap();
+                match case {
+                    "replaced" => {
+                        let q = dir.join("another");
+                        std::fs::write(&q, other).unwrap();
+                        std::fs::rename(&q, &aside).unwrap();
+                    }
+                    _ => {
+                        let w = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&aside)
+                            .unwrap();
+                        std::os::unix::fs::FileExt::write_all_at(&w, &changed[999..], 999).unwrap();
+                        if case == "name taken too" {
+                            std::fs::write(&left_over, took).unwrap();
+                        }
+                    }
+                }
+                did += 1;
+            },
+        )
+        .unwrap();
+        assert_eq!(did, 1, "{case}");
+        assert!(
+            std::fs::read(&p).unwrap() == body,
+            "{case}: not byte for byte"
+        );
+        let name = left_over
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let names = new_names(dir);
+        match case {
+            "written in place" => assert!(
+                names == [(name, changed.clone())],
+                "{case}: removed, or not put back: {:?}",
+                names.iter().map(|(n, b)| (n, b.len())).collect::<Vec<_>>()
+            ),
+            "replaced" => assert!(
+                names == [(name, other.to_vec())],
+                "{case}: removed, or not put back: {:?}",
+                names.iter().map(|(n, b)| (n, b.len())).collect::<Vec<_>>()
+            ),
+            _ => {
+                assert_eq!(
+                    names.len(),
+                    2,
+                    "{case}: {:?}",
+                    names.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                );
+                assert!(
+                    names.contains(&(name, took.to_vec())),
+                    "{case}: the file that took the name lost it"
+                );
+                assert!(
+                    names.iter().any(|(_, b)| *b == changed),
+                    "{case}: the changed leftover was removed"
+                );
+            }
+        }
+    }
 }

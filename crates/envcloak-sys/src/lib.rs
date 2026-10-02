@@ -11,13 +11,13 @@
 //!   the uid a trusted directory must belong to.
 //! - [`open_beneath`]: `openat` from a directory handle, never following a
 //!   symlink and never blocking on a FIFO; [`list_dir`],
-//!   [`open_dir_beneath`], [`create_beneath`], [`create_dir_beneath`],
-//!   [`link_beneath`], [`rename_beneath`], [`exchange_beneath`],
-//!   [`unlink_beneath`] and [`remove_dir_beneath`]: the other name
-//!   operations a scan, `envcloak init` and the file backups make in a
-//!   directory they hold open; [`volume_of`]: whether a directory is on a
-//!   network volume; and [`open_elsewhere`]: whether another process has
-//!   a file open.
+//!   [`open_dir_beneath`], [`create_beneath`], [`create_rw_beneath`],
+//!   [`create_dir_beneath`], [`link_beneath`], [`rename_beneath`],
+//!   [`exchange_beneath`], [`unlink_beneath`] and [`remove_dir_beneath`]:
+//!   the other name operations a scan, `envcloak init` and the file
+//!   backups make in a directory they hold open; [`volume_of`]: whether a
+//!   directory is on a network volume; and [`open_elsewhere`]: whether
+//!   another process has a file open.
 //! - [`sync_file`]: durable writes, with `F_FULLFSYNC` on macOS.
 //! - The daemon's socket and lifecycle: [`peer_identity`] and [`peer_uid`]
 //!   (who is on the other end of a Unix socket), [`connect_unix`] (a
@@ -85,8 +85,8 @@ pub use child::{Relayed, SignalRelay, has_exited, signal_group, signal_process, 
 pub use clock::{awake_time, time_including_sleep};
 pub use dir::{
     DirEntryKind, DirEntryName, MAX_DIR_ENTRIES, Volume, create_beneath, create_dir_beneath,
-    exchange_beneath, kind_beneath, link_beneath, list_dir, open_dir_beneath, read_link_beneath,
-    remove_dir_beneath, rename_beneath, unlink_beneath, volume_of,
+    create_rw_beneath, exchange_beneath, kind_beneath, link_beneath, list_dir, open_dir_beneath,
+    read_link_beneath, remove_dir_beneath, rename_beneath, unlink_beneath, volume_of,
 };
 pub use fd::{cloexec_flag, inherited_fd};
 pub use fs::open_beneath;
