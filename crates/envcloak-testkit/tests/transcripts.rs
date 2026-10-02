@@ -671,6 +671,8 @@ fn the_model_s_request_bodies_are_swept() {
             path: "/v1/messages".to_owned(),
             query: None,
             headers: Vec::new(),
+            header_values: Vec::new(),
+            forward: Zeroizing::new(Vec::new()),
             status: 200,
             answered: true,
             api: Some("messages".to_owned()),
@@ -697,11 +699,14 @@ fn the_model_s_request_bodies_are_swept() {
 
 /// A host, or a command through the proxy variables that point at the
 /// scripted model, can put a value in a request line as well as a body:
-/// the path, the query, a method of its own, a header name, the host of a
-/// tunnel or of a request to forward. Each is swept, as the model
+/// the path, the query, a method of its own, a header name or value, the
+/// host of a tunnel or of a request to forward, and a request to
+/// forward's own path, query and body. Each is swept, as the model
 /// recorded it, and filed by the part it was in (verifier, low: only
 /// bodies were swept, so S0's check that nothing sent to the model holds
-/// a value missed these). A control in a body is found too.
+/// a value missed these; Codex review, medium: header values, and a
+/// request to forward's path, query and body, were not recorded). A
+/// control in a body is found too.
 #[test]
 fn the_model_s_request_lines_are_swept() {
     let curl = ["/usr/bin/curl", "/bin/curl"]
@@ -714,7 +719,12 @@ fn the_model_s_request_lines_are_swept() {
     let tunnel = Canary::new("TUNNEL_VALUE", format!("ectunnel{}", hex()));
     let forward = Canary::new("FORWARD_VALUE", format!("ecfwd{}", hex()));
     let header = Canary::new("HEADER_VALUE", format!("echdr{}", hex()));
+    let value = Canary::new("HEADER_FIELD_VALUE", format!("ecval{}", hex()));
     let body = Canary::new("BODY_VALUE", format!("ecbody{}", hex()));
+    let fwd_path = Canary::new("FORWARD_PATH_VALUE", format!("ecfpath{}", hex()));
+    let fwd_query = Canary::new("FORWARD_QUERY_VALUE", format!("ecfquery{}", hex()));
+    let fwd_body = Canary::new("FORWARD_BODY_VALUE", format!("ecfbody{}", hex()));
+    let fwd_header = Canary::new("FORWARD_HEADER_VALUE", format!("ecfhdr{}", hex()));
     // A method is 16 upper-case letters at most.
     let letters: String = hex()
         .bytes()
@@ -740,6 +750,8 @@ fn the_model_s_request_lines_are_swept() {
         &key,
         "-H",
         &format!("x-{}: 1", header.as_str()),
+        "-H",
+        &format!("x-leak: {}", value.as_str()),
         &format!("{base}/{}?{}", path.as_str(), query.as_str()),
     ]);
     run(&["-X", method.as_str(), "-H", &key, &format!("{base}/v1/x")]);
@@ -753,6 +765,19 @@ fn the_model_s_request_lines_are_swept() {
         "-x",
         &base,
         &format!("http://{}.example/", forward.as_str()),
+    ]);
+    run(&[
+        "-x",
+        &base,
+        "-H",
+        &format!("x-leak: {}", fwd_header.as_str()),
+        "--data-binary",
+        fwd_body.as_str(),
+        &format!(
+            "http://ec.example/{}?{}",
+            fwd_path.as_str(),
+            fwd_query.as_str()
+        ),
     ]);
     run(&[
         "-H",
@@ -770,8 +795,13 @@ fn the_model_s_request_lines_are_swept() {
         tunnel.clone(),
         forward.clone(),
         header.clone(),
+        value.clone(),
         body.clone(),
         method.clone(),
+        fwd_path.clone(),
+        fwd_query.clone(),
+        fwd_body.clone(),
+        fwd_header.clone(),
     ];
     let hits = sweep_model(&report, &cs);
     let parts = |c: &Canary| -> Vec<&str> {
@@ -783,16 +813,23 @@ fn the_model_s_request_lines_are_swept() {
         p.dedup();
         p
     };
-    for (c, part) in [
-        (&path, "target"),
-        (&query, "target"),
-        (&tunnel, "target"),
-        (&forward, "target"),
-        (&header, "header names"),
-        (&method, "method"),
-        (&body, "body"),
+    for (c, want) in [
+        (&path, &["target"][..]),
+        (&query, &["target"]),
+        // The host a tunnel names is in its `Host` header too; the host of
+        // a request to forward also in its whole target.
+        (&tunnel, &["target", "header values"]),
+        (&forward, &["target", "forwarded target", "header values"]),
+        (&header, &["header names"]),
+        (&value, &["header values"]),
+        (&method, &["method"]),
+        (&body, &["body"]),
+        (&fwd_path, &["forwarded target"]),
+        (&fwd_query, &["forwarded target"]),
+        (&fwd_body, &["body"]),
+        (&fwd_header, &["header values"]),
     ] {
-        assert_eq!(parts(c), [part], "{} in {:?}", c.label, report.requests);
+        assert_eq!(parts(c), want, "{} in {:?}", c.label, report.requests);
     }
 }
 
@@ -911,6 +948,8 @@ fn every_encoding_is_found_inside_each_host_and_model_envelope() {
                     path: "/v1/x".to_owned(),
                     query: None,
                     headers: Vec::new(),
+                    header_values: Vec::new(),
+                    forward: Zeroizing::new(Vec::new()),
                     status: 200,
                     answered: true,
                     api: None,

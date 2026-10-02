@@ -15,8 +15,9 @@
 //! raw: nothing is filtered, the harness's own canaries included, so a
 //! positive control (a canary a scripted turn prints) is counted like
 //! anything else. The scripted model's requests are swept too, bodies,
-//! request lines and header names ([`sweep_model`]): what a host sent its
-//! model is what a real model would have seen. Both read through up to
+//! request lines, header names and values and forwarded targets
+//! ([`sweep_model`]): what a host sent its model is what a real model
+//! would have seen. Both read through up to
 //! [`crate::detect::JSON_LEVELS`] levels of JSON string escaping, since a
 //! host keeps what a command printed as a JSON string, sometimes inside
 //! another, and a value escaped again matches none of its listed
@@ -397,8 +398,9 @@ pub struct ModelHit {
     /// The request's number in the run.
     pub seq: u64,
     /// Where in the request: `body`, `method`, `target` (the path and
-    /// query, or the `host:port` of a tunnel or a request to forward) or
-    /// `header names`.
+    /// query, or the `host:port` of a tunnel or a request to forward),
+    /// `header names`, `header values` or `forwarded target` (a request
+    /// to forward's whole target).
     pub part: &'static str,
     pub found: Found,
 }
@@ -568,9 +570,12 @@ pub fn sweep_stores(
 }
 
 /// Every canary occurrence in the requests the model recorded: each
-/// body, and each request line and header name, which a host (or a
-/// command, through the proxy variables that point at the model) can put
-/// a value in as well as a body (verifier, low: only bodies were swept).
+/// body, and each request line, header name and header value, and a
+/// forwarded request's whole target, which a host (or a command, through
+/// the proxy variables that point at the model) can put a value in as
+/// well as a body (verifier, low: only bodies were swept; Codex review,
+/// medium: header values and a forwarded request's path, query and body
+/// were not recorded).
 pub fn sweep_model(report: &ModelReport, cs: &[Canary]) -> Vec<ModelHit> {
     let detector = Detector::new(cs);
     let mut hits = Vec::new();
@@ -580,12 +585,19 @@ pub fn sweep_model(report: &ModelReport, cs: &[Canary]) -> Vec<ModelHit> {
             None => r.path.clone(),
         };
         let headers = r.headers.join("\n");
-        for (part, bytes) in [
+        let mut parts: Vec<(&'static str, &[u8])> = vec![
             ("method", r.method.as_bytes()),
             ("target", target.as_bytes()),
             ("header names", headers.as_bytes()),
+            ("forwarded target", r.forward.as_slice()),
             ("body", r.body.as_slice()),
-        ] {
+        ];
+        parts.extend(
+            r.header_values
+                .iter()
+                .map(|v| ("header values", v.as_slice())),
+        );
+        for (part, bytes) in parts {
             hits.extend(detector.find(bytes).into_iter().map(|found| ModelHit {
                 seq: r.seq,
                 part,

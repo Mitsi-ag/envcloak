@@ -59,17 +59,19 @@ pub enum Form {
     Forward,
 }
 
-/// A parsed request head. The credential headers are kept only to be
-/// compared with the run's token; `Debug` shows neither, and shows the
-/// target only by the name of the endpoint it is, or by its length.
+/// A parsed request head. The credential headers are kept apart to be
+/// compared with the run's token; every header's value is kept, in a
+/// wiping buffer, for the record, and so is a forwarded request's whole
+/// target. `Debug` shows no value and no target, only the name of the
+/// endpoint a target is, or its length.
 pub struct Head {
     /// The method, upper-case letters only.
     pub method: String,
     /// What the target is for.
     pub form: Form,
     /// The target's path, before any `?`; for a tunnel or a forwarded
-    /// request, the `host:port` it names (a forwarded request's own path
-    /// and query are not kept).
+    /// request, the `host:port` it names (a forwarded request's whole
+    /// target is in [`Head::forward`]).
     pub path: String,
     /// The target's query, after the first `?`.
     pub query: Option<String>,
@@ -79,6 +81,12 @@ pub struct Head {
     pub close: bool,
     /// Every header name, lower-cased, in the order given.
     pub header_names: Vec<String>,
+    /// Each header's value, trimmed, in the order of
+    /// [`Head::header_names`].
+    pub(crate) header_values: Vec<Zeroizing<Vec<u8>>>,
+    /// A forwarded request's whole target as sent (scheme, authority,
+    /// path and query); `None` for any other form.
+    pub(crate) forward: Option<Zeroizing<Vec<u8>>>,
     pub(crate) api_key: Option<Zeroizing<Vec<u8>>>,
     pub(crate) authorization: Option<Zeroizing<Vec<u8>>>,
 }
@@ -164,6 +172,11 @@ impl fmt::Debug for Head {
             .field("content_length", &self.content_length)
             .field("close", &self.close)
             .field("header_names", &names)
+            .field(
+                "header_value_bytes",
+                &self.header_values.iter().map(|v| v.len()).sum::<usize>(),
+            )
+            .field("forward_len", &self.forward.as_ref().map(|f| f.len()))
             .finish_non_exhaustive()
     }
 }
@@ -194,7 +207,7 @@ pub fn parse_head(head: &[u8], body_cap: usize) -> Result<Head, HttpError> {
     let Some(request_line) = lines.next() else {
         return Err(HttpError::Malformed("request line"));
     };
-    let (method, form, path, query) = request_line_parts(request_line)?;
+    let (method, form, path, query, forward) = request_line_parts(request_line)?;
     let mut head = Head {
         method,
         form,
@@ -203,6 +216,8 @@ pub fn parse_head(head: &[u8], body_cap: usize) -> Result<Head, HttpError> {
         content_length: 0,
         close: false,
         header_names: Vec::new(),
+        header_values: Vec::new(),
+        forward,
         api_key: None,
         authorization: None,
     };
@@ -253,9 +268,15 @@ fn split_crlf(text: &[u8]) -> Result<impl Iterator<Item = &[u8]>, HttpError> {
     }))
 }
 
-/// The parts of a request line: method, form, path (or `host:port`) and
-/// query.
-type RequestLine = (String, Form, String, Option<String>);
+/// The parts of a request line: method, form, path (or `host:port`),
+/// query, and a forwarded request's whole target.
+type RequestLine = (
+    String,
+    Form,
+    String,
+    Option<String>,
+    Option<Zeroizing<Vec<u8>>>,
+);
 
 fn request_line_parts(line: &[u8]) -> Result<RequestLine, HttpError> {
     let mut parts = line.split(|&b| b == b' ');
@@ -281,14 +302,21 @@ fn request_line_parts(line: &[u8]) -> Result<RequestLine, HttpError> {
                 Form::Tunnel,
                 String::from_utf8_lossy(target).into_owned(),
                 None,
+                None,
             )),
             false => Err(HttpError::Malformed("target")),
         };
     }
     if let Some(at) = forwarded(target) {
         // A request a proxy is to forward (HTTP_PROXY pointed here): kept
-        // by the `host:port` it goes to.
-        return Ok((method_text, Form::Forward, at, None));
+        // by the `host:port` it goes to, and whole for the record.
+        return Ok((
+            method_text,
+            Form::Forward,
+            at,
+            None,
+            Some(Zeroizing::new(target.to_vec())),
+        ));
     }
     // Only a request for this server is held to HTTP/1.1.
     if version != b"HTTP/1.1" {
@@ -308,7 +336,7 @@ fn request_line_parts(line: &[u8]) -> Result<RequestLine, HttpError> {
     if path.contains('#') || query.as_deref().is_some_and(|q| q.contains('#')) {
         return Err(HttpError::Malformed("target"));
     }
-    Ok((method_text, Form::Origin, path, query))
+    Ok((method_text, Form::Origin, path, query, None))
 }
 
 /// The `host:port` an absolute-form target (`http://host[:port]/...` or
@@ -432,6 +460,7 @@ fn header(
     }
     head.header_names
         .push(String::from_utf8_lossy(&name).into_owned());
+    head.header_values.push(Zeroizing::new(value.to_vec()));
     Ok(())
 }
 

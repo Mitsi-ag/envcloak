@@ -3091,6 +3091,8 @@ fn a_tier_2_run_incomplete_or_failed_after_its_tool_turn_is_not_drivable() {
         path: "/v1/messages".to_owned(),
         query: None,
         headers: Vec::new(),
+        header_values: Vec::new(),
+        forward: Vec::new().into(),
         status: 200,
         answered: true,
         api: Some("messages".to_owned()),
