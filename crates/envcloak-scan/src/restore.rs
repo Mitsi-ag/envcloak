@@ -20,26 +20,26 @@
 //!   [`crate::replace_atomically`] replaces one: only while that file's
 //!   SHA-256 is the one the daemon recorded after the change
 //!   (`backup.v2.record_result`), and only while it is still the file
-//!   that was hashed when the new one takes its name; and only when the
-//!   contents the chunks make up have the backed-up SHA-256. It is the
+//!   that was hashed, with those contents, when the new one takes its
+//!   name; and only when the contents the chunks make up have the
+//!   backed-up SHA-256. It is the
 //!   write-back the backup v2 undo commands of M2-16, M2-20 and M2-22 are
 //!   to call (docs/IPC.md "Backups v2", "Writing back"); `init --undo`
 //!   restores its v1 backups through [`restore_over`].
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 use envcloak_core::SecretBytes;
 use envcloak_core::file_backup_v2::{MAX_FILE_V2, chunk_len, chunks_of};
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
 
 use std::time::SystemTime;
 
 use crate::atomic::{
-    Inside, ModifyError, ModifyErrorKind, create_atomically, io, replace_atomically,
+    Inside, ModifyError, ModifyErrorKind, create_atomically, digest_of, io, replace_atomically,
     replace_in_with, rewrite_checked_observed,
 };
 use crate::root::{FileStamp, ScanRoot, open_file};
@@ -121,8 +121,16 @@ pub struct BackedUpFile {
 /// ([`ModifyErrorKind::BackupUnread`] otherwise, and nothing is written in
 /// its place), and only while the file there is still the one hashed, as
 /// [`crate::replace_atomically`] checks: a save meanwhile is kept
-/// ([`ModifyErrorKind::Changed`]). The file keeps its mode. A file with
-/// another hard link is never written over. Returns the new file's stamp.
+/// ([`ModifyErrorKind::Changed`]). The two names are swapped in one step,
+/// and what came out is read again whole: unless it still has
+/// `file.sha256_after`, the names are swapped back and the file is kept
+/// (`changed`), so an edit made in place after the last check, at the
+/// same length with its modification time put back, is never deleted. A
+/// file system that cannot swap names writes nothing
+/// ([`ModifyErrorKind::SwapUnsupported`]). A write by a program that still
+/// has the old file open, after that read, is not seen. The file keeps
+/// its mode. A file with another hard link is never written over. Returns
+/// the new file's stamp.
 ///
 /// # Errors
 /// As above, and as [`crate::replace_atomically`].
@@ -172,36 +180,18 @@ pub fn restore_over_left_observed(
     }
     observe(Inside::Hashed);
     // The file must still be the one hashed when its replacement takes
-    // its name: the stamp is the one it had before it was read.
+    // its name: the stamp is the one it had before it was read, and what
+    // comes out of the swap must still hold what the change left.
     let mut fill = |out: &mut File| write_chunks(out, file, chunk);
-    replace_in_with(&dir, rel, &name, &mut fill, &stamp, observe)
-}
-
-/// The SHA-256 of `f`, which must hold exactly the bytes `stamp` says and
-/// still have that stamp once read (else [`ModifyErrorKind::Changed`]), so
-/// a file changed while it was hashed is refused before a chunk is asked
-/// for. The bytes pass through a buffer wiped after.
-fn digest_of(f: &mut File, stamp: &FileStamp) -> Result<[u8; 32], ModifyErrorKind> {
-    let size = stamp.size;
-    let mut buf = Zeroizing::new(vec![0u8; 64 * 1024]);
-    let mut h = Sha256::new();
-    let mut read: u64 = 0;
-    loop {
-        let n = f.read(&mut buf[..]).map_err(|e| io(&e))?;
-        if n == 0 {
-            break;
-        }
-        read += n as u64;
-        if read > size {
-            return Err(ModifyErrorKind::Changed);
-        }
-        h.update(&buf[..n]);
-    }
-    let after = f.metadata().map_err(|e| io(&e))?;
-    if read != size || FileStamp::of(&after) != *stamp {
-        return Err(ModifyErrorKind::Changed);
-    }
-    Ok(h.finalize().into())
+    replace_in_with(
+        &dir,
+        rel,
+        &name,
+        &mut fill,
+        &stamp,
+        Some(&file.sha256_after),
+        observe,
+    )
 }
 
 /// Writes the chunks of `file` to `out`, in order, each at its length,
