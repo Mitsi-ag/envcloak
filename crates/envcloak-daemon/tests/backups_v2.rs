@@ -593,8 +593,9 @@ fn backup_v2_child() {
 /// reparented, whether or not its maker was reaped): as [`CHILD_HELD_CALL`]
 /// says, it records a result for file 0 of the backup [`CHILD_HELD`]
 /// names (`result`), reads chunk 0 of file 0 under the lease
-/// [`CHILD_HELD_LEASE`] names (`read`) or begins a backup (`begin`), and
-/// says what came back, or that the daemon closed the connection.
+/// [`CHILD_HELD_LEASE`] names (`read`), begins a backup (`begin`) or opens
+/// a restore of the backup with the right passphrase (`open`), and says
+/// what came back, or that the daemon closed the connection.
 fn holder() {
     use std::os::fd::AsFd;
     let maker: u32 = std::env::var(CHILD_MAKER).unwrap().parse().unwrap();
@@ -612,6 +613,23 @@ fn holder() {
     let call = match std::env::var(CHILD_HELD_CALL).unwrap().as_str() {
         "read" => json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.read",
             "params": {"lease": std::env::var(CHILD_HELD_LEASE).unwrap(), "file": 0, "chunk": 0}}),
+        "open" => {
+            // The right passphrase, from the fixtures of the seed: only the
+            // caller's liveness refuses the proof.
+            let cs = canaries(std::env::var(CHILD_SEED).unwrap().parse().unwrap());
+            let pass = envcloak_testkit::by_label(&cs, envcloak_testkit::labels::VAULT_PASSPHRASE);
+            let params = envcloak_ipc::proto::OpenRestoreParams {
+                id: id.clone(),
+                passphrase: envcloak_ipc::WireSecret::new(SecretBytes::copy_from(
+                    pass.as_str().as_bytes(),
+                )),
+                created_by_agent_ticked: true,
+                unrecorded: true,
+                claims: Vec::new(),
+            };
+            json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.open_restore",
+                "params": serde_json::to_value(params).unwrap()})
+        }
         "begin" => json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.begin",
             "params": {"purpose": "scrub", "files": [{"path": "/held/.env", "size": 1, "mode": 384}],
                 "claims": []}}),
@@ -1542,7 +1560,8 @@ fn a_restore_is_refused_to_an_agent_and_to_a_process_without_a_terminal() {
 /// on Linux the daemon still names the worker there, which has exited
 /// (`not_backup_owner`, `no_such_lease` or `evidence`); on macOS it
 /// closes the connection, whose peer changed. While the worker is still
-/// unreaped its backup lists `result_unrecorded`, and its lease ends.
+/// unreaped its backup lists `result_unrecorded`, its lease ends, and no
+/// lease is opened for it.
 fn handed_on_after_exit(what: &str) {
     let f = Fixture::new();
     let files = [Spec::made(&f.home.home().join("acme/.env"), 20, 15)];
@@ -1583,6 +1602,13 @@ fn handed_on_after_exit(what: &str) {
     // Still not reaped: the worker is a zombie, and has exited.
     let unreaped = || envcloak_sys::proc_info(pid).is_ok_and(|i| i.start_time == start);
     assert!(unreaped(), "{what}: the worker was reaped");
+    if what == "open" {
+        assert_eq!(
+            f.list().open_leases,
+            0,
+            "a lease was opened for an exited process"
+        );
+    }
     if what == "read" {
         let end = Instant::now() + Duration::from_secs(10);
         while f.list().open_leases != 0 {
@@ -1625,6 +1651,14 @@ fn a_connection_handed_on_reads_nothing_under_the_lease_of_a_process_that_exited
 #[test]
 fn a_connection_handed_on_begins_nothing_for_a_process_that_exited() {
     handed_on_after_exit("begin");
+}
+
+/// [`handed_on_after_exit`] with `open_restore` and the right passphrase:
+/// no restore is opened for a process that exited, reaped or not
+/// (`evidence`, `caller_gone`, before the passphrase is looked at).
+#[test]
+fn a_connection_handed_on_opens_no_restore_for_a_process_that_exited() {
+    handed_on_after_exit("open");
 }
 
 /// A lock stops a call already in flight (SPEC "Lock"; D-07): the daemon
@@ -1889,42 +1923,52 @@ fn one_root_holds_at_most_four_backups_in_progress() {
 /// `status` and takes a `lock` and an `unlock` meanwhile. The list then
 /// ends `vault_locked` at once, as a lock ends any call in flight: it
 /// opens no other backup with its copy of the key (the daemon's test
-/// trace counts each one it opens).
+/// trace counts each one it opens). With one backup, the lock comes after
+/// the last one is opened, and the list still ends `vault_locked`: it
+/// never answers with what it read before a lock.
 #[test]
 fn a_list_holds_no_lock_while_it_opens_backups() {
-    let mut f = Fixture::pausing(Some("backup.v2.list"));
-    for n in 0..3u8 {
-        let files = [Spec::made(
-            &f.claude(&format!("projects/p/l{n}.jsonl")),
-            40,
-            20 + n,
-        )];
-        f.backup("scrub", &files);
+    for count in [3u8, 1] {
+        let mut f = Fixture::pausing(Some("backup.v2.list"));
+        for n in 0..count {
+            let files = [Spec::made(
+                &f.claude(&format!("projects/p/l{n}.jsonl")),
+                40,
+                20 + n,
+            )];
+            f.backup("scrub", &files);
+        }
+        let paths = f.paths();
+        let listing =
+            std::thread::spawn(move || Client::connect(&paths)?.backup_v2_list().map(drop));
+        f.wait_paused("backup.v2.list");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let paths = f.paths();
+        std::thread::spawn(move || {
+            let state = Client::connect(&paths).and_then(|mut c| c.status());
+            let _ = tx.send(state.map(|s| s.vault.state));
+        });
+        let state = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("status waited for the list");
+        assert_eq!(state.unwrap(), VaultState::Unlocked);
+        client(&f.home).lock().unwrap();
+        client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
+        f.release();
+        let e = listing.join().unwrap().err().unwrap_or_else(|| {
+            panic!("{count} backups: the list answered with what it read before a lock")
+        });
+        assert_eq!(rpc(e).0, ErrorKind::VaultLocked, "{count} backups");
+        let opened = String::from_utf8_lossy(&f.d.log_bytes())
+            .lines()
+            .filter(|l| l.contains("envcloak test: backup.v2.list opened a backup"))
+            .count();
+        assert_eq!(
+            opened, 1,
+            "{count} backups: the list went on opening backups after the lock"
+        );
+        f.sweep();
     }
-    let paths = f.paths();
-    let listing = std::thread::spawn(move || Client::connect(&paths)?.backup_v2_list().map(drop));
-    f.wait_paused("backup.v2.list");
-    let (tx, rx) = std::sync::mpsc::channel();
-    let paths = f.paths();
-    std::thread::spawn(move || {
-        let state = Client::connect(&paths).and_then(|mut c| c.status());
-        let _ = tx.send(state.map(|s| s.vault.state));
-    });
-    let state = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("status waited for the list");
-    assert_eq!(state.unwrap(), VaultState::Unlocked);
-    client(&f.home).lock().unwrap();
-    client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
-    f.release();
-    let e = listing.join().unwrap().unwrap_err();
-    assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
-    let opened = String::from_utf8_lossy(&f.d.log_bytes())
-        .lines()
-        .filter(|l| l.contains("envcloak test: backup.v2.list opened a backup"))
-        .count();
-    assert_eq!(opened, 1, "the list went on opening backups after the lock");
-    f.sweep();
 }
 
 /// How many times a test daemon opened a backup's `data` file, and read
@@ -2012,5 +2056,61 @@ fn a_purge_holds_no_lock() {
     put_all(&f.paths(), f.files_cs(), &id, &files).unwrap();
     client(&f.home).backup_v2_commit(&id).unwrap();
     assert_eq!(f.list().backups.len(), 1);
+    f.sweep();
+}
+
+/// A creator that exits while its `record_result` is in flight records
+/// nothing: the daemon is stopped by a barrier in `record_result` after
+/// its first check of the creator, the creator is killed and reaped, and
+/// once the daemon goes on (the call's connection then closes, which its
+/// test trace says) the backup lists `result_unrecorded`, and its
+/// statement has no result.
+#[test]
+fn a_creator_that_exits_with_its_result_in_flight_records_nothing() {
+    let mut f = Fixture::pausing(Some("backup.v2.record_result"));
+    let files = [Spec::made(&f.home.home().join("acme/.env"), 25, 71)];
+    let mut w = f.child("worker", false);
+    let pid = w.child.id();
+    let id = w.ask(json!({"op": "begin", "purpose": "scrub",
+        "files": files.iter().map(Spec::to_json).collect::<Vec<_>>()}))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(w.ask(json!({"op": "put_next", "id": id}))["final"], true);
+    assert_eq!(w.ask(json!({"op": "commit", "id": id}))["files"], 1);
+    let sha = hex(&files[0].sha(f.files_cs()));
+    writeln!(
+        w.stdin,
+        "{}",
+        json!({"op": "result", "id": id, "file": 0, "sha256": sha})
+    )
+    .unwrap();
+    w.stdin.flush().unwrap();
+    f.wait_paused("backup.v2.record_result");
+    w.child.kill().unwrap();
+    w.child.wait().unwrap();
+    let count = |what: &str| {
+        let line = format!("envcloakd: test: connection {what} pid={pid} ");
+        String::from_utf8_lossy(&f.d.log_bytes())
+            .lines()
+            .filter(|l| l.contains(&line))
+            .count()
+    };
+    f.release();
+    let end = Instant::now() + Duration::from_secs(30);
+    while count("closed") < count("opened") {
+        assert!(
+            Instant::now() < end,
+            "the call in flight never ended its connection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        f.list().backups[0].state,
+        BackupStateView::ResultUnrecorded,
+        "a creator that exited recorded its result"
+    );
+    let lease = f.open(&id, false, true).unwrap();
+    assert_eq!(lease.statement.files[0].sha256_after, None);
     f.sweep();
 }
