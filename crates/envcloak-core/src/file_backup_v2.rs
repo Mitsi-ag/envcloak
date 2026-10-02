@@ -31,9 +31,11 @@
 //!
 //! After the change, [`Vault::record_file_backup_v2_result`] records what
 //! the change left in each file (its SHA-256), once per file, each in a
-//! file of its own (`result-<index>`, `O_EXCL`), sealed under the
-//! backup's key: the "restore only while the file is what the change
-//! left" check compares against it.
+//! file of its own (`result-<index>`), sealed under the backup's key: the
+//! "restore only while the file is what the change left" check compares
+//! against it. A result is written and flushed under a temporary name,
+//! then linked to its own, which fails when that exists: a reader, or a
+//! restart after a crash, finds it absent or whole, never in part.
 //!
 //! [`Vault::open_file_backup_v2`] opens a backup for reading: it checks
 //! the header, the key, the metadata and the layout every chunk must have,
@@ -99,6 +101,9 @@ const STAGING_SUFFIX: &str = ".tmp";
 const DATA: &str = "data";
 /// Each result's file name: `result-<file index>`.
 const RESULT: &str = "result-";
+/// A result's temporary name before it is published:
+/// `.result-<file index>-<random id>.tmp`.
+const RESULT_TEMP: &str = ".result-";
 /// The row version of a result: this bit, with the file's index.
 const RESULT_BIT: u64 = 1 << 63;
 /// The largest chunk record: a full chunk, sealed.
@@ -1000,7 +1005,9 @@ impl Vault {
 
     /// Records what the change left in file `file` of backup `id`: its
     /// SHA-256, sealed under the backup's key in a file of its own,
-    /// written once (`O_EXCL`) and flushed with its directory.
+    /// written and flushed under a temporary name, then published under
+    /// its own once (a link that never replaces one), and flushed with its
+    /// directory.
     ///
     /// # Errors
     /// As [`Vault::open_file_backup_v2`]; [`VaultErrorKind::InvalidRecord`]
@@ -1128,6 +1135,38 @@ impl FileBackupV2Reader {
     /// # Errors
     /// As [`Vault::record_file_backup_v2_result`].
     pub fn record_result(&self, file: usize, sha256_after: &[u8; 32]) -> Result<(), VaultError> {
+        self.record(file, sha256_after, &mut |_| {})
+    }
+
+    /// [`FileBackupV2Reader::record_result`], reporting each step to
+    /// `observe` as it is done. Test support only (feature `testing`): the
+    /// crash tests stop the writer there.
+    ///
+    /// # Errors
+    /// As [`FileBackupV2Reader::record_result`].
+    #[cfg(feature = "testing")]
+    pub fn record_result_observed(
+        &self,
+        file: usize,
+        sha256_after: &[u8; 32],
+        mut observe: impl FnMut(ResultStepV2),
+    ) -> Result<(), VaultError> {
+        self.record(file, sha256_after, &mut observe)
+    }
+
+    /// The result is sealed into a file of its own under a name no reader
+    /// takes (`.result-<index>-<random>.tmp`), flushed, and only then
+    /// linked to its name `result-<index>`, which fails when that name
+    /// exists: a reader sees a result absent or whole, never in part, and
+    /// a crash at any step leaves the file unrecorded or recorded, never
+    /// damaged. The temporary name then goes, and the directory is
+    /// flushed.
+    fn record(
+        &self,
+        file: usize,
+        sha256_after: &[u8; 32],
+        observe: &mut dyn FnMut(ResultStepV2),
+    ) -> Result<(), VaultError> {
         if file >= self.meta.files.len() {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
@@ -1138,29 +1177,74 @@ impl FileBackupV2Reader {
             .raw(sha256_after);
         let sealed = seal_record(&self.key, &self.ctx.aad(Rec::Result(index)), &e.finish())?;
         let path = self.dir.join(format!("{RESULT}{file}"));
-        let mut out = match OpenOptions::new()
+        let temp = self.dir.join(format!(
+            "{RESULT_TEMP}{file}-{}{STAGING_SUFFIX}",
+            FileBackupId::generate()
+        ));
+        let mut out = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(VaultErrorKind::AlreadyExists.into());
+            .open(&temp)?;
+        observe(ResultStepV2::Created);
+        let mut published = || -> Result<(), VaultError> {
+            out.write_all(&sealed)?;
+            observe(ResultStepV2::Written);
+            out.sync_all()?;
+            observe(ResultStepV2::Synced);
+            match std::fs::hard_link(&temp, &path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(VaultErrorKind::AlreadyExists.into());
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
+            observe(ResultStepV2::Published);
+            Ok(())
         };
-        let written = out.write_all(&sealed).and_then(|()| out.sync_all());
-        if let Err(e) = written {
-            // A result that is not whole is no result: it goes, so the
-            // file reads as unrecorded, never as damaged.
-            drop(out);
-            let _ = std::fs::remove_file(&path);
-            return Err(e.into());
-        }
-        sync_dir(&self.dir)
+        let published = published();
+        drop(out);
+        // The temporary name goes whatever happened. A failure to remove it
+        // leaves a file no reader takes, which the purge removes with the
+        // backup: the result itself is recorded or not as `published` says.
+        let _ = std::fs::remove_file(&temp);
+        published?;
+        observe(ResultStepV2::Unlinked);
+        sync_dir(&self.dir)?;
+        observe(ResultStepV2::Done);
+        Ok(())
     }
+}
+
+/// A point [`FileBackupV2Reader::record_result`] passes, for the crash
+/// tests (feature `testing`): each is reported after the step is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultStepV2 {
+    /// The temporary file exists, empty.
+    Created,
+    /// The sealed result is written to it.
+    Written,
+    /// It is flushed.
+    Synced,
+    /// It is linked to the result's name: the result is recorded.
+    Published,
+    /// The temporary name is removed.
+    Unlinked,
+    /// The backup's directory is flushed.
+    Done,
+}
+
+/// Whether `name` is a temporary name [`FileBackupV2Reader::record_result`]
+/// uses: `.result-<index>-<id>.tmp`.
+fn result_temp(name: &str) -> bool {
+    name.strip_prefix(RESULT_TEMP)
+        .and_then(|n| n.strip_suffix(STAGING_SUFFIX))
+        .is_some_and(|n| {
+            !n.is_empty()
+                && n.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 /// The directory of backup `id` in `p`'s backups directory, by its name.
@@ -1247,13 +1331,15 @@ pub fn list_file_backups_v2(p: &VaultPaths) -> Result<Vec<ListedV2>, VaultError>
     Ok(out)
 }
 
-/// Removes a backup's directory: its `data` and result files, then the
+/// Removes a backup's directory: its `data` and result files, the
+/// temporary names a result left when its writer stopped, then the
 /// directory. Anything else in it stays, and so does the directory.
 fn remove_backup_dir(dir: &Path) -> Result<bool, VaultError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let ours = entry.file_name().to_str().is_some_and(|n| {
             n == DATA
+                || result_temp(n)
                 || n.strip_prefix(RESULT)
                     .is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()))
         });
