@@ -25,7 +25,8 @@
 //! exits, whatever is left of its group (a command it started in the
 //! background) is killed too, before the home is removed. A descendant
 //! that left the group and still holds the output open 10 s later is
-//! reported; one that left it and closed its output cannot be seen. The
+//! reported, as is a read of the output that fails (the output is then
+//! incomplete); one that left it and closed its output cannot be seen. The
 //! home is removed when COMMAND has ended, unless `--keep-home` keeps it
 //! for a look at what the host wrote (its path is printed).
 //!
@@ -42,9 +43,10 @@
 //! hosts were measured reaching for are named, anything else only by its
 //! length; the record has them whole), and the outcome.
 //!
-//! Exits with COMMAND's code when it ended within its limit, nothing
-//! outside its group held its output, and the run was complete with
-//! every request one the script served; else 3 (and 2 on a usage error).
+//! Exits with COMMAND's code when it ended within its limit, its output
+//! was read whole, nothing outside its group held it, and the run was
+//! complete with every request one the script served; else 3 (and 2 on a
+//! usage error).
 
 use std::fs::File;
 use std::io::Write;
@@ -175,7 +177,10 @@ fn main() -> ExitCode {
                 );
                 ok = false;
             }
-            if !b.complete {
+            if b.read_failed {
+                eprintln!("ec-model: a read of the command's output failed; it is incomplete");
+                ok = false;
+            } else if !b.complete {
                 eprintln!(
                     "ec-model: a process outside the command's group still held its output \
                      open after it ended; it may still be running"
