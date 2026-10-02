@@ -1,5 +1,7 @@
 [package]
 name = "envcloak-mcp"
+description = "EnvCloak's MCP server (`envcloak mcp`): metadata tools and run_with_secrets over stdio JSON-RPC, never a value"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,4 +12,25 @@ authors.workspace = true
 [lints]
 workspace = true
 
+# Normal dependencies stay within the edges scripts/check-crate-graph.py
+# allows for this crate (D-02). The server holds no value, so it needs no
+# expose_secret entry: run_with_secrets runs a child `envcloak run`, which
+# alone receives the values (D-03).
 [dependencies]
+# Each host's MCP tool cutoff, which bounds how long a tool waits for a
+# person (tool_timeouts).
+envcloak-agents.workspace = true
+# The verified daemon connection, failures and their tokens, the provider
+# registry's key masking, and the manifest editor of `envcloak ref`.
+envcloak-client.workspace = true
+envcloak-ipc.workspace = true
+envcloak-policy.workspace = true
+# Owned children: a call's child is signalled, as a group, only while it
+# is unreaped; this server's own ancestry, to show its own root's grants.
+envcloak-sys.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+envcloak-testkit.workspace = true
+tempfile.workspace = true

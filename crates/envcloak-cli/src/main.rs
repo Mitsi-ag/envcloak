@@ -29,7 +29,11 @@
 //!   only after the four conditions of SPEC §6.4 (see [`cmd::init`]);
 //! - `envcloak backup create` and `recover`: an encrypted backup of the
 //!   vault, and the vault restored from one with the Recovery Kit under a
-//!   new passphrase (see [`cmd::recover`]).
+//!   new passphrase (see [`cmd::recover`]);
+//! - `envcloak mcp [--host ID] [--wait-ms N]`: EnvCloak's MCP server, which
+//!   an agent host starts and talks to over standard input and output
+//!   (SPEC §7; `envcloak_mcp`, docs/MCP.md). It never receives a value:
+//!   `run_with_secrets` runs a child `envcloak run`.
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
 //! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`, `init`,
@@ -95,6 +99,7 @@ const HELP: &str = "usage:
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+  envcloak mcp [--host ID] [--wait-ms N]
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
@@ -102,7 +107,6 @@ Not in this build (each exits 125 with not_in_this_build):
   envcloak scrub
   envcloak agents install | uninstall | status | migrate-mcp
   envcloak hook
-  envcloak mcp
   envcloak mcp-bridge
   envcloak standing
   envcloak items reclassify

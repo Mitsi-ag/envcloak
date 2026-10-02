@@ -28,6 +28,7 @@ usage:
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+  envcloak mcp [--host ID] [--wait-ms N]
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
@@ -35,7 +36,6 @@ Not in this build (each exits 125 with not_in_this_build):
   envcloak scrub
   envcloak agents install | uninstall | status | migrate-mcp
   envcloak hook
-  envcloak mcp
   envcloak mcp-bridge
   envcloak standing
   envcloak items reclassify
@@ -80,6 +80,7 @@ usage:
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+  envcloak mcp [--host ID] [--wait-ms N]
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
@@ -87,7 +88,6 @@ Not in this build (each exits 125 with not_in_this_build):
   envcloak scrub
   envcloak agents install | uninstall | status | migrate-mcp
   envcloak hook
-  envcloak mcp
   envcloak mcp-bridge
   envcloak standing
   envcloak items reclassify
@@ -294,3 +294,23 @@ exit: 2
 --- stdout
 --- stderr
 envcloak: usage: envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
+$ envcloak mcp --help
+exit: 0
+--- stdout
+usage: envcloak mcp [--host ID] [--wait-ms 1000..20000]
+       started by an agent host, which talks to it on standard input and output
+--- stderr
+$ envcloak mcp --wait-ms 25000
+exit: 2
+--- stdout
+--- stderr
+envcloak: --wait-ms takes 1000 to 20000 milliseconds
+envcloak: usage: envcloak mcp [--host ID] [--wait-ms 1000..20000]
+       started by an agent host, which talks to it on standard input and output
+$ envcloak mcp --host Claude Code
+exit: 2
+--- stdout
+--- stderr
+envcloak: --host needs a host id: lowercase letters, digits and -
+envcloak: usage: envcloak mcp [--host ID] [--wait-ms 1000..20000]
+       started by an agent host, which talks to it on standard input and output

@@ -24,7 +24,6 @@ const STUBS: &[(&[&str], &str)] = &[
     (&["agents", "status"], "`envcloak agents status`"),
     (&["agents", "migrate-mcp"], "`envcloak agents migrate-mcp`"),
     (&["hook"], "`envcloak hook`"),
-    (&["mcp"], "`envcloak mcp`"),
     (&["mcp-bridge"], "`envcloak mcp-bridge`"),
     (&["standing"], "`envcloak standing`"),
     (&["items", "reclassify"], "`envcloak items reclassify`"),
@@ -157,10 +156,11 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
             "{what} is listed as available: {help}"
         );
     }
-    // The check sees the commands this build has, those M2-03 landed
-    // among them.
+    // The check sees the commands this build has, those M2-03 and M2-06
+    // landed among them.
     assert!(lists(available, &["run"]));
     assert!(lists(available, &["pending"]));
+    assert!(lists(available, &["mcp"]));
     let run = available
         .lines()
         .find(|l| l.trim_start().starts_with("envcloak run "))

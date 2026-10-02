@@ -222,10 +222,12 @@ dependencies = [
 name = "envcloak"
 version = "0.1.0"
 dependencies = [
+ "envcloak-agents",
  "envcloak-client",
  "envcloak-core",
  "envcloak-exec",
  "envcloak-ipc",
+ "envcloak-mcp",
  "envcloak-policy",
  "envcloak-providers",
  "envcloak-scan",
@@ -359,6 +361,17 @@ dependencies = [
 [[package]]
 name = "envcloak-mcp"
 version = "0.1.0"
+dependencies = [
+ "envcloak-agents",
+ "envcloak-client",
+ "envcloak-ipc",
+ "envcloak-policy",
+ "envcloak-sys",
+ "envcloak-testkit",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "envcloak-policy"
