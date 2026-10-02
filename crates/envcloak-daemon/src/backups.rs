@@ -33,8 +33,9 @@
 //! process made unless `created_by_agent_ticked`, one whose results are
 //! not all recorded unless `unrecorded`, and a caller that shares a
 //! session or a terminal with a process of the creator's sealed chain
-//! that still runs (`requester_terminal`, as for approvals), whether or
-//! not this daemon took the backup. Argon2id runs once. The whole backup
+//! that is still there, exited and not yet reaped included
+//! (`requester_terminal`, as for approvals), whether or not this daemon
+//! took the backup. Argon2id runs once. The whole backup
 //! is then opened and checked (every chunk, every file's SHA-256), so no
 //! restore is ever partial; the audit entry is written durably; and only
 //! then is a lease issued, bound to the backup, the caller's process
@@ -86,7 +87,7 @@ use crate::audit::AuditEvent;
 use crate::clock::Clocks;
 use crate::import::prove_as;
 use crate::lock::Reading;
-use crate::requests::{evidence, refuse_unless_prover, subject_summary};
+use crate::requests::{alive, evidence, refuse_unless_prover, subject_summary};
 use crate::server::{Shared, locked, refuse_if_traced};
 use crate::state::{State, vault_reason};
 
@@ -262,12 +263,6 @@ fn same_instance(owner: &BackupOwner, peer: &PeerIdentity) -> bool {
         }
 }
 
-/// Whether process instance `i` still runs: a process that exited and is
-/// not yet reaped (a zombie) keeps its pid and start time but does not.
-fn running(i: &ProcessInstance) -> bool {
-    envcloak_sys::process_running(i.pid, i.start_time)
-}
-
 /// Whether `owner` still runs: in this boot, and running, as `watch` says
 /// when the daemon holds one for it (taken from the same process
 /// instance), or as the process table says. A process that exited and is
@@ -322,9 +317,12 @@ fn chain_of(e: &SubjectEvidence) -> Vec<CreatorProcess> {
 }
 
 /// Whether `caller` shares a session or a terminal with a process of the
-/// chain sealed with backup creator `c` that still runs in this boot
-/// ([`SubjectEvidence::shares_session_or_terminal`]): read from the
-/// backup, so it holds after a restart of the daemon.
+/// chain sealed with backup creator `c` that is still in this boot's
+/// process table ([`SubjectEvidence::shares_session_or_terminal`]): read
+/// from the backup, so it holds after a restart of the daemon. A process
+/// that exited and is not yet reaped still counts ([`alive`], as for a
+/// pending request's approval): the boundary errs toward refusing, while
+/// whether a creator or a lease's process may act asks whether it runs.
 fn shares_with_creator(caller: &SubjectEvidence, c: &BackupCreator) -> bool {
     if !this_boots(c.owner.boot) {
         return false;
@@ -344,7 +342,7 @@ fn shares_with_creator(caller: &SubjectEvidence, c: &BackupCreator) -> bool {
             agent: None,
         })
         .collect();
-    caller.shares_session_or_terminal(&scope, &running)
+    caller.shares_session_or_terminal(&scope, &alive)
 }
 
 /// A backup in progress's writer, shared by the calls that use it. Boxed,
@@ -1513,6 +1511,72 @@ mod tests {
             (0, 0, 0)
         );
         child.wait().unwrap();
+    }
+
+    /// The restore's approval-origin boundary errs toward refusing: a
+    /// process of an agent's sealed chain that exited and is not yet
+    /// reaped (a zombie) still bounds it, as for a pending request's
+    /// approval, though it no longer runs; once reaped it does not. The
+    /// caller and the sealed process share a session id (a synthetic one).
+    #[test]
+    fn an_exited_unreaped_process_of_the_creators_chain_still_bounds_a_restore() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read x"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let info = envcloak_sys::proc_info(i32::try_from(child.id()).unwrap()).unwrap();
+        let sid = Some(0x7eed);
+        let creator = BackupCreator {
+            kind: CreatorKind::Agent,
+            evidence_digest: [0; 32],
+            agent: Some("an agent".into()),
+            owner: owner_of(&peer_of(&info)),
+            chain: vec![CreatorProcess {
+                pid: info.pid,
+                start_time: info.start_time.raw(),
+                token: None,
+                sid,
+                terminal: None,
+            }],
+        };
+        let me = me();
+        let caller = SubjectEvidence::from_chain(
+            vec![Ancestor {
+                instance: ProcessInstance {
+                    pid: me.pid,
+                    start_time: me.start_time,
+                    pidversion: None,
+                    exe: None,
+                },
+                sid,
+                terminal: None,
+                agent: None,
+            }],
+            envcloak_policy::ChainEnd::Top,
+            false,
+            envcloak_policy::Claims::none(),
+            None,
+        )
+        .unwrap();
+        assert!(shares_with_creator(&caller, &creator), "while it runs");
+        drop(child.stdin.take());
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while envcloak_sys::process_running(info.pid, info.start_time) {
+            assert!(std::time::Instant::now() < end, "the child never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            envcloak_sys::proc_info(info.pid).unwrap().start_time,
+            info.start_time,
+            "the child was reaped"
+        );
+        assert!(
+            shares_with_creator(&caller, &creator),
+            "an exited, unreaped process of the creator's chain no longer bounds the restore"
+        );
+        child.wait().unwrap();
+        assert!(!shares_with_creator(&caller, &creator), "once reaped");
     }
 
     /// A process instance recorded in another boot is neither alive nor
