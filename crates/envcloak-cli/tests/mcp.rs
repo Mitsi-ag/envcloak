@@ -1545,6 +1545,107 @@ fn a_stopped_call_leaves_nothing_of_its_command_on_a_terminal() {
     stopped_calls_leave_nothing(true);
 }
 
+/// `project_status` shows the grants that may cover this agent's calls and
+/// no other (Codex review of M2-06, medium). The agent is started by a
+/// shell leading a session on a terminal of its own, and that shell's own
+/// `envcloak run` asks for the project's keys as a terminal subject: the
+/// person approves it, so a terminal grant is rooted at the shell, an
+/// ancestor of the server above the agent. The agent's own request,
+/// through `run_with_secrets`, is still pending (the agent barrier, SPEC
+/// §10b "Match" rules 3 and 4), and once the person approves it, its grant
+/// is rooted at the agent. The person's `envcloak grants list` shows both;
+/// `project_status` shows the agent's alone.
+///
+/// Mutation checked: grants chosen by their root's pid being in this
+/// server's ancestry (the round-2 filter): the terminal grant is shown too,
+/// and this fails.
+#[test]
+fn project_status_shows_only_the_grants_that_cover_this_agent() {
+    /// The shell: its own run of `true` in the background, as a terminal
+    /// subject, then the agent, then it waits for both.
+    const SHELL: &str =
+        "\"$1\" run --wait 120s -- true >\"$2\" 2>&1 </dev/null & shift 2; \"$@\"; wait";
+    let f = Fixture::new();
+    let files = outside_dir();
+    let log = files.path().join("shell-run.log");
+    let mut cmd = Command::new(python3());
+    f.home
+        .apply(&mut cmd)
+        .args(["-c", ON_AGENT_TERMINAL, "/bin/sh", "-c", SHELL, "sh"])
+        .arg(common::cli())
+        .arg(&log)
+        .arg(testkit_bin("fixture-agent"))
+        .arg("--")
+        .arg(common::cli());
+    let mut m = Mcp::spawn(cmd, &f.project, &["--wait-ms", "1000"], &f.cs);
+    m.initialize();
+    let shell_log =
+        || String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default()).into_owned();
+    let end = Instant::now() + Duration::from_secs(60);
+    let shells = loop {
+        if let [id] = &f.listed()[..] {
+            break id.clone();
+        }
+        assert!(
+            Instant::now() < end,
+            "the shell's run opened no request: {}",
+            shell_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    f.approve(&shells);
+
+    let dir = f.project.to_str().unwrap();
+    let py = python3();
+    let argv = json!([py.to_str().unwrap(), "has_tty.py"]);
+    let r = m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": argv}),
+    );
+    let s = structured(&r);
+    assert_eq!(
+        s["status"], "approval_required",
+        "the shell's terminal grant covered the agent: {s}"
+    );
+    let agents = s["request"].as_str().unwrap().to_owned();
+    f.approve(&agents);
+    let r = m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": argv}),
+    );
+    assert_eq!(structured(&r)["status"], "completed", "{r}");
+
+    let theirs = f.person(&["grants", "list", "--json"]);
+    assert!(theirs.status.success(), "{}", stderr(&theirs));
+    let theirs: Value = serde_json::from_slice(&theirs.stdout).unwrap();
+    let of_kind = |kind: &str| -> Vec<String> {
+        theirs["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| g["kind"] == kind)
+            .map(|g| g["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (terminal, agent) = (of_kind("terminal"), of_kind("agent"));
+    assert_eq!(terminal.len(), 1, "{theirs}; shell: {}", shell_log());
+    assert_eq!(agent.len(), 1, "{theirs}");
+
+    let status = structured(&m.call("project_status", json!({"project_dir": dir}))).clone();
+    let shown: Vec<&str> = status["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        shown, agent,
+        "project_status showed a grant that cannot cover this agent: {status}"
+    );
+    m.finish();
+    f.sweep();
+}
+
 /// A daemon slow to answer at the wait's deadline cannot push a tool's
 /// answer past its host's cutoff: `run_with_secrets` gives `envcloak run`
 /// its wait less a grace for the daemon's last answer (`--wait-grace`), so

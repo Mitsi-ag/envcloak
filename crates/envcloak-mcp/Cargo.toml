@@ -26,13 +26,15 @@ envcloak-client.workspace = true
 envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
 # Owned children: a call's child is signalled, as a group, only while it
-# is unreaped; this server's own ancestry, to show its own root's grants.
+# is unreaped; this server's own identity and ancestry, read as the daemon
+# reads a caller's, to show the grants that cover its calls.
 envcloak-sys.workspace = true
+# Where the agent catalog the daemon loads lives (VaultPaths), for that
+# same evidence.
+envcloak-core.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# Real Recovery Kits, for the request-id tests.
-envcloak-core.workspace = true
 envcloak-testkit.workspace = true
 tempfile.workspace = true

@@ -8,8 +8,8 @@
 //!   wait;
 //! - the requests this server's `run_with_secrets` calls opened that are
 //!   still pending (an agent is never shown the person's list, SPEC
-//!   §10b), and the grants rooted at a process in this server's own
-//!   ancestry, whatever their project;
+//!   §10b), and the grants that may cover those calls, whatever their
+//!   project ([`covers_this_server`]);
 //! - coverage, which is not reported in this build (`envcloak agents
 //!   status` has not shipped), and the features that are unavailable,
 //!   with the milestone that brings each (R-M2-01).
@@ -25,7 +25,10 @@ use std::time::Instant;
 
 use envcloak_client::fail::Failure;
 use envcloak_ipc::view::{CheckReport, GrantView};
-use envcloak_policy::{GrantId, PendingState};
+use envcloak_policy::{
+    AgentCatalog, Claims, GrantId, PendingState, ProcessInstance, SubjectEvidence, gather,
+};
+use envcloak_sys::{PeerIdentity, PeerSource};
 use serde_json::{Map, Value, json};
 
 use super::{Ctx, check_keys, object, project_dir, refuse_value_like, req_str, shown, shown_path};
@@ -178,20 +181,58 @@ fn check(
     serde_json::from_slice::<CheckReport>(&report).map_err(|_| failed())
 }
 
-/// The process ids of this process and its ancestors.
-fn ancestry() -> Vec<i32> {
-    let mut out = Vec::new();
-    let Ok(mut pid) = i32::try_from(std::process::id()) else {
-        return out;
+/// This server's own evidence, read as the daemon reads a caller's
+/// (`envcloak_policy::gather`): its ancestry from the kernel, each process
+/// of this user classified with the agent catalog the daemon loads (the
+/// builtin entries and the user's extensions), and the agent markers in its
+/// environment as its claims. The daemon does not tell a client the
+/// evidence it read, so the server reads its own the same way. An
+/// `envcloak run` it starts has this chain above it, in the same session
+/// with the same terminal and markers, so a grant rooted in that chain
+/// covers the run exactly when it covers this process. `None` when it
+/// cannot be read: no grant is shown then.
+fn own_evidence() -> Option<SubjectEvidence> {
+    let pid = i32::try_from(std::process::id()).ok()?;
+    let me = PeerIdentity {
+        uid: envcloak_sys::effective_uid(),
+        pid,
+        start_time: envcloak_sys::process_start_time(pid).ok()?,
+        pidversion: None,
+        // Read from the process table, not a socket; the walk checks the
+        // start time again.
+        source: PeerSource::PeerCred,
     };
-    while pid > 0 && out.len() < envcloak_sys::MAX_ANCESTRY {
-        out.push(pid);
-        match envcloak_sys::proc_info(pid) {
-            Ok(p) if p.ppid != pid => pid = p.ppid,
-            _ => break,
-        }
+    let catalog = match envcloak_core::vault::VaultPaths::for_user() {
+        Ok(p) => AgentCatalog::load(&p.data_dir),
+        Err(_) => AgentCatalog::builtin(),
+    };
+    gather(&me, Claims::from_env(&catalog), &catalog).ok()
+}
+
+/// Whether grant `g` may cover this server's `run_with_secrets` calls, by
+/// SPEC §10b "Match" rules 3 and 4 as the daemon applies them
+/// (`SubjectEvidence::covered_by`): its root is in this server's chain
+/// with its start time, no known agent sits between the root and the
+/// server unless the root is that agent (the agent barrier), a root above
+/// the session is an agent that may be one, and a grant approved for a
+/// terminal subject covers only a terminal subject. So a terminal grant
+/// rooted at the shell that started the agent is not this agent's. The
+/// project, bindings and mode (rules 5 to 7) are each call's, and are not
+/// asked here.
+fn covers_this_server(me: &SubjectEvidence, g: &GrantView) -> bool {
+    if g.root_pid < 1 {
+        return false;
     }
-    out
+    let Ok(start_time) = envcloak_sys::process_start_time(g.root_pid) else {
+        return false;
+    };
+    let root = ProcessInstance {
+        pid: g.root_pid,
+        start_time,
+        pidversion: None,
+        exe: None,
+    };
+    me.covered_by(&root, g.kind)
 }
 
 /// A grant id the daemon sent, in its canonical form (26 Crockford base32
@@ -229,12 +270,12 @@ fn status(args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Fa
 
     let mut client = ctx.connect_by(deadline)?;
     let vault = client.status()?.vault.state;
-    let mine = ancestry();
+    let me = own_evidence();
     let grants: Vec<Value> = client
         .grants_list()?
         .grants
         .iter()
-        .filter(|g| mine.contains(&g.root_pid))
+        .filter(|g| me.as_ref().is_some_and(|me| covers_this_server(me, g)))
         .map(grant)
         .collect();
     // Each request remembered, as it stands now; one that has ended is
