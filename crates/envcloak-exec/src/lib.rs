@@ -31,8 +31,10 @@
 //!    that group. This process outlives them all, so every byte the child
 //!    writes goes through the redactor. A second SIGTERM is sent as
 //!    SIGKILL; without a terminal, once a SIGTERM was passed on, what is
-//!    left of the child's group when the child exits is killed before the
-//!    child is reaped.
+//!    left of the child's group when the child exits is killed, and so it
+//!    is when a SIGTERM comes while the child's output is still read
+//!    after its exit: the child is reaped only after that, so the group
+//!    is still its own.
 //! 5. The exit: [`ChildExit`], the child's code or the signal that ended
 //!    it, which a shell reports as 128 plus its number
 //!    ([`ChildExit::shell_code`]). After the child exits, output is read
@@ -363,17 +365,21 @@ fn follow(
         }
         let waited = envcloak_sys::wait_for_exit(pid);
         // The child has exited and is not reaped yet, so the group it led
-        // is still its own: a run that got a SIGTERM, passed on to the
-        // child, ends what is left of that group (a descendant that ignored
-        // the SIGTERM) before the reap. The forwarder read that SIGTERM
-        // before it passed it on, so before the child's exit.
-        if waited.is_ok() && forwarder.ends_childs_group() {
-            let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
-        }
+        // is still its own; it stays unreaped until its output has been
+        // read. A run that got a SIGTERM, passed on to the child, ends what
+        // is left of that group (a descendant that ignored the SIGTERM) now,
+        // so a descendant holding the output does not hold up the drain.
+        // The forwarder read that SIGTERM before it passed it on, so before
+        // the child's exit.
+        let end_group = || {
+            if waited.is_ok() && forwarder.ends_childs_group() {
+                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+            }
+        };
+        end_group();
         // Signals caught from here on stop the run (review T12-2).
         forwarder.child_exited();
         state.exited();
-        let status = child.wait();
         cutoff.start(DRAIN_LIMIT);
         // Bounded by the cutoff while a descendant holds a pipe, and by a
         // signal that stops the run (review F-49).
@@ -388,6 +394,13 @@ fn follow(
         if let Ok(f) = f {
             let _ = f.join();
         }
+        // The forwarder has read every signal caught before its stop: a
+        // SIGTERM that came while the output was read (it stopped the run)
+        // ends what the child left in its group too, before the child is
+        // reaped and the group can be another's (Codex review of M2-06,
+        // high: `envcloak mcp` cancelling a call in those 2 seconds).
+        end_group();
+        let status = child.wait();
         if let Some(kind) = failed {
             return Err(ExecError::Setup(kind));
         }

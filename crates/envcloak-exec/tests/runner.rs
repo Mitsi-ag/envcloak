@@ -229,6 +229,10 @@ const TESTS: &[Test] = &[
         without_a_terminal_a_sigterm_ends_what_the_child_left_in_its_group,
     ),
     (
+        "without_a_terminal_a_sigterm_while_the_output_drains_ends_the_childs_group",
+        without_a_terminal_a_sigterm_while_the_output_drains_ends_the_childs_group,
+    ),
+    (
         "on_a_terminal_ctrl_c_reaches_the_child_and_the_runner_stays",
         on_a_terminal_ctrl_c_reaches_the_child_and_the_runner_stays,
     ),
@@ -1652,6 +1656,103 @@ fn without_a_terminal_a_sigterm_ends_what_the_child_left_in_its_group() {
         assert!(
             Instant::now() < end,
             "a descendant left in the child's group outlived the run"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_no_canary(&out, &cs);
+    assert_no_canary(&err, &cs);
+    home.assert_clean(&cs);
+}
+
+/// A child that takes an exclusive lock on argv[1] and starts a
+/// descendant that takes one on argv[2], ignores SIGTERM and keeps the
+/// child's standard output, so it holds the runner's pipe; the descendant
+/// lets go of the child's lock. Once the descendant is set up, the child
+/// says `ready` and exits 0, so its lock is free again as soon as it has
+/// exited. The descendant waits until the lifetime whose directory is
+/// argv[3] and stop request argv[4] asks it to stop, or for argv[5]
+/// seconds; its lock is free again only once it is gone.
+const LEAVES_A_WRITER: &str = r#"import fcntl, os, signal, sys, time
+own, held, life, stop, deadline = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], time.time() + float(sys.argv[5])
+mine = open(own, "a")
+fcntl.flock(mine, fcntl.LOCK_EX)
+r, w = os.pipe()
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    mine.close()
+    f = open(held, "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    os.close(r)
+    os.write(w, b"x")
+    os.close(w)
+    while os.path.isdir(life) and not os.path.exists(stop) and time.time() < deadline:
+        time.sleep(0.05)
+    os._exit(0)
+os.close(w)
+os.read(r, 1)
+os.write(1, b"ready\n")
+"#;
+
+/// Without a terminal, a SIGTERM that comes after the child exited, while
+/// a descendant it left in its group still holds the output: the SIGTERM
+/// stops the run (128 plus its number), and the runner ends the
+/// descendant with it, by SIGKILL to the group the child led, which is
+/// still the child's: the child is reaped only once its output has been
+/// read. `envcloak mcp` cancels a call so in those 2 seconds, and nothing
+/// holding the injected values may outlive it (Codex review of M2-06,
+/// high). The SIGTERM is sent once the child's own lock is free, so after
+/// its exit, which the runner sees at once.
+///
+/// Mutation checked: the group not killed once the output has been read
+/// (no second `end_group` before the reap): the runner stops at the
+/// SIGTERM and exits, the descendant runs on holding its lock, and this
+/// fails.
+fn without_a_terminal_a_sigterm_while_the_output_drains_ends_the_childs_group() {
+    let seed = fresh_seed();
+    let cs = all_canaries(seed);
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    let life = Lifetime::new(&home, "drain-sigterm");
+    let own = home.root().join("child.lock");
+    let lock = home.root().join("held.lock");
+    let argv: Vec<OsString> = vec![
+        python3().into(),
+        "-c".into(),
+        LEAVES_A_WRITER.into(),
+        own.clone().into(),
+        lock.clone().into(),
+        life.dir.clone().into(),
+        life.stop_path().into(),
+        FIXTURE_DEADLINE_SECS.to_string().into(),
+    ];
+    let p = Proc::spawn(detached(&home, &setup, &os(&argv)));
+    assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
+    let held = std::fs::File::open(&lock).unwrap();
+    assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
+    // The child's own lock is free once it has exited.
+    let child_lock = std::fs::File::open(&own).unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    while !envcloak_sys::try_lock_exclusive(&child_lock).unwrap() {
+        assert!(Instant::now() < end, "the child did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !envcloak_sys::try_lock_exclusive(&held).unwrap(),
+        "the descendant did not outlive the child"
+    );
+    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    let (status, out, err) = p.finish(Duration::from_secs(30));
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{}", lossy(&err));
+    let end = Instant::now() + Duration::from_secs(10);
+    while !envcloak_sys::try_lock_exclusive(&held).unwrap() {
+        assert!(
+            Instant::now() < end,
+            "a descendant holding the output outlived a SIGTERM that came while it drained"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
