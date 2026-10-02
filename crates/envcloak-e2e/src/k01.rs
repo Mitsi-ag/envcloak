@@ -77,17 +77,28 @@ impl Reach {
     /// The receipt a story step or a status line gives for it on `os`: a
     /// refusal there is `unsupported (sandbox_blocks_socket)` where no
     /// documented allowance reaches the daemon ([`unsupported`]), and
-    /// otherwise a setting without the allowance M2-08 writes.
+    /// otherwise a setting without the allowance M2-08 writes. A sandbox
+    /// that runs no command at all never reached the socket: that is a
+    /// limit of the environment (Claude Code's seccomp helper inside a
+    /// user namespace), not the refusal, and gives no K-01 receipt; the
+    /// receipt for that setting rests on its run outside a user namespace,
+    /// which CI requires (verifier, low).
     pub fn receipt(self, os: &str) -> String {
-        let (why, what) = match self {
+        let why = match self {
             Reach::Reaches => return "qualified: reaches the daemon".to_owned(),
-            Reach::Refused(why) => (why, "the CLI refuses"),
-            Reach::NotRun(why) => (why, "the sandbox runs no command"),
+            Reach::NotRun(why) => {
+                return format!(
+                    "no receipt here (an environment limitation: the sandbox runs no command, \
+                     so the socket is never tried): {why}; K-01's receipt for this setting is \
+                     the run outside a user namespace"
+                );
+            }
+            Reach::Refused(why) => why,
         };
         if unsupported(os) {
-            format!("unsupported ({REASON}): {what}: {why}")
+            format!("unsupported ({REASON}): the CLI refuses: {why}")
         } else {
-            format!("refused without the allowance M2-08 writes on {os}: {what}: {why}")
+            format!("refused without the allowance M2-08 writes on {os}: the CLI refuses: {why}")
         }
     }
 }
@@ -180,4 +191,35 @@ pub fn check_documented() {
         section.contains(&format!("`{REASON}`")),
         "docs/AGENTS.md's K-01 section does not name `{REASON}`"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the CLI's own refusal is K-01's `unsupported` receipt: a
+    /// sandbox that ran no command never tried the socket, and its line
+    /// says it is an environment limitation, never `sandbox_blocks_socket`
+    /// (verifier, low: it printed `unsupported (sandbox_blocks_socket)`).
+    #[test]
+    fn only_the_cli_s_refusal_is_the_unsupported_receipt() {
+        let refused = Reach::Refused(RUNTIME_DIR).receipt("linux");
+        assert!(
+            refused.starts_with(&format!("unsupported ({REASON})")),
+            "{refused}"
+        );
+        for os in ["linux", "macos"] {
+            let not_run = Reach::NotRun(SECCOMP_HELPER).receipt(os);
+            assert!(
+                !not_run.contains("unsupported") && !not_run.contains(REASON),
+                "{not_run}"
+            );
+            assert!(not_run.contains("environment limitation"), "{not_run}");
+        }
+        assert!(
+            !Reach::Refused(RUNTIME_DIR)
+                .receipt("macos")
+                .contains(REASON)
+        );
+    }
 }
