@@ -12,9 +12,9 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::process::{Command, Stdio};
 
 use envcloak_sys::{
-    DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, exchange_beneath, kind_beneath,
-    link_beneath, list_dir, open_dir_beneath, open_elsewhere, read_link_beneath,
-    remove_dir_beneath, rename_beneath, unlink_beneath, volume_of,
+    DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, create_dir_beneath,
+    exchange_beneath, kind_beneath, link_beneath, list_dir, open_dir_beneath, open_elsewhere,
+    read_link_beneath, remove_dir_beneath, rename_beneath, unlink_beneath, volume_of,
 };
 
 fn names(dir: &File) -> Vec<(OsString, DirEntryKind)> {
@@ -89,6 +89,44 @@ fn remove_dir_beneath_removes_only_an_empty_directory() {
     assert_eq!(e.kind(), ErrorKind::NotFound);
     for name in ["", ".", "..", "full/kept", "a\0b"] {
         let e = remove_dir_beneath(&dir, OsStr::new(name)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{name:?}");
+    }
+}
+
+/// `create_dir_beneath` makes a directory in the directory held open,
+/// with the mode it is given: with that directory's path moved and a
+/// symlink to another directory in its place, the new directory is in the
+/// one held open, and nothing is made in the other. An existing name, a
+/// dangling symlink included, is refused, and nothing is made where it
+/// points.
+#[test]
+fn create_dir_beneath_makes_the_directory_in_the_one_held_open() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let held = tmp.path().join("held");
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&held).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let dir = File::open(&held).unwrap();
+    let moved = tmp.path().join("moved");
+    std::fs::rename(&held, &moved).unwrap();
+    symlink(&other, &held).unwrap();
+    create_dir_beneath(&dir, OsStr::new("made"), 0o700).unwrap();
+    let m = std::fs::symlink_metadata(moved.join("made")).unwrap();
+    assert!(m.is_dir());
+    assert_eq!(m.permissions().mode() & 0o777, 0o700);
+    assert!(
+        std::fs::read_dir(&other).unwrap().next().is_none(),
+        "a directory was made through the path, not the handle"
+    );
+    let e = create_dir_beneath(&dir, OsStr::new("made"), 0o700).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::AlreadyExists);
+    symlink(tmp.path().join("nowhere"), moved.join("dangling")).unwrap();
+    let e = create_dir_beneath(&dir, OsStr::new("dangling"), 0o700).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::AlreadyExists);
+    assert!(!tmp.path().join("nowhere").exists());
+    for name in ["", ".", "..", "made/sub", "a\0b"] {
+        let e = create_dir_beneath(&dir, OsStr::new(name), 0o700).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput, "{name:?}");
     }
 }

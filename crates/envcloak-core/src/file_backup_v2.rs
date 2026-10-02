@@ -8,8 +8,9 @@
 //!    against the caps (a file over [`MAX_FILE_V2`], a backup over
 //!    [`MAX_BACKUP_V2`] or over [`MAX_FILES_V2`] files is refused
 //!    [`VaultErrorKind::TooLarge`], never cut), makes a staging directory
-//!    `.files2-<UTC time>-<id>.tmp/` in `backups/`, and starts its `data`
-//!    file (`O_EXCL`, 0600) with a plaintext header and record 0: a fresh
+//!    `.files2-<UTC time>-<id>.tmp/` in `backups/` (through the directory
+//!    it opened, never by its path again), and starts its `data` file
+//!    (`O_EXCL`, 0600) with a plaintext header and record 0: a fresh
 //!    256-bit key for this backup alone, sealed under the vault's `backup`
 //!    subkey.
 //! 2. [`FileBackupV2Writer::put`] takes each chunk of each file in order:
@@ -59,12 +60,12 @@
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use envcloak_sys::{
-    DirEntryKind, MAX_DIR_ENTRIES, create_beneath, kind_beneath, link_beneath, list_dir,
-    open_beneath, open_dir_beneath, remove_dir_beneath, rename_beneath, unlink_beneath,
+    DirEntryKind, MAX_DIR_ENTRIES, create_beneath, create_dir_beneath, kind_beneath, link_beneath,
+    list_dir, open_beneath, open_dir_beneath, remove_dir_beneath, rename_beneath, unlink_beneath,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -322,6 +323,8 @@ pub struct CommittedV2 {
 /// `testing`): each is reported after the step is done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepV2 {
+    /// `backups/` is opened; nothing is made in it yet.
+    Opened,
     /// The staging directory and its `data` file exist.
     Staged,
     /// The header and the sealed key are written.
@@ -799,6 +802,10 @@ impl Vault {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(&backups_path)?;
+        let mut observe = observe;
+        if let Some(f) = observe.as_mut() {
+            f(StepV2::Opened);
+        }
         let id = FileBackupId::generate();
         let ctx = Ctx {
             schema_version,
@@ -806,9 +813,9 @@ impl Vault {
         };
         let final_name = dir_name(&id, created_at);
         let staging_name = format!(".{final_name}{STAGING_SUFFIX}");
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(backups_path.join(&staging_name))?;
+        // Made through `backups/` as opened, never by its path again: a
+        // directory put in its place meanwhile gets nothing.
+        create_dir_beneath(&backups, OsStr::new(&staging_name), 0o700)?;
         let staging = match open_dir_beneath(&backups, OsStr::new(&staging_name)) {
             Ok(d) => d,
             Err(e) => {
