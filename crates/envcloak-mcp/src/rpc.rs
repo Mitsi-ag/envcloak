@@ -103,8 +103,8 @@ impl Id {
     }
 }
 
-/// One line, read.
-#[derive(Debug)]
+/// One line, read. Its `Debug` shows kinds and lengths, never the method
+/// or the parameters, which could hold a pasted key (L-12).
 pub enum Incoming {
     /// A request: answered with a result or an error for its id.
     Request {
@@ -127,6 +127,36 @@ pub enum Incoming {
         code: i64,
         message: &'static str,
     },
+}
+
+impl std::fmt::Debug for Incoming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params = |p: &Option<Map<String, Value>>| p.as_ref().map(Map::len);
+        match self {
+            Incoming::Request {
+                id,
+                method,
+                params: p,
+            } => f
+                .debug_struct("Request")
+                .field("id", id)
+                .field("method_bytes", &method.len())
+                .field("params", &params(p))
+                .finish(),
+            Incoming::Notification { method, params: p } => f
+                .debug_struct("Notification")
+                .field("method_bytes", &method.len())
+                .field("params", &params(p))
+                .finish(),
+            Incoming::Response => f.write_str("Response"),
+            Incoming::Invalid { id, code, message } => f
+                .debug_struct("Invalid")
+                .field("id", id)
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+        }
+    }
 }
 
 /// Reads one line (without its newline).
@@ -313,15 +343,37 @@ mod tests {
         assert_eq!(format!("{:?}", Id::Text("abc".into())), "Id(<3 bytes>)");
     }
 
+    /// What was read is never in its `Debug`: a key pasted as a method, a
+    /// parameter's name or a value shows as lengths only (L-12).
+    ///
+    /// Mutation checked: `Incoming` deriving `Debug`: the key shows and
+    /// this fails.
+    #[test]
+    fn what_was_read_is_never_in_its_debug() {
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        for c in &cs {
+            let k = c.as_str();
+            for line in [
+                json!({"jsonrpc": "2.0", "id": 1, "method": k, "params": {k: k}}),
+                json!({"jsonrpc": "2.0", "method": k, "params": {"x": k}}),
+            ] {
+                let shown = format!("{:?}", parse(line.to_string().as_bytes()));
+                envcloak_testkit::assert_no_canary(shown.as_bytes(), &cs);
+            }
+        }
+    }
+
     /// A string id is echoed only when it cannot hold a key: real Recovery
     /// Kits (seven groups of four symbols joined by `-`), the fixture keys
     /// split at every place by each separator the grammar takes, and a
     /// UUID are refused, and answered with a `null` id; the ids clients
     /// send are taken.
     ///
-    /// Mutation checked: no count of letters and digits (the shape and
+    /// Mutations checked: no count of letters and digits (the shape and
     /// `looks_like_value` alone): every kit, and every split key, is taken
-    /// as an id and this fails.
+    /// as an id and this fails. No `looks_like_value` (the shape and the
+    /// count alone): an AWS access key id, 20 letters and digits, is taken
+    /// as an id and this fails (verifier, M2-06 round 2).
     #[test]
     fn ids_that_could_hold_a_kit_or_a_key_are_refused() {
         let refused = |s: &str| {
@@ -358,6 +410,50 @@ mod tests {
             }
         }
         assert!(refused("123e4567-e89b-12d3-a456-426614174000"));
+        // The registry's key patterns with fewer letters and digits than
+        // the count refuses, built here at run time: AWS access key ids
+        // (`AKIA` or `ASIA` and 16 of `A-Z2-7`: 20) and Stripe keys with a
+        // body of 10 to 17 (16 to 23). Only their pattern refuses them.
+        let seed = envcloak_testkit::fresh_seed();
+        let pick = |alphabet: &[u8], n: usize, salt: u64| -> String {
+            let mut x = (seed ^ salt) | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let at = usize::try_from(x % alphabet.len() as u64).unwrap();
+                    char::from(alphabet[at])
+                })
+                .collect()
+        };
+        let base32 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let alnum = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut short_keys = Vec::new();
+        for (i, start) in ["AK", "AS"].into_iter().enumerate() {
+            for salt in 0..16u64 {
+                short_keys.push(format!(
+                    "{start}IA{}",
+                    pick(base32, 16, salt * 2 + i as u64)
+                ));
+            }
+        }
+        for kind in ["s", "r", "p"] {
+            for mode in ["live", "test"] {
+                for body in 10..=17 {
+                    let salt = body as u64 * 7 + u64::from(kind.as_bytes()[0]);
+                    short_keys.push(format!("{kind}k_{mode}_{}", pick(alnum, body, salt)));
+                }
+            }
+        }
+        for key in &short_keys {
+            let symbols = key.bytes().filter(u8::is_ascii_alphanumeric).count();
+            assert!(symbols <= MAX_ID_SYMBOLS, "{symbols}");
+            assert!(
+                refused(key),
+                "a key of a registry pattern was taken as an id"
+            );
+        }
         for ok in [
             "1",
             "req-1",
