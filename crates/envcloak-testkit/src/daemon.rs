@@ -125,6 +125,12 @@ impl Daemon {
         i32::try_from(self.child.id()).unwrap_or(-1)
     }
 
+    /// Whether the daemon is still running: this very process, not
+    /// reaped and not exited.
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     /// Waits until the log holds a line containing `text`, or `limit`
     /// passes, or the daemon exits.
     pub fn wait_for_log(&mut self, text: &str, limit: Duration) -> bool {

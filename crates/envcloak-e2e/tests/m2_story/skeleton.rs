@@ -1,28 +1,50 @@
 //! Story step S0 (M2 plan task M2-04): the walking skeleton. A pinned host
 //! (Claude Code, Codex), driven by the scripted model with its flags
 //! pinned (§4 setup), runs `envcloak run -- ./emit --quick` in the M1
-//! fixture repo `acme-web` through its own shell tool. The daemon answers
-//! `approval_required`; the person approves from a terminal of their own,
-//! with the statement naming the host; the model's next turn, held until
-//! then by a barrier, reruns the command, which now gets its values; and
-//! nothing the host printed, stored or sent its model holds a value or
-//! any encoding of one, while the host's transcript holds a positive
-//! control the same session printed.
+//! fixture repo `acme-web` through its own shell tool, twice, each
+//! invocation marked with a nonce of its own so its result is told from
+//! any other. What the shell gets is K-01's table (`envcloak_e2e::k01`,
+//! which `agent_hosts` asserts its measurements against and
+//! docs/AGENTS.md records), for the shell setting each case pins:
 //!
-//! Codex runs in its `workspace-write` sandbox with the settings §4 says
-//! the person makes (M2-08's installer will write them): command
-//! networking on, the network proxy on with no domain rule, and one
-//! `unix_sockets` allow rule for EnvCloak's socket. Codex honours that rule
-//! on macOS only; on Linux its sandbox refuses the socket (K-01, measured
-//! by `agent_hosts`), so there S0 checks the other half of K-01: the CLI
-//! fails closed in the sandbox, twice, the daemon sees no request, and the
-//! sweep is as clean, with the positive control found.
+//! - where the table says the shell reaches the daemon (a qualified path),
+//!   the positive story: the daemon answers `approval_required`; the
+//!   person approves from a terminal of their own, with the statement
+//!   naming the host and the grant rooted at the host process itself; the
+//!   model's next turn, held until then by a barrier, reruns the command,
+//!   which now gets its values: every serializer's frames, and a digest
+//!   per runtime and variable equal to the fixture's (an oracle that does
+//!   not depend on the redactor);
+//! - where it says the sandbox blocks the socket (`unsupported
+//!   (sandbox_blocks_socket)`), the refusal, which is not a delivery and
+//!   is reported as such: each invocation's own result is the table's
+//!   refusal and nothing else (the CLI's one `daemon_unverified` line and
+//!   exit 125, or the sandbox running no command at all), the daemon is
+//!   meanwhile running and answers `envcloak status` from outside the
+//!   sandbox with the same environment (so the refusal is the sandbox's,
+//!   not a daemon that stopped or a directory that is gone), it logs no
+//!   request, nothing of the command's output exists, and docs/AGENTS.md
+//!   records the same refusal and `unsupported` for the host.
+//!
+//! Either way nothing the host printed, stored or sent its model holds a
+//! value or any encoding of one, while the host's transcript holds a
+//! positive control the same session printed.
+//!
+//! The cases (§4 setup): Claude Code with its sandbox off (its default:
+//! qualified on both systems); Claude Code with its sandbox on and the
+//! allowance M2-08 writes where it writes one (macOS: the socket's
+//! resolved path; Linux: none, K-01); Codex `exec --sandbox
+//! workspace-write` with the bounded setting M2-08 writes on macOS, and
+//! with no network setting on Linux, where it writes none.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use envcloak_e2e::{Emitters, Harness, Human, NAMES, age, quoted, versions_toml, write_script};
+use envcloak_e2e::k01::{self, Reach, Shell};
+use envcloak_e2e::{
+    Emitters, Harness, Human, NAMES, age, quoted, sha256_hex, text, versions_toml, write_script,
+};
 use envcloak_testkit::agents::{AgentHome, Host, HostFlags, Installed, require};
 use envcloak_testkit::transcripts::Sweep;
 use envcloak_testkit::{Canary, daemon_socket, fresh_seed, labels};
@@ -116,11 +138,22 @@ fn request_id(text: &str) -> String {
         .to_owned()
 }
 
-fn s0(host: Host, name: &str) {
+/// One S0 case: `host` in the shell setting `shell`, which K-01's table
+/// says reaches the daemon here (the positive story) or not (the
+/// refusal).
+fn s0(host: Host, shell: Shell, name: &str) {
     let found = Installed::find(&versions_toml(), host.id(), "native");
     let Some(installed) = require(found, &format!("S0 ({name})")) else {
         return;
     };
+    let os = std::env::consts::OS;
+    let ns = if k01::user_namespace() {
+        " (in a user namespace)"
+    } else {
+        ""
+    };
+    let expected = k01::expected(shell, os, k01::user_namespace())
+        .unwrap_or_else(|| panic!("{shell:?} is not a setting on {os}"));
     let mut h = Harness::start();
     // Gate 8's serializers are the M1 story's; S0 needs output that holds
     // the values, and Python's and serde's are enough.
@@ -130,143 +163,139 @@ fn s0(host: Host, name: &str) {
     // looked for as it is.
     let values: BTreeMap<&str, Vec<u8>> = NAMES.iter().map(|n| (*n, h.value(n).to_vec())).collect();
     let pairs: Vec<(&str, &[u8])> = values.iter().map(|(n, v)| (*n, v.as_slice())).collect();
-    for (label, bytes) in emitters.oracle(&repo.join("emit.json"), &pairs) {
-        h.add_needle(format!("{label} of a fixture"), bytes);
+    let results = emitters.oracle(&repo.join("emit.json"), &pairs);
+    for (label, bytes) in &results {
+        h.add_needle(format!("{label} of a fixture"), bytes.clone());
     }
     vault_and_import(&mut h, &repo);
 
     let mut agent = AgentHome::within(&h.home, host, installed);
-    let flags = match host {
-        Host::ClaudeCode => {
-            // Claude Code cuts a command's output past 30,000 characters
-            // by default; the whole of it is what is swept.
-            agent.set_env("BASH_MAX_OUTPUT_LENGTH", "500000");
-            HostFlags::claude("default", &["Bash"])
-        }
-        Host::Codex => {
-            let socket = daemon_socket(&h.home);
-            agent.codex_config(&format!(
-                "# The person's settings (M2 plan §4; M2-08's installer writes them):\n\
-                 # command networking on, limited to EnvCloak's socket.\n\
-                 [sandbox_workspace_write]\nnetwork_access = true\n\
-                 [features.network_proxy]\nenabled = true\n\
-                 [features.network_proxy.unix_sockets]\n{} = \"allow\"\n",
-                json!(socket.to_str().unwrap())
-            ));
-            HostFlags::codex("workspace-write", "never")
-        }
-    };
+    let flags = configure(&mut agent, shell, &daemon_socket(&h.home));
     // The positive control: a canary this session prints, which the
     // host's transcript must hold, so a clean sweep below means something.
     let control = Canary::new(
         "POSITIVE_CONTROL",
         format!("ecctl-{:016x}{:016x}", fresh_seed(), fresh_seed()),
     );
-    let run_emit = format!(
-        "{} run -- ./emit --quick; echo \"EXIT=$?\"",
-        quoted(h.cli().to_str().unwrap())
+    // Each invocation prints a nonce of its own first, named in two
+    // pieces: whole, it is that invocation's output. `envcloak run`'s
+    // standard output and error (redacted) go to files of that
+    // invocation's own, printed after its exit status: the host merges
+    // the two streams into one, which can cut a frame in two, and Codex
+    // shortens what it sends its model, so the files are what the test
+    // reads frames and digests from (swept with the home, as the tool
+    // result is with the request bodies).
+    let (first_nonce, second_nonce) = (
+        format!("{:016x}", fresh_seed()),
+        format!("{:016x}", fresh_seed()),
     );
+    let run_emit = |nonce: &str| {
+        format!(
+            "printf '%s%s\\n' 'ecinv-' '{nonce}'; {} run -- ./emit --quick >emit-{nonce}.out \
+             2>emit-{nonce}.err; echo \"EXIT=$?\"; cat emit-{nonce}.out emit-{nonce}.err",
+            quoted(h.cli().to_str().unwrap())
+        )
+    };
     // Named in two pieces: whole, it can only be what the command printed.
     let (head, tail) = control.as_str().split_at(control.as_str().len() / 2);
     let print_control = format!("printf '%s%s\\n' {} {}", quoted(head), quoted(tail));
     let script = json!({"steps": [
-        {"say": "I'll run emit through EnvCloak.", "shell": run_emit},
-        {"say": "Approved; running it again.", "shell": run_emit, "after": "approved"},
+        {"say": "I'll run emit through EnvCloak.", "shell": run_emit(&first_nonce)},
+        {"say": "Running it again.", "shell": run_emit(&second_nonce), "after": "approved"},
         {"shell": print_control},
         {"say": "done"},
     ]});
     let requests_before = audit_requests(&h);
+    daemon_answers(&mut h, "before the host starts");
     let mut running = agent.spawn(&script, "Run ./emit through envcloak.", &flags, &repo);
 
-    // The host sent the first run's output to its model: approval needed,
-    // nothing released.
+    // What the first invocation printed, as the host sent it to its
+    // model: the last tool result in the request after the call.
     let held = running.model.wait_for("step 1", &mut running.child);
     h.record(
         "the host's request to its model (S0, first run)",
         &held.body,
     );
     let first = String::from_utf8_lossy(&held.body).into_owned();
-    // Swept clean just above, so its end can be shown.
-    let tail = first
-        .char_indices()
-        .rev()
-        .nth(3000)
-        .map_or(first.as_str(), |(at, _)| &first[at..]);
-    // What the first run printed: the last tool result in the request
-    // (the one for the call the model made last).
     let first_run = last_tool_output(&first);
-    let held_for_approval = first_run.contains("approval_required");
-    let refused = !held_for_approval && sandbox_refuses_the_socket(host);
-    assert!(
-        held_for_approval || refused,
-        "the first run was not held for approval; the request ends:\n{tail}"
-    );
-    if held_for_approval {
-        assert_eq!(
-            exits(&first_run),
-            ["125"],
-            "the first run did not exit 125; the request ends:\n{tail}"
-        );
-        let id = request_id(&first);
-
-        // The person approves from a terminal of their own; the statement
-        // names the host.
-        let approved = approve(&mut h, &repo, &id);
-        assert_eq!(approved.code, 0, "{}", approved.all());
-        let agent_name = match host {
-            Host::ClaudeCode => "Claude Code",
-            Host::Codex => "Codex",
-        };
-        assert!(
-            approved
-                .shown()
-                .contains(&format!("requested by: agent {agent_name}")),
-            "{}",
-            approved.all()
-        );
-        // What the daemon recorded for the request: the subject, and the
-        // process its grant is rooted at, which must be the host this test
-        // started, that very process (its pid, still unreaped, and its
-        // start time), running the pinned entry: a grant rooted above the
-        // host, or at another process, fails the step (review: it
-        // was only printed).
-        let root = rooted_at(&approved.shown())
-            .unwrap_or_else(|why| panic!("the statement's root: {why}\n{}", approved.all()));
-        let host_pid = running.child.id();
-        assert_eq!(
-            root.pid, host_pid,
-            "the grant is rooted at pid {}, not at the host (pid {host_pid})",
-            root.pid
-        );
-        assert_eq!(
-            Some(root.start),
-            envcloak_testkit::agents::start_time(host_pid),
-            "the grant's root is another process instance than the running host"
-        );
-        assert!(
-            is_entry(&root.exe, &agent.installed),
-            "the grant's root runs {}, not the host's pinned entry",
-            root.exe.display()
-        );
-        println!(
-            "measurement: S0 subject host={} os={}: requested by: agent {agent_name}, \
-             rooted at the host process itself (its pid and start time), running the \
-             pinned entry",
-            host.id(),
-            std::env::consts::OS
-        );
-    } else {
-        // K-01 on this system: the CLI cannot open the socket from the
-        // host's sandbox, so it fails closed before it sends a byte, and
-        // the daemon never sees a request.
-        let refusal = refused_once(&first_run)
-            .unwrap_or_else(|why| panic!("the first run: {why}; the request ends:\n{tail}"));
-        println!(
-            "measurement: S0 host={} os={}: unsupported under its sandbox with the bounded \
-             setting (K-01): {refusal}",
-            host.id(),
-            std::env::consts::OS
-        );
+    // Swept clean just above, so its end can be shown.
+    let shown = tail_of(&first_run);
+    match expected {
+        Reach::Reaches => {
+            // Approval needed, nothing released.
+            assert_eq!(
+                invocation(&first_run, &first_nonce),
+                Some(1),
+                "the first run's own output is not there:\n{shown}"
+            );
+            assert!(
+                first_run.contains("approval_required"),
+                "the first run was not held for approval:\n{shown}"
+            );
+            assert_eq!(
+                exits(&first_run),
+                ["125"],
+                "the first run did not exit 125:\n{shown}"
+            );
+            let id = request_id(&first);
+            // The person approves from a terminal of their own; the
+            // statement names the host.
+            let approved = approve(&mut h, &repo, &id);
+            assert_eq!(approved.code, 0, "{}", approved.all());
+            let agent_name = match host {
+                Host::ClaudeCode => "Claude Code",
+                Host::Codex => "Codex",
+            };
+            assert!(
+                approved
+                    .shown()
+                    .contains(&format!("requested by: agent {agent_name}")),
+                "{}",
+                approved.all()
+            );
+            // What the daemon recorded for the request: the subject, and
+            // the process its grant is rooted at, which must be the host
+            // this test started, that very process (its pid, still
+            // unreaped, and its start time), running the pinned entry.
+            let root = rooted_at(&approved.shown())
+                .unwrap_or_else(|why| panic!("the statement's root: {why}\n{}", approved.all()));
+            let host_pid = running.child.id();
+            assert_eq!(
+                root.pid, host_pid,
+                "the grant is rooted at pid {}, not at the host (pid {host_pid})",
+                root.pid
+            );
+            assert_eq!(
+                Some(root.start),
+                envcloak_testkit::agents::start_time(host_pid),
+                "the grant's root is another process instance than the running host"
+            );
+            assert!(
+                is_entry(&root.exe, &agent.installed),
+                "the grant's root runs {}, not the host's pinned entry",
+                root.exe.display()
+            );
+            println!(
+                "measurement: S0 subject host={} os={os} shell={shell:?}: requested by: agent \
+                 {agent_name}, rooted at the host process itself (its pid and start time), \
+                 running the pinned entry",
+                host.id(),
+            );
+        }
+        refusal => {
+            // This invocation's own result is the refusal the table gives,
+            // the daemon is up and answers outside the sandbox, and it saw
+            // no request.
+            if let Err(why) = refused(&first_run, &first_nonce, refusal) {
+                panic!("the first run: {why}:\n{shown}");
+            }
+            daemon_answers(&mut h, "after the first run was refused");
+            assert_eq!(
+                audit_requests(&h),
+                requests_before,
+                "the daemon saw a request from the sandbox"
+            );
+        }
     }
     running.model.release("approved");
     let run = running.wait();
@@ -292,7 +321,7 @@ fn s0(host: Host, name: &str) {
 
     // What the rerun printed: the last tool result in the request after
     // it. The earlier results in the same conversation (the first run's)
-    // say nothing about the rerun.
+    // say nothing about the rerun, and its nonce tells them apart.
     let second = run
         .model
         .requests
@@ -300,27 +329,51 @@ fn s0(host: Host, name: &str) {
         .find(|r| r.pick.as_deref() == Some("step 2"))
         .map(|r| last_tool_output(&String::from_utf8_lossy(&r.body)))
         .unwrap();
-    if held_for_approval {
-        // The rerun got its values: exit 0, and redaction markers where
-        // the values were.
-        assert_eq!(exits(&second), ["0"], "the rerun did not exit 0");
-        assert!(
-            second.contains("[envcloak:openai/acme-web]"),
-            "no redaction marker in the rerun's output"
-        );
-    } else {
-        // Refused again, by the CLI, before it sent a byte: one refusal
-        // line and exit 125 in the rerun's own result; and nothing
-        // reached the daemon.
-        if let Err(why) = refused_once(&second) {
-            panic!("the rerun was not refused: {why}");
+    let shown = tail_of(&second);
+    match expected {
+        Reach::Reaches => {
+            let streams = [".out", ".err"].map(|ext| {
+                std::fs::read(repo.join(format!("emit-{second_nonce}{ext}")))
+                    .unwrap_or_else(|e| panic!("the rerun's {ext} file: {e}"))
+            });
+            if let Err(why) = delivered(
+                &second,
+                &second_nonce,
+                &streams,
+                &emitters,
+                &results,
+                &values,
+            ) {
+                panic!("the rerun: {why}:\n{shown}");
+            }
         }
-        assert_eq!(
-            audit_requests(&h),
-            requests_before,
-            "the daemon saw a request from the sandbox"
-        );
+        refusal => {
+            if let Err(why) = refused(&second, &second_nonce, refusal) {
+                panic!("the rerun: {why}:\n{shown}");
+            }
+            daemon_answers(&mut h, "after the rerun was refused");
+            assert_eq!(
+                audit_requests(&h),
+                requests_before,
+                "the daemon saw a request from the sandbox"
+            );
+            // The receipt: where the host's sandboxed shell is
+            // unsupported, what this run found is what docs/AGENTS.md
+            // records for it.
+            if k01::unsupported(os) {
+                k01::check_documented();
+            }
+        }
     }
+    println!(
+        "receipt: S0 host={} os={os}{ns} shell={shell:?}: {}; {}",
+        host.id(),
+        expected.receipt(os),
+        match expected {
+            Reach::Reaches => "executed: approved and delivered",
+            _ => "expected refusal, verified for both invocations (not a delivery)",
+        }
+    );
 
     // The control is in the tool result the host sent its model.
     let third = run
@@ -363,6 +416,211 @@ fn s0(host: Host, name: &str) {
         .sum();
     assert_eq!(leaks, 0, "{hits}");
     candidate_density(&agent);
+}
+
+/// The settings the person makes for `shell` (M2 plan §4; M2-08's
+/// installer will write the allowances), written into the agent's home
+/// and labelled so, and the host's flags.
+fn configure(agent: &mut AgentHome, shell: Shell, socket: &Path) -> HostFlags {
+    match shell {
+        Shell::ClaudeUnsandboxed
+        | Shell::ClaudeSandboxNoAllowance
+        | Shell::ClaudeSandboxAllowResolved => {
+            // Claude Code cuts a command's output past 30,000 characters
+            // by default; the whole of it is what is swept.
+            agent.set_env("BASH_MAX_OUTPUT_LENGTH", "500000");
+            let mut sandbox = json!({"enabled": true, "failIfUnavailable": true,
+                "autoAllowBashIfSandboxed": true, "allowUnsandboxedCommands": false});
+            if shell == Shell::ClaudeSandboxAllowResolved {
+                // macOS resolves /tmp to /private/tmp before its sandbox
+                // compares a path.
+                let resolved = std::fs::canonicalize(socket).unwrap();
+                sandbox["network"] = json!({"allowUnixSockets": [resolved.to_str().unwrap()]});
+            }
+            let settings = if shell == Shell::ClaudeUnsandboxed {
+                json!({})
+            } else {
+                json!({"_comment": "the person's settings (M2 plan §4)", "sandbox": sandbox})
+            };
+            let dir = agent.home_dir().join(".claude");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+            HostFlags::claude("default", &["Bash"])
+        }
+        Shell::CodexWorkspaceWriteBounded => {
+            agent.codex_config(&format!(
+                "# The person's settings (M2 plan §4; M2-08's installer writes them):\n\
+                 # command networking on, limited to EnvCloak's socket.\n\
+                 [sandbox_workspace_write]\nnetwork_access = true\n\
+                 [features.network_proxy]\nenabled = true\n\
+                 [features.network_proxy.unix_sockets]\n{} = \"allow\"\n",
+                json!(socket.to_str().unwrap())
+            ));
+            HostFlags::codex("workspace-write", "never")
+        }
+        // No network setting: what M2-08 leaves on Linux.
+        Shell::CodexWorkspaceWrite => HostFlags::codex("workspace-write", "never"),
+        other => panic!("S0 does not run {other:?}"),
+    }
+}
+
+/// The daemon the harness started is still running, that very process,
+/// and answers `envcloak status` from outside any sandbox, with the
+/// environment the host's commands get: the check, independent of the
+/// host, that a refusal inside the sandbox is the sandbox's (review: a
+/// stopped daemon or a runtime directory gone would give an unrelated
+/// failure the refusal check alone could take for it).
+fn daemon_answers(h: &mut Harness, when: &str) {
+    assert!(h.daemon.is_running(), "the daemon is not running {when}");
+    let cli = h.cli();
+    let out = h.program(&cli, &["status"], None);
+    let said = text(&out);
+    let pid = h.daemon.pid();
+    assert!(
+        out.status.success() && said.contains(&format!("daemon: running (pid {pid},")),
+        "the daemon (pid {pid}) does not answer outside the sandbox {when}:\n{said}"
+    );
+}
+
+/// How many lines of `output` are the invocation marker `ecinv-<nonce>`;
+/// `None` when there is none.
+fn invocation(output: &str, nonce: &str) -> Option<usize> {
+    let marker = format!("ecinv-{nonce}");
+    let n = output.lines().filter(|l| l.trim() == marker).count();
+    (n > 0).then_some(n)
+}
+
+/// What only a command that got its values prints: a serializer's frame,
+/// a digest, the serializer list, a redaction marker.
+const DELIVERY_TRACES: [&str; 5] = ["<W|", "<B|", "sha256 ", "SERIALIZERS ", "[envcloak:"];
+
+/// Whether `output` is the invocation `nonce`'s refusal as K-01's table
+/// gives it, and nothing else: for a CLI refusal, the marker once, then
+/// exactly one `envcloak:` line, the table's message with "nothing was
+/// sent to it", and exit 125; for a sandbox that runs no command, its
+/// message and no marker, `envcloak:` line or exit at all. In both, no
+/// trace of a delivery. Why not, when it is not.
+fn refused(output: &str, nonce: &str, want: Reach) -> Result<(), String> {
+    if let Some(trace) = DELIVERY_TRACES.iter().find(|t| output.contains(*t)) {
+        return Err(format!("a trace of a delivery ({trace:?})"));
+    }
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("envcloak: "))
+        .collect();
+    match want {
+        Reach::Refused(message) => {
+            if invocation(output, nonce) != Some(1) {
+                return Err(format!("not invocation {nonce}'s own output"));
+            }
+            let after = output
+                .split(&format!("ecinv-{nonce}"))
+                .nth(1)
+                .unwrap_or_default();
+            let refusal = format!("envcloak: {message}{}", k01::NOTHING_SENT);
+            match (lines.as_slice(), exits(after).as_slice()) {
+                ([line], ["125"]) if *line == refusal && after.contains(&refusal) => Ok(()),
+                (lines, codes) => Err(format!(
+                    "not the refusal {refusal:?} and exit 125: {} `envcloak:` line(s) \
+                     {lines:?}, exit codes {codes:?}",
+                    lines.len()
+                )),
+            }
+        }
+        Reach::NotRun(message) => {
+            if !output.contains(message) {
+                return Err(format!("the sandbox did not say {message:?}"));
+            }
+            if invocation(output, nonce).is_some() || !lines.is_empty() || !exits(output).is_empty()
+            {
+                return Err("the command ran".to_owned());
+            }
+            Ok(())
+        }
+        Reach::Reaches => Err("no refusal is expected".to_owned()),
+    }
+}
+
+/// Whether the invocation `nonce` delivered: in the tool result the host
+/// sent its model, the marker once and exit 0; in what `envcloak run`
+/// printed on its standard output and error (`streams`, each written by
+/// one writer, so no frame is cut), every serializer listed with every
+/// result, both frames of every result the oracle made, a digest per
+/// serializer and variable equal to the fixture value's SHA-256 (what the
+/// command received, checked by an oracle that does not depend on the
+/// redactor), and a redaction marker for every binding on both streams.
+/// Why not, when it is not.
+fn delivered(
+    output: &str,
+    nonce: &str,
+    streams: &[Vec<u8>; 2],
+    emitters: &Emitters,
+    results: &[(String, Vec<u8>)],
+    values: &BTreeMap<&str, Vec<u8>>,
+) -> Result<(), String> {
+    if invocation(output, nonce) != Some(1) {
+        return Err(format!("not invocation {nonce}'s own output"));
+    }
+    if exits(output) != ["0"] {
+        return Err(format!("exit codes {:?}, not 0", exits(output)));
+    }
+    let [out, err] = streams
+        .each_ref()
+        .map(|s| String::from_utf8_lossy(s).into_owned());
+    for slug in [
+        "openai/acme-web",
+        "stripe/acme-web",
+        "github/acme-web",
+        "database-url/acme-web",
+    ] {
+        let marker = format!("[envcloak:{slug}]");
+        if !out.contains(&marker) || !err.contains(&marker) {
+            return Err(format!("no redaction marker for {slug} on both streams"));
+        }
+    }
+    let output = format!("{out}{err}");
+    let tags = emitters.tags();
+    let listed = format!("SERIALIZERS {} RESULTS {}", tags.join(","), results.len());
+    if !output.contains(&listed) || !output.contains("DONE") {
+        return Err(format!("no {listed:?} and DONE"));
+    }
+    for (label, _) in results {
+        for frame in ["<W|", "<B|"] {
+            if !output.contains(&format!("{frame}{label}=")) {
+                return Err(format!("no {frame}{label} frame"));
+            }
+        }
+    }
+    let digests: BTreeMap<(&str, &str), &str> = out
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.trim().split(' ');
+            (w.next() == Some("sha256")).then_some(())?;
+            Some(((w.next()?, w.next()?), w.next()?))
+        })
+        .collect();
+    for tag in &tags {
+        for name in NAMES {
+            let want = sha256_hex(&values[name]);
+            if digests.get(&(tag.as_str(), name)) != Some(&want.as_str()) {
+                return Err(format!(
+                    "the {tag} digest of {name} is not the fixture's ({:?})",
+                    digests.get(&(tag.as_str(), name))
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The last 3,000 characters of `text`, for a failure message (what it
+/// is taken from was swept first).
+fn tail_of(text: &str) -> &str {
+    text.char_indices()
+        .rev()
+        .nth(3000)
+        .map_or(text, |(at, _)| &text[at..])
 }
 
 /// The process an approval statement says the grant is rooted at.
@@ -411,18 +669,6 @@ fn is_entry(exe: &Path, installed: &Installed) -> bool {
     canonical(exe).is_some_and(|e| pinned.contains(&Some(e)))
 }
 
-/// Whether `host`'s sandbox, with the settings §4 pins, is measured to
-/// refuse the daemon's socket on this system (K-01), so that S0 checks the
-/// refusal instead of the approval. Codex 0.159.2 honours `unix_sockets`
-/// rules on macOS only (`unix_socket_permissions_supported` in its
-/// `network-proxy/src/runtime.rs` is `cfg!(target_os = "macos")`); on
-/// Linux its network seccomp filter in proxy-routed mode refuses every
-/// Unix socket unless all are allowed (`linux-sandbox/src/landlock.rs`),
-/// which K-01 rules out. `agent_hosts` measures both systems.
-fn sandbox_refuses_the_socket(host: Host) -> bool {
-    host == Host::Codex && cfg!(target_os = "linux")
-}
-
 /// The text of the last tool result in a request body (Anthropic
 /// Messages or OpenAI Responses): what the call the model made last
 /// printed, as the host sent it.
@@ -461,29 +707,6 @@ fn exits(output: &str) -> Vec<&str> {
         .lines()
         .filter_map(|l| l.trim().strip_prefix("EXIT="))
         .collect()
-}
-
-/// The CLI's refusal in one command's output (K-01's fail-closed half):
-/// exactly one `envcloak: daemon_unverified: ...` or `envcloak:
-/// daemon_unavailable: ...` line and `EXIT=125`, the exit of `run`'s own
-/// failures. The refusal line, or why the output is not that.
-fn refused_once(output: &str) -> Result<String, String> {
-    let lines: Vec<&str> = output
-        .lines()
-        .map(str::trim)
-        .filter(|l| {
-            l.starts_with("envcloak: daemon_unverified: ")
-                || l.starts_with("envcloak: daemon_unavailable: ")
-        })
-        .collect();
-    let codes = exits(output);
-    match (lines.as_slice(), codes.as_slice()) {
-        ([line], ["125"]) => Ok((*line).to_owned()),
-        (lines, codes) => Err(format!(
-            "{} refusal line(s), exit codes {codes:?}",
-            lines.len()
-        )),
-    }
 }
 
 /// The number of `request` lines in the daemons' audit log so far.
@@ -591,12 +814,150 @@ fn the_statement_s_root_is_read_whole_or_refused() {
     }
 }
 
+/// The refusal check takes only the table's refusal of this very
+/// invocation, and nothing that would also be there if the daemon had
+/// stopped, another invocation's result came back, or the command had
+/// run (Codex review, high: any `daemon_unavailable` or
+/// `daemon_unverified` line with exit 125 passed).
 #[test]
-fn s0_claude_code_runs_envcloak_and_the_person_approves() {
-    s0(Host::ClaudeCode, "Claude Code");
+fn a_refusal_is_this_invocation_s_and_the_table_s() {
+    let ok = format!(
+        "ecinv-n1\nenvcloak: {}{}\nEXIT=125\n",
+        k01::RUNTIME_DIR,
+        k01::NOTHING_SENT
+    );
+    assert_eq!(refused(&ok, "n1", Reach::Refused(k01::RUNTIME_DIR)), Ok(()));
+    let not_run = format!(
+        "Exit code 1 /bin/bash: x: Permission denied {}",
+        k01::SECCOMP_HELPER
+    );
+    assert_eq!(
+        refused(&not_run, "n1", Reach::NotRun(k01::SECCOMP_HELPER)),
+        Ok(())
+    );
+    let unavailable = "ecinv-n1\nenvcloak: daemon_unavailable: the EnvCloak daemon is not \
+                       running; start it\nEXIT=125\n";
+    let other_unverified = format!(
+        "ecinv-n1\nenvcloak: {}{}\nEXIT=125\n",
+        k01::NO_PEER_PID,
+        k01::NOTHING_SENT
+    );
+    let another_invocation = ok.replace("n1", "n0");
+    let twice = format!("{ok}{ok}");
+    let ran = format!("{ok}<W|OPENAI_API_KEY/raw=[envcloak:openai/acme-web]\n");
+    let exit_1 = ok.replace("EXIT=125", "EXIT=1");
+    for bad in [
+        unavailable.to_owned(),
+        other_unverified,
+        another_invocation,
+        twice,
+        ran,
+        exit_1,
+        String::new(),
+    ] {
+        assert!(
+            refused(&bad, "n1", Reach::Refused(k01::RUNTIME_DIR)).is_err(),
+            "{bad:?}"
+        );
+    }
+    for bad in [ok.clone(), "Exit code 1".to_owned()] {
+        assert!(
+            refused(&bad, "n1", Reach::NotRun(k01::SECCOMP_HELPER)).is_err(),
+            "{bad:?}"
+        );
+    }
 }
 
+/// K-01's table and docs/AGENTS.md agree: every refusal the table gives
+/// is recorded there, and the K-01 section names both hosts `unsupported
+/// (sandbox_blocks_socket)` on Linux.
 #[test]
-fn s0_codex_runs_envcloak_and_the_person_approves() {
-    s0(Host::Codex, "Codex");
+fn k01_s_table_is_what_the_docs_record() {
+    k01::check_documented();
+    for (shell, os, ns, want) in [
+        (Shell::ClaudeUnsandboxed, "linux", true, Reach::Reaches),
+        (
+            Shell::ClaudeSandboxNoAllowance,
+            "linux",
+            true,
+            Reach::NotRun(k01::SECCOMP_HELPER),
+        ),
+        (
+            Shell::ClaudeSandboxNoAllowance,
+            "linux",
+            false,
+            Reach::Refused(k01::RUNTIME_DIR),
+        ),
+        (
+            Shell::ClaudeSandboxAllowResolved,
+            "macos",
+            false,
+            Reach::Reaches,
+        ),
+        (
+            Shell::CodexWorkspaceWriteBounded,
+            "macos",
+            false,
+            Reach::Reaches,
+        ),
+        (
+            Shell::CodexWorkspaceWrite,
+            "linux",
+            true,
+            Reach::Refused(k01::RUNTIME_DIR),
+        ),
+    ] {
+        assert_eq!(
+            k01::expected(shell, os, ns),
+            Some(want),
+            "{shell:?} {os} {ns}"
+        );
+    }
+    assert_eq!(
+        k01::expected(Shell::ClaudeSandboxAllowResolved, "linux", false),
+        None
+    );
+}
+
+/// Claude Code with its sandbox off: qualified on both systems.
+#[test]
+fn s0_claude_code_runs_envcloak_and_the_person_approves() {
+    s0(Host::ClaudeCode, Shell::ClaudeUnsandboxed, "Claude Code");
+}
+
+/// Claude Code with its sandbox on: macOS with the socket allowance M2-08
+/// writes (qualified); Linux with none (K-01: refused).
+#[test]
+fn s0_claude_code_sandboxed() {
+    let shell = if cfg!(target_os = "macos") {
+        Shell::ClaudeSandboxAllowResolved
+    } else {
+        Shell::ClaudeSandboxNoAllowance
+    };
+    s0(Host::ClaudeCode, shell, "Claude Code, sandboxed");
+}
+
+/// Claude Code with its sandbox on and no socket allowance (a person who
+/// switched the sandbox on without M2-08's allowance; on Linux the same
+/// setting as [`s0_claude_code_sandboxed`]): refused on both systems, so
+/// the refusal story runs on macOS too.
+#[test]
+fn s0_claude_code_sandboxed_without_an_allowance() {
+    s0(
+        Host::ClaudeCode,
+        Shell::ClaudeSandboxNoAllowance,
+        "Claude Code, sandboxed without an allowance",
+    );
+}
+
+/// Codex `exec --sandbox workspace-write`: macOS with the bounded setting
+/// M2-08 writes (qualified); Linux with none (K-01: refused).
+#[test]
+fn s0_codex_workspace_write() {
+    let shell = if cfg!(target_os = "macos") {
+        Shell::CodexWorkspaceWriteBounded
+    } else {
+        Shell::CodexWorkspaceWrite
+    };
+    s0(Host::Codex, shell, "Codex");
 }
