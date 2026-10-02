@@ -30,6 +30,10 @@
 //!   `envcloak-probe-model` ([`agents::Model`]), and
 //!   [`transcripts`]: the stores they write into and their sweep, with raw
 //!   counts per store (M2 plan task M2-04).
+//! - [`lifeline`]: owner-lifetime witnesses for fixture processes (a
+//!   socket every holder keeps until it exits), and [`controlled`]: a
+//!   server's input and output under a test's control, each with a witness
+//!   of its drop (M2 plan task M2-06).
 //! - [`testkit_bin`]: this crate's programs, for the tests of other crates:
 //!   `fixture-agent`, the stand-in agent the builtin agent catalog knows,
 //!   and `ec-probe`, a caller that connects to a socket after escaping its
@@ -38,12 +42,14 @@
 
 pub mod agents;
 mod canary;
+pub mod controlled;
 pub mod crash;
 mod daemon;
 mod detect;
 mod encode;
 mod fresh;
 mod home;
+pub mod lifeline;
 pub mod transcripts;
 
 pub use canary::{Canary, by_label, canaries, fresh_seed, labels};
