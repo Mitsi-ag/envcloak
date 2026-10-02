@@ -840,3 +840,46 @@ fn a_leftover_changed_or_replaced_while_it_is_checked_is_kept() {
         }
     }
 }
+
+/// What a swap puts in the file's place must be the file written: another
+/// file put under the restore's temporary name once its last check passed
+/// (a barrier at `Checked`) is swapped in by the swap, so the names are
+/// swapped back, the file the change left keeps its name, the other file
+/// is kept under the temporary name the restore names (`moved_aside`),
+/// and nothing is answered as restored.
+#[test]
+fn a_file_put_under_the_new_name_before_the_swap_is_never_left_in_place() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join(".mcp.json");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(d.path()).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    let theirs: &[u8] = b"{\"mcpServers\": {\"planted\": {}}}\n";
+    let mut did = 0;
+    let e = restore_over_left_observed(
+        &r,
+        Path::new(".mcp.json"),
+        &file,
+        &mut |c| Some(chunk_of(&body, c)),
+        &mut |at| {
+            if at != Inside::Checked {
+                return;
+            }
+            let (temp, _) = new_names(d.path()).remove(0);
+            let other = d.path().join("other");
+            std::fs::write(&other, theirs).unwrap();
+            std::fs::rename(&other, d.path().join(temp)).unwrap();
+            did += 1;
+        },
+    )
+    .unwrap_err();
+    assert_eq!(did, 1);
+    assert_eq!(e.kind, ModifyErrorKind::MovedAside);
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        LEFT,
+        "the other file was left in place"
+    );
+    assert_eq!(std::fs::read(d.path().join(&e.rel)).unwrap(), theirs);
+}

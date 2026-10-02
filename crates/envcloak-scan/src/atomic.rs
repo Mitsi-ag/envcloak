@@ -11,15 +11,16 @@
 //! - [`replace_atomically`] writes the new contents to a new file beside
 //!   the old one (`O_EXCL`, the old file's mode), flushes it, checks the
 //!   old file again, swaps the two names in one step and checks that what
-//!   came out is the file checked (swapping back when another program
-//!   saved over the name meanwhile), then removes it and flushes the
-//!   directory. A crash leaves the old file or the new one, never part of
+//!   came out is the file checked and what went in the file it wrote
+//!   (swapping back when another program saved over either name
+//!   meanwhile), then removes it and flushes the directory. A crash leaves the old file or the new one, never part of
 //!   either; a leftover temporary file is never read by anyone. On a file
 //!   system that cannot swap names (macOS HFS+, some network and FUSE
 //!   ones), the new file is renamed over the old one right after the
 //!   check, and a save landing between the two is replaced.
 //! - [`create_atomically`] writes a new file the same way and links it
-//!   into place only if the name is still free.
+//!   into place only if the name is still free, answering only once the
+//!   name holds the file it wrote.
 //! - [`remove_checked`] removes a file only when it is unchanged since it
 //!   was read, not modified within [`MIN_AGE`], and not open in another
 //!   process as far as the system can tell
@@ -566,12 +567,16 @@ fn replace_in_using(
     match swap(dir, &temp, name) {
         Ok(()) => {
             observe(Inside::Exchanged);
+            // A swap takes whatever has each name at that moment: what came
+            // out must be the file checked, and what went in the file
+            // written (another file put under the temporary name meanwhile
+            // is never left in the file's place).
             let checked = match open_file(dir, &temp, usize::MAX) {
                 Ok((mut out, m)) if is_checked(&m, expect) => left.is_none_or(|want| {
                     digest_of(&mut out, &FileStamp::of(&m)).is_ok_and(|got| got == *want)
                 }),
                 _ => false,
-            };
+            } && holds(dir, name, &f);
             if !checked {
                 return Err(swap_back(swap, dir, rel, name, &temp, &f));
             }
@@ -592,6 +597,12 @@ fn replace_in_using(
             if let Err(e) = rename_beneath(dir, &temp, name) {
                 let _ = unlink_beneath(dir, &temp);
                 return Err(fail(io(&e)));
+            }
+            // A rename takes whatever has the temporary name at that
+            // moment: another file put there is never answered as written.
+            if !holds(dir, name, &f) {
+                let _ = sync_file(dir);
+                return Err(fail(ModifyErrorKind::Changed));
             }
         }
         Err(e) => {
@@ -698,21 +709,53 @@ pub fn create_atomically(
     let (dir, name) = r
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
-    let temp = temp_name(&name, "new");
-    let f = write_new(&dir, &temp, new, mode).map_err(|e| fail(io(&e)))?;
-    let linked = link_beneath(&dir, &temp, &name);
-    let unlinked = unlink_beneath(&dir, &temp);
+    create_in(&dir, &name, new, mode, &mut || {}).map_err(fail)
+}
+
+/// [`create_atomically`] in `dir`, calling `written` once the new file is
+/// written and flushed under its temporary name, before it is linked to
+/// `name` (a unit test puts another file under the temporary name there).
+/// A link takes whatever has the temporary name at that moment, so `name`
+/// is then opened (never through a symlink) and compared by device and
+/// inode with the file written: another file put under the temporary name
+/// is never answered as created ([`ModifyErrorKind::Changed`]; it keeps
+/// `name`, nothing is removed).
+fn create_in(
+    dir: &File,
+    name: &OsStr,
+    new: &[u8],
+    mode: u32,
+    written: &mut dyn FnMut(),
+) -> Result<FileStamp, ModifyErrorKind> {
+    let temp = temp_name(name, "new");
+    let f = write_new(dir, &temp, new, mode).map_err(|e| io(&e))?;
+    written();
+    let linked = link_beneath(dir, &temp, name);
+    let unlinked = unlink_beneath(dir, &temp);
     match linked {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(fail(ModifyErrorKind::Exists));
+            return Err(ModifyErrorKind::Exists);
         }
-        Err(e) => return Err(fail(io(&e))),
+        Err(e) => return Err(io(&e)),
     }
-    unlinked.map_err(|e| fail(io(&e)))?;
-    sync_file(&dir).map_err(|e| fail(io(&e)))?;
-    let m = f.metadata().map_err(|e| fail(io(&e)))?;
+    unlinked.map_err(|e| io(&e))?;
+    sync_file(dir).map_err(|e| io(&e))?;
+    if !holds(dir, name, &f) {
+        return Err(ModifyErrorKind::Changed);
+    }
+    let m = f.metadata().map_err(|e| io(&e))?;
     Ok(FileStamp::of(&m))
+}
+
+/// Whether `name` in `dir` is the file `f` is open on: a regular file of
+/// this user, never through a symlink, with `f`'s device and inode.
+fn holds(dir: &File, name: &OsStr, f: &File) -> bool {
+    let Ok(ours) = f.metadata() else {
+        return false;
+    };
+    open_file(dir, name, usize::MAX)
+        .is_ok_and(|(_, m)| (m.dev(), m.ino()) == (ours.dev(), ours.ino()))
 }
 
 /// What must hold before plaintext is removed or rewritten: the file in
@@ -894,5 +937,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"rewritten");
+    }
+
+    /// Puts a file of `bytes` under `temp` in `dir`, as another program
+    /// renaming its own file there would.
+    fn put_under(dir: &Path, temp: &OsStr, bytes: &[u8]) {
+        let other = dir.join("another-programs-file");
+        std::fs::write(&other, bytes).unwrap();
+        std::fs::rename(&other, dir.join(temp)).unwrap();
+    }
+
+    /// The temporary name of the one new file in `dir` besides `name`.
+    fn new_temp(dir: &Path, name: &str) -> OsString {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .find(|n| new_name_of(OsStr::new(name), n))
+            .unwrap()
+    }
+
+    /// A file created, or renamed into place where names cannot be
+    /// swapped, is answered as written only when its name holds the file
+    /// written: a link and a rename take whatever has the temporary name at
+    /// that moment. Another file put under the temporary name once the new
+    /// file is flushed makes the call fail (`changed`), and that file is
+    /// kept, under the name.
+    #[test]
+    fn a_link_or_rename_into_place_answers_only_for_the_file_written() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = File::open(d.path()).unwrap();
+        let name = OsStr::new("envcloak.toml");
+        let e = create_in(&dir, name, b"ours", 0o600, &mut || {
+            put_under(d.path(), &new_temp(d.path(), "envcloak.toml"), b"theirs");
+        })
+        .unwrap_err();
+        assert_eq!(e, ModifyErrorKind::Changed);
+        assert_eq!(std::fs::read(d.path().join(name)).unwrap(), b"theirs");
+        std::fs::remove_file(d.path().join(name)).unwrap();
+        create_in(&dir, name, b"ours", 0o600, &mut || {}).unwrap();
+        assert_eq!(std::fs::read(d.path().join(name)).unwrap(), b"ours");
+
+        let p = d.path().join("settings.json");
+        std::fs::write(&p, b"before").unwrap();
+        let stamp = FileStamp::of(&std::fs::symlink_metadata(&p).unwrap());
+        let mut fill = |f: &mut File| f.write_all(b"rewritten").map_err(|e| io(&e));
+        let e = replace_in_using(
+            cannot_swap,
+            &dir,
+            Path::new("settings.json"),
+            OsStr::new("settings.json"),
+            &mut fill,
+            &stamp,
+            None,
+            &mut |at| {
+                if at == Inside::Checked {
+                    put_under(d.path(), &new_temp(d.path(), "settings.json"), b"theirs");
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, ModifyErrorKind::Changed);
+        assert_eq!(std::fs::read(&p).unwrap(), b"theirs");
     }
 }
