@@ -1772,8 +1772,32 @@ fn backup_file(name: &str) -> bool {
 /// names a result left, each through `dir`, then the directory by its
 /// name. Anything else in it stays, and so does the directory. Returns
 /// whether the directory went: `false` when it was gone already or
-/// something else is left in it.
+/// something else is left in it. When files went from a directory that
+/// stays (something else is left in it, or a removal failed), `dir` is
+/// flushed, so their removal is on disk too; a failed flush is the error
+/// when nothing failed before it. A directory that went is flushed with
+/// `backups/` ([`purge_v2`]).
 fn empty_and_remove(backups: &File, name: &OsStr, dir: &File) -> Result<bool, VaultError> {
+    let mut unlinked = false;
+    let went = remove_backup_files(dir, &mut unlinked).and_then(|()| {
+        match remove_dir_beneath(backups, name) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || not_empty(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    });
+    if unlinked && !matches!(went, Ok(true)) {
+        let flushed = sync_file(dir);
+        if let (Ok(_), Err(e)) = (&went, flushed) {
+            return Err(e.into());
+        }
+    }
+    went
+}
+
+/// Unlinks a backup's own files from `dir` ([`backup_file`]), regular
+/// files only, each through `dir`; sets `unlinked` once one went.
+fn remove_backup_files(dir: &File, unlinked: &mut bool) -> Result<(), VaultError> {
     for entry in list_dir(dir, MAX_DIR_ENTRIES)? {
         if !entry.name.to_str().is_some_and(backup_file) {
             continue;
@@ -1789,29 +1813,30 @@ fn empty_and_remove(backups: &File, name: &OsStr, dir: &File) -> Result<bool, Va
             continue;
         }
         match unlink_beneath(dir, &entry.name) {
-            Ok(()) => {}
+            Ok(()) => *unlinked = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
     }
-    match remove_dir_beneath(backups, name) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound || not_empty(&e) => Ok(false),
-        Err(e) => Err(e.into()),
-    }
+    Ok(())
 }
 
-/// What a purge removed, and the first thing it could not.
+/// What a purge removed, whether it changed `backups/` since it last
+/// flushed it, and the first thing it could not do.
 #[derive(Default)]
 struct Purged {
     removed: usize,
+    unflushed: bool,
     failed: Option<VaultError>,
 }
 
 impl Purged {
     fn count(&mut self, r: Result<bool, VaultError>) {
         match r {
-            Ok(true) => self.removed += 1,
+            Ok(true) => {
+                self.removed += 1;
+                self.unflushed = true;
+            }
             Ok(false) => {}
             Err(e) => {
                 self.failed.get_or_insert(e);
@@ -1853,12 +1878,18 @@ pub fn purge_file_backups_v2(p: &VaultPaths, now: u64) -> Result<usize, VaultErr
 ///
 /// One backup it cannot remove does not stop it: a directory something
 /// else is left in stays, deliberately (counted as not removed), and
-/// after any other failure the others are still removed. The removals are
-/// flushed to disk before it returns, also when it then reports a failure.
+/// after any other failure the others are still removed. A committed
+/// backup's rename out of the listing is flushed before any of its files
+/// goes, and none goes when that flush fails. Every change is flushed to
+/// disk before it returns, also when no directory went and when it then
+/// reports a failure: a rename and a removal in `backups/` by flushing
+/// `backups/`, the files removed from a directory that stays by flushing
+/// that directory.
 ///
 /// # Errors
 /// When the directory cannot be read or flushed, or the first backup or
-/// staging directory that could not be removed, after the rest went.
+/// staging directory that could not be removed or flushed, after the rest
+/// went.
 pub fn purge_file_backups_v2_except(
     p: &VaultPaths,
     now: u64,
@@ -1915,7 +1946,7 @@ fn purge_v2(
             continue;
         };
         let removed = if listed_id(&entry.name).is_some() {
-            purge_committed(&backups, name, now, observe)
+            purge_committed(&backups, name, now, &mut purged.unflushed, observe)
         } else if staging_name(name) {
             purge_staging(&backups, name, now, &mut in_progress, observe)
         } else if purged_name(name) {
@@ -1931,20 +1962,29 @@ fn purge_v2(
         };
         purged.count(removed);
     }
-    if purged.removed > 0 {
-        sync_file(&backups)?;
+    // Whatever changed `backups/` since its last flush, also when no
+    // directory went or something failed: renamed out of the listing,
+    // removed.
+    if purged.unflushed {
+        if let Err(e) = sync_file(&backups) {
+            purged.failed.get_or_insert(e.into());
+        }
     }
     purged.failed.map_or(Ok(purged.removed), Err)
 }
 
 /// Removes the committed backup `name` of `backups` when it was made more
 /// than [`FILE_BACKUP_RETENTION`] before `now`, first renaming it out of
-/// the listing. Returns whether its directory went; a directory whose
-/// name names another meanwhile is left as it is, as one gone.
+/// the listing and flushing `backups/`, so no crash brings it back listed
+/// with records missing: a failed flush removes none of them. Returns
+/// whether its directory went; a directory whose name names another
+/// meanwhile is left as it is, as one gone. Sets `unflushed` while
+/// `backups/` holds a change not yet flushed.
 fn purge_committed(
     backups: &File,
     name: &str,
     now: u64,
+    unflushed: &mut bool,
     observe: &mut dyn FnMut(PurgeStepV2<'_>),
 ) -> Result<bool, VaultError> {
     let os = OsStr::new(name);
@@ -1960,6 +2000,9 @@ fn purge_committed(
     }
     let hidden = format!(".{name}{PURGE_SUFFIX}");
     rename_beneath(backups, os, OsStr::new(&hidden))?;
+    *unflushed = true;
+    sync_file(backups)?;
+    *unflushed = false;
     observe(PurgeStepV2::Removing(&hidden));
     empty_and_remove(backups, OsStr::new(&hidden), &dir)
 }
