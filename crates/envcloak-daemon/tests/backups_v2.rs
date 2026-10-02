@@ -1726,6 +1726,73 @@ fn a_lease_serves_only_the_terminal_it_is_on_when_the_chunk_goes_out() {
     }
 }
 
+/// A lock stops a restore or a result in flight, also when the vault is
+/// unlocked again before the call goes on: the daemon is stopped by a
+/// barrier in `open_restore` after the proof and the check of the whole
+/// backup, before the lease, and in `record_result` before the result is
+/// put in place, and the vault is locked (and, the second time, unlocked
+/// again) meanwhile. The call then ends `vault_locked`: no lease is open
+/// and no result recorded, and both go through once asked again.
+#[test]
+fn a_lock_stops_a_restore_or_a_result_in_flight() {
+    for site in ["backup.v2.open_restore", "backup.v2.record_result"] {
+        for relock in [false, true] {
+            let what = format!("{site}, unlocked again: {relock}");
+            let mut f = Fixture::pausing(Some(site));
+            let files = [Spec::made(&f.claude("projects/p/o.jsonl"), 700, 22)];
+            let id = f.backup("scrub", &files);
+            let sha = files[0].sha(f.files_cs());
+            let paths = f.paths();
+            let pass = passphrase(&f.cs);
+            let in_flight: std::thread::JoinHandle<Result<(), ClientError>> = {
+                let id = id.clone();
+                if site == "backup.v2.open_restore" {
+                    std::thread::spawn(move || {
+                        Client::connect(&paths)?
+                            .backup_v2_open_restore(&id, pass, false, true, &[])
+                            .map(drop)
+                    })
+                } else {
+                    std::thread::spawn(move || {
+                        Client::connect(&paths)?
+                            .backup_v2_record_result(&id, 0, &sha)
+                            .map(drop)
+                    })
+                }
+            };
+            f.wait_paused(site);
+            client(&f.home).lock().unwrap();
+            if relock {
+                client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
+            }
+            f.release();
+            let e = in_flight
+                .join()
+                .unwrap()
+                .err()
+                .unwrap_or_else(|| panic!("{what}: the call in flight went through the lock"));
+            assert_eq!(rpc(e).0, ErrorKind::VaultLocked, "{what}");
+            if !relock {
+                client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
+            }
+            let l = f.list();
+            assert_eq!(l.open_leases, 0, "{what}");
+            assert_eq!(
+                l.backups[0].state,
+                BackupStateView::AwaitingResult,
+                "{what}"
+            );
+            let r = client(&f.home)
+                .backup_v2_record_result(&id, 0, &sha)
+                .unwrap();
+            assert!(r.complete, "{what}");
+            let lease = f.open(&id, false, false).unwrap();
+            read_back(&f.paths(), f.files_cs(), &lease, &files);
+            f.sweep();
+        }
+    }
+}
+
 /// A backup keeps a file's permission bits only: the set-user-id,
 /// set-group-id and sticky bits a client declares are dropped, so a
 /// restore is never handed one to set.
@@ -1777,14 +1844,22 @@ fn one_root_holds_at_most_four_backups_in_progress() {
 }
 
 /// `list` opens the backups outside the daemon's state lock: stopped by a
-/// barrier after it opened one, the daemon still answers `status` and
-/// takes a `lock` meanwhile. The list then ends `vault_locked`, as a lock
-/// ends any call in flight.
+/// barrier after it opened the first of three, the daemon still answers
+/// `status` and takes a `lock` and an `unlock` meanwhile. The list then
+/// ends `vault_locked` at once, as a lock ends any call in flight: it
+/// opens no other backup with its copy of the key (the daemon's test
+/// trace counts each one it opens).
 #[test]
 fn a_list_holds_no_lock_while_it_opens_backups() {
     let mut f = Fixture::pausing(Some("backup.v2.list"));
-    let files = [Spec::made(&f.claude("projects/p/l.jsonl"), 40, 20)];
-    f.backup("scrub", &files);
+    for n in 0..3u8 {
+        let files = [Spec::made(
+            &f.claude(&format!("projects/p/l{n}.jsonl")),
+            40,
+            20 + n,
+        )];
+        f.backup("scrub", &files);
+    }
     let paths = f.paths();
     let listing = std::thread::spawn(move || Client::connect(&paths)?.backup_v2_list().map(drop));
     f.wait_paused("backup.v2.list");
@@ -1799,8 +1874,14 @@ fn a_list_holds_no_lock_while_it_opens_backups() {
         .expect("status waited for the list");
     assert_eq!(state.unwrap(), VaultState::Unlocked);
     client(&f.home).lock().unwrap();
+    client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
     f.release();
     let e = listing.join().unwrap().unwrap_err();
     assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
+    let opened = String::from_utf8_lossy(&f.d.log_bytes())
+        .lines()
+        .filter(|l| l.contains("envcloak test: backup.v2.list opened a backup"))
+        .count();
+    assert_eq!(opened, 1, "the list went on opening backups after the lock");
     f.sweep();
 }
