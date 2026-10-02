@@ -1200,6 +1200,64 @@ fn ci_runs_the_sandboxed_cases_outside_a_user_namespace_as_required_steps() {
     }
 }
 
+/// Every step of every job that runs tests by name with `--exact`, the
+/// open-network positive controls included (verifier, low: those ran
+/// `the_network_is_what_ci_says` unguarded, so a renamed test would run
+/// nothing and pass), names only tests its target has and fails unless
+/// every one it names ran and passed.
+#[test]
+fn ci_fails_every_exact_step_whose_tests_did_not_all_run() {
+    let ci = ci_file();
+    let mut open_controls = 0;
+    for (job, body) in ci_jobs(&ci) {
+        for text in body.split("\n      - name: ").skip(1) {
+            // What the step runs: its lines but comments (the comment
+            // above the next step's name is in this one's text).
+            let step: String = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let step = step.as_str();
+            if !step.contains("--exact") {
+                continue;
+            }
+            let name = step.lines().next().unwrap_or_default();
+            let target = step
+                .split_once("--test ")
+                .and_then(|(_, t)| t.split_whitespace().next())
+                .unwrap_or_else(|| panic!("{job}/{name}: --exact with no --test target"));
+            let tests = target_tests(target);
+            let names = exact_names(step);
+            assert!(!names.is_empty(), "{job}/{name}: no test named");
+            for n in &names {
+                assert!(
+                    tests.contains(&(*n).to_owned()),
+                    "{job}/{name} names {n}, which {target} has no test of"
+                );
+            }
+            assert_ran_all(step, names.len(), &format!("{job}/{name}"));
+            if name.contains("network outside") {
+                assert_eq!(names, ["the_network_is_what_ci_says"], "{job}/{name}");
+                assert_eq!(
+                    yaml_env(step, 8)
+                        .iter()
+                        .find(|(k, _)| k == "ENVCLOAK_TEST_NETWORK")
+                        .map(|(_, v)| v.as_str()),
+                    Some("open"),
+                    "{job}/{name}"
+                );
+                open_controls += 1;
+            }
+        }
+    }
+    // The gates job's, agents-e2e's and the release job's.
+    assert_eq!(
+        open_controls, 3,
+        "not every agent job checks the open network"
+    );
+}
+
 /// Gate 12 on the hosts' paths (Codex review, medium: no host job set
 /// `RUST_LOG=trace` or `RUST_BACKTRACE=full`, and the jobs that did had
 /// no host): the `gates` and `agents-e2e` jobs set both for every step.
@@ -1333,15 +1391,53 @@ fn yaml_env(text: &str, indent: usize) -> Vec<(String, String)> {
     out
 }
 
-/// The test names a step gives `--exact`: the words after it, to the end
-/// of the quoted command.
+/// The test names a step gives `--exact`: the words after it that are
+/// test names (letters, digits, `_` and `::`), to the end of the quoted
+/// command or the first other word (`2>&1`, a pipe), line continuations
+/// passed over.
 fn exact_names(step: &str) -> Vec<&str> {
     let after = step
         .split_once("--exact")
         .map(|(_, a)| a)
         .unwrap_or_else(|| panic!("a step runs no exact test list"));
     let list = after.split('"').next().unwrap_or_default();
-    list.split_whitespace().filter(|w| *w != "\\").collect()
+    list.split_whitespace()
+        .filter(|w| *w != "\\")
+        .take_while(|w| {
+            w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        })
+        .collect()
+}
+
+/// Every test of a test target, as `--exact` names it: `m2_story`'s
+/// ([`story_tests`]) or `agent_hosts`'s.
+fn target_tests(target: &str) -> Vec<String> {
+    match target {
+        "m2_story" => story_tests(),
+        "agent_hosts" => {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/agent_hosts.rs");
+            test_fns(&std::fs::read_to_string(path).unwrap(), "")
+        }
+        other => panic!("ci.yml runs --exact tests of {other}, which no check here lists"),
+    }
+}
+
+/// The `#[test]` functions of a source file's text, each as `<module><name>`.
+fn test_fns(text: &str, module: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut lines = text.lines().map(str::trim);
+    while let Some(l) = lines.next() {
+        if l == "#[test]" {
+            let name = lines
+                .next()
+                .and_then(|f| f.strip_prefix("fn "))
+                .and_then(|f| f.split('(').next())
+                .unwrap_or_else(|| panic!("a #[test] without a fn"));
+            out.push(format!("{module}{name}"));
+        }
+    }
+    out
 }
 
 /// Every test `m2_story` has, as `--exact` names it: its own and
@@ -1350,31 +1446,30 @@ fn story_tests() -> Vec<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/m2_story");
     let mut out = Vec::new();
     for (file, module) in [("main.rs", ""), ("skeleton.rs", "skeleton::")] {
-        let text = std::fs::read_to_string(dir.join(file)).unwrap();
-        let mut lines = text.lines().map(str::trim);
-        while let Some(l) = lines.next() {
-            if l == "#[test]" {
-                let name = lines
-                    .next()
-                    .and_then(|f| f.strip_prefix("fn "))
-                    .and_then(|f| f.split('(').next())
-                    .unwrap_or_else(|| panic!("a #[test] without a fn in {file}"));
-                out.push(format!("{module}{name}"));
-            }
-        }
+        out.extend(test_fns(
+            &std::fs::read_to_string(dir.join(file)).unwrap(),
+            module,
+        ));
     }
     out
 }
 
-/// The step fails unless all `n` tests it names ran and passed.
+/// The step fails unless all `n` tests it names ran and passed: its
+/// output goes through `tee` to a log, with `pipefail` set, and the log is
+/// checked for the count (cargo's "running 1 test", "running 3 tests").
 fn assert_ran_all(step: &str, n: usize, job: &str) {
     let log = step
         .split("| tee \"")
         .nth(1)
         .and_then(|r| r.split('"').next())
         .unwrap_or_else(|| panic!("{job}'s step keeps no log to check"));
+    assert!(
+        step.lines().any(|l| l.trim() == "set -o pipefail"),
+        "{job}'s step does not fail with the tests it pipes"
+    );
+    let tests = if n == 1 { "test" } else { "tests" };
     for check in [
-        format!("grep -qx 'running {n} tests' \"{log}\""),
+        format!("grep -qx 'running {n} {tests}' \"{log}\""),
         format!("grep -q '^test result: ok. {n} passed; 0 failed' \"{log}\""),
     ] {
         assert!(
