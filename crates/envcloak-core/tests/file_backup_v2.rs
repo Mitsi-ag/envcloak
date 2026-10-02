@@ -18,8 +18,8 @@ use envcloak_core::SecretBytes;
 use envcloak_core::file_backup::{FILE_BACKUP_RETENTION, FileBackupId, STAGING_GRACE};
 use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, FileBackupV2Writer,
-    HEADER_LEN_V2, MAX_FILE_V2, PlannedFile, chunk_len, chunks_of, list_file_backups_v2,
-    purge_file_backups_v2,
+    HEADER_LEN_V2, MAX_FILE_V2, MAX_FILES_V2, MAX_LABEL_V2, MAX_PATH_V2, PlannedFile, chunk_len,
+    chunks_of, list_file_backups_v2, purge_file_backups_v2,
 };
 use envcloak_core::vault::{Vault, VaultErrorKind};
 use envcloak_testkit::{assert_no_canary, by_label, labels};
@@ -566,6 +566,45 @@ fn a_backup_over_its_caps_is_refused_before_anything_is_written() {
         assert_eq!(e.kind(), VaultErrorKind::TooLarge);
     }
     assert!(!v.paths().backups_dir.exists() || dir_names(&v.paths().backups_dir).is_empty());
+}
+
+/// At both maxima together, 4,096 files each at the longest path (and the
+/// longest agent label), a backup is taken, and it opens again whole:
+/// the reader's bound on the metadata is the encoding's own.
+#[test]
+fn a_backup_at_every_maximum_at_once_opens_again() {
+    let (_f, v) = KitFixture::create();
+    let plan: Vec<PlannedFile> = (0..MAX_FILES_V2)
+        .map(|i| {
+            let name = format!("/h/.claude/projects/{i:04}/");
+            PlannedFile {
+                path: format!("{name}{}", "x".repeat(MAX_PATH_V2 - name.len())),
+                mode: 0o600,
+                size: 0,
+            }
+        })
+        .collect();
+    assert!(plan.iter().all(|p| p.path.len() == MAX_PATH_V2));
+    let mut c = creator(CreatorKind::Agent);
+    c.agent = Some("l".repeat(MAX_LABEL_V2));
+    let mut w = v
+        .begin_file_backup_v2(BackupPurpose::Scrub, c.clone(), plan.clone(), now())
+        .unwrap();
+    for i in 0..MAX_FILES_V2 {
+        assert!(w.put(i, 0, &SecretBytes::copy_from(b"")).unwrap());
+    }
+    let id = w.commit().unwrap().id;
+    let r = v.open_file_backup_v2(&id).unwrap();
+    r.verify().unwrap();
+    assert_eq!(r.meta().creator, c);
+    assert_eq!(r.meta().files.len(), MAX_FILES_V2);
+    assert!(
+        r.meta()
+            .files
+            .iter()
+            .zip(&plan)
+            .all(|(f, p)| f.path == p.path)
+    );
 }
 
 /// The 7-day purge, by the time in each header (an injected clock: `now`

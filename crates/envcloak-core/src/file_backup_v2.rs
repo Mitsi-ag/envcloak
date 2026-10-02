@@ -108,8 +108,18 @@ const RESULT_TEMP: &str = ".result-";
 const RESULT_BIT: u64 = 1 << 63;
 /// The largest chunk record: a full chunk, sealed.
 const MAX_CHUNK_RECORD: usize = CHUNK_V2 + Sealed::OVERHEAD;
-/// The largest metadata record: every file at the longest path.
-const MAX_METADATA: usize = 256 + MAX_LABEL_V2 + MAX_FILES_V2 * (2 + MAX_PATH_V2 + 4 + 8 + 32);
+/// The metadata's bytes besides its files, each field at its longest, as
+/// [`encode_metadata`] writes them: version(1) header_sha256(32)
+/// chunk_size(4) purpose(1) creator_kind(1) evidence_digest(32) agent(1 +
+/// 4 + [`MAX_LABEL_V2`]) owner_pid(4) owner_start_time(8) owner_token(1 +
+/// 4) count(4).
+const META_FIXED: usize = 1 + 32 + 4 + 1 + 1 + 32 + (1 + 4 + MAX_LABEL_V2) + 4 + 8 + (1 + 4) + 4;
+/// One file's entry at its longest: path(4 + [`MAX_PATH_V2`]) mode(4)
+/// size(8) sha256(32).
+const META_FILE: usize = 4 + MAX_PATH_V2 + 4 + 8 + 32;
+/// The largest metadata record: every file at the longest path. A backup
+/// [`check_plan`] takes always fits it, so it always opens again.
+const MAX_METADATA: usize = META_FIXED + MAX_FILES_V2 * META_FILE;
 
 /// What a backup is for: the change it was made before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1240,11 +1250,7 @@ pub enum ResultStepV2 {
 fn result_temp(name: &str) -> bool {
     name.strip_prefix(RESULT_TEMP)
         .and_then(|n| n.strip_suffix(STAGING_SUFFIX))
-        .is_some_and(|n| {
-            !n.is_empty()
-                && n.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
 /// The directory of backup `id` in `p`'s backups directory, by its name.
@@ -1508,6 +1514,38 @@ mod tests {
         let mut longer = m.clone();
         longer.push(0);
         assert!(decode_metadata(&longer).is_err());
+    }
+
+    /// The bound the reader takes metadata up to is the encoding's own:
+    /// metadata with every field at its longest (4,096 files, each at the
+    /// longest path, the longest label) is exactly [`MAX_METADATA`].
+    #[test]
+    fn the_metadata_bound_is_the_encodings_longest() {
+        let creator = BackupCreator {
+            kind: CreatorKind::Unknown,
+            evidence_digest: [3; 32],
+            agent: Some("a".repeat(MAX_LABEL_V2)),
+            owner: BackupOwner {
+                pid: i32::MAX,
+                start_time: u64::MAX,
+                token: Some(i32::MAX),
+            },
+        };
+        let file = FileMetaV2 {
+            path: format!("/{}", "p".repeat(MAX_PATH_V2 - 1)),
+            mode: 0o777,
+            size: 0,
+            sha256: [9; 32],
+        };
+        let files = vec![file; MAX_FILES_V2];
+        let m = encode_metadata(
+            &[0; HEADER_LEN_V2],
+            BackupPurpose::Migrate,
+            &creator,
+            &files,
+        );
+        assert_eq!(m.len(), MAX_METADATA);
+        assert!(decode_metadata(&m).is_ok());
     }
 
     #[test]
