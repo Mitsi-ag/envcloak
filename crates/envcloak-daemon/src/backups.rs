@@ -63,8 +63,8 @@ use envcloak_core::audit::{AuditKind, SubjectSummary};
 use envcloak_core::file_backup::FileBackupId;
 use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
-    FileBackupV2Reader, FileBackupV2Writer, FileBackupsV2, MAX_CHAIN_V2, MAX_LABEL_V2, PlannedFile,
-    check_plan, chunks_of, list_file_backups_v2, purge_file_backups_v2,
+    FileBackupV2Reader, FileBackupV2Writer, FileBackupsV2, ListedV2, MAX_CHAIN_V2, MAX_LABEL_V2,
+    PlannedFile, check_plan, chunks_of, list_file_backups_v2, purge_file_backups_v2,
 };
 use envcloak_core::vault::{VaultError, VaultErrorKind};
 use envcloak_ipc::proto::{
@@ -111,6 +111,9 @@ pub const MAX_LEASES: usize = 16;
 pub const MAX_CREATOR_WATCHES: usize = 64;
 /// Backups `backup.v2.list` names, newest first.
 pub const MAX_LISTED: usize = 512;
+/// How often at most a `begin` purges the backups over 7 days old: a purge
+/// reads every backup's header.
+pub const PURGE_EVERY: Duration = Duration::from_secs(60);
 // Every process of a creator's chain the daemon reads is sealed.
 const _: () = assert!(MAX_CHAIN_V2 >= envcloak_sys::MAX_ANCESTRY);
 /// The bytes of file entries a restore statement carries at most.
@@ -396,6 +399,8 @@ pub struct Registry {
     /// Bumped at every lock: a call that began before one (a restore, a
     /// result, a listing) ends without its effect.
     locks: u64,
+    /// Awake time a `begin` last purged old backups at.
+    purged_at: Option<Duration>,
 }
 
 impl core::fmt::Debug for Registry {
@@ -431,6 +436,20 @@ impl Registry {
             awake.saturating_sub(l.last_used) <= LEASE_IDLE && owner_alive(&l.owner, Some(&l.watch))
         });
         self.creators.retain(|_, w| w.running());
+    }
+
+    /// Whether a purge of old backups is due at awake time `awake`: the
+    /// first time, then once [`PURGE_EVERY`] has passed since the last;
+    /// counted as done when due.
+    fn purge_due(&mut self, awake: Duration) -> bool {
+        if self
+            .purged_at
+            .is_some_and(|t| awake.saturating_sub(t) < PURGE_EVERY)
+        {
+            return false;
+        }
+        self.purged_at = Some(awake);
+        true
     }
 
     /// The backup of `lease` for `peer` on controlling terminal
@@ -727,6 +746,23 @@ pub fn begin(
         chain: chain_of(&caller),
     };
     let now = wall_secs(shared);
+    // Backups over 7 days old go, at most every [`PURGE_EVERY`] and
+    // outside the state lock: a purge reads every backup's header.
+    let purge = {
+        let mut s = locked(&shared.state);
+        s.unlocked()?;
+        let due = s.backups().purge_due(shared.clocks.awake());
+        due.then(|| s.paths().clone())
+    };
+    if let Some(paths) = purge {
+        envcloak_sys::pause_point("backup.v2.purge");
+        if let Err(e) = purge_file_backups_v2(&paths, now) {
+            log_line!(
+                "envcloakd: old file backups v2 could not be removed ({})",
+                vault_reason(e.kind())
+            );
+        }
+    }
     let mut s = locked(&shared.state);
     s.unlocked()?;
     s.backups().sweep(shared.clocks.awake());
@@ -741,12 +777,6 @@ pub fn begin(
         return Err(RpcError::new(ErrorKind::Busy));
     }
     let v = s.unlocked()?;
-    if let Err(e) = purge_file_backups_v2(v.paths(), now) {
-        log_line!(
-            "envcloakd: old file backups v2 could not be removed ({})",
-            vault_reason(e.kind())
-        );
-    }
     let w = v
         .begin_file_backup_v2(purpose, creator, plan, now)
         .map_err(|e| backup_error(&e))?;
@@ -1192,7 +1222,7 @@ pub fn list(shared: &Shared, _p: NoParams) -> Result<BackupListView, RpcError> {
         if !still_unlocked() {
             return Err(RpcError::new(ErrorKind::VaultLocked));
         }
-        backups.push(entry(&b, &listed.id, listed.created_at));
+        backups.push(entry(&b, &listed));
         envcloak_sys::test_event("backup.v2.list opened a backup");
         envcloak_sys::pause_point("backup.v2.list");
     }
@@ -1207,9 +1237,13 @@ pub fn list(shared: &Shared, _p: NoParams) -> Result<BackupListView, RpcError> {
     })
 }
 
-fn entry(b: &FileBackupsV2, id: &FileBackupId, created_at: u64) -> BackupEntryView {
+/// A listed backup's entry, opened where the listing found it: each
+/// backup is opened once, never looked for again by its id.
+fn entry(b: &FileBackupsV2, listed: &ListedV2) -> BackupEntryView {
+    let id = &listed.id;
+    let created_at = listed.created_at;
     let opened = b
-        .open(id)
+        .open_listed(listed)
         .and_then(|r| r.results().map(|results| (r, results)));
     match opened {
         Ok((r, results)) => {
@@ -1600,6 +1634,21 @@ mod tests {
             assert!(!owner_alive(&there, Some(&w)), "{other:?}");
             assert!(!same_instance(&there, &peer), "{other:?}");
         }
+    }
+
+    /// A `begin` purges old backups the first time and then at most once
+    /// every [`PURGE_EVERY`] (an injected clock): a purge reads every
+    /// backup's header, so a client's run of `begin` calls does not read
+    /// them all each time.
+    #[test]
+    fn a_purge_runs_at_most_once_a_minute() {
+        let mut reg = Registry::default();
+        let t0 = Duration::from_secs(1000);
+        assert!(reg.purge_due(t0), "the first purge");
+        assert!(!reg.purge_due(t0), "a purge at every begin");
+        assert!(!reg.purge_due(t0 + PURGE_EVERY - Duration::from_secs(1)));
+        assert!(reg.purge_due(t0 + PURGE_EVERY));
+        assert!(!reg.purge_due(t0 + PURGE_EVERY + Duration::from_secs(1)));
     }
 
     fn upload_of(owner: BackupOwner, last_used: Duration) -> Upload {
