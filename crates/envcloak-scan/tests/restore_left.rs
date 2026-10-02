@@ -5,7 +5,8 @@
 //! takes its name, and only with contents that came whole and have the
 //! backed-up SHA-256. Nothing else is ever written in its place, and no
 //! temporary file is left; one a restore killed while it wrote left
-//! beside the file goes once the file is written back.
+//! beside the file goes once a later restore has the contents whole, and
+//! only when it holds nothing but their first bytes.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -351,8 +352,9 @@ fn restore_crash_child() {
 /// its new contents so far beside it under its temporary name, 0600,
 /// holding only bytes of what it was writing back, and nothing in its
 /// temporary directory. The next restore of the file writes it back byte
-/// for byte, with its mode, and removes what the killed one left, so no
-/// temporary file stays; a file of another name of the same shape stays.
+/// for byte, with its mode, and removes what the killed one left (the
+/// first bytes of what it writes back), so no temporary file stays; a
+/// file of another name of the same shape stays.
 #[test]
 fn a_restore_killed_while_it_writes_leaves_the_file_and_the_next_one_cleans_up() {
     if std::env::var_os(CRASH_DIR).is_some() {
@@ -427,4 +429,227 @@ fn a_restore_killed_while_it_writes_leaves_the_file_and_the_next_one_cleans_up()
 /// The first `n` bytes of [`original`].
 fn body_prefix(n: usize) -> Vec<u8> {
     original()[..n].to_vec()
+}
+
+/// `.mcp.json`'s temporary name in `dir` with `hex` (16 lowercase hex
+/// digits), as a restore of it names its new file.
+fn new_name_in(dir: &Path, hex: &str) -> std::path::PathBuf {
+    dir.join(format!("..mcp.json.envcloak-new-{hex}.tmp"))
+}
+
+/// A save a swap brought out and could not put back survives every later
+/// restore of the file (a rollback that fails, then a retry that works).
+/// Right after the swap, another program edits the file that came out in
+/// place (so it is not what the change left) and moves the restored file
+/// away from the name (so the names cannot be swapped back): the restore
+/// keeps the edit under the temporary name it reports (`moved_aside`).
+/// Once the file the change left is back, the next restore writes it back
+/// byte for byte and keeps that edit as it was: it holds other bytes than
+/// the ones written back, so nothing shows it to be a restore's.
+#[test]
+fn a_save_left_aside_when_the_names_cannot_be_put_back_survives_the_next_restore() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join(".mcp.json");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(d.path()).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    let mut edit = LEFT.to_vec();
+    let at = edit.len() - 2;
+    edit[at] ^= 0x20;
+    let away = d.path().join("moved-by-another-program.json");
+    let mut held: Option<std::fs::File> = None;
+    let mut did = false;
+    let e = restore_over_left_observed(
+        &r,
+        Path::new(".mcp.json"),
+        &file,
+        &mut |c| Some(chunk_of(&body, c)),
+        &mut |now| {
+            if now == Inside::Hashed {
+                held = Some(std::fs::OpenOptions::new().write(true).open(&p).unwrap());
+            }
+            if now == Inside::Exchanged {
+                let w = held.as_mut().unwrap();
+                std::os::unix::fs::FileExt::write_all_at(w, &edit, 0).unwrap();
+                std::fs::rename(&p, &away).unwrap();
+                did = true;
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(did);
+    assert_eq!(e.kind, ModifyErrorKind::MovedAside);
+    let kept = d.path().join(&e.rel);
+    assert!(
+        kept.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("..mcp.json.envcloak-new-"),
+        "{kept:?}"
+    );
+    assert_eq!(std::fs::read(&kept).unwrap(), edit);
+    assert!(std::fs::read(&away).unwrap() == body);
+
+    std::fs::remove_file(&away).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    restore_over_left(&r, Path::new(".mcp.json"), &file, &mut |c| {
+        Some(chunk_of(&body, c))
+    })
+    .unwrap();
+    assert!(std::fs::read(&p).unwrap() == body, "not byte for byte");
+    assert_eq!(
+        std::fs::read(&kept).ok(),
+        Some(edit),
+        "the save kept aside was removed by the next restore"
+    );
+}
+
+/// A restore removes beside the file only what earlier restores of it
+/// left of the same contents: files of its temporary names holding
+/// nothing but the first bytes of what it writes back (part of a chunk,
+/// the first chunk, the whole, none at all). Every other one stays as it
+/// was: the first chunk with its last byte altered, the whole and one
+/// byte more, what the change left (the file a restore stopped after its
+/// swap takes out), the first chunk with a second hard link, a symlink to
+/// a file holding the first chunk (and that file), a FIFO, and the first
+/// chunk under another file's temporary name, under a name of another
+/// shape (upper-case hex) and under a removal's temporary name.
+#[test]
+fn a_restore_removes_only_leftovers_holding_the_first_bytes_it_writes_back() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = d.path();
+    let p = dir.join(".mcp.json");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(dir).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    let first = body[..CHUNK_V2].to_vec();
+    let go = [
+        (new_name_in(dir, "0000000000000001"), body[..1000].to_vec()),
+        (new_name_in(dir, "0000000000000002"), first.clone()),
+        (new_name_in(dir, "0000000000000003"), body.clone()),
+        (new_name_in(dir, "0000000000000004"), Vec::new()),
+    ];
+    let mut altered = first.clone();
+    altered[CHUNK_V2 - 1] ^= 1;
+    let mut longer = body.clone();
+    longer.push(0);
+    let stay = [
+        (new_name_in(dir, "00000000000000a1"), altered),
+        (new_name_in(dir, "00000000000000a2"), longer),
+        (new_name_in(dir, "00000000000000a3"), LEFT.to_vec()),
+        (
+            dir.join("..settings.json.envcloak-new-00000000000000a4.tmp"),
+            first.clone(),
+        ),
+        (
+            dir.join("..mcp.json.envcloak-new-00000000000000A5.tmp"),
+            first.clone(),
+        ),
+        (
+            dir.join("..mcp.json.envcloak-del-00000000000000a6.tmp"),
+            first.clone(),
+        ),
+    ];
+    for (q, b) in go.iter().chain(stay.iter()) {
+        std::fs::write(q, b).unwrap();
+    }
+    let linked = new_name_in(dir, "00000000000000b1");
+    std::fs::write(&linked, &first).unwrap();
+    let second = dir.join("second-link");
+    std::fs::hard_link(&linked, &second).unwrap();
+    let target = dir.join("symlink-target");
+    std::fs::write(&target, &first).unwrap();
+    let link = new_name_in(dir, "00000000000000b2");
+    symlink(&target, &link).unwrap();
+    let fifo = new_name_in(dir, "00000000000000b3");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    restore_over_left(&r, Path::new(".mcp.json"), &file, &mut |c| {
+        Some(chunk_of(&body, c))
+    })
+    .unwrap();
+    assert!(std::fs::read(&p).unwrap() == body, "not byte for byte");
+    for (q, _) in &go {
+        assert!(!q.exists(), "{q:?}: a restore's leftover stayed");
+    }
+    for (q, b) in &stay {
+        assert!(
+            std::fs::read(q).ok().as_ref() == Some(b),
+            "{q:?}: removed or changed"
+        );
+    }
+    assert!(std::fs::read(&linked).unwrap() == first);
+    assert_eq!(std::fs::metadata(&second).unwrap().nlink(), 2);
+    assert!(link.symlink_metadata().unwrap().is_symlink());
+    assert!(std::fs::read(&target).unwrap() == first);
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_fifo(&fifo.symlink_metadata().unwrap().file_type()),
+        "the FIFO went"
+    );
+}
+
+/// Every restore that gets the contents whole beside the file removes
+/// what earlier restores of it left of them, whatever it then comes to:
+/// here a save lands once the contents are staged, so the file is kept as
+/// saved (`changed`), and the first chunk a restore stopped mid-write left
+/// is gone all the same, with no temporary file left. A restore that
+/// stops before it has the contents whole (a chunk altered:
+/// `backup_unread`) has nothing to compare with and removes nothing.
+#[test]
+fn every_restore_with_the_contents_whole_removes_what_earlier_ones_left() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join(".mcp.json");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(d.path()).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    let left_over = new_name_in(d.path(), "0123456789abcdef");
+    std::fs::write(&left_over, &body[..CHUNK_V2]).unwrap();
+
+    let e = restore_over_left(&r, Path::new(".mcp.json"), &file, &mut |c| {
+        let mut b = chunk_of(&body, c);
+        if c == 1 {
+            b = SecretBytes::copy_from(&[0u8; 7]);
+        }
+        Some(b)
+    })
+    .unwrap_err();
+    assert_eq!(e.kind, ModifyErrorKind::BackupUnread);
+    assert!(left_over.exists(), "removed before the contents came whole");
+
+    let saved: &[u8] = b"{\"saved\": \"once the contents were staged\"}\n";
+    let mut did = false;
+    let e = restore_over_left_observed(
+        &r,
+        Path::new(".mcp.json"),
+        &file,
+        &mut |c| Some(chunk_of(&body, c)),
+        &mut |at| {
+            if at == Inside::Staged {
+                std::fs::write(&p, saved).unwrap();
+                did = true;
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(did);
+    assert_eq!(e.kind, ModifyErrorKind::Changed);
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        saved,
+        "the save was written over"
+    );
+    assert!(
+        !left_over.exists(),
+        "a restore that had the contents whole left an earlier one's leftover"
+    );
+    no_temps(d.path());
 }
