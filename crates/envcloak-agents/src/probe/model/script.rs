@@ -18,7 +18,8 @@ pub const MAX_SCRIPT: usize = 1024 * 1024;
 pub const MAX_STEPS: usize = 256;
 
 /// A run's script. `Debug` shows its shape, never its text: a probe's
-/// script can carry a canary on purpose (a positive control).
+/// script can carry a canary on purpose (a positive control), in any
+/// field, a barrier's name included.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Script {
@@ -80,7 +81,10 @@ impl fmt::Debug for Step {
         f.debug_struct("Step")
             .field("kind", &kind)
             .field("says", &self.say.is_some())
-            .field("after", &self.after)
+            .field(
+                "after",
+                &self.after.as_ref().map(|a| format!("<{} bytes>", a.len())),
+            )
             .finish()
     }
 }
@@ -190,6 +194,15 @@ mod tests {
             !shown.contains("echo") && !shown.contains("done"),
             "{shown}"
         );
+        // A barrier's name is the script's text too (Codex review,
+        // medium: it was shown).
+        let held = br#"{"steps":[{"say":"a","after":"MARK-barrier"}]}"#;
+        let shown = format!(
+            "{:?}",
+            Script::parse(held).unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert!(!shown.contains("MARK"), "{shown}");
+        assert!(shown.contains("<12 bytes>"), "{shown}");
 
         let refused: &[(&[u8], ScriptError)] = &[
             (br#"{"steps":[]}"#, ScriptError::Steps),

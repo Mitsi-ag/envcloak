@@ -96,15 +96,74 @@ pub fn shown_target(path: &str, query: Option<&str>) -> String {
     }
 }
 
+/// The methods `Debug` names: HTTP's own.
+const METHODS: [&str; 9] = [
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE",
+];
+
+/// How `Debug` shows a method: by name when it is one of HTTP's, else
+/// only by its length. A method is any token a client sent (up to 16
+/// upper-case letters here), so it can hold anything (Codex review,
+/// medium).
+pub fn shown_method(method: &str) -> String {
+    if METHODS.contains(&method) {
+        method.to_owned()
+    } else {
+        format!("<method of {} bytes>", method.len())
+    }
+}
+
+/// The header names `Debug` names: the ones the pinned hosts and their
+/// HTTP clients send, and the ones this server reads.
+const HEADER_NAMES: [&str; 21] = [
+    "host",
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "expect",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "user-agent",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "anthropic-version",
+    "anthropic-beta",
+    "openai-beta",
+    "originator",
+    "session_id",
+];
+
+/// How `Debug` shows a header name: by name when it is one of
+/// [`HEADER_NAMES`], else only by its length. A header name is any token
+/// a client sent, so it can hold anything (Codex review, medium).
+pub fn shown_header_name(name: &str) -> String {
+    if HEADER_NAMES.contains(&name) {
+        name.to_owned()
+    } else {
+        format!("<{} bytes>", name.len())
+    }
+}
+
 impl fmt::Debug for Head {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<String> = self
+            .header_names
+            .iter()
+            .map(|n| shown_header_name(n))
+            .collect();
         f.debug_struct("Head")
-            .field("method", &self.method)
+            .field("method", &shown_method(&self.method))
             .field("form", &self.form)
             .field("target", &shown_target(&self.path, self.query.as_deref()))
             .field("content_length", &self.content_length)
             .field("close", &self.close)
-            .field("header_names", &self.header_names)
+            .field("header_names", &names)
             .finish_non_exhaustive()
     }
 }
@@ -626,6 +685,28 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}"))
         );
         assert!(shown.contains("/v1/messages?<9 bytes>"), "{shown}");
+    }
+
+    /// `Debug` never shows a method or a header name a client made up:
+    /// HTTP's methods and the known header names by name, anything else
+    /// by its length (Codex review, medium: both were printed verbatim).
+    #[test]
+    fn debug_shows_a_method_or_header_name_only_by_name_or_length() {
+        let h = parse(
+            "MARKMETHOD /v1/messages HTTP/1.1\r\nHost: x\r\nX-Markname: 1\r\n\
+             X-Api-Key: k\r\n\r\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let shown = format!("{h:?}");
+        assert!(!shown.to_ascii_lowercase().contains("mark"), "{shown}");
+        assert!(shown.contains("<method of 10 bytes>"), "{shown}");
+        assert!(
+            shown.contains(r#"["host", "<10 bytes>", "x-api-key"]"#),
+            "{shown}"
+        );
+        let h = parse("PATCH /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(format!("{h:?}").contains("\"PATCH\""));
     }
 
     #[test]
