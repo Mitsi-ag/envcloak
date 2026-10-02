@@ -414,7 +414,10 @@ jobs:
           key: agents
       # No setup-node: the installer puts the Node.js versions.toml pins
       # (version, archive and binary SHA-256) in the host cache, runs npm
-      # with it, and the harness runs every node host with it.
+      # with it, and the harness runs every node host with it. The Chrome
+      # for Testing cache M2-04's CI scope also lists is deferred to M2b-02,
+      # which pins the browser (integrations/browser/versions.toml) and is
+      # the first task to run one; no job before it starts a browser.
       - name: Agent hosts from the cache, keyed by their pins
         uses: actions/cache@v4
         with:
