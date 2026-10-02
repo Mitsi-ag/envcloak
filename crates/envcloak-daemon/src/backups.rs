@@ -133,26 +133,44 @@ const HOME_DIRS: [&str; 13] = [
     ".local/share/goose",
 ];
 const HOME_FILES: [&str; 2] = [".claude.json", ".aider.conf.yml"];
-/// Agent files a project may hold, by name.
-const PROJECT_FILES: [&str; 8] = [
+/// Agent files a project may hold, by name (Map C §2, §3 item 8, §4 and
+/// §6): instruction files, MCP configs (Claude Code's and Copilot's
+/// `.mcp.json`, OpenCode's `opencode.json`) and Aider's history.
+const PROJECT_FILES: [&str; 9] = [
     "AGENTS.md",
     "CLAUDE.md",
     "GEMINI.md",
     ".mcp.json",
+    "opencode.json",
     ".goosehints",
     ".aider.chat.history.md",
     ".aider.input.history",
     ".aider.conf.yml",
 ];
-/// Agent directories a project may hold: any file below one.
-const PROJECT_DIRS: [&str; 6] = [".claude", ".codex", ".cursor", ".gemini", ".kimi", ".qwen"];
+/// Agent directories a project may hold: any file below one (Cursor's
+/// `.cursor/mcp.json`, Gemini's and Qwen's `settings.json`, Kimi Code's
+/// `.kimi-code/mcp.json`, OpenCode's `.opencode/` plugins and config).
+const PROJECT_DIRS: [&str; 8] = [
+    ".claude",
+    ".codex",
+    ".cursor",
+    ".gemini",
+    ".kimi",
+    ".kimi-code",
+    ".qwen",
+    ".opencode",
+];
+/// Project MCP configs named by the directory that holds them: VS Code's
+/// `.vscode/mcp.json` and Copilot's `.github/mcp.json`.
+const PROJECT_MCP_DIRS: [&str; 2] = [".vscode", ".github"];
 
 /// Whether `path` is a file a backup v2 may hold (docs/IPC.md "Backups
 /// v2"): an absolute path of 1 to 4096 bytes without a NUL, an empty, `.`
 /// or `..` component or a trailing `/`, that is an env file (`.env`,
 /// `.env.<suffix>`), is under `<data>/mcp/`, is under one of the agent
 /// roots of the home or is one of its agent files, or is a project's
-/// agent file or under a project's agent directory. The test is on the
+/// agent file, under a project's agent directory or a project's
+/// `.vscode/mcp.json` or `.github/mcp.json`. The test is on the
 /// path as written: a restore writes it back without following a
 /// symlink.
 pub fn allowed_path(path: &str, home: Option<&Path>, data_dir: &Path) -> bool {
@@ -202,7 +220,7 @@ pub fn allowed_path(path: &str, home: Option<&Path>, data_dir: &Path) -> bool {
     if dirs.iter().any(|d| PROJECT_DIRS.contains(d)) {
         return true;
     }
-    *name == "mcp.json" && dirs.last() == Some(&".vscode")
+    *name == "mcp.json" && dirs.last().is_some_and(|d| PROJECT_MCP_DIRS.contains(d))
 }
 
 /// The running boot's id (`envcloak_sys::boot_id`), read once: `None` on
@@ -1244,6 +1262,13 @@ mod tests {
             "/src/acme/.claude/settings.local.json",
             "/src/acme/.cursor/mcp.json",
             "/src/acme/.vscode/mcp.json",
+            "/src/acme/.github/mcp.json",
+            "/src/acme/opencode.json",
+            "/src/acme/.opencode/plugins/envcloak.ts",
+            "/src/acme/.opencode/opencode.json",
+            "/src/acme/.kimi-code/mcp.json",
+            "/src/acme/.gemini/settings.json",
+            "/src/acme/.qwen/settings.json",
         ];
         for p in ok {
             assert!(allowed_path(p, Some(home), data), "{p}");
@@ -1267,6 +1292,11 @@ mod tests {
             "/h/u/.local/share/envcloak/vault/vault.db",
             "/h/u/.local/share/envcloak/mcp",
             "/src/acme/.vscode/settings.json",
+            "/src/acme/.github/workflows/ci.yml",
+            "/src/acme/.github/mcp.json.bak",
+            "/src/acme/opencode.json.bak",
+            "/src/acme/.opencodex/x.ts",
+            "/src/acme/.opencode",
             "/src/acme/.env\0x",
         ];
         for p in refused {
