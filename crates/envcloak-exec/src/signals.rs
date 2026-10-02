@@ -21,6 +21,15 @@
 //!   killed in turn (as `envcloak mcp` does after two SIGTERMs and a
 //!   grace), still holding the injected values, in a group nothing else
 //!   owns.
+//! - Without a terminal, a run that passed a SIGTERM on leaves nothing of
+//!   the child's group behind ([`Forwarder::ends_childs_group`]): a child
+//!   that exits on it may leave a descendant in its group that ignores it,
+//!   and once the child has exited the runner kills that group (SIGKILL)
+//!   before it reaps the child, which leads the group until then. A
+//!   SIGTERM that comes only after the exit stops the run instead (below).
+//!   With a terminal the child is in this process's own group, which this
+//!   process does not signal: whoever started this process in a group of
+//!   its own (as `envcloak mcp` does) ends that group.
 //!
 //! The four signals are caught (never ignored, since `exec` would pass an
 //! ignored disposition on to the child) from before the child starts until
@@ -149,6 +158,8 @@ pub(crate) struct Forwarder {
     /// [`Forwarder::child_exited`] could not write its mark: every signal
     /// read from then on counts as caught after the exit.
     mark_lost: AtomicBool,
+    /// A SIGTERM was read.
+    term_seen: AtomicBool,
 }
 
 impl Forwarder {
@@ -157,7 +168,16 @@ impl Forwarder {
             relay: SignalRelay::install(&CAUGHT)?,
             terminal,
             mark_lost: AtomicBool::new(false),
+            term_seen: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the run must end what is left of the child's group before
+    /// it reaps the child: without a terminal (the child leads a group of
+    /// its own), once a SIGTERM was read. Asked when the child's exit is
+    /// seen: a SIGTERM the child died of was read before it was passed on.
+    pub(crate) fn ends_childs_group(&self) -> bool {
+        !self.terminal && self.term_seen.load(Ordering::SeqCst)
     }
 
     /// Passes signals on until [`Forwarder::stop`], and stops the run
@@ -175,6 +195,9 @@ impl Forwarder {
                 }
                 Relayed::Signal { number, by_process } => (number, by_process),
             };
+            if sig == libc::SIGTERM {
+                self.term_seen.store(true, Ordering::SeqCst);
+            }
             let after_exit = marked || self.mark_lost.load(Ordering::SeqCst);
             let pid = child.pid.lock().unwrap_or_else(|e| e.into_inner());
             match act(sig, by_process, self.terminal, after_exit, *pid) {

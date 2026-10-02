@@ -46,15 +46,18 @@ for name in sys.argv[1:]:
 sys.stderr.write("emitted\n")
 "#;
 
-/// Takes an exclusive lock on argv[1], forks a child that keeps it, then
-/// marks argv[2] and waits while argv[3] exists (at most 600 s): the lock
-/// is free again only once both are gone. With argv[4] `stubborn`, both
-/// ignore SIGTERM first. argv[3] is the test's own directory, gone when
-/// the test ends however it ends, so a run the test failed to stop ends
-/// by itself (L-03).
+/// Takes an exclusive lock on argv[1] and forks a child that keeps it;
+/// the child marks argv[2] once it is set up, and both wait while argv[3]
+/// exists (at most 600 s): the lock is free again only once both are
+/// gone. The flags after them: `stubborn`, both ignore SIGTERM;
+/// `child-ignores`, the child alone does; `quiet-child`, the child's
+/// output goes to `/dev/null`, so it holds none of `envcloak run`'s pipes.
+/// argv[3] is the test's own directory, gone when the test ends however it
+/// ends, so a run the test failed to stop ends by itself (L-03).
 const HOLD: &str = r#"import fcntl, os, signal, sys, time
 lock, ready, life = sys.argv[1], sys.argv[2], sys.argv[3]
-if sys.argv[4:] == ["stubborn"]:
+flags = set(sys.argv[4:])
+if "stubborn" in flags:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 f = open(lock, "a")
 fcntl.flock(f, fcntl.LOCK_EX)
@@ -63,16 +66,68 @@ def wait():
     while os.path.exists(life) and time.time() < deadline:
         time.sleep(0.05)
 if os.fork() == 0:
+    if "child-ignores" in flags:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if "quiet-child" in flags:
+        null = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(null, 1)
+        os.dup2(null, 2)
+    open(ready, "w").close()
     wait()
     os._exit(0)
-open(ready, "w").close()
 wait()
 "#;
+
+/// Runs argv[1..] as the leader of a new session whose controlling
+/// terminal is a new pseudo-terminal, as an agent host started in a
+/// terminal window is (Claude Code starts its stdio MCP servers in its own
+/// session), with this wrapper's standard input, output and error, so a
+/// test drives it over pipes. The terminal stays open on descriptor 9 (on
+/// macOS a session whose terminal no process holds open loses it); what is
+/// written to it is read and dropped. Exits with the program's code, or
+/// 128 plus the signal that ended it.
+const ON_AGENT_TERMINAL: &str = "import os, pty, select, sys
+keep = [os.dup(0), os.dup(1), os.dup(2)]
+pid, fd = pty.fork()
+if pid == 0:
+    os.dup2(0, 9)
+    for n, k in enumerate(keep):
+        os.dup2(k, n)
+    os.execv(sys.argv[1], sys.argv[1:])
+for k in keep:
+    os.close(k)
+reading = True
+while True:
+    if reading:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try:
+                reading = bool(os.read(fd, 4096))
+            except OSError:
+                reading = False
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+    else:
+        _, status = os.waitpid(pid, 0)
+        break
+code = os.waitstatus_to_exitcode(status)
+sys.exit(code if code >= 0 else 128 - code)
+";
 
 /// Reads its standard input to the end and says how much it read.
 const READ_STDIN: &str = r#"import sys
 data = sys.stdin.buffer.read()
 print("stdin=%d" % len(data))
+"#;
+
+/// Says whether it has a controlling terminal: `/dev/tty` opens only then.
+const HAS_TTY: &str = r#"import os
+try:
+    os.close(os.open("/dev/tty", os.O_RDONLY))
+    print("tty=yes")
+except OSError:
+    print("tty=no")
 "#;
 
 /// The fixtures shaped like a key, which every tool refuses as an
@@ -140,6 +195,7 @@ impl Fixture {
             ("emit.py", EMIT),
             ("hold.py", HOLD),
             ("read_stdin.py", READ_STDIN),
+            ("has_tty.py", HAS_TTY),
         ] {
             std::fs::write(project.join(name), body).unwrap();
         }
@@ -204,6 +260,35 @@ impl Mcp {
     fn start(home: &TestHome, cwd: &Path, args: &[&str], cs: &[Canary]) -> Mcp {
         let mut cmd = Command::new(testkit_bin("fixture-agent"));
         home.apply(&mut cmd).arg("--").arg(common::cli());
+        Mcp::spawn(cmd, cwd, args, cs)
+    }
+
+    /// The server started by `fixture-agent` leading a session on a
+    /// terminal of its own ([`ON_AGENT_TERMINAL`]): `envcloak run` then has
+    /// a controlling terminal, and keeps its command in its own group.
+    fn start_on_terminal(home: &TestHome, cwd: &Path, args: &[&str], cs: &[Canary]) -> Mcp {
+        let mut cmd = Command::new(python3());
+        home.apply(&mut cmd)
+            .args(["-c", ON_AGENT_TERMINAL])
+            .arg(testkit_bin("fixture-agent"))
+            .arg("--")
+            .arg(common::cli());
+        Mcp::spawn(cmd, cwd, args, cs)
+    }
+
+    /// The server started by `fixture-agent` leading a session of its own
+    /// with no controlling terminal, whatever terminal the tests were run
+    /// from: `envcloak run` then puts its command in a group of its own.
+    fn start_without_terminal(home: &TestHome, cwd: &Path, args: &[&str], cs: &[Canary]) -> Mcp {
+        let mut cmd = Command::new(python3());
+        home.apply(&mut cmd)
+            .args([
+                "-c",
+                "import os, sys\nos.setsid()\nos.execv(sys.argv[1], sys.argv[1:])",
+            ])
+            .arg(testkit_bin("fixture-agent"))
+            .arg("--")
+            .arg(common::cli());
         Mcp::spawn(cmd, cwd, args, cs)
     }
 
@@ -1310,6 +1395,154 @@ fn a_cancelled_command_that_ignores_sigterm_is_ended_with_its_group() {
         "a process of the command, which ignores SIGTERM, outlived the session",
     );
     f.sweep();
+}
+
+/// How a stopped command takes `SIGTERM`, in [`stopped_calls_leave_nothing`].
+#[derive(Debug, Clone, Copy)]
+enum Takes {
+    /// The command and its forked child both ignore it.
+    Stubborn,
+    /// The command dies of it; its forked child ignores it.
+    ChildIgnores,
+}
+
+/// Cancellation and the session's end, each with a command whose forked
+/// child ignores `SIGTERM` and holds none of `envcloak run`'s pipes (its
+/// output is on `/dev/null`), once with a command that ignores `SIGTERM`
+/// too and once with one that dies of it: nothing of the command outlives
+/// the call (a lock both hold is free again), and the cancelled call is
+/// answered nothing. With `terminal`, the agent leads a session on a
+/// terminal of its own, as Claude Code started in a terminal window does,
+/// so `envcloak run` keeps its command in the group the server started
+/// (checked: the command can open `/dev/tty`); without (the agent leads a
+/// session with no terminal, however the tests were started), the command
+/// leads a group of its own, which only `envcloak run` owns.
+fn stopped_calls_leave_nothing(terminal: bool) {
+    let f = Fixture::new();
+    let dir = f.project.to_str().unwrap();
+    let py = python3();
+    for takes in [Takes::Stubborn, Takes::ChildIgnores] {
+        let args = ["--wait-ms", "1000"];
+        let mut m = if terminal {
+            Mcp::start_on_terminal(&f.home, &f.project, &args, &f.cs)
+        } else {
+            Mcp::start_without_terminal(&f.home, &f.project, &args, &f.cs)
+        };
+        m.initialize();
+        let files = outside_dir();
+        let lock = files.path().join("lock");
+        let ready = files.path().join("ready");
+        let flag = match takes {
+            Takes::Stubborn => "stubborn",
+            Takes::ChildIgnores => "child-ignores",
+        };
+        let argv = json!([
+            py.to_str().unwrap(),
+            "hold.py",
+            lock.to_str().unwrap(),
+            ready.to_str().unwrap(),
+            files.path().to_str().unwrap(),
+            flag,
+            "quiet-child"
+        ]);
+        let case = format!("{takes:?}, terminal {terminal}");
+        let r = m.call(
+            "run_with_secrets",
+            json!({"project_dir": dir, "argv": argv}),
+        );
+        let id = structured(&r)["request"].as_str().unwrap().to_owned();
+        f.approve(&id);
+        // The case is the one named: the command has a controlling
+        // terminal exactly when the agent has one.
+        let r = m.call(
+            "run_with_secrets",
+            json!({"project_dir": dir, "argv": [py.to_str().unwrap(), "has_tty.py"]}),
+        );
+        let want = if terminal { "tty=yes\n" } else { "tty=no\n" };
+        assert_eq!(structured(&r)["stdout"], want, "{case}: {r}");
+        let started = |m: &Mcp| {
+            let end = Instant::now() + Duration::from_secs(60);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < end,
+                    "{case}: the command did not start: {}",
+                    m.stderr()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let held = std::fs::File::open(&lock).unwrap();
+            assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
+            held
+        };
+        let freed = |held: &std::fs::File, what: &str| {
+            let end = Instant::now() + Duration::from_secs(20);
+            while !envcloak_sys::try_lock_exclusive(held).unwrap() {
+                assert!(Instant::now() < end, "{case}: {what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        let call = m.call_async(
+            "run_with_secrets",
+            json!({"project_dir": dir, "argv": argv}),
+        );
+        let held = started(&m);
+        m.send(
+            &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": call}}),
+        );
+        freed(
+            &held,
+            "a process of the cancelled command still holds its lock",
+        );
+        drop(held);
+        let ping = m.request("ping", json!({}));
+        assert_eq!(ping["result"], json!({}));
+        assert!(
+            m.kept.iter().all(|v| v["id"] != call),
+            "{case}: the cancelled call was answered: {:?}",
+            m.kept
+        );
+
+        // The session's end, with such a command running again.
+        std::fs::remove_file(&ready).unwrap();
+        m.call_async(
+            "run_with_secrets",
+            json!({"project_dir": dir, "argv": argv}),
+        );
+        let held = started(&m);
+        let (_, _) = m.finish();
+        freed(&held, "a process of the command outlived the session");
+    }
+    f.sweep();
+}
+
+/// [`stopped_calls_leave_nothing`] without a controlling terminal: the
+/// command leads a group of its own, and `envcloak run` ends what is left
+/// of it before it reaps the command, once it got a `SIGTERM`.
+///
+/// Mutation checked: `envcloak run` not killing its command's group at the
+/// end of a run that got a `SIGTERM`: with `ChildIgnores`, the command dies
+/// of the first `SIGTERM`, `envcloak run` exits at once, its child runs on
+/// holding the lock, and this fails.
+#[test]
+fn a_stopped_call_leaves_nothing_of_its_command_without_a_terminal() {
+    stopped_calls_leave_nothing(false);
+}
+
+/// [`stopped_calls_leave_nothing`] on the agent's terminal (verifier,
+/// M2-06 round 2, medium): `envcloak run` keeps its command in the group
+/// the server started, and the server kills that group once `envcloak run`
+/// has exited, before it reaps it.
+///
+/// Mutation checked: the server not killing a stopped call's group before
+/// it reaps its leader: in both cases `envcloak run` exits once its command
+/// is gone (killed by pid on the second `SIGTERM`, or dead of the first),
+/// the command's child runs on in the group holding the lock, and this
+/// fails.
+#[test]
+fn a_stopped_call_leaves_nothing_of_its_command_on_a_terminal() {
+    stopped_calls_leave_nothing(true);
 }
 
 /// A daemon slow to answer at the wait's deadline cannot push a tool's

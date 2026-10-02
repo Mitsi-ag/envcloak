@@ -225,6 +225,10 @@ const TESTS: &[Test] = &[
         without_a_terminal_a_second_sigterm_kills_the_childs_group,
     ),
     (
+        "without_a_terminal_a_sigterm_ends_what_the_child_left_in_its_group",
+        without_a_terminal_a_sigterm_ends_what_the_child_left_in_its_group,
+    ),
+    (
         "on_a_terminal_ctrl_c_reaches_the_child_and_the_runner_stays",
         on_a_terminal_ctrl_c_reaches_the_child_and_the_runner_stays,
     ),
@@ -1564,6 +1568,90 @@ fn without_a_terminal_a_second_sigterm_kills_the_childs_group() {
         assert!(
             Instant::now() < end,
             "a process of the child's group outlived the second SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_no_canary(&out, &cs);
+    assert_no_canary(&err, &cs);
+    home.assert_clean(&cs);
+}
+
+/// A child that takes an exclusive lock on argv[1] and starts a
+/// descendant that keeps the lock, ignores SIGTERM and has its output on
+/// `/dev/null`, so it holds none of the runner's pipes; once the
+/// descendant is set up, the child says `ready`. Both wait until the
+/// lifetime whose directory is argv[2] and stop request argv[3] asks them
+/// to stop, or for argv[4] seconds. The child itself dies of SIGTERM. The
+/// lock is free again only once both are gone.
+const LEAVES_A_DESCENDANT: &str = r#"import fcntl, os, signal, sys, time
+lock, life, stop, deadline = sys.argv[1], sys.argv[2], sys.argv[3], time.time() + float(sys.argv[4])
+f = open(lock, "a")
+fcntl.flock(f, fcntl.LOCK_EX)
+def wait():
+    while os.path.isdir(life) and not os.path.exists(stop) and time.time() < deadline:
+        time.sleep(0.05)
+r, w = os.pipe()
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    null = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null, 1)
+    os.dup2(null, 2)
+    os.close(r)
+    os.write(w, b"x")
+    os.close(w)
+    wait()
+    os._exit(0)
+os.close(w)
+os.read(r, 1)
+os.write(1, b"ready\n")
+wait()
+"#;
+
+/// Without a terminal, a child that dies of the SIGTERM passed on to its
+/// group, but leaves a descendant in that group that ignores it and holds
+/// none of the runner's pipes: the runner ends the descendant with the
+/// run (SIGKILL to the group the child led, sent before the child is
+/// reaped), and exits as the child did, 128 plus SIGTERM's number. One
+/// SIGTERM is enough: `envcloak mcp` stops a cancelled call so, and its
+/// second SIGTERM never comes once the runner has exited (Codex review of
+/// M2-06, high).
+///
+/// Mutation checked: the group not killed at the end of the run (no
+/// `ends_childs_group` kill before the reap): the runner exits at once, the
+/// descendant runs on holding the lock, and this fails.
+fn without_a_terminal_a_sigterm_ends_what_the_child_left_in_its_group() {
+    let seed = fresh_seed();
+    let cs = all_canaries(seed);
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    let life = Lifetime::new(&home, "left-descendant");
+    let lock = home.root().join("held.lock");
+    let argv: Vec<OsString> = vec![
+        python3().into(),
+        "-c".into(),
+        LEAVES_A_DESCENDANT.into(),
+        lock.clone().into(),
+        life.dir.clone().into(),
+        life.stop_path().into(),
+        FIXTURE_DEADLINE_SECS.to_string().into(),
+    ];
+    let p = Proc::spawn(detached(&home, &setup, &os(&argv)));
+    assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
+    let held = std::fs::File::open(&lock).unwrap();
+    assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
+    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    let (status, out, err) = p.finish(Duration::from_secs(30));
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{}", lossy(&err));
+    let end = Instant::now() + Duration::from_secs(10);
+    while !envcloak_sys::try_lock_exclusive(&held).unwrap() {
+        assert!(
+            Instant::now() < end,
+            "a descendant left in the child's group outlived the run"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
