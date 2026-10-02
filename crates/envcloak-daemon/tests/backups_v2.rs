@@ -1868,6 +1868,116 @@ fn a_lock_stops_a_restore_or_a_result_in_flight() {
     }
 }
 
+/// 64 lowercase hex characters as 32 bytes.
+fn unhex(s: &str) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    for (i, b) in h.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+    }
+    h
+}
+
+/// A restore writes a file back only while it is what the change left
+/// (R-M2-73): two project files are backed up by this terminal, changed
+/// (each rewritten as a migration would leave it) and their results
+/// recorded, the SHA-256 of what the change left; then one of them is
+/// edited again. One proof opens a lease, and each file is written back
+/// as a client does, through `envcloak_scan::restore_over_left` with the
+/// statement's `sha256_after` and chunks read under the lease: the file
+/// the change left comes back byte for byte (two chunks), and the one
+/// edited after the change is kept as it is (`edited_since`), none of its
+/// chunks read.
+#[test]
+fn a_restore_writes_a_file_back_only_while_it_is_what_the_change_left() {
+    let f = Fixture::new();
+    let project = f.home.home().join("src/acme");
+    std::fs::create_dir_all(project.join(".cursor")).unwrap();
+    let big: Vec<u8> = (0..CHUNK_V2 + 99)
+        .map(|i| b"{\"mcpServers\": {}}\n"[i % 19])
+        .collect();
+    let files = [
+        (project.join(".mcp.json"), big),
+        (
+            project.join(".cursor/mcp.json"),
+            b"{\"mcpServers\": {\"db\": {\"env\": {\"PORT\": \"5432\"}}}}\n".to_vec(),
+        ),
+    ];
+    let left: [&[u8]; 2] = [
+        b"{\"mcpServers\": {\"x\": {\"command\": \"envcloak\"}}}\n",
+        b"{\"mcpServers\": {\"db\": {\"command\": \"envcloak\"}}}\n",
+    ];
+    let specs: Vec<Spec> = files
+        .iter()
+        .map(|(p, b)| {
+            std::fs::write(p, b).unwrap();
+            Spec {
+                path: p.to_str().unwrap().to_owned(),
+                size: b.len() as u64,
+                salt: 0,
+                text: Some(b.clone()),
+            }
+        })
+        .collect();
+    let id = f.backup("migrate", &specs);
+    for (i, ((p, _), l)) in files.iter().zip(left).enumerate() {
+        std::fs::write(p, l).unwrap();
+        client(&f.home)
+            .backup_v2_record_result(&id, u32::try_from(i).unwrap(), &Sha256::digest(l).into())
+            .unwrap();
+    }
+    let mut edited = left[1].to_vec();
+    edited.extend_from_slice(b"\n");
+    std::fs::write(&files[1].0, &edited).unwrap();
+    let lease = f.open(&id, false, false).unwrap();
+    let mut outcome = Vec::new();
+    for (i, (p, _)) in files.iter().enumerate() {
+        let view = &lease.statement.files[i];
+        let file = envcloak_scan::BackedUpFile {
+            size: view.size,
+            sha256: unhex(&view.sha256),
+            sha256_after: unhex(view.sha256_after.as_deref().unwrap()),
+        };
+        let root = envcloak_scan::open_root(p.parent().unwrap()).unwrap();
+        let mut reads = 0;
+        let paths = f.paths();
+        let done = envcloak_scan::restore_over_left(
+            &root,
+            Path::new(p.file_name().unwrap()),
+            &file,
+            &mut |c| {
+                reads += 1;
+                Client::connect(&paths)
+                    .and_then(|mut conn| {
+                        conn.backup_v2_read(
+                            &lease.lease,
+                            u32::try_from(i).unwrap(),
+                            u32::try_from(c).unwrap(),
+                        )
+                    })
+                    .ok()
+                    .map(|chunk| chunk.data.into_inner())
+            },
+        );
+        outcome.push((done.map(drop).map_err(|e| e.kind), reads));
+    }
+    assert_eq!(outcome[0], (Ok(()), 2), "the file the change left");
+    assert!(
+        std::fs::read(&files[0].0).unwrap() == files[0].1,
+        "not written back byte for byte"
+    );
+    assert_eq!(
+        outcome[1],
+        (Err(envcloak_scan::ModifyErrorKind::EditedSince), 0),
+        "the file edited after the change"
+    );
+    assert_eq!(
+        std::fs::read(&files[1].0).unwrap(),
+        edited,
+        "a file edited after the change was written over"
+    );
+    f.sweep();
+}
+
 /// A backup keeps a file's permission bits only: the set-user-id,
 /// set-group-id and sticky bits a client declares are dropped, so a
 /// restore is never handed one to set.
