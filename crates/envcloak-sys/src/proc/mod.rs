@@ -355,6 +355,52 @@ pub fn proc_info(pid: i32) -> io::Result<ProcInfo> {
     }
 }
 
+/// Whether process `pid` is the instance that started at `start` and has
+/// not exited. A process that exited and is not yet reaped (a zombie)
+/// keeps its pid and its start time until its parent waits for it, so a
+/// pid and a start time alone still find it: its state says it ended
+/// (Linux `Z` or `X` in `/proc/<pid>/stat`, macOS `SZOMB`). `false` when
+/// there is no such process, it is another instance, it has exited, or it
+/// cannot be read: a caller asks whether it may act for that process, and
+/// the answer fails closed.
+pub fn process_running(pid: i32, start: StartTime) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        linux::process_running(pid, start)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_running(pid, start)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = start;
+        false
+    }
+}
+
+/// The state letter (field 3) of a Linux `/proc/<pid>/stat` file: the
+/// first character after the `)` that ends the command name (the last one
+/// in the file, since the name may hold parentheses), between single
+/// spaces. `None` when it is not one ASCII letter so placed.
+pub fn parse_stat_state(stat: &[u8]) -> Option<u8> {
+    let close = stat.iter().rposition(|b| *b == b')')?;
+    match stat.get(close + 1..close + 4)? {
+        [b' ', s, b' '] if s.is_ascii_alphabetic() => Some(*s),
+        _ => None,
+    }
+}
+
+/// Whether a Linux process state letter ([`parse_stat_state`]) is one of a
+/// process that has exited: `Z` (a zombie, not yet reaped), `X` or `x`
+/// (dead, being reaped).
+pub fn stat_state_exited(state: u8) -> bool {
+    matches!(state, b'Z' | b'X' | b'x')
+}
+
 /// The arguments of process `pid`, `argv[0]` first: at most [`MAX_ARGV`]
 /// of them and [`MAX_ARGV_BYTES`] in all, in wiped storage. See the module
 /// documentation for what is read, and when environment strings can be

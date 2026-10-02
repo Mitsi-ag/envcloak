@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use super::{
     Argv, ExeIdentity, MAX_ARGV, MAX_ARGV_BYTES, ProcInfo, parse_cmdline, parse_proc_stat,
-    parse_status_euid,
+    parse_stat_state, parse_status_euid, stat_state_exited,
 };
 
 /// A process that is gone, or never was, is [`io::ErrorKind::NotFound`].
@@ -96,6 +96,15 @@ pub(super) fn proc_info(pid: i32) -> io::Result<ProcInfo> {
         exe: exe(pid),
         argv: None,
     })
+}
+
+pub(super) fn process_running(pid: i32, start: crate::StartTime) -> bool {
+    // One read: the pid, the start time and the state are of one moment.
+    let Ok(stat) = read_proc(pid, "stat", 4096) else {
+        return false;
+    };
+    parse_proc_stat(&stat).is_some_and(|f| f.pid == pid && f.start_time == start)
+        && parse_stat_state(&stat).is_some_and(|s| !stat_state_exited(s))
 }
 
 pub(super) fn proc_argv(pid: i32) -> io::Result<Argv> {
