@@ -14,6 +14,13 @@
 //! - Without one, the child leads a group of its own, so a signal meant
 //!   for this process does not reach it by itself: SIGINT, SIGTERM, SIGHUP
 //!   and SIGQUIT are passed on to the child's whole group.
+//! - A second SIGTERM ends the child at once: from the second SIGTERM this
+//!   process gets on, SIGKILL is sent in its place, to the child's group
+//!   without a terminal and to the child on one ([`sent_as`]). A child
+//!   that ignores SIGTERM would otherwise outlive this process when it is
+//!   killed in turn (as `envcloak mcp` does after two SIGTERMs and a
+//!   grace), still holding the injected values, in a group nothing else
+//!   owns.
 //!
 //! The four signals are caught (never ignored, since `exec` would pass an
 //! ignored disposition on to the child) from before the child starts until
@@ -66,6 +73,17 @@ pub(crate) fn passed_on_with_terminal(sig: i32, by_process: bool) -> bool {
         libc::SIGTERM | libc::SIGHUP => true,
         libc::SIGINT | libc::SIGQUIT => by_process,
         _ => false,
+    }
+}
+
+/// What is sent to the child for caught signal `sig`, when this process
+/// has already passed `terms_passed` SIGTERMs on: SIGKILL in place of a
+/// second SIGTERM and every one after it, `sig` otherwise.
+pub(crate) fn sent_as(sig: i32, terms_passed: u32) -> i32 {
+    if sig == libc::SIGTERM && terms_passed > 0 {
+        libc::SIGKILL
+    } else {
+        sig
     }
 }
 
@@ -148,6 +166,7 @@ impl Forwarder {
     /// [`act`]). Run on its own thread.
     pub(crate) fn forward(&self, child: &ChildState, cutoff: &Cutoff) {
         let mut marked = false;
+        let mut terms_passed = 0u32;
         while let Ok(Some(caught)) = self.relay.next() {
             let (sig, by_process) = match caught {
                 Relayed::Mark => {
@@ -163,11 +182,16 @@ impl Forwarder {
                 // pid is still the child's. A child that is gone by now,
                 // or a group already empty, is not an error: there is
                 // nothing left to tell.
-                Act::PassOn { pid, group: true } => {
-                    let _ = envcloak_sys::signal_group(pid, sig);
-                }
-                Act::PassOn { pid, group: false } => {
-                    let _ = envcloak_sys::signal_process(pid, sig);
+                Act::PassOn { pid, group } => {
+                    let sent = sent_as(sig, terms_passed);
+                    if sig == libc::SIGTERM {
+                        terms_passed = terms_passed.saturating_add(1);
+                    }
+                    let _ = if group {
+                        envcloak_sys::signal_group(pid, sent)
+                    } else {
+                        envcloak_sys::signal_process(pid, sent)
+                    };
                 }
                 Act::Stop => {
                     drop(pid);
@@ -434,6 +458,20 @@ mod tests {
                 std::thread::yield_now();
             }
         });
+    }
+
+    /// The first SIGTERM is passed on as it is; every one after it is
+    /// SIGKILL. Other signals are passed on as they are, however many
+    /// SIGTERMs came before.
+    #[test]
+    fn a_second_sigterm_is_sent_as_sigkill() {
+        assert_eq!(sent_as(libc::SIGTERM, 0), libc::SIGTERM);
+        assert_eq!(sent_as(libc::SIGTERM, 1), libc::SIGKILL);
+        assert_eq!(sent_as(libc::SIGTERM, 7), libc::SIGKILL);
+        for sig in [libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            assert_eq!(sent_as(sig, 0), sig);
+            assert_eq!(sent_as(sig, 3), sig);
+        }
     }
 
     /// With a terminal: SIGTERM and SIGHUP are passed on whoever sent

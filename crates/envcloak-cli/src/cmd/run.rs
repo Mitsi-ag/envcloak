@@ -38,8 +38,11 @@
 //!    ([`envcloak_ipc::wait`]). A call the daemon did not take (its
 //!    connection closed unanswered, as at its connection limit) is asked
 //!    again the same way until the deadline. The wait never outlasts its
-//!    deadline by more than 5 seconds: every call, from its connect to the
-//!    last byte of its answer, is given only the time left to that limit,
+//!    deadline by more than 5 seconds, or by the shorter grace
+//!    `--wait-grace` gives (1 to 5 seconds; `envcloak mcp` passes 1, so
+//!    that its tool answers within its host's timeout): every call, from
+//!    its connect to the last byte of its answer, is given only the time
+//!    left to that limit,
 //!    however the daemon paces what it sends or reads, and an answer read
 //!    later is dropped, its values wiped, with exit 125 and
 //!    `daemon_unavailable`. Before each request
@@ -90,7 +93,9 @@ use envcloak_core::{SecretBuf, SecretBytes};
 use envcloak_exec::{CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
 use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunAnswer, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
-use envcloak_ipc::wait::{CALL_GRACE, Fresh, MAX_WAIT, Notice, SystemClock, Waited, wait_for_run};
+use envcloak_ipc::wait::{
+    CALL_GRACE, Fresh, MAX_WAIT, Notice, SystemClock, Waited, wait_for_run_with_grace,
+};
 use envcloak_ipc::{Client, ClientError};
 use envcloak_policy::{
     Binding, EnvFileRefs, EnvName, GrantId, MAX_ENV_FILE, Mode, PendingId, PlainVar, find_manifest,
@@ -99,7 +104,8 @@ use envcloak_policy::{
 use zeroize::Zeroize;
 
 const USAGE_TEXT: &str = "envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] \
-     [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m)] -- <cmd...>";
+     [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] \
+     -- <cmd...>";
 
 /// The parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -111,6 +117,9 @@ struct RunArgs {
     manifest: Option<String>,
     /// `--wait`: how long to wait for an approval.
     wait: Option<Duration>,
+    /// `--wait-grace`: how long after the wait's deadline the daemon's
+    /// last answer is waited for ([`CALL_GRACE`] when not given).
+    wait_grace: Option<Duration>,
     argv: Vec<String>,
 }
 
@@ -128,6 +137,18 @@ fn parse_wait(s: &str) -> Option<Duration> {
     }
     let d = Duration::from_secs(digits.parse::<u64>().ok()?.checked_mul(per_unit)?);
     (Duration::from_secs(1)..=MAX_WAIT)
+        .contains(&d)
+        .then_some(d)
+}
+
+/// `--wait-grace`: `<n>s`, from 1 second to [`CALL_GRACE`].
+fn parse_grace(s: &str) -> Option<Duration> {
+    let digits = s.strip_suffix('s')?;
+    if digits.is_empty() || digits.len() > 1 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let d = Duration::from_secs(digits.parse::<u64>().ok()?);
+    (Duration::from_secs(1)..=CALL_GRACE)
         .contains(&d)
         .then_some(d)
 }
@@ -212,6 +233,16 @@ fn parse(args: &[&str]) -> Result<RunArgs, ParseError> {
                     .ok_or("--wait needs a duration from 1s to 10m, such as 30s or 5m")?;
                 a.wait = Some(d);
             }
+            Some(&"--wait-grace") => {
+                if a.wait_grace.is_some() {
+                    return Err("--wait-grace is given twice".into());
+                }
+                let d = it
+                    .next()
+                    .and_then(|v| parse_grace(v))
+                    .ok_or("--wait-grace needs a duration from 1s to 5s")?;
+                a.wait_grace = Some(d);
+            }
             // M2's PTY mode, refused before anything is read.
             Some(&"--pty") => return Err(ParseError::NotInThisBuild("`envcloak run --pty`")),
             Some(_) => return Err("unknown option; see envcloak run --help".into()),
@@ -220,6 +251,9 @@ fn parse(args: &[&str]) -> Result<RunArgs, ParseError> {
     a.argv = it.map(|s| (*s).to_owned()).collect();
     if a.argv.is_empty() {
         return Err("run needs a command after --".into());
+    }
+    if a.wait_grace.is_some() && a.wait.is_none() {
+        return Err("--wait-grace needs --wait".into());
     }
     Ok(a)
 }
@@ -256,8 +290,8 @@ enum Ask {
     /// Once, on this verified connection.
     Now(Client),
     /// Waiting up to this long for an approval, each call on a connection
-    /// of its own.
-    Waiting(Duration),
+    /// of its own, and up to the grace after it for a last answer.
+    Waiting(Duration, Duration),
 }
 
 fn request(a: RunArgs) -> Result<ExitCode, Failure> {
@@ -268,7 +302,7 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
     // ordinary call timeout, could hold it past its deadline.
     let ask = match a.wait {
         None => Ask::Now(connect()?),
-        Some(wait) => Ask::Waiting(wait),
+        Some(wait) => Ask::Waiting(wait, a.wait_grace.unwrap_or(CALL_GRACE)),
     };
     let manifest = match a.manifest {
         Some(p) => p,
@@ -292,7 +326,7 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
             answer
         }
         // No connection is held while waiting: each step opens its own.
-        Ask::Waiting(wait) => match wait_for(&params, wait)? {
+        Ask::Waiting(wait, grace) => match wait_for(&params, wait, grace)? {
             Some(answer) => answer,
             None => return Ok(ExitCode::from(RUN_FAILURE)),
         },
@@ -355,13 +389,18 @@ fn found_manifest() -> Result<String, Failure> {
 }
 
 /// Waits up to `wait` for the request `params` to be covered or denied,
-/// on fresh connections ([`wait_for_run`]), printing the
+/// and up to `grace` after that for a last answer, on fresh connections
+/// ([`wait_for_run_with_grace`]), printing the
 /// `approval_required` line once per request and the `too_many_pending`
 /// line once. Returns the deciding answer, or `None` when the wait ended
 /// with nothing decided (still pending at the deadline, expired, or every
 /// place taken): the line already printed is then the failure, and the
 /// run exits 125.
-fn wait_for(params: &RunRequestParams, wait: Duration) -> Result<Option<RunAnswer>, Failure> {
+fn wait_for(
+    params: &RunRequestParams,
+    wait: Duration,
+    grace: Duration,
+) -> Result<Option<RunAnswer>, Failure> {
     // SIGINT ends the wait whatever this process was started with: an
     // ignored or blocked SIGINT survives `exec`, and a wait it could not
     // end would start the command on an approval that comes later.
@@ -390,7 +429,13 @@ fn wait_for(params: &RunRequestParams, wait: Duration) -> Result<Option<RunAnswe
             );
         }
     };
-    match wait_for_run(&mut fresh, &mut SystemClock::new(), wait, &mut notice)? {
+    match wait_for_run_with_grace(
+        &mut fresh,
+        &mut SystemClock::new(),
+        wait,
+        grace,
+        &mut notice,
+    )? {
         Waited::Answer(answer) => Ok(Some(answer)),
         Waited::Denied(id) => Err(Failure::new(
             "approval_denied",
@@ -405,7 +450,7 @@ fn wait_for(params: &RunRequestParams, wait: Duration) -> Result<Option<RunAnswe
             format!(
                 "the daemon did not answer within the wait ({shown}, and {}s for a last \
                  answer); nothing was started",
-                CALL_GRACE.as_secs()
+                grace.as_secs()
             ),
         )),
     }
@@ -654,8 +699,40 @@ mod tests {
             &["--wait", "1.5m", "--", "true"],
             &["--wait", "5\u{e9}", "--", "true"],
             &["--wait", "1m", "--wait", "2m", "--", "true"],
+            // A --wait-grace outside 1s to 5s, malformed, twice or
+            // without --wait.
+            &["--wait", "8s", "--wait-grace"],
+            &["--wait", "8s", "--wait-grace", "0s", "--", "true"],
+            &["--wait", "8s", "--wait-grace", "6s", "--", "true"],
+            &["--wait", "8s", "--wait-grace", "10s", "--", "true"],
+            &["--wait", "8s", "--wait-grace", "1", "--", "true"],
+            &["--wait", "8s", "--wait-grace", "1m", "--", "true"],
+            &["--wait", "8s", "--wait-grace", "500ms", "--", "true"],
+            &[
+                "--wait",
+                "8s",
+                "--wait-grace",
+                "1s",
+                "--wait-grace",
+                "1s",
+                "--",
+                "true",
+            ],
+            &["--wait-grace", "1s", "--", "true"],
         ] {
             assert!(matches!(parse(bad), Err(ParseError::Usage(_))), "{bad:?}");
+        }
+        assert_eq!(
+            parse(&["--wait-grace", "1s", "--wait", "7s", "--", "true"]).unwrap(),
+            RunArgs {
+                wait: Some(Duration::from_secs(7)),
+                wait_grace: Some(Duration::from_secs(1)),
+                argv: vec!["true".into()],
+                ..RunArgs::default()
+            }
+        );
+        for (ok, secs) in [("1s", 1), ("3s", 3), ("5s", 5)] {
+            assert_eq!(parse_grace(ok), Some(Duration::from_secs(secs)), "{ok}");
         }
         for (ok, secs) in [
             ("1s", 1),

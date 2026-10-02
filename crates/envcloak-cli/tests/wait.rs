@@ -562,6 +562,63 @@ fn a_wait_on_a_silent_daemon_ends_by_its_limit() {
     assert!(!marker.exists(), "the command was started");
 }
 
+/// `--wait-grace` shortens the time given to the daemon's last answer: a
+/// daemon that takes each connection and never answers holds `run --wait
+/// 2s --wait-grace 1s` for its 2 seconds and 1 more, not 5, and the
+/// failure names that grace. `envcloak mcp` passes it so that its tool
+/// answers within its host's timeout (docs/MCP.md).
+///
+/// Mutation checked: `--wait-grace` parsed but not passed to the wait
+/// (always `CALL_GRACE`): the run takes 7 seconds, and this fails on the
+/// time and on the message.
+#[test]
+fn a_shorter_grace_ends_a_wait_on_a_silent_daemon_sooner() {
+    use std::os::unix::net::UnixListener;
+
+    let home = TestHome::new();
+    let l = UnixListener::bind(stand_in_socket(&home)).unwrap();
+    // Takes every connection and holds it, unanswered.
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept() {
+            held.push(s);
+        }
+    });
+    let files = outside_dir();
+    let marker = files.path().join("started");
+    let mut cmd = cli_command(
+        &home,
+        &[
+            "run",
+            "--wait",
+            "2s",
+            "--wait-grace",
+            "1s",
+            "--manifest",
+            "/nowhere/envcloak.toml",
+            "--",
+            "touch",
+            marker.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let started = Instant::now();
+    let out = finish_within_child(cmd.spawn().unwrap(), Duration::from_secs(60));
+    let took = started.elapsed();
+    let e = stderr(&out);
+    assert_eq!(out.status.code(), Some(125), "{e}");
+    assert_eq!(
+        e,
+        "envcloak: daemon_unavailable: the daemon did not answer within the wait (2s, and 1s \
+         for a last answer); nothing was started\n"
+    );
+    assert!(
+        took >= Duration::from_secs(3) && took < Duration::from_secs(6),
+        "{took:?}"
+    );
+    assert!(!marker.exists(), "the command was started");
+}
+
 /// The daemon's runtime directory under `home`, made as the daemon makes
 /// it (0700), and the socket path in it, for a peer standing in for the
 /// daemon.
