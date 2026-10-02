@@ -1699,53 +1699,61 @@ pub fn purge_file_backups_v2_except(
     now: u64,
     mut in_progress: impl FnMut(&FileBackupId) -> bool,
 ) -> Result<usize, VaultError> {
+    let dir = match std::fs::canonicalize(&p.backups_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
     let mut purged = Purged::default();
     for b in list_file_backups_v2(p)? {
         if now.saturating_sub(b.created_at) > FILE_BACKUP_RETENTION.as_secs() {
             purged.count(remove_backup_dir(&b.dir));
         }
     }
-    let dir = match std::fs::canonicalize(&p.backups_dir) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return purged.failed.map_or(Ok(purged.removed), Err);
-        }
-        Err(e) => return Err(e.into()),
-    };
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                purged.count(Err(e.into()));
-                continue;
-            }
-        };
-        let name = entry.file_name();
-        let Some(name) = name.to_str().filter(|n| staging_name(n)) else {
-            continue;
-        };
-        // `DirEntry` reads the entry itself: a symlink is not followed.
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => {}
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                purged.count(Err(e.into()));
-                continue;
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries {
+                purged.count(
+                    entry
+                        .map_err(VaultError::from)
+                        .and_then(|e| purge_staging(&e, now, &mut in_progress)),
+                );
             }
         }
-        let modified = entry.metadata().map_or(0, |m| modified_secs(&m));
-        if now.saturating_sub(modified) <= STAGING_GRACE.as_secs()
-            || staging_id(name).is_some_and(|id| in_progress(&id))
-        {
-            continue;
-        }
-        purged.count(remove_backup_dir(&entry.path()));
+        Err(e) => purged.count(Err(e.into())),
     }
     if purged.removed > 0 {
         sync_dir(&dir)?;
     }
     purged.failed.map_or(Ok(purged.removed), Err)
+}
+
+/// Removes `entry` of `backups/` if it is a staging directory unchanged
+/// for [`STAGING_GRACE`] before `now` whose backup is not in progress.
+/// Returns whether it went.
+fn purge_staging(
+    entry: &std::fs::DirEntry,
+    now: u64,
+    in_progress: &mut impl FnMut(&FileBackupId) -> bool,
+) -> Result<bool, VaultError> {
+    let name = entry.file_name();
+    let Some(name) = name.to_str().filter(|n| staging_name(n)) else {
+        return Ok(false);
+    };
+    // `DirEntry` reads the entry itself: a symlink is not followed.
+    match entry.file_type() {
+        Ok(t) if t.is_dir() => {}
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
+    let modified = entry.metadata().map_or(0, |m| modified_secs(&m));
+    if now.saturating_sub(modified) <= STAGING_GRACE.as_secs()
+        || staging_id(name).is_some_and(|id| in_progress(&id))
+    {
+        return Ok(false);
+    }
+    remove_backup_dir(&entry.path())
 }
 
 /// Rewrites the creation time in a backup's header. Test support only
