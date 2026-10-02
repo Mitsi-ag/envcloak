@@ -49,6 +49,57 @@ fn a_blocked_termination_signal_waits_for_sigwait() {
     assert!(format!("{signals:?}").contains("SIGTERM"));
 }
 
+/// A child started with `unblock_termination_on_spawn`, by a thread that
+/// blocks the termination signals (as every thread of `envcloak mcp`
+/// does), has none of them blocked: a shell that sends itself each one
+/// ends by it. Started without it, the same shell goes on past its own
+/// signal and says so: the positive control, that the mask is inherited
+/// and the test can fail (Codex review of M2-06, high).
+///
+/// Mutation checked: `unblock_termination_on_spawn` adding nothing to the
+/// command: each shell goes on past its signal and this fails.
+#[test]
+fn a_child_can_start_with_the_termination_signals_unblocked() {
+    use std::os::unix::process::ExitStatusExt;
+    // On a thread of its own, whose mask ends with it.
+    std::thread::spawn(|| {
+        let _blocked = TerminationSignals::block().unwrap();
+        for (sig, name) in [
+            (libc::SIGTERM, "TERM"),
+            (libc::SIGINT, "INT"),
+            (libc::SIGHUP, "HUP"),
+        ] {
+            let shell = |unblocked: bool| {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.arg("-c")
+                    .arg(format!("kill -{name} $$; echo went-on"))
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin");
+                if unblocked {
+                    envcloak_sys::unblock_termination_on_spawn(&mut cmd).unwrap();
+                }
+                cmd.output().unwrap()
+            };
+            let kept = shell(false);
+            assert_eq!(
+                (kept.status.code(), kept.stdout.as_slice()),
+                (Some(0), &b"went-on\n"[..]),
+                "{name}: the blocked mask was not inherited"
+            );
+            let freed = shell(true);
+            assert_eq!(
+                freed.status.signal(),
+                Some(sig),
+                "{name}: {:?}",
+                freed.status
+            );
+            assert!(freed.stdout.is_empty(), "{name}");
+        }
+    })
+    .join()
+    .unwrap();
+}
+
 /// Reads time awake, time including sleep, then time awake again, 50
 /// times, and keeps the reading whose two awake reads were closest: the
 /// middle read then happened, in awake time, within that gap after the

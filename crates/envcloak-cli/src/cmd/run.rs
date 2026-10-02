@@ -47,11 +47,13 @@
 //!    later is dropped, its values wiped, with exit 125 and
 //!    `daemon_unavailable`. Before each request
 //!    that could carry values, the CLI looks for a tracer again, and stops
-//!    with `traced` if one is attached now. SIGINT ends the wait as it
-//!    ends any program (a shell reports 130), also when the run was
-//!    started with it ignored or blocked: its default action is restored
-//!    and it is unblocked before the wait begins; nothing is held open
-//!    then, and nothing starts.
+//!    with `traced` if one is attached now. SIGINT and SIGTERM end the
+//!    wait as they end any program (a shell reports 130 or 143), also
+//!    when the run was started with them ignored or blocked (`envcloak
+//!    mcp` blocks them in every thread): their default action is restored
+//!    and they are unblocked, with SIGHUP, before the wait begins; nothing
+//!    is held open then, and nothing starts. SIGHUP keeps the disposition
+//!    the run came with (`nohup`).
 //!    Approval input is never read here: the terminal this command runs
 //!    in may be an agent's.
 //! 5. A covered answer carries the bindings' values, which the daemon
@@ -401,13 +403,17 @@ fn wait_for(
     wait: Duration,
     grace: Duration,
 ) -> Result<Option<RunAnswer>, Failure> {
-    // SIGINT ends the wait whatever this process was started with: an
-    // ignored or blocked SIGINT survives `exec`, and a wait it could not
-    // end would start the command on an approval that comes later.
-    envcloak_sys::interrupt_ends_process().map_err(|_| {
+    // SIGINT and SIGTERM end the wait whatever this process was started
+    // with, and a SIGHUP not ignored ends it too: an ignored or blocked
+    // signal survives `exec` (a shell starts a background job with SIGINT
+    // ignored; a program that takes these signals on one thread, as
+    // `envcloak mcp` does, blocks them), and a wait one could not end
+    // would start the command on an approval that comes later. One sent
+    // before this point waited, blocked, and ends the run here.
+    envcloak_sys::termination_ends_process().map_err(|_| {
         Failure::new(
             "run_failed",
-            "SIGINT could not be made to end the wait; nothing was sent",
+            "SIGINT and SIGTERM could not be made to end the wait; nothing was sent",
         )
     })?;
     let paths = run_paths()?;

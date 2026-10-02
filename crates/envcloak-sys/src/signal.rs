@@ -18,6 +18,12 @@
 //! blocking read returns `EINTR`, the reader sees the record, restores the
 //! terminal, and then [`exit_by_signal`] ends the process the way the
 //! signal would have.
+//!
+//! A blocked mask outlives the process that set it: a child inherits it,
+//! and keeps it when it starts its program. A process that blocks these
+//! signals starts its children with [`unblock_termination_on_spawn`], so
+//! they can be stopped; a process that must end on them whatever started
+//! it calls [`termination_ends_process`].
 
 use std::io;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -170,15 +176,102 @@ impl Drop for TerminationWatch {
 /// mask both survive `exec`, so a program can start this one with
 /// `SIGINT` ignored (as a shell starts a background job) or blocked. A
 /// wait that a person must be able to end, and that holds nothing a
-/// signal could leave behind (`envcloak run --wait`), calls this first:
-/// a `SIGINT` sent to the process then reaches the calling thread, if no
-/// other, and ends the process as its default action does (a shell
-/// reports 130).
+/// signal could leave behind, calls this or
+/// [`termination_ends_process`] first: a `SIGINT` sent to the process
+/// then reaches the calling thread, if no other, and ends the process as
+/// its default action does (a shell reports 130).
 ///
 /// # Errors
 /// When the disposition or the mask cannot be changed; either may have
 /// been changed then.
 pub fn interrupt_ends_process() -> io::Result<()> {
+    default_action(libc::SIGINT)?;
+    unblock_here(&[libc::SIGINT])
+}
+
+/// Lets the signals that ask a process to stop end it, whatever it was
+/// started with: `SIGINT` and `SIGTERM` get their default action, and the
+/// calling thread stops blocking them and `SIGHUP`. `SIGHUP` keeps the
+/// disposition it came with, so a run started under `nohup` still ignores
+/// a hangup. An ignored disposition and a blocked mask both survive
+/// `exec`: a shell starts a background job with `SIGINT` ignored, and a
+/// program that takes these signals on one thread blocks them in every
+/// other ([`TerminationSignals::block`], as `envcloak mcp` does), which a
+/// child it starts inherits unless it is started with
+/// [`unblock_termination_on_spawn`].
+///
+/// A wait that must end when it is asked to, and that holds nothing a
+/// signal could leave behind (`envcloak run --wait`, which a person ends
+/// with Ctrl-C and `envcloak mcp` with `SIGTERM` when its host cancels the
+/// call), calls this first: such a signal, sent to the process before or
+/// during the wait, then reaches the calling thread, if no other, and ends
+/// the process as its default action does. Were it left blocked, it would
+/// wait unseen, and an approval that came meanwhile would start the
+/// command (Codex review of M2-06, high).
+///
+/// # Errors
+/// When a disposition or the mask cannot be changed; some may have been
+/// changed then.
+pub fn termination_ends_process() -> io::Result<()> {
+    default_action(libc::SIGINT)?;
+    default_action(libc::SIGTERM)?;
+    unblock_here(&TerminationSignals::SIGNALS)
+}
+
+/// Has the program `cmd` starts begin with `SIGTERM`, `SIGINT` and `SIGHUP`
+/// unblocked, whatever the thread that starts it blocks. A signal mask
+/// survives `fork` and `exec` (the standard library's `Command` keeps
+/// it), so a program that blocks these signals in every thread, to take
+/// them on one ([`TerminationSignals::block`]), would otherwise start each
+/// child with them blocked: the child could not be stopped by them, and an
+/// `envcloak run` still waiting for an approval would start its command
+/// once the approval came, after the `SIGTERM` meant to stop it. Their
+/// dispositions are left alone: `exec` resets a caught signal to its
+/// default action, and an ignored one stays the program's to keep.
+///
+/// # Errors
+/// When the set cannot be built. Changing the mask in the child, between
+/// `fork` and `exec`, cannot fail with a valid set; were it to, the spawn
+/// would fail with that error.
+pub fn unblock_termination_on_spawn(cmd: &mut std::process::Command) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let set = signal_set(&TerminationSignals::SIGNALS)?;
+    let unblock = move || {
+        // SAFETY: `set` was initialized before the fork and is copied into
+        // the closure; the old mask is not wanted.
+        if unsafe { libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    // SAFETY: the closure runs in the child between `fork` and `exec`,
+    // where a child forked from a threaded parent may call only
+    // async-signal-safe functions. It calls `sigprocmask`, which is one, on
+    // a set built before the fork; it allocates nothing, takes no lock, and
+    // `last_os_error` only reads errno.
+    unsafe { cmd.pre_exec(unblock) };
+    Ok(())
+}
+
+/// A set holding `signals`.
+fn signal_set(signals: &[i32]) -> io::Result<libc::sigset_t> {
+    // SAFETY: sigset_t is plain data; sigemptyset initializes it.
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is a writable sigset_t.
+    if unsafe { libc::sigemptyset(&mut set) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for &sig in signals {
+        // SAFETY: `set` was initialized above; sigaddset checks `sig`.
+        if unsafe { libc::sigaddset(&mut set, sig) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(set)
+}
+
+/// Gives `sig` its default action.
+fn default_action(sig: i32) -> io::Result<()> {
     // SAFETY: sigaction is plain data; SIG_DFL with an empty mask is valid.
     let mut dfl: libc::sigaction = unsafe { std::mem::zeroed() };
     dfl.sa_sigaction = libc::SIG_DFL;
@@ -186,17 +279,17 @@ pub fn interrupt_ends_process() -> io::Result<()> {
     if unsafe { libc::sigemptyset(&mut dfl.sa_mask) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: SIGINT is a valid signal; `dfl` is initialized and the old
+    // SAFETY: sigaction checks `sig`; `dfl` is initialized and the old
     // action is not wanted.
-    if unsafe { libc::sigaction(libc::SIGINT, &dfl, std::ptr::null_mut()) } != 0 {
+    if unsafe { libc::sigaction(sig, &dfl, std::ptr::null_mut()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: sigset_t is plain data; sigemptyset initializes it.
-    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `set` is a writable sigset_t and SIGINT a valid signal.
-    if unsafe { libc::sigemptyset(&mut set) != 0 || libc::sigaddset(&mut set, libc::SIGINT) != 0 } {
-        return Err(io::Error::last_os_error());
-    }
+    Ok(())
+}
+
+/// Stops the calling thread blocking `signals`.
+fn unblock_here(signals: &[i32]) -> io::Result<()> {
+    let set = signal_set(signals)?;
     // SAFETY: `set` is initialized; the old mask is not wanted. The call
     // changes only the calling thread's mask.
     let rc = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
