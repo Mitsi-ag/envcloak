@@ -43,10 +43,10 @@ use envcloak_core::audit::{AuditKind, SubjectSummary};
 use envcloak_core::file_backup::FileBackupId;
 use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
-    FileBackupV2Reader, FileBackupV2Writer, MAX_CHAIN_V2, MAX_LABEL_V2, PlannedFile, check_plan,
-    chunks_of, list_file_backups_v2, purge_file_backups_v2,
+    FileBackupV2Reader, FileBackupV2Writer, FileBackupsV2, MAX_CHAIN_V2, MAX_LABEL_V2, PlannedFile,
+    check_plan, chunks_of, list_file_backups_v2, purge_file_backups_v2,
 };
-use envcloak_core::vault::{Vault, VaultError, VaultErrorKind};
+use envcloak_core::vault::{VaultError, VaultErrorKind};
 use envcloak_ipc::proto::{
     BackupBeginParams, BackupChunk, BackupIdParams, BackupPutParams, BackupReadParams,
     BackupResultParams, ErrorKind, NoParams, OpenRestoreParams,
@@ -73,6 +73,13 @@ use crate::state::{State, vault_reason};
 pub const LEASE_IDLE: Duration = Duration::from_secs(60);
 /// Backups in progress at once.
 pub const MAX_UPLOADS: usize = 16;
+/// Backups in progress at once for the processes of one root (an agent
+/// and its commands, or one terminal session), so one root cannot hold
+/// every slot.
+pub const MAX_UPLOADS_PER_ROOT: usize = 4;
+/// How long a backup in progress may go without a call before it is
+/// dropped.
+pub const UPLOAD_IDLE: Duration = Duration::from_secs(120);
 /// Restore leases open at once.
 pub const MAX_LEASES: usize = 16;
 /// Backups `backup.v2.list` names, newest first.
@@ -281,9 +288,14 @@ type SharedWriter = Arc<Mutex<Option<Box<FileBackupV2Writer>>>>;
 /// A backup in progress.
 struct Upload {
     owner: BackupOwner,
+    /// The root of its creator's subject: at most
+    /// [`MAX_UPLOADS_PER_ROOT`] are in progress for one.
+    root: ProcessInstance,
     writer: SharedWriter,
     subject: SubjectSummary,
     purpose: BackupPurpose,
+    /// Awake time of its last call.
+    last_used: Duration,
 }
 
 /// A restore lease.
@@ -327,11 +339,13 @@ impl Registry {
         self.locks += 1;
     }
 
-    /// Drops the backups in progress whose creator exited, and the leases
-    /// whose process exited or that sat idle for [`LEASE_IDLE`] at awake
-    /// time `awake`.
+    /// Drops the backups in progress whose creator exited or that went
+    /// [`UPLOAD_IDLE`] without a call, and the leases whose process exited
+    /// or that sat idle for [`LEASE_IDLE`], at awake time `awake`.
     pub fn sweep(&mut self, awake: Duration) {
-        self.uploads.retain(|_, u| owner_alive(&u.owner));
+        self.uploads.retain(|_, u| {
+            awake.saturating_sub(u.last_used) <= UPLOAD_IDLE && owner_alive(&u.owner)
+        });
         self.leases.retain(|_, l| {
             awake.saturating_sub(l.last_used) <= LEASE_IDLE && owner_alive(&l.owner)
         });
@@ -482,18 +496,29 @@ fn wall_secs(shared: &Shared) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Opens backup `id` from the unlocked vault.
-fn open_reader(s: &State, id: &FileBackupId) -> Result<FileBackupV2Reader, RpcError> {
-    s.unlocked()?
-        .open_file_backup_v2(id)
-        .map_err(|e| backup_error(&e))
+/// The unlocked vault's backups v2, to open outside the state lock (a
+/// backup's metadata is read and opened there, up to 17 MB of it), and
+/// the count of locks it was taken at.
+fn backups_of(shared: &Shared) -> Result<(FileBackupsV2, u64), RpcError> {
+    let mut s = locked(&shared.state);
+    let b = s
+        .unlocked()?
+        .file_backups_v2()
+        .map_err(|e| backup_error(&e))?;
+    Ok((b, s.backups().locks))
+}
+
+/// Opens backup `id`, outside the state lock.
+fn open_reader(shared: &Shared, id: &FileBackupId) -> Result<FileBackupV2Reader, RpcError> {
+    let (b, _) = backups_of(shared)?;
+    b.open(id).map_err(|e| backup_error(&e))
 }
 
 /// A committed backup's answer to a caller that may not change it, or to
 /// its creator: `backup_frozen` for the creator, `not_backup_owner` for
 /// anyone else, `no_such_backup` when there is none.
-fn not_in_progress(s: &State, id: &FileBackupId, peer: &PeerIdentity) -> RpcError {
-    match open_reader(s, id) {
+fn not_in_progress(shared: &Shared, id: &FileBackupId, peer: &PeerIdentity) -> RpcError {
+    match open_reader(shared, id) {
         Ok(r) if owner_may_act(&r.meta().creator.owner, peer) => {
             RpcError::new(ErrorKind::BackupFrozen)
         }
@@ -502,21 +527,27 @@ fn not_in_progress(s: &State, id: &FileBackupId, peer: &PeerIdentity) -> RpcErro
     }
 }
 
-/// The writer of backup `id` in progress, for its creator only.
+/// The writer of backup `id` in progress, for its creator only; the
+/// upload counts as used now.
 fn writer_for(
     shared: &Shared,
     id: &FileBackupId,
     peer: &PeerIdentity,
 ) -> Result<(SharedWriter, SubjectSummary, BackupPurpose), RpcError> {
-    let mut s = locked(&shared.state);
-    s.unlocked()?;
-    match s.backups().uploads.get(id) {
-        Some(u) if owner_may_act(&u.owner, peer) => {
-            Ok((Arc::clone(&u.writer), u.subject.clone(), u.purpose))
+    {
+        let mut s = locked(&shared.state);
+        s.unlocked()?;
+        let awake = shared.clocks.awake();
+        match s.backups().uploads.get_mut(id) {
+            Some(u) if owner_may_act(&u.owner, peer) => {
+                u.last_used = awake;
+                return Ok((Arc::clone(&u.writer), u.subject.clone(), u.purpose));
+            }
+            Some(_) => return Err(RpcError::new(ErrorKind::NotBackupOwner)),
+            None => {}
         }
-        Some(_) => Err(RpcError::new(ErrorKind::NotBackupOwner)),
-        None => Err(not_in_progress(&s, id, peer)),
     }
+    Err(not_in_progress(shared, id, peer))
 }
 
 /// `backup.v2.begin`. See the module documentation.
@@ -564,7 +595,14 @@ pub fn begin(
     let mut s = locked(&shared.state);
     s.unlocked()?;
     s.backups().sweep(shared.clocks.awake());
-    if s.backups().uploads.len() >= MAX_UPLOADS {
+    let root = caller.root();
+    let of_root = s
+        .backups()
+        .uploads
+        .values()
+        .filter(|u| u.root == root)
+        .count();
+    if s.backups().uploads.len() >= MAX_UPLOADS || of_root >= MAX_UPLOADS_PER_ROOT {
         return Err(RpcError::new(ErrorKind::Busy));
     }
     let v = s.unlocked()?;
@@ -580,9 +618,11 @@ pub fn begin(
     let id = w.id();
     let upload = Upload {
         owner: owner_of(peer),
+        root,
         writer: Arc::new(Mutex::new(Some(Box::new(w)))),
         subject: subject_summary(peer, &caller),
         purpose,
+        last_used: shared.clocks.awake(),
     };
     s.backups().uploads.insert(id, upload);
     Ok(BackupBegunView {
@@ -684,7 +724,7 @@ pub fn record_result(
 ) -> Result<BackupResultView, RpcError> {
     let id = parse_id(&p.id)?;
     let after = parse_sha256(&p.sha256_after).ok_or_else(invalid)?;
-    let reader = {
+    {
         let mut s = locked(&shared.state);
         s.unlocked()?;
         if let Some(u) = s.backups().uploads.get(&id) {
@@ -695,8 +735,8 @@ pub fn record_result(
                 RpcError::new(ErrorKind::NotBackupOwner)
             });
         }
-        open_reader(&s, &id)?
-    };
+    }
+    let reader = open_reader(shared, &id)?;
     // From the creator, while it lives (D-07): once it has exited the
     // backup stays `result_unrecorded`, whoever holds its connection.
     if !owner_may_act(&reader.meta().creator.owner, peer) {
@@ -812,8 +852,7 @@ pub fn open_restore(
     refuse_unless_prover(shared, peer, &caller, METHOD)?;
     // What the backup is, before the passphrase is looked at.
     let (reader, results) = {
-        let mut s = locked(&shared.state);
-        let r = open_reader(&s, &id)?;
+        let r = open_reader(shared, &id)?;
         let results = r.results().map_err(|e| backup_error(&e))?;
         // The approval-origin boundary, as for a pending request: not from
         // a session or terminal of the chain of the agent or unknown process
@@ -821,7 +860,7 @@ pub fn open_restore(
         let c = &r.meta().creator;
         if c.kind != CreatorKind::Terminal && shares_with_creator(&caller, c) {
             let r = ProofRefusal::RequesterTerminal;
-            s.audit(AuditEvent::ProofRefused {
+            shared.audit(AuditEvent::ProofRefused {
                 pid: peer.pid,
                 method: METHOD,
                 reason: r.token(),
@@ -963,20 +1002,28 @@ pub fn read(
     })
 }
 
-/// `backup.v2.list`.
+/// `backup.v2.list`. The backups are opened outside the state lock; a
+/// lock while they are read ends the call (`vault_locked`).
 pub fn list(shared: &Shared, _p: NoParams) -> Result<BackupListView, RpcError> {
-    let mut s = locked(&shared.state);
-    s.backups().sweep(shared.clocks.awake());
-    let open_leases = u32::try_from(s.backups().leases.len()).unwrap_or(u32::MAX);
-    let v = s.unlocked()?;
-    let mut found = list_file_backups_v2(v.paths()).map_err(|e| backup_error(&e))?;
+    let open_leases = {
+        let mut s = locked(&shared.state);
+        s.backups().sweep(shared.clocks.awake());
+        u32::try_from(s.backups().leases.len()).unwrap_or(u32::MAX)
+    };
+    let (b, locks) = backups_of(shared)?;
+    let mut found = list_file_backups_v2(b.paths()).map_err(|e| backup_error(&e))?;
     found.reverse();
     let truncated = found.len() > MAX_LISTED;
     found.truncate(MAX_LISTED);
-    let backups = found
-        .into_iter()
-        .map(|b| entry(v, &b.id, b.created_at))
-        .collect();
+    let mut backups = Vec::with_capacity(found.len());
+    for listed in found {
+        backups.push(entry(&b, &listed.id, listed.created_at));
+        envcloak_sys::pause_point("backup.v2.list");
+    }
+    drop(b);
+    if locked(&shared.state).backups().locks != locks {
+        return Err(RpcError::new(ErrorKind::VaultLocked));
+    }
     Ok(BackupListView {
         backups,
         truncated,
@@ -984,9 +1031,9 @@ pub fn list(shared: &Shared, _p: NoParams) -> Result<BackupListView, RpcError> {
     })
 }
 
-fn entry(v: &Vault, id: &FileBackupId, created_at: u64) -> BackupEntryView {
-    let opened = v
-        .open_file_backup_v2(id)
+fn entry(b: &FileBackupsV2, id: &FileBackupId, created_at: u64) -> BackupEntryView {
+    let opened = b
+        .open(id)
         .and_then(|r| r.results().map(|results| (r, results)));
     match opened {
         Ok((r, results)) => {
@@ -1192,47 +1239,109 @@ mod tests {
         }
     }
 
-    fn test_reader() -> Arc<FileBackupV2Reader> {
-        use std::sync::OnceLock;
-        static READER: OnceLock<(tempfile::TempDir, Arc<FileBackupV2Reader>)> = OnceLock::new();
-        let (_, r) = READER.get_or_init(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let paths = envcloak_core::vault::VaultPaths::under(dir.path().join("data"));
-            let (v, _) = envcloak_core::create_vault(
-                &paths,
-                &envcloak_core::SecretBytes::copy_from(b"a test passphrase, not a fixture"),
-                envcloak_core::crypto::KdfParams::minimum(),
-            )
-            .unwrap();
-            let mut w = v
-                .begin_file_backup_v2(
-                    BackupPurpose::Scrub,
-                    BackupCreator {
-                        kind: CreatorKind::Terminal,
-                        evidence_digest: [0; 32],
-                        agent: None,
-                        owner: BackupOwner {
-                            pid: 1,
-                            start_time: 1,
-                            token: None,
-                            boot: None,
-                        },
-                        chain: Vec::new(),
+    /// A backup in progress goes when its creator exits, and after
+    /// [`UPLOAD_IDLE`] without a call (an injected clock), so no process
+    /// holds a slot it does not use.
+    #[test]
+    fn an_upload_ends_after_its_idle_limit_or_when_its_creator_exits() {
+        let me = envcloak_sys::proc_info(i32::try_from(std::process::id()).unwrap()).unwrap();
+        let owner = BackupOwner {
+            pid: me.pid,
+            start_time: me.start_time.raw(),
+            token: None,
+            boot: this_boot(),
+        };
+        let gone = BackupOwner {
+            start_time: me.start_time.raw() + 1,
+            ..owner
+        };
+        let t0 = Duration::from_secs(1000);
+        let mut reg = Registry::default();
+        for (n, o) in [(1u8, owner), (2, gone)] {
+            reg.uploads.insert(
+                FileBackupId([n; 16]),
+                Upload {
+                    owner: o,
+                    root: ProcessInstance {
+                        pid: me.pid,
+                        start_time: me.start_time,
+                        pidversion: None,
+                        exe: None,
                     },
-                    vec![PlannedFile {
-                        path: "/h/.env".into(),
-                        mode: 0o600,
-                        size: 0,
-                    }],
-                    1_790_000_000,
+                    writer: Arc::new(Mutex::new(Some(Box::new(test_writer())))),
+                    subject: SubjectSummary::default(),
+                    purpose: BackupPurpose::Scrub,
+                    last_used: t0,
+                },
+            );
+        }
+        reg.sweep(t0);
+        assert_eq!(
+            reg.uploads.len(),
+            1,
+            "the upload of an exited creator stays"
+        );
+        reg.sweep(t0 + UPLOAD_IDLE);
+        assert_eq!(
+            reg.uploads.len(),
+            1,
+            "an upload ended before its idle limit"
+        );
+        reg.sweep(t0 + UPLOAD_IDLE + Duration::from_secs(1));
+        assert_eq!(reg.uploads.len(), 0, "an upload outlived its idle limit");
+    }
+
+    /// Runs `f` on this thread's vault for the unit tests' backups, made
+    /// once per thread.
+    fn with_test_vault<R>(f: impl FnOnce(&envcloak_core::vault::Vault) -> R) -> R {
+        thread_local! {
+            static VAULT: (tempfile::TempDir, envcloak_core::vault::Vault) = {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = envcloak_core::vault::VaultPaths::under(dir.path().join("data"));
+                let (v, _) = envcloak_core::create_vault(
+                    &paths,
+                    &envcloak_core::SecretBytes::copy_from(b"a test passphrase, not a fixture"),
+                    envcloak_core::crypto::KdfParams::minimum(),
                 )
                 .unwrap();
-            w.put(0, 0, &envcloak_core::SecretBytes::copy_from(b""))
-                .unwrap();
-            let id = w.commit().unwrap().id;
-            let r = Arc::new(v.open_file_backup_v2(&id).unwrap());
-            (dir, r)
-        });
-        Arc::clone(r)
+                (dir, v)
+            };
+        }
+        VAULT.with(|(_, v)| f(v))
+    }
+
+    fn test_writer() -> FileBackupV2Writer {
+        with_test_vault(|v| {
+            v.begin_file_backup_v2(
+                BackupPurpose::Scrub,
+                BackupCreator {
+                    kind: CreatorKind::Terminal,
+                    evidence_digest: [0; 32],
+                    agent: None,
+                    owner: BackupOwner {
+                        pid: 1,
+                        start_time: 1,
+                        token: None,
+                        boot: None,
+                    },
+                    chain: Vec::new(),
+                },
+                vec![PlannedFile {
+                    path: "/h/.env".into(),
+                    mode: 0o600,
+                    size: 0,
+                }],
+                1_790_000_000,
+            )
+            .unwrap()
+        })
+    }
+
+    fn test_reader() -> Arc<FileBackupV2Reader> {
+        let mut w = test_writer();
+        w.put(0, 0, &envcloak_core::SecretBytes::copy_from(b""))
+            .unwrap();
+        let id = w.commit().unwrap().id;
+        Arc::new(with_test_vault(|v| v.open_file_backup_v2(&id).unwrap()))
     }
 }
