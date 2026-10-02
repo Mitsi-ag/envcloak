@@ -135,6 +135,48 @@ fn a_save_after_the_file_was_hashed_is_kept() {
     no_temps(d.path());
 }
 
+/// A file changed while it is hashed is kept (`changed`) before any chunk
+/// is asked for: here it is written over in place with the very bytes the
+/// change left, after its stamp was read and before it is read, so its
+/// SHA-256 still matches, and only its stamp tells.
+#[test]
+fn a_file_changed_while_it_is_hashed_is_kept_and_no_chunk_is_read() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join("config.toml");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(d.path()).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    let mut did = false;
+    let mut asked = 0;
+    let e = restore_over_left_observed(
+        &r,
+        Path::new("config.toml"),
+        &file,
+        &mut |c| {
+            asked += 1;
+            Some(chunk_of(&body, c))
+        },
+        &mut |at| {
+            if at == Inside::Opened {
+                let mut w = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+                std::io::Write::write_all(&mut w, LEFT).unwrap();
+                w.set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+                )
+                .unwrap();
+                did = true;
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(did);
+    assert_eq!(e.kind, ModifyErrorKind::Changed);
+    assert_eq!(asked, 0, "a chunk was asked for a file that changed");
+    assert_eq!(std::fs::read(&p).unwrap(), LEFT);
+    no_temps(d.path());
+}
+
 /// Contents that do not come whole are never written in the file's place
 /// (`backup_unread`): a chunk that does not come, one of another length,
 /// and chunks of the right lengths whose whole is not the backed-up

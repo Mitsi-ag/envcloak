@@ -21,9 +21,10 @@
 //!   SHA-256 is the one the daemon recorded after the change
 //!   (`backup.v2.record_result`), and only while it is still the file
 //!   that was hashed when the new one takes its name; and only when the
-//!   contents the chunks make up have the backed-up SHA-256. `scrub
-//!   --undo`, `agents migrate-mcp --undo` and `init --undo` write back
-//!   through it.
+//!   contents the chunks make up have the backed-up SHA-256. It is the
+//!   write-back the backup v2 undo commands of M2-16, M2-20 and M2-22 are
+//!   to call (docs/IPC.md "Backups v2", "Writing back"); `init --undo`
+//!   restores its v1 backups through [`restore_over`].
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -134,8 +135,9 @@ pub fn restore_over_left(
     restore_over_left_observed(r, rel, file, chunk, &mut |_| {})
 }
 
-/// [`restore_over_left`], telling `observe` when the file was hashed and
-/// when the new contents are staged, checked and swapped in.
+/// [`restore_over_left`], telling `observe` when the file is open and
+/// about to be hashed, when it was hashed, and when the new contents are
+/// staged, checked and swapped in.
 ///
 /// # Errors
 /// As [`restore_over_left`].
@@ -162,6 +164,7 @@ pub fn restore_over_left_observed(
     if stamp.nlink > 1 {
         return Err(fail(ModifyErrorKind::HardLinked));
     }
+    observe(Inside::Opened);
     let now = digest_of(&mut f, &stamp).map_err(fail)?;
     drop(f);
     if now != file.sha256_after {
@@ -175,8 +178,9 @@ pub fn restore_over_left_observed(
 }
 
 /// The SHA-256 of `f`, which must hold exactly the bytes `stamp` says and
-/// still have that stamp once read (else [`ModifyErrorKind::Changed`]).
-/// The bytes pass through a buffer wiped after.
+/// still have that stamp once read (else [`ModifyErrorKind::Changed`]), so
+/// a file changed while it was hashed is refused before a chunk is asked
+/// for. The bytes pass through a buffer wiped after.
 fn digest_of(f: &mut File, stamp: &FileStamp) -> Result<[u8; 32], ModifyErrorKind> {
     let size = stamp.size;
     let mut buf = Zeroizing::new(vec![0u8; 64 * 1024]);
