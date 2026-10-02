@@ -332,6 +332,16 @@ impl Installed {
     }
 }
 
+/// When process `pid` started, in the kernel's units, as the daemon records
+/// a process instance (`envcloak_sys::process_start_time`); `None` when
+/// there is no such process.
+pub fn start_time(pid: u32) -> Option<u64> {
+    let pid = i32::try_from(pid).ok()?;
+    envcloak_sys::process_start_time(pid)
+        .ok()
+        .map(envcloak_sys::StartTime::raw)
+}
+
 /// `found`, or `None` after saying why on standard error when no host has
 /// been installed on this machine ([`cache_dir`] does not exist) and
 /// [`REQUIRE_VAR`] is not set. Otherwise a host that is not there fails
