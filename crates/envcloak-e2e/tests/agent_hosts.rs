@@ -3328,7 +3328,7 @@ fn tier_2_gemini_cli_speaks_neither_protocol() {
 
 /// Cursor CLI: no documented base-URL setting; with every proxy variable
 /// at the scripted model, all it tries is a tunnel to its own servers.
-/// Not drivable, measured.
+/// Not drivable, measured ([`cursor_stopped_at_its_tunnel`]).
 #[test]
 fn tier_2_cursor_cli_has_no_base_url() {
     let Some(run) = tier_2("cursor-cli", "native", None, |_, model, cmd| {
@@ -3337,9 +3337,160 @@ fn tier_2_cursor_cli_has_no_base_url() {
     }) else {
         return;
     };
-    assert!(
-        run.report.model_endpoints().is_empty(),
-        "Cursor CLI reached the scripted model itself: {:?}",
-        run.report.requests
-    );
+    if let Err(why) = cursor_stopped_at_its_tunnel(&run) {
+        panic!("Cursor CLI's run is not the measurement: {why}");
+    }
+}
+
+/// Where Cursor CLI reaches for its model, as a tunnel through the proxy.
+const CURSOR_API: &str = "api2.cursor.sh:443";
+
+/// What Cursor CLI says when it stops on the refused tunnel.
+const CURSOR_STOPS: &str = "Failed to reach the Cursor API";
+
+/// Whether a Cursor CLI run is what docs/ACCEPTANCE.md records for it:
+/// the scripted model's run complete and clean, nothing served, every
+/// request it recorded a tunnel to [`CURSOR_API`], refused (403) with the
+/// reply sent, at least one, and the host stopping on it, saying
+/// [`CURSOR_STOPS`], with an exit code that is not 0. A run with no
+/// traffic, one that failed some other way (another message, a signal, a
+/// success), or an incomplete record is not that measurement (Codex
+/// review, low: only "no request to the model itself" was checked, which
+/// a host that never started passed). Why not, naming no request target.
+fn cursor_stopped_at_its_tunnel(run: &Tier2Run) -> Result<(), String> {
+    let report = &run.report;
+    if !report.clean() {
+        return Err(format!(
+            "the scripted model's run is not clean: {}",
+            report.outcome
+        ));
+    }
+    if !report.model_endpoints().is_empty() {
+        return Err("it reached the scripted model itself".to_owned());
+    }
+    let tunnels = report
+        .requests
+        .iter()
+        .filter(|r| {
+            r.api.as_deref() == Some("connect")
+                && r.path == CURSOR_API
+                && r.status == 403
+                && r.answered
+        })
+        .count();
+    if tunnels == 0 {
+        return Err(format!("no refused tunnel to {CURSOR_API}"));
+    }
+    if tunnels != report.requests.len()
+        || report.outcome["connect"].as_u64() != Some(tunnels as u64)
+    {
+        return Err(format!(
+            "{} request(s) other than a refused tunnel to {CURSOR_API}",
+            report.requests.len() - tunnels
+        ));
+    }
+    match run.output.status.code() {
+        Some(code) if code != 0 => {}
+        other => return Err(format!("it did not stop with a failure: exit {other:?}")),
+    }
+    let said = [&run.output.stdout, &run.output.stderr]
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .concat();
+    if !said.contains(CURSOR_STOPS) {
+        return Err(format!(
+            "it did not stop on the refused tunnel (no {CURSOR_STOPS:?})"
+        ));
+    }
+    Ok(())
+}
+
+/// The Cursor check takes only the measured run: a refused tunnel to its
+/// API, then the host stopping on it. The control passes; a run with no
+/// traffic, one stopped by another failure or a signal, one that
+/// succeeded, an incomplete or unclean record, a tunnel elsewhere or one
+/// besides, and a request to the model itself all fail (Codex review,
+/// low).
+#[test]
+fn cursor_s_measurement_is_its_refused_tunnel_and_nothing_else() {
+    use envcloak_testkit::agents::{ModelReport, ModelRequest};
+    use std::os::unix::process::ExitStatusExt as _;
+    let tunnel = |seq: u64, path: &str| ModelRequest {
+        seq,
+        at_ms: 0,
+        method: "CONNECT".to_owned(),
+        path: path.to_owned(),
+        query: None,
+        headers: Vec::new(),
+        header_values: Vec::new(),
+        forward: Vec::new().into(),
+        status: 403,
+        answered: true,
+        api: Some("connect".to_owned()),
+        pick: None,
+        body: Vec::new().into(),
+    };
+    let outcome = json!({"bad_peer": 0, "bad_token": 0, "busy": 0, "connect": 1,
+        "exhausted": 0, "incomplete": [], "malformed": 0, "mismatch": 0,
+        "unanswered": 0, "unknown": 0});
+    let good = || Tier2Run {
+        report: ModelReport {
+            requests: vec![tunnel(1, CURSOR_API)],
+            outcome: outcome.clone(),
+        },
+        output: std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: format!("Error: {CURSOR_STOPS}\n").into_bytes(),
+        },
+    };
+    assert_eq!(cursor_stopped_at_its_tunnel(&good()), Ok(()));
+    let mut failed: Vec<(&str, Tier2Run)> = Vec::new();
+    let mut run = good();
+    run.report.requests.clear();
+    run.report.outcome["connect"] = json!(0);
+    failed.push(("no traffic, the same failure", run));
+    let mut run = good();
+    run.output.stderr = b"Segmentation fault\n".to_vec();
+    failed.push(("an unrelated failure", run));
+    let mut run = good();
+    run.output.status = std::process::ExitStatus::from_raw(libc::SIGKILL);
+    failed.push(("killed by a signal", run));
+    let mut run = good();
+    run.output.status = std::process::ExitStatus::from_raw(0);
+    failed.push(("a success", run));
+    let mut run = good();
+    run.report.outcome["incomplete"] = json!(["time_limit"]);
+    failed.push(("an incomplete record", run));
+    let mut run = good();
+    run.report.outcome["malformed"] = json!(1);
+    failed.push(("a malformed request", run));
+    let mut run = good();
+    run.report.requests[0].answered = false;
+    failed.push(("a refusal never sent", run));
+    let mut run = good();
+    run.report.requests[0] = tunnel(1, "elsewhere.example:443");
+    failed.push(("a tunnel elsewhere", run));
+    let mut run = good();
+    run.report.requests.push(tunnel(2, "elsewhere.example:443"));
+    run.report.outcome["connect"] = json!(2);
+    failed.push(("a tunnel besides", run));
+    let mut run = good();
+    run.report.outcome["connect"] = json!(2);
+    failed.push(("a tunnel the record lacks", run));
+    let mut run = good();
+    run.report.requests.push(ModelRequest {
+        method: "POST".to_owned(),
+        path: "/v1/messages".to_owned(),
+        status: 200,
+        api: Some("messages".to_owned()),
+        pick: Some("step 0".to_owned()),
+        ..tunnel(2, "")
+    });
+    failed.push(("a request to the model itself", run));
+    for (what, run) in &failed {
+        assert!(
+            cursor_stopped_at_its_tunnel(run).is_err(),
+            "{what} passed as the measurement"
+        );
+    }
 }
