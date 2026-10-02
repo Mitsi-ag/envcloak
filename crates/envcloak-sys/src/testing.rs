@@ -972,6 +972,34 @@ pub(crate) fn panic_point(site: &str) {
     );
 }
 
+/// Names the [`crate::pause_point`] a test build stops at.
+pub const PAUSE_SITE: &str = "ENVCLOAK_TEST_PAUSE";
+/// Names the file whose existence lets a stopped [`crate::pause_point`] go
+/// on.
+pub const PAUSE_RELEASE: &str = "ENVCLOAK_TEST_PAUSE_RELEASE";
+
+/// Stops at `site` when [`PAUSE_SITE`] names it, until the file
+/// [`PAUSE_RELEASE`] names exists (at most a minute).
+pub(crate) fn pause_point(site: &str) {
+    if std::env::var_os(PAUSE_SITE).is_none_or(|s| s != site) {
+        return;
+    }
+    let Some(release) = std::env::var_os(PAUSE_RELEASE).map(std::path::PathBuf::from) else {
+        return;
+    };
+    if release.exists() {
+        return;
+    }
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "envcloak test: paused at {site}");
+    }
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !release.exists() && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Names the time, in milliseconds, a test build of `envcloakd` waits for
 /// a frame to start on an open connection, in place of its bound
 /// ([`crate::idle_connection_override`]).

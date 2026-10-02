@@ -257,10 +257,18 @@ struct Fixture {
     seed: u64,
     home: TestHome,
     d: Daemon,
+    /// The file that lets the daemon go on from its pause point.
+    release: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::pausing(None)
+    }
+
+    /// A fixture whose daemon stops at the pause point `site`, when given,
+    /// until [`Fixture::release`] (`envcloak_sys::pause_point`).
+    fn pausing(site: Option<&str>) -> Self {
         common::terminal_session();
         let seed = fresh_seed();
         let cs = canaries(seed);
@@ -268,9 +276,36 @@ impl Fixture {
         let kit = seed_vault(&home, &cs);
         let mut cs = cs;
         cs.push(kit);
-        let d = Self::daemon(&home);
+        let release = home.home().join("pause-released");
+        let mut cmd = Command::new(common::exe());
+        home.apply(&mut cmd).env(envcloak_sys::testing::TRACE, "1");
+        if let Some(site) = site {
+            cmd.env(envcloak_sys::testing::PAUSE_SITE, site)
+                .env(envcloak_sys::testing::PAUSE_RELEASE, &release);
+        }
+        let d = Daemon::start_command(cmd, &[]);
         client(&home).unlock(passphrase(&cs), &[]).unwrap();
-        Fixture { cs, seed, home, d }
+        Fixture {
+            cs,
+            seed,
+            home,
+            d,
+            release,
+        }
+    }
+
+    /// Waits until the daemon stops at its pause point `site`.
+    fn wait_paused(&mut self, site: &str) {
+        let line = format!("envcloak test: paused at {site}");
+        assert!(
+            self.d.wait_for_log(&line, Duration::from_secs(30)),
+            "the daemon never stopped at {site}"
+        );
+    }
+
+    /// Lets the daemon go on from its pause point.
+    fn release(&self) {
+        std::fs::write(&self.release, b"").unwrap();
     }
 
     fn daemon(home: &TestHome) -> Daemon {
@@ -1449,4 +1484,83 @@ fn a_connection_handed_on_does_not_act_for_a_creator_that_exited() {
     let lease = f.open(&id, false, true).unwrap();
     assert_eq!(lease.statement.files[0].sha256_after, None);
     f.sweep();
+}
+
+/// A lock stops a call already in flight (SPEC "Lock"; D-07): the daemon
+/// is stopped by a barrier in `read` after it decrypted a chunk, in `put`
+/// after it wrote one and in `commit` after the metadata is sealed and
+/// before the backup is put in place, and the vault is locked meanwhile.
+/// The read then delivers nothing (`no_such_lease`), the put and the
+/// commit report the backup ended, and after the next unlock no backup
+/// is listed or left in `backups/`, staging directories included.
+#[test]
+fn a_lock_stops_a_call_in_flight() {
+    for site in ["backup.v2.read", "backup.v2.put", "backup.v2.commit"] {
+        let mut f = Fixture::pausing(Some(site));
+        let files = [Spec::made(&f.claude("projects/p/f.jsonl"), 3000, 16)];
+        let cs: Vec<Canary> = f.files_cs().to_vec();
+        let paths = f.paths();
+        let begin = || {
+            client(&f.home)
+                .backup_v2_begin(&begin_params("scrub", &files, &[]))
+                .unwrap()
+                .id
+        };
+        let in_flight: std::thread::JoinHandle<Result<(), ClientError>> = match site {
+            "backup.v2.read" => {
+                let id = begin();
+                put_all(&paths, &cs, &id, &files).unwrap();
+                client(&f.home).backup_v2_commit(&id).unwrap();
+                let lease = f.open(&id, false, true).unwrap().lease;
+                std::thread::spawn(move || {
+                    Client::connect(&paths)?
+                        .backup_v2_read(&lease, 0, 0)
+                        .map(drop)
+                })
+            }
+            "backup.v2.put" => {
+                let id = begin();
+                let data = SecretBytes::from_vec(files[0].chunk(&cs, 0));
+                std::thread::spawn(move || {
+                    Client::connect(&paths)?
+                        .backup_v2_put(&id, 0, 0, data)
+                        .map(drop)
+                })
+            }
+            _ => {
+                let id = begin();
+                put_all(&paths, &cs, &id, &files).unwrap();
+                std::thread::spawn(move || Client::connect(&paths)?.backup_v2_commit(&id).map(drop))
+            }
+        };
+        f.wait_paused(site);
+        client(&f.home).lock().unwrap();
+        f.release();
+        let e = in_flight
+            .join()
+            .unwrap()
+            .err()
+            .unwrap_or_else(|| panic!("{site}: the call in flight went through the lock"));
+        let (kind, _) = rpc(e);
+        let ended = [
+            ErrorKind::NoSuchLease,
+            ErrorKind::NoSuchBackup,
+            ErrorKind::VaultLocked,
+        ];
+        assert!(ended.contains(&kind), "{site}: {kind:?}");
+        client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
+        let l = f.list();
+        let backups = data_dir(&f.home).join("backups");
+        let left: Vec<String> = std::fs::read_dir(&backups)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        if site == "backup.v2.read" {
+            assert_eq!((l.backups.len(), l.open_leases), (1, 0), "{site}");
+        } else {
+            assert!(l.backups.is_empty(), "{site}: {l:?}");
+            assert!(left.is_empty(), "{site}: {left:?}");
+        }
+        f.sweep();
+    }
 }

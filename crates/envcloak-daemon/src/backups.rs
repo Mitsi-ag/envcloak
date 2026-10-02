@@ -599,16 +599,37 @@ pub fn put(
     let id = parse_id(&p.id)?;
     refuse_if_traced()?;
     let (writer, _, _) = writer_for(shared, &id, peer)?;
-    let mut g = locked(&writer);
-    let w = g.as_mut().ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
-    let last = w
-        .put(
+    let last = {
+        let mut g = locked(&writer);
+        let w = g.as_mut().ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
+        w.put(
             usize::try_from(p.file).map_err(|_| invalid())?,
             u64::from(p.chunk),
             &data,
         )
-        .map_err(|e| backup_error(&e))?;
+        .map_err(|e| backup_error(&e))?
+    };
+    envcloak_sys::pause_point("backup.v2.put");
+    // A lock, or the owner's exit, while the chunk was written ended the
+    // backup: the answer says so, never that the chunk is in.
+    still_in_progress(&mut locked(&shared.state), &id, &writer)?;
     Ok(BackupPutView { last })
+}
+
+/// Fails unless `writer` is still backup `id`'s in progress, the vault
+/// unlocked and the owner alive: a call that took the writer before a
+/// lock (which drops every backup in progress) or before its owner
+/// exited reports the backup ended (`vault_locked`, `no_such_backup`).
+fn still_in_progress(
+    s: &mut State,
+    id: &FileBackupId,
+    writer: &SharedWriter,
+) -> Result<(), RpcError> {
+    s.unlocked()?;
+    match s.backups().uploads.get(id) {
+        Some(u) if Arc::ptr_eq(&u.writer, writer) && owner_alive(&u.owner) => Ok(()),
+        _ => Err(RpcError::new(ErrorKind::NoSuchBackup)),
+    }
 }
 
 /// `backup.v2.commit`.
@@ -619,14 +640,25 @@ pub fn commit(
 ) -> Result<BackupCommittedView, RpcError> {
     let id = parse_id(&p.id)?;
     let (writer, subject, purpose) = writer_for(shared, &id, peer)?;
-    let done = {
+    {
         let mut g = locked(&writer);
         let w = g.as_mut().ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
-        w.commit().map_err(|e| backup_error(&e))?
-    };
+        w.seal().map_err(|e| backup_error(&e))?;
+    }
+    envcloak_sys::pause_point("backup.v2.commit");
+    // The backup is put in place under the state lock, only while it is
+    // still in progress: a lock while the metadata was sealed ended it,
+    // and a lock now waits until it is in place. Either way the upload
+    // goes, and with its last handle the writer (and a staging directory
+    // never put in place).
     let mut s = locked(&shared.state);
-    // The writer is dropped where it is, with the last of its handles.
+    let installed = still_in_progress(&mut s, &id, &writer).and_then(|()| {
+        let mut g = locked(&writer);
+        let w = g.as_mut().ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
+        w.install().map_err(|e| backup_error(&e))
+    });
     s.backups().uploads.remove(&id);
+    let done = installed?;
     s.audit(AuditEvent::BackupV2Committed {
         pid: peer.pid,
         subject,
@@ -902,6 +934,22 @@ pub fn read(
     let (data, last) = reader
         .chunk(file, u64::from(p.chunk))
         .map_err(|e| backup_error(&e))?;
+    envcloak_sys::pause_point("backup.v2.read");
+    // A delivery (SPEC "Lock"): the chunk goes out only while the lease
+    // still stands, checked under the state lock after it was read. A
+    // lock, the lease's end or its owner's exit meanwhile delivers
+    // nothing.
+    {
+        let mut s = locked(&shared.state);
+        let standing = s.unlocked().is_ok()
+            && s.backups()
+                .leases
+                .get(&lease)
+                .is_some_and(|l| owner_may_act(&l.owner, peer));
+        if !standing {
+            return Err(none());
+        }
+    }
     Ok(BackupChunk {
         data: WireSecret::new(data),
         last,
