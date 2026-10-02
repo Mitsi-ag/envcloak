@@ -167,6 +167,17 @@ fn s0(host: Host, shell: Shell, name: &str) {
     for (label, bytes) in &results {
         h.add_needle(format!("{label} of a fixture"), bytes.clone());
     }
+    // Where each result holds its value, which a frame's markers must
+    // cover: the oracle again, on other values of the same shape, and
+    // where the two differ (verifier, low: a frame with its value redacted
+    // only in part passed).
+    let others: Vec<(&str, Vec<u8>)> = values.iter().map(|(n, v)| (*n, other_value(v))).collect();
+    let other_pairs: Vec<(&str, &[u8])> = others.iter().map(|(n, v)| (*n, v.as_slice())).collect();
+    let cores = cores(
+        &results,
+        &emitters.oracle(&repo.join("emit.json"), &other_pairs),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
     vault_and_import(&mut h, &repo);
 
     let mut agent = AgentHome::within(&h.home, host, installed);
@@ -343,6 +354,7 @@ fn s0(host: Host, shell: Shell, name: &str) {
                 &streams,
                 &emitters,
                 &results,
+                &cores,
                 &values,
             ) {
                 panic!("the rerun: {why}:\n{shown}");
@@ -626,6 +638,7 @@ fn delivered(
     streams: &[Vec<u8>; 2],
     emitters: &Emitters,
     results: &[(String, Vec<u8>)],
+    cores: &BTreeMap<String, std::ops::Range<usize>>,
     values: &BTreeMap<&str, Vec<u8>>,
 ) -> Result<(), String> {
     if invocation(output, nonce) != Some(1) {
@@ -657,7 +670,7 @@ fn delivered(
     if !output.contains(&listed) || !output.contains("DONE") {
         return Err(format!("no {listed:?} and DONE"));
     }
-    frames(streams, results)?;
+    frames(streams, results, cores)?;
     let digests: BTreeMap<(&str, &str), &str> = out
         .lines()
         .filter_map(|l| {
@@ -690,19 +703,104 @@ fn slug_of(name: &str) -> Option<&'static str> {
     }
 }
 
+/// `value` with every letter and digit replaced by another of its kind
+/// (letters rotated by 13, digits by 5) and every other byte kept: what
+/// the oracle is run on a second time, so each result keeps its length in
+/// every encoding the serializers use and differs where it holds the
+/// value ([`value_span`]). Never a value of the vault: it is held here
+/// only, for the oracle.
+fn other_value(value: &[u8]) -> Vec<u8> {
+    value
+        .iter()
+        .map(|b| match b {
+            b'a'..=b'z' => b'a' + (b - b'a' + 13) % 26,
+            b'A'..=b'Z' => b'A' + (b - b'A' + 13) % 26,
+            b'0'..=b'9' => b'0' + (b - b'0' + 5) % 10,
+            other => *other,
+        })
+        .collect()
+}
+
+/// The span of `result` that holds its value: from the first byte to the
+/// last that `other` (the same serializer's result for
+/// [`other_value`]) differs in. `None` when the two differ in length or
+/// not at all, where the value's place cannot be told.
+fn value_span(result: &[u8], other: &[u8]) -> Option<std::ops::Range<usize>> {
+    if result.len() != other.len() {
+        return None;
+    }
+    let differs = |i: &usize| result[*i] != other[*i];
+    let start = (0..result.len()).find(differs)?;
+    let end = (0..result.len()).rev().find(differs)? + 1;
+    Some(start..end)
+}
+
+/// What of a result's value span (`span`) a marker must cover: all of it,
+/// but for a base64 result, whose value the redactor finds only as the
+/// 3-byte groups wholly inside it (crates/envcloak-redact, "Coverage"),
+/// up to three characters at each end (two from the value's own bytes
+/// and one shared with what is beside it).
+fn must_cover(label: &str, span: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let base64 = label
+        .split_once('/')
+        .is_some_and(|(_, tag)| tag.starts_with("b64"));
+    if !base64 {
+        return span;
+    }
+    let start = span.start + 3;
+    start..span.end.saturating_sub(3).max(start)
+}
+
+/// For each result, by label, what a marker must cover
+/// ([`value_span`], [`must_cover`]), from the oracle's results for the
+/// fixture values and for [`other_value`]s. Refused, naming the label
+/// only, when the two runs' labels differ or a result's value cannot be
+/// placed, or leaves nothing to cover.
+fn cores(
+    results: &[(String, Vec<u8>)],
+    others: &[(String, Vec<u8>)],
+) -> Result<BTreeMap<String, std::ops::Range<usize>>, String> {
+    let labels = |r: &[(String, Vec<u8>)]| r.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>();
+    if labels(results) != labels(others) {
+        return Err("the two oracle runs made different results".to_owned());
+    }
+    let mut out = BTreeMap::new();
+    for ((label, result), (_, other)) in results.iter().zip(others) {
+        let span =
+            value_span(result, other).ok_or_else(|| format!("{label}'s value cannot be placed"))?;
+        let core = must_cover(label, span);
+        if core.is_empty() {
+            return Err(format!(
+                "{label}'s value leaves nothing a marker must cover"
+            ));
+        }
+        out.insert(label.clone(), core);
+    }
+    Ok(out)
+}
+
 /// Whether every result the oracle made (`<NAME>/<serializer>` and its
 /// bytes) has exactly one whole frame (`<W|`) and one frame written in
 /// pieces (`<B|`) on the two streams together, each payload the result as
 /// the serializer made it with one or more non-empty spans replaced by
-/// its own binding's marker and nothing else changed ([`redacted_from`]):
-/// so a frame with its payload gone, cut short, unredacted or redacted
-/// for another binding fails (verifier, low: only the frame names were
-/// checked). Why not, naming the frame and never its payload.
-fn frames(streams: &[Vec<u8>; 2], results: &[(String, Vec<u8>)]) -> Result<(), String> {
+/// its own binding's marker, those spans covering what `cores` gives for
+/// it, and nothing else changed ([`redacted_from`]): so a frame with its
+/// payload gone, cut short, unredacted, redacted in part or for another
+/// binding fails (verifier, low: only the frame names were checked, then
+/// a value redacted in part passed). Why not, naming the frame and never
+/// its payload.
+fn frames(
+    streams: &[Vec<u8>; 2],
+    results: &[(String, Vec<u8>)],
+    cores: &BTreeMap<String, std::ops::Range<usize>>,
+) -> Result<(), String> {
     for (label, result) in results {
         let name = label.split('/').next().unwrap_or_default();
         let slug = slug_of(name).ok_or_else(|| format!("no binding for {label}"))?;
         let marker = format!("[envcloak:{slug}]");
+        let core = cores
+            .get(label)
+            .ok_or_else(|| format!("no place of the value in {label}"))?;
         for frame in ["<W|", "<B|"] {
             let head = format!("{frame}{label}=");
             let lines: Vec<&[u8]> = streams
@@ -713,7 +811,7 @@ fn frames(streams: &[Vec<u8>; 2], results: &[(String, Vec<u8>)]) -> Result<(), S
             let [line] = lines.as_slice() else {
                 return Err(format!("{} {frame}{label} frame(s), not one", lines.len()));
             };
-            if !redacted_from(&line[head.len()..], result, marker.as_bytes()) {
+            if !redacted_from(&line[head.len()..], result, marker.as_bytes(), core) {
                 return Err(format!(
                     "the {frame}{label} frame is not that result with its value redacted as \
                      {slug}"
@@ -725,11 +823,20 @@ fn frames(streams: &[Vec<u8>; 2], results: &[(String, Vec<u8>)]) -> Result<(), S
 }
 
 /// Whether `payload` is `result` with one or more non-empty spans each
-/// replaced by `marker`, and nothing else changed: the pieces between the
-/// markers are, in order, a prefix of `result`, parts of it, and a suffix
-/// of it, each apart from the next by at least one byte (placed leftmost,
-/// which leaves the most room for the rest).
-fn redacted_from(payload: &[u8], result: &[u8], marker: &[u8]) -> bool {
+/// replaced by `marker`, those spans covering all of `core` (where the
+/// result holds its value, [`cores`]), and nothing else changed: the
+/// pieces between the markers are, in order, a prefix of `result`, parts
+/// of it, and a suffix of it, each apart from the next by at least one
+/// byte, and none of them shows a byte of `core` (a piece left of it ends
+/// at its start at the latest, one right of it starts at its end at the
+/// earliest; an empty piece shows nothing). Each piece is placed
+/// leftmost where it may be, which leaves the most room for the rest.
+fn redacted_from(
+    payload: &[u8],
+    result: &[u8],
+    marker: &[u8],
+    core: &std::ops::Range<usize>,
+) -> bool {
     let mut pieces: Vec<&[u8]> = Vec::new();
     let mut rest = payload;
     while let Some(at) = rest.windows(marker.len()).position(|w| w == marker) {
@@ -744,11 +851,16 @@ fn redacted_from(payload: &[u8], result: &[u8], marker: &[u8]) -> bool {
         return false;
     }
     let limit = result.len() - last.len();
+    if first.len() > core.start || limit < core.end {
+        return false;
+    }
+    let shows_none = |at: usize, len: usize| len == 0 || at + len <= core.start || at >= core.end;
     let mut at = first.len();
     for piece in &middle[..middle.len() - 1] {
         let from = at + 1;
         let Some(found) = result.get(from..limit).and_then(|r| {
-            (0..=r.len().checked_sub(piece.len())?).find(|i| r[*i..].starts_with(piece))
+            (0..=r.len().checked_sub(piece.len())?)
+                .find(|i| r[*i..].starts_with(piece) && shows_none(from + i, piece.len()))
         }) else {
             return false;
         };
@@ -1053,40 +1165,64 @@ fn a_held_run_is_this_invocation_s_and_released_nothing() {
 }
 
 /// A frame is taken only as the serializer's own result with spans of
-/// it replaced by its own binding's marker (verifier, low: frames with
-/// every payload removed passed): the control passes; payloads removed,
-/// cut short where what is left differs from the result, left
-/// unredacted, redacted as another binding, or with anything added, a
-/// frame missing or doubled, all fail, and no reason quotes a payload.
+/// it replaced by its own binding's marker, those spans covering where
+/// the result holds its value (verifier, low: frames with every payload
+/// removed passed; then one redacted only in part, its value's remaining
+/// text visible, passed): the control passes; payloads removed, cut
+/// short where what is left differs from the result, left unredacted or
+/// redacted in part, redacted as another binding, or with anything
+/// added, a frame missing or doubled, all fail, and no reason quotes a
+/// payload.
 #[test]
 fn a_frame_is_its_result_with_the_value_redacted() {
     let m = "[envcloak:openai/acme-web]";
-    for (payload, result, ok) in [
-        (m.to_owned(), "VALUEVALUE", true),
-        (format!("\"{m}\""), "\"VALUEVALUE\"", true),
-        (format!("dT{m}IQ=="), "dTVBTFVFVkFMVUUhIQ==", true),
-        (format!("\"{m}{m}\""), "\"VALUEVALUE\"", true),
-        (format!("a{m}b{m}c"), "aVALUEbVALUEc", true),
-        (String::new(), "VALUEVALUE", false),
-        ("VALUEVALUE".to_owned(), "VALUEVALUE", false),
+    // The base64 of `u`, a value and `!!!`, as `emit.py` makes it at
+    // offset 1: its value spans bytes 1 to 15, and the redactor leaves up
+    // to three characters at each end of that.
+    let b64 = "dVZBTFVFVkFMVUUhISE=";
+    assert_eq!(
+        value_span(b64.as_bytes(), b"dUlOWUhSSU5ZSFIhISE="),
+        Some(1..15)
+    );
+    let b64_core = must_cover("X/b64url-at1", 1..15);
+    assert_eq!(b64_core, 4..12);
+    for (payload, result, core, ok) in [
+        (m.to_owned(), "VALUEVALUE", 0..10, true),
+        (format!("\"{m}\""), "\"VALUEVALUE\"", 1..11, true),
+        (format!("dVZB{m}VUUhISE="), b64, b64_core.clone(), true),
+        (format!("dT{m}IQ=="), "dTVBTFVFVkFMVUUhIQ==", 2..16, true),
+        (format!("\"{m}{m}\""), "\"VALUEVALUE\"", 1..11, true),
+        (format!("a{m}b{m}c"), "aVALUEbVALUEc", 1..6, true),
+        (String::new(), "VALUEVALUE", 0..10, false),
+        ("VALUEVALUE".to_owned(), "VALUEVALUE", 0..10, false),
         // A marker may cover the quote beside the value too.
-        (format!("\"{m}"), "\"VALUEVALUE\"", true),
-        (format!("{m}\""), "\"VALUEVALUE\"", true),
+        (format!("\"{m}"), "\"VALUEVALUE\"", 1..11, true),
+        (format!("{m}\""), "\"VALUEVALUE\"", 1..11, true),
+        // Redacted in part: what is left of the value shows, at its end,
+        // its start, or between two markers (verifier, low).
+        (format!("{m}ALUEVALUE"), "VALUEVALUE", 0..10, false),
+        (format!("{m}E"), "VALUEVALUE", 0..10, false),
+        (format!("V{m}"), "VALUEVALUE", 0..10, false),
+        (format!("{m}LUEV{m}"), "VALUEVALUE", 0..10, false),
+        (format!("a{m}b{m}c"), "aVALUEbVALUEc", 1..12, false),
+        (format!("dVZBT{m}VUUhISE="), b64, b64_core.clone(), false),
+        (format!("dVZB{m}MVUUhISE="), b64, b64_core.clone(), false),
         // Cut short, before or after the marker.
-        ("\"VALU".to_owned(), "\"VALUEVALUE\"", false),
-        (format!("dT{m}IQ="), "dTVBTFVFVkFMVUUhIQ==", false),
-        (format!("\"{m}\"x"), "\"VALUEVALUE\"", false),
-        (format!("\"\"{m}"), "\"VALUEVALUE\"", false),
+        ("\"VALU".to_owned(), "\"VALUEVALUE\"", 1..11, false),
+        (format!("dT{m}IQ="), "dTVBTFVFVkFMVUUhIQ==", 2..16, false),
+        (format!("\"{m}\"x"), "\"VALUEVALUE\"", 1..11, false),
+        (format!("\"\"{m}"), "\"VALUEVALUE\"", 1..11, false),
         (
             "\"[envcloak:stripe/acme-web]\"".to_owned(),
             "\"VALUEVALUE\"",
+            1..11,
             false,
         ),
-        (m.to_owned(), "", false),
-        (format!("ab{m}"), "ab", false),
+        (m.to_owned(), "", 0..0, false),
+        (format!("ab{m}"), "ab", 2..2, false),
     ] {
         assert_eq!(
-            redacted_from(payload.as_bytes(), result.as_bytes(), m.as_bytes()),
+            redacted_from(payload.as_bytes(), result.as_bytes(), m.as_bytes(), &core),
             ok,
             "{payload:?} from {result:?}"
         );
@@ -1098,6 +1234,19 @@ fn a_frame_is_its_result_with_the_value_redacted() {
             b"\"VALUEVALUE\"".to_vec(),
         ),
     ];
+    let others = vec![
+        ("OPENAI_API_KEY/raw".to_owned(), b"INYHRINYHR".to_vec()),
+        (
+            "OPENAI_API_KEY/py-json-ascii".to_owned(),
+            b"\"INYHRINYHR\"".to_vec(),
+        ),
+    ];
+    let cores = cores(&results, &others).unwrap();
+    assert_eq!(
+        cores.values().cloned().collect::<Vec<_>>(),
+        [1..11, 0..10],
+        "{cores:?}"
+    );
     let good = [
         format!("<W|OPENAI_API_KEY/raw={m}\n<B|OPENAI_API_KEY/raw={m}\n"),
         format!(
@@ -1105,7 +1254,14 @@ fn a_frame_is_its_result_with_the_value_redacted() {
         ),
     ];
     let streams = |out: &str, err: &str| [out.as_bytes().to_vec(), err.as_bytes().to_vec()];
-    assert_eq!(frames(&streams(&good[0], &good[1]), &results), Ok(()));
+    assert_eq!(
+        frames(&streams(&good[0], &good[1]), &results, &cores),
+        Ok(())
+    );
+    // The verifier's case: the frame's value redacted in part.
+    let part = good[0].replacen(m, &format!("{m}ALUEVALUE"), 1);
+    let why = frames(&streams(&part, &good[1]), &results, &cores).unwrap_err();
+    assert!(!why.contains("VALUE"), "{why}");
     let emptied = |s: &str| {
         s.lines()
             .map(|l| format!("{}=\n", l.split('=').next().unwrap()))
@@ -1127,9 +1283,63 @@ fn a_frame_is_its_result_with_the_value_redacted() {
         (format!("{}{}", good[0], good[0]), good[1].clone()),
         (good[0].clone(), String::new()),
     ] {
-        let why = frames(&streams(&out, &err), &results).unwrap_err();
+        let why = frames(&streams(&out, &err), &results, &cores).unwrap_err();
         assert!(!why.contains("VALUE"), "{why}");
     }
+}
+
+/// Where a result holds its value is found, not typed: the other values
+/// change every letter and digit and keep every length, a result the
+/// two runs make alike or of different lengths, or a label one run lacks,
+/// is refused, and the base64 results alone leave the redactor's
+/// boundary characters out of what must be covered.
+#[test]
+fn where_a_result_holds_its_value_is_found_by_changing_the_value() {
+    let v = b"sk_live-Az09.x/Y@zZ:9".to_vec();
+    let w = other_value(&v);
+    assert_eq!(w.len(), v.len());
+    for (a, b) in v.iter().zip(&w) {
+        if a.is_ascii_alphanumeric() {
+            assert_ne!(a, b);
+            assert_eq!(
+                (
+                    a.is_ascii_lowercase(),
+                    a.is_ascii_uppercase(),
+                    a.is_ascii_digit()
+                ),
+                (
+                    b.is_ascii_lowercase(),
+                    b.is_ascii_uppercase(),
+                    b.is_ascii_digit()
+                )
+            );
+        } else {
+            assert_eq!(a, b);
+        }
+    }
+    assert_eq!(value_span(b"\"abc\"", b"\"nop\""), Some(1..4));
+    assert_eq!(value_span(b"abc", b"abc"), None);
+    assert_eq!(value_span(b"abc", b"abcd"), None);
+    assert_eq!(must_cover("OPENAI_API_KEY/b64-nopad-at2", 1..30), 4..27);
+    assert_eq!(must_cover("OPENAI_API_KEY/py-json-ascii", 1..30), 1..30);
+    assert_eq!(must_cover("OPENAI_API_KEY/b64-at0", 0..5), 3..3);
+    let results = vec![("A/raw".to_owned(), b"abc".to_vec())];
+    for others in [
+        vec![("A/raw".to_owned(), b"abc".to_vec())],
+        vec![("A/raw".to_owned(), b"abcd".to_vec())],
+        vec![("B/raw".to_owned(), b"nop".to_vec())],
+        vec![],
+    ] {
+        assert!(cores(&results, &others).is_err(), "{others:?}");
+    }
+    // A span the boundary leaves nothing of cannot vouch for a frame.
+    assert!(
+        cores(
+            &[("A/b64-at0".to_owned(), b"abcde".to_vec())],
+            &[("A/b64-at0".to_owned(), b"nopqr".to_vec())]
+        )
+        .is_err()
+    );
 }
 
 /// K-01's receipt for a sandboxed shell rests on a run outside a user
