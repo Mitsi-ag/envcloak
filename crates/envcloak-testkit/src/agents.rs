@@ -1443,6 +1443,23 @@ impl GroupChild {
         self.seen_exit
     }
 
+    /// Sends `sig` to it alone, only while it is unreaped (D-34: the
+    /// signaller's own unreaped child).
+    pub fn signal(&self, sig: i32) {
+        if self.status.is_none() {
+            let _ = envcloak_sys::signal_process(self.pid, sig);
+        }
+    }
+
+    /// Waits up to `limit` for it to exit, then kills what is left of its
+    /// group and reaps it. Its exit status, or `None` when it was still
+    /// running at `limit` (it is then killed with its group).
+    pub fn end_within(&mut self, limit: Duration) -> Option<ExitStatus> {
+        let exited = self.wait_exit(limit);
+        let status = self.finish();
+        exited.then_some(status)
+    }
+
     /// Sends `sig` to every process in its group, only while it is
     /// unreaped.
     fn signal_group(&self, sig: i32) {
