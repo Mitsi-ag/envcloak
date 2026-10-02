@@ -1083,40 +1083,251 @@ fn a_frame_is_its_result_with_the_value_redacted() {
 /// K-01's receipt for a sandboxed shell rests on a run outside a user
 /// namespace (inside one, Claude Code's Linux sandbox runs no command,
 /// an environment limitation): CI runs S0's sandboxed cases there, in the
-/// pull-request `gates` job and in `agents-e2e`, as required steps, never
-/// allowed to fail (verifier, low).
+/// pull-request `gates` job, in `agents-e2e` and in the release job, as
+/// required steps, never allowed to fail (verifier, low). Each such step
+/// runs under its own condition exactly (verifier, low: `if: false`
+/// passed), names only tests `m2_story` has, and fails unless every one
+/// it names ran and passed (verifier, low: a misspelt name ran nothing
+/// with `--exact`, and the step passed).
 #[test]
 fn ci_runs_the_sandboxed_cases_outside_a_user_namespace_as_required_steps() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml");
-    let ci =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let ci = ci_file();
     let jobs = ci_jobs(&ci);
-    for job in ["gates", "agents-e2e"] {
-        let Some(body) = jobs.iter().find(|(name, _)| name == job).map(|(_, b)| b) else {
-            panic!("ci.yml has no {job} job");
-        };
+    let tests = story_tests();
+    for (job, prefix, condition) in [
+        (
+            "gates",
+            "Story steps, sandboxed cases outside a user namespace",
+            "${{ !cancelled() }}",
+        ),
+        (
+            "agents-e2e",
+            "Story steps, sandboxed cases outside a user namespace",
+            "${{ !cancelled() && runner.os == 'Linux' && github.event_name != 'pull_request' }}",
+        ),
+        (
+            "release",
+            "S0 on the release binaries, sandboxed cases outside a user namespace",
+            "${{ !cancelled() && runner.os == 'Linux' }}",
+        ),
+    ] {
+        let body = ci_job(&jobs, job);
         assert!(
             !body.contains("continue-on-error"),
             "the {job} job may fail without failing CI"
         );
-        let steps: Vec<&str> = body
-            .split("\n      - name: ")
-            .skip(1)
-            .filter(|s| s.starts_with("Story steps, sandboxed cases outside a user namespace"))
-            .collect();
+        let steps = ci_steps(body, prefix);
         assert_eq!(steps.len(), 1, "{job}: no single outside-namespace S0 step");
         let step = steps[0];
-        for needed in [
-            "unshare --net --",
-            "skeleton::s0_claude_code_sandboxed",
-            "skeleton::s0_codex_workspace_write",
-            "--exact",
-        ] {
+        assert_eq!(
+            yaml_value(step, 8, "if"),
+            Some(condition),
+            "{job}'s outside-namespace S0 step does not run under its own condition"
+        );
+        for needed in ["unshare --net --", "--test m2_story", "set -o pipefail"] {
             assert!(step.contains(needed), "{job}'s step lacks {needed:?}");
         }
         assert!(
             !step.contains("--user") && !step.contains("continue-on-error"),
             "{job}'s step is not a required run outside a user namespace"
+        );
+        let names = exact_names(step);
+        for name in [
+            "skeleton::s0_claude_code_sandboxed",
+            "skeleton::s0_codex_workspace_write",
+        ] {
+            assert!(names.contains(&name), "{job}'s step does not run {name}");
+        }
+        for name in &names {
+            assert!(
+                tests.contains(&(*name).to_owned()),
+                "{job}'s step names {name}, which m2_story has no test of"
+            );
+        }
+        assert_ran_all(step, names.len(), job);
+    }
+}
+
+/// Gate 12 on the hosts' paths (Codex review, medium: no host job set
+/// `RUST_LOG=trace` or `RUST_BACKTRACE=full`, and the jobs that did had
+/// no host): the `gates` and `agents-e2e` jobs set both for every step.
+/// And S0 runs on the release binaries (Codex review, medium: the release
+/// job installed no host, so S0 skipped there): the release job installs
+/// the pinned tier-1 hosts and runs `m2_story` on `target/release` with
+/// the hosts required, at trace, loopback only, on both systems.
+#[test]
+fn ci_runs_the_hosts_at_trace_and_s0_on_the_release_binaries() {
+    let ci = ci_file();
+    let jobs = ci_jobs(&ci);
+    let trace = [("RUST_LOG", "trace"), ("RUST_BACKTRACE", "full")];
+    for job in ["gates", "agents-e2e"] {
+        let env = yaml_env(ci_job(&jobs, job), 4);
+        for (k, v) in trace {
+            assert_eq!(
+                env.iter().find(|(n, _)| n == k).map(|(_, x)| x.as_str()),
+                Some(v),
+                "the {job} job does not set {k}={v}"
+            );
+        }
+    }
+    let release = ci_job(&jobs, "release");
+    assert!(!release.contains("continue-on-error"));
+    let install = ci_steps(release, "Install and verify the pinned tier-1 hosts");
+    assert_eq!(install.len(), 1, "the release job installs no host");
+    assert!(install[0].contains("install-agent-hosts.py --tier 1"));
+    let mut runs = 0;
+    for (prefix, os, isolation) in [
+        (
+            "S0 on the release binaries, loopback only (Linux)",
+            "Linux",
+            "unshare --user --map-root-user --net --",
+        ),
+        (
+            "S0 on the release binaries, sandboxed cases outside a user namespace",
+            "Linux",
+            "unshare --net --",
+        ),
+        (
+            "S0 on the release binaries, loopback only (macOS)",
+            "macOS",
+            "os.setgroups([4242])",
+        ),
+    ] {
+        let steps = ci_steps(release, prefix);
+        assert_eq!(
+            steps.len(),
+            1,
+            "the release job has no single step {prefix:?}"
+        );
+        let step = steps[0];
+        let condition = yaml_value(step, 8, "if").unwrap_or_default();
+        assert!(
+            condition.contains(&format!("runner.os == '{os}'")) && !condition.contains("false"),
+            "{prefix}: runs under {condition:?}"
+        );
+        assert!(
+            step.contains("--test m2_story") && step.contains(isolation),
+            "{prefix}"
+        );
+        let env = yaml_env(step, 8);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        for (k, v) in trace.into_iter().chain([
+            ("ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS", "\"1\""),
+            (
+                "ENVCLOAK_E2E_BIN_DIR",
+                "${{ github.workspace }}/target/release",
+            ),
+            (
+                "ENVCLOAK_AGENT_HOSTS",
+                "${{ github.workspace }}/../agent-hosts",
+            ),
+            ("ENVCLOAK_TEST_NETWORK", "loopback-only"),
+        ]) {
+            assert_eq!(get(k), Some(v), "{prefix}: {k}");
+        }
+        runs += 1;
+    }
+    assert_eq!(runs, 3);
+}
+
+fn ci_file() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn ci_job<'a>(jobs: &'a [(String, String)], job: &str) -> &'a str {
+    jobs.iter()
+        .find(|(name, _)| name == job)
+        .map(|(_, b)| b.as_str())
+        .unwrap_or_else(|| panic!("ci.yml has no {job} job"))
+}
+
+/// The steps of a job's text whose name starts with `prefix`, each from
+/// its name on.
+fn ci_steps<'a>(job: &'a str, prefix: &str) -> Vec<&'a str> {
+    job.split("\n      - name: ")
+        .skip(1)
+        .filter(|s| s.starts_with(prefix))
+        .collect()
+}
+
+/// The value of `key` at `indent` spaces in `text` (a job's or a step's
+/// own line, not a nested one).
+fn yaml_value<'a>(text: &'a str, indent: usize, key: &str) -> Option<&'a str> {
+    let head = format!("{}{key}: ", " ".repeat(indent));
+    text.lines().find_map(|l| l.strip_prefix(head.as_str()))
+}
+
+/// The variables of the `env:` block at `indent` spaces in `text`.
+fn yaml_env(text: &str, indent: usize) -> Vec<(String, String)> {
+    let head = format!("{}env:", " ".repeat(indent));
+    let inner = " ".repeat(indent + 2);
+    let mut out = Vec::new();
+    let mut lines = text.lines().skip_while(|l| *l != head);
+    if lines.next().is_none() {
+        return out;
+    }
+    for l in lines {
+        let Some(rest) = l.strip_prefix(inner.as_str()) else {
+            break;
+        };
+        if rest.starts_with(' ') || rest.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = rest.split_once(": ") {
+            out.push((k.to_owned(), v.trim().to_owned()));
+        }
+    }
+    out
+}
+
+/// The test names a step gives `--exact`: the words after it, to the end
+/// of the quoted command.
+fn exact_names(step: &str) -> Vec<&str> {
+    let after = step
+        .split_once("--exact")
+        .map(|(_, a)| a)
+        .unwrap_or_else(|| panic!("a step runs no exact test list"));
+    let list = after.split('"').next().unwrap_or_default();
+    list.split_whitespace().filter(|w| *w != "\\").collect()
+}
+
+/// Every test `m2_story` has, as `--exact` names it: its own and
+/// `skeleton::`'s.
+fn story_tests() -> Vec<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/m2_story");
+    let mut out = Vec::new();
+    for (file, module) in [("main.rs", ""), ("skeleton.rs", "skeleton::")] {
+        let text = std::fs::read_to_string(dir.join(file)).unwrap();
+        let mut lines = text.lines().map(str::trim);
+        while let Some(l) = lines.next() {
+            if l == "#[test]" {
+                let name = lines
+                    .next()
+                    .and_then(|f| f.strip_prefix("fn "))
+                    .and_then(|f| f.split('(').next())
+                    .unwrap_or_else(|| panic!("a #[test] without a fn in {file}"));
+                out.push(format!("{module}{name}"));
+            }
+        }
+    }
+    out
+}
+
+/// The step fails unless all `n` tests it names ran and passed.
+fn assert_ran_all(step: &str, n: usize, job: &str) {
+    let log = step
+        .split("| tee \"")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .unwrap_or_else(|| panic!("{job}'s step keeps no log to check"));
+    for check in [
+        format!("grep -qx 'running {n} tests' \"{log}\""),
+        format!("grep -q '^test result: ok. {n} passed; 0 failed' \"{log}\""),
+    ] {
+        assert!(
+            step.lines().any(|l| l.trim() == check),
+            "{job}'s step does not check that its {n} tests ran: {check}"
         );
     }
 }
