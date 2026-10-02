@@ -862,6 +862,29 @@ fn only_allowed_paths_and_sizes_are_taken_and_no_client_names_the_creator() {
     assert!(f.list().backups.is_empty());
     let staging = data_dir(&f.home).join("backups");
     assert!(!staging.exists() || std::fs::read_dir(&staging).unwrap().next().is_none());
+    // The project configs the covered agents read (Map C): OpenCode's
+    // `opencode.json` and `.opencode/`, Kimi Code's `.kimi-code/mcp.json`,
+    // Copilot's `.github/mcp.json`, Cursor's, Gemini's and Qwen's, are
+    // taken, and come back as backed up.
+    let project = home.join("src/acme");
+    let covered: Vec<Spec> = [
+        "opencode.json",
+        ".opencode/plugins/envcloak.ts",
+        ".kimi-code/mcp.json",
+        ".github/mcp.json",
+        ".vscode/mcp.json",
+        ".cursor/mcp.json",
+        ".gemini/settings.json",
+        ".qwen/settings.json",
+        ".mcp.json",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, rel)| Spec::made(&project.join(rel), 30, 40 + i as u8))
+    .collect();
+    let id = f.backup("migrate", &covered);
+    let lease = f.open(&id, false, true).unwrap();
+    read_back(&f.paths(), f.files_cs(), &lease, &covered);
     f.sweep();
 }
 
