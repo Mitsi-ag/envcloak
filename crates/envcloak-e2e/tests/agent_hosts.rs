@@ -2871,17 +2871,12 @@ fn tier_2_probe(run: &Tier2Run) -> (bool, Vec<String>) {
 }
 
 /// A drivable tier-2 host: it spoke Anthropic Messages to the scripted
-/// model, its shell tool ran the probe, and the command's shell and its
-/// nearest ancestors are `expected`, by name, in order (the shell first).
+/// model, its shell tool ran the probe, the command's shell and its
+/// nearest ancestors are `expected`, by name, in order (the shell first),
+/// and the run was whole: the model's run clean (no unknown endpoint, no
+/// unscripted or unanswered request, nothing refused or cut short), every
+/// model call answered, and the host exited 0.
 fn tier_2_drivable(id: &str, run: &Tier2Run, expected: &[&str]) {
-    assert!(
-        run.report
-            .model_endpoints()
-            .iter()
-            .any(|e| e == "POST /v1/messages"),
-        "{id} did not speak Anthropic Messages to the scripted model: {:?}",
-        run.report.requests
-    );
     let (ran, chain) = tier_2_probe(run);
     println!(
         "measurement: tier 2 host={id} os={}: shell tool ran the command: {ran}; its ancestry, \
@@ -2889,15 +2884,149 @@ fn tier_2_drivable(id: &str, run: &Tier2Run, expected: &[&str]) {
         os(),
         chain.join(" <- ")
     );
-    assert!(
-        ran,
-        "{id}'s shell tool did not run the command; stdout {:?}",
-        String::from_utf8_lossy(&run.output.stdout)
-    );
+    if let Some(why) = not_drivable(run, expected) {
+        panic!("{id}: {why}");
+    }
+}
+
+/// Why `run` does not show a drivable host ([`tier_2_drivable`]), if it
+/// does not. Every check, the run's completeness included, so protocol
+/// drift after a successful tool turn fails loudly (Codex review, medium:
+/// an unknown endpoint, an unanswered final reply or a host failure after
+/// the marker still passed).
+fn not_drivable(run: &Tier2Run, expected: &[&str]) -> Option<String> {
+    if !run
+        .report
+        .model_endpoints()
+        .iter()
+        .any(|e| e == "POST /v1/messages")
+    {
+        return Some(format!(
+            "it did not speak Anthropic Messages to the scripted model: {:?}",
+            run.report.requests
+        ));
+    }
+    let (ran, chain) = tier_2_probe(run);
+    if !ran {
+        return Some(format!(
+            "its shell tool did not run the command; stdout {:?}",
+            String::from_utf8_lossy(&run.output.stdout)
+        ));
+    }
     for (i, want) in expected.iter().enumerate() {
+        if !chain.get(i).is_some_and(|c| c.contains(want)) {
+            return Some(format!("ancestor {i} is not {want}: {chain:?}"));
+        }
+    }
+    if !run.report.clean() {
+        return Some(format!(
+            "the scripted model's run is not clean: {}; {:?}",
+            run.report.outcome, run.report.requests
+        ));
+    }
+    if let Some(r) = run.report.model_calls().into_iter().find(|r| !r.answered) {
+        return Some(format!("a model call was never answered: {r:?}"));
+    }
+    if run.output.status.code() != Some(0) {
+        return Some(format!(
+            "the host exited {:?}; stderr {:?}",
+            run.output.status.code(),
+            String::from_utf8_lossy(&run.output.stderr)
+        ));
+    }
+    None
+}
+
+/// The drivability check fails a run that is incomplete or failed after
+/// a successful tool turn, not only one without it. A synthetic run with
+/// the marker, the ancestry and a clean model run passes (the control);
+/// each change below, made after the tool turn, fails it (Codex review,
+/// medium).
+#[test]
+fn a_tier_2_run_incomplete_or_failed_after_its_tool_turn_is_not_drivable() {
+    use envcloak_testkit::agents::{ModelReport, ModelRequest};
+    use std::os::unix::process::ExitStatusExt as _;
+    let call = |seq: u64, pick: &str, body: serde_json::Value| ModelRequest {
+        seq,
+        at_ms: 0,
+        method: "POST".to_owned(),
+        path: "/v1/messages".to_owned(),
+        query: None,
+        headers: Vec::new(),
+        status: 200,
+        answered: true,
+        api: Some("messages".to_owned()),
+        pick: Some(pick.to_owned()),
+        body: body.to_string().into_bytes().into(),
+    };
+    let result = "MARKER-ran\nANC sh | sh -c printf\nANC node | /c/node /c/cli-entry.js\n";
+    let outcome = json!({"bad_peer": 0, "bad_token": 0, "busy": 0, "connect": 1,
+        "exhausted": 0, "incomplete": [], "malformed": 0, "mismatch": 0,
+        "unanswered": 0, "unknown": 0});
+    let good = || Tier2Run {
+        report: ModelReport {
+            requests: vec![
+                call(
+                    1,
+                    "step 0",
+                    json!({"messages": [{"role": "user", "content": "go"}]}),
+                ),
+                call(
+                    2,
+                    "step 1",
+                    json!({"messages": [{"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": result}]}]}),
+                ),
+            ],
+            outcome: outcome.clone(),
+        },
+        output: std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"probe done\n".to_vec(),
+            stderr: Vec::new(),
+        },
+    };
+    let expected = ["sh", "node (node cli-entry.js)"];
+    assert_eq!(not_drivable(&good(), &expected), None);
+    let mut failed: Vec<(&str, Tier2Run)> = Vec::new();
+    // An endpoint the model does not serve, after the tool turn.
+    let mut run = good();
+    run.report.requests.push(ModelRequest {
+        path: "/v1/messages/count_tokens".to_owned(),
+        status: 404,
+        api: None,
+        pick: None,
+        ..call(3, "", json!({}))
+    });
+    run.report.outcome["unknown"] = json!(1);
+    failed.push(("an unknown endpoint", run));
+    // A request past the script (the host wanted another turn).
+    let mut run = good();
+    run.report.requests.push(call(3, "exhausted", json!({})));
+    run.report.outcome["exhausted"] = json!(1);
+    failed.push(("a request past the script", run));
+    // The final reply never sent whole, by the outcome and by the record.
+    let mut run = good();
+    run.report.outcome["unanswered"] = json!(1);
+    failed.push(("an unanswered reply (outcome)", run));
+    let mut run = good();
+    run.report.requests[1].answered = false;
+    failed.push(("an unanswered reply (record)", run));
+    // The run cut short.
+    let mut run = good();
+    run.report.outcome["incomplete"] = json!(["time_limit"]);
+    failed.push(("an incomplete run", run));
+    // The host failing after the marker.
+    let mut run = good();
+    run.output.status = std::process::ExitStatus::from_raw(1 << 8);
+    failed.push(("a host exit of 1", run));
+    let mut run = good();
+    run.output.status = std::process::ExitStatus::from_raw(libc::SIGKILL);
+    failed.push(("a host killed by a signal", run));
+    for (what, run) in &failed {
         assert!(
-            chain.get(i).is_some_and(|c| c.contains(want)),
-            "{id}: ancestor {i} is not {want}: {chain:?}"
+            not_drivable(run, &expected).is_some(),
+            "{what} passed as drivable"
         );
     }
 }
