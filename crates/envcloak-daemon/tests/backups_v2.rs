@@ -1608,3 +1608,26 @@ fn a_lease_serves_only_the_terminal_of_its_proof() {
     }
     f.sweep();
 }
+
+/// A backup keeps a file's permission bits only: the set-user-id,
+/// set-group-id and sticky bits a client declares are dropped, so a
+/// restore is never handed one to set.
+#[test]
+fn a_backup_keeps_only_permission_bits() {
+    let f = Fixture::new();
+    let modes = [0o4755, 0o2700, 0o1777, 0o7640, 0o640];
+    let files: Vec<Spec> = (0..modes.len())
+        .map(|i| Spec::made(&f.claude(&format!("projects/p/m{i}.jsonl")), 10, 18))
+        .collect();
+    let mut params = begin_params("scrub", &files, &[]);
+    for (p, m) in params.files.iter_mut().zip(modes) {
+        p.mode = m;
+    }
+    let id = client(&f.home).backup_v2_begin(&params).unwrap().id;
+    put_all(&f.paths(), f.files_cs(), &id, &files).unwrap();
+    client(&f.home).backup_v2_commit(&id).unwrap();
+    let lease = f.open(&id, false, true).unwrap();
+    let kept: Vec<u32> = lease.statement.files.iter().map(|v| v.mode).collect();
+    assert_eq!(kept, [0o755, 0o700, 0o777, 0o640, 0o640]);
+    f.sweep();
+}
