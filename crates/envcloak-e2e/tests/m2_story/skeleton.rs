@@ -52,7 +52,7 @@ use serde_json::json;
 
 /// The fixture repo: `.env` with the M1 values, and `./emit` with its
 /// configuration (the M1 story's, without the `short` profile).
-fn write_repo(h: &mut Harness, emitters: &Emitters) -> PathBuf {
+pub(super) fn write_repo(h: &mut Harness, emitters: &Emitters) -> PathBuf {
     let repo = h.home.root().join("acme-web");
     std::fs::create_dir_all(&repo).unwrap();
     let v = |l: &str| h.canary(l).as_str().to_owned();
@@ -76,7 +76,7 @@ fn write_repo(h: &mut Harness, emitters: &Emitters) -> PathBuf {
 
 /// S1 of the M1 story, as the person: the vault, the import, the kit
 /// confirmed, the plaintext deleted.
-fn vault_and_import(h: &mut Harness, repo: &Path) {
+pub(super) fn vault_and_import(h: &mut Harness, repo: &Path) {
     let home = h.home.home();
     let pass = h.secret_file(labels::VAULT_PASSPHRASE, true);
     let kit = h.files().join("kit");
@@ -117,7 +117,7 @@ fn vault_and_import(h: &mut Harness, repo: &Path) {
 }
 
 /// `envcloak approve <id> --for 1h` by the person, typing the passphrase.
-fn approve(h: &mut Harness, repo: &Path, id: &str) -> Human {
+pub(super) fn approve(h: &mut Harness, repo: &Path, id: &str) -> Human {
     let typed = format!("{}\r", h.canary(labels::VAULT_PASSPHRASE).as_str());
     h.human(
         repo,
@@ -927,7 +927,7 @@ fn is_entry(exe: &Path, installed: &Installed) -> bool {
 /// The text of the last tool result in a request body (Anthropic
 /// Messages or OpenAI Responses): what the call the model made last
 /// printed, as the host sent it.
-fn last_tool_output(body: &str) -> String {
+pub(super) fn last_tool_output(body: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return String::new();
     };
@@ -1650,12 +1650,16 @@ fn test_fns(text: &str, module: &str) -> Vec<String> {
     out
 }
 
-/// Every test `m2_story` has, as `--exact` names it: its own and
-/// `skeleton::`'s.
+/// Every test `m2_story` has, as `--exact` names it: its own,
+/// `skeleton::`'s and `mcp::`'s.
 fn story_tests() -> Vec<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/m2_story");
     let mut out = Vec::new();
-    for (file, module) in [("main.rs", ""), ("skeleton.rs", "skeleton::")] {
+    for (file, module) in [
+        ("main.rs", ""),
+        ("skeleton.rs", "skeleton::"),
+        ("mcp.rs", "mcp::"),
+    ] {
         out.extend(test_fns(
             &std::fs::read_to_string(dir.join(file)).unwrap(),
             module,
