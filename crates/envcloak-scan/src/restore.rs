@@ -123,8 +123,10 @@ pub struct BackedUpFile {
 /// [`crate::replace_atomically`] checks: a save meanwhile is kept
 /// ([`ModifyErrorKind::Changed`]). The two names are swapped in one step,
 /// and what came out is read again whole: unless it still has
-/// `file.sha256_after`, the names are swapped back and the file is kept
-/// (`changed`), so an edit made in place after the last check, at the
+/// `file.sha256_after`, and what went in is the file written (another
+/// file put under the temporary name meanwhile is swapped in by the swap
+/// too), the names are swapped back and the file is kept (`changed`, or
+/// `moved_aside` naming where the other file is kept), so an edit made in place after the last check, at the
 /// same length with its modification time put back, is never deleted. A
 /// file system that cannot swap names writes nothing
 /// ([`ModifyErrorKind::SwapUnsupported`]). A write by a program that still
