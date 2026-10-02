@@ -19,7 +19,13 @@
 //!
 //! A tool waits for a person at most the cutoff less [`MARGIN`], at least
 //! [`MIN_WAIT`] and at most [`MAX_WAIT`] ([`default_wait`]): it answers
-//! with the pending request before the host gives up on the call.
+//! with the pending request before the host gives up on the call. That
+//! wait holds the daemon's last answer too: a tool that waits through
+//! `envcloak run --wait` gives it [`person_wait`] for the person and
+//! [`LAST_ANSWER_GRACE`] after that for the daemon's last answer (`--wait-grace`),
+//! so that a daemon slow to answer at the deadline cannot push the answer
+//! past the wait, and the margin is left for starting and ending the
+//! processes.
 
 use std::time::Duration;
 
@@ -56,6 +62,19 @@ pub const MARGIN: Duration = Duration::from_secs(2);
 pub const MIN_WAIT: Duration = Duration::from_secs(1);
 /// The longest wait, whatever the cutoff.
 pub const MAX_WAIT: Duration = Duration::from_secs(20);
+
+/// How long after the person's wait the daemon's last answer is waited
+/// for (`envcloak run --wait-grace`), within a tool's wait.
+pub const LAST_ANSWER_GRACE: Duration = Duration::from_secs(1);
+
+/// The part of a tool's `wait` that is spent waiting for the person
+/// (`envcloak run --wait`, whole seconds): `wait` less
+/// [`LAST_ANSWER_GRACE`], rounded down, and at least 1 second. With the
+/// grace it ends within `wait`, or, for a wait under 2 seconds, within 2
+/// seconds, which [`MARGIN`] covers.
+pub fn person_wait(wait: Duration) -> Duration {
+    Duration::from_secs(wait.saturating_sub(LAST_ANSWER_GRACE).as_secs().max(1))
+}
 
 /// The host `id` names, when its cutoff is known.
 pub fn host(id: &str) -> Option<&'static McpHost> {
@@ -100,6 +119,24 @@ mod tests {
             assert!(wait + MARGIN <= cut, "{id:?}: {wait:?} against {cut:?}");
             assert!((MIN_WAIT..=MAX_WAIT).contains(&wait), "{id:?}");
         }
+        // The person's wait and the grace for the daemon's last answer end
+        // within the wait, or within 2 s for the shortest, under the
+        // cutoff by the margin either way.
+        for ms in [1000u64, 1500, 1999, 2000, 2500, 8000, 8999, 20_000] {
+            let wait = Duration::from_millis(ms);
+            let person = person_wait(wait);
+            assert!(person >= MIN_WAIT, "{ms}");
+            assert_eq!(person.subsec_nanos(), 0, "{ms}");
+            assert!(
+                person + LAST_ANSWER_GRACE <= wait.max(Duration::from_secs(2)),
+                "{ms}: {person:?}"
+            );
+        }
+        assert_eq!(person_wait(Duration::from_secs(8)), Duration::from_secs(7));
+        assert_eq!(
+            person_wait(Duration::from_secs(20)),
+            Duration::from_secs(19)
+        );
         // The ids are unique and are catalog ids.
         let mut ids: Vec<&str> = HOSTS.iter().map(|h| h.id).collect();
         ids.sort_unstable();

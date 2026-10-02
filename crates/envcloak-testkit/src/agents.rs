@@ -1541,6 +1541,21 @@ impl GroupChild {
         self.child.id()
     }
 
+    /// Its standard input, when piped and not taken yet.
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    /// Its standard output, when piped and not taken yet.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    /// Its standard error, when piped and not taken yet.
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
     /// Whether it has exited (it stays unreaped).
     pub fn has_exited(&mut self) -> bool {
         if !self.seen_exit && self.exited.try_recv().is_ok() {

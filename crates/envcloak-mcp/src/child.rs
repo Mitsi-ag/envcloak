@@ -12,12 +12,15 @@
 //!   plan §6, rule 3; D-34). No signal goes to a number read from anywhere
 //!   else.
 //! - A host's cancellation ([`Call::cancel`]) sends the group `SIGTERM`,
-//!   which `envcloak run` passes on to its command's group, and then
-//!   `SIGKILL` if the leader has not exited within [`KILL_GRACE`]. Without
-//!   a controlling terminal the command leads a group of its own, which
-//!   only `envcloak run` owns: a command that ignores `SIGTERM` keeps
-//!   running after `envcloak run` is killed, without its output pipes
-//!   (docs/MCP.md "Limits").
+//!   which `envcloak run` passes on to its command's group; if the leader
+//!   has not exited within [`TERM_GRACE`], a second `SIGTERM`, on which
+//!   `envcloak run` kills its command's group (`SIGKILL`, through the
+//!   handle it owns: the command is its unreaped child); and `SIGKILL` if
+//!   the leader has still not exited [`KILL_GRACE`] later. Without a
+//!   controlling terminal the command leads a group of its own, which only
+//!   `envcloak run` owns, so a command that ignores `SIGTERM` is ended
+//!   through `envcloak run`, never by a signal from here to a group this
+//!   server did not start.
 //! - Output is kept as its first and last [`OUTPUT_HEAD`] and
 //!   [`OUTPUT_TAIL`] bytes, with a count of what was left out between them
 //!   ([`HeadTail`]); it is read until end of stream, or for [`DRAIN`] after
@@ -35,7 +38,10 @@ use std::time::{Duration, Instant};
 pub const OUTPUT_HEAD: usize = 64 * 1024;
 /// How much of the end of each output stream is kept.
 pub const OUTPUT_TAIL: usize = 64 * 1024;
-/// How long a cancelled child's group has between `SIGTERM` and `SIGKILL`.
+/// How long a cancelled child's group has between its first `SIGTERM` and
+/// the second, on which `envcloak run` kills its command.
+pub const TERM_GRACE: Duration = Duration::from_secs(2);
+/// How long it has after the second `SIGTERM`, before `SIGKILL`.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// How long output is still read after the child exits.
 pub const DRAIN: Duration = Duration::from_secs(2);
@@ -85,12 +91,16 @@ impl Group {
     }
 }
 
-/// Stops `group`: `SIGTERM`, then `SIGKILL` once [`KILL_GRACE`] has passed
-/// with the leader not reaped.
+/// Stops `group`: `SIGTERM`; again once [`TERM_GRACE`] has passed with the
+/// leader not reaped (`envcloak run` then kills its command's group); then
+/// `SIGKILL` once [`KILL_GRACE`] more has passed.
 fn stop(group: Arc<Group>) {
     if group.signal(libc::SIGTERM) {
         std::thread::spawn(move || {
-            if !group.wait_reaped(KILL_GRACE) {
+            if !group.wait_reaped(TERM_GRACE)
+                && group.signal(libc::SIGTERM)
+                && !group.wait_reaped(KILL_GRACE)
+            {
                 group.signal(libc::SIGKILL);
             }
         });
@@ -115,7 +125,8 @@ impl Call {
     }
 
     /// Cancels the call: a child it runs is stopped (`SIGTERM` to its
-    /// group, then `SIGKILL`), and one it would start is not started.
+    /// group, a second `SIGTERM`, then `SIGKILL`), and one it would start
+    /// is not started.
     pub fn cancel(&self) {
         if self.cancelled.swap(true, Ordering::SeqCst) {
             return;
@@ -383,6 +394,38 @@ mod tests {
         // the output ended at once rather than after the drain.
         assert!(!c.cut);
         assert!(start.elapsed() < Duration::from_secs(30));
+    }
+
+    /// Cancelling a call whose child ignores `SIGTERM`: the group gets
+    /// `SIGTERM`, a second `SIGTERM` [`TERM_GRACE`] later (on which
+    /// `envcloak run` kills its command's group), then `SIGKILL`.
+    ///
+    /// Mutation checked: no second `SIGTERM` (straight to `SIGKILL`): the
+    /// child records one `SIGTERM` and this fails.
+    #[test]
+    fn a_cancelled_child_gets_a_second_sigterm_before_sigkill() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("rec");
+        let ready = dir.path().join("ready");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("trap 'echo term >>\"$1\"' TERM; : >\"$2\"; while :; do sleep 0.05; done")
+            .arg("sh")
+            .arg(&rec)
+            .arg(&ready);
+        let call = Arc::new(Call::new());
+        let running = Arc::clone(&call);
+        let t = std::thread::spawn(move || run(cmd, &running, Some(Duration::from_secs(120))));
+        let end = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < end, "the child did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        call.cancel();
+        let done = t.join().unwrap().unwrap();
+        assert_eq!(done.signal, Some(libc::SIGKILL));
+        assert!(!done.timed_out);
+        assert_eq!(std::fs::read_to_string(&rec).unwrap(), "term\nterm\n");
     }
 
     #[test]

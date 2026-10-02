@@ -8,13 +8,15 @@
 //! 1. The arguments are checked against the schema, and every string is
 //!    refused, unechoed, when it is shaped like a key or token (gate 13),
 //!    before anything is started or asked of the daemon.
-//! 2. The child is `<this envcloak> run --wait <n>s [--profile p] --
-//!    <argv>`, in `project_dir`, with standard input from `/dev/null`, its
-//!    output on pipes, leading a process group of its own
-//!    ([`crate::child`]). `<n>` is the server's wait (`--wait-ms`, from the
-//!    host's tool cutoff): the child waits that long for the person's
-//!    approval, polling without holding a connection, and gives up before
-//!    the host does.
+//! 2. The child is `<this envcloak> run --wait <n>s --wait-grace <g>s
+//!    [--profile p] -- <argv>`, in `project_dir`, with standard input from
+//!    `/dev/null`, its output on pipes, leading a process group of its own
+//!    ([`crate::child`]). The server's wait (`--wait-ms`, from the host's
+//!    tool cutoff) holds both: `<n>` for the person's approval, polling
+//!    without holding a connection, and `<g>` after it for the daemon's
+//!    last answer (`envcloak_agents::tool_timeouts::person_wait` and
+//!    `LAST_ANSWER_GRACE`), so the child gives up before the host does even
+//!    when the daemon is slow to answer at the deadline.
 //! 3. When the child stops at EnvCloak's own failure (exit 125 with
 //!    nothing but `envcloak: <token>: ...` lines), the result is that
 //!    outcome: `approval_required` names the request and says how the
@@ -25,12 +27,16 @@
 //!    [`child::OUTPUT_TAIL`] from the end of each stream, with a marker
 //!    naming how much was left out between them, and with every word a
 //!    provider's key pattern matches masked here too
-//!    (`Registry::mask_keys`), for keys the run does not bind.
+//!    (`Registry::mask_keys`), for keys the run does not bind. A word cut
+//!    by the head's end, the tail's start or a stream left unread is
+//!    dropped whole ([`shown_output`]): what is left of a key past a cut
+//!    has no prefix for a pattern to match.
 //! 4. A host's cancellation stops the child's group; the call then answers
 //!    nothing (see [`crate::child`]).
 
 use std::process::Command;
 
+use envcloak_agents::tool_timeouts;
 use envcloak_client::fail::Failure;
 use envcloak_policy::{PendingId, ProfileName};
 use serde_json::{Map, Value, json};
@@ -47,10 +53,6 @@ pub const MAX_ARGS: usize = 256;
 pub const MAX_ARGV_BYTES: usize = 128 * 1024;
 /// The longest message passed on from `envcloak run`'s own failure line.
 const MAX_MESSAGE: usize = 1024;
-/// How far a cut between the head and the tail of the output is moved, to
-/// a byte that cannot be part of a key, so that the masking sees whole
-/// words.
-const CUT_SLACK: usize = 1024;
 
 #[derive(Debug)]
 pub struct RunWithSecrets;
@@ -175,9 +177,13 @@ fn args(args: &Map<String, Value>) -> Result<Args<'_>, Failure> {
 
 fn run(a: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Failure> {
     let a = args(a)?;
-    let wait_secs = ctx.wait.as_secs().max(1);
+    let wait_secs = tool_timeouts::person_wait(ctx.wait).as_secs();
     let mut cmd = Command::new(&ctx.exe);
-    cmd.arg("run").arg("--wait").arg(format!("{wait_secs}s"));
+    cmd.arg("run")
+        .arg("--wait")
+        .arg(format!("{wait_secs}s"))
+        .arg("--wait-grace")
+        .arg(format!("{}s", tool_timeouts::LAST_ANSWER_GRACE.as_secs()));
     if let Some(p) = &a.profile {
         cmd.arg("--profile").arg(p.as_str());
     }
@@ -259,8 +265,8 @@ fn outcome(done: &Captured, ctx: &Ctx, wait_secs: u64) -> Value {
         }
         return v;
     }
-    let (stdout, out_left) = shown_output(&done.stdout);
-    let (stderr, err_left) = shown_output(&done.stderr);
+    let (stdout, out_left) = shown_output(&done.stdout, done.cut);
+    let (stderr, err_left) = shown_output(&done.stderr, done.cut);
     let message = match (done.code, done.signal) {
         (Some(c), _) => format!("The command ran through EnvCloak and exited with code {c}."),
         (None, Some(s)) => format!("The command ran through EnvCloak and was ended by signal {s}."),
@@ -307,34 +313,61 @@ fn key_byte(b: u8) -> bool {
 
 /// A stream as the result shows it: whole when it was kept whole;
 /// otherwise its head and its tail with a marker between them naming how
-/// many bytes were left out. Each cut is moved off a run of key bytes (at
-/// most [`CUT_SLACK`]), so that no key is cut in two, and the masking runs
-/// over the result. Returns the text and the bytes left out.
-pub fn shown_output(s: &HeadTail) -> (String, u64) {
-    if s.left_out() == 0 {
-        let mut all = s.head().to_vec();
-        all.extend(s.tail());
-        return (masked(&String::from_utf8_lossy(&all)), 0);
-    }
+/// many bytes were left out. A word cut by the head's end or the tail's
+/// start is dropped whole, however long (a run of bytes that could be part
+/// of a key, [`key_byte`]), and so is the stream's last word when it was
+/// left unread past there (`unread`, the output still open after the
+/// command exited): what is left of a key past a cut has no prefix for a
+/// pattern to match, so it is never shown. The masking then runs over the
+/// whole text. Returns the text and the bytes left out, those dropped with
+/// a cut word included.
+pub fn shown_output(s: &HeadTail, unread: bool) -> (String, u64) {
     let head = s.head();
     let tail = s.tail();
-    let mut head_end = head.len();
-    let floor = head.len().saturating_sub(CUT_SLACK);
-    while head_end > floor && key_byte(head[head_end - 1]) {
-        head_end -= 1;
+    let (mut body, mut rest): (Vec<u8>, Vec<u8>) = if s.left_out() == 0 {
+        let mut all = head.to_vec();
+        all.extend_from_slice(&tail);
+        (all, Vec::new())
+    } else {
+        (head.to_vec(), tail)
+    };
+    let mut left_out = s.left_out();
+    if s.left_out() > 0 {
+        let head_end = body.len() - trailing_word(&body);
+        left_out += (body.len() - head_end) as u64;
+        body.truncate(head_end);
+        let tail_start = rest.iter().take_while(|b| key_byte(**b)).count();
+        left_out += tail_start as u64;
+        rest.drain(..tail_start);
     }
-    let mut tail_start = 0;
-    let ceiling = CUT_SLACK.min(tail.len());
-    while tail_start < ceiling && key_byte(tail[tail_start]) {
-        tail_start += 1;
+    if unread {
+        let last = if s.left_out() > 0 {
+            &mut rest
+        } else {
+            &mut body
+        };
+        let end = last.len() - trailing_word(last);
+        left_out += (last.len() - end) as u64;
+        last.truncate(end);
     }
-    let left_out = s.left_out() + (head.len() - head_end) as u64 + tail_start as u64;
-    let text = format!(
-        "{}\n[envcloak: {left_out} bytes of output left out here]\n{}",
-        String::from_utf8_lossy(&head[..head_end]),
-        String::from_utf8_lossy(&tail[tail_start..]),
-    );
+    let mut text = if s.left_out() > 0 {
+        format!(
+            "{}\n[envcloak: {left_out} bytes of output left out here]\n{}",
+            String::from_utf8_lossy(&body),
+            String::from_utf8_lossy(&rest),
+        )
+    } else {
+        String::from_utf8_lossy(&body).into_owned()
+    };
+    if unread {
+        text.push_str("\n[envcloak: the output was not read past here]\n");
+    }
     (masked(&text), left_out)
+}
+
+/// How many bytes at the end of `b` could be part of a key: its last word.
+fn trailing_word(b: &[u8]) -> usize {
+    b.iter().rev().take_while(|b| key_byte(**b)).count()
 }
 
 #[cfg(test)]
@@ -425,7 +458,7 @@ mod tests {
         assert_eq!(stream.len() - OUTPUT_TAIL, second + 10);
         let mut h = HeadTail::default();
         h.push(&stream);
-        let (text, left) = shown_output(&h);
+        let (text, left) = shown_output(&h, false);
         envcloak_testkit::assert_no_canary(text.as_bytes(), &cs);
         assert!(text.contains(&format!("[envcloak: {left} bytes of output left out here]")));
         assert!(left > h.left_out());
@@ -436,10 +469,88 @@ mod tests {
         // A key whole inside the output is masked by its pattern.
         let mut h = HeadTail::default();
         h.push(format!("token {key} end\n").as_bytes());
-        let (text, left) = shown_output(&h);
+        let (text, left) = shown_output(&h, false);
         assert_eq!(left, 0);
         assert!(text.contains("[envcloak:key:github]"), "{text}");
         envcloak_testkit::assert_no_canary(text.as_bytes(), &cs);
+    }
+
+    /// `n` letters and digits from `seed`, none repeating a window.
+    fn alnum(seed: u64, n: usize) -> String {
+        const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                char::from(ALNUM[usize::try_from((x >> 33) % 62).unwrap()])
+            })
+            .collect()
+    }
+
+    /// Whether any 16-byte piece of `token` shows in `text`.
+    fn any_piece(text: &str, token: &str) -> bool {
+        let shown: std::collections::HashSet<&[u8]> = text.as_bytes().windows(16).collect();
+        token.as_bytes().windows(16).any(|w| shown.contains(w))
+    }
+
+    /// A key-shaped word of any length cut by the head's end, by the
+    /// tail's start, or by the end of output left unread, is dropped whole:
+    /// no piece of it shows, however far it runs past the cut (Codex's
+    /// reproduction: a 1,068-byte remnant of a long provider token beside
+    /// the head's cut).
+    ///
+    /// Mutation checked: each cut moved at most 1,024 bytes (the old
+    /// bound): what is left of each 4,000-byte token past it shows, and
+    /// this fails.
+    #[test]
+    fn a_long_word_at_a_cut_is_dropped_whole() {
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        let seed = envcloak_testkit::fresh_seed();
+        let prefix = envcloak_testkit::by_label(&cs, envcloak_testkit::labels::OPENAI_API_KEY);
+        let token = |i: u64| format!("{}{}", prefix.as_str(), alnum(seed ^ i, 4000));
+        let (first, second, third) = (token(1), token(2), token(3));
+        // The first crosses the head's end 1,000 bytes in; the second the
+        // tail's start the same way.
+        let mut stream = vec![b' '; OUTPUT_HEAD - 1000];
+        stream.extend_from_slice(first.as_bytes());
+        stream.extend(vec![b' '; 300_000]);
+        let tail_start = stream.len() + 1000;
+        stream.extend_from_slice(second.as_bytes());
+        stream.extend(vec![b' '; tail_start + OUTPUT_TAIL - stream.len() - 1]);
+        stream.push(b'\n');
+        let mut h = HeadTail::default();
+        h.push(&stream);
+        assert_eq!(h.tail().len(), OUTPUT_TAIL);
+        let (text, left) = shown_output(&h, false);
+        assert!(
+            !any_piece(&text, &first),
+            "a piece of the first token shows"
+        );
+        assert!(
+            !any_piece(&text, &second),
+            "a piece of the second token shows"
+        );
+        assert!(text.contains(&format!("[envcloak: {left} bytes of output left out here]")));
+        // The 1,000 bytes of the first in the head, and the rest of the
+        // second in the tail, are left out with the middle.
+        assert_eq!(left, h.left_out() + 1000 + (second.len() as u64 - 1000));
+        envcloak_testkit::assert_no_canary(text.as_bytes(), &cs);
+
+        // Output left unread after the command exited: its last word may
+        // be cut, and is dropped whole; earlier words are kept.
+        let mut h = HeadTail::default();
+        h.push(format!("kept {third}").as_bytes());
+        let (text, left) = shown_output(&h, true);
+        assert!(!any_piece(&text, &third), "a piece of the last token shows");
+        assert!(text.starts_with("kept "), "{text}");
+        assert!(text.contains("[envcloak: the output was not read past here]"));
+        assert_eq!(left, third.len() as u64);
+        // Read to its end, the same output is whole.
+        let (text, left) = shown_output(&h, false);
+        assert_eq!(left, 0);
+        assert!(!text.contains("not read past here"));
     }
 
     #[test]

@@ -100,8 +100,14 @@ impl Ctx {
     /// A verified connection to the daemon whose every call is answered
     /// within the wait, or fails then.
     pub(crate) fn connect(&self) -> Result<Client, Failure> {
+        self.connect_by(Instant::now() + self.wait)
+    }
+
+    /// A verified connection to the daemon whose every call is answered
+    /// by `deadline`, or fails then.
+    pub(crate) fn connect_by(&self, deadline: Instant) -> Result<Client, Failure> {
         let paths = envcloak_client::connect::run_paths()?;
-        Client::connect_by(&paths, Instant::now() + self.wait).map_err(Failure::from)
+        Client::connect_by(&paths, deadline).map_err(Failure::from)
     }
 }
 
