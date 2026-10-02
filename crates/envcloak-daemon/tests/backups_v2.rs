@@ -497,6 +497,7 @@ const CHILD_HELD: &str = "ENVCLOAK_TEST_BACKUP_HELD";
 const CHILD_HELD_CALL: &str = "ENVCLOAK_TEST_BACKUP_HELD_CALL";
 const CHILD_HELD_LEASE: &str = "ENVCLOAK_TEST_BACKUP_HELD_LEASE";
 const CHILD_MAKER: &str = "ENVCLOAK_TEST_BACKUP_MAKER";
+const CHILD_HELD_NOW: &str = "ENVCLOAK_TEST_BACKUP_HELD_NOW";
 
 fn reply(v: &Value) {
     println!("@@ {v}");
@@ -594,22 +595,26 @@ fn backup_v2_child() {
 
 /// A process holding a connection another process made (its standard
 /// input), which it uses only once that process has exited (it is then
-/// reparented, whether or not its maker was reaped): as [`CHILD_HELD_CALL`]
+/// reparented, whether or not its maker was reaped), or at once while its
+/// maker runs when [`CHILD_HELD_NOW`] is set: as [`CHILD_HELD_CALL`]
 /// says, it records a result for file 0 of the backup [`CHILD_HELD`]
 /// names (`result`), reads chunk 0 of file 0 under the lease
 /// [`CHILD_HELD_LEASE`] names (`read`), begins a backup (`begin`) or opens
 /// a restore of the backup with the right passphrase (`open`), and says
-/// what came back, or that the daemon closed the connection.
+/// what came back, or that the daemon closed the connection. Acting at
+/// once, it first makes the same call on a connection of its own, and
+/// says what came back there too (`own`).
 fn holder() {
     use std::os::fd::AsFd;
     let maker: u32 = std::env::var(CHILD_MAKER).unwrap().parse().unwrap();
+    let now = std::env::var_os(CHILD_HELD_NOW).is_some();
     let mut conn = std::os::unix::net::UnixStream::from(
         std::io::stdin().as_fd().try_clone_to_owned().unwrap(),
     );
     conn.set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     let end = Instant::now() + Duration::from_secs(30);
-    while std::os::unix::process::parent_id() == maker {
+    while !now && std::os::unix::process::parent_id() == maker {
         assert!(Instant::now() < end, "the connection's maker never exited");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -640,13 +645,23 @@ fn holder() {
         _ => json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.record_result",
             "params": {"id": id, "file": 0, "sha256_after": hex(&[7; 32])}}),
     };
-    common::send_json(&mut conn, &call);
-    let answer = match common::read_json(&mut conn) {
-        None => json!({"closed": true}),
-        Some(v) if v.get("error").is_some() => json!({"err": common::error_kind(&v)}),
-        Some(v) => json!({"ok": v["result"]}),
+    let answer_on = |conn: &mut std::os::unix::net::UnixStream| {
+        common::send_json(conn, &call);
+        match common::read_json(conn) {
+            None => json!({"closed": true}),
+            Some(v) if v.get("error").is_some() => json!({"err": common::error_kind(&v)}),
+            Some(v) => json!({"ok": v["result"]}),
+        }
     };
-    reply(&json!({"held": answer}));
+    let own = now.then(|| {
+        let run = RunPaths::under(PathBuf::from(std::env::var_os(CHILD_RUN).unwrap())).unwrap();
+        let mut mine = std::os::unix::net::UnixStream::connect(&run.socket).unwrap();
+        mine.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        answer_on(&mut mine)
+    });
+    let answer = answer_on(&mut conn);
+    reply(&json!({"held": answer, "own": own}));
 }
 
 fn worker() {
@@ -699,6 +714,9 @@ fn worker() {
                     .stdin(Stdio::from(std::os::fd::OwnedFd::from(conn)));
                 if let Some(lease) = cmd["lease"].as_str() {
                     holder.env(CHILD_HELD_LEASE, lease);
+                }
+                if cmd["now"] == true {
+                    holder.env(CHILD_HELD_NOW, "1");
                 }
                 #[allow(clippy::zombie_processes)]
                 holder.spawn().unwrap();
@@ -1663,6 +1681,104 @@ fn a_connection_handed_on_begins_nothing_for_a_process_that_exited() {
 #[test]
 fn a_connection_handed_on_opens_no_restore_for_a_process_that_exited() {
     handed_on_after_exit("open");
+}
+
+/// While the creator runs, a connection it hands on is still the
+/// creator's (docs/IPC.md "Peer checks" and "Upload"): the descriptor
+/// reaches another process only from the creator, which could make the
+/// same calls itself. A worker begins and commits a backup (and for
+/// `read` opens a lease on it), then passes one of its connections, used
+/// once, to a child of its own and keeps running. The child first makes
+/// the call `what` on a connection of its own, which is refused
+/// (`not_backup_owner`, `no_such_lease`): it is another process instance,
+/// in the creator's session. Then it makes it on the handed connection:
+/// on Linux, which keeps naming the connector, the call acts for the
+/// creator (the result recorded, the chunk delivered); on macOS, which
+/// names the last process to use the socket, the daemon closes the
+/// connection unanswered.
+fn handed_on_while_running(what: &str) {
+    let f = Fixture::new();
+    let files = [Spec::made(&f.home.home().join("acme/.env"), 20, 18)];
+    let mut w = f.child("worker", false);
+    let id = w.ask(json!({"op": "begin", "purpose": "scrub",
+        "files": files.iter().map(Spec::to_json).collect::<Vec<_>>()}))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(w.ask(json!({"op": "put_next", "id": id}))["final"], true);
+    assert_eq!(w.ask(json!({"op": "commit", "id": id}))["files"], 1);
+    let mut hand = json!({"op": "hand_over", "id": id, "call": what, "now": true});
+    if what == "read" {
+        let r = w.ask(json!({"op": "open", "id": id, "pass": f.pass()}));
+        hand["lease"] = r["lease"].clone();
+        assert!(hand["lease"].is_string(), "{r}");
+    }
+    writeln!(w.stdin, "{hand}").unwrap();
+    w.stdin.flush().unwrap();
+    // The worker's answer and the child's, in either order.
+    let (a, b) = (read_reply(&mut w.out), read_reply(&mut w.out));
+    let (handed, held) = if a.get("handed").is_some() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert_eq!(handed["handed"], true, "{handed}");
+    let own = held["own"].clone();
+    let held = held["held"].clone();
+    let mut shown = held.clone();
+    if shown["ok"].get("data").is_some() {
+        shown["ok"]["data"] = json!("<chunk>");
+    }
+    let refused = if what == "read" {
+        "no_such_lease"
+    } else {
+        "not_backup_owner"
+    };
+    assert_eq!(
+        own["err"], refused,
+        "{what}: another process's own connection: {own}"
+    );
+    if cfg!(target_os = "linux") {
+        assert!(
+            held["ok"].is_object(),
+            "{what}: the creator's connection, handed on: {shown}"
+        );
+        if what == "read" {
+            assert_eq!(held["ok"]["final"], true, "{shown}");
+        } else {
+            assert_eq!(held["ok"]["recorded"], 1, "{shown}");
+        }
+    } else {
+        assert_eq!(
+            held["closed"], true,
+            "{what}: a connection another process used: {shown}"
+        );
+    }
+    let state = f.list().backups[0].state;
+    let recorded = cfg!(target_os = "linux") && what == "result";
+    assert_eq!(
+        state,
+        if recorded {
+            BackupStateView::Complete
+        } else {
+            BackupStateView::AwaitingResult
+        },
+        "{what}"
+    );
+    w.end();
+    f.sweep();
+}
+
+/// [`handed_on_while_running`] with `record_result`.
+#[test]
+fn a_connection_the_creator_hands_on_while_it_runs_records_for_it() {
+    handed_on_while_running("result");
+}
+
+/// [`handed_on_while_running`] with `read` under the creator's lease.
+#[test]
+fn a_connection_handed_on_while_its_process_runs_reads_under_its_lease() {
+    handed_on_while_running("read");
 }
 
 /// A lock stops a call already in flight (SPEC "Lock"; D-07): the daemon
