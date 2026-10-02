@@ -163,18 +163,77 @@ impl Fixture {
     /// With a daemon, unlocked.
     fn new() -> Self {
         let mut f = Self::without_daemon();
+        f.start_daemon();
+        f
+    }
+
+    /// Starts the daemon and unlocks the vault.
+    fn start_daemon(&mut self) {
         let mut cmd = Command::new(daemon_exe());
-        f.home
+        self.home
             .apply(&mut cmd)
             .env(envcloak_sys::testing::TRACE, "1");
-        f.d = Some(Daemon::start_command(cmd, &[]));
+        self.d = Some(Daemon::start_command(cmd, &[]));
         let out = run_on_terminal(
-            &f.home,
+            &self.home,
             &["unlock", "--passphrase-fd", "3"],
-            &[(3, &f.pass, true)],
+            &[(3, &self.pass, true)],
         );
         assert!(out.status.success(), "{}", stderr(&out));
-        f
+    }
+
+    /// Adds a card (`card/acme-web`) and an issuer credential
+    /// (`issuer/acme-web`) to the vault, before the daemon starts, each
+    /// with a `value` field holding a fixture of its own, which every sweep
+    /// then looks for.
+    fn add_items_that_are_not_secrets(&mut self) {
+        use envcloak_core::SecretBytes;
+        use envcloak_core::crypto::ItemClass;
+        use envcloak_core::vault::{
+            FieldName, ItemDetails, LockedVault, NewItem, Slug, VaultPaths,
+        };
+        assert!(self.d.is_none(), "items are added before the daemon starts");
+        let digits = |seed: u64| -> String {
+            (0..16)
+                .map(|i| char::from(b'0' + u8::try_from((seed >> (i * 4)) % 10).unwrap()))
+                .collect()
+        };
+        let card = Canary::new("CARD_NUMBER", digits(fresh_seed()));
+        let issuer = Canary::new(
+            "ISSUER_CREDENTIAL",
+            format!("{}{}", digits(fresh_seed()), digits(fresh_seed())),
+        );
+        let pass = SecretBytes::copy_from(by_label(&self.cs, labels::VAULT_PASSPHRASE).value());
+        let mut v = LockedVault::open(&VaultPaths::under(common::data_dir(&self.home)))
+            .unwrap()
+            .unlock_with_passphrase(&pass)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        v.transact(|t| {
+            for (class, slug, c) in [
+                (ItemClass::Card, "card/acme-web", &card),
+                (ItemClass::IssuerCredential, "issuer/acme-web", &issuer),
+            ] {
+                let id = t.create_item(NewItem {
+                    class,
+                    slug: Slug::new(slug).unwrap(),
+                    details: ItemDetails {
+                        title: slug.to_owned(),
+                        ..ItemDetails::default()
+                    },
+                })?;
+                t.add_field(
+                    id,
+                    FieldName::new("value").unwrap(),
+                    SecretBytes::copy_from(c.value()),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        drop(v);
+        self.cs.push(card);
+        self.cs.push(issuer);
     }
 
     /// With a vault on disk and no daemon running.
@@ -1641,6 +1700,71 @@ fn project_status_shows_only_the_grants_that_cover_this_agent() {
     assert_eq!(
         shown, agent,
         "project_status showed a grant that cannot cover this agent: {status}"
+    );
+    m.finish();
+    f.sweep();
+}
+
+/// Items that are not secrets (a card, an issuer credential) are named
+/// and never bound (R-M2-34): `list_secrets` shows each by its slug and
+/// class alone (no provider, classification or field names), and
+/// `add_reference` refuses each with `not_secret`, with or without a
+/// field, before envcloak.toml is touched. Their values, fixtures of their
+/// own, are in every sweep.
+///
+/// Mutations checked: `add_reference` without its `not_secret` refusal: the
+/// card is bound (the call succeeds, envcloak.toml changed) and this fails.
+/// `list_secrets` without its branch for other classes: the card's field
+/// name shows, and this fails.
+#[test]
+fn items_that_are_not_secrets_are_named_only_and_never_bound() {
+    let mut f = Fixture::without_daemon();
+    f.add_items_that_are_not_secrets();
+    f.start_daemon();
+    let mut m = Mcp::start(&f.home, &f.project, &["--wait-ms", "1000"], &f.cs);
+    m.initialize();
+    let dir = f.project.to_str().unwrap();
+    let list = structured(&m.call("list_secrets", json!({"project_dir": dir}))).clone();
+    for (slug, class) in [
+        ("card/acme-web", "card"),
+        ("issuer/acme-web", "issuer_credential"),
+    ] {
+        let item = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["slug"] == slug)
+            .unwrap_or_else(|| panic!("{slug} is not listed: {list}"));
+        assert_eq!(
+            item,
+            &json!({"slug": slug, "class": class, "provider": null,
+                    "classification": "unknown", "fields": [], "exposed": null}),
+            "{list}"
+        );
+    }
+    // The secrets are shown with their fields as before.
+    let openai = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["slug"] == "openai/acme-web")
+        .unwrap();
+    assert_eq!(openai["fields"], json!(["value"]), "{list}");
+
+    let manifest_path = f.project.join("envcloak.toml");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    for slug in ["card/acme-web", "issuer/acme-web"] {
+        for reference in [slug.to_owned(), format!("{slug}#value")] {
+            let r = m.call(
+                "add_reference",
+                json!({"project_dir": dir, "env_name": "NOT_A_SECRET", "slug": reference}),
+            );
+            assert_eq!(failed(&r), "not_secret", "{reference}: {r}");
+        }
+    }
+    assert!(
+        std::fs::read(&manifest_path).unwrap() == manifest,
+        "a refused binding changed envcloak.toml"
     );
     m.finish();
     f.sweep();
