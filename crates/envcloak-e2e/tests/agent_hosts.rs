@@ -2085,11 +2085,13 @@ fn the_pty_driver_ends_the_program_before_a_diagnostic_write_that_fails() {
 }
 
 /// Keys typed after the program has exited (as when a host quits at its
-/// trust dialog) go to a terminal that is closed, which the write reports
-/// (`EIO`): the driver says so, with the program's exit, and ends what the
-/// program left running (review F-87: the error ended the driver with a
-/// traceback before any cleanup). The process left behind holds no
-/// terminal, so the terminal closes when the program exits.
+/// trust dialog) go to a terminal that is closed. macOS reports that to
+/// the write (`EIO`), and the driver says so, with the program's exit;
+/// Linux (CI) takes the keys into the terminal's buffer, and the exit is
+/// seen after the steps as usual. Either way the driver ends what the
+/// program left running (review F-87: on macOS the error ended the driver
+/// with a traceback before any cleanup). The process left behind holds
+/// no terminal, so the terminal closes when the program exits.
 #[test]
 fn the_pty_driver_ends_what_is_left_when_a_key_is_sent_after_the_program_exited() {
     let out = pty_driver_leaves_nothing(
@@ -2100,7 +2102,15 @@ fn the_pty_driver_ends_what_is_left_when_a_key_is_sent_after_the_program_exited(
         std::time::Duration::from_secs(60),
     )
     .expect("the driver did not finish");
-    assert_eq!(last_line(&out), "GONE 2: EXIT 0");
+    let last = last_line(&out);
+    if cfg!(target_os = "macos") {
+        assert_eq!(last, "GONE 2: EXIT 0");
+    } else {
+        assert!(
+            matches!(last.as_str(), "GONE 2: EXIT 0" | "EXIT 0"),
+            "{last}"
+        );
+    }
 }
 
 /// Any error in the driver (here a malformed step) still ends the
