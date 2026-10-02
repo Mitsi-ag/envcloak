@@ -1803,6 +1803,99 @@ fn a_lock_waits_for_a_chunk_on_its_way_out() {
     f.sweep();
 }
 
+/// The daemon's stop and a recovery lock the vault as a lock request
+/// does, and wait the same way for a chunk on its way out: stopped by a
+/// barrier in `read` after the chunk passed its last check, the daemon is
+/// sent SIGTERM (`stop`), or asked to restore the vault from a backup with
+/// the Recovery Kit (`recover`). It says it waits for the chunk; the
+/// barrier is then lifted, the chunk is delivered, and the daemon's log
+/// shows its answer written before the daemon stopped, or before the vault
+/// was restored. (Idle and sleep locks: `server.rs`
+/// `an_idle_or_sleep_lock_waits_for_a_chunk_on_its_way_out`.)
+fn a_lock_by_waits_for_a_chunk(by: &str) {
+    let mut f = Fixture::pausing(Some("backup.v2.deliver"));
+    let files = [Spec::made(&f.claude("projects/p/s.jsonl"), 300, 24)];
+    let id = f.backup("scrub", &files);
+    let vault_backup = client(&f.home).backup_create().unwrap().path;
+    let lease = f.open(&id, false, true).unwrap().lease;
+    let reading = {
+        let (paths, lease) = (f.paths(), lease.clone());
+        std::thread::spawn(move || Client::connect(&paths)?.backup_v2_read(&lease, 0, 0))
+    };
+    f.wait_paused("backup.v2.deliver");
+    let locking = if by == "stop" {
+        f.d.signal("-TERM");
+        None
+    } else {
+        let paths = f.paths();
+        let kit = SecretBytes::copy_from(f.cs.last().unwrap().value());
+        Some(std::thread::spawn(move || {
+            Client::connect(&paths)?.vault_recover(
+                &vault_backup,
+                kit,
+                SecretBytes::copy_from(b"the passphrase after the recovery"),
+                &[],
+            )
+        }))
+    };
+    let waits = "envcloak test: a lock waits for a chunk on its way out";
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        if String::from_utf8_lossy(&f.d.log_bytes()).contains(waits) {
+            break;
+        }
+        let done = match &locking {
+            Some(l) => l.is_finished(),
+            None => !f.d.is_running(),
+        };
+        assert!(
+            !done && Instant::now() < end,
+            "{by}: the lock did not wait for a chunk on its way out"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    f.release();
+    let got = reading.join().unwrap().unwrap_or_else(|e| {
+        panic!("{by}: a chunk checked before the lock was not delivered: {e:?}")
+    });
+    assert!(got.data.as_secret().ct_eq(&files[0].chunk(f.files_cs(), 0)));
+    let after = match locking {
+        Some(l) => {
+            assert!(!l.join().unwrap().unwrap().locked);
+            "envcloakd: vault restored from a backup"
+        }
+        None => {
+            assert!(f.d.wait_exit(Duration::from_secs(30)).is_some());
+            "envcloakd: stopping on signal"
+        }
+    };
+    let written = "envcloak test: backup.v2 chunk written";
+    for line in [written, after] {
+        assert!(
+            f.d.wait_for_log(line, Duration::from_secs(30)),
+            "{by}: never in the log: {line}"
+        );
+    }
+    let log = String::from_utf8_lossy(&f.d.log_bytes()).into_owned();
+    assert!(
+        log.find(written).unwrap() < log.find(after).unwrap(),
+        "{by}: the lock went on while a chunk checked before it was still on its way out"
+    );
+    f.sweep();
+}
+
+/// [`a_lock_by_waits_for_a_chunk`] with the daemon's stop.
+#[test]
+fn a_stop_waits_for_a_chunk_on_its_way_out() {
+    a_lock_by_waits_for_a_chunk("stop");
+}
+
+/// [`a_lock_by_waits_for_a_chunk`] with a recovery.
+#[test]
+fn a_recovery_waits_for_a_chunk_on_its_way_out() {
+    a_lock_by_waits_for_a_chunk("recover");
+}
+
 /// A chunk goes out under a lease that stands while another proof runs:
 /// a proof takes the vault out of its slot, which other requests see as
 /// `busy`, but every lock ends the leases, so a lease that stands is
