@@ -27,9 +27,11 @@
 //!    the daemon read them; never anything the client said), and per file
 //!    its display path, mode, size and SHA-256. It flushes the file and the
 //!    staging directory, renames the directory to `files2-<UTC time>-<id>/`
-//!    and flushes `backups/`. Only then is the backup listed: an
-//!    interrupted backup is a staging directory, never listed, which a
-//!    purge removes once it is [`STAGING_GRACE`] old.
+//!    and flushes `backups/`, each with [`envcloak_sys::sync_file`]
+//!    (`F_FULLFSYNC` on macOS, and a flush that fails fails the step).
+//!    Only then is the backup listed: an interrupted backup is a staging
+//!    directory, never listed, which a purge removes once it is
+//!    [`STAGING_GRACE`] old.
 //!
 //! After the change, [`Vault::record_file_backup_v2_result`] records what
 //! the change left in each file (its SHA-256), once per file, each in a
@@ -65,7 +67,8 @@ use std::path::{Path, PathBuf};
 
 use envcloak_sys::{
     DirEntryKind, MAX_DIR_ENTRIES, create_beneath, create_dir_beneath, kind_beneath, link_beneath,
-    list_dir, open_beneath, open_dir_beneath, remove_dir_beneath, rename_beneath, unlink_beneath,
+    list_dir, open_beneath, open_dir_beneath, remove_dir_beneath, rename_beneath, sync_file,
+    unlink_beneath,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -1004,9 +1007,9 @@ impl FileBackupV2Writer {
         let file = out
             .into_inner()
             .map_err(|e| VaultError::from(e.into_error()))?;
-        file.sync_all()?;
+        sync_file(&file)?;
         drop(file);
-        self.staging.sync_all()?;
+        sync_file(&self.staging)?;
         self.sealed_len = Some(at + n + TRAILER_LEN as u64);
         self.step(StepV2::Synced);
         Ok(())
@@ -1033,7 +1036,7 @@ impl FileBackupV2Writer {
         )?;
         self.done = true;
         self.step(StepV2::Installed);
-        self.backups.sync_all()?;
+        sync_file(&self.backups)?;
         self.step(StepV2::Done);
         Ok(CommittedV2 {
             id: self.ctx.id,
@@ -1475,7 +1478,7 @@ impl FileBackupV2Reader {
         let mut published = || -> Result<(), VaultError> {
             out.write_all(&sealed)?;
             observe(ResultStepV2::Written);
-            out.sync_all()?;
+            sync_file(&out)?;
             observe(ResultStepV2::Synced);
             match link_beneath(&self.dir, temp, path) {
                 Ok(()) => {}
@@ -1495,7 +1498,7 @@ impl FileBackupV2Reader {
         let _ = unlink_beneath(&self.dir, temp);
         published?;
         observe(ResultStepV2::Unlinked);
-        self.dir.sync_all()?;
+        sync_file(&self.dir)?;
         observe(ResultStepV2::Done);
         Ok(())
     }
@@ -1897,7 +1900,7 @@ fn purge_v2(
         purged.count(removed);
     }
     if purged.removed > 0 {
-        backups.sync_all()?;
+        sync_file(&backups)?;
     }
     purged.failed.map_or(Ok(purged.removed), Err)
 }
@@ -1964,7 +1967,8 @@ pub fn age_file_backup_v2_for_testing(dir: &Path, created_at: u64) -> Result<(),
         .open(dir.join(DATA))?;
     f.seek(SeekFrom::Start(43))?;
     f.write_all(&created_at.to_be_bytes())?;
-    Ok(f.sync_all()?)
+    sync_file(&f)?;
+    Ok(())
 }
 
 #[cfg(test)]
