@@ -79,9 +79,10 @@ wait()
 "#;
 
 /// Runs argv[1..] as the leader of a new session whose controlling
-/// terminal is a new pseudo-terminal, as an agent host started in a
-/// terminal window is (Claude Code starts its stdio MCP servers in its own
-/// session), with this wrapper's standard input, output and error, so a
+/// terminal is a new pseudo-terminal, as a host that starts its stdio MCP
+/// servers in a terminal session of their own would (whether a pinned
+/// host does is not measured yet: docs/MCP.md "Cancellation"), with this
+/// wrapper's standard input, output and error, so a
 /// test drives it over pipes. The terminal stays open on descriptor 9 (on
 /// macOS a session whose terminal no process holds open loses it); what is
 /// written to it is read and dropped. Exits with the program's code, or
@@ -114,6 +115,34 @@ while True:
 code = os.waitstatus_to_exitcode(status)
 sys.exit(code if code >= 0 else 128 - code)
 ";
+
+/// Takes an exclusive lock on argv[1] and forks a descendant that lets go
+/// of it, takes one on argv[2], ignores SIGTERM and keeps the standard
+/// streams, so it holds `envcloak run`'s pipes; once the descendant is set
+/// up, makes argv[3] and exits 0, so the first lock is free again as soon
+/// as it has exited. The descendant waits while argv[4] exists (at most
+/// 600 s), the second lock free again only once it is gone.
+const LEAVES_A_WRITER: &str = r#"import fcntl, os, signal, sys, time
+own, held, ready, life = sys.argv[1:5]
+deadline = time.time() + 600
+mine = open(own, "a")
+fcntl.flock(mine, fcntl.LOCK_EX)
+r, w = os.pipe()
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    mine.close()
+    f = open(held, "a")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    os.close(r)
+    os.write(w, b"x")
+    os.close(w)
+    while os.path.exists(life) and time.time() < deadline:
+        time.sleep(0.05)
+    os._exit(0)
+os.close(w)
+os.read(r, 1)
+open(ready, "w").close()
+"#;
 
 /// Reads its standard input to the end and says how much it read.
 const READ_STDIN: &str = r#"import sys
@@ -254,6 +283,7 @@ impl Fixture {
             ("emit.py", EMIT),
             ("hold.py", HOLD),
             ("read_stdin.py", READ_STDIN),
+            ("leaves_a_writer.py", LEAVES_A_WRITER),
             ("has_tty.py", HAS_TTY),
         ] {
             std::fs::write(project.join(name), body).unwrap();
@@ -501,6 +531,37 @@ impl Mcp {
 
     fn stderr(&self) -> String {
         String::from_utf8_lossy(&self.err.lock().unwrap()).into_owned()
+    }
+
+    /// Waits up to `limit` until the call `id` is no longer in hand: a
+    /// request with its id is then taken as a call of its own (a
+    /// `request_new_secret` refused for its arguments) rather than refused
+    /// as one in progress. Returns whether it came within `limit`, and the
+    /// answers to the call itself read meanwhile (none, for a call that
+    /// was cancelled).
+    fn call_over(&mut self, id: i64, limit: Duration) -> (bool, Vec<Value>) {
+        let end = Instant::now() + limit;
+        let mut its_own = Vec::new();
+        loop {
+            self.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "request_new_secret", "arguments": {"probe": 1}}}));
+            loop {
+                let v = self.answer(id, Duration::from_secs(60));
+                if v["error"]["code"] == -32600 {
+                    break;
+                }
+                if v["result"]["isError"] == true {
+                    assert_eq!(failed(&v["result"]), "invalid_params", "{v}");
+                    return (true, its_own);
+                }
+                // The call's own answer, ahead of the probe's.
+                its_own.push(v);
+            }
+            if Instant::now() >= end {
+                return (false, its_own);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Ends the input and waits for the server to exit; returns all it
@@ -1456,6 +1517,220 @@ fn a_cancelled_command_that_ignores_sigterm_is_ended_with_its_group() {
     f.sweep();
 }
 
+/// The `once` grants `envcloak grants list --json` shows the person.
+fn once_grants(f: &Fixture) -> usize {
+    let out = f.person(&["grants", "list", "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["uses"] == "once")
+        .count()
+}
+
+/// Host cancellation of a `run_with_secrets` still waiting for the
+/// person's approval (Codex review of M2-06, high): the server blocks
+/// SIGTERM in every thread, and its `envcloak run` used to inherit that
+/// mask, so the cancellation's SIGTERM waited unseen and an approval that
+/// came meanwhile started the command. Now the call ends at the first
+/// SIGTERM, well before the second; the person then approves the request
+/// once, and nothing starts: the command's marker is never made and the
+/// one-use grant stays unused. The call made again runs the command under
+/// that grant, which is then used (the controls: the grant and the marker
+/// can show a run).
+///
+/// Mutation checked: both fixes undone (the server's children inheriting
+/// its blocked mask, and `run --wait` unblocking SIGINT alone): the
+/// waiting `envcloak run` lives on until the server's `SIGKILL` 4 seconds
+/// later, and this fails on the time. Either fix alone keeps it passing;
+/// each has its own test (`envcloak_mcp::child`'s
+/// `a_child_starts_with_the_termination_signals_unblocked`, and
+/// `wait.rs`'s `a_waiting_run_ends_on_sigterm_however_it_inherited_it`).
+#[test]
+fn a_call_cancelled_while_it_waits_starts_nothing_when_approved_after() {
+    let f = Fixture::new();
+    let mut m = Mcp::start(&f.home, &f.project, &["--wait-ms", "20000"], &f.cs);
+    m.initialize();
+    let dir = f.project.to_str().unwrap();
+    let files = outside_dir();
+    let marker = files.path().join("ran");
+    let argv = json!(["/usr/bin/touch", marker.to_str().unwrap()]);
+    let call = m.call_async(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": argv}),
+    );
+    // The request waits for the person: `envcloak run` is in its wait.
+    let end = Instant::now() + Duration::from_secs(60);
+    let id = loop {
+        if let Some(id) = f.listed().pop() {
+            break id;
+        }
+        assert!(Instant::now() < end, "no request: {}", m.stderr());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let start = Instant::now();
+    m.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": call}}),
+    );
+    let (over, answered) = m.call_over(call, Duration::from_secs(30));
+    let took = start.elapsed();
+    assert!(over, "the cancelled call is still in hand");
+    assert!(
+        answered.is_empty(),
+        "the cancelled call was answered: {answered:?}"
+    );
+    assert!(
+        took < envcloak_mcp::child::TERM_GRACE,
+        "the waiting run outlived the first SIGTERM: the call ended {took:?} after its \
+         cancellation"
+    );
+    let out = f.person(&["approve", &id, "--once", "--passphrase-fd", "3"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(once_grants(&f), 1);
+    assert!(!marker.exists(), "the cancelled call's command ran");
+    assert!(
+        m.kept.iter().all(|v| v["id"] != call),
+        "the cancelled call was answered: {:?}",
+        m.kept
+    );
+    // The controls: the next call runs under the grant, and uses it.
+    let r = m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": argv}),
+    );
+    assert_eq!(structured(&r)["status"], "completed", "{r}");
+    assert!(marker.exists(), "the call made again did not run");
+    assert_eq!(once_grants(&f), 0, "the grant was not used");
+    m.finish();
+    f.sweep();
+}
+
+/// Host cancellation while `envcloak run` still reads its command's
+/// output, after the command exited (Codex review of M2-06, high): the
+/// command leaves a descendant in its group that ignores SIGTERM and holds
+/// `envcloak run`'s pipes, so `envcloak run` reads on for up to 2 seconds.
+/// A cancellation in that time ends the descendant (a lock it holds is
+/// free again), with a terminal or without: without one `envcloak run`,
+/// which owns the command's group, kills it before it reaps the command,
+/// which it now does only after the output; on the agent's terminal the
+/// server kills its own child's group, which holds the command. The call
+/// is answered nothing. A round whose call was answered, because its 2
+/// seconds ran out before the cancellation reached `envcloak run` (the
+/// command then ended by itself, and what it left runs on, as documented),
+/// proves nothing and is run again, at most 3 times.
+///
+/// Mutation checked: `envcloak run` reaping the command before reading
+/// its output (no `end_group` after the drain): without a terminal the
+/// cancellation stops `envcloak run` at once, the descendant runs on
+/// holding its lock, and this fails.
+fn a_call_cancelled_while_its_output_drains_leaves_nothing(terminal: bool) {
+    let f = Fixture::new();
+    let dir = f.project.to_str().unwrap();
+    let py = python3();
+    let args = ["--wait-ms", "1000"];
+    let mut m = if terminal {
+        Mcp::start_on_terminal(&f.home, &f.project, &args, &f.cs)
+    } else {
+        Mcp::start_without_terminal(&f.home, &f.project, &args, &f.cs)
+    };
+    m.initialize();
+    let r = m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": [py.to_str().unwrap(), "has_tty.py"]}),
+    );
+    let id = structured(&r)["request"].as_str().unwrap().to_owned();
+    f.approve(&id);
+    let r = m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": [py.to_str().unwrap(), "has_tty.py"]}),
+    );
+    let want = if terminal { "tty=yes\n" } else { "tty=no\n" };
+    assert_eq!(structured(&r)["stdout"], want, "{r}");
+    let files = outside_dir();
+    for round in 0..3 {
+        let life = files.path().join(format!("life{round}"));
+        std::fs::create_dir(&life).unwrap();
+        let own = files.path().join(format!("own{round}"));
+        let lock = files.path().join(format!("lock{round}"));
+        let ready = files.path().join(format!("ready{round}"));
+        let call = m.call_async(
+            "run_with_secrets",
+            json!({"project_dir": dir, "argv": [
+                py.to_str().unwrap(), "leaves_a_writer.py", own.to_str().unwrap(),
+                lock.to_str().unwrap(), ready.to_str().unwrap(), life.to_str().unwrap()
+            ]}),
+        );
+        let end = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < end,
+                "the command did not start: {}",
+                m.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let held = std::fs::File::open(&lock).unwrap();
+        assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
+        // The command's own lock is free once it has exited.
+        let mine = std::fs::File::open(&own).unwrap();
+        while !envcloak_sys::try_lock_exclusive(&mine).unwrap() {
+            assert!(Instant::now() < end, "the command did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        m.send(
+            &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": call}}),
+        );
+        let end = Instant::now() + Duration::from_secs(15);
+        let mut freed = false;
+        while Instant::now() < end {
+            if envcloak_sys::try_lock_exclusive(&held).unwrap() {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (over, its_own) = m.call_over(call, Duration::from_secs(30));
+        assert!(over, "the cancelled call is still in hand");
+        let answered = its_own
+            .iter()
+            .any(|v| v["result"]["structuredContent"]["status"] == "completed");
+        // Whatever happened, the descendant goes now: its life ends.
+        std::fs::remove_dir(&life).unwrap();
+        if freed {
+            assert!(
+                its_own.is_empty(),
+                "the cancelled call was answered: {its_own:?}"
+            );
+            m.finish();
+            f.sweep();
+            return;
+        }
+        assert!(
+            answered,
+            "terminal {terminal}: a descendant holding the output outlived the cancellation"
+        );
+    }
+    panic!("terminal {terminal}: each round's output ended before its cancellation came");
+}
+
+/// [`a_call_cancelled_while_its_output_drains_leaves_nothing`] without a
+/// controlling terminal.
+#[test]
+fn a_call_cancelled_while_its_output_drains_leaves_nothing_without_a_terminal() {
+    a_call_cancelled_while_its_output_drains_leaves_nothing(false);
+}
+
+/// [`a_call_cancelled_while_its_output_drains_leaves_nothing`] on the
+/// agent's terminal.
+#[test]
+fn a_call_cancelled_while_its_output_drains_leaves_nothing_on_a_terminal() {
+    a_call_cancelled_while_its_output_drains_leaves_nothing(true);
+}
+
 /// How a stopped command takes `SIGTERM`, in [`stopped_calls_leave_nothing`].
 #[derive(Debug, Clone, Copy)]
 enum Takes {
@@ -1471,8 +1746,9 @@ enum Takes {
 /// too and once with one that dies of it: nothing of the command outlives
 /// the call (a lock both hold is free again), and the cancelled call is
 /// answered nothing. With `terminal`, the agent leads a session on a
-/// terminal of its own, as Claude Code started in a terminal window does,
-/// so `envcloak run` keeps its command in the group the server started
+/// terminal of its own, as a host that starts its servers in a terminal
+/// session would, so `envcloak run` keeps its command in the group the
+/// server started
 /// (checked: the command can open `/dev/tty`); without (the agent leads a
 /// session with no terminal, however the tests were started), the command
 /// leads a group of its own, which only `envcloak run` owns.
