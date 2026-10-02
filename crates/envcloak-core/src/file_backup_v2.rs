@@ -56,11 +56,16 @@
 //! [`purge_file_backups_v2_except`] keeps those of backups still being
 //! written, however old.
 
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use envcloak_sys::{
+    DirEntryKind, MAX_DIR_ENTRIES, create_beneath, kind_beneath, link_beneath, list_dir,
+    open_beneath, open_dir_beneath, remove_dir_beneath, rename_beneath, unlink_beneath,
+};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -72,7 +77,7 @@ use crate::secret::SecretBytes;
 use crate::vault::codec::{Dec, Enc};
 use crate::vault::{
     Vault, VaultError, VaultErrorKind, VaultPaths, check_private_dir, open_record, open_value,
-    seal_record, seal_value, sha256_update, sync_dir, utc_stamp,
+    seal_record, seal_value, sha256_update, utc_stamp,
 };
 
 /// The bytes of a file each chunk holds, but a file's last: 512 KiB. A
@@ -103,6 +108,9 @@ pub const HEADER_LEN_V2: usize = 51;
 const TRAILER_LEN: usize = 8;
 const PREFIX: &str = "files2-";
 const STAGING_SUFFIX: &str = ".tmp";
+/// The suffix of a backup's directory being purged:
+/// `.files2-<time>-<id>.purge`, never listed.
+const PURGE_SUFFIX: &str = ".purge";
 /// The file in a backup's directory that holds its records.
 const DATA: &str = "data";
 /// Each result's file name: `result-<file index>`.
@@ -678,8 +686,15 @@ fn backups_dir(p: &VaultPaths) -> Result<PathBuf, VaultError> {
 pub struct FileBackupV2Writer {
     ctx: Ctx,
     key: SubKey,
-    backups: PathBuf,
-    staging: PathBuf,
+    /// `backups/`, opened: the staging directory is renamed and removed
+    /// through it.
+    backups: File,
+    /// The staging directory, opened when it was made: `data` is made and
+    /// removed through it, never by a path someone could swap meanwhile.
+    staging: File,
+    /// Its name in `backups/`, and the backup's name there once committed.
+    staging_name: String,
+    final_name: String,
     final_dir: PathBuf,
     out: Option<BufWriter<File>>,
     /// Bytes written to `data` so far.
@@ -779,22 +794,36 @@ impl Vault {
         {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
-        let backups = backups_dir(self.paths())?;
+        let backups_path = backups_dir(self.paths())?;
+        let backups = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&backups_path)?;
         let id = FileBackupId::generate();
         let ctx = Ctx {
             schema_version,
             ..Ctx::of(self, id, created_at)
         };
-        let name = dir_name(&id, created_at);
-        let staging = backups.join(format!(".{name}{STAGING_SUFFIX}"));
-        let final_dir = backups.join(&name);
-        std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+        let final_name = dir_name(&id, created_at);
+        let staging_name = format!(".{final_name}{STAGING_SUFFIX}");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(backups_path.join(&staging_name))?;
+        let staging = match open_dir_beneath(&backups, OsStr::new(&staging_name)) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = remove_dir_beneath(&backups, OsStr::new(&staging_name));
+                return Err(e.into());
+            }
+        };
         let mut w = FileBackupV2Writer {
             ctx,
             key: SubKey::random(Purpose::Backup),
             backups,
             staging,
-            final_dir,
+            staging_name,
+            final_dir: backups_path.join(&final_name),
+            final_name,
             out: None,
             offset: 0,
             header_hash: [0; 32],
@@ -809,12 +838,7 @@ impl Vault {
             done: false,
             observe,
         };
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(w.staging.join(DATA))?;
+        let file = create_beneath(&w.staging, OsStr::new(DATA), 0o600)?;
         w.out = Some(BufWriter::with_capacity(64 * 1024, file));
         w.start(self)?;
         Ok(w)
@@ -975,7 +999,7 @@ impl FileBackupV2Writer {
             .map_err(|e| VaultError::from(e.into_error()))?;
         file.sync_all()?;
         drop(file);
-        sync_dir(&self.staging)?;
+        self.staging.sync_all()?;
         self.sealed_len = Some(at + n + TRAILER_LEN as u64);
         self.step(StepV2::Synced);
         Ok(())
@@ -995,10 +1019,14 @@ impl FileBackupV2Writer {
         let Some(bytes) = self.sealed_len.filter(|_| !self.done) else {
             return Err(VaultErrorKind::InvalidRecord.into());
         };
-        std::fs::rename(&self.staging, &self.final_dir)?;
+        rename_beneath(
+            &self.backups,
+            OsStr::new(&self.staging_name),
+            OsStr::new(&self.final_name),
+        )?;
         self.done = true;
         self.step(StepV2::Installed);
-        sync_dir(&self.backups)?;
+        self.backups.sync_all()?;
         self.step(StepV2::Done);
         Ok(CommittedV2 {
             id: self.ctx.id,
@@ -1015,11 +1043,12 @@ impl Drop for FileBackupV2Writer {
         if self.done {
             return;
         }
-        // Not committed: the staging directory goes, with its `data`. It
-        // holds sealed records only, and a purge removes what is left.
+        // Not committed: the staging directory goes, with its `data`, both
+        // through the handles opened when it was made. It holds sealed
+        // records only, and a purge removes what is left.
         drop(self.out.take());
-        let _ = std::fs::remove_file(self.staging.join(DATA));
-        let _ = std::fs::remove_dir(&self.staging);
+        let _ = unlink_beneath(&self.staging, OsStr::new(DATA));
+        let _ = remove_dir_beneath(&self.backups, OsStr::new(&self.staging_name));
     }
 }
 
@@ -1038,7 +1067,9 @@ pub struct FileBackupV2Reader {
     ctx: Ctx,
     key: SubKey,
     file: File,
-    dir: PathBuf,
+    /// The backup's directory, opened with its `data`: its results are
+    /// read and written through it.
+    dir: File,
     meta: BackupMetaV2,
     layout: Vec<FileLayout>,
 }
@@ -1143,15 +1174,23 @@ impl FileBackupsV2 {
         self.open_dir(listed.dir.clone(), &listed.id)
     }
 
-    /// Opens the backup in `dir`, which must be backup `id`'s.
+    /// Opens the backup in `dir`, which must be backup `id`'s: the
+    /// directory, never through a symlink in its place, then its `data`
+    /// in it.
     fn open_dir(&self, dir: PathBuf, id: &FileBackupId) -> Result<FileBackupV2Reader, VaultError> {
-        let file = open_data(&dir).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        let gone = |e: std::io::Error| {
+            if not_a_dir(&e) {
                 damaged()
             } else {
                 VaultError::from(e)
             }
-        })?;
+        };
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&dir)
+            .map_err(gone)?;
+        let file = open_data_in(&dir).map_err(gone)?;
         let len = {
             let m = file.metadata()?;
             if !m.is_file() {
@@ -1332,9 +1371,8 @@ impl FileBackupV2Reader {
     /// open as that file's result.
     pub fn results(&self) -> Result<Vec<Option<[u8; 32]>>, VaultError> {
         let mut out = vec![None; self.meta.files.len()];
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
+        for entry in list_dir(&self.dir, MAX_DIR_ENTRIES)? {
+            let name = entry.name;
             let Some(index) = name
                 .to_str()
                 .and_then(|n| n.strip_prefix(RESULT))
@@ -1343,13 +1381,18 @@ impl FileBackupV2Reader {
             else {
                 continue;
             };
-            if index >= out.len() || !entry.file_type()?.is_file() {
+            let file = match entry.kind {
+                DirEntryKind::File => true,
+                DirEntryKind::Unknown => kind_beneath(&self.dir, &name)? == DirEntryKind::File,
+                _ => false,
+            };
+            if index >= out.len() || !file {
                 return Err(damaged());
             }
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(entry.path())?;
+            let file = open_beneath(&self.dir, &name)?;
+            if !file.metadata()?.is_file() {
+                return Err(damaged());
+            }
             let mut sealed = Vec::new();
             file.take(256).read_to_end(&mut sealed)?;
             let rec = Rec::Result(u32::try_from(index).map_err(|_| damaged())?);
@@ -1414,24 +1457,20 @@ impl FileBackupV2Reader {
             .raw(&index.to_be_bytes())
             .raw(sha256_after);
         let sealed = seal_record(&self.key, &self.ctx.aad(Rec::Result(index)), &e.finish())?;
-        let path = self.dir.join(format!("{RESULT}{file}"));
-        let temp = self.dir.join(format!(
+        let path = format!("{RESULT}{file}");
+        let temp = format!(
             "{RESULT_TEMP}{file}-{}{STAGING_SUFFIX}",
             FileBackupId::generate()
-        ));
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)?;
+        );
+        let (path, temp) = (OsStr::new(&path), OsStr::new(&temp));
+        let mut out = create_beneath(&self.dir, temp, 0o600)?;
         observe(ResultStepV2::Created);
         let mut published = || -> Result<(), VaultError> {
             out.write_all(&sealed)?;
             observe(ResultStepV2::Written);
             out.sync_all()?;
             observe(ResultStepV2::Synced);
-            match std::fs::hard_link(&temp, &path) {
+            match link_beneath(&self.dir, temp, path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     return Err(VaultErrorKind::AlreadyExists.into());
@@ -1446,10 +1485,10 @@ impl FileBackupV2Reader {
         // The temporary name goes whatever happened. A failure to remove it
         // leaves a file no reader takes, which the purge removes with the
         // backup: the result itself is recorded or not as `published` says.
-        let _ = std::fs::remove_file(&temp);
+        let _ = unlink_beneath(&self.dir, temp);
         published?;
         observe(ResultStepV2::Unlinked);
-        sync_dir(&self.dir)?;
+        self.dir.sync_all()?;
         observe(ResultStepV2::Done);
         Ok(())
     }
@@ -1490,6 +1529,12 @@ fn open_data(dir: &Path) -> std::io::Result<File> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dir.join(DATA))
+}
+
+/// [`open_data`], in the backup's directory opened.
+fn open_data_in(dir: &File) -> std::io::Result<File> {
+    envcloak_sys::test_event("file backup v2 data opened");
+    open_beneath(dir, OsStr::new(DATA))
 }
 
 /// The id a committed backup's directory is named for:
@@ -1605,6 +1650,13 @@ fn staging_name(name: &str) -> bool {
         .is_some_and(|n| n.starts_with(PREFIX) && n.ends_with(STAGING_SUFFIX))
 }
 
+/// Whether `name` is the name a purge gives a backup's directory before it
+/// removes it: `.files2-<...>.purge`.
+fn purged_name(name: &str) -> bool {
+    name.strip_prefix('.')
+        .is_some_and(|n| n.starts_with(PREFIX) && n.ends_with(PURGE_SUFFIX))
+}
+
 /// Whether removing a directory failed because something is left in it.
 fn not_empty(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::DirectoryNotEmpty
@@ -1612,34 +1664,108 @@ fn not_empty(e: &std::io::Error) -> bool {
             .is_some_and(|c| c == libc::ENOTEMPTY || c == libc::EEXIST)
 }
 
-/// Removes a backup's directory: its `data` and result files, the
-/// temporary names a result left when its writer stopped, then the
-/// directory. Anything else in it stays, and so does the directory.
-/// Returns whether the directory went: `false` when it was gone already
-/// or something else is left in it.
-fn remove_backup_dir(dir: &Path) -> Result<bool, VaultError> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+/// Whether opening `name` as a directory failed because it is not one of
+/// a backup's: gone, a symlink, or not a directory.
+fn not_a_dir(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+        || e.raw_os_error()
+            .is_some_and(|c| c == libc::ELOOP || c == libc::ENOTDIR)
+}
+
+/// The backups directory, opened (never through a symlink in its place)
+/// and checked: `None` when there is none.
+fn open_backups(p: &VaultPaths) -> Result<Option<File>, VaultError> {
+    let dir = match std::fs::canonicalize(&p.backups_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    for entry in entries {
-        let entry = entry?;
-        let ours = entry.file_name().to_str().is_some_and(|n| {
-            n == DATA
-                || result_temp(n)
-                || n.strip_prefix(RESULT)
-                    .is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()))
-        });
-        if ours && entry.file_type()?.is_file() {
-            match std::fs::remove_file(entry.path()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+    check_private_dir(&dir)?;
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&dir)?;
+    Ok(Some(f))
+}
+
+/// The directory `name` of `backups`, opened where it is now, never
+/// through a symlink: `None` when it is gone, a symlink or not a
+/// directory. Everything the purge removes in it, it removes through this
+/// handle, so nothing outside it is touched, whatever takes its name.
+fn open_member(backups: &File, name: &OsStr) -> Result<Option<File>, VaultError> {
+    match open_dir_beneath(backups, name) {
+        Ok(d) => Ok(Some(d)),
+        Err(e) if not_a_dir(&e) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// When the backup in `dir` was made: its header's time, or its
+/// directory's modification time when the header does not read.
+fn made_at(dir: &File) -> u64 {
+    let mut head = [0u8; HEADER_LEN_V2];
+    open_beneath(dir, std::ffi::OsStr::new(DATA))
+        .ok()
+        .filter(|f| f.metadata().is_ok_and(|m| m.is_file()))
+        .filter(|f| read_at(f, &mut head, 0).is_ok())
+        .and_then(|_| parse_header(&head).ok())
+        .map_or_else(
+            || dir.metadata().map_or(0, |m| modified_secs(&m)),
+            |h| h.created_at,
+        )
+}
+
+/// Whether `name` in `backups` still names the directory `dir` is.
+fn still_named(backups: &File, name: &OsStr, dir: &File) -> Result<bool, VaultError> {
+    use std::os::unix::fs::MetadataExt;
+    let ours = dir.metadata()?;
+    Ok(match open_dir_beneath(backups, name) {
+        Ok(d) => d
+            .metadata()
+            .is_ok_and(|m| (m.dev(), m.ino()) == (ours.dev(), ours.ino())),
+        Err(e) if not_a_dir(&e) => false,
+        Err(e) => return Err(e.into()),
+    })
+}
+
+/// Whether `name` is a file of a backup's own: `data`, a result, or a
+/// temporary name a result left when its writer stopped.
+fn backup_file(name: &str) -> bool {
+    name == DATA
+        || result_temp(name)
+        || name
+            .strip_prefix(RESULT)
+            .is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Removes a backup's files from `dir`, the directory `name` of `backups`
+/// opened ([`open_member`]): its `data` and result files and the temporary
+/// names a result left, each through `dir`, then the directory by its
+/// name. Anything else in it stays, and so does the directory. Returns
+/// whether the directory went: `false` when it was gone already or
+/// something else is left in it.
+fn empty_and_remove(backups: &File, name: &OsStr, dir: &File) -> Result<bool, VaultError> {
+    for entry in list_dir(dir, MAX_DIR_ENTRIES)? {
+        if !entry.name.to_str().is_some_and(backup_file) {
+            continue;
+        }
+        let file = match entry.kind {
+            DirEntryKind::File => true,
+            DirEntryKind::Unknown => {
+                kind_beneath(dir, &entry.name).is_ok_and(|k| k == DirEntryKind::File)
             }
+            _ => false,
+        };
+        if !file {
+            continue;
+        }
+        match unlink_beneath(dir, &entry.name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
     }
-    match std::fs::remove_dir(dir) {
+    match remove_dir_beneath(backups, name) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound || not_empty(&e) => Ok(false),
         Err(e) => Err(e.into()),
@@ -1686,6 +1812,16 @@ pub fn purge_file_backups_v2(p: &VaultPaths, now: u64) -> Result<usize, VaultErr
 /// lock, which `in_progress` takes, never loses one: a directory seen
 /// before its backup was registered is asked about after.
 ///
+/// Each directory is opened once, never through a symlink, its time read
+/// through that handle, and every file removed from it removed through
+/// that handle: whatever takes its name meanwhile (a symlink to another
+/// directory, say), nothing outside `backups/` is removed. A committed
+/// backup due to go first leaves the listing: its directory is renamed to
+/// `.files2-<time>-<id>.purge` (only while its name still names the
+/// directory opened), so no listing shows it half removed, and a
+/// directory something else is left in stays under that name, never
+/// listed, and is tried again by the next purge.
+///
 /// One backup it cannot remove does not stop it: a directory something
 /// else is left in stays, deliberately (counted as not removed), and
 /// after any other failure the others are still removed. The removals are
@@ -1697,63 +1833,116 @@ pub fn purge_file_backups_v2(p: &VaultPaths, now: u64) -> Result<usize, VaultErr
 pub fn purge_file_backups_v2_except(
     p: &VaultPaths,
     now: u64,
-    mut in_progress: impl FnMut(&FileBackupId) -> bool,
+    in_progress: impl FnMut(&FileBackupId) -> bool,
 ) -> Result<usize, VaultError> {
-    let dir = match std::fs::canonicalize(&p.backups_dir) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e.into()),
+    purge_v2(p, now, in_progress, &mut |_| {})
+}
+
+/// [`purge_file_backups_v2_except`], telling `observe` the name each
+/// directory it removes has right before the files in it are removed:
+/// once it is opened and found due and, for a committed backup's, renamed
+/// out of the listing. Test support only (feature `testing`): a test
+/// replaces the directory there.
+///
+/// # Errors
+/// As [`purge_file_backups_v2_except`].
+#[cfg(feature = "testing")]
+pub fn purge_file_backups_v2_observed(
+    p: &VaultPaths,
+    now: u64,
+    in_progress: impl FnMut(&FileBackupId) -> bool,
+    mut observe: impl FnMut(&str),
+) -> Result<usize, VaultError> {
+    purge_v2(p, now, in_progress, &mut observe)
+}
+
+fn purge_v2(
+    p: &VaultPaths,
+    now: u64,
+    mut in_progress: impl FnMut(&FileBackupId) -> bool,
+    observe: &mut dyn FnMut(&str),
+) -> Result<usize, VaultError> {
+    let Some(backups) = open_backups(p)? else {
+        return Ok(0);
     };
+    let mut entries = list_dir(&backups, MAX_DIR_ENTRIES)?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     let mut purged = Purged::default();
-    for b in list_file_backups_v2(p)? {
-        if now.saturating_sub(b.created_at) > FILE_BACKUP_RETENTION.as_secs() {
-            purged.count(remove_backup_dir(&b.dir));
-        }
-    }
-    match std::fs::read_dir(&dir) {
-        Ok(entries) => {
-            for entry in entries {
-                purged.count(
-                    entry
-                        .map_err(VaultError::from)
-                        .and_then(|e| purge_staging(&e, now, &mut in_progress)),
-                );
-            }
-        }
-        Err(e) => purged.count(Err(e.into())),
+    for entry in entries {
+        let Some(name) = entry.name.to_str() else {
+            continue;
+        };
+        let removed = if listed_id(&entry.name).is_some() {
+            purge_committed(&backups, name, now, observe)
+        } else if staging_name(name) {
+            purge_staging(&backups, name, now, &mut in_progress, observe)
+        } else if purged_name(name) {
+            open_member(&backups, &entry.name).and_then(|d| match d {
+                Some(dir) => {
+                    observe(name);
+                    empty_and_remove(&backups, &entry.name, &dir)
+                }
+                None => Ok(false),
+            })
+        } else {
+            continue;
+        };
+        purged.count(removed);
     }
     if purged.removed > 0 {
-        sync_dir(&dir)?;
+        backups.sync_all()?;
     }
     purged.failed.map_or(Ok(purged.removed), Err)
 }
 
-/// Removes `entry` of `backups/` if it is a staging directory unchanged
-/// for [`STAGING_GRACE`] before `now` whose backup is not in progress.
-/// Returns whether it went.
-fn purge_staging(
-    entry: &std::fs::DirEntry,
+/// Removes the committed backup `name` of `backups` when it was made more
+/// than [`FILE_BACKUP_RETENTION`] before `now`, first renaming it out of
+/// the listing. Returns whether its directory went; a directory whose
+/// name names another meanwhile is left as it is, as one gone.
+fn purge_committed(
+    backups: &File,
+    name: &str,
     now: u64,
-    in_progress: &mut impl FnMut(&FileBackupId) -> bool,
+    observe: &mut dyn FnMut(&str),
 ) -> Result<bool, VaultError> {
-    let name = entry.file_name();
-    let Some(name) = name.to_str().filter(|n| staging_name(n)) else {
+    let os = OsStr::new(name);
+    let Some(dir) = open_member(backups, os)? else {
         return Ok(false);
     };
-    // `DirEntry` reads the entry itself: a symlink is not followed.
-    match entry.file_type() {
-        Ok(t) if t.is_dir() => {}
-        Ok(_) => return Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
+    if now.saturating_sub(made_at(&dir)) <= FILE_BACKUP_RETENTION.as_secs() {
+        return Ok(false);
     }
-    let modified = entry.metadata().map_or(0, |m| modified_secs(&m));
+    if !still_named(backups, os, &dir)? {
+        return Ok(false);
+    }
+    let hidden = format!(".{name}{PURGE_SUFFIX}");
+    rename_beneath(backups, os, OsStr::new(&hidden))?;
+    observe(&hidden);
+    empty_and_remove(backups, OsStr::new(&hidden), &dir)
+}
+
+/// Removes the staging directory `name` of `backups` if it was unchanged
+/// for [`STAGING_GRACE`] before `now` and its backup is not in progress.
+/// Returns whether it went.
+fn purge_staging(
+    backups: &File,
+    name: &str,
+    now: u64,
+    in_progress: &mut impl FnMut(&FileBackupId) -> bool,
+    observe: &mut dyn FnMut(&str),
+) -> Result<bool, VaultError> {
+    let os = OsStr::new(name);
+    let Some(dir) = open_member(backups, os)? else {
+        return Ok(false);
+    };
+    let modified = dir.metadata().map_or(0, |m| modified_secs(&m));
     if now.saturating_sub(modified) <= STAGING_GRACE.as_secs()
         || staging_id(name).is_some_and(|id| in_progress(&id))
     {
         return Ok(false);
     }
-    remove_backup_dir(&entry.path())
+    observe(name);
+    empty_and_remove(backups, os, &dir)
 }
 
 /// Rewrites the creation time in a backup's header. Test support only

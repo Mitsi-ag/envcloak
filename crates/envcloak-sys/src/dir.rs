@@ -9,8 +9,8 @@
 //! entries, [`kind_beneath`] says what one is, [`read_link_beneath`] reads
 //! a symlink's target, [`open_dir_beneath`] opens a subdirectory, and
 //! [`create_beneath`], [`link_beneath`], [`rename_beneath`],
-//! [`exchange_beneath`] and [`unlink_beneath`] make, link, move, swap and
-//! remove names in it. None of
+//! [`exchange_beneath`], [`unlink_beneath`] and [`remove_dir_beneath`]
+//! make, link, move, swap and remove names in it. None of
 //! them follows a symlink in the name's place. [`volume_of`] says whether
 //! the directory is on a network volume.
 //!
@@ -193,6 +193,17 @@ pub fn unlink_beneath(dir: &File, name: &OsStr) -> io::Result<()> {
     // SAFETY: `dir` keeps its descriptor open for the call, and `c`
     // outlives it.
     retry(|| unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) }).map(drop)
+}
+
+/// Removes the empty directory `name` from `dir` with `unlinkat(2)` and
+/// `AT_REMOVEDIR`. A symlink in its place is never followed: it fails
+/// (`ENOTDIR`), and so does a directory with anything left in it
+/// (`ENOTEMPTY`, or `EEXIST` on some systems).
+pub fn remove_dir_beneath(dir: &File, name: &OsStr) -> io::Result<()> {
+    let c = component(name)?;
+    // SAFETY: `dir` keeps its descriptor open for the call, and `c`
+    // outlives it.
+    retry(|| unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) }).map(drop)
 }
 
 /// Moves `from` to `to`, both in `dir`, with `renameat(2)`: `to` is
