@@ -222,6 +222,16 @@ fn owner_alive(owner: &BackupOwner) -> bool {
         })
 }
 
+/// Whether `peer` may act as `owner`: it is that process instance, and
+/// that instance still runs. A connection outlives the process that made
+/// it when the descriptor was passed on or inherited; on Linux the kernel
+/// keeps naming the process that connected, so after it exits a call on
+/// that connection is no one's (macOS closes it instead: the peer
+/// changed).
+fn owner_may_act(owner: &BackupOwner, peer: &PeerIdentity) -> bool {
+    same_instance(owner, peer) && owner_alive(owner)
+}
+
 /// The processes of `e`'s chain the restore's session and terminal check
 /// looks at ([`SubjectEvidence::terminal_scope`]), as a backup seals them.
 fn chain_of(e: &SubjectEvidence) -> Vec<CreatorProcess> {
@@ -484,7 +494,7 @@ fn open_reader(s: &State, id: &FileBackupId) -> Result<FileBackupV2Reader, RpcEr
 /// anyone else, `no_such_backup` when there is none.
 fn not_in_progress(s: &State, id: &FileBackupId, peer: &PeerIdentity) -> RpcError {
     match open_reader(s, id) {
-        Ok(r) if same_instance(&r.meta().creator.owner, peer) => {
+        Ok(r) if owner_may_act(&r.meta().creator.owner, peer) => {
             RpcError::new(ErrorKind::BackupFrozen)
         }
         Ok(_) => RpcError::new(ErrorKind::NotBackupOwner),
@@ -501,7 +511,7 @@ fn writer_for(
     let mut s = locked(&shared.state);
     s.unlocked()?;
     match s.backups().uploads.get(id) {
-        Some(u) if same_instance(&u.owner, peer) => {
+        Some(u) if owner_may_act(&u.owner, peer) => {
             Ok((Arc::clone(&u.writer), u.subject.clone(), u.purpose))
         }
         Some(_) => Err(RpcError::new(ErrorKind::NotBackupOwner)),
@@ -645,7 +655,7 @@ pub fn record_result(
         s.unlocked()?;
         if let Some(u) = s.backups().uploads.get(&id) {
             // Not committed yet: there is nothing to record a result for.
-            return Err(if same_instance(&u.owner, peer) {
+            return Err(if owner_may_act(&u.owner, peer) {
                 invalid()
             } else {
                 RpcError::new(ErrorKind::NotBackupOwner)
@@ -653,7 +663,9 @@ pub fn record_result(
         }
         open_reader(&s, &id)?
     };
-    if !same_instance(&reader.meta().creator.owner, peer) {
+    // From the creator, while it lives (D-07): once it has exited the
+    // backup stays `result_unrecorded`, whoever holds its connection.
+    if !owner_may_act(&reader.meta().creator.owner, peer) {
         return Err(RpcError::new(ErrorKind::NotBackupOwner));
     }
     let file = usize::try_from(p.file).map_err(|_| invalid())?;
@@ -876,7 +888,7 @@ pub fn read(
         let mut s = locked(&shared.state);
         let reg = s.backups();
         let l = reg.leases.get_mut(&lease).ok_or_else(none)?;
-        if !same_instance(&l.owner, peer) || terminal != Some(l.terminal) {
+        if !owner_may_act(&l.owner, peer) || terminal != Some(l.terminal) {
             return Err(none());
         }
         if awake.saturating_sub(l.last_used) > LEASE_IDLE {
@@ -1075,6 +1087,31 @@ mod tests {
         assert_eq!(alive_now(&reg), 1, "a lease ended before 60 seconds idle");
         reg.sweep(t0 + LEASE_IDLE + Duration::from_secs(1));
         assert_eq!(alive_now(&reg), 0, "a lease outlived 60 seconds idle");
+    }
+
+    /// An owner-bound call is answered only while the owner runs: a caller
+    /// with the pid and start time of a process that has exited (a
+    /// connection it passed on before it exited, on Linux) is the owner's
+    /// instance but may not act for it.
+    #[test]
+    fn only_a_live_owner_may_act() {
+        let me = envcloak_sys::proc_info(i32::try_from(std::process::id()).unwrap()).unwrap();
+        let peer = PeerIdentity {
+            uid: 0,
+            pid: me.pid,
+            start_time: me.start_time,
+            pidversion: None,
+            source: envcloak_sys::PeerSource::PeerCred,
+        };
+        assert!(owner_may_act(&owner_of(&peer), &peer));
+        let gone = PeerIdentity {
+            start_time: StartTime::from_raw(me.start_time.raw() + 1),
+            ..peer
+        };
+        let owner = owner_of(&gone);
+        assert!(same_instance(&owner, &gone));
+        assert!(!owner_may_act(&owner, &gone));
+        assert!(!owner_may_act(&owner, &peer));
     }
 
     /// A process instance recorded in another boot is neither alive nor

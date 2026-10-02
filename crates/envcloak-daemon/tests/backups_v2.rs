@@ -448,6 +448,8 @@ const CHILD_INNER: &str = "ENVCLOAK_TEST_BACKUP_INNER";
 const CHILD_RUN: &str = "ENVCLOAK_TEST_BACKUP_RUN";
 const CHILD_SEED: &str = "ENVCLOAK_TEST_BACKUP_SEED";
 const CHILD_AGENT_BIN: &str = "ENVCLOAK_TEST_BACKUP_AGENT_BIN";
+const CHILD_HELD: &str = "ENVCLOAK_TEST_BACKUP_HELD";
+const CHILD_MAKER: &str = "ENVCLOAK_TEST_BACKUP_MAKER";
 
 fn reply(v: &Value) {
     println!("@@ {v}");
@@ -537,8 +539,40 @@ fn backup_v2_child() {
             }
             worker();
         }
+        "holder" => holder(),
         other => panic!("unknown child mode {other}"),
     }
+}
+
+/// A process holding a connection another process made (its standard
+/// input), which it uses only once that process has exited: it records
+/// a result for file 0 of the backup [`CHILD_HELD`] names, and says what
+/// came back, or that the daemon closed the connection.
+fn holder() {
+    use std::os::fd::AsFd;
+    let maker: u32 = std::env::var(CHILD_MAKER).unwrap().parse().unwrap();
+    let mut conn = std::os::unix::net::UnixStream::from(
+        std::io::stdin().as_fd().try_clone_to_owned().unwrap(),
+    );
+    conn.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    while std::os::unix::process::parent_id() == maker {
+        assert!(Instant::now() < end, "the connection's maker never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let id = std::env::var(CHILD_HELD).unwrap();
+    common::send_json(
+        &mut conn,
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "backup.v2.record_result",
+            "params": {"id": id, "file": 0, "sha256_after": hex(&[7; 32])}}),
+    );
+    let answer = match common::read_json(&mut conn) {
+        None => json!({"closed": true}),
+        Some(v) if v.get("error").is_some() => json!({"err": common::error_kind(&v)}),
+        Some(v) => json!({"ok": v["result"]}),
+    };
+    reply(&json!({"held": answer}));
 }
 
 fn worker() {
@@ -554,6 +588,31 @@ fn worker() {
         let answer = match cmd["op"].as_str().unwrap() {
             "exit" => break,
             "pid" => json!({"pid": std::process::id()}),
+            "hand_over" => {
+                // A connection of this worker's, used once (so the daemon
+                // has taken it as this process's), handed to a child of
+                // its own as the child's standard input.
+                let mut conn = std::os::unix::net::UnixStream::connect(&run.socket).unwrap();
+                common::send_json(
+                    &mut conn,
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": "backup.v2.list", "params": {}}),
+                );
+                assert!(common::read_json(&mut conn).unwrap()["result"].is_object());
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "backup_v2_child",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD_MODE, "holder")
+                    .env(CHILD_HELD, &id)
+                    .env(CHILD_MAKER, std::process::id().to_string())
+                    .stdin(Stdio::from(std::os::fd::OwnedFd::from(conn)))
+                    .spawn()
+                    .unwrap();
+                json!({"handed": true})
+            }
             "begin" => {
                 let files: Vec<Spec> = cmd["files"]
                     .as_array()
@@ -1357,5 +1416,37 @@ fn a_restore_is_refused_to_an_agent_and_to_a_process_without_a_terminal() {
         })
         .count();
     assert_eq!(refusals, 6);
+    f.sweep();
+}
+
+/// A connection outlives the process that made it when the descriptor is
+/// handed on: the creator of a committed backup passes one of its
+/// connections to a child and exits before recording a result. The child
+/// then records one on it, and is refused: on Linux the daemon still
+/// names the creator on that connection, which has exited
+/// (`not_backup_owner`); on macOS it closes the connection, whose peer
+/// changed. The backup stays `result_unrecorded`.
+#[test]
+fn a_connection_handed_on_does_not_act_for_a_creator_that_exited() {
+    let f = Fixture::new();
+    let files = [Spec::made(&f.home.home().join("acme/.env"), 20, 15)];
+    let mut w = f.child("worker", false);
+    let id = w.ask(json!({"op": "begin", "purpose": "scrub",
+        "files": files.iter().map(Spec::to_json).collect::<Vec<_>>()}))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(w.ask(json!({"op": "put_next", "id": id}))["final"], true);
+    assert_eq!(w.ask(json!({"op": "commit", "id": id}))["files"], 1);
+    assert_eq!(w.ask(json!({"op": "hand_over", "id": id}))["handed"], true);
+    let _ = writeln!(w.stdin, "{}", json!({"op": "exit"}));
+    w.child.wait().unwrap();
+    let held = read_reply(&mut w.out)["held"].clone();
+    let refused = held["err"] == "not_backup_owner" || held["closed"] == true;
+    assert!(refused, "the handed-on connection acted: {held}");
+    let l = f.list();
+    assert_eq!(l.backups[0].state, BackupStateView::ResultUnrecorded);
+    let lease = f.open(&id, false, true).unwrap();
+    assert_eq!(lease.statement.files[0].sha256_after, None);
     f.sweep();
 }
