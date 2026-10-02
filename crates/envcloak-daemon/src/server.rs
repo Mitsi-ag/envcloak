@@ -851,9 +851,11 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
                 .wall
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            let v1 = envcloak_core::file_backup::purge_file_backups(s.paths(), secs);
-            let v2 = envcloak_core::file_backup_v2::purge_file_backups_v2(s.paths(), secs);
-            if v1.is_err() || v2.is_err() {
+            let purged = purge_both(
+                || envcloak_core::file_backup::purge_file_backups(s.paths(), secs),
+                || envcloak_core::file_backup_v2::purge_file_backups_v2(s.paths(), secs),
+            );
+            if !purged {
                 log_line!("envcloakd: old file backups could not be removed");
             }
             s.audit(AuditEvent::Unlocked {
@@ -868,6 +870,17 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
         Err(_) => {}
     }
     r
+}
+
+/// Runs the purge of v1 file backups, then the purge of v2 ones, each
+/// whatever the other did. Returns whether both succeeded.
+fn purge_both<E>(
+    v1: impl FnOnce() -> Result<usize, E>,
+    v2: impl FnOnce() -> Result<usize, E>,
+) -> bool {
+    let v1 = v1();
+    let v2 = v2();
+    v1.is_ok() && v2.is_ok()
 }
 
 fn create(
@@ -945,5 +958,30 @@ mod tests {
             p.give_back(7);
         }
         assert!(!p.by_pid.contains_key(&7));
+    }
+
+    /// An unlock purges the v2 backups whatever the v1 purge did, and the
+    /// v1 ones whatever the v2 purge did; a failure of either is reported.
+    #[test]
+    fn an_unlock_runs_each_purge_whatever_the_other_did() {
+        for v1_fails in [true, false] {
+            let (mut v1_ran, mut v2_ran) = (false, false);
+            let purged = purge_both(
+                || {
+                    v1_ran = true;
+                    if v1_fails { Err(()) } else { Ok(1) }
+                },
+                || {
+                    v2_ran = true;
+                    if v1_fails { Ok(1) } else { Err(()) }
+                },
+            );
+            assert!(
+                v1_ran && v2_ran,
+                "v1 failing: {v1_fails}: a purge's failure kept the other from running"
+            );
+            assert!(!purged, "v1 failing: {v1_fails}: a failure not reported");
+        }
+        assert!(purge_both::<()>(|| Ok(0), || Ok(2)));
     }
 }
