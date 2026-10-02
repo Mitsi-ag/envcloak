@@ -21,7 +21,8 @@
 //!    chunks as they pass.
 //! 3. [`FileBackupV2Writer::commit`] seals the metadata after the chunks:
 //!    the header's SHA-256, the chunk size, the purpose, the creator (its
-//!    subject kind, evidence digest, agent label and process instance, as
+//!    subject kind, evidence digest, agent label, process instance and boot,
+//!    and the processes of its chain with their sessions and terminals, as
 //!    the daemon read them; never anything the client said), and per file
 //!    its display path, mode, size and SHA-256. It flushes the file and the
 //!    staging directory, renames the directory to `files2-<UTC time>-<id>/`
@@ -86,6 +87,9 @@ pub const MAX_FILES_V2: usize = 4096;
 pub const MAX_PATH_V2: usize = 4096;
 /// The longest agent label a backup records, in bytes.
 pub const MAX_LABEL_V2: usize = 256;
+/// The most processes of its creator's chain a backup records: the
+/// daemon reads at most this many (`envcloak_sys::MAX_ANCESTRY`).
+pub const MAX_CHAIN_V2: usize = 64;
 
 const MAGIC: [u8; 4] = *b"ECF2";
 const FORMAT_VERSION: u8 = 2;
@@ -112,8 +116,25 @@ const MAX_CHUNK_RECORD: usize = CHUNK_V2 + Sealed::OVERHEAD;
 /// [`encode_metadata`] writes them: version(1) header_sha256(32)
 /// chunk_size(4) purpose(1) creator_kind(1) evidence_digest(32) agent(1 +
 /// 4 + [`MAX_LABEL_V2`]) owner_pid(4) owner_start_time(8) owner_token(1 +
-/// 4) count(4).
-const META_FIXED: usize = 1 + 32 + 4 + 1 + 1 + 32 + (1 + 4 + MAX_LABEL_V2) + 4 + 8 + (1 + 4) + 4;
+/// 4) owner_boot(1 + 16) chain_count(4), [`MAX_CHAIN_V2`] processes of
+/// [`META_PROCESS`] bytes, count(4).
+const META_FIXED: usize = 1
+    + 32
+    + 4
+    + 1
+    + 1
+    + 32
+    + (1 + 4 + MAX_LABEL_V2)
+    + 4
+    + 8
+    + (1 + 4)
+    + (1 + 16)
+    + 4
+    + MAX_CHAIN_V2 * META_PROCESS
+    + 4;
+/// One process of the creator's chain at its longest: pid(4)
+/// start_time(8) token(1 + 4) sid(1 + 4) terminal(1 + 8).
+const META_PROCESS: usize = 4 + 8 + (1 + 4) + (1 + 4) + (1 + 8);
 /// One file's entry at its longest: path(4 + [`MAX_PATH_V2`]) mode(4)
 /// size(8) sha256(32).
 const META_FILE: usize = 4 + MAX_PATH_V2 + 4 + 8 + 32;
@@ -197,7 +218,7 @@ impl CreatorKind {
 /// The process instance that began a backup: only it may add chunks,
 /// commit and record results (M2 plan D-07). An instance identity, not a
 /// code identity: the pid with its start time as the kernel records it,
-/// and on macOS the audit token's pid version.
+/// and on macOS the audit token's pid version, in the boot it ran in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BackupOwner {
     pub pid: i32,
@@ -205,6 +226,28 @@ pub struct BackupOwner {
     pub start_time: u64,
     /// macOS: the pid version from the audit token. `None` on Linux.
     pub token: Option<i32>,
+    /// The boot it ran in (`envcloak_sys::boot_id`): on Linux a start time
+    /// counts from boot, so a process of a later boot can have this pid
+    /// and start time again, and is not this one. `None` on macOS, whose
+    /// start times are wall-clock time. The processes of
+    /// [`BackupCreator::chain`] ran in this boot too.
+    pub boot: Option<[u8; 16]>,
+}
+
+/// One process of the chain the daemon read for a backup's creator: what
+/// the restore's session and terminal check (T9-3, F-70) needs, sealed so
+/// that it holds after a restart of the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CreatorProcess {
+    pub pid: i32,
+    /// The kernel's start time (`envcloak_sys::StartTime::raw`).
+    pub start_time: u64,
+    /// macOS: the pid version from the audit token, when known.
+    pub token: Option<i32>,
+    /// Its session id.
+    pub sid: Option<i32>,
+    /// Its controlling terminal's device.
+    pub terminal: Option<u64>,
 }
 
 /// What the daemon seals into a backup about who made it. Never taken from
@@ -217,6 +260,9 @@ pub struct BackupCreator {
     /// The agent's display name, when one is involved.
     pub agent: Option<String>,
     pub owner: BackupOwner,
+    /// The creator's chain, the caller first, up to its root or up to its
+    /// nearest agent, whichever is further: at most [`MAX_CHAIN_V2`].
+    pub chain: Vec<CreatorProcess>,
 }
 
 /// One file a backup will hold, as declared at its start.
@@ -450,10 +496,19 @@ fn encode_metadata(
         .opt_str(creator.agent.as_deref())
         .raw(&creator.owner.pid.to_be_bytes())
         .u64(creator.owner.start_time);
-    match creator.owner.token {
-        None => e.u8(0),
-        Some(t) => e.u8(1).raw(&t.to_be_bytes()),
-    };
+    opt_raw(&mut e, creator.owner.token.map(i32::to_be_bytes).as_ref());
+    opt_raw(&mut e, creator.owner.boot.as_ref());
+    e.raw(
+        &u32::try_from(creator.chain.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for p in &creator.chain {
+        e.raw(&p.pid.to_be_bytes()).u64(p.start_time);
+        opt_raw(&mut e, p.token.map(i32::to_be_bytes).as_ref());
+        opt_raw(&mut e, p.sid.map(i32::to_be_bytes).as_ref());
+        opt_raw(&mut e, p.terminal.map(u64::to_be_bytes).as_ref());
+    }
     e.raw(&u32::try_from(files.len()).unwrap_or(u32::MAX).to_be_bytes());
     for f in files {
         e.str(&f.path)
@@ -462,6 +517,18 @@ fn encode_metadata(
             .raw(&f.sha256);
     }
     e.finish()
+}
+
+/// An optional fixed-size value: a `0` byte, or a `1` byte and the value.
+fn opt_raw<const N: usize>(e: &mut Enc, v: Option<&[u8; N]>) {
+    match v {
+        None => e.u8(0),
+        Some(b) => e.u8(1).raw(b),
+    };
+}
+
+fn opt_array<const N: usize>(d: &mut Dec<'_>) -> Result<Option<[u8; N]>, VaultError> {
+    Ok(if d.bool()? { Some(d.array()?) } else { None })
 }
 
 /// The metadata as decoded: the header's hash, and the rest.
@@ -490,11 +557,22 @@ fn decode_metadata(b: &[u8]) -> Result<Decoded, VaultError> {
     }
     let pid = i32::from_be_bytes(d.array()?);
     let start_time = d.u64()?;
-    let token = if d.bool()? {
-        Some(i32::from_be_bytes(d.array()?))
-    } else {
-        None
-    };
+    let token = opt_array(&mut d)?.map(i32::from_be_bytes);
+    let boot = opt_array(&mut d)?;
+    let processes = usize::try_from(d.u32()?).map_err(|_| damaged())?;
+    if processes > MAX_CHAIN_V2 {
+        return Err(damaged());
+    }
+    let mut chain = Vec::with_capacity(processes);
+    for _ in 0..processes {
+        chain.push(CreatorProcess {
+            pid: i32::from_be_bytes(d.array()?),
+            start_time: d.u64()?,
+            token: opt_array(&mut d)?.map(i32::from_be_bytes),
+            sid: opt_array(&mut d)?.map(i32::from_be_bytes),
+            terminal: opt_array(&mut d)?.map(u64::from_be_bytes),
+        });
+    }
     let count = usize::try_from(d.u32()?).map_err(|_| damaged())?;
     if count == 0 || count > MAX_FILES_V2 {
         return Err(damaged());
@@ -532,7 +610,9 @@ fn decode_metadata(b: &[u8]) -> Result<Decoded, VaultError> {
                 pid,
                 start_time,
                 token,
+                boot,
             },
+            chain,
         },
         files,
     })
@@ -691,6 +771,7 @@ impl Vault {
             .agent
             .as_ref()
             .is_some_and(|a| a.len() > MAX_LABEL_V2)
+            || creator.chain.len() > MAX_CHAIN_V2
         {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
@@ -1522,7 +1603,24 @@ mod tests {
                 pid: 42,
                 start_time: 7,
                 token: Some(9),
+                boot: Some([6; 16]),
             },
+            chain: vec![
+                CreatorProcess {
+                    pid: 42,
+                    start_time: 7,
+                    token: Some(9),
+                    sid: Some(40),
+                    terminal: Some(0x1000_0003),
+                },
+                CreatorProcess {
+                    pid: 40,
+                    start_time: 5,
+                    token: None,
+                    sid: None,
+                    terminal: None,
+                },
+            ],
         };
         let files = [FileMetaV2 {
             path: "/h/.claude/settings.json".into(),
@@ -1565,7 +1663,9 @@ mod tests {
                 pid: 7,
                 start_time: 8,
                 token: None,
+                boot: None,
             },
+            chain: Vec::new(),
         }
     }
 
@@ -1693,7 +1793,18 @@ mod tests {
                 pid: i32::MAX,
                 start_time: u64::MAX,
                 token: Some(i32::MAX),
+                boot: Some([0xff; 16]),
             },
+            chain: vec![
+                CreatorProcess {
+                    pid: i32::MAX,
+                    start_time: u64::MAX,
+                    token: Some(i32::MAX),
+                    sid: Some(i32::MAX),
+                    terminal: Some(u64::MAX),
+                };
+                MAX_CHAIN_V2
+            ],
         };
         let file = FileMetaV2 {
             path: format!("/{}", "p".repeat(MAX_PATH_V2 - 1)),
@@ -1709,7 +1820,17 @@ mod tests {
             &files,
         );
         assert_eq!(m.len(), MAX_METADATA);
-        assert!(decode_metadata(&m).is_ok());
+        assert_eq!(decode_metadata(&m).unwrap().creator, creator);
+        // One process more than a backup records is refused.
+        let mut longer = creator.clone();
+        longer.chain.push(longer.chain[0]);
+        let m = encode_metadata(
+            &[0; HEADER_LEN_V2],
+            BackupPurpose::Migrate,
+            &longer,
+            &files[..1],
+        );
+        assert!(decode_metadata(&m).is_err());
     }
 
     #[test]

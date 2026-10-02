@@ -17,9 +17,9 @@ use common::{KitFixture, dir_names};
 use envcloak_core::SecretBytes;
 use envcloak_core::file_backup::{FILE_BACKUP_RETENTION, FileBackupId, STAGING_GRACE};
 use envcloak_core::file_backup_v2::{
-    BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, FileBackupV2Writer,
-    HEADER_LEN_V2, MAX_FILE_V2, MAX_FILES_V2, MAX_LABEL_V2, MAX_PATH_V2, PlannedFile, chunk_len,
-    chunks_of, list_file_backups_v2, purge_file_backups_v2,
+    BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
+    FileBackupV2Writer, HEADER_LEN_V2, MAX_FILE_V2, MAX_FILES_V2, MAX_LABEL_V2, MAX_PATH_V2,
+    PlannedFile, chunk_len, chunks_of, list_file_backups_v2, purge_file_backups_v2,
 };
 use envcloak_core::vault::{Vault, VaultErrorKind};
 use envcloak_testkit::{assert_no_canary, by_label, labels};
@@ -43,7 +43,24 @@ fn creator(kind: CreatorKind) -> BackupCreator {
             pid: 4242,
             start_time: 99,
             token: None,
+            boot: Some([0x11; 16]),
         },
+        chain: vec![
+            CreatorProcess {
+                pid: 4242,
+                start_time: 99,
+                token: None,
+                sid: Some(4240),
+                terminal: None,
+            },
+            CreatorProcess {
+                pid: 4240,
+                start_time: 98,
+                token: Some(3),
+                sid: Some(4240),
+                terminal: Some(0x1000_0004),
+            },
+        ],
     }
 }
 

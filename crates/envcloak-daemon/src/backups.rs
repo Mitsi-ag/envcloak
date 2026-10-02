@@ -36,15 +36,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use envcloak_core::audit::{AuditKind, SubjectSummary};
 use envcloak_core::file_backup::FileBackupId;
 use envcloak_core::file_backup_v2::{
-    BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, FileBackupV2Reader,
-    FileBackupV2Writer, MAX_LABEL_V2, PlannedFile, check_plan, chunks_of, list_file_backups_v2,
-    purge_file_backups_v2,
+    BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
+    FileBackupV2Reader, FileBackupV2Writer, MAX_CHAIN_V2, MAX_LABEL_V2, PlannedFile, check_plan,
+    chunks_of, list_file_backups_v2, purge_file_backups_v2,
 };
 use envcloak_core::vault::{Vault, VaultError, VaultErrorKind};
 use envcloak_ipc::proto::{
@@ -57,7 +57,7 @@ use envcloak_ipc::view::{
     RestoreStatementView,
 };
 use envcloak_ipc::{RpcError, WireSecret};
-use envcloak_policy::{ProcessInstance, SubjectEvidence, SubjectKind};
+use envcloak_policy::{Ancestor, ProcessInstance, ProofRefusal, SubjectEvidence, SubjectKind};
 use envcloak_sys::{PeerIdentity, StartTime};
 use sha2::{Digest, Sha256};
 
@@ -77,8 +77,8 @@ pub const MAX_UPLOADS: usize = 16;
 pub const MAX_LEASES: usize = 16;
 /// Backups `backup.v2.list` names, newest first.
 pub const MAX_LISTED: usize = 512;
-/// Creators' evidence kept for the restore's session and terminal check.
-const MAX_CREATORS: usize = 4096;
+// Every process of a creator's chain the daemon reads is sealed.
+const _: () = assert!(MAX_CHAIN_V2 >= envcloak_sys::MAX_ANCESTRY);
 /// The bytes of file entries a restore statement carries at most.
 const STATEMENT_BUDGET: usize = 512 * 1024;
 
@@ -172,20 +172,38 @@ pub fn allowed_path(path: &str, home: Option<&Path>, data_dir: &Path) -> bool {
     *name == "mcp.json" && dirs.last() == Some(&".vscode")
 }
 
-/// The process instance the kernel identified `peer` as.
+/// The running boot's id (`envcloak_sys::boot_id`), read once: `None` on
+/// macOS, and on Linux when it cannot be read, which no recorded boot
+/// matches.
+fn this_boot() -> Option<[u8; 16]> {
+    static BOOT: OnceLock<Option<[u8; 16]>> = OnceLock::new();
+    *BOOT.get_or_init(|| envcloak_sys::boot_id().ok().flatten())
+}
+
+/// Whether processes recorded in boot `boot` are of this boot: the same
+/// id, and on Linux an id at all.
+fn this_boots(boot: Option<[u8; 16]>) -> bool {
+    boot == this_boot()
+        && (boot.is_some() || !cfg!(any(target_os = "linux", target_os = "android")))
+}
+
+/// The process instance the kernel identified `peer` as, in this boot.
 fn owner_of(peer: &PeerIdentity) -> BackupOwner {
     BackupOwner {
         pid: peer.pid,
         start_time: peer.start_time.raw(),
         token: peer.pidversion,
+        boot: this_boot(),
     }
 }
 
 /// Whether `peer` is the process instance `owner`: the same pid and start
-/// time, and the same pid version when both know one. Another process in
-/// the same tree, root or session is not.
+/// time in the same boot, and the same pid version when both know one.
+/// Another process in the same tree, root or session is not, nor a process
+/// of a later boot with the same pid and start time.
 fn same_instance(owner: &BackupOwner, peer: &PeerIdentity) -> bool {
-    owner.pid == peer.pid
+    this_boots(owner.boot)
+        && owner.pid == peer.pid
         && owner.start_time == peer.start_time.raw()
         && match (owner.token, peer.pidversion) {
             (Some(a), Some(b)) => a == b,
@@ -193,14 +211,56 @@ fn same_instance(owner: &BackupOwner, peer: &PeerIdentity) -> bool {
         }
 }
 
-/// Whether `owner` still runs.
+/// Whether `owner` still runs: in this boot, and alive.
 fn owner_alive(owner: &BackupOwner) -> bool {
-    alive(&ProcessInstance {
-        pid: owner.pid,
-        start_time: StartTime::from_raw(owner.start_time),
-        pidversion: owner.token,
-        exe: None,
-    })
+    this_boots(owner.boot)
+        && alive(&ProcessInstance {
+            pid: owner.pid,
+            start_time: StartTime::from_raw(owner.start_time),
+            pidversion: owner.token,
+            exe: None,
+        })
+}
+
+/// The processes of `e`'s chain the restore's session and terminal check
+/// looks at ([`SubjectEvidence::terminal_scope`]), as a backup seals them.
+fn chain_of(e: &SubjectEvidence) -> Vec<CreatorProcess> {
+    e.terminal_scope()
+        .iter()
+        .map(|a| CreatorProcess {
+            pid: a.instance.pid,
+            start_time: a.instance.start_time.raw(),
+            token: a.instance.pidversion,
+            sid: a.sid,
+            terminal: a.terminal,
+        })
+        .collect()
+}
+
+/// Whether `caller` shares a session or a terminal with a process of the
+/// chain sealed with backup creator `c` that still runs in this boot
+/// ([`SubjectEvidence::shares_session_or_terminal`]): read from the
+/// backup, so it holds after a restart of the daemon.
+fn shares_with_creator(caller: &SubjectEvidence, c: &BackupCreator) -> bool {
+    if !this_boots(c.owner.boot) {
+        return false;
+    }
+    let scope: Vec<Ancestor> = c
+        .chain
+        .iter()
+        .map(|p| Ancestor {
+            instance: ProcessInstance {
+                pid: p.pid,
+                start_time: StartTime::from_raw(p.start_time),
+                pidversion: p.token,
+                exe: None,
+            },
+            sid: p.sid,
+            terminal: p.terminal,
+            agent: None,
+        })
+        .collect();
+    caller.shares_session_or_terminal(&scope, &alive)
 }
 
 /// A backup in progress's writer, shared by the calls that use it. Boxed,
@@ -227,14 +287,13 @@ struct Lease {
     last_used: Duration,
 }
 
-/// The daemon's backups v2 in memory: those in progress, the restore
-/// leases, and the evidence of the creators of agent and unknown backups
-/// made since the daemon started. Lives in [`State`], under its lock.
+/// The daemon's backups v2 in memory: those in progress and the restore
+/// leases. Lives in [`State`], under its lock. Who made a backup is in
+/// the backup, sealed, not here.
 #[derive(Default)]
 pub struct Registry {
     uploads: HashMap<FileBackupId, Upload>,
     leases: HashMap<FileBackupId, Lease>,
-    creators: HashMap<FileBackupId, SubjectEvidence>,
     /// Bumped at every lock: a restore that began before one gets no
     /// lease.
     locks: u64,
@@ -258,17 +317,14 @@ impl Registry {
         self.locks += 1;
     }
 
-    /// Drops the backups in progress whose creator exited, the leases
+    /// Drops the backups in progress whose creator exited, and the leases
     /// whose process exited or that sat idle for [`LEASE_IDLE`] at awake
-    /// time `awake`, and the creators' evidence no process of which still
-    /// runs.
+    /// time `awake`.
     pub fn sweep(&mut self, awake: Duration) {
         self.uploads.retain(|_, u| owner_alive(&u.owner));
         self.leases.retain(|_, l| {
             awake.saturating_sub(l.last_used) <= LEASE_IDLE && owner_alive(&l.owner)
         });
-        self.creators
-            .retain(|_, e| e.chain().iter().any(|a| alive(&a.instance)));
     }
 }
 
@@ -460,6 +516,12 @@ pub fn begin(
     p: BackupBeginParams,
 ) -> Result<BackupBegunView, RpcError> {
     let purpose = BackupPurpose::from_token(&p.purpose).ok_or_else(invalid)?;
+    if !this_boots(this_boot()) {
+        // Linux without a boot id: no owner could be told from a process
+        // of a later boot.
+        log_line!("envcloakd: the boot id cannot be read; no file backup v2 is begun");
+        return Err(RpcError::new(ErrorKind::FilesBackupFailed));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|h| h.is_absolute());
@@ -484,14 +546,13 @@ pub fn begin(
         evidence_digest: evidence_digest(&caller),
         agent: label_of(&caller),
         owner: owner_of(peer),
+        chain: chain_of(&caller),
     };
     let now = wall_secs(shared);
     let mut s = locked(&shared.state);
     s.unlocked()?;
     s.backups().sweep(shared.clocks.awake());
-    if s.backups().uploads.len() >= MAX_UPLOADS
-        || (kind != CreatorKind::Terminal && s.backups().creators.len() >= MAX_CREATORS)
-    {
+    if s.backups().uploads.len() >= MAX_UPLOADS {
         return Err(RpcError::new(ErrorKind::Busy));
     }
     let v = s.unlocked()?;
@@ -511,11 +572,7 @@ pub fn begin(
         subject: subject_summary(peer, &caller),
         purpose,
     };
-    let reg = s.backups();
-    reg.uploads.insert(id, upload);
-    if kind != CreatorKind::Terminal {
-        reg.creators.insert(id, caller);
-    }
+    s.backups().uploads.insert(id, upload);
     Ok(BackupBegunView {
         id: id.to_string(),
         chunk_size: u32::try_from(CHUNK_V2).unwrap_or(u32::MAX),
@@ -712,21 +769,18 @@ pub fn open_restore(
         let mut s = locked(&shared.state);
         let r = open_reader(&s, &id)?;
         let results = r.results().map_err(|e| backup_error(&e))?;
-        let creator = r.meta().creator.kind;
-        if creator != CreatorKind::Terminal {
-            let refusal = s
-                .backups()
-                .creators
-                .get(&id)
-                .and_then(|made_by| caller.approval_refusal(made_by, &alive));
-            if let Some(r) = refusal {
-                s.audit(AuditEvent::ProofRefused {
-                    pid: peer.pid,
-                    method: METHOD,
-                    reason: r.token(),
-                });
-                return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
-            }
+        // The approval-origin boundary, as for a pending request: not from
+        // a session or terminal of the chain of the agent or unknown process
+        // that made the backup, while a process of it runs.
+        let c = &r.meta().creator;
+        if c.kind != CreatorKind::Terminal && shares_with_creator(&caller, c) {
+            let r = ProofRefusal::RequesterTerminal;
+            s.audit(AuditEvent::ProofRefused {
+                pid: peer.pid,
+                method: METHOD,
+                reason: r.token(),
+            });
+            return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
         }
         (Arc::new(r), Arc::new(results))
     };
@@ -994,6 +1048,7 @@ mod tests {
             pid: me.pid,
             start_time: me.start_time.raw(),
             token: None,
+            boot: this_boot(),
         };
         let gone = BackupOwner {
             start_time: me.start_time.raw() + 1,
@@ -1022,6 +1077,34 @@ mod tests {
         assert_eq!(alive_now(&reg), 0, "a lease outlived 60 seconds idle");
     }
 
+    /// A process instance recorded in another boot is neither alive nor
+    /// the caller, whatever its pid and start time: on Linux a start time
+    /// counts from boot, and a process of a later boot can have both again.
+    #[test]
+    fn an_owner_of_another_boot_is_neither_alive_nor_the_caller() {
+        let me = envcloak_sys::proc_info(i32::try_from(std::process::id()).unwrap()).unwrap();
+        let peer = PeerIdentity {
+            uid: 0,
+            pid: me.pid,
+            start_time: me.start_time,
+            pidversion: None,
+            source: envcloak_sys::PeerSource::PeerCred,
+        };
+        let here = owner_of(&peer);
+        assert!(same_instance(&here, &peer) && owner_alive(&here));
+        for other in [Some([0xee; 16]), None, Some([0; 16])] {
+            if other == this_boot() {
+                continue;
+            }
+            let there = BackupOwner {
+                boot: other,
+                ..here
+            };
+            assert!(!owner_alive(&there), "{other:?}");
+            assert!(!same_instance(&there, &peer), "{other:?}");
+        }
+    }
+
     fn test_reader() -> Arc<FileBackupV2Reader> {
         use std::sync::OnceLock;
         static READER: OnceLock<(tempfile::TempDir, Arc<FileBackupV2Reader>)> = OnceLock::new();
@@ -1045,7 +1128,9 @@ mod tests {
                             pid: 1,
                             start_time: 1,
                             token: None,
+                            boot: None,
                         },
+                        chain: Vec::new(),
                     },
                     vec![PlannedFile {
                         path: "/h/.env".into(),

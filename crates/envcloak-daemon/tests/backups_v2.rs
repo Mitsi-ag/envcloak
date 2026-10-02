@@ -324,6 +324,17 @@ impl Fixture {
         client(&self.home).backup_v2_open_restore(id, passphrase(&self.cs), tick, unrecorded, &[])
     }
 
+    /// Stops the daemon and starts it again, unlocked: nothing it held in
+    /// memory survives.
+    fn restart(&mut self) {
+        self.d.signal("-TERM");
+        assert!(self.d.wait_exit(Duration::from_secs(30)).is_some());
+        self.d = Self::daemon(&self.home);
+        client(&self.home)
+            .unlock(passphrase(&self.cs), &[])
+            .unwrap();
+    }
+
     /// The audit log's entries, read after the daemon stopped.
     fn audit_after_stop(&mut self) -> Vec<envcloak_core::audit::AuditEntry> {
         self.d.signal("-TERM");
@@ -1242,11 +1253,12 @@ fn a_killed_client_or_daemon_leaves_no_listed_partial_backup() {
 /// agent made on this very terminal is not restored from that terminal
 /// or its session while the agent still runs (`proof_refused`,
 /// `requester_terminal`), tick or not: the agent could read what is
-/// typed there, or be what types it. Once the agent has exited, the
-/// person restores it there.
+/// typed there, or be what types it. The creator's chain is sealed with
+/// the backup, so this holds after a restart of the daemon too. Once the
+/// agent has exited, the person restores it there.
 #[test]
 fn an_agents_backup_is_not_restored_from_the_agents_terminal() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let files = [Spec::made(&f.claude("settings.local.json"), 64, 8)];
     let mut agent = f.agent_here();
     let begun = agent.ask(json!({"op": "begin", "purpose": "agents",
@@ -1266,6 +1278,15 @@ fn an_agents_backup_is_not_restored_from_the_agents_terminal() {
     assert_eq!(
         rpc(e),
         (ErrorKind::ProofRefused, Some("requester_terminal"))
+    );
+    assert_eq!(f.list().open_leases, 0);
+    // A daemon that did not see the backup begin reads the chain from it.
+    f.restart();
+    let e = f.open(&id, true, false).unwrap_err();
+    assert_eq!(
+        rpc(e),
+        (ErrorKind::ProofRefused, Some("requester_terminal")),
+        "after a restart"
     );
     assert_eq!(f.list().open_leases, 0);
     agent.end();
