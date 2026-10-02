@@ -441,6 +441,12 @@ impl Registry {
         self.creators.retain(|_, w| w.running());
     }
 
+    /// The count of locks so far.
+    #[cfg(test)]
+    pub(crate) fn locks(&self) -> u64 {
+        self.locks
+    }
+
     /// Whether a purge of old backups is due at awake time `awake`: the
     /// first time, then once [`PURGE_EVERY`] has passed since the last;
     /// counted as done when due.
@@ -510,6 +516,9 @@ pub struct Deliveries {
     /// How many are out, by the count of locks they were checked at.
     out: Mutex<BTreeMap<u64, usize>>,
     done: Condvar,
+    /// How many locks are waiting for a chunk now: a unit test's barrier.
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl core::fmt::Debug for Deliveries {
@@ -523,7 +532,7 @@ impl core::fmt::Debug for Deliveries {
 impl Deliveries {
     /// Counts a chunk that passed its last check at lock count `locks`,
     /// under the state lock, until the [`Delivering`] is dropped.
-    fn start(&self, locks: u64) -> Delivering<'_> {
+    pub(crate) fn start(&self, locks: u64) -> Delivering<'_> {
         *locked(&self.out).entry(locks).or_insert(0) += 1;
         Delivering { of: self, locks }
     }
@@ -536,12 +545,24 @@ impl Deliveries {
             return;
         }
         envcloak_sys::test_event("a lock waits for a chunk on its way out");
+        #[cfg(test)]
+        self.waiting
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         while out.range(..locks).next().is_some() {
             out = self
                 .done
                 .wait(out)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        #[cfg(test)]
+        self.waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many locks are waiting for a chunk now.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -570,10 +591,12 @@ impl Drop for Delivering<'_> {
 
 /// After a lock: waits until no restore chunk that passed its last check
 /// before it is still going out (each is bounded by the server's limit
-/// for writing an answer). Called without the state lock held.
-pub(crate) fn wait_for_deliveries(shared: &Shared) {
-    let locks = locked(&shared.state).backups().locks;
-    shared.deliveries.wait_before(locks);
+/// for writing an answer). Called without the state lock held, after
+/// every lock: by request, idle time, sleep, a recovery and the daemon's
+/// stop.
+pub(crate) fn wait_for_deliveries(state: &Mutex<State>, deliveries: &Deliveries) {
+    let locks = locked(state).backups().locks;
+    deliveries.wait_before(locks);
 }
 
 /// The controlling terminal of `peer`'s process now, read for its pid

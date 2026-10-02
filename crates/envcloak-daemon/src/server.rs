@@ -392,7 +392,7 @@ fn bind(socket: &Path) -> Result<UnixListener, DaemonError> {
 fn stop_on_signal(signals: &TerminationSignals, shared: &Shared, socket: &Path, lock_file: File) {
     let sig = signals.wait().unwrap_or(0);
     let was_unlocked = locked(&shared.state).lock(LockReason::Signal);
-    backups::wait_for_deliveries(shared);
+    backups::wait_for_deliveries(&shared.state, &shared.deliveries);
     let _ = std::fs::remove_file(socket);
     log_line!(
         "envcloakd: stopping on signal {sig}; vault {}",
@@ -409,11 +409,19 @@ fn stop_on_signal(signals: &TerminationSignals, shared: &Shared, socket: &Path, 
 /// The sleep and idle checks. A lock they make waits for the restore
 /// chunks on their way out, as every lock does.
 fn observe(shared: &Shared) {
-    let now = Reading::now(&shared.clocks);
-    let reason = locked(&shared.state).observe(now);
+    observe_at(
+        &shared.state,
+        &shared.deliveries,
+        Reading::now(&shared.clocks),
+    );
+}
+
+/// [`observe`] at the reading `now`.
+fn observe_at(state: &Mutex<State>, deliveries: &backups::Deliveries, now: Reading) {
+    let reason = locked(state).observe(now);
     if let Some(reason) = reason {
         log_line!("envcloakd: vault locked (reason: {})", reason.as_str());
-        backups::wait_for_deliveries(shared);
+        backups::wait_for_deliveries(state, deliveries);
     }
 }
 
@@ -561,7 +569,11 @@ impl Read for FrameReader<'_> {
 /// Writes an answer within one deadline, [`WRITE_TIMEOUT`] from its
 /// first byte, however slowly the client reads it: a lock waits for a
 /// restore chunk's answer to be written ([`backups::Deliveries`]), so the
-/// whole write is bounded, not each part of it.
+/// whole write is bounded, not each part of it. Each write waits for the
+/// socket (`poll`) only for the time left and then writes without
+/// blocking: a blocking write with a send timeout stays in the kernel as
+/// long as the reader keeps taking a little, since the timeout starts
+/// again at every wait inside one call (macOS), so it would bound nothing.
 struct FrameWriter<'a> {
     stream: &'a UnixStream,
     deadline: Instant,
@@ -569,23 +581,56 @@ struct FrameWriter<'a> {
 
 impl<'a> FrameWriter<'a> {
     fn new(stream: &'a UnixStream) -> Self {
-        FrameWriter {
-            stream,
-            deadline: Instant::now() + WRITE_TIMEOUT,
+        Self::until(stream, Instant::now() + WRITE_TIMEOUT)
+    }
+
+    /// A writer whose every write ends by `deadline`.
+    fn until(stream: &'a UnixStream, deadline: Instant) -> Self {
+        FrameWriter { stream, deadline }
+    }
+}
+
+impl FrameWriter<'_> {
+    /// Writes what the socket takes now of `buf`, once it takes any, on a
+    /// socket left non-blocking; past the deadline, `TimedOut`.
+    fn write_when_ready(&self, buf: &[u8]) -> io::Result<usize> {
+        loop {
+            let left = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or(io::ErrorKind::TimedOut)?;
+            match envcloak_sys::wait_writable(self.stream.as_fd(), left) {
+                // Not ready in the time left: past the deadline that is the
+                // timeout, at the top of the loop.
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+            let mut stream: &UnixStream = self.stream;
+            match stream.write(buf) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                r => return r,
+            }
         }
     }
 }
 
 impl Write for FrameWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let left = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or(io::ErrorKind::TimedOut)?;
-        self.stream.set_write_timeout(Some(left))?;
-        let mut stream: &UnixStream = self.stream;
-        stream.write(buf)
+        // Non-blocking for the write only: the next request is read with
+        // the socket blocking again.
+        self.stream.set_nonblocking(true)?;
+        let written = self.write_when_ready(buf);
+        let blocking = self.stream.set_nonblocking(false);
+        let n = written?;
+        blocking?;
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -692,7 +737,7 @@ fn respond<'s>(
             }
             // Answered once no restore chunk checked before it is still
             // going out.
-            backups::wait_for_deliveries(shared);
+            backups::wait_for_deliveries(&shared.state, &shared.deliveries);
             envcloak_sys::test_event("lock answered");
             Ok(LockedView { was_unlocked })
         }),
@@ -983,5 +1028,100 @@ mod tests {
             assert!(!purged, "v1 failing: {v1_fails}: a failure not reported");
         }
         assert!(purge_both::<()>(|| Ok(0), || Ok(2)));
+    }
+
+    /// A lock by idle time or by sleep waits for a restore chunk on its way
+    /// out, as one by request does: with a chunk counted as going out (as
+    /// `read` counts one that passed its last check), the tick's checks at
+    /// a reading past the idle limit, and at one after the machine slept,
+    /// lock the vault and then wait (a barrier: the lock is seen waiting)
+    /// until the chunk's answer is written, and return only then.
+    #[test]
+    fn an_idle_or_sleep_lock_waits_for_a_chunk_on_its_way_out() {
+        use crate::clock::FakeClocks;
+        use envcloak_core::SecretBytes;
+        for asleep in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = VaultPaths::under(dir.path().join("data"));
+            let clocks = FakeClocks::new();
+            let mut st = State::open(
+                paths.clone(),
+                crate::lock::DEFAULT_IDLE,
+                Reading::now(&clocks),
+            );
+            let generation = st.begin_create().unwrap();
+            let v = create_vault_with_kit(
+                &paths,
+                &SecretBytes::copy_from(b"a passphrase long enough to pass"),
+                &RecoveryKit::generate(),
+                KdfParams::minimum(),
+            );
+            st.finish_create(generation, Reading::now(&clocks), v)
+                .unwrap();
+            let state = Mutex::new(st);
+            let deliveries = backups::Deliveries::default();
+            let held = deliveries.start(locked(&state).backups().locks());
+            if asleep {
+                clocks.sleep(Duration::from_secs(600));
+            } else {
+                clocks.run(crate::lock::DEFAULT_IDLE + Duration::from_secs(1));
+            }
+            let now = Reading::now(&clocks);
+            thread::scope(|scope| {
+                let observing = scope.spawn(|| observe_at(&state, &deliveries, now));
+                while deliveries.waiting() == 0 {
+                    assert!(
+                        !observing.is_finished(),
+                        "asleep: {asleep}: the lock did not wait for a chunk on its way out"
+                    );
+                    thread::yield_now();
+                }
+                assert!(
+                    locked(&state).unlocked().is_err(),
+                    "asleep: {asleep}: not locked"
+                );
+                assert!(!observing.is_finished());
+                drop(held);
+                observing.join().unwrap();
+            });
+            assert_eq!(deliveries.waiting(), 0);
+        }
+    }
+
+    /// An answer is written within one deadline as a whole, however slowly
+    /// the client reads it (a lock waits for a restore chunk's answer, so
+    /// that wait is bounded too): a client reading 4 KiB every 20 ms keeps
+    /// every write making progress, and the writer still stops at its
+    /// deadline (300 ms here, [`WRITE_TIMEOUT`] in the daemon), long before
+    /// 4 MiB is through. The client stops reading after 3 seconds, so a
+    /// writer that took its deadline afresh at each write would stop only
+    /// after that.
+    #[test]
+    fn an_answer_is_written_within_one_deadline_however_slowly_it_is_read() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let start = Instant::now();
+        let reader = thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            let mut theirs = theirs;
+            while start.elapsed() < Duration::from_secs(3) {
+                if matches!(theirs.read(&mut buf), Ok(0)) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let written = FrameWriter::until(&ours, start + Duration::from_millis(300))
+            .write_all(&vec![0u8; 4 << 20]);
+        let took = start.elapsed();
+        drop(ours);
+        let _ = reader.join();
+        assert!(written.is_err(), "4 MiB went through a slow reader");
+        assert!(
+            took < Duration::from_secs(2),
+            "the writer ran past its deadline: {took:?}"
+        );
     }
 }
