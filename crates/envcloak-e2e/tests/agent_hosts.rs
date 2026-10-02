@@ -2458,11 +2458,43 @@ fn tier_2(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // The run's own environment, for the version check after it.
+    let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
+        .collect();
     let output = envcloak_testkit::agents::finish_within(cmd, envcloak_testkit::agents::RUN_LIMIT);
     let report = model.finish();
     if let Err(why) = installed.verify() {
         panic!("the host changed during the run: {why}");
     }
+    // As for the tier-1 hosts (`AgentHome::check_pinned`): after the run,
+    // in the same isolated environment and directory, the host still
+    // reports the pinned version, so an update it made of itself (a new
+    // build beside the pinned file, a version the files do not show)
+    // fails the test (Codex review, low).
+    let mut version = installed.command();
+    version
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .arg("--version")
+        .current_dir(&project)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let shown =
+        envcloak_testkit::agents::finish_within(version, std::time::Duration::from_secs(120));
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&shown.stdout),
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(
+        reports_version(&said, &installed.pin.version),
+        "{id} --version says {:?} after the run, pinned {}",
+        said.chars().take(300).collect::<String>(),
+        installed.pin.version
+    );
     let label = format!("{id}/{variant} {}", installed.pin.version);
     println!(
         "measurement: tier 2 host={label} os={}: endpoints {}; tunnels refused {}; outcome {}",
@@ -2472,6 +2504,35 @@ fn tier_2(
         report.outcome
     );
     Some(Tier2Run { report, output })
+}
+
+/// Whether `--version`'s output names `version` as a whole word: `1.0.9`
+/// is not `1.0.90`.
+fn reports_version(said: &str, version: &str) -> bool {
+    said.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
+        .map(|w| w.trim_start_matches('v').trim_end_matches('.'))
+        .any(|w| w == version)
+}
+
+#[test]
+fn a_version_is_reported_only_as_a_whole_word() {
+    for said in [
+        "1.0.90\n",
+        "GitHub Copilot CLI 1.0.90.\nRun 'copilot update' to check for updates.\n",
+        "v1.0.90",
+        "2026.09.28-64d2043\n",
+    ] {
+        let want = if said.starts_with("2026") {
+            "2026.09.28-64d2043"
+        } else {
+            "1.0.90"
+        };
+        assert!(reports_version(said, want), "{said:?}");
+    }
+    for said in ["1.0.9\n", "1.0.901\n", "", "11.0.90", "2026.09.28\n"] {
+        assert!(!reports_version(said, "1.0.90"), "{said:?}");
+        assert!(!reports_version(said, "2026.09.28-64d2043"), "{said:?}");
+    }
 }
 
 /// The probe's answer in the request after the shell call: the marker,
