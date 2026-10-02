@@ -12,15 +12,19 @@
 //!   plan §6, rule 3; D-34). No signal goes to a number read from anywhere
 //!   else.
 //! - A host's cancellation ([`Call::cancel`]) sends the group `SIGTERM`,
-//!   which `envcloak run` passes on to its command's group; if the leader
-//!   has not exited within [`TERM_GRACE`], a second `SIGTERM`, on which
-//!   `envcloak run` kills its command's group (`SIGKILL`, through the
-//!   handle it owns: the command is its unreaped child); and `SIGKILL` if
-//!   the leader has still not exited [`KILL_GRACE`] later. Without a
-//!   controlling terminal the command leads a group of its own, which only
-//!   `envcloak run` owns, so a command that ignores `SIGTERM` is ended
-//!   through `envcloak run`, never by a signal from here to a group this
-//!   server did not start.
+//!   which `envcloak run` passes on to its command; if the leader has not
+//!   exited within [`TERM_GRACE`], a second `SIGTERM`, on which `envcloak
+//!   run` kills its command (`SIGKILL`, through the handle it owns: the
+//!   command is its unreaped child); and `SIGKILL` if the leader has still
+//!   not exited [`KILL_GRACE`] later. Once the leader of a stopped call has
+//!   exited, and before it is reaped, its whole group gets `SIGKILL`: what
+//!   is left there (on a controlling terminal `envcloak run` keeps its
+//!   command, and what the command starts, in this group) ends with the
+//!   call, however soon `envcloak run` exited. Without a controlling
+//!   terminal the command leads a group of its own, which only `envcloak
+//!   run` owns, and `envcloak run` ends what is left of it in turn before
+//!   it reaps the command (docs/RUN.md); never by a signal from here to a
+//!   group this server did not start.
 //! - Output is kept as its first and last [`OUTPUT_HEAD`] and
 //!   [`OUTPUT_TAIL`] bytes, with a count of what was left out between them
 //!   ([`HeadTail`]); it is read until end of stream, or for [`DRAIN`] after
@@ -74,9 +78,17 @@ impl Group {
     }
 
     /// The leader has exited and is about to be reaped: from here on
-    /// nothing is signalled.
-    fn reaping(&self) {
-        *lock(&self.leader) = None;
+    /// nothing is signalled. When `stopped` says, under the same lock, that
+    /// its call was stopped, what is left of its group is killed first,
+    /// while the group is still the exited leader's.
+    fn reaping(&self, stopped: impl FnOnce() -> bool) {
+        let mut leader = lock(&self.leader);
+        if let Some(pid) = *leader {
+            if stopped() {
+                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+            }
+        }
+        *leader = None;
         self.reaped.notify_all();
     }
 
@@ -92,7 +104,7 @@ impl Group {
 }
 
 /// Stops `group`: `SIGTERM`; again once [`TERM_GRACE`] has passed with the
-/// leader not reaped (`envcloak run` then kills its command's group); then
+/// leader not reaped (`envcloak run` then kills its command); then
 /// `SIGKILL` once [`KILL_GRACE`] more has passed.
 fn stop(group: Arc<Group>) {
     if group.signal(libc::SIGTERM) {
@@ -308,7 +320,10 @@ pub fn run(mut cmd: Command, call: &Call, limit: Option<Duration>) -> Result<Cap
     } else {
         let _ = exited.recv();
     }
-    group.reaping();
+    // A cancellation that signalled the group did so before this takes
+    // the lock, after it marked the call cancelled: the call is seen
+    // stopped here, and what is left of its group goes with it.
+    group.reaping(|| timed_out || call.cancelled());
     let status = child.wait();
     call.detach();
     let deadline = Instant::now() + DRAIN;
@@ -426,6 +441,45 @@ mod tests {
         assert_eq!(done.signal, Some(libc::SIGKILL));
         assert!(!done.timed_out);
         assert_eq!(std::fs::read_to_string(&rec).unwrap(), "term\nterm\n");
+    }
+
+    /// Cancelling a call whose leader dies of the `SIGTERM` but leaves a
+    /// process in its group that ignores it (on a controlling terminal,
+    /// `envcloak run` and its command are such a group): the group gets
+    /// `SIGKILL` once the leader has exited, before it is reaped, so that
+    /// process ends with the call. It held the output pipes, which close at
+    /// once rather than at the drain's end.
+    ///
+    /// Mutation checked: the group not killed at the reap (`reaping`
+    /// ignoring `stopped`): the process runs on holding the pipes, the
+    /// output is cut at the drain's end and this fails.
+    #[test]
+    fn what_a_cancelled_leader_leaves_in_its_group_ends_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("(trap '' TERM; : >\"$1\"; exec sleep 30) & wait")
+            .arg("sh")
+            .arg(&ready);
+        let call = Arc::new(Call::new());
+        let running = Arc::clone(&call);
+        let t = std::thread::spawn(move || run(cmd, &running, Some(Duration::from_secs(120))));
+        let end = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(Instant::now() < end, "the child did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let start = Instant::now();
+        call.cancel();
+        let done = t.join().unwrap().unwrap();
+        assert_eq!(done.signal, Some(libc::SIGTERM));
+        assert!(!done.timed_out);
+        assert!(
+            !done.cut,
+            "a process left in the cancelled call's group held its output"
+        );
+        assert!(start.elapsed() < DRAIN, "{:?}", start.elapsed());
     }
 
     #[test]
