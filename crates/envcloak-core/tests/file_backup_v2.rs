@@ -1613,3 +1613,85 @@ fn a_commit_refuses_a_symlink_put_under_the_backup_name() {
 fn a_commit_refuses_a_directory_put_under_the_backup_name() {
     refuses_a_substituted_publication(true, false);
 }
+
+/// A result is answered as recorded only when its name holds the file
+/// written (the class of the commit's check above: a link takes whatever
+/// has the temporary name at that moment). Once the result's temporary
+/// file is flushed, another file is put under its name, or a symlink to
+/// a file elsewhere: the call fails, the other file and the symlink's
+/// target are as they were, and a result recorded after that one is
+/// refused (`AlreadyExists`), never taken for the change's.
+#[test]
+fn a_result_is_recorded_only_for_the_file_written() {
+    use envcloak_core::file_backup_v2::ResultStepV2;
+    for symlink in [false, true] {
+        let (f, v) = KitFixture::create();
+        let id = small(&v, now());
+        let r = v.open_file_backup_v2(&id).unwrap();
+        let dir = data_file(&v, &id).parent().unwrap().to_owned();
+        let outside = f.home.root().join("outside");
+        std::fs::write(&outside, b"not a result").unwrap();
+        let after: [u8; 32] = Sha256::digest(b"what init left").into();
+        let mut did = 0;
+        let e = r.record_result_observed(0, &after, |step| {
+            if step != ResultStepV2::Synced {
+                return;
+            }
+            let temp = dir_names(&dir)
+                .into_iter()
+                .find(|n| n.starts_with(".result-0-"))
+                .unwrap();
+            let other = dir.join("other");
+            if symlink {
+                std::os::unix::fs::symlink(&outside, &other).unwrap();
+            } else {
+                std::fs::write(&other, b"not a result either").unwrap();
+            }
+            std::fs::rename(&other, dir.join(temp)).unwrap();
+            did += 1;
+        });
+        assert_eq!(did, 1);
+        assert!(
+            e.is_err(),
+            "symlink {symlink}: a result answered as recorded for a file it did not write"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"not a result");
+        assert!(r.record_result(0, &after).is_err());
+        drop(f);
+    }
+}
+
+/// A writer dropped unfinished removes its staging directory's name only
+/// while it still names the directory it made: with that directory moved
+/// away and an empty directory put under its name, the empty directory
+/// stays, and the moved one loses its `data` through the handle held.
+#[test]
+fn a_writer_dropped_unfinished_removes_only_its_own_staging_directory() {
+    let (f, v) = KitFixture::create();
+    let backups = v.paths().backups_dir.clone();
+    let plan = vec![PlannedFile {
+        path: "/h/.env".into(),
+        mode: 0o600,
+        size: 4,
+    }];
+    let w = v
+        .begin_file_backup_v2(
+            BackupPurpose::Init,
+            creator(CreatorKind::Terminal),
+            plan,
+            now(),
+        )
+        .unwrap();
+    let staging = dir_names(&backups);
+    assert_eq!(staging.len(), 1);
+    let away = f.home.root().join("staging-moved");
+    std::fs::rename(backups.join(&staging[0]), &away).unwrap();
+    std::fs::create_dir(backups.join(&staging[0])).unwrap();
+    drop(w);
+    assert!(
+        backups.join(&staging[0]).is_dir(),
+        "an empty directory put under the staging name was removed"
+    );
+    assert!(dir_names(&away).is_empty(), "{:?}", dir_names(&away));
+    drop(f);
+}
