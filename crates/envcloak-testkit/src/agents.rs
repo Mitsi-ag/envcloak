@@ -1525,29 +1525,59 @@ struct Collector {
     err: Collected,
 }
 
-type Collected = std::sync::Arc<std::sync::Mutex<(Vec<u8>, bool)>>;
+/// How far a stream of a child's output was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// Still being read.
+    Open,
+    /// Read to its end.
+    Ended,
+    /// A read failed: what came after it is missing, so the output is
+    /// incomplete, never taken for whole.
+    Failed,
+}
+
+type Collected = std::sync::Arc<std::sync::Mutex<(Vec<u8>, Reading)>>;
+
+/// Reads `s` to its end into `into`, then marks it [`Reading::Ended`]; a
+/// read interrupted by a signal is tried again, and any other error marks
+/// it [`Reading::Failed`] and stops (Codex review, medium: every error
+/// was taken for the end, so output cut short by one passed the sweep as
+/// whole).
+fn drain(mut s: impl Read, into: &Collected) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = s.read(&mut chunk);
+        let mut b = into
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match read {
+            Ok(0) => {
+                b.1 = Reading::Ended;
+                return;
+            }
+            Ok(n) => b.0.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                b.1 = Reading::Failed;
+                return;
+            }
+        }
+    }
+}
 
 impl Collector {
     fn start(child: &mut Child) -> Collector {
         fn collect(s: Option<Box<dyn Read + Send>>) -> Collected {
-            let buf: Collected =
-                std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), s.is_none())));
-            if let Some(mut s) = s {
+            let state = if s.is_some() {
+                Reading::Open
+            } else {
+                Reading::Ended
+            };
+            let buf: Collected = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), state)));
+            if let Some(s) = s {
                 let into = std::sync::Arc::clone(&buf);
-                std::thread::spawn(move || {
-                    let mut chunk = [0u8; 8192];
-                    loop {
-                        let n = s.read(&mut chunk).unwrap_or(0);
-                        let mut b = into
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if n == 0 {
-                            b.1 = true;
-                            return;
-                        }
-                        b.0.extend_from_slice(&chunk[..n]);
-                    }
-                });
+                std::thread::spawn(move || drain(s, &into));
             }
             buf
         }
@@ -1582,6 +1612,7 @@ impl Collector {
     fn wait_grace(&self, child: &mut GroupChild, limit: Duration, grace: Duration) -> Output {
         let ended = self.end(child, limit, grace);
         assert!(ended.in_time, "a process did not exit within {limit:?}");
+        assert!(!ended.read_failed, "incomplete output: a read of it failed");
         assert!(
             ended.complete,
             "incomplete output: {grace:?} after the process exited and its group was killed, \
@@ -1598,16 +1629,22 @@ impl Collector {
             child.wait_exit(Duration::from_secs(2));
         }
         let status = child.finish();
-        let done = |c: &Collected| {
+        let state = |c: &Collected| {
             c.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .1
         };
+        let done = |c: &Collected| state(c) != Reading::Open;
         let end = Instant::now() + grace;
         while !(done(&self.out) && done(&self.err)) && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
         }
-        let complete = done(&self.out) && done(&self.err);
+        let read_failed = [&self.out, &self.err]
+            .iter()
+            .any(|c| state(c) == Reading::Failed);
+        let complete = [&self.out, &self.err]
+            .iter()
+            .all(|c| state(c) == Reading::Ended);
         let take = |c: &Collected| {
             std::mem::take(
                 &mut c
@@ -1624,6 +1661,7 @@ impl Collector {
             },
             in_time,
             complete,
+            read_failed,
         }
     }
 }
@@ -1637,10 +1675,14 @@ pub struct Bounded {
     /// It exited within its limit; else its group was sent `SIGTERM`,
     /// then `SIGKILL` 2 s later.
     pub in_time: bool,
-    /// Its output was read to the end: no process outside its group
-    /// still held it open [`OUTPUT_GRACE`] after it exited and its group
-    /// was killed. Such a process escaped the group and may still run.
+    /// Its output was read to the end: no read of it failed, and no
+    /// process outside its group still held it open [`OUTPUT_GRACE`]
+    /// after it exited and its group was killed. Such a process escaped
+    /// the group and may still run.
     pub complete: bool,
+    /// A read of its output failed: what came after is missing (the run
+    /// is not [`Bounded::complete`] either).
+    pub read_failed: bool,
 }
 
 impl std::fmt::Debug for Bounded {
@@ -1649,6 +1691,7 @@ impl std::fmt::Debug for Bounded {
             .field("status", &self.output.status)
             .field("in_time", &self.in_time)
             .field("complete", &self.complete)
+            .field("read_failed", &self.read_failed)
             .field("stdout_len", &self.output.stdout.len())
             .field("stderr_len", &self.output.stderr.len())
             .finish()
@@ -1855,6 +1898,77 @@ mod tests {
             .and_then(|p| p.downcast_ref::<String>().cloned())
             .unwrap_or_default();
         assert!(message.starts_with("incomplete output"), "{message:?}");
+    }
+
+    /// A read of a child's output that fails part way leaves the output
+    /// incomplete, never taken for its end (Codex review, medium: every
+    /// error was read as the end): an error between a harmless prefix and
+    /// a canary stops the reading as failed with the prefix only, and the
+    /// run is incomplete, its wait failing; a read a signal interrupted is
+    /// tried again, and the rest is read to the end.
+    #[test]
+    fn a_failed_read_leaves_the_output_incomplete() {
+        struct Script(std::collections::VecDeque<Result<Vec<u8>, std::io::ErrorKind>>);
+        impl Read for Script {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.pop_front() {
+                    None => Ok(0),
+                    Some(Ok(b)) => {
+                        buf[..b.len()].copy_from_slice(&b);
+                        Ok(b.len())
+                    }
+                    Some(Err(kind)) => Err(std::io::Error::from(kind)),
+                }
+            }
+        }
+        let canary = format!("ecread{:016x}", crate::fresh_seed()).into_bytes();
+        let read = |kind| {
+            let into: Collected =
+                std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), Reading::Open)));
+            let script = vec![Ok(b"harmless ".to_vec()), Err(kind), Ok(canary.clone())];
+            drain(Script(script.into()), &into);
+            let got = into
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (got.0.clone(), got.1)
+        };
+        assert_eq!(
+            read(std::io::ErrorKind::Other),
+            (b"harmless ".to_vec(), Reading::Failed)
+        );
+        assert_eq!(
+            read(std::io::ErrorKind::Interrupted),
+            ([&b"harmless "[..], &canary].concat(), Reading::Ended)
+        );
+        // A run whose output stream failed is incomplete, and its wait
+        // fails; the control, both streams read to the end, is complete.
+        let collector = |out: Reading| {
+            let stream = |state| std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), state)));
+            Collector {
+                out: stream(out),
+                err: stream(Reading::Ended),
+            }
+        };
+        let limit = Duration::from_secs(60);
+        let mut child = GroupChild::spawn(&mut sh("true")).unwrap_or_else(|e| panic!("{e}"));
+        let ended = collector(Reading::Failed).end(&mut child, limit, Duration::from_secs(1));
+        assert!(ended.read_failed && !ended.complete, "{ended:?}");
+        let mut child = GroupChild::spawn(&mut sh("true")).unwrap_or_else(|e| panic!("{e}"));
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            collector(Reading::Failed).wait_grace(&mut child, limit, Duration::from_secs(1))
+        }));
+        let message = failed
+            .err()
+            .and_then(|p| {
+                p.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            })
+            .unwrap_or_default();
+        assert_eq!(message, "incomplete output: a read of it failed");
+        let mut child = GroupChild::spawn(&mut sh("true")).unwrap_or_else(|e| panic!("{e}"));
+        let ended = collector(Reading::Ended).end(&mut child, limit, Duration::from_secs(1));
+        assert!(!ended.read_failed && ended.complete, "{ended:?}");
     }
 
     /// Past its limit the child and its group are stopped, and the test
