@@ -274,3 +274,144 @@ fn staging_files_an_interrupted_backup_left_are_purged() {
     assert_eq!(purge_file_backups(&f.paths, secs + week).unwrap(), 2);
     assert!(!kept.path.exists() && !fresh.exists());
 }
+
+/// Nothing outside the vault's own `backups/` is listed, read, written or
+/// removed when `backups/` itself, or the data directory that holds it,
+/// is replaced by a symlink to a private directory of this user's
+/// elsewhere holding backup-shaped files (L-11; the class of the backups
+/// v2 finding of the M2-05 review): `backups/` is opened through the data
+/// directory, never through a symlink in place of either, and every file
+/// is listed, opened, linked and removed through that handle. With the
+/// real `backups/` (an expired backup, a fresh one, a stale staging file)
+/// moved away and a symlink to it in its place, a purge, an open and a
+/// new backup each fail (`Path(Symlink)`) and every file in the moved
+/// directory stays as it was; the same with the data directory replaced.
+/// Once both are back, the purge removes the expired backup and the
+/// staging file, and the fresh backup opens.
+#[test]
+fn a_symlink_in_place_of_backups_or_the_data_directory_is_never_followed() {
+    use envcloak_core::vault::{PathErrorKind, Vault, VaultError};
+    let (f, v) = KitFixture::create();
+    let (_, backup) = files(&f);
+    let old = v.backup_files(&backup).unwrap();
+    let fresh = v.backup_files(&backup).unwrap();
+    let now = fresh.created_at;
+    let week = FILE_BACKUP_RETENTION.as_secs();
+    age_file_backup_for_testing(&old.path, now - week - 1).unwrap();
+    let backups = f.paths.backups_dir.clone();
+    let stale = backups.join(".files-20260901T000000Z-A.ecfiles.tmp");
+    std::fs::write(&stale, b"sealed bytes only").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - week))
+        .unwrap();
+    // Each call's error kind, or `None` when it went through.
+    let every_call = |v: &Vault| {
+        let kind = |r: Result<(), VaultError>| r.err().map(|e| e.kind());
+        vec![
+            ("purge", kind(purge_file_backups(&f.paths, now).map(drop))),
+            ("open", kind(v.open_file_backup(&fresh.id).map(drop))),
+            ("backup", kind(v.backup_files(&backup).map(drop))),
+        ]
+    };
+    let refused = |got: Vec<(&str, Option<VaultErrorKind>)>| {
+        for (call, kind) in got {
+            assert_eq!(
+                kind,
+                Some(VaultErrorKind::Path(PathErrorKind::Symlink)),
+                "{call} through a symlink"
+            );
+        }
+    };
+
+    let before = common::tree(&backups);
+    let elsewhere = f.home.root().join("elsewhere");
+    std::fs::rename(&backups, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &backups).unwrap();
+    let got = every_call(&v);
+    assert_eq!(
+        common::tree(&elsewhere),
+        before,
+        "a call through a symlink in place of backups/ changed what it points at"
+    );
+    refused(got);
+    std::fs::remove_file(&backups).unwrap();
+    std::fs::rename(&elsewhere, &backups).unwrap();
+
+    let data_elsewhere = f.home.root().join("data-elsewhere");
+    std::fs::rename(&f.paths.data_dir, &data_elsewhere).unwrap();
+    std::os::unix::fs::symlink(&data_elsewhere, &f.paths.data_dir).unwrap();
+    let got = every_call(&v);
+    assert_eq!(
+        common::tree(&data_elsewhere.join("backups")),
+        before,
+        "a call through a symlink in place of the data directory changed what it points at"
+    );
+    refused(got);
+    std::fs::remove_file(&f.paths.data_dir).unwrap();
+    std::fs::rename(&data_elsewhere, &f.paths.data_dir).unwrap();
+
+    assert_eq!(purge_file_backups(&f.paths, now).unwrap(), 2);
+    assert!(!old.path.exists() && !stale.exists());
+    assert_eq!(dir_names(&backups).len(), 1);
+    assert_eq!(v.open_file_backup(&fresh.id).unwrap().len(), 2);
+}
+
+/// A file backup is made durable through `envcloak_sys::sync_file`
+/// (`F_FULLFSYNC` on macOS), in order, and a flush that fails fails its
+/// step (the class of the backups v2 flush findings of the M2-05 review):
+/// a backup flushes, after the directories the vault's paths make sure of
+/// (the data directory's parent and the data directory), its file, then
+/// `backups/` once it is linked to its name (the counting shim records
+/// each by device and inode); with the
+/// file's flush failing, the backup fails and nothing is left in
+/// `backups/`; with the directory's failing, it fails with the backup in
+/// place. A purge flushes `backups/` once its files went, and a failed
+/// flush fails it.
+#[test]
+fn a_file_backup_is_flushed_in_order_and_a_failed_flush_fails_its_step() {
+    use envcloak_sys::testing::{fail_sync_after, record_syncs, take_synced};
+    use std::os::unix::fs::MetadataExt;
+    let id_of = |p: &std::path::Path| {
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    let (f, v) = KitFixture::create();
+    let (_, backup) = files(&f);
+    let backups = f.paths.backups_dir.clone();
+    record_syncs();
+    let info = v.backup_files(&backup).unwrap();
+    assert_eq!(
+        take_synced(),
+        [
+            id_of(f.paths.data_dir.parent().unwrap()),
+            id_of(&f.paths.data_dir),
+            id_of(&info.path),
+            id_of(&backups)
+        ],
+        "a backup's flushes: the data directory's parent and itself, the file, then backups/"
+    );
+
+    fail_sync_after(2);
+    assert!(
+        v.backup_files(&backup).is_err(),
+        "the failed flush of a backup's file was unreported"
+    );
+    assert_eq!(dir_names(&backups).len(), 1, "{:?}", dir_names(&backups));
+    fail_sync_after(3);
+    assert!(
+        v.backup_files(&backup).is_err(),
+        "the failed flush of backups/ was unreported"
+    );
+    assert_eq!(dir_names(&backups).len(), 2, "the backup linked before");
+
+    let later = info.created_at + FILE_BACKUP_RETENTION.as_secs() + 60;
+    fail_sync_after(0);
+    assert!(
+        purge_file_backups(&f.paths, later).is_err(),
+        "the failed flush of a purge's removals was unreported"
+    );
+    assert!(dir_names(&backups).is_empty());
+}

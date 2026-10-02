@@ -26,12 +26,16 @@
 //! the staging files interrupted writes left
 //! (`.files-<time>-<id>.ecfiles.tmp`, unchanged for [`STAGING_GRACE`]).
 
-use std::fs::OpenOptions;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use envcloak_sys::{
+    DirEntryKind, DirEntryName, MAX_DIR_ENTRIES, create_beneath, kind_beneath, link_beneath,
+    list_dir, open_beneath, sync_file, unlink_beneath,
+};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -41,8 +45,8 @@ use crate::crypto::{
 };
 use crate::secret::SecretBytes;
 use crate::vault::{
-    Vault, VaultError, VaultErrorKind, VaultPaths, check_private_dir, open_record, open_value,
-    seal_record, seal_value, sync_dir, utc_stamp,
+    Vault, VaultError, VaultErrorKind, VaultPaths, open_private_child, open_record, open_value,
+    seal_record, seal_value, utc_stamp,
 };
 
 /// The extension of file backups.
@@ -380,49 +384,51 @@ impl Vault {
         }
         let paths = self.paths();
         paths.ensure_dirs()?;
-        let dir = std::fs::canonicalize(&paths.backups_dir)?;
-        check_private_dir(&dir)?;
+        // `backups/` opened once, never through a symlink in its place, and
+        // everything made, linked and removed through it.
+        let dir = open_private_child(&paths.backups_dir)?.ok_or(VaultErrorKind::NotFound)?;
         let created_at = now_secs();
         let id = FileBackupId::generate();
         let ctx = Ctx::of(self, id, created_at);
         let head = ctx.header();
         let key = SubKey::random(Purpose::Backup);
         let name = file_name(&id, created_at);
-        let path = dir.join(&name);
-        let tmp = dir.join(format!(".{name}.tmp"));
-        let written = self.write_files(&tmp, &head, &ctx, &key, files);
-        let linked = written.and_then(|()| Ok(std::fs::hard_link(&tmp, &path)?));
-        let removed = match std::fs::remove_file(&tmp) {
+        let tmp = format!(".{name}.tmp");
+        let (name_os, tmp_os) = (OsStr::new(&name), OsStr::new(&tmp));
+        let written = self.write_files(&dir, tmp_os, &head, &ctx, &key, files);
+        let linked = written.and_then(|bytes| match link_beneath(&dir, tmp_os, name_os) {
+            Ok(()) => Ok(bytes),
+            Err(e) => Err(e.into()),
+        });
+        let removed = match unlink_beneath(&dir, tmp_os) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(VaultError::from(e)),
         };
-        linked?;
+        let bytes = linked?;
         removed?;
-        sync_dir(&dir)?;
+        sync_file(&dir)?;
         Ok(FileBackupInfo {
             id,
-            bytes: std::fs::metadata(&path)?.len(),
-            path,
+            bytes,
+            path: paths.backups_dir.join(&name),
             created_at,
             files: files.len(),
         })
     }
 
+    /// Writes the backup to the new file `tmp` in `dir` (`O_EXCL`, never
+    /// through a symlink, 0600) and flushes it. Returns its size.
     fn write_files(
         &self,
-        tmp: &Path,
+        dir: &File,
+        tmp: &OsStr,
         head: &[u8],
         ctx: &Ctx,
         key: &SubKey,
         files: &[BackupFile],
-    ) -> Result<(), VaultError> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(tmp)?;
+    ) -> Result<u64, VaultError> {
+        let file = create_beneath(dir, tmp, 0o600)?;
         let mut w = BufWriter::new(file);
         w.write_all(head)?;
         let wrapped = seal_subkey(self.keys().key(Purpose::Backup), &ctx.aad(0), key)?;
@@ -436,7 +442,8 @@ impl Vault {
         let file = w
             .into_inner()
             .map_err(|e| VaultError::from(e.into_error()))?;
-        Ok(file.sync_all()?)
+        sync_file(&file)?;
+        Ok(file.metadata()?.len())
     }
 
     /// The files of backup `id`, byte for byte, with their paths and
@@ -446,11 +453,10 @@ impl Vault {
     /// truncated or extended, or belongs to another vault.
     pub fn open_file_backup(&self, id: &FileBackupId) -> Result<Vec<BackupFile>, VaultError> {
         self.header()?;
-        let (path, _) = find_backup(self.paths(), id)?.ok_or(VaultErrorKind::NotFound)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)?;
+        let dir = open_private_child(&self.paths().backups_dir)?.ok_or(VaultErrorKind::NotFound)?;
+        let name =
+            find_backup(&dir, &self.paths().backups_dir, id)?.ok_or(VaultErrorKind::NotFound)?;
+        let file = open_beneath(&dir, &name)?;
         if !file.metadata()?.is_file() {
             return Err(VaultErrorKind::BackupDamaged.into());
         }
@@ -505,92 +511,92 @@ impl Vault {
     }
 }
 
-/// The backup file of `id` in `p`'s backups directory, by its name: a
-/// file whose header was damaged is still found, and then refused as
-/// damaged rather than missing.
-fn find_backup(p: &VaultPaths, id: &FileBackupId) -> Result<Option<(PathBuf, u64)>, VaultError> {
+/// The name in `dir` (`backups/`, opened) of the backup file of `id`, by
+/// its name: a file whose header was damaged is still found, and then
+/// refused as damaged rather than missing.
+fn find_backup(dir: &File, path: &Path, id: &FileBackupId) -> Result<Option<OsString>, VaultError> {
     let suffix = format!("-{id}.{FILE_BACKUP_EXTENSION}");
-    Ok(list_backups(p)?.into_iter().find(|(path, _)| {
-        path.file_name()
-            .and_then(|n| n.to_str())
+    Ok(list_backups(dir, path)?.into_iter().find_map(|(name, _)| {
+        name.to_str()
             .is_some_and(|n| n.ends_with(&suffix))
+            .then_some(name)
     }))
 }
 
-/// Every file backup in `p`'s backups directory, with the creation time
-/// its header records, or its modification time when the header does not
-/// read.
-fn list_backups(p: &VaultPaths) -> Result<Vec<(PathBuf, u64)>, VaultError> {
-    let dir = match std::fs::canonicalize(&p.backups_dir) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    check_private_dir(&dir)?;
+/// Whether the entry `e` of `dir` is a regular file now (never a symlink):
+/// as the listing read it, or, where it could not tell, as `fstatat(2)`
+/// without following a symlink says.
+fn is_file_entry(dir: &File, e: &DirEntryName) -> bool {
+    match e.kind {
+        DirEntryKind::File => true,
+        DirEntryKind::Unknown => kind_beneath(dir, &e.name).is_ok_and(|k| k == DirEntryKind::File),
+        _ => false,
+    }
+}
+
+/// The modification time of the file `name` in `dir` (`backups/`, opened,
+/// whose path is `path`), in Unix seconds: through the file opened (never
+/// through a symlink, never waiting on a FIFO) when it opens, else as
+/// `lstat` reads `name` under `path` (a file this user cannot read, say);
+/// 0 when neither does. Only a time is read by the path: whatever a purge
+/// then removes, it removes through `dir`.
+fn modified_secs(dir: &File, path: &Path, name: &OsStr) -> u64 {
+    open_beneath(dir, name)
+        .and_then(|f| f.metadata())
+        .or_else(|_| std::fs::symlink_metadata(path.join(name)))
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Every file backup in `dir` (`backups/`, opened; `path` is its path, for
+/// [`modified_secs`]), by name, with the creation time its header
+/// records, or its modification time when the header does not read.
+fn list_backups(dir: &File, path: &Path) -> Result<Vec<(OsString, u64)>, VaultError> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let named = name.to_str().is_some_and(|n| {
+    for entry in list_dir(dir, MAX_DIR_ENTRIES)? {
+        let named = entry.name.to_str().is_some_and(|n| {
             n.starts_with(PREFIX) && n.ends_with(&format!(".{FILE_BACKUP_EXTENSION}"))
         });
-        if !named || !entry.file_type()?.is_file() {
+        if !named || !is_file_entry(dir, &entry) {
             continue;
         }
-        let path = entry.path();
-        let modified = entry
-            .metadata()?
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
         let mut head = [0u8; HEADER_LEN];
-        let created_at = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
+        let created_at = open_beneath(dir, &entry.name)
             .ok()
+            .filter(|f| f.metadata().is_ok_and(|m| m.is_file()))
             .filter(|f| read_exact(&mut &*f, &mut head).is_ok())
             .and_then(|_| parse_header(&head).ok())
-            .map_or(modified, |h| h.created_at);
-        out.push((path, created_at));
+            .map(|h| h.created_at);
+        let created_at = match created_at {
+            Some(t) => t,
+            None => modified_secs(dir, path, &entry.name),
+        };
+        out.push((entry.name, created_at));
     }
     out.sort();
     Ok(out)
 }
 
-/// The staging files of file backups in `p`'s backups directory that
+/// The staging files of file backups in `dir` (`backups/`, opened) that
 /// interrupted writes left: regular files (a symlink is never one) named
-/// `.files-*.ecfiles.tmp`, not modified for [`STAGING_GRACE`] before
-/// `now` (Unix seconds). Complete or partial, they hold ciphertext only,
-/// and no backup that is being written is this old.
-fn stale_staging(p: &VaultPaths, now: u64) -> Result<Vec<PathBuf>, VaultError> {
-    let dir = match std::fs::canonicalize(&p.backups_dir) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    check_private_dir(&dir)?;
+/// `.files-*.ecfiles.tmp`, not modified for [`STAGING_GRACE`] before `now`
+/// (Unix seconds). Complete or partial, they hold ciphertext only, and no
+/// backup that is being written is this old.
+fn stale_staging(dir: &File, path: &Path, now: u64) -> Result<Vec<OsString>, VaultError> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let named = name.to_str().is_some_and(|n| {
+    for entry in list_dir(dir, MAX_DIR_ENTRIES)? {
+        let named = entry.name.to_str().is_some_and(|n| {
             n.starts_with(&format!(".{PREFIX}"))
                 && n.ends_with(&format!(".{FILE_BACKUP_EXTENSION}.tmp"))
         });
-        // `DirEntry` reads the entry itself: a symlink is not followed.
-        if !named || !entry.file_type()?.is_file() {
+        if !named || !is_file_entry(dir, &entry) {
             continue;
         }
-        let modified = entry
-            .metadata()?
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
+        let modified = modified_secs(dir, path, &entry.name);
         if now.saturating_sub(modified) > STAGING_GRACE.as_secs() {
-            out.push(entry.path());
+            out.push(entry.name);
         }
     }
     Ok(out)
@@ -600,21 +606,39 @@ fn stale_staging(p: &VaultPaths, now: u64) -> Result<Vec<PathBuf>, VaultError> {
 /// [`FILE_BACKUP_RETENTION`] before `now` (Unix seconds), and the staging
 /// files interrupted writes left, unchanged for [`STAGING_GRACE`]. Returns
 /// how many files it removed. Needs no key: the time is in the header.
+///
+/// `backups/` is opened once, through the data directory that names it,
+/// never through a symlink in place of either (one is refused, and
+/// nothing is removed), and checked through the descriptor opened; each
+/// file is removed through that handle (`unlinkat(2)`, which removes a
+/// symlink put in a file's place itself, never what it points at), so
+/// nothing outside the vault's `backups/` is removed. The removals are
+/// flushed (`envcloak_sys::sync_file` on `backups/`), and a failed flush
+/// fails the purge.
+///
+/// # Errors
+/// When `backups/` cannot be opened, is not one this user alone may write
+/// ([`VaultErrorKind::Path`]), or cannot be read, a file cannot be
+/// removed, or the removals cannot be flushed.
 pub fn purge_file_backups(p: &VaultPaths, now: u64) -> Result<usize, VaultError> {
+    let Some(dir) = open_private_child(&p.backups_dir)? else {
+        return Ok(0);
+    };
     let mut removed = 0;
-    let old = list_backups(p)?
+    let old = list_backups(&dir, &p.backups_dir)?
         .into_iter()
         .filter(|(_, created_at)| now.saturating_sub(*created_at) > FILE_BACKUP_RETENTION.as_secs())
-        .map(|(path, _)| path);
-    for path in old.chain(stale_staging(p, now)?) {
-        match std::fs::remove_file(&path) {
+        .map(|(name, _)| name);
+    let stale = stale_staging(&dir, &p.backups_dir, now)?;
+    for name in old.chain(stale) {
+        match unlink_beneath(&dir, &name) {
             Ok(()) => removed += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
     }
     if removed > 0 {
-        sync_dir(&std::fs::canonicalize(&p.backups_dir)?)?;
+        sync_file(&dir)?;
     }
     Ok(removed)
 }

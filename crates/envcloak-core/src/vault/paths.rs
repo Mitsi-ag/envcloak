@@ -175,6 +175,119 @@ fn exists_no_follow(p: &Path) -> Result<bool, PathError> {
     }
 }
 
+/// The directory at `p`, opened through the directory that names it and
+/// checked through the descriptor opened: the directory that names it
+/// (the data directory, for `backups/`) is opened without following a
+/// symlink in its place ([`open_private_dir`]), then `p`'s last component
+/// in it, never through a symlink either ([`open_private_dir_beneath`]),
+/// and each is checked, as [`check_private_dir`] checks a path, by `fstat`
+/// on what was opened. What is checked is then what is used: every file
+/// made, read or removed through the handle is in that directory, whatever
+/// takes either name meanwhile. The ancestors of the directory that names
+/// `p` may be symlinks (macOS `/tmp`, say), as [`check_private_dir`]
+/// allows. `None` when either is missing.
+///
+/// # Errors
+/// [`PathErrorKind::Symlink`] for a symlink in place of either,
+/// [`PathErrorKind::NotDirectory`], [`PathErrorKind::ForeignOwner`] and
+/// [`PathErrorKind::OpenPermissions`] as [`check_private_dir`], or the
+/// I/O error.
+pub(crate) fn open_private_child(p: &Path) -> Result<Option<std::fs::File>, PathError> {
+    let Some(name) = p.file_name() else {
+        return Err(PathErrorKind::NotDirectory.into());
+    };
+    let Some(up) = open_private_dir(parent_of(p))? else {
+        return Ok(None);
+    };
+    open_private_dir_beneath(&up, name)
+}
+
+/// The directory at `p`, opened with `O_DIRECTORY | O_NOFOLLOW` (a symlink
+/// as its last component is refused, never followed) and checked through
+/// the descriptor opened ([`check_private_handle`]). `None` when it is
+/// missing.
+///
+/// # Errors
+/// As [`open_private_child`].
+pub(crate) fn open_private_dir(p: &Path) -> Result<Option<std::fs::File>, PathError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(p);
+    let f = match opened {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if refused_as_directory(&e) => {
+            return Err(match std::fs::symlink_metadata(p) {
+                Ok(m) if m.file_type().is_symlink() => PathErrorKind::Symlink.into(),
+                Ok(_) => PathErrorKind::NotDirectory.into(),
+                Err(e) => e.into(),
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    check_private_handle(&f)?;
+    Ok(Some(f))
+}
+
+/// The directory `name` of `dir`, opened with `openat(2)` and
+/// `O_DIRECTORY | O_NOFOLLOW` (`envcloak_sys::open_dir_beneath`) and
+/// checked through the descriptor opened ([`check_private_handle`]).
+/// `None` when it is missing.
+///
+/// # Errors
+/// As [`open_private_child`].
+pub(crate) fn open_private_dir_beneath(
+    dir: &std::fs::File,
+    name: &OsStr,
+) -> Result<Option<std::fs::File>, PathError> {
+    let f = match envcloak_sys::open_dir_beneath(dir, name) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if refused_as_directory(&e) => {
+            return Err(match envcloak_sys::kind_beneath(dir, name) {
+                Ok(envcloak_sys::DirEntryKind::Symlink) => PathErrorKind::Symlink.into(),
+                Ok(_) => PathErrorKind::NotDirectory.into(),
+                Err(e) => e.into(),
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    check_private_handle(&f)?;
+    Ok(Some(f))
+}
+
+/// Whether opening a directory with `O_DIRECTORY | O_NOFOLLOW` failed
+/// because its name is a symlink (`ELOOP`, or `ENOTDIR` on some systems)
+/// or not a directory (`ENOTDIR`).
+fn refused_as_directory(e: &io::Error) -> bool {
+    e.raw_os_error()
+        .is_some_and(|c| c == libc::ELOOP || c == libc::ENOTDIR)
+}
+
+/// Checks the directory `f` is open on as [`check_private_dir`] checks a
+/// path, by `fstat` on the descriptor: a directory, owned by the effective
+/// uid, not writable by group or others; tightened to 0700 (with `fchmod`)
+/// when group or others can read or search it.
+fn check_private_handle(f: &std::fs::File) -> Result<(), PathError> {
+    let m = f.metadata()?;
+    if !m.is_dir() {
+        return Err(PathErrorKind::NotDirectory.into());
+    }
+    if m.uid() != envcloak_sys::effective_uid() {
+        return Err(PathErrorKind::ForeignOwner.into());
+    }
+    let mode = m.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(PathErrorKind::OpenPermissions.into());
+    }
+    if mode != 0o700 {
+        f.set_permissions(Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Checks that `p` is a directory EnvCloak may trust, and tightens it to
 /// 0700 when group or others can read or search it.
 pub(crate) fn check_private_dir(p: &Path) -> Result<(), PathError> {
@@ -376,6 +489,58 @@ mod tests {
             p.ensure_dirs().unwrap_err().kind(),
             PathErrorKind::NotDirectory
         );
+    }
+
+    /// `open_private_child` opens `backups/` through the data directory and
+    /// checks what it opened, by its descriptor, as `check_private_dir`
+    /// checks a path: missing is `None`; a symlink in place of either
+    /// directory is refused (`Symlink`), never followed, also when it
+    /// points at a private directory; a file is `NotDirectory`; one
+    /// writable by group or others is refused and left alone; one readable
+    /// by others is tightened to 0700 through the descriptor.
+    #[test]
+    fn a_private_child_is_opened_through_its_parent_and_checked_as_opened() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o7777;
+        let p = VaultPaths::under(t.path().join("envcloak"));
+        let kind = |p: &Path| open_private_child(p).unwrap_err().kind();
+        assert!(open_private_child(&p.backups_dir).unwrap().is_none());
+        p.ensure_dirs().unwrap();
+        let opened = open_private_child(&p.backups_dir).unwrap().unwrap();
+        let m = std::fs::symlink_metadata(&p.backups_dir).unwrap();
+        let o = opened.metadata().unwrap();
+        assert_eq!((o.dev(), o.ino()), (m.dev(), m.ino()));
+
+        std::fs::set_permissions(&p.backups_dir, Permissions::from_mode(0o750)).unwrap();
+        open_private_child(&p.backups_dir).unwrap().unwrap();
+        assert_eq!(mode(&p.backups_dir), 0o700, "readable by group: tightened");
+
+        for (dir, bits) in [(&p.backups_dir, 0o770), (&p.data_dir, 0o702)] {
+            std::fs::set_permissions(dir, Permissions::from_mode(bits)).unwrap();
+            assert_eq!(kind(&p.backups_dir), PathErrorKind::OpenPermissions);
+            assert_eq!(mode(dir), bits, "refused and left alone");
+            std::fs::set_permissions(dir, Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&p.backups_dir, elsewhere.join("backups")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("backups"), &p.backups_dir).unwrap();
+        assert_eq!(kind(&p.backups_dir), PathErrorKind::Symlink);
+        std::fs::remove_file(&p.backups_dir).unwrap();
+        std::fs::rename(elsewhere.join("backups"), &p.backups_dir).unwrap();
+
+        std::fs::rename(&p.data_dir, elsewhere.join("data")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("data"), &p.data_dir).unwrap();
+        assert_eq!(kind(&p.backups_dir), PathErrorKind::Symlink);
+        std::fs::remove_file(&p.data_dir).unwrap();
+        std::fs::rename(elsewhere.join("data"), &p.data_dir).unwrap();
+
+        std::fs::remove_dir(&p.backups_dir).unwrap();
+        std::fs::write(&p.backups_dir, b"").unwrap();
+        assert_eq!(kind(&p.backups_dir), PathErrorKind::NotDirectory);
     }
 
     /// Review T10 open 3 (verification): every directory `ensure_dirs`

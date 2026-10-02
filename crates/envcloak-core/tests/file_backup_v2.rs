@@ -1080,6 +1080,138 @@ fn a_backup_makes_its_staging_directory_in_the_directory_it_opened() {
     drop(f);
 }
 
+/// Nothing outside the vault's own `backups/` is listed, read, made or
+/// removed when `backups/` itself, or the data directory that holds it,
+/// is replaced by a symlink to a private directory of this user's
+/// elsewhere holding backup-shaped entries (L-11, Codex round 8 high):
+/// `backups/` is opened through the data directory, never through a
+/// symlink in place of either, and checked through the descriptor opened;
+/// its path is never resolved first. Here the real `backups/`, holding an
+/// expired backup, a fresh one, an interrupted staging directory and a
+/// directory a purge left, is moved away and a symlink to it put in its
+/// place: a purge, a listing, an open by id or as listed, a recorded
+/// result and a begin each fail (`Path(Symlink)`), and every file in the
+/// moved directory stays as it was. The same with the data directory
+/// replaced by a symlink to where it was moved. Once both are back, the
+/// purge removes the expired backup, the staging directory and the
+/// purge's leftover, and the fresh backup reads back.
+#[test]
+fn a_symlink_in_place_of_backups_or_the_data_directory_is_never_followed() {
+    use envcloak_core::vault::PathErrorKind;
+    let (f, v) = KitFixture::create();
+    let t = now();
+    let p = v.paths().clone();
+    let backups = p.backups_dir.clone();
+    small(&v, t - FILE_BACKUP_RETENTION.as_secs() - 1);
+    let fresh = small(&v, t);
+    let listed = list_file_backups_v2(&p)
+        .unwrap()
+        .into_iter()
+        .find(|b| b.id == fresh)
+        .unwrap();
+    let stale = backups.join(format!(
+        ".files2-20260901T000000Z-{}.tmp",
+        FileBackupId::generate()
+    ));
+    let left = backups.join(format!(
+        ".files2-20260901T000000Z-{}.purge",
+        FileBackupId::generate()
+    ));
+    for d in [&stale, &left] {
+        std::fs::create_dir(d).unwrap();
+        std::fs::write(d.join("data"), b"sealed bytes only").unwrap();
+        set_time(d, t - STAGING_GRACE.as_secs() - 60);
+    }
+    let plan = || {
+        vec![PlannedFile {
+            path: "/h/.env".into(),
+            mode: 0o600,
+            size: 4,
+        }]
+    };
+    let after: [u8; 32] = Sha256::digest(b"what init left").into();
+    // Each call's error kind, or `None` when it went through.
+    let every_call = |v: &Vault| {
+        let kind = |r: Result<(), envcloak_core::vault::VaultError>| r.err().map(|e| e.kind());
+        vec![
+            ("purge", kind(purge_file_backups_v2(&p, t).map(drop))),
+            (
+                "purge except",
+                kind(purge_file_backups_v2_except(&p, t, |_| false).map(drop)),
+            ),
+            ("list", kind(list_file_backups_v2(&p).map(drop))),
+            ("open", kind(v.open_file_backup_v2(&fresh).map(drop))),
+            (
+                "open listed",
+                kind(v.file_backups_v2().unwrap().open_listed(&listed).map(drop)),
+            ),
+            (
+                "record result",
+                kind(v.record_file_backup_v2_result(&fresh, 0, &after)),
+            ),
+            (
+                "begin",
+                kind(
+                    v.begin_file_backup_v2(
+                        BackupPurpose::Init,
+                        creator(CreatorKind::Terminal),
+                        plan(),
+                        t,
+                    )
+                    .map(drop),
+                ),
+            ),
+        ]
+    };
+    let refused = |got: Vec<(&str, Option<VaultErrorKind>)>| {
+        for (call, kind) in got {
+            assert_eq!(
+                kind,
+                Some(VaultErrorKind::Path(PathErrorKind::Symlink)),
+                "{call} through a symlink"
+            );
+        }
+    };
+
+    let elsewhere = f.home.root().join("elsewhere");
+    let before = common::tree(&backups);
+    std::fs::rename(&backups, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &backups).unwrap();
+    let got = every_call(&v);
+    assert_eq!(
+        common::tree(&elsewhere),
+        before,
+        "a call through a symlink in place of backups/ changed what it points at"
+    );
+    refused(got);
+    std::fs::remove_file(&backups).unwrap();
+    std::fs::rename(&elsewhere, &backups).unwrap();
+
+    let data_elsewhere = f.home.root().join("data-elsewhere");
+    std::fs::rename(&p.data_dir, &data_elsewhere).unwrap();
+    std::os::unix::fs::symlink(&data_elsewhere, &p.data_dir).unwrap();
+    let got = every_call(&v);
+    assert_eq!(
+        common::tree(&data_elsewhere.join("backups")),
+        before,
+        "a call through a symlink in place of the data directory changed what it points at"
+    );
+    refused(got);
+    std::fs::remove_file(&p.data_dir).unwrap();
+    std::fs::rename(&data_elsewhere, &p.data_dir).unwrap();
+
+    assert_eq!(purge_file_backups_v2(&p, t).unwrap(), 3);
+    let ids: Vec<FileBackupId> = list_file_backups_v2(&p)
+        .unwrap()
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    assert_eq!(ids, [fresh]);
+    assert_eq!(dir_names(&backups).len(), 1);
+    assert_reads_back(&v, &fresh, &[b"A=1\n"]);
+    drop(f);
+}
+
 /// A backup is made durable through `envcloak_sys::sync_file`
 /// (`F_FULLFSYNC` on macOS), in order, and a flush that fails fails the
 /// step it belongs to. Its commit flushes the `data` file, then the

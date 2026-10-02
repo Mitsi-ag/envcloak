@@ -15,6 +15,7 @@ use envcloak_core::vault::{
 };
 use envcloak_core::{RecoveryKit, SecretBytes, create_vault};
 use envcloak_testkit::{Canary, TestHome, by_label, canaries, fresh_seed, labels};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 /// The passphrase of every fixture vault's passphrase unlocker.
@@ -241,6 +242,34 @@ pub fn dir_names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Every entry under `dir`, never following a symlink, by its path
+/// relative to `dir`, sorted: a regular file with the SHA-256 of its
+/// bytes (in hex), a directory and a symlink with a tag. For checking
+/// that nothing under `dir` was removed or changed.
+pub fn tree(dir: &Path) -> Vec<(String, String)> {
+    fn walk(root: &Path, at: &Path, out: &mut Vec<(String, String)>) {
+        for e in std::fs::read_dir(at).unwrap() {
+            let e = e.unwrap();
+            let p = e.path();
+            let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            let t = e.file_type().unwrap();
+            if t.is_dir() {
+                out.push((rel, "<dir>".to_owned()));
+                walk(root, &p, out);
+            } else if t.is_symlink() {
+                out.push((rel, "<symlink>".to_owned()));
+            } else {
+                let d = Sha256::digest(std::fs::read(&p).unwrap());
+                out.push((rel, d.iter().map(|b| format!("{b:02x}")).collect()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }
 
 /// Copies every regular file of `from` into `to` (created), for snapshots
