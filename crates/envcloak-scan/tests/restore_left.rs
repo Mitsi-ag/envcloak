@@ -4,11 +4,15 @@
 //! the change, only while it is still the file hashed when the new one
 //! takes its name, and only with contents that came whole and have the
 //! backed-up SHA-256. Nothing else is ever written in its place, and no
-//! temporary file is left.
+//! temporary file is left; one a restore killed while it wrote left
+//! beside the file goes once the file is written back.
 #![allow(clippy::unwrap_used)]
 
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use envcloak_core::SecretBytes;
 use envcloak_core::file_backup_v2::{CHUNK_V2, chunk_len};
@@ -317,4 +321,110 @@ fn a_hard_link_a_symlink_or_a_missing_file_is_never_written() {
     assert_eq!(e.kind, ModifyErrorKind::Scan(ScanErrorKind::NotFound));
     assert!(!d.path().join("gone.json").exists());
     no_temps(d.path());
+}
+
+/// Names the directory the child below writes back in.
+const CRASH_DIR: &str = "ENVCLOAK_TEST_RESTORE_CRASH_DIR";
+
+/// Runs only as the child the test below starts: writes the original
+/// back over `.mcp.json` in the directory [`CRASH_DIR`] names, and stops
+/// once the first chunk is written, until it is killed.
+#[test]
+fn restore_crash_child() {
+    let Some(dir) = std::env::var_os(CRASH_DIR) else {
+        return;
+    };
+    let body = original();
+    let r = open_root(Path::new(&dir)).unwrap();
+    let _ = restore_over_left(&r, Path::new(".mcp.json"), &backed_up(&body), &mut |c| {
+        if c == 1 {
+            println!("@@hold");
+            std::io::stdout().flush().unwrap();
+            std::thread::sleep(Duration::from_secs(120));
+        }
+        Some(chunk_of(&body, c))
+    });
+}
+
+/// A restore killed while it writes (`kill -9`, once its first chunk is
+/// written beside the file) leaves the file as the change left it, and
+/// its new contents so far beside it under its temporary name, 0600,
+/// holding only bytes of what it was writing back, and nothing in its
+/// temporary directory. The next restore of the file writes it back byte
+/// for byte, with its mode, and removes what the killed one left, so no
+/// temporary file stays; a file of another name of the same shape stays.
+#[test]
+fn a_restore_killed_while_it_writes_leaves_the_file_and_the_next_one_cleans_up() {
+    if std::env::var_os(CRASH_DIR).is_some() {
+        return;
+    }
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let p = d.path().join(".mcp.json");
+    std::fs::write(&p, LEFT).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let other = d
+        .path()
+        .join("..settings.json.envcloak-new-0123456789abcdef.tmp");
+    std::fs::write(&other, b"not this file's").unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "restore_crash_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .env(CRASH_DIR, d.path())
+        .env("TMPDIR", tmp.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = BufReader::new(child.stdout.take().unwrap());
+    let held = out
+        .lines()
+        .map_while(Result::ok)
+        .any(|l| l.contains("@@hold"));
+    assert!(held, "the child never wrote its first chunk");
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert_eq!(std::fs::read(&p).unwrap(), LEFT, "the file was changed");
+    let left: Vec<std::path::PathBuf> = std::fs::read_dir(d.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|q| {
+            q.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("..mcp.json.envcloak-new-")
+        })
+        .collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+    let m = std::fs::metadata(&left[0]).unwrap();
+    assert_eq!(m.mode() & 0o777, 0o600);
+    assert!(
+        std::fs::read(&left[0]).unwrap() == body_prefix(CHUNK_V2),
+        "the leftover holds other bytes than the first chunk"
+    );
+    assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+
+    let body = original();
+    let r = open_root(d.path()).unwrap();
+    restore_over_left(&r, Path::new(".mcp.json"), &backed_up(&body), &mut |c| {
+        Some(chunk_of(&body, c))
+    })
+    .unwrap();
+    assert!(std::fs::read(&p).unwrap() == body, "not byte for byte");
+    assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o640);
+    assert!(!left[0].exists(), "the killed restore's file was left");
+    assert_eq!(std::fs::read(&other).unwrap(), b"not this file's");
+    std::fs::remove_file(&other).unwrap();
+    no_temps(d.path());
+}
+
+/// The first `n` bytes of [`original`].
+fn body_prefix(n: usize) -> Vec<u8> {
+    original()[..n].to_vec()
 }

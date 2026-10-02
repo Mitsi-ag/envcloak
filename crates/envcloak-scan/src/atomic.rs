@@ -50,8 +50,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use envcloak_sys::{
-    InUse, create_beneath, exchange_beneath, link_beneath, open_elsewhere, rename_beneath,
-    sync_file, unlink_beneath,
+    DirEntryKind, InUse, MAX_DIR_ENTRIES, create_beneath, exchange_beneath, kind_beneath,
+    link_beneath, list_dir, open_elsewhere, rename_beneath, sync_file, unlink_beneath,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -194,6 +194,48 @@ fn temp_name(name: &OsStr, what: &str) -> OsString {
     }
     t.push(format!(".envcloak-{what}-{h:016x}.tmp"));
     t
+}
+
+/// Removes from `dir` the files a write of `name` left under its
+/// temporary names (`.<name>.envcloak-<what>-<16 hex>.tmp`, [`temp_name`])
+/// when it was stopped before it ended: regular files only, each by its
+/// name, a symlink of such a name never followed. A name too long to be
+/// carried in one ([`temp_name`] leaves it out) says nothing of whose it
+/// is, so nothing is removed then. Best effort: returns how many went,
+/// and flushes `dir` when any did. Nothing is read from them.
+pub(crate) fn remove_leftovers(dir: &File, name: &OsStr, what: &str) -> usize {
+    if name.as_bytes().len() > 128 {
+        return 0;
+    }
+    let mut prefix = b".".to_vec();
+    prefix.extend_from_slice(name.as_bytes());
+    prefix.extend_from_slice(format!(".envcloak-{what}-").as_bytes());
+    let Ok(entries) = list_dir(dir, MAX_DIR_ENTRIES) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for e in entries {
+        let ours = e
+            .name
+            .as_bytes()
+            .strip_prefix(prefix.as_slice())
+            .and_then(|rest| rest.strip_suffix(b".tmp"))
+            .is_some_and(|h| {
+                h.len() == 16
+                    && h.iter()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+            });
+        if ours
+            && kind_beneath(dir, &e.name).is_ok_and(|k| k == DirEntryKind::File)
+            && unlink_beneath(dir, &e.name).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        let _ = sync_file(dir);
+    }
+    removed
 }
 
 /// Writes `bytes` to a new file `temp` in `dir` with `mode`, flushed.
