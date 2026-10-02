@@ -39,8 +39,8 @@ use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 
 use crate::atomic::{
-    Inside, ModifyError, ModifyErrorKind, create_atomically, digest_of, io, replace_atomically,
-    replace_in_with, rewrite_checked_observed,
+    Inside, ModifyError, ModifyErrorKind, create_atomically, digest_of, io, remove_leftovers,
+    replace_atomically, replace_in_with, rewrite_checked_observed,
 };
 use crate::root::{FileStamp, ScanRoot, open_file};
 
@@ -132,6 +132,18 @@ pub struct BackedUpFile {
 /// its mode. A file with another hard link is never written over. Returns
 /// the new file's stamp.
 ///
+/// The new file is the write itself (SPEC §6.5 "Modifying a file",
+/// R-M2-44: a new file in the same directory, `O_EXCL`, 0600 until it is
+/// whole, flushed, then put in place): it holds only the bytes the person
+/// asked to have written back at `rel`, never anywhere else. A process
+/// killed while it writes leaves the file at `rel` as it was, or the
+/// restored one, and may leave the new file so far beside it under its
+/// temporary name (`.<name>.envcloak-new-<hex>.tmp`, 0600), which nothing
+/// reads; once a later restore of the same file has written it back, it
+/// removes those it finds: the file then holds their bytes whole. A
+/// restore of the same file running in another process at that moment
+/// may then fail, and reports it.
+///
 /// # Errors
 /// As above, and as [`crate::replace_atomically`].
 pub fn restore_over_left(
@@ -183,7 +195,7 @@ pub fn restore_over_left_observed(
     // its name: the stamp is the one it had before it was read, and what
     // comes out of the swap must still hold what the change left.
     let mut fill = |out: &mut File| write_chunks(out, file, chunk);
-    replace_in_with(
+    let written = replace_in_with(
         &dir,
         rel,
         &name,
@@ -191,7 +203,11 @@ pub fn restore_over_left_observed(
         &stamp,
         Some(&file.sha256_after),
         observe,
-    )
+    )?;
+    // A restore of this file killed while it wrote left its new contents
+    // so far beside it; the file now holds them whole, so they go.
+    remove_leftovers(&dir, &name, "new");
+    Ok(written)
 }
 
 /// Writes the chunks of `file` to `out`, in order, each at its length,
