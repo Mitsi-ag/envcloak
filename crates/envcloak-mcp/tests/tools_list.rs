@@ -102,3 +102,32 @@ fn the_annotations_and_schemas_keep_their_rules() {
         assert!(!d.contains("paste sheet"), "{d}");
     }
 }
+
+/// `run_with_secrets` claims what SPEC §1.1 and §6.1 establish and no more
+/// (R-M2-02, R-M2-03, L-15): each key and its common encodings are masked
+/// in the command's output, output the command transforms is not, and the
+/// command holds the keys while it runs, outside the host's sandbox.
+///
+/// Mutation checked: the round-2 description ("Values never come back:
+/// each key and its common encodings are masked in the output"): this
+/// fails.
+#[test]
+fn run_with_secrets_claims_no_more_than_masking_does() {
+    let v = listed();
+    let tools = v["tools"].as_array().unwrap();
+    let run = tools
+        .iter()
+        .find(|t| t["name"] == "run_with_secrets")
+        .unwrap();
+    let d = run["description"].as_str().unwrap();
+    for part in [
+        "each key, and its common encodings, are masked",
+        "output the command transforms",
+        "is not",
+        "outside this host's sandbox",
+        "holds the injected keys",
+    ] {
+        assert!(d.contains(part), "{part}: {d}");
+    }
+    assert!(!d.contains("never come back"), "{d}");
+}
