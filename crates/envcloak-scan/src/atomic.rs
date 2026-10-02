@@ -87,6 +87,15 @@ pub enum ModifyErrorKind {
     /// name is free), but the old file could not be unlinked: it is left
     /// under the temporary name in [`ModifyError::rel`].
     NotRemoved,
+    /// A restore from a backup v2 found the file is not what the change
+    /// the backup was made for left in it: its SHA-256 is not the one the
+    /// daemon recorded ([`crate::restore_over_left`]).
+    EditedSince,
+    /// A restore from a backup v2 could not have the backed-up contents
+    /// whole: a chunk did not come, had another length, or the whole did
+    /// not have the backed-up SHA-256. Nothing was written in the file's
+    /// place.
+    BackupUnread,
 }
 
 impl ModifyErrorKind {
@@ -102,6 +111,8 @@ impl ModifyErrorKind {
             ModifyErrorKind::Scan(k) => k.token(),
             ModifyErrorKind::MovedAside => "moved_aside",
             ModifyErrorKind::NotRemoved => "not_removed",
+            ModifyErrorKind::EditedSince => "edited_since",
+            ModifyErrorKind::BackupUnread => "backup_unread",
         }
     }
 
@@ -129,6 +140,12 @@ impl ModifyErrorKind {
             ModifyErrorKind::NotRemoved => {
                 "the change was made, but the old file could not be removed and is left under \
                  the name shown: look at it, then delete it"
+            }
+            ModifyErrorKind::EditedSince => {
+                "it changed after the change its backup was made for, so it was kept as it is"
+            }
+            ModifyErrorKind::BackupUnread => {
+                "the backup's contents could not be read whole, so nothing was written"
             }
         }
     }
@@ -182,6 +199,31 @@ fn write_new(dir: &File, temp: &OsStr, bytes: &[u8], mode: u32) -> std::io::Resu
     Ok(f)
 }
 
+/// What writes a new file's contents: called once with the new file, open
+/// for writing and empty. A failure leaves no new file.
+pub(crate) type Fill<'a> = &'a mut dyn FnMut(&mut File) -> Result<(), ModifyErrorKind>;
+
+/// Writes what `fill` writes to a new file `temp` in `dir`, then gives it
+/// `mode` and flushes it. On a failure the new file goes.
+fn write_new_with(
+    dir: &File,
+    temp: &OsStr,
+    mode: u32,
+    fill: Fill<'_>,
+) -> Result<File, ModifyErrorKind> {
+    let mut f = create_beneath(dir, temp, 0o600).map_err(|e| io(&e))?;
+    let written = fill(&mut f).and_then(|()| {
+        f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
+            .and_then(|()| sync_file(&f).map(drop))
+            .map_err(|e| io(&e))
+    });
+    if let Err(k) = written {
+        let _ = unlink_beneath(dir, temp);
+        return Err(k);
+    }
+    Ok(f)
+}
+
 /// The file `name` in `dir` as it is now, checked to be the one `expect`
 /// stamps, with no other hard link.
 fn check_same(dir: &File, name: &OsStr, expect: &FileStamp) -> Result<File, ModifyErrorKind> {
@@ -199,7 +241,7 @@ fn check_same(dir: &File, name: &OsStr, expect: &FileStamp) -> Result<File, Modi
     Ok(f)
 }
 
-fn io(e: &std::io::Error) -> ModifyErrorKind {
+pub(crate) fn io(e: &std::io::Error) -> ModifyErrorKind {
     ModifyErrorKind::Scan(io_kind(e))
 }
 
@@ -220,6 +262,9 @@ pub enum Inside {
     /// new contents have the file's name, and the old file is under the
     /// temporary name, not unlinked yet.
     Swapped,
+    /// The file to write back over was hashed and is what the change left
+    /// ([`crate::restore_over_left`]); its replacement is not written yet.
+    Hashed,
 }
 
 /// Whether `m` is the file `expect` stamps, as a rename leaves it: a
@@ -257,12 +302,26 @@ fn replace_in(
     expect: &FileStamp,
     observe: &mut dyn FnMut(Inside),
 ) -> Result<FileStamp, ModifyError> {
+    let mut fill = |f: &mut File| f.write_all(new).map_err(|e| io(&e));
+    replace_in_with(dir, rel, name, &mut fill, expect, observe)
+}
+
+/// [`replace_in`], with the new contents written by `fill`, so they can
+/// be written a part at a time.
+pub(crate) fn replace_in_with(
+    dir: &File,
+    rel: &Path,
+    name: &OsStr,
+    fill: Fill<'_>,
+    expect: &FileStamp,
+    observe: &mut dyn FnMut(Inside),
+) -> Result<FileStamp, ModifyError> {
     let fail = |kind| ModifyError {
         rel: rel.to_path_buf(),
         kind,
     };
     let temp = temp_name(name, "new");
-    let f = write_new(dir, &temp, new, expect.mode).map_err(|e| fail(io(&e)))?;
+    let f = write_new_with(dir, &temp, expect.mode, fill).map_err(fail)?;
     observe(Inside::Staged);
     // Another program may have written the file while this one wrote its
     // replacement: keep theirs.

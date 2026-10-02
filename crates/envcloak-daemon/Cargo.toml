@@ -26,6 +26,8 @@ sha2.workspace = true
 [dev-dependencies]
 base64.workspace = true
 envcloak-ipc = { workspace = true, features = ["testing"] }
+# A backup v2 restore writes files back as a client does (R-M2-73).
+envcloak-scan.workspace = true
 envcloak-sys = { workspace = true, features = ["testing"] }
 envcloak-testkit.workspace = true
 # The grant tests tamper with a vault file directly, as the core's do.

@@ -20,8 +20,10 @@
 //! - [`delete`]: [`delete_plaintext`], the entries the vault holds taken
 //!   out of their files after the four conditions of gate 16; [`restore`]:
 //!   [`restore_file`] and [`restore_over`], a file written back from its
-//!   encrypted backup, and [`rewrite_observed`], a file rewritten to hold
-//!   what the vault does not.
+//!   encrypted backup, [`restore_over_left`], one written back from a
+//!   backup v2 only while it is what the change left, and
+//!   [`rewrite_observed`], a file rewritten to hold what the vault does
+//!   not.
 //! - [`pause_point`]: the points gate 16's test kills `envcloak init` at,
 //!   which do nothing outside a test build.
 //!
@@ -47,7 +49,10 @@ pub use dotenv::{
     DotenvEntry, DotenvError, DotenvErrorKind, EntryKind, MAX_DOTENV, parse_dotenv, trimmed_from,
     without_entries,
 };
-pub use restore::{restore_file, restore_over, rewrite_observed};
+pub use restore::{
+    BackedUpFile, restore_file, restore_over, restore_over_left, restore_over_left_observed,
+    rewrite_observed,
+};
 pub use root::{FileStamp, ScanError, ScanErrorKind, ScanRoot, open_root, read_capped, read_plain};
 pub use walk::{
     DEFAULT_SKIP_DIRS, FileKind, FoundFile, TEMPLATE_SUFFIXES, Walk, WalkOptions, dotenv_kind,

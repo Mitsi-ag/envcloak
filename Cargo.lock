@@ -432,6 +432,7 @@ dependencies = [
  "libc",
  "proptest",
  "secrecy",
+ "sha2",
  "tempfile",
  "zeroize",
 ]
@@ -485,6 +486,7 @@ dependencies = [
  "envcloak-policy",
  "envcloak-providers",
  "envcloak-redact",
+ "envcloak-scan",
  "envcloak-sys",
  "envcloak-testkit",
  "libc",
