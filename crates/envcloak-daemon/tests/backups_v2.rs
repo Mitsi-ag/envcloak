@@ -1573,7 +1573,13 @@ fn handed_on_after_exit(what: &str) {
             _ => "evidence",
         }
         || held["closed"] == true;
-    assert!(refused, "{what}: the handed-on connection acted: {held}");
+    // What came back, with a chunk's bytes left out: a failure message
+    // never carries a fixture.
+    let mut shown = held.clone();
+    if shown["ok"].get("data").is_some() {
+        shown["ok"]["data"] = json!("<chunk>");
+    }
+    assert!(refused, "{what}: the handed-on connection acted: {shown}");
     // Still not reaped: the worker is a zombie, and has exited.
     let unreaped = || envcloak_sys::proc_info(pid).is_ok_and(|i| i.start_time == start);
     assert!(unreaped(), "{what}: the worker was reaped");
