@@ -1295,3 +1295,67 @@ fn an_agents_backup_is_not_restored_from_the_agents_terminal() {
     read_back(&f.paths(), f.files_cs(), &lease, &files);
     f.sweep();
 }
+
+/// The proof-origin check comes first and stands alone (SPEC §10b, L-10):
+/// a backup this terminal made, its results all recorded, is not
+/// restored by a caller that says it is an agent, by an agent in a
+/// terminal of its own, nor by a process without a terminal, tick or
+/// not. After a restart of the daemon the same holds for a backup the
+/// agent made. Each refusal is `proof_refused`, audited with the method,
+/// and leaves no lease; the person then restores both from this terminal.
+#[test]
+fn a_restore_is_refused_to_an_agent_and_to_a_process_without_a_terminal() {
+    let mut f = Fixture::new();
+    let files = [Spec::made(&f.claude("projects/p/t.jsonl"), 300, 13)];
+    let id = f.backup("scrub", &files);
+    client(&f.home)
+        .backup_v2_record_result(&id, 0, &files[0].sha(f.files_cs()))
+        .unwrap();
+    let mut agent = f.child("worker", true);
+    let mut notty = f.child("notty", false);
+    let refused_everywhere = |f: &Fixture, agent: &mut Worker, notty: &mut Worker, id: &str| {
+        let e = client(&f.home)
+            .backup_v2_open_restore(id, passphrase(&f.cs), true, true, &[AGENT.to_owned()])
+            .unwrap_err();
+        assert_eq!(rpc(e).0, ErrorKind::ProofRefused, "claimed agent");
+        for (who, w) in [("agent", agent), ("no terminal", notty)] {
+            let r = w.ask(json!({"op": "open", "id": id, "pass": f.pass()}));
+            assert_eq!(err(&r), "proof_refused", "{who}: {r}");
+        }
+        assert_eq!(f.list().open_leases, 0);
+    };
+    refused_everywhere(&f, &mut agent, &mut notty, &id);
+
+    let settings = Spec::made(&f.claude("settings.json"), 50, 14);
+    let theirs = agent.ask(json!({"op": "begin", "purpose": "agents",
+        "files": [settings.to_json()]}))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        agent.ask(json!({"op": "put_next", "id": theirs}))["final"],
+        true
+    );
+    assert_eq!(agent.ask(json!({"op": "commit", "id": theirs}))["files"], 1);
+    let r = agent.ask(json!({"op": "result", "id": theirs, "file": 0, "sha256": hex(&[5; 32])}));
+    assert_eq!(r["complete"], true, "{r}");
+    f.restart();
+    refused_everywhere(&f, &mut agent, &mut notty, &theirs);
+    agent.end();
+    notty.end();
+
+    let lease = f.open(&id, false, false).unwrap();
+    read_back(&f.paths(), f.files_cs(), &lease, &files);
+    let lease = f.open(&theirs, true, false).unwrap();
+    read_back(&f.paths(), f.files_cs(), &lease, &[settings]);
+    let entries = f.audit_after_stop();
+    let refusals = entries
+        .iter()
+        .filter(|e| {
+            e.record.kind == AuditKind::ProofRefused
+                && e.record.decision.method.as_deref() == Some("backup.v2.open_restore")
+        })
+        .count();
+    assert_eq!(refusals, 6);
+    f.sweep();
+}
