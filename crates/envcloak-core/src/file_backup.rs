@@ -404,6 +404,7 @@ impl Vault {
         paths.ensure_dirs()?;
         // `backups/` opened once, never through a symlink in its place, and
         // everything made, linked and removed through it.
+        envcloak_sys::pause_point("backups.open");
         let dir = open_private_child(&paths.backups_dir)?.ok_or(VaultErrorKind::NotFound)?;
         let created_at = now_secs();
         let id = FileBackupId::generate();
