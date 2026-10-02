@@ -21,6 +21,11 @@
 //! and the session is over ([`Outbox::stalled`]): the server stops reading
 //! and stops the calls in hand, rather than keep answers it cannot
 //! deliver.
+//!
+//! The output closes when a write fails (the host closed its end) or when
+//! the queue fills. Either way the writer's owner is told at once (the
+//! `on_close` of [`spawn_writer`]), so a server waiting for input that may
+//! never come stops waiting.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,18 +168,36 @@ struct Queued {
 }
 
 /// The state an [`Outbox`] and its writer share.
-#[derive(Debug, Default)]
 struct Shared {
     /// No more is sent: a write failed, or the queue was full.
     closed: AtomicBool,
     /// The queue was full: the host stopped reading.
     stalled: AtomicBool,
     queued: Mutex<Queued>,
+    /// Called once, when the output closes.
+    on_close: Box<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("closed", &self.closed)
+            .field("stalled", &self.stalled)
+            .field("queued", &self.queued)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Shared {
     fn queued(&self) -> std::sync::MutexGuard<'_, Queued> {
         self.queued.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Closes the output, and says so the first time.
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            (self.on_close)();
+        }
     }
 }
 
@@ -198,8 +221,9 @@ impl Outbox {
             let mut q = self.shared.queued();
             let over = q.messages + 1 > MAX_QUEUED || q.bytes + message.len() > MAX_QUEUED_BYTES;
             if q.messages > 0 && over {
+                drop(q);
                 self.shared.stalled.store(true, Ordering::SeqCst);
-                self.shared.closed.store(true, Ordering::SeqCst);
+                self.shared.close();
                 return false;
             }
             q.messages += 1;
@@ -224,15 +248,26 @@ impl Outbox {
 /// Starts the thread that writes `out`. It ends when every [`Outbox`] is
 /// dropped and what they queued is written, or when a write fails. A
 /// write the host never reads stays blocked: the server does not wait
-/// for this thread for ever ([`crate::Server::run`]).
-pub fn spawn_writer<W: Write + Send + 'static>(mut out: W) -> (Outbox, JoinHandle<()>) {
+/// for this thread for ever ([`crate::Server::run`]). `on_close` is called
+/// once, from whichever thread closes the output: the writer's, on a
+/// failed write, or a sender's, on a full queue.
+pub fn spawn_writer<W, F>(mut out: W, on_close: F) -> (Outbox, JoinHandle<()>)
+where
+    W: Write + Send + 'static,
+    F: Fn() + Send + Sync + 'static,
+{
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let shared = Arc::new(Shared::default());
+    let shared = Arc::new(Shared {
+        closed: AtomicBool::new(false),
+        stalled: AtomicBool::new(false),
+        queued: Mutex::new(Queued::default()),
+        on_close: Box::new(on_close),
+    });
     let state = Arc::clone(&shared);
     let handle = std::thread::spawn(move || {
         for message in rx {
             if out.write_all(&message).and_then(|()| out.flush()).is_err() {
-                state.closed.store(true, Ordering::SeqCst);
+                state.close();
                 break;
             }
             let mut q = state.queued();
@@ -324,9 +359,24 @@ mod tests {
         assert_eq!(r.next_line().unwrap(), Line::End);
     }
 
+    /// An `on_close` that counts its calls in `told`.
+    fn closing(told: &Arc<std::sync::atomic::AtomicUsize>) -> impl Fn() + Send + Sync + 'static {
+        let told = Arc::clone(told);
+        move || {
+            told.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A failed write closes the output and says so, once; nothing is sent
+    /// after it.
+    ///
+    /// Mutation checked: the writer's failure not calling `on_close`: the
+    /// count stays 0 and this fails (and `tests/server.rs`'s
+    /// `closed_output_ends_the_session_while_input_stays_open` hangs).
     #[test]
     fn the_writer_writes_whole_messages_until_closed() {
-        let (outbox, handle) = spawn_writer(Vec::<u8>::new());
+        let told = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (outbox, handle) = spawn_writer(Vec::<u8>::new(), || {});
         assert!(outbox.send(b"a\n".to_vec()));
         drop(outbox);
         handle.join().unwrap();
@@ -340,12 +390,17 @@ mod tests {
                 Ok(())
             }
         }
-        let (outbox, handle) = spawn_writer(Broken);
+        let (outbox, handle) = spawn_writer(Broken, closing(&told));
         assert!(outbox.send(b"a\n".to_vec()));
         handle.join().unwrap();
         assert!(outbox.closed());
         assert!(!outbox.stalled());
         assert!(!outbox.send(b"b\n".to_vec()));
+        assert_eq!(
+            told.load(Ordering::SeqCst),
+            1,
+            "the closing was not told once"
+        );
     }
 
     /// A writer that takes nothing until told to: the host not reading.
@@ -371,8 +426,9 @@ mod tests {
     /// not come and this fails.
     #[test]
     fn answers_waiting_for_a_host_that_does_not_read_are_bounded() {
+        let told = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (_go, held) = mpsc::channel();
-        let (outbox, _) = spawn_writer(Held(held, Vec::new()));
+        let (outbox, _) = spawn_writer(Held(held, Vec::new()), closing(&told));
         let mut sent = 0;
         while outbox.send(b"{}\n".to_vec()) {
             sent += 1;
@@ -381,15 +437,20 @@ mod tests {
         assert_eq!(sent, MAX_QUEUED);
         assert!(outbox.stalled() && outbox.closed());
         assert!(!outbox.send(b"{}\n".to_vec()));
+        assert_eq!(
+            told.load(Ordering::SeqCst),
+            1,
+            "the stall was not told once"
+        );
 
         let (_go, held) = mpsc::channel();
-        let (outbox, _) = spawn_writer(Held(held, Vec::new()));
+        let (outbox, _) = spawn_writer(Held(held, Vec::new()), || {});
         assert!(outbox.send(vec![b'x'; MAX_QUEUED_BYTES + 1]));
         assert!(!outbox.send(b"{}\n".to_vec()));
         assert!(outbox.stalled());
 
         let (_go, held) = mpsc::channel();
-        let (outbox, _) = spawn_writer(Held(held, Vec::new()));
+        let (outbox, _) = spawn_writer(Held(held, Vec::new()), || {});
         let piece = MAX_QUEUED_BYTES / 4;
         let mut sent = 0;
         while outbox.send(vec![b'x'; piece]) {
@@ -403,7 +464,7 @@ mod tests {
     /// Answers written leave the queue: a host that reads takes any number.
     #[test]
     fn a_host_that_reads_takes_any_number_of_answers() {
-        let (outbox, handle) = spawn_writer(io::sink());
+        let (outbox, handle) = spawn_writer(io::sink(), || {});
         for _ in 0..4 * MAX_QUEUED {
             assert!(
                 outbox.send(vec![b'x'; 64 * 1024]),

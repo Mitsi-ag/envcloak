@@ -8,7 +8,7 @@
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use envcloak_mcp::{
     Annotations, Call, Ctx, QUEUE, Router, Server, Tool, ToolResult, ToolSchema, WORKERS,
@@ -187,9 +187,11 @@ impl Tool for Echo {
     }
 }
 
-/// A tool that runs until its call is cancelled, then answers.
+/// A tool that runs until its call is cancelled, says it saw the
+/// cancellation, then answers.
 struct UntilCancelled {
     started: Mutex<Sender<()>>,
+    saw_cancel: Mutex<Sender<()>>,
 }
 
 impl Tool for UntilCancelled {
@@ -202,6 +204,7 @@ impl Tool for UntilCancelled {
         while !call.cancelled() {
             std::thread::sleep(Duration::from_millis(5));
         }
+        let _ = self.saw_cancel.lock().unwrap().send(());
         ToolResult::Ok(json!({"answered_after_cancel": true}))
     }
 }
@@ -358,14 +361,22 @@ fn calls_beyond_the_queue_are_answered_busy() {
 }
 
 /// A cancelled call is answered nothing, whether it was running or still
-/// waiting; the server goes on answering the rest.
+/// waiting; the server goes on answering the rest. The running call sees
+/// its cancellation while the session goes on, not at its end, when every
+/// call in hand is stopped anyway (verifier, M2-06 round 2).
+///
+/// Mutation checked: `notifications/cancelled` ignored (no
+/// `inflight.cancel`): the call never sees a cancellation before the end
+/// of input, and this fails.
 #[test]
 fn a_cancelled_call_is_answered_nothing() {
     let (started_tx, started) = mpsc::channel();
+    let (saw_tx, saw_cancel) = mpsc::channel();
     let mut router = Router::new();
     router
         .register(Box::new(UntilCancelled {
             started: Mutex::new(started_tx),
+            saw_cancel: Mutex::new(saw_tx),
         }))
         .unwrap();
     router.register(Box::new(Echo("echo"))).unwrap();
@@ -377,6 +388,9 @@ fn a_cancelled_call_is_answered_nothing() {
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 1, "reason": "test"}}),
     );
+    saw_cancel
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the running call never saw its cancellation");
     // An id that is not in hand, and one of a shape not taken, change
     // nothing.
     r.send(
@@ -422,4 +436,65 @@ fn an_id_in_hand_is_not_taken_twice() {
     let v = r.expect();
     assert_eq!(v["result"]["structuredContent"]["done"], true);
     assert!(r.end().is_empty());
+}
+
+/// The host closes its end of standard output while it keeps standard
+/// input open and sends nothing more, with one call answering and another
+/// still running: the answer's write fails, and the server ends the
+/// session at once, cancelling the running call, without waiting for input
+/// that may never come (Codex review of M2-06, medium).
+///
+/// Mutation checked: the writer's failure not waking the server (its
+/// `on_close` doing nothing): the server waits for input, the running call
+/// is never cancelled, and this fails.
+#[test]
+fn closed_output_ends_the_session_while_input_stays_open() {
+    let gate = Arc::new(Barrier::new(2));
+    let (started_tx, started) = mpsc::channel();
+    let (saw_tx, saw_cancel) = mpsc::channel();
+    let mut router = Router::new();
+    router
+        .register(Box::new(Gated {
+            name: "gated",
+            gate: Arc::clone(&gate),
+            started: Mutex::new(started_tx.clone()),
+        }))
+        .unwrap();
+    router
+        .register(Box::new(UntilCancelled {
+            started: Mutex::new(started_tx),
+            saw_cancel: Mutex::new(saw_tx),
+        }))
+        .unwrap();
+    let mut r = Running::start(Server::with_router(router));
+    r.initialize();
+    r.call(1, "gated", json!({}));
+    r.call(2, "until_cancelled", json!({}));
+    for _ in 0..2 {
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
+    }
+    // The host's end of standard output closes; its input stays open.
+    let Running {
+        input,
+        output,
+        done,
+        ..
+    } = r;
+    drop(output);
+    // The gated call answers now, and the write fails.
+    gate.wait();
+    let done = done.unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    while !done.is_finished() {
+        assert!(
+            Instant::now() < end,
+            "the server went on waiting for input after its output closed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    done.join().unwrap().unwrap();
+    saw_cancel
+        .recv_timeout(Duration::from_secs(1))
+        .expect("the running call was not stopped");
+    drop(input);
 }
