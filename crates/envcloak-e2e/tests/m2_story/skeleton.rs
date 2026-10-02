@@ -197,12 +197,19 @@ fn s0(host: Host, shell: Shell, name: &str) {
         )
     };
     // Named in two pieces: whole, it can only be what the command printed.
+    // Where the sandbox runs no command at all, nothing can print it: the
+    // model says it instead, and the host keeps it with its reply.
     let (head, tail) = control.as_str().split_at(control.as_str().len() / 2);
     let print_control = format!("printf '%s%s\\n' {} {}", quoted(head), quoted(tail));
+    let control_step = if matches!(expected, Reach::NotRun(_)) {
+        json!({"say": control.as_str(), "shell": "true"})
+    } else {
+        json!({"shell": print_control})
+    };
     let script = json!({"steps": [
         {"say": "I'll run emit through EnvCloak.", "shell": run_emit(&first_nonce)},
         {"say": "Running it again.", "shell": run_emit(&second_nonce), "after": "approved"},
-        {"shell": print_control},
+        control_step,
         {"say": "done"},
     ]});
     let requests_before = audit_requests(&h);
@@ -375,7 +382,8 @@ fn s0(host: Host, shell: Shell, name: &str) {
         }
     );
 
-    // The control is in the tool result the host sent its model.
+    // The control is in the tool result the host sent its model (or, where
+    // no command runs, in the reply the host sent back with it).
     let third = run
         .model
         .requests
@@ -383,9 +391,13 @@ fn s0(host: Host, shell: Shell, name: &str) {
         .find(|r| r.pick.as_deref() == Some("step 3"))
         .map(|r| String::from_utf8_lossy(&r.body).into_owned())
         .unwrap();
+    let carried = match expected {
+        Reach::NotRun(_) => third.contains(control.as_str()),
+        _ => last_tool_output(&third).contains(control.as_str()),
+    };
     assert!(
-        last_tool_output(&third).contains(control.as_str()),
-        "the printed control is not in the tool result the host sent its model"
+        carried,
+        "the control is not in what the host sent its model after it"
     );
 
     // The sweep: every capture, every daemon log, the whole home, raw.
