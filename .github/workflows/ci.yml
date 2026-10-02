@@ -204,7 +204,8 @@ jobs:
   # The shipped binaries as `cargo build --release` makes them: panic =
   # "abort" and no core file (gate 19), no test hook, a truthful `status`,
   # and the fixture story and gate 12 run on them
-  # (crates/envcloak-e2e/tests/release.rs).
+  # (crates/envcloak-e2e/tests/release.rs), then story step S0 with the
+  # pinned hosts.
   release:
     name: release (${{ matrix.os }})
     if: github.event_name != 'pull_request'
@@ -268,6 +269,93 @@ jobs:
           export ENVCLOAK_TEST_RELEASE_DIR="$PWD/target/release"
           export ENVCLOAK_E2E_BIN_DIR="$PWD/target/release"
           cargo test --locked -p envcloak-e2e --no-fail-fast
+      # Story step S0 on the release binaries (M2 plan §6: the release job
+      # runs the stories on release binaries), with the pinned hosts
+      # required, at trace with full backtraces, and loopback only, as
+      # agents-e2e runs it on the test build. The step above finds no host
+      # (the cache is not where it looks), so S0 runs here only.
+      - name: Agent hosts from the cache, keyed by their pins
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../agent-hosts
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'scripts/install-agent-hosts.py') }}
+      - name: Install and verify the pinned tier-1 hosts
+        env:
+          ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
+        run: |
+          python3 scripts/install-agent-hosts.py --self-test
+          python3 scripts/install-agent-hosts.py --tier 1
+      - name: Claude Code's sandbox dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends bubblewrap socat
+      - name: Allow unprivileged user namespaces (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Build S0 for the release binaries
+        run: cargo test --locked -p envcloak-e2e --test m2_story --no-run
+      - name: The network outside the isolation is open
+        env:
+          ENVCLOAK_TEST_NETWORK: open
+        run: cargo test --locked --offline -p envcloak-e2e --test m2_story -- --exact the_network_is_what_ci_says
+      - name: S0 on the release binaries, loopback only (Linux)
+        if: runner.os == 'Linux'
+        env:
+          ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
+          ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
+          ENVCLOAK_E2E_BIN_DIR: ${{ github.workspace }}/target/release
+          ENVCLOAK_TEST_NETWORK: loopback-only
+          RUST_LOG: trace
+          RUST_BACKTRACE: full
+        run: |
+          unshare --user --map-root-user --net -- sh -ec \
+            'ip link set lo up; exec cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1'
+      - name: S0 on the release binaries, sandboxed cases outside a user namespace, loopback only (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
+          ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
+          ENVCLOAK_E2E_BIN_DIR: ${{ github.workspace }}/target/release
+          ENVCLOAK_TEST_NETWORK: loopback-only
+          RUST_LOG: trace
+          RUST_BACKTRACE: full
+        run: |
+          set -o pipefail
+          sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
+            "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
+             cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1 \
+             --exact skeleton::s0_claude_code_sandboxed skeleton::s0_codex_workspace_write \
+             the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/s0-outside.log"
+          grep -qx 'running 3 tests' "$RUNNER_TEMP/s0-outside.log"
+          grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
+      # As agents-e2e: the tests' own group, whose packets to anywhere but
+      # lo0 a pf rule refuses.
+      - name: Loopback only for the tests' group (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo dscl . -create /Groups/ecnonet
+          sudo dscl . -create /Groups/ecnonet PrimaryGroupID 4242
+          printf '%s\n' 'pass quick on lo0 all flags any no state' \
+            'block return out quick proto { tcp udp } all group 4242' \
+            | sudo pfctl -a com.apple/ecnonet -f -
+          sudo pfctl -E
+          sudo pfctl -a com.apple/ecnonet -s rules
+      - name: S0 on the release binaries, loopback only (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
+          ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
+          ENVCLOAK_E2E_BIN_DIR: ${{ github.workspace }}/target/release
+          ENVCLOAK_TEST_NETWORK: loopback-only
+          RUST_LOG: trace
+          RUST_BACKTRACE: full
+        run: |
+          sudo -E env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID \
+            "PATH=$PATH" "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" \
+            "$(command -v python3)" -c 'import os, sys; os.setgroups([4242]); os.setgid(4242); os.setuid(int(sys.argv[1])); os.execvp(sys.argv[2], sys.argv[2:])' \
+            "$(id -u)" cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1
 
   deny:
     runs-on: ubuntu-latest
@@ -333,6 +421,11 @@ jobs:
     env:
       ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
       ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
+      # Gate 12 on the hosts' paths too: every process the tests start,
+      # the hosts and the `envcloak run` they start included, runs at
+      # trace with full backtraces, and the tests sweep what they capture.
+      RUST_LOG: trace
+      RUST_BACKTRACE: full
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -377,16 +470,21 @@ jobs:
       # S0's sandboxed cases again outside a user namespace, as a person's
       # machine runs them (K-01: the CLI's own refusal, where Claude Code's
       # sandbox applies its seccomp filter).
+      # --exact runs nothing for a name no test has, and passes: the step
+      # then also requires that all three ran and passed.
       - name: Story steps, sandboxed cases outside a user namespace, loopback only
         if: ${{ !cancelled() }}
         env:
           ENVCLOAK_TEST_NETWORK: loopback-only
         run: |
+          set -o pipefail
           sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1 \
              --exact skeleton::s0_claude_code_sandboxed skeleton::s0_codex_workspace_write \
-             the_network_is_what_ci_says"
+             the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/s0-outside.log"
+          grep -qx 'running 3 tests' "$RUNNER_TEMP/s0-outside.log"
+          grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
 
   # The pinned agent hosts against the scripted model (M2-04's harness,
   # probes and measurements; later tasks add theirs). Linux on pull
@@ -406,6 +504,9 @@ jobs:
       ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
       ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
       TESTS: ${{ github.event_name == 'pull_request' && '--test agent_hosts' || '--test agent_hosts --test m2_story' }}
+      # Gate 12 on the hosts' paths too (see the gates job).
+      RUST_LOG: trace
+      RUST_BACKTRACE: full
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -467,11 +568,14 @@ jobs:
         env:
           ENVCLOAK_TEST_NETWORK: loopback-only
         run: |
+          set -o pipefail
           sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test agent_hosts -- --nocapture --test-threads=1 \
              --exact claude_code_sandbox_reaches_the_socket codex_sandbox_reaches_the_socket_and_nothing_else \
-             the_network_is_what_ci_says"
+             the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/k01-outside.log"
+          grep -qx 'running 3 tests' "$RUNNER_TEMP/k01-outside.log"
+          grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/k01-outside.log"
       # S0's sandboxed cases the same way (the gates job runs them on pull
       # requests), on main, nightly and manual runs.
       - name: Story steps, sandboxed cases outside a user namespace, loopback only (Linux)
@@ -479,11 +583,14 @@ jobs:
         env:
           ENVCLOAK_TEST_NETWORK: loopback-only
         run: |
+          set -o pipefail
           sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1 \
              --exact skeleton::s0_claude_code_sandboxed skeleton::s0_codex_workspace_write \
-             the_network_is_what_ci_says"
+             the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/s0-outside.log"
+          grep -qx 'running 3 tests' "$RUNNER_TEMP/s0-outside.log"
+          grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
       # macOS has no network namespaces: the tests run as the runner's user
       # with one group of their own (ecnonet, gid 4242, made here), and a pf
       # rule in an anchor of the default ruleset refuses every TCP and UDP
