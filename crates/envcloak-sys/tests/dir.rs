@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 
 use envcloak_sys::{
     DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, exchange_beneath, kind_beneath,
-    link_beneath, list_dir, open_dir_beneath, open_elsewhere, read_link_beneath, rename_beneath,
-    unlink_beneath, volume_of,
+    link_beneath, list_dir, open_dir_beneath, open_elsewhere, read_link_beneath,
+    remove_dir_beneath, rename_beneath, unlink_beneath, volume_of,
 };
 
 fn names(dir: &File) -> Vec<(OsString, DirEntryKind)> {
@@ -56,6 +56,41 @@ fn list_dir_names_every_entry_but_dot_and_dot_dot() {
     // Listing twice gives the same names: the handle's offset is not used
     // up by the first listing.
     assert_eq!(names(&dir), got);
+}
+
+/// `remove_dir_beneath` removes an empty directory by its name in the
+/// directory held open, never one with anything left in it, never a
+/// symlink in its place (nor what it points at) and never a file.
+#[test]
+fn remove_dir_beneath_removes_only_an_empty_directory() {
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::create_dir(tmp.path().join("empty")).unwrap();
+    std::fs::create_dir(tmp.path().join("full")).unwrap();
+    std::fs::write(tmp.path().join("full").join("kept"), b"").unwrap();
+    std::fs::create_dir(tmp.path().join("target")).unwrap();
+    symlink("target", tmp.path().join("link")).unwrap();
+    std::fs::write(tmp.path().join("file"), b"").unwrap();
+    let dir = File::open(tmp.path()).unwrap();
+    remove_dir_beneath(&dir, OsStr::new("empty")).unwrap();
+    assert!(!tmp.path().join("empty").exists());
+    let e = remove_dir_beneath(&dir, OsStr::new("full")).unwrap_err();
+    assert!(
+        matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::EEXIST)),
+        "{e}"
+    );
+    assert!(tmp.path().join("full").join("kept").exists());
+    for name in ["link", "file"] {
+        let e = remove_dir_beneath(&dir, OsStr::new(name)).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR), "{name}: {e}");
+    }
+    assert!(tmp.path().join("link").symlink_metadata().is_ok());
+    assert!(tmp.path().join("target").is_dir());
+    let e = remove_dir_beneath(&dir, OsStr::new("gone")).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    for name in ["", ".", "..", "full/kept", "a\0b"] {
+        let e = remove_dir_beneath(&dir, OsStr::new(name)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{name:?}");
+    }
 }
 
 #[test]

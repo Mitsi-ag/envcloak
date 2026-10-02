@@ -7,7 +7,8 @@
 //! are sealed with it; a result is recorded once per file; caps refuse
 //! rather than cut; backups go after 7 days, and so do the staging
 //! directories interrupted backups left, never one still being written;
-//! a backup the purge cannot remove stops no other.
+//! a backup the purge cannot remove stops no other and is never listed
+//! again, and a purge removes nothing outside the directories it opened.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -21,7 +22,7 @@ use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CHUNK_V2, CreatorKind, CreatorProcess,
     FileBackupV2Writer, HEADER_LEN_V2, MAX_FILE_V2, MAX_FILES_V2, MAX_LABEL_V2, MAX_PATH_V2,
     PlannedFile, chunk_len, chunks_of, list_file_backups_v2, purge_file_backups_v2,
-    purge_file_backups_v2_except,
+    purge_file_backups_v2_except, purge_file_backups_v2_observed,
 };
 use envcloak_core::vault::{Vault, VaultErrorKind};
 use envcloak_testkit::{assert_no_canary, by_label, labels};
@@ -732,6 +733,13 @@ fn writes_past_permissions(scratch: &Path) -> bool {
     wrote
 }
 
+/// Where the purge puts a backup's directory before it removes it:
+/// `.files2-<time>-<id>.purge`, beside it.
+fn purging(dir: &Path) -> PathBuf {
+    let name = dir.file_name().unwrap().to_str().unwrap();
+    dir.with_file_name(format!(".{name}.purge"))
+}
+
 /// A purge goes on past a backup it cannot remove. Three expired backups,
 /// in the order the purge meets them: the first's directory holds a file
 /// the purge does not own (a `.DS_Store`), which stays with its directory
@@ -739,7 +747,9 @@ fn writes_past_permissions(scratch: &Path) -> bool {
 /// directory is made read-only, so its files cannot be removed (skipped
 /// as root, which removes them anyway); the third is removed. The purge
 /// then reports the second's failure, after the third went; once the
-/// second can be removed, it goes too and the first is still kept.
+/// second can be removed, it goes too and the first is still kept. A
+/// backup the purge began to remove is never listed again: the directory
+/// kept for the `.DS_Store` is renamed out of the listing first.
 #[test]
 fn a_backup_the_purge_cannot_remove_stops_no_other() {
     use std::os::unix::fs::PermissionsExt;
@@ -755,22 +765,157 @@ fn a_backup_the_purge_cannot_remove_stops_no_other() {
     let guarded = !writes_past_permissions(f.home.root());
     if guarded {
         std::fs::set_permissions(&stuck.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let e = purge_file_backups_v2(v.paths(), t).unwrap_err();
+    }
+    let first = purge_file_backups_v2(v.paths(), t);
+    assert!(
+        list_file_backups_v2(v.paths()).unwrap().is_empty(),
+        "a backup the purge began to remove is still listed"
+    );
+    assert!(!plain.dir.exists(), "a failure stopped the purge");
+    if guarded {
         assert_eq!(
-            e.kind(),
+            first.unwrap_err().kind(),
             VaultErrorKind::Io(std::io::ErrorKind::PermissionDenied)
         );
-        assert!(!plain.dir.exists(), "a failure stopped the purge");
-        assert!(stuck.dir.join("data").exists());
-        std::fs::set_permissions(&stuck.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(purging(&stuck.dir).join("data").exists());
+        std::fs::set_permissions(purging(&stuck.dir), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert_eq!(purge_file_backups_v2(v.paths(), t).unwrap(), 1);
+    } else {
+        assert_eq!(first.unwrap(), 2);
     }
-    let removed = purge_file_backups_v2(v.paths(), t).unwrap();
-    assert_eq!(removed, if guarded { 1 } else { 2 });
-    assert!(!stuck.dir.exists() && !plain.dir.exists());
-    assert_eq!(dir_names(&kept.dir), [".DS_Store"]);
+    for gone in [stuck, plain] {
+        assert!(!gone.dir.exists() && !purging(&gone.dir).exists());
+    }
+    assert!(!kept.dir.exists());
+    assert_eq!(dir_names(&purging(&kept.dir)), [".DS_Store"]);
     // Kept again, and never counted as a failure.
     assert_eq!(purge_file_backups_v2(v.paths(), t).unwrap(), 0);
-    assert_eq!(dir_names(&kept.dir), [".DS_Store"]);
+    assert_eq!(dir_names(&purging(&kept.dir)), [".DS_Store"]);
+    // Once the foreign file is gone, the next purge removes the rest.
+    std::fs::remove_file(purging(&kept.dir).join(".DS_Store")).unwrap();
+    assert_eq!(purge_file_backups_v2(v.paths(), t).unwrap(), 1);
+    assert!(dir_names(&v.paths().backups_dir).is_empty());
+    drop(f);
+}
+
+/// A backup acts on the directories it opened, whatever takes their names
+/// (L-11). A writer dropped unfinished removes its staging directory's
+/// `data` through the handle it made it with: with that directory moved
+/// away and a symlink to another directory in its place, the other
+/// directory's `data` is kept, and so is the symlink. A reader records a
+/// result in the backup's directory it opened: with that directory moved
+/// away and a symlink in its place, the result is in the moved directory
+/// and reads back, and nothing is written in the other directory.
+#[test]
+fn a_backup_acts_on_the_directories_it_opened() {
+    let (f, v) = KitFixture::create();
+    let t = now();
+    let backups = v.paths().backups_dir.clone();
+    let victim = f.home.root().join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    std::fs::write(victim.join("data"), b"not the backup's").unwrap();
+    let plan = vec![PlannedFile {
+        path: "/h/.env".into(),
+        mode: 0o600,
+        size: 4,
+    }];
+    let w = v
+        .begin_file_backup_v2(BackupPurpose::Init, creator(CreatorKind::Terminal), plan, t)
+        .unwrap();
+    let staging = dir_names(&backups);
+    assert_eq!(staging.len(), 1);
+    let away = f.home.root().join("staging-moved");
+    std::fs::rename(backups.join(&staging[0]), &away).unwrap();
+    std::os::unix::fs::symlink(&victim, backups.join(&staging[0])).unwrap();
+    drop(w);
+    assert_eq!(
+        std::fs::read(victim.join("data")).ok().as_deref(),
+        Some(&b"not the backup's"[..]),
+        "a writer removed a file outside its staging directory"
+    );
+    assert!(dir_names(&away).is_empty(), "{:?}", dir_names(&away));
+    assert!(
+        backups
+            .join(&staging[0])
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink()
+    );
+    std::fs::remove_file(backups.join(&staging[0])).unwrap();
+
+    let id = small(&v, t);
+    let r = v.open_file_backup_v2(&id).unwrap();
+    let dir = data_file(&v, &id).parent().unwrap().to_owned();
+    let moved = f.home.root().join("backup-moved");
+    std::fs::rename(&dir, &moved).unwrap();
+    std::os::unix::fs::symlink(&victim, &dir).unwrap();
+    let after: [u8; 32] = Sha256::digest(b"what init left").into();
+    r.record_result(0, &after).unwrap();
+    assert_eq!(dir_names(&victim), ["data"], "a result written elsewhere");
+    assert_eq!(dir_names(&moved), ["data", "result-0"]);
+    assert_eq!(r.results().unwrap(), [Some(after)]);
+    drop(f);
+}
+
+/// A purge removes nothing outside the directory it opened (L-11): right
+/// before it removes the files of an expired backup's directory (renamed
+/// out of the listing) and of an interrupted staging directory, a test
+/// moves each directory away and puts a symlink to another directory in
+/// its place, one holding files of the names a backup holds (`data`, a
+/// result, a result's temporary name). Every one of those files is kept,
+/// and so is each symlink; the backup's own files go from where its
+/// directory went, through the handle the purge opened; and the purge
+/// reports that a directory it was removing was replaced.
+#[test]
+fn a_purge_removes_nothing_outside_the_directory_it_opened() {
+    let (f, v) = KitFixture::create();
+    let t = now();
+    small(&v, t - FILE_BACKUP_RETENTION.as_secs() - 1);
+    let backups = v.paths().backups_dir.clone();
+    let stale = backups.join(".files2-20260901T000000Z-00112233445566778899aabbccddeeff.tmp");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("data"), b"sealed bytes only").unwrap();
+    set_time(&stale, t - STAGING_GRACE.as_secs() - 60);
+    let victim = f.home.root().join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    let theirs = [
+        "data",
+        "result-0",
+        ".result-0-00112233445566778899aabbccddeeff.tmp",
+    ];
+    for n in theirs {
+        std::fs::write(victim.join(n), b"not the purge's").unwrap();
+    }
+    let mut moved = Vec::new();
+    let e = purge_file_backups_v2_observed(
+        v.paths(),
+        t,
+        |_| false,
+        |name| {
+            let away = f.home.root().join(format!("moved-{}", moved.len()));
+            std::fs::rename(backups.join(name), &away).unwrap();
+            std::os::unix::fs::symlink(&victim, backups.join(name)).unwrap();
+            moved.push((name.to_owned(), away));
+        },
+    )
+    .unwrap_err();
+    assert_eq!(moved.len(), 2, "{moved:?}");
+    for n in theirs {
+        assert_eq!(
+            std::fs::read(victim.join(n)).ok().as_deref(),
+            Some(&b"not the purge's"[..]),
+            "{n}: a file outside backups/ was removed"
+        );
+    }
+    for (name, away) in &moved {
+        assert!(backups.join(name).symlink_metadata().unwrap().is_symlink());
+        assert!(dir_names(away).is_empty(), "{name}: {:?}", dir_names(away));
+    }
+    assert_eq!(
+        e.kind(),
+        VaultErrorKind::Io(std::io::ErrorKind::NotADirectory)
+    );
     drop(f);
 }
 
