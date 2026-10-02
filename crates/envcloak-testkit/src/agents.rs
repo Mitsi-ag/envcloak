@@ -401,11 +401,11 @@ pub fn probe_model_exe() -> PathBuf {
     path
 }
 
-/// One request the scripted model recorded. `Debug` leaves the body out,
-/// shows the method and the path only when they are HTTP's and an
-/// endpoint the model serves (else their lengths), the query by its
-/// length and the header names by their number: a request line is
-/// whatever a host sent.
+/// One request the scripted model recorded. `Debug` leaves the body, the
+/// header values and a forwarded target out (their lengths only), shows
+/// the method and the path only when they are HTTP's and an endpoint the
+/// model serves (else their lengths), the query by its length and the
+/// header names by their number: a request line is whatever a host sent.
 #[derive(Clone)]
 pub struct ModelRequest {
     pub seq: u64,
@@ -415,8 +415,13 @@ pub struct ModelRequest {
     /// The target's query, after the first `?` (a request to forward
     /// keeps none).
     pub query: Option<String>,
-    /// The header names, lower-cased, in order (never their values).
+    /// The header names, lower-cased, in order.
     pub headers: Vec<String>,
+    /// Their values, in the same order; a credential that presented the
+    /// run's token holds `<token>` instead.
+    pub header_values: Vec<Zeroizing<Vec<u8>>>,
+    /// A request to forward's whole target as sent (empty otherwise).
+    pub forward: Zeroizing<Vec<u8>>,
     pub status: u64,
     /// Whether the reply was sent whole (a reply held on a barrier is
     /// recorded first, unanswered).
@@ -447,6 +452,11 @@ impl std::fmt::Debug for ModelRequest {
                 &self.query.as_ref().map(|q| format!("<{} bytes>", q.len())),
             )
             .field("headers", &self.headers.len())
+            .field(
+                "value_bytes",
+                &self.header_values.iter().map(|v| v.len()).sum::<usize>(),
+            )
+            .field("forward_len", &self.forward.len())
             .field("status", &self.status)
             .field("answered", &self.answered)
             .field("api", &self.api)
@@ -798,6 +808,13 @@ fn read_line(r: &mut BufReader<ChildStdout>) -> Zeroizing<Vec<u8>> {
 
 fn parse_report(v: &Value) -> ModelReport {
     let text = |r: &Value, k: &str| r[k].as_str().map(str::to_owned);
+    let bytes = |b: &Value| {
+        Zeroizing::new(
+            STANDARD
+                .decode(b.as_str().unwrap_or(""))
+                .unwrap_or_else(|_| panic!("a recorded field is not base64")),
+        )
+    };
     let requests = v["requests"]
         .as_array()
         .map(|rs| {
@@ -816,15 +833,16 @@ fn parse_report(v: &Value) -> ModelReport {
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    header_values: r["values"]
+                        .as_array()
+                        .map(|vs| vs.iter().map(bytes).collect())
+                        .unwrap_or_default(),
+                    forward: bytes(&r["forward"]),
                     status: r["status"].as_u64().unwrap_or(0),
                     answered: r["answered"].as_bool().unwrap_or(false),
                     api: text(r, "api"),
                     pick: text(r, "pick"),
-                    body: Zeroizing::new(
-                        STANDARD
-                            .decode(r["body"].as_str().unwrap_or(""))
-                            .unwrap_or_else(|_| panic!("a recorded body is not base64")),
-                    ),
+                    body: bytes(&r["body"]),
                 })
                 .collect()
         })
@@ -2179,6 +2197,8 @@ mod tests {
             path: path.to_owned(),
             query: None,
             headers: Vec::new(),
+            header_values: Vec::new(),
+            forward: Zeroizing::new(Vec::new()),
             status: 200,
             answered: true,
             api: api.map(str::to_owned),
@@ -2224,6 +2244,8 @@ mod tests {
         let mut r = request("ECMARKMETHOD", "/ecmark-path", None);
         r.query = Some("ecmark-query".to_owned());
         r.headers = vec!["x-ecmark-header".to_owned()];
+        r.header_values = vec![Zeroizing::new(b"ecmark-value".to_vec())];
+        r.forward = Zeroizing::new(b"http://ecmark.example/ecmark".to_vec());
         r.body = Zeroizing::new(b"ecmark-body".to_vec());
         let shown = format!("{r:?}");
         assert!(!shown.to_ascii_lowercase().contains("mark"), "{shown}");

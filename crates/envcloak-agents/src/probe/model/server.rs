@@ -345,18 +345,41 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         // The head's bytes, credentials included, leave the buffer; what
         // follows is this request's body, then any next request.
         buf.drain(..end);
+        // What the record keeps of the head: every header's value (the
+        // run's token as `<token>`) and a forwarded request's whole
+        // target, counted against the metadata cap.
+        let values = shared.token.recorded_values(&head);
+        let meta = super::meta_len(
+            &head.method,
+            &head.path,
+            head.query.as_deref(),
+            &head.header_names,
+            &values,
+            head.forward.as_ref().map_or(&[][..], |f| f.as_slice()),
+        );
         if head.form != Form::Origin {
             // A host reaching for anywhere else through the proxy the
             // harness names, by a tunnel or a forwarded request: refused,
-            // and recorded by the `host:port` it names.
-            let mut state = lock(&shared.state);
-            state.outcome.connect += 1;
-            let Some(seq) = reserve(&mut state, &shared.limits, &head, 0) else {
-                drop(state);
-                respond(stream, &full());
+            // and recorded by the `host:port` it names, with its whole
+            // target, its header values and its body (Codex review,
+            // medium: a value in the path, query or body of a refused
+            // proxy request was never recorded, so never swept).
+            let seq = {
+                let mut state = lock(&shared.state);
+                state.outcome.connect += 1;
+                let Some(seq) = reserve(&mut state, &shared.limits, meta, head.content_length)
+                else {
+                    drop(state);
+                    respond(stream, &full());
+                    return;
+                };
+                seq
+            };
+            let Some(body) = read_body(stream, &mut buf, head.content_length) else {
+                lock(&shared.state).outcome.malformed += 1;
                 return;
             };
-            let mut rec = Recorded::without_body(seq, shared.started.elapsed(), &head, 403);
+            let mut rec = Recorded::of(seq, shared.started.elapsed(), &head, values, 403);
             rec.api = Some(
                 if head.form == Form::Tunnel {
                     "connect"
@@ -365,8 +388,8 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
                 }
                 .to_owned(),
             );
-            state.requests.push(rec);
-            drop(state);
+            rec.body = body;
+            lock(&shared.state).requests.push(rec);
             let sent = respond_keep(
                 stream,
                 &Response::error(403, "the scripted model reaches nothing else"),
@@ -377,12 +400,12 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         }
         if is_hello(&head) {
             let mut state = lock(&shared.state);
-            let Some(seq) = reserve(&mut state, &shared.limits, &head, 0) else {
+            let Some(seq) = reserve(&mut state, &shared.limits, meta, 0) else {
                 drop(state);
                 respond(stream, &full());
                 return;
             };
-            let mut rec = Recorded::without_body(seq, shared.started.elapsed(), &head, 200);
+            let mut rec = Recorded::of(seq, shared.started.elapsed(), &head, values, 200);
             rec.api = Some("hello".to_owned());
             state.requests.push(rec);
             drop(state);
@@ -401,15 +424,16 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         if !shared.token.admits(&head) {
             let mut state = lock(&shared.state);
             state.outcome.bad_token += 1;
-            let Some(seq) = reserve(&mut state, &shared.limits, &head, 0) else {
+            let Some(seq) = reserve(&mut state, &shared.limits, meta, 0) else {
                 drop(state);
                 respond(stream, &full());
                 return;
             };
-            state.requests.push(Recorded::without_body(
+            state.requests.push(Recorded::of(
                 seq,
                 shared.started.elapsed(),
                 &head,
+                values,
                 401,
             ));
             drop(state);
@@ -428,7 +452,7 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
         };
         let seq = {
             let mut state = lock(&shared.state);
-            let Some(seq) = reserve(&mut state, &shared.limits, &head, head.content_length) else {
+            let Some(seq) = reserve(&mut state, &shared.limits, meta, head.content_length) else {
                 drop(state);
                 respond(stream, &full());
                 return;
@@ -472,19 +496,11 @@ fn serve_connection<S: Read + Write>(shared: &Shared, stream: &mut S) {
                 (_, Some(Pick::Exhausted)) => state.outcome.exhausted += 1,
                 _ => {}
             }
-            state.requests.push(Recorded {
-                seq,
-                at_ms: millis(shared.started.elapsed()),
-                method: head.method.clone(),
-                path: head.path.clone(),
-                query: head.query.clone(),
-                headers: head.header_names.clone(),
-                status,
-                answered: false,
-                api: api.map(|a| a.name().to_owned()),
-                pick: pick.map(Pick::name),
-                body,
-            });
+            let mut rec = Recorded::of(seq, shared.started.elapsed(), &head, values, status);
+            rec.api = api.map(|a| a.name().to_owned());
+            rec.pick = pick.map(Pick::name);
+            rec.body = body;
+            state.requests.push(rec);
         }
         if let Some(name) = barrier {
             if !wait_released(shared, &name) {
@@ -541,19 +557,14 @@ fn is_hello(head: &http::Head) -> bool {
     head.method == "HEAD" && head.path == "/api/hello" && head.content_length == 0
 }
 
-/// Room in the run for one more record of `head` with a body of `body`
-/// bytes: the next sequence number, with the record, its metadata and its
-/// body counted; or `None`, with the run marked incomplete, when any of
-/// the three caps would be passed. Every path that records a request
-/// comes through here first, so nothing a request sends grows the run
-/// past its caps.
-fn reserve(state: &mut State, limits: &Limits, head: &http::Head, body: usize) -> Option<u64> {
-    let meta = super::meta_len(
-        &head.method,
-        &head.path,
-        head.query.as_deref(),
-        &head.header_names,
-    ) as u64;
+/// Room in the run for one more record whose metadata counts `meta`
+/// bytes ([`Recorded::meta_len`]) with a body of `body` bytes: the next
+/// sequence number, with the record, its metadata and its body counted;
+/// or `None`, with the run marked incomplete, when any of the three caps
+/// would be passed. Every path that records a request comes through here
+/// first, so nothing a request sends grows the run past its caps.
+fn reserve(state: &mut State, limits: &Limits, meta: usize, body: usize) -> Option<u64> {
+    let meta = meta as u64;
     // Reservations, not records: a request holds its place from here,
     // while its body is still being read, so connections that reserve at
     // the same time cannot pass the cap between them.
@@ -575,10 +586,6 @@ fn reserve(state: &mut State, limits: &Limits, head: &http::Head, body: usize) -
 /// The refusal once the run has recorded all it may.
 fn full() -> Response {
     Response::error(503, "the run has recorded all it may")
-}
-
-fn millis(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The reply to a request for `api`: the body parsed as JSON and handed

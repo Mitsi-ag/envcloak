@@ -624,6 +624,96 @@ fn every_request_meant_for_a_proxy_is_refused_and_recorded() {
             .iter()
             .all(|r| r.query.is_none() && r.answered)
     );
+    let forwards: Vec<&[u8]> = report.requests.iter().map(|r| &r.forward[..]).collect();
+    assert_eq!(
+        forwards,
+        [
+            &b""[..],
+            b"http://b.example/MARK?MARK",
+            b"http://c.example:8080/"
+        ]
+    );
+}
+
+/// A request to forward is recorded whole: its target as sent (path and
+/// query included), its header values and its body, which is read (up to
+/// the body cap) and counted like any other (Codex review, medium: the
+/// path, query and body of a refused proxy request were dropped, so a
+/// value there was never swept). The run stays clean: a refusal is what
+/// the stub does with every request meant for a proxy.
+#[test]
+fn a_request_to_forward_is_recorded_whole_with_its_header_values_and_body() {
+    let stub = start();
+    let body = b"MARK-BODY-1";
+    let mut request = format!(
+        "POST http://b.example/MARK-P?MARK-Q HTTP/1.1\r\nHost: b.example\r\n\
+         X-Leak: MARK-H\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    let got = send(stub.addr(), &request).unwrap();
+    assert_eq!(got.status, 403);
+    assert!(!String::from_utf8_lossy(&got.body).contains("MARK"));
+    let report = stub.finish().unwrap();
+    assert!(report.outcome.clean(), "{:?}", report.outcome);
+    assert_eq!(report.outcome.recorded_bytes, body.len() as u64);
+    let r = &report.requests[0];
+    assert_eq!(r.api.as_deref(), Some("proxy"));
+    assert_eq!(r.path, "b.example:80");
+    assert_eq!(&r.forward[..], b"http://b.example/MARK-P?MARK-Q");
+    assert_eq!(&r.body[..], body);
+    let values: Vec<&[u8]> = r.values.iter().map(|v| &v[..]).collect();
+    assert_eq!(values, [&b"b.example"[..], b"MARK-H", b"11"]);
+    assert_eq!(r.headers, ["host", "x-leak", "content-length"]);
+    // Debug shows none of it.
+    let shown = format!("{r:?}");
+    assert!(!shown.contains("MARK"), "{shown}");
+}
+
+/// Every header's value is recorded, in order (Codex review, medium: a
+/// value in a request's header was discarded): a header a host made up,
+/// on a request the script served, and the credentials of a refused
+/// token as they were sent. A credential that presents the run's token
+/// is recorded as `<token>`, so the token is in no record; the token
+/// itself is checked against what was sent, never the record.
+#[test]
+fn header_values_are_recorded_and_the_run_s_token_is_not() {
+    let stub = start();
+    let token = stub.token().as_str().to_owned();
+    let auth = format!("{}{}X-Leak:  MARK-VALUE \r\n", key(&stub), bearer(&stub));
+    let got = send(
+        stub.addr(),
+        &post("/v1/messages", &auth, &messages_body("x")),
+    )
+    .unwrap();
+    assert_eq!(got.status, 200);
+    let wrong = "x-api-key: MARK-WRONG\r\n";
+    let got = send(stub.addr(), &post("/v1/messages", wrong, b"{}")).unwrap();
+    assert_eq!(got.status, 401);
+    let report = stub.finish().unwrap();
+    let value = |r: &envcloak_agents::probe::model::Recorded, name: &str| -> Vec<u8> {
+        let at = r.headers.iter().position(|h| h == name).unwrap();
+        r.values[at].to_vec()
+    };
+    let served = &report.requests[0];
+    assert_eq!(served.values.len(), served.headers.len());
+    assert_eq!(value(served, "x-leak"), b"MARK-VALUE");
+    assert_eq!(value(served, "x-api-key"), b"<token>");
+    assert_eq!(value(served, "authorization"), b"Bearer <token>");
+    assert_eq!(value(served, "host"), b"127.0.0.1");
+    let refused = &report.requests[1];
+    assert_eq!(refused.status, 401);
+    assert_eq!(value(refused, "x-api-key"), b"MARK-WRONG");
+    assert!(refused.body.is_empty());
+    for r in &report.requests {
+        for v in &r.values {
+            assert!(!v.windows(token.len()).any(|w| w == token.as_bytes()));
+        }
+    }
+    let meta: u64 = report.requests.iter().map(|r| r.meta_len() as u64).sum();
+    assert_eq!(report.outcome.recorded_meta, meta);
+    assert!(meta > (2 * RECORD_OVERHEAD + "MARK-VALUE".len()) as u64);
 }
 
 /// Python's own `urllib`, pointed at the stub by its proxy variables, for

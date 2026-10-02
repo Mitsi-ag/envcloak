@@ -15,20 +15,25 @@
 //!   `Content-Length` bodies only, at most 4 MiB a body and 16 MiB recorded
 //!   in all, after which the run is *incomplete* and says why ([`Outcome`]);
 //! - records at most 1,024 requests and 1 MiB of what describes them
-//!   (method, target, header names), whatever path a request takes (a
-//!   refused token, a tunnel, Claude Code's connectivity check), then
-//!   refuses the rest and is incomplete;
+//!   (method, target, header names and values, a forwarded request's
+//!   whole target), whatever path a request takes (a refused token, a
+//!   tunnel, Claude Code's connectivity check), then refuses the rest and
+//!   is incomplete;
 //! - answers `POST /v1/messages` (Anthropic Messages) and `POST
 //!   /v1/responses` (OpenAI Responses) from a [`Script`] ([`wire`]), and any
 //!   other path `404`, recording it, so a host that calls something new
 //!   fails the run loudly instead of being half served;
 //! - refuses a request meant for a proxy, a tunnel (`CONNECT host:port`)
 //!   or a request to forward (an absolute `http://` or `https://` target),
-//!   in HTTP/1.1 or 1.0, and records the `host:port` it names, so with a
-//!   host's proxy variables pointed at it a run shows every other place
-//!   the host tried to reach;
-//! - records every request it accepts with its whole body, held in wiping
-//!   buffers and wiped when the run ends.
+//!   in HTTP/1.1 or 1.0, and records the `host:port` it names, the whole
+//!   target of a request to forward and its body, so with a host's proxy
+//!   variables pointed at it a run shows every other place the host tried
+//!   to reach and everything it sent there;
+//! - records every request it accepts with every header's value and its
+//!   whole body (a refused token's body is never read, and fails the
+//!   run), held in wiping buffers and wiped when the run ends. A
+//!   credential header that presents the run's token is recorded with
+//!   `<token>` in its place.
 //!
 //! The program is driven over its standard input and output, never over
 //! the network: the first line in is the script as JSON; the first line
@@ -39,8 +44,10 @@
 //! of input, ends the run with a last line whose `final` is true. The
 //! program exits 0 when the run was complete, 3 when it was not or its
 //! last line was not read within 10 s (the records are wiped either way),
-//! and 2 on a usage error. A request's body is base64 in `body`; its headers are
-//! listed by name, never by value. [`ModelStub`] is the client side.
+//! and 2 on a usage error. A request's body is base64 in `body`, its
+//! header names are in `headers` and their values, base64, in `values`,
+//! and a forwarded request's whole target is base64 in `forward`.
+//! [`ModelStub`] is the client side.
 //!
 //! The pinned hosts the wire protocols are qualified against are in
 //! [`QUALIFIED`]: a host version outside it is `not_qualified`, which
@@ -122,8 +129,9 @@ pub struct Limits {
     /// The most requests the run records, whatever their path (1,024).
     pub records: usize,
     /// The most bytes of request metadata the run records in all (1 MiB):
-    /// each record's method, path, query and header names, and
-    /// [`RECORD_OVERHEAD`] for the record itself.
+    /// each record's method, path, query, header names and values, a
+    /// forwarded request's whole target, and [`RECORD_OVERHEAD`] for the
+    /// record itself.
     pub meta: usize,
 }
 
@@ -186,6 +194,29 @@ impl Token {
     fn equals(&self, presented: &[u8]) -> bool {
         let mine = self.0.as_bytes();
         mine.len() == presented.len() && bool::from(mine.ct_eq(presented))
+    }
+
+    /// What a record keeps of `head`'s header values: each as it was
+    /// sent, except a credential header that presents this token, which
+    /// keeps `<token>` in its place (`Bearer <token>` for
+    /// `Authorization`). A credential that is anything else is kept as
+    /// sent, so a value put there is swept like any other.
+    pub fn recorded_values(&self, head: &http::Head) -> Vec<Zeroizing<Vec<u8>>> {
+        head.header_names
+            .iter()
+            .zip(&head.header_values)
+            .map(|(name, value)| match name.as_str() {
+                "x-api-key" if self.equals(value) => Zeroizing::new(b"<token>".to_vec()),
+                "authorization"
+                    if value
+                        .strip_prefix(b"Bearer ")
+                        .is_some_and(|t| self.equals(t)) =>
+                {
+                    Zeroizing::new(b"Bearer <token>".to_vec())
+                }
+                _ => value.clone(),
+            })
+            .collect()
     }
 
     /// Whether `head` presents this token, in every credential header it
@@ -313,8 +344,16 @@ pub struct Recorded {
     pub path: String,
     /// The target's query.
     pub query: Option<String>,
-    /// Its header names, lower-cased, in order; never their values.
+    /// Its header names, lower-cased, in order.
     pub headers: Vec<String>,
+    /// Their values, in the same order, base64 on the wire
+    /// ([`Token::recorded_values`]: the run's token is not among them).
+    #[serde(with = "b64_list")]
+    pub values: Vec<Zeroizing<Vec<u8>>>,
+    /// A request to forward's whole target as sent (empty for any other
+    /// request), base64 on the wire.
+    #[serde(with = "b64")]
+    pub forward: Zeroizing<Vec<u8>>,
     /// The status it is answered with.
     pub status: u16,
     /// Whether that answer was sent whole. A reply held on a barrier is
@@ -329,7 +368,7 @@ pub struct Recorded {
     /// What the script gave it: `step <n>`, `side`, `exhausted` or
     /// `mismatch`.
     pub pick: Option<String>,
-    /// The whole body (empty for a refused request, whose body is never
+    /// The whole body (empty for a refused token, whose body is never
     /// read), base64 on the wire.
     #[serde(with = "b64")]
     pub body: Zeroizing<Vec<u8>>,
@@ -355,13 +394,26 @@ impl fmt::Debug for Recorded {
             .field("api", &self.api)
             .field("pick", &self.pick)
             .field("headers", &headers)
+            .field(
+                "value_bytes",
+                &self.values.iter().map(|v| v.len()).sum::<usize>(),
+            )
+            .field("forward_len", &self.forward.len())
             .field("body_len", &self.body.len())
             .finish_non_exhaustive()
     }
 }
 
 impl Recorded {
-    fn without_body(seq: u64, at: Duration, head: &http::Head, status: u16) -> Recorded {
+    /// The record of `head`, with `values` ([`Token::recorded_values`])
+    /// and no body yet.
+    fn of(
+        seq: u64,
+        at: Duration,
+        head: &http::Head,
+        values: Vec<Zeroizing<Vec<u8>>>,
+        status: u16,
+    ) -> Recorded {
         Recorded {
             seq,
             at_ms: u64::try_from(at.as_millis()).unwrap_or(u64::MAX),
@@ -369,6 +421,8 @@ impl Recorded {
             path: head.path.clone(),
             query: head.query.clone(),
             headers: head.header_names.clone(),
+            values,
+            forward: head.forward.clone().unwrap_or_default(),
             status,
             answered: false,
             api: None,
@@ -384,6 +438,8 @@ impl Recorded {
             &self.path,
             self.query.as_deref(),
             &self.headers,
+            &self.values,
+            &self.forward,
         )
     }
 
@@ -393,14 +449,23 @@ impl Recorded {
     }
 }
 
-/// What a request with this method, path, query and header names counts
-/// against [`Limits::meta`].
-fn meta_len(method: &str, path: &str, query: Option<&str>, headers: &[String]) -> usize {
+/// What a request with this method, path, query, header names and
+/// values and forwarded target counts against [`Limits::meta`].
+fn meta_len(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &[String],
+    values: &[Zeroizing<Vec<u8>>],
+    forward: &[u8],
+) -> usize {
     RECORD_OVERHEAD
         + method.len()
         + path.len()
         + query.map_or(0, str::len)
         + headers.iter().map(String::len).sum::<usize>()
+        + values.iter().map(|v| v.len()).sum::<usize>()
+        + forward.len()
 }
 
 /// A run's report, as the program writes it.
@@ -422,6 +487,42 @@ struct ReportRef<'a> {
     last: bool,
     requests: &'a [Recorded],
     outcome: &'a Outcome,
+}
+
+mod b64_list {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::ser::SerializeSeq as _;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+    use zeroize::Zeroizing;
+
+    pub(super) fn serialize<S: Serializer>(
+        v: &[Zeroizing<Vec<u8>>],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for item in v {
+            let text = Zeroizing::new(STANDARD.encode(item.as_slice()));
+            seq.serialize_element(text.as_str())?;
+        }
+        seq.end()
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<Zeroizing<Vec<u8>>>, D::Error> {
+        let texts: Vec<String> = Vec::deserialize(d)?;
+        texts
+            .into_iter()
+            .map(|t| {
+                let t = Zeroizing::new(t);
+                STANDARD
+                    .decode(t.as_bytes())
+                    .map(Zeroizing::new)
+                    .map_err(|_| D::Error::custom("a header value that is not base64"))
+            })
+            .collect()
+    }
 }
 
 mod b64 {

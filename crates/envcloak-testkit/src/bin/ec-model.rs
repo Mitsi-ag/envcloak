@@ -30,7 +30,8 @@
 //! for a look at what the host wrote (its path is printed).
 //!
 //! When COMMAND has ended, the run is stopped and its report (every
-//! request with its body, and the outcome) is written to the `--record`
+//! request with its header values, a forwarded request's whole target and
+//! its body, and the outcome) is written to the `--record`
 //! file as JSON: a new file, made with mode 0600 before COMMAND starts; a
 //! path that already exists, a symbolic link included, is refused (L-12:
 //! the record holds every body whole). Give it a path outside any home a
@@ -208,11 +209,14 @@ fn main() -> ExitCode {
             .requests
             .iter()
             .map(|r| {
+                let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+                let values: Vec<String> = r.header_values.iter().map(|v| lossy(v)).collect();
                 serde_json::json!({
                     "seq": r.seq, "at_ms": r.at_ms, "method": r.method, "path": r.path,
-                    "query": r.query, "headers": r.headers, "status": r.status,
+                    "query": r.query, "headers": r.headers, "values": values,
+                    "forward": lossy(&r.forward), "status": r.status,
                     "answered": r.answered, "api": r.api, "pick": r.pick,
-                    "body": String::from_utf8_lossy(&r.body),
+                    "body": lossy(&r.body),
                 })
             })
             .collect();
