@@ -694,9 +694,6 @@ fn debug_output_names_no_argument() {
     assert!(shown.contains("argc: Some(1)"), "{shown}");
 }
 
-/// A `KERN_PROCARGS2` buffer as `exec` lays it out: argc, the executable's
-/// path, its NUL and NULs to the next multiple of [`PROCARGS_ALIGN`], then
-/// the arguments and the environment, each NUL-terminated.
 /// A child of this test that exits when its standard input closes.
 fn exits_on_eof() -> Child {
     Command::new("/bin/sh")
@@ -797,6 +794,9 @@ fn the_state_letter_is_read_after_the_last_parenthesis() {
     }
 }
 
+/// A `KERN_PROCARGS2` buffer as `exec` lays it out: argc, the executable's
+/// path, its NUL and NULs to the next multiple of [`PROCARGS_ALIGN`], then
+/// the arguments and the environment, each NUL-terminated.
 fn procargs(argc: usize, path: &[u8], args: &[Vec<u8>], env: &[Vec<u8>]) -> Vec<u8> {
     let mut b = i32::try_from(argc).unwrap().to_ne_bytes().to_vec();
     b.extend_from_slice(path);
