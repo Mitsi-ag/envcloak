@@ -1744,6 +1744,65 @@ fn a_lock_stops_a_call_in_flight() {
     }
 }
 
+/// A lock waits for a chunk on its way out (SPEC §5 "Lock"): stopped by a
+/// barrier in `read` after the chunk passed its last check, before its
+/// answer is written, the vault is locked from another connection. The
+/// lock either says it waits for the chunk or answers; the barrier is then
+/// lifted. The chunk, which passed its check before the lock, is
+/// delivered, and the daemon's test trace shows its answer written before
+/// the lock answered. The lease is then ended.
+#[test]
+fn a_lock_waits_for_a_chunk_on_its_way_out() {
+    let mut f = Fixture::pausing(Some("backup.v2.deliver"));
+    let files = [Spec::made(&f.claude("projects/p/w.jsonl"), 300, 23)];
+    let id = f.backup("scrub", &files);
+    let lease = f.open(&id, false, true).unwrap().lease;
+    let reading = {
+        let (paths, lease) = (f.paths(), lease.clone());
+        std::thread::spawn(move || Client::connect(&paths)?.backup_v2_read(&lease, 0, 0))
+    };
+    f.wait_paused("backup.v2.deliver");
+    let locking = {
+        let paths = f.paths();
+        std::thread::spawn(move || Client::connect(&paths)?.lock())
+    };
+    let waits = "envcloak test: a lock waits for a chunk on its way out";
+    let end = Instant::now() + Duration::from_secs(30);
+    while !locking.is_finished() && !String::from_utf8_lossy(&f.d.log_bytes()).contains(waits) {
+        assert!(Instant::now() < end, "the lock neither waited nor answered");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    f.release();
+    let got = reading
+        .join()
+        .unwrap()
+        .expect("a chunk checked before the lock was not delivered");
+    assert!(got.data.as_secret().ct_eq(&files[0].chunk(f.files_cs(), 0)));
+    assert!(locking.join().unwrap().unwrap().was_unlocked);
+    let (written, answered) = (
+        "envcloak test: backup.v2 chunk written",
+        "envcloak test: lock answered",
+    );
+    for line in [written, answered] {
+        assert!(
+            f.d.wait_for_log(line, Duration::from_secs(30)),
+            "never in the trace: {line}"
+        );
+    }
+    let log = String::from_utf8_lossy(&f.d.log_bytes()).into_owned();
+    let (written, answered) = (log.find(written).unwrap(), log.find(answered).unwrap());
+    assert!(
+        written < answered,
+        "the lock answered while a chunk checked before it was still on its way out"
+    );
+    let e = Client::connect(&f.paths())
+        .unwrap()
+        .backup_v2_read(&lease, 0, 0)
+        .unwrap_err();
+    assert_eq!(rpc(e).0, ErrorKind::NoSuchLease);
+    f.sweep();
+}
+
 /// A lease is bound to the terminal its proof came from (D-07): a process
 /// that opened one and then moved to another terminal (a new session on a
 /// pseudo-terminal of its own), or to none, is the same process instance

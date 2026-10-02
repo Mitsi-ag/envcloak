@@ -118,6 +118,8 @@ pub fn recover(
         }
         (generation, s.paths().clone())
     };
+    // As every lock: no restore chunk checked before it is still going out.
+    crate::backups::wait_for_deliveries(shared);
     let result = restore_backup(&paths, backup, &kit, &new_pass);
     drop((kit, new_pass));
     let wrong_kit = matches!(
