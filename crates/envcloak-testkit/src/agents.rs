@@ -919,9 +919,11 @@ impl AgentHome {
             cwds: std::sync::Mutex::new(Vec::new()),
             shared_tmp: PathBuf::from("/tmp"),
         };
-        if host == Host::Codex {
-            std::fs::create_dir_all(a.codex_home())
-                .unwrap_or_else(|e| panic!("create CODEX_HOME: {e}"));
+        match host {
+            Host::Codex => std::fs::create_dir_all(a.codex_home())
+                .unwrap_or_else(|e| panic!("create CODEX_HOME: {e}")),
+            Host::ClaudeCode => std::fs::create_dir_all(a.claude_tmp())
+                .unwrap_or_else(|e| panic!("create CLAUDE_CODE_TMPDIR: {e}")),
         }
         a
     }
@@ -946,12 +948,14 @@ impl AgentHome {
         self.home_dir().join(".codex")
     }
 
-    /// Where Claude Code makes its per-user temporary directory: the
-    /// home's `tmp/`, by `CLAUDE_CODE_TMPDIR`. Without it, 2.1.280 makes
-    /// it in `/tmp` whatever `TMPDIR` says, outside the home, where a
-    /// running command's output then lands.
+    /// Where Claude Code makes its per-user temporary directory and its
+    /// Bash tool's working-directory files: `claude-tmp/` in the test
+    /// root, by `CLAUDE_CODE_TMPDIR`, apart from `TMPDIR` (the root's
+    /// `tmp/`), so a run shows which of the two the host follows. Without
+    /// it, 2.1.280 uses `/tmp` whatever `TMPDIR` says, outside the home,
+    /// where a running command's output then lands.
     pub fn claude_tmp(&self) -> PathBuf {
-        self.root.join("tmp")
+        self.root.join("claude-tmp")
     }
 
     /// Where this home's host stores are (see

@@ -342,8 +342,11 @@ fn claude_code_keeps_a_running_command_s_output_in_its_temporary_store() {
         format!("ecrun-{:016x}{:016x}", fresh_seed(), fresh_seed()),
     );
     let release = a.root().join("release");
+    // Where the Bash tool has the shell write its working directory when
+    // the command ends: the last word of the shell's own arguments
+    // (`... && pwd -P >| <file>`, verifier, low).
     let shell = format!(
-        "{}; {}",
+        "{}; printf '%s%s%s%s\\n' 'CWD' 'FILE[' \"$(ps -ww -o args= -p $$ | awk '{{print $NF}}')\" ']END'; {}",
         print_split(&[control.as_str()]),
         barrier(&release, a.root(), 1200)
     );
@@ -379,6 +382,46 @@ fn claude_code_keeps_a_running_command_s_output_in_its_temporary_store() {
         "the command did not end by its release"
     );
     let after = Sweep::host_stores(&a, &cs, &[&run.model]);
+    let said = last_tool_output(&body_of(&run, "step 1"));
+    let cwd_file = said
+        .split("CWDFILE[")
+        .nth(1)
+        .and_then(|r| r.split("]END").next())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| panic!("the shell's arguments were not shown: {said}"));
+    // As docs/AGENTS.md records: directly in CLAUDE_CODE_TMPDIR (which
+    // the harness keeps apart from TMPDIR), named as the sweep's
+    // `claude/cwd` store expects, and gone once the host has read it.
+    let name = cwd_file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let left = std::fs::symlink_metadata(&cwd_file).is_ok();
+    measure(
+        &a,
+        "the Bash tool's working-directory file",
+        format!(
+            "in {} ({name}); there after the command: {left}",
+            if cwd_file.parent() == Some(a.claude_tmp().as_path()) {
+                "CLAUDE_CODE_TMPDIR"
+            } else {
+                "neither CLAUDE_CODE_TMPDIR nor where it was seen"
+            },
+        ),
+    );
+    assert_eq!(
+        cwd_file.parent(),
+        Some(a.claude_tmp().as_path()),
+        "the working-directory file is not in CLAUDE_CODE_TMPDIR"
+    );
+    assert!(
+        envcloak_testkit::transcripts::is_claude_cwd_file(&name),
+        "{name}"
+    );
+    assert!(
+        !left,
+        "the working-directory file was left after the command"
+    );
     measure(
         &a,
         "a running Bash command's printed output in claude/tmp",

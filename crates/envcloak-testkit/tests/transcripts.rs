@@ -27,7 +27,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use envcloak_testkit::agents::{Host, ModelReport, ModelRequest};
 use envcloak_testkit::transcripts::{
-    Hits, HostDirs, OTHER, claude_tmp_dir, host_roots, sweep_model, sweep_stores, transcript_roots,
+    Hits, HostDirs, OTHER, claude_tmp_dir, host_roots, is_claude_cwd_file, sweep_model,
+    sweep_stores, transcript_roots,
 };
 use envcloak_testkit::{Canary, Hit, TestHome, by_label, canaries, fresh_seed, labels};
 use zeroize::Zeroizing;
@@ -73,6 +74,10 @@ const CLAUDE_TMP: &[(&str, &str)] = &[
     ),
     ("claude/tmp", "-tmp-acme/9a/tasks/b2.output"),
 ];
+
+/// The same for the working-directory file Claude Code's Bash tool has
+/// a command's shell write directly in `CLAUDE_CODE_TMPDIR` (or `/tmp`).
+const CLAUDE_CWD: &[(&str, &str)] = &[("claude/cwd", "claude-f2cb-cwd")];
 
 /// The same for Codex, relative to `$CODEX_HOME` (`~/.codex`).
 const CODEX: &[(&str, &str)] = &[
@@ -467,6 +472,25 @@ fn every_canary_planted_in_claude_code_s_temporary_store_is_found_there_in_every
     });
 }
 
+/// Claude Code 2.1.280's Bash tool has each command's shell write its
+/// working directory to `claude-<4 hex>-cwd` beside that directory
+/// (verifier, low: outside HOME, and in no store list): its control. A
+/// file there of any other name is not the host's.
+#[test]
+fn every_canary_planted_in_claude_code_s_working_directory_file_is_found_there() {
+    every_store(Host::ClaudeCode, CLAUDE_CWD, |h| h.root().join("tmp"));
+    for (name, is) in [
+        ("claude-f2cb-cwd", true),
+        ("claude-0-cwd", true),
+        ("claude--cwd", false),
+        ("claude-xyz-cwd", false),
+        ("claude-f2cb-cwd.tmp", false),
+        ("other-f2cb-cwd", false),
+    ] {
+        assert_eq!(is_claude_cwd_file(name), is, "{name}");
+    }
+}
+
 #[test]
 fn every_canary_planted_in_every_codex_store_is_found_there_in_every_encoding() {
     every_store(Host::Codex, CODEX, |h| h.home().join(".codex"));
@@ -603,6 +627,9 @@ fn the_negative_control_is_clean() {
     }
     for (_, rel) in CLAUDE_TMP {
         plant(&claude_tmp_dir(&home.root().join("tmp")).join(rel), &others);
+    }
+    for (_, rel) in CLAUDE_CWD {
+        plant(&home.root().join("tmp").join(rel), &others);
     }
     for host in [Host::ClaudeCode, Host::Codex] {
         let hits = sweep(host, &home, &cs);

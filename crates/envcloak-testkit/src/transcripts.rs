@@ -118,10 +118,12 @@ pub fn claude_tmp_dir(tmp: &Path) -> PathBuf {
 
 /// What a sweep of `host` reads: each directory, and which files under
 /// it are the host's. Claude Code keeps `~/.claude/` and, beside it in
-/// `HOME`, `.claude.json` and its backups, and its per-user temporary
-/// directory ([`claude_tmp_dir`]); Codex keeps `$CODEX_HOME`. Anything
-/// else in `HOME` (a project, a fixture) is not a host store; the tests
-/// sweep the whole home separately.
+/// `HOME`, `.claude.json` and its backups; its per-user temporary
+/// directory ([`claude_tmp_dir`]); and, beside that, the file its Bash
+/// tool has each command's shell write its working directory into
+/// ([`is_claude_cwd_file`]). Codex keeps `$CODEX_HOME`. Anything else in
+/// `HOME` (a project, a fixture) is not a host store; the tests sweep the
+/// whole home separately.
 pub fn host_roots(host: Host, dirs: &HostDirs) -> Vec<(PathBuf, HostFiles)> {
     match host {
         Host::ClaudeCode => vec![
@@ -132,9 +134,27 @@ pub fn host_roots(host: Host, dirs: &HostDirs) -> Vec<(PathBuf, HostFiles)> {
                 },
             ),
             (claude_tmp_dir(&dirs.claude_tmp), HostFiles::All),
+            (
+                dirs.claude_tmp.clone(),
+                HostFiles::ClaudeCwd {
+                    tmp: dirs.claude_tmp.clone(),
+                },
+            ),
         ],
         Host::Codex => vec![(dirs.codex_home.clone(), HostFiles::All)],
     }
+}
+
+/// Whether `name` is the file Claude Code 2.1.280's Bash tool has a
+/// command's shell write its working directory into when the command
+/// ends (`... && pwd -P >| <tmp>/claude-<4 hex>-cwd`): directly in
+/// `CLAUDE_CODE_TMPDIR`, or `/tmp` without it (not `TMPDIR`), and removed
+/// once the host has read it. It holds a path, not what the command
+/// printed; a host stopped half way can leave it.
+pub fn is_claude_cwd_file(name: &str) -> bool {
+    name.strip_prefix("claude-")
+        .and_then(|r| r.strip_suffix("-cwd"))
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Which files under a host's root are the host's.
@@ -144,6 +164,10 @@ pub enum HostFiles {
     All,
     /// `<home>/.claude/` and `<home>/.claude.json*`.
     Claude { home: PathBuf },
+    /// Claude Code's working-directory files directly in `<tmp>`
+    /// ([`is_claude_cwd_file`]); not the per-user directory beside them,
+    /// which is a root of its own.
+    ClaudeCwd { tmp: PathBuf },
 }
 
 impl HostFiles {
@@ -154,6 +178,7 @@ impl HostFiles {
         match self {
             HostFiles::All => true,
             HostFiles::Claude { home } => self.has(path) || home.join(".claude").starts_with(path),
+            HostFiles::ClaudeCwd { tmp } => self.has(path) || tmp.starts_with(path),
         }
     }
 
@@ -166,6 +191,12 @@ impl HostFiles {
                         && file
                             .file_name()
                             .is_some_and(|n| n.to_string_lossy().starts_with(".claude.json")))
+            }
+            HostFiles::ClaudeCwd { tmp } => {
+                file.parent() == Some(tmp.as_path())
+                    && file
+                        .file_name()
+                        .is_some_and(|n| is_claude_cwd_file(&n.to_string_lossy()))
             }
         }
     }
@@ -286,6 +317,16 @@ pub fn transcript_roots(host: Host, dirs: &HostDirs) -> Vec<Store> {
                 "claude/tmp",
                 claude_tmp_dir(&dirs.claude_tmp),
                 Dir,
+                Transient,
+                "observed",
+            ),
+            // Beside it: `claude-<4 hex>-cwd`, the working directory a
+            // Bash command's shell wrote when it ended (a path, not its
+            // output), removed once the host has read it (verifier, low).
+            s(
+                "claude/cwd",
+                dirs.claude_tmp.clone(),
+                Named("-cwd"),
                 Transient,
                 "observed",
             ),
