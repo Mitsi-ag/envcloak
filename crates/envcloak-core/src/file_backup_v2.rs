@@ -1054,7 +1054,43 @@ fn chunk_record_len(size: u64, chunk: u64) -> u64 {
     4 + chunk_len(size, chunk).map_or(0, |n| n as u64) + Sealed::OVERHEAD as u64
 }
 
+/// What opening this vault's backups v2 takes of it, held apart from it:
+/// a copy of the `backup` subkey (wiped when this is dropped), the ids
+/// the records are bound to and the paths. For a caller that opens
+/// backups without holding the vault, as the daemon does outside its
+/// state lock. Its `Debug` shows no key.
+pub struct FileBackupsV2 {
+    key: SubKey,
+    vault_id: VaultId,
+    schema_version: u16,
+    epoch: u32,
+    paths: VaultPaths,
+}
+
+impl core::fmt::Debug for FileBackupsV2 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FileBackupsV2")
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Vault {
+    /// This vault's backups v2, to open apart from it.
+    ///
+    /// # Errors
+    /// [`VaultErrorKind::Tampered`] unless the vault verified.
+    pub fn file_backups_v2(&self) -> Result<FileBackupsV2, VaultError> {
+        self.header()?;
+        Ok(FileBackupsV2 {
+            key: self.keys().key(Purpose::Backup).duplicate(),
+            vault_id: self.vault_id(),
+            schema_version: self.schema_version(),
+            epoch: self.epoch(),
+            paths: self.paths().clone(),
+        })
+    }
+
     /// Opens backup `id` for reading. See the module documentation.
     ///
     /// # Errors
@@ -1062,8 +1098,22 @@ impl Vault {
     /// purged), [`VaultErrorKind::BackupDamaged`] when its header, key,
     /// metadata or layout is not the one a whole backup of this vault has.
     pub fn open_file_backup_v2(&self, id: &FileBackupId) -> Result<FileBackupV2Reader, VaultError> {
-        self.header()?;
-        let dir = find_backup_v2(self.paths(), id)?.ok_or(VaultErrorKind::NotFound)?;
+        self.file_backups_v2()?.open(id)
+    }
+}
+
+impl FileBackupsV2 {
+    /// The vault's paths.
+    pub fn paths(&self) -> &VaultPaths {
+        &self.paths
+    }
+
+    /// As [`Vault::open_file_backup_v2`].
+    ///
+    /// # Errors
+    /// As [`Vault::open_file_backup_v2`].
+    pub fn open(&self, id: &FileBackupId) -> Result<FileBackupV2Reader, VaultError> {
+        let dir = find_backup_v2(&self.paths, id)?.ok_or(VaultErrorKind::NotFound)?;
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1091,15 +1141,18 @@ impl Vault {
         // before it, for their 7 days. A newer schema's is not this
         // build's to read.
         if h.id != *id
-            || h.vault_id != self.vault_id().0
-            || h.epoch != self.epoch()
-            || h.schema_version > self.schema_version()
+            || h.vault_id != self.vault_id.0
+            || h.epoch != self.epoch
+            || h.schema_version > self.schema_version
         {
             return Err(damaged());
         }
         let ctx = Ctx {
+            vault_id: self.vault_id,
             schema_version: h.schema_version,
-            ..Ctx::of(self, h.id, h.created_at)
+            epoch: self.epoch,
+            id: h.id,
+            created_at: h.created_at,
         };
         let (wrapped, chunks_at) = read_record_at(
             &file,
@@ -1108,13 +1161,8 @@ impl Vault {
             Some(32 + Sealed::OVERHEAD),
         )?;
         let wrapped = Sealed::from_bytes(&wrapped).map_err(|_| damaged())?;
-        let key = open_subkey(
-            self.keys().key(Purpose::Backup),
-            &ctx.aad(Rec::Key),
-            &wrapped,
-            Purpose::Backup,
-        )
-        .map_err(|_| damaged())?;
+        let key = open_subkey(&self.key, &ctx.aad(Rec::Key), &wrapped, Purpose::Backup)
+            .map_err(|_| damaged())?;
         if len < chunks_at + TRAILER_LEN as u64 {
             return Err(damaged());
         }
@@ -1163,7 +1211,9 @@ impl Vault {
             layout,
         })
     }
+}
 
+impl Vault {
     /// Records what the change left in file `file` of backup `id`: its
     /// SHA-256, sealed under the backup's key in a file of its own,
     /// written and flushed under a temporary name, then published under

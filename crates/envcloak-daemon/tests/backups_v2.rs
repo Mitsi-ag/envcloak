@@ -1631,3 +1631,59 @@ fn a_backup_keeps_only_permission_bits() {
     assert_eq!(kept, [0o755, 0o700, 0o777, 0o640, 0o640]);
     f.sweep();
 }
+
+/// One root holds at most four backups in progress, so no agent can take
+/// every slot: a fifth `begin` from this terminal's session, this process
+/// or another process in the session, is `busy` (back off), while an
+/// agent in a terminal of its own still begins one; once one of the
+/// session's is committed, it begins again.
+#[test]
+fn one_root_holds_at_most_four_backups_in_progress() {
+    let f = Fixture::new();
+    let files = [Spec::made(&f.home.home().join("acme/.env"), 5, 19)];
+    let begin = || client(&f.home).backup_v2_begin(&begin_params("scrub", &files, &[]));
+    let ids: Vec<String> = (0..4).map(|_| begin().unwrap().id).collect();
+    assert_eq!(rpc(begin().unwrap_err()).0, ErrorKind::Busy);
+    let ask_begin = json!({"op": "begin", "purpose": "scrub", "files": [files[0].to_json()]});
+    let mut here = f.child("worker", false);
+    let r = here.ask(ask_begin.clone());
+    assert_eq!(err(&r), "busy", "{r}");
+    let mut agent = f.child("worker", true);
+    let r = agent.ask(ask_begin);
+    assert!(r["id"].is_string(), "{r}");
+    put_all(&f.paths(), f.files_cs(), &ids[0], &files).unwrap();
+    client(&f.home).backup_v2_commit(&ids[0]).unwrap();
+    begin().unwrap();
+    here.end();
+    agent.end();
+    f.sweep();
+}
+
+/// `list` opens the backups outside the daemon's state lock: stopped by a
+/// barrier after it opened one, the daemon still answers `status` and
+/// takes a `lock` meanwhile. The list then ends `vault_locked`, as a lock
+/// ends any call in flight.
+#[test]
+fn a_list_holds_no_lock_while_it_opens_backups() {
+    let mut f = Fixture::pausing(Some("backup.v2.list"));
+    let files = [Spec::made(&f.claude("projects/p/l.jsonl"), 40, 20)];
+    f.backup("scrub", &files);
+    let paths = f.paths();
+    let listing = std::thread::spawn(move || Client::connect(&paths)?.backup_v2_list().map(drop));
+    f.wait_paused("backup.v2.list");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let paths = f.paths();
+    std::thread::spawn(move || {
+        let state = Client::connect(&paths).and_then(|mut c| c.status());
+        let _ = tx.send(state.map(|s| s.vault.state));
+    });
+    let state = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("status waited for the list");
+    assert_eq!(state.unwrap(), VaultState::Unlocked);
+    client(&f.home).lock().unwrap();
+    f.release();
+    let e = listing.join().unwrap().unwrap_err();
+    assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
+    f.sweep();
+}
