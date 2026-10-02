@@ -353,6 +353,14 @@ fn s0(host: Host, shell: Shell, name: &str) {
             ) {
                 panic!("the rerun: {why}:\n{shown}");
             }
+            // The counter the refusal path compares is seen to count: the
+            // delivered run's request is in the audit (verifier, low:
+            // with no positive control, a changed audit line would make
+            // the refusal path's check 0 == 0).
+            assert!(
+                audit_requests(&h) > requests_before,
+                "the daemon's audit counted no request for a delivered run"
+            );
         }
         refusal => {
             if let Err(why) = refused(&second, &second_nonce, refusal) {
