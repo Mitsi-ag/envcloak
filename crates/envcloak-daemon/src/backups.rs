@@ -599,6 +599,24 @@ pub(crate) fn wait_for_deliveries(state: &Mutex<State>, deliveries: &Deliveries)
     deliveries.wait_before(locks);
 }
 
+/// Marks in a test build's trace where a call began and, on every path
+/// out of it, where it ended: a test that counts the trace lines a call
+/// made counts those between the two (`envcloak_sys::test_event`).
+struct Traced(&'static str);
+
+impl Traced {
+    fn call(began: &'static str, ended: &'static str) -> Self {
+        envcloak_sys::test_event(began);
+        Traced(ended)
+    }
+}
+
+impl Drop for Traced {
+    fn drop(&mut self) {
+        envcloak_sys::test_event(self.0);
+    }
+}
+
 /// The controlling terminal of `peer`'s process now, read for its pid
 /// only while that pid still has the start time the kernel gave at
 /// accept: `None` when it cannot be read so.
@@ -1020,6 +1038,10 @@ pub fn record_result(
     peer: &PeerIdentity,
     p: BackupResultParams,
 ) -> Result<BackupResultView, RpcError> {
+    let _traced = Traced::call(
+        "backup.v2.record_result began",
+        "backup.v2.record_result ended",
+    );
     let id = parse_id(&p.id)?;
     let after = parse_sha256(&p.sha256_after).ok_or_else(invalid)?;
     let file = usize::try_from(p.file).map_err(|_| invalid())?;
@@ -1348,6 +1370,7 @@ pub fn read<'s>(
 /// lock while they are read ends the call (`vault_locked`) before the next
 /// one is opened, and the copy of the `backup` subkey goes with it.
 pub fn list(shared: &Shared, _p: NoParams) -> Result<BackupListView, RpcError> {
+    let _traced = Traced::call("backup.v2.list began", "backup.v2.list ended");
     let open_leases = {
         let mut s = locked(&shared.state);
         s.backups().sweep(shared.clocks.awake());

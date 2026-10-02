@@ -2308,6 +2308,10 @@ fn a_list_holds_no_lock_while_it_opens_backups() {
             panic!("{count} backups: the list answered with what it read before a lock")
         });
         assert_eq!(rpc(e).0, ErrorKind::VaultLocked, "{count} backups");
+        // Counted once the daemon stopped: its log is then read whole, and
+        // no line of the list lags behind.
+        f.d.signal("-TERM");
+        assert!(f.d.wait_exit(Duration::from_secs(30)).is_some());
         let opened = String::from_utf8_lossy(&f.d.log_bytes())
             .lines()
             .filter(|l| l.contains("envcloak test: backup.v2.list opened a backup"))
@@ -2321,11 +2325,21 @@ fn a_list_holds_no_lock_while_it_opens_backups() {
 }
 
 /// How many times a test daemon opened a backup's `data` file, and read
-/// the backups directory, so far: its test trace says so at each.
-fn backup_reads(d: &Daemon) -> (usize, usize) {
-    let log = d.log_bytes();
-    let log = String::from_utf8_lossy(&log);
-    let count = |what: &str| log.lines().filter(|l| l.contains(what)).count();
+/// the backups directory, during its one call of `method`: its test trace
+/// says so at each, between the call's `began` and `ended` marks. Read
+/// from `log`, the daemon's whole log once it stopped, so no line lags
+/// behind.
+fn backup_reads(log: &str, method: &str) -> (usize, usize) {
+    let lines: Vec<&str> = log.lines().collect();
+    let mark = |what: &str| {
+        let at: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].contains(&format!("envcloak test: {method} {what}")))
+            .collect();
+        assert_eq!(at.len(), 1, "{method} {what}: {at:?}");
+        at[0]
+    };
+    let call = &lines[mark("began")..mark("ended")];
+    let count = |what: &str| call.iter().filter(|l| l.contains(what)).count();
     (
         count("envcloak test: file backup v2 data opened"),
         count("envcloak test: file backup v2 directory listed"),
@@ -2340,7 +2354,7 @@ fn backup_reads(d: &Daemon) -> (usize, usize) {
 /// and opens one `data` file, never every backup's header.
 #[test]
 fn a_list_opens_each_backup_once_and_a_call_opens_one() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let n = 5;
     let mut ids = Vec::new();
     for i in 0..n {
@@ -2351,20 +2365,20 @@ fn a_list_opens_each_backup_once_and_a_call_opens_one() {
         )];
         ids.push(f.backup("scrub", &files));
     }
-    let (data, dirs) = backup_reads(&f.d);
     assert_eq!(f.list().backups.len(), n);
-    let (data_now, dirs_now) = backup_reads(&f.d);
-    assert_eq!(
-        (data_now - data, dirs_now - dirs),
-        (2 * n, 1),
-        "one list of {n} backups: (data files opened, directory reads)"
-    );
     client(&f.home)
         .backup_v2_record_result(&ids[2], 0, &[9; 32])
         .unwrap();
-    let (data_then, dirs_then) = backup_reads(&f.d);
+    f.d.signal("-TERM");
+    assert!(f.d.wait_exit(Duration::from_secs(30)).is_some());
+    let log = String::from_utf8_lossy(&f.d.log_bytes()).into_owned();
     assert_eq!(
-        (data_then - data_now, dirs_then - dirs_now),
+        backup_reads(&log, "backup.v2.list"),
+        (2 * n, 1),
+        "one list of {n} backups: (data files opened, directory reads)"
+    );
+    assert_eq!(
+        backup_reads(&log, "backup.v2.record_result"),
         (1, 1),
         "one record_result among {n} backups: (data files opened, directory reads)"
     );
