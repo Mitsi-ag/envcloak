@@ -53,11 +53,13 @@ use envcloak_core::crypto::KdfParams;
 use envcloak_core::vault::VaultPaths;
 use envcloak_core::{RecoveryKit, check_passphrase, create_vault_with_kit};
 use envcloak_ipc::proto::{
-    self, Approve, AuditVerify, BackupCreate, Deny, ErrorKind, FilesBackup, FilesRestore,
-    GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify, IncomingRequest, ItemsAdd,
-    ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock, Method,
-    PendingGet, PendingList, PendingPoll, RecoveryConfirm, Role, RunRequest, Status, Unlock,
-    UnlockParams, VaultCreate, VaultCreateParams, VaultRecover, loggable_method, required_role,
+    self, Approve, AuditVerify, BackupBegin, BackupCommit, BackupCreate, BackupList,
+    BackupOpenRestore, BackupPut, BackupRead, BackupRecordResult, Deny, ErrorKind, FilesBackup,
+    FilesRestore, GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify,
+    IncomingRequest, ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow,
+    ItemsTarget, Lock, Method, PendingGet, PendingList, PendingPoll, RecoveryConfirm, Role,
+    RunRequest, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams, VaultRecover,
+    loggable_method, required_role,
 };
 use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
@@ -69,6 +71,7 @@ use envcloak_sys::{PeerIdentity, TerminationSignals};
 
 use crate::audit::AuditEvent;
 use crate::backup;
+use crate::backups;
 use crate::clock::{SystemClocks, now_of};
 use crate::import;
 use crate::items;
@@ -409,12 +412,15 @@ fn observe(shared: &Shared) {
 
 /// The tick: the sleep and idle checks, then the grant sweep, which
 /// drops expired grants and pending requests and every grant whose root
-/// process exited (SPEC §10b: a grant never outlives its root).
+/// process exited (SPEC §10b: a grant never outlives its root), and the
+/// backups v2 sweep, which ends restore leases whose process exited or
+/// that sat idle, and drops backups in progress whose creator exited.
 fn tick(shared: &Shared) {
     observe(shared);
     let now = now_of(&shared.clocks);
     let mut s = locked(&shared.state);
     s.grants().sweep(&now, &requests::alive);
+    s.backups().sweep(now.awake);
     s.audit_tick(Reading::now(&shared.clocks));
 }
 
@@ -677,6 +683,19 @@ fn dispatch(frame: &Frame, peer: &PeerIdentity, shared: &Shared) -> Option<Frame
         VaultRecover::NAME => {
             answer::<VaultRecover>(id, &req, |p| backup::recover(shared, peer, p))
         }
+        BackupBegin::NAME => answer::<BackupBegin>(id, &req, |p| backups::begin(shared, peer, p)),
+        BackupPut::NAME => answer::<BackupPut>(id, &req, |p| backups::put(shared, peer, p)),
+        BackupCommit::NAME => {
+            answer::<BackupCommit>(id, &req, |p| backups::commit(shared, peer, p))
+        }
+        BackupRecordResult::NAME => {
+            answer::<BackupRecordResult>(id, &req, |p| backups::record_result(shared, peer, p))
+        }
+        BackupOpenRestore::NAME => {
+            answer::<BackupOpenRestore>(id, &req, |p| backups::open_restore(shared, peer, p))
+        }
+        BackupRead::NAME => answer::<BackupRead>(id, &req, |p| backups::read(shared, peer, p)),
+        BackupList::NAME => answer::<BackupList>(id, &req, |p| backups::list(shared, p)),
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
 }
@@ -758,7 +777,9 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
                 .wall
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            if envcloak_core::file_backup::purge_file_backups(s.paths(), secs).is_err() {
+            if envcloak_core::file_backup::purge_file_backups(s.paths(), secs).is_err()
+                || envcloak_core::file_backup_v2::purge_file_backups_v2(s.paths(), secs).is_err()
+            {
                 log_line!("envcloakd: old file backups could not be removed");
             }
             s.audit(AuditEvent::Unlocked {

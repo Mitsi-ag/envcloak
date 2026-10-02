@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::process::ExitCode;
 
 use envcloak_ipc::ClientError;
+use envcloak_ipc::proto::ErrorKind;
 
 /// Exit code of a usage error.
 pub const USAGE: u8 = 2;
@@ -53,7 +54,9 @@ impl From<ClientError> for Failure {
             }
             ClientError::Unverified(u) => format!("{}; nothing was sent to it", u.message()).into(),
             ClientError::Rpc(r) => match r.reason {
-                Some(reason) => format!("{} ({})", r.kind.message(), reason_text(reason)).into(),
+                Some(reason) => {
+                    format!("{} ({})", r.kind.message(), reason_text_for(r.kind, reason)).into()
+                }
                 None => r.kind.message().into(),
             },
             other => other.to_string().into(),
@@ -234,7 +237,29 @@ const REASON_TEXTS: &[(&str, &str)] = &[
         "this terminal or its session is where the request came from; approve it from another \
          terminal window",
     ),
+    // A backup v2 restore refused before the proof (`restore_refused`).
+    (
+        "result_unrecorded",
+        "the process that made the backup never recorded what its change left, so EnvCloak \
+         does not know it; only the recovery form `--unrecorded` restores it",
+    ),
+    (
+        "created_by_agent",
+        "an agent or an unknown process made the backup, not you; restoring it writes that \
+         process's bytes, so it needs `--created-by-agent`",
+    ),
 ];
+
+/// Words for `reason` on an error of `kind`: [`reason_text`], except for
+/// a backup v2 over its caps (`files_backup_failed` with `too_large`).
+fn reason_text_for(kind: ErrorKind, reason: &str) -> &'static str {
+    if kind == ErrorKind::FilesBackupFailed && reason == "too_large" {
+        "a file is over 256 MiB, the files are over 1 GiB in all, or there are more than 4,096 \
+         of them"
+    } else {
+        reason_text(reason)
+    }
+}
 
 /// Words for an error's reason token.
 fn reason_text(reason: &str) -> &'static str {
@@ -277,6 +302,17 @@ mod tests {
     use super::*;
     use envcloak_ipc::proto::REASONS;
     use envcloak_policy::DenyReason;
+
+    /// A backup v2 over its caps says which caps; `too_large` elsewhere
+    /// keeps the manifest's words.
+    #[test]
+    fn a_backup_over_its_caps_has_words_of_its_own() {
+        assert!(reason_text_for(ErrorKind::FilesBackupFailed, "too_large").contains("256 MiB"));
+        assert_eq!(
+            reason_text_for(ErrorKind::ManifestInvalid, "too_large"),
+            reason_text("too_large")
+        );
+    }
 
     /// Review R-7: two lanes adding reason tokens could leave one without
     /// words, printed as "no detail". Every token of `REASONS` has words

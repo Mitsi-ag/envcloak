@@ -160,6 +160,18 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.envcloak-redact]
 opt-level = 3
+# A file backup v2 crosses the socket a 512 KiB chunk per frame, base64 in
+# JSON, both ways; gate 37's 200 MiB restore moves 800 such frames, so the
+# frame and its encodings are optimized in test builds too.
+[profile.dev.package.envcloak-ipc]
+opt-level = 2
+[profile.dev.package.base64]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3
+# Every buffer that held a chunk is wiped as it is freed.
+[profile.dev.package.zeroize]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

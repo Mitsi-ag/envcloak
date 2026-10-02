@@ -954,6 +954,19 @@ fn prove<'s>(
     refuse_if_traced()?;
     let caller = evidence(shared, peer, claims)?;
     refuse_unless_prover(shared, peer, &caller, method)?;
+    prove_as(shared, peer, caller, kind, check)
+}
+
+/// [`prove`] for a caller whose evidence was read, and whose proof
+/// [`refuse_unless_prover`] admitted, before: the attempt limiter, then
+/// `check` on the vault taken out of its slot, one proof at a time.
+pub(crate) fn prove_as<'s>(
+    shared: &'s Shared,
+    peer: &PeerIdentity,
+    caller: SubjectEvidence,
+    kind: AuditKind,
+    check: impl FnOnce(&Vault) -> Result<(), VaultError>,
+) -> Result<(std::sync::MutexGuard<'s, State>, SubjectEvidence), RpcError> {
     let _gate = locked(&shared.proof_gate);
     let (vault, generation) = {
         let mut s = locked(&shared.state);

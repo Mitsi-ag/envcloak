@@ -124,6 +124,8 @@ pub struct State {
     /// `too_many_pending` answers counted, not yet written
     /// ([`crate::crowded`]).
     crowded: Crowded,
+    /// Backups v2 in progress and restore leases ([`crate::backups`]).
+    backups: crate::backups::Registry,
 }
 
 impl State {
@@ -142,6 +144,7 @@ impl State {
             unsaved_head: None,
             save_head: Vault::save_audit_head,
             crowded: Crowded::default(),
+            backups: crate::backups::Registry::default(),
         }
     }
 
@@ -157,6 +160,11 @@ impl State {
     /// The grants and pending requests.
     pub fn grants(&mut self) -> &mut GrantStore {
         &mut self.grants
+    }
+
+    /// Backups v2 in progress and restore leases.
+    pub fn backups(&mut self) -> &mut crate::backups::Registry {
+        &mut self.backups
     }
 
     /// The passphrase attempt limiter, shared by every proof.
@@ -274,8 +282,10 @@ impl State {
             self.audit(AuditEvent::Request(Box::new(e)));
         }
         // Whatever the slot holds, a lock ends every grant and pending
-        // request (SPEC §5 "Lock").
+        // request (SPEC §5 "Lock"), every backup v2 in progress and every
+        // restore lease.
         self.grants.on_lock();
+        self.backups.on_lock();
         let recorded = matches!(self.slot, Slot::Unlocked(_))
             || (matches!(self.slot, Slot::Busy) && reason != LockReason::Idle);
         if recorded {

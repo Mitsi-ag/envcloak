@@ -211,9 +211,10 @@ pub enum AuditEvent {
         subject: SubjectSummary,
         already: bool,
     },
-    /// A `files.restore`, `recovery.confirm` or `vault.recover` failed its
-    /// proof: the passphrase or the kit was wrong. `kind` is
-    /// [`AuditKind::FilesRestore`], [`AuditKind::RecoveryConfirm`] or
+    /// A `files.restore`, `backup.v2.open_restore`, `recovery.confirm` or
+    /// `vault.recover` failed its proof: the passphrase or the kit was
+    /// wrong. `kind` is [`AuditKind::FilesRestore`],
+    /// [`AuditKind::RestoreV2`], [`AuditKind::RecoveryConfirm`] or
     /// [`AuditKind::Recover`].
     ProofFailed { pid: i32, kind: AuditKind },
     /// An encrypted backup of the vault was written (`backup.create`):
@@ -231,6 +232,26 @@ pub enum AuditEvent {
         subject: SubjectSummary,
         backup: String,
         items: usize,
+    },
+    /// A file backup v2 was committed (`backup.v2.commit`): its id, its
+    /// purpose's token, how many files it holds, and who made it.
+    BackupV2Committed {
+        pid: i32,
+        subject: SubjectSummary,
+        backup: String,
+        purpose: &'static str,
+        files: usize,
+    },
+    /// A restore lease was opened on a backup v2, with a proof
+    /// (`backup.v2.open_restore`): a delivery, written before the lease is
+    /// issued. `form` is `unrecorded` or `created_by_agent` when the
+    /// restore took that explicit option.
+    RestoreV2Opened {
+        pid: i32,
+        subject: SubjectSummary,
+        backup: String,
+        files: usize,
+        form: Option<&'static str>,
     },
 }
 
@@ -391,6 +412,22 @@ impl AuditEvent {
             AuditEvent::Recovered {
                 pid, backup, items, ..
             } => format!("envcloakd: audit: vault recovered id={backup} items={items} pid={pid}"),
+            AuditEvent::BackupV2Committed {
+                pid,
+                backup,
+                purpose,
+                files,
+                ..
+            } => format!(
+                "envcloakd: audit: backup v2 committed id={backup} purpose={purpose} \
+                 files={files} pid={pid}"
+            ),
+            AuditEvent::RestoreV2Opened {
+                pid, backup, files, ..
+            } => format!(
+                "envcloakd: audit: backup v2 restore lease opened id={backup} files={files} \
+                 pid={pid}"
+            ),
         })
     }
 
@@ -693,6 +730,40 @@ impl AuditEvent {
                     Some(u64::try_from(*items).unwrap_or(u64::MAX)),
                 ),
                 ..AuditRecord::new(AuditKind::Recover, "recovered")
+            },
+            AuditEvent::BackupV2Committed {
+                subject,
+                backup,
+                purpose,
+                files,
+                ..
+            } => AuditRecord {
+                request_id: Some(backup.clone()),
+                subject: subject.clone(),
+                decision: decision(
+                    "committed",
+                    Some(purpose),
+                    Some("backup.v2.commit"),
+                    Some(u64::try_from(*files).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::BackupV2, "committed")
+            },
+            AuditEvent::RestoreV2Opened {
+                subject,
+                backup,
+                files,
+                form,
+                ..
+            } => AuditRecord {
+                request_id: Some(backup.clone()),
+                subject: subject.clone(),
+                decision: decision(
+                    "opened",
+                    *form,
+                    Some("backup.v2.open_restore"),
+                    Some(u64::try_from(*files).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::RestoreV2, "opened")
             },
         }
     }
