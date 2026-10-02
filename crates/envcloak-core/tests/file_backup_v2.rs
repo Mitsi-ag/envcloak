@@ -1090,7 +1090,8 @@ fn a_backup_makes_its_staging_directory_in_the_directory_it_opened() {
 /// rename fails the commit too, with the whole backup in place. A result
 /// flushes its file, then the backup's directory: a failed flush of the
 /// file records nothing, and one of the directory fails the call. A purge
-/// flushes `backups/` after its removals, and a failed flush fails it.
+/// flushes `backups/` once a backup is renamed out of the listing and
+/// again after its removals, and a failed flush fails it.
 #[test]
 fn a_backup_is_flushed_in_order_and_a_failed_flush_fails_its_step() {
     use envcloak_sys::testing::{fail_sync_after, record_syncs, take_synced};
@@ -1187,9 +1188,110 @@ fn a_backup_is_flushed_in_order_and_a_failed_flush_fails_its_step() {
         "the purge's flush failed unreported"
     );
     assert!(list_file_backups_v2(v.paths()).unwrap().is_empty());
+    assert_eq!(purge_file_backups_v2(v.paths(), t).unwrap(), 1);
     small(&v, now() - FILE_BACKUP_RETENTION.as_secs() - 1);
     record_syncs();
     assert_eq!(purge_file_backups_v2(v.paths(), now()).unwrap(), 1);
-    assert_eq!(take_synced(), [id_of(&backups)]);
+    assert_eq!(
+        take_synced(),
+        [id_of(&backups), id_of(&backups)],
+        "a purge's flushes: backups/ once the backup is out of the listing, again once it went"
+    );
+    assert!(dir_names(&backups).is_empty());
+    drop(f);
+}
+
+/// A purge flushes every change it made, also when no directory went and
+/// when it fails part way. An expired backup whose directory holds a file
+/// the purge does not own (a `.DS_Store`) is renamed out of the listing
+/// and `backups/` flushed before any of its records goes (what the shim
+/// recorded by the purge's `Removing` step is `backups/` alone); then its
+/// records go and the directory kept is flushed, and the purge answers 0.
+/// With the flush of the rename failing, the purge fails, the backup is
+/// not listed, none of its records goes, and `backups/` is flushed again
+/// before the purge returns; the next purge removes the records. With the
+/// flush of the kept directory failing, the purge fails.
+#[test]
+fn a_purge_flushes_every_change_also_when_no_backup_goes() {
+    use envcloak_sys::testing::{fail_sync_after, record_syncs, take_synced};
+    use std::os::unix::fs::MetadataExt;
+    let id_of = |p: &Path| {
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    let (f, v) = KitFixture::create();
+    let t = now();
+    let backups = v.paths().backups_dir.clone();
+    let blocked = |v: &Vault| {
+        let id = small(v, t - FILE_BACKUP_RETENTION.as_secs() - 1);
+        let dir = list_file_backups_v2(v.paths())
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id == id)
+            .unwrap()
+            .dir;
+        std::fs::write(dir.join(".DS_Store"), b"finder").unwrap();
+        dir
+    };
+
+    let dir = blocked(&v);
+    let mut by_removing = None;
+    record_syncs();
+    let removed = purge_file_backups_v2_observed(
+        v.paths(),
+        t,
+        |_| false,
+        |step| {
+            if matches!(step, PurgeStepV2::Removing(_)) {
+                by_removing = Some(take_synced());
+                record_syncs();
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(removed, 0);
+    let kept = purging(&dir);
+    assert_eq!(
+        by_removing,
+        Some(vec![id_of(&backups)]),
+        "the rename out of the listing was not flushed before the records went"
+    );
+    assert_eq!(
+        take_synced(),
+        [id_of(&kept)],
+        "the records' removal from the directory kept was not flushed"
+    );
+    assert_eq!(dir_names(&kept), [".DS_Store"]);
+    std::fs::remove_dir_all(&kept).unwrap();
+
+    let dir = blocked(&v);
+    record_syncs();
+    fail_sync_after(0);
+    assert!(
+        purge_file_backups_v2(v.paths(), t).is_err(),
+        "the rename's failed flush unreported"
+    );
+    assert_eq!(
+        take_synced(),
+        [id_of(&backups)],
+        "the rename whose flush failed was not flushed again"
+    );
+    assert!(list_file_backups_v2(v.paths()).unwrap().is_empty());
+    assert_eq!(
+        dir_names(&purging(&dir)),
+        [".DS_Store", "data"],
+        "records removed after the rename's flush failed"
+    );
+    assert_eq!(purge_file_backups_v2(v.paths(), t).unwrap(), 0);
+    assert_eq!(dir_names(&purging(&dir)), [".DS_Store"]);
+    std::fs::remove_dir_all(purging(&dir)).unwrap();
+
+    let dir = blocked(&v);
+    fail_sync_after(1);
+    assert!(
+        purge_file_backups_v2(v.paths(), t).is_err(),
+        "the failed flush of the directory kept unreported"
+    );
+    assert_eq!(dir_names(&purging(&dir)), [".DS_Store"]);
     drop(f);
 }
