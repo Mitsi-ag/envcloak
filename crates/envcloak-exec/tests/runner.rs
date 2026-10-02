@@ -221,6 +221,10 @@ const TESTS: &[Test] = &[
         without_a_terminal_signals_go_to_the_childs_own_group,
     ),
     (
+        "without_a_terminal_a_second_sigterm_kills_the_childs_group",
+        without_a_terminal_a_second_sigterm_kills_the_childs_group,
+    ),
+    (
         "on_a_terminal_ctrl_c_reaches_the_child_and_the_runner_stays",
         on_a_terminal_ctrl_c_reaches_the_child_and_the_runner_stays,
     ),
@@ -1479,6 +1483,92 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
         assert_no_canary(&out, &cs);
         assert_no_canary(&err, &cs);
     }
+    home.assert_clean(&cs);
+}
+
+/// A child that notes each SIGTERM (`got-TERM`) and goes on, after it has
+/// taken an exclusive lock on argv[1] and started a descendant that keeps
+/// the lock and ignores SIGTERM; it says `ready`, and both wait until the
+/// lifetime whose directory is argv[2] and stop request argv[3] asks them
+/// to stop, or for argv[4] seconds. The lock is free again only once both
+/// are gone.
+const HOLDS_THROUGH_SIGTERM: &str = r#"import fcntl, os, signal, sys, time
+lock, life, stop, deadline = sys.argv[1], sys.argv[2], sys.argv[3], time.time() + float(sys.argv[4])
+f = open(lock, "a")
+fcntl.flock(f, fcntl.LOCK_EX)
+def wait():
+    while os.path.isdir(life) and not os.path.exists(stop) and time.time() < deadline:
+        time.sleep(0.05)
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    wait()
+    os._exit(0)
+def noted(*_):
+    os.write(1, b"got-TERM\n")
+signal.signal(signal.SIGTERM, noted)
+os.write(1, b"ready\n")
+wait()
+"#;
+
+/// Without a terminal, the first SIGTERM sent to the runner is passed on
+/// to the child's group as it is: a child that takes it and goes on keeps
+/// running. The second ends the child's whole group at once (SIGKILL in
+/// its place): the child and the descendant it started, which ignores
+/// SIGTERM, both go (a lock they share is free again), and the runner
+/// exits 128 plus SIGKILL's number. `envcloak mcp` relies on it to end a
+/// cancelled command that ignores SIGTERM (docs/MCP.md).
+///
+/// Mutation checked: the second SIGTERM passed on as it is (`sent_as`
+/// returning `sig`): the child and its descendant run on, the runner
+/// waits for them, and this fails on the time it takes.
+fn without_a_terminal_a_second_sigterm_kills_the_childs_group() {
+    let seed = fresh_seed();
+    let cs = all_canaries(seed);
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    let life = Lifetime::new(&home, "second-sigterm");
+    let lock = home.root().join("held.lock");
+    let argv: Vec<OsString> = vec![
+        python3().into(),
+        "-c".into(),
+        HOLDS_THROUGH_SIGTERM.into(),
+        lock.clone().into(),
+        life.dir.clone().into(),
+        life.stop_path().into(),
+        FIXTURE_DEADLINE_SECS.to_string().into(),
+    ];
+    let p = Proc::spawn(detached(&home, &setup, &os(&argv)));
+    assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
+    let held = std::fs::File::open(&lock).unwrap();
+    assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
+    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    assert!(
+        p.wait_for(0, b"got-TERM\n", Duration::from_secs(60)),
+        "the first SIGTERM was not passed on"
+    );
+    assert!(
+        !envcloak_sys::try_lock_exclusive(&held).unwrap(),
+        "the first SIGTERM ended the child"
+    );
+    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    let (status, out, err) = p.finish(Duration::from_secs(30));
+    assert_eq!(status.code(), Some(128 + libc::SIGKILL), "{}", lossy(&err));
+    assert_eq!(count(&out, b"got-TERM\n"), 1, "{}", lossy(&out));
+    let end = Instant::now() + Duration::from_secs(10);
+    while !envcloak_sys::try_lock_exclusive(&held).unwrap() {
+        assert!(
+            Instant::now() < end,
+            "a process of the child's group outlived the second SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_no_canary(&out, &cs);
+    assert_no_canary(&err, &cs);
     home.assert_clean(&cs);
 }
 
