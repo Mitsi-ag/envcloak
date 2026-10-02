@@ -41,8 +41,16 @@ found on PATH.
 `url` may name {version}, {platform} (darwin-arm64, linux-x64), {os}
 (darwin, linux) and {arch} (arm64, x64).
 
+--mcp-client also installs the official MCP TypeScript SDK that M2-06's
+tests drive `envcloak mcp` with (versions.toml's [mcp_client] table: its
+package and version), with `npm ci --ignore-scripts` from the lockfile in
+crates/envcloak-e2e/mcp-client/ (an integrity hash for every package in
+the tree), under the Node this run verified, into
+mcp-client-<version>-<lockfile digest>-<platform>/ in the same cache. It is
+kept only when the installed package's version is the pinned one.
+
 usage: install-agent-hosts.py [--tier 1|2|all] [--host ID[/VARIANT]]...
-                              [--platform P] [--print-hashes]
+                              [--mcp-client] [--platform P] [--print-hashes]
        install-agent-hosts.py --print-cache-dir
        install-agent-hosts.py --self-test
 --print-hashes downloads and prints the SHA-256 values for the platform
@@ -75,6 +83,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 VERSIONS = os.path.join(ROOT, "crates", "envcloak-e2e", "agents", "versions.toml")
 NPM_LOCKS = os.path.join(ROOT, "crates", "envcloak-e2e", "agents", "npm")
+MCP_CLIENT = os.path.join(ROOT, "crates", "envcloak-e2e", "mcp-client")
 
 
 def this_platform():
@@ -382,11 +391,85 @@ def install(host, plat, cache, print_hashes, node):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def mcp_client_dir(cache, client, plat, lock_digest):
+    return os.path.join(cache, "mcp-client-%s-%s-%s" % (client["version"], lock_digest[:16], plat))
+
+
+def install_mcp_client(client, plat, cache, node):
+    """Installs the pinned MCP SDK client (see the module documentation)
+    with `npm ci --ignore-scripts` under `node`, the Node this run
+    verified (None: nothing is run). Returns (ok, why)."""
+    try:
+        with open(os.path.join(MCP_CLIENT, "package.json"), "rb") as f:
+            manifest = json.load(f)
+        lock_path = os.path.join(MCP_CLIENT, "package-lock.json")
+        with open(lock_path, "rb") as f:
+            lock = json.load(f)
+        digest = sha256_file(lock_path)
+    except (OSError, ValueError) as e:
+        return False, "no lockfile for the MCP client: %s" % e
+    if manifest.get("dependencies") != {client["package"]: client["version"]}:
+        return False, "%s/package.json does not name %s@%s alone" % (
+            MCP_CLIENT, client["package"], client["version"])
+    unpinned = [k for k, v in lock.get("packages", {}).items()
+                if k and not v.get("link") and not v.get("integrity")]
+    if unpinned:
+        return False, "the MCP client's lockfile pins no integrity for %s" % ", ".join(unpinned[:3])
+    final = mcp_client_dir(cache, client, plat, digest)
+
+    def verified(base):
+        try:
+            with open(os.path.join(base, "installed.json"), "rb") as f:
+                stamp = json.load(f)
+            with open(os.path.join(base, "node_modules", client["package"], "package.json"),
+                      "rb") as f:
+                version = json.load(f).get("version")
+        except (OSError, ValueError):
+            return False
+        return stamp.get("lock_sha256") == digest and version == client["version"]
+
+    if os.path.lexists(final):
+        if not os.path.islink(final) and os.path.isdir(final) and verified(final):
+            return True, "already installed, verified"
+        return False, "installed copy does not match its pin; remove %s and run again" % final
+    if node is None:
+        return False, "not installed: no Node.js this run verified against its pins"
+    os.makedirs(cache, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=".tmp-mcp-client-", dir=cache)
+    try:
+        for name in ("package.json", "package-lock.json"):
+            shutil.copyfile(os.path.join(MCP_CLIENT, name), os.path.join(tmp, name))
+        npm = os.path.join(node, "lib", "node_modules", "npm", "bin", "npm-cli.js")
+        cmd = [os.path.join(node, "bin", "node"), npm, "ci", "--ignore-scripts", "--prefix",
+               os.path.realpath(tmp), "--no-audit", "--no-fund", "--loglevel=error"]
+        env = dict(os.environ)
+        env["PATH"] = os.path.join(node, "bin") + os.pathsep + env.get("PATH", "")
+        env["npm_config_update_notifier"] = "false"
+        r = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            return False, "npm install failed: %s" % r.stderr.decode("utf-8", "replace")[-400:]
+        with open(os.path.join(tmp, "installed.json"), "w") as f:
+            json.dump({"package": client["package"], "version": client["version"],
+                       "platform": plat, "lock_sha256": digest}, f)
+        if not verified(tmp):
+            return False, "the installed %s is not version %s" % (
+                client["package"], client["version"])
+        os.rename(tmp, final)
+        tmp = None
+        return True, "installed, verified"
+    except (OSError, ValueError) as e:
+        return False, "%s" % e
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main(argv):
     tier = "1"
     only = []
     plat = this_platform()
     print_hashes = False
+    mcp_client = False
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -401,6 +484,9 @@ def main(argv):
             i += 2
         elif a == "--print-hashes":
             print_hashes = True
+            i += 1
+        elif a == "--mcp-client":
+            mcp_client = True
             i += 1
         elif a == "--print-cache-dir" and len(argv) == 2:
             print(cache_dir())
@@ -417,12 +503,12 @@ def main(argv):
 
     with open(VERSIONS, "rb") as f:
         doc = tomllib.load(f)
-    return run(doc, plat, cache_dir(), tier, only, print_hashes)
+    return run(doc, plat, cache_dir(), tier, only, print_hashes, mcp_client)
 
 
-def run(doc, plat, cache, tier, only, print_hashes):
-    """Installs the hosts of `doc` (versions.toml) asked for; the exit
-    status."""
+def run(doc, plat, cache, tier, only, print_hashes, mcp_client=False):
+    """Installs the hosts of `doc` (versions.toml) asked for, and the MCP
+    client with `mcp_client`; the exit status."""
     ok = True
     hosts = []
     for host in doc.get("host", []):
@@ -435,13 +521,19 @@ def run(doc, plat, cache, tier, only, print_hashes):
     # The Node npm runs under: only one this run verified whole against its
     # pins, never one taken from a directory because it is there.
     node = None
-    if any(h["method"] == "npm" or h.get("interpreter") == "node" for h in hosts):
+    if mcp_client or any(h["method"] == "npm" or h.get("interpreter") == "node" for h in hosts):
         good, why, node = install_node(doc["node"], plat, cache, print_hashes)
         print("install-agent-hosts: node %s (%s): %s" % (doc["node"]["version"], plat, why))
         ok = ok and good
     for host in hosts:
         good, why = install(host, plat, cache, print_hashes, node)
         print("install-agent-hosts: %s (%s): %s" % (label(host), plat, why))
+        ok = ok and good
+    if mcp_client and not print_hashes:
+        client = doc["mcp_client"]
+        good, why = install_mcp_client(client, plat, cache, node)
+        print("install-agent-hosts: mcp client %s@%s (%s): %s" % (
+            client["package"], client["version"], plat, why))
         ok = ok and good
     return 0 if ok else 1
 
@@ -453,7 +545,7 @@ def self_test():
     check (its bin/node, or any other file, its npm included) is never run
     and no npm host is installed; a verified one runs `npm ci` once per
     npm host. The exit status: 0 when every case passes."""
-    global fetch, NPM_LOCKS
+    global fetch, NPM_LOCKS, MCP_CLIENT
     real_fetch, real_locks, real_run = fetch, NPM_LOCKS, subprocess.run
     plat = "linux-x64"
     failures = []
@@ -489,6 +581,15 @@ def self_test():
                 "sha256": {plat: hashlib.sha256(entry).hexdigest()}}
         downloads = {"https://node.invalid/node-1.2.3.tar.gz": archive}
         dispatched, names = [], []
+        # The MCP client's lockfile, and the version its `npm ci` installs.
+        client = {"package": "fake-sdk", "version": "7.8.9"}
+        client_locks = os.path.join(top, "mcp-client")
+        os.makedirs(client_locks)
+        with open(os.path.join(client_locks, "package.json"), "w") as f:
+            json.dump({"dependencies": {"fake-sdk": "7.8.9"}}, f)
+        with open(os.path.join(client_locks, "package-lock.json"), "w") as f:
+            json.dump({"packages": {"": {}, "node_modules/fake-sdk": {"integrity": "sha512-y"}}}, f)
+        installs_version = ["7.8.9"]
 
         def local_fetch(url, dest):
             if url not in downloads:
@@ -496,13 +597,18 @@ def self_test():
             shutil.copyfile(downloads[url], dest)
 
         def spy(cmd, **kwargs):
-            # `npm ci` as it would end: the host's entry in the prefix.
+            # `npm ci` as it would end: the host's entry in the prefix, and
+            # the MCP client's package at the version the case says.
             dispatched.append(list(cmd))
             prefix = cmd[cmd.index("--prefix") + 1]
             path = os.path.join(prefix, host["entry"])
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(entry)
+            sdk = os.path.join(prefix, "node_modules", client["package"])
+            os.makedirs(sdk, exist_ok=True)
+            with open(os.path.join(sdk, "package.json"), "w") as f:
+                json.dump({"version": installs_version[0]}, f)
             return subprocess.CompletedProcess(cmd, 0, b"", b"")
 
         def case(name, prepare, want_status, want_dispatches, want_host, doc_node=node):
@@ -539,8 +645,50 @@ def self_test():
                 with open(os.path.join(dest, change), "ab") as f:
                     f.write(b"changed\n")
 
+        def client_case(name, prepare, want_status, want_dispatches, want_client,
+                        version="7.8.9"):
+            """`--mcp-client` with no host: the client is installed only
+            under a Node this run verified, and kept only at its pinned
+            version."""
+            cache = os.path.join(top, "cache-%d" % len(names))
+            names.append(name)
+            os.makedirs(cache)
+            prepare(cache)
+            del dispatched[:]
+            installs_version[0] = version
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = run({"node": node, "host": [], "mcp_client": client}, plat, cache,
+                             "all", [], False, True)
+            got = any(n.startswith("mcp-client-7.8.9-") for n in os.listdir(cache))
+            nodes = {c[0] for c in dispatched}
+            want_node = {os.path.join(node_dir(cache, node, plat), "bin", "node")}
+            problems = []
+            if status != want_status:
+                problems.append("exit %d, wanted %d" % (status, want_status))
+            if len(dispatched) != want_dispatches:
+                problems.append("%d npm runs, wanted %d" % (len(dispatched), want_dispatches))
+            if dispatched and nodes != want_node:
+                problems.append("npm ran under %s" % sorted(nodes))
+            if dispatched and any("--ignore-scripts" not in c for c in dispatched):
+                problems.append("npm ran install scripts")
+            if got != want_client:
+                problems.append("client installed: %s" % got)
+            if problems:
+                failures.append(name)
+            print("self-test: %s: %s" % (name, "; ".join(problems) or "ok"))
+            for line in out.getvalue().splitlines():
+                print("    " + line)
+
+        real_client = MCP_CLIENT
         fetch, NPM_LOCKS, subprocess.run = local_fetch, os.path.dirname(locks), spy
+        MCP_CLIENT = client_locks
         try:
+            client_case("mcp client, verified cached node", copy_node, 0, 1, True)
+            client_case("mcp client, cached node whose bin/node is not the pinned one",
+                        lambda c: copy_node(c, "bin/node"), 1, 0, False)
+            client_case("mcp client, npm installs another version", copy_node, 1, 1, False,
+                        version="7.8.10")
             case("verified cached node, uncached npm host", copy_node, 0, 1, True)
             case("no cached node, download verified", lambda c: None, 0, 1, True)
             case("cached node whose bin/node is not the pinned one, uncached npm host",
@@ -558,6 +706,7 @@ def self_test():
                  dict(node, tree_sha256={}))
         finally:
             fetch, NPM_LOCKS, subprocess.run = real_fetch, real_locks, real_run
+            MCP_CLIENT = real_client
     if failures:
         print("install-agent-hosts: self-test failed: %s" % ", ".join(failures), file=sys.stderr)
         return 1

@@ -371,6 +371,105 @@ pub fn require(found: Result<Installed, String>, test: &str) -> Option<Installed
     }
 }
 
+/// The official MCP TypeScript SDK client (M2 plan task M2-06), as
+/// scripts/install-agent-hosts.py `--mcp-client` installs it: its
+/// `node_modules`, and the pinned Node.js that runs it.
+#[derive(Debug, Clone)]
+pub struct McpClient {
+    pub node: PathBuf,
+    pub node_modules: PathBuf,
+    /// The SDK's version, as versions.toml pins it.
+    pub version: String,
+}
+
+/// The MCP client pinned in `versions` (its `[mcp_client]` table, and the
+/// lockfile in `mcp-client/` beside `agents/`), found in the cache and
+/// checked: installed from this lockfile (its SHA-256 is the one the
+/// installer recorded), the SDK at the pinned version, and the pinned
+/// Node's `bin/node` hash. Skipped and required as [`require`] says for a
+/// host.
+///
+/// # Errors
+/// Why it cannot be used.
+pub fn mcp_client(versions: &Path) -> Result<McpClient, String> {
+    let Some(plat) = platform() else {
+        return Err("this platform has no pinned MCP client".to_owned());
+    };
+    let text = std::fs::read_to_string(versions).map_err(|e| format!("{e}"))?;
+    let doc: toml_edit::Document<String> = text.parse().map_err(|e| format!("{e}"))?;
+    let pinned = doc
+        .get("mcp_client")
+        .and_then(|t| t.as_table_like())
+        .and_then(|t| Some((t.get("package")?.as_str()?, t.get("version")?.as_str()?)))
+        .ok_or("versions.toml pins no MCP client")?;
+    let (package, version) = (pinned.0.to_owned(), pinned.1.to_owned());
+    let lock = versions
+        .parent()
+        .and_then(Path::parent)
+        .map(|d| d.join("mcp-client/package-lock.json"))
+        .ok_or("no mcp-client directory")?;
+    let digest = sha256_file(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+    let dir = cache_dir().join(format!("mcp-client-{version}-{}-{plat}", &digest[..16]));
+    let missing = || {
+        format!(
+            "the MCP client {package}@{version} is not installed in {}; run {INSTALL} --mcp-client",
+            dir.display()
+        )
+    };
+    let stamp: Value = std::fs::read(dir.join("installed.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(missing)?;
+    let installed: Value =
+        std::fs::read(dir.join("node_modules").join(&package).join("package.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or_else(missing)?;
+    if stamp["lock_sha256"] != digest.as_str() || installed["version"] != version.as_str() {
+        return Err(format!(
+            "{} is not the pinned MCP client; remove it and run {INSTALL} --mcp-client",
+            dir.display()
+        ));
+    }
+    let node_pin = node_pin(versions).ok_or("Node.js is not pinned")?;
+    let node = cache_dir()
+        .join(format!("node-{}-{plat}", node_pin.version))
+        .join("bin/node");
+    match sha256_file(&node) {
+        Ok(got) if got == node_pin.sha256 => {}
+        _ => {
+            return Err(format!(
+                "the pinned Node.js is not at {}; run {INSTALL}",
+                node.display()
+            ));
+        }
+    }
+    Ok(McpClient {
+        node,
+        node_modules: dir.join("node_modules"),
+        version,
+    })
+}
+
+/// `found`, or `None` after saying why on standard error when the cache
+/// holds no MCP client and [`REQUIRE_VAR`] is not set (CI's jobs that run
+/// the client set it).
+///
+/// # Panics
+/// When [`REQUIRE_VAR`] is set and the client cannot be used.
+pub fn require_mcp_client(found: Result<McpClient, String>, test: &str) -> Option<McpClient> {
+    match found {
+        Ok(c) => Some(c),
+        Err(why) if std::env::var_os(REQUIRE_VAR).is_some() => {
+            panic!("{test}: {why} ({REQUIRE_VAR} is set)")
+        }
+        Err(why) => {
+            eprintln!("{test}: skipped: {why}");
+            None
+        }
+    }
+}
+
 /// `envcloak-probe-model` from the target directory of the running test
 /// binary, refused when older than its sources.
 ///

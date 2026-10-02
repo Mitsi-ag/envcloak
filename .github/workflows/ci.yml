@@ -279,13 +279,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../agent-hosts
-          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'scripts/install-agent-hosts.py') }}
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'crates/envcloak-e2e/mcp-client/package*.json', 'scripts/install-agent-hosts.py') }}
       - name: Install and verify the pinned tier-1 hosts
         env:
           ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
         run: |
           python3 scripts/install-agent-hosts.py --self-test
-          python3 scripts/install-agent-hosts.py --tier 1
+          python3 scripts/install-agent-hosts.py --tier 1 --mcp-client
       - name: Claude Code's sandbox dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends bubblewrap socat
@@ -453,11 +453,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../agent-hosts
-          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'scripts/install-agent-hosts.py') }}
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'crates/envcloak-e2e/mcp-client/package*.json', 'scripts/install-agent-hosts.py') }}
       - name: Install and verify the pinned tier-1 hosts
         run: |
           python3 scripts/install-agent-hosts.py --self-test
-          python3 scripts/install-agent-hosts.py --tier 1
+          python3 scripts/install-agent-hosts.py --tier 1 --mcp-client
       # S0's sandboxed Claude Code case: its Bash sandbox needs bubblewrap
       # and socat on Linux (https://code.claude.com/docs/en/sandboxing).
       - name: Claude Code's sandbox dependencies
@@ -544,11 +544,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../agent-hosts
-          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'scripts/install-agent-hosts.py') }}
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'crates/envcloak-e2e/mcp-client/package*.json', 'scripts/install-agent-hosts.py') }}
       - name: Install and verify the pinned hosts (tier 1 and tier 2)
         run: |
           python3 scripts/install-agent-hosts.py --self-test
-          python3 scripts/install-agent-hosts.py --tier all
+          python3 scripts/install-agent-hosts.py --tier all --mcp-client
       # Claude Code's Bash sandbox needs bubblewrap and socat on Linux
       # (https://code.claude.com/docs/en/sandboxing); without them the
       # sandbox measurements read "the host did not run".

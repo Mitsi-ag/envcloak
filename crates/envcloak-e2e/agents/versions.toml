@@ -51,6 +51,16 @@ linux-x64 = "fde6a4bf8d0562f7751d1a2d6cb9b417c4cfe107bbcb0aa3e9a24e125e348f48"
 darwin-arm64 = "50c7196e2751a2336079f05f50a4bd220dca035cfa9f3bb8fb8acaa43b985f9e"
 linux-x64 = "9480f03571438d3e0c800174f657e2f529ce647d443d7dc040034ae675e8febf"
 
+# The official MCP TypeScript SDK, the independent client M2-06's tests
+# drive `envcloak mcp` with (lesson L-02). `install-agent-hosts.py
+# --mcp-client` installs it with `npm ci --ignore-scripts` from the lockfile
+# in crates/envcloak-e2e/mcp-client/ (every package of the tree pinned by
+# its integrity hash), under the pinned Node above, and keeps it only at
+# this version; the tests run its client with that Node.
+[mcp_client]
+package = "@modelcontextprotocol/sdk"
+version = "1.31.0"
+
 # Claude Code, the native build (the documented install).
 [[host]]
 id = "claude-code"
