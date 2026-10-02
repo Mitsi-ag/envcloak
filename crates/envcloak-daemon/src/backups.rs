@@ -14,7 +14,13 @@
 //! `record_result`, and only while it runs: another process, one in the
 //! same agent root that knows or lists the id included, gets
 //! `not_backup_owner`, changes nothing and learns nothing more, and so
-//! does a call on the creator's connection after the creator exited. A
+//! does a call on the creator's connection after the creator exited,
+//! reaped or not. The daemon watches the creator for its exit through an
+//! [`envcloak_sys::ProcessWatch`] (a pidfd on Linux) taken at `begin` and
+//! kept while the backup is in progress or awaits a result; without one
+//! (after a restart, or past [`MAX_CREATOR_WATCHES`]) it reads the
+//! process table, where a process that exited and is not yet reaped does
+//! not run either. A
 //! committed backup's contents are frozen (`backup_frozen`), and each
 //! file's result is recorded once. A backup in progress is dropped (its
 //! staging directory removed) when its creator exits, after
@@ -34,9 +40,11 @@
 //! then is a lease issued, bound to the backup, the caller's process
 //! instance and its terminal. `read` hands out one chunk under the lease,
 //! on fresh connections, only to that process on that terminal, and only
-//! if the lease still stands once the chunk is read. A lease ends when its
-//! process exits, after 60 seconds idle, at lock and at a restart; an
-//! audit entry that cannot be written issues no lease, so no chunk.
+//! if the lease still stands once the chunk is read: that process still
+//! runs, is still on that terminal and the lease is not past its idle
+//! limit. A lease ends when its process exits (reaped or not), after 60
+//! seconds idle, at lock and at a restart; an audit entry that cannot be
+//! written issues no lease, so no chunk.
 //!
 //! **Locks.** A lock while a call is in flight stops it: a `read`
 //! delivers nothing, a `put` or `commit` reports the backup ended, and a
@@ -66,15 +74,17 @@ use envcloak_ipc::view::{
     RestoreStatementView,
 };
 use envcloak_ipc::{RpcError, WireSecret};
-use envcloak_policy::{Ancestor, ProcessInstance, ProofRefusal, SubjectEvidence, SubjectKind};
-use envcloak_sys::{PeerIdentity, StartTime};
+use envcloak_policy::{
+    Ancestor, EvidenceError, ProcessInstance, ProofRefusal, SubjectEvidence, SubjectKind,
+};
+use envcloak_sys::{PeerIdentity, ProcessWatch, StartTime};
 use sha2::{Digest, Sha256};
 
 use crate::audit::AuditEvent;
 use crate::clock::Clocks;
 use crate::import::prove_as;
 use crate::lock::Reading;
-use crate::requests::{alive, evidence, refuse_unless_prover, subject_summary};
+use crate::requests::{evidence, refuse_unless_prover, subject_summary};
 use crate::server::{Shared, locked, refuse_if_traced};
 use crate::state::{State, vault_reason};
 
@@ -91,6 +101,11 @@ pub const MAX_UPLOADS_PER_ROOT: usize = 4;
 pub const UPLOAD_IDLE: Duration = Duration::from_secs(120);
 /// Restore leases open at once.
 pub const MAX_LEASES: usize = 16;
+/// Creators of committed backups awaiting a result that the daemon keeps
+/// watching ([`ProcessWatch`], a descriptor each on Linux). Past it, a
+/// creator is looked up in the process table instead, which answers the
+/// same.
+pub const MAX_CREATOR_WATCHES: usize = 64;
 /// Backups `backup.v2.list` names, newest first.
 pub const MAX_LISTED: usize = 512;
 // Every process of a creator's chain the daemon reads is sealed.
@@ -227,25 +242,48 @@ fn same_instance(owner: &BackupOwner, peer: &PeerIdentity) -> bool {
         }
 }
 
-/// Whether `owner` still runs: in this boot, and alive.
-fn owner_alive(owner: &BackupOwner) -> bool {
+/// Whether process instance `i` still runs: a process that exited and is
+/// not yet reaped (a zombie) keeps its pid and start time but does not.
+fn running(i: &ProcessInstance) -> bool {
+    envcloak_sys::process_running(i.pid, i.start_time)
+}
+
+/// Whether `owner` still runs: in this boot, and running, as `watch` says
+/// when the daemon holds one for it (taken from the same process
+/// instance), or as the process table says. A process that exited and is
+/// not yet reaped does not run.
+fn owner_alive(owner: &BackupOwner, watch: Option<&ProcessWatch>) -> bool {
     this_boots(owner.boot)
-        && alive(&ProcessInstance {
-            pid: owner.pid,
-            start_time: StartTime::from_raw(owner.start_time),
-            pidversion: owner.token,
-            exe: None,
-        })
+        && match watch {
+            Some(w) => w.running(),
+            None => envcloak_sys::process_running(owner.pid, StartTime::from_raw(owner.start_time)),
+        }
 }
 
 /// Whether `peer` may act as `owner`: it is that process instance, and
-/// that instance still runs. A connection outlives the process that made
-/// it when the descriptor was passed on or inherited; on Linux the kernel
-/// keeps naming the process that connected, so after it exits a call on
-/// that connection is no one's (macOS closes it instead: the peer
-/// changed).
-fn owner_may_act(owner: &BackupOwner, peer: &PeerIdentity) -> bool {
-    same_instance(owner, peer) && owner_alive(owner)
+/// that instance still runs ([`owner_alive`]). A connection outlives the
+/// process that made it when the descriptor was passed on or inherited;
+/// on Linux the kernel keeps naming the process that connected, so after
+/// it exits, before or after it is reaped, a call on that connection is
+/// no one's (macOS closes it instead: the peer changed).
+fn owner_may_act(owner: &BackupOwner, watch: Option<&ProcessWatch>, peer: &PeerIdentity) -> bool {
+    same_instance(owner, peer) && owner_alive(owner, watch)
+}
+
+/// A watch of `peer`'s process instance, refused (`evidence`,
+/// `caller_gone`) when that process no longer runs: a call on the
+/// connection of a process that exited, reaped or not, begins nothing and
+/// opens no lease.
+fn watch_of(peer: &PeerIdentity) -> Result<ProcessWatch, RpcError> {
+    let w = ProcessWatch::new(peer.pid, peer.start_time);
+    if w.running() {
+        Ok(w)
+    } else {
+        Err(RpcError::with_reason(
+            ErrorKind::Evidence,
+            EvidenceError::CallerGone.token(),
+        ))
+    }
 }
 
 /// The processes of `e`'s chain the restore's session and terminal check
@@ -286,7 +324,7 @@ fn shares_with_creator(caller: &SubjectEvidence, c: &BackupCreator) -> bool {
             agent: None,
         })
         .collect();
-    caller.shares_session_or_terminal(&scope, &alive)
+    caller.shares_session_or_terminal(&scope, &running)
 }
 
 /// A backup in progress's writer, shared by the calls that use it. Boxed,
@@ -297,6 +335,8 @@ type SharedWriter = Arc<Mutex<Option<Box<FileBackupV2Writer>>>>;
 /// A backup in progress.
 struct Upload {
     owner: BackupOwner,
+    /// Its creator's process, watched for its exit.
+    watch: ProcessWatch,
     /// The root of its creator's subject: at most
     /// [`MAX_UPLOADS_PER_ROOT`] are in progress for one.
     root: ProcessInstance,
@@ -307,9 +347,14 @@ struct Upload {
     last_used: Duration,
 }
 
+/// A lease's backup, opened and checked, and its recorded results.
+type Leased = (Arc<FileBackupV2Reader>, Arc<Vec<Option<[u8; 32]>>>);
+
 /// A restore lease.
 struct Lease {
     owner: BackupOwner,
+    /// Its process, watched for its exit.
+    watch: ProcessWatch,
     /// The caller's controlling terminal at the proof.
     terminal: Option<u64>,
     reader: Arc<FileBackupV2Reader>,
@@ -325,6 +370,11 @@ struct Lease {
 pub struct Registry {
     uploads: HashMap<FileBackupId, Upload>,
     leases: HashMap<FileBackupId, Lease>,
+    /// The creators of committed backups whose results are not all
+    /// recorded, watched from their upload on: at most
+    /// [`MAX_CREATOR_WATCHES`], each dropped once its process exited or
+    /// its backup's results are all in.
+    creators: HashMap<FileBackupId, ProcessWatch>,
     /// Bumped at every lock: a restore that began before one gets no
     /// lease.
     locks: u64,
@@ -335,13 +385,15 @@ impl core::fmt::Debug for Registry {
         f.debug_struct("Registry")
             .field("uploads", &self.uploads.len())
             .field("leases", &self.leases.len())
+            .field("creators", &self.creators.len())
             .finish_non_exhaustive()
     }
 }
 
 impl Registry {
     /// A lock ends every backup in progress (their staging directories
-    /// go) and every restore lease.
+    /// go) and every restore lease. The creators' watches stay: they hold
+    /// nothing of the vault.
     pub fn on_lock(&mut self) {
         self.uploads.clear();
         self.leases.clear();
@@ -349,16 +401,71 @@ impl Registry {
     }
 
     /// Drops the backups in progress whose creator exited or that went
-    /// [`UPLOAD_IDLE`] without a call, and the leases whose process exited
-    /// or that sat idle for [`LEASE_IDLE`], at awake time `awake`.
+    /// [`UPLOAD_IDLE`] without a call, the leases whose process exited or
+    /// that sat idle for [`LEASE_IDLE`], at awake time `awake`, and the
+    /// watches of creators that exited. Exited means reaped or not.
     pub fn sweep(&mut self, awake: Duration) {
         self.uploads.retain(|_, u| {
-            awake.saturating_sub(u.last_used) <= UPLOAD_IDLE && owner_alive(&u.owner)
+            awake.saturating_sub(u.last_used) <= UPLOAD_IDLE
+                && owner_alive(&u.owner, Some(&u.watch))
         });
         self.leases.retain(|_, l| {
-            awake.saturating_sub(l.last_used) <= LEASE_IDLE && owner_alive(&l.owner)
+            awake.saturating_sub(l.last_used) <= LEASE_IDLE && owner_alive(&l.owner, Some(&l.watch))
         });
+        self.creators.retain(|_, w| w.running());
     }
+
+    /// The backup of `lease` for `peer` on controlling terminal
+    /// `terminal` (the outer `None` when its process could not be read)
+    /// at awake time `awake`, the lease counting as used then: `None`
+    /// unless the lease is that process's, while it runs, on the terminal
+    /// of its proof, and has not sat idle past [`LEASE_IDLE`] (an idle one
+    /// ends here).
+    fn lease_for(
+        &mut self,
+        lease: &FileBackupId,
+        peer: &PeerIdentity,
+        terminal: Option<Option<u64>>,
+        awake: Duration,
+    ) -> Option<Leased> {
+        let l = self.leases.get_mut(lease)?;
+        if !owner_may_act(&l.owner, Some(&l.watch), peer) || terminal != Some(l.terminal) {
+            return None;
+        }
+        if awake.saturating_sub(l.last_used) > LEASE_IDLE {
+            self.leases.remove(lease);
+            return None;
+        }
+        l.last_used = awake;
+        Some((Arc::clone(&l.reader), Arc::clone(&l.results)))
+    }
+
+    /// Whether `lease` still serves `peer` on terminal `terminal` at awake
+    /// time `awake`, as [`Registry::lease_for`] asks, without counting a
+    /// use: checked again once a chunk is read, just before it goes out.
+    fn lease_stands(
+        &self,
+        lease: &FileBackupId,
+        peer: &PeerIdentity,
+        terminal: Option<Option<u64>>,
+        awake: Duration,
+    ) -> bool {
+        self.leases.get(lease).is_some_and(|l| {
+            owner_may_act(&l.owner, Some(&l.watch), peer)
+                && terminal == Some(l.terminal)
+                && awake.saturating_sub(l.last_used) <= LEASE_IDLE
+        })
+    }
+}
+
+/// The controlling terminal of `peer`'s process now, read for its pid
+/// only while that pid still has the start time the kernel gave at
+/// accept: `None` when it cannot be read so.
+fn terminal_now(peer: &PeerIdentity) -> Option<Option<u64>> {
+    envcloak_sys::proc_info(peer.pid)
+        .ok()
+        .filter(|i| i.start_time == peer.start_time)
+        .map(|i| i.controlling_tty)
 }
 
 fn invalid() -> RpcError {
@@ -528,7 +635,7 @@ fn open_reader(shared: &Shared, id: &FileBackupId) -> Result<FileBackupV2Reader,
 /// anyone else, `no_such_backup` when there is none.
 fn not_in_progress(shared: &Shared, id: &FileBackupId, peer: &PeerIdentity) -> RpcError {
     match open_reader(shared, id) {
-        Ok(r) if owner_may_act(&r.meta().creator.owner, peer) => {
+        Ok(r) if owner_may_act(&r.meta().creator.owner, None, peer) => {
             RpcError::new(ErrorKind::BackupFrozen)
         }
         Ok(_) => RpcError::new(ErrorKind::NotBackupOwner),
@@ -548,7 +655,7 @@ fn writer_for(
         s.unlocked()?;
         let awake = shared.clocks.awake();
         match s.backups().uploads.get_mut(id) {
-            Some(u) if owner_may_act(&u.owner, peer) => {
+            Some(u) if owner_may_act(&u.owner, Some(&u.watch), peer) => {
                 u.last_used = awake;
                 return Ok((Arc::clone(&u.writer), u.subject.clone(), u.purpose));
             }
@@ -592,6 +699,7 @@ pub fn begin(
     check_plan(&plan).map_err(|e| backup_error(&e))?;
     refuse_if_traced()?;
     let caller = evidence(shared, peer, &p.claims)?;
+    let watch = watch_of(peer)?;
     let kind = kind_of(&caller);
     let creator = BackupCreator {
         kind,
@@ -627,6 +735,7 @@ pub fn begin(
     let id = w.id();
     let upload = Upload {
         owner: owner_of(peer),
+        watch,
         root,
         writer: Arc::new(Mutex::new(Some(Box::new(w)))),
         subject: subject_summary(peer, &caller),
@@ -678,7 +787,9 @@ fn still_in_progress(
 ) -> Result<(), RpcError> {
     s.unlocked()?;
     match s.backups().uploads.get(id) {
-        Some(u) if Arc::ptr_eq(&u.writer, writer) && owner_alive(&u.owner) => Ok(()),
+        Some(u) if Arc::ptr_eq(&u.writer, writer) && owner_alive(&u.owner, Some(&u.watch)) => {
+            Ok(())
+        }
         _ => Err(RpcError::new(ErrorKind::NoSuchBackup)),
     }
 }
@@ -708,8 +819,15 @@ pub fn commit(
         let w = g.as_mut().ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
         w.install().map_err(|e| backup_error(&e))
     });
-    s.backups().uploads.remove(&id);
+    let upload = s.backups().uploads.remove(&id);
     let done = installed?;
+    // The creator stays watched while the backup awaits its results.
+    let reg = s.backups();
+    if let Some(u) = upload {
+        if reg.creators.len() < MAX_CREATOR_WATCHES {
+            reg.creators.insert(id, u.watch);
+        }
+    }
     s.audit(AuditEvent::BackupV2Committed {
         pid: peer.pid,
         subject,
@@ -733,12 +851,13 @@ pub fn record_result(
 ) -> Result<BackupResultView, RpcError> {
     let id = parse_id(&p.id)?;
     let after = parse_sha256(&p.sha256_after).ok_or_else(invalid)?;
+    let file = usize::try_from(p.file).map_err(|_| invalid())?;
     {
         let mut s = locked(&shared.state);
         s.unlocked()?;
         if let Some(u) = s.backups().uploads.get(&id) {
             // Not committed yet: there is nothing to record a result for.
-            return Err(if owner_may_act(&u.owner, peer) {
+            return Err(if owner_may_act(&u.owner, Some(&u.watch), peer) {
                 invalid()
             } else {
                 RpcError::new(ErrorKind::NotBackupOwner)
@@ -746,12 +865,19 @@ pub fn record_result(
         }
     }
     let reader = open_reader(shared, &id)?;
-    // From the creator, while it lives (D-07): once it has exited the
-    // backup stays `result_unrecorded`, whoever holds its connection.
-    if !owner_may_act(&reader.meta().creator.owner, peer) {
+    // From the creator, while it lives (D-07): once it has exited, reaped
+    // or not, the backup stays `result_unrecorded`, whoever holds its
+    // connection.
+    let creator_may_act = |s: &mut State| {
+        owner_may_act(
+            &reader.meta().creator.owner,
+            s.backups().creators.get(&id),
+            peer,
+        )
+    };
+    if !creator_may_act(&mut locked(&shared.state)) {
         return Err(RpcError::new(ErrorKind::NotBackupOwner));
     }
-    let file = usize::try_from(p.file).map_err(|_| invalid())?;
     reader
         .record_result(file, &after)
         .map_err(|e| match e.kind() {
@@ -760,9 +886,13 @@ pub fn record_result(
         })?;
     let results = reader.results().map_err(|e| backup_error(&e))?;
     let recorded = results.iter().filter(|r| r.is_some()).count();
+    let complete = recorded == results.len();
+    if complete {
+        locked(&shared.state).backups().creators.remove(&id);
+    }
     Ok(BackupResultView {
         recorded: u32::try_from(recorded).unwrap_or(u32::MAX),
-        complete: recorded == results.len(),
+        complete,
     })
 }
 
@@ -771,7 +901,7 @@ pub fn record_result(
 fn state_of(r: &FileBackupV2Reader, results: &[Option<[u8; 32]>]) -> BackupStateView {
     if results.iter().all(Option::is_some) {
         BackupStateView::Complete
-    } else if owner_alive(&r.meta().creator.owner) {
+    } else if owner_alive(&r.meta().creator.owner, None) {
         BackupStateView::AwaitingResult
     } else {
         BackupStateView::ResultUnrecorded
@@ -859,6 +989,7 @@ pub fn open_restore(
     refuse_if_traced()?;
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, METHOD)?;
+    let watch = watch_of(peer)?;
     // What the backup is, before the passphrase is looked at.
     let (reader, results) = {
         let r = open_reader(shared, &id)?;
@@ -937,6 +1068,7 @@ pub fn open_restore(
         lease,
         Lease {
             owner: owner_of(peer),
+            watch,
             terminal: caller.chain().first().and_then(|a| a.terminal),
             reader,
             results,
@@ -959,26 +1091,13 @@ pub fn read(
     let none = || RpcError::new(ErrorKind::NoSuchLease);
     let lease = FileBackupId::parse(&p.lease).ok_or_else(none)?;
     refuse_if_traced()?;
-    // The caller's terminal now, read for this pid only while it still has
-    // the start time the kernel gave at accept.
-    let terminal = envcloak_sys::proc_info(peer.pid)
-        .ok()
-        .filter(|i| i.start_time == peer.start_time)
-        .map(|i| i.controlling_tty);
-    let awake = shared.clocks.awake();
     let (reader, results) = {
+        let terminal = terminal_now(peer);
+        let awake = shared.clocks.awake();
         let mut s = locked(&shared.state);
-        let reg = s.backups();
-        let l = reg.leases.get_mut(&lease).ok_or_else(none)?;
-        if !owner_may_act(&l.owner, peer) || terminal != Some(l.terminal) {
-            return Err(none());
-        }
-        if awake.saturating_sub(l.last_used) > LEASE_IDLE {
-            reg.leases.remove(&lease);
-            return Err(none());
-        }
-        l.last_used = awake;
-        (Arc::clone(&l.reader), Arc::clone(&l.results))
+        s.backups()
+            .lease_for(&lease, peer, terminal, awake)
+            .ok_or_else(none)?
     };
     let file = usize::try_from(p.file).map_err(|_| invalid())?;
     let (data, last) = reader
@@ -986,16 +1105,16 @@ pub fn read(
         .map_err(|e| backup_error(&e))?;
     envcloak_sys::pause_point("backup.v2.read");
     // A delivery (SPEC "Lock"): the chunk goes out only while the lease
-    // still stands, checked under the state lock after it was read. A
-    // lock, the lease's end or its owner's exit meanwhile delivers
-    // nothing.
+    // still stands, checked under the state lock after it was read, with
+    // the caller's terminal and the clocks read again. A lock, the lease's
+    // end, its owner's exit, a move to another terminal or a read that
+    // outlasted the idle limit meanwhile delivers nothing.
     {
+        let terminal = terminal_now(peer);
+        let awake = shared.clocks.awake();
         let mut s = locked(&shared.state);
-        let standing = s.unlocked().is_ok()
-            && s.backups()
-                .leases
-                .get(&lease)
-                .is_some_and(|l| owner_may_act(&l.owner, peer));
+        let standing =
+            s.unlocked().is_ok() && s.backups().lease_stands(&lease, peer, terminal, awake);
         if !standing {
             return Err(none());
         }
@@ -1157,17 +1276,37 @@ mod tests {
         assert_eq!(parse_sha256(&"g".repeat(64)), None);
     }
 
+    fn me() -> envcloak_sys::ProcInfo {
+        envcloak_sys::proc_info(i32::try_from(std::process::id()).unwrap()).unwrap()
+    }
+
+    fn peer_of(i: &envcloak_sys::ProcInfo) -> PeerIdentity {
+        PeerIdentity {
+            uid: 0,
+            pid: i.pid,
+            start_time: i.start_time,
+            pidversion: None,
+            source: envcloak_sys::PeerSource::PeerCred,
+        }
+    }
+
+    fn lease_of(owner: BackupOwner, terminal: Option<u64>, last_used: Duration) -> Lease {
+        Lease {
+            owner,
+            watch: ProcessWatch::new(owner.pid, StartTime::from_raw(owner.start_time)),
+            terminal,
+            reader: test_reader(),
+            results: Arc::new(Vec::new()),
+            last_used,
+        }
+    }
+
     /// A lease, an upload and a creator's evidence go with their process;
     /// a lease also after 60 seconds idle (an injected clock).
     #[test]
     fn a_lease_ends_after_60_seconds_idle_or_when_its_process_exits() {
-        let me = envcloak_sys::proc_info(i32::try_from(std::process::id()).unwrap()).unwrap();
-        let owner = BackupOwner {
-            pid: me.pid,
-            start_time: me.start_time.raw(),
-            token: None,
-            boot: this_boot(),
-        };
+        let me = me();
+        let owner = owner_of(&peer_of(&me));
         let gone = BackupOwner {
             start_time: me.start_time.raw() + 1,
             ..owner
@@ -1176,16 +1315,8 @@ mod tests {
         let mut reg = Registry::default();
         let t0 = Duration::from_secs(1000);
         for (n, o) in [(1u8, owner), (2, gone)] {
-            reg.leases.insert(
-                FileBackupId([n; 16]),
-                Lease {
-                    owner: o,
-                    terminal: None,
-                    reader: test_reader(),
-                    results: Arc::new(Vec::new()),
-                    last_used: t0,
-                },
-            );
+            reg.leases
+                .insert(FileBackupId([n; 16]), lease_of(o, None, t0));
         }
         reg.sweep(t0);
         assert_eq!(alive_now(&reg), 1, "the lease of an exited process stays");
@@ -1195,29 +1326,131 @@ mod tests {
         assert_eq!(alive_now(&reg), 0, "a lease outlived 60 seconds idle");
     }
 
+    /// `read` takes a lease only for its process on the terminal of its
+    /// proof and within 60 seconds of its last use, an idle lease ending
+    /// there and then; and checks it again with the terminal and clock
+    /// read anew before a chunk goes out (injected clock and terminals;
+    /// the tick's sweep, which would end an idle lease first, is not
+    /// involved).
+    #[test]
+    fn a_read_takes_a_lease_only_on_its_terminal_and_within_its_idle_limit() {
+        let me = me();
+        let peer = peer_of(&me);
+        let tty = me.controlling_tty;
+        let other_tty = Some(Some(tty.map_or(1, |t| t ^ 1)));
+        let here = Some(tty);
+        let id = FileBackupId([7; 16]);
+        let t0 = Duration::from_secs(1000);
+        let mut reg = Registry::default();
+        reg.leases.insert(id, lease_of(owner_of(&peer), tty, t0));
+        // Another terminal, none readable, or another process: refused,
+        // and the lease stays.
+        assert!(reg.lease_for(&id, &peer, other_tty, t0).is_none());
+        assert!(reg.lease_for(&id, &peer, None, t0).is_none());
+        let stranger = PeerIdentity {
+            start_time: StartTime::from_raw(me.start_time.raw() + 1),
+            ..peer
+        };
+        assert!(reg.lease_for(&id, &stranger, here, t0).is_none());
+        assert_eq!(reg.leases.len(), 1);
+        // At its idle limit it serves, and counts as used then.
+        let used = t0 + LEASE_IDLE;
+        assert!(reg.lease_for(&id, &peer, here, used).is_some());
+        // Before delivery: only on its terminal, within the limit.
+        assert!(reg.lease_stands(&id, &peer, here, used + LEASE_IDLE));
+        assert!(!reg.lease_stands(&id, &peer, other_tty, used));
+        assert!(!reg.lease_stands(&id, &peer, None, used));
+        assert!(!reg.lease_stands(&id, &stranger, here, used));
+        assert!(
+            !reg.lease_stands(&id, &peer, here, used + LEASE_IDLE + Duration::from_secs(1)),
+            "a chunk read past the idle limit went out"
+        );
+        // Past the limit since its last use: refused, and ended.
+        assert!(
+            reg.lease_for(&id, &peer, here, used + LEASE_IDLE + Duration::from_secs(1))
+                .is_none(),
+            "an idle lease served a read"
+        );
+        assert!(reg.leases.is_empty(), "an idle lease was kept");
+    }
+
     /// An owner-bound call is answered only while the owner runs: a caller
     /// with the pid and start time of a process that has exited (a
     /// connection it passed on before it exited, on Linux) is the owner's
     /// instance but may not act for it.
     #[test]
     fn only_a_live_owner_may_act() {
-        let me = envcloak_sys::proc_info(i32::try_from(std::process::id()).unwrap()).unwrap();
-        let peer = PeerIdentity {
-            uid: 0,
-            pid: me.pid,
-            start_time: me.start_time,
-            pidversion: None,
-            source: envcloak_sys::PeerSource::PeerCred,
-        };
-        assert!(owner_may_act(&owner_of(&peer), &peer));
+        let me = me();
+        let peer = peer_of(&me);
+        let w = ProcessWatch::new(peer.pid, peer.start_time);
+        assert!(owner_may_act(&owner_of(&peer), None, &peer));
+        assert!(owner_may_act(&owner_of(&peer), Some(&w), &peer));
         let gone = PeerIdentity {
             start_time: StartTime::from_raw(me.start_time.raw() + 1),
             ..peer
         };
         let owner = owner_of(&gone);
+        let gw = ProcessWatch::new(gone.pid, gone.start_time);
         assert!(same_instance(&owner, &gone));
-        assert!(!owner_may_act(&owner, &gone));
-        assert!(!owner_may_act(&owner, &peer));
+        assert!(!owner_may_act(&owner, None, &gone));
+        assert!(!owner_may_act(&owner, Some(&gw), &gone));
+        assert!(!owner_may_act(&owner, None, &peer));
+        assert!(watch_of(&gone).is_err());
+        assert!(watch_of(&peer).is_ok());
+    }
+
+    /// A creator that exited and is not yet reaped (a zombie) keeps its
+    /// pid and start time, but no longer runs: it may not act, by its
+    /// watch or by the process table, its upload and lease go at the
+    /// sweep, its watch is dropped, and no new watch is taken of it.
+    #[test]
+    fn an_exited_unreaped_owner_may_not_act() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read x"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let info = envcloak_sys::proc_info(i32::try_from(child.id()).unwrap()).unwrap();
+        let peer = peer_of(&info);
+        let owner = owner_of(&peer);
+        let t0 = Duration::from_secs(1000);
+        let mut reg = Registry::default();
+        reg.leases
+            .insert(FileBackupId([1; 16]), lease_of(owner, None, t0));
+        reg.uploads
+            .insert(FileBackupId([2; 16]), upload_of(owner, t0));
+        reg.creators.insert(
+            FileBackupId([3; 16]),
+            ProcessWatch::new(peer.pid, peer.start_time),
+        );
+        let watch = watch_of(&peer).unwrap();
+        assert!(owner_may_act(&owner, Some(&watch), &peer));
+        assert!(owner_may_act(&owner, None, &peer));
+        reg.sweep(t0);
+        assert_eq!(
+            (reg.leases.len(), reg.uploads.len(), reg.creators.len()),
+            (1, 1, 1)
+        );
+        drop(child.stdin.take());
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while envcloak_sys::process_running(peer.pid, peer.start_time) {
+            assert!(std::time::Instant::now() < end, "the child never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Not reaped yet: the process table still has it.
+        assert_eq!(
+            envcloak_sys::proc_info(peer.pid).unwrap().start_time,
+            peer.start_time
+        );
+        assert!(!owner_may_act(&owner, Some(&watch), &peer));
+        assert!(!owner_may_act(&owner, None, &peer));
+        assert!(watch_of(&peer).is_err());
+        reg.sweep(t0);
+        assert_eq!(
+            (reg.leases.len(), reg.uploads.len(), reg.creators.len()),
+            (0, 0, 0)
+        );
+        child.wait().unwrap();
     }
 
     /// A process instance recorded in another boot is neither alive nor
@@ -1225,16 +1458,10 @@ mod tests {
     /// counts from boot, and a process of a later boot can have both again.
     #[test]
     fn an_owner_of_another_boot_is_neither_alive_nor_the_caller() {
-        let me = envcloak_sys::proc_info(i32::try_from(std::process::id()).unwrap()).unwrap();
-        let peer = PeerIdentity {
-            uid: 0,
-            pid: me.pid,
-            start_time: me.start_time,
-            pidversion: None,
-            source: envcloak_sys::PeerSource::PeerCred,
-        };
+        let peer = peer_of(&me());
         let here = owner_of(&peer);
-        assert!(same_instance(&here, &peer) && owner_alive(&here));
+        let w = ProcessWatch::new(peer.pid, peer.start_time);
+        assert!(same_instance(&here, &peer) && owner_alive(&here, None));
         for other in [Some([0xee; 16]), None, Some([0; 16])] {
             if other == this_boot() {
                 continue;
@@ -1243,8 +1470,27 @@ mod tests {
                 boot: other,
                 ..here
             };
-            assert!(!owner_alive(&there), "{other:?}");
+            assert!(!owner_alive(&there, None), "{other:?}");
+            assert!(!owner_alive(&there, Some(&w)), "{other:?}");
             assert!(!same_instance(&there, &peer), "{other:?}");
+        }
+    }
+
+    fn upload_of(owner: BackupOwner, last_used: Duration) -> Upload {
+        let me = me();
+        Upload {
+            owner,
+            watch: ProcessWatch::new(owner.pid, StartTime::from_raw(owner.start_time)),
+            root: ProcessInstance {
+                pid: me.pid,
+                start_time: me.start_time,
+                pidversion: None,
+                exe: None,
+            },
+            writer: Arc::new(Mutex::new(Some(Box::new(test_writer())))),
+            subject: SubjectSummary::default(),
+            purpose: BackupPurpose::Scrub,
+            last_used,
         }
     }
 
@@ -1253,13 +1499,8 @@ mod tests {
     /// holds a slot it does not use.
     #[test]
     fn an_upload_ends_after_its_idle_limit_or_when_its_creator_exits() {
-        let me = envcloak_sys::proc_info(i32::try_from(std::process::id()).unwrap()).unwrap();
-        let owner = BackupOwner {
-            pid: me.pid,
-            start_time: me.start_time.raw(),
-            token: None,
-            boot: this_boot(),
-        };
+        let me = me();
+        let owner = owner_of(&peer_of(&me));
         let gone = BackupOwner {
             start_time: me.start_time.raw() + 1,
             ..owner
@@ -1267,22 +1508,7 @@ mod tests {
         let t0 = Duration::from_secs(1000);
         let mut reg = Registry::default();
         for (n, o) in [(1u8, owner), (2, gone)] {
-            reg.uploads.insert(
-                FileBackupId([n; 16]),
-                Upload {
-                    owner: o,
-                    root: ProcessInstance {
-                        pid: me.pid,
-                        start_time: me.start_time,
-                        pidversion: None,
-                        exe: None,
-                    },
-                    writer: Arc::new(Mutex::new(Some(Box::new(test_writer())))),
-                    subject: SubjectSummary::default(),
-                    purpose: BackupPurpose::Scrub,
-                    last_used: t0,
-                },
-            );
+            reg.uploads.insert(FileBackupId([n; 16]), upload_of(o, t0));
         }
         reg.sweep(t0);
         assert_eq!(
