@@ -1926,3 +1926,91 @@ fn a_list_holds_no_lock_while_it_opens_backups() {
     assert_eq!(opened, 1, "the list went on opening backups after the lock");
     f.sweep();
 }
+
+/// How many times a test daemon opened a backup's `data` file, and read
+/// the backups directory, so far: its test trace says so at each.
+fn backup_reads(d: &Daemon) -> (usize, usize) {
+    let log = d.log_bytes();
+    let log = String::from_utf8_lossy(&log);
+    let count = |what: &str| log.lines().filter(|l| l.contains(what)).count();
+    (
+        count("envcloak test: file backup v2 data opened"),
+        count("envcloak test: file backup v2 directory listed"),
+    )
+}
+
+/// `list` opens each backup once, where its listing found it, and a call
+/// on one backup opens that one alone: with five backups, one `list`
+/// reads the backups directory once and opens ten `data` files (five
+/// headers read for the listing, five backups opened), never looking a
+/// backup up again by its id; a `record_result` finds its backup by name
+/// and opens one `data` file, never every backup's header.
+#[test]
+fn a_list_opens_each_backup_once_and_a_call_opens_one() {
+    let f = Fixture::new();
+    let n = 5;
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let files = [Spec::made(
+            &f.claude(&format!("projects/p/once{i}.jsonl")),
+            30,
+            60 + i as u8,
+        )];
+        ids.push(f.backup("scrub", &files));
+    }
+    let (data, dirs) = backup_reads(&f.d);
+    assert_eq!(f.list().backups.len(), n);
+    let (data_now, dirs_now) = backup_reads(&f.d);
+    assert_eq!(
+        (data_now - data, dirs_now - dirs),
+        (2 * n, 1),
+        "one list of {n} backups: (data files opened, directory reads)"
+    );
+    client(&f.home)
+        .backup_v2_record_result(&ids[2], 0, &[9; 32])
+        .unwrap();
+    let (data_then, dirs_then) = backup_reads(&f.d);
+    assert_eq!(
+        (data_then - data_now, dirs_then - dirs_now),
+        (1, 1),
+        "one record_result among {n} backups: (data files opened, directory reads)"
+    );
+    f.sweep();
+}
+
+/// A `begin` purges old backups outside the daemon's state lock: stopped
+/// by a barrier in its purge, the daemon still answers `status` and
+/// lists the backups meanwhile; once released, the backup begins.
+#[test]
+fn a_purge_holds_no_lock() {
+    let mut f = Fixture::pausing(Some("backup.v2.purge"));
+    let files = [Spec::made(&f.claude("projects/p/purge.jsonl"), 30, 70)];
+    let paths = f.paths();
+    let params = begin_params("scrub", &files, &[]);
+    let begun = std::thread::spawn(move || {
+        Client::connect(&paths)?
+            .backup_v2_begin(&params)
+            .map(|b| b.id)
+    });
+    f.wait_paused("backup.v2.purge");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let paths = f.paths();
+    std::thread::spawn(move || {
+        let answered = Client::connect(&paths).and_then(|mut c| {
+            let state = c.status()?.vault.state;
+            let listed = Client::connect(&paths)?.backup_v2_list()?.backups.len();
+            Ok((state, listed))
+        });
+        let _ = tx.send(answered);
+    });
+    let answered = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("status or list waited for the purge");
+    assert_eq!(answered.unwrap(), (VaultState::Unlocked, 0));
+    f.release();
+    let id = begun.join().unwrap().unwrap();
+    put_all(&f.paths(), f.files_cs(), &id, &files).unwrap();
+    client(&f.home).backup_v2_commit(&id).unwrap();
+    assert_eq!(f.list().backups.len(), 1);
+    f.sweep();
+}

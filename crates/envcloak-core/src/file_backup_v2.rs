@@ -1114,17 +1114,42 @@ impl FileBackupsV2 {
     /// As [`Vault::open_file_backup_v2`].
     pub fn open(&self, id: &FileBackupId) -> Result<FileBackupV2Reader, VaultError> {
         let dir = find_backup_v2(&self.paths, id)?.ok_or(VaultErrorKind::NotFound)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(dir.join(DATA))
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    damaged()
-                } else {
-                    VaultError::from(e)
-                }
-            })?;
+        self.open_dir(dir, id)
+    }
+
+    /// Opens a backup [`list_file_backups_v2`] found, where it found it,
+    /// as [`FileBackupsV2::open`] opens one by its id, without looking
+    /// for it again: a listing then opens each backup once. Its directory
+    /// must be one in this vault's backups directory, named for its id;
+    /// the header in it must name that id too.
+    ///
+    /// # Errors
+    /// [`VaultErrorKind::NotFound`] for a directory that is not one of
+    /// this vault's backups; as [`FileBackupsV2::open`] otherwise.
+    pub fn open_listed(&self, listed: &ListedV2) -> Result<FileBackupV2Reader, VaultError> {
+        let backups = std::fs::canonicalize(&self.paths.backups_dir)?;
+        check_private_dir(&backups)?;
+        let ours = listed.dir.parent() == Some(backups.as_path())
+            && listed
+                .dir
+                .file_name()
+                .and_then(listed_id)
+                .is_some_and(|id| id == listed.id);
+        if !ours {
+            return Err(VaultErrorKind::NotFound.into());
+        }
+        self.open_dir(listed.dir.clone(), &listed.id)
+    }
+
+    /// Opens the backup in `dir`, which must be backup `id`'s.
+    fn open_dir(&self, dir: PathBuf, id: &FileBackupId) -> Result<FileBackupV2Reader, VaultError> {
+        let file = open_data(&dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                damaged()
+            } else {
+                VaultError::from(e)
+            }
+        })?;
         let len = {
             let m = file.metadata()?;
             if !m.is_file() {
@@ -1454,18 +1479,50 @@ fn result_temp(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
-/// The directory of backup `id` in `p`'s backups directory, by its name.
+/// Opens the `data` file of the backup in `dir`, read only, never through
+/// a symlink and never waiting on a FIFO. Every open of one goes through
+/// here: a test build's trace counts them (`file backup v2 data opened`).
+fn open_data(dir: &Path) -> std::io::Result<File> {
+    envcloak_sys::test_event("file backup v2 data opened");
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(DATA))
+}
+
+/// The id a committed backup's directory is named for:
+/// `files2-<time>-<id>`. `None` for any other name.
+fn listed_id(name: &std::ffi::OsStr) -> Option<FileBackupId> {
+    name.to_str()
+        .filter(|n| n.starts_with(PREFIX))
+        .and_then(|n| n.rsplit('-').next())
+        .and_then(FileBackupId::parse)
+}
+
+/// The directory of backup `id` in `p`'s backups directory, by its name
+/// alone: no backup is opened to find it. The first by name when two
+/// have the id.
 fn find_backup_v2(p: &VaultPaths, id: &FileBackupId) -> Result<Option<PathBuf>, VaultError> {
-    let suffix = format!("-{id}");
-    Ok(list_file_backups_v2(p)?
-        .into_iter()
-        .find(|e| {
-            e.dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(&suffix))
-        })
-        .map(|e| e.dir))
+    let dir = match std::fs::canonicalize(&p.backups_dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    check_private_dir(&dir)?;
+    envcloak_sys::test_event("file backup v2 directory listed");
+    let mut found: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        // `DirEntry` reads the entry itself: a symlink is not followed.
+        if listed_id(&entry.file_name()) != Some(*id) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if found.as_ref().is_none_or(|f| path < *f) {
+            found = Some(path);
+        }
+    }
+    Ok(found)
 }
 
 /// A backup's directory, as a listing finds it.
@@ -1487,8 +1544,10 @@ fn modified_secs(m: &std::fs::Metadata) -> u64 {
 }
 
 /// Every committed backup in `p`'s backups directory: directories (never
-/// a symlink) named `files2-<time>-<id>`. Staging directories are never
-/// listed. Sorted by name, so oldest first.
+/// a symlink) named `files2-<time>-<id>`, each one's header read once for
+/// its time. Staging directories are never listed. Sorted by name, so
+/// oldest first. [`FileBackupsV2::open_listed`] opens one where it was
+/// found.
 ///
 /// # Errors
 /// When the directory cannot be read.
@@ -1499,16 +1558,11 @@ pub fn list_file_backups_v2(p: &VaultPaths) -> Result<Vec<ListedV2>, VaultError>
         Err(e) => return Err(e.into()),
     };
     check_private_dir(&dir)?;
+    envcloak_sys::test_event("file backup v2 directory listed");
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
-        let name = entry.file_name();
-        let Some(id) = name
-            .to_str()
-            .filter(|n| n.starts_with(PREFIX))
-            .and_then(|n| n.rsplit('-').next())
-            .and_then(FileBackupId::parse)
-        else {
+        let Some(id) = listed_id(&entry.file_name()) else {
             continue;
         };
         // `DirEntry` reads the entry itself: a symlink is not followed.
@@ -1517,10 +1571,7 @@ pub fn list_file_backups_v2(p: &VaultPaths) -> Result<Vec<ListedV2>, VaultError>
         }
         let path = entry.path();
         let mut head = [0u8; HEADER_LEN_V2];
-        let created_at = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path.join(DATA))
+        let created_at = open_data(&path)
             .ok()
             .filter(|f| read_at(f, &mut head, 0).is_ok())
             .and_then(|_| parse_header(&head).ok())

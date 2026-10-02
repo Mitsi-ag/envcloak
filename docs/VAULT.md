@@ -237,7 +237,9 @@ A chunk holds 512 KiB of its file (every chunk but a file's last is full; a file
 
 **Writing.** `Vault::begin_file_backup_v2` makes the staging directory and starts `data` (created exclusively, not following symlinks); `FileBackupV2Writer::put` takes each chunk in order at its exact length (another one, or another length, is refused and nothing is written), seals it and adds it to its file's SHA-256 (a hasher that wipes its state); `commit` refuses while a chunk is missing, then writes the metadata and the offset, syncs `data` and the staging directory (`seal`), renames it and syncs `backups/` (`install`); the daemon checks between the two, under its state lock, that the backup is still in progress (IPC.md "Backups v2"). A writer dropped before its commit removes its staging directory; a process killed before the rename leaves one, never listed. No plaintext copy is written anywhere.
 
-`purge_file_backups_v2` removes v2 backups whose header's `created_at` is more than 7 days old (their `data` and result files and the temporary names a stopped result left, then the directory; anything else in it keeps it) and staging directories unchanged for an hour (a symlink of that name is never followed or removed). The daemon runs it after each unlock and whenever a backup v2 begins. It needs no key.
+`purge_file_backups_v2` removes v2 backups whose header's `created_at` is more than 7 days old (their `data` and result files and the temporary names a stopped result left, then the directory; anything else in it keeps it) and staging directories unchanged for an hour (a symlink of that name is never followed or removed). The daemon runs it after each unlock and when a backup v2 begins, at most once a minute and outside its state lock. It needs no key.
+
+`list_file_backups_v2` reads `backups/` once and each backup's header once (for its time); `FileBackupsV2::open_listed` opens a listed backup where the listing found it (its directory must be one in `backups/` named for its id, and its header must name that id), and `FileBackupsV2::open` finds a backup by its directory's name alone, opening no other backup.
 
 ## Restore
 
