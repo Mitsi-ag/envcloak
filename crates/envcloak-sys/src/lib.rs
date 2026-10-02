@@ -32,7 +32,9 @@
 //!   and [`inherited_fd`] (a descriptor named by `--passphrase-fd`).
 //! - Caller evidence: [`proc_info`] and [`proc_argv`] (one process as the
 //!   kernel reports it) and [`ancestry`] (a peer's parent chain, checked
-//!   again after the walk).
+//!   again after the walk); [`process_running`] and [`ProcessWatch`]
+//!   (whether a process instance still runs, a zombie being one that does
+//!   not; a pidfd on Linux).
 //! - The runner (`envcloak run`): [`SignalRelay`] (signals caught and
 //!   handed to a thread that passes them on, each with whether a process
 //!   sent it, and marks between them), [`wait_for_exit`] and
@@ -75,6 +77,7 @@ mod sync;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod tty;
+mod watch;
 
 pub use alloc::{SystemBacking, WipingAllocator, wiping_allocator_active};
 pub use child::{Relayed, SignalRelay, has_exited, signal_group, signal_process, wait_for_exit};
@@ -105,8 +108,8 @@ pub use perm::{PRIVATE_UMASK, effective_uid, restrict_umask};
 pub use proc::{
     AncestryError, Argv, CDHASH_LEN, CodeSignature, ExeIdentity, LiveProcesses, MAX_ANCESTRY,
     MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, ProcInfo, ProcessTable, StatFields, ancestry,
-    ancestry_in, parse_cmdline, parse_proc_stat, parse_procargs2, parse_status_euid, proc_argv,
-    proc_info, reaches_top,
+    ancestry_in, parse_cmdline, parse_proc_stat, parse_procargs2, parse_stat_state,
+    parse_status_euid, proc_argv, proc_info, process_running, reaches_top, stat_state_exited,
 };
 pub use signal::{
     TerminationSignals, TerminationWatch, exit_by_signal, interrupt_ends_process,
@@ -115,3 +118,4 @@ pub use signal::{
 pub use sock::connect_unix;
 pub use sync::{SyncMethod, sync_file};
 pub use tty::{SecretInput, hung_up, wait_readable, wait_writable};
+pub use watch::ProcessWatch;

@@ -298,6 +298,20 @@ pub(super) fn proc_info(pid: i32) -> io::Result<ProcInfo> {
     })
 }
 
+pub(super) fn process_running(pid: i32, start: StartTime) -> bool {
+    // One read: the pid, the start time and the state are of one moment.
+    // `KERN_PROC_PID` answers for a zombie too, with `p_stat` `SZOMB`.
+    let Ok(kp) = kinfo(pid) else {
+        return false;
+    };
+    let t = &kp.kp_proc.p_starttime;
+    let (Ok(secs), Ok(micros)) = (u64::try_from(t.tv_sec), u64::try_from(t.tv_usec)) else {
+        return false;
+    };
+    StartTime::from_raw(secs.saturating_mul(1_000_000).saturating_add(micros)) == start
+        && u32::from(kp.kp_proc.p_stat.to_ne_bytes()[0]) != libc::SZOMB
+}
+
 /// `kern.argmax`: the size of the largest argument area, and so of the
 /// buffer `KERN_PROCARGS2` needs.
 fn argmax() -> io::Result<usize> {

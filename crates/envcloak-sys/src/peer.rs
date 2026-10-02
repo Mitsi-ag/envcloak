@@ -305,6 +305,7 @@ mod linux {
     use super::{
         PeerIdentity, PeerSource, StartTime, parse_stat_start_time, peer_gone, pretended_start_time,
     };
+    use crate::watch::linux::pidfd_alive;
 
     /// Slack, in clock ticks, for rounding between the boot clock and the
     /// kernel's start time.
@@ -402,27 +403,6 @@ mod linux {
             Some(libc::EINVAL | libc::ESRCH | libc::ENODATA | libc::ENOTCONN) => peer_gone(),
             _ => e,
         })
-    }
-
-    /// Whether the process `pidfd` refers to is still running: its pidfd
-    /// becomes readable when it exits.
-    fn pidfd_alive(pidfd: &OwnedFd) -> io::Result<bool> {
-        let mut p = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        loop {
-            // SAFETY: one valid pollfd; a zero timeout never blocks.
-            let n = unsafe { libc::poll(&mut p, 1, 0) };
-            if n >= 0 {
-                return Ok(n == 0);
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
     }
 
     /// The boot clock (`CLOCK_BOOTTIME`) in clock ticks, the unit of

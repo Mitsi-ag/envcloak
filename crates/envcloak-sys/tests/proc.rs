@@ -16,9 +16,9 @@ use std::process::{Child, Command, Stdio};
 
 use envcloak_sys::{
     AncestryError, Argv, MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, PeerIdentity, PeerSource,
-    ProcInfo, ProcessTable, StartTime, ancestry, ancestry_in, effective_uid, parse_cmdline,
-    parse_proc_stat, parse_procargs2, peer_identity, proc_argv, proc_info, process_start_time,
-    reaches_top,
+    ProcInfo, ProcessTable, ProcessWatch, StartTime, ancestry, ancestry_in, effective_uid,
+    parse_cmdline, parse_proc_stat, parse_procargs2, parse_stat_state, peer_identity, proc_argv,
+    proc_info, process_running, process_start_time, reaches_top, stat_state_exited,
 };
 use proptest::prelude::*;
 
@@ -697,6 +697,106 @@ fn debug_output_names_no_argument() {
 /// A `KERN_PROCARGS2` buffer as `exec` lays it out: argc, the executable's
 /// path, its NUL and NULs to the next multiple of [`PROCARGS_ALIGN`], then
 /// the arguments and the environment, each NUL-terminated.
+/// A child of this test that exits when its standard input closes.
+fn exits_on_eof() -> Child {
+    Command::new("/bin/sh")
+        .args(["-c", "read x"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Closes `child`'s standard input, so it exits, and waits, without
+/// reaping it, until `running` says it no longer runs (at most 10 s).
+fn exit_unreaped(child: &mut Child, running: &dyn Fn() -> bool) {
+    drop(child.stdin.take());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while running() {
+        assert!(
+            std::time::Instant::now() < end,
+            "an exited, unreaped process still runs"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A process that has exited and is not yet reaped (a zombie) keeps its
+/// pid and its start time until its parent waits for it, and does not
+/// run: `process_running` says so while `proc_info` still finds it with
+/// that start time, and after the wait. Before it exits it runs; its pid
+/// with another start time, and no pid, never run.
+#[test]
+fn an_exited_process_does_not_run_before_it_is_reaped() {
+    let mut child = exits_on_eof();
+    let pid = i32::try_from(child.id()).unwrap();
+    let start = proc_info(pid).unwrap().start_time;
+    assert!(process_running(pid, start));
+    assert!(!process_running(pid, StartTime::from_raw(start.raw() + 1)));
+    assert!(!process_running(0, start) && !process_running(-1, start));
+    exit_unreaped(&mut child, &|| process_running(pid, start));
+    assert_eq!(
+        proc_info(pid).unwrap().start_time,
+        start,
+        "the zombie is still in the process table"
+    );
+    child.wait().unwrap();
+    assert!(!process_running(pid, start));
+}
+
+/// A `ProcessWatch` (a pidfd on Linux) of a process runs until the
+/// process exits, and no longer once it has exited, before it is reaped
+/// (while `proc_info` still finds it) and after. A watch of the pid with
+/// another start time never runs, nor one taken once the process exited.
+#[test]
+fn a_watch_ends_when_its_process_exits_before_it_is_reaped() {
+    let mut child = exits_on_eof();
+    let pid = i32::try_from(child.id()).unwrap();
+    let start = proc_info(pid).unwrap().start_time;
+    let watch = ProcessWatch::new(pid, start);
+    assert!(watch.running());
+    assert_eq!(
+        watch.has_pidfd(),
+        cfg!(any(target_os = "linux", target_os = "android"))
+    );
+    assert!(!ProcessWatch::new(pid, StartTime::from_raw(start.raw() + 1)).running());
+    exit_unreaped(&mut child, &|| watch.running());
+    assert_eq!(
+        proc_info(pid).unwrap().start_time,
+        start,
+        "the zombie is still in the process table"
+    );
+    assert!(!ProcessWatch::new(pid, start).running());
+    child.wait().unwrap();
+    assert!(!watch.running());
+}
+
+#[test]
+fn the_state_letter_is_read_after_the_last_parenthesis() {
+    for (stat, want) in [
+        (&b"42 (sh) Z 1 42 42 0 -1"[..], Some(b'Z')),
+        (b"42 (sh) S 1 42", Some(b'S')),
+        (b"42 (a) Z (b) R 1 2", Some(b'R')),
+        (b"42 (a b) X 1", Some(b'X')),
+        (b"42 (\xff) x 1", Some(b'x')),
+        (b"", None),
+        (b"42 sh S 1", None),
+        (b"42 (sh) S", None),
+        (b"42 (sh)  S 1", None),
+        (b"42 (sh) SS 1", None),
+        (b"42 (sh) 1 1", None),
+        (b"42 (sh)\tS 1", None),
+        (b"42 (sh) \xffS 1", None),
+    ] {
+        assert_eq!(parse_stat_state(stat), want, "{stat:?}");
+    }
+    for s in *b"ZXx" {
+        assert!(stat_state_exited(s), "{}", s as char);
+    }
+    for s in *b"RSDTtIWPK" {
+        assert!(!stat_state_exited(s), "{}", s as char);
+    }
+}
+
 fn procargs(argc: usize, path: &[u8], args: &[Vec<u8>], env: &[Vec<u8>]) -> Vec<u8> {
     let mut b = i32::try_from(argc).unwrap().to_ne_bytes().to_vec();
     b.extend_from_slice(path);
@@ -761,6 +861,24 @@ proptest! {
         let b = procargs(args.len(), &path, &args, &env);
         let want: Vec<OsString> = args.iter().map(|a| OsString::from_vec(a.clone())).collect();
         prop_assert_eq!(parse_procargs2(&b).unwrap(), Argv::new(want));
+    }
+
+    /// Whatever a command name holds (parentheses, spaces, any byte), the
+    /// state is the letter after the `)` that closes it; arbitrary bytes
+    /// never panic.
+    #[test]
+    fn the_state_survives_any_command_name(
+        comm in prop::collection::vec(any::<u8>(), 0..32),
+        state in prop::sample::select(b"RSDZTtXxIWPK".to_vec()),
+        junk in prop::collection::vec(any::<u8>(), 0..64),
+    ) {
+        let mut stat = b"7 (".to_vec();
+        stat.extend_from_slice(&comm);
+        stat.extend_from_slice(b") ");
+        stat.push(state);
+        stat.extend_from_slice(b" 1 7 7 0 -1");
+        prop_assert_eq!(parse_stat_state(&stat), Some(state));
+        let _ = parse_stat_state(&junk);
     }
 
     /// A buffer cut before its last argument's NUL is refused: it never
