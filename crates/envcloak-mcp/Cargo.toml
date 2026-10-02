@@ -32,5 +32,7 @@ libc.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Real Recovery Kits, for the request-id tests.
+envcloak-core.workspace = true
 envcloak-testkit.workspace = true
 tempfile.workspace = true

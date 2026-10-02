@@ -6,9 +6,11 @@
 //! apart. Nothing from the input is ever put in an error: each error is a
 //! code and fixed text ([`error`]). The one thing echoed is a request's
 //! id, which JSON-RPC requires in its answer, and only an id of the shape
-//! [`Id`] takes, which a key, a URL or a passphrase does not have; any
-//! other is answered as an invalid request with a `null` id. (The host
-//! chose the id, and a short plain string cannot be told from one.)
+//! [`Id`] takes, which a key, a URL, a passphrase or a Recovery Kit does
+//! not have; any other is answered as an invalid request with a `null`
+//! id. (The host chose the id, and a short plain string, such as a token
+//! of under [`MAX_ID_SYMBOLS`] letters and digits, cannot be told from
+//! one.)
 
 use serde_json::{Map, Value, json};
 
@@ -18,25 +20,40 @@ pub const PARSE_ERROR: i64 = -32700;
 /// or wrong `jsonrpc`, an id of a shape this server does not take, or a
 /// request out of the session's order.
 pub const INVALID_REQUEST: i64 = -32600;
-/// No such method, or no such tool (a `tools/call` naming a tool that is
-/// not listed).
+/// No such method. (A `tools/call` naming a tool that is not listed is
+/// [`INVALID_PARAMS`], with [`UNKNOWN_TOOL`], as MCP has it.)
 pub const METHOD_NOT_FOUND: i64 = -32601;
-/// Parameters of the wrong shape.
+/// Parameters of the wrong shape, or a `tools/call` naming a tool that is
+/// not listed ([`UNKNOWN_TOOL`]).
 pub const INVALID_PARAMS: i64 = -32602;
+/// The message for a `tools/call` naming a tool that is not listed:
+/// nothing has that name, or a tool that has it is registered but not
+/// listed. The two are answered alike.
+pub const UNKNOWN_TOOL: &str = "unknown tool: tools/list shows the tools";
 /// The call queue is full: the error kind `busy` of EnvCloak's own
 /// protocol (docs/IPC.md), reused for the MCP server's queue.
 pub const BUSY: i64 = -32008;
 
 /// The longest string id taken.
 pub const MAX_ID: usize = 64;
+/// The most letters and digits a string id may hold, in all: one short
+/// of the shortest run a key is taken to be
+/// ([`envcloak_policy::VALUE_RUN`]), so that a key, or a Recovery Kit
+/// (28 symbols in groups joined by `-`), is refused whatever separates
+/// its parts.
+pub const MAX_ID_SYMBOLS: usize = envcloak_policy::VALUE_RUN - 1;
 /// The longest method name looked at; a longer one is not one this server
 /// has.
 pub const MAX_METHOD: usize = 64;
 
 /// A request id: an integer, or a string of at most [`MAX_ID`] ASCII
-/// letters, digits, `_`, `-`, `.` and `:` that is not shaped like a key
-/// (`envcloak_client::render::looks_like_value`). Anything else could
-/// carry a value that the answer would echo, so it is refused.
+/// letters, digits, `_`, `-`, `.` and `:`, holding at most
+/// [`MAX_ID_SYMBOLS`] letters and digits in all, that is not shaped like
+/// a key (`envcloak_client::render::looks_like_value`). Anything else
+/// could carry a value that the answer would echo, so it is refused: a
+/// Recovery Kit, and a key split by separators, are too long in letters
+/// and digits; so is a UUID, a common shape for API keys. MCP clients
+/// number their requests, which this takes whole.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum Id {
     Signed(i64),
@@ -67,7 +84,8 @@ impl Id {
                     && s.len() <= MAX_ID
                     && s.bytes().all(|b| {
                         b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':')
-                    });
+                    })
+                    && s.bytes().filter(u8::is_ascii_alphanumeric).count() <= MAX_ID_SYMBOLS;
                 (shaped && !envcloak_client::render::looks_like_value(s))
                     .then(|| Id::Text(s.clone()))
             }
@@ -140,7 +158,7 @@ pub fn parse(line: &[u8]) -> Incoming {
                     None,
                     INVALID_REQUEST,
                     "an id must be an integer, or a short string of letters, digits, `_`, `-`, \
-                     `.` and `:` that is not shaped like a key",
+                     `.` and `:` that is not shaped like a key or token",
                 );
             }
         },
@@ -293,6 +311,66 @@ mod tests {
         );
         assert_eq!(Id::from_value(&json!(-3)), Some(Id::Signed(-3)));
         assert_eq!(format!("{:?}", Id::Text("abc".into())), "Id(<3 bytes>)");
+    }
+
+    /// A string id is echoed only when it cannot hold a key: real Recovery
+    /// Kits (seven groups of four symbols joined by `-`), the fixture keys
+    /// split at every place by each separator the grammar takes, and a
+    /// UUID are refused, and answered with a `null` id; the ids clients
+    /// send are taken.
+    ///
+    /// Mutation checked: no count of letters and digits (the shape and
+    /// `looks_like_value` alone): every kit, and every split key, is taken
+    /// as an id and this fails.
+    #[test]
+    fn ids_that_could_hold_a_kit_or_a_key_are_refused() {
+        let refused = |s: &str| {
+            let line = json!({"jsonrpc": "2.0", "id": s, "method": "ping"}).to_string();
+            match parse(line.as_bytes()) {
+                Incoming::Invalid { id: None, code, .. } => code == INVALID_REQUEST,
+                _ => false,
+            }
+        };
+        for _ in 0..64 {
+            let kit = envcloak_core::recovery::RecoveryKit::generate().to_display();
+            assert!(refused(&kit), "a Recovery Kit was taken as an id");
+            assert!(refused(&kit.to_lowercase()));
+            assert!(refused(&kit.replace('-', "")));
+            assert!(refused(&kit.replace('-', ".")));
+        }
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        for c in &cs {
+            let alnum: String = c
+                .as_str()
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect();
+            if alnum.len() < envcloak_policy::VALUE_RUN {
+                continue;
+            }
+            for sep in ["-", "_", ".", ":"] {
+                for at in 1..alnum.len().min(MAX_ID) {
+                    let split = format!("{}{sep}{}", &alnum[..at], &alnum[at..]);
+                    if split.len() <= MAX_ID {
+                        assert!(refused(&split), "{} split at {at}", c.label);
+                    }
+                }
+            }
+        }
+        assert!(refused("123e4567-e89b-12d3-a456-426614174000"));
+        for ok in [
+            "1",
+            "req-1",
+            "1a2b3c4d-5",
+            "call_42",
+            "a.b:c-d_e",
+            &"x".repeat(MAX_ID_SYMBOLS),
+        ] {
+            assert!(!refused(ok), "{ok}");
+            assert_eq!(Id::from_value(&json!(ok)), Some(Id::Text(ok.to_owned())));
+        }
+        assert!(refused(&"x".repeat(MAX_ID_SYMBOLS + 1)));
+        assert!(refused(&"x-".repeat(MAX_ID_SYMBOLS + 1)));
     }
 
     #[test]

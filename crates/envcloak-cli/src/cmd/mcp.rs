@@ -13,6 +13,11 @@
 //! - `--wait-ms` sets that wait itself, from 1,000 to 20,000 milliseconds;
 //!   `envcloak run`'s wait is whole seconds, so it is rounded down.
 //!
+//! A host that goes on sending but stops reading the answers ends the
+//! session once the answers waiting for it reach their bound
+//! (`envcloak_mcp::stdio`): the calls in hand are stopped and the command
+//! fails with `output_stalled`.
+//!
 //! The process is hardened and its panics show their place only, as every
 //! command's are (`main`). `SIGTERM`, `SIGINT` and `SIGHUP` are taken by one
 //! thread, blocked in every other before any starts: the calls in hand are
@@ -127,6 +132,16 @@ fn serve(a: McpArgs) -> Result<ExitCode, Failure> {
     let ctx = envcloak_mcp::Ctx::new(exe, a.host, a.wait);
     match server.run(std::io::stdin().lock(), std::io::stdout(), ctx) {
         Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(e)
+            if e.get_ref()
+                .is_some_and(|inner| inner.is::<envcloak_mcp::Stalled>()) =>
+        {
+            Err(Failure::new(
+                "output_stalled",
+                "the host stopped reading this server's answers while it went on sending; the \
+                 session was ended and the calls in hand were stopped",
+            ))
+        }
         Err(_) => Err(Failure::new(
             "io",
             "standard input could not be read; the calls in hand were stopped",
