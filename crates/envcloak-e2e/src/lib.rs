@@ -39,6 +39,7 @@ use std::time::{Duration, Instant, SystemTime};
 use envcloak_testkit::{Canary, Daemon, Detector, TestHome, canaries, fresh_seed, sweep_dir};
 
 mod emitters;
+pub mod k01;
 mod network;
 
 pub use emitters::{Emitters, NAMES, sha256_hex};
