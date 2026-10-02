@@ -642,13 +642,15 @@ fn worker() {
             "hand_over" => {
                 // A connection of this worker's, used once (so the daemon
                 // has taken it as this process's), handed to a child of
-                // its own as the child's standard input.
+                // its own as the child's standard input. The child outlives
+                // this worker by design and is never waited for here.
                 let mut conn = std::os::unix::net::UnixStream::connect(&run.socket).unwrap();
                 common::send_json(
                     &mut conn,
                     &json!({"jsonrpc": "2.0", "id": 1, "method": "backup.v2.list", "params": {}}),
                 );
                 assert!(common::read_json(&mut conn).unwrap()["result"].is_object());
+                #[allow(clippy::zombie_processes)]
                 Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
