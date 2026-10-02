@@ -343,6 +343,11 @@ fn s0(host: Host, shell: Shell, name: &str) {
                 std::fs::read(repo.join(format!("emit-{second_nonce}{ext}")))
                     .unwrap_or_else(|e| panic!("the rerun's {ext} file: {e}"))
             });
+            // Swept before anything is read from them for a message
+            // (verifier, low: a digest error quoted the unswept file).
+            for (stream, ext) in streams.iter().zip([".out", ".err"]) {
+                h.record(&format!("the rerun's emit{ext} file (S0)"), stream);
+            }
             if let Err(why) = delivered(
                 &second,
                 &second_nonce,
@@ -514,6 +519,18 @@ fn invocation(output: &str, nonce: &str) -> Option<usize> {
     (n > 0).then_some(n)
 }
 
+/// Whether `output` holds an invocation marker other than `nonce`'s: a
+/// line that starts with `ecinv-` and is not `ecinv-<nonce>`, another
+/// invocation's output, which fails the step whatever else is there
+/// (Codex review, low: a foreign marker with no exit line passed).
+fn foreign_invocation(output: &str, nonce: &str) -> bool {
+    let marker = format!("ecinv-{nonce}");
+    output
+        .lines()
+        .map(str::trim)
+        .any(|l| l.starts_with("ecinv-") && l != marker)
+}
+
 /// What only a command that got its values prints: a serializer's frame,
 /// a digest, the serializer list, a redaction marker.
 const DELIVERY_TRACES: [&str; 5] = ["<W|", "<B|", "sha256 ", "SERIALIZERS ", "[envcloak:"];
@@ -523,10 +540,14 @@ const DELIVERY_TRACES: [&str; 5] = ["<W|", "<B|", "sha256 ", "SERIALIZERS ", "[e
 /// exactly one `envcloak:` line, the table's message with "nothing was
 /// sent to it", and exit 125; for a sandbox that runs no command, its
 /// message and no marker, `envcloak:` line or exit at all. In both, no
-/// trace of a delivery. Why not, when it is not.
+/// trace of a delivery and no other invocation's marker. Why not, when it
+/// is not.
 fn refused(output: &str, nonce: &str, want: Reach) -> Result<(), String> {
     if let Some(trace) = DELIVERY_TRACES.iter().find(|t| output.contains(*t)) {
         return Err(format!("a trace of a delivery ({trace:?})"));
+    }
+    if foreign_invocation(output, nonce) {
+        return Err("another invocation's output".to_owned());
     }
     let lines: Vec<&str> = output
         .lines()
@@ -567,14 +588,16 @@ fn refused(output: &str, nonce: &str, want: Reach) -> Result<(), String> {
 }
 
 /// Whether the invocation `nonce` delivered: in the tool result the host
-/// sent its model, the marker once and exit 0; in what `envcloak run`
-/// printed on its standard output and error (`streams`, each written by
-/// one writer, so no frame is cut), every serializer listed with every
-/// result, both frames of every result the oracle made, a digest per
-/// serializer and variable equal to the fixture value's SHA-256 (what the
-/// command received, checked by an oracle that does not depend on the
-/// redactor), and a redaction marker for every binding on both streams.
-/// Why not, when it is not.
+/// sent its model, the marker once (and no other invocation's) and exit
+/// 0; in what `envcloak run` printed on its standard output and error
+/// (`streams`, each written by one writer, so no frame is cut), every
+/// serializer listed with every result, both frames of every result the
+/// oracle made, each holding that result as the serializer made it with
+/// its value redacted ([`frames`]), a digest per serializer and variable
+/// equal to the fixture value's SHA-256 (what the command received,
+/// checked by an oracle that does not depend on the redactor), and a
+/// redaction marker for every binding on both streams. Why not, when it
+/// is not; the reason quotes nothing the streams hold.
 fn delivered(
     output: &str,
     nonce: &str,
@@ -585,6 +608,9 @@ fn delivered(
 ) -> Result<(), String> {
     if invocation(output, nonce) != Some(1) {
         return Err(format!("not invocation {nonce}'s own output"));
+    }
+    if foreign_invocation(output, nonce) {
+        return Err("another invocation's output".to_owned());
     }
     if exits(output) != ["0"] {
         return Err(format!("exit codes {:?}, not 0", exits(output)));
@@ -609,13 +635,7 @@ fn delivered(
     if !output.contains(&listed) || !output.contains("DONE") {
         return Err(format!("no {listed:?} and DONE"));
     }
-    for (label, _) in results {
-        for frame in ["<W|", "<B|"] {
-            if !output.contains(&format!("{frame}{label}=")) {
-                return Err(format!("no {frame}{label} frame"));
-            }
-        }
-    }
+    frames(streams, results)?;
     let digests: BTreeMap<(&str, &str), &str> = out
         .lines()
         .filter_map(|l| {
@@ -627,15 +647,92 @@ fn delivered(
     for tag in &tags {
         for name in NAMES {
             let want = sha256_hex(&values[name]);
-            if digests.get(&(tag.as_str(), name)) != Some(&want.as_str()) {
+            match digests.get(&(tag.as_str(), name)) {
+                Some(got) if *got == want => {}
+                Some(_) => return Err(format!("the {tag} digest of {name} is not the fixture's")),
+                None => return Err(format!("no {tag} digest of {name}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The binding each of [`NAMES`] has in `acme-web`.
+fn slug_of(name: &str) -> Option<&'static str> {
+    match name {
+        "OPENAI_API_KEY" => Some("openai/acme-web"),
+        "STRIPE_SECRET_KEY" => Some("stripe/acme-web"),
+        "GITHUB_TOKEN" => Some("github/acme-web"),
+        "DATABASE_URL" => Some("database-url/acme-web"),
+        _ => None,
+    }
+}
+
+/// Whether every result the oracle made (`<NAME>/<serializer>` and its
+/// bytes) has exactly one whole frame (`<W|`) and one frame written in
+/// pieces (`<B|`) on the two streams together, each payload the result as
+/// the serializer made it with one or more non-empty spans replaced by
+/// its own binding's marker and nothing else changed ([`redacted_from`]):
+/// so a frame with its payload gone, cut short, unredacted or redacted
+/// for another binding fails (verifier, low: only the frame names were
+/// checked). Why not, naming the frame and never its payload.
+fn frames(streams: &[Vec<u8>; 2], results: &[(String, Vec<u8>)]) -> Result<(), String> {
+    for (label, result) in results {
+        let name = label.split('/').next().unwrap_or_default();
+        let slug = slug_of(name).ok_or_else(|| format!("no binding for {label}"))?;
+        let marker = format!("[envcloak:{slug}]");
+        for frame in ["<W|", "<B|"] {
+            let head = format!("{frame}{label}=");
+            let lines: Vec<&[u8]> = streams
+                .iter()
+                .flat_map(|s| s.split(|b| *b == b'\n'))
+                .filter(|l| l.starts_with(head.as_bytes()))
+                .collect();
+            let [line] = lines.as_slice() else {
+                return Err(format!("{} {frame}{label} frame(s), not one", lines.len()));
+            };
+            if !redacted_from(&line[head.len()..], result, marker.as_bytes()) {
                 return Err(format!(
-                    "the {tag} digest of {name} is not the fixture's ({:?})",
-                    digests.get(&(tag.as_str(), name))
+                    "the {frame}{label} frame is not that result with its value redacted as \
+                     {slug}"
                 ));
             }
         }
     }
     Ok(())
+}
+
+/// Whether `payload` is `result` with one or more non-empty spans each
+/// replaced by `marker`, and nothing else changed: the pieces between the
+/// markers are, in order, a prefix of `result`, parts of it, and a suffix
+/// of it, each apart from the next by at least one byte (placed leftmost,
+/// which leaves the most room for the rest).
+fn redacted_from(payload: &[u8], result: &[u8], marker: &[u8]) -> bool {
+    let mut pieces: Vec<&[u8]> = Vec::new();
+    let mut rest = payload;
+    while let Some(at) = rest.windows(marker.len()).position(|w| w == marker) {
+        pieces.push(&rest[..at]);
+        rest = &rest[at + marker.len()..];
+    }
+    pieces.push(rest);
+    let (Some((first, middle)), Some(last)) = (pieces.split_first(), pieces.last()) else {
+        return false;
+    };
+    if pieces.len() < 2 || !result.starts_with(first) || !result.ends_with(last) {
+        return false;
+    }
+    let limit = result.len() - last.len();
+    let mut at = first.len();
+    for piece in &middle[..middle.len() - 1] {
+        let from = at + 1;
+        let Some(found) = result.get(from..limit).and_then(|r| {
+            (0..=r.len().checked_sub(piece.len())?).find(|i| r[*i..].starts_with(piece))
+        }) else {
+            return false;
+        };
+        at = from + found + piece.len();
+    }
+    at < limit
 }
 
 /// The last 3,000 characters of `text`, for a failure message (what it
@@ -867,6 +964,9 @@ fn a_refusal_is_this_invocation_s_and_the_table_s() {
         k01::NOTHING_SENT
     );
     let another_invocation = ok.replace("n1", "n0");
+    // Another invocation's marker beside this one's, with no output of
+    // its own (Codex review, low).
+    let and_another = format!("ecinv-n0\n{ok}");
     let twice = format!("{ok}{ok}");
     let ran = format!("{ok}<W|OPENAI_API_KEY/raw=[envcloak:openai/acme-web]\n");
     let exit_1 = ok.replace("EXIT=125", "EXIT=1");
@@ -874,6 +974,7 @@ fn a_refusal_is_this_invocation_s_and_the_table_s() {
         unavailable.to_owned(),
         other_unverified,
         another_invocation,
+        and_another,
         twice,
         ran,
         exit_1,
@@ -884,11 +985,98 @@ fn a_refusal_is_this_invocation_s_and_the_table_s() {
             "{bad:?}"
         );
     }
-    for bad in [ok.clone(), "Exit code 1".to_owned()] {
+    for bad in [
+        ok.clone(),
+        "Exit code 1".to_owned(),
+        // Another invocation's marker and nothing else of it: still not a
+        // sandbox that ran nothing (Codex review, low: only this
+        // invocation's marker was refused).
+        format!("ecinv-n0\n{not_run}"),
+    ] {
         assert!(
             refused(&bad, "n1", Reach::NotRun(k01::SECCOMP_HELPER)).is_err(),
             "{bad:?}"
         );
+    }
+}
+
+/// A frame is taken only as the serializer's own result with spans of
+/// it replaced by its own binding's marker (verifier, low: frames with
+/// every payload removed passed): the control passes; payloads removed,
+/// cut short where what is left differs from the result, left
+/// unredacted, redacted as another binding, or with anything added, a
+/// frame missing or doubled, all fail, and no reason quotes a payload.
+#[test]
+fn a_frame_is_its_result_with_the_value_redacted() {
+    let m = "[envcloak:openai/acme-web]";
+    for (payload, result, ok) in [
+        (m.to_owned(), "VALUEVALUE", true),
+        (format!("\"{m}\""), "\"VALUEVALUE\"", true),
+        (format!("dT{m}IQ=="), "dTVBTFVFVkFMVUUhIQ==", true),
+        (format!("\"{m}{m}\""), "\"VALUEVALUE\"", true),
+        (format!("a{m}b{m}c"), "aVALUEbVALUEc", true),
+        (String::new(), "VALUEVALUE", false),
+        ("VALUEVALUE".to_owned(), "VALUEVALUE", false),
+        // A marker may cover the quote beside the value too.
+        (format!("\"{m}"), "\"VALUEVALUE\"", true),
+        (format!("{m}\""), "\"VALUEVALUE\"", true),
+        // Cut short, before or after the marker.
+        ("\"VALU".to_owned(), "\"VALUEVALUE\"", false),
+        (format!("dT{m}IQ="), "dTVBTFVFVkFMVUUhIQ==", false),
+        (format!("\"{m}\"x"), "\"VALUEVALUE\"", false),
+        (format!("\"\"{m}"), "\"VALUEVALUE\"", false),
+        (
+            "\"[envcloak:stripe/acme-web]\"".to_owned(),
+            "\"VALUEVALUE\"",
+            false,
+        ),
+        (m.to_owned(), "", false),
+        (format!("ab{m}"), "ab", false),
+    ] {
+        assert_eq!(
+            redacted_from(payload.as_bytes(), result.as_bytes(), m.as_bytes()),
+            ok,
+            "{payload:?} from {result:?}"
+        );
+    }
+    let results = vec![
+        ("OPENAI_API_KEY/raw".to_owned(), b"VALUEVALUE".to_vec()),
+        (
+            "OPENAI_API_KEY/py-json-ascii".to_owned(),
+            b"\"VALUEVALUE\"".to_vec(),
+        ),
+    ];
+    let good = [
+        format!("<W|OPENAI_API_KEY/raw={m}\n<B|OPENAI_API_KEY/raw={m}\n"),
+        format!(
+            "<W|OPENAI_API_KEY/py-json-ascii=\"{m}\"\n<B|OPENAI_API_KEY/py-json-ascii=\"{m}\"\n"
+        ),
+    ];
+    let streams = |out: &str, err: &str| [out.as_bytes().to_vec(), err.as_bytes().to_vec()];
+    assert_eq!(frames(&streams(&good[0], &good[1]), &results), Ok(()));
+    let emptied = |s: &str| {
+        s.lines()
+            .map(|l| format!("{}=\n", l.split('=').next().unwrap()))
+            .collect::<String>()
+    };
+    for (out, err) in [
+        (emptied(&good[0]), emptied(&good[1])),
+        (emptied(&good[0]), good[1].clone()),
+        (good[0].replace(m, "VALUEVALUE"), good[1].clone()),
+        (
+            good[0].replace(m, "[envcloak:github/acme-web]"),
+            good[1].clone(),
+        ),
+        (
+            good[0].replace(&format!("{m}\n<B"), "\n<B"),
+            good[1].clone(),
+        ),
+        (good[0].lines().next().unwrap().to_owned(), good[1].clone()),
+        (format!("{}{}", good[0], good[0]), good[1].clone()),
+        (good[0].clone(), String::new()),
+    ] {
+        let why = frames(&streams(&out, &err), &results).unwrap_err();
+        assert!(!why.contains("VALUE"), "{why}");
     }
 }
 
