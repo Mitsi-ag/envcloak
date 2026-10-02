@@ -146,7 +146,12 @@ pub struct BackedUpFile {
 /// byte for byte), so nothing is lost with it; it keeps any other, whose
 /// origin it cannot know: another program's save a swap brought out and
 /// could not put back ([`ModifyErrorKind::MovedAside`] names it), or the
-/// file a restore stopped after its swap took out. A restore that stops
+/// file a restore stopped after its swap took out. A file it removes is
+/// first moved aside to a fresh name of the same shape and checked there
+/// again, and only that file is unlinked, while that name still holds it
+/// unchanged: a file that takes the old name meanwhile keeps it, and one
+/// changed or replaced while it is checked is put back (or, when its name
+/// was taken meanwhile, kept under the fresh name). A restore that stops
 /// earlier (`edited_since`, `backup_unread`) removes nothing. A restore
 /// of the same file running in another process at that moment may then
 /// fail, and reports it.
@@ -163,8 +168,9 @@ pub fn restore_over_left(
 }
 
 /// [`restore_over_left`], telling `observe` when the file is open and
-/// about to be hashed, when it was hashed, and when the new contents are
-/// staged, checked and swapped in.
+/// about to be hashed, when it was hashed, when an earlier restore's
+/// leftover is moved aside and when its bytes were compared there, and
+/// when the new contents are staged, checked and swapped in.
 ///
 /// # Errors
 /// As [`restore_over_left`].

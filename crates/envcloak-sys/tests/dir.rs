@@ -13,8 +13,9 @@ use std::process::{Command, Stdio};
 
 use envcloak_sys::{
     DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, create_dir_beneath,
-    exchange_beneath, kind_beneath, link_beneath, list_dir, open_dir_beneath, open_elsewhere,
-    read_link_beneath, remove_dir_beneath, rename_beneath, unlink_beneath, volume_of,
+    create_rw_beneath, exchange_beneath, kind_beneath, link_beneath, list_dir, open_dir_beneath,
+    open_elsewhere, read_link_beneath, remove_dir_beneath, rename_beneath, unlink_beneath,
+    volume_of,
 };
 
 fn names(dir: &File) -> Vec<(OsString, DirEntryKind)> {
@@ -362,6 +363,35 @@ fn create_beneath_applies_the_mode_it_is_given() {
     // The umask may take bits away, never add them.
     let mode = std::fs::metadata(tmp.path().join("a")).unwrap().mode() & 0o777;
     assert_eq!(mode & !0o644, 0);
+}
+
+/// `create_rw_beneath` creates as `create_beneath` does (`O_EXCL`, never
+/// through a symlink, the mode it is given), with the file open for
+/// reading too: what was written reads back through the same descriptor,
+/// whatever has the file's name by then.
+#[test]
+fn create_rw_beneath_reads_back_through_the_descriptor() {
+    use std::os::unix::fs::FileExt;
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = File::open(tmp.path()).unwrap();
+    let mut f = create_rw_beneath(&dir, OsStr::new("new"), 0o600).unwrap();
+    f.write_all(b"written").unwrap();
+    std::fs::rename(tmp.path().join("new"), tmp.path().join("moved")).unwrap();
+    std::fs::write(tmp.path().join("new"), b"another file").unwrap();
+    let mut back = [0u8; 7];
+    f.read_exact_at(&mut back, 0).unwrap();
+    assert_eq!(&back, b"written");
+    let mode = std::fs::metadata(tmp.path().join("moved")).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let e = create_rw_beneath(&dir, OsStr::new("new"), 0o600).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::AlreadyExists);
+    symlink("elsewhere", tmp.path().join("dangling")).unwrap();
+    let e = create_rw_beneath(&dir, OsStr::new("dangling"), 0o600).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::AlreadyExists);
+    assert!(!tmp.path().join("elsewhere").exists());
+    // `create_beneath` opens for writing only.
+    let w = create_beneath(&dir, OsStr::new("write-only"), 0o600).unwrap();
+    assert!(w.read_exact_at(&mut back, 0).is_err());
 }
 
 #[test]

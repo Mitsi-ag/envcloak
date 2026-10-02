@@ -163,7 +163,9 @@ pub fn delete_plaintext<G: DeleteGate>(
                 | Inside::Checked
                 | Inside::Exchanged
                 | Inside::Opened
-                | Inside::Hashed => {}
+                | Inside::Hashed
+                | Inside::LeftoverMoved
+                | Inside::LeftoverRead => {}
             })
             .map(|_| (&mut out.rewritten, DeleteStep::Rewritten(i))),
             Remains::Everything => continue,
