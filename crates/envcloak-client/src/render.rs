@@ -930,7 +930,10 @@ fn path_reason(token: &str) -> String {
         "recently_changed" => "modified in the last 2 minutes, so it may be in use",
         "open_elsewhere" => "another program has it open",
         "unchecked" => "whether another program has it open could not be checked, so it was kept",
-        "moved_aside" => "saved over while it was deleted; the checked file was kept",
+        "moved_aside" => {
+            "another program saved over it, or wrote into its new file, while it was changed; \
+             that file was kept under this name, and nothing was removed"
+        }
         "not_removed" => {
             "its file was changed, but this old copy, which may hold plaintext, could not be \
              removed: look at it, then delete it"

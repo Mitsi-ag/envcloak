@@ -1179,7 +1179,7 @@ fn a_deletion_makes_git_ignore_its_temporary_names_first() {
     assert!(text.starts_with(partial), "{text}");
     assert!(text.lines().any(|l| l == ".*.envcloak-*.tmp"), "{text}");
     for last in "0123456789abcdef".chars() {
-        for what in ["del", "new"] {
+        for what in ["del", "new", "swap"] {
             let t = format!("..env.envcloak-{what}-{:015x}{last}.tmp", fresh_seed() >> 4);
             assert!(git_ignores(&g.repo, &t), "{t}");
         }

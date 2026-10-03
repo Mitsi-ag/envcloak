@@ -505,12 +505,13 @@ pub(crate) const TEMP_PATTERN: &str = ".*.envcloak-*.tmp";
 
 /// The shapes of the names a change of the env file `name` may leave
 /// behind ([`envcloak_scan::atomic`]'s temporary names,
-/// `.<name>.envcloak-<del|new>-<16 hex digits>.tmp`, the name left out
-/// when long), to ask a `.gitignore` about: every name of them, whatever
-/// its random digits ([`envcloak_client::gitignore::ignores_every`]), not a sample.
+/// `.<name>.envcloak-<del|new|swap>-<16 hex digits>.tmp`, the name left
+/// out when long), to ask a `.gitignore` about: every name of them,
+/// whatever its random digits
+/// ([`envcloak_client::gitignore::ignores_every`]), not a sample.
 fn temp_shapes(name: &str) -> Vec<Vec<Pos>> {
     let mut out = Vec::new();
-    for what in ["del", "new"] {
+    for what in ["del", "new", "swap"] {
         out.push(shape(&format!(".{name}.envcloak-{what}-"), 16, ".tmp"));
         out.push(shape(&format!("..envcloak-{what}-"), 16, ".tmp"));
     }
@@ -877,7 +878,7 @@ mod tests {
         let mut out = Vec::new();
         let random = format!("{:016x}", envcloak_testkit::fresh_seed());
         for hex in ["0123456789abcdef", "fedcba9876543210", random.as_str()] {
-            for what in ["del", "new"] {
+            for what in ["del", "new", "swap"] {
                 out.push(format!(".{name}.envcloak-{what}-{hex}.tmp"));
                 out.push(format!("..envcloak-{what}-{hex}.tmp"));
             }
@@ -946,6 +947,13 @@ mod tests {
             ),
             (
                 Some(".env*\n.*.envcloak-*.tmp\n!*01*\n"),
+                FileChange::Updated,
+                vec![TEMP_PATTERN],
+            ),
+            // The names a change writes and removes under, not the one a
+            // swap takes a new file from (M2-05 round 10).
+            (
+                Some(".env*\n.*.envcloak-del-*.tmp\n.*.envcloak-new-*.tmp\n"),
                 FileChange::Updated,
                 vec![TEMP_PATTERN],
             ),
