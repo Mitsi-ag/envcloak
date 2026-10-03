@@ -1,16 +1,23 @@
 //! The commands and options of M2 and M2b that later tasks land (M2 plan
 //! D-23, R-M2-01): this build registers each one, and each exits 125 with
 //! `not_in_this_build`, prints nothing on standard output and one fixed
-//! line on standard error, whatever its arguments. Key-shaped ones (every
-//! canary, as an argument, an option's value or a command after `--`) are
-//! never echoed. No daemon runs in these tests, so a stub that asked one
-//! would fail otherwise, and nothing is written in the home. The help lists
-//! every one of them as not in this build, and never as available.
+//! line on standard error, whatever its arguments, one that is not UTF-8
+//! included. Key-shaped ones (every canary, as an argument, an option's
+//! value or a command after `--`) are never echoed. A listener on the
+//! daemon's socket path sees no connection from any of them (with a
+//! positive control that a command asking the daemon is seen), and the
+//! home holds the same files after them as before (review M2R-10: the
+//! test claimed both, and checked neither). The help lists every one of
+//! them as not in this build, and never as available.
 #![allow(clippy::unwrap_used)]
 
 mod common;
 
-use common::{run, stderr, stdout};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use common::{cli_command, finish_within, run, stderr, stdout};
 use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 
 /// Each registered command or option (the words that select it) and how
@@ -53,6 +60,118 @@ const TAILS: &[&[&str]] = &[
         "Authorization={v}",
     ],
 ];
+
+/// Every file and directory under `dir`, sorted.
+fn listing(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if std::fs::symlink_metadata(&p).unwrap().is_dir() {
+                stack.push(p.clone());
+            }
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A listener on the daemon's socket path in `home`, taking connections
+/// without blocking, so that every attempt to reach a daemon is seen.
+fn daemon_listener(home: &TestHome) -> std::os::unix::net::UnixListener {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = envcloak_testkit::daemon_run_dir(home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let l = std::os::unix::net::UnixListener::bind(envcloak_testkit::daemon_socket(home)).unwrap();
+    l.set_nonblocking(true).unwrap();
+    l
+}
+
+/// Whether `l` has a connection waiting.
+fn connected(l: &std::os::unix::net::UnixListener) -> bool {
+    match l.accept() {
+        // Dropped at once: the client's call ends.
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(e) => panic!("accept: {e}"),
+    }
+}
+
+/// No stub asks the daemon or writes in the home (review M2R-10): a
+/// listener on the daemon's socket path sees no connection, and the home
+/// lists the same files before and after; the positive control, `envcloak
+/// lock`, which asks the daemon, is seen (its connection is closed
+/// unanswered, so it fails at once).
+///
+/// Mutations checked: the doctor stub asking the daemon first
+/// (`envcloak_client::connect::connect()`): the listener sees the
+/// connection and this fails. The doctor stub writing a file in the home:
+/// the listing differs and this fails.
+#[test]
+fn no_stub_asks_the_daemon_or_writes_in_the_home() {
+    let home = TestHome::new();
+    let l = daemon_listener(&home);
+    let before = listing(home.root());
+    for (words, what) in STUBS {
+        let out = run(&home, words, &[]);
+        assert_eq!(out.status.code(), Some(NOT_IN_THIS_BUILD), "{what}");
+        assert!(!connected(&l), "{what} asked the daemon");
+    }
+    assert_eq!(listing(home.root()), before, "a stub wrote in the home");
+    let seen = std::thread::spawn(move || {
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < end {
+            if connected(&l) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    });
+    let out = run(&home, &["lock"], &[]);
+    assert_ne!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        seen.join().unwrap(),
+        "the listener does not see the daemon's clients"
+    );
+}
+
+/// A stub refuses an argument that is not UTF-8 as it refuses any other
+/// (review M2R-9: the check that refuses such an argument as a usage
+/// error ran first, so a stub exited 2 without `not_in_this_build`).
+///
+/// Mutation checked: the stubs routed after that check, as before: each
+/// exits 2 and this fails.
+#[test]
+fn every_stub_refuses_an_argument_that_is_not_utf8() {
+    let home = TestHome::new();
+    let bad = std::ffi::OsStr::from_bytes(b"\xff\xfe");
+    for (words, what) in STUBS {
+        let want = format!(
+            "envcloak: not_in_this_build: {what} is not in this build of EnvCloak; nothing was \
+             done\n"
+        );
+        let mut cmd = cli_command(&home, words, &[]);
+        cmd.arg(bad);
+        let out = finish_within(cmd, Duration::from_secs(60));
+        assert_eq!(
+            out.status.code(),
+            Some(NOT_IN_THIS_BUILD),
+            "{what}: {}",
+            stderr(&out)
+        );
+        assert_eq!(stdout(&out), "", "{what}");
+        assert_eq!(stderr(&out), want, "{what}");
+    }
+    // Elsewhere the argument is the usage error it was.
+    let mut cmd = cli_command(&home, &["run", "--"], &[]);
+    cmd.arg(bad);
+    let out = finish_within(cmd, Duration::from_secs(60));
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
 
 #[test]
 fn every_stub_exits_125_and_echoes_nothing() {
