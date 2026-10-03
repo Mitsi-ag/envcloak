@@ -356,10 +356,13 @@ jobs:
             | sudo pfctl -a com.apple/ecnonet -f -
           sudo pfctl -E
           sudo pfctl -a com.apple/ecnonet -s rules
-          # Name lookups too: the system's resolver takes them on its socket
-          # and sends the queries itself, outside the group; an access
-          # control entry denies the group that socket, so a lookup fails
-          # before any query is made for it.
+          # Name lookups through getaddrinfo too: the system's resolver takes
+          # them on its socket and sends the queries itself, outside the
+          # group; an access control entry denies the group that socket, so
+          # such a lookup fails before any query is made for it. Lookups
+          # over the resolver's XPC service (Network.framework, URLSession)
+          # are not refused: agent_hosts.rs checks that no pinned host
+          # imports one (docs/ACCEPTANCE.md).
           sudo chmod +a "group:ecnonet deny write,append" /var/run/mDNSResponder
           /bin/ls -le /var/run/mDNSResponder
       - name: S0 on the release binaries, loopback only (macOS)
@@ -632,11 +635,14 @@ jobs:
       # rule in an anchor of the default ruleset refuses every TCP and UDP
       # packet a socket of that group sends anywhere but lo0 (a refusal at
       # once, ECONNREFUSED). The runner's own traffic, in its own groups,
-      # is untouched. Name lookups go through the system's resolver, which
-      # sends the queries itself, outside the group: an access control entry
-      # denies the group the resolver's socket, so a lookup from the tests
-      # fails and no query leaves for it (Codex review, medium: a value in a
-      # name could reach external DNS unrecorded).
+      # is untouched. Name lookups through getaddrinfo go through the
+      # system's resolver, which sends the queries itself, outside the
+      # group: an access control entry denies the group the resolver's
+      # socket, so such a lookup from the tests fails and no query leaves
+      # for it (Codex review, medium: a value in a name could reach external
+      # DNS unrecorded). The resolver's XPC service, which Network.framework
+      # and URLSession use, is not refused; agent_hosts.rs fails a host
+      # that imports it (docs/ACCEPTANCE.md).
       - name: Loopback only for the tests' group (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -647,10 +653,13 @@ jobs:
             | sudo pfctl -a com.apple/ecnonet -f -
           sudo pfctl -E
           sudo pfctl -a com.apple/ecnonet -s rules
-          # Name lookups too: the system's resolver takes them on its socket
-          # and sends the queries itself, outside the group; an access
-          # control entry denies the group that socket, so a lookup fails
-          # before any query is made for it.
+          # Name lookups through getaddrinfo too: the system's resolver takes
+          # them on its socket and sends the queries itself, outside the
+          # group; an access control entry denies the group that socket, so
+          # such a lookup fails before any query is made for it. Lookups
+          # over the resolver's XPC service (Network.framework, URLSession)
+          # are not refused: agent_hosts.rs checks that no pinned host
+          # imports one (docs/ACCEPTANCE.md).
           sudo chmod +a "group:ecnonet deny write,append" /var/run/mDNSResponder
           /bin/ls -le /var/run/mDNSResponder
       - name: Agent hosts, loopback only (macOS)

@@ -5,12 +5,27 @@
 //! `lo` (`unshare --net`), on macOS with a group of their own whose every
 //! TCP and UDP packet to anywhere but `lo0` a `pf` rule refuses, and to
 //! which an access control entry denies the system resolver's socket
-//! (`/var/run/mDNSResponder`), so a name lookup fails too and no query
-//! leaves for one (Codex review, medium: lookups went through the
-//! resolver, outside the group, and a value in a name could reach
+//! (`/var/run/mDNSResponder`), so a lookup through `getaddrinfo` fails
+//! and no query leaves for it (Codex review, medium: lookups went through
+//! the resolver, outside the group, and a value in a name could reach
 //! external DNS unrecorded). Each job says which it set up in
 //! [`NETWORK_VAR`], and first, outside it, that the network is open, so a
 //! refusal inside is the isolation's and not a network that is down.
+//!
+//! What that does not refuse (verifier review of M2-04): on macOS the
+//! resolver also answers over its XPC service (`com.apple.dnssd.service`),
+//! which Network.framework, URLSession, `dnssd_getaddrinfo` and
+//! `CFHostStartInfoResolution` use, and which no file access control can
+//! deny; on Linux, systemd-resolved's varlink and D-Bus endpoints are
+//! filesystem sockets a network namespace does not cut off (not
+//! measured). So a program that resolves through those could still send a
+//! name, and a value in it, to external DNS unrecorded.
+//! [`open_resolver_imports`] guards the pinned hosts on macOS: a host's
+//! test fails if any executable or library of its pinned tree imports one
+//! of [`OPEN_RESOLVERS`]. None does today (Claude Code's binaries link
+//! `getaddrinfo` only; Codex imports `getaddrinfo` and CFNetwork's proxy
+//! auto-configuration calls, which fetch a PAC URL only when the system
+//! names one, and none is set on the runners).
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -73,6 +88,71 @@ fn resolves(name: &str) -> Result<(), String> {
         Ok(None) => Err("no address".to_owned()),
         Err(e) => Err(format!("{:?}", e.kind())),
     }
+}
+
+/// The macOS resolver entry points the tests' isolation does not refuse
+/// (see the module documentation): imported symbols starting so.
+pub const OPEN_RESOLVERS: [&str; 4] = [
+    "_nw_connection_",
+    "_nw_resolver",
+    "_dnssd_getaddrinfo",
+    "_CFHostStartInfoResolution",
+];
+
+/// Every Mach-O file at or under `path` (not following symlinks) that
+/// imports one of [`OPEN_RESOLVERS`], with the first such symbol, as
+/// `nm -u` lists its imports. Files that are not Mach-O are skipped.
+///
+/// # Errors
+/// When a directory cannot be read, or `nm` fails on a Mach-O file: a
+/// file whose imports cannot be read is never taken as clean.
+pub fn open_resolver_imports(path: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    use std::io::Read as _;
+    let mut found = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&p).map_err(|e| format!("{}: {e}", p.display()))? {
+                stack.push(entry.map_err(|e| format!("{}: {e}", p.display()))?.path());
+            }
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let mut magic = [0u8; 4];
+        let is_macho = std::fs::File::open(&p)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .is_ok()
+            && matches!(
+                magic,
+                [0xcf, 0xfa, 0xed, 0xfe] | [0xfe, 0xed, 0xfa, 0xcf] | [0xca, 0xfe, 0xba, 0xbe]
+            );
+        if !is_macho {
+            continue;
+        }
+        let out = Command::new("/usr/bin/nm")
+            .arg("-u")
+            .arg(&p)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("nm {}: {e}", p.display()))?;
+        if !out.status.success() {
+            return Err(format!("nm could not read the imports of {}", p.display()));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(sym) = text
+            .lines()
+            .map(str::trim)
+            .find(|l| OPEN_RESOLVERS.iter().any(|r| l.starts_with(r)))
+        {
+            found.push((p.display().to_string(), sym.to_owned()));
+        }
+    }
+    Ok(found)
 }
 
 /// Checks that the tests' network is what [`NETWORK_VAR`] says, from this

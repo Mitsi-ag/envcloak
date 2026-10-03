@@ -43,7 +43,7 @@ pub mod k01;
 mod network;
 
 pub use emitters::{Emitters, NAMES, sha256_hex};
-pub use network::{NETWORK_VAR, check_network};
+pub use network::{NETWORK_VAR, OPEN_RESOLVERS, check_network, open_resolver_imports};
 
 /// How long one command may take before the test fails.
 pub const COMMAND_LIMIT: Duration = Duration::from_secs(300);
