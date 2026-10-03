@@ -452,7 +452,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | Domain | Task | Status | Use |
 |---|---|---|---|
 | `envcloak-statement/2` | M2-13 | reserved | approval statements with classifications, live ticks and test-item proposals; version 1 digests are refused after the upgrade |
-| `envcloak-signin-statement/1` | M2b-01 | reserved | sign-in approval statements (SPEC §6.8) |
+| `envcloak-signin-statement/1` | M2b-01 | landed | sign-in approval statements (SPEC §6.8) |
 <!-- /reservations -->
 
 **MCP tools** (`envcloak mcp`):
