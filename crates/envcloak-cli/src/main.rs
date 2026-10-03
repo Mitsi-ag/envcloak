@@ -94,7 +94,7 @@ const HELP: &str = "usage:
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
   envcloak init [--import] [--yes] [--delete-plaintext] [--json]
-  envcloak init --undo <ID> [--created-by-agent] [--passphrase-fd N] [--json]
+  envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak import --scan <dir> [--yes] [--json]
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]

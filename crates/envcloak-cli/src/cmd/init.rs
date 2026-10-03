@@ -1,6 +1,6 @@
 //! `envcloak init [--import] [--yes] [--delete-plaintext] [--json]` and
-//! `envcloak init --undo <ID> [--passphrase-fd N] [--json]` (SPEC §6.4,
-//! story S2).
+//! `envcloak init --undo <ID> [--created-by-agent] [--unrecorded]
+//! [--passphrase-fd N] [--json]` (SPEC §6.4, story S2).
 //!
 //! The project is the directory of the nearest `envcloak.toml` at or
 //! above the working directory, or the working directory when there is
