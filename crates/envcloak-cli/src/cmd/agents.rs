@@ -32,7 +32,7 @@ use envcloak_agents::install::{
 use envcloak_agents::locations::Locations;
 use envcloak_agents::writer::{DaemonBackups, Journal, Outcome, StateFile, Writer};
 use envcloak_client::claims::claims;
-use envcloak_client::fail::{FAILURE, Failure, usage};
+use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use envcloak_client::render::print_json;
 use envcloak_policy::{escape_for_display, find_manifest};
 use serde_json::{Value, json};
@@ -89,6 +89,12 @@ pub fn run(args: &[&str]) -> ExitCode {
             let Some(a) = parse(rest, install) else {
                 return usage(USAGE_TEXT);
             };
+            // The agents' configs can hold literal keys (an `env` block,
+            // an MCP server's `env`), and planning reads them: nothing is
+            // read under a tracer (SPEC §5; the Codex review).
+            if let Err(f) = refuse_if_traced() {
+                return f.report(FAILURE);
+            }
             let done = if install {
                 run_install(a)
             } else {

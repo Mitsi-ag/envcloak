@@ -104,11 +104,15 @@ pub enum Reason {
     /// The payload was larger than the handler reads, or did not arrive in
     /// time, so it was not checked.
     Unchecked,
+    /// A debugger or tracer is attached to the handler, which therefore
+    /// read nothing (SPEC §5: no secret is read under a tracer, and a
+    /// prompt can hold one).
+    Traced,
 }
 
 impl Reason {
     /// Every reason, for the tests.
-    pub const ALL: [Reason; 7] = [
+    pub const ALL: [Reason; 8] = [
         Reason::KeyInPrompt,
         Reason::EnvFile,
         Reason::EnvDump,
@@ -116,6 +120,7 @@ impl Reason {
         Reason::Approve,
         Reason::Ambiguous,
         Reason::Unchecked,
+        Reason::Traced,
     ];
 
     /// The name in the marker, `[envcloak:<name>]`.
@@ -128,6 +133,7 @@ impl Reason {
             Reason::Approve => "approve",
             Reason::Ambiguous => "ambiguous",
             Reason::Unchecked => "unchecked",
+            Reason::Traced => "traced",
         }
     }
 
@@ -178,6 +184,11 @@ impl Reason {
                 "[envcloak:unchecked] EnvCloak's hook stopped this: the request was larger than \
                  the hook reads (2 MiB) or did not arrive within its 2 second limit, so it could \
                  not be checked. This hook prevents accidents; it is not a security boundary."
+            }
+            Reason::Traced => {
+                "[envcloak:traced] EnvCloak's hook stopped this: a debugger or tracer is attached \
+                 to the hook, so it did not read the request, which could hold a key. Run the agent \
+                 without the tracer. This hook prevents accidents; it is not a security boundary."
             }
         }
     }
