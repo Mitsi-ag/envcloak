@@ -674,6 +674,12 @@ class Fn:
         self.public = public
 
 
+def crate_of(rel):
+    """`crates/<name>/` for a file under it."""
+    parts = rel.split("/")
+    return "/".join(parts[:2]) + "/"
+
+
 def generic_end(skel, k):
     """The offset just after the `>` that closes the `<` at `k` (an `->`
     inside is not one), or None if a `{` or `;` comes first."""
@@ -970,9 +976,9 @@ def code_exit_tokens(root):
     # Token helpers: free functions with a `token: &'static str` (or an
     # alias) parameter, by name, with its positions.
     helpers = {}
-    # Where a helper's name is read: every file for a `pub` one, its own
-    # file otherwise (a private function is not visible elsewhere).
-    scope = {}
+    # Where each helper is defined: (file, crate, public). A private one is
+    # visible in its crate only (its module's descendants included).
+    defs = {}
     exempt = []
     for src in sources:
         failure_impls = impl_spans(src, names) if src.rel == FAIL_RS else []
@@ -991,8 +997,7 @@ def code_exit_tokens(root):
                     exempt.append((src, f))
                 continue
             helpers.setdefault(f.name, set()).update(positions)
-            files = scope.setdefault(f.name, set())
-            files.add(None if f.public else src.rel)
+            defs.setdefault(f.name, []).append((src.rel, crate_of(src.rel), f.public))
             exempt.append((src, f))
     found = {}
 
@@ -1048,12 +1053,22 @@ def code_exit_tokens(root):
         # Token helpers: the argument at each `token` position, and every
         # mention of a helper other than a call or its own definition.
         if helper_word:
+            uses = [u.group(0) for u in USE_STMT.finditer(src.skel)]
             for m in helper_word.finditer(src.skel):
                 name = m.group(1)
-                if None not in scope[name] and src.rel not in scope[name]:
+                where_defined = defs[name]
+                if not any(pub or crate == crate_of(src.rel) for _, crate, pub in where_defined):
                     continue
                 before = src.skel[:m.start()].rstrip()
                 if before.endswith(".") or re.search(r"\bfn$", before):
+                    continue
+                # Elsewhere than where it is defined, the bare name is the
+                # helper only if this file imports it (or imports a glob);
+                # otherwise it is a local of the same name. A path to it
+                # (`super::name`) is the helper anywhere it is visible.
+                imported = any(re.search(r"\b%s\b|::\s*\*" % re.escape(name), u) for u in uses)
+                if (not before.endswith("::") and not imported
+                        and src.rel not in {rel for rel, _, _ in where_defined}):
                     continue
                 rest = src.skel[m.end():m.end() + 200]
                 call = re.match(r"\s*(?:::\s*<[^()]*>\s*)?\(", rest)
