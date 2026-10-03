@@ -195,19 +195,25 @@ pub fn open_resolver_imports(path: &std::path::Path) -> Result<Vec<(String, Stri
             return Err(format!("nm could not read the imports of {}", p.display()));
         }
         let text = String::from_utf8_lossy(&out.stdout);
-        let mut syms: Vec<&str> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| OPEN_RESOLVERS.iter().any(|r| l.starts_with(r)))
-            .collect();
-        syms.sort_unstable();
-        syms.dedup();
         found.extend(
-            syms.into_iter()
+            open_resolver_symbols(&text)
+                .into_iter()
                 .map(|sym| (p.display().to_string(), sym.to_owned())),
         );
     }
     Ok(found)
+}
+
+/// The imports of [`OPEN_RESOLVERS`] among `nm -u`'s lines, each once.
+fn open_resolver_symbols(nm_output: &str) -> Vec<&str> {
+    let mut syms: Vec<&str> = nm_output
+        .lines()
+        .map(str::trim)
+        .filter(|l| OPEN_RESOLVERS.iter().any(|r| l.starts_with(r)))
+        .collect();
+    syms.sort_unstable();
+    syms.dedup();
+    syms
 }
 
 /// Checks that the tests' network is what [`NETWORK_VAR`] says, from this
@@ -305,6 +311,62 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// One entry point of each way to resolve a name that the isolation
+    /// leaves open, written out here from the frameworks' headers, apart
+    /// from the guard's own table (Codex review of M2-RES1: the controls
+    /// were built from that table, so an entry left out of it took its
+    /// control with it): Network.framework's connections and resolver
+    /// configuration, libdnssd's XPC lookup, CFNetwork's host lookup, its
+    /// socket streams to a named host and its two HTTP streams, and
+    /// URLSession's and NSURLConnection's classes, as `nm -u` lists them.
+    /// `agent_hosts.rs` writes the same names out for its macOS control.
+    const OPEN_RESOLVER_ENTRY_POINTS: [&str; 10] = [
+        "_nw_connection_create",
+        "_nw_resolver_config_create_https",
+        "_dnssd_getaddrinfo_create",
+        "_CFHostStartInfoResolution",
+        "_CFStreamCreatePairWithSocketToHost",
+        "_CFStreamCreatePairWithSocketToCFHost",
+        "_CFReadStreamCreateForHTTPRequest",
+        "_CFReadStreamCreateForStreamedHTTPRequest",
+        "_OBJC_CLASS_$_NSURLSession",
+        "_OBJC_CLASS_$_NSURLConnection",
+    ];
+
+    /// The guard finds each entry point above among a file's imports, and
+    /// none of the lookups the isolation does refuse or that are no
+    /// lookup of a name (`getaddrinfo` and dns_sd's `DNSServiceGetAddrInfo`,
+    /// over the socket the access control entry denies; CFNetwork's proxy
+    /// auto-configuration, which Codex imports).
+    ///
+    /// Mutations checked: each of the ten entries of [`OPEN_RESOLVERS`]
+    /// left out in turn: its entry point is not found and this fails, on
+    /// every system. The filter matching every line: the refused lookups
+    /// are found and this fails.
+    #[test]
+    fn the_guard_finds_each_open_resolver_written_out_apart_from_it() {
+        let mut nm = String::new();
+        for sym in OPEN_RESOLVER_ENTRY_POINTS {
+            nm.push_str(&format!("                 {sym}\n"));
+        }
+        let refused = [
+            "_getaddrinfo",
+            "_DNSServiceGetAddrInfo",
+            "_DNSServiceRefSockFD",
+            "_CFNetworkCopyProxiesForAutoConfigurationScript",
+        ];
+        for sym in refused {
+            nm.push_str(&format!("{sym}\n"));
+        }
+        let found = open_resolver_symbols(&nm);
+        for sym in OPEN_RESOLVER_ENTRY_POINTS {
+            assert!(found.contains(&sym), "{sym} is not found: {found:?}");
+        }
+        for sym in refused {
+            assert!(!found.contains(&sym), "{sym} is found: {found:?}");
+        }
+    }
 
     /// Every Mach-O format is known by its first bytes, whatever follows,
     /// and a file that is not one, or shorter than a magic number, is
