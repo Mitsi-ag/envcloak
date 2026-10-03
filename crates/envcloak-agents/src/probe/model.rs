@@ -205,7 +205,7 @@ impl Token {
         head.header_names
             .iter()
             .zip(&head.header_values)
-            .map(|(name, value)| match name.as_str() {
+            .map(|(name, value)| match name.to_ascii_lowercase().as_str() {
                 "x-api-key" if self.equals(value) => Zeroizing::new(b"<token>".to_vec()),
                 "authorization"
                     if value

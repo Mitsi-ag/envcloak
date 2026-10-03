@@ -665,7 +665,7 @@ fn a_request_to_forward_is_recorded_whole_with_its_header_values_and_body() {
     assert_eq!(&r.body[..], body);
     let values: Vec<&[u8]> = r.values.iter().map(|v| &v[..]).collect();
     assert_eq!(values, [&b"b.example"[..], b"MARK-H", b"11"]);
-    assert_eq!(r.headers, ["host", "x-leak", "content-length"]);
+    assert_eq!(r.headers, ["Host", "X-Leak", "Content-Length"]);
     // Debug shows none of it.
     let shown = format!("{r:?}");
     assert!(!shown.contains("MARK"), "{shown}");
@@ -693,7 +693,11 @@ fn header_values_are_recorded_and_the_run_s_token_is_not() {
     assert_eq!(got.status, 401);
     let report = stub.finish().unwrap();
     let value = |r: &envcloak_agents::probe::model::Recorded, name: &str| -> Vec<u8> {
-        let at = r.headers.iter().position(|h| h == name).unwrap();
+        let at = r
+            .headers
+            .iter()
+            .position(|h| h.eq_ignore_ascii_case(name))
+            .unwrap();
         r.values[at].to_vec()
     };
     let served = &report.requests[0];
@@ -780,7 +784,7 @@ fn a_record_s_debug_shows_no_target() {
     assert!(
         report.requests[0]
             .headers
-            .contains(&"x-markheader".to_owned())
+            .contains(&"X-Markheader".to_owned())
     );
     let shown = format!("{:?}", report.requests);
     assert!(!shown.to_ascii_lowercase().contains("mark"), "{shown}");

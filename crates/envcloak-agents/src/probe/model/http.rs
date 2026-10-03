@@ -79,7 +79,11 @@ pub struct Head {
     pub content_length: usize,
     /// The client asked to close the connection after this request.
     pub close: bool,
-    /// Every header name, lower-cased, in the order given.
+    /// Every header name as it was sent, its letter case kept, in the
+    /// order given: a value put in a name is recorded, and swept, as it
+    /// came (Codex review of M2-04: a lower-cased record hid a mixed-case
+    /// value from the case-sensitive sweep). Only the protocol checks here
+    /// match names without regard to case.
     pub header_names: Vec<String>,
     /// Each header's value, trimmed, in the order of
     /// [`Head::header_names`].
@@ -147,12 +151,14 @@ const HEADER_NAMES: [&str; 21] = [
     "session_id",
 ];
 
-/// How `Debug` shows a header name: by name when it is one of
-/// [`HEADER_NAMES`], else only by its length. A header name is any token
-/// a client sent, so it can hold anything (Codex review, medium).
+/// How `Debug` shows a header name: by its lower-case name when it is one
+/// of [`HEADER_NAMES`] in any letter case, else only by its length. A header
+/// name is any token a client sent, so it can hold anything (Codex
+/// review, medium).
 pub fn shown_header_name(name: &str) -> String {
-    if HEADER_NAMES.contains(&name) {
-        name.to_owned()
+    let lower = name.to_ascii_lowercase();
+    if HEADER_NAMES.contains(&lower.as_str()) {
+        lower
     } else {
         format!("<{} bytes>", name.len())
     }
@@ -407,8 +413,8 @@ fn header(
         return Err(HttpError::Malformed("header value"));
     }
     let value = trim_ows(value);
-    let name = name.to_ascii_lowercase();
-    match name.as_slice() {
+    // Matched without regard to case; recorded as sent (below).
+    match name.to_ascii_lowercase().as_slice() {
         b"content-length" => {
             if content_length.is_some() {
                 return Err(HttpError::Malformed("content-length twice"));
@@ -459,7 +465,7 @@ fn header(
         _ => {}
     }
     head.header_names
-        .push(String::from_utf8_lossy(&name).into_owned());
+        .push(String::from_utf8_lossy(name).into_owned());
     head.header_values.push(Zeroizing::new(value.to_vec()));
     Ok(())
 }
@@ -494,9 +500,10 @@ mod tests {
         assert_eq!(h.query.as_deref(), Some("beta=true"));
         assert_eq!(h.content_length, 12);
         assert!(h.close);
+        // As sent: a value in a name is swept as it came.
         assert_eq!(
             h.header_names,
-            ["host", "content-length", "x-api-key", "connection"]
+            ["Host", "Content-Length", "X-Api-Key", "Connection"]
         );
         assert_eq!(h.api_key.as_deref().map(Vec::as_slice), Some(&b"abc"[..]));
         let shown = format!("{h:?}");

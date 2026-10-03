@@ -719,6 +719,13 @@ fn the_model_s_request_lines_are_swept() {
     let tunnel = Canary::new("TUNNEL_VALUE", format!("ectunnel{}", hex()));
     let forward = Canary::new("FORWARD_VALUE", format!("ecfwd{}", hex()));
     let header = Canary::new("HEADER_VALUE", format!("echdr{}", hex()));
+    // A name a host sent in mixed case is recorded and swept as it came
+    // (Codex review of M2-04: the record lower-cased it, and the
+    // case-sensitive sweep missed it).
+    let mixed = Canary::new(
+        "HEADER_MIXED_VALUE",
+        format!("EcHdr{}", hex().to_uppercase()),
+    );
     let value = Canary::new("HEADER_FIELD_VALUE", format!("ecval{}", hex()));
     let body = Canary::new("BODY_VALUE", format!("ecbody{}", hex()));
     let fwd_path = Canary::new("FORWARD_PATH_VALUE", format!("ecfpath{}", hex()));
@@ -750,6 +757,8 @@ fn the_model_s_request_lines_are_swept() {
         &key,
         "-H",
         &format!("x-{}: 1", header.as_str()),
+        "-H",
+        &format!("X-{}: 1", mixed.as_str()),
         "-H",
         &format!("x-leak: {}", value.as_str()),
         &format!("{base}/{}?{}", path.as_str(), query.as_str()),
@@ -795,6 +804,7 @@ fn the_model_s_request_lines_are_swept() {
         tunnel.clone(),
         forward.clone(),
         header.clone(),
+        mixed.clone(),
         value.clone(),
         body.clone(),
         method.clone(),
@@ -821,6 +831,7 @@ fn the_model_s_request_lines_are_swept() {
         (&tunnel, &["target", "header values"]),
         (&forward, &["target", "forwarded target", "header values"]),
         (&header, &["header names"]),
+        (&mixed, &["header names"]),
         (&value, &["header values"]),
         (&method, &["method"]),
         (&body, &["body"]),
