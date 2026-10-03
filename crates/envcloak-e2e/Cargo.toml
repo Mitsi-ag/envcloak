@@ -28,3 +28,7 @@ tempfile.workspace = true
 # qualified-version table against agents/versions.toml.
 [dev-dependencies]
 envcloak-agents.workspace = true
+# The catalog's tests (M2 plan task M2-10) gather a caller's evidence as
+# the daemon does, against the pinned hosts.
+envcloak-policy.workspace = true
+envcloak-sys.workspace = true
