@@ -384,7 +384,10 @@ fn follow(
             let _ = child.kill();
             forwarder.stop(forwarding);
         }
-        let waited = envcloak_sys::wait_for_exit(pid);
+        // A test build can make the wait fail here, after the command has
+        // run, to reach the "may have run" failure no fixture can cause.
+        let waited = envcloak_sys::wait_for_exit(pid)
+            .and_then(|w| envcloak_sys::fail_point("exec.follow.wait").map(|()| w));
         // The child has exited and is not reaped yet, so the group it led
         // is still its own; it stays unreaped until its output has been
         // read. A run that got a SIGTERM, passed on to the child, ends what

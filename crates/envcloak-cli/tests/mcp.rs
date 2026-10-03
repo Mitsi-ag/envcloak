@@ -1314,6 +1314,94 @@ fn run_outcomes_come_from_envcloak_run_never_from_the_command() {
     f.sweep();
 }
 
+/// Writes the file argv[1] names, then exits 0: the mark that the command
+/// ran.
+const MARKS_IT_RAN: &str = "import sys
+open(sys.argv[1], 'w').close()
+";
+
+/// The third kind of record (Codex's completion-channel gate 6): `envcloak
+/// run` failing after its command may have started, here its wait for the
+/// command failing in a test build (`ENVCLOAK_TEST_FAIL`) once the command
+/// has run, is `execution_unknown`, never "not run": the command's mark is
+/// there, no exit code is claimed, and `envcloak run`'s own line says it
+/// may have run. The paired control, a command that is not found, fails
+/// before anything starts: `refused` with `command_not_found`, exit 127,
+/// and no mark.
+///
+/// Mutation checked: `ExecError::may_have_started` always false (every
+/// runner failure taken as before the start): the run that ran is
+/// answered `refused` with `run_failed` and this fails.
+#[test]
+fn a_run_that_fails_after_its_command_started_may_have_run() {
+    let f = Fixture::new();
+    let mut cmd = Command::new(testkit_bin("fixture-agent"));
+    f.home
+        .apply(&mut cmd)
+        .env(envcloak_sys::testing::FAIL_SITE, "exec.follow.wait")
+        .arg("--")
+        .arg(common::cli());
+    let mut m = Mcp::spawn(cmd, &f.project, &["--wait-ms", "8000"], &f.cs);
+    m.initialize();
+    let dir = f.project.to_str().unwrap().to_owned();
+    std::fs::write(f.project.join("marks_it_ran.py"), MARKS_IT_RAN).unwrap();
+    let py = python3();
+    let mark = |name: &str| f.project.join(name);
+    let argv = |name: &str| {
+        json!([
+            py.to_str().unwrap(),
+            "-I",
+            "-B",
+            "marks_it_ran.py",
+            mark(name).to_str().unwrap()
+        ])
+    };
+    let s = structured(&m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": argv("first")}),
+    ))
+    .clone();
+    assert_eq!(s["status"], "approval_required", "{s}");
+    assert!(
+        !mark("first").exists(),
+        "a pending request started its command"
+    );
+    f.approve(s["request"].as_str().unwrap());
+
+    let s = structured(&m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": argv("ran")}),
+    ))
+    .clone();
+    assert!(mark("ran").exists(), "the command did not run: {s}");
+    assert_eq!(s["status"], "execution_unknown", "{s}");
+    assert_eq!(s["exit_code"], Value::Null, "{s}");
+    assert_eq!(s["token"], Value::Null, "{s}");
+    let message = s["message"].as_str().unwrap();
+    assert!(message.contains("may have run"), "{s}");
+    assert!(!message.contains("nothing was run"), "{s}");
+    assert!(
+        s["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("envcloak: run_failed: the command was started"),
+        "{s}"
+    );
+
+    // The control: refused before anything starts.
+    let missing = f.project.join("no-such-command");
+    let s = structured(&m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": [missing.to_str().unwrap()]}),
+    ))
+    .clone();
+    assert_eq!(s["status"], "refused", "{s}");
+    assert_eq!(s["token"], "command_not_found", "{s}");
+    assert_eq!(s["exit_code"], 127, "{s}");
+    m.finish();
+    f.sweep();
+}
+
 /// Host cancellation (`notifications/cancelled`) of a running
 /// `run_with_secrets`: the call is answered nothing, ever, and the
 /// command's whole process tree ends, its forked child too (a lock both

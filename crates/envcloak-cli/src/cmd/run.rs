@@ -770,6 +770,60 @@ fn protocol() -> Failure {
 mod tests {
     use super::*;
 
+    /// The record and exit code a runner failure ends a run with: one
+    /// after the command may have started is `unknown` (Codex's
+    /// completion-channel gate 6: never "not run"), one before it is
+    /// `not_started` with its token, and a command not found or not
+    /// executable keeps `env(1)`'s code. Read back as the server reads it.
+    ///
+    /// Mutation checked: `ExecError::may_have_started` always false (every
+    /// runner failure taken as before the start): the `unknown` record is
+    /// written `not_started` and this fails.
+    #[test]
+    fn a_runner_failure_after_the_start_is_recorded_as_may_have_run() {
+        use std::io::{Seek, SeekFrom};
+        for (e, record, code) in [
+            (
+                ExecError::Followed(std::io::ErrorKind::Other),
+                RunStatus::Unknown,
+                125u8,
+            ),
+            (
+                ExecError::NotFound,
+                RunStatus::NotStarted {
+                    token: "command_not_found".into(),
+                    request: None,
+                },
+                127,
+            ),
+            (
+                ExecError::NotExecutable(std::io::ErrorKind::PermissionDenied),
+                RunStatus::NotStarted {
+                    token: "command_not_executable".into(),
+                    request: None,
+                },
+                126,
+            ),
+            (
+                ExecError::Setup(std::io::ErrorKind::OutOfMemory),
+                RunStatus::NotStarted {
+                    token: "run_failed".into(),
+                    request: None,
+                },
+                125,
+            ),
+        ] {
+            let what = format!("{e:?}");
+            let mut file = tempfile::tempfile().unwrap();
+            let exit = Ended::exec(e).finish(Some(&mut file));
+            assert_eq!(exit, ExitCode::from(code), "{what}");
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut written = Vec::new();
+            file.read_to_end(&mut written).unwrap();
+            assert_eq!(RunStatus::decode(&written), Some(record), "{what}");
+        }
+    }
+
     #[test]
     fn options_come_before_the_command() {
         assert_eq!(
