@@ -34,7 +34,12 @@
 //!    step 5, gate 33). An answer too large for one frame is known before
 //!    anything is committed (F-77): it is `frame_too_large`, audited as
 //!    that, with nothing released and the grant left as it was, so a
-//!    `once` grant still covers a smaller request.
+//!    `once` grant still covers a smaller request. The values are read
+//!    and the answer framed after the decision, so once the answer is
+//!    built the grant is asked again on clocks read then: one that ran
+//!    out meanwhile (by the wall clock or by time awake) commits nothing,
+//!    and the request is decided again on fresh clocks, as one arriving
+//!    then would be.
 //!
 //! `approve` takes the passphrase as the proof. Before Argon2id runs, the
 //! approver must be a terminal subject with no agent by any evidence
@@ -95,6 +100,13 @@ use crate::clock::now_of;
 use crate::lock::Reading;
 use crate::server::{Shared, locked, refuse_if_traced};
 use crate::state::{Delivery, vault_reason};
+
+/// How many times one `run.request` is decided at most: a second decision
+/// follows only a grant that ran out while its answer was prepared, and
+/// that grant is expired on the clocks the next decision reads, unless
+/// the wall clock was set back meanwhile. A request decided this often
+/// is answered `internal`, with nothing committed.
+const MAX_DECISIONS: u32 = 4;
 
 /// Refuses a proof, or the statement a proof would approve, from a caller
 /// that may not give one (SPEC §10b): an agent by any evidence, or no
@@ -431,11 +443,18 @@ pub fn run_request(
         argv_display: p.argv,
         new_project,
     };
-    let now = now_of(&shared.clocks);
     // A `once` grant is consumed under the same lock as the decision, so
     // of concurrent requests exactly one is covered by it (gate 30).
     let mut request = Some(request);
+    // Each decision on clocks read for it: one taken again after a grant
+    // ran out while its answer was prepared sees it expired (F-77).
+    let mut decisions = 0;
     let decision = loop {
+        decisions += 1;
+        if decisions > MAX_DECISIONS {
+            return Err(RpcError::new(ErrorKind::Internal));
+        }
+        let now = now_of(&shared.clocks);
         let r = request.take().ok_or(RpcError::new(ErrorKind::Internal))?;
         let again = r.clone();
         match s.grants().decide(r, &now) {
@@ -486,12 +505,30 @@ pub fn run_request(
                             })
                             .collect(),
                     };
-                    framed(id, &answer)
+                    let frame = framed(id, &answer);
+                    // A test stops here, holding the framed answer and
+                    // the state lock, to let the grant run out (F-77).
+                    envcloak_sys::pause_point("run.answer_framed");
+                    frame
                 };
-                let frame = match s.deliver(AuditEvent::Request(Box::new(covered)), &fields, answer)
-                {
+                let delivered = s.deliver(
+                    g,
+                    &shared.clocks,
+                    AuditEvent::Request(Box::new(covered)),
+                    &fields,
+                    answer,
+                );
+                let frame = match delivered {
                     Ok(frame) => frame,
                     Err(Delivery::Refused(e)) => return Err(e),
+                    Err(Delivery::Lapsed) => {
+                        // The grant ran out while the answer was prepared:
+                        // nothing was recorded or released. The request is
+                        // decided again on clocks read now, as if it came
+                        // now, which that grant no longer covers.
+                        request = Some(again);
+                        continue;
+                    }
                     Err(Delivery::Unsendable(e)) => {
                         // Nothing released and the grant as it was; the
                         // refusal is recorded, with the grant that would
