@@ -21,7 +21,7 @@
 //!   runs the process out of descriptors (macOS allows 256 by default).
 //!
 //! A file an interrupted change of an env file left under a temporary name
-//! (`.<name>.envcloak-<new|del>-<hex>.tmp`, see [`crate::atomic`]) is
+//! (`.<name>.envcloak-<new|swap|del>-<hex>.tmp`, see [`crate::atomic`]) is
 //! reported as [`ScanErrorKind::Leftover`]: it may hold plaintext, and no
 //! `.gitignore` line for the env file covers it.
 //!

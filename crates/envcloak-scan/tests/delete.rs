@@ -237,7 +237,7 @@ fn an_old_file_that_cannot_be_unlinked_after_the_swap_is_reported() {
         let name = std::fs::read_dir(d.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .find(|n| n.starts_with("..env.envcloak-new-"))
+            .find(|n| n.starts_with("..env.envcloak-swap-"))
             .unwrap();
         assert_eq!(std::fs::read(d.path().join(&name)).unwrap(), BODY);
         assert_eq!(

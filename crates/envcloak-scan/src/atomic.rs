@@ -9,18 +9,22 @@
 //! modified), since the other name would keep the old contents.
 //!
 //! - [`replace_atomically`] writes the new contents to a new file beside
-//!   the old one (`O_EXCL`, the old file's mode), flushes it, checks the
-//!   old file again, swaps the two names in one step and checks that what
-//!   came out is the file checked and what went in the file it wrote
-//!   (swapping back when another program saved over either name
-//!   meanwhile), then removes it and flushes the directory. A crash leaves the old file or the new one, never part of
-//!   either; a leftover temporary file is never read by anyone. On a file
-//!   system that cannot swap names (macOS HFS+, some network and FUSE
-//!   ones), the new file is renamed over the old one right after the
-//!   check, and a save landing between the two is replaced.
+//!   the old one (`O_EXCL`, the old file's mode), flushes it, moves it in
+//!   one step that replaces nothing to the name it is swapped from,
+//!   checks that this name holds the file written with exactly the bytes
+//!   written, checks the old file again, swaps the two names in one step
+//!   and checks that what came out is the file checked and what went in
+//!   the file written, still holding those bytes (swapping back when
+//!   another program saved over either name, or wrote into the new file,
+//!   meanwhile), then removes the old file and flushes the directory. A
+//!   crash leaves the old file or the new one, never part of either; a
+//!   leftover temporary file is never read by anyone. On a file system
+//!   that cannot swap names (macOS HFS+, some network and FUSE ones), the
+//!   new file is renamed over the old one right after the check, and a
+//!   save landing between the two is replaced.
 //! - [`create_atomically`] writes a new file the same way and links it
 //!   into place only if the name is still free, answering only once the
-//!   name holds the file it wrote.
+//!   name holds the file it wrote, with the bytes it wrote.
 //! - [`remove_checked`] removes a file only when it is unchanged since it
 //!   was read, not modified within [`MIN_AGE`], and not open in another
 //!   process as far as the system can tell
@@ -35,9 +39,24 @@
 //!   rewrites an env file to hold only the entries it did not import.
 //!
 //! A crash between the steps leaves the file, or its replacement, under a
-//! temporary name `.<name>.envcloak-<new|del>-<hex>.tmp` ([`temp_name`]),
-//! which a scan reports ([`ScanErrorKind::Leftover`]) and `envcloak init`
-//! makes sure its project's `.gitignore` ignores.
+//! temporary name `.<name>.envcloak-<new|swap|del>-<hex>.tmp`
+//! ([`temp_name`]), which a scan reports ([`ScanErrorKind::Leftover`]) and
+//! `envcloak init` makes sure its project's `.gitignore` ignores. A name
+//! of the shape `new` only ever holds a new file while it is written: a
+//! swap takes the new file from a name of the shape `swap`, so whatever a
+//! swap brings out (the old file, another program's save) never has a
+//! name of the shape `new`, the one shape a later restore removes files
+//! of ([`remove_leftovers`]). Nothing this module wrote is removed unless
+//! it is shown to be the file written, holding what was written; anything
+//! else under one of these names is kept, and named.
+//!
+//! Each removal of a temporary name checks the very file it unlinks: the
+//! file is first moved, in one step that replaces nothing, to a fresh
+//! name of the same shape, checked there, and unlinked there only while
+//! that name still holds it unchanged ([`remove_if`]). What none of this
+//! can exclude is a process that renames another file onto that fresh
+//! name between the last check and the unlink: only one that reads the
+//! directory for a name that did not exist a moment before.
 //!
 //! No temporary copy holds anything the caller did not write, and nothing
 //! here writes a backup: plaintext is never copied (SPEC §6.4 "Backups").
@@ -51,8 +70,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use envcloak_sys::{
-    DirEntryKind, InUse, MAX_DIR_ENTRIES, create_beneath, create_rw_beneath, exchange_beneath,
-    kind_beneath, link_beneath, list_dir, open_elsewhere, rename_beneath, sync_file,
+    DirEntryKind, InUse, MAX_DIR_ENTRIES, create_rw_beneath, exchange_beneath, kind_beneath,
+    link_beneath, list_dir, open_elsewhere, rename_beneath, rename_new_beneath, sync_file,
     unlink_beneath,
 };
 use sha2::{Digest, Sha256};
@@ -83,8 +102,9 @@ pub enum ModifyErrorKind {
     Exists,
     /// It could not be opened or checked, for this reason.
     Scan(ScanErrorKind),
-    /// The file was moved aside and something else took its name before
-    /// it could be put back: it was left under the name in
+    /// Another program saved over a name, or wrote into a new file this
+    /// one wrote, while it was being changed, so a file of unknown origin
+    /// is under a temporary name: it was left there, under the name in
     /// [`ModifyError::rel`], and nothing was removed.
     MovedAside,
     /// The change was made (the new contents have the file's name, or the
@@ -143,8 +163,8 @@ impl ModifyErrorKind {
             ModifyErrorKind::Exists => "a file of that name exists already",
             ModifyErrorKind::Scan(k) => k.message(),
             ModifyErrorKind::MovedAside => {
-                "it was saved over while it was being removed; the checked file was kept under \
-                 the name shown, and nothing was removed"
+                "another program saved over it, or wrote into the new file beside it, while it was \
+                 being changed; that file was kept under the name shown, and nothing was removed"
             }
             ModifyErrorKind::NotRemoved => {
                 "the change was made, but the old file could not be removed and is left under \
@@ -180,9 +200,12 @@ impl core::fmt::Display for ModifyError {
 
 impl std::error::Error for ModifyError {}
 
-/// A new name beside `name`: `.<name>.envcloak-<what>-<hex>.tmp`, from a randomly
-/// keyed hash of the time and this process. Not secret; a clash only makes
-/// `O_EXCL` fail. Names too long for one leave the name out.
+/// A new name beside `name`: `.<name>.envcloak-<what>-<hex>.tmp`, from a
+/// randomly keyed hash of the time and this process. Not secret; a clash
+/// only makes `O_EXCL`, or a move that replaces nothing, fail. Names too
+/// long for one leave the name out. `what` is `new` for a new file while
+/// it is written, `swap` for the name a swap takes it from (and leaves
+/// what it brings out under), and `del` for a file being removed.
 fn temp_name(name: &OsStr, what: &str) -> OsString {
     use std::hash::{BuildHasher, RandomState};
     let nanos = SystemTime::now()
@@ -190,6 +213,11 @@ fn temp_name(name: &OsStr, what: &str) -> OsString {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let h = RandomState::new().hash_one((nanos, std::process::id()));
+    // A unit test names the next ones, to put a file there first.
+    #[cfg(test)]
+    let h = tests::NEXT_HEX
+        .with(|q| q.borrow_mut().pop_front())
+        .unwrap_or(h);
     let mut t = OsString::from(".");
     if name.as_bytes().len() <= 128 {
         t.push(name);
@@ -198,8 +226,9 @@ fn temp_name(name: &OsStr, what: &str) -> OsString {
     t
 }
 
-/// Whether `n` is one of `name`'s temporary names for a new file:
-/// `.<name>.envcloak-new-<16 lowercase hex>.tmp` ([`temp_name`]).
+/// Whether `n` is one of `name`'s temporary names for a new file while it
+/// is written: `.<name>.envcloak-new-<16 lowercase hex>.tmp`
+/// ([`temp_name`]).
 fn new_name_of(name: &OsStr, n: &OsStr) -> bool {
     let mut prefix = b".".to_vec();
     prefix.extend_from_slice(name.as_bytes());
@@ -214,48 +243,151 @@ fn new_name_of(name: &OsStr, n: &OsStr) -> bool {
         })
 }
 
+/// Moves `from` to the fresh name `to` in `dir` without replacing what has
+/// `to`: in one step ([`rename_new_beneath`]) where the file system can;
+/// where it cannot, only after `to` was seen free, so there a file that
+/// takes that unpredictable name in between is replaced.
+fn move_aside(dir: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+    move_aside_using(rename_new_beneath, dir, from, to)
+}
+
+/// What moves a name to a free one in one step: [`rename_new_beneath`],
+/// or a unit test's file system that cannot.
+type RenameNew = fn(&File, &OsStr, &OsStr) -> std::io::Result<()>;
+
+/// [`move_aside`] with `rename_new`.
+fn move_aside_using(
+    rename_new: RenameNew,
+    dir: &File,
+    from: &OsStr,
+    to: &OsStr,
+) -> std::io::Result<()> {
+    match rename_new(dir, from, to) {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => match kind_beneath(dir, to) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => rename_beneath(dir, from, to),
+            Err(e) => Err(e),
+            Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+        },
+        moved => moved,
+    }
+}
+
+/// What [`remove_if`] did with a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Removal {
+    /// It was taken for the one to remove, and unlinked.
+    Unlinked,
+    /// Nothing had the name.
+    Absent,
+    /// It was kept, under this name.
+    Kept(OsString),
+}
+
+/// The points [`remove_if`] passes, for the leftover cleanup's barriers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removing {
+    /// The file was moved to a fresh name and is not checked there yet.
+    Moved,
+    /// It was checked there, and its name there is not checked again yet.
+    Read,
+    /// It failed the check and was linked back under its name; the fresh
+    /// name is not removed yet.
+    PutBack,
+}
+
+/// Removes the file `at` in `dir` (one of `name`'s temporary names) only
+/// when `is_it` takes it for the one to remove, and only the very file it
+/// took. A first look opens it by its name (a regular file of this user,
+/// never through a symlink) and asks `is_it`; a file that passes is moved,
+/// in one step that replaces nothing ([`move_aside`]), to a fresh name of
+/// the shape `what` (`.<name>.envcloak-<what>-<hex>.tmp`), opened and
+/// asked again there, and unlinked there only while that name still holds
+/// it with the stamp it had before it was asked, change time included. A
+/// file that fails there is put back under `at` with a link that never
+/// replaces a name, and the fresh name then goes only while it names that
+/// same file; when `at` was taken meanwhile, the file is left under the
+/// fresh name. `observe` hears each [`Removing`] point. The one thing this
+/// cannot exclude is a process that renames another file onto the fresh
+/// name between the last check and the unlink.
+fn remove_if(
+    dir: &File,
+    name: &OsStr,
+    at: &OsStr,
+    what: &str,
+    is_it: &mut dyn FnMut(&mut File, &std::fs::Metadata) -> bool,
+    observe: &mut dyn FnMut(Removing),
+) -> Removal {
+    let first = match open_file(dir, at, usize::MAX) {
+        Err(ScanErrorKind::NotFound) => return Removal::Absent,
+        Ok((mut f, m)) => is_it(&mut f, &m),
+        Err(_) => false,
+    };
+    if !first {
+        return Removal::Kept(at.to_os_string());
+    }
+    let aside = temp_name(name, what);
+    if move_aside(dir, at, &aside).is_err() {
+        return Removal::Kept(at.to_os_string());
+    }
+    observe(Removing::Moved);
+    let taken = open_file(dir, &aside, usize::MAX).is_ok_and(|(mut f, m)| {
+        let stamp = FileStamp::of(&m);
+        let ok = is_it(&mut f, &m);
+        observe(Removing::Read);
+        ok && open_file(dir, &aside, usize::MAX).is_ok_and(|(_, now)| FileStamp::of(&now) == stamp)
+    });
+    if taken {
+        return match unlink_beneath(dir, &aside) {
+            Ok(()) => Removal::Unlinked,
+            Err(_) => Removal::Kept(aside),
+        };
+    }
+    if link_beneath(dir, &aside, at).is_err() {
+        return Removal::Kept(aside);
+    }
+    observe(Removing::PutBack);
+    let id = |n: &OsStr| open_file(dir, n, usize::MAX).map(|(_, m)| (m.dev(), m.ino()));
+    if id(&aside).is_ok_and(|a| id(at).is_ok_and(|b| a == b)) {
+        let _ = unlink_beneath(dir, &aside);
+    }
+    Removal::Kept(at.to_os_string())
+}
+
 /// Removes from `dir` what earlier writes back of `name` left beside it
-/// under their temporary names (`.<name>.envcloak-new-<16 hex>.tmp`,
-/// [`temp_name`]) when they were stopped before they ended, once `staged`,
-/// the new file `ours` in `dir` (open for reading as well), holds the whole
-/// contents being written back. A file of such a name goes only when it is
-/// shown to hold nothing but those contents' first bytes: a regular file
-/// of this user with one link, no longer than `staged`, every byte of it
-/// equal to the byte of `staged` at its place ([`holds_first_bytes_of`]).
-/// Whatever else has such a name stays, since its origin is not known:
-/// another program's save a swap brought out and could not put back
-/// ([`ModifyErrorKind::MovedAside`]), the file a stopped write swapped
-/// out, the contents of another backup. A name too long to be carried in
-/// one ([`temp_name`] leaves it out) says nothing of whose it is, so
-/// nothing is removed then. Never through a symlink.
+/// under the names a new file has while it is written
+/// (`.<name>.envcloak-new-<16 hex>.tmp`, [`temp_name`]) when they were
+/// stopped before they ended, once `staged`, the new file `ours` in `dir`,
+/// holds the whole contents being written back. A file of such a name
+/// goes only when it is shown to hold nothing but those contents' first
+/// bytes: a regular file of this user with one link, no longer than
+/// `staged`, every byte of it equal to the byte of `staged` at its place
+/// ([`holds_first_bytes_of`]). Such a name is only ever given to a new
+/// file while it is written: whatever a swap brings out, another
+/// program's save included, is left under a name of the shape `swap`
+/// ([`ModifyErrorKind::MovedAside`]), which is never removed here, since
+/// nothing shows where it came from. A file of the shape `new` that holds
+/// anything else stays too. A name too long to be carried in one
+/// ([`temp_name`] leaves it out) says nothing of whose it is, so nothing
+/// is removed then. Never through a symlink.
 ///
-/// The check that decides reads the very file that is then unlinked, not
-/// whatever has its name by then (a name checked, then removed by that
-/// name again, removes what took the name meanwhile): a file that passes
-/// a first look by its name is first moved aside, in one `rename(2)` in
-/// `dir`, to a fresh name of the same shape, then checked there again,
-/// whole, and unlinked there only while that name still holds the file
-/// checked, unchanged since before it was read. A file that fails the
-/// check there is put back under its name with a link that never replaces
-/// one (whatever took the name meanwhile keeps it), or, when that name is
-/// taken, left under the fresh name, where a later restore or a report of
-/// leftovers finds it. A process killed between the move and the end
-/// leaves the file under the fresh name, of the same shape. What this
-/// cannot exclude is a process that renames another file onto that fresh
-/// name between the last check and the unlink: only one that reads this
-/// directory for that name, as another restore of the same file running
-/// at that moment does, and then only a file that one checked too.
+/// Each file goes through [`remove_if`]: checked by its name, moved aside
+/// to a fresh name of the same shape, checked there again, whole, and
+/// unlinked there only while that name still holds it unchanged; put back
+/// (or left under the fresh name) otherwise. A process killed between the
+/// move and the end leaves the file under the fresh name, of the same
+/// shape.
 ///
-/// `observe` hears [`Inside::LeftoverMoved`] once a file is moved aside
-/// and [`Inside::LeftoverRead`] once its bytes there are compared, before
-/// the last check of its name. Best effort: returns how many went, and
-/// flushes `dir` when any did. The bytes read pass through buffers wiped
-/// after.
-pub(crate) fn remove_leftovers(
+/// `observe` hears [`Inside::LeftoverMoved`] once a file is moved aside,
+/// [`Inside::LeftoverRead`] once its bytes there are compared, before the
+/// last check of its name, and [`Inside::LeftoverPutBack`] once a file
+/// that failed is linked back under its name, before the fresh name goes.
+/// Best effort: returns how many went, and flushes `dir` when any did. The
+/// bytes read pass through buffers wiped after.
+fn remove_leftovers(
     dir: &File,
     name: &OsStr,
     ours: &OsStr,
-    staged: &File,
+    staged: &Staged,
     observe: &mut dyn FnMut(Inside),
 ) -> usize {
     if name.as_bytes().len() > 128 {
@@ -264,42 +396,31 @@ pub(crate) fn remove_leftovers(
     let Ok(entries) = list_dir(dir, MAX_DIR_ENTRIES) else {
         return 0;
     };
-    let Ok(want) = staged.metadata() else {
-        return 0;
-    };
-    let len = want.len();
     let mut removed = 0;
     for e in entries {
-        // A first look, by the name: a file that is not a restore's
-        // leftover (another program's save, say) is never moved.
+        // A file of another name or kind is never looked at.
         if !new_name_of(name, &e.name)
             || e.name == ours
             || !kind_beneath(dir, &e.name).is_ok_and(|k| k == DirEntryKind::File)
-            || !holds_first_bytes_of(dir, &e.name, staged, len, &mut || {})
         {
             continue;
         }
-        let aside = temp_name(name, "new");
-        if kind_beneath(dir, &aside)
-            .map_or_else(|e| e.kind() != std::io::ErrorKind::NotFound, |_| true)
-            || rename_beneath(dir, &e.name, &aside).is_err()
-        {
-            continue;
-        }
-        observe(Inside::LeftoverMoved);
-        if holds_first_bytes_of(dir, &aside, staged, len, &mut || {
-            observe(Inside::LeftoverRead);
-        }) {
-            if unlink_beneath(dir, &aside).is_ok() {
-                removed += 1;
-            }
-        } else if link_beneath(dir, &aside, &e.name).is_ok() {
-            // Back under its name; the fresh name goes only while it still
-            // names the same file.
-            let same = |n: &OsStr| open_file(dir, n, usize::MAX).map(|(_, m)| (m.dev(), m.ino()));
-            if same(&aside).is_ok_and(|a| same(&e.name).is_ok_and(|b| a == b)) {
-                let _ = unlink_beneath(dir, &aside);
-            }
+        let gone = remove_if(
+            dir,
+            name,
+            &e.name,
+            "new",
+            &mut |f, m| holds_first_bytes_of(f, m, &staged.f, staged.len),
+            &mut |at| {
+                observe(match at {
+                    Removing::Moved => Inside::LeftoverMoved,
+                    Removing::Read => Inside::LeftoverRead,
+                    Removing::PutBack => Inside::LeftoverPutBack,
+                });
+            },
+        );
+        if gone == Removal::Unlinked {
+            removed += 1;
         }
     }
     if removed > 0 {
@@ -308,26 +429,13 @@ pub(crate) fn remove_leftovers(
     removed
 }
 
-/// Whether the file `leftover` in `dir` holds nothing but the first bytes
-/// of `whole`, which is `len` bytes long: a regular file of this user,
-/// never through a symlink, with one link, no longer than `whole`, each of
-/// its bytes the byte of `whole` at its place; and, once read (`read` is
-/// called then), still the file of that name with the stamp it had before
-/// the read, its change time included: a file written while it was read,
-/// or another file put under that name, is not taken for it.
-fn holds_first_bytes_of(
-    dir: &File,
-    leftover: &OsStr,
-    whole: &File,
-    len: u64,
-    read: &mut dyn FnMut(),
-) -> bool {
+/// Whether `f`, opened with the metadata `m`, holds nothing but the first
+/// bytes of `whole`, which is `len` bytes long: one link, no longer than
+/// `whole`, each of its bytes the byte of `whole` at its place, and as
+/// long as `m` says.
+fn holds_first_bytes_of(f: &mut File, m: &std::fs::Metadata, whole: &File, len: u64) -> bool {
     use std::os::unix::fs::FileExt;
-    let Ok((mut f, m)) = open_file(dir, leftover, usize::MAX) else {
-        return false;
-    };
-    let stamp = FileStamp::of(&m);
-    if stamp.nlink != 1 || stamp.size > len {
+    if m.nlink() != 1 || m.len() > len {
         return false;
     }
     let mut theirs = Zeroizing::new(vec![0u8; 64 * 1024]);
@@ -340,7 +448,7 @@ fn holds_first_bytes_of(
             Err(_) => return false,
         };
         let end = at + n as u64;
-        if end > stamp.size
+        if end > m.len()
             || whole.read_exact_at(&mut ours[..n], at).is_err()
             || theirs[..n] != ours[..n]
         {
@@ -348,50 +456,204 @@ fn holds_first_bytes_of(
         }
         at = end;
     }
-    read();
-    at == stamp.size
-        && open_file(dir, leftover, usize::MAX).is_ok_and(|(_, now)| FileStamp::of(&now) == stamp)
+    at == m.len()
 }
 
-/// Writes `bytes` to a new file `temp` in `dir` with `mode`, flushed.
-fn write_new(dir: &File, temp: &OsStr, bytes: &[u8], mode: u32) -> std::io::Result<File> {
-    let mut f = create_beneath(dir, temp, 0o600)?;
-    let written = f
-        .write_all(bytes)
-        .and_then(|()| f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777)))
-        .and_then(|()| sync_file(&f).map(drop));
-    if let Err(e) = written {
-        let _ = unlink_beneath(dir, temp);
-        return Err(e);
+/// A new file written beside the one it is to replace or create, open for
+/// reading and writing, and what was written to it: the mode it was given,
+/// and the length and SHA-256 of the bytes written. It is read back
+/// through this descriptor only, never by a name.
+struct Staged {
+    f: File,
+    mode: u32,
+    len: u64,
+    sha256: [u8; 32],
+}
+
+impl Staged {
+    /// Whether the file holds exactly the bytes written: read whole
+    /// through its descriptor, of the length and SHA-256 written, its
+    /// whole stamp the same before and after that read, change time
+    /// included. An edit in place, one at the same length that puts the
+    /// modification time back included, and a write while it is read are
+    /// each seen. The bytes pass through a buffer wiped after.
+    fn holds_written(&self) -> bool {
+        use std::os::unix::fs::FileExt;
+        let Ok(before) = self.f.metadata().map(|m| FileStamp::of(&m)) else {
+            return false;
+        };
+        if before.size != self.len {
+            return false;
+        }
+        let mut buf = Zeroizing::new(vec![0u8; 64 * 1024]);
+        let mut h = Sha256::new();
+        let mut at: u64 = 0;
+        loop {
+            let n = match self.f.read_at(&mut buf[..], at) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            };
+            at += n as u64;
+            if at > self.len {
+                return false;
+            }
+            h.update(&buf[..n]);
+            #[cfg(test)]
+            tests::during_read();
+        }
+        let digest: [u8; 32] = h.finalize().into();
+        at == self.len
+            && digest == self.sha256
+            && self.f.metadata().is_ok_and(|m| FileStamp::of(&m) == before)
     }
-    Ok(f)
+
+    /// Whether the file is still as written: the bytes written
+    /// ([`Staged::holds_written`]) and the mode it was given, so a file
+    /// another program made readable to others is never put in place.
+    fn intact(&self) -> bool {
+        self.f.metadata().is_ok_and(|m| m.mode() == self.mode) && self.holds_written()
+    }
+
+    /// Whether `at` in `dir` is this file (a regular file of this user,
+    /// never through a symlink, with its device and inode), still as
+    /// written ([`Staged::intact`]).
+    fn named(&self, dir: &File, at: &OsStr) -> bool {
+        holds(dir, at, &self.f) && self.intact()
+    }
+
+    /// Removes this file from `at` in `dir`, one of `name`'s temporary
+    /// names of the shape `what`, only while `at` names it and it holds
+    /// the bytes written ([`remove_if`], [`Staged::holds_written`]):
+    /// anything else under that name, this file written into by another
+    /// program included, is kept, and [`Removal::Kept`] says where. `dir`
+    /// is flushed when anything went.
+    fn discard(&self, dir: &File, name: &OsStr, at: &OsStr, what: &str) -> Removal {
+        let ours = self.f.metadata().map(|m| (m.dev(), m.ino())).ok();
+        let r = remove_if(
+            dir,
+            name,
+            at,
+            what,
+            &mut |_, m| ours == Some((m.dev(), m.ino())) && self.holds_written(),
+            &mut |_| {},
+        );
+        if r == Removal::Unlinked {
+            let _ = sync_file(dir);
+        }
+        r
+    }
 }
 
-/// What writes a new file's contents: called once with the new file, open
-/// for reading and writing and empty. A failure leaves no new file.
-pub(crate) type Fill<'a> = &'a mut dyn FnMut(&mut File) -> Result<(), ModifyErrorKind>;
+/// What a new file's contents are written through: the file, and the
+/// length and SHA-256 of every byte that reaches it.
+struct Hashing<'a> {
+    f: &'a mut File,
+    h: Sha256,
+    len: u64,
+}
 
-/// Writes what `fill` writes to a new file `temp` in `dir`, then gives it
-/// `mode` and flushes it. On a failure the new file goes.
+impl Write for Hashing<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.f.write(buf)?;
+        let wrote = buf.get(..n).unwrap_or_default();
+        self.h.update(wrote);
+        self.len += wrote.len() as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.f.flush()
+    }
+}
+
+/// What writes a new file's contents: called once with a writer to the
+/// new file, which is empty. A failure leaves no new file.
+pub(crate) type Fill<'a> = &'a mut dyn FnMut(&mut dyn Write) -> Result<(), ModifyErrorKind>;
+
+/// Writes what `fill` writes to a new file `temp` in `dir` (one of
+/// `name`'s temporary names of the shape `new`), counting and hashing
+/// every byte that reaches it, then gives it `mode` and flushes it. On a
+/// failure the new file goes, only while `temp` names it and it holds what
+/// was written ([`Staged::discard`]); anything else there is kept and
+/// named (`moved_aside`). `rel` is the file's path for errors.
 fn write_new_with(
     dir: &File,
+    rel: &Path,
+    name: &OsStr,
     temp: &OsStr,
     mode: u32,
     fill: Fill<'_>,
-) -> Result<File, ModifyErrorKind> {
+) -> Result<Staged, ModifyError> {
+    let fail = |kind| ModifyError {
+        rel: rel.to_path_buf(),
+        kind,
+    };
     // Open for reading as well: what it holds is read back through this
-    // descriptor (`remove_leftovers`), never by its name again.
-    let mut f = create_rw_beneath(dir, temp, 0o600).map_err(|e| io(&e))?;
-    let written = fill(&mut f).and_then(|()| {
+    // descriptor, never by its name again.
+    let mut f = create_rw_beneath(dir, temp, 0o600).map_err(|e| fail(io(&e)))?;
+    let mut w = Hashing {
+        f: &mut f,
+        h: Sha256::new(),
+        len: 0,
+    };
+    let filled = fill(&mut w);
+    let (len, sha256): (u64, [u8; 32]) = (w.len, w.h.finalize().into());
+    let written = filled.and_then(|()| {
         f.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
             .and_then(|()| sync_file(&f).map(drop))
             .map_err(|e| io(&e))
     });
-    if let Err(k) = written {
-        let _ = unlink_beneath(dir, temp);
-        return Err(k);
+    // Without its mode nothing shows what the file is: it is kept, and
+    // named.
+    let Ok(mode) = f.metadata().map(|m| m.mode()) else {
+        return Err(kept(rel, temp));
+    };
+    let staged = Staged {
+        f,
+        mode,
+        len,
+        sha256,
+    };
+    match written {
+        Ok(()) => Ok(staged),
+        Err(k) => Err(give_up(dir, rel, name, &staged, temp, "new", k)),
     }
-    Ok(f)
+}
+
+/// The error for a file of unknown origin left under the temporary name
+/// `at` beside `rel`.
+fn kept(rel: &Path, at: &OsStr) -> ModifyError {
+    ModifyError {
+        rel: rel.with_file_name(at),
+        kind: ModifyErrorKind::MovedAside,
+    }
+}
+
+/// A change that stops with `k`: the new file `staged` goes from `at` (a
+/// temporary name of the shape `what`), only while `at` names it and it
+/// holds what was written; when anything else is there, it is kept, and
+/// the error names it (`moved_aside`) instead.
+fn give_up(
+    dir: &File,
+    rel: &Path,
+    name: &OsStr,
+    staged: &Staged,
+    at: &OsStr,
+    what: &str,
+    k: ModifyErrorKind,
+) -> ModifyError {
+    match staged.discard(dir, name, at, what) {
+        Removal::Kept(at) => {
+            let _ = sync_file(dir);
+            kept(rel, &at)
+        }
+        Removal::Unlinked | Removal::Absent => ModifyError {
+            rel: rel.to_path_buf(),
+            kind: k,
+        },
+    }
 }
 
 /// The file `name` in `dir` as it is now, checked to be the one `expect`
@@ -422,19 +684,20 @@ pub(crate) fn io(e: &std::io::Error) -> ModifyErrorKind {
 pub enum Inside {
     /// The file to remove was renamed aside, and is not unlinked yet.
     MovedAside,
-    /// The new contents are written beside the file, and not in its place
-    /// yet.
+    /// The new contents are written and flushed beside the file, under
+    /// the name the swap takes them from, and not checked there yet, nor
+    /// in its place.
     Staged,
-    /// The file was checked for the last time before the new contents take
-    /// its name.
+    /// The new file was checked under that name, and the file for the
+    /// last time, before the new contents take its name.
     Checked,
     /// The names are swapped: the new contents have the file's name, and
     /// what came out is under the temporary name, not checked yet.
     Exchanged,
-    /// The names are swapped and what came out is the file checked (for a
-    /// restore from a backup v2, with the contents the change left): the
-    /// new contents have the file's name, and the old file is under the
-    /// temporary name, not unlinked yet.
+    /// The names are swapped, what came out is the file checked (for a
+    /// restore from a backup v2, with the contents the change left), and
+    /// what went in is the new file, holding what was written: the old
+    /// file is under the temporary name, not removed yet.
     Swapped,
     /// The file to write back over is open and its stamp read, and it is
     /// not read yet ([`crate::restore_over_left`]).
@@ -450,6 +713,12 @@ pub enum Inside {
     /// That file's bytes were compared where it was moved, and its name
     /// there is not checked again yet, nor the file unlinked.
     LeftoverRead,
+    /// That file failed the check where it was moved and is linked back
+    /// under its name; the fresh name is not removed yet.
+    LeftoverPutBack,
+    /// A file created is linked to its name, and its temporary name is not
+    /// removed yet ([`crate::create_atomically`]).
+    Linked,
 }
 
 /// Whether `m` is the file `expect` stamps, as a rename leaves it: a
@@ -474,7 +743,7 @@ fn is_checked(m: &std::fs::Metadata, expect: &FileStamp) -> bool {
 /// ([`exchange_beneath`]) and what came out is checked: when another
 /// program saved over the name after the check (an editor's atomic save),
 /// the names are swapped back, so its file is kept and nothing is
-/// replaced (`changed`). Then the old file is unlinked; when it cannot be,
+/// replaced (`changed`). Then the old file is removed; when it cannot be,
 /// the change stands and the old file is named where it is left
 /// (`not_removed`). Where the names cannot be swapped, the new file is
 /// renamed over the name right after the check, and a save landing
@@ -487,7 +756,7 @@ fn replace_in(
     expect: &FileStamp,
     observe: &mut dyn FnMut(Inside),
 ) -> Result<FileStamp, ModifyError> {
-    let mut fill = |f: &mut File| f.write_all(new).map_err(|e| io(&e));
+    let mut fill = |w: &mut dyn Write| w.write_all(new).map_err(|e| io(&e));
     replace_in_with(dir, rel, name, &mut fill, expect, None, observe)
 }
 
@@ -499,6 +768,16 @@ type Swap = fn(&File, &OsStr, &OsStr) -> std::io::Result<()>;
 /// be written a part at a time; and, when `left` is given, only over a
 /// file that still holds the contents of that SHA-256 when it moves out.
 ///
+/// The new file is written under a name of the shape `new`, then moved,
+/// in one step that replaces nothing, to a name of the shape `swap`,
+/// which the swap takes it from; there, and again once it has the file's
+/// name, it must be the file written and hold exactly what was written
+/// ([`Staged::named`]): another file put under either name, or this one
+/// written into in place, is never left in the file's place. One found so
+/// before the swap is kept where it is (`moved_aside`), and nothing is
+/// swapped; one found so after it is swapped back out and kept the same
+/// way. So nothing a swap brings out ever has a name of the shape `new`.
+///
 /// With `left`, the file that came out of the swap is read whole, its
 /// stamp checked again after the read, and its SHA-256 compared with
 /// `left`: an edit made in place after the last check (the same length,
@@ -507,11 +786,10 @@ type Swap = fn(&File, &OsStr, &OsStr) -> std::io::Result<()>;
 /// that cannot swap names then writes nothing (`swap_unsupported`), never
 /// renaming over a file it could not check. What it cannot see is a write
 /// to the old file, by a program that still has it open, after that read.
-/// Also with `left`, once the new file is whole and before the last
-/// check, the files earlier restores of `name` stopped while writing left
-/// beside it, holding only its first bytes, go, each moved aside and
-/// checked where it moved before it is unlinked there
-/// ([`remove_leftovers`]).
+/// Also with `left`, once the new file is whole and before it moves, the
+/// files earlier restores of `name` stopped while writing left beside it,
+/// holding only its first bytes, go, each moved aside and checked where
+/// it moved before it is unlinked there ([`remove_leftovers`]).
 pub(crate) fn replace_in_with(
     dir: &File,
     rel: &Path,
@@ -548,70 +826,111 @@ fn replace_in_using(
         rel: rel.to_path_buf(),
         kind,
     };
-    let temp = temp_name(name, "new");
-    let f = write_new_with(dir, &temp, expect.mode, fill).map_err(fail)?;
+    let new = temp_name(name, "new");
+    let staged = write_new_with(dir, rel, name, &new, expect.mode, fill)?;
     if left.is_some() {
         // A restore, its contents now whole beside the file: what earlier
         // restores of the file left of those contents goes, whatever this
         // one comes to (`remove_leftovers`).
-        remove_leftovers(dir, name, &temp, &f, observe);
+        remove_leftovers(dir, name, &new, &staged, observe);
+    }
+    // The swap takes the new file from a name of another shape, so what it
+    // brings out never has the shape a later restore's cleanup reads.
+    let temp = temp_name(name, "swap");
+    if let Err(e) = move_aside(dir, &new, &temp) {
+        return Err(give_up(dir, rel, name, &staged, &new, "new", io(&e)));
     }
     observe(Inside::Staged);
+    // What the swap takes must be the file written, holding what was
+    // written: another file under that name, or this one written into, is
+    // kept, and never swapped in.
+    if !staged.named(dir, &temp) {
+        return Err(give_up(
+            dir,
+            rel,
+            name,
+            &staged,
+            &temp,
+            "swap",
+            ModifyErrorKind::Changed,
+        ));
+    }
     // Another program may have written the file while this one wrote its
     // replacement: keep theirs.
     if let Err(k) = check_same(dir, name, expect) {
-        let _ = unlink_beneath(dir, &temp);
-        return Err(fail(k));
+        return Err(give_up(dir, rel, name, &staged, &temp, "swap", k));
     }
     observe(Inside::Checked);
+    // What came out of a swap must be the file checked, holding (with
+    // `left`) the contents the change left.
+    let mut came_out = |out: &mut File, m: &std::fs::Metadata| {
+        is_checked(m, expect)
+            && left
+                .is_none_or(|want| digest_of(out, &FileStamp::of(m)).is_ok_and(|got| got == *want))
+    };
     match swap(dir, &temp, name) {
         Ok(()) => {
             observe(Inside::Exchanged);
             // A swap takes whatever has each name at that moment: what came
             // out must be the file checked, and what went in the file
-            // written (another file put under the temporary name meanwhile
-            // is never left in the file's place).
-            let checked = match open_file(dir, &temp, usize::MAX) {
-                Ok((mut out, m)) if is_checked(&m, expect) => left.is_none_or(|want| {
-                    digest_of(&mut out, &FileStamp::of(&m)).is_ok_and(|got| got == *want)
-                }),
-                _ => false,
-            } && holds(dir, name, &f);
+            // written, still holding what was written (another file put
+            // under the temporary name, or the new file written into
+            // meanwhile, is never left in the file's place).
+            let checked = open_file(dir, &temp, usize::MAX)
+                .is_ok_and(|(mut out, m)| came_out(&mut out, &m))
+                && staged.named(dir, name);
             if !checked {
-                return Err(swap_back(swap, dir, rel, name, &temp, &f));
+                return Err(swap_back(swap, dir, rel, name, &temp, &staged));
             }
             observe(Inside::Swapped);
-            if unlink_beneath(dir, &temp).is_err() {
-                let _ = sync_file(dir);
-                return Err(ModifyError {
-                    rel: rel.with_file_name(&temp),
-                    kind: ModifyErrorKind::NotRemoved,
-                });
+            // The old file goes only while it is still the file checked.
+            match remove_if(dir, name, &temp, "swap", &mut came_out, &mut |_| {}) {
+                Removal::Unlinked => {}
+                Removal::Absent => {
+                    let _ = sync_file(dir);
+                    return Err(ModifyError {
+                        rel: rel.with_file_name(&temp),
+                        kind: ModifyErrorKind::NotRemoved,
+                    });
+                }
+                Removal::Kept(at) => {
+                    let _ = sync_file(dir);
+                    return Err(ModifyError {
+                        rel: rel.with_file_name(at),
+                        kind: ModifyErrorKind::NotRemoved,
+                    });
+                }
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported && left.is_some() => {
-            let _ = unlink_beneath(dir, &temp);
-            return Err(fail(ModifyErrorKind::SwapUnsupported));
+            return Err(give_up(
+                dir,
+                rel,
+                name,
+                &staged,
+                &temp,
+                "swap",
+                ModifyErrorKind::SwapUnsupported,
+            ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
             if let Err(e) = rename_beneath(dir, &temp, name) {
-                let _ = unlink_beneath(dir, &temp);
-                return Err(fail(io(&e)));
+                return Err(give_up(dir, rel, name, &staged, &temp, "swap", io(&e)));
             }
             // A rename takes whatever has the temporary name at that
-            // moment: another file put there is never answered as written.
-            if !holds(dir, name, &f) {
+            // moment: another file put there, or the new file written into
+            // meanwhile, is never answered as written.
+            if !staged.named(dir, name) {
                 let _ = sync_file(dir);
                 return Err(fail(ModifyErrorKind::Changed));
             }
         }
         Err(e) => {
-            let _ = unlink_beneath(dir, &temp);
-            return Err(fail(io(&e)));
+            return Err(give_up(dir, rel, name, &staged, &temp, "swap", io(&e)));
         }
     }
     sync_file(dir).map_err(|e| fail(io(&e)))?;
-    let m = f.metadata().map_err(|e| fail(io(&e)))?;
+    let m = staged.f.metadata().map_err(|e| fail(io(&e)))?;
     Ok(FileStamp::of(&m))
 }
 
@@ -643,35 +962,35 @@ pub(crate) fn digest_of(f: &mut File, stamp: &FileStamp) -> Result<[u8; 32], Mod
     Ok(h.finalize().into())
 }
 
-/// After a swap brought out a file that is not the one checked: swaps the
-/// names back, so `name` is that file again, and removes the new
-/// contents, `staged`, from `temp`. Returns `changed`; or, when the names
-/// could not be put back as they were, what is under `temp` is kept and
-/// named (`moved_aside`), and nothing is removed.
+/// After a swap brought out a file that is not the one checked, or put in
+/// a file that is not `staged` holding what was written: swaps the names
+/// back, so `name` is that file again, and removes `staged` from `temp`,
+/// only while `temp` names it and it holds what was written. Returns
+/// `changed`; or, when the names could not be swapped back, or anything
+/// else is under `temp` then (another program's file, or `staged`
+/// written into), that file is kept where it is and named (`moved_aside`),
+/// and nothing is removed.
 fn swap_back(
     swap: Swap,
     dir: &File,
     rel: &Path,
     name: &OsStr,
     temp: &OsStr,
-    staged: &File,
+    staged: &Staged,
 ) -> ModifyError {
-    let ours = staged.metadata().map(|m| (m.dev(), m.ino()));
-    let back = swap(dir, temp, name).is_ok()
-        && open_file(dir, temp, usize::MAX)
-            .is_ok_and(|(_, m)| ours.as_ref().is_ok_and(|o| *o == (m.dev(), m.ino())));
-    if back && unlink_beneath(dir, temp).is_ok() {
-        let _ = sync_file(dir);
-        return ModifyError {
-            rel: rel.to_path_buf(),
-            kind: ModifyErrorKind::Changed,
-        };
+    if swap(dir, temp, name).is_ok() {
+        return give_up(
+            dir,
+            rel,
+            name,
+            staged,
+            temp,
+            "swap",
+            ModifyErrorKind::Changed,
+        );
     }
     let _ = sync_file(dir);
-    ModifyError {
-        rel: rel.with_file_name(temp),
-        kind: ModifyErrorKind::MovedAside,
-    }
+    kept(rel, temp)
 }
 
 /// Replaces the file at `rel`, which must still be the one `expect`
@@ -709,42 +1028,76 @@ pub fn create_atomically(
     let (dir, name) = r
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
-    create_in(&dir, &name, new, mode, &mut || {}).map_err(fail)
+    create_in(&dir, rel, &name, new, mode, &mut |_| {})
 }
 
-/// [`create_atomically`] in `dir`, calling `written` once the new file is
-/// written and flushed under its temporary name, before it is linked to
-/// `name` (a unit test puts another file under the temporary name there).
-/// A link takes whatever has the temporary name at that moment, so `name`
-/// is then opened (never through a symlink) and compared by device and
-/// inode with the file written: another file put under the temporary name
-/// is never answered as created ([`ModifyErrorKind::Changed`]; it keeps
-/// `name`, nothing is removed).
+/// [`create_atomically`] in `dir`. The new file, once written and flushed
+/// under its temporary name (`observe` hears [`Inside::Staged`]), must be
+/// the file that name holds, as written ([`Staged::named`]), or nothing
+/// is linked and what is there is kept and named (`moved_aside`); then
+/// (`observe` hears [`Inside::Checked`]) it is linked to `name` only if no
+/// file has that name. A link takes whatever has the temporary name at
+/// that moment, so `name` is then checked the same way: another file put
+/// under the temporary name, or the new file written into, is never
+/// answered as created ([`ModifyErrorKind::Changed`]; what has `name`
+/// keeps it, nothing is removed). Once linked (`observe` hears
+/// [`Inside::Linked`]), the temporary name goes only while it names the
+/// new file holding the bytes written ([`Staged::discard`]); when the new
+/// file keeps that name too, the file is created but the call says so
+/// ([`ModifyErrorKind::NotRemoved`], naming it).
 fn create_in(
     dir: &File,
+    rel: &Path,
     name: &OsStr,
     new: &[u8],
     mode: u32,
-    written: &mut dyn FnMut(),
-) -> Result<FileStamp, ModifyErrorKind> {
+    observe: &mut dyn FnMut(Inside),
+) -> Result<FileStamp, ModifyError> {
+    let fail = |kind| ModifyError {
+        rel: rel.to_path_buf(),
+        kind,
+    };
     let temp = temp_name(name, "new");
-    let f = write_new(dir, &temp, new, mode).map_err(|e| io(&e))?;
-    written();
-    let linked = link_beneath(dir, &temp, name);
-    let unlinked = unlink_beneath(dir, &temp);
-    match linked {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(ModifyErrorKind::Exists);
+    let mut fill = |w: &mut dyn Write| w.write_all(new).map_err(|e| io(&e));
+    let staged = write_new_with(dir, rel, name, &temp, mode, &mut fill)?;
+    observe(Inside::Staged);
+    if !staged.named(dir, &temp) {
+        return Err(give_up(
+            dir,
+            rel,
+            name,
+            &staged,
+            &temp,
+            "new",
+            ModifyErrorKind::Changed,
+        ));
+    }
+    observe(Inside::Checked);
+    if let Err(e) = link_beneath(dir, &temp, name) {
+        let k = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            ModifyErrorKind::Exists
+        } else {
+            io(&e)
+        };
+        return Err(give_up(dir, rel, name, &staged, &temp, "new", k));
+    }
+    observe(Inside::Linked);
+    let dropped = staged.discard(dir, name, &temp, "new");
+    sync_file(dir).map_err(|e| fail(io(&e)))?;
+    if !staged.named(dir, name) {
+        return Err(fail(ModifyErrorKind::Changed));
+    }
+    // Created; but the new file keeps its temporary name too when that
+    // could not be removed.
+    if let Removal::Kept(at) = dropped {
+        if holds(dir, &at, &staged.f) {
+            return Err(ModifyError {
+                rel: rel.with_file_name(at),
+                kind: ModifyErrorKind::NotRemoved,
+            });
         }
-        Err(e) => return Err(io(&e)),
     }
-    unlinked.map_err(|e| io(&e))?;
-    sync_file(dir).map_err(|e| io(&e))?;
-    if !holds(dir, name, &f) {
-        return Err(ModifyErrorKind::Changed);
-    }
-    let m = f.metadata().map_err(|e| io(&e))?;
+    let m = staged.f.metadata().map_err(|e| fail(io(&e)))?;
     Ok(FileStamp::of(&m))
 }
 
@@ -815,9 +1168,10 @@ pub fn remove_checked_observed(
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
     check_removable(&dir, &name, expect, now).map_err(fail)?;
-    // Move it aside, and remove it only if what moved is the file checked.
+    // Move it aside, never over another file, and remove it only if what
+    // moved is the file checked.
     let aside = temp_name(&name, "del");
-    rename_beneath(&dir, &name, &aside).map_err(|e| fail(io(&e)))?;
+    move_aside(&dir, &name, &aside).map_err(|e| fail(io(&e)))?;
     observe(Inside::MovedAside);
     let moved = open_file(&dir, &aside, usize::MAX).map(|(_, m)| m);
     if !moved.as_ref().is_ok_and(|m| is_checked(m, expect)) {
@@ -883,9 +1237,46 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    thread_local! {
+        /// The hex digits the next temporary names on this thread take,
+        /// in order ([`temp_name`]), so a test can put a file there first.
+        pub(super) static NEXT_HEX: core::cell::RefCell<std::collections::VecDeque<u64>> =
+            const { core::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+
+    /// Makes the next temporary names on this thread end in `hex`, in
+    /// order.
+    fn next_names(hex: &[u64]) {
+        NEXT_HEX.with(|q| q.borrow_mut().extend(hex.iter().copied()));
+    }
+
+    thread_local! {
+        /// What [`Staged::holds_written`] runs, once, after it read the
+        /// first part of the file.
+        static DURING_READ: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { core::cell::RefCell::new(None) };
+    }
+
+    /// Called by [`Staged::holds_written`] after each part it reads.
+    pub(super) fn during_read() {
+        if let Some(f) = DURING_READ.with(|d| d.borrow_mut().take()) {
+            f();
+        }
+    }
+
     /// A file system that cannot swap two names in one step.
     fn cannot_swap(_: &File, _: &OsStr, _: &OsStr) -> std::io::Result<()> {
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// The names in `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<OsString> {
+        let mut v: Vec<OsString> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        v.sort();
+        v
     }
 
     /// Where the names cannot be swapped, a restore from a backup v2 (a
@@ -904,7 +1295,7 @@ mod tests {
         let left: [u8; 32] = Sha256::digest(b"what the change left").into();
         let name = OsStr::new("settings.json");
         let rel = Path::new("settings.json");
-        let mut fill = |f: &mut File| f.write_all(b"backed up").map_err(|e| io(&e));
+        let mut fill = |w: &mut dyn Write| w.write_all(b"backed up").map_err(|e| io(&e));
         let e = replace_in_using(
             cannot_swap,
             &dir,
@@ -919,12 +1310,8 @@ mod tests {
         assert_eq!(e.kind, ModifyErrorKind::SwapUnsupported);
         assert_eq!(e.kind.token(), "swap_unsupported");
         assert_eq!(std::fs::read(&p).unwrap(), b"what the change left");
-        let names: Vec<_> = std::fs::read_dir(d.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, [name]);
-        let mut fill = |f: &mut File| f.write_all(b"rewritten").map_err(|e| io(&e));
+        assert_eq!(names_in(d.path()), [name]);
+        let mut fill = |w: &mut dyn Write| w.write_all(b"rewritten").map_err(|e| io(&e));
         replace_in_using(
             cannot_swap,
             &dir,
@@ -947,56 +1334,319 @@ mod tests {
         std::fs::rename(&other, dir.join(temp)).unwrap();
     }
 
-    /// The temporary name of the one new file in `dir` besides `name`.
-    fn new_temp(dir: &Path, name: &str) -> OsString {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .find(|n| new_name_of(OsStr::new(name), n))
-            .unwrap()
+    /// Writes `bytes` into the file at `p` in place, at its start, and puts
+    /// its modification time back, as a program holding it open could.
+    fn write_into(p: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        let w = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        let modified = w.metadata().unwrap().modified().unwrap();
+        w.write_all_at(bytes, 0).unwrap();
+        w.set_modified(modified).unwrap();
     }
 
-    /// A file created, or renamed into place where names cannot be
-    /// swapped, is answered as written only when its name holds the file
-    /// written: a link and a rename take whatever has the temporary name at
-    /// that moment. Another file put under the temporary name once the new
-    /// file is flushed makes the call fail (`changed`), and that file is
-    /// kept, under the name.
+    /// The name of the one temporary file of the shape `what` in `dir`
+    /// beside `name`.
+    fn temp_of(dir: &Path, name: &str, what: &str) -> OsString {
+        let prefix = format!(".{name}.envcloak-{what}-");
+        let found: Vec<OsString> = names_in(dir)
+            .into_iter()
+            .filter(|n| n.to_string_lossy().starts_with(&prefix))
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        found[0].clone()
+    }
+
+    /// A file created is answered as created only when its name holds the
+    /// file written, holding exactly the bytes written. Once the new file
+    /// is flushed under its temporary name (`Staged`), another file put
+    /// under that name, or the new file written into in place, is never
+    /// linked: the call fails (`moved_aside`, naming the temporary name,
+    /// where that file is kept as it was), and the name stays free. Once
+    /// that check passed (`Checked`), the link takes whatever has the
+    /// temporary name: another file put there keeps the name, and the new
+    /// file written into in place is never answered as created (`changed`
+    /// both). Unchanged, the file is created, and no temporary file is
+    /// left.
     #[test]
-    fn a_link_or_rename_into_place_answers_only_for_the_file_written() {
+    fn a_create_answers_only_for_the_file_and_bytes_written() {
+        for (at, how) in [
+            (Inside::Staged, "replaced"),
+            (Inside::Staged, "written into"),
+            (Inside::Checked, "replaced"),
+            (Inside::Checked, "written into"),
+        ] {
+            let d = tempfile::tempdir_in("/tmp").unwrap();
+            let dir = File::open(d.path()).unwrap();
+            let name = OsStr::new("envcloak.toml");
+            let rel = Path::new("envcloak.toml");
+            let mut did = 0;
+            let e = create_in(&dir, rel, name, b"ours", 0o600, &mut |now| {
+                if now != at {
+                    return;
+                }
+                let temp = temp_of(d.path(), "envcloak.toml", "new");
+                match how {
+                    "replaced" => put_under(d.path(), &temp, b"theirs"),
+                    _ => write_into(&d.path().join(&temp), b"THEM"),
+                }
+                did += 1;
+            })
+            .unwrap_err();
+            assert_eq!(did, 1, "{at:?} {how}");
+            let theirs: &[u8] = if how == "replaced" {
+                b"theirs"
+            } else {
+                b"THEM"
+            };
+            if at == Inside::Staged {
+                assert_eq!(e.kind, ModifyErrorKind::MovedAside, "{at:?} {how}");
+                assert!(!d.path().join(name).exists(), "{at:?} {how}: linked");
+                assert_eq!(
+                    std::fs::read(d.path().join(&e.rel)).unwrap(),
+                    theirs,
+                    "{at:?} {how}"
+                );
+            } else {
+                assert_eq!(e.kind, ModifyErrorKind::Changed, "{at:?} {how}");
+                assert_eq!(
+                    std::fs::read(d.path().join(name)).unwrap(),
+                    theirs,
+                    "{at:?} {how}"
+                );
+            }
+        }
         let d = tempfile::tempdir_in("/tmp").unwrap();
         let dir = File::open(d.path()).unwrap();
         let name = OsStr::new("envcloak.toml");
-        let e = create_in(&dir, name, b"ours", 0o600, &mut || {
-            put_under(d.path(), &new_temp(d.path(), "envcloak.toml"), b"theirs");
-        })
-        .unwrap_err();
-        assert_eq!(e, ModifyErrorKind::Changed);
-        assert_eq!(std::fs::read(d.path().join(name)).unwrap(), b"theirs");
-        std::fs::remove_file(d.path().join(name)).unwrap();
-        create_in(&dir, name, b"ours", 0o600, &mut || {}).unwrap();
-        assert_eq!(std::fs::read(d.path().join(name)).unwrap(), b"ours");
-
-        let p = d.path().join("settings.json");
-        std::fs::write(&p, b"before").unwrap();
-        let stamp = FileStamp::of(&std::fs::symlink_metadata(&p).unwrap());
-        let mut fill = |f: &mut File| f.write_all(b"rewritten").map_err(|e| io(&e));
-        let e = replace_in_using(
-            cannot_swap,
+        create_in(
             &dir,
-            Path::new("settings.json"),
-            OsStr::new("settings.json"),
+            Path::new("envcloak.toml"),
+            name,
+            b"ours",
+            0o600,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(d.path().join(name)).unwrap(), b"ours");
+        assert_eq!(names_in(d.path()), [name]);
+    }
+
+    /// Where names cannot be swapped, the new file renamed into place is
+    /// answered as written only when the name then holds the file written,
+    /// holding exactly the bytes written: once the last check passed
+    /// (`Checked`), another file put under the temporary name, or the new
+    /// file written into in place, makes the call fail (`changed`).
+    #[test]
+    fn a_rename_into_place_answers_only_for_the_file_and_bytes_written() {
+        for how in ["replaced", "written into"] {
+            let d = tempfile::tempdir_in("/tmp").unwrap();
+            let dir = File::open(d.path()).unwrap();
+            let p = d.path().join("settings.json");
+            std::fs::write(&p, b"before").unwrap();
+            let stamp = FileStamp::of(&std::fs::symlink_metadata(&p).unwrap());
+            let mut fill = |w: &mut dyn Write| w.write_all(b"rewritten").map_err(|e| io(&e));
+            let mut did = 0;
+            let e = replace_in_using(
+                cannot_swap,
+                &dir,
+                Path::new("settings.json"),
+                OsStr::new("settings.json"),
+                &mut fill,
+                &stamp,
+                None,
+                &mut |at| {
+                    if at != Inside::Checked {
+                        return;
+                    }
+                    let temp = temp_of(d.path(), "settings.json", "swap");
+                    match how {
+                        "replaced" => put_under(d.path(), &temp, b"theirs"),
+                        _ => write_into(&d.path().join(&temp), b"THEM"),
+                    }
+                    did += 1;
+                },
+            )
+            .unwrap_err();
+            assert_eq!(did, 1, "{how}");
+            assert_eq!(e.kind, ModifyErrorKind::Changed, "{how}");
+            let theirs: &[u8] = if how == "replaced" {
+                b"theirs"
+            } else {
+                b"THEMitten"
+            };
+            assert_eq!(std::fs::read(&p).unwrap(), theirs, "{how}");
+        }
+    }
+
+    /// A move to a fresh name never replaces a file that has that name: it
+    /// fails, and both files stay as they were.
+    #[test]
+    fn a_move_aside_never_replaces_a_file() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = File::open(d.path()).unwrap();
+        std::fs::write(d.path().join("a"), b"to move").unwrap();
+        std::fs::write(d.path().join("b"), b"there first").unwrap();
+        let e = move_aside(&dir, OsStr::new("a"), OsStr::new("b")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(d.path().join("a")).unwrap(), b"to move");
+        assert_eq!(std::fs::read(d.path().join("b")).unwrap(), b"there first");
+        move_aside(&dir, OsStr::new("a"), OsStr::new("c")).unwrap();
+        assert_eq!(std::fs::read(d.path().join("c")).unwrap(), b"to move");
+    }
+
+    /// Every move to a fresh temporary name replaces nothing that took the
+    /// name first: a file put under the name a removal moves the file to
+    /// (`del`), under the name a replacement hands its new file to the swap
+    /// under (`swap`), and under the name a restore moves an earlier one's
+    /// leftover to (`new`) stays as it was. The removal and the
+    /// replacement fail and change nothing; the restore keeps the leftover
+    /// under its name and still writes the file back.
+    #[test]
+    fn no_move_to_a_fresh_name_replaces_a_file_there() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = d.path();
+        let r = crate::open_root(dir).unwrap();
+        let p = dir.join(".env");
+        std::fs::write(&p, b"A=1\n").unwrap();
+        let stamp = FileStamp::of(&std::fs::symlink_metadata(&p).unwrap());
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        let planted = dir.join("..env.envcloak-del-00000000000000d1.tmp");
+        std::fs::write(&planted, b"there first").unwrap();
+        next_names(&[0xd1]);
+        remove_checked_at(&r, Path::new(".env"), &stamp, later).unwrap_err();
+        assert_eq!(std::fs::read(&p).unwrap(), b"A=1\n", "removed");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"there first");
+        std::fs::remove_file(&planted).unwrap();
+
+        let planted = dir.join("..env.envcloak-swap-00000000000000e2.tmp");
+        std::fs::write(&planted, b"there first").unwrap();
+        next_names(&[0xe1, 0xe2]);
+        let e = replace_atomically(&r, Path::new(".env"), b"B=2\n", &stamp).unwrap_err();
+        assert_ne!(e.kind, ModifyErrorKind::MovedAside);
+        assert_eq!(std::fs::read(&p).unwrap(), b"A=1\n", "replaced");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"there first");
+        std::fs::remove_file(&planted).unwrap();
+        assert_eq!(names_in(dir), [OsStr::new(".env")]);
+
+        let body = b"the original, backed up".to_vec();
+        let mcp = dir.join(".mcp.json");
+        std::fs::write(&mcp, b"what the change left").unwrap();
+        let leftover = dir.join("..mcp.json.envcloak-new-00000000000000f0.tmp");
+        std::fs::write(&leftover, &body[..7]).unwrap();
+        let planted = dir.join("..mcp.json.envcloak-new-00000000000000f2.tmp");
+        std::fs::write(&planted, b"there first").unwrap();
+        let file = crate::BackedUpFile {
+            size: body.len() as u64,
+            sha256: Sha256::digest(&body).into(),
+            sha256_after: Sha256::digest(b"what the change left").into(),
+        };
+        next_names(&[0xf1, 0xf2, 0xf3]);
+        crate::restore_over_left(&r, Path::new(".mcp.json"), &file, &mut |_| {
+            Some(envcloak_core::SecretBytes::copy_from(&body))
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&mcp).unwrap(), body);
+        assert_eq!(std::fs::read(&planted).unwrap(), b"there first");
+        assert_eq!(std::fs::read(&leftover).unwrap(), &body[..7]);
+        NEXT_HEX.with(|q| assert!(q.borrow().is_empty()));
+    }
+
+    /// Where the file system cannot move a name to a free one in one step,
+    /// a move to a fresh name still never replaces a file that has it: it
+    /// looks first, and fails when the name is taken, both files as they
+    /// were; a free name is moved to.
+    #[test]
+    fn a_move_aside_without_a_no_replace_rename_still_replaces_nothing() {
+        fn cannot(_: &File, _: &OsStr, _: &OsStr) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = File::open(d.path()).unwrap();
+        std::fs::write(d.path().join("a"), b"to move").unwrap();
+        std::fs::write(d.path().join("b"), b"there first").unwrap();
+        let e = move_aside_using(cannot, &dir, OsStr::new("a"), OsStr::new("b")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(d.path().join("a")).unwrap(), b"to move");
+        assert_eq!(std::fs::read(d.path().join("b")).unwrap(), b"there first");
+        move_aside_using(cannot, &dir, OsStr::new("a"), OsStr::new("c")).unwrap();
+        assert_eq!(std::fs::read(d.path().join("c")).unwrap(), b"to move");
+    }
+
+    /// A new file is taken for the one written only when it held the bytes
+    /// written all the while it was read back: one written into, in a part
+    /// already read and at its length, while it is read (a hook after the
+    /// first part) is not, though the bytes read make up the SHA-256
+    /// written. Read again, unchanged since, it is not either; and a file
+    /// left alone is.
+    #[test]
+    fn a_new_file_written_into_while_it_is_read_back_is_not_taken_for_it() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = File::open(d.path()).unwrap();
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut fill = |w: &mut dyn Write| w.write_all(&body).map_err(|e| io(&e));
+        let temp = OsString::from("..env.envcloak-new-00000000000000c1.tmp");
+        let staged = write_new_with(
+            &dir,
+            Path::new(".env"),
+            OsStr::new(".env"),
+            &temp,
+            0o600,
             &mut fill,
-            &stamp,
-            None,
+        )
+        .unwrap();
+        assert!(staged.holds_written());
+        assert!(staged.intact());
+        let path = d.path().join(&temp);
+        DURING_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                use std::os::unix::fs::FileExt;
+                let w = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                w.write_all_at(b"X", 10).unwrap();
+            }));
+        });
+        assert!(
+            !staged.holds_written(),
+            "a file written into while it was read was taken for the one written"
+        );
+        assert!(!staged.holds_written());
+        assert!(!staged.intact());
+    }
+
+    /// A created file that keeps its temporary name too, because that name
+    /// could not be removed once it was linked (its directory made
+    /// read-only then, a barrier at `Linked`), is created, and the call
+    /// says so (`not_removed`, naming the temporary name), never answering
+    /// as if nothing were left.
+    #[test]
+    fn a_create_whose_temporary_name_stays_says_so() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = File::open(d.path()).unwrap();
+        let name = OsStr::new("envcloak.toml");
+        let mut did = 0;
+        let e = create_in(
+            &dir,
+            Path::new("envcloak.toml"),
+            name,
+            b"ours",
+            0o600,
             &mut |at| {
-                if at == Inside::Checked {
-                    put_under(d.path(), &new_temp(d.path(), "settings.json"), b"theirs");
+                if at == Inside::Linked {
+                    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o500))
+                        .unwrap();
+                    did += 1;
                 }
             },
-        )
-        .unwrap_err();
-        assert_eq!(e.kind, ModifyErrorKind::Changed);
-        assert_eq!(std::fs::read(&p).unwrap(), b"theirs");
+        );
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(did, 1);
+        let e = e.unwrap_err();
+        assert_eq!(e.kind, ModifyErrorKind::NotRemoved);
+        assert_eq!(std::fs::read(d.path().join(name)).unwrap(), b"ours");
+        assert_eq!(std::fs::read(d.path().join(&e.rel)).unwrap(), b"ours");
+        assert!(
+            e.rel
+                .to_string_lossy()
+                .starts_with(".envcloak.toml.envcloak-new-")
+        );
     }
 }

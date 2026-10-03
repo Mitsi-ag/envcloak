@@ -3,11 +3,14 @@
 //! is replaced only while its SHA-256 is the one the daemon recorded after
 //! the change, only while it is still the file hashed when the new one
 //! takes its name, and only with contents that came whole and have the
-//! backed-up SHA-256. Nothing else is ever written in its place, and no
+//! backed-up SHA-256, and only with the new file holding exactly what was
+//! written to it. Nothing else is ever written in its place, and no
 //! temporary file is left; one a restore killed while it wrote left
 //! beside the file goes once a later restore has the contents whole, and
-//! only when it holds nothing but their first bytes, checked where it was
-//! moved aside before it is unlinked there.
+//! only when it is under a name a new file has while it is written and
+//! holds nothing but their first bytes, checked where it was moved aside
+//! before it is unlinked there. Whatever a swap brings out is kept under
+//! a name of another shape, which no restore removes.
 #![allow(clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -439,71 +442,84 @@ fn new_name_in(dir: &Path, hex: &str) -> std::path::PathBuf {
 }
 
 /// A save a swap brought out and could not put back survives every later
-/// restore of the file (a rollback that fails, then a retry that works).
-/// Right after the swap, another program edits the file that came out in
-/// place (so it is not what the change left) and moves the restored file
+/// restore of the file (a rollback that fails, then a retry that works),
+/// whatever it holds: another edit, the first bytes of what the restore
+/// writes back, or nothing at all (Codex, M2-05 round 10: a save that is
+/// a prefix of the backed-up contents, an empty one included, was taken
+/// for a leftover and removed). Right after the swap, another program
+/// rewrites the file that came out in place and moves the restored file
 /// away from the name (so the names cannot be swapped back): the restore
-/// keeps the edit under the temporary name it reports (`moved_aside`).
-/// Once the file the change left is back, the next restore writes it back
-/// byte for byte and keeps that edit as it was: it holds other bytes than
-/// the ones written back, so nothing shows it to be a restore's.
+/// keeps the save under the temporary name it reports (`moved_aside`), of
+/// the shape a swap takes the new file from, never of the shape a new
+/// file has while it is written. Once the file the change left is back,
+/// the next restore writes it back byte for byte and keeps that save as
+/// it was.
 #[test]
 fn a_save_left_aside_when_the_names_cannot_be_put_back_survives_the_next_restore() {
-    let d = tempfile::tempdir_in("/tmp").unwrap();
-    let p = d.path().join(".mcp.json");
     let body = original();
-    let file = backed_up(&body);
-    let r = open_root(d.path()).unwrap();
-    std::fs::write(&p, LEFT).unwrap();
     let mut edit = LEFT.to_vec();
     let at = edit.len() - 2;
     edit[at] ^= 0x20;
-    let away = d.path().join("moved-by-another-program.json");
-    let mut held: Option<std::fs::File> = None;
-    let mut did = false;
-    let e = restore_over_left_observed(
-        &r,
-        Path::new(".mcp.json"),
-        &file,
-        &mut |c| Some(chunk_of(&body, c)),
-        &mut |now| {
-            if now == Inside::Hashed {
-                held = Some(std::fs::OpenOptions::new().write(true).open(&p).unwrap());
-            }
-            if now == Inside::Exchanged {
-                let w = held.as_mut().unwrap();
-                std::os::unix::fs::FileExt::write_all_at(w, &edit, 0).unwrap();
-                std::fs::rename(&p, &away).unwrap();
-                did = true;
-            }
-        },
-    )
-    .unwrap_err();
-    assert!(did);
-    assert_eq!(e.kind, ModifyErrorKind::MovedAside);
-    let kept = d.path().join(&e.rel);
-    assert!(
-        kept.file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("..mcp.json.envcloak-new-"),
-        "{kept:?}"
-    );
-    assert_eq!(std::fs::read(&kept).unwrap(), edit);
-    assert!(std::fs::read(&away).unwrap() == body);
+    for (what, save) in [
+        ("an edit", edit),
+        ("the first bytes", body[..1000].to_vec()),
+        ("nothing", Vec::new()),
+    ] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let p = d.path().join(".mcp.json");
+        let file = backed_up(&body);
+        let r = open_root(d.path()).unwrap();
+        std::fs::write(&p, LEFT).unwrap();
+        let away = d.path().join("moved-by-another-program.json");
+        let mut held: Option<std::fs::File> = None;
+        let mut did = false;
+        let e = restore_over_left_observed(
+            &r,
+            Path::new(".mcp.json"),
+            &file,
+            &mut |c| Some(chunk_of(&body, c)),
+            &mut |now| {
+                if now == Inside::Hashed {
+                    held = Some(std::fs::OpenOptions::new().write(true).open(&p).unwrap());
+                }
+                if now == Inside::Exchanged {
+                    let w = held.as_mut().unwrap();
+                    w.set_len(0).unwrap();
+                    std::os::unix::fs::FileExt::write_all_at(w, &save, 0).unwrap();
+                    std::fs::rename(&p, &away).unwrap();
+                    did = true;
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(did, "{what}");
+        assert_eq!(e.kind, ModifyErrorKind::MovedAside, "{what}");
+        let kept = d.path().join(&e.rel);
+        assert!(
+            kept.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("..mcp.json.envcloak-swap-"),
+            "{what}: {kept:?}"
+        );
+        assert!(std::fs::read(&kept).unwrap() == save, "{what}");
+        assert!(std::fs::read(&away).unwrap() == body, "{what}");
 
-    std::fs::remove_file(&away).unwrap();
-    std::fs::write(&p, LEFT).unwrap();
-    restore_over_left(&r, Path::new(".mcp.json"), &file, &mut |c| {
-        Some(chunk_of(&body, c))
-    })
-    .unwrap();
-    assert!(std::fs::read(&p).unwrap() == body, "not byte for byte");
-    assert_eq!(
-        std::fs::read(&kept).ok(),
-        Some(edit),
-        "the save kept aside was removed by the next restore"
-    );
+        std::fs::remove_file(&away).unwrap();
+        std::fs::write(&p, LEFT).unwrap();
+        restore_over_left(&r, Path::new(".mcp.json"), &file, &mut |c| {
+            Some(chunk_of(&body, c))
+        })
+        .unwrap();
+        assert!(
+            std::fs::read(&p).unwrap() == body,
+            "{what}: not byte for byte"
+        );
+        assert!(
+            std::fs::read(&kept).ok() == Some(save),
+            "{what}: the save kept aside was removed by the next restore"
+        );
+    }
 }
 
 /// A restore removes beside the file only what earlier restores of it
@@ -515,9 +531,11 @@ fn a_save_left_aside_when_the_names_cannot_be_put_back_survives_the_next_restore
 /// swap takes out), the first chunk with a second hard link, a symlink to
 /// a file holding the first chunk (and that file), a FIFO, and the first
 /// chunk under another file's temporary name, under a name of another
-/// shape (upper-case hex) and under a removal's temporary name. Only the
-/// four that go are ever moved aside to be checked: a first look by their
-/// names leaves every other file where it is.
+/// shape (upper-case hex), under a removal's temporary name, and the
+/// first chunk and an empty file under names a swap takes a new file from
+/// (what a swap brings out is left under those, whatever it holds). Only
+/// the four that go are ever moved aside to be checked: a first look by
+/// their names leaves every other file where it is.
 #[test]
 fn a_restore_removes_only_leftovers_holding_the_first_bytes_it_writes_back() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
@@ -553,6 +571,14 @@ fn a_restore_removes_only_leftovers_holding_the_first_bytes_it_writes_back() {
         (
             dir.join("..mcp.json.envcloak-del-00000000000000a6.tmp"),
             first.clone(),
+        ),
+        (
+            dir.join("..mcp.json.envcloak-swap-00000000000000a7.tmp"),
+            first.clone(),
+        ),
+        (
+            dir.join("..mcp.json.envcloak-swap-00000000000000a8.tmp"),
+            Vec::new(),
         ),
     ];
     for (q, b) in go.iter().chain(stay.iter()) {
@@ -667,9 +693,16 @@ fn every_restore_with_the_contents_whole_removes_what_earlier_ones_left() {
     no_temps(d.path());
 }
 
-/// The files of `.mcp.json`'s temporary names in `dir`, with their bytes,
-/// sorted by name.
+/// The files of `.mcp.json`'s temporary names a new file has while it is
+/// written in `dir`, with their bytes, sorted by name.
 fn new_names(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    names_of(dir, "new")
+}
+
+/// The files of `.mcp.json`'s temporary names of the shape `what` in
+/// `dir`, with their bytes, sorted by name.
+fn names_of(dir: &Path, what: &str) -> Vec<(String, Vec<u8>)> {
+    let prefix = format!("..mcp.json.envcloak-{what}-");
     let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -677,7 +710,7 @@ fn new_names(dir: &Path) -> Vec<(String, Vec<u8>)> {
             q.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("..mcp.json.envcloak-new-")
+                .starts_with(&prefix)
         })
         .map(|q| {
             let b = std::fs::read(&q).unwrap();
@@ -842,11 +875,11 @@ fn a_leftover_changed_or_replaced_while_it_is_checked_is_kept() {
 }
 
 /// What a swap puts in the file's place must be the file written: another
-/// file put under the restore's temporary name once its last check passed
-/// (a barrier at `Checked`) is swapped in by the swap, so the names are
-/// swapped back, the file the change left keeps its name, the other file
-/// is kept under the temporary name the restore names (`moved_aside`),
-/// and nothing is answered as restored.
+/// file put under the name the swap takes the new file from once the last
+/// check passed (a barrier at `Checked`) is swapped in by the swap, so the
+/// names are swapped back, the file the change left keeps its name, the
+/// other file is kept under that temporary name, which the restore names
+/// (`moved_aside`), and nothing is answered as restored.
 #[test]
 fn a_file_put_under_the_new_name_before_the_swap_is_never_left_in_place() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
@@ -866,7 +899,7 @@ fn a_file_put_under_the_new_name_before_the_swap_is_never_left_in_place() {
             if at != Inside::Checked {
                 return;
             }
-            let (temp, _) = new_names(d.path()).remove(0);
+            let (temp, _) = names_of(d.path(), "swap").remove(0);
             let other = d.path().join("other");
             std::fs::write(&other, theirs).unwrap();
             std::fs::rename(&other, d.path().join(temp)).unwrap();
@@ -882,4 +915,258 @@ fn a_file_put_under_the_new_name_before_the_swap_is_never_left_in_place() {
         "the other file was left in place"
     );
     assert_eq!(std::fs::read(d.path().join(&e.rel)).unwrap(), theirs);
+}
+
+/// The file a restore puts in place must hold exactly what it wrote, not
+/// only be the file it wrote (Codex, M2-05 round 10: the check after the
+/// swap compared device and inode only, so a new file written into in
+/// place was put in place and answered as restored). Under the name the
+/// swap takes it from, once it is there (a barrier at `Staged`), the new
+/// file is written into in place (one byte, at its length, its
+/// modification time put back), or another file is renamed onto that
+/// name: either way nothing is swapped in (no `Exchanged`). Once the last
+/// check passed (`Checked`), and once the names were swapped
+/// (`Exchanged`), the new file is written into the same way: the names are
+/// swapped back. Each time the file the change left keeps its name, what
+/// the other program left is kept under the swap name the restore names
+/// (`moved_aside`), no file of the shape a new file has while it is
+/// written is left, and nothing is answered as restored.
+#[test]
+fn a_new_file_written_into_or_replaced_is_never_answered_as_restored() {
+    for (when, how) in [
+        (Inside::Staged, "written into"),
+        (Inside::Staged, "replaced"),
+        (Inside::Checked, "written into"),
+        (Inside::Exchanged, "written into"),
+    ] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = d.path();
+        let p = dir.join(".mcp.json");
+        let body = original();
+        let file = backed_up(&body);
+        let r = open_root(dir).unwrap();
+        std::fs::write(&p, LEFT).unwrap();
+        let mut exchanged = false;
+        let mut other: Vec<u8> = Vec::new();
+        let e = restore_over_left_observed(
+            &r,
+            Path::new(".mcp.json"),
+            &file,
+            &mut |c| Some(chunk_of(&body, c)),
+            &mut |at| {
+                exchanged |= at == Inside::Exchanged;
+                if at != when {
+                    return;
+                }
+                // The new file: under the swap name, or, once swapped, the
+                // file's own.
+                let target = if when == Inside::Exchanged {
+                    p.clone()
+                } else {
+                    dir.join(names_of(dir, "swap").remove(0).0)
+                };
+                if how == "replaced" {
+                    other = b"another program's file".to_vec();
+                    let q = dir.join("another");
+                    std::fs::write(&q, &other).unwrap();
+                    std::fs::rename(&q, &target).unwrap();
+                } else {
+                    let w = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&target)
+                        .unwrap();
+                    let modified = w.metadata().unwrap().modified().unwrap();
+                    other = body.clone();
+                    other[100] ^= 1;
+                    std::os::unix::fs::FileExt::write_all_at(&w, &other[100..101], 100).unwrap();
+                    w.set_modified(modified).unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(!other.is_empty(), "{when:?} {how}: never reached");
+        assert_eq!(e.kind, ModifyErrorKind::MovedAside, "{when:?} {how}");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            LEFT,
+            "{when:?} {how}: the file the change left lost its name"
+        );
+        assert!(
+            e.rel
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("..mcp.json.envcloak-swap-"),
+            "{when:?} {how}: {:?}",
+            e.rel
+        );
+        assert!(
+            std::fs::read(dir.join(&e.rel)).unwrap() == other,
+            "{when:?} {how}: what the other program left was not kept"
+        );
+        assert_eq!(
+            exchanged,
+            when != Inside::Staged,
+            "{when:?} {how}: swapped in"
+        );
+        assert!(new_names(dir).is_empty(), "{when:?} {how}");
+    }
+}
+
+/// A leftover that fails its check where it was moved aside is linked back
+/// under its name, and the fresh name then goes only while it names that
+/// same file (verifier, M2-05 round 9: with that guard removed every test
+/// still passed). Right after its bytes are compared there, it is written
+/// into in place, so it fails and is put back; right after it is linked
+/// back (a barrier at `LeftoverPutBack`), another program renames its own
+/// file onto the fresh name. That file is kept, under the fresh name, and
+/// the leftover, as written into, under its own; the restore writes the
+/// file back.
+#[test]
+fn a_file_renamed_onto_the_fresh_name_once_a_leftover_is_put_back_stays() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = d.path();
+    let p = dir.join(".mcp.json");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(dir).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    let left_over = new_name_in(dir, "0000000000000001");
+    std::fs::write(&left_over, body_prefix(1000)).unwrap();
+    let mut changed = body_prefix(1000);
+    changed[999] ^= 1;
+    let other: &[u8] = b"another program's file";
+    let mut aside: Option<std::path::PathBuf> = None;
+    let mut did = 0;
+    restore_over_left_observed(
+        &r,
+        Path::new(".mcp.json"),
+        &file,
+        &mut |c| Some(chunk_of(&body, c)),
+        &mut |at| match at {
+            Inside::LeftoverRead => {
+                // Where it was moved: the file of the temporary names that
+                // is 1000 bytes long (the restore's own holds the whole).
+                let q = new_names(dir)
+                    .into_iter()
+                    .find(|(_, b)| b.len() == 1000)
+                    .map(|(n, _)| dir.join(n))
+                    .unwrap();
+                let w = std::fs::OpenOptions::new().write(true).open(&q).unwrap();
+                std::os::unix::fs::FileExt::write_all_at(&w, &changed[999..], 999).unwrap();
+                aside = Some(q);
+            }
+            Inside::LeftoverPutBack => {
+                let q = dir.join("another");
+                std::fs::write(&q, other).unwrap();
+                std::fs::rename(&q, aside.as_ref().unwrap()).unwrap();
+                did += 1;
+            }
+            _ => {}
+        },
+    )
+    .unwrap();
+    assert_eq!(did, 1, "never put back");
+    assert!(std::fs::read(&p).unwrap() == body, "not byte for byte");
+    let aside = aside.unwrap();
+    let mut want = vec![
+        (
+            left_over
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            changed,
+        ),
+        (
+            aside.file_name().unwrap().to_string_lossy().into_owned(),
+            other.to_vec(),
+        ),
+    ];
+    want.sort();
+    let names = new_names(dir);
+    assert!(
+        names == want,
+        "the file renamed onto the fresh name, or the leftover, was removed: {:?}",
+        names.iter().map(|(n, b)| (n, b.len())).collect::<Vec<_>>()
+    );
+}
+
+/// A new file another program made readable to others is never put in
+/// place: once it is under the name the swap takes it from (a barrier at
+/// `Staged`), its mode is widened to 0644. Its bytes are still the ones
+/// written, so it goes; nothing is swapped in, the file the change left
+/// keeps its name, and no temporary file is left (`changed`).
+#[test]
+fn a_new_file_whose_mode_changed_is_never_put_in_place() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = d.path();
+    let p = dir.join(".mcp.json");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(dir).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut exchanged = false;
+    let mut did = 0;
+    let e = restore_over_left_observed(
+        &r,
+        Path::new(".mcp.json"),
+        &file,
+        &mut |c| Some(chunk_of(&body, c)),
+        &mut |at| {
+            exchanged |= at == Inside::Exchanged;
+            if at == Inside::Staged {
+                let q = dir.join(names_of(dir, "swap").remove(0).0);
+                std::fs::set_permissions(&q, std::fs::Permissions::from_mode(0o644)).unwrap();
+                did += 1;
+            }
+        },
+    )
+    .unwrap_err();
+    assert_eq!(did, 1);
+    assert_eq!(e.kind, ModifyErrorKind::Changed);
+    assert!(!exchanged, "a new file with another mode was swapped in");
+    assert_eq!(std::fs::read(&p).unwrap(), LEFT);
+    assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
+    no_temps(dir);
+}
+
+/// Once the new file has the file's name, the old file goes only while it
+/// is still the one checked: right after the swap is checked (a barrier at
+/// `Swapped`), another program renames its own file onto the temporary
+/// name the old file is under. That file is kept, and named
+/// (`not_removed`); the file is written back.
+#[test]
+fn a_file_renamed_onto_the_old_files_name_once_swapped_stays() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = d.path();
+    let p = dir.join(".mcp.json");
+    let body = original();
+    let file = backed_up(&body);
+    let r = open_root(dir).unwrap();
+    std::fs::write(&p, LEFT).unwrap();
+    let other: &[u8] = b"another program's file";
+    let mut did = 0;
+    let e = restore_over_left_observed(
+        &r,
+        Path::new(".mcp.json"),
+        &file,
+        &mut |c| Some(chunk_of(&body, c)),
+        &mut |at| {
+            if at == Inside::Swapped {
+                let (old, b) = names_of(dir, "swap").remove(0);
+                assert_eq!(b, LEFT);
+                let q = dir.join("another");
+                std::fs::write(&q, other).unwrap();
+                std::fs::rename(&q, dir.join(old)).unwrap();
+                did += 1;
+            }
+        },
+    )
+    .unwrap_err();
+    assert_eq!(did, 1);
+    assert_eq!(e.kind, ModifyErrorKind::NotRemoved);
+    assert!(std::fs::read(&p).unwrap() == body, "not byte for byte");
+    assert_eq!(std::fs::read(dir.join(&e.rel)).unwrap(), other);
 }
