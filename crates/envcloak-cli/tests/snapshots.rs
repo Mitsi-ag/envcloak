@@ -750,8 +750,9 @@ fn every_command_prints_its_value_free_json_snapshot() {
 
 /// What `help-and-usage` runs: the top-level help and version, an unknown
 /// command, and each command's `--help` or a usage error of it (M1's, and
-/// those M2-03 landed: `run --wait`, `run --manifest`, `pending`; and M2-06's
-/// `mcp`). (`-h`
+/// those M2-03 landed: `run --wait`, `run --manifest`, `pending`; M2-06's
+/// `mcp`; and M2-08's `agents install` and `uninstall`, `hook` and `init
+/// --agents-note`). (`-h`
 /// and `help` take the arm of `--help`, and `-V` that of `--version`.)
 const HELP_AND_USAGE: &[&[&str]] = &[
     &["--help"],
@@ -797,6 +798,13 @@ const HELP_AND_USAGE: &[&[&str]] = &[
     &["mcp", "--help"],
     &["mcp", "--wait-ms", "25000"],
     &["mcp", "--host", "Claude Code"],
+    &["agents", "install", "--help"],
+    &["agents", "install", "--bogus"],
+    &["agents", "uninstall", "--consent-sandbox-sockets"],
+    &["agents", "install", "--agent", "cursor"],
+    &["hook"],
+    &["hook", "--host", "claude-code", "--event", "Stop"],
+    &["init", "--undo", "X", "--agents-note"],
 ];
 
 /// The help and usage text a person or an agent reads before running a

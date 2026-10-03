@@ -247,12 +247,22 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "envcloak-agents",
+ "envcloak-client",
+ "envcloak-core",
+ "envcloak-ipc",
+ "envcloak-policy",
+ "envcloak-scan",
  "envcloak-sys",
+ "envcloak-testkit",
  "getrandom 0.4.3",
  "proptest",
+ "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
+ "tempfile",
+ "toml_edit",
  "zeroize",
 ]
 

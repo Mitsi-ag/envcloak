@@ -1885,6 +1885,68 @@ fn key_shaped_arguments_are_refused_before_the_daemon_is_asked() {
     f.sweep();
 }
 
+/// D-22 (M2 plan M2-08): `run_with_secrets` refuses what EnvCloak's
+/// `PreToolUse` hook denies in a shell, with the hook's own message, before
+/// the daemon is asked, so a host without hooks gets the same accident
+/// prevention: an env file read, the environment printed, `envcloak
+/// approve` or `reveal` run by the agent, a script it cannot read. A
+/// command the hook allows is the positive control: it reaches the daemon.
+///
+/// Mutation checked: the `decide_argv` refusal removed from
+/// `run_with_secrets`: `printenv` and `cat .env` reach the daemon (a
+/// connection opens and a request waits for the person) and this fails.
+#[test]
+fn hook_classes_are_refused_before_the_daemon_is_asked() {
+    let f = Fixture::new();
+    let mut m = Mcp::start(&f.home, &f.project, &["--wait-ms", "1000"], &f.cs);
+    m.initialize();
+    let dir = f.project.to_str().unwrap();
+    let opened = || {
+        f.d.as_ref()
+            .unwrap()
+            .log()
+            .matches("envcloakd: test: connection opened")
+            .count()
+    };
+    let control = |m: &mut Mcp, after: usize| {
+        structured(&m.call("list_secrets", json!({})));
+        let end = Instant::now() + Duration::from_secs(30);
+        while opened() <= after {
+            assert!(Instant::now() < end, "the trace shows no connection");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        opened()
+    };
+    let before = control(&mut m, 0);
+    let cases: [(&[&str], &str); 6] = [
+        (&["printenv"], "[envcloak:env_dump]"),
+        (&["cat", ".env"], "[envcloak:env_file]"),
+        (&["env"], "[envcloak:env_dump]"),
+        (&["sh", "-c", "head -n 1 .env.local"], "[envcloak:env_file]"),
+        (&["envcloak", "approve", "REQUEST"], "[envcloak:approve]"),
+        (&["sh", "-c", "$c .env"], "[envcloak:ambiguous]"),
+    ];
+    for (argv, marker) in cases {
+        let r = m.call(
+            "run_with_secrets",
+            json!({"project_dir": dir, "argv": argv}),
+        );
+        assert_eq!(failed(&r), "command_refused", "{argv:?}: {r}");
+        let text: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        let message = text["message"].as_str().unwrap();
+        assert!(message.starts_with(marker), "{argv:?}: {message}");
+    }
+    // The positive control: its one connection is the only one since.
+    assert_eq!(
+        control(&mut m, before),
+        before + 1,
+        "a refused call reached the daemon"
+    );
+    assert!(f.listed().is_empty(), "a refused call opened a request");
+    m.finish();
+    f.sweep();
+}
+
 /// Host cancellation of a command that ignores `SIGTERM`, and whose forked
 /// child does too: the server's first `SIGTERM` reaches it through
 /// `envcloak run` and is ignored; its second makes `envcloak run` kill the

@@ -1,0 +1,34 @@
+# EnvCloak: commands that print secrets, refused before they run.
+# Written by `envcloak agents install`; `envcloak agents uninstall` removes
+# this file. A prefix rule matches a command's first words only: a compound
+# script (a pipe, `&&`, a redirection, a substitution) reaches Codex as one
+# shell call and is not matched here. EnvCloak's PreToolUse hook reads
+# those. Neither is a security boundary: they prevent accidents.
+prefix_rule(
+    pattern = ["printenv"],
+    decision = "forbidden",
+    justification = "It prints environment variables, which can hold keys. Run a command that needs a key as `envcloak run -- <command>`, and use `envcloak ls` to see which keys exist.",
+    match = ["printenv", "printenv HOME"],
+    not_match = ["envcloak run -- npm test"],
+)
+prefix_rule(
+    pattern = ["export", "-p"],
+    decision = "forbidden",
+    justification = "It prints environment variables, which can hold keys. Use `envcloak ls` to see which keys exist.",
+    match = ["export -p"],
+    not_match = ["export PATH=/usr/bin"],
+)
+prefix_rule(
+    pattern = ["envcloak", ["reveal", "approve"]],
+    decision = "forbidden",
+    justification = "Only the person runs `envcloak reveal` and `envcloak approve`, in a terminal of their own. Ask them to run `envcloak pending` and approve the request there.",
+    match = ["envcloak reveal openai/project", "envcloak approve REQUEST"],
+    not_match = ["envcloak pending", "envcloak run -- npm test"],
+)
+prefix_rule(
+    pattern = [["cat", "head", "tail", "less", "more", "bat", "source", "."], [".env", ".env.local", ".env.development", ".env.development.local", ".env.production", ".env.production.local", ".env.test", ".env.test.local"]],
+    decision = "forbidden",
+    justification = "It reads a .env file, whose values would reach the model. Run the command that needs them as `envcloak run -- <command>`.",
+    match = ["cat .env", "head .env.local", "source .env.local"],
+    not_match = ["cat README.md", "cat .env.example"],
+)

@@ -1,6 +1,6 @@
 [package]
 name = "envcloak-agents"
-description = "EnvCloak's agent integrations: the scripted model that coverage probes drive the agent hosts with (envcloak-probe-model)"
+description = "EnvCloak's agent integrations: the hook handler, the installers and host catalog, and the scripted model that coverage probes drive the agent hosts with (envcloak-probe-model)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,11 +19,27 @@ testing = []
 
 [dependencies]
 base64.workspace = true
+# The hook reads its payload into wiped storage (SecretBuf); the installer
+# finds EnvCloak's data directory (VaultPaths) and sends backups v2.
+envcloak-core.workspace = true
+# The installer's backups v2 and its daemon connection; the provider
+# registry's key patterns for the prompt check (render::registry).
+envcloak-client.workspace = true
+envcloak-ipc.workspace = true
+envcloak-policy.workspace = true
+# Scan-owned descriptors (source::ConfigSource) the host catalog emits,
+# `dotenv_kind` for the hook's file checks, and the atomic file changes
+# the installer makes (D-02: agents -> scan, never back).
+envcloak-scan.workspace = true
 envcloak-sys.workspace = true
 getrandom.workspace = true
+secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 subtle.workspace = true
+# Codex's config.toml is edited key by key, keeping the rest as it is.
+toml_edit = { workspace = true, features = ["display"] }
 zeroize.workspace = true
 
 # The scripted model of M2 plan task M2-04: a loopback HTTP/1.1 server that
@@ -37,3 +53,6 @@ path = "src/bin/envcloak-probe-model.rs"
 # Enables the `testing` feature for this crate's own tests.
 envcloak-agents = { path = ".", features = ["testing"] }
 proptest.workspace = true
+tempfile.workspace = true
+# The allocator probe (gate 11) for the hook's decision, tests/hook_probe.rs.
+envcloak-testkit.workspace = true

@@ -66,6 +66,18 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The hook's glob oracle (crates/envcloak-agents/tests/
+      # grep_glob_oracle.rs) asks ripgrep which file a glob picks out; it
+      # fails here if ripgrep is missing.
+      - name: Install ripgrep
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get install -y --no-install-recommends ripgrep
+          else
+            command -v rg >/dev/null || brew install ripgrep
+          fi
+          rg --version
+          echo "ENVCLOAK_TEST_REQUIRE_RG=1" >> "$GITHUB_ENV"
       # The gate 19 crash test runs its positive core-dump control only when
       # core files go to a known directory, which it checks and cleans up.
       # In CI it fails if the control cannot run.
@@ -408,6 +420,10 @@ jobs:
           python3 scripts/check-crate-graph.py
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check --workspace --all-targets --all-features --locked
+      # The combined-graph gate (M2 plan F-75, M2-08): the agent catalog,
+      # the scanner, the MCP server and the CLI with no default features
+      # too.
+      - run: cargo check -p envcloak-agents -p envcloak-scan -p envcloak-mcp -p envcloak --all-targets --no-default-features --locked
 
   # Which of the M2 agent jobs a pull request needs, from the paths it
   # changes (scripts/ci-paths.py, which checks its own table of paths

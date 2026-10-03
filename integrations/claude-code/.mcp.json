@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "envcloak": {
+      "command": "envcloak",
+      "args": [
+        "mcp",
+        "--host",
+        "claude-code"
+      ],
+      "timeout": 60000
+    }
+  }
+}

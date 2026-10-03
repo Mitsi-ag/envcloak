@@ -34,6 +34,10 @@
 //!   an agent host starts and talks to over standard input and output
 //!   (SPEC §7; `envcloak_mcp`, docs/MCP.md). It never receives a value:
 //!   `run_with_secrets` runs a child `envcloak run`.
+//! - `envcloak agents install` and `uninstall`, which teach Claude Code
+//!   and Codex EnvCloak and take it out again, and `envcloak hook`, the
+//!   handler their prompt and tool-call hooks run (SPEC §7;
+//!   `envcloak_agents`, docs/INSTALLERS.md).
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
 //! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`, `init`,
@@ -93,20 +97,22 @@ const HELP: &str = "usage:
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
-  envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+  envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
   envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak import --scan <dir> [--yes] [--json]
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
   envcloak mcp [--host ID] [--wait-ms N]
+  envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+  envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
+  envcloak hook --host ID --event NAME
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
-  envcloak agents install | uninstall | status | migrate-mcp
-  envcloak hook
+  envcloak agents status | migrate-mcp
   envcloak mcp-bridge
   envcloak standing
   envcloak items reclassify
@@ -202,12 +208,11 @@ fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Opti
         "reveal" => cmd::reveal::run(&[]),
         "doctor" => cmd::doctor::run(&[]),
         "scrub" => cmd::scrub::run(&[]),
-        "hook" => cmd::hook::run(&[]),
         "mcp-bridge" => cmd::mcp_bridge::run(&[]),
         "standing" => cmd::standing::run(&[]),
         "login" => cmd::login::run(&[]),
         "signin" => cmd::signin::run(&[]),
-        "agents" => cmd::agents::run(&[word(1)?]),
+        "agents" if matches!(word(1)?, "status" | "migrate-mcp") => cmd::agents::run(&[word(1)?]),
         "items" => cmd::items::run(&[word(1)?]),
         "run"
             if args[1..]

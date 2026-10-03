@@ -1,6 +1,6 @@
-//! `envcloak init [--import] [--yes] [--delete-plaintext] [--json]` and
-//! `envcloak init --undo <ID> [--created-by-agent] [--unrecorded]
-//! [--passphrase-fd N] [--json]` (SPEC §6.4, story S2).
+//! `envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note]
+//! [--json]` and `envcloak init --undo <ID> [--created-by-agent]
+//! [--unrecorded] [--passphrase-fd N] [--json]` (SPEC §6.4, story S2).
 //!
 //! The project is the directory of the nearest `envcloak.toml` at or
 //! above the working directory, or the working directory when there is
@@ -64,6 +64,14 @@
 //! Deletion removes the working copy only: a value that was committed to
 //! git, synced or backed up elsewhere is still there, and the report says
 //! to rotate it.
+//!
+//! `--agents-note` (SPEC §6.4 step 4, M2 plan M2-08) adds EnvCloak's
+//! instruction block to the project's agent instruction file, as
+//! `envcloak agents install --project` does (Map C §6: `CLAUDE.md` and
+//! `AGENTS.md` where they exist, else a new `AGENTS.md`; never a new
+//! `CLAUDE.md` beside a lone `AGENTS.md`), after a backup v2 of a file
+//! that is there; not in a dry run of `--import`. Its results follow the
+//! report (with `--json`, as a line of their own).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -94,7 +102,8 @@ use envcloak_scan::{
 use super::import::{ReadFile, edit_gitignore, import, project_name, report, scan};
 use super::{fd_number, require_unlocked};
 
-const USAGE_TEXT: &str = "envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+const USAGE_TEXT: &str =
+    "envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
        envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]";
 
 /// The parsed command line.
@@ -103,6 +112,7 @@ struct InitArgs {
     import: bool,
     yes: bool,
     delete: bool,
+    agents_note: bool,
     undo: Option<String>,
     /// `--created-by-agent`: the backup may be one an agent or an unknown
     /// process made.
@@ -122,6 +132,7 @@ fn parse(args: &[&str]) -> Option<InitArgs> {
             "--import" if !a.import => a.import = true,
             "--yes" if !a.yes => a.yes = true,
             "--delete-plaintext" if !a.delete => a.delete = true,
+            "--agents-note" if !a.agents_note => a.agents_note = true,
             "--json" if !a.json => a.json = true,
             "--undo" if a.undo.is_none() => a.undo = Some((*it.next()?).to_owned()),
             "--created-by-agent" if !a.created_by_agent => a.created_by_agent = true,
@@ -132,7 +143,7 @@ fn parse(args: &[&str]) -> Option<InitArgs> {
             _ => return None,
         }
     }
-    let undo_only = a.undo.is_some() && !a.import && !a.yes && !a.delete;
+    let undo_only = a.undo.is_some() && !a.import && !a.yes && !a.delete && !a.agents_note;
     let no_undo =
         a.undo.is_none() && a.passphrase_fd.is_none() && !a.created_by_agent && !a.unrecorded;
     (undo_only || no_undo).then_some(a)
@@ -243,6 +254,17 @@ fn init(a: &InitArgs) -> Result<ExitCode, Failure> {
     print(&report, a.json);
     if let Some(f) = refusal {
         return Err(f);
+    }
+    if a.agents_note {
+        if a.import && !a.yes {
+            if !a.json {
+                eprintln!(
+                    "envcloak: dry run: the agent note was not written; run it again with --yes"
+                );
+            }
+        } else {
+            super::agents::project_note(&dir, a.json)?;
+        }
     }
     let planned = report.import.as_ref().is_some_and(|r| !r.items.is_empty());
     if a.import && !a.yes && !a.json && planned {
