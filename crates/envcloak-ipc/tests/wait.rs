@@ -1533,3 +1533,142 @@ fn wait_for_run_with_grace_of(
 ) -> Waited {
     envcloak_ipc::wait::wait_for_run_with_grace(t, c, wait, grace, &mut |_| {}).unwrap()
 }
+
+/// A clock on the system's time whose every pause first asks the
+/// stand-in daemon of [`a_waiter_holds_no_connection_through_any_pause`]
+/// how many of the waiter's connections are still open, and records the
+/// answer: a barrier at the start of each pause.
+struct PauseBarrier {
+    inner: envcloak_ipc::wait::SystemClock,
+    ask: std::sync::mpsc::Sender<()>,
+    answer: std::sync::mpsc::Receiver<usize>,
+    open_at_pauses: Vec<usize>,
+}
+
+impl Clock for PauseBarrier {
+    fn now(&self) -> Duration {
+        self.inner.now()
+    }
+
+    fn sleep(&mut self, d: Duration) {
+        self.ask.send(()).unwrap();
+        let open = self
+            .answer
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stand-in daemon did not count");
+        self.open_at_pauses.push(open);
+        self.inner.sleep(d);
+    }
+}
+
+/// D-04, with a barrier at every pause (Codex and verifier review of
+/// M2-03, M2R-15): over real connections ([`Fresh`]), a waiter whose
+/// request stays pending for a wait of 31 seconds (past the daemon's
+/// 30-second idle bound) holds none of its connections open during any
+/// pause. Each time the wait pauses, the stand-in daemon, which keeps its
+/// end of every connection it took, reads each without blocking: a
+/// connection the waiter closed reads as its end, one it still holds
+/// would block. The earlier test could not tell a waiter that kept each
+/// connection through the pause and closed it just before the next from
+/// one that closed it at once.
+///
+/// Mutation checked: `Fresh` keeping each call's connection until its
+/// next call (closed just before the next connect): every pause finds one
+/// connection open and this fails.
+#[test]
+fn a_waiter_holds_no_connection_through_any_pause() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use envcloak_ipc::RunPaths;
+    use envcloak_ipc::view::PendingStateView;
+    use envcloak_ipc::wait::{Fresh, SystemClock};
+
+    let home = envcloak_testkit::TestHome::new();
+    let p = RunPaths::under(home.root().join("run").join("envcloak")).unwrap();
+    std::fs::create_dir_all(&p.dir).unwrap();
+    std::fs::set_permissions(&p.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let l = UnixListener::bind(&p.socket).unwrap();
+    let held: Arc<Mutex<Vec<UnixStream>>> = Arc::default();
+    let pending = answer_bytes(&RunAnswer::decided(pending("ABCDEFGH")));
+    let still = {
+        let f = envcloak_ipc::proto::result_frame(
+            1,
+            &PendingStateView {
+                state: PendingState::Pending,
+            },
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        f.write_to(&mut out).unwrap();
+        out
+    };
+    // The daemon: every request answered pending, its end of the
+    // connection kept, before the answer goes out, so that the count at a
+    // pause sees it.
+    let taken = Arc::clone(&held);
+    std::thread::spawn(move || {
+        let mut first = true;
+        while let Ok((mut s, _)) = l.accept() {
+            if envcloak_ipc::Frame::read_from(&mut s).is_err() {
+                continue;
+            }
+            taken.lock().unwrap().push(s.try_clone().unwrap());
+            let answer = if std::mem::take(&mut first) {
+                &pending
+            } else {
+                &still
+            };
+            let _ = s.write_all(answer);
+        }
+    });
+    // The count: each connection read without blocking; open while a read
+    // would block.
+    let (ask, asked) = mpsc::channel::<()>();
+    let (tell, answer) = mpsc::channel::<usize>();
+    let counted = Arc::clone(&held);
+    std::thread::spawn(move || {
+        while asked.recv().is_ok() {
+            let mut open = 0;
+            for s in counted.lock().unwrap().iter_mut() {
+                s.set_nonblocking(true).unwrap();
+                let mut b = [0u8; 1];
+                match s.read(&mut b) {
+                    Ok(0) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => open += 1,
+                    other => panic!("the waiter sent more than a request: {other:?}"),
+                }
+            }
+            if tell.send(open).is_err() {
+                return;
+            }
+        }
+    });
+    let mut clock = PauseBarrier {
+        inner: SystemClock::new(),
+        ask,
+        answer,
+        open_at_pauses: Vec::new(),
+    };
+    let params = run_params(vec!["./emit".to_owned()]);
+    let mut t = Fresh {
+        paths: &p,
+        params: &params,
+    };
+    let got = wait_for_run(&mut t, &mut clock, Duration::from_secs(31), &mut |_| {}).unwrap();
+    assert!(
+        matches!(got, Waited::TimedOut(i) if i == id("ABCDEFGH")),
+        "{got:?}"
+    );
+    let pauses = clock.open_at_pauses;
+    // About 35 pauses: four of 250 ms, two of 500 ms, then one a second.
+    assert!(pauses.len() >= 30, "{} pauses", pauses.len());
+    assert!(
+        pauses.iter().all(|n| *n == 0),
+        "connections open at the pauses: {pauses:?}"
+    );
+    // The waiter made a connection for its request and one for each poll.
+    assert_eq!(held.lock().unwrap().len(), pauses.len() + 1);
+}

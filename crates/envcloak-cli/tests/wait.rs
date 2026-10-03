@@ -395,13 +395,20 @@ fn a_y_typed_into_the_waiting_terminal_approves_nothing() {
     f.sweep();
 }
 
-/// D-04: no connection stays open between polls. A waiting run is
-/// watched through the daemon's test trace, with the idle bound cut to 2
-/// seconds: each poll is a connection of its own, opened and closed
-/// before the next (so the daemon holds none of the waiter's between
-/// polls), polls keep coming until the deadline, and the idle bound
-/// never closes one. At the deadline the run exits 125 with its one
-/// `approval_required` line, and the request still waits.
+/// D-04: no connection stays open between polls, across a wait of 31
+/// seconds against the daemon's real 30-second idle bound (the plan's
+/// test: the connection count sampled during a 30-second wait, and the
+/// idle close never firing; Codex review of M2-03, M2R-15: the wait was 8
+/// seconds with the bound cut to 2). A waiting run is watched through the
+/// daemon's test trace: each poll is a connection of its own, opened and
+/// closed before the next, polls keep coming until the deadline, and the
+/// idle bound never closes one. At the deadline the run exits 125 with
+/// its one `approval_required` line, and the request still waits. That
+/// none is held during a pause, which the trace cannot tell from one
+/// closed just before the next connect, is
+/// crates/envcloak-ipc/tests/wait.rs
+/// `a_waiter_holds_no_connection_through_any_pause`, with a barrier at
+/// every pause.
 ///
 /// Mutation: hold the connection while waiting (poll on one connection
 /// kept open): the waiter's connections are not opened and closed per
@@ -413,8 +420,8 @@ fn a_y_typed_into_the_waiting_terminal_approves_nothing() {
 /// `a_wait_on_a_silent_daemon_ends_by_its_limit` counts it.)
 #[test]
 fn a_waiting_run_holds_no_connection_between_polls() {
-    let f = Fixture::with_env(&[(envcloak_sys::testing::IDLE_CONNECTION_MS, "2000")]);
-    let mut cmd = cli_command(&f.home, &["run", "--wait", "8s", "--", "./emit"], &[]);
+    let f = Fixture::with_env(&[]);
+    let mut cmd = cli_command(&f.home, &["run", "--wait", "31s", "--", "./emit"], &[]);
     cmd.current_dir(&f.project);
     let child = cmd.spawn().unwrap();
     let pid = child.id().to_string();
@@ -453,7 +460,7 @@ fn a_waiting_run_holds_no_connection_between_polls() {
         }
     }
     assert_eq!(open, 0, "{log}");
-    assert!(polls >= 9, "{polls} polls in 8 s:\n{log}");
+    assert!(polls >= 30, "{polls} polls in 31 s:\n{log}");
     assert_eq!(opened, polls + 1, "{log}");
     assert_eq!(f.listed().len(), 1);
     f.sweep();
