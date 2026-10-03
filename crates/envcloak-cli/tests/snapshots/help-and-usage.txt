@@ -22,20 +22,22 @@ usage:
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
-  envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+  envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
   envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak import --scan <dir> [--yes] [--json]
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
   envcloak mcp [--host ID] [--wait-ms N]
+  envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+  envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
+  envcloak hook --host ID --event NAME
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
-  envcloak agents install | uninstall | status | migrate-mcp
-  envcloak hook
+  envcloak agents status | migrate-mcp
   envcloak mcp-bridge
   envcloak standing
   envcloak items reclassify
@@ -74,20 +76,22 @@ usage:
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
-  envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+  envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
   envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak import --scan <dir> [--yes] [--json]
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
   envcloak mcp [--host ID] [--wait-ms N]
+  envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+  envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
+  envcloak hook --host ID --event NAME
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
-  envcloak agents install | uninstall | status | migrate-mcp
-  envcloak hook
+  envcloak agents status | migrate-mcp
   envcloak mcp-bridge
   envcloak standing
   envcloak items reclassify
@@ -250,14 +254,14 @@ envcloak: usage: envcloak rm <slug> [--passphrase-fd N] [--json]
 $ envcloak init --help
 exit: 0
 --- stdout
-usage: envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+usage: envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
        envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
 --- stderr
 $ envcloak init --bogus
 exit: 2
 --- stdout
 --- stderr
-envcloak: usage: envcloak init [--import] [--yes] [--delete-plaintext] [--json]
+envcloak: usage: envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
        envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
 $ envcloak import --help
 exit: 0
@@ -314,3 +318,47 @@ exit: 2
 envcloak: --host needs a host id: lowercase letters, digits and -
 envcloak: usage: envcloak mcp [--host ID] [--wait-ms 1000..20000]
        started by an agent host, which talks to it on standard input and output
+$ envcloak agents install --help
+exit: 0
+--- stdout
+usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+       envcloak agents status | migrate-mcp (not in this build)
+--- stderr
+$ envcloak agents install --bogus
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+       envcloak agents status | migrate-mcp (not in this build)
+$ envcloak agents uninstall --consent-sandbox-sockets
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+       envcloak agents status | migrate-mcp (not in this build)
+$ envcloak agents install --agent cursor
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+       envcloak agents status | migrate-mcp (not in this build)
+$ envcloak hook
+exit: 1
+--- stdout
+--- stderr
+envcloak: usage: envcloak hook --host claude-code|codex --event UserPromptSubmit|PreToolUse|SessionStart
+$ envcloak hook --host claude-code --event Stop
+exit: 1
+--- stdout
+--- stderr
+envcloak: usage: envcloak hook --host claude-code|codex --event UserPromptSubmit|PreToolUse|SessionStart
+$ envcloak init --undo X --agents-note
+exit: 2
+--- stdout
+--- stderr
+envcloak: usage: envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
+       envcloak init --undo <ID> [--passphrase-fd N] [--json]
