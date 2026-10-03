@@ -2193,3 +2193,36 @@ fn a_source_directory_that_cannot_be_listed_fails() {
         );
     }
 }
+
+/// Unsupported code tokens are refused before the ASCII source readers
+/// run. Text in comments/literals and omitted test modules stays supported.
+#[test]
+fn non_ascii_code_is_refused_without_rejecting_unicode_text() {
+    for body in [
+        r#"use crate::fail::Failure as Φ; pub fn make()->Φ { Φ::new("pty_unavailable", "") }"#,
+        r#"type Φ=crate::fail::Failure; pub fn make()->Φ { Φ::new("pty_unavailable", "") }"#,
+        r#"use crate::fail::Failure as AliasΦ; pub fn make()->AliasΦ { AliasΦ::new("pty_unavailable", "") }"#,
+        r#"type AliasΦ=crate::fail::Failure; pub fn make()->AliasΦ { AliasΦ::new("pty_unavailable", "") }"#,
+        r#"mod δοκιμή { pub use crate::fail::Failure; } pub fn make()->δοκιμή::Failure { δοκιμή::Failure::new("pty_unavailable", "") }"#,
+        r#"use crate::fail::Failure as r#Φ; pub fn make()->r#Φ { r#Φ::new("pty_unavailable", "") }"#,
+        r#"type é=crate::fail::Failure;"#,
+        r#"type é=crate::fail::Failure;"#,
+        r#"pub fn borrowed<'α>(value: &'α str)->&'α str { value }"#,
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(&t, "unsupported non-ASCII Rust code");
+    }
+    for body in [
+        r#"// Φ aliases remain text here.
+        /* δοκιμή /* Φ */ */
+        pub fn text()->&'static str { "Φ δοκιμή" }"#,
+        r###"pub const TEXT: &str = r##"Φ δοκιμή"##; pub const LETTER: char = 'Φ';"###,
+        r#"#[doc = "Φ"] pub fn make()->crate::fail::Failure { crate::fail::Failure::new("daemon_unavailable", "Φ") }"#,
+        r#"#[cfg(test)] mod tests { type Φ=crate::fail::Failure; fn make()->Φ { Φ::new("pty_unavailable", "") } }"#,
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_passes(&t.home());
+    }
+}
