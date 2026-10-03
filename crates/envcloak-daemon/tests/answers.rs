@@ -15,7 +15,9 @@
 mod common;
 
 use std::io::Read;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use common::{client, data_dir, passphrase, raw, send_json, start};
@@ -36,6 +38,14 @@ const ALIASES: usize = 15;
 const ID: u64 = 7;
 /// The shortest name of the variable the tuning item is bound under.
 const TUNE_MIN: usize = 8;
+/// Where the daemon stops, once a covered answer is framed and before
+/// its grant is asked again and anything is committed.
+const FRAMED: &str = "run.answer_framed";
+/// The grant that runs out while its answer is framed: long enough for
+/// the request to be decided under it (the daemon reads the caller's
+/// ancestry first, which takes over a second on macOS), short enough to
+/// wait for.
+const SHORT: Duration = Duration::from_secs(8);
 
 /// `n` bytes of lower-case hex from `seed`, never key-shaped.
 fn generated(seed: &mut u64, n: usize) -> String {
@@ -110,10 +120,18 @@ struct Fixture {
     big: Vec<u8>,
     tune: Vec<u8>,
     name: usize,
+    /// The file whose existence lets the daemon go on from [`FRAMED`].
+    release: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::pausing(None)
+    }
+
+    /// As [`Fixture::new`], the daemon stopping at `site` until
+    /// [`Fixture::release`] is called.
+    fn pausing(site: Option<&str>) -> Self {
         common::terminal_session();
         let mut cs = canaries(fresh_seed());
         let home = TestHome::new();
@@ -145,7 +163,17 @@ impl Fixture {
         })
         .unwrap();
         drop(v);
-        let d = start(&home);
+        let release = home.home().join("pause-released");
+        let d = match site {
+            None => start(&home),
+            Some(site) => {
+                let mut cmd = Command::new(common::exe());
+                home.apply(&mut cmd)
+                    .env(envcloak_sys::testing::PAUSE_SITE, site)
+                    .env(envcloak_sys::testing::PAUSE_RELEASE, &release);
+                Daemon::start_command(cmd, &[])
+            }
+        };
         client(&home).unlock(passphrase(&cs), &[]).unwrap();
         let manifest = common::project(&home, "budget", "[project]\nname = \"budget\"\n");
         Fixture {
@@ -156,7 +184,30 @@ impl Fixture {
             big: big.into_bytes(),
             tune: tune.into_bytes(),
             name,
+            release,
         }
+    }
+
+    /// Waits until the daemon stopped at `site` for the `n`th time.
+    fn wait_paused(&self, site: &str, n: usize) {
+        let line = format!("envcloak test: paused at {site}\n");
+        let log = self.d.log_when(Duration::from_secs(30), |log| {
+            log.matches(&line).count() >= n
+        });
+        assert!(
+            log.matches(&line).count() >= n,
+            "the daemon did not stop at {site} {n} times"
+        );
+    }
+
+    /// Lets the daemon go on from its pause point, and every later one.
+    fn release(&self) {
+        std::fs::write(&self.release, b"").unwrap();
+    }
+
+    /// Makes the next pause point stop again.
+    fn rearm(&self) {
+        std::fs::remove_file(&self.release).unwrap();
     }
 
     /// A request for the large item under `aliases` variables and the
@@ -209,26 +260,49 @@ impl Fixture {
     }
 
     /// Checks a covered answer: under `grant`, each variable with its
-    /// item's value, as `p` bound them.
+    /// item's value, as `p` bound them. Failures say only [`outline`] and
+    /// which variable is wrong.
     fn delivered(&self, answer: &serde_json::Value, p: &RunRequestParams, grant: &str) {
         let r = &answer["result"];
-        assert_eq!(r["decision"]["decision"], "covered", "{}", r["decision"]);
-        assert_eq!(r["decision"]["grant"], grant);
-        let values = r["values"].as_array().unwrap();
-        assert_eq!(values.len(), p.refs.len());
+        assert!(
+            r["decision"]["decision"] == "covered" && r["decision"]["grant"] == grant,
+            "expected covered by {grant}, got {}",
+            outline(answer)
+        );
+        let values = r["values"].as_array().map_or(&[][..], Vec::as_slice);
+        assert!(
+            values.len() == p.refs.len(),
+            "expected {} values, got {}",
+            p.refs.len(),
+            outline(answer)
+        );
         for (v, binding) in values.iter().zip(&p.refs) {
             let (name, slug) = binding.split_once('=').unwrap();
-            assert_eq!(v["env_name"], name);
+            assert!(v["env_name"] == name, "{name}: not the variable sent");
             let want = if slug == "big/value" {
                 &self.big
             } else {
                 &self.tune
             };
-            let got = base64::engine::general_purpose::STANDARD
-                .decode(v["value"].as_str().unwrap())
-                .unwrap();
-            assert!(got == *want, "{name}: not its item's value");
+            let got = v["value"]
+                .as_str()
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok());
+            assert!(got.as_ref() == Some(want), "{name}: not its item's value");
         }
+    }
+
+    /// Whether the answer to `p` is the decision `want` (`pending`, say):
+    /// failures name only the answer's decision or error kind, never what
+    /// else it holds (SPEC §15.1).
+    fn decided(&self, answer: &serde_json::Value, want: &str) {
+        let got = &answer["result"]["decision"]["decision"];
+        assert!(got == want, "expected {want}, got {}", outline(answer));
+        assert!(
+            answer["result"]["values"]
+                .as_array()
+                .is_none_or(|v| v.is_empty()),
+            "values with a {want} answer"
+        );
     }
 
     fn holds(&self, grant: &str) -> bool {
@@ -248,6 +322,37 @@ impl Fixture {
 
 fn once() -> ApprovalOptions {
     ApprovalOptions::once(Duration::from_secs(600))
+}
+
+/// What a failure may say of an answer (SPEC §15.1): its decision, or its
+/// error's kind, and how many values it carries; never a value, or any
+/// other part of it, which a regression could fill with one.
+fn outline(answer: &serde_json::Value) -> String {
+    let token = |v: &serde_json::Value| {
+        v.as_str()
+            .filter(|t| t.len() <= 32 && t.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+            .unwrap_or("(not a token)")
+            .to_owned()
+    };
+    match (answer.get("result"), answer.get("error")) {
+        (Some(r), None) => format!(
+            "a result: decision {}, {} values",
+            token(&r["decision"]["decision"]),
+            r["values"].as_array().map_or(0, Vec::len)
+        ),
+        (None, Some(e)) => format!("an error of kind {}", token(&e["data"]["kind"])),
+        _ => "neither one result nor one error".to_owned(),
+    }
+}
+
+/// Whether `answer` is the error of kind `kind`; failures say only
+/// [`outline`].
+fn refused(answer: &serde_json::Value, kind: &str) {
+    assert!(
+        answer["error"]["data"]["kind"] == kind && answer.get("result").is_none(),
+        "expected an error of kind {kind}, got {}",
+        outline(answer)
+    );
 }
 
 /// F-77 (gates 30 and 32): answers of one byte under a frame and of
@@ -275,11 +380,7 @@ fn an_answer_over_a_frame_releases_nothing_and_keeps_the_once_grant() {
     let over = f.params(ALIASES, 2, "over");
     let grant = f.approved(&over, once());
     let (_, answer) = f.raw_run(&over);
-    assert_eq!(
-        answer["error"]["data"]["kind"], "frame_too_large",
-        "{answer}"
-    );
-    assert!(answer.get("result").is_none());
+    refused(&answer, "frame_too_large");
     assert!(
         f.holds(&grant),
         "the once grant was used by an answer never sent"
@@ -292,12 +393,10 @@ fn an_answer_over_a_frame_releases_nothing_and_keeps_the_once_grant() {
     );
     assert!(f.holds(&grant));
     let log = f.d.log();
-    assert_eq!(
-        log.matches(&format!("request decision=frame_too_large id={grant} "))
-            .count(),
-        2,
-        "{log}"
-    );
+    let refusals = log
+        .matches(&format!("request decision=frame_too_large id={grant} "))
+        .count();
+    assert_eq!(refusals, 2, "refusals of the grant's requests logged");
     assert!(!log.contains(&format!("request decision=covered id={grant} ")));
 
     // One variable fewer: covered by the grant the refusal kept, once.
@@ -326,10 +425,7 @@ fn an_answer_over_a_frame_leaves_a_session_grant_as_it_was() {
     let grant = f.approved(&over, ApprovalOptions::session(Duration::from_secs(600)));
     for _ in 0..2 {
         let (_, answer) = f.raw_run(&over);
-        assert_eq!(
-            answer["error"]["data"]["kind"], "frame_too_large",
-            "{answer}"
-        );
+        refused(&answer, "frame_too_large");
         assert!(f.holds(&grant));
     }
     let smaller = f.params(ALIASES - 1, 2, "session");
@@ -344,5 +440,51 @@ fn an_answer_over_a_frame_leaves_a_session_grant_as_it_was() {
     );
     let after = client(&f.home).run_request(&smaller).unwrap();
     assert!(matches!(after.decision, DecisionView::Pending { .. }));
+    f.sweep();
+}
+
+/// F-77, expiry before commit, through the daemon: a `once` grant of
+/// [`SHORT`] covers a request; the daemon is stopped by a barrier once the
+/// answer is framed (holding the answer and the state lock) until both
+/// of the grant's deadlines have passed; let go, it commits nothing: no
+/// value goes out, no delivery is audited, and the request, decided again
+/// on clocks read then, is pending. The control, first: the same barrier
+/// under a grant of ten minutes, which then delivers.
+///
+/// Mutations: no check once the answer is built (covered, with its
+/// values); a lapsed grant answered `internal` rather than decided again.
+#[test]
+fn a_grant_that_runs_out_while_the_answer_is_framed_covers_nothing() {
+    let f = Fixture::pausing(Some(FRAMED));
+    let control = f.params(1, 0, "control");
+    let grant = f.approved(&control, once());
+    let answer = std::thread::scope(|sc| {
+        let run = sc.spawn(|| f.raw_run(&control).1);
+        f.wait_paused(FRAMED, 1);
+        f.release();
+        run.join().unwrap()
+    });
+    f.delivered(&answer, &control, &grant);
+    f.rearm();
+
+    let lapsing = f.params(1, 0, "lapsing");
+    let grant = f.approved(&lapsing, ApprovalOptions::once(SHORT));
+    // Both deadlines are at most that long after the approval's answer.
+    let past = Instant::now() + SHORT + Duration::from_millis(500);
+    let answer = std::thread::scope(|sc| {
+        let run = sc.spawn(|| f.raw_run(&lapsing).1);
+        f.wait_paused(FRAMED, 2);
+        // Waiting for the deadline itself, with the daemon stopped.
+        std::thread::sleep(past.saturating_duration_since(Instant::now()));
+        f.release();
+        run.join().unwrap()
+    });
+    f.decided(&answer, "pending");
+    assert!(!f.holds(&grant), "the grant outlived its deadlines");
+    let log = f.d.log();
+    assert!(
+        !log.contains(&format!("request decision=covered id={grant} ")),
+        "a delivery under the lapsed grant was audited"
+    );
     f.sweep();
 }

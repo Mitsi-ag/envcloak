@@ -81,6 +81,12 @@ impl FakeClocks {
         g.0 += d;
         g.2 += d;
     }
+
+    /// The wall clock is set to `wall`, earlier or later; the other clocks
+    /// do not move.
+    pub fn set_wall(&self, wall: SystemTime) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).0 = wall;
+    }
 }
 
 #[cfg(test)]

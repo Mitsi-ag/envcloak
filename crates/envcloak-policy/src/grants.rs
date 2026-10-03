@@ -932,6 +932,20 @@ impl GrantStore {
         self.grants.get(&id)
     }
 
+    /// Whether grant `id` is still in force at `now`: there, before both
+    /// its deadlines (wall clock and time awake), and of the current
+    /// epochs. A delivery asks again on clocks read once its answer is
+    /// built, just before anything is committed (F-77): the values are
+    /// read and the answer framed after the decision, and a grant that
+    /// ran out meanwhile covers nothing.
+    pub fn in_force(&self, id: GrantId, now: &Now) -> bool {
+        self.grants.get(&id).is_some_and(|g| {
+            !g.expired(now)
+                && g.vault_epoch == self.vault_epoch
+                && g.policy_epoch == self.policy_epoch
+        })
+    }
+
     /// Every grant, oldest first.
     pub fn grants(&self) -> impl Iterator<Item = &Grant> {
         self.grants.values()

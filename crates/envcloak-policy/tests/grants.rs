@@ -872,6 +872,59 @@ fn grants_expire_on_either_clock() {
     assert_eq!(s.grants().count(), 0);
 }
 
+/// F-77, expiry before commit: `in_force`, which a delivery asks on fresh
+/// clocks once its answer is built, holds until either deadline, without
+/// a decision or a sweep in between to remove the grant: a second before
+/// each deadline it holds; at the wall clock's (awake time short of its
+/// own) and at awake time's (the wall clock short of its own) it does
+/// not, though the grant is still in the store; nor after a policy epoch
+/// bump, for a revoked grant or for an id never issued.
+///
+/// Mutations: compare only the wall clock (the awake case holds); only
+/// awake time (the wall case holds).
+#[test]
+fn a_grant_is_in_force_until_either_deadline() {
+    let it = items();
+    let now = now_at(0);
+    let r = || {
+        request(
+            under_agent(),
+            vec![bound("OPENAI_API_KEY", &it[0])],
+            &["./emit"],
+        )
+    };
+    let mut s = store();
+    let g = approve(&mut s, r(), once(), &now).unwrap();
+    assert!(s.in_force(g, &now));
+    let ttl = Duration::from_secs(once().ttl_secs);
+    let short = ttl - Duration::from_secs(1);
+
+    let mut wall = now_at(0);
+    wall.wall += short;
+    assert!(s.in_force(g, &wall), "a second before the wall deadline");
+    wall.wall += Duration::from_secs(1);
+    assert!(!s.in_force(g, &wall), "at the wall deadline, awake short");
+
+    let mut awake = now_at(0);
+    awake.awake += short;
+    assert!(s.in_force(g, &awake), "a second before the awake deadline");
+    awake.awake += Duration::from_secs(1);
+    assert!(!s.in_force(g, &awake), "at the awake deadline, wall short");
+
+    // Asking removes nothing: the grant is there until a decision or a
+    // sweep expires it.
+    assert!(s.grant(g).is_some());
+    assert!(s.in_force(g, &now));
+
+    s.set_policy_epoch(2);
+    assert!(!s.in_force(g, &now), "after a policy epoch bump");
+    let mut s = store();
+    let g = approve(&mut s, r(), once(), &now).unwrap();
+    assert_eq!(s.revoke(RevokeSelector::Id(g)), 1);
+    assert!(!s.in_force(g, &now), "a revoked grant");
+    assert!(!s.in_force(GrantId::parse(&"0".repeat(26)).unwrap(), &now));
+}
+
 #[test]
 fn revoke_lock_root_exit_and_epochs_end_grants() {
     let it = items();

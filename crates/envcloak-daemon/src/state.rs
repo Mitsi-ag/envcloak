@@ -53,9 +53,10 @@ use envcloak_ipc::view::{
     Integrity as IntegrityView, LockReason, LockView, RecoveredView, StatusView, UnlockedView,
     VaultState, VaultView,
 };
-use envcloak_policy::{AttemptLimiter, GrantStore, Now};
+use envcloak_policy::{AttemptLimiter, GrantId, GrantStore, Now};
 
 use crate::audit::{AuditEvent, AuditLog, RequestAudit};
+use crate::clock::{Clocks, now_of};
 use crate::crowded::Crowded;
 use crate::lock::{LockTimer, Reading};
 
@@ -90,6 +91,10 @@ pub enum Delivery {
     /// The answer the values make could not be built: too large for one
     /// frame (F-77). Nothing was recorded or released.
     Unsendable(RpcError),
+    /// The grant was no longer in force once the answer was built: it ran
+    /// out while the values were read and framed (F-77). Nothing was
+    /// recorded or released.
+    Lapsed,
     /// The delivery's audit entry could not be written.
     AuditFailed,
 }
@@ -567,23 +572,32 @@ impl State {
         }
     }
 
-    /// A covered request's delivery (SPEC §6.1 step 5, gate 33): reads the
-    /// value of each field from the verified vault, builds the answer from
-    /// them with `answer` (the frame that will be sent, so an answer too
-    /// large for one is known before anything is committed, F-77), then
-    /// writes the delivery's entry durably, and only then gives the answer
-    /// out. The answer is the only way to a release, so no value leaves
-    /// the daemon before its entry is on disk.
+    /// A covered request's delivery under `grant` (SPEC §6.1 step 5, gate
+    /// 33): reads the value of each field from the verified vault, builds
+    /// the answer from them with `answer` (the frame that will be sent, so
+    /// an answer too large for one is known before anything is committed,
+    /// F-77), asks whether `grant` is still in force on `clocks` read then
+    /// (the reads and the framing come after the decision, and a grant
+    /// that ran out meanwhile covers nothing, F-77), then writes the
+    /// delivery's entry durably, and only then gives the answer out. The
+    /// answer is the only way to a release, so no value leaves the daemon
+    /// before its entry is on disk. The caller holds the state lock from
+    /// its decision to its use of the grant, so nothing else ends the
+    /// grant meanwhile; only time does.
     ///
     /// # Errors
     /// [`Delivery::Refused`] when the vault is not unlocked and verified,
     /// or a value cannot be read (a vault that turns out changed on disk
     /// is marked tampered by the read, and releases nothing more). Nothing
-    /// is recorded then. [`Delivery::Unsendable`] with `answer`'s error;
-    /// nothing is recorded then either. [`Delivery::AuditFailed`] when the
-    /// entry could not be written; the answer is dropped, and wiped.
+    /// is recorded then. [`Delivery::Unsendable`] with `answer`'s error,
+    /// and [`Delivery::Lapsed`] when the grant is no longer in force;
+    /// nothing is recorded then either, and the answer is dropped, and
+    /// wiped. [`Delivery::AuditFailed`] when the entry could not be
+    /// written; the answer is dropped, and wiped.
     pub fn deliver<T>(
         &mut self,
+        grant: GrantId,
+        clocks: &dyn Clocks,
         e: AuditEvent,
         fields: &[FieldId],
         answer: impl FnOnce(Vec<SecretBytes>) -> Result<T, RpcError>,
@@ -603,6 +617,9 @@ impl State {
             return Err(Delivery::Refused(RpcError::new(ErrorKind::VaultTampered)));
         }
         let answer = answer(values).map_err(Delivery::Unsendable)?;
+        if !self.grants.in_force(grant, &now_of(clocks)) {
+            return Err(Delivery::Lapsed);
+        }
         if !self.audit_delivery(e) {
             return Err(Delivery::AuditFailed);
         }
@@ -1572,51 +1589,85 @@ mod tests {
         }
     }
 
+    /// `value` in a new item `slug` of `s`'s vault: its field.
+    fn stored_value(s: &mut State, slug: &str, value: &[u8]) -> FieldId {
+        use envcloak_core::crypto::ItemClass;
+        use envcloak_core::vault::{FieldName, ItemDetails, NewItem, Slug};
+        s.unlocked_mut()
+            .unwrap()
+            .transact(|t| {
+                let id = t.create_item(NewItem {
+                    class: ItemClass::Secret,
+                    slug: Slug::new(slug).unwrap(),
+                    details: ItemDetails::default(),
+                })?;
+                t.add_field(
+                    id,
+                    FieldName::new("value").unwrap(),
+                    SecretBytes::copy_from(value),
+                )
+            })
+            .unwrap()
+    }
+
+    /// A grant of `opts` for `r`, approved now, as its requester (a
+    /// terminal session).
+    fn granted(
+        f: &Fixture,
+        s: &mut State,
+        r: envcloak_policy::AccessRequest,
+        opts: envcloak_policy::ApprovalOptions,
+    ) -> GrantId {
+        use envcloak_policy::{ApprovalProof, Decision, ProofKind, statement_digest};
+        let t = at(&f.clocks);
+        let Decision::Pending(id) = s.grants().decide(r.clone(), &t) else {
+            panic!("expected a pending request");
+        };
+        let digest = statement_digest(s.grants().pending_descriptor(&id, &t).unwrap(), &opts);
+        let proof = ApprovalProof {
+            approver: r.subject,
+            kind: ProofKind::Passphrase,
+        };
+        s.grants().approve(&id, proof, opts, digest, &t).unwrap()
+    }
+
+    /// A covered request's delivery entry.
+    fn delivery(pid: i32) -> AuditEvent {
+        AuditEvent::Request(Box::new(crate::audit::RequestAudit {
+            pid,
+            decision: "covered",
+            request_id: None,
+            grant_id: None,
+            reason: None,
+            subject: Default::default(),
+            project: None,
+            items: Vec::new(),
+            argv: Vec::new(),
+            count: None,
+        }))
+    }
+
+    const VALUE: &[u8] = b"a value of forty bytes, made for this..";
+
     /// Gate 33's release order, at the one place values are released
     /// from: `deliver` gives values out only after the delivery's entry
     /// reads back from the log on disk, and when the entry cannot be
     /// written it gives none. On a locked vault it reads nothing.
     #[test]
     fn values_are_released_only_after_their_entry_is_on_disk() {
-        use envcloak_core::crypto::ItemClass;
-        use envcloak_core::vault::{FieldName, ItemDetails, NewItem, Slug};
-
-        const VALUE: &[u8] = b"a value of forty bytes, made for this..";
         let f = fixture();
         let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
         create(&f, &mut s);
-        let field = s
-            .unlocked_mut()
-            .unwrap()
-            .transact(|t| {
-                let id = t.create_item(NewItem {
-                    class: ItemClass::Secret,
-                    slug: Slug::new("a/b").unwrap(),
-                    details: ItemDetails::default(),
-                })?;
-                t.add_field(
-                    id,
-                    FieldName::new("value").unwrap(),
-                    SecretBytes::copy_from(VALUE),
-                )
-            })
-            .unwrap();
-        let delivery = |pid| {
-            AuditEvent::Request(Box::new(crate::audit::RequestAudit {
-                pid,
-                decision: "covered",
-                request_id: None,
-                grant_id: None,
-                reason: None,
-                subject: Default::default(),
-                project: None,
-                items: Vec::new(),
-                argv: Vec::new(),
-                count: None,
-            }))
-        };
+        let field = stored_value(&mut s, "a/b", VALUE);
+        let g = granted(
+            &f,
+            &mut s,
+            request("OPENAI_API_KEY"),
+            envcloak_policy::ApprovalOptions::session(Duration::from_secs(600)),
+        );
+        let c = &f.clocks;
 
-        let values = s.deliver(delivery(1), &[field], Ok).unwrap();
+        let values = s.deliver(g, c, delivery(1), &[field], Ok).unwrap();
         // The values exist: the entry is already in the log's files.
         assert_eq!(
             entries(&s).last().map(|e| e.2.clone()),
@@ -1629,7 +1680,7 @@ mod tests {
         let before = entries(&s).len();
         let too_large = RpcError::new(ErrorKind::FrameTooLarge);
         assert_eq!(
-            s.deliver(delivery(5), &[field], |_| Err::<(), _>(too_large))
+            s.deliver(g, c, delivery(5), &[field], |_| Err::<(), _>(too_large))
                 .unwrap_err(),
             Delivery::Unsendable(too_large)
         );
@@ -1640,17 +1691,101 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::write(dir, b"in the way").unwrap();
         assert_eq!(
-            s.deliver(delivery(2), &[field], Ok).unwrap_err(),
+            s.deliver(g, c, delivery(2), &[field], Ok).unwrap_err(),
             Delivery::AuditFailed
         );
         std::fs::remove_file(dir).unwrap();
-        assert_eq!(s.deliver(delivery(3), &[field], Ok).unwrap().len(), 1);
+        assert_eq!(s.deliver(g, c, delivery(3), &[field], Ok).unwrap().len(), 1);
 
         // Locked: refused before anything is read or written.
         s.lock(LockReason::Request);
         assert_eq!(
-            s.deliver(delivery(4), &[field], Ok).unwrap_err(),
+            s.deliver(g, c, delivery(4), &[field], Ok).unwrap_err(),
             Delivery::Refused(RpcError::new(ErrorKind::VaultLocked))
         );
+    }
+
+    /// F-77, expiry before commit: the values are read and the answer
+    /// framed after the decision, and a grant that runs out meanwhile
+    /// commits nothing. Each case is a `once` grant of 60 seconds, decided
+    /// on and then delivered while the preparation (the `answer` closure
+    /// here, where the daemon reads the values and frames them) moves the
+    /// injected clocks on:
+    /// - to a second before the deadline: delivered, and its entry written
+    ///   (the control);
+    /// - to the deadline on both clocks;
+    /// - to the wall clock's deadline alone (the machine slept: time awake
+    ///   stands still);
+    /// - to the awake deadline alone (the wall clock set back as far):
+    ///
+    /// the last three are [`Delivery::Lapsed`]: no entry, and no value
+    /// given out. The decision the grant was found by is taken before the
+    /// clocks move, so these cases fail against a check on its clocks.
+    ///
+    /// Mutations: no check after the answer is built, or one on clocks
+    /// read before it (the three lapsed cases are delivered); a check of
+    /// the wall clock alone (the awake case is delivered).
+    #[test]
+    fn a_grant_that_runs_out_while_its_answer_is_prepared_commits_nothing() {
+        /// Moves the clocks as a preparation taking that long would.
+        type Prepare = fn(&FakeClocks, Duration);
+        let ttl = Duration::from_secs(60);
+        let cases: [(&str, Prepare, bool); 4] = [
+            (
+                "a second short",
+                |c, ttl| c.run(ttl - Duration::from_secs(1)),
+                true,
+            ),
+            ("both deadlines", |c, ttl| c.run(ttl), false),
+            ("asleep: the wall deadline", |c, ttl| c.sleep(ttl), false),
+            (
+                "the awake deadline, the wall clock set back",
+                |c, ttl| {
+                    let wall = c.wall();
+                    c.run(ttl);
+                    c.set_wall(wall);
+                },
+                false,
+            ),
+        ];
+        for (case, prepare, delivered) in cases {
+            let f = fixture();
+            let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+            create(&f, &mut s);
+            let field = stored_value(&mut s, "a/b", VALUE);
+            let r = request("OPENAI_API_KEY");
+            let g = granted(
+                &f,
+                &mut s,
+                r.clone(),
+                envcloak_policy::ApprovalOptions::once(ttl),
+            );
+            // The decision, on the clocks before the preparation.
+            assert_eq!(
+                s.grants().decide(r, &at(&f.clocks)),
+                envcloak_policy::Decision::Covered(g),
+                "{case}"
+            );
+            let before = entries(&s).len();
+            let mut prepared = false;
+            let got = s.deliver(g, &f.clocks, delivery(1), &[field], |values| {
+                prepare(&f.clocks, ttl);
+                prepared = true;
+                Ok(values)
+            });
+            assert!(prepared, "{case}: the answer was not built");
+            if delivered {
+                let values = got.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                assert!(values[0].ct_eq(VALUE), "{case}: not the item's value");
+                assert_eq!(entries(&s).len(), before + 1, "{case}");
+            } else {
+                assert!(
+                    matches!(got, Err(Delivery::Lapsed)),
+                    "{case}: delivered, or refused otherwise: {:?}",
+                    got.map(|v| v.len())
+                );
+                assert_eq!(entries(&s).len(), before, "{case}: an entry was written");
+            }
+        }
     }
 }
