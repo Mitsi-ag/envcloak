@@ -362,7 +362,8 @@ jobs:
           # such a lookup fails before any query is made for it. Lookups
           # over the resolver's XPC service (Network.framework, URLSession)
           # are not refused: agent_hosts.rs checks that no pinned host
-          # imports one (docs/ACCEPTANCE.md).
+          # imports one, by static imports only (a framework loaded at run
+          # time is not seen; docs/ACCEPTANCE.md).
           sudo chmod +a "group:ecnonet deny write,append" /var/run/mDNSResponder
           /bin/ls -le /var/run/mDNSResponder
       - name: S0 on the release binaries, loopback only (macOS)
@@ -642,7 +643,8 @@ jobs:
       # for it (Codex review, medium: a value in a name could reach external
       # DNS unrecorded). The resolver's XPC service, which Network.framework
       # and URLSession use, is not refused; agent_hosts.rs fails a host
-      # that imports it (docs/ACCEPTANCE.md).
+      # whose files import it, which a framework loaded at run time passes
+      # unseen (docs/ACCEPTANCE.md).
       - name: Loopback only for the tests' group (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -659,7 +661,8 @@ jobs:
           # such a lookup fails before any query is made for it. Lookups
           # over the resolver's XPC service (Network.framework, URLSession)
           # are not refused: agent_hosts.rs checks that no pinned host
-          # imports one (docs/ACCEPTANCE.md).
+          # imports one, by static imports only (a framework loaded at run
+          # time is not seen; docs/ACCEPTANCE.md).
           sudo chmod +a "group:ecnonet deny write,append" /var/run/mDNSResponder
           /bin/ls -le /var/run/mDNSResponder
       - name: Agent hosts, loopback only (macOS)
