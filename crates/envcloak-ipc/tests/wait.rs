@@ -1479,17 +1479,28 @@ fn an_approval_read_after_the_deadline_starts_nothing() {
     assert_eq!(calls(&t), ["request", "poll"]);
 }
 
-/// Once a request was named, a covered answer read after the deadline is
-/// taken only for the request asked again on an approval read in time
-/// (review of M2-03, M2R-14): one asked again after `busy` just before
-/// the deadline may be covered by an approval given after it, and the
-/// wait has timed out. Before any request was named (a grant that covers
-/// the first request), and read by the deadline, a covered answer is the
-/// run's.
+/// A covered answer read after the deadline is taken only as the answer
+/// to the request asked again on its own approval read in time (reviews
+/// of M2-03 and M2-RES1, M2R-14): any other may be covered by an approval
+/// given after the deadline, another waiter's under the same root
+/// included, and the wait has timed out. So: one asked again after `busy`
+/// just before the deadline times out with its request; the first
+/// request, read late with no request named, ends unanswered (its values
+/// dropped unused); one asked while a pending cap was full ends as
+/// `too_many_pending`; and an approval read in time for one request is no
+/// evidence for the request that replaced it. The controls: read by the
+/// deadline, each is the run's, and so is the answer to a request asked
+/// again on its own approval read in time, read late.
 ///
-/// Mutation checked: no check of a covered answer read after the
-/// deadline: the re-asked request's answer starts the command and this
-/// fails.
+/// Mutations checked: no check of a covered answer read after the
+/// deadline (as before M2R-14): the re-asked request's answer starts the
+/// command and this fails. A late covered answer taken whenever no request
+/// is named (as the M2R-14 fix had it): the first and the capped answers
+/// start the command and this fails. The evidence kept for any approval
+/// read in time, whatever request it was for (a flag, as the M2R-14 fix
+/// had it): the replacing request's late answer starts the command and
+/// this fails. The evidence kept when the request is pending again: the
+/// same request's late answer starts the command and this fails.
 #[test]
 fn a_covered_answer_read_after_the_deadline_needs_an_approval_read_in_time() {
     let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
@@ -1514,14 +1525,100 @@ fn a_covered_answer_read_after_the_deadline_needs_an_approval_read_in_time() {
         w.next(ms(1000), Event::Answered(Ok(&covered()))).0,
         Action::Finish(Finish::Decided)
     );
-    // No request named yet: a covered first answer read late is the
-    // run's (the grant was there before this wait opened any request).
+
+    // The first request, read late: nothing names a request, and nothing
+    // shows the grant came before the deadline.
     let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
     w.next(Duration::ZERO, Event::Start);
     assert_eq!(
         w.next(ms(1500), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::Unanswered)
+    );
+    // Read by the deadline, it is the run's.
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    assert_eq!(
+        w.next(ms(1000), Event::Answered(Ok(&covered()))).0,
         Action::Finish(Finish::Decided)
     );
+
+    // Asked while a pending cap was full, read late; an approval read in
+    // time for the request before the cap is no evidence for it.
+    let ClientError::Rpc(cap) = crowded() else {
+        unreachable!()
+    };
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    w.next(ms(250), Event::Woke);
+    assert_eq!(
+        w.next(ms(250), Event::Polled(Ok(PendingState::Approved))).0,
+        Action::Request
+    );
+    w.next(ms(300), Event::Answered(Err(crowded())));
+    assert_eq!(w.next(ms(1000), Event::Woke).0, Action::Request);
+    assert_eq!(
+        w.next(ms(1400), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::TooManyPending(cap))
+    );
+
+    // A request that replaced the one approved in time: the approval was
+    // for the first, not for it.
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    w.next(ms(250), Event::Woke);
+    w.next(ms(250), Event::Polled(Ok(PendingState::Approved)));
+    assert_eq!(
+        w.next(ms(300), Event::Answered(Ok(&pending("JKMNPQRS")))).1,
+        Some(Notice::Pending(id("JKMNPQRS")))
+    );
+    w.next(ms(900), Event::Answered(Err(busy())));
+    assert_eq!(w.next(ms(1000), Event::Woke).0, Action::Request);
+    assert_eq!(
+        w.next(ms(1400), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::TimedOut(id("JKMNPQRS")))
+    );
+
+    // Pending again under the same id after its approval: whatever the
+    // approval was, it does not cover the request now.
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    w.next(ms(250), Event::Woke);
+    w.next(ms(250), Event::Polled(Ok(PendingState::Approved)));
+    w.next(ms(300), Event::Answered(Ok(&pending("ABCDEFGH"))));
+    w.next(ms(900), Event::Answered(Err(busy())));
+    assert_eq!(w.next(ms(1000), Event::Woke).0, Action::Request);
+    assert_eq!(
+        w.next(ms(1400), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::TimedOut(id("ABCDEFGH")))
+    );
+
+    // The control: the request asked again on its own approval read in
+    // time, answered after `busy` and read late, is the run's.
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    w.next(ms(1000), Event::Woke);
+    assert_eq!(
+        w.next(ms(1000), Event::Polled(Ok(PendingState::Approved)))
+            .0,
+        Action::Request
+    );
+    assert_eq!(
+        w.next(ms(1400), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::Decided)
+    );
+
+    // Through the driver: the first request answered covered 1.5 s into a
+    // 1 s wait is dropped, with its value, and nothing starts.
+    let mut t = Scripted::new([Ok(covered_with_a_value())], []);
+    t.delays = VecDeque::from([ms(1500)]);
+    let mut c = t.clock();
+    let got = wait_for_run_with_grace_of(&mut t, &mut c, ms(1000), ms(1000));
+    assert!(matches!(got, Waited::Unanswered), "{got:?}");
+    assert_eq!(calls(&t), ["request"]);
 }
 
 /// [`wait_for_run_with_grace`] on `t` and `c`.

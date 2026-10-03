@@ -42,13 +42,22 @@
 //! `approved` read by the deadline is still asked again then, once: the
 //! approval came within the wait. An `approved` read after the deadline (a
 //! poll the daemon answered late, during the grace) may have come after
-//! it, so the wait has timed out; and once a request was named, a covered
-//! answer read after the deadline is taken only for the request asked
-//! again on such an approval: any other may be covered by an approval
-//! given after the deadline, and the wait has timed out then too (review
-//! of M2-03: the grace is for finishing a run approved within the wait,
-//! never for an approval given during it). A call the daemon did not take
-//! at the deadline ends the wait with that failure. Nothing here reads a terminal or any input: approval
+//! it, so the wait has timed out. A covered answer read after the deadline
+//! is taken only as the answer to the request asked again on an approval
+//! of that same request read by the deadline: that evidence belongs to one
+//! request and is dropped when the request waited on changes (a new
+//! pending request, a full pending cap, `unknown`). Any other covered
+//! answer read late, the first request's included, may be covered by an
+//! approval given after the deadline (another waiter's under the same
+//! root), so the wait has timed out with the request it named, ends at a
+//! full cap as `too_many_pending`, or, having named none, ends
+//! [`Waited::Unanswered`] (reviews of M2-03 and M2-RES1: the grace is for
+//! finishing a run approved within the wait, never for an approval given
+//! during it). The daemon's covered answer does not name the request whose
+//! approval made its grant, so a covered answer to the request asked again
+//! is taken as that approval's; the person approved that very request in
+//! time. A call the daemon did not take at the deadline ends the wait with
+//! that failure. Nothing here reads a terminal or any input: approval
 //! input is never read from the requesting process's terminal.
 //!
 //! **Bounded.** No call of a wait is answered later than its limit, the
@@ -213,6 +222,9 @@ pub enum Finish {
     /// Any other failure of either call, and a call the daemon did not
     /// take at the deadline.
     Failed(ClientError),
+    /// A covered answer read after the deadline with no request named:
+    /// nothing shows it came from an approval given in time.
+    Unanswered,
 }
 
 /// The waiting decision: see the module documentation.
@@ -232,9 +244,13 @@ pub struct Wait {
     crowded: bool,
     /// The daemon has answered a call of this wait.
     answered: bool,
-    /// `approved` was read by the deadline: the request asked again on it
-    /// may be answered covered after the deadline.
-    approved_in_time: bool,
+    /// The request whose `approved` was read by the deadline: the request
+    /// asked again on it may be answered covered after the deadline.
+    /// Dropped whenever the request waited on changes.
+    approved_in_time: Option<PendingId>,
+    /// The pending cap that was full, while no request is named: how the
+    /// wait ends at the deadline then.
+    cap: Option<RpcError>,
 }
 
 /// Whether `e` is the daemon's `kind`.
@@ -290,7 +306,8 @@ impl Wait {
             announced: None,
             crowded: false,
             answered: false,
-            approved_in_time: false,
+            approved_in_time: None,
+            cap: None,
         }
     }
 
@@ -346,21 +363,27 @@ impl Wait {
                 self.request = Some(id);
                 self.ask_again = false;
                 self.announced = Some(id);
+                // Pending again: no approval read so far covers it.
+                self.approved_in_time = None;
+                self.cap = None;
                 if now >= self.deadline {
                     return (Action::Finish(Finish::TimedOut(id)), notice);
                 }
                 (self.pause(now), notice)
             }
-            // Covered after the deadline, for a request named before it,
-            // and not on an approval read in time: the approval may have
+            // Covered after the deadline, other than for the request asked
+            // again on its own approval read in time: the approval may have
             // come after the deadline (see the module documentation).
             Event::Answered(Ok(DecisionView::Covered { .. }))
-                if now > self.deadline && !self.approved_in_time && self.request.is_some() =>
+                if now > self.deadline
+                    && (self.request.is_none() || self.approved_in_time != self.request) =>
             {
-                let id = self
-                    .request
-                    .map_or(Finish::Failed(ClientError::Protocol), Finish::TimedOut);
-                (Action::Finish(id), None)
+                let end = match (self.request, self.cap) {
+                    (Some(id), _) => Finish::TimedOut(id),
+                    (None, Some(r)) => Finish::TooManyPending(r),
+                    (None, None) => Finish::Unanswered,
+                };
+                (Action::Finish(end), None)
             }
             Event::Answered(Ok(_)) => (Action::Finish(Finish::Decided), None),
             Event::Answered(Err(e)) if is_kind(&e, ErrorKind::TooManyPending) => {
@@ -371,6 +394,8 @@ impl Wait {
                 self.crowded = true;
                 self.request = None;
                 self.ask_again = true;
+                self.approved_in_time = None;
+                self.cap = Some(r);
                 if now >= self.deadline {
                     return (Action::Finish(Finish::TooManyPending(r)), notice);
                 }
@@ -423,7 +448,7 @@ impl Wait {
                             return (Action::Finish(Finish::TimedOut(id)), None);
                         }
                         self.ask_again = true;
-                        self.approved_in_time = true;
+                        self.approved_in_time = Some(id);
                         (Action::Request, None)
                     }
                     // Ended in a way this tree is not told: asked again
@@ -433,6 +458,7 @@ impl Wait {
                             return (Action::Finish(Finish::TimedOut(id)), None);
                         }
                         self.ask_again = true;
+                        self.approved_in_time = None;
                         (Action::Request, None)
                     }
                     Ok(PendingState::Denied) => (Action::Finish(Finish::Denied(id)), None),
@@ -479,8 +505,11 @@ pub enum Waited {
     Traced,
     /// The daemon did not answer a call by the wait's limit, the deadline
     /// plus [`CALL_GRACE`]: the call was given up, or its answer, read
-    /// too late, dropped unused with any values it carried. Nothing was
-    /// started.
+    /// too late, dropped unused with any values it carried; or, before
+    /// any request was named, it answered covered after the deadline,
+    /// with nothing to show the approval came in time (see the module
+    /// documentation), and that answer was dropped the same way. Nothing
+    /// was started.
     Unanswered,
 }
 
@@ -682,6 +711,7 @@ pub fn wait_for_run_with_grace(
                     Finish::TimedOut(id) => Ok(Waited::TimedOut(id)),
                     Finish::TooManyPending(r) => Ok(Waited::TooManyPending(r)),
                     Finish::Failed(e) => Err(e),
+                    Finish::Unanswered => Ok(Waited::Unanswered),
                 };
             }
         };
