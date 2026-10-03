@@ -2549,8 +2549,12 @@ fn the_compiler_reads_no_rust_the_reader_does_not() {
 /// (`CARGO_BIN_EXE_<name>`, `CARGO_TARGET_TMPDIR`), which tests use,
 /// pass.
 ///
-/// Mutation checked: the text `include_bytes!` brings in left unread: the
-/// domain in it is not seen and this fails.
+/// A module directory named `target` is read too: only a crate's own
+/// build directory, right under `crates/<name>/`, is left out.
+///
+/// Mutations checked: the text `include_bytes!` brings in left unread: the
+/// domain in it is not seen and this fails. Every directory named `target`
+/// left out, as before: the module's domain is not seen and this fails.
 #[test]
 fn the_statement_domain_reader_reads_what_tests_bring_in() {
     let test_rs = "crates/envcloak-core/tests/zz_domain.rs";
@@ -2565,6 +2569,15 @@ fn the_statement_domain_reader_reads_what_tests_bring_in() {
         &t,
         "crates/envcloak-core/tests/zz.bin",
         &format!("envcloak-zz{}/1\n", "statement"),
+    );
+    assert_fails(&t, "the code has `envcloak-zzstatement/1`");
+    // A module directory named `target` is read: only a crate's own
+    // build directory is left out.
+    let t = fixture();
+    add_file(
+        &t,
+        "crates/envcloak-core/src/target/mod.rs",
+        &format!("pub const D: &[u8] = b\"envcloak-zz{}/1\\n\";\n", "statement"),
     );
     assert_fails(&t, "the code has `envcloak-zzstatement/1`");
     for (body, expect) in [
