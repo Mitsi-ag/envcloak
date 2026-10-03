@@ -230,7 +230,7 @@ impl CreatorKind {
         }
     }
 
-    fn from_u8(v: u8) -> Option<CreatorKind> {
+    pub(crate) fn from_u8(v: u8) -> Option<CreatorKind> {
         CreatorKind::ALL.into_iter().find(|k| *k as u8 == v)
     }
 }

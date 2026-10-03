@@ -12,9 +12,10 @@ mod common;
 use common::{KitFixture, dir_names};
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::file_backup::{
-    BackupFile, FILE_BACKUP_RETENTION, FileBackupId, FileLeft, MAX_BACKUP_BYTES, MAX_BACKUP_FILES,
-    STAGING_GRACE, age_file_backup_for_testing, purge_file_backups,
+    BackupFile, FILE_BACKUP_RETENTION, FileBackupCreator, FileBackupId, FileLeft, MAX_BACKUP_BYTES,
+    MAX_BACKUP_FILES, STAGING_GRACE, age_file_backup_for_testing, purge_file_backups,
 };
+use envcloak_core::file_backup_v2::CreatorKind;
 use envcloak_core::vault::VaultErrorKind;
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_testkit::{assert_no_canary, by_label, labels};
@@ -51,6 +52,15 @@ fn files(f: &KitFixture) -> (Vec<Vec<u8>>, Vec<BackupFile>) {
     (raw, backup)
 }
 
+/// Who the daemon says made a backup: an agent, so a test sees that it
+/// comes back.
+fn creator() -> FileBackupCreator {
+    FileBackupCreator {
+        kind: CreatorKind::Agent,
+        agent: Some("Codex".to_owned()),
+    }
+}
+
 fn only_file(dir: &std::path::Path) -> std::path::PathBuf {
     let names: Vec<String> = dir_names(dir)
         .into_iter()
@@ -64,7 +74,7 @@ fn only_file(dir: &std::path::Path) -> std::path::PathBuf {
 fn a_backup_gives_the_files_back_byte_for_byte_and_holds_ciphertext_only() {
     let (f, v) = KitFixture::create();
     let (raw, backup) = files(&f);
-    let info = v.backup_files(&backup).unwrap();
+    let info = v.backup_files(&backup, &creator()).unwrap();
     assert_eq!(info.files, 2);
     let path = only_file(&f.paths.backups_dir);
     assert_eq!(path.file_name(), info.path.file_name());
@@ -84,6 +94,9 @@ fn a_backup_gives_the_files_back_byte_for_byte_and_holds_ciphertext_only() {
     assert_eq!(dir_names(&f.paths.backups_dir).len(), 1);
 
     let back = v.open_file_backup(&info.id).unwrap();
+    assert_eq!(back.creator, Some(creator()));
+    assert_eq!(v.file_backup_creator(&info.id).unwrap(), Some(creator()));
+    let back = back.files;
     assert_eq!(back.len(), 2);
     for (b, (want, orig)) in back.iter().zip(raw.iter().zip(&backup)) {
         assert!(b.content.ct_eq(want));
@@ -95,14 +108,18 @@ fn a_backup_gives_the_files_back_byte_for_byte_and_holds_ciphertext_only() {
     drop(v);
     let v = f.unlock();
     let id = FileBackupId::parse(&info.id.to_string()).unwrap();
-    assert!(v.open_file_backup(&id).unwrap()[1].content.ct_eq(&raw[1]));
+    assert!(
+        v.open_file_backup(&id).unwrap().files[1]
+            .content
+            .ct_eq(&raw[1])
+    );
 }
 
 #[test]
 fn any_change_to_a_backup_is_refused() {
     let (f, v) = KitFixture::create();
     let (_, backup) = files(&f);
-    let info = v.backup_files(&backup).unwrap();
+    let info = v.backup_files(&backup, &creator()).unwrap();
     let good = std::fs::read(&info.path).unwrap();
     let damaged = |bytes: &[u8]| {
         std::fs::write(&info.path, bytes).unwrap();
@@ -131,14 +148,14 @@ fn any_change_to_a_backup_is_refused() {
     let mut longer = good.clone();
     longer.push(0);
     assert_eq!(damaged(&longer), VaultErrorKind::BackupDamaged);
-    assert_eq!(v.open_file_backup(&info.id).unwrap().len(), 2);
+    assert_eq!(v.open_file_backup(&info.id).unwrap().files.len(), 2);
 }
 
 #[test]
 fn another_vault_cannot_open_a_backup_and_an_unknown_id_is_not_found() {
     let (f, v) = KitFixture::create();
     let (_, backup) = files(&f);
-    let info = v.backup_files(&backup).unwrap();
+    let info = v.backup_files(&backup, &creator()).unwrap();
     let (g, w) = KitFixture::create();
     let copy = g.paths.backups_dir.join(info.path.file_name().unwrap());
     std::fs::create_dir_all(&g.paths.backups_dir).unwrap();
@@ -153,8 +170,8 @@ fn another_vault_cannot_open_a_backup_and_an_unknown_id_is_not_found() {
 fn backups_are_purged_after_seven_days() {
     let (f, v) = KitFixture::create();
     let (_, backup) = files(&f);
-    let old = v.backup_files(&backup).unwrap();
-    let new = v.backup_files(&backup).unwrap();
+    let old = v.backup_files(&backup, &creator()).unwrap();
+    let new = v.backup_files(&backup, &creator()).unwrap();
     let now = old.created_at;
     assert_eq!(purge_file_backups(&f.paths, now).unwrap(), 0);
     let week = FILE_BACKUP_RETENTION.as_secs();
@@ -164,7 +181,7 @@ fn backups_are_purged_after_seven_days() {
     assert_eq!(purge_file_backups(&f.paths, now).unwrap(), 1);
     assert!(!old.path.exists());
     assert!(new.path.exists());
-    assert_eq!(v.open_file_backup(&new.id).unwrap().len(), 2);
+    assert_eq!(v.open_file_backup(&new.id).unwrap().files.len(), 2);
     assert_eq!(
         v.open_file_backup(&old.id).unwrap_err().kind(),
         VaultErrorKind::NotFound
@@ -184,7 +201,7 @@ fn a_backup_has_limits() {
         content: SecretBytes::copy_from(&vec![b'x'; len]),
         left: None,
     };
-    let kind = |files: &[BackupFile]| v.backup_files(files).unwrap_err().kind();
+    let kind = |files: &[BackupFile]| v.backup_files(files, &creator()).unwrap_err().kind();
     assert_eq!(kind(&[]), VaultErrorKind::InvalidRecord);
     assert_eq!(kind(&[one("", 1)]), VaultErrorKind::InvalidRecord);
     assert_eq!(
@@ -200,9 +217,14 @@ fn a_backup_has_limits() {
         VaultErrorKind::TooLarge
     );
     // At the limits it is written; an empty file is kept too.
-    v.backup_files(&[one("/a", MAX_BACKUP_BYTES)]).unwrap();
-    let back = v.backup_files(&[one("/empty", 0)]).unwrap();
-    assert!(v.open_file_backup(&back.id).unwrap()[0].content.is_empty());
+    v.backup_files(&[one("/a", MAX_BACKUP_BYTES)], &creator())
+        .unwrap();
+    let back = v.backup_files(&[one("/empty", 0)], &creator()).unwrap();
+    assert!(
+        v.open_file_backup(&back.id).unwrap().files[0]
+            .content
+            .is_empty()
+    );
 }
 
 #[test]
@@ -238,7 +260,7 @@ fn value_keys_compare_values_without_holding_them() {
 fn staging_files_an_interrupted_backup_left_are_purged() {
     let (f, v) = KitFixture::create();
     let (_, backup) = files(&f);
-    let kept = v.backup_files(&backup).unwrap();
+    let kept = v.backup_files(&backup, &creator()).unwrap();
     let dir = kept.path.parent().unwrap().to_owned();
     let bytes = std::fs::read(&kept.path).unwrap();
     let now = std::time::SystemTime::now();
@@ -271,7 +293,7 @@ fn staging_files_an_interrupted_backup_left_are_purged() {
     assert!(fresh.exists());
     assert!(link.symlink_metadata().is_ok() && target.exists());
     assert!(kept.path.exists());
-    assert_eq!(v.open_file_backup(&kept.id).unwrap().len(), 2);
+    assert_eq!(v.open_file_backup(&kept.id).unwrap().files.len(), 2);
     // A week on, the published backup goes too, and the fresh staging
     // file is old by then.
     let week = FILE_BACKUP_RETENTION.as_secs() + 2 * STAGING_GRACE.as_secs();
@@ -297,8 +319,8 @@ fn a_symlink_in_place_of_backups_or_the_data_directory_is_never_followed() {
     use envcloak_core::vault::{PathErrorKind, Vault, VaultError};
     let (f, v) = KitFixture::create();
     let (_, backup) = files(&f);
-    let old = v.backup_files(&backup).unwrap();
-    let fresh = v.backup_files(&backup).unwrap();
+    let old = v.backup_files(&backup, &creator()).unwrap();
+    let fresh = v.backup_files(&backup, &creator()).unwrap();
     let now = fresh.created_at;
     let week = FILE_BACKUP_RETENTION.as_secs();
     age_file_backup_for_testing(&old.path, now - week - 1).unwrap();
@@ -317,7 +339,10 @@ fn a_symlink_in_place_of_backups_or_the_data_directory_is_never_followed() {
         vec![
             ("purge", kind(purge_file_backups(&f.paths, now).map(drop))),
             ("open", kind(v.open_file_backup(&fresh.id).map(drop))),
-            ("backup", kind(v.backup_files(&backup).map(drop))),
+            (
+                "backup",
+                kind(v.backup_files(&backup, &creator()).map(drop)),
+            ),
         ]
     };
     let refused = |got: Vec<(&str, Option<VaultErrorKind>)>| {
@@ -360,7 +385,7 @@ fn a_symlink_in_place_of_backups_or_the_data_directory_is_never_followed() {
     assert_eq!(purge_file_backups(&f.paths, now).unwrap(), 2);
     assert!(!old.path.exists() && !stale.exists());
     assert_eq!(dir_names(&backups).len(), 1);
-    assert_eq!(v.open_file_backup(&fresh.id).unwrap().len(), 2);
+    assert_eq!(v.open_file_backup(&fresh.id).unwrap().files.len(), 2);
 }
 
 /// A file backup is made durable through `envcloak_sys::sync_file`
@@ -386,7 +411,7 @@ fn a_file_backup_is_flushed_in_order_and_a_failed_flush_fails_its_step() {
     let (_, backup) = files(&f);
     let backups = f.paths.backups_dir.clone();
     record_syncs();
-    let info = v.backup_files(&backup).unwrap();
+    let info = v.backup_files(&backup, &creator()).unwrap();
     assert_eq!(
         take_synced(),
         [
@@ -400,13 +425,13 @@ fn a_file_backup_is_flushed_in_order_and_a_failed_flush_fails_its_step() {
 
     fail_sync_after(2);
     assert!(
-        v.backup_files(&backup).is_err(),
+        v.backup_files(&backup, &creator()).is_err(),
         "the failed flush of a backup's file was unreported"
     );
     assert_eq!(dir_names(&backups).len(), 1, "{:?}", dir_names(&backups));
     fail_sync_after(3);
     assert!(
-        v.backup_files(&backup).is_err(),
+        v.backup_files(&backup, &creator()).is_err(),
         "the failed flush of backups/ was unreported"
     );
     assert_eq!(dir_names(&backups).len(), 2, "the backup linked before");

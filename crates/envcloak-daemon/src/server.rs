@@ -786,7 +786,7 @@ fn respond<'s>(
             answer::<FilesBackup>(id, &req, |p| import::files_backup(shared, peer, p))
         }
         FilesRestore::NAME => {
-            answer::<FilesRestore>(id, &req, |p| import::files_restore(shared, peer, p))
+            framed::<FilesRestore>(id, &req, |p| import::files_restore(shared, peer, id, p))
         }
         RecoveryConfirm::NAME => {
             answer::<RecoveryConfirm>(id, &req, |p| import::recovery_confirm(shared, peer, p))
@@ -833,7 +833,8 @@ fn answer<'a, M: Method>(
 }
 
 /// As [`answer`], for a method that frames its own result: a covered
-/// `run.request` frames its answer before it commits it (F-77).
+/// `run.request` and `files.restore` frame their answer before they
+/// commit it (F-77).
 fn framed<'a, M: Method>(
     id: u64,
     req: &IncomingRequest<'a>,

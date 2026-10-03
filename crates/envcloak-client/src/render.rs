@@ -1207,6 +1207,16 @@ impl Render for UndoReport {
     fn human(&self) -> String {
         let mut o = String::new();
         let _ = writeln!(o, "Backup {}", shown_id(&self.backup));
+        let made = match &self.creator {
+            None => "made by a process EnvCloak did not record".to_owned(),
+            Some(c) => match (c.kind.as_str(), c.agent.as_deref()) {
+                ("terminal", _) => "made from a terminal".to_owned(),
+                ("agent", Some(a)) => format!("made by an agent ({}), not by you", shown(a)),
+                ("agent", None) => "made by an agent, not by you".to_owned(),
+                _ => "made by an unknown process, not by you".to_owned(),
+            },
+        };
+        let _ = writeln!(o, "  {made}");
         for f in &self.files {
             let _ = writeln!(o, "  {}: {}", shown_path(&f.path), path_reason(&f.state));
         }

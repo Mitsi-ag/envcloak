@@ -61,8 +61,16 @@
 //! slot while Argon2id runs. `files.restore` is the one other method that
 //! hands plaintext to a client: it gives back the files the person asked
 //! to put back (`envcloak init --undo`), and like a covered run's
-//! delivery, only after its audit entry is written durably
-//! (`audit_failed` otherwise).
+//! delivery, framed as it will be sent before anything is committed (an
+//! answer larger than one frame is `frame_too_large`, with nothing
+//! audited as restored), and then only after its audit entry is written
+//! durably (`audit_failed` otherwise). `files.backup` seals who made the
+//! backup, as this daemon's evidence classed the caller, never as the
+//! client says; a backup an agent or an unknown process made, or one that
+//! does not record who made it, is restored only with
+//! `created_by_agent_ticked`, refused (`restore_refused`,
+//! `created_by_agent`) before the passphrase is looked at and checked
+//! again on the backup opened after the proof (SPEC §6.4).
 //!
 //! Nothing here answers with a value except `files.restore`, and no error
 //! repeats text a client sent.
@@ -73,7 +81,10 @@ use std::time::Duration;
 
 use envcloak_core::audit::AuditKind;
 use envcloak_core::crypto::{CryptoErrorKind, ItemClass};
-use envcloak_core::file_backup::{BackupFile, FileBackupId, FileLeft, purge_file_backups};
+use envcloak_core::file_backup::{
+    BackupFile, FileBackupCreator, FileBackupId, FileLeft, purge_file_backups,
+};
+use envcloak_core::file_backup_v2::CreatorKind;
 use envcloak_core::vault::{
     Classification, FieldName, ItemDetails, ItemMeta, MAX_FIELD, NewItem, Slug, ValueKey, Vault,
     VaultError, VaultErrorKind,
@@ -84,11 +95,11 @@ use envcloak_ipc::proto::{
     RecoveryConfirmParams, RestoredFile, RestoredFiles, VerifyParams,
 };
 use envcloak_ipc::view::{
-    ClassificationView, EntryStatus, FileBackupView, ImportEntryView, ImportItemView,
-    ImportPlanView, LengthClass, RecoveryConfirmedView, SkipReason, VerifyEntryView,
-    VerifyFileView, VerifyView,
+    ClassificationView, EntryStatus, FileBackupCreatorView, FileBackupView, ImportEntryView,
+    ImportItemView, ImportPlanView, LengthClass, RecoveryConfirmedView, SkipReason,
+    VerifyEntryView, VerifyFileView, VerifyView,
 };
-use envcloak_ipc::{RpcError, WireSecret};
+use envcloak_ipc::{Frame, FrameError, RpcError, WireSecret};
 use envcloak_policy::{
     Binding, EnvName, ManifestError, ProcessInstance, ProfileName, SubjectEvidence, bind_items,
     load_project, resolve,
@@ -98,6 +109,7 @@ use envcloak_sys::PeerIdentity;
 use sha2::{Digest, Sha256};
 
 use crate::audit::AuditEvent;
+use crate::backups::{kind_of, label_of};
 use crate::clock::now_of;
 use crate::items::{DEFAULT_FIELD, DEFAULT_SLUG, looks_like_value};
 use crate::requests::{evidence, refuse_unless_prover, subject_summary};
@@ -965,10 +977,16 @@ pub fn files_backup(
     }
     refuse_if_traced()?;
     let caller = evidence(shared, peer, &p.claims)?;
+    // Who made it, from the evidence read here: any client may store a
+    // backup, and its restore writes these bytes outside the client.
+    let creator = FileBackupCreator {
+        kind: kind_of(&caller),
+        agent: label_of(&caller),
+    };
     let mut s = locked(&shared.state);
     let v = s.unlocked()?;
     let info = v
-        .backup_files(&files)
+        .backup_files(&files, &creator)
         .map_err(|e| files_backup_error(e.kind()))?;
     let now = now_of(&shared.clocks);
     let secs = now
@@ -1067,48 +1085,72 @@ pub(crate) fn prove_as<'s>(
     }
 }
 
-/// `files.restore`.
+/// A file backup that could not be opened, as `files.restore` answers it.
+fn open_backup_error(e: &VaultError) -> RpcError {
+    match e.kind() {
+        VaultErrorKind::NotFound => RpcError::new(ErrorKind::NoSuchBackup),
+        VaultErrorKind::Tampered | VaultErrorKind::ReadOnly => {
+            RpcError::new(ErrorKind::VaultTampered)
+        }
+        _ => RpcError::new(ErrorKind::FilesBackupFailed),
+    }
+}
+
+/// Refuses a file backup an agent or an unknown process made, or one that
+/// does not record who made it, unless the person ticked
+/// `--created-by-agent` (SPEC §6.4): restoring it writes that process's
+/// bytes outside its sandbox.
+fn refuse_unticked(creator: Option<&FileBackupCreator>, ticked: bool) -> Result<(), RpcError> {
+    let by_terminal = creator.is_some_and(|c| c.kind == CreatorKind::Terminal);
+    if by_terminal || ticked {
+        Ok(())
+    } else {
+        Err(RpcError::with_reason(
+            ErrorKind::RestoreRefused,
+            "created_by_agent",
+        ))
+    }
+}
+
+/// `files.restore`, answering request `id` with its result frame, built
+/// here so that the answer is framed before its delivery is audited. See
+/// the module documentation.
 pub fn files_restore(
     shared: &Shared,
     peer: &PeerIdentity,
+    id: u64,
     p: FilesRestoreParams,
-) -> Result<RestoredFiles, RpcError> {
+) -> Result<Frame, RpcError> {
     let pass = p.passphrase.into_inner();
-    let id = FileBackupId::parse(&p.backup).ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
-    let (mut s, caller) = prove(
-        shared,
-        peer,
-        "files.restore",
-        AuditKind::FilesRestore,
-        &p.claims,
-        |v| v.verify_passphrase(&pass),
-    )?;
-    drop(pass);
-    let files = s
+    let backup = FileBackupId::parse(&p.backup).ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
+    refuse_if_traced()?;
+    let caller = evidence(shared, peer, &p.claims)?;
+    refuse_unless_prover(shared, peer, &caller, "files.restore")?;
+    // Who made it, before the passphrase is looked at: a refusal takes no
+    // attempt, and reads no file's bytes.
+    let creator = locked(&shared.state)
         .unlocked()?
-        .open_file_backup(&id)
-        .map_err(|e| match e.kind() {
-            VaultErrorKind::NotFound => RpcError::new(ErrorKind::NoSuchBackup),
-            VaultErrorKind::Tampered | VaultErrorKind::ReadOnly => {
-                RpcError::new(ErrorKind::VaultTampered)
-            }
-            _ => RpcError::new(ErrorKind::FilesBackupFailed),
-        })?;
-    // A delivery: its entry is on disk before any byte is released (SPEC
-    // §3 principle 4, gate 33); when it cannot be written, the files read
-    // are dropped, and wiped, and the call is refused.
-    let entry = AuditEvent::FilesRestored {
-        pid: peer.pid,
-        subject: subject_summary(peer, &caller),
-        backup: id.to_string(),
-        files: files.len(),
-    };
-    if !s.audit_delivery(entry) {
-        drop(files);
-        return Err(RpcError::new(ErrorKind::AuditFailed));
-    }
-    Ok(RestoredFiles {
-        files: files
+        .file_backup_creator(&backup)
+        .map_err(|e| open_backup_error(&e))?;
+    refuse_unticked(creator.as_ref(), p.created_by_agent_ticked)?;
+    let (mut s, caller) = prove_as(shared, peer, caller, AuditKind::FilesRestore, |v| {
+        v.verify_passphrase(&pass)
+    })?;
+    drop(pass);
+    let opened = s
+        .unlocked()?
+        .open_file_backup(&backup)
+        .map_err(|e| open_backup_error(&e))?;
+    // Again on the backup opened: what goes out is what was checked.
+    refuse_unticked(opened.creator.as_ref(), p.created_by_agent_ticked)?;
+    let files = opened.files.len();
+    let answer = RestoredFiles {
+        creator: opened.creator.map(|c| FileBackupCreatorView {
+            kind: c.kind.as_str().to_owned(),
+            agent: c.agent,
+        }),
+        files: opened
+            .files
             .into_iter()
             .map(|f| RestoredFile {
                 path: f.path,
@@ -1117,7 +1159,29 @@ pub fn files_restore(
                 left: f.left.map(left_view),
             })
             .collect(),
-    })
+    };
+    // Framed as it will be sent before anything is committed (F-77's
+    // order): one larger than a frame releases nothing and is not
+    // recorded as restored.
+    let frame = proto::result_frame(id, &answer).map_err(|e| match e {
+        FrameError::TooLarge => RpcError::new(ErrorKind::FrameTooLarge),
+        _ => RpcError::new(ErrorKind::Internal),
+    })?;
+    drop(answer);
+    // A delivery: its entry is on disk before any byte is released (SPEC
+    // §3 principle 4, gate 33); when it cannot be written, the frame is
+    // dropped, and wiped, and the call is refused.
+    let entry = AuditEvent::FilesRestored {
+        pid: peer.pid,
+        subject: subject_summary(peer, &caller),
+        backup: backup.to_string(),
+        files,
+    };
+    if !s.audit_delivery(entry) {
+        drop(frame);
+        return Err(RpcError::new(ErrorKind::AuditFailed));
+    }
+    Ok(frame)
 }
 
 /// `recovery.confirm`.
@@ -1173,6 +1237,38 @@ mod tests {
             files_backup_error(VaultErrorKind::InvalidRecord).kind,
             ErrorKind::InvalidParams
         );
+    }
+
+    /// Only a backup the daemon recorded as a terminal's restores
+    /// unticked: one an agent or an unknown process made, and one that
+    /// does not record who made it (made before that was recorded), need
+    /// `--created-by-agent`. Ticked, each restores.
+    ///
+    /// Mutation: a backup that records no creator taken as a terminal's
+    /// (its unticked restore is let through).
+    #[test]
+    fn only_a_terminals_backup_restores_unticked() {
+        let made = |kind| Some(FileBackupCreator { kind, agent: None });
+        let refused = Err(RpcError::with_reason(
+            ErrorKind::RestoreRefused,
+            "created_by_agent",
+        ));
+        assert_eq!(
+            refuse_unticked(made(CreatorKind::Terminal).as_ref(), false),
+            Ok(())
+        );
+        for creator in [made(CreatorKind::Agent), made(CreatorKind::Unknown), None] {
+            assert_eq!(
+                refuse_unticked(creator.as_ref(), false),
+                refused,
+                "{creator:?}"
+            );
+            assert_eq!(
+                refuse_unticked(creator.as_ref(), true),
+                Ok(()),
+                "{creator:?}"
+            );
+        }
     }
 
     #[test]

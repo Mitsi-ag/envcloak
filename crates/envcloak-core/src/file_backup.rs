@@ -9,10 +9,13 @@
 //! - record 0: a fresh 256-bit key for this backup alone, sealed under
 //!   the vault's `backup` subkey;
 //! - record 1: a manifest sealed under that key: the SHA-256 of the
-//!   header, and each file's path, mode and length, and what the deletion
-//!   leaves of it ([`FileLeft`]: removed, or rewritten to bytes of a
-//!   SHA-256 the manifest holds), so `envcloak init --undo` writes the
-//!   original back over exactly that and nothing else (F-78);
+//!   header, who made the backup as the daemon's evidence classed the
+//!   caller ([`FileBackupCreator`]: never taken from the client, so `init
+//!   --undo` restores one an agent or an unknown process made only when
+//!   the person ticks it), and each file's path, mode and length, and
+//!   what the deletion leaves of it ([`FileLeft`]: removed, or rewritten
+//!   to bytes of a SHA-256 the manifest holds), so `envcloak init --undo`
+//!   writes the original back over exactly that and nothing else (F-78);
 //! - records 2 and up: each file's bytes, sealed under that key.
 //!
 //! Every record is XChaCha20-Poly1305, bound by its associated data to the
@@ -24,7 +27,9 @@
 //! linked into place.
 //!
 //! [`Vault::open_file_backup`] returns the files as they were, byte for
-//! byte (`envcloak init --undo`). [`purge_file_backups`] removes backups
+//! byte, and who made the backup (`envcloak init --undo`);
+//! [`Vault::file_backup_creator`] reads who made it alone, without a
+//! file's bytes. [`purge_file_backups`] removes backups
 //! older than [`FILE_BACKUP_RETENTION`], by the time in their header, and
 //! the staging files interrupted writes left
 //! (`.files-<time>-<id>.ecfiles.tmp`, unchanged for [`STAGING_GRACE`]).
@@ -47,6 +52,7 @@ use crate::crypto::{
     Aad, FieldTag, ItemClass, Purpose, Sealed, SubKey, TableTag, fill_random_or_panic, open_subkey,
     seal_subkey,
 };
+use crate::file_backup_v2::{CreatorKind, MAX_LABEL_V2};
 use crate::secret::SecretBytes;
 use crate::vault::{
     Vault, VaultError, VaultErrorKind, VaultPaths, open_private_child, open_record, open_value,
@@ -71,10 +77,12 @@ pub const MAX_BACKUP_PATH: usize = 4096;
 
 const MAGIC: [u8; 4] = *b"ECFB";
 const FORMAT_VERSION: u8 = 1;
-/// The manifest's version: 2 records what the deletion leaves of each
-/// file; 1, which backups made before it hold, does not.
+/// The manifest's version: 2 records who made the backup and what the
+/// deletion leaves of each file; 1, which backups made before it hold,
+/// records neither.
 const MANIFEST_VERSION: u8 = 2;
-/// The manifest's version before [`FileLeft`] was recorded: still read.
+/// The manifest's version before [`FileBackupCreator`] and [`FileLeft`]
+/// were recorded: still read.
 const MANIFEST_V1: u8 = 1;
 /// `magic(4) version(1) vault_id(16) schema_version(2) epoch(4)
 /// backup_id(16) created_at(8)`.
@@ -141,6 +149,29 @@ pub enum FileLeft {
     Removed,
     /// The file is rewritten to bytes with this SHA-256.
     Rewritten([u8; 32]),
+}
+
+/// Who made a backup, as the daemon's evidence classed the caller of
+/// `files.backup` (SPEC §6.4): sealed in the manifest by the daemon, never
+/// taken from the client. Any client may store a backup, an agent
+/// included, and `init --undo` writes its bytes outside that client's
+/// sandbox, so the person is told who made it and restores one an agent
+/// or an unknown process made only when they tick it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBackupCreator {
+    pub kind: CreatorKind,
+    /// The agent's display name, when one is involved: at most
+    /// [`MAX_LABEL_V2`] bytes.
+    pub agent: Option<String>,
+}
+
+/// A backup [`Vault::open_file_backup`] opened.
+#[derive(Debug)]
+pub struct OpenedFileBackup {
+    /// Who made it; `None` for a backup that does not record it (one made
+    /// before it was recorded, manifest version 1).
+    pub creator: Option<FileBackupCreator>,
+    pub files: Vec<BackupFile>,
 }
 
 /// One file in a backup.
@@ -258,13 +289,33 @@ fn parse_header(h: &[u8; HEADER_LEN]) -> Result<Header, VaultError> {
     })
 }
 
-/// The manifest: the header's hash and each file's path, mode and length,
-/// and what the deletion leaves of it.
-fn encode_manifest(header: &[u8], files: &[BackupFile]) -> Result<Vec<u8>, VaultError> {
+/// The manifest: the header's hash, who made the backup, and each file's
+/// path, mode and length, and what the deletion leaves of it.
+fn encode_manifest(
+    header: &[u8],
+    creator: &FileBackupCreator,
+    files: &[BackupFile],
+) -> Result<Vec<u8>, VaultError> {
     let too_large = || VaultError::from(VaultErrorKind::TooLarge);
     let mut m = Vec::new();
     m.push(MANIFEST_VERSION);
     m.extend_from_slice(&Sha256::digest(header));
+    m.push(creator.kind as u8);
+    match &creator.agent {
+        None => m.push(0),
+        Some(a) => {
+            if a.len() > MAX_LABEL_V2 {
+                return Err(VaultErrorKind::InvalidRecord.into());
+            }
+            m.push(1);
+            m.extend_from_slice(
+                &u16::try_from(a.len())
+                    .map_err(|_| too_large())?
+                    .to_be_bytes(),
+            );
+            m.extend_from_slice(a.as_bytes());
+        }
+    }
     m.extend_from_slice(
         &u32::try_from(files.len())
             .map_err(|_| too_large())?
@@ -298,6 +349,25 @@ const LEFT_REWRITTEN: u8 = 2;
 /// One manifest entry: path, mode, length and what is left.
 type Entry = (String, u32, usize, Option<FileLeft>);
 
+/// A backup opened up to its manifest ([`Vault::open_manifest`]).
+struct OpenedManifest {
+    /// At the first file record.
+    reader: BufReader<File>,
+    /// The backup's own key.
+    key: SubKey,
+    ctx: Ctx,
+    manifest: Manifest,
+}
+
+/// A decoded manifest: the header's hash, who made the backup (`None` in
+/// version 1) and the entries.
+#[derive(Debug)]
+struct Manifest {
+    hash: [u8; 32],
+    creator: Option<FileBackupCreator>,
+    entries: Vec<Entry>,
+}
+
 /// Reads fixed-size pieces off the front of a slice.
 struct Take<'a>(&'a [u8]);
 
@@ -318,7 +388,7 @@ impl<'a> Take<'a> {
     }
 }
 
-fn decode_manifest(b: &[u8]) -> Result<([u8; 32], Vec<Entry>), VaultError> {
+fn decode_manifest(b: &[u8]) -> Result<Manifest, VaultError> {
     let damaged = || VaultError::from(VaultErrorKind::BackupDamaged);
     let mut r = Take(b);
     let [version] = r.array::<1>()?;
@@ -326,6 +396,25 @@ fn decode_manifest(b: &[u8]) -> Result<([u8; 32], Vec<Entry>), VaultError> {
         return Err(damaged());
     }
     let hash = r.array::<32>()?;
+    let creator = if version == MANIFEST_V1 {
+        None
+    } else {
+        let [kind] = r.array::<1>()?;
+        let kind = CreatorKind::from_u8(kind).ok_or_else(damaged)?;
+        let agent = match r.array::<1>()? {
+            [0] => None,
+            [1] => {
+                let len = usize::from(u16::from_be_bytes(r.array()?));
+                if len > MAX_LABEL_V2 {
+                    return Err(damaged());
+                }
+                let a = std::str::from_utf8(r.bytes(len)?).map_err(|_| damaged())?;
+                Some(a.to_owned())
+            }
+            _ => return Err(damaged()),
+        };
+        Some(FileBackupCreator { kind, agent })
+    };
     let count = usize::try_from(u32::from_be_bytes(r.array()?)).map_err(|_| damaged())?;
     if count == 0 || count > MAX_BACKUP_FILES {
         return Err(damaged());
@@ -358,7 +447,11 @@ fn decode_manifest(b: &[u8]) -> Result<([u8; 32], Vec<Entry>), VaultError> {
     if !r.0.is_empty() {
         return Err(damaged());
     }
-    Ok((hash, out))
+    Ok(Manifest {
+        hash,
+        creator,
+        entries: out,
+    })
 }
 
 fn write_record(w: &mut impl Write, sealed: &[u8]) -> Result<(), VaultError> {
@@ -409,16 +502,21 @@ fn file_name(id: &FileBackupId, created_at: u64) -> String {
 }
 
 impl Vault {
-    /// Writes an encrypted backup of `files` to the `backups` directory
-    /// and returns it once it is on disk. See the module documentation.
+    /// Writes an encrypted backup of `files`, made by `creator`, to the
+    /// `backups` directory and returns it once it is on disk. See the
+    /// module documentation.
     ///
     /// Refused with [`VaultErrorKind::Tampered`] unless the vault verified,
-    /// with [`VaultErrorKind::InvalidRecord`] for no files or a path that
-    /// is empty or over [`MAX_BACKUP_PATH`], and with
-    /// [`VaultErrorKind::TooLarge`] beyond [`MAX_BACKUP_FILES`] or
-    /// [`MAX_BACKUP_BYTES`].
-    pub fn backup_files(&self, files: &[BackupFile]) -> Result<FileBackupInfo, VaultError> {
-        self.backup_files_observed(files, &mut || {})
+    /// with [`VaultErrorKind::InvalidRecord`] for no files, a path that is
+    /// empty or over [`MAX_BACKUP_PATH`] or an agent label over
+    /// [`MAX_LABEL_V2`], and with [`VaultErrorKind::TooLarge`] beyond
+    /// [`MAX_BACKUP_FILES`] or [`MAX_BACKUP_BYTES`].
+    pub fn backup_files(
+        &self,
+        files: &[BackupFile],
+        creator: &FileBackupCreator,
+    ) -> Result<FileBackupInfo, VaultError> {
+        self.backup_files_observed(files, creator, &mut || {})
     }
 
     /// [`Vault::backup_files`], calling `written` once the new file is
@@ -440,6 +538,7 @@ impl Vault {
     fn backup_files_observed(
         &self,
         files: &[BackupFile],
+        creator: &FileBackupCreator,
         written: &mut dyn FnMut(),
     ) -> Result<FileBackupInfo, VaultError> {
         self.header()?;
@@ -463,12 +562,11 @@ impl Vault {
         let created_at = now_secs();
         let id = FileBackupId::generate();
         let ctx = Ctx::of(self, id, created_at);
-        let head = ctx.header();
         let key = SubKey::random(Purpose::Backup);
         let name = file_name(&id, created_at);
         let tmp = format!(".{name}.tmp");
         let (name_os, tmp_os) = (OsStr::new(&name), OsStr::new(&tmp));
-        let made = self.write_files(&dir, tmp_os, &head, &ctx, &key, files);
+        let made = self.write_files(&dir, tmp_os, &ctx, &key, creator, files);
         let linked = made.and_then(|(file, wrote)| {
             written();
             link_beneath(&dir, tmp_os, name_os)?;
@@ -506,17 +604,18 @@ impl Vault {
         &self,
         dir: &File,
         tmp: &OsStr,
-        head: &[u8],
         ctx: &Ctx,
         key: &SubKey,
+        creator: &FileBackupCreator,
         files: &[BackupFile],
     ) -> Result<(File, Written), VaultError> {
         let file = create_beneath(dir, tmp, 0o600)?;
         let mut w = BufWriter::new(Counted::new(file));
-        w.write_all(head)?;
+        let head = ctx.header();
+        w.write_all(&head)?;
         let wrapped = seal_subkey(self.keys().key(Purpose::Backup), &ctx.aad(0), key)?;
         write_record(&mut w, &wrapped.to_bytes())?;
-        let manifest = encode_manifest(head, files)?;
+        let manifest = encode_manifest(&head, creator, files)?;
         write_record(&mut w, &seal_record(key, &ctx.aad(1), &manifest)?)?;
         for (i, f) in files.iter().enumerate() {
             let sealed = seal_value(key, &ctx.aad(i as u64 + 2), &f.content)?;
@@ -530,12 +629,60 @@ impl Vault {
         Ok((file, written))
     }
 
+    /// Who made backup `id`, read from its sealed manifest without
+    /// opening a file's bytes: for a check before a proof. `None` for a
+    /// backup that does not record it. Fails as
+    /// [`Vault::open_file_backup`], except that a file record past the
+    /// manifest is not read.
+    pub fn file_backup_creator(
+        &self,
+        id: &FileBackupId,
+    ) -> Result<Option<FileBackupCreator>, VaultError> {
+        Ok(self.open_manifest(id)?.manifest.creator)
+    }
+
     /// The files of backup `id`, byte for byte, with their paths and
-    /// modes. Fails with [`VaultErrorKind::NotFound`] when no backup has
-    /// that id (or it was purged), and with
+    /// modes, and who made it. Fails with [`VaultErrorKind::NotFound`]
+    /// when no backup has that id (or it was purged), and with
     /// [`VaultErrorKind::BackupDamaged`] when the file was altered,
     /// truncated or extended, or belongs to another vault.
-    pub fn open_file_backup(&self, id: &FileBackupId) -> Result<Vec<BackupFile>, VaultError> {
+    pub fn open_file_backup(&self, id: &FileBackupId) -> Result<OpenedFileBackup, VaultError> {
+        let OpenedManifest {
+            reader: mut r,
+            key,
+            ctx,
+            manifest,
+        } = self.open_manifest(id)?;
+        let damaged = || VaultError::from(VaultErrorKind::BackupDamaged);
+        let mut out = Vec::with_capacity(manifest.entries.len());
+        for (i, (path, mode, size, left)) in manifest.entries.into_iter().enumerate() {
+            let sealed = read_record(&mut r)?;
+            let content =
+                open_value(&key, &ctx.aad(i as u64 + 2), &sealed).map_err(|_| damaged())?;
+            if content.len() != size {
+                return Err(damaged());
+            }
+            out.push(BackupFile {
+                path,
+                mode,
+                content,
+                left,
+            });
+        }
+        // Nothing may follow the last record.
+        let mut extra = [0u8; 1];
+        if r.read(&mut extra)? != 0 {
+            return Err(damaged());
+        }
+        Ok(OpenedFileBackup {
+            creator: manifest.creator,
+            files: out,
+        })
+    }
+
+    /// Opens backup `id` up to its manifest, checked against the header it
+    /// was read with.
+    fn open_manifest(&self, id: &FileBackupId) -> Result<OpenedManifest, VaultError> {
         self.header()?;
         let dir = open_private_child(&self.paths().backups_dir)?.ok_or(VaultErrorKind::NotFound)?;
         let name =
@@ -566,33 +713,18 @@ impl Vault {
         )
         .map_err(|_| damaged())?;
         let manifest = read_record(&mut r)?;
-        let (hash, entries) =
+        let manifest =
             open_record(&key, &ctx.aad(1), &manifest, decode_manifest).map_err(|_| damaged())?;
         let want: [u8; 32] = Sha256::digest(head).into();
-        if !bool::from(hash.ct_eq(&want)) {
+        if !bool::from(manifest.hash.ct_eq(&want)) {
             return Err(damaged());
         }
-        let mut out = Vec::with_capacity(entries.len());
-        for (i, (path, mode, size, left)) in entries.into_iter().enumerate() {
-            let sealed = read_record(&mut r)?;
-            let content =
-                open_value(&key, &ctx.aad(i as u64 + 2), &sealed).map_err(|_| damaged())?;
-            if content.len() != size {
-                return Err(damaged());
-            }
-            out.push(BackupFile {
-                path,
-                mode,
-                content,
-                left,
-            });
-        }
-        // Nothing may follow the last record.
-        let mut extra = [0u8; 1];
-        if r.read(&mut extra)? != 0 {
-            return Err(damaged());
-        }
-        Ok(out)
+        Ok(OpenedManifest {
+            reader: r,
+            key,
+            ctx,
+            manifest,
+        })
     }
 }
 
@@ -782,11 +914,20 @@ mod tests {
         assert_eq!(h.created_at, 1_790_000_000);
     }
 
+    /// A terminal subject, as the daemon seals one.
+    fn terminal() -> FileBackupCreator {
+        FileBackupCreator {
+            kind: CreatorKind::Terminal,
+            agent: None,
+        }
+    }
+
     /// F-78: the manifest records what the deletion leaves of each file
     /// (removed, rewritten with the SHA-256 of what is left, or not
     /// recorded) and reads each back; a version 1 manifest, as a backup
-    /// made before this holds, reads as not recording it; an unknown kind,
-    /// a SHA-256 cut short and an unknown version are damage.
+    /// made before this holds, reads as not recording it (nor who made
+    /// it); an unknown kind, a SHA-256 cut short and an unknown version
+    /// are damage.
     #[test]
     fn a_manifest_records_what_the_deletion_leaves() {
         let file = |left| BackupFile {
@@ -801,29 +942,38 @@ mod tests {
             None,
         ];
         let files = kinds.map(file);
-        let m = encode_manifest(b"header", &files).unwrap();
+        let m = encode_manifest(b"header", &terminal(), &files).unwrap();
         assert_eq!(m[0], MANIFEST_VERSION);
-        let (_, entries) = decode_manifest(&m).unwrap();
-        let left: Vec<Option<FileLeft>> = entries.iter().map(|e| e.3).collect();
+        let got = decode_manifest(&m).unwrap();
+        let left: Vec<Option<FileLeft>> = got.entries.iter().map(|e| e.3).collect();
         assert_eq!(left, kinds);
-        // The same entries in version 1, without the byte.
+        assert_eq!(got.creator, Some(terminal()));
+        // The same entries in version 1, without the creator (two bytes
+        // after the hash for a terminal: its kind, no agent) or the byte.
         let mut v1 = vec![MANIFEST_V1];
-        v1.extend_from_slice(&m[1..37]);
+        v1.extend_from_slice(&m[1..33]);
+        v1.extend_from_slice(&m[35..39]);
         for _ in 0..3 {
             v1.extend_from_slice(&7u16.to_be_bytes());
             v1.extend_from_slice(b"/p/.env");
             v1.extend_from_slice(&0o600u32.to_be_bytes());
             v1.extend_from_slice(&4u32.to_be_bytes());
         }
-        let (_, entries) = decode_manifest(&v1).unwrap();
-        assert!(entries.iter().all(|e| e.3.is_none() && e.2 == 4));
+        let old = decode_manifest(&v1).unwrap();
+        assert!(old.entries.iter().all(|e| e.3.is_none() && e.2 == 4));
+        assert_eq!(old.creator, None);
         // Damage: a kind byte no version has, a SHA-256 cut short, and a
         // version 1 manifest carrying a kind byte.
-        let at = 37 + 2 + 7 + 4 + 4;
+        let at = 39 + 2 + 7 + 4 + 4;
         let mut bad = m.clone();
         bad[at] = 3;
         assert!(decode_manifest(&bad).is_err());
-        let one = encode_manifest(b"header", &[file(Some(FileLeft::Rewritten([9; 32])))]).unwrap();
+        let one = encode_manifest(
+            b"header",
+            &terminal(),
+            &[file(Some(FileLeft::Rewritten([9; 32])))],
+        )
+        .unwrap();
         assert!(decode_manifest(&one[..one.len() - 1]).is_err());
         let mut v1_extra = v1.clone();
         v1_extra.push(LEFT_REMOVED);
@@ -841,16 +991,61 @@ mod tests {
             content: SecretBytes::copy_from(b"A=1\n"),
             left: None,
         }];
-        let m = encode_manifest(b"header", &files).unwrap();
-        let (hash, entries) = decode_manifest(&m).unwrap();
-        assert_eq!(hash, <[u8; 32]>::from(Sha256::digest(b"header")));
-        assert_eq!(entries, [("/p/.env".to_owned(), 0o600, 4, None)]);
+        let m = encode_manifest(b"header", &terminal(), &files).unwrap();
+        let got = decode_manifest(&m).unwrap();
+        assert_eq!(got.hash, <[u8; 32]>::from(Sha256::digest(b"header")));
+        assert_eq!(got.entries, [("/p/.env".to_owned(), 0o600, 4, None)]);
         for cut in 0..m.len() {
             assert!(decode_manifest(&m[..cut]).is_err(), "{cut}");
         }
         let mut longer = m.clone();
         longer.push(0);
         assert!(decode_manifest(&longer).is_err());
+    }
+
+    /// Who made a backup is sealed in its manifest and read back as it
+    /// was: each kind, with and without an agent's label (one of the
+    /// longest a label may be among them); a kind no creator has, a label
+    /// flag other than 0 or 1, a label over the bound or not UTF-8 is
+    /// damage, and one over the bound is not written.
+    #[test]
+    fn a_manifest_records_who_made_the_backup() {
+        let files = [BackupFile {
+            path: "/p/.env".into(),
+            mode: 0o600,
+            content: SecretBytes::copy_from(b"A=1\n"),
+            left: Some(FileLeft::Removed),
+        }];
+        for kind in CreatorKind::ALL {
+            for agent in [None, Some("Codex".to_owned()), Some("é".repeat(128))] {
+                let creator = FileBackupCreator { kind, agent };
+                let m = encode_manifest(b"header", &creator, &files).unwrap();
+                assert_eq!(decode_manifest(&m).unwrap().creator, Some(creator));
+            }
+        }
+        let codex = FileBackupCreator {
+            kind: CreatorKind::Agent,
+            agent: Some("Codex".to_owned()),
+        };
+        let m = encode_manifest(b"header", &codex, &files).unwrap();
+        // The kind after the hash, then the label's flag, length and bytes:
+        // kinds 0 and 4, flag 2, a length of 261 and a byte that is not
+        // UTF-8.
+        for (at, byte) in [(33, 0), (33, 4), (34, 2), (35, 1), (37, 0xff)] {
+            let mut bad = m.clone();
+            bad[at] = byte;
+            assert!(decode_manifest(&bad).is_err(), "{at}: {byte}");
+        }
+        let long = FileBackupCreator {
+            kind: CreatorKind::Agent,
+            agent: Some("a".repeat(MAX_LABEL_V2 + 1)),
+        };
+        assert_eq!(
+            encode_manifest(b"header", &long, &files)
+                .unwrap_err()
+                .kind(),
+            VaultErrorKind::InvalidRecord
+        );
     }
 
     /// A backup is answered as written only when its name holds the file
@@ -881,7 +1076,7 @@ mod tests {
             }];
             let backups = paths.backups_dir.clone();
             let mut did = 0;
-            let e = v.backup_files_observed(&files, &mut || {
+            let e = v.backup_files_observed(&files, &terminal(), &mut || {
                 let temp = std::fs::read_dir(&backups)
                     .unwrap()
                     .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -945,7 +1140,7 @@ mod tests {
             }];
             let backups = paths.backups_dir.clone();
             let mut did = 0;
-            let got = v.backup_files_observed(&files, &mut || {
+            let got = v.backup_files_observed(&files, &terminal(), &mut || {
                 let temp = std::fs::read_dir(&backups)
                     .unwrap()
                     .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -973,7 +1168,7 @@ mod tests {
             assert_eq!(did, 1, "{how}");
             if how == "untouched" {
                 let info = got.unwrap();
-                assert_eq!(v.open_file_backup(&info.id).unwrap().len(), 1);
+                assert_eq!(v.open_file_backup(&info.id).unwrap().files.len(), 1);
                 continue;
             }
             assert_eq!(
@@ -1024,7 +1219,7 @@ mod tests {
             std::fs::write(&other, b"not a backup").unwrap();
             std::fs::rename(&other, backups.join(name)).unwrap();
         });
-        let got = v.backup_files_observed(&files, &mut || {});
+        let got = v.backup_files_observed(&files, &terminal(), &mut || {});
         crate::written::tests::clear_during_read();
         assert_eq!(
             got.map(drop).map_err(|e| e.kind()),

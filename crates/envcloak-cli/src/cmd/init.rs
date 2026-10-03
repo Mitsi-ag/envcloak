@@ -82,7 +82,7 @@ use super::import::{ReadFile, edit_gitignore, import, project_name, report, scan
 use super::{fd_number, require_unlocked};
 
 const USAGE_TEXT: &str = "envcloak init [--import] [--yes] [--delete-plaintext] [--json]
-       envcloak init --undo <ID> [--passphrase-fd N] [--json]";
+       envcloak init --undo <ID> [--created-by-agent] [--passphrase-fd N] [--json]";
 
 /// The parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -91,6 +91,9 @@ struct InitArgs {
     yes: bool,
     delete: bool,
     undo: Option<String>,
+    /// `--created-by-agent`: the backup may be one an agent or an unknown
+    /// process made.
+    created_by_agent: bool,
     passphrase_fd: Option<i32>,
     json: bool,
 }
@@ -105,6 +108,7 @@ fn parse(args: &[&str]) -> Option<InitArgs> {
             "--delete-plaintext" if !a.delete => a.delete = true,
             "--json" if !a.json => a.json = true,
             "--undo" if a.undo.is_none() => a.undo = Some((*it.next()?).to_owned()),
+            "--created-by-agent" if !a.created_by_agent => a.created_by_agent = true,
             "--passphrase-fd" if a.passphrase_fd.is_none() => {
                 a.passphrase_fd = Some(fd_number(it.next()?)?);
             }
@@ -112,7 +116,7 @@ fn parse(args: &[&str]) -> Option<InitArgs> {
         }
     }
     let undo_only = a.undo.is_some() && !a.import && !a.yes && !a.delete;
-    let no_undo = a.undo.is_none() && a.passphrase_fd.is_none();
+    let no_undo = a.undo.is_none() && a.passphrase_fd.is_none() && !a.created_by_agent;
     (undo_only || no_undo).then_some(a)
 }
 
@@ -636,12 +640,18 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
     let project = open_root(&dir)
         .map_err(|_| Failure::new("io", "the project directory could not be opened"))?;
     require_unlocked(&mut connect()?)?;
-    let statement = format!(
+    let mut statement = format!(
         "Write back the env files of backup {id} into {}. They hold plaintext secrets; a file \
          there now is replaced only when it is exactly what the deletion left of it, any other \
          is left alone, and nothing is written anywhere else.\n",
         escape_for_display(&project.path().to_string_lossy())
     );
+    if a.created_by_agent {
+        statement.push_str(
+            "--created-by-agent: this backup may have been made by an agent or another process, \
+             not by you, and its bytes are written back as that process stored them.\n",
+        );
+    }
     let passphrase = match a.passphrase_fd {
         Some(fd) => {
             eprint!("{statement}");
@@ -659,9 +669,10 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
             t.read_secret("Vault passphrase to write them back: ")?
         }
     };
-    let restored = connect()?.files_restore(id, passphrase, &claims_now)?;
+    let restored = connect()?.files_restore(id, passphrase, a.created_by_agent, &claims_now)?;
     let mut report = UndoReport {
         backup: id.to_owned(),
+        creator: restored.creator,
         files: Vec::new(),
     };
     for f in restored.files {
@@ -773,10 +784,16 @@ mod tests {
         let a = parse(&["--undo", "ID", "--passphrase-fd", "3"]).unwrap();
         assert_eq!(a.undo.as_deref(), Some("ID"));
         assert_eq!(a.passphrase_fd, Some(3));
+        assert!(!a.created_by_agent);
+        let a = parse(&["--undo", "ID", "--created-by-agent"]).unwrap();
+        assert!(a.created_by_agent);
         for bad in [
             &["--undo"][..],
             &["--undo", "a", "--import"],
             &["--passphrase-fd", "3"],
+            &["--created-by-agent"],
+            &["--import", "--created-by-agent"],
+            &["--undo", "a", "--created-by-agent", "--created-by-agent"],
             &["--import", "--import"],
             &["--value", "x"],
             &["somewhere"],

@@ -708,7 +708,8 @@ impl Client {
     }
 
     /// `files.restore`: the files of backup `id`, with the passphrase as
-    /// the proof.
+    /// the proof; `created_by_agent_ticked` when the person ticked
+    /// `--created-by-agent`.
     ///
     /// # Errors
     /// As [`Client::call`].
@@ -716,11 +717,13 @@ impl Client {
         &mut self,
         id: &str,
         passphrase: SecretBytes,
+        created_by_agent_ticked: bool,
         claims: &[String],
     ) -> Result<RestoredFiles, ClientError> {
         self.call::<FilesRestore>(&FilesRestoreParams {
             backup: id.to_owned(),
             passphrase: WireSecret::new(passphrase),
+            created_by_agent_ticked,
             claims: claims.to_vec(),
         })
     }

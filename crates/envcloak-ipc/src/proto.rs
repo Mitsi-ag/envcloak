@@ -29,9 +29,10 @@ use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, BackupBegunView, BackupCommittedView, BackupListView,
     BackupPutView, BackupResultView, BackupView, CheckView, CreatedView, DecisionView, DeniedView,
-    FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView, LockedView, PendingListView,
-    PendingStateView, RecoveredView, RecoveryConfirmedView, RemovedView, RestoreFileView,
-    RestoreLeaseView, RevokedView, RotatedView, StatusView, TargetView, UnlockedView, VerifyView,
+    FileBackupCreatorView, FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView,
+    LockedView, PendingListView, PendingStateView, RecoveredView, RecoveryConfirmedView,
+    RemovedView, RestoreFileView, RestoreLeaseView, RevokedView, RotatedView, StatusView,
+    TargetView, UnlockedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -800,7 +801,10 @@ pub enum FileLeft {
 /// `files.restore`: the files of a backup, byte for byte, for `envcloak
 /// init --undo`, which writes them back. It hands plaintext to the
 /// client, so it is a proof: the passphrase, from a terminal subject
-/// (SPEC §10b), as `items.rotate` is.
+/// (SPEC §10b), as `items.rotate` is. A backup an agent or an unknown
+/// process made, or one that does not record who made it, comes back only
+/// with `created_by_agent_ticked`, refused before the passphrase is looked
+/// at, as `backup.v2.open_restore` refuses one (SPEC §6.4).
 #[derive(Debug)]
 pub struct FilesRestore;
 
@@ -816,15 +820,24 @@ pub struct FilesRestoreParams {
     /// The backup's id: 26 Crockford base32 characters.
     pub backup: String,
     pub passphrase: WireSecret,
+    /// The person ticked `--created-by-agent`: the backup may be one an
+    /// agent or an unknown process made.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub created_by_agent_ticked: bool,
     /// As [`UnlockParams::claims`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<String>,
 }
 
-/// What `files.restore` answers: each file with its bytes.
+/// What `files.restore` answers: who made the backup, and each file with
+/// its bytes.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoredFiles {
+    /// Who made the backup, as the daemon sealed it; none for a backup
+    /// made before that was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<FileBackupCreatorView>,
     pub files: Vec<RestoredFile>,
 }
 

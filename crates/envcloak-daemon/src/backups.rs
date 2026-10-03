@@ -755,7 +755,7 @@ fn evidence_digest(e: &SubjectEvidence) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn kind_of(e: &SubjectEvidence) -> CreatorKind {
+pub(crate) fn kind_of(e: &SubjectEvidence) -> CreatorKind {
     match e.kind() {
         SubjectKind::Terminal => CreatorKind::Terminal,
         SubjectKind::Agent => CreatorKind::Agent,
@@ -765,7 +765,7 @@ fn kind_of(e: &SubjectEvidence) -> CreatorKind {
 
 /// The agent's label as a backup keeps it: at most [`MAX_LABEL_V2`]
 /// bytes, cut at a character boundary.
-fn label_of(e: &SubjectEvidence) -> Option<String> {
+pub(crate) fn label_of(e: &SubjectEvidence) -> Option<String> {
     e.label().map(|l| {
         let mut end = l.name.len().min(MAX_LABEL_V2);
         while !l.name.is_char_boundary(end) {
