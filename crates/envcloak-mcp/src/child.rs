@@ -205,16 +205,49 @@ fn stop(group: Arc<Group>) {
     }
 }
 
-/// One tool call: whether it was cancelled, and the child it runs.
-#[derive(Debug, Default)]
+/// One tool call: when it arrived, whether it was cancelled, and the
+/// child it runs.
+#[derive(Debug)]
 pub struct Call {
     cancelled: AtomicBool,
     group: Mutex<Option<Arc<Group>>>,
+    /// When the host sent it: its time, the host's cutoff, runs from here,
+    /// the time it waits for a worker included (Codex review of M2-06).
+    arrived: Instant,
+}
+
+impl Default for Call {
+    fn default() -> Self {
+        Call {
+            cancelled: AtomicBool::new(false),
+            group: Mutex::new(None),
+            arrived: Instant::now(),
+        }
+    }
 }
 
 impl Call {
+    /// A call arriving now.
     pub fn new() -> Call {
         Call::default()
+    }
+
+    /// How long ago the call arrived.
+    pub fn waited(&self) -> Duration {
+        self.arrived.elapsed()
+    }
+
+    /// What is left of `budget` (the time the host gives a call, from its
+    /// arrival); `None` once it has run out.
+    pub fn time_left(&self, budget: Duration) -> Option<Duration> {
+        budget
+            .checked_sub(self.arrived.elapsed())
+            .filter(|d| !d.is_zero())
+    }
+
+    /// The instant `budget` from the call's arrival runs out.
+    pub fn deadline(&self, budget: Duration) -> Instant {
+        self.arrived + budget
     }
 
     /// Whether the call was cancelled.

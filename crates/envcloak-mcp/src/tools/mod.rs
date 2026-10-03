@@ -98,9 +98,10 @@ impl Ctx {
     }
 
     /// A verified connection to the daemon whose every call is answered
-    /// within the wait, or fails then.
-    pub(crate) fn connect(&self) -> Result<Client, Failure> {
-        self.connect_by(Instant::now() + self.wait)
+    /// within the wait counted from `call`'s arrival (the time it waited
+    /// for a worker included), or fails then.
+    pub(crate) fn connect(&self, call: &crate::child::Call) -> Result<Client, Failure> {
+        self.connect_by(call.deadline(self.wait))
     }
 
     /// A verified connection to the daemon whose every call is answered

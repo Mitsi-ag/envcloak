@@ -265,7 +265,9 @@ fn status(args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Fa
     let given = req_str(args, "project_dir")?;
     refuse_value_like(&[given])?;
     let dir = project_dir(given)?;
-    let deadline = Instant::now() + ctx.wait;
+    // The wait counts from the call's arrival, the time it waited for a
+    // worker included.
+    let deadline = call.deadline(ctx.wait);
     let report = check(&dir, ctx, call, deadline)?;
 
     let mut client = ctx.connect_by(deadline)?;

@@ -18,7 +18,11 @@
 //! tools and browser backend.
 //!
 //! Calls run on [`WORKERS`] threads, with at most [`QUEUE`] more waiting;
-//! a call beyond that is answered `busy` at once. A call the host cancels
+//! a call beyond that is answered `busy` at once. A call's time, the wait
+//! that keeps it under the host's cutoff, runs from its arrival: one that
+//! waited for a worker past it is answered `busy` when a worker takes it,
+//! and nothing of it runs ([`Call::time_left`]; `run_with_secrets` is
+//! given only what is left). A call the host cancels
 //! (`notifications/cancelled`) is answered nothing further: one still
 //! waiting is dropped, one running has its child stopped
 //! ([`child::Call::cancel`]), and an answer still waiting to be written
@@ -558,6 +562,20 @@ fn worker(
             continue;
         }
         let call = &job.slot.call;
+        // A call that waited for a worker past the host's time is answered
+        // at once, and nothing of it runs (Codex review of M2-06): the
+        // host has given up on it, and what it would start could outlive
+        // the answer nobody reads.
+        if call.time_left(ctx.wait).is_none() {
+            let failed = ToolResult::Err(tools::run_with_secrets::no_time_left());
+            inflight.answer(
+                &job.id,
+                &job.slot,
+                outbox,
+                Some(rpc::result(&job.id, failed.to_json())),
+            );
+            continue;
+        }
         let answer = match router.route(&job.name) {
             Some(Target::Tool(t)) => rpc::result(&job.id, t.call(&job.args, ctx, call).to_json()),
             Some(Target::Backend(b)) => {

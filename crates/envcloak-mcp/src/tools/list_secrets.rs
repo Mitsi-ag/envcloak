@@ -66,8 +66,8 @@ impl Tool for ListSecrets {
         }
     }
 
-    fn call(&self, args: &Map<String, Value>, ctx: &Ctx, _: &Call) -> ToolResult {
-        match list(args, ctx) {
+    fn call(&self, args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> ToolResult {
+        match list(args, ctx, call) {
             Ok(v) => ToolResult::Ok(v),
             Err(f) => ToolResult::Err(f),
         }
@@ -100,14 +100,14 @@ fn item(v: &ItemView) -> Value {
     })
 }
 
-fn list(args: &Map<String, Value>, ctx: &Ctx) -> Result<Value, Failure> {
+fn list(args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Failure> {
     check_keys(args, &["project_dir"], &[])?;
     let dir = opt_str(args, "project_dir")?;
     if let Some(d) = dir {
         refuse_value_like(&[d])?;
     }
     let dir = dir.map(project_dir).transpose()?;
-    let mut client = ctx.connect()?;
+    let mut client = ctx.connect(call)?;
     let items = client.items_list(false)?;
     let project = match dir {
         None => Value::Null,
