@@ -1325,10 +1325,10 @@ fn a_frame_is_its_result_with_the_value_redacted() {
 }
 
 /// Where a result holds its value is found, not typed: the other values
-/// change every letter and digit and keep every length, a result the
-/// two runs make alike or of different lengths, or a label one run lacks,
-/// is refused, and the base64 results alone leave the redactor's
-/// boundary characters out of what must be covered.
+/// change every letter and digit, swap `-` and `_`, and keep every length,
+/// a result the two runs make alike or of different lengths, or a label
+/// one run lacks, is refused, and the base64 results alone leave the
+/// redactor's boundary characters out of what must be covered.
 #[test]
 fn where_a_result_holds_its_value_is_found_by_changing_the_value() {
     let v = b"sk_live-Az09.x/Y@zZ:9".to_vec();
@@ -1349,6 +1349,8 @@ fn where_a_result_holds_its_value_is_found_by_changing_the_value() {
                     b.is_ascii_digit()
                 )
             );
+        } else if matches!(a, b'-' | b'_') {
+            assert_eq!(*b, if *a == b'-' { b'_' } else { b'-' });
         } else {
             assert_eq!(a, b);
         }
