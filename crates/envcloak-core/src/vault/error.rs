@@ -85,6 +85,11 @@ pub enum VaultErrorKind {
     RestoreUnverified,
     /// An authenticated record failed to decode: a bug, not an attack.
     Corrupt,
+    /// A file or directory the vault wrote under a temporary name was not
+    /// the one its final name held once it was linked or renamed there:
+    /// something replaced it under one of the names meanwhile. Nothing is
+    /// answered as written.
+    Substituted,
 }
 
 impl VaultErrorKind {
@@ -144,6 +149,10 @@ impl VaultErrorKind {
                 "the backup was installed as the vault, but the installed vault did not open or verify as the restored one"
             }
             VaultErrorKind::Corrupt => "a sealed vault record could not be decoded",
+            VaultErrorKind::Substituted => {
+                "something replaced a file the vault wrote before it was checked in place, so \
+                 it was not answered as written"
+            }
         }
     }
 }
@@ -242,6 +251,7 @@ mod tests {
             VaultErrorKind::BackupDamaged,
             VaultErrorKind::BackupOfAnotherVault,
             VaultErrorKind::RestoreUnverified,
+            VaultErrorKind::Substituted,
         ] {
             let e = VaultError::from(k);
             assert_eq!(e.to_string(), k.message());

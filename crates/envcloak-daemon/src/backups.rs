@@ -663,11 +663,22 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// A backup's failure to be written or read, as the protocol reports it.
-/// Nothing of the file's contents is in it.
+/// Nothing of the file's contents is in it. A directory or result the
+/// vault wrote that its final name did not hold once published
+/// (`Substituted`: something replaced it inside the vault's directory) is
+/// `files_backup_failed` with the reason `substituted`, logged, never the
+/// client's malformed request.
 fn backup_error(e: &VaultError) -> RpcError {
     match e.kind() {
         VaultErrorKind::NotFound => RpcError::new(ErrorKind::NoSuchBackup),
         VaultErrorKind::InvalidRecord => invalid(),
+        VaultErrorKind::Substituted => {
+            log_line!(
+                "envcloakd: a file backup v2's directory or result was replaced under its name \
+                 before it was checked in place (substituted); it was not answered as written"
+            );
+            RpcError::with_reason(ErrorKind::FilesBackupFailed, "substituted")
+        }
         VaultErrorKind::TooLarge => {
             RpcError::with_reason(ErrorKind::FilesBackupFailed, "too_large")
         }
@@ -1441,6 +1452,22 @@ fn entry(b: &FileBackupsV2, listed: &ListedV2) -> BackupEntryView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review (verifier, M2-05 round 9): a commit, a result or a backup
+    /// whose published name does not hold what was written
+    /// (`Substituted`) is a failure of the backup, with its reason, never
+    /// `invalid_params`, the client's malformed request, which a request
+    /// that is malformed still gets.
+    #[test]
+    fn a_substituted_backup_is_reported_as_a_failed_backup() {
+        let e = backup_error(&VaultErrorKind::Substituted.into());
+        assert_eq!(e.kind, ErrorKind::FilesBackupFailed);
+        assert_eq!(e.reason, Some("substituted"));
+        assert_eq!(
+            backup_error(&VaultErrorKind::InvalidRecord.into()).kind,
+            ErrorKind::InvalidParams
+        );
+    }
 
     #[test]
     fn only_paths_under_the_allowed_roots_are_taken() {

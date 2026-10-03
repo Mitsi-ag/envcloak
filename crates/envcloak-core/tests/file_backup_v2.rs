@@ -1564,7 +1564,7 @@ fn refuses_a_substituted_publication(after_rename: bool, symlink: bool) {
     }
     assert_eq!(
         w.install().unwrap_err().kind(),
-        VaultErrorKind::InvalidRecord,
+        VaultErrorKind::Substituted,
         "a commit answered for a directory it did not seal"
     );
     assert_eq!(installed.load(Ordering::SeqCst), 1);
@@ -1651,8 +1651,9 @@ fn a_result_is_recorded_only_for_the_file_written() {
             did += 1;
         });
         assert_eq!(did, 1);
-        assert!(
-            e.is_err(),
+        assert_eq!(
+            e.map_err(|e| e.kind()),
+            Err(VaultErrorKind::Substituted),
             "symlink {symlink}: a result answered as recorded for a file it did not write"
         );
         assert_eq!(std::fs::read(&outside).unwrap(), b"not a result");

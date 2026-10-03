@@ -176,7 +176,7 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 | `backup_failed` | -32028 | An encrypted backup of the vault could not be written (`backup.create`, or `items.remove` first, which then removed nothing) |
 | `plan_changed` | -32029 | `import.commit` found another plan than the one shown: the vault or the files changed meanwhile |
 | `no_such_backup` | -32030 | No file backup has the id, or it was purged after 7 days |
-| `files_backup_failed` | -32031 | A file backup could not be written, or could not be read back; nothing was deleted or restored. A backup v2 that does not open whole (a chunk missing, moved or altered) is this, value-free; with the reason `too_large`, a backup v2 over its caps (256 MiB a file, 1 GiB a backup, 4,096 files), refused before anything is written |
+| `files_backup_failed` | -32031 | A file backup could not be written, or could not be read back; nothing was deleted or restored. A backup v2 that does not open whole (a chunk missing, moved or altered) is this, value-free; with the reason `too_large`, a backup v2 over its caps (256 MiB a file, 1 GiB a backup, 4,096 files), refused before anything is written; with the reason `substituted`, a backup, a backup v2's directory or one of its results that its name did not hold once published (something replaced it inside the vault's directory), never answered as written, and logged |
 | `too_many_checks` | -32032 | The caller's subject root had 100,000 values compared with the vault in the last hour (`import.plan`, `import.commit`, `import.verify`) |
 | `audit_failed` | -32033 | A delivery's audit entry could not be written (`files.restore`): nothing was released |
 | `backup_unusable` | -32034 | The file named for `vault.recover` is not a vault backup this build can read (missing, not a regular file, a symlink as its last component, altered or cut short), or is a backup of another vault than the one in place; nothing was restored |
@@ -208,6 +208,7 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `invalid_slug`, `invalid_field`, `unknown_provider`, `invalid_account`, `looks_like_value`, `empty_value`, `nul_byte`, `value_too_large`, `no_free_slug` | `invalid_item` |
 | `requester_terminal` | `proof_refused` |
 | `result_unrecorded`, `created_by_agent` | `restore_refused` |
+| `substituted` | `files_backup_failed` |
 
 ## Lock
 
@@ -309,6 +310,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `too_large` | M2-05 | reuse | a file or a backup v2 over its caps (256 MiB a file, 1 GiB a backup, 4,096 files), refused rather than cut |
 | `result_unrecorded` | M2-05 | landed | a backup whose creator exited before recording what the change left; it restores only with `--unrecorded` |
 | `created_by_agent` | M2-05 | landed | a backup v2 an agent or unknown process made, restored without `--created-by-agent` |
+| `substituted` | M2-05 | landed | a file backup, a backup v2's directory or one of its results that its name did not hold once published, never answered as written (`files_backup_failed`) |
 | `limited` | M2-11 | reserved | a comparison budget stopped `scan.match`, so the run reports `incomplete (limited)` |
 <!-- /reservations -->
 

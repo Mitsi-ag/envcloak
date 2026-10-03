@@ -381,8 +381,9 @@ impl Vault {
     /// A link takes whatever has the temporary name at that moment, so the
     /// backup's name is then opened (never through a symlink) and compared
     /// by device and inode with the file written: another file put under
-    /// the temporary name fails the backup (`InvalidRecord`), never
-    /// answered as written, so nothing is deleted on the strength of it.
+    /// the temporary name fails the backup ([`VaultErrorKind::Substituted`]),
+    /// never answered as written, so nothing is deleted on the strength of
+    /// it.
     fn backup_files_observed(
         &self,
         files: &[BackupFile],
@@ -418,9 +419,11 @@ impl Vault {
         let linked = made.and_then(|file| {
             written();
             link_beneath(&dir, tmp_os, name_os)?;
-            let (ours, named) = (file.metadata()?, open_beneath(&dir, name_os)?.metadata()?);
+            let named = open_beneath(&dir, name_os)
+                .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?;
+            let (ours, named) = (file.metadata()?, named.metadata()?);
             if (ours.dev(), ours.ino()) != (named.dev(), named.ino()) {
-                return Err(VaultError::from(VaultErrorKind::InvalidRecord));
+                return Err(VaultError::from(VaultErrorKind::Substituted));
             }
             Ok(ours.len())
         });
@@ -783,8 +786,9 @@ mod tests {
                 did += 1;
             });
             assert_eq!(did, 1);
-            assert!(
-                e.is_err(),
+            assert_eq!(
+                e.map(drop).map_err(|e| e.kind()),
+                Err(VaultErrorKind::Substituted),
                 "symlink {symlink}: a backup answered as written for a file it did not write"
             );
             assert_eq!(std::fs::read(&outside).unwrap(), b"not a backup");

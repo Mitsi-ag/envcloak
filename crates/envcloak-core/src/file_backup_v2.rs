@@ -1043,13 +1043,13 @@ impl FileBackupV2Writer {
     ///
     /// # Errors
     /// [`VaultErrorKind::InvalidRecord`] unless sealed and not yet in
-    /// place, and when the backup's name does not open as the directory
-    /// sealed; an I/O error when the rename fails (nothing is listed),
-    /// `backups/` cannot be flushed (the backup is in place, but may not
-    /// last a crash), or a directory's metadata cannot be read. From the
-    /// rename on a failure is final: the writer installs nothing again,
-    /// and dropped, it keeps the sealed directory, wherever it is, and
-    /// removes nothing that took its name.
+    /// place; [`VaultErrorKind::Substituted`] when the backup's name does
+    /// not open as the directory sealed; an I/O error when the rename
+    /// fails (nothing is listed), `backups/` cannot be flushed (the backup
+    /// is in place, but may not last a crash), or a directory's metadata
+    /// cannot be read. From the rename on a failure is final: the writer
+    /// installs nothing again, and dropped, it keeps the sealed directory,
+    /// wherever it is, and removes nothing that took its name.
     pub fn install(&mut self) -> Result<CommittedV2, VaultError> {
         let Some(bytes) = self.sealed_len.filter(|_| !self.installed) else {
             return Err(VaultErrorKind::InvalidRecord.into());
@@ -1081,11 +1081,11 @@ impl FileBackupV2Writer {
     fn check_installed(&self) -> Result<(), VaultError> {
         use std::os::unix::fs::MetadataExt;
         let named = open_dir_beneath(&self.backups, OsStr::new(&self.final_name))
-            .map_err(|_| VaultError::from(VaultErrorKind::InvalidRecord))?
+            .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?
             .metadata()?;
         let sealed = self.staging.metadata()?;
         if (named.dev(), named.ino()) != (sealed.dev(), sealed.ino()) {
-            return Err(VaultErrorKind::InvalidRecord.into());
+            return Err(VaultErrorKind::Substituted.into());
         }
         Ok(())
     }
@@ -1523,7 +1523,7 @@ impl FileBackupV2Reader {
     /// moment, so the result's name is then opened (never through a
     /// symlink) and compared, by device and inode, with the file written:
     /// another file put under the temporary name meanwhile fails the call
-    /// ([`VaultErrorKind::InvalidRecord`]), never answered as recorded.
+    /// ([`VaultErrorKind::Substituted`]), never answered as recorded.
     /// The temporary name then goes, and the directory is flushed.
     fn record(
         &self,
@@ -1562,8 +1562,10 @@ impl FileBackupV2Reader {
             }
             // A link takes whatever has the temporary name then: the result
             // is recorded only if its name holds the file written.
-            if !same_file(&open_beneath(&self.dir, path)?, &out)? {
-                return Err(VaultErrorKind::InvalidRecord.into());
+            let named = open_beneath(&self.dir, path)
+                .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?;
+            if !same_file(&named, &out)? {
+                return Err(VaultErrorKind::Substituted.into());
             }
             observe(ResultStepV2::Published);
             Ok(())

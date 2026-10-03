@@ -741,6 +741,17 @@ pub fn vault_reason(k: VaultErrorKind) -> &'static str {
     }
 }
 
+/// Why a backup could not be written, for a log line: [`vault_reason`],
+/// or `substituted` for a file the vault wrote that its name did not hold
+/// once linked (something replaced it inside the vault's directory), which
+/// is not damage.
+pub fn backup_reason(k: VaultErrorKind) -> &'static str {
+    match k {
+        VaultErrorKind::Substituted => "substituted",
+        k => vault_reason(k),
+    }
+}
+
 /// An unlock failure. A wrong passphrase and a damaged or missing
 /// passphrase envelope give the one generic error (gate 3).
 fn unlock_error(k: VaultErrorKind) -> RpcError {
@@ -780,6 +791,15 @@ mod tests {
     use crate::clock::{Clocks, FakeClocks};
     use envcloak_core::crypto::KdfParams;
     use envcloak_core::{RecoveryKit, SecretBytes, create_vault_with_kit};
+
+    /// A vault backup that something replaced under its name is logged as
+    /// that, not as damage (verifier, M2-05 round 9).
+    #[test]
+    fn a_substituted_backup_is_logged_as_substituted() {
+        assert_eq!(backup_reason(VaultErrorKind::Substituted), "substituted");
+        assert_eq!(backup_reason(VaultErrorKind::DiskFull), "disk_full");
+        assert_eq!(vault_reason(VaultErrorKind::Substituted), "damaged");
+    }
 
     struct Fixture {
         _dir: tempfile::TempDir,

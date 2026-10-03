@@ -41,7 +41,7 @@ use crate::clock::now_of;
 use crate::lock::Reading;
 use crate::requests::{evidence, refuse_unless_prover, subject_summary};
 use crate::server::{Shared, locked, refuse_if_traced};
-use crate::state::{passphrase_error, vault_reason};
+use crate::state::{backup_reason, passphrase_error, vault_reason};
 
 /// `backup.create`. See the module documentation.
 pub fn create(shared: &Shared, peer: &PeerIdentity, _p: NoParams) -> Result<BackupView, RpcError> {
@@ -49,7 +49,7 @@ pub fn create(shared: &Shared, peer: &PeerIdentity, _p: NoParams) -> Result<Back
     let info = s.unlocked()?.create_backup().map_err(|e| {
         log_line!(
             "envcloakd: a vault backup could not be written ({})",
-            vault_reason(e.kind())
+            backup_reason(e.kind())
         );
         match e.kind() {
             VaultErrorKind::Tampered | VaultErrorKind::ReadOnly => {
