@@ -53,7 +53,7 @@ use envcloak_ipc::view::{
     Integrity as IntegrityView, LockReason, LockView, RecoveredView, StatusView, UnlockedView,
     VaultState, VaultView,
 };
-use envcloak_policy::{AttemptLimiter, GrantId, GrantStore, Now};
+use envcloak_policy::{AttemptLimiter, GrantId, GrantStore, Now, ProcessInstance};
 
 use crate::audit::{AuditEvent, AuditLog, RequestAudit};
 use crate::clock::{Clocks, now_of};
@@ -577,20 +577,25 @@ impl State {
     /// the answer from them with `answer` (the frame that will be sent, so
     /// an answer too large for one is known before anything is committed,
     /// F-77), asks whether `grant` is still in force on `clocks` read then
-    /// (the reads and the framing come after the decision, and a grant
-    /// that ran out meanwhile covers nothing, F-77), then writes the
-    /// delivery's entry durably, and only then gives the answer out. The
-    /// answer is the only way to a release, so no value leaves the daemon
-    /// before its entry is on disk. The caller holds the state lock from
-    /// its decision to its use of the grant, so nothing else ends the
-    /// grant meanwhile; only time does.
+    /// and with its root still running as `alive` tells (the reads and the
+    /// framing come after the decision, and a grant that ran out, or whose
+    /// root exited, meanwhile covers nothing: F-77, SPEC §10b), then
+    /// writes the delivery's entry durably, and only then gives the answer
+    /// out. The answer is the only way to a release, so no value leaves
+    /// the daemon before its entry is on disk. The caller holds the state
+    /// lock from its decision to its use of the grant, so nothing else in
+    /// the daemon ends the grant meanwhile; only time and the root's exit
+    /// do, and the tick's sweep, which removes a grant whose root exited,
+    /// waits for that lock.
     ///
     /// # Errors
     /// [`Delivery::Refused`] when the vault is not unlocked and verified,
     /// or a value cannot be read (a vault that turns out changed on disk
     /// is marked tampered by the read, and releases nothing more). Nothing
     /// is recorded then. [`Delivery::Unsendable`] with `answer`'s error,
-    /// and [`Delivery::Lapsed`] when the grant is no longer in force;
+    /// and [`Delivery::Lapsed`] when the grant is no longer in force, which
+    /// then sweeps the grants as the tick does (a grant whose root exited
+    /// is removed, so the request decided again is not covered by it);
     /// nothing is recorded then either, and the answer is dropped, and
     /// wiped. [`Delivery::AuditFailed`] when the entry could not be
     /// written; the answer is dropped, and wiped.
@@ -598,6 +603,7 @@ impl State {
         &mut self,
         grant: GrantId,
         clocks: &dyn Clocks,
+        alive: &dyn Fn(&ProcessInstance) -> bool,
         e: AuditEvent,
         fields: &[FieldId],
         answer: impl FnOnce(Vec<SecretBytes>) -> Result<T, RpcError>,
@@ -617,7 +623,9 @@ impl State {
             return Err(Delivery::Refused(RpcError::new(ErrorKind::VaultTampered)));
         }
         let answer = answer(values).map_err(Delivery::Unsendable)?;
-        if !self.grants.in_force(grant, &now_of(clocks)) {
+        let now = now_of(clocks);
+        if !self.grants.in_force(grant, &now, alive) {
+            self.grants.sweep(&now, alive);
             return Err(Delivery::Lapsed);
         }
         if !self.audit_delivery(e) {
@@ -1631,6 +1639,12 @@ mod tests {
         s.grants().approve(&id, proof, opts, digest, &t).unwrap()
     }
 
+    /// Every process is still running: what `alive` says when no root
+    /// exited.
+    fn running(_: &ProcessInstance) -> bool {
+        true
+    }
+
     /// A covered request's delivery entry.
     fn delivery(pid: i32) -> AuditEvent {
         AuditEvent::Request(Box::new(crate::audit::RequestAudit {
@@ -1667,7 +1681,9 @@ mod tests {
         );
         let c = &f.clocks;
 
-        let values = s.deliver(g, c, delivery(1), &[field], Ok).unwrap();
+        let values = s
+            .deliver(g, c, &running, delivery(1), &[field], Ok)
+            .unwrap();
         // The values exist: the entry is already in the log's files.
         assert_eq!(
             entries(&s).last().map(|e| e.2.clone()),
@@ -1680,8 +1696,10 @@ mod tests {
         let before = entries(&s).len();
         let too_large = RpcError::new(ErrorKind::FrameTooLarge);
         assert_eq!(
-            s.deliver(g, c, delivery(5), &[field], |_| Err::<(), _>(too_large))
-                .unwrap_err(),
+            s.deliver(g, c, &running, delivery(5), &[field], |_| Err::<(), _>(
+                too_large
+            ))
+            .unwrap_err(),
             Delivery::Unsendable(too_large)
         );
         assert_eq!(entries(&s).len(), before);
@@ -1691,16 +1709,23 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::write(dir, b"in the way").unwrap();
         assert_eq!(
-            s.deliver(g, c, delivery(2), &[field], Ok).unwrap_err(),
+            s.deliver(g, c, &running, delivery(2), &[field], Ok)
+                .unwrap_err(),
             Delivery::AuditFailed
         );
         std::fs::remove_file(dir).unwrap();
-        assert_eq!(s.deliver(g, c, delivery(3), &[field], Ok).unwrap().len(), 1);
+        assert_eq!(
+            s.deliver(g, c, &running, delivery(3), &[field], Ok)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Locked: refused before anything is read or written.
         s.lock(LockReason::Request);
         assert_eq!(
-            s.deliver(g, c, delivery(4), &[field], Ok).unwrap_err(),
+            s.deliver(g, c, &running, delivery(4), &[field], Ok)
+                .unwrap_err(),
             Delivery::Refused(RpcError::new(ErrorKind::VaultLocked))
         );
     }
@@ -1768,7 +1793,7 @@ mod tests {
             );
             let before = entries(&s).len();
             let mut prepared = false;
-            let got = s.deliver(g, &f.clocks, delivery(1), &[field], |values| {
+            let got = s.deliver(g, &f.clocks, &running, delivery(1), &[field], |values| {
                 prepare(&f.clocks, ttl);
                 prepared = true;
                 Ok(values)
@@ -1785,6 +1810,66 @@ mod tests {
                     got.map(|v| v.len())
                 );
                 assert_eq!(entries(&s).len(), before, "{case}: an entry was written");
+            }
+        }
+    }
+
+    /// SPEC §10b, a grant never outlives its root, before commit (Codex's
+    /// review of F-77): a `once` grant covers a request, and its root
+    /// exits while the answer is prepared (the `answer` closure here,
+    /// where the daemon reads the values and frames them; `alive` then
+    /// says the grant's root is gone). The delivery commits nothing:
+    /// [`Delivery::Lapsed`], no entry, no value given out, and the grant
+    /// is gone, so the request decided again is pending, not covered by
+    /// it. The control: the same delivery with the root running is
+    /// delivered and its entry written.
+    ///
+    /// Mutations: `in_force` without the root (delivered); the lapse
+    /// without the sweep (the grant stays, and covers the request decided
+    /// again).
+    #[test]
+    fn a_grant_whose_root_exits_while_its_answer_is_prepared_commits_nothing() {
+        use std::cell::Cell;
+        for exits in [false, true] {
+            let f = fixture();
+            let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+            create(&f, &mut s);
+            let field = stored_value(&mut s, "a/b", VALUE);
+            let r = request("OPENAI_API_KEY");
+            let root = r.subject.root();
+            let g = granted(
+                &f,
+                &mut s,
+                r.clone(),
+                envcloak_policy::ApprovalOptions::once(Duration::from_secs(600)),
+            );
+            assert_eq!(
+                s.grants().decide(r.clone(), &at(&f.clocks)),
+                envcloak_policy::Decision::Covered(g)
+            );
+            let exited = Cell::new(false);
+            let alive = |p: &ProcessInstance| !(exited.get() && *p == root);
+            let before = entries(&s).len();
+            let got = s.deliver(g, &f.clocks, &alive, delivery(1), &[field], |values| {
+                exited.set(exits);
+                Ok(values)
+            });
+            if exits {
+                assert!(
+                    matches!(got, Err(Delivery::Lapsed)),
+                    "delivered, or refused otherwise: {:?}",
+                    got.map(|v| v.len())
+                );
+                assert_eq!(entries(&s).len(), before, "an entry was written");
+                assert!(s.grants().grant(g).is_none(), "the grant outlived its root");
+                assert!(matches!(
+                    s.grants().decide(r, &at(&f.clocks)),
+                    envcloak_policy::Decision::Pending(_)
+                ));
+            } else {
+                let values = got.unwrap_or_else(|e| panic!("the control: {e:?}"));
+                assert!(values[0].ct_eq(VALUE));
+                assert_eq!(entries(&s).len(), before + 1);
             }
         }
     }

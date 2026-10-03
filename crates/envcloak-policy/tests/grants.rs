@@ -178,6 +178,12 @@ fn now_at(secs: u64) -> Now {
     }
 }
 
+/// Every process is still running: what `alive` says when no root
+/// exited.
+fn running(_: &ProcessInstance) -> bool {
+    true
+}
+
 fn store() -> GrantStore {
     let mut s = GrantStore::new();
     s.set_epochs(1, 1);
@@ -872,18 +878,21 @@ fn grants_expire_on_either_clock() {
     assert_eq!(s.grants().count(), 0);
 }
 
-/// F-77, expiry before commit: `in_force`, which a delivery asks on fresh
-/// clocks once its answer is built, holds until either deadline, without
-/// a decision or a sweep in between to remove the grant: a second before
-/// each deadline it holds; at the wall clock's (awake time short of its
-/// own) and at awake time's (the wall clock short of its own) it does
-/// not, though the grant is still in the store. A grant an epoch bump
-/// removed (it is no longer in the store), a revoked grant and an id
-/// never issued are not in force: `in_force` holds only for a grant that
-/// is there.
+/// F-77, expiry and root exit before commit: `in_force`, which a delivery
+/// asks on fresh clocks once its answer is built, holds until either
+/// deadline, without a decision or a sweep in between to remove the
+/// grant: a second before each deadline it holds; at the wall clock's
+/// (awake time short of its own) and at awake time's (the wall clock
+/// short of its own) it does not, though the grant is still in the store.
+/// Nor once its root has exited (SPEC §10b: a grant never outlives its
+/// root), which `alive` is asked about for the grant's own root instance,
+/// though no sweep has removed it. A grant an epoch bump removed (it is
+/// no longer in the store), a revoked grant and an id never issued are
+/// not in force: `in_force` holds only for a grant that is there.
 ///
 /// Mutations: compare only the wall clock (the awake case holds); only
-/// awake time (the wall case holds).
+/// awake time (the wall case holds); `alive` not asked (the exited root's
+/// grant holds).
 #[test]
 fn a_grant_is_in_force_until_either_deadline() {
     let it = items();
@@ -897,35 +906,60 @@ fn a_grant_is_in_force_until_either_deadline() {
     };
     let mut s = store();
     let g = approve(&mut s, r(), once(), &now).unwrap();
-    assert!(s.in_force(g, &now));
+    assert!(s.in_force(g, &now, &running));
     let ttl = Duration::from_secs(once().ttl_secs);
     let short = ttl - Duration::from_secs(1);
 
     let mut wall = now_at(0);
     wall.wall += short;
-    assert!(s.in_force(g, &wall), "a second before the wall deadline");
+    assert!(
+        s.in_force(g, &wall, &running),
+        "a second before the wall deadline"
+    );
     wall.wall += Duration::from_secs(1);
-    assert!(!s.in_force(g, &wall), "at the wall deadline, awake short");
+    assert!(
+        !s.in_force(g, &wall, &running),
+        "at the wall deadline, awake short"
+    );
 
     let mut awake = now_at(0);
     awake.awake += short;
-    assert!(s.in_force(g, &awake), "a second before the awake deadline");
+    assert!(
+        s.in_force(g, &awake, &running),
+        "a second before the awake deadline"
+    );
     awake.awake += Duration::from_secs(1);
-    assert!(!s.in_force(g, &awake), "at the awake deadline, wall short");
+    assert!(
+        !s.in_force(g, &awake, &running),
+        "at the awake deadline, wall short"
+    );
 
     // Asking removes nothing: the grant is there until a decision or a
     // sweep expires it.
     assert!(s.grant(g).is_some());
-    assert!(s.in_force(g, &now));
+    assert!(s.in_force(g, &now, &running));
+
+    // Its root exited (no sweep since): not in force, asked about the
+    // grant's own root; another process's exit changes nothing.
+    let root = s.grant(g).unwrap().root.clone();
+    assert!(!s.in_force(g, &now, &|r| *r != root), "its root exited");
+    assert!(
+        s.in_force(g, &now, &|r| *r == root),
+        "another process exited"
+    );
+    assert!(s.grant(g).is_some(), "asking removed the grant");
 
     s.set_policy_epoch(2);
     assert!(s.grant(g).is_none(), "an epoch bump left the grant");
-    assert!(!s.in_force(g, &now), "removed by a policy epoch bump");
+    assert!(
+        !s.in_force(g, &now, &running),
+        "removed by a policy epoch bump"
+    );
     let mut s = store();
     let g = approve(&mut s, r(), once(), &now).unwrap();
     assert_eq!(s.revoke(RevokeSelector::Id(g)), 1);
-    assert!(!s.in_force(g, &now), "a revoked grant");
-    assert!(!s.in_force(GrantId::parse(&"0".repeat(26)).unwrap(), &now));
+    assert!(!s.in_force(g, &now, &running), "a revoked grant");
+    assert!(!s.in_force(GrantId::parse(&"0".repeat(26)).unwrap(), &now, &running));
 }
 
 #[test]

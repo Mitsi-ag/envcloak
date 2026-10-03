@@ -932,16 +932,29 @@ impl GrantStore {
         self.grants.get(&id)
     }
 
-    /// Whether grant `id` is still in force at `now`: there, and before
-    /// both its deadlines (wall clock and time awake). A grant of another
-    /// epoch is never there: every change of an epoch removes those at
-    /// once ([`GrantStore::set_epochs`], [`GrantStore::set_policy_epoch`]).
-    /// A delivery asks again on clocks read once its answer is built, just
-    /// before anything is committed (F-77): the values are read and the
-    /// answer framed after the decision, and a grant that ran out
-    /// meanwhile covers nothing.
-    pub fn in_force(&self, id: GrantId, now: &Now) -> bool {
-        self.grants.get(&id).is_some_and(|g| !g.expired(now))
+    /// Whether grant `id` is still in force at `now`: there, before both
+    /// its deadlines (wall clock and time awake), and its root still
+    /// running as `alive` tells (the pid with the start time the grant
+    /// recorded; SPEC §10b: a grant never outlives its root). These are
+    /// the two ways a grant ends that do not go through this store under
+    /// the daemon's lock: time, and the root's exit, which only a sweep
+    /// sees ([`GrantStore::sweep`]). A grant of another epoch is never
+    /// there: every change of an epoch removes those at once
+    /// ([`GrantStore::set_epochs`], [`GrantStore::set_policy_epoch`]), as
+    /// a revocation, a lock and an item's removal remove theirs. A delivery
+    /// asks again on clocks read once its answer is built, just before
+    /// anything is committed (F-77): the values are read and the answer
+    /// framed after the decision, and a grant that ran out, or whose root
+    /// exited, meanwhile covers nothing.
+    pub fn in_force(
+        &self,
+        id: GrantId,
+        now: &Now,
+        alive: &dyn Fn(&ProcessInstance) -> bool,
+    ) -> bool {
+        self.grants
+            .get(&id)
+            .is_some_and(|g| !g.expired(now) && alive(&g.root))
     }
 
     /// Every grant, oldest first.

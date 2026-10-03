@@ -14,9 +14,9 @@
 
 mod common;
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -506,5 +506,189 @@ fn a_grant_that_runs_out_while_the_answer_is_framed_covers_nothing() {
         !log.contains(&format!("request decision=covered id={grant} ")),
         "a delivery under the lapsed grant was audited"
     );
+    f.sweep();
+}
+
+/// Set in the environment of [`root_child`]: the daemon's run directory,
+/// then the request's parameters as JSON, a line each.
+const ROOT_CHILD: &str = "ENVCLOAK_TEST_ROOT_CHILD";
+
+/// Runs only as a child of a test here: this test binary again, leading a
+/// session on a pseudo-terminal of its own, as a person's command in
+/// another terminal window, so it is its requests' root. It prints
+/// `ready`; then for each `ask` on its standard input it sends the
+/// request [`ROOT_CHILD`] names as request [`ID`] over a raw connection
+/// and prints [`outline`] of the answer, and `pending=<id>` when it is
+/// pending.
+#[test]
+fn root_child() {
+    let Some(spec) = std::env::var_os(ROOT_CHILD) else {
+        return;
+    };
+    let spec = spec.into_string().unwrap();
+    let (run_dir, params) = spec.split_once('\n').unwrap();
+    let params: serde_json::Value = serde_json::from_str(params).unwrap();
+    common::terminal_session();
+    let paths = envcloak_ipc::RunPaths::under(PathBuf::from(run_dir)).unwrap();
+    println!("\nready");
+    for line in std::io::stdin().lock().lines() {
+        if line.unwrap() != "ask" {
+            continue;
+        }
+        let mut s = std::os::unix::net::UnixStream::connect(&paths.socket).unwrap();
+        send_json(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": ID, "method": "run.request",
+                "params": params}),
+        );
+        let answer = common::read_json(&mut s).unwrap();
+        let request = answer["result"]["decision"]["request"]
+            .as_str()
+            .unwrap_or("");
+        println!("\nanswer={}\npending={request}", outline(&answer));
+    }
+}
+
+/// A [`root_child`] running.
+struct Root {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    out: BufReader<std::process::ChildStdout>,
+}
+
+impl Root {
+    fn start(f: &Fixture, p: &RunRequestParams) -> Root {
+        let run_dir = envcloak_testkit::daemon_run_dir(&f.home);
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        f.home
+            .apply(&mut cmd)
+            .args(["--exact", "root_child", "--nocapture", "--test-threads=1"])
+            .env(
+                ROOT_CHILD,
+                format!(
+                    "{}\n{}",
+                    run_dir.to_str().unwrap(),
+                    serde_json::to_string(p).unwrap()
+                ),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        let mut r = Root { child, stdin, out };
+        r.line("ready");
+        r
+    }
+
+    /// The next line that starts with `prefix`, without it.
+    fn line(&mut self, prefix: &str) -> String {
+        loop {
+            let mut l = String::new();
+            assert!(
+                self.out.read_line(&mut l).unwrap() > 0,
+                "the child ended before {prefix}"
+            );
+            if let Some(rest) = l.trim_end().strip_prefix(prefix) {
+                return rest.to_owned();
+            }
+        }
+    }
+
+    /// Asks the request once more, without waiting for the answer.
+    fn ask(&mut self) {
+        writeln!(self.stdin, "ask").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// The answer to the last [`Root::ask`]: its outline, and the pending
+    /// request's id (empty when it is not pending).
+    fn answer(&mut self) -> (String, String) {
+        let outline = self.line("answer=");
+        (outline, self.line("pending="))
+    }
+}
+
+impl Drop for Root {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// SPEC §10b, a grant never outlives its root, before commit (Codex's
+/// review of F-77): the daemon is stopped by the barrier once a covered
+/// answer is framed (holding the answer and the state lock, so the tick's
+/// sweep cannot remove the grant), and the grant's root, the requester
+/// leading its own session, is killed and reaped meanwhile. Let go, the
+/// daemon commits nothing under that grant: no delivery is audited, the
+/// `once` grant is not used but gone, and the request, decided again, is
+/// pending. The control, first: another requester's grant through the
+/// same barrier, its root running, is delivered.
+///
+/// Mutation: the delivery's check without the root (the dead root's grant
+/// covers the request, and its delivery is audited).
+#[test]
+fn a_grant_whose_root_exits_while_the_answer_is_framed_covers_nothing() {
+    let f = Fixture::pausing(Some(FRAMED));
+    let approved = |r: &mut Root| {
+        r.ask();
+        let (outline, request) = r.answer();
+        assert!(!request.is_empty(), "expected pending, got {outline}");
+        let mut c = client(&f.home);
+        let d = c.pending_get(&request, &[]).unwrap();
+        let digest = statement_digest(&d, &once());
+        c.approve(&request, once(), &digest, passphrase(&f.cs), &[])
+            .unwrap()
+            .grant
+    };
+
+    let control = f.params(1, 0, "root-running");
+    let mut root = Root::start(&f, &control);
+    let grant = approved(&mut root);
+    root.ask();
+    assert!(
+        f.wait_paused(FRAMED, 1, || false),
+        "the covered request did not stop at {FRAMED}"
+    );
+    f.release();
+    let (outline, _) = root.answer();
+    assert_eq!(outline, "a result: decision covered, 2 values");
+    assert_eq!(
+        f.d.log()
+            .matches(&format!("request decision=covered id={grant} "))
+            .count(),
+        1
+    );
+    drop(root);
+
+    f.rearm();
+    let lapsing = f.params(1, 0, "root-exits");
+    let mut root = Root::start(&f, &lapsing);
+    let grant = approved(&mut root);
+    let pending = f.d.log().matches("request decision=pending ").count();
+    root.ask();
+    assert!(
+        f.wait_paused(FRAMED, 2, || false),
+        "the covered request did not stop at {FRAMED}"
+    );
+    root.child.kill().unwrap();
+    root.child.wait().unwrap();
+    f.release();
+    let covered = format!("request decision=covered id={grant} ");
+    let log = f.d.log_when(Duration::from_secs(60), |log| {
+        log.contains(&covered) || log.matches("request decision=pending ").count() > pending
+    });
+    assert!(
+        !log.contains(&covered),
+        "a delivery under the grant of a root that exited was audited"
+    );
+    assert!(
+        log.matches("request decision=pending ").count() > pending,
+        "the request was not decided again"
+    );
+    assert!(!f.holds(&grant), "the grant outlived its root");
+    drop(root);
     f.sweep();
 }
