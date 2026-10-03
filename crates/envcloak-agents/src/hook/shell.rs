@@ -55,6 +55,10 @@ use std::os::unix::ffi::OsStrExt;
 use envcloak_scan::{FileKind, dotenv_kind};
 use zeroize::{Zeroize, Zeroizing};
 
+mod glob;
+
+pub use glob::{RG_ENV_TYPES, glob_may_name_env_file, grep_tool_glob_may_name_env_file};
+
 /// A class of command the hook denies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Class {
@@ -1364,11 +1368,18 @@ impl Analyzer {
                 Ok(())
             }
             b"envcloak" => {
-                for a in args {
+                for (k, a) in args.iter().enumerate() {
                     match plain(a) {
                         Some(o) if o.starts_with(b"-") => continue,
                         Some(o) if o == b"reveal" => self.found.push(Class::Reveal),
                         Some(o) if o == b"approve" => self.found.push(Class::Approve),
+                        // `envcloak run [options] -- COMMAND...` runs the
+                        // command with the project's keys in its
+                        // environment (the verifier's finding: EnvCloak's
+                        // own wrapper is read through like any other).
+                        Some(o) if o == b"run" => {
+                            return self.envcloak_run(&args[k + 1..], bodies, next);
+                        }
                         Some(_) => {}
                         None => return Err(Amb),
                     }
@@ -1653,6 +1664,21 @@ impl Analyzer {
 
     /// `find ... -exec cmd {} ;`: the command runs on the files found,
     /// which are env files when a `-name` or `-path` test could match one.
+    /// `envcloak run [options] -- COMMAND...`: the command after `--`,
+    /// read as the argv it runs. A word before `--` only known when it
+    /// runs could be `--` itself: what runs then cannot be told.
+    fn envcloak_run(&mut self, args: &[Word], bodies: &[Body], depth: usize) -> Result<(), Amb> {
+        for (k, a) in args.iter().enumerate() {
+            match plain(a) {
+                Some(o) if o == b"--" => return self.run(&args[k + 1..], bodies, depth),
+                Some(_) => {}
+                None => return Err(Amb),
+            }
+        }
+        // No command: `envcloak run` refuses, and runs nothing.
+        Ok(())
+    }
+
     fn find(&mut self, args: &[Word], depth: usize) -> Result<(), Amb> {
         let mut names_env = false;
         let mut i = 0;
@@ -1675,18 +1701,20 @@ impl Analyzer {
                                 Ch::Unknown => Ch::Unknown,
                             })
                             .collect();
-                        if dotenv(&pat) != Tri::Not {
+                        // find's wildcards match a leading `.` (POSIX
+                        // interpretation 126), as a search tool's do.
+                        if glob::word_may_name_env_file(&pat, false) {
                             names_env = true;
                         }
                     }
                     i += 1;
                 }
                 Some(b"-regex" | b"-iregex") => {
-                    if let Some(p) = args.get(i) {
-                        let text = joined(std::slice::from_ref(p));
-                        if text.windows(3).any(|w| w == b"env") {
-                            names_env = true;
-                        }
+                    if args
+                        .get(i)
+                        .is_some_and(|p| glob::regex_may_name_env_file(p))
+                    {
+                        names_env = true;
                     }
                     i += 1;
                 }
@@ -2110,60 +2138,6 @@ pub fn path_class(path: &str) -> Option<Class> {
     }
 }
 
-/// Whether a search glob (Claude Code's `Grep` `glob`, ripgrep's
-/// `--glob`, where `*` matches a leading `.` as well) may pick out an env
-/// file: after brace expansion, its last component is an env file's name
-/// (any case), its literal start fits `.env` or `.env.` (`.env*`, `.e?v`,
-/// `.env.st*`), or it starts with a wildcard and names `env` anywhere
-/// (`*.env`, `*env*`, `[.]env`). A glob whose literal parts never name
-/// `env` (`*`, `*.rs`, which a `.env.rs` would match) is read as a search
-/// of every file, which is in docs/INSTALLERS.md's list of what the hook
-/// does not see. A glob of too many alternatives is taken as one that
-/// may.
-pub fn glob_may_name_env_file(glob: &str) -> bool {
-    let negated = glob.starts_with('!');
-    if negated {
-        // An exclusion picks out nothing.
-        return false;
-    }
-    let w: Zeroizing<Word> =
-        Zeroizing::new(glob.bytes().map(|b| Ch::Lit { b, quoted: false }).collect());
-    let mut cost = BraceCost::default();
-    let Ok(alts) = brace_expand(&w, &mut cost, 0) else {
-        return true;
-    };
-    let alts = Zeroizing::new(alts);
-    alts.iter().any(|a| {
-        let start = a
-            .iter()
-            .rposition(|ch| matches!(ch, Ch::Lit { b: b'/', .. }))
-            .map_or(0, |p| p + 1);
-        let tail = &a[start..];
-        if let Some(name) = plain(tail) {
-            return names_dotenv(&name);
-        }
-        let mut prefix = Vec::new();
-        for (i, ch) in tail.iter().enumerate() {
-            match ch {
-                Ch::Lit { .. } if glob_at(tail, i) => break,
-                Ch::Lit { b, .. } => prefix.push(b.to_ascii_lowercase()),
-                Ch::Unknown => break,
-            }
-        }
-        if !prefix.is_empty() {
-            return b".env".starts_with(&prefix) || prefix.starts_with(b".env");
-        }
-        let text: Vec<u8> = tail
-            .iter()
-            .map(|ch| match ch {
-                Ch::Lit { b, .. } => b.to_ascii_lowercase(),
-                Ch::Unknown => b'*',
-            })
-            .collect();
-        text.windows(3).any(|x| x == b"env")
-    })
-}
-
 /// The name a command word runs: its last path component, in lower case.
 /// `None` for an empty word; [`Amb`] when the name is only known when it
 /// runs.
@@ -2425,6 +2399,17 @@ struct Reader {
     two: &'static [&'static str],
     /// Options that take a name, then a file the command reads.
     name_then_file: &'static [&'static str],
+    /// Options whose value is a glob picking the files the command reads
+    /// (ripgrep's `--glob`, grep's `--include`).
+    glob_opts: &'static [&'static str],
+    /// Options whose value is a regular expression picking the files the
+    /// command reads (ag's `-G`).
+    regex_opts: &'static [&'static str],
+    /// Options whose value names a file type, by the globs it stands for
+    /// (ripgrep's `--type`).
+    type_opts: &'static [&'static str],
+    /// Options whose value defines a file type (ripgrep's `--type-add`).
+    type_add_opts: &'static [&'static str],
 }
 
 const PLAIN: Reader = Reader {
@@ -2434,7 +2419,36 @@ const PLAIN: Reader = Reader {
     file_opts: &[],
     two: &[],
     name_then_file: &[],
+    glob_opts: &[],
+    regex_opts: &[],
+    type_opts: &[],
+    type_add_opts: &[],
 };
+
+impl Reader {
+    /// Whether `opt` takes a value that picks the files read.
+    fn selects(&self, opt: &str) -> bool {
+        self.glob_opts.contains(&opt)
+            || self.regex_opts.contains(&opt)
+            || self.type_opts.contains(&opt)
+            || self.type_add_opts.contains(&opt)
+    }
+
+    /// Whether `value`, given to the option `opt` that picks the files
+    /// read, may pick an env file (Codex review: these were skipped as
+    /// ordinary values).
+    fn selects_env(&self, opt: &str, value: &[Ch]) -> bool {
+        if self.glob_opts.contains(&opt) {
+            glob::word_may_name_env_file(value, true)
+        } else if self.regex_opts.contains(&opt) {
+            glob::regex_may_name_env_file(value)
+        } else if self.type_opts.contains(&opt) {
+            glob::rg_type_may_name_env_file(value)
+        } else {
+            self.type_add_opts.contains(&opt) && glob::rg_type_add_may_name_env_file(value)
+        }
+    }
+}
 
 /// The commands that print what they read, and how they take arguments.
 fn reader(name: &[u8]) -> Option<Reader> {
@@ -2611,7 +2625,6 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--context",
                 "--directories",
                 "--devices",
-                "--include",
                 "--exclude",
                 "--exclude-dir",
                 "--label",
@@ -2620,16 +2633,12 @@ fn reader(name: &[u8]) -> Option<Reader> {
             ],
             pattern_opts: &["-e", "--regexp"],
             file_opts: &["-f", "--file", "--exclude-from"],
+            glob_opts: &["--include"],
             ..PLAIN
         },
         b"rg" => Reader {
             pattern_first: true,
             valued: &[
-                "-g",
-                "--glob",
-                "--iglob",
-                "-t",
-                "--type",
                 "-T",
                 "--type-not",
                 "-m",
@@ -2646,7 +2655,6 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--max-columns",
                 "-r",
                 "--replace",
-                "--type-add",
                 "--type-clear",
                 "--max-depth",
                 "-d",
@@ -2671,13 +2679,14 @@ fn reader(name: &[u8]) -> Option<Reader> {
             ],
             pattern_opts: &["-e", "--regexp"],
             file_opts: &["-f", "--file", "--ignore-file"],
+            glob_opts: &["-g", "--glob", "--iglob"],
+            type_opts: &["-t", "--type"],
+            type_add_opts: &["--type-add"],
             ..PLAIN
         },
         b"ag" => Reader {
             pattern_first: true,
             valued: &[
-                "-G",
-                "--file-search-regex",
                 "-m",
                 "--max-count",
                 "-A",
@@ -2691,6 +2700,7 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--width",
             ],
             file_opts: &["-p", "--path-to-ignore"],
+            regex_opts: &["-G", "--file-search-regex"],
             ..PLAIN
         },
         b"sed" | b"gsed" => Reader {
@@ -2714,6 +2724,7 @@ fn reader(name: &[u8]) -> Option<Reader> {
             file_opts: &["-f", "--from-file"],
             two: &["--arg", "--argjson"],
             name_then_file: &["--slurpfile", "--rawfile"],
+            ..PLAIN
         },
         _ => return None,
     })
@@ -2734,9 +2745,18 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
             operands.push(a);
             continue;
         }
-        let Some(o) = plain(a) else {
-            operands.push(a);
-            continue;
+        let o = match plain(a) {
+            Some(o) => o,
+            // An option whose value holds a glob character the shell
+            // leaves as it is (`--glob=.env*` unquoted) is still that
+            // option.
+            None => match literal(a) {
+                Some(t) if t.len() > 1 && t.starts_with(b"-") => Plain(Zeroizing::new(t)),
+                _ => {
+                    operands.push(a);
+                    continue;
+                }
+            },
         };
         if o == b"--" {
             only_operands = true;
@@ -2756,7 +2776,18 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
                 None => (text.clone(), None),
             };
             let n = name.as_str();
-            if spec.two.contains(&n) {
+            if spec.selects(n) {
+                let picks_env = match value {
+                    Some(v) => spec.selects_env(n, &lits(v.as_bytes())),
+                    None => {
+                        i += 1;
+                        args.get(i - 1).is_some_and(|w| spec.selects_env(n, w))
+                    }
+                };
+                if picks_env {
+                    return true;
+                }
+            } else if spec.two.contains(&n) {
                 i += 2;
             } else if spec.name_then_file.contains(&n) {
                 if args.get(i + 1).is_some_and(is_env) {
@@ -2800,17 +2831,24 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
             let f = flag.as_str();
             let is_file = spec.file_opts.contains(&f);
             let is_pattern = spec.pattern_opts.contains(&f);
-            if !(is_file || is_pattern || spec.valued.contains(&f)) {
+            let selects = spec.selects(f);
+            if !(is_file || is_pattern || selects || spec.valued.contains(&f)) {
                 continue;
             }
             pattern_given |= is_pattern;
             let rest = &bytes[k + 1..];
             if rest.is_empty() {
-                if is_file && args.get(i).is_some_and(is_env) {
+                let value = args.get(i);
+                if is_file && value.is_some_and(is_env) {
+                    return true;
+                }
+                if selects && value.is_some_and(|w| spec.selects_env(f, w)) {
                     return true;
                 }
                 i += 1;
-            } else if is_file && is_env(&lits(rest)) {
+            } else if (is_file && is_env(&lits(rest)))
+                || (selects && spec.selects_env(f, &lits(rest)))
+            {
                 return true;
             }
             break;

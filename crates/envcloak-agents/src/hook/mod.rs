@@ -241,10 +241,12 @@ pub fn decide(host: Host, event: Event, payload: &SecretBuf) -> Decision {
 /// miss on the others): a command, as a shell reads it ([`shell`]), for
 /// `Bash` and `Monitor` (whose `command` is a shell script, Claude Code
 /// 2.1.280's `sdk-tools.d.ts`); a path, for the file tools and every
-/// string of an MCP tool's input or an MCP resource's URI
+/// string of an MCP tool's input, an MCP resource's URI and the input of
+/// the tools that read a local file to send it on
 /// ([`shell::path_class`]: env files and `/proc/<pid>/environ`); a search
-/// glob ([`shell::glob_may_name_env_file`]); and the argv of
-/// `run_with_secrets` ([`decide_argv`]).
+/// glob, as Claude Code splits it, and a search's file type
+/// ([`shell::grep_tool_glob_may_name_env_file`], [`shell::RG_ENV_TYPES`]);
+/// and the argv of `run_with_secrets` ([`decide_argv`]).
 fn tool_call(host: Host, tool: &str, input: &Map<String, Value>) -> Decision {
     let deny_if = |c: Option<Class>| c.map_or(Decision::Allow, |c| Decision::Deny(Reason::of(c)));
     let claude = host == Host::ClaudeCode;
@@ -272,9 +274,16 @@ fn tool_call(host: Host, tool: &str, input: &Map<String, Value>) -> Decision {
         "Grep" if claude => {
             let path = input.get("path").and_then(Value::as_str);
             let glob = input.get("glob").and_then(Value::as_str);
+            let kind = input.get("type").and_then(Value::as_str);
             match path.and_then(shell::path_class) {
                 Some(c) => Decision::Deny(Reason::of(c)),
-                None if glob.is_some_and(shell::glob_may_name_env_file) => {
+                // The glob as Claude Code splits it into ripgrep's
+                // `--glob`s, and the `type` it passes as `--type`.
+                None if glob.is_some_and(shell::grep_tool_glob_may_name_env_file)
+                    || kind.is_some_and(|t| {
+                        shell::RG_ENV_TYPES.contains(&t.to_ascii_lowercase().as_str())
+                    }) =>
+                {
                     Decision::Deny(Reason::EnvFile)
                 }
                 None => Decision::Allow,
@@ -291,7 +300,21 @@ fn tool_call(host: Host, tool: &str, input: &Map<String, Value>) -> Decision {
             }
             _ => Decision::Allow,
         },
-        "ReadMcpResourceTool" if claude => deny_if(strings_class(input.values(), 0)),
+        // An MCP resource, or a directory of them, by its URI; and the
+        // tools that read a local file named anywhere in their input to
+        // send it on (Artifact's `file_path` and `file_paths`, Projects'
+        // `local_path`, Workflow's `scriptPath`, ClaudeDesign's
+        // `arguments`), read as an MCP tool's arguments are.
+        "ReadMcpResourceTool"
+        | "ReadMcpResourceDirTool"
+        | "Artifact"
+        | "Projects"
+        | "Workflow"
+        | "ClaudeDesign"
+            if claude =>
+        {
+            deny_if(strings_class(input.values(), 0))
+        }
         t if t.starts_with("mcp__") => deny_if(strings_class(input.values(), 0)),
         _ => Decision::Allow,
     }
@@ -507,6 +530,10 @@ mod tests {
     /// without its `/proc/<pid>/environ` answer (the env-dump class for
     /// Bash only, as before); `glob_may_name_env_file` back to the five
     /// sample names (`.env.staging` allowed); the `ReadMcpResourceTool` arm
+    /// taken out. This round: the Grep glob judged whole, without the
+    /// host's split (`README.md,.env` allowed); classes read as text (the
+    /// previous `glob_may_name_env_file`: `[.]e[n]v` allowed); Grep's
+    /// `type` not read; the `Artifact`, `Projects` and `Workflow` arms
     /// taken out. Each fails this.
     #[test]
     fn every_channel_a_class_comes_through_is_read() {
@@ -604,8 +631,95 @@ mod tests {
                 serde_json::json!({"server": "fs", "uri": "file:///w/README.md"}),
                 Decision::Allow,
             ),
+            // The tools of the pinned version that read a local file to
+            // send it on, or a directory of resources (the verifier's
+            // finding: they were not in the matcher, nor read).
+            (
+                "ReadMcpResourceDirTool",
+                serde_json::json!({"server": "fs", "uri": "file:///proc/self/environ"}),
+                env_dump,
+            ),
+            (
+                "NotebookEdit",
+                serde_json::json!({"notebook_path": "/w/.env", "new_source": "x"}),
+                env_file,
+            ),
+            (
+                "Artifact",
+                serde_json::json!({"action": "upload_asset", "url": "u", "file_path": "/w/.env.local"}),
+                env_file,
+            ),
+            (
+                "Artifact",
+                serde_json::json!({"action": "upload_asset", "url": "u", "file_paths": ["/w/a.png", "/w/.env"]}),
+                env_file,
+            ),
+            (
+                "Artifact",
+                serde_json::json!({"file_path": "/w/page.html"}),
+                Decision::Allow,
+            ),
+            (
+                "Projects",
+                serde_json::json!({"method": "project_write", "local_path": "/w/.ENV"}),
+                env_file,
+            ),
+            (
+                "Workflow",
+                serde_json::json!({"scriptPath": "/w/.env.staging"}),
+                env_file,
+            ),
+            (
+                "ClaudeDesign",
+                serde_json::json!({"operation": "upload", "arguments": {"file": "/proc/1/environ"}}),
+                env_dump,
+            ),
+            (
+                "Write",
+                serde_json::json!({"file_path": "/w/.env.example", "content": "A="}),
+                Decision::Allow,
+            ),
+            // Grep's `type` is ripgrep's `--type`: `sh` holds `.env`.
+            (
+                "Grep",
+                serde_json::json!({"pattern": "K", "type": "sh"}),
+                env_file,
+            ),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "K", "type": "ALL"}),
+                env_file,
+            ),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "K", "type": "rust"}),
+                Decision::Allow,
+            ),
         ] {
             assert_eq!(d(tool, input.clone()), want, "{tool} {input}");
+        }
+        // Every tool the hook reads is in the installer's matcher.
+        for tool in [
+            "Bash",
+            "Monitor",
+            "Read",
+            "Edit",
+            "NotebookEdit",
+            "Grep",
+            "Glob",
+            "ReadMcpResourceTool",
+            "ReadMcpResourceDirTool",
+            "Artifact",
+            "Projects",
+            "Workflow",
+            "ClaudeDesign",
+        ] {
+            assert!(
+                crate::hosts::claude::TOOL_MATCHER
+                    .split('|')
+                    .any(|t| t == tool),
+                "{tool}"
+            );
         }
         for glob in [
             ".env*",
@@ -620,6 +734,17 @@ mod tests {
             "[.]env",
             ".E*",
             "src/.e?v",
+            // Classes are sets (F119), and Claude Code splits the glob on
+            // white space and commas before ripgrep reads it.
+            "[.]e[n]v",
+            "[.]e[n]v*",
+            "**/[.][e][n][v].staging",
+            "{*.rs,[.]env.ci}",
+            ".env.local src/*.rs",
+            "README.md,.env",
+            ".env,config/app.yaml",
+            ".env* src/**",
+            ".env x",
         ] {
             assert_eq!(
                 d("Grep", serde_json::json!({"pattern": "K", "glob": glob})),
@@ -634,6 +759,9 @@ mod tests {
             "!.env*",
             "src/**/*.py",
             ".env.example",
+            "[u]nit.rs",
+            "*.rs src/**/*.ts",
+            "README.md,docs/*.md",
         ] {
             assert_eq!(
                 d("Grep", serde_json::json!({"pattern": "K", "glob": glob})),

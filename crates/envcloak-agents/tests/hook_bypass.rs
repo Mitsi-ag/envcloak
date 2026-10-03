@@ -292,6 +292,40 @@ const CORPUS: &[(&str, Option<Class>)] = &[
     ("arch -arm64 printenv", Some(Class::EnvDump)),
     ("taskset 0x1 printenv", Some(Class::EnvDump)),
     ("chronic printenv", Some(Class::EnvDump)),
+    // EnvCloak's own wrapper, whose command has the project's keys in its
+    // environment (the verifier's finding).
+    ("envcloak run -- printenv", Some(Class::EnvDump)),
+    ("envcloak run --profile dev -- env", Some(Class::EnvDump)),
+    (
+        "envcloak run --ref A=openai/x -- cat .env",
+        Some(Class::EnvFile),
+    ),
+    ("envcloak run -- sh -c 'export -p'", Some(Class::EnvDump)),
+    ("envcloak run $SEP printenv", Some(Class::Ambiguous)),
+    ("envcloak run -- sh -c 'echo $OPENAI_API_KEY'", None),
+    // Options whose value picks the files a search reads (Codex review:
+    // they were skipped as ordinary values), in every form.
+    ("rg -g '.env*' KEY", Some(Class::EnvFile)),
+    ("rg --glob=.env KEY .", Some(Class::EnvFile)),
+    ("rg --glob=.env* KEY", Some(Class::EnvFile)),
+    ("rg -g.env.local KEY", Some(Class::EnvFile)),
+    ("rg --iglob '[.]E[N]V' KEY", Some(Class::EnvFile)),
+    ("rg -t sh KEY", Some(Class::EnvFile)),
+    ("rg --type=all KEY", Some(Class::EnvFile)),
+    ("rg -tsh KEY", Some(Class::EnvFile)),
+    ("rg --type-add 'x:.env*' -t x KEY", Some(Class::EnvFile)),
+    ("grep -r --include=.env KEY .", Some(Class::EnvFile)),
+    ("grep -r --include '*.env' KEY .", Some(Class::EnvFile)),
+    ("ag -G '[.]env' KEY", Some(Class::EnvFile)),
+    ("rg -g '!.env*' -g '*.rs' KEY", None),
+    // find's wildcards and classes match a leading `.`.
+    ("find . -name '[.]env' -exec cat {} +", Some(Class::EnvFile)),
+    ("find . -name '*env' -exec cat {} \\;", Some(Class::EnvFile)),
+    (
+        "find . -regex '.*/[.]e[n]v' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    ("find . -regex '.*\\.e.v' -exec cat {} +", None),
     // What the hook lets through (docs/INSTALLERS.md, "What the hook does
     // not see").
     ("f=.env; cat \"$f\"", None),
