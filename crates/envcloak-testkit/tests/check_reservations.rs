@@ -1440,6 +1440,48 @@ fn a_helpers_token_used_other_than_handed_on_fails() {
     assert_fails(&t, "a failure token the reader cannot read (`token`)");
 }
 
+/// A private helper is visible in its module's children too, in other
+/// files: its calls there, by a path (`super::name`) or after a `use`, are
+/// read, and a function pointer to it through a glob import is refused. A
+/// local of the same name in a file that does not import it is not the
+/// helper, and passes.
+///
+/// Mutation checked: a private helper's calls read in its own file only:
+/// the child's call is not read, the copy passes and this fails.
+#[test]
+fn a_private_helpers_calls_in_its_modules_children_are_read() {
+    let parent = "crates/envcloak-client/src/zzmod/mod.rs";
+    let child = "crates/envcloak-client/src/zzmod/child.rs";
+    let helper = "fn zz_h(token: &'static str) -> crate::fail::Failure { crate::fail::Failure::new(token, \"x\") }\nmod child;\n";
+    for (body, expect) in [
+        (
+            "pub fn g() -> crate::fail::Failure { super::zz_h(\"pty_unavailable\") }\n",
+            format!("`pty_unavailable` is reserved, but the code already has it ({child})"),
+        ),
+        (
+            "use super::zz_h;\npub fn g() -> crate::fail::Failure { zz_h(\"pty_unavailable\") }\n",
+            format!("`pty_unavailable` is reserved, but the code already has it ({child})"),
+        ),
+        (
+            "use super::*;\npub fn g() -> Option<crate::fail::Failure> { Some(\"pty_unavailable\").map(zz_h) }\n",
+            "the token helper `zz_h` is used other than called by name".to_owned(),
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, parent, helper);
+        add_file(&t, child, body);
+        assert_fails(&t, &expect);
+    }
+    let t = fixture();
+    add_file(&t, parent, helper);
+    add_file(
+        &t,
+        child,
+        "pub fn g(f: &crate::fail::Failure) { let zz_h = f; let _ = zz_h.token(); }\n",
+    );
+    assert_passes(&t.home());
+}
+
 /// `Failure::new` and a token helper are read at their calls, so naming
 /// either any other way (a function pointer, an alias made with `use ...
 /// as`) is refused: the tokens handed to it would not be read.
