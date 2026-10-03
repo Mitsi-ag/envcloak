@@ -21,12 +21,13 @@ pub(crate) static AGENTS_TOML: &str = r#"# Known AI coding agents, for caller ev
 #
 # Every pattern rests on evidence (M2 plan task M2-10, lesson L-15): a
 # real install observed (M2-04's pinned hosts, crates/envcloak-e2e/agents/
-# versions.toml, whose layouts and commands crates/envcloak-e2e/tests/
-# agent_hosts/catalog.rs classifies) or the agent's own documentation,
-# named beside it. `product` names the product an entry belongs to, for
-# coverage reporting. `install_trees` names the directories the agent's
-# documented installers write to, for the Linux standing statement (M2
-# plan D-10); an agent with none has no Linux standing approval.
+# versions.toml, whose layouts and commands the `catalog` tests of
+# crates/envcloak-e2e/tests/agent_hosts.rs classify) or the agent's own
+# documentation, named beside it. `product` names the product an entry
+# belongs to, for coverage reporting. `install_trees` names the
+# directories the agent's documented installers write to, for the Linux
+# standing statement (M2 plan D-10); an agent with none has no Linux
+# standing approval.
 #
 # Left out for want of evidence: Goose (no install observed and no marker
 # documented; its command name `goose` is also a database migration
