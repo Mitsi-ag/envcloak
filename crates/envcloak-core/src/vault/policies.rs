@@ -149,8 +149,8 @@ pub enum IdentityCheckKind {
 }
 
 /// A sign-in target's identity check and the account, tenant and role it
-/// must name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// must name. Its `Debug` shows the kind and the texts' lengths only.
+#[derive(Clone, PartialEq, Eq)]
 pub struct IdentityCheck {
     pub kind: IdentityCheckKind,
     /// The endpoint's path or the element's selector.
@@ -185,8 +185,9 @@ pub enum SessionFormat {
     CookiesAndStorage = 3,
 }
 
-/// What a target's delivery moves, and nothing else.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a target's delivery moves, and nothing else. Its `Debug` shows
+/// how many cookies and storage keys, and the format.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TransferScope {
     pub cookies: Vec<CookieScope>,
     pub storage: Vec<StorageScope>,
@@ -202,8 +203,10 @@ pub struct AdapterRef {
 
 /// A sign-in target (SPEC §6.8; M2b-05 registers and checks them), record
 /// version 1. Origins are kept as the person registered them, in ASCII;
-/// M2b-05's parser (D-26) decides what is accepted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// M2b-05's parser (D-26) decides what is accepted. Its `Debug` shows its
+/// name, ids, numbers and how many of each list, never a text the person
+/// registered (L-12).
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignInTarget {
     /// The name requests use for it.
     pub name: String,
@@ -299,8 +302,9 @@ pub struct DirIdentity {
 /// A registered launch's environment, besides the runner's fixed
 /// passthrough list (D-33): the recorded `PATH`, the declared non-secret
 /// variables and the names of the injected bindings. Never a value of a
-/// binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// binding. Its `Debug` shows names only: a declared variable's value came
+/// from a host config, where literal keys sit.
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchEnv {
     pub path_env: Vec<u8>,
     pub vars: Vec<(String, String)>,
@@ -308,8 +312,11 @@ pub struct LaunchEnv {
 }
 
 /// The declaration `migrate-mcp` gave, exactly as given (CR-2), which
-/// `migrate-mcp --update` re-resolves.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `migrate-mcp --update` re-resolves. Its `Debug` shows how many
+/// arguments and the variables' names: what a host config gave may hold a
+/// literal key (`--api-key=<key>` in argv, a value in env) that extraction
+/// missed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchDecl {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
@@ -317,8 +324,9 @@ pub struct LaunchDecl {
     pub path_env: Option<String>,
 }
 
-/// A managed stdio server's registered launch (D-33).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A managed stdio server's registered launch (D-33). Its `Debug` shows
+/// argv by count and its environment and declaration as theirs do.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredLaunch {
     pub launch_id: [u8; 16],
     pub revision: u64,
@@ -334,8 +342,9 @@ pub struct RegisteredLaunch {
     pub declaration: LaunchDecl,
 }
 
-/// How a managed server is reached.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How a managed server is reached. Its `Debug` shows a bridge's header
+/// names and its origin's length.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ManagedTransport {
     Stdio(Box<RegisteredLaunch>),
     /// An HTTP server reached through `mcp-bridge` (D-18): its exact
@@ -357,6 +366,125 @@ pub struct ManagedServer {
     pub registered_by: SubjectKindRecord,
     /// "Written by migrate-mcp on this device".
     pub written_by_migrate_mcp: bool,
+}
+
+/// A text or byte string a person or a host config gave, as the policy
+/// records' `Debug` shows it: its length, never its bytes (L-12).
+struct Elided(usize);
+
+impl core::fmt::Debug for Elided {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "<{} bytes>", self.0)
+    }
+}
+
+fn elided(b: &(impl AsRef<[u8]> + ?Sized)) -> Elided {
+    Elided(b.as_ref().len())
+}
+
+/// The names of `(name, value)` pairs, for a `Debug` that shows no value.
+fn names(pairs: &[(String, String)]) -> Vec<&str> {
+    pairs.iter().map(|(n, _)| n.as_str()).collect()
+}
+
+impl core::fmt::Debug for IdentityCheck {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IdentityCheck")
+            .field("kind", &self.kind)
+            .field("locator", &elided(&self.locator))
+            .field("account", &elided(&self.account))
+            .field("tenant", &self.tenant.as_ref().map(elided))
+            .field("role", &elided(&self.role))
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for TransferScope {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TransferScope")
+            .field("cookies", &self.cookies.len())
+            .field("storage", &self.storage.len())
+            .field("format", &self.format)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for SignInTarget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SignInTarget")
+            .field("name", &self.name)
+            .field("login", &self.login)
+            .field("revision", &self.revision)
+            .field("app_origins", &self.app_origins.len())
+            .field("credential_origins", &self.credential_origins.len())
+            .field(
+                "identity_provider_origins",
+                &self.identity_provider_origins.len(),
+            )
+            .field("callback_origins", &self.callback_origins.len())
+            .field("identity_check", &self.identity_check)
+            .field("transfer", &self.transfer)
+            .field("tier", &self.tier)
+            .field("adapter", &self.adapter)
+            .field("approval_lifetime", &self.approval_lifetime)
+            .field("session_lifetime", &self.session_lifetime)
+            .field("revocation", &self.revocation.as_ref().map(elided))
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for LaunchEnv {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LaunchEnv")
+            .field("path_env", &elided(&self.path_env))
+            .field("vars", &names(&self.vars))
+            .field("binding_names", &self.binding_names)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for LaunchDecl {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LaunchDecl")
+            .field("argv", &self.argv.len())
+            .field("cwd", &self.cwd.as_ref().map(elided))
+            .field("env", &names(&self.env))
+            .field("path_env", &self.path_env.as_ref().map(elided))
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for RegisteredLaunch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RegisteredLaunch")
+            .field("launch_id", &self.launch_id)
+            .field("revision", &self.revision)
+            .field("class", &self.class)
+            .field("executable", &self.executable)
+            .field("argv", &self.argv.len())
+            .field("cwd", &self.cwd)
+            .field("env", &self.env)
+            .field("entry", &self.entry)
+            .field("strength", &self.strength)
+            .field("declaration", &self.declaration)
+            .finish()
+    }
+}
+
+impl core::fmt::Debug for ManagedTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ManagedTransport::Stdio(l) => f.debug_tuple("Stdio").field(l).finish(),
+            ManagedTransport::Bridge {
+                origin,
+                header_names,
+            } => f
+                .debug_struct("Bridge")
+                .field("origin", &elided(origin))
+                .field("header_names", header_names)
+                .finish(),
+        }
+    }
 }
 
 /// The standing-policy set's header (D-10): its generation, moved by one
@@ -1222,6 +1350,122 @@ mod tests {
                 header_names: vec!["Authorization".into()],
             }),
         ]
+    }
+
+    /// Every policy record's `Debug` is value-free (L-12): a text or byte
+    /// string a person or a host config gave (argv, a variable's value, the
+    /// declaration as `migrate-mcp` gave it, an origin, the identity
+    /// check's account and the rest a target registers) shows as its
+    /// length, neither as text nor as the list of its bytes; names show.
+    /// The positive controls: each canary is in the record's encoding, so
+    /// the record holds it, and the names are in its `Debug`.
+    ///
+    /// Mutations checked: the derived `Debug` given back to `LaunchDecl`,
+    /// to `LaunchEnv`, to `RegisteredLaunch`, to `ManagedTransport` and to
+    /// `SignInTarget`: a canary shows, and this fails for each.
+    #[test]
+    fn debug_shows_no_text_a_person_or_a_host_config_gave() {
+        let c = |slot: &str| format!("debug-canary-{slot}");
+        // Text, and the list of its bytes as a derived `Debug` of a byte
+        // string prints it.
+        let shows = |debug: &str, canary: &str| {
+            let bytes = format!("{:?}", canary.as_bytes());
+            debug.contains(canary) || debug.contains(&bytes[1..bytes.len() - 1])
+        };
+        let mut l = launch(LaunchClass::Script, false);
+        l.argv.push(c("argv").into_bytes());
+        l.env.path_env = c("path-env").into_bytes();
+        l.env.vars.push(("NODE_OPTIONS_NAME".into(), c("var")));
+        l.declaration = LaunchDecl {
+            argv: vec!["node".into(), c("decl-argv")],
+            cwd: Some(c("decl-cwd")),
+            env: vec![("TOKEN_NAME".into(), c("decl-env"))],
+            path_env: Some(c("decl-path")),
+        };
+        let stdio = managed(ManagedTransport::Stdio(Box::new(l)));
+        let bridge = managed(ManagedTransport::Bridge {
+            origin: c("origin"),
+            header_names: vec!["Authorization".into()],
+        });
+        let PolicyRecord::SignInTarget(mut t) = target(true) else {
+            unreachable!()
+        };
+        t.app_origins.push(c("app-origin"));
+        t.credential_origins.push(c("credential-origin"));
+        t.identity_provider_origins.push(c("idp-origin"));
+        t.callback_origins.push(c("callback-origin"));
+        t.identity_check = IdentityCheck {
+            kind: IdentityCheckKind::Endpoint,
+            locator: c("locator"),
+            account: c("account"),
+            tenant: Some(c("tenant")),
+            role: c("role"),
+        };
+        t.transfer.cookies.push(CookieScope {
+            name: c("cookie-name"),
+            domain: c("cookie-domain"),
+            path: c("cookie-path"),
+        });
+        t.transfer.storage.push(StorageScope {
+            origin: c("storage-origin"),
+            key: c("storage-key"),
+        });
+        t.revocation = Some(c("revocation"));
+        let target = PolicyRecord::SignInTarget(t);
+        let cases: [(&PolicyRecord, &[&str], &[&str]); 3] = [
+            (
+                &stdio,
+                &[
+                    "argv",
+                    "path-env",
+                    "var",
+                    "decl-argv",
+                    "decl-cwd",
+                    "decl-env",
+                    "decl-path",
+                ],
+                &["NODE_OPTIONS_NAME", "TOKEN_NAME", "API_KEY", "codex/files"],
+            ),
+            (&bridge, &["origin"], &["Authorization", "codex/files"]),
+            (
+                &target,
+                &[
+                    "app-origin",
+                    "credential-origin",
+                    "idp-origin",
+                    "callback-origin",
+                    "locator",
+                    "account",
+                    "tenant",
+                    "role",
+                    "cookie-name",
+                    "cookie-domain",
+                    "cookie-path",
+                    "storage-origin",
+                    "storage-key",
+                    "revocation",
+                ],
+                &["fixture", "envcloak-test-session"],
+            ),
+        ];
+        for (r, slots, names) in cases {
+            let encoded = r.encode();
+            for debug in [format!("{r:?}"), format!("{r:#?}")] {
+                for slot in slots {
+                    let canary = c(slot);
+                    assert!(
+                        encoded
+                            .windows(canary.len())
+                            .any(|w| w == canary.as_bytes()),
+                        "the record does not hold {slot}"
+                    );
+                    assert!(!shows(&debug, &canary), "Debug shows {slot}: {debug}");
+                }
+                for name in names {
+                    assert!(debug.contains(name), "Debug lacks {name}: {debug}");
+                }
+            }
+        }
     }
 
     #[test]
