@@ -455,6 +455,43 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(e.kind(), VaultErrorKind::LoginField);
+        // Nor does the typed write make a login field on another item:
+        // every typed value, on a secret, is refused, and the secret is
+        // left as it was. Mutation checked: `replace_login_field` without
+        // its class check: it writes a typed field on the secret, and this
+        // fails.
+        let secret = v
+            .transact(|t| {
+                let s = t.create_item(NewItem {
+                    class: ItemClass::Secret,
+                    slug: Slug::new("fixture/secret").unwrap(),
+                    details: ItemDetails::default(),
+                })?;
+                t.add_field(
+                    s,
+                    FieldName::new("value").unwrap(),
+                    SecretBytes::copy_from(b"x"),
+                )?;
+                Ok(s)
+            })
+            .unwrap();
+        let before = v.item(secret).unwrap().clone();
+        for value in [
+            LoginFieldValue::Username(SecretBytes::copy_from(b"u")),
+            LoginFieldValue::Password(SecretBytes::copy_from(b"p")),
+            LoginFieldValue::AdapterKey(SecretBytes::copy_from(b"a")),
+            LoginFieldValue::Totp(TotpEnrollment {
+                params: TotpParams::new(TotpAlgorithm::Sha1, 6, 30).unwrap(),
+                seed: SecretBytes::copy_from(b"s"),
+            }),
+        ] {
+            let kind = value.kind();
+            let e = v
+                .transact(|t| t.replace_login_field(secret, value))
+                .unwrap_err();
+            assert_eq!(e.kind(), VaultErrorKind::LoginField, "{kind:?}");
+        }
+        assert_eq!(v.item(secret).unwrap(), &before);
         assert_eq!(v.integrity(), Integrity::Ok);
     }
 

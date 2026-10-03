@@ -736,3 +736,31 @@ fn unreadable(e: &CryptoOrRecord) -> TamperKind {
         CryptoOrRecord::Record => TamperKind::RowInconsistent,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The login class (4) is read only from schema version 2, which added
+    /// it: in a version 1 vault a row of class 4 has no class (unlock
+    /// reports the rows inconsistent, and the migration refuses the vault)
+    /// rather than being taken for a login. Mutation checked: class 4 read
+    /// as a login at every schema version: this fails.
+    #[test]
+    fn the_login_class_is_read_only_from_schema_version_2() {
+        for schema in [1, 2, 3] {
+            assert_eq!(item_class_from(1, schema), Some(ItemClass::Secret));
+            assert_eq!(item_class_from(2, schema), Some(ItemClass::Card));
+            assert_eq!(
+                item_class_from(3, schema),
+                Some(ItemClass::IssuerCredential)
+            );
+            for unknown in [-1, 0, 5, i64::MAX] {
+                assert_eq!(item_class_from(unknown, schema), None, "{unknown}");
+            }
+        }
+        assert_eq!(item_class_from(4, 1), None);
+        assert_eq!(item_class_from(4, 2), Some(ItemClass::Login));
+        assert_eq!(item_class_from(4, 3), Some(ItemClass::Login));
+    }
+}
