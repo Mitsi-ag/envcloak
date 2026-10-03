@@ -413,3 +413,83 @@ fn session_start_names_the_bound_variables_and_is_silent_without_a_daemon() {
     drop(d);
     home.assert_clean(&cs);
 }
+
+/// The Codex review: the hook read its payload, which can hold a pasted
+/// key, with no tracer check (SPEC §5: nothing that may be a secret is
+/// read under a tracer). Traced from its first instruction, `envcloak
+/// hook` reads nothing from standard input (a file here, whose offset,
+/// shared with this test, shows any read), stops the prompt and the tool
+/// call with `[envcloak:traced]`, and adds nothing at `SessionStart`. The
+/// control, untraced, reads the same file and stops the prompt for its
+/// key.
+///
+/// Mutation checked: the `refuse_if_traced` check taken out of
+/// `cmd/hook.rs`: the payload is read (the offset moves), the prompt is
+/// stopped as `key_in_prompt`, and this fails.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_a_traced_hook_reads_nothing() {
+    use std::io::Seek;
+
+    use envcloak_sys::testing::spawn_traced;
+
+    let home = TestHome::new();
+    let cs = canaries(fresh_seed());
+    let key = by_label(&cs, labels::OPENAI_API_KEY).as_str();
+    let files = outside_dir();
+    // `event`'s payload in a file, as `host`'s hook reads it, traced or
+    // not: the output, and how far the file was read.
+    let feed = |host: &str, event: &str, payload: &[u8], traced: bool| -> (Output, u64) {
+        let p = files.path().join(format!("{host}-{event}-{traced}"));
+        std::fs::write(&p, payload).unwrap();
+        let f = std::fs::File::open(&p).unwrap();
+        let mut probe = f.try_clone().unwrap();
+        let mut cmd = Command::new(cli());
+        home.apply(&mut cmd)
+            .arg("hook")
+            .args(args(host, event))
+            .current_dir(home.home())
+            .stdin(Stdio::from(f))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = if traced {
+            spawn_traced(&mut cmd).unwrap()
+        } else {
+            cmd.spawn().unwrap()
+        };
+        let o = wait(child, Duration::from_secs(30));
+        assert_no_canary(&o.stdout, &cs);
+        assert_no_canary(&o.stderr, &cs);
+        (o, probe.stream_position().unwrap())
+    };
+    for host in ["claude-code", "codex"] {
+        let prompt = with_prompt(host, &format!("please use {key}"));
+        for (event, payload) in [
+            ("UserPromptSubmit", prompt.clone()),
+            ("PreToolUse", with_command(host, &format!("echo {key}"))),
+        ] {
+            let (o, read) = feed(host, event, &payload, true);
+            assert_eq!(read, 0, "{host} {event}: the traced hook read its payload");
+            assert_denied(&o, host, event, "[envcloak:traced]");
+        }
+        let (o, read) = feed(
+            host,
+            "SessionStart",
+            &session_start(host, &home.home()),
+            true,
+        );
+        assert_eq!(read, 0, "{host}: the traced SessionStart read its payload");
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        assert!(o.stdout.is_empty() && o.stderr.is_empty());
+        // The control: untraced, the payload is read, and the prompt is
+        // stopped for its key.
+        let (o, read) = feed(host, "UserPromptSubmit", &prompt, false);
+        assert_eq!(
+            read,
+            prompt.len() as u64,
+            "{host}: the control read nothing"
+        );
+        assert_denied(&o, host, "UserPromptSubmit", "[envcloak:key_in_prompt]");
+    }
+    home.assert_clean(&cs);
+}

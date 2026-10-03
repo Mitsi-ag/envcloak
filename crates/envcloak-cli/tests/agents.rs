@@ -1481,3 +1481,73 @@ fn arguments_are_never_echoed() {
         }
     }
 }
+
+/// The Codex review: `agents install` and `uninstall` read the agents'
+/// configs, which can hold literal keys, with no tracer check (SPEC §5).
+/// Traced from their first instruction, each exits 1 with `traced` before
+/// it reads one: no plan and no report is printed, and nothing changes.
+/// The control, untraced, prints the plan, which reading the configs
+/// makes (`~/.claude/settings.json` is read for the plugin), so only the
+/// order of the check refuses the traced runs.
+///
+/// Mutation checked: the `refuse_if_traced` check taken out of
+/// `cmd/agents.rs`: the traced install prints its plan and this fails.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_traced_agents_commands_read_no_config() {
+    use envcloak_sys::testing::spawn_traced;
+
+    let f = Fixture::new();
+    std::fs::write(
+        f.path(".claude/settings.json"),
+        format!(
+            "{{\"env\": {{\"OPENAI_API_KEY\": \"{}\"}}}}\n",
+            by_label(&f.cs, labels::OPENAI_API_KEY).as_str()
+        ),
+    )
+    .unwrap();
+    let before: Vec<Vec<u8>> = FILES.iter().map(|p| f.read(p)).collect();
+    let agents = |args: &[&str], traced: bool| -> Output {
+        let mut cmd = Command::new(cli());
+        f.home
+            .apply(&mut cmd)
+            .arg("agents")
+            .args(args)
+            .env("PATH", format!("{}:{TEST_PATH}", f.bin.display()))
+            .current_dir(f.home.home())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = if traced {
+            spawn_traced(&mut cmd).unwrap()
+        } else {
+            cmd.spawn().unwrap()
+        };
+        let out = child.wait_with_output().unwrap();
+        assert_no_canary(&out.stdout, &f.cs);
+        assert_no_canary(&out.stderr, &f.cs);
+        out
+    };
+    for args in [
+        &["install"][..],
+        &["install", "--yes"],
+        &["uninstall"],
+        &["uninstall", "--yes"],
+    ] {
+        let out = agents(args, true);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).starts_with("envcloak: traced:"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+        assert!(out.stdout.is_empty(), "{args:?}: {}", stdout(&out));
+    }
+    let now: Vec<Vec<u8>> = FILES.iter().map(|p| f.read(p)).collect();
+    assert_eq!(now, before);
+    // The control: untraced, the plan is printed.
+    let out = agents(&["install"], false);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("settings.json"), "{}", stdout(&out));
+    f.sweep();
+}

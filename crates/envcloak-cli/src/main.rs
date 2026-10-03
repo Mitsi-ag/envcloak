@@ -41,7 +41,9 @@
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
 //! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`, `init`,
-//! `import`, `recovery confirm`, `recover`) refuses under a tracer first,
+//! `import`, `recovery confirm`, `recover`), or input that can hold one
+//! (`hook`, whose prompt can hold a pasted key; `agents install` and
+//! `uninstall`, which read agents' configs), refuses under a tracer first,
 //! before it reads a file, a descriptor or the terminal.
 //!
 //! The commands of M2 and M2b are registered ahead of their tasks and

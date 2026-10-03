@@ -24,6 +24,10 @@
 //! - A payload that is not the one `--host` and `--event` name: no
 //!   decision, a value-free diagnostic and exit 1, which both hosts take
 //!   as a hook error that stops nothing.
+//! - A debugger or tracer attached to the handler: standard input is not
+//!   read at all (a prompt can hold a key; SPEC §5, the Codex review), and
+//!   the prompt or the tool call is stopped (`traced`); `SessionStart`
+//!   adds nothing.
 //! - `SessionStart`: when the session's directory has an `envcloak.toml`
 //!   and the daemon answers within the 2 seconds, the names (never the
 //!   values) of the variables it binds and the one-line usage rule, as
@@ -42,7 +46,7 @@ use envcloak_agents::hook::{
     self, Decision, Event, Host, MAX_PAYLOAD, NO_DECISION, Reason, answer, payload_cwd,
     session_context,
 };
-use envcloak_client::fail::Failure;
+use envcloak_client::fail::{Failure, refuse_if_traced};
 use envcloak_core::SecretBuf;
 use envcloak_policy::find_manifest;
 use zeroize::Zeroizing;
@@ -150,6 +154,15 @@ pub fn run(args: &[&str]) -> ExitCode {
         eprintln!("envcloak: usage: {USAGE_TEXT}");
         return ExitCode::from(NO_DECISION);
     };
+    // Nothing is read under a tracer, the payload included: a prompt can
+    // hold a pasted key (SPEC §5; the Codex review: the hook read it
+    // first).
+    if refuse_if_traced().is_err() {
+        if event == Event::SessionStart {
+            return ExitCode::SUCCESS;
+        }
+        return emit(&answer(host, event, Decision::Deny(Reason::Traced)));
+    }
     let deadline = start + LIMIT;
     let payload = match read_payload(deadline) {
         Ok(p) => p,
