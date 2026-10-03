@@ -919,6 +919,48 @@ fn the_project_scope_writes_where_the_project_already_keeps_instructions() {
     f.sweep();
 }
 
+/// `envcloak init --agents-note` (SPEC §6.4 step 4) writes the project's
+/// block as `agents install --project` does: into a lone `AGENTS.md`,
+/// with no `CLAUDE.md` beside it; a dry run of `--import` writes nothing.
+///
+/// Mutation checked: `--agents-note` parsed but `project_note` not called
+/// from `init`: `AGENTS.md` has no block and this fails.
+#[test]
+fn init_agents_note_writes_the_projects_block() {
+    let f = Fixture::new();
+    let dir = f.home.root().join("noted");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("AGENTS.md"), "# Notes\n").unwrap();
+    let init = |args: &[&str]| {
+        let mut argv = vec!["init"];
+        argv.extend_from_slice(args);
+        let mut cmd = cli_command(&f.home, &argv, &[]);
+        cmd.current_dir(&dir);
+        let out = finish_within(cmd, Duration::from_secs(120));
+        assert_no_canary(&out.stdout, &f.cs);
+        assert_no_canary(&out.stderr, &f.cs);
+        out
+    };
+    let out = init(&["--import", "--agents-note"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("the agent note was not written"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
+        "# Notes\n"
+    );
+    let out = init(&["--agents-note"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("Agent note:"), "{}", stdout(&out));
+    let t = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+    assert_eq!(t, format!("# Notes\n\n{}", blocks::block()));
+    assert!(!dir.join("CLAUDE.md").exists());
+    f.sweep();
+}
+
 /// D-20: every `envcloak <command>` the instruction block names is one
 /// this build ships (dispatched, never `not_in_this_build`), the block
 /// never names `--ask`, and it is the reviewed text.
