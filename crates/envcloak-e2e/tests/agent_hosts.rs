@@ -82,11 +82,11 @@ fn importer_of_every_open_resolver() -> (tempfile::TempDir, std::path::PathBuf) 
 }
 
 /// What the loopback-only isolation leaves open on macOS (verifier review
-/// of M2-04): the resolver's XPC service, which Network.framework,
-/// URLSession, CFNetwork's streams and host lookups and
-/// `dnssd_getaddrinfo` use, and which no file access control can deny. No
+/// of M2-04): the resolver's XPC service, which Network.framework (and
+/// URLSession on it) and `dnssd_getaddrinfo` use, and which no file access
+/// control can deny, and CFNetwork's own lookups, not shown refused. No
 /// executable or library of a pinned host's tree, nor the Node.js that
-/// runs a script host, imports any of them
+/// runs a script host, imports any of their entry points
 /// ([`envcloak_e2e::OPEN_RESOLVERS`]): a check of static imports only,
 /// which a framework loaded at run time (`dlopen`) passes unseen
 /// (docs/ACCEPTANCE.md). The positive controls: a program built here that
