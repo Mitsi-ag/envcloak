@@ -385,6 +385,9 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `backup_unread` | M2-05 | landed | a backup v2 restore could not have a file's backed-up contents whole (a chunk missing or of another length, or the whole not the backed-up SHA-256); nothing is written in its place |
 | `swap_unsupported` | M2-05 | landed | a backup v2 restore found a file system that cannot swap two names in one step, so the file it would write over could not be checked as it moved out; nothing is written in its place |
 | `aside_changed` | M2-05 | landed | a file was rewritten or written back, but what was under the temporary name the old file was left under is not the old file as it was checked (another program wrote into it there, or put its own file under that name, after the swap): it is kept as it is, and named, never called the old copy |
+| `hook_payload` | M2-08 | landed | `envcloak hook`: the payload on standard input is not the one `--host` and `--event` name (another host's or event's, or not JSON); no decision is made, and the hook exits 1, which both hosts take as an error that stops nothing |
+| `command_refused` | M2-08 | landed | `run_with_secrets`: an argv the `PreToolUse` hook denies in a shell (an env file read, the environment printed, `envcloak reveal` or `approve`, or a script it cannot read), refused with the hook's message before the daemon is asked (D-22) |
+| `agents_incomplete` | M2-08 | landed | `envcloak agents install` or `uninstall` (or `init --agents-note`) left a file as it was (refused, with the reason on its line of the report), or a host named with `--agent` is not installed; exit 1 |
 <!-- /reservations -->
 
 **Coverage tokens** (`envcloak agents status`; states, reasons and probe outcomes share one namespace):

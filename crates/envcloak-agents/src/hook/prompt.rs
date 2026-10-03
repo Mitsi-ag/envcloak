@@ -17,7 +17,9 @@
 //! What this does not catch is in docs/INSTALLERS.md ("What the hook does
 //! not see"): a key made of words and separators that no provider
 //! pattern names (an AWS secret access key on its own), a key of 40 or 64
-//! hexadecimal digits, and a key encoded or split by other text.
+//! hexadecimal digits, a URL whose password holds a character a URL must
+//! escape (`/`, a space, a quote) written unescaped, and a key encoded or
+//! split by other text.
 
 /// The shortest run of letters and digits taken for a generated key.
 pub const RUN: usize = 24;

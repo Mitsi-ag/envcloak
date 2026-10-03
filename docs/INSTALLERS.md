@@ -116,7 +116,7 @@ Each row is a way past the hook, with the commands of the bypass corpus (`crates
 | A relative path into `/proc` | `cd /proc/self && cat environ` |
 <!-- /hook-misses -->
 
-The prompt check misses: a key made of words and separators that no provider pattern names (an AWS secret access key on its own), a key of exactly 40 or 64 hexadecimal digits, and a key encoded or broken up by other text. Hooks see only what the host passes them: Codex's `write_stdin` into a running session does not rerun `PreToolUse`, hosted tools are not covered, and `@` mentions never reach Claude Code's `PreToolUse` (the `Read(**/.env*)` deny rule covers them, best effort).
+The prompt check misses: a key made of words and separators that no provider pattern names (an AWS secret access key on its own), a key of exactly 40 or 64 hexadecimal digits, a URL whose password holds a character a URL must escape (a `/`, a space, a quote) written unescaped, and a key encoded or broken up by other text. Hooks see only what the host passes them: Codex's `write_stdin` into a running session does not rerun `PreToolUse`, hosted tools are not covered, and `@` mentions never reach Claude Code's `PreToolUse` (the `Read(**/.env*)` deny rule covers them, best effort).
 
 ## Claude Code plugin
 
