@@ -357,12 +357,24 @@ pub(crate) fn read_segment(path: &Path) -> Result<Vec<u8>, AuditError> {
 
 /// How the writer writes and flushes. The default writes to the file and
 /// flushes with [`envcloak_sys::sync_file`]; tests put a shim in its place
-/// to count the calls and to make one fail.
+/// to count the calls, to make one fail, and to act as another program
+/// at a moment they pick.
 pub trait AuditIo: Send {
     /// Appends `bytes` to `f`, a segment opened for appending.
     fn write(&mut self, f: &File, bytes: &[u8]) -> io::Result<()>;
     /// Makes `f`, a segment or the log's directory, durable.
     fn sync(&mut self, f: &File) -> io::Result<()>;
+    /// Opens the directory at `path` to flush it, as [`open_dir`] does
+    /// (`O_DIRECTORY`, and `O_NOFOLLOW` with `nofollow`): every directory
+    /// the writer flushes is opened here (R-26).
+    fn open_dir(&mut self, path: &Path, nofollow: bool) -> io::Result<File> {
+        open_dir(path, nofollow)
+    }
+    /// Called in an append once the directories are flushed, between the
+    /// check that the flushed log directory names the segment and the
+    /// check that the log's path still names that directory (R-24). The
+    /// default does nothing.
+    fn checking(&mut self) {}
 }
 
 /// The real thing.
@@ -479,9 +491,10 @@ impl AuditWriter {
             check_private_dir(dir)?;
         }
         let keys = LogKeys::new(k);
+        let mut io = io;
         let other_vault_moved = other_vaults_log(dir, &keys.vault_id)?;
         if other_vault_moved {
-            move_aside(dir)?;
+            move_aside(dir, io.as_mut())?;
         }
         let w: Walk = walk(dir, &keys, anchor, false)?;
         let mut report = OpenReport {
@@ -513,7 +526,8 @@ impl AuditWriter {
                 // A segment whose header a crash cut short: no entry was
                 // ever in it. Remove it; the next append makes it again.
                 std::fs::remove_file(&last.path)?;
-                writer.io.sync(&File::open(dir)?)?;
+                let log = writer.io.open_dir(dir, true)?;
+                writer.io.sync(&log)?;
                 report.torn_tail_removed = true;
                 report.torn_bytes = last.len;
             } else if last.torn && last.clean && last.good_len < last.len {
@@ -561,14 +575,53 @@ impl AuditWriter {
     /// the same sequence number again.
     pub fn append(&mut self, r: &AuditRecord) -> Result<u64, AuditError> {
         let seq = self.next_seq;
-        let next = seq.checked_add(1).ok_or(AuditErrorKind::Full)?;
-        let sealed = self.keys.seal(seq, r)?;
-        let mac = self.keys.chain(&self.head_mac, seq, &sealed);
-        let frame = encode_frame(seq, &sealed, &mac);
+        self.append_batch(core::slice::from_ref(r))?;
+        Ok(seq)
+    }
+
+    /// Appends the first of `rs`, and as many after it as the segment has
+    /// room for, as the next entries, durable together when this returns:
+    /// written at once, then the segment flushed once and the directories
+    /// once for all of them, as [`AuditWriter::append`] flushes one (R-25:
+    /// the daemon writes the events it queued while the vault was locked
+    /// so, which gate no request, rather than flushing three times for
+    /// each). Returns how many were appended, at least one when `rs` is
+    /// not empty; the caller appends the rest again.
+    ///
+    /// # Errors
+    /// As [`AuditWriter::append`]: none of them was acknowledged.
+    pub fn append_batch(&mut self, rs: &[AuditRecord]) -> Result<usize, AuditError> {
+        let Some(first) = rs.first() else {
+            return Ok(0);
+        };
+        let mut seq = self.next_seq;
+        let mut next = seq.checked_add(1).ok_or(AuditErrorKind::Full)?;
+        let sealed = self.keys.seal(seq, first)?;
+        let mut mac = self.keys.chain(&self.head_mac, seq, &sealed);
+        let mut frames = encode_frame(seq, &sealed, &mac);
+        let mut count = 1;
         let (mut cur, before) = self.segment()?;
+        for r in &rs[1..] {
+            // More only while the segment has room: it never grows past
+            // one frame over its size, as one append at a time leaves it.
+            let full = before.saturating_add(frames.len() as u64) >= self.max_segment;
+            let (Some(after), false) = (next.checked_add(1), full) else {
+                break;
+            };
+            // An entry that cannot be sealed is the first of the next call,
+            // which reports it.
+            let Ok(sealed) = self.keys.seal(next, r) else {
+                break;
+            };
+            seq = next;
+            next = after;
+            mac = self.keys.chain(&mac, seq, &sealed);
+            frames.extend_from_slice(&encode_frame(seq, &sealed, &mac));
+            count += 1;
+        }
         let written = self
             .io
-            .write(&cur.file, &frame)
+            .write(&cur.file, &frames)
             .map_err(AuditError::from)
             .and_then(|()| {
                 self.io
@@ -581,11 +634,11 @@ impl AuditWriter {
                 self.current = Some(cur);
                 self.next_seq = next;
                 self.head_mac = mac;
-                Ok(seq)
+                Ok(count)
             }
             Err(e) => {
-                // Cut the frame back off. If that fails too, the segment
-                // may end in a frame nobody acknowledged: the next append
+                // Cut the frames back off. If that fails too, the segment
+                // may end in frames nobody acknowledged: the next append
                 // starts a new segment.
                 let undone = cur
                     .file
@@ -634,26 +687,31 @@ impl AuditWriter {
     /// back, or a directory made anew (by this writer or another program,
     /// on a file system that can give it the device and inode of the one
     /// before), is not durable until the directory holding it is flushed
-    /// again (Codex F-64). Then the directory there must still be the one
-    /// it flushed, and the segment's name in it must be the file the entry
-    /// was written to ([`in_log`]): a directory swapped in, even one
-    /// holding the segment, was not flushed. A failed flush or check fails
-    /// the append.
+    /// again (Codex F-64). Then the segment's name in the directory it
+    /// flushed, looked up through that directory's handle, must be the
+    /// file the entry was written to ([`held_in`]), and last the log's path
+    /// must still name that directory, a private one: a directory swapped
+    /// in, even one holding the segment, was not flushed, and a swap
+    /// between the two checks fails the second (R-24). A failed flush or
+    /// check fails the append.
     fn settle(&mut self, cur: &Current) -> Result<(), AuditError> {
-        let log = open_dir(&self.dir, true)?;
+        let log = self.io.open_dir(&self.dir, true)?;
         let data = match self.dir.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
-        let data = open_dir(data, false)?;
+        let data = self.io.open_dir(data, false)?;
         self.io
             .sync(&log)
             .and_then(|()| self.io.sync(&data))
             .map_err(|_| AuditError::from(AuditErrorKind::Sync))?;
+        let held = held_in(&log, cur);
+        self.io.checking();
         let flushed = log.metadata()?;
-        let there = std::fs::symlink_metadata(&self.dir)
-            .is_ok_and(|m| m.dev() == flushed.dev() && m.ino() == flushed.ino());
-        if there && in_log(&self.dir, cur) {
+        let there = check_private_dir(&self.dir).is_ok()
+            && std::fs::symlink_metadata(&self.dir)
+                .is_ok_and(|m| m.dev() == flushed.dev() && m.ino() == flushed.ino());
+        if held && there {
             Ok(())
         } else {
             Err(io::Error::from(io::ErrorKind::NotFound).into())
@@ -701,6 +759,20 @@ fn in_log(dir: &Path, cur: &Current) -> bool {
             .is_ok_and(|m| m.is_file() && m.dev() == open.dev() && m.ino() == open.ino())
 }
 
+/// Whether `log`, a directory the writer holds open, names `cur`'s
+/// segment by its file name as the file the writer has open (same device
+/// and inode, a regular file): looked up through the handle, never
+/// through a symlink and never waiting on a FIFO, so the answer is about
+/// the directory flushed, whatever its path names now (R-24).
+fn held_in(log: &File, cur: &Current) -> bool {
+    let (Some(name), Ok(open)) = (cur.path.file_name(), cur.file.metadata()) else {
+        return false;
+    };
+    envcloak_sys::open_beneath(log, name)
+        .and_then(|f| f.metadata())
+        .is_ok_and(|m| m.is_file() && m.dev() == open.dev() && m.ino() == open.ino())
+}
+
 /// Opens a directory to flush it, with `O_DIRECTORY`: anything else in its
 /// place (a file, a FIFO another program put there) fails rather than
 /// being flushed instead, or blocking the open. With `nofollow`, a symlink
@@ -736,8 +808,10 @@ fn other_vaults_log(dir: &Path, ours: &VaultId) -> Result<bool, AuditError> {
 }
 
 /// Renames the log's directory to `audit.replaced-<UTC time>` beside it
-/// (`-1`, `-2` and so on when that is taken) and syncs the parent.
-fn move_aside(dir: &Path) -> Result<(), AuditError> {
+/// (`-1`, `-2` and so on when that is taken) and syncs the parent, opened
+/// as a directory through `io` (R-26: anything else in its place fails
+/// rather than blocking the open).
+fn move_aside(dir: &Path, io: &mut dyn AuditIo) -> Result<(), AuditError> {
     let parent = dir.parent().ok_or(AuditErrorKind::Unsafe)?;
     let stamp = utc_stamp(now_secs());
     for n in 0..1000u32 {
@@ -751,7 +825,8 @@ fn move_aside(dir: &Path) -> Result<(), AuditError> {
             continue;
         }
         std::fs::rename(dir, &to)?;
-        envcloak_sys::sync_file(&File::open(parent)?)?;
+        let parent = io.open_dir(parent, false)?;
+        io.sync(&parent)?;
         return Ok(());
     }
     Err(std::io::Error::from(io::ErrorKind::AlreadyExists).into())

@@ -62,6 +62,12 @@ struct Plan {
     before_frame: Option<Race>,
     /// Run just before the next directory is flushed.
     before_dir_sync: Option<Race>,
+    /// Run just before the next directory is opened to be flushed.
+    before_dir_open: Option<Race>,
+    /// Run between the two checks after the next append's flushes.
+    between_checks: Option<Race>,
+    /// How many directories were opened to be flushed.
+    dir_opens: usize,
 }
 
 /// The counting shim: records every call, then runs the real one, or fails
@@ -127,6 +133,25 @@ impl AuditIo for Shim {
             return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         OsIo.sync(f)
+    }
+
+    fn open_dir(&mut self, path: &Path, nofollow: bool) -> io::Result<File> {
+        let race = {
+            let mut p = self.0.lock().unwrap();
+            p.dir_opens += 1;
+            p.before_dir_open.take()
+        };
+        if let Some(race) = race {
+            race();
+        }
+        OsIo.open_dir(path, nofollow)
+    }
+
+    fn checking(&mut self) {
+        let race = self.0.lock().unwrap().between_checks.take();
+        if let Some(race) = race {
+            race();
+        }
     }
 }
 
@@ -559,6 +584,190 @@ fn a_log_directory_swapped_in_during_the_flush_takes_no_acknowledged_entry() {
     assert_eq!(seqs, [1, 2]);
     let records: Vec<AuditRecord> = entries.into_iter().map(|e| e.record).collect();
     assert_eq!(records, kept);
+}
+
+/// R-24: after an append's flushes, the segment is looked up in the
+/// directory flushed, through its handle, and the log's path is compared
+/// with that directory last. A directory swapped in between the two
+/// checks, one holding the segment (a hard link to it), is not the one
+/// flushed: the append fails, with nothing acknowledged and the frame cut
+/// back. The retry flushes the directory there now, which names the
+/// segment, and the log checks out.
+#[test]
+fn a_directory_swapped_in_between_the_checks_takes_no_acknowledged_entry() {
+    let log = Log::new();
+    let parent = log.dir.parent().unwrap().to_owned();
+    let shim = Shim::default();
+    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+    let mut kept = fill(&mut w, 1, 1);
+    let seg = log.segments().pop().unwrap();
+    let len = std::fs::metadata(&seg).unwrap().len();
+    let name = seg.file_name().unwrap().to_owned();
+    let (dir, aside) = (log.dir.clone(), parent.join("audit.aside"));
+    let swapped = Arc::new(Mutex::new(false));
+    let did = Arc::clone(&swapped);
+    shim.plan().between_checks = Some(Box::new(move || {
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        std::fs::hard_link(aside.join(&name), dir.join(&name)).unwrap();
+        *did.lock().unwrap() = true;
+    }));
+    let e = w.append(&record(2)).unwrap_err();
+    assert!(*swapped.lock().unwrap(), "the swap ran");
+    assert_eq!(e.to_string(), "the audit log could not be read or written");
+    assert_eq!(w.head().0, 1);
+    assert_eq!(std::fs::metadata(&seg).unwrap().len(), len, "cut back");
+
+    kept.extend(fill(&mut w, 2, 1));
+    let (entries, report) = read_entries(&log.dir, &log.keys, None).unwrap();
+    assert!(report.ok(), "{report:?}");
+    let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, [1, 2]);
+    let records: Vec<AuditRecord> = entries.into_iter().map(|e| e.record).collect();
+    assert_eq!(records, kept);
+}
+
+/// R-25: a batch of entries is written at once and made durable together:
+/// one write, one flush of the segment and one of each directory, however
+/// many entries, which then verify in order. A failed flush acknowledges
+/// none of them, cut back off, and the retry writes them all. A batch
+/// takes the first entry and then only what the segment has room for:
+/// with room for one entry a segment, each call writes one, into a
+/// segment of its own. An empty batch writes nothing.
+#[test]
+fn a_batch_is_flushed_once_and_acknowledged_whole_or_not_at_all() {
+    let log = Log::new();
+    let shim = Shim::default();
+    let mut w = log.writer_with(shim.clone(), MAX_SEGMENT);
+    let mut kept = fill(&mut w, 1, 1);
+    shim.ops();
+    let batch: Vec<AuditRecord> = (2..=258).map(record).collect();
+    assert_eq!(w.append_batch(&batch).unwrap(), 257);
+    let ops = shim.ops();
+    assert!(
+        matches!(
+            ops[..],
+            [Op::Write(_), Op::SyncFile, Op::SyncDir, Op::SyncDir]
+        ),
+        "{ops:?}"
+    );
+    assert_eq!(w.head().0, 258);
+    kept.extend(batch);
+
+    let seg = log.segments().pop().unwrap();
+    let len = std::fs::metadata(&seg).unwrap().len();
+    let more: Vec<AuditRecord> = (259..=268).map(record).collect();
+    shim.plan().fail_file_sync = true;
+    assert!(w.append_batch(&more).is_err());
+    assert_eq!(w.head().0, 258);
+    assert_eq!(std::fs::metadata(&seg).unwrap().len(), len, "cut back");
+    assert_eq!(w.append_batch(&more).unwrap(), 10);
+    kept.extend(more);
+    assert_eq!(w.append_batch(&[]).unwrap(), 0);
+    let (entries, report) = read_entries(&log.dir, &log.keys, None).unwrap();
+    assert!(report.ok(), "{report:?}");
+    let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=268).collect::<Vec<u64>>());
+    let records: Vec<AuditRecord> = entries.into_iter().map(|e| e.record).collect();
+    assert_eq!(records, kept);
+
+    let small = Log::new();
+    let mut w = small.writer_with(Shim::default(), 1);
+    let five: Vec<AuditRecord> = (1..=5).map(record).collect();
+    let (mut done, mut calls) = (0, 0);
+    while done < five.len() {
+        done += w.append_batch(&five[done..]).unwrap();
+        calls += 1;
+    }
+    assert_eq!(calls, 5);
+    assert_eq!(small.segments().len(), 5);
+    let r = small.verify(None);
+    assert!(r.ok() && r.last_seq == 5, "{r:?}");
+}
+
+/// Opens a writer for `dir` with `shim`, failing the test when the open
+/// waits more than 10 seconds (on a FIFO at `fifo`, which it then lets
+/// go). Returns whether the writer opened.
+fn opens_within(dir: &Path, keys: &Keyring, shim: Shim, fifo: &Path) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let r = AuditWriter::open_with_io(dir, keys, None, Box::new(shim), MAX_SEGMENT);
+            tx.send(r.is_ok()).ok();
+        });
+        let Ok(opened) = rx.recv_timeout(Duration::from_secs(10)) else {
+            // Let the blocked open go before failing.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo);
+            panic!("opening the writer waited on the FIFO");
+        };
+        opened
+    })
+}
+
+/// R-26: every directory the writer flushes is opened as a directory. A
+/// FIFO another program puts in place of the log's directory as the
+/// writer, opening, removes a segment whose header a crash cut short, or
+/// in place of the data directory as it moves another vault's log aside,
+/// fails the open at once instead of blocking it, and the unlock with it.
+/// With the directories back, the writer opens and goes on.
+#[test]
+fn a_fifo_in_place_of_a_directory_fails_opening_the_writer_without_blocking() {
+    // A segment whose header a crash cut short: the log's directory.
+    let log = Log::new();
+    let mut w = log.writer_with(Shim::default(), 1);
+    fill(&mut w, 1, 2);
+    drop(w);
+    let second = log.segments()[1].clone();
+    let header = std::fs::read(&second).unwrap()[..HEADER_LEN].to_vec();
+    std::fs::write(&second, &header[..HEADER_LEN - 1]).unwrap();
+    let aside = log.dir.parent().unwrap().join("audit.aside");
+    let shim = Shim::default();
+    let (dir, moved) = (log.dir.clone(), aside.clone());
+    shim.plan().before_dir_open = Some(Box::new(move || {
+        std::fs::rename(&dir, &moved).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&dir).status();
+        assert!(made.unwrap().success());
+    }));
+    assert!(!opens_within(&log.dir, &log.keys, shim.clone(), &log.dir));
+    assert_eq!(shim.plan().dir_opens, 1);
+    std::fs::remove_file(&log.dir).unwrap();
+    std::fs::rename(&aside, &log.dir).unwrap();
+    let (mut w, _) = AuditWriter::open(&log.dir, &log.keys, None).unwrap();
+    assert_eq!(w.append(&record(2)).unwrap(), 2);
+    let r = log.verify(None);
+    assert!(r.ok() && r.last_seq == 2, "{r:?}");
+
+    // Another vault's log moved aside: the data directory.
+    let old = Log::new();
+    let mut w = old.writer(None);
+    fill(&mut w, 1, 1);
+    drop(w);
+    let new = Log::new();
+    std::fs::remove_dir_all(&new.dir).unwrap();
+    std::fs::rename(&old.dir, &new.dir).unwrap();
+    let data = new.dir.parent().unwrap().to_owned();
+    let data_aside = data.with_extension("aside");
+    let shim = Shim::default();
+    let (path, moved) = (data.clone(), data_aside.clone());
+    shim.plan().before_dir_open = Some(Box::new(move || {
+        std::fs::rename(&path, &moved).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&path).status();
+        assert!(made.unwrap().success());
+    }));
+    assert!(!opens_within(&new.dir, &new.keys, shim.clone(), &data));
+    assert_eq!(shim.plan().dir_opens, 1);
+    std::fs::remove_file(&data).unwrap();
+    std::fs::rename(&data_aside, &data).unwrap();
+    let (mut w, report) = AuditWriter::open(&new.dir, &new.keys, None).unwrap();
+    assert!(
+        !report.other_vault_moved,
+        "moved aside before the open failed"
+    );
+    assert_eq!(w.append(&record(1)).unwrap(), 1);
+    assert!(new.verify(None).ok());
 }
 
 /// A FIFO another program puts in place of the log's directory while an

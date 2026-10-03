@@ -944,15 +944,17 @@ impl AuditLog {
         Ok(())
     }
 
-    /// Writes the queue, and the count of dropped events.
+    /// Writes the queue, and the count of dropped events. Queued events
+    /// gate no request, so they go in batches, each durable at once: a
+    /// full queue costs a few flushes, not three for each event (R-25).
     fn flush(&mut self) -> Result<(), AuditError> {
         let Some(w) = self.writer.as_mut() else {
             return Ok(());
         };
-        while let Some(r) = self.queue.front() {
-            w.append(r)?;
-            self.queue.pop_front();
-            self.since_anchor += 1;
+        while !self.queue.is_empty() {
+            let n = w.append_batch(self.queue.make_contiguous())?;
+            self.queue.drain(..n);
+            self.since_anchor += n as u64;
         }
         if self.dropped > 0 {
             let r = AuditRecord {
@@ -1116,7 +1118,10 @@ mod tests {
 
     /// Review T10 open 2: the events that came while the log was closed
     /// are written at the next open, in order, and after them one entry
-    /// counts, exactly, those the queue had no room for.
+    /// counts, exactly, those the queue had no room for. R-25: a full
+    /// queue goes in one batch, and the count in one more entry, each
+    /// flushed once with its directories (a few flushes in all, counted
+    /// on this thread), not three flushes for each of its 257 entries.
     #[test]
     fn events_dropped_while_closed_are_counted_at_the_next_open() {
         let (_dir, _paths, v) = vault();
@@ -1125,7 +1130,14 @@ mod tests {
             assert!(!log.record(event(i)));
         }
         assert_eq!(log.backlog(), (QUEUE_MAX as u64, 9));
+        let flushes = || {
+            let c = envcloak_sys::testing::sync_counts();
+            c.full_fsync + c.fsync
+        };
+        let before = flushes();
         assert!(log.open(&v));
+        let flushed = flushes() - before;
+        assert!(flushed <= 8, "{flushed} flushes to write the queue");
         assert_eq!(log.backlog(), (0, 0));
         let _ = log.close();
 
