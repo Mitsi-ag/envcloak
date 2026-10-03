@@ -638,3 +638,90 @@ fn a_sign_in_driver_started_from_a_path_read_again_fails() {
         ],
     );
 }
+
+// --- M2-RES1 (residuals of M2-01) ------------------------------------------
+
+/// The end of §10b rule 6, after which the review added its paraphrases.
+const RULE_6_END: &str = "A launch whose code EnvCloak can check only at rest (interpreter scripts, package runners) gets once and session approvals, never standing approvals.";
+
+/// The review's paraphrases of a release resting on the requester's code
+/// (M2R-4), each added after rule 6 of a copy: each passed before.
+///
+/// Mutation checked: the four paraphrase patterns removed and `RESTS_ON`
+/// without `satisfies` and `hashes to`, as before: every copy passes and
+/// this fails.
+#[test]
+fn a_release_resting_on_the_requesters_code_in_the_reviews_paraphrases_fails() {
+    for (wording, name) in [
+        (
+            "The daemon releases the values only to a bridge signed by EnvCloak's Developer ID.",
+            "a release that rests on who signed the requester (CR-1)",
+        ),
+        (
+            "Values go to the requesting process only when its executable hashes to the envcloak release digest.",
+            "a release that rests on the requester's code, named later in the sentence (CR-1)",
+        ),
+        (
+            "The daemon checks that the client process runs the envcloak binary before it releases a value.",
+            "a release that rests on the requester running the `envcloak` binary (CR-1)",
+        ),
+        (
+            "The values go only if /proc/<pid>/exe of the peer is the installed envcloak.",
+            "a release that rests on the requester's `/proc/<pid>/exe` (CR-1)",
+        ),
+        (
+            "Values are released to an mcp-bridge whose code signature satisfies EnvCloak's designated requirement.",
+            "a release that rests on the requester's code (CR-1)",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, RULE_6_END, &format!("{RULE_6_END} {wording}"));
+        assert_fails(&t.home(), &[], &format!("the SPEC still holds {name}"));
+    }
+}
+
+/// The SPEC wording items of M2-RES1, each required: the relay's host rule
+/// as D-18 has it (M2R-5), dev sign-in unavailable without a sealed copy
+/// (M2R-6), and reclassifying towards `test` or `unknown` as a proven
+/// write in §4.3 and §10b (M2R-8). The old relay wording is refused.
+#[test]
+fn the_m2_res1_wording_is_required() {
+    let t = fixture();
+    edit(
+        &t,
+        "sends it, when the provider is known, only to a host within that provider's `allowed_hosts`,",
+        "requires a known provider's `allowed_hosts`,",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "§6.6 the relay's host rule (D-18): found 0 times",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the relay requiring a known provider for any HTTP server (D-18)",
+    );
+    for (sentence, name) in [
+        (
+            " Where that sealed copy cannot be made or executed (for example under `vm.memfd_noexec=2`, as for managed servers in §6.6), dev sign-in is unavailable: a sign-in request is refused with `runner_unavailable`, and `envcloak agents status` and the sign-in tool's result say so.",
+            "§6.8 no sealed copy, no dev sign-in (D-36)",
+        ),
+        (
+            ", and reclassifying an item towards `test` or `unknown` (§10b)",
+            "§4.3 reclassification is passphrase-proven (M2-13)",
+        ),
+        (
+            ";\n- reclassifying an item towards `test` or `unknown` (M2), which loosens the live-key guard and, towards `test`, what a standing approval can cover.",
+            "§10b reclassification needs a proof (M2-13)",
+        ),
+    ] {
+        let t = fixture();
+        edit(
+            &t,
+            sentence,
+            if sentence.starts_with(';') { "." } else { "" },
+        );
+        assert_fails(&t.home(), &[], &format!("{name}: found 0 times"));
+    }
+}
