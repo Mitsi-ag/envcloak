@@ -34,7 +34,11 @@
 //! holds is in the vault where the manifest (opened here, not sent) binds
 //! its variable, whether every reference resolves, and whether the
 //! Recovery Kit is confirmed. `files.backup` writes the encrypted backup
-//! a deletion needs first, and purges backups over 7 days old.
+//! a deletion needs first, and purges backups over 7 days old. It takes a
+//! backup only when the answer `files.restore` would give for it, framed
+//! for the largest request id, fits in one frame (`frame_too_large`
+//! otherwise, nothing written): a backup taken is one that can be given
+//! back, so nothing is deleted on the strength of one that cannot.
 //!
 //! Comparing a value with the vault tells the caller whether the vault
 //! holds it, so it is guarded as SPEC §6.5 guards doctor's matching:
@@ -118,7 +122,7 @@ use crate::backups::{kind_of, label_of};
 use crate::clock::now_of;
 use crate::items::{DEFAULT_FIELD, DEFAULT_SLUG, looks_like_value};
 use crate::requests::{evidence, refuse_unless_prover, subject_summary};
-use crate::server::{Shared, commit_framed, locked, refuse_if_traced};
+use crate::server::{Shared, commit_framed, locked, refuse_if_traced, result_framed};
 use crate::state::{State, vault_reason};
 
 /// Entries one import takes at most.
@@ -975,7 +979,8 @@ fn creator_view(c: FileBackupCreator) -> FileBackupCreatorView {
 }
 
 /// The answer `files.restore` gives for a backup of `files` made by
-/// `creator`.
+/// `creator`: built here alone, for the restore and for the check
+/// `files.backup` makes that it fits in a frame.
 fn restore_answer(creator: Option<FileBackupCreator>, files: Vec<BackupFile>) -> RestoredFiles {
     RestoredFiles {
         creator: creator.map(creator_view),
@@ -1020,6 +1025,27 @@ pub fn files_backup(
         kind: kind_of(&caller),
         agent: label_of(&caller),
     };
+    // The answer its restore will give, framed for the largest request id
+    // a client can send: a backup whose restore could not be answered in
+    // one frame is not taken (`frame_too_large`), so no deletion goes on
+    // the strength of it. Its answer carries more than this request (who
+    // made it, a longer id), so the request fitting is not enough. The
+    // frame is dropped, and wiped, at once.
+    let lefts: Vec<Option<FileLeft>> = files.iter().map(|f| f.left).collect();
+    let answer = restore_answer(Some(creator.clone()), files);
+    let fits = result_framed::<FilesRestore>(u64::MAX, &answer).map(drop);
+    let files: Vec<BackupFile> = answer
+        .files
+        .into_iter()
+        .zip(lefts)
+        .map(|(f, left)| BackupFile {
+            path: f.path,
+            mode: f.mode,
+            content: f.content.into_inner(),
+            left,
+        })
+        .collect();
+    fits?;
     let mut s = locked(&shared.state);
     let v = s.unlocked()?;
     let info = v
