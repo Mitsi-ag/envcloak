@@ -14,8 +14,8 @@ use std::process::{Command, Stdio};
 use envcloak_sys::{
     DirEntryKind, InUse, MAX_DIR_ENTRIES, Volume, create_beneath, create_dir_beneath,
     create_rw_beneath, exchange_beneath, kind_beneath, link_beneath, list_dir, open_dir_beneath,
-    open_elsewhere, read_link_beneath, remove_dir_beneath, rename_beneath, unlink_beneath,
-    volume_of,
+    open_elsewhere, read_link_beneath, remove_dir_beneath, rename_beneath, rename_new_beneath,
+    unlink_beneath, volume_of,
 };
 
 fn names(dir: &File) -> Vec<(OsString, DirEntryKind)> {
@@ -351,6 +351,48 @@ fn exchange_swaps_two_names_in_the_handle() {
     assert_eq!(std::fs::read(tmp.path().join("target")).unwrap(), b"t");
     for bad in ["", ".", "..", "a/b", "x\0"] {
         let e = exchange_beneath(&dir, OsStr::new(bad), OsStr::new("b")).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{bad:?}");
+    }
+}
+
+/// A rename that replaces nothing moves a name in one step only while
+/// the new name is free: a file, an empty directory or a symlink (even a
+/// dangling one) that has it keeps it, unchanged, and the file to move
+/// keeps its own name. The file systems the tests run on (APFS, ext4,
+/// tmpfs) can do it.
+#[test]
+fn rename_new_moves_a_name_only_to_a_free_one() {
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = File::open(tmp.path()).unwrap();
+    let p = |n: &str| tmp.path().join(n);
+    std::fs::write(p("a"), b"moved").unwrap();
+    let ino = std::fs::metadata(p("a")).unwrap().ino();
+    rename_new_beneath(&dir, OsStr::new("a"), OsStr::new("b")).unwrap();
+    assert!(!p("a").exists());
+    assert_eq!(std::fs::read(p("b")).unwrap(), b"moved");
+    assert_eq!(std::fs::metadata(p("b")).unwrap().ino(), ino);
+
+    std::fs::write(p("taken"), b"keeps its name").unwrap();
+    std::fs::create_dir(p("empty-dir")).unwrap();
+    symlink("elsewhere", p("dangling")).unwrap();
+    for to in ["taken", "empty-dir", "dangling"] {
+        let e = rename_new_beneath(&dir, OsStr::new("b"), OsStr::new(to)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::AlreadyExists, "{to}");
+        assert_eq!(std::fs::read(p("b")).unwrap(), b"moved", "{to}");
+    }
+    assert_eq!(std::fs::read(p("taken")).unwrap(), b"keeps its name");
+    assert!(p("empty-dir").is_dir());
+    assert_eq!(
+        std::fs::read_link(p("dangling")).unwrap(),
+        std::path::Path::new("elsewhere")
+    );
+    assert!(!p("elsewhere").exists());
+    let e = rename_new_beneath(&dir, OsStr::new("missing"), OsStr::new("c")).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::NotFound);
+    for bad in ["", ".", "..", "a/b", "x\0"] {
+        let e = rename_new_beneath(&dir, OsStr::new(bad), OsStr::new("ok")).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput, "{bad:?}");
+        let e = rename_new_beneath(&dir, OsStr::new("b"), OsStr::new(bad)).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::InvalidInput, "{bad:?}");
     }
 }
