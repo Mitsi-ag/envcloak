@@ -25,7 +25,9 @@
 //!   bounds, approvals, the worker's and the supervisor's messages, lock,
 //!   root exit, epochs, revisions and the clock (R-M2b-13, R-M2b-17).
 //!
-//! The TOTP function joins with plan task M2b-03.
+//! The TOTP function joins with plan task M2b-03. The contract's
+//! invariants are checked by exhaustive enumeration of event orderings in
+//! `tests/enumeration.rs`.
 
 pub mod authorization;
 pub mod operation;
