@@ -7,6 +7,13 @@
 //! A reference to a secret still binds (the control). No login value is in
 //! any output, the daemon's log or the home.
 //!
+//! `ref` never writes a binding the daemon did not check: with no daemon
+//! running, and with the daemon's vault locked, a login's field and a
+//! secret alike are refused (`daemon_unavailable`, `vault_locked`) and
+//! `envcloak.toml` is left as it was. Mutation checked: the class check's
+//! failure taken as "not a login" (the `.ok()` fallback ref had), which
+//! writes the login's binding here and fails.
+//!
 //! The person's commands run on a terminal of their own, as tests/run.rs's
 //! approver's do; under a developer's Claude Code the unlock is refused,
 //! so run them outside the agent's tree then.
@@ -89,7 +96,42 @@ fn b18_run_and_ref_refuse_a_login_field() {
     cs.push(kit);
     let login = plant_login(&home, &cs);
     cs.extend(login);
+    let story = project(&home, "acme-web", MANIFEST);
+    let manifest = std::fs::read(story.join("envcloak.toml")).unwrap();
+    let swept = |o: &Output| {
+        assert_no_canary(&o.stdout, &cs);
+        assert_no_canary(&o.stderr, &cs);
+    };
+    // `ref` that the daemon could not check writes nothing, for a login's
+    // field and a secret's reference alike.
+    let unchecked = |token: &str| {
+        for binding in [
+            "PASSWORD=fixture/editor#password",
+            "PASSWORD=fixture/editor",
+            "GITHUB_TOKEN=github/acme-web",
+        ] {
+            let o = in_dir(&home, &story, &["ref", binding], &[]);
+            swept(&o);
+            assert_eq!(o.status.code(), Some(1), "ref {binding}: {}", stderr(&o));
+            let err = stderr(&o);
+            assert!(
+                err.starts_with(&format!("envcloak: {token}: ")),
+                "ref {binding}: {err}"
+            );
+            assert!(err.contains("nothing was written"), "ref {binding}: {err}");
+            assert!(stdout(&o).is_empty(), "ref {binding}: {}", stdout(&o));
+            assert_eq!(
+                std::fs::read(story.join("envcloak.toml")).unwrap(),
+                manifest,
+                "ref {binding} changed envcloak.toml with {token}"
+            );
+        }
+    };
+    // No daemon running.
+    unchecked("daemon_unavailable");
     let d = start_daemon(&home);
+    // The daemon's vault locked.
+    unchecked("vault_locked");
     let files = outside_dir();
     let pass = secret_file(
         files.path(),
@@ -102,12 +144,6 @@ fn b18_run_and_ref_refuse_a_login_field() {
         &[(3, &pass, true)],
     );
     assert!(out.status.success(), "{}{}", stderr(&out), d.log());
-    let story = project(&home, "acme-web", MANIFEST);
-    let manifest = std::fs::read(story.join("envcloak.toml")).unwrap();
-    let swept = |o: &Output| {
-        assert_no_canary(&o.stdout, &cs);
-        assert_no_canary(&o.stderr, &cs);
-    };
     let refused = |o: &Output, code: i32, what: &str| {
         swept(o);
         assert_eq!(o.status.code(), Some(code), "{what}: {}", stderr(o));

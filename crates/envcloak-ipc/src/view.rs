@@ -1115,8 +1115,10 @@ pub struct RefEditView {
     pub change: RefChange,
     /// The reference it had, when replaced.
     pub previous: Option<String>,
-    /// Whether the vault has the item: `None` when it could not be asked.
-    pub resolves: Option<RefStatus>,
+    /// What the daemon said of the reference before it was written: whether
+    /// the vault has the item, or why not. `envcloak ref` writes no binding
+    /// the daemon did not check, so there is always one.
+    pub resolves: RefStatus,
 }
 
 /// What `envcloak ref` did.

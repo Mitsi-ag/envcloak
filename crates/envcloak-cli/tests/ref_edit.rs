@@ -1,5 +1,7 @@
 //! `envcloak ref` against the manifest, as the built CLI runs it in an
-//! isolated home with no daemon (docs/MANIFEST.md "Adding a binding"):
+//! isolated home whose daemon's vault is unlocked (docs/MANIFEST.md
+//! "Adding a binding": `ref` writes only a binding the daemon checked;
+//! tests/login_refs.rs has it refused without one):
 //!
 //! - a variable named like a profile (`ref short=...` when `[env.short]`
 //!   exists, as a table or with dotted keys) is refused, and the manifest
@@ -20,11 +22,39 @@ use std::path::Path;
 use std::process::Output;
 use std::time::Duration;
 
-use common::{cli_command, finish_within, stderr, stdout};
-use envcloak_testkit::{Canary, TestHome, assert_no_canary, fresh_seed};
+use common::{
+    cli_command, finish_within, outside_dir, run_on_terminal, secret_file, seed_vault,
+    start_daemon, stderr, stdout,
+};
+use envcloak_testkit::{
+    Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
+};
 
 /// Placeholder the CLI prints in place of a name shaped like a key.
 const HIDDEN: &str = "[not shown: looks like a key or token]";
+
+/// A test home with a vault and its daemon, the vault unlocked by the
+/// person on a terminal of their own (so run outside an agent's process
+/// tree, whose unlock is refused).
+fn unlocked_home() -> (TestHome, Daemon) {
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    seed_vault(&home, &cs);
+    let d = start_daemon(&home);
+    let files = outside_dir();
+    let pass = secret_file(
+        files.path(),
+        "pass",
+        by_label(&cs, labels::VAULT_PASSPHRASE).value(),
+    );
+    let out = run_on_terminal(
+        &home,
+        &["unlock", "--passphrase-fd", "3"],
+        &[(3, &pass, true)],
+    );
+    assert!(out.status.success(), "{}{}", stderr(&out), d.log());
+    (home, d)
+}
 
 /// `envcloak <args>` with the working directory `dir`.
 fn ref_in(home: &TestHome, dir: &Path, args: &[&str]) -> Output {
@@ -49,7 +79,7 @@ fn hex(n: usize) -> String {
 
 #[test]
 fn a_variable_named_like_a_profile_is_refused_and_the_profile_kept() {
-    let home = TestHome::new();
+    let (home, _d) = unlocked_home();
     for text in [
         "[env]\nA = \"a/b\"\n\n[env.short]\nS = \"s/t\"\nT = \"u/v\"\n",
         "[env]\nA = \"a/b\"\nshort.S = \"s/t\"\nshort.T = \"u/v\"\n",
@@ -70,7 +100,7 @@ fn a_variable_named_like_a_profile_is_refused_and_the_profile_kept() {
 
 #[test]
 fn a_hard_linked_manifest_is_left_alone() {
-    let home = TestHome::new();
+    let (home, _d) = unlocked_home();
     let dir = home.root().join("linked");
     std::fs::create_dir_all(&dir).unwrap();
     let text = "[env]\nA = \"a/b\"\n";
@@ -86,7 +116,7 @@ fn a_hard_linked_manifest_is_left_alone() {
 
 #[test]
 fn a_key_shaped_previous_reference_is_hidden_and_paths_are_whole() {
-    let home = TestHome::new();
+    let (home, _d) = unlocked_home();
     let token = Canary::new("HEX_REFERENCE", hex(40));
     let cs = [token.clone()];
     // A project under a directory named like a hash, as a git worktree or

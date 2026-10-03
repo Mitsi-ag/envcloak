@@ -813,22 +813,12 @@ impl Render for RefEditView {
                 format!("{binding} is already in {place} in {manifest}; nothing changed.\n")
             }
         };
-        match self.resolves {
-            Some(RefStatus::Ok) => {}
-            Some(s) => {
-                let _ = writeln!(
-                    o,
-                    "warning: the reference does not resolve yet: {}",
-                    status_text(s)
-                );
-            }
-            None => {
-                let _ = writeln!(
-                    o,
-                    "note: the vault was not asked whether the reference resolves; run \
-                     `envcloak check`"
-                );
-            }
+        if self.resolves != RefStatus::Ok {
+            let _ = writeln!(
+                o,
+                "warning: the reference does not resolve yet: {}",
+                status_text(self.resolves)
+            );
         }
         o
     }
@@ -1792,7 +1782,7 @@ result: the env-file check is incomplete: the project directory could not be lis
             reference: "github/acme-web".into(),
             change: RefChange::Added,
             previous: None,
-            resolves: Some(RefStatus::Ok),
+            resolves: RefStatus::Ok,
         };
         snap(
             edit.human(),
@@ -1803,7 +1793,7 @@ result: the env-file check is incomplete: the project directory could not be lis
             profile: Some("short".into()),
             change: RefChange::Replaced,
             previous: Some("github/old".into()),
-            resolves: Some(RefStatus::UnknownItem),
+            resolves: RefStatus::UnknownItem,
             ..edit.clone()
         };
         snap(
@@ -1814,13 +1804,11 @@ warning: the reference does not resolve yet: no item has that slug
         );
         let same = RefEditView {
             change: RefChange::Unchanged,
-            resolves: None,
             ..edit
         };
         snap(
             same.human(),
             r#"GITHUB_TOKEN = github/acme-web is already in [env] in /src/acme-web/envcloak.toml; nothing changed.
-note: the vault was not asked whether the reference resolves; run `envcloak check`
 "#,
         );
     }
@@ -1897,7 +1885,7 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
                 reference: v.to_owned(),
                 change: RefChange::Replaced,
                 previous: Some(v.to_owned()),
-                resolves: Some(RefStatus::Ok),
+                resolves: RefStatus::Ok,
             };
             let texts = [
                 i.human(),
@@ -2023,7 +2011,7 @@ note: the vault was not asked whether the reference resolves; run `envcloak chec
             reference: "c/d".into(),
             change: RefChange::Added,
             previous: None,
-            resolves: Some(RefStatus::Ok),
+            resolves: RefStatus::Ok,
         };
         assert_eq!(
             edit.human(),

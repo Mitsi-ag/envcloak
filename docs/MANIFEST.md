@@ -115,7 +115,7 @@ A `--env-file` is a dotenv-style file of at most 1 MiB. It can hold real values,
 
 ## Adding a binding: `envcloak ref`
 
-`envcloak ref NAME=<slug>[#field] [--profile NAME]` sets one binding in the nearest manifest, in `[env]` or in `[env.<profile>]` (made when missing). The manifest holds names only, so it reads and writes no value and needs no daemon; when one answers, it says whether the reference resolves. A binding written is not an approval: `envcloak run` still asks for it.
+`envcloak ref NAME=<slug>[#field] [--profile NAME]` sets one binding in the nearest manifest, in `[env]` or in `[env.<profile>]` (made when missing). The manifest holds names only, so it reads and writes no value. A slug does not say what its item is, and a login's field is never bound (SPEC §6.8), so `ref` asks the daemon what the reference names before it writes anything (`items.check`), and writes nothing when it cannot: with no daemon running (`daemon_unavailable`), the vault locked (`vault_locked`), or any other failure to check, each with that failure's token, and for a reference the daemon finds shaped like a value (`value_on_argv`). A login's field is refused `login_reference`. Any other answer is written with what the daemon said of it: whether the reference resolves, or why not (a missing item or field, or an item of a class that is never bound, which `envcloak run` then refuses). A binding written is not an approval: `envcloak run` still asks for it.
 
 The edit keeps the rest of the file as it was: comments, order, spacing and quoting stay, a new binding goes at the end of its table, and a replaced one keeps its comment. Setting a binding that is there already (in either form) writes nothing. The write is atomic:
 
@@ -140,7 +140,7 @@ A name or reference shaped like a key is reported without its text. The exit is 
 
 Errors are value-free. A manifest error is a kind and a place (a manifest line, a `--ref` argument's position or an env-file line); an env-file error is a kind and a line. The TOML library's own messages quote the source, so they are never passed on: a syntax error reports `not valid TOML` and its line. A binding that cannot be tied to an item names its variable and the kind, not the reference.
 
-`envcloak run` prints one token for each (SPEC §6.1 step 9): `manifest_invalid` for the manifest, its path, and references to cards and other classes; `login_reference` for a reference to a login's field, in the manifest or a `--ref` (SPEC §6.8: login fields are typed, and only a sign-in opens them); `binding_unresolved` for `--profile`, `--ref`, `--env-file` and references to missing items or fields. `envcloak ref` refuses a reference to a login's field too, `login_reference`, and writes nothing, when the daemon answers; without one it cannot know the item's class, and the binding written is refused at the next `run`.
+`envcloak run` prints one token for each (SPEC §6.1 step 9): `manifest_invalid` for the manifest, its path, and references to cards and other classes; `login_reference` for a reference to a login's field, in the manifest or a `--ref` (SPEC §6.8: login fields are typed, and only a sign-in opens them); `binding_unresolved` for `--profile`, `--ref`, `--env-file` and references to missing items or fields. `envcloak ref` refuses a reference to a login's field too, `login_reference`, and writes nothing; it writes no binding the daemon did not check ("Adding a binding").
 
 ## Gates
 
