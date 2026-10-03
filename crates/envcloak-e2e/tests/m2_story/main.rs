@@ -7,8 +7,12 @@
 //!   terminal of their own, the rerun, and the sweep.
 //! - [`mcp`] (M2-06): steps S7 and S8 through EnvCloak's MCP server, with
 //!   the official MCP TypeScript SDK client and with Claude Code.
+//! - [`install`] (M2-08): `envcloak agents install` and `uninstall` on
+//!   configurations the pinned hosts' own CLIs wrote, and the hosts
+//!   loading what it wrote (the hooks' denials, K-01's socket allowance).
 #![allow(clippy::unwrap_used)]
 
+mod install;
 mod mcp;
 mod skeleton;
 
