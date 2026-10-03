@@ -122,6 +122,8 @@ pub enum StepKind {
     OwnFile { content: String },
     /// EnvCloak's MCP server, registered with `claude mcp add-json`.
     ClaudeMcp { exe: PathBuf, entry: Value },
+    /// A change asked for and not made, and why: nothing is written.
+    Withheld(Refusal),
 }
 
 /// What to do for one host.
@@ -245,7 +247,7 @@ pub fn plan(ctx: &Context<'_>, opts: &Options) -> Plan {
         if let Ok(d) = &found {
             match host {
                 Host::ClaudeCode => claude_plan(ctx, d, &mut hp),
-                Host::Codex => codex_plan(ctx, opts, &mut hp),
+                Host::Codex => codex_plan(ctx, opts, d, &mut hp),
             }
         }
         out.hosts.push(hp);
@@ -340,7 +342,7 @@ fn claude_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
     ));
 }
 
-fn codex_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
+fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan) {
     let l = &ctx.locations;
     if l.codex_instructions_override().exists() {
         hp.notes.push(note(
@@ -376,7 +378,11 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
         },
     });
     let linux = !cfg!(target_os = "macos");
-    let socket = (!linux && opts.consent_sockets).then_some(ctx.socket.as_path());
+    // The allowance turns command networking on and relies on the proxy
+    // settings to limit it to EnvCloak's socket, which M2-04 measured on
+    // the pinned version only: another version gets none (Codex review).
+    let qualified = crate::locations::socket_allowance_qualified(Host::Codex, &d.version);
+    let socket = (!linux && opts.consent_sockets && qualified).then_some(ctx.socket.as_path());
     hp.steps.push(Step {
         what: format!(
             "add [mcp_servers.envcloak] (tool_timeout_sec 60; no approval setting){}",
@@ -393,6 +399,28 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
             settings: codex::config_settings(&ctx.envcloak, linux, socket),
         },
     });
+    if !linux && opts.consent_sockets && !qualified {
+        hp.steps.push(Step {
+            what: "with your consent, command networking limited to EnvCloak's socket".to_owned(),
+            path: l.codex_config(),
+            kind: StepKind::Withheld(Refusal::new(
+                "socket_allowance_unqualified",
+                format!(
+                    "Codex {} is not a version EnvCloak's socket allowance was measured on ({}): \
+                     on another version the proxy settings that limit command networking to \
+                     EnvCloak's socket may not hold, so the allowance was not written, and the \
+                     sandboxed shell cannot reach EnvCloak",
+                    d.version,
+                    crate::locations::SOCKET_ALLOWANCE_QUALIFIED
+                        .iter()
+                        .filter(|(h, _)| *h == Host::Codex.id())
+                        .map(|(_, v)| *v)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        });
+    }
     hp.notes.push(note(
         "hooks_untrusted",
         "Codex runs these hooks only once you trust them: open /hooks in Codex and trust \
@@ -569,7 +597,7 @@ fn edit_for(
             )),
             (None, _) => Ok(Some((content.as_bytes().to_vec(), vec![Edit::WholeFile]))),
         },
-        StepKind::ClaudeMcp { .. } => Ok(None),
+        StepKind::ClaudeMcp { .. } | StepKind::Withheld(_) => Ok(None),
     }
 }
 
@@ -591,6 +619,7 @@ fn run_step(
 ) -> StepResult {
     let outcome = match &step.kind {
         StepKind::ClaudeMcp { exe, entry } => register_claude_mcp(ctx, w, exe, entry, notes),
+        StepKind::Withheld(r) => Outcome::Refused(r.clone()),
         kind => {
             let mut edit = edit_for(kind);
             w.change(&t, &mut edit)
@@ -609,6 +638,8 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
         hosts: Vec::new(),
         project: None,
     };
+    // What earlier runs left under temporary names goes first.
+    w.sweep_all();
     for hp in &plan.hosts {
         let mut results = Vec::new();
         let mut notes = hp.notes.clone();
@@ -672,6 +703,16 @@ fn claude_registered(ctx: &Context<'_>) -> Result<Registered, Refusal> {
         return Ok((None, None));
     };
     match read_plain(&root, Path::new(name), 64 * 1024 * 1024) {
+        // Claude Code rewrites the file through its own command, but the
+        // writer's rule holds for it all the same (Codex review): a file
+        // with another hard link is reported, and EnvCloak runs no
+        // command that would change it. (A symlink is refused by the
+        // read.)
+        Ok((_, stamp)) if stamp.nlink > 1 => Err(Refusal::new(
+            "hard_linked",
+            "it has another hard link, which would keep its old contents: reported, never \
+             changed",
+        )),
         Ok((bytes, stamp)) => Ok((claude::registered(&bytes)?, Some((bytes, stamp.mode)))),
         Err(e) if e.kind == ScanErrorKind::NotFound => Ok((None, None)),
         Err(e) => Err(Refusal::new(e.kind.token(), e.kind.message())),
@@ -961,6 +1002,7 @@ pub fn uninstall(ctx: &Context<'_>, opts: &Options, w: &mut Writer<'_>) -> Repor
         hosts: Vec::new(),
         project: None,
     };
+    w.sweep_all();
     let undo_files = |w: &mut Writer<'_>, host: &'static str, scope: &str, name: &'static str| {
         let paths: Vec<(String, bool)> = w
             .state
@@ -1017,6 +1059,155 @@ pub fn digest(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state as saved; `fail` refuses the saves whose numbers (from
+    /// 1) it holds.
+    #[derive(Default)]
+    struct Saved {
+        fail: Vec<usize>,
+        count: usize,
+    }
+
+    impl crate::writer::Journal for Saved {
+        fn save(&mut self, _: &crate::writer::State) -> Result<(), Refusal> {
+            self.count += 1;
+            if self.fail.contains(&self.count) {
+                return Err(Refusal::new("state_unwritable", "refused for the test"));
+            }
+            Ok(())
+        }
+    }
+
+    struct NoBackups;
+
+    impl crate::writer::Backups for NoBackups {
+        fn back_up(&mut self, _: &Path, _: &[u8], _: u32) -> Result<String, Refusal> {
+            Ok("B".to_owned())
+        }
+        fn record(&mut self, _: &str, _: &[u8]) -> Result<(), Refusal> {
+            Ok(())
+        }
+    }
+
+    /// Claude Code 2.1.280 as the installer runs it: `--version`, and
+    /// `mcp add-json --scope user`, `get` and `remove --scope user` on
+    /// `$HOME/.claude.json`, rewritten whole (the CLI tests' stand-in).
+    const FAKE_CLAUDE: &str = r#"
+import json, os, sys
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("2.1.280 (Claude Code)")
+    sys.exit(0)
+path = os.path.join(os.environ["HOME"], ".claude.json")
+def load():
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+def save(v):
+    with open(path + ".tmp", "w") as f:
+        json.dump(v, f)
+    os.rename(path + ".tmp", path)
+if args[:4] == ["mcp", "add-json", "--scope", "user"]:
+    v = load()
+    v.setdefault("mcpServers", {})[args[4]] = json.loads(args[5])
+    save(v)
+    sys.exit(0)
+if args[:4] == ["mcp", "remove", "--scope", "user"]:
+    v = load()
+    del v["mcpServers"][args[4]]
+    save(v)
+    sys.exit(0)
+if args[:2] == ["mcp", "get"]:
+    sys.exit(0 if args[2] in load().get("mcpServers", {}) else 1)
+sys.exit(2)
+"#;
+
+    /// The verifier's class (a state save failing after a change, never
+    /// tested on every path): after `claude mcp add-json`, and after
+    /// `claude mcp remove`, a failing save is reported with the server as
+    /// registered or removed, never as a success.
+    ///
+    /// Mutation checked: the final save's failure ignored in
+    /// `try_register` and in `unregister_claude_mcp` (`let _ =`): the
+    /// outcomes are `Changed` and `Removed`, and this fails.
+    #[test]
+    fn a_state_save_failing_after_claude_codes_command_says_so() {
+        let Some(python) = std::env::var_os("PATH").and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("python3"))
+                .find(|c| c.is_file())
+        }) else {
+            eprintln!("skipped: no python3 on PATH for the stand-in claude");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let home = std::fs::canonicalize(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap_or_else(|e| panic!("{e}"));
+        let claude = bin.join("claude");
+        std::fs::write(&claude, format!("#!{}\n{FAKE_CLAUDE}", python.display()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let home_os = home.clone().into_os_string();
+        let env = move |k: &str| match k {
+            "HOME" => Some(home_os.clone()),
+            "PATH" => Some(OsString::from("/usr/bin:/bin")),
+            _ => None,
+        };
+        let ctx = Context {
+            locations: Locations::new(&env).unwrap_or_else(|_| panic!("no home")),
+            envcloak: PathBuf::from("/b/envcloak"),
+            data_dir: home.join("data"),
+            socket: home.join("s.sock"),
+            path: bin.clone().into_os_string(),
+            env: &env,
+        };
+        let entry = claude::mcp_entry(Path::new("/b/envcloak"));
+        let mut state = crate::writer::State::default();
+        let mut backups = NoBackups;
+        // The intent's save, then the save after the command: the second
+        // fails.
+        let mut saved = Saved {
+            fail: vec![2],
+            ..Saved::default()
+        };
+        let mut w = Writer {
+            state: &mut state,
+            journal: &mut saved,
+            backups: &mut backups,
+            now: std::time::SystemTime::now(),
+        };
+        let o = register_claude_mcp(&ctx, &mut w, &claude, &entry, &mut Vec::new());
+        assert!(
+            matches!(&o, Outcome::Partial { made: Made::Created, failed, .. } if failed.name == "state_unwritable"),
+            "{o:?}"
+        );
+        assert_eq!(w.state.mcp.get(Host::ClaudeCode.id()), Some(&entry));
+        // The only save after `claude mcp remove` fails.
+        let mut saved = Saved {
+            fail: vec![1],
+            ..Saved::default()
+        };
+        let mut w = Writer {
+            state: &mut state,
+            journal: &mut saved,
+            backups: &mut backups,
+            now: std::time::SystemTime::now(),
+        };
+        let r = unregister_claude_mcp(&ctx, &mut w).map(|r| r.outcome);
+        assert!(
+            matches!(&r, Some(Outcome::Partial { made: Made::Removed, failed, .. }) if failed.name == "state_unwritable"),
+            "{r:?}"
+        );
+        let left = std::fs::read(home.join(".claude.json")).unwrap_or_default();
+        assert!(claude::registered(&left).is_ok_and(|e| e.is_none()));
+    }
 
     /// Lesson L-09 for the hooks' own command: a versioned install (a
     /// package manager's `Cellar/<version>/bin/envcloak`) is named by the

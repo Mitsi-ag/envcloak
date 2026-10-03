@@ -16,6 +16,22 @@ use std::path::{Path, PathBuf};
 
 use envcloak_scan::source::{ConfigFormat, ConfigSource, SourceKind};
 
+/// The host versions a setting that loosens a host's sandbox was measured
+/// on, by host id (M2-04, and `m2_story`'s
+/// `codex_reaches_the_socket_and_nothing_else_after_install` on each pin):
+/// Codex's socket allowance turns command networking on and leaves it to
+/// the proxy settings to limit it to EnvCloak's socket, which another
+/// version may read otherwise, so only these get it.
+pub const SOCKET_ALLOWANCE_QUALIFIED: &[(&str, &str)] = &[("codex", "0.159.2")];
+
+/// Whether `host` at `version` is one the socket allowance was measured
+/// on.
+pub fn socket_allowance_qualified(host: crate::hook::Host, version: &str) -> bool {
+    SOCKET_ALLOWANCE_QUALIFIED
+        .iter()
+        .any(|(h, v)| *h == host.id() && *v == version)
+}
+
 /// The catalog for one home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Locations {
@@ -316,6 +332,30 @@ impl Locations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every version the socket allowance is written for is a pinned one,
+    /// which CI's egress test (`m2_story`) measures it on.
+    #[test]
+    fn the_socket_allowance_is_qualified_on_pinned_versions_only() {
+        for (host, version) in SOCKET_ALLOWANCE_QUALIFIED {
+            assert!(
+                crate::probe::model::qualified(host, version),
+                "{host} {version}"
+            );
+        }
+        assert!(socket_allowance_qualified(
+            crate::hook::Host::Codex,
+            "0.159.2"
+        ));
+        assert!(!socket_allowance_qualified(
+            crate::hook::Host::Codex,
+            "0.159.3"
+        ));
+        assert!(!socket_allowance_qualified(
+            crate::hook::Host::ClaudeCode,
+            "0.159.2"
+        ));
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let pairs: Vec<(String, String)> = pairs
