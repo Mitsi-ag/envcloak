@@ -4,8 +4,8 @@
 //! - the instruction block in `~/.claude/CLAUDE.md`;
 //! - in `~/.claude/settings.json` (which Claude Code may rewrite itself,
 //!   so D-16's rule applies): the hooks (`UserPromptSubmit`; `PreToolUse`
-//!   for `Bash`, `Monitor`, `Read`, `Edit`, `Grep`, `Glob`,
-//!   `ReadMcpResourceTool` and every MCP tool, `mcp__.*`; `SessionStart`),
+//!   for the tools in [`TOOL_MATCHER`] and every MCP tool, `mcp__.*`;
+//!   `SessionStart`),
 //!   unless EnvCloak's plugin, which carries them, is enabled; the deny
 //!   rule `Read(**/.env*)`, which
 //!   Claude Code also applies, best effort, to `@` file mentions that no
@@ -39,11 +39,17 @@ pub const SERVER: &str = "envcloak";
 /// The deny rule for env files.
 pub const READ_DENY: &str = "Read(**/.env*)";
 /// The `PreToolUse` matcher for Claude Code's own tools: an exact list,
-/// every tool of the pinned version (2.1.280's `sdk-tools.d.ts`) that runs
-/// a command (`Bash`; `Monitor`, whose `command` is a shell script) or
-/// reads a file or a resource (`Read`, `Edit`, `Grep`, `Glob`,
-/// `ReadMcpResourceTool`).
-pub const TOOL_MATCHER: &str = "Bash|Monitor|Read|Edit|Grep|Glob|ReadMcpResourceTool";
+/// every tool of the pinned version (2.1.280's `sdk-tools.d.ts`, and
+/// `ClaudeDesign`, whose `arguments` its server checks) that runs a
+/// command (`Bash`; `Monitor`, whose `command` is a shell script), reads a
+/// file or a resource (`Read`, `Edit`, `NotebookEdit`, `Grep`, `Glob`,
+/// `ReadMcpResourceTool`, `ReadMcpResourceDirTool`), or reads a local file
+/// to send it on (`Artifact`'s `file_path` and `file_paths`, `Projects`'
+/// `local_path`, `Workflow`'s `scriptPath`). `Write` reads nothing;
+/// `WebFetch` fetches a URL. The m2_story test reads the pinned
+/// `sdk-tools.d.ts` and fails on a tool with a path, a URI or a command
+/// that is in neither list.
+pub const TOOL_MATCHER: &str = "Bash|Monitor|Read|Edit|NotebookEdit|Grep|Glob|ReadMcpResourceTool|ReadMcpResourceDirTool|Artifact|Projects|Workflow|ClaudeDesign";
 /// The `PreToolUse` matcher for every MCP tool: a regular expression.
 pub const MCP_MATCHER: &str = "mcp__.*";
 /// How long a `claude mcp` command may take.
