@@ -1946,3 +1946,156 @@ fn a_restore_larger_than_a_frame_records_nothing() {
     assert_eq!(restored, ["restored"]);
     f.sweep();
 }
+
+/// F-77's order through `import.commit` itself (Codex's review, round 4):
+/// its answer is the plan `import.plan` gave for the digest, to another
+/// request id, so a plan answered within a frame to request id 0 can be
+/// larger than a frame answered to id `u64::MAX`, 19 digits longer. Here
+/// a plan of thousands of new items is answered to id 0 within the last
+/// 19 bytes of a frame (its size set two bytes at a time by lengthening
+/// variable names, each in an item's slug and reference). The same plan
+/// to id `u64::MAX` is `frame_too_large` (the generic answer path). The
+/// commit sent as id `u64::MAX` is refused `frame_too_large` and writes
+/// nothing: no item is made and no import is audited. The same commit
+/// sent as id 0, whose answer fits, makes every item and is audited once.
+///
+/// Mutation: `import_commit` writing the vault and auditing the import
+/// before it frames its answer (the refused commit makes the items, and
+/// the retry is `plan_changed`).
+#[test]
+fn a_commit_whose_answer_is_larger_than_a_frame_writes_nothing() {
+    use envcloak_ipc::MAX_FRAME;
+    use std::io::Read as _;
+    let mut f = Fixture::new(|_, _| {});
+    let dir = f.dir("acme-web");
+    let seed = fresh_seed();
+    // Generated here: never a provider's key shape, so each new item is
+    // named after its variable.
+    let value = |i: usize| format!("an import value {i:05} of {seed:016x}");
+    let params = |n: usize, longer: usize| ImportParams {
+        projects: vec![ImportProject {
+            dir: dir.clone(),
+            name: "acme-web".into(),
+        }],
+        entries: (0..n)
+            .map(|i| {
+                let name = format!("SECRET_{i:05}{}", if i < longer { "X" } else { "" });
+                entry(0, ".env", None, &name, value(i).as_bytes())
+            })
+            .collect(),
+        claims: Vec::new(),
+    };
+    // Sends `method` with `params` as request `id` over a raw connection:
+    // the answer's frame length and body.
+    let ask = |id: u64, method: &str, params: serde_json::Value| {
+        let mut s = common::raw(&f.home);
+        common::send_json(
+            &mut s,
+            &serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        );
+        let mut header = [0u8; 4];
+        s.read_exact(&mut header).unwrap();
+        let len = u32::from_be_bytes(header) as usize;
+        let mut body = vec![0u8; len];
+        s.read_exact(&mut body).unwrap();
+        (
+            len,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        )
+    };
+    let plan_len = |n: usize, longer: usize| {
+        let (len, answer) = ask(
+            0,
+            "import.plan",
+            serde_json::to_value(params(n, longer)).unwrap(),
+        );
+        answer.get("result").map(|_| len)
+    };
+    // A plan within the last 19 bytes of a frame to id 0.
+    let (small, more) = (plan_len(1000, 0).unwrap(), plan_len(2000, 0).unwrap());
+    let per = (more - small).div_ceil(1000);
+    let mut n = 2000 + (MAX_FRAME - more) / per;
+    let len = loop {
+        match plan_len(n, 0) {
+            Some(len) if len <= MAX_FRAME - 18 => break len,
+            _ => n -= 8,
+        }
+    };
+    let longer = (MAX_FRAME - 9 - len) / 2;
+    assert!(longer <= n, "the model of the plan's size is off");
+    let len = plan_len(n, longer).expect("the plan does not fit to id 0");
+    assert!(
+        (MAX_FRAME - 18..=MAX_FRAME).contains(&len),
+        "the plan's answer to id 0 is {len} bytes"
+    );
+    let p = serde_json::to_value(params(n, longer)).unwrap();
+    let (_, plan) = ask(u64::MAX, "import.plan", p);
+    assert_eq!(plan["error"]["data"]["kind"], "frame_too_large");
+    let (_, plan) = ask(
+        0,
+        "import.plan",
+        serde_json::to_value(params(n, longer)).unwrap(),
+    );
+    let digest = plan["result"]["digest"].as_str().unwrap().to_owned();
+    let items = plan["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), n, "not one new item per entry");
+    // The first and the last item the plan makes (the vault's listing of
+    // thousands is itself larger than a frame).
+    let slugs = [&items[0], &items[n - 1]].map(|i| i["slug"].as_str().unwrap().to_owned());
+    let mut c = client(&f.home);
+    let made = |c: &mut envcloak_ipc::Client| {
+        slugs.each_ref().map(|slug| match c.items_show(slug) {
+            Ok(_) => true,
+            Err(e) => {
+                assert_eq!(rpc(e), ErrorKind::NoSuchItem);
+                false
+            }
+        })
+    };
+    assert_eq!(made(&mut c), [false, false]);
+    let commit = || {
+        serde_json::to_value(ImportCommitParams {
+            import: params(n, longer),
+            digest: digest.clone(),
+        })
+        .unwrap()
+    };
+    let (_, refused) = ask(u64::MAX, "import.commit", commit());
+    assert!(
+        refused["error"]["data"]["kind"] == "frame_too_large" && refused.get("result").is_none(),
+        "the oversized commit was not refused frame_too_large"
+    );
+    assert_eq!(
+        made(&mut c),
+        [false, false],
+        "a commit whose answer was never sent made items"
+    );
+    let (got, done) = ask(0, "import.commit", commit());
+    assert!(
+        done.get("result").is_some(),
+        "the commit that fits was refused: {}",
+        done["error"]["data"]["kind"]
+    );
+    assert_eq!(got, len, "the commit's answer is not the plan's");
+    assert_eq!(made(&mut c), [true, true]);
+    drop(c);
+    assert_eq!(
+        f.d.log().matches("envcloakd: audit: imported ").count(),
+        1,
+        "imports audited"
+    );
+    assert!(
+        f.d.log()
+            .contains(&format!("envcloakd: audit: imported created={n} "))
+    );
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let imported: Vec<usize> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::Import && e.record.decision.outcome == "imported")
+        .map(|e| e.record.items.len())
+        .collect();
+    // An entry names at most 256 items (`MAX_ITEMS`, core audit/record.rs).
+    assert_eq!(imported, [n.min(256)], "imports audited");
+    f.sweep();
+}
