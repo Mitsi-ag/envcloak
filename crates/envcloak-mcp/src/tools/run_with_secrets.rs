@@ -8,20 +8,27 @@
 //! 1. The arguments are checked against the schema, and every string is
 //!    refused, unechoed, when it is shaped like a key or token (gate 13),
 //!    before anything is started or asked of the daemon.
-//! 2. The child is `<this envcloak> run --wait <n>s --wait-grace <g>s
-//!    [--profile p] -- <argv>`, in `project_dir`, with standard input from
-//!    `/dev/null`, its output on pipes, leading a process group of its own
-//!    ([`crate::child`]). The server's wait (`--wait-ms`, from the host's
-//!    tool cutoff) holds both: `<n>` for the person's approval, polling
-//!    without holding a connection, and `<g>` after it for the daemon's
-//!    last answer (`envcloak_agents::tool_timeouts::person_wait` and
-//!    `LAST_ANSWER_GRACE`), so the child gives up before the host does even
-//!    when the daemon is slow to answer at the deadline.
-//! 3. When the child stops at EnvCloak's own failure (exit 125 with
-//!    nothing but `envcloak: <token>: ...` lines), the result is that
-//!    outcome: `approval_required` names the request and says how the
-//!    person approves it, from a terminal of their own (T-15); the child's
-//!    own line, which names `envcloak approve`, is not passed on.
+//! 2. The child is `<this envcloak> run --status-fd <fd> --wait <n>s
+//!    --wait-grace <g>s [--profile p] -- <argv>`, in `project_dir`, with
+//!    standard input from `/dev/null`, its output on pipes, leading a
+//!    process group of its own ([`crate::child`]). The server's wait
+//!    (`--wait-ms`, from the host's tool cutoff) holds both: `<n>` for the person's approval,
+//!    polling without holding a connection, and `<g>` after it for the
+//!    daemon's last answer (`envcloak_agents::tool_timeouts::person_wait`
+//!    and `LAST_ANSWER_GRACE`), so the child gives up before the host does
+//!    even when the daemon is slow to answer at the deadline.
+//! 3. How the run ended comes only from the child's status record, on a
+//!    descriptor the command never holds
+//!    ([`envcloak_client::run_status`]), never from the exit code or the
+//!    output: a command that exits 125 after printing EnvCloak's own
+//!    failure line ran all the same (Codex F-113). Refused before the
+//!    command started, the result is that outcome, and its message the
+//!    child's own failure line (nothing else wrote to its output then):
+//!    `approval_required` names the request the record names and says how
+//!    the person approves it, from a terminal of their own (T-15); the
+//!    child's own line, which names `envcloak approve`, is not passed on.
+//!    No record, or one that is not well formed, is `execution_unknown`:
+//!    the command may have run, and the result says so with the output.
 //!    Otherwise the command ran: the result is its exit code and its
 //!    output, at most [`child::OUTPUT_HEAD`] bytes from the start and
 //!    [`child::OUTPUT_TAIL`] from the end of each stream, with a marker
@@ -38,11 +45,12 @@ use std::process::Command;
 
 use envcloak_agents::tool_timeouts;
 use envcloak_client::fail::Failure;
+use envcloak_client::run_status::{Exit, RunStatus};
 use envcloak_policy::{PendingId, ProfileName};
 use serde_json::{Map, Value, json};
 
 use super::{Ctx, check_keys, invalid, object, opt_str, project_dir, refuse_value_like, req_str};
-use crate::child::{self, Call, Captured, HeadTail, NotRun};
+use crate::child::{self, Call, Captured, HeadTail, NotRun, Report};
 use crate::router::{Annotations, Tool, ToolResult, ToolSchema};
 
 /// The tool's name.
@@ -72,7 +80,9 @@ impl Tool for RunWithSecrets {
                  approved. The command runs outside this host's sandbox, and holds the injected \
                  keys in its environment and memory while it runs: what it does with them (files, \
                  network, its own child processes) is up to the command. argv runs without a \
-                 shell; output is cut to its first and last 64 KiB per stream.",
+                 shell; output is cut to its first and last 64 KiB per stream. A status of \
+                 execution_unknown means the command may have run: check before running it \
+                 again.",
             input: object(
                 json!({
                     "project_dir": {
@@ -99,7 +109,13 @@ impl Tool for RunWithSecrets {
                 json!({
                     "status": {
                         "type": "string",
-                        "enum": ["completed", "approval_required", "denied", "refused"],
+                        "enum": [
+                            "completed",
+                            "approval_required",
+                            "denied",
+                            "refused",
+                            "execution_unknown",
+                        ],
                     },
                     "exit_code": {"type": ["integer", "null"]},
                     "signal": {"type": ["integer", "null"]},
@@ -179,17 +195,22 @@ fn args(args: &Map<String, Value>) -> Result<Args<'_>, Failure> {
 fn run(a: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Failure> {
     let a = args(a)?;
     let wait_secs = tool_timeouts::person_wait(ctx.wait).as_secs();
-    let mut cmd = Command::new(&ctx.exe);
-    cmd.arg("run")
-        .arg("--wait")
-        .arg(format!("{wait_secs}s"))
-        .arg("--wait-grace")
-        .arg(format!("{}s", tool_timeouts::LAST_ANSWER_GRACE.as_secs()));
-    if let Some(p) = &a.profile {
-        cmd.arg("--profile").arg(p.as_str());
-    }
-    cmd.arg("--").args(&a.argv).current_dir(&a.dir);
-    let done = match child::run(cmd, call, None) {
+    let make = |status_fd: i32| {
+        let mut cmd = Command::new(&ctx.exe);
+        cmd.arg("run")
+            .arg("--status-fd")
+            .arg(status_fd.to_string())
+            .arg("--wait")
+            .arg(format!("{wait_secs}s"))
+            .arg("--wait-grace")
+            .arg(format!("{}s", tool_timeouts::LAST_ANSWER_GRACE.as_secs()));
+        if let Some(p) = &a.profile {
+            cmd.arg("--profile").arg(p.as_str());
+        }
+        cmd.arg("--").args(&a.argv).current_dir(&a.dir);
+        cmd
+    };
+    let (done, report) = match child::run_reporting(make, call, None) {
         Ok(done) => done,
         Err(NotRun::Cancelled) => return Err(Failure::new("cancelled", "the call was cancelled")),
         Err(NotRun::Spawn) => {
@@ -199,87 +220,139 @@ fn run(a: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Failure>
             ));
         }
     };
-    Ok(outcome(&done, ctx, wait_secs))
+    Ok(outcome(&done, &report, ctx, wait_secs))
 }
 
-/// `envcloak run`'s own failure, when that is how it stopped: its token
-/// and message, from the last `envcloak: <token>: <message>` line.
-fn own_failure(done: &Captured) -> Option<(String, String)> {
-    if done.code != Some(125)
-        || !done.stdout.head().is_empty()
-        || done.stderr.left_out() > 0
-        || done.cut
-    {
-        return None;
-    }
+/// How the run ended, from the child's status record: the record when it
+/// came whole and the pipe ended, [`RunStatus::Unknown`] otherwise.
+fn status_of(report: &Report) -> RunStatus {
+    report
+        .bytes
+        .as_deref()
+        .filter(|_| report.ended)
+        .and_then(RunStatus::decode)
+        .unwrap_or(RunStatus::Unknown)
+}
+
+/// `envcloak run`'s own message for its failure `token`: the last line
+/// `envcloak: <token>: <message>` it printed. Read only for a run that
+/// started no command, when nothing else wrote to its output.
+fn own_message(done: &Captured, token: &str) -> Option<String> {
     let mut text = done.stderr.head().to_vec();
     text.extend(done.stderr.tail());
-    let text = std::str::from_utf8(&text).ok()?;
-    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-    if lines.is_empty() || !lines.iter().all(|l| l.starts_with("envcloak: ")) {
-        return None;
-    }
-    let last = lines.last()?.strip_prefix("envcloak: ")?;
-    let (token, message) = last.split_once(": ")?;
-    let token_shaped = !token.is_empty()
-        && token
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-    (token_shaped && token != "coverage").then(|| (token.to_owned(), message.to_owned()))
+    let text = String::from_utf8_lossy(&text);
+    let prefix = format!("envcloak: {token}: ");
+    text.lines()
+        .rev()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .map(str::to_owned)
 }
 
-/// The request id in `approval_required`'s message: `request=<id>`.
-fn request_of(message: &str) -> Option<PendingId> {
-    let rest = message.split_once("request=")?.1;
-    PendingId::parse(rest.get(..8)?)
-}
-
-/// What the call answers for `done`.
-fn outcome(done: &Captured, ctx: &Ctx, wait_secs: u64) -> Value {
-    if let Some((token, message)) = own_failure(done) {
-        let mut v = json!({
-            "status": "refused",
-            "exit_code": done.code,
-            "signal": Value::Null,
-            "token": envcloak_client::render::shown(&token),
-            "request": Value::Null,
-        });
-        match (token.as_str(), request_of(&message)) {
-            ("approval_required", Some(id)) => {
-                ctx.remember_pending(id);
-                v["status"] = json!("approval_required");
-                v["request"] = json!(id.to_string());
-                v["message"] = json!(format!(
-                    "Request {id} needs the person's approval in EnvCloak. Ask them to run \
-                     `envcloak pending` and approve it from a terminal of their own; approvals \
-                     from this session are refused. This call waited {wait_secs} s for it. Once \
-                     it is approved, call run_with_secrets again with the same arguments. The \
-                     command then runs outside this host's sandbox and holds the injected keys \
-                     while it runs."
-                ));
-            }
-            ("approval_denied", _) => {
-                v["status"] = json!("denied");
-                v["message"] = json!(passed_on(&message));
-            }
-            _ => v["message"] = json!(passed_on(&message)),
+/// What the call answers for `done`, whose status record is in `report`.
+fn outcome(done: &Captured, report: &Report, ctx: &Ctx, wait_secs: u64) -> Value {
+    match status_of(report) {
+        RunStatus::NotStarted { token, request } => {
+            not_started(done, &token, request, ctx, wait_secs)
         }
-        return v;
+        RunStatus::Ran(exit) => completed(done, exit),
+        RunStatus::Unknown => unknown(done),
     }
+}
+
+/// `envcloak run` refused with `token` before it started the command.
+fn not_started(
+    done: &Captured,
+    token: &str,
+    request: Option<PendingId>,
+    ctx: &Ctx,
+    wait_secs: u64,
+) -> Value {
+    let message = own_message(done, token).unwrap_or_else(|| {
+        "`envcloak run` refused before it started the command; nothing was run".to_owned()
+    });
+    let mut v = json!({
+        "status": "refused",
+        "exit_code": done.code,
+        "signal": Value::Null,
+        "token": envcloak_client::render::shown(token),
+        "request": Value::Null,
+    });
+    match (token, request) {
+        ("approval_required", Some(id)) => {
+            ctx.remember_pending(id);
+            v["status"] = json!("approval_required");
+            v["request"] = json!(id.to_string());
+            v["message"] = json!(format!(
+                "Request {id} needs the person's approval in EnvCloak. Ask them to run \
+                 `envcloak pending` and approve it from a terminal of their own; approvals \
+                 from this session are refused. This call waited {wait_secs} s for it. Once \
+                 it is approved, call run_with_secrets again with the same arguments. The \
+                 command then runs outside this host's sandbox and holds the injected keys \
+                 while it runs."
+            ));
+        }
+        ("approval_denied", _) => {
+            v["status"] = json!("denied");
+            v["message"] = json!(passed_on(&message));
+        }
+        _ => v["message"] = json!(passed_on(&message)),
+    }
+    v
+}
+
+/// The command ran, and ended as `exit` says.
+fn completed(done: &Captured, exit: Exit) -> Value {
     let (stdout, out_left) = shown_output(&done.stdout, done.cut);
     let (stderr, err_left) = shown_output(&done.stderr, done.cut);
-    let message = match (done.code, done.signal) {
-        (Some(c), _) => format!("The command ran through EnvCloak and exited with code {c}."),
-        (None, Some(s)) => format!("The command ran through EnvCloak and was ended by signal {s}."),
-        (None, None) => "The command ran through EnvCloak; its exit status is unknown.".to_owned(),
+    let (code, signal, message) = match exit {
+        Exit::Code(c) => (
+            i32::from(c),
+            None,
+            format!("The command ran through EnvCloak and exited with code {c}."),
+        ),
+        Exit::Signal(s) => (
+            128 + s,
+            Some(s),
+            format!("The command ran through EnvCloak and was ended by signal {s}."),
+        ),
+        Exit::Stopped(s) => (
+            128 + s,
+            Some(s),
+            format!(
+                "The command ran through EnvCloak and exited; signal {s} stopped the run before \
+                 all its output was read."
+            ),
+        ),
     };
     json!({
         "status": "completed",
-        "exit_code": done.code,
-        "signal": done.signal,
+        "exit_code": code,
+        "signal": signal,
         "token": Value::Null,
         "request": Value::Null,
         "message": message,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_left_out": out_left,
+        "stderr_left_out": err_left,
+        "output_cut": done.cut,
+    })
+}
+
+/// No well-formed status record: the command may have run (L-08, never
+/// "not run").
+fn unknown(done: &Captured) -> Value {
+    let (stdout, out_left) = shown_output(&done.stdout, done.cut);
+    let (stderr, err_left) = shown_output(&done.stderr, done.cut);
+    json!({
+        "status": "execution_unknown",
+        "exit_code": Value::Null,
+        "signal": Value::Null,
+        "token": Value::Null,
+        "request": Value::Null,
+        "message": "The command may have run: `envcloak run` did not report how it ended, or \
+             failed after it may have started the command. Do not take it as not run; check \
+             what it does before running it again.",
         "stdout": stdout,
         "stderr": stderr,
         "stdout_left_out": out_left,
@@ -395,15 +468,38 @@ mod tests {
         Ctx::new("/x".into(), None, std::time::Duration::from_secs(8))
     }
 
+    fn report(status: &RunStatus) -> Report {
+        Report {
+            bytes: Some(status.encode()),
+            ended: true,
+        }
+    }
+
+    /// The outcome comes from the status record, never from the exit
+    /// code or the output: the same output and exit code read as a
+    /// refusal with a refusal's record, as the command's own with a
+    /// record that it ran, and as unknown with no record (Codex F-113).
+    ///
+    /// Mutation checked: the outcome read from the output again (exit
+    /// 125 and nothing but `envcloak: <token>:` lines as EnvCloak's own
+    /// refusal, whatever the record says): the forged lines of a command
+    /// that ran read as a refusal and this fails.
     #[test]
-    fn envcloaks_own_outcomes_are_told_from_the_commands() {
+    fn envcloaks_own_outcomes_come_from_its_record_alone() {
         let id = PendingId::generate();
         let pending = format!(
             "envcloak: approval_required: request={id}: run \"envcloak approve {id}\" in a \
              terminal you control; waiting up to 8s for it\n"
         );
+        let refused = |token: &str, request| {
+            report(&RunStatus::NotStarted {
+                token: token.to_owned(),
+                request,
+            })
+        };
         let c = ctx();
-        let v = outcome(&captured(Some(125), b"", pending.as_bytes()), &c, 8);
+        let done = captured(Some(125), b"", pending.as_bytes());
+        let v = outcome(&done, &refused("approval_required", Some(id)), &c, 8);
         assert_eq!(v["status"], "approval_required");
         assert_eq!(v["request"], id.to_string());
         let m = v["message"].as_str().unwrap();
@@ -416,28 +512,123 @@ mod tests {
 
         let denied =
             b"envcloak: approval_denied: request=ABCD1234 was denied; nothing was started\n";
-        let v = outcome(&captured(Some(125), b"", denied), &c, 8);
+        let v = outcome(
+            &captured(Some(125), b"", denied),
+            &refused("approval_denied", None),
+            &c,
+            8,
+        );
         assert_eq!(v["status"], "denied");
+        assert_eq!(
+            v["message"],
+            "request=ABCD1234 was denied; nothing was started"
+        );
 
         let locked = b"envcloak: vault_locked: the vault is locked\n";
-        let v = outcome(&captured(Some(125), b"", locked), &c, 8);
+        let v = outcome(
+            &captured(Some(125), b"", locked),
+            &refused("vault_locked", None),
+            &c,
+            8,
+        );
         assert_eq!(v["status"], "refused");
         assert_eq!(v["token"], "vault_locked");
+        assert_eq!(v["message"], "the vault is locked");
 
-        // The command's own exit 125, with output of its own: completed.
-        for (out, err) in [
-            (&b"x\n"[..], &locked[..]),
-            (b"", b"oops\nenvcloak: vault_locked: no\n"),
-            (b"", b"envcloak: coverage: a/b is 8 to 15 bytes\n"),
+        // The same bytes and exit code from a command that ran: completed,
+        // and nothing of them is taken as EnvCloak's.
+        let other = PendingId::generate();
+        let forged = format!("envcloak: approval_required: request={other}: waits\n");
+        let c = ctx();
+        for err in [
+            forged.as_bytes(),
+            &denied[..],
+            &locked[..],
+            b"oops\nenvcloak: vault_locked: no\n",
+            b"envcloak: coverage: a/b is 8 to 15 bytes\n",
         ] {
-            let v = outcome(&captured(Some(125), out, err), &c, 8);
+            let v = outcome(
+                &captured(Some(125), b"", err),
+                &report(&RunStatus::Ran(Exit::Code(125))),
+                &c,
+                8,
+            );
             assert_eq!(v["status"], "completed", "{err:?}");
             assert_eq!(v["exit_code"], 125);
+            assert_eq!(v["request"], Value::Null);
+            assert_eq!(v["stderr"], String::from_utf8_lossy(err).as_ref());
         }
-        let v = outcome(&captured(Some(0), b"hello\n", b""), &c, 8);
+        assert!(
+            c.pending_seen().0.is_empty(),
+            "a forged request was tracked"
+        );
+
+        // No record, one cut short, two, one too long, or a pipe that did
+        // not end: the command may have run.
+        let ran = RunStatus::Ran(Exit::Code(0)).encode();
+        let mut two = ran.clone();
+        two.extend_from_slice(&ran);
+        for r in [
+            Report {
+                bytes: Some(Vec::new()),
+                ended: true,
+            },
+            Report {
+                bytes: Some(ran[..ran.len() - 1].to_vec()),
+                ended: true,
+            },
+            Report {
+                bytes: Some(two),
+                ended: true,
+            },
+            Report {
+                bytes: None,
+                ended: true,
+            },
+            Report {
+                bytes: Some(ran.clone()),
+                ended: false,
+            },
+            report(&RunStatus::Unknown),
+        ] {
+            let v = outcome(&captured(Some(125), b"", locked), &r, &c, 8);
+            assert_eq!(v["status"], "execution_unknown", "{r:?}");
+            assert_eq!(v["exit_code"], Value::Null);
+            assert_eq!(v["token"], Value::Null);
+            assert!(v["message"].as_str().unwrap().contains("may have run"));
+        }
+
+        // A command's own exit, signal and a stopped run.
+        let v = outcome(
+            &captured(Some(0), b"hello\n", b""),
+            &report(&RunStatus::Ran(Exit::Code(0))),
+            &c,
+            8,
+        );
         assert_eq!(v["status"], "completed");
         assert_eq!(v["stdout"], "hello\n");
         assert_eq!(v["stdout_left_out"], 0);
+        let v = outcome(
+            &captured(Some(143), b"", b""),
+            &report(&RunStatus::Ran(Exit::Signal(15))),
+            &c,
+            8,
+        );
+        assert_eq!(
+            (v["exit_code"].clone(), v["signal"].clone()),
+            (json!(143), json!(15))
+        );
+        let v = outcome(
+            &captured(Some(130), b"", b""),
+            &report(&RunStatus::Ran(Exit::Stopped(2))),
+            &c,
+            8,
+        );
+        assert_eq!(
+            (v["exit_code"].clone(), v["signal"].clone()),
+            (json!(130), json!(2))
+        );
+        assert!(v["message"].as_str().unwrap().contains("stopped the run"));
     }
 
     /// Output past the caps keeps its ends, names what was left out, and

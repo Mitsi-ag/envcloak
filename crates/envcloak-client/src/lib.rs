@@ -4,8 +4,9 @@
 //! rendering of the daemon's metadata views as text and JSON ([`render`]),
 //! reading a secret from a person ([`tty`]), the `.gitignore` reading of
 //! `init` and `import` ([`gitignore`]), the agent markers a process
-//! carries ([`claims`]) and the manifest editor of `envcloak ref`
-//! ([`manifest_edit`]).
+//! carries ([`claims`]), the manifest editor of `envcloak ref`
+//! ([`manifest_edit`]) and the status record `envcloak run --status-fd`
+//! writes for `envcloak mcp` ([`run_status`]).
 //!
 //! The `envcloak` binary keeps argument parsing and printing. `envcloak
 //! mcp` and the agent installers build on this crate rather than on the
@@ -26,6 +27,7 @@ pub mod fail;
 pub mod gitignore;
 pub mod manifest_edit;
 pub mod render;
+pub mod run_status;
 pub mod tty;
 
 pub use claims::{claims, refuse_if_claimed};

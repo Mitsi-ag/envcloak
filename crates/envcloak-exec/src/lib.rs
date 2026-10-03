@@ -200,9 +200,15 @@ pub enum ExecError {
     NotFound,
     /// The command was found but could not be run (exit 126, as `env(1)`).
     NotExecutable(io::ErrorKind),
-    /// Setting up the run failed: signals, pipes, threads, or waiting for
-    /// the child.
+    /// Setting up the run failed before the command was started: its
+    /// signals, or the spawn itself (out of descriptors, processes or
+    /// memory).
     Setup(io::ErrorKind),
+    /// The command was started, but could not be followed to its end: its
+    /// output threads, or waiting for it, failed. It may have run, and
+    /// did what it did; how it ended is not known
+    /// ([`ExecError::may_have_started`]).
+    Followed(io::ErrorKind),
 }
 
 impl ExecError {
@@ -224,8 +230,17 @@ impl ExecError {
             ExecError::NulByte => "binding_unresolved",
             ExecError::NotFound => "command_not_found",
             ExecError::NotExecutable(_) => "command_not_executable",
-            ExecError::Setup(_) => "run_failed",
+            ExecError::Setup(_) | ExecError::Followed(_) => "run_failed",
         }
+    }
+
+    /// Whether the command may have been started before this failure:
+    /// only [`ExecError::Followed`]. Every other failure comes before the
+    /// command could run (a spawn that fails runs nothing), so a program
+    /// that started `envcloak run` may tell "not started" from "may have
+    /// run" by this, never by the exit code or the output.
+    pub fn may_have_started(&self) -> bool {
+        matches!(self, ExecError::Followed(_))
     }
 
     /// A fixed message: no argument, value or path.
@@ -242,7 +257,12 @@ impl ExecError {
             ExecError::NotFound => "the command was not found",
             ExecError::NotExecutable(_) => "the command could not be run",
             ExecError::Setup(_) => {
-                "the command could not be started or followed (signals, pipes or threads)"
+                "the command could not be started (signals, descriptors, processes or memory); \
+                 nothing was run"
+            }
+            ExecError::Followed(_) => {
+                "the command was started, but could not be followed to its end (pipes, threads \
+                 or waiting for it): it may have run"
             }
         }
     }
@@ -262,9 +282,10 @@ impl std::error::Error for ExecError {}
 /// # Errors
 /// [`ExecError::NoCommand`], [`ExecError::NulByte`], [`ExecError::NotFound`]
 /// and [`ExecError::NotExecutable`] before anything runs, and
-/// [`ExecError::Setup`] when signals, pipes or threads cannot be set up (a
-/// child already started is then killed and reaped) or waiting for it
-/// fails.
+/// [`ExecError::Setup`] when signals cannot be set up or the spawn fails;
+/// [`ExecError::Followed`] once the command was started, when its output
+/// threads cannot be set up (it is then killed and reaped) or waiting for
+/// it fails.
 pub fn run(spec: RunSpec) -> Result<ChildExit, ExecError> {
     let RunSpec {
         argv,
@@ -318,7 +339,7 @@ fn follow(
         forwarder,
         interrupter,
     } = threads;
-    let setup = |e: io::Error| ExecError::Setup(e.kind());
+    let setup = |e: io::Error| ExecError::Followed(e.kind());
     let Ok(pid) = i32::try_from(child.id()) else {
         return Err(abandon(child, io::ErrorKind::InvalidData.into()));
     };
@@ -402,9 +423,9 @@ fn follow(
         end_group();
         let status = child.wait();
         if let Some(kind) = failed {
-            return Err(ExecError::Setup(kind));
+            return Err(ExecError::Followed(kind));
         }
-        pumped.map_err(ExecError::Setup)?;
+        pumped.map_err(ExecError::Followed)?;
         waited.map_err(setup)?;
         let status = status.map_err(setup)?;
         Ok(match cutoff.stopped_by() {
@@ -414,11 +435,12 @@ fn follow(
     })
 }
 
-/// Kills and reaps a child that cannot be followed, and returns the error.
+/// Kills and reaps a child that cannot be followed, and returns the error:
+/// it was started, so it may have run.
 fn abandon(mut child: std::process::Child, e: io::Error) -> ExecError {
     let _ = child.kill();
     let _ = child.wait();
-    ExecError::Setup(e.kind())
+    ExecError::Followed(e.kind())
 }
 
 #[cfg(test)]
