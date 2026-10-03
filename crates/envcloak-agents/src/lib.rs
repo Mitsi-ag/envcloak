@@ -3,9 +3,9 @@
 //! - [`hook`]: the handler the agent hosts' prompt and tool-call hooks run
 //!   (`envcloak hook`), and the argv check `run_with_secrets` shares with
 //!   it (M2 plan M2-08, D-12, D-22).
-//! - [`install`] with [`blocks`], [`jsonedit`], [`writer`], [`detect`] and
-//!   [`hosts`]: `envcloak agents install` and `uninstall` for Claude Code
-//!   and Codex (M2-08, D-16).
+//! - [`install`] with [`blocks`], [`jsonedit`], [`writer`], [`hunks`],
+//!   [`detect`] and [`hosts`]: `envcloak agents install` and `uninstall`
+//!   for Claude Code and Codex (M2-08, D-16).
 //! - [`locations`]: the host, version and path catalog, the only place
 //!   host paths are named, which emits the scanner's descriptors (D-02).
 //! - [`probe::model`]: the scripted model that the agent hosts are pointed
@@ -19,6 +19,7 @@ pub mod blocks;
 pub mod detect;
 pub mod hook;
 pub mod hosts;
+pub mod hunks;
 pub mod install;
 pub mod jsonedit;
 pub mod locations;

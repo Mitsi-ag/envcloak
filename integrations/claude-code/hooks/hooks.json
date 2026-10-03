@@ -13,7 +13,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|Read|Grep|Glob|Edit",
+        "matcher": "Bash|Monitor|Read|Edit|Grep|Glob|ReadMcpResourceTool",
         "hooks": [
           {
             "type": "command",
