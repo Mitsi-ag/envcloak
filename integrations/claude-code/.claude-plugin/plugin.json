@@ -1,0 +1,13 @@
+{
+  "name": "envcloak",
+  "displayName": "EnvCloak",
+  "version": "0.1.0",
+  "description": "Keeps API keys out of the chat: EnvCloak's instructions, its prompt and tool-call hooks, and its MCP server. Needs the envcloak command on PATH.",
+  "author": {
+    "name": "EnvCloak contributors"
+  },
+  "homepage": "https://github.com/Mitsi-ag/envcloak",
+  "repository": "https://github.com/Mitsi-ag/envcloak",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["secrets", "api-keys", "env"]
+}
