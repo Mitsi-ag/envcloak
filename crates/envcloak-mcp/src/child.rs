@@ -45,10 +45,11 @@
 //!   the standard streams before it starts its command, so whatever a
 //!   child of this server inherits by mistake never reaches the command.
 //! - [`run_reporting`] also hands the child the write end of a pipe of its
-//!   own, its status descriptor (`envcloak run --status-fd N`): the flag
-//!   is cleared on it in that child only, after the fork, and this
-//!   server's copy is closed once the child is started, so the end of
-//!   that pipe is the child's exit. What comes through it is the child's
+//!   own, its status descriptor (`envcloak run --status-fd N`): in that
+//!   child only, after the fork, a copy the command holds is put at `N`
+//!   without the close-on-exec flag, and this server's copies are closed
+//!   once the child is started, so the end of that pipe is the child's
+//!   exit. What comes through it is the child's
 //!   record of how the run ended ([`Report`]), which the command, never
 //!   holding the descriptor, cannot write.
 //! - Output is kept as its first and last [`OUTPUT_HEAD`] and
@@ -463,8 +464,8 @@ fn follow(
             envcloak_sys::inherit_on_spawn(&mut cmd, w.as_fd()).map_err(|_| NotRun::Spawn)?;
         }
         let child = cmd.spawn().map_err(|_| NotRun::Spawn)?;
-        // This server's write end closes here: the child's copy is the
-        // only one left.
+        // This server's write end, and the command's copy of it, close
+        // here: the child's is the only one left.
         (child, pipe.map(|(r, _)| std::fs::File::from(r)))
     };
     let Ok(pid) = i32::try_from(child.id()) else {

@@ -42,13 +42,16 @@ pub fn cloexec_flag(fd: BorrowedFd<'_>) -> io::Result<bool> {
     Ok(flags & libc::FD_CLOEXEC != 0)
 }
 
-/// Takes the inherited descriptor `n` (3 or more) as this process's own,
-/// with the close-on-exec flag set on it first, so that no program this
-/// process starts inherits it: `envcloak run --status-fd N` takes its
-/// status channel so before it starts anything. Unlike [`inherited_fd`]
-/// no copy is made, and `n` itself is closed when the result is dropped.
-/// Nothing else in the process may own `n`: the caller takes it before it
-/// opens anything.
+/// The inherited descriptor `n` (3 or more), for this process to write
+/// to, with no program it starts ever holding it: `envcloak run
+/// --status-fd N` takes its status channel so before it starts anything.
+/// The close-on-exec flag is set on `n` itself, and the result is a copy
+/// of it made with `F_DUPFD_CLOEXEC` ([`inherited_fd`]), which this
+/// process owns alone; `n` stays open, closed on exec, until the process
+/// exits. A safe function cannot take ownership of a number something
+/// else may own (a `File` the caller holds, say): two owners would each
+/// close it, the second closing whatever reused the number (Codex review
+/// of M2-RES1). Setting the flag changes no ownership.
 ///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] for a number under 3 (the standard
@@ -63,13 +66,12 @@ pub fn claim_inherited_fd(n: i32) -> io::Result<OwnedFd> {
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: as above; F_SETFD changes only this descriptor's flags.
+    // SAFETY: as above; F_SETFD changes only this descriptor's flags, and
+    // no handle in this process gains or loses ownership.
     if unsafe { libc::fcntl(n, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `n` is open, and the caller owns no other handle to it (see
-    // above), so the result is its only owner.
-    Ok(unsafe { OwnedFd::from_raw_fd(n) })
+    inherited_fd(n)
 }
 
 /// A new pipe, both ends close-on-exec: `(read, write)`. On Linux the
@@ -177,37 +179,55 @@ fn close_on_exec_listed(numbers: impl Iterator<Item = i32>) -> io::Result<usize>
     Ok(changed)
 }
 
-/// Makes `cmd`'s child keep `fd`, at the same number, when it starts its
-/// program: the close-on-exec flag is cleared on that number in the child
-/// only, after the fork, so this process's copy keeps the flag and no
-/// other child started meanwhile gets the descriptor. The caller keeps
-/// `fd` open until the spawn returns, and passes its number to the child
-/// (`envcloak run --status-fd N`).
+/// Makes `cmd`'s child have the open file `fd` refers to now at `fd`'s
+/// number when it starts its program, and no other child started
+/// meanwhile get it. `cmd` keeps its own copy, made now with
+/// `F_DUPFD_CLOEXEC` and closed with `cmd`; in the child only, after the
+/// fork, `dup2` puts that copy at `fd`'s number without the close-on-exec
+/// flag. So the child gets this file whatever becomes of the number here
+/// before the spawn: a hook that cleared the flag on the number itself
+/// used it after the borrow ended, and would have handed the child
+/// whatever descriptor reused it (the class of Codex's review of
+/// M2-RES1). The caller passes the number to the child (`envcloak run
+/// --status-fd N`). `cmd` holds its copy until it is dropped: a reader
+/// waiting for the end of the file waits for that too.
 ///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] for a standard stream's number, which
-/// the spawn sets up itself.
+/// the spawn sets up itself; and when the copy cannot be made.
 pub fn inherit_on_spawn(cmd: &mut std::process::Command, fd: BorrowedFd<'_>) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
     let n = fd.as_raw_fd();
     if n < 3 {
         return Err(io::ErrorKind::InvalidInput.into());
     }
+    let copy = inherited_fd(n)?;
     let keep = move || {
-        // SAFETY: F_GETFD and F_SETFD on a number open in the child (the
-        // fork copied it); fcntl is async-signal-safe, and nothing here
-        // allocates or takes a lock.
-        let flags = unsafe { libc::fcntl(n, libc::F_GETFD) };
-        // SAFETY: as above.
-        if flags < 0 || unsafe { libc::fcntl(n, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        let m = copy.as_raw_fd();
+        if m == n {
+            // SAFETY: F_GETFD and F_SETFD on `copy`, open in the child (the
+            // fork copied it); fcntl is async-signal-safe.
+            let flags = unsafe { libc::fcntl(n, libc::F_GETFD) };
+            // SAFETY: as above.
+            if flags < 0 || unsafe { libc::fcntl(n, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        // SAFETY: dup2 from `copy`, open in the child, onto `n`, closing in
+        // the child only whatever had that number there; the new
+        // descriptor has no close-on-exec flag. dup2 is async-signal-safe,
+        // and nothing here allocates or takes a lock.
+        if unsafe { libc::dup2(m, n) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     };
     // SAFETY: the closure runs in the child after the fork and before its
     // program starts, where a child forked from a threaded parent may call
-    // only async-signal-safe functions: it calls `fcntl` twice on a number
-    // copied before the fork, and `last_os_error` only reads errno.
+    // only async-signal-safe functions: it calls `dup2` or `fcntl` on
+    // descriptors the fork copied, and `last_os_error` only reads errno.
     unsafe { cmd.pre_exec(keep) };
     Ok(())
 }
@@ -228,9 +248,10 @@ mod tests {
         assert_eq!(r, 0);
     }
 
-    /// Held by each test that sweeps the process's descriptors or clears a
-    /// flag and reads it back: a sweep sets the flag on every other
-    /// test's descriptors too.
+    /// Held by each test that sweeps the process's descriptors, clears a
+    /// flag and reads it back, or starts a child: a sweep sets the flag on
+    /// every other test's descriptors too, and a child started while
+    /// another test's descriptor has the flag cleared would hold it.
     static SWEEPING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sweeping() -> std::sync::MutexGuard<'static, ()> {
@@ -339,23 +360,48 @@ mod tests {
         assert!(cloexec_flag(high.as_fd()).unwrap());
     }
 
-    /// A claimed descriptor gets the flag and is closed with its owner; a
-    /// standard stream's number and one that is not open are refused.
+    /// A claimed descriptor is a copy this process owns alone, both it and
+    /// the inherited number closed on exec: dropping the copy leaves the
+    /// number open for whatever else owns it (Codex review of M2-RES1: the
+    /// claim took ownership of the number itself, so a safe caller holding
+    /// it as a `File` had two owners, and the first drop closed the
+    /// other's descriptor). A standard stream's number and one that is not
+    /// open are refused.
+    ///
+    /// Mutation checked: the claim taking `n` itself as its result, as
+    /// before (`OwnedFd::from_raw_fd(n)`): dropping it closes the pipe's
+    /// only write end, the reader sees its end and this fails.
     #[test]
-    fn a_claimed_descriptor_is_closed_on_exec_and_owned() {
-        use std::os::fd::IntoRawFd;
+    fn a_claimed_descriptor_is_a_copy_and_both_close_on_exec() {
+        let _sweeping = sweeping();
         let (r, w) = pipe_cloexec().unwrap();
         inheritable(w.as_fd());
-        let n = w.into_raw_fd();
-        let owned = claim_inherited_fd(n).unwrap();
-        assert!(cloexec_flag(owned.as_fd()).unwrap());
-        drop(owned);
-        // Its only owner is gone: the reader sees the end at once.
+        // The caller's own handle on the number, as a `File`; never closed
+        // twice, whatever the claim does.
+        let held = std::mem::ManuallyDrop::new(std::fs::File::from(w));
+        let n = held.as_raw_fd();
+        let claimed = claim_inherited_fd(n).unwrap();
+        assert_ne!(claimed.as_raw_fd(), n);
+        assert!(cloexec_flag(claimed.as_fd()).unwrap());
+        drop(claimed);
+        // The number is still open, its flag set, and still the pipe's
+        // write end: the reader has no end of input yet.
+        let mut reader = std::fs::File::from(r);
+        // SAFETY: F_GETFL and F_SETFL on the read end this test owns.
+        let fl = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+        // SAFETY: as above.
+        let set = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) };
+        assert_eq!(set, 0);
         let mut buf = [0u8; 1];
+        let pending = std::io::Read::read(&mut reader, &mut buf);
         assert_eq!(
-            std::io::Read::read(&mut std::fs::File::from(r), &mut buf).unwrap(),
-            0
+            pending.map_err(|e| e.kind()),
+            Err(io::ErrorKind::WouldBlock),
+            "the inherited number was closed with the copy"
         );
+        assert!(cloexec_flag(held.as_fd()).unwrap());
+        drop(std::mem::ManuallyDrop::into_inner(held));
+        assert_eq!(std::io::Read::read(&mut reader, &mut buf).unwrap(), 0);
         assert_eq!(
             claim_inherited_fd(2).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
@@ -369,12 +415,17 @@ mod tests {
 
     /// A child keeps the descriptor it is handed, at its number, while
     /// this process's copy keeps its flag; without the hand-over the child
-    /// has nothing there.
+    /// has nothing there; and when the number is closed here and given to
+    /// another file before the spawn, the child still gets the file it was
+    /// handed, never the other.
     ///
-    /// Mutation checked: the hook not clearing the flag: the child's write
-    /// fails and this fails.
+    /// Mutations checked: the hook not clearing the flag: the child's write
+    /// fails and this fails. The hook clearing the flag on the number in
+    /// the child, as before, in place of its own copy: the child writes
+    /// into the file that reused the number and this fails.
     #[test]
     fn a_child_keeps_the_descriptor_it_is_handed() {
+        let _sweeping = sweeping();
         for handed in [true, false] {
             let (r, w) = pipe_cloexec().unwrap();
             let n = w.as_fd().as_raw_fd();
@@ -387,12 +438,37 @@ mod tests {
             }
             let status = cmd.status().unwrap();
             assert!(cloexec_flag(w.as_fd()).unwrap());
+            // `cmd` holds its copy of the write end until it goes.
+            drop(cmd);
             drop(w);
             let mut got = String::new();
             std::io::Read::read_to_string(&mut std::fs::File::from(r), &mut got).unwrap();
             assert_eq!(status.success(), handed, "handed {handed}");
             assert_eq!(got, if handed { "kept\n" } else { "" }, "handed {handed}");
         }
+        // The number closed here, and given to another file, before the
+        // spawn: the child still gets the file it was handed there.
+        let (r, w) = pipe_cloexec().unwrap();
+        let n = w.as_fd().as_raw_fd();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("echo kept >&{n}"))
+            .stderr(std::process::Stdio::null());
+        inherit_on_spawn(&mut cmd, w.as_fd()).unwrap();
+        drop(w);
+        // SAFETY: dup2 of this test's own read end onto the number just
+        // closed; the copy is owned below.
+        assert_eq!(unsafe { libc::dup2(r.as_raw_fd(), n) }, n);
+        // SAFETY: `n` was just made by dup2 and nothing else owns it.
+        let reused = unsafe { OwnedFd::from_raw_fd(n) };
+        inheritable(reused.as_fd());
+        let status = cmd.status().unwrap();
+        drop(cmd);
+        drop(reused);
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut std::fs::File::from(r), &mut got).unwrap();
+        assert!(status.success());
+        assert_eq!(got, "kept\n", "the child got what reused the number");
         let mut cmd = std::process::Command::new("/bin/sh");
         assert_eq!(
             inherit_on_spawn(&mut cmd, std::io::stderr().as_fd())
