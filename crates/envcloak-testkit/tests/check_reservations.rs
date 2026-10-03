@@ -1568,12 +1568,18 @@ fn a_failures_token_is_set_only_where_it_is_made() {
 
 /// A `fn token` that returns a static string is read for every value it
 /// can have, so another value's `.token()` hides none: one returning a
-/// field, or an index, is refused. One that lends its receiver's own
-/// field (`-> &str`, `&self.field`) lives no longer than the receiver and
-/// is no failure token; it passes.
+/// field, or an index, is refused. A method named `token` that returns
+/// anything else is refused too (Codex review of M2-RES1: one lending
+/// its receiver's field, `-> &str`, was passed over, so a `.token()`
+/// printed as `envcloak: {}:` printed a value nobody read): a `.token()`
+/// cannot be told from a failure's, so every method of that name is read.
+/// A free function named `token` is not what `.token()` calls, and
+/// passes.
 ///
-/// Mutation checked: `fn token` bodies read for their string literals
-/// only, as before: the copies pass and this fails.
+/// Mutations checked: `fn token` bodies read for their string literals
+/// only, as before: the first copies pass and this fails. The check of a
+/// `token` method's return type removed: the lending method, printed,
+/// passes and this fails.
 #[test]
 fn a_token_method_the_reader_cannot_read_fails() {
     for (body, expect) in [
@@ -1592,11 +1598,30 @@ fn a_token_method_the_reader_cannot_read_fails() {
         add_file(&t, CLIENT_STUB, body);
         assert_fails(&t, expect);
     }
+    for (body, ret) in [
+        (
+            "pub struct M { key: String }\nimpl M { pub fn token(&self) -> &str { &self.key } }\n\
+             pub fn d(m: &M) { eprintln!(\"envcloak: {}: x\", m.token()); }\n",
+            "`&str`",
+        ),
+        (
+            "pub struct M { key: String }\nimpl M { pub fn token(&self) -> String { self.key.clone() } }\n",
+            "`String`",
+        ),
+        ("pub trait ZzT { fn token(&self) -> &str; }\n", "`&str`"),
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(
+            &t,
+            &format!("a method `token` returns {ret}, not a static string"),
+        );
+    }
     let t = fixture();
     add_file(
         &t,
         CLIENT_STUB,
-        "pub struct M { key: String }\nimpl M { pub fn token(&self) -> &str { &self.key } }\n",
+        "pub fn token(b: &[u8]) -> String { String::from_utf8_lossy(b).into_owned() }\n",
     );
     assert_passes(&t.home());
 }
@@ -2095,7 +2120,10 @@ fn every_reader_takes_a_value_whole() {
         "macro_rules! zz_m { ($n:ident) => { pub fn $n(&self) -> &'static str { \"x\" } }; }\n\
          pub struct ZzS;\nimpl ZzS { zz_m!(token); }\n",
     );
-    assert_fails(&t, "a `fn` named by a macro's metavariable");
+    assert_fails(
+        &t,
+        "a `fn`, `const` or `static` named by a macro's metavariable",
+    );
 }
 
 /// What `fn parse` is, and what it may call, is read as narrowly: a
@@ -2225,4 +2253,386 @@ fn non_ascii_code_is_refused_without_rejecting_unicode_text() {
         add_file(&t, CLIENT_STUB, body);
         assert_passes(&t.home());
     }
+}
+
+const STATUS_RS: &str = "crates/envcloak-cli/src/cmd/status.rs";
+
+/// `Failure::new` is read however the path before `new` is written
+/// (verifier review of M2-RES1: `::envcloak_client::fail::Failure::new`,
+/// `::envcloak_client::Fail::new`, `<::envcloak_client::fail::Failure>::new`
+/// and `<Self>::new` in an `impl Failure` compiled and passed, reserved,
+/// unreserved and run-time tokens alike, since the constructor was matched
+/// by a pattern anchored at its start). Every `::new` is now read back to
+/// the type it is called on: a leading `::`, a qualified path, `return`
+/// before one, a turbofish, `Self` in an implementation of a trait for
+/// `Failure`. A type the reader cannot tell is refused: a macro's
+/// metavariable (`$t::new`, `<$t>::new`), a type a macro makes, and a
+/// trait's `new` for `Failure` (`<Failure as T>::new`); so are a run-time
+/// token and a function pointer however the path is written.
+///
+/// Mutation checked: the constructor matched forward from its start, as
+/// in round 3 (`(?<![\w:])` before the path): the leading-`::` and
+/// `<Self>` copies pass and this fails.
+#[test]
+fn a_constructor_is_read_however_its_path_is_written() {
+    for body in [
+        "\npub fn zz() -> envcloak_client::Failure { ::envcloak_client::fail::Failure::new(\"TOKEN\", \"x\") }\n",
+        "\npub fn zz() -> envcloak_client::Failure { ::envcloak_client::Fail::new(\"TOKEN\", \"x\") }\n",
+        "\npub fn zz() -> envcloak_client::Failure { <::envcloak_client::fail::Failure>::new(\"TOKEN\", \"x\") }\n",
+        "\npub fn zz() -> envcloak_client::Failure { return <envcloak_client::Fail>::new(\"TOKEN\", \"x\"); }\n",
+    ] {
+        assert_counted(body, STATUS_RS);
+    }
+    for body in [
+        "impl crate::fail::Failure { pub fn zz() -> Self { <Self>::new(\"TOKEN\", \"x\") } }\n",
+        "pub trait ZzMk { fn mk() -> Self; }\n\
+         impl ZzMk for ::std::string::String { fn mk() -> Self { Self::new() } }\n\
+         impl ZzMk for crate::fail::Failure { fn mk() -> Self { <Self>::new(\"TOKEN\", \"x\") } }\n",
+        "pub fn zz() -> std::collections::BTreeMap::<[u8; 2], u8> { let _ = crate::fail::Failure::new(\"TOKEN\", \"x\"); std::collections::BTreeMap::<[u8; 2], u8>::new() }\n",
+    ] {
+        assert_counted(body, CLIENT_STUB);
+    }
+    for (file, body, expect) in [
+        (
+            STATUS_RS,
+            "\npub fn zz(t: &'static str) -> envcloak_client::Failure { ::envcloak_client::fail::Failure::new(t, \"x\") }\n",
+            "a failure token the reader cannot read (`t`)",
+        ),
+        (
+            STATUS_RS,
+            "\npub fn zz() -> Option<envcloak_client::Failure> { Some(\"pty_unavailable\").map(|t| (t, \"x\")).map(|(t, m)| (::envcloak_client::Fail::new)(t, m)) }\n",
+            "`Fail::new` is used other than called",
+        ),
+        (
+            CLIENT_STUB,
+            "macro_rules! zz_mk { ($t:ty) => { <$t>::new(\"pty_unavailable\", \"x\") }; }\n\
+             pub fn zz() -> crate::fail::Failure { zz_mk!(crate::fail::Failure) }\n",
+            "`$t::new` is called on a macro's metavariable",
+        ),
+        (
+            CLIENT_STUB,
+            "macro_rules! zz_mk { ($t:ident) => { $t::new(\"pty_unavailable\", \"x\") }; }\n\
+             pub fn zz() -> crate::fail::Failure { use crate::fail::Failure; zz_mk!(Failure) }\n",
+            "`$t::new` is called on a macro's metavariable",
+        ),
+        (
+            CLIENT_STUB,
+            "macro_rules! zz_ty { () => { crate::fail::Failure }; }\n\
+             pub fn zz() -> crate::fail::Failure { <zz_ty!()>::new(\"pty_unavailable\", \"x\") }\n",
+            "`<zz_ty!()>::new` is called on a type the reader cannot read",
+        ),
+        (
+            CLIENT_STUB,
+            "pub trait ZzNew { fn new(a: u8) -> Self; }\n\
+             impl ZzNew for crate::fail::Failure { fn new(a: u8) -> Self { let _ = a; crate::fail::Failure::new(\"io\", \"x\") } }\n\
+             pub fn zz() -> crate::fail::Failure { <crate::fail::Failure as ZzNew>::new(1) }\n",
+            "`<Failure as ..>::new` calls a trait's `new` for `Failure`",
+        ),
+    ] {
+        let t = fixture();
+        if file == CLIENT_STUB {
+            add_file(&t, file, body);
+        } else {
+            append_to(&t, file, body);
+        }
+        assert_fails(&t, expect);
+    }
+}
+
+/// A function a trait declares or implements is called without its name
+/// (`.into()` and `?` call `From::from`, a generic `T::new` a trait's
+/// `new`), so its callers cannot be read: one that takes a `token` to
+/// hand on is refused, `Failure`'s own `new` in fail.rs only where it is
+/// inherent.
+///
+/// Mutation checked: the check of functions in traits removed: `from`
+/// becomes a helper whose `.into()` callers are never read (the copy
+/// fails only elsewhere, without this message), and a trait's `new` for
+/// `Failure` in fail.rs is taken for `Failure::new`, its generic callers
+/// unread: this fails.
+#[test]
+fn a_function_a_trait_calls_unnamed_takes_no_token() {
+    for (file, body, name) in [
+        (
+            CLIENT_STUB,
+            "impl From<&'static str> for crate::fail::Failure { fn from(token: &'static str) -> Self { Self::new(token, \"x\") } }\n\
+             pub fn zz() -> crate::fail::Failure { \"pty_unavailable\".into() }\n",
+            "from",
+        ),
+        (
+            FAIL,
+            "pub trait ZzCtor { fn new(token: ExitToken) -> Self; }\n\
+             impl ZzCtor for Failure { fn new(token: ExitToken) -> Self { Failure::new(token, \"x\") } }\n\
+             pub fn zz<T: ZzCtor>() -> T { T::new(\"pty_unavailable\") }\n",
+            "new",
+        ),
+        (
+            CLIENT_STUB,
+            "pub trait ZzMk { fn mk(token: &'static str) -> crate::fail::Failure { crate::fail::Failure::new(token, \"x\") } }\n",
+            "mk",
+        ),
+    ] {
+        let t = fixture();
+        if file == CLIENT_STUB {
+            add_file(&t, file, body);
+        } else {
+            append_to(&t, file, body);
+        }
+        assert_fails(
+            &t,
+            &format!(
+                "`fn {name}` takes a `token` to hand on inside a trait or a trait's implementation"
+            ),
+        );
+    }
+}
+
+/// A name or a type a macro gives could be `Failure` under a name the
+/// reader never sees: an import built from a metavariable (`use $p as
+/// Q;`, `use .. Failure as $n;`), a type alias named by one or of one, a
+/// type alias of a type a macro makes, and a constant named by one. They
+/// are refused; an import through `$crate` is read.
+///
+/// Mutations checked: the checks of imports and type aliases built by
+/// macros removed: the copies pass and this fails. `const` and `static`
+/// left out of the metavariable-named items: the constant copy passes and
+/// this fails.
+#[test]
+fn a_name_or_type_a_macro_gives_is_refused() {
+    for (body, expect) in [
+        (
+            "macro_rules! zz_imp { ($n:ident) => { use crate::fail::Failure as $n; }; }\nzz_imp!(Q);\n\
+             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+            "an import built from a macro's metavariable",
+        ),
+        (
+            "macro_rules! zz_imp { ($p:path) => { use $p as Q; }; }\nzz_imp!(crate::fail::Failure);\n\
+             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+            "an import built from a macro's metavariable",
+        ),
+        (
+            "macro_rules! zz_al { ($t:ty) => { type Q = $t; }; }\nzz_al!(crate::fail::Failure);\n\
+             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+            "the type alias `Q` is of a type a macro gives (`$t`)",
+        ),
+        (
+            "macro_rules! zz_ty { () => { crate::fail::Failure }; }\ntype Q = zz_ty!();\n\
+             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+            "the type alias `Q` is of a type a macro gives (`zz_ty!()`)",
+        ),
+        (
+            "macro_rules! zz_al { ($n:ident) => { type $n = crate::fail::Failure; }; }\nzz_al!(Q);\n\
+             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+            "a type alias named by a macro's metavariable",
+        ),
+        (
+            "pub const ZZ_T: &str = \"io\";\n\
+             mod zz_m { macro_rules! zz_c { ($n:ident) => { const $n: &str = \"pty_unavailable\"; }; }\n\
+             zz_c!(ZZ_T); pub fn zz() -> crate::fail::Failure { crate::fail::Failure::new(ZZ_T, \"x\") } }\n",
+            "a `fn`, `const` or `static` named by a macro's metavariable",
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(&t, expect);
+    }
+    assert_counted(
+        "macro_rules! zz_imp { () => { use $crate::fail::Failure as Qz; }; }\nzz_imp!();\n\
+         pub fn zz() -> Qz { Qz::new(\"TOKEN\", \"x\") }\n",
+        CLIENT_STUB,
+    );
+}
+
+/// The compiler reads no Rust for a crate that the reader does not
+/// (verifier review of M2-RES1: a `#[path]` module in another directory,
+/// and a source directory that is a symbolic link, compiled and passed,
+/// since the walk never reached their files). Refused: a `#[path]`
+/// attribute (also under `cfg_attr`), a symbolic link under a `src/`
+/// (to a directory or a file), a library or binary target whose file is
+/// outside `src/`, a path dependency outside `crates/`, and a workspace
+/// member outside `crates/` other than the canaries. Each is refused by
+/// both readers that walk the sources.
+///
+/// Mutations checked: `#[path]` not refused: the first copy passes the
+/// failure-token reader, and the statement-domain reader too, and this
+/// fails. Symbolic links to directories left to `os.walk`, which passes
+/// over them: the linked directory passes and this fails. The manifest
+/// checks not called: the target, dependency and member copies pass and
+/// this fails.
+#[test]
+fn the_compiler_reads_no_rust_the_reader_does_not() {
+    let hidden = "pub fn h() -> envcloak_client::Failure { envcloak_client::Failure::new(\"pty_unavailable\", \"x\") }\n";
+    for attr in [
+        "#[path = \"../../gen/hidden.rs\"]",
+        "#[cfg_attr(unix, path = \"../../gen/hidden.rs\")]",
+    ] {
+        let t = fixture();
+        append_to(&t, STATUS_RS, &format!("\n{attr}\nmod hidden;\n"));
+        add_file(&t, "crates/envcloak-cli/gen/hidden.rs", hidden);
+        let out = run(&t.home());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{attr}: {stderr}");
+        for reader in ["`exit_token`", "`statement_domain`"] {
+            assert!(
+                stderr.lines().any(|l| l.contains(reader)
+                    && l.contains(
+                        "a `#[path]` attribute compiles a file the reader does not walk to"
+                    )),
+                "{reader}, {attr}: {stderr}"
+            );
+        }
+    }
+    for (link, target, real) in [
+        (
+            "crates/envcloak-cli/src/linked",
+            "../realmod",
+            "crates/envcloak-cli/realmod/mod.rs",
+        ),
+        (
+            "crates/envcloak-cli/src/linked.rs",
+            "../realmod.rs",
+            "crates/envcloak-cli/realmod.rs",
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, real, hidden);
+        append_to(&t, "crates/envcloak-cli/src/main.rs", "mod linked;\n");
+        std::os::unix::fs::symlink(target, t.home().join(link)).unwrap();
+        let out = run(&t.home());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{link}: {stderr}");
+        for reader in ["`exit_token`", "`statement_domain`"] {
+            assert!(
+                stderr.lines().any(
+                    |l| l.contains(reader) && l.contains(&format!("{link} is a symbolic link"))
+                ),
+                "{reader}, {link}: {stderr}"
+            );
+        }
+    }
+    for (rel, text, expect) in [
+        (
+            "crates/envcloak-cli/Cargo.toml",
+            "\n[lib]\npath = \"gen/lib.rs\"\n",
+            "a target's file outside the crate's src/ (`gen/lib.rs`)",
+        ),
+        (
+            "crates/envcloak-cli/Cargo.toml",
+            "\n[[bin]]\nname = \"zz\"\npath = \"../envcloak-core/gen/zz.rs\"\n",
+            "a target's file outside the crate's src/ (`../envcloak-core/gen/zz.rs`)",
+        ),
+        (
+            "crates/envcloak-cli/Cargo.toml",
+            "\n[target.'cfg(unix)'.dependencies]\nzz = { path = \"../../vendor/zz\" }\n",
+            "a path outside crates/ (`../../vendor/zz`)",
+        ),
+    ] {
+        let t = fixture();
+        append_to(&t, rel, text);
+        assert_fails(&t, expect);
+    }
+    let t = fixture();
+    edit(
+        &t,
+        "Cargo.toml",
+        "members = [\"crates/*\",",
+        "members = [\"crates/*\", \"vendor/zz\",",
+    );
+    assert_fails(&t, "the workspace member `vendor/zz` is outside crates/");
+}
+
+/// The statement-domain reader reads every Rust file under `crates/`,
+/// tests included, and refuses what it would not see: a domain in a file
+/// `include_bytes!` brings in is read; `include!`, an `include_str!` of a
+/// file outside the repository, `env!` of a variable Cargo does not set,
+/// and a `#[path]` module are refused. Cargo's own variables
+/// (`CARGO_BIN_EXE_<name>`, `CARGO_TARGET_TMPDIR`), which tests use,
+/// pass.
+///
+/// Mutation checked: the text `include_bytes!` brings in left unread: the
+/// domain in it is not seen and this fails.
+#[test]
+fn the_statement_domain_reader_reads_what_tests_bring_in() {
+    let test_rs = "crates/envcloak-core/tests/zz_domain.rs";
+    let t = fixture();
+    add_file(
+        &t,
+        test_rs,
+        "pub const D: &[u8] = include_bytes!(\"zz.bin\");\n",
+    );
+    // Made here, so this file's own literals name no domain.
+    add_file(
+        &t,
+        "crates/envcloak-core/tests/zz.bin",
+        &format!("envcloak-zz{}/1\n", "statement"),
+    );
+    assert_fails(&t, "the code has `envcloak-zzstatement/1`");
+    for (body, expect) in [
+        (
+            "include!(\"zz.in\");\n",
+            "`include!` brings in text from another file",
+        ),
+        (
+            "pub const D: &str = include_str!(\"../../../../zz.txt\");\n",
+            "of a file outside the repository",
+        ),
+        (
+            "pub const D: &str = env!(\"ZZ_DOMAIN\");\n",
+            "`env!` of a variable other than",
+        ),
+        (
+            "#[path = \"../../zz.rs\"]\nmod zz;\n",
+            "a `#[path]` attribute",
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, test_rs, body);
+        assert_fails(&t, expect);
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        test_rs,
+        "pub const A: &str = env!(\"CARGO_BIN_EXE_envcloak\");\npub const B: &str = env!(\"CARGO_TARGET_TMPDIR\");\n",
+    );
+    assert_passes(&t.home());
+}
+
+/// A placeholder right after `envcloak:` prints its value where a token
+/// goes, with or without white space before it: padding (`{:>16}`) or the
+/// value itself can give the space (verifier review of M2-RES1:
+/// `envcloak:{:>16}: x` printed `envcloak:  pty_unavailable: x` and
+/// passed). It is read, its value counted without the white space around
+/// it; a value printed mid-line, not followed by `:`, counts by the token
+/// it starts with when the reader can read it. A token put together from
+/// pieces (`{}{}:`, `pty_{}:`) or a colon a value brings after `envcloak`
+/// (`envcloak{}`) is refused. A count printed mid-line passes.
+///
+/// Mutation checked: placeholders read only after `envcloak:` and white
+/// space, as before: the padded copy passes and this fails.
+#[test]
+fn a_placeholder_right_after_envcloak_is_read() {
+    for body in [
+        "pub fn d() { eprintln!(\"envcloak:{:>16}: x\", \"TOKEN\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak:{}: x\", \" TOKEN\"); }\n",
+        "pub fn d() { eprintln!(\"! envcloak: {}\", \"TOKEN: x\"); }\n",
+    ] {
+        assert_counted(body, CLIENT_STUB);
+    }
+    for body in [
+        "pub fn d() { eprintln!(\"envcloak: {}{}: x\", \"pty_\", \"unavailable\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak: pty_{}: x\", \"unavailable\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak{} x\", \": pty_unavailable:\"); }\n",
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(&t, "comes in pieces");
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn d(n: usize) { eprintln!(\"[envcloak: {} bytes cut]\", n); }\n",
+    );
+    assert_passes(&t.home());
 }

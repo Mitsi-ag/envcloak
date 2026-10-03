@@ -60,6 +60,20 @@ The CLI's failure tokens are read from every crate's `src/` (comments and
 it, never skipping one (reviews of M2-RES1: forms that were neither read
 nor refused let a reserved token through).
 
+What is read. Every `.rs` file under each crate's `src/`, and nothing
+the compiler builds a crate from is elsewhere (verifier review of
+M2-RES1: a `#[path]` module in another directory, and a source
+directory that was a symbolic link, compiled unread): a `#[path]`
+attribute (also under `cfg_attr`) is refused, and so are a symbolic link
+anywhere under a `src/`, a `.rs` entry that is not a regular file, a
+library or binary target whose file a manifest puts outside its crate's
+`src/`, a path dependency outside `crates/`, and a workspace member
+outside `crates/` other than the two canaries (which no crate may depend
+on, scripts/check-unsafe.sh). scripts/check-unsafe.sh refuses `#[path]`
+and `include!` in every Rust file too, and scripts/check-sources.sh
+settles one a macro builds from pieces with the compiler's own list of
+the files it read.
+
 The source readers support ASCII Rust code tokens. Non-ASCII code outside
 comments, string and character literals, and the omitted test modules is
 refused before any reader runs. Unicode text in those places is kept;
@@ -79,19 +93,33 @@ a `Failure` literal's field, the field read whole as a token
 `.token()` call; any other (a pattern that binds the field, `ref mut`,
 an assignment, `clone_from`, a macro, a local of that name) is refused.
 So no code can set a failure's token but by making one, and a token is
-read where a failure is made: the first argument of `Failure::new` (also
-`Self::new` in its `impl`s, `<Failure>::new`, either with generic
-arguments, and `<alias>::new` for every name `Failure` is imported or
-defined as, whatever its case: `use ... Failure as fail`, `pub use ...
-as X`, `type X = Failure;` or `type X<'a> = Failure;`, and aliases of
-those; a type alias that names `Failure` any other way is refused); the
-`token` field of a `Failure` struct literal, written out or shorthand;
-and the argument at each `token` position of a token helper, a free
-function with a `token: &'static str` parameter (or `ExitToken`, or an
-alias of either, made with `type` or `use ... as`) in any position, at
-every call by name. `Failure::new` or a token helper named any other way
-(a function pointer, `use ... as`) is refused, since its callers'
-tokens could not be read. A raw identifier is read as its name
+read where a failure is made: the first argument of every call of `new`
+on `Failure`. Each `::new` in the sources is read back to the type it is
+called on, whatever comes before (verifier review of M2-RES1: a pattern
+anchored at the path's start missed `::envcloak_client::fail::Failure::
+new` and `<Self>::new`): a path with or without a leading `::`, a
+qualified path (`<Failure>::new`, `return <F<'a>>::new`), a turbofish
+(`F::<'a>::new`), `Self` in an `impl` of `Failure` or of a trait for it,
+and every name `Failure` is imported or defined as, whatever its case
+(`use ... Failure as fail`, `pub use ... as X`, `type X = Failure;`,
+`type X<'a> = Failure;`, and aliases of those). Refused: `new` on a type
+the reader cannot tell, which could be `Failure` (a macro's
+metavariable, `$t::new` or `<$t>::new`; `<_>`; a type a macro makes), a
+trait's `new` for `Failure` (`<Failure as T>::new`), a type alias that
+names `Failure` any other way, and an import or a type alias a macro
+builds from a metavariable (`use $p as Q;`, `use .. as $n;`, `type $n =
+..;`, `type Q = $t;`) or of a type a macro makes (`type Q = m!();`). Also
+read: the `token` field of a `Failure` struct literal, written out or
+shorthand; and the argument at each `token` position of a token helper,
+a free or inherent function with a `token: &'static str` parameter (or
+`ExitToken`, or an alias of either, made with `type` or `use ... as`) in
+any position, at every call by name. `Failure::new` or a token helper
+named any other way (a function pointer, `use ... as`) is refused, since
+its callers' tokens could not be read, and so is a function with a
+`token` to hand on inside a trait or a trait's implementation, which
+code calls without naming it (`.into()` and `?` call `From::from`, a
+generic `T::new` a trait's `new`): only the inherent `Failure::new` in
+fail.rs is `Failure`'s constructor. A raw identifier is read as its name
 (`r#token` is `token`).
 
 What a token argument may be. A string literal, a `&str` constant or
@@ -113,21 +141,35 @@ in the sources or a manifest) are refused, and CI denies warnings. A
 `.token()` is read from the workspace's `fn token` bodies (no dependency
 in Cargo.lock has one that returns a string): every string in any of
 them counts, and one that returns a static string (`&'static str`,
-`ExitToken` or an alias, or a `&str` other than a borrow of its
-receiver's own field, which lives no longer than the receiver) must
-have only such values; a `fn` named by a macro's metavariable, which
-could be a `fn token` the reader does not see, is refused.
+`ExitToken` or an alias) must have only such values. Since a `.token()`
+cannot be told from a failure's, every method named `token` returns a
+static string so read: one that returns anything else (a borrow of its
+receiver's field, a `String`, another type) is refused, and is renamed
+(Codex review of M2-RES1: one lending a field was passed over while a
+`.token()` printing it was taken). A free function named `token` is not
+what `.token()` calls. A `fn`, `const` or `static` named by a macro's
+metavariable, which could be a `fn token` or a constant named as a token
+the reader does not see, is refused.
 
 What is printed. Every string literal and every `concat!` the reader
 can read is searched for `envcloak: <token>:` anywhere in it (a slice of
 it, or a later line, prints it too), with any white space after the
 colon, whatever crate it is in; the token
 counts (a line printed directly, as `eprintln!` does for `coverage`,
-`warning` and `usage`). A placeholder after `envcloak: ` and before `:`
-prints its argument where a token goes, which must be a token argument
-as above (counted among the format string's placeholders, so one after
-a newline takes the right argument). At the start of a line, `envcloak:
-{x}` is a usage line: it must be printed in the arm of `match parse(..)`
+`warning` and `usage`). A placeholder right after `envcloak:`, with
+white space or none (padding such as `{:>16}`, or the value itself, can
+give the space: verifier review of M2-RES1), and before `:` prints its
+argument where a token goes, which must be a token argument as above
+(counted among the format string's placeholders, so one after a newline
+takes the right argument), its values counted without the white space
+around them. Elsewhere in a line and not followed by `:`, its value is
+counted by the token it starts with when the reader can read it (a
+value can bring its own colon). A token in pieces is refused: a
+placeholder followed by more of a token or by another placeholder
+(`envcloak: {}{}:`), the start of a token followed by a placeholder
+(`envcloak: pty_{}:`), and a placeholder right after `envcloak`
+(`envcloak{}`), whose value could bring `: <token>:`. At the start of a
+line, `envcloak: {x}` is a usage line: it must be printed in the arm of `match parse(..)`
 that binds `x` (`Err(x)`, or `E::V(x)` for an error enum `E`), with a
 free `fn parse` in its file (a method of that name is not the one
 called), and every value that `fn parse` can give as its error is read
@@ -149,9 +191,17 @@ variable other than Cargo's own package variables (the build's
 environment), a build script that sets one (`rustc-env`), `stringify!`
 of text that holds `envcloak`, and `concat!` of anything but literals
 (also in the statement-domain reader); so is a source directory that
-cannot be listed. The boundary: a line put together
-at run time from pieces (format arguments, strings joined or built) is
-beyond what a reader of the source can see; review keeps such code out.
+cannot be listed. The statement-domain reader reads every Rust file
+under `crates/` (tests too) by the same walk, and the text of the files
+`include_str!` and `include_bytes!` bring in from the repository; it
+refuses `include!`, `#[path]`, a symbolic link to a directory or a Rust
+file, and `env!` of a variable Cargo does not set. The boundary: a line
+put together at run time from pieces is beyond what a reader of the
+source can see, among them a value printed mid-line that only the run
+knows (a count, a label), and the name `envcloak` or its colon given as
+a format argument (`"{}: {}:", program, token`, as the panic hook prints
+the program's name); review keeps failures out of such lines, and
+`Failure::report` prints each one whole.
 Within these forms the reader over-counts rather than under-counts: a
 string it takes for a token that is not printed makes a `reserved` row
 with that name fail, which is a name to avoid anyway, and a new one
@@ -170,6 +220,7 @@ stderr and exits 1.
 
 import os
 import re
+import stat
 import sys
 
 DOCS = ("docs/IPC.md", "docs/VAULT.md")
@@ -396,6 +447,8 @@ class Source:
         (text from the build's environment)."""
         self.concats = {}
         self.unreadable = []
+        self.env_vars = {}
+        self.includes = {}
         for m in COMPILE_TIME.finditer(self.skel):
             name, open_at = m.group(1), m.end() - 1
             close = self.close_of(open_at)
@@ -405,10 +458,14 @@ class Source:
                 if "envcloak" in self.code[open_at:close]:
                     self.unreadable.append((m.start(), "stringify", "`stringify!` of text that holds `envcloak`: write the line as a string literal"))
             elif name.startswith("include"):
-                self.unreadable.append((m.start(), "include", "`%s!` brings in text from another file, which the reader does not read" % name))
+                kind = "include" if name == "include" else "include_text"
+                parts = self.split_top(open_at + 1, close)
+                self.includes[m.start()] = self.only_string(parts[0][0], parts[0][1]) if len(parts) == 1 else None
+                self.unreadable.append((m.start(), kind, "`%s!` brings in text from another file, which the reader does not read" % name))
             else:
                 parts = self.split_top(open_at + 1, close)
                 var = self.only_string(parts[0][0], parts[0][1]) if parts else None
+                self.env_vars[m.start()] = var if len(parts) <= 2 else None
                 if var not in CARGO_ENV or len(parts) > 2:
                     self.unreadable.append((m.start(), "env", "`%s!` of a variable other than Cargo's own package variables (%s): its text comes from the build's environment, which the reader cannot see" % (name, ", ".join(sorted(CARGO_ENV)))))
         values = {}
@@ -435,6 +492,11 @@ class Source:
             if value(start) is None:
                 self.unreadable.append((start, "concat", "`concat!` of something other than literals: the reader cannot read the string it makes"))
         self.concat_values = values
+
+    def env_var(self, at):
+        """The variable the `env!` or `option_env!` at `at` names, when it
+        is one string literal; else None."""
+        return self.env_vars.get(at)
 
     def strip(self, a, b):
         while a < b and self.skel[a].isspace():
@@ -576,9 +638,42 @@ def walk_error(e):
     raise SourceError("%s could not be listed (%s)" % (e.filename, e.strerror))
 
 
+def rust_files(root, top, skip=(), any_link=False):
+    """The paths, relative to `root`, of every `.rs` file under `top`
+    (directories named in `skip` left out), refusing what the compiler can
+    read and a walk would not (verifier review of M2-RES1): a directory
+    that cannot be listed, a symbolic link to a directory (which the walk
+    does not enter, while `mod` reads through it) or to a `.rs` file, any
+    symbolic link at all with `any_link`, and a `.rs` entry that is not a
+    regular file."""
+    out = []
+    for dirpath, dirnames, names in os.walk(os.path.join(root, top), onerror=walk_error):
+        dirnames[:] = sorted(d for d in dirnames if d not in skip)
+        for d in dirnames:
+            if os.path.islink(os.path.join(dirpath, d)):
+                raise SourceError("%s is a symbolic link to a directory, whose files the reader would not read; keep the sources in the tree" % os.path.relpath(os.path.join(dirpath, d), root))
+        for file in sorted(names):
+            path = os.path.join(dirpath, file)
+            rel = os.path.relpath(path, root)
+            rust = file.endswith(".rs")
+            if os.path.islink(path) and (rust or any_link):
+                raise SourceError("%s is a symbolic link; keep the sources in the tree" % rel)
+            if not rust:
+                continue
+            try:
+                regular = stat.S_ISREG(os.lstat(path).st_mode)
+            except OSError as e:
+                raise SourceError("%s could not be read (%s)" % (rel, e.strerror))
+            if not regular:
+                raise SourceError("%s is not a regular file" % rel)
+            out.append(rel)
+    return out
+
+
 def rust_sources(root, crate=None):
     """Every Rust file under `crates/<crate>/src/` (every crate's, or the
-    one named), as `Source`s."""
+    one named), as `Source`s. A symbolic link anywhere under a `src/` is
+    refused (`rust_files`)."""
     out = []
     base = os.path.join(root, CRATES)
     try:
@@ -586,13 +681,8 @@ def rust_sources(root, crate=None):
     except OSError as e:
         raise SourceError("%s could not be listed (%s)" % (CRATES, e.strerror))
     for name in crates:
-        src = os.path.join(base, name, "src")
-        for dirpath, dirnames, names in os.walk(src, onerror=walk_error):
-            dirnames.sort()
-            for file in sorted(names):
-                if file.endswith(".rs"):
-                    rel = os.path.relpath(os.path.join(dirpath, file), root)
-                    out.append(Source(rel, read(root, rel)))
+        for rel in rust_files(root, os.path.join(CRATES, name, "src"), any_link=True):
+            out.append(Source(rel, read(root, rel)))
     if not out:
         raise SourceError("no Rust source under crates/%s/src" % (crate or "*"))
     return out
@@ -811,10 +901,14 @@ IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 # `const NAME: <type> =` and `static [mut] NAME: <type> =`: a value read by
 # its name.
 VALUE_DEF = re.compile(r"\b(const|static)\s+(mut\s+)?(%s)\s*:\s*([^=;{}]+?)\s*=" % IDENT)
-CONST_REF = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)$")
+CONST_REF = re.compile(r"^(?:::\s*)?(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*([A-Z][A-Z0-9_]*)$")
 # `envcloak: <token>:`, with any white space after the colon (a tab, two
 # spaces), which prints the token as plainly.
 PRINTED_TOKEN = re.compile(r"envcloak:\s+([a-z][a-z0-9_]*):")
+# A printed token, or the colon after `envcloak`, in pieces: a token's
+# start right before a placeholder (`envcloak: pty_{}:`), or a placeholder
+# right after the name (`envcloak{}`), whose value could hold `: <token>:`.
+PIECES = re.compile(r"envcloak:\s*[a-z0-9_]+\{(?!\{)|envcloak\{(?!\{)")
 # `X as Y` in a `use` item (in a group too): Y names X. Any identifier,
 # whatever its case (Codex review of M2-RES1: `use Failure as failure`).
 ALIAS_USE = re.compile(r"\b(%s)\s+as\s+(%s)\b" % (IDENT, IDENT))
@@ -822,10 +916,12 @@ ALIAS_USE = re.compile(r"\b(%s)\s+as\s+(%s)\b" % (IDENT, IDENT))
 TYPE_ALIAS = re.compile(r"\btype\s+(%s)\s*(?:<[^<>=;{}]*>)?\s*=([^;{}]*);" % IDENT)
 FN_NAME = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*")
 # Another value's `.token()`: read from the `fn token` bodies.
-TOKEN_CHAIN = re.compile(r"(?:%s\s*::\s*)*%s(?:\s*\.\s*%s)*\s*\.\s*token\s*\(\s*\)" % (IDENT, IDENT, IDENT))
+TOKEN_CHAIN = re.compile(r"(?:::\s*)?(?:%s\s*::\s*)*%s(?:\s*\.\s*%s)*\s*\.\s*token\s*\(\s*\)" % (IDENT, IDENT, IDENT))
 # A `Failure`'s own field, read where it is set (fail.rs only).
 FIELD_TOKEN = re.compile(r"%s\s*\.\s*token" % IDENT)
 MACRO = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*!\s*[\(\[\{]")
+# A macro's metavariable, `$crate` aside (a path to the macro's own crate).
+METAVARIABLE = re.compile(r"\$(?!crate\b)[A-Za-z_]")
 RECEIVER = re.compile(r"^(?:&\s*(?:'[A-Za-z_]+\s+)?)?(?:mut\s+)?self\b")
 TOKEN_PARAM = re.compile(r"^(?:mut\s+)?token\s*:\s*(.+)$", re.S)
 USE_STMT = re.compile(r"\buse\b[^;{}]*(?:\{[^;]*\})?[^;]*;")
@@ -1140,26 +1236,165 @@ def failure_names(sources):
     names = grow({"Failure"}, pairs)
     word = re.compile(r"\b(?:%s)\b" % "|".join(map(re.escape, sorted(names))))
     for src in sources:
+        # A name a macro gives (`use $p as Q;`, `type $n = ..;`, `type Q =
+        # $t;`) or a type a macro makes (`type Q = m!();`) could be
+        # `Failure` under a name the reader never sees (verifier review of
+        # M2-RES1, the class of the aliases it read only when written out).
+        for u in USE_STMT.finditer(src.skel):
+            if METAVARIABLE.search(u.group(0)):
+                raise SourceError("%s line %d: an import built from a macro's metavariable could name `Failure` under a name the reader does not see; write the import out" % (src.rel, src.skel.count("\n", 0, u.start()) + 1))
+        for m in re.finditer(r"\btype\s+\$", src.skel):
+            raise SourceError("%s line %d: a type alias named by a macro's metavariable could name `Failure` under a name the reader does not see; write the alias out" % (src.rel, src.skel.count("\n", 0, m.start()) + 1))
+        for alias, rhs, at in type_aliases(src):
+            if METAVARIABLE.search(rhs) or re.search(r"%s\s*!" % IDENT, rhs):
+                raise SourceError("%s line %d: the type alias `%s` is of a type a macro gives (`%s`), which could be `Failure`; write the type out" % (src.rel, src.skel.count("\n", 0, at) + 1, alias, " ".join(rhs.split())[:60]))
         for alias, rhs, at in type_aliases(src):
             if plain_type(rhs) is None and word.search(rhs):
                 raise SourceError("%s line %d: the type alias `%s` names `Failure` in a form the reader cannot read (`%s`); write `type %s = Failure;`" % (src.rel, src.skel.count("\n", 0, at) + 1, alias, " ".join(rhs.split())[:60], alias))
     return names
 
 
-def impl_spans(src, names):
-    """The bodies of `impl` blocks whose `Self` is one of `names`."""
-    spans = []
+def impl_blocks(src):
+    """Every `impl` block of `src`, as (body span, the last segment of the
+    type it is for, or None when that is no path, whether it implements a
+    trait). The type is read as `plain_type` reads one: with or without a
+    leading `::`, in parentheses, with generic arguments (verifier review
+    of M2-RES1: `impl Tr for ::envcloak_client::Failure` was not taken for
+    `Failure`'s)."""
+    out = []
     for m in re.finditer(r"\bimpl\b", src.skel):
-        open_at = BODY_OR_END.search(src.skel, m.end())
+        k = m.end()
+        while k < len(src.skel) and src.skel[k].isspace():
+            k += 1
+        if src.skel.startswith("<", k):
+            k = generic_end(src.skel, k)
+            if k is None:
+                continue
+        open_at = BODY_OR_END.search(src.skel, k)
         if not open_at or open_at.group(0) != "{":
             continue
-        head = " ".join(src.skel[m.end():open_at.start()].split())
-        head = re.sub(r"^<.*?>\s*", "", head) if head.startswith("<") else head
-        target = head.split(" for ", 1)[1] if " for " in " %s " % head else head
-        last = re.match(r"(?:%s::)*(%s)" % (IDENT, IDENT), target.strip())
-        if last and last.group(1) in names:
+        head = " ".join(src.skel[k:open_at.start()].split())
+        head = re.sub(r"\s+where\b.*$", "", head)
+        trait = find_top_text(head, " for ")
+        target = head[trait + 5:] if trait is not None else head
+        target = re.sub(r"^!\s*", "", target.strip())
+        out.append(((open_at.start(), src.block_end(open_at.start())), plain_type(target), trait is not None))
+    return out
+
+
+def find_top_text(text, what):
+    """The first offset of `what` in `text` outside brackets of any kind,
+    angle brackets included, or None."""
+    depth = 0
+    for k, ch in enumerate(text):
+        if depth == 0 and text.startswith(what, k):
+            return k
+        if ch in "<([{":
+            depth += 1
+        elif ch in ">)]}" and not (ch == ">" and k > 0 and text[k - 1] in "-="):
+            depth -= 1
+    return None
+
+
+def impl_spans(src, names, traits=True):
+    """The bodies of `impl` blocks whose `Self` is one of `names` (trait
+    implementations too, unless `traits` is false)."""
+    return [span for span, last, trait in impl_blocks(src) if last in names and (traits or not trait)]
+
+
+def trait_spans(src):
+    """The bodies of every `trait` block and every implementation of a
+    trait in `src`: where a function can be called without its name."""
+    spans = [span for span, _, trait in impl_blocks(src) if trait]
+    for m in re.finditer(r"\btrait\s+%s\b" % IDENT, src.skel):
+        open_at = BODY_OR_END.search(src.skel, m.end())
+        if open_at and open_at.group(0) == "{":
             spans.append((open_at.start(), src.block_end(open_at.start())))
     return spans
+
+
+# Keywords that can stand right before an expression, so before the `<` of
+# a qualified path (`return <F>::new(..)`), never a type with generic
+# arguments.
+KEYWORDS = {
+    "as", "async", "await", "box", "break", "const", "continue", "crate", "do", "dyn", "else",
+    "enum", "extern", "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match",
+    "mod", "move", "mut", "pub", "ref", "return", "static", "struct", "trait", "true", "try",
+    "type", "unsafe", "use", "where", "while", "yield",
+}
+
+
+def angle_open(skel, j):
+    """The offset of the `<` that opens the `>` at `j`, counted back past
+    nested ones (an `->` or `=>` is no bracket, and whatever is inside
+    other brackets, `[u8; 16]` or `{ N }`, is passed over whole), or None
+    if the brackets do not match before a `;` or the start."""
+    depth, inner = 0, 0
+    for k in range(j, -1, -1):
+        ch = skel[k]
+        if ch in ")]}":
+            inner += 1
+        elif ch in "([{":
+            inner -= 1
+            if inner < 0:
+                return None
+        elif inner:
+            continue
+        elif ch == ">" and not (k > 0 and skel[k - 1] in "-="):
+            depth += 1
+        elif ch == "<":
+            depth -= 1
+            if depth == 0:
+                return k
+        elif ch == ";":
+            return None
+    return None
+
+
+def segment_before(skel, at):
+    """What names the type whose item is named just after the `::` at
+    `at`, read back from it, whatever comes before (verifier review of
+    M2-RES1: a constructor written `::envcloak_client::fail::Failure::new`
+    or `<Self>::new` was matched by no forward pattern, so neither read
+    nor refused). Returns ("name", segment) for a path's last segment,
+    after a turbofish (`F::<'a>::new`) or a qualified path (`<F>::new`,
+    `<::a::F<'a>>::new`, `<(F)>::new`); ("as", segment) for `<T as
+    Trait>::new`, the segment T's; ("meta", text) for a macro's
+    metavariable (`$t::new`, `<$t>::new`), which could be any type; and
+    ("unknown", text) for anything else (`<_>::new`, a type a macro
+    makes)."""
+    j = at - 1
+    while j >= 0 and skel[j].isspace():
+        j -= 1
+    if j < 0:
+        return ("unknown", "")
+    if skel[j] == ">":
+        o = angle_open(skel, j)
+        if o is None:
+            return ("unknown", " ".join(skel[max(0, j - 40):at].split()))
+        k = o - 1
+        while k >= 0 and skel[k].isspace():
+            k -= 1
+        if k >= 1 and skel[k - 1:k + 1] == "::":
+            return segment_before(skel, k - 1)
+        w = re.search(r"(\$?)(%s)$" % IDENT, skel[:k + 1]) if k >= 0 else None
+        if w and w.group(2) not in KEYWORDS:
+            return ("meta", w.group(0)) if w.group(1) else ("name", w.group(2))
+        inner = " ".join(skel[o + 1:j].split())
+        if "$" in inner:
+            return ("meta", inner)
+        if "!" in inner:
+            return ("unknown", inner)
+        cut = find_top_text(inner, " as ")
+        if cut is not None:
+            last = plain_type(inner[:cut])
+            return ("as", last) if last else ("unknown", inner)
+        last = plain_type(inner)
+        return ("name", last) if last else ("unknown", inner)
+    w = re.search(r"(\$?)(%s)$" % IDENT, skel[:j + 1])
+    if w:
+        return ("meta", w.group(0)) if w.group(1) else ("name", w.group(2))
+    return ("unknown", " ".join(skel[max(0, j - 40):at].split()))
 
 
 # What may be written on `Failure`: attributes and derives that give it no
@@ -1299,9 +1534,9 @@ def check_fail_rs_tokens(src, allowed, exempt):
 # without one such a name never lands, and a name in capitals that the
 # reader reads as a constant's is one.
 LINT_OVERRIDE = re.compile(r"\b(?:allow|expect|warn)\s*\([^)]*\b(non_snake_case|nonstandard_style|warnings)\b")
-# A `fn` named by a macro's metavariable: it could be a `fn token` the
-# reader does not see.
-MACRO_FN = re.compile(r"\bfn\s+\$")
+# A `fn`, `const` or `static` named by a macro's metavariable: it could be
+# a `fn token`, or a constant named as a token, the reader does not see.
+MACRO_FN = re.compile(r"\b(?:fn|const|static)\s+(?:mut\s+)?\$")
 
 
 def read_consts(sources, statics):
@@ -1356,20 +1591,125 @@ def read_consts(sources, statics):
     return consts, bad
 
 
+# Workspace members outside `crates/`: the canaries, which no crate may
+# depend on (scripts/check-unsafe.sh) and which are empty in every build
+# but their own check's.
+CANARIES = ("security/lint-canary", "security/unsafe-canary")
+
+
+def toml_lines(root, rel):
+    """The manifest at `rel` as (line number, text) with each comment (a
+    `#` outside a string, to the end of its line) left out. Read as text,
+    not parsed: what the checks below need is a key or two, and a form
+    they cannot read is refused (a multi-line string is one)."""
+    out = []
+    for n, line in enumerate(read(root, rel).split("\n"), 1):
+        if '"""' in line or "'''" in line:
+            raise SourceError("%s line %d: a multi-line string, which the reader of manifests does not read" % (rel, n))
+        k, quote = 0, None
+        while k < len(line):
+            ch = line[k]
+            if quote:
+                if ch == "\\" and quote == '"':
+                    k += 1
+                elif ch == quote:
+                    quote = None
+            elif ch in "\"'":
+                quote = ch
+            elif ch == "#":
+                line = line[:k]
+                break
+            k += 1
+        out.append((n, line))
+    return out
+
+
+# A `path` key, bare or quoted, alone, dotted (`zz.path`) or in an inline
+# table (`{ path = .. }`), and its value.
+TOML_PATH = re.compile(r"""(?:^|(?<=[\s{,.]))(?:path|"path"|'path')\s*=\s*""")
+TOML_STRING = re.compile(r"""\s*(?:"([^"\\]*)"|'([^']*)')""")
+TOML_HEADER = re.compile(r"\s*\[\[?\s*([^\]]*?)\s*\]\]?\s*$")
+
+
+def inside(path, top):
+    """Whether `path` is `top` or under it, both made absolute and normal."""
+    path, top = os.path.normpath(os.path.abspath(path)), os.path.normpath(os.path.abspath(top))
+    return path == top or path.startswith(top + os.sep)
+
+
+def check_manifest_paths(root, rel, src_dir=None):
+    """Every `path` the manifest at `rel` gives, in any table, inline
+    table or dotted key: a dependency's (or, in the root manifest, any)
+    is under `crates/`, and so is a test, bench or example target's; any
+    other in a crate's manifest (its `[lib]`, a `[[bin]]`) is a file under
+    the crate's `src/` (`src_dir`). A `path` whose value is not one plain
+    string is refused."""
+    here = os.path.dirname(os.path.join(root, rel))
+    header = ""
+    for n, line in toml_lines(root, rel):
+        h = TOML_HEADER.match(line)
+        if h:
+            header = re.sub(r"[\s\"']", "", h.group(1))
+            continue
+        for m in TOML_PATH.finditer(line):
+            v = TOML_STRING.match(line, m.end())
+            if not v:
+                raise SourceError("%s line %d: a `path` whose value the reader cannot read" % (rel, n))
+            value = v.group(1) if v.group(1) is not None else v.group(2)
+            where = re.sub(r"[\s\"']", "", header + "." + line[:m.start()])
+            dependency = re.search(r"(?:^|[.={\[,])(?:dev-|build-)?dependencies(?:[.={]|$)", where) is not None
+            if src_dir is None or dependency or header in ("test", "bench", "example"):
+                if not inside(os.path.join(here, value), os.path.join(root, CRATES)):
+                    raise SourceError("%s line %d: a path outside crates/ (`%s`), whose sources the reader does not read" % (rel, n, value))
+            elif not inside(os.path.join(here, value), src_dir):
+                raise SourceError("%s line %d: a target's file outside the crate's src/ (`%s`), which the reader reads" % (rel, n, value))
+
+
+def check_workspace(root):
+    """The workspace builds from no Rust the reader does not read: its
+    members are `crates/*` and the canaries, and every path the root
+    manifest gives is under `crates/` (verifier review of M2-RES1: the
+    compiler read files the walk never reached)."""
+    text = "\n".join(line for _, line in toml_lines(root, "Cargo.toml"))
+    for m in re.finditer(r"(?:^|[\s.])members\s*=\s*\[", text):
+        close = text.find("]", m.end())
+        body = text[m.end():close if close >= 0 else len(text)]
+        rest = re.sub(r"""\s*(?:"[^"\\]*"|'[^']*')\s*,?""", "", body)
+        if close < 0 or rest.strip():
+            raise SourceError("Cargo.toml: the workspace's members are not a list of plain strings the reader can read")
+        for member in re.findall(r"""["']([^"']*)["']""", body):
+            if member != "crates/*" and member not in CANARIES:
+                raise SourceError("Cargo.toml: the workspace member `%s` is outside crates/, whose sources the reader reads" % member)
+    check_manifest_paths(root, "Cargo.toml")
+
+
+def check_targets(root, name, rel):
+    """The crate at `crates/<name>` builds its library and binaries from
+    files under its `src/`, and its path dependencies are crates under
+    `crates/`."""
+    check_manifest_paths(root, rel, os.path.join(root, CRATES, name, "src"))
+
+
 def check_compile_time(root, sources):
     """Refuses, in every crate's sources, what would give the reader text
     it cannot see: a compile-time macro whose text it cannot read (see
-    `Source.read_macros`), a lint override that lets a local be named as
-    a constant is, and a `fn` named by a macro; and, in every crate, a
-    build script that sets an environment variable for `env!`, and a
-    manifest that quiets the naming lints."""
+    `Source.read_macros`), a `#[path]` attribute, a lint override that
+    lets a local be named as a constant is, and a `fn`, `const` or
+    `static` named by a macro; in the workspace, a member or a path
+    dependency outside `crates/` (`check_workspace`); and, in every
+    crate, a target whose file is outside `src/` or a path dependency
+    outside `crates/` (`check_targets`), a build script that sets an
+    environment variable for `env!`, and a manifest that quiets the
+    naming lints."""
     for src in sources:
         for at, _, why in src.unreadable:
             raise SourceError("%s line %d: %s" % (src.rel, src.skel.count("\n", 0, at) + 1, why))
+        refuse_path_attributes(src)
         for m in LINT_OVERRIDE.finditer(src.skel):
             raise SourceError("%s line %d: `%s` is allowed, so a local could be named as a constant is and read as one; name it in lower case" % (src.rel, src.skel.count("\n", 0, m.start()) + 1, m.group(1)))
         for m in MACRO_FN.finditer(src.skel):
-            raise SourceError("%s line %d: a `fn` named by a macro's metavariable could be a `fn token` the reader does not see; write the function out" % (src.rel, src.skel.count("\n", 0, m.start()) + 1))
+            raise SourceError("%s line %d: a `fn`, `const` or `static` named by a macro's metavariable could be a `fn token`, or a constant named as a token, the reader does not see; write it out" % (src.rel, src.skel.count("\n", 0, m.start()) + 1))
+    check_workspace(root)
     root_manifest = re.sub(r"#[^\n]*", "", read(root, "Cargo.toml"))
     for m in re.finditer(r"\b(non_snake_case|nonstandard_style|warnings)\s*=", root_manifest):
         raise SourceError("Cargo.toml sets `%s`, so a local could be named as a constant is and read as one" % m.group(1))
@@ -1385,6 +1725,7 @@ def check_compile_time(root, sources):
         manifest = re.sub(r"#[^\n]*", "", read(root, rel))
         for m in re.finditer(r"\b(non_snake_case|nonstandard_style|warnings)\s*=", manifest):
             raise SourceError("%s sets `%s`, so a local could be named as a constant is and read as one" % (rel, m.group(1)))
+        check_targets(root, name, rel)
         m = re.search(r"^\s*build\s*=\s*\"([^\"]+)\"", manifest, re.M)
         script = m.group(1) if m else "build.rs"
         if os.path.exists(os.path.join(base, name, script)):
@@ -1411,7 +1752,10 @@ def code_exit_tokens(root):
     defs = {}
     exempt = []
     for src in sources:
-        failure_impls = impl_spans(src, names) if src.rel == FAIL_RS else []
+        # `Failure::new` is the inherent one in fail.rs: a trait's `new`
+        # implemented for `Failure` is called through a generic, unnamed.
+        inherent = impl_spans(src, names, traits=False) if src.rel == FAIL_RS else []
+        traits = trait_spans(src)
         for f in fns[src.rel]:
             if f.body is None:
                 continue
@@ -1421,9 +1765,14 @@ def code_exit_tokens(root):
                 continue
             if f.params and RECEIVER.match(f.params[0]):
                 continue
+            if any(x < f.start < y for x, y in traits):
+                # A trait's function is called without its name (`.into()`
+                # for a `From`, `?`, a generic `T::new`), so its callers,
+                # and the tokens they hand it, could not be read.
+                raise SourceError("%s line %d: `fn %s` takes a `token` to hand on inside a trait or a trait's implementation, which code can call without naming it (`.into()`, `?`, a generic), so the tokens handed to it would not be read; make it a free function or an inherent one" % (src.rel, src.skel.count("\n", 0, f.start) + 1, f.name))
             if f.name == "new":
                 # `Failure::new` itself, whose callers are read below.
-                if any(x < f.start < y for x, y in failure_impls) and positions == [0]:
+                if any(x < f.start < y for x, y in inherent) and positions == [0]:
                     exempt.append((src, f))
                 continue
             helpers.setdefault(f.name, set()).update(positions)
@@ -1431,8 +1780,17 @@ def code_exit_tokens(root):
             exempt.append((src, f))
     found = {}
 
-    def take(values, src):
+    def take(values, src, printed=False):
+        """Each value that is a token counts. A value printed where a
+        token goes counts with the white space around it left out (a value
+        can bring its own), and so does the token it starts with,
+        `<token>:` (a value can bring its own colon)."""
         for v in values:
+            if printed:
+                v = v.strip()
+                lead = re.match(r"([a-z][a-z0-9_]*):", v)
+                if lead:
+                    found.setdefault(lead.group(1), src.rel)
             if TOKEN.match(v):
                 found.setdefault(v, src.rel)
 
@@ -1450,12 +1808,16 @@ def code_exit_tokens(root):
     field_names = {}
     field_reads = {}
 
-    def read(src, a, b, field=False):
+    def read(src, a, b, field=False, printed=False, quiet=False):
+        """Reads the token argument at [a, b) and takes its values; one
+        the reader cannot read is refused, or with `quiet` passed over."""
         f = body_of(src, a)
         r = Reading(consts, forward=f is not None, field=field and src.rel == FAIL_RS, bad=bad)
         try:
-            take(values_of(src, a, b, r), src)
+            take(values_of(src, a, b, r), src, printed)
         except Unreadable as e:
+            if quiet:
+                return
             raise SourceError("%s: %s" % (where(src, a), e))
         for at in r.forwards:
             forwarded.setdefault(src.rel, set()).add(at)
@@ -1464,24 +1826,34 @@ def code_exit_tokens(root):
 
     ctx = Context(sources, fns, consts, bad, read, take)
     alias = "|".join(map(re.escape, sorted(names)))
-    # `Failure::new`, `<Failure>::new`, and either with generic arguments
-    # (`F::<'static>::new`, `<F<'static>>::new`) for a generic alias.
-    ctor = re.compile(r"(?<![\w:])(?:<\s*)?(?:%s\s*::\s*)*(?:%s)(?:\s*(?:::\s*)?<[^<>()]*>)?(?:\s*>)?\s*::\s*new\b" % (IDENT, alias))
     helper_word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(helpers)))) if helpers else None
     literal_of = re.compile(r"(?<![\w:])(?:%s\s*::\s*)*(%s|Self)(?:\s*::\s*<[^<>()]*>)?\s*\{" % (IDENT, alias))
     for src in sources:
         failure_impls = impl_spans(src, names)
-        # `Failure::new(..)` (and its aliases): the first argument. Named
-        # any other way (a function pointer, a turbofish), it is refused.
-        ctors = list(ctor.finditer(src.skel))
-        ctors += [m for m in re.finditer(r"(?<![\w:])Self\s*::\s*new\b", src.skel)
-                  if any(x < m.start() < y for x, y in failure_impls)]
-        for m in ctors:
+        # `Failure::new(..)`: the first argument. Every `::new` is read
+        # back to the type it is called on, however the path before it is
+        # written (a leading `::`, a qualified path, a turbofish, `Self` in
+        # an `impl` of `Failure`), so no spelling of the constructor goes
+        # unread; one on a type the reader cannot tell (a macro's
+        # metavariable, `<_>`, a type a macro makes) is refused, and so is
+        # `Failure::new` named other than called (a function pointer).
+        for m in re.finditer(r"::\s*new\b", src.skel):
+            kind, seg = segment_before(src.skel, m.start())
+            in_impl = any(x < m.start() < y for x, y in failure_impls)
+            failure = seg in names or (seg == "Self" and in_impl)
+            if kind == "meta":
+                raise SourceError("%s: `%s::new` is called on a macro's metavariable, which could be `Failure`, whose token would then not be read; write the type out" % (where(src, m.start()), seg))
+            if kind == "unknown":
+                raise SourceError("%s: `<%s>::new` is called on a type the reader cannot read, which could be `Failure`; write the type's path" % (where(src, m.start()), seg))
+            if not failure:
+                continue
+            if kind == "as":
+                raise SourceError("%s: `<%s as ..>::new` calls a trait's `new` for `Failure`, whose tokens the reader does not read; call `Failure::new`" % (where(src, m.start()), seg))
             k = m.end()
             rest = src.skel[k:k + 200]
             call = re.match(r"\s*(?:::\s*<[^()]*>\s*)?\(", rest)
             if not call:
-                raise SourceError("%s: `%s` is used other than called, so its tokens could not be read" % (where(src, m.start()), " ".join(m.group(0).split())))
+                raise SourceError("%s: `%s::new` is used other than called, so its tokens could not be read" % (where(src, m.start()), seg))
             open_at = k + call.end() - 1
             args = src.split_top(open_at + 1, src.close_of(open_at))
             if args:
@@ -1560,22 +1932,22 @@ def code_exit_tokens(root):
         # `fn token`: every string in it; and one returning a static
         # string, every value it can have.
         for f in fns[src.rel]:
-            if f.name != "token" or f.body is None:
+            if f.name != "token":
+                continue
+            ret = re.sub(r"^->\s*", "", f.ret)
+            ret = re.sub(r"\s*where\b.*$", "", ret).strip()
+            # A method: `.token()` calls it, and a `.token()` is taken as a
+            # token argument on the strength of these bodies, so each one
+            # returns a static string they read (Codex review of M2-RES1: a
+            # `token` method lending its receiver's field was passed over,
+            # and a `.token()` printing it was taken unread).
+            if f.params and RECEIVER.match(f.params[0]) and not is_static_str(ret, statics):
+                raise SourceError("%s line %d: a method `token` returns `%s`, not a static string the reader reads: every `.token()` made into a failure or printed as one is read from the `fn token` bodies, so a method of that name returns `&'static str` or `ExitToken`; rename this one" % (src.rel, src.skel.count("\n", 0, f.start) + 1, ret[:40] or "()"))
+            if f.body is None:
                 continue
             take(src.literals(*f.body), src)
-            ret = re.sub(r"^->\s*", "", f.ret)
-            ret = re.sub(r"\s*where\b.*$", "", ret)
             if is_static_str(ret, statics):
-                pass
-            elif re.fullmatch(r"&\s*str", ret):
-                # A borrow of the receiver's own field lives no longer than
-                # the receiver: never a `&'static str` failure token.
-                body = " ".join(src.skel[f.body[0] + 1:f.body[1] - 1].split())
-                if re.fullmatch(r"&\s*(?:\*\s*)?self\s*\.\s*%s|self\s*\.\s*%s\s*\.\s*as_str\s*\(\s*\)" % (IDENT, IDENT), body):
-                    continue
-            else:
-                continue
-            read(src, f.body[0], f.body[1], field=True)
+                read(src, f.body[0], f.body[1], field=True)
         # A line printed as `envcloak: <token>:`, from a string literal or a
         # `concat!`: anywhere in it (a slice of it, or a later line, prints
         # it too), the token; from a placeholder where the token goes, the
@@ -1584,8 +1956,13 @@ def code_exit_tokens(root):
         for start, lit in src.texts(0, len(src.skel)):
             for m in PRINTED_TOKEN.finditer(lit):
                 take([m.group(1)], src)
+            for m in PIECES.finditer(lit):
+                raise SourceError("%s line %d: a line printed as `envcloak: <token>:` whose token, or the colon after `envcloak`, comes in pieces (`%s`): print a whole token in one place" % (src.rel, src.skel.count("\n", 0, start) + 1, m.group(0)))
             starts = [0] + [i + 1 for i, ch in enumerate(lit) if ch in "\n\r"]
-            for m in re.finditer(r"envcloak:\s+\{(?!\{)", lit):
+            # A placeholder after `envcloak:`, with white space or none:
+            # padding (`{:>16}`) or the value itself can give the space
+            # (verifier review of M2-RES1).
+            for m in re.finditer(r"envcloak:\s*\{(?!\{)", lit):
                 printed_placeholder(src, start, lit, m.start(), m.start() in starts, ctx)
     # A helper's `token` is only ever handed on as a failure token: any
     # other mention (a `let` or a pattern that rebinds it, a use in an
@@ -1662,19 +2039,23 @@ def implicit_args(text):
 
 
 def printed_placeholder(src, start, lit, at, line_start, ctx):
-    """A placeholder after `envcloak: ` at offset `at` of the string (a
-    literal or a `concat!`) that starts at `start`. Followed by `:`, it
-    is printed where a token goes, and its argument must be one the reader
-    reads. At the start of a line and not followed by `:`, it is a usage
-    line, `envcloak: <message>` (see `usage_line`). Elsewhere in a line,
-    it prints no token."""
+    """A placeholder after `envcloak:`, with white space or none, at offset
+    `at` of the string (a literal or a `concat!`) that starts at `start`.
+    Followed by `:`, it is printed where a token goes, and its argument
+    must be one the reader reads. Followed by more of a token or another
+    placeholder, the token would come in pieces, and it is refused. At the
+    start of a line and not followed by `:`, it is a usage line,
+    `envcloak: <message>` (see `usage_line`). Elsewhere in a line, its
+    value is counted by the token it starts with when the reader can read
+    it."""
     where = "%s line %d" % (src.rel, src.skel.count("\n", 0, start) + 1)
-    pm = re.compile(r"envcloak:\s+\{([^{}:]*)(:[^{}]*)?\}(:?)").match(lit, at)
+    pm = re.compile(r"envcloak:\s*\{([^{}:]*)(:[^{}]*)?\}(.?)", re.S).match(lit, at)
     if not pm:
         raise SourceError("%s: a line printed as `envcloak: {...}` the reader cannot read" % where)
-    name, spec, token_position = pm.group(1).strip(), pm.group(2) or "", pm.group(3) == ":"
-    if not token_position and not line_start:
-        return
+    name, spec, after = pm.group(1).strip(), pm.group(2) or "", pm.group(3)
+    token_position = after == ":"
+    if re.fullmatch(r"[A-Za-z0-9_]", after) or (after == "{" and not lit.startswith("{", pm.end())):
+        raise SourceError("%s: a line printed as `envcloak: {%s%s}%s...`, whose token comes in pieces: print a whole token in one place" % (where, name, spec, after))
     if "*" in spec or "$" in spec:
         raise SourceError("%s: a line printed as `envcloak: {%s%s}` the reader cannot read" % (where, name, spec))
     # The format macro's arguments after the string.
@@ -1709,10 +2090,19 @@ def printed_placeholder(src, start, lit, at, line_start, ctx):
         span = None
     if token_position:
         if span is not None:
-            ctx.read(src, span[0], span[1], field=True)
+            ctx.read(src, span[0], span[1], field=True, printed=True)
             return
         raise SourceError("%s: a line printed as `envcloak: {%s}:` takes its token from a variable the reader cannot read; print a failure's token (`.token()`)" % (where, name))
-    usage_line(src, start, where, name, span, ctx)
+    if line_start:
+        usage_line(src, start, where, name, span, ctx)
+        return
+    # Elsewhere in a line and not followed by `:`, the value is printed
+    # where a token goes and could bring its own colon: when the reader can
+    # read it, the token it starts with counts. A value only known at run
+    # time (a count, a label) is beyond it, as any line put together at run
+    # time is.
+    if span is not None:
+        ctx.read(src, span[0], span[1], field=True, printed=True, quiet=True)
 
 
 def usage_line(src, start, where, name, span, ctx):
@@ -1970,24 +2360,87 @@ def code_mcp_tools(root):
     return found
 
 
+STATEMENT_DOMAIN = re.compile(r"(envcloak-[a-z0-9-]*statement/[0-9]+)")
+# `#[path = "..."]` and `#[cfg_attr(<cfg>, path = "...")]`: a module read
+# from a file the walk may never reach (verifier review of M2-RES1).
+# scripts/check-unsafe.sh refuses these too, and scripts/check-sources.sh
+# settles one a macro builds from pieces with the compiler's own list.
+PATH_ATTRIBUTE = re.compile(r"#\s*!?\s*\[\s*(?:path\s*=|cfg_attr\s*\((?:[^\[\]]|\[[^\]]*\])*?\bpath\s*=)")
+
+
+def cargo_path_or_name(var):
+    """Whether `var` is one Cargo sets for a test or a crate, holding a
+    path, a name or a version and never a domain: Cargo's package
+    variables, `CARGO`, `CARGO_MANIFEST_PATH`, `CARGO_TARGET_TMPDIR` and
+    `CARGO_BIN_EXE_<name>`."""
+    return var is not None and (
+        var in CARGO_ENV
+        or var in ("CARGO", "CARGO_MANIFEST_PATH", "CARGO_TARGET_TMPDIR")
+        or re.fullmatch(r"CARGO_BIN_EXE_[A-Za-z0-9_-]+", var) is not None
+    )
+
+
+def refuse_path_attributes(src):
+    """A `#[path]` attribute, which compiles a file the reader walks past,
+    is refused."""
+    for m in PATH_ATTRIBUTE.finditer(src.skel):
+        raise SourceError("%s line %d: a `#[path]` attribute compiles a file the reader does not walk to; keep each module in the file its name gives" % (src.rel, src.skel.count("\n", 0, m.start()) + 1))
+
+
+def included_text(root, src, at, where):
+    """The text of the file that the `include_str!` or `include_bytes!` at
+    `at` of `src` brings in, so it is read too: its path must be one string
+    literal naming a regular file in the repository, reached through no
+    symbolic link; anything else is refused."""
+    lit = src.includes.get(at)
+    if lit is None:
+        raise SourceError("%s: `include_str!` or `include_bytes!` of something other than one string literal: the reader cannot tell which file it brings in" % where)
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.join(root, src.rel)), lit))
+    rel = os.path.relpath(path, root)
+    if os.path.isabs(lit) or rel.startswith(".."):
+        raise SourceError("%s: `include_str!` or `include_bytes!` of a file outside the repository (`%s`)" % (where, lit))
+    if os.path.realpath(path) != os.path.join(os.path.realpath(root), rel):
+        raise SourceError("%s: `include_str!` or `include_bytes!` of a file reached through a symbolic link (`%s`)" % (where, lit))
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise SourceError("%s: `include_str!` or `include_bytes!` of something other than a regular file (`%s`)" % (where, lit))
+        with open(path, "rb") as f:
+            return [f.read().decode("latin-1")]
+    except OSError as e:
+        raise SourceError("%s: the file `include_str!` or `include_bytes!` brings in could not be read (%s)" % (where, e.strerror))
+
+
 def code_statement_domains(root):
-    """Statement domains written as string literals, or `concat!` of
-    literals, in the workspace's Rust files (`b"envcloak-statement/1\n"`);
-    a domain named in a comment is not one the code uses, and a `concat!`
-    of anything but literals is refused."""
+    """Statement domains written in string literals, or `concat!` of
+    literals, anywhere in them, in the workspace's Rust files
+    (`b"envcloak-statement/1\n"`), and in the files `include_str!` and
+    `include_bytes!` bring in; a domain named in a comment is not one the
+    code uses. Refused, never skipped: a `concat!` of anything but
+    literals, `include!`, `stringify!` of `envcloak`, `env!` of a variable
+    other than Cargo's own, a `#[path]` module, and a symbolic link to a
+    directory or a Rust file (verifier review of M2-RES1: a walk passed
+    over what the compiler read)."""
     found = {}
-    for dirpath, dirnames, names in os.walk(os.path.join(root, CRATES), onerror=walk_error):
-        dirnames[:] = sorted(d for d in dirnames if d != "target")
-        for name in sorted(names):
-            if not name.endswith(".rs"):
+    for rel in rust_files(root, CRATES, skip=("target",)):
+        src = Source(rel, read(root, rel))
+        refuse_path_attributes(src)
+        for at, kind, why in src.unreadable:
+            line = "%s line %d" % (rel, src.skel.count("\n", 0, at) + 1)
+            if kind == "include_text":
+                # Text brought in from another file: read too, as text.
+                for text in included_text(root, src, at, line):
+                    for m in STATEMENT_DOMAIN.finditer(text):
+                        found.setdefault(m.group(1), rel)
                 continue
-            rel = os.path.relpath(os.path.join(dirpath, name), root)
-            src = Source(rel, read(root, rel))
-            for at, kind, why in src.unreadable:
-                if kind == "concat":
-                    raise SourceError("%s line %d: %s" % (rel, src.skel.count("\n", 0, at) + 1, why))
-            for lit in src.literals(0, len(src.skel)):
-                m = re.match(r"(envcloak-[a-z0-9-]*statement/[0-9]+)", lit)
+            if kind == "env" and cargo_path_or_name(src.env_var(at)):
+                continue  # Cargo's own: a path, a name or a version
+            raise SourceError("%s: %s" % (line, why))
+        # In a crate's sources, a domain anywhere in a literal; elsewhere
+        # (tests, whose literals hold fixture code for this script's own
+        # tests) at a literal's start, where a domain is written.
+        product = rel.split("/")[2:3] == ["src"]
+        for lit in src.literals(0, len(src.skel)):
+            for m in (STATEMENT_DOMAIN.finditer(lit) if product else [STATEMENT_DOMAIN.match(lit)]):
                 if m:
                     found.setdefault(m.group(1), rel)
     if not found:
