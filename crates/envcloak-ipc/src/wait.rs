@@ -39,9 +39,16 @@
 //! request's lifetime): the last poll is made at the deadline itself, and a
 //! request still pending then is [`Finish::TimedOut`]; so is one told
 //! `unknown` at or after the deadline, which is not asked again. Only
-//! `approved` is still asked again then, once: the approval came within the
-//! wait. A call the daemon did not take at the deadline ends the wait with
-//! that failure. Nothing here reads a terminal or any input: approval
+//! `approved` read by the deadline is still asked again then, once: the
+//! approval came within the wait. An `approved` read after the deadline (a
+//! poll the daemon answered late, during the grace) may have come after
+//! it, so the wait has timed out; and once a request was named, a covered
+//! answer read after the deadline is taken only for the request asked
+//! again on such an approval: any other may be covered by an approval
+//! given after the deadline, and the wait has timed out then too (review
+//! of M2-03: the grace is for finishing a run approved within the wait,
+//! never for an approval given during it). A call the daemon did not take
+//! at the deadline ends the wait with that failure. Nothing here reads a terminal or any input: approval
 //! input is never read from the requesting process's terminal.
 //!
 //! **Bounded.** No call of a wait is answered later than its limit, the
@@ -225,6 +232,9 @@ pub struct Wait {
     crowded: bool,
     /// The daemon has answered a call of this wait.
     answered: bool,
+    /// `approved` was read by the deadline: the request asked again on it
+    /// may be answered covered after the deadline.
+    approved_in_time: bool,
 }
 
 /// Whether `e` is the daemon's `kind`.
@@ -280,6 +290,7 @@ impl Wait {
             announced: None,
             crowded: false,
             answered: false,
+            approved_in_time: false,
         }
     }
 
@@ -340,6 +351,17 @@ impl Wait {
                 }
                 (self.pause(now), notice)
             }
+            // Covered after the deadline, for a request named before it,
+            // and not on an approval read in time: the approval may have
+            // come after the deadline (see the module documentation).
+            Event::Answered(Ok(DecisionView::Covered { .. }))
+                if now > self.deadline && !self.approved_in_time && self.request.is_some() =>
+            {
+                let id = self
+                    .request
+                    .map_or(Finish::Failed(ClientError::Protocol), Finish::TimedOut);
+                (Action::Finish(id), None)
+            }
             Event::Answered(Ok(_)) => (Action::Finish(Finish::Decided), None),
             Event::Answered(Err(e)) if is_kind(&e, ErrorKind::TooManyPending) => {
                 let ClientError::Rpc(r) = e else {
@@ -394,9 +416,14 @@ impl Wait {
                         (self.pause(now), None)
                     }
                     // Approved within the wait: asked again, even at the
-                    // deadline, once.
+                    // deadline, once. Read after the deadline, the approval
+                    // may have come after it: the wait has timed out.
                     Ok(PendingState::Approved) => {
+                        if now > self.deadline {
+                            return (Action::Finish(Finish::TimedOut(id)), None);
+                        }
                         self.ask_again = true;
+                        self.approved_in_time = true;
                         (Action::Request, None)
                     }
                     // Ended in a way this tree is not told: asked again
