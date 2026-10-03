@@ -743,8 +743,9 @@ pub fn vault_reason(k: VaultErrorKind) -> &'static str {
 
 /// Why a backup could not be written, for a log line: [`vault_reason`],
 /// or `substituted` for a file the vault wrote that its name did not hold
-/// once linked (something replaced it inside the vault's directory), which
-/// is not damage.
+/// once linked, or that did not hold exactly the bytes written (something
+/// replaced, cut or wrote into it inside the vault's directory), which is
+/// not damage.
 pub fn backup_reason(k: VaultErrorKind) -> &'static str {
     match k {
         VaultErrorKind::Substituted => "substituted",
