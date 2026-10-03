@@ -73,14 +73,14 @@ use std::time::Duration;
 
 use envcloak_core::audit::AuditKind;
 use envcloak_core::crypto::{CryptoErrorKind, ItemClass};
-use envcloak_core::file_backup::{BackupFile, FileBackupId, purge_file_backups};
+use envcloak_core::file_backup::{BackupFile, FileBackupId, FileLeft, purge_file_backups};
 use envcloak_core::vault::{
     Classification, FieldName, ItemDetails, ItemMeta, MAX_FIELD, NewItem, Slug, ValueKey, Vault,
     VaultError, VaultErrorKind,
 };
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_ipc::proto::{
-    ErrorKind, FilesBackupParams, FilesRestoreParams, ImportCommitParams, ImportParams,
+    self, ErrorKind, FilesBackupParams, FilesRestoreParams, ImportCommitParams, ImportParams,
     RecoveryConfirmParams, RestoredFile, RestoredFiles, VerifyParams,
 };
 use envcloak_ipc::view::{
@@ -906,8 +906,45 @@ fn files_backup_error(k: VaultErrorKind) -> RpcError {
     }
 }
 
+/// What the deletion leaves of a file, as a backup records it: `None`
+/// for a SHA-256 that is not 64 lower-case hex characters.
+fn file_left(l: &proto::FileLeft) -> Option<FileLeft> {
+    match l {
+        proto::FileLeft::Removed => Some(FileLeft::Removed),
+        proto::FileLeft::Rewritten(hex) => {
+            let b = hex.as_bytes();
+            if b.len() != 64 || !b.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+                return None;
+            }
+            let mut sha = [0u8; 32];
+            for (o, pair) in sha.iter_mut().zip(b.chunks(2)) {
+                let digit = |c: u8| {
+                    if c.is_ascii_digit() {
+                        c - b'0'
+                    } else {
+                        c - b'a' + 10
+                    }
+                };
+                *o = digit(pair[0]) << 4 | digit(pair[1]);
+            }
+            Some(FileLeft::Rewritten(sha))
+        }
+    }
+}
+
+/// What the deletion left of a file, as `files.restore` answers it.
+fn left_view(l: FileLeft) -> proto::FileLeft {
+    match l {
+        FileLeft::Removed => proto::FileLeft::Removed,
+        FileLeft::Rewritten(sha) => {
+            proto::FileLeft::Rewritten(sha.iter().map(|b| format!("{b:02x}")).collect())
+        }
+    }
+}
+
 /// `files.backup`: the files of an env-file deletion, each an absolute
-/// path to an env file ([`env_file_path`]).
+/// path to an env file ([`env_file_path`]), with what the deletion leaves
+/// of it (F-78).
 pub fn files_backup(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -918,10 +955,12 @@ pub fn files_backup(
         if !Path::new(&f.path).is_absolute() || f.path.contains('\0') || !env_file_path(&f.path) {
             return Err(invalid());
         }
+        let left = file_left(&f.left).ok_or_else(invalid)?;
         files.push(BackupFile {
             path: f.path,
             mode: f.mode & 0o7777,
             content: f.content.into_inner(),
+            left: Some(left),
         });
     }
     refuse_if_traced()?;
@@ -1075,6 +1114,7 @@ pub fn files_restore(
                 path: f.path,
                 mode: f.mode,
                 content: WireSecret::new(f.content),
+                left: f.left.map(left_view),
             })
             .collect(),
     })

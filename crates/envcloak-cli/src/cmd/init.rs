@@ -42,9 +42,12 @@
 //!   session with no agent in it. The statement before it names the
 //!   project directory, and only env files directly in it are written: a
 //!   backup names its paths, and any client can store one. A file that
-//!   exists is replaced only when it is what the deletion left of it (the
-//!   original with some entries taken out, and nothing else changed); any
-//!   other is left alone.
+//!   exists is replaced only when it is exactly what the deletion left of
+//!   it: the backup records that (the SHA-256 of what a rewrite leaves, or
+//!   that the file was removed) when it is made, before any file changes
+//!   (F-78). Any other is left alone: one edited since, an entry added or
+//!   taken out included, one the deletion removed that is there again,
+//!   and every file of a backup that does not record it.
 //!
 //! Deletion removes the working copy only: a value that was committed to
 //! git, synced or backed up elsewhere is still there, and the report says
@@ -61,7 +64,7 @@ use envcloak_client::tty::{Terminal, read_secret_fd};
 use envcloak_core::SecretBytes;
 use envcloak_ipc::WireSecret;
 use envcloak_ipc::proto::{
-    BackupFileParams, FilesBackupParams, VerifyEntry, VerifyFile, VerifyParams,
+    BackupFileParams, FileLeft, FilesBackupParams, VerifyEntry, VerifyFile, VerifyParams,
 };
 use envcloak_ipc::view::{
     DeleteReport, EntryStatus, FileChange, InitReport, SkipReason, SkippedPath, UndoFile,
@@ -72,7 +75,7 @@ use envcloak_scan::{
     DeleteGate, DeleteStep, DotenvEntry, EntryKind, FileKind, FileStamp, MAX_DOTENV,
     ModifyErrorKind, Remains, ScanErrorKind, ScanRoot, create_atomically, delete_plaintext,
     dotenv_kind, open_root, parse_dotenv, pause_point, read_capped, read_plain, restore_file,
-    restore_over, trimmed_from, without_entries,
+    restore_over, without_entries,
 };
 
 use super::import::{ReadFile, edit_gitignore, import, project_name, report, scan};
@@ -387,7 +390,18 @@ impl DeleteGate for Gate<'_> {
 
     fn backup(&mut self, which: &[usize]) -> Result<String, Refusal> {
         let mut files = Vec::with_capacity(which.len());
-        for c in which.iter().filter_map(|&i| self.files.get(i)) {
+        for &i in which {
+            let Some(c) = self.files.get(i) else {
+                continue;
+            };
+            // What the deletion will leave of it, which the backup records
+            // so that an undo writes it back only over exactly that (F-78).
+            let left = match self.remains(i) {
+                Remains::Nothing => FileLeft::Removed,
+                Remains::Bytes(b) => FileLeft::Rewritten(hex(&b.sha256())),
+                // A file the deletion leaves as it is is never backed up.
+                Remains::Everything => return Err(changed_meanwhile()),
+            };
             let f = c.file;
             // Read again, and only if it is still the file checked.
             let (bytes, stamp) =
@@ -399,6 +413,7 @@ impl DeleteGate for Gate<'_> {
                 path: self.root.path().join(&f.rel).to_string_lossy().into_owned(),
                 mode: stamp.mode & 0o7777,
                 content: WireSecret::new(bytes),
+                left,
             });
         }
         let view = connect()
@@ -623,7 +638,8 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
     require_unlocked(&mut connect()?)?;
     let statement = format!(
         "Write back the env files of backup {id} into {}. They hold plaintext secrets; a file \
-         that exists there now is left alone, and nothing is written anywhere else.\n",
+         there now is replaced only when it is exactly what the deletion left of it, any other \
+         is left alone, and nothing is written anywhere else.\n",
         escape_for_display(&project.path().to_string_lossy())
     );
     let passphrase = match a.passphrase_fd {
@@ -649,7 +665,13 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
         files: Vec::new(),
     };
     for f in restored.files {
-        let state = write_back(&project, &f.path, f.mode, f.content.into_inner());
+        let state = write_back(
+            &project,
+            &f.path,
+            f.mode,
+            f.content.into_inner(),
+            f.left.as_ref(),
+        );
         report.files.push(UndoFile {
             path: f.path,
             state: state.to_owned(),
@@ -670,16 +692,39 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
     }
 }
 
+/// Lower-case hex of `b`.
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Whether `now` is exactly what the deletion left of a file, as its
+/// backup recorded it: a rewrite to bytes of that SHA-256. A file the
+/// deletion removed is never what it left.
+fn deletion_left(left: Option<&FileLeft>, now: &SecretBytes) -> bool {
+    match left {
+        Some(FileLeft::Rewritten(sha)) => *sha == hex(&now.sha256()),
+        Some(FileLeft::Removed) | None => false,
+    }
+}
+
 /// Writes one restored file where it was, only when that is an env file
 /// (`.env` or `.env.<profile>`, as a deletion takes out) directly in
 /// `project`, the directory `init --undo` runs for: a backup any client
 /// can store names any path, and the passphrase statement names only that
 /// directory. Another name is `not_env_file`, another directory
 /// `elsewhere`. A file there already is `unchanged` when it holds the same
-/// bytes, replaced (`restored`) when it is what the deletion left of it
-/// (the original with some entries taken out, nothing else changed), and
-/// `exists` otherwise.
-fn write_back(project: &ScanRoot, path: &str, mode: u32, content: SecretBytes) -> &'static str {
+/// bytes, replaced (`restored`) only when it is exactly what the deletion
+/// left of it, by the SHA-256 its backup recorded (`left`, F-78), and
+/// `exists` otherwise: edited since, an entry added or taken out included,
+/// one the deletion removed that is there again, and any file of a backup
+/// that does not record what the deletion left. A missing file is made.
+fn write_back(
+    project: &ScanRoot,
+    path: &str,
+    mode: u32,
+    content: SecretBytes,
+    left: Option<&FileLeft>,
+) -> &'static str {
     let p = Path::new(path);
     let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else {
         return "invalid_path";
@@ -699,7 +744,7 @@ fn write_back(project: &ScanRoot, path: &str, mode: u32, content: SecretBytes) -
     let rel = Path::new(name);
     match read_capped(&root, rel, content.len().max(MAX_DOTENV)) {
         Ok((now, _)) if now.ct_eq_secret(&content) => return "unchanged",
-        Ok((now, stamp)) if trimmed_from(&content, &now) => {
+        Ok((now, stamp)) if deletion_left(left, &now) => {
             return match restore_over(&root, rel, &content, &stamp) {
                 Ok(_) => "restored",
                 Err(e) => e.kind.token(),
@@ -761,16 +806,104 @@ mod tests {
             (at(&project.join("sub"), ".env"), "no_directory"),
             (".env".to_owned(), "invalid_path"),
         ] {
-            assert_eq!(write_back(&root, &path, 0o600, body()), want, "{path}");
+            assert_eq!(
+                write_back(&root, &path, 0o600, body(), None),
+                want,
+                "{path}"
+            );
         }
         for dir in [&project, &other] {
             assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
         }
         assert_eq!(
-            write_back(&root, &at(&project, ".env.local"), 0o600, body()),
+            write_back(&root, &at(&project, ".env.local"), 0o600, body(), None),
             "restored"
         );
         assert_eq!(std::fs::read(project.join(".env.local")).unwrap(), b"A=1\n");
+    }
+
+    /// F-78: a file there is replaced only when it is exactly what the
+    /// deletion left of it, by the SHA-256 its backup recorded. The cases
+    /// of the M1 audit's undo probe: the original there (`unchanged`), the
+    /// exact leftover (`restored`, to the original), an ordinary edit
+    /// after the deletion (a newline added) and a whole entry taken out
+    /// after it (the finding: both `exists`, kept as they are), and the
+    /// file missing (`restored`); then a value changed, a file the
+    /// deletion removed that is there again, and the exact leftover under
+    /// a backup that recorded nothing (all `exists`, never replaced).
+    #[test]
+    fn undo_replaces_only_exactly_what_the_deletion_left() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let original: &[u8] = b"TOKEN=aaaaaaaaaaaaaaaaaaaa\nMODE=bbb\nFLAG=ccc\n";
+        // The deletion took the first entry out.
+        let leftover: &[u8] = b"MODE=bbb\nFLAG=ccc\n";
+        let rewritten = FileLeft::Rewritten(hex(&SecretBytes::copy_from(leftover).sha256()));
+        // Each case: its name, the file there before the undo (none:
+        // missing), what the backup recorded, and the undo's state.
+        type Case<'a> = (&'a str, Option<&'a [u8]>, Option<FileLeft>, &'a str);
+        let cases: [Case<'_>; 8] = [
+            (
+                "identical",
+                Some(original),
+                Some(rewritten.clone()),
+                "unchanged",
+            ),
+            (
+                "leftover",
+                Some(leftover),
+                Some(rewritten.clone()),
+                "restored",
+            ),
+            (
+                "edited",
+                Some(b"MODE=bbb\nFLAG=ccc\n\n"),
+                Some(rewritten.clone()),
+                "exists",
+            ),
+            (
+                "entry_removed",
+                Some(b"FLAG=ccc\n"),
+                Some(rewritten.clone()),
+                "exists",
+            ),
+            ("missing", None, Some(rewritten.clone()), "restored"),
+            (
+                "value_changed",
+                Some(b"MODE=bbx\nFLAG=ccc\n"),
+                Some(rewritten.clone()),
+                "exists",
+            ),
+            (
+                "made_again",
+                Some(b"MODE=bbb\n"),
+                Some(FileLeft::Removed),
+                "exists",
+            ),
+            ("unrecorded", Some(leftover), None, "exists"),
+        ];
+        for (name, now, left, want) in cases {
+            let dir = d.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let root = open_root(&dir).unwrap();
+            let path = dir.join(".env");
+            if let Some(now) = now {
+                std::fs::write(&path, now).unwrap();
+            }
+            let got = write_back(
+                &root,
+                path.to_str().unwrap(),
+                0o600,
+                SecretBytes::copy_from(original),
+                left.as_ref(),
+            );
+            assert_eq!(got, want, "{name}");
+            let expect = if want == "restored" {
+                original
+            } else {
+                now.unwrap()
+            };
+            assert_eq!(std::fs::read(&path).unwrap(), expect, "{name}");
+        }
     }
 
     #[test]

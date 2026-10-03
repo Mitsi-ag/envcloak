@@ -26,8 +26,8 @@ use envcloak_core::crypto::ItemClass;
 use envcloak_core::vault::{FieldName, ItemDetails, LockedVault, NewItem, Slug, Vault, VaultPaths};
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_ipc::proto::{
-    BackupFileParams, ErrorKind, FilesBackupParams, ImportCommitParams, ImportEntry, ImportParams,
-    ImportProject, VerifyEntry, VerifyFile, VerifyParams,
+    BackupFileParams, ErrorKind, FileLeft, FilesBackupParams, ImportCommitParams, ImportEntry,
+    ImportParams, ImportProject, VerifyEntry, VerifyFile, VerifyParams,
 };
 use envcloak_ipc::view::{EntryStatus, ImportPlanView, LengthClass, SkipReason, VerifyView};
 use envcloak_ipc::{ClientError, WireSecret};
@@ -510,20 +510,50 @@ fn verify_answers_the_delete_gate_and_the_kit_is_confirmed_with_a_proof() {
 }
 
 /// `files.backup` writes ciphertext; `files.restore` hands the bytes back
-/// only with the passphrase from a terminal subject.
+/// only with the passphrase from a terminal subject, with what the
+/// deletion leaves of each file as the backup recorded it (F-78). What is
+/// left must be `removed` or a SHA-256 in lower-case hex.
 #[test]
 fn a_file_backup_comes_back_only_with_a_proof() {
     let mut f = Fixture::new(|_, _| {});
     let key = by_label(&f.cs, labels::OPENAI_API_KEY).as_str();
     let body = format!("OPENAI_API_KEY={key}\nPORT=8080\n");
+    let left = {
+        use sha2::{Digest, Sha256};
+        let sha: String = Sha256::digest(b"PORT=8080\n")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        FileLeft::Rewritten(sha)
+    };
     let path = f.home.root().join("acme-web/.env");
     let mut c = client(&f.home);
+    for bad in [
+        "ab".repeat(31),
+        "ab".repeat(33),
+        "AB".repeat(32),
+        format!("{}g", "a".repeat(63)),
+    ] {
+        let e = c
+            .files_backup(&FilesBackupParams {
+                files: vec![BackupFileParams {
+                    path: path.to_str().unwrap().to_owned(),
+                    mode: 0o600,
+                    content: WireSecret::new(SecretBytes::copy_from(b"A=1")),
+                    left: FileLeft::Rewritten(bad.clone()),
+                }],
+                claims: Vec::new(),
+            })
+            .unwrap_err();
+        assert_eq!(rpc(e), ErrorKind::InvalidParams, "{bad}");
+    }
     let b = c
         .files_backup(&FilesBackupParams {
             files: vec![BackupFileParams {
                 path: path.to_str().unwrap().to_owned(),
                 mode: 0o600,
                 content: WireSecret::new(SecretBytes::copy_from(body.as_bytes())),
+                left: left.clone(),
             }],
             claims: Vec::new(),
         })
@@ -550,6 +580,7 @@ fn a_file_backup_comes_back_only_with_a_proof() {
                     path: path.clone(),
                     mode: 0o600,
                     content: WireSecret::new(SecretBytes::copy_from(b"A=1")),
+                    left: FileLeft::Removed,
                 }],
                 claims: Vec::new(),
             })
@@ -579,6 +610,7 @@ fn a_file_backup_comes_back_only_with_a_proof() {
     assert_eq!(back.files[0].path, path.to_str().unwrap());
     assert_eq!(back.files[0].mode, 0o600);
     assert!(back.files[0].content.as_secret().ct_eq(body.as_bytes()));
+    assert_eq!(back.files[0].left, Some(left));
     drop((c, back));
     let v = f.stop_and_open();
     let (entries, _) = v.read_audit().unwrap();
@@ -1491,6 +1523,7 @@ fn a_restore_whose_audit_entry_cannot_be_written_releases_nothing() {
                 path: path.to_str().unwrap().to_owned(),
                 mode: 0o600,
                 content: WireSecret::new(SecretBytes::copy_from(body.as_bytes())),
+                left: FileLeft::Removed,
             }],
             claims: Vec::new(),
         })

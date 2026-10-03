@@ -774,7 +774,7 @@ pub struct FilesBackupParams {
     pub claims: Vec<String>,
 }
 
-/// One file's bytes, and where it was.
+/// One file's bytes, where it was, and what the deletion leaves of it.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupFileParams {
@@ -783,6 +783,18 @@ pub struct BackupFileParams {
     /// Its permission bits.
     pub mode: u32,
     pub content: WireSecret,
+    /// What the deletion leaves of it, which the backup records so that
+    /// `init --undo` writes it back only over exactly that (F-78).
+    pub left: FileLeft,
+}
+
+/// What a deletion leaves of a file (F-78): `"removed"`, or
+/// `{"rewritten": "<the SHA-256 of what is left, 64 lower-case hex>"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileLeft {
+    Removed,
+    Rewritten(String),
 }
 
 /// `files.restore`: the files of a backup, byte for byte, for `envcloak
@@ -822,6 +834,11 @@ pub struct RestoredFile {
     pub path: String,
     pub mode: u32,
     pub content: WireSecret,
+    /// What the deletion left of it, as its backup recorded; none for a
+    /// backup made before that was recorded, which then replaces no file
+    /// that is there (F-78).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<FileLeft>,
 }
 
 /// `recovery.confirm`: records that the person holds the Recovery Kit

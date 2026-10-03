@@ -10,8 +10,8 @@
 //!   replaces a file: one that exists stays as it is.
 //! - [`restore_over`] puts the original back over the file a deletion
 //!   rewrote, as [`crate::replace_atomically`] replaces one, only while it
-//!   is still the file read (the caller checked it is that rewrite,
-//!   [`crate::trimmed_from`]).
+//!   is still the file read (the caller checked it is exactly that
+//!   rewrite, by the SHA-256 the backup recorded of it, F-78).
 //! - [`rewrite_observed`] rewrites a file under the rules of a removal
 //!   ([`crate::rewrite_checked`]) to hold what the vault does not.
 //! - [`restore_over_left`] puts a file's contents back from a backup v2

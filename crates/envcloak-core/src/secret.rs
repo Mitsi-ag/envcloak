@@ -77,6 +77,17 @@ impl SecretBytes {
             .map(|s| s.chars().count())
     }
 
+    /// The SHA-256 of the value, for a comparison that keeps the value in
+    /// this process and in the vault's encryption: an env file now
+    /// against what its encrypted backup recorded the deletion leaves of
+    /// it (F-78). The hasher's state is wiped when it is dropped (`sha2`
+    /// with `zeroize`).
+    #[allow(clippy::disallowed_methods)] // Hashes in place.
+    pub fn sha256(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.0.expose_secret()).into()
+    }
+
     /// Whether the value holds the byte `b` anywhere: a NUL, say, which no
     /// environment variable can carry. One bit about the value, and never
     /// where the byte is.
