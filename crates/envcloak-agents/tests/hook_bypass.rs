@@ -330,6 +330,29 @@ const CORPUS: &[(&str, Option<Class>)] = &[
         Some(Class::EnvFile),
     ),
     ("find . -regex '.*\\.e.v' -exec cat {} +", None),
+    // A `/` inside a class is a member, and a class that may match one is
+    // read as the separator too (the verifier's F119 follow-up); find's
+    // `-path` matches a `/` with `*` and `?` as well.
+    ("rg -g '[/.]env*' KEY", Some(Class::EnvFile)),
+    ("rg --glob 'sub[/].env' KEY", Some(Class::EnvFile)),
+    ("rg -g '**[!a].env' KEY", Some(Class::EnvFile)),
+    ("grep -r --include='[/.]env*' KEY .", Some(Class::EnvFile)),
+    (
+        "find . -name '[/.]env*' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    (
+        "find sub -path 'sub*env' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    (
+        "find . -path './sub?.env' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    (
+        "find . -wholename './s*[e]nv' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
     // What the hook lets through (docs/INSTALLERS.md, "What the hook does
     // not see").
     ("f=.env; cat \"$f\"", None),

@@ -1687,8 +1687,17 @@ impl Analyzer {
             i += 1;
             match o.as_deref() {
                 Some(
-                    b"-name" | b"-iname" | b"-path" | b"-ipath" | b"-wholename" | b"-iwholename",
+                    t @ (b"-name" | b"-iname" | b"-path" | b"-ipath" | b"-wholename"
+                    | b"-iwholename"),
                 ) => {
+                    // `-path` and `-wholename` match the whole path, their
+                    // wildcards a `/` too (the verifier's F119 follow-up);
+                    // `-name` a file's name.
+                    let slash = if matches!(t, b"-name" | b"-iname") {
+                        glob::Slash::Classes
+                    } else {
+                        glob::Slash::Any
+                    };
                     if let Some(p) = args.get(i) {
                         // A find pattern is a glob, quoted or not.
                         let pat: Word = p
@@ -1703,7 +1712,7 @@ impl Analyzer {
                             .collect();
                         // find's wildcards match a leading `.` (POSIX
                         // interpretation 126), as a search tool's do.
-                        if glob::word_may_name_env_file(&pat, false) {
+                        if glob::word_may_name_env_file(&pat, false, slash) {
                             names_env = true;
                         }
                     }
@@ -2439,7 +2448,7 @@ impl Reader {
     /// ordinary values).
     fn selects_env(&self, opt: &str, value: &[Ch]) -> bool {
         if self.glob_opts.contains(&opt) {
-            glob::word_may_name_env_file(value, true)
+            glob::word_may_name_env_file(value, true, glob::Slash::Classes)
         } else if self.regex_opts.contains(&opt) {
             glob::regex_may_name_env_file(value)
         } else if self.type_opts.contains(&opt) {
