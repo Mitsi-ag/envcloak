@@ -2455,13 +2455,26 @@ fn a_name_or_type_a_macro_gives_is_refused() {
 ///
 /// Mutations checked: `#[path]` not refused: the first copy passes the
 /// failure-token reader, and the statement-domain reader too, and this
-/// fails. Symbolic links to directories left to `os.walk`, which passes
+/// fails. `path = ` in a macro's argument not refused: the macro-made
+/// attribute passes and this fails. Symbolic links to directories left to `os.walk`, which passes
 /// over them: the linked directory passes and this fails. The manifest
 /// checks not called: the target, dependency and member copies pass and
 /// this fails.
 #[test]
 fn the_compiler_reads_no_rust_the_reader_does_not() {
     let hidden = "pub fn h() -> envcloak_client::Failure { envcloak_client::Failure::new(\"pty_unavailable\", \"x\") }\n";
+    // A macro can make the attribute from `path = ".."` it is given.
+    let t = fixture();
+    append_to(
+        &t,
+        STATUS_RS,
+        "\nmacro_rules! zz_m { ($($t:tt)*) => { #[$($t)*] mod hidden; }; }\nzz_m!(path = \"../../gen/hidden.rs\");\n",
+    );
+    add_file(&t, "crates/envcloak-cli/gen/hidden.rs", hidden);
+    assert_fails(
+        &t,
+        "`path = ` where a macro could make it a `#[path]` attribute",
+    );
     for attr in [
         "#[path = \"../../gen/hidden.rs\"]",
         "#[cfg_attr(unix, path = \"../../gen/hidden.rs\")]",
