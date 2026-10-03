@@ -938,6 +938,10 @@ fn path_reason(token: &str) -> String {
             "its file was changed, but this old copy, which may hold plaintext, could not be \
              removed: look at it, then delete it"
         }
+        "aside_changed" => {
+            "its file was changed, but another program changed the old copy under this name, or \
+             put its own file there, meanwhile, so it was kept as it is: it may be that program's"
+        }
         "exists" => "a file is there already, and is left as it is",
         "restored" => "restored",
         "unchanged" => "there already, as it was",
@@ -1275,6 +1279,30 @@ mod tests {
     };
 
     const T0: u64 = 1_790_000_000;
+
+    /// What `init --delete-plaintext` reports a file kept for, or a file
+    /// left under a temporary name after its file was changed, has words
+    /// of its own, never the token alone; and a file another program
+    /// changed or put under that name is never called the old copy to
+    /// delete (verifier, M2-05 round 11).
+    #[test]
+    fn what_a_deletion_keeps_has_words() {
+        for token in [
+            "changed",
+            "hard_linked",
+            "recently_changed",
+            "open_elsewhere",
+            "unchecked",
+            "moved_aside",
+            "not_removed",
+            "aside_changed",
+        ] {
+            assert_ne!(path_reason(token), shown(token), "{token}");
+        }
+        assert!(path_reason("not_removed").contains("delete it"));
+        assert!(!path_reason("aside_changed").contains("delete"));
+        assert!(!path_reason("moved_aside").contains("delete"));
+    }
 
     /// An item as the daemon describes one, at `detail`: 0 summary, 1 with
     /// the account, 2 with everything.

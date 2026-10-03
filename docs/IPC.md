@@ -380,6 +380,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `edited_since` | M2-05 | landed | a file a backup v2 restore would write back over is not what the change left (its SHA-256 is not the recorded `sha256_after`); it is kept as it is |
 | `backup_unread` | M2-05 | landed | a backup v2 restore could not have a file's backed-up contents whole (a chunk missing or of another length, or the whole not the backed-up SHA-256); nothing is written in its place |
 | `swap_unsupported` | M2-05 | landed | a backup v2 restore found a file system that cannot swap two names in one step, so the file it would write over could not be checked as it moved out; nothing is written in its place |
+| `aside_changed` | M2-05 | landed | a file was rewritten or written back, but what was under the temporary name the old file was left under is not the old file as it was checked (another program wrote into it there, or put its own file under that name, after the swap): it is kept as it is, and named, never called the old copy |
 <!-- /reservations -->
 
 **Coverage tokens** (`envcloak agents status`; states, reasons and probe outcomes share one namespace):

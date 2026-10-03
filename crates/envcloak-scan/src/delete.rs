@@ -108,7 +108,9 @@ pub struct DeleteOutcome {
     pub unchanged: Vec<PathBuf>,
     /// Files left in place, and why; and plaintext left under a temporary
     /// name after its file was changed, when it could not be unlinked
-    /// ([`ModifyErrorKind::NotRemoved`], the temporary name given).
+    /// ([`ModifyErrorKind::NotRemoved`], the temporary name given), or a
+    /// file kept there because another program changed it or put it there
+    /// meanwhile ([`ModifyErrorKind::AsideChanged`]).
     pub kept: Vec<(PathBuf, ModifyErrorKind)>,
 }
 
@@ -152,8 +154,10 @@ pub fn delete_plaintext<G: DeleteGate>(
         let (rel, stamp) = &files[i];
         let now = SystemTime::now();
         let done = match &remains[i] {
-            Remains::Nothing => remove_checked_observed(r, rel, stamp, now, &mut |_| {
-                observe(DeleteStep::MovedAside(i));
+            Remains::Nothing => remove_checked_observed(r, rel, stamp, now, &mut |at| {
+                if at == Inside::MovedAside {
+                    observe(DeleteStep::MovedAside(i));
+                }
             })
             .map(|()| (&mut out.removed, DeleteStep::Removed(i))),
             Remains::Bytes(b) => rewrite_observed(r, rel, b, stamp, now, &mut |at| match at {
@@ -167,7 +171,10 @@ pub fn delete_plaintext<G: DeleteGate>(
                 | Inside::LeftoverMoved
                 | Inside::LeftoverRead
                 | Inside::LeftoverPutBack
-                | Inside::Linked => {}
+                | Inside::Linked
+                | Inside::OldMoved
+                | Inside::NewMoved
+                | Inside::PutBack => {}
             })
             .map(|_| (&mut out.rewritten, DeleteStep::Rewritten(i))),
             Remains::Everything => continue,
@@ -178,9 +185,14 @@ pub fn delete_plaintext<G: DeleteGate>(
                 observe(step);
             }
             Err(e) => {
-                // Rewritten, with the old file left: both are said.
-                if e.kind == ModifyErrorKind::NotRemoved && matches!(remains[i], Remains::Bytes(_))
-                {
+                // Rewritten, with a file left under a temporary name (the
+                // old file, or one another program changed or put there):
+                // both are said.
+                let made = matches!(
+                    e.kind,
+                    ModifyErrorKind::NotRemoved | ModifyErrorKind::AsideChanged
+                );
+                if made && matches!(remains[i], Remains::Bytes(_)) {
                     out.rewritten.push(rel.clone());
                 }
                 out.kept.push((e.rel, e.kind));
