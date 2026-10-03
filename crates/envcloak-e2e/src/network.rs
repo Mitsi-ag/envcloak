@@ -14,9 +14,11 @@
 //!
 //! What that does not refuse (verifier review of M2-04): on macOS the
 //! resolver also answers over its XPC service (`com.apple.dnssd.service`),
-//! which Network.framework, URLSession, CFNetwork's streams and host
-//! lookups and `dnssd_getaddrinfo` use, and which no file access control
-//! can deny; on Linux, systemd-resolved's varlink and D-Bus endpoints are
+//! which Network.framework (and URLSession, built on it) and
+//! `dnssd_getaddrinfo` use, and which no file access control can deny;
+//! CFNetwork's host lookups and its streams to a named host resolve names
+//! inside that framework too, not through `getaddrinfo`, and are not shown
+//! refused either; on Linux, systemd-resolved's varlink and D-Bus endpoints are
 //! filesystem sockets a network namespace does not cut off (not
 //! measured). So a program that resolves through those could still send a
 //! name, and a value in it, to external DNS unrecorded.
@@ -97,9 +99,10 @@ fn resolves(name: &str) -> Result<(), String> {
     }
 }
 
-/// The macOS resolver entry points the tests' isolation does not refuse
-/// (see the module documentation), as a program imports them: imported
-/// symbols starting so. Network.framework's connections and resolver
+/// The macOS entry points that resolve a name other than through
+/// `getaddrinfo`, which the tests' isolation is not shown to refuse (see
+/// the module documentation), as a program imports them: imported symbols
+/// starting so. Network.framework's connections and resolver
 /// configuration; libdnssd's XPC lookup; CFNetwork's host lookup, its
 /// socket streams to a named host and its HTTP streams; and URLSession and
 /// NSURLConnection, whose Objective-C classes a program imports by their
