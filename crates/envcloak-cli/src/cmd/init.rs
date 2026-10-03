@@ -47,8 +47,10 @@
 //!   left: the backup records that (the SHA-256 of what a rewrite leaves,
 //!   or that the file was removed) when it is made, before any file
 //!   changes (F-78). So a file there is replaced only when it is exactly
-//!   that rewrite, and a missing file is made only when the deletion
-//!   removed it. Any other is left as it is: one edited since, an entry
+//!   that rewrite, checked again up to the moment the original takes its
+//!   name (an edit made meanwhile is kept, `changed`; a file system that
+//!   cannot swap two names writes nothing, `swap_unsupported`), and a
+//!   missing file is made only when the deletion removed it. Any other is left as it is: one edited since, an entry
 //!   added or taken out included (`exists`), one the deletion removed
 //!   that is there again (`exists`), and one it rewrote that was deleted
 //!   since (`deleted_since`). A backup that does not record what the
@@ -83,10 +85,10 @@ use envcloak_ipc::view::{
 };
 use envcloak_policy::{MANIFEST_NAME, escape_for_display, find_manifest};
 use envcloak_scan::{
-    DeleteGate, DeleteStep, DotenvEntry, EntryKind, FileKind, FileStamp, MAX_DOTENV,
+    DeleteGate, DeleteStep, DotenvEntry, EntryKind, FileKind, FileStamp, Inside, MAX_DOTENV,
     ModifyErrorKind, Remains, ScanErrorKind, ScanRoot, create_atomically, delete_plaintext,
     dotenv_kind, open_root, parse_dotenv, pause_point, read_capped, read_plain, restore_file,
-    restore_over, without_entries,
+    restore_over_observed, without_entries,
 };
 
 use super::import::{ReadFile, edit_gitignore, import, project_name, report, scan};
@@ -819,14 +821,26 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Whether `now` is exactly what the deletion left of a file, as its
-/// backup recorded it: a rewrite to bytes of that SHA-256. A file the
-/// deletion removed is never what it left.
-fn deletion_left(left: Option<&FileLeft>, now: &SecretBytes) -> bool {
-    match left {
-        Some(FileLeft::Rewritten(sha)) => *sha == hex(&now.sha256()),
-        Some(FileLeft::Removed) | None => false,
+/// The SHA-256 a backup recorded of what a deletion's rewrite left: 64
+/// lower-case hex digits (the daemon takes no other form), or `None`.
+fn rewritten(left: Option<&FileLeft>) -> Option<[u8; 32]> {
+    let Some(FileLeft::Rewritten(sha)) = left else {
+        return None;
+    };
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let b = sha.as_bytes();
+    if b.len() != 64 {
+        return None;
     }
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = digit(b[2 * i])? << 4 | digit(b[2 * i + 1])?;
+    }
+    Some(out)
 }
 
 /// Writes one restored file where it was, only when that is an env file
@@ -840,7 +854,12 @@ fn deletion_left(left: Option<&FileLeft>, now: &SecretBytes) -> bool {
 ///   replaced (`restored`) only when it is exactly the rewrite recorded,
 ///   by its SHA-256, and `exists` otherwise: edited since, an entry added
 ///   or taken out included, one the deletion removed that is there again,
-///   and any file whose result is not recorded;
+///   and any file whose result is not recorded. The replacement checks
+///   that SHA-256 again on the file it replaces, up to the moment the
+///   original takes its name and on what the swap brought out
+///   ([`restore_over_observed`]): an edit seen before the write is
+///   `exists`, one made while it writes is kept and `changed`, and a file
+///   system that cannot swap two names writes nothing (`swap_unsupported`);
 /// - a missing file is made (`restored`) only when the deletion removed
 ///   it. One the deletion rewrote was deleted since (`deleted_since`), and
 ///   is left so: making it would bring back what the person deleted. One
@@ -873,13 +892,23 @@ fn write_back(
     let rel = Path::new(name);
     match read_capped(&root, rel, content.len().max(MAX_DOTENV)) {
         Ok((now, _)) if now.ct_eq_secret(&content) => return "unchanged",
-        Ok((now, stamp)) if deletion_left(left, &now) => {
-            return match restore_over(&root, rel, &content, &stamp) {
+        Ok((now, _)) => {
+            let Some(sha) = rewritten(left).filter(|sha| *sha == now.sha256()) else {
+                return "exists";
+            };
+            // The last check before the original takes the file's name: a
+            // test stops here to edit the file (F-78).
+            let mut observe = |at| {
+                if at == Inside::Checked {
+                    pause_point("undo_checked");
+                }
+            };
+            return match restore_over_observed(&root, rel, &content, &sha, &mut observe) {
                 Ok(_) => "restored",
+                Err(e) if e.kind == ModifyErrorKind::EditedSince => "exists",
                 Err(e) => e.kind.token(),
             };
         }
-        Ok(_) => return "exists",
         Err(e) if e.kind == ScanErrorKind::NotFound => {}
         Err(e) => return e.kind.token(),
     }

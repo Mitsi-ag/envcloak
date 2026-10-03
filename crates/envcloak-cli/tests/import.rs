@@ -1506,6 +1506,109 @@ fn undo_keeps_an_entry_taken_out_after_the_deletion() {
     g.sweep();
 }
 
+/// F-78, end to end (Codex's review, round 4): the write-back replaces
+/// `.env` only while it is exactly what the deletion left at the moment
+/// the original takes its name. `init --undo` is stopped after its last
+/// check of `.env` (the pause point `undo_checked`, in test builds only),
+/// and `.env` is edited in place then: one byte changed, the length kept
+/// and the modification time put back, so only the contents and the
+/// change time tell. Let go, the undo keeps the edit (`changed`), says it
+/// is incomplete and puts back `.env.short`; once `.env` is again what
+/// the deletion left, the same backup restores it.
+///
+/// Mutation: the write-back without the contents the file must still hold
+/// when the swap brings it out (the old `replace_atomically` path): the
+/// edit is written over and reported `restored`.
+#[test]
+fn undo_keeps_an_edit_made_while_it_writes_back() {
+    let g = Gate16::new(true);
+    ok(&g.import(), &g.cs);
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--delete-plaintext", "--json"],
+        &[],
+    );
+    ok(&out, &g.cs);
+    let backup = json(&out)["delete"]["backup"].as_str().unwrap().to_owned();
+    let env = g.repo.join(".env");
+    let left = std::fs::read(&env).unwrap();
+    let mut edit = left.clone();
+    let at = edit.len() - 2;
+    edit[at] ^= 0x20;
+    let pass = g.home.root().join("pass");
+    std::fs::write(
+        &pass,
+        format!("{}\n", by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str()),
+    )
+    .unwrap();
+    let args = ["init", "--undo", &backup, "--passphrase-fd", "3", "--json"];
+    let pause = tempfile::Builder::new()
+        .prefix("ecp")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut cmd = on_terminal_command(&g.home, &args, &[(3, &pass, true)]);
+    cmd.current_dir(&g.repo)
+        .env(envcloak_scan::testing::PAUSE_DIR, pause.path());
+    let mut child = cmd.spawn().unwrap();
+    let (mut out, mut err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let reader = std::thread::spawn(move || {
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        std::io::Read::read_to_end(&mut out, &mut o).unwrap();
+        std::io::Read::read_to_end(&mut err, &mut e).unwrap();
+        (o, e)
+    });
+    let point = pause.path().join("000.undo_checked");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !point.exists() {
+        assert!(
+            Instant::now() < deadline && child.try_wait().unwrap().is_none(),
+            "the undo did not stop after its last check of .env"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let w = std::fs::OpenOptions::new().write(true).open(&env).unwrap();
+    let modified = w.metadata().unwrap().modified().unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&w, &edit, 0).unwrap();
+    w.set_modified(modified).unwrap();
+    drop(w);
+    File::create(pause.path().join("000.go")).unwrap();
+    let status = child.wait().unwrap();
+    let (stdout, err) = reader.join().unwrap();
+    assert_no_canary(&stdout, &g.cs);
+    assert_no_canary(&err, &g.cs);
+    assert_eq!(status.code(), Some(1), "{}", String::from_utf8_lossy(&err));
+    let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    let states: Vec<(&str, &str)> = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["path"].as_str().unwrap().rsplit('/').next().unwrap(),
+                f["state"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(states, [(".env", "changed"), (".env.short", "restored")]);
+    assert!(
+        std::fs::read(&env).unwrap() == edit,
+        "the edit made while the undo wrote back was written over"
+    );
+    for e in std::fs::read_dir(&g.repo).unwrap() {
+        let n = e.unwrap().file_name();
+        assert!(!n.to_string_lossy().contains(".envcloak-"), "{n:?} left");
+    }
+
+    // What the deletion left again: the same backup restores it.
+    std::fs::write(&env, &left).unwrap();
+    let out = person_in(&g.home, &g.repo, &args, &[(3, &pass, true)]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(g.intact(), [true, true]);
+    std::fs::remove_file(&pass).unwrap();
+    g.sweep();
+}
+
 /// F-78, end to end (Codex review, round 3): a file the deletion
 /// rewrote that the person then deletes whole stays deleted: `init
 /// --undo` reports it `deleted_since` and makes nothing there, since SPEC

@@ -38,7 +38,9 @@
 //! leaving every other byte as it was (`envcloak init --delete-plaintext`
 //! keeps the entries it did not import), and [`trimmed_from`] tells
 //! whether a file is another with some of its entries taken out that way
-//! (`envcloak init --undo` puts such a file back).
+//! (gate 16's test asks it of what a killed deletion left). `envcloak init
+//! --undo` does not: it puts a file back only when it is exactly what the
+//! deletion left, by the SHA-256 the backup recorded (F-78).
 
 use std::collections::BTreeSet;
 use std::ops::Range;

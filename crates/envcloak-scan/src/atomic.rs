@@ -915,7 +915,7 @@ fn replace_in(
 
 /// What swaps two names in a directory in one step: [`exchange_beneath`],
 /// or a unit test's file system that cannot.
-type Swap = fn(&File, &OsStr, &OsStr) -> std::io::Result<()>;
+pub(crate) type Swap = fn(&File, &OsStr, &OsStr) -> std::io::Result<()>;
 
 /// [`replace_in`], with the new contents written by `fill`, so they can
 /// be written a part at a time; and, when `left` is given, only over a
@@ -965,7 +965,7 @@ pub(crate) fn replace_in_with(
 }
 
 #[allow(clippy::too_many_arguments)] // replace_in_with's, and the swap.
-fn replace_in_using(
+pub(crate) fn replace_in_using(
     swap: Swap,
     dir: &File,
     rel: &Path,
