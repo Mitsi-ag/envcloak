@@ -321,6 +321,15 @@ fn a_payload_too_large_or_too_slow_is_stopped_within_the_deadline() {
         assert!(took < Duration::from_millis(2500), "{took:?}");
         assert!(took >= Duration::from_millis(1900), "{took:?}");
 
+        // A valid payload of the whole 2 MiB, thousands of here-documents:
+        // decided, and answered within the deadline (Codex review: the
+        // decision is under the deadline too, and read in one pass).
+        let cmd = "cat <<A\nx\nA\n".repeat((2 * 1024 * 1024 - 8192) / 16);
+        let (o, took) = hook(&home, &a, with_command(host, &cmd));
+        assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(o.stdout.is_empty(), "allowed: no output");
+        assert!(took < Duration::from_millis(2500), "{took:?}");
+
         // SessionStart decides nothing: silent.
         let a = args(host, "SessionStart");
         let a: Vec<&str> = a.iter().map(String::as_str).collect();

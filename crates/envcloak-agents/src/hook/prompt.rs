@@ -21,28 +21,34 @@
 //! escape (`/`, a space, a quote) written unescaped, and a key encoded or
 //! split by other text.
 
+use zeroize::Zeroizing;
+
 /// The shortest run of letters and digits taken for a generated key.
 pub const RUN: usize = 24;
 
-/// Whether `prompt` holds something shaped like a key or token.
+/// Whether `prompt` holds something shaped like a key or token. Every
+/// copy made of it on the way is wiped when dropped.
 pub fn holds_key(prompt: &str) -> bool {
     shaped(prompt) || {
         let joined = without_paste_markers(prompt);
-        joined != prompt && shaped(&joined)
+        *joined != prompt && shaped(&joined)
     }
 }
 
 fn shaped(text: &str) -> bool {
     has_key_run(text.as_bytes())
         || has_url_password(text.as_bytes())
-        || envcloak_client::render::registry().is_some_and(|r| r.mask_keys(text) != text)
+        || envcloak_client::render::registry().is_some_and(|r| {
+            let masked = Zeroizing::new(r.mask_keys(text));
+            *masked != text
+        })
 }
 
 /// `text` with the lines that open and close a paste
 /// (`<pasted_content id="...">`, `</pasted_content id="...">`) taken out,
 /// and what was on either side of one joined without a line break.
-pub fn without_paste_markers(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+pub fn without_paste_markers(text: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(text.len()));
     let mut join = true;
     let mut first = true;
     for line in text.split('\n') {
@@ -191,6 +197,6 @@ mod tests {
         );
         assert!(!shaped(&prompt), "each part alone is no key");
         assert!(holds_key(&prompt));
-        assert_eq!(without_paste_markers("a\nb"), "a\nb");
+        assert_eq!(*without_paste_markers("a\nb"), "a\nb");
     }
 }

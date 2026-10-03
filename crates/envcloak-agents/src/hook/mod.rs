@@ -236,34 +236,48 @@ pub fn decide(host: Host, event: Event, payload: &SecretBuf) -> Decision {
     }
 }
 
-/// The decision for one tool call.
+/// The decision for one tool call. Every channel a class can come
+/// through is read for it (a deny class enforced on one tool only is a
+/// miss on the others): a command, as a shell reads it ([`shell`]), for
+/// `Bash` and `Monitor` (whose `command` is a shell script, Claude Code
+/// 2.1.280's `sdk-tools.d.ts`); a path, for the file tools and every
+/// string of an MCP tool's input or an MCP resource's URI
+/// ([`shell::path_class`]: env files and `/proc/<pid>/environ`); a search
+/// glob ([`shell::glob_may_name_env_file`]); and the argv of
+/// `run_with_secrets` ([`decide_argv`]).
 fn tool_call(host: Host, tool: &str, input: &Map<String, Value>) -> Decision {
     let deny_if = |c: Option<Class>| c.map_or(Decision::Allow, |c| Decision::Deny(Reason::of(c)));
+    let claude = host == Host::ClaudeCode;
     match tool {
         "Bash" => match input.get("command").and_then(Value::as_str) {
             Some(cmd) => deny_if(shell::check_script(cmd)),
             None => Decision::NoDecision,
         },
-        "Read" | "Edit" | "Write" | "NotebookEdit" if host == Host::ClaudeCode => {
+        "Monitor" if claude => match input.get("command") {
+            Some(Value::String(cmd)) => deny_if(shell::check_script(cmd)),
+            // A WebSocket to watch, which runs nothing.
+            None if input.contains_key("ws") => Decision::Allow,
+            _ => Decision::NoDecision,
+        },
+        "Read" | "Edit" | "NotebookEdit" if claude => {
             match input
                 .get("file_path")
                 .or_else(|| input.get("notebook_path"))
                 .and_then(Value::as_str)
             {
-                Some(path) if tool != "Write" && names_env_file(path) => {
-                    Decision::Deny(Reason::EnvFile)
-                }
-                Some(_) => Decision::Allow,
+                Some(path) => deny_if(shell::path_class(path)),
                 None => Decision::NoDecision,
             }
         }
-        "Grep" if host == Host::ClaudeCode => {
+        "Grep" if claude => {
             let path = input.get("path").and_then(Value::as_str);
             let glob = input.get("glob").and_then(Value::as_str);
-            if path.is_some_and(names_env_file) || glob.is_some_and(glob_matches_env_file) {
-                Decision::Deny(Reason::EnvFile)
-            } else {
-                Decision::Allow
+            match path.and_then(shell::path_class) {
+                Some(c) => Decision::Deny(Reason::of(c)),
+                None if glob.is_some_and(shell::glob_may_name_env_file) => {
+                    Decision::Deny(Reason::EnvFile)
+                }
+                None => Decision::Allow,
             }
         }
         "mcp__envcloak__run_with_secrets" => match input.get("argv") {
@@ -277,13 +291,8 @@ fn tool_call(host: Host, tool: &str, input: &Map<String, Value>) -> Decision {
             }
             _ => Decision::Allow,
         },
-        t if t.starts_with("mcp__") => {
-            if strings_name_env_file(&Value::Object(input.clone()), 0) {
-                Decision::Deny(Reason::EnvFile)
-            } else {
-                Decision::Allow
-            }
-        }
+        "ReadMcpResourceTool" if claude => deny_if(strings_class(input.values(), 0)),
+        t if t.starts_with("mcp__") => deny_if(strings_class(input.values(), 0)),
         _ => Decision::Allow,
     }
 }
@@ -295,55 +304,27 @@ pub fn decide_argv<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> Decision {
     shell::check_argv(argv).map_or(Decision::Allow, |c| Decision::Deny(Reason::of(c)))
 }
 
-/// Whether a path names an env file (by its last component).
+/// Whether a path names an env file (by its last component, in any case).
 pub fn names_env_file(path: &str) -> bool {
-    shell::check_argv(&["cat", path]) == Some(Class::EnvFile)
+    shell::path_class(path) == Some(Class::EnvFile)
 }
 
-/// Whether a search glob (Claude Code's `Grep` tool's `glob`) could match
-/// an env file, `*` matching a leading dot as search tools have it.
-fn glob_matches_env_file(glob: &str) -> bool {
-    let last = glob.rsplit('/').next().unwrap_or(glob);
-    [
-        ".env",
-        ".env.local",
-        ".env.development",
-        ".env.production",
-        ".env.test",
-    ]
-    .iter()
-    .any(|name| shell_glob(last.as_bytes(), name.as_bytes()))
-}
-
-fn shell_glob(pat: &[u8], name: &[u8]) -> bool {
-    // `{a,b}` alternatives first.
-    if let (Some(open), Some(close)) = (
-        pat.iter().position(|&b| b == b'{'),
-        pat.iter().position(|&b| b == b'}'),
-    ) {
-        if open < close {
-            return pat[open + 1..close].split(|&b| b == b',').any(|alt| {
-                let mut p = pat[..open].to_vec();
-                p.extend_from_slice(alt);
-                p.extend_from_slice(&pat[close + 1..]);
-                shell_glob(&p, name)
-            });
+/// The class of the first string in a tool's input, at any depth, that
+/// names an env file or a process's environment.
+fn strings_class<'a>(values: impl Iterator<Item = &'a Value>, depth: usize) -> Option<Class> {
+    for v in values {
+        let c = match v {
+            _ if depth > 64 => Some(Class::Ambiguous),
+            Value::String(s) => shell::path_class(s),
+            Value::Array(a) => strings_class(a.iter(), depth + 1),
+            Value::Object(o) => strings_class(o.values(), depth + 1),
+            _ => None,
+        };
+        if c.is_some() {
+            return c;
         }
     }
-    shell::glob_matches(pat, name)
-}
-
-/// Whether any string in a tool's input, at any depth, names an env file.
-fn strings_name_env_file(v: &Value, depth: usize) -> bool {
-    if depth > 64 {
-        return true;
-    }
-    match v {
-        Value::String(s) => names_env_file(s),
-        Value::Array(a) => a.iter().any(|x| strings_name_env_file(x, depth + 1)),
-        Value::Object(o) => o.values().any(|x| strings_name_env_file(x, depth + 1)),
-        _ => false,
-    }
+    None
 }
 
 /// What the handler writes and how it exits.
@@ -512,6 +493,154 @@ mod tests {
             Decision::Deny(Reason::EnvFile)
         );
         assert_eq!(d("Bash", serde_json::json!({})), Decision::NoDecision);
+    }
+
+    /// Every channel a class can come through gets the same check: a
+    /// command in `Monitor` as in `Bash` (Claude Code 2.1.280's Monitor
+    /// runs a shell command), a process's environment through a file tool,
+    /// a search glob or an MCP tool as through `cat`, an env file of any
+    /// profile or case through a `Grep` glob, an MCP resource's URI as an
+    /// MCP tool's arguments.
+    ///
+    /// Mutations checked: the `Monitor` arm taken out of `tool_call`
+    /// (`Monitor {command: "printenv"}` allowed); `shell::path_class`
+    /// without its `/proc/<pid>/environ` answer (the env-dump class for
+    /// Bash only, as before); `glob_may_name_env_file` back to the five
+    /// sample names (`.env.staging` allowed); the `ReadMcpResourceTool` arm
+    /// taken out. Each fails this.
+    #[test]
+    fn every_channel_a_class_comes_through_is_read() {
+        let d = |tool: &str, input: Value| {
+            decide(
+                Host::ClaudeCode,
+                Event::PreToolUse,
+                &buf(&claude_pre(tool, input)),
+            )
+        };
+        let j = |v: Value| v;
+        let env_dump = Decision::Deny(Reason::EnvDump);
+        let env_file = Decision::Deny(Reason::EnvFile);
+        for (tool, input, want) in [
+            (
+                "Monitor",
+                j(
+                    serde_json::json!({"description": "d", "timeout_ms": 1000, "command": "printenv"}),
+                ),
+                env_dump,
+            ),
+            (
+                "Monitor",
+                j(
+                    serde_json::json!({"description": "d", "timeout_ms": 1000, "command": "tail -f .env"}),
+                ),
+                env_file,
+            ),
+            (
+                "Monitor",
+                j(
+                    serde_json::json!({"description": "d", "timeout_ms": 1000, "command": "tail -f app.log"}),
+                ),
+                Decision::Allow,
+            ),
+            (
+                "Monitor",
+                j(
+                    serde_json::json!({"description": "d", "timeout_ms": 1000, "ws": {"url": "ws://x"}}),
+                ),
+                Decision::Allow,
+            ),
+            (
+                "Monitor",
+                j(serde_json::json!({"description": "d", "timeout_ms": 1000, "command": 3})),
+                Decision::NoDecision,
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/proc/self/environ"}),
+                env_dump,
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/proc/1/environ"}),
+                env_dump,
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/w/.ENV"}),
+                env_file,
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/w/.env.staging"}),
+                env_file,
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/w/.env.Example"}),
+                Decision::Allow,
+            ),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "K", "path": "/proc/42/environ"}),
+                env_dump,
+            ),
+            (
+                "mcp__fs__read_file",
+                serde_json::json!({"path": "/proc/self/environ"}),
+                env_dump,
+            ),
+            (
+                "ReadMcpResourceTool",
+                serde_json::json!({"server": "fs", "uri": "file:///w/.env.local"}),
+                env_file,
+            ),
+            (
+                "ReadMcpResourceTool",
+                serde_json::json!({"server": "fs", "uri": "file:///proc/self/environ"}),
+                env_dump,
+            ),
+            (
+                "ReadMcpResourceTool",
+                serde_json::json!({"server": "fs", "uri": "file:///w/README.md"}),
+                Decision::Allow,
+            ),
+        ] {
+            assert_eq!(d(tool, input.clone()), want, "{tool} {input}");
+        }
+        for glob in [
+            ".env*",
+            ".env.staging",
+            ".env.prod",
+            ".env.ci",
+            "**/.env.preview",
+            "{.env.stage,x}",
+            "*.{env,txt}",
+            "*.env",
+            "*env*",
+            "[.]env",
+            ".E*",
+            "src/.e?v",
+        ] {
+            assert_eq!(
+                d("Grep", serde_json::json!({"pattern": "K", "glob": glob})),
+                env_file,
+                "{glob}"
+            );
+        }
+        for glob in [
+            "*.rs",
+            "*.{ts,tsx}",
+            "*",
+            "!.env*",
+            "src/**/*.py",
+            ".env.example",
+        ] {
+            assert_eq!(
+                d("Grep", serde_json::json!({"pattern": "K", "glob": glob})),
+                Decision::Allow,
+                "{glob}"
+            );
+        }
     }
 
     #[test]
