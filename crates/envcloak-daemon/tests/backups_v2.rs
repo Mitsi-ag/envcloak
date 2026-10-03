@@ -2611,6 +2611,73 @@ fn a_purge_holds_no_lock() {
     f.sweep();
 }
 
+/// A commit reads its backup back whole outside the daemon's state lock
+/// (M2-05 round 12: the read, up to 1 GiB, ran under it, so every call,
+/// a lock included, waited for it). Stopped by a barrier in that read,
+/// the daemon still answers `status` and lists the backups meanwhile; a
+/// lock taken then goes through at once and ends the backup: the commit
+/// answers `vault_locked`, and once unlocked nothing is listed and no
+/// staging directory is left. Left alone, the commit answers once
+/// released and the backup reads back byte for byte.
+#[test]
+fn a_commit_reads_its_backup_back_outside_the_state_lock() {
+    for lock in [false, true] {
+        let mut f = Fixture::pausing(Some("backup.read_back"));
+        let files = [Spec::made(
+            &f.claude("projects/p/readback.jsonl"),
+            MIB + 3,
+            74,
+        )];
+        let id = client(&f.home)
+            .backup_v2_begin(&begin_params("scrub", &files, &[]))
+            .unwrap()
+            .id;
+        put_all(&f.paths(), f.files_cs(), &id, &files).unwrap();
+        let committing = {
+            let (paths, id) = (f.paths(), id.clone());
+            std::thread::spawn(move || Client::connect(&paths)?.backup_v2_commit(&id).map(drop))
+        };
+        f.wait_paused("backup.read_back");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let paths = f.paths();
+        std::thread::spawn(move || {
+            let answered = Client::connect(&paths).and_then(|mut c| {
+                let state = c.status()?.vault.state;
+                let listed = Client::connect(&paths)?.backup_v2_list()?.backups.len();
+                if lock {
+                    Client::connect(&paths)?.lock()?;
+                }
+                Ok((state, listed))
+            });
+            let _ = tx.send(answered);
+        });
+        let answered = rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                panic!("lock {lock}: status, list or lock waited for the commit's read back")
+            });
+        assert_eq!(answered.unwrap(), (VaultState::Unlocked, 0), "lock {lock}");
+        f.release();
+        let committed = committing.join().unwrap();
+        if lock {
+            let e = committed
+                .expect_err("a commit went through a lock taken while it read its backup back");
+            assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
+            client(&f.home).unlock(passphrase(&f.cs), &[]).unwrap();
+            assert!(f.list().backups.is_empty());
+            assert!(staging_dirs(&f.home).is_empty());
+        } else {
+            committed.unwrap();
+            client(&f.home)
+                .backup_v2_record_result(&id, 0, &files[0].sha(f.files_cs()))
+                .unwrap();
+            let lease = f.open(&id, false, false).unwrap();
+            read_back(&f.paths(), f.files_cs(), &lease, &files);
+        }
+        f.sweep();
+    }
+}
+
 /// The staging directories (`.files2-*.tmp`) in the vault's `backups/`.
 fn staging_dirs(home: &TestHome) -> Vec<PathBuf> {
     let dir = VaultPaths::under(data_dir(home)).backups_dir;
