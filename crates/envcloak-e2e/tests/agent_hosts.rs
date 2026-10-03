@@ -150,6 +150,76 @@ fn no_pinned_host_imports_a_resolver_the_isolation_leaves_open() {
     }
 }
 
+/// The guard reads every Mach-O format `nm` reads, and never takes a file
+/// it cannot read as clean (Codex review of M2-RES1: a fat file with
+/// 64-bit offsets was skipped as not Mach-O, and so was a file that could
+/// not be opened). The positive controls: the program that imports every
+/// entry, made fat with 32-bit and with 64-bit offsets (`lipo -create`,
+/// `-fat64`), is found by each entry in each form; and a tree holding a
+/// copy of it that cannot be read is an error. As root, a file of mode 0
+/// opens anyway, and that case is skipped with a line.
+///
+/// Mutations checked: `FAT_MAGIC_64` left out of the magic numbers: the
+/// 64-bit fat control is skipped and this fails. A file that cannot be
+/// opened taken as not Mach-O: the tree passes as clean and this fails.
+#[test]
+fn the_resolver_guard_reads_every_mach_o_form_and_every_file() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("the_resolver_guard_reads_every_mach_o_form_and_every_file: macOS only");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let (dir, importer) = importer_of_every_open_resolver();
+    for (name, flags) in [("fat32", &[][..]), ("fat64", &["-fat64"][..])] {
+        let out = dir.path().join(name);
+        let made = std::process::Command::new("/usr/bin/lipo")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg("-create")
+            .args(flags)
+            .arg(&importer)
+            .arg("-output")
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "lipo {name}: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let magic = std::fs::read(&out).unwrap()[..4].to_vec();
+        let want: &[u8] = if name == "fat64" {
+            &[0xca, 0xfe, 0xba, 0xbf]
+        } else {
+            &[0xca, 0xfe, 0xba, 0xbe]
+        };
+        assert_eq!(magic, want, "{name}");
+        let hits = envcloak_e2e::open_resolver_imports(&out).unwrap();
+        for entry in envcloak_e2e::OPEN_RESOLVERS {
+            assert!(
+                hits.iter().any(|(_, sym)| sym == entry),
+                "the guard does not find {entry} in the {name} control: {hits:?}"
+            );
+        }
+    }
+    let tree = tempfile::tempdir().unwrap();
+    let hidden = tree.path().join("hidden");
+    std::fs::copy(&importer, &hidden).unwrap();
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&hidden).is_ok() {
+        eprintln!(
+            "the_resolver_guard_reads_every_mach_o_form_and_every_file: a file of mode 0 opens here (root); its case is skipped"
+        );
+        return;
+    }
+    let refused = envcloak_e2e::open_resolver_imports(tree.path());
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        refused.as_ref().is_err_and(|e| e.contains("hidden")),
+        "a tree holding a file the guard cannot read passed: {refused:?}"
+    );
+}
+
 /// The flags every run here pins (D-13): Claude Code `-p` in the default
 /// permission mode with Bash allowed; Codex `exec` in its workspace-write
 /// sandbox with approval policy `never`. Never a bypass mode.

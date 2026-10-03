@@ -120,16 +120,53 @@ pub const OPEN_RESOLVERS: [&str; 10] = [
     "_OBJC_CLASS_$_NSURLConnection",
 ];
 
-/// Every import of [`OPEN_RESOLVERS`] by a Mach-O file at or under `path`
-/// (not following symlinks), as (file, symbol), as `nm -u` lists the
-/// file's imports. Files that are not Mach-O are skipped. Only static
-/// imports are seen: a framework loaded at run time is not.
+/// The first four bytes of every Mach-O format: a thin file of 32 or 64
+/// bits, and a fat (universal) file with 32-bit or 64-bit offsets, each
+/// in either byte order (`<mach-o/loader.h>`, `<mach-o/fat.h>`).
+const MACH_O_MAGICS: [[u8; 4]; 8] = [
+    [0xfe, 0xed, 0xfa, 0xce], // MH_MAGIC
+    [0xce, 0xfa, 0xed, 0xfe], // MH_CIGAM
+    [0xfe, 0xed, 0xfa, 0xcf], // MH_MAGIC_64
+    [0xcf, 0xfa, 0xed, 0xfe], // MH_CIGAM_64
+    [0xca, 0xfe, 0xba, 0xbe], // FAT_MAGIC
+    [0xbe, 0xba, 0xfe, 0xca], // FAT_CIGAM
+    [0xca, 0xfe, 0xba, 0xbf], // FAT_MAGIC_64
+    [0xbf, 0xba, 0xfe, 0xca], // FAT_CIGAM_64
+];
+
+/// Whether the regular file at `p` is Mach-O, by its first four bytes. A
+/// file shorter than that is not one.
 ///
 /// # Errors
-/// When a directory cannot be read, or `nm` fails on a Mach-O file: a
-/// file whose imports cannot be read is never taken as clean.
-pub fn open_resolver_imports(path: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+/// When the file cannot be opened or read: a file whose kind is not known
+/// is never taken as not Mach-O, and so skipped (Codex review of M2-RES1).
+fn is_mach_o(p: &std::path::Path) -> Result<bool, String> {
     use std::io::Read as _;
+    let mut file = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let mut magic = [0u8; 4];
+    let mut got = 0;
+    while got < magic.len() {
+        match file.read(&mut magic[got..]) {
+            Ok(0) => return Ok(false),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        }
+    }
+    Ok(MACH_O_MAGICS.contains(&magic))
+}
+
+/// Every import of [`OPEN_RESOLVERS`] by a Mach-O file at or under `path`
+/// (not following symlinks), as (file, symbol), as `nm -u` lists the
+/// file's imports. Mach-O is every format of [`MACH_O_MAGICS`]; other
+/// files are skipped. Only static imports are seen: a framework loaded at
+/// run time is not.
+///
+/// # Errors
+/// When a directory cannot be read, a file cannot be opened or read to
+/// tell whether it is Mach-O, or `nm` fails on a Mach-O file: a file
+/// whose imports cannot be read is never taken as clean.
+pub fn open_resolver_imports(path: &std::path::Path) -> Result<Vec<(String, String)>, String> {
     let mut found = Vec::new();
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
@@ -143,15 +180,7 @@ pub fn open_resolver_imports(path: &std::path::Path) -> Result<Vec<(String, Stri
         if !meta.is_file() {
             continue;
         }
-        let mut magic = [0u8; 4];
-        let is_macho = std::fs::File::open(&p)
-            .and_then(|mut f| f.read_exact(&mut magic))
-            .is_ok()
-            && matches!(
-                magic,
-                [0xcf, 0xfa, 0xed, 0xfe] | [0xfe, 0xed, 0xfa, 0xcf] | [0xca, 0xfe, 0xba, 0xbe]
-            );
-        if !is_macho {
+        if !is_mach_o(&p)? {
             continue;
         }
         let out = Command::new("/usr/bin/nm")
@@ -268,5 +297,76 @@ pub fn check_network() {
             );
         }
         _ => panic!("{NETWORK_VAR} is neither loopback-only nor open"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Every Mach-O format is known by its first bytes, whatever follows,
+    /// and a file that is not one, or shorter than a magic number, is
+    /// not (Codex review of M2-RES1: a fat file with 64-bit offsets, and
+    /// thin 32-bit files, were skipped as not Mach-O).
+    ///
+    /// Mutation checked: `FAT_MAGIC_64` left out of [`MACH_O_MAGICS`]:
+    /// its file is taken as not Mach-O and this fails.
+    #[test]
+    fn every_mach_o_format_is_known_by_its_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        // Written out here, apart from the guard's own table, from
+        // <mach-o/loader.h> and <mach-o/fat.h>: MH_MAGIC, MH_MAGIC_64,
+        // FAT_MAGIC and FAT_MAGIC_64, as stored big- and little-endian.
+        for magic in [0xfeed_face_u32, 0xfeed_facf, 0xcafe_babe, 0xcafe_babf]
+            .into_iter()
+            .flat_map(|m| [m.to_be_bytes(), m.to_le_bytes()])
+        {
+            let p = dir.path().join(format!("m{magic:02x?}"));
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&[0; 28]);
+            std::fs::write(&p, bytes).unwrap();
+            assert_eq!(is_mach_o(&p), Ok(true), "{magic:02x?}");
+        }
+        for (name, bytes) in [
+            ("script", b"#!/bin/sh\nexit 0\n".as_slice()),
+            ("short", &[0xca, 0xfe, 0xba]),
+            ("empty", &[]),
+            ("text", b"\xfe\xed\xfa\xcd and more"),
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            assert_eq!(is_mach_o(&p), Ok(false), "{name}");
+        }
+    }
+
+    /// A file whose first bytes cannot be read is an error, and so is a
+    /// tree that holds one: never skipped as not Mach-O (Codex review of
+    /// M2-RES1). Where this process can read a file of mode 0 anyway (as
+    /// root), the case cannot be made and is skipped with a line.
+    ///
+    /// Mutation checked: a file that cannot be opened taken as not
+    /// Mach-O, as before: the tree passes as clean and this fails.
+    #[test]
+    fn a_file_whose_kind_cannot_be_read_is_never_skipped() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("unreadable");
+        std::fs::write(&p, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&p).is_ok() {
+            eprintln!(
+                "a_file_whose_kind_cannot_be_read_is_never_skipped: a file of mode 0 opens here (root); skipped"
+            );
+            return;
+        }
+        assert!(is_mach_o(&p).is_err());
+        let refused = open_resolver_imports(dir.path());
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("unreadable")),
+            "{refused:?}"
+        );
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
