@@ -568,8 +568,8 @@ fn unknown_after_the_deadline_is_not_asked_again() {
     );
     assert_eq!(calls(&t), ["request", "poll"]);
 
-    // `approved` answered after the deadline: asked again, once, with the
-    // time left to the limit.
+    // `approved` answered after the deadline is not asked again either:
+    // the approval may have come after the deadline (review of M2-03).
     let mut t = Scripted::new(
         [
             Ok(RunAnswer::decided(pending("ABCDEFGH"))),
@@ -580,11 +580,28 @@ fn unknown_after_the_deadline_is_not_asked_again() {
     t.delays = VecDeque::from([Duration::ZERO, ms(1500)]);
     let mut c = t.clock();
     let got = wait_for_run(&mut t, &mut c, ms(1000), &mut |_| {}).unwrap();
+    assert!(
+        matches!(got, Waited::TimedOut(i) if i == id("ABCDEFGH")),
+        "{got:?}"
+    );
+    assert_eq!(calls(&t), ["request", "poll"]);
+    // Answered by the deadline, it is asked again, once, with the time
+    // left to the limit.
+    let mut t = Scripted::new(
+        [
+            Ok(RunAnswer::decided(pending("ABCDEFGH"))),
+            Ok(covered_with_a_value()),
+        ],
+        [Ok(PendingState::Approved)],
+    );
+    t.delays = VecDeque::from([Duration::ZERO, ms(750)]);
+    let mut c = t.clock();
+    let got = wait_for_run(&mut t, &mut c, ms(1000), &mut |_| {}).unwrap();
     assert!(matches!(got, Waited::Answer(_)), "{got:?}");
     assert_eq!(calls(&t), ["request", "poll", "request"]);
     assert_eq!(
         t.within.last(),
-        Some(&(ms(1750), ms(1000) + CALL_GRACE - ms(1750)))
+        Some(&(ms(1000), ms(1000) + CALL_GRACE - ms(1000)))
     );
 }
 
@@ -876,7 +893,7 @@ fn a_smaller_grace_ends_the_wait_sooner() {
         ],
         [Ok(PendingState::Approved)],
     );
-    t.delays = VecDeque::from([Duration::ZERO, ms(1000), ms(800)]);
+    t.delays = VecDeque::from([Duration::ZERO, ms(750), ms(800)]);
     let mut c = t.clock();
     let got = wait_for_run_with_grace(&mut t, &mut c, ms(1000), ms(500), &mut |_| {}).unwrap();
     assert!(matches!(got, Waited::Unanswered), "{got:?}");
@@ -1401,4 +1418,118 @@ fn five_waiters_back_off_on_busy_and_still_reach_their_outcome() {
         }
     }
     assert!(busy_seen > 0, "the noisy poller made no waiter busy");
+}
+
+/// The grace after the deadline finishes a run approved within the wait,
+/// and never starts one approved during the grace (review of M2-03,
+/// M2R-14): a poll made before the deadline and answered `approved` after
+/// it, during the grace, ends the wait timed out with no request asked;
+/// read at the deadline itself it is asked again as before.
+///
+/// Mutation checked: the `approved` arm without its deadline check, as
+/// before: the request is asked again after the deadline, the covered
+/// answer starts the command, and this fails.
+#[test]
+fn an_approval_read_after_the_deadline_starts_nothing() {
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    assert_eq!(
+        w.next(ms(1000), Event::Woke).0,
+        Action::Poll(id("ABCDEFGH"))
+    );
+    assert_eq!(
+        w.next(ms(1400), Event::Polled(Ok(PendingState::Approved)))
+            .0,
+        Action::Finish(Finish::TimedOut(id("ABCDEFGH")))
+    );
+    // The control: read at the deadline, it is asked again, and its
+    // covered answer, read in the grace, is the run's.
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    w.next(ms(1000), Event::Woke);
+    assert_eq!(
+        w.next(ms(1000), Event::Polled(Ok(PendingState::Approved)))
+            .0,
+        Action::Request
+    );
+    assert_eq!(
+        w.next(ms(1600), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::Decided)
+    );
+
+    // Through the driver: the request is answered at 750 ms, and the poll
+    // made at the 1 s deadline 650 ms later, approved; nothing more is
+    // asked.
+    let mut t = Scripted::new(
+        [
+            Ok(RunAnswer::decided(pending("ABCDEFGH"))),
+            Ok(covered_with_a_value()),
+        ],
+        [Ok(PendingState::Approved)],
+    );
+    t.delays = VecDeque::from([ms(750), ms(650)]);
+    let mut c = t.clock();
+    let got = wait_for_run_with_grace_of(&mut t, &mut c, ms(1000), ms(1000));
+    assert!(
+        matches!(got, Waited::TimedOut(i) if i == id("ABCDEFGH")),
+        "{got:?}"
+    );
+    assert_eq!(calls(&t), ["request", "poll"]);
+}
+
+/// Once a request was named, a covered answer read after the deadline is
+/// taken only for the request asked again on an approval read in time
+/// (review of M2-03, M2R-14): one asked again after `busy` just before
+/// the deadline may be covered by an approval given after it, and the
+/// wait has timed out. Before any request was named (a grant that covers
+/// the first request), and read by the deadline, a covered answer is the
+/// run's.
+///
+/// Mutation checked: no check of a covered answer read after the
+/// deadline: the re-asked request's answer starts the command and this
+/// fails.
+#[test]
+fn a_covered_answer_read_after_the_deadline_needs_an_approval_read_in_time() {
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    assert_eq!(w.next(ms(250), Event::Woke).0, Action::Poll(id("ABCDEFGH")));
+    w.next(ms(250), Event::Polled(Ok(PendingState::Pending)));
+    // `busy` from a request asked again: asked again at the deadline.
+    w.next(ms(900), Event::Answered(Err(busy())));
+    assert_eq!(w.next(ms(1000), Event::Woke).0, Action::Request);
+    assert_eq!(
+        w.next(ms(1400), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::TimedOut(id("ABCDEFGH")))
+    );
+    // Read at the deadline, the same answer is the run's.
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    w.next(Duration::ZERO, Event::Answered(Ok(&pending("ABCDEFGH"))));
+    w.next(ms(900), Event::Answered(Err(busy())));
+    w.next(ms(1000), Event::Woke);
+    assert_eq!(
+        w.next(ms(1000), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::Decided)
+    );
+    // No request named yet: a covered first answer read late is the
+    // run's (the grant was there before this wait opened any request).
+    let mut w = Wait::with_grace(Duration::ZERO, ms(1000), ms(1000));
+    w.next(Duration::ZERO, Event::Start);
+    assert_eq!(
+        w.next(ms(1500), Event::Answered(Ok(&covered()))).0,
+        Action::Finish(Finish::Decided)
+    );
+}
+
+/// [`wait_for_run_with_grace`] on `t` and `c`.
+fn wait_for_run_with_grace_of(
+    t: &mut Scripted,
+    c: &mut TestClock,
+    wait: Duration,
+    grace: Duration,
+) -> Waited {
+    envcloak_ipc::wait::wait_for_run_with_grace(t, c, wait, grace, &mut |_| {}).unwrap()
 }
