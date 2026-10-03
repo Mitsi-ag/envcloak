@@ -60,6 +60,11 @@ The CLI's failure tokens are read from every crate's `src/` (comments and
 it, never skipping one (reviews of M2-RES1: forms that were neither read
 nor refused let a reserved token through).
 
+The source readers support ASCII Rust code tokens. Non-ASCII code outside
+comments, string and character literals, and the omitted test modules is
+refused before any reader runs. Unicode text in those places is kept;
+Unicode identifiers and lifetimes are unsupported, never silently skipped.
+
 Where a failure gets its token. `Failure` is defined once, in
 crates/envcloak-client/src/fail.rs, with named fields, one of them a
 private `token` of a static string type, and with no attribute or derive
@@ -362,6 +367,14 @@ class Source:
         if tests:
             self.code = _blank_spans(self.code, tests)
             self.skel = _blank_spans(self.skel, tests)
+        unsupported = re.search(r"[^\x00-\x7f]", self.skel)
+        if unsupported:
+            line = self.skel.count("\n", 0, unsupported.start()) + 1
+            raise SourceError(
+                "%s line %d: unsupported non-ASCII Rust code; use ASCII "
+                "code tokens outside comments, literals and cfg(test) modules"
+                % (rel, line)
+            )
         # start -> (end, value); and the starts in order.
         self.strings = {}
         for start, quote, close, end, raw in strings:
