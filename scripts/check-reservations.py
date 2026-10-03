@@ -168,8 +168,13 @@ value can bring its own colon). A token in pieces is refused: a
 placeholder followed by more of a token or by another placeholder
 (`envcloak: {}{}:`), the start of a token followed by a placeholder
 (`envcloak: pty_{}:`), and a placeholder right after `envcloak`
-(`envcloak{}`), whose value could bring `: <token>:`. At the start of a
-line, `envcloak: {x}` is a usage line: it must be printed in the arm of `match parse(..)`
+(`envcloak{}`), whose value could bring `: <token>:`. A format string
+is also read with the values of its arguments the reader can read put
+in its placeholders (a literal, a constant, also one captured by name,
+`{NAME}`, a named argument, `concat!`, a conditional of those), so a
+line whose `envcloak:` or token is such an argument (`"{}: {}: x",
+"envcloak", "tok"`) is read as printed. At the start of a line,
+`envcloak: {x}` is a usage line: it must be printed in the arm of `match parse(..)`
 that binds `x` (`Err(x)`, or `E::V(x)` for an error enum `E`), with a
 free `fn parse` in its file (a method of that name is not the one
 called), and every value that `fn parse` can give as its error is read
@@ -197,10 +202,10 @@ under `crates/` (tests too) by the same walk, and the text of the files
 refuses `include!`, `#[path]`, a symbolic link to a directory or a Rust
 file, and `env!` of a variable Cargo does not set. The boundary: a line
 put together at run time from pieces is beyond what a reader of the
-source can see, among them a value printed mid-line that only the run
-knows (a count, a label), and the name `envcloak` or its colon given as
-a format argument (`"{}: {}:", program, token`, as the panic hook prints
-the program's name); review keeps failures out of such lines, and
+source can see: a value printed that only the run knows (a count, a
+label, the program's name the panic hook is given and prints as
+`{program}:`), and a line printed in more than one call (`eprint!` then
+`eprintln!`); review keeps failures out of such lines, and
 `Failure::report` prints each one whole.
 Within these forms the reader over-counts rather than under-counts: a
 string it takes for a token that is not printed makes a `reserved` row
@@ -1824,7 +1829,15 @@ def code_exit_tokens(root):
         for at in r.fields:
             field_reads.setdefault(src.rel, set()).add(at)
 
-    ctx = Context(sources, fns, consts, bad, read, take)
+    def quiet_values(src, a, b):
+        """The values the expression at [a, b) can have, or None when the
+        reader cannot read it (nothing is refused or recorded)."""
+        try:
+            return values_of(src, a, b, Reading(consts, bad=bad))
+        except Unreadable:
+            return None
+
+    ctx = Context(sources, fns, consts, bad, read, take, quiet_values)
     alias = "|".join(map(re.escape, sorted(names)))
     helper_word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(helpers)))) if helpers else None
     literal_of = re.compile(r"(?<![\w:])(?:%s\s*::\s*)*(%s|Self)(?:\s*::\s*<[^<>()]*>)?\s*\{" % (IDENT, alias))
@@ -1956,6 +1969,9 @@ def code_exit_tokens(root):
         for start, lit in src.texts(0, len(src.skel)):
             for m in PRINTED_TOKEN.finditer(lit):
                 take([m.group(1)], src)
+            for line in expand_format(src, start, lit, ctx):
+                for m in PRINTED_TOKEN.finditer(line):
+                    take([m.group(1)], src)
             for m in PIECES.finditer(lit):
                 raise SourceError("%s line %d: a line printed as `envcloak: <token>:` whose token, or the colon after `envcloak`, comes in pieces (`%s`): print a whole token in one place" % (src.rel, src.skel.count("\n", 0, start) + 1, m.group(0)))
             starts = [0] + [i + 1 for i, ch in enumerate(lit) if ch in "\n\r"]
@@ -2016,13 +2032,14 @@ class Context:
     `fn` items, the constants (and the names that cannot be read), and
     the functions that read a token argument and take a token."""
 
-    def __init__(self, sources, fns, consts, bad, read, take):
+    def __init__(self, sources, fns, consts, bad, read, take, values=None):
         self.sources = sources
         self.fns = fns
         self.consts = consts
         self.bad = bad
         self.read = read
         self.take = take
+        self.values = values
 
 
 def implicit_args(text):
@@ -2036,6 +2053,89 @@ def implicit_args(text):
         arg, _, spec = m.group(1).partition(":")
         n += (not arg.strip()) + (".*" in spec)
     return n
+
+
+def format_arguments(src, start):
+    """The arguments after the string that starts at `start`, in the
+    brackets it is an argument in (a format macro's): (positional spans,
+    {name: span} of the named ones); None when it is in no brackets."""
+    depth, k = 0, start - 1
+    while k >= 0:
+        ch = src.skel[k]
+        if ch in ")]}":
+            depth += 1
+        elif ch in "([{":
+            if depth == 0:
+                break
+            depth -= 1
+        k -= 1
+    if k < 0 or src.skel[k] not in "([{":
+        return None
+    args = src.split_top(k + 1, src.close_of(k))
+    here = [i for i, (x, y, _) in enumerate(args) if x <= start < y]
+    rest = args[here[0] + 1:] if here else []
+    positional = [(x, y) for x, y, t in rest if not re.match(r"\s*%s\s*=(?!=)" % IDENT, t)]
+    named = {re.match(r"\s*(%s)" % IDENT, t).group(1): (x + t.index("=") + 1, y)
+             for x, y, t in rest if re.match(r"\s*%s\s*=(?!=)" % IDENT, t)}
+    return positional, named
+
+
+# Stands for a value the reader cannot read where a line is put together:
+# no token or name holds it.
+UNREAD = "\x00"
+# The most lines one format string is read as, its readable arguments'
+# values put in every way.
+MAX_LINES = 256
+
+
+def expand_format(src, start, lit, ctx):
+    """The lines the format string `lit` (at `start`) prints with the
+    values of its arguments the reader can read put in its placeholders
+    (a literal, a constant, `concat!`, a conditional of those; a constant
+    captured by name, `{NAME}`), every other one as `UNREAD`; [] when `lit`
+    has no placeholder, is no macro's argument, or neither it nor a value
+    holds `envcloak`. So a line whose `envcloak:`, or whose token, is a
+    format argument the source holds (`"{}: {}: x", "envcloak", "tok"`)
+    is read as printed (the class of the verifier's review of M2-RES1:
+    a line made of pieces the reader could see)."""
+    marks = list(re.finditer(r"\{\{|\}\}|\{([^{}]*)\}", lit))
+    if not any(m.group(1) is not None for m in marks):
+        return []
+    found = format_arguments(src, start)
+    if found is None:
+        return []
+    positional, named = found
+    pieces, last, implicit = [], 0, 0
+    for m in marks:
+        pieces.append([lit[last:m.start()]])
+        last = m.end()
+        if m.group(1) is None:
+            pieces.append([m.group(0)[0]])
+            continue
+        name, _, spec = m.group(1).partition(":")
+        name = name.strip()
+        values = None
+        # A precision `.*` takes an argument of its own before the value.
+        implicit += ".*" in spec
+        if name == "" or name.isdigit():
+            i = int(name) if name else implicit
+            implicit += name == ""
+            if i < len(positional):
+                values = ctx.values(src, *positional[i])
+        elif name in named:
+            values = ctx.values(src, *named[name])
+        elif name in ctx.consts and name not in ctx.bad:
+            values = sorted(ctx.consts[name])
+        pieces.append(values or [UNREAD])
+    pieces.append([lit[last:]])
+    if "envcloak" not in "".join(v for p in pieces for v in p):
+        return []
+    lines = [""]
+    for p in pieces:
+        lines = [a + b for a in lines for b in p]
+        if len(lines) > MAX_LINES:
+            raise SourceError("%s line %d: a format string whose arguments the reader reads as more than %d lines; print fewer pieces" % (src.rel, src.skel.count("\n", 0, start) + 1, MAX_LINES))
+    return lines
 
 
 def printed_placeholder(src, start, lit, at, line_start, ctx):
@@ -2059,24 +2159,10 @@ def printed_placeholder(src, start, lit, at, line_start, ctx):
     if "*" in spec or "$" in spec:
         raise SourceError("%s: a line printed as `envcloak: {%s%s}` the reader cannot read" % (where, name, spec))
     # The format macro's arguments after the string.
-    depth, k = 0, start - 1
-    while k >= 0:
-        ch = src.skel[k]
-        if ch in ")]}":
-            depth += 1
-        elif ch in "([{":
-            if depth == 0:
-                break
-            depth -= 1
-        k -= 1
-    if k < 0 or src.skel[k] not in "([{":
+    found = format_arguments(src, start)
+    if found is None:
         raise SourceError("%s: a line printed as `envcloak: {...}` outside a format macro's arguments" % where)
-    args = src.split_top(k + 1, src.close_of(k))
-    here = [i for i, (x, y, _) in enumerate(args) if x <= start < y]
-    rest = args[here[0] + 1:] if here else []
-    positional = [(x, y) for x, y, t in rest if not re.match(r"\s*%s\s*=(?!=)" % IDENT, t)]
-    named = {re.match(r"\s*(%s)" % IDENT, t).group(1): (x + t.index("=") + 1, y)
-             for x, y, t in rest if re.match(r"\s*%s\s*=(?!=)" % IDENT, t)}
+    positional, named = found
     if name == "" or name.isdigit():
         # An implicit placeholder takes the next positional argument after
         # those the placeholders before it in the string took.
