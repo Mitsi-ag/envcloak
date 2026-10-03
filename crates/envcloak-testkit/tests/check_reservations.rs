@@ -1158,3 +1158,165 @@ fn a_failure_token_in_a_raw_string_or_with_an_escape_counts() {
         );
     }
 }
+
+/// An arm whose value goes on past its literal is refused, never read as
+/// the literal (review M2R-1): `-32602 + 1` is `MethodNotFound`'s code,
+/// and `"invalid_params".split_at(8).1` is `params`, yet the reader took
+/// the leading literal of each and passed.
+///
+/// Mutation checked: the reader taking the leading literal as before (no
+/// check of what follows it): both copies pass and this fails.
+#[test]
+fn an_arm_whose_value_goes_on_past_its_literal_fails() {
+    for (from, to, expect) in [
+        (
+            "ErrorKind::InvalidParams => -32602,",
+            "ErrorKind::InvalidParams => -32602 + 1,",
+            "`fn code` gives `ErrorKind::InvalidParams` an expression the reader cannot read (`-32602 + 1",
+        ),
+        (
+            "ErrorKind::InvalidParams => \"invalid_params\",",
+            "ErrorKind::InvalidParams => \"invalid_params\".split_at(8).1,",
+            "`fn token` gives `ErrorKind::InvalidParams` an expression the reader cannot read (`\"invalid_params\".split_at(8).1",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, PROTO, from, to);
+        assert_fails(&t, expect);
+    }
+    // The same arm with only its literal, a comment or the match's end
+    // after it, passes.
+    let t = fixture();
+    edit(
+        &t,
+        PROTO,
+        "ErrorKind::InvalidParams => -32602,",
+        "ErrorKind::InvalidParams => -32602, // the JSON-RPC code",
+    );
+    assert_passes(&t.home());
+}
+
+/// Failure tokens in the forms the reader skipped (review M2R-2, M2R-3):
+/// `concat!` of literals is read joined, an inline `const` block and each
+/// branch of a conditional by their literals, and `Fail::new` (the
+/// client's public alias of `Failure`) and an alias of it made with
+/// `use ... as` or `type` like `Failure::new`. A reserved token in any of
+/// them is refused, and so is an unreserved one.
+///
+/// Mutation checked: the reader taking only `Failure::new` and only a
+/// lone literal or constant as before: each copy passes and this fails.
+#[test]
+fn failure_tokens_in_every_form_the_code_can_write_count() {
+    for body in [
+        "pub fn a() -> Failure { Failure::new(concat!(\"pty_\", \"unavailable\"), \"refused\") }\n",
+        "pub fn a() -> Failure { Failure::new(const { \"pty_unavailable\" }, \"refused\") }\n",
+        "pub fn a() -> Failure { Failure::new(if true { \"io\" } else { \"pty_unavailable\" }, \"x\") }\n",
+        "pub fn a() -> crate::Fail { crate::Fail::new(\"pty_unavailable\", \"refused\") }\n",
+        "pub fn a() -> Fail { envcloak_client::Fail::new(\"pty_unavailable\", \"refused\") }\n",
+        "use crate::fail::Failure as Oops;\npub fn a() -> Oops { Oops::new(\"pty_unavailable\", \"x\") }\n",
+        "type Bad = crate::Fail;\npub fn a() -> Bad { Bad::new(\"pty_unavailable\", \"x\") }\n",
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(
+            &t,
+            &format!("`pty_unavailable` is reserved, but the code already has it ({CLIENT_STUB})"),
+        );
+    }
+    for body in [
+        "pub fn a() -> Failure { Failure::new(concat!(\"zz_\", \"unreserved\"), \"x\") }\n",
+        "pub fn a() -> crate::Fail { crate::Fail::new(\"zz_unreserved\", \"x\") }\n",
+        "pub fn a() -> Failure { Failure::new(if true { \"io\" } else { \"zz_unreserved\" }, \"x\") }\n",
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(
+            &t,
+            &format!(
+                "`exit_token`: the code has `zz_unreserved` ({CLIENT_STUB}), which no `landed` row reserves"
+            ),
+        );
+    }
+}
+
+/// A token argument the reader cannot read is refused, never skipped: a
+/// local variable, a constant it does not know, `concat!` of anything but
+/// literals, and another macro. The enclosing function's own `token`
+/// parameter and another value's `.token()` are read where their values
+/// are (the helper's callers, the `fn token` bodies), and pass.
+#[test]
+fn a_failure_token_the_reader_cannot_read_fails() {
+    for (body, expect) in [
+        (
+            "pub fn a(t: &'static str) -> Failure { Failure::new(t, \"x\") }\n",
+            "a failure token the reader cannot read (`t`)",
+        ),
+        (
+            "pub fn a() -> Failure { Failure::new(UNKNOWN_TOKEN, \"x\") }\n",
+            "a failure token names `UNKNOWN_TOKEN`, which is no `&str` constant the reader knows",
+        ),
+        (
+            "pub fn a(x: &'static str) -> Failure { Failure::new(concat!(\"pty_\", x), \"x\") }\n",
+            "a failure token in `concat!` of something other than string literals",
+        ),
+        (
+            "pub fn a() -> Failure { Failure::new(stringify!(pty_unavailable), \"x\") }\n",
+            "a macro other than `concat!` of literals",
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(&t, expect);
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn stub_refuse(token: &'static str) -> Failure { Failure::new(token, \"x\") }\n\
+         pub fn stub_again(e: &crate::fail::Failure) -> Failure { Failure::new(e.token(), \"x\") }\n",
+    );
+    assert_passes(&t.home());
+}
+
+/// A table with no code reader takes no `landed` row (review M2R-7): the
+/// row would be accepted with no code behind it.
+///
+/// Mutation checked: `landed` accepted in such a table as before: the
+/// copy passes and this fails.
+#[test]
+fn a_landed_row_in_a_table_without_a_reader_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `active` | state | M2-09 | reserved |",
+        "| `active` | state | M2-09 | landed |",
+    );
+    assert_fails(
+        &t,
+        "`coverage`: `active` is `landed`, but this table has no code reader to check it against: add its reader first",
+    );
+}
+
+/// A failure token is accounted for only by a row of a table whose tokens
+/// the failure-token reader takes (the printed tables and the audit
+/// kinds), never by a row of an unrelated table (review M2R-7): an MCP
+/// tool's name is not a failure token's reservation.
+///
+/// Mutation checked: `elsewhere` taking every table's rows as before: the
+/// copy passes and this fails.
+#[test]
+fn a_failure_token_covered_only_by_an_unrelated_table_fails() {
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn a() -> Failure { Failure::new(\"list_secrets\", \"x\") }\n",
+    );
+    assert_fails(
+        &t,
+        &format!(
+            "`exit_token`: the code has `list_secrets` ({CLIENT_STUB}), which no `landed` row reserves"
+        ),
+    );
+}
