@@ -430,8 +430,20 @@ fn a_waiting_run_holds_no_connection_between_polls() {
     assert_eq!(out.status.code(), Some(125), "{e}");
     assert_eq!(required(&e).len(), 1, "{e}");
     assert_eq!(e.lines().count(), 1, "{e}");
-    let log = f.d.log();
     let tag = format!("pid={pid}");
+    // A connection's closing is logged when the daemon's thread for it
+    // ends, which can be after the run exited: wait, with a deadline, for
+    // as many closings as openings (F-80). One that never comes fails
+    // the count below.
+    let log = f.d.log_when(Duration::from_secs(30), |log| {
+        let mine = |what: &str| {
+            log.lines()
+                .filter(|l| l.starts_with("envcloakd: test: ") && l.split(' ').any(|w| w == tag))
+                .filter(|l| l.contains(what))
+                .count()
+        };
+        mine("connection opened") == mine("connection closed")
+    });
     let mine: Vec<&str> = log
         .lines()
         .filter(|l| l.starts_with("envcloakd: test: ") && l.split(' ').any(|w| w == tag))
