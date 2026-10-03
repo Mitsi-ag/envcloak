@@ -685,7 +685,7 @@ fn try_register(
     }
     w.state.mcp.insert(host.to_owned(), entry.clone());
     Ok(Outcome::Changed {
-        created: current.is_none(),
+        created: file.is_none(),
         backup,
     })
 }
