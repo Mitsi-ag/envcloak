@@ -42,8 +42,11 @@ octal or binary, with `_` separators and a type suffix), and a variant
 without a number, with a number that is not an integer literal, or that is
 not a unit variant is an error; every `AuditKind` and `ErrorKind` variant
 has exactly one arm `Enum::Name => <value>` (or, in the enum's own `impl`,
-`Self::Name`) in `fn token` and `fn code`, and a variant without one the
-reader can read is an error; every `impl Method for` block in the
+`Self::Name`) in `fn token` and `fn code`, whose whole expression is the
+value (one string literal, or one integer literal), and a variant without
+one the reader can read is an error, as is an arm whose value goes on
+past the literal (`-32602 + 1`, `"invalid_params".split_at(8).1`); every
+`impl Method for` block in the
 `envcloak-ipc` crate holds exactly one `const NAME` whose value is one
 string literal, and a `const NAME` of another form or elsewhere is an
 error; every entry of `REASONS` is one string literal; every MCP tool is
@@ -53,18 +56,30 @@ String literals are read in every form Rust has (plain, raw, byte and C
 strings), with their escapes decoded.
 
 The CLI's failure tokens are read from every crate's `src/` (comments and
-`#[cfg(test)]` modules left out): the first argument of `Failure::new` and
-of every function whose first parameter is `token: &'static str` (or
-`ExitToken`), every `token: <value>` field, every string in the body of a
-`fn token`, and the `<token>` of every string literal that starts
-`envcloak: <token>:` (a line printed directly, as `eprintln!` does for
-`coverage`, `warning` and `usage`), whatever crate it is in. A value
-written as a `&str` constant counts by the constant's string. The reader
-over-counts rather than under-counts: a string it takes for a token that
-is not printed makes a `reserved` row with that name fail, which is a
-name to avoid anyway, and a new one needs a `landed` row like any token.
-It also takes the tokens of audit kinds, error kinds and reasons, so a
-`landed` or `reuse` row in any table accounts for a failure token.
+`#[cfg(test)]` modules left out): the first argument of `Failure::new`, of
+`<alias>::new` for every name `Failure` is imported or defined as
+(`use ... Failure as Fail`, `pub use ... as X`, `type X = Failure;`, and
+aliases of those), and of every function whose first parameter is `token:
+&'static str` (or `ExitToken`); every `token: <value>` field, every string
+in the body of a `fn token`, and the `<token>` of every string literal
+that starts `envcloak: <token>:` (a line printed directly, as `eprintln!`
+does for `coverage`, `warning` and `usage`), whatever crate it is in. A
+first argument is one string literal, a `&str` constant by name, `concat!`
+of string literals (read joined), another value's `.token()` (read from
+the `fn token` bodies), or the enclosing function's own `token`
+parameter (read at its callers); any other expression counts by every
+string literal and every `&str` constant in it (a conditional's every
+branch), and one in which the reader finds neither, or a macro other than
+`concat!` of literals, is an error, never skipped. The reader over-counts
+rather than under-counts: a string it takes for a token that is not
+printed makes a `reserved` row with that name fail, which is a name to
+avoid anyway, and a new one needs a `landed` row like any token. It also
+takes the tokens of audit kinds, error kinds and reasons, so a `landed`
+or `reuse` row in one of the tables printed as `envcloak: <token>`, or in
+the audit-kind table, accounts for a failure token; a row in any other
+table does not. A table with no code reader yet (the coverage tokens,
+control messages, fields, sign-in tokens and policy kinds) takes no
+`landed` row: the task that lands one adds its reader first.
 
 Usage: scripts/check-reservations.py [--root <repository root>]
 Prints "check-reservations: ok" and exits 0, or names every problem on
@@ -476,6 +491,12 @@ def enum_arms(src, enum, fn, value, convert=lambda x: x):
             x = convert(m.group(2))
             if x is None:
                 raise SourceError("%s: `fn %s` gives `%s` a value the reader cannot read (`%s`)" % (src.rel, fn, m.group(1), m.group(2)))
+            # The literal is the arm's whole expression: what follows it is
+            # the arm's end, never more of the value (review M2R-1).
+            after = src.skel[m.end():end].lstrip()
+            if not after or after[0] not in ",}":
+                value = src.code[m.start() + m.group(0).index("=>") + 2:m.end() + 20]
+                raise SourceError("%s: `fn %s` gives `%s` an expression the reader cannot read (`%s`): an arm's value is one literal" % (src.rel, fn, " ".join(m.group(1).split()), " ".join(value.split())))
             for v in re.findall(r"(?:%s|Self)::([A-Z][A-Za-z0-9]*)" % enum, m.group(1)):
                 pairs.append((v, x))
     by_variant, by_value = {}, {}
@@ -591,6 +612,44 @@ CONST_DEF = re.compile(r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*%s\s*=" % STR_TYPE)
 HELPER_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)\s*(?:<[^>]*>)?\s*\(\s*token\s*:\s*(?:&\s*'static\s+str|ExitToken)\b")
 CONST_REF = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)$")
 PRINTED_PREFIX = re.compile(r"envcloak: ([a-z][a-z0-9_]*):")
+# `use ... X as Y` (in a group too) and `type Y = ...::X;`: Y names X.
+ALIAS_USE = re.compile(r"\b([A-Z][A-Za-z0-9_]*)\s+as\s+([A-Z][A-Za-z0-9_]*)\b")
+ALIAS_TYPE = re.compile(r"\btype\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Za-z0-9_]*)\s*;")
+FN_HEAD = re.compile(r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:<[^>{;]*>)?\s*\(")
+TOKEN_METHOD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.token\(\s*\)")
+CONCAT = re.compile(r"(?:(?:::)?(?:std|core)::)?concat\s*!\s*\(")
+MACRO = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*!\s*[\(\[\{]")
+
+
+def failure_names(sources):
+    """`Failure` and every name it is imported or defined as, aliases of
+    aliases included."""
+    names = {"Failure"}
+    pairs = []
+    for src in sources:
+        pairs += [(m.group(1), m.group(2)) for m in ALIAS_USE.finditer(src.skel)]
+        pairs += [(m.group(2), m.group(1)) for m in ALIAS_TYPE.finditer(src.skel)]
+    grew = True
+    while grew:
+        grew = False
+        for orig, alias in pairs:
+            if orig in names and alias not in names:
+                names.add(alias)
+                grew = True
+    return names
+
+
+def token_param_spans(src):
+    """The bodies of the functions whose parameters include `token`."""
+    spans = []
+    for m in FN_HEAD.finditer(src.skel):
+        close = src.close_of(m.end() - 1)
+        if not re.search(r"\btoken\s*:", src.skel[m.end():close]):
+            continue
+        k = BODY_OR_END.search(src.skel, close)
+        if k and k.group(0) == "{":
+            spans.append((k.start(), src.block_end(k.start())))
+    return spans
 
 
 def code_exit_tokens(root):
@@ -614,8 +673,8 @@ def code_exit_tokens(root):
             found.setdefault(value, src.rel)
 
     def take(src, a, b):
-        """The argument or field value at [a, b): a string literal of any
-        form, or a constant by name."""
+        """The field value at [a, b): a string literal of any form, or a
+        constant by name."""
         value = src.only_string(a, b)
         if value is not None:
             take_value(value, src)
@@ -624,11 +683,56 @@ def code_exit_tokens(root):
         for v in consts.get(m.group(1), ()) if m else ():
             take_value(v, src)
 
-    calls = [r"\bFailure::new\s*\("] + [r"(?<!\w)(?<!fn )%s\s*\(" % re.escape(h) for h in sorted(helpers)]
+    def take_token_arg(src, a, b, own_param):
+        """The token argument at [a, b) of a failure constructor or token
+        helper (see the module comment); one it cannot read is an error."""
+        text = " ".join(src.skel[a:b].split())
+        where = "%s line %d" % (src.rel, src.skel.count("\n", 0, a) + 1)
+        value = src.only_string(a, b)
+        if value is not None:
+            take_value(value, src)
+            return
+        m = CONST_REF.match(text)
+        if m:
+            if m.group(1) not in consts:
+                raise SourceError("%s: a failure token names `%s`, which is no `&str` constant the reader knows" % (where, text[:60]))
+            for v in consts[m.group(1)]:
+                take_value(v, src)
+            return
+        if text == "token" and own_param:
+            return
+        if TOKEN_METHOD.fullmatch(text):
+            return
+        lead = len(src.skel[a:b]) - len(src.skel[a:b].lstrip())
+        c = CONCAT.match(src.skel, a + lead)
+        if c:
+            close = src.close_of(c.end() - 1)
+            if src.skel[close + 1:b].strip():
+                raise SourceError("%s: a failure token the reader cannot read (`%s`)" % (where, text[:60]))
+            parts = [src.only_string(x, y) for x, y, _ in src.split_top(c.end(), close)]
+            if not parts or any(p is None for p in parts):
+                raise SourceError("%s: a failure token in `concat!` of something other than string literals (`%s`)" % (where, text[:60]))
+            take_value("".join(parts), src)
+            return
+        if MACRO.search(src.skel, a, b):
+            raise SourceError("%s: a failure token the reader cannot read (`%s`): a macro other than `concat!` of literals" % (where, text[:60]))
+        values = list(src.literals(a, b))
+        for ident in re.findall(r"\b[A-Z][A-Z0-9_]*\b", src.skel[a:b]):
+            values += sorted(consts.get(ident, ()))
+        if not values:
+            raise SourceError("%s: a failure token the reader cannot read (`%s`): write one string literal, a `&str` constant or `concat!` of literals" % (where, text[:60]))
+        for v in values:
+            take_value(v, src)
+
+    ctors = sorted(failure_names(sources))
+    calls = [r"(?<![\w:])(?:[A-Za-z_][A-Za-z0-9_]*::)*(?:%s)::new\s*\(" % "|".join(map(re.escape, ctors))]
+    calls += [r"(?<!\w)(?<!fn )%s\s*\(" % re.escape(h) for h in sorted(helpers)]
     call = re.compile("|".join(calls))
     for src in sources:
+        own = token_param_spans(src)
         for m in call.finditer(src.skel):
-            take(src, *src.first_arg(m.end() - 1))
+            a, b = src.first_arg(m.end() - 1)
+            take_token_arg(src, a, b, any(x < m.start() < y for x, y in own))
         for m in re.finditer(r"\btoken\s*:\s*", src.skel):
             k = m.end()
             lit = src.string_at(k)
@@ -912,15 +1016,16 @@ def check_code(reg, rows, code, base, elsewhere):
     """Checks one table against the code: each row as its status says, and,
     with `base` (the registry's baseline), each code entry as one the code
     held before the reservations or one a `landed` or `reuse` row accounts
-    for. `elsewhere` holds the names a `landed` or `reuse` row of any table
-    accounts for, which also account for a failure token, since that reader
-    also takes the tokens of audit kinds, error kinds and reasons."""
+    for. `elsewhere` holds the names a `landed` or `reuse` row of a printed
+    table or the audit-kind table accounts for, which also account for a
+    failure token, since that reader also takes the tokens of audit kinds,
+    error kinds and reasons."""
     spec = REGISTRIES[reg]
     where = "%s `%s`" % (spec["doc"], reg)
     if code is None:
         for key, _, status, _ in rows:
-            if status == "reuse":
-                fail("%s: `%s` is `reuse`, but this table has no code source to check it against" % (where, key))
+            if status in ("reuse", "landed"):
+                fail("%s: `%s` is `%s`, but this table has no code reader to check it against: add its reader first" % (where, key, status))
         return
     if isinstance(code, SourceError):
         fail("%s: %s" % (where, code))
@@ -1011,7 +1116,16 @@ def main(argv):
     except SourceError as e:
         fail(str(e))
         baseline = {}
-    elsewhere = {k for rows in checked.values() for k, _, s, _ in rows if s in ("landed", "reuse")}
+    # Only the tables whose tokens the failure-token reader takes account
+    # for a failure token: the ones printed as `envcloak: <token>`, and
+    # the audit kinds (their `fn token`).
+    elsewhere = {
+        k
+        for reg, rows in checked.items()
+        if reg in PRINTED or reg == "audit_kind"
+        for k, _, s, _ in rows
+        if s in ("landed", "reuse")
+    }
     codes = read_code(root)
     for reg, rows in checked.items():
         check_code(reg, rows, codes[reg], baseline.get(reg), elsewhere)
