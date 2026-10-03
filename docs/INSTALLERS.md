@@ -62,7 +62,7 @@ macOS: Claude Code's allowance needs no consent (one socket, SPEC §7); Codex's 
 
 The same bytes in every file (so hosts that read several can tell the copies are one), between the lines `<!-- envcloak:begin -->` and `<!-- envcloak:end -->`, which Claude Code strips from context; the instructions are never inside an HTML comment. Its text (`envcloak_agents::blocks::INSTRUCTIONS`) names only commands this build ships (`run`, `ls`, `ref`, `add`, `init`) and never `--ask`, which comes with the app (M3; D-20). It is worded for any agent: it never says a hook will stop anything, since some hosts that read these files run no hook.
 
-A file is refused, and reported, when it is not UTF-8, when its markers are repeated, unpaired, out of order or not lines of their own, and when it ends inside an open HTML comment or code fence (the block would be hidden there). An older block is replaced in place.
+A file is refused, and reported, when it is not UTF-8, when its markers are repeated, unpaired, out of order or not lines of their own, and when the block would be inside an open HTML comment or code fence (hidden there): a file that ends inside one, or a block already there inside one, even one exactly as it should be (`inside_comment`). A fence closes only with its own character (backticks or tildes), at least as many of them and nothing after but white space, as CommonMark reads it. A block of an earlier EnvCloak version is replaced in place; a block whose text between the markers is not one EnvCloak wrote (the person edited it) is neither replaced by install nor taken out by uninstall (`block_modified`): that text may be theirs.
 
 ## How a file is changed
 
