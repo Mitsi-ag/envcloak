@@ -75,6 +75,7 @@ use crate::vault::{
     Vault, VaultError, VaultErrorKind, VaultPaths, check_private_dir, open_private_child,
     open_record, remove_temp, seal_record, set_aside, sync_dir, utc_stamp, with_suffix,
 };
+use crate::written::{Counted, Written};
 
 /// The extension of backup files.
 pub const BACKUP_EXTENSION: &str = "ecbackup";
@@ -169,12 +170,14 @@ impl Vault {
     /// puts another file under its temporary name there.
     ///
     /// A link takes whatever has the temporary name at that moment, so the
-    /// backup's name is then opened (never through a symlink) and compared
-    /// by device and inode with the file written: another file put under
-    /// the temporary name fails the backup
-    /// ([`VaultErrorKind::Substituted`]), never answered as written, so
-    /// nothing is removed on the strength of it (`envcloak rm` removes an
-    /// item only once its backup is written).
+    /// backup's name is then opened (never through a symlink), compared by
+    /// device and inode with the file written, and read back whole: it
+    /// must hold exactly the bytes written to it, their length and
+    /// SHA-256, its stamp unchanged while it is read. Another file put
+    /// under the temporary name, or the file written into in place or cut,
+    /// fails the backup ([`VaultErrorKind::Substituted`]), never answered
+    /// as written, so nothing is removed on the strength of it (`envcloak
+    /// rm` removes an item only once its backup is written).
     fn create_backup_observed(&self, written: &mut dyn FnMut()) -> Result<BackupInfo, VaultError> {
         let header = self.header()?;
         let envelopes: Vec<&Envelope> = self
@@ -228,17 +231,17 @@ impl Vault {
         // A link takes whatever has the temporary name at that moment: the
         // backup is answered as written only when its name holds the file
         // written.
-        let linked = made.and_then(|file| {
+        let linked = made.and_then(|(file, wrote)| {
             use std::os::unix::fs::MetadataExt;
             written();
             link_beneath(&dir, tmp_os, name_os)?;
             let named = open_beneath(&dir, name_os)
                 .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?;
-            let (ours, named) = (file.metadata()?, named.metadata()?);
-            if (ours.dev(), ours.ino()) != (named.dev(), named.ino()) {
+            let (ours, theirs) = (file.metadata()?, named.metadata()?);
+            if (ours.dev(), ours.ino()) != (theirs.dev(), theirs.ino()) || !wrote.held_by(&named)? {
                 return Err(VaultError::from(VaultErrorKind::Substituted));
             }
-            Ok(ours.len())
+            Ok(wrote.len)
         });
         let removed = match unlink_beneath(&dir, tmp_os) {
             Ok(()) => Ok(()),
@@ -790,7 +793,8 @@ impl Cursor<'_> {
 }
 
 /// Writes the backup to the new file `tmp` in `dir` (`O_EXCL`, never
-/// through a symlink, 0600) and flushes it. Returns it, open.
+/// through a symlink, 0600) and flushes it. Returns it, open, with the
+/// length and SHA-256 of every byte written to it.
 fn write_backup(
     dir: &File,
     tmp: &std::ffi::OsStr,
@@ -799,20 +803,21 @@ fn write_backup(
     image: &[u8],
     k: &SubKey,
     ctx: &BackupCtx,
-) -> Result<File, VaultError> {
+) -> Result<(File, Written), VaultError> {
     let file = envcloak_sys::create_beneath(dir, tmp, 0o600)?;
-    let mut w = BufWriter::new(file);
+    let mut w = BufWriter::new(Counted::new(file));
     w.write_all(head)?;
     write_record(&mut w, &seal_record(k, &ctx.aad(0), &manifest.encode())?)?;
     for (i, chunk) in image.chunks(BACKUP_CHUNK).enumerate() {
         let sealed = seal_record(k, &ctx.aad(i as u64 + 1), chunk)?;
         write_record(&mut w, &sealed)?;
     }
-    let file = w
+    let (file, written) = w
         .into_inner()
-        .map_err(|e| VaultError::from(e.into_error()))?;
+        .map_err(|e| VaultError::from(e.into_error()))?
+        .finish();
     envcloak_sys::sync_file(&file)?;
-    Ok(file)
+    Ok((file, written))
 }
 
 fn write_record(w: &mut impl Write, sealed: &[u8]) -> Result<(), VaultError> {
@@ -1160,6 +1165,60 @@ mod tests {
         }
     }
 
+    /// A backup is answered as written only while its name holds exactly
+    /// the bytes written (Codex, M2-05 round 11, the class of the v2
+    /// commit's check of `data`): once the new file is flushed, before it
+    /// is linked, it is written into in place (one byte, its modification
+    /// time put back) or cut by its last byte. The backup fails
+    /// (`Substituted`), never answered as written, so `envcloak rm` removes
+    /// nothing on the strength of it; untouched, it is written.
+    #[test]
+    fn a_backup_written_into_before_its_link_is_never_answered_as_written() {
+        use std::os::unix::fs::FileExt;
+        for how in ["written into", "cut", "untouched"] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = VaultPaths::under(dir.path().join("data"));
+            let pass = SecretBytes::copy_from(b"a unit test passphrase, not a secret");
+            let (v, _) = crate::unlock::create_vault(&p, &pass, KdfParams::minimum()).unwrap();
+            let backups = p.backups_dir.clone();
+            let mut did = 0;
+            let got = v.create_backup_observed(&mut || {
+                let temp = std::fs::read_dir(&backups)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().into_string().unwrap())
+                    .find(|n| n.starts_with(".vault-") && n.ends_with(".tmp"))
+                    .unwrap();
+                let q = backups.join(temp);
+                let w = std::fs::OpenOptions::new().write(true).open(&q).unwrap();
+                let len = w.metadata().unwrap().len();
+                match how {
+                    "cut" => w.set_len(len - 1).unwrap(),
+                    "written into" => {
+                        let modified = w.metadata().unwrap().modified().unwrap();
+                        let mut byte = [0u8];
+                        File::open(&q)
+                            .unwrap()
+                            .read_exact_at(&mut byte, len - 1)
+                            .unwrap();
+                        w.write_all_at(&[byte[0] ^ 1], len - 1).unwrap();
+                        w.set_modified(modified).unwrap();
+                    }
+                    _ => {}
+                }
+                did += 1;
+            });
+            assert_eq!(did, 1, "{how}");
+            if how == "untouched" {
+                got.unwrap();
+                continue;
+            }
+            assert_eq!(
+                got.map(drop).map_err(|e| e.kind()),
+                Err(VaultErrorKind::Substituted),
+                "{how}: a backup answered as written for bytes it did not write"
+            );
+        }
+    }
     fn no_change(_: &crate::vault::MigrationTx<'_>) -> Result<(), VaultError> {
         Ok(())
     }
