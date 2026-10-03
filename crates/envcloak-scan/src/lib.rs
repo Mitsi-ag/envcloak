@@ -51,7 +51,7 @@ pub use dotenv::{
 };
 pub use restore::{
     BackedUpFile, restore_file, restore_over, restore_over_left, restore_over_left_observed,
-    rewrite_observed,
+    restore_over_observed, rewrite_observed,
 };
 pub use root::{FileStamp, ScanError, ScanErrorKind, ScanRoot, open_root, read_capped, read_plain};
 pub use walk::{

@@ -948,6 +948,10 @@ fn path_reason(token: &str) -> String {
              put its own file there, meanwhile, so it was kept as it is: it may be that program's"
         }
         "exists" => "a file is there that is not what the deletion left, and is left as it is",
+        "swap_unsupported" => {
+            "its file system cannot swap two names in one step, so it was left as it is rather \
+             than renamed over unchecked"
+        }
         "deleted_since" => {
             "the deletion rewrote it and it was deleted since, so it is left deleted: writing it \
              back would bring back what was deleted"

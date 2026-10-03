@@ -9,9 +9,13 @@
 //!   free), from the bytes the daemon handed back after a proof. It never
 //!   replaces a file: one that exists stays as it is.
 //! - [`restore_over`] puts the original back over the file a deletion
-//!   rewrote, as [`crate::replace_atomically`] replaces one, only while it
-//!   is still the file read (the caller checked it is exactly that
-//!   rewrite, by the SHA-256 the backup recorded of it, F-78).
+//!   rewrote, only while that file is exactly what the deletion left, by
+//!   the SHA-256 the backup recorded of it (F-78), checked as
+//!   [`restore_over_left`] checks a backup v2's: hashed whole through the
+//!   descriptor its stamp was read from, still that file holding those
+//!   bytes when the original takes its name, and what the swap brought
+//!   out read again whole; a file system that cannot swap two names
+//!   writes nothing.
 //! - [`rewrite_observed`] rewrites a file under the rules of a removal
 //!   ([`crate::rewrite_checked`]) to hold what the vault does not.
 //! - [`restore_over_left`] puts a file's contents back from a backup v2
@@ -26,7 +30,7 @@
 //!   to it. It is the write-back the backup v2 undo commands of M2-16,
 //!   M2-20 and M2-22 are to call (docs/IPC.md "Backups v2", "Writing
 //!   back"); `init --undo` restores its v1 backups through
-//!   [`restore_over`].
+//!   [`restore_over`], which shares its checks.
 
 use std::io::Write;
 use std::path::Path;
@@ -39,10 +43,11 @@ use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 
 use crate::atomic::{
-    Inside, ModifyError, ModifyErrorKind, create_atomically, digest_of, io, replace_atomically,
-    replace_in_with, rewrite_checked_observed,
+    Fill, Inside, ModifyError, ModifyErrorKind, Swap, create_atomically, digest_of, io,
+    replace_in_using, rewrite_checked_observed,
 };
 use crate::root::{FileStamp, ScanRoot, open_file};
+use envcloak_sys::exchange_beneath;
 
 /// Creates the file at `rel` under `r` with `content` and `mode`, only if
 /// no file has that name. Returns the new file's stamp.
@@ -61,21 +66,66 @@ pub fn restore_file(
     create_atomically(r, rel, bytes, mode)
 }
 
-/// Replaces the file at `rel` under `r`, which must still be the one
-/// `expect` stamps, with `content`, keeping its mode. Returns the new
-/// file's stamp.
+/// Puts `content`, a file's original from its backup, back over the file
+/// at `rel` under `r`, only while that file is exactly what the deletion
+/// left: its SHA-256 is `left`, the one the backup recorded of the
+/// rewrite (else [`ModifyErrorKind::EditedSince`], and the file stays as
+/// it is), F-78. It is checked as [`restore_over_left`] checks a backup
+/// v2's file, with every guarantee written there: hashed whole through
+/// the descriptor its stamp was read from, its stamp (the change time
+/// included) unchanged by the read; still that file, with that stamp,
+/// when the original takes its name, a save meanwhile kept
+/// ([`ModifyErrorKind::Changed`]); and what the swap of the two names
+/// brought out read again whole, the names swapped back unless it still
+/// has `left` (an edit made in place after the last check, at the same
+/// length with its modification time put back, is kept: `changed`). A
+/// file system that cannot swap two names writes nothing
+/// ([`ModifyErrorKind::SwapUnsupported`]), never renaming over a file it
+/// could not check. The file keeps its mode; one with another hard link
+/// is never written over. Returns the new file's stamp.
 ///
 /// # Errors
-/// As [`replace_atomically`].
+/// As above, and as [`restore_over_left`].
 pub fn restore_over(
     r: &ScanRoot,
     rel: &Path,
     content: &SecretBytes,
-    expect: &FileStamp,
+    left: &[u8; 32],
 ) -> Result<FileStamp, ModifyError> {
-    #[allow(clippy::disallowed_methods)] // Writes the file back, as the person asked, with a proof.
-    let bytes = content.expose_secret();
-    replace_atomically(r, rel, bytes, expect)
+    restore_over_observed(r, rel, content, left, &mut |_| {})
+}
+
+/// [`restore_over`], telling `observe` what [`restore_over_left_observed`]
+/// tells.
+///
+/// # Errors
+/// As [`restore_over`].
+pub fn restore_over_observed(
+    r: &ScanRoot,
+    rel: &Path,
+    content: &SecretBytes,
+    left: &[u8; 32],
+    observe: &mut dyn FnMut(Inside),
+) -> Result<FileStamp, ModifyError> {
+    over_left(exchange_beneath, r, rel, content, left, observe)
+}
+
+/// [`restore_over_observed`], swapping names with `swap`.
+fn over_left(
+    swap: Swap,
+    r: &ScanRoot,
+    rel: &Path,
+    content: &SecretBytes,
+    left: &[u8; 32],
+    observe: &mut dyn FnMut(Inside),
+) -> Result<FileStamp, ModifyError> {
+    let mut fill = |out: &mut dyn Write| {
+        #[allow(clippy::disallowed_methods)]
+        // Writes the file back, as the person asked, with a proof.
+        let bytes = content.expose_secret();
+        out.write_all(bytes).map_err(|e| io(&e))
+    };
+    replace_if_left(swap, r, rel, left, &mut fill, observe)
 }
 
 /// Rewrites the file at `rel` under `r` to `content`, at the time `now`,
@@ -210,6 +260,33 @@ pub fn restore_over_left_observed(
     if file.size > MAX_FILE_V2 {
         return Err(fail(ModifyErrorKind::BackupUnread));
     }
+    let mut fill = |out: &mut dyn Write| write_chunks(out, file, chunk);
+    replace_if_left(
+        exchange_beneath,
+        r,
+        rel,
+        &file.sha256_after,
+        &mut fill,
+        observe,
+    )
+}
+
+/// Replaces the file at `rel` under `r` with what `fill` writes, only
+/// while it is what a change left (its SHA-256 is `left`), as
+/// [`restore_over_left`] says, swapping names with `swap`: the one
+/// write-back of [`restore_over_left`] and [`restore_over`].
+fn replace_if_left(
+    swap: Swap,
+    r: &ScanRoot,
+    rel: &Path,
+    left: &[u8; 32],
+    fill: Fill<'_>,
+    observe: &mut dyn FnMut(Inside),
+) -> Result<FileStamp, ModifyError> {
+    let fail = |kind| ModifyError {
+        rel: rel.to_path_buf(),
+        kind,
+    };
     let (dir, name) = r
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
@@ -222,23 +299,14 @@ pub fn restore_over_left_observed(
     observe(Inside::Opened);
     let now = digest_of(&mut f, &stamp, &dir).map_err(fail)?;
     drop(f);
-    if now != file.sha256_after {
+    if now != *left {
         return Err(fail(ModifyErrorKind::EditedSince));
     }
     observe(Inside::Hashed);
     // The file must still be the one hashed when its replacement takes
     // its name: the stamp is the one it had before it was read, and what
     // comes out of the swap must still hold what the change left.
-    let mut fill = |out: &mut dyn Write| write_chunks(out, file, chunk);
-    replace_in_with(
-        &dir,
-        rel,
-        &name,
-        &mut fill,
-        &stamp,
-        Some(&file.sha256_after),
-        observe,
-    )
+    replace_in_using(swap, &dir, rel, &name, fill, &stamp, Some(left), observe)
 }
 
 /// Writes the chunks of `file` to `out`, in order, each at its length,
@@ -266,4 +334,55 @@ fn write_chunks(
         return Err(ModifyErrorKind::BackupUnread);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::ffi::OsStr;
+    use std::fs::File;
+
+    /// A file system that cannot swap two names in one step.
+    fn cannot_swap(_: &File, _: &OsStr, _: &OsStr) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// F-78 (Codex's review): `init --undo`'s write-back, where two names
+    /// cannot be swapped in one step, writes nothing (`swap_unsupported`):
+    /// the file the deletion left stays as it is and no temporary file is
+    /// left, since a rename over it could replace an edit made after the
+    /// last check. Where they can, the same call writes the original back.
+    ///
+    /// Mutation: `restore_over` without the contents the file must still
+    /// hold (the old `replace_atomically` path, which falls back to a
+    /// rename): the file is replaced.
+    #[test]
+    fn an_undo_writes_nothing_where_names_cannot_be_swapped() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let p = d.path().join(".env");
+        let left: &[u8] = b"PORT=8080\n";
+        std::fs::write(&p, left).unwrap();
+        let r = crate::open_root(d.path()).unwrap();
+        let original = SecretBytes::copy_from(b"TOKEN=from the backup\nPORT=8080\n");
+        let sha: [u8; 32] = Sha256::digest(left).into();
+        let e = over_left(
+            cannot_swap,
+            &r,
+            Path::new(".env"),
+            &original,
+            &sha,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, ModifyErrorKind::SwapUnsupported);
+        assert_eq!(std::fs::read(&p).unwrap(), left, "written over");
+        let names: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [OsStr::new(".env")]);
+        restore_over(&r, Path::new(".env"), &original, &sha).unwrap();
+        assert!(original.ct_eq(&std::fs::read(&p).unwrap()));
+    }
 }
