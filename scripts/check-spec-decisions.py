@@ -22,16 +22,25 @@ SPEC v0.4 pull request wrote them (plan task M2-01).
   instead (D-33); the sealed copy the daemon starts its own modes from,
   and that managed servers are unavailable where it cannot be executed
   (D-36); the daemon's own executable as the only source of the sign-in
-  reaper and driver (D-25, D-36); and gate 39's launch binding.
+  reaper and driver (D-25, D-36); and gate 39's launch binding. Since
+  M2-RES1 also: the HTTP relay's host rule as D-18 has it (a known
+  provider's `allowed_hosts` bound the host; an unknown provider's server
+  is not refused for it), dev sign-in unavailable where the sealed copy is
+  (D-36), and reclassifying an item towards `test` or `unknown` as a
+  passphrase-proven write in §4.3 and §10b.
 - The wording they replaced is gone, in any letter case, and nothing makes
   a release depend on the requesting process's code: not on EnvCloak's own
   `envcloak` (backticked or not), not on the requester, caller, client,
   peer, bridge or `envcloak mcp` being the `envcloak` binary, and not on
   their executable, binary, code, signature, hash, SHA-256, cdhash, Team
-  ID or signing identifier matching anything. The daemon cannot identify a
+  ID or signing identifier matching anything, nor on the requester being
+  signed by anyone, its executable hashing to anything, its code
+  signature satisfying a requirement, it running the `envcloak` binary,
+  or `/proc/<pid>/exe` of it being anything. The daemon cannot identify a
   hardened client's code on Linux (CR-1). These patterns catch the
-  wordings reviewers wrote; a paraphrase they miss is left to code-owner
-  review of SPEC edits.
+  wordings reviewers wrote, and the paraphrases a review found passing
+  (M2R-4); one they still miss is left to code-owner review of SPEC edits,
+  which `main`'s branch protection must require (plan §3).
 - The status line says v0.4, and the file holds no em dash.
 
 Runs of whitespace, line breaks included, count as one space in the SPEC
@@ -230,6 +239,23 @@ REQUIRED = {
         "(below), so managed servers are unavailable there: a request for one is refused with "
         "`runner_unavailable`, and the server is reported as manual."
     ),
+    "§6.6 the relay's host rule (D-18)": (
+        "sends it, when the provider is known, only to a host within that provider's "
+        "`allowed_hosts`"
+    ),
+    "§6.8 no sealed copy, no dev sign-in (D-36)": (
+        "Where that sealed copy cannot be made or executed (for example under "
+        "`vm.memfd_noexec=2`, as for managed servers in §6.6), dev sign-in is unavailable: a "
+        "sign-in request is refused with `runner_unavailable`, and `envcloak agents status` and "
+        "the sign-in tool's result say so."
+    ),
+    "§4.3 reclassification is passphrase-proven (M2-13)": (
+        "and reclassifying an item towards `test` or `unknown` (§10b)"
+    ),
+    "§10b reclassification needs a proof (M2-13)": (
+        "reclassifying an item towards `test` or `unknown` (M2), which loosens the live-key guard "
+        "and, towards `test`, what a standing approval can cover."
+    ),
     "§6.8 the reaper and driver start from the daemon's own executable (D-25, D-36)": (
         "The daemon starts the reaper and the driver from its own executable as it was when the "
         "daemon started, never from a path it reads again: on Linux from a sealed in-memory copy "
@@ -249,7 +275,10 @@ CODE = (
     r"(?: (?:identity|signature|hash|sha-256|cdhash|code directory hash|team id|signing identifier))?"
     r"|code directory hash|signature|hash|sha-256|cdhash|team id|signing identifier)"
 )
-RESTS_ON = r"(?:is|are|must|matches|match|equals|equal|comes from|come from|has to)"
+RESTS_ON = (
+    r"(?:is|are|must|matches|match|equals|equal|comes from|come from|has to|"
+    r"satisfies|satisfy|meets|meet|hashes to|hash to|verifies|verify)"
+)
 
 # What v0.4 replaced, as regular expressions over the SPEC with its
 # whitespace collapsed, matched in any letter case; a plain phrase is
@@ -268,7 +297,22 @@ FORBIDDEN = {
         r"(?:binary|executable|program|code|command)\b" % REQUESTER
     ),
     "a release that rests on the requester's executable identity (CR-1)": re.escape("executable identity is EnvCloak's"),
+    # The paraphrases a review found passing (M2R-4).
+    "a release that rests on who signed the requester (CR-1)": (
+        r"\b%s(?: process)?(?: that is| which is)? (?:signed|notari[sz]ed) (?:by|with)\b" % REQUESTER
+    ),
+    "a release that rests on the requester's code, named later in the sentence (CR-1)": (
+        r"\b%s\b[^.;:]{0,160}?\b(?:its|their) %s %s\b" % (REQUESTER, CODE, RESTS_ON)
+    ),
+    "a release that rests on the requester running the `envcloak` binary (CR-1)": (
+        r"\b%s(?: process)? (?:runs|is running|executes) (?:the |an? |envcloak's |envcloak\u2019s )?"
+        r"(?:own |installed |released? )?`?envcloak`? (?:binary|executable|program|release)\b" % REQUESTER
+    ),
+    "a release that rests on the requester's `/proc/<pid>/exe` (CR-1)": (
+        r"/proc/\S+/exe (?:of|for) (?:the |a |an |its )?%s" % REQUESTER
+    ),
     "the old §1.1 inject-mode claim": re.escape("keeps keys out of files, prompts, configs and transcripts"),
+    "the relay requiring a known provider for any HTTP server (D-18)": re.escape("requires a known provider's `allowed_hosts`"),
     "`rmcp` as the MCP library": re.escape("`rmcp` 3.x (pinned)"),
     "the old stdio rewrite form": re.escape("`args: [\"run\", \"--ref\""),
     "the old instruction 3": re.escape("`envcloak add <provider> --ask` so the user pastes it into the app"),
