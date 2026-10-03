@@ -140,13 +140,23 @@ fn a_login_ciphertext_moved_into_a_secret_row_does_not_open() {
     );
     let s = v.item(secret).unwrap();
     assert_eq!(s.fields.len(), 1, "the moved login field is not listed");
+    // The control: the read-only vault does serve what opens, so the sweep
+    // below reads values, and the secret's own is among them.
+    assert!(
+        v.read_value(s.fields[0].id)
+            .unwrap()
+            .ct_eq(b"a secret value")
+    );
+    let mut read = 0;
     for item in v.items() {
         for field in &item.fields {
             if let Ok(got) = v.read_value(field.id) {
+                read += 1;
                 assert!(!got.ct_eq(PASSWORD), "{}#{}", item.slug, field.name);
             }
         }
     }
+    assert!(read >= 1, "the sweep read no value");
     let l = v.item(login_id).unwrap();
     assert!(l.fields.iter().all(|f| f.kind != FieldKind::Password));
 }
@@ -317,29 +327,50 @@ fn a_policy_out_of_bounds_is_refused_unwritten() {
     assert_eq!(v.policies().unwrap().count(), 0);
 }
 
-/// Item record v2: an exposure only grows (its first time kept, the kinds
-/// joined, the counts summed) and sets the rotation flag; clearing it
+/// Item record v2: an exposure only grows (its first mark's time kept, the
+/// kinds joined, the counts summed) and sets the rotation flag; clearing it
 /// clears both. The classification's last change is recorded at creation
 /// and at every change, and only then. Both survive a reopen.
+///
+/// Each transaction runs at a time of its own (the vault's test clock), so
+/// every time asserted is the one transaction's that should have set it
+/// and no other's: the first mark's, not the second's; the creation's
+/// after an edit that keeps the classification; the change's after one
+/// that changes it. Mutations checked: `since` set at every mark (this
+/// fails: it reads the second mark's time); the classification's time
+/// left alone when it changes, and moved by an edit that keeps it (each
+/// fails here).
 #[test]
 fn exposure_and_the_classification_time_are_kept_by_the_vault() {
+    // The transactions' times, each a different second.
+    const CREATED: u64 = 1_800_000_000;
+    const FIRST_MARK: u64 = CREATED + 100;
+    const SECOND_MARK: u64 = CREATED + 200;
+    const RENAMED: u64 = CREATED + 300;
+    const RECLASSIFIED: u64 = CREATED + 400;
+    const CLEARED: u64 = CREATED + 500;
+
     let (f, mut v) = Fixture::create();
     let item = v
-        .transact(|t| {
+        .transact_at_for_testing(CREATED, |t| {
             let i = t.create_item(secret_item("stripe/acme"))?;
             t.add_field(i, name("value"), SecretBytes::copy_from(b"v"))?;
             Ok(i)
         })
         .unwrap();
     let m = v.item(item).unwrap().clone();
-    let created = m.classification_changed_at.unwrap();
-    assert_eq!(created, m.created_at);
+    assert_eq!(m.created_at, CREATED);
+    assert_eq!(m.classification_changed_at, Some(CREATED));
     assert_eq!((m.exposure.clone(), m.rotate_recommended), (None, false));
 
-    v.transact(|t| t.mark_exposed(item, &[ExposureSource::Transcript], 2))
-        .unwrap();
-    let first = v.item(item).unwrap().exposure.clone().unwrap();
-    v.transact(|t| {
+    v.transact_at_for_testing(FIRST_MARK, |t| {
+        t.mark_exposed(item, &[ExposureSource::Transcript], 2)
+    })
+    .unwrap();
+    let first = v.item(item).unwrap().clone();
+    assert_eq!(first.exposure.clone().unwrap().since, FIRST_MARK);
+    assert_eq!(first.updated_at, FIRST_MARK);
+    v.transact_at_for_testing(SECOND_MARK, |t| {
         t.mark_exposed(
             item,
             &[ExposureSource::GitHistory, ExposureSource::Transcript],
@@ -348,23 +379,27 @@ fn exposure_and_the_classification_time_are_kept_by_the_vault() {
     })
     .unwrap();
     let m = v.item(item).unwrap().clone();
+    // The second mark wrote the row (its time is the row's), and kept the
+    // first mark's time as the exposure's.
+    assert_eq!(m.updated_at, SECOND_MARK);
     let x = m.exposure.clone().unwrap();
-    assert_eq!(x.since, first.since);
+    assert_eq!(x.since, FIRST_MARK, "the first mark's time is kept");
     assert_eq!(
         x.sources,
         [ExposureSource::Transcript, ExposureSource::GitHistory]
     );
     assert_eq!(x.count, 5);
     assert!(m.rotate_recommended);
+    assert_eq!(m.classification_changed_at, Some(CREATED));
     assert_eq!(
-        v.transact(|t| t.mark_exposed(item, &[], 1))
+        v.transact_at_for_testing(SECOND_MARK + 1, |t| t.mark_exposed(item, &[], 1))
             .unwrap_err()
             .kind(),
         VaultErrorKind::InvalidRecord
     );
 
     // An edit that keeps the classification keeps its time.
-    v.transact(|t| {
+    v.transact_at_for_testing(RENAMED, |t| {
         t.update_item(
             item,
             ItemDetails {
@@ -374,33 +409,38 @@ fn exposure_and_the_classification_time_are_kept_by_the_vault() {
         )
     })
     .unwrap();
-    assert_eq!(
-        v.item(item).unwrap().classification_changed_at,
-        Some(created)
-    );
-    assert_eq!(v.item(item).unwrap().exposure, Some(x.clone()));
-    // A change of it is recorded.
-    v.transact(|t| {
+    let renamed = v.item(item).unwrap().clone();
+    assert_eq!(renamed.updated_at, RENAMED);
+    assert_eq!(renamed.classification_changed_at, Some(CREATED));
+    assert_eq!(renamed.exposure, Some(x.clone()));
+    // A change of it is recorded, at the time of the change.
+    assert_ne!(m.details.classification, Classification::Live);
+    v.transact_at_for_testing(RECLASSIFIED, |t| {
         t.update_item(
             item,
             ItemDetails {
                 classification: Classification::Live,
-                ..m.details.clone()
+                ..renamed.details.clone()
             },
         )
     })
     .unwrap();
-    let changed = v.item(item).unwrap().classification_changed_at.unwrap();
-    assert!(changed >= created);
+    assert_eq!(
+        v.item(item).unwrap().classification_changed_at,
+        Some(RECLASSIFIED)
+    );
     drop(v);
     let mut v = f.unlock();
     assert_eq!(v.integrity(), Integrity::Ok);
     let m = v.item(item).unwrap().clone();
-    assert_eq!(m.classification_changed_at, Some(changed));
+    assert_eq!(m.classification_changed_at, Some(RECLASSIFIED));
     assert_eq!(m.exposure, Some(x));
-    v.transact(|t| t.clear_exposure(item)).unwrap();
+    v.transact_at_for_testing(CLEARED, |t| t.clear_exposure(item))
+        .unwrap();
     let m = v.item(item).unwrap();
     assert_eq!((m.exposure.clone(), m.rotate_recommended), (None, false));
+    assert_eq!(m.updated_at, CLEARED);
+    assert_eq!(m.classification_changed_at, Some(RECLASSIFIED));
 }
 
 /// A login item lists its typed fields with their kinds and its own
