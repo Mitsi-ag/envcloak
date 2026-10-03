@@ -2939,7 +2939,7 @@ fn claude_code_interactive_trust_and_paste() {
     let approve_key = |model: &envcloak_testkit::agents::Model| {
         // Settings the person made, so the session opens at the trust
         // dialog: onboarding done, the key in ANTHROPIC_API_KEY approved.
-        let token = model.token();
+        let token = model.api_key();
         let cfg = json!({"hasCompletedOnboarding": true, "theme": "dark",
                          "customApiKeyResponses": {"approved": [&token[token.len() - 20..]], "rejected": []}});
         std::fs::write(a.home_dir().join(".claude.json"), cfg.to_string()).unwrap();
@@ -3511,7 +3511,7 @@ fn tier_2_qwen_code_against_the_scripted_model() {
                 "security": {"auth": {"selectedType": "anthropic"}},
             });
             std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
-            cmd.env("EC_MODEL_TOKEN", model.token()).args([
+            cmd.env("EC_MODEL_TOKEN", model.api_key()).args([
                 "Run the probe.",
                 "--approval-mode",
                 "default",
@@ -3543,7 +3543,7 @@ fn tier_2_kimi_code_against_the_scripted_model() {
                 json!(model.base_url())
             );
             std::fs::write(dir.join("config.toml"), config).unwrap();
-            cmd.env("EC_MODEL_TOKEN", model.token())
+            cmd.env("EC_MODEL_TOKEN", model.api_key())
                 .env("KIMI_CODE_HOME", &dir)
                 .args(["-p", "Run the probe."]);
         },
@@ -3575,7 +3575,7 @@ fn tier_2_opencode_against_the_scripted_model() {
                 "share": "disabled",
             });
             std::fs::write(dir.join("opencode.json"), config.to_string()).unwrap();
-            cmd.env("EC_MODEL_TOKEN", model.token())
+            cmd.env("EC_MODEL_TOKEN", model.api_key())
                 .args(["run", "Run the probe."]);
         },
     ) else {
@@ -3598,7 +3598,7 @@ fn tier_2_copilot_cli_against_the_scripted_model() {
                 .env("COPILOT_AUTO_UPDATE", "false")
                 .env("COPILOT_PROVIDER_BASE_URL", model.base_url())
                 .env("COPILOT_PROVIDER_TYPE", "anthropic")
-                .env("COPILOT_PROVIDER_API_KEY", model.token())
+                .env("COPILOT_PROVIDER_API_KEY", model.api_key())
                 .env("COPILOT_MODEL", "ec-scripted")
                 .args(["-p", "Run the probe.", "--allow-tool=shell"]);
         },
@@ -3627,7 +3627,7 @@ fn tier_2_gemini_cli_speaks_neither_protocol() {
                               "general": {"disableAutoUpdate": true}});
         std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
         cmd.env("GOOGLE_GEMINI_BASE_URL", model.base_url())
-            .env("GEMINI_API_KEY", model.token())
+            .env("GEMINI_API_KEY", model.api_key())
             .args(["-p", "Say hello.", "--skip-trust"]);
     }) else {
         return;
@@ -3653,7 +3653,7 @@ fn tier_2_gemini_cli_speaks_neither_protocol() {
 #[test]
 fn tier_2_cursor_cli_has_no_base_url() {
     let Some(run) = tier_2("cursor-cli", "native", None, |_, model, cmd| {
-        cmd.env("CURSOR_API_KEY", model.token())
+        cmd.env("CURSOR_API_KEY", model.api_key())
             .args(["-p", "Say hello."]);
     }) else {
         return;

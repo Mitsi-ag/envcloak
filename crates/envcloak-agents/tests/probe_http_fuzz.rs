@@ -167,7 +167,7 @@ proptest! {
     ) {
         let s = server();
         let handle = s.handle();
-        let token = s.token().as_str().to_owned();
+        let token = s.api_key().as_str().to_owned();
         let path = if api { "/v1/messages" } else { "/v1/responses" };
         let mut input = valid(&token, &body(api), path);
         if twice {
@@ -188,7 +188,7 @@ proptest! {
 fn oversized_and_capped_input_through_the_same_path() {
     let s = server();
     let handle = s.handle();
-    let token = s.token().as_str().to_owned();
+    let token = s.api_key().as_str().to_owned();
     let big = vec![b'a'; 4096];
     let out = serve_bytes(&handle, &valid(&token, &big, "/v1/messages"));
     assert!(out.starts_with(b"HTTP/1.1 413 "));

@@ -112,7 +112,7 @@ impl Server {
     }
 
     /// The run's token: hosts must present it as their API key.
-    pub fn token(&self) -> &Token {
+    pub fn api_key(&self) -> &Token {
         &self.shared.token
     }
 

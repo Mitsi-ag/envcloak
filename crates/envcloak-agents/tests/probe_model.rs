@@ -89,11 +89,11 @@ fn post(path: &str, auth: &str, body: &[u8]) -> Vec<u8> {
 }
 
 fn key(stub: &ModelStub) -> String {
-    format!("x-api-key: {}\r\n", stub.token().as_str())
+    format!("x-api-key: {}\r\n", stub.api_key().as_str())
 }
 
 fn bearer(stub: &ModelStub) -> String {
-    format!("Authorization: Bearer {}\r\n", stub.token().as_str())
+    format!("Authorization: Bearer {}\r\n", stub.api_key().as_str())
 }
 
 fn messages_body(marker: &str) -> Vec<u8> {
@@ -232,7 +232,7 @@ fn claude_codes_connectivity_check_is_answered_without_a_token() {
 fn a_connection_from_a_non_loopback_address_is_closed_unanswered() {
     let server = Server::bind(Script::parse(&script()).unwrap(), Limits::default()).unwrap();
     let handle = server.handle();
-    let token = server.token().as_str().to_owned();
+    let token = server.api_key().as_str().to_owned();
     // A real socket, handed to the server's accept path as if its peer
     // were a documentation address (RFC 5737).
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -680,7 +680,7 @@ fn a_request_to_forward_is_recorded_whole_with_its_header_values_and_body() {
 #[test]
 fn header_values_are_recorded_and_the_run_s_token_is_not() {
     let stub = start();
-    let token = stub.token().as_str().to_owned();
+    let token = stub.api_key().as_str().to_owned();
     let auth = format!("{}{}X-Leak:  MARK-VALUE \r\n", key(&stub), bearer(&stub));
     let got = send(
         stub.addr(),
@@ -943,7 +943,7 @@ fn concurrent_requests_cannot_pass_the_record_cap_while_bodies_are_read() {
     };
     let server = Server::bind(script, limits).unwrap();
     let (addr, handle) = (server.addr(), server.handle());
-    let auth = format!("x-api-key: {}\r\n", server.token().as_str());
+    let auth = format!("x-api-key: {}\r\n", server.api_key().as_str());
     let serving = std::thread::spawn(move || server.serve());
     let body = messages_body("first");
     let request = post("/v1/messages", &auth, &body);

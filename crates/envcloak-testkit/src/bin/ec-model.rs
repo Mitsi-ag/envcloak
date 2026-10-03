@@ -158,7 +158,7 @@ fn main() -> ExitCode {
         .env("CODEX_HOME", &codex_home)
         .env("CLAUDE_CODE_TMPDIR", home.root().join("tmp"))
         .env("EC_MODEL_BASE_URL", model.base_url())
-        .env("EC_MODEL_TOKEN", model.token())
+        .env("EC_MODEL_TOKEN", model.api_key())
         .current_dir(home.home())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
