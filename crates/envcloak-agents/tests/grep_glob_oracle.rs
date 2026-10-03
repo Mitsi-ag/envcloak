@@ -174,16 +174,25 @@ fn the_hook_stops_exactly_the_globs_ripgrep_reads_an_env_file_with() {
     );
 }
 
-/// ripgrep's built-in file types against `RG_ENV_TYPES`: a type with a
-/// glob that may pick out an env file is one the hook stops a `--type`
-/// (and Grep's `type`) for, and each one it stops for has such a glob.
+/// ripgrep's built-in file types against `RG_ENV_TYPES`: every type of
+/// the installed ripgrep with a glob that may pick out an env file is one
+/// the hook stops a `--type` (and Grep's `type`) for. Which types hold
+/// one depends on ripgrep's version (15.1.0's `sh` holds `.env` and
+/// `*.env`; Ubuntu 24.04's 14.1.0 has none, measured in CI), so the list
+/// is the union, and this prints what the installed one has.
 ///
-/// Mutation checked: `sh` taken out of `RG_ENV_TYPES`: this fails.
+/// Mutation checked: `sh` taken out of `RG_ENV_TYPES`: this fails with
+/// ripgrep 15.1.0.
 #[test]
 fn ripgreps_own_types_that_hold_env_files_are_the_hooks() {
     let Some(rg) = rg() else {
         return;
     };
+    let version = Command::new(&rg)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .unwrap();
     let out = Command::new(&rg)
         .args(["--no-config", "--type-list"])
         .env_clear()
@@ -192,22 +201,31 @@ fn ripgreps_own_types_that_hold_env_files_are_the_hooks() {
     assert!(out.status.success());
     let list = String::from_utf8(out.stdout).unwrap();
     let mut env_types: Vec<String> = Vec::new();
+    let mut rust = false;
     for line in list.lines() {
         let Some((name, globs)) = line.split_once(": ") else {
             continue;
         };
+        rust |= name == "rust" && globs.split(", ").any(|g| g == "*.rs");
         if globs.split(", ").any(glob_may_name_env_file) {
             env_types.push(name.to_owned());
         }
     }
-    // The positive control: `sh` holds `.env`.
-    assert!(env_types.iter().any(|t| t == "sh"), "{env_types:?}");
-    let listed: Vec<&str> = RG_ENV_TYPES
+    // The positive control: the list was read (`rust` holds `*.rs`).
+    assert!(rust, "ripgrep's type list was not read");
+    let missed: Vec<&String> = env_types
         .iter()
-        .copied()
-        .filter(|t| *t != "all")
+        .filter(|t| !RG_ENV_TYPES.contains(&t.as_str()))
         .collect();
-    let mut found: Vec<&str> = env_types.iter().map(String::as_str).collect();
-    found.sort_unstable();
-    assert_eq!(found, listed, "ripgrep's types that hold env files");
+    assert!(
+        missed.is_empty(),
+        "ripgrep's types that hold env files and the hook lets through: {missed:?}"
+    );
+    println!(
+        "measurement: {}: types holding env files: {env_types:?}",
+        String::from_utf8_lossy(&version.stdout)
+            .lines()
+            .next()
+            .unwrap_or("ripgrep")
+    );
 }
