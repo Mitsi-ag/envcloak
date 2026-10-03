@@ -64,7 +64,8 @@ What is read. Every `.rs` file under each crate's `src/`, and nothing
 the compiler builds a crate from is elsewhere (verifier review of
 M2-RES1: a `#[path]` module in another directory, and a source
 directory that was a symbolic link, compiled unread): a `#[path]`
-attribute (also under `cfg_attr`) is refused, and so are a symbolic link
+attribute (also under `cfg_attr`, and `path = ` where a macro could
+make one, as scripts/check-unsafe.sh has it) is refused, and so are a symbolic link
 anywhere under a `src/`, a `.rs` entry that is not a regular file, a
 library or binary target whose file a manifest puts outside its crate's
 `src/`, a path dependency outside `crates/` (manifests are read as
@@ -2487,11 +2488,24 @@ def cargo_path_or_name(var):
     )
 
 
+# `path = ` as a key (not `path ==` or `path =>`).
+PATH_KEY = re.compile(r"(?<![A-Za-z0-9_])path\s*=(?![=>])")
+
+
 def refuse_path_attributes(src):
     """A `#[path]` attribute, which compiles a file the reader walks past,
-    is refused."""
+    is refused; and, as scripts/check-unsafe.sh has it, so is `path = ` in
+    any attribute or argument position (after `[`, `(` or `,`) and `path =
+    "..."` anywhere but a `let` binding, which a macro can turn into one
+    (`m! { path = "x.rs" }`)."""
     for m in PATH_ATTRIBUTE.finditer(src.skel):
         raise SourceError("%s line %d: a `#[path]` attribute compiles a file the reader does not walk to; keep each module in the file its name gives" % (src.rel, src.skel.count("\n", 0, m.start()) + 1))
+    for m in PATH_KEY.finditer(src.skel):
+        before = src.skel[:m.start()].rstrip()
+        word = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", before)
+        literal = re.match(r"\s*[bcr]*#*\"", src.skel[m.end():])
+        if before[-1:] in ("[", "(", ",") or (literal and (not word or word.group(1) not in ("let", "mut"))):
+            raise SourceError("%s line %d: `path = ` where a macro could make it a `#[path]` attribute, which compiles a file the reader does not walk to; rename it" % (src.rel, src.skel.count("\n", 0, m.start()) + 1))
 
 
 def included_text(root, src, at, where):
