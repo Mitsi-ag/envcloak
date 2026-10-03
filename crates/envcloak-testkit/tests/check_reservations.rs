@@ -507,15 +507,15 @@ fn a_token_printed_directly_as_envcloak_token_counts() {
 #[test]
 fn text_that_only_mentions_envcloak_is_not_a_printed_token() {
     // Not a `envcloak: <token>:` prefix: two words, no colon after the
-    // word, the prefix inside the text, or a placeholder.
+    // word, or the prefix inside the text. (A placeholder where the token
+    // goes is read: `a_token_printed_from_a_placeholder_is_read_or_refused`.)
     let t = fixture();
     add_file(
         &t,
         CLIENT_STUB,
         "pub fn a() { eprintln!(\"envcloak: pty unavailable: no terminal\"); }\n\
          pub fn b() { eprintln!(\"envcloak: app_required because\"); }\n\
-         pub fn c() -> String { format!(\"[envcloak: incomplete: cut]\") }\n\
-         pub fn d(t: &str) { eprintln!(\"envcloak: {t}: x\"); }\n",
+         pub fn c() -> String { format!(\"[envcloak: incomplete: cut]\") }\n",
     );
     assert_passes(&t.home());
 }
@@ -1318,5 +1318,307 @@ fn a_failure_token_covered_only_by_an_unrelated_table_fails() {
         &format!(
             "`exit_token`: the code has `list_secrets` ({CLIENT_STUB}), which no `landed` row reserves"
         ),
+    );
+}
+
+/// The reserved token and an unreserved one, refused as a clash and as a
+/// token no `landed` row reserves.
+fn assert_counted(body: &str, file: &str) {
+    for (token, expect) in [
+        (
+            "pty_unavailable",
+            format!("`pty_unavailable` is reserved, but the code already has it ({file})"),
+        ),
+        (
+            "zz_unreserved",
+            format!(
+                "`exit_token`: the code has `zz_unreserved` ({file}), which no `landed` row reserves"
+            ),
+        ),
+    ] {
+        let t = fixture();
+        if file == CLIENT_STUB {
+            add_file(&t, file, &body.replace("TOKEN", token));
+        } else {
+            let path = t.home().join(file);
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            text.push_str(&body.replace("TOKEN", token));
+            std::fs::write(&path, text).unwrap();
+        }
+        assert_fails(&t, &expect);
+    }
+}
+
+/// A token handed on through a `token` parameter in any position is read
+/// at the helper's callers, in that position (review of M2-RES1: a
+/// `token` second parameter was exempt in the helper's body, but its
+/// callers were read only at their first argument, so a reserved or
+/// unreserved token passed there was never seen). The verifier's
+/// reproduction appended to `envcloak check`, and Codex's in the client.
+///
+/// Mutation checked: helpers taken only with `token` first and read at
+/// the first argument, the exemption kept for any function with a `token`
+/// parameter (as before): each copy passes and this fails.
+#[test]
+fn a_token_handed_on_from_any_parameter_position_is_read_at_the_callers() {
+    assert_counted(
+        "\nfn zz_a(code: u8, token: &'static str) -> ExitCode { Failure::new(token, \"x\").report(code) }\n\
+         fn zz_b() -> ExitCode { zz_a(125, \"TOKEN\") }\n",
+        "crates/envcloak-cli/src/cmd/check.rs",
+    );
+    assert_counted(
+        "pub fn zz_a(code: u8, token: crate::fail::ExitToken) -> Failure { let _ = code; Failure::new(token, \"x\") }\n\
+         pub fn zz_b() -> Failure { zz_a(1, \"TOKEN\") }\n",
+        CLIENT_STUB,
+    );
+    // Through an alias of `&'static str`, and through a second helper.
+    assert_counted(
+        "pub type Tok = &'static str;\n\
+         pub fn zz_a(code: u8, token: Tok) -> Failure { let _ = code; zz_c(token) }\n\
+         fn zz_c(token: &'static str) -> Failure { Failure::new(token, \"x\") }\n\
+         pub fn zz_b() -> Failure { zz_a(1, \"TOKEN\") }\n",
+        CLIENT_STUB,
+    );
+}
+
+/// A `Failure` struct literal's `token` is read as an argument is: each
+/// branch of a conditional, `concat!` joined, and one the reader cannot
+/// read refused (review of M2-RES1: the field reader skipped any value
+/// that was not one literal or constant). The verifier's reproductions,
+/// appended to `envcloak check`.
+///
+/// Mutation checked: a struct literal's `token` read as the other
+/// structs' fields are (a literal or a constant, anything else skipped):
+/// the copies pass and this fails.
+#[test]
+fn a_failure_literal_token_is_read_in_every_form_or_refused() {
+    let check = "crates/envcloak-cli/src/cmd/check.rs";
+    assert_counted(
+        "\nfn zz_c(flag: bool) -> Failure { Failure { token: if flag { \"io\" } else { \"TOKEN\" }, message: \"x\".into() } }\n",
+        check,
+    );
+    assert_counted(
+        "\nfn zz_d() -> Failure { Failure { token: concat!(\"\", \"TOKEN\"), message: \"x\".into() } }\n",
+        check,
+    );
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn a() -> Failure { let token = \"pty_unavailable\"; Failure { token, message: \"x\".into() } }\n",
+    );
+    assert_fails(&t, "a failure token the reader cannot read (`token`)");
+}
+
+/// A helper's `token` is only ever handed on as a failure token: rebound
+/// by a `let`, a closure or a pattern, a value the callers did not pass
+/// could reach a failure. A method's `token` parameter is not read at its
+/// callers, so a method cannot hand one on.
+///
+/// Mutation checked: the check of a helper's other uses of `token`
+/// removed: each copy passes and this fails.
+#[test]
+fn a_helpers_token_used_other_than_handed_on_fails() {
+    for body in [
+        "pub fn zz_h(token: &'static str) -> Failure { let token = \"pty_unavailable\"; Failure::new(token, \"x\") }\n",
+        "pub fn zz_h(token: &'static str) -> Failure { let f = |token| Failure::new(token, \"x\"); f(\"pty_unavailable\") }\n",
+        "pub fn zz_h(token: &'static str, o: Option<&'static str>) -> Failure { if let Some(token) = o { return Failure::new(token, \"x\"); } Failure::new(token, \"y\") }\n",
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(
+            &t,
+            "`zz_h`'s `token` is used other than handed on as a failure token",
+        );
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub struct S;\nimpl S { pub fn f(&self, token: &'static str) -> Failure { Failure::new(token, \"x\") } }\n",
+    );
+    assert_fails(&t, "a failure token the reader cannot read (`token`)");
+}
+
+/// `Failure::new` and a token helper are read at their calls, so naming
+/// either any other way (a function pointer, an alias made with `use ...
+/// as`) is refused: the tokens handed to it would not be read.
+///
+/// Mutation checked: mentions other than calls skipped: each copy passes
+/// and this fails.
+#[test]
+fn a_token_helper_or_failure_new_named_other_than_called_fails() {
+    for (body, expect) in [
+        (
+            "pub fn zz_h(token: &'static str) -> Failure { Failure::new(token, \"x\") }\n\
+             pub fn zz_g() -> Option<Failure> { Some(\"pty_unavailable\").map(zz_h) }\n",
+            "the token helper `zz_h` is used other than called by name",
+        ),
+        (
+            "pub fn zz_h(token: &'static str) -> Failure { Failure::new(token, \"x\") }\n\
+             mod inner { use super::zz_h as other; pub fn g() -> crate::fail::Failure { other(\"pty_unavailable\") } }\n",
+            "the token helper `zz_h` is used other than called by name",
+        ),
+        (
+            "pub fn zz_g() -> Failure { let f = Failure::new; f(\"pty_unavailable\", \"x\") }\n",
+            "`Failure::new` is used other than called",
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(&t, expect);
+    }
+    // Called by a path, or with a turbofish, it is read.
+    assert_counted(
+        "impl Failure { pub fn zz_x() -> Self { Self::new(\"TOKEN\", \"x\") } }\n",
+        CLIENT_STUB,
+    );
+    assert_counted(
+        "pub fn zz_g() -> Failure { <Failure>::new(\"TOKEN\", \"x\") }\n",
+        CLIENT_STUB,
+    );
+}
+
+const FAIL: &str = "crates/envcloak-client/src/fail.rs";
+
+/// `Failure` is defined once, in fail.rs, with a private `token` that
+/// file never changes after the failure is made; otherwise code anywhere
+/// could set a token where the reader does not look.
+///
+/// Mutation checked: `check_failure_struct` not called: each copy passes
+/// and this fails.
+#[test]
+fn a_failures_token_is_set_only_where_it_is_made() {
+    let t = fixture();
+    edit(
+        &t,
+        FAIL,
+        "    token: ExitToken,\n",
+        "    pub token: ExitToken,\n",
+    );
+    assert_fails(&t, "`Failure`'s `token` field is public");
+    for change in [
+        "impl Failure { pub fn zz(&mut self) { self.token = \"pty_unavailable\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { let _ = std::mem::replace(&mut self.token, \"pty_unavailable\"); } }\n",
+    ] {
+        let t = fixture();
+        let path = t.home().join(FAIL);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(change);
+        std::fs::write(&path, text).unwrap();
+        assert_fails(&t, "`Failure`'s token is changed after it is made");
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub struct Failure { pub token: &'static str }\n",
+    );
+    assert_fails(&t, "`Failure` must be defined once");
+}
+
+/// A `fn token` that returns a static string is read for every value it
+/// can have, so another value's `.token()` hides none: one returning a
+/// field, or an index, is refused. One that lends its receiver's own
+/// field (`-> &str`, `&self.field`) lives no longer than the receiver and
+/// is no failure token; it passes.
+///
+/// Mutation checked: `fn token` bodies read for their string literals
+/// only, as before: the copies pass and this fails.
+#[test]
+fn a_token_method_the_reader_cannot_read_fails() {
+    for (body, expect) in [
+        (
+            "pub struct E { name: &'static str }\n\
+             impl E { pub fn token(&self) -> &'static str { self.name } }\n",
+            "a failure token the reader cannot read (`self.name`)",
+        ),
+        (
+            "pub enum K { A }\nconst NAMES: [&str; 1] = [\"pty_unavailable\"];\n\
+             impl K { pub fn token(self) -> crate::fail::ExitToken { match self { K::A => NAMES[0] } } }\n",
+            "a failure token the reader cannot read (`NAMES[0]`)",
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(&t, expect);
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub struct M { key: String }\nimpl M { pub fn token(&self) -> &str { &self.key } }\n",
+    );
+    assert_passes(&t.home());
+}
+
+/// A placeholder where the token goes prints its argument as one: it is
+/// read as a token argument (a failure's `.token()` passes), and a
+/// variable is refused. A usage line, `envcloak: {why}`, prints a message
+/// from its file's `fn parse`, whose every `<token>:` start counts; one
+/// whose message comes from anywhere else is refused.
+///
+/// Mutation checked: lines starting `envcloak: {` skipped, as before: the
+/// copies pass and this fails.
+#[test]
+fn a_token_printed_from_a_placeholder_is_read_or_refused() {
+    for (body, expect) in [
+        (
+            "pub fn d(t: &str) { eprintln!(\"envcloak: {t}: x\"); }\n",
+            "a line printed as `envcloak: {t}:` takes its token from a variable",
+        ),
+        (
+            "pub fn d() { let why = \"pty_unavailable: x\"; eprintln!(\"envcloak: {why}\"); }\n",
+            "a usage line `envcloak: {why}` whose message the reader cannot trace",
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(&t, expect);
+    }
+    assert_counted(
+        "pub fn d() { eprintln!(\"envcloak: {}: x\", \"TOKEN\"); }\n",
+        CLIENT_STUB,
+    );
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn d(f: &Failure) { eprintln!(\"envcloak: {}: x\", f.token()); }\n",
+    );
+    assert_passes(&t.home());
+    // A usage message of `envcloak add` starting with a token.
+    let t = fixture();
+    edit(
+        &t,
+        "crates/envcloak-cli/src/cmd/add.rs",
+        "Err(\"unknown or repeated option\")",
+        "Err(\"pty_unavailable: unknown or repeated option\")",
+    );
+    assert_fails(
+        &t,
+        "`pty_unavailable` is reserved, but the code already has it (crates/envcloak-cli/src/cmd/add.rs)",
+    );
+}
+
+/// An `if` or a `match` is read by every branch, and one whose branch the
+/// reader cannot read is refused (review of M2-RES1: an expression was
+/// counted by whatever literals it held, so a variable beside a literal
+/// went unread).
+///
+/// Mutation checked: any other expression counted by its literals and
+/// constants, as before: the variable copy passes and this fails.
+#[test]
+fn a_conditional_with_a_branch_the_reader_cannot_read_fails() {
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn zz_g(c: bool, t: &'static str) -> Failure { Failure::new(if c { \"io\" } else { t }, \"x\") }\n",
+    );
+    assert_fails(&t, "a failure token the reader cannot read (`t`)");
+    assert_counted(
+        "pub fn zz_g(k: u8) -> Failure { Failure::new(match k { 1 => \"io\", _ => \"TOKEN\" }, \"x\") }\n",
+        CLIENT_STUB,
     );
 }

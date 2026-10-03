@@ -399,7 +399,7 @@ fn wait_for_daemon() -> Result<u32, Failure> {
                     "daemon_not_started",
                     format!(
                         "the service was loaded, but the daemon did not answer: {}",
-                        f.message
+                        f.message()
                     ),
                 ));
             }

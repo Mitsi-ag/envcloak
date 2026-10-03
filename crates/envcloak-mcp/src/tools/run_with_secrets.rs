@@ -278,10 +278,13 @@ fn own_message(done: &Captured, token: &str) -> Option<String> {
     let mut text = done.stderr.head().to_vec();
     text.extend(done.stderr.tail());
     let text = String::from_utf8_lossy(&text);
-    let prefix = format!("envcloak: {token}: ");
     text.lines()
         .rev()
-        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .find_map(|l| {
+            l.strip_prefix("envcloak: ")?
+                .strip_prefix(token)?
+                .strip_prefix(": ")
+        })
         .map(str::to_owned)
 }
 
@@ -791,38 +794,38 @@ mod tests {
             args(&m).map(|_| ()).unwrap_err()
         };
         assert_eq!(
-            call(json!({"project_dir": "/", "argv": []})).token,
+            call(json!({"project_dir": "/", "argv": []})).token(),
             "invalid_params"
         );
         assert_eq!(
-            call(json!({"project_dir": "/", "argv": [""]})).token,
+            call(json!({"project_dir": "/", "argv": [""]})).token(),
             "invalid_params"
         );
         assert_eq!(
-            call(json!({"project_dir": "/", "argv": [1]})).token,
+            call(json!({"project_dir": "/", "argv": [1]})).token(),
             "invalid_params"
         );
         assert_eq!(
-            call(json!({"project_dir": "/", "argv": "ls"})).token,
+            call(json!({"project_dir": "/", "argv": "ls"})).token(),
             "invalid_params"
         );
         assert_eq!(
-            call(json!({"project_dir": "/", "argv": ["ls"], "extra": key.as_str()})).token,
+            call(json!({"project_dir": "/", "argv": ["ls"], "extra": key.as_str()})).token(),
             "invalid_params"
         );
-        assert_eq!(call(json!({"argv": ["ls"]})).token, "invalid_params");
+        assert_eq!(call(json!({"argv": ["ls"]})).token(), "invalid_params");
         assert_eq!(
-            call(json!({"project_dir": "/", "argv": ["a\u{0}b"]})).token,
+            call(json!({"project_dir": "/", "argv": ["a\u{0}b"]})).token(),
             "invalid_params"
         );
         let e = call(json!({"project_dir": "/", "argv": ["curl", "-H", key.as_str()]}));
-        assert_eq!(e.token, "value_on_argv");
-        envcloak_testkit::assert_no_canary(e.message.as_bytes(), &cs);
+        assert_eq!(e.token(), "value_on_argv");
+        envcloak_testkit::assert_no_canary(e.message().as_bytes(), &cs);
         let e = call(json!({"project_dir": "rel", "argv": ["ls"]}));
-        assert_eq!(e.token, "invalid_path");
+        assert_eq!(e.token(), "invalid_path");
         let many: Vec<&str> = vec!["x"; MAX_ARGS + 1];
         assert_eq!(
-            call(json!({"project_dir": "/", "argv": many})).token,
+            call(json!({"project_dir": "/", "argv": many})).token(),
             "invalid_params"
         );
     }

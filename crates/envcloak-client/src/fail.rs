@@ -21,10 +21,15 @@ pub const FAILURE: u8 = 1;
 pub type ExitToken = &'static str;
 
 /// A failure to report.
+///
+/// Its fields are private: a failure gets its token only where it is made
+/// ([`Failure::new`], or a conversion in this file), never after, so
+/// `scripts/check-reservations.py` reads every token a failure can carry
+/// where it is made (review of M2-RES1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
-    pub token: ExitToken,
-    pub message: Cow<'static, str>,
+    token: ExitToken,
+    message: Cow<'static, str>,
 }
 
 impl Failure {
@@ -32,6 +37,26 @@ impl Failure {
         Failure {
             token,
             message: message.into(),
+        }
+    }
+
+    /// The failure's stable token.
+    pub fn token(&self) -> ExitToken {
+        self.token
+    }
+
+    /// The failure's message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The same failure with `tail` after its message (`<message>;
+    /// <tail>`).
+    #[must_use]
+    pub fn with_tail(self, tail: &str) -> Self {
+        Failure {
+            token: self.token,
+            message: format!("{}; {tail}", self.message).into(),
         }
     }
 

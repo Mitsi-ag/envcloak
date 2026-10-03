@@ -34,7 +34,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     let (status, identity) = match answer {
         Ok(a) => a,
         Err(f) => {
-            let running = if f.token == ClientError::Unavailable.token() {
+            let running = if f.token() == ClientError::Unavailable.token() {
                 "not running"
             } else {
                 "not verified"

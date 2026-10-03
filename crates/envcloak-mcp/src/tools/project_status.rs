@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(
             check(dir.path(), &ctx, &Call::new(), later())
                 .unwrap_err()
-                .token,
+                .token(),
             "run_failed"
         );
     }

@@ -88,7 +88,7 @@ impl ToolResult {
                 "isError": false,
             }),
             ToolResult::Err(f) => {
-                let text = json!({"error": f.token, "message": f.message}).to_string();
+                let text = json!({"error": f.token(), "message": f.message()}).to_string();
                 json!({"content": [{"type": "text", "text": text}], "isError": true})
             }
         }

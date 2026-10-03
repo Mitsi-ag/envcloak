@@ -56,25 +56,49 @@ String literals are read in every form Rust has (plain, raw, byte and C
 strings), with their escapes decoded.
 
 The CLI's failure tokens are read from every crate's `src/` (comments and
-`#[cfg(test)]` modules left out): the first argument of `Failure::new`, of
-`<alias>::new` for every name `Failure` is imported or defined as
-(`use ... Failure as Fail`, `pub use ... as X`, `type X = Failure;`, and
-aliases of those), and of every function whose first parameter is `token:
-&'static str` (or `ExitToken`); every `token: <value>` field, every string
-in the body of a `fn token`, and the `<token>` of every string literal
-that starts `envcloak: <token>:` (a line printed directly, as `eprintln!`
-does for `coverage`, `warning` and `usage`), whatever crate it is in. A
-first argument is one string literal, a `&str` constant by name, `concat!`
-of string literals (read joined), another value's `.token()` (read from
-the `fn token` bodies), or the enclosing function's own `token`
-parameter (read at its callers); any other expression counts by every
-string literal and every `&str` constant in it (a conditional's every
-branch), and one in which the reader finds neither, or a macro other than
-`concat!` of literals, is an error, never skipped. The reader over-counts
-rather than under-counts: a string it takes for a token that is not
-printed makes a `reserved` row with that name fail, which is a name to
-avoid anyway, and a new one needs a `landed` row like any token. It also
-takes the tokens of audit kinds, error kinds and reasons, so a `landed`
+`#[cfg(test)]` modules left out). `Failure` is defined once, in
+crates/envcloak-client/src/fail.rs, with a private `token` field that
+file never changes after a failure is made (each refused otherwise), so
+no code elsewhere can set a failure's token but by making one, and a
+token is read where a failure is made: the first argument of
+`Failure::new` (also `Self::new` in its `impl`s, `<Failure>::new`, and
+`<alias>::new` for every name `Failure` is imported or defined as: `use
+... Failure as Fail`, `pub use ... as X`, `type X = Failure;`, and
+aliases of those); the `token` field of a `Failure` struct literal,
+written out or shorthand (a pattern only reads one, and is skipped); and
+the argument at each `token` position of a token helper, a free function
+with a `token: &'static str` parameter (or `ExitToken`, or an alias of
+either) in any position, at every call by name. `Failure::new` or a
+token helper named any other way (a function pointer, `use ... as`) is
+an error, since its callers' tokens could not be read. A token argument
+is a string literal, a `&str` constant by name, `concat!` of string
+literals (read joined), another value's `.token()`, or an `if` with its
+`else`, a `match` or a block (after `use` items only) whose every value
+is one of those; in a token helper (and in `Failure::new`) also the
+helper's own `token`, which it may only hand on so: a `let`, a pattern,
+a closure or any other use of that name there is an error, since a
+value its callers did not pass could then reach a failure. Anything else
+is an error, never skipped (review of M2-RES1: a `token` handed on from
+another parameter position, or a struct literal's conditional or
+`concat!`, was passed over). A `.token()` is read from the `fn token`
+bodies: every string literal in any of them counts, and one that returns
+a static string (`&'static str`, `ExitToken` or an alias, or a `&str`
+other than a borrow of its receiver's own field, which lives no longer
+than the receiver) must have only such values, a `Failure`'s own field
+in fail.rs being read where the failure is made. A string literal that
+starts `envcloak: <token>:` counts (a line printed directly, as
+`eprintln!` does for `coverage`, `warning` and `usage`), whatever crate
+it is in; one that starts `envcloak: {...}:` prints its argument where a
+token goes, which must be a token argument as above; and a usage line
+`envcloak: {x}`, whose `x` must be bound by `Err(x)` or `Usage(x)` in a
+function that calls its file's `fn parse`, counts the leading `<token>:`
+of every string literal in that `fn parse`. Within these forms the reader
+over-counts rather than under-counts: a string it takes for a token that
+is not printed makes a `reserved` row with that name fail, which is a name to
+avoid anyway, and a new one needs a `landed` row like any token. Outside
+them, a token put together at run time (pieces joined into a string that
+is printed later) is beyond what a reader of the source can see; review
+keeps such code out. It also takes the tokens of audit kinds, error kinds and reasons, so a `landed`
 or `reuse` row in one of the tables printed as `envcloak: <token>`, or in
 the audit-kind table, accounts for a failure token; a row in any other
 table does not. A table with no code reader yet (the coverage tokens,
@@ -609,16 +633,270 @@ def tags(enum):
 
 STR_TYPE = r"(?:&\s*(?:'static\s+)?str|ExitToken)"
 CONST_DEF = re.compile(r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*%s\s*=" % STR_TYPE)
-HELPER_DEF = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)\s*(?:<[^>]*>)?\s*\(\s*token\s*:\s*(?:&\s*'static\s+str|ExitToken)\b")
 CONST_REF = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)$")
 PRINTED_PREFIX = re.compile(r"envcloak: ([a-z][a-z0-9_]*):")
 # `use ... X as Y` (in a group too) and `type Y = ...::X;`: Y names X.
 ALIAS_USE = re.compile(r"\b([A-Z][A-Za-z0-9_]*)\s+as\s+([A-Z][A-Za-z0-9_]*)\b")
 ALIAS_TYPE = re.compile(r"\btype\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Za-z0-9_]*)\s*;")
-FN_HEAD = re.compile(r"\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:<[^>{;]*>)?\s*\(")
-TOKEN_METHOD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.token\(\s*\)")
+# `type X = &'static str;`: X is a static string type, as `ExitToken` is.
+STATIC_STR_ALIAS = re.compile(r"\btype\s+([A-Z][A-Za-z0-9_]*)\s*=\s*&\s*'static\s+str\s*;")
+FN_NAME = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*")
+IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+# Another value's `.token()`: read from the `fn token` bodies.
+TOKEN_CHAIN = re.compile(r"(?:%s\s*::\s*)*%s(?:\s*\.\s*%s)*\s*\.\s*token\s*\(\s*\)" % (IDENT, IDENT, IDENT))
+# A `Failure`'s own field, read where it is set (fail.rs only).
+FIELD_TOKEN = re.compile(r"%s\s*\.\s*token" % IDENT)
 CONCAT = re.compile(r"(?:(?:::)?(?:std|core)::)?concat\s*!\s*\(")
 MACRO = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*!\s*[\(\[\{]")
+RECEIVER = re.compile(r"^(?:&\s*(?:'[A-Za-z_]+\s+)?)?(?:mut\s+)?self\b")
+TOKEN_PARAM = re.compile(r"^(?:mut\s+)?token\s*:\s*(.+)$", re.S)
+USE_STMT = re.compile(r"\buse\b[^;{}]*(?:\{[^;]*\})?[^;]*;")
+# The file that defines `Failure`: the only one where its fields may be
+# named, which `check_failure_struct` holds it to.
+FAIL_RS = "crates/envcloak-client/src/fail.rs"
+
+
+class Unreadable(Exception):
+    """A failure token in a form the reader cannot read."""
+
+
+class Fn:
+    """A `fn` item: its name, parameters (flattened text), return type,
+    body span (None for a declaration) and where its head starts."""
+
+    def __init__(self, src, name, start, params, ret, body, public):
+        self.src = src
+        self.name = name
+        self.start = start
+        self.params = params
+        self.ret = ret
+        self.body = body
+        self.public = public
+
+
+def generic_end(skel, k):
+    """The offset just after the `>` that closes the `<` at `k` (an `->`
+    inside is not one), or None if a `{` or `;` comes first."""
+    depth = 0
+    for i in range(k, len(skel)):
+        ch = skel[i]
+        if ch == "<":
+            depth += 1
+        elif ch == ">" and skel[i - 1] != "-":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        elif ch in "{;":
+            return None
+    return None
+
+
+def fn_items(src):
+    """Every `fn` item of `src`, generic ones too."""
+    out = []
+    for m in FN_NAME.finditer(src.skel):
+        k = m.end()
+        if src.skel.startswith("<", k):
+            k = generic_end(src.skel, k)
+            if k is None:
+                continue
+            while k < len(src.skel) and src.skel[k].isspace():
+                k += 1
+        if not src.skel.startswith("(", k):
+            continue
+        close = src.close_of(k)
+        params = [" ".join(t.split()) for _, _, t in src.split_top(k + 1, close)]
+        e = BODY_OR_END.search(src.skel, close)
+        ret = " ".join(src.skel[close + 1:e.start() if e else len(src.skel)].split())
+        body = (e.start(), src.block_end(e.start())) if e and e.group(0) == "{" else None
+        head = src.skel[max(0, m.start() - 80):m.start()]
+        public = bool(re.search(r"\bpub\b(?:\s*\([^)]*\))?\s*(?:(?:const|async|unsafe|extern\s*\"[^\"]*\")\s+)*$", head))
+        out.append(Fn(src, m.group(1), m.start(), params, ret, body, public))
+    return out
+
+
+def find_top(src, start, end, what):
+    """The first offset in [start, end) where `what` starts at bracket
+    depth 0, or None."""
+    depth = 0
+    k = start
+    while k < end:
+        ch = src.skel[k]
+        if depth == 0 and src.skel.startswith(what, k):
+            return k
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        k += 1
+    return None
+
+
+def strip_span(src, a, b):
+    while a < b and src.skel[a].isspace():
+        a += 1
+    while b > a and src.skel[b - 1].isspace():
+        b -= 1
+    return a, b
+
+
+class Reading:
+    """What a value may be where it is read: the enclosing token helper's
+    own `token` parameter (`forward`), and a `Failure`'s own field (in
+    fail.rs). `forwards` collects where `token` was taken so."""
+
+    def __init__(self, consts, forward=False, field=False):
+        self.consts = consts
+        self.forward = forward
+        self.field = field
+        self.forwards = []
+
+
+def values_of(src, a, b, r):
+    """Every value the expression at [a, b) can have, as a failure token:
+    a string literal, a `&str` constant, `concat!` of literals, and each
+    branch of an `if`/`else` or a `match` and the tail of a block, read the
+    same way; another value's `.token()` (read from the `fn token` bodies),
+    and where `r` allows it the helper's own `token` and a `Failure`'s own
+    field, add none here. Anything else is `Unreadable`, never skipped."""
+    a, b = strip_span(src, a, b)
+    text = " ".join(src.skel[a:b].split())
+    if a >= b:
+        raise Unreadable("a failure token the reader cannot read (an empty expression)")
+    lit = src.only_string(a, b)
+    if lit is not None:
+        return [lit]
+    if src.skel[a] in "({" and src.close_of(a) == b - 1:
+        if src.skel[a] == "(":
+            return values_of(src, a + 1, b - 1, r)
+        return block_values(src, a, b, r)
+    m = re.match(r"const\s*\{", src.skel[a:b])
+    if m and src.close_of(a + m.end() - 1) == b - 1:
+        return block_values(src, a + m.end() - 1, b, r)
+    if re.match(r"if\b", text):
+        return if_values(src, a, b, r)
+    if re.match(r"match\b", text):
+        return match_values(src, a, b, r)
+    if text == "token":
+        if r.forward:
+            r.forwards.append(a)
+            return []
+        raise Unreadable("a failure token the reader cannot read (`token`): a `token` parameter is read at the callers only of a function whose callers the reader reads, a free function with that parameter of type `&'static str` or `ExitToken`")
+    if TOKEN_CHAIN.fullmatch(text):
+        return []
+    if r.field and FIELD_TOKEN.fullmatch(text):
+        return []
+    m = CONST_REF.match(text)
+    if m:
+        if m.group(1) not in r.consts:
+            raise Unreadable("a failure token names `%s`, which is no `&str` constant the reader knows" % text[:60])
+        return sorted(r.consts[m.group(1)])
+    c = CONCAT.match(src.skel, a)
+    if c:
+        close = src.close_of(c.end() - 1)
+        parts = [src.only_string(x, y) for x, y, _ in src.split_top(c.end(), close)]
+        if close != b - 1 or not parts or any(p is None for p in parts):
+            raise Unreadable("a failure token in `concat!` of something other than string literals (`%s`)" % text[:60])
+        return ["".join(parts)]
+    if MACRO.match(src.skel, a):
+        raise Unreadable("a failure token the reader cannot read (`%s`): a macro other than `concat!` of literals" % text[:60])
+    raise Unreadable("a failure token the reader cannot read (`%s`): write one string literal, a `&str` constant, `concat!` of literals, another value's `.token()`, or an `if`, `match` or block whose every value is one of those" % text[:60])
+
+
+def block_values(src, a, b, r):
+    """The values of the block [a, b) (`{` to `}`): its tail expression,
+    after nothing but `use` items."""
+    inner_a, inner_b = a + 1, b - 1
+    stmts = []
+    k = inner_a
+    while True:
+        semi = find_top(src, k, inner_b, ";")
+        if semi is None:
+            break
+        stmts.append((k, semi))
+        k = semi + 1
+    for x, y in stmts:
+        if src.skel[x:y].strip() and not re.match(r"\s*use\b", src.skel[x:y]):
+            raise Unreadable("a failure token the reader cannot read (`%s`): a block whose value comes after a statement" % " ".join(src.skel[a:b].split())[:60])
+    return values_of(src, k, inner_b, r)
+
+
+def if_values(src, a, b, r):
+    """The values of every branch of the `if` at [a, b), which must end
+    with an `else`."""
+    whole = " ".join(src.skel[a:b].split())[:60]
+    out = []
+    k = a
+    while True:
+        open_at = find_top(src, k + 2, b, "{")
+        if open_at is None:
+            raise Unreadable("a failure token the reader cannot read (`%s`)" % whole)
+        close = src.close_of(open_at)
+        out += block_values(src, open_at, close + 1, r)
+        rest = close + 1
+        m = re.compile(r"\s*else\b\s*").match(src.skel, rest, b)
+        if not m:
+            raise Unreadable("a failure token the reader cannot read (`%s`): an `if` without `else`" % whole)
+        k = m.end()
+        if re.match(r"if\b", src.skel[k:b]):
+            continue
+        if not src.skel.startswith("{", k) or src.close_of(k) != b - 1:
+            raise Unreadable("a failure token the reader cannot read (`%s`)" % whole)
+        return out + block_values(src, k, b, r)
+
+
+def match_values(src, a, b, r):
+    """The values of every arm of the `match` at [a, b)."""
+    whole = " ".join(src.skel[a:b].split())[:60]
+    open_at = find_top(src, a + 5, b, "{")
+    if open_at is None or src.close_of(open_at) != b - 1:
+        raise Unreadable("a failure token the reader cannot read (`%s`)" % whole)
+    out = []
+    k, end = open_at + 1, b - 1
+    while True:
+        while k < end and (src.skel[k].isspace() or src.skel[k] == ","):
+            k += 1
+        if k >= end:
+            break
+        arrow = find_top(src, k, end, "=>")
+        if arrow is None:
+            raise Unreadable("a failure token the reader cannot read (`%s`)" % whole)
+        v = arrow + 2
+        while v < end and src.skel[v].isspace():
+            v += 1
+        if src.skel.startswith("{", v):
+            stop = src.close_of(v) + 1
+        else:
+            comma = find_top(src, v, end, ",")
+            stop = end if comma is None else comma
+        out += values_of(src, v, stop, r)
+        k = stop
+    return out
+
+
+def static_str_types(sources):
+    """`ExitToken` and every alias of `&'static str` or of one of them."""
+    names = {"ExitToken"}
+    pairs = []
+    for src in sources:
+        names |= {m.group(1) for m in STATIC_STR_ALIAS.finditer(src.skel)}
+        pairs += [(m.group(2), m.group(1)) for m in ALIAS_TYPE.finditer(src.skel)]
+    grew = True
+    while grew:
+        grew = False
+        for orig, alias in pairs:
+            if orig in names and alias not in names:
+                names.add(alias)
+                grew = True
+    return names
+
+
+def is_static_str(ty, statics):
+    ty = " ".join(ty.split())
+    if re.fullmatch(r"&\s*'static\s+str", ty):
+        return True
+    last = re.fullmatch(r"(?:%s::)*(%s)" % (IDENT, IDENT), ty)
+    return bool(last and last.group(1) in statics)
 
 
 def failure_names(sources):
@@ -639,122 +917,308 @@ def failure_names(sources):
     return names
 
 
-def token_param_spans(src):
-    """The bodies of the functions whose parameters include `token`."""
+def impl_spans(src, names):
+    """The bodies of `impl` blocks whose `Self` is one of `names`."""
     spans = []
-    for m in FN_HEAD.finditer(src.skel):
-        close = src.close_of(m.end() - 1)
-        if not re.search(r"\btoken\s*:", src.skel[m.end():close]):
+    for m in re.finditer(r"\bimpl\b", src.skel):
+        open_at = BODY_OR_END.search(src.skel, m.end())
+        if not open_at or open_at.group(0) != "{":
             continue
-        k = BODY_OR_END.search(src.skel, close)
-        if k and k.group(0) == "{":
-            spans.append((k.start(), src.block_end(k.start())))
+        head = " ".join(src.skel[m.end():open_at.start()].split())
+        head = re.sub(r"^<.*?>\s*", "", head) if head.startswith("<") else head
+        target = head.split(" for ", 1)[1] if " for " in " %s " % head else head
+        last = re.match(r"(?:%s::)*(%s)" % (IDENT, IDENT), target.strip())
+        if last and last.group(1) in names:
+            spans.append((open_at.start(), src.block_end(open_at.start())))
     return spans
+
+
+def check_failure_struct(sources, names):
+    """`Failure` is defined once, in fail.rs, and its `token` field is
+    private: elsewhere no struct literal, field assignment or borrow of it
+    compiles, so `Failure::new`, the struct literals of fail.rs and the
+    conversions it defines are the only ways a failure gets its token."""
+    defs = []
+    for src in sources:
+        for m in re.finditer(r"\bstruct\s+(%s)\b" % "|".join(map(re.escape, sorted(names))), src.skel):
+            defs.append((src, m))
+    if len(defs) != 1 or defs[0][0].rel != FAIL_RS:
+        raise SourceError("`Failure` must be defined once, in %s (found in %s)" % (FAIL_RS, ", ".join(s.rel for s, _ in defs) or "no file"))
+    src, m = defs[0]
+    open_at = src.skel.index("{", m.end())
+    fields = src.skel[open_at + 1:src.block_end(open_at) - 1]
+    if re.search(r"\bpub\b(?:\s*\([^)]*\))?\s+token\s*:", fields):
+        raise SourceError("%s: `Failure`'s `token` field is public: a failure's token could then be set where the reader does not look; keep it private" % FAIL_RS)
+    for k in re.finditer(r"\.\s*token\s*(?:=(?!=)|[-+*/|&^]=)|&\s*mut\s+[\w.]*\btoken\b", src.skel):
+        raise SourceError("%s line %d: `Failure`'s token is changed after it is made; a token is given only when the failure is made" % (FAIL_RS, src.skel.count("\n", 0, k.start()) + 1))
 
 
 def code_exit_tokens(root):
     """Tokens the CLI can print for its own failures, with the first file
     each is found in (see the module comment for what is read)."""
     sources = rust_sources(root)
+    statics = static_str_types(sources)
+    names = failure_names(sources)
+    check_failure_struct(sources, names)
     consts = {}
-    helpers = set()
     for src in sources:
         for m in CONST_DEF.finditer(src.skel):
             lit = src.string_at(m.end())
             if lit is not None:
                 consts.setdefault(m.group(1), set()).add(lit[1])
-        for m in HELPER_DEF.finditer(src.skel):
-            if m.group(1) != "new":
-                helpers.add(m.group(1))
+    fns = {src.rel: fn_items(src) for src in sources}
+    # Token helpers: free functions with a `token: &'static str` (or an
+    # alias) parameter, by name, with its positions.
+    helpers = {}
+    # Where a helper's name is read: every file for a `pub` one, its own
+    # file otherwise (a private function is not visible elsewhere).
+    scope = {}
+    exempt = []
+    for src in sources:
+        failure_impls = impl_spans(src, names) if src.rel == FAIL_RS else []
+        for f in fns[src.rel]:
+            if f.body is None:
+                continue
+            positions = [i for i, p in enumerate(f.params)
+                         if TOKEN_PARAM.match(p) and is_static_str(TOKEN_PARAM.match(p).group(1), statics)]
+            if not positions:
+                continue
+            if f.params and RECEIVER.match(f.params[0]):
+                continue
+            if f.name == "new":
+                # `Failure::new` itself, whose callers are read below.
+                if any(x < f.start < y for x, y in failure_impls) and positions == [0]:
+                    exempt.append((src, f))
+                continue
+            helpers.setdefault(f.name, set()).update(positions)
+            files = scope.setdefault(f.name, set())
+            files.add(None if f.public else src.rel)
+            exempt.append((src, f))
     found = {}
 
-    def take_value(value, src):
-        if TOKEN.match(value):
-            found.setdefault(value, src.rel)
-
-    def take(src, a, b):
-        """The field value at [a, b): a string literal of any form, or a
-        constant by name."""
-        value = src.only_string(a, b)
-        if value is not None:
-            take_value(value, src)
-            return
-        m = CONST_REF.match(src.skel[a:b].strip())
-        for v in consts.get(m.group(1), ()) if m else ():
-            take_value(v, src)
-
-    def take_token_arg(src, a, b, own_param):
-        """The token argument at [a, b) of a failure constructor or token
-        helper (see the module comment); one it cannot read is an error."""
-        text = " ".join(src.skel[a:b].split())
-        where = "%s line %d" % (src.rel, src.skel.count("\n", 0, a) + 1)
-        value = src.only_string(a, b)
-        if value is not None:
-            take_value(value, src)
-            return
-        m = CONST_REF.match(text)
-        if m:
-            if m.group(1) not in consts:
-                raise SourceError("%s: a failure token names `%s`, which is no `&str` constant the reader knows" % (where, text[:60]))
-            for v in consts[m.group(1)]:
-                take_value(v, src)
-            return
-        if text == "token" and own_param:
-            return
-        if TOKEN_METHOD.fullmatch(text):
-            return
-        lead = len(src.skel[a:b]) - len(src.skel[a:b].lstrip())
-        c = CONCAT.match(src.skel, a + lead)
-        if c:
-            close = src.close_of(c.end() - 1)
-            if src.skel[close + 1:b].strip():
-                raise SourceError("%s: a failure token the reader cannot read (`%s`)" % (where, text[:60]))
-            parts = [src.only_string(x, y) for x, y, _ in src.split_top(c.end(), close)]
-            if not parts or any(p is None for p in parts):
-                raise SourceError("%s: a failure token in `concat!` of something other than string literals (`%s`)" % (where, text[:60]))
-            take_value("".join(parts), src)
-            return
-        if MACRO.search(src.skel, a, b):
-            raise SourceError("%s: a failure token the reader cannot read (`%s`): a macro other than `concat!` of literals" % (where, text[:60]))
-        values = list(src.literals(a, b))
-        for ident in re.findall(r"\b[A-Z][A-Z0-9_]*\b", src.skel[a:b]):
-            values += sorted(consts.get(ident, ()))
-        if not values:
-            raise SourceError("%s: a failure token the reader cannot read (`%s`): write one string literal, a `&str` constant or `concat!` of literals" % (where, text[:60]))
+    def take(values, src):
         for v in values:
-            take_value(v, src)
+            if TOKEN.match(v):
+                found.setdefault(v, src.rel)
 
-    ctors = sorted(failure_names(sources))
-    calls = [r"(?<![\w:])(?:[A-Za-z_][A-Za-z0-9_]*::)*(?:%s)::new\s*\(" % "|".join(map(re.escape, ctors))]
-    calls += [r"(?<!\w)(?<!fn )%s\s*\(" % re.escape(h) for h in sorted(helpers)]
-    call = re.compile("|".join(calls))
+    def where(src, at):
+        return "%s line %d" % (src.rel, src.skel.count("\n", 0, at) + 1)
+
+    def body_of(src, at):
+        """The exempt function whose body holds `at`, if any."""
+        for s, f in exempt:
+            if s is src and f.body[0] < at < f.body[1]:
+                return f
+        return None
+
+    forwarded = {}
+    field_names = {}
+
+    def read(src, a, b, field=False):
+        f = body_of(src, a)
+        r = Reading(consts, forward=f is not None, field=field and src.rel == FAIL_RS)
+        try:
+            take(values_of(src, a, b, r), src)
+        except Unreadable as e:
+            raise SourceError("%s: %s" % (where(src, a), e))
+        for at in r.forwards:
+            forwarded.setdefault(src.rel, set()).add(at)
+
+    alias = "|".join(map(re.escape, sorted(names)))
+    ctor = re.compile(r"(?<![\w:])(?:<\s*)?(?:%s::)*(?:%s)(?:\s*>)?\s*::\s*new\b" % (IDENT, alias))
+    helper_word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, sorted(helpers)))) if helpers else None
+    literal_of = re.compile(r"(?<![\w:])(?:%s::)*(%s|Self)\s*\{" % (IDENT, alias))
     for src in sources:
-        own = token_param_spans(src)
-        for m in call.finditer(src.skel):
-            a, b = src.first_arg(m.end() - 1)
-            take_token_arg(src, a, b, any(x < m.start() < y for x, y in own))
+        failure_impls = impl_spans(src, names)
+        # `Failure::new(..)` (and its aliases): the first argument. Named
+        # any other way (a function pointer, a turbofish), it is refused.
+        ctors = list(ctor.finditer(src.skel))
+        ctors += [m for m in re.finditer(r"(?<![\w:])Self\s*::\s*new\b", src.skel)
+                  if any(x < m.start() < y for x, y in failure_impls)]
+        for m in ctors:
+            k = m.end()
+            rest = src.skel[k:k + 200]
+            call = re.match(r"\s*(?:::\s*<[^()]*>\s*)?\(", rest)
+            if not call:
+                raise SourceError("%s: `%s` is used other than called, so its tokens could not be read" % (where(src, m.start()), " ".join(m.group(0).split())))
+            open_at = k + call.end() - 1
+            args = src.split_top(open_at + 1, src.close_of(open_at))
+            if args:
+                read(src, args[0][0], args[0][1])
+        # Token helpers: the argument at each `token` position, and every
+        # mention of a helper other than a call or its own definition.
+        if helper_word:
+            for m in helper_word.finditer(src.skel):
+                name = m.group(1)
+                if None not in scope[name] and src.rel not in scope[name]:
+                    continue
+                before = src.skel[:m.start()].rstrip()
+                if before.endswith(".") or re.search(r"\bfn$", before):
+                    continue
+                rest = src.skel[m.end():m.end() + 200]
+                call = re.match(r"\s*(?:::\s*<[^()]*>\s*)?\(", rest)
+                if not call:
+                    in_use = any(u.start() < m.start() < u.end() for u in USE_STMT.finditer(src.skel))
+                    if in_use and not re.match(r"\s+as\b", rest):
+                        continue
+                    raise SourceError("%s: the token helper `%s` is used other than called by name, so the tokens handed to it would not be read" % (where(src, m.start()), name))
+                open_at = m.end() + call.end() - 1
+                args = src.split_top(open_at + 1, src.close_of(open_at))
+                for i in sorted(helpers[name]):
+                    if i < len(args):
+                        read(src, args[i][0], args[i][1])
+        # Struct literals of `Failure` (and `Self` in its `impl`s): the
+        # `token` field, written out or shorthand. A pattern (after `let`,
+        # before `=>` or `=`, or with `..`) only reads one, and is skipped.
+        for m in literal_of.finditer(src.skel):
+            if m.group(1) == "Self" and not any(x < m.start() < y for x, y in failure_impls):
+                continue
+            before = src.skel[:m.start()].rstrip()
+            if re.search(r"\b(?:struct|enum|union|impl|for|let)$", before) or before.endswith(("|", "->")):
+                continue
+            open_at = m.end() - 1
+            close = src.close_of(open_at)
+            after = src.skel[close + 1:close + 4].lstrip()
+            if after.startswith("=>") or (after.startswith("=") and not after.startswith("==")):
+                continue
+            fields = src.split_top(open_at + 1, close)
+            if any(t.strip() == ".." for _, _, t in fields):
+                continue
+            for x, y, t in fields:
+                fm = re.match(r"(\s*)token\b(\s*:(?!:))?", src.skel[x:y])
+                if not fm:
+                    continue
+                at = x + len(fm.group(1))
+                field_names.setdefault(src.rel, set()).add(at)
+                if fm.group(2):
+                    read(src, x + fm.end(), y, field=True)
+                elif not src.skel[at + 5:y].strip():
+                    read(src, at, at + 5)
+                else:
+                    raise SourceError("%s: a `Failure` literal's `token` field the reader cannot read" % where(src, at))
+        # Other structs' `token` fields: a literal or a constant counts.
         for m in re.finditer(r"\btoken\s*:\s*", src.skel):
             k = m.end()
             lit = src.string_at(k)
             if lit is not None:
-                take_value(lit[1], src)
+                take([lit[1]], src)
             else:
-                ident = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Z0-9_]*\b", src.skel[k:])
-                if ident:
-                    take(src, k, k + ident.end())
-        for start, end in src.fn_bodies("token"):
-            for lit in src.literals(start, end):
-                take_value(lit, src)
-            for ident in re.findall(r"\b[A-Z][A-Z0-9_]*\b", src.skel[start:end]):
-                for v in consts.get(ident, ()):
-                    take_value(v, src)
-        for lit in src.literals(0, len(src.skel)):
+                ident = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)\b", src.skel[k:])
+                if ident and ident.group(1) in consts:
+                    take(sorted(consts[ident.group(1)]), src)
+        # `fn token`: every string in it; and one returning a static
+        # string, every value it can have.
+        for f in fns[src.rel]:
+            if f.name != "token" or f.body is None:
+                continue
+            take(src.literals(*f.body), src)
+            ret = re.sub(r"^->\s*", "", f.ret)
+            ret = re.sub(r"\s*where\b.*$", "", ret)
+            if is_static_str(ret, statics):
+                pass
+            elif re.fullmatch(r"&\s*str", ret):
+                # A borrow of the receiver's own field lives no longer than
+                # the receiver: never a `&'static str` failure token.
+                body = " ".join(src.skel[f.body[0] + 1:f.body[1] - 1].split())
+                if re.fullmatch(r"&\s*(?:\*\s*)?self\s*\.\s*%s|self\s*\.\s*%s\s*\.\s*as_str\s*\(\s*\)" % (IDENT, IDENT), body):
+                    continue
+            else:
+                continue
+            read(src, f.body[0], f.body[1], field=True)
+        # A line printed as `envcloak: <token>:`: from a literal, the token;
+        # from a placeholder, the value of its argument.
+        for start in src.starts:
+            lit = src.strings[start][1]
             m = PRINTED_PREFIX.match(lit)
             if m:
-                take_value(m.group(1), src)
+                take([m.group(1)], src)
+            elif lit.startswith("envcloak: {"):
+                printed_placeholder(src, start, lit, fns[src.rel], read, take)
+    # A helper's `token` is only ever handed on as a failure token: any
+    # other mention (a `let` or a pattern that rebinds it, a use in an
+    # expression) would let a value the callers did not pass reach it.
+    for src, f in exempt:
+        for m in re.finditer(r"\btoken\b", src.skel[f.body[0]:f.body[1]]):
+            at = f.body[0] + m.start()
+            before = src.skel[:at].rstrip()
+            after = src.skel[at + 5:at + 7]
+            if before.endswith(".") or after.startswith("::") or after.startswith("!"):
+                continue
+            if at in forwarded.get(src.rel, ()):
+                continue
+            if at in field_names.get(src.rel, ()):
+                continue
+            raise SourceError("%s: `%s`'s `token` is used other than handed on as a failure token, so a value its callers did not pass could reach one" % (where(src, at), f.name))
     if not found:
         raise SourceError("no CLI failure tokens found under crates/*/src")
     return found
+
+
+def printed_placeholder(src, start, lit, items, read, take):
+    """A string literal starting `envcloak: {`: the placeholder is printed
+    where a token goes. Followed by `:`, it is a token, and its argument
+    must be one the reader reads. Otherwise it is a usage line, `envcloak:
+    <message>`, whose message must come from this file's `fn parse` (an
+    `Err(x)` or `Usage(x)` of a `parse(..)` call in the same function):
+    every string there starting `<token>:` counts as a token."""
+    end = src.strings[start][0]
+    where = "%s line %d" % (src.rel, src.skel.count("\n", 0, start) + 1)
+    pm = re.match(r"envcloak: \{([^{}:]*)(?::[^{}]*)?\}(:?)", lit)
+    if not pm:
+        raise SourceError("%s: a line printed as `envcloak: {...}` the reader cannot read" % where)
+    name, token_position = pm.group(1).strip(), pm.group(2) == ":"
+    # The format macro's arguments after the literal.
+    depth, k = 0, start - 1
+    while k >= 0:
+        ch = src.skel[k]
+        if ch in ")]}":
+            depth += 1
+        elif ch in "([{":
+            if depth == 0:
+                break
+            depth -= 1
+        k -= 1
+    if k < 0 or src.skel[k] != "(":
+        raise SourceError("%s: a line printed as `envcloak: {...}` outside a format macro's arguments" % where)
+    args = src.split_top(k + 1, src.close_of(k))
+    at = [i for i, (x, y, _) in enumerate(args) if x <= start < y]
+    rest = args[at[0] + 1:] if at else []
+    positional = [(x, y) for x, y, t in rest if not re.match(r"\s*%s\s*=(?!=)" % IDENT, t)]
+    named = {re.match(r"\s*(%s)" % IDENT, t).group(1): (x + t.index("=") + 1, y)
+             for x, y, t in rest if re.match(r"\s*%s\s*=(?!=)" % IDENT, t)}
+    if name == "" or name.isdigit():
+        i = int(name) if name else 0
+        if i >= len(positional):
+            raise SourceError("%s: a line printed as `envcloak: {}` without its argument" % where)
+        span = positional[i]
+    elif name in named:
+        span = named[name]
+    else:
+        span = None
+    if token_position:
+        if span is not None:
+            read(src, span[0], span[1], field=True)
+            return
+        raise SourceError("%s: a line printed as `envcloak: {%s}:` takes its token from a variable the reader cannot read; print a failure's token (`.token()`)" % (where, name))
+    ident = None
+    if span is None and re.fullmatch(IDENT, name):
+        ident = name
+    elif span is not None and re.fullmatch(IDENT, src.skel[span[0]:span[1]].strip()):
+        ident = src.skel[span[0]:span[1]].strip()
+    holder = [f for f in items if f.body and f.body[0] < start < f.body[1]]
+    parse = [f for f in items if f.name == "parse" and f.body]
+    ok = False
+    if ident and holder and parse:
+        body = src.skel[holder[-1].body[0]:holder[-1].body[1]]
+        bound = re.search(r"(?:\bErr|::\s*Usage)\s*\(\s*%s\s*\)" % re.escape(ident), body)
+        ok = bool(bound and re.search(r"(?<![\w.:])parse\s*\(", body))
+    if not ok:
+        raise SourceError("%s: a usage line `envcloak: {%s}` whose message the reader cannot trace to this file's `fn parse`" % (where, name))
+    for f in parse:
+        for v in src.literals(*f.body):
+            m = re.match(r"([a-z][a-z0-9_]*):", v)
+            if m:
+                take([m.group(1)], src)
 
 
 TOOL_CONST = re.compile(r"\bconst\s+TOOL\s*:\s*%s\s*=" % STR_TYPE)
