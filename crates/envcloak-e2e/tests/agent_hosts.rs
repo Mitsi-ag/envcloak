@@ -44,19 +44,62 @@ fn the_network_is_what_ci_says() {
     envcloak_e2e::check_network();
 }
 
+/// A Mach-O file that imports every entry of
+/// [`envcloak_e2e::OPEN_RESOLVERS`] by that very name, built with the
+/// system's C compiler (each symbol left for the loader to find, so no
+/// framework need be linked): the guard's positive control, one per
+/// entry. Its directory goes with the result.
+fn importer_of_every_open_resolver() -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::fmt::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = String::new();
+    for (i, sym) in envcloak_e2e::OPEN_RESOLVERS.iter().enumerate() {
+        writeln!(c, "extern char s{i} __asm__(\"{sym}\");").unwrap();
+    }
+    c.push_str("int main(void) { volatile const void *p[] = {");
+    for i in 0..envcloak_e2e::OPEN_RESOLVERS.len() {
+        write!(c, "&s{i}, ").unwrap();
+    }
+    c.push_str("0}; return p[0] == 0; }\n");
+    let src = dir.path().join("imports.c");
+    std::fs::write(&src, c).unwrap();
+    let out = dir.path().join("imports");
+    let built = std::process::Command::new("/usr/bin/cc")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("-o")
+        .arg(&out)
+        .arg(&src)
+        .arg("-Wl,-undefined,dynamic_lookup")
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "the positive control could not be built: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    (dir, out)
+}
+
 /// What the loopback-only isolation leaves open on macOS (verifier review
 /// of M2-04): the resolver's XPC service, which Network.framework,
-/// URLSession, `dnssd_getaddrinfo` and `CFHostStartInfoResolution` use,
-/// and which no file access control can deny. No executable or library of
-/// a pinned host's tree, nor the Node.js that runs a script host, imports
-/// any of them ([`envcloak_e2e::OPEN_RESOLVERS`]), so the isolation covers
-/// the lookups the hosts can make (`getaddrinfo`); the positive control,
-/// `/usr/bin/nscurl`, a client on Network.framework, is found. On Linux
-/// the check does not apply: there is no such API, and systemd-resolved's
-/// sockets are stated uncovered in docs/ACCEPTANCE.md.
+/// URLSession, CFNetwork's streams and host lookups and
+/// `dnssd_getaddrinfo` use, and which no file access control can deny. No
+/// executable or library of a pinned host's tree, nor the Node.js that
+/// runs a script host, imports any of them
+/// ([`envcloak_e2e::OPEN_RESOLVERS`]): a check of static imports only,
+/// which a framework loaded at run time (`dlopen`) passes unseen
+/// (docs/ACCEPTANCE.md). The positive controls: a program built here that
+/// imports every entry is found by each, and `/usr/bin/nscurl`, a client
+/// on URLSession and Network.framework, by its URLSession class and its
+/// connection calls. On Linux the check does not apply: there is no such
+/// API, and systemd-resolved's sockets are stated uncovered in
+/// docs/ACCEPTANCE.md.
 ///
-/// Mutation checked: the guard matching no import (`find` never true):
-/// the control is not found and this fails.
+/// Mutations checked: the guard matching no import (`filter` never
+/// true): the controls are not found and this fails. An entry left out of
+/// the guard (URLSession's class, as the verifier of M2-RES1 found): its
+/// control is not found and this fails.
 #[test]
 fn no_pinned_host_imports_a_resolver_the_isolation_leaves_open() {
     if !cfg!(target_os = "macos") {
@@ -66,11 +109,21 @@ fn no_pinned_host_imports_a_resolver_the_isolation_leaves_open() {
         );
         return;
     }
+    let (_dir, importer) = importer_of_every_open_resolver();
+    let hits = envcloak_e2e::open_resolver_imports(&importer).unwrap();
+    for entry in envcloak_e2e::OPEN_RESOLVERS {
+        assert!(
+            hits.iter().any(|(_, sym)| sym == entry),
+            "the guard does not find {entry} in a program that imports it: {hits:?}"
+        );
+    }
     let control = envcloak_e2e::open_resolver_imports(Path::new("/usr/bin/nscurl")).unwrap();
-    assert!(
-        !control.is_empty(),
-        "the positive control, /usr/bin/nscurl, imports none"
-    );
+    for wanted in ["_OBJC_CLASS_$_NSURLSession", "_nw_connection_"] {
+        assert!(
+            control.iter().any(|(_, sym)| sym.starts_with(wanted)),
+            "the positive control, /usr/bin/nscurl, is not found by {wanted}: {control:?}"
+        );
+    }
     for pin in pins(&versions_toml()) {
         let found = Installed::find(&versions_toml(), &pin.id, &pin.variant);
         let label = format!("{}/{}", pin.id, pin.variant);

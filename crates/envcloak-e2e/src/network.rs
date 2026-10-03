@@ -14,18 +14,25 @@
 //!
 //! What that does not refuse (verifier review of M2-04): on macOS the
 //! resolver also answers over its XPC service (`com.apple.dnssd.service`),
-//! which Network.framework, URLSession, `dnssd_getaddrinfo` and
-//! `CFHostStartInfoResolution` use, and which no file access control can
-//! deny; on Linux, systemd-resolved's varlink and D-Bus endpoints are
+//! which Network.framework, URLSession, CFNetwork's streams and host
+//! lookups and `dnssd_getaddrinfo` use, and which no file access control
+//! can deny; on Linux, systemd-resolved's varlink and D-Bus endpoints are
 //! filesystem sockets a network namespace does not cut off (not
 //! measured). So a program that resolves through those could still send a
 //! name, and a value in it, to external DNS unrecorded.
-//! [`open_resolver_imports`] guards the pinned hosts on macOS: a host's
-//! test fails if any executable or library of its pinned tree imports one
-//! of [`OPEN_RESOLVERS`]. None does today (Claude Code's binaries link
-//! `getaddrinfo` only; Codex imports `getaddrinfo` and CFNetwork's proxy
-//! auto-configuration calls, which fetch a PAC URL only when the system
-//! names one, and none is set on the runners).
+//! [`open_resolver_imports`] guards the pinned hosts on macOS, by their
+//! static imports only: a host's test fails if any executable or library
+//! of its pinned tree imports one of [`OPEN_RESOLVERS`]. None does today:
+//! Claude Code's native binary imports `getaddrinfo` and dns_sd's
+//! `DNSServiceGetAddrInfo`, which `dns_sd.h` documents as working over a
+//! Unix domain socket to the resolver (`DNSServiceRefSockFD`), the socket
+//! the access control entry denies; Codex
+//! imports `getaddrinfo` and CFNetwork's proxy auto-configuration calls,
+//! which fetch a PAC URL only when the system names one, and none is set
+//! on the runners. What imports cannot show is not covered (verifier
+//! review of M2-RES1): a framework a program loads at run time
+//! (`dlopen`, as Bun's and Node's foreign function interfaces can), and
+//! Foundation calls that load a URL without naming URLSession.
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -91,17 +98,29 @@ fn resolves(name: &str) -> Result<(), String> {
 }
 
 /// The macOS resolver entry points the tests' isolation does not refuse
-/// (see the module documentation): imported symbols starting so.
-pub const OPEN_RESOLVERS: [&str; 4] = [
+/// (see the module documentation), as a program imports them: imported
+/// symbols starting so. Network.framework's connections and resolver
+/// configuration; libdnssd's XPC lookup; CFNetwork's host lookup, its
+/// socket streams to a named host and its HTTP streams; and URLSession and
+/// NSURLConnection, whose Objective-C classes a program imports by their
+/// class symbols (verifier review of M2-RES1).
+pub const OPEN_RESOLVERS: [&str; 10] = [
     "_nw_connection_",
     "_nw_resolver",
     "_dnssd_getaddrinfo",
     "_CFHostStartInfoResolution",
+    "_CFStreamCreatePairWithSocketToHost",
+    "_CFStreamCreatePairWithSocketToCFHost",
+    "_CFReadStreamCreateForHTTPRequest",
+    "_CFReadStreamCreateForStreamedHTTPRequest",
+    "_OBJC_CLASS_$_NSURLSession",
+    "_OBJC_CLASS_$_NSURLConnection",
 ];
 
-/// Every Mach-O file at or under `path` (not following symlinks) that
-/// imports one of [`OPEN_RESOLVERS`], with the first such symbol, as
-/// `nm -u` lists its imports. Files that are not Mach-O are skipped.
+/// Every import of [`OPEN_RESOLVERS`] by a Mach-O file at or under `path`
+/// (not following symlinks), as (file, symbol), as `nm -u` lists the
+/// file's imports. Files that are not Mach-O are skipped. Only static
+/// imports are seen: a framework loaded at run time is not.
 ///
 /// # Errors
 /// When a directory cannot be read, or `nm` fails on a Mach-O file: a
@@ -144,13 +163,17 @@ pub fn open_resolver_imports(path: &std::path::Path) -> Result<Vec<(String, Stri
             return Err(format!("nm could not read the imports of {}", p.display()));
         }
         let text = String::from_utf8_lossy(&out.stdout);
-        if let Some(sym) = text
+        let mut syms: Vec<&str> = text
             .lines()
             .map(str::trim)
-            .find(|l| OPEN_RESOLVERS.iter().any(|r| l.starts_with(r)))
-        {
-            found.push((p.display().to_string(), sym.to_owned()));
-        }
+            .filter(|l| OPEN_RESOLVERS.iter().any(|r| l.starts_with(r)))
+            .collect();
+        syms.sort_unstable();
+        syms.dedup();
+        found.extend(
+            syms.into_iter()
+                .map(|sym| (p.display().to_string(), sym.to_owned())),
+        );
     }
     Ok(found)
 }
