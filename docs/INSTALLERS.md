@@ -15,7 +15,7 @@ Exit 0 when every change was made or was there already; otherwise 1 with `agents
 
 ## Hosts are detected, never assumed
 
-A host is the executable of its name on `PATH` (`claude`, `codex`) asked for its `--version` with a cleared environment (`HOME`, `PATH` and the host's own location variable) and a 5-second limit. The answer is read strictly: Claude Code's `<version> (Claude Code)`, Codex's `codex-cli <version>`, the version three runs of digits with an optional pre-release. Any other answer is `not_recognized`, and nothing is written for that host (SPEC §7.2 rule 1).
+A host is the executable of its name on `PATH` (`claude`, `codex`) asked for its `--version` with a cleared environment (`HOME`, `PATH` and the host's own location variable) and a 5-second limit, which covers reading its output too: a process it leaves behind holding the output open ends the wait at the limit, as `version_timeout` (the same bound applies to the `claude mcp` commands, 60 seconds). The answer is read strictly: Claude Code's `<version> (Claude Code)`, Codex's `codex-cli <version>`, the version three runs of digits with an optional pre-release. Any other answer is `not_recognized`, and nothing is written for that host (SPEC §7.2 rule 1).
 
 ## What install writes
 
