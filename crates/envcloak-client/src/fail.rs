@@ -297,7 +297,7 @@ fn reason_text_for(kind: ErrorKind, reason: &str) -> &'static str {
 fn reason_text(reason: &str) -> &'static str {
     REASON_TEXTS
         .iter()
-        .find(|(token, _)| *token == reason)
+        .find(|(name, _)| *name == reason)
         .map_or("no detail", |(_, text)| text)
 }
 
