@@ -184,6 +184,13 @@ pub struct State {
     /// command line, by host id.
     #[serde(default)]
     pub mcp: BTreeMap<String, Value>,
+    /// Files EnvCloak gave back by an undo, so nothing of its own is left
+    /// in them, by absolute path, with the stamp that write left: while a
+    /// file's stamp is still this one, EnvCloak's next change of it (an
+    /// install right after an uninstall) is its own edit, exempt from the
+    /// 2-minute rule like any other (D-16).
+    #[serde(default)]
+    pub written: BTreeMap<String, Stamp>,
 }
 
 /// The state file's format version.
@@ -510,10 +517,10 @@ impl Writer<'_> {
     /// Whether `stamp` is the one EnvCloak recorded for `path` right after
     /// its own last write.
     fn own(&self, path: &Path, stamp: &FileStamp) -> bool {
-        self.state
-            .files
-            .get(&key(path))
-            .is_some_and(|r| r.stamp == Stamp::from(*stamp))
+        let k = key(path);
+        let s = Stamp::from(*stamp);
+        self.state.files.get(&k).is_some_and(|r| r.stamp == s)
+            || self.state.written.get(&k) == Some(&s)
     }
 
     /// D-16: a file its host rewrites is changed only while no other
@@ -585,6 +592,7 @@ impl Writer<'_> {
         let sp = splice(&before_text, &after_text);
         let k = key(&t.path);
         let created = r.current.is_none();
+        self.state.written.remove(&k);
         let rec = self.state.files.entry(k).or_insert_with(|| FileRecord {
             host: t.host.to_owned(),
             scope: t.scope.clone(),
@@ -664,8 +672,9 @@ impl Writer<'_> {
             Undo::Rewrite(after) => {
                 self.host_rule(t, &r, stamp)?;
                 let id = self.backups.back_up(&t.path, bytes, stamp.mode)?;
-                replace_atomically(&r.root, &r.name, &after, stamp)
+                let left = replace_atomically(&r.root, &r.name, &after, stamp)
                     .map_err(|e| Refusal::modify(&e))?;
+                self.state.written.insert(k.clone(), Stamp::from(left));
                 self.backups.record(&id, &after)?;
                 Outcome::Changed {
                     created: false,
@@ -684,6 +693,7 @@ impl Writer<'_> {
                 };
                 let id = self.backups.back_up(&t.path, bytes, stamp.mode)?;
                 remove_checked_at(&r.root, &r.name, stamp, at).map_err(|e| Refusal::modify(&e))?;
+                self.state.written.remove(&k);
                 self.backups.record(&id, b"")?;
                 Outcome::Removed { backup: Some(id) }
             }
@@ -835,6 +845,49 @@ mod tests {
             "{o:?}"
         );
         assert_eq!(std::fs::read(&p).unwrap_or_default(), b"{}\n");
+    }
+
+    /// EnvCloak's own writes, its undo included, leave a stamp it knows:
+    /// an install right after an uninstall needs no 2-minute wait, while a
+    /// file someone else wrote since still does.
+    #[test]
+    fn a_change_right_after_envcloaks_own_undo_is_its_own() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, b"{}\n").unwrap_or_else(|e| panic!("{e}"));
+        let old = SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .and_then(|f| f.set_modified(old))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut state = State::default();
+        let mut kept = Kept::default();
+        let mut w = Writer {
+            state: &mut state,
+            backups: &mut kept,
+            now: SystemTime::now(),
+        };
+        let t = target(&p, true);
+        assert!(matches!(w.change(&t, &mut append("x")), Outcome::Changed { .. }));
+        assert!(matches!(
+            w.undo(&t, &mut |_, _, _| Ok(Undo::Nothing)),
+            Outcome::Changed { .. }
+        ));
+        assert_eq!(std::fs::read(&p).unwrap_or_default(), b"{}\n");
+        let o = w.change(&t, &mut append("x"));
+        assert!(matches!(o, Outcome::Changed { .. }), "{o:?}");
+        assert!(matches!(
+            w.undo(&t, &mut |_, _, _| Ok(Undo::Nothing)),
+            Outcome::Changed { .. }
+        ));
+        // Someone else writes it now: the 2 minutes apply again.
+        std::fs::write(&p, b"{ }\n").unwrap_or_else(|e| panic!("{e}"));
+        let o = w.change(&t, &mut append("x"));
+        assert!(
+            matches!(&o, Outcome::Refused(r) if r.name == "recently_changed"),
+            "{o:?}"
+        );
     }
 
     /// A change made by someone else between EnvCloak's read and its

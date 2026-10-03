@@ -553,6 +553,14 @@ fn install_then_uninstall_gives_every_byte_back() {
     let (u2, code) = f.report(&["uninstall", "--yes"]);
     assert_eq!(code, 0, "{u2}");
     assert!(outcomes(&u2).is_empty(), "{u2}");
+    // Installed again at once: the uninstall's writes were EnvCloak's own.
+    let (v3, code) = f.report(&["install", "--yes"]);
+    assert_eq!(code, 0, "{v3}");
+    let (u3, code) = f.report(&["uninstall", "--yes"]);
+    assert_eq!(code, 0, "{u3}");
+    for (p, b) in FILES.iter().zip(&before) {
+        assert!(&f.read(p) == b, "{p} is not as it was after a second round");
+    }
     f.sweep();
 }
 
