@@ -78,14 +78,15 @@ use envcloak_core::audit::{ProjectSummary, SubjectSummary};
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{FieldId, ItemId, Slug, Vault, VaultErrorKind};
 use envcloak_ipc::proto::{
-    self, ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, PendingListParams,
-    PendingStateParams, ReleasedValue, RequestParams, RevokeParams, RunAnswer, RunRequestParams,
+    ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, PendingListParams,
+    PendingStateParams, ReleasedValue, RequestParams, RevokeParams, RunAnswer, RunRequest,
+    RunRequestParams,
 };
 use envcloak_ipc::view::{
     ApprovedView, DecisionView, DeniedView, GrantBindingView, GrantView, GrantsView,
     MAX_LISTED_BINDINGS, PendingListView, PendingStateView, PendingView, RevokedView,
 };
-use envcloak_ipc::{Frame, FrameError, RpcError, WireSecret};
+use envcloak_ipc::{Frame, RpcError, WireSecret};
 use envcloak_policy::{
     AccessRequest, ApprovalProof, ApproveError, BindError, Binding, BoundRef, Claims, Decision,
     DenyReason, EvidenceError, GrantId, ManifestError, Mode, PENDING_TTL, Pending,
@@ -98,7 +99,7 @@ use envcloak_sys::PeerIdentity;
 use crate::audit::{AuditEvent, RequestAudit};
 use crate::clock::now_of;
 use crate::lock::Reading;
-use crate::server::{Shared, locked, refuse_if_traced};
+use crate::server::{Shared, locked, refuse_if_traced, result_framed};
 use crate::state::{Delivery, vault_reason};
 
 /// How many times one `run.request` is decided at most: a second decision
@@ -317,15 +318,6 @@ fn release_plan(vault: &Vault, bound: &[BoundRef]) -> Result<ReleasePlan, RpcErr
     Ok((fields, meta))
 }
 
-/// `answer` framed as the result of request `id`: an answer that does
-/// not fit in a frame is `frame_too_large`, any other failure `internal`.
-fn framed(id: u64, answer: &RunAnswer) -> Result<Frame, RpcError> {
-    proto::result_frame(id, answer).map_err(|e| match e {
-        FrameError::TooLarge => RpcError::new(ErrorKind::FrameTooLarge),
-        _ => RpcError::new(ErrorKind::Internal),
-    })
-}
-
 /// `run.request`, answering request `id` with its result frame, built
 /// here so that a covered answer is framed before it is committed. See
 /// the module documentation.
@@ -505,7 +497,7 @@ pub fn run_request(
                             })
                             .collect(),
                     };
-                    let frame = framed(id, &answer);
+                    let frame = result_framed::<RunRequest>(id, &answer);
                     // A test stops here, holding the framed answer and
                     // the state lock, to let the grant run out (F-77).
                     envcloak_sys::pause_point("run.answer_framed");
@@ -609,7 +601,7 @@ pub fn run_request(
             }
         }
     };
-    framed(id, &decision)
+    result_framed::<RunRequest>(id, &decision)
 }
 
 fn request_id(p: &RequestParams) -> Result<PendingId, RpcError> {

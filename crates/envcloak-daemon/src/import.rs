@@ -91,15 +91,16 @@ use envcloak_core::vault::{
 };
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_ipc::proto::{
-    self, ErrorKind, FilesBackupParams, FilesRestoreParams, ImportCommitParams, ImportParams,
-    RecoveryConfirmParams, RestoredFile, RestoredFiles, VerifyParams,
+    self, ErrorKind, FilesBackupParams, FilesRestore, FilesRestoreParams, ImportCommit,
+    ImportCommitParams, ImportParams, RecoveryConfirmParams, RestoredFile, RestoredFiles,
+    VerifyParams,
 };
 use envcloak_ipc::view::{
     ClassificationView, EntryStatus, FileBackupCreatorView, FileBackupView, ImportEntryView,
     ImportItemView, ImportPlanView, LengthClass, RecoveryConfirmedView, SkipReason,
     VerifyEntryView, VerifyFileView, VerifyView,
 };
-use envcloak_ipc::{Frame, FrameError, RpcError, WireSecret};
+use envcloak_ipc::{Frame, RpcError, WireSecret};
 use envcloak_policy::{
     Binding, EnvName, ManifestError, ProcessInstance, ProfileName, SubjectEvidence, bind_items,
     load_project, resolve,
@@ -113,7 +114,7 @@ use crate::backups::{kind_of, label_of};
 use crate::clock::now_of;
 use crate::items::{DEFAULT_FIELD, DEFAULT_SLUG, looks_like_value};
 use crate::requests::{evidence, refuse_unless_prover, subject_summary};
-use crate::server::{Shared, locked, refuse_if_traced};
+use crate::server::{Shared, commit_framed, locked, refuse_if_traced};
 use crate::state::{State, vault_reason};
 
 /// Entries one import takes at most.
@@ -704,11 +705,16 @@ pub fn import_plan(
 }
 
 /// `import.commit`.
+/// `import.commit`, answering request `id` with its result frame, built
+/// before the vault is written ([`commit_framed`]): the answer is the view
+/// `import.plan` gave for this digest, and one too large for a frame
+/// writes nothing.
 pub fn import_commit(
     shared: &Shared,
     peer: &PeerIdentity,
+    id: u64,
     p: ImportCommitParams,
-) -> Result<ImportPlanView, RpcError> {
+) -> Result<Frame, RpcError> {
     let wanted = p.digest;
     let (mut input, claims) = check_input(shared, p.import)?;
     refuse_if_traced()?;
@@ -743,26 +749,28 @@ pub fn import_commit(
         }
     }
     let reused = plan.items.len() - new.len();
-    let v = s.unlocked_mut()?;
-    let created = v
-        .transact(|t| {
-            let mut out = Vec::with_capacity(new.len());
-            for (item, field, value) in new {
-                let slug = item.slug.clone();
-                let id = t.create_item(item)?;
-                t.add_field(id, field, value)?;
-                out.push((id, slug));
-            }
-            Ok(out)
-        })
-        .map_err(|e| write_error(&e))?;
-    s.audit(AuditEvent::Imported {
-        pid: peer.pid,
-        subject: subject_summary(peer, &caller),
-        created,
-        reused,
-    });
-    Ok(view(&plan))
+    commit_framed::<ImportCommit>(id, &view(&plan), || {
+        let v = s.unlocked_mut()?;
+        let created = v
+            .transact(|t| {
+                let mut out = Vec::with_capacity(new.len());
+                for (item, field, value) in new {
+                    let slug = item.slug.clone();
+                    let id = t.create_item(item)?;
+                    t.add_field(id, field, value)?;
+                    out.push((id, slug));
+                }
+                Ok(out)
+            })
+            .map_err(|e| write_error(&e))?;
+        s.audit(AuditEvent::Imported {
+            pid: peer.pid,
+            subject: subject_summary(peer, &caller),
+            created,
+            reused,
+        });
+        Ok(())
+    })
 }
 
 fn write_error(e: &VaultError) -> RpcError {
@@ -1161,27 +1169,24 @@ pub fn files_restore(
             .collect(),
     };
     // Framed as it will be sent before anything is committed (F-77's
-    // order): one larger than a frame releases nothing and is not
-    // recorded as restored.
-    let frame = proto::result_frame(id, &answer).map_err(|e| match e {
-        FrameError::TooLarge => RpcError::new(ErrorKind::FrameTooLarge),
-        _ => RpcError::new(ErrorKind::Internal),
-    })?;
-    drop(answer);
-    // A delivery: its entry is on disk before any byte is released (SPEC
-    // §3 principle 4, gate 33); when it cannot be written, the frame is
-    // dropped, and wiped, and the call is refused.
-    let entry = AuditEvent::FilesRestored {
-        pid: peer.pid,
-        subject: subject_summary(peer, &caller),
-        backup: backup.to_string(),
-        files,
-    };
-    if !s.audit_delivery(entry) {
-        drop(frame);
-        return Err(RpcError::new(ErrorKind::AuditFailed));
-    }
-    Ok(frame)
+    // order, [`commit_framed`]): one larger than a frame releases nothing
+    // and is not recorded as restored. A delivery: its entry is on disk
+    // before any byte is released (SPEC §3 principle 4, gate 33); when it
+    // cannot be written, the frame is dropped, and wiped, and the call is
+    // refused.
+    commit_framed::<FilesRestore>(id, &answer, || {
+        let entry = AuditEvent::FilesRestored {
+            pid: peer.pid,
+            subject: subject_summary(peer, &caller),
+            backup: backup.to_string(),
+            files,
+        };
+        if s.audit_delivery(entry) {
+            Ok(())
+        } else {
+            Err(RpcError::new(ErrorKind::AuditFailed))
+        }
+    })
 }
 
 /// `recovery.confirm`.
