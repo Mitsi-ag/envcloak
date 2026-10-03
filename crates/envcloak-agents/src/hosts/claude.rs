@@ -166,6 +166,7 @@ pub fn run(
         "LC_ALL",
         "TMPDIR",
         "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_TMPDIR",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",

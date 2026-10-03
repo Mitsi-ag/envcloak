@@ -178,14 +178,19 @@ pub fn insert(text: &[u8]) -> Result<Change, BlockError> {
 }
 
 /// `text` without the block: the block, and the blank line before it that
-/// [`insert`] adds, taken out. Unchanged when there is no block.
+/// [`insert`] adds, taken out (kept when no blank line or end of file
+/// follows the block, so the text on either side stays apart).
+/// Unchanged when there is no block.
 pub fn remove(text: &[u8]) -> Result<Change, BlockError> {
     let text = std::str::from_utf8(text).map_err(|_| BlockError::NotUtf8)?;
     let Some((b, e)) = find(text)? else {
         return Ok(Change::Unchanged);
     };
     let mut start = b;
-    if e == text.len() && text[..b].ends_with("\n\n") {
+    let after = &text[e..];
+    if text[..b].ends_with("\n\n")
+        && (after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n"))
+    {
         start -= 1;
     }
     Ok(Change::New(format!("{}{}", &text[..start], &text[e..])))
@@ -235,6 +240,25 @@ mod tests {
             };
             assert_eq!(without, back, "{original:?}");
         }
+    }
+
+    /// Text the person added after the block stays, without the blank
+    /// line the block's insertion made: the file reads as before plus the
+    /// person's text.
+    #[test]
+    fn text_added_after_the_block_stays_and_the_separator_goes() {
+        let with = new(insert(b"# Notes\n").unwrap_or(Change::Unchanged));
+        let added = format!("{with}\nMore of mine.\n");
+        assert_eq!(
+            new(remove(added.as_bytes()).unwrap_or(Change::Unchanged)),
+            "# Notes\n\nMore of mine.\n"
+        );
+        // Text right after the block, with no blank line: kept apart.
+        let tight = format!("{with}Right after.\n");
+        assert_eq!(
+            new(remove(tight.as_bytes()).unwrap_or(Change::Unchanged)),
+            "# Notes\n\nRight after.\n"
+        );
     }
 
     #[test]
