@@ -68,13 +68,17 @@ const PATH_KEYS: [&str; 6] = [
 
 /// Replaces with [`HIDDEN`] every string of `v` that the text would hide:
 /// a name that looks like a value, or an `id` that is not an id's shape.
-/// Paths ([`PATH_KEYS`]) stay. `key` is the key `v` is under; the items of
-/// an array are under the array's key.
+/// Paths ([`PATH_KEYS`]) stay. A `backup` is an undo's id or a vault
+/// backup's file name, as the text shows it: kept when it is either, and
+/// hidden only when it looks like a value (verifier review of M2-02: `rm
+/// --json` hid the file name `envcloak recover --backup` needs). `key` is
+/// the key `v` is under; the items of an array are under the array's key.
 fn hide_names(v: &mut serde_json::Value, key: Option<&str>) {
     match v {
         serde_json::Value::String(s) => {
             let keep = match key {
-                Some("id" | "backup") => shown_id(s) == *s,
+                Some("id") => shown_id(s) == *s,
+                Some("backup") => shown_id(s) == *s || !looks_like_value(s),
                 Some(k) if PATH_KEYS.contains(&k) => true,
                 _ => !looks_like_value(s),
             };
@@ -1480,6 +1484,12 @@ Reclassified from test to live by the new value: 1 grant that bound the item end
   backup: vault-20260929T120000Z-0123456789abcdef.ecbackup in the vault's backups directory; `envcloak recover --backup <file>` brings the item back
   grants that bound it and ended: 1
 "#,
+        );
+        // The JSON names the same file, which `envcloak recover --backup`
+        // takes (verifier review of M2-02: it was hidden as an id).
+        assert_eq!(
+            removed.json()["backup"],
+            "vault-20260929T120000Z-0123456789abcdef.ecbackup"
         );
         let target = TargetView {
             item: item("openai/acme-web", 1),
