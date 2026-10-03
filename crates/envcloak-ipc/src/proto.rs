@@ -1620,6 +1620,9 @@ pub const REASONS: &[&str] = &[
     // A backup v2 restore refused before the proof (`restore_refused`).
     "result_unrecorded",
     "created_by_agent",
+    // A backup the vault wrote that its name did not hold once published
+    // (`files_backup_failed`).
+    "substituted",
 ];
 
 /// An error response. Built from fixed tokens only.
@@ -1633,7 +1636,8 @@ pub struct RpcError {
     /// [`ErrorKind::InvalidItem`], [`ErrorKind::ProofRefused`]
     /// (`requester_terminal` only), [`ErrorKind::TooManyPending`],
     /// [`ErrorKind::RestoreRefused`] and [`ErrorKind::FilesBackupFailed`]
-    /// (`too_large` only: a backup v2 over its caps).
+    /// (`too_large`, a backup v2 over its caps, and `substituted`, a
+    /// backup replaced under its name before it was checked in place).
     pub reason: Option<&'static str>,
 }
 

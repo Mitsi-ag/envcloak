@@ -1061,3 +1061,57 @@ fn a_restored_vault_backs_up_and_restores_again() {
     assert_holds_canaries(&v, &f.cs);
     f.home.assert_clean(&f.cs);
 }
+
+/// A vault backup is made durable through `envcloak_sys::sync_file`
+/// (`F_FULLFSYNC` on macOS), in order, and a flush that fails fails the
+/// backup (verifier, M2-05 round 9: with the error of the last flush
+/// ignored, every test still passed, and `envcloak rm` removes an item on
+/// the strength of the answer): a backup flushes the data directory's
+/// parent and the data directory (the directories the vault's paths make
+/// sure of), its file, then `backups/` once the file is linked to its
+/// name (the counting shim records each by device and inode). With the
+/// file's flush failing, the backup fails; with the last one, `backups/`,
+/// failing, it fails too, the backup linked by then.
+#[test]
+fn a_vault_backup_is_flushed_in_order_and_a_failed_flush_fails_it() {
+    use envcloak_sys::testing::{fail_sync_after, record_syncs, take_synced};
+    use std::os::unix::fs::MetadataExt;
+    let id_of = |p: &Path| {
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    let (f, v) = KitFixture::create();
+    let backups = f.paths.backups_dir.clone();
+    record_syncs();
+    let info = v.create_backup().unwrap();
+    assert_eq!(
+        take_synced(),
+        [
+            id_of(f.paths.data_dir.parent().unwrap()),
+            id_of(&f.paths.data_dir),
+            id_of(&info.path),
+            id_of(&backups)
+        ],
+        "a backup's flushes: the data directory's parent and itself, the file, then backups/"
+    );
+    let before = dir_names(&backups).len();
+
+    fail_sync_after(2);
+    assert!(
+        v.create_backup().is_err(),
+        "the failed flush of a backup's file was unreported"
+    );
+    fail_sync_after(3);
+    assert!(
+        v.create_backup().is_err(),
+        "the failed flush of backups/ was unreported"
+    );
+    assert_eq!(
+        dir_names(&backups).len(),
+        before + 1,
+        "the backup whose last flush failed is linked, the other is not: {:?}",
+        dir_names(&backups)
+    );
+    drop(v);
+    f.home.assert_clean(&f.cs);
+}

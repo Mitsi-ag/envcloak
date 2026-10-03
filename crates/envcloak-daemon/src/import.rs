@@ -876,6 +876,35 @@ fn env_file_path(path: &str) -> bool {
             .is_some_and(|n| n == ".env" || n.strip_prefix(".env.").is_some_and(|s| !s.is_empty()))
 }
 
+/// A file backup's failure to be written, as `files.backup` answers it,
+/// logged without a value. One the vault's directory had replaced under
+/// its name before it was checked in place (`Substituted`) is
+/// `files_backup_failed` with the reason `substituted`, never the
+/// client's malformed request (`invalid_params`), which a request that is
+/// malformed still gets.
+fn files_backup_error(k: VaultErrorKind) -> RpcError {
+    match k {
+        VaultErrorKind::InvalidRecord => invalid(),
+        VaultErrorKind::Substituted => {
+            log_line!(
+                "envcloakd: a file backup was replaced under its name before it was checked in \
+                 place (substituted); nothing was deleted"
+            );
+            RpcError::with_reason(ErrorKind::FilesBackupFailed, "substituted")
+        }
+        VaultErrorKind::Tampered | VaultErrorKind::ReadOnly => {
+            RpcError::new(ErrorKind::VaultTampered)
+        }
+        k => {
+            log_line!(
+                "envcloakd: a file backup could not be written ({}); nothing was deleted",
+                vault_reason(k)
+            );
+            RpcError::new(ErrorKind::FilesBackupFailed)
+        }
+    }
+}
+
 /// `files.backup`: the files of an env-file deletion, each an absolute
 /// path to an env file ([`env_file_path`]).
 pub fn files_backup(
@@ -898,19 +927,9 @@ pub fn files_backup(
     let caller = evidence(shared, peer, &p.claims)?;
     let mut s = locked(&shared.state);
     let v = s.unlocked()?;
-    let info = v.backup_files(&files).map_err(|e| match e.kind() {
-        VaultErrorKind::InvalidRecord => invalid(),
-        VaultErrorKind::Tampered | VaultErrorKind::ReadOnly => {
-            RpcError::new(ErrorKind::VaultTampered)
-        }
-        k => {
-            log_line!(
-                "envcloakd: a file backup could not be written ({}); nothing was deleted",
-                vault_reason(k)
-            );
-            RpcError::new(ErrorKind::FilesBackupFailed)
-        }
-    })?;
+    let info = v
+        .backup_files(&files)
+        .map_err(|e| files_backup_error(e.kind()))?;
     let now = now_of(&shared.clocks);
     let secs = now
         .wall
@@ -1100,6 +1119,20 @@ pub fn recovery_confirm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review (verifier, M2-05 round 9): a file backup its name did not
+    /// hold once linked (`Substituted`) is a failed backup with its
+    /// reason, never `invalid_params`, which a malformed request keeps.
+    #[test]
+    fn a_substituted_file_backup_is_reported_as_a_failed_backup() {
+        let e = files_backup_error(VaultErrorKind::Substituted);
+        assert_eq!(e.kind, ErrorKind::FilesBackupFailed);
+        assert_eq!(e.reason, Some("substituted"));
+        assert_eq!(
+            files_backup_error(VaultErrorKind::InvalidRecord).kind,
+            ErrorKind::InvalidParams
+        );
+    }
 
     #[test]
     fn secret_words_are_whole_words_of_the_name() {

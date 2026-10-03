@@ -63,7 +63,7 @@ use crate::audit::AuditEvent;
 use crate::clock::now_of;
 use crate::requests::{evidence, refuse_unless_prover, subject_summary};
 use crate::server::{Shared, locked, refuse_if_traced};
-use crate::state::vault_reason;
+use crate::state::{backup_reason, vault_reason};
 
 /// The field a new item's value goes in when none is named.
 pub const DEFAULT_FIELD: &str = "value";
@@ -726,7 +726,7 @@ pub fn remove(
             log_line!(
                 "envcloakd: the backup before a removal could not be written ({}); nothing was \
                  removed",
-                vault_reason(e.kind())
+                backup_reason(e.kind())
             );
             RpcError::new(ErrorKind::BackupFailed)
         })?;

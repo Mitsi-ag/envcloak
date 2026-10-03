@@ -161,6 +161,21 @@ impl Vault {
     /// no Recovery Kit envelope, which a restore needs. A vault that could
     /// not be migrated is backed up at its on-disk version.
     pub fn create_backup(&self) -> Result<BackupInfo, VaultError> {
+        self.create_backup_observed(&mut || {})
+    }
+
+    /// [`Vault::create_backup`], calling `written` once the new file is
+    /// written and flushed, before it is linked to its name: a unit test
+    /// puts another file under its temporary name there.
+    ///
+    /// A link takes whatever has the temporary name at that moment, so the
+    /// backup's name is then opened (never through a symlink) and compared
+    /// by device and inode with the file written: another file put under
+    /// the temporary name fails the backup
+    /// ([`VaultErrorKind::Substituted`]), never answered as written, so
+    /// nothing is removed on the strength of it (`envcloak rm` removes an
+    /// item only once its backup is written).
+    fn create_backup_observed(&self, written: &mut dyn FnMut()) -> Result<BackupInfo, VaultError> {
         let header = self.header()?;
         let envelopes: Vec<&Envelope> = self
             .unlockers()
@@ -209,16 +224,19 @@ impl Vault {
             chunk_count,
         };
         let k = self.keys().key(Purpose::Backup);
-        let written = write_backup(&dir, tmp_os, &head, &manifest, &image, k, &ctx);
+        let made = write_backup(&dir, tmp_os, &head, &manifest, &image, k, &ctx);
         // A link takes whatever has the temporary name at that moment: the
         // backup is answered as written only when its name holds the file
         // written.
-        let linked = written.and_then(|file| {
+        let linked = made.and_then(|file| {
             use std::os::unix::fs::MetadataExt;
+            written();
             link_beneath(&dir, tmp_os, name_os)?;
-            let (ours, named) = (file.metadata()?, open_beneath(&dir, name_os)?.metadata()?);
+            let named = open_beneath(&dir, name_os)
+                .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?;
+            let (ours, named) = (file.metadata()?, named.metadata()?);
             if (ours.dev(), ours.ino()) != (named.dev(), named.ino()) {
-                return Err(VaultError::from(VaultErrorKind::InvalidRecord));
+                return Err(VaultError::from(VaultErrorKind::Substituted));
             }
             Ok(ours.len())
         });
@@ -1086,6 +1104,60 @@ mod tests {
         bad[0] = 2;
         assert!(Manifest::decode(&bad).is_err());
         assert!(Manifest::decode(&base.encode()[..MANIFEST_LEN - 1]).is_err());
+    }
+
+    /// A backup is answered as written only when its name holds the file
+    /// written (a link takes whatever has the temporary name at that
+    /// moment, and `envcloak rm` removes an item on the strength of the
+    /// answer): once the new file is flushed, another file, or a symlink
+    /// to a file elsewhere, is put under its temporary name. The backup
+    /// fails (`Substituted`), the symlink's target is as it was, and the
+    /// backup's name holds that other file, never one this call wrote.
+    #[test]
+    fn a_backup_is_answered_only_for_the_file_written() {
+        for symlink in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = VaultPaths::under(dir.path().join("data"));
+            let pass = SecretBytes::copy_from(b"a unit test passphrase, not a secret");
+            let (v, _) = crate::unlock::create_vault(&p, &pass, KdfParams::minimum()).unwrap();
+            let outside = dir.path().join("outside");
+            std::fs::write(&outside, b"not a backup").unwrap();
+            let backups = p.backups_dir.clone();
+            let mut did = 0;
+            let e = v
+                .create_backup_observed(&mut || {
+                    let temp = std::fs::read_dir(&backups)
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name().into_string().unwrap())
+                        .find(|n| n.starts_with(".vault-") && n.ends_with(".tmp"))
+                        .unwrap();
+                    let other = backups.join("other");
+                    if symlink {
+                        std::os::unix::fs::symlink(&outside, &other).unwrap();
+                    } else {
+                        std::fs::write(&other, b"not a backup either").unwrap();
+                    }
+                    std::fs::rename(&other, backups.join(temp)).unwrap();
+                    did += 1;
+                })
+                .unwrap_err();
+            assert_eq!(did, 1);
+            assert_eq!(
+                e.kind(),
+                VaultErrorKind::Substituted,
+                "symlink {symlink}: a backup answered as written for a file it did not write"
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), b"not a backup");
+            for n in std::fs::read_dir(&backups).unwrap() {
+                let n = n.unwrap().path();
+                let m = std::fs::symlink_metadata(&n).unwrap();
+                if symlink {
+                    assert!(m.file_type().is_symlink(), "{n:?}");
+                } else {
+                    assert_eq!(std::fs::read(&n).unwrap(), b"not a backup either", "{n:?}");
+                }
+            }
+        }
     }
 
     fn no_change(_: &crate::vault::MigrationTx<'_>) -> Result<(), VaultError> {
