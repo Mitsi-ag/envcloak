@@ -267,6 +267,31 @@ const CORPUS: &[(&str, Option<Class>)] = &[
     ("f() { envcloak approve REQUEST; }; f", Some(Class::Approve)),
     // A command named by a variable.
     ("$c .env", Some(Class::Ambiguous)),
+    // Case: macOS's file system opens `.ENV` as `.env` and finds `CAT`
+    // as `cat` by default, so names are read in one case.
+    ("cat .ENV", Some(Class::EnvFile)),
+    ("CAT .env", Some(Class::EnvFile)),
+    ("PrintEnv", Some(Class::EnvDump)),
+    ("source .Env.Local", Some(Class::EnvFile)),
+    // More programs that run a command.
+    ("script -q /dev/null printenv", Some(Class::EnvDump)),
+    ("script -c printenv /dev/null", Some(Class::EnvDump)),
+    ("strace -f printenv", Some(Class::EnvDump)),
+    ("ltrace -o log cat .env", Some(Class::EnvFile)),
+    ("flock /tmp/l printenv", Some(Class::EnvDump)),
+    ("flock -w 5 /tmp/l -c 'cat .env'", Some(Class::EnvFile)),
+    ("npx printenv", Some(Class::EnvDump)),
+    ("npm exec -- printenv", Some(Class::EnvDump)),
+    ("npx -c 'cat .env'", Some(Class::EnvFile)),
+    ("uv run printenv", Some(Class::EnvDump)),
+    ("uv run --with httpx printenv", Some(Class::EnvDump)),
+    ("poetry run cat .env", Some(Class::EnvFile)),
+    ("direnv exec . printenv", Some(Class::EnvDump)),
+    ("mise exec -- printenv", Some(Class::EnvDump)),
+    ("bundle exec printenv", Some(Class::EnvDump)),
+    ("arch -arm64 printenv", Some(Class::EnvDump)),
+    ("taskset 0x1 printenv", Some(Class::EnvDump)),
+    ("chronic printenv", Some(Class::EnvDump)),
     // What the hook lets through (docs/INSTALLERS.md, "What the hook does
     // not see").
     ("f=.env; cat \"$f\"", None),
@@ -286,6 +311,8 @@ const CORPUS: &[(&str, Option<Class>)] = &[
     ("shopt -s dotglob; cat *", None),
     ("e", None),
     ("cd /proc/self && cat environ", None),
+    ("dbus-run-session printenv", None),
+    ("parallel ::: printenv", None),
 ];
 
 /// The examples in docs/INSTALLERS.md's "What the hook does not see".
@@ -328,6 +355,54 @@ fn the_corpus_misses_exactly_what_the_honesty_table_lists() {
         missed, listed,
         "the commands the hook lets through are not the ones docs/INSTALLERS.md lists"
     );
+}
+
+/// The Codex review's finding: here-documents are matched to their
+/// commands once each, so a payload of many is read in one pass, well
+/// within the hook's 2 seconds, and decided.
+///
+/// Mutation checked: `classify_all` filtering every body for every
+/// command again (the previous `self.bodies.iter().filter(...)`): this
+/// takes far longer than 2 seconds and fails.
+#[test]
+fn many_here_documents_are_read_in_one_pass() {
+    for host in [Host::ClaudeCode, Host::Codex] {
+        let unit = "cat <<A\nx\nA\n";
+        // Each unit takes 16 bytes as JSON (its line breaks escaped).
+        let cmd = unit.repeat((MAX_PAYLOAD - 8192) / 16);
+        let payload = with_command(host, &cmd);
+        assert!(payload.len() <= MAX_PAYLOAD, "{}", payload.len());
+        let t = Instant::now();
+        let d = decide(host, Event::PreToolUse, &buf(&payload));
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "{host:?}: {:?}",
+            t.elapsed()
+        );
+        assert_eq!(d, Decision::Allow, "{host:?}");
+    }
+}
+
+/// Claude Code 2.1.280's `Monitor` reaches the hook as a `PreToolUse` of
+/// the captured shape, its `command` a shell script: it gets the shell
+/// command's decision.
+#[test]
+fn monitor_gets_the_shell_commands_decision() {
+    let mut p = captured(Host::ClaudeCode, "PreToolUse");
+    p["tool_name"] = json!("Monitor");
+    for (command, want) in [
+        ("printenv", Decision::Deny(Reason::EnvDump)),
+        ("tail -f .env.local", Decision::Deny(Reason::EnvFile)),
+        ("tail -f app.log", Decision::Allow),
+    ] {
+        p["tool_input"] = json!({"description": "watch", "timeout_ms": 60000, "command": command});
+        let raw = serde_json::to_vec(&p).unwrap();
+        assert_eq!(
+            decide(Host::ClaudeCode, Event::PreToolUse, &buf(&raw)),
+            want,
+            "{command}"
+        );
+    }
 }
 
 #[test]

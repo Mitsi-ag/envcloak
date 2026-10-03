@@ -253,6 +253,7 @@ dependencies = [
  "envcloak-policy",
  "envcloak-scan",
  "envcloak-sys",
+ "envcloak-testkit",
  "getrandom 0.4.3",
  "proptest",
  "secrecy",
