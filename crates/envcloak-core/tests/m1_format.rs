@@ -22,12 +22,14 @@
 
 mod common;
 
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-use common::{Rng, kill_child, read_stdin, spawn_self, standing_record, wait_for};
+use common::{Rng, kill_child, read_stdin, spawn_self, standing_record};
 use envcloak_core::crypto::{ItemClass, KdfParams, Vmk};
 use envcloak_core::file_backup::{FileBackupId, FileLeft};
 use envcloak_core::file_backup_v2::CreatorKind;
@@ -519,6 +521,79 @@ fn m1_migration_child() {
     std::thread::sleep(Duration::from_secs(60));
 }
 
+/// How long the test waits for a marker of the migrating child: far
+/// longer than a migration of the fixture takes, so only a child that
+/// stopped making progress reaches it.
+const MARKER_LIMIT: Duration = Duration::from_secs(120);
+
+/// The migrating child, owned by the test (L-03/L-04): its stdout is read
+/// on a thread of its own into a channel, so every wait for a marker has a
+/// deadline, and it is killed through its own handle and reaped when the
+/// test is done with it or an assertion unwinds, never left running.
+struct Migrator {
+    /// `Some` until reaped.
+    child: Option<Child>,
+    lines: Receiver<String>,
+}
+
+impl Migrator {
+    fn start(m: &M1, hold: bool) -> Migrator {
+        let data = m.data();
+        let mut env = vec![(MIGRATOR, data.as_str())];
+        if hold {
+            env.push((HOLD, "1"));
+        }
+        let mut child = spawn_self(&m.home, "m1_migration_child", &env, &derived("vmk"));
+        let out = BufReader::new(child.stdout.take().unwrap());
+        let (tx, lines) = channel();
+        // Ends at the end of the child's output, which its death closes.
+        std::thread::spawn(move || {
+            for line in out.lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Migrator {
+            child: Some(child),
+            lines,
+        }
+    }
+
+    /// Whether the child printed a line carrying `marker` within
+    /// [`MARKER_LIMIT`]: `false` at the end of its output or at the
+    /// deadline, never a wait without end.
+    fn reached(&self, marker: &str) -> bool {
+        let deadline = Instant::now() + MARKER_LIMIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) if line.contains(marker) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// `kill -9` through the owned handle, then reaped; fails if the child
+    /// had ended on its own ([`kill_child`]).
+    fn kill(mut self) {
+        let mut child = self.child.take().unwrap();
+        kill_child(&mut child, "migration");
+    }
+}
+
+impl Drop for Migrator {
+    fn drop(&mut self) {
+        // Not reaped yet, so the handle still names this child.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Left {
     Old,
@@ -553,7 +628,9 @@ fn left_by_kill(m: &M1, before: &[(String, Vec<Vec<Value>>)], ctx: &str) -> Left
 /// the header written, and killed there: M1's vault is left, row for row.
 /// Held after the commit and killed: the migrated one. Neither depends on
 /// when the kill lands. Kills at random moments within a measured
-/// migration add coverage, each leaving one vault or the other.
+/// migration add coverage, each leaving one vault or the other. Every
+/// child is the test's own ([`Migrator`]): each wait for it is bounded,
+/// and one an assertion leaves behind is killed and reaped.
 #[test]
 fn kill_9_during_the_migration_leaves_the_m1_vault_or_the_migrated_one() {
     let seed = fresh_seed();
@@ -562,46 +639,36 @@ fn kill_9_during_the_migration_leaves_the_m1_vault_or_the_migrated_one() {
     let before = m.dump();
     let start = |hold: bool| {
         m.put_back("vault.db");
-        let data = m.data();
-        let mut env = vec![(MIGRATOR, data.as_str())];
-        if hold {
-            env.push((HOLD, "1"));
-        }
-        let mut child = spawn_self(&m.home, "m1_migration_child", &env, &derived("vmk"));
-        let out = BufReader::new(child.stdout.take().unwrap());
-        (child, out)
+        Migrator::start(&m, hold)
     };
 
     for round in 0..3 {
-        let (mut child, mut out) = start(true);
+        let child = start(true);
         assert!(
-            wait_for(&mut out, "@@in-migration").is_some(),
+            child.reached("@@in-migration"),
             "held round {round}: the child did not reach the migration"
         );
-        kill_child(&mut child, "migration");
+        child.kill();
         let ctx = format!("killed inside the migration, round {round}");
         assert_eq!(left_by_kill(&m, &before, &ctx), Left::Old, "{ctx}");
     }
 
-    let (mut child, mut out) = start(false);
-    assert!(wait_for(&mut out, "@@start").is_some());
+    let child = start(false);
+    assert!(child.reached("@@start"));
     let started = Instant::now();
-    assert!(
-        wait_for(&mut out, "@@migrated").is_some(),
-        "the migration did not finish"
-    );
+    assert!(child.reached("@@migrated"), "the migration did not finish");
     let window = started.elapsed();
-    kill_child(&mut child, "migration");
+    child.kill();
     let ctx = "killed after the commit";
     assert_eq!(left_by_kill(&m, &before, ctx), Left::New, "{ctx}");
 
     let (mut old, mut new) = (0, 0);
     for round in 0..10 {
-        let (mut child, mut out) = start(false);
-        assert!(wait_for(&mut out, "@@start").is_some(), "round {round}");
+        let child = start(false);
+        assert!(child.reached("@@start"), "round {round}");
         let us = rng.below(window.as_micros() as u64 * 5 / 4 + 1);
         std::thread::sleep(Duration::from_micros(us));
-        kill_child(&mut child, "migration");
+        child.kill();
         match left_by_kill(&m, &before, &format!("seed {seed}: round {round}")) {
             Left::Old => old += 1,
             Left::New => new += 1,
