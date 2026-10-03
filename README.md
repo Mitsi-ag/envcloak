@@ -50,6 +50,7 @@ Project manifests and env files are in [docs/MANIFEST.md](docs/MANIFEST.md), and
 The daemon protocol, socket checks and lock rules are in [docs/IPC.md](docs/IPC.md), the caller evidence in [docs/AGENTS.md](docs/AGENTS.md), and grants and approvals in [docs/GRANTS.md](docs/GRANTS.md).
 How `envcloak run` releases, injects and redacts values, and handles signals and exit codes, is in [docs/RUN.md](docs/RUN.md).
 How `envcloak init` and `envcloak import` move `.env` files into the vault, and when they delete them, is in [docs/IMPORT.md](docs/IMPORT.md).
+What `envcloak agents install` writes for Claude Code and Codex, what its hooks stop and what they do not see, is in [docs/INSTALLERS.md](docs/INSTALLERS.md). On Linux neither host's sandboxed shell can reach EnvCloak in this build, so no sandbox exception is written there: commands that need keys run through EnvCloak's MCP server or with the host's sandbox off.
 The brand (logo, app icon, colour, type, motion and voice) is in [docs/BRAND.md](docs/BRAND.md), and its files are in [assets/brand/](assets/brand/).
 
 ## Contributing
