@@ -1755,6 +1755,149 @@ fn a_backup_without_a_result_comes_back_only_in_the_recovery_form() {
     f.sweep();
 }
 
+/// Codex review, round 3: a backup is taken only when the answer its
+/// restore will give fits in one frame, for any request id. That answer
+/// carries more than the `files.backup` request (who made the backup, an
+/// id of up to 20 digits), so a request that fits can make a backup that
+/// could never be given back, and then the deletion goes on and the undo
+/// always fails. Through `files.backup`: a backup whose restore's answer
+/// to request id `u64::MAX` is exactly one frame is taken, and over a raw
+/// connection `files.show` and then `files.restore` with that id answer
+/// it, the restore in a frame of exactly `MAX_FRAME` bytes holding the
+/// file whole; with a path one byte longer (the request still fits in a
+/// frame) it is refused `frame_too_large`, nothing is written in
+/// `backups/` and no backup is audited.
+///
+/// Mutations: no check (the longer one is taken); the check framed for the
+/// request's own id (the longer one is taken); the check after the backup
+/// is written (a backup is left in `backups/`).
+#[test]
+fn a_backup_is_taken_only_when_its_restore_fits_in_a_frame() {
+    use base64::Engine as _;
+    use envcloak_ipc::proto::{FilesRestoreParams, FilesShowParams, RestoredFile, RestoredFiles};
+    use envcloak_ipc::{MAX_FRAME, proto::result_frame};
+    let mut f = Fixture::new(|_, _| {});
+    let dir = f.dir("acme-web");
+    let path = |k: usize| format!("{dir}/.env.{}", "a".repeat(k));
+    let body = |n: usize| SecretBytes::copy_from(&vec![b'#'; n]);
+    // The restore's answer to request id u64::MAX for a file of `n` bytes
+    // under a suffix of `k` letters, made from this terminal, as the
+    // daemon frames it.
+    let restore_len = |n: usize, k: usize| {
+        let answer = RestoredFiles {
+            creator: Some(envcloak_ipc::view::FileBackupCreatorView {
+                kind: "terminal".to_owned(),
+                agent: None,
+            }),
+            files: vec![RestoredFile {
+                path: path(k),
+                mode: 0o600,
+                content: WireSecret::new(body(n)),
+                left: Some(FileLeft::Removed),
+            }],
+        };
+        result_frame(u64::MAX, &answer).unwrap().len()
+    };
+    // Every 3 bytes of the file add 4 of base64, every letter one.
+    let base = restore_len(0, 1);
+    let m = (MAX_FRAME - base) / 4;
+    let (n, k) = (3 * m, 1 + (MAX_FRAME - base - 4 * m));
+    assert_eq!(restore_len(n, k), MAX_FRAME);
+    let backup = |c: &mut envcloak_ipc::Client, k: usize| {
+        c.files_backup(&FilesBackupParams {
+            files: vec![BackupFileParams {
+                path: path(k),
+                mode: 0o600,
+                content: WireSecret::new(body(n)),
+                left: FileLeft::Removed,
+            }],
+            claims: Vec::new(),
+        })
+    };
+    let backups = data_dir(&f.home).join("backups");
+    let listed = || {
+        std::fs::read_dir(&backups).map_or(0, |d| {
+            d.filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.file_name().to_string_lossy().contains("files-"))
+            })
+            .count()
+        })
+    };
+    let mut c = client(&f.home);
+    let e = backup(&mut c, k + 1).unwrap_err();
+    assert_eq!(rpc(e), ErrorKind::FrameTooLarge);
+    assert_eq!(listed(), 0, "a backup it could not give back was written");
+    let id = backup(&mut c, k).unwrap().id;
+    assert_eq!(listed(), 1);
+    drop(c);
+
+    let mut s = common::raw(&f.home);
+    let show = FilesShowParams {
+        backup: id.clone(),
+        claims: Vec::new(),
+    };
+    common::send_json(
+        &mut s,
+        &serde_json::json!({"jsonrpc": "2.0", "id": u64::MAX, "method": "files.show",
+            "params": serde_json::to_value(&show).unwrap()}),
+    );
+    let shown = common::read_json(&mut s).unwrap();
+    assert_eq!(shown["result"]["files"][0]["path"], path(k));
+    let restore = FilesRestoreParams {
+        backup: id,
+        passphrase: WireSecret::new(passphrase(&f.cs)),
+        created_by_agent_ticked: false,
+        unrecorded: false,
+        claims: Vec::new(),
+    };
+    common::send_json(
+        &mut s,
+        &serde_json::json!({"jsonrpc": "2.0", "id": u64::MAX, "method": "files.restore",
+            "params": serde_json::to_value(&restore).unwrap()}),
+    );
+    let mut header = [0u8; 4];
+    std::io::Read::read_exact(&mut s, &mut header).unwrap();
+    let len = u32::from_be_bytes(header) as usize;
+    assert_eq!(len, MAX_FRAME, "the restore's frame");
+    let mut frame = vec![0u8; len];
+    std::io::Read::read_exact(&mut s, &mut frame).unwrap();
+    let answer: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    drop(frame);
+    let content = base64::engine::general_purpose::STANDARD
+        .decode(
+            answer["result"]["files"][0]["content"]
+                .as_str()
+                .unwrap_or(""),
+        )
+        .unwrap_or_default();
+    assert!(
+        content.len() == n && content.iter().all(|&b| b == b'#'),
+        "the file did not come back whole"
+    );
+    drop((s, answer));
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let kinds: Vec<(AuditKind, &str)> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.record.kind,
+                AuditKind::FilesBackup | AuditKind::FilesRestore
+            )
+        })
+        .map(|e| (e.record.kind, e.record.decision.outcome.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (AuditKind::FilesBackup, "backed_up"),
+            (AuditKind::FilesRestore, "restored"),
+        ]
+    );
+    f.sweep();
+}
+
 /// A restore whose answer is larger than one frame (a backup of 1 MiB
 /// and more, which only a writer other than `files.backup` can make: its
 /// request is one frame) is framed before anything is committed, as a

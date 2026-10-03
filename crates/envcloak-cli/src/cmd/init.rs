@@ -444,11 +444,14 @@ impl DeleteGate for Gate<'_> {
                 })
                 .map_err(|e| match e {
                     envcloak_ipc::ClientError::Frame(envcloak_ipc::FrameError::TooLarge) => {
-                        Failure::new(
-                            "files_backup_failed",
-                            "the env files are too large to back up in one request; nothing was \
-                             deleted",
-                        )
+                        too_large_to_back_up()
+                    }
+                    // The daemon takes a backup only when its restore's
+                    // answer fits in a frame too.
+                    envcloak_ipc::ClientError::Rpc(r)
+                        if r.kind == envcloak_ipc::proto::ErrorKind::FrameTooLarge =>
+                    {
+                        too_large_to_back_up()
                     }
                     e => Failure::from(e),
                 })
@@ -457,6 +460,16 @@ impl DeleteGate for Gate<'_> {
         self.backup = Some(view.id.clone());
         Ok(view.id)
     }
+}
+
+/// The env files are too large to back up, or to be given back, in one
+/// frame.
+fn too_large_to_back_up() -> Failure {
+    Failure::new(
+        "files_backup_failed",
+        "the env files are too large to back up, and write back, in one request; nothing was \
+         deleted",
+    )
 }
 
 /// The name of a pause point for gate 16's test ([`pause_point`]).
