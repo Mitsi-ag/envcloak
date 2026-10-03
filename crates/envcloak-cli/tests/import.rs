@@ -1609,6 +1609,243 @@ fn undo_keeps_an_edit_made_while_it_writes_back() {
     g.sweep();
 }
 
+/// A backup made by `init --delete-plaintext` from a person's terminal:
+/// the fixture imported and its plaintext deleted. Returns the backup's
+/// id.
+fn deleted(g: &Gate16) -> String {
+    ok(&g.import(), &g.cs);
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--delete-plaintext", "--json"],
+        &[],
+    );
+    ok(&out, &g.cs);
+    json(&out)["delete"]["backup"].as_str().unwrap().to_owned()
+}
+
+/// `envcloak <args>` run by a person in the fixture's repository, its
+/// passphrase descriptor 3 a FIFO this test writes to only when it
+/// chooses, and its standard error read as it comes.
+struct OnFifo {
+    child: std::process::Child,
+    writer: Option<File>,
+    shown: Vec<u8>,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+    _dir: tempfile::TempDir,
+}
+
+impl OnFifo {
+    fn start(g: &Gate16, args: &[&str]) -> OnFifo {
+        let dir = outside_dir();
+        let fifo = dir.path().join("pass");
+        let made = Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let mut cmd = on_terminal_command(&g.home, args, &[(3, &fifo, true)]);
+        cmd.current_dir(&g.repo);
+        let mut child = cmd.spawn().unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let mut err = child.stderr.take().unwrap();
+        let stdout = std::thread::spawn(move || {
+            let mut o = Vec::new();
+            std::io::Read::read_to_end(&mut out, &mut o).unwrap();
+            o
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = std::io::Read::read(&mut err, &mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        // Blocks until the wrapper opens the FIFO to read it.
+        let writer = Some(std::fs::OpenOptions::new().write(true).open(&fifo).unwrap());
+        OnFifo {
+            child,
+            writer,
+            shown: Vec::new(),
+            rx,
+            stdout: Some(stdout),
+            _dir: dir,
+        }
+    }
+
+    /// Whether standard error shows `text` within `limit`, nothing having
+    /// been written to the FIFO.
+    fn shows_within(&mut self, text: &[u8], limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while !self.shown.windows(text.len()).any(|w| w == text) {
+            match self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(chunk) => self.shown.extend_from_slice(&chunk),
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// Writes `line` and a newline to the FIFO, and closes it.
+    fn send(&mut self, line: &str) {
+        let mut w = self.writer.take().unwrap();
+        std::io::Write::write_all(&mut w, format!("{line}\n").as_bytes()).unwrap();
+    }
+
+    /// Whether the command exits within `limit`, with what it printed:
+    /// its exit status, standard output and standard error. One that does
+    /// not is killed.
+    fn exits_within(
+        mut self,
+        limit: Duration,
+    ) -> Option<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(self.writer.take());
+        let stdout = self.stdout.take().unwrap().join().unwrap();
+        while let Ok(chunk) = self.rx.recv_timeout(Duration::from_secs(5)) {
+            self.shown.extend_from_slice(&chunk);
+        }
+        Some((status, stdout, std::mem::take(&mut self.shown)))
+    }
+}
+
+impl Drop for OnFifo {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// SPEC §6.4 (the restore statement names the creator before the proof;
+/// the verifier's review, round 4): `init --undo --passphrase-fd` shows
+/// its statement, naming who made the backup, before it reads the
+/// passphrase. The passphrase comes on a FIFO that this test writes only
+/// once the statement is on standard error, within a deadline: an undo
+/// that read first would wait for it, and show nothing.
+///
+/// Mutation: the statement printed after the passphrase is read (no
+/// statement within the deadline).
+#[test]
+fn undo_names_who_made_the_backup_before_it_reads_the_passphrase() {
+    let g = Gate16::new(true);
+    let backup = deleted(&g);
+    let mut run = OnFifo::start(&g, &["init", "--undo", &backup, "--passphrase-fd", "3"]);
+    assert!(
+        run.shows_within(
+            b"The backup was made from a terminal",
+            Duration::from_secs(30)
+        ),
+        "the statement naming who made the backup was not shown before the passphrase was read"
+    );
+    run.send(by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str());
+    let (status, stdout, shown) = run.exits_within(Duration::from_secs(60)).unwrap();
+    assert_no_canary(&stdout, &g.cs);
+    assert_no_canary(&shown, &g.cs);
+    assert!(status.success(), "{}", String::from_utf8_lossy(&shown));
+    assert_eq!(g.intact(), [true, true]);
+    g.sweep();
+}
+
+/// SPEC §6.4, the order the statement promises (the verifier's review,
+/// round 4): a backup made by an agent, undone without
+/// `--created-by-agent`, is refused by the CLI (`restore_refused`) once
+/// the statement names its maker and before the passphrase is read. The
+/// passphrase descriptor is a FIFO nothing is ever written to: an undo
+/// that read it first would wait there, past the deadline, rather than
+/// refuse. `.env` is left as it is.
+///
+/// Mutation: the forms checked after the passphrase is read (the undo
+/// waits on the FIFO).
+#[test]
+fn undo_refuses_a_backup_without_its_forms_before_it_reads_the_passphrase() {
+    let g = Gate16::new(true);
+    let env = std::fs::canonicalize(&g.repo).unwrap().join(".env");
+    let now: &[u8] = b"PORT=8080\n";
+    std::fs::write(&env, now).unwrap();
+    let id = Client::connect(&RunPaths::under(envcloak_testkit::daemon_run_dir(&g.home)).unwrap())
+        .unwrap()
+        .files_backup(&FilesBackupParams {
+            files: vec![BackupFileParams {
+                path: env.to_str().unwrap().to_owned(),
+                mode: 0o600,
+                content: WireSecret::new(SecretBytes::copy_from(b"PLANTED=by an agent\n")),
+                left: FileLeft::Removed,
+            }],
+            claims: vec!["ENVCLOAK_FIXTURE_AGENT".to_owned()],
+        })
+        .unwrap()
+        .id;
+    let run = OnFifo::start(&g, &["init", "--undo", &id, "--passphrase-fd", "3"]);
+    let (status, stdout, shown) = run
+        .exits_within(Duration::from_secs(30))
+        .expect("the undo waited for the passphrase before refusing");
+    assert_no_canary(&stdout, &g.cs);
+    let shown = String::from_utf8_lossy(&shown).into_owned();
+    assert_eq!(status.code(), Some(1), "{shown}");
+    let statement = shown.find("The backup was made by").unwrap_or(usize::MAX);
+    let refusal = shown
+        .find("envcloak: restore_refused:")
+        .unwrap_or(usize::MAX);
+    assert!(
+        statement < refusal && refusal < usize::MAX,
+        "not the statement, then the CLI's refusal: {shown}"
+    );
+    assert!(std::fs::read(&env).unwrap() == now, ".env was written");
+    g.sweep();
+}
+
+/// As [`undo_names_who_made_the_backup_before_it_reads_the_passphrase`],
+/// on the terminal: `init --undo` without `--passphrase-fd` says its
+/// statement on `/dev/tty` before it asks for the passphrase there. A
+/// pseudo-terminal of the test's own types the passphrase only once the
+/// statement is on it (within a minute): an undo that asked first would
+/// wait for it, and show nothing more.
+///
+/// Mutation: the statement said after the passphrase is read (the
+/// terminal shows the prompt alone, and the typing never starts).
+#[test]
+fn undo_says_who_made_the_backup_on_the_terminal_before_it_asks() {
+    let g = Gate16::new(true);
+    let backup = deleted(&g);
+    let cli = common::cli().to_str().unwrap().to_owned();
+    let pass = format!("{}\r", by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str());
+    let (out, code) = common::drive_from(
+        &g.home,
+        &g.repo,
+        &[&cli, "init", "--undo", &backup],
+        &[
+            ("The backup was made from a terminal", ""),
+            ("Vault passphrase to write them back: ", &pass),
+        ],
+    );
+    let shown = stdout(&out);
+    assert_no_canary(shown.as_bytes(), &g.cs);
+    assert_eq!(code, 0, "{shown}");
+    let statement = shown.find("The backup was made from a terminal").unwrap();
+    let prompt = shown.find("Vault passphrase to write them back").unwrap();
+    assert!(statement < prompt, "the prompt came before the statement");
+    assert_eq!(g.intact(), [true, true]);
+    g.sweep();
+}
+
 /// F-78, end to end (Codex review, round 3): a file the deletion
 /// rewrote that the person then deletes whole stays deleted: `init
 /// --undo` reports it `deleted_since` and makes nothing there, since SPEC
