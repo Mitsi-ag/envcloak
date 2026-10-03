@@ -7,7 +7,11 @@
 //!
 //! 1. The arguments are checked against the schema, and every string is
 //!    refused, unechoed, when it is shaped like a key or token (gate 13),
-//!    before anything is started or asked of the daemon.
+//!    before anything is started or asked of the daemon. So is an argv
+//!    that EnvCloak's `PreToolUse` hook would deny in a shell (reading an
+//!    env file, printing the environment, `envcloak reveal` or `approve`,
+//!    or a script it cannot read: `envcloak_agents::hook::decide_argv`,
+//!    D-22), with the hook's message and the token `command_refused`.
 //! 2. The child is `<this envcloak> run --status-fd <fd> --wait <n>s
 //!    --wait-grace <g>s [--profile p] -- <argv>`, in `project_dir`, with
 //!    standard input from `/dev/null`, its output on pipes, leading a
@@ -44,6 +48,7 @@
 
 use std::process::Command;
 
+use envcloak_agents::hook::{self, Decision};
 use envcloak_agents::tool_timeouts;
 use envcloak_client::fail::Failure;
 use envcloak_client::run_status::{Exit, RunStatus};
@@ -182,6 +187,14 @@ fn args(args: &Map<String, Value>) -> Result<Args<'_>, Failure> {
     names.extend(argv.iter().copied());
     names.extend(profile);
     refuse_value_like(&names)?;
+    // What EnvCloak's PreToolUse hook denies in a shell (D-22): an argv
+    // that reads an env file, prints the environment, or runs `envcloak
+    // reveal` or `envcloak approve`, refused before the daemon is asked,
+    // with the hook's own message, so a host without hooks gets the same
+    // accident prevention.
+    if let Decision::Deny(reason) = hook::decide_argv(&argv) {
+        return Err(Failure::new("command_refused", reason.message()));
+    }
     let profile = profile
         .map(ProfileName::new)
         .transpose()
