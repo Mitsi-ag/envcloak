@@ -1,6 +1,6 @@
 exit: 0
 --- stdout
-{"backup":"[not shown: looks like a key or token]","grants_ended":0,"slug":"misc/extra"}
+{"backup":"<BACKUP>","grants_ended":0,"slug":"misc/extra"}
 --- stderr
 Remove misc/extra (misc/extra; not classified) and its values from the vault.
   fields: value
