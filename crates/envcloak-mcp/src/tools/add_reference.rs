@@ -83,15 +83,15 @@ impl Tool for AddReference {
         }
     }
 
-    fn call(&self, args: &Map<String, Value>, ctx: &Ctx, _: &Call) -> ToolResult {
-        match add(args, ctx) {
+    fn call(&self, args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> ToolResult {
+        match add(args, ctx, call) {
             Ok(v) => ToolResult::Ok(v),
             Err(f) => ToolResult::Err(f),
         }
     }
 }
 
-fn add(args: &Map<String, Value>, ctx: &Ctx) -> Result<Value, Failure> {
+fn add(args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Failure> {
     check_keys(
         args,
         &["project_dir", "env_name", "slug", "profile"],
@@ -124,7 +124,7 @@ fn add(args: &Map<String, Value>, ctx: &Ctx) -> Result<Value, Failure> {
     let dir = project_dir(dir)?;
 
     // What the slug names, from the daemon: only a secret can be bound.
-    let mut client = ctx.connect()?;
+    let mut client = ctx.connect(call)?;
     let item = match client.items_show(binding.reference.slug.as_str()) {
         Ok(item) => item,
         Err(ClientError::Rpc(RpcError {

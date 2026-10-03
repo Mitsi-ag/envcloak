@@ -12,7 +12,8 @@
 //!    --wait-grace <g>s [--profile p] -- <argv>`, in `project_dir`, with
 //!    standard input from `/dev/null`, its output on pipes, leading a
 //!    process group of its own ([`crate::child`]). The server's wait
-//!    (`--wait-ms`, from the host's tool cutoff) holds both: `<n>` for the person's approval,
+//!    (`--wait-ms`, from the host's tool cutoff, less the time the call
+//!    waited for a worker) holds both: `<n>` for the person's approval,
 //!    polling without holding a connection, and `<g>` after it for the
 //!    daemon's last answer (`envcloak_agents::tool_timeouts::person_wait`
 //!    and `LAST_ANSWER_GRACE`), so the child gives up before the host does
@@ -194,7 +195,24 @@ fn args(args: &Map<String, Value>) -> Result<Args<'_>, Failure> {
 
 fn run(a: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Failure> {
     let a = args(a)?;
-    let wait_secs = tool_timeouts::person_wait(ctx.wait).as_secs();
+    // The wait counts from the call's arrival (Codex review of M2-06: the
+    // time it waited for a worker counts against the host's cutoff). The
+    // shortest run takes MIN_START; a call that waited so long that it
+    // would end more than QUEUE_SLACK after a call that never waited
+    // starts nothing.
+    let budget = ctx.wait.max(MIN_START);
+    let queued = call.waited();
+    if queued + MIN_START > budget + QUEUE_SLACK {
+        return Err(no_time_left());
+    }
+    // A call taken at once (within the slack) gets the whole wait, which
+    // `envcloak run` takes in whole seconds.
+    let left = if queued <= QUEUE_SLACK {
+        budget
+    } else {
+        budget.saturating_sub(queued)
+    };
+    let wait_secs = tool_timeouts::person_wait(left).as_secs();
     let make = |status_fd: i32| {
         let mut cmd = Command::new(&ctx.exe);
         cmd.arg("run")
@@ -221,6 +239,25 @@ fn run(a: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Failure>
         }
     };
     Ok(outcome(&done, &report, ctx, wait_secs))
+}
+
+/// The shortest run: one second of wait for an approval and the last
+/// answer's grace. A call given a shorter wait (`--wait-ms` under 2,000)
+/// still takes this long.
+pub const MIN_START: std::time::Duration =
+    tool_timeouts::MIN_WAIT.saturating_add(tool_timeouts::LAST_ANSWER_GRACE);
+/// How much later than a call that never waited a call that waited for a
+/// worker may end.
+pub const QUEUE_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A call that waited for a worker until too little of the host's cutoff
+/// was left to start anything.
+pub(crate) fn no_time_left() -> Failure {
+    Failure::new(
+        "busy",
+        "the call waited for the server's other calls until too little of the host's time was \
+         left; nothing was run: call it again",
+    )
 }
 
 /// How the run ended, from the child's status record: the record when it

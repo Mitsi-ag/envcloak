@@ -1545,6 +1545,64 @@ fn each_hosts_default_wait_answers_before_its_cutoff() {
     f.sweep();
 }
 
+/// A call's time runs from its arrival, the time it waits for a worker
+/// included (Codex review of M2-06, M2R-22): five calls on one server of a
+/// host with no known cutoff (10 s, a wait of 8), each left pending, are
+/// all answered before the cutoff. Four take the four workers and wait
+/// for the person; the fifth waits for a worker until too little of its
+/// time is left, and is answered `busy` with nothing run, rather than
+/// waiting its full 8 seconds from then.
+///
+/// Mutation checked: the wait counted from when a worker takes the call,
+/// as before (`time_left` the whole budget): the fifth waits its full
+/// wait after the others and is answered after the cutoff, and this
+/// fails.
+#[test]
+fn calls_waiting_for_a_worker_still_answer_before_the_cutoff() {
+    let f = Fixture::new();
+    let py = python3();
+    let mut m = Mcp::start(&f.home, &f.project, &[], &f.cs);
+    m.initialize();
+    let cutoff = envcloak_agents::tool_timeouts::cutoff(None);
+    let ids: Vec<(i64, Instant)> = (0..5)
+        .map(|i| {
+            let id = m.call_async(
+                "run_with_secrets",
+                json!({"project_dir": f.project.to_str().unwrap(),
+                       "argv": [py.to_str().unwrap(), "emit.py", format!("V{i}")]}),
+            );
+            (id, Instant::now())
+        })
+        .collect();
+    let mut outcomes = Vec::new();
+    for (id, sent) in ids {
+        let v = m.answer(id, Duration::from_secs(120));
+        let took = sent.elapsed();
+        assert!(took < cutoff, "call {id} answered after {took:?}: {v}");
+        let r = &v["result"];
+        let outcome = if r["isError"] == true {
+            failed(r)
+        } else {
+            structured(r)["status"].as_str().unwrap().to_owned()
+        };
+        outcomes.push(outcome);
+    }
+    // Nothing ran, and the fifth was the one that waited for a worker.
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o == "approval_required" || o == "refused" || o == "busy"),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|o| *o == "busy").count(),
+        1,
+        "{outcomes:?}"
+    );
+    m.finish();
+    f.sweep();
+}
+
 /// Gate 13 through every tool, with the daemon up and the vault unlocked:
 /// each key-shaped fixture, in each string a tool takes (a project
 /// directory, a variable's name, a slug and its field, a profile, a
