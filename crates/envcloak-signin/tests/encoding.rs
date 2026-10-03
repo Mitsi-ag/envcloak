@@ -735,6 +735,10 @@ fn hosts_and_origins_take_only_the_registered_form() {
         "xn--bcher-kva.example",
         "a-b.c9",
         &"a".repeat(63),
+        "a.0xg",
+        "0x1.a",
+        "a.1x",
+        "a.x0",
     ] {
         assert!(Host::name(ok).is_ok(), "{ok:?}");
     }
@@ -758,6 +762,11 @@ fn hosts_and_origins_take_only_the_registered_form() {
         "a/b",
         "1.2.3.4",
         "a.123",
+        "a.0x",
+        "a.0x1",
+        "a.0xff",
+        "0x1",
+        "a.09",
         "bücher.example",
         "a\u{0}",
         &"a".repeat(64),
@@ -794,6 +803,138 @@ fn hosts_and_origins_take_only_the_registered_form() {
         Origin::new(Scheme::Https, h("a"), 0).unwrap_err(),
         ScopeError::Port
     );
+}
+
+/// Node, found on the test's `PATH`, run with a cleared environment. A
+/// missing Node fails the test: the oracle is never skipped.
+fn run_node(script: &str, input: &Value) -> Value {
+    let node = std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|d| d.join("node"))
+        .find(|p| p.is_file())
+        .expect("node is needed on PATH for the host oracle");
+    let oracle = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(script);
+    let mut child = std::process::Command::new(node)
+        .arg(&oracle)
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(input).unwrap())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// Every host name the crate accepts is one the browser serializes as
+/// itself: Node's WHATWG URL parser (`tests/oracles/host_serialization.mjs`,
+/// adapted from the origin-parsing oracle) reads each generated name the
+/// crate accepted and must give it back byte for byte (plan D-26: hosts
+/// "as the browser serializes them"; L-02, L-06). Positive controls: the
+/// oracle rewrites or refuses names the crate must refuse (upper case,
+/// Unicode, a last label it reads as a number), and the rule before this
+/// one (only an all-digit last label refused) accepts names of this corpus
+/// that the oracle refuses, so the comparison would catch it.
+#[test]
+fn every_accepted_host_name_is_one_the_browser_serializes_as_itself() {
+    let labels = [
+        "a",
+        "app",
+        "x0",
+        "1x",
+        "0x",
+        "0x1",
+        "0xg",
+        "0xff",
+        "0x0x",
+        "1",
+        "09",
+        "123",
+        "a-b",
+        "xn--bcher-kva",
+        "localhost",
+        "-a",
+        "a-",
+        "A",
+        "a_b",
+        "",
+    ];
+    let mut names: Vec<String> = Vec::new();
+    for a in labels {
+        names.push(a.to_owned());
+        for b in labels {
+            names.push(format!("{a}.{b}"));
+            for c in ["a", "0x1", "12", "localhost"] {
+                names.push(format!("{a}.{b}.{c}"));
+            }
+        }
+    }
+    let accepted: Vec<&String> = names.iter().filter(|n| Host::name(n).is_ok()).collect();
+    let refused = names.len() - accepted.len();
+    assert!(
+        accepted.len() > 500 && refused > 1000,
+        "{} {refused}",
+        accepted.len()
+    );
+    let got = run_node("tests/oracles/host_serialization.mjs", &json!(accepted));
+    let hostnames = got["hostnames"].as_array().unwrap();
+    assert_eq!(hostnames.len(), accepted.len());
+    let differ: Vec<&&String> = accepted
+        .iter()
+        .zip(hostnames)
+        .filter(|(n, h)| h.as_str() != Some(n.as_str()))
+        .map(|(n, _)| n)
+        .collect();
+    assert!(
+        differ.is_empty(),
+        "the browser rewrites or refuses {differ:?}"
+    );
+    // The oracle tells a non-canonical name apart.
+    let controls = [
+        "App.example",
+        "b\u{fc}cher.example",
+        "a.0x1",
+        "a.123",
+        "a.0x",
+        "0x7f.1",
+    ];
+    let got = run_node("tests/oracles/host_serialization.mjs", &json!(controls));
+    for (name, h) in controls.iter().zip(got["hostnames"].as_array().unwrap()) {
+        assert_ne!(h.as_str(), Some(*name), "{name:?}");
+        assert!(Host::name(name).is_err(), "{name:?}");
+    }
+    // The earlier rule, applied to the same corpus, accepts names the
+    // oracle refuses.
+    let earlier = |s: &str| {
+        let labels: Vec<&str> = s.split('.').collect();
+        labels.iter().all(|l| {
+            (1..=63).contains(&l.len())
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        }) && !labels
+            .last()
+            .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let wider: Vec<&String> = names.iter().filter(|n| earlier(n)).collect();
+    let got = run_node("tests/oracles/host_serialization.mjs", &json!(wider));
+    let caught = wider
+        .iter()
+        .zip(got["hostnames"].as_array().unwrap())
+        .filter(|(n, h)| h.as_str() != Some(n.as_str()))
+        .count();
+    assert!(caught > 0);
 }
 
 /// Limits, options and the scope's own rules.
@@ -836,6 +977,14 @@ fn limits_and_options_are_bounded() {
         }
     );
     assert_eq!(Options::default_for(&each), Options::Once);
+    let two = Limits::new(Tier::Dev, 2, d(3600), d(60), d(60)).unwrap();
+    assert_eq!(
+        Options::default_for(&two),
+        Options::Dev {
+            window: d(3600),
+            attempts: 2
+        }
+    );
     assert_eq!(Options::Once.allowed_by(&dev), Ok(()));
     let opt = |w, a| Options::Dev {
         window: d(w),
@@ -884,7 +1033,7 @@ proptest! {
     /// The parsers take any text without panicking and accept exactly
     /// their grammar, checked here by a separate reading of it.
     #[test]
-    fn parsers_accept_exactly_their_grammar(s in "\\PC{0,140}|[a-z0-9.-]{0,70}|[A-Za-z0-9._-]{0,130}") {
+    fn parsers_accept_exactly_their_grammar(s in "\\PC{0,140}|[a-z0-9.-]{0,70}|[A-Za-z0-9._-]{0,130}|[a-z0-9-]{1,6}(\\.(0x[0-9a-fA-F]{0,3}|[0-9]{1,3}|[a-z0-9-]{1,6})){0,3}") {
         let key_ok = !s.is_empty()
             && s.len() <= 128
             && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
@@ -898,7 +1047,14 @@ proptest! {
                     && !l.ends_with('-')
                     && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             })
-            && !labels.last().unwrap().bytes().all(|b| b.is_ascii_digit());
+            && !{
+                // The URL standard's "ends in a number": decimal, or 0x
+                // and hex digits (none at all included).
+                let last = labels.last().unwrap();
+                last.bytes().all(|b| b.is_ascii_digit())
+                    || (last.starts_with("0x")
+                        && last[2..].bytes().all(|b| b.is_ascii_hexdigit()))
+            };
         prop_assert_eq!(Host::name(&s).is_ok(), host_ok);
         let label_ok = !s.is_empty()
             && s.len() <= 256
