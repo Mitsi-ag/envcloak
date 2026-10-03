@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "envcloak hook --host claude-code --event UserPromptSubmit",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Grep|Glob|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "envcloak hook --host claude-code --event PreToolUse",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "envcloak hook --host claude-code --event PreToolUse",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "envcloak hook --host claude-code --event SessionStart",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
