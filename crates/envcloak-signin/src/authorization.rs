@@ -3,11 +3,16 @@
 //!
 //! A proof over a statement opens an [`Authorization`] for that
 //! statement's exact scope: `once` (one credit, for the approved operation
-//! only) or `dev` (a budget of 1 to 5 credits within a window of at most
-//! 24 hours from the approval). Its deadline is fixed when it is made and
-//! never moves: nothing a request, a retry, a poll or a new key does
-//! extends it, and lock, root exit, an epoch change and a change of the
-//! login's authorization revision end it (the operation store does that).
+//! only, for the scope's approval duration) or `dev` (a budget of 1 to 5
+//! credits within a window of at most 24 hours from the approval, and at
+//! most the scope's approval duration). Its deadline is fixed when it is
+//! made and never moves: nothing a request, a retry, a poll or a new key
+//! does extends it, and lock, root exit, an epoch change and a change of
+//! the login's authorization revision end it (the operation store does
+//! that). While it is in force it covers an attempt's start, the
+//! publication decision and every tool call on a delivered session (SPEC
+//! §6.8: the supervisor checks the grant on every call); once it is not,
+//! each of its operations stops, a delivered one included.
 //!
 //! A credit is reserved with [`Authorization::reserve_credit`], which
 //! checks that the authorization was not ended, that its deadline has not
@@ -131,7 +136,12 @@ pub struct Authorization {
 
 impl Authorization {
     /// A `once` authorization for `scope`, approved at `now`: one credit,
-    /// until the scope's per-attempt timeout has passed.
+    /// until the scope's approval duration has passed. That is the one
+    /// lifetime the statement carries for it (the daemon resolves it
+    /// already clamped by SPEC §10b's subject limits), so it bounds the
+    /// attempt's start, the publication and every tool call on the
+    /// delivered session; the attempt itself is bounded again by the
+    /// per-attempt timeout from its start.
     pub fn once(id: AuthorizationId, scope: &SignInScope, now: &Now) -> Authorization {
         Authorization {
             id,
@@ -140,7 +150,7 @@ impl Authorization {
             kind: AuthorizationKind::Once,
             credits: 1,
             used: 0,
-            deadline: Deadline::after(now, scope.limits().attempt_timeout()),
+            deadline: Deadline::after(now, scope.limits().approval()),
             ended: false,
         }
     }

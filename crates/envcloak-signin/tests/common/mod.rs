@@ -19,10 +19,17 @@ pub const DAEMON: DaemonInstance = DaemonInstance::from_bytes([7; 16]);
 /// The clock `t` seconds after the test's origin: wall and awake time
 /// move together.
 pub fn at(t: u64) -> Now {
+    clock(t, t)
+}
+
+/// The clock with the wall clock `wall` seconds after the test's origin
+/// and `awake` seconds of time awake: the two apart, as after a sleep
+/// (awake time stands still) or a wall clock set back.
+pub fn clock(wall: u64, awake: u64) -> Now {
     Now {
-        wall: UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t),
-        awake: Duration::from_secs(t),
-        including_sleep: Duration::from_secs(t),
+        wall: UNIX_EPOCH + Duration::from_secs(1_700_000_000 + wall),
+        awake: Duration::from_secs(awake),
+        including_sleep: Duration::from_secs(awake.max(wall)),
     }
 }
 

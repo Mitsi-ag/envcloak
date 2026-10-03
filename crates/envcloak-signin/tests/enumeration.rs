@@ -306,11 +306,11 @@ fn step(cfg: &Config, prev: &Sim, ev: Ev, reached: &mut Reached) -> Result<Optio
                         reached.other_root_own_operation += 1;
                     }
                     sim.slots[o] = Some(st.request);
-                    let x = sim.store.operation(&st.request).unwrap();
                     let shown = sim
                         .store
-                        .statement(&st.request, cfg.options)
+                        .statement(&st.request, cfg.options, &now, &sim.world)
                         .map(|s| s.digest());
+                    let x = sim.store.operation(&st.request).unwrap();
                     if let Some(a) = x.authorization() {
                         if prev.mon.approved_for.get(&a) == Some(&o) {
                             reached.covered += 1;
