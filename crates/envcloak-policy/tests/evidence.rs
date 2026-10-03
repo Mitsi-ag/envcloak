@@ -1028,6 +1028,98 @@ fn claims_only_tighten() {
     assert!(agent.agent_involved());
 }
 
+/// The markers the agents' documentation names (M2 plan task M2-10) are
+/// claims like `CLAUDECODE`: the CLI finds them in its environment by
+/// name, and each makes a terminal subject an agent one, labeled with its
+/// agent, its chain and root unchanged, a terminal grant no longer
+/// covering it and its proofs refused.
+#[test]
+fn the_documented_markers_only_tighten() {
+    let cat = AgentCatalog::builtin();
+    let plain = ev(terminal_chain(None), true, &[]);
+    for (marker, id) in [
+        ("CLAUDE_CODE_CHILD_SESSION", "claude-code"),
+        ("CURSOR_AGENT", "cursor"),
+        ("CURSOR_SANDBOX", "cursor"),
+        ("GEMINI_CLI", "gemini-cli"),
+    ] {
+        let found = Claims::from_vars([OsString::from(marker), OsString::from("PATH")], &cat);
+        assert_eq!(found.markers(), [marker]);
+        let claimed = SubjectEvidence::from_chain(
+            terminal_chain(None),
+            ChainEnd::Top,
+            true,
+            found,
+            cat.agent_for_marker(marker),
+        )
+        .unwrap();
+        assert_eq!(claimed.kind(), SubjectKind::Agent, "{marker}");
+        assert_eq!(claimed.label().unwrap().id, id);
+        assert_eq!(claimed.label().unwrap().basis, MatchBasis::Asserted);
+        assert_eq!(claimed.chain(), plain.chain());
+        assert_eq!(claimed.root(), plain.root());
+        assert_eq!(claimed.proof_refusal(), Some(ProofRefusal::Agent));
+        assert!(!claimed.covered_by(&plain.root(), SubjectKind::Terminal));
+    }
+}
+
+/// An agent's command on a pseudo-terminal of its own, in a new session
+/// it leads: envcloak (95) <- sh (91, leading session 91 on terminal 9,
+/// the pseudo-terminal the agent opened) <- the agent (80, in the person's
+/// session 70 on terminal 7) <- zsh (70) <- login (60) <- Terminal (50)
+/// <- launchd. Gemini CLI's `node-pty` and Codex's `tty: true` start
+/// commands so (M2 plan risk K-03).
+fn agent_pty_chain(agent: Option<AgentLabel>) -> Vec<Ancestor> {
+    vec![
+        on(9, p(95, 91, None)),
+        on(9, p(91, 91, None)),
+        on(7, p(80, 70, agent)),
+        on(7, p(70, 70, None)),
+        p(60, 60, None),
+        p(50, 1, None),
+        p(1, 1, None),
+    ]
+}
+
+/// Gates 23 and 25 (risk K-03): a command an agent starts on a
+/// pseudo-terminal of its own has a controlling terminal and its own
+/// session leader, yet it is an agent subject: a grant for that terminal
+/// does not cover it, and its proofs are refused, whether the agent is
+/// known by its executable (Codex, rooted at it) or only by its script
+/// under node (Gemini CLI, rooted in the command's session). The control:
+/// the same chain with an agent the catalog does not know is a terminal
+/// subject a terminal grant covers and whose proofs are taken.
+#[test]
+fn a_command_an_agent_starts_on_its_own_pty_is_an_agent() {
+    let leader = inst(91, 910);
+    for (agent, root) in [
+        (builtin("codex"), 80),
+        (asserted("gemini-cli"), 91),
+        (asserted("qwen-code"), 91),
+        (builtin("copilot-cli"), 80),
+    ] {
+        let e = ev(agent_pty_chain(agent.clone()), true, &[]);
+        assert!(e.terminal());
+        assert!(e.session_leader().unwrap().same(&leader));
+        assert_eq!(e.kind(), SubjectKind::Agent, "{agent:?}");
+        assert_eq!(e.root().pid, root, "{agent:?}");
+        assert!(!e.covered_by(&leader, SubjectKind::Terminal));
+        assert!(!e.covered_by(&e.root(), SubjectKind::Terminal));
+        assert_eq!(e.proof_refusal(), Some(ProofRefusal::Agent));
+        // And an approval from the person's terminal 7, where the agent
+        // runs, is refused for its requests.
+        let person = person_on(75, 70, 7);
+        assert_eq!(
+            person.approval_refusal(&e, &|_| true),
+            Some(ProofRefusal::RequesterTerminal)
+        );
+    }
+    let unknown = ev(agent_pty_chain(None), true, &[]);
+    assert_eq!(unknown.kind(), SubjectKind::Terminal);
+    assert!(unknown.covered_by(&leader, SubjectKind::Terminal));
+    assert_eq!(unknown.proof_refusal(), None);
+}
+
 #[test]
 fn the_agent_barrier_and_terminal_grants() {
     // A terminal grant rooted at the session leader...
