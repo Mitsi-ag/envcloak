@@ -472,12 +472,12 @@ pub(super) fn rg_type_add_may_name_env_file(def: &[Ch]) -> bool {
     };
     let globs = &def[p + 1..];
     let comma = |ch: &Ch| matches!(ch, Ch::Lit { b: b',', .. });
-    let include: Vec<Ch> = b"include:"
+    let others: Vec<Ch> = b"include:"
         .iter()
         .map(|&b| Ch::Lit { b, quoted: false })
         .collect();
     let unquoted = as_tool_glob(globs);
-    if let Some(types) = unquoted.strip_prefix(include.as_slice()) {
+    if let Some(types) = unquoted.strip_prefix(others.as_slice()) {
         return types.split(comma).any(rg_type_may_name_env_file);
     }
     globs.split(comma).any(|g| word_may_name_env_file(g, true))
