@@ -744,7 +744,7 @@ fn respond<'s>(
         Unlock::NAME => answer::<Unlock>(id, &req, |p| unlock(shared, peer, p)),
         VaultCreate::NAME => answer::<VaultCreate>(id, &req, |p| create(shared, peer, p)),
         RunRequest::NAME => {
-            answer::<RunRequest>(id, &req, |p| requests::run_request(shared, peer, p))
+            framed::<RunRequest>(id, &req, |p| requests::run_request(shared, peer, id, p))
         }
         PendingGet::NAME => {
             answer::<PendingGet>(id, &req, |p| requests::pending_get(shared, peer, p))
@@ -828,6 +828,19 @@ fn answer<'a, M: Method>(
         Ok(out) => proto::result_frame(id, &out)
             .or_else(|_| proto::error_frame(Some(id), &RpcError::new(ErrorKind::Internal)))
             .ok(),
+        Err(e) => proto::error_frame(Some(id), &e).ok(),
+    }
+}
+
+/// As [`answer`], for a method that frames its own result: a covered
+/// `run.request` frames its answer before it commits it (F-77).
+fn framed<'a, M: Method>(
+    id: u64,
+    req: &IncomingRequest<'a>,
+    f: impl FnOnce(M::Params) -> Result<Frame, RpcError>,
+) -> Option<Frame> {
+    match req.params::<M::Params>().and_then(f) {
+        Ok(frame) => Some(frame),
         Err(e) => proto::error_frame(Some(id), &e).ok(),
     }
 }

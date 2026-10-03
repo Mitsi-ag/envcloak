@@ -246,6 +246,8 @@ TASKS = (
     {"M2-%02d" % n for n in range(1, 29)}
     | {"M2b-%02d" % n for n in range(1, 12)}
     | {"M%d" % n for n in range(3, 12)}
+    # Repairs of M1 that the M2 plan schedules (plan section 8).
+    | {"M1-AUDIT"}
     | {"spare"}
 )
 STATUSES = ("reserved", "landed", "reuse")

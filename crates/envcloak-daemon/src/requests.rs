@@ -25,12 +25,16 @@
 //!    for the request's values and the registry's key patterns
 //!    ([`crate::redact`]). A covered request is a delivery
 //!    ([`crate::state::State::deliver`]): under a tracer nothing is read;
-//!    otherwise the values are read from the verified vault, the entry is
-//!    written and flushed, and only then do the values go into the answer.
-//!    When a value cannot be read (the vault changed on disk and turns
-//!    tampered) nothing is released; when the entry cannot be written the
-//!    request is denied (`audit_failed`), the values are dropped, and a
-//!    `once` grant is left unused (SPEC §6.1 step 5, gate 33).
+//!    otherwise the values are read from the verified vault, the answer
+//!    is framed as it will be sent, the entry is written and flushed, and
+//!    only then does the answer go out. When a value cannot be read (the
+//!    vault changed on disk and turns tampered) nothing is released; when
+//!    the entry cannot be written the request is denied (`audit_failed`),
+//!    the answer is dropped, and a `once` grant is left unused (SPEC §6.1
+//!    step 5, gate 33). An answer too large for one frame is known before
+//!    anything is committed (F-77): it is `frame_too_large`, audited as
+//!    that, with nothing released and the grant left as it was, so a
+//!    `once` grant still covers a smaller request.
 //!
 //! `approve` takes the passphrase as the proof. Before Argon2id runs, the
 //! approver must be a terminal subject with no agent by any evidence
@@ -69,14 +73,14 @@ use envcloak_core::audit::{ProjectSummary, SubjectSummary};
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{FieldId, ItemId, Slug, Vault, VaultErrorKind};
 use envcloak_ipc::proto::{
-    ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, PendingListParams,
+    self, ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, PendingListParams,
     PendingStateParams, ReleasedValue, RequestParams, RevokeParams, RunAnswer, RunRequestParams,
 };
 use envcloak_ipc::view::{
     ApprovedView, DecisionView, DeniedView, GrantBindingView, GrantView, GrantsView,
     MAX_LISTED_BINDINGS, PendingListView, PendingStateView, PendingView, RevokedView,
 };
-use envcloak_ipc::{RpcError, WireSecret};
+use envcloak_ipc::{Frame, FrameError, RpcError, WireSecret};
 use envcloak_policy::{
     AccessRequest, ApprovalProof, ApproveError, BindError, Binding, BoundRef, Claims, Decision,
     DenyReason, EvidenceError, GrantId, ManifestError, Mode, PENDING_TTL, Pending,
@@ -301,12 +305,24 @@ fn release_plan(vault: &Vault, bound: &[BoundRef]) -> Result<ReleasePlan, RpcErr
     Ok((fields, meta))
 }
 
-/// `run.request`. See the module documentation.
+/// `answer` framed as the result of request `id`: an answer that does
+/// not fit in a frame is `frame_too_large`, any other failure `internal`.
+fn framed(id: u64, answer: &RunAnswer) -> Result<Frame, RpcError> {
+    proto::result_frame(id, answer).map_err(|e| match e {
+        FrameError::TooLarge => RpcError::new(ErrorKind::FrameTooLarge),
+        _ => RpcError::new(ErrorKind::Internal),
+    })
+}
+
+/// `run.request`, answering request `id` with its result frame, built
+/// here so that a covered answer is framed before it is committed. See
+/// the module documentation.
 pub fn run_request(
     shared: &Shared,
     peer: &PeerIdentity,
+    id: u64,
     p: RunRequestParams,
-) -> Result<RunAnswer, RpcError> {
+) -> Result<Frame, RpcError> {
     let subject = evidence(shared, peer, &p.claims)?;
     let profile = p
         .profile
@@ -447,9 +463,46 @@ pub fn run_request(
                 // The daemon hands out no value under a tracer.
                 refuse_if_traced()?;
                 let (fields, released) = release_plan(s.unlocked()?, &again.bindings)?;
-                let values = match s.deliver(AuditEvent::Request(Box::new(covered)), &fields) {
-                    Ok(values) => values,
+                let decision = DecisionView::Covered {
+                    grant: g.to_string(),
+                    redact,
+                    mode: policy.mode,
+                    manifest_changed: changed,
+                };
+                // The answer, framed as it will be sent, before its entry
+                // is written or the grant used (F-77): one too large for
+                // a frame commits nothing.
+                let answer = |values: Vec<SecretBytes>| {
+                    let answer = RunAnswer {
+                        decision,
+                        values: released
+                            .into_iter()
+                            .zip(values)
+                            .map(|((env_name, slug, allow_short), value)| ReleasedValue {
+                                env_name,
+                                slug,
+                                allow_short,
+                                value: WireSecret::new(value),
+                            })
+                            .collect(),
+                    };
+                    framed(id, &answer)
+                };
+                let frame = match s.deliver(AuditEvent::Request(Box::new(covered)), &fields, answer)
+                {
+                    Ok(frame) => frame,
                     Err(Delivery::Refused(e)) => return Err(e),
+                    Err(Delivery::Unsendable(e)) => {
+                        // Nothing released and the grant as it was; the
+                        // refusal is recorded, with the grant that would
+                        // have covered it.
+                        s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                            decision: e.kind.token(),
+                            grant_id: Some(g.to_string()),
+                            ..entry
+                        })));
+                        return Err(e);
+                    }
                     Err(Delivery::AuditFailed) => {
                         let reason = DenyReason::AuditFailed.token();
                         s.audit(AuditEvent::Request(Box::new(RequestAudit {
@@ -478,26 +531,9 @@ pub fn run_request(
                 }
                 s.touch(Reading::now(&shared.clocks));
                 // Gate 12: a test build panics here on request, holding the
-                // values about to be sent and the state lock.
+                // answer about to be sent and the state lock.
                 envcloak_sys::panic_point("daemon.release");
-                break RunAnswer {
-                    decision: DecisionView::Covered {
-                        grant: g.to_string(),
-                        redact,
-                        mode: policy.mode,
-                        manifest_changed: changed,
-                    },
-                    values: released
-                        .into_iter()
-                        .zip(values)
-                        .map(|((env_name, slug, allow_short), value)| ReleasedValue {
-                            env_name,
-                            slug,
-                            allow_short,
-                            value: WireSecret::new(value),
-                        })
-                        .collect(),
-                };
+                return Ok(frame);
             }
             Decision::Pending(id) => {
                 s.audit(AuditEvent::Request(Box::new(RequestAudit {
@@ -536,7 +572,7 @@ pub fn run_request(
             }
         }
     };
-    Ok(decision)
+    framed(id, &decision)
 }
 
 fn request_id(p: &RequestParams) -> Result<PendingId, RpcError> {
