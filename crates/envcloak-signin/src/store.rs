@@ -18,9 +18,11 @@
 //! operations per root and [`MAX_OPERATIONS`] in all, and refuses new work
 //! when full ([`RequestError::Full`]) rather than forgetting one: a
 //! stopped operation's value-free receipt stays until its `retry_until`
-//! ([`crate::RETRY_WINDOW`] after it stopped) has passed and its cleanup
-//! is not pending. A daemon restart starts an empty store: no operation
-//! is claimed exactly-once across one.
+//! ([`crate::RETRY_WINDOW`] after it stopped) has passed and its teardown,
+//! if one was asked for, was confirmed: a pending or failed close keeps it
+//! as a tombstone (and keeps its login from starting another attempt)
+//! until a report confirms it. A daemon restart starts an empty store: no
+//! operation is claimed exactly-once across one.
 //!
 //! **Owners.** Status, cancel and end answer only the owner root; to any
 //! other caller an operation is [`NotFound`], the same answer as an id
@@ -474,13 +476,21 @@ impl OperationStore {
         }
         let id = op.request;
         self.ops.insert(id, op);
-        self.start_ready(now);
         Ok((false, id))
     }
 
     /// The statement a proof for `request` with `options` approves, while
-    /// it waits for one.
-    pub fn statement(&self, request: &RequestId, options: Options) -> Option<SignInStatement> {
+    /// it waits for one, read after the world and the clock stopped what
+    /// they ended: a statement is rebuilt when it is shown (L-09), so the
+    /// approval screen never shows one for a scope that already changed.
+    pub fn statement(
+        &mut self,
+        request: &RequestId,
+        options: Options,
+        now: &Now,
+        world: &dyn World,
+    ) -> Option<SignInStatement> {
+        self.finish(now, world);
         self.ops
             .get(request)
             .filter(|op| op.stop.is_none() && op.phase == Phase::PendingApproval)
@@ -543,7 +553,6 @@ impl OperationStore {
             op.lease = Some(lease);
             op.phase = Phase::Approved;
         }
-        self.start_ready(now);
         Ok(())
     }
 
@@ -555,7 +564,6 @@ impl OperationStore {
         now: &Now,
         world: &dyn World,
     ) -> Result<Status, NotFound> {
-        self.settle(now, world);
         self.finish(now, world);
         self.owned(caller, request)?;
         self.status_of(request).ok_or(NotFound)
@@ -598,7 +606,6 @@ impl OperationStore {
             && self.ops.get(request).is_some_and(|op| op.stop.is_none())
         {
             self.stop_op(request, reason, now);
-            self.start_ready(now);
         }
         self.finish(now, world);
         self.owned(caller, request)?;
@@ -628,7 +635,6 @@ impl OperationStore {
     /// root exit, an epoch or revision change, a replaced recipient, and
     /// on the clock's tick.
     pub fn reconcile(&mut self, now: &Now, world: &dyn World) {
-        self.settle(now, world);
         self.finish(now, world);
     }
 
@@ -694,7 +700,6 @@ impl OperationStore {
                     request: *request,
                     generation,
                 });
-                self.start_ready(now);
                 Ok(())
             }
             _ => Err(Discarded),
@@ -721,7 +726,6 @@ impl OperationStore {
         });
         let done = if running {
             self.stop_op(request, StopReason::AttemptFailed(failure), now);
-            self.start_ready(now);
             Ok(())
         } else {
             Err(Discarded)
@@ -810,7 +814,6 @@ impl OperationStore {
             }
             PublishDecision::Refuse(Refusal::IdentityUnverified) => {
                 self.stop_op(request, StopReason::IdentityUnverified, now);
-                self.start_ready(now);
             }
             PublishDecision::Refuse(_) => {}
         }
@@ -844,7 +847,8 @@ impl OperationStore {
 
     /// The per-call check before the supervisor on `from` forwards a
     /// browser tool call for `request`: only for a published session
-    /// that has not stopped.
+    /// that has not stopped, read after the world and the clock stopped
+    /// whatever they ended (its authorization included).
     pub fn check(
         &mut self,
         from: &Channel,
@@ -853,8 +857,7 @@ impl OperationStore {
         world: &dyn World,
     ) -> Result<(), ChannelRefused> {
         self.settle(now, world);
-        self.finish(now, world);
-        match self.ops.get(request) {
+        let done = match self.ops.get(request) {
             Some(op)
                 if from_supervisor(from, op)
                     && op.stop.is_none()
@@ -863,11 +866,16 @@ impl OperationStore {
                 Ok(())
             }
             _ => Err(ChannelRefused),
-        }
+        };
+        self.finish(now, world);
+        done
     }
 
     /// The reaper or supervisor of `generation` reported `request`'s
-    /// teardown: `closed` false is a failed close, kept visible.
+    /// teardown: `closed` false is a failed close, kept visible and never
+    /// taken as done; a later report that it closed confirms it. Anything
+    /// else (another generation, nothing asked for, already confirmed, a
+    /// failure reported again) is discarded.
     pub fn cleanup_result(
         &mut self,
         request: &RequestId,
@@ -878,14 +886,17 @@ impl OperationStore {
     ) -> Result<(), Discarded> {
         self.settle(now, world);
         let done = match self.ops.get_mut(request) {
-            Some(op) if op.generation == Some(generation) && op.cleanup == Cleanup::Pending => {
-                op.cleanup = if closed {
-                    Cleanup::Done
-                } else {
-                    Cleanup::Failed
-                };
-                Ok(())
-            }
+            Some(op) if op.generation == Some(generation) => match (op.cleanup, closed) {
+                (Cleanup::Pending | Cleanup::Failed, true) => {
+                    op.cleanup = Cleanup::Done;
+                    Ok(())
+                }
+                (Cleanup::Pending, false) => {
+                    op.cleanup = Cleanup::Failed;
+                    Ok(())
+                }
+                _ => Err(Discarded),
+            },
             _ => Err(Discarded),
         };
         self.finish(now, world);
@@ -897,18 +908,23 @@ impl OperationStore {
         std::mem::take(&mut self.effects)
     }
 
+    /// `request`'s operation as the last call left it (call
+    /// [`OperationStore::reconcile`] first to see it at a later moment).
     pub fn operation(&self, request: &RequestId) -> Option<&Operation> {
         self.ops.get(request)
     }
 
+    /// Every operation, as the last call left them.
     pub fn operations(&self) -> impl Iterator<Item = &Operation> {
         self.ops.values()
     }
 
+    /// The authorization `id`, as the last call left it.
     pub fn authorization(&self, id: &AuthorizationId) -> Option<&Authorization> {
         self.auths.get(id)
     }
 
+    /// Every authorization, as the last call left them.
     pub fn authorizations(&self) -> impl Iterator<Item = &Authorization> {
         self.auths.values()
     }
@@ -979,7 +995,13 @@ impl OperationStore {
     }
 
     /// Starts approved attempts, oldest first, whose login has no other
-    /// attempt running or still being torn down.
+    /// attempt that may still be using its credentials: one running, or
+    /// stopped while it ran and not yet confirmed torn down (SPEC §6.8:
+    /// attempts on one account are serialised, so a worker that may still
+    /// run never overlaps the next). A failed close is not a confirmation:
+    /// it holds the login until a later report confirms the teardown. A
+    /// captured attempt frees it, since from capture on no credential step
+    /// is permitted for that generation.
     fn start_ready(&mut self, now: &Now) {
         let mut ready: Vec<(u64, RequestId)> = self
             .ops
@@ -995,7 +1017,7 @@ impl OperationStore {
             let busy = self.ops.values().any(|o| {
                 o.scope.account().login_item == login
                     && o.phase == Phase::AttemptRunning
-                    && (o.stop.is_none() || o.cleanup == Cleanup::Pending)
+                    && (o.stop.is_none() || o.cleanup != Cleanup::Done)
             });
             if busy {
                 continue;
@@ -1018,13 +1040,16 @@ impl OperationStore {
         }
     }
 
-    /// Forgets stopped operations past their retry window whose cleanup is
-    /// not pending, and authorizations that ended or ran out which no
-    /// live operation holds.
+    /// Forgets stopped operations past their retry window whose teardown
+    /// was not needed or was confirmed (a pending or failed one stays, as
+    /// a tombstone, until a report confirms it), and authorizations that
+    /// ended or ran out which no live operation holds.
     fn sweep(&mut self, now: &Now) {
         self.ops.retain(|_, op| {
-            !op.stop
-                .is_some_and(|s| s.retry_until.passed(now) && op.cleanup != Cleanup::Pending)
+            !op.stop.is_some_and(|s| {
+                s.retry_until.passed(now)
+                    && matches!(op.cleanup, Cleanup::NotNeeded | Cleanup::Done)
+            })
         });
         let held: BTreeSet<AuthorizationId> = self
             .ops
@@ -1092,21 +1117,24 @@ fn stop_reason(
     if current.browser != pinned.browser || !current.requester_alive {
         return Some(StopReason::RecipientReplaced);
     }
-    let authorized = || {
-        op.authorization
-            .and_then(|a| auths.get(&a))
-            .is_some_and(|a| a.in_force(epochs, now))
-    };
-    let passed = |d: Option<Deadline>| d.is_some_and(|d| d.passed(now));
-    match op.phase {
-        Phase::Requested | Phase::PendingApproval => op
+    if op.phase == Phase::Requested || op.phase == Phase::PendingApproval {
+        return op
             .statement_deadline
             .passed(now)
-            .then_some(StopReason::StatementExpired),
-        Phase::Approved | Phase::AttemptRunning | Phase::Captured if !authorized() => {
-            Some(StopReason::AuthorizationEnded)
-        }
-        Phase::Approved => None,
+            .then_some(StopReason::StatementExpired);
+    }
+    // From the approval on, in every phase, a delivered session included:
+    // the authorization is the grant the supervisor checks on every call.
+    let authorized = op
+        .authorization
+        .and_then(|a| auths.get(&a))
+        .is_some_and(|a| a.in_force(epochs, now));
+    if !authorized {
+        return Some(StopReason::AuthorizationEnded);
+    }
+    let passed = |d: Option<Deadline>| d.is_some_and(|d| d.passed(now));
+    match op.phase {
+        Phase::Requested | Phase::PendingApproval | Phase::Approved => None,
         Phase::AttemptRunning | Phase::Captured => {
             passed(op.attempt_deadline).then_some(StopReason::AttemptTimedOut)
         }
