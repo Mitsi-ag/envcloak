@@ -89,7 +89,11 @@ fn the_captured_payloads_are_read_and_decided() {
             ("UserPromptSubmit", Event::UserPromptSubmit),
         ] {
             let raw = serde_json::to_vec(&captured(host, event)).unwrap();
-            assert_eq!(decide(host, e, &buf(&raw)), Decision::Allow, "{host:?} {event}");
+            assert_eq!(
+                decide(host, e, &buf(&raw)),
+                Decision::Allow,
+                "{host:?} {event}"
+            );
             // The other host's handler gets no decision from it.
             let other = if host == Host::Codex {
                 Host::ClaudeCode
@@ -103,7 +107,11 @@ fn the_captured_payloads_are_read_and_decided() {
             );
         }
         assert_eq!(
-            decide(host, Event::PreToolUse, &buf(&with_command(host, "printenv"))),
+            decide(
+                host,
+                Event::PreToolUse,
+                &buf(&with_command(host, "printenv"))
+            ),
             Decision::Deny(Reason::EnvDump)
         );
         assert_eq!(
@@ -236,7 +244,10 @@ const CORPUS: &[(&str, Option<Class>)] = &[
     // Redirections.
     ("cat < .env", Some(Class::EnvFile)),
     ("read -r x < .env", Some(Class::EnvFile)),
-    ("while read l; do echo \"$l\"; done < .env", Some(Class::EnvFile)),
+    (
+        "while read l; do echo \"$l\"; done < .env",
+        Some(Class::EnvFile),
+    ),
     // find -exec.
     ("find . -name '.env*' -exec cat {} +", Some(Class::EnvFile)),
     // A process's environment.
@@ -249,7 +260,10 @@ const CORPUS: &[(&str, Option<Class>)] = &[
     ("typeset -x", Some(Class::EnvDump)),
     // envcloak reveal and approve.
     ("command envcloak approve REQUEST", Some(Class::Approve)),
-    ("sh -c 'envcloak reveal openai/project'", Some(Class::Reveal)),
+    (
+        "sh -c 'envcloak reveal openai/project'",
+        Some(Class::Reveal),
+    ),
     ("f() { envcloak approve REQUEST; }; f", Some(Class::Approve)),
     // A command named by a variable.
     ("$c .env", Some(Class::Ambiguous)),
@@ -343,7 +357,11 @@ fn hostile_payloads_get_no_decision_or_a_refusal_and_are_quick() {
         b"\x00\x01\x02",
         b"{\"a\": \"\\ud800\"}",
     ] {
-        for e in [Event::PreToolUse, Event::UserPromptSubmit, Event::SessionStart] {
+        for e in [
+            Event::PreToolUse,
+            Event::UserPromptSubmit,
+            Event::SessionStart,
+        ] {
             assert_eq!(decide(host, e, &buf(bad)), Decision::NoDecision, "{bad:?}");
         }
     }
@@ -357,9 +375,37 @@ fn hostile_payloads_get_no_decision_or_a_refusal_and_are_quick() {
     // A command of the whole cap, of each kind of byte the reader treats
     // specially: answered within 2 seconds.
     for unit in [
-        "$(", "'", "\"", "`", "{a,b}", "{", "{1..2}", "\\", "<<X\n", "a", ";", "$x", "${",
-        "${x:-\"", "$((", "$\"", "\"$(", "a=(", "[[ ", "( ", "{ ", "case x in x) ", "<(",
-        "|", "command ", "env ", "sudo ", "eval ", "sh -c ", "f() ", "for x in ",
+        "$(",
+        "'",
+        "\"",
+        "`",
+        "{a,b}",
+        "{",
+        "{1..2}",
+        "\\",
+        "<<X\n",
+        "a",
+        ";",
+        "$x",
+        "${",
+        "${x:-\"",
+        "$((",
+        "$\"",
+        "\"$(",
+        "a=(",
+        "[[ ",
+        "( ",
+        "{ ",
+        "case x in x) ",
+        "<(",
+        "|",
+        "command ",
+        "env ",
+        "sudo ",
+        "eval ",
+        "sh -c ",
+        "f() ",
+        "for x in ",
     ] {
         let mut cmd = String::new();
         while cmd.len() + unit.len() < MAX_PAYLOAD - 1024 {
@@ -368,8 +414,15 @@ fn hostile_payloads_get_no_decision_or_a_refusal_and_are_quick() {
         let payload = with_command(host, &cmd);
         let t = Instant::now();
         let d = decide(host, Event::PreToolUse, &buf(&payload));
-        assert!(t.elapsed() < Duration::from_secs(2), "{unit:?}: {:?}", t.elapsed());
-        assert!(matches!(d, Decision::Allow | Decision::Deny(_)), "{unit:?}: {d:?}");
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "{unit:?}: {:?}",
+            t.elapsed()
+        );
+        assert!(
+            matches!(d, Decision::Allow | Decision::Deny(_)),
+            "{unit:?}: {d:?}"
+        );
     }
 }
 

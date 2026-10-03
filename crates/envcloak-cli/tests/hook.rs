@@ -24,8 +24,8 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{
-    MANIFEST, cli, outside_dir, project, run_on_terminal, secret_file, seed_vault,
-    start_daemon, stderr, stdout,
+    MANIFEST, cli, outside_dir, project, run_on_terminal, secret_file, seed_vault, start_daemon,
+    stderr, stdout,
 };
 use envcloak_testkit::{TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels};
 use serde_json::{Value, json};
@@ -129,7 +129,10 @@ fn assert_denied(o: &Output, host: &str, event: &str, marker: &str) {
     let shown = if event == "UserPromptSubmit" {
         assert_eq!(v["decision"], "block", "{v}");
         if host == "claude-code" {
-            assert_eq!(v["hookSpecificOutput"]["suppressOriginalPrompt"], true, "{v}");
+            assert_eq!(
+                v["hookSpecificOutput"]["suppressOriginalPrompt"], true,
+                "{v}"
+            );
         }
         v["reason"].as_str().unwrap().to_owned()
     } else {
@@ -148,7 +151,12 @@ fn each_host_gets_its_own_answer() {
     for host in ["claude-code", "codex"] {
         for event in ["UserPromptSubmit", "PreToolUse"] {
             // As captured: a benign prompt, `echo hook-check`.
-            let o = run(&home, host, event, serde_json::to_vec(&captured(host, event)).unwrap());
+            let o = run(
+                &home,
+                host,
+                event,
+                serde_json::to_vec(&captured(host, event)).unwrap(),
+            );
             assert_eq!(code(&o), 0, "{host} {event}: {}", stderr(&o));
             assert!(o.stdout.is_empty() && o.stderr.is_empty(), "{host} {event}");
         }
@@ -164,7 +172,11 @@ fn each_host_gets_its_own_answer() {
             assert_denied(&o, host, "PreToolUse", marker);
         }
         // The other host's payload, or no JSON: no decision, exit 1.
-        let other = if host == "codex" { "claude-code" } else { "codex" };
+        let other = if host == "codex" {
+            "claude-code"
+        } else {
+            "codex"
+        };
         for payload in [
             with_command(other, "printenv"),
             b"not json".to_vec(),
@@ -204,7 +216,11 @@ fn usage_errors_exit_1_never_2() {
         let (o, _) = hook(&home, a, with_command("codex", "printenv"));
         assert_eq!(code(&o), 1, "{a:?}");
         assert!(o.stdout.is_empty(), "{a:?}");
-        assert!(stderr(&o).starts_with("envcloak: usage: "), "{}", stderr(&o));
+        assert!(
+            stderr(&o).starts_with("envcloak: usage: "),
+            "{}",
+            stderr(&o)
+        );
     }
 }
 
@@ -363,13 +379,21 @@ fn session_start_names_the_bound_variables_and_is_silent_without_a_daemon() {
             let o = run(&home, host, "SessionStart", session_start(host, cwd));
             assert_eq!(code(&o), 0, "{}", stderr(&o));
             let text = context_names(&o);
-            assert!(text.contains("binds OPENAI_API_KEY, SHORT_TOKEN, STRIPE_SECRET_KEY."), "{text}");
+            assert!(
+                text.contains("binds OPENAI_API_KEY, SHORT_TOKEN, STRIPE_SECRET_KEY."),
+                "{text}"
+            );
             assert!(text.contains("envcloak run -- <command>"), "{text}");
             assert_no_canary(&o.stdout, &cs);
             assert_no_canary(&o.stderr, &cs);
         }
         // No manifest: nothing.
-        let o = run(&home, host, "SessionStart", session_start(host, &home.home()));
+        let o = run(
+            &home,
+            host,
+            "SessionStart",
+            session_start(host, &home.home()),
+        );
         assert_eq!(code(&o), 0);
         assert!(o.stdout.is_empty());
     }

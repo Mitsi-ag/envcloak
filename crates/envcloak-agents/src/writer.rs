@@ -869,7 +869,10 @@ mod tests {
             now: SystemTime::now(),
         };
         let t = target(&p, true);
-        assert!(matches!(w.change(&t, &mut append("x")), Outcome::Changed { .. }));
+        assert!(matches!(
+            w.change(&t, &mut append("x")),
+            Outcome::Changed { .. }
+        ));
         assert!(matches!(
             w.undo(&t, &mut |_, _, _| Ok(Undo::Nothing)),
             Outcome::Changed { .. }
@@ -914,11 +917,11 @@ mod tests {
             Ok(Some((v, vec![Edit::Block])))
         };
         let o = w.change(&target(&p, false), &mut racing);
-        assert!(matches!(&o, Outcome::Refused(r) if r.name == "changed"), "{o:?}");
-        assert_eq!(
-            std::fs::read(&p).unwrap_or_default(),
-            b"# theirs, longer\n"
+        assert!(
+            matches!(&o, Outcome::Refused(r) if r.name == "changed"),
+            "{o:?}"
         );
+        assert_eq!(std::fs::read(&p).unwrap_or_default(), b"# theirs, longer\n");
         assert!(state.files.is_empty());
     }
 

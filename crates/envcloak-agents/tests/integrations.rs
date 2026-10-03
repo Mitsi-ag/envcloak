@@ -47,7 +47,10 @@ fn the_claude_code_plugin_is_the_installers_integration() {
         .unwrap()
         .split_once("\n---\n\n")
         .unwrap();
-    assert!(front.starts_with("name: envcloak\ndescription: "), "{front}");
+    assert!(
+        front.starts_with("name: envcloak\ndescription: "),
+        "{front}"
+    );
     assert_eq!(body, format!("{INSTRUCTIONS}\n"));
     let envcloak = Path::new("envcloak");
     assert_eq!(
