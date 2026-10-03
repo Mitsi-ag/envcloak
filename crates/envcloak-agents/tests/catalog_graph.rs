@@ -99,7 +99,13 @@ fn declared(package: &str) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let out = Command::new(env!("CARGO"))
         .current_dir(&root)
-        .args(["metadata", "--format-version", "1", "--no-deps", "--offline"])
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -127,8 +133,16 @@ fn declared(package: &str) -> Vec<String> {
 #[test]
 fn the_graph_is_agents_to_scan_and_never_back() {
     let scan = declared("envcloak-scan");
-    for never in ["envcloak-agents", "envcloak-mcp", "envcloak-client", "envcloak"] {
-        assert!(!scan.iter().any(|d| d == never), "scan -> {never}: {scan:?}");
+    for never in [
+        "envcloak-agents",
+        "envcloak-mcp",
+        "envcloak-client",
+        "envcloak",
+    ] {
+        assert!(
+            !scan.iter().any(|d| d == never),
+            "scan -> {never}: {scan:?}"
+        );
     }
     // Control: the edge the check would see is there the other way.
     let agents = declared("envcloak-agents");

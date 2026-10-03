@@ -1932,8 +1932,7 @@ fn hook_classes_are_refused_before_the_daemon_is_asked() {
             json!({"project_dir": dir, "argv": argv}),
         );
         assert_eq!(failed(&r), "command_refused", "{argv:?}: {r}");
-        let text: Value =
-            serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        let text: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
         let message = text["message"].as_str().unwrap();
         assert!(message.starts_with(marker), "{argv:?}: {message}");
     }
