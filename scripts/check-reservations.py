@@ -649,7 +649,9 @@ def walk_error(e):
 
 def rust_files(root, top, skip=(), any_link=False):
     """The paths, relative to `root`, of every `.rs` file under `top`
-    (directories named in `skip` left out), refusing what the compiler can
+    (a crate's own directories named in `skip`, such as a build's
+    `target/`, left out: only right under `crates/<name>/`, never a module
+    of that name), refusing what the compiler can
     read and a walk would not (verifier review of M2-RES1): a directory
     that cannot be listed, a symbolic link to a directory (which the walk
     does not enter, while `mod` reads through it) or to a `.rs` file, any
@@ -657,7 +659,8 @@ def rust_files(root, top, skip=(), any_link=False):
     regular file."""
     out = []
     for dirpath, dirnames, names in os.walk(os.path.join(root, top), onerror=walk_error):
-        dirnames[:] = sorted(d for d in dirnames if d not in skip)
+        crate_level = len(os.path.relpath(dirpath, root).split(os.sep)) == 2
+        dirnames[:] = sorted(d for d in dirnames if not (crate_level and d in skip))
         for d in dirnames:
             if os.path.islink(os.path.join(dirpath, d)):
                 raise SourceError("%s is a symbolic link to a directory, whose files the reader would not read; keep the sources in the tree" % os.path.relpath(os.path.join(dirpath, d), root))
@@ -690,6 +693,8 @@ def rust_sources(root, crate=None):
     except OSError as e:
         raise SourceError("%s could not be listed (%s)" % (CRATES, e.strerror))
     for name in crates:
+        if crate is None and os.path.isfile(os.path.join(base, name)):
+            continue  # a file beside the crates (a `.DS_Store`) is no crate
         for rel in rust_files(root, os.path.join(CRATES, name, "src"), any_link=True):
             out.append(Source(rel, read(root, rel)))
     if not out:
