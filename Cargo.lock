@@ -444,7 +444,6 @@ version = "0.1.0"
 dependencies = [
  "envcloak-core",
  "envcloak-policy",
- "envcloak-sys",
  "proptest",
  "serde_json",
  "sha2",
