@@ -301,10 +301,8 @@ mod tests {
         // SAFETY: rlimit is plain data, for which all zeros is valid.
         let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
         // SAFETY: a valid resource and a writable rlimit.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) },
-            0
-        );
+        let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) };
+        assert_eq!(got, 0);
         let need = libc::rlim_t::try_from(HIGH).unwrap() + 1;
         if lim.rlim_max < need {
             eprintln!("skipped: the hard RLIMIT_NOFILE is under {need}");
@@ -316,10 +314,8 @@ mod tests {
                 rlim_max: lim.rlim_max,
             };
             // SAFETY: a valid resource and an rlimit within the hard limit.
-            assert_eq!(
-                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const l) },
-                0
-            );
+            let set = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const l) };
+            assert_eq!(set, 0);
         };
         set(lim.rlim_cur.max(need));
         let (_r, w) = pipe_cloexec().unwrap();
