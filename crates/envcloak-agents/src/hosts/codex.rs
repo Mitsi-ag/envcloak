@@ -228,6 +228,54 @@ fn json_value(v: &Value) -> Result<toml_edit::Value, Refusal> {
     })
 }
 
+/// EnvCloak's server table, changed since EnvCloak wrote it.
+fn server_modified() -> Refusal {
+    Refusal::new(
+        "server_modified",
+        format!(
+            "[mcp_servers.{SERVER}] in config.toml changed since EnvCloak wrote it (a setting in it \
+             is not EnvCloak's), so it was left as it is: take your change out, or remove the \
+             table, and run this again"
+        ),
+    )
+}
+
+/// Sets `leaf` in `t` to `value`, keeping what the file has around it
+/// (the Codex review: a reinstall dropped the person's comments): the
+/// key and its comments stay, a value written over keeps its own
+/// decoration (a trailing comment), and a table is changed key by key,
+/// the keys of it `value` lacks taken out (it holds only EnvCloak's: the
+/// caller checked it is what EnvCloak wrote).
+fn set_kept(t: &mut Table, leaf: &str, value: &Value) -> Result<(), Refusal> {
+    match (t.get_mut(leaf), value) {
+        (Some(Item::Table(old)), Value::Object(m)) => {
+            let stale: Vec<String> = old
+                .iter()
+                .map(|(k, _)| k.to_owned())
+                .filter(|k| !m.contains_key(k))
+                .collect();
+            for k in stale {
+                old.remove(&k);
+            }
+            for (k, x) in m {
+                if old.get(k).map(item_json).as_ref() != Some(x) {
+                    set_kept(old, k, x)?;
+                }
+            }
+        }
+        (Some(Item::Value(old)), v) if !v.is_object() => {
+            let mut new = json_value(v)?;
+            *new.decor_mut() = old.decor().clone();
+            *old = new;
+        }
+        (Some(item), v) => *item = json_item(v)?,
+        (None, v) => {
+            t.insert(leaf, json_item(v)?);
+        }
+    }
+    Ok(())
+}
+
 /// The values EnvCloak writes over, and so keeps as what was there
 /// before: a boolean, or a rule's `"allow"` or `"deny"`. Anything else at
 /// one of its keys is not written over (and so never copied into
@@ -389,20 +437,31 @@ pub fn apply(
                 .and_then(Item::as_table_mut)
                 .ok_or_else(shape)?;
         }
-        let previous = t.get(leaf).map(item_json);
-        if previous.as_ref() == Some(value) {
+        let current = t.get(leaf).map(item_json);
+        if current.as_ref() == Some(value) {
             continue;
         }
-        let ours = owned.iter().find_map(|e| match e {
+        // What EnvCloak last wrote here, and what was there before it.
+        let last = owned.iter().rev().find_map(|e| match e {
             Edit::TomlValue {
-                path: p, previous, ..
-            } if p == path => Some(previous.clone()),
+                path: p,
+                value: v,
+                previous,
+                ..
+            } if p == path => Some((v, previous)),
             _ => None,
         });
-        let previous = match ours {
-            // Written by EnvCloak before: what was there before it.
-            Some(p) => p,
-            None if value.is_object() && previous.is_some() => {
+        let previous = match (&current, last) {
+            // Not there (any more): written afresh.
+            (None, _) => None,
+            // Still what EnvCloak wrote: EnvCloak's to change, and what
+            // was there before it stays the value to give back.
+            (Some(c), Some((v, before))) if c == v => before.clone(),
+            // EnvCloak's server table, changed since (a setting of the
+            // person's in it): theirs now, never written over (the Codex
+            // review: a reinstall replaced it whole).
+            (Some(_), Some(_)) if value.is_object() => return Err(server_modified()),
+            (Some(_), None) if value.is_object() => {
                 return Err(Refusal::new(
                     "conflict",
                     format!(
@@ -411,7 +470,9 @@ pub fn apply(
                     ),
                 ));
             }
-            None => previous,
+            // A value of the person's, or one they set since EnvCloak
+            // wrote it: what there was before.
+            (Some(c), _) => Some(c.clone()),
         };
         if previous.as_ref().is_some_and(|p| !plain_previous(p)) {
             return Err(shape());
@@ -421,7 +482,7 @@ pub fn apply(
                 return Err(shape());
             }
         }
-        t.insert(leaf, json_item(value)?);
+        set_kept(t, leaf, value)?;
         edits.push(Edit::TomlValue {
             path: path.clone(),
             value: value.clone(),
@@ -467,9 +528,7 @@ pub fn undo(current: &[u8], edits: &[Edit], created_file: bool) -> Result<Undo, 
                 continue;
             }
             match previous {
-                Some(p) => {
-                    t.insert(leaf, json_item(p)?);
-                }
+                Some(p) => set_kept(t, leaf, p)?,
                 None => {
                     t.remove(leaf);
                 }
@@ -659,6 +718,78 @@ mod tests {
             Edit::TomlValue { previous, .. } => previous.as_ref().is_none_or(plain_previous),
             _ => true,
         }));
+    }
+
+    /// The Codex review: a reinstall wrote EnvCloak's whole server table
+    /// over the person's changes to it. A table still as EnvCloak wrote
+    /// it is changed key by key (a comment of the person's in it stays);
+    /// one with a setting of the person's is left, and refused; a value
+    /// the person set since EnvCloak wrote it is what uninstall gives
+    /// back.
+    ///
+    /// Mutation checked: the table replaced whole whenever EnvCloak wrote
+    /// it before (the previous `t.insert` of the whole item with the
+    /// recorded previous value): the person's `enabled_tools` and comment
+    /// are gone and this fails.
+    #[test]
+    fn a_reinstall_changes_only_what_is_still_envcloaks() {
+        let old = config_settings(Path::new("/old/envcloak"), false, None);
+        let new = config_settings(Path::new("/new/envcloak"), false, None);
+        let (after, edits) = run("model = \"m\"\n", &old);
+        // The person adds a comment in EnvCloak's table: an upgrade's
+        // reinstall changes the command and keeps the comment.
+        let commented = after.replace(
+            "[mcp_servers.envcloak]\n",
+            "[mcp_servers.envcloak]\n# my note\n",
+        );
+        let Ok(Some((again, more))) = apply(Some(commented.as_bytes()), &new, &edits) else {
+            panic!("not changed");
+        };
+        let again = String::from_utf8(again).unwrap_or_default();
+        assert!(again.contains("# my note"), "{again}");
+        assert!(
+            again.contains("/new/envcloak") && !again.contains("/old/envcloak"),
+            "{again}"
+        );
+        // A setting of the person's in it: left, and refused.
+        let theirs = after.replace(
+            "[mcp_servers.envcloak]\n",
+            "[mcp_servers.envcloak]\nenabled_tools = [\"run_with_secrets\"]\n",
+        );
+        assert!(matches!(
+            apply(Some(theirs.as_bytes()), &new, &edits),
+            Err(r) if r.name == "server_modified"
+        ));
+        // Uninstall of the upgraded table takes it out whole.
+        let mut all = edits.clone();
+        all.extend(more);
+        let back = match undo(again.as_bytes(), &all, false) {
+            Ok(Undo::Rewrite(b)) => String::from_utf8(b).unwrap_or_default(),
+            other => panic!("{other:?}"),
+        };
+        assert!(!back.contains("envcloak"), "{back}");
+        // A value set since EnvCloak wrote it is the person's: install
+        // keeps it as what was there before, with its comment.
+        let s = config_settings(
+            Path::new("/b/envcloak"),
+            false,
+            Some(Path::new("/r/s.sock")),
+        );
+        let (after, edits) = run("[features.network_proxy]\nenabled = true\n", &s);
+        assert!(after.contains("network_access = true"), "{after}");
+        let theirs = after.replace("network_access = true", "network_access = false # mine");
+        let Ok(Some((again, more))) = apply(Some(theirs.as_bytes()), &s, &edits) else {
+            panic!("not changed");
+        };
+        let again = String::from_utf8(again).unwrap_or_default();
+        assert!(again.contains("network_access = true # mine"), "{again}");
+        let mut all = edits;
+        all.extend(more);
+        let back = match undo(again.as_bytes(), &all, false) {
+            Ok(Undo::Rewrite(b)) => String::from_utf8(b).unwrap_or_default(),
+            other => panic!("{other:?}"),
+        };
+        assert!(back.contains("network_access = false # mine"), "{back}");
     }
 
     #[test]
