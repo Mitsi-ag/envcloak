@@ -91,6 +91,9 @@ pub enum ItemClass {
     Secret = 1,
     Card = 2,
     IssuerCredential = 3,
+    /// A login (SPEC §6.8): typed fields only the sign-in worker's lease
+    /// opens. From schema version 2.
+    Login = 4,
 }
 
 /// The associated data of one sealed value.

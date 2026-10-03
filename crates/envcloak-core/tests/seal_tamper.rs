@@ -231,6 +231,12 @@ fn ciphertexts_swapped_between_rows_fields_tables_or_classes_fail() {
             item_class: ItemClass::Card,
             ..a
         },
+        // A login's ciphertext, sealed under the same subkey as a secret's
+        // (M2-07): only the class tells them apart.
+        Aad {
+            item_class: ItemClass::Login,
+            ..a
+        },
     ];
     let values: Vec<&[u8]> = cs.iter().map(Canary::value).collect();
     let sealed: Vec<Sealed> = places
@@ -408,6 +414,7 @@ fn the_associated_data_is_the_canonical_tuple() {
         (ItemClass::Secret, 1),
         (ItemClass::Card, 2),
         (ItemClass::IssuerCredential, 3),
+        (ItemClass::Login, 4),
     ];
     for (c, n) in classes {
         assert_eq!(c as u16, n);

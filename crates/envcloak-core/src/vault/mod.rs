@@ -26,8 +26,10 @@ pub(crate) mod codec;
 mod error;
 mod integrity;
 mod items;
+mod login;
 mod migrate;
 mod paths;
+mod policies;
 mod schema;
 mod snapshot;
 mod state;
@@ -49,12 +51,25 @@ use crate::secret::SecretBytes;
 pub use error::{VaultError, VaultErrorKind};
 pub use integrity::{AuditHead, HeaderState, Integrity, TamperKind};
 pub use items::{
-    Account, Classification, FieldId, FieldMeta, FieldName, ItemDetails, ItemId, ItemMeta, Links,
-    MAX_FIELD, MAX_PRIOR, MAX_ROW, NewItem, PolicyId, ProjectBinding, ProjectId, ProjectKey,
-    ProjectRecord, Slug,
+    Account, Classification, Exposure, ExposureSource, FieldId, FieldKind, FieldMeta, FieldName,
+    ItemDetails, ItemId, ItemMeta, Links, LoginMeta, LoginTier, MAX_FIELD, MAX_PRIOR, MAX_ROW,
+    NewItem, PolicyId, ProjectBinding, ProjectId, ProjectKey, ProjectRecord, Slug,
 };
+pub use login::{
+    AttemptLease, LoginFieldReader, LoginFieldValue, LoginValue, NewLogin, TotpAlgorithm,
+    TotpEnrollment, TotpParams,
+};
+#[cfg(feature = "testing")]
+pub use migrate::BeforeCommit;
 pub use migrate::{Migration, MigrationPlan, MigrationTx};
 pub use paths::{PathError, PathErrorKind, Platform, VaultPaths, data_dir_for};
+pub use policies::{
+    AdapterRef, BindingStrength, CodeDigest, CodeIdentity, CookieScope, DirIdentity, FileIdentity,
+    IdentityCheck, IdentityCheckKind, LaunchClass, LaunchDecl, LaunchEnv, LaunchRef, MAX_DIGESTS,
+    MAX_LIST, MAX_SIGNATURE, MAX_TEXT, ManagedServer, ManagedTransport, PolicyKind, PolicyRecord,
+    ProjectIdentity, ProofKind, RegisteredLaunch, SessionFormat, SignInTarget, StandingApproval,
+    StandingBinding, StandingSetHeader, StorageScope, SubjectKindRecord, TransferScope,
+};
 pub use schema::{CURRENT_SCHEMA, StorageReport};
 pub use txn::Txn;
 pub(crate) use txn::now_secs;
@@ -809,7 +824,9 @@ impl Vault {
         self.state.items.get(&id).and_then(|r| self.find(&r.slug))
     }
 
-    /// Decrypts a field's current value.
+    /// Decrypts a field's current value. A login's field is refused
+    /// ([`VaultErrorKind::LoginField`]) before anything is read: only a
+    /// sign-in attempt's [`LoginFieldReader`] opens one.
     pub fn read_value(&self, field: FieldId) -> Result<SecretBytes, VaultError> {
         let (class, rv, _) = self.field_context(field)?;
         let stored: Option<Vec<u8>> = self
@@ -838,7 +855,8 @@ impl Vault {
 
     /// Decrypts one of a field's prior values, 0 being the newest. A stored
     /// list that is missing, or holds another number of values than the
-    /// field's record counts, was changed on disk.
+    /// field's record counts, was changed on disk. Refused for a login's
+    /// field, as [`Vault::read_value`] refuses it.
     pub fn read_prior(&self, field: FieldId, index: usize) -> Result<SecretBytes, VaultError> {
         let (class, rv, count) = self.field_context(field)?;
         let stored: Option<Option<Vec<u8>>> = self
@@ -869,7 +887,9 @@ impl Vault {
     }
 
     /// A field's item class, row version and prior count, as verified at
-    /// unlock or written since.
+    /// unlock or written since. A login's field has none to give
+    /// ([`VaultErrorKind::LoginField`]): this is the step every generic read
+    /// of a value goes through.
     fn field_context(
         &self,
         field: FieldId,
@@ -884,6 +904,9 @@ impl Vault {
             .items
             .get(&f.item)
             .ok_or(VaultErrorKind::UnknownItem)?;
+        if item.class == crate::crypto::ItemClass::Login || f.record.kind.is_login() {
+            return Err(VaultErrorKind::LoginField.into());
+        }
         Ok((item.class, f.row_version, f.record.prior_count))
     }
 
@@ -935,14 +958,29 @@ impl Vault {
 
     /// Every policy record. Fails with [`VaultErrorKind::Tampered`] unless
     /// the vault verified: a deleted or rolled-back policy row must not
-    /// loosen a decision.
-    pub fn policies(&self) -> Result<impl Iterator<Item = (PolicyId, &[u8])>, VaultError> {
+    /// loosen a decision. Fails with [`VaultErrorKind::Migration`] for a
+    /// vault left at schema version 1 by a failed migration, whose policy
+    /// rows have no type: none of them is served.
+    pub fn policies(&self) -> Result<impl Iterator<Item = (PolicyId, &PolicyRecord)>, VaultError> {
         self.trusted()?;
-        Ok(self
+        if self.migration_error.is_some() || self.ctx.schema_version < CURRENT_SCHEMA {
+            return Err(VaultErrorKind::Migration.into());
+        }
+        let records: Vec<(PolicyId, &PolicyRecord)> = self
             .state
             .policies
             .iter()
-            .map(|(id, p)| (*id, p.body.as_slice())))
+            .map(|(id, p)| p.record.as_ref().map(|r| (*id, r)))
+            .collect::<Option<_>>()
+            .ok_or(VaultErrorKind::Migration)?;
+        Ok(records.into_iter())
+    }
+
+    /// The standing-policy set's generation and digest as of the last
+    /// commit (D-10). Fails as [`Vault::policies`] does.
+    pub fn standing_set(&self) -> Result<StandingSetHeader, VaultError> {
+        drop(self.policies()?);
+        Ok(self.state.header.standing_set)
     }
 
     /// The unlocker envelopes that verified at unlock.
@@ -1069,6 +1107,10 @@ fn build_new(
     let header = HeaderState {
         write_counter: 1,
         state_digest: state_digest(&keys, &stamps),
+        standing_set: StandingSetHeader {
+            generation: 0,
+            set_digest: policies::standing_set_digest(&keys, core::iter::empty()),
+        },
         ..HeaderState::default()
     };
     let sealed = seal_record(

@@ -746,7 +746,7 @@ impl From<ItemClass> for ItemClassView {
             ItemClass::Secret => ItemClassView::Secret,
             ItemClass::Card => ItemClassView::Card,
             ItemClass::IssuerCredential => ItemClassView::IssuerCredential,
-            ItemClass::None => ItemClassView::Other,
+            ItemClass::Login | ItemClass::None => ItemClassView::Other,
         }
     }
 }

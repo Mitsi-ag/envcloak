@@ -19,10 +19,18 @@ use crate::secret::SecretBytes;
 
 use super::error::{VaultError, VaultErrorKind};
 use super::items::{MAX_FIELD, MAX_PRIOR};
+use super::login::{TotpAlgorithm, TotpEnrollment, TotpParams};
 
 /// The keyed-hash domain of `fields.value_hash`.
 pub(crate) const VALUE_DOMAIN: &str = "envcloak/v1/value";
+/// The keyed-hash domain of a login field's `fields.value_hash`: another
+/// domain than [`VALUE_DOMAIN`], so no comparison against the vault's
+/// values (import's deduplication, `find_by_value`) ever matches a login's
+/// username, password, TOTP enrollment or adapter key.
+pub(crate) const LOGIN_VALUE_DOMAIN: &str = "envcloak/v2/login-value";
 const PRIOR_RECORD: u8 = 1;
+/// The format version of a sealed TOTP enrollment.
+const TOTP_RECORD: u8 = 1;
 
 /// Seals a non-secret record (metadata, the header).
 pub(crate) fn seal_record(k: &SubKey, aad: &Aad, record: &[u8]) -> Result<Vec<u8>, VaultError> {
@@ -85,6 +93,57 @@ pub(crate) fn sha256_update(h: &mut sha2::Sha256, v: &SecretBytes) {
 #[allow(clippy::disallowed_methods)] // Hashes the value for lookups.
 pub(crate) fn value_hash(index: &SubKey, v: &SecretBytes) -> [u8; 32] {
     keyed_hash(index, VALUE_DOMAIN, v.expose_secret())
+}
+
+/// Keyed BLAKE3 of a login field's value under the `index` subkey, in
+/// [`LOGIN_VALUE_DOMAIN`].
+#[allow(clippy::disallowed_methods)] // Hashes a login value for the row's stamp only.
+pub(crate) fn login_value_hash(index: &SubKey, v: &SecretBytes) -> [u8; 32] {
+    keyed_hash(index, LOGIN_VALUE_DOMAIN, v.expose_secret())
+}
+
+/// Packs a TOTP enrollment into the value a login's TOTP field seals:
+/// `version(1) algorithm(1) digits(1) period(4) seed`. Fails with
+/// [`VaultErrorKind::InvalidValue`] for an empty seed and
+/// [`VaultErrorKind::TooLarge`] for one over [`TotpEnrollment::MAX_SEED`].
+#[allow(clippy::disallowed_methods)] // Packs a TOTP seed to encrypt it.
+pub(crate) fn pack_totp(
+    params: &TotpParams,
+    seed: &SecretBytes,
+) -> Result<SecretBytes, VaultError> {
+    if seed.is_empty() {
+        return Err(VaultErrorKind::InvalidValue.into());
+    }
+    if seed.len() > TotpEnrollment::MAX_SEED {
+        return Err(VaultErrorKind::TooLarge.into());
+    }
+    let total = 7 + seed.len();
+    // Exact capacity: the pushes below never reallocate, so no unwiped copy
+    // is freed, and `SecretBytes` wipes the buffer when it drops.
+    let mut buf = Vec::with_capacity(total);
+    buf.push(TOTP_RECORD);
+    buf.push(params.algorithm() as u8);
+    buf.push(params.digits());
+    buf.extend_from_slice(&params.period().to_be_bytes());
+    buf.extend_from_slice(seed.expose_secret());
+    debug_assert_eq!(buf.len(), total);
+    Ok(SecretBytes::from_vec(buf))
+}
+
+/// Unpacks [`pack_totp`]'s output. Anything else is
+/// [`VaultErrorKind::Corrupt`].
+#[allow(clippy::disallowed_methods)] // Unpacks a TOTP enrollment.
+pub(crate) fn unpack_totp(v: &SecretBytes) -> Result<(TotpParams, SecretBytes), VaultError> {
+    let corrupt = || VaultError::from(VaultErrorKind::Corrupt);
+    let b = v.expose_secret();
+    let (head, seed) = b.split_at_checked(7).ok_or_else(corrupt)?;
+    if head[0] != TOTP_RECORD || seed.is_empty() || seed.len() > TotpEnrollment::MAX_SEED {
+        return Err(corrupt());
+    }
+    let algorithm = TotpAlgorithm::from_byte(head[1])?;
+    let period = u32::from_be_bytes([head[3], head[4], head[5], head[6]]);
+    let params = TotpParams::new(algorithm, head[2], period).map_err(|_| corrupt())?;
+    Ok((params, SecretBytes::copy_from(seed)))
 }
 
 /// Seals prior values, newest first: `version(1) count(1)` then `len(4)
@@ -174,6 +233,23 @@ pub(crate) fn reseal(
 ) -> Result<Vec<u8>, CryptoError> {
     let pt = open_stored(k, from, stored)?;
     Ok(seal(k, to, pt.expose_secret())?.to_bytes())
+}
+
+/// Re-seals a stored metadata record under new associated data, rewritten
+/// by `upgrade` on the way (a migration that changes the record's layout).
+/// The old plaintext is wiped when this returns.
+#[allow(clippy::disallowed_methods)] // Hands migrated metadata to its upgrade.
+pub(crate) fn reseal_record(
+    k: &SubKey,
+    from: &Aad,
+    to: &Aad,
+    stored: &[u8],
+    upgrade: impl FnOnce(&[u8]) -> Result<Vec<u8>, VaultError>,
+) -> Result<Vec<u8>, VaultError> {
+    let pt =
+        open_stored(k, from, stored).map_err(|_| VaultError::from(VaultErrorKind::Migration))?;
+    let new = upgrade(pt.expose_secret())?;
+    Ok(seal(k, to, &new)?.to_bytes())
 }
 
 fn open_stored(k: &SubKey, aad: &Aad, stored: &[u8]) -> Result<SecretBytes, CryptoError> {

@@ -55,6 +55,13 @@ impl RecoveryKit {
         RecoveryKit(SecretBytes::from_vec(v))
     }
 
+    /// Test support only (feature `testing`): the kit whose secret is the
+    /// 16 bytes `b`, for fixtures whose kit is derived at run time.
+    #[cfg(feature = "testing")]
+    pub fn from_bytes_for_testing(b: &[u8]) -> Option<Self> {
+        (b.len() == Self::BYTES).then(|| RecoveryKit(SecretBytes::copy_from(b)))
+    }
+
     /// The kit as the user writes it down: seven groups of four symbols
     /// joined by hyphens, such as `ABCD-EFGH-...`.
     #[allow(clippy::disallowed_methods)] // Encodes the kit for display.

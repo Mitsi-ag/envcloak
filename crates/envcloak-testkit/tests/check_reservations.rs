@@ -341,8 +341,8 @@ fn a_malformed_name_or_row_fails() {
     edit(
         &t,
         VAULT,
-        "| 4 | `login` | M2-07 | reserved |",
-        "| four | `login` | M2-07 | reserved |",
+        "| 4 | `login` | M2-07 | landed |",
+        "| four | `login` | M2-07 | landed |",
     );
     assert_fails(&t, "`login` has number 'four', not an integer");
 }

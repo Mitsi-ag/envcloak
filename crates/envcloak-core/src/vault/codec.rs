@@ -31,6 +31,28 @@ impl Enc {
         self
     }
 
+    pub(crate) fn u32(&mut self, v: u32) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+
+    pub(crate) fn bool(&mut self, v: bool) -> &mut Self {
+        self.u8(u8::from(v))
+    }
+
+    /// A list's count. Lists are capped far below 4 GiB before they are
+    /// encoded, so a longer one is a bug.
+    pub(crate) fn count(&mut self, n: usize) -> &mut Self {
+        self.u32(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
+    pub(crate) fn opt_bytes(&mut self, b: Option<&[u8]>) -> &mut Self {
+        match b {
+            None => self.u8(0),
+            Some(b) => self.u8(1).bytes(b),
+        }
+    }
+
     pub(crate) fn raw(&mut self, b: &[u8]) -> &mut Self {
         self.buf.extend_from_slice(b);
         self
@@ -153,6 +175,26 @@ impl<'a> Dec<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    pub(crate) fn opt_bytes(&mut self) -> Result<Option<&'a [u8]>, VaultError> {
+        if self.bool()? {
+            self.bytes().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// A list's count: at most `max`, and at most as many items of
+    /// `min_len` bytes each as the rest of the input holds, which also
+    /// bounds what a caller allocates for them.
+    pub(crate) fn count(&mut self, min_len: usize, max: usize) -> Result<usize, VaultError> {
+        let n = usize::try_from(self.u32()?).map_err(|_| corrupt())?;
+        let rest = self.buf.len() - self.at;
+        if n > max || n > rest / min_len.max(1) {
+            return Err(corrupt());
+        }
+        Ok(n)
     }
 
     pub(crate) fn strings(&mut self) -> Result<Vec<String>, VaultError> {

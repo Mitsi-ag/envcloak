@@ -76,7 +76,7 @@ fn pristine() -> Pristine {
             let other = t.add_field(b, name("value"), SecretBytes::copy_from(b"other value"))?;
             t.add_field(b, name("second"), SecretBytes::copy_from(b"second value"))?;
             t.upsert_project(project(1))?;
-            t.put_policy(PolicyId::generate(), b"a policy")?;
+            t.put_policy(PolicyId::generate(), &common::standing_record(1))?;
             t.add_unlocker(kit)?;
             Ok((keep, other))
         })
@@ -296,7 +296,7 @@ fn restoring_one_row_from_an_older_copy_opens_read_only() {
             },
         )?;
         t.upsert_project(project(2))?;
-        t.put_policy(policy, b"policy v2")?;
+        t.put_policy(policy, &common::standing_record(2))?;
         t.replace_unlocker(replaced)
     })
     .unwrap();
@@ -614,7 +614,7 @@ fn the_rows_that_name_the_vault_are_covered_too() {
         drop(locked);
         let v = p.f.unlock_with_passphrase();
         assert_eq!(v.vault_id(), p.f.vault_id, "{case}");
-        assert_eq!(v.schema_version(), 1, "{case}");
+        assert_eq!(v.schema_version(), 2, "{case}");
         assert_read_only(v, Some(want), Some(p.keep), case);
     }
 }
@@ -769,7 +769,8 @@ fn unlocking_the_handle_kept_by_lock_reads_the_file_again() {
     p.restore();
     let mut v = p.f.unlock();
     let policy = v.policies().unwrap().next().unwrap().0;
-    v.transact(|t| t.put_policy(policy, b"policy v2")).unwrap();
+    v.transact(|t| t.put_policy(policy, &common::standing_record(2)))
+        .unwrap();
     drop(v);
     let locked = open_and_lock();
     rewrite_on_disk(
@@ -855,7 +856,7 @@ fn the_kept_handle_reads_the_file_again_with_session_frames_in_the_wal() {
                 let value = SecretBytes::copy_from(b"a value that fills the pages");
                 t.add_field(item, name("value"), value)?;
             }
-            t.put_policy(policy, b"policy v2")
+            t.put_policy(policy, &common::standing_record(2))
         })
         .unwrap();
         drop(v);
