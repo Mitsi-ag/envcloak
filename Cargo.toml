@@ -172,6 +172,11 @@ opt-level = 3
 # Every buffer that held a chunk is wiped as it is freed.
 [profile.dev.package.zeroize]
 opt-level = 3
+# The sign-in contract is checked by enumerating every ordering of its
+# events (crates/envcloak-signin/tests/enumeration.rs), millions of store
+# calls; the crate and its tests are optimized in test builds.
+[profile.dev.package.envcloak-signin]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
