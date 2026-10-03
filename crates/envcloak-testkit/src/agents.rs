@@ -800,7 +800,7 @@ impl Model {
     }
 
     /// The run's token, the hosts' API key.
-    pub fn token(&self) -> &str {
+    pub fn api_key(&self) -> &str {
         &self.token
     }
 
@@ -1303,10 +1303,10 @@ impl AgentHome {
             match self.host {
                 Host::ClaudeCode => {
                     cmd.env("ANTHROPIC_BASE_URL", m.base_url())
-                        .env("ANTHROPIC_API_KEY", m.token());
+                        .env("ANTHROPIC_API_KEY", m.api_key());
                 }
                 Host::Codex => {
-                    cmd.env("EC_MODEL_TOKEN", m.token());
+                    cmd.env("EC_MODEL_TOKEN", m.api_key());
                 }
             }
         }

@@ -102,7 +102,7 @@ impl ModelStub {
     }
 
     /// The run's token, which a host must present as its API key.
-    pub fn token(&self) -> &Token {
+    pub fn api_key(&self) -> &Token {
         &self.token
     }
 

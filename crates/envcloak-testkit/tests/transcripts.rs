@@ -740,7 +740,7 @@ fn the_model_s_request_lines_are_swept() {
         .collect();
     let method = Canary::new("METHOD_VALUE", format!("EC{letters}"));
     let model = Model::start(&serde_json::json!({"steps": [{"say": "done"}]}));
-    let (base, key) = (model.base_url(), format!("x-api-key: {}", model.token()));
+    let (base, key) = (model.base_url(), format!("x-api-key: {}", model.api_key()));
     let run = |args: &[&str]| {
         let out = Command::new(curl)
             .args(["-s", "-o", "/dev/null", "--max-time", "20"])

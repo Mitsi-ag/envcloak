@@ -89,7 +89,7 @@ fn main() -> ExitCode {
     };
     let ready = serde_json::json!({
         "addr": server.addr().to_string(),
-        "token": server.token().as_str(),
+        "token": server.api_key().as_str(),
     });
     let mut out: Zeroizing<Vec<u8>> = Zeroizing::new(ready.to_string().into_bytes());
     drop(ready);
