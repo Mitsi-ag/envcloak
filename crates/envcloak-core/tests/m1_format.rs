@@ -18,6 +18,9 @@
 //!   build, checked against its manifest as it was backed up and migrated
 //!   after; and an `init` file backup M1 wrote opens once the vault has
 //!   moved to version 2.
+//! - The largest records M1 stored (`vault-boundary.db`) migrate whole and
+//!   take every later write M1 took of them: the vault's own additions do
+//!   not count against the size the person's records were held to.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -35,8 +38,9 @@ use envcloak_core::file_backup::{FileBackupId, FileLeft};
 use envcloak_core::file_backup_v2::CreatorKind;
 use envcloak_core::vault::{
     Account, AuditHead, Classification, ExposureSource, FieldKind, Integrity, ItemDetails, Links,
-    LockedVault, LoginMeta, LoginTier, MigrationPlan, MigrationTx, NewLogin, PolicyId,
-    ProjectBinding, ProjectKey, ProjectRecord, Slug, Vault, VaultError, VaultErrorKind, VaultPaths,
+    LockedVault, LoginMeta, LoginTier, MAX_FIELD, MAX_PRIOR, MigrationPlan, MigrationTx, NewLogin,
+    PolicyId, ProjectBinding, ProjectKey, ProjectRecord, Slug, Vault, VaultError, VaultErrorKind,
+    VaultPaths,
 };
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_testkit::{TestHome, fresh_seed};
@@ -107,6 +111,35 @@ fn details(n: usize) -> ItemDetails {
         last_used_at: pick(4).then_some(1_800_000_000 + n as u64),
         notes: format!("notes for item {n:02}"),
     }
+}
+
+/// `vault-boundary.db`'s items: each item record exactly `MAX_FIELD`
+/// bytes as M1 laid it out (M1's own check refused one byte more when it
+/// wrote them), sealed under each class's key.
+const BOUNDARY: [(ItemClass, &str); 2] = [
+    (ItemClass::Secret, "m1/boundary"),
+    (ItemClass::Card, "m1/boundary-card"),
+];
+
+fn boundary_details(slug: &str, len: usize) -> ItemDetails {
+    let notes = "boundary notes ".repeat(len / 15 + 1);
+    ItemDetails {
+        title: slug.to_owned(),
+        classification: Classification::Live,
+        notes: notes[..len].to_owned(),
+        ..ItemDetails::default()
+    }
+}
+
+fn boundary_notes(slug: &str) -> usize {
+    MAX_FIELD - 43 - 2 * slug.len()
+}
+
+fn boundary_value(slug: &str, version: usize) -> Vec<u8> {
+    let unit = format!("{slug} boundary value version {version} ");
+    let mut v = unit.repeat(MAX_FIELD / unit.len() + 1).into_bytes();
+    v.truncate(MAX_FIELD);
+    v
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -484,6 +517,131 @@ fn an_m1_policy_row_fails_the_migration_and_changes_nothing() {
     assert_opens_at_version_1(&m, MigrationPlan::current());
     assert_eq!(m.dump(), before);
     assert_eq!(m.versions(), (1, 1));
+}
+
+/// The largest records M1 stored migrate whole, and every later write M1
+/// took of them is still taken. `vault-boundary.db` holds, written by M1's
+/// code, items whose records are exactly `MAX_FIELD` bytes as M1 laid them
+/// out, and a field row with a value and three prior values of `MAX_FIELD`
+/// bytes. After the migration, which adds the parts schema version 2 keeps
+/// to every record: the same details written again, a rename to a slug of
+/// the same length, a classification change and an exposure mark (each
+/// adding to what the vault keeps), the mark cleared, and a new value of
+/// `MAX_FIELD` bytes pushing out the oldest prior value all succeed, and
+/// survive reopening; one byte more of notes is refused, as M1 refused it.
+///
+/// Mutations checked: the whole version 2 record held to `MAX_FIELD` in
+/// `encode_item`: the migration fails and this fails; the code as it was
+/// (the migration's rewrite unchecked, `write_item` holding the whole
+/// record to `MAX_FIELD`): the migration succeeds and the first later
+/// write is refused `TooLarge`, and this fails.
+#[test]
+fn the_largest_records_m1_wrote_migrate_and_take_later_writes() {
+    let m = M1::install("vault-boundary.db");
+    assert_eq!(m.versions(), (1, 1));
+    let mut v = m
+        .open(MigrationPlan::current())
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_eq!(v.migration_error(), None);
+    assert_eq!(v.integrity(), Integrity::Ok);
+    assert_eq!(v.schema_version(), 2);
+    let expected = |slug: &str, version: usize| boundary_value(slug, version);
+    let held = |v: &Vault, slug: &str, class: ItemClass, latest: usize| {
+        let item = v.find(&Slug::new(slug).unwrap()).unwrap().clone();
+        assert_eq!(item.class, class, "{slug}");
+        let f = &item.fields[0];
+        assert!(v.read_value(f.id).unwrap().ct_eq(&expected(slug, latest)));
+        let priors = if class == ItemClass::Secret {
+            MAX_PRIOR
+        } else {
+            0
+        };
+        assert_eq!(usize::from(f.prior_count), priors, "{slug}");
+        for i in 0..priors {
+            let got = v.read_prior(f.id, i).unwrap();
+            assert!(
+                got.ct_eq(&expected(slug, latest - 1 - i)),
+                "{slug} prior {i}"
+            );
+        }
+        item
+    };
+    for (class, slug) in BOUNDARY {
+        let item = held(
+            &v,
+            slug,
+            class,
+            if class == ItemClass::Secret {
+                MAX_PRIOR
+            } else {
+                0
+            },
+        );
+        assert_eq!(item.details, boundary_details(slug, boundary_notes(slug)));
+        assert_eq!(item.classification_changed_at, None);
+    }
+
+    for (class, slug) in BOUNDARY {
+        let item = v.find(&Slug::new(slug).unwrap()).unwrap().clone();
+        let same_length = Slug::new(&format!("{}z", &slug[..slug.len() - 1])).unwrap();
+        v.transact(|t| {
+            t.update_item(item.id, item.details.clone())?;
+            t.rename_item(item.id, same_length.clone())?;
+            t.update_item(
+                item.id,
+                ItemDetails {
+                    classification: Classification::Test,
+                    ..item.details.clone()
+                },
+            )?;
+            t.mark_exposed(item.id, &ExposureSource::ALL, 3)?;
+            Ok(())
+        })
+        .unwrap();
+        let marked = v.item(item.id).unwrap();
+        assert!(marked.rotate_recommended && marked.exposure.is_some());
+        assert!(marked.classification_changed_at.is_some());
+        v.transact(|t| t.clear_exposure(item.id)).unwrap();
+        if class == ItemClass::Secret {
+            let f = item.fields[0].id;
+            v.transact(|t| t.set_value(f, SecretBytes::copy_from(&expected(slug, 4))))
+                .unwrap();
+        }
+        v.transact(|t| t.rename_item(item.id, Slug::new(slug).unwrap()))
+            .unwrap();
+        // One byte more of what the person gives is refused, as M1 refused
+        // it, and changes nothing.
+        let mut over = item.details.clone();
+        over.notes.push('n');
+        let e = v.transact(|t| t.update_item(item.id, over)).unwrap_err();
+        assert_eq!(e.kind(), VaultErrorKind::TooLarge, "{slug}");
+    }
+    drop(v);
+
+    let v = m
+        .open(MigrationPlan::current())
+        .map_err(|(_, e)| e)
+        .unwrap();
+    assert_eq!(v.integrity(), Integrity::Ok);
+    for (class, slug) in BOUNDARY {
+        let latest = if class == ItemClass::Secret {
+            MAX_PRIOR + 1
+        } else {
+            0
+        };
+        let item = held(&v, slug, class, latest);
+        assert_eq!(
+            item.details,
+            ItemDetails {
+                classification: Classification::Test,
+                ..boundary_details(slug, boundary_notes(slug))
+            }
+        );
+        assert!(item.classification_changed_at.is_some());
+        assert_eq!(item.exposure, None);
+        assert!(!item.rotate_recommended);
+    }
 }
 
 const MIGRATOR: &str = "ENVCLOAK_M1_MIGRATOR";

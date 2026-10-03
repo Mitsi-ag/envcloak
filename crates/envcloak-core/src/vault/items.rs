@@ -14,7 +14,9 @@ use super::error::{VaultError, VaultErrorKind};
 /// The largest sealed plaintext of one column: a secret value, an item's
 /// metadata, a project or a policy (SPEC §5: 64 KiB per sensitive field).
 /// The prior list is the exception: it packs up to [`MAX_PRIOR`] values of
-/// at most this size each into one column, bounded by [`MAX_ROW`].
+/// at most this size each into one column, bounded by [`MAX_ROW`]. An
+/// item's record holds this much of what its writer gives, and after it the
+/// few bytes the vault keeps itself ([`MAX_ITEM_KEPT`]).
 pub const MAX_FIELD: usize = 64 * 1024;
 /// The largest row, all columns together (SPEC §5: 1 MiB per row).
 pub const MAX_ROW: usize = 1024 * 1024;
@@ -498,16 +500,36 @@ pub(crate) const RECORDS_V2_FROM: u16 = 2;
 /// The longest list of exposure sources a record holds: each source once.
 const MAX_SOURCES: usize = ExposureSource::ALL.len();
 
-/// The sealed plaintext of `items.sealed_meta`, version 2.
+/// The most bytes an item record holds after `notes`: the parts schema
+/// version 2 added, which the vault keeps itself ([`ItemExtra`]): the
+/// classification's last change (9), the exposure (1, then 8 + 8 + 4 and a
+/// byte per source), the rotation flag (1) and a login's block (1, then 1 +
+/// 8). They are bounded by their types and counted apart from
+/// [`MAX_FIELD`], which bounds the rest, what the item's writer gives: so
+/// neither the migration, which adds them to every record version 1 held,
+/// nor a mark the vault makes later (a classification change, an exposure)
+/// takes a record that was within the limit over it.
+pub(crate) const MAX_ITEM_KEPT: usize = 9 + (1 + 8 + 8 + 4 + MAX_SOURCES) + 1 + (1 + 1 + 8);
+
+/// The sealed plaintext of `items.sealed_meta`, version 2, and the one
+/// check of its size, for every writer of one (a transaction and the
+/// migration alike): the record up to `notes`, what version 1 held and what
+/// the item's writer gives, is at most [`MAX_FIELD`] bytes, as version 1
+/// counted it ([`VaultErrorKind::TooLarge`] beyond); the parts the vault
+/// keeps add at most [`MAX_ITEM_KEPT`] after it.
 pub(crate) fn encode_item(
     slug: &Slug,
     created_at: u64,
     d: &ItemDetails,
     extra: &ItemExtra,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, VaultError> {
     let mut e = Enc::new();
     e.u8(ITEM_RECORD_V2);
     encode_item_body(&mut e, slug, created_at, d);
+    let given = e.len();
+    if given > MAX_FIELD {
+        return Err(VaultErrorKind::TooLarge.into());
+    }
     e.opt_u64(extra.classification_changed_at);
     match &extra.exposure {
         None => {
@@ -529,7 +551,20 @@ pub(crate) fn encode_item(
             e.u8(1).u8(l.tier as u8).u64(l.session_lifetime);
         }
     }
-    e.finish()
+    debug_assert!(e.len() - given <= MAX_ITEM_KEPT);
+    Ok(e.finish())
+}
+
+/// A version 1 item record (schema version 1) of an item of `class` as
+/// version 2: everything it holds kept, and what version 1 did not record
+/// left empty (in particular the classification's last change, which is
+/// not known). The migration's one way to rewrite one: through
+/// [`encode_item`]'s check, so it writes no record a later write would
+/// refuse. Every record version 1 held passes it, version 1's limit being
+/// the same bytes.
+pub(crate) fn upgrade_item_v1(b: &[u8], class: ItemClass) -> Result<Vec<u8>, VaultError> {
+    let (slug, created_at, details, _) = decode_item(b, RECORDS_V2_FROM - 1, class)?;
+    encode_item(&slug, created_at, &details, &ItemExtra::default())
 }
 
 /// The fields version 1 has, which version 2 keeps in the same order.
@@ -680,6 +715,14 @@ pub(crate) fn encode_field(r: &FieldRecord) -> Vec<u8> {
         .u64(r.updated_at)
         .u8(r.kind as u8);
     e.finish()
+}
+
+/// A version 1 field record as version 2: every field of version 1 holds
+/// a value. Its name is at most [`FieldName::MAX_LEN`] bytes, so the record
+/// stays far under [`MAX_FIELD`], and its row under [`MAX_ROW`], with the
+/// byte version 2 adds (`field_rows_stay_under_their_limits`).
+pub(crate) fn upgrade_field_v1(b: &[u8]) -> Result<Vec<u8>, VaultError> {
+    Ok(encode_field(&decode_field(b, RECORDS_V2_FROM - 1)?))
 }
 
 /// The field record as schema version 1 holds it (no kind). Unit tests
@@ -900,7 +943,7 @@ mod tests {
         let details = details();
         let slug = Slug::new("openai/work").unwrap();
         for extra in [ItemExtra::default(), exposed()] {
-            let bytes = encode_item(&slug, 42, &details, &extra);
+            let bytes = encode_item(&slug, 42, &details, &extra).unwrap();
             for schema in [2, 3] {
                 assert_eq!(
                     decode_item(&bytes, schema, ItemClass::Secret).unwrap(),
@@ -916,7 +959,7 @@ mod tests {
                 VaultErrorKind::Corrupt
             );
         }
-        let bytes = encode_item(&slug, 42, &details, &login_extra());
+        let bytes = encode_item(&slug, 42, &details, &login_extra()).unwrap();
         assert_eq!(
             decode_item(&bytes, 2, ItemClass::Login).unwrap().3,
             login_extra()
@@ -965,7 +1008,7 @@ mod tests {
             decode_item(&v1, 1, ItemClass::Secret).unwrap(),
             (slug.clone(), 42, details.clone(), ItemExtra::default())
         );
-        let v2 = encode_item(&slug, 42, &details, &ItemExtra::default());
+        let v2 = encode_item(&slug, 42, &details, &ItemExtra::default()).unwrap();
         for (bytes, schema) in [(&v1, 2), (&v2, 1)] {
             assert_eq!(
                 decode_item(bytes, schema, ItemClass::Secret)
@@ -997,12 +1040,12 @@ mod tests {
             assert_eq!(r.unwrap_err().kind(), VaultErrorKind::Corrupt);
         };
         corrupt(decode_item(
-            &encode_item(&slug, 1, &d, &login_extra()),
+            &encode_item(&slug, 1, &d, &login_extra()).unwrap(),
             2,
             ItemClass::Secret,
         ));
         corrupt(decode_item(
-            &encode_item(&slug, 1, &d, &ItemExtra::default()),
+            &encode_item(&slug, 1, &d, &ItemExtra::default()).unwrap(),
             2,
             ItemClass::Login,
         ));
@@ -1020,6 +1063,7 @@ mod tests {
                     ..ItemExtra::default()
                 },
             )
+            .unwrap()
         };
         for bad in [
             vec![],
@@ -1037,7 +1081,7 @@ mod tests {
             .unwrap();
         b[at] = 8;
         corrupt(decode_item(&b, 2, ItemClass::Secret));
-        let mut b = encode_item(&slug, 1, &d, &login_extra());
+        let mut b = encode_item(&slug, 1, &d, &login_extra()).unwrap();
         let at = b.len() - 9;
         assert_eq!(b[at], LoginTier::Dev as u8);
         b[at] = 4;
@@ -1060,8 +1104,8 @@ mod tests {
         assert!(decode_field(&encode_field(&renamed), 2).is_err());
         // Every cut short record fails, and none panics.
         for full in [
-            encode_item(&slug, 1, &d, &exposed()),
-            encode_item(&slug, 1, &d, &login_extra()),
+            encode_item(&slug, 1, &d, &exposed()).unwrap(),
+            encode_item(&slug, 1, &d, &login_extra()).unwrap(),
         ] {
             for n in 0..full.len() {
                 assert!(decode_item(&full[..n], 2, ItemClass::Secret).is_err());
@@ -1072,5 +1116,132 @@ mod tests {
         for n in 0..full.len() {
             assert!(decode_field(&full[..n], 2).is_err());
         }
+    }
+
+    /// Details whose record, as version 1 lays it out, is `size` bytes:
+    /// the notes fill it.
+    fn details_of_size(slug: &Slug, size: usize) -> ItemDetails {
+        let d = details();
+        let besides = encode_item_v1(slug, 42, &d).len() - d.notes.len();
+        ItemDetails {
+            notes: "n".repeat(size - besides),
+            ..d
+        }
+    }
+
+    /// The most the vault keeps after `notes`: every part present, every
+    /// exposure source.
+    fn most_kept() -> ItemExtra {
+        ItemExtra {
+            classification_changed_at: Some(11),
+            exposure: Some(Exposure {
+                since: 12,
+                sources: ExposureSource::ALL.to_vec(),
+                count: u64::MAX,
+            }),
+            rotate_recommended: true,
+            login: Some(LoginMeta {
+                tier: LoginTier::NeverAgent,
+                session_lifetime: u64::MAX,
+            }),
+        }
+    }
+
+    /// What an item's writer gives is held to `MAX_FIELD` bytes as version
+    /// 1 counted it, and what the vault keeps comes after it, at most
+    /// `MAX_ITEM_KEPT` bytes: a record at the limit takes every part the
+    /// vault adds (a migration's, a classification change's, an
+    /// exposure's), and one byte more is refused whatever it carries.
+    /// Mutations checked: the whole record held to `MAX_FIELD` (as
+    /// `write_item` held it): the record at the limit is refused with any
+    /// part kept, and this fails (and `m1_format`'s boundary test, whose
+    /// migration then fails); no check in `encode_item`: the byte more is
+    /// taken, and this fails.
+    #[test]
+    fn an_item_record_holds_max_field_of_what_it_is_given_and_what_the_vault_keeps() {
+        let slug = Slug::new("openai/work").unwrap();
+        let full = details_of_size(&slug, MAX_FIELD);
+        assert_eq!(encode_item_v1(&slug, 42, &full).len(), MAX_FIELD);
+        for (extra, class) in [
+            (ItemExtra::default(), ItemClass::Secret),
+            (exposed(), ItemClass::Card),
+            (most_kept(), ItemClass::Login),
+        ] {
+            let b = encode_item(&slug, 42, &full, &extra).unwrap();
+            assert!(b.len() > MAX_FIELD && b.len() - MAX_FIELD <= MAX_ITEM_KEPT);
+            assert_eq!(
+                decode_item(&b, 2, class).unwrap(),
+                (slug.clone(), 42, full.clone(), extra)
+            );
+        }
+        // The bound is the most the vault keeps.
+        assert_eq!(
+            encode_item(&slug, 42, &full, &most_kept()).unwrap().len(),
+            MAX_FIELD + MAX_ITEM_KEPT
+        );
+        let over = details_of_size(&slug, MAX_FIELD + 1);
+        for extra in [ItemExtra::default(), most_kept()] {
+            assert_eq!(
+                encode_item(&slug, 42, &over, &extra).unwrap_err().kind(),
+                VaultErrorKind::TooLarge
+            );
+        }
+    }
+
+    /// The migration's rewrite of a version 1 item record keeps the record
+    /// whole up to the largest version 1 stored, and the record it writes
+    /// takes every later write of the same item; a record over that limit
+    /// (which version 1 never stored) is refused, not written for later
+    /// writes to refuse. Mutation checked: the rewrite encoding without
+    /// `encode_item`'s check (as the migration did): the record over the
+    /// limit is rewritten, and this fails.
+    #[test]
+    fn a_version_1_item_record_upgrades_whole_up_to_its_limit() {
+        let slug = Slug::new("openai/work").unwrap();
+        for size in [MAX_FIELD - 1, MAX_FIELD] {
+            let full = details_of_size(&slug, size);
+            let v1 = encode_item_v1(&slug, 42, &full);
+            assert_eq!(v1.len(), size);
+            for class in [ItemClass::Secret, ItemClass::Card] {
+                let v2 = upgrade_item_v1(&v1, class).unwrap();
+                assert_eq!(
+                    decode_item(&v2, 2, class).unwrap(),
+                    (slug.clone(), 42, full.clone(), ItemExtra::default())
+                );
+                // A later write of it, with what the vault adds.
+                encode_item(&slug, 42, &full, &exposed()).unwrap();
+            }
+        }
+        let over = encode_item_v1(&slug, 42, &details_of_size(&slug, MAX_FIELD + 1));
+        assert_eq!(
+            upgrade_item_v1(&over, ItemClass::Secret)
+                .unwrap_err()
+                .kind(),
+            VaultErrorKind::TooLarge
+        );
+    }
+
+    /// The byte a field record gains in the migration cannot take it, or
+    /// its row, over a limit: the longest name makes a record of a few
+    /// dozen bytes, and the largest row (that record, a value of
+    /// `MAX_FIELD` bytes and `MAX_PRIOR` prior values of that size, each
+    /// sealed) stays under `MAX_ROW`. `m1_format`'s boundary test writes
+    /// such a row after the migration.
+    #[test]
+    fn field_rows_stay_under_their_limits() {
+        let longest = FieldRecord {
+            name: FieldName::new(&"a".repeat(FieldName::MAX_LEN)).unwrap(),
+            prior_count: 3,
+            created_at: u64::MAX,
+            updated_at: u64::MAX,
+            kind: FieldKind::Value,
+        };
+        let v1 = encode_field_v1(&longest);
+        let v2 = upgrade_field_v1(&v1).unwrap();
+        assert_eq!(v2.len(), v1.len() + 1);
+        assert_eq!(decode_field(&v2, 2).unwrap(), longest);
+        let sealed = |n: usize| n + crate::crypto::Sealed::OVERHEAD;
+        let row = sealed(v2.len()) + sealed(MAX_FIELD) + sealed(2 + MAX_PRIOR * (4 + MAX_FIELD));
+        assert!(v2.len() < 128 && row < MAX_ROW, "{row}");
     }
 }
