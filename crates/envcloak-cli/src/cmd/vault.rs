@@ -243,7 +243,7 @@ fn outcome_from_status(state: VaultState, busy: bool) -> KitOutcome {
     }
 }
 
-fn with_kit_outcome(mut f: Failure, outcome: KitOutcome) -> Failure {
+fn with_kit_outcome(f: Failure, outcome: KitOutcome) -> Failure {
     let tail = match outcome {
         KitOutcome::Void => {
             "no vault was created, so the Recovery Kit just shown or written is void"
@@ -257,8 +257,7 @@ fn with_kit_outcome(mut f: Failure, outcome: KitOutcome) -> Failure {
              just shown or written, and run `envcloak status` once the daemon is running"
         }
     };
-    f.message = format!("{}; {tail}", f.message).into();
-    f
+    f.with_tail(tail)
 }
 
 fn no_terminal(a: &CreateArgs) -> Failure {
@@ -377,11 +376,19 @@ mod tests {
             KitOutcome::Unknown
         );
         let f = with_kit_outcome(Failure::new("x", "failed"), KitOutcome::Unknown);
-        assert!(f.message.contains("keep the Recovery Kit"), "{}", f.message);
-        assert!(!f.message.contains("void"), "{}", f.message);
+        assert!(
+            f.message().contains("keep the Recovery Kit"),
+            "{}",
+            f.message()
+        );
+        assert!(!f.message().contains("void"), "{}", f.message());
         let f = with_kit_outcome(Failure::new("x", "failed"), KitOutcome::MaybeCreated);
-        assert!(f.message.contains("keep the Recovery Kit"), "{}", f.message);
-        assert!(!f.message.contains("void"), "{}", f.message);
+        assert!(
+            f.message().contains("keep the Recovery Kit"),
+            "{}",
+            f.message()
+        );
+        assert!(!f.message().contains("void"), "{}", f.message());
     }
 
     #[test]

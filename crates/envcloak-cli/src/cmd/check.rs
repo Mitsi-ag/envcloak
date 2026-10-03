@@ -105,7 +105,7 @@ fn check(json: bool) -> Result<ExitCode, Failure> {
                 c.items_check(manifest_text.as_deref(), &sent)
                     .map_err(Failure::from)
             })
-            .map_err(|f| f.token.to_owned())
+            .map_err(|f| f.token().to_owned())
     };
     let (references, unchecked) = match answer {
         Ok(v) => (Some(v), None),

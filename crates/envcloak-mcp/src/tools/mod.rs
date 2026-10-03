@@ -255,7 +255,7 @@ mod tests {
         assert!(req_str(&args, "c").is_err());
         assert_eq!(opt_str(&args, "c").unwrap(), None);
         let e = invalid();
-        assert_eq!(e.token, "invalid_params");
+        assert_eq!(e.token(), "invalid_params");
 
         let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
         for label in [
@@ -265,14 +265,14 @@ mod tests {
         ] {
             let key = envcloak_testkit::by_label(&cs, label).as_str();
             let e = refuse_value_like(&["fine", key]).unwrap_err();
-            assert_eq!(e.token, "value_on_argv");
-            envcloak_testkit::assert_no_canary(e.message.as_bytes(), &cs);
+            assert_eq!(e.token(), "value_on_argv");
+            envcloak_testkit::assert_no_canary(e.message().as_bytes(), &cs);
         }
         assert!(refuse_value_like(&["openai/acme-web", "OPENAI_API_KEY"]).is_ok());
 
         for bad in ["", "relative/dir", "./x", "/no/such/dir/here", "/a\0b"] {
             assert_eq!(
-                project_dir(bad).unwrap_err().token,
+                project_dir(bad).unwrap_err().token(),
                 "invalid_path",
                 "{bad:?}"
             );

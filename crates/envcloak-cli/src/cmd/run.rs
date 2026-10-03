@@ -383,7 +383,7 @@ impl Ended {
                     failure.report(code);
                 }
                 let record = RunStatus::NotStarted {
-                    token: failure.token.to_owned(),
+                    token: failure.token().to_owned(),
                     request,
                 };
                 (record, code)
@@ -578,7 +578,8 @@ fn wait_for(
             let f = Failure::from(ClientError::Rpc(e));
             eprintln!(
                 "envcloak: {}: {}; waiting up to {shown} for a place",
-                f.token, f.message
+                f.token(),
+                f.message()
             );
         }
     };
@@ -952,7 +953,7 @@ mod tests {
     fn an_env_file_is_read_only_from_a_regular_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
-        let message = |p: &str| read_env_file(p).unwrap_err().message.into_owned();
+        let message = |p: &str| read_env_file(p).unwrap_err().message().to_owned();
 
         std::fs::write(
             path("good"),
@@ -981,12 +982,12 @@ mod tests {
         )
         .unwrap();
         let e = read_env_file(&path("bad")).unwrap_err();
-        assert_eq!(e.token, "binding_unresolved");
+        assert_eq!(e.token(), "binding_unresolved");
         assert_eq!(
-            e.message,
+            e.message(),
             "--env-file: env file line 2: a quoted value is not closed"
         );
-        assert!(!e.message.contains(hidden));
+        assert!(!e.message().contains(hidden));
 
         std::fs::write(path("big"), vec![b'#'; MAX_ENV_FILE + 1]).unwrap();
         assert_eq!(message(&path("big")), "the --env-file is larger than 1 MiB");
