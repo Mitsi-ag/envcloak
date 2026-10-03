@@ -29,13 +29,17 @@ use rusqlite::{Connection, OpenFlags};
 use super::error::{VaultError, VaultErrorKind};
 use super::migrate::MigrationPlan;
 
-/// The schema version this build writes.
-pub const CURRENT_SCHEMA: u16 = 1;
+/// The schema version this build writes: 2 (docs/VAULT.md "Schema version
+/// 2"), the one migration of M2 and M2b. It adds no table or column to
+/// version 1: what changed is in the sealed records (item and field
+/// records, the header, typed policy records) and the `login` item class.
+pub const CURRENT_SCHEMA: u16 = 2;
 
 /// `PRAGMA application_id` of a vault file: "ECV1".
 pub(crate) const APPLICATION_ID: i32 = 0x4543_5631;
 
-/// Schema version 1 (SPEC §5; docs/VAULT.md). Plaintext columns hold only
+/// The tables of schema version 1 (SPEC §5; docs/VAULT.md), which version
+/// 2 keeps as they are. Plaintext columns hold only
 /// opaque ids, row versions, timestamps, kinds and keyed hashes; `sealed*`
 /// columns hold XChaCha20-Poly1305 output. The vault id is kept in `meta`,
 /// the header and every unlocker, and the schema version in `meta` and the

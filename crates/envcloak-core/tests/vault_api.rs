@@ -12,7 +12,8 @@ use envcloak_core::crypto::{
 };
 use envcloak_core::vault::{
     AuditHead, INITIAL_EPOCH, Integrity, ItemDetails, LockedVault, MAX_FIELD, MAX_PRIOR, NewItem,
-    PolicyId, ProjectBinding, ProjectKey, ProjectRecord, Vault, VaultErrorKind,
+    PolicyId, PolicyRecord, ProjectBinding, ProjectKey, ProjectRecord, StandingBinding, Vault,
+    VaultErrorKind,
 };
 
 fn value(s: &[u8]) -> SecretBytes {
@@ -46,7 +47,7 @@ fn a_new_vault_is_empty_verified_and_durable() {
     assert_eq!(v.integrity(), Integrity::Ok);
     assert!(v.items().is_empty());
     assert_eq!(v.header().unwrap().write_counter, 1);
-    assert_eq!(v.schema_version(), 1);
+    assert_eq!(v.schema_version(), 2);
     assert_eq!(v.epoch(), INITIAL_EPOCH);
     assert_eq!(v.vault_id(), f.vault_id);
     assert_eq!(v.unlockers().count(), 1);
@@ -268,8 +269,20 @@ fn size_caps_hold() {
         })
         .unwrap_err();
     assert_eq!(e.kind(), VaultErrorKind::TooLarge);
+    // A record within every bound of its kind, but larger than a column.
+    let mut big = common::standing_record(1);
+    if let PolicyRecord::StandingApproval(s) = &mut big {
+        s.bindings = (0..200)
+            .map(|n| StandingBinding {
+                env_name: format!("{}_{n}", "V".repeat(400)),
+                item: envcloak_core::vault::ItemId::generate(),
+                field: envcloak_core::vault::FieldId::generate(),
+            })
+            .collect();
+    }
+    assert!(big.encode().len() > MAX_FIELD);
     let e = v
-        .transact(|t| t.put_policy(PolicyId::generate(), &vec![0; MAX_FIELD + 1]))
+        .transact(|t| t.put_policy(PolicyId::generate(), &big))
         .unwrap_err();
     assert_eq!(e.kind(), VaultErrorKind::TooLarge);
     let e = v
@@ -357,7 +370,7 @@ fn projects_policies_and_header_fields_persist() {
     let policy = PolicyId::generate();
     let pid = v
         .transact(|t| {
-            t.put_policy(policy, b"policy body v1")?;
+            t.put_policy(policy, &common::standing_record(1))?;
             t.set_audit_head(AuditHead {
                 seq: 42,
                 mac: [9; 32],
@@ -374,7 +387,7 @@ fn projects_policies_and_header_fields_persist() {
     };
     let pid2 = v
         .transact(|t| {
-            t.put_policy(policy, b"policy body v2")?;
+            t.put_policy(policy, &common::standing_record(2))?;
             t.upsert_project(updated.clone())
         })
         .unwrap();
@@ -385,7 +398,7 @@ fn projects_policies_and_header_fields_persist() {
     assert_eq!(v.find_project(&key).unwrap().unwrap(), (pid, &updated));
     assert_eq!(v.projects().unwrap().count(), 1);
     let policies: Vec<_> = v.policies().unwrap().collect();
-    assert_eq!(policies, [(policy, &b"policy body v2"[..])]);
+    assert_eq!(policies, [(policy, &common::standing_record(2))]);
     let h = v.header().unwrap();
     assert_eq!(h.audit_head.unwrap().seq, 42);
     assert!(h.recovery_confirmed);

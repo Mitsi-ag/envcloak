@@ -29,9 +29,10 @@ use super::integrity::{
     policy_body, project_body, row_key, state_digest, unlocker_body,
 };
 use super::items::{
-    FieldId, FieldMeta, FieldRecord, ItemDetails, ItemId, ItemMeta, PolicyId, ProjectId,
-    ProjectRecord, Slug, decode_field, decode_item, decode_project,
+    FieldId, FieldMeta, FieldRecord, ItemDetails, ItemExtra, ItemId, ItemMeta, PolicyId, ProjectId,
+    ProjectRecord, RECORDS_V2_FROM, Slug, decode_field, decode_item, decode_project,
 };
+use super::policies::{PolicyRecord, standing_set_digest};
 use super::values::{CryptoOrRecord, open_record};
 
 /// The keyed-hash domain of `items.slug_hash`.
@@ -80,12 +81,14 @@ impl VaultCtx {
     }
 }
 
-/// The class stored in `items.class`: 1 to 3.
-pub(crate) fn item_class_from(v: i64) -> Option<ItemClass> {
+/// The class stored in `items.class` of a vault of `schema`: 1 to 3, and
+/// 4 (`login`) from schema version 2 on.
+pub(crate) fn item_class_from(v: i64, schema: u16) -> Option<ItemClass> {
     match v {
         1 => Some(ItemClass::Secret),
         2 => Some(ItemClass::Card),
         3 => Some(ItemClass::IssuerCredential),
+        4 if schema >= RECORDS_V2_FROM => Some(ItemClass::Login),
         _ => None,
     }
 }
@@ -116,6 +119,7 @@ pub(crate) struct ItemRow {
     pub class: ItemClass,
     pub slug: Slug,
     pub details: ItemDetails,
+    pub extra: ItemExtra,
     pub created_at: u64,
     pub updated_at: u64,
     pub row_version: u64,
@@ -137,7 +141,10 @@ pub(crate) struct ProjectRow {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PolicyRow {
-    pub body: Vec<u8>,
+    /// `None` in a vault of schema version 1, whose policy rows have no
+    /// type: such a vault is never written or trusted for a decision by
+    /// this build (its migration refuses them).
+    pub record: Option<PolicyRecord>,
     pub row_version: u64,
 }
 
@@ -157,6 +164,17 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// The digest of the standing approvals among the policy rows
+    /// ([`StandingSetHeader`](super::policies::StandingSetHeader)).
+    pub(crate) fn standing_set_digest(&self, keys: &Keyring) -> [u8; 32] {
+        standing_set_digest(
+            keys,
+            self.policies
+                .iter()
+                .filter_map(|(id, p)| p.record.as_ref().map(|r| (id, r))),
+        )
+    }
+
     /// The items, sorted by slug, each with its fields sorted by name.
     pub(crate) fn item_list(&self) -> Vec<ItemMeta> {
         let mut fields: BTreeMap<ItemId, Vec<FieldMeta>> = BTreeMap::new();
@@ -164,6 +182,7 @@ impl State {
             fields.entry(f.item).or_default().push(FieldMeta {
                 id: *id,
                 name: f.record.name.clone(),
+                kind: f.record.kind,
                 prior_count: f.record.prior_count,
                 created_at: f.record.created_at,
                 updated_at: f.record.updated_at,
@@ -183,6 +202,10 @@ impl State {
                     created_at: row.created_at,
                     updated_at: row.updated_at,
                     fields: fs,
+                    classification_changed_at: row.extra.classification_changed_at,
+                    exposure: row.extra.exposure.clone(),
+                    rotate_recommended: row.extra.rotate_recommended,
+                    login: row.extra.login,
                 })
             })
             .collect()
@@ -461,12 +484,9 @@ pub(crate) fn load(
     )?;
     let mut opened_headers = Vec::new();
     for (epoch, vault_id, version, sealed) in &headers {
-        let opened = open_record(
-            keys.key(Purpose::Header),
-            &ctx.header_aad(),
-            sealed,
-            HeaderState::decode,
-        );
+        let opened = open_record(keys.key(Purpose::Header), &ctx.header_aad(), sealed, |b| {
+            HeaderState::decode(b, ctx.schema_version)
+        });
         if let Ok(h) = opened {
             let consistent = *epoch == i64::from(ctx.epoch)
                 && vault_id[..] == ctx.vault_id.0[..]
@@ -517,7 +537,7 @@ pub(crate) fn load(
         note_stamp(&mut st, &mut found, it.stamp());
         let (Some(id), Some(class), Ok(rv), Ok(updated_at)) = (
             id16(&it.id),
-            item_class_from(it.class),
+            item_class_from(it.class, ctx.schema_version),
             u64::try_from(it.row_version),
             u64::try_from(it.updated_at),
         ) else {
@@ -525,8 +545,9 @@ pub(crate) fn load(
             continue;
         };
         let aad = ctx.aad(TableTag::Items, &id, FieldTag::ItemMeta, class, rv);
-        let (slug, created_at, details) =
-            match open_record(item_key(keys, class), &aad, &it.sealed_meta, decode_item) {
+        let decode = |b: &[u8]| decode_item(b, ctx.schema_version, class);
+        let (slug, created_at, details, extra) =
+            match open_record(item_key(keys, class), &aad, &it.sealed_meta, decode) {
                 Ok(v) => v,
                 Err(e) => {
                     found.note(unreadable(&e));
@@ -546,6 +567,7 @@ pub(crate) fn load(
                 class,
                 slug,
                 details,
+                extra,
                 created_at,
                 updated_at,
                 row_version: rv,
@@ -571,7 +593,8 @@ pub(crate) fn load(
             continue;
         };
         let aad = ctx.aad(TableTag::Fields, &id, FieldTag::FieldName, class, rv);
-        let record = match open_record(item_key(keys, class), &aad, &f.sealed_name, decode_field) {
+        let decode = |b: &[u8]| decode_field(b, ctx.schema_version);
+        let record = match open_record(item_key(keys, class), &aad, &f.sealed_name, decode) {
             Ok(r) => r,
             Err(e) => {
                 found.note(unreadable(&e));
@@ -580,7 +603,11 @@ pub(crate) fn load(
         };
         opened_any = true;
         let clash = !names.insert((item, record.name.clone()));
-        if clash || (record.prior_count == 0) != f.sealed_prior.is_none() {
+        // A login's fields are typed, and no other item's are; a login
+        // field keeps no prior value.
+        let typed = record.kind.is_login() != (class == ItemClass::Login)
+            || (record.kind.is_login() && record.prior_count != 0);
+        if clash || typed || (record.prior_count == 0) != f.sealed_prior.is_none() {
             found.note(TamperKind::RowInconsistent);
             continue;
         }
@@ -646,13 +673,24 @@ pub(crate) fn load(
             ItemClass::None,
             rv,
         );
-        match open_record(data, &aad, &p.sealed, |b| Ok(b.to_vec())) {
-            Ok(body) => {
+        // From schema version 2 a policy row is a typed record: one that
+        // does not decode (an unknown kind or version included) is
+        // refused like tampering, and not served (policies.rs).
+        let typed = ctx.schema_version >= RECORDS_V2_FROM;
+        let decode = |b: &[u8]| {
+            if typed {
+                PolicyRecord::decode(b).map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        match open_record(data, &aad, &p.sealed, decode) {
+            Ok(record) => {
                 opened_any = true;
                 st.policies.insert(
                     PolicyId::from_bytes(id),
                     PolicyRow {
-                        body,
+                        record,
                         row_version: rv,
                     },
                 );
@@ -669,6 +707,17 @@ pub(crate) fn load(
     } else {
         if !digest_eq(&state_digest(keys, &st.stamps), &st.header.state_digest) {
             found.note(TamperKind::DigestMismatch);
+        }
+        // The standing set's digest is the vault's own: it must be the one
+        // the rows give (a sealed header that vouches for another set is
+        // not the one this vault's writes produced).
+        if ctx.schema_version >= RECORDS_V2_FROM
+            && !digest_eq(
+                &st.standing_set_digest(keys),
+                &st.header.standing_set.set_digest,
+            )
+        {
+            found.note(TamperKind::RowInconsistent);
         }
         match found.0 {
             None => Integrity::Ok,

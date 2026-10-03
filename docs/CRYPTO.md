@@ -61,7 +61,7 @@ The tag numbers are fixed and never reused.
 | items | 2 | items.sealed_meta | 2 | secret | 1 |
 | fields | 3 | fields.sealed_name | 3 | card | 2 |
 | projects | 4 | fields.sealed_value | 4 | issuer_credential | 3 |
-| policies | 5 | fields.sealed_prior | 5 | | |
+| policies | 5 | fields.sealed_prior | 5 | login (schema version 2 on; VAULT.md "Login items") | 4 |
 | audit | 6 | projects.sealed | 6 | | |
 | unlockers | 7 | policies.sealed | 7 | | |
 | backup | 8 | audit entry | 8 | | |

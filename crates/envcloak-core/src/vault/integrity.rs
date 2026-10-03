@@ -29,6 +29,8 @@ use crate::crypto::{Keyring, Purpose, TableTag, keyed_hash};
 
 use super::codec::{Dec, Enc};
 use super::error::{VaultError, VaultErrorKind};
+use super::items::RECORDS_V2_FROM;
+use super::policies::StandingSetHeader;
 
 /// The audit log's head as last saved in the header (T10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,33 +52,66 @@ pub struct HeaderState {
     pub audit_head: Option<AuditHead>,
     /// The user proved they hold the Recovery Kit (T4).
     pub recovery_confirmed: bool,
+    /// The standing-policy set's generation and digest (D-10): kept by
+    /// the vault itself, moved by every transaction that changes the set.
+    /// Schema version 2 on; a header of version 1 holds none, which reads
+    /// as generation 0 with a zero digest.
+    pub standing_set: StandingSetHeader,
 }
 
-const HEADER_RECORD: u8 = 1;
+const HEADER_RECORD_V1: u8 = 1;
+const HEADER_RECORD_V2: u8 = 2;
 
 impl HeaderState {
-    /// `version(1) write_counter(8) state_digest(32) policy_epoch(8)
-    /// audit_present(1) audit_seq(8) audit_mac(32) recovery_confirmed(1)`.
+    /// Version 2: `version(1) write_counter(8) state_digest(32)
+    /// policy_epoch(8) audit_present(1) audit_seq(8) audit_mac(32)
+    /// recovery_confirmed(1) standing_generation(8)
+    /// standing_set_digest(32)`, 131 bytes. Version 1, which a vault of
+    /// schema version 1 holds, is the first 91 of them.
     pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new();
+        e.u8(HEADER_RECORD_V2);
+        self.encode_body(&mut e);
+        e.u64(self.standing_set.generation)
+            .raw(&self.standing_set.set_digest);
+        e.finish()
+    }
+
+    fn encode_body(&self, e: &mut Enc) {
         let head = self.audit_head.unwrap_or(AuditHead {
             seq: 0,
             mac: [0; 32],
         });
-        let mut e = Enc::new();
-        e.u8(HEADER_RECORD)
-            .u64(self.write_counter)
+        e.u64(self.write_counter)
             .raw(&self.state_digest)
             .u64(self.policy_epoch)
             .u8(u8::from(self.audit_head.is_some()))
             .u64(head.seq)
             .raw(&head.mac)
             .u8(u8::from(self.recovery_confirmed));
+    }
+
+    /// The header as schema version 1 holds it. Unit tests only.
+    #[cfg(test)]
+    pub(crate) fn encode_v1(&self) -> Vec<u8> {
+        let mut e = Enc::new();
+        e.u8(HEADER_RECORD_V1);
+        self.encode_body(&mut e);
         e.finish()
     }
 
-    pub(crate) fn decode(b: &[u8]) -> Result<Self, VaultError> {
+    /// Decodes the header of a vault of `schema`: version 1 at schema
+    /// version 1, version 2 from then on; anything else is
+    /// [`VaultErrorKind::Corrupt`].
+    pub(crate) fn decode(b: &[u8], schema: u16) -> Result<Self, VaultError> {
         let mut d = Dec::new(b);
-        if d.u8()? != HEADER_RECORD {
+        let v2 = schema >= RECORDS_V2_FROM;
+        let want = if v2 {
+            HEADER_RECORD_V2
+        } else {
+            HEADER_RECORD_V1
+        };
+        if d.u8()? != want {
             return Err(VaultErrorKind::Corrupt.into());
         }
         let write_counter = d.u64()?;
@@ -88,6 +123,14 @@ impl HeaderState {
             mac: d.array()?,
         };
         let recovery_confirmed = d.bool()?;
+        let standing_set = if v2 {
+            StandingSetHeader {
+                generation: d.u64()?,
+                set_digest: d.array()?,
+            }
+        } else {
+            StandingSetHeader::default()
+        };
         d.end()?;
         Ok(HeaderState {
             write_counter,
@@ -95,6 +138,7 @@ impl HeaderState {
             policy_epoch,
             audit_head: present.then_some(head),
             recovery_confirmed,
+            standing_set,
         })
     }
 }
@@ -272,18 +316,43 @@ mod tests {
             policy_epoch: 2,
             audit_head: None,
             recovery_confirmed: false,
+            standing_set: StandingSetHeader {
+                generation: 4,
+                set_digest: [6; 32],
+            },
         };
-        assert_eq!(HeaderState::decode(&h.encode()).unwrap(), h);
-        assert_eq!(h.encode().len(), 91);
+        assert_eq!(HeaderState::decode(&h.encode(), 2).unwrap(), h);
+        assert_eq!(h.encode().len(), 131);
         h.audit_head = Some(AuditHead {
             seq: 77,
             mac: [5; 32],
         });
         h.recovery_confirmed = true;
-        assert_eq!(HeaderState::decode(&h.encode()).unwrap(), h);
+        assert_eq!(HeaderState::decode(&h.encode(), 2).unwrap(), h);
+        // A later schema reads version 2 too: records change by version,
+        // not by schema (plan D-08).
+        assert_eq!(HeaderState::decode(&h.encode(), 3).unwrap(), h);
         let mut bad = h.encode();
-        bad[0] = 2;
-        assert!(HeaderState::decode(&bad).is_err());
+        bad[0] = 3;
+        assert!(HeaderState::decode(&bad, 2).is_err());
+        // Version 1 is read at schema version 1 only, without a set; and
+        // version 2 not there.
+        let v1 = h.encode_v1();
+        assert_eq!(v1.len(), 91);
+        let old = HeaderState::decode(&v1, 1).unwrap();
+        assert_eq!(old.standing_set, StandingSetHeader::default());
+        assert_eq!(
+            old,
+            HeaderState {
+                standing_set: StandingSetHeader::default(),
+                ..h
+            }
+        );
+        assert!(HeaderState::decode(&v1, 2).is_err());
+        assert!(HeaderState::decode(&h.encode(), 1).is_err());
+        let mut short = h.encode();
+        short.pop();
+        assert!(HeaderState::decode(&short, 2).is_err());
     }
 
     #[test]

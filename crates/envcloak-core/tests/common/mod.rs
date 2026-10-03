@@ -10,8 +10,9 @@ use envcloak_core::crypto::{
     unwrap_vmk_with, wrap_vmk_with,
 };
 use envcloak_core::vault::{
-    FieldName, INITIAL_EPOCH, ItemDetails, LockedVault, NewItem, ProjectKey, ProjectRecord, Slug,
-    Vault, VaultPaths,
+    CodeIdentity, FieldId, FieldName, INITIAL_EPOCH, ItemDetails, ItemId, LockedVault, NewItem,
+    PolicyRecord, ProjectIdentity, ProjectKey, ProjectRecord, ProofKind, Slug, StandingApproval,
+    StandingBinding, Vault, VaultPaths,
 };
 use envcloak_core::{RecoveryKit, SecretBytes, create_vault};
 use envcloak_testkit::{Canary, TestHome, by_label, canaries, fresh_seed, labels};
@@ -133,6 +134,32 @@ pub fn secret_item(s: &str) -> NewItem {
             ..ItemDetails::default()
         },
     }
+}
+
+/// A standing approval record whose bindings name `n` (a policy row for
+/// tests that need one; its contents mean nothing).
+pub fn standing_record(n: u64) -> PolicyRecord {
+    PolicyRecord::StandingApproval(StandingApproval {
+        agent_id: "claude-code".to_owned(),
+        code_identity: CodeIdentity::LinuxSha256 {
+            digests: vec![[u8::try_from(n % 251).unwrap(); 32]],
+        },
+        project: ProjectIdentity {
+            canonical_dir: format!("/src/project-{n}").into_bytes(),
+            dev: 1,
+            ino: n,
+        },
+        launch: None,
+        bindings: vec![StandingBinding {
+            env_name: "OPENAI_API_KEY".to_owned(),
+            item: ItemId::from_bytes([u8::try_from(n % 251).unwrap(); 16]),
+            field: FieldId::from_bytes([u8::try_from(n % 251).unwrap().wrapping_add(1); 16]),
+        }],
+        created: 1_000 + n,
+        not_after: 2_000 + n,
+        proof_kind: ProofKind::Passphrase,
+        signature: None,
+    })
 }
 
 /// A small deterministic generator for workloads and timings.

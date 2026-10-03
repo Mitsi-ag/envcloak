@@ -734,14 +734,22 @@ impl Vault {
         read_exact(&mut r, &mut head)?;
         let h = parse_header(&head)?;
         let damaged = || VaultError::from(VaultErrorKind::BackupDamaged);
+        // A backup a vault of an older schema made still opens, bound to
+        // the schema it was made under (its header's, which the manifest
+        // authenticates): the migration to schema version 2 keeps `init
+        // --undo` of what was deleted before it, for its 7 days, as file
+        // backups v2 do. A newer schema's is not this build's to read.
         if h.id != *id
             || h.vault_id != self.vault_id().0
             || h.epoch != self.epoch()
-            || h.schema_version != self.schema_version()
+            || h.schema_version > self.schema_version()
         {
             return Err(damaged());
         }
-        let ctx = Ctx::of(self, h.id, h.created_at);
+        let ctx = Ctx {
+            schema_version: h.schema_version,
+            ..Ctx::of(self, h.id, h.created_at)
+        };
         let wrapped = Sealed::from_bytes(&read_record(&mut r)?).map_err(|_| damaged())?;
         let key = open_subkey(
             self.keys().key(Purpose::Backup),

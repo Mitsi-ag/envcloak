@@ -1277,11 +1277,11 @@ mod tests {
         Ok(())
     }
 
-    /// A plan to schema version 2 whose step changes nothing but adds a
-    /// table.
-    fn to_v2() -> MigrationPlan {
+    /// The shipped plan and a step to schema version 3 that changes nothing
+    /// but adds a table.
+    fn to_v3() -> MigrationPlan {
         MigrationPlan::new(vec![crate::vault::Migration {
-            from: 1,
+            from: 2,
             ddl: "CREATE TABLE notes (id BLOB PRIMARY KEY NOT NULL) STRICT;",
             transform: no_change,
         }])
@@ -1352,7 +1352,7 @@ mod tests {
         let new_pass = SecretBytes::copy_from(b"another unit test passphrase");
         for (what, bytes) in &forged {
             std::fs::write(&bad, bytes).unwrap();
-            for (build, plan) in [("this build", MigrationPlan::current()), ("v2", to_v2())] {
+            for (build, plan) in [("this build", MigrationPlan::current()), ("v2", to_v3())] {
                 let e = restore(
                     &p,
                     &bad,
@@ -1375,11 +1375,11 @@ mod tests {
             &kit,
             &new_pass,
             &KdfParams::minimum(),
-            to_v2(),
+            to_v3(),
             &mut |_| {},
         )
         .unwrap();
-        assert_eq!(v.schema_version(), 2);
+        assert_eq!(v.schema_version(), 3);
         assert_eq!(v.integrity(), Integrity::Ok);
         assert_eq!(v.items().len(), 1);
     }

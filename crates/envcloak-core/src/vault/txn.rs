@@ -22,17 +22,19 @@ use super::integrity::{
     unlocker_body,
 };
 use super::items::{
-    FieldId, FieldName, FieldRecord, ItemDetails, ItemId, MAX_FIELD, MAX_PRIOR, MAX_ROW, NewItem,
-    PolicyId, ProjectId, ProjectKey, ProjectRecord, Slug, encode_field, encode_item,
-    encode_project,
+    Exposure, ExposureSource, FieldId, FieldKind, FieldName, FieldRecord, ItemDetails, ItemExtra,
+    ItemId, MAX_FIELD, MAX_PRIOR, MAX_ROW, NewItem, PolicyId, ProjectId, ProjectKey, ProjectRecord,
+    Slug, encode_field, encode_item, encode_project,
 };
+use super::login::{LoginFieldValue, NewLogin};
+use super::policies::{PolicyRecord, StandingSetHeader};
 use super::schema::drop_page_cache;
 use super::state::{
     FieldRow, ItemRow, PolicyRow, ProjectRow, State, VaultCtx, dir_hash, item_key, slug_hash,
 };
 use super::values::{
-    check_value, open_priors, open_value, seal_priors, seal_record, seal_value, tampered,
-    value_hash,
+    check_value, login_value_hash, open_priors, open_value, pack_totp, seal_priors, seal_record,
+    seal_value, tampered, value_hash,
 };
 
 /// A write transaction on an unlocked vault. See [`Vault::transact`].
@@ -44,6 +46,9 @@ pub struct Txn<'v> {
     ctx: VaultCtx,
     state: State,
     dirty: bool,
+    /// A standing approval was added, changed or removed: the commit moves
+    /// the standing set's generation and recomputes its digest.
+    standing_changed: bool,
     now: u64,
 }
 
@@ -98,6 +103,7 @@ impl<'v> Txn<'v> {
             ctx,
             state,
             dirty: false,
+            standing_changed: false,
             now: now_secs(),
         })
     }
@@ -110,10 +116,21 @@ impl<'v> Txn<'v> {
             ctx,
             mut state,
             dirty,
+            standing_changed,
             ..
         } = self;
         if dirty {
             let mut header = state.header;
+            if standing_changed {
+                header.standing_set = StandingSetHeader {
+                    generation: header
+                        .standing_set
+                        .generation
+                        .checked_add(1)
+                        .ok_or(VaultErrorKind::Corrupt)?,
+                    set_digest: state.standing_set_digest(keys),
+                };
+            }
             header.write_counter = header
                 .write_counter
                 .checked_add(1)
@@ -150,12 +167,25 @@ impl<'v> Txn<'v> {
             .map(|(id, _)| *id)
     }
 
-    /// Creates an item with no fields.
+    /// Creates an item with no fields. A login is made with
+    /// [`Txn::create_login`] instead ([`VaultErrorKind::LoginField`]).
     pub fn create_item(&mut self, n: NewItem) -> Result<ItemId, VaultError> {
-        if n.class == ItemClass::None {
-            return Err(VaultErrorKind::InvalidRecord.into());
+        match n.class {
+            ItemClass::None => return Err(VaultErrorKind::InvalidRecord.into()),
+            ItemClass::Login => return Err(VaultErrorKind::LoginField.into()),
+            ItemClass::Secret | ItemClass::Card | ItemClass::IssuerCredential => {}
         }
-        if self.state.slugs.contains_key(&n.slug) {
+        self.new_item(n.class, n.slug, n.details, None)
+    }
+
+    fn new_item(
+        &mut self,
+        class: ItemClass,
+        slug: Slug,
+        details: ItemDetails,
+        login: Option<super::items::LoginMeta>,
+    ) -> Result<ItemId, VaultError> {
+        if self.state.slugs.contains_key(&slug) {
             return Err(VaultErrorKind::DuplicateSlug.into());
         }
         let id = loop {
@@ -165,9 +195,15 @@ impl<'v> Txn<'v> {
             }
         };
         let row = ItemRow {
-            class: n.class,
-            slug: n.slug,
-            details: n.details,
+            class,
+            slug,
+            details,
+            extra: ItemExtra {
+                // Set at creation: its first value.
+                classification_changed_at: Some(self.now),
+                login,
+                ..ItemExtra::default()
+            },
             created_at: self.now,
             updated_at: self.now,
             row_version: 1,
@@ -176,16 +212,81 @@ impl<'v> Txn<'v> {
         Ok(id)
     }
 
-    /// Replaces an item's details.
+    /// Replaces an item's details. A change of the classification records
+    /// when it happened ([`ItemMeta::classification_changed_at`]).
+    ///
+    /// [`ItemMeta::classification_changed_at`]: super::ItemMeta::classification_changed_at
     pub fn update_item(&mut self, id: ItemId, details: ItemDetails) -> Result<(), VaultError> {
         let old = self.item_row(id)?;
+        let mut extra = old.extra.clone();
+        if details.classification != old.details.classification {
+            extra.classification_changed_at = Some(self.now);
+        }
         let row = ItemRow {
             details,
+            extra,
             updated_at: self.now,
             row_version: old.row_version + 1,
             ..old.clone()
         };
         self.write_item(id, row, Some(&old))
+    }
+
+    /// Marks an item "exposed: rotate" (R-M2-40): its value was found in
+    /// `count` places of the kinds in `sources` (at least one). Only adds:
+    /// the first mark's time stays, the kinds are joined and the counts
+    /// summed; rotation is then recommended. Idempotent in what it shows,
+    /// a second mark of the same kinds adding only to the count.
+    pub fn mark_exposed(
+        &mut self,
+        item: ItemId,
+        sources: &[ExposureSource],
+        count: u64,
+    ) -> Result<(), VaultError> {
+        if sources.is_empty() {
+            return Err(VaultErrorKind::InvalidRecord.into());
+        }
+        let old = self.item_row(item)?;
+        let mut exposure = old.extra.exposure.clone().unwrap_or(Exposure {
+            since: self.now,
+            sources: Vec::new(),
+            count: 0,
+        });
+        exposure.sources.extend_from_slice(sources);
+        exposure.sources.sort_unstable();
+        exposure.sources.dedup();
+        exposure.count = exposure.count.saturating_add(count);
+        let row = ItemRow {
+            extra: ItemExtra {
+                exposure: Some(exposure),
+                rotate_recommended: true,
+                ..old.extra.clone()
+            },
+            updated_at: self.now,
+            row_version: old.row_version + 1,
+            ..old.clone()
+        };
+        self.write_item(item, row, Some(&old))
+    }
+
+    /// Clears an item's exposure and its rotation flag: its exposed value
+    /// was replaced (M2-11: "rotation clears the mark").
+    pub fn clear_exposure(&mut self, item: ItemId) -> Result<(), VaultError> {
+        let old = self.item_row(item)?;
+        if old.extra.exposure.is_none() && !old.extra.rotate_recommended {
+            return Ok(());
+        }
+        let row = ItemRow {
+            extra: ItemExtra {
+                exposure: None,
+                rotate_recommended: false,
+                ..old.extra.clone()
+            },
+            updated_at: self.now,
+            row_version: old.row_version + 1,
+            ..old.clone()
+        };
+        self.write_item(item, row, Some(&old))
     }
 
     /// Gives an item a new slug.
@@ -220,7 +321,7 @@ impl<'v> Txn<'v> {
         row: ItemRow,
         old: Option<&ItemRow>,
     ) -> Result<(), VaultError> {
-        let record = encode_item(&row.slug, row.created_at, &row.details);
+        let record = encode_item(&row.slug, row.created_at, &row.details, &row.extra);
         if record.len() > MAX_FIELD {
             return Err(VaultErrorKind::TooLarge.into());
         }
@@ -266,7 +367,8 @@ impl<'v> Txn<'v> {
         Ok(())
     }
 
-    /// Adds a field holding `value` to an item.
+    /// Adds a field holding `value` to an item. A login's fields are
+    /// typed: refused here ([`VaultErrorKind::LoginField`]).
     pub fn add_field(
         &mut self,
         item: ItemId,
@@ -275,15 +377,13 @@ impl<'v> Txn<'v> {
     ) -> Result<FieldId, VaultError> {
         check_value(&value)?;
         let class = self.item_row(item)?.class;
+        if class == ItemClass::Login {
+            return Err(VaultErrorKind::LoginField.into());
+        }
         if self.field_id(item, &name).is_some() {
             return Err(VaultErrorKind::DuplicateField.into());
         }
-        let id = loop {
-            let id = FieldId::generate();
-            if !self.state.fields.contains_key(&id) {
-                break id;
-            }
-        };
+        let id = self.new_field_id();
         let row = FieldRow {
             item,
             record: FieldRecord {
@@ -291,6 +391,7 @@ impl<'v> Txn<'v> {
                 prior_count: 0,
                 created_at: self.now,
                 updated_at: self.now,
+                kind: FieldKind::Value,
             },
             row_version: 1,
             value_hash: value_hash(self.keys.key(Purpose::Index), &value),
@@ -299,8 +400,126 @@ impl<'v> Txn<'v> {
         Ok(id)
     }
 
+    fn new_field_id(&self) -> FieldId {
+        loop {
+            let id = FieldId::generate();
+            if !self.state.fields.contains_key(&id) {
+                break id;
+            }
+        }
+    }
+
+    /// Creates a login item with its typed fields (SPEC §6.8): a username
+    /// and a password, and a TOTP enrollment and an adapter key when given,
+    /// each named for its kind and sealed with the `login` class.
+    pub fn create_login(&mut self, n: NewLogin) -> Result<ItemId, VaultError> {
+        let NewLogin {
+            slug,
+            details,
+            meta,
+            username,
+            password,
+            totp,
+            adapter_key,
+        } = n;
+        let mut values = vec![
+            LoginFieldValue::Username(username),
+            LoginFieldValue::Password(password),
+        ];
+        values.extend(totp.map(LoginFieldValue::Totp));
+        values.extend(adapter_key.map(LoginFieldValue::AdapterKey));
+        // Every value is checked before anything is written.
+        let packed = values
+            .into_iter()
+            .map(|v| Ok((v.kind(), login_value(v)?)))
+            .collect::<Result<Vec<_>, VaultError>>()?;
+        let item = self.new_item(ItemClass::Login, slug, details, Some(meta))?;
+        for (kind, value) in packed {
+            self.write_login_field(item, kind, &value)?;
+        }
+        Ok(item)
+    }
+
+    /// Replaces one field of login `item`, or adds its TOTP enrollment or
+    /// adapter key when it has none. The old value is not kept: a login
+    /// keeps no prior values. The login's row moves too, so a sign-in
+    /// attempt's lease issued before it opens nothing (`LeaseStale`).
+    pub fn replace_login_field(
+        &mut self,
+        item: ItemId,
+        value: LoginFieldValue,
+    ) -> Result<FieldId, VaultError> {
+        let old = self.item_row(item)?;
+        if old.class != ItemClass::Login {
+            return Err(VaultErrorKind::LoginField.into());
+        }
+        let kind = value.kind();
+        let value = login_value(value)?;
+        let field = self.write_login_field(item, kind, &value)?;
+        let row = ItemRow {
+            updated_at: self.now,
+            row_version: old.row_version + 1,
+            ..old.clone()
+        };
+        self.write_item(item, row, Some(&old))?;
+        Ok(field)
+    }
+
+    /// Writes the `kind` field of login `item`: a new row, or the next
+    /// version of the one it has.
+    fn write_login_field(
+        &mut self,
+        item: ItemId,
+        kind: FieldKind,
+        value: &SecretBytes,
+    ) -> Result<FieldId, VaultError> {
+        let name = FieldName::new(kind.login_name().ok_or(VaultErrorKind::LoginField)?)?;
+        let hash = login_value_hash(self.keys.key(Purpose::Index), value);
+        let existing = self
+            .state
+            .fields
+            .iter()
+            .find(|(_, f)| f.item == item && f.record.kind == kind)
+            .map(|(id, f)| (*id, f.clone()));
+        let (id, row, old_version) = match existing {
+            None => (
+                self.new_field_id(),
+                FieldRow {
+                    item,
+                    record: FieldRecord {
+                        name,
+                        prior_count: 0,
+                        created_at: self.now,
+                        updated_at: self.now,
+                        kind,
+                    },
+                    row_version: 1,
+                    value_hash: hash,
+                },
+                None,
+            ),
+            Some((id, old)) => (
+                id,
+                FieldRow {
+                    record: FieldRecord {
+                        updated_at: self.now,
+                        ..old.record.clone()
+                    },
+                    row_version: old.row_version + 1,
+                    value_hash: hash,
+                    ..old.clone()
+                },
+                Some(old.row_version),
+            ),
+        };
+        self.write_field(id, row, ItemClass::Login, value, &[], old_version)?;
+        Ok(id)
+    }
+
     /// Replaces a field's value. The old value becomes the newest prior
-    /// value; at most [`MAX_PRIOR`] are kept.
+    /// value; at most [`MAX_PRIOR`] are kept. A login's field is replaced
+    /// with [`Txn::replace_login_field`] instead
+    /// ([`VaultErrorKind::LoginField`]).
     pub fn set_value(&mut self, field: FieldId, value: SecretBytes) -> Result<(), VaultError> {
         check_value(&value)?;
         let old = self
@@ -310,6 +529,9 @@ impl<'v> Txn<'v> {
             .cloned()
             .ok_or(VaultErrorKind::UnknownField)?;
         let class = self.item_row(old.item)?.class;
+        if class == ItemClass::Login {
+            return Err(VaultErrorKind::LoginField.into());
+        }
         let k = item_key(self.keys, class);
         let a = |f| {
             self.ctx.aad(
@@ -521,8 +743,50 @@ impl<'v> Txn<'v> {
         Ok(true)
     }
 
-    /// Stores a policy record (its format belongs to the policy layer).
-    pub fn put_policy(&mut self, id: PolicyId, body: &[u8]) -> Result<(), VaultError> {
+    /// Stores a policy record under `id`, replacing the one it had.
+    /// Refused with [`VaultErrorKind::InvalidRecord`] when the record breaks
+    /// its kind's bounds and [`VaultErrorKind::TooLarge`] over
+    /// [`MAX_FIELD`]. A standing approval added or replaced, or replaced by
+    /// another kind, moves the standing set (see [`StandingSetHeader`]) at
+    /// the commit.
+    pub fn put_policy(&mut self, id: PolicyId, record: &PolicyRecord) -> Result<(), VaultError> {
+        record.check()?;
+        let body = record.encode();
+        let standing =
+            |p: Option<&PolicyRecord>| matches!(p, Some(PolicyRecord::StandingApproval(_)));
+        let was = standing(self.state.policies.get(&id).and_then(|p| p.record.as_ref()));
+        self.put_policy_body(id, &body, Some(record.clone()))?;
+        if was || standing(Some(record)) {
+            self.standing_changed = true;
+        }
+        Ok(())
+    }
+
+    /// Test support only: stores `body` sealed as a policy row, whatever it
+    /// holds, as only a program holding the vault's key could (an unknown
+    /// kind, say).
+    #[cfg(feature = "testing")]
+    pub fn put_raw_policy_for_testing(
+        &mut self,
+        id: PolicyId,
+        body: &[u8],
+    ) -> Result<(), VaultError> {
+        let record = PolicyRecord::decode(body).ok();
+        let standing =
+            |p: Option<&PolicyRecord>| matches!(p, Some(PolicyRecord::StandingApproval(_)));
+        let was = standing(self.state.policies.get(&id).and_then(|p| p.record.as_ref()));
+        if was || standing(record.as_ref()) {
+            self.standing_changed = true;
+        }
+        self.put_policy_body(id, body, record)
+    }
+
+    fn put_policy_body(
+        &mut self,
+        id: PolicyId,
+        body: &[u8],
+        record: Option<PolicyRecord>,
+    ) -> Result<(), VaultError> {
         if body.len() > MAX_FIELD {
             return Err(VaultErrorKind::TooLarge.into());
         }
@@ -551,18 +815,27 @@ impl<'v> Txn<'v> {
         self.state.policies.insert(
             id,
             PolicyRow {
-                body: body.to_vec(),
+                record,
                 row_version: rv,
             },
         );
         Ok(())
     }
 
-    /// Deletes a policy record. Returns whether it existed.
+    /// Deletes a policy record. Returns whether it existed. Removing a
+    /// standing approval moves the standing set at the commit.
     pub fn delete_policy(&mut self, id: PolicyId) -> Result<bool, VaultError> {
-        let Some(rv) = self.state.policies.get(&id).map(|p| p.row_version) else {
+        let Some((rv, standing)) = self.state.policies.get(&id).map(|p| {
+            (
+                p.row_version,
+                matches!(p.record, Some(PolicyRecord::StandingApproval(_))),
+            )
+        }) else {
             return Ok(false);
         };
+        if standing {
+            self.standing_changed = true;
+        }
         let n = self.tx.execute(
             "DELETE FROM policies WHERE id = ?1 AND row_version = ?2",
             params![&id.as_bytes()[..], to_i64(rv)?],
@@ -675,6 +948,19 @@ impl<'v> Txn<'v> {
     }
 }
 
+/// A login field's value as its row seals it: the text, or the packed TOTP
+/// enrollment. Checked for size and emptiness as any value is.
+fn login_value(v: LoginFieldValue) -> Result<SecretBytes, VaultError> {
+    let packed = match v {
+        LoginFieldValue::Username(s)
+        | LoginFieldValue::Password(s)
+        | LoginFieldValue::AdapterKey(s) => s,
+        LoginFieldValue::Totp(t) => pack_totp(&t.params, &t.seed)?,
+    };
+    check_value(&packed)?;
+    Ok(packed)
+}
+
 pub(crate) fn find_by_value(keys: &Keyring, state: &State, v: &SecretBytes) -> Vec<FieldId> {
     let h = value_hash(keys.key(Purpose::Index), v);
     state
@@ -683,4 +969,97 @@ pub(crate) fn find_by_value(keys: &Keyring, state: &State, v: &SecretBytes) -> V
         .filter(|(_, f)| f.value_hash == h)
         .map(|(id, _)| *id)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{
+        Argon2id, EnvelopeCtx, KdfParams, UnlockerId, UnlockerKind, VaultId, Vmk, wrap_vmk_with,
+    };
+    use crate::vault::{
+        INITIAL_EPOCH, Integrity, LockedVault, LoginMeta, LoginTier, TamperKind, Vault, VaultPaths,
+    };
+
+    fn vault() -> (tempfile::TempDir, VaultPaths, Vec<u8>, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = VaultPaths::under(dir.path().join("data"));
+        let vault_id = VaultId::generate();
+        let vmk = Vmk::generate();
+        let raw = vmk.export_for_testing();
+        let env = wrap_vmk_with(
+            &vmk,
+            &SecretBytes::copy_from(b"unit test passphrase"),
+            UnlockerKind::Passphrase,
+            &EnvelopeCtx {
+                vault_id,
+                unlocker_id: UnlockerId::generate(),
+                epoch: INITIAL_EPOCH,
+            },
+            &KdfParams::minimum(),
+            &Argon2id,
+        )
+        .unwrap();
+        let v = Vault::create(&paths, vault_id, vmk, vec![env]).unwrap();
+        (dir, paths, raw, v)
+    }
+
+    fn reopened(paths: &VaultPaths, raw: &[u8]) -> Vault {
+        LockedVault::open(paths)
+            .unwrap()
+            .unlock(Vmk::import_for_testing(raw).unwrap())
+            .map_err(|(_, e)| e)
+            .unwrap()
+    }
+
+    /// A field whose kind does not fit its item's class (a typed field on
+    /// a secret, a value field on a login), written here with the key as
+    /// only a holder of the key could, is inconsistent at the next unlock:
+    /// the type rule holds for what is on disk, not only for what the
+    /// public writes allow.
+    #[test]
+    fn a_field_whose_kind_does_not_fit_its_class_is_refused() {
+        for (class, kind, name) in [
+            (ItemClass::Secret, FieldKind::Password, "password"),
+            (ItemClass::Login, FieldKind::Value, "value"),
+        ] {
+            let (_d, paths, raw, mut v) = vault();
+            v.transact(|t| {
+                let login = (class == ItemClass::Login).then_some(LoginMeta {
+                    tier: LoginTier::Dev,
+                    session_lifetime: 60,
+                });
+                let item = t.new_item(
+                    class,
+                    Slug::new("a/b").unwrap(),
+                    ItemDetails::default(),
+                    login,
+                )?;
+                let id = t.new_field_id();
+                let value = SecretBytes::copy_from(b"a value");
+                let row = FieldRow {
+                    item,
+                    record: FieldRecord {
+                        name: FieldName::new(name).unwrap(),
+                        prior_count: 0,
+                        created_at: 1,
+                        updated_at: 1,
+                        kind,
+                    },
+                    row_version: 1,
+                    value_hash: value_hash(t.keys.key(Purpose::Index), &value),
+                };
+                t.write_field(id, row, class, &value, &[], None)
+            })
+            .unwrap();
+            drop(v);
+            let v = reopened(&paths, &raw);
+            assert_eq!(
+                v.integrity(),
+                Integrity::Tampered(TamperKind::RowInconsistent),
+                "{class:?} with a {kind:?} field"
+            );
+            assert!(v.items()[0].fields.is_empty(), "the field is not served");
+        }
+    }
 }

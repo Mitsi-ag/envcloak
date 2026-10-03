@@ -78,11 +78,11 @@ fn vault_value_paths_leave_no_fixture_in_freed_memory() {
             .id;
         v.transact(|t| t.delete_item(doomed)).unwrap();
         // Lock, close, reopen and unlock (metadata only). On the first pass
-        // the unlock migrates to version 2, which re-seals every value.
+        // the unlock migrates to version 3, which re-seals every value.
         drop(v.lock());
         let plan = MigrationPlan::new(vec![Migration {
-            from: 1,
-            ddl: "CREATE TABLE probe_v2 (x INTEGER) STRICT;",
+            from: 2,
+            ddl: "CREATE TABLE probe_v3 (x INTEGER) STRICT;",
             transform: nothing,
         }])
         .unwrap();
@@ -92,7 +92,7 @@ fn vault_value_paths_leave_no_fixture_in_freed_memory() {
             .map_err(|(_, e)| e)
             .unwrap();
         assert_eq!(v.integrity(), Integrity::Ok);
-        assert_eq!(v.schema_version(), 2);
+        assert_eq!(v.schema_version(), 3);
         drop(ids);
         let report = session.finish();
         assert!(report.freed > 0, "{mode:?} {report:?}");

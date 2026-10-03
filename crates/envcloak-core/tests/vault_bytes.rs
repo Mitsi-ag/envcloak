@@ -1,5 +1,7 @@
 //! Gate 2, storage part (SPEC §15.2): no fixture appears in the SQLite
 //! main, WAL, shared-memory or journal bytes, raw or in any listed encoding.
+//! Login fixtures too (plan task M2-07): a login's username, password, TOTP
+//! seed and adapter key, and a replaced password.
 //!
 //! The vault directory is swept while the vault is open (the WAL holds the
 //! latest frames), after it is closed (the WAL has been checkpointed into
@@ -18,8 +20,9 @@ use common::{Fixture, Rng, kill_child, name, read_stdin, secret_item, spawn_self
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::Vmk;
 use envcloak_core::vault::{
-    CURRENT_SCHEMA, FieldId, Integrity, LockedVault, Migration, MigrationPlan, MigrationTx, Vault,
-    VaultError, VaultPaths,
+    CURRENT_SCHEMA, FieldId, Integrity, ItemDetails, LockedVault, LoginFieldValue, LoginMeta,
+    LoginTier, Migration, MigrationPlan, MigrationTx, NewLogin, Slug, TotpAlgorithm,
+    TotpEnrollment, TotpParams, Vault, VaultError, VaultPaths,
 };
 use envcloak_testkit::{
     Canary, Hit, assert_sweep_clean, by_label, canaries, fresh_seed, labels, sweep_dir,
@@ -29,10 +32,86 @@ fn value(c: &Canary) -> SecretBytes {
     SecretBytes::copy_from(c.value())
 }
 
+/// Labels of the login fixtures [`login_canaries`] adds.
+const LOGIN_USERNAME: &str = "LOGIN_USERNAME";
+const LOGIN_PASSWORD: &str = "LOGIN_PASSWORD";
+const LOGIN_PASSWORD_REPLACED: &str = "LOGIN_PASSWORD_REPLACED";
+const LOGIN_TOTP_SEED: &str = "LOGIN_TOTP_SEED";
+const LOGIN_ADAPTER_KEY: &str = "LOGIN_ADAPTER_KEY";
+
+/// The login fixtures, generated now (no literal is committed).
+fn login_canaries() -> Vec<Canary> {
+    [
+        LOGIN_USERNAME,
+        LOGIN_PASSWORD,
+        LOGIN_PASSWORD_REPLACED,
+        LOGIN_TOTP_SEED,
+        LOGIN_ADAPTER_KEY,
+    ]
+    .into_iter()
+    .map(|label| {
+        Canary::new(
+            label,
+            format!(
+                "{}-{:016x}{:016x}",
+                label.to_ascii_lowercase(),
+                fresh_seed(),
+                fresh_seed()
+            ),
+        )
+    })
+    .collect()
+}
+
+/// Stores a login whose every field is a login fixture, then replaces its
+/// password, so the first password is gone and the new one stored.
+fn store_a_login(v: &mut Vault, cs: &[Canary]) {
+    let item = v
+        .transact(|t| {
+            t.create_login(NewLogin {
+                slug: Slug::new("fixture/login").unwrap(),
+                details: ItemDetails::default(),
+                meta: LoginMeta {
+                    tier: LoginTier::Dev,
+                    session_lifetime: 60,
+                },
+                username: value(by_label(cs, LOGIN_USERNAME)),
+                password: value(by_label(cs, LOGIN_PASSWORD)),
+                totp: Some(TotpEnrollment {
+                    params: TotpParams::new(TotpAlgorithm::Sha1, 6, 30).unwrap(),
+                    seed: value(by_label(cs, LOGIN_TOTP_SEED)),
+                }),
+                adapter_key: Some(value(by_label(cs, LOGIN_ADAPTER_KEY))),
+            })
+        })
+        .unwrap();
+    v.transact(|t| {
+        t.replace_login_field(
+            item,
+            LoginFieldValue::Password(value(by_label(cs, LOGIN_PASSWORD_REPLACED))),
+        )
+    })
+    .unwrap();
+}
+
 /// Stores every fixture: each canary as a field value, the OpenAI key
 /// rotated so the old and new keys are a value and a prior value, and one
-/// item created and deleted.
+/// item created and deleted. The login fixtures, when `cs` holds them, go
+/// in a login item instead ([`store_a_login`]).
 fn store_every_fixture(v: &mut Vault, cs: &[Canary]) -> Vec<(FieldId, String)> {
+    let logins: Vec<Canary> = cs
+        .iter()
+        .filter(|c| c.label.starts_with("LOGIN_"))
+        .cloned()
+        .collect();
+    if !logins.is_empty() {
+        store_a_login(v, &logins);
+    }
+    let cs: Vec<Canary> = cs
+        .iter()
+        .filter(|c| !c.label.starts_with("LOGIN_"))
+        .cloned()
+        .collect();
     v.transact(|t| {
         let mut ids = Vec::new();
         for (n, c) in cs.iter().enumerate() {
@@ -44,7 +123,7 @@ fn store_every_fixture(v: &mut Vault, cs: &[Canary]) -> Vec<(FieldId, String)> {
         t.add_field(
             doomed,
             name("value"),
-            value(by_label(cs, labels::GITHUB_TOKEN)),
+            value(by_label(&cs, labels::GITHUB_TOKEN)),
         )?;
         t.delete_item(doomed)?;
         Ok(ids)
@@ -54,7 +133,8 @@ fn store_every_fixture(v: &mut Vault, cs: &[Canary]) -> Vec<(FieldId, String)> {
 
 #[test]
 fn values_never_reach_the_database_files() {
-    let cs = canaries(fresh_seed());
+    let mut cs = canaries(fresh_seed());
+    cs.extend(login_canaries());
     let (f, mut v) = Fixture::create();
     let ids = store_every_fixture(&mut v, &cs);
     let openai = ids
@@ -106,10 +186,11 @@ fn values_never_reach_the_database_files() {
     // And the whole test home.
     f.home.assert_clean(&cs);
 
-    // Reopened, every value is still there.
+    // Reopened, every value is still there: one item per canary but the
+    // login's, which are one item.
     let v = f.unlock();
     assert_eq!(v.integrity(), Integrity::Ok);
-    assert_eq!(v.items().len(), cs.len());
+    assert_eq!(v.items().len(), cs.len() - login_canaries().len() + 1);
 }
 
 fn no_transform(_: &MigrationTx<'_>) -> Result<(), VaultError> {
@@ -122,7 +203,8 @@ fn no_transform(_: &MigrationTx<'_>) -> Result<(), VaultError> {
 /// is checkpointed.
 #[test]
 fn a_migration_writes_no_value_either() {
-    let cs = canaries(fresh_seed());
+    let mut cs = canaries(fresh_seed());
+    cs.extend(login_canaries());
     let (f, mut v) = Fixture::create();
     let ids = store_every_fixture(&mut v, &cs);
     let openai = ids

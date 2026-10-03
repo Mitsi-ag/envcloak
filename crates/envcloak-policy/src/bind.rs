@@ -135,7 +135,7 @@ fn bind_one(b: &Binding, items: &[ItemMeta]) -> Result<BoundBinding, BindError> 
         ItemClass::Secret => {}
         ItemClass::Card => return Err(fail(BindErrorKind::CardReference)),
         ItemClass::IssuerCredential => return Err(fail(BindErrorKind::IssuerCredentialReference)),
-        ItemClass::None => return Err(fail(BindErrorKind::UnknownItemClass)),
+        ItemClass::Login | ItemClass::None => return Err(fail(BindErrorKind::UnknownItemClass)),
     }
     let field = match &b.reference.field {
         Some(name) => item

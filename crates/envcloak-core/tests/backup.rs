@@ -926,10 +926,11 @@ fn no_change(_: &MigrationTx<'_>) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// A plan to schema version 2 whose step only adds a table.
-fn to_v2() -> MigrationPlan {
+/// The shipped plan and a step to schema version 3 that only adds a
+/// table.
+fn to_v3() -> MigrationPlan {
     MigrationPlan::new(vec![Migration {
-        from: 1,
+        from: 2,
         ddl: "CREATE TABLE notes (id BLOB PRIMARY KEY NOT NULL) STRICT;",
         transform: no_change,
     }])
@@ -944,7 +945,7 @@ fn an_older_format_backup_restores_and_is_migrated() {
     let (f, v) = KitFixture::create();
     let info = v.create_backup().unwrap();
     let items: Vec<ItemMeta> = v.items().to_vec();
-    assert_eq!(v.schema_version(), 1);
+    assert_eq!(v.schema_version(), 2);
     drop(v);
 
     let new = other_passphrase(8);
@@ -954,26 +955,26 @@ fn an_older_format_backup_restores_and_is_migrated() {
         &f.kit(),
         &new,
         &KdfParams::minimum(),
-        to_v2(),
+        to_v3(),
     )
     .unwrap();
-    assert_eq!(v.schema_version(), 2);
+    assert_eq!(v.schema_version(), 3);
     assert_eq!(v.integrity(), Integrity::Ok);
     assert_eq!(v.items(), &items[..]);
     assert_holds_canaries(&v, &f.cs);
     assert_eq!(report.backup_write_counter, info.write_counter);
     drop(v);
 
-    let v = LockedVault::open_with_plan(&f.paths, to_v2())
+    let v = LockedVault::open_with_plan(&f.paths, to_v3())
         .unwrap()
         .unlock_with_passphrase(&new)
         .map_err(|(_, e)| e)
         .unwrap();
-    assert_eq!(v.schema_version(), 2);
+    assert_eq!(v.schema_version(), 3);
     assert_eq!(v.integrity(), Integrity::Ok);
     assert_holds_canaries(&v, &f.cs);
     drop(v);
-    // This build, which knows version 1 only, refuses the newer file.
+    // This build, which knows version 2 at most, refuses the newer file.
     assert_eq!(
         LockedVault::open(&f.paths).unwrap_err().kind(),
         VaultErrorKind::UnsupportedVersion

@@ -91,6 +91,14 @@ pub enum VaultErrorKind {
     /// under one of the names, or cut or wrote into it, meanwhile. Nothing
     /// is answered as written.
     Substituted,
+    /// A login field (SPEC §6.8: "Login fields are typed"): it is read
+    /// only through a sign-in attempt's lease (`LoginFieldReader`) and
+    /// written only through the login methods of a transaction, never as
+    /// a value.
+    LoginField,
+    /// The login a sign-in attempt's lease names changed, or was removed,
+    /// after the lease was issued: the lease opens nothing.
+    LeaseStale,
 }
 
 impl VaultErrorKind {
@@ -153,6 +161,12 @@ impl VaultErrorKind {
             VaultErrorKind::Substituted => {
                 "something replaced or changed a file the vault wrote before it was checked in \
                  place, so it was not answered as written"
+            }
+            VaultErrorKind::LoginField => {
+                "a login field is opened only by a sign-in attempt, never as a value"
+            }
+            VaultErrorKind::LeaseStale => {
+                "the login changed after this sign-in attempt began, so the attempt opens nothing"
             }
         }
     }
