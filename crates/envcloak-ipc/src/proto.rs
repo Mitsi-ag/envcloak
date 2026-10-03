@@ -1441,7 +1441,9 @@ impl ErrorKind {
                 "a debugger or tracer is attached to the daemon, so it will not handle secrets"
             }
             ErrorKind::VaultUnavailable => "the vault could not be opened",
-            ErrorKind::FrameTooLarge => "the request exceeds the 1 MiB frame limit",
+            ErrorKind::FrameTooLarge => {
+                "the request, or the answer its values would make, exceeds the 1 MiB frame limit"
+            }
             ErrorKind::Evidence => "the caller's ancestry could not be read",
             ErrorKind::ManifestInvalid => "the project manifest is invalid or could not be opened",
             ErrorKind::BindingUnresolved => "a binding the run asked for could not be resolved",

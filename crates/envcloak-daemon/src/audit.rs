@@ -45,8 +45,9 @@ pub const ANCHOR_RETRY_FIRST: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestAudit {
     pub pid: i32,
-    /// `covered`, `pending`, `denied`, `policy_denied` or
-    /// `too_many_pending`.
+    /// `covered`, `pending`, `denied`, `policy_denied`,
+    /// `too_many_pending`, or `frame_too_large` for a covered request whose
+    /// answer does not fit in a frame (nothing released, F-77).
     pub decision: &'static str,
     pub request_id: Option<String>,
     pub grant_id: Option<String>,

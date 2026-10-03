@@ -87,6 +87,9 @@ pub enum Delivery {
     /// The vault is not unlocked and verified, or a value could not be
     /// read.
     Refused(RpcError),
+    /// The answer the values make could not be built: too large for one
+    /// frame (F-77). Nothing was recorded or released.
+    Unsendable(RpcError),
     /// The delivery's audit entry could not be written.
     AuditFailed,
 }
@@ -565,22 +568,26 @@ impl State {
     }
 
     /// A covered request's delivery (SPEC §6.1 step 5, gate 33): reads the
-    /// value of each field from the verified vault, then writes the
-    /// delivery's entry durably, and only then gives the values out. The
-    /// values are the only way to a release, so none leaves the daemon
-    /// before its entry is on disk.
+    /// value of each field from the verified vault, builds the answer from
+    /// them with `answer` (the frame that will be sent, so an answer too
+    /// large for one is known before anything is committed, F-77), then
+    /// writes the delivery's entry durably, and only then gives the answer
+    /// out. The answer is the only way to a release, so no value leaves
+    /// the daemon before its entry is on disk.
     ///
     /// # Errors
     /// [`Delivery::Refused`] when the vault is not unlocked and verified,
     /// or a value cannot be read (a vault that turns out changed on disk
     /// is marked tampered by the read, and releases nothing more). Nothing
-    /// is recorded then. [`Delivery::AuditFailed`] when the entry could
-    /// not be written; the values read are dropped, and wiped.
-    pub fn deliver(
+    /// is recorded then. [`Delivery::Unsendable`] with `answer`'s error;
+    /// nothing is recorded then either. [`Delivery::AuditFailed`] when the
+    /// entry could not be written; the answer is dropped, and wiped.
+    pub fn deliver<T>(
         &mut self,
         e: AuditEvent,
         fields: &[FieldId],
-    ) -> Result<Vec<SecretBytes>, Delivery> {
+        answer: impl FnOnce(Vec<SecretBytes>) -> Result<T, RpcError>,
+    ) -> Result<T, Delivery> {
         let vault = self.unlocked().map_err(Delivery::Refused)?;
         let values = fields
             .iter()
@@ -595,10 +602,11 @@ impl State {
         if vault.integrity() != Integrity::Ok {
             return Err(Delivery::Refused(RpcError::new(ErrorKind::VaultTampered)));
         }
+        let answer = answer(values).map_err(Delivery::Unsendable)?;
         if !self.audit_delivery(e) {
             return Err(Delivery::AuditFailed);
         }
-        Ok(values)
+        Ok(answer)
     }
 
     /// A `too_many_pending` answer to the request with fingerprint `key`
@@ -1608,7 +1616,7 @@ mod tests {
             }))
         };
 
-        let values = s.deliver(delivery(1), &[field]).unwrap();
+        let values = s.deliver(delivery(1), &[field], Ok).unwrap();
         // The values exist: the entry is already in the log's files.
         assert_eq!(
             entries(&s).last().map(|e| e.2.clone()),
@@ -1616,21 +1624,32 @@ mod tests {
         );
         assert!(values[0].ct_eq(VALUE));
 
+        // An answer that cannot be built (too large for a frame, F-77):
+        // nothing recorded, and its error given back.
+        let before = entries(&s).len();
+        let too_large = RpcError::new(ErrorKind::FrameTooLarge);
+        assert_eq!(
+            s.deliver(delivery(5), &[field], |_| Err::<(), _>(too_large))
+                .unwrap_err(),
+            Delivery::Unsendable(too_large)
+        );
+        assert_eq!(entries(&s).len(), before);
+
         // No entry can be written: no values.
         let dir = &f.paths.audit_dir;
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::write(dir, b"in the way").unwrap();
         assert_eq!(
-            s.deliver(delivery(2), &[field]).unwrap_err(),
+            s.deliver(delivery(2), &[field], Ok).unwrap_err(),
             Delivery::AuditFailed
         );
         std::fs::remove_file(dir).unwrap();
-        assert_eq!(s.deliver(delivery(3), &[field]).unwrap().len(), 1);
+        assert_eq!(s.deliver(delivery(3), &[field], Ok).unwrap().len(), 1);
 
         // Locked: refused before anything is read or written.
         s.lock(LockReason::Request);
         assert_eq!(
-            s.deliver(delivery(4), &[field]).unwrap_err(),
+            s.deliver(delivery(4), &[field], Ok).unwrap_err(),
             Delivery::Refused(RpcError::new(ErrorKind::VaultLocked))
         );
     }
