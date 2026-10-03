@@ -139,9 +139,17 @@ fn check(text: String) -> Result<RefStatus, Failure> {
     let answer = c
         .items_check(None, &[text])
         .map_err(|e| unchecked(e.into()))?;
-    match answer.refs.as_slice() {
+    one_status(&answer.refs)
+}
+
+/// The status an `items.check` answer gives the one reference sent. An
+/// answer with none, or with more (a status for a reference never sent),
+/// answers something else, whatever its first status says: it fails
+/// `protocol_error`, and nothing is written.
+fn one_status(refs: &[RefStatus]) -> Result<RefStatus, Failure> {
+    match refs {
         [status] => Ok(*status),
-        _ => Err(unchecked(ClientError::Protocol.into())),
+        _ => Err(Failure::from(ClientError::Protocol).with_tail(NOT_WRITTEN)),
     }
 }
 
@@ -214,6 +222,32 @@ mod tests {
             let f = writable(refused).unwrap_err();
             assert_eq!(f.token(), token, "{refused:?}");
             assert!(f.message().contains("nothing was written"), "{refused:?}");
+        }
+    }
+
+    /// An answer is one status for the one reference, or nothing is
+    /// written: none, two, or a status for a reference never sent fail
+    /// `protocol_error` whatever the first says. Mutation checked (the
+    /// verifier's survivor): the first of any number taken, and none taken
+    /// as `ok` (`[status, ..] => Ok(*status), _ => Ok(RefStatus::Ok)`):
+    /// this fails, and so does `login_refs`'s stand-in daemon test.
+    #[test]
+    fn an_answer_is_one_status_for_the_one_reference() {
+        assert_eq!(one_status(&[RefStatus::Ok]), Ok(RefStatus::Ok));
+        assert_eq!(
+            one_status(&[RefStatus::LoginReference]),
+            Ok(RefStatus::LoginReference)
+        );
+        for refs in [
+            &[][..],
+            &[RefStatus::Ok, RefStatus::Ok],
+            &[RefStatus::Ok, RefStatus::LoginReference],
+            &[RefStatus::LoginReference, RefStatus::Ok],
+            &[RefStatus::UnknownItem; 3],
+        ] {
+            let f = one_status(refs).unwrap_err();
+            assert_eq!(f.token(), "protocol_error", "{refs:?}");
+            assert!(f.message().contains("nothing was written"), "{refs:?}");
         }
     }
 

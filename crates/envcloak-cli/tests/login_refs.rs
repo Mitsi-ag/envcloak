@@ -12,7 +12,9 @@
 //! secret alike are refused (`daemon_unavailable`, `vault_locked`) and
 //! `envcloak.toml` is left as it was. Mutation checked: the class check's
 //! failure taken as "not a login" (the `.ok()` fallback ref had), which
-//! writes the login's binding here and fails.
+//! writes the login's binding here and fails. Nor does it write on an
+//! answer that is not one status for the one reference, an unverified
+//! daemon or a daemon's error, which a stand-in daemon gives.
 //!
 //! The person's commands run on a terminal of their own, as tests/run.rs's
 //! approver's do; under a developer's Claude Code the unlock is refused,
@@ -21,12 +23,16 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::Output;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use common::{
-    Fd, MANIFEST, data_dir, finish_within, on_terminal_command, outside_dir, project,
+    Fd, MANIFEST, cli_command, data_dir, finish_within, on_terminal_command, outside_dir, project,
     run_on_terminal, secret_file, seed_vault, start_daemon, stderr, stdout,
 };
 use envcloak_core::SecretBytes;
@@ -34,8 +40,11 @@ use envcloak_core::vault::{
     ItemDetails, LockedVault, LoginMeta, LoginTier, NewLogin, Slug, TotpAlgorithm, TotpEnrollment,
     TotpParams, VaultPaths,
 };
+use envcloak_ipc::proto::{self, ErrorKind, IncomingRequest, RpcError};
+use envcloak_ipc::view::{CheckView, RefStatus};
+use envcloak_ipc::{Frame, RunPaths};
 use envcloak_testkit::{
-    Canary, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
+    Canary, TestHome, assert_no_canary, by_label, canaries, daemon_run_dir, fresh_seed, labels,
 };
 
 /// Plants `fixture/editor`, a login whose every field is a fixture of its
@@ -207,4 +216,203 @@ fn b18_run_and_ref_refuse_a_login_field() {
     assert_no_canary(&d.log_bytes(), &cs);
     home.assert_clean(&cs);
     drop(files);
+}
+
+/// What a stand-in daemon answers `items.check` with.
+enum Answer {
+    Refs(serde_json::Value),
+    Error(ErrorKind),
+}
+
+/// A request the stand-in took: its method, and the references it sent.
+type Asked = (String, Vec<String>);
+
+/// A stand-in for the daemon, on the daemon's socket under `home`: it
+/// answers each request with `answer` and records its method and the
+/// references it sent. The socket is bound before it returns (ready), and
+/// the thread takes connections only until it is stopped or 60 seconds
+/// pass, so it never outlives the test.
+struct StandIn {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<Vec<Asked>>>,
+}
+
+impl StandIn {
+    fn start(home: &TestHome, answer: Answer) -> StandIn {
+        let paths = RunPaths::under(daemon_run_dir(home)).unwrap();
+        paths.prepare_dir().unwrap();
+        let _ = std::fs::remove_file(&paths.socket);
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let until = Instant::now() + Duration::from_secs(60);
+            while !stopping.load(Ordering::SeqCst) && Instant::now() < until {
+                let mut s = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                };
+                s.set_nonblocking(false).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                let Ok(f) = Frame::read_from(&mut s) else {
+                    continue;
+                };
+                let req = IncomingRequest::parse(&f).unwrap();
+                let refs = req
+                    .params::<serde_json::Value>()
+                    .ok()
+                    .and_then(|p| serde_json::from_value(p["refs"].clone()).ok())
+                    .unwrap_or_default();
+                seen.push((req.method.to_owned(), refs));
+                let frame = match &answer {
+                    Answer::Refs(refs) => proto::result_frame(
+                        req.id,
+                        &serde_json::json!({
+                            "project_dir": null,
+                            "project_name": null,
+                            "bindings": [],
+                            "refs": refs,
+                        }),
+                    ),
+                    Answer::Error(kind) => proto::error_frame(Some(req.id), &RpcError::new(*kind)),
+                };
+                let _ = frame.unwrap().write_to(&mut s);
+            }
+            seen
+        });
+        StandIn {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stops it, and what it was asked.
+    fn asked(mut self) -> Vec<Asked> {
+        self.stop.store(true, Ordering::SeqCst);
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// `envcloak ref` writes only on an answer of one status for the one
+/// reference it sent. Against a stand-in daemon, an answer with no
+/// status, with two, with a status this build does not know, and a
+/// daemon's error each leave `envcloak.toml` byte for byte as it was, and
+/// say so with the failure's token; so does a daemon whose directory its
+/// group can write (`daemon_unverified`), which is asked nothing. The positive
+/// control: the same stand-in answering one `ok` gets the binding written.
+/// Each run asks `items.check` once, with the one reference.
+///
+/// Mutation checked (the verifier's survivor): the first status of any
+/// number taken, and none taken as `ok` (`[status, ..] => Ok(*status), _
+/// => Ok(RefStatus::Ok)` in `ref_.rs`): the empty and the two-status
+/// answers write the binding, and this fails.
+#[test]
+fn ref_writes_nothing_unless_the_daemon_answers_one_status() {
+    let home = TestHome::new();
+    let story = project(&home, "acme-web", MANIFEST);
+    let manifest = std::fs::read(story.join("envcloak.toml")).unwrap();
+    let binding = "GITHUB_TOKEN=github/acme-web";
+    let ref_ = || {
+        let mut cmd = cli_command(&home, &["ref", binding], &[]);
+        cmd.current_dir(&story);
+        finish_within(cmd, Duration::from_secs(60))
+    };
+    let one_check = |asked: &[Asked], what: &str| {
+        assert_eq!(
+            asked,
+            [("items.check".to_owned(), vec![binding.to_owned()])],
+            "{what}"
+        );
+    };
+    let ok = serde_json::to_value(RefStatus::Ok).unwrap();
+    for (answer, token, what) in [
+        (
+            Answer::Refs(serde_json::json!([])),
+            "protocol_error",
+            "no status",
+        ),
+        (
+            Answer::Refs(serde_json::json!([ok, ok])),
+            "protocol_error",
+            "two statuses",
+        ),
+        (
+            Answer::Refs(serde_json::json!([ok, "login_reference"])),
+            "protocol_error",
+            "a status for a reference never sent",
+        ),
+        (
+            Answer::Refs(serde_json::json!(["not_a_status"])),
+            "protocol_error",
+            "a status this build does not know",
+        ),
+        (Answer::Error(ErrorKind::Internal), "internal", "an error"),
+    ] {
+        let daemon = StandIn::start(&home, answer);
+        let o = ref_();
+        let asked = daemon.asked();
+        let err = stderr(&o);
+        assert_eq!(o.status.code(), Some(1), "{what}: {err}");
+        assert!(
+            err.starts_with(&format!("envcloak: {token}: ")),
+            "{what}: {err}"
+        );
+        assert!(err.contains("nothing was written"), "{what}: {err}");
+        assert!(stdout(&o).is_empty(), "{what}: {}", stdout(&o));
+        assert_eq!(
+            std::fs::read(story.join("envcloak.toml")).unwrap(),
+            manifest,
+            "{what} changed envcloak.toml"
+        );
+        one_check(&asked, what);
+    }
+
+    // A daemon directory its group can write: the daemon is not verified,
+    // and nothing is sent to it or written.
+    let daemon = StandIn::start(&home, Answer::Refs(serde_json::json!([ok])));
+    let dir = daemon_run_dir(&home);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let o = ref_();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let asked = daemon.asked();
+    let err = stderr(&o);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(err.starts_with("envcloak: daemon_unverified: "), "{err}");
+    assert!(err.contains("nothing was written"), "{err}");
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_eq!(
+        std::fs::read(story.join("envcloak.toml")).unwrap(),
+        manifest
+    );
+
+    // The control: one `ok` for the one reference, and it is written.
+    let daemon = StandIn::start(&home, Answer::Refs(serde_json::json!([ok])));
+    let o = ref_();
+    one_check(&daemon.asked(), "one ok");
+    assert!(o.status.success(), "{}", stderr(&o));
+    let written = String::from_utf8(std::fs::read(story.join("envcloak.toml")).unwrap()).unwrap();
+    assert!(
+        written.contains("GITHUB_TOKEN = \"github/acme-web\""),
+        "{written}"
+    );
+    // `CheckView` is what the stand-in's answers are shaped as.
+    let _: CheckView = serde_json::from_value(serde_json::json!({
+        "project_dir": null, "project_name": null, "bindings": [], "refs": [ok],
+    }))
+    .unwrap();
 }
