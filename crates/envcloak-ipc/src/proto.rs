@@ -1345,12 +1345,15 @@ pub enum ErrorKind {
     /// The backup v2 is committed: it takes no more chunks, and each
     /// file's result is recorded once.
     BackupFrozen,
+    /// A reference to a login's field (SPEC §6.8): `run`, `ref` and every
+    /// resolver refuse it; only a sign-in opens a login's fields.
+    LoginReference,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 44] = [
+    pub const ALL: [ErrorKind; 45] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -1394,6 +1397,7 @@ impl ErrorKind {
         ErrorKind::RestoreRefused,
         ErrorKind::NoSuchLease,
         ErrorKind::BackupFrozen,
+        ErrorKind::LoginReference,
         ErrorKind::Internal,
     ];
 
@@ -1443,6 +1447,7 @@ impl ErrorKind {
             ErrorKind::RestoreRefused => -32048,
             ErrorKind::NoSuchLease => -32049,
             ErrorKind::BackupFrozen => -32050,
+            ErrorKind::LoginReference => -32037,
             ErrorKind::Internal => -32099,
         }
     }
@@ -1493,6 +1498,7 @@ impl ErrorKind {
             ErrorKind::RestoreRefused => "restore_refused",
             ErrorKind::NoSuchLease => "no_such_lease",
             ErrorKind::BackupFrozen => "backup_frozen",
+            ErrorKind::LoginReference => "login_reference",
             ErrorKind::Internal => "internal",
         }
     }
@@ -1601,6 +1607,10 @@ impl ErrorKind {
             ErrorKind::BackupFrozen => {
                 "the backup is committed: it takes no more chunks, and each file's result is \
                  recorded once; nothing was changed"
+            }
+            ErrorKind::LoginReference => {
+                "a reference names a login's field, which is never bound to a variable: only a \
+                 sign-in opens a login, after the person approves it in EnvCloak"
             }
             ErrorKind::Internal => "the daemon failed",
         }

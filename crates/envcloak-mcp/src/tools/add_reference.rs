@@ -138,6 +138,13 @@ fn add(args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Failu
         }
         Err(e) => return Err(e.into()),
     };
+    if item.class == ItemClassView::Login {
+        return Err(Failure::new(
+            "login_reference",
+            "that slug names a login, whose fields are never bound to a variable: only a sign-in \
+             opens them, after the person approves it in EnvCloak; nothing was written",
+        ));
+    }
     if item.class != ItemClassView::Secret {
         return Err(Failure::new(
             "not_secret",

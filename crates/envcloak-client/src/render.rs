@@ -256,6 +256,7 @@ fn class_word(c: ItemClassView) -> &'static str {
         ItemClassView::Secret => "secret",
         ItemClassView::Card => "card",
         ItemClassView::IssuerCredential => "issuer credential",
+        ItemClassView::Login => "login",
         ItemClassView::Other => "unknown class",
     }
 }
@@ -565,6 +566,9 @@ pub fn status_text(s: RefStatus) -> &'static str {
         RefStatus::CardReference => "a card is never bound to a variable",
         RefStatus::IssuerCredentialReference => "an issuer credential is never bound to a variable",
         RefStatus::UnknownItemClass => "the item is of a class that cannot be bound",
+        RefStatus::LoginReference => {
+            "a login's field is never bound to a variable: only a sign-in opens it"
+        }
         RefStatus::InvalidReference => "not NAME=<slug>[#field]",
         RefStatus::LooksLikeValue => {
             "shaped like a key or token rather than a name, so not shown: was a value pasted here?"

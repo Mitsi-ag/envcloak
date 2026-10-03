@@ -1,11 +1,14 @@
 //! Gate 17, card half: a reference to a card, an issuer credential or an
 //! item of unknown class is rejected when the manifest's bindings are bound
-//! to the vault's items. Also how a reference picks its field.
+//! to the vault's items. Gate b18's `run` and `ref` part (plan task M2-07):
+//! so is a reference to a login's field, as `login_reference`. Also how a
+//! reference picks its field.
 #![allow(clippy::unwrap_used)]
 
 use envcloak_core::crypto::{ItemClass, KdfParams};
 use envcloak_core::vault::{
-    Classification, FieldName, ItemDetails, ItemId, ItemMeta, NewItem, Slug, Vault, VaultPaths,
+    Classification, FieldKind, FieldName, ItemDetails, ItemId, ItemMeta, LoginMeta, LoginTier,
+    NewItem, NewLogin, Slug, TotpAlgorithm, TotpEnrollment, TotpParams, Vault, VaultPaths,
 };
 use envcloak_core::{SecretBytes, create_vault};
 use envcloak_policy::{BindErrorKind, Binding, EnvName, bind_items, parse_manifest, resolve};
@@ -81,6 +84,28 @@ fn fixture() -> Fixture {
         &["api_key"],
         Classification::Unknown,
     );
+    vault
+        .transact(|t| {
+            t.create_login(NewLogin {
+                slug: Slug::new("fixture/editor").unwrap(),
+                details: ItemDetails {
+                    classification: Classification::Test,
+                    ..ItemDetails::default()
+                },
+                meta: LoginMeta {
+                    tier: LoginTier::Dev,
+                    session_lifetime: 900,
+                },
+                username: SecretBytes::copy_from(b"editor@example.test"),
+                password: SecretBytes::copy_from(b"a login password for bind"),
+                totp: Some(TotpEnrollment {
+                    params: TotpParams::new(TotpAlgorithm::Sha1, 6, 30).unwrap(),
+                    seed: SecretBytes::copy_from(b"a totp seed for bind"),
+                }),
+                adapter_key: Some(SecretBytes::copy_from(b"an adapter key for bind")),
+            })
+        })
+        .unwrap();
     Fixture { _home: home, vault }
 }
 
@@ -181,4 +206,63 @@ fn a_reference_picks_its_field() {
 
 fn find_by_id(items: &[ItemMeta], id: ItemId) -> &ItemMeta {
     items.iter().find(|m| m.id == id).unwrap()
+}
+
+/// Gate b18, `run` and `ref` part (plan task M2-07): every field of a login
+/// is refused when bound, named or not, alone or beside a secret, in
+/// `[env]`, in a profile and as a `--ref`, as `login_reference`: no login
+/// field becomes a variable, whatever names it. Its typed fields are there
+/// to be named (the control), and a secret beside it still binds.
+#[test]
+fn b18_login_fields_are_refused_when_bound() {
+    let f = fixture();
+    let items = f.vault.items();
+    let login = items
+        .iter()
+        .find(|m| m.slug.as_str() == "fixture/editor")
+        .unwrap();
+    let kinds: Vec<FieldKind> = login.fields.iter().map(|f| f.kind).collect();
+    assert_eq!(kinds.len(), 4);
+    assert!(kinds.iter().all(|k| k.is_login()));
+    let mut refs = vec!["fixture/editor".to_owned()];
+    refs.extend(
+        login
+            .fields
+            .iter()
+            .map(|f| format!("fixture/editor#{}", f.name)),
+    );
+    refs.push("fixture/editor#value".to_owned());
+    for reference in &refs {
+        for manifest in [
+            format!("[env]\nPASSWORD = \"{reference}\"\n"),
+            format!("[env]\nOPENAI_API_KEY = \"openai/work\"\nPASSWORD = \"{reference}\"\n"),
+            format!(
+                "[env]\nOPENAI_API_KEY = \"openai/work\"\n[env.e2e]\nPASSWORD = \"{reference}\"\n"
+            ),
+        ] {
+            let m = parse_manifest(manifest.as_bytes()).unwrap();
+            let profile = manifest
+                .contains("[env.e2e]")
+                .then(|| envcloak_policy::ProfileName::new("e2e").unwrap());
+            let b = resolve(&m, profile.as_ref(), &[], None).unwrap();
+            let e = bind_items(&b, items).unwrap_err();
+            assert_eq!(e.kind(), BindErrorKind::LoginReference, "{manifest}");
+            assert_eq!(e.token(), "login_reference");
+            assert_eq!(e.kind().token(), "login_reference");
+            assert_eq!(e.env_name().as_str(), "PASSWORD");
+        }
+        let arg = Binding::parse_arg(&format!("PASSWORD={reference}")).unwrap();
+        let e = bind_items(&[arg], items).unwrap_err();
+        assert_eq!(e.kind(), BindErrorKind::LoginReference, "{reference}");
+        // The message names the rule, never the reference or a value.
+        let shown = e.to_string();
+        assert!(!shown.contains("fixture/editor") && !shown.contains("editor@"));
+    }
+    assert!(
+        bind_items(
+            &bindings("[env]\nOPENAI_API_KEY = \"openai/work\"\n"),
+            items
+        )
+        .is_ok()
+    );
 }

@@ -3,7 +3,8 @@
 //! it here): binds a variable to an item in the nearest `envcloak.toml`.
 //! The manifest holds names only, so this reads and writes no value, and
 //! needs no daemon; when one answers, it says whether the reference
-//! resolves.
+//! resolves, and a reference to a login's field (SPEC §6.8, gate b18) is
+//! refused, `login_reference`, with nothing written.
 //!
 //! The edit itself, which keeps everything else in the file as it was and
 //! replaces it atomically, is [`envcloak_client::manifest_edit`]'s. A
@@ -17,7 +18,7 @@ use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, USAGE, usage};
 use envcloak_client::manifest_edit::edit_manifest_ref;
 use envcloak_client::render::print;
-use envcloak_ipc::view::RefEditView;
+use envcloak_ipc::view::{RefEditView, RefStatus};
 use envcloak_policy::{Binding, ProfileName, find_manifest};
 
 use super::refuse_value_like;
@@ -98,14 +99,22 @@ fn edit(a: RefArgs) -> Result<ExitCode, Failure> {
             ));
         }
     };
-    let e = edit_manifest_ref(&manifest, &a.binding, a.profile.as_ref())?;
-    // Whether the vault has the item: asked when a daemon answers, and
-    // never a reason to fail.
+    // Whether the vault has the item: asked when a daemon answers, and no
+    // reason to fail, but for a login's field (SPEC §6.8): that binding is
+    // never made, so nothing is written for it.
     let text = format!("{}={}", a.binding.env_name, a.binding.reference);
     let resolves = connect()
         .ok()
         .and_then(|mut c| c.items_check(None, &[text]).ok())
         .and_then(|v| v.refs.first().copied());
+    if resolves == Some(RefStatus::LoginReference) {
+        return Err(Failure::new(
+            "login_reference",
+            "that reference names a login's field, which is never bound to a variable (only a \
+             sign-in opens it); nothing was written",
+        ));
+    }
+    let e = edit_manifest_ref(&manifest, &a.binding, a.profile.as_ref())?;
     let view = RefEditView {
         manifest: manifest.to_string_lossy().into_owned(),
         profile: a.profile.map(|p| p.as_str().to_owned()),
