@@ -2,7 +2,7 @@
 
 Status: schema version 2 (M2-07), the one schema change of M2 and M2b; version 1 is M1's, which this build migrates (see Migrations). This file fixes how SPEC §5 "Vault", "Integrity" and "Items" are stored on disk: the SQLite schema, what each column holds, the records sealed into rows, the state digest, how writes, crashes and migrations are handled, and how a vault is unlocked, backed up and restored. The crypto it builds on (sealing, associated data, subkeys, keyed hashes, envelopes, the Recovery Kit) is in [CRYPTO.md](CRYPTO.md). The code is in `crates/envcloak-core/src/vault/`, `unlock.rs` and `backup.rs`.
 
-A change to any layout, label or number here is a format change: it needs a new schema version and a migration.
+A change to the SQLite schema (its tables, columns or DDL), to what a column holds, to a label, keyed-hash domain or associated data, or to any other number here is a format change: it needs a new schema version and a migration. A change to the layout of a sealed record is not: from schema version 2 it is a new version of that record, read beside the old one (see Records), never a schema migration (M2 plan decision D-08: schema version 2 is the one migration of M2 and M2b).
 
 ## Location
 
