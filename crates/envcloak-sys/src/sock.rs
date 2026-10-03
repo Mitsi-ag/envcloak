@@ -115,7 +115,52 @@ fn stream_socket() -> io::Result<OwnedFd> {
             return Err(io::Error::last_os_error());
         }
     }
+    // On Apple systems a write to a connection the peer closed raises
+    // SIGPIPE unless the socket says not to, as std's sockets do: a client
+    // running with SIGPIPE at its default action would be killed where a
+    // waiter expects `EPIPE` and asks again (a daemon at its connection
+    // limit closes a connection unanswered). Linux writes with
+    // MSG_NOSIGNAL in std, and the Rust runtime ignores SIGPIPE there.
+    #[cfg(target_vendor = "apple")]
+    {
+        let on: libc::c_int = 1;
+        // SAFETY: `fd` is an open socket owned here; `on` is a valid int
+        // that outlives the call, and its size is passed.
+        let r = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw const on).cast::<libc::c_void>(),
+                socklen(size_of::<libc::c_int>()),
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     Ok(fd)
+}
+
+/// Whether `fd`'s `SO_NOSIGPIPE` is set (Apple systems only).
+#[cfg(all(test, target_vendor = "apple"))]
+fn no_sigpipe(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    let mut on: libc::c_int = 0;
+    let mut len = socklen(size_of::<libc::c_int>());
+    // SAFETY: `fd` is open; `on` and `len` are writable and sized.
+    let r = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&raw mut on).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(on != 0)
 }
 
 /// The address of `path`, and its length.
@@ -192,8 +237,12 @@ mod tests {
     }
 
     /// The connection works as `UnixStream::connect`'s does: bytes cross
-    /// both ways, the descriptor is close-on-exec, and the timeouts are
-    /// the ones asked for.
+    /// both ways, the descriptor is close-on-exec, the timeouts are the
+    /// ones asked for, and on Apple systems a write to a closed peer gives
+    /// `EPIPE` rather than SIGPIPE (`SO_NOSIGPIPE`).
+    ///
+    /// Mutation checked: `stream_socket` not setting `SO_NOSIGPIPE`: the
+    /// flag reads off on macOS and this fails.
     #[test]
     fn a_connection_carries_bytes_and_its_timeouts() {
         use std::io::{Read, Write};
@@ -215,6 +264,9 @@ mod tests {
             Some(Duration::from_millis(1500))
         );
         assert!(crate::cloexec_flag(std::os::fd::AsFd::as_fd(&c)).unwrap());
+        // As std's own sockets on Apple systems (review of M2-03).
+        #[cfg(target_vendor = "apple")]
+        assert!(no_sigpipe(std::os::fd::AsFd::as_fd(&c)).unwrap());
     }
 
     /// Nothing listening, no socket file, and a path too long: the errors
