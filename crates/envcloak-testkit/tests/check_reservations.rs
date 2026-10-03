@@ -2577,7 +2577,10 @@ fn the_statement_domain_reader_reads_what_tests_bring_in() {
     add_file(
         &t,
         "crates/envcloak-core/src/target/mod.rs",
-        &format!("pub const D: &[u8] = b\"envcloak-zz{}/1\\n\";\n", "statement"),
+        &format!(
+            "pub const D: &[u8] = b\"envcloak-zz{}/1\\n\";\n",
+            "statement"
+        ),
     );
     assert_fails(&t, "the code has `envcloak-zzstatement/1`");
     for (body, expect) in [
@@ -2685,4 +2688,387 @@ fn a_line_whose_pieces_the_source_holds_is_read_whole() {
         "pub fn d(program: &str) { eprintln!(\"{program}: internal error: x\"); }\n",
     );
     assert_passes(&t.home());
+}
+
+// --- The compiled oracle of constructor forms and source layouts ----------
+
+/// The `envcloak-client`, `envcloak-ipc` and `envcloak-sys` libraries,
+/// built (or found built) by Cargo in this test's target directory: name
+/// to `.rlib` path, and the directory of their dependencies.
+fn client_libraries() -> (Vec<(String, PathBuf)>, PathBuf) {
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap();
+    let out = Command::new(env!("CARGO"))
+        .current_dir(repo_root())
+        .env("CARGO_TARGET_DIR", target)
+        .args([
+            "build",
+            "-p",
+            "envcloak-client",
+            "--offline",
+            "--message-format=json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cargo build -p envcloak-client: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut libs = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Ok(m) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let name = m["target"]["name"].as_str().unwrap_or_default();
+        if m["reason"] != "compiler-artifact"
+            || !["envcloak_client", "envcloak_ipc", "envcloak_sys"].contains(&name)
+        {
+            continue;
+        }
+        for f in m["filenames"].as_array().unwrap() {
+            let f = f.as_str().unwrap();
+            if f.ends_with(".rlib") {
+                libs.push((name.to_owned(), PathBuf::from(f)));
+            }
+        }
+    }
+    assert_eq!(libs.len(), 3, "{libs:?}");
+    let deps = libs[0].1.parent().unwrap().to_path_buf();
+    (libs, deps)
+}
+
+/// Compiles `main` (edition 2024, warnings denied) against the client's
+/// libraries and runs it: it must build cleanly, exit 0 and print
+/// nothing, which shows the form it holds is Rust that makes the failure
+/// with the token it asserts (the oracle's positive control).
+fn compile_and_run(main: &Path, libs: &[(String, PathBuf)], deps: &Path, label: &str) {
+    let rustc = Path::new(env!("CARGO")).with_file_name("rustc");
+    let binary = main.with_extension("bin");
+    let mut cmd = Command::new(rustc);
+    cmd.args([
+        "--edition=2024",
+        "--crate-name",
+        "oracle",
+        "-D",
+        "warnings",
+        "-L",
+    ])
+    .arg(format!("dependency={}", deps.display()));
+    for (name, path) in libs {
+        cmd.arg("--extern")
+            .arg(format!("{name}={}", path.display()));
+    }
+    let made = cmd.arg(main).arg("-o").arg(&binary).output().unwrap();
+    assert!(
+        made.status.success() && made.stderr.is_empty(),
+        "{label}: the consumer does not build cleanly: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let ran = Command::new(&binary).env_clear().output().unwrap();
+    assert!(
+        ran.status.success() && ran.stdout.is_empty() && ran.stderr.is_empty(),
+        "{label}: the consumer does not make its token: {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+}
+
+/// An independent reviewer's compiled corpus (round 3 of M2-RES1), each
+/// form compiled with rustc against the real `envcloak-client` library
+/// and run, so it is a constructor or a layout the compiler accepts and
+/// that makes its token, then checked: every form that makes a reserved,
+/// unregistered or run-time token is refused, whatever the path before
+/// `new` (relative, with a leading `::`, qualified, through `extern crate
+/// .. as`, `Self` or `<Self>` in fail.rs, a receiver's run-time value),
+/// and wherever the module is (beside the source, in a subdirectory,
+/// outside `src/`, through a symbolic link to a directory or a file). The
+/// controls: the same constructor forms with a landed token pass. A
+/// `#[path]` module that makes a landed token is refused too: this checker
+/// reads no `#[path]` layout, so that layout's refusal is the gate.
+///
+/// Mutations checked: the constructor matched forward from its start, as
+/// in round 3: the leading-`::`, qualified and `<Self>` forms pass and
+/// this fails. `#[path]` not refused: the module outside `src/` passes
+/// and this fails.
+#[test]
+fn a_compiled_corpus_of_constructors_and_layouts_is_read_or_refused() {
+    let (libs, deps) = client_libraries();
+    let (reserved, landed, unknown) = ("pty_unavailable", "daemon_unavailable", "zz_unregistered");
+    let direct = |form: &str, value: &str| {
+        format!(
+            "pub fn make() -> envcloak_client::fail::Failure {{ {form}({value}, String::new()) }}\n"
+        )
+    };
+    let q = |s: &str| format!("\"{s}\"");
+    let runtime = format!(
+        "fn selected() -> &'static str {{ if std::env::var_os(\"ZZ_CONTROL\").is_some() {{ {} }} else {{ {} }} }}\n",
+        q(landed),
+        q(unknown)
+    );
+    // (case, kind, form, token made, refused)
+    let cases: Vec<(&str, &str, String, &str, bool)> = vec![
+        (
+            "relative",
+            "ctor",
+            direct("envcloak_client::fail::Failure::new", &q(reserved)),
+            reserved,
+            true,
+        ),
+        (
+            "absolute",
+            "ctor",
+            direct("::envcloak_client::fail::Failure::new", &q(reserved)),
+            reserved,
+            true,
+        ),
+        (
+            "qualified_absolute",
+            "ctor",
+            direct("<::envcloak_client::fail::Failure>::new", &q(reserved)),
+            reserved,
+            true,
+        ),
+        (
+            "qualified_relative",
+            "ctor",
+            direct("<envcloak_client::fail::Failure>::new", &q(reserved)),
+            reserved,
+            true,
+        ),
+        (
+            "absolute_unknown",
+            "ctor",
+            direct("::envcloak_client::fail::Failure::new", &q(unknown)),
+            unknown,
+            true,
+        ),
+        (
+            "absolute_runtime",
+            "ctor",
+            direct("::envcloak_client::fail::Failure::new", "selected()") + &runtime,
+            unknown,
+            true,
+        ),
+        (
+            "absolute_crate_alias",
+            "ctor",
+            "extern crate envcloak_client as ec;\n".to_owned()
+                + &direct("::ec::fail::Failure::new", &q(reserved)),
+            reserved,
+            true,
+        ),
+        (
+            "absolute_landed",
+            "ctor",
+            direct("::envcloak_client::fail::Failure::new", &q(landed)),
+            landed,
+            false,
+        ),
+        (
+            "self",
+            "self",
+            format!("Self::new({}, String::new())", q(reserved)),
+            reserved,
+            true,
+        ),
+        (
+            "self_qualified",
+            "self",
+            format!("<Self>::new({}, String::new())", q(reserved)),
+            reserved,
+            true,
+        ),
+        (
+            "self_qualified_unknown",
+            "self",
+            format!("<Self>::new({}, String::new())", q(unknown)),
+            unknown,
+            true,
+        ),
+        (
+            "self_qualified_landed",
+            "self",
+            format!("<Self>::new({}, String::new())", q(landed)),
+            landed,
+            false,
+        ),
+        (
+            "self_receiver_runtime",
+            "receiver",
+            "<Self>::new(name, String::new())".to_owned(),
+            unknown,
+            true,
+        ),
+        // A module outside `src/` first: with `#[path]` not refused, it is
+        // the one no reading of the tree reaches.
+        (
+            "path_outside_src",
+            "module",
+            "../../../extra/hidden.rs".to_owned(),
+            reserved,
+            true,
+        ),
+        (
+            "path_outside_src_landed",
+            "module",
+            "../../../extra/hidden.rs".to_owned(),
+            landed,
+            true,
+        ),
+        (
+            "path_beside",
+            "module",
+            "hidden.rs".to_owned(),
+            reserved,
+            true,
+        ),
+        (
+            "path_subdirectory",
+            "module",
+            "regular/hidden.rs".to_owned(),
+            reserved,
+            true,
+        ),
+        (
+            "path_linked_directory",
+            "module",
+            "linked/hidden.rs".to_owned(),
+            reserved,
+            true,
+        ),
+        (
+            "path_linked_file",
+            "module",
+            "hidden.rs".to_owned(),
+            reserved,
+            true,
+        ),
+    ];
+    let t = fixture();
+    let root = t.home();
+    let src = root.join("crates/envcloak-client/src");
+    let fail = src.join("fail.rs");
+    let original = std::fs::read_to_string(&fail).unwrap();
+    assert_eq!(original.matches("impl Failure {").count(), 1);
+    let stub = src.join("zz_oracle.rs");
+    let outside = root.join("probe");
+    std::fs::create_dir_all(&outside).unwrap();
+    for (label, kind, form, token, refused) in cases {
+        std::fs::write(&fail, &original).unwrap();
+        for name in ["hidden.rs", "linked"] {
+            let p = src.join(name);
+            if std::fs::symlink_metadata(&p).is_ok() {
+                std::fs::remove_file(&p).unwrap();
+            }
+        }
+        for dir in [src.join("regular"), root.join("extra")] {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+        }
+        if stub.exists() {
+            std::fs::remove_file(&stub).unwrap();
+        }
+        let assert_token =
+            |e: &str| format!("fn main() {{ assert_eq!(({e}).token(), {}); }}\n", q(token));
+        let main = match kind {
+            "ctor" => {
+                std::fs::write(&stub, form.clone() + &assert_token("make()")).unwrap();
+                stub.clone()
+            }
+            "self" | "receiver" => {
+                let (method, e) = if kind == "self" {
+                    (
+                        format!("    pub fn zz_oracle() -> Self {{ {form} }}\n"),
+                        "fail_copy::Failure::zz_oracle()".to_owned(),
+                    )
+                } else {
+                    (
+                        format!(
+                            "    pub fn zz_oracle(&self, name: &'static str) -> Self {{ {form} }}\n"
+                        ),
+                        format!(
+                            "fail_copy::Failure::new({}, String::new()).zz_oracle({})",
+                            q(landed),
+                            q(token)
+                        ),
+                    )
+                };
+                std::fs::write(
+                    &fail,
+                    original.replacen("impl Failure {", &format!("impl Failure {{\n{method}"), 1),
+                )
+                .unwrap();
+                // The consumer is outside the tree the checker reads: only
+                // the method put in fail.rs is checked.
+                let main = outside.join("self.rs");
+                std::fs::write(
+                    &main,
+                    format!(
+                        "#![allow(dead_code)]\n#[path = {:?}]\nmod fail_copy;\n{}",
+                        fail.display().to_string(),
+                        assert_token(&e)
+                    ),
+                )
+                .unwrap();
+                main
+            }
+            _ => {
+                let hidden = direct("envcloak_client::fail::Failure::new", &q(token));
+                match label {
+                    "path_outside_src"
+                    | "path_outside_src_landed"
+                    | "path_linked_directory"
+                    | "path_linked_file" => {
+                        std::fs::create_dir_all(root.join("extra")).unwrap();
+                        std::fs::write(root.join("extra/hidden.rs"), &hidden).unwrap();
+                        if label == "path_linked_directory" {
+                            std::os::unix::fs::symlink(root.join("extra"), src.join("linked"))
+                                .unwrap();
+                        } else if label == "path_linked_file" {
+                            std::os::unix::fs::symlink(
+                                root.join("extra/hidden.rs"),
+                                src.join("hidden.rs"),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    "path_subdirectory" => {
+                        std::fs::create_dir_all(src.join("regular")).unwrap();
+                        std::fs::write(src.join("regular/hidden.rs"), &hidden).unwrap();
+                    }
+                    _ => std::fs::write(src.join("hidden.rs"), &hidden).unwrap(),
+                }
+                std::fs::write(
+                    &stub,
+                    format!(
+                        "#[path = {form:?}]\nmod hidden;\n{}",
+                        assert_token("hidden::make()")
+                    ),
+                )
+                .unwrap();
+                stub.clone()
+            }
+        };
+        compile_and_run(&main, &libs, &deps, label);
+        let out = run(&root);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if refused {
+            assert_eq!(out.status.code(), Some(1), "{label} passed: {stderr}");
+            let why = if kind == "module" && label.starts_with("path_linked") {
+                "is a symbolic link".to_owned()
+            } else if kind == "module" {
+                "a `#[path]` attribute".to_owned()
+            } else if label.ends_with("runtime") {
+                "a failure token the reader cannot read".to_owned()
+            } else {
+                format!("`{token}`")
+            };
+            assert!(
+                stderr.contains(&why),
+                "{label}: expected {why:?} in: {stderr}"
+            );
+        } else {
+            assert!(out.status.success(), "{label} was refused: {stderr}");
+        }
+    }
 }
