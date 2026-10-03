@@ -267,6 +267,57 @@ impl Fixture {
         self.cs.push(issuer);
     }
 
+    /// Adds `fixture/editor`, a login whose every field is a fixture of
+    /// its own (which every sweep then looks for), before the daemon
+    /// starts, as `login.add` (M2b-03) will.
+    fn add_a_login(&mut self) {
+        use envcloak_core::SecretBytes;
+        use envcloak_core::vault::{
+            ItemDetails, LockedVault, LoginMeta, LoginTier, NewLogin, Slug, TotpAlgorithm,
+            TotpEnrollment, TotpParams, VaultPaths,
+        };
+        assert!(self.d.is_none(), "items are added before the daemon starts");
+        let login: Vec<Canary> = ["USERNAME", "PASSWORD", "TOTP_SEED", "ADAPTER_KEY"]
+            .into_iter()
+            .map(|label| {
+                Canary::new(
+                    format!("LOGIN_{label}"),
+                    format!("login-{}-{:016x}", label.to_ascii_lowercase(), fresh_seed()),
+                )
+            })
+            .collect();
+        let value = |n: usize| SecretBytes::copy_from(login[n].value());
+        let pass = SecretBytes::copy_from(by_label(&self.cs, labels::VAULT_PASSPHRASE).value());
+        let mut v = LockedVault::open(&VaultPaths::under(common::data_dir(&self.home)))
+            .unwrap()
+            .unlock_with_passphrase(&pass)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        v.transact(|t| {
+            t.create_login(NewLogin {
+                slug: Slug::new("fixture/editor").unwrap(),
+                details: ItemDetails {
+                    title: "fixture editor".into(),
+                    ..ItemDetails::default()
+                },
+                meta: LoginMeta {
+                    tier: LoginTier::Dev,
+                    session_lifetime: 900,
+                },
+                username: value(0),
+                password: value(1),
+                totp: Some(TotpEnrollment {
+                    params: TotpParams::new(TotpAlgorithm::Sha1, 6, 30).unwrap(),
+                    seed: value(2),
+                }),
+                adapter_key: Some(value(3)),
+            })
+        })
+        .unwrap();
+        drop(v);
+        self.cs.extend(login);
+    }
+
     /// With a vault on disk and no daemon running.
     fn without_daemon() -> Self {
         let cs = canaries(fresh_seed());
@@ -2535,6 +2586,81 @@ fn items_that_are_not_secrets_are_named_only_and_never_bound() {
         std::fs::read(&manifest_path).unwrap() == manifest,
         "a refused binding changed envcloak.toml"
     );
+    m.finish();
+    f.sweep();
+}
+
+/// Gate b18 through the MCP server (plan task M2-07, SPEC §6.8 "Login
+/// fields are typed"): a login is named and never bound. `list_secrets`
+/// shows it by its slug and class alone; `add_reference` refuses it,
+/// with or without a field, as `login_reference`, before envcloak.toml
+/// is touched; and `run_with_secrets` in a project whose manifest binds
+/// one of its fields is refused `login_reference` by `envcloak run`, the
+/// command never started. Its values are in every sweep.
+///
+/// Mutations checked: `bind_items` mapping a login to a secret: the run
+/// starts (its marker is written) and this fails; `add_reference` without
+/// its login branch: the token is `not_secret` and this fails.
+#[test]
+fn b18_a_login_is_named_only_and_never_bound_or_run() {
+    let mut f = Fixture::without_daemon();
+    f.add_a_login();
+    f.start_daemon();
+    let mut m = Mcp::start(&f.home, &f.project, &["--wait-ms", "1000"], &f.cs);
+    m.initialize();
+    let dir = f.project.to_str().unwrap();
+    let list = structured(&m.call("list_secrets", json!({"project_dir": dir}))).clone();
+    let item = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["slug"] == "fixture/editor")
+        .unwrap_or_else(|| panic!("the login is not listed: {list}"));
+    assert_eq!(
+        item,
+        &json!({"slug": "fixture/editor", "class": "login", "provider": null,
+                "classification": "unknown", "fields": [], "exposed": null}),
+        "{list}"
+    );
+
+    let manifest_path = f.project.join("envcloak.toml");
+    let manifest = std::fs::read(&manifest_path).unwrap();
+    for reference in [
+        "fixture/editor",
+        "fixture/editor#username",
+        "fixture/editor#password",
+        "fixture/editor#totp",
+        "fixture/editor#adapter_key",
+    ] {
+        let r = m.call(
+            "add_reference",
+            json!({"project_dir": dir, "env_name": "PASSWORD", "slug": reference}),
+        );
+        assert_eq!(failed(&r), "login_reference", "{reference}: {r}");
+    }
+    assert!(
+        std::fs::read(&manifest_path).unwrap() == manifest,
+        "a refused binding changed envcloak.toml"
+    );
+    m.finish();
+
+    let bound = project(
+        &f.home,
+        "login-bound",
+        "[env]\nOPENAI_API_KEY = \"openai/acme-web\"\nPASSWORD = \"fixture/editor#password\"\n",
+    );
+    let marker = bound.join("started");
+    let mut m = Mcp::start(&f.home, &bound, &["--wait-ms", "1000"], &f.cs);
+    m.initialize();
+    let r = m.call(
+        "run_with_secrets",
+        json!({"project_dir": bound.to_str().unwrap(),
+               "argv": ["/usr/bin/touch", marker.to_str().unwrap()]}),
+    );
+    let s = structured(&r);
+    assert_eq!(s["status"], "refused", "{s}");
+    assert_eq!(s["token"], "login_reference", "{s}");
+    assert!(!marker.exists(), "the command started");
     m.finish();
     f.sweep();
 }

@@ -736,6 +736,8 @@ pub enum ItemClassView {
     Secret,
     Card,
     IssuerCredential,
+    /// A login (SPEC §6.8): typed fields, never bound to a variable.
+    Login,
     /// A class this build does not know.
     Other,
 }
@@ -746,7 +748,8 @@ impl From<ItemClass> for ItemClassView {
             ItemClass::Secret => ItemClassView::Secret,
             ItemClass::Card => ItemClassView::Card,
             ItemClass::IssuerCredential => ItemClassView::IssuerCredential,
-            ItemClass::Login | ItemClass::None => ItemClassView::Other,
+            ItemClass::Login => ItemClassView::Login,
+            ItemClass::None => ItemClassView::Other,
         }
     }
 }
@@ -919,6 +922,8 @@ pub enum RefStatus {
     CardReference,
     IssuerCredentialReference,
     UnknownItemClass,
+    /// The reference names a login's field (SPEC §6.8).
+    LoginReference,
     /// Not `NAME=<slug>[#field]`.
     InvalidReference,
     /// A name or reference shaped like a key rather than a name: most

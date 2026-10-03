@@ -161,6 +161,7 @@ fn status_of(k: BindErrorKind) -> RefStatus {
         BindErrorKind::NoField => RefStatus::NoField,
         BindErrorKind::CardReference => RefStatus::CardReference,
         BindErrorKind::IssuerCredentialReference => RefStatus::IssuerCredentialReference,
+        BindErrorKind::LoginReference => RefStatus::LoginReference,
         _ => RefStatus::UnknownItemClass,
     }
 }

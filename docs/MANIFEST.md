@@ -140,7 +140,7 @@ A name or reference shaped like a key is reported without its text. The exit is 
 
 Errors are value-free. A manifest error is a kind and a place (a manifest line, a `--ref` argument's position or an env-file line); an env-file error is a kind and a line. The TOML library's own messages quote the source, so they are never passed on: a syntax error reports `not valid TOML` and its line. A binding that cannot be tied to an item names its variable and the kind, not the reference.
 
-`envcloak run` prints one token for each (SPEC §6.1 step 9): `manifest_invalid` for the manifest, its path, and references to cards and other classes; `binding_unresolved` for `--profile`, `--ref`, `--env-file` and references to missing items or fields.
+`envcloak run` prints one token for each (SPEC §6.1 step 9): `manifest_invalid` for the manifest, its path, and references to cards and other classes; `login_reference` for a reference to a login's field, in the manifest or a `--ref` (SPEC §6.8: login fields are typed, and only a sign-in opens them); `binding_unresolved` for `--profile`, `--ref`, `--env-file` and references to missing items or fields. `envcloak ref` refuses a reference to a login's field too, `login_reference`, and writes nothing, when the daemon answers; without one it cannot know the item's class, and the binding written is refused at the next `run`.
 
 ## Gates
 

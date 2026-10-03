@@ -3,9 +3,14 @@
 //! what grants compare (SPEC §10b "Match" rule 6), and that refuses a
 //! reference to anything but a secret (SPEC §5, gate 17). A slug does not
 //! say its item's class, so a reference to a card or an issuer credential
-//! parses, and this is where it is rejected (`manifest_invalid`). The
-//! daemon's `run.request` takes the item ids it releases only from
-//! [`bind_items`].
+//! parses, and this is where it is rejected (`manifest_invalid`). So is a
+//! reference to a login's field (SPEC §6.8 "Login fields are typed"), with
+//! a token of its own, `login_reference`: `run`, `ref`, `add_reference` and
+//! `run_with_secrets` all bind through here, so none of them ever binds a
+//! login's username, password, TOTP enrollment or adapter key. The match on
+//! the class has no wildcard: a class added later fails to compile here
+//! until it is decided. The daemon's `run.request` takes the item ids it
+//! releases only from [`bind_items`].
 
 use envcloak_core::crypto::ItemClass;
 use envcloak_core::vault::{Classification, FieldId, ItemId, ItemMeta};
@@ -40,6 +45,9 @@ pub enum BindErrorKind {
     IssuerCredentialReference,
     /// The item's class is not one this version resolves.
     UnknownItemClass,
+    /// The item is a login (SPEC §6.8): its fields are typed, and only a
+    /// sign-in attempt opens them.
+    LoginReference,
 }
 
 impl BindErrorKind {
@@ -54,6 +62,7 @@ impl BindErrorKind {
             K::CardReference => "card_reference",
             K::IssuerCredentialReference => "issuer_credential_reference",
             K::UnknownItemClass => "unknown_item_class",
+            K::LoginReference => "login_reference",
         }
     }
 
@@ -69,6 +78,10 @@ impl BindErrorKind {
                 "the reference names an issuer credential, which is never bound to a variable"
             }
             K::UnknownItemClass => "the reference names an item of a class that cannot be bound",
+            K::LoginReference => {
+                "the reference names a login's field, which is never bound to a variable: only a \
+                 sign-in opens it"
+            }
         }
     }
 }
@@ -91,10 +104,13 @@ impl BindError {
     }
 
     /// The stable token `envcloak run` prints (SPEC §6.1 step 9). A
-    /// reference to an item of the wrong class makes the manifest invalid
-    /// (SPEC §5); anything else leaves the binding unresolved.
+    /// reference to a login's field is `login_reference` (its own error
+    /// kind, docs/IPC.md); one to an item of another wrong class makes the
+    /// manifest invalid (SPEC §5); anything else leaves the binding
+    /// unresolved.
     pub fn token(&self) -> &'static str {
         match self.kind {
+            BindErrorKind::LoginReference => "login_reference",
             BindErrorKind::CardReference
             | BindErrorKind::IssuerCredentialReference
             | BindErrorKind::UnknownItemClass => "manifest_invalid",
@@ -135,7 +151,8 @@ fn bind_one(b: &Binding, items: &[ItemMeta]) -> Result<BoundBinding, BindError> 
         ItemClass::Secret => {}
         ItemClass::Card => return Err(fail(BindErrorKind::CardReference)),
         ItemClass::IssuerCredential => return Err(fail(BindErrorKind::IssuerCredentialReference)),
-        ItemClass::Login | ItemClass::None => return Err(fail(BindErrorKind::UnknownItemClass)),
+        ItemClass::Login => return Err(fail(BindErrorKind::LoginReference)),
+        ItemClass::None => return Err(fail(BindErrorKind::UnknownItemClass)),
     }
     let field = match &b.reference.field {
         Some(name) => item

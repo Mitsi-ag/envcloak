@@ -24,7 +24,7 @@ use common::{MANIFEST, SLUGS, client, data_dir, passphrase, project, seed_vault,
 use envcloak_core::SecretBytes;
 use envcloak_core::vault::VaultPaths;
 use envcloak_ipc::proto::{EnvFileLine, EnvFileParams, ErrorKind, RunRequestParams};
-use envcloak_ipc::view::{DecisionView, VaultState};
+use envcloak_ipc::view::{DecisionView, ItemClassView, RefStatus, VaultState};
 use envcloak_ipc::{Client, ClientError};
 use envcloak_policy::{
     ApprovalOptions, DenyReason, FREE_ATTEMPTS, GrantId, MAX_PENDING_PER_ROOT, PendingId,
@@ -1321,6 +1321,154 @@ fn a_reference_to_a_card_is_rejected_when_bound() {
         DecisionView::Pending { .. }
     ));
     assert_eq!(c.status().unwrap().approvals.pending, 1);
+    drop(c);
+    assert_no_canary(&d.log_bytes(), &cs);
+    home.assert_clean(&cs);
+}
+
+/// Gate b18's `run` and `ref` part (plan task M2-07, SPEC §6.8 "Login
+/// fields are typed"): a login planted through the core API, its every
+/// field named by a manifest (alone, beside a secret, in a profile) or a
+/// `--ref`, with or without a field, is refused by `run.request` as
+/// `login_reference`, its own kind with no reason, before any request is
+/// pending; `items.check`, which `envcloak ref`, `add_reference` and
+/// `list_secrets` ask, says `login_reference` for each. No login value is
+/// in an answer, the daemon's log or the test home, and the story's
+/// manifest still opens a request.
+#[test]
+fn b18_a_reference_to_a_login_field_is_refused_when_bound() {
+    common::terminal_session();
+    let mut cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let kit = seed_vault(&home, &cs);
+    cs.push(kit);
+    let login: Vec<Canary> = ["USERNAME", "PASSWORD", "TOTP_SEED", "ADAPTER_KEY"]
+        .into_iter()
+        .map(|label| {
+            Canary::new(
+                format!("LOGIN_{label}"),
+                format!("login-{}-{:016x}", label.to_ascii_lowercase(), fresh_seed()),
+            )
+        })
+        .collect();
+    {
+        use envcloak_core::vault::{
+            ItemDetails, LockedVault, LoginMeta, LoginTier, NewLogin, Slug, TotpAlgorithm,
+            TotpEnrollment, TotpParams,
+        };
+        let value = |n: usize| SecretBytes::copy_from(login[n].value());
+        let mut v = LockedVault::open(&VaultPaths::under(data_dir(&home)))
+            .unwrap()
+            .unlock_with_passphrase(&passphrase(&cs))
+            .map_err(|(_, e)| e)
+            .unwrap();
+        v.transact(|t| {
+            t.create_login(NewLogin {
+                slug: Slug::new("fixture/editor").unwrap(),
+                details: ItemDetails {
+                    title: "fixture editor".into(),
+                    ..ItemDetails::default()
+                },
+                meta: LoginMeta {
+                    tier: LoginTier::Dev,
+                    session_lifetime: 900,
+                },
+                username: value(0),
+                password: value(1),
+                totp: Some(TotpEnrollment {
+                    params: TotpParams::new(TotpAlgorithm::Sha1, 6, 30).unwrap(),
+                    seed: value(2),
+                }),
+                adapter_key: Some(value(3)),
+            })
+        })
+        .unwrap();
+    }
+    cs.extend(login);
+    let d = start(&home);
+    let mut c = client(&home);
+    c.unlock(passphrase(&cs), &[]).unwrap();
+    let story = project(&home, "acme-web", MANIFEST);
+    let ask = |manifest: &std::path::Path, profile: Option<&str>, refs: &[&str]| {
+        client(&home).run_request(&RunRequestParams {
+            manifest: manifest.to_str().unwrap().to_owned(),
+            profile: profile.map(str::to_owned),
+            refs: refs.iter().map(|r| (*r).to_owned()).collect(),
+            env_file: None,
+            argv: vec!["./emit".to_owned()],
+            claims: Vec::new(),
+        })
+    };
+    let references = [
+        "fixture/editor",
+        "fixture/editor#username",
+        "fixture/editor#password",
+        "fixture/editor#totp",
+        "fixture/editor#adapter_key",
+        "fixture/editor#value",
+    ];
+    let mut cases: Vec<(std::path::PathBuf, Option<&str>, Vec<String>)> = Vec::new();
+    for (n, reference) in references.iter().enumerate() {
+        cases.push((
+            project(
+                &home,
+                &format!("login-only-{n}"),
+                &format!("[env]\nPASSWORD = \"{reference}\"\n"),
+            ),
+            None,
+            Vec::new(),
+        ));
+        cases.push((
+            project(
+                &home,
+                &format!("login-profile-{n}"),
+                &format!(
+                    "[env]\nOPENAI_API_KEY = \"openai/acme-web\"\n[env.e2e]\nPASSWORD = \"{reference}\"\n"
+                ),
+            ),
+            Some("e2e"),
+            Vec::new(),
+        ));
+        cases.push((story.clone(), None, vec![format!("PASSWORD={reference}")]));
+    }
+    for (manifest, profile, refs) in &cases {
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        let e = ask(manifest, *profile, &refs).unwrap_err();
+        let shown = format!("{e:?}");
+        assert_eq!(
+            rpc_kind(e),
+            (ErrorKind::LoginReference, None),
+            "{manifest:?} {profile:?} {refs:?}"
+        );
+        assert_no_canary(shown.as_bytes(), &cs);
+    }
+    let st = c.status().unwrap();
+    assert_eq!((st.approvals.grants, st.approvals.pending), (0, 0));
+
+    let refs: Vec<String> = references.iter().map(|r| format!("PASSWORD={r}")).collect();
+    let checked = c.items_check(None, &refs).unwrap();
+    assert_eq!(checked.refs, vec![RefStatus::LoginReference; refs.len()]);
+    let checked = c
+        .items_check(Some(cases[0].0.to_str().unwrap()), &[])
+        .unwrap();
+    assert_eq!(checked.bindings.len(), 1);
+    assert_eq!(checked.bindings[0].status, RefStatus::LoginReference);
+    assert_no_canary(format!("{checked:?}").as_bytes(), &cs);
+    // The listing names the login and its typed fields, and no value.
+    let listed = c.items_list(true).unwrap();
+    let item = listed
+        .items
+        .iter()
+        .find(|i| i.slug == "fixture/editor")
+        .unwrap();
+    assert_eq!(item.class, ItemClassView::Login);
+    assert_no_canary(format!("{listed:?}").as_bytes(), &cs);
+
+    // The story's manifest, on the same vault, opens a request.
+    assert!(matches!(
+        ask(&story, None, &[]).unwrap().decision,
+        DecisionView::Pending { .. }
+    ));
     drop(c);
     assert_no_canary(&d.log_bytes(), &cs);
     home.assert_clean(&cs);

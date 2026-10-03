@@ -88,9 +88,9 @@ use envcloak_ipc::view::{
 };
 use envcloak_ipc::{Frame, RpcError, WireSecret};
 use envcloak_policy::{
-    AccessRequest, ApprovalProof, ApproveError, BindError, Binding, BoundRef, Claims, Decision,
-    DenyReason, EvidenceError, GrantId, ManifestError, Mode, PENDING_TTL, Pending,
-    PendingDescriptor, PendingId, PendingState, ProcessInstance, ProfileName, ProofKind,
+    AccessRequest, ApprovalProof, ApproveError, BindError, BindErrorKind, Binding, BoundRef,
+    Claims, Decision, DenyReason, EvidenceError, GrantId, ManifestError, Mode, PENDING_TTL,
+    Pending, PendingDescriptor, PendingId, PendingState, ProcessInstance, ProfileName, ProofKind,
     RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy, bind_items,
     effective_policy, gather, load_project, resolve,
 };
@@ -187,12 +187,15 @@ fn manifest_error(e: ManifestError) -> RpcError {
 }
 
 fn bind_error(e: &BindError) -> RpcError {
-    let kind = if e.token() == "binding_unresolved" {
-        ErrorKind::BindingUnresolved
-    } else {
-        ErrorKind::ManifestInvalid
-    };
-    RpcError::with_reason(kind, e.kind().token())
+    match e.kind() {
+        // Its own kind, with no reason: a login's field is refused as such
+        // (SPEC §6.8), never taken for a manifest error or a missing item.
+        BindErrorKind::LoginReference => RpcError::new(ErrorKind::LoginReference),
+        k if e.token() == "binding_unresolved" => {
+            RpcError::with_reason(ErrorKind::BindingUnresolved, k.token())
+        }
+        k => RpcError::with_reason(ErrorKind::ManifestInvalid, k.token()),
+    }
 }
 
 fn approve_error(e: ApproveError) -> RpcError {
