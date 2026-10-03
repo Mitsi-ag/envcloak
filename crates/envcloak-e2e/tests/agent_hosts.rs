@@ -44,20 +44,42 @@ fn the_network_is_what_ci_says() {
     envcloak_e2e::check_network();
 }
 
-/// A Mach-O file that imports every entry of
-/// [`envcloak_e2e::OPEN_RESOLVERS`] by that very name, built with the
-/// system's C compiler (each symbol left for the loader to find, so no
-/// framework need be linked): the guard's positive control, one per
-/// entry. Its directory goes with the result.
+/// One entry point of each way to resolve a name that the isolation
+/// leaves open on macOS, written out here from the frameworks' headers,
+/// apart from the guard's own table ([`envcloak_e2e::OPEN_RESOLVERS`]),
+/// so an entry left out of that table fails its control (Codex review of
+/// M2-RES1: the controls were built from the table itself):
+/// Network.framework's connections and resolver configuration, libdnssd's
+/// XPC lookup, CFNetwork's host lookup, its socket streams to a named
+/// host and its two HTTP streams, and URLSession's and NSURLConnection's
+/// classes. The guard's unit test in `network.rs` writes the same names.
+const OPEN_RESOLVER_ENTRY_POINTS: [&str; 10] = [
+    "_nw_connection_create",
+    "_nw_resolver_config_create_https",
+    "_dnssd_getaddrinfo_create",
+    "_CFHostStartInfoResolution",
+    "_CFStreamCreatePairWithSocketToHost",
+    "_CFStreamCreatePairWithSocketToCFHost",
+    "_CFReadStreamCreateForHTTPRequest",
+    "_CFReadStreamCreateForStreamedHTTPRequest",
+    "_OBJC_CLASS_$_NSURLSession",
+    "_OBJC_CLASS_$_NSURLConnection",
+];
+
+/// A Mach-O file that imports every one of [`OPEN_RESOLVER_ENTRY_POINTS`]
+/// by that very name, built with the system's C compiler (each symbol
+/// left for the loader to find, so no framework need be linked): the
+/// guard's positive control, one per entry point. Its directory goes with
+/// the result.
 fn importer_of_every_open_resolver() -> (tempfile::TempDir, std::path::PathBuf) {
     use std::fmt::Write as _;
     let dir = tempfile::tempdir().unwrap();
     let mut c = String::new();
-    for (i, sym) in envcloak_e2e::OPEN_RESOLVERS.iter().enumerate() {
+    for (i, sym) in OPEN_RESOLVER_ENTRY_POINTS.iter().enumerate() {
         writeln!(c, "extern char s{i} __asm__(\"{sym}\");").unwrap();
     }
     c.push_str("int main(void) { volatile const void *p[] = {");
-    for i in 0..envcloak_e2e::OPEN_RESOLVERS.len() {
+    for i in 0..OPEN_RESOLVER_ENTRY_POINTS.len() {
         write!(c, "&s{i}, ").unwrap();
     }
     c.push_str("0}; return p[0] == 0; }\n");
@@ -97,9 +119,10 @@ fn importer_of_every_open_resolver() -> (tempfile::TempDir, std::path::PathBuf) 
 /// docs/ACCEPTANCE.md.
 ///
 /// Mutations checked: the guard matching no import (`filter` never
-/// true): the controls are not found and this fails. An entry left out of
-/// the guard (URLSession's class, as the verifier of M2-RES1 found): its
-/// control is not found and this fails.
+/// true): the controls are not found and this fails. Each entry left out
+/// of the guard in turn (URLSession's class, as the verifier of M2-RES1
+/// found, among them): its entry point, written out here apart from the
+/// guard's table, is not found and this fails.
 #[test]
 fn no_pinned_host_imports_a_resolver_the_isolation_leaves_open() {
     if !cfg!(target_os = "macos") {
@@ -111,7 +134,7 @@ fn no_pinned_host_imports_a_resolver_the_isolation_leaves_open() {
     }
     let (_dir, importer) = importer_of_every_open_resolver();
     let hits = envcloak_e2e::open_resolver_imports(&importer).unwrap();
-    for entry in envcloak_e2e::OPEN_RESOLVERS {
+    for entry in OPEN_RESOLVER_ENTRY_POINTS {
         assert!(
             hits.iter().any(|(_, sym)| sym == entry),
             "the guard does not find {entry} in a program that imports it: {hits:?}"
@@ -195,7 +218,7 @@ fn the_resolver_guard_reads_every_mach_o_form_and_every_file() {
         };
         assert_eq!(magic, want, "{name}");
         let hits = envcloak_e2e::open_resolver_imports(&out).unwrap();
-        for entry in envcloak_e2e::OPEN_RESOLVERS {
+        for entry in OPEN_RESOLVER_ENTRY_POINTS {
             assert!(
                 hits.iter().any(|(_, sym)| sym == entry),
                 "the guard does not find {entry} in the {name} control: {hits:?}"
