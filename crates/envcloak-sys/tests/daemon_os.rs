@@ -13,8 +13,22 @@ use envcloak_sys::{
     try_lock_exclusive,
 };
 
+/// Held by the test that starts children and by the lock test: a child
+/// forked while the lock test holds its first open file keeps a copy of
+/// that descriptor until it runs its program, so the lock would outlast
+/// the test's own close (a CI failure of M2-RES1's pull request, on
+/// Linux).
+static FORKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn no_forks() -> std::sync::MutexGuard<'static, ()> {
+    FORKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn a_second_open_of_a_locked_file_cannot_lock_it() {
+    let _no_forks = no_forks();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("envcloakd.lock");
     let open = || {
@@ -61,6 +75,7 @@ fn a_blocked_termination_signal_waits_for_sigwait() {
 #[test]
 fn a_child_can_start_with_the_termination_signals_unblocked() {
     use std::os::unix::process::ExitStatusExt;
+    let _forks = no_forks();
     // On a thread of its own, whose mask ends with it.
     std::thread::spawn(|| {
         let _blocked = TerminationSignals::block().unwrap();
