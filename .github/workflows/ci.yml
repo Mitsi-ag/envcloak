@@ -408,6 +408,10 @@ jobs:
           python3 scripts/check-crate-graph.py
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check --workspace --all-targets --all-features --locked
+      # The combined-graph gate (M2 plan F-75, M2-08): the agent catalog,
+      # the scanner, the MCP server and the CLI with no default features
+      # too.
+      - run: cargo check -p envcloak-agents -p envcloak-scan -p envcloak-mcp -p envcloak --all-targets --no-default-features --locked
 
   # Which of the M2 agent jobs a pull request needs, from the paths it
   # changes (scripts/ci-paths.py, which checks its own table of paths
