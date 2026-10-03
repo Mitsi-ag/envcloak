@@ -33,6 +33,10 @@
 //!   the machine slept).
 //! - The CLI's secret input: [`SecretInput`] (a terminal with echo off)
 //!   and [`inherited_fd`] (a descriptor named by `--passphrase-fd`).
+//! - Descriptors a child gets: [`claim_inherited_fd`] (`envcloak run
+//!   --status-fd` takes its status channel), [`close_on_exec_above`]
+//!   (nothing inherited reaches the command), [`inherit_on_spawn`] (one
+//!   descriptor handed to one child) and [`pipe_cloexec`].
 //! - Caller evidence: [`proc_info`] and [`proc_argv`] (one process as the
 //!   kernel reports it) and [`ancestry`] (a peer's parent chain, checked
 //!   again after the walk); [`process_running`] and [`ProcessWatch`]
@@ -92,7 +96,10 @@ pub use dir::{
     read_link_beneath, remove_dir_beneath, rename_beneath, rename_new_beneath, unlink_beneath,
     volume_of,
 };
-pub use fd::{cloexec_flag, inherited_fd};
+pub use fd::{
+    MAX_SWEEP, claim_inherited_fd, cloexec_flag, close_on_exec_above, inherit_on_spawn,
+    inherited_fd, pipe_cloexec,
+};
 pub use fs::open_beneath;
 pub use fsclock::wait_for_clock_past;
 pub use harden::{

@@ -37,7 +37,20 @@
 //!   gets its close-on-exec flag only after it is made, so a child started
 //!   by another worker in between would inherit the pipes of another
 //!   call's child: it could hold that call's output open, or write into
-//!   it what its own `envcloak run` never redacted.
+//!   it what its own `envcloak run` never redacted. The lock covers the
+//!   pipes made here, not every descriptor this server makes (a worker's
+//!   connection to the daemon is made meanwhile, and on macOS a socket too
+//!   gets its flag only after it is made): `envcloak run --status-fd`
+//!   sets the close-on-exec flag on every descriptor it inherited above
+//!   the standard streams before it starts its command, so whatever a
+//!   child of this server inherits by mistake never reaches the command.
+//! - [`run_reporting`] also hands the child the write end of a pipe of its
+//!   own, its status descriptor (`envcloak run --status-fd N`): the flag
+//!   is cleared on it in that child only, after the fork, and this
+//!   server's copy is closed once the child is started, so the end of
+//!   that pipe is the child's exit. What comes through it is the child's
+//!   record of how the run ended ([`Report`]), which the command, never
+//!   holding the descriptor, cannot write.
 //! - Output is kept as its first and last [`OUTPUT_HEAD`] and
 //!   [`OUTPUT_TAIL`] bytes, with a count of what was left out between them
 //!   ([`HeadTail`]); it is read until end of stream, or for [`DRAIN`] after
@@ -330,6 +343,16 @@ pub enum NotRun {
     Spawn,
 }
 
+/// What came through a child's status descriptor ([`run_reporting`]).
+#[derive(Debug, Clone)]
+pub struct Report {
+    /// The bytes read, at most [`OUTPUT_HEAD`]; `None` when more came.
+    pub bytes: Option<Vec<u8>>,
+    /// The pipe ended (every copy of its write end closed) within
+    /// [`DRAIN`] of the child's exit.
+    pub ended: bool,
+}
+
 /// Reads `pipe` into a shared [`HeadTail`] until end of stream; the
 /// receiver hears when it ends.
 fn pump<R: Read + Send + 'static>(pipe: Option<R>) -> (Arc<Mutex<HeadTail>>, mpsc::Receiver<()>) {
@@ -357,20 +380,60 @@ fn pump<R: Read + Send + 'static>(pipe: Option<R>) -> (Arc<Mutex<HeadTail>>, mps
 /// Runs `cmd` as the child of `call` (see the module documentation), and
 /// waits for it: killed at `limit` when one is given, and stopped when
 /// the call is cancelled.
-pub fn run(mut cmd: Command, call: &Call, limit: Option<Duration>) -> Result<Captured, NotRun> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    envcloak_sys::unblock_termination_on_spawn(&mut cmd).map_err(|_| NotRun::Spawn)?;
+pub fn run(cmd: Command, call: &Call, limit: Option<Duration>) -> Result<Captured, NotRun> {
+    follow(|_| cmd, false, call, limit).map(|(captured, _)| captured)
+}
+
+/// [`run`], for a child that reports how it ended on a status descriptor:
+/// `make` builds the command given that descriptor's number, which it
+/// passes on (`envcloak run --status-fd N`). Returns what came through
+/// it with what the child did (see the module documentation).
+pub fn run_reporting(
+    make: impl FnOnce(i32) -> Command,
+    call: &Call,
+    limit: Option<Duration>,
+) -> Result<(Captured, Report), NotRun> {
+    let (captured, report) = follow(|fd| make(fd.unwrap_or(-1)), true, call, limit)?;
+    let report = report.ok_or(NotRun::Spawn)?;
+    Ok((captured, report))
+}
+
+/// Starts the child `make` builds, with a status pipe when `reporting`,
+/// and follows it (see [`run`] and [`run_reporting`]).
+fn follow(
+    make: impl FnOnce(Option<i32>) -> Command,
+    reporting: bool,
+    call: &Call,
+    limit: Option<Duration>,
+) -> Result<(Captured, Option<Report>), NotRun> {
+    use std::os::fd::{AsFd, AsRawFd};
     if call.cancelled() {
         return Err(NotRun::Cancelled);
     }
-    let spawned = {
+    // The pipes are made, and the child started, one child at a time: the
+    // status pipe's write end, like the output pipes, gets its
+    // close-on-exec flag only after it is made on macOS.
+    let (mut child, status) = {
         let _one_at_a_time = lock(&SPAWNING);
-        cmd.spawn()
+        let pipe = if reporting {
+            Some(envcloak_sys::pipe_cloexec().map_err(|_| NotRun::Spawn)?)
+        } else {
+            None
+        };
+        let mut cmd = make(pipe.as_ref().map(|(_, w)| w.as_fd().as_raw_fd()));
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        envcloak_sys::unblock_termination_on_spawn(&mut cmd).map_err(|_| NotRun::Spawn)?;
+        if let Some((_, w)) = &pipe {
+            envcloak_sys::inherit_on_spawn(&mut cmd, w.as_fd()).map_err(|_| NotRun::Spawn)?;
+        }
+        let child = cmd.spawn().map_err(|_| NotRun::Spawn)?;
+        // This server's write end closes here: the child's copy is the
+        // only one left.
+        (child, pipe.map(|(r, _)| std::fs::File::from(r)))
     };
-    let mut child = spawned.map_err(|_| NotRun::Spawn)?;
     let Ok(pid) = i32::try_from(child.id()) else {
         // A pid that does not fit an i32 cannot be signalled as a group;
         // it is reaped and refused.
@@ -381,6 +444,7 @@ pub fn run(mut cmd: Command, call: &Call, limit: Option<Duration>) -> Result<Cap
     let group = Group::new(pid);
     let (out, out_done) = pump(child.stdout.take());
     let (err, err_done) = pump(child.stderr.take());
+    let status = status.map(|r| pump(Some(r)));
     if !call.attach(Arc::clone(&group)) {
         stop(Arc::clone(&group));
     }
@@ -409,6 +473,16 @@ pub fn run(mut cmd: Command, call: &Call, limit: Option<Duration>) -> Result<Cap
         let left = deadline.saturating_duration_since(Instant::now());
         cut |= done.recv_timeout(left).is_err();
     }
+    let report = status.map(|(buf, done)| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let ended = done.recv_timeout(left).is_ok();
+        let read = lock(&buf);
+        let whole = read.left_out() == 0 && read.tail().is_empty();
+        Report {
+            bytes: whole.then(|| read.head().to_vec()),
+            ended,
+        }
+    });
     group.reaping(|| timed_out || call.cancelled());
     let status = child.wait();
     call.detach();
@@ -418,14 +492,15 @@ pub fn run(mut cmd: Command, call: &Call, limit: Option<Duration>) -> Result<Cap
     };
     let stdout = lock(&out).clone();
     let stderr = lock(&err).clone();
-    Ok(Captured {
+    let captured = Captured {
         code,
         signal,
         stdout,
         stderr,
         timed_out,
         cut,
-    })
+    };
+    Ok((captured, report))
 }
 
 #[cfg(test)]

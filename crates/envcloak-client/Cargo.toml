@@ -23,7 +23,9 @@ envcloak-policy.workspace = true
 envcloak-providers.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
-serde.workspace = true
+# `run_status`'s record is read strictly: unknown and doubled fields
+# are refused.
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 # `envcloak ref` edits envcloak.toml in place: comments, order and layout
 # are kept, so it needs the writer as well as the parser.

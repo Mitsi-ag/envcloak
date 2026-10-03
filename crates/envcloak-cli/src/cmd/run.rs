@@ -75,6 +75,20 @@
 //! `not_in_this_build` until its task lands (M2-19), before anything is
 //! sent; after `--` it is the command's.
 //!
+//! `--status-fd N` is for a program that starts `envcloak run` and must
+//! know how it ended (`envcloak mcp`; docs/RUN.md "Status descriptor"):
+//! the command's exit code and output are the command's own, and a
+//! command can exit 125 after printing EnvCloak's own failure line (Codex
+//! F-113). Before anything else, the run takes the inherited descriptor
+//! `N` as its own and sets the close-on-exec flag on it and on every
+//! other descriptor it inherited above the standard streams, so the
+//! command inherits none of them; as it ends, it writes one record there
+//! ([`envcloak_client::run_status`]): refused before the command started
+//! (with the token, and the request id for `approval_required`), the
+//! command's exit, or unknown when the runner failed after the command
+//! may have started. A run without `--status-fd` passes inherited
+//! descriptors on to its command, as `env(1)` does.
+//!
 //! No argument is ever echoed, and no value is ever accepted on the
 //! command line (gate 13): `--ref` names an item, never a value. The
 //! values never enter this process's environment or argv, or a file.
@@ -90,9 +104,10 @@ use std::time::Duration;
 use envcloak_client::claims::claims;
 use envcloak_client::connect::{connect, run_paths};
 use envcloak_client::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, traced, usage};
+use envcloak_client::run_status::{Exit, RunStatus};
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
-use envcloak_exec::{CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
+use envcloak_exec::{ChildExit, CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
 use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunAnswer, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
 use envcloak_ipc::wait::{
@@ -107,7 +122,7 @@ use zeroize::Zeroize;
 
 const USAGE_TEXT: &str = "envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] \
      [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] \
-     -- <cmd...>";
+     [--status-fd N] -- <cmd...>";
 
 /// The parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -122,6 +137,8 @@ struct RunArgs {
     /// `--wait-grace`: how long after the wait's deadline the daemon's
     /// last answer is waited for ([`CALL_GRACE`] when not given).
     wait_grace: Option<Duration>,
+    /// `--status-fd`: the inherited descriptor the status record goes to.
+    status_fd: Option<i32>,
     argv: Vec<String>,
 }
 
@@ -245,6 +262,17 @@ fn parse(args: &[&str]) -> Result<RunArgs, ParseError> {
                     .ok_or("--wait-grace needs a duration from 1s to 5s")?;
                 a.wait_grace = Some(d);
             }
+            Some(&"--status-fd") => {
+                if a.status_fd.is_some() {
+                    return Err("--status-fd is given twice".into());
+                }
+                let n = it
+                    .next()
+                    .and_then(|v| super::fd_number(v))
+                    .filter(|n| *n >= 3)
+                    .ok_or("--status-fd needs a descriptor number of 3 or more")?;
+                a.status_fd = Some(n);
+            }
             // M2's PTY mode, refused before anything is read.
             Some(&"--pty") => return Err(ParseError::NotInThisBuild("`envcloak run --pty`")),
             Some(_) => return Err("unknown option; see envcloak run --help".into()),
@@ -273,17 +301,129 @@ pub fn run(args: &[&str]) -> ExitCode {
             return usage(USAGE_TEXT);
         }
     };
+    // The status descriptor is taken first, before anything is opened or
+    // started, and with every other inherited descriptor above the
+    // standard streams it is closed on exec: the command never holds it.
+    let mut status = match a.status_fd {
+        None => None,
+        Some(n) => match envcloak_sys::claim_inherited_fd(n) {
+            Ok(fd) => Some(std::fs::File::from(fd)),
+            Err(_) => {
+                eprintln!("envcloak: --status-fd names a descriptor that is not open");
+                return usage(USAGE_TEXT);
+            }
+        },
+    };
+    let ended = if status.is_some() && envcloak_sys::close_on_exec_above(2).is_err() {
+        Ended::refused(
+            Failure::new(
+                "run_failed",
+                "the descriptors this run inherited could not be closed on exec; nothing was \
+                 started",
+            ),
+            RUN_FAILURE,
+        )
+    } else {
+        checked(a)
+    };
+    ended.finish(status.as_mut())
+}
+
+/// How a run ended: what it exits with, and the status record it writes
+/// with `--status-fd`.
+enum Ended {
+    /// EnvCloak's own failure before the command was started: nothing
+    /// ran. `printed` when its line is out already (the wait's
+    /// `approval_required` line, which is the failure at the deadline).
+    NotStarted {
+        failure: Failure,
+        code: u8,
+        request: Option<PendingId>,
+        printed: bool,
+    },
+    /// The command was started and followed to its end.
+    Ran(ChildExit),
+    /// The runner failed after the command may have been started.
+    Lost(ExecError),
+}
+
+impl Ended {
+    /// `failure`, before the command was started, exiting with `code`.
+    fn refused(failure: Failure, code: u8) -> Ended {
+        Ended::NotStarted {
+            failure,
+            code,
+            request: None,
+            printed: false,
+        }
+    }
+
+    /// A runner failure: 127 for a command not found and 126 for one that
+    /// could not be run, as `env(1)` has them, and 125 for EnvCloak's own;
+    /// one after the command may have started is [`Ended::Lost`].
+    fn exec(e: ExecError) -> Ended {
+        if e.may_have_started() {
+            return Ended::Lost(e);
+        }
+        let code = e.exit_code();
+        Ended::refused(Failure::new(e.token(), e.message()), code)
+    }
+
+    /// Prints what is left to print, writes the status record when there
+    /// is a status descriptor, and returns the exit code.
+    fn finish(self, status: Option<&mut std::fs::File>) -> ExitCode {
+        let (record, code) = match self {
+            Ended::NotStarted {
+                failure,
+                code,
+                request,
+                printed,
+            } => {
+                if !printed {
+                    failure.report(code);
+                }
+                let record = RunStatus::NotStarted {
+                    token: failure.token.to_owned(),
+                    request,
+                };
+                (record, code)
+            }
+            Ended::Ran(exit) => {
+                let record = RunStatus::Ran(match exit {
+                    ChildExit::Code(c) => Exit::Code(c),
+                    ChildExit::Signal(s) => Exit::Signal(s),
+                    ChildExit::Stopped(s) => Exit::Stopped(s),
+                });
+                (record, exit.shell_code())
+            }
+            Ended::Lost(e) => {
+                Failure::new(e.token(), e.message()).report(e.exit_code());
+                (RunStatus::Unknown, e.exit_code())
+            }
+        };
+        // A reader that is gone makes the write fail (SIGPIPE is ignored):
+        // the run's exit is the same either way.
+        if let Some(out) = status {
+            let _ = record.write_to(out);
+        }
+        ExitCode::from(code)
+    }
+}
+
+/// The run once the command line is parsed (and the status descriptor
+/// taken).
+fn checked(a: RunArgs) -> Ended {
     // Names only (gate 13): a `--ref` or `--profile` shaped like a key is
     // refused, unechoed, before anything is sent. The command after `--`
     // is the user's own, which the audit entry masks.
     let mut names: Vec<&str> = a.profile.iter().map(String::as_str).collect();
     names.extend(a.refs.iter().flat_map(|r| r.split(['=', '#'])));
     if let Err(f) = super::refuse_value_like(&names) {
-        return f.report(USAGE);
+        return Ended::refused(f, USAGE);
     }
     match request(a) {
-        Ok(code) => code,
-        Err(f) => f.report(RUN_FAILURE),
+        Ok(ended) => ended,
+        Err(f) => Ended::refused(f, RUN_FAILURE),
     }
 }
 
@@ -296,7 +436,7 @@ enum Ask {
     Waiting(Duration, Duration),
 }
 
-fn request(a: RunArgs) -> Result<ExitCode, Failure> {
+fn request(a: RunArgs) -> Result<Ended, Failure> {
     refuse_if_traced()?;
     // Only a verified daemon is ever asked; with none, run says how to
     // start one and starts nothing. A waiting run connects only within its
@@ -329,8 +469,8 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
         }
         // No connection is held while waiting: each step opens its own.
         Ask::Waiting(wait, grace) => match wait_for(&params, wait, grace)? {
-            Some(answer) => answer,
-            None => return Ok(ExitCode::from(RUN_FAILURE)),
+            Ok(answer) => answer,
+            Err(ended) => return Ok(ended),
         },
     };
     let decision = answer.decision;
@@ -339,10 +479,17 @@ fn request(a: RunArgs) -> Result<ExitCode, Failure> {
             // The id is printed only in its canonical form: a program
             // answering in the daemon's place could send anything.
             let id = PendingId::parse(&request).ok_or_else(protocol)?;
-            Err(Failure::new(
-                "approval_required",
-                format!("request={id}: run \"envcloak approve {id}\" in a terminal you control"),
-            ))
+            Ok(Ended::NotStarted {
+                failure: Failure::new(
+                    "approval_required",
+                    format!(
+                        "request={id}: run \"envcloak approve {id}\" in a terminal you control"
+                    ),
+                ),
+                code: RUN_FAILURE,
+                request: Some(id),
+                printed: false,
+            })
         }
         DecisionView::Denied { .. } => {
             let message = decision
@@ -394,15 +541,15 @@ fn found_manifest() -> Result<String, Failure> {
 /// and up to `grace` after that for a last answer, on fresh connections
 /// ([`wait_for_run_with_grace`]), printing the
 /// `approval_required` line once per request and the `too_many_pending`
-/// line once. Returns the deciding answer, or `None` when the wait ended
-/// with nothing decided (still pending at the deadline, expired, or every
-/// place taken): the line already printed is then the failure, and the
-/// run exits 125.
+/// line once. Returns the deciding answer, or how the run ended when the
+/// wait ended with nothing decided (still pending at the deadline,
+/// expired, or every place taken): the line already printed is then the
+/// failure, and the run exits 125.
 fn wait_for(
     params: &RunRequestParams,
     wait: Duration,
     grace: Duration,
-) -> Result<Option<RunAnswer>, Failure> {
+) -> Result<Result<RunAnswer, Ended>, Failure> {
     // SIGINT and SIGTERM end the wait whatever this process was started
     // with, and a SIGHUP not ignored ends it too: an ignored or blocked
     // signal survives `exec` (a shell starts a background job with SIGINT
@@ -442,12 +589,15 @@ fn wait_for(
         grace,
         &mut notice,
     )? {
-        Waited::Answer(answer) => Ok(Some(answer)),
+        Waited::Answer(answer) => Ok(Ok(answer)),
         Waited::Denied(id) => Err(Failure::new(
             "approval_denied",
             format!("request={id} was denied; nothing was started"),
         )),
-        Waited::Expired(_) | Waited::TimedOut(_) | Waited::TooManyPending(_) => Ok(None),
+        Waited::Expired(id) | Waited::TimedOut(id) => {
+            Ok(Err(printed_already("approval_required", Some(id))))
+        }
+        Waited::TooManyPending(_) => Ok(Err(printed_already("too_many_pending", None))),
         // A tracer attached while it waited: no request that could carry
         // values was sent.
         Waited::Traced => Err(traced()),
@@ -462,14 +612,25 @@ fn wait_for(
     }
 }
 
+/// A wait that ended with nothing decided: the line it printed for the
+/// request (or for the pending cap), `token`'s, is the failure.
+fn printed_already(token: &'static str, request: Option<PendingId>) -> Ended {
+    Ended::NotStarted {
+        failure: Failure::new(token, ""),
+        code: RUN_FAILURE,
+        request,
+        printed: true,
+    }
+}
+
 /// Runs `argv` with the released values and the env file's ordinary
-/// variables in its environment, its output redacted. Returns the
-/// command's exit code.
+/// variables in its environment, its output redacted. Returns how the
+/// run ended.
 fn start(
     values: Vec<ReleasedValue>,
     plain: Vec<PlainVar>,
     argv: Vec<String>,
-) -> Result<ExitCode, Failure> {
+) -> Result<Ended, Failure> {
     let mut bound: Vec<(EnvName, Slug, SecretBytes, ShortPolicy)> =
         Vec::with_capacity(values.len());
     for v in values {
@@ -496,7 +657,7 @@ fn start(
     let (redactor, report) = match built {
         Ok(b) => b,
         Err(ExecError::ValueTooShort(r)) => return Err(too_short(&r)),
-        Err(e) => return Ok(exec_failure(&e)),
+        Err(e) => return Ok(Ended::exec(e)),
     };
     // Gate 12: a test build panics here on request, holding the values and
     // the redactor built from them.
@@ -524,8 +685,8 @@ fn start(
         out(std::io::stderr().as_fd())?,
     );
     match envcloak_exec::run(spec) {
-        Ok(exit) => Ok(ExitCode::from(exit.shell_code())),
-        Err(e) => Ok(exec_failure(&e)),
+        Ok(exit) => Ok(Ended::Ran(exit)),
+        Err(e) => Ok(Ended::exec(e)),
     }
 }
 
@@ -540,13 +701,6 @@ fn too_short(r: &CoverageReport) -> Failure {
             slugs.join(", ")
         ),
     )
-}
-
-/// Reports a runner failure with its exit code: 127 for a command not
-/// found and 126 for one that could not be run, as `env(1)` has them, and
-/// 125 for EnvCloak's own.
-fn exec_failure(e: &ExecError) -> ExitCode {
-    Failure::new(e.token(), e.message()).report(e.exit_code())
 }
 
 /// What the redactor covers less than fully, one line per item on
@@ -725,9 +879,27 @@ mod tests {
                 "true",
             ],
             &["--wait-grace", "1s", "--", "true"],
+            // A --status-fd that is not a descriptor number of 3 or more,
+            // or given twice.
+            &["--status-fd"],
+            &["--status-fd", "--", "true"],
+            &["--status-fd", "2", "--", "true"],
+            &["--status-fd", "0", "--", "true"],
+            &["--status-fd", "-3", "--", "true"],
+            &["--status-fd", "3x", "--", "true"],
+            &["--status-fd", "3", "--status-fd", "4", "--", "true"],
         ] {
             assert!(matches!(parse(bad), Err(ParseError::Usage(_))), "{bad:?}");
         }
+        assert_eq!(
+            parse(&["--wait", "8s", "--status-fd", "7", "--", "true"]).unwrap(),
+            RunArgs {
+                wait: Some(Duration::from_secs(8)),
+                status_fd: Some(7),
+                argv: vec!["true".into()],
+                ..RunArgs::default()
+            }
+        );
         assert_eq!(
             parse(&["--wait-grace", "1s", "--wait", "7s", "--", "true"]).unwrap(),
             RunArgs {
