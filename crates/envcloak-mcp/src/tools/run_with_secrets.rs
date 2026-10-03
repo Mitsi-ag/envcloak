@@ -785,6 +785,24 @@ mod tests {
         assert!(!text.contains("not read past here"));
     }
 
+    /// An `envcloak run` that cannot be started is `run_failed`, with
+    /// "nothing was run": no child ran, so no command did.
+    ///
+    /// Mutation checked: a spawn failure answered as the child's outcome
+    /// (an empty capture, no record: `execution_unknown`): this fails.
+    #[test]
+    fn an_envcloak_run_that_cannot_be_started_ran_nothing() {
+        let ctx = Ctx::new(
+            "/nonexistent/envcloak".into(),
+            None,
+            std::time::Duration::from_secs(1),
+        );
+        let m = json!({"project_dir": "/", "argv": ["true"]});
+        let e = run(m.as_object().unwrap(), &ctx, &Call::new()).unwrap_err();
+        assert_eq!(e.token(), "run_failed");
+        assert!(e.message().contains("nothing was run"), "{}", e.message());
+    }
+
     #[test]
     fn arguments_are_refused_before_anything_runs() {
         let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
