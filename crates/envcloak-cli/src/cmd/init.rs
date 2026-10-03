@@ -40,14 +40,24 @@
 //!   where they were. That hands plaintext back, so it is a proof: the
 //!   passphrase, from `/dev/tty` or `--passphrase-fd`, in a terminal
 //!   session with no agent in it. The statement before it names the
-//!   project directory, and only env files directly in it are written: a
-//!   backup names its paths, and any client can store one. A file that
-//!   exists is replaced only when it is exactly what the deletion left of
-//!   it: the backup records that (the SHA-256 of what a rewrite leaves, or
-//!   that the file was removed) when it is made, before any file changes
-//!   (F-78). Any other is left alone: one edited since, an entry added or
-//!   taken out included, one the deletion removed that is there again,
-//!   and every file of a backup that does not record it.
+//!   project directory, who made the backup (as the daemon sealed it,
+//!   `files.show`) and its files, and only env files directly in that
+//!   directory are written: a backup names its paths, and any client can
+//!   store one. A file is written back only while it is what the deletion
+//!   left: the backup records that (the SHA-256 of what a rewrite leaves,
+//!   or that the file was removed) when it is made, before any file
+//!   changes (F-78). So a file there is replaced only when it is exactly
+//!   that rewrite, and a missing file is made only when the deletion
+//!   removed it. Any other is left as it is: one edited since, an entry
+//!   added or taken out included (`exists`), one the deletion removed
+//!   that is there again (`exists`), and one it rewrote that was deleted
+//!   since (`deleted_since`). A backup that does not record what the
+//!   deletion left (one an earlier EnvCloak made) is written back only
+//!   with the recovery form `--unrecorded`, and then only where a file is
+//!   missing; one an agent or an unknown process made, or that does not
+//!   record who made it, only with `--created-by-agent`. Without them it
+//!   is refused before the passphrase is asked for, after the statement
+//!   naming who made it.
 //!
 //! Deletion removes the working copy only: a value that was committed to
 //! git, synced or backed up elsewhere is still there, and the report says
@@ -59,12 +69,13 @@ use std::process::ExitCode;
 use envcloak_client::claims::{claims, refuse_if_claimed};
 use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
-use envcloak_client::render::{looks_like_value, print};
+use envcloak_client::render::{looks_like_value, made_by, print};
 use envcloak_client::tty::{Terminal, read_secret_fd};
 use envcloak_core::SecretBytes;
 use envcloak_ipc::WireSecret;
 use envcloak_ipc::proto::{
-    BackupFileParams, FileLeft, FilesBackupParams, VerifyEntry, VerifyFile, VerifyParams,
+    BackupFileParams, FileLeft, FilesBackupParams, FilesShown, VerifyEntry, VerifyFile,
+    VerifyParams,
 };
 use envcloak_ipc::view::{
     DeleteReport, EntryStatus, FileChange, InitReport, SkipReason, SkippedPath, UndoFile,
@@ -82,7 +93,7 @@ use super::import::{ReadFile, edit_gitignore, import, project_name, report, scan
 use super::{fd_number, require_unlocked};
 
 const USAGE_TEXT: &str = "envcloak init [--import] [--yes] [--delete-plaintext] [--json]
-       envcloak init --undo <ID> [--created-by-agent] [--passphrase-fd N] [--json]";
+       envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]";
 
 /// The parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -94,6 +105,9 @@ struct InitArgs {
     /// `--created-by-agent`: the backup may be one an agent or an unknown
     /// process made.
     created_by_agent: bool,
+    /// `--unrecorded`: the recovery form, for a backup that does not
+    /// record what the deletion left.
+    unrecorded: bool,
     passphrase_fd: Option<i32>,
     json: bool,
 }
@@ -109,6 +123,7 @@ fn parse(args: &[&str]) -> Option<InitArgs> {
             "--json" if !a.json => a.json = true,
             "--undo" if a.undo.is_none() => a.undo = Some((*it.next()?).to_owned()),
             "--created-by-agent" if !a.created_by_agent => a.created_by_agent = true,
+            "--unrecorded" if !a.unrecorded => a.unrecorded = true,
             "--passphrase-fd" if a.passphrase_fd.is_none() => {
                 a.passphrase_fd = Some(fd_number(it.next()?)?);
             }
@@ -116,7 +131,8 @@ fn parse(args: &[&str]) -> Option<InitArgs> {
         }
     }
     let undo_only = a.undo.is_some() && !a.import && !a.yes && !a.delete;
-    let no_undo = a.undo.is_none() && a.passphrase_fd.is_none() && !a.created_by_agent;
+    let no_undo =
+        a.undo.is_none() && a.passphrase_fd.is_none() && !a.created_by_agent && !a.unrecorded;
     (undo_only || no_undo).then_some(a)
 }
 
@@ -640,17 +656,13 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
     let project = open_root(&dir)
         .map_err(|_| Failure::new("io", "the project directory could not be opened"))?;
     require_unlocked(&mut connect()?)?;
-    let mut statement = format!(
-        "Write back the env files of backup {id} into {}. They hold plaintext secrets; a file \
-         there now is replaced only when it is exactly what the deletion left of it, any other \
-         is left alone, and nothing is written anywhere else.\n",
-        escape_for_display(&project.path().to_string_lossy())
-    );
-    if a.created_by_agent {
-        statement.push_str(
-            "--created-by-agent: this backup may have been made by an agent or another process, \
-             not by you, and its bytes are written back as that process stored them.\n",
-        );
+    // What the backup is, as the daemon sealed it, before the passphrase:
+    // the statement names who made it (SPEC §6.4).
+    let shown = connect()?.files_show(id, &claims_now)?;
+    let statement = undo_statement(id, &project.path().to_string_lossy(), &shown, a);
+    if let Some(f) = missing_form(&shown, a) {
+        eprint!("{statement}");
+        return Err(f);
     }
     let passphrase = match a.passphrase_fd {
         Some(fd) => {
@@ -669,7 +681,16 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
             t.read_secret("Vault passphrase to write them back: ")?
         }
     };
-    let restored = connect()?.files_restore(id, passphrase, a.created_by_agent, &claims_now)?;
+    // The files come from the manifest the statement was read from: it
+    // is sealed under the vault's `backup` subkey and bound to the
+    // backup's id, which only the daemon writes, never two under one id.
+    let restored = connect()?.files_restore(
+        id,
+        passphrase,
+        a.created_by_agent,
+        a.unrecorded,
+        &claims_now,
+    )?;
     let mut report = UndoReport {
         backup: id.to_owned(),
         creator: restored.creator,
@@ -682,6 +703,7 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
             f.mode,
             f.content.into_inner(),
             f.left.as_ref(),
+            a.unrecorded,
         );
         report.files.push(UndoFile {
             path: f.path,
@@ -701,6 +723,82 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
             "some files were not written back (the report says why)",
         ))
     }
+}
+
+/// Whether the backup `shown` records who made it and what the deletion
+/// left of every file: one that does not is written back only with the
+/// recovery form `--unrecorded`.
+fn recorded(shown: &FilesShown) -> bool {
+    shown.creator.is_some() && shown.files.iter().all(|f| f.left.is_some())
+}
+
+/// Whether the daemon sealed the backup `shown` as a terminal's: any
+/// other needs `--created-by-agent`.
+fn by_terminal(shown: &FilesShown) -> bool {
+    shown.creator.as_ref().is_some_and(|c| c.kind == "terminal")
+}
+
+/// The statement `init --undo` shows before the passphrase: the project
+/// directory `dir`, who made backup `id` (`shown`, as the daemon sealed
+/// it), its files, and what the forms the person gave mean for it.
+fn undo_statement(id: &str, dir: &str, shown: &FilesShown, a: &InitArgs) -> String {
+    let files: Vec<String> = shown
+        .files
+        .iter()
+        .map(|f| escape_for_display(&f.path))
+        .collect();
+    let mut s = format!(
+        "Write back the env files of backup {id} into {}. They hold plaintext secrets; a file \
+         there now is replaced only when it is exactly what the deletion left of it, any other \
+         is left alone, and nothing is written anywhere else.\nThe backup was {}; it holds {}.\n",
+        escape_for_display(dir),
+        made_by(shown.creator.as_ref()),
+        files.join(", ")
+    );
+    if !recorded(shown) {
+        s.push_str(
+            "It does not record what the deletion left of every file, so such a file is \
+             written back only with --unrecorded, and then only where it is missing: one there \
+             is left as it is.\n",
+        );
+    }
+    if !by_terminal(shown) && a.created_by_agent {
+        s.push_str(
+            "--created-by-agent: its bytes are written back as the process that made it stored \
+             them.\n",
+        );
+    }
+    s
+}
+
+/// The refusal, before the passphrase is asked for, of a backup whose
+/// forms the person did not give, as the daemon would refuse it
+/// (`restore_refused`): `--unrecorded` for one that does not record what
+/// the deletion left or who made it, `--created-by-agent` for one not
+/// sealed as a terminal's.
+fn missing_form(shown: &FilesShown, a: &InitArgs) -> Option<Failure> {
+    let unrecorded = !recorded(shown) && !a.unrecorded;
+    let unticked = !by_terminal(shown) && !a.created_by_agent;
+    let message = match (unrecorded, unticked) {
+        (false, false) => return None,
+        (true, false) => {
+            "the backup does not record what the deletion left of every file (the statement \
+             above says so), so it is written back only with the recovery form --unrecorded, and \
+             then only where a file is missing; nothing was written"
+        }
+        (false, true) => {
+            "the backup was not made from a terminal with no agent in it (the statement above \
+             names who made it), and writing it back writes the bytes that process stored, so it \
+             needs --created-by-agent; nothing was written"
+        }
+        (true, true) => {
+            "the backup does not record what the deletion left, nor that it was made from a \
+             terminal with no agent in it (the statement above says so): it is written back only \
+             with --unrecorded --created-by-agent, and then only where a file is missing; nothing \
+             was written"
+        }
+    };
+    Some(Failure::new("restore_refused", message))
 }
 
 /// Lower-case hex of `b`.
@@ -723,18 +821,25 @@ fn deletion_left(left: Option<&FileLeft>, now: &SecretBytes) -> bool {
 /// `project`, the directory `init --undo` runs for: a backup any client
 /// can store names any path, and the passphrase statement names only that
 /// directory. Another name is `not_env_file`, another directory
-/// `elsewhere`. A file there already is `unchanged` when it holds the same
-/// bytes, replaced (`restored`) only when it is exactly what the deletion
-/// left of it, by the SHA-256 its backup recorded (`left`, F-78), and
-/// `exists` otherwise: edited since, an entry added or taken out included,
-/// one the deletion removed that is there again, and any file of a backup
-/// that does not record what the deletion left. A missing file is made.
+/// `elsewhere`. Otherwise it is written only while the file is what the
+/// deletion left, by what its backup recorded (`left`, F-78; SPEC §6.4):
+/// - a file there already is `unchanged` when it holds the same bytes,
+///   replaced (`restored`) only when it is exactly the rewrite recorded,
+///   by its SHA-256, and `exists` otherwise: edited since, an entry added
+///   or taken out included, one the deletion removed that is there again,
+///   and any file whose result is not recorded;
+/// - a missing file is made (`restored`) only when the deletion removed
+///   it. One the deletion rewrote was deleted since (`deleted_since`), and
+///   is left so: making it would bring back what the person deleted. One
+///   whose result the backup does not record is made only under the
+///   recovery form `unrecorded` (`unrecorded` otherwise).
 fn write_back(
     project: &ScanRoot,
     path: &str,
     mode: u32,
     content: SecretBytes,
     left: Option<&FileLeft>,
+    unrecorded: bool,
 ) -> &'static str {
     let p = Path::new(path);
     let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else {
@@ -765,6 +870,13 @@ fn write_back(
         Err(e) if e.kind == ScanErrorKind::NotFound => {}
         Err(e) => return e.kind.token(),
     }
+    // Missing: what the deletion left only when it removed the file.
+    match left {
+        Some(FileLeft::Removed) => {}
+        Some(FileLeft::Rewritten(_)) => return "deleted_since",
+        None if unrecorded => {}
+        None => return "unrecorded",
+    }
     match restore_file(&root, rel, &content, mode & 0o7777) {
         Ok(_) => "restored",
         Err(e) if e.kind == ModifyErrorKind::Exists => "exists",
@@ -785,15 +897,21 @@ mod tests {
         assert_eq!(a.undo.as_deref(), Some("ID"));
         assert_eq!(a.passphrase_fd, Some(3));
         assert!(!a.created_by_agent);
+        assert!(!a.unrecorded);
         let a = parse(&["--undo", "ID", "--created-by-agent"]).unwrap();
-        assert!(a.created_by_agent);
+        assert!(a.created_by_agent && !a.unrecorded);
+        let a = parse(&["--unrecorded", "--undo", "ID", "--created-by-agent"]).unwrap();
+        assert!(a.created_by_agent && a.unrecorded);
         for bad in [
             &["--undo"][..],
             &["--undo", "a", "--import"],
             &["--passphrase-fd", "3"],
             &["--created-by-agent"],
+            &["--unrecorded"],
             &["--import", "--created-by-agent"],
+            &["--import", "--unrecorded"],
             &["--undo", "a", "--created-by-agent", "--created-by-agent"],
+            &["--undo", "a", "--unrecorded", "--unrecorded"],
             &["--import", "--import"],
             &["--value", "x"],
             &["somewhere"],
@@ -813,6 +931,7 @@ mod tests {
         }
         let root = open_root(&project).unwrap();
         let body = || SecretBytes::copy_from(b"A=1\n");
+        let removed = Some(&FileLeft::Removed);
         let at = |dir: &Path, name: &str| dir.join(name).to_str().unwrap().to_owned();
         for (path, want) in [
             (at(&project, "run.plist"), "not_env_file"),
@@ -824,7 +943,7 @@ mod tests {
             (".env".to_owned(), "invalid_path"),
         ] {
             assert_eq!(
-                write_back(&root, &path, 0o600, body(), None),
+                write_back(&root, &path, 0o600, body(), removed, false),
                 want,
                 "{path}"
             );
@@ -833,72 +952,133 @@ mod tests {
             assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
         }
         assert_eq!(
-            write_back(&root, &at(&project, ".env.local"), 0o600, body(), None),
+            write_back(
+                &root,
+                &at(&project, ".env.local"),
+                0o600,
+                body(),
+                removed,
+                false
+            ),
             "restored"
         );
         assert_eq!(std::fs::read(project.join(".env.local")).unwrap(), b"A=1\n");
     }
 
-    /// F-78: a file there is replaced only when it is exactly what the
-    /// deletion left of it, by the SHA-256 its backup recorded. The cases
-    /// of the M1 audit's undo probe: the original there (`unchanged`), the
-    /// exact leftover (`restored`, to the original), an ordinary edit
-    /// after the deletion (a newline added) and a whole entry taken out
-    /// after it (the finding: both `exists`, kept as they are), and the
-    /// file missing (`restored`); then a value changed, a file the
-    /// deletion removed that is there again, and the exact leftover under
-    /// a backup that recorded nothing (all `exists`, never replaced).
+    /// F-78: a file is written back only while it is what the deletion
+    /// left, by what its backup recorded (SPEC §6.4). The cases of the M1
+    /// audit's undo probe: the original there (`unchanged`), the exact
+    /// leftover (`restored`, to the original), an ordinary edit after the
+    /// deletion (a newline added) and a whole entry taken out after it
+    /// (both `exists`, kept as they are); a value changed and a file the
+    /// deletion removed that is there again (`exists`). Missing: a file
+    /// the deletion removed is made (`restored`); one it rewrote was
+    /// deleted since and stays deleted (`deleted_since`), the recovery
+    /// form changing nothing for a result that is recorded. A backup that
+    /// records no result: a file there is never replaced (`exists`), and
+    /// a missing one is made only under the recovery form `--unrecorded`
+    /// (`unrecorded` without it).
+    ///
+    /// Mutations: a missing file made whatever was recorded (the old
+    /// behaviour: `deleted_since` and `unrecorded` restore); the recovery
+    /// form taken for a recorded rewrite (`deleted_since` restores); an
+    /// unrecorded file replaced under the recovery form.
     #[test]
-    fn undo_replaces_only_exactly_what_the_deletion_left() {
+    fn undo_writes_back_only_what_the_deletion_left() {
         let d = tempfile::tempdir_in("/tmp").unwrap();
         let original: &[u8] = b"TOKEN=aaaaaaaaaaaaaaaaaaaa\nMODE=bbb\nFLAG=ccc\n";
         // The deletion took the first entry out.
         let leftover: &[u8] = b"MODE=bbb\nFLAG=ccc\n";
         let rewritten = FileLeft::Rewritten(hex(&SecretBytes::copy_from(leftover).sha256()));
+        let removed = FileLeft::Removed;
         // Each case: its name, the file there before the undo (none:
-        // missing), what the backup recorded, and the undo's state.
-        type Case<'a> = (&'a str, Option<&'a [u8]>, Option<FileLeft>, &'a str);
-        let cases: [Case<'_>; 8] = [
+        // missing), what the backup recorded, whether the recovery form
+        // was given, and the undo's state.
+        type Case<'a> = (
+            &'a str,
+            Option<&'a [u8]>,
+            Option<&'a FileLeft>,
+            bool,
+            &'a str,
+        );
+        let cases: [Case<'_>; 15] = [
             (
                 "identical",
                 Some(original),
-                Some(rewritten.clone()),
+                Some(&rewritten),
+                false,
                 "unchanged",
             ),
             (
                 "leftover",
                 Some(leftover),
-                Some(rewritten.clone()),
+                Some(&rewritten),
+                false,
                 "restored",
             ),
             (
                 "edited",
                 Some(b"MODE=bbb\nFLAG=ccc\n\n"),
-                Some(rewritten.clone()),
+                Some(&rewritten),
+                false,
                 "exists",
             ),
             (
                 "entry_removed",
                 Some(b"FLAG=ccc\n"),
-                Some(rewritten.clone()),
+                Some(&rewritten),
+                false,
                 "exists",
             ),
-            ("missing", None, Some(rewritten.clone()), "restored"),
             (
                 "value_changed",
                 Some(b"MODE=bbx\nFLAG=ccc\n"),
-                Some(rewritten.clone()),
+                Some(&rewritten),
+                false,
                 "exists",
             ),
             (
                 "made_again",
                 Some(b"MODE=bbb\n"),
-                Some(FileLeft::Removed),
+                Some(&removed),
+                false,
                 "exists",
             ),
-            ("unrecorded", Some(leftover), None, "exists"),
+            ("removed_missing", None, Some(&removed), false, "restored"),
+            (
+                "deleted_since",
+                None,
+                Some(&rewritten),
+                false,
+                "deleted_since",
+            ),
+            (
+                "deleted_since_recovery",
+                None,
+                Some(&rewritten),
+                true,
+                "deleted_since",
+            ),
+            ("unrecorded", Some(leftover), None, false, "exists"),
+            (
+                "unrecorded_identical",
+                Some(original),
+                None,
+                false,
+                "unchanged",
+            ),
+            ("unrecorded_missing", None, None, false, "unrecorded"),
+            ("unrecorded_recovery", None, None, true, "restored"),
+            ("unrecorded_there", Some(leftover), None, true, "exists"),
+            (
+                "unrecorded_edited",
+                Some(b"MODE=bbb\n"),
+                None,
+                true,
+                "exists",
+            ),
         ];
-        for (name, now, left, want) in cases {
+        for (name, now, left, unrecorded, want) in cases {
             let dir = d.path().join(name);
             std::fs::create_dir(&dir).unwrap();
             let root = open_root(&dir).unwrap();
@@ -911,16 +1091,148 @@ mod tests {
                 path.to_str().unwrap(),
                 0o600,
                 SecretBytes::copy_from(original),
-                left.as_ref(),
+                left,
+                unrecorded,
             );
             assert_eq!(got, want, "{name}");
-            let expect = if want == "restored" {
-                original
-            } else {
-                now.unwrap()
-            };
-            assert_eq!(std::fs::read(&path).unwrap(), expect, "{name}");
+            match (want, now) {
+                ("restored", _) => {
+                    assert!(std::fs::read(&path).unwrap() == original, "{name}");
+                }
+                (_, Some(now)) => assert!(std::fs::read(&path).unwrap() == now, "{name}"),
+                (_, None) => assert!(!path.exists(), "{name}: made"),
+            }
         }
+    }
+
+    /// A file backup as `files.show` answers it: made by `creator` (kind
+    /// and label), with `.env` rewritten and `.env.short` removed, or,
+    /// `recorded` false, recording nothing (an M1 build's).
+    fn shown(creator: Option<(&str, Option<&str>)>, recorded: bool) -> FilesShown {
+        use envcloak_ipc::proto::ShownFile;
+        use envcloak_ipc::view::FileBackupCreatorView;
+        let file = |path: &str, left: FileLeft| ShownFile {
+            path: path.to_owned(),
+            left: recorded.then_some(left),
+        };
+        FilesShown {
+            creator: creator.map(|(kind, agent)| FileBackupCreatorView {
+                kind: kind.to_owned(),
+                agent: agent.map(str::to_owned),
+            }),
+            files: vec![
+                file("/p/acme/.env", FileLeft::Rewritten("ab".repeat(32))),
+                file("/p/acme/.env.short", FileLeft::Removed),
+            ],
+        }
+    }
+
+    /// Codex and verifier review, round 3 (SPEC §6.4: the restore
+    /// statement names the creator): the statement before the passphrase
+    /// names who made the backup as the daemon sealed it (each kind, an
+    /// agent's label, and a backup that does not record it) and its
+    /// files; a backup that does not record what the deletion left says
+    /// so, and the tick is repeated only when it was given for a backup
+    /// that needs it.
+    ///
+    /// Mutation: the statement built without the backup shown (the old
+    /// generic text: no maker, no files).
+    #[test]
+    fn the_undo_statement_names_who_made_the_backup() {
+        let a = |tick: bool, unrecorded: bool| InitArgs {
+            undo: Some("ID".to_owned()),
+            created_by_agent: tick,
+            unrecorded,
+            ..InitArgs::default()
+        };
+        for (creator, recorded, words) in [
+            (
+                Some(("terminal", None)),
+                true,
+                "The backup was made from a terminal;",
+            ),
+            (
+                Some(("agent", Some("Claude Code"))),
+                true,
+                "The backup was made by an agent (Claude Code), not by you;",
+            ),
+            (
+                Some(("unknown", Some("Codex"))),
+                true,
+                "The backup was made by a process EnvCloak could not identify (Codex), not by you;",
+            ),
+            (
+                Some(("unknown", None)),
+                true,
+                "The backup was made by a process EnvCloak could not identify, not by you;",
+            ),
+            (
+                None,
+                false,
+                "The backup was made before EnvCloak recorded who makes a backup;",
+            ),
+        ] {
+            let b = shown(creator, recorded);
+            let s = undo_statement("ID", "/p/acme", &b, &a(true, true));
+            assert!(
+                s.starts_with("Write back the env files of backup ID into /p/acme. "),
+                "{s}"
+            );
+            assert!(s.contains(words), "{s}");
+            assert!(
+                s.contains("it holds /p/acme/.env, /p/acme/.env.short.\n"),
+                "{s}"
+            );
+            assert_eq!(
+                s.contains("It does not record what the deletion left"),
+                !recorded,
+                "{s}"
+            );
+            let by_terminal = creator.is_some_and(|(k, _)| k == "terminal");
+            assert_eq!(s.contains("--created-by-agent:"), !by_terminal, "{s}");
+            let unticked = undo_statement("ID", "/p/acme", &b, &a(false, true));
+            assert!(!unticked.contains("--created-by-agent:"), "{unticked}");
+        }
+    }
+
+    /// The forms a backup needs are asked for before the passphrase, as
+    /// the daemon refuses without them: none for a terminal's recorded
+    /// backup, `--created-by-agent` for an agent's or an unknown
+    /// process's, `--unrecorded` for one with a result not recorded, and
+    /// both for one that records nothing (an M1 build's), each refusal
+    /// `restore_refused` saying which.
+    ///
+    /// Mutations: a backup that records no maker taken as a terminal's;
+    /// results not looked at.
+    #[test]
+    fn an_undo_without_the_forms_its_backup_needs_is_refused_first() {
+        let a = |tick: bool, unrecorded: bool| InitArgs {
+            undo: Some("ID".to_owned()),
+            created_by_agent: tick,
+            unrecorded,
+            ..InitArgs::default()
+        };
+        let terminal = shown(Some(("terminal", None)), true);
+        let agent = shown(Some(("agent", Some("Claude Code"))), true);
+        let mut partly = shown(Some(("terminal", None)), true);
+        partly.files[1].left = None;
+        let m1 = shown(None, false);
+        let needs = |b: &FilesShown, tick: bool, unrecorded: bool| {
+            missing_form(b, &a(tick, unrecorded)).map(|f| {
+                assert_eq!(f.token(), "restore_refused");
+                let m = f.message().to_owned();
+                (m.contains("--unrecorded"), m.contains("--created-by-agent"))
+            })
+        };
+        assert_eq!(needs(&terminal, false, false), None);
+        assert_eq!(needs(&agent, false, false), Some((false, true)));
+        assert_eq!(needs(&agent, true, false), None);
+        assert_eq!(needs(&partly, false, false), Some((true, false)));
+        assert_eq!(needs(&partly, false, true), None);
+        assert_eq!(needs(&m1, false, false), Some((true, true)));
+        assert_eq!(needs(&m1, true, false), Some((true, false)));
+        assert_eq!(needs(&m1, false, true), Some((false, true)));
+        assert_eq!(needs(&m1, true, true), None);
     }
 
     #[test]

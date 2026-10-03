@@ -28,8 +28,10 @@
 //!
 //! [`Vault::open_file_backup`] returns the files as they were, byte for
 //! byte, and who made the backup (`envcloak init --undo`);
-//! [`Vault::file_backup_creator`] reads who made it alone, without a
-//! file's bytes. [`purge_file_backups`] removes backups
+//! [`Vault::file_backup_manifest`] reads the manifest alone (who made it,
+//! and each file's path, mode, length and what the deletion left), without
+//! a file's bytes, for the statement and the checks before a proof.
+//! [`purge_file_backups`] removes backups
 //! older than [`FILE_BACKUP_RETENTION`], by the time in their header, and
 //! the staging files interrupted writes left
 //! (`.files-<time>-<id>.ecfiles.tmp`, unchanged for [`STAGING_GRACE`]).
@@ -172,6 +174,29 @@ pub struct OpenedFileBackup {
     /// before it was recorded, manifest version 1).
     pub creator: Option<FileBackupCreator>,
     pub files: Vec<BackupFile>,
+}
+
+/// A backup's manifest, as [`Vault::file_backup_manifest`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBackupManifest {
+    /// Who made it; `None` for a backup that does not record it (manifest
+    /// version 1).
+    pub creator: Option<FileBackupCreator>,
+    pub files: Vec<ManifestFile>,
+}
+
+/// One file of a backup's manifest: everything but its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestFile {
+    /// Where it was: an absolute path, as the client gave it.
+    pub path: String,
+    /// Its permission bits.
+    pub mode: u32,
+    /// The length of its bytes.
+    pub size: usize,
+    /// What the deletion leaves of it; `None` when the backup does not
+    /// say.
+    pub left: Option<FileLeft>,
 }
 
 /// One file in a backup.
@@ -629,16 +654,29 @@ impl Vault {
         Ok((file, written))
     }
 
-    /// Who made backup `id`, read from its sealed manifest without
-    /// opening a file's bytes: for a check before a proof. `None` for a
-    /// backup that does not record it. Fails as
-    /// [`Vault::open_file_backup`], except that a file record past the
-    /// manifest is not read.
-    pub fn file_backup_creator(
+    /// The sealed manifest of backup `id`, read without opening a file's
+    /// bytes: who made it and what each file is, for the statement shown
+    /// before a proof and the checks made before the passphrase is looked
+    /// at. Fails as [`Vault::open_file_backup`], except that a file record
+    /// past the manifest is not read.
+    pub fn file_backup_manifest(
         &self,
         id: &FileBackupId,
-    ) -> Result<Option<FileBackupCreator>, VaultError> {
-        Ok(self.open_manifest(id)?.manifest.creator)
+    ) -> Result<FileBackupManifest, VaultError> {
+        let m = self.open_manifest(id)?.manifest;
+        Ok(FileBackupManifest {
+            creator: m.creator,
+            files: m
+                .entries
+                .into_iter()
+                .map(|(path, mode, size, left)| ManifestFile {
+                    path,
+                    mode,
+                    size,
+                    left,
+                })
+                .collect(),
+        })
     }
 
     /// The files of backup `id`, byte for byte, with their paths and

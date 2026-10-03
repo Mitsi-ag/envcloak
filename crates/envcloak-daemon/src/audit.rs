@@ -200,11 +200,15 @@ pub enum AuditEvent {
         files: usize,
     },
     /// A file backup was handed back, with a proof (`files.restore`).
+    /// `form` is the explicit form the restore took, as for
+    /// [`AuditEvent::RestoreV2Opened`]: `created_by_agent`, `unrecorded`,
+    /// both joined by `+`, or none.
     FilesRestored {
         pid: i32,
         subject: SubjectSummary,
         backup: String,
         files: usize,
+        form: Option<&'static str>,
     },
     /// The Recovery Kit was confirmed (`recovery.confirm`).
     RecoveryConfirmed {
@@ -245,8 +249,8 @@ pub enum AuditEvent {
     },
     /// A restore lease was opened on a backup v2, with a proof
     /// (`backup.v2.open_restore`): a delivery, written before the lease is
-    /// issued. `form` is `unrecorded` or `created_by_agent` when the
-    /// restore took that explicit option.
+    /// issued. `form` is `unrecorded`, `created_by_agent` or both joined
+    /// by `+` when the restore took that explicit option.
     RestoreV2Opened {
         pid: i32,
         subject: SubjectSummary,
@@ -398,8 +402,15 @@ impl AuditEvent {
                 pid, backup, files, ..
             } => format!("envcloakd: audit: files backed up id={backup} files={files} pid={pid}"),
             AuditEvent::FilesRestored {
-                pid, backup, files, ..
-            } => format!("envcloakd: audit: files restored id={backup} files={files} pid={pid}"),
+                pid,
+                backup,
+                files,
+                form,
+                ..
+            } => format!(
+                "envcloakd: audit: files restored id={backup} files={files}{} pid={pid}",
+                form_part(*form)
+            ),
             AuditEvent::RecoveryConfirmed { pid, already, .. } => {
                 format!("envcloakd: audit: recovery kit confirmed already={already} pid={pid}")
             }
@@ -424,10 +435,15 @@ impl AuditEvent {
                  files={files} pid={pid}"
             ),
             AuditEvent::RestoreV2Opened {
-                pid, backup, files, ..
+                pid,
+                backup,
+                files,
+                form,
+                ..
             } => format!(
-                "envcloakd: audit: backup v2 restore lease opened id={backup} files={files} \
-                 pid={pid}"
+                "envcloakd: audit: backup v2 restore lease opened id={backup} files={files}{} \
+                 pid={pid}",
+                form_part(*form)
             ),
         })
     }
@@ -676,13 +692,14 @@ impl AuditEvent {
                 subject,
                 backup,
                 files,
+                form,
                 ..
             } => AuditRecord {
                 request_id: Some(backup.clone()),
                 subject: subject.clone(),
                 decision: decision(
                     "restored",
-                    None,
+                    *form,
                     Some("files.restore"),
                     Some(u64::try_from(*files).unwrap_or(u64::MAX)),
                 ),
@@ -768,6 +785,11 @@ impl AuditEvent {
             },
         }
     }
+}
+
+/// A restore's explicit form on its log line: ` form=<form>`, or nothing.
+fn form_part(form: Option<&str>) -> String {
+    form.map(|f| format!(" form={f}")).unwrap_or_default()
 }
 
 fn decision(

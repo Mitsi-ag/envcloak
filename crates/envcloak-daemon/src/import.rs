@@ -1,6 +1,6 @@
 //! Import and the deletion of plaintext after it (SPEC §6.4, gates 10 and
 //! 16): `import.plan`, `import.commit`, `import.verify`, `files.backup`,
-//! `files.restore` and `recovery.confirm`.
+//! `files.show`, `files.restore` and `recovery.confirm`.
 //!
 //! The CLI scans and parses env files (so a macOS privacy prompt names the
 //! terminal, not the daemon) and sends each entry's value to this verified
@@ -66,11 +66,15 @@
 //! audited as restored), and then only after its audit entry is written
 //! durably (`audit_failed` otherwise). `files.backup` seals who made the
 //! backup, as this daemon's evidence classed the caller, never as the
-//! client says; a backup an agent or an unknown process made, or one that
-//! does not record who made it, is restored only with
-//! `created_by_agent_ticked`, refused (`restore_refused`,
-//! `created_by_agent`) before the passphrase is looked at and checked
-//! again on the backup opened after the proof (SPEC §6.4).
+//! client says, and `files.show` reads it, with each file's path and what
+//! the deletion left, for the statement before the passphrase (SPEC §6.4:
+//! the restore statement names the creator). Before the passphrase is
+//! looked at, `files.restore` refuses (`restore_refused`) a backup that
+//! does not record what the deletion left of a file, or who made it,
+//! without `unrecorded` (`result_unrecorded`), and one an agent or an
+//! unknown process made, or that does not record who made it, without
+//! `created_by_agent_ticked` (`created_by_agent`); the explicit form taken
+//! is in the restore's audit entry ([`restore_form`]).
 //!
 //! Nothing here answers with a value except `files.restore`, and no error
 //! repeats text a client sent.
@@ -82,7 +86,7 @@ use std::time::Duration;
 use envcloak_core::audit::AuditKind;
 use envcloak_core::crypto::{CryptoErrorKind, ItemClass};
 use envcloak_core::file_backup::{
-    BackupFile, FileBackupCreator, FileBackupId, FileLeft, purge_file_backups,
+    BackupFile, FileBackupCreator, FileBackupId, FileBackupManifest, FileLeft, purge_file_backups,
 };
 use envcloak_core::file_backup_v2::CreatorKind;
 use envcloak_core::vault::{
@@ -91,9 +95,9 @@ use envcloak_core::vault::{
 };
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_ipc::proto::{
-    self, ErrorKind, FilesBackupParams, FilesRestore, FilesRestoreParams, ImportCommit,
-    ImportCommitParams, ImportParams, RecoveryConfirmParams, RestoredFile, RestoredFiles,
-    VerifyParams,
+    self, ErrorKind, FilesBackupParams, FilesRestore, FilesRestoreParams, FilesShowParams,
+    FilesShown, ImportCommit, ImportCommitParams, ImportParams, RecoveryConfirmParams,
+    RestoredFile, RestoredFiles, ShownFile, VerifyParams,
 };
 use envcloak_ipc::view::{
     ClassificationView, EntryStatus, FileBackupCreatorView, FileBackupView, ImportEntryView,
@@ -962,6 +966,31 @@ fn left_view(l: FileLeft) -> proto::FileLeft {
     }
 }
 
+/// Who made a backup, as `files.restore` and `files.show` answer it.
+fn creator_view(c: FileBackupCreator) -> FileBackupCreatorView {
+    FileBackupCreatorView {
+        kind: c.kind.as_str().to_owned(),
+        agent: c.agent,
+    }
+}
+
+/// The answer `files.restore` gives for a backup of `files` made by
+/// `creator`.
+fn restore_answer(creator: Option<FileBackupCreator>, files: Vec<BackupFile>) -> RestoredFiles {
+    RestoredFiles {
+        creator: creator.map(creator_view),
+        files: files
+            .into_iter()
+            .map(|f| RestoredFile {
+                path: f.path,
+                mode: f.mode,
+                content: WireSecret::new(f.content),
+                left: f.left.map(left_view),
+            })
+            .collect(),
+    }
+}
+
 /// `files.backup`: the files of an env-file deletion, each an absolute
 /// path to an env file ([`env_file_path`]), with what the deletion leaves
 /// of it (F-78).
@@ -1104,20 +1133,74 @@ fn open_backup_error(e: &VaultError) -> RpcError {
     }
 }
 
-/// Refuses a file backup an agent or an unknown process made, or one that
-/// does not record who made it, unless the person ticked
-/// `--created-by-agent` (SPEC §6.4): restoring it writes that process's
-/// bytes outside its sandbox.
-fn refuse_unticked(creator: Option<&FileBackupCreator>, ticked: bool) -> Result<(), RpcError> {
-    let by_terminal = creator.is_some_and(|c| c.kind == CreatorKind::Terminal);
-    if by_terminal || ticked {
-        Ok(())
-    } else {
-        Err(RpcError::with_reason(
+/// The explicit form a restore of a backup with manifest `m` needs, as
+/// `backup.v2.open_restore` decides it (SPEC §6.4), or its refusal
+/// (`restore_refused`), made before the passphrase is looked at:
+/// - a backup that does not record what the deletion left of every file,
+///   or who made it (manifest version 1), restores only through the
+///   recovery form `unrecorded` (`result_unrecorded`): EnvCloak cannot
+///   check a file there against it;
+/// - one an agent or an unknown process made, or that does not record who
+///   made it, only with `created_by_agent_ticked` (`created_by_agent`):
+///   restoring it writes that process's bytes outside its sandbox.
+///
+/// The form taken (`unrecorded`, `created_by_agent`, both joined by `+`,
+/// or none) goes in the restore's audit entry.
+fn restore_form(
+    m: &FileBackupManifest,
+    ticked: bool,
+    unrecorded_form: bool,
+) -> Result<Option<&'static str>, RpcError> {
+    let by_agent = !m
+        .creator
+        .as_ref()
+        .is_some_and(|c| c.kind == CreatorKind::Terminal);
+    let unrecorded = m.creator.is_none() || m.files.iter().any(|f| f.left.is_none());
+    if unrecorded && !unrecorded_form {
+        return Err(RpcError::with_reason(
+            ErrorKind::RestoreRefused,
+            "result_unrecorded",
+        ));
+    }
+    if by_agent && !ticked {
+        return Err(RpcError::with_reason(
             ErrorKind::RestoreRefused,
             "created_by_agent",
-        ))
+        ));
     }
+    Ok(match (by_agent, unrecorded) {
+        (true, true) => Some("created_by_agent+unrecorded"),
+        (true, false) => Some("created_by_agent"),
+        (false, true) => Some("unrecorded"),
+        (false, false) => None,
+    })
+}
+
+/// `files.show`: what backup `p.backup` is, from its sealed manifest, for
+/// a caller that may give a proof. See the module documentation.
+pub fn files_show(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: FilesShowParams,
+) -> Result<FilesShown, RpcError> {
+    let backup = FileBackupId::parse(&p.backup).ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
+    let caller = evidence(shared, peer, &p.claims)?;
+    refuse_unless_prover(shared, peer, &caller, "files.show")?;
+    let m = locked(&shared.state)
+        .unlocked()?
+        .file_backup_manifest(&backup)
+        .map_err(|e| open_backup_error(&e))?;
+    Ok(FilesShown {
+        creator: m.creator.map(creator_view),
+        files: m
+            .files
+            .into_iter()
+            .map(|f| ShownFile {
+                path: f.path,
+                left: f.left.map(left_view),
+            })
+            .collect(),
+    })
 }
 
 /// `files.restore`, answering request `id` with its result frame, built
@@ -1134,40 +1217,28 @@ pub fn files_restore(
     refuse_if_traced()?;
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "files.restore")?;
-    // Who made it, before the passphrase is looked at: a refusal takes no
+    // What it is, before the passphrase is looked at: a refusal takes no
     // attempt, and reads no file's bytes.
-    let creator = locked(&shared.state)
+    let manifest = locked(&shared.state)
         .unlocked()?
-        .file_backup_creator(&backup)
+        .file_backup_manifest(&backup)
         .map_err(|e| open_backup_error(&e))?;
-    refuse_unticked(creator.as_ref(), p.created_by_agent_ticked)?;
+    let form = restore_form(&manifest, p.created_by_agent_ticked, p.unrecorded)?;
     let (mut s, caller) = prove_as(shared, peer, caller, AuditKind::FilesRestore, |v| {
         v.verify_passphrase(&pass)
     })?;
     drop(pass);
+    // Opened again after the proof, it is the backup checked: its
+    // manifest is sealed under the vault's `backup` subkey and bound to
+    // its id by its header and every record's associated data, which only
+    // this daemon writes, and never two backups under one id. So the
+    // check is made once, above, and nothing here could fail a second.
     let opened = s
         .unlocked()?
         .open_file_backup(&backup)
         .map_err(|e| open_backup_error(&e))?;
-    // Again on the backup opened: what goes out is what was checked.
-    refuse_unticked(opened.creator.as_ref(), p.created_by_agent_ticked)?;
     let files = opened.files.len();
-    let answer = RestoredFiles {
-        creator: opened.creator.map(|c| FileBackupCreatorView {
-            kind: c.kind.as_str().to_owned(),
-            agent: c.agent,
-        }),
-        files: opened
-            .files
-            .into_iter()
-            .map(|f| RestoredFile {
-                path: f.path,
-                mode: f.mode,
-                content: WireSecret::new(f.content),
-                left: f.left.map(left_view),
-            })
-            .collect(),
-    };
+    let answer = restore_answer(opened.creator, opened.files);
     // Framed as it will be sent before anything is committed (F-77's
     // order, [`commit_framed`]): one larger than a frame releases nothing
     // and is not recorded as restored. A delivery: its entry is on disk
@@ -1180,6 +1251,7 @@ pub fn files_restore(
             subject: subject_summary(peer, &caller),
             backup: backup.to_string(),
             files,
+            form,
         };
         if s.audit_delivery(entry) {
             Ok(())
@@ -1244,35 +1316,79 @@ mod tests {
         );
     }
 
-    /// Only a backup the daemon recorded as a terminal's restores
-    /// unticked: one an agent or an unknown process made, and one that
-    /// does not record who made it (made before that was recorded), need
-    /// `--created-by-agent`. Ticked, each restores.
+    /// The explicit form each backup needs, before the passphrase: only a
+    /// terminal's backup that records what the deletion left of every
+    /// file restores with no form. One an agent or an unknown process
+    /// made needs `created_by_agent_ticked`; one with a file whose result
+    /// is not recorded needs `unrecorded`; one that records neither who
+    /// made it nor any result (manifest version 1, an M1 build's) needs
+    /// both, `unrecorded` asked for first. Each is refused, with that
+    /// reason, without its form, and the form taken is the one audited.
     ///
-    /// Mutation: a backup that records no creator taken as a terminal's
-    /// (its unticked restore is let through).
+    /// Mutations: a backup that records no creator taken as a terminal's
+    /// (the version 1 backup restores with `unrecorded` alone); results
+    /// not looked at (a missing result restores with no form); the tick
+    /// ignored (the agent's backup restores unticked).
     #[test]
-    fn only_a_terminals_backup_restores_unticked() {
+    fn each_backup_restores_only_with_the_forms_it_needs() {
+        use envcloak_core::file_backup::ManifestFile;
         let made = |kind| Some(FileBackupCreator { kind, agent: None });
-        let refused = Err(RpcError::with_reason(
-            ErrorKind::RestoreRefused,
-            "created_by_agent",
-        ));
-        assert_eq!(
-            refuse_unticked(made(CreatorKind::Terminal).as_ref(), false),
-            Ok(())
-        );
-        for creator in [made(CreatorKind::Agent), made(CreatorKind::Unknown), None] {
-            assert_eq!(
-                refuse_unticked(creator.as_ref(), false),
-                refused,
-                "{creator:?}"
-            );
-            assert_eq!(
-                refuse_unticked(creator.as_ref(), true),
-                Ok(()),
-                "{creator:?}"
-            );
+        let file = |left| ManifestFile {
+            path: "/p/.env".to_owned(),
+            mode: 0o600,
+            size: 4,
+            left,
+        };
+        let manifest = |creator, lefts: &[Option<FileLeft>]| FileBackupManifest {
+            creator,
+            files: lefts.iter().copied().map(file).collect(),
+        };
+        let recorded = [Some(FileLeft::Removed), Some(FileLeft::Rewritten([7; 32]))];
+        let one_unrecorded = [Some(FileLeft::Removed), None];
+        let refused = |reason| Err(RpcError::with_reason(ErrorKind::RestoreRefused, reason));
+        // Each manifest, and the form its restore takes.
+        let cases = [
+            (manifest(made(CreatorKind::Terminal), &recorded), None),
+            (
+                manifest(made(CreatorKind::Agent), &recorded),
+                Some("created_by_agent"),
+            ),
+            (
+                manifest(made(CreatorKind::Unknown), &recorded),
+                Some("created_by_agent"),
+            ),
+            (
+                manifest(made(CreatorKind::Terminal), &one_unrecorded),
+                Some("unrecorded"),
+            ),
+            (
+                manifest(made(CreatorKind::Agent), &one_unrecorded),
+                Some("created_by_agent+unrecorded"),
+            ),
+            (
+                manifest(None, &[None, None]),
+                Some("created_by_agent+unrecorded"),
+            ),
+        ];
+        for (m, form) in cases {
+            let by_agent = form.is_some_and(|f| f.starts_with("created_by_agent"));
+            let unrecorded = form.is_some_and(|f| f.ends_with("unrecorded"));
+            assert_eq!(restore_form(&m, true, true), Ok(form), "{m:?}");
+            let without_tick = restore_form(&m, false, true);
+            let without_unrecorded = restore_form(&m, true, false);
+            let without_either = restore_form(&m, false, false);
+            if by_agent {
+                assert_eq!(without_tick, refused("created_by_agent"), "{m:?}");
+            } else {
+                assert_eq!(without_tick, Ok(form), "{m:?}");
+            }
+            if unrecorded {
+                assert_eq!(without_unrecorded, refused("result_unrecorded"), "{m:?}");
+                assert_eq!(without_either, refused("result_unrecorded"), "{m:?}");
+            } else {
+                assert_eq!(without_unrecorded, Ok(form), "{m:?}");
+                assert_eq!(without_either, without_tick, "{m:?}");
+            }
         }
     }
 

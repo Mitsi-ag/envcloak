@@ -31,9 +31,10 @@ use std::fmt::Write as _;
 
 use envcloak_ipc::view::{
     AddedView, BackupView, CheckReport, ClassificationView, DeleteReport, EntryStatus,
-    EnvFileState, EnvFileView, FileChange, ImportItemView, ImportReport, InitReport, ItemClassView,
-    ItemView, ItemsView, LengthClass, RecoveredView, RecoveryConfirmedView, RefChange, RefEditView,
-    RefStatus, RemovedView, RotatedView, SkipReason, TargetView, UndoReport, View,
+    EnvFileState, EnvFileView, FileBackupCreatorView, FileChange, ImportItemView, ImportReport,
+    InitReport, ItemClassView, ItemView, ItemsView, LengthClass, RecoveredView,
+    RecoveryConfirmedView, RefChange, RefEditView, RefStatus, RemovedView, RotatedView, SkipReason,
+    TargetView, UndoReport, View,
 };
 use envcloak_policy::{display_escaped, escape_for_display, value_shaped};
 
@@ -946,7 +947,15 @@ fn path_reason(token: &str) -> String {
             "its file was changed, but another program changed the old copy under this name, or \
              put its own file there, meanwhile, so it was kept as it is: it may be that program's"
         }
-        "exists" => "a file is there already, and is left as it is",
+        "exists" => "a file is there that is not what the deletion left, and is left as it is",
+        "deleted_since" => {
+            "the deletion rewrote it and it was deleted since, so it is left deleted: writing it \
+             back would bring back what was deleted"
+        }
+        "unrecorded" => {
+            "the backup does not record what the deletion left of it, so only the recovery form \
+             --unrecorded writes it back, where it is missing"
+        }
         "restored" => "restored",
         "unchanged" => "there already, as it was",
         "no_directory" => "its directory is gone",
@@ -1203,20 +1212,31 @@ impl Render for InitReport {
     }
 }
 
+/// Who made a file backup, as the daemon sealed it, in words: for the
+/// statement `init --undo` shows before the passphrase and for its
+/// report. `None` is a backup that does not record it (one an earlier
+/// EnvCloak made).
+pub fn made_by(c: Option<&FileBackupCreatorView>) -> String {
+    match c {
+        None => "made before EnvCloak recorded who makes a backup".to_owned(),
+        Some(c) => match (c.kind.as_str(), c.agent.as_deref()) {
+            ("terminal", _) => "made from a terminal".to_owned(),
+            ("agent", Some(a)) => format!("made by an agent ({}), not by you", shown(a)),
+            ("agent", None) => "made by an agent, not by you".to_owned(),
+            (_, Some(a)) => format!(
+                "made by a process EnvCloak could not identify ({}), not by you",
+                shown(a)
+            ),
+            _ => "made by a process EnvCloak could not identify, not by you".to_owned(),
+        },
+    }
+}
+
 impl Render for UndoReport {
     fn human(&self) -> String {
         let mut o = String::new();
         let _ = writeln!(o, "Backup {}", shown_id(&self.backup));
-        let made = match &self.creator {
-            None => "made by a process EnvCloak did not record".to_owned(),
-            Some(c) => match (c.kind.as_str(), c.agent.as_deref()) {
-                ("terminal", _) => "made from a terminal".to_owned(),
-                ("agent", Some(a)) => format!("made by an agent ({}), not by you", shown(a)),
-                ("agent", None) => "made by an agent, not by you".to_owned(),
-                _ => "made by an unknown process, not by you".to_owned(),
-            },
-        };
-        let _ = writeln!(o, "  {made}");
+        let _ = writeln!(o, "  {}", made_by(self.creator.as_ref()));
         for f in &self.files {
             let _ = writeln!(o, "  {}: {}", shown_path(&f.path), path_reason(&f.state));
         }

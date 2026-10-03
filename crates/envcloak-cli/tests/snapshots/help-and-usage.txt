@@ -251,14 +251,14 @@ $ envcloak init --help
 exit: 0
 --- stdout
 usage: envcloak init [--import] [--yes] [--delete-plaintext] [--json]
-       envcloak init --undo <ID> [--created-by-agent] [--passphrase-fd N] [--json]
+       envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
 --- stderr
 $ envcloak init --bogus
 exit: 2
 --- stdout
 --- stderr
 envcloak: usage: envcloak init [--import] [--yes] [--delete-plaintext] [--json]
-       envcloak init --undo <ID> [--created-by-agent] [--passphrase-fd N] [--json]
+       envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
 $ envcloak import --help
 exit: 0
 --- stdout

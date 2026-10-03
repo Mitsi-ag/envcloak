@@ -265,13 +265,14 @@ const REASON_TEXTS: &[(&str, &str)] = &[
     // A backup v2 restore refused before the proof (`restore_refused`).
     (
         "result_unrecorded",
-        "the process that made the backup never recorded what its change left, so EnvCloak \
-         does not know it; only the recovery form `--unrecorded` restores it",
+        "the backup does not record what the change left (the process that made it never \
+         recorded it, or an earlier EnvCloak made it), so EnvCloak cannot check the file \
+         against it; only the recovery form `--unrecorded` restores it",
     ),
     (
         "created_by_agent",
-        "an agent or an unknown process made the backup, not you; restoring it writes that \
-         process's bytes, so it needs `--created-by-agent`",
+        "the backup was made by an agent or an unknown process, or does not record who made \
+         it; restoring it writes bytes that process stored, so it needs `--created-by-agent`",
     ),
     // A backup replaced under its name, or cut or written into, before it
     // was checked in place (`files_backup_failed`).
