@@ -777,7 +777,7 @@ fn respond<'s>(
             answer::<ImportPlan>(id, &req, |p| import::import_plan(shared, peer, p))
         }
         ImportCommit::NAME => {
-            answer::<ImportCommit>(id, &req, |p| import::import_commit(shared, peer, p))
+            framed::<ImportCommit>(id, &req, |p| import::import_commit(shared, peer, id, p))
         }
         ImportVerify::NAME => {
             answer::<ImportVerify>(id, &req, |p| import::import_verify(shared, peer, p))
@@ -817,24 +817,51 @@ fn respond<'s>(
     }
 }
 
-/// Parses `M`'s parameters, runs `f` and frames the result or error.
+/// Parses `M`'s parameters, runs `f` and frames the result or error. A
+/// result too large for one frame is answered `frame_too_large`, never
+/// `internal`.
 fn answer<'a, M: Method>(
     id: u64,
     req: &IncomingRequest<'a>,
     f: impl FnOnce(M::Params) -> Result<M::Output, RpcError>,
 ) -> Option<Frame> {
-    let result = req.params::<M::Params>().and_then(f);
-    match result {
-        Ok(out) => proto::result_frame(id, &out)
-            .or_else(|_| proto::error_frame(Some(id), &RpcError::new(ErrorKind::Internal)))
-            .ok(),
+    match req.params::<M::Params>().and_then(f) {
+        Ok(out) => match result_framed::<M>(id, &out) {
+            Ok(frame) => Some(frame),
+            Err(e) => proto::error_frame(Some(id), &e).ok(),
+        },
         Err(e) => proto::error_frame(Some(id), &e).ok(),
     }
 }
 
+/// `answer`, `M`'s result, framed as the answer to request `id`: one that
+/// does not fit in a frame is `frame_too_large`, any other failure
+/// `internal`.
+pub(crate) fn result_framed<M: Method>(id: u64, answer: &M::Output) -> Result<Frame, RpcError> {
+    proto::result_frame(id, answer).map_err(|e| match e {
+        FrameError::TooLarge => RpcError::new(ErrorKind::FrameTooLarge),
+        _ => RpcError::new(ErrorKind::Internal),
+    })
+}
+
+/// A method's answer that commits something (a vault write, an audited
+/// delivery): `answer` is framed as the result of request `id` first, and
+/// `commit` runs only once it is known to fit (F-77's order), so an
+/// answer too large for a frame commits nothing. The frame is given back
+/// only when `commit` succeeded, and dropped (wiped) otherwise.
+pub(crate) fn commit_framed<M: Method>(
+    id: u64,
+    answer: &M::Output,
+    commit: impl FnOnce() -> Result<(), RpcError>,
+) -> Result<Frame, RpcError> {
+    let frame = result_framed::<M>(id, answer)?;
+    commit()?;
+    Ok(frame)
+}
+
 /// As [`answer`], for a method that frames its own result: a covered
-/// `run.request` and `files.restore` frame their answer before they
-/// commit it (F-77).
+/// `run.request`, `files.restore` and `import.commit` frame their answer
+/// before they commit it (F-77, [`commit_framed`]).
 fn framed<'a, M: Method>(
     id: u64,
     req: &IncomingRequest<'a>,
@@ -989,6 +1016,51 @@ fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-77's order for every method that commits something: the answer
+    /// is framed first, and the commit runs only when it fits. One larger
+    /// than a frame is `frame_too_large` with nothing committed; one that
+    /// fits commits once and is given back; a commit that fails gives its
+    /// error, not the frame.
+    ///
+    /// Mutation: commit, then frame (the oversized answer commits).
+    #[test]
+    fn an_answer_is_framed_before_anything_is_committed() {
+        let plan = |digest: String| envcloak_ipc::view::ImportPlanView {
+            digest,
+            entries: Vec::new(),
+            items: Vec::new(),
+        };
+        let big = plan("x".repeat(envcloak_ipc::MAX_FRAME));
+        let mut commits = 0;
+        let got = commit_framed::<ImportCommit>(7, &big, || {
+            commits += 1;
+            Ok(())
+        });
+        assert_eq!(got.unwrap_err(), RpcError::new(ErrorKind::FrameTooLarge));
+        assert_eq!(commits, 0, "committed an answer that was never sent");
+        assert_eq!(
+            result_framed::<ImportCommit>(7, &big).unwrap_err().kind,
+            ErrorKind::FrameTooLarge
+        );
+
+        let small = plan("x".to_owned());
+        let frame = commit_framed::<ImportCommit>(7, &small, || {
+            commits += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(commits, 1);
+        assert_eq!(
+            frame.len(),
+            result_framed::<ImportCommit>(7, &small).unwrap().len()
+        );
+        let failed = RpcError::new(ErrorKind::AuditFailed);
+        assert_eq!(
+            commit_framed::<ImportCommit>(7, &small, || Err(failed)).unwrap_err(),
+            failed
+        );
+    }
 
     #[test]
     fn places_are_limited_in_all_and_per_process() {
