@@ -12,7 +12,7 @@ mod common;
 use common::{KitFixture, dir_names};
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::file_backup::{
-    BackupFile, FILE_BACKUP_RETENTION, FileBackupId, MAX_BACKUP_BYTES, MAX_BACKUP_FILES,
+    BackupFile, FILE_BACKUP_RETENTION, FileBackupId, FileLeft, MAX_BACKUP_BYTES, MAX_BACKUP_FILES,
     STAGING_GRACE, age_file_backup_for_testing, purge_file_backups,
 };
 use envcloak_core::vault::VaultErrorKind;
@@ -39,11 +39,13 @@ fn files(f: &KitFixture) -> (Vec<Vec<u8>>, Vec<BackupFile>) {
             path: "/p/acme-web/.env".into(),
             mode: 0o600,
             content: SecretBytes::copy_from(&raw[0]),
+            left: Some(FileLeft::Rewritten([0x5a; 32])),
         },
         BackupFile {
             path: "/p/acme-web/.env.short".into(),
             mode: 0o644,
             content: SecretBytes::copy_from(&raw[1]),
+            left: Some(FileLeft::Removed),
         },
     ];
     (raw, backup)
@@ -87,6 +89,7 @@ fn a_backup_gives_the_files_back_byte_for_byte_and_holds_ciphertext_only() {
         assert!(b.content.ct_eq(want));
         assert_eq!(b.path, orig.path);
         assert_eq!(b.mode, orig.mode);
+        assert_eq!(b.left, orig.left);
     }
     // After the vault locks and unlocks, with the id as text.
     drop(v);
@@ -179,6 +182,7 @@ fn a_backup_has_limits() {
         path: path.into(),
         mode: 0o600,
         content: SecretBytes::copy_from(&vec![b'x'; len]),
+        left: None,
     };
     let kind = |files: &[BackupFile]| v.backup_files(files).unwrap_err().kind();
     assert_eq!(kind(&[]), VaultErrorKind::InvalidRecord);

@@ -1381,6 +1381,104 @@ fn undo_replaces_only_what_the_deletion_left() {
     g.sweep();
 }
 
+/// The undo report's files, by name, with their states.
+fn undo_states(out: &Output) -> Vec<(String, String)> {
+    json(out)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["path"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+                f["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// F-78, end to end: after `init --delete-plaintext`, a whole entry the
+/// person then takes out of the rewritten `.env` stays out: `init --undo`
+/// leaves that file as it is (`exists`) and puts back `.env.short`, which
+/// the deletion removed. Once `.env` is again exactly what the deletion
+/// left, the same backup puts its original back (`restored`).
+#[test]
+fn undo_keeps_an_entry_taken_out_after_the_deletion() {
+    let g = Gate16::new(true);
+    ok(&g.import(), &g.cs);
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--delete-plaintext", "--json"],
+        &[],
+    );
+    ok(&out, &g.cs);
+    let backup = json(&out)["delete"]["backup"].as_str().unwrap().to_owned();
+    let env = g.repo.join(".env");
+    let left = std::fs::read(&env).unwrap();
+    let (name, original) = &g.files[0];
+    assert_eq!(*name, ".env");
+    assert_eq!(left, env_left(original));
+    // The person then takes a whole configuration entry out.
+    let edited: Vec<u8> = left
+        .split_inclusive(|&b| b == b'\n')
+        .filter(|l| !l.starts_with(b"PORT="))
+        .flatten()
+        .copied()
+        .collect();
+    assert_ne!(edited, left);
+    std::fs::write(&env, &edited).unwrap();
+    let pass = g.home.root().join("pass");
+    std::fs::write(
+        &pass,
+        format!("{}\n", by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str()),
+    )
+    .unwrap();
+    let undo = || {
+        let out = person_in(
+            &g.home,
+            &g.repo,
+            &["init", "--undo", &backup, "--passphrase-fd", "3", "--json"],
+            &[(3, &pass, true)],
+        );
+        assert_no_canary(&out.stdout, &g.cs);
+        assert_no_canary(&out.stderr, &g.cs);
+        out
+    };
+    let out = undo();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("undo_incomplete"), "{}", stderr(&out));
+    assert_eq!(
+        undo_states(&out),
+        [
+            (".env".to_owned(), "exists".to_owned()),
+            (".env.short".to_owned(), "restored".to_owned()),
+        ]
+    );
+    assert_eq!(std::fs::read(&env).unwrap(), edited, "the entry came back");
+    assert_eq!(g.intact(), [false, true]);
+
+    // Exactly what the deletion left again: the original comes back.
+    std::fs::write(&env, &left).unwrap();
+    let out = undo();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        undo_states(&out),
+        [
+            (".env".to_owned(), "restored".to_owned()),
+            (".env.short".to_owned(), "unchanged".to_owned()),
+        ]
+    );
+    assert_eq!(g.intact(), [true, true]);
+    std::fs::remove_file(&pass).unwrap();
+    g.sweep();
+}
+
 /// After a kill: every entry of every file is in its file, or committed in
 /// the vault where the manifest binds it. A file that is there is the one
 /// read, or what the deletion leaves of it (some entries taken out whole,

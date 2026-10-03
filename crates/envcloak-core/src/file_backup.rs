@@ -9,7 +9,10 @@
 //! - record 0: a fresh 256-bit key for this backup alone, sealed under
 //!   the vault's `backup` subkey;
 //! - record 1: a manifest sealed under that key: the SHA-256 of the
-//!   header, and each file's path, mode and length;
+//!   header, and each file's path, mode and length, and what the deletion
+//!   leaves of it ([`FileLeft`]: removed, or rewritten to bytes of a
+//!   SHA-256 the manifest holds), so `envcloak init --undo` writes the
+//!   original back over exactly that and nothing else (F-78);
 //! - records 2 and up: each file's bytes, sealed under that key.
 //!
 //! Every record is XChaCha20-Poly1305, bound by its associated data to the
@@ -68,7 +71,11 @@ pub const MAX_BACKUP_PATH: usize = 4096;
 
 const MAGIC: [u8; 4] = *b"ECFB";
 const FORMAT_VERSION: u8 = 1;
-const MANIFEST_VERSION: u8 = 1;
+/// The manifest's version: 2 records what the deletion leaves of each
+/// file; 1, which backups made before it hold, does not.
+const MANIFEST_VERSION: u8 = 2;
+/// The manifest's version before [`FileLeft`] was recorded: still read.
+const MANIFEST_V1: u8 = 1;
 /// `magic(4) version(1) vault_id(16) schema_version(2) epoch(4)
 /// backup_id(16) created_at(8)`.
 const HEADER_LEN: usize = 51;
@@ -126,6 +133,16 @@ impl core::fmt::Display for FileBackupId {
     }
 }
 
+/// What a deletion leaves of a file it backs up (F-78), recorded in the
+/// backup so that an undo puts the original back only over exactly that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileLeft {
+    /// Nothing: the file is removed.
+    Removed,
+    /// The file is rewritten to bytes with this SHA-256.
+    Rewritten([u8; 32]),
+}
+
 /// One file in a backup.
 #[derive(Debug)]
 pub struct BackupFile {
@@ -134,6 +151,9 @@ pub struct BackupFile {
     /// Its permission bits.
     pub mode: u32,
     pub content: SecretBytes,
+    /// What the deletion leaves of it; `None` when the backup does not
+    /// say (one made before it was recorded, manifest version 1).
+    pub left: Option<FileLeft>,
 }
 
 /// A backup [`Vault::backup_files`] wrote.
@@ -238,7 +258,8 @@ fn parse_header(h: &[u8; HEADER_LEN]) -> Result<Header, VaultError> {
     })
 }
 
-/// The manifest: the header's hash and each file's path, mode and length.
+/// The manifest: the header's hash and each file's path, mode and length,
+/// and what the deletion leaves of it.
 fn encode_manifest(header: &[u8], files: &[BackupFile]) -> Result<Vec<u8>, VaultError> {
     let too_large = || VaultError::from(VaultErrorKind::TooLarge);
     let mut m = Vec::new();
@@ -256,12 +277,26 @@ fn encode_manifest(header: &[u8], files: &[BackupFile]) -> Result<Vec<u8>, Vault
         m.extend_from_slice(&f.mode.to_be_bytes());
         let size = u32::try_from(f.content.len()).map_err(|_| too_large())?;
         m.extend_from_slice(&size.to_be_bytes());
+        match f.left {
+            None => m.push(LEFT_UNKNOWN),
+            Some(FileLeft::Removed) => m.push(LEFT_REMOVED),
+            Some(FileLeft::Rewritten(sha)) => {
+                m.push(LEFT_REWRITTEN);
+                m.extend_from_slice(&sha);
+            }
+        }
     }
     Ok(m)
 }
 
-/// One manifest entry: path, mode and length.
-type Entry = (String, u32, usize);
+/// A manifest entry's `left` byte: not recorded, removed, or rewritten
+/// (then the SHA-256 of what is left follows).
+const LEFT_UNKNOWN: u8 = 0;
+const LEFT_REMOVED: u8 = 1;
+const LEFT_REWRITTEN: u8 = 2;
+
+/// One manifest entry: path, mode, length and what is left.
+type Entry = (String, u32, usize, Option<FileLeft>);
 
 /// Reads fixed-size pieces off the front of a slice.
 struct Take<'a>(&'a [u8]);
@@ -286,7 +321,8 @@ impl<'a> Take<'a> {
 fn decode_manifest(b: &[u8]) -> Result<([u8; 32], Vec<Entry>), VaultError> {
     let damaged = || VaultError::from(VaultErrorKind::BackupDamaged);
     let mut r = Take(b);
-    if r.array::<1>()? != [MANIFEST_VERSION] {
+    let [version] = r.array::<1>()?;
+    if version != MANIFEST_VERSION && version != MANIFEST_V1 {
         return Err(damaged());
     }
     let hash = r.array::<32>()?;
@@ -307,7 +343,17 @@ fn decode_manifest(b: &[u8]) -> Result<([u8; 32], Vec<Entry>), VaultError> {
         if total > MAX_BACKUP_BYTES {
             return Err(damaged());
         }
-        out.push((path, mode, size));
+        let left = if version == MANIFEST_V1 {
+            None
+        } else {
+            match r.array::<1>()? {
+                [LEFT_UNKNOWN] => None,
+                [LEFT_REMOVED] => Some(FileLeft::Removed),
+                [LEFT_REWRITTEN] => Some(FileLeft::Rewritten(r.array()?)),
+                _ => return Err(damaged()),
+            }
+        };
+        out.push((path, mode, size, left));
     }
     if !r.0.is_empty() {
         return Err(damaged());
@@ -527,7 +573,7 @@ impl Vault {
             return Err(damaged());
         }
         let mut out = Vec::with_capacity(entries.len());
-        for (i, (path, mode, size)) in entries.into_iter().enumerate() {
+        for (i, (path, mode, size, left)) in entries.into_iter().enumerate() {
             let sealed = read_record(&mut r)?;
             let content =
                 open_value(&key, &ctx.aad(i as u64 + 2), &sealed).map_err(|_| damaged())?;
@@ -538,6 +584,7 @@ impl Vault {
                 path,
                 mode,
                 content,
+                left,
             });
         }
         // Nothing may follow the last record.
@@ -735,17 +782,69 @@ mod tests {
         assert_eq!(h.created_at, 1_790_000_000);
     }
 
+    /// F-78: the manifest records what the deletion leaves of each file
+    /// (removed, rewritten with the SHA-256 of what is left, or not
+    /// recorded) and reads each back; a version 1 manifest, as a backup
+    /// made before this holds, reads as not recording it; an unknown kind,
+    /// a SHA-256 cut short and an unknown version are damage.
+    #[test]
+    fn a_manifest_records_what_the_deletion_leaves() {
+        let file = |left| BackupFile {
+            path: "/p/.env".into(),
+            mode: 0o600,
+            content: SecretBytes::copy_from(b"A=1\n"),
+            left,
+        };
+        let kinds = [
+            Some(FileLeft::Removed),
+            Some(FileLeft::Rewritten([9; 32])),
+            None,
+        ];
+        let files = kinds.map(file);
+        let m = encode_manifest(b"header", &files).unwrap();
+        assert_eq!(m[0], MANIFEST_VERSION);
+        let (_, entries) = decode_manifest(&m).unwrap();
+        let left: Vec<Option<FileLeft>> = entries.iter().map(|e| e.3).collect();
+        assert_eq!(left, kinds);
+        // The same entries in version 1, without the byte.
+        let mut v1 = vec![MANIFEST_V1];
+        v1.extend_from_slice(&m[1..37]);
+        for _ in 0..3 {
+            v1.extend_from_slice(&7u16.to_be_bytes());
+            v1.extend_from_slice(b"/p/.env");
+            v1.extend_from_slice(&0o600u32.to_be_bytes());
+            v1.extend_from_slice(&4u32.to_be_bytes());
+        }
+        let (_, entries) = decode_manifest(&v1).unwrap();
+        assert!(entries.iter().all(|e| e.3.is_none() && e.2 == 4));
+        // Damage: a kind byte no version has, a SHA-256 cut short, and a
+        // version 1 manifest carrying a kind byte.
+        let at = 37 + 2 + 7 + 4 + 4;
+        let mut bad = m.clone();
+        bad[at] = 3;
+        assert!(decode_manifest(&bad).is_err());
+        let one = encode_manifest(b"header", &[file(Some(FileLeft::Rewritten([9; 32])))]).unwrap();
+        assert!(decode_manifest(&one[..one.len() - 1]).is_err());
+        let mut v1_extra = v1.clone();
+        v1_extra.push(LEFT_REMOVED);
+        assert!(decode_manifest(&v1_extra).is_err());
+        let mut v3 = m.clone();
+        v3[0] = 3;
+        assert!(decode_manifest(&v3).is_err());
+    }
+
     #[test]
     fn a_manifest_decodes_only_whole() {
         let files = [BackupFile {
             path: "/p/.env".into(),
             mode: 0o600,
             content: SecretBytes::copy_from(b"A=1\n"),
+            left: None,
         }];
         let m = encode_manifest(b"header", &files).unwrap();
         let (hash, entries) = decode_manifest(&m).unwrap();
         assert_eq!(hash, <[u8; 32]>::from(Sha256::digest(b"header")));
-        assert_eq!(entries, [("/p/.env".to_owned(), 0o600, 4)]);
+        assert_eq!(entries, [("/p/.env".to_owned(), 0o600, 4, None)]);
         for cut in 0..m.len() {
             assert!(decode_manifest(&m[..cut]).is_err(), "{cut}");
         }
@@ -778,6 +877,7 @@ mod tests {
                 path: "/p/.env".into(),
                 mode: 0o600,
                 content: SecretBytes::copy_from(b"A=1\n"),
+                left: None,
             }];
             let backups = paths.backups_dir.clone();
             let mut did = 0;
@@ -841,6 +941,7 @@ mod tests {
                 path: "/p/.env".into(),
                 mode: 0o600,
                 content: SecretBytes::copy_from(b"A=1\n"),
+                left: None,
             }];
             let backups = paths.backups_dir.clone();
             let mut did = 0;
@@ -906,6 +1007,7 @@ mod tests {
             path: "/p/.env".into(),
             mode: 0o600,
             content: SecretBytes::copy_from(b"A=1\n"),
+            left: None,
         }];
         let (backups, other) = (paths.backups_dir.clone(), dir.path().join("other"));
         let mut did = 0;

@@ -49,6 +49,7 @@ fn backups_race_child() {
                 path: "/p/.env".into(),
                 mode: 0o600,
                 content: SecretBytes::copy_from(b"A=1\n"),
+                left: None,
             }])
             .map(drop),
         "v2" => v
@@ -97,6 +98,7 @@ fn race(which: &str, swap_data_dir: bool) {
         path: "/p/.env".into(),
         mode: 0o600,
         content: SecretBytes::copy_from(b"B=2\n"),
+        left: None,
     }])
     .unwrap();
     std::fs::write(
