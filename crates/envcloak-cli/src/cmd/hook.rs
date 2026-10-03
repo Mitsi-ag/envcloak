@@ -5,7 +5,10 @@
 //! with EnvCloak's absolute path.
 //!
 //! The host's payload is read from standard input into wiped storage, at
-//! most 2 MiB, within 2 seconds of the start. What to answer is
+//! most 2 MiB, and answered within 2 seconds of the start: the deadline
+//! covers the reading, the decision and `SessionStart`'s lookup alike
+//! (the work runs on a thread of its own, and an answer not ready by the
+//! deadline is `unchecked`, Codex review). What to answer is
 //! `envcloak_agents::hook::decide`, a pure function of the payload:
 //! registry key patterns and key shape for a prompt, what a command reads
 //! or runs and file names for a tool call. Nothing is compared with the
@@ -15,8 +18,9 @@
 //! - Stopped: the host's JSON on standard output, the message (with
 //!   EnvCloak's marker, `[envcloak:<reason>]`) on standard error, exit 2,
 //!   which stops the prompt or the tool call on both hosts.
-//! - A payload larger than 2 MiB, or one that does not arrive in time:
-//!   the prompt or the tool call is stopped (`unchecked`).
+//! - A payload larger than 2 MiB, one that does not arrive in time, or one
+//!   not decided in time: the prompt or the tool call is stopped
+//!   (`unchecked`).
 //! - A payload that is not the one `--host` and `--event` name: no
 //!   decision, a value-free diagnostic and exit 1, which both hosts take
 //!   as a hook error that stops nothing.
@@ -117,6 +121,29 @@ fn no_decision() -> ExitCode {
     .report(NO_DECISION)
 }
 
+/// What the work on the payload came to.
+enum Reply {
+    /// The payload is not one this hook was set up for.
+    NoDecision,
+    /// Bytes for standard output and standard error, and the exit status.
+    Answer(hook::Answer),
+}
+
+/// `work`, run on a thread of its own, if it is done by `deadline`. A
+/// thread still running then is left to the process's exit, which follows
+/// at once.
+fn within<T: Send + 'static>(
+    deadline: Instant,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+}
+
 pub fn run(args: &[&str]) -> ExitCode {
     let start = Instant::now();
     let Some((host, event)) = parse(args) else {
@@ -132,59 +159,89 @@ pub fn run(args: &[&str]) -> ExitCode {
         Err(Unread::Unchecked) => return ExitCode::SUCCESS,
         Err(Unread::Failed) => return no_decision(),
     };
-    let decision = hook::decide(host, event, &payload);
-    if decision == Decision::NoDecision {
-        return no_decision();
+    let work = move || {
+        let decision = hook::decide(host, event, &payload);
+        if decision == Decision::NoDecision {
+            return Reply::NoDecision;
+        }
+        if event == Event::SessionStart {
+            return Reply::Answer(session_start(host, &payload, deadline));
+        }
+        Reply::Answer(answer(host, event, decision))
+    };
+    match within(deadline, work) {
+        Some(Reply::NoDecision) => no_decision(),
+        Some(Reply::Answer(a)) => emit(&a),
+        None if event == Event::SessionStart => ExitCode::SUCCESS,
+        None => emit(&answer(host, event, Decision::Deny(Reason::Unchecked))),
     }
-    if event == Event::SessionStart {
-        return session_start(host, &payload, deadline);
-    }
-    emit(&answer(host, event, decision))
 }
 
 /// `SessionStart`: the project's bound names, when the daemon answers in
 /// time; nothing otherwise.
-fn session_start(host: Host, payload: &SecretBuf, deadline: Instant) -> ExitCode {
+fn session_start(host: Host, payload: &SecretBuf, deadline: Instant) -> hook::Answer {
+    let nothing = hook::Answer {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        code: 0,
+    };
     let Some(cwd) = payload_cwd(host, Event::SessionStart, payload) else {
-        return ExitCode::SUCCESS;
+        return nothing;
     };
     let Ok(Some(manifest)) = find_manifest(Path::new(&cwd)) else {
-        return ExitCode::SUCCESS;
+        return nothing;
     };
     let Some(text) = manifest.to_str().map(str::to_owned) else {
-        return ExitCode::SUCCESS;
+        return nothing;
     };
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let names = (|| {
-            let mut c = envcloak_client::connect::connect().ok()?;
-            let check = c.items_check(Some(&text), &[]).ok()?;
-            let mut names: Vec<String> = check
-                .bindings
-                .iter()
-                .filter_map(|b| b.env_name.clone())
-                .filter(|n| !envcloak_client::render::looks_like_value(n))
-                .collect();
-            names.sort();
-            names.dedup();
-            names.truncate(64);
-            Some(names)
-        })();
-        let _ = tx.send(names);
+    let names = within(deadline, move || {
+        let mut c = envcloak_client::connect::connect().ok()?;
+        let check = c.items_check(Some(&text), &[]).ok()?;
+        let mut names: Vec<String> = check
+            .bindings
+            .iter()
+            .filter_map(|b| b.env_name.clone())
+            .filter(|n| !envcloak_client::render::looks_like_value(n))
+            .collect();
+        names.sort();
+        names.dedup();
+        names.truncate(64);
+        Some(names)
     });
-    let left = deadline.saturating_duration_since(Instant::now());
-    match rx.recv_timeout(left) {
-        Ok(Some(names)) if !names.is_empty() => {
-            let _ = std::io::stdout().write_all(&session_context(host, &names));
-            ExitCode::SUCCESS
-        }
-        _ => ExitCode::SUCCESS,
+    match names {
+        Some(Some(names)) if !names.is_empty() => hook::Answer {
+            stdout: session_context(host, &names),
+            stderr: Vec::new(),
+            code: 0,
+        },
+        _ => nothing,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Codex review's finding: the 2 seconds cover the decision too,
+    /// not only the reading. Work not done by the deadline gives no
+    /// answer, at the deadline; work done in time gives its own.
+    ///
+    /// Mutation checked: `within` running the work on the calling thread
+    /// and returning its result (the previous synchronous `decide`): the
+    /// slow work's answer comes after 3 s and this fails.
+    #[test]
+    fn work_past_the_deadline_gives_no_answer_at_the_deadline() {
+        let t = Instant::now();
+        let deadline = t + Duration::from_millis(300);
+        let slow = within(deadline, || {
+            std::thread::sleep(Duration::from_secs(3));
+            1
+        });
+        assert_eq!(slow, None);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        let quick = within(Instant::now() + Duration::from_secs(5), || 2);
+        assert_eq!(quick, Some(2));
+    }
 
     #[test]
     fn arguments_are_read_exactly() {

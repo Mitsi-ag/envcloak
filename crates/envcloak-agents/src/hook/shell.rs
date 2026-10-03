@@ -48,10 +48,12 @@
 //! Nothing here keeps or returns text from the command: the result is a
 //! class.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
 use envcloak_scan::{FileKind, dotenv_kind};
+use zeroize::{Zeroize, Zeroizing};
 
 /// A class of command the hook denies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,6 +95,17 @@ enum Ch {
     Unknown,
 }
 
+impl Zeroize for Ch {
+    fn zeroize(&mut self) {
+        // Both bytes written; a `Vec`'s zeroize then wipes its whole
+        // buffer as well.
+        *self = Ch::Lit {
+            b: 0,
+            quoted: false,
+        };
+    }
+}
+
 type Word = Vec<Ch>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +130,23 @@ struct Cmd {
     words: Vec<Word>,
     redirs: Vec<Redir>,
 }
+
+impl Cmd {
+    /// A command's text can hold a key (`curl -H "Authorization: ..."`):
+    /// it is wiped once read.
+    fn wipe(&mut self) {
+        for w in &mut self.words {
+            w.zeroize();
+        }
+        for r in &mut self.redirs {
+            r.target.zeroize();
+        }
+    }
+}
+
+/// A here-document's or here-string's body, and whether its delimiter was
+/// quoted.
+type Body = (Zeroizing<Vec<u8>>, bool);
 
 /// A here-document whose body is still to be read, at the next newline.
 #[derive(Debug, Clone)]
@@ -167,9 +197,10 @@ impl<'a> Cur<'a> {
 struct Analyzer {
     cmds: Vec<Cmd>,
     pending: Vec<Pending>,
-    /// Here-document bodies read: the command's id, the body, whether its
-    /// delimiter was quoted.
-    bodies: Vec<(usize, Vec<u8>, bool)>,
+    /// Here-document bodies read, by the id of the command they feed
+    /// (looked up once per command, so many bodies cost no more than one
+    /// pass: Codex review).
+    bodies: HashMap<usize, Vec<Body>>,
     found: Vec<Class>,
     work: usize,
     /// Quotes, expansions and arrays open inside one another: past
@@ -198,12 +229,20 @@ pub fn check_argv<S: AsRef<OsStr>>(argv: &[S]) -> Option<Class> {
     a.result(r)
 }
 
+impl Drop for Analyzer {
+    fn drop(&mut self) {
+        for c in &mut self.cmds {
+            c.wipe();
+        }
+    }
+}
+
 impl Analyzer {
     fn new() -> Self {
         Analyzer {
             cmds: Vec::new(),
             pending: Vec::new(),
-            bodies: Vec::new(),
+            bodies: HashMap::new(),
             found: Vec::new(),
             work: 0,
             nest: 0,
@@ -480,7 +519,7 @@ impl Analyzer {
                 // A shell reads it as its script (`sh <<< 'cmd'`).
                 let mut body = joined(std::slice::from_ref(&target));
                 body.push(b'\n');
-                self.bodies.push((cmd.id, body, true));
+                self.bodies.entry(cmd.id).or_default().push((body, true));
             }
             Op::HereDoc { strip } => {
                 let delim = literal(&target).ok_or(Amb)?;
@@ -508,7 +547,7 @@ impl Analyzer {
     fn read_heredocs(&mut self, c: &mut Cur<'_>) -> Result<(), Amb> {
         let pending = std::mem::take(&mut self.pending);
         for p in pending {
-            let mut body = Vec::new();
+            let mut body = Zeroizing::new(Vec::new());
             while c.peek().is_some() {
                 let start = c.i;
                 while let Some(b) = c.peek() {
@@ -536,7 +575,7 @@ impl Analyzer {
             if !p.quoted {
                 self.body_expansions(&body, p.depth)?;
             }
-            self.bodies.push((p.cmd, body, p.quoted));
+            self.bodies.entry(p.cmd).or_default().push((body, p.quoted));
         }
         Ok(())
     }
@@ -989,25 +1028,24 @@ impl Analyzer {
         }
     }
 
-    /// Looks at every command read, and at what they run.
+    /// Looks at every command read, and at what they run (commands found
+    /// on the way are read in turn). Each command and its bodies are taken
+    /// once, by its id.
     fn classify_all(&mut self) -> Result<(), Amb> {
         let mut i = 0;
         while i < self.cmds.len() {
             self.tick(1)?;
-            let cmd = self.cmds[i].clone();
-            let bodies: Vec<(Vec<u8>, bool)> = self
-                .bodies
-                .iter()
-                .filter(|(id, _, _)| *id == cmd.id)
-                .map(|(_, b, q)| (b.clone(), *q))
-                .collect();
-            self.classify(&cmd, &bodies)?;
+            let mut cmd = std::mem::take(&mut self.cmds[i]);
+            let bodies = self.bodies.remove(&cmd.id).unwrap_or_default();
+            let r = self.classify(&cmd, &bodies);
+            cmd.wipe();
+            r?;
             i += 1;
         }
         Ok(())
     }
 
-    fn classify(&mut self, cmd: &Cmd, bodies: &[(Vec<u8>, bool)]) -> Result<(), Amb> {
+    fn classify(&mut self, cmd: &Cmd, bodies: &[Body]) -> Result<(), Amb> {
         for r in &cmd.redirs {
             if r.kind == RedirKind::Read && dotenv(&r.target) == Tri::Is {
                 self.found.push(Class::EnvFile);
@@ -1016,7 +1054,7 @@ impl Analyzer {
                 self.found.push(Class::EnvDump);
             }
         }
-        let mut words = Vec::new();
+        let mut words: Zeroizing<Vec<Word>> = Zeroizing::new(Vec::new());
         let mut cost = BraceCost::default();
         for w in &cmd.words {
             words.extend(brace_expand(w, &mut cost, 0)?);
@@ -1030,7 +1068,7 @@ impl Analyzer {
     }
 
     /// What `words`, a command and its arguments, runs.
-    fn run(&mut self, words: &[Word], bodies: &[(Vec<u8>, bool)], depth: usize) -> Result<(), Amb> {
+    fn run(&mut self, words: &[Word], bodies: &[Body], depth: usize) -> Result<(), Amb> {
         self.tick(1)?;
         if depth > MAX_DEPTH {
             return Err(Amb);
@@ -1132,6 +1170,125 @@ impl Analyzer {
             }
             b"env" => self.env(args, bodies, next),
             b"xargs" => self.xargs(args, next),
+            b"script" => self.script_cmd(args, next),
+            b"strace" | b"ltrace" => {
+                let i = skip_flags(
+                    args,
+                    &[
+                        b"-a",
+                        b"-A",
+                        b"-b",
+                        b"-e",
+                        b"-E",
+                        b"-I",
+                        b"-l",
+                        b"-n",
+                        b"-o",
+                        b"-O",
+                        b"-p",
+                        b"-P",
+                        b"-s",
+                        b"-S",
+                        b"-u",
+                        b"-U",
+                        b"-w",
+                        b"-X",
+                        b"-F",
+                        b"--output",
+                        b"--attach",
+                        b"--string-limit",
+                        b"--user",
+                        b"--env",
+                        b"--trace",
+                        b"--signal",
+                        b"--status",
+                        b"--columns",
+                        b"--trace-path",
+                    ],
+                );
+                self.run(&args[i..], bodies, next)
+            }
+            b"flock" => self.flock(args, next),
+            b"npx" | b"bunx" | b"pnpx" => self.npx(args, next),
+            b"npm" | b"pnpm" | b"yarn" | b"bun" => match args.first().and_then(|a| plain(a)) {
+                Some(sub) if matches!(sub.as_slice(), b"exec" | b"x" | b"dlx") => {
+                    self.npx(&args[1..], next)
+                }
+                _ => Ok(()),
+            },
+            b"uv" | b"poetry" | b"pipenv" | b"pdm" | b"rye" | b"hatch" => {
+                match args.first().and_then(|a| plain(a)) {
+                    Some(sub) if sub == b"run" => {
+                        let rest = &args[1..];
+                        let i = skip_flags(
+                            rest,
+                            &[
+                                b"--with",
+                                b"--with-editable",
+                                b"--with-requirements",
+                                b"--python",
+                                b"-p",
+                                b"--project",
+                                b"--directory",
+                                b"-C",
+                                b"-P",
+                                b"--env-file",
+                                b"--extra",
+                                b"--group",
+                                b"--package",
+                                b"--index",
+                                b"--index-url",
+                                b"--extra-index-url",
+                                b"--default-index",
+                                b"-i",
+                                b"--find-links",
+                                b"-f",
+                            ],
+                        );
+                        self.run(&rest[i..], bodies, next)
+                    }
+                    _ => Ok(()),
+                }
+            }
+            b"bundle" | b"asdf" => match args.first().and_then(|a| plain(a)) {
+                Some(sub) if sub == b"exec" => {
+                    let rest = &args[1..];
+                    let i = skip_flags(rest, &[]);
+                    self.run(&rest[i..], bodies, next)
+                }
+                _ => Ok(()),
+            },
+            b"direnv" => match args.first().and_then(|a| plain(a)) {
+                // `direnv exec DIR COMMAND...`
+                Some(sub) if sub == b"exec" => self.run(args.get(2..).unwrap_or(&[]), bodies, next),
+                _ => Ok(()),
+            },
+            b"mise" | b"rtx" => match args.first().and_then(|a| plain(a)) {
+                Some(sub) if sub == b"exec" || sub == b"x" => self.mise(&args[1..], next),
+                _ => Ok(()),
+            },
+            b"arch" => {
+                // macOS's `arch [-arch NAME | -x86_64 | -arm64 ...] [-e
+                // VAR=VALUE] [-d VAR] PROGRAM [ARGS]`.
+                let i = skip_flags(args, &[b"-arch", b"-e", b"-d"]);
+                self.run(&args[i..], bodies, next)
+            }
+            b"chronic" => {
+                let i = skip_flags(args, &[]);
+                self.run(&args[i..], bodies, next)
+            }
+            b"taskset" => {
+                let i = skip_flags(args, &[]);
+                if option_chars(&args[..i]).contains(&b'p')
+                    || args[..i]
+                        .iter()
+                        .any(|a| plain(a).as_deref() == Some(b"--pid"))
+                {
+                    return Ok(());
+                }
+                // The mask, then the command.
+                self.run(args.get(i + 1..).unwrap_or(&[]), bodies, next)
+            }
             b"watch" => {
                 let mut i = 0;
                 let mut exec_form = false;
@@ -1258,7 +1415,7 @@ impl Analyzer {
 
     /// `env [options] [NAME=VALUE]... [command]`: with no command, it
     /// prints the environment.
-    fn env(&mut self, args: &[Word], bodies: &[(Vec<u8>, bool)], depth: usize) -> Result<(), Amb> {
+    fn env(&mut self, args: &[Word], bodies: &[Body], depth: usize) -> Result<(), Amb> {
         let mut i = 0;
         while let Some(a) = args.get(i) {
             let Some(o) = plain(a) else {
@@ -1286,16 +1443,16 @@ impl Analyzer {
                     let mut text = joined(std::slice::from_ref(s));
                     for rest in args.get(i + 1..).unwrap_or(&[]) {
                         text.push(b' ');
-                        text.extend(joined(std::slice::from_ref(rest)));
+                        text.extend_from_slice(&joined(std::slice::from_ref(rest)));
                     }
                     return self.script(&text, depth);
                 }
                 _ if o.starts_with(b"--split-string=") || (o.starts_with(b"-S") && o.len() > 2) => {
                     let cut = if o.starts_with(b"-S") { 2 } else { 15 };
-                    let mut text = o[cut..].to_vec();
+                    let mut text = Zeroizing::new(o[cut..].to_vec());
                     for rest in args.get(i..).unwrap_or(&[]) {
                         text.push(b' ');
-                        text.extend(joined(std::slice::from_ref(rest)));
+                        text.extend_from_slice(&joined(std::slice::from_ref(rest)));
                     }
                     return self.script(&text, depth);
                 }
@@ -1342,14 +1499,118 @@ impl Analyzer {
         self.run(args.get(i..).unwrap_or(&[]), &[], depth)
     }
 
+    /// `script`: util-linux's `-c COMMAND` (run by a shell), or the BSD and
+    /// macOS form, `script [options] [FILE [COMMAND...]]`.
+    fn script_cmd(&mut self, args: &[Word], depth: usize) -> Result<(), Amb> {
+        // `-c` anywhere among the options (util-linux reads options after
+        // the file too).
+        for (k, a) in args.iter().enumerate() {
+            match plain(a).as_deref() {
+                Some(b"-c" | b"--command") => {
+                    let s = args.get(k + 1).ok_or(Amb)?;
+                    return self.script(&joined(std::slice::from_ref(s)), depth);
+                }
+                Some(o) if o.starts_with(b"--command=") => {
+                    return self.script(&Zeroizing::new(o[10..].to_vec()), depth);
+                }
+                Some(b"--") => break,
+                _ => {}
+            }
+        }
+        let mut i = 0;
+        while let Some(o) = args.get(i).and_then(|a| plain(a)) {
+            if !o.starts_with(b"-") || o == b"-" {
+                break;
+            }
+            i += 1;
+            if o == b"--" {
+                break;
+            }
+            match o.as_slice() {
+                // BSD's `-t TIME` (util-linux's `-t` takes no word).
+                b"-t"
+                    if args
+                        .get(i)
+                        .and_then(|a| plain(a))
+                        .is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit)) =>
+                {
+                    i += 1
+                }
+                b"-F" | b"-T" | b"-I" | b"-O" | b"-B" | b"-E" | b"-m" | b"-o" => i += 1,
+                _ => {}
+            }
+        }
+        // The file, then the command.
+        self.run(args.get(i + 1..).unwrap_or(&[]), &[], depth)
+    }
+
+    /// `flock [options] FILE COMMAND...` or `flock [options] FILE -c
+    /// COMMAND` (a shell runs it).
+    fn flock(&mut self, args: &[Word], depth: usize) -> Result<(), Amb> {
+        let valued: &[&[u8]] = &[
+            b"-w",
+            b"--wait",
+            b"--timeout",
+            b"-E",
+            b"--conflict-exit-code",
+        ];
+        let i = skip_flags(args, valued);
+        let rest = args.get(i + 1..).unwrap_or(&[]);
+        let j = skip_flags_but(rest, valued, &[b"-c", b"--command"]);
+        match rest.get(j).and_then(|a| plain(a)).as_deref() {
+            Some(b"-c" | b"--command") => {
+                let s = rest.get(j + 1).ok_or(Amb)?;
+                self.script(&joined(std::slice::from_ref(s)), depth)
+            }
+            _ => self.run(&rest[j..], &[], depth),
+        }
+    }
+
+    /// `npx [options] COMMAND...`, `npm exec -- COMMAND...`, and `-c
+    /// 'COMMAND'` (a shell runs it).
+    fn npx(&mut self, args: &[Word], depth: usize) -> Result<(), Amb> {
+        let mut i = 0;
+        while let Some(o) = args.get(i).and_then(|a| plain(a)) {
+            if !o.starts_with(b"-") || o == b"-" {
+                break;
+            }
+            i += 1;
+            match o.as_slice() {
+                b"--" => break,
+                b"-c" | b"--call" => {
+                    let s = args.get(i).ok_or(Amb)?;
+                    return self.script(&joined(std::slice::from_ref(s)), depth);
+                }
+                _ if o.starts_with(b"--call=") => {
+                    return self.script(&Zeroizing::new(o[7..].to_vec()), depth);
+                }
+                b"-p" | b"--package" => i += 1,
+                _ => {}
+            }
+        }
+        self.run(args.get(i..).unwrap_or(&[]), &[], depth)
+    }
+
+    /// `mise exec [TOOL@VERSION]... -- COMMAND...`, or `-c 'COMMAND'` (a
+    /// shell runs it). With neither, it starts a shell, which reads no
+    /// command here.
+    fn mise(&mut self, args: &[Word], depth: usize) -> Result<(), Amb> {
+        for (k, a) in args.iter().enumerate() {
+            match plain(a).as_deref() {
+                Some(b"-c" | b"--command") => {
+                    let s = args.get(k + 1).ok_or(Amb)?;
+                    return self.script(&joined(std::slice::from_ref(s)), depth);
+                }
+                Some(b"--") => return self.run(&args[k + 1..], &[], depth),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// A shell: with `-c`, its script; reading its standard input, a
     /// here-document's body is its script.
-    fn shell(
-        &mut self,
-        args: &[Word],
-        bodies: &[(Vec<u8>, bool)],
-        depth: usize,
-    ) -> Result<(), Amb> {
+    fn shell(&mut self, args: &[Word], bodies: &[Body], depth: usize) -> Result<(), Amb> {
         let mut i = 0;
         let mut dash_c = false;
         while let Some(o) = args.get(i).and_then(|a| plain(a)) {
@@ -1504,8 +1765,8 @@ fn is_meta(b: u8) -> bool {
 
 /// A backquoted command after its opening backquote, through the closing
 /// one, with the backslashes that quote `` ` ``, `\` and `$` removed.
-fn backquoted(c: &mut Cur<'_>) -> Result<Vec<u8>, Amb> {
-    let mut out = Vec::new();
+fn backquoted(c: &mut Cur<'_>) -> Result<Zeroizing<Vec<u8>>, Amb> {
+    let mut out = Zeroizing::new(Vec::new());
     loop {
         match c.bump() {
             None => return Err(Amb),
@@ -1615,17 +1876,49 @@ fn literal(w: &[Ch]) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// A word's bytes, read out of it: a command's text can hold a key, so
+/// they are wiped when dropped, and made in one allocation (a growing
+/// buffer would leave copies in the blocks it outgrew).
+struct Plain(Zeroizing<Vec<u8>>);
+
+impl std::ops::Deref for Plain {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Plain {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for Plain {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.0.as_slice() == other.as_slice()
+    }
+}
+
+impl Plain {
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// The bytes of a word that is all literal and holds no unquoted glob
 /// character: what the shell passes as it is.
-fn plain(w: &[Ch]) -> Option<Vec<u8>> {
-    w.iter()
-        .enumerate()
-        .map(|(i, ch)| match ch {
-            Ch::Lit { .. } if glob_at(w, i) => None,
-            Ch::Lit { b, .. } => Some(*b),
-            Ch::Unknown => None,
-        })
-        .collect()
+fn plain(w: &[Ch]) -> Option<Plain> {
+    let mut out = Zeroizing::new(Vec::with_capacity(w.len()));
+    for (i, ch) in w.iter().enumerate() {
+        match ch {
+            Ch::Lit { .. } if glob_at(w, i) => return None,
+            Ch::Lit { b, .. } => out.push(*b),
+            Ch::Unknown => return None,
+        }
+    }
+    Some(Plain(out))
 }
 
 /// Whether the character at `i` is an unquoted glob character: `*`, `?`,
@@ -1663,8 +1956,8 @@ fn lits(s: &[u8]) -> Word {
 /// Words as one script text, with a NUL byte, which no shell text holds,
 /// standing for each stretch only known when it runs, which
 /// [`Analyzer::word`] reads back as one.
-fn joined(words: &[Word]) -> Vec<u8> {
-    let mut out = Vec::new();
+fn joined(words: &[Word]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::new());
     for (k, w) in words.iter().enumerate() {
         if k > 0 {
             out.push(b' ');
@@ -1780,9 +2073,101 @@ fn skip_flags(args: &[Word], valued: &[&[u8]]) -> usize {
     i.min(args.len())
 }
 
-/// The name a command word runs: its last path component. `None` for an
-/// empty word; [`Amb`] when the name is only known when it runs.
-fn command_name(w: &[Ch]) -> Result<Option<Vec<u8>>, Amb> {
+/// How many leading words are options, as [`skip_flags`], stopping at
+/// any of `stop` too.
+fn skip_flags_but(args: &[Word], valued: &[&[u8]], stop: &[&[u8]]) -> usize {
+    let mut i = 0;
+    while let Some(o) = args.get(i).and_then(|a| plain(a)) {
+        if !o.starts_with(b"-") || o == b"-" || stop.contains(&o.as_slice()) {
+            break;
+        }
+        i += 1;
+        if o == b"--" {
+            break;
+        }
+        if valued.contains(&o.as_slice()) {
+            i += 1;
+        }
+    }
+    i.min(args.len())
+}
+
+/// The class a path given to a file tool falls in, read as it is written
+/// (no glob, no expansion): [`Class::EnvDump`] for a process's
+/// environment, `/proc/<pid>/environ`; [`Class::EnvFile`] for an env file,
+/// by its last component in any case; else none. The hook applies it to
+/// every path a tool reads, and to every string of an MCP tool's input
+/// (a `file://` URI included), as it applies [`check_script`] to a
+/// command.
+pub fn path_class(path: &str) -> Option<Class> {
+    let w: Zeroizing<Word> = Zeroizing::new(lits(path.as_bytes()));
+    if names_environ(&w) {
+        Some(Class::EnvDump)
+    } else if dotenv(&w) == Tri::Is {
+        Some(Class::EnvFile)
+    } else {
+        None
+    }
+}
+
+/// Whether a search glob (Claude Code's `Grep` `glob`, ripgrep's
+/// `--glob`, where `*` matches a leading `.` as well) may pick out an env
+/// file: after brace expansion, its last component is an env file's name
+/// (any case), its literal start fits `.env` or `.env.` (`.env*`, `.e?v`,
+/// `.env.st*`), or it starts with a wildcard and names `env` anywhere
+/// (`*.env`, `*env*`, `[.]env`). A glob whose literal parts never name
+/// `env` (`*`, `*.rs`, which a `.env.rs` would match) is read as a search
+/// of every file, which is in docs/INSTALLERS.md's list of what the hook
+/// does not see. A glob of too many alternatives is taken as one that
+/// may.
+pub fn glob_may_name_env_file(glob: &str) -> bool {
+    let negated = glob.starts_with('!');
+    if negated {
+        // An exclusion picks out nothing.
+        return false;
+    }
+    let w: Zeroizing<Word> =
+        Zeroizing::new(glob.bytes().map(|b| Ch::Lit { b, quoted: false }).collect());
+    let mut cost = BraceCost::default();
+    let Ok(alts) = brace_expand(&w, &mut cost, 0) else {
+        return true;
+    };
+    let alts = Zeroizing::new(alts);
+    alts.iter().any(|a| {
+        let start = a
+            .iter()
+            .rposition(|ch| matches!(ch, Ch::Lit { b: b'/', .. }))
+            .map_or(0, |p| p + 1);
+        let tail = &a[start..];
+        if let Some(name) = plain(tail) {
+            return names_dotenv(&name);
+        }
+        let mut prefix = Vec::new();
+        for (i, ch) in tail.iter().enumerate() {
+            match ch {
+                Ch::Lit { .. } if glob_at(tail, i) => break,
+                Ch::Lit { b, .. } => prefix.push(b.to_ascii_lowercase()),
+                Ch::Unknown => break,
+            }
+        }
+        if !prefix.is_empty() {
+            return b".env".starts_with(&prefix) || prefix.starts_with(b".env");
+        }
+        let text: Vec<u8> = tail
+            .iter()
+            .map(|ch| match ch {
+                Ch::Lit { b, .. } => b.to_ascii_lowercase(),
+                Ch::Unknown => b'*',
+            })
+            .collect();
+        text.windows(3).any(|x| x == b"env")
+    })
+}
+
+/// The name a command word runs: its last path component, in lower case.
+/// `None` for an empty word; [`Amb`] when the name is only known when it
+/// runs.
+fn command_name(w: &[Ch]) -> Result<Option<Plain>, Amb> {
     if w.is_empty() {
         return Ok(None);
     }
@@ -1790,10 +2175,13 @@ fn command_name(w: &[Ch]) -> Result<Option<Vec<u8>>, Amb> {
         .iter()
         .rposition(|ch| matches!(ch, Ch::Lit { b: b'/', .. }))
         .map_or(0, |p| p + 1);
-    let name = plain(&w[start..]).ok_or(Amb)?;
+    let mut name = plain(&w[start..]).ok_or(Amb)?;
     if name.is_empty() || name.contains(&0) {
         return Err(Amb);
     }
+    // macOS's file system finds `CAT` as `cat` by default: a name is read
+    // in one case, on every system (the conservative reading).
+    name.make_ascii_lowercase();
     Ok(Some(name))
 }
 
@@ -1805,11 +2193,22 @@ enum Tri {
     Not,
 }
 
-/// Whether the path `w` names an env file, by its last component: an env
-/// file or a name `dotenv_kind` cannot read (`.env.` and the like), not a
-/// template. A glob that could match one counts (a leading `*`, `?` or
-/// `[` never matches a leading `.`, as the shell's default has it); a name
-/// only known when it runs may be one.
+/// Whether a file name, in any case (macOS's file system opens `.ENV` as
+/// `.env` by default), is an env file's or one `dotenv_kind` cannot read
+/// (`.env.` and the like), not a template's.
+fn names_dotenv(name: &[u8]) -> bool {
+    let lower = Zeroizing::new(name.to_ascii_lowercase());
+    matches!(
+        dotenv_kind(OsStr::from_bytes(&lower)),
+        Some(Ok(FileKind::Dotenv { .. }) | Err(()))
+    )
+}
+
+/// Whether the path `w` names an env file, by its last component, in any
+/// case: an env file or a name `dotenv_kind` cannot read (`.env.` and the
+/// like), not a template. A glob that could match one counts (a leading
+/// `*`, `?` or `[` never matches a leading `.`, as the shell's default has
+/// it); a name only known when it runs may be one.
 fn dotenv(w: &[Ch]) -> Tri {
     let start = w
         .iter()
@@ -1820,9 +2219,10 @@ fn dotenv(w: &[Ch]) -> Tri {
         return Tri::Not;
     }
     if let Some(name) = plain(tail) {
-        return match dotenv_kind(OsStr::from_bytes(&name)) {
-            Some(Ok(FileKind::Dotenv { .. }) | Err(())) => Tri::Is,
-            _ => Tri::Not,
+        return if names_dotenv(&name) {
+            Tri::Is
+        } else {
+            Tri::Not
         };
     }
     let mut prefix = Vec::new();
@@ -1830,7 +2230,7 @@ fn dotenv(w: &[Ch]) -> Tri {
     for (i, ch) in tail.iter().enumerate() {
         match ch {
             Ch::Lit { .. } if glob_at(tail, i) => break,
-            Ch::Lit { b, .. } => prefix.push(*b),
+            Ch::Lit { b, .. } => prefix.push(b.to_ascii_lowercase()),
             Ch::Unknown => {
                 unknown = true;
                 break;
@@ -1851,13 +2251,14 @@ fn dotenv(w: &[Ch]) -> Tri {
 /// Whether the path `w` names a process's environment,
 /// `/proc/<pid>/environ` (any pid, a glob or a variable included).
 fn names_environ(w: &Word) -> bool {
-    let text: Vec<u8> = w
-        .iter()
-        .map(|ch| match ch {
-            Ch::Lit { b, .. } => *b,
-            Ch::Unknown => b'*',
-        })
-        .collect();
+    let text: Zeroizing<Vec<u8>> = Zeroizing::new(
+        w.iter()
+            .map(|ch| match ch {
+                Ch::Lit { b, .. } => *b,
+                Ch::Unknown => b'*',
+            })
+            .collect(),
+    );
     if !text.windows(6).any(|x| x == b"/proc/") && !text.starts_with(b"proc/") {
         return false;
     }
@@ -2345,10 +2746,13 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
             operands.push(a);
             continue;
         }
-        let text = String::from_utf8_lossy(&o).into_owned();
+        let text = Zeroizing::new(String::from_utf8_lossy(&o).into_owned());
         if let Some(rest) = text.strip_prefix("--") {
             let (name, value) = match rest.split_once('=') {
-                Some((n, v)) => (format!("--{n}"), Some(v.to_owned())),
+                Some((n, v)) => (
+                    Zeroizing::new(format!("--{n}")),
+                    Some(Zeroizing::new(v.to_owned())),
+                ),
                 None => (text.clone(), None),
             };
             let n = name.as_str();
@@ -2390,7 +2794,7 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
         }
         // A cluster of short options; one that takes a value takes the rest
         // of the cluster, or the next word.
-        let bytes = o[1..].to_vec();
+        let bytes = Zeroizing::new(o[1..].to_vec());
         for (k, &b) in bytes.iter().enumerate() {
             let flag = format!("-{}", char::from(b));
             let f = flag.as_str();
