@@ -969,24 +969,97 @@ fn a_backup_comes_back_byte_for_byte() {
     f.sweep();
 }
 
+/// The most memory the daemon `pid` held while `run` ran, in KiB: what it
+/// holds now (`envcloak_sys::testing::process_memory`), sampled every
+/// millisecond from another thread, and once before and once after `run`.
+fn peak_while<T>(pid: i32, run: impl FnOnce() -> T) -> (T, u64) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let now = move || envcloak_sys::testing::process_memory(pid).unwrap().now_kib;
+    let (stop, peak) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(now())),
+    );
+    let sampler = {
+        let (stop, peak) = (stop.clone(), peak.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok(m) = envcloak_sys::testing::process_memory(pid) {
+                    peak.fetch_max(m.now_kib, Ordering::SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let out = run();
+    stop.store(true, Ordering::SeqCst);
+    sampler.join().unwrap();
+    peak.fetch_max(now(), Ordering::SeqCst);
+    (out, peak.load(Ordering::SeqCst))
+}
+
 /// A 200 MiB file: uploaded and read back byte for byte with one proof
 /// (`open_restore` is the only call that carries the passphrase), one
 /// Argon2id run (the daemon's test trace counts them) and one audit entry
-/// of kind `restore_v2`, while the daemon's resident memory grows by far
-/// less than the file: it holds one chunk at a time.
+/// of kind `restore_v2`, while the daemon holds far less than the file: it
+/// holds one chunk at a time.
+///
+/// What the daemon holds is measured while it takes the upload and commits
+/// it, while it records the result, while it checks the whole backup
+/// behind the proof, and while it hands the chunks out: sampled every
+/// millisecond during each (Codex, M2-05 round 11: sampled only before
+/// the upload and after the reads, a daemon that held the whole file and
+/// freed it before the last sample passed), and as the kernel's own peak
+/// over the whole run (Linux `VmHWM`, macOS the lifetime maximum of its
+/// footprint), which no sample can miss. Argon2id's memory (the vault's
+/// KDF memory, 64 MiB here) is counted apart: only the phase with the
+/// proof, and the whole run (the unlock's proof included), may hold that
+/// much more. Each bound is 48 MiB over what the daemon held once
+/// unlocked (a daemon that holds a chunk at a time holds a few MiB more);
+/// a daemon holding the file whole at any moment holds about 200 MiB
+/// more, less what its allocator kept of an earlier Argon2id run and
+/// hands out again.
 #[test]
 fn a_200_mib_file_takes_one_proof_and_one_audit_entry_in_bounded_memory() {
     let mut f = Fixture::new();
     let files = [Spec::made(&f.claude("projects/p/huge.jsonl"), 200 * MIB, 9)];
-    let before = common::rss_kib(f.d.pid());
-    let id = f.backup("scrub", &files);
-    client(&f.home)
-        .backup_v2_record_result(&id, 0, &files[0].sha(f.files_cs()))
-        .unwrap();
-    let lease = f.open(&id, false, false).unwrap();
-    read_back(&f.paths(), f.files_cs(), &lease, &files);
-    let grew = common::rss_kib(f.d.pid()).saturating_sub(before);
-    assert!(grew < 64 * 1024, "the daemon grew by {grew} KiB");
+    let pid = f.d.pid();
+    let argon2 = u64::from(envcloak_core::crypto::KdfParams::minimum().m_kib());
+    let slack: u64 = 48 * 1024;
+    let before = envcloak_sys::testing::process_memory(pid).unwrap().now_kib;
+    let (id, upload) = peak_while(pid, || f.backup("scrub", &files));
+    let ((), result) = peak_while(pid, || {
+        client(&f.home)
+            .backup_v2_record_result(&id, 0, &files[0].sha(f.files_cs()))
+            .unwrap();
+    });
+    let (lease, proof) = peak_while(pid, || f.open(&id, false, false).unwrap());
+    let ((), reads) = peak_while(pid, || {
+        read_back(&f.paths(), f.files_cs(), &lease, &files);
+    });
+    let whole = envcloak_sys::testing::process_memory(pid).unwrap().peak_kib;
+    for (what, peak, bound) in [
+        ("the upload and its commit", upload, slack),
+        ("the result", result, slack),
+        (
+            "the proof and the check of the whole backup",
+            proof,
+            slack + argon2,
+        ),
+        ("the reads", reads, slack),
+        (
+            "the whole run, as the kernel counts its peak",
+            whole,
+            slack + argon2,
+        ),
+    ] {
+        let grew = peak.saturating_sub(before);
+        eprintln!("{what}: {grew} KiB over {before} KiB");
+        assert!(
+            grew < bound,
+            "the daemon held {grew} KiB more during {what} (bound {bound} KiB)"
+        );
+    }
     let entries = f.audit_after_stop();
     // The daemon's whole log, read once it has exited: the unlock's run
     // and the restore's, no more.

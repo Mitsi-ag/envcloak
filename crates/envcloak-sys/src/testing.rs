@@ -1028,3 +1028,69 @@ pub(crate) fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(TRACE).is_some_and(|v| v == "1"))
 }
+
+/// The memory a process holds now and the most it has held since it
+/// started, in KiB ([`process_memory`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessMemory {
+    pub now_kib: u64,
+    pub peak_kib: u64,
+}
+
+/// The memory process `pid` holds now and the most it has held since it
+/// started, as the kernel counts them: on Linux its resident set and that
+/// set's high-water mark (`VmRSS` and `VmHWM` in `/proc/<pid>/status`), so
+/// no peak between two samples is missed. A test bounds a daemon's memory
+/// with it.
+///
+/// # Errors
+/// When the process is gone or its status cannot be read or parsed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn process_memory(pid: i32) -> io::Result<ProcessMemory> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().strip_suffix("kB"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no such status field"))
+    };
+    Ok(ProcessMemory {
+        now_kib: field("VmRSS:")?,
+        peak_kib: field("VmHWM:")?,
+    })
+}
+
+/// The memory process `pid` holds now and the most it has held since it
+/// started, as the kernel counts them: on macOS its physical footprint
+/// (what Activity Monitor shows as its memory: the pages it wrote, resident
+/// or compressed) and that footprint's lifetime maximum
+/// (`proc_pid_rusage`, `RUSAGE_INFO_V4`), so no peak between two samples is
+/// missed. A test bounds a daemon's memory with it.
+///
+/// # Errors
+/// When the process is gone or this user may not ask about it.
+#[cfg(target_os = "macos")]
+pub fn process_memory(pid: i32) -> io::Result<ProcessMemory> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `info` is a writable `rusage_info_v4`, the struct the
+    // `RUSAGE_INFO_V4` flavor fills, and lives for the call.
+    let r = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: zeroed before the call, which filled it; every field is an
+    // integer, so any bytes are a valid value.
+    let info = unsafe { info.assume_init() };
+    Ok(ProcessMemory {
+        now_kib: info.ri_phys_footprint / 1024,
+        peak_kib: info.ri_lifetime_max_phys_footprint / 1024,
+    })
+}

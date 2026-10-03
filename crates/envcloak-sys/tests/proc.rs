@@ -767,6 +767,69 @@ fn a_watch_ends_when_its_process_exits_before_it_is_reaped() {
     assert!(!watch.running());
 }
 
+/// `testing::process_memory` reads what the kernel counts for another
+/// process, the positive control of the daemon's memory gate (M2-05
+/// round 11): a `python3` child writes 96 MiB of anonymous memory and
+/// unmaps it before it is looked at again, so what it holds then is about
+/// what it held at the start, yet its peak holds the buffer; then it
+/// writes another and keeps it, and holds about that much more.
+#[test]
+fn process_memory_keeps_a_peak_no_sample_saw() {
+    const MIB: u64 = 1024;
+    let mut c = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import mmap, sys\n\
+             n = 96 * 1024 * 1024\n\
+             part = b'\\x01' * (1024 * 1024)\n\
+             def written():\n\
+             \x20   m = mmap.mmap(-1, n)\n\
+             \x20   for at in range(0, n, len(part)):\n\
+             \x20       m[at:at + len(part)] = part\n\
+             \x20   return m\n\
+             print('start', flush=True)\n\
+             sys.stdin.readline()\n\
+             written().close()\n\
+             print('freed', flush=True)\n\
+             sys.stdin.readline()\n\
+             kept = written()\n\
+             print('held', flush=True)\n\
+             sys.stdin.readline()\n",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = i32::try_from(c.id()).unwrap();
+    let mut out = BufReader::new(c.stdout.take().unwrap());
+    let mut input = c.stdin.take().unwrap();
+    let mut step = |want: &str| {
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), want);
+        let m = envcloak_sys::testing::process_memory(pid).unwrap();
+        std::io::Write::write_all(&mut input, b"\n").unwrap();
+        m
+    };
+    let start = step("start");
+    let freed = step("freed");
+    let held = step("held");
+    c.wait().unwrap();
+    assert!(
+        freed.now_kib < start.now_kib + 30 * MIB,
+        "the buffer was not given back: {start:?} {freed:?}"
+    );
+    assert!(
+        freed.peak_kib >= start.now_kib + 90 * MIB,
+        "the peak missed a buffer freed between two samples: {start:?} {freed:?}"
+    );
+    assert!(
+        held.now_kib >= start.now_kib + 90 * MIB,
+        "{start:?} {held:?}"
+    );
+    assert!(held.peak_kib >= held.now_kib, "{held:?}");
+}
+
 #[test]
 fn the_state_letter_is_read_after_the_last_parenthesis() {
     for (stat, want) in [
