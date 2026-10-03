@@ -2068,7 +2068,20 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
 /// the group while the program that leads it is still unreaped, so the
 /// group's id cannot have been reused, and then reaps the program (D-34);
 /// what the program left running in its group (a process that ignores the
-/// hangup when the terminal closes) goes with it. The program's exit is
+/// hangup when the terminal closes) goes with it. The driver forks the
+/// program itself (a pseudo-terminal, then `fork`; the child makes its
+/// session, takes the terminal and starts the program) and waits, before
+/// anything else, until the child has made its session and started the
+/// program (a close-on-exec pipe the child holds until then ends): until
+/// it has, the group does not exist, and a kill of it would reach nothing
+/// (Codex review of M2-04, medium: the driver could return from the fork,
+/// take a signal and find no group, then wait for the program without
+/// end). A signal that comes during that wait, or any time the group
+/// cannot be signalled, ends the program directly, by its pid, which is
+/// the driver's unreaped child; the program is then reaped within 10
+/// seconds, never waited for without a bound. A `hold` path in the spec
+/// (tests only) makes the child open it for writing, write `x` there and
+/// wait before it makes its session. The program's exit is
 /// seen without reaping it, with `waitid(WNOWAIT)`, or a kqueue exit note
 /// where Python has no `waitid` (macOS before 3.13). Every signal whose
 /// default action ends a process (`SIGTERM`, the harness's, and `SIGHUP`,
@@ -2081,7 +2094,7 @@ fn codex_sandbox_reaches_the_socket_and_nothing_else() {
 /// there is one), to the driver itself skips the cleanup (verifier, low:
 /// only `SIGTERM` was blocked, and a `SIGHUP` left the program's group
 /// running).
-const PTY_DRIVER: &str = r#"import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
+const PTY_DRIVER: &str = r#"import fcntl, json, os, re, select, signal, struct, sys, termios, time
 def named(*names):
     return {getattr(signal, n) for n in names if hasattr(signal, n)}
 # Signals that do not end a process, and those a fault raises.
@@ -2092,31 +2105,77 @@ ENDS = set(signal.valid_signals()) - KEEP
 assert named("SIGTERM", "SIGHUP", "SIGINT", "SIGQUIT", "SIGUSR1", "SIGALRM") <= ENDS
 MASK = signal.pthread_sigmask(signal.SIG_BLOCK, ENDS)
 spec = json.load(open(sys.argv[1]))
-pid, fd = pty.fork()
+fd, tty = os.openpty()
+# Held by the child until it starts the program (close-on-exec), after it
+# made its session; `hold` (tests only) keeps it waiting before that.
+ready_r, ready_w = os.pipe()
+hold_r, hold_w = os.pipe()
+pid = os.fork()
 if pid == 0:
     try:
+        os.close(fd)
+        os.close(ready_r)
+        os.close(hold_w)
+        if spec.get("hold"):
+            h = os.open(spec["hold"], os.O_WRONLY)
+            os.write(h, b"x")
+            os.read(hold_r, 1)
+        os.setsid()
+        fcntl.ioctl(tty, termios.TIOCSCTTY, 0)
+        for n in (0, 1, 2):
+            os.dup2(tty, n)
+        if tty > 2:
+            os.close(tty)
         signal.pthread_sigmask(signal.SIG_SETMASK, MASK)
         os.chdir(spec["cwd"])
         os.execve(spec["argv"][0], spec["argv"], dict(spec["env"]))
     finally:
         os._exit(127)
+os.close(tty)
+os.close(ready_w)
+os.close(hold_r)
 status = []
 def finish():
-    # The one cleanup, run once. The program leads its group (pty.fork made
-    # it a session leader) and is unreaped until here, so the group's id is
-    # still its own: the group is killed, then the program reaped. Its exit
-    # code, or 128 plus its signal.
+    # The one cleanup, run once. Once the program leads its group (it made
+    # its session) and while it is unreaped (until here), the group's id
+    # is its own: the group is killed, then the program reaped. Until it
+    # has made its session there is no such group: the program, the
+    # driver's unreaped child, is killed directly then. It is reaped
+    # within 10 s, or reported. Its exit code, or 128 plus its signal.
     if not status:
         try:
             os.killpg(pid, signal.SIGKILL)
         except OSError:
-            pass
-        code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
-        status.append(code if code >= 0 else 128 - code)
+            os.kill(pid, signal.SIGKILL)
+        end = time.time() + 10
+        while True:
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                code = os.waitstatus_to_exitcode(st)
+                status.append(code if code >= 0 else 128 - code)
+                break
+            if time.time() > end:
+                print("the program was not reaped within 10 s", file=sys.stderr)
+                status.append(255)
+                break
+            time.sleep(0.02)
     return status[0]
 class Ended(Exception):
     pass
+def started():
+    # Until the child has made its session and started the program (or
+    # failed to): the end of the pipe it held. A signal that would end the
+    # driver ends the wait.
+    end = time.time() + spec["limit"]
+    while time.time() < end:
+        if ENDS & set(signal.sigpending()):
+            raise Ended()
+        r, _, _ = select.select([ready_r], [], [], 0.2)
+        if r and not os.read(ready_r, 1):
+            return
+    raise Ended()
 def drive():
+    started()
     # Whether the program has exited, seen without reaping it.
     if hasattr(os, "waitid"):
         def exited():
@@ -2486,6 +2545,92 @@ fn the_pty_driver_ends_the_program_on_an_error_of_its_own() {
         !last.starts_with("EXIT") && !last.starts_with("TIMEOUT"),
         "{last}"
     );
+}
+
+/// A signal that comes before the program has made its session ends it
+/// all the same (Codex review of M2-04, medium: the driver could take the
+/// signal while the group did not exist yet, find nothing to kill, and
+/// then wait for the program without end; 9 runs in 12 missed it with the
+/// child paused at its start). The child is held before its session
+/// (`hold`), holding the test's FIFO; the driver, the test's own
+/// unreaped child, gets `SIGTERM`, ends the child by its pid and exits 1
+/// through its cleanup, and the FIFO's last writer is gone.
+///
+/// Mutation checked: the cleanup as it was (the group kill alone, its
+/// error ignored, then a wait without a bound): the driver waits for the
+/// held child for ever and this fails at its 30-second bound.
+#[test]
+fn the_pty_driver_ends_a_program_signalled_before_its_session_exists() {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let home = envcloak_testkit::TestHome::new();
+    let fifo = home.root().join("held");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    let spec = json!({
+        "argv": ["/bin/sh", "-c", "exec sleep 90"],
+        "env": [["PATH", "/usr/bin:/bin"]],
+        "cwd": home.root().to_str().unwrap(),
+        "limit": 120,
+        "steps": [["wait", "never shown", 1]],
+        "hold": fifo.to_str().unwrap(),
+    });
+    let spec_path = home.root().join("pty-spec.json");
+    std::fs::write(&spec_path, spec.to_string()).unwrap();
+    let mut cmd = std::process::Command::new(envcloak_e2e::python3());
+    cmd.arg("-c")
+        .arg(PTY_DRIVER)
+        .arg(&spec_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut driver = envcloak_testkit::agents::GroupChild::spawn(&mut cmd).unwrap();
+    // `x` once the child is held, before its session; then the end, once
+    // the child is gone.
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 16];
+    let mut read_until = |done: &dyn Fn(&[u8], bool) -> bool, what: &str| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) if done(&got, true) => return,
+                Ok(n) => got.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("read the FIFO: {e}"),
+            }
+            if done(&got, false) {
+                return;
+            }
+            assert!(std::time::Instant::now() < end, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    read_until(
+        &|g, _| g == b"x",
+        "the child was not held before its session",
+    );
+    driver.signal(libc::SIGTERM);
+    let status = driver.end_within(std::time::Duration::from_secs(30));
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(1),
+        "the driver did not end through its cleanup ({status:?})"
+    );
+    read_until(
+        &|_, ended| ended,
+        "the held child still holds the FIFO after the driver exited",
+    );
+    assert_eq!(got, b"x");
 }
 
 /// The harness's limit (a SIGTERM to the driver's group) ends the program
