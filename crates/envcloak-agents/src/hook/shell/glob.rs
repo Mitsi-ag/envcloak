@@ -463,20 +463,24 @@ pub(super) fn rg_type_may_name_env_file(t: &[Ch]) -> bool {
 }
 
 /// Whether a `--type-add` definition (`NAME:GLOB[,GLOB...]`, or
-/// `NAME:include:...`) gives a type a glob that may pick out an env file.
+/// `NAME:include:TYPE[,TYPE...]`) gives a type a glob that may pick out
+/// an env file, its own or an included type's.
 pub(super) fn rg_type_add_may_name_env_file(def: &[Ch]) -> bool {
     let colon = |ch: &Ch| matches!(ch, Ch::Lit { b: b':', .. });
     let Some(p) = def.iter().position(colon) else {
         return false;
     };
     let globs = &def[p + 1..];
-    // `NAME:include:OTHER,...` names other types, read by their names.
-    if super::literal(globs).is_some_and(|g| g.starts_with(b"include:")) {
-        return false;
+    let comma = |ch: &Ch| matches!(ch, Ch::Lit { b: b',', .. });
+    let include: Vec<Ch> = b"include:"
+        .iter()
+        .map(|&b| Ch::Lit { b, quoted: false })
+        .collect();
+    let unquoted = as_tool_glob(globs);
+    if let Some(types) = unquoted.strip_prefix(include.as_slice()) {
+        return types.split(comma).any(rg_type_may_name_env_file);
     }
-    globs
-        .split(|ch| matches!(ch, Ch::Lit { b: b',', .. }))
-        .any(|g| word_may_name_env_file(g, true))
+    globs.split(comma).any(|g| word_may_name_env_file(g, true))
 }
 
 #[cfg(test)]
