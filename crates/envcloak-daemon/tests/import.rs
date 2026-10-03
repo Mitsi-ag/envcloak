@@ -589,28 +589,37 @@ fn a_file_backup_comes_back_only_with_a_proof() {
     }
 
     let wrong = SecretBytes::copy_from(b"not the passphrase, not at all");
-    let e = c.files_restore(&b.id, wrong, &[]).unwrap_err();
+    let e = c.files_restore(&b.id, wrong, false, &[]).unwrap_err();
     assert_eq!(rpc(e), ErrorKind::WrongPassphrase);
     let e = c
         .files_restore(
             &b.id,
             passphrase(&f.cs),
+            false,
             &["ENVCLOAK_FIXTURE_AGENT".to_owned()],
         )
         .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::ProofRefused);
     let e = c
-        .files_restore("0000000000000000000000000Z", passphrase(&f.cs), &[])
+        .files_restore("0000000000000000000000000Z", passphrase(&f.cs), false, &[])
         .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::NoSuchBackup);
-    let e = c.files_restore("nope", passphrase(&f.cs), &[]).unwrap_err();
+    let e = c
+        .files_restore("nope", passphrase(&f.cs), false, &[])
+        .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::NoSuchBackup);
-    let back = c.files_restore(&b.id, passphrase(&f.cs), &[]).unwrap();
+    let back = c
+        .files_restore(&b.id, passphrase(&f.cs), false, &[])
+        .unwrap();
     assert_eq!(back.files.len(), 1);
     assert_eq!(back.files[0].path, path.to_str().unwrap());
     assert_eq!(back.files[0].mode, 0o600);
     assert!(back.files[0].content.as_secret().ct_eq(body.as_bytes()));
     assert_eq!(back.files[0].left, Some(left));
+    assert_eq!(
+        back.creator.as_ref().map(|c| c.kind.as_str()),
+        Some("terminal")
+    );
     drop((c, back));
     let v = f.stop_and_open();
     let (entries, _) = v.read_audit().unwrap();
@@ -1531,12 +1540,16 @@ fn a_restore_whose_audit_entry_cannot_be_written_releases_nothing() {
     let audit = data_dir(&f.home).join("audit");
     std::fs::remove_dir_all(&audit).unwrap();
     std::fs::write(&audit, b"in the way").unwrap();
-    let e = c.files_restore(&b.id, passphrase(&f.cs), &[]).unwrap_err();
+    let e = c
+        .files_restore(&b.id, passphrase(&f.cs), false, &[])
+        .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::AuditFailed);
     std::fs::remove_file(&audit).unwrap();
     std::fs::create_dir(&audit).unwrap();
     std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let back = c.files_restore(&b.id, passphrase(&f.cs), &[]).unwrap();
+    let back = c
+        .files_restore(&b.id, passphrase(&f.cs), false, &[])
+        .unwrap();
     assert!(back.files[0].content.as_secret().ct_eq(body.as_bytes()));
     drop((c, back));
     let v = f.stop_and_open();
@@ -1550,5 +1563,135 @@ fn a_restore_whose_audit_entry_cannot_be_written_releases_nothing() {
     for e in &entries {
         assert_no_canary(format!("{:?}", e.record).as_bytes(), &f.cs);
     }
+    f.sweep();
+}
+
+/// The kind and reason of an RPC refusal.
+fn refusal(e: ClientError) -> (ErrorKind, Option<&'static str>) {
+    match e {
+        ClientError::Rpc(r) => (r.kind, r.reason),
+        other => panic!("not a refusal: {other:?}"),
+    }
+}
+
+/// A file backup an agent made (here a claimed agent marker, which only
+/// tightens the daemon's evidence) is restored only when the person ticks
+/// `--created-by-agent` (SPEC §6.4): the daemon seals who made it, never
+/// as the client says, and refuses an unticked restore before the
+/// passphrase is looked at, so a wrong passphrase is not even counted.
+/// Ticked, it comes back, naming its maker; one the terminal made comes
+/// back unticked, naming the terminal.
+///
+/// Mutations: the creator ignored at restore (the unticked restore comes
+/// back); the client's word taken for it (the marker's backup is sealed
+/// as a terminal's); the check after the proof only (the wrong passphrase
+/// is counted).
+#[test]
+fn a_file_backup_an_agent_made_comes_back_only_when_ticked() {
+    let f = Fixture::new(|_, _| {});
+    let path = f.home.root().join("acme-web/.env");
+    let mut c = client(&f.home);
+    let backup = |c: &mut envcloak_ipc::Client, claims: Vec<String>| {
+        c.files_backup(&FilesBackupParams {
+            files: vec![BackupFileParams {
+                path: path.to_str().unwrap().to_owned(),
+                mode: 0o600,
+                content: WireSecret::new(SecretBytes::copy_from(b"PLANTED=by an agent\n")),
+                left: FileLeft::Removed,
+            }],
+            claims,
+        })
+        .unwrap()
+        .id
+    };
+    let by_agent = backup(&mut c, vec!["ENVCLOAK_FIXTURE_AGENT".to_owned()]);
+    let failures = || client(&f.home).status().unwrap().approvals.proof_failures;
+    let before = failures();
+    for pass in [
+        passphrase(&f.cs),
+        SecretBytes::copy_from(b"not the passphrase, not at all"),
+    ] {
+        let e = c.files_restore(&by_agent, pass, false, &[]).unwrap_err();
+        assert_eq!(
+            refusal(e),
+            (ErrorKind::RestoreRefused, Some("created_by_agent"))
+        );
+    }
+    assert_eq!(failures(), before, "a refused restore counted an attempt");
+    let back = c
+        .files_restore(&by_agent, passphrase(&f.cs), true, &[])
+        .unwrap();
+    assert_eq!(
+        back.creator.as_ref().map(|c| c.kind.as_str()),
+        Some("agent")
+    );
+    assert!(
+        back.files[0]
+            .content
+            .as_secret()
+            .ct_eq(b"PLANTED=by an agent\n")
+    );
+
+    let by_terminal = backup(&mut c, Vec::new());
+    let back = c
+        .files_restore(&by_terminal, passphrase(&f.cs), false, &[])
+        .unwrap();
+    assert_eq!(
+        back.creator,
+        Some(envcloak_ipc::view::FileBackupCreatorView {
+            kind: "terminal".to_owned(),
+            agent: None,
+        })
+    );
+    drop((c, back));
+    f.sweep();
+}
+
+/// A restore whose answer is larger than one frame (a backup of 1 MiB
+/// and more, which only a writer other than `files.backup` can make: its
+/// request is one frame) is framed before anything is committed, as a
+/// covered run's is (F-77): `frame_too_large`, and no restore audited;
+/// a backup of a frame's worth less restores, and is audited, once.
+///
+/// Mutation: the delivery audited before the answer is framed (the
+/// refusal is `internal`, and a restore is audited that never went out).
+#[test]
+fn a_restore_larger_than_a_frame_records_nothing() {
+    use envcloak_core::file_backup::{BackupFile, FileBackupCreator};
+    use envcloak_core::file_backup_v2::CreatorKind;
+    let mut ids = Vec::new();
+    let mut f = Fixture::new(|v, _| {
+        for len in [envcloak_ipc::MAX_FRAME, 1024] {
+            let file = BackupFile {
+                path: "/p/acme-web/.env".to_owned(),
+                mode: 0o600,
+                content: SecretBytes::copy_from(&vec![b'#'; len]),
+                left: Some(envcloak_core::file_backup::FileLeft::Removed),
+            };
+            let creator = FileBackupCreator {
+                kind: CreatorKind::Terminal,
+                agent: None,
+            };
+            ids.push(v.backup_files(&[file], &creator).unwrap().id.to_string());
+        }
+    });
+    let mut c = client(&f.home);
+    let e = c
+        .files_restore(&ids[0], passphrase(&f.cs), false, &[])
+        .unwrap_err();
+    assert_eq!(rpc(e), ErrorKind::FrameTooLarge);
+    let back = c
+        .files_restore(&ids[1], passphrase(&f.cs), false, &[])
+        .unwrap();
+    assert_eq!(back.files[0].content.as_secret().len(), 1024);
+    drop((c, back));
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let restored: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::FilesRestore)
+        .map(|e| e.record.decision.outcome.as_str())
+        .collect();
+    assert_eq!(restored, ["restored"]);
     f.sweep();
 }

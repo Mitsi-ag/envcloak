@@ -19,7 +19,7 @@ use std::path::Path;
 use common::{KitFixture, read_stdin, spawn_self};
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::Vmk;
-use envcloak_core::file_backup::BackupFile;
+use envcloak_core::file_backup::{BackupFile, FileBackupCreator};
 use envcloak_core::file_backup_v2::{
     BackupCreator, BackupOwner, BackupPurpose, CreatorKind, PlannedFile,
 };
@@ -45,12 +45,18 @@ fn backups_race_child() {
         .unwrap();
     let kind = match std::env::var(WHICH).unwrap().as_str() {
         "v1" => v
-            .backup_files(&[BackupFile {
-                path: "/p/.env".into(),
-                mode: 0o600,
-                content: SecretBytes::copy_from(b"A=1\n"),
-                left: None,
-            }])
+            .backup_files(
+                &[BackupFile {
+                    path: "/p/.env".into(),
+                    mode: 0o600,
+                    content: SecretBytes::copy_from(b"A=1\n"),
+                    left: None,
+                }],
+                &FileBackupCreator {
+                    kind: CreatorKind::Terminal,
+                    agent: None,
+                },
+            )
             .map(drop),
         "v2" => v
             .begin_file_backup_v2(
@@ -94,12 +100,18 @@ fn backups_race_child() {
 fn race(which: &str, swap_data_dir: bool) {
     let (f, v) = KitFixture::create();
     let backups = f.paths.backups_dir.clone();
-    v.backup_files(&[BackupFile {
-        path: "/p/.env".into(),
-        mode: 0o600,
-        content: SecretBytes::copy_from(b"B=2\n"),
-        left: None,
-    }])
+    v.backup_files(
+        &[BackupFile {
+            path: "/p/.env".into(),
+            mode: 0o600,
+            content: SecretBytes::copy_from(b"B=2\n"),
+            left: None,
+        }],
+        &FileBackupCreator {
+            kind: CreatorKind::Terminal,
+            agent: None,
+        },
+    )
     .unwrap();
     std::fs::write(
         backups.join(".vault-20260901T000000Z-00000000.ecbackup.tmp"),

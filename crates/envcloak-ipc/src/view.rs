@@ -1438,12 +1438,29 @@ pub struct DeleteReport {
     pub skipped: Vec<SkippedPath>,
 }
 
-/// `envcloak init --undo`: the files written back.
+/// `envcloak init --undo`: who made the backup, and the files written
+/// back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UndoReport {
     pub backup: String,
+    /// Who made the backup, as the daemon sealed it; none for a backup
+    /// made before that was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<FileBackupCreatorView>,
     pub files: Vec<UndoFile>,
+}
+
+/// Who made a file backup, as the daemon sealed it from its evidence of
+/// the caller of `files.backup`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileBackupCreatorView {
+    /// `terminal`, `agent` or `unknown`.
+    pub kind: String,
+    /// The agent's display name, when one was involved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

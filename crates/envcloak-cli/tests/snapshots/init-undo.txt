@@ -1,6 +1,7 @@
 exit: 0
 --- stdout
 Backup <ULID>
+  made from a terminal
   <ROOT>/acme-web/.env: restored
   <ROOT>/acme-web/.env.short: restored
 --- stderr

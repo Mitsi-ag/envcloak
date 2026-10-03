@@ -43,7 +43,9 @@ use common::{
 use envcloak_core::crypto::{ItemClass, KdfParams};
 use envcloak_core::vault::{FieldName, ItemDetails, NewItem, Slug, VaultPaths};
 use envcloak_core::{RecoveryKit, SecretBytes, create_vault_with_kit};
-use envcloak_ipc::proto::{VerifyEntry, VerifyFile, VerifyParams};
+use envcloak_ipc::proto::{
+    BackupFileParams, FileLeft, FilesBackupParams, VerifyEntry, VerifyFile, VerifyParams,
+};
 use envcloak_ipc::view::EntryStatus;
 use envcloak_ipc::{Client, RunPaths, WireSecret};
 use envcloak_scan::{EntryKind, parse_dotenv, trimmed_from};
@@ -390,7 +392,10 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
     );
     assert_no_canary(&out.stdout, &s.cs);
     for (name, body) in &files {
-        assert_eq!(&std::fs::read(repo.join(name)).unwrap(), body);
+        assert!(
+            std::fs::read(repo.join(name)).unwrap() == *body,
+            "{name} is not its original"
+        );
     }
     let out = person_in(
         &s.home,
@@ -495,7 +500,10 @@ fn story_s2_and_s3_import_confirm_delete_and_undo() {
         .collect();
     assert_eq!(states, ["restored", "restored"]);
     for (name, body) in files {
-        assert_eq!(&std::fs::read(repo.join(name)).unwrap(), body, "{name}");
+        assert!(
+            std::fs::read(repo.join(name)).unwrap() == *body,
+            "{name} is not its original"
+        );
     }
     let mode = std::fs::metadata(repo.join(".env")).unwrap().mode() & 0o777;
     assert_eq!(mode & !0o644, 0);
@@ -1376,7 +1384,10 @@ fn undo_replaces_only_what_the_deletion_left() {
             (".env.short".to_owned(), "restored".to_owned()),
         ]
     );
-    assert_eq!(std::fs::read(&env).unwrap(), edited);
+    assert!(
+        std::fs::read(&env).unwrap() == edited,
+        "the edit was undone"
+    );
     assert_eq!(g.intact(), [false, true]);
     g.sweep();
 }
@@ -1423,7 +1434,9 @@ fn undo_keeps_an_entry_taken_out_after_the_deletion() {
     let left = std::fs::read(&env).unwrap();
     let (name, original) = &g.files[0];
     assert_eq!(*name, ".env");
-    assert_eq!(left, env_left(original));
+    // Compared without printing either side: a regression could leave a
+    // fixture value in the file (SPEC §15.1).
+    assert!(left == env_left(original), "not what the deletion leaves");
     // The person then takes a whole configuration entry out.
     let edited: Vec<u8> = left
         .split_inclusive(|&b| b == b'\n')
@@ -1431,7 +1444,7 @@ fn undo_keeps_an_entry_taken_out_after_the_deletion() {
         .flatten()
         .copied()
         .collect();
-    assert_ne!(edited, left);
+    assert!(edited != left, "no entry taken out");
     std::fs::write(&env, &edited).unwrap();
     let pass = g.home.root().join("pass");
     std::fs::write(
@@ -1460,7 +1473,10 @@ fn undo_keeps_an_entry_taken_out_after_the_deletion() {
             (".env.short".to_owned(), "restored".to_owned()),
         ]
     );
-    assert_eq!(std::fs::read(&env).unwrap(), edited, "the entry came back");
+    assert!(
+        std::fs::read(&env).unwrap() == edited,
+        "the entry came back"
+    );
     assert_eq!(g.intact(), [false, true]);
 
     // Exactly what the deletion left again: the original comes back.
@@ -1475,6 +1491,94 @@ fn undo_keeps_an_entry_taken_out_after_the_deletion() {
         ]
     );
     assert_eq!(g.intact(), [true, true]);
+    std::fs::remove_file(&pass).unwrap();
+    g.sweep();
+}
+
+/// A backup an agent stored (any client may store one) is not written
+/// back by `init --undo` unless the person ticks `--created-by-agent`:
+/// the daemon seals who made it, so a backup crafted to replace `.env`
+/// (its `left` the SHA-256 of the file there now, its contents the
+/// agent's) is refused before the passphrase is looked at, and the file
+/// is left as it is. Ticked, the statement says so, the file is written
+/// back and the report names the agent as its maker (its kind `unknown`
+/// here, the test process having no terminal session).
+///
+/// Mutations: the daemon ignoring who made a backup (the unticked undo
+/// replaces `.env`); the CLI not sending the tick (the ticked undo is
+/// refused).
+#[test]
+fn undo_writes_an_agents_backup_back_only_when_ticked() {
+    let g = Gate16::new(true);
+    let env = std::fs::canonicalize(&g.repo).unwrap().join(".env");
+    let now: &[u8] = b"PORT=8080\n";
+    let planted: &[u8] = b"PLANTED=by an agent\n";
+    std::fs::write(&env, now).unwrap();
+    let left = SecretBytes::copy_from(now)
+        .sha256()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // The agent's backup: a claimed agent marker, which only tightens.
+    let id = Client::connect(&RunPaths::under(envcloak_testkit::daemon_run_dir(&g.home)).unwrap())
+        .unwrap()
+        .files_backup(&FilesBackupParams {
+            files: vec![BackupFileParams {
+                path: env.to_str().unwrap().to_owned(),
+                mode: 0o600,
+                content: WireSecret::new(SecretBytes::copy_from(planted)),
+                left: FileLeft::Rewritten(left),
+            }],
+            claims: vec!["ENVCLOAK_FIXTURE_AGENT".to_owned()],
+        })
+        .unwrap()
+        .id;
+    let pass = g.home.root().join("pass");
+    std::fs::write(
+        &pass,
+        format!("{}\n", by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str()),
+    )
+    .unwrap();
+    let undo = |extra: &[&str]| {
+        let mut args = vec!["init", "--undo", &id];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--passphrase-fd", "3", "--json"]);
+        let out = person_in(&g.home, &g.repo, &args, &[(3, &pass, true)]);
+        assert_no_canary(&out.stdout, &g.cs);
+        assert_no_canary(&out.stderr, &g.cs);
+        out
+    };
+
+    let out = undo(&[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(
+        e.contains("envcloak: restore_refused:") && e.contains("--created-by-agent"),
+        "{e}"
+    );
+    assert!(
+        std::fs::read(&env).unwrap() == now,
+        "the agent's backup replaced .env"
+    );
+
+    let out = undo(&["--created-by-agent"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--created-by-agent: this backup may have been made by an agent"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(std::fs::read(&env).unwrap() == planted, "not written back");
+    // Not a terminal's: an agent, or (this test process has no terminal
+    // session) an unknown process, under the fixture agent's label.
+    let r = json(&out);
+    let kind = r["creator"]["kind"].as_str().unwrap_or("none");
+    assert!(kind == "agent" || kind == "unknown", "made by {kind}");
+    assert!(r["creator"]["agent"].is_string(), "no agent named");
+    assert_eq!(
+        undo_states(&out),
+        [(".env".to_owned(), "restored".to_owned())]
+    );
     std::fs::remove_file(&pass).unwrap();
     g.sweep();
 }
