@@ -133,10 +133,17 @@ pub struct BackedUpFile {
 /// written, the names are swapped back and the file is kept (`changed`,
 /// or `moved_aside` naming where the other file is kept), so an edit made
 /// in place after the last check, at the same length with its
-/// modification time put back, is never deleted. A file system that
-/// cannot swap names writes nothing ([`ModifyErrorKind::SwapUnsupported`]).
-/// A write by a program that still has the old file open, after that
-/// read, is not seen. The file keeps its mode. A file with another hard
+/// modification time put back, is never deleted. Once the new file has
+/// the file's name, the old file goes only while it is still the one
+/// checked, moved to a fresh name and checked there first: a file another
+/// program changed or put under its temporary name meanwhile is kept and
+/// named for what it is ([`ModifyErrorKind::AsideChanged`]), never called
+/// the old copy; one that cannot be removed is named
+/// ([`ModifyErrorKind::NotRemoved`]); one another program moved or
+/// removed from there is not named, and the file is answered as written
+/// back. A file system that cannot swap names writes nothing
+/// ([`ModifyErrorKind::SwapUnsupported`]). A write by a program that still
+/// has the old file open, after that read, is not seen. The file keeps its mode. A file with another hard
 /// link is never written over. Returns the new file's stamp.
 ///
 /// The new file is the write itself (SPEC §6.5 "Modifying a file",

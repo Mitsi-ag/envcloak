@@ -111,6 +111,12 @@ pub enum ModifyErrorKind {
     /// name is free), but the old file could not be unlinked: it is left
     /// under the temporary name in [`ModifyError::rel`].
     NotRemoved,
+    /// The change was made (the new contents have the file's name), but
+    /// the file under the temporary name in [`ModifyError::rel`] is not
+    /// the old file as it was checked: another program wrote into it
+    /// there, or put its own file under that name, after the names were
+    /// swapped. It was kept as it is, and nothing shows whose it is.
+    AsideChanged,
     /// A restore from a backup v2 found the file is not what the change
     /// the backup was made for left in it: its SHA-256 is not the one the
     /// daemon recorded ([`crate::restore_over_left`]).
@@ -139,6 +145,7 @@ impl ModifyErrorKind {
             ModifyErrorKind::Scan(k) => k.token(),
             ModifyErrorKind::MovedAside => "moved_aside",
             ModifyErrorKind::NotRemoved => "not_removed",
+            ModifyErrorKind::AsideChanged => "aside_changed",
             ModifyErrorKind::EditedSince => "edited_since",
             ModifyErrorKind::BackupUnread => "backup_unread",
             ModifyErrorKind::SwapUnsupported => "swap_unsupported",
@@ -169,6 +176,10 @@ impl ModifyErrorKind {
             ModifyErrorKind::NotRemoved => {
                 "the change was made, but the old file could not be removed and is left under \
                  the name shown: look at it, then delete it"
+            }
+            ModifyErrorKind::AsideChanged => {
+                "the change was made, but another program changed the old file under the name \
+                 shown, or put its own file there, meanwhile, so it was kept as it is"
             }
             ModifyErrorKind::EditedSince => {
                 "it changed after the change its backup was made for, so it was kept as it is"
@@ -277,9 +288,16 @@ fn move_aside_using(
 enum Removal {
     /// It was taken for the one to remove, and unlinked.
     Unlinked,
-    /// Nothing had the name.
+    /// Nothing had the name; or the file taken was gone from where it was
+    /// moved before it was checked there (another program moved or
+    /// removed it).
     Absent,
-    /// It was kept, under this name.
+    /// It was taken for the one to remove, but could not be moved aside
+    /// or unlinked: it is left, under this name.
+    Left(OsString),
+    /// It was not taken for the one to remove (another file, or the one
+    /// expected changed): it was kept, under this name. Nothing shows
+    /// whose it is.
     Kept(OsString),
 }
 
@@ -305,10 +323,16 @@ enum Removing {
 /// it with the stamp it had before it was asked, change time included. A
 /// file that fails there is put back under `at` with a link that never
 /// replaces a name, and the fresh name then goes only while it names that
-/// same file; when `at` was taken meanwhile, the file is left under the
-/// fresh name. `observe` hears each [`Removing`] point. The one thing this
-/// cannot exclude is a process that renames another file onto the fresh
-/// name between the last check and the unlink.
+/// same file ([`unlink_if_same`]); when `at` was taken meanwhile, the file
+/// is left under the fresh name. `observe` hears each [`Removing`] point.
+/// The one thing this cannot exclude is a process that renames another
+/// file onto the fresh name between the last check and the unlink.
+///
+/// [`Removal::Left`] names a file taken for the one to remove that could
+/// not be moved or unlinked; [`Removal::Kept`] one that was not taken
+/// (put back, or left under the fresh name); [`Removal::Absent`] says
+/// nothing had `at`, or the file moved aside was gone from the fresh name
+/// before it was checked there.
 fn remove_if(
     dir: &File,
     name: &OsStr,
@@ -326,8 +350,10 @@ fn remove_if(
         return Removal::Kept(at.to_os_string());
     }
     let aside = temp_name(name, what);
-    if move_aside(dir, at, &aside).is_err() {
-        return Removal::Kept(at.to_os_string());
+    match move_aside(dir, at, &aside) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Removal::Absent,
+        Err(_) => return Removal::Left(at.to_os_string()),
     }
     observe(Removing::Moved);
     let taken = open_file(dir, &aside, usize::MAX).is_ok_and(|(mut f, m)| {
@@ -339,18 +365,27 @@ fn remove_if(
     if taken {
         return match unlink_beneath(dir, &aside) {
             Ok(()) => Removal::Unlinked,
-            Err(_) => Removal::Kept(aside),
+            Err(_) => Removal::Left(aside),
         };
     }
-    if link_beneath(dir, &aside, at).is_err() {
-        return Removal::Kept(aside);
+    match link_beneath(dir, &aside, at) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Removal::Absent,
+        Err(_) => return Removal::Kept(aside),
     }
     observe(Removing::PutBack);
-    let id = |n: &OsStr| open_file(dir, n, usize::MAX).map(|(_, m)| (m.dev(), m.ino()));
-    if id(&aside).is_ok_and(|a| id(at).is_ok_and(|b| a == b)) {
-        let _ = unlink_beneath(dir, &aside);
-    }
+    unlink_if_same(dir, &aside, at);
     Removal::Kept(at.to_os_string())
+}
+
+/// Unlinks `extra` in `dir` only while it and `name` are the same file
+/// (device and inode, each opened never through a symlink): once a file
+/// was linked back under `name`, the name it had been moved to goes, and
+/// a file another program renamed onto that name meanwhile stays.
+/// Returns whether it went.
+fn unlink_if_same(dir: &File, extra: &OsStr, name: &OsStr) -> bool {
+    let id = |n: &OsStr| open_file(dir, n, usize::MAX).map(|(_, m)| (m.dev(), m.ino()));
+    id(extra).is_ok_and(|a| id(name).is_ok_and(|b| a == b)) && unlink_beneath(dir, extra).is_ok()
 }
 
 /// Removes from `dir` what earlier writes back of `name` left beside it
@@ -369,6 +404,14 @@ fn remove_if(
 /// anything else stays too. A name too long to be carried in one
 /// ([`temp_name`] leaves it out) says nothing of whose it is, so nothing
 /// is removed then. Never through a symlink.
+///
+/// What each file is compared with is itself checked first: `staged` must
+/// hold exactly the bytes written to it, read whole through its
+/// descriptor, with the mode it was given ([`Staged::intact_stamp`]), or
+/// nothing is removed; and its whole stamp, change time included, must be
+/// the one that check read after every comparison, so a file compared
+/// with bytes another program wrote into `staged` meanwhile (even put
+/// back as they were) is never taken for a leftover.
 ///
 /// Each file goes through [`remove_if`]: checked by its name, moved aside
 /// to a fresh name of the same shape, checked there again, whole, and
@@ -393,6 +436,11 @@ fn remove_leftovers(
     if name.as_bytes().len() > 128 {
         return 0;
     }
+    // The bytes every leftover is compared with: the new file, holding
+    // exactly what was written, and unchanged after each comparison.
+    let Some(reference) = staged.intact_stamp() else {
+        return 0;
+    };
     let Ok(entries) = list_dir(dir, MAX_DIR_ENTRIES) else {
         return 0;
     };
@@ -410,7 +458,9 @@ fn remove_leftovers(
             name,
             &e.name,
             "new",
-            &mut |f, m| holds_first_bytes_of(f, m, &staged.f, staged.len),
+            &mut |f, m| {
+                holds_first_bytes_of(f, m, &staged.f, staged.len) && staged.stamped(&reference)
+            },
             &mut |at| {
                 observe(match at {
                     Removing::Moved => Inside::LeftoverMoved,
@@ -478,12 +528,17 @@ impl Staged {
     /// modification time back included, and a write while it is read are
     /// each seen. The bytes pass through a buffer wiped after.
     fn holds_written(&self) -> bool {
+        self.written_stamp().is_some()
+    }
+
+    /// The file's stamp when it holds exactly the bytes written
+    /// ([`Staged::holds_written`]): the one it had both before and after
+    /// it was read whole. `None` otherwise.
+    fn written_stamp(&self) -> Option<FileStamp> {
         use std::os::unix::fs::FileExt;
-        let Ok(before) = self.f.metadata().map(|m| FileStamp::of(&m)) else {
-            return false;
-        };
+        let before = FileStamp::of(&self.f.metadata().ok()?);
         if before.size != self.len {
-            return false;
+            return None;
         }
         let mut buf = Zeroizing::new(vec![0u8; 64 * 1024]);
         let mut h = Sha256::new();
@@ -493,27 +548,36 @@ impl Staged {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return false,
+                Err(_) => return None,
             };
             at += n as u64;
             if at > self.len {
-                return false;
+                return None;
             }
             h.update(&buf[..n]);
             #[cfg(test)]
             tests::during_read();
         }
         let digest: [u8; 32] = h.finalize().into();
-        at == self.len
-            && digest == self.sha256
-            && self.f.metadata().is_ok_and(|m| FileStamp::of(&m) == before)
+        (at == self.len && digest == self.sha256 && self.stamped(&before)).then_some(before)
+    }
+
+    /// Whether the file's whole stamp, change time included, is `stamp`.
+    fn stamped(&self, stamp: &FileStamp) -> bool {
+        self.f.metadata().is_ok_and(|m| FileStamp::of(&m) == *stamp)
     }
 
     /// Whether the file is still as written: the bytes written
     /// ([`Staged::holds_written`]) and the mode it was given, so a file
     /// another program made readable to others is never put in place.
     fn intact(&self) -> bool {
-        self.f.metadata().is_ok_and(|m| m.mode() == self.mode) && self.holds_written()
+        self.intact_stamp().is_some()
+    }
+
+    /// The file's stamp when it is still as written ([`Staged::intact`]):
+    /// the one read before and after its bytes were. `None` otherwise.
+    fn intact_stamp(&self) -> Option<FileStamp> {
+        self.written_stamp().filter(|s| s.mode == self.mode)
     }
 
     /// Whether `at` in `dir` is this file (a regular file of this user,
@@ -528,8 +592,17 @@ impl Staged {
     /// the bytes written ([`remove_if`], [`Staged::holds_written`]):
     /// anything else under that name, this file written into by another
     /// program included, is kept, and [`Removal::Kept`] says where. `dir`
-    /// is flushed when anything went.
-    fn discard(&self, dir: &File, name: &OsStr, at: &OsStr, what: &str) -> Removal {
+    /// is flushed when anything went. `observe` hears
+    /// [`Inside::NewMoved`] once the file is moved to a fresh name, and
+    /// [`Inside::PutBack`] once a file that failed there is linked back.
+    fn discard(
+        &self,
+        dir: &File,
+        name: &OsStr,
+        at: &OsStr,
+        what: &str,
+        observe: &mut dyn FnMut(Inside),
+    ) -> Removal {
         let ours = self.f.metadata().map(|m| (m.dev(), m.ino())).ok();
         let r = remove_if(
             dir,
@@ -537,12 +610,23 @@ impl Staged {
             at,
             what,
             &mut |_, m| ours == Some((m.dev(), m.ino())) && self.holds_written(),
-            &mut |_| {},
+            &mut removing(observe, Inside::NewMoved),
         );
         if r == Removal::Unlinked {
             let _ = sync_file(dir);
         }
         r
+    }
+}
+
+/// What a removal of a temporary name ([`remove_if`]) tells `observe`:
+/// `moved` once the file is moved to a fresh name, and [`Inside::PutBack`]
+/// once a file that failed its check there is linked back under its name.
+fn removing(observe: &mut dyn FnMut(Inside), moved: Inside) -> impl FnMut(Removing) + '_ {
+    move |at| match at {
+        Removing::Moved => observe(moved),
+        Removing::PutBack => observe(Inside::PutBack),
+        Removing::Read => {}
     }
 }
 
@@ -618,7 +702,16 @@ fn write_new_with(
     };
     match written {
         Ok(()) => Ok(staged),
-        Err(k) => Err(give_up(dir, rel, name, &staged, temp, "new", k)),
+        Err(k) => Err(give_up(
+            dir,
+            rel,
+            name,
+            &staged,
+            temp,
+            "new",
+            k,
+            &mut |_| {},
+        )),
     }
 }
 
@@ -633,8 +726,10 @@ fn kept(rel: &Path, at: &OsStr) -> ModifyError {
 
 /// A change that stops with `k`: the new file `staged` goes from `at` (a
 /// temporary name of the shape `what`), only while `at` names it and it
-/// holds what was written; when anything else is there, it is kept, and
-/// the error names it (`moved_aside`) instead.
+/// holds what was written ([`Staged::discard`], which `observe` hears);
+/// when anything else is there, or it could not be removed, it is kept,
+/// and the error names it (`moved_aside`) instead.
+#[allow(clippy::too_many_arguments)] // The change's place, and the barrier.
 fn give_up(
     dir: &File,
     rel: &Path,
@@ -643,9 +738,10 @@ fn give_up(
     at: &OsStr,
     what: &str,
     k: ModifyErrorKind,
+    observe: &mut dyn FnMut(Inside),
 ) -> ModifyError {
-    match staged.discard(dir, name, at, what) {
-        Removal::Kept(at) => {
+    match staged.discard(dir, name, at, what, observe) {
+        Removal::Kept(at) | Removal::Left(at) => {
             let _ = sync_file(dir);
             kept(rel, &at)
         }
@@ -719,6 +815,21 @@ pub enum Inside {
     /// A file created is linked to its name, and its temporary name is not
     /// removed yet ([`crate::create_atomically`]).
     Linked,
+    /// The old file, once the names are swapped and checked ([`Swapped`]),
+    /// was moved from its temporary name to a fresh name of the same
+    /// shape, and is not checked there yet.
+    ///
+    /// [`Swapped`]: Inside::Swapped
+    OldMoved,
+    /// The new file, being removed from its temporary name (the change
+    /// stopped, or a create linked it to its name), was moved to a fresh
+    /// name of the same shape, and is not checked there yet.
+    NewMoved,
+    /// A file a removal moved aside (the file [`crate::remove_checked`]
+    /// removes, the old file or the new one) failed its check where it
+    /// moved and is linked back under its name; the name it moved to is
+    /// not removed yet.
+    PutBack,
 }
 
 /// Whether `m` is the file `expect` stamps, as a rename leaves it: a
@@ -743,11 +854,16 @@ fn is_checked(m: &std::fs::Metadata, expect: &FileStamp) -> bool {
 /// ([`exchange_beneath`]) and what came out is checked: when another
 /// program saved over the name after the check (an editor's atomic save),
 /// the names are swapped back, so its file is kept and nothing is
-/// replaced (`changed`). Then the old file is removed; when it cannot be,
-/// the change stands and the old file is named where it is left
-/// (`not_removed`). Where the names cannot be swapped, the new file is
-/// renamed over the name right after the check, and a save landing
-/// between the two is replaced. `rel` is the file's path for errors.
+/// replaced (`changed`). Then the old file is removed, only while it is
+/// still the file checked ([`remove_if`]); when it cannot be, the change
+/// stands and the old file is named where it is left (`not_removed`); when
+/// another program changed it, or put its own file under its temporary
+/// name, meanwhile, the change stands and that file is kept and named for
+/// what it is (`aside_changed`), never called the old copy; when another
+/// program moved or removed it, nothing is named. Where the names cannot
+/// be swapped, the new file is renamed over the name right after the
+/// check, and a save landing between the two is replaced. `rel` is the
+/// file's path for errors.
 fn replace_in(
     dir: &File,
     rel: &Path,
@@ -834,31 +950,28 @@ fn replace_in_using(
         // one comes to (`remove_leftovers`).
         remove_leftovers(dir, name, &new, &staged, observe);
     }
+    // A change that stops: the new file goes from `at` only while it is
+    // the file written, holding what was written (`give_up`).
+    let stop = |at: &OsStr, what: &str, k, observe: &mut dyn FnMut(Inside)| {
+        give_up(dir, rel, name, &staged, at, what, k, observe)
+    };
     // The swap takes the new file from a name of another shape, so what it
     // brings out never has the shape a later restore's cleanup reads.
     let temp = temp_name(name, "swap");
     if let Err(e) = move_aside(dir, &new, &temp) {
-        return Err(give_up(dir, rel, name, &staged, &new, "new", io(&e)));
+        return Err(stop(&new, "new", io(&e), observe));
     }
     observe(Inside::Staged);
     // What the swap takes must be the file written, holding what was
     // written: another file under that name, or this one written into, is
     // kept, and never swapped in.
     if !staged.named(dir, &temp) {
-        return Err(give_up(
-            dir,
-            rel,
-            name,
-            &staged,
-            &temp,
-            "swap",
-            ModifyErrorKind::Changed,
-        ));
+        return Err(stop(&temp, "swap", ModifyErrorKind::Changed, observe));
     }
     // Another program may have written the file while this one wrote its
     // replacement: keep theirs.
     if let Err(k) = check_same(dir, name, expect) {
-        return Err(give_up(dir, rel, name, &staged, &temp, "swap", k));
+        return Err(stop(&temp, "swap", k, observe));
     }
     observe(Inside::Checked);
     // What came out of a swap must be the file checked, holding (with
@@ -880,42 +993,53 @@ fn replace_in_using(
                 .is_ok_and(|(mut out, m)| came_out(&mut out, &m))
                 && staged.named(dir, name);
             if !checked {
-                return Err(swap_back(swap, dir, rel, name, &temp, &staged));
+                if swap(dir, &temp, name).is_ok() {
+                    return Err(stop(&temp, "swap", ModifyErrorKind::Changed, observe));
+                }
+                // The names could not be swapped back: what came out is
+                // kept where it is, and named.
+                let _ = sync_file(dir);
+                return Err(kept(rel, &temp));
             }
             observe(Inside::Swapped);
-            // The old file goes only while it is still the file checked.
-            match remove_if(dir, name, &temp, "swap", &mut came_out, &mut |_| {}) {
-                Removal::Unlinked => {}
-                Removal::Absent => {
-                    let _ = sync_file(dir);
-                    return Err(ModifyError {
-                        rel: rel.with_file_name(&temp),
-                        kind: ModifyErrorKind::NotRemoved,
-                    });
-                }
-                Removal::Kept(at) => {
-                    let _ = sync_file(dir);
-                    return Err(ModifyError {
-                        rel: rel.with_file_name(at),
-                        kind: ModifyErrorKind::NotRemoved,
-                    });
-                }
+            // The old file goes only while it is still the file checked,
+            // and the answer names only what was checked: a file another
+            // program changed or put under the temporary name meanwhile is
+            // kept, and never called the old file.
+            let gone = remove_if(
+                dir,
+                name,
+                &temp,
+                "swap",
+                &mut came_out,
+                &mut removing(observe, Inside::OldMoved),
+            );
+            let left_aside = |at: OsString, kind| {
+                let _ = sync_file(dir);
+                Err(ModifyError {
+                    rel: rel.with_file_name(at),
+                    kind,
+                })
+            };
+            match gone {
+                // Gone from the temporary name before it was taken: nothing
+                // this call left is under one.
+                Removal::Unlinked | Removal::Absent => {}
+                Removal::Left(at) => return left_aside(at, ModifyErrorKind::NotRemoved),
+                Removal::Kept(at) => return left_aside(at, ModifyErrorKind::AsideChanged),
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported && left.is_some() => {
-            return Err(give_up(
-                dir,
-                rel,
-                name,
-                &staged,
+            return Err(stop(
                 &temp,
                 "swap",
                 ModifyErrorKind::SwapUnsupported,
+                observe,
             ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
             if let Err(e) = rename_beneath(dir, &temp, name) {
-                return Err(give_up(dir, rel, name, &staged, &temp, "swap", io(&e)));
+                return Err(stop(&temp, "swap", io(&e), observe));
             }
             // A rename takes whatever has the temporary name at that
             // moment: another file put there, or the new file written into
@@ -926,7 +1050,7 @@ fn replace_in_using(
             }
         }
         Err(e) => {
-            return Err(give_up(dir, rel, name, &staged, &temp, "swap", io(&e)));
+            return Err(stop(&temp, "swap", io(&e), observe));
         }
     }
     sync_file(dir).map_err(|e| fail(io(&e)))?;
@@ -960,37 +1084,6 @@ pub(crate) fn digest_of(f: &mut File, stamp: &FileStamp) -> Result<[u8; 32], Mod
         return Err(ModifyErrorKind::Changed);
     }
     Ok(h.finalize().into())
-}
-
-/// After a swap brought out a file that is not the one checked, or put in
-/// a file that is not `staged` holding what was written: swaps the names
-/// back, so `name` is that file again, and removes `staged` from `temp`,
-/// only while `temp` names it and it holds what was written. Returns
-/// `changed`; or, when the names could not be swapped back, or anything
-/// else is under `temp` then (another program's file, or `staged`
-/// written into), that file is kept where it is and named (`moved_aside`),
-/// and nothing is removed.
-fn swap_back(
-    swap: Swap,
-    dir: &File,
-    rel: &Path,
-    name: &OsStr,
-    temp: &OsStr,
-    staged: &Staged,
-) -> ModifyError {
-    if swap(dir, temp, name).is_ok() {
-        return give_up(
-            dir,
-            rel,
-            name,
-            staged,
-            temp,
-            "swap",
-            ModifyErrorKind::Changed,
-        );
-    }
-    let _ = sync_file(dir);
-    kept(rel, temp)
 }
 
 /// Replaces the file at `rel`, which must still be the one `expect`
@@ -1042,9 +1135,12 @@ pub fn create_atomically(
 /// answered as created ([`ModifyErrorKind::Changed`]; what has `name`
 /// keeps it, nothing is removed). Once linked (`observe` hears
 /// [`Inside::Linked`]), the temporary name goes only while it names the
-/// new file holding the bytes written ([`Staged::discard`]); when the new
-/// file keeps that name too, the file is created but the call says so
-/// ([`ModifyErrorKind::NotRemoved`], naming it).
+/// new file holding the bytes written ([`Staged::discard`], moved to a
+/// fresh name and checked there first: `observe` hears
+/// [`Inside::NewMoved`]); a file another program put under either name
+/// meanwhile stays. When the new file keeps that name too, the file is
+/// created but the call says so ([`ModifyErrorKind::NotRemoved`], naming
+/// it).
 fn create_in(
     dir: &File,
     rel: &Path,
@@ -1070,6 +1166,7 @@ fn create_in(
             &temp,
             "new",
             ModifyErrorKind::Changed,
+            observe,
         ));
     }
     observe(Inside::Checked);
@@ -1079,17 +1176,17 @@ fn create_in(
         } else {
             io(&e)
         };
-        return Err(give_up(dir, rel, name, &staged, &temp, "new", k));
+        return Err(give_up(dir, rel, name, &staged, &temp, "new", k, observe));
     }
     observe(Inside::Linked);
-    let dropped = staged.discard(dir, name, &temp, "new");
+    let dropped = staged.discard(dir, name, &temp, "new", observe);
     sync_file(dir).map_err(|e| fail(io(&e)))?;
     if !staged.named(dir, name) {
         return Err(fail(ModifyErrorKind::Changed));
     }
     // Created; but the new file keeps its temporary name too when that
     // could not be removed.
-    if let Removal::Kept(at) = dropped {
+    if let Removal::Kept(at) | Removal::Left(at) = dropped {
         if holds(dir, &at, &staged.f) {
             return Err(ModifyError {
                 rel: rel.with_file_name(at),
@@ -1152,7 +1249,16 @@ pub fn remove_checked_at(
     remove_checked_observed(r, rel, expect, now, &mut |_| {})
 }
 
-/// [`remove_checked_at`], telling `observe` when the file is aside.
+/// [`remove_checked_at`], telling `observe` when the file is aside
+/// ([`Inside::MovedAside`]) and, when what moved is not the file checked,
+/// once it is linked back under its name ([`Inside::PutBack`]).
+///
+/// A file that is not the one checked once it moved is put back under its
+/// name with a link that never replaces one, and the name it was moved to
+/// goes only while it names that same file ([`unlink_if_same`]): a file
+/// another program renamed onto that name meanwhile stays, and is named
+/// (`moved_aside`). When the file is gone from where it moved (another
+/// program moved or removed it), nothing is named: `changed`.
 pub fn remove_checked_observed(
     r: &ScanRoot,
     rel: &Path,
@@ -1175,16 +1281,23 @@ pub fn remove_checked_observed(
     observe(Inside::MovedAside);
     let moved = open_file(&dir, &aside, usize::MAX).map(|(_, m)| m);
     if !moved.as_ref().is_ok_and(|m| is_checked(m, expect)) {
+        let left_aside = ModifyError {
+            rel: rel.with_file_name(&aside),
+            kind: ModifyErrorKind::MovedAside,
+        };
         return Err(match link_beneath(&dir, &aside, &name) {
             Ok(()) => {
-                let _ = unlink_beneath(&dir, &aside);
+                observe(Inside::PutBack);
+                let gone = unlink_if_same(&dir, &aside, &name);
                 let _ = sync_file(&dir);
-                fail(ModifyErrorKind::Changed)
+                if gone {
+                    fail(ModifyErrorKind::Changed)
+                } else {
+                    left_aside
+                }
             }
-            Err(_) => ModifyError {
-                rel: rel.with_file_name(&aside),
-                kind: ModifyErrorKind::MovedAside,
-            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fail(ModifyErrorKind::Changed),
+            Err(_) => left_aside,
         });
     }
     if unlink_beneath(&dir, &aside).is_err() {
@@ -1429,6 +1542,50 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read(d.path().join(name)).unwrap(), b"ours");
         assert_eq!(names_in(d.path()), [name]);
+    }
+
+    /// Once a file created is linked to its name, its temporary name goes
+    /// only while the check where it was moved still takes it (verifier,
+    /// M2-05 round 11: the check at the fresh name had no test that could
+    /// fail): right after the new file is moved from its temporary name to
+    /// a fresh one (`NewMoved`), another program renames its own file onto
+    /// that fresh name. That file is never removed: it is linked back under
+    /// the temporary name, and the create, whose file has its name holding
+    /// what was written, is answered as made.
+    #[test]
+    fn a_file_renamed_onto_a_creates_fresh_name_stays() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = File::open(d.path()).unwrap();
+        let name = OsStr::new("envcloak.toml");
+        let mut temp = None;
+        let mut did = 0;
+        create_in(
+            &dir,
+            Path::new("envcloak.toml"),
+            name,
+            b"ours",
+            0o600,
+            &mut |now| match now {
+                Inside::Linked => temp = Some(temp_of(d.path(), "envcloak.toml", "new")),
+                Inside::NewMoved => {
+                    let fresh = temp_of(d.path(), "envcloak.toml", "new");
+                    assert_ne!(Some(&fresh), temp.as_ref(), "not moved");
+                    put_under(d.path(), &fresh, b"theirs");
+                    did += 1;
+                }
+                _ => {}
+            },
+        )
+        .unwrap();
+        assert_eq!(did, 1);
+        assert_eq!(std::fs::read(d.path().join(name)).unwrap(), b"ours");
+        let temp = temp.unwrap();
+        assert_eq!(temp_of(d.path(), "envcloak.toml", "new"), temp);
+        assert_eq!(
+            std::fs::read(d.path().join(&temp)).unwrap(),
+            b"theirs",
+            "the file renamed onto the fresh name was removed"
+        );
     }
 
     /// Where names cannot be swapped, the new file renamed into place is

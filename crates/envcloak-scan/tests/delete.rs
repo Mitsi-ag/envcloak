@@ -216,45 +216,65 @@ fn a_file_changed_since_it_was_read_is_kept() {
 }
 
 /// Review finding (low): after the swap, the old file (the whole
-/// plaintext) is under a temporary name until it is unlinked. When that
-/// unlink fails, the file was still rewritten: it is reported rewritten,
-/// and the old copy is reported kept under its temporary name
-/// (`not_removed`), not the file as kept.
+/// plaintext) is under a temporary name until it is unlinked. When it
+/// cannot be removed (its directory made read-only right after the swap,
+/// so it cannot be moved aside to be checked and unlinked), the file was
+/// still rewritten: it is reported rewritten, and the old copy is
+/// reported kept under its temporary name (`not_removed`), not the file
+/// as kept. When another program puts its own entry under that name
+/// instead (the old file moved away, a directory put there), the file is
+/// reported rewritten too, and that entry kept and named for what it is,
+/// one this call did not check (`aside_changed`, verifier, M2-05 round
+/// 11: it was called the old copy, `not_removed`, which the person is
+/// told to delete), never removed.
 #[test]
 fn an_old_file_that_cannot_be_unlinked_after_the_swap_is_reported() {
-    let (d, files) = setup(&[".env"]);
-    let r = open_root(d.path()).unwrap();
-    let mut g = gate(vec![true, true], true, vec![Keep::Some(b"PORT=8080\n")]);
-    let mut steps = Vec::new();
-    let mut temp = None;
-    let out = delete_plaintext(&r, &files, &mut g, &mut |s| {
-        steps.push(s);
-        if s != DeleteStep::Swapped(0) {
-            return;
-        }
-        // The old file is under the temporary name now: put a directory
-        // there, which no unlink removes, and keep the old file aside.
-        let name = std::fs::read_dir(d.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .find(|n| n.starts_with("..env.envcloak-swap-"))
-            .unwrap();
-        assert_eq!(std::fs::read(d.path().join(&name)).unwrap(), BODY);
+    use std::os::unix::fs::PermissionsExt;
+    for case in ["read-only", "replaced"] {
+        let (d, files) = setup(&[".env"]);
+        let r = open_root(d.path()).unwrap();
+        let mut g = gate(vec![true, true], true, vec![Keep::Some(b"PORT=8080\n")]);
+        let mut steps = Vec::new();
+        let mut temp = None;
+        let out = delete_plaintext(&r, &files, &mut g, &mut |s| {
+            steps.push(s);
+            if s != DeleteStep::Swapped(0) {
+                return;
+            }
+            let name = std::fs::read_dir(d.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .find(|n| n.starts_with("..env.envcloak-swap-"))
+                .unwrap();
+            assert_eq!(std::fs::read(d.path().join(&name)).unwrap(), BODY);
+            assert_eq!(
+                std::fs::read(d.path().join(".env")).unwrap(),
+                b"PORT=8080\n"
+            );
+            if case == "read-only" {
+                std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+            } else {
+                std::fs::rename(d.path().join(&name), d.path().join("old")).unwrap();
+                std::fs::create_dir(d.path().join(&name)).unwrap();
+            }
+            temp = Some(name);
+        })
+        .unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let temp = PathBuf::from(temp.expect("the swap was observed"));
+        assert_eq!(out.rewritten, [PathBuf::from(".env")], "{case}");
+        assert!(!steps.contains(&DeleteStep::Rewritten(0)), "{case}");
         assert_eq!(
             std::fs::read(d.path().join(".env")).unwrap(),
             b"PORT=8080\n"
         );
-        std::fs::rename(d.path().join(&name), d.path().join("old")).unwrap();
-        std::fs::create_dir(d.path().join(&name)).unwrap();
-        temp = Some(name);
-    })
-    .unwrap();
-    let temp = PathBuf::from(temp.expect("the swap was observed"));
-    assert_eq!(out.rewritten, [PathBuf::from(".env")]);
-    assert_eq!(out.kept, [(temp, ModifyErrorKind::NotRemoved)]);
-    assert!(!steps.contains(&DeleteStep::Rewritten(0)));
-    assert_eq!(
-        std::fs::read(d.path().join(".env")).unwrap(),
-        b"PORT=8080\n"
-    );
+        if case == "read-only" {
+            assert_eq!(out.kept, [(temp.clone(), ModifyErrorKind::NotRemoved)]);
+            assert_eq!(std::fs::read(d.path().join(&temp)).unwrap(), BODY);
+        } else {
+            assert_eq!(out.kept, [(temp.clone(), ModifyErrorKind::AsideChanged)]);
+            assert!(d.path().join(&temp).is_dir(), "the other entry was removed");
+            assert_eq!(std::fs::read(d.path().join("old")).unwrap(), BODY);
+        }
+    }
 }

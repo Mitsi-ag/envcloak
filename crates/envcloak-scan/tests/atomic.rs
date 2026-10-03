@@ -18,8 +18,8 @@ use std::time::{Duration, SystemTime};
 
 use envcloak_scan::{
     FileStamp, Inside, MAX_DOTENV, ModifyErrorKind, ScanErrorKind, create_atomically, open_root,
-    read_capped, remove_checked, remove_checked_at, replace_atomically, rewrite_checked,
-    rewrite_checked_observed,
+    read_capped, remove_checked, remove_checked_at, remove_checked_observed, replace_atomically,
+    rewrite_checked, rewrite_checked_observed,
 };
 
 /// Held for the whole of each test.
@@ -293,6 +293,81 @@ fn remove_takes_only_the_file_that_was_read() {
     let e = remove_checked(&r, Path::new(".env"), &s).unwrap_err();
     assert_eq!(e.kind, ModifyErrorKind::Changed);
     no_temps(d.path());
+}
+
+/// A file that is not the one checked once it moved aside is put back
+/// under its name, and the name it moved to goes only while it names that
+/// same file (verifier, M2-05 round 11: it was unlinked whatever it named).
+/// Once `.env` is moved aside (a barrier at `MovedAside`), another program
+/// writes into it there, so it is not the file checked; once it is linked
+/// back (a barrier at `PutBack`), another program renames its own file onto
+/// the name it moved to. That file stays, and is named (`moved_aside`);
+/// `.env` keeps its name, as written into. And when the file is gone from
+/// where it moved (removed there by another program), nothing is named
+/// (`changed`) and nothing is left under a temporary name.
+#[test]
+fn a_file_renamed_onto_a_removals_name_once_put_back_stays() {
+    let _serial = serial();
+    for case in ["put back", "gone"] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let p = d.path().join(".env");
+        write(&p, b"A=1\n");
+        age(&p, Duration::from_secs(600));
+        let r = open_root(d.path()).unwrap();
+        let (_, s) = read_capped(&r, Path::new(".env"), MAX_DOTENV).unwrap();
+        let mut aside = None;
+        let mut put_back = 0;
+        let e =
+            remove_checked_observed(
+                &r,
+                Path::new(".env"),
+                &s,
+                SystemTime::now(),
+                &mut |at| match at {
+                    Inside::MovedAside => {
+                        let n = std::fs::read_dir(d.path())
+                            .unwrap()
+                            .map(|e| e.unwrap().file_name().into_string().unwrap())
+                            .find(|n| n.starts_with("..env.envcloak-del-"))
+                            .unwrap();
+                        let q = d.path().join(&n);
+                        if case == "gone" {
+                            std::fs::remove_file(&q).unwrap();
+                        } else {
+                            let mut w = File::options().append(true).open(&q).unwrap();
+                            w.write_all(b"B=2\n").unwrap();
+                        }
+                        aside = Some(q);
+                    }
+                    Inside::PutBack => {
+                        let other = d.path().join("another");
+                        write(&other, b"another program's file");
+                        std::fs::rename(&other, aside.as_ref().unwrap()).unwrap();
+                        put_back += 1;
+                    }
+                    _ => {}
+                },
+            )
+            .unwrap_err();
+        let aside = aside.expect("never moved aside");
+        if case == "gone" {
+            assert_eq!(put_back, 0);
+            assert_eq!(e.kind, ModifyErrorKind::Changed);
+            assert_eq!(e.rel, Path::new(".env"));
+            assert!(!p.exists());
+            no_temps(d.path());
+        } else {
+            assert_eq!(put_back, 1, "never put back");
+            assert_eq!(e.kind, ModifyErrorKind::MovedAside);
+            assert_eq!(d.path().join(&e.rel), aside);
+            assert_eq!(
+                std::fs::read(&aside).unwrap(),
+                b"another program's file",
+                "the file renamed onto the name was removed"
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"A=1\nB=2\n");
+        }
+    }
 }
 
 #[test]
