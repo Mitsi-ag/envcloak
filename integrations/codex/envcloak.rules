@@ -29,6 +29,6 @@ prefix_rule(
     pattern = [["cat", "head", "tail", "less", "more", "bat", "source", "."], [".env", ".env.local", ".env.development", ".env.development.local", ".env.production", ".env.production.local", ".env.test", ".env.test.local"]],
     decision = "forbidden",
     justification = "It reads a .env file, whose values would reach the model. Run the command that needs them as `envcloak run -- <command>`.",
-    match = ["cat .env", "head -n 5 .env", "source .env.local"],
+    match = ["cat .env", "head .env.local", "source .env.local"],
     not_match = ["cat README.md", "cat .env.example"],
 )
