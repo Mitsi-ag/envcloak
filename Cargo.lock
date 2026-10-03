@@ -441,6 +441,16 @@ dependencies = [
 [[package]]
 name = "envcloak-signin"
 version = "0.1.0"
+dependencies = [
+ "envcloak-core",
+ "envcloak-policy",
+ "envcloak-sys",
+ "proptest",
+ "serde_json",
+ "sha2",
+ "static_assertions",
+ "subtle",
+]
 
 [[package]]
 name = "envcloak-sync"
