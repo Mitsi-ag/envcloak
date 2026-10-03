@@ -30,7 +30,7 @@ use envcloak_agents::install::{
     self, Context, HostReport, Note, Options, Plan, Report, StepResult, host_name,
 };
 use envcloak_agents::locations::Locations;
-use envcloak_agents::writer::{DaemonBackups, Outcome, StateFile, Writer};
+use envcloak_agents::writer::{DaemonBackups, Journal, Outcome, StateFile, Writer};
 use envcloak_client::claims::claims;
 use envcloak_client::fail::{FAILURE, Failure, usage};
 use envcloak_client::render::print_json;
@@ -129,9 +129,12 @@ fn context() -> Result<Context<'static>, Failure> {
             )
         })?
         .data_dir;
-    let envcloak = std::env::current_exe()
+    let exe = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(|_| Failure::new("io", "the path of this envcloak could not be read"))?;
+    // The hooks and the MCP entries name it by its link on PATH, which an
+    // upgrade keeps, where there is one.
+    let envcloak = install::stable_exe(&exe, &env("PATH").unwrap_or_default());
     Ok(Context {
         locations,
         envcloak,
@@ -160,6 +163,16 @@ fn outcome_word(o: &Outcome) -> (&'static str, Option<&str>, Option<String>, Opt
         } => ("created", None, None, backup.as_deref()),
         Outcome::Changed { backup, .. } => ("changed", None, None, backup.as_deref()),
         Outcome::Removed { backup } => ("removed", None, None, backup.as_deref()),
+        Outcome::Partial {
+            made,
+            backup,
+            failed,
+        } => (
+            made.word(),
+            Some(failed.name),
+            Some(failed.message.clone()),
+            backup.as_deref(),
+        ),
         Outcome::Refused(r) => ("refused", Some(r.name), Some(r.message.clone()), None),
     }
 }
@@ -260,7 +273,7 @@ fn print_results(home: &Path, results: &[StepResult]) {
     }
 }
 
-fn print_report(home: &Path, report: &Report, json: bool, install: bool) {
+fn print_report(home: &Path, report: &Report, json: bool, install: bool, saved: bool) {
     if json {
         let hosts: Vec<Value> = report
             .hosts
@@ -289,7 +302,7 @@ fn print_report(home: &Path, report: &Report, json: bool, install: bool) {
             "hosts": hosts,
             "project": project,
             "applied": true,
-            "complete": report.complete(),
+            "complete": report.complete() && saved,
         }));
         return;
     }
@@ -332,16 +345,17 @@ pub fn project_note(dir: &Path, json: bool) -> Result<(), Failure> {
     let mut client = envcloak_client::connect::connect()?;
     require_unlocked(&mut client)?;
     let mut backups = DaemonBackups::new(client, claims());
-    let mut state = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
+    let (mut file, mut state) = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
     let report = {
         let mut w = Writer {
-            state: &mut state.state,
+            state: &mut state,
+            journal: &mut file,
             backups: &mut backups,
             now: SystemTime::now(),
         };
         install::apply(&ctx, &plan, &mut w)
     };
-    state.save().map_err(|r| state_failure(&r))?;
+    file.save(&state).map_err(|r| state_failure(&r))?;
     let results = report.project.map(|p| p.results).unwrap_or_default();
     if json {
         print_json(&json!({
@@ -353,7 +367,7 @@ pub fn project_note(dir: &Path, json: bool) -> Result<(), Failure> {
     }
     if results
         .iter()
-        .any(|r| matches!(r.outcome, Outcome::Refused(_)))
+        .any(|r| matches!(r.outcome, Outcome::Refused(_) | Outcome::Partial { .. }))
     {
         return Err(incomplete());
     }
@@ -386,17 +400,21 @@ fn run_install(mut a: Args) -> Result<ExitCode, Failure> {
     let mut client = envcloak_client::connect::connect()?;
     require_unlocked(&mut client)?;
     let mut backups = DaemonBackups::new(client, claims());
-    let mut state = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
+    let (mut file, mut state) = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
     let report = {
         let mut w = Writer {
-            state: &mut state.state,
+            state: &mut state,
+            journal: &mut file,
             backups: &mut backups,
             now: SystemTime::now(),
         };
         install::apply(&ctx, &plan, &mut w)
     };
-    state.save().map_err(|r| state_failure(&r))?;
-    print_report(&home, &report, a.json, true);
+    // The report is printed whatever the last save says: a file changed
+    // above is reported as changed (L-08).
+    let saved = file.save(&state);
+    print_report(&home, &report, a.json, true, saved.is_ok());
+    saved.map_err(|r| state_failure(&r))?;
     if report.complete() {
         Ok(ExitCode::SUCCESS)
     } else {
@@ -411,7 +429,7 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
     let ctx = context()?;
     let home = ctx.locations.home().to_path_buf();
     if !a.yes {
-        let state = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
+        let (_file, state) = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
         let hosts: Vec<Host> = if a.opts.hosts.is_empty() {
             install::TIER_1.to_vec()
         } else {
@@ -424,7 +442,6 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
             .as_ref()
             .map(|d| d.to_string_lossy().into_owned());
         let listed: Vec<Value> = state
-            .state
             .files
             .iter()
             .filter(|(_, r)| {
@@ -435,7 +452,8 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
             .collect();
         let mcp = global
             && hosts.contains(&Host::ClaudeCode)
-            && state.state.mcp.contains_key(Host::ClaudeCode.id());
+            && (state.mcp.contains_key(Host::ClaudeCode.id())
+                || state.mcp_intent.contains_key(Host::ClaudeCode.id()));
         if a.json {
             print_json(&json!({"files": listed, "mcp_server": mcp, "applied": false}));
         } else {
@@ -458,17 +476,21 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
     let mut client = envcloak_client::connect::connect()?;
     require_unlocked(&mut client)?;
     let mut backups = DaemonBackups::new(client, claims());
-    let mut state = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
+    let (mut file, mut state) = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
     let report = {
         let mut w = Writer {
-            state: &mut state.state,
+            state: &mut state,
+            journal: &mut file,
             backups: &mut backups,
             now: SystemTime::now(),
         };
         install::uninstall(&ctx, &a.opts, &mut w)
     };
-    state.save().map_err(|r| state_failure(&r))?;
-    print_report(&home, &report, a.json, false);
+    // The report is printed whatever the last save says: a file changed
+    // above is reported as changed (L-08).
+    let saved = file.save(&state);
+    print_report(&home, &report, a.json, false, saved.is_ok());
+    saved.map_err(|r| state_failure(&r))?;
     if report.complete() {
         Ok(ExitCode::SUCCESS)
     } else {

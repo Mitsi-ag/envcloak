@@ -228,13 +228,135 @@ fn json_value(v: &Value) -> Result<toml_edit::Value, Refusal> {
     })
 }
 
+/// The values EnvCloak writes over, and so keeps as what was there
+/// before: a boolean, or a rule's `"allow"` or `"deny"`. Anything else at
+/// one of its keys is not written over (and so never copied into
+/// EnvCloak's state, lesson L-12).
+fn plain_previous(v: &Value) -> bool {
+    matches!(v, Value::Bool(_)) || matches!(v.as_str(), Some("allow" | "deny"))
+}
+
+fn broader() -> Refusal {
+    Refusal::new(
+        "network_settings_present",
+        "config.toml already has network settings of its own (a proxy domain rule, another \
+         allowed socket, another proxy option, network access without the proxy, or a profile or \
+         permission profile with network settings), which EnvCloak's socket allowance would turn \
+         on or change: the allowance was not written. Add the unix_sockets rule for EnvCloak's \
+         socket to your own proxy settings yourself, or remove them and run this again",
+    )
+}
+
+/// The setting EnvCloak wrote at `path` (lesson L-09: its own earlier
+/// write is not the person's setting).
+fn written_by_envcloak(owned: &[Edit], path: &[&str], value: &Value) -> bool {
+    owned.iter().any(|e| {
+        matches!(e, Edit::TomlValue { path: p, value: v, .. }
+            if p.iter().map(String::as_str).eq(path.iter().copied()) && v == value)
+    })
+}
+
+/// With the socket allowance among `settings`: refuses a file whose own
+/// settings would make it broader than command networking limited to
+/// EnvCloak's socket once `network_access` and the proxy are on (Codex
+/// review: existing domain and socket rules would be switched on with
+/// it), or whose network access the proxy would change.
+fn allowance_fits(doc: &DocumentMut, settings: &[Setting], owned: &[Edit]) -> Result<(), Refusal> {
+    let Some(socket) = settings.iter().find_map(|(p, _)| match p.as_slice() {
+        [f, n, u, s] if f == "features" && n == "network_proxy" && u == "unix_sockets" => {
+            Some(s.as_str())
+        }
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let root = doc.as_table();
+    // Named permission profiles and config profiles have network settings
+    // of their own, which this allowance would combine with.
+    if root.contains_key("default_permissions") || root.contains_key("permissions") {
+        return Err(broader());
+    }
+    if let Some(profiles) = root.get("profiles") {
+        let Some(profiles) = profiles.as_table_like() else {
+            return Err(broader());
+        };
+        for (_, p) in profiles.iter() {
+            let Some(p) = p.as_table_like() else {
+                continue;
+            };
+            if p.contains_key("sandbox_workspace_write")
+                || p.get("features")
+                    .and_then(Item::as_table_like)
+                    .is_some_and(|f| f.contains_key("network_proxy"))
+            {
+                return Err(broader());
+            }
+        }
+    }
+    let proxy = root
+        .get("features")
+        .and_then(Item::as_table_like)
+        .and_then(|f| f.get("network_proxy"));
+    let mut proxy_on = false;
+    if let Some(proxy) = proxy {
+        let Some(t) = proxy.as_table_like() else {
+            return Err(broader());
+        };
+        for (k, v) in t.iter() {
+            match k {
+                "enabled" => match item_json(v) {
+                    Value::Bool(on) => {
+                        proxy_on = on
+                            && !written_by_envcloak(
+                                owned,
+                                &["features", "network_proxy", "enabled"],
+                                &Value::Bool(true),
+                            )
+                    }
+                    _ => return Err(broader()),
+                },
+                "unix_sockets" => {
+                    let Some(rules) = v.as_table_like() else {
+                        return Err(broader());
+                    };
+                    for (path, rule) in rules.iter() {
+                        let rule = item_json(rule);
+                        if path != socket && rule.as_str() != Some("deny") {
+                            return Err(broader());
+                        }
+                    }
+                }
+                _ => return Err(broader()),
+            }
+        }
+    }
+    let access = root
+        .get("sandbox_workspace_write")
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get("network_access"))
+        .map(item_json);
+    let access_mine = written_by_envcloak(
+        owned,
+        &["sandbox_workspace_write", "network_access"],
+        &Value::Bool(true),
+    );
+    if access == Some(Value::Bool(true)) && !access_mine && !proxy_on {
+        // Networking without the proxy: the proxy would limit it to the
+        // socket, changing the person's own setting.
+        return Err(broader());
+    }
+    Ok(())
+}
+
 /// `before` (`None` for no file) with `settings` set. `owned` names the
 /// settings EnvCloak wrote before, which it may change; another value
 /// already at the MCP server's place is a conflict, refused.
 ///
 /// # Errors
-/// When the file is not TOML, a table on the way is not one, or another
-/// MCP server named `envcloak` is there.
+/// When the file is not TOML, a table on the way is not one, another
+/// MCP server named `envcloak` is there, a value EnvCloak would write over
+/// is not a plain one ([`plain_previous`]), or the socket allowance would
+/// be broader than EnvCloak's socket ([`allowance_fits`]).
 pub fn apply(
     before: Option<&[u8]>,
     settings: &[Setting],
@@ -245,6 +367,7 @@ pub fn apply(
         None => "",
     };
     let mut doc: DocumentMut = text.parse().map_err(|_| not_toml())?;
+    allowance_fits(&doc, settings, owned)?;
     let mut edits = Vec::new();
     for (path, value) in settings {
         let Some((leaf, tables)) = path.split_last() else {
@@ -290,6 +413,9 @@ pub fn apply(
             }
             None => previous,
         };
+        if previous.as_ref().is_some_and(|p| !plain_previous(p)) {
+            return Err(shape());
+        }
         if let Some(existing) = t.get(leaf) {
             if value.is_object() != existing.is_table() {
                 return Err(shape());
@@ -381,7 +507,7 @@ pub fn undo(current: &[u8], edits: &[Edit], created_file: bool) -> Result<Undo, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jsonedit::splice;
+    use crate::hunks::{hunks, unapply};
 
     fn run(before: &str, settings: &[Setting]) -> (String, Vec<Edit>) {
         match apply(Some(before.as_bytes()), settings, &[]) {
@@ -418,8 +544,15 @@ mod tests {
             assert!(!after.contains("approval"), "{after}");
             // Again: no change.
             assert_eq!(apply(Some(after.as_bytes()), &s, &edits), Ok(None));
-            // The exact splice gives the file back.
-            assert_eq!(splice(before, &after).undo(&after).as_deref(), Some(before));
+            // Where nothing but an insertion was made, its hunks give the
+            // file back exactly; a value set over another has none.
+            match hunks(before.as_bytes(), after.as_bytes()) {
+                Some(h) => assert_eq!(
+                    unapply(after.as_bytes(), &h).as_deref(),
+                    Some(before.as_bytes())
+                ),
+                None => assert!(before.contains("network_access = false"), "{before}"),
+            }
             // So does the structural undo, as TOML.
             let back = match undo(after.as_bytes(), &edits, before.is_empty()) {
                 Ok(Undo::Rewrite(b)) => String::from_utf8(b).unwrap_or_default(),
@@ -447,6 +580,85 @@ mod tests {
             apply(Some(b"mcp_servers = 3\n"), &s, &[]),
             Err(r) if r.name == "unexpected_shape"
         ));
+    }
+
+    /// The Codex review's finding: with consent, settings already in
+    /// config.toml that `network_access` and the proxy would switch on (a
+    /// domain rule, another allowed socket, another proxy option), or a
+    /// network access the proxy would limit, refuse the allowance; a
+    /// denied socket, an enabled proxy of the person's with nothing else,
+    /// and EnvCloak's own earlier allowance do not.
+    ///
+    /// Mutation checked: `allowance_fits` answering `Ok(())` at once (the
+    /// previous code): each refused case is written and this fails.
+    #[test]
+    fn the_socket_allowance_is_refused_where_it_would_be_broader() {
+        let s = config_settings(
+            Path::new("/b/envcloak"),
+            false,
+            Some(Path::new("/r/s.sock")),
+        );
+        for before in [
+            "[features.network_proxy]\nenabled = false\n\n[features.network_proxy.domains]\n\"example.com\" = \"allow\"\n",
+            "[features.network_proxy.unix_sockets]\n\"/other.sock\" = \"allow\"\n",
+            "[features.network_proxy]\ndangerously_allow_all_unix_sockets = true\n",
+            "[features.network_proxy]\nallow_local_binding = true\n",
+            "[features]\nnetwork_proxy = true\n",
+            "[sandbox_workspace_write]\nnetwork_access = true\n",
+            "default_permissions = \"mine\"\n",
+            "[permissions.mine.network]\nenabled = true\n",
+            "[profiles.fast.features.network_proxy.domains]\n\"x.dev\" = \"allow\"\n",
+            "[profiles.fast.sandbox_workspace_write]\nnetwork_access = false\n",
+        ] {
+            assert!(
+                matches!(apply(Some(before.as_bytes()), &s, &[]), Err(r) if r.name == "network_settings_present"),
+                "{before}"
+            );
+        }
+        for before in [
+            "[features.network_proxy.unix_sockets]\n\"/other.sock\" = \"deny\"\n",
+            "[features.network_proxy]\nenabled = true\n",
+            "[sandbox_workspace_write]\nnetwork_access = true\n\n[features.network_proxy]\nenabled = true\n",
+            "[sandbox_workspace_write]\nnetwork_access = false\n",
+            "[profiles.fast]\nmodel = \"m\"\n",
+        ] {
+            assert!(
+                matches!(apply(Some(before.as_bytes()), &s, &[]), Ok(Some(_))),
+                "{before}"
+            );
+        }
+        // EnvCloak's own allowance, written before, is no obstacle.
+        let (after, edits) = run("", &s);
+        assert_eq!(apply(Some(after.as_bytes()), &s, &edits), Ok(None));
+        // Without consent nothing is looked at.
+        let plain = config_settings(Path::new("/b/envcloak"), false, None);
+        assert!(matches!(
+            apply(
+                Some(b"[sandbox_workspace_write]\nnetwork_access = true\n"),
+                &plain,
+                &[]
+            ),
+            Ok(Some(_))
+        ));
+    }
+
+    /// Lesson L-12: a value EnvCloak would write over is kept in its state
+    /// as what was there before, so only a plain one (a boolean, `allow`,
+    /// `deny`) is written over; anything else is refused, never copied.
+    #[test]
+    fn only_a_plain_value_is_written_over() {
+        let s = config_settings(
+            Path::new("/b/envcloak"),
+            false,
+            Some(Path::new("/r/s.sock")),
+        );
+        let odd = "[features.network_proxy.unix_sockets]\n\"/r/s.sock\" = \"anything else\"\n";
+        assert!(apply(Some(odd.as_bytes()), &s, &[]).is_err());
+        let (_, edits) = run("[sandbox_workspace_write]\nnetwork_access = false\n", &s);
+        assert!(edits.iter().all(|e| match e {
+            Edit::TomlValue { previous, .. } => previous.as_ref().is_none_or(plain_previous),
+            _ => true,
+        }));
     }
 
     #[test]

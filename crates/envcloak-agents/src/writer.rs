@@ -1,6 +1,6 @@
 //! How the installer changes an agent's files (M2 plan M2-08, D-16;
-//! lesson L-11; SPEC §6.4 "Backups" and "Modifying a file"), and what it
-//! records so `agents uninstall` removes exactly what it added.
+//! lessons L-08, L-11, L-12; SPEC §6.4 "Backups" and "Modifying a file"),
+//! and what it records so `agents uninstall` removes exactly what it added.
 //!
 //! One change to one file:
 //! 1. The file is read beneath its directory, never through a symlink;
@@ -17,21 +17,36 @@
 //!    and an EnvCloak edit right after it work without waiting.
 //! 4. An existing file is backed up first, as a backup v2 the daemon
 //!    seals (purpose `agents`); with no backup, nothing is changed.
-//! 5. The file is replaced in one step, and only if it is still the file
+//! 5. The record of the change is written to EnvCloak's state file
+//!    ([`State`], `<data>/agents/state.json`) before the file is, marked
+//!    as an intent ([`Intent`]): a run stopped after the file changed but
+//!    before its record was confirmed still owns the change, and one
+//!    stopped before the file changed does not ([`Writer`]'s `settle`).
+//! 6. The file is replaced in one step, and only if it is still the file
 //!    read (`envcloak_scan::replace_atomically`: its stamp checked again,
 //!    change time included, just before the swap); a new file is created
-//!    only if its name is still free. The backup's result (the SHA-256 of
-//!    what the change left) is recorded with the daemon.
-//! 6. The new stamp, the exact splice made and the edits it stands for
-//!    are kept in EnvCloak's state file ([`State`]), `<data>/agents/
-//!    state.json`.
+//!    only if its name is still free.
+//! 7. The record is confirmed with the new stamp and saved; then the
+//!    backup's result (the SHA-256 of what the change left) is recorded
+//!    with the daemon. A failure of either after the file changed is
+//!    reported as such ([`Outcome::Partial`]), never as a success and never
+//!    as a refusal of a change that was made.
+//!
+//! The state keeps no text of the person's files (lesson L-12: it sits
+//! outside the vault and its sealed backups, and a config can hold a
+//! literal key next to what EnvCloak edits): only SHA-256 digests, stamps,
+//! EnvCloak's own edits, and for each change where its inserted text went
+//! ([`crate::hunks`]), with the white space it replaced.
 //!
 //! Undoing a file: while it is byte for byte what EnvCloak last left
-//! (its SHA-256), the splices are undone in reverse, which gives back the
-//! file as it was before the first install, byte for byte, or removes a
-//! file EnvCloak created. A file changed since (the host rewrote it, the
-//! person edited it) has EnvCloak's edits taken out by structure instead
-//! (a block, an array element, a key), and everything else kept.
+//! (its SHA-256), each change's inserted text is taken out in reverse,
+//! which gives back the file as it was before the first install, its
+//! SHA-256 checked, or removes a file EnvCloak created. A file changed
+//! since (the host rewrote it, the person edited it), or a change that
+//! replaced more than white space, has EnvCloak's edits taken out by
+//! structure instead (a block, an array element, a key), and everything
+//! else kept; a file that is EnvCloak's whole is removed only while it is
+//! exactly what EnvCloak wrote.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -52,7 +67,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::jsonedit::{Splice, splice};
+use crate::hunks::{self, Hunk};
 
 /// The largest file the installer reads (1 MiB).
 pub const MAX_FILE: usize = 1024 * 1024;
@@ -84,7 +99,8 @@ impl Refusal {
 }
 
 /// One structural edit, kept so it can be taken out of a file changed
-/// since by its host or its person.
+/// since by its host or its person. Each holds EnvCloak's own values
+/// only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Edit {
@@ -98,7 +114,8 @@ pub enum Edit {
         created: usize,
     },
     /// A TOML value set at `path` (its leaves, as JSON), and what was
-    /// there before, `created` of `path`'s last keys made for it.
+    /// there before (a boolean, `"allow"` or `"deny"`: nothing else is
+    /// written over), `created` of `path`'s last keys made for it.
     TomlValue {
         path: Vec<String>,
         value: Value,
@@ -142,16 +159,18 @@ impl From<FileStamp> for Stamp {
     }
 }
 
-/// A splice, as kept.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A change written to the state before the file is: not yet known to
+/// have been made.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SpliceRecord {
-    pub at: usize,
-    pub old: String,
-    pub new: String,
+pub struct Intent {
+    /// The SHA-256 of the file before the change (`None`: there was none).
+    pub before_sha256: Option<String>,
+    /// The record before the change (`None`: there was none).
+    pub previous: Option<Box<FileRecord>>,
 }
 
-/// What EnvCloak did to one file.
+/// What EnvCloak did to one file. No text of the file is kept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileRecord {
@@ -159,18 +178,24 @@ pub struct FileRecord {
     pub host: String,
     /// `global`, or the project directory.
     pub scope: String,
+    /// The host rewrites the file itself (D-16), as the change found it.
+    pub host_owned: bool,
     /// EnvCloak created the file.
     pub created: bool,
     /// The SHA-256 of the file before EnvCloak's first change.
     pub pre_sha256: String,
     /// The SHA-256 of what EnvCloak's last change left.
     pub post_sha256: String,
-    /// The stamp right after EnvCloak's last write.
-    pub stamp: Stamp,
-    /// Every splice made, in order.
-    pub splices: Vec<SpliceRecord>,
-    /// The edits they stand for.
+    /// The stamp right after EnvCloak's last write, when it is known.
+    pub stamp: Option<Stamp>,
+    /// Where each change's inserted text went, in order, while every
+    /// change can be undone exactly; `None` once one replaced more than
+    /// white space, or the file changed between two of EnvCloak's.
+    pub journal: Option<Vec<Vec<Hunk>>>,
+    /// The edits the changes stand for.
     pub edits: Vec<Edit>,
+    /// Set while the last change is written and not yet confirmed.
+    pub intent: Option<Intent>,
 }
 
 /// EnvCloak's record of its agent integrations, `<data>/agents/state.json`.
@@ -184,6 +209,12 @@ pub struct State {
     /// command line, by host id.
     #[serde(default)]
     pub mcp: BTreeMap<String, Value>,
+    /// The MCP server entries EnvCloak is registering, by host id: saved
+    /// before the host's command runs, so a run stopped after it still
+    /// owns the entry (the next run finds it there and adopts it) and one
+    /// stopped before it does not.
+    #[serde(default)]
+    pub mcp_intent: BTreeMap<String, Value>,
     /// Files EnvCloak gave back by an undo, so nothing of its own is left
     /// in them, by absolute path, with the stamp that write left: while a
     /// file's stamp is still this one, EnvCloak's next change of it (an
@@ -196,11 +227,21 @@ pub struct State {
 /// The state file's format version.
 pub const STATE_VERSION: u32 = 1;
 
-/// EnvCloak's agent state, held locked while it is changed.
+/// Where the state is saved as a run goes: before each file is changed,
+/// and again once it is.
+pub trait Journal {
+    /// Saves `state`.
+    ///
+    /// # Errors
+    /// When it was not saved.
+    fn save(&mut self, state: &State) -> Result<(), Refusal>;
+}
+
+/// EnvCloak's agent state file, held locked while an install or an
+/// uninstall runs.
 #[derive(Debug)]
 pub struct StateFile {
     dir: ScanRoot,
-    pub state: State,
     stamp: Option<FileStamp>,
     _lock: std::fs::File,
 }
@@ -210,13 +251,13 @@ const LOCK_NAME: &str = "state.lock";
 
 impl StateFile {
     /// Opens (creating `<data>/agents/`, 0700, when missing) and locks the
-    /// state in `data_dir`.
+    /// state in `data_dir`, and reads it.
     ///
     /// # Errors
     /// When the directory or the state cannot be read, the state is not
     /// one this build reads, or another `agents install` or `uninstall`
     /// holds it.
-    pub fn open(data_dir: &Path) -> Result<StateFile, Refusal> {
+    pub fn open(data_dir: &Path) -> Result<(StateFile, State), Refusal> {
         let dir = data_dir.join("agents");
         DirBuilder::new()
             .recursive(true)
@@ -273,32 +314,33 @@ impl StateFile {
             ),
             Err(e) => return Err(Refusal::scan(e.kind)),
         };
-        Ok(StateFile {
-            dir: root,
+        Ok((
+            StateFile {
+                dir: root,
+                stamp,
+                _lock: lock,
+            },
             state,
-            stamp,
-            _lock: lock,
-        })
+        ))
     }
+}
 
-    /// Writes the state back.
-    ///
-    /// # Errors
-    /// When it cannot be written.
-    pub fn save(&mut self) -> Result<(), Refusal> {
-        let mut bytes = serde_json::to_vec_pretty(&self.state).map_err(|_| {
+impl Journal for StateFile {
+    fn save(&mut self, state: &State) -> Result<(), Refusal> {
+        let unwritable = || {
             Refusal::new(
                 "state_unwritable",
                 "EnvCloak's agent state could not be written",
             )
-        })?;
+        };
+        let mut bytes = serde_json::to_vec_pretty(state).map_err(|_| unwritable())?;
         bytes.push(b'\n');
         let rel = Path::new(STATE_NAME);
         let stamp = match self.stamp {
             Some(s) => replace_atomically(&self.dir, rel, &bytes, &s),
             None => create_atomically(&self.dir, rel, &bytes, 0o600),
         }
-        .map_err(|e| Refusal::modify(&e))?;
+        .map_err(|_| unwritable())?;
         self.stamp = Some(stamp);
         Ok(())
     }
@@ -389,7 +431,17 @@ impl Backups for DaemonBackups {
         self.client
             .backup_v2_record_result(id, 0, &digest)
             .map(drop)
-            .map_err(|e| backup_failed(&e))
+            .map_err(|e| {
+                let f = envcloak_client::fail::Failure::from(e);
+                Refusal::new(
+                    "result_unrecorded",
+                    format!(
+                        "the file was changed, but EnvCloak could not record what the change \
+                         left with its backup ({}): the backup restores only with --unrecorded",
+                        f.token()
+                    ),
+                )
+            })
     }
 }
 
@@ -404,6 +456,25 @@ pub fn sha256_hex(b: &[u8]) -> String {
         })
 }
 
+/// What was done to a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    Created,
+    Changed,
+    Removed,
+}
+
+impl Made {
+    /// The word a report uses.
+    pub fn word(self) -> &'static str {
+        match self {
+            Made::Created => "created",
+            Made::Changed => "changed",
+            Made::Removed => "removed",
+        }
+    }
+}
+
 /// What happened to one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -416,6 +487,13 @@ pub enum Outcome {
     },
     /// Removed, after the backup named.
     Removed { backup: Option<String> },
+    /// The file was changed (`made`), after the backup named, but a step
+    /// after the change failed (`failed`): the run is incomplete.
+    Partial {
+        made: Made,
+        backup: Option<String>,
+        failed: Refusal,
+    },
     /// Not changed, and why.
     Refused(Refusal),
 }
@@ -438,8 +516,9 @@ pub struct Target {
 /// What an edit makes of a file: its new contents and the edits they
 /// hold, or `None` for no change.
 pub type Edited = Option<(Vec<u8>, Vec<Edit>)>;
-/// An edit of a file's contents (`None` when it does not exist).
-pub type EditFn<'a> = dyn FnMut(Option<&[u8]>) -> Result<Edited, Refusal> + 'a;
+/// An edit of a file's contents (`None` when it does not exist), given
+/// EnvCloak's record of the file, if it has one.
+pub type EditFn<'a> = dyn FnMut(Option<&[u8]>, Option<&FileRecord>) -> Result<Edited, Refusal> + 'a;
 /// A structural undo: the current contents, the recorded edits, and
 /// whether EnvCloak created the file.
 pub type UndoFn<'a> = dyn FnMut(&[u8], &[Edit], bool) -> Result<Undo, Refusal> + 'a;
@@ -458,6 +537,7 @@ pub enum Undo {
 /// Changes and undoes files, keeping the record.
 pub struct Writer<'a> {
     pub state: &'a mut State,
+    pub journal: &'a mut dyn Journal,
     pub backups: &'a mut dyn Backups,
     pub now: SystemTime,
 }
@@ -513,13 +593,29 @@ fn open_target(path: &Path, create_dir: bool) -> Result<Read, Refusal> {
     })
 }
 
+/// The steps after a change that can fail once the file has changed.
+fn finished(made: Made, backup: Option<String>, failed: Option<Refusal>) -> Outcome {
+    match (failed, made) {
+        (Some(failed), made) => Outcome::Partial {
+            made,
+            backup,
+            failed,
+        },
+        (None, Made::Removed) => Outcome::Removed { backup },
+        (None, made) => Outcome::Changed {
+            created: made == Made::Created,
+            backup,
+        },
+    }
+}
+
 impl Writer<'_> {
     /// Whether `stamp` is the one EnvCloak recorded for `path` right after
     /// its own last write.
     fn own(&self, path: &Path, stamp: &FileStamp) -> bool {
         let k = key(path);
         let s = Stamp::from(*stamp);
-        self.state.files.get(&k).is_some_and(|r| r.stamp == s)
+        self.state.files.get(&k).is_some_and(|r| r.stamp == Some(s))
             || self.state.written.get(&k) == Some(&s)
     }
 
@@ -553,9 +649,40 @@ impl Writer<'_> {
         }
     }
 
+    /// Settles a change whose record was written and not confirmed (a run
+    /// stopped between the two), by what the file holds now: the change
+    /// was made (the record stands, its stamp unknown, so the 2 minutes
+    /// apply), was not (the record before it comes back), or the file
+    /// changed since (the record stands, undone by structure only).
+    fn settle(&mut self, k: &str, current: Option<&[u8]>) {
+        let Some(rec) = self.state.files.get_mut(k) else {
+            return;
+        };
+        let Some(intent) = rec.intent.take() else {
+            return;
+        };
+        let now = current.map(sha256_hex);
+        if now.as_deref() == Some(rec.post_sha256.as_str()) {
+            rec.stamp = None;
+        } else if now == intent.before_sha256 {
+            match intent.previous {
+                Some(p) => {
+                    self.state.files.insert(k.to_owned(), *p);
+                }
+                None => {
+                    self.state.files.remove(k);
+                }
+            }
+        } else {
+            rec.stamp = None;
+            rec.journal = None;
+        }
+    }
+
     /// Changes the file `t` names to what `edit` makes of its contents
-    /// (`None` when it does not exist): `Ok(None)` for no change, else the
-    /// new contents and the edits they hold.
+    /// (`None` when it does not exist) and EnvCloak's record of it:
+    /// `Ok(None)` for no change, else the new contents and the edits they
+    /// hold.
     pub fn change(&mut self, t: &Target, edit: &mut EditFn<'_>) -> Outcome {
         match self.try_change(t, edit) {
             Ok(o) => o,
@@ -563,10 +690,21 @@ impl Writer<'_> {
         }
     }
 
+    /// The backup made for a change that did not happen gets the file as
+    /// it is as its result, so its restore statement is true.
+    fn not_made(&mut self, backup: Option<&str>, bytes: &[u8]) {
+        if let Some(id) = backup {
+            let _ = self.backups.record(id, bytes);
+        }
+    }
+
     fn try_change(&mut self, t: &Target, edit: &mut EditFn<'_>) -> Result<Outcome, Refusal> {
         let r = open_target(&t.path, true)?;
+        let k = key(&t.path);
         let before = r.current.as_ref().map(|(b, _)| b.as_slice());
-        let Some((after, edits)) = edit(before)? else {
+        self.settle(&k, before);
+        let prev = self.state.files.get(&k).cloned();
+        let Some((after, edits)) = edit(before, prev.as_ref())? else {
             return Ok(Outcome::Unchanged);
         };
         if before == Some(after.as_slice()) {
@@ -579,43 +717,91 @@ impl Writer<'_> {
             }
             None => None,
         };
-        let stamp = match &r.current {
-            Some((_, stamp)) => replace_atomically(&r.root, &r.name, &after, stamp),
-            None => create_atomically(&r.root, &r.name, &after, 0o600),
-        }
-        .map_err(|e| Refusal::modify(&e))?;
-        if let Some(id) = &backup {
-            self.backups.record(id, &after)?;
-        }
-        let before_text = String::from_utf8_lossy(before.unwrap_or_default()).into_owned();
-        let after_text = String::from_utf8_lossy(&after).into_owned();
-        let sp = splice(&before_text, &after_text);
-        let k = key(&t.path);
+        let before_bytes = before.unwrap_or_default();
+        let before_sha = sha256_hex(before_bytes);
         let created = r.current.is_none();
-        self.state.written.remove(&k);
-        let rec = self.state.files.entry(k).or_insert_with(|| FileRecord {
+        let mut rec = prev.clone().unwrap_or_else(|| FileRecord {
             host: t.host.to_owned(),
             scope: t.scope.clone(),
+            host_owned: t.host_owned,
             created,
-            pre_sha256: sha256_hex(before.unwrap_or_default()),
-            post_sha256: String::new(),
-            stamp: Stamp::from(stamp),
-            splices: Vec::new(),
+            pre_sha256: before_sha.clone(),
+            post_sha256: before_sha.clone(),
+            stamp: None,
+            journal: Some(Vec::new()),
             edits: Vec::new(),
+            intent: None,
         });
+        rec.host_owned |= t.host_owned;
+        // The journal holds only while each change starts from what the
+        // last one left.
+        let chained = rec.post_sha256 == before_sha;
+        rec.journal = match (rec.journal.take(), hunks::hunks(before_bytes, &after)) {
+            (Some(mut j), Some(h)) if chained => {
+                j.push(h);
+                Some(j)
+            }
+            _ => None,
+        };
         rec.post_sha256 = sha256_hex(&after);
-        rec.stamp = Stamp::from(stamp);
-        rec.splices.push(SpliceRecord {
-            at: sp.at,
-            old: sp.old,
-            new: sp.new,
-        });
+        rec.stamp = None;
         for e in edits {
             if !rec.edits.contains(&e) {
                 rec.edits.push(e);
             }
         }
-        Ok(Outcome::Changed { created, backup })
+        rec.intent = Some(Intent {
+            before_sha256: r.current.as_ref().map(|_| before_sha.clone()),
+            previous: prev.clone().map(Box::new),
+        });
+        self.state.files.insert(k.clone(), rec);
+        if let Err(e) = self.journal.save(self.state) {
+            self.restore(&k, prev);
+            self.not_made(backup.as_deref(), before_bytes);
+            return Err(e);
+        }
+        let stamp = match &r.current {
+            Some((_, stamp)) => replace_atomically(&r.root, &r.name, &after, stamp),
+            None => create_atomically(&r.root, &r.name, &after, 0o600),
+        };
+        let stamp = match stamp {
+            Ok(s) => s,
+            Err(e) => {
+                self.restore(&k, prev);
+                let _ = self.journal.save(self.state);
+                self.not_made(backup.as_deref(), before_bytes);
+                return Err(Refusal::modify(&e));
+            }
+        };
+        if let Some(rec) = self.state.files.get_mut(&k) {
+            rec.stamp = Some(Stamp::from(stamp));
+            rec.intent = None;
+        }
+        self.state.written.remove(&k);
+        let mut failed = self.journal.save(self.state).err();
+        if let Some(id) = &backup {
+            if let Err(e) = self.backups.record(id, &after) {
+                failed.get_or_insert(e);
+            }
+        }
+        let made = if created {
+            Made::Created
+        } else {
+            Made::Changed
+        };
+        Ok(finished(made, backup, failed))
+    }
+
+    /// Puts back the record a change replaced.
+    fn restore(&mut self, k: &str, prev: Option<FileRecord>) {
+        match prev {
+            Some(p) => {
+                self.state.files.insert(k.to_owned(), p);
+            }
+            None => {
+                self.state.files.remove(k);
+            }
+        }
     }
 
     /// Undoes EnvCloak's changes to `path`: exactly, while the file is
@@ -629,57 +815,75 @@ impl Writer<'_> {
         }
     }
 
+    /// The file as it was before EnvCloak's first change, when `bytes` is
+    /// what its last one left and every change can be undone exactly.
+    fn exact(rec: &FileRecord, bytes: &[u8]) -> Option<Vec<u8>> {
+        if sha256_hex(bytes) != rec.post_sha256 {
+            return None;
+        }
+        let mut text = bytes.to_vec();
+        for h in rec.journal.as_ref()?.iter().rev() {
+            text = hunks::unapply(&text, h)?;
+        }
+        (sha256_hex(&text) == rec.pre_sha256).then_some(text)
+    }
+
     fn try_undo(&mut self, t: &Target, structural: &mut UndoFn<'_>) -> Result<Outcome, Refusal> {
         let k = key(&t.path);
+        if !self.state.files.contains_key(&k) {
+            return Ok(Outcome::Unchanged);
+        }
+        let r = open_target(&t.path, false)?;
+        self.settle(&k, r.current.as_ref().map(|(b, _)| b.as_slice()));
         let Some(rec) = self.state.files.get(&k).cloned() else {
             return Ok(Outcome::Unchanged);
         };
-        let r = open_target(&t.path, false)?;
         let Some((bytes, stamp)) = &r.current else {
             // Gone already: nothing of EnvCloak's is left.
             self.state.files.remove(&k);
+            let _ = self.journal.save(self.state);
             return Ok(Outcome::Unchanged);
         };
-        let exact = if sha256_hex(bytes) == rec.post_sha256 {
-            let mut text = String::from_utf8_lossy(bytes).into_owned();
-            let mut ok = true;
-            for s in rec.splices.iter().rev() {
-                let sp = Splice {
-                    at: s.at,
-                    old: s.old.clone(),
-                    new: s.new.clone(),
-                };
-                match sp.undo(&text) {
-                    Some(t) => text = t,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            (ok && sha256_hex(text.as_bytes()) == rec.pre_sha256).then_some(text.into_bytes())
-        } else {
-            None
-        };
-        let plan = match exact {
+        let ours = sha256_hex(bytes) == rec.post_sha256;
+        let plan = match Self::exact(&rec, bytes) {
             Some(b) if rec.created && b.is_empty() => Undo::Remove,
             Some(b) => Undo::Rewrite(b),
+            // EnvCloak's whole file, exactly as it wrote it.
+            None if ours && rec.created && rec.edits.contains(&Edit::WholeFile) => Undo::Remove,
             None => structural(bytes, &rec.edits, rec.created)?,
         };
-        let outcome = match plan {
-            Undo::Nothing => Outcome::Unchanged,
-            Undo::Rewrite(after) if &after == bytes => Outcome::Unchanged,
+        let t = Target {
+            host_owned: t.host_owned || rec.host_owned,
+            ..t.clone()
+        };
+        match plan {
+            Undo::Nothing => {
+                self.state.files.remove(&k);
+                let _ = self.journal.save(self.state);
+                Ok(Outcome::Unchanged)
+            }
+            Undo::Rewrite(after) if &after == bytes => {
+                self.state.files.remove(&k);
+                let _ = self.journal.save(self.state);
+                Ok(Outcome::Unchanged)
+            }
             Undo::Rewrite(after) => {
-                self.host_rule(t, &r, stamp)?;
+                self.host_rule(&t, &r, stamp)?;
                 let id = self.backups.back_up(&t.path, bytes, stamp.mode)?;
-                let left = replace_atomically(&r.root, &r.name, &after, stamp)
-                    .map_err(|e| Refusal::modify(&e))?;
+                let left = match replace_atomically(&r.root, &r.name, &after, stamp) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.not_made(Some(&id), bytes);
+                        return Err(Refusal::modify(&e));
+                    }
+                };
+                self.state.files.remove(&k);
                 self.state.written.insert(k.clone(), Stamp::from(left));
-                self.backups.record(&id, &after)?;
-                Outcome::Changed {
-                    created: false,
-                    backup: Some(id),
+                let mut failed = self.journal.save(self.state).err();
+                if let Err(e) = self.backups.record(&id, &after) {
+                    failed.get_or_insert(e);
                 }
+                Ok(finished(Made::Changed, Some(id), failed))
             }
             Undo::Remove => {
                 // A file of EnvCloak's own making: the 2 minutes run from
@@ -692,14 +896,19 @@ impl Writer<'_> {
                     self.now
                 };
                 let id = self.backups.back_up(&t.path, bytes, stamp.mode)?;
-                remove_checked_at(&r.root, &r.name, stamp, at).map_err(|e| Refusal::modify(&e))?;
+                if let Err(e) = remove_checked_at(&r.root, &r.name, stamp, at) {
+                    self.not_made(Some(&id), bytes);
+                    return Err(Refusal::modify(&e));
+                }
+                self.state.files.remove(&k);
                 self.state.written.remove(&k);
-                self.backups.record(&id, b"")?;
-                Outcome::Removed { backup: Some(id) }
+                let mut failed = self.journal.save(self.state).err();
+                if let Err(e) = self.backups.record(&id, b"") {
+                    failed.get_or_insert(e);
+                }
+                Ok(finished(Made::Removed, Some(id), failed))
             }
-        };
-        self.state.files.remove(&k);
-        Ok(outcome)
+        }
     }
 }
 
@@ -718,6 +927,7 @@ mod tests {
         made: Vec<(PathBuf, Vec<u8>)>,
         results: Vec<(String, String)>,
         refuse: bool,
+        refuse_record: bool,
     }
 
     impl Backups for Kept {
@@ -729,7 +939,30 @@ mod tests {
             Ok(format!("B{}", self.made.len()))
         }
         fn record(&mut self, id: &str, after: &[u8]) -> Result<(), Refusal> {
+            if self.refuse_record {
+                return Err(Refusal::new("result_unrecorded", "refused for the test"));
+            }
             self.results.push((id.to_owned(), sha256_hex(after)));
+            Ok(())
+        }
+    }
+
+    /// The state as saved, each save kept; `fail` refuses the saves whose
+    /// numbers (from 1) it holds.
+    #[derive(Default)]
+    struct Saved {
+        saves: Vec<State>,
+        fail: Vec<usize>,
+        count: usize,
+    }
+
+    impl Journal for Saved {
+        fn save(&mut self, state: &State) -> Result<(), Refusal> {
+            self.count += 1;
+            if self.fail.contains(&self.count) {
+                return Err(Refusal::new("state_unwritable", "refused for the test"));
+            }
+            self.saves.push(state.clone());
             Ok(())
         }
     }
@@ -744,8 +977,10 @@ mod tests {
         }
     }
 
-    fn append(text: &'static str) -> impl FnMut(Option<&[u8]>) -> Result<Edited, Refusal> {
-        move |b: Option<&[u8]>| {
+    fn append(
+        text: &'static str,
+    ) -> impl FnMut(Option<&[u8]>, Option<&FileRecord>) -> Result<Edited, Refusal> {
+        move |b: Option<&[u8]>, _| {
             let mut v = b.unwrap_or_default().to_vec();
             if v.ends_with(text.as_bytes()) {
                 return Ok(None);
@@ -755,20 +990,31 @@ mod tests {
         }
     }
 
+    fn nothing(_: &[u8], _: &[Edit], _: bool) -> Result<Undo, Refusal> {
+        Ok(Undo::Nothing)
+    }
+
+    macro_rules! writer {
+        ($state:expr, $saved:expr, $kept:expr) => {
+            Writer {
+                state: $state,
+                journal: $saved,
+                backups: $kept,
+                now: SystemTime::now(),
+            }
+        };
+    }
+
     #[test]
     fn a_change_backs_up_first_and_an_undo_gives_the_bytes_back() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let p = dir.path().join("CLAUDE.md");
-        std::fs::write(&p, b"# mine\n").unwrap_or_else(|e| panic!("{e}"));
-        let mut state = State::default();
-        let mut kept = Kept::default();
-        let mut w = Writer {
-            state: &mut state,
-            backups: &mut kept,
-            now: SystemTime::now(),
-        };
+        std::fs::write(&p, b"# mine").unwrap_or_else(|e| panic!("{e}"));
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
         let t = target(&p, false);
-        let o = w.change(&t, &mut append("added\n"));
+        let o = w.change(&t, &mut append("\n\nadded\n"));
         assert_eq!(
             o,
             Outcome::Changed {
@@ -776,12 +1022,12 @@ mod tests {
                 backup: Some("B1".to_owned())
             }
         );
-        assert_eq!(w.change(&t, &mut append("added\n")), Outcome::Unchanged);
-        let o = w.undo(&t, &mut |_, _, _| Ok(Undo::Nothing));
+        assert_eq!(w.change(&t, &mut append("\n\nadded\n")), Outcome::Unchanged);
+        let o = w.undo(&t, &mut nothing);
         assert!(matches!(o, Outcome::Changed { .. }), "{o:?}");
-        assert_eq!(std::fs::read(&p).unwrap_or_default(), b"# mine\n");
+        assert_eq!(std::fs::read(&p).unwrap_or_default(), b"# mine");
         assert!(state.files.is_empty());
-        assert_eq!(kept.made[0].1, b"# mine\n");
+        assert_eq!(kept.made[0].1, b"# mine");
         assert_eq!(kept.results.len(), 2);
     }
 
@@ -789,13 +1035,9 @@ mod tests {
     fn a_created_file_is_removed_by_its_undo_at_once() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let p = dir.path().join("sub/hooks.json");
-        let mut state = State::default();
-        let mut kept = Kept::default();
-        let mut w = Writer {
-            state: &mut state,
-            backups: &mut kept,
-            now: SystemTime::now(),
-        };
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
         let t = target(&p, true);
         assert_eq!(
             w.change(&t, &mut append("{}\n")),
@@ -805,7 +1047,7 @@ mod tests {
             }
         );
         // Right after EnvCloak's own write: no 2-minute wait.
-        let o = w.undo(&t, &mut |_, _, _| Ok(Undo::Nothing));
+        let o = w.undo(&t, &mut nothing);
         assert!(matches!(o, Outcome::Removed { .. }), "{o:?}");
         assert!(!p.exists());
     }
@@ -815,13 +1057,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let p = dir.path().join("settings.json");
         std::fs::write(&p, b"{}\n").unwrap_or_else(|e| panic!("{e}"));
-        let mut state = State::default();
-        let mut kept = Kept::default();
-        let mut w = Writer {
-            state: &mut state,
-            backups: &mut kept,
-            now: SystemTime::now(),
-        };
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
         let o = w.change(&target(&p, true), &mut append("x"));
         assert!(
             matches!(&o, Outcome::Refused(r) if r.name == "recently_changed"),
@@ -834,17 +1072,14 @@ mod tests {
             refuse: true,
             ..Kept::default()
         };
-        let mut w = Writer {
-            state: &mut state,
-            backups: &mut kept,
-            now: SystemTime::now(),
-        };
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
         let o = w.change(&target(&p, false), &mut append("x"));
         assert!(
             matches!(&o, Outcome::Refused(r) if r.name == "backup_failed"),
             "{o:?}"
         );
         assert_eq!(std::fs::read(&p).unwrap_or_default(), b"{}\n");
+        assert!(state.files.is_empty());
     }
 
     /// EnvCloak's own writes, its undo included, leave a stamp it knows:
@@ -861,29 +1096,19 @@ mod tests {
             .open(&p)
             .and_then(|f| f.set_modified(old))
             .unwrap_or_else(|e| panic!("{e}"));
-        let mut state = State::default();
-        let mut kept = Kept::default();
-        let mut w = Writer {
-            state: &mut state,
-            backups: &mut kept,
-            now: SystemTime::now(),
-        };
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
         let t = target(&p, true);
         assert!(matches!(
             w.change(&t, &mut append("x")),
             Outcome::Changed { .. }
         ));
-        assert!(matches!(
-            w.undo(&t, &mut |_, _, _| Ok(Undo::Nothing)),
-            Outcome::Changed { .. }
-        ));
+        assert!(matches!(w.undo(&t, &mut nothing), Outcome::Changed { .. }));
         assert_eq!(std::fs::read(&p).unwrap_or_default(), b"{}\n");
         let o = w.change(&t, &mut append("x"));
         assert!(matches!(o, Outcome::Changed { .. }), "{o:?}");
-        assert!(matches!(
-            w.undo(&t, &mut |_, _, _| Ok(Undo::Nothing)),
-            Outcome::Changed { .. }
-        ));
+        assert!(matches!(w.undo(&t, &mut nothing), Outcome::Changed { .. }));
         // Someone else writes it now: the 2 minutes apply again.
         std::fs::write(&p, b"{ }\n").unwrap_or_else(|e| panic!("{e}"));
         let o = w.change(&t, &mut append("x"));
@@ -901,15 +1126,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let p = dir.path().join("CLAUDE.md");
         std::fs::write(&p, b"# mine\n").unwrap_or_else(|e| panic!("{e}"));
-        let mut state = State::default();
-        let mut kept = Kept::default();
-        let mut w = Writer {
-            state: &mut state,
-            backups: &mut kept,
-            now: SystemTime::now(),
-        };
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
         let theirs = p.clone();
-        let mut racing = move |b: Option<&[u8]>| {
+        let mut racing = move |b: Option<&[u8]>, _: Option<&FileRecord>| {
             // The person saves the file while EnvCloak is editing it.
             std::fs::write(&theirs, b"# theirs, longer\n").unwrap_or_else(|e| panic!("{e}"));
             let mut v = b.unwrap_or_default().to_vec();
@@ -923,6 +1144,8 @@ mod tests {
         );
         assert_eq!(std::fs::read(&p).unwrap_or_default(), b"# theirs, longer\n");
         assert!(state.files.is_empty());
+        // The backup's result says the file was left as it was read.
+        assert_eq!(kept.results, [("B1".to_owned(), sha256_hex(b"# mine\n"))]);
     }
 
     #[test]
@@ -936,10 +1159,11 @@ mod tests {
         std::fs::hard_link(&real, &hard).unwrap_or_else(|e| panic!("{e}"));
         let big = dir.path().join("CLAUDE.md");
         std::fs::write(&big, vec![b'a'; 4 * 1024 * 1024]).unwrap_or_else(|e| panic!("{e}"));
-        let mut state = State::default();
-        let mut kept = Kept::default();
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
         let mut w = Writer {
             state: &mut state,
+            journal: &mut saved,
             backups: &mut kept,
             now: SystemTime::now() + Duration::from_secs(3600),
         };
@@ -956,5 +1180,198 @@ mod tests {
         }
         assert!(kept.made.is_empty());
         assert_eq!(std::fs::read(&real).unwrap_or_default(), b"{}\n");
+    }
+
+    /// Lesson L-12: what the state keeps of a change is where EnvCloak's
+    /// text went, never the person's own text, even text between two
+    /// places one change edits.
+    ///
+    /// Mutation checked: the journal kept as one splice of the whole span
+    /// between the first and last changed byte, with its old text (the
+    /// previous `SpliceRecord { at, old, new }`): the canary between the
+    /// two edits is in the saved state and this fails.
+    #[test]
+    fn the_state_keeps_no_text_of_the_file() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let p = dir.path().join("settings.json");
+        let canary = format!("canary{:016x}", u64::from(std::process::id()) << 7 | 0x5a5a);
+        let before = format!(
+            "{{\n  \"deny\": [\n    \"A\"\n  ],\n  \"env\": {{\n    \"KEY\": \"{canary}\"\n  \
+             }},\n  \"z\": 1\n}}\n"
+        );
+        std::fs::write(&p, &before).unwrap_or_else(|e| panic!("{e}"));
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let t = target(&p, false);
+        let two_sites = |b: Option<&[u8]>, _: Option<&FileRecord>| {
+            let text = String::from_utf8(b.unwrap_or_default().to_vec()).unwrap_or_default();
+            if text.contains("\"B\"") {
+                return Ok(None);
+            }
+            let text = text.replacen("\"A\"\n", "\"A\",\n    \"B\"\n", 1).replacen(
+                "\"z\": 1\n",
+                "\"z\": 1,\n  \"hooks\": {}\n",
+                1,
+            );
+            Ok(Some((text.into_bytes(), vec![Edit::Block])))
+        };
+        let mut edit = two_sites;
+        assert!(matches!(w.change(&t, &mut edit), Outcome::Changed { .. }));
+        for s in std::iter::once(&state).chain(saved.saves.iter()) {
+            let kept = serde_json::to_string(s).unwrap_or_default();
+            assert!(!kept.contains(&canary), "the state holds the file's text");
+            assert!(!kept.contains("\"B\""), "the state holds the inserted text");
+        }
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        assert!(matches!(w.undo(&t, &mut nothing), Outcome::Changed { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap_or_default(),
+            before,
+            "the exact undo"
+        );
+    }
+
+    /// Lesson L-08 and the state's write-ahead record: a run that stops
+    /// after the file changed still owns the change, one that stops
+    /// before does not, and a step that fails after the change says the
+    /// file was changed.
+    ///
+    /// Mutations checked: the record saved only after the rename (the
+    /// first save moved below `replace_atomically`): the stopped run's
+    /// change is not in the saved state and this fails. A failed result
+    /// record answered as a refusal (`Outcome::Refused` for the
+    /// `record` error): the outcome is not `Partial` and this fails.
+    #[test]
+    fn a_change_is_recorded_before_it_is_made_and_failures_after_it_say_so() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let p = dir.path().join("CLAUDE.md");
+        std::fs::write(&p, b"# mine\n").unwrap_or_else(|e| panic!("{e}"));
+        let t = target(&p, false);
+
+        // The save after the change fails (the run is stopped there): the
+        // first save already holds the change, as an intent.
+        let (mut state, mut kept) = (State::default(), Kept::default());
+        let mut saved = Saved {
+            fail: vec![2],
+            ..Saved::default()
+        };
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let o = w.change(&t, &mut append("added\n"));
+        assert!(
+            matches!(&o, Outcome::Partial { made: Made::Changed, failed, .. } if failed.name == "state_unwritable"),
+            "{o:?}"
+        );
+        let on_disk = saved.saves.last().cloned().unwrap_or_default();
+        let rec = on_disk.files.get(&key(&p)).cloned();
+        assert!(rec.as_ref().is_some_and(|r| r.intent.is_some()), "{rec:?}");
+        // The next run, from what was saved, settles it as made and owns
+        // it: the uninstall takes the block out.
+        let mut state = on_disk;
+        let (mut saved, mut kept) = (Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let o = w.undo(&t, &mut nothing);
+        assert!(matches!(o, Outcome::Changed { .. }), "{o:?}");
+        assert_eq!(std::fs::read(&p).unwrap_or_default(), b"# mine\n");
+
+        // A run stopped after the record was saved and before the file
+        // changed (here the directory refuses the new file): the next run
+        // drops the intent, and the file is the person's alone.
+        use std::os::unix::fs::PermissionsExt as _;
+        let sub = dir.path().join("ro");
+        std::fs::create_dir(&sub).unwrap_or_else(|e| panic!("{e}"));
+        let q = sub.join("AGENTS.md");
+        std::fs::write(&q, b"# theirs\n").unwrap_or_else(|e| panic!("{e}"));
+        let mode = |m: u32| {
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(m))
+                .unwrap_or_else(|e| panic!("{e}"));
+        };
+        mode(0o500);
+        // As root the directory's mode stops nothing: this part needs a
+        // user it stops.
+        let probe = sub.join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            mode(0o700);
+            return;
+        }
+        let tq = target(&q, false);
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let o = w.change(&tq, &mut append("added\n"));
+        mode(0o700);
+        assert!(matches!(o, Outcome::Refused(_)), "{o:?}");
+        assert!(state.files.is_empty());
+        let first = saved.saves.first().cloned().unwrap_or_default();
+        assert!(
+            first
+                .files
+                .get(&key(&q))
+                .is_some_and(|r| r.intent.is_some())
+        );
+        let mut state = first;
+        let (mut saved, mut kept) = (Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let o = w.undo(&tq, &mut |_, _, _| {
+            Ok(Undo::Rewrite(b"not EnvCloak's to write\n".to_vec()))
+        });
+        assert_eq!(o, Outcome::Unchanged);
+        assert!(state.files.is_empty());
+        assert_eq!(std::fs::read(&q).unwrap_or_default(), b"# theirs\n");
+
+        // The backup's result cannot be recorded: the file was changed,
+        // and the outcome says so, with the record kept.
+        std::fs::write(&p, b"# mine\n").unwrap_or_else(|e| panic!("{e}"));
+        let (mut state, mut saved) = (State::default(), Saved::default());
+        let mut kept = Kept {
+            refuse_record: true,
+            ..Kept::default()
+        };
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let o = w.change(&t, &mut append("added\n"));
+        assert!(
+            matches!(&o, Outcome::Partial { made: Made::Changed, failed, .. } if failed.name == "result_unrecorded"),
+            "{o:?}"
+        );
+        assert!(
+            state
+                .files
+                .get(&key(&p))
+                .is_some_and(|r| r.intent.is_none())
+        );
+    }
+
+    /// A file EnvCloak wrote whole is removed only while it is what
+    /// EnvCloak wrote; changed since, it is left, and the undo says why.
+    ///
+    /// Mutation checked: `install::structural` answering `Undo::Remove`
+    /// for a whole file whatever it holds (the previous code): the
+    /// person's edited file is removed and this fails.
+    #[test]
+    fn a_whole_file_changed_since_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let p = dir.path().join("envcloak.rules");
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let t = target(&p, false);
+        let mut whole = |b: Option<&[u8]>, _: Option<&FileRecord>| match b {
+            Some(_) => Ok(None),
+            None => Ok(Some((b"rule\n".to_vec(), vec![Edit::WholeFile]))),
+        };
+        assert!(matches!(w.change(&t, &mut whole), Outcome::Changed { .. }));
+        std::fs::write(&p, b"rule\nmine\n").unwrap_or_else(|e| panic!("{e}"));
+        // Older than 2 minutes: only the check of its contents keeps it.
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .and_then(|f| f.set_modified(SystemTime::now() - Duration::from_secs(600)))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let o = w.undo(&t, &mut crate::install::structural);
+        assert!(
+            matches!(&o, Outcome::Refused(r) if r.name == "modified"),
+            "{o:?}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap_or_default(), b"rule\nmine\n");
     }
 }

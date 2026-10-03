@@ -39,12 +39,13 @@ use common::{
     seed_vault, start_daemon, stderr, stdout,
 };
 use envcloak_agents::blocks;
+use envcloak_agents::hosts::claude::{READ_DENY, TOOL_MATCHER};
 use envcloak_agents::hosts::codex::RULES;
 use envcloak_core::file_backup_v2::list_file_backups_v2;
 use envcloak_core::vault::VaultPaths;
 use envcloak_testkit::{
     Canary, Daemon, TEST_PATH, TestHome, assert_no_canary, by_label, canaries, daemon_socket,
-    fresh_seed, labels,
+    fresh_seed, labels, sweep_dir,
 };
 use serde_json::{Value, json};
 
@@ -461,7 +462,7 @@ fn install_then_uninstall_gives_every_byte_back() {
     let hook = |event: &str| format!("{me} hook --host claude-code --event {event}");
     for (event, matcher) in [
         ("UserPromptSubmit", None),
-        ("PreToolUse", Some("Bash|Read|Grep|Glob|Edit")),
+        ("PreToolUse", Some(TOOL_MATCHER)),
         ("PreToolUse", Some("mcp__.*")),
         ("SessionStart", None),
     ] {
@@ -826,6 +827,37 @@ fn socket_allowances_follow_k01() {
         assert_eq!(f.text(".claude/settings.json"), SETTINGS);
         f.sweep();
     }
+    // With consent, settings of the person's own that the allowance would
+    // switch on (a proxy domain rule here) refuse it, and config.toml is
+    // left as it was (Codex review). Linux writes no allowance at all.
+    let f = Fixture::new();
+    let with_domain = format!(
+        "{}\n[features.network_proxy.domains]\n\"example.com\" = \"allow\"\n",
+        config_toml()
+    );
+    std::fs::write(f.path(".codex/config.toml"), &with_domain).unwrap();
+    age(&f.path(".codex/config.toml"), OLD);
+    let (v, code) = f.report(&[
+        "install",
+        "--agent",
+        "codex",
+        "--consent-sandbox-sockets",
+        "--yes",
+    ]);
+    if cfg!(target_os = "macos") {
+        assert_eq!(code, 1, "{v}");
+        let (outcome, reason, _) = outcome_of(&v, "~/.codex/config.toml");
+        assert_eq!(
+            (outcome.as_str(), reason),
+            ("refused", json!("network_settings_present")),
+            "{v}"
+        );
+        assert_eq!(f.text(".codex/config.toml"), with_domain);
+    } else {
+        assert_eq!(code, 0, "{v}");
+        assert!(!f.text(".codex/config.toml").contains("network_access"));
+    }
+    f.sweep();
 }
 
 /// No approval setting for any EnvCloak tool, in either host, and the
@@ -999,6 +1031,246 @@ fn every_command_the_block_names_is_shipped() {
             "{cmd}: {both}"
         );
     }
+}
+
+/// A literal written into a config by the person (Claude Code's `env`
+/// block, between two places install edits; a Codex MCP server's `env`
+/// table) never reaches EnvCloak's state: `<data>/agents/` is swept after
+/// install and after uninstall (lesson L-12; the review's finding that the
+/// undo journal kept the text between two edits).
+///
+/// Mutation checked: `hunks::hunks` keeping one splice of the whole span
+/// from the first changed byte to the last, with its old text (the
+/// previous `SpliceRecord`): the sweep finds the settings.json literal in
+/// state.json and this fails.
+#[test]
+fn literals_in_the_configs_never_reach_the_state() {
+    let f = Fixture::new();
+    let seed = || format!("{:016x}{:016x}", fresh_seed(), fresh_seed());
+    let lits = [
+        Canary::new("SETTINGS_ENV_LITERAL", format!("ecst{}", seed())),
+        Canary::new("CODEX_ENV_LITERAL", format!("eccx{}", seed())),
+    ];
+    let settings = SETTINGS.replacen(
+        "  \"hooks\": {",
+        &format!(
+            "  \"env\": {{\n    \"API_TOKEN\": \"{}\"\n  }},\n  \"hooks\": {{",
+            lits[0].as_str()
+        ),
+        1,
+    );
+    assert!(settings.contains(lits[0].as_str()));
+    std::fs::write(f.path(".claude/settings.json"), &settings).unwrap();
+    // On macOS, consent makes two Codex sites too: network_access near the
+    // top, the proxy and EnvCloak's server at the end.
+    let toml = format!(
+        "[sandbox_workspace_write]\nnetwork_access = false\n\n{}\n[mcp_servers.other.env]\nTOKEN = \"{}\"\n",
+        config_toml(),
+        lits[1].as_str()
+    );
+    std::fs::write(f.path(".codex/config.toml"), &toml).unwrap();
+    for p in [".claude/settings.json", ".codex/config.toml"] {
+        age(&f.path(p), OLD);
+    }
+    let state = data_dir(&f.home).join("agents");
+    let swept = |when: &str| {
+        let hits = sweep_dir(&state, &lits);
+        assert!(
+            hits.is_empty(),
+            "{when}: {} hit(s) in <data>/agents",
+            hits.len()
+        );
+    };
+    let (v, code) = f.report(&["install", "--yes", "--consent-sandbox-sockets"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(state.join("state.json").exists());
+    swept("after install");
+    let (u, code) = f.report(&["uninstall", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    swept("after uninstall");
+    assert_eq!(f.text(".claude/settings.json"), settings);
+    assert_eq!(f.text(".codex/config.toml"), toml);
+    f.sweep();
+}
+
+/// With EnvCloak's plugin enabled, its hooks and MCP server are not
+/// installed again (each hook would run twice), but what no plugin
+/// carries still is: the deny rule, which also covers `@` file mentions,
+/// and the sandbox settings (Codex review). Uninstall gives the bytes
+/// back.
+///
+/// Mutation checked: the plugin's early return in `claude_plan` (the
+/// previous code: only the block written): settings.json has no deny rule
+/// and this fails.
+#[test]
+fn a_plugin_install_still_gets_the_protections() {
+    let f = Fixture::new();
+    let settings = SETTINGS.replacen(
+        "  \"model\": \"opus\"",
+        "  \"model\": \"opus\",\n  \"enabledPlugins\": {\n    \"envcloak@market\": true\n  }",
+        1,
+    );
+    std::fs::write(f.path(".claude/settings.json"), &settings).unwrap();
+    age(&f.path(".claude/settings.json"), OLD);
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        notes(&v, "claude-code").contains(&"plugin_enabled".to_owned()),
+        "{v}"
+    );
+    let s = f.json(".claude/settings.json");
+    assert!(
+        s["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(READ_DENY)),
+        "{s}"
+    );
+    let data = data_dir(&f.home);
+    assert!(
+        s["sandbox"]["credentials"]["files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"path": data.join("vault").to_string_lossy(), "mode": "deny"})),
+        "{s}"
+    );
+    assert_eq!(
+        s["sandbox"]["network"]["allowUnixSockets"].is_array(),
+        cfg!(target_os = "macos"),
+        "{s}"
+    );
+    assert!(
+        !f.text(".claude/settings.json").contains(" hook --host "),
+        "{s}"
+    );
+    assert!(
+        f.json(".claude.json")["mcpServers"]
+            .get("envcloak")
+            .is_none()
+    );
+    let (u, code) = f.report(&["uninstall", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(f.text(".claude/settings.json"), settings);
+    f.sweep();
+}
+
+/// An MCP server named `envcloak` the person registered themselves, with
+/// EnvCloak's very settings, stays theirs: install changes nothing and
+/// says so, and uninstall leaves it (Codex review: "removes exactly what
+/// was added").
+///
+/// Mutation checked: the entry claimed when it is equal (the previous
+/// `w.state.mcp.insert` before `Outcome::Unchanged`): uninstall removes
+/// the person's entry and this fails.
+#[test]
+fn a_server_the_person_registered_stays_theirs() {
+    let f = Fixture::new();
+    let entry = json!({
+        "command": envcloak_path(),
+        "args": ["mcp", "--host", "claude-code"],
+        "timeout": 60000,
+    });
+    let out = f.host(
+        "claude",
+        &[
+            "mcp",
+            "add-json",
+            "--scope",
+            "user",
+            "envcloak",
+            &entry.to_string(),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    age(&f.path(".claude.json"), OLD);
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(outcome_of(&v, "~/.claude.json").0, "unchanged", "{v}");
+    assert!(
+        notes(&v, "claude-code").contains(&"mcp_server_yours".to_owned()),
+        "{v}"
+    );
+    let (u, code) = f.report(&["uninstall", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(f.json(".claude.json")["mcpServers"]["envcloak"], entry);
+    f.sweep();
+}
+
+/// A file that is EnvCloak's whole (Codex's rules) is removed by
+/// uninstall, and replaced by install, only while it is exactly what
+/// EnvCloak wrote: one the person changed is left and reported (Codex
+/// review: uninstall deleted the person's rules).
+///
+/// Mutations checked: `install::structural` answering `Undo::Remove` for a
+/// whole file whatever it holds (the previous code): uninstall deletes the
+/// person's rules and this fails. `OwnFile` overwritten whenever EnvCloak
+/// has a record of it (the previous `known`): the second install replaces
+/// the person's rules and this fails.
+#[test]
+fn a_rules_file_changed_since_is_left_and_reported() {
+    let f = Fixture::new();
+    let (v, code) = f.report(&["install", "--agent", "codex", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    let mine = format!("{RULES}# mine\n");
+    std::fs::write(f.path(".codex/rules/envcloak.rules"), &mine).unwrap();
+    // Older than 2 minutes: only the check of its contents keeps it.
+    age(&f.path(".codex/rules/envcloak.rules"), OLD);
+    let (v, code) = f.report(&["install", "--agent", "codex", "--yes"]);
+    assert_eq!(code, 1, "{v}");
+    let (outcome, reason, _) = outcome_of(&v, "~/.codex/rules/envcloak.rules");
+    assert_eq!(
+        (outcome.as_str(), reason),
+        ("refused", json!("modified")),
+        "{v}"
+    );
+    assert_eq!(f.text(".codex/rules/envcloak.rules"), mine);
+    let (u, code) = f.report(&["uninstall", "--yes"]);
+    assert_eq!(code, 1, "{u}");
+    let (outcome, reason, _) = outcome_of(&u, "~/.codex/rules/envcloak.rules");
+    assert_eq!(
+        (outcome.as_str(), reason),
+        ("refused", json!("modified")),
+        "{u}"
+    );
+    assert_eq!(f.text(".codex/rules/envcloak.rules"), mine);
+    // The rest was taken out.
+    assert_eq!(f.text(".codex/config.toml"), config_toml());
+    assert!(!f.path(".codex/hooks.json").exists());
+    f.sweep();
+}
+
+/// The hooks and the MCP entries name EnvCloak by its link on `PATH`
+/// (a package manager's, which an upgrade keeps), not by the versioned
+/// file it points to, whose path an upgrade removes (a hook whose command
+/// is gone fails open on both hosts).
+///
+/// Mutation checked: `install::stable_exe` not called in `context` (the
+/// previous `current_exe().canonicalize()`): the hooks name the built
+/// binary's own path and this fails.
+#[test]
+fn the_hooks_name_envcloak_by_its_link_on_path() {
+    let f = Fixture::new();
+    let link = f.home.root().join("linked");
+    std::fs::create_dir(&link).unwrap();
+    std::os::unix::fs::symlink(cli(), link.join("envcloak")).unwrap();
+    let mut cmd = cli_command(
+        &f.home,
+        &["agents", "install", "--agent", "codex", "--yes"],
+        &[],
+    );
+    cmd.env(
+        "PATH",
+        format!("{}:{}:{TEST_PATH}", link.display(), f.bin.display()),
+    );
+    let out = finish_within(cmd, Duration::from_secs(120));
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let hooks = f.text(".codex/hooks.json");
+    let want = format!("{} hook --host codex", link.join("envcloak").display());
+    assert!(hooks.contains(&want), "{hooks}");
+    assert!(!hooks.contains(&envcloak_path()), "{hooks}");
+    let (u, code) = f.report(&["uninstall", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    f.sweep();
 }
 
 /// No argument is echoed: a key-shaped `--agent` is a usage error that

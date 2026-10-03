@@ -2,8 +2,9 @@
 //! §7: Claude Code's `settings.json`, Codex's `hooks.json`): every byte
 //! outside the spans an edit changes stays as it was, so the person's
 //! layout, order and spacing survive an install, and an uninstall right
-//! after it gives the file back byte for byte (the installer also keeps
-//! the exact splice it made, [`splice`]).
+//! after it gives the file back byte for byte (the installer keeps where
+//! each edit's text went, [`crate::hunks`]). An edit only inserts, apart
+//! from the white space inside an empty container it fills.
 //!
 //! The reader is strict JSON (RFC 8259): a comment or a trailing comma is
 //! JSONC, which is refused and named ([`JsonError::Jsonc`]), not
@@ -337,53 +338,6 @@ fn utf8_len(b: u8) -> usize {
         0xE0..=0xEF => 3,
         0xC0..=0xDF => 2,
         _ => 1,
-    }
-}
-
-/// The one change between two texts: at byte `at`, `old` became `new`
-/// (the common start and end left out). Applying it to the first text
-/// gives the second, and its inverse gives the first back.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Splice {
-    pub at: usize,
-    pub old: String,
-    pub new: String,
-}
-
-/// The splice that turns `before` into `after`, on character boundaries.
-pub fn splice(before: &str, after: &str) -> Splice {
-    let (a, b) = (before.as_bytes(), after.as_bytes());
-    let mut pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
-    while !before.is_char_boundary(pre) || !after.is_char_boundary(pre) {
-        pre -= 1;
-    }
-    let max_suf = a.len().min(b.len()) - pre;
-    let mut suf = a
-        .iter()
-        .rev()
-        .zip(b.iter().rev())
-        .take(max_suf)
-        .take_while(|(x, y)| x == y)
-        .count();
-    while !before.is_char_boundary(a.len() - suf) || !after.is_char_boundary(b.len() - suf) {
-        suf -= 1;
-    }
-    Splice {
-        at: pre,
-        old: before[pre..a.len() - suf].to_owned(),
-        new: after[pre..b.len() - suf].to_owned(),
-    }
-}
-
-impl Splice {
-    /// `text` with this splice undone, when `text` holds its new part
-    /// where it was made.
-    pub fn undo(&self, text: &str) -> Option<String> {
-        let end = self.at.checked_add(self.new.len())?;
-        if text.get(self.at..end)? != self.new {
-            return None;
-        }
-        Some(format!("{}{}{}", &text[..self.at], self.old, &text[end..]))
     }
 }
 
@@ -765,9 +719,14 @@ mod tests {
                 assert!(src.chars().all(|c| it.any(|d| d == c)), "{src}\n{text}");
                 // Adding again changes nothing.
                 assert_eq!(d.add_to_array(path, value), Ok(None));
-                // The splice undoes exactly.
-                let sp = splice(src, &text);
-                assert_eq!(sp.undo(&text).as_deref(), Some(src));
+                // Only insertions (and white space filled): they undo
+                // exactly.
+                let h = crate::hunks::hunks(src.as_bytes(), text.as_bytes())
+                    .unwrap_or_else(|| panic!("{src}\n{text}"));
+                assert_eq!(
+                    crate::hunks::unapply(text.as_bytes(), &h).as_deref(),
+                    Some(src.as_bytes())
+                );
                 // The structural removal gives the value back.
                 let created = created.unwrap_or(0);
                 assert_eq!(d.remove_from_array(path, value, created), Ok(true));
