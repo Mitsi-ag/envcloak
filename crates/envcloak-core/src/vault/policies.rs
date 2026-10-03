@@ -1281,7 +1281,9 @@ mod tests {
             }
         }
         // Every single-byte change either fails or decodes to a record in
-        // bounds; none panics.
+        // bounds; none panics. Both happen (the counts), so neither half
+        // of the check is empty.
+        let (mut accepted, mut refused) = (0u32, 0u32);
         for r in every_record() {
             let b = r.encode();
             for at in 0..b.len() {
@@ -1290,10 +1292,14 @@ mod tests {
                     x[at] = bad;
                     if let Ok(d) = PolicyRecord::decode(&x) {
                         d.check().unwrap();
+                        accepted += 1;
+                    } else {
+                        refused += 1;
                     }
                 }
             }
         }
+        assert!(accepted > 0 && refused > 0, "{accepted} {refused}");
     }
 
     /// Random bytes behind each kind and version, and random records'
@@ -1310,6 +1316,7 @@ mod tests {
             z ^ (z >> 31)
         };
         let records = every_record();
+        let mut accepted = 0u32;
         for round in 0..20_000u32 {
             let b: Vec<u8> = if round % 2 == 0 {
                 let len = (next() % 200) as usize;
@@ -1331,8 +1338,11 @@ mod tests {
             if let Ok(r) = PolicyRecord::decode(&b) {
                 r.check().unwrap();
                 assert_eq!(r.encode(), b);
+                accepted += 1;
             }
         }
+        // Some inputs decode, so the round trip above was checked.
+        assert!(accepted > 0);
     }
 
     #[test]
