@@ -55,7 +55,7 @@ fn the_claude_code_plugin_is_the_installers_integration() {
     let envcloak = Path::new("envcloak");
     assert_eq!(
         json_file("claude-code/hooks/hooks.json"),
-        hooks_file(claude::settings_additions(envcloak, None, Path::new("/d")))
+        hooks_file(claude::hooks_additions(envcloak))
     );
     assert_eq!(
         json_file("claude-code/.mcp.json"),

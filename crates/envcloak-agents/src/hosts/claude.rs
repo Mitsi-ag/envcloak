@@ -4,8 +4,10 @@
 //! - the instruction block in `~/.claude/CLAUDE.md`;
 //! - in `~/.claude/settings.json` (which Claude Code may rewrite itself,
 //!   so D-16's rule applies): the hooks (`UserPromptSubmit`; `PreToolUse`
-//!   for `Bash`, `Read`, `Grep`, `Glob`, `Edit` and every MCP tool,
-//!   `mcp__.*`; `SessionStart`), the deny rule `Read(**/.env*)`, which
+//!   for `Bash`, `Monitor`, `Read`, `Edit`, `Grep`, `Glob`,
+//!   `ReadMcpResourceTool` and every MCP tool, `mcp__.*`; `SessionStart`),
+//!   unless EnvCloak's plugin, which carries them, is enabled; the deny
+//!   rule `Read(**/.env*)`, which
 //!   Claude Code also applies, best effort, to `@` file mentions that no
 //!   hook sees, `sandbox.credentials` deny entries for the vault and the
 //!   backups, and on macOS the socket's resolved path in
@@ -36,8 +38,12 @@ use crate::writer::Refusal;
 pub const SERVER: &str = "envcloak";
 /// The deny rule for env files.
 pub const READ_DENY: &str = "Read(**/.env*)";
-/// The `PreToolUse` matcher for Claude Code's own tools: an exact list.
-pub const TOOL_MATCHER: &str = "Bash|Read|Grep|Glob|Edit";
+/// The `PreToolUse` matcher for Claude Code's own tools: an exact list,
+/// every tool of the pinned version (2.1.280's `sdk-tools.d.ts`) that runs
+/// a command (`Bash`; `Monitor`, whose `command` is a shell script) or
+/// reads a file or a resource (`Read`, `Edit`, `Grep`, `Glob`,
+/// `ReadMcpResourceTool`).
+pub const TOOL_MATCHER: &str = "Bash|Monitor|Read|Edit|Grep|Glob|ReadMcpResourceTool";
 /// The `PreToolUse` matcher for every MCP tool: a regular expression.
 pub const MCP_MATCHER: &str = "mcp__.*";
 /// How long a `claude mcp` command may take.
@@ -64,15 +70,10 @@ fn handler(envcloak: &Path, event: Event) -> Value {
     })
 }
 
-/// The array elements the installer adds to `settings.json`, each with
-/// its path. `socket` is the daemon's socket, resolved (macOS only).
-pub fn settings_additions(
-    envcloak: &Path,
-    socket: Option<&Path>,
-    data_dir: &Path,
-) -> Vec<(Vec<&'static str>, Value)> {
-    let mut out = vec![
-        (vec!["permissions", "deny"], json!(READ_DENY)),
+/// The hooks the installer adds to `settings.json`, each with its path:
+/// what EnvCloak's plugin carries too.
+pub fn hooks_additions(envcloak: &Path) -> Vec<(Vec<&'static str>, Value)> {
+    vec![
         (
             vec!["hooks", "UserPromptSubmit"],
             json!({"hooks": [handler(envcloak, Event::UserPromptSubmit)]}),
@@ -89,7 +90,15 @@ pub fn settings_additions(
             vec!["hooks", "SessionStart"],
             json!({"hooks": [handler(envcloak, Event::SessionStart)]}),
         ),
-    ];
+    ]
+}
+
+/// The settings no plugin carries, which the installer adds to
+/// `settings.json` with or without one, each with its path: the deny rule,
+/// the sandbox's deny entries for the vault and the backups, and with
+/// `socket` (the daemon's socket, resolved; macOS only) its allowance.
+pub fn protections(socket: Option<&Path>, data_dir: &Path) -> Vec<(Vec<&'static str>, Value)> {
+    let mut out = vec![(vec!["permissions", "deny"], json!(READ_DENY))];
     if let Some(s) = socket {
         out.push((
             vec!["sandbox", "network", "allowUnixSockets"],
@@ -102,6 +111,18 @@ pub fn settings_additions(
             json!({"path": data_dir.join(d).to_string_lossy(), "mode": "deny"}),
         ));
     }
+    out
+}
+
+/// Every element the installer adds to `settings.json` when no plugin
+/// carries the hooks.
+pub fn settings_additions(
+    envcloak: &Path,
+    socket: Option<&Path>,
+    data_dir: &Path,
+) -> Vec<(Vec<&'static str>, Value)> {
+    let mut out = protections(socket, data_dir);
+    out.extend(hooks_additions(envcloak));
     out
 }
 

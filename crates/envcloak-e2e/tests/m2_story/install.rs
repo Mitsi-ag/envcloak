@@ -2,9 +2,14 @@
 //! plan M2-08; gate 38's installer half, gate 34's hook denial,
 //! advisory), on configurations the hosts' own CLIs wrote (L-02):
 //!
-//! - `claude mcp add-json` and `codex mcp add` register another server,
-//!   and the person keeps instructions and settings of their own; the
-//!   files are then older than 2 minutes, as a person's are.
+//! - `claude mcp add-json` and `codex mcp add` register another server
+//!   (Codex's with a literal in its `env`), and the person keeps
+//!   instructions and settings of their own (a literal in Claude Code's
+//!   `env` block, between two places install edits; Codex's
+//!   `network_access = false`); the files are then older than 2 minutes,
+//!   as a person's are. Neither literal ever reaches EnvCloak's state,
+//!   `<data>/agents/`, swept after install and after uninstall (lesson
+//!   L-12).
 //! - Install, then uninstall at once: every file byte for byte as it was,
 //!   what install created gone, and each host's own `mcp list` still
 //!   listing the other server (and, while installed, EnvCloak's). The
@@ -20,15 +25,15 @@
 //! - K-01: on Linux, with or without consent, no socket allowance or
 //!   broader network setting is written for either host; on macOS, with
 //!   consent, a command in Codex's `workspace-write` sandbox reaches
-//!   EnvCloak's socket and nothing else (a loopback TCP listener and
-//!   another Unix socket both refused).
+//!   EnvCloak's socket and nothing else (a loopback TCP listener, directly
+//!   and through Codex's proxy, and another Unix socket all refused).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use envcloak_e2e::{Harness, age, quoted, text, versions_toml, write_script};
 use envcloak_testkit::agents::{AgentHome, Host, HostFlags, HostRun, Installed, require};
-use envcloak_testkit::{Canary, TEST_PATH, daemon_socket, fresh_seed, labels};
+use envcloak_testkit::{Canary, TEST_PATH, daemon_socket, fresh_seed, labels, sweep_dir};
 use serde_json::{Value, json};
 
 use super::skeleton::last_tool_output;
@@ -146,6 +151,11 @@ const CREATED: [&str; 2] = [".codex/hooks.json", ".codex/rules/envcloak.rules"];
 /// and the execpolicy check fails. The hook's denial for `Bash` answered
 /// with no decision (`hook::decide` returning `NoDecision` for
 /// `PreToolUse`): `printenv` runs, no marker reaches the model, and this
+/// fails. Names read in their own case (`names_dotenv` without its
+/// lower-casing): Claude Code's Read of `.ENV.staging` returns the file and
+/// this fails. The unchanged-text journal (`hunks::hunks` keeping the
+/// whole span between the first and last change, with its old text):
+/// the sweep of `<data>/agents/` finds the settings.json literal and this
 /// fails.
 #[test]
 fn the_installer_on_the_hosts_own_configs() {
@@ -165,6 +175,23 @@ fn the_installer_on_the_hosts_own_configs() {
     let bin = host_bin(&h, &[&claude, &codex]);
     let tmp = claude.claude_tmp();
 
+    // Literals the person wrote into the configs: never in EnvCloak's
+    // state (not the harness's canaries, which the configs would hold).
+    let seed = || format!("{:016x}{:016x}", fresh_seed(), fresh_seed());
+    let lits = [
+        Canary::new("SETTINGS_ENV_LITERAL", format!("ecst{}", seed())),
+        Canary::new("CODEX_ENV_LITERAL", format!("eccx{}", seed())),
+    ];
+    let state = h.data_dir().join("agents");
+    let swept = |when: &str| {
+        let hits = sweep_dir(&state, &lits);
+        assert!(
+            hits.is_empty(),
+            "{when}: {} hit(s) in <data>/agents",
+            hits.len()
+        );
+    };
+
     // What the hosts' CLIs write, and the person's own files.
     let other = json!({"command": "/usr/bin/true", "args": ["serve"]});
     let added = claude.host_cli(&[
@@ -176,13 +203,37 @@ fn the_installer_on_the_hosts_own_configs() {
         &other.to_string(),
     ]);
     assert!(added.status.success(), "{}", text(&added));
-    let added = codex.host_cli(&["mcp", "add", "other", "--", "/usr/bin/true", "serve"]);
+    let env = format!("TOKEN={}", lits[1].as_str());
+    let added = codex.host_cli(&[
+        "mcp",
+        "add",
+        "other",
+        "--env",
+        &env,
+        "--",
+        "/usr/bin/true",
+        "serve",
+    ]);
     assert!(added.status.success(), "{}", text(&added));
+    // A setting of the person's near the top of config.toml: with consent
+    // on macOS, install edits it and the end of the file.
+    let toml_path = home.join(".codex/config.toml");
+    let theirs = std::fs::read_to_string(&toml_path).unwrap();
+    assert!(theirs.contains(lits[1].as_str()), "codex mcp add --env");
+    std::fs::write(
+        &toml_path,
+        format!("[sandbox_workspace_write]\nnetwork_access = false\n\n{theirs}"),
+    )
+    .unwrap();
     std::fs::create_dir_all(home.join(".claude")).unwrap();
     std::fs::write(home.join(".claude/CLAUDE.md"), "# Mine\n\nUse tabs.\n").unwrap();
     std::fs::write(
         home.join(".claude/settings.json"),
-        "{\n  \"permissions\": {\n    \"allow\": [\"Bash(npm test)\"]\n  }\n}\n",
+        format!(
+            "{{\n  \"permissions\": {{\n    \"allow\": [\"Bash(npm test)\"]\n  }},\n  \
+             \"env\": {{\n    \"API_TOKEN\": \"{}\"\n  }},\n  \"model\": \"sonnet\"\n}}\n",
+            lits[0].as_str()
+        ),
     )
     .unwrap();
     std::fs::write(home.join(".codex/AGENTS.md"), "# Codex notes\n").unwrap();
@@ -213,17 +264,17 @@ fn the_installer_on_the_hosts_own_configs() {
     };
     lists(false);
 
-    // Install; the hosts list both servers; uninstall at once.
-    let consent: &[&str] = if cfg!(target_os = "linux") {
-        &["--consent-sandbox-sockets"]
-    } else {
-        &[]
-    };
-    let mut args = vec!["install", "--yes"];
-    args.extend_from_slice(consent);
-    let (v, code) = agents(&mut h, &bin, &tmp, &args);
+    // Install, with consent; the hosts list both servers; uninstall at
+    // once.
+    let (v, code) = agents(
+        &mut h,
+        &bin,
+        &tmp,
+        &["install", "--yes", "--consent-sandbox-sockets"],
+    );
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["complete"], true, "{v}");
+    swept("after install");
     for host in ["claude-code", "codex"] {
         assert!(
             v["hosts"]
@@ -241,10 +292,15 @@ fn the_installer_on_the_hosts_own_configs() {
     let toml = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
     assert!(!toml.contains("domains"), "{toml}");
     assert!(!toml.contains("approval"), "{toml}");
+    assert_eq!(
+        toml.contains("network_access = true"),
+        cfg!(target_os = "macos"),
+        "{toml}"
+    );
     if cfg!(target_os = "linux") {
         // K-01, with consent given: nothing for the socket, nothing broader.
         assert!(settings["sandbox"].get("network").is_none(), "{settings}");
-        for word in ["network_access", "network_proxy", "sandbox_workspace_write"] {
+        for word in ["network_proxy", "unix_sockets"] {
             assert!(!toml.contains(word), "{word}: {toml}");
         }
         for host in ["claude-code", "codex"] {
@@ -276,6 +332,7 @@ fn the_installer_on_the_hosts_own_configs() {
     }
     let (u, code) = agents(&mut h, &bin, &tmp, &["uninstall", "--yes"]);
     assert_eq!(code, 0, "{u}");
+    swept("after uninstall");
     for (f, b) in FILES.iter().zip(&before) {
         assert!(
             &std::fs::read(home.join(f)).unwrap() == b,
@@ -384,6 +441,59 @@ fn the_installer_on_the_hosts_own_configs() {
         );
     }
 
+    // Claude Code's own file tool reaches the hook as well: a Read of an
+    // env file of another profile, in another case, and on Linux of a
+    // process's environment. (Grep, ToolSearch and the deferred Monitor
+    // were measured unavailable in the pinned version's non-interactive
+    // session, "No such tool available", so their decisions are tested on
+    // the captured payload's shape: tests/hook_bypass.rs.)
+    let staging = home.join(".ENV.staging");
+    std::fs::write(&staging, "STAGING_PROBE=1\n").unwrap();
+    let mut steps =
+        vec![json!({"tool": "Read", "input": {"file_path": staging.to_str().unwrap()}})];
+    if cfg!(target_os = "linux") {
+        steps.push(json!({"tool": "Read", "input": {"file_path": "/proc/self/environ"}}));
+    }
+    steps.push(json!({"shell": "echo ecctl-hook-control"}));
+    steps.push(json!({"say": "done"}));
+    let run = claude.run(
+        &json!({ "steps": steps }),
+        "Read the env file.",
+        &HostFlags::claude("default", &["Bash"]),
+        &home,
+    );
+    h.record("claude read stdout", &run.output.stdout);
+    h.record("claude read stderr", &run.output.stderr);
+    let read = last_tool_output(&request(&run, "step 1"));
+    assert!(
+        read.contains("[envcloak:env_file]"),
+        "Read of .ENV.staging: {read}"
+    );
+    assert!(!read.contains("STAGING_PROBE"), "the file was read");
+    let mut next = 2;
+    if cfg!(target_os = "linux") {
+        let environ = last_tool_output(&request(&run, "step 2"));
+        assert!(
+            environ.contains("[envcloak:env_dump]"),
+            "Read of /proc/self/environ: {environ}"
+        );
+        assert!(!environ.contains("PATH="), "the environment was read");
+        next = 3;
+    }
+    let control = last_tool_output(&request(&run, &format!("step {next}")));
+    assert!(control.contains("ecctl-hook-control"), "{control}");
+    println!(
+        "measurement: Claude Code {} after agents install: Read of .ENV.staging denied by \
+         EnvCloak's hook{}, the control ran",
+        claude.installed.pin.version,
+        if cfg!(target_os = "linux") {
+            ", and of /proc/self/environ"
+        } else {
+            ""
+        }
+    );
+    std::fs::remove_file(&staging).unwrap();
+
     // Uninstall after the hosts ran: Claude Code rewrote ~/.claude.json
     // and the harness set its model keys in config.toml since, which
     // EnvCloak takes for the host's own writes: two minutes on, only
@@ -409,6 +519,7 @@ fn the_installer_on_the_hosts_own_configs() {
     for f in CREATED {
         assert!(!home.join(f).exists(), "{f}");
     }
+    swept("at the end");
     claude.check_isolated();
     h.assert_swept("M2-08 install");
 }
@@ -418,9 +529,13 @@ fn the_installer_on_the_hosts_own_configs() {
 /// else. On Linux there is no such setting (the test above shows none is
 /// written).
 ///
-/// Mutation checked: the socket allowance written without consent's
+/// Mutations checked: the socket allowance written without consent's
 /// `unix_sockets` rule (only `network_access` and the proxy enabled):
-/// `envcloak status` no longer reaches the daemon and this fails.
+/// `envcloak status` no longer reaches the daemon and this fails. A
+/// `domains` allow rule for `127.0.0.1` added to the proxy settings in
+/// `hosts::codex::config_settings`: the request through Codex's proxy
+/// reaches the loopback listener and this fails (the Codex review: the
+/// probe checked raw sockets only).
 #[test]
 fn codex_reaches_the_socket_and_nothing_else_after_install() {
     if !cfg!(target_os = "macos") {
@@ -469,12 +584,19 @@ fn codex_reaches_the_socket_and_nothing_else_after_install() {
     std::fs::write(&probe, EGRESS).unwrap();
     let cli = h.cli();
     let command = format!(
-        "{} status 2>&1 | head -n 1; python3 {} {port} {}",
+        "{} status 2>&1 | head -n 1; python3 {} raw {port} {}",
         quoted(cli.to_str().unwrap()),
         quoted(probe.to_str().unwrap()),
         quoted(other.to_str().unwrap())
     );
-    let script = json!({"steps": [{"shell": command}, {"say": "done"}]});
+    // Through the proxy, in a call of its own: Codex fails the whole call
+    // when its proxy blocks a request (docs/AGENTS.md, K-01's table).
+    let proxied = format!(
+        "python3 {} proxied {port} {}",
+        quoted(probe.to_str().unwrap()),
+        quoted(other.to_str().unwrap())
+    );
+    let script = json!({"steps": [{"shell": command}, {"shell": proxied}, {"say": "done"}]});
     let run = codex.run(
         &script,
         "Check the daemon.",
@@ -499,15 +621,36 @@ fn codex_reaches_the_socket_and_nothing_else_after_install() {
         );
         assert!(!out.contains(&format!("{key}OK")), "{key}: {out}");
     }
+    let through = last_tool_output(&request(&run, "step 2"));
+    println!(
+        "measurement: Codex {} workspace-write, a request through its proxy to a loopback \
+         listener: {}",
+        codex.installed.pin.version,
+        through.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    assert!(
+        !through.contains("PROXIEDOK")
+            && (through.contains("PROXIEDNO") || through.contains("was blocked")),
+        "through the proxy: {through}"
+    );
+    // Nothing reached the listener, directly or through the proxy: the
+    // independent check (the listener never answers, so a request the
+    // proxy lets through ends in the probe's own timeout).
+    tcp.set_nonblocking(true).unwrap();
+    assert!(
+        matches!(tcp.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "a connection reached the loopback listener"
+    );
     h.assert_swept("M2-08 Codex socket allowance");
 }
 
 /// What a sandboxed command tries besides EnvCloak's socket: a loopback
-/// TCP listener and another Unix socket. Each prints `<KEY>OK` or
-/// `<KEY>NO <why>` (the keys built at run time, so the command's text
-/// never holds them).
-const EGRESS: &str = r#"import errno, socket, sys
-port, other = int(sys.argv[1]), sys.argv[2]
+/// TCP listener, directly and through the proxy Codex points the command
+/// at, and another Unix socket. Each prints `<KEY>OK` or `<KEY>NO <why>`
+/// (the keys built at run time, so the command's text never holds them);
+/// with no proxy in the command's environment, `PROXIEDNO no_proxy`.
+const EGRESS: &str = r#"import errno, os, socket, sys, urllib.request
+mode, port, other = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 def raw(key, family, addr):
     s = None
     try:
@@ -520,6 +663,20 @@ def raw(key, family, addr):
     finally:
         if s is not None:
             s.close()
-raw("TCP", socket.AF_INET, ("127.0.0.1", port))
-raw("UNIX", socket.AF_UNIX, other)
+if mode == "raw":
+    raw("TCP", socket.AF_INET, ("127.0.0.1", port))
+    raw("UNIX", socket.AF_UNIX, other)
+    sys.exit(0)
+proxy = next((os.environ[k] for k in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY") if os.environ.get(k)), None)
+if proxy is None:
+    print("PROXIED" + "NO", "no_proxy")
+else:
+    if "://" not in proxy:
+        proxy = "http://" + proxy
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy}))
+    try:
+        opener.open("http://127.0.0.1:%d/" % port, timeout=5)
+        print("PROXIED" + "OK")
+    except Exception as e:
+        print("PROXIED" + "NO", type(e).__name__)
 "#;
