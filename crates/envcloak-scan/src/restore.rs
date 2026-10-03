@@ -21,13 +21,13 @@
 //!   SHA-256 is the one the daemon recorded after the change
 //!   (`backup.v2.record_result`), and only while it is still the file
 //!   that was hashed, with those contents, when the new one takes its
-//!   name; and only when the contents the chunks make up have the
-//!   backed-up SHA-256. It is the
-//!   write-back the backup v2 undo commands of M2-16, M2-20 and M2-22 are
-//!   to call (docs/IPC.md "Backups v2", "Writing back"); `init --undo`
-//!   restores its v1 backups through [`restore_over`].
+//!   name; only when the contents the chunks make up have the backed-up
+//!   SHA-256; and only while the new file holds exactly the bytes written
+//!   to it. It is the write-back the backup v2 undo commands of M2-16,
+//!   M2-20 and M2-22 are to call (docs/IPC.md "Backups v2", "Writing
+//!   back"); `init --undo` restores its v1 backups through
+//!   [`restore_over`].
 
-use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
@@ -121,42 +121,53 @@ pub struct BackedUpFile {
 /// ([`ModifyErrorKind::BackupUnread`] otherwise, and nothing is written in
 /// its place), and only while the file there is still the one hashed, as
 /// [`crate::replace_atomically`] checks: a save meanwhile is kept
-/// ([`ModifyErrorKind::Changed`]). The two names are swapped in one step,
-/// and what came out is read again whole: unless it still has
-/// `file.sha256_after`, and what went in is the file written (another
-/// file put under the temporary name meanwhile is swapped in by the swap
-/// too), the names are swapped back and the file is kept (`changed`, or
-/// `moved_aside` naming where the other file is kept), so an edit made in place after the last check, at the
-/// same length with its modification time put back, is never deleted. A
-/// file system that cannot swap names writes nothing
-/// ([`ModifyErrorKind::SwapUnsupported`]). A write by a program that still
-/// has the old file open, after that read, is not seen. The file keeps
-/// its mode. A file with another hard link is never written over. Returns
-/// the new file's stamp.
+/// ([`ModifyErrorKind::Changed`]). The new file must hold exactly the
+/// bytes written to it (their length and SHA-256, read back whole through
+/// the descriptor it was written through, its stamp unchanged meanwhile)
+/// before the swap and again once it has the file's name: a new file
+/// written into in place, or another file put under its name, is never
+/// left in the file's place nor answered as restored; it is kept, and
+/// named ([`ModifyErrorKind::MovedAside`]). The two names are swapped in
+/// one step, and what came out is read again whole: unless it still has
+/// `file.sha256_after`, and what went in is the new file holding what was
+/// written, the names are swapped back and the file is kept (`changed`,
+/// or `moved_aside` naming where the other file is kept), so an edit made
+/// in place after the last check, at the same length with its
+/// modification time put back, is never deleted. A file system that
+/// cannot swap names writes nothing ([`ModifyErrorKind::SwapUnsupported`]).
+/// A write by a program that still has the old file open, after that
+/// read, is not seen. The file keeps its mode. A file with another hard
+/// link is never written over. Returns the new file's stamp.
 ///
 /// The new file is the write itself (SPEC §6.5 "Modifying a file",
 /// R-M2-44: a new file in the same directory, `O_EXCL`, 0600 until it is
 /// whole, flushed, then put in place): it holds only the bytes the person
-/// asked to have written back at `rel`, never anywhere else. A process
-/// killed while it writes leaves the file at `rel` as it was, or the
-/// restored one, and may leave the new file so far beside it under its
-/// temporary name (`.<name>.envcloak-new-<hex>.tmp`, 0600), which nothing
-/// reads. Every later restore of the same file that gets the contents
-/// whole beside it, whether or not it then takes the file's place,
-/// removes each file of that file's temporary names holding nothing but
-/// those contents' first bytes (a regular file with one link, compared
-/// byte for byte), so nothing is lost with it; it keeps any other, whose
-/// origin it cannot know: another program's save a swap brought out and
-/// could not put back ([`ModifyErrorKind::MovedAside`] names it), or the
-/// file a restore stopped after its swap took out. A file it removes is
-/// first moved aside to a fresh name of the same shape and checked there
-/// again, and only that file is unlinked, while that name still holds it
-/// unchanged: a file that takes the old name meanwhile keeps it, and one
-/// changed or replaced while it is checked is put back (or, when its name
-/// was taken meanwhile, kept under the fresh name). A restore that stops
-/// earlier (`edited_since`, `backup_unread`) removes nothing. A restore
-/// of the same file running in another process at that moment may then
-/// fail, and reports it.
+/// asked to have written back at `rel`, never anywhere else. While it is
+/// written it is under `.<name>.envcloak-new-<hex>.tmp` (0600); once
+/// whole, it is moved, in one step that replaces nothing, to
+/// `.<name>.envcloak-swap-<hex>.tmp`, which the swap takes it from and
+/// leaves what came out under. A process killed while it writes leaves the
+/// file at `rel` as it was, or the restored one, and may leave the new
+/// file so far beside it under its `new` name, which nothing reads. Every
+/// later restore of the same file that gets the contents whole beside it,
+/// whether or not it then takes the file's place, removes each file of
+/// that file's `new` names holding nothing but those contents' first
+/// bytes (a regular file with one link, compared byte for byte), so
+/// nothing is lost with it. A `new` name only ever holds a new file while
+/// it is written; whatever a swap brings out (another program's save that
+/// could not be put back, which [`ModifyErrorKind::MovedAside`] names, or
+/// the file a restore stopped after its swap took out) is under a `swap`
+/// name, which no restore removes, whatever it holds, since nothing shows
+/// where it came from. So is the whole new file of a restore killed
+/// between that move and the swap. A file it removes is first moved aside
+/// to a fresh name of the same shape and checked there again, and only
+/// that file is unlinked, while that name still holds it unchanged: a file
+/// that takes the old name meanwhile keeps it, and one changed or replaced
+/// while it is checked is put back (or, when its name was taken
+/// meanwhile, kept under the fresh name). A restore that stops earlier
+/// (`edited_since`, `backup_unread`) removes nothing. A restore of the
+/// same file running in another process at that moment may then fail, and
+/// reports it.
 ///
 /// # Errors
 /// As above, and as [`crate::replace_atomically`].
@@ -171,8 +182,9 @@ pub fn restore_over_left(
 
 /// [`restore_over_left`], telling `observe` when the file is open and
 /// about to be hashed, when it was hashed, when an earlier restore's
-/// leftover is moved aside and when its bytes were compared there, and
-/// when the new contents are staged, checked and swapped in.
+/// leftover is moved aside, when its bytes were compared there and when
+/// one that failed is put back, and when the new contents are staged,
+/// checked and swapped in.
 ///
 /// # Errors
 /// As [`restore_over_left`].
@@ -209,7 +221,7 @@ pub fn restore_over_left_observed(
     // The file must still be the one hashed when its replacement takes
     // its name: the stamp is the one it had before it was read, and what
     // comes out of the swap must still hold what the change left.
-    let mut fill = |out: &mut File| write_chunks(out, file, chunk);
+    let mut fill = |out: &mut dyn Write| write_chunks(out, file, chunk);
     replace_in_with(
         &dir,
         rel,
@@ -224,7 +236,7 @@ pub fn restore_over_left_observed(
 /// Writes the chunks of `file` to `out`, in order, each at its length,
 /// and checks that they make up `file.sha256`.
 fn write_chunks(
-    out: &mut File,
+    out: &mut dyn Write,
     file: &BackedUpFile,
     chunk: &mut dyn FnMut(u64) -> Option<SecretBytes>,
 ) -> Result<(), ModifyErrorKind> {
