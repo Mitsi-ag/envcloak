@@ -26,6 +26,8 @@
 //!   not.
 //! - [`pause_point`]: the points gate 16's test kills `envcloak init` at,
 //!   which do nothing outside a test build.
+//! - [`source`]: [`source::ConfigSource`], the neutral descriptor of a
+//!   config or store to scan, which the agent catalog emits (M2 plan D-02).
 //!
 //! Nothing here logs, and no error carries text from a file.
 
@@ -34,6 +36,7 @@ pub mod delete;
 pub mod dotenv;
 pub mod restore;
 pub mod root;
+pub mod source;
 pub mod walk;
 
 #[cfg(feature = "testing")]
