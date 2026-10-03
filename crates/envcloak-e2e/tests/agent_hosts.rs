@@ -44,6 +44,59 @@ fn the_network_is_what_ci_says() {
     envcloak_e2e::check_network();
 }
 
+/// What the loopback-only isolation leaves open on macOS (verifier review
+/// of M2-04): the resolver's XPC service, which Network.framework,
+/// URLSession, `dnssd_getaddrinfo` and `CFHostStartInfoResolution` use,
+/// and which no file access control can deny. No executable or library of
+/// a pinned host's tree, nor the Node.js that runs a script host, imports
+/// any of them ([`envcloak_e2e::OPEN_RESOLVERS`]), so the isolation covers
+/// the lookups the hosts can make (`getaddrinfo`); the positive control,
+/// `/usr/bin/nscurl`, a client on Network.framework, is found. On Linux
+/// the check does not apply: there is no such API, and systemd-resolved's
+/// sockets are stated uncovered in docs/ACCEPTANCE.md.
+///
+/// Mutation checked: the guard matching no import (`find` never true):
+/// the control is not found and this fails.
+#[test]
+fn no_pinned_host_imports_a_resolver_the_isolation_leaves_open() {
+    if !cfg!(target_os = "macos") {
+        eprintln!(
+            "no_pinned_host_imports_a_resolver_the_isolation_leaves_open: macOS only (Linux has no \
+             such API)"
+        );
+        return;
+    }
+    let control = envcloak_e2e::open_resolver_imports(Path::new("/usr/bin/nscurl")).unwrap();
+    assert!(
+        !control.is_empty(),
+        "the positive control, /usr/bin/nscurl, imports none"
+    );
+    for pin in pins(&versions_toml()) {
+        let found = Installed::find(&versions_toml(), &pin.id, &pin.variant);
+        let label = format!("{}/{}", pin.id, pin.variant);
+        // A tier-1 host is required where CI says so; a tier-2 host is
+        // checked when it is installed.
+        let installed = if pin.tier == 1 {
+            require(found, &format!("open resolver imports ({label})"))
+        } else {
+            found.ok()
+        };
+        let Some(i) = installed else {
+            continue;
+        };
+        let mut hits = envcloak_e2e::open_resolver_imports(&i.dir).unwrap();
+        if let Some((node, _)) = &i.interpreter {
+            hits.extend(envcloak_e2e::open_resolver_imports(node).unwrap());
+        }
+        assert!(hits.is_empty(), "{label} imports {hits:?}");
+        println!(
+            "measurement: open resolver imports host={label} version={} os={}: none",
+            pin.version,
+            os()
+        );
+    }
+}
+
 /// The flags every run here pins (D-13): Claude Code `-p` in the default
 /// permission mode with Bash allowed; Codex `exec` in its workspace-write
 /// sandbox with approval policy `never`. Never a bypass mode.
