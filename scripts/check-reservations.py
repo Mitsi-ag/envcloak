@@ -90,9 +90,9 @@ starts `envcloak: <token>:` counts (a line printed directly, as
 `eprintln!` does for `coverage`, `warning` and `usage`), whatever crate
 it is in; one that starts `envcloak: {...}:` prints its argument where a
 token goes, which must be a token argument as above; and a usage line
-`envcloak: {x}`, whose `x` must be bound by `Err(x)` or `Usage(x)` in a
-function that calls its file's `fn parse`, counts the leading `<token>:`
-of every string literal in that `fn parse`. Within these forms the reader
+`envcloak: {x}`, which must be printed in the arm of `match parse(..)`
+that binds `x` (`Err(x)` or `...::Usage(x)`), with `fn parse` in its file,
+counts the leading `<token>:` of every string literal in that `fn parse`. Within these forms the reader
 over-counts rather than under-counts: a string it takes for a token that
 is not printed makes a `reserved` row with that name fail, which is a name to
 avoid anyway, and a new one needs a `landed` row like any token. Outside
@@ -1169,6 +1169,30 @@ def code_exit_tokens(root):
     return found
 
 
+def arm_at(src, open_at, pos):
+    """The pattern span of the arm of the `match` block opened at
+    `open_at` whose value holds `pos`, or None."""
+    k, end = open_at + 1, src.close_of(open_at)
+    while k < end:
+        while k < end and (src.skel[k].isspace() or src.skel[k] == ","):
+            k += 1
+        arrow = find_top(src, k, end, "=>")
+        if arrow is None:
+            return None
+        v = arrow + 2
+        while v < end and src.skel[v].isspace():
+            v += 1
+        if src.skel.startswith("{", v):
+            stop = src.close_of(v) + 1
+        else:
+            comma = find_top(src, v, end, ",")
+            stop = end if comma is None else comma
+        if v <= pos < stop:
+            return (k, arrow)
+        k = stop
+    return None
+
+
 def printed_placeholder(src, start, lit, items, read, take):
     """A string literal starting `envcloak: {`: the placeholder is printed
     where a token goes. Followed by `:`, it is a token, and its argument
@@ -1224,9 +1248,17 @@ def printed_placeholder(src, start, lit, items, read, take):
     parse = [f for f in items if f.name == "parse" and f.body]
     ok = False
     if ident and holder and parse:
-        body = src.skel[holder[-1].body[0]:holder[-1].body[1]]
-        bound = re.search(r"(?:\bErr|::\s*Usage)\s*\(\s*%s\s*\)" % re.escape(ident), body)
-        ok = bool(bound and re.search(r"(?<![\w.:])parse\s*\(", body))
+        # The line is in an arm of `match parse(..) { .. }` whose pattern
+        # binds the message: `Err(x)` or `...::Usage(x)`.
+        a, b = holder[-1].body
+        binds = re.compile(r"(?:\bErr|::\s*Usage)\s*\(\s*%s\s*\)" % re.escape(ident))
+        for m in re.finditer(r"\bmatch\s+parse\s*\(", src.skel[a:b]):
+            call_close = src.close_of(a + m.end() - 1)
+            open_at = find_top(src, call_close + 1, b, "{")
+            if open_at is None or not open_at < start < src.close_of(open_at):
+                continue
+            arm = arm_at(src, open_at, start)
+            ok = arm is not None and bool(binds.search(src.skel, arm[0], arm[1]))
     if not ok:
         raise SourceError("%s: a usage line `envcloak: {%s}` whose message the reader cannot trace to this file's `fn parse`" % (where, name))
     for f in parse:

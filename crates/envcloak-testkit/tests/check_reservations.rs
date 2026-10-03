@@ -1600,8 +1600,10 @@ fn a_token_method_the_reader_cannot_read_fails() {
 /// from its file's `fn parse`, whose every `<token>:` start counts; one
 /// whose message comes from anywhere else is refused.
 ///
-/// Mutation checked: lines starting `envcloak: {` skipped, as before: the
-/// copies pass and this fails.
+/// Mutations checked: lines starting `envcloak: {` skipped, as before: the
+/// copies pass and this fails. A usage line taken whenever its function
+/// binds the name with `Err(..)` and calls `parse` anywhere: another
+/// call's message passes and this fails.
 #[test]
 fn a_token_printed_from_a_placeholder_is_read_or_refused() {
     for (body, expect) in [
@@ -1611,6 +1613,14 @@ fn a_token_printed_from_a_placeholder_is_read_or_refused() {
         ),
         (
             "pub fn d() { let why = \"pty_unavailable: x\"; eprintln!(\"envcloak: {why}\"); }\n",
+            "a usage line `envcloak: {why}` whose message the reader cannot trace",
+        ),
+        // In a function that calls `parse`, but printing another call's
+        // message.
+        (
+            "fn parse(a: &[&str]) -> Result<(), &'static str> { let _ = a; Err(\"bad option\") }\n\
+             fn other() -> Result<(), &'static str> { Err(\"pty_unavailable: x\") }\n\
+             pub fn run(a: &[&str]) { let _ = parse(a); match other() { Ok(()) => {}, Err(why) => eprintln!(\"envcloak: {why}\") } }\n",
             "a usage line `envcloak: {why}` whose message the reader cannot trace",
         ),
     ] {
