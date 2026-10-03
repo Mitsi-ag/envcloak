@@ -88,12 +88,14 @@ fn one_row(n: usize) -> Result<(), VaultError> {
 impl<'v> Txn<'v> {
     /// Starts the transaction on the file as it is now: a page cached
     /// before another program changed the file must not be written back
-    /// over the change (see [`drop_page_cache`]).
+    /// over the change (see [`drop_page_cache`]). Every time it records is
+    /// `now` (Unix seconds).
     pub(crate) fn begin(
         conn: &'v mut Connection,
         keys: &'v Keyring,
         ctx: VaultCtx,
         state: State,
+        now: u64,
     ) -> Result<Self, VaultError> {
         drop_page_cache(conn)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -104,7 +106,7 @@ impl<'v> Txn<'v> {
             state,
             dirty: false,
             standing_changed: false,
-            now: now_secs(),
+            now,
         })
     }
 

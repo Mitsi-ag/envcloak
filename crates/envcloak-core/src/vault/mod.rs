@@ -1002,6 +1002,28 @@ impl Vault {
         &mut self,
         f: impl FnOnce(&mut Txn<'_>) -> Result<T, VaultError>,
     ) -> Result<T, VaultError> {
+        self.transact_at(now_secs(), f)
+    }
+
+    /// Test support only: [`Vault::transact`] with the transaction's clock
+    /// reading `now` (Unix seconds), so a test sets the time each write
+    /// records (an exposure's first mark, a classification's change) and
+    /// can tell one transaction's time from another's without waiting for
+    /// the clock.
+    #[cfg(feature = "testing")]
+    pub fn transact_at_for_testing<T>(
+        &mut self,
+        now: u64,
+        f: impl FnOnce(&mut Txn<'_>) -> Result<T, VaultError>,
+    ) -> Result<T, VaultError> {
+        self.transact_at(now, f)
+    }
+
+    fn transact_at<T>(
+        &mut self,
+        now: u64,
+        f: impl FnOnce(&mut Txn<'_>) -> Result<T, VaultError>,
+    ) -> Result<T, VaultError> {
         if self.integrity.get() != Integrity::Ok {
             return Err(VaultErrorKind::ReadOnly.into());
         }
@@ -1014,6 +1036,7 @@ impl Vault {
                 &self.keys,
                 self.ctx,
                 self.state.clone(),
+                now,
             )?;
             let out = f(&mut txn)?;
             Ok((out, txn.commit()?))
