@@ -188,16 +188,15 @@ impl Fixture {
         }
     }
 
-    /// Waits until the daemon stopped at `site` for the `n`th time.
-    fn wait_paused(&self, site: &str, n: usize) {
+    /// Waits until the daemon stopped at `site` for the `n`th time, or
+    /// `gone` holds (the call it would stop finished without stopping).
+    /// Returns whether it stopped.
+    fn wait_paused(&self, site: &str, n: usize, gone: impl Fn() -> bool) -> bool {
         let line = format!("envcloak test: paused at {site}\n");
-        let log = self.d.log_when(Duration::from_secs(30), |log| {
-            log.matches(&line).count() >= n
+        let log = self.d.log_when(Duration::from_secs(60), |log| {
+            log.matches(&line).count() >= n || gone()
         });
-        assert!(
-            log.matches(&line).count() >= n,
-            "the daemon did not stop at {site} {n} times"
-        );
+        log.matches(&line).count() >= n
     }
 
     /// Lets the daemon go on from its pause point, and every later one.
@@ -460,25 +459,46 @@ fn a_grant_that_runs_out_while_the_answer_is_framed_covers_nothing() {
     let grant = f.approved(&control, once());
     let answer = std::thread::scope(|sc| {
         let run = sc.spawn(|| f.raw_run(&control).1);
-        f.wait_paused(FRAMED, 1);
+        assert!(
+            f.wait_paused(FRAMED, 1, || run.is_finished()),
+            "the covered request did not stop at {FRAMED}"
+        );
         f.release();
         run.join().unwrap()
     });
     f.delivered(&answer, &control, &grant);
-    f.rearm();
 
-    let lapsing = f.params(1, 0, "lapsing");
-    let grant = f.approved(&lapsing, ApprovalOptions::once(SHORT));
-    // Both deadlines are at most that long after the approval's answer.
-    let past = Instant::now() + SHORT + Duration::from_millis(500);
-    let answer = std::thread::scope(|sc| {
-        let run = sc.spawn(|| f.raw_run(&lapsing).1);
-        f.wait_paused(FRAMED, 2);
-        // Waiting for the deadline itself, with the daemon stopped.
-        std::thread::sleep(past.saturating_duration_since(Instant::now()));
-        f.release();
-        run.join().unwrap()
-    });
+    // The grant must still be in force when the request is decided, which
+    // a loaded machine can delay past a short grant's deadline (the daemon
+    // reads the caller's ancestry first): then the request is pending
+    // without stopping, and is asked again under a grant twice as long.
+    let mut ttl = SHORT;
+    let (grant, answer) = loop {
+        f.rearm();
+        let lapsing = f.params(1, 0, &format!("lapsing-{}", ttl.as_secs()));
+        let grant = f.approved(&lapsing, ApprovalOptions::once(ttl));
+        // Both deadlines are at most that long after the approval's answer.
+        let past = Instant::now() + ttl + Duration::from_millis(500);
+        let (stopped, answer) = std::thread::scope(|sc| {
+            let run = sc.spawn(|| f.raw_run(&lapsing).1);
+            let stopped = f.wait_paused(FRAMED, 2, || run.is_finished());
+            if stopped {
+                // Waiting for the deadline itself, with the daemon stopped.
+                std::thread::sleep(past.saturating_duration_since(Instant::now()));
+            }
+            f.release();
+            (stopped, run.join().unwrap())
+        });
+        if stopped {
+            break (grant, answer);
+        }
+        f.decided(&answer, "pending");
+        assert!(
+            ttl < SHORT * 8,
+            "a grant of {ttl:?} ran out before its request was decided"
+        );
+        ttl *= 2;
+    };
     f.decided(&answer, "pending");
     assert!(!f.holds(&grant), "the grant outlived its deadlines");
     let log = f.d.log();
