@@ -30,6 +30,10 @@ use envcloak_testkit::transcripts::{OTHER, Sweep};
 use envcloak_testkit::{Canary, by_label, canaries, fresh_seed, labels};
 use serde_json::json;
 
+/// The agent catalog against these hosts (M2 plan task M2-10).
+#[path = "agent_hosts/catalog.rs"]
+mod catalog;
+
 fn host(h: Host, variant: &str, test: &str) -> Option<AgentHome> {
     let found = Installed::find(&versions_toml(), h.id(), variant);
     require(found, test).map(|i| AgentHome::start(h, i))
@@ -3241,7 +3245,11 @@ fn tier_2(
     let script = match &shell {
         Some((tool, extra)) => {
             let mut input = extra.clone();
-            input["command"] = json!(ANCESTRY_PROBE);
+            // The ancestry probe, unless the caller gives its own command
+            // (the catalog's tests, `catalog.rs`).
+            if input.get("command").is_none() {
+                input["command"] = json!(ANCESTRY_PROBE);
+            }
             json!({"steps": [{"tool": tool, "input": input}, {"say": "probe done"}], "side": "ok"})
         }
         None => json!({"steps": [{"say": "scripted reply"}], "side": "ok"}),
