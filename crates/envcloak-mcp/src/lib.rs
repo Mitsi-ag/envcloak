@@ -19,12 +19,14 @@
 //!
 //! Calls run on [`WORKERS`] threads, with at most [`QUEUE`] more waiting;
 //! a call beyond that is answered `busy` at once. A call's time, the wait
-//! that keeps it under the host's cutoff, runs from its arrival: one that
-//! waited for a worker past it is answered `busy` when a worker takes it,
-//! and nothing of it runs ([`Call::time_left`]; `run_with_secrets` is
-//! given only what is left). A call the host cancels
+//! that keeps it under the host's cutoff, runs from its arrival: one still
+//! waiting for a worker when it runs out is answered `busy` then, whether
+//! or not a worker is free, and nothing of it runs, so calls that hold
+//! every worker longer leave none unanswered past the cutoff (Codex
+//! reviews of M2-06 and M2-RES1; [`Call::time_left`]: `run_with_secrets`
+//! is given only what is left). A call the host cancels
 //! (`notifications/cancelled`) is answered nothing further: one still
-//! waiting is dropped, one running has its child stopped
+//! waiting leaves the queue at once, one running has its child stopped
 //! ([`child::Call::cancel`]), and an answer still waiting to be written
 //! (behind writes a slow host has not read) is withdrawn; only one the
 //! writer has begun to write goes out. At the end of input every call in hand is
@@ -43,7 +45,7 @@ pub mod rpc;
 pub mod stdio;
 pub mod tools;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -123,14 +125,84 @@ enum Answer {
     Settled,
 }
 
-/// The calls in hand, by id.
-#[derive(Debug, Default)]
+/// The calls in hand, by id, and those of them waiting for a worker.
+#[derive(Default)]
 struct InFlight {
     calls: Mutex<HashMap<Id, Arc<Slot>>>,
     /// Told when a call's answer leaves [`Answer::Pending`], and when a
     /// call leaves.
     changed: Condvar,
     stopping: AtomicBool,
+    queue: Queue,
+}
+
+impl std::fmt::Debug for InFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InFlight").finish_non_exhaustive()
+    }
+}
+
+/// The calls waiting for a worker, oldest first: at most [`QUEUE`]. A
+/// worker takes the oldest; a call taken out by its expiry or its
+/// cancellation is no worker's.
+#[derive(Default)]
+struct Queue {
+    state: Mutex<Queued>,
+    /// Told when a call is queued, and when the queue closes.
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Queued {
+    jobs: VecDeque<Job>,
+    closed: bool,
+}
+
+impl Queue {
+    /// Queues `job`, or hands it back when [`QUEUE`] wait already or the
+    /// queue is closed.
+    fn push(&self, job: Job) -> Result<(), Job> {
+        let mut q = lock(&self.state);
+        if q.closed || q.jobs.len() >= QUEUE {
+            return Err(job);
+        }
+        q.jobs.push_back(job);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// The oldest call, once there is one; `None` once the queue is
+    /// closed and empty.
+    fn pop(&self) -> Option<Job> {
+        let mut q = lock(&self.state);
+        loop {
+            if let Some(job) = q.jobs.pop_front() {
+                return Some(job);
+            }
+            if q.closed {
+                return None;
+            }
+            q = self.changed.wait(q).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Takes out the call `slot` is the slot of, if it still waits.
+    fn remove(&self, slot: &Arc<Slot>) -> Option<Job> {
+        let mut q = lock(&self.state);
+        let i = q.jobs.iter().position(|j| Arc::ptr_eq(&j.slot, slot))?;
+        q.jobs.remove(i)
+    }
+
+    /// Takes out every call waiting.
+    fn drain(&self) -> Vec<Job> {
+        lock(&self.state).jobs.drain(..).collect()
+    }
+
+    /// No call is queued from now on; the workers end once it is empty.
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.changed.notify_all();
+    }
 }
 
 impl InFlight {
@@ -154,17 +226,29 @@ impl InFlight {
         self.changed.notify_all();
     }
 
-    /// Cancels the call `id`, if it is in hand: a running call is
-    /// stopped, and an answer still waiting for the writer is withdrawn.
-    /// One whose answer is being written goes on.
+    /// Cancels the call `id`, if it is in hand: one waiting for a worker
+    /// leaves at once, answered nothing; a running call is stopped, and an
+    /// answer still waiting for the writer is withdrawn. One whose answer
+    /// is being written goes on.
     fn cancel(&self, id: &Id) {
         let slot = lock(&self.calls).get(id).cloned();
         if let Some(slot) = slot {
+            if let Some(job) = self.queue.remove(&slot) {
+                job.slot.call.cancel();
+                self.unanswered(&job.id, &job.slot);
+                return;
+            }
             let answer = lock(&slot.answer);
             if *answer != Answer::Settled {
                 slot.call.cancel();
             }
         }
+    }
+
+    /// Closes the call `id`, which nothing will be sent for.
+    fn unanswered(&self, id: &Id, slot: &Arc<Slot>) {
+        *lock(&slot.answer) = Answer::Settled;
+        self.close(id, slot);
     }
 
     /// Queues `answer` for `id` unless the call was cancelled (or, with
@@ -211,6 +295,10 @@ impl InFlight {
     /// the writer are left to it.
     fn stop_all(&self, limit: Duration) {
         self.stopping.store(true, Ordering::SeqCst);
+        for job in self.queue.drain() {
+            job.slot.call.cancel();
+            self.unanswered(&job.id, &job.slot);
+        }
         let slots: Vec<Arc<Slot>> = lock(&self.calls).values().cloned().collect();
         for slot in slots {
             let answer = lock(&slot.answer);
@@ -359,18 +447,23 @@ impl Server {
             let _ = wake.try_send(Event::OutputClosed);
         });
         std::thread::spawn(move || read_lines(stdin, &events_tx));
-        let (jobs, queue) = mpsc::sync_channel::<Job>(QUEUE);
-        let queue = Arc::new(Mutex::new(queue));
-        let workers: Vec<_> = (0..WORKERS)
+        let mut workers: Vec<_> = (0..WORKERS)
             .map(|_| {
-                let queue = Arc::clone(&queue);
                 let router = Arc::clone(&self.router);
                 let inflight = Arc::clone(&self.inflight);
                 let outbox = outbox.clone();
                 let ctx = Arc::clone(&ctx);
-                std::thread::spawn(move || worker(&queue, &router, &inflight, &outbox, &ctx))
+                std::thread::spawn(move || worker(&router, &inflight, &outbox, &ctx))
             })
             .collect();
+        {
+            let inflight = Arc::clone(&self.inflight);
+            let outbox = outbox.clone();
+            let budget = ctx.wait;
+            workers.push(std::thread::spawn(move || {
+                expire_waiting(&inflight, &outbox, budget);
+            }));
+        }
         let mut phase = Phase::New;
         let read = loop {
             if outbox.closed() {
@@ -385,16 +478,17 @@ impl Server {
                 Ok(Event::Input(Ok(Line::Message(bytes)))) => {
                     let incoming = rpc::parse(&bytes);
                     drop(bytes);
-                    self.handle(incoming, &mut phase, &outbox, &jobs);
+                    self.handle(incoming, &mut phase, &outbox);
                 }
             }
         };
         drop(events);
         // The end: what is in hand is stopped and waited for.
         self.inflight.stop_all(SHUTDOWN_WAIT);
-        drop(jobs);
-        // Each worker ends once its queue is closed and its call done. One
-        // still in a tool a second later is left to the process's exit.
+        self.inflight.queue.close();
+        // Each worker ends once the queue is closed and its call done, and
+        // the expiry once the queue is closed. One still in a tool a second
+        // later is left to the process's exit.
         finished_within(&workers, Duration::from_secs(1));
         for w in workers {
             if w.is_finished() {
@@ -415,13 +509,7 @@ impl Server {
         read
     }
 
-    fn handle(
-        &self,
-        incoming: Incoming,
-        phase: &mut Phase,
-        outbox: &Outbox,
-        jobs: &mpsc::SyncSender<Job>,
-    ) {
+    fn handle(&self, incoming: Incoming, phase: &mut Phase, outbox: &Outbox) {
         let (id, method, params) = match incoming {
             Incoming::Response => return,
             Incoming::Invalid { id, code, message } => {
@@ -480,7 +568,7 @@ impl Server {
                     rpc::result(&id, json!({"tools": tools}))
                 }
             }
-            ("tools/call", Phase::Ready) => match self.enqueue(&id, &params, jobs) {
+            ("tools/call", Phase::Ready) => match self.enqueue(&id, &params) {
                 Ok(()) => return,
                 Err(answer) => answer,
             },
@@ -490,12 +578,7 @@ impl Server {
     }
 
     /// Queues a `tools/call`, or returns the error to answer it with.
-    fn enqueue(
-        &self,
-        id: &Id,
-        params: &Map<String, Value>,
-        jobs: &mpsc::SyncSender<Job>,
-    ) -> Result<(), Vec<u8>> {
+    fn enqueue(&self, id: &Id, params: &Map<String, Value>) -> Result<(), Vec<u8>> {
         let name = match params.get("name") {
             Some(Value::String(n)) => n.clone(),
             _ => {
@@ -533,9 +616,9 @@ impl Server {
             args,
             slot,
         };
-        match jobs.try_send(job) {
+        match self.inflight.queue.push(job) {
             Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
+            Err(job) => {
                 self.inflight.close(&job.id, &job.slot);
                 Err(rpc::error(
                     Some(id),
@@ -547,16 +630,64 @@ impl Server {
     }
 }
 
-fn worker(
-    queue: &Mutex<mpsc::Receiver<Job>>,
-    router: &Router,
-    inflight: &Arc<InFlight>,
-    outbox: &Outbox,
-    ctx: &Ctx,
-) {
+/// Answers `busy`, with nothing of it run, each call still waiting for a
+/// worker when its time from its arrival, `budget`, runs out: then, and not
+/// when a worker is free, which calls that hold every worker could put off
+/// past the host's cutoff (Codex review of M2-RES1). Ends once the queue
+/// is closed.
+fn expire_waiting(inflight: &Arc<InFlight>, outbox: &Outbox, budget: Duration) {
+    let queue = &inflight.queue;
+    let mut q = lock(&queue.state);
     loop {
-        let job = lock(queue).recv();
-        let Ok(job) = job else { return };
+        let now = Instant::now();
+        // Oldest first, so the calls whose time is out are at the front.
+        let mut due = Vec::new();
+        while q
+            .jobs
+            .front()
+            .is_some_and(|j| j.slot.call.deadline(budget) <= now)
+        {
+            due.extend(q.jobs.pop_front());
+        }
+        if !due.is_empty() {
+            drop(q);
+            for job in due {
+                let failed = ToolResult::Err(tools::run_with_secrets::no_time_left());
+                inflight.answer(
+                    &job.id,
+                    &job.slot,
+                    outbox,
+                    Some(rpc::result(&job.id, failed.to_json())),
+                );
+            }
+            q = lock(&queue.state);
+            continue;
+        }
+        if q.closed {
+            return;
+        }
+        let next = q.jobs.front().map(|j| j.slot.call.deadline(budget));
+        q = match next {
+            Some(at) => {
+                queue
+                    .changed
+                    .wait_timeout(q, at.saturating_duration_since(now))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
+            None => queue
+                .changed
+                .wait(q)
+                .unwrap_or_else(PoisonError::into_inner),
+        };
+    }
+}
+
+fn worker(router: &Router, inflight: &Arc<InFlight>, outbox: &Outbox, ctx: &Ctx) {
+    loop {
+        let Some(job) = inflight.queue.pop() else {
+            return;
+        };
         if inflight.stopping.load(Ordering::SeqCst) || job.slot.call.cancelled() {
             inflight.answer(&job.id, &job.slot, outbox, None);
             continue;

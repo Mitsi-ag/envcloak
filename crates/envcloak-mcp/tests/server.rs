@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use envcloak_mcp::{
@@ -65,9 +65,14 @@ struct Running {
 
 impl Running {
     fn start(server: Server) -> Running {
+        Running::start_with_wait(server, Duration::from_secs(1))
+    }
+
+    /// The server with `wait` as each call's time from its arrival.
+    fn start_with_wait(server: Server, wait: Duration) -> Running {
         let (in_tx, in_rx) = mpsc::channel();
         let (out_tx, out_rx) = mpsc::channel();
-        let ctx = Ctx::new("/nonexistent/envcloak".into(), None, Duration::from_secs(1));
+        let ctx = Ctx::new("/nonexistent/envcloak".into(), None, wait);
         let done = std::thread::spawn(move || {
             server.run(
                 Input {
@@ -497,4 +502,164 @@ fn closed_output_ends_the_session_while_input_stays_open() {
         .recv_timeout(Duration::from_secs(1))
         .expect("the running call was not stopped");
     drop(input);
+}
+
+/// Lets every [`HeldOpen`] call go on.
+type Release = Arc<(Mutex<bool>, Condvar)>;
+
+fn release(r: &Release) {
+    *r.0.lock().unwrap() = true;
+    r.1.notify_all();
+}
+
+/// A tool whose calls each say they started, then hold their worker until
+/// the test releases them all at once.
+struct HeldOpen {
+    started: Mutex<Sender<()>>,
+    release: Release,
+}
+
+impl Tool for HeldOpen {
+    fn schema(&self) -> ToolSchema {
+        schema("held")
+    }
+
+    fn call(&self, _: &Map<String, Value>, _: &Ctx, _: &Call) -> ToolResult {
+        let _ = self.started.lock().unwrap().send(());
+        let mut go = self.release.0.lock().unwrap();
+        while !*go {
+            go = self.release.1.wait(go).unwrap();
+        }
+        ToolResult::Ok(json!({"done": true}))
+    }
+}
+
+fn held_router() -> (Router, Receiver<()>, Release) {
+    let (started_tx, started) = mpsc::channel();
+    let gate: Release = Arc::new((Mutex::new(false), Condvar::new()));
+    let mut router = Router::new();
+    router
+        .register(Box::new(HeldOpen {
+            started: Mutex::new(started_tx),
+            release: Arc::clone(&gate),
+        }))
+        .unwrap();
+    router.register(Box::new(Echo("echo"))).unwrap();
+    (router, started, gate)
+}
+
+/// A call waiting for a worker while calls that run longer hold every
+/// worker is answered `busy` when its time from its arrival runs out (1 s
+/// here), not when a worker is free, and nothing of it runs (Codex review
+/// of M2-RES1, M2R-22: queued calls expired only when a worker took them,
+/// so four long approved commands left a fifth call unanswered past the
+/// host's cutoff).
+///
+/// Mutation checked: no expiry of waiting calls (as before, only a worker
+/// taking the call answers it so): the call is unanswered while the
+/// workers are held, and this fails.
+#[test]
+fn a_call_waiting_while_every_worker_is_held_is_answered_when_its_time_runs_out() {
+    let (router, started, gate) = held_router();
+    let mut r = Running::start(Server::with_router(router));
+    r.initialize();
+    for id in 0..WORKERS {
+        r.call(id as i64, "held", json!({}));
+    }
+    for _ in 0..WORKERS {
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
+    }
+    let sent = Instant::now();
+    r.call(100, "held", json!({}));
+    let v = r
+        .next(Duration::from_secs(10))
+        .expect("the waiting call was not answered while every worker was held");
+    let took = sent.elapsed();
+    assert_eq!(v["id"], 100, "{v}");
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_secs(3),
+        "answered after {took:?}"
+    );
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("\"error\":\"busy\""), "{text}");
+    release(&gate);
+    let mut done: Vec<i64> = (0..WORKERS)
+        .map(|_| {
+            let v = r.expect();
+            assert_eq!(v["result"]["structuredContent"]["done"], true, "{v}");
+            v["id"].as_i64().unwrap()
+        })
+        .collect();
+    done.sort_unstable();
+    assert_eq!(done, (0..WORKERS as i64).collect::<Vec<_>>());
+    assert!(
+        started.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the expired call ran"
+    );
+    assert!(r.end().is_empty());
+}
+
+/// A call cancelled while it waits for a worker leaves the queue at once:
+/// its place is free for the next call (the queue full of calls behind
+/// held workers answers one more `busy`, and after a cancellation takes
+/// one), its id may be used again, and it is answered nothing.
+///
+/// Mutation checked: a cancellation leaving a waiting call in the queue
+/// until a worker takes it (as before): the next call is answered `busy`
+/// at once and this fails.
+#[test]
+fn a_cancelled_call_waiting_for_a_worker_leaves_the_queue_at_once() {
+    let (router, started, gate) = held_router();
+    let mut r = Running::start_with_wait(Server::with_router(router), Duration::from_secs(300));
+    r.initialize();
+    for id in 0..WORKERS {
+        r.call(id as i64, "held", json!({}));
+    }
+    for _ in 0..WORKERS {
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
+    }
+    let waiting = 10..(10 + QUEUE) as i64;
+    for id in waiting.clone() {
+        r.call(id, "held", json!({}));
+    }
+    // The control: the queue is full.
+    r.call(1000, "echo", json!({}));
+    let v = r.expect();
+    assert_eq!(v["id"], 1000);
+    assert_eq!(v["error"]["code"], -32008);
+    for id in [10, 11] {
+        r.send(
+            &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": id}}),
+        );
+    }
+    r.call(1001, "echo", json!({}));
+    r.call(11, "echo", json!({}));
+    assert!(
+        r.next(Duration::from_millis(500)).is_none(),
+        "a call was answered while every worker was held"
+    );
+    release(&gate);
+    let mut answers = Vec::new();
+    for _ in 0..(WORKERS + QUEUE) {
+        answers.push(r.expect());
+    }
+    let echoed: Vec<i64> = answers
+        .iter()
+        .filter(|v| v["result"]["structuredContent"]["tool"] == "echo")
+        .map(|v| v["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(echoed.len(), 2, "{answers:?}");
+    assert!(echoed.contains(&1001) && echoed.contains(&11), "{echoed:?}");
+    let mut held: Vec<i64> = answers
+        .iter()
+        .filter(|v| v["result"]["structuredContent"]["done"] == true)
+        .map(|v| v["id"].as_i64().unwrap())
+        .collect();
+    held.sort_unstable();
+    let mut want: Vec<i64> = (0..WORKERS as i64).chain(12..(10 + QUEUE) as i64).collect();
+    want.sort_unstable();
+    assert_eq!(held, want);
+    assert!(r.end().is_empty());
 }
