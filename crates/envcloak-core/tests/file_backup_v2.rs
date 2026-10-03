@@ -806,7 +806,9 @@ fn a_backup_the_purge_cannot_remove_stops_no_other() {
 /// directory's `data` is kept, and so is the symlink. A reader records a
 /// result in the backup's directory it opened: with that directory moved
 /// away and a symlink in its place, the result is in the moved directory
-/// and reads back, and nothing is written in the other directory.
+/// and reads back, and nothing is written in the other directory. Since
+/// the backup's name no longer holds that directory, the call is not
+/// answered as recorded (`Substituted`, M2-05 round 12).
 #[test]
 fn a_backup_acts_on_the_directories_it_opened() {
     let (f, v) = KitFixture::create();
@@ -851,7 +853,10 @@ fn a_backup_acts_on_the_directories_it_opened() {
     std::fs::rename(&dir, &moved).unwrap();
     std::os::unix::fs::symlink(&victim, &dir).unwrap();
     let after: [u8; 32] = Sha256::digest(b"what init left").into();
-    r.record_result(0, &after).unwrap();
+    assert_eq!(
+        r.record_result(0, &after).map_err(|e| e.kind()),
+        Err(VaultErrorKind::Substituted)
+    );
     assert_eq!(dir_names(&victim), ["data"], "a result written elsewhere");
     assert_eq!(dir_names(&moved), ["data", "result-0"]);
     assert_eq!(r.results().unwrap(), [Some(after)]);
