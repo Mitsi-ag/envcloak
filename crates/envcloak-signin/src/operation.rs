@@ -145,7 +145,10 @@ pub enum StopReason {
     RecipientReplaced,
     /// The pending statement expired without a proof.
     StatementExpired,
-    /// The authorization ended or ran out before the attempt started.
+    /// The authorization ended (lock, root exit, an epoch or revision
+    /// change) or its deadline passed: before the attempt started, under
+    /// it, or under the delivered session, whose every tool call it
+    /// covers.
     AuthorizationEnded,
     /// The attempt's timeout passed.
     AttemptTimedOut,
