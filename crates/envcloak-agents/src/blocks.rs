@@ -11,12 +11,19 @@
 //! no hook (Map C §2.1).
 //!
 //! The markers are HTML comments, which Claude Code strips before the
-//! text reaches the model; the instructions are never inside one. A file
-//! that ends inside an open HTML comment or an open code fence is refused
-//! ([`BlockError::Unclosed`]): the block appended there would be read as
-//! part of it. A file whose markers are not exactly one begin before one
+//! text reaches the model; the instructions are never inside one. A block
+//! that would sit inside an open HTML comment or an open code fence (a
+//! file that ends inside one, or an existing block inside one, even one
+//! already as it should be) is refused ([`BlockError::Unclosed`]): it
+//! would be read as part of it. A fence closes only with its own
+//! character, at least as many of them and nothing after but white space
+//! (CommonMark). A file whose markers are not exactly one begin before one
 //! end, each a line of its own, is refused ([`BlockError::Damaged`]), and
 //! so is one that is not UTF-8.
+//!
+//! A block whose text is not EnvCloak's (the person edited it between the
+//! markers) is neither replaced nor removed ([`BlockError::Modified`]):
+//! that text is theirs.
 
 /// The line that opens the block.
 pub const BEGIN: &str = "<!-- envcloak:begin -->";
@@ -47,6 +54,8 @@ pub enum BlockError {
     Damaged,
     /// The file ends inside an open HTML comment or code fence.
     Unclosed,
+    /// The text between the markers is not one EnvCloak wrote.
+    Modified,
 }
 
 impl BlockError {
@@ -56,6 +65,7 @@ impl BlockError {
             BlockError::NotUtf8 => "not_utf8",
             BlockError::Damaged => "block_damaged",
             BlockError::Unclosed => "inside_comment",
+            BlockError::Modified => "block_modified",
         }
     }
 
@@ -68,8 +78,13 @@ impl BlockError {
                  hand"
             }
             BlockError::Unclosed => {
-                "the file ends inside an open HTML comment or code block, where the instructions \
-                 would be hidden"
+                "the block would be inside an open HTML comment or code block, where the \
+                 instructions would be hidden"
+            }
+            BlockError::Modified => {
+                "the text between EnvCloak's markers changed since EnvCloak wrote it, so it was \
+                 left as it is: it may be yours. Take out what is yours, or the whole block, and \
+                 run this again"
             }
         }
     }
@@ -99,18 +114,54 @@ fn find(text: &str) -> Result<Option<(usize, usize)>, BlockError> {
     }
 }
 
+/// A fence line's character and length (CommonMark: up to three spaces,
+/// then three or more backticks or tildes; a backtick fence's info string
+/// holds no backtick), and whether nothing but white space follows, as a
+/// closing fence needs.
+fn fence(line: &str) -> Option<(u8, usize, bool)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let t = &line[indent..];
+    let c = *t.as_bytes().first()?;
+    if c != b'`' && c != b'~' {
+        return None;
+    }
+    let n = t.bytes().take_while(|b| *b == c).count();
+    if n < 3 {
+        return None;
+    }
+    let info = &t[n..];
+    if c == b'`' && info.contains('`') {
+        return None;
+    }
+    Some((c, n, info.trim().is_empty()))
+}
+
 /// Whether the end of `text` is inside an open HTML comment or fenced code
-/// block.
+/// block. A fence is closed only by a fence of its own character, at
+/// least as long, with nothing after it (the Codex review: another
+/// character or a shorter run closed it here before).
 fn ends_open(text: &str) -> bool {
-    let mut in_fence = false;
+    let mut open_fence: Option<(u8, usize)> = None;
     let mut in_comment = false;
     for line in text.split('\n') {
-        let t = line.trim_start();
-        if !in_comment && (t.starts_with("```") || t.starts_with("~~~")) {
-            in_fence = !in_fence;
-            continue;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !in_comment {
+            match (open_fence, fence(line)) {
+                (None, Some((c, n, _))) => {
+                    open_fence = Some((c, n));
+                    continue;
+                }
+                (Some((c, n)), Some((c2, n2, bare))) if c2 == c && n2 >= n && bare => {
+                    open_fence = None;
+                    continue;
+                }
+                _ => {}
+            }
         }
-        if in_fence {
+        if open_fence.is_some() {
             continue;
         }
         let mut rest = line;
@@ -134,7 +185,7 @@ fn ends_open(text: &str) -> bool {
             }
         }
     }
-    in_fence || in_comment
+    open_fence.is_some() || in_comment
 }
 
 /// A change to a file's block.
@@ -146,18 +197,42 @@ pub enum Change {
     New(String),
 }
 
+/// The blocks earlier versions of EnvCloak wrote, which [`insert`]
+/// replaces and [`remove`] takes out: none before this one.
+const EARLIER: &[&str] = &[];
+
+/// Whether `found` (a block, markers and final newline included) is one
+/// EnvCloak wrote: this version's or an earlier one's. Line ends do not
+/// count: an editor that saves the file with CRLF leaves EnvCloak's block
+/// EnvCloak's.
+fn envcloaks(found: &str) -> bool {
+    let lf = found.replace("\r\n", "\n");
+    let bare = lf.strip_suffix('\n').unwrap_or(&lf);
+    bare == block().trim_end_matches('\n')
+        || EARLIER
+            .iter()
+            .any(|e| bare == format!("{BEGIN}\n{e}\n{END}"))
+}
+
 /// `text` with the block in it: appended after a blank line when there is
-/// none, replaced in place when an older one differs.
+/// none, replaced in place when an earlier version's differs. A block
+/// inside an open comment or fence is refused even when it is as it
+/// should be (the Codex review: it reported success while hidden), and
+/// one whose text the person changed is left (lesson L-09: not
+/// EnvCloak's to write over).
 pub fn insert(text: &[u8]) -> Result<Change, BlockError> {
     let text = std::str::from_utf8(text).map_err(|_| BlockError::NotUtf8)?;
     let want = block();
     match find(text)? {
         Some((b, e)) => {
+            if ends_open(&text[..b]) {
+                return Err(BlockError::Unclosed);
+            }
             if text[b..e] == want {
                 return Ok(Change::Unchanged);
             }
-            if ends_open(&text[..b]) {
-                return Err(BlockError::Unclosed);
+            if !envcloaks(&text[b..e]) {
+                return Err(BlockError::Modified);
             }
             Ok(Change::New(format!("{}{want}{}", &text[..b], &text[e..])))
         }
@@ -181,11 +256,19 @@ pub fn insert(text: &[u8]) -> Result<Change, BlockError> {
 /// [`insert`] adds, taken out (kept when no blank line or end of file
 /// follows the block, so the text on either side stays apart).
 /// Unchanged when there is no block.
+///
+/// # Errors
+/// When the file is not UTF-8, its markers are damaged, or the block's
+/// text is not one EnvCloak wrote ([`BlockError::Modified`]: the person's
+/// text between the markers is never taken out).
 pub fn remove(text: &[u8]) -> Result<Change, BlockError> {
     let text = std::str::from_utf8(text).map_err(|_| BlockError::NotUtf8)?;
     let Some((b, e)) = find(text)? else {
         return Ok(Change::Unchanged);
     };
+    if !envcloaks(&text[b..e]) {
+        return Err(BlockError::Modified);
+    }
     let mut start = b;
     let after = &text[e..];
     if text[..b].ends_with("\n\n")
@@ -261,11 +344,78 @@ mod tests {
         );
     }
 
+    /// Lesson L-09 for the block: text between the markers that is not
+    /// EnvCloak's is the person's, and neither install nor uninstall
+    /// writes over it or takes it out.
+    ///
+    /// Mutation checked: `envcloaks` answering true for any block (the
+    /// previous replace-whatever-differs): the person's line is replaced,
+    /// and removed, and this fails.
     #[test]
-    fn an_older_block_is_replaced_in_place() {
-        let old = format!("top\n\n{BEGIN}\nold words\n{END}\nbottom\n");
-        let got = new(insert(old.as_bytes()).unwrap_or(Change::Unchanged));
-        assert_eq!(got, format!("top\n\n{}bottom\n", block()));
+    fn a_block_the_person_changed_is_left_as_it_is() {
+        let edited = format!("top\n\n{BEGIN}\nold words\n{END}\nbottom\n");
+        assert_eq!(insert(edited.as_bytes()), Err(BlockError::Modified));
+        assert_eq!(remove(edited.as_bytes()), Err(BlockError::Modified));
+        let mine = new(insert(b"top\n").unwrap_or(Change::Unchanged));
+        let added = mine.replace(END, &format!("- and mine\n{END}"));
+        assert_eq!(insert(added.as_bytes()), Err(BlockError::Modified));
+        assert_eq!(remove(added.as_bytes()), Err(BlockError::Modified));
+        // CRLF line ends are still EnvCloak's block.
+        let crlf = mine.replace('\n', "\r\n");
+        assert!(remove(crlf.as_bytes()).is_ok());
+    }
+
+    /// The Codex review: a block already there, as it should be, inside an
+    /// open fence or comment is hidden, and is refused, not reported as
+    /// in place; a fence closes only with its own character, at least as
+    /// long and bare.
+    ///
+    /// Mutations checked: the equality shortcut before the placement
+    /// check (the previous order): the hidden identical block answers
+    /// `Unchanged` and this fails; any fence line closing the open one
+    /// (the previous toggle): the fences closed by `~~~` or a shorter run
+    /// are taken as closed and this fails.
+    #[test]
+    fn a_hidden_block_is_refused_even_when_it_is_as_it_should_be() {
+        for open in [
+            "<!-- open\n",
+            "```\n",
+            "~~~~\n",
+            "```sh\n",
+            "````\n```\n",
+            "```\n~~~\n",
+            "~~~\n```\n",
+            "```\n``` not a close\n",
+            "  ```\n",
+        ] {
+            let hidden = format!("{open}{}", block());
+            assert_eq!(
+                insert(hidden.as_bytes()),
+                Err(BlockError::Unclosed),
+                "{open:?}"
+            );
+            assert_eq!(
+                insert(open.as_bytes()),
+                Err(BlockError::Unclosed),
+                "{open:?}"
+            );
+        }
+        for closed in [
+            "```\ncode\n```\n",
+            "~~~\ncode\n~~~~\n",
+            "````\n```\n````\n",
+            "<!-- c -->\n",
+            "    ```\n",
+            "``` a`b\n",
+        ] {
+            let shown = format!("{closed}\n{}", block());
+            assert_eq!(
+                insert(shown.as_bytes()),
+                Ok(Change::Unchanged),
+                "{closed:?}"
+            );
+            assert!(insert(closed.as_bytes()).is_ok(), "{closed:?}");
+        }
     }
 
     #[test]
