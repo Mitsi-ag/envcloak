@@ -94,6 +94,11 @@ impl Enc {
         self
     }
 
+    /// The bytes encoded so far.
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     pub(crate) fn finish(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.buf)
     }

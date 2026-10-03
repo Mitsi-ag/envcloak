@@ -49,9 +49,7 @@ use crate::crypto::{FieldTag, ItemClass, Keyring, Purpose, TableTag};
 
 use super::error::{VaultError, VaultErrorKind};
 use super::integrity::{HeaderState, RowKey, Stamp};
-use super::items::{
-    FieldRecord, ItemExtra, RECORDS_V2_FROM, decode_field, decode_item, encode_field, encode_item,
-};
+use super::items::{RECORDS_V2_FROM, upgrade_field_v1, upgrade_item_v1};
 use super::policies::{StandingSetHeader, standing_set_digest};
 use super::schema::{CURRENT_SCHEMA, drop_page_cache, verify_schema};
 use super::state::{VaultCtx, item_class_from, item_key, scan_stamps};
@@ -350,15 +348,9 @@ fn reseal_rows(
         let new = if upgrade {
             // Version 1 to 2: what version 1 does not record starts empty;
             // in particular the classification's last change is not known.
+            // The record passes the size check every later write applies.
             reseal_record(k, &a(from), &a(to), &sealed, |b| {
-                let (slug, created_at, details, _) =
-                    decode_item(b, from.schema_version, class).map_err(migration)?;
-                Ok(encode_item(
-                    &slug,
-                    created_at,
-                    &details,
-                    &ItemExtra::default(),
-                ))
+                upgrade_item_v1(b, class).map_err(migration)
             })?
         } else {
             reseal(k, &a(from), &a(to), &sealed).map_err(fail)?
@@ -397,10 +389,7 @@ fn reseal_rows(
                 &a(from, FieldTag::FieldName),
                 &a(to, FieldTag::FieldName),
                 &name,
-                |b| {
-                    let r: FieldRecord = decode_field(b, from.schema_version).map_err(migration)?;
-                    Ok(encode_field(&r))
-                },
+                |b| upgrade_field_v1(b).map_err(migration),
             )?
         } else {
             reseal(

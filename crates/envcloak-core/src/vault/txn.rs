@@ -323,10 +323,9 @@ impl<'v> Txn<'v> {
         row: ItemRow,
         old: Option<&ItemRow>,
     ) -> Result<(), VaultError> {
-        let record = encode_item(&row.slug, row.created_at, &row.details, &row.extra);
-        if record.len() > MAX_FIELD {
-            return Err(VaultErrorKind::TooLarge.into());
-        }
+        // Its size checked there (what the writer gives at most MAX_FIELD,
+        // what the vault keeps after it), as the migration's records are.
+        let record = encode_item(&row.slug, row.created_at, &row.details, &row.extra)?;
         let aad = self.ctx.aad(
             TableTag::Items,
             id.as_bytes(),

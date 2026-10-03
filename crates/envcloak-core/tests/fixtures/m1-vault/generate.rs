@@ -15,11 +15,12 @@
 //! ```
 //!
 //! then copy what it wrote here: `vault.db`, `vault-policy.db`,
-//! `backup.ecbackup` and the file backup `files-<time>-<id>.ecfiles`. No
-//! value in them is shaped like a key: the VMK, the Recovery Kit's secret
-//! and every value are derived at run time from the fixed labels below, by
-//! the writer and by the tests alike, so no key-shaped literal is
-//! committed.
+//! `backup.ecbackup` and the file backup `files-<time>-<id>.ecfiles`.
+//! `vault-boundary.db`, a vault whose records are as large as M1 stores
+//! them, is written the same way by `write_m1_boundary_fixture`. No value
+//! in them is shaped like a key: the VMK, the Recovery Kit's secret and
+//! every value are derived at run time from the fixed labels below, by the
+//! writer and by the tests alike, so no key-shaped literal is committed.
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -33,7 +34,8 @@ use envcloak_core::file_backup::{BackupFile, FileBackupCreator, FileLeft};
 use envcloak_core::file_backup_v2::CreatorKind;
 use envcloak_core::vault::{
     Account, AuditHead, CURRENT_SCHEMA, Classification, FieldName, INITIAL_EPOCH, ItemDetails,
-    Links, NewItem, PolicyId, ProjectBinding, ProjectKey, ProjectRecord, Slug, Vault, VaultPaths,
+    Links, MAX_FIELD, MAX_PRIOR, NewItem, PolicyId, ProjectBinding, ProjectKey, ProjectRecord,
+    Slug, Vault, VaultErrorKind, VaultPaths,
 };
 use sha2::{Digest, Sha256};
 
@@ -232,4 +234,107 @@ fn write_m1_fixture() {
         .unwrap();
     drop(v);
     std::fs::copy(&db, out.join("vault-policy.db")).unwrap();
+}
+
+/// The items of `vault-boundary.db`, each holding the largest item record
+/// M1 stores: `MAX_FIELD` bytes as M1 lays it out. Each class's own key
+/// seals one.
+const BOUNDARY: [(ItemClass, &str); 2] = [
+    (ItemClass::Secret, "m1/boundary"),
+    (ItemClass::Card, "m1/boundary-card"),
+];
+
+/// A boundary item's details: its slug as its title, live, and `len` bytes
+/// of notes.
+fn boundary_details(slug: &str, len: usize) -> ItemDetails {
+    let notes = "boundary notes ".repeat(len / 15 + 1);
+    ItemDetails {
+        title: slug.to_owned(),
+        classification: Classification::Live,
+        notes: notes[..len].to_owned(),
+        ..ItemDetails::default()
+    }
+}
+
+/// The length of a boundary item's notes: its record, as M1 lays it out
+/// (docs/VAULT.md "Records" at b643efb), is 43 bytes besides its slug,
+/// title and notes. M1's own size check is the oracle: the writer below
+/// requires it to store these notes and to refuse one byte more.
+fn boundary_notes(slug: &str) -> usize {
+    MAX_FIELD - 43 - 2 * slug.len()
+}
+
+/// A boundary item's value, version `version`: `MAX_FIELD` bytes of text
+/// no provider pattern matches.
+fn boundary_value(slug: &str, version: usize) -> Vec<u8> {
+    let unit = format!("{slug} boundary value version {version} ");
+    let mut v = unit.repeat(MAX_FIELD / unit.len() + 1).into_bytes();
+    v.truncate(MAX_FIELD);
+    v
+}
+
+/// Writes `vault-boundary.db`: for each of [`BOUNDARY`], an item whose
+/// record is the largest M1 stores, with a field holding a value of
+/// `MAX_FIELD` bytes; the secret's field also keeps three prior values of
+/// that size, the largest field row M1 writes.
+#[test]
+#[ignore = "writes the M1 boundary fixture; run by hand at the M1 commit"]
+fn write_m1_boundary_fixture() {
+    assert_eq!(
+        CURRENT_SCHEMA, 1,
+        "the fixture is M1's format: run at b643efb"
+    );
+    let out = std::path::PathBuf::from(std::env::var_os("ENVCLOAK_WRITE_M1_FIXTURE").unwrap());
+    let home = envcloak_testkit::TestHome::new();
+    let paths = VaultPaths::under(home.root().join("data"));
+    let vault_id = VaultId::generate();
+    let ctx = EnvelopeCtx {
+        vault_id,
+        unlocker_id: UnlockerId::generate(),
+        epoch: INITIAL_EPOCH,
+    };
+    let envelopes = vec![
+        wrap_vmk_with(
+            &Vmk::import_for_testing(&derived("vmk")).unwrap(),
+            &SecretBytes::copy_from(common::PASSPHRASE),
+            UnlockerKind::Passphrase,
+            &ctx,
+            &KdfParams::minimum(),
+            &Argon2id,
+        )
+        .unwrap(),
+    ];
+    let vmk = Vmk::import_for_testing(&derived("vmk")).unwrap();
+    let mut v = Vault::create(&paths, vault_id, vmk, envelopes).unwrap();
+    for (class, slug) in BOUNDARY {
+        let new = |len| NewItem {
+            class,
+            slug: Slug::new(slug).unwrap(),
+            details: boundary_details(slug, len),
+        };
+        let len = boundary_notes(slug);
+        // One byte more is over M1's limit.
+        let over = v.transact(|t| t.create_item(new(len + 1)).map(drop));
+        assert_eq!(over.unwrap_err().kind(), VaultErrorKind::TooLarge, "{slug}");
+        v.transact(|t| {
+            let item = t.create_item(new(len))?;
+            let f = t.add_field(
+                item,
+                FieldName::new("value").unwrap(),
+                SecretBytes::copy_from(&boundary_value(slug, 0)),
+            )?;
+            if class == ItemClass::Secret {
+                for version in 1..=MAX_PRIOR {
+                    t.set_value(f, SecretBytes::copy_from(&boundary_value(slug, version)))?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    drop(v);
+    let db = std::fs::canonicalize(&paths.vault_dir)
+        .unwrap()
+        .join("vault.db");
+    std::fs::copy(&db, out.join("vault-boundary.db")).unwrap();
 }
