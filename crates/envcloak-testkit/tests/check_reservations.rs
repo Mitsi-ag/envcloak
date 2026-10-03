@@ -2526,6 +2526,11 @@ fn the_compiler_reads_no_rust_the_reader_does_not() {
             "\n[target.'cfg(unix)'.dependencies]\nzz = { path = \"../../vendor/zz\" }\n",
             "a path outside crates/ (`../../vendor/zz`)",
         ),
+        (
+            "crates/envcloak-cli/Cargo.toml",
+            "\n[target.'cfg(unix)'.dependencies]\nzz = { \"pa\\u0074h\" = \"../../vendor/zz\" }\n",
+            "a quoted key with an escape",
+        ),
     ] {
         let t = fixture();
         append_to(&t, rel, text);

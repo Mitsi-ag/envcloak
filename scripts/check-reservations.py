@@ -67,7 +67,9 @@ directory that was a symbolic link, compiled unread): a `#[path]`
 attribute (also under `cfg_attr`) is refused, and so are a symbolic link
 anywhere under a `src/`, a `.rs` entry that is not a regular file, a
 library or binary target whose file a manifest puts outside its crate's
-`src/`, a path dependency outside `crates/`, and a workspace member
+`src/`, a path dependency outside `crates/` (manifests are read as
+text: a `path` whose value is not one plain string, and a quoted key
+with an escape, are refused), and a workspace member
 outside `crates/` other than the two canaries (which no crate may depend
 on, scripts/check-unsafe.sh). scripts/check-unsafe.sh refuses `#[path]`
 and `include!` in every Rust file too, and scripts/check-sources.sh
@@ -1671,6 +1673,10 @@ def check_manifest_paths(root, rel, src_dir=None):
         if h:
             header = re.sub(r"[\s\"']", "", h.group(1))
             continue
+        # A key spelled with an escape (`"pa\u0074h" = ..`) is `path` to
+        # Cargo and not to a reader of text: refused.
+        if re.search(r"\"[^\"]*\\[^\"]*\"\s*[.=\]]", line):
+            raise SourceError("%s line %d: a quoted key with an escape, which the reader of manifests does not read" % (rel, n))
         for m in TOML_PATH.finditer(line):
             v = TOML_STRING.match(line, m.end())
             if not v:
