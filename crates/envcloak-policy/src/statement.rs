@@ -137,6 +137,13 @@ impl Enc {
         self.str(&n.to_string())
     }
 
+    /// A signed number, in decimal with its sign (F-81): `-5` and `5`
+    /// render differently, so they encode differently. A positive one
+    /// encodes as [`Enc::num`] encodes it.
+    fn signed(&mut self, n: i64) -> &mut Self {
+        self.str(&n.to_string())
+    }
+
     fn flag(&mut self, b: bool) -> &mut Self {
         self.str(if b { "1" } else { "0" })
     }
@@ -183,8 +190,8 @@ pub fn canonical_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> Vec<u8
         .str(kind_word(p.subject.kind))
         .str(p.subject.label.as_deref().unwrap_or(""))
         .flag(p.subject.label.is_some())
-        .num(i64::from(p.subject.caller_pid).unsigned_abs())
-        .num(i64::from(p.subject.root.pid).unsigned_abs())
+        .signed(i64::from(p.subject.caller_pid))
+        .signed(i64::from(p.subject.root.pid))
         .num(p.subject.root.start_time)
         .str(p.subject.root.exe.as_deref().unwrap_or(""))
         .flag(p.subject.root.exe.is_some())
