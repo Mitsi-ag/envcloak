@@ -361,4 +361,4 @@ exit: 2
 --- stdout
 --- stderr
 envcloak: usage: envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
-       envcloak init --undo <ID> [--passphrase-fd N] [--json]
+       envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
