@@ -1693,6 +1693,85 @@ fn calls_waiting_for_a_worker_still_answer_before_the_cutoff() {
     f.sweep();
 }
 
+/// The case of M2R-22 left after it (Codex review of M2-RES1): four
+/// approved commands that run past the host's cutoff hold every worker of
+/// a server of a host with no known cutoff (10 s, a wait of 8), and a
+/// fifth call waiting for a worker is answered `busy` before the cutoff,
+/// when its time from its arrival runs out, with nothing of it run. The
+/// four end when the test lets them, and are answered as completed.
+///
+/// Mutation checked: no expiry of waiting calls (only a worker taking a
+/// call answers it so, as before): the fifth is unanswered until a
+/// command ends, after the cutoff, and this fails.
+#[test]
+fn a_call_waiting_behind_long_commands_still_answers_before_the_cutoff() {
+    let f = Fixture::new();
+    let py = python3();
+    let mut m = Mcp::start(&f.home, &f.project, &[], &f.cs);
+    m.initialize();
+    let dir = f.project.to_str().unwrap().to_owned();
+    let files = outside_dir();
+    let life = files.path().join("life");
+    std::fs::create_dir(&life).unwrap();
+    let hold = |i: usize| {
+        json!([
+            py.to_str().unwrap(),
+            "hold.py",
+            files.path().join(format!("lock{i}")).to_str().unwrap(),
+            files.path().join(format!("ready{i}")).to_str().unwrap(),
+            life.to_str().unwrap(),
+            "quiet-child"
+        ])
+    };
+    // Approved once, for the hour, so the next calls run.
+    let s = structured(&m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": hold(0)}),
+    ))
+    .clone();
+    assert_eq!(s["status"], "approval_required", "{s}");
+    f.approve(s["request"].as_str().unwrap());
+    let held: Vec<i64> = (0..envcloak_mcp::WORKERS)
+        .map(|i| {
+            m.call_async(
+                "run_with_secrets",
+                json!({"project_dir": dir, "argv": hold(i)}),
+            )
+        })
+        .collect();
+    let end = Instant::now() + Duration::from_secs(60);
+    for i in 0..envcloak_mcp::WORKERS {
+        while !files.path().join(format!("ready{i}")).exists() {
+            assert!(
+                Instant::now() < end,
+                "command {i} did not start: {}",
+                m.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let cutoff = envcloak_agents::tool_timeouts::cutoff(None);
+    let sent = Instant::now();
+    let fifth = m.call_async(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": [py.to_str().unwrap(), "emit.py", "V5"]}),
+    );
+    let v = m.answer(fifth, cutoff + Duration::from_secs(10));
+    let took = sent.elapsed();
+    assert!(
+        took < cutoff,
+        "the waiting call was answered after {took:?}: {v}"
+    );
+    assert_eq!(failed(&v["result"]), "busy", "{v}");
+    std::fs::remove_dir(&life).unwrap();
+    for id in held {
+        let v = m.answer(id, Duration::from_secs(60));
+        assert_eq!(structured(&v["result"])["status"], "completed", "{v}");
+    }
+    m.finish();
+    f.sweep();
+}
+
 /// Gate 13 through every tool, with the daemon up and the vault unlocked:
 /// each key-shaped fixture, in each string a tool takes (a project
 /// directory, a variable's name, a slug and its field, a profile, a
