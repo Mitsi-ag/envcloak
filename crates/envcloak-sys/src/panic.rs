@@ -131,3 +131,24 @@ pub fn panic_with_input() -> ! {
         String::from_utf8_lossy(&input)
     );
 }
+
+/// A place where a test build can be made to fail as a system call
+/// would, so a test reaches a failure path no fixture can cause (the run
+/// pipeline failing after its command started). `Ok(())` in a build
+/// without the `testing` feature, which only tests enable (release builds
+/// never have it: `crates/envcloak-cli/tests/release_features.rs`). With
+/// it, when `ENVCLOAK_TEST_FAIL` names `site`, an error.
+///
+/// # Errors
+/// In a test build, when `ENVCLOAK_TEST_FAIL` names `site`.
+pub fn fail_point(site: &str) -> std::io::Result<()> {
+    #[cfg(feature = "testing")]
+    {
+        crate::testing::fail_point(site)
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        let _ = site;
+        Ok(())
+    }
+}
