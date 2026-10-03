@@ -220,7 +220,7 @@ pub fn restore_over_left_observed(
         return Err(fail(ModifyErrorKind::HardLinked));
     }
     observe(Inside::Opened);
-    let now = digest_of(&mut f, &stamp).map_err(fail)?;
+    let now = digest_of(&mut f, &stamp, &dir).map_err(fail)?;
     drop(f);
     if now != file.sha256_after {
         return Err(fail(ModifyErrorKind::EditedSince));

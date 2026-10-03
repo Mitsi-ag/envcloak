@@ -83,6 +83,29 @@ use crate::root::{FileStamp, ScanErrorKind, ScanRoot, io_kind, open_file};
 /// editing it.
 pub const MIN_AGE: Duration = Duration::from_secs(120);
 
+/// The longest a read whose stamp is compared before and after waits for
+/// the file system's clock to move past the file's last change
+/// ([`clock_past`]): a file system that stamps whole seconds takes up to a
+/// second.
+const CLOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// Waits, before a read whose stamp is compared before and after, until
+/// the file system's clock has moved past `stamp`'s change time, probing
+/// it in `dir`, the file's directory
+/// ([`envcloak_sys::wait_for_clock_past`]): any change to the file from
+/// then on moves its change time, however soon it comes (Linux stamps
+/// every change within one tick of its clock alike, so a write right
+/// after the file's last change would otherwise leave its stamp as it
+/// was). The probe gives `dir` the permissions it has, which changes
+/// nothing but its change time; a directory that is not the user's (or a
+/// file system that keeps no permissions) refuses it, and the read then
+/// goes on without the wait, as does one whose clock does not move within
+/// [`CLOCK_WAIT`]: there a change within that tick, while the file is
+/// read, is not seen.
+fn clock_past(dir: &File, stamp: &FileStamp) {
+    let _ = envcloak_sys::wait_for_clock_past(dir, (stamp.ctime, stamp.ctime_nsec), CLOCK_WAIT);
+}
+
 /// Why a file was not changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -358,6 +381,9 @@ fn remove_if(
     observe(Removing::Moved);
     let taken = open_file(dir, &aside, usize::MAX).is_ok_and(|(mut f, m)| {
         let stamp = FileStamp::of(&m);
+        // The move just changed it: its stamp shows a write while it is
+        // compared only once the clock moved past that.
+        clock_past(dir, &stamp);
         let ok = is_it(&mut f, &m);
         observe(Removing::Read);
         ok && open_file(dir, &aside, usize::MAX).is_ok_and(|(_, now)| FileStamp::of(&now) == stamp)
@@ -505,6 +531,8 @@ fn holds_first_bytes_of(f: &mut File, m: &std::fs::Metadata, whole: &File, len: 
             return false;
         }
         at = end;
+        #[cfg(test)]
+        tests::during_read();
     }
     at == m.len()
 }
@@ -515,6 +543,9 @@ fn holds_first_bytes_of(f: &mut File, m: &std::fs::Metadata, whole: &File, len: 
 /// through this descriptor only, never by a name.
 struct Staged {
     f: File,
+    /// The directory it is in, held open: its stamp's clock is probed
+    /// there ([`clock_past`]).
+    dir: File,
     mode: u32,
     len: u64,
     sha256: [u8; 32],
@@ -540,6 +571,7 @@ impl Staged {
         if before.size != self.len {
             return None;
         }
+        clock_past(&self.dir, &before);
         let mut buf = Zeroizing::new(vec![0u8; 64 * 1024]);
         let mut h = Sha256::new();
         let mut at: u64 = 0;
@@ -582,7 +614,9 @@ impl Staged {
 
     /// Whether `at` in `dir` is this file (a regular file of this user,
     /// never through a symlink, with its device and inode), still as
-    /// written ([`Staged::intact`]).
+    /// written ([`Staged::intact`]). `at` is a link to the very file then
+    /// read back, so another file renamed onto it while it is read unlinks
+    /// it there, which its stamp shows.
     fn named(&self, dir: &File, at: &OsStr) -> bool {
         holds(dir, at, &self.f) && self.intact()
     }
@@ -674,8 +708,10 @@ fn write_new_with(
         rel: rel.to_path_buf(),
         kind,
     };
-    // Open for reading as well: what it holds is read back through this
-    // descriptor, never by its name again.
+    // The directory, held for the clock of the new file's stamps; then the
+    // file, open for reading as well: what it holds is read back through
+    // this descriptor, never by its name again.
+    let held = dir.try_clone().map_err(|e| fail(io(&e)))?;
     let mut f = create_rw_beneath(dir, temp, 0o600).map_err(|e| fail(io(&e)))?;
     let mut w = Hashing {
         f: &mut f,
@@ -696,6 +732,7 @@ fn write_new_with(
     };
     let staged = Staged {
         f,
+        dir: held,
         mode,
         len,
         sha256,
@@ -978,8 +1015,9 @@ fn replace_in_using(
     // `left`) the contents the change left.
     let mut came_out = |out: &mut File, m: &std::fs::Metadata| {
         is_checked(m, expect)
-            && left
-                .is_none_or(|want| digest_of(out, &FileStamp::of(m)).is_ok_and(|got| got == *want))
+            && left.is_none_or(|want| {
+                digest_of(out, &FileStamp::of(m), dir).is_ok_and(|got| got == *want)
+            })
     };
     match swap(dir, &temp, name) {
         Ok(()) => {
@@ -1061,9 +1099,16 @@ fn replace_in_using(
 /// The SHA-256 of `f`, which must hold exactly the bytes `stamp` says and
 /// still have that stamp once read, its change time included (else
 /// [`ModifyErrorKind::Changed`]): a file written while it was hashed is
-/// never taken for the one hashed. The bytes pass through a buffer wiped
+/// never taken for the one hashed, the read waiting first for the file
+/// system's clock to move past its last change, probed in `dir`, its
+/// directory ([`clock_past`]). The bytes pass through a buffer wiped
 /// after.
-pub(crate) fn digest_of(f: &mut File, stamp: &FileStamp) -> Result<[u8; 32], ModifyErrorKind> {
+pub(crate) fn digest_of(
+    f: &mut File,
+    stamp: &FileStamp,
+    dir: &File,
+) -> Result<[u8; 32], ModifyErrorKind> {
+    clock_past(dir, stamp);
     let size = stamp.size;
     let mut buf = Zeroizing::new(vec![0u8; 64 * 1024]);
     let mut h = Sha256::new();
@@ -1078,6 +1123,8 @@ pub(crate) fn digest_of(f: &mut File, stamp: &FileStamp) -> Result<[u8; 32], Mod
             return Err(ModifyErrorKind::Changed);
         }
         h.update(&buf[..n]);
+        #[cfg(test)]
+        tests::during_read();
     }
     let after = f.metadata().map_err(|e| io(&e))?;
     if read != size || FileStamp::of(&after) != *stamp {
@@ -1364,13 +1411,15 @@ mod tests {
     }
 
     thread_local! {
-        /// What [`Staged::holds_written`] runs, once, after it read the
-        /// first part of the file.
+        /// What [`Staged::holds_written`], [`digest_of`] or a leftover's
+        /// comparison ([`holds_first_bytes_of`]) runs, once, after it read
+        /// the first part of the file.
         static DURING_READ: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { core::cell::RefCell::new(None) };
     }
 
-    /// Called by [`Staged::holds_written`] after each part it reads.
+    /// Called by [`Staged::holds_written`], [`digest_of`] and
+    /// [`holds_first_bytes_of`] after each part they read.
     pub(super) fn during_read() {
         if let Some(f) = DURING_READ.with(|d| d.borrow_mut().take()) {
             f();
@@ -1635,6 +1684,101 @@ mod tests {
         }
     }
 
+    /// A file another program renames onto the name the new file is
+    /// checked under, while the new file is read back there, is seen
+    /// (M2-05 round 12, the class of a backup v2 commit's name checked
+    /// before its read, here not an instance): the name is a link to the
+    /// very file read, so the rename unlinks it there, which moves its
+    /// link count and change time, and the read's stamp shows it. While
+    /// the new file is read back under the file's name (after the swap,
+    /// after the rename where names cannot be swapped, and after a
+    /// create's link), another program renames its own file onto that
+    /// name. The call fails, never answering for a file the name no longer
+    /// holds, and that program's file is never removed: after the swap it is
+    /// swapped back out and kept under the temporary name (`moved_aside`),
+    /// and the old file has its name again; after a rename or a link it
+    /// keeps the name (`changed`).
+    #[test]
+    fn a_file_put_under_the_name_while_the_new_file_is_read_back_is_seen() {
+        for how in ["swap", "rename", "create"] {
+            let d = tempfile::tempdir_in("/tmp").unwrap();
+            let dir = File::open(d.path()).unwrap();
+            let p = d.path().join("settings.json");
+            let name = OsStr::new("settings.json");
+            let rel = Path::new("settings.json");
+            let (q, put) = (d.path().to_owned(), p.clone());
+            // Renames another program's file onto the name while the new
+            // file is read back there.
+            let arm = move || {
+                let (q, put) = (q.clone(), put.clone());
+                DURING_READ.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        let other = q.join("another-programs-save");
+                        std::fs::write(&other, b"theirs").unwrap();
+                        std::fs::rename(&other, &put).unwrap();
+                    }));
+                });
+            };
+            let mut armed = 0;
+            let e = if how == "create" {
+                // The create reads the new file back twice after its link
+                // (its temporary name is checked where it is moved, then
+                // removed) before its name's last check: the third read.
+                let mut observe = |at: Inside| {
+                    if at != Inside::Linked {
+                        return;
+                    }
+                    armed += 1;
+                    let arm = arm.clone();
+                    DURING_READ.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move || {
+                            DURING_READ.with(|h| {
+                                *h.borrow_mut() = Some(Box::new(arm));
+                            });
+                        }));
+                    });
+                };
+                create_in(&dir, rel, name, b"ours", 0o600, &mut observe).unwrap_err()
+            } else {
+                std::fs::write(&p, b"before").unwrap();
+                let stamp = FileStamp::of(&std::fs::symlink_metadata(&p).unwrap());
+                let mut fill = |w: &mut dyn Write| w.write_all(b"rewritten").map_err(|e| io(&e));
+                let (swap, at): (Swap, Inside) = if how == "swap" {
+                    (exchange_beneath, Inside::Exchanged)
+                } else {
+                    (cannot_swap, Inside::Checked)
+                };
+                replace_in_using(
+                    swap,
+                    &dir,
+                    rel,
+                    name,
+                    &mut fill,
+                    &stamp,
+                    None,
+                    &mut |step| {
+                        if step == at {
+                            armed += 1;
+                            arm();
+                        }
+                    },
+                )
+                .unwrap_err()
+            };
+            assert_eq!(armed, 1, "{how}");
+            DURING_READ.with(|h| assert!(h.borrow().is_none(), "{how}: never read back"));
+            if how == "swap" {
+                assert_eq!(e.kind, ModifyErrorKind::MovedAside, "{how}");
+                assert_eq!(std::fs::read(&p).unwrap(), b"before", "{how}");
+                let kept = temp_of(d.path(), "settings.json", "swap");
+                assert_eq!(std::fs::read(d.path().join(kept)).unwrap(), b"theirs");
+            } else {
+                assert_eq!(e.kind, ModifyErrorKind::Changed, "{how}");
+                assert_eq!(std::fs::read(&p).unwrap(), b"theirs", "{how}");
+            }
+        }
+    }
+
     /// A move to a fresh name never replaces a file that has that name: it
     /// fails, and both files stay as they were.
     #[test]
@@ -1767,6 +1911,132 @@ mod tests {
         );
         assert!(!staged.holds_written());
         assert!(!staged.intact());
+    }
+
+    /// The stamp a new file is read back with stands for the bytes read:
+    /// a write into it in place (at its length, its modification time put
+    /// back) made right after the read back, as soon as a program can,
+    /// moves it, every time. Linux stamps every change within one tick of
+    /// its clock alike, and the new file was changed within that tick (its
+    /// mode set), so this holds only because the read back waited for the
+    /// clock to move past the file's last change ([`clock_past`]). In the
+    /// directory `TMPDIR` names, so it can be run on a volume whose clock
+    /// stamps whole seconds.
+    #[test]
+    fn a_write_right_after_the_new_file_is_read_back_moves_its_stamp() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = File::open(d.path()).unwrap();
+        let body = vec![b'k'; 4096];
+        for i in 0..30u64 {
+            let mut fill = |w: &mut dyn Write| w.write_all(&body).map_err(|e| io(&e));
+            let temp = OsString::from(format!("..env.envcloak-new-{i:016x}.tmp"));
+            let staged = write_new_with(
+                &dir,
+                Path::new(".env"),
+                OsStr::new(".env"),
+                &temp,
+                0o600,
+                &mut fill,
+            )
+            .unwrap();
+            let stamp = staged.intact_stamp().unwrap();
+            write_into(&d.path().join(&temp), b"K");
+            assert!(
+                !staged.stamped(&stamp),
+                "a write right after the read back (file {i}) left the stamp as read"
+            );
+        }
+    }
+
+    /// A file written into while it is hashed, right after its last change
+    /// (in place, at its length, its modification time put back, in a part
+    /// already read), is never taken for the one hashed (`changed`), every
+    /// time: the hash waited for the file system's clock to move past the
+    /// file's last change, so the write moves its stamp. In the directory
+    /// `TMPDIR` names, as above.
+    #[test]
+    fn a_file_written_into_while_it_is_hashed_right_after_a_change_is_seen() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = File::open(d.path()).unwrap();
+        for i in 0..30 {
+            let p = d.path().join(format!("f{i}"));
+            std::fs::write(&p, vec![b'v'; 4096]).unwrap();
+            let mut f = File::open(&p).unwrap();
+            let stamp = FileStamp::of(&f.metadata().unwrap());
+            DURING_READ.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || write_into(&p, b"W")));
+            });
+            let got = digest_of(&mut f, &stamp, &dir);
+            assert!(DURING_READ.with(|h| h.borrow().is_none()));
+            assert_eq!(
+                got,
+                Err(ModifyErrorKind::Changed),
+                "file {i}: a file written into while it was hashed was taken for it"
+            );
+        }
+    }
+
+    /// A leftover written into while it is compared where it moved, right
+    /// after its last change (the move, or here another program giving it
+    /// its mode again just after the move), in place, in a part already
+    /// compared, at its length, its modification time put back, is kept,
+    /// every time: the comparison waited for the file system's clock to
+    /// move past the leftover's last change, so the write moves its stamp,
+    /// which is checked again before the unlink. In the directory `TMPDIR`
+    /// names, so it can be run on a volume whose clock stamps whole
+    /// seconds.
+    #[test]
+    fn a_leftover_written_into_while_it_is_compared_is_kept() {
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        for i in 0..20u64 {
+            let d = tempfile::tempdir().unwrap();
+            let dir = File::open(d.path()).unwrap();
+            let left = format!("..env.envcloak-new-{:016x}.tmp", 0x1000 + i);
+            std::fs::write(d.path().join(&left), &body[..3000]).unwrap();
+            let ours = OsString::from(format!("..env.envcloak-new-{:016x}.tmp", 0x2000 + i));
+            let mut fill = |w: &mut dyn Write| w.write_all(&body).map_err(|e| io(&e));
+            let staged = write_new_with(
+                &dir,
+                Path::new(".env"),
+                OsStr::new(".env"),
+                &ours,
+                0o600,
+                &mut fill,
+            )
+            .unwrap();
+            let q = d.path().to_owned();
+            let (left_os, ours_os) = (OsString::from(&left), ours.clone());
+            let mut armed = 0;
+            let removed = remove_leftovers(&dir, OsStr::new(".env"), &ours, &staged, &mut |at| {
+                if at != Inside::LeftoverMoved {
+                    return;
+                }
+                armed += 1;
+                let aside: Vec<OsString> = names_in(&q)
+                    .into_iter()
+                    .filter(|n| *n != left_os && *n != ours_os)
+                    .collect();
+                assert_eq!(aside.len(), 1, "{aside:?}");
+                let p = q.join(&aside[0]);
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+                DURING_READ.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || write_into(&p, &[0xff])));
+                });
+            });
+            assert_eq!(armed, 1, "leftover {i}");
+            assert!(DURING_READ.with(|h| h.borrow().is_none()), "leftover {i}");
+            assert_eq!(
+                removed, 0,
+                "leftover {i}: a leftover written into while it was compared was removed"
+            );
+            let kept: Vec<Vec<u8>> = names_in(d.path())
+                .into_iter()
+                .filter(|n| *n != ours)
+                .map(|n| std::fs::read(d.path().join(n)).unwrap())
+                .collect();
+            assert_eq!(kept.len(), 1, "leftover {i}");
+            assert_eq!(kept[0][0], 0xff, "leftover {i}");
+        }
     }
 
     /// A created file that keeps its temporary name too, because that name
