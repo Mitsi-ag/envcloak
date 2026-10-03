@@ -877,8 +877,10 @@ fn grants_expire_on_either_clock() {
 /// a decision or a sweep in between to remove the grant: a second before
 /// each deadline it holds; at the wall clock's (awake time short of its
 /// own) and at awake time's (the wall clock short of its own) it does
-/// not, though the grant is still in the store; nor after a policy epoch
-/// bump, for a revoked grant or for an id never issued.
+/// not, though the grant is still in the store. A grant an epoch bump
+/// removed (it is no longer in the store), a revoked grant and an id
+/// never issued are not in force: `in_force` holds only for a grant that
+/// is there.
 ///
 /// Mutations: compare only the wall clock (the awake case holds); only
 /// awake time (the wall case holds).
@@ -917,7 +919,8 @@ fn a_grant_is_in_force_until_either_deadline() {
     assert!(s.in_force(g, &now));
 
     s.set_policy_epoch(2);
-    assert!(!s.in_force(g, &now), "after a policy epoch bump");
+    assert!(s.grant(g).is_none(), "an epoch bump left the grant");
+    assert!(!s.in_force(g, &now), "removed by a policy epoch bump");
     let mut s = store();
     let g = approve(&mut s, r(), once(), &now).unwrap();
     assert_eq!(s.revoke(RevokeSelector::Id(g)), 1);
