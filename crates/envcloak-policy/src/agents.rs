@@ -32,6 +32,12 @@
 //! So a builtin `executables` pattern must name agents only: one that also
 //! matched a terminal multiplexer's executable would root grants at it.
 //! Errors are value-free: a kind and a line.
+//!
+//! Each entry also names its `product` ([`AgentLabel::product`], for
+//! coverage reporting) and, in the builtin catalog only, the
+//! `install_trees` its documented installers write to
+//! ([`AgentCatalog::within_install_tree`], for the Linux standing
+//! statement, M2 plan D-10). Neither changes what matches.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -67,6 +73,8 @@ const MAX_COMPONENTS: usize = 8;
 const MAX_PATTERN: usize = 256;
 /// Bytes in an agent's display name.
 const MAX_NAME: usize = 64;
+/// Components in an install tree.
+const MAX_TREE_COMPONENTS: usize = 16;
 /// How many arguments of an interpreter are looked at for its script:
 /// the first few that are not options, among the first few in all, which
 /// are all the kernel's view keeps after `argv[0]`
@@ -106,6 +114,12 @@ pub struct AgentLabel {
     pub id: String,
     /// The display name: `Claude Code`, ...
     pub name: String,
+    /// The product the entry belongs to, for coverage reporting (`agents
+    /// status`, the installers): `claude-code`, `cursor`, `kimi`, ... One
+    /// product can be several programs (Kimi Code and kimi-cli both run
+    /// as `kimi`, and their installer tells them apart by data root), and
+    /// it carries no version: the evidence never names one.
+    pub product: String,
     /// Whether a builtin entry matched, or only an extension did.
     pub source: CatalogSource,
     /// Whether the match rests on the executable, or only on what the
@@ -159,6 +173,12 @@ pub enum CatalogErrorKind {
     NotOwned,
     /// Writable by group or others.
     Writable,
+    /// An install tree that is not an absolute or `~/` path of names and
+    /// `*`.
+    InvalidInstallTree,
+    /// `install_trees` in an extension: only the builtin catalog says
+    /// where an agent's own installers put it (M2 plan D-10).
+    BuiltinOnly,
     /// Another I/O error.
     Io(io::ErrorKind),
 }
@@ -175,7 +195,8 @@ impl CatalogErrorKind {
             K::WrongType => "a value has the wrong type",
             K::MissingKey => "an agent needs an id, and a new agent a name",
             K::InvalidId => {
-                "invalid agent id: lowercase ASCII letters, digits and inner -, at most 32 bytes"
+                "invalid agent id or product: lowercase ASCII letters, digits and inner -, at \
+                 most 32 bytes"
             }
             K::InvalidName => {
                 "invalid agent name: 1 to 64 bytes, without control or invisible characters"
@@ -204,6 +225,11 @@ impl CatalogErrorKind {
             K::NotRegularFile => "the catalog file is not a regular file",
             K::NotOwned => "the catalog file is owned by another user",
             K::Writable => "the catalog file is writable by group or others",
+            K::InvalidInstallTree => {
+                "invalid install tree: /<path> or ~/<path>, components separated by /, each a \
+                 name or *, at most 16 components and 256 bytes"
+            }
+            K::BuiltinOnly => "install_trees may be set only in the builtin catalog",
             K::Io(_) => "cannot read the catalog file",
         }
     }
@@ -311,6 +337,79 @@ impl Pattern {
     }
 }
 
+/// Where an agent's own installers put it: a directory, as an absolute
+/// path (`/usr/local/lib/node_modules/@openai/codex`) or one under the
+/// home directory (`~/.local/share/claude/versions`), each component a
+/// name or `*` (any one component). An executable is in the tree when its
+/// path lies strictly below it (M2 plan D-10: the Linux standing
+/// statement refuses an identity outside every tree of its agent).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InstallTree {
+    /// Whether the path starts at the home directory.
+    home: bool,
+    components: Vec<Component>,
+}
+
+impl InstallTree {
+    fn parse(s: &str) -> Option<InstallTree> {
+        if s.len() > MAX_PATTERN {
+            return None;
+        }
+        let (home, rest) = match (s.strip_prefix("~/"), s.strip_prefix('/')) {
+            (Some(rest), _) => (true, rest),
+            (None, Some(rest)) => (false, rest),
+            (None, None) => return None,
+        };
+        let mut components = Vec::new();
+        for c in rest.split('/') {
+            if c.is_empty() || c == "." || c == ".." || c.chars().any(char::is_control) {
+                return None;
+            }
+            if c == "*" {
+                components.push(Component::Any);
+            } else if c.contains('*') {
+                return None;
+            } else {
+                components.push(Component::Name(c.as_bytes().to_vec()));
+            }
+        }
+        (components.len() <= MAX_TREE_COMPONENTS).then_some(InstallTree { home, components })
+    }
+
+    /// Whether `path` lies strictly below this tree. `path` must be
+    /// absolute and hold no `.` or `..` component (the kernel's paths do
+    /// not); `home` must be absolute too, or a `~/` tree matches nothing.
+    fn contains(&self, path: &Path, home: Option<&Path>) -> bool {
+        let comps = |p: &Path| -> Option<Vec<Vec<u8>>> {
+            let b = p.as_os_str().as_bytes();
+            if !b.starts_with(b"/") {
+                return None;
+            }
+            let parts: Vec<&[u8]> = b.split(|c| *c == b'/').filter(|c| !c.is_empty()).collect();
+            if parts.iter().any(|c| *c == b"." || *c == b"..") {
+                return None;
+            }
+            Some(parts.into_iter().map(<[u8]>::to_vec).collect())
+        };
+        let Some(path) = comps(path) else {
+            return false;
+        };
+        let mut want: Vec<Component> = Vec::new();
+        if self.home {
+            let Some(home) = home.and_then(comps) else {
+                return false;
+            };
+            want.extend(home.into_iter().map(Component::Name));
+        }
+        want.extend(self.components.iter().cloned());
+        path.len() > want.len()
+            && want.iter().zip(&path).all(|(w, c)| match w {
+                Component::Any => true,
+                Component::Name(n) => n == c,
+            })
+    }
+}
+
 /// A macOS code signature an agent is signed with.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Signature {
@@ -325,10 +424,13 @@ struct Signature {
 struct Agent {
     id: String,
     name: String,
+    product: String,
     executables: Vec<(Pattern, CatalogSource)>,
     scripts: Vec<(Pattern, CatalogSource)>,
     signatures: Vec<(Signature, CatalogSource)>,
     markers: Vec<(String, CatalogSource)>,
+    /// From the builtin catalog only ([`CatalogErrorKind::BuiltinOnly`]).
+    install_trees: Vec<InstallTree>,
 }
 
 /// The known agents. See the module documentation.
@@ -423,6 +525,20 @@ impl AgentCatalog {
                 Ok(file) if cat.agents.len() + file.new_ids(&cat) > MAX_AGENTS => {
                     cat.problem(name, CatalogErrorKind::TooMany.into());
                 }
+                Ok(file) if file.agents.iter().any(|a| !a.install_trees.is_empty()) => {
+                    let line = file
+                        .agents
+                        .iter()
+                        .find(|a| !a.install_trees.is_empty())
+                        .and_then(|a| a.line);
+                    cat.problem(
+                        name,
+                        CatalogError {
+                            kind: CatalogErrorKind::BuiltinOnly,
+                            line,
+                        },
+                    );
+                }
                 Ok(file) if file.unnamed_new(&cat).is_some() => {
                     let line = file.unnamed_new(&cat);
                     cat.problem(
@@ -455,6 +571,29 @@ impl AgentCatalog {
     /// The ids of the known agents, builtin first.
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         self.agents.iter().map(|a| a.id.as_str())
+    }
+
+    /// The product of agent `id` ([`AgentLabel::product`]), if the catalog
+    /// knows it.
+    pub fn product(&self, id: &str) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.product.as_str())
+    }
+
+    /// Whether `exe`, an absolute executable path as the kernel reports
+    /// it, lies within one of the install trees the builtin catalog lists
+    /// for agent `id`; `~/` trees start at `home`. `false` for an agent
+    /// with none, an unknown id, and a path with `.` or `..` components.
+    /// For the Linux standing statement (M2 plan D-10, task M2-15:
+    /// `identity_outside_install_tree`): a renamed copy of any program
+    /// matches an agent by path, never by where its installer put it.
+    pub fn within_install_tree(&self, id: &str, exe: &Path, home: Option<&Path>) -> bool {
+        self.agents
+            .iter()
+            .find(|a| a.id == id)
+            .is_some_and(|a| a.install_trees.iter().any(|t| t.contains(exe, home)))
     }
 
     /// Every environment marker the catalog knows, for the CLI's claims
@@ -606,6 +745,7 @@ impl AgentCatalog {
         for new in file.agents {
             let tag = |v: Vec<Pattern>| v.into_iter().map(|p| (p, source)).collect::<Vec<_>>();
             match self.agents.iter_mut().find(|a| a.id == new.id) {
+                // An existing agent keeps its name and product.
                 Some(a) => {
                     a.executables.extend(tag(new.executables));
                     a.scripts.extend(tag(new.scripts));
@@ -613,11 +753,14 @@ impl AgentCatalog {
                         .extend(new.signatures.into_iter().map(|s| (s, source)));
                     a.markers
                         .extend(new.markers.into_iter().map(|m| (m, source)));
+                    a.install_trees.extend(new.install_trees);
                 }
                 None => self.agents.push(Agent {
                     // A new agent always has a name: `load` refuses an
                     // extension without one, and the builtin file names each.
                     name: new.name.unwrap_or_else(|| new.id.clone()),
+                    product: new.product.unwrap_or_else(|| new.id.clone()),
+                    install_trees: new.install_trees,
                     id: new.id,
                     executables: tag(new.executables),
                     scripts: tag(new.scripts),
@@ -633,6 +776,7 @@ fn label(a: &Agent, source: CatalogSource, basis: MatchBasis) -> AgentLabel {
     AgentLabel {
         id: a.id.clone(),
         name: a.name.clone(),
+        product: a.product.clone(),
         source,
         basis,
     }
@@ -726,10 +870,12 @@ struct FileAgent {
     line: Option<u32>,
     id: String,
     name: Option<String>,
+    product: Option<String>,
     executables: Vec<Pattern>,
     scripts: Vec<Pattern>,
     signatures: Vec<Signature>,
     markers: Vec<String>,
+    install_trees: Vec<InstallTree>,
 }
 
 /// Line numbers for byte offsets into a file.
@@ -867,10 +1013,12 @@ fn agent(
         line: at,
         id: String::new(),
         name: None,
+        product: None,
         executables: Vec::new(),
         scripts: Vec::new(),
         signatures: Vec::new(),
         markers: Vec::new(),
+        install_trees: Vec::new(),
     };
     for (key, item) in t.iter() {
         let line = lines.key(t, key).or(at);
@@ -889,6 +1037,21 @@ fn agent(
                     return Err(lines.err(CatalogErrorKind::InvalidName, line));
                 }
                 a.name = Some(s.to_owned());
+            }
+            "product" => {
+                let s = item.as_str().ok_or_else(wrong)?;
+                if !valid_id(s) {
+                    return Err(lines.err(CatalogErrorKind::InvalidId, line));
+                }
+                a.product = Some(s.to_owned());
+            }
+            "install_trees" => {
+                for s in strings(lines, item, line)? {
+                    a.install_trees
+                        .push(InstallTree::parse(s).ok_or_else(|| {
+                            lines.err(CatalogErrorKind::InvalidInstallTree, line)
+                        })?);
+                }
             }
             "executables" | "scripts" => {
                 let mut v = Vec::new();
@@ -988,6 +1151,67 @@ mod tests {
         assert!(Pattern::parse("a/".repeat(8).trim_end_matches('/')).is_some());
         assert!(Pattern::parse("a/".repeat(9).trim_end_matches('/')).is_none());
         assert!(Pattern::parse(&"a".repeat(257)).is_none());
+    }
+
+    /// Install trees: absolute or `~/` paths of names and `*`; an
+    /// executable is in one when its path lies strictly below it, every
+    /// component compared byte for byte.
+    #[test]
+    fn install_trees_hold_paths_strictly_below_them() {
+        let home = Path::new("/home/u");
+        let t = InstallTree::parse("~/.local/share/claude/versions").unwrap();
+        assert!(t.contains(
+            Path::new("/home/u/.local/share/claude/versions/2.1.280"),
+            Some(home)
+        ));
+        for outside in [
+            "/home/u/.local/share/claude/versions",
+            "/home/u/.local/share/claude/version/2.1.280",
+            "/home/v/.local/share/claude/versions/2.1.280",
+            "/home/u/.local/share/claude/versions/../../../bin/claude",
+            "/home/u/.local/share/claude/versions/./x",
+            "relative/.local/share/claude/versions/x",
+            "/tmp/claude",
+        ] {
+            assert!(!t.contains(Path::new(outside), Some(home)), "{outside}");
+        }
+        // No home, or a relative one: a ~/ tree holds nothing.
+        let inside = Path::new("/home/u/.local/share/claude/versions/2.1.280");
+        assert!(!t.contains(inside, None));
+        assert!(!t.contains(inside, Some(Path::new("home/u"))));
+        // `*` is one component; absolute trees ignore the home directory.
+        let t = InstallTree::parse("/opt/*/lib/node_modules/@openai/codex").unwrap();
+        assert!(t.contains(
+            Path::new("/opt/v22/lib/node_modules/@openai/codex/bin/codex.js"),
+            None
+        ));
+        assert!(!t.contains(
+            Path::new("/opt/a/b/lib/node_modules/@openai/codex/bin/codex.js"),
+            None
+        ));
+        // A deleted executable's path keeps its directory.
+        let t = InstallTree::parse("/usr/local/bin").unwrap();
+        assert!(t.contains(Path::new("/usr/local/bin/copilot (deleted)"), None));
+        for bad in [
+            "",
+            "~",
+            "~/",
+            "/",
+            "relative/path",
+            "//x",
+            "/a//b",
+            "/a/./b",
+            "/a/../b",
+            "~x/y",
+            "/a/b*",
+            "/a\nb",
+            "~/a/",
+        ] {
+            assert!(InstallTree::parse(bad).is_none(), "{bad:?}");
+        }
+        assert!(InstallTree::parse(&format!("/{}", ["a"; 16].join("/"))).is_some());
+        assert!(InstallTree::parse(&format!("/{}", ["a"; 17].join("/"))).is_none());
+        assert!(InstallTree::parse(&format!("/{}", "a".repeat(256))).is_none());
     }
 
     #[test]

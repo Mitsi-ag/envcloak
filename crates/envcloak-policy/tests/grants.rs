@@ -38,6 +38,7 @@ fn label(id: &str) -> AgentLabel {
     AgentLabel {
         id: id.to_owned(),
         name: id.to_owned(),
+        product: id.to_owned(),
         source: CatalogSource::Builtin,
         basis: MatchBasis::Executable,
     }

@@ -29,6 +29,9 @@
 /crates/envcloak-policy/src/evidence.rs      @Mitsi-ag
 /crates/envcloak-sys/src/proc/               @Mitsi-ag
 /scripts/gen-agents.py                       @Mitsi-ag
+# The Linux executable SHA-256 each ancestor's identity records (M2 plan
+# D-09), which standing approvals will name (D-10).
+/crates/envcloak-daemon/src/exe_hash.rs      @Mitsi-ag
 
 # M2 plan D-02 (F-75): the crate graph is one-way, and a new edge between
 # workspace crates is a plan change, never a table edit inside a feature

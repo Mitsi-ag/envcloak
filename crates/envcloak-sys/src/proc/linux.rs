@@ -67,8 +67,15 @@ fn exe(pid: i32) -> Option<ExeIdentity> {
     Some(ExeIdentity {
         path,
         file,
+        sha256: None,
         signature: None,
     })
+}
+
+pub(super) fn open_exe(pid: i32) -> io::Result<File> {
+    // `File::open` is read-only and close-on-exec. Opening the link opens
+    // the file the process runs, not whatever its path names now.
+    open_proc(pid, "exe")
 }
 
 pub(super) fn proc_info(pid: i32) -> io::Result<ProcInfo> {

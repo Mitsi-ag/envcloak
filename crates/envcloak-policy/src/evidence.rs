@@ -85,6 +85,20 @@
 //! manager or `setsid` is neither an agent nor an orphan, but it has no
 //! terminal, so no person could have typed its proof.
 //!
+//! **Executable identity** ([`gather_hashed`], SPEC §6.1 step 3): on
+//! Linux the daemon also records the SHA-256 of each ancestor's
+//! executable ([`envcloak_sys::ExeIdentity::sha256`]), through an
+//! [`ExeHasher`] it supplies (a cache and a per-request budget, M2 plan
+//! D-09). Hashing comes after the walk, so each identity is checked
+//! against it: the hasher compares the file it opened with the device and
+//! inode the walk read, and once every hash is taken the walk's start
+//! times are read again; an ancestor whose process exited or ran another
+//! file meanwhile keeps no hash. An identity that is not known (no hasher,
+//! another user's process, a non-dumpable one, a file too large, a budget
+//! spent, a change while it was read) is `None`, which never changes the
+//! root, the kind, the label or a proof refusal: identity is recorded,
+//! not matched (docs/AGENTS.md).
+//!
 //! The Linux CLI makes itself non-dumpable, so its own `exe` is hidden
 //! from the daemon; its `stat` and `cmdline` are not, and the walk starts
 //! there. Arguments are read only for processes whose executable is hidden
@@ -708,6 +722,16 @@ fn roots_above_session(a: &Ancestor) -> bool {
         .is_some_and(AgentLabel::may_root_above_session)
 }
 
+/// Reads the SHA-256 of a process's executable, which the walk does not
+/// (see the module documentation): the daemon's implementation reads it
+/// through a descriptor of the file the process runs, with a cache and a
+/// per-request budget (M2 plan D-09).
+pub trait ExeHasher {
+    /// The SHA-256 of the file `p` runs, the file the walk saw (`p.exe`'s
+    /// device and inode), or `None` when it is not known.
+    fn sha256(&mut self, p: &ProcInfo) -> Option<[u8; 32]>;
+}
+
 /// Gathers the evidence for `peer` from the live process table: see
 /// [`gather_in`].
 ///
@@ -728,9 +752,44 @@ fn classifiable(p: &ProcInfo, uid: u32) -> bool {
     p.uid == uid
 }
 
+/// [`gather`], with each ancestor's executable hashed by `hasher`: see
+/// [`gather_in_hashed`].
+///
+/// # Errors
+/// As [`gather_in`].
+pub fn gather_hashed(
+    peer: &PeerIdentity,
+    claims: Claims,
+    cat: &AgentCatalog,
+    hasher: &mut dyn ExeHasher,
+) -> Result<SubjectEvidence, EvidenceError> {
+    gather_in_hashed(&mut LiveProcesses, peer, claims, cat, hasher)
+}
+
+/// [`gather_in`], and then, for each process of the caller's uid whose
+/// executable's device and inode the walk read, its SHA-256 from
+/// `hasher`, nearest the caller first. Once every hash is taken, each
+/// hashed process is read from `table` again: one that no longer has the
+/// start time and the executable file the walk saw (it exited, its pid was
+/// reused, it ran another file) keeps no hash. Nothing else changes: the
+/// root, the kind, the labels and the proof refusals are those
+/// [`gather_in`] gives.
+///
+/// # Errors
+/// As [`gather_in`].
+pub fn gather_in_hashed(
+    table: &mut dyn ProcessTable,
+    peer: &PeerIdentity,
+    claims: Claims,
+    cat: &AgentCatalog,
+    hasher: &mut dyn ExeHasher,
+) -> Result<SubjectEvidence, EvidenceError> {
+    gather_with(table, peer, claims, cat, Some(hasher))
+}
+
 /// Walks `peer`'s ancestry in `table` (up to [`GATHER_ATTEMPTS`] times
 /// while it changes under the walk), classifies it with `cat`, and adds
-/// `claims`.
+/// `claims`. Executables are not hashed: see [`gather_in_hashed`].
 ///
 /// # Errors
 /// [`EvidenceError::CallerGone`] when the peer is no longer the process
@@ -744,6 +803,50 @@ pub fn gather_in(
     claims: Claims,
     cat: &AgentCatalog,
 ) -> Result<SubjectEvidence, EvidenceError> {
+    gather_with(table, peer, claims, cat, None)
+}
+
+/// Hashes each process of the caller's uid in `procs` whose executable
+/// file the walk read, then drops each hash whose process `table` no
+/// longer shows with the start time and the file the walk saw.
+fn hash_executables(
+    table: &mut dyn ProcessTable,
+    procs: &mut [ProcInfo],
+    uid: u32,
+    hasher: &mut dyn ExeHasher,
+) {
+    for p in procs.iter_mut() {
+        if !classifiable(p, uid) || p.exe.as_ref().and_then(|e| e.file).is_none() {
+            continue;
+        }
+        let digest = hasher.sha256(p);
+        if let Some(exe) = p.exe.as_mut() {
+            exe.sha256 = digest;
+        }
+    }
+    for p in procs.iter_mut() {
+        let Some(exe) = p.exe.as_mut() else {
+            continue;
+        };
+        if exe.sha256.is_none() {
+            continue;
+        }
+        let same = table.info(p.pid).is_ok_and(|again| {
+            again.start_time == p.start_time && again.exe.as_ref().and_then(|e| e.file) == exe.file
+        });
+        if !same {
+            exe.sha256 = None;
+        }
+    }
+}
+
+fn gather_with(
+    table: &mut dyn ProcessTable,
+    peer: &PeerIdentity,
+    claims: Claims,
+    cat: &AgentCatalog,
+    hasher: Option<&mut dyn ExeHasher>,
+) -> Result<SubjectEvidence, EvidenceError> {
     let want_argv = |p: &ProcInfo| classifiable(p, peer.uid) && cat.needs_argv(p);
     let mut procs = None;
     for _ in 0..GATHER_ATTEMPTS {
@@ -756,7 +859,10 @@ pub fn gather_in(
             Err(e) => return Err(e.into()),
         }
     }
-    let procs = procs.ok_or(EvidenceError::Changed)?;
+    let mut procs = procs.ok_or(EvidenceError::Changed)?;
+    if let Some(hasher) = hasher {
+        hash_executables(table, &mut procs, peer.uid, hasher);
+    }
     let end = if reaches_top(&procs) {
         ChainEnd::Top
     } else {

@@ -13,9 +13,10 @@
 //!     signature the kernel validated at exec (`csops`: signing identifier,
 //!     Team ID and cdhash). Arguments come from `KERN_PROCARGS2`.
 //!   - Linux: `/proc/<pid>/stat` and `status`, and `/proc/<pid>/exe` for
-//!     the executable's path and its device and inode. A process that made
-//!     itself non-dumpable (the EnvCloak CLI does) or belongs to another
-//!     user keeps its `exe` from us; its `stat` and `cmdline` stay
+//!     the executable's path and its device and inode; [`open_exe`] opens
+//!     that file itself, for its SHA-256 (the daemon hashes it). A process
+//!     that made itself non-dumpable (the EnvCloak CLI does) or belongs to
+//!     another user keeps its `exe` from us; its `stat` and `cmdline` stay
 //!     readable. Arguments come from `/proc/<pid>/cmdline`.
 //! - [`ancestry`]: the chain from a connected peer up to the top of the
 //!   process tree, re-validated after the walk. Neither kernel offers a
@@ -128,13 +129,74 @@ pub struct ExeIdentity {
     /// file was removed).
     pub path: PathBuf,
     /// Linux: the device and inode of the file the process runs, read
-    /// through `/proc/<pid>/exe`. `None` on macOS. The executable's
-    /// SHA-256, which SPEC §6.1 also names, is deferred to M2 (see
-    /// docs/AGENTS.md "Limits").
+    /// through `/proc/<pid>/exe`. `None` on macOS.
     pub file: Option<(u64, u64)>,
+    /// Linux: the SHA-256 of the file the process runs (SPEC §6.1 step 3),
+    /// read through a descriptor of that file ([`open_exe`]), never its
+    /// path. [`proc_info`] leaves it `None`: hashing is the daemon's, with
+    /// a cache and a budget (M2 plan D-09; docs/AGENTS.md "The executable's
+    /// SHA-256"), and `None` there means the identity is unknown. Always
+    /// `None` on macOS, where the code signature's cdhash names the build.
+    pub sha256: Option<[u8; 32]>,
     /// macOS: see [`CodeSignature`]. `None` on Linux and for unsigned or
     /// invalid signatures.
     pub signature: Option<CodeSignature>,
+}
+
+/// One state of a file, as `fstat` shows it: its device, inode, size and
+/// change time (seconds, nanoseconds). The executable hash cache is keyed
+/// by it (M2 plan D-09). No program can set a change time, and every
+/// write, truncation, link or permission change moves it once the file
+/// system's clock has moved past the file's last change
+/// ([`crate::wait_for_clock_past`]); a rename over the path gives another
+/// inode. The modification time is left out: a program can put it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileKey {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub ctime: (i64, i64),
+}
+
+impl FileKey {
+    /// The key of the open file `f` now (`fstat`).
+    ///
+    /// # Errors
+    /// When `fstat` fails.
+    pub fn of(f: &std::fs::File) -> io::Result<FileKey> {
+        use std::os::unix::fs::MetadataExt;
+        let m = f.metadata()?;
+        Ok(FileKey {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        })
+    }
+}
+
+/// Opens, read-only and close-on-exec, the file process `pid` runs: on
+/// Linux through `/proc/<pid>/exe`, which opens the file itself, even when
+/// it was renamed or removed since the process started it. The kernel
+/// allows it only to a reader that may trace the process, so not for
+/// another user's process or a non-dumpable one (the EnvCloak CLI).
+///
+/// # Errors
+/// [`io::ErrorKind::NotFound`] when there is no such process; others when
+/// the kernel refuses; [`io::ErrorKind::Unsupported`] on macOS, where the
+/// code signature's cdhash names the build.
+pub fn open_exe(pid: i32) -> io::Result<std::fs::File> {
+    if pid <= 0 {
+        return Err(io::ErrorKind::NotFound.into());
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        linux::open_exe(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// One process, as the kernel reported it at one moment.

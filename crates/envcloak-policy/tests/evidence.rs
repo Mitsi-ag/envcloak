@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use envcloak_policy::{
     AGENTS_DIR, AgentCatalog, AgentLabel, Ancestor, CatalogSource, ChainEnd, Claims, EvidenceError,
-    GATHER_ATTEMPTS, MatchBasis, ProcessInstance, ProofRefusal, SubjectEvidence, SubjectKind,
-    gather_in,
+    ExeHasher, GATHER_ATTEMPTS, MatchBasis, ProcessInstance, ProofRefusal, SubjectEvidence,
+    SubjectKind, gather_in, gather_in_hashed,
 };
 use envcloak_sys::{
     Argv, CodeSignature, ExeIdentity, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo,
@@ -35,6 +35,7 @@ fn label(id: &str, source: CatalogSource, basis: MatchBasis) -> AgentLabel {
     AgentLabel {
         id: id.to_owned(),
         name: id.to_owned(),
+        product: id.to_owned(),
         source,
         basis,
     }
@@ -902,6 +903,7 @@ fn a_process_instance_is_keyed_by_pid_and_start_time() {
         Some(ExeIdentity {
             path: PathBuf::from(path),
             file: Some((1, 2)),
+            sha256: None,
             signature: None,
         })
     };
@@ -1167,6 +1169,7 @@ fn info(pid: i32, ppid: i32, sid: i32, uid: u32, exe: Option<&str>) -> ProcInfo 
         exe: exe.map(|e| ExeIdentity {
             path: PathBuf::from(e),
             file: None,
+            sha256: None,
             signature: None,
         }),
         argv: None,
@@ -1660,5 +1663,184 @@ fn a_caller_that_is_gone_is_refused_at_once() {
     assert_eq!(
         gather_in(&mut t, &peer(91), Claims::none(), &cat).unwrap_err(),
         EvidenceError::CallerGone
+    );
+}
+
+/// A hasher a test scripts: a digest per pid, every pid it is asked for
+/// recorded.
+#[derive(Default)]
+struct Hasher {
+    digests: HashMap<i32, [u8; 32]>,
+    asked: Vec<i32>,
+}
+
+impl ExeHasher for Hasher {
+    fn sha256(&mut self, p: &ProcInfo) -> Option<[u8; 32]> {
+        self.asked.push(p.pid);
+        self.digests.get(&p.pid).copied()
+    }
+}
+
+/// `p` with its executable's device and inode read, as the Linux walk
+/// reads them.
+fn with_file(mut p: ProcInfo, file: (u64, u64)) -> ProcInfo {
+    p.exe.as_mut().unwrap().file = Some(file);
+    p
+}
+
+/// [`table`] with each executable's device and inode, as on Linux, and
+/// `extra` answers for pid 70 and 80 after the two reads of the walk.
+fn linux_table(extra70: Option<ProcInfo>, extra80: Option<ProcInfo>) -> Table {
+    let node = with_file(info(80, 70, 70, 501, Some("/usr/bin/node")), (1, 80));
+    let zsh = with_file(info(70, 60, 70, 501, Some("/bin/zsh")), (1, 70));
+    let answers = |p: ProcInfo, extra: Option<ProcInfo>| {
+        let mut v = vec![p.clone(), p];
+        v.extend(extra);
+        v
+    };
+    Table::default()
+        .add(vec![info(90, 80, 70, 501, None)])
+        .add(answers(node, extra80))
+        .add(answers(zsh, extra70))
+        .add(vec![with_file(
+            info(60, 1, 60, 0, Some("/usr/local/bin/claude")),
+            (1, 60),
+        )])
+        .add(vec![info(1, 0, 1, 0, Some("/sbin/launchd"))])
+        .with_argv(90, vec!["envcloak", "run", "--", "npm", "test"])
+        .with_argv(
+            80,
+            vec![
+                "node",
+                "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+            ],
+        )
+}
+
+fn digest(e: &SubjectEvidence, pid: i32) -> Option<[u8; 32]> {
+    e.chain()
+        .iter()
+        .find(|a| a.instance.pid == pid)
+        .and_then(|a| a.instance.exe.as_ref())
+        .and_then(|x| x.sha256)
+}
+
+/// SPEC §6.1 step 3: the walk records the SHA-256 of each executable of
+/// the caller's uid whose device and inode it read (Linux), nearest the
+/// caller first; not the hidden caller's, nor another user's. The
+/// classification is the one the walk without hashing gives, and an
+/// identity that is not known (a hasher that answers nothing: a budget
+/// spent, a file too large) leaves the evidence exactly as that walk's.
+#[test]
+fn gather_records_executable_digests_and_classifies_alike() {
+    let cat = AgentCatalog::builtin();
+    let plain = gather_in(
+        &mut linux_table(None, None),
+        &peer(90),
+        Claims::none(),
+        &cat,
+    )
+    .unwrap();
+    let mut h = Hasher::default();
+    h.digests.insert(80, [8; 32]);
+    h.digests.insert(70, [7; 32]);
+    h.digests.insert(60, [6; 32]);
+    let hashed = gather_in_hashed(
+        &mut linux_table(None, None),
+        &peer(90),
+        Claims::none(),
+        &cat,
+        &mut h,
+    )
+    .unwrap();
+    assert_eq!(h.asked, [80, 70], "the caller's uid only, nearest first");
+    assert_eq!(digest(&hashed, 80), Some([8; 32]));
+    assert_eq!(digest(&hashed, 70), Some([7; 32]));
+    assert_eq!(digest(&hashed, 60), None, "another user's process");
+    assert_eq!(digest(&hashed, 90), None, "a hidden executable");
+    assert_eq!(hashed.kind(), plain.kind());
+    assert!(hashed.root().same(&plain.root()));
+    assert_eq!(hashed.label(), plain.label());
+    assert_eq!(hashed.proof_refusal(), plain.proof_refusal());
+    for a in plain.chain() {
+        for kind in [
+            SubjectKind::Agent,
+            SubjectKind::Terminal,
+            SubjectKind::Unknown,
+        ] {
+            assert_eq!(
+                hashed.covered_by(&a.instance, kind),
+                plain.covered_by(&a.instance, kind)
+            );
+        }
+    }
+    // Unknown identities: the evidence is the plain walk's, field for
+    // field.
+    let mut unknown = Hasher::default();
+    let none = gather_in_hashed(
+        &mut linux_table(None, None),
+        &peer(90),
+        Claims::none(),
+        &cat,
+        &mut unknown,
+    )
+    .unwrap();
+    assert_eq!(unknown.asked, [80, 70]);
+    assert_eq!(none, plain);
+    // Without a device and inode (macOS), nothing is asked.
+    let mut mac = Hasher::default();
+    gather_in_hashed(&mut table(), &peer(90), Claims::none(), &cat, &mut mac).unwrap();
+    assert!(mac.asked.is_empty());
+}
+
+/// Start times are read again after hashing: a process that exited (its
+/// pid now another process's) or that runs another file since the walk
+/// keeps no digest, and the rest of the evidence is unchanged. Mutation
+/// checked: skipping the re-read after hashing fails this test.
+#[test]
+fn a_digest_is_dropped_when_its_process_changed_while_hashing() {
+    let cat = AgentCatalog::builtin();
+    let mut reused = with_file(info(70, 60, 70, 501, Some("/bin/zsh")), (1, 70));
+    reused.start_time = StartTime::from_raw(99_999);
+    let execd = with_file(info(80, 70, 70, 501, Some("/usr/bin/node")), (1, 81));
+    let mut h = Hasher::default();
+    h.digests.insert(80, [8; 32]);
+    h.digests.insert(70, [7; 32]);
+    let e = gather_in_hashed(
+        &mut linux_table(Some(reused), Some(execd)),
+        &peer(90),
+        Claims::none(),
+        &cat,
+        &mut h,
+    )
+    .unwrap();
+    assert_eq!(h.asked, [80, 70]);
+    assert_eq!(digest(&e, 70), None, "its pid is another process's");
+    assert_eq!(digest(&e, 80), None, "it runs another file");
+    let plain = gather_in(
+        &mut linux_table(None, None),
+        &peer(90),
+        Claims::none(),
+        &cat,
+    )
+    .unwrap();
+    assert_eq!(e, plain);
+    // The control: unchanged, both keep their digests.
+    let mut h = Hasher::default();
+    h.digests.insert(80, [8; 32]);
+    h.digests.insert(70, [7; 32]);
+    let same70 = with_file(info(70, 60, 70, 501, Some("/bin/zsh")), (1, 70));
+    let same80 = with_file(info(80, 70, 70, 501, Some("/usr/bin/node")), (1, 80));
+    let e = gather_in_hashed(
+        &mut linux_table(Some(same70), Some(same80)),
+        &peer(90),
+        Claims::none(),
+        &cat,
+        &mut h,
+    )
+    .unwrap();
+    assert_eq!(
+        (digest(&e, 70), digest(&e, 80)),
+        (Some([7; 32]), Some([8; 32]))
     );
 }

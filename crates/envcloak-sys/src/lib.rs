@@ -38,8 +38,10 @@
 //!   (nothing inherited reaches the command), [`inherit_on_spawn`] (one
 //!   descriptor handed to one child) and [`pipe_cloexec`].
 //! - Caller evidence: [`proc_info`] and [`proc_argv`] (one process as the
-//!   kernel reports it) and [`ancestry`] (a peer's parent chain, checked
-//!   again after the walk); [`process_running`] and [`ProcessWatch`]
+//!   kernel reports it), [`open_exe`] and [`FileKey`] (a descriptor of the
+//!   file a process runs, and that file's state, for its SHA-256 on Linux)
+//!   and [`ancestry`] (a peer's parent chain, checked again after the
+//!   walk); [`process_running`] and [`ProcessWatch`]
 //!   (whether a process instance still runs, a zombie being one that does
 //!   not; a pidfd on Linux).
 //! - The runner (`envcloak run`): [`SignalRelay`] (signals caught and
@@ -119,10 +121,11 @@ pub use peer::{
 };
 pub use perm::{PRIVATE_UMASK, effective_uid, restrict_umask};
 pub use proc::{
-    AncestryError, Argv, CDHASH_LEN, CodeSignature, ExeIdentity, LiveProcesses, MAX_ANCESTRY,
-    MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, ProcInfo, ProcessTable, StatFields, ancestry,
-    ancestry_in, parse_cmdline, parse_proc_stat, parse_procargs2, parse_stat_state,
-    parse_status_euid, proc_argv, proc_info, process_running, reaches_top, stat_state_exited,
+    AncestryError, Argv, CDHASH_LEN, CodeSignature, ExeIdentity, FileKey, LiveProcesses,
+    MAX_ANCESTRY, MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, ProcInfo, ProcessTable, StatFields,
+    ancestry, ancestry_in, open_exe, parse_cmdline, parse_proc_stat, parse_procargs2,
+    parse_stat_state, parse_status_euid, proc_argv, proc_info, process_running, reaches_top,
+    stat_state_exited,
 };
 pub use signal::{
     TerminationSignals, TerminationWatch, exit_by_signal, interrupt_ends_process,

@@ -1147,6 +1147,7 @@ fn anc(pid: i32, sid: i32, agent: bool) -> Ancestor {
         agent: agent.then(|| AgentLabel {
             id: "fixture".to_owned(),
             name: "fixture".to_owned(),
+            product: "fixture".to_owned(),
             source: CatalogSource::Builtin,
             basis: MatchBasis::Executable,
         }),
