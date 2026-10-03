@@ -425,8 +425,13 @@ fn install_then_uninstall_gives_every_byte_back() {
     ] {
         let (outcome, _, backup) = outcome_of(&v, p);
         assert_eq!(outcome, "changed", "{p}: {v}");
-        let id = backup.as_str().unwrap_or_else(|| panic!("{p} has no backup: {v}"));
-        assert!(backups.iter().any(|b| b == id), "{p}: {id} not in {backups:?}");
+        let id = backup
+            .as_str()
+            .unwrap_or_else(|| panic!("{p} has no backup: {v}"));
+        assert!(
+            backups.iter().any(|b| b == id),
+            "{p}: {id} not in {backups:?}"
+        );
     }
     assert_eq!(backups.len(), 5, "{backups:?}");
     for p in ["~/.codex/hooks.json", "~/.codex/rules/envcloak.rules"] {
@@ -475,7 +480,10 @@ fn install_then_uninstall_gives_every_byte_back() {
     }
     let text = f.text(".claude/settings.json");
     assert!(!text.contains("excludedCommands"));
-    assert!(!text.contains("mcp__envcloak"), "no approval of an EnvCloak tool");
+    assert!(
+        !text.contains("mcp__envcloak"),
+        "no approval of an EnvCloak tool"
+    );
     // ~/.claude.json: EnvCloak's server as written, the other one as it was.
     let cj = f.json(".claude.json");
     assert_eq!(
@@ -504,7 +512,10 @@ fn install_then_uninstall_gives_every_byte_back() {
     assert!(toml.starts_with(&config_toml()), "{toml}");
     let table = envcloak_table(&toml);
     assert!(table.contains(&format!("command = \"{me}\"")), "{table}");
-    assert!(table.contains(r#"args = ["mcp", "--host", "codex"]"#), "{table}");
+    assert!(
+        table.contains(r#"args = ["mcp", "--host", "codex"]"#),
+        "{table}"
+    );
     assert!(table.contains("tool_timeout_sec = 60"), "{table}");
     assert!(!table.contains("approval"), "{table}");
     assert_eq!(
@@ -547,7 +558,11 @@ fn install_then_uninstall_gives_every_byte_back() {
         assert!(!f.path(p).exists(), "{p} is still there");
     }
     for host in ["claude", "codex"] {
-        assert_eq!(stdout(&f.host(host, &["mcp", "list"])).trim(), "other", "{host}");
+        assert_eq!(
+            stdout(&f.host(host, &["mcp", "list"])).trim(),
+            "other",
+            "{host}"
+        );
     }
     // Nothing left to take out.
     let (u2, code) = f.report(&["uninstall", "--yes"]);
@@ -594,7 +609,10 @@ fn a_change_made_since_is_kept_and_a_fresh_one_is_waited_for() {
         "{u}"
     );
     // CLAUDE.md is no host file: its block is taken out, the rest kept.
-    assert_eq!(f.text(".claude/CLAUDE.md"), format!("{CLAUDE_MD}\nMore of mine.\n"));
+    assert_eq!(
+        f.text(".claude/CLAUDE.md"),
+        format!("{CLAUDE_MD}\nMore of mine.\n")
+    );
     // Two minutes on, settings.json loses EnvCloak's entries only.
     age(&f.path(".claude/settings.json"), OLD);
     let (u, code) = f.report(&["uninstall", "--yes"]);
@@ -662,7 +680,11 @@ fn files_it_must_not_change_are_reported_and_left_alone() {
         ("~/.codex/AGENTS.md", "too_large"),
     ] {
         let (outcome, reason, backup) = outcome_of(&v, p);
-        assert_eq!((outcome.as_str(), reason), ("refused", json!(why)), "{p}: {v}");
+        assert_eq!(
+            (outcome.as_str(), reason),
+            ("refused", json!(why)),
+            "{p}: {v}"
+        );
         assert!(backup.is_null(), "{p}: {v}");
     }
     let now: Vec<Vec<u8>> = [
@@ -717,9 +739,14 @@ fn the_codex_block_is_not_written_beside_an_override() {
     std::fs::write(f.path(".codex/AGENTS.override.md"), "# Override\n").unwrap();
     let (v, code) = f.report(&["install", "--agent", "codex", "--yes"]);
     assert_eq!(code, 0, "{v}");
-    assert!(notes(&v, "codex").contains(&"override_file".to_owned()), "{v}");
     assert!(
-        !outcomes(&v).iter().any(|(_, p, _, _)| p.ends_with("AGENTS.md")),
+        notes(&v, "codex").contains(&"override_file".to_owned()),
+        "{v}"
+    );
+    assert!(
+        !outcomes(&v)
+            .iter()
+            .any(|(_, p, _, _)| p.ends_with("AGENTS.md")),
         "{v}"
     );
     assert_eq!(f.text(".codex/AGENTS.md"), CODEX_AGENTS_MD);
@@ -784,7 +811,10 @@ fn socket_allowances_follow_k01() {
                 );
                 assert_eq!(toml.matches("= \"allow\"").count(), 1, "{toml}");
             } else {
-                assert!(notes(&v, "codex").contains(&"consent_needed".to_owned()), "{v}");
+                assert!(
+                    notes(&v, "codex").contains(&"consent_needed".to_owned()),
+                    "{v}"
+                );
             }
         }
         // The person's own settings, as they were.
@@ -815,7 +845,10 @@ fn no_approval_setting_is_written_for_envcloak() {
     assert!(toml.contains(OTHER_SERVER), "{toml}");
     let settings = f.text(".claude/settings.json");
     assert!(!settings.contains("mcp__envcloak"), "{settings}");
-    assert!(!settings.contains("\"allow\": [\n      \"mcp__other__lookup\",\n      \"Bash(npm test)\",") );
+    assert!(
+        !settings
+            .contains("\"allow\": [\n      \"mcp__other__lookup\",\n      \"Bash(npm test)\",")
+    );
     let cj = f.json(".claude.json");
     let entry = cj["mcpServers"]["envcloak"].as_object().unwrap();
     let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
@@ -844,7 +877,11 @@ fn the_project_scope_writes_where_the_project_already_keeps_instructions() {
     std::fs::write(both.join("AGENTS.md"), "# A\n").unwrap();
     std::fs::write(both.join("CLAUDE.md"), "# C\n").unwrap();
     for (dir, present, absent) in [
-        (&lone, &["AGENTS.md"][..], &["CLAUDE.md", "CLAUDE.local.md"][..]),
+        (
+            &lone,
+            &["AGENTS.md"][..],
+            &["CLAUDE.md", "CLAUDE.local.md"][..],
+        ),
         (&claude, &["CLAUDE.md"], &["AGENTS.md"]),
         (&both, &["AGENTS.md", "CLAUDE.md"], &[]),
         (&none, &["AGENTS.md"], &["CLAUDE.md"]),
@@ -857,7 +894,11 @@ fn the_project_scope_writes_where_the_project_already_keeps_instructions() {
         assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
         for n in present {
             let t = std::fs::read_to_string(dir.join(n)).unwrap();
-            assert!(t.ends_with(&blocks::block()), "{}: {t}", dir.join(n).display());
+            assert!(
+                t.ends_with(&blocks::block()),
+                "{}: {t}",
+                dir.join(n).display()
+            );
         }
         for n in absent {
             assert!(!dir.join(n).exists(), "{}", dir.join(n).display());
@@ -867,7 +908,12 @@ fn the_project_scope_writes_where_the_project_already_keeps_instructions() {
         let out = f.agents_in(dir, &["uninstall", "--project", "--yes"]);
         assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
         for (n, b) in present.iter().zip(&before) {
-            assert_eq!(&std::fs::read(dir.join(n)).ok(), b, "{}", dir.join(n).display());
+            assert_eq!(
+                &std::fs::read(dir.join(n)).ok(),
+                b,
+                "{}",
+                dir.join(n).display()
+            );
         }
     }
     f.sweep();
@@ -883,7 +929,8 @@ fn the_project_scope_writes_where_the_project_already_keeps_instructions() {
 fn every_command_the_block_names_is_shipped() {
     let block = blocks::block();
     assert!(!block.contains("--ask"));
-    let snapshot = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/instruction-block.md");
+    let snapshot =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/instruction-block.md");
     assert_eq!(
         block,
         std::fs::read_to_string(&snapshot).unwrap(),
@@ -905,7 +952,10 @@ fn every_command_the_block_names_is_shipped() {
         // Its own usage line (`ls` takes no --help and prints it as a
         // usage error): dispatched to the command, not to a stub.
         let both = format!("{}{}", stdout(&out), stderr(&out));
-        assert!(both.contains(&format!("usage: envcloak {cmd} ")), "{cmd}: {both}");
+        assert!(
+            both.contains(&format!("usage: envcloak {cmd} ")),
+            "{cmd}: {both}"
+        );
     }
 }
 

@@ -198,8 +198,17 @@ fn the_installer_on_the_hosts_own_configs() {
             let out = a.host_cli(&["mcp", "list"]);
             let said = text(&out);
             assert!(out.status.success(), "{said}");
-            assert!(said.contains("other"), "{:?} lost the other server: {said}", a.host);
-            assert_eq!(said.contains("envcloak"), want_envcloak, "{:?}: {said}", a.host);
+            assert!(
+                said.contains("other"),
+                "{:?} lost the other server: {said}",
+                a.host
+            );
+            assert_eq!(
+                said.contains("envcloak"),
+                want_envcloak,
+                "{:?}: {said}",
+                a.host
+            );
         }
     };
     lists(false);
@@ -268,7 +277,10 @@ fn the_installer_on_the_hosts_own_configs() {
     let (u, code) = agents(&mut h, &bin, &tmp, &["uninstall", "--yes"]);
     assert_eq!(code, 0, "{u}");
     for (f, b) in FILES.iter().zip(&before) {
-        assert!(&std::fs::read(home.join(f)).unwrap() == b, "{f} is not as it was");
+        assert!(
+            &std::fs::read(home.join(f)).unwrap() == b,
+            "{f} is not as it was"
+        );
     }
     for f in CREATED {
         assert!(!home.join(f).exists(), "{f}");
@@ -321,7 +333,11 @@ fn the_installer_on_the_hosts_own_configs() {
             a.host
         );
         let control = last_tool_output(&request(&run, "step 2"));
-        assert!(control.contains("ecctl-hook-control"), "{:?}: {control}", a.host);
+        assert!(
+            control.contains("ecctl-hook-control"),
+            "{:?}: {control}",
+            a.host
+        );
         println!(
             "measurement: {:?} {} after agents install: {command} denied by EnvCloak's hook, the \
              control ran",
@@ -330,7 +346,12 @@ fn the_installer_on_the_hosts_own_configs() {
 
         // A prompt holding a key-shaped token never reaches the model.
         let prompt = format!("Deploy with {}", pasted.as_str());
-        let blocked = a.run(&json!({"steps": [{"say": "not blocked"}]}), &prompt, &flags, &home);
+        let blocked = a.run(
+            &json!({"steps": [{"say": "not blocked"}]}),
+            &prompt,
+            &flags,
+            &home,
+        );
         assert!(
             blocked.model.model_calls().is_empty(),
             "{:?}: a prompt holding a key reached the model",
@@ -367,13 +388,21 @@ fn the_installer_on_the_hosts_own_configs() {
     // and the harness set its model keys in config.toml since, which
     // EnvCloak takes for the host's own writes: two minutes on, only
     // EnvCloak's entries come out.
-    for f in [".codex/config.toml", ".claude.json", ".claude/settings.json"] {
+    for f in [
+        ".codex/config.toml",
+        ".claude.json",
+        ".claude/settings.json",
+    ] {
         age(&home.join(f), Duration::from_secs(180));
     }
     let (u, code) = agents(&mut h, &bin, &tmp, &["uninstall", "--yes"]);
     assert_eq!(code, 0, "{u}");
     lists(false);
-    for f in [".claude/settings.json", ".codex/config.toml", ".claude/CLAUDE.md"] {
+    for f in [
+        ".claude/settings.json",
+        ".codex/config.toml",
+        ".claude/CLAUDE.md",
+    ] {
         let t = std::fs::read_to_string(home.join(f)).unwrap();
         assert!(!t.contains("envcloak"), "{f}: {t}");
     }
