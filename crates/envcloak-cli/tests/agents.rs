@@ -860,6 +860,194 @@ fn socket_allowances_follow_k01() {
     f.sweep();
 }
 
+/// The Codex review: the socket allowance was written for any Codex
+/// version, while M2-04 measured that the proxy settings limit command
+/// networking to EnvCloak's socket on the pinned one only. On another
+/// version, consent writes no allowance: the step is reported as not
+/// made, with its reason, and the run exits 1; the MCP server and the
+/// hooks are written. On Linux nothing is written either way.
+///
+/// Mutation checked: `socket_allowance_qualified` answering true: the
+/// allowance is written for 0.159.3 and this fails.
+#[test]
+fn the_socket_allowance_needs_a_codex_it_was_measured_on() {
+    let f = Fixture::new();
+    let p = f.bin.join("codex");
+    std::fs::write(
+        &p,
+        format!(
+            "#!{}\n{}",
+            python3().display(),
+            FAKE_CODEX.replace("codex-cli 0.159.2", "codex-cli 0.159.3")
+        ),
+    )
+    .unwrap();
+    let (v, code) = f.report(&[
+        "install",
+        "--agent",
+        "codex",
+        "--consent-sandbox-sockets",
+        "--yes",
+    ]);
+    let toml = f.text(".codex/config.toml");
+    assert!(toml.contains("[mcp_servers.envcloak]"), "{toml}");
+    for word in ["network_access", "network_proxy", "unix_sockets"] {
+        assert!(!toml.contains(word), "{word}: {toml}");
+    }
+    let withheld = outcomes(&v).into_iter().any(|(h, path, o, r)| {
+        h == "codex"
+            && path == "~/.codex/config.toml"
+            && o == "refused"
+            && r == "socket_allowance_unqualified"
+    });
+    if cfg!(target_os = "macos") {
+        assert_eq!(code, 1, "{v}");
+        assert!(withheld, "{v}");
+        assert_eq!(v["complete"], false, "{v}");
+    } else {
+        assert_eq!(code, 0, "{v}");
+        assert!(!withheld, "{v}");
+    }
+    f.sweep();
+}
+
+/// The Codex review: `~/.claude.json` reached Claude Code's own `claude mcp`
+/// commands without the writer's hard-link rule. With another hard link
+/// it is reported and no command that would change it runs, on install
+/// and on uninstall; the link keeps its contents. A symlink is refused the
+/// same way.
+///
+/// Mutation checked: the `nlink > 1` refusal taken out of
+/// `claude_registered`: `claude mcp add-json` rewrites the file (the stand-in
+/// renames over it, as Claude Code does), the outcome is `changed`, and
+/// this fails.
+#[test]
+fn a_linked_claude_json_is_reported_and_left_alone() {
+    let f = Fixture::new();
+    let outside = f.home.root().join("elsewhere");
+    std::fs::create_dir(&outside).unwrap();
+    let before = f.read(".claude.json");
+    std::fs::hard_link(f.path(".claude.json"), outside.join("claude.json")).unwrap();
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 1, "{v}");
+    let (outcome, reason, backup) = outcome_of(&v, "~/.claude.json");
+    assert_eq!(
+        (outcome.as_str(), reason),
+        ("refused", json!("hard_linked")),
+        "{v}"
+    );
+    assert!(backup.is_null(), "{v}");
+    assert_eq!(f.read(".claude.json"), before);
+    assert_eq!(std::fs::read(outside.join("claude.json")).unwrap(), before);
+    // Uninstall leaves it too: EnvCloak registered nothing.
+    let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(f.read(".claude.json"), before);
+    f.sweep();
+    // A symlink, to a file elsewhere, the same: refused by the read.
+    let f = Fixture::new();
+    let outside = f.home.root().join("elsewhere");
+    std::fs::create_dir(&outside).unwrap();
+    let real = outside.join("claude.json");
+    std::fs::rename(f.path(".claude.json"), &real).unwrap();
+    std::os::unix::fs::symlink(&real, f.path(".claude.json")).unwrap();
+    let before = std::fs::read(&real).unwrap();
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 1, "{v}");
+    let (outcome, reason, _) = outcome_of(&v, "~/.claude.json");
+    assert_eq!(
+        (outcome.as_str(), reason),
+        ("refused", json!("symlink")),
+        "{v}"
+    );
+    assert_eq!(std::fs::read(&real).unwrap(), before);
+    assert!(
+        std::fs::symlink_metadata(f.path(".claude.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    f.sweep();
+}
+
+/// The verifier's finding: `init --agents-note` saved the state before it
+/// printed what it changed, so a failing save hid the results. They are
+/// printed first, then the failure; `agents install` and `uninstall`
+/// the same.
+///
+/// Mutations checked: the save moved back above the printing in
+/// `project_note` (`file.save(&state).map_err(...)?` first), and in
+/// `run_install`: nothing is printed and this fails.
+#[test]
+fn init_agents_note_prints_its_results_before_a_state_failure() {
+    let f = Fixture::new();
+    let init = |dir: &Path| {
+        let mut cmd = cli_command(&f.home, &["init", "--agents-note"], &[]);
+        cmd.current_dir(dir);
+        let out = finish_within(cmd, Duration::from_secs(120));
+        assert_no_canary(&out.stdout, &f.cs);
+        assert_no_canary(&out.stderr, &f.cs);
+        out
+    };
+    let first = f.home.root().join("first");
+    std::fs::create_dir_all(&first).unwrap();
+    let out = init(&first);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    // EnvCloak's state directory can no longer be written.
+    let state = data_dir(&f.home).join("agents");
+    let mode = |m: u32| {
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    mode(0o500);
+    // As root the directory's mode stops nothing: this needs a user it
+    // stops.
+    if std::fs::write(state.join("probe"), b"").is_ok() {
+        mode(0o700);
+        let _ = std::fs::remove_file(state.join("probe"));
+        return;
+    }
+    let second = f.home.root().join("second");
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("AGENTS.md"), "# Notes\n").unwrap();
+    let out = init(&second);
+    // `agents install` and `uninstall` print theirs first too.
+    let installed = f.agents(&["install", "--agent", "codex", "--yes"]);
+    let uninstalled = f.agents(&["uninstall", "--yes"]);
+    mode(0o700);
+    for (o, line) in [
+        (&installed, "~/.codex/config.toml: refused"),
+        (&uninstalled, "nothing of EnvCloak's to take out"),
+    ] {
+        assert_eq!(o.status.code(), Some(1), "{}{}", stdout(o), stderr(o));
+        assert!(stdout(o).contains(line), "{}", stdout(o));
+        assert!(
+            stderr(o).starts_with("envcloak: agents_incomplete: "),
+            "{}",
+            stderr(o)
+        );
+    }
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("Agent note:"), "{text}");
+    assert!(text.contains("AGENTS.md: refused"), "{text}");
+    assert!(
+        stderr(&out).starts_with("envcloak: agents_incomplete: "),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(second.join("AGENTS.md")).unwrap(),
+        "# Notes\n"
+    );
+    f.sweep();
+}
+
 /// No approval setting for any EnvCloak tool, in either host, and the
 /// other server's approval settings byte for byte as they were.
 ///
