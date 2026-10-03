@@ -9,11 +9,11 @@
 //! entries, [`kind_beneath`] says what one is, [`read_link_beneath`] reads
 //! a symlink's target, [`open_dir_beneath`] opens a subdirectory, and
 //! [`create_beneath`], [`create_rw_beneath`], [`create_dir_beneath`],
-//! [`link_beneath`], [`rename_beneath`], [`exchange_beneath`],
-//! [`unlink_beneath`] and [`remove_dir_beneath`] make, link, move, swap
-//! and remove names in it. None of them follows a symlink in the name's
-//! place. [`volume_of`] says whether
-//! the directory is on a network volume.
+//! [`link_beneath`], [`rename_beneath`], [`rename_new_beneath`],
+//! [`exchange_beneath`], [`unlink_beneath`] and [`remove_dir_beneath`]
+//! make, link, move, swap and remove names in it. None of them follows a
+//! symlink in the name's place. [`volume_of`] says whether the directory
+//! is on a network volume.
 //!
 //! Every name must be one path component: not empty, not `.` or `..`, and
 //! without `/` or NUL, or the call fails with
@@ -238,6 +238,40 @@ pub fn rename_beneath(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
     retry(|| unsafe { libc::renameat(fd, a.as_ptr(), fd, b.as_ptr()) }).map(drop)
 }
 
+/// Moves `from` to `to`, both in `dir`, only while nothing has the name
+/// `to`, in one step: Linux `renameat2(2)` with `RENAME_NOREPLACE`, macOS
+/// `renameatx_np(2)` with `RENAME_EXCL`. Whatever takes `to` first, a
+/// symlink (even a dangling one) included, keeps it, and the call fails
+/// with [`io::ErrorKind::AlreadyExists`]. A file system that cannot (some
+/// network and FUSE ones, a kernel before 3.15) fails with
+/// [`io::ErrorKind::Unsupported`], having changed nothing.
+pub fn rename_new_beneath(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let (a, b) = (component(from)?, component(to)?);
+    let fd = dir.as_raw_fd();
+    // SAFETY: as in `rename_beneath`; the flags are the constant the
+    // system defines for a rename that replaces nothing.
+    #[cfg(target_os = "linux")]
+    let moved = retry(|| unsafe {
+        libc::renameat2(fd, a.as_ptr(), fd, b.as_ptr(), libc::RENAME_NOREPLACE)
+    });
+    // SAFETY: as above.
+    #[cfg(target_os = "macos")]
+    let moved =
+        retry(|| unsafe { libc::renameatx_np(fd, a.as_ptr(), fd, b.as_ptr(), libc::RENAME_EXCL) });
+    moved.map(drop).map_err(unsupported)
+}
+
+/// `e`, or [`io::ErrorKind::Unsupported`] for the codes a file system
+/// gives for a rename flag it does not implement.
+fn unsupported(e: io::Error) -> io::Error {
+    let codes = [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP];
+    if e.raw_os_error().is_some_and(|c| codes.contains(&c)) {
+        io::ErrorKind::Unsupported.into()
+    } else {
+        e
+    }
+}
+
 /// Swaps the names `a` and `b` in `dir` in one step: each then names what
 /// the other named, and no moment passes with either missing. Linux
 /// `renameat2(2)` with `RENAME_EXCHANGE`, macOS `renameatx_np(2)` with
@@ -256,14 +290,7 @@ pub fn exchange_beneath(dir: &File, a: &OsStr, b: &OsStr) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let swapped =
         retry(|| unsafe { libc::renameatx_np(fd, x.as_ptr(), fd, y.as_ptr(), libc::RENAME_SWAP) });
-    swapped.map(drop).map_err(|e| {
-        let unsupported = [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP];
-        if e.raw_os_error().is_some_and(|c| unsupported.contains(&c)) {
-            io::ErrorKind::Unsupported.into()
-        } else {
-            e
-        }
-    })
+    swapped.map(drop).map_err(unsupported)
 }
 
 /// Gives the file `from` in `dir` a second name `to` there, with
