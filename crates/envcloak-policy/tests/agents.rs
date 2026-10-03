@@ -52,6 +52,23 @@ fn signed(path: &str, identifier: &str, team: Option<&str>) -> ProcInfo {
     p
 }
 
+/// The builtin catalog's agents, in its order.
+const BUILTIN: [&str; 9] = [
+    "claude-code",
+    "codex",
+    "cursor",
+    "gemini-cli",
+    "copilot-cli",
+    "opencode",
+    "kimi",
+    "qwen-code",
+    "fixture",
+];
+
+fn builtin_ids() -> Vec<&'static str> {
+    BUILTIN.to_vec()
+}
+
 fn id_of(cat: &AgentCatalog, p: &ProcInfo) -> Option<String> {
     cat.classify(p).map(|l| l.id)
 }
@@ -101,10 +118,7 @@ fn codeowners_cover_the_catalog_and_the_evidence() {
 #[test]
 fn the_builtin_catalog_loads_with_its_agents_named() {
     let cat = AgentCatalog::builtin();
-    assert_eq!(
-        cat.ids().collect::<Vec<_>>(),
-        ["claude-code", "codex", "fixture"]
-    );
+    assert_eq!(cat.ids().collect::<Vec<_>>(), builtin_ids());
     assert!(cat.problems().is_empty());
     for (marker, id, name) in [
         ("CLAUDECODE", "claude-code", "Claude Code"),
@@ -230,6 +244,333 @@ fn codex_is_recognized_however_it_is_installed() {
     );
 }
 
+/// What a fixture should classify as: an agent id and the basis of the
+/// match, or nothing.
+type Want = Option<(&'static str, MatchBasis)>;
+
+const BY_EXE: MatchBasis = MatchBasis::Executable;
+const SAID: MatchBasis = MatchBasis::Asserted;
+
+/// `node` running `args` (`argv[0]` first).
+fn node(args: &[&str]) -> ProcInfo {
+    proc_with(Some("/usr/local/bin/node"), "node", Some(args))
+}
+
+/// Every agent the M2 catalog adds (M2 plan task M2-10), and Claude Code's
+/// additions, as their documented installs and M2-04's pinned hosts run
+/// them (positive fixtures: executables by path, scripts under node, the
+/// names a process gives itself), and the same files under other names or
+/// in other places (negative fixtures: no match, so nothing rooted above
+/// the caller's session). Each match's basis decides whether it may root
+/// a grant there: only a builtin match on the executable's path or
+/// signature does, never one on a script, `argv[0]` or a command name
+/// (review finding F-37). Each label carries its product.
+#[test]
+fn every_new_entry_has_positive_and_negative_fixtures() {
+    let cat = AgentCatalog::builtin();
+    let home = "/home/u";
+    let v = "2026.09.28-64d2043";
+    let cursor_dir = format!("{home}/.local/share/cursor-agent/versions/{v}");
+    let mut cases: Vec<(String, ProcInfo, Want)> = vec![
+        // Claude Code: npm's launcher with install scripts off.
+        (
+            "claude cli-wrapper".into(),
+            node(&[
+                "node",
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs",
+            ]),
+            Some(("claude-code", SAID)),
+        ),
+        // Cursor CLI: its own node in its versions directory, and its
+        // index.js under any node; `exec -a` gives node the link's name.
+        (
+            "cursor node".into(),
+            proc_with(
+                Some(&format!("{cursor_dir}/node")),
+                "node",
+                Some(&[
+                    &format!("{home}/.local/bin/agent"),
+                    &format!("{cursor_dir}/index.js"),
+                ]),
+            ),
+            Some(("cursor", BY_EXE)),
+        ),
+        (
+            "cursor index.js".into(),
+            node(&["node", &format!("{cursor_dir}/index.js")]),
+            Some(("cursor", SAID)),
+        ),
+        // Not Cursor: node elsewhere, its links, its files elsewhere, and
+        // the Node.js Foundation's signature that its node carries.
+        ("node elsewhere".into(), exe("/usr/local/bin/node"), None),
+        (
+            "agent link".into(),
+            exe(&format!("{home}/.local/bin/agent")),
+            None,
+        ),
+        (
+            "cursor files outside versions".into(),
+            exe(&format!("{home}/.local/share/cursor-agent/{v}/node")),
+            None,
+        ),
+        (
+            "index.js elsewhere".into(),
+            node(&["node", "/srv/app/index.js"]),
+            None,
+        ),
+        (
+            "Node.js Foundation signature".into(),
+            signed(&format!("{cursor_dir}/node2"), "node", Some("HX7739G8FX")),
+            None,
+        ),
+        // Gemini CLI: its bundle under node, or its `gemini` link.
+        (
+            "gemini bundle".into(),
+            node(&[
+                "node",
+                "--no-warnings=DEP0040",
+                "/usr/local/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+            ]),
+            Some(("gemini-cli", SAID)),
+        ),
+        (
+            "gemini link".into(),
+            node(&["node", "/usr/local/bin/gemini", "-p", "x"]),
+            Some(("gemini-cli", SAID)),
+        ),
+        // No executable is Gemini CLI by its name alone.
+        ("gemini binary".into(), exe("/usr/local/bin/gemini"), None),
+        (
+            "another bundle".into(),
+            node(&["node", "/srv/gemini-cli/bundle/gemini.js"]),
+            None,
+        ),
+        // Copilot CLI: the platform binary (on Linux its command name is
+        // its main thread's), the install script's binary, and npm's
+        // launcher.
+        (
+            "copilot platform binary".into(),
+            proc_with(
+                Some(
+                    "/usr/local/lib/node_modules/@github/copilot/node_modules/@github/copilot-linux-x64/copilot",
+                ),
+                "MainThread",
+                None,
+            ),
+            Some(("copilot-cli", BY_EXE)),
+        ),
+        (
+            "copilot install script".into(),
+            exe(&format!("{home}/.local/bin/copilot")),
+            Some(("copilot-cli", BY_EXE)),
+        ),
+        (
+            "copilot npm-loader".into(),
+            node(&[
+                "node",
+                "/usr/local/lib/node_modules/@github/copilot/npm-loader.js",
+            ]),
+            Some(("copilot-cli", SAID)),
+        ),
+        (
+            "copilot link".into(),
+            node(&["node", "/usr/local/bin/copilot"]),
+            Some(("copilot-cli", SAID)),
+        ),
+        (
+            "copilot renamed".into(),
+            exe("/usr/local/bin/copilot-x"),
+            None,
+        ),
+        (
+            "another npm-loader".into(),
+            node(&["node", "/srv/npm-loader.js"]),
+            None,
+        ),
+        // OpenCode: the native binary, from npm or its install script.
+        (
+            "opencode platform binary".into(),
+            exe(
+                "/usr/local/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64/bin/opencode",
+            ),
+            Some(("opencode", BY_EXE)),
+        ),
+        (
+            "opencode install script".into(),
+            exe(&format!("{home}/.opencode/bin/opencode")),
+            Some(("opencode", BY_EXE)),
+        ),
+        (
+            "opencode renamed".into(),
+            exe("/usr/local/bin/opencoder"),
+            None,
+        ),
+        // Kimi: Kimi Code's binary; npm's Kimi Code, which renames its
+        // node process and its arguments; its main.mjs; kimi-cli's
+        // Python script, by its command name on Linux.
+        (
+            "kimi binary".into(),
+            exe(&format!("{home}/.kimi-code/bin/kimi")),
+            Some(("kimi", BY_EXE)),
+        ),
+        (
+            "kimi-code retitled".into(),
+            proc_with(
+                Some("/usr/local/bin/node"),
+                "kimi-code",
+                Some(&["kimi-code"]),
+            ),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "kimi-code main.mjs".into(),
+            node(&[
+                "node",
+                "/usr/local/lib/node_modules/@moonshot-ai/kimi-code/dist/main.mjs",
+            ]),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "kimi-cli script".into(),
+            proc_with(Some("/usr/bin/python3.12"), "kimi", None),
+            Some(("kimi", SAID)),
+        ),
+        ("kimi renamed".into(), exe("/usr/local/bin/kimi2"), None),
+        (
+            "another main.mjs".into(),
+            node(&["node", "/srv/dist/main.mjs"]),
+            None,
+        ),
+        // Qwen Code: its entry script under node, or its `qwen` link.
+        (
+            "qwen entry".into(),
+            node(&[
+                "node",
+                "/usr/local/lib/node_modules/@qwen-code/qwen-code/cli-entry.js",
+            ]),
+            Some(("qwen-code", SAID)),
+        ),
+        (
+            "qwen link".into(),
+            node(&["node", "/usr/local/bin/qwen"]),
+            Some(("qwen-code", SAID)),
+        ),
+        ("qwen binary".into(), exe("/usr/local/bin/qwen"), None),
+        (
+            "another cli-entry".into(),
+            node(&["node", "/srv/qwen-code/cli-entry.js"]),
+            None,
+        ),
+    ];
+    let products = [
+        ("claude-code", "claude-code"),
+        ("cursor", "cursor"),
+        ("gemini-cli", "gemini-cli"),
+        ("copilot-cli", "copilot-cli"),
+        ("opencode", "opencode"),
+        ("kimi", "kimi"),
+        ("qwen-code", "qwen-code"),
+    ];
+    for (what, p, want) in cases.drain(..) {
+        let got = cat.classify(&p);
+        let shown = got.as_ref().map(|l| (l.id.as_str(), l.basis));
+        assert_eq!(shown, want, "{what}");
+        if let Some(l) = got {
+            assert_eq!(l.source, CatalogSource::Builtin, "{what}");
+            assert_eq!(l.may_root_above_session(), l.basis == BY_EXE, "{what}");
+            let product = products.iter().find(|(id, _)| *id == l.id).unwrap().1;
+            assert_eq!(l.product, product, "{what}");
+        }
+    }
+    // Markers from the agents' documentation are claims.
+    for (marker, id) in [
+        ("CLAUDE_CODE_CHILD_SESSION", "claude-code"),
+        ("CURSOR_AGENT", "cursor"),
+        ("CURSOR_SANDBOX", "cursor"),
+        ("GEMINI_CLI", "gemini-cli"),
+    ] {
+        let l = cat.agent_for_marker(marker).unwrap();
+        assert_eq!((l.id.as_str(), l.basis), (id, SAID), "{marker}");
+        assert!(!l.may_root_above_session());
+    }
+    assert_eq!(cat.product("fixture"), Some("fixture"));
+}
+
+/// Install trees (M2 plan D-10): an agent's executable is in one when its
+/// documented installer put it there; the same file anywhere else, and an
+/// agent with no tree, is not.
+#[test]
+fn install_trees_name_where_each_agents_installers_put_it() {
+    let cat = AgentCatalog::builtin();
+    let home = Some(Path::new("/home/u"));
+    let inside = [
+        (
+            "claude-code",
+            "/home/u/.local/share/claude/versions/2.1.280",
+        ),
+        (
+            "claude-code",
+            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        ),
+        (
+            "claude-code",
+            "/usr/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude",
+        ),
+        (
+            "codex",
+            "/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
+        ),
+        (
+            "cursor",
+            "/home/u/.local/share/cursor-agent/versions/2026.09.28-64d2043/node",
+        ),
+        ("copilot-cli", "/home/u/.local/bin/copilot"),
+        ("copilot-cli", "/usr/local/bin/copilot"),
+        ("opencode", "/home/u/.opencode/bin/opencode"),
+        ("kimi", "/home/u/.kimi-code/bin/kimi"),
+    ];
+    for (id, path) in inside {
+        assert!(
+            cat.within_install_tree(id, Path::new(path), home),
+            "{id} {path}"
+        );
+    }
+    let outside = [
+        ("claude-code", "/tmp/x/claude"),
+        ("claude-code", "/home/u/.local/bin/claude"),
+        (
+            "claude-code",
+            "/home/v/.local/share/claude/versions/2.1.280",
+        ),
+        ("claude-code", "/home/u/.local/share/claude/versions"),
+        ("codex", "/home/u/bin/codex"),
+        ("cursor", "/home/u/.local/bin/agent"),
+        ("copilot-cli", "/home/u/.local/bin/opencode/../copilot"),
+        ("opencode", "/home/u/.local/bin/opencode"),
+        ("kimi", "/home/u/.kimi/bin/kimi"),
+        (
+            "gemini-cli",
+            "/usr/local/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+        ),
+        ("qwen-code", "/usr/local/bin/qwen"),
+        ("fixture", "/work/target/debug/fixture-agent"),
+        ("no-such-agent", "/usr/local/bin/copilot"),
+    ];
+    for (id, path) in outside {
+        assert!(
+            !cat.within_install_tree(id, Path::new(path), home),
+            "{id} {path}"
+        );
+    }
+    // Another agent's tree is not this one's.
+    assert!(!cat.within_install_tree("opencode", Path::new("/home/u/.local/bin/opencode"), home));
+    assert!(!cat.within_install_tree(
+        "claude-code",
+        Path::new("/home/u/.kimi-code/bin/claude"),
+        home
+    ));
+}
+
 #[test]
 fn the_fixture_agent_is_recognized_by_its_file_name_only() {
     let cat = AgentCatalog::builtin();
@@ -305,7 +646,7 @@ fn a_missing_agents_dir_is_the_builtin_catalog() {
     let root = tempfile::tempdir().unwrap();
     let cat = AgentCatalog::load(root.path());
     assert!(cat.problems().is_empty());
-    assert_eq!(cat.ids().count(), 3);
+    assert_eq!(cat.ids().count(), builtin_ids().len());
 }
 
 #[test]
@@ -345,10 +686,9 @@ executables = ["my-claude"]
     );
     let cat = AgentCatalog::load(root.path());
     assert!(cat.problems().is_empty(), "{:?}", cat.problems());
-    assert_eq!(
-        cat.ids().collect::<Vec<_>>(),
-        ["claude-code", "codex", "fixture", "aider"]
-    );
+    let mut want = builtin_ids();
+    want.push("aider");
+    assert_eq!(cat.ids().collect::<Vec<_>>(), want);
 
     let l = cat.classify(&exe("/usr/local/bin/aider")).unwrap();
     assert_eq!((l.id.as_str(), l.name.as_str()), ("aider", "Aider"));
@@ -674,7 +1014,7 @@ fn malformed_extensions_are_skipped_and_reported_by_kind_and_line() {
         .unwrap();
     assert_eq!(big.error.kind(), CatalogErrorKind::TooLarge);
     // Nothing from the bad files was added.
-    assert_eq!(cat.ids().count(), 3);
+    assert_eq!(cat.ids().count(), builtin_ids().len());
 }
 
 #[test]
@@ -749,7 +1089,7 @@ fn at_most_sixteen_extension_files_are_read() {
         );
     }
     let cat = AgentCatalog::load(root.path());
-    assert_eq!(cat.ids().count(), 3 + MAX_EXTENSION_FILES);
+    assert_eq!(cat.ids().count(), builtin_ids().len() + MAX_EXTENSION_FILES);
     let skipped: Vec<_> = cat.problems().iter().map(|p| p.file.clone()).collect();
     assert_eq!(skipped, ["16.toml", "17.toml"]);
     assert!(

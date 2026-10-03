@@ -18,6 +18,20 @@ pub(crate) static AGENTS_TOML: &str = r#"# Known AI coding agents, for caller ev
 # argv[0], a script or the command name, which a process sets itself, never
 # does that. Compiled into the release by scripts/gen-agents.py; users add
 # entries under <data>/agents.d/.
+#
+# Every pattern rests on evidence (M2 plan task M2-10, lesson L-15): a
+# real install observed (M2-04's pinned hosts, crates/envcloak-e2e/agents/
+# versions.toml, whose layouts and commands crates/envcloak-e2e/tests/
+# agent_hosts/catalog.rs classifies) or the agent's own documentation,
+# named beside it. `product` names the product an entry belongs to, for
+# coverage reporting. `install_trees` names the directories the agent's
+# documented installers write to, for the Linux standing statement (M2
+# plan D-10); an agent with none has no Linux standing approval.
+#
+# Left out for want of evidence: Goose (no install observed and no marker
+# documented; its command name `goose` is also a database migration
+# tool's, so a pattern would root grants at that tool), the Cursor IDE (no
+# signature observed) and Aider.
 
 # Executables that run scripts. For these, the script arguments are matched
 # against each agent's `scripts`.
@@ -26,29 +40,139 @@ interpreters = ["node", "nodejs", "bun", "deno"]
 [[agent]]
 id = "claude-code"
 name = "Claude Code"
+product = "claude-code"
 # The native build: ~/.local/share/claude/versions/<version>, or npm's
 # @anthropic-ai/claude-code/bin/claude.exe, run through a `claude` link.
 executables = ["claude", "claude.exe", "claude/versions/*"]
 # The older npm build: node .../@anthropic-ai/claude-code/cli.js, or a
-# `claude` script run through its shebang.
-scripts = ["claude", "@anthropic-ai/claude-code/cli.js"]
+# `claude` script run through its shebang. npm's launcher with install
+# scripts off, `node cli-wrapper.cjs`, which starts the native binary.
+scripts = [
+  "claude",
+  "@anthropic-ai/claude-code/cli.js",
+  "@anthropic-ai/claude-code/cli-wrapper.cjs",
+]
 signatures = [{ team = "Q6L2SF6YDW", identifier = "com.anthropic.claude-code" }]
-# Set in the environment of the commands it runs.
-markers = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]
+# Set in the environment of the commands it runs (measured: docs/AGENTS.md
+# "Host behaviour").
+markers = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION"]
+# https://code.claude.com/docs/en/setup: the native installer's versions
+# directory, and `npm install -g` into npm's global folder,
+# {prefix}/lib/node_modules, the prefix being where node is installed,
+# /usr/local by default (https://docs.npmjs.com/cli/v10/configuring-npm/
+# folders), /usr for a distribution's node. The package holds the
+# platform binary.
+install_trees = [
+  "~/.local/share/claude/versions",
+  "/usr/local/lib/node_modules/@anthropic-ai/claude-code",
+  "/usr/lib/node_modules/@anthropic-ai/claude-code",
+]
 
 [[agent]]
 id = "codex"
 name = "Codex"
+product = "codex"
 # The native binary, also under npm's @openai/codex-<platform>/vendor/.
 executables = ["codex"]
 # npm's launcher, which starts the native binary.
 scripts = ["codex", "@openai/codex/bin/codex.js"]
 signatures = [{ team = "2DC432GLL2", identifier = "codex" }]
 markers = ["CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"]
+# `npm install -g @openai/codex`, in npm's global folder (as above).
+install_trees = [
+  "/usr/local/lib/node_modules/@openai/codex",
+  "/usr/lib/node_modules/@openai/codex",
+]
+
+[[agent]]
+id = "cursor"
+name = "Cursor"
+product = "cursor"
+# Cursor CLI as its installer lays it out (https://cursor.com/install):
+# ~/.local/share/cursor-agent/versions/<version>/, whose cursor-agent
+# script runs that directory's own node on its index.js; ~/.local/bin/
+# agent and ~/.local/bin/cursor-agent link to the script. The command name
+# `agent` is too generic for a pattern, and the bundled node is signed by
+# the Node.js Foundation, not by Cursor (measured on M2-04's pinned
+# build), so only the versioned paths name it.
+executables = ["cursor-agent/versions/*/node"]
+scripts = ["cursor-agent/versions/*/index.js"]
+# Set in the commands its agent and its sandbox run (Map C §2).
+markers = ["CURSOR_AGENT", "CURSOR_SANDBOX"]
+install_trees = ["~/.local/share/cursor-agent/versions"]
+
+[[agent]]
+id = "gemini-cli"
+name = "Gemini CLI"
+product = "gemini-cli"
+# npm's @google/gemini-cli under node: its bundle, or the `gemini` link run
+# through its shebang.
+scripts = ["gemini", "@google/gemini-cli/bundle/gemini.js"]
+# Set in the commands its shell tool runs (https://raw.githubusercontent.
+# com/google-gemini/gemini-cli/main/docs/tools/shell.md).
+markers = ["GEMINI_CLI"]
+
+[[agent]]
+id = "copilot-cli"
+name = "GitHub Copilot CLI"
+product = "copilot-cli"
+# The native binary: npm's @github/copilot-<platform>/copilot, which `node
+# npm-loader.js` starts (on Linux its process takes its main thread's
+# name), or the install script's $PREFIX/bin/copilot (https://
+# raw.githubusercontent.com/github/copilot-cli/main/install.sh).
+executables = ["copilot"]
+# npm's launcher, directly or through the `copilot` link.
+scripts = ["copilot", "@github/copilot/npm-loader.js"]
+# The install script's prefix, $HOME/.local, or /usr/local as root; npm's
+# global folder (as above).
+install_trees = [
+  "~/.local/bin",
+  "/usr/local/bin",
+  "/usr/local/lib/node_modules/@github/copilot",
+  "/usr/lib/node_modules/@github/copilot",
+]
+
+[[agent]]
+id = "opencode"
+name = "OpenCode"
+product = "opencode"
+# The native binary: npm's opencode-<platform>/bin/opencode, or the install
+# script's ~/.opencode/bin/opencode (https://raw.githubusercontent.com/
+# anomalyco/opencode/dev/install).
+executables = ["opencode"]
+install_trees = [
+  "~/.opencode/bin",
+  "/usr/local/lib/node_modules/opencode-ai",
+  "/usr/lib/node_modules/opencode-ai",
+]
+
+[[agent]]
+id = "kimi"
+name = "Kimi"
+product = "kimi"
+# Kimi Code and kimi-cli both run as `kimi`; their installer tells them
+# apart by data root (~/.kimi-code, ~/.kimi). Kimi Code's native binary is
+# its install script's ~/.kimi-code/bin/kimi (https://code.kimi.com/
+# kimi-code/install.sh); npm's @moonshot-ai/kimi-code runs under node,
+# which renames its process and overwrites its own arguments with
+# `kimi-code`. kimi-cli's `kimi` is a Python script, known by its command
+# name on Linux.
+executables = ["kimi", "kimi-code"]
+scripts = ["kimi", "@moonshot-ai/kimi-code/dist/main.mjs"]
+install_trees = ["~/.kimi-code/bin"]
+
+[[agent]]
+id = "qwen-code"
+name = "Qwen Code"
+product = "qwen-code"
+# npm's @qwen-code/qwen-code under node: its entry script, or the `qwen`
+# link run through its shebang.
+scripts = ["qwen", "@qwen-code/qwen-code/cli-entry.js"]
 
 [[agent]]
 id = "fixture"
 name = "EnvCloak test fixture agent"
+product = "fixture"
 # crates/envcloak-testkit/src/bin/fixture-agent.rs, which the acceptance
 # tests run as an agent, in CI from the release build. Only a program by
 # this name matches, and like every executable here it then roots its
