@@ -703,12 +703,20 @@ fn slug_of(name: &str) -> Option<&'static str> {
     }
 }
 
-/// `value` with every letter and digit replaced by another of its kind
-/// (letters rotated by 13, digits by 5) and every other byte kept: what
-/// the oracle is run on a second time, so each result keeps its length in
-/// every encoding the serializers use and differs where it holds the
-/// value ([`value_span`]). Never a value of the vault: it is held here
-/// only, for the oracle.
+/// `value` with every byte that can be changed without changing the
+/// length of any encoding the serializers use replaced by another of its
+/// kind: letters rotated by 13, digits by 5, `-` and `_` swapped (both
+/// written as they are by every JSON and URL encoder here), `"` and `\`
+/// swapped (both escaped in two bytes in JSON and three in a URL), and
+/// the last bit of every UTF-8 continuation byte flipped (another
+/// character of the same UTF-8 length, the same JSON and URL lengths).
+/// Other punctuation is kept: the encoders disagree on it (`/` and `~`).
+/// What the oracle is run on a second time, so each result keeps its
+/// length in every encoding and differs where it holds the value
+/// ([`value_span`]), its ends included when they are any of those bytes
+/// (verifier, low: a key ending in `-` or `_`, which the canaries' key
+/// alphabet holds, left that byte outside the span). Never a value of
+/// the vault: it is held here only, for the oracle.
 fn other_value(value: &[u8]) -> Vec<u8> {
     value
         .iter()
@@ -716,6 +724,11 @@ fn other_value(value: &[u8]) -> Vec<u8> {
             b'a'..=b'z' => b'a' + (b - b'a' + 13) % 26,
             b'A'..=b'Z' => b'A' + (b - b'A' + 13) % 26,
             b'0'..=b'9' => b'0' + (b - b'0' + 5) % 10,
+            b'-' => b'_',
+            b'_' => b'-',
+            b'"' => b'\\',
+            b'\\' => b'"',
+            0x80..=0xbf => b ^ 1,
             other => *other,
         })
         .collect()
@@ -1227,6 +1240,29 @@ fn a_frame_is_its_result_with_the_value_redacted() {
             "{payload:?} from {result:?}"
         );
     }
+    // A value ending in `-`, one of the canaries' key characters: its
+    // span takes the `-`, and a frame that leaves it beside the marker is
+    // refused (verifier, low).
+    let dash = b"VALUEVALU-".to_vec();
+    let core = must_cover(
+        "OPENAI_API_KEY/raw",
+        value_span(&dash, &other_value(&dash)).unwrap(),
+    );
+    assert_eq!(core, 0..10);
+    for (payload, ok) in [(m.to_owned(), true), (format!("{m}-"), false)] {
+        assert_eq!(
+            redacted_from(payload.as_bytes(), &dash, m.as_bytes(), &core),
+            ok,
+            "{payload:?}"
+        );
+    }
+    // And a JSON escape and a multibyte character at the ends keep their
+    // lengths and fall inside the span.
+    let odd = "\"VAL\u{e9}".as_bytes().to_vec();
+    let other = other_value(&odd);
+    assert_eq!(other.len(), odd.len());
+    assert!(std::str::from_utf8(&other).is_ok());
+    assert_eq!(value_span(&odd, &other), Some(0..odd.len()));
     let results = vec![
         ("OPENAI_API_KEY/raw".to_owned(), b"VALUEVALUE".to_vec()),
         (
