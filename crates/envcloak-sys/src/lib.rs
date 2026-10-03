@@ -18,7 +18,9 @@
 //!   backups make in a directory they hold open; [`volume_of`]: whether a
 //!   directory is on a network volume; and [`open_elsewhere`]: whether
 //!   another process has a file open.
-//! - [`sync_file`]: durable writes, with `F_FULLFSYNC` on macOS.
+//! - [`sync_file`]: durable writes, with `F_FULLFSYNC` on macOS;
+//!   [`wait_for_clock_past`]: a file's stamp, once the file system's clock
+//!   moved past its last change, shows any change to it.
 //! - The daemon's socket and lifecycle: [`peer_identity`] and [`peer_uid`]
 //!   (who is on the other end of a Unix socket), [`connect_unix`] (a
 //!   client's connection, bounded in time from before the connect),
@@ -64,6 +66,7 @@ mod clock;
 mod dir;
 mod fd;
 mod fs;
+mod fsclock;
 mod harden;
 mod interrupt;
 mod inuse;
@@ -91,6 +94,7 @@ pub use dir::{
 };
 pub use fd::{cloexec_flag, inherited_fd};
 pub use fs::open_beneath;
+pub use fsclock::wait_for_clock_past;
 pub use harden::{
     Hardening, core_dump_limit, disable_core_dumps, harden_process, hardening_report,
     hardening_status, lock_memory, parse_tracer_pid, set_non_dumpable, tracer_present,
