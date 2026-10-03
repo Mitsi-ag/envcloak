@@ -59,8 +59,9 @@ pub use envfile::{
     PlainVar, REFERENCE_SCHEME, parse_env_file_refs,
 };
 pub use evidence::{
-    Ancestor, ChainEnd, Claims, ClaimsError, EvidenceError, GATHER_ATTEMPTS, ProcessInstance,
-    ProofRefusal, SubjectEvidence, gather, gather_in,
+    Ancestor, ChainEnd, Claims, ClaimsError, EvidenceError, ExeHasher, GATHER_ATTEMPTS,
+    ProcessInstance, ProofRefusal, SubjectEvidence, gather, gather_hashed, gather_in,
+    gather_in_hashed,
 };
 pub use flood::{
     AUTO_DENY, DENIAL_WINDOW, DENIALS_TO_AUTO_DENY, MAX_DENIALS, MAX_PENDING, MAX_PENDING_PER_ROOT,

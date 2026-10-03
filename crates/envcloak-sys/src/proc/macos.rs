@@ -269,6 +269,7 @@ fn exe(pid: i32) -> Option<ExeIdentity> {
     Some(ExeIdentity {
         path: PathBuf::from(OsString::from_vec(buf)),
         file: None,
+        sha256: None,
         signature: signature(pid),
     })
 }

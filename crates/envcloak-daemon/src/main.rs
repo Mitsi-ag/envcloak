@@ -36,6 +36,7 @@ mod backup;
 mod backups;
 mod clock;
 mod crowded;
+mod exe_hash;
 mod import;
 mod items;
 mod lock;

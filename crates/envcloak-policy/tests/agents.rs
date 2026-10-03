@@ -27,6 +27,7 @@ fn proc_with(exe: Option<&str>, comm: &str, argv: Option<&[&str]>) -> ProcInfo {
         exe: exe.map(|p| ExeIdentity {
             path: PathBuf::from(p),
             file: None,
+            sha256: None,
             signature: None,
         }),
         argv: argv.map(Argv::new),
@@ -88,6 +89,7 @@ fn codeowners_cover_the_catalog_and_the_evidence() {
         "/crates/envcloak-policy/src/evidence.rs",
         "/crates/envcloak-sys/src/proc/",
         "/scripts/gen-agents.py",
+        "/crates/envcloak-daemon/src/exe_hash.rs",
     ] {
         assert!(
             owned.iter().any(|(p, owners)| *p == want && *owners > 0),
@@ -374,6 +376,71 @@ executables = ["my-claude"]
     assert_eq!(cat.agent_for_marker("AIDER_SESSION").unwrap().id, "aider");
     assert_eq!(id_of(&cat, &exe("/bin/zsh")), None);
     assert_eq!(id_of(&cat, &exe("/bin/bash")), None);
+}
+
+/// An agent's product is its id unless its entry names one; an extension
+/// that names a product for an existing agent leaves it, as it leaves its
+/// name. Only the builtin catalog says where an agent's own installers
+/// put it: an extension that lists install trees is skipped and reported,
+/// and so is a product that is not an id.
+#[test]
+fn products_and_install_trees_come_from_the_builtin_catalog() {
+    let (root, dir) = data_dir();
+    write(
+        &dir,
+        "a.toml",
+        "[[agent]]\nid = \"aider\"\nname = \"Aider\"\nproduct = \"aider-chat\"\n\
+         executables = [\"aider\"]\n\n[[agent]]\nid = \"codex\"\nproduct = \"other\"\n\
+         executables = [\"codex-nightly\"]\n\n[[agent]]\nid = \"goose\"\nname = \"Goose\"\n\
+         executables = [\"goose-agent\"]\n",
+    );
+    write(
+        &dir,
+        "b.toml",
+        "[[agent]]\nid = \"claude-code\"\nexecutables = [\"cc\"]\n\
+         install_trees = [\"/tmp\"]\n",
+    );
+    write(
+        &dir,
+        "c.toml",
+        "[[agent]]\nid = \"x\"\nname = \"X\"\nexecutables = [\"x\"]\nproduct = \"Not An Id\"\n",
+    );
+    let cat = AgentCatalog::load(root.path());
+    assert_eq!(cat.product("aider"), Some("aider-chat"));
+    assert_eq!(cat.product("goose"), Some("goose"));
+    assert_eq!(cat.product("codex"), Some("codex"));
+    assert_eq!(cat.product("nothing"), None);
+    let l = cat.classify(&exe("/usr/local/bin/codex-nightly")).unwrap();
+    assert_eq!((l.id.as_str(), l.product.as_str()), ("codex", "codex"));
+    assert_eq!(
+        cat.classify(&exe("/usr/local/bin/aider")).unwrap().product,
+        "aider-chat"
+    );
+    let problems: Vec<(String, CatalogErrorKind, Option<u32>)> = cat
+        .problems()
+        .iter()
+        .map(|p| {
+            (
+                p.file.to_string_lossy().into_owned(),
+                p.error.kind(),
+                p.error.line(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        problems,
+        [
+            ("b.toml".to_owned(), CatalogErrorKind::BuiltinOnly, Some(1)),
+            ("c.toml".to_owned(), CatalogErrorKind::InvalidId, Some(5)),
+        ]
+    );
+    assert_eq!(id_of(&cat, &exe("/usr/bin/cc")), None, "b.toml was skipped");
+    assert!(!cat.within_install_tree(
+        "claude-code",
+        Path::new("/tmp/claude"),
+        Some(Path::new("/home/u"))
+    ));
+    assert!(!cat.within_install_tree("aider", Path::new("/usr/local/bin/aider"), None));
 }
 
 #[test]

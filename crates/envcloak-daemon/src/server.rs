@@ -65,7 +65,7 @@ use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
 };
 use envcloak_ipc::{Frame, FrameError, RpcError, RunPathErrorKind, RunPaths};
-use envcloak_policy::{AgentCatalog, Claims, gather};
+use envcloak_policy::{AgentCatalog, Claims, gather_hashed};
 use envcloak_providers::Registry;
 use envcloak_sys::{PeerIdentity, TerminationSignals};
 
@@ -183,6 +183,9 @@ pub(crate) struct Shared {
     /// The known agents: builtin plus the user's extensions, read once at
     /// start.
     pub(crate) catalog: AgentCatalog,
+    /// The digests of the executables in callers' ancestries (Linux; M2
+    /// plan D-09), which every request's evidence reads through.
+    pub(crate) exe_hashes: crate::exe_hash::ExeHashCache,
     /// The provider registry compiled into this build, whose key patterns
     /// mask keys in the command lines the audit log keeps.
     pub(crate) registry: Option<Registry>,
@@ -314,6 +317,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         places: Mutex::new(Places::default()),
         runtime_dir_fallback: run.fallback,
         catalog,
+        exe_hashes: crate::exe_hash::ExeHashCache::new(),
         registry,
         value_checks: Mutex::new(crate::import::ValueChecks::default()),
         deliveries: backups::Deliveries::default(),
@@ -904,7 +908,8 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
     refuse_if_traced()?;
     let claims =
         Claims::from_markers(&p.claims).map_err(|_| RpcError::new(ErrorKind::InvalidParams))?;
-    let evidence = gather(peer, claims, &shared.catalog)
+    let mut hasher = crate::exe_hash::RequestHasher::new(&shared.exe_hashes);
+    let evidence = gather_hashed(peer, claims, &shared.catalog, &mut hasher)
         .map_err(|e| RpcError::with_reason(ErrorKind::Evidence, e.token()))?;
     requests::refuse_unless_prover(shared, peer, &evidence, "unlock")?;
     let _gate = locked(&shared.proof_gate);

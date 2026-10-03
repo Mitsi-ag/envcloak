@@ -36,6 +36,7 @@ fn p(pid: i32, sid: i32, agent: Option<&str>) -> Ancestor {
         agent: agent.map(|id| AgentLabel {
             id: id.to_owned(),
             name: id.to_owned(),
+            product: id.to_owned(),
             source: CatalogSource::Builtin,
             basis: MatchBasis::Executable,
         }),

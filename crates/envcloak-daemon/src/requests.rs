@@ -92,7 +92,7 @@ use envcloak_policy::{
     Claims, Decision, DenyReason, EvidenceError, GrantId, ManifestError, Mode, PENDING_TTL,
     Pending, PendingDescriptor, PendingId, PendingState, ProcessInstance, ProfileName, ProofKind,
     RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy, bind_items,
-    effective_policy, gather, load_project, resolve,
+    effective_policy, gather_hashed, load_project, resolve,
 };
 use envcloak_sys::PeerIdentity;
 
@@ -164,7 +164,9 @@ fn refuse_requester_terminal(
     }
 }
 
-/// Reads the caller's evidence.
+/// Reads the caller's evidence, its ancestors' executables hashed on
+/// Linux (`crate::exe_hash`). Called before the state lock is taken, so
+/// hashing never holds it.
 pub(crate) fn evidence(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -172,7 +174,8 @@ pub(crate) fn evidence(
 ) -> Result<SubjectEvidence, RpcError> {
     let claims =
         Claims::from_markers(claims).map_err(|_| RpcError::new(ErrorKind::InvalidParams))?;
-    gather(peer, claims, &shared.catalog)
+    let mut hasher = crate::exe_hash::RequestHasher::new(&shared.exe_hashes);
+    gather_hashed(peer, claims, &shared.catalog, &mut hasher)
         .map_err(|e: EvidenceError| RpcError::with_reason(ErrorKind::Evidence, e.token()))
 }
 
