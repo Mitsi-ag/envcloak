@@ -152,8 +152,8 @@ const CREATED: [&str; 2] = [".codex/hooks.json", ".codex/rules/envcloak.rules"];
 /// with no decision (`hook::decide` returning `NoDecision` for
 /// `PreToolUse`): `printenv` runs, no marker reaches the model, and this
 /// fails. Names read in their own case (`names_dotenv` without its
-/// lower-casing): Claude Code's Read of `.ENV.staging` returns the file and
-/// this fails. The unchanged-text journal (`hunks::hunks` keeping the
+/// lower-casing): on macOS, Claude Code's Read of `.ENV.staging` is stopped
+/// by its own deny rule instead, with no EnvCloak marker, and this fails. The unchanged-text journal (`hunks::hunks` keeping the
 /// whole span between the first and last change, with its old text):
 /// the sweep of `<data>/agents/` finds the settings.json literal and this
 /// fails.
@@ -464,33 +464,39 @@ fn the_installer_on_the_hosts_own_configs() {
     );
     h.record("claude read stdout", &run.output.stdout);
     h.record("claude read stderr", &run.output.stderr);
+    // Neither file is read. On macOS EnvCloak's hook is what refuses the
+    // env file (measured: the hook runs before Claude Code's own deny
+    // rule, which stops it when the hook does not); on Linux, CI measured
+    // Claude Code refusing a file in that directory before any hook runs,
+    // so there the refusal's source is recorded, not asserted.
+    let shown = |out: &str| out.chars().take(160).collect::<String>();
     let read = last_tool_output(&request(&run, "step 1"));
-    assert!(
-        read.contains("[envcloak:env_file]"),
-        "Read of .ENV.staging: {read}"
-    );
     assert!(!read.contains("STAGING_PROBE"), "the file was read");
+    let by_hook = read.contains("[envcloak:env_file]");
+    if cfg!(target_os = "macos") {
+        assert!(by_hook, "Read of .ENV.staging: {}", shown(&read));
+    }
     let mut next = 2;
+    let mut environ_by_hook = None;
     if cfg!(target_os = "linux") {
         let environ = last_tool_output(&request(&run, "step 2"));
-        assert!(
-            environ.contains("[envcloak:env_dump]"),
-            "Read of /proc/self/environ: {environ}"
-        );
         assert!(!environ.contains("PATH="), "the environment was read");
+        environ_by_hook = Some(environ.contains("[envcloak:env_dump]"));
+        println!(
+            "measurement: Claude Code {} after agents install, Read of /proc/self/environ: {}",
+            claude.installed.pin.version,
+            shown(&environ)
+        );
         next = 3;
     }
     let control = last_tool_output(&request(&run, &format!("step {next}")));
     assert!(control.contains("ecctl-hook-control"), "{control}");
     println!(
-        "measurement: Claude Code {} after agents install: Read of .ENV.staging denied by \
-         EnvCloak's hook{}, the control ran",
+        "measurement: Claude Code {} after agents install: Read of .ENV.staging refused \
+         (EnvCloak's marker: {by_hook}; {}), of /proc/self/environ: {environ_by_hook:?}, the \
+         control ran",
         claude.installed.pin.version,
-        if cfg!(target_os = "linux") {
-            ", and of /proc/self/environ"
-        } else {
-            ""
-        }
+        shown(&read)
     );
     std::fs::remove_file(&staging).unwrap();
 
