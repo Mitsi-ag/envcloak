@@ -383,7 +383,11 @@ impl Vault {
     /// backup's name is then opened (never through a symlink), compared by
     /// device and inode with the file written, and read back whole: it
     /// must hold exactly the bytes written to it, their length and
-    /// SHA-256, its stamp unchanged while it is read. Another file put
+    /// SHA-256, its stamp unchanged while it is read (`Written::read_back`,
+    /// which first waits for the file system's clock to move past its last
+    /// change, so any change while it is read moves its stamp). The name is
+    /// a link to the very file read, so another file renamed onto it while
+    /// it is read unlinks it there, which its stamp shows. Another file put
     /// under the temporary name, or the file written into in place or cut,
     /// fails the backup ([`VaultErrorKind::Substituted`]), never answered
     /// as written, so nothing is deleted on the strength of it.
@@ -425,7 +429,9 @@ impl Vault {
             let named = open_beneath(&dir, name_os)
                 .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?;
             let (ours, theirs) = (file.metadata()?, named.metadata()?);
-            if (ours.dev(), ours.ino()) != (theirs.dev(), theirs.ino()) || !wrote.held_by(&named)? {
+            if (ours.dev(), ours.ino()) != (theirs.dev(), theirs.ino())
+                || wrote.read_back(&named, &dir)?.is_none()
+            {
                 return Err(VaultError::from(VaultErrorKind::Substituted));
             }
             Ok(wrote.len)
@@ -875,5 +881,62 @@ mod tests {
                 "{how}: a backup answered as written for bytes it did not write"
             );
         }
+    }
+
+    /// A backup's name replaced while the backup is read back is seen
+    /// (M2-05 round 12, the class of a backup v2 commit's name checked
+    /// before its read, here not an instance): the name is a link to the
+    /// very file read, so another file renamed onto it unlinks it there,
+    /// which moves that file's link count and change time, and the read's
+    /// stamp shows it. While the file is read back, once linked, another
+    /// file is renamed onto the backup's name: the backup fails
+    /// (`Substituted`), never answered as written, so nothing is
+    /// deleted on the strength of it, and that file keeps the name.
+    #[test]
+    fn a_backup_is_answered_only_while_its_name_holds_it_after_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = VaultPaths::under(dir.path().join("data"));
+        let (v, _) = crate::create_vault(
+            &paths,
+            &SecretBytes::copy_from(b"a test passphrase, not a fixture"),
+            crate::crypto::KdfParams::minimum(),
+        )
+        .unwrap();
+        let files = [BackupFile {
+            path: "/p/.env".into(),
+            mode: 0o600,
+            content: SecretBytes::copy_from(b"A=1\n"),
+        }];
+        let (backups, other) = (paths.backups_dir.clone(), dir.path().join("other"));
+        let mut did = 0;
+        crate::written::tests::set_during_read(move || {
+            if did > 0 {
+                return;
+            }
+            did += 1;
+            let name = std::fs::read_dir(&backups)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .find(|n| n.starts_with("files-"))
+                .unwrap();
+            std::fs::write(&other, b"not a backup").unwrap();
+            std::fs::rename(&other, backups.join(name)).unwrap();
+        });
+        let got = v.backup_files_observed(&files, &mut || {});
+        crate::written::tests::clear_during_read();
+        assert_eq!(
+            got.map(drop).map_err(|e| e.kind()),
+            Err(VaultErrorKind::Substituted),
+            "a backup answered as written for a file its name no longer held"
+        );
+        let names: Vec<String> = std::fs::read_dir(&paths.backups_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert_eq!(
+            std::fs::read(paths.backups_dir.join(&names[0])).unwrap(),
+            b"not a backup"
+        );
     }
 }

@@ -26,10 +26,14 @@
 //!    and the processes of its chain with their sessions and terminals, as
 //!    the daemon read them; never anything the client said), and per file
 //!    its display path, mode, size and SHA-256. It flushes the file and the
-//!    staging directory, renames the directory to `files2-<UTC time>-<id>/`
-//!    and flushes `backups/`, each with [`envcloak_sys::sync_file`]
+//!    staging directory and reads the file back whole through the
+//!    descriptor it wrote it through, which must hold exactly the bytes
+//!    written; then it renames the directory to `files2-<UTC time>-<id>/`
+//!    and flushes `backups/`, each flush with [`envcloak_sys::sync_file`]
 //!    (`F_FULLFSYNC` on macOS, and a flush that fails fails the step), and
-//!    answers only once the backup's name opens as the directory it sealed.
+//!    answers only once the directory sealed still holds that file, its
+//!    stamp the one the read saw, and, checked last, the backup's name
+//!    opens as the directory it sealed.
 //!    Only then is the backup listed: an interrupted backup is a staging
 //!    directory, never listed, which a purge removes once it is
 //!    [`STAGING_GRACE`] old.
@@ -67,9 +71,9 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use envcloak_sys::{
-    DirEntryKind, MAX_DIR_ENTRIES, create_beneath, create_dir_beneath, kind_beneath, link_beneath,
-    list_dir, open_beneath, open_dir_beneath, remove_dir_beneath, rename_beneath, sync_file,
-    unlink_beneath,
+    DirEntryKind, MAX_DIR_ENTRIES, create_beneath, create_dir_beneath, create_rw_beneath,
+    kind_beneath, link_beneath, list_dir, open_beneath, open_dir_beneath, remove_dir_beneath,
+    rename_beneath, sync_file, unlink_beneath,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -84,7 +88,7 @@ use crate::vault::{
     Vault, VaultError, VaultErrorKind, VaultPaths, open_private_child, open_record, open_value,
     seal_record, seal_value, sha256_update, utc_stamp,
 };
-use crate::written::{Counted, Written};
+use crate::written::{Counted, Stamp, Written};
 
 /// The bytes of a file each chunk holds, but a file's last: 512 KiB. A
 /// chunk crosses the socket base64-encoded in one frame, which is at most
@@ -724,11 +728,10 @@ pub struct FileBackupV2Writer {
     next_chunk: u64,
     hasher: Sha256,
     digests: Vec<[u8; 32]>,
-    /// `data` once [`FileBackupV2Writer::seal`] wrote it all, open, and
-    /// the length and SHA-256 of every byte written to it: a commit
-    /// answers only while the backup's name holds this very file, holding
-    /// exactly those bytes.
-    sealed: Option<(File, Written)>,
+    /// `data` once [`FileBackupV2Writer::seal`] wrote it all and read it
+    /// back whole: a commit answers only while the backup's name holds
+    /// this very file, its stamp still the one that read saw.
+    sealed: Option<SealedData>,
     /// Whether the staging directory's name was renamed to the backup's:
     /// from then on, whatever the checks after it found, the writer
     /// neither installs again nor removes anything when dropped.
@@ -738,6 +741,15 @@ pub struct FileBackupV2Writer {
 
 /// What a test build's writer reports its steps to.
 type Observer = Box<dyn FnMut(StepV2) + Send>;
+
+/// `data` once sealed: the file, open since it was made, the count of
+/// bytes written to it, and its stamp while it held exactly those bytes,
+/// read back whole ([`Written::read_back`]).
+struct SealedData {
+    file: File,
+    len: u64,
+    stamp: Stamp,
+}
 
 impl core::fmt::Debug for FileBackupV2Writer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -865,7 +877,9 @@ impl Vault {
             installed: false,
             observe,
         };
-        let file = create_beneath(&w.staging, OsStr::new(DATA), 0o600)?;
+        // Open for reading as well: `seal` reads it back through this
+        // descriptor, never by its name.
+        let file = create_rw_beneath(&w.staging, OsStr::new(DATA), 0o600)?;
         w.out = Some(BufWriter::with_capacity(64 * 1024, Counted::new(file)));
         w.start(self)?;
         Ok(w)
@@ -982,16 +996,26 @@ impl FileBackupV2Writer {
     }
 
     /// The first half of [`FileBackupV2Writer::commit`]: writes the sealed
-    /// metadata and the trailer, and flushes `data` and the staging
-    /// directory. Nothing is listed yet, and a writer dropped now still
-    /// removes its staging directory: whoever puts the backup in place
-    /// ([`FileBackupV2Writer::install`]) can check first that it still
-    /// may.
+    /// metadata and the trailer, flushes `data` and the staging directory,
+    /// and reads `data` back whole through the descriptor it was written
+    /// through: it must hold exactly the bytes written to it, of their
+    /// length and SHA-256, its stamp unchanged while it is read
+    /// ([`Written::read_back`], which first waits for the file system's
+    /// clock to move past its last change, so that any change to it after
+    /// shows in its stamp). That stamp is what
+    /// [`FileBackupV2Writer::install`] checks, so the read, up to the 1 GiB
+    /// cap, is done here, before the backup is put in place and outside
+    /// whatever its caller holds while it does that (the daemon's state
+    /// lock). Nothing is listed yet, and a writer dropped now still removes
+    /// its staging directory: whoever puts the backup in place can check
+    /// first that it still may.
     ///
     /// # Errors
     /// [`VaultErrorKind::InvalidRecord`] while a chunk is missing, or once
-    /// sealed (nothing is written then); an I/O error, after which the
-    /// backup cannot be put in place.
+    /// sealed (nothing is written then); [`VaultErrorKind::Substituted`]
+    /// when `data` does not hold exactly what was written (written into,
+    /// cut or extended since); an I/O error. After either of the last two
+    /// the backup cannot be put in place.
     pub fn seal(&mut self) -> Result<(), VaultError> {
         if self.next().is_some()
             || self.digests.len() != self.plan.len()
@@ -1030,7 +1054,14 @@ impl FileBackupV2Writer {
         }
         sync_file(&file)?;
         sync_file(&self.staging)?;
-        self.sealed = Some((file, written));
+        let stamp = written
+            .read_back(&file, &self.staging)?
+            .ok_or_else(|| VaultError::from(VaultErrorKind::Substituted))?;
+        self.sealed = Some(SealedData {
+            file,
+            len: written.len,
+            stamp,
+        });
         self.step(StepV2::Synced);
         Ok(())
     }
@@ -1042,20 +1073,24 @@ impl FileBackupV2Writer {
     ///
     /// A rename moves whatever has the staging directory's name at that
     /// moment, which need not be the directory this writer made and
-    /// sealed (another directory, or a symlink, put in its place). So the
+    /// sealed (another directory, or a symlink, put in its place). So once
+    /// the rename is flushed, `data` is opened in the directory sealed
+    /// (through the handle held on it, never through a symlink) and must be
+    /// the file sealed, by device and inode, its whole stamp the one
+    /// [`FileBackupV2Writer::seal`] read it back with: any write, cut,
+    /// link or mode change since moves its change time. Then, last, the
     /// backup's name is opened again through `backups/` (never through a
-    /// symlink) once the rename is flushed, and its device and inode
-    /// compared with the staging directory held open; and its `data`, the
-    /// directory's contents, is opened there (never through a symlink),
-    /// compared by device and inode with the file sealed, held open since,
-    /// and read back whole: it must hold exactly the bytes written to it,
-    /// of their length and SHA-256, its stamp unchanged while it is read.
-    /// A commit answers that the backup is in place only for the directory
+    /// symlink) and must be the directory sealed, by device and inode. A
+    /// commit answers that the backup is in place only for the directory
     /// sealed holding the `data` sealed, whatever took either name, or
-    /// replaced, removed, cut or wrote into `data`, before that check
+    /// replaced, removed, cut or wrote into `data`, before those checks
     /// (Codex, M2-05 round 11: the directory alone was checked, so a
     /// backup whose `data` was replaced inside it was answered as made,
-    /// and its originals could be deleted). It cannot keep the backup from
+    /// and its originals could be deleted). Each check is a few system
+    /// calls, and none takes time after the name's (Codex, M2-05 round 12:
+    /// the name was checked before a read of up to 1 GiB, after which a
+    /// directory put under it went unseen; and the read made a commit hold
+    /// the daemon's state lock for as long). It cannot keep the backup from
     /// being changed later.
     ///
     /// # Errors
@@ -1072,7 +1107,7 @@ impl FileBackupV2Writer {
         let Some(bytes) = self
             .sealed
             .as_ref()
-            .map(|(_, w)| w.len)
+            .map(|s| s.len)
             .filter(|_| !self.installed)
         else {
             return Err(VaultErrorKind::InvalidRecord.into());
@@ -1098,28 +1133,30 @@ impl FileBackupV2Writer {
 }
 
 impl FileBackupV2Writer {
-    /// Whether the backup's name in `backups/` opens (never through a
-    /// symlink) as the staging directory this writer made and sealed (the
-    /// same device and inode as the handle it holds on it), and its `data`
-    /// (never through a symlink either) as the file it sealed, holding
-    /// exactly the bytes written to it: read back whole, of their length
-    /// and SHA-256, its stamp unchanged while it is read
-    /// ([`Written::held_by`]). A `data` replaced, removed, cut or written
-    /// into in place, inside the very directory sealed, fails the commit
-    /// too ([`VaultErrorKind::Substituted`]).
+    /// Whether the directory this writer made and sealed holds, as `data`
+    /// (opened through the handle on it, never through a symlink), the
+    /// file it sealed (the same device and inode as the handle it holds
+    /// on it), its whole stamp the one [`FileBackupV2Writer::seal`] read
+    /// it back with; and then, last, whether the backup's name in
+    /// `backups/` opens (never through a symlink) as that directory (the
+    /// same device and inode as the handle it holds on it). A `data`
+    /// replaced, removed, cut or written into in place, inside the very
+    /// directory sealed, fails the commit too
+    /// ([`VaultErrorKind::Substituted`]). Nothing here reads a file's
+    /// contents: each check is a few system calls.
     fn check_installed(&self) -> Result<(), VaultError> {
         let substituted = || VaultError::from(VaultErrorKind::Substituted);
-        let named = open_dir_beneath(&self.backups, OsStr::new(&self.final_name))
-            .map_err(|_| substituted())?;
-        if !same_file(&named, &self.staging)? {
-            return Err(substituted());
-        }
-        let (sealed, written) = self
+        let sealed = self
             .sealed
             .as_ref()
             .ok_or_else(|| VaultError::from(VaultErrorKind::InvalidRecord))?;
-        let data = open_beneath(&named, OsStr::new(DATA)).map_err(|_| substituted())?;
-        if !same_file(&data, sealed)? || !written.held_by(&data)? {
+        let data = open_beneath(&self.staging, OsStr::new(DATA)).map_err(|_| substituted())?;
+        if !same_file(&data, &sealed.file)? || Stamp::of(&data)? != sealed.stamp {
+            return Err(substituted());
+        }
+        let named = open_dir_beneath(&self.backups, OsStr::new(&self.final_name))
+            .map_err(|_| substituted())?;
+        if !same_file(&named, &self.staging)? {
             return Err(substituted());
         }
         Ok(())
@@ -1163,6 +1200,11 @@ pub struct FileBackupV2Reader {
     /// The backup's directory, opened with its `data`: its results are
     /// read and written through it.
     dir: File,
+    /// `backups/`, opened, and the directory's name in it: a result is
+    /// answered as recorded only while that name still holds the directory
+    /// it went into.
+    backups: File,
+    name: OsString,
     meta: BackupMetaV2,
     layout: Vec<FileLayout>,
 }
@@ -1360,6 +1402,8 @@ impl FileBackupsV2 {
             key,
             file,
             dir,
+            backups: backups.try_clone()?,
+            name: name.to_owned(),
             meta: BackupMetaV2 {
                 id: h.id,
                 created_at: h.created_at,
@@ -1381,11 +1425,13 @@ impl Vault {
     ///
     /// # Errors
     /// As [`Vault::open_file_backup_v2`]; [`VaultErrorKind::InvalidRecord`]
-    /// for a file index the backup does not have, and when the result's
-    /// name, once linked, does not hold the file written (another file put
-    /// under its temporary name meanwhile);
-    /// [`VaultErrorKind::AlreadyExists`] when the file's result is
-    /// recorded already.
+    /// for a file index the backup does not have;
+    /// [`VaultErrorKind::Substituted`] when the result's name, once
+    /// linked, does not hold the file written, holding exactly the sealed
+    /// result (another file put under its temporary name meanwhile, or the
+    /// file written into or cut), or the backup's name no longer holds the
+    /// directory it went into; [`VaultErrorKind::AlreadyExists`] when the
+    /// file's result is recorded already.
     pub fn record_file_backup_v2_result(
         &self,
         id: &FileBackupId,
@@ -1557,10 +1603,21 @@ impl FileBackupV2Reader {
     /// damaged. A link takes whatever has the temporary name at that
     /// moment, so the result's name is then opened (never through a
     /// symlink) and compared, by device and inode, with the file written,
-    /// and read back whole: another file put under the temporary name
-    /// meanwhile, or this one written into or cut, fails the call
-    /// ([`VaultErrorKind::Substituted`]), never answered as recorded.
-    /// The temporary name then goes, and the directory is flushed.
+    /// and read back whole ([`Written::read_back`], which first waits for
+    /// the file system's clock to move past its last change): another file
+    /// put under the temporary name meanwhile, or this one written into or
+    /// cut, fails the call ([`VaultErrorKind::Substituted`]), never
+    /// answered as recorded. The name is a link to the very file read, so
+    /// another file renamed onto it while it is read unlinks it there,
+    /// which its stamp shows. The temporary name then goes, and the
+    /// directory is flushed. Last, the backup's name in `backups/` must
+    /// still open (never through a symlink) as the directory the result
+    /// went into, by device and inode (M2-05 round 12, the class of the
+    /// commit's name checked before what follows): a backup moved away, or
+    /// another directory put under its name, since it was opened, fails
+    /// the call ([`VaultErrorKind::Substituted`]), its result recorded in
+    /// the directory moved but never answered as recorded for this
+    /// backup.
     fn record(
         &self,
         file: usize,
@@ -1601,7 +1658,9 @@ impl FileBackupV2Reader {
             // exactly the sealed result.
             let named = open_beneath(&self.dir, path)
                 .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?;
-            if !same_file(&named, &out)? || !Written::of(&sealed).held_by(&named)? {
+            if !same_file(&named, &out)?
+                || Written::of(&sealed).read_back(&named, &self.dir)?.is_none()
+            {
                 return Err(VaultErrorKind::Substituted.into());
             }
             observe(ResultStepV2::Published);
@@ -1616,6 +1675,13 @@ impl FileBackupV2Reader {
         published?;
         observe(ResultStepV2::Unlinked);
         sync_file(&self.dir)?;
+        // Last, the backup's name: the result is answered as recorded for
+        // this backup only while its name still holds the directory the
+        // result went into (another directory put under it since the
+        // backup was opened, or the backup moved away, fails the call).
+        if !still_named(&self.backups, &self.name, &self.dir)? {
+            return Err(VaultErrorKind::Substituted.into());
+        }
         observe(ResultStepV2::Done);
         Ok(())
     }
@@ -2337,6 +2403,207 @@ mod tests {
             r.verify().unwrap_err().kind(),
             VaultErrorKind::BackupDamaged
         );
+    }
+
+    /// A commit reads nothing back once its backup is named, and answers
+    /// only while that name holds the directory it sealed (Codex, M2-05
+    /// round 12: the name was checked, then `data` read back whole, up to
+    /// 1 GiB, and a directory put under the name during that read went
+    /// unseen; the read also held the daemon's state lock all along, since
+    /// the daemon puts a backup in place under it). At every part of every
+    /// read a commit does, the backup's name, once it exists, is moved
+    /// away and another directory put under it. `seal` reads `data` back,
+    /// before the backup is named; `install`, which the daemon runs under
+    /// its state lock, reads nothing; and the commit answers with its name
+    /// holding the directory sealed.
+    #[test]
+    fn a_commit_reads_nothing_back_once_its_backup_is_named() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let (dir, v) = test_vault();
+        let body: Vec<u8> = (0..CHUNK_V2 + 70_000).map(|i| (i % 251) as u8).collect();
+        let mut w = v
+            .begin_file_backup_v2(
+                BackupPurpose::Scrub,
+                test_creator(),
+                vec![PlannedFile {
+                    path: "/h/.claude/settings.json".into(),
+                    mode: 0o600,
+                    size: body.len() as u64,
+                }],
+                1_790_000_000,
+            )
+            .unwrap();
+        w.put(0, 0, &SecretBytes::copy_from(&body[..CHUNK_V2]))
+            .unwrap();
+        w.put(0, 1, &SecretBytes::copy_from(&body[CHUNK_V2..]))
+            .unwrap();
+        let (reads, named) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (final_dir, held) = (w.final_dir.clone(), dir.path().join("held"));
+        let (r, n) = (reads.clone(), named.clone());
+        crate::written::tests::set_during_read(move || {
+            r.set(r.get() + 1);
+            if final_dir.exists() && !held.exists() {
+                n.set(n.get() + 1);
+                std::fs::rename(&final_dir, &held).unwrap();
+                std::fs::create_dir(&final_dir).unwrap();
+                std::fs::copy(held.join(DATA), final_dir.join(DATA)).unwrap();
+            }
+        });
+        let sealed = w.seal().map(|()| reads.get());
+        let installed = sealed.as_ref().ok().map(|_| w.install());
+        let read_installing = reads.get() - *sealed.as_ref().unwrap_or(&0);
+        crate::written::tests::clear_during_read();
+        assert!(sealed.unwrap() >= 2, "seal did not read `data` back");
+        assert_eq!(read_installing, 0, "install read a file back");
+        assert_eq!(
+            named.get(),
+            0,
+            "a file was read back once the backup was named"
+        );
+        let done = installed.unwrap().unwrap();
+        let at = File::open(&done.dir).unwrap();
+        assert!(same_file(&at, &w.staging).unwrap());
+        drop(w);
+        let r = v.open_file_backup_v2(&done.id).unwrap();
+        r.verify().unwrap();
+    }
+
+    /// A `data` written into right after `seal` read it back, as soon as a
+    /// program can (one byte in place, its modification time put back, its
+    /// length kept), fails the commit (`Substituted`), every time: `install`
+    /// reads nothing back and checks `data` by its stamp, which shows the
+    /// write only because the read back waited for the file system's clock
+    /// to move past `data`'s last change (Linux stamps every change within
+    /// one tick of its clock alike; HFS+ within one second).
+    #[test]
+    fn a_data_written_into_right_after_its_read_back_fails_the_commit() {
+        use std::os::unix::fs::FileExt;
+        let (_dir, v) = test_vault();
+        for i in 0..8 {
+            let mut w = v
+                .begin_file_backup_v2(
+                    BackupPurpose::Scrub,
+                    test_creator(),
+                    vec![PlannedFile {
+                        path: "/h/.env".into(),
+                        mode: 0o600,
+                        size: 4,
+                    }],
+                    1_790_000_000,
+                )
+                .unwrap();
+            w.put(0, 0, &SecretBytes::copy_from(b"body")).unwrap();
+            w.seal().unwrap();
+            let data = w.final_dir.with_file_name(&w.staging_name).join(DATA);
+            let f = File::options().read(true).write(true).open(&data).unwrap();
+            let modified = f.metadata().unwrap().modified().unwrap();
+            let mut b = [0u8];
+            f.read_exact_at(&mut b, 60).unwrap();
+            f.write_all_at(&[b[0] ^ 1], 60).unwrap();
+            f.set_modified(modified).unwrap();
+            assert_eq!(
+                w.install().map(drop).map_err(|e| e.kind()),
+                Err(VaultErrorKind::Substituted),
+                "backup {i}: a commit answered for a `data` written into after its read back"
+            );
+        }
+    }
+
+    /// A result's name replaced while the result is read back is seen
+    /// (M2-05 round 12, the class of the commit's name checked before its
+    /// read, here not an instance): the name is a link to the very file
+    /// read, so another file renamed onto it unlinks it there, which moves
+    /// that file's link count and change time, and the read's stamp shows
+    /// it. While the result's file is read back, once linked, another file
+    /// is renamed onto the result's name: the call fails (`Substituted`),
+    /// never answered as recorded, and that file keeps the name.
+    #[test]
+    fn a_result_is_answered_only_while_its_name_holds_it_after_the_read() {
+        let (dir, v) = test_vault();
+        let mut w = v
+            .begin_file_backup_v2(
+                BackupPurpose::Scrub,
+                test_creator(),
+                vec![PlannedFile {
+                    path: "/h/.env".into(),
+                    mode: 0o600,
+                    size: 4,
+                }],
+                1_790_000_000,
+            )
+            .unwrap();
+        w.put(0, 0, &SecretBytes::copy_from(b"body")).unwrap();
+        let done = w.commit().unwrap();
+        drop(w);
+        let r = v.open_file_backup_v2(&done.id).unwrap();
+        let (result, other) = (done.dir.join("result-0"), dir.path().join("other"));
+        let mut once = true;
+        crate::written::tests::set_during_read(move || {
+            if std::mem::take(&mut once) {
+                std::fs::write(&other, b"another result").unwrap();
+                std::fs::rename(&other, &result).unwrap();
+            }
+        });
+        let got = r.record_result(0, &[7; 32]);
+        crate::written::tests::clear_during_read();
+        assert_eq!(
+            got.map_err(|e| e.kind()),
+            Err(VaultErrorKind::Substituted),
+            "a result answered as recorded for a file its name no longer held"
+        );
+        assert_eq!(
+            std::fs::read(done.dir.join("result-0")).unwrap(),
+            b"another result"
+        );
+    }
+
+    /// A result is answered as recorded only while the backup's name still
+    /// holds the directory the result went into (M2-05 round 12, the class
+    /// of the commit's name checked before what follows: the backup was
+    /// found by its name when opened, and nothing looked at that name
+    /// again). Once the backup is opened, its directory is moved away and a
+    /// copy of it (its `data`) put under its name: the call fails
+    /// (`Substituted`), the result is in the directory moved, and the copy
+    /// under the backup's name has none. Left alone, the result is recorded
+    /// and reads back.
+    #[test]
+    fn a_result_is_answered_only_while_the_backups_name_holds_its_directory() {
+        let (dir, v) = test_vault();
+        let commit = || {
+            let mut w = v
+                .begin_file_backup_v2(
+                    BackupPurpose::Scrub,
+                    test_creator(),
+                    vec![PlannedFile {
+                        path: "/h/.env".into(),
+                        mode: 0o600,
+                        size: 4,
+                    }],
+                    1_790_000_000,
+                )
+                .unwrap();
+            w.put(0, 0, &SecretBytes::copy_from(b"body")).unwrap();
+            w.commit().unwrap()
+        };
+        let done = commit();
+        let r = v.open_file_backup_v2(&done.id).unwrap();
+        let held = dir.path().join("held");
+        std::fs::rename(&done.dir, &held).unwrap();
+        std::fs::create_dir(&done.dir).unwrap();
+        std::fs::copy(held.join(DATA), done.dir.join(DATA)).unwrap();
+        assert_eq!(
+            r.record_result(0, &[7; 32]).map_err(|e| e.kind()),
+            Err(VaultErrorKind::Substituted),
+            "a result answered as recorded for a backup whose name holds another directory"
+        );
+        assert!(held.join("result-0").exists());
+        assert!(!done.dir.join("result-0").exists());
+        let other = commit();
+        let r = v.open_file_backup_v2(&other.id).unwrap();
+        r.record_result(0, &[7; 32]).unwrap();
+        let again = v.open_file_backup_v2(&other.id).unwrap();
+        assert_eq!(again.results().unwrap(), [Some([7; 32])]);
     }
 
     /// A backup made under an older schema (before a migration) opens and
