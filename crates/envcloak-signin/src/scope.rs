@@ -71,8 +71,9 @@ pub enum ScopeError {
     /// A label with a control, invisible or direction-changing character.
     LabelCharacter,
     /// A host name that is not lowercase ASCII letters, digits and `-` in
-    /// dot-separated labels of 1 to 63 bytes, or that ends in an all-digit
-    /// label (an address written as a name).
+    /// dot-separated labels of 1 to 63 bytes, or whose last label the URL
+    /// standard reads as a number (all digits, or `0x` and hex digits: an
+    /// address written as a name).
     Host,
     /// `http` for a host other than `127.0.0.1`, `::1` or a `*.localhost`
     /// name.
@@ -205,9 +206,17 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 /// name, a storage key, an identity-check locator. 1 to [`MAX_LABEL`]
 /// bytes of UTF-8 with no character a terminal would act on or hide
 /// (`envcloak_policy::display_escaped`), compared byte for byte: a role
-/// has no ordering and no case folding (SPEC §10b).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// has no ordering and no case folding (SPEC §10b). It holds what a
+/// registration or an agent's request gave, so its `Debug` shows only its
+/// length (L-12).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Label(String);
+
+impl fmt::Debug for Label {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Label({} bytes)", self.0.len())
+    }
+}
 
 impl Label {
     pub fn new(s: &str) -> Result<Self, ScopeError> {
@@ -228,22 +237,50 @@ impl Label {
     }
 }
 
-/// A host as the browser serializes it (plan D-26): a lowercase ASCII
-/// name, a punycode A-label written as it is, or an IP address.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Host {
-    Name(String),
-    V4([u8; 4]),
-    V6([u8; 16]),
-}
+/// A host name in the form the browser serializes it (plan D-26), checked
+/// by [`HostName::new`], the only way to make one: so a [`Host`], an
+/// [`Origin`] or a declared cookie never holds a name that was not
+/// checked. Its `Debug` shows only its length (L-12).
+///
+/// ```
+/// use envcloak_signin::{Host, HostName, Origin, Scheme};
+/// let name = HostName::new("app.localhost").unwrap();
+/// let host = Host::Name(name);
+/// assert!(Origin::new(Scheme::Http, host, 3000).is_ok());
+/// assert!(HostName::new("App.localhost").is_err());
+/// ```
+///
+/// Nothing else makes one: not the tuple constructor,
+///
+/// ```compile_fail
+/// let _ = envcloak_signin::HostName(String::from("App.localhost"));
+/// ```
+///
+/// not a [`Host`] from a string,
+///
+/// ```compile_fail
+/// let _ = envcloak_signin::Host::Name(String::from("App.localhost"));
+/// ```
+///
+/// and not an [`Origin`] built field by field.
+///
+/// ```compile_fail
+/// use envcloak_signin::{Host, Origin, Scheme};
+/// let _ = Origin { scheme: Scheme::Http, host: Host::V4([10, 0, 0, 1]), port: 0 };
+/// ```
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostName(String);
 
-impl Host {
+impl HostName {
     /// A host name: dot-separated labels of 1 to 63 bytes, each of
     /// lowercase ASCII letters, digits and `-`, not starting or ending
     /// with `-`; at most [`MAX_HOST`] bytes; no trailing dot; and a last
-    /// label that is not all digits, so an address is never read as a
-    /// name.
-    pub fn name(s: &str) -> Result<Self, ScopeError> {
+    /// label that the URL standard does not read as a number (all digits,
+    /// or `0x` and hex digits: "ends in a number", where the browser parses
+    /// the host as an IPv4 address and refuses the URL), so an address is
+    /// never read as a name and every name is one the browser serializes
+    /// as itself.
+    pub fn new(s: &str) -> Result<Self, ScopeError> {
         let label_ok = |l: &str| {
             !l.is_empty()
                 && l.len() <= 63
@@ -252,18 +289,47 @@ impl Host {
                 && l.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         };
+        let number = |l: &str| {
+            l.bytes().all(|b| b.is_ascii_digit())
+                || l.strip_prefix("0x")
+                    .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+        };
         let ok = !s.is_empty()
             && s.len() <= MAX_HOST
             && s.split('.').all(label_ok)
-            && !s
-                .rsplit('.')
-                .next()
-                .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
+            && !s.rsplit('.').next().is_some_and(number);
         if ok {
-            Ok(Host::Name(s.to_owned()))
+            Ok(HostName(s.to_owned()))
         } else {
             Err(ScopeError::Host)
         }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for HostName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HostName({} bytes)", self.0.len())
+    }
+}
+
+/// A host as the browser serializes it (plan D-26): a checked
+/// [`HostName`] (lowercase ASCII, a punycode A-label written as it is),
+/// or an IP address.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Host {
+    Name(HostName),
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+impl Host {
+    /// A host name, checked by [`HostName::new`].
+    pub fn name(s: &str) -> Result<Self, ScopeError> {
+        HostName::new(s).map(Host::Name)
     }
 
     /// Whether `http` may be registered for it (SPEC §6.8): `127.0.0.1`,
@@ -272,7 +338,7 @@ impl Host {
         match self {
             Host::V4(a) => *a == [127, 0, 0, 1],
             Host::V6(a) => *a == std::net::Ipv6Addr::LOCALHOST.octets(),
-            Host::Name(n) => n.ends_with(".localhost"),
+            Host::Name(n) => n.0.ends_with(".localhost"),
         }
     }
 
@@ -280,7 +346,7 @@ impl Host {
         match self {
             Host::Name(n) => {
                 lp(out, &[1]);
-                lp(out, n.as_bytes());
+                lp(out, n.0.as_bytes());
             }
             Host::V4(a) => {
                 lp(out, &[4]);
@@ -450,13 +516,25 @@ pub struct Subject {
 }
 
 /// The project: its canonical directory (bytes), the directory's device
-/// and inode, and SHA-256 of the effective sign-in configuration.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// and inode, and SHA-256 of the effective sign-in configuration. Its
+/// `Debug` shows the directory's length, never the path (L-12).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectScope {
     pub dir: Vec<u8>,
     pub dev: u64,
     pub ino: u64,
     pub config: [u8; 32],
+}
+
+impl fmt::Debug for ProjectScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProjectScope")
+            .field("dir", &format_args!("{} bytes", self.dir.len()))
+            .field("dev", &self.dev)
+            .field("ino", &self.ino)
+            .field("config", &format_args!("{}", hex(&self.config)))
+            .finish()
+    }
 }
 
 impl ProjectScope {
