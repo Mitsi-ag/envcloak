@@ -314,6 +314,10 @@ const CORPUS: &[(&str, Option<Class>)] = &[
     ("rg --type=all KEY", Some(Class::EnvFile)),
     ("rg -tsh KEY", Some(Class::EnvFile)),
     ("rg --type-add 'x:.env*' -t x KEY", Some(Class::EnvFile)),
+    (
+        "rg --type-add 'x:include:sh' -t x KEY",
+        Some(Class::EnvFile),
+    ),
     ("grep -r --include=.env KEY .", Some(Class::EnvFile)),
     ("grep -r --include '*.env' KEY .", Some(Class::EnvFile)),
     ("ag -G '[.]env' KEY", Some(Class::EnvFile)),
