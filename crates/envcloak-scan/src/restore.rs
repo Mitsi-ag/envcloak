@@ -143,8 +143,9 @@ pub struct BackedUpFile {
 /// removed from there is not named, and the file is answered as written
 /// back. A file system that cannot swap names writes nothing
 /// ([`ModifyErrorKind::SwapUnsupported`]). A write by a program that still
-/// has the old file open, after that read, is not seen. The file keeps its mode. A file with another hard
-/// link is never written over. Returns the new file's stamp.
+/// has the old file open, after that read, is not seen. The file keeps its
+/// mode. A file with another hard link is never written over. Returns the
+/// new file's stamp.
 ///
 /// The new file is the write itself (SPEC §6.5 "Modifying a file",
 /// R-M2-44: a new file in the same directory, `O_EXCL`, 0600 until it is

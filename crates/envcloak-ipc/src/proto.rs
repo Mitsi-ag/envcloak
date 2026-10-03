@@ -1637,7 +1637,8 @@ pub struct RpcError {
     /// (`requester_terminal` only), [`ErrorKind::TooManyPending`],
     /// [`ErrorKind::RestoreRefused`] and [`ErrorKind::FilesBackupFailed`]
     /// (`too_large`, a backup v2 over its caps, and `substituted`, a
-    /// backup replaced under its name before it was checked in place).
+    /// backup replaced under its name, or cut or written into, before it
+    /// was checked in place).
     pub reason: Option<&'static str>,
 }
 

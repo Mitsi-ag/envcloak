@@ -877,8 +877,9 @@ fn env_file_path(path: &str) -> bool {
 }
 
 /// A file backup's failure to be written, as `files.backup` answers it,
-/// logged without a value. One the vault's directory had replaced under
-/// its name before it was checked in place (`Substituted`) is
+/// logged without a value. One replaced under its name, or cut or written
+/// into, inside the vault's directory before it was checked in place
+/// (`Substituted`) is
 /// `files_backup_failed` with the reason `substituted`, never the
 /// client's malformed request (`invalid_params`), which a request that is
 /// malformed still gets.
@@ -887,8 +888,8 @@ fn files_backup_error(k: VaultErrorKind) -> RpcError {
         VaultErrorKind::InvalidRecord => invalid(),
         VaultErrorKind::Substituted => {
             log_line!(
-                "envcloakd: a file backup was replaced under its name before it was checked in \
-                 place (substituted); nothing was deleted"
+                "envcloakd: a file backup was replaced or changed before it was checked in place \
+                 (substituted); nothing was deleted"
             );
             RpcError::with_reason(ErrorKind::FilesBackupFailed, "substituted")
         }

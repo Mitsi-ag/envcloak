@@ -663,9 +663,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// A backup's failure to be written or read, as the protocol reports it.
-/// Nothing of the file's contents is in it. A directory or result the
-/// vault wrote that its final name did not hold once published
-/// (`Substituted`: something replaced it inside the vault's directory) is
+/// Nothing of the file's contents is in it. A directory, `data` or result
+/// the vault wrote that its final name did not hold once published, or
+/// that did not hold exactly the bytes written (`Substituted`: something
+/// replaced, cut or wrote into it inside the vault's directory) is
 /// `files_backup_failed` with the reason `substituted`, logged, never the
 /// client's malformed request.
 fn backup_error(e: &VaultError) -> RpcError {
@@ -674,7 +675,7 @@ fn backup_error(e: &VaultError) -> RpcError {
         VaultErrorKind::InvalidRecord => invalid(),
         VaultErrorKind::Substituted => {
             log_line!(
-                "envcloakd: a file backup v2's directory or result was replaced under its name \
+                "envcloakd: a file backup v2's directory, data or result was replaced or changed \
                  before it was checked in place (substituted); it was not answered as written"
             );
             RpcError::with_reason(ErrorKind::FilesBackupFailed, "substituted")

@@ -248,12 +248,12 @@ const REASON_TEXTS: &[(&str, &str)] = &[
         "an agent or an unknown process made the backup, not you; restoring it writes that \
          process's bytes, so it needs `--created-by-agent`",
     ),
-    // A backup replaced under its name before it was checked in place
-    // (`files_backup_failed`).
+    // A backup replaced under its name, or cut or written into, before it
+    // was checked in place (`files_backup_failed`).
     (
         "substituted",
-        "something replaced the backup inside the vault's directory before it was checked in \
-         place, so it was not taken as written; nothing was deleted",
+        "something replaced or changed the backup inside the vault's directory before it was \
+         checked in place, so it was not taken as written; nothing was deleted",
     ),
 ];
 
