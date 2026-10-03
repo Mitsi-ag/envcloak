@@ -128,6 +128,12 @@ fn main() -> ExitCode {
         .map(|a| a.to_str())
         .collect::<Option<Vec<&str>>>()
     else {
+        // A command this build registers but does not have refuses
+        // whatever its arguments, one that is not UTF-8 included (M2-02's
+        // rule; review M2R-9): its words are read as text, nothing else.
+        if let Some(code) = not_in_this_build_whatever_the_arguments(&args) {
+            return code;
+        }
         eprintln!("envcloak: an argument is not valid UTF-8, which this build does not take");
         return ExitCode::from(USAGE);
     };
@@ -184,6 +190,35 @@ fn main() -> ExitCode {
             ExitCode::from(USAGE)
         }
     }
+}
+
+/// The refusal of an M2 or M2b command this build does not have, or of
+/// `run --pty`, chosen by the words that select it (the first, and for
+/// `agents` and `items` the second; for `run`, `--pty` anywhere before
+/// `--`); `None` for any other command line. No other argument is read.
+fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
+    let word = |i: usize| args.get(i).and_then(|a| a.to_str());
+    Some(match word(0)? {
+        "reveal" => cmd::reveal::run(&[]),
+        "doctor" => cmd::doctor::run(&[]),
+        "scrub" => cmd::scrub::run(&[]),
+        "hook" => cmd::hook::run(&[]),
+        "mcp-bridge" => cmd::mcp_bridge::run(&[]),
+        "standing" => cmd::standing::run(&[]),
+        "login" => cmd::login::run(&[]),
+        "signin" => cmd::signin::run(&[]),
+        "agents" => cmd::agents::run(&[word(1)?]),
+        "items" => cmd::items::run(&[word(1)?]),
+        "run"
+            if args[1..]
+                .iter()
+                .take_while(|a| a.as_os_str() != "--")
+                .any(|a| a.as_os_str() == "--pty") =>
+        {
+            cmd::not_in_this_build("`envcloak run --pty`")
+        }
+        _ => return None,
+    })
 }
 
 fn internal_hardening(hold: bool) -> ExitCode {
