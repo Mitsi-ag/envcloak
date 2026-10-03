@@ -861,6 +861,60 @@ fn a_missing_or_malformed_baseline_fails() {
     );
 }
 
+// --- Policy record kinds (M2-07) ---------------------------------------
+
+const POLICIES: &str = "crates/envcloak-core/src/vault/policies.rs";
+
+/// The policy kinds have a code reader from M2-07 on, which reads
+/// `PolicyKind`: the tree's three landed kinds pass, and a kind renumbered,
+/// one added without a row, a reserved row the code has, and a variant
+/// without its number each fail.
+///
+/// Mutation checked: no reader for the table (`code=None`, as before
+/// M2-07): the tree itself fails ("no code reader"), and so does this.
+#[test]
+fn policy_kinds_are_read_from_the_code() {
+    assert_passes(&repo_root());
+    let t = fixture();
+    edit(
+        &t,
+        POLICIES,
+        "    StandingApproval = 1,\n",
+        "    StandingApproval = 5,\n",
+    );
+    assert_fails(&t, "`standing_approval` is 1 here and 5 in the code");
+    let t = fixture();
+    edit(
+        &t,
+        POLICIES,
+        "    ManagedServer = 3,\n}",
+        "    ManagedServer = 3,\n    Spare = 9,\n}",
+    );
+    assert_fails(
+        &t,
+        "the code has `spare` = 9 in the reserved range with no `landed` row",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        VAULT,
+        "| 2 | `signin_target` | M2-07 | landed |",
+        "| 2 | `signin_target` | M2-07 | reserved |",
+    );
+    assert_fails(
+        &t,
+        "`signin_target` is reserved, but the code already has it",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        POLICIES,
+        "    ManagedServer = 3,\n}",
+        "    ManagedServer = 3,\n    StandingSet,\n}",
+    );
+    assert_fails(&t, "`PolicyKind::StandingSet` has no explicit number");
+}
+
 // --- Readers that read every declaration or refuse it (Codex, PR #14) -----
 
 const AAD: &str = "crates/envcloak-core/src/crypto/aad.rs";

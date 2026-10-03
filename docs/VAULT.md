@@ -431,8 +431,8 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 <!-- reservations:policy_kind -->
 | Number | Kind | Task | Status | Use |
 |---|---|---|---|---|
-| 1 | `standing_approval` | M2-07 | reserved | a standing approval (M2-15), with a slot for the signature M5 adds |
-| 2 | `signin_target` | M2-07 | reserved | a sign-in target (M2b-05) |
-| 3 | `managed_server` | M2-07 | reserved | a managed MCP server with its registered launch or origin (M2-27) |
-| 4 | `standing_set` | M2-07 | reserved | the standing set's generation and digest, if M2-07 keeps it as a policy row |
+| 1 | `standing_approval` | M2-07 | landed | a standing approval (M2-15), with a slot for the signature M5 adds |
+| 2 | `signin_target` | M2-07 | landed | a sign-in target (M2b-05) |
+| 3 | `managed_server` | M2-07 | landed | a managed MCP server with its registered launch or origin (M2-27) |
+| 4 | `standing_set` | spare | reserved | not used: M2-07 keeps the standing set's generation and digest in the sealed header (header record version 2), not as a policy row; the number stays unused |
 <!-- /reservations -->
