@@ -5,12 +5,15 @@
 //! the answer the line came with; [`Daemon::log`] reads whatever the
 //! socket holds before it answers, so it holds every line written before
 //! the call, whether or not the reading thread got to it. The thread only
-//! keeps the socket from filling while no one asks. A line the daemon
+//! keeps the socket from filling while no one asks: it waits until the
+//! socket has bytes (`poll`, no timer) and empties it then, so a daemon
+//! writing a burst of lines, often while it holds its state lock, waits
+//! no longer than the thread takes to be scheduled. A line the daemon
 //! writes after an answer (an event it reports later) is waited for with
-//! a deadline ([`Daemon::wait_for_log`]).
+//! a deadline ([`Daemon::wait_for_log`], [`Daemon::log_when`]).
 
 use std::io::{self, Read};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -23,8 +26,12 @@ use crate::home::TestHome;
 /// How long a daemon may take to start listening.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How often the reading thread empties the socket while no one asks.
-const COLLECT_EVERY: Duration = Duration::from_millis(5);
+/// How long the reading thread waits in one `poll` for bytes; it waits
+/// again when none came. Not a timer: nothing is read when it ends.
+const WAIT_FOR_BYTES: Duration = Duration::from_secs(60);
+
+/// How often a deadline waiter looks at the log again.
+const LOOK_EVERY: Duration = Duration::from_millis(20);
 
 /// What the daemon wrote to standard error, as read so far, and the
 /// socket the rest arrives on.
@@ -63,36 +70,59 @@ impl Collected {
 struct Collector(Arc<Mutex<Collected>>);
 
 impl Collector {
-    /// A collector reading `stream`, the end the test keeps. `every`
-    /// starts the thread that empties it that often; `None` starts none,
-    /// for a test of the barrier.
-    fn start(stream: UnixStream, every: Option<Duration>) -> (Collector, Option<JoinHandle<()>>) {
+    /// A collector reading `stream`, the end the test keeps. `thread`
+    /// starts the thread that empties it whenever it has bytes; `false`
+    /// starts none, for a test of the barrier.
+    fn start(stream: UnixStream, thread: bool) -> (Collector, Option<JoinHandle<()>>) {
         // Read only under the lock, never waiting: see `Collected`.
         let _ = stream.set_nonblocking(true);
+        // The thread waits on its own descriptor of the socket, outside
+        // the lock, so a test's read is never kept waiting by it.
+        let waiter = thread.then(|| stream.try_clone()).and_then(Result::ok);
         let c = Collector(Arc::new(Mutex::new(Collected {
             stream,
             bytes: Vec::new(),
             closed: false,
             drains: 0,
         })));
-        let reader = every.map(|every| {
+        let reader = waiter.map(|waiter| {
             let c = c.clone();
             std::thread::spawn(move || {
                 loop {
-                    let closed = {
-                        let mut g = c.lock();
-                        g.drain();
-                        g.closed
-                    };
-                    if closed {
+                    match envcloak_sys::wait_readable(waiter.as_fd(), WAIT_FOR_BYTES) {
+                        // Bytes, or the writers gone: emptied now.
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        // `poll` itself failed, which it does not on an
+                        // open socket: emptied each time a look would
+                        // have been.
+                        Err(_) => std::thread::sleep(LOOK_EVERY),
+                    }
+                    let mut g = c.lock();
+                    g.drain();
+                    if g.closed {
                         break;
                     }
-                    // Not holding the lock, so a test's read gets it.
-                    std::thread::sleep(every);
                 }
             })
         });
         (c, reader)
+    }
+
+    /// Waits until `done` holds of the log, or `limit` passes, and returns
+    /// the log it last looked at, read after `done` last failed when the
+    /// deadline ended the wait. The one waiter [`Daemon::log_when`] and
+    /// [`Daemon::wait_for_log`] use.
+    fn wait_until(&self, limit: Duration, mut done: impl FnMut(&str) -> bool) -> String {
+        let end = Instant::now() + limit;
+        loop {
+            let log = self.text();
+            if done(&log) || Instant::now() >= end {
+                return log;
+            }
+            std::thread::sleep(LOOK_EVERY);
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Collected> {
@@ -203,7 +233,7 @@ impl Daemon {
         // of the stream once the daemon (and whatever it handed it to)
         // closed it.
         drop(cmd);
-        let (log, reader) = Collector::start(ours, Some(COLLECT_EVERY));
+        let (log, reader) = Collector::start(ours, true);
         Daemon { child, log, reader }
     }
 
@@ -232,17 +262,15 @@ impl Daemon {
     /// Waits until the log holds a line containing `text`, or `limit`
     /// passes, or the daemon exits.
     pub fn wait_for_log(&mut self, text: &str, limit: Duration) -> bool {
-        let end = Instant::now() + limit;
-        loop {
-            if self.log().contains(text) {
-                return true;
-            }
-            if Instant::now() >= end || matches!(self.child.try_wait(), Ok(Some(_))) {
-                // One last look: the log read now holds all it wrote.
-                return self.log().contains(text);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let child = &mut self.child;
+        let mut exited = false;
+        let log = self.log.wait_until(limit, |log| {
+            exited = !log.contains(text) && matches!(child.try_wait(), Ok(Some(_)));
+            exited || log.contains(text)
+        });
+        // After an exit, one last look: the log read now holds all it
+        // wrote.
+        log.contains(text) || (exited && self.log().contains(text))
     }
 
     /// Waits until `done` holds of the log, or `limit` passes, and returns
@@ -251,14 +279,7 @@ impl Daemon {
     /// thread for the connection ends. A line that never comes leaves
     /// `done` false, and the caller's assertions fail on that log.
     pub fn log_when(&self, limit: Duration, done: impl Fn(&str) -> bool) -> String {
-        let end = Instant::now() + limit;
-        loop {
-            let log = self.log();
-            if done(&log) || Instant::now() >= end {
-                return log;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        self.log.wait_until(limit, done)
     }
 
     /// Waits until the daemon says it listens.
@@ -320,7 +341,7 @@ mod tests {
     #[test]
     fn the_log_holds_every_line_written_before_it_is_read() {
         let (ours, mut theirs) = UnixStream::pair().unwrap();
-        let (log, reader) = Collector::start(ours, None);
+        let (log, reader) = Collector::start(ours, false);
         assert!(reader.is_none());
         theirs.write_all(b"one\ntwo\n").unwrap();
         assert_eq!(log.text(), "one\ntwo\n");
@@ -345,43 +366,39 @@ mod tests {
         );
     }
 
-    /// A waiter with a deadline sees a line written after it started
-    /// (a barrier: written once the waiter has looked and not found it),
-    /// and a line never written fails it at the deadline.
+    /// The waiter `Daemon::log_when` and `Daemon::wait_for_log` use sees
+    /// a line written after it started (a barrier: written once the
+    /// waiter has looked, and not found it, twice), and a line never
+    /// written ends it at its deadline, not before, with the log it last
+    /// read.
+    ///
+    /// Mutations: a waiter that looks once (the late line is missed); one
+    /// that returns before its deadline (the missing line's wait is
+    /// short).
     #[test]
     fn a_wait_sees_a_late_line_and_fails_on_a_missing_one() {
         let (ours, mut theirs) = UnixStream::pair().unwrap();
-        let (log, reader) = Collector::start(ours, None);
+        let (log, reader) = Collector::start(ours, false);
         assert!(reader.is_none());
-        let wait = |log: &Collector, text: &str, limit: Duration| {
-            let end = Instant::now() + limit;
-            loop {
-                if log.text().contains(text) {
-                    return true;
-                }
-                if Instant::now() >= end {
-                    return log.text().contains(text);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
         let seen = log.drains();
         let late = {
             let log = log.clone();
             std::thread::spawn(move || {
-                // Once the waiter looked at least once and found nothing.
-                while log.drains() <= seen + 1 {
+                // Once the waiter looked at least twice and found nothing.
+                while log.drains() < seen + 2 {
                     std::thread::yield_now();
                 }
                 theirs.write_all(b"late line\n").unwrap();
                 theirs
             })
         };
-        assert!(wait(&log, "late line", Duration::from_secs(30)));
+        let got = log.wait_until(Duration::from_secs(30), |l| l.contains("late line"));
+        assert!(got.contains("late line"), "the late line was missed");
         let _theirs = late.join().unwrap();
         let start = Instant::now();
-        assert!(!wait(&log, "never written", Duration::from_millis(200)));
-        assert!(start.elapsed() >= Duration::from_millis(200));
+        let got = log.wait_until(Duration::from_millis(200), |l| l.contains("never written"));
+        assert!(start.elapsed() >= Duration::from_millis(200), "left early");
+        assert_eq!(got, "late line\n");
     }
 
     /// The reading thread keeps the socket from filling, and ends once
@@ -389,11 +406,42 @@ mod tests {
     #[test]
     fn the_thread_reads_until_the_writers_close() {
         let (ours, mut theirs) = UnixStream::pair().unwrap();
-        let (log, reader) = Collector::start(ours, Some(COLLECT_EVERY));
+        let (log, reader) = Collector::start(ours, true);
         let big = vec![b'y'; 256 * 1024];
         theirs.write_all(&big).unwrap();
         drop(theirs);
         reader.unwrap().join().unwrap();
         assert_eq!(log.bytes().len(), 256 * 1024);
+    }
+
+    /// The reading thread reads when bytes come, not on a timer: while
+    /// nothing is written it reads nothing, and a writer of 16 MiB (more
+    /// than the socket holds two thousand times over on macOS, where it
+    /// holds 8 KiB, and some eighty times on Linux) finishes well within
+    /// its deadline with no read by the test, as a daemon writing a burst
+    /// of lines under its state lock does.
+    ///
+    /// Mutations: a thread that empties the socket every 5 ms (it reads
+    /// while nothing comes); every second (the writer misses its
+    /// deadline).
+    #[test]
+    fn the_thread_reads_as_bytes_come() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let (log, reader) = Collector::start(ours, true);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(log.lock().drains, 0, "read with nothing written");
+        const BURST: usize = 16 * 1024 * 1024;
+        let writer = std::thread::spawn(move || {
+            theirs.write_all(&vec![b'z'; BURST]).unwrap();
+            theirs
+        });
+        let end = Instant::now() + Duration::from_secs(20);
+        while !writer.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(writer.is_finished(), "the writer was kept waiting");
+        drop(writer.join().unwrap());
+        reader.unwrap().join().unwrap();
+        assert_eq!(log.bytes().len(), BURST);
     }
 }
