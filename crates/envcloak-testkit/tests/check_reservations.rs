@@ -41,12 +41,13 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// A copy of what the script reads (the two documents, the baseline and
-/// every crate's `src/`), under a fresh test home.
+/// A copy of what the script reads (the two documents, the baseline, the
+/// workspace's manifest, and every crate's `src/`, manifest and build
+/// script), under a fresh test home.
 fn fixture() -> TestHome {
     let t = TestHome::new();
     let root = t.home();
-    for rel in ["docs/IPC.md", "docs/VAULT.md", BASELINE] {
+    for rel in ["docs/IPC.md", "docs/VAULT.md", BASELINE, "Cargo.toml"] {
         let dest = root.join(rel);
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::copy(repo_root().join(rel), dest).unwrap();
@@ -55,10 +56,13 @@ fn fixture() -> TestHome {
         let entry = entry.unwrap();
         let src = entry.path().join("src");
         if src.is_dir() {
-            copy_dir(
-                &src,
-                &root.join("crates").join(entry.file_name()).join("src"),
-            );
+            let dest = root.join("crates").join(entry.file_name());
+            copy_dir(&src, &dest.join("src"));
+            for file in ["Cargo.toml", "build.rs"] {
+                if entry.path().join(file).is_file() {
+                    std::fs::copy(entry.path().join(file), dest.join(file)).unwrap();
+                }
+            }
         }
     }
     t
@@ -506,16 +510,19 @@ fn a_token_printed_directly_as_envcloak_token_counts() {
 
 #[test]
 fn text_that_only_mentions_envcloak_is_not_a_printed_token() {
-    // Not a `envcloak: <token>:` prefix: two words, no colon after the
-    // word, or the prefix inside the text. (A placeholder where the token
-    // goes is read: `a_token_printed_from_a_placeholder_is_read_or_refused`.)
+    // Not a `envcloak: <token>:` line: two words, no colon after the
+    // word, or a placeholder inside a line that no colon follows. (A
+    // placeholder where the token goes is read:
+    // `a_token_printed_from_a_placeholder_is_read_or_refused`; and
+    // `envcloak: <token>:` anywhere in a string counts, since a slice of
+    // it prints it: `a_line_made_at_compile_time_is_read_or_refused`.)
     let t = fixture();
     add_file(
         &t,
         CLIENT_STUB,
         "pub fn a() { eprintln!(\"envcloak: pty unavailable: no terminal\"); }\n\
          pub fn b() { eprintln!(\"envcloak: app_required because\"); }\n\
-         pub fn c() -> String { format!(\"[envcloak: incomplete: cut]\") }\n",
+         pub fn c() -> String { format!(\"[envcloak: {} incomplete: cut]\", 3) }\n",
     );
     assert_passes(&t.home());
 }
@@ -1257,7 +1264,7 @@ fn a_failure_token_the_reader_cannot_read_fails() {
         ),
         (
             "pub fn a(x: &'static str) -> Failure { Failure::new(concat!(\"pty_\", x), \"x\") }\n",
-            "a failure token in `concat!` of something other than string literals",
+            "`concat!` of something other than literals",
         ),
         (
             "pub fn a() -> Failure { Failure::new(stringify!(pty_unavailable), \"x\") }\n",
@@ -1673,4 +1680,516 @@ fn a_conditional_with_a_branch_the_reader_cannot_read_fails() {
         "pub fn zz_g(k: u8) -> Failure { Failure::new(match k { 1 => \"io\", _ => \"TOKEN\" }, \"x\") }\n",
         CLIENT_STUB,
     );
+}
+
+/// Appends `text` to the copy of `rel`.
+fn append_to(t: &TestHome, rel: &str, text: &str) {
+    let path = t.home().join(rel);
+    let mut old = std::fs::read_to_string(&path).unwrap();
+    old.push_str(text);
+    std::fs::write(&path, old).unwrap();
+}
+
+/// fail.rs names `Failure`'s token only where the reader has read it or
+/// knows it changes nothing (verifier review of M2-RES1: a destructuring
+/// `let Failure { token, .. } = &mut f; *token = t;` changed a made
+/// failure's token unseen, so `from_parts("pty_unavailable")` passed).
+/// Every way to reach the field is refused: a pattern that binds it
+/// (against `&mut`, with `ref mut`, `token: ref mut`, in an `if let`), an
+/// assignment through a parenthesized place, `clone_from`, a macro that
+/// assigns it, and another struct with a `token` field in fail.rs, whose
+/// field would pass for `Failure`'s.
+///
+/// Mutation checked: `check_fail_rs_tokens` not called: the copies
+/// refused by it pass and this fails.
+#[test]
+fn fail_rs_names_a_failures_token_only_where_it_is_read() {
+    let t = fixture();
+    append_to(
+        &t,
+        FAIL,
+        "impl Failure { pub fn from_parts(t: ExitToken) -> Self { let mut f = Failure::new(\"run_failed\", \"\"); \
+         let Failure { token, .. } = &mut f; *token = t; f } }\n",
+    );
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn g() -> crate::fail::Failure { crate::fail::Failure::from_parts(\"pty_unavailable\") }\n",
+    );
+    let named = "`Failure`'s `token` is named where the reader cannot tell it is not changed";
+    assert_fails(&t, named);
+    for change in [
+        "impl Failure { pub fn zz(&mut self) { let Failure { ref mut token, .. } = *self; *token = \"pty_unavailable\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { let Failure { token: ref mut x, .. } = *self; *x = \"pty_unavailable\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { if let Failure { token, .. } = self { *token = \"pty_unavailable\"; } } }\n",
+        "impl Failure { pub fn zz(&mut self) { (self.token) = \"pty_unavailable\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { self.token.clone_from(&\"pty_unavailable\"); } }\n",
+        "macro_rules! zz_set { ($f:expr) => { let Failure { token, .. } = $f; *token = \"pty_unavailable\"; }; }\n\
+         impl Failure { pub fn zz(&mut self) { zz_set!(self); } }\n",
+        "struct Zz { token: &'static str }\n\
+         pub fn zz(t: &'static str) { let z = Zz { token: t }; eprintln!(\"envcloak: {}: x\", z.token); }\n",
+    ] {
+        let t = fixture();
+        append_to(&t, FAIL, change);
+        assert_fails(&t, named);
+    }
+}
+
+/// `Failure` can be made no way the reader does not read: a derive or an
+/// attribute that would make one (`Default`, a deserializer, one added
+/// under `cfg_attr`) is refused, and so is a module of fail.rs in another
+/// file, which could reach the private field.
+///
+/// Mutations checked: the attribute check removed: the `Default` copy
+/// passes and this fails. The check of fail.rs's modules removed: the
+/// child module's assignment is not seen, the copy passes and this
+/// fails.
+#[test]
+fn a_failure_is_made_no_way_the_reader_does_not_read() {
+    for (derive, expect) in [
+        (
+            "#[derive(Debug, Clone, PartialEq, Eq, Default)]",
+            "`Failure` derives `Default`",
+        ),
+        (
+            "#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]",
+            "`Failure` derives `serde::Deserialize`",
+        ),
+        (
+            "#[derive(Debug, Clone, PartialEq, Eq)]\n#[cfg_attr(test, derive(Default))]",
+            "`Failure` carries `#[cfg_attr(test, derive(Default))]`",
+        ),
+    ] {
+        let t = fixture();
+        edit(
+            &t,
+            FAIL,
+            "#[derive(Debug, Clone, PartialEq, Eq)]\npub struct Failure",
+            &format!("{derive}\npub struct Failure"),
+        );
+        assert_fails(&t, expect);
+    }
+    let t = fixture();
+    append_to(&t, FAIL, "mod zz_child;\n");
+    add_file(
+        &t,
+        "crates/envcloak-client/src/fail/zz_child.rs",
+        "impl super::Failure { pub fn zz(&mut self) { self.token = \"pty_unavailable\"; } }\n",
+    );
+    assert_fails(&t, "fail.rs declares a module in another file");
+}
+
+/// A raw identifier names what the plain one does: `Failure::r#new` is
+/// read as `Failure::new`, and `self.r#token = ..` in fail.rs is refused
+/// as `self.token = ..` is.
+///
+/// Mutation checked: raw identifiers left as written: `r#new` is not
+/// read, the reserved token passes and this fails.
+#[test]
+fn a_raw_identifier_is_read_as_its_name() {
+    assert_counted(
+        "pub fn zz_g() -> Failure { Failure::r#new(\"TOKEN\", \"x\") }\n",
+        CLIENT_STUB,
+    );
+    let t = fixture();
+    append_to(
+        &t,
+        FAIL,
+        "impl Failure { pub fn zz(&mut self) { self.r#token = \"pty_unavailable\"; } }\n",
+    );
+    assert_fails(&t, "`Failure`'s token is changed after it is made");
+}
+
+const RUN_RS: &str = "crates/envcloak-cli/src/cmd/run.rs";
+const ADD_RS: &str = "crates/envcloak-cli/src/cmd/add.rs";
+
+/// Every message `fn parse` can give a usage line, `envcloak: {why}`, is
+/// read as a token argument (verifier review of M2-RES1: `concat!`, a
+/// constant and a helper's `ParseError::Usage("pty_unavailable: ...")`
+/// each printed `envcloak: pty_unavailable: ...` and passed). A message
+/// from `concat!` or a constant counts; one from a helper, a `?` on a
+/// helper's result, a `From` that makes its own message (in run.rs or in
+/// another file) or a last expression other than `Ok`/`Err` is refused.
+///
+/// Mutation checked: `parse_errors` not called (only the strings written
+/// in `fn parse` read, as before): the constant and refused copies pass
+/// and this fails.
+#[test]
+fn every_message_fn_parse_can_give_is_read() {
+    let grace = "return Err(\"--wait-grace needs --wait\".into());";
+    let reserved = format!("`pty_unavailable` is reserved, but the code already has it ({RUN_RS})");
+    for (to, extra, expect) in [
+        (
+            "return Err(concat!(\"pty_unavailable\", \": no terminal\").into());",
+            "",
+            reserved.as_str(),
+        ),
+        (
+            "return Err(ZZ_WHY.into());",
+            "const ZZ_WHY: &str = \"pty_unavailable: no terminal\";\n",
+            reserved.as_str(),
+        ),
+        (
+            "return Err(zz_why());",
+            "fn zz_why() -> ParseError { ParseError::Usage(\"pty_unavailable: no terminal\") }\n",
+            "`fn parse` gives an error the reader cannot read",
+        ),
+        (
+            "zz_check()?;",
+            "fn zz_check() -> Result<(), &'static str> { Err(\"pty_unavailable: x\") }\n",
+            "`fn parse` has a `?` whose error the reader cannot read",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, RUN_RS, grace, to);
+        append_to(&t, RUN_RS, extra);
+        assert_fails(&t, expect);
+    }
+    let t = fixture();
+    edit(
+        &t,
+        RUN_RS,
+        "        ParseError::Usage(why)\n",
+        "        let _ = why;\n        ParseError::Usage(\"pty_unavailable: x\")\n",
+    );
+    assert_fails(
+        &t,
+        "a `From` for `ParseError`, the error of `fn parse`, that does not hand its value to a variant unchanged",
+    );
+    let t = fixture();
+    append_to(
+        &t,
+        "crates/envcloak-cli/src/main.rs",
+        "impl From<u8> for crate::cmd::run::ParseError { fn from(_: u8) -> Self { Self::Usage(\"pty_unavailable: x\") } }\n",
+    );
+    assert_fails(&t, &format!("the error of `fn parse`, outside {RUN_RS}"));
+    let t = fixture();
+    edit(
+        &t,
+        ADD_RS,
+        "    Ok(a)\n}\n\npub fn run",
+        "    zz(a)\n}\n\nfn zz(a: AddArgs) -> Result<AddArgs, &'static str> { let _ = a; Err(\"pty_unavailable: x\") }\n\npub fn run",
+    );
+    assert_fails(
+        &t,
+        "`fn parse` ends with something other than `Ok(..)` or `Err(..)`",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        ADD_RS,
+        ".ok_or(\"an option needs a name after it\")?",
+        ".ok_or(ZZ_WHY)?",
+    );
+    append_to(&t, ADD_RS, "const ZZ_WHY: &str = \"pty_unavailable: x\";\n");
+    assert_fails(
+        &t,
+        &format!("`pty_unavailable` is reserved, but the code already has it ({ADD_RS})"),
+    );
+}
+
+/// A line made at compile time is read wherever its text is, or refused
+/// (verifier review of M2-RES1: `eprintln!(concat!("envcloak: ",
+/// "pty_unavailable", ": x"))` passed). `concat!` in any brackets is read
+/// joined; a literal holding the line anywhere counts (a slice of it
+/// prints it), with any white space after `envcloak:`; a placeholder
+/// after a newline takes the argument its place among the placeholders
+/// gives. Text the reader cannot see is refused:
+/// `stringify!` of `envcloak`, `include_str!`, `env!` of a variable other
+/// than Cargo's own, and `concat!` of anything but literals.
+///
+/// Mutations checked: `concat!` values left out of the strings read: the
+/// first two copies pass and this fails. `envcloak: <token>:` matched at
+/// the start of a string only: the slice passes and this fails. One
+/// space only after `envcloak:`: the tab passes and this fails.
+/// Placeholders read only at the start of a string: the newline copy
+/// passes and this fails. The unreadable macros not refused: those copies
+/// pass and this fails.
+#[test]
+fn a_line_made_at_compile_time_is_read_or_refused() {
+    for body in [
+        "pub fn zz_d() { eprintln!(concat!(\"envcloak: \", \"TOKEN\", \": x\")); }\n",
+        "pub fn zz_d() { eprintln!(concat![\"envcloak: \", \"TOKEN\", \": x\"]); }\n",
+        "const ZZ_L: &str = \"(envcloak: TOKEN: x\";\npub fn zz_d() { eprintln!(\"{}\", &ZZ_L[1..]); }\n",
+        "pub fn zz_d() { eprintln!(\"{}\\nenvcloak: {}: x\", 1, \"TOKEN\"); }\n",
+        "pub fn zz_d() { eprintln!(\"envcloak:\\tTOKEN: x\"); }\n",
+    ] {
+        assert_counted(body, CLIENT_STUB);
+    }
+    for (body, expect) in [
+        (
+            "pub fn zz_d(a: u8, t: &str) { eprintln!(\"{}\\nenvcloak: {}: x\", a, t); }\n",
+            "a failure token the reader cannot read (`t`)",
+        ),
+        (
+            "pub fn zz_d(t: &str) { eprintln!(concat!(\"envcloak: {}\", \": x\"), t); }\n",
+            "a failure token the reader cannot read (`t`)",
+        ),
+        (
+            "pub fn zz_d() { eprintln!(stringify!(envcloak: pty_unavailable: x)); }\n",
+            "`stringify!` of text that holds `envcloak`",
+        ),
+        (
+            "pub fn zz_d() { eprintln!(include_str!(\"zz.txt\")); }\n",
+            "`include_str!` brings in text from another file",
+        ),
+        (
+            "pub fn zz_d() { eprintln!(env!(\"ZZ_LINE\")); }\n",
+            "`env!` of a variable other than Cargo's own package variables",
+        ),
+        (
+            "pub fn zz_d() { eprintln!(concat!(env!(\"CARGO_PKG_NAME\"), \": pty_unavailable: x\")); }\n",
+            "`concat!` of something other than literals",
+        ),
+    ] {
+        let t = fixture();
+        add_file(&t, CLIENT_STUB, body);
+        assert_fails(&t, expect);
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn zz_d(a: u8, f: &Failure) { eprintln!(\"{}\\nenvcloak: {}: x\", a, f.token()); }\n",
+    );
+    assert_passes(&t.home());
+}
+
+/// A constant or a static is read by its whole value (Codex review of
+/// M2-RES1: `"approval_required".split_at(9).1` was read by its leading
+/// literal, though it is `required`). One the reader cannot read, or a
+/// mutable static, is refused where it is named as a token; a static and
+/// a constant naming another are read. A name in capitals is a
+/// constant's: a lint override that would let a local be named so (and
+/// read as a constant of that name in another module), in the sources or
+/// a manifest, is refused, and so is a build script that sets a variable
+/// for `env!`.
+///
+/// Mutations checked: a constant read by its leading literal, and
+/// statics left unread, as before: the `split_at` copy passes, the
+/// static is refused for another reason, and this fails. The lint,
+/// manifest and build-script checks removed: each copy passes and this
+/// fails.
+#[test]
+fn a_constant_is_read_by_its_whole_value() {
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "const ZZ_T: &str = \"approval_required\".split_at(9).1;\n\
+         pub fn zz_a() -> Failure { Failure::new(ZZ_T, \"x\") }\n",
+    );
+    assert_fails(
+        &t,
+        "a failure token names `ZZ_T`, whose value the reader cannot read",
+    );
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "static mut ZZ_T: &str = \"io\";\npub fn zz_a() -> Failure { Failure::new(ZZ_T, \"x\") }\n",
+    );
+    assert_fails(&t, "a failure token names `ZZ_T`, a mutable static");
+    assert_counted(
+        "static ZZ_T: &str = \"TOKEN\";\npub fn zz_a() -> Failure { Failure::new(ZZ_T, \"x\") }\n",
+        CLIENT_STUB,
+    );
+    assert_counted(
+        "const ZZ_A: &str = ZZ_B;\nconst ZZ_B: &str = \"TOKEN\";\n\
+         pub fn zz_a() -> Failure { Failure::new(ZZ_A, \"x\") }\n",
+        CLIENT_STUB,
+    );
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "mod zz_m { pub const ZZ_T: &str = \"io\"; }\n\
+         #[allow(non_snake_case)]\npub fn zz_a() -> Failure { let ZZ_T = \"pty_unavailable\"; Failure::new(ZZ_T, \"x\") }\n",
+    );
+    assert_fails(&t, "`non_snake_case` is allowed");
+    let t = fixture();
+    append_to(
+        &t,
+        "crates/envcloak-client/Cargo.toml",
+        "\n[package.metadata.zz]\nnonstandard_style = \"allow\"\n",
+    );
+    assert_fails(
+        &t,
+        "crates/envcloak-client/Cargo.toml sets `nonstandard_style`",
+    );
+    let t = fixture();
+    add_file(
+        &t,
+        "crates/envcloak-client/build.rs",
+        "fn main() { println!(\"cargo:rustc-env=ZZ_LINE=x\"); }\n",
+    );
+    assert_fails(
+        &t,
+        "crates/envcloak-client/build.rs sets an environment variable for `env!`",
+    );
+}
+
+/// `Failure` named any way Rust allows is read as `Failure` (Codex review
+/// of M2-RES1: `use Failure as failure; failure::new(..)` passed, the
+/// alias reader taking capitalized names only): an alias in lower case,
+/// a generic alias called with a turbofish, an alias in parentheses, and
+/// a lower-case alias of `ExitToken` on a helper's parameter. A type
+/// alias that names `Failure` some other way is refused.
+///
+/// Mutation checked: aliases read only when capitalized, as before: the
+/// lower-case copies pass and this fails.
+#[test]
+fn an_alias_of_failure_in_any_form_is_read() {
+    for body in [
+        "use crate::fail::Failure as failure;\npub fn zz_a() -> failure { failure::new(\"TOKEN\", \"x\") }\n",
+        "type ZzF<'a> = crate::fail::Failure;\npub fn zz_a() -> ZzF<'static> { ZzF::<'static>::new(\"TOKEN\", \"x\") }\n",
+        "type ZzF = (crate::fail::Failure);\npub fn zz_a() -> ZzF { ZzF::new(\"TOKEN\", \"x\") }\n",
+        "use crate::fail::ExitToken as tok;\n\
+         pub fn zz_h(token: tok) -> Failure { Failure::new(token, \"x\") }\n\
+         pub fn zz_g() -> Failure { zz_h(\"TOKEN\") }\n",
+    ] {
+        assert_counted(body, CLIENT_STUB);
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub trait ZzT { type A; }\nimpl ZzT for u8 { type A = crate::fail::Failure; }\ntype ZzF = <u8 as ZzT>::A;\n",
+    );
+    assert_fails(
+        &t,
+        "the type alias `ZzF` names `Failure` in a form the reader cannot read",
+    );
+}
+
+/// The other readers take a value whole too: an MCP tool's `const TOOL`
+/// that goes on past its literal is refused, a statement domain made with
+/// `concat!` is read joined, and a `fn` named by a macro (which could be a
+/// `fn token` the reader does not see) is refused.
+///
+/// Mutations checked: `const TOOL` read by its leading literal: the copy
+/// passes and this fails. `concat!` left out of the statement-domain
+/// reader: the domain is not seen and this fails. The macro `fn` check
+/// removed: the copy passes and this fails.
+#[test]
+fn every_reader_takes_a_value_whole() {
+    let t = fixture();
+    edit(
+        &t,
+        "crates/envcloak-mcp/src/tools/list_secrets.rs",
+        "const TOOL: &str = \"list_secrets\";",
+        "const TOOL: &str = \"list_secrets\".split_at(4).1;",
+    );
+    assert_fails(&t, "`const TOOL` is not one string literal");
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub const ZZ_D: &str = concat!(\"envcloak-zz\", \"statement/1\");\n",
+    );
+    assert_fails(&t, "the code has `envcloak-zzstatement/1`");
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "macro_rules! zz_m { ($n:ident) => { pub fn $n(&self) -> &'static str { \"x\" } }; }\n\
+         pub struct ZzS;\nimpl ZzS { zz_m!(token); }\n",
+    );
+    assert_fails(&t, "a `fn` named by a macro's metavariable");
+}
+
+/// What `fn parse` is, and what it may call, is read as narrowly: a
+/// method named `parse` is not the free `parse(..)` a usage line's match
+/// calls (an imported one, whose messages are not read, is refused); a
+/// macro in `fn parse` could give an error unseen, and is refused; and a
+/// conversion a macro makes for a type it is given could be one into the
+/// error, and is refused.
+///
+/// Mutations checked: methods taken for `fn parse`: the method's message
+/// is read in place of the imported function's, the copy passes and this
+/// fails. The macro check in `fn parse` removed: the macro's hidden
+/// `return Err(..)` passes and this fails. The check of conversions made
+/// by a macro removed: the copy passes and this fails.
+#[test]
+fn fn_parse_is_read_as_narrowly_as_a_token() {
+    let t = fixture();
+    add_file(
+        &t,
+        "crates/envcloak-client/src/zz_other.rs",
+        "pub fn parse(a: &[&str]) -> Result<(), &'static str> { let _ = a; Err(ZZ_WHY) }\n\
+         const ZZ_WHY: &str = \"pty_unavailable: x\";\n",
+    );
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "use crate::zz_other::parse;\npub struct Zz;\n\
+         impl Zz { pub fn parse(a: &[&str]) -> Result<(), &'static str> { let _ = a; Err(\"bad option\") } }\n\
+         pub fn zz_run(a: &[&str]) { match parse(a) { Ok(()) => {}, Err(why) => eprintln!(\"envcloak: {why}\") } }\n",
+    );
+    assert_fails(
+        &t,
+        "a usage line `envcloak: {why}` whose message the reader cannot trace",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        ADD_RS,
+        "            return Err(\"an option is given twice\");",
+        "            zz_bail!();",
+    );
+    append_to(
+        &t,
+        ADD_RS,
+        "macro_rules! zz_bail { () => { return Err(zz_why()) }; }\nfn zz_why() -> &'static str { \"pty_unavailable: x\" }\n",
+    );
+    assert_fails(&t, "`fn parse` calls a macro (`zz_bail!(`)");
+    let t = fixture();
+    append_to(
+        &t,
+        RUN_RS,
+        "macro_rules! zz_conv { ($t:ty) => { impl From<u8> for $t { fn from(_: u8) -> Self { ParseError::Usage(\"pty_unavailable: x\") } } }; }\n\
+         zz_conv!(ParseError);\n",
+    );
+    assert_fails(&t, "a conversion a macro makes for a type it is given");
+}
+
+/// A directory of a crate's sources that cannot be listed is an error,
+/// never one with nothing in it (`os.walk` skips it unless told). Where
+/// this process can list a directory of mode 0 anyway (as root), the case
+/// cannot be made and is skipped with a line.
+///
+/// Mutations checked: `os.walk` without `onerror`, as before, in the
+/// failure-token reader, and in the statement-domain reader: each skips
+/// the directory, its line is missing and this fails.
+#[test]
+fn a_source_directory_that_cannot_be_listed_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let t = fixture();
+    let dir = t.home().join("crates/envcloak-client/src/zz_hidden");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mod.rs"),
+        "pub fn zz() -> crate::fail::Failure { crate::fail::Failure::new(\"pty_unavailable\", \"x\") }\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&dir).is_ok() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!(
+            "a_source_directory_that_cannot_be_listed_fails: a directory of mode 0 lists here (root); skipped"
+        );
+        return;
+    }
+    let out = run(&t.home());
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "expected a failure: {stderr}");
+    for reader in ["`exit_token`", "`statement_domain`"] {
+        assert!(
+            stderr
+                .lines()
+                .any(|l| l.contains(reader) && l.contains("zz_hidden could not be listed")),
+            "{reader}: {stderr}"
+        );
+    }
 }
