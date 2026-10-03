@@ -29,6 +29,19 @@
 //! searches the hook does not see. An exclusion (`!...`) picks nothing
 //! out. A glob past the bounds read ([`MAX_TOKENS`], or too many brace
 //! alternatives) is taken as one that may.
+//!
+//! Where the last component starts is found in the glob's own grammar too
+//! ([`Slash`], the verifier's F119 follow-up): a `/` inside a character
+//! class is one of its members, not a separator, so `[/.]env*` is read
+//! whole; and since a class that holds `/` (or a negated one that does
+//! not leave it out) can match the separator itself in ripgrep
+//! (`sub[/].env` and `sub[!a].env` pick out `sub/.env`, measured with
+//! ripgrep 15.1.0), each such class is read both ways: as a member, and
+//! as the separator before the last component. find's `-path` matches a
+//! `/` with `*` and `?` too, so there each wildcard may end a component
+//! as well; a stretch only known when the command runs may hold one
+//! anywhere. A glob may pick out an env file when any of those readings'
+//! last component may.
 
 use std::collections::HashSet;
 
@@ -40,6 +53,27 @@ use super::{BraceCost, Ch, Word, brace_expand};
 /// The most pieces of one glob's last component read; past it, the glob
 /// may pick out an env file.
 const MAX_TOKENS: usize = 4096;
+
+/// The most places one glob's last component may start at (a `/`, a
+/// class that may match one, or a wildcard that may in find's `-path`);
+/// past it, the glob may pick out an env file.
+const MAX_STARTS: usize = 64;
+
+/// How a tool's glob matches the `/` between a path's components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Slash {
+    /// ripgrep's globs (`--glob`, `--iglob`, and Claude Code's `Grep`),
+    /// grep's `--include` and find's `-name`: `*` and `?` never match a
+    /// `/` (measured with ripgrep 15.1.0: `su*.env` and `sub?.env` pick out
+    /// no `sub/.env`), while a character class that holds one (`[/]`,
+    /// `[.-0]`), or a negated one that does not leave it out (`[!a]`), may.
+    Classes,
+    /// find's `-path` and `-wholename`, which match the whole path as
+    /// `fnmatch` does without `FNM_PATHNAME`: `*`, `?` and classes all
+    /// match a `/` (measured with macOS's find: `./su*env` and `./sub?.env`
+    /// pick out `./sub/.env`; GNU find documents the same).
+    Any,
+}
 
 /// A set of bytes.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -146,10 +180,18 @@ fn tokens(pat: &[Option<u8>]) -> Option<Zeroizing<Vec<Tok>>> {
     Some(out)
 }
 
-/// A character class after its `[`: the set (in one case) and how many
-/// bytes it took, its `]` included; `None` when no `]` closes it. A
-/// stretch only known when the command runs makes it any byte.
-fn class(rest: &[Option<u8>]) -> Option<(Tok, usize)> {
+/// A character class after its `[`, as written: the bytes it lists (its
+/// ranges spelled out), whether it is negated, whether a stretch only
+/// known when the command runs is in it, and how many bytes it took, its
+/// `]` included. `None` when no `]` closes it.
+struct ClassParts {
+    members: Bytes,
+    neg: bool,
+    unknown: bool,
+    used: usize,
+}
+
+fn class_parts(rest: &[Option<u8>]) -> Option<ClassParts> {
     let mut k = 0;
     let neg = matches!(rest.first(), Some(Some(b'!' | b'^')));
     if neg {
@@ -183,17 +225,102 @@ fn class(rest: &[Option<u8>]) -> Option<(Tok, usize)> {
             }
         }
     }
-    let used = k + 1;
-    if unknown {
-        return Some((Tok::One, used));
+    Some(ClassParts {
+        members,
+        neg,
+        unknown,
+        used: k + 1,
+    })
+}
+
+impl ClassParts {
+    /// Whether the class may match a `/`: it lists one (a range included),
+    /// it is negated and does not, or what it holds is only known when the
+    /// command runs.
+    fn may_match_slash(&self) -> bool {
+        self.unknown || self.members.has(b'/') != self.neg
+    }
+}
+
+/// A character class after its `[`, as a piece of a last component: the
+/// set of the bytes it matches there (in one case, never `/`) and how many
+/// bytes it took, its `]` included; `None` when no `]` closes it. A
+/// stretch only known when the command runs makes it any byte.
+fn class(rest: &[Option<u8>]) -> Option<(Tok, usize)> {
+    let c = class_parts(rest)?;
+    if c.unknown {
+        return Some((Tok::One, c.used));
     }
     let mut set = Bytes::default();
     for b in 1..=255u8 {
-        if b != b'/' && members.has(b) != neg {
+        if b != b'/' && c.members.has(b) != c.neg {
             set.add(b.to_ascii_lowercase());
         }
     }
-    Some((Tok::Set(set), used))
+    Some((Tok::Set(set), c.used))
+}
+
+/// Where the last component of the glob `pat` (`None` for a stretch only
+/// known when the command runs) may start, read in its grammar (see the
+/// module documentation): after its last `/` (or `\/`), and after each
+/// piece past that which may match a `/` in `slash`'s tools; at a `*` or
+/// a stretch only known when the command runs, which may hold the `/`
+/// and then the start of the name. `None` past [`MAX_STARTS`] places, or
+/// past a bound on the bytes the classes are scanned for (a glob of many
+/// unclosed `[`), when the glob may pick out an env file.
+fn component_starts(pat: &[Option<u8>], slash: Slash) -> Option<Vec<usize>> {
+    let mut starts = vec![0];
+    let mut scanned = 0usize;
+    let mut i = 0;
+    while i < pat.len() {
+        match pat[i] {
+            Some(b'/') => {
+                starts.clear();
+                starts.push(i + 1);
+                i += 1;
+            }
+            Some(b'\\') if matches!(pat.get(i + 1), Some(Some(_))) => {
+                if pat[i + 1] == Some(b'/') {
+                    starts.clear();
+                    starts.push(i + 2);
+                }
+                i += 2;
+            }
+            Some(b'[') => {
+                scanned = scanned.checked_add(pat.len() - i)?;
+                if scanned > MAX_TOKENS.saturating_mul(MAX_TOKENS) {
+                    return None;
+                }
+                match class_parts(&pat[i + 1..]) {
+                    Some(c) => {
+                        if c.may_match_slash() {
+                            starts.push(i + 1 + c.used);
+                        }
+                        i += 1 + c.used;
+                    }
+                    // No closing `]`: a `[` of its own.
+                    None => i += 1,
+                }
+            }
+            Some(b'*') if slash == Slash::Any => {
+                starts.push(i);
+                i += 1;
+            }
+            Some(b'?') if slash == Slash::Any => {
+                starts.push(i + 1);
+                i += 1;
+            }
+            None => {
+                starts.push(i);
+                i += 1;
+            }
+            Some(_) => i += 1,
+        }
+        if starts.len() > MAX_STARTS {
+            return None;
+        }
+    }
+    Some(starts)
 }
 
 /// The names of env files, in lower case, as an automaton: `.env`, or
@@ -365,10 +492,11 @@ fn as_tool_glob(w: &[Ch]) -> Word {
 }
 
 /// Whether the glob `w` may pick out an env file: each of its brace
-/// alternatives' last component, `**` read as `*`. With `exclusions`, a
-/// glob starting with `!` excludes, and picks out nothing (ripgrep's
-/// globs; a find pattern has no such form).
-pub(super) fn word_may_name_env_file(w: &[Ch], exclusions: bool) -> bool {
+/// alternatives, its last component found as `slash`'s tools read it
+/// (every place it may start, [`component_starts`]), `**` read as `*`.
+/// With `exclusions`, a glob starting with `!` excludes, and picks out
+/// nothing (ripgrep's globs; a find pattern has no such form).
+pub(super) fn word_may_name_env_file(w: &[Ch], exclusions: bool, slash: Slash) -> bool {
     let w: Zeroizing<Word> = Zeroizing::new(as_tool_glob(w));
     if exclusions
         && w.first()
@@ -385,20 +513,20 @@ pub(super) fn word_may_name_env_file(w: &[Ch], exclusions: bool) -> bool {
     };
     let alts = Zeroizing::new(alts);
     alts.iter().any(|a| {
-        let start = a
-            .iter()
-            .rposition(|ch| matches!(ch, Ch::Lit { b: b'/', .. }))
-            .map_or(0, |p| p + 1);
-        let tail: Zeroizing<Vec<Option<u8>>> = Zeroizing::new(
-            a[start..]
-                .iter()
+        let pat: Zeroizing<Vec<Option<u8>>> = Zeroizing::new(
+            a.iter()
                 .map(|ch| match ch {
                     Ch::Lit { b, .. } => Some(*b),
                     Ch::Unknown => None,
                 })
                 .collect(),
         );
-        component_may(&tail)
+        // The verifier's F119 follow-up: a `/` in a class is not cut on
+        // as text, and a class that may match one is read both ways.
+        let Some(starts) = component_starts(&pat, slash) else {
+            return true;
+        };
+        starts.iter().any(|&s| component_may(&pat[s..]))
     })
 }
 
@@ -408,7 +536,7 @@ pub(super) fn word_may_name_env_file(w: &[Ch], exclusions: bool) -> bool {
 pub fn glob_may_name_env_file(glob: &str) -> bool {
     let w: Zeroizing<Word> =
         Zeroizing::new(glob.bytes().map(|b| Ch::Lit { b, quoted: false }).collect());
-    word_may_name_env_file(&w, true)
+    word_may_name_env_file(&w, true, Slash::Classes)
 }
 
 /// Whether Claude Code's `Grep` `glob` may pick out an env file, split as
@@ -480,7 +608,9 @@ pub(super) fn rg_type_add_may_name_env_file(def: &[Ch]) -> bool {
     if let Some(types) = unquoted.strip_prefix(others.as_slice()) {
         return types.split(comma).any(rg_type_may_name_env_file);
     }
-    globs.split(comma).any(|g| word_may_name_env_file(g, true))
+    globs
+        .split(comma)
+        .any(|g| word_may_name_env_file(g, true, Slash::Classes))
 }
 
 #[cfg(test)]
@@ -584,5 +714,71 @@ mod tests {
         // A piece with both braces is one glob: its commas are its own.
         assert!(grep_tool_glob_may_name_env_file("{a,.env}"));
         assert!(!grep_tool_glob_may_name_env_file("{a,b}.rs"));
+    }
+
+    /// The verifier's F119 follow-up (and Codex's cycles 326 and 327): the
+    /// last component was cut at the last `/` byte, so a `/` inside a
+    /// class dropped the name after it (`[/.]env*` allowed while ripgrep
+    /// picks out `.env.local` with it). A class is read in the glob's
+    /// grammar: as a member, and, when it may match a `/` (it holds one,
+    /// or is negated and does not leave it out), as the separator too, so
+    /// `sub[/].env` is `sub/.env`. find's `-path` matches a `/` with `*`
+    /// and `?` as well. ripgrep's answers for the same globs are in
+    /// `tests/grep_glob_oracle.rs`.
+    ///
+    /// Mutations checked: the last component taken at the raw last `/`
+    /// (the previous `rposition` split): the class cases are allowed and
+    /// this fails; find's `-path` read with [`Slash::Classes`]: `x*env`
+    /// and `./sub?.env` are allowed and this fails.
+    #[test]
+    fn a_slash_is_found_by_the_globs_own_grammar() {
+        for g in [
+            // Codex's six.
+            "[/.]env*",
+            "[.-/]env*",
+            "[./]e[n]v*",
+            "[/.][e][n][v]*",
+            "[/\\.]env*",
+            "[.\\/]env*",
+            // A class that may match the separator, read as one.
+            "**[/].env",
+            "sub[/].env",
+            "sub[!a].env",
+            "sub[^a].env",
+            "sub[.-0].env.local",
+            "sub\\/.env",
+            "{x.rs,sub[/].env}",
+        ] {
+            assert!(glob_may_name_env_file(g), "{g}");
+            assert!(grep_tool_glob_may_name_env_file(g), "{g}");
+        }
+        for g in [
+            "src/[a-c]*.rs",
+            "src/[a-c]/main.rs",
+            "src/.env.example",
+            "sub[/]x.rs",
+            "sub[/].env.example",
+            "x[/]",
+            "[!.]nv",
+            "!sub[/].env",
+        ] {
+            assert!(!glob_may_name_env_file(g), "{g}");
+            assert!(!grep_tool_glob_may_name_env_file(g), "{g}");
+        }
+        // Past the bounds read: one that may.
+        assert!(glob_may_name_env_file(&"[".repeat(MAX_TOKENS * 2)));
+        assert!(glob_may_name_env_file(&format!(
+            "{}x.rs",
+            "[/]".repeat(MAX_STARTS + 1)
+        )));
+        // find's `-path`: `*` and `?` match a `/` there; `-name`'s do not.
+        let w = |s: &str| super::super::lits(s.as_bytes());
+        for g in ["x*env", "./sub?.env", "./s*env.local", "./su*[e]nv"] {
+            assert!(word_may_name_env_file(&w(g), false, Slash::Any), "{g}");
+            assert!(!word_may_name_env_file(&w(g), false, Slash::Classes), "{g}");
+        }
+        for g in ["./src/*.rs", "*", "./node_modules/*", "x?y/*.md"] {
+            assert!(!word_may_name_env_file(&w(g), false, Slash::Any), "{g}");
+        }
     }
 }
