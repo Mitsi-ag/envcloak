@@ -589,27 +589,36 @@ fn a_file_backup_comes_back_only_with_a_proof() {
     }
 
     let wrong = SecretBytes::copy_from(b"not the passphrase, not at all");
-    let e = c.files_restore(&b.id, wrong, false, &[]).unwrap_err();
+    let e = c
+        .files_restore(&b.id, wrong, false, false, &[])
+        .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::WrongPassphrase);
     let e = c
         .files_restore(
             &b.id,
             passphrase(&f.cs),
             false,
+            false,
             &["ENVCLOAK_FIXTURE_AGENT".to_owned()],
         )
         .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::ProofRefused);
     let e = c
-        .files_restore("0000000000000000000000000Z", passphrase(&f.cs), false, &[])
+        .files_restore(
+            "0000000000000000000000000Z",
+            passphrase(&f.cs),
+            false,
+            false,
+            &[],
+        )
         .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::NoSuchBackup);
     let e = c
-        .files_restore("nope", passphrase(&f.cs), false, &[])
+        .files_restore("nope", passphrase(&f.cs), false, false, &[])
         .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::NoSuchBackup);
     let back = c
-        .files_restore(&b.id, passphrase(&f.cs), false, &[])
+        .files_restore(&b.id, passphrase(&f.cs), false, false, &[])
         .unwrap();
     assert_eq!(back.files.len(), 1);
     assert_eq!(back.files[0].path, path.to_str().unwrap());
@@ -1541,14 +1550,14 @@ fn a_restore_whose_audit_entry_cannot_be_written_releases_nothing() {
     std::fs::remove_dir_all(&audit).unwrap();
     std::fs::write(&audit, b"in the way").unwrap();
     let e = c
-        .files_restore(&b.id, passphrase(&f.cs), false, &[])
+        .files_restore(&b.id, passphrase(&f.cs), false, false, &[])
         .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::AuditFailed);
     std::fs::remove_file(&audit).unwrap();
     std::fs::create_dir(&audit).unwrap();
     std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o700)).unwrap();
     let back = c
-        .files_restore(&b.id, passphrase(&f.cs), false, &[])
+        .files_restore(&b.id, passphrase(&f.cs), false, false, &[])
         .unwrap();
     assert!(back.files[0].content.as_secret().ct_eq(body.as_bytes()));
     drop((c, back));
@@ -1579,16 +1588,19 @@ fn refusal(e: ClientError) -> (ErrorKind, Option<&'static str>) {
 /// `--created-by-agent` (SPEC §6.4): the daemon seals who made it, never
 /// as the client says, and refuses an unticked restore before the
 /// passphrase is looked at, so a wrong passphrase is not even counted.
-/// Ticked, it comes back, naming its maker; one the terminal made comes
-/// back unticked, naming the terminal.
+/// `files.show` names the maker before any proof (the statement names the
+/// creator), to a caller that may give one only. Ticked, it comes back,
+/// naming its maker, and the restore's audit entry records the form
+/// taken; one the terminal made comes back unticked, naming the
+/// terminal, with no form.
 ///
 /// Mutations: the creator ignored at restore (the unticked restore comes
 /// back); the client's word taken for it (the marker's backup is sealed
 /// as a terminal's); the check after the proof only (the wrong passphrase
-/// is counted).
+/// is counted); the form left out of the audit entry.
 #[test]
 fn a_file_backup_an_agent_made_comes_back_only_when_ticked() {
-    let f = Fixture::new(|_, _| {});
+    let mut f = Fixture::new(|_, _| {});
     let path = f.home.root().join("acme-web/.env");
     let mut c = client(&f.home);
     let backup = |c: &mut envcloak_ipc::Client, claims: Vec<String>| {
@@ -1605,13 +1617,27 @@ fn a_file_backup_an_agent_made_comes_back_only_when_ticked() {
         .id
     };
     let by_agent = backup(&mut c, vec!["ENVCLOAK_FIXTURE_AGENT".to_owned()]);
+    // Who made it, before any proof, as the daemon sealed it.
+    let shown = c.files_show(&by_agent, &[]).unwrap();
+    let maker = shown.creator.clone().unwrap();
+    assert_eq!(maker.kind, "agent");
+    assert!(maker.agent.is_some(), "the agent is not named");
+    assert_eq!(shown.files.len(), 1);
+    assert_eq!(shown.files[0].path, path.to_str().unwrap());
+    assert_eq!(shown.files[0].left, Some(FileLeft::Removed));
+    let e = c.files_show(&by_agent, &[AGENT.to_owned()]).unwrap_err();
+    assert_eq!(rpc(e), ErrorKind::ProofRefused);
+    let e = c.files_show("0000000000000000000000000Z", &[]).unwrap_err();
+    assert_eq!(rpc(e), ErrorKind::NoSuchBackup);
     let failures = || client(&f.home).status().unwrap().approvals.proof_failures;
     let before = failures();
     for pass in [
         passphrase(&f.cs),
         SecretBytes::copy_from(b"not the passphrase, not at all"),
     ] {
-        let e = c.files_restore(&by_agent, pass, false, &[]).unwrap_err();
+        let e = c
+            .files_restore(&by_agent, pass, false, false, &[])
+            .unwrap_err();
         assert_eq!(
             refusal(e),
             (ErrorKind::RestoreRefused, Some("created_by_agent"))
@@ -1619,12 +1645,9 @@ fn a_file_backup_an_agent_made_comes_back_only_when_ticked() {
     }
     assert_eq!(failures(), before, "a refused restore counted an attempt");
     let back = c
-        .files_restore(&by_agent, passphrase(&f.cs), true, &[])
+        .files_restore(&by_agent, passphrase(&f.cs), true, false, &[])
         .unwrap();
-    assert_eq!(
-        back.creator.as_ref().map(|c| c.kind.as_str()),
-        Some("agent")
-    );
+    assert_eq!(back.creator, Some(maker));
     assert!(
         back.files[0]
             .content
@@ -1634,7 +1657,7 @@ fn a_file_backup_an_agent_made_comes_back_only_when_ticked() {
 
     let by_terminal = backup(&mut c, Vec::new());
     let back = c
-        .files_restore(&by_terminal, passphrase(&f.cs), false, &[])
+        .files_restore(&by_terminal, passphrase(&f.cs), false, false, &[])
         .unwrap();
     assert_eq!(
         back.creator,
@@ -1644,6 +1667,91 @@ fn a_file_backup_an_agent_made_comes_back_only_when_ticked() {
         })
     );
     drop((c, back));
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let forms: Vec<Option<&str>> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::FilesRestore)
+        .filter(|e| e.record.decision.outcome == "restored")
+        .map(|e| e.record.decision.reason.as_deref())
+        .collect();
+    assert_eq!(forms, [Some("created_by_agent"), None]);
+    f.sweep();
+}
+
+/// A backup that does not record what the deletion left of a file (one
+/// written here through the vault, as only an earlier writer than
+/// `files.backup` can: `files.backup` takes `left` for every file) comes
+/// back only in the recovery form `unrecorded` (SPEC §6.4), refused
+/// before the passphrase is looked at, so no attempt is counted, whatever
+/// else is ticked. `files.show` says which file's result is not
+/// recorded. In the recovery form it comes back, and its audit entry
+/// records the form.
+///
+/// Mutations: results not looked at (it comes back unrecorded); the form
+/// left out of the audit entry.
+#[test]
+fn a_backup_without_a_result_comes_back_only_in_the_recovery_form() {
+    use envcloak_core::file_backup::{BackupFile, FileBackupCreator};
+    use envcloak_core::file_backup_v2::CreatorKind;
+    let mut id = String::new();
+    let mut f = Fixture::new(|v, _| {
+        let file = |name: &str, left| BackupFile {
+            path: format!("/p/acme-web/{name}"),
+            mode: 0o600,
+            content: SecretBytes::copy_from(b"PORT=8080\n"),
+            left,
+        };
+        let files = [
+            file(".env", None),
+            file(
+                ".env.short",
+                Some(envcloak_core::file_backup::FileLeft::Removed),
+            ),
+        ];
+        let creator = FileBackupCreator {
+            kind: CreatorKind::Terminal,
+            agent: None,
+        };
+        id = v.backup_files(&files, &creator).unwrap().id.to_string();
+    });
+    let mut c = client(&f.home);
+    let shown = c.files_show(&id, &[]).unwrap();
+    let lefts: Vec<Option<FileLeft>> = shown.files.iter().map(|f| f.left.clone()).collect();
+    assert_eq!(lefts, [None, Some(FileLeft::Removed)]);
+    let failures = || client(&f.home).status().unwrap().approvals.proof_failures;
+    let before = failures();
+    for (pass, tick) in [
+        (passphrase(&f.cs), false),
+        (passphrase(&f.cs), true),
+        (
+            SecretBytes::copy_from(b"not the passphrase, not at all"),
+            true,
+        ),
+    ] {
+        let e = c.files_restore(&id, pass, tick, false, &[]).unwrap_err();
+        assert_eq!(
+            refusal(e),
+            (ErrorKind::RestoreRefused, Some("result_unrecorded")),
+            "ticked: {tick}"
+        );
+    }
+    assert_eq!(failures(), before, "a refused restore counted an attempt");
+    let back = c
+        .files_restore(&id, passphrase(&f.cs), false, true, &[])
+        .unwrap();
+    let lefts: Vec<Option<FileLeft>> = back.files.iter().map(|f| f.left.clone()).collect();
+    assert_eq!(lefts, [None, Some(FileLeft::Removed)]);
+    drop((c, back));
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let forms: Vec<Option<&str>> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::FilesRestore)
+        .filter(|e| e.record.decision.outcome == "restored")
+        .map(|e| e.record.decision.reason.as_deref())
+        .collect();
+    assert_eq!(forms, [Some("unrecorded")]);
     f.sweep();
 }
 
@@ -1677,11 +1785,11 @@ fn a_restore_larger_than_a_frame_records_nothing() {
     });
     let mut c = client(&f.home);
     let e = c
-        .files_restore(&ids[0], passphrase(&f.cs), false, &[])
+        .files_restore(&ids[0], passphrase(&f.cs), false, false, &[])
         .unwrap_err();
     assert_eq!(rpc(e), ErrorKind::FrameTooLarge);
     let back = c
-        .files_restore(&ids[1], passphrase(&f.cs), false, &[])
+        .files_restore(&ids[1], passphrase(&f.cs), false, false, &[])
         .unwrap();
     assert_eq!(back.files[0].content.as_secret().len(), 1024);
     drop((c, back));

@@ -95,7 +95,18 @@ fn a_backup_gives_the_files_back_byte_for_byte_and_holds_ciphertext_only() {
 
     let back = v.open_file_backup(&info.id).unwrap();
     assert_eq!(back.creator, Some(creator()));
-    assert_eq!(v.file_backup_creator(&info.id).unwrap(), Some(creator()));
+    let m = v.file_backup_manifest(&info.id).unwrap();
+    assert_eq!(m.creator, Some(creator()));
+    let listed: Vec<(&str, u32, usize, Option<FileLeft>)> = m
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.mode, f.size, f.left))
+        .collect();
+    let want: Vec<(&str, u32, usize, Option<FileLeft>)> = backup
+        .iter()
+        .map(|f| (f.path.as_str(), f.mode, f.content.len(), f.left))
+        .collect();
+    assert_eq!(listed, want);
     let back = back.files;
     assert_eq!(back.len(), 2);
     for (b, (want, orig)) in back.iter().zip(raw.iter().zip(&backup)) {

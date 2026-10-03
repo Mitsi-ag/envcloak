@@ -861,6 +861,16 @@ impl Gate16 {
 
     /// As [`Gate16::new`], with `env` added to the daemon's environment.
     fn with_daemon_env(confirm_kit: bool, env: &[(&str, &str)]) -> Self {
+        Self::build(confirm_kit, env, |_, _| {})
+    }
+
+    /// As [`Gate16::with_daemon_env`], calling `before` with the vault
+    /// and the home before the daemon starts.
+    fn build(
+        confirm_kit: bool,
+        env: &[(&str, &str)],
+        before: impl FnOnce(&envcloak_core::vault::Vault, &TestHome),
+    ) -> Self {
         let cs = with_kept_values(canaries(fresh_seed()));
         let home = TestHome::new();
         let kit = RecoveryKit::generate();
@@ -885,6 +895,7 @@ impl Gate16 {
             Ok(())
         })
         .unwrap();
+        before(&v, &home);
         drop(v);
         let mut cs = cs;
         cs.push(Canary::new("RECOVERY_KIT", kit.to_display().to_string()));
@@ -1495,18 +1506,161 @@ fn undo_keeps_an_entry_taken_out_after_the_deletion() {
     g.sweep();
 }
 
+/// F-78, end to end (Codex review, round 3): a file the deletion
+/// rewrote that the person then deletes whole stays deleted: `init
+/// --undo` reports it `deleted_since` and makes nothing there, since SPEC
+/// §6.4 restores only while the file is what the deletion left, and puts
+/// back `.env.short`, which the deletion removed.
+///
+/// Mutation: a missing file made whatever the backup recorded (the old
+/// behaviour: `.env` comes back).
+#[test]
+fn undo_leaves_a_file_deleted_since_the_deletion_deleted() {
+    let g = Gate16::new(true);
+    ok(&g.import(), &g.cs);
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--delete-plaintext", "--json"],
+        &[],
+    );
+    ok(&out, &g.cs);
+    let backup = json(&out)["delete"]["backup"].as_str().unwrap().to_owned();
+    let env = g.repo.join(".env");
+    assert!(env.exists(), "the deletion did not rewrite .env");
+    assert!(!g.repo.join(".env.short").exists());
+    // The person then deletes what the deletion left of `.env`.
+    std::fs::remove_file(&env).unwrap();
+    let pass = g.home.root().join("pass");
+    std::fs::write(
+        &pass,
+        format!("{}\n", by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str()),
+    )
+    .unwrap();
+    let out = person_in(
+        &g.home,
+        &g.repo,
+        &["init", "--undo", &backup, "--passphrase-fd", "3", "--json"],
+        &[(3, &pass, true)],
+    );
+    std::fs::remove_file(&pass).unwrap();
+    assert_no_canary(&out.stdout, &g.cs);
+    assert_no_canary(&out.stderr, &g.cs);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("undo_incomplete"), "{}", stderr(&out));
+    assert_eq!(
+        undo_states(&out),
+        [
+            (".env".to_owned(), "deleted_since".to_owned()),
+            (".env.short".to_owned(), "restored".to_owned()),
+        ]
+    );
+    assert!(!env.exists(), "the deleted file came back");
+    assert_eq!(g.intact(), [false, true]);
+    g.sweep();
+}
+
+/// F-78's recovery form (Codex review, round 3; SPEC §6.4): a backup
+/// that does not record what the deletion left (here one written through
+/// the vault before the daemon starts, as only an earlier writer than
+/// `files.backup` can: it takes `left` for every file) is written back
+/// only with `--unrecorded`. Without it the CLI shows the statement,
+/// which names the maker and says the results are not recorded, and
+/// refuses before it asks for the passphrase, writing nothing. With it a
+/// missing file is written back and a file there is left as it is
+/// (`exists`), since nothing says what the deletion left of it.
+///
+/// Mutations: the CLI not sending `--unrecorded` (the daemon refuses the
+/// restore); the CLI not asking for the form before the passphrase (the
+/// daemon's refusal comes instead).
+#[test]
+fn undo_writes_an_unrecorded_backup_back_only_in_the_recovery_form() {
+    use envcloak_core::file_backup::{BackupFile, FileBackupCreator};
+    use envcloak_core::file_backup_v2::CreatorKind;
+    let left: &[u8] = b"PORT=8080\n";
+    let mut id = String::new();
+    let g = Gate16::build(true, &[], |v, home| {
+        let dir = std::fs::canonicalize(home.root()).unwrap().join("acme-web");
+        let file = |name: &str| BackupFile {
+            path: dir.join(name).to_str().unwrap().to_owned(),
+            mode: 0o600,
+            content: SecretBytes::copy_from(left),
+            left: None,
+        };
+        let creator = FileBackupCreator {
+            kind: CreatorKind::Terminal,
+            agent: None,
+        };
+        id = v
+            .backup_files(&[file(".env"), file(".env.short")], &creator)
+            .unwrap()
+            .id
+            .to_string();
+    });
+    let short = g.repo.join(".env.short");
+    std::fs::remove_file(&short).unwrap();
+    let pass = g.home.root().join("pass");
+    std::fs::write(
+        &pass,
+        format!("{}\n", by_label(&g.cs, labels::VAULT_PASSPHRASE).as_str()),
+    )
+    .unwrap();
+    let undo = |extra: &[&str]| {
+        let mut args = vec!["init", "--undo", &id];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--passphrase-fd", "3", "--json"]);
+        let out = person_in(&g.home, &g.repo, &args, &[(3, &pass, true)]);
+        assert_no_canary(&out.stdout, &g.cs);
+        assert_no_canary(&out.stderr, &g.cs);
+        out
+    };
+
+    let out = undo(&[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let e = stderr(&out);
+    assert!(
+        e.contains("The backup was made from a terminal;")
+            && e.contains("It does not record what the deletion left of every file")
+            && e.contains(
+                "envcloak: restore_refused: the backup does not record what the deletion left \
+                 of every file (the statement above says so)"
+            ),
+        "{e}"
+    );
+    assert!(!short.exists(), "written back without the recovery form");
+    assert_eq!(g.intact(), [true, false]);
+
+    let out = undo(&["--unrecorded"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("undo_incomplete"), "{}", stderr(&out));
+    assert_eq!(
+        undo_states(&out),
+        [
+            (".env".to_owned(), "exists".to_owned()),
+            (".env.short".to_owned(), "restored".to_owned()),
+        ]
+    );
+    assert!(std::fs::read(&short).unwrap() == left, "not written back");
+    assert!(g.intact()[0], ".env was replaced");
+    std::fs::remove_file(&pass).unwrap();
+    g.sweep();
+}
+
 /// A backup an agent stored (any client may store one) is not written
 /// back by `init --undo` unless the person ticks `--created-by-agent`:
 /// the daemon seals who made it, so a backup crafted to replace `.env`
 /// (its `left` the SHA-256 of the file there now, its contents the
-/// agent's) is refused before the passphrase is looked at, and the file
-/// is left as it is. Ticked, the statement says so, the file is written
-/// back and the report names the agent as its maker (its kind `unknown`
-/// here, the test process having no terminal session).
+/// agent's) is refused before the passphrase is asked for, after the
+/// statement names its maker, and the file is left as it is. Ticked, the
+/// statement names the maker before the passphrase and repeats the tick,
+/// the file is written back and the report names the agent as its maker
+/// (its kind `unknown` here, the test process having no terminal
+/// session).
 ///
-/// Mutations: the daemon ignoring who made a backup (the unticked undo
-/// replaces `.env`); the CLI not sending the tick (the ticked undo is
-/// refused).
+/// Mutations: the statement not naming the maker (the old generic text);
+/// the CLI not asking for the tick before the passphrase (the daemon's
+/// refusal comes instead, after it); the CLI not sending the tick (the
+/// ticked undo is refused).
 #[test]
 fn undo_writes_an_agents_backup_back_only_when_ticked() {
     let g = Gate16::new(true);
@@ -1551,10 +1705,13 @@ fn undo_writes_an_agents_backup_back_only_when_ticked() {
 
     let out = undo(&[]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
-    let e = stderr(&out);
+    let refused = stderr(&out);
     assert!(
-        e.contains("envcloak: restore_refused:") && e.contains("--created-by-agent"),
-        "{e}"
+        refused.contains(
+            "envcloak: restore_refused: the backup was not made from a terminal with no agent \
+             in it (the statement above names who made it)"
+        ) && refused.contains("--created-by-agent"),
+        "{refused}"
     );
     assert!(
         std::fs::read(&env).unwrap() == now,
@@ -1563,18 +1720,25 @@ fn undo_writes_an_agents_backup_back_only_when_ticked() {
 
     let out = undo(&["--created-by-agent"]);
     assert!(out.status.success(), "{}", stderr(&out));
+    let ticked = stderr(&out);
     assert!(
-        stderr(&out).contains("--created-by-agent: this backup may have been made by an agent"),
-        "{}",
-        stderr(&out)
+        ticked
+            .contains("--created-by-agent: its bytes are written back as the process that made it"),
+        "{ticked}"
     );
     assert!(std::fs::read(&env).unwrap() == planted, "not written back");
     // Not a terminal's: an agent, or (this test process has no terminal
-    // session) an unknown process, under the fixture agent's label.
+    // session) an unknown process, under the fixture agent's label, which
+    // both statements name before the passphrase, with the file.
     let r = json(&out);
     let kind = r["creator"]["kind"].as_str().unwrap_or("none");
     assert!(kind == "agent" || kind == "unknown", "made by {kind}");
-    assert!(r["creator"]["agent"].is_string(), "no agent named");
+    let label = r["creator"]["agent"].as_str().expect("no agent named");
+    let named = format!("({label}), not by you; it holds {}.", env.display());
+    for e in [&refused, &ticked] {
+        assert!(e.contains("The backup was made by "), "{e}");
+        assert!(e.contains(&named), "{e}");
+    }
     assert_eq!(
         undo_states(&out),
         [(".env".to_owned(), "restored".to_owned())]

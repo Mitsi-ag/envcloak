@@ -798,13 +798,59 @@ pub enum FileLeft {
     Rewritten(String),
 }
 
+/// `files.show`: what a file backup is, from its sealed manifest, for
+/// the statement `envcloak init --undo` shows before the passphrase (SPEC
+/// §6.4: the restore statement names the creator): who made it, and each
+/// file's path and what the deletion left of it. Metadata only, for a
+/// caller that may give a proof, as `files.restore` is.
+#[derive(Debug)]
+pub struct FilesShow;
+
+impl Method for FilesShow {
+    const NAME: &'static str = "files.show";
+    type Params = FilesShowParams;
+    type Output = FilesShown;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesShowParams {
+    /// The backup's id: 26 Crockford base32 characters.
+    pub backup: String,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// What `files.show` answers: [`RestoredFiles`] without the files' modes
+/// and bytes, so it fits in a frame whenever the restore's answer does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesShown {
+    /// As [`RestoredFiles::creator`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<FileBackupCreatorView>,
+    pub files: Vec<ShownFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShownFile {
+    pub path: String,
+    /// As [`RestoredFile::left`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<FileLeft>,
+}
+
 /// `files.restore`: the files of a backup, byte for byte, for `envcloak
 /// init --undo`, which writes them back. It hands plaintext to the
 /// client, so it is a proof: the passphrase, from a terminal subject
-/// (SPEC §10b), as `items.rotate` is. A backup an agent or an unknown
-/// process made, or one that does not record who made it, comes back only
-/// with `created_by_agent_ticked`, refused before the passphrase is looked
-/// at, as `backup.v2.open_restore` refuses one (SPEC §6.4).
+/// (SPEC §10b), as `items.rotate` is. Before the passphrase is looked at,
+/// as `backup.v2.open_restore` refuses one (SPEC §6.4): a backup that
+/// does not record what the deletion left of a file, or who made it,
+/// comes back only with `unrecorded` (the recovery form), and one an
+/// agent or an unknown process made, or that does not record who made
+/// it, only with `created_by_agent_ticked`.
 #[derive(Debug)]
 pub struct FilesRestore;
 
@@ -824,6 +870,11 @@ pub struct FilesRestoreParams {
     /// agent or an unknown process made.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub created_by_agent_ticked: bool,
+    /// The recovery form `--unrecorded`: the backup may not record what
+    /// the deletion left, so the client writes back only a file that is
+    /// missing.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub unrecorded: bool,
     /// As [`UnlockParams::claims`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<String>,
@@ -848,8 +899,8 @@ pub struct RestoredFile {
     pub mode: u32,
     pub content: WireSecret,
     /// What the deletion left of it, as its backup recorded; none for a
-    /// backup made before that was recorded, which then replaces no file
-    /// that is there (F-78).
+    /// backup made before that was recorded, which then writes back only
+    /// a file that is missing, and only with `unrecorded` (F-78).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left: Option<FileLeft>,
 }
@@ -1101,7 +1152,7 @@ impl Method for BackupList {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 35] = [
+pub const CLIENT_METHODS: [&str; 36] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1126,6 +1177,7 @@ pub const CLIENT_METHODS: [&str; 35] = [
     ImportCommit::NAME,
     ImportVerify::NAME,
     FilesBackup::NAME,
+    FilesShow::NAME,
     FilesRestore::NAME,
     RecoveryConfirm::NAME,
     BackupCreate::NAME,

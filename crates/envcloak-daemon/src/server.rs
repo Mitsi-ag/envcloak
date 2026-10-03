@@ -55,7 +55,7 @@ use envcloak_core::{RecoveryKit, check_passphrase, create_vault_with_kit};
 use envcloak_ipc::proto::{
     self, Approve, AuditVerify, BackupBegin, BackupCommit, BackupCreate, BackupList,
     BackupOpenRestore, BackupPut, BackupRead, BackupRecordResult, Deny, ErrorKind, FilesBackup,
-    FilesRestore, GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify,
+    FilesRestore, FilesShow, GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify,
     IncomingRequest, ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow,
     ItemsTarget, Lock, Method, PendingGet, PendingList, PendingPoll, RecoveryConfirm, Role,
     RunRequest, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams, VaultRecover,
@@ -785,6 +785,7 @@ fn respond<'s>(
         FilesBackup::NAME => {
             answer::<FilesBackup>(id, &req, |p| import::files_backup(shared, peer, p))
         }
+        FilesShow::NAME => answer::<FilesShow>(id, &req, |p| import::files_show(shared, peer, p)),
         FilesRestore::NAME => {
             framed::<FilesRestore>(id, &req, |p| import::files_restore(shared, peer, id, p))
         }

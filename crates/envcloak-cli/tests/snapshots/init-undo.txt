@@ -6,3 +6,4 @@ Backup <ULID>
   <ROOT>/acme-web/.env.short: restored
 --- stderr
 Write back the env files of backup <ULID> into <ROOT>/acme-web. They hold plaintext secrets; a file there now is replaced only when it is exactly what the deletion left of it, any other is left alone, and nothing is written anywhere else.
+The backup was made from a terminal; it holds <ROOT>/acme-web/.env, <ROOT>/acme-web/.env.short.

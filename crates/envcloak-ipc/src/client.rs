@@ -56,10 +56,10 @@ use crate::proto::{
     BackupRecordResult, BackupResultParams, OpenRestoreParams,
 };
 use crate::proto::{
-    BackupCreate, FilesBackup, FilesBackupParams, FilesRestore, FilesRestoreParams, ImportCommit,
-    ImportCommitParams, ImportParams, ImportPlan, ImportVerify, PendingList, PendingListParams,
-    PendingPoll, PendingStateParams, RecoverParams, RecoveryConfirm, RecoveryConfirmParams,
-    RestoredFiles, VaultRecover, VerifyParams,
+    BackupCreate, FilesBackup, FilesBackupParams, FilesRestore, FilesRestoreParams, FilesShow,
+    FilesShowParams, FilesShown, ImportCommit, ImportCommitParams, ImportParams, ImportPlan,
+    ImportVerify, PendingList, PendingListParams, PendingPoll, PendingStateParams, RecoverParams,
+    RecoveryConfirm, RecoveryConfirmParams, RestoredFiles, VaultRecover, VerifyParams,
 };
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
@@ -707,9 +707,22 @@ impl Client {
         self.call::<FilesBackup>(p)
     }
 
+    /// `files.show`: who made backup `id` and what its files are, without
+    /// their bytes, for the statement before the proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn files_show(&mut self, id: &str, claims: &[String]) -> Result<FilesShown, ClientError> {
+        self.call::<FilesShow>(&FilesShowParams {
+            backup: id.to_owned(),
+            claims: claims.to_vec(),
+        })
+    }
+
     /// `files.restore`: the files of backup `id`, with the passphrase as
     /// the proof; `created_by_agent_ticked` when the person ticked
-    /// `--created-by-agent`.
+    /// `--created-by-agent`, `unrecorded` for the recovery form
+    /// `--unrecorded`.
     ///
     /// # Errors
     /// As [`Client::call`].
@@ -718,12 +731,14 @@ impl Client {
         id: &str,
         passphrase: SecretBytes,
         created_by_agent_ticked: bool,
+        unrecorded: bool,
         claims: &[String],
     ) -> Result<RestoredFiles, ClientError> {
         self.call::<FilesRestore>(&FilesRestoreParams {
             backup: id.to_owned(),
             passphrase: WireSecret::new(passphrase),
             created_by_agent_ticked,
+            unrecorded,
             claims: claims.to_vec(),
         })
     }
