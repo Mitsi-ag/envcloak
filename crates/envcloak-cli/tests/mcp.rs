@@ -119,9 +119,9 @@ sys.exit(code if code >= 0 else 128 - code)
 /// Takes an exclusive lock on argv[1] and forks a descendant that lets go
 /// of it, takes one on argv[2], ignores SIGTERM and keeps the standard
 /// streams, so it holds `envcloak run`'s pipes; once the descendant is set
-/// up, makes argv[3] and exits 0, so the first lock is free again as soon
-/// as it has exited. The descendant waits while argv[4] exists (at most
-/// 600 s), the second lock free again only once it is gone.
+/// up, makes argv[3] holding its own pid and exits 0. The descendant waits
+/// while argv[4] exists (at most 600 s), the second lock free again only
+/// once it is gone.
 const LEAVES_A_WRITER: &str = r#"import fcntl, os, signal, sys, time
 own, held, ready, life = sys.argv[1:5]
 deadline = time.time() + 600
@@ -141,7 +141,9 @@ if os.fork() == 0:
     os._exit(0)
 os.close(w)
 os.read(r, 1)
-open(ready, "w").close()
+with open(ready + ".tmp", "w") as f:
+    f.write(str(os.getpid()))
+os.rename(ready + ".tmp", ready)
 "#;
 
 /// Reads its standard input to the end and says how much it read.
@@ -1910,15 +1912,21 @@ fn a_call_cancelled_while_it_waits_starts_nothing_when_approved_after() {
 /// which owns the command's group, kills it before it reaps the command,
 /// which it now does only after the output; on the agent's terminal the
 /// server kills its own child's group, which holds the command. The call
-/// is answered nothing. A round whose call was answered, because its 2
-/// seconds ran out before the cancellation reached `envcloak run` (the
-/// command then ended by itself, and what it left runs on, as documented),
-/// proves nothing and is run again, at most 3 times.
+/// is answered nothing. The cancellation is sent once the command has
+/// exited: a zombie (`ps` shows it `Z`), which `envcloak run` reaps only
+/// after its output, so while the output drains (verifier review of
+/// M2-06: the command's own lock, the barrier before, is freed during
+/// Python's shutdown, before the process is a zombie, so the cancellation
+/// could come while it still ran, and the drain path the gate exists for
+/// did not run). A round whose call was answered, because its 2 seconds
+/// ran out before the cancellation reached `envcloak run` (the command
+/// then ended by itself, and what it left runs on, as documented), proves
+/// nothing and is run again, at most 3 times.
 ///
 /// Mutation checked: `envcloak run` reaping the command before reading
 /// its output (no `end_group` after the drain): without a terminal the
 /// cancellation stops `envcloak run` at once, the descendant runs on
-/// holding its lock, and this fails.
+/// holding its lock, and this fails, in each of five repeated runs.
 fn a_call_cancelled_while_its_output_drains_leaves_nothing(terminal: bool) {
     let f = Fixture::new();
     let dir = f.project.to_str().unwrap();
@@ -1967,12 +1975,13 @@ fn a_call_cancelled_while_its_output_drains_leaves_nothing(terminal: bool) {
         }
         let held = std::fs::File::open(&lock).unwrap();
         assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
-        // The command's own lock is free once it has exited.
-        let mine = std::fs::File::open(&own).unwrap();
-        while !envcloak_sys::try_lock_exclusive(&mine).unwrap() {
-            assert!(Instant::now() < end, "the command did not exit");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // The command has exited: a zombie, which `envcloak run` reaps only
+        // after its output. Its pid is observed, never signalled.
+        let pid = std::fs::read_to_string(&ready).unwrap();
+        assert!(
+            zombie_within(pid.trim(), Duration::from_secs(30)),
+            "the command did not exit"
+        );
         m.send(
             &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
             "params": {"requestId": call}}),
@@ -2008,6 +2017,30 @@ fn a_call_cancelled_while_its_output_drains_leaves_nothing(terminal: bool) {
         );
     }
     panic!("terminal {terminal}: each round's output ended before its cancellation came");
+}
+
+/// Whether process `pid` is a zombie (`ps` shows it `Z`) within `limit`:
+/// it has exited and its parent has not reaped it. The process is only
+/// observed.
+fn zombie_within(pid: &str, limit: Duration) -> bool {
+    let end = Instant::now() + limit;
+    loop {
+        let zombie = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim_start()
+                    .starts_with('Z')
+            });
+        if zombie {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// [`a_call_cancelled_while_its_output_drains_leaves_nothing`] without a

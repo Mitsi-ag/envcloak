@@ -1695,7 +1695,7 @@ if os.fork() == 0:
     os._exit(0)
 os.close(w)
 os.read(r, 1)
-os.write(1, b"ready\n")
+os.write(1, b"pid=%d\nready\n" % os.getpid())
 "#;
 
 /// Without a terminal, a SIGTERM that comes after the child exited, while
@@ -1705,13 +1705,18 @@ os.write(1, b"ready\n")
 /// still the child's: the child is reaped only once its output has been
 /// read. `envcloak mcp` cancels a call so in those 2 seconds, and nothing
 /// holding the injected values may outlive it (Codex review of M2-06,
-/// high). The SIGTERM is sent once the child's own lock is free, so after
-/// its exit, which the runner sees at once.
+/// high). The SIGTERM is sent once the child has exited: a zombie (`ps`
+/// shows it `Z`), which the runner reaps only after its output, so before
+/// the reap. The child's own lock is no such barrier (verifier review of
+/// M2-06: Python frees it during its shutdown, before the process is a
+/// zombie, so the SIGTERM could reach a child still running, be passed
+/// on, and end the group before the drain path ran; the gate failed 2 runs
+/// in 7 on a correct tree).
 ///
 /// Mutation checked: the group not killed once the output has been read
 /// (no second `end_group` before the reap): the runner stops at the
 /// SIGTERM and exits, the descendant runs on holding its lock, and this
-/// fails.
+/// fails, in each of five repeated runs.
 fn without_a_terminal_a_sigterm_while_the_output_drains_ends_the_childs_group() {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
@@ -1739,13 +1744,13 @@ fn without_a_terminal_a_sigterm_while_the_output_drains_ends_the_childs_group() 
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
     let held = std::fs::File::open(&lock).unwrap();
     assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
-    // The child's own lock is free once it has exited.
-    let child_lock = std::fs::File::open(&own).unwrap();
-    let end = Instant::now() + Duration::from_secs(30);
-    while !envcloak_sys::try_lock_exclusive(&child_lock).unwrap() {
-        assert!(Instant::now() < end, "the child did not exit");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // The child has exited: a zombie, not reaped while its output drains.
+    let child = field(&p.captured(0), "pid");
+    let child = (child, envcloak_sys::process_start_time(child).ok());
+    assert!(
+        exited_within(child, Duration::from_secs(30)),
+        "the child did not exit"
+    );
     assert!(
         !envcloak_sys::try_lock_exclusive(&held).unwrap(),
         "the descendant did not outlive the child"
