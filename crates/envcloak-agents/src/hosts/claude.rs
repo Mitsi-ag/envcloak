@@ -23,7 +23,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -141,7 +141,8 @@ pub fn registered(claude_json: &[u8]) -> Result<Option<Value>, Refusal> {
 }
 
 /// Runs `claude` with `args`, with only the environment Claude Code needs
-/// to find its files from `env`, within 60 seconds.
+/// to find its files from `env`, within 60 seconds, its output read within
+/// them too ([`crate::detect::run_bounded`]).
 ///
 /// # Errors
 /// When it cannot start or does not finish in time.
@@ -177,55 +178,17 @@ pub fn run(
             cmd.env(k, v);
         }
     }
-    let mut child = cmd.spawn().map_err(|_| {
-        Refusal::new(
+    match crate::detect::run_bounded(&mut cmd, CLI_LIMIT, 1 << 20) {
+        Ok(out) => Ok(out),
+        Err(crate::detect::Bounded::Failed) => Err(Refusal::new(
             "host_cli_failed",
             "Claude Code's `claude` command could not be started",
-        )
-    })?;
-    let (out, err) = (child.stdout.take(), child.stderr.take());
-    let read = |s: Option<std::process::ChildStdout>| {
-        std::thread::spawn(move || {
-            let mut v = Vec::new();
-            if let Some(mut s) = s {
-                let _ =
-                    std::io::Read::read_to_end(&mut std::io::Read::take(&mut s, 1 << 20), &mut v);
-            }
-            v
-        })
-    };
-    let out_t = read(out);
-    let err_t = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        if let Some(mut s) = err {
-            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(&mut s, 1 << 20), &mut v);
-        }
-        v
-    });
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) if start.elapsed() < CLI_LIMIT => {
-                std::thread::sleep(Duration::from_millis(25))
-            }
-            Ok(None) | Err(_) => break None,
-        }
-    };
-    let Some(status) = status else {
-        // This process's own unreaped child: the signal reaches it.
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(Refusal::new(
+        )),
+        Err(crate::detect::Bounded::Timeout) => Err(Refusal::new(
             "host_cli_failed",
             "Claude Code's `claude mcp` command did not finish within 60 seconds",
-        ));
-    };
-    Ok(Output {
-        status,
-        stdout: out_t.join().unwrap_or_default(),
-        stderr: err_t.join().unwrap_or_default(),
-    })
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -15,7 +15,8 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::hook::Host;
@@ -134,7 +135,7 @@ pub fn detect(
         .env("PATH", path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let own = match host {
         Host::ClaudeCode => "CLAUDE_CONFIG_DIR",
         Host::Codex => "CODEX_HOME",
@@ -156,24 +157,56 @@ pub fn detect(
 }
 
 /// Runs `cmd`, reading at most [`MAX_OUTPUT`] bytes of its standard
-/// output, and returns that output when it exits 0 within `limit`. A
-/// child past the limit is killed while it is this process's own unreaped
-/// child, then reaped. `Err(true)` is a timeout, `Err(false)` a failure.
+/// output, and returns that output when it exits 0 within `limit`.
+/// `Err(true)` is a timeout, `Err(false)` a failure.
 fn run_limited(cmd: &mut Command, limit: Duration) -> Result<Vec<u8>, bool> {
-    let mut child = cmd.spawn().map_err(|_| false)?;
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
+    match run_bounded(cmd, limit, MAX_OUTPUT) {
+        Ok(out) if out.status.success() => Ok(out.stdout),
+        Ok(_) => Err(false),
+        Err(Bounded::Timeout) => Err(true),
+        Err(Bounded::Failed) => Err(false),
+    }
+}
+
+/// Why [`run_bounded`] has no output to give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bounded {
+    /// The command, or the reading of its output, was not done in time.
+    Timeout,
+    /// It could not be started.
+    Failed,
+}
+
+/// A pipe's contents, read on a thread of its own, at most `max` bytes.
+fn read_pipe(pipe: Option<impl Read + Send + 'static>, max: u64) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut out = Vec::new();
-        if let Some(s) = stdout {
-            let _ = s.take(MAX_OUTPUT).read_to_end(&mut out);
+        if let Some(p) = pipe {
+            let _ = p.take(max).read_to_end(&mut out);
         }
-        out
+        let _ = tx.send(out);
     });
+    rx
+}
+
+/// Runs `cmd` with its standard output and error piped, and has its exit
+/// status and at most `max` bytes of each within `limit` of its start, or
+/// [`Bounded::Timeout`]. The whole wait is bounded, the reading of the
+/// output included: a process the command left behind that keeps a pipe
+/// open (Codex review) ends the wait at the limit, its reader left to
+/// finish on its own. A command past the limit is killed while it is
+/// this process's own unreaped child (D-34), then reaped.
+pub(crate) fn run_bounded(cmd: &mut Command, limit: Duration, max: u64) -> Result<Output, Bounded> {
     let start = Instant::now();
+    let deadline = start + limit;
+    let mut child = cmd.spawn().map_err(|_| Bounded::Failed)?;
+    let out_rx = read_pipe(child.stdout.take(), max);
+    let err_rx = read_pipe(child.stderr.take(), max);
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) | Err(_) => break None,
         }
     };
@@ -182,15 +215,16 @@ fn run_limited(cmd: &mut Command, limit: Duration) -> Result<Vec<u8>, bool> {
         // the wait reaps it.
         let _ = child.kill();
         let _ = child.wait();
-        let _ = reader.join();
-        return Err(true);
+        return Err(Bounded::Timeout);
     };
-    let out = reader.join().map_err(|_| false)?;
-    if status.success() {
-        Ok(out)
-    } else {
-        Err(false)
-    }
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let stdout = out_rx.recv_timeout(left()).map_err(|_| Bounded::Timeout)?;
+    let stderr = err_rx.recv_timeout(left()).map_err(|_| Bounded::Timeout)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
@@ -223,5 +257,45 @@ mod tests {
             assert_eq!(parse_version(Host::ClaudeCode, bad), None, "{bad:?}");
         }
         assert_eq!(parse_version(Host::Codex, b"2.1.280 (Claude Code)\n"), None);
+    }
+
+    /// The Codex review's finding: a `--version` that exits at once but
+    /// leaves a process holding its output open is answered within the
+    /// limit, as a timeout, never a wait for that process.
+    ///
+    /// Mutation checked: the readers joined after the exit (the previous
+    /// `reader.join()`): the call waits for the left process (30 s) and
+    /// this fails.
+    #[test]
+    fn a_process_left_holding_the_output_does_not_hold_the_wait() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let fake = dir.path().join("codex");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho 'codex-cli 0.159.2'\nsleep 30 &\nexit 0\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut cmd = Command::new(&fake);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let t = Instant::now();
+        let got = run_bounded(&mut cmd, Duration::from_secs(2), MAX_OUTPUT);
+        assert_eq!(got.err(), Some(Bounded::Timeout));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // A command that finishes, its output closed, is read whole.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo out; echo err >&2"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let got = run_bounded(&mut cmd, Duration::from_secs(5), MAX_OUTPUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(
+            (got.stdout.as_slice(), got.stderr.as_slice()),
+            (&b"out\n"[..], &b"err\n"[..])
+        );
     }
 }
