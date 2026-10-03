@@ -278,3 +278,145 @@ fn the_statement_asks_for_the_difference_first() {
         "{text}"
     );
 }
+
+/// The pids a descriptor can carry: the edges of an `i32`, and around 0.
+const SIGNED: [i32; 9] = [i32::MIN, -1000, -2, -1, 0, 1, 2, 1000, i32::MAX];
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// `d` with its caller's pid (`caller`) or its root's pid set to `pid`.
+fn with_pid(mut d: PendingDescriptor, caller: bool, pid: i32) -> PendingDescriptor {
+    if caller {
+        d.subject.caller_pid = pid;
+    } else {
+        d.subject.root.pid = pid;
+    }
+    d
+}
+
+/// F-81 (gate 23): each pid is bound with its sign. Set to each of
+/// [`SIGNED`], the caller's pid and the root's each give a statement of
+/// their own; a pid and its negative render differently and so must
+/// differ in the digest. A positive pid encodes as it always did: the
+/// digest of this file's descriptor is the one the encoding before the
+/// change gave, so a statement already shown approves as before.
+#[test]
+fn each_pid_is_bound_with_its_sign() {
+    let o = opts();
+    for caller in [true, false] {
+        let mut seen = std::collections::HashSet::new();
+        for pid in SIGNED {
+            let d = with_pid(descriptor(strings(&["./emit"])), caller, pid);
+            assert!(
+                seen.insert(statement_digest(&d, &o)),
+                "caller {caller}: pid {pid} shares its digest"
+            );
+        }
+        let d = descriptor(strings(&["./emit"]));
+        let pid = if caller {
+            d.subject.caller_pid
+        } else {
+            d.subject.root.pid
+        };
+        let negative = with_pid(d.clone(), caller, -pid);
+        assert_ne!(render_statement(&d, &o), render_statement(&negative, &o));
+        assert_ne!(statement_digest(&d, &o), statement_digest(&negative, &o));
+    }
+    assert_eq!(
+        hex(&statement_digest(
+            &descriptor(strings(&["./emit", "a b"])),
+            &o
+        )),
+        "825ff7c19353506ba2da685f5081d90f44238198147ad60708dd84276201053f"
+    );
+}
+
+/// The canonical statement against an independent encoder of
+/// docs/GRANTS.md's format (`tests/oracles/statement.py`, Python): byte
+/// for byte, for each pid of [`SIGNED`] in each field, and for
+/// descriptors with no label or executable, no bindings, empty, multibyte
+/// and control-character arguments, and `once` options without live
+/// names. The oracle's encoding before F-81 (absolute pids) is its
+/// positive control: it gives a pid and its negative the same bytes, and
+/// differs from the crate for every negative pid; for the rest it is the
+/// same as now.
+#[test]
+fn the_canonical_statement_matches_an_independent_encoder() {
+    let o = opts();
+    let mut cases: Vec<(PendingDescriptor, ApprovalOptions)> = Vec::new();
+    for caller in [true, false] {
+        for pid in SIGNED {
+            cases.push((
+                with_pid(descriptor(strings(&["./emit"])), caller, pid),
+                o.clone(),
+            ));
+        }
+    }
+    let mut bare = descriptor(strings(&["", "中文 argument", "a\u{202e}b", "\u{0}"]));
+    bare.subject.label = None;
+    bare.subject.root.exe = None;
+    bare.subject.kind = SubjectKind::Unknown;
+    bare.bindings.clear();
+    bare.mode = Mode::Proxy;
+    let once = ApprovalOptions {
+        uses: Uses::Once,
+        ttl_secs: 1,
+        live: Vec::new(),
+    };
+    cases.push((bare, once.clone()));
+    cases.push((descriptor(Vec::new()), once));
+    let input = serde_json::to_vec(
+        &cases
+            .iter()
+            .map(|(d, o)| serde_json::json!({"descriptor": d, "options": o}))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let oracle =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracles/statement.py");
+    let mut child = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(&oracle)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 is needed on PATH");
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let got: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got.len(), cases.len());
+    let mut negatives = 0;
+    for ((d, o), g) in cases.iter().zip(&got) {
+        let ours = hex(&canonical_statement(d, o));
+        assert_eq!(ours, g["signed"], "{d:?}");
+        if d.subject.caller_pid < 0 || d.subject.root.pid < 0 {
+            assert_ne!(ours, g["legacy"], "{d:?}");
+            negatives += 1;
+        } else {
+            assert_eq!(g["legacy"], g["signed"], "{d:?}");
+        }
+    }
+    assert_eq!(negatives, 8);
+    // The control: the legacy encoding gives each pid and its negative
+    // the same bytes (i32::MIN has no positive).
+    for (i, pid) in SIGNED.iter().enumerate() {
+        let Some(j) = SIGNED
+            .iter()
+            .position(|p| *pid < 0 && i64::from(*p) == -i64::from(*pid))
+        else {
+            continue;
+        };
+        for field in [0, SIGNED.len()] {
+            assert_eq!(got[field + i]["legacy"], got[field + j]["legacy"]);
+            assert_ne!(got[field + i]["signed"], got[field + j]["signed"]);
+        }
+    }
+}

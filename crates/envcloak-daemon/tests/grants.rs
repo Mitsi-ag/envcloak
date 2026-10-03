@@ -28,7 +28,7 @@ use envcloak_ipc::view::{DecisionView, VaultState};
 use envcloak_ipc::{Client, ClientError};
 use envcloak_policy::{
     ApprovalOptions, DenyReason, FREE_ATTEMPTS, GrantId, MAX_PENDING_PER_ROOT, PendingId,
-    SubjectKind, Uses, statement_digest,
+    SubjectKind, Uses, render_statement, statement_digest,
 };
 use envcloak_testkit::{
     Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
@@ -549,6 +549,62 @@ fn claimed_markers_refuse_every_proof() {
             "{log}"
         );
     }
+    f.sweep();
+}
+
+/// Gate 23, F-81: a statement whose caller's or root's pid has the other
+/// sign reads differently, so it is another statement: refused
+/// (`statement_mismatch`) before the passphrase is looked at, with no
+/// grant made, the request still pending and nothing counted. The
+/// statement as the daemon shows it approves (the control), its request
+/// cannot be approved again, and the grant covers the request.
+#[test]
+fn a_pid_of_the_other_sign_is_another_statement() {
+    let f = Fixture::new();
+    let mut c = client(&f.home);
+    let id = pending(&f.request(&["./emit"]));
+    let d = c.pending_get(&id, &[]).unwrap();
+    assert!(d.subject.caller_pid > 0 && d.subject.root.pid > 0, "{d:?}");
+    let opts = session(600);
+    for caller in [true, false] {
+        let mut changed = d.clone();
+        if caller {
+            changed.subject.caller_pid = -changed.subject.caller_pid;
+        } else {
+            changed.subject.root.pid = -changed.subject.root.pid;
+        }
+        assert_ne!(
+            render_statement(&changed, &opts),
+            render_statement(&d, &opts)
+        );
+        let digest = statement_digest(&changed, &opts);
+        let e = c
+            .approve(&id, opts.clone(), &digest, passphrase(&f.cs), &[])
+            .unwrap_err();
+        assert_eq!(
+            rpc_kind(e).0,
+            ErrorKind::StatementMismatch,
+            "caller {caller}"
+        );
+        let st = c.status().unwrap();
+        assert_eq!(
+            (
+                st.approvals.grants,
+                st.approvals.pending,
+                st.approvals.proof_failures
+            ),
+            (0, 1, 0),
+            "caller {caller}"
+        );
+    }
+    let grant = f.approve_ok(&id, opts.clone());
+    assert_eq!(c.grants_list().unwrap().grants.len(), 1);
+    let digest = statement_digest(&d, &opts);
+    let e = c
+        .approve(&id, opts, &digest, passphrase(&f.cs), &[])
+        .unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::NoSuchRequest);
+    assert_eq!(covered(&f.request(&["./emit"])), grant);
     f.sweep();
 }
 
