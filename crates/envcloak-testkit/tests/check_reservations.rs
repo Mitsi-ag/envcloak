@@ -2307,7 +2307,7 @@ fn a_constructor_is_read_however_its_path_is_written() {
             CLIENT_STUB,
             "macro_rules! zz_mk { ($t:ty) => { <$t>::new(\"pty_unavailable\", \"x\") }; }\n\
              pub fn zz() -> crate::fail::Failure { zz_mk!(crate::fail::Failure) }\n",
-            "`$t::new` is called on a macro's metavariable",
+            "`<$t>::new` is called on a macro's metavariable",
         ),
         (
             CLIENT_STUB,
@@ -2640,14 +2640,16 @@ fn a_placeholder_right_after_envcloak_is_read() {
 /// A line whose `envcloak:` or token is a format argument the source
 /// holds is read as it is printed: each placeholder takes the values the
 /// reader can read of its argument (a literal, a constant, also one
-/// captured by name, `{NAME}`, a named argument, `concat!`), and the lines
-/// so made are searched for `envcloak: <token>:` (the class of the
-/// verifier's review of M2-RES1: a line made of pieces the source spells
-/// out). A name only the run knows, as the panic hook's `{program}:`,
-/// stays beyond the reader, and passes.
+/// captured by name, `{NAME}`, a named argument, `concat!`; Cargo's name
+/// for the package or binary, `env!("CARGO_PKG_NAME")`, taken as the
+/// program's), and the lines so made are searched for `envcloak:
+/// <token>:` (the class of the verifier's review of M2-RES1: a line made
+/// of pieces the source spells out). A name only the run knows, as the
+/// panic hook's `{program}:`, stays beyond the reader, and passes.
 ///
-/// Mutation checked: the lines with their arguments put in left unread:
-/// each copy passes and this fails.
+/// Mutations checked: the lines with their arguments put in left unread:
+/// each copy passes and this fails. Cargo's name variables left unread:
+/// the two `env!` copies pass and this fails.
 #[test]
 fn a_line_whose_pieces_the_source_holds_is_read_whole() {
     for body in [
@@ -2658,6 +2660,8 @@ fn a_line_whose_pieces_the_source_holds_is_read_whole() {
         "pub fn d() { eprintln!(\"{p}: {t}: x\", p = \"envcloak\", t = \"TOKEN\"); }\n",
         "pub fn d() { eprintln!(concat!(\"{}\", \": TOKEN: x\"), \"envcloak\"); }\n",
         "pub fn d() { eprintln!(\"{:.*}{}: x\", 3, \"abc\", \"envcloak: TOKEN\"); }\n",
+        "pub fn d() { eprintln!(\"{}: TOKEN: x\", env!(\"CARGO_PKG_NAME\")); }\n",
+        "const ZZ_NAME: &str = std::env!(\"CARGO_BIN_NAME\");\npub fn d() { eprintln!(\"{ZZ_NAME}: TOKEN: x\"); }\n",
     ] {
         assert_counted(body, CLIENT_STUB);
     }

@@ -171,7 +171,9 @@ placeholder followed by more of a token or by another placeholder
 (`envcloak{}`), whose value could bring `: <token>:`. A format string
 is also read with the values of its arguments the reader can read put
 in its placeholders (a literal, a constant, also one captured by name,
-`{NAME}`, a named argument, `concat!`, a conditional of those), so a
+`{NAME}`, a named argument, `concat!`, a conditional of those; Cargo's
+name for the package, crate or binary, `env!("CARGO_PKG_NAME")`, taken
+as the program's, `envcloak`), so a
 line whose `envcloak:` or token is such an argument (`"{}: {}: x",
 "envcloak", "tok"`) is read as printed. At the start of a line,
 `envcloak: {x}` is a usage line: it must be printed in the arm of `match parse(..)`
@@ -306,6 +308,8 @@ COMPILE_TIME = re.compile(
 # The variables Cargo sets from a package's manifest, none of which can
 # hold a line of text (a version, a path, a package or crate name).
 CARGO_ENV = {"CARGO_PKG_VERSION", "CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "CARGO_CRATE_NAME", "CARGO_BIN_NAME"}
+# The ones that name the package, the crate or the binary.
+CARGO_NAMES = {"CARGO_PKG_NAME", "CARGO_CRATE_NAME", "CARGO_BIN_NAME"}
 FLOAT = re.compile(r"(-?)\s*([0-9][0-9_]*\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?|[0-9][0-9_]*[eE][+-]?[0-9_]+)(?:f32|f64)?")
 
 
@@ -1087,6 +1091,12 @@ def values_of(src, a, b, r):
         if m.group(1) not in r.consts:
             raise Unreadable("a failure token names `%s`, which is no `&str` constant the reader knows" % text[:60])
         return sorted(r.consts[m.group(1)])
+    if src.env_var(a) in CARGO_NAMES and re.fullmatch(r"(?:(?:::\s*)?(?:std|core)\s*::\s*)?env\s*!\s*\(\s*\"\s*\"\s*,?\s*\)", text):
+        # Cargo's name for the package, the crate or the binary: taken as
+        # the program's (over-counted), so a line that prints it before
+        # `: <token>:` is read (the class of the verifier's review of
+        # M2-RES1: a line made of pieces the source names).
+        return ["envcloak"]
     if a in src.concats:
         joined = src.concat_values.get(a)
         if src.concats[a][1] != b or joined is None:
@@ -1387,15 +1397,15 @@ def segment_before(skel, at):
             return ("meta", w.group(0)) if w.group(1) else ("name", w.group(2))
         inner = " ".join(skel[o + 1:j].split())
         if "$" in inner:
-            return ("meta", inner)
+            return ("meta", "<%s>" % inner)
         if "!" in inner:
-            return ("unknown", inner)
+            return ("unknown", "<%s>" % inner)
         cut = find_top_text(inner, " as ")
         if cut is not None:
             last = plain_type(inner[:cut])
-            return ("as", last) if last else ("unknown", inner)
+            return ("as", last) if last else ("unknown", "<%s>" % inner)
         last = plain_type(inner)
-        return ("name", last) if last else ("unknown", inner)
+        return ("name", last) if last else ("unknown", "<%s>" % inner)
     w = re.search(r"(\$?)(%s)$" % IDENT, skel[:j + 1])
     if w:
         return ("meta", w.group(0)) if w.group(1) else ("name", w.group(2))
@@ -1857,7 +1867,7 @@ def code_exit_tokens(root):
             if kind == "meta":
                 raise SourceError("%s: `%s::new` is called on a macro's metavariable, which could be `Failure`, whose token would then not be read; write the type out" % (where(src, m.start()), seg))
             if kind == "unknown":
-                raise SourceError("%s: `<%s>::new` is called on a type the reader cannot read, which could be `Failure`; write the type's path" % (where(src, m.start()), seg))
+                raise SourceError("%s: `%s::new` is called on a type the reader cannot read, which could be `Failure`; write the type's path" % (where(src, m.start()), seg))
             if not failure:
                 continue
             if kind == "as":
