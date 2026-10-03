@@ -469,7 +469,28 @@ fn the_installer_on_the_hosts_own_configs() {
     // rule, which stops it when the hook does not); on Linux, CI measured
     // Claude Code refusing a file in that directory before any hook runs,
     // so there the refusal's source is recorded, not asserted.
-    let shown = |out: &str| out.chars().take(160).collect::<String>();
+    // What refused, named from a fixed list: no tool output is printed
+    // (it could hold fixture data; Codex's cycle 321 review).
+    let shown = |out: &str| -> String {
+        [
+            ("[envcloak:env_file]", "EnvCloak's hook (env_file)"),
+            ("[envcloak:env_dump]", "EnvCloak's hook (env_dump)"),
+            (
+                "denied by your permission settings",
+                "Claude Code's permission settings",
+            ),
+            (
+                "would block or produce infinite output",
+                "Claude Code's device-file check",
+            ),
+        ]
+        .iter()
+        .find(|(needle, _)| out.contains(needle))
+        .map_or_else(
+            || format!("an answer of {} bytes from no known source", out.len()),
+            |(_, source)| (*source).to_owned(),
+        )
+    };
     let read = last_tool_output(&request(&run, "step 1"));
     assert!(!read.contains("STAGING_PROBE"), "the file was read");
     let by_hook = read.contains("[envcloak:env_file]");
@@ -490,7 +511,11 @@ fn the_installer_on_the_hosts_own_configs() {
         next = 3;
     }
     let control = last_tool_output(&request(&run, &format!("step {next}")));
-    assert!(control.contains("ecctl-hook-control"), "{control}");
+    assert!(
+        control.contains("ecctl-hook-control"),
+        "the control's output ({} bytes) is not its echo",
+        control.len()
+    );
     println!(
         "measurement: Claude Code {} after agents install: Read of .ENV.staging refused \
          (EnvCloak's marker: {by_hook}; {}), of /proc/self/environ: {environ_by_hook:?}, the \
@@ -686,3 +711,105 @@ else:
     except Exception as e:
         print("PROXIED" + "NO", type(e).__name__)
 "#;
+
+/// The verifier's finding: the Claude Code matcher was said to name every
+/// tool of the pinned version that runs a command or reads a file, while
+/// the pinned version had more (Artifact's `file_path`, Workflow's
+/// `scriptPath`, ReadMcpResourceDirTool, NotebookEdit). The pinned
+/// package's own `sdk-tools.d.ts` is the oracle: every tool whose input
+/// names a command, a local path or a URI is in EnvCloak's matcher, or is
+/// one that reads nothing it would send on (listed here, with why). A new
+/// pin with another such tool fails this until it is classified.
+///
+/// Mutation checked: `Artifact` taken out of `TOOL_MATCHER`: this fails.
+#[test]
+fn every_tool_of_the_pinned_claude_code_that_reads_a_file_is_hooked() {
+    let found = Installed::find(&versions_toml(), Host::ClaudeCode.id(), "npm");
+    let Some(ci) = require(found, "M2-08 matcher (Claude Code sdk-tools.d.ts)") else {
+        return;
+    };
+    let d = ci
+        .dir
+        .join("node_modules/@anthropic-ai/claude-code/sdk-tools.d.ts");
+    let text = std::fs::read_to_string(&d).unwrap();
+    // Each `export interface <Name>Input {`, and its fields.
+    let mut tools: Vec<(String, Vec<String>)> = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("export interface ") {
+            if let Some(name) = rest.strip_suffix("Input {") {
+                current = Some((name.to_owned(), Vec::new()));
+                continue;
+            }
+        }
+        if line == "}" {
+            tools.extend(current.take());
+            continue;
+        }
+        if let (Some((_, fields)), Some(field)) = (
+            current.as_mut(),
+            line.strip_prefix("  ")
+                .filter(|l| !l.starts_with(' '))
+                .and_then(|l| l.split_once(':'))
+                .map(|(f, _)| f),
+        ) {
+            let field = field.trim_end_matches('?').trim_matches('"');
+            if !field.is_empty() && !field.starts_with('/') && !field.starts_with('*') {
+                fields.push(field.to_owned());
+            }
+        }
+    }
+    let tool = |iface: &str| match iface {
+        "FileEdit" => "Edit".to_owned(),
+        "FileRead" => "Read".to_owned(),
+        "FileWrite" => "Write".to_owned(),
+        "ReadMcpResourceDir" => "ReadMcpResourceDirTool".to_owned(),
+        "ReadMcpResource" => "ReadMcpResourceTool".to_owned(),
+        other => other.to_owned(),
+    };
+    const READS: [&str; 8] = [
+        "command",
+        "file_path",
+        "file_paths",
+        "notebook_path",
+        "path",
+        "local_path",
+        "scriptPath",
+        "uri",
+    ];
+    // Tools with such a field that read nothing they would send on.
+    const NOT_READS: [(&str, &str); 2] = [
+        ("Write", "it writes a file and reads none"),
+        ("EnterWorktree", "its path is a worktree to switch into"),
+    ];
+    let hooked: Vec<&str> = envcloak_agents::hosts::claude::TOOL_MATCHER
+        .split('|')
+        .collect();
+    let mut seen = Vec::new();
+    for (iface, fields) in &tools {
+        if !fields.iter().any(|f| READS.contains(&f.as_str())) {
+            continue;
+        }
+        let t = tool(iface);
+        seen.push(t.clone());
+        assert!(
+            hooked.contains(&t.as_str()) || NOT_READS.iter().any(|(n, _)| *n == t),
+            "{t} ({iface}Input: {fields:?}) reads a file, runs a command or names a URI, \
+             and is not in the matcher {hooked:?}"
+        );
+    }
+    // The positive control: the parse found the tools it must.
+    for t in [
+        "Bash",
+        "Read",
+        "Edit",
+        "Artifact",
+        "Workflow",
+        "ReadMcpResourceDirTool",
+    ] {
+        assert!(
+            seen.iter().any(|s| s == t),
+            "{t} not found in {d:?}: {seen:?}"
+        );
+    }
+}
