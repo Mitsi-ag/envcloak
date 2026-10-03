@@ -27,3 +27,4 @@ crates/envcloak-ipc/src/wire_secret.rs       # base64-encodes a value into a req
 crates/envcloak-daemon/src/redact.rs          # hands a request's values to the redactor that masks the command line its audit entry keeps
 crates/envcloak-exec/src/coverage.rs         # hands a run's values to the redactor that masks the command's output
 crates/envcloak-exec/src/spawn.rs            # puts a run's values in the child's environment, and nowhere else
+crates/envcloak-agents/src/hook/payload.rs   # the hook handler reads a host's payload in place to decide; only the decision and fixed text leave it
