@@ -506,6 +506,7 @@ pub fn run_request(
                 let delivered = s.deliver(
                     g,
                     &shared.clocks,
+                    &alive,
                     AuditEvent::Request(Box::new(covered)),
                     &fields,
                     answer,
@@ -514,10 +515,12 @@ pub fn run_request(
                     Ok(frame) => frame,
                     Err(Delivery::Refused(e)) => return Err(e),
                     Err(Delivery::Lapsed) => {
-                        // The grant ran out while the answer was prepared:
-                        // nothing was recorded or released. The request is
-                        // decided again on clocks read now, as if it came
-                        // now, which that grant no longer covers.
+                        // The grant ran out, or its root exited, while the
+                        // answer was prepared: nothing was recorded or
+                        // released, and a grant whose root exited is gone.
+                        // The request is decided again on clocks read now,
+                        // as if it came now, which that grant no longer
+                        // covers.
                         request = Some(again);
                         continue;
                     }
