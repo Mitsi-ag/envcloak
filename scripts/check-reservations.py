@@ -219,9 +219,10 @@ needs a `landed` row like any token. It also takes the tokens of audit
 kinds, error kinds and reasons, so a `landed` or `reuse` row in one of
 the tables printed as `envcloak: <token>`, or in the audit-kind table,
 accounts for a failure token; a row in any other table does not. A table
-with no code reader yet (the coverage tokens, control messages, fields,
-sign-in tokens and policy kinds) takes no `landed` row: the task that
-lands one adds its reader first.
+with no code reader yet (the coverage tokens, control messages, fields
+and sign-in tokens) takes no `landed` row: the task that lands one adds
+its reader first. The policy kinds are read from `PolicyKind` in the
+vault's policies module (M2-07).
 
 Usage: scripts/check-reservations.py [--root <repository root>]
 Prints "check-reservations: ok" and exits 0, or names every problem on
@@ -905,6 +906,16 @@ def code_methods(root):
     if not found:
         raise SourceError("no `impl Method for` with a `const NAME` under crates/envcloak-ipc/src")
     return found
+
+
+POLICIES_RS = "crates/envcloak-core/src/vault/policies.rs"
+
+
+def code_policy_kinds(root):
+    """The policy record kinds: `PolicyKind`'s variants in the vault's
+    policies module, each with its explicit number."""
+    src = Source(POLICIES_RS, read(root, POLICIES_RS))
+    return {snake(v): n for v, n in numbered_variants(src, "PolicyKind")}
 
 
 def tags(enum):
@@ -2589,7 +2600,7 @@ REGISTRIES = {
                       name="Field", num="Number", grammar=TOKEN, code=tags("FieldTag"),
                       range=(14, 65535)),
     "policy_kind": dict(doc="docs/VAULT.md", cols=["Number", "Kind", "Task", "Status", "Use"],
-                        name="Kind", num="Number", grammar=TOKEN, code=None,
+                        name="Kind", num="Number", grammar=TOKEN, code=code_policy_kinds,
                         range=(1, 255)),
     "error_kind": dict(doc="docs/IPC.md", cols=["Token", "Code", "Task", "Status", "Use"],
                        name="Token", num="Code", grammar=TOKEN, code=code_error_kinds,
