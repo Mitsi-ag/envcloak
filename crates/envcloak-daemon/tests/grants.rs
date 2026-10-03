@@ -608,6 +608,143 @@ fn a_pid_of_the_other_sign_is_another_statement() {
     f.sweep();
 }
 
+/// Gate 23's exact statement, field by field over the daemon's socket:
+/// every field of the descriptor the daemon showed (the request, nonce,
+/// times, subject, project, both bindings, mode and the hidden tail of a
+/// 3,000-byte argument) and each option, changed one at a time, is
+/// another statement, refused before the passphrase is read, with
+/// nothing granted or counted and the request still pending. Then the
+/// controls: an empty and a wrong passphrase are counted and refused, the
+/// statement as shown approves and delivers, its request cannot be
+/// approved again, and after a lock the same command is a new request
+/// with a new nonce, which the old digest does not approve.
+#[test]
+fn every_changed_field_is_another_statement() {
+    let f = Fixture::new();
+    let mut c = client(&f.home);
+    let long = "x".repeat(3000);
+    let argv = ["./emit", long.as_str()];
+    let id = pending(&f.request(&argv));
+    let d = c.pending_get(&id, &[]).unwrap();
+    let opts = session(600);
+    let digest = statement_digest(&d, &opts);
+    let fields = [
+        "/request",
+        "/nonce",
+        "/created_secs",
+        "/expires_in_secs",
+        "/subject/kind",
+        "/subject/label",
+        "/subject/caller_pid",
+        "/subject/root/pid",
+        "/subject/root/start_time",
+        "/subject/root/exe",
+        "/project/dir",
+        "/project/manifest",
+        "/project/manifest_sha256",
+        "/project/new_project",
+        "/bindings/0/env_name",
+        "/bindings/0/slug",
+        "/bindings/0/item",
+        "/bindings/0/field",
+        "/bindings/0/field_name",
+        "/bindings/0/classification",
+        "/bindings/0/first_use",
+        "/bindings/0/granted",
+        "/bindings/1/slug",
+        "/mode",
+        "/argv/1",
+    ];
+    let unchanged = |c: &mut Client, what: &str| {
+        let st = c.status().unwrap();
+        assert_eq!(
+            (
+                st.approvals.grants,
+                st.approvals.pending,
+                st.approvals.proof_failures
+            ),
+            (0, 1, 0),
+            "{what}"
+        );
+    };
+    for path in fields {
+        let mut v = serde_json::to_value(&d).unwrap();
+        let at = v.pointer_mut(path).unwrap();
+        *at = match (path, &*at) {
+            ("/subject/kind", _) => serde_json::json!("unknown"),
+            ("/mode", _) => serde_json::json!("proxy"),
+            (_, serde_json::Value::String(s)) => serde_json::json!(format!("{s}-changed")),
+            (_, serde_json::Value::Number(n)) => serde_json::json!(n.as_i64().unwrap() + 1),
+            (_, serde_json::Value::Bool(b)) => serde_json::json!(!b),
+            (_, serde_json::Value::Null) => serde_json::json!("changed"),
+            (_, other) => panic!("{path}: {other}"),
+        };
+        let changed: envcloak_policy::PendingDescriptor = serde_json::from_value(v).unwrap();
+        assert_ne!(changed, d, "{path}");
+        let altered = statement_digest(&changed, &opts);
+        assert_ne!(altered, digest, "{path}");
+        let e = c
+            .approve(&id, opts.clone(), &altered, passphrase(&f.cs), &[])
+            .unwrap_err();
+        assert_eq!(rpc_kind(e).0, ErrorKind::StatementMismatch, "{path}");
+        unchanged(&mut c, path);
+    }
+    let mut shorter = opts.clone();
+    shorter.ttl_secs -= 1;
+    let mut once = opts.clone();
+    once.uses = Uses::Once;
+    let mut live = opts.clone();
+    live.live
+        .push(envcloak_policy::EnvName::new("OPENAI_API_KEY").unwrap());
+    for (what, other) in [("ttl", shorter), ("uses", once), ("live", live)] {
+        let e = c
+            .approve(&id, other, &digest, passphrase(&f.cs), &[])
+            .unwrap_err();
+        assert_eq!(rpc_kind(e).0, ErrorKind::StatementMismatch, "{what}");
+        unchanged(&mut c, what);
+    }
+    assert_eq!(c.pending_get(&id, &[]).unwrap(), d);
+
+    let e = c
+        .approve(&id, opts.clone(), &digest, SecretBytes::copy_from(b""), &[])
+        .unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::WrongPassphrase);
+    let e = c
+        .approve(
+            &id,
+            opts.clone(),
+            &digest,
+            SecretBytes::copy_from(b"not the passphrase, not at all"),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::WrongPassphrase);
+    assert_eq!(c.status().unwrap().approvals.proof_failures, 2);
+    let grant = c
+        .approve(&id, opts.clone(), &digest, passphrase(&f.cs), &[])
+        .unwrap()
+        .grant;
+    let e = c
+        .approve(&id, opts.clone(), &digest, passphrase(&f.cs), &[])
+        .unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::NoSuchRequest);
+    let answer = client(&f.home).run_request(&f.params(&argv)).unwrap();
+    assert_eq!(covered(&answer.decision), grant);
+    assert_eq!(answer.values.len(), 2);
+    drop(answer);
+
+    assert!(c.lock().unwrap().was_unlocked);
+    c.unlock(passphrase(&f.cs), &[]).unwrap();
+    let again = pending(&f.request(&argv));
+    let fresh = c.pending_get(&again, &[]).unwrap();
+    assert_ne!(fresh.nonce, d.nonce);
+    let e = c
+        .approve(&again, opts, &digest, passphrase(&f.cs), &[])
+        .unwrap_err();
+    assert_eq!(rpc_kind(e).0, ErrorKind::StatementMismatch);
+    f.sweep();
+}
+
 /// Review T9 open 5 (gate 23: a missing passphrase fails): `approve`
 /// with an empty passphrase is a wrong passphrase, counted by the attempt
 /// limiter, and grants nothing; a frame that has no passphrase at all is
