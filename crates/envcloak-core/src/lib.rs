@@ -21,6 +21,7 @@ pub mod secret;
 pub mod unlock;
 pub mod vault;
 mod wordlists;
+mod written;
 
 pub use backup::{BackupInfo, RestoreReport, restore_backup};
 pub use passphrase::{PassphraseRejected, check_passphrase, suggest_passphrase};

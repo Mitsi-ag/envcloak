@@ -1495,8 +1495,8 @@ fn a_failed_last_flush_of_backups_fails_the_purge() {
 /// then). Before the rename (the staging directory moved away and a
 /// symlink to another directory, or another directory, put under its
 /// name) or right after it (the same done to the backup's name), the
-/// commit fails (`InvalidRecord`) and reports no `Done` step, and a second
-/// try fails too. Dropped, the writer removes nothing: the sealed `data`
+/// commit fails (`Substituted`) and reports no `Done` step, and a second
+/// try fails (`InvalidRecord`). Dropped, the writer removes nothing: the sealed `data`
 /// is whole where the directory was moved, and the other directory, the
 /// symlink and what it points at are as they were. With the sealed
 /// directory put back under the backup's name, the backup reads back.
@@ -1612,6 +1612,181 @@ fn a_commit_refuses_a_symlink_put_under_the_backup_name() {
 #[test]
 fn a_commit_refuses_a_directory_put_under_the_backup_name() {
     refuses_a_substituted_publication(true, false);
+}
+
+/// A commit answers that the backup is in place only while the directory
+/// sealed holds the `data` sealed, holding exactly the bytes written
+/// (Codex, M2-05 round 11: the directory alone was checked, so a backup
+/// whose `data` was replaced inside it was answered as made, and its
+/// originals could be deleted). Once `data` is sealed and flushed, before
+/// the rename or right after it, inside the very directory sealed, `data`
+/// is replaced by another file holding the same bytes, written into in
+/// place (one byte, its modification time put back), cut by its last
+/// byte, or removed: the commit fails (`Substituted`), reports no `Done`
+/// step, and a second try fails (`InvalidRecord`). Untouched, the same
+/// steps commit and the backup reads back.
+fn refuses_a_changed_data(after_rename: bool, how: &'static str) {
+    use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (f, v) = KitFixture::create();
+    let body = content(&f, CHUNK_V2 + 17, 9);
+    let files: [(&str, u32, &[u8]); 1] = [("/h/.claude/settings.json", 0o600, &body)];
+    let backups = v.paths().backups_dir.clone();
+    let change = move |dir: &Path| {
+        let data = dir.join("data");
+        match how {
+            "replaced" => {
+                let bytes = std::fs::read(&data).unwrap();
+                let other = dir.join("other");
+                std::fs::write(&other, &bytes).unwrap();
+                std::fs::rename(&other, &data).unwrap();
+            }
+            "written into" => {
+                let w = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
+                let modified = w.metadata().unwrap().modified().unwrap();
+                let at = HEADER_LEN_V2 as u64 + 40;
+                let mut byte = [0u8];
+                std::fs::File::open(&data)
+                    .unwrap()
+                    .read_exact_at(&mut byte, at)
+                    .unwrap();
+                w.write_all_at(&[byte[0] ^ 1], at).unwrap();
+                w.set_modified(modified).unwrap();
+            }
+            "cut" => {
+                let w = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
+                let len = w.metadata().unwrap().len();
+                w.set_len(len - 1).unwrap();
+            }
+            "removed" => std::fs::remove_file(&data).unwrap(),
+            "untouched" => {}
+            _ => unreachable!(),
+        }
+    };
+    let installed = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+    let (seen_installed, seen_done) = (installed.clone(), done.clone());
+    let parent = backups.clone();
+    let mut w = v
+        .begin_file_backup_v2_observed(
+            BackupPurpose::Scrub,
+            creator(CreatorKind::Agent),
+            vec![PlannedFile {
+                path: files[0].0.into(),
+                mode: 0o600,
+                size: body.len() as u64,
+            }],
+            now(),
+            move |step| {
+                if step == StepV2::Installed {
+                    seen_installed.fetch_add(1, Ordering::SeqCst);
+                    if after_rename {
+                        let names = dir_names(&parent);
+                        assert_eq!(names.len(), 1);
+                        change(&parent.join(&names[0]));
+                    }
+                } else if step == StepV2::Done {
+                    seen_done.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .unwrap();
+    let id = w.id();
+    put_all(&mut w, &files);
+    w.seal().unwrap();
+    if !after_rename {
+        let names = dir_names(&backups);
+        assert_eq!(names.len(), 1);
+        change(&backups.join(&names[0]));
+    }
+    let what = format!("{how}, after the rename {after_rename}");
+    if how == "untouched" {
+        w.install().unwrap();
+        assert_eq!(done.load(Ordering::SeqCst), 1);
+        drop(w);
+        assert_reads_back(&v, &id, &[&body]);
+        return;
+    }
+    assert_eq!(
+        w.install().unwrap_err().kind(),
+        VaultErrorKind::Substituted,
+        "{what}: a commit answered for a data it did not write"
+    );
+    assert_eq!(installed.load(Ordering::SeqCst), 1, "{what}");
+    assert_eq!(done.load(Ordering::SeqCst), 0, "{what}");
+    assert_eq!(
+        w.install().unwrap_err().kind(),
+        VaultErrorKind::InvalidRecord,
+        "{what}"
+    );
+    drop(f);
+}
+
+#[test]
+fn a_commit_refuses_a_data_changed_before_the_rename() {
+    for how in ["replaced", "written into", "cut", "removed", "untouched"] {
+        refuses_a_changed_data(false, how);
+    }
+}
+
+#[test]
+fn a_commit_refuses_a_data_changed_after_the_rename() {
+    for how in ["replaced", "written into", "cut", "removed", "untouched"] {
+        refuses_a_changed_data(true, how);
+    }
+}
+
+/// A result is answered as recorded only while its name holds the sealed
+/// result whole (Codex, M2-05 round 11, the class of the commit's check of
+/// `data`): once the result's temporary file is flushed, it is written
+/// into in place (one byte, its modification time put back) or cut by its
+/// last byte, before it is linked. The call fails (`Substituted`), never
+/// answered as recorded.
+#[test]
+fn a_result_written_into_before_its_link_is_never_answered_as_recorded() {
+    use envcloak_core::file_backup_v2::ResultStepV2;
+    use std::os::unix::fs::FileExt;
+    for how in ["written into", "cut"] {
+        let (f, v) = KitFixture::create();
+        let id = small(&v, now());
+        let r = v.open_file_backup_v2(&id).unwrap();
+        let dir = data_file(&v, &id).parent().unwrap().to_owned();
+        let after: [u8; 32] = Sha256::digest(b"what init left").into();
+        let mut did = 0;
+        let e = r.record_result_observed(0, &after, |step| {
+            if step != ResultStepV2::Synced {
+                return;
+            }
+            let temp = dir_names(&dir)
+                .into_iter()
+                .find(|n| n.starts_with(".result-0-"))
+                .unwrap();
+            let p = dir.join(temp);
+            let w = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            let len = w.metadata().unwrap().len();
+            if how == "cut" {
+                w.set_len(len - 1).unwrap();
+            } else {
+                let modified = w.metadata().unwrap().modified().unwrap();
+                let mut byte = [0u8];
+                std::fs::File::open(&p)
+                    .unwrap()
+                    .read_exact_at(&mut byte, len - 1)
+                    .unwrap();
+                w.write_all_at(&[byte[0] ^ 1], len - 1).unwrap();
+                w.set_modified(modified).unwrap();
+            }
+            did += 1;
+        });
+        assert_eq!(did, 1, "{how}");
+        assert_eq!(
+            e.map_err(|e| e.kind()),
+            Err(VaultErrorKind::Substituted),
+            "{how}: a result answered as recorded for bytes it did not write"
+        );
+        drop(f);
+    }
 }
 
 /// A result is answered as recorded only when its name holds the file

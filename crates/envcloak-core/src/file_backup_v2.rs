@@ -84,6 +84,7 @@ use crate::vault::{
     Vault, VaultError, VaultErrorKind, VaultPaths, open_private_child, open_record, open_value,
     seal_record, seal_value, sha256_update, utc_stamp,
 };
+use crate::written::{Counted, Written};
 
 /// The bytes of a file each chunk holds, but a file's last: 512 KiB. A
 /// chunk crosses the socket base64-encoded in one frame, which is at most
@@ -710,7 +711,9 @@ pub struct FileBackupV2Writer {
     staging_name: String,
     final_name: String,
     final_dir: PathBuf,
-    out: Option<BufWriter<File>>,
+    /// `data`, while it is written: every byte that reaches it is counted
+    /// and hashed.
+    out: Option<BufWriter<Counted<File>>>,
     /// Bytes written to `data` so far.
     offset: u64,
     header_hash: [u8; 32],
@@ -721,8 +724,11 @@ pub struct FileBackupV2Writer {
     next_chunk: u64,
     hasher: Sha256,
     digests: Vec<[u8; 32]>,
-    /// The size of `data` once [`FileBackupV2Writer::seal`] wrote it all.
-    sealed_len: Option<u64>,
+    /// `data` once [`FileBackupV2Writer::seal`] wrote it all, open, and
+    /// the length and SHA-256 of every byte written to it: a commit
+    /// answers only while the backup's name holds this very file, holding
+    /// exactly those bytes.
+    sealed: Option<(File, Written)>,
     /// Whether the staging directory's name was renamed to the backup's:
     /// from then on, whatever the checks after it found, the writer
     /// neither installs again nor removes anything when dropped.
@@ -855,12 +861,12 @@ impl Vault {
             next_chunk: 0,
             hasher: Sha256::new(),
             digests: Vec::new(),
-            sealed_len: None,
+            sealed: None,
             installed: false,
             observe,
         };
         let file = create_beneath(&w.staging, OsStr::new(DATA), 0o600)?;
-        w.out = Some(BufWriter::with_capacity(64 * 1024, file));
+        w.out = Some(BufWriter::with_capacity(64 * 1024, Counted::new(file)));
         w.start(self)?;
         Ok(w)
     }
@@ -889,7 +895,7 @@ impl FileBackupV2Writer {
         }
     }
 
-    fn out(&mut self) -> Result<&mut BufWriter<File>, VaultError> {
+    fn out(&mut self) -> Result<&mut BufWriter<Counted<File>>, VaultError> {
         self.out
             .as_mut()
             .ok_or_else(|| VaultError::from(VaultErrorKind::InvalidRecord))
@@ -990,7 +996,7 @@ impl FileBackupV2Writer {
         if self.next().is_some()
             || self.digests.len() != self.plan.len()
             || self.installed
-            || self.sealed_len.is_some()
+            || self.sealed.is_some()
         {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
@@ -1015,13 +1021,16 @@ impl FileBackupV2Writer {
         let n = write_record(&mut out, &sealed)?;
         out.write_all(&at.to_be_bytes())?;
         self.step(StepV2::MetadataWritten);
-        let file = out
+        let (file, written) = out
             .into_inner()
-            .map_err(|e| VaultError::from(e.into_error()))?;
+            .map_err(|e| VaultError::from(e.into_error()))?
+            .finish();
+        if written.len != at + n + TRAILER_LEN as u64 {
+            return Err(VaultErrorKind::InvalidRecord.into());
+        }
         sync_file(&file)?;
-        drop(file);
         sync_file(&self.staging)?;
-        self.sealed_len = Some(at + n + TRAILER_LEN as u64);
+        self.sealed = Some((file, written));
         self.step(StepV2::Synced);
         Ok(())
     }
@@ -1036,22 +1045,36 @@ impl FileBackupV2Writer {
     /// sealed (another directory, or a symlink, put in its place). So the
     /// backup's name is opened again through `backups/` (never through a
     /// symlink) once the rename is flushed, and its device and inode
-    /// compared with the staging directory held open: a commit answers
-    /// that the backup is in place only for the directory sealed, whatever
-    /// took either name before that check. It cannot keep the name from
-    /// being replaced later.
+    /// compared with the staging directory held open; and its `data`, the
+    /// directory's contents, is opened there (never through a symlink),
+    /// compared by device and inode with the file sealed, held open since,
+    /// and read back whole: it must hold exactly the bytes written to it,
+    /// of their length and SHA-256, its stamp unchanged while it is read.
+    /// A commit answers that the backup is in place only for the directory
+    /// sealed holding the `data` sealed, whatever took either name, or
+    /// replaced, removed, cut or wrote into `data`, before that check
+    /// (Codex, M2-05 round 11: the directory alone was checked, so a
+    /// backup whose `data` was replaced inside it was answered as made,
+    /// and its originals could be deleted). It cannot keep the backup from
+    /// being changed later.
     ///
     /// # Errors
     /// [`VaultErrorKind::InvalidRecord`] unless sealed and not yet in
     /// place; [`VaultErrorKind::Substituted`] when the backup's name does
-    /// not open as the directory sealed; an I/O error when the rename
+    /// not open as the directory sealed, or its `data` as the file sealed
+    /// holding what was written; an I/O error when the rename
     /// fails (nothing is listed), `backups/` cannot be flushed (the backup
     /// is in place, but may not last a crash), or a directory's metadata
     /// cannot be read. From the rename on a failure is final: the writer
     /// installs nothing again, and dropped, it keeps the sealed directory,
     /// wherever it is, and removes nothing that took its name.
     pub fn install(&mut self) -> Result<CommittedV2, VaultError> {
-        let Some(bytes) = self.sealed_len.filter(|_| !self.installed) else {
+        let Some(bytes) = self
+            .sealed
+            .as_ref()
+            .map(|(_, w)| w.len)
+            .filter(|_| !self.installed)
+        else {
             return Err(VaultErrorKind::InvalidRecord.into());
         };
         rename_beneath(
@@ -1076,16 +1099,28 @@ impl FileBackupV2Writer {
 
 impl FileBackupV2Writer {
     /// Whether the backup's name in `backups/` opens (never through a
-    /// symlink) as the staging directory this writer made and sealed:
-    /// the same device and inode as the handle it holds on it.
+    /// symlink) as the staging directory this writer made and sealed (the
+    /// same device and inode as the handle it holds on it), and its `data`
+    /// (never through a symlink either) as the file it sealed, holding
+    /// exactly the bytes written to it: read back whole, of their length
+    /// and SHA-256, its stamp unchanged while it is read
+    /// ([`Written::held_by`]). A `data` replaced, removed, cut or written
+    /// into in place, inside the very directory sealed, fails the commit
+    /// too ([`VaultErrorKind::Substituted`]).
     fn check_installed(&self) -> Result<(), VaultError> {
-        use std::os::unix::fs::MetadataExt;
+        let substituted = || VaultError::from(VaultErrorKind::Substituted);
         let named = open_dir_beneath(&self.backups, OsStr::new(&self.final_name))
-            .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?
-            .metadata()?;
-        let sealed = self.staging.metadata()?;
-        if (named.dev(), named.ino()) != (sealed.dev(), sealed.ino()) {
-            return Err(VaultErrorKind::Substituted.into());
+            .map_err(|_| substituted())?;
+        if !same_file(&named, &self.staging)? {
+            return Err(substituted());
+        }
+        let (sealed, written) = self
+            .sealed
+            .as_ref()
+            .ok_or_else(|| VaultError::from(VaultErrorKind::InvalidRecord))?;
+        let data = open_beneath(&named, OsStr::new(DATA)).map_err(|_| substituted())?;
+        if !same_file(&data, sealed)? || !written.held_by(&data)? {
+            return Err(substituted());
         }
         Ok(())
     }
@@ -1521,8 +1556,9 @@ impl FileBackupV2Reader {
     /// a crash at any step leaves the file unrecorded or recorded, never
     /// damaged. A link takes whatever has the temporary name at that
     /// moment, so the result's name is then opened (never through a
-    /// symlink) and compared, by device and inode, with the file written:
-    /// another file put under the temporary name meanwhile fails the call
+    /// symlink) and compared, by device and inode, with the file written,
+    /// and read back whole: another file put under the temporary name
+    /// meanwhile, or this one written into or cut, fails the call
     /// ([`VaultErrorKind::Substituted`]), never answered as recorded.
     /// The temporary name then goes, and the directory is flushed.
     fn record(
@@ -1561,10 +1597,11 @@ impl FileBackupV2Reader {
                 Err(e) => return Err(e.into()),
             }
             // A link takes whatever has the temporary name then: the result
-            // is recorded only if its name holds the file written.
+            // is recorded only if its name holds the file written, holding
+            // exactly the sealed result.
             let named = open_beneath(&self.dir, path)
                 .map_err(|_| VaultError::from(VaultErrorKind::Substituted))?;
-            if !same_file(&named, &out)? {
+            if !same_file(&named, &out)? || !Written::of(&sealed).held_by(&named)? {
                 return Err(VaultErrorKind::Substituted.into());
             }
             observe(ResultStepV2::Published);
