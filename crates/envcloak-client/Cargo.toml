@@ -36,4 +36,6 @@ zeroize.workspace = true
 # The terminal reader's test signals its own thread.
 envcloak-sys = { workspace = true, features = ["testing"] }
 envcloak-testkit.workspace = true
+# Random hostile records for the status record's reader (L-06).
+proptest.workspace = true
 tempfile.workspace = true

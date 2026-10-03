@@ -24,9 +24,11 @@
 //! with one `write`: a pipe takes a write of up to 512 bytes whole
 //! (POSIX's `PIPE_BUF` minimum), so the reader never sees part of one. It
 //! carries no value, no output and no free text: a token, an id, a number.
-//! A reader takes a missing record, a second one, one cut short, one too
-//! long, one of an unknown version or any other malformed one as
-//! [`RunStatus::Unknown`] ([`RunStatus::decode`]): never as "not run".
+//! A reader takes only the exact bytes [`RunStatus::encode`] writes for a
+//! well-formed record; a missing record, a second one, one cut short, one
+//! too long, one of an unknown version, one written any other way (other
+//! spacing, field order or case) or any other malformed one is
+//! [`RunStatus::Unknown`] ([`RunStatus::decode`]): never "not run".
 
 use std::io::{self, Write};
 
@@ -157,11 +159,19 @@ impl RunStatus {
         RunStatus::decode(line).filter(|d| d == self)
     }
 
-    /// The record in `bytes`, all a reader received: exactly one line of
-    /// at most [`MAX_RECORD`] bytes, this version, each field as its state
-    /// requires. Anything else is `None`, which a reader takes as
-    /// [`RunStatus::Unknown`].
+    /// The record in `bytes`, all a reader received: exactly the line
+    /// [`RunStatus::encode`] writes for a record of this version whose
+    /// every field is as its state requires, at most [`MAX_RECORD`] bytes.
+    /// Anything else, a well-formed record written another way included,
+    /// is `None`, which a reader takes as [`RunStatus::Unknown`]: one
+    /// writer, one encoding, so no second reading of a record exists.
     pub fn decode(bytes: &[u8]) -> Option<RunStatus> {
+        RunStatus::parse_fields(bytes).filter(|s| s.encode() == bytes)
+    }
+
+    /// The record `bytes` describes, read field by field (see
+    /// [`RunStatus::decode`], which also requires the exact encoding).
+    fn parse_fields(bytes: &[u8]) -> Option<RunStatus> {
         if bytes.len() > MAX_RECORD {
             return None;
         }
@@ -232,17 +242,20 @@ mod tests {
             assert_eq!(out.iter().filter(|b| **b == b'\n').count(), 1);
             assert_eq!(RunStatus::decode(&out), Some(s.clone()), "{s:?}");
         }
-        // The id in either case is the same request, shown canonically.
+        // Only the encoding written: the same record with the id in
+        // lower case, or with a space, is not it.
         let lower = format!(
             "{{\"v\":1,\"state\":\"not_started\",\"token\":\"approval_required\",\"request\":\"{}\"}}\n",
             id.to_string().to_ascii_lowercase()
         );
+        assert_eq!(RunStatus::decode(lower.as_bytes()), None);
         assert_eq!(
-            RunStatus::decode(lower.as_bytes()),
-            Some(RunStatus::NotStarted {
-                token: "approval_required".into(),
-                request: Some(id)
-            })
+            RunStatus::decode(b"{\"v\":1, \"state\":\"unknown\"}\n"),
+            None
+        );
+        assert_eq!(
+            RunStatus::decode(b"{\"state\":\"unknown\",\"v\":1}\n"),
+            None
         );
     }
 
