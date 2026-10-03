@@ -1029,6 +1029,18 @@ pub(crate) fn trace() -> bool {
     *ON.get_or_init(|| std::env::var_os(TRACE).is_some_and(|v| v == "1"))
 }
 
+/// Names the [`crate::fail_point`] at which a test build fails.
+pub const FAIL_SITE: &str = "ENVCLOAK_TEST_FAIL";
+
+/// An error, of kind [`std::io::ErrorKind::Other`], when [`FAIL_SITE`]
+/// names `site`.
+pub(crate) fn fail_point(site: &str) -> std::io::Result<()> {
+    if std::env::var_os(FAIL_SITE).is_some_and(|s| s == site) {
+        return Err(std::io::Error::other("an injected failure"));
+    }
+    Ok(())
+}
+
 /// The memory a process holds now and the most it has held since it
 /// started, in KiB ([`process_memory`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -97,8 +97,8 @@ pub use dir::{
     volume_of,
 };
 pub use fd::{
-    MAX_SWEEP, claim_inherited_fd, cloexec_flag, close_on_exec_above, inherit_on_spawn,
-    inherited_fd, pipe_cloexec,
+    claim_inherited_fd, cloexec_flag, close_on_exec_above, inherit_on_spawn, inherited_fd,
+    pipe_cloexec,
 };
 pub use fs::open_beneath;
 pub use fsclock::wait_for_clock_past;
@@ -110,8 +110,8 @@ pub use interrupt::Interrupter;
 pub use inuse::{InUse, open_elsewhere};
 pub use lockfile::try_lock_exclusive;
 pub use panic::{
-    idle_connection_override, install as install_panic_hook, panic_point, panic_with_input,
-    pause_point, test_event, test_trace,
+    fail_point, idle_connection_override, install as install_panic_hook, panic_point,
+    panic_with_input, pause_point, test_event, test_trace,
 };
 pub use peer::{
     PeerIdentity, PeerSource, StartTime, boot_id, parse_boot_id, parse_stat_start_time,
