@@ -27,7 +27,7 @@ use std::time::SystemTime;
 
 use envcloak_agents::hook::Host;
 use envcloak_agents::install::{
-    self, Context, HostReport, Note, Options, Plan, Report, StepResult, host_name,
+    self, Context, HostReport, Note, Options, Plan, Report, Step, StepKind, StepResult, host_name,
 };
 use envcloak_agents::locations::Locations;
 use envcloak_agents::writer::{DaemonBackups, Journal, Outcome, StateFile, Writer};
@@ -208,6 +208,29 @@ fn host_line(
     }
 }
 
+/// A planned step as a person reads it: a change asked for and withheld
+/// says so, and why.
+fn step_line(home: &Path, s: &Step) -> String {
+    match &s.kind {
+        StepKind::Withheld(r) => format!(
+            "{}: not written: {} ({}): {}",
+            shown(home, &s.path),
+            s.what,
+            r.name,
+            r.message
+        ),
+        _ => format!("{}: {}", shown(home, &s.path), s.what),
+    }
+}
+
+fn step_json(home: &Path, s: &Step) -> Value {
+    let withheld = match &s.kind {
+        StepKind::Withheld(r) => json!({"reason": r.name, "message": r.message}),
+        _ => Value::Null,
+    };
+    json!({"path": shown(home, &s.path), "what": s.what, "withheld": withheld})
+}
+
 fn print_plan(home: &Path, plan: &Plan, json: bool) {
     if json {
         let hosts: Vec<Value> = plan
@@ -218,10 +241,7 @@ fn print_plan(home: &Path, plan: &Plan, json: bool) {
                     "host": h.host.id(),
                     "version": h.found.as_ref().ok().map(|d| d.version.clone()),
                     "found": h.found.as_ref().map_or_else(|e| e.name(), |_| "installed"),
-                    "changes": h.steps.iter().map(|s| json!({
-                        "path": shown(home, &s.path),
-                        "what": s.what,
-                    })).collect::<Vec<_>>(),
+                    "changes": h.steps.iter().map(|s| step_json(home, s)).collect::<Vec<_>>(),
                     "notes": notes_json(&h.notes),
                 })
             })
@@ -229,10 +249,7 @@ fn print_plan(home: &Path, plan: &Plan, json: bool) {
         let project = plan.project.as_ref().map(|p| {
             json!({
                 "dir": escape_for_display(&p.dir.display().to_string()),
-                "changes": p.steps.iter().map(|s| json!({
-                    "path": shown(home, &s.path),
-                    "what": s.what,
-                })).collect::<Vec<_>>(),
+                "changes": p.steps.iter().map(|s| step_json(home, s)).collect::<Vec<_>>(),
             })
         });
         print_json(&json!({"hosts": hosts, "project": project, "applied": false}));
@@ -241,7 +258,7 @@ fn print_plan(home: &Path, plan: &Plan, json: bool) {
     for h in &plan.hosts {
         println!("{}", host_line(h.host, &h.found));
         for s in &h.steps {
-            println!("  {}: {}", shown(home, &s.path), s.what);
+            println!("  {}", step_line(home, s));
         }
         for n in &h.notes {
             println!("  note ({}): {}", n.name, n.text);
@@ -253,7 +270,7 @@ fn print_plan(home: &Path, plan: &Plan, json: bool) {
             escape_for_display(&p.dir.display().to_string())
         );
         for s in &p.steps {
-            println!("  {}: {}", shown(home, &s.path), s.what);
+            println!("  {}", step_line(home, s));
         }
     }
     println!("Nothing was changed: run this again with --yes to write it.");
@@ -355,16 +372,23 @@ pub fn project_note(dir: &Path, json: bool) -> Result<(), Failure> {
         };
         install::apply(&ctx, &plan, &mut w)
     };
-    file.save(&state).map_err(|r| state_failure(&r))?;
+    // The results are printed whatever the last save says: a file changed
+    // above is reported as changed (L-08; the verifier's finding: the save
+    // came first here, and its failure hid what was changed).
+    let saved = file.save(&state);
     let results = report.project.map(|p| p.results).unwrap_or_default();
     if json {
         print_json(&json!({
             "agents_note": results.iter().map(|r| result_json(&home, r)).collect::<Vec<_>>(),
+            "complete": saved.is_ok() && results.iter().all(|r| {
+                !matches!(r.outcome, Outcome::Refused(_) | Outcome::Partial { .. })
+            }),
         }));
     } else {
         println!("Agent note:");
         print_results(&home, &results);
     }
+    saved.map_err(|r| state_failure(&r))?;
     if results
         .iter()
         .any(|r| matches!(r.outcome, Outcome::Refused(_) | Outcome::Partial { .. }))
