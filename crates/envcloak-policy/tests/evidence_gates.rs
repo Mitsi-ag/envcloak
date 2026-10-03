@@ -579,6 +579,64 @@ fn gate25_only_an_agents_executable_roots_a_grant_above_the_session() {
     s.finish();
 }
 
+/// Gates 23 and 25 with real processes (M2 plan risk K-03): the fixture
+/// agent starts a command on a new pseudo-terminal of its own, in a new
+/// session the command leads (the shape of Gemini CLI's `node-pty` and
+/// Codex's `tty: true`), under `env -i`. The command has a controlling
+/// terminal and leads its session, yet it is an agent subject rooted at
+/// the fixture agent: a grant for its terminal does not cover it, and its
+/// proofs are refused. The control: the same tree under a copy of the
+/// fixture agent by another name, which the catalog does not know, is a
+/// terminal subject a terminal grant covers and whose proofs are taken,
+/// which is what the catalog prevents. Mutation checked: removing the
+/// fixture agent's executable pattern fails this test.
+#[test]
+fn gate23_a_command_an_agent_starts_on_a_pty_of_its_own_is_an_agent() {
+    let outer = outer_agent_root();
+    let l = Listener::new();
+    let run = |holder: &Path| {
+        let (p, py) = (probe(), python3());
+        let args: Vec<&std::ffi::OsStr> = vec![
+            py.as_os_str(),
+            "-c".as_ref(),
+            PTY.as_ref(),
+            "/usr/bin/env".as_ref(),
+            "-i".as_ref(),
+            p.as_os_str(),
+            l.sock.as_os_str(),
+        ];
+        let s = Scenario::start(&l.home, holder, &args);
+        (l.next(), s)
+    };
+    // probe (leading its session on the new terminal) <- python3 (the
+    // pseudo-terminal's owner) <- fixture-agent.
+    let (agent, s) = run(&fixture());
+    assert!(agent.terminal(), "{agent:?}");
+    assert!(agent.session_leader().unwrap().same(agent.caller()));
+    assert!(agent.claims().markers().is_empty());
+    assert_rooted_at_the_fixture(&agent, 2);
+    assert!(!agent.covered_by(agent.caller(), SubjectKind::Terminal));
+    assert!(!agent.covered_by(&agent.root(), SubjectKind::Terminal));
+    assert_eq!(agent.proof_refusal(), Some(ProofRefusal::Agent));
+    s.finish();
+
+    let copy = l.home.root().join("not-an-agent");
+    std::fs::copy(fixture(), &copy).unwrap();
+    let (control, s) = run(&copy);
+    assert!(control.terminal(), "{control:?}");
+    assert!(control.session_leader().unwrap().same(control.caller()));
+    match outer {
+        None => {
+            assert!(control.nearest_agent().is_none(), "{control:?}");
+            assert_eq!(control.kind(), SubjectKind::Terminal);
+            assert!(control.covered_by(control.caller(), SubjectKind::Terminal));
+            assert_eq!(control.proof_refusal(), None);
+        }
+        Some(_) => eprintln!("an agent runs this test: the control is inside its tree"),
+    }
+    s.finish();
+}
+
 /// The gate 26 check: `escape` runs under the fixture agent after the same
 /// probe connected from inside its tree. `own_session`: whether the
 /// escaped probe leads a session of its own (`Some(true)`), is in a
