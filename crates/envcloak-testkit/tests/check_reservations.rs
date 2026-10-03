@@ -2636,3 +2636,36 @@ fn a_placeholder_right_after_envcloak_is_read() {
     );
     assert_passes(&t.home());
 }
+
+/// A line whose `envcloak:` or token is a format argument the source
+/// holds is read as it is printed: each placeholder takes the values the
+/// reader can read of its argument (a literal, a constant, also one
+/// captured by name, `{NAME}`, a named argument, `concat!`), and the lines
+/// so made are searched for `envcloak: <token>:` (the class of the
+/// verifier's review of M2-RES1: a line made of pieces the source spells
+/// out). A name only the run knows, as the panic hook's `{program}:`,
+/// stays beyond the reader, and passes.
+///
+/// Mutation checked: the lines with their arguments put in left unread:
+/// each copy passes and this fails.
+#[test]
+fn a_line_whose_pieces_the_source_holds_is_read_whole() {
+    for body in [
+        "pub fn d() { eprintln!(\"{}: {}: x\", \"envcloak\", \"TOKEN\"); }\n",
+        "pub fn d() { eprintln!(\"{}: TOKEN: x\", \"envcloak\"); }\n",
+        "pub fn d() { eprintln!(\"{}{}\", \"envcloak: \", \"TOKEN: x\"); }\n",
+        "const ZZ_NAME: &str = \"envcloak\";\npub fn d() { eprintln!(\"{ZZ_NAME}: TOKEN: x\"); }\n",
+        "pub fn d() { eprintln!(\"{p}: {t}: x\", p = \"envcloak\", t = \"TOKEN\"); }\n",
+        "pub fn d() { eprintln!(concat!(\"{}\", \": TOKEN: x\"), \"envcloak\"); }\n",
+        "pub fn d() { eprintln!(\"{:.*}{}: x\", 3, \"abc\", \"envcloak: TOKEN\"); }\n",
+    ] {
+        assert_counted(body, CLIENT_STUB);
+    }
+    let t = fixture();
+    add_file(
+        &t,
+        CLIENT_STUB,
+        "pub fn d(program: &str) { eprintln!(\"{program}: internal error: x\"); }\n",
+    );
+    assert_passes(&t.home());
+}
