@@ -249,7 +249,9 @@ impl ExposureSource {
 /// [`Txn::mark_exposed`](super::Txn::mark_exposed), which only adds to it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Exposure {
-    /// Unix seconds of the first mark.
+    /// Unix seconds of the mark: the first mark's, restarted by a mark
+    /// made while the item held a value set after it. The mark covers the
+    /// values set at or before this time ([`ItemMeta::exposure_covers`]).
     pub since: u64,
     /// Every kind of place it was found, sorted, each once; never empty.
     pub sources: Vec<ExposureSource>,
@@ -441,6 +443,34 @@ pub struct ItemMeta {
     pub rotate_recommended: bool,
     /// A login item's own metadata; `None` for every other class.
     pub login: Option<LoginMeta>,
+}
+
+impl ItemMeta {
+    /// Whether the item's "exposed: rotate" mark covers every value it
+    /// holds: each was set at or before the mark's time, so any of them
+    /// may be the one found. False for an item with no mark, and for one
+    /// holding a value set after its mark (a field replaced since), which
+    /// a new mark must restart the mark for ([`Txn::mark_exposed`]).
+    ///
+    /// [`Txn::mark_exposed`]: super::Txn::mark_exposed
+    pub fn exposure_covers(&self) -> bool {
+        self.exposure
+            .as_ref()
+            .is_some_and(|x| self.fields.iter().all(|f| f.updated_at <= x.since))
+    }
+
+    /// Whether replacing the value of `field` leaves the item holding no
+    /// value its mark covers: every other field's value was set after the
+    /// mark's time. A value set in the mark's own second counts as covered,
+    /// so a rotation then leaves the mark. False for an item with no mark.
+    pub fn exposure_replaced_but(&self, field: FieldId) -> bool {
+        self.exposure.as_ref().is_some_and(|x| {
+            self.fields
+                .iter()
+                .filter(|f| f.id != field)
+                .all(|f| f.updated_at > x.since)
+        })
+    }
 }
 
 /// What identifies a project directory to the vault: bytes chosen by the

@@ -236,9 +236,15 @@ impl<'v> Txn<'v> {
 
     /// Marks an item "exposed: rotate" (R-M2-40): its value was found in
     /// `count` places of the kinds in `sources` (at least one). Only adds:
-    /// the first mark's time stays, the kinds are joined and the counts
-    /// summed; rotation is then recommended. Idempotent in what it shows,
-    /// a second mark of the same kinds adding only to the count.
+    /// the kinds are joined and the counts summed; rotation is then
+    /// recommended. The mark's time ([`Exposure::since`]) stands for the
+    /// values it covers, those set at or before it: it is the first
+    /// mark's, and it stays while the item holds no value set after it. A
+    /// mark made when the item holds one (a field replaced since, whose new
+    /// value may be the one found now) restarts it now, so the mark covers
+    /// every value the item holds again ([`ItemMeta::exposure_covers`]).
+    ///
+    /// [`ItemMeta::exposure_covers`]: super::ItemMeta::exposure_covers
     pub fn mark_exposed(
         &mut self,
         item: ItemId,
@@ -249,11 +255,29 @@ impl<'v> Txn<'v> {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
         let old = self.item_row(item)?;
-        let mut exposure = old.extra.exposure.clone().unwrap_or(Exposure {
+        let fresh = Exposure {
             since: self.now,
             sources: Vec::new(),
             count: 0,
-        });
+        };
+        let mut exposure = match old.extra.exposure.clone() {
+            None => fresh,
+            Some(x) => {
+                let newer = self
+                    .state
+                    .fields
+                    .values()
+                    .any(|f| f.item == item && f.record.updated_at > x.since);
+                if newer {
+                    Exposure {
+                        since: self.now,
+                        ..x
+                    }
+                } else {
+                    x
+                }
+            }
+        };
         exposure.sources.extend_from_slice(sources);
         exposure.sources.sort_unstable();
         exposure.sources.dedup();
@@ -272,7 +296,10 @@ impl<'v> Txn<'v> {
     }
 
     /// Clears an item's exposure and its rotation flag: its exposed value
-    /// was replaced (M2-11: "rotation clears the mark").
+    /// was replaced (M2-11: a rotation that leaves no value the mark covers,
+    /// [`ItemMeta::exposure_replaced_but`]).
+    ///
+    /// [`ItemMeta::exposure_replaced_but`]: super::ItemMeta::exposure_replaced_but
     pub fn clear_exposure(&mut self, item: ItemId) -> Result<(), VaultError> {
         let old = self.item_row(item)?;
         if old.extra.exposure.is_none() && !old.extra.rotate_recommended {
