@@ -376,10 +376,16 @@ fn machine_scope_values_dedupe_with_projects_and_are_named_by_label() {
 /// the project's variable naming the base (and its `env_hint`), and only
 /// the project's entry adopts it; the items are those of the same entries
 /// sent project first. A value only machine entries hold is named after
-/// the first of them sent. The commit makes the items so named.
+/// the first of them sent. Two values that want one slug are numbered by
+/// their first project entries, whatever machine entry came first
+/// (verifier review): a machine entry of the second value sent before
+/// both does not give it the unnumbered slug. The commit makes the items
+/// so named.
 ///
-/// Mutation: the first entry sent names the item (the machine-first plan
-/// names them `openai/zshrc` and `my-token/mcp-claude-code`).
+/// Mutations: the first entry sent names the item (the machine-first plan
+/// names them `openai/zshrc` and `my-token/mcp-claude-code`); items made in
+/// the order their values first appear (the machine entry sent first gives
+/// its value `app-token/acme-api` and the other `-2`).
 #[test]
 fn a_value_a_project_holds_is_named_after_the_project_in_any_order() {
     let mut f = Fixture::new(|_, _| {});
@@ -389,6 +395,10 @@ fn a_value_a_project_holds_is_named_after_the_project_in_any_order() {
     let (token, other) = (word(24), word(24));
     f.cs.push(Canary::new("PROJECT_TOKEN", token.clone()));
     f.cs.push(Canary::new("MACHINE_ONLY", other.clone()));
+    let (t1, t2, t3) = (word(24), word(24), word(24));
+    f.cs.push(Canary::new("COLLIDING_1", t1.clone()));
+    f.cs.push(Canary::new("COLLIDING_2", t2.clone()));
+    f.cs.push(Canary::new("COLLIDING_3", t3.clone()));
     let machine_first = || {
         vec![
             machine(
@@ -454,6 +464,52 @@ fn a_value_a_project_holds_is_named_after_the_project_in_any_order() {
     project_first.rotate_left(2);
     let other_order = c.import_plan(&params(project_first)).unwrap();
     assert_eq!(other_order.items, plan.items);
+    // Three values want one slug: two of one variable in two of the
+    // project's files, and one only the machine holds, under a label that
+    // is the project's name. The project's are numbered first, by their
+    // project entries, then the machine's, whether the machine entries come
+    // first or last.
+    let colliding = |machine_first: bool| {
+        let m = [
+            machine(
+                MachineSource::Profile,
+                "acme-api",
+                "~/.acme-api",
+                "APP_TOKEN",
+                t3.as_bytes(),
+            ),
+            machine(
+                MachineSource::Profile,
+                "zshrc",
+                "~/.zshrc",
+                "APP_TOKEN",
+                t1.as_bytes(),
+            ),
+        ];
+        let p = [
+            entry(0, ".env", None, "APP_TOKEN", t2.as_bytes()),
+            entry(0, ".env.local", None, "APP_TOKEN", t1.as_bytes()),
+        ];
+        if machine_first {
+            m.into_iter().chain(p).collect::<Vec<_>>()
+        } else {
+            p.into_iter().chain(m).collect()
+        }
+    };
+    // The slugs of t2, t1 (project), t3 (machine only), by entry.
+    let slugs = |p: &ImportPlanView, of: [usize; 3]| -> Vec<String> {
+        of.iter().map(|&i| item_of(p, i).slug.clone()).collect()
+    };
+    let first = c.import_plan(&params(colliding(true))).unwrap();
+    let last = c.import_plan(&params(colliding(false))).unwrap();
+    let want = [
+        "app-token/acme-api",
+        "app-token/acme-api-2",
+        "app-token/acme-api-3",
+    ];
+    assert_eq!(slugs(&first, [2, 3, 0]), want);
+    assert_eq!(slugs(&last, [0, 1, 2]), want);
+    assert_eq!(first.items, last.items);
     let done = c
         .import_commit(&ImportCommitParams {
             import: params(machine_first()),
