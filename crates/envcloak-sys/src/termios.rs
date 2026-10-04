@@ -23,7 +23,12 @@
 //!
 //! The guard keeps its own copy of the terminal's descriptor, so the
 //! number the panic hook restores through stays open for as long as the
-//! guard is registered. One guard is registered at a time.
+//! guard is registered. One guard is registered at a time. A restore on
+//! another thread holds the registration while it runs: a guard dropped
+//! meanwhile waits for it before its descriptor closes, and no new guard
+//! registers over settings being read. [`TerminalGuard::release`] ends a
+//! guard and reports whether the restore worked; a drop restores without
+//! reporting.
 //!
 //! [`TerminalSettings`] are the settings themselves: the PTY's slave side
 //! starts with the outer terminal's (`crate::pty::open_pty`), so a
@@ -34,7 +39,7 @@ use std::cell::UnsafeCell;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 /// A terminal's settings (`struct termios`), read with
 /// [`TerminalSettings::read`].
@@ -247,82 +252,162 @@ pub fn set_window_size(fd: BorrowedFd<'_>, size: WindowSize) -> io::Result<()> {
     Ok(())
 }
 
-/// The registered settings, for [`restore_outer_terminal`]: written by
-/// the one thread that registers a guard before [`STATE`] says they are
-/// there, and only read after.
-struct SavedSlot(UnsafeCell<MaybeUninit<libc::termios>>);
-
-// SAFETY: the slot is written only while STATE is EMPTY (by the thread
-// registering a guard, which first moves STATE from EMPTY to WRITING), and
-// read only after STATE was seen READY, which the writer stores with
-// Release after its write.
-unsafe impl Sync for SavedSlot {}
-
-static SAVED: SavedSlot = SavedSlot(UnsafeCell::new(MaybeUninit::uninit()));
-/// The descriptor the registered guard holds, -1 for none.
-static SAVED_FD: AtomicI32 = AtomicI32::new(-1);
-static STATE: AtomicU8 = AtomicU8::new(EMPTY);
-const EMPTY: u8 = 0;
-const WRITING: u8 = 1;
-const READY: u8 = 2;
-
-fn register(fd: libc::c_int, saved: &libc::termios) -> io::Result<()> {
-    if STATE
-        .compare_exchange(EMPTY, WRITING, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "a terminal guard is already registered",
-        ));
-    }
-    // SAFETY: STATE is WRITING, so no other thread writes the slot, and no
-    // reader reads it until STATE is READY.
-    unsafe { (*SAVED.0.get()).write(*saved) };
-    SAVED_FD.store(fd, Ordering::Release);
-    STATE.store(READY, Ordering::Release);
-    Ok(())
+/// The registered guard's terminal and saved settings, for
+/// [`restore_outer_terminal`], which a panic hook or a signal path calls
+/// from any thread while other threads may drop the guard and register a
+/// new one. A reader announces itself in `state` before it reads and
+/// leaves after its `tcsetattr`; retiring the slot first shuts readers
+/// out, then waits for those inside to leave, so the settings are never
+/// written while one reads them and the guard's descriptor is closed only
+/// once no reader can use its number (review cycle 365). Lock-free and
+/// allocation-free on the reading side, so async-signal-safe.
+struct Slot {
+    /// The phase in the top two bits, the readers inside below.
+    state: AtomicU32,
+    fd: AtomicI32,
+    saved: UnsafeCell<MaybeUninit<libc::termios>>,
 }
 
-fn unregister() {
-    if STATE
-        .compare_exchange(READY, WRITING, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        SAVED_FD.store(-1, Ordering::Release);
-        STATE.store(EMPTY, Ordering::Release);
+const READERS: u32 = (1 << 30) - 1;
+const PHASE: u32 = !READERS;
+/// Nothing registered.
+const EMPTY: u32 = 0;
+/// A guard is writing its settings in; no reader enters.
+const WRITING: u32 = 1 << 30;
+/// Registered: readers may enter.
+const READY: u32 = 2 << 30;
+/// Being unregistered: no reader enters; the ones inside finish.
+const RETIRING: u32 = 3 << 30;
+
+// SAFETY: `saved` and `fd` are written only by the thread that moved
+// `state` from EMPTY to WRITING, before it stores READY with Release; they
+// are read only by a reader that entered with an Acquire compare-exchange
+// from READY, and the phase leaves READY (for RETIRING, then EMPTY) only
+// once every reader inside has left with a Release decrement, which the
+// retiring thread observes with Acquire before the slot can be written
+// again.
+unsafe impl Sync for Slot {}
+
+impl Slot {
+    const fn new() -> Self {
+        Slot {
+            state: AtomicU32::new(EMPTY),
+            fd: AtomicI32::new(-1),
+            saved: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    fn register(&self, fd: libc::c_int, saved: &libc::termios) -> io::Result<()> {
+        if self
+            .state
+            .compare_exchange(EMPTY, WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a terminal guard is already registered",
+            ));
+        }
+        // SAFETY: the phase is WRITING, which this thread set: no other
+        // thread writes the slot, and no reader is inside or can enter.
+        unsafe { (*self.saved.get()).write(*saved) };
+        self.fd.store(fd, Ordering::Relaxed);
+        self.state.store(READY, Ordering::Release);
+        Ok(())
+    }
+
+    /// Runs `f` on the registered descriptor and settings, with the slot
+    /// held so it is neither retired nor rewritten meanwhile; `None` when
+    /// nothing is registered or the slot is being retired.
+    fn read<R>(&self, f: impl FnOnce(libc::c_int, &libc::termios) -> R) -> Option<R> {
+        let mut now = self.state.load(Ordering::Acquire);
+        loop {
+            if now & PHASE != READY || now & READERS == READERS {
+                return None;
+            }
+            match self.state.compare_exchange_weak(
+                now,
+                now + 1,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(seen) => now = seen,
+            }
+        }
+        let fd = self.fd.load(Ordering::Relaxed);
+        // SAFETY: this reader entered while the phase was READY, so the
+        // registering thread's write happened before (Release/Acquire),
+        // and no write can happen until this reader leaves below.
+        let saved = unsafe { (*self.saved.get()).assume_init_ref() };
+        let result = f(fd, saved);
+        self.state.fetch_sub(1, Ordering::Release);
+        Some(result)
+    }
+
+    /// Unregisters: no new reader enters, and this returns once every
+    /// reader inside has left. Then the caller may close the descriptor.
+    fn unregister(&self) {
+        let mut now = self.state.load(Ordering::Acquire);
+        loop {
+            if now & PHASE != READY {
+                return;
+            }
+            let retiring = (now & READERS) | RETIRING;
+            match self.state.compare_exchange_weak(
+                now,
+                retiring,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(seen) => now = seen,
+            }
+        }
+        // A reader inside runs one tcsetattr; it cannot be this thread
+        // (no guard is dropped from inside a restore).
+        while self.state.load(Ordering::Acquire) & READERS != 0 {
+            std::thread::yield_now();
+        }
+        self.fd.store(-1, Ordering::Relaxed);
+        self.state.store(EMPTY, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn phase(&self) -> u32 {
+        self.state.load(Ordering::Acquire) & PHASE
     }
 }
+
+static SLOT: Slot = Slot::new();
 
 /// Puts the registered guard's saved settings back on its terminal with
 /// `TCSAFLUSH`, and returns whether it did. Async-signal-safe: it reads
 /// atomics and the saved settings and calls `tcsetattr`, which POSIX lists
-/// as safe in a signal handler. The panic hook calls it first, so a
-/// release build, which aborts on a panic without running destructors,
-/// still leaves the terminal as it found it. The guard stays registered:
-/// its drop restores again, which changes nothing.
+/// as safe in a signal handler, and it holds the slot while it does, so a
+/// guard dropped meanwhile on another thread waits for it before it closes
+/// the descriptor. The panic hook calls it first, so a release build,
+/// which aborts on a panic without running destructors, still leaves the
+/// terminal as it found it. The guard stays registered: its drop restores
+/// again, which changes nothing.
 pub fn restore_outer_terminal() -> bool {
-    if STATE.load(Ordering::Acquire) != READY {
-        return false;
-    }
-    let fd = SAVED_FD.load(Ordering::Acquire);
-    if fd < 0 {
-        return false;
-    }
-    // SAFETY: STATE was READY, so the slot holds the settings the
-    // registering thread wrote before it stored READY.
-    let saved = unsafe { (*SAVED.0.get()).assume_init() };
-    loop {
-        // SAFETY: `saved` is an initialized termios; on a descriptor that
-        // is not a terminal tcsetattr fails without effect.
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &saved) } == 0 {
-            return true;
-        }
-        // EINTR only: retry. Anything else: give up.
-        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+    SLOT.read(|fd, saved| {
+        if fd < 0 {
             return false;
         }
-    }
+        loop {
+            // SAFETY: `saved` is an initialized termios; on a descriptor
+            // that is not a terminal tcsetattr fails without effect.
+            if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, saved) } == 0 {
+                return true;
+            }
+            // EINTR only: retry. Anything else: give up.
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return false;
+            }
+        }
+    })
+    .unwrap_or(false)
 }
 
 /// The outer terminal in raw mode for as long as the guard lives. See the
@@ -330,6 +415,9 @@ pub fn restore_outer_terminal() -> bool {
 pub struct TerminalGuard {
     fd: OwnedFd,
     saved: TerminalSettings,
+    /// [`TerminalGuard::release`] restored already; the drop only
+    /// unregisters.
+    released: bool,
 }
 
 impl core::fmt::Debug for TerminalGuard {
@@ -358,8 +446,12 @@ impl TerminalGuard {
         // SAFETY: `copy` was just created and nothing else owns it.
         let fd = unsafe { OwnedFd::from_raw_fd(copy) };
         let saved = TerminalSettings(get(fd.as_raw_fd())?);
-        register(fd.as_raw_fd(), &saved.0)?;
-        let guard = TerminalGuard { fd, saved };
+        SLOT.register(fd.as_raw_fd(), &saved.0)?;
+        let guard = TerminalGuard {
+            fd,
+            saved,
+            released: false,
+        };
         set(guard.fd.as_raw_fd(), libc::TCSANOW, &saved.raw().0)?;
         Ok(guard)
     }
@@ -393,14 +485,31 @@ impl TerminalGuard {
     pub fn reenter_raw(&self) -> io::Result<()> {
         set(self.fd.as_raw_fd(), libc::TCSANOW, &self.saved.raw().0)
     }
+
+    /// Ends the guard on a way out that can still report: puts the saved
+    /// settings back with `TCSAFLUSH`, unregisters and closes, and says
+    /// whether the restore worked (a drop cannot; it restores all the
+    /// same and ignores the result).
+    ///
+    /// # Errors
+    /// When the settings cannot be put back.
+    pub fn release(mut self) -> io::Result<()> {
+        let result = set(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.saved.0);
+        self.released = true;
+        result
+    }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // TCSAFLUSH: input not read yet is discarded, not left for the
-        // next reader with echo back on.
-        let _ = set(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.saved.0);
-        unregister();
+        if !self.released {
+            // TCSAFLUSH: input not read yet is discarded, not left for the
+            // next reader with echo back on.
+            let _ = set(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.saved.0);
+        }
+        // Waits for a restore running on another thread (the panic hook)
+        // before the descriptor closes after this.
+        SLOT.unregister();
     }
 }
 
@@ -416,5 +525,120 @@ mod tests {
         assert!(!restore_outer_terminal(), "nothing is registered");
         assert!(TerminalSettings::read(file.as_fd()).is_err());
         assert!(window_size(file.as_fd()).is_err());
+    }
+
+    fn settings(tag: libc::tcflag_t) -> libc::termios {
+        // SAFETY: termios is plain data.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        t.c_iflag = tag;
+        t
+    }
+
+    /// A reader inside the slot (the panic hook on another thread, in its
+    /// `tcsetattr`) holds off both the guard's unregistering, so its
+    /// descriptor is not closed under the reader, and a new registration,
+    /// so the settings it reads are not rewritten under it: the reader
+    /// reads the slot again at its end and finds what it read at its
+    /// start. Let `unregister` return without waiting for readers and the
+    /// new registration lands while the reader is inside.
+    #[test]
+    fn a_reader_inside_holds_off_unregistering_and_a_new_registration() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let slot: &'static Slot = Box::leak(Box::new(Slot::new()));
+        slot.register(100, &settings(100)).unwrap();
+        let (inside_tx, inside) = mpsc::channel();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            slot.read(|fd, t| {
+                inside_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                // What the slot holds now, read the way the next reader
+                // would.
+                // SAFETY: test-only peek, made while this reader holds the
+                // slot.
+                let now = unsafe { (*slot.saved.get()).assume_init_ref() };
+                (fd, t.c_iflag, slot.fd.load(Ordering::Relaxed), now.c_iflag)
+            })
+        });
+        inside.recv().unwrap();
+        let done = Box::leak(Box::new(AtomicBool::new(false)));
+        let done_ref: &'static AtomicBool = done;
+        let dropper = std::thread::spawn(move || {
+            slot.unregister();
+            done_ref.store(true, Ordering::Release);
+        });
+        let end = Instant::now() + Duration::from_secs(10);
+        while slot.phase() == READY {
+            assert!(Instant::now() < end, "unregister never started");
+            std::thread::yield_now();
+        }
+        // While the reader is inside: no new registration, and the
+        // unregistering thread has not returned. A bounded wait proves the
+        // second: without the wait for readers it returns at once.
+        let watch = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < watch {
+            assert!(
+                slot.register(200, &settings(200)).is_err(),
+                "a new guard registered while a restore was reading the slot"
+            );
+            assert!(
+                !done.load(Ordering::Acquire),
+                "the guard was unregistered (and its descriptor free to close) while a \
+                 restore was using it"
+            );
+            std::thread::yield_now();
+        }
+        go.send(()).unwrap();
+        let (fd, read, fd_after, read_after) = reader.join().unwrap().unwrap();
+        assert_eq!((fd, read), (100, 100));
+        assert_eq!(
+            (fd_after, read_after),
+            (100, 100),
+            "rewritten under the reader"
+        );
+        dropper.join().unwrap();
+        assert!(done.load(Ordering::Acquire));
+        assert!(
+            slot.read(|_, _| ()).is_none(),
+            "nothing registered after it"
+        );
+        slot.register(200, &settings(200)).unwrap();
+        assert_eq!(slot.read(|fd, t| (fd, t.c_iflag)), Some((200, 200)));
+    }
+
+    /// Teardown and re-registration racing readers: each guard registers a
+    /// descriptor number and settings that carry the same tag, and every
+    /// read sees a matching pair (never one guard's number with another's
+    /// settings, never a torn value).
+    #[test]
+    fn readers_racing_teardown_and_reregistration_see_whole_registrations() {
+        use std::sync::atomic::AtomicBool;
+        let slot: &'static Slot = Box::leak(Box::new(Slot::new()));
+        let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mut seen = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some((fd, tag)) = slot.read(|fd, t| (fd, t.c_iflag)) {
+                            assert_eq!(libc::tcflag_t::try_from(fd).unwrap(), tag);
+                            seen += 1;
+                        }
+                    }
+                    seen
+                })
+            })
+            .collect();
+        for tag in 3..20_000 {
+            slot.register(tag, &settings(libc::tcflag_t::try_from(tag).unwrap()))
+                .unwrap();
+            slot.unregister();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
     }
 }
