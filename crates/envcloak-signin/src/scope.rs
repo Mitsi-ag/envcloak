@@ -98,8 +98,8 @@ pub enum ScopeError {
     /// identities only).
     LiveDev,
     /// A cookie path that does not start with `/`, is over
-    /// [`MAX_COOKIE_PATH`] bytes, or holds a byte that is not printable
-    /// ASCII (`!` to `~`), or a `;`.
+    /// [`MAX_COOKIE_PATH`] bytes, or holds a byte outside RFC 6265's
+    /// `path-value` (a control byte, a `;`, or a byte past ASCII).
     CookiePath,
 }
 
@@ -466,16 +466,23 @@ impl CookieDomain {
 }
 
 /// A cookie's path as the browser stored it (RFC 6265 §5.2.4): `/`, then
-/// printable ASCII other than `;`, at most [`MAX_COOKIE_PATH`] bytes,
-/// compared byte for byte. Never normalized: a trailing slash, the case
-/// of a letter and the spelling of a percent-escape each make another
-/// path, as the browser's path match reads them. Its `Debug` shows only
-/// its length (L-12). [`CookiePath::new`] is the only way to make one:
+/// the rest of RFC 6265's `path-value` (§4.1.1: any character except
+/// controls and `;`, so printable ASCII and the space), at most
+/// [`MAX_COOKIE_PATH`] bytes, compared byte for byte. Never normalized: a
+/// trailing slash, the case of a letter and the spelling of a
+/// percent-escape each make another path, as the browser's path match
+/// reads them. A byte past ASCII, which `path-value` does not hold, is
+/// refused: a cookie stored with one cannot be declared, so a capture
+/// that holds it is broader than declared and fails. Its `Debug` shows
+/// only its length (L-12). [`CookiePath::new`] is the only way to make
+/// one:
 ///
 /// ```
 /// use envcloak_signin::CookiePath;
 /// assert!(CookiePath::new("/app").is_ok());
+/// assert!(CookiePath::new("/a b").is_ok());
 /// assert!(CookiePath::new("app").is_err());
+/// assert!(CookiePath::new("/a;b").is_err());
 /// ```
 ///
 /// ```compile_fail
@@ -488,7 +495,7 @@ impl CookiePath {
     pub fn new(s: &str) -> Result<Self, ScopeError> {
         let ok = s.starts_with('/')
             && s.len() <= MAX_COOKIE_PATH
-            && s.bytes().all(|b| b.is_ascii_graphic() && b != b';');
+            && s.bytes().all(|b| (b' '..=b'~').contains(&b) && b != b';');
         if ok {
             Ok(CookiePath(s.to_owned()))
         } else {
@@ -508,7 +515,11 @@ impl fmt::Debug for CookiePath {
 }
 
 /// A site, as a cookie's partition key names the top-level site: a scheme
-/// and a host, no port.
+/// and a host, no port. A name takes [`HostName`]'s registered form, which
+/// is narrower than what a browser accepts (no `_`, labels of at most 63
+/// bytes): a cookie partitioned under a site outside it cannot be
+/// declared, so a capture that holds one is broader than declared and
+/// fails, never passes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Site {
     pub scheme: Scheme,
@@ -556,7 +567,10 @@ impl CookiePartition {
 /// cookie, never a broader one found by its name alone (SPEC §6.8
 /// "Delivery": cookies are never rewritten to fit). Its other attributes
 /// (`Secure`, `HttpOnly`, `SameSite`, its expiry) move with it unchanged
-/// and are not part of what it names.
+/// and are not part of what it names. Its name is a [`Label`], which
+/// refuses a character a terminal would act on or hide, so the approval
+/// screen can show it: a cookie named with one cannot be declared, and a
+/// capture that holds it fails the same way.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclaredCookie {
     pub name: Label,
