@@ -1961,12 +1961,15 @@ fn linux_traced_agents_commands_read_no_config() {
     use envcloak_sys::testing::spawn_traced;
 
     let f = Fixture::new();
+    // A literal of the person's in the config (not one of the vault's
+    // canaries, which the home must not hold).
+    let lit = Canary::new(
+        "SETTINGS_ENV_LITERAL",
+        format!("ecst{:016x}{:016x}", fresh_seed(), fresh_seed()),
+    );
     std::fs::write(
         f.path(".claude/settings.json"),
-        format!(
-            "{{\"env\": {{\"OPENAI_API_KEY\": \"{}\"}}}}\n",
-            by_label(&f.cs, labels::OPENAI_API_KEY).as_str()
-        ),
+        format!("{{\"env\": {{\"API_TOKEN\": \"{}\"}}}}\n", lit.as_str()),
     )
     .unwrap();
     let before: Vec<Vec<u8>> = FILES.iter().map(|p| f.read(p)).collect();
@@ -1987,8 +1990,10 @@ fn linux_traced_agents_commands_read_no_config() {
             cmd.spawn().unwrap()
         };
         let out = child.wait_with_output().unwrap();
-        assert_no_canary(&out.stdout, &f.cs);
-        assert_no_canary(&out.stderr, &f.cs);
+        for cs in [&f.cs[..], std::slice::from_ref(&lit)] {
+            assert_no_canary(&out.stdout, cs);
+            assert_no_canary(&out.stderr, cs);
+        }
         out
     };
     for args in [
