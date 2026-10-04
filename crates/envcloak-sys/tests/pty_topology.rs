@@ -6,31 +6,41 @@
 //!   typed suspend character and does not stop (an orphaned process group
 //!   ignores SIGTSTP), while SIGSTOP, SIGCONT and a typed interrupt behave
 //!   normally. This is why the command never leads the session;
-//! - (b) the monitor's topology with `/bin/cat`, on both systems: the
+//! - (b) the monitor's topology, on both systems, with two cats: the
 //!   suspend character stops cat and the monitor reports it, `Resume`
-//!   continues it, and then, on Linux, cat reads its input again and EOF
-//!   ends it. macOS's `/bin/cat` ends with "Interrupted system call" once
-//!   a stop and continue interrupt its read, under any job-control shell
-//!   as under the monitor (measured by the last case here), so on macOS
-//!   that ending is asserted for `/bin/cat`, and the round trip is shown
-//!   with a cat that reads again on `EINTR` (this binary's `cat` role).
+//!   gives the terminal back and continues it. `/bin/cat` must then do
+//!   what it did, stopped and continued in a read, under a plain
+//!   job-control shell in the same run (Linux's reads on and EOF ends it;
+//!   macOS's ends with "Interrupted system call", under any shell as under
+//!   the monitor, the last case here). A cat that reads again on `EINTR`
+//!   (this binary's `cat` role, with the default dispositions, so the
+//!   suspend character stops it) must make the round trip on each system.
 //!   This runs under an allocator that aborts in any process but the
 //!   test's own, so the monitor (and the command between `fork` and
 //!   `exec`) is shown not to allocate;
-//! - (c) the outer-shell gate in its minimal form, with `/bin/cat` on both
-//!   systems: a job-control shell (`/bin/sh -i`, `set -m`, cleared
+//! - (c) the outer-shell gate in its minimal form, with the same two cats
+//!   on both systems: a job-control shell (`/bin/sh -i`, `set -m`, cleared
 //!   environment, no rc files) on a private outer PTY starts a driver
 //!   that relays to cat under the monitor as `envcloak run --pty` will;
 //!   the suspend character gives the shell its prompt back with `stty -g`
-//!   as before, `jobs` shows the job stopped, `fg` resumes it, and then a
-//!   fresh line comes back through cat (Linux), or `/bin/cat` ends as it
-//!   does under any shell there (macOS), where the round trip is shown
-//!   again with the `EINTR`-retrying cat;
+//!   as before, `jobs` shows the job stopped, `fg` resumes it, and then
+//!   `/bin/cat` again does what its baseline did, and the retrying cat
+//!   round-trips a fresh line;
 //! - the command's place: a terminal on 0, 1 and 2 and no other
 //!   descriptor, its own process group as the terminal's foreground group,
 //!   and the monitor, its parent, leading its session (`getsid(0)` equals
 //!   `getppid()`), so its group is not orphaned; the monitor holds only the
-//!   slave and the control channel.
+//!   slave and the control channel, also when the CLI held a descriptor
+//!   above a lowered limit (or, where it cannot show that, starts
+//!   nothing); and the monitor's death is the end of the control channel
+//!   for the CLI.
+//!
+//! The kill criterion of M2-17 is judged on these: on either system, a
+//! missing stop or report, the terminal not handed back before SIGCONT,
+//! the outer prompt, `jobs`, `stty -g` or `fg` failing, `/bin/cat` doing
+//! other than its baseline, or the retrying cat's round trip failing,
+//! fails (b) or (c). `/bin/cat`'s own ending on macOS is an application's
+//! (BSD cat does not retry a read `EINTR` interrupts), not the topology's.
 //!
 //! No libtest harness (`harness = false`): a copy of this binary plays the
 //! driver and the probe, and nothing else runs in the process that forks
@@ -225,35 +235,70 @@ fn a_session_leading_child_does_not_stop_on_the_suspend_character() {
     );
 }
 
-/// Whether `/bin/cat` reads on after a stop and continue interrupt its
-/// read: on Linux it does; on macOS the read fails with `EINTR` and cat
-/// ends ("Interrupted system call"), under a plain job-control shell as
-/// under the monitor
-/// ([`a_command_stopped_in_a_read_sees_the_same_under_the_monitor_as_under_a_shell`]).
-fn bin_cat_reads_on_after_a_stop() -> bool {
-    !cfg!(target_os = "macos")
+/// What `/bin/cat`, stopped in a read of its terminal and continued, did
+/// next, from what the terminal showed.
+fn cat_outcome(screen: &str) -> &'static str {
+    if screen.contains("Interrupted system call") {
+        "the read failed with EINTR"
+    } else if screen.matches("line-two").count() >= 2 {
+        "cat read the next line"
+    } else {
+        "neither"
+    }
 }
 
-/// The cats (b) and (c) run: `/bin/cat` on both systems, and on macOS
-/// also this binary's `cat` role, which reads again on `EINTR`, for the
-/// round trip `/bin/cat` does not make there with or without EnvCloak.
-fn cats() -> Vec<(String, bool)> {
-    let mut v = vec![("/bin/cat".to_owned(), bin_cat_reads_on_after_a_stop())];
-    if !bin_cat_reads_on_after_a_stop() {
-        v.push((std::env::current_exe().unwrap().display().to_string(), true));
+/// Whether `/bin/cat` reads on after a stop and continue interrupt its
+/// read, on this system, measured in this run under a plain job-control
+/// shell: the baseline (b) and (c) hold `/bin/cat` under the monitor to.
+/// Linux's reads on; macOS's read fails with `EINTR` and cat ends
+/// ("Interrupted system call", measured on macOS 26.4), with or without
+/// EnvCloak
+/// ([`a_command_stopped_in_a_read_sees_the_same_under_the_monitor_as_under_a_shell`]).
+fn bin_cat_reads_on_after_a_stop() -> bool {
+    let screen = stopped_cat_under_a_shell();
+    match cat_outcome(&screen) {
+        "cat read the next line" => true,
+        "the read failed with EINTR" => false,
+        _ => panic!("the plain-shell baseline showed neither ending:\n{screen}"),
     }
-    v
+}
+
+/// How a cat of [`cats`] is named in a line the test prints.
+fn cat_label(cat: &str) -> &str {
+    if cat == "/bin/cat" {
+        cat
+    } else {
+        "the EINTR-retrying cat"
+    }
+}
+
+/// The cats (b) and (c) run, on both systems: `/bin/cat`, expected to do
+/// after `Resume` or `fg` what it did under the plain shell in this run;
+/// and this binary's `cat` role, which reads again on `EINTR` (and on no
+/// other error), writes whole, and keeps the default dispositions, so the
+/// suspend character stops it: it must make the round trip after the
+/// stop on each system. The kill criterion (M2-17) is judged on both: a
+/// missing stop or report, the terminal not handed back before SIGCONT,
+/// the outer shell's prompt, `jobs`, `stty -g` or `fg` failing, `/bin/cat`
+/// doing other than its baseline, or the fixture's round trip failing,
+/// on either system, fails (b) or (c).
+fn cats() -> Vec<(String, bool)> {
+    vec![
+        ("/bin/cat".to_owned(), bin_cat_reads_on_after_a_stop()),
+        (std::env::current_exe().unwrap().display().to_string(), true),
+    ]
 }
 
 /// (b) The monitor's topology, with each of [`cats`]: the suspend
 /// character stops cat and the monitor reports `Stopped(SIGTSTP)`; a line
 /// typed while cat is stopped waits; `Resume` gives the slave back and
-/// continues cat (`Continued`). A cat that reads on then reads that line
-/// and does not stop again on SIGTTIN, and EOF ends it with 0; macOS's
-/// `/bin/cat` ends with 1 and "Interrupted system call" instead, as it
-/// does under a shell. Every cycle runs under [`OwnPidOnly`]: an
-/// allocation in the monitor or in the command before `exec` would abort
-/// it, and the channel would end without `Exited`.
+/// continues cat (`Continued`). A cat that reads on (the retrying one on
+/// both systems, and `/bin/cat` where its baseline read on) then reads
+/// that line and does not stop again on SIGTTIN, and EOF ends it with 0;
+/// a `/bin/cat` whose baseline ended with `EINTR` ends with 1 and
+/// "Interrupted system call" here too. Every cycle runs under
+/// [`OwnPidOnly`]: an allocation in the monitor or in the command before
+/// `exec` would abort it, and the channel would end without `Exited`.
 fn the_monitor_stops_cat_on_the_suspend_character_and_resumes_it() {
     for (cat, reads_on) in cats() {
         monitor_cycle(&cat, reads_on);
@@ -324,9 +369,10 @@ fn monitor_cycle(cat: &str, reads_on: bool) {
     }
     assert!(monitor.finish().unwrap().success());
     println!(
-        "pty_topology ({}): {cat} under the monitor: stopped by the suspend character, \
+        "pty_topology ({}): {} under the monitor: stopped by the suspend character, \
          continued by Resume, {}",
         std::env::consts::OS,
+        cat_label(cat),
         if reads_on {
             "read on and ended at EOF"
         } else {
@@ -568,10 +614,12 @@ fn say(screen: &mut Screen, prompts: &mut usize, line: &str) {
 /// stops cat; the driver restores the outer terminal and stops itself, so
 /// the shell prints its prompt, with `stty -g` as recorded before; `jobs`
 /// lists the job as stopped; `fg` resumes it. Then a fresh line
-/// round-trips through a cat that reads on (twice on the screen: the inner
-/// terminal's echo, and cat's copy) and EOF ends it with 0; macOS's
-/// `/bin/cat` ends at once with "Interrupted system call" and 1, as under
-/// any shell there, and the outer shell has its prompt again.
+/// round-trips through a cat that reads on (the retrying one on both
+/// systems, `/bin/cat` where its baseline read on; twice on the screen:
+/// the inner terminal's echo, and cat's copy) and EOF ends it with 0; a
+/// `/bin/cat` whose baseline ended with `EINTR` ends at once with
+/// "Interrupted system call" and 1, and the outer shell has its prompt
+/// again.
 fn an_outer_job_control_shell_regains_its_terminal_and_fg_resumes() {
     for (cat, reads_on) in cats() {
         outer_shell_cycle(&cat, reads_on);
@@ -677,9 +725,10 @@ fn outer_shell_cycle(cat: &str, reads_on: bool) {
     }
     assert_eq!(status.code(), Some(0), "{status:?}");
     println!(
-        "pty_topology ({}): {cat}: the outer shell regained its terminal on the suspend \
+        "pty_topology ({}): {}: the outer shell regained its terminal on the suspend \
          character, and fg resumed it; {}",
         std::env::consts::OS,
+        cat_label(cat),
         if reads_on {
             "a fresh line round-tripped"
         } else {
@@ -1035,15 +1084,7 @@ fn stopped_cat_under_the_monitor() -> String {
 /// So on macOS (b) and (c) assert that ending for `/bin/cat`, and show the
 /// round trip with a cat that reads again on `EINTR`.
 fn a_command_stopped_in_a_read_sees_the_same_under_the_monitor_as_under_a_shell() {
-    let outcome = |screen: &str| {
-        if screen.contains("Interrupted system call") {
-            "the read failed with EINTR"
-        } else if screen.matches("line-two").count() >= 2 {
-            "cat read the next line"
-        } else {
-            "neither"
-        }
-    };
+    let outcome = cat_outcome;
     let shell = stopped_cat_under_a_shell();
     let monitor = stopped_cat_under_the_monitor();
     let (a, b) = (outcome(&shell), outcome(&monitor));
