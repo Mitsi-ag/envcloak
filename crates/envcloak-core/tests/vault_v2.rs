@@ -371,9 +371,9 @@ fn a_policy_out_of_bounds_is_refused_unwritten() {
     assert_eq!(v.policies().unwrap().count(), 0);
 }
 
-/// Item record v2: an exposure only grows (its first mark's time kept, the
-/// kinds joined, the counts summed) and sets the rotation flag; clearing it
-/// clears both. The classification's last change is recorded at creation
+/// Item record v2 and v3: an exposure only grows (its first mark's time
+/// kept, the kinds joined, the counts summed) and sets the rotation flag;
+/// clearing it clears both. The classification's last change is recorded at creation
 /// and at every change, and only then. Both survive a reopen.
 ///
 /// Each transaction runs at a time of its own (the vault's test clock), so
@@ -487,77 +487,112 @@ fn exposure_and_the_classification_time_are_kept_by_the_vault() {
     assert_eq!(m.classification_changed_at, Some(RECLASSIFIED));
 }
 
-/// A mark covers the values an item held at its time (M2-11, Codex
-/// review): a second mark keeps the first mark's time while the item holds
-/// no value set after it, and restarts it once the item holds one (a field
-/// replaced since the mark, whose new value may be the one found), so the
-/// mark covers every value again. [`ItemMeta::exposure_covers`] and
-/// [`ItemMeta::exposure_replaced_but`] read the same rule: a value set in
-/// the mark's own second counts as covered, never as replaced.
+/// A mark covers the values its item held at each mark, by keyed hash
+/// (M2-11, Codex review), wherever they go after: the item is "exposed:
+/// rotate" until it holds none of them. With two fields `a` and `b`
+/// marked: `a` written again with its own value, or given `b`'s, or given
+/// a new value and then its old one back, still holds a covered value, so
+/// the mark stays whatever is replaced besides; only a value no mark was
+/// made over in every field clears it. A second mark keeps the first's
+/// time and covers the values held then too, so a value set between two
+/// marks keeps the mark after it. The cover survives a reopen.
 ///
-/// Mutations: the first mark's time kept whatever the item holds (the
-/// third mark keeps it); a value set in the mark's second counted as
-/// replaced (`exposure_replaced_but` says true at the end).
+/// Mutations checked (each fails here): the cover left out of a mark
+/// (`mark_exposed` adds nothing: the first rotation clears the mark); the
+/// cover taken from the item's values after the write instead of the
+/// mark's (the reuse cases clear it); the old rule by times (`a` written
+/// again with its own value, then `b` rotated, clears it).
 #[test]
-fn a_mark_restarts_when_the_item_holds_a_value_set_after_it() {
+fn a_mark_covers_the_values_its_item_held_wherever_they_go() {
     const CREATED: u64 = 1_800_000_000;
     const FIRST_MARK: u64 = CREATED + 100;
-    const SECOND_MARK: u64 = CREATED + 150;
-    const SET_A: u64 = CREATED + 200;
-    const THIRD_MARK: u64 = CREATED + 300;
 
     let (f, mut v) = Fixture::create();
+    let value = |s: &str| SecretBytes::copy_from(s.as_bytes());
     let (item, a, b) = v
         .transact_at_for_testing(CREATED, |t| {
             let i = t.create_item(secret_item("two/fields"))?;
-            let a = t.add_field(i, name("a"), SecretBytes::copy_from(b"value of a"))?;
-            let b = t.add_field(i, name("b"), SecretBytes::copy_from(b"value of b"))?;
+            let a = t.add_field(i, name("a"), value("first value of a"))?;
+            let b = t.add_field(i, name("b"), value("first value of b"))?;
             Ok((i, a, b))
         })
         .unwrap();
-    assert!(!v.item(item).unwrap().exposure_covers());
-    let mark = |v: &mut envcloak_core::vault::Vault, at, source| {
-        v.transact_at_for_testing(at, |t| t.mark_exposed(item, &[source], 1))
-            .unwrap();
-        v.item(item).unwrap().clone()
-    };
-    let m = mark(&mut v, FIRST_MARK, ExposureSource::Transcript);
-    assert_eq!(m.exposure.as_ref().unwrap().since, FIRST_MARK);
-    assert!(m.exposure_covers());
-    assert!(!m.exposure_replaced_but(a) && !m.exposure_replaced_but(b));
-    let m = mark(&mut v, SECOND_MARK, ExposureSource::GitHistory);
-    assert_eq!(m.exposure.as_ref().unwrap().since, FIRST_MARK);
-    // `a` replaced after the mark: the mark no longer covers every value,
-    // and replacing `b` too would leave none it covers.
-    v.transact_at_for_testing(SET_A, |t| {
-        t.set_value(a, SecretBytes::copy_from(b"new value of a"))
+    assert!(!v.exposure_covers(item));
+    v.transact_at_for_testing(FIRST_MARK, |t| {
+        t.mark_exposed(item, &[ExposureSource::Transcript], 1)
     })
     .unwrap();
-    let m = v.item(item).unwrap().clone();
-    assert!(!m.exposure_covers());
-    assert!(m.exposure_replaced_but(b) && !m.exposure_replaced_but(a));
-    // A mark now restarts the mark's time, the kinds and counts kept.
-    let m = mark(&mut v, THIRD_MARK, ExposureSource::Transcript);
-    let x = m.exposure.clone().unwrap();
-    assert_eq!(x.since, THIRD_MARK);
+    assert!(v.exposure_covers(item));
+    // Each step writes `new` to `field` ten seconds after the last, as a
+    // rotation does, and says whether the mark is left after it.
+    fn step(
+        v: &mut envcloak_core::vault::Vault,
+        at: &mut u64,
+        item: envcloak_core::vault::ItemId,
+        field: envcloak_core::vault::FieldId,
+        new: &str,
+    ) -> bool {
+        *at += 10;
+        v.transact_at_for_testing(*at, |t| {
+            t.set_value(field, SecretBytes::copy_from(new.as_bytes()))?;
+            t.clear_exposure_if_replaced(item)
+        })
+        .unwrap();
+        v.item(item).unwrap().exposure.is_some()
+    }
+    let mut at = FIRST_MARK;
+    // `a` written again with its own value; given a new one, then its
+    // exposed one back; then `b` rotated: `a` still holds its exposed value.
+    assert!(step(&mut v, &mut at, item, a, "first value of a"));
+    assert!(step(&mut v, &mut at, item, a, "second value of a"));
+    assert!(step(&mut v, &mut at, item, a, "first value of a"));
+    assert!(step(&mut v, &mut at, item, b, "second value of b"));
+    assert!(!v.exposure_covers(item), "b's new value is not covered");
+    // `a` given `b`'s exposed value: still covered.
+    assert!(step(&mut v, &mut at, item, a, "first value of b"));
+    // A value no mark covers in every field: cleared.
+    assert!(!step(&mut v, &mut at, item, a, "third value of a"));
+    let m = v.item(item).unwrap();
+    assert_eq!((m.exposure.clone(), m.rotate_recommended), (None, false));
+
+    // A second mark keeps the first's time and covers what the item holds
+    // then, so a value set between the marks keeps the mark after it.
+    at += 5;
+    v.transact_at_for_testing(at, |t| {
+        t.mark_exposed(item, &[ExposureSource::Transcript], 1)
+    })
+    .unwrap();
+    let first = v.item(item).unwrap().exposure.clone().unwrap().since;
+    assert_eq!(first, at);
+    assert!(step(&mut v, &mut at, item, a, "fourth value of a"));
+    assert!(!v.exposure_covers(item));
+    at += 5;
+    v.transact_at_for_testing(at, |t| {
+        t.mark_exposed(item, &[ExposureSource::GitHistory], 2)
+    })
+    .unwrap();
+    let x = v.item(item).unwrap().exposure.clone().unwrap();
+    assert_eq!((x.since, x.count), (first, 3));
     assert_eq!(
         x.sources,
         [ExposureSource::Transcript, ExposureSource::GitHistory]
     );
-    assert_eq!(x.count, 3);
-    assert!(m.exposure_covers());
-    assert!(!m.exposure_replaced_but(b) && !m.exposure_replaced_but(a));
-    // A value set in the mark's own second is covered, not replaced.
-    v.transact_at_for_testing(THIRD_MARK, |t| {
-        t.set_value(b, SecretBytes::copy_from(b"new value of b"))
-    })
-    .unwrap();
-    let m = v.item(item).unwrap().clone();
-    assert!(m.exposure_covers());
-    assert!(!m.exposure_replaced_but(a));
+    assert!(v.exposure_covers(item));
+    assert!(
+        step(&mut v, &mut at, item, b, "third value of b"),
+        "a's value is covered"
+    );
     drop(v);
-    let v = f.unlock();
+    let mut v = f.unlock();
     assert_eq!(v.item(item).unwrap().exposure, Some(x));
+    assert!(
+        v.transact(|t| t.clear_exposure_if_replaced(item))
+            .map(|c| !c)
+            .unwrap()
+    );
+    v.transact(|t| t.set_value(a, value("fifth value of a")))
+        .unwrap();
+    assert!(v.transact(|t| t.clear_exposure_if_replaced(item)).unwrap());
 }
 
 /// A login item lists its typed fields with their kinds and its own

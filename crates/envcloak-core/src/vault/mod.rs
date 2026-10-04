@@ -51,9 +51,10 @@ use crate::secret::SecretBytes;
 pub use error::{VaultError, VaultErrorKind};
 pub use integrity::{AuditHead, HeaderState, Integrity, TamperKind};
 pub use items::{
-    Account, Classification, Exposure, ExposureSource, FieldId, FieldKind, FieldMeta, FieldName,
-    ItemDetails, ItemId, ItemMeta, Links, LoginMeta, LoginTier, MAX_FIELD, MAX_PRIOR, MAX_ROW,
-    NewItem, PolicyId, ProjectBinding, ProjectId, ProjectKey, ProjectRecord, Slug,
+    Account, COVER_BITS, COVER_HASHES, Classification, Exposure, ExposureCover, ExposureSource,
+    FieldId, FieldKind, FieldMeta, FieldName, ItemDetails, ItemId, ItemMeta, Links, LoginMeta,
+    LoginTier, MAX_FIELD, MAX_PRIOR, MAX_ROW, NewItem, PolicyId, ProjectBinding, ProjectId,
+    ProjectKey, ProjectRecord, Slug,
 };
 pub use login::{
     AttemptLease, LoginFieldReader, LoginFieldValue, LoginValue, NewLogin, TotpAlgorithm,
@@ -950,6 +951,26 @@ impl Vault {
             })
             .map(|(id, f)| (*id, ValueKey(f.value_hash)))
             .collect()
+    }
+
+    /// Whether `item` is marked "exposed: rotate" by a mark that covers
+    /// every value it holds now ([`Exposure::covered`]): a mark of the
+    /// kinds it names already would add nothing. False with no mark, and
+    /// when a value was set that no mark covers yet.
+    pub fn exposure_covers(&self, item: ItemId) -> bool {
+        let Some(x) = self
+            .state
+            .items
+            .get(&item)
+            .and_then(|r| r.extra.exposure.as_ref())
+        else {
+            return false;
+        };
+        self.state
+            .fields
+            .values()
+            .filter(|f| f.item == item)
+            .all(|f| x.covered.has(&f.value_hash))
     }
 
     /// Every project record. Fails with [`VaultErrorKind::Tampered`] unless
