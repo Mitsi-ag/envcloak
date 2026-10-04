@@ -1723,8 +1723,7 @@ mod tests {
             now: std::time::SystemTime::now(),
         };
         // The override appears after the plan.
-        std::fs::write(proj.join("AGENTS.override.md"), "# O\n")
-            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(proj.join("AGENTS.override.md"), "# O\n").unwrap_or_else(|e| panic!("{e}"));
         let o = w.change(&target(&step.path), &mut edit_for(&step.kind));
         assert!(
             matches!(&o, Outcome::Refused(r) if r.name == "override_file"),
