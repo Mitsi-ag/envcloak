@@ -34,8 +34,17 @@
 //!
 //! The PTY's output passes through the slave's line discipline, which maps
 //! NL to CR NL (`ONLCR`): the redactor matches the CR LF form of every
-//! value holding LF (`RedactorBuilder::crlf_variants`, D-19). EnvCloak's
-//! own writer never sends VEOF when it closes.
+//! value holding LF (`RedactorBuilder::crlf_variants`, D-19). The master
+//! side is handed over as a plain descriptor: there is no writer object
+//! here, so nothing writes into the PTY when it closes (`portable-pty`'s
+//! writer sends VEOF on drop, D-19); the relay that writes the person's
+//! input to it is M2-19's.
+//!
+//! Before it forks the monitor, [`spawn_session`] makes sure this process
+//! does not reap its children on its own
+//! ([`crate::owned::keep_children_unreaped`]): the monitor's pid is the
+//! session's id and its handle's signal target, and both hold only while
+//! it is unreaped.
 
 use std::ffi::{OsStr, c_char};
 use std::io;
@@ -258,8 +267,10 @@ fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 ///
 /// # Errors
 /// [`SessionError::Exec`] when the command could not be executed;
-/// [`SessionError::Setup`] for everything else. A NUL byte in `argv` or
-/// `env` is [`io::ErrorKind::InvalidInput`], under `Setup`.
+/// [`SessionError::Setup`] for everything else, including a SIGCHLD that
+/// would reap the monitor on its own and cannot be given its default back.
+/// A NUL byte in `argv` or `env` is [`io::ErrorKind::InvalidInput`], under
+/// `Setup`.
 pub fn spawn_session(
     argv: &[&OsStr],
     env: &[(&OsStr, &OsStr)],
@@ -303,6 +314,9 @@ pub fn spawn_session(
     let program_ptrs = pointers(&programs);
     let argv_ptrs = pointers(&args);
     let envp_ptrs = pointers(&vars);
+    // The monitor must stay unreaped until `finish`: an inherited ignored
+    // SIGCHLD would let the kernel reap it the moment it exits.
+    crate::owned::keep_children_unreaped().map_err(SessionError::Setup)?;
     let (ours, theirs) = socket_pair().map_err(SessionError::Setup)?;
     let prepared = pty_monitor::Prepared {
         slave: slave.as_raw_fd(),
@@ -590,7 +604,10 @@ pub fn signal_route(sig: i32) -> Option<SignalRoute> {
 }
 
 /// How a forwarded signal went: its route, and for [`SignalRoute::Session`]
-/// how many processes it was sent to.
+/// how many processes it was sent to. For [`SignalRoute::Tiocsig`] the
+/// kernel took the signal for the foreground group; for
+/// [`SignalRoute::CommandGroup`] the monitor took the request, which it
+/// carries out on its own time (and which no system uses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Forwarded {
     pub route: SignalRoute,
@@ -618,7 +635,11 @@ pub fn signal_foreground_job(master: BorrowedFd<'_>, sig: i32) -> io::Result<()>
 ///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] for a signal that is not forwarded; the
-/// route's own errors.
+/// route's own errors: for [`SignalRoute::Session`], `Unsupported` on a
+/// kernel without `pidfd_open` (nothing sent), and an error carrying
+/// [`crate::owned::PartialDelivery`] when some process of the job could not
+/// be signalled or checked (the others were). A signal that reached no
+/// one for a reason is never reported as forwarded.
 pub fn forward_signal(
     monitor: &SessionMonitor,
     master: BorrowedFd<'_>,

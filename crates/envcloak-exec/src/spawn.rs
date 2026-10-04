@@ -55,6 +55,10 @@ pub(crate) fn spawn(
     if own_group {
         cmd.process_group(0);
     }
+    // The child (and the group it leads) is signalled by number and
+    // waited for: it must stay unreaped until then, which an inherited
+    // ignored SIGCHLD would not let it.
+    envcloak_sys::owned::keep_children_unreaped().map_err(|e| ExecError::Setup(e.kind()))?;
     let spawned = cmd.spawn();
     // The command's copies of the values are freed here, and wiped.
     drop(cmd);
