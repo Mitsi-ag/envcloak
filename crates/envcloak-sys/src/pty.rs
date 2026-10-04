@@ -24,13 +24,19 @@
 //!   | SIGINT, SIGQUIT | `TIOCSIG` on the master | `TIOCSIG` on the master |
 //!   | SIGTERM, SIGHUP | `OwnedSession` (`TIOCSIG` refuses them, `EINVAL`) | `TIOCSIG` on the master |
 //!
-//!   With `TIOCSIG` the kernel resolves the foreground group itself.
-//!   macOS flushes the terminal's queues with it unless `NOFLSH` is set,
-//!   so input not yet read and output not yet relayed are lost, never
-//!   passed through. No signal is narrowed to the command's own group on
-//!   either system ([`SignalRoute::CommandGroup`] stays for a system where
-//!   the spike finds one). EnvCloak never signals a group number it read
-//!   from the terminal: `TIOCGPGRP` is only a filter in `OwnedSession`.
+//!   With `TIOCSIG` the kernel resolves the foreground group itself, and
+//!   with `OwnedSession` the kernel signals the foreground group as one,
+//!   through its leader's pidfd, once that leader is shown to be in the
+//!   monitor's session (`crate::owned`). macOS flushes the terminal's
+//!   queues with `TIOCSIG` unless `NOFLSH` is set, so input not yet read
+//!   and output not yet relayed are lost, never passed through. While the
+//!   command is stopped the monitor holds the terminal, and the job is the
+//!   command's own group, which the monitor signals
+//!   ([`SignalRoute::CommandGroup`]). No signal is narrowed to the
+//!   command's own group on either system while it runs, except on Linux
+//!   at run time where the kernel or the job cannot take the group signal
+//!   ([`RouteReason::Narrowed`]). EnvCloak never signals a group number it
+//!   read from the terminal.
 //!
 //! The PTY's output passes through the slave's line discipline, which maps
 //! NL to CR NL (`ONLCR`): the redactor matches the CR LF form of every
@@ -583,17 +589,20 @@ pub enum SignalRoute {
     /// `TIOCSIG` on the master: the kernel signals the slave's foreground
     /// process group.
     Tiocsig,
-    /// `OwnedSession` (Linux): each process of the monitor's session in
-    /// the slave's foreground group, through a pidfd of its own.
+    /// `OwnedSession` (Linux): the foreground group, a group of the
+    /// monitor's session, signalled as one through its leader's pidfd.
     Session,
-    /// [`MonitorCommand::Signal`]: the command's own group only, for a
-    /// signal narrowed on a system. None is, on Linux or macOS.
+    /// [`MonitorCommand::Signal`]: the command's own group, through the
+    /// monitor, which owns it. The job when the command is stopped (the
+    /// monitor then holds the terminal), and the route of a signal
+    /// narrowed on a system or at run time ([`RouteReason`]).
     CommandGroup,
 }
 
-/// The route [`forward_signal`] takes for `sig` on this system (the M2-17
-/// spike's result, `crates/envcloak-sys/tests/pty_signals.rs`), or `None`
-/// for a signal that is not forwarded.
+/// The route [`forward_signal`] takes for `sig` on this system while the
+/// command runs (the M2-17 spike's result,
+/// `crates/envcloak-sys/tests/pty_signals.rs`), or `None` for a signal that
+/// is not forwarded.
 pub fn signal_route(sig: i32) -> Option<SignalRoute> {
     match sig {
         libc::SIGINT | libc::SIGQUIT => Some(SignalRoute::Tiocsig),
@@ -603,15 +612,32 @@ pub fn signal_route(sig: i32) -> Option<SignalRoute> {
     }
 }
 
-/// How a forwarded signal went: its route, and for [`SignalRoute::Session`]
-/// how many processes it was sent to. For [`SignalRoute::Tiocsig`] the
-/// kernel took the signal for the foreground group; for
-/// [`SignalRoute::CommandGroup`] the monitor took the request, which it
-/// carries out on its own time (and which no system uses).
+/// Why [`forward_signal`] took the route it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteReason {
+    /// The route [`signal_route`] gives for the signal on this system.
+    Measured,
+    /// The monitor held the terminal: the command was stopped, so the job
+    /// was the command's own group, which the monitor signals. The signal
+    /// waits there until the command continues.
+    CommandStopped,
+    /// (Linux) The foreground job could not be signalled as one group: the
+    /// kernel has no process-group signal through a pidfd (before 6.9), or
+    /// the job's group leader is gone (a pipeline whose first command
+    /// ended first). Narrowed to the command's own group, which is not the
+    /// job when a nested shell runs one.
+    Narrowed,
+}
+
+/// How a forwarded signal went: its route and why. For
+/// [`SignalRoute::Tiocsig`] the kernel took the signal for the foreground
+/// group; for [`SignalRoute::Session`] at least one process of the job's
+/// group received it; for [`SignalRoute::CommandGroup`] the monitor took
+/// the request, which it carries out on its own time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Forwarded {
     pub route: SignalRoute,
-    pub processes: Option<usize>,
+    pub reason: RouteReason,
 }
 
 /// Sends `sig` to the slave's foreground process group with `TIOCSIG` on
@@ -630,46 +656,116 @@ pub fn signal_foreground_job(master: BorrowedFd<'_>, sig: i32) -> io::Result<()>
     Ok(())
 }
 
+/// The slave's foreground process group, read on the master side
+/// (`TIOCGPGRP`): to compare with the monitor's own and to choose whose
+/// pidfd to open, never a signal target.
+pub(crate) fn foreground_group(master: BorrowedFd<'_>) -> io::Result<i32> {
+    let mut pgrp: libc::pid_t = 0;
+    // SAFETY: TIOCGPGRP writes one pid_t into `pgrp`; on a PTY's master
+    // side it reports the slave's foreground group.
+    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPGRP as _, &mut pgrp) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pgrp)
+}
+
+/// How many times [`forward_signal`] reads the foreground group again when
+/// the job it read ended before the signal reached it.
+const FORWARD_ATTEMPTS: usize = 3;
+
 /// Forwards `sig`, which another process sent the CLI, to the slave's
-/// foreground job along [`signal_route`]'s route for it.
+/// foreground job:
+///
+/// - while the monitor holds the terminal (the command is stopped), the
+///   job is the command's own group, and the monitor signals it
+///   ([`RouteReason::CommandStopped`]); the signal waits until the command
+///   continues;
+/// - otherwise along [`signal_route`]'s route for it. With `TIOCSIG`, a
+///   command that stops between the read of the foreground and the signal
+///   leaves the monitor's own group in the foreground, and the monitor
+///   passes the signal on to the command's group itself (it catches the
+///   four signals and relays them, `crate::pty_monitor`). With
+///   `OwnedSession` (Linux), a job that ended before the signal reached it
+///   is read again, up to three times, and a job that cannot be signalled
+///   as one group ([`crate::owned::NoJob::Unsupported`],
+///   [`crate::owned::NoJob::NoLeader`]) has the signal narrowed to the
+///   command's own group ([`RouteReason::Narrowed`]).
+///
+/// A signal that reached no process is never reported as forwarded, with
+/// one exception the kernel makes: Linux's `TIOCSIG` reports success for a
+/// foreground group that has just emptied (`pty_signal` ignores what the
+/// delivery returned), which happens only once the job has ended.
 ///
 /// # Errors
-/// [`io::ErrorKind::InvalidInput`] for a signal that is not forwarded; the
-/// route's own errors: for [`SignalRoute::Session`], `Unsupported` on a
-/// kernel without `pidfd_open` (nothing sent), and an error carrying
-/// [`crate::owned::PartialDelivery`] when some process of the job could not
-/// be signalled or checked (the others were). A signal that reached no
-/// one for a reason is never reported as forwarded.
+/// [`io::ErrorKind::InvalidInput`] for a signal that is not forwarded;
+/// [`io::ErrorKind::BrokenPipe`] when the monitor is gone; `TIOCGPGRP`'s
+/// and `TIOCSIG`'s errors; for [`SignalRoute::Session`], `EPERM` when no
+/// process of the job could be signalled, and an error carrying
+/// [`crate::owned::NoJob`] when the job kept changing under the reads.
 pub fn forward_signal(
     monitor: &SessionMonitor,
     master: BorrowedFd<'_>,
     sig: i32,
 ) -> io::Result<Forwarded> {
     let route = signal_route(sig).ok_or(io::ErrorKind::InvalidInput)?;
-    let processes = match route {
-        SignalRoute::Tiocsig => {
-            signal_foreground_job(master, sig)?;
-            None
-        }
-        SignalRoute::Session => Some(session_signal(monitor, master, sig)?),
-        SignalRoute::CommandGroup => {
-            monitor.send(MonitorCommand::Signal(sig))?;
-            None
-        }
+    let session = i32::try_from(monitor.monitor_id())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    if session < 2 {
+        return Err(io::ErrorKind::BrokenPipe.into());
+    }
+    let through_monitor = |reason: RouteReason| -> io::Result<Forwarded> {
+        monitor.send(MonitorCommand::Signal(sig))?;
+        Ok(Forwarded {
+            route: SignalRoute::CommandGroup,
+            reason,
+        })
     };
-    Ok(Forwarded { route, processes })
+    let mut last = None;
+    for _ in 0..FORWARD_ATTEMPTS {
+        if foreground_group(master)? == session {
+            return through_monitor(RouteReason::CommandStopped);
+        }
+        match route {
+            SignalRoute::Tiocsig => {
+                signal_foreground_job(master, sig)?;
+                return Ok(Forwarded {
+                    route,
+                    reason: RouteReason::Measured,
+                });
+            }
+            SignalRoute::CommandGroup => return through_monitor(RouteReason::Measured),
+            SignalRoute::Session => match session_signal(monitor, master, sig) {
+                Ok(()) => {
+                    return Ok(Forwarded {
+                        route,
+                        reason: RouteReason::Measured,
+                    });
+                }
+                Err(e) => match crate::owned::NoJob::of(&e) {
+                    Some(crate::owned::NoJob::Unsupported | crate::owned::NoJob::NoLeader) => {
+                        return through_monitor(RouteReason::Narrowed);
+                    }
+                    // The job changed under the reads, or the command
+                    // stopped: read the foreground again.
+                    Some(_) => last = Some(e),
+                    None => return Err(e),
+                },
+            },
+        }
+    }
+    Err(last.unwrap_or_else(|| io::ErrorKind::NotFound.into()))
 }
 
 #[cfg(target_os = "linux")]
-fn session_signal(monitor: &SessionMonitor, master: BorrowedFd<'_>, sig: i32) -> io::Result<usize> {
+fn session_signal(monitor: &SessionMonitor, master: BorrowedFd<'_>, sig: i32) -> io::Result<()> {
     monitor
         .session()
-        .ok_or(io::ErrorKind::NotFound)?
+        .ok_or(io::ErrorKind::BrokenPipe)?
         .signal_foreground(master, sig)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn session_signal(_: &SessionMonitor, _: BorrowedFd<'_>, _: i32) -> io::Result<usize> {
+fn session_signal(_: &SessionMonitor, _: BorrowedFd<'_>, _: i32) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 

@@ -13,12 +13,17 @@
 //! process). macOS has no pidfd: ownership alone carries the guarantee.
 //!
 //! Ownership holds only while no wait happens behind the handle's back.
-//! A process whose SIGCHLD is ignored (`SIG_IGN`, inherited across `exec`
-//! from whatever started it) or set with `SA_NOCLDWAIT` has its children
-//! reaped by the kernel the moment they exit, and their numbers are free
-//! for reuse at once (POSIX `wait`; review cycle 365). So
-//! [`keep_children_unreaped`] runs before every fork that makes an
-//! `OwnedChild` (it gives SIGCHLD its default action back, or refuses),
+//! A process whose SIGCHLD is set to be ignored (`SIG_IGN`) or carries
+//! `SA_NOCLDWAIT` may have its children reaped by the kernel the moment
+//! they exit, their numbers free for reuse at once (POSIX `wait` leaves
+//! `SIG_IGN` to the system; review cycle 365). Linux reaps so for both,
+//! a `SIG_IGN` inherited across `exec` included. On macOS 26.4.1 it was
+//! measured for `SA_NOCLDWAIT` and for `SIG_IGN` set in the process
+//! itself, and not for a `SIG_IGN` inherited across `exec` (XNU marks the
+//! process when `sigaction` sets it; `crates/envcloak-sys/tests/pty.rs`
+//! prints what each setup does). So [`keep_children_unreaped`] runs
+//! before every fork that makes an `OwnedChild`, whichever setup the
+//! process has (it gives SIGCHLD its default action back, or refuses),
 //! and every signal sent by number, rather than through a pidfd, checks
 //! first that this process still does not reap on its own and that the
 //! child is still its own, unreaped one (`waitid` with `WNOWAIT`).
@@ -29,16 +34,25 @@
 //! `ProcessOps` seam and the clippy ban on `kill` elsewhere).
 //!
 //! `OwnedSession` (Linux) is D-34's one bounded exception, for the PTY
-//! monitor's session: it signals the processes of the session the monitor
-//! leads that are in the slave's foreground process group, each through a
-//! pidfd of its own, opened before its session and group are read and
-//! checked to be alive after. A process enters a session only by being
-//! created in it (`setsid` makes a new one; `setpgid` moves a process only
-//! within its own), and the monitor's pid, which is the session's id,
-//! cannot be reused while the monitor is unreaped, so the authority comes
-//! from the owned session, never from a number: the foreground group
-//! number read from the terminal (`TIOCGPGRP`) only selects among
-//! processes already shown to be in that session.
+//! monitor's session: it signals the terminal's foreground job when that
+//! job is a process group of the session the monitor leads, as one
+//! operation of the kernel. A process enters a session only by being
+//! created in it (`setsid` makes a new one), a process group never spans
+//! two sessions (`setpgid` joins only a group of the caller's own
+//! session, and `setsid` leaves the group), and the monitor's pid, which
+//! is the session's id, cannot be reused while the monitor is unreaped. So
+//! a pidfd is opened on the process whose pid is the foreground group's
+//! number (the group's leader), and only then is that process's session
+//! read and checked to be the monitor's: a process that is in the session
+//! has been in it all its life, so every group it created, its own, is in
+//! it too. The signal then goes through that pidfd to the group the
+//! process leads or led (`PIDFD_SIGNAL_PROCESS_GROUP`, Linux 6.9), which
+//! the kernel resolves by the group's identity, never its number, and
+//! signals at the moment of delivery: a member that left the group or the
+//! session before then (`setpgid`, `setsid`) gets nothing, and a number
+//! reused since the read names no member of it. The group number read
+//! from the terminal (`TIOCGPGRP`) only says whose pidfd to open; it is
+//! never a signal target.
 
 use std::io;
 use std::os::unix::process::ExitStatusExt;
@@ -340,15 +354,22 @@ fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
 
 #[cfg(target_os = "linux")]
 fn pidfd_send_signal(pidfd: libc::c_int, sig: i32) -> io::Result<()> {
-    // SAFETY: pidfd_send_signal with a null siginfo and no flags sends
-    // `sig` as kill would, to the process `pidfd` refers to.
+    pidfd_send_signal_with(pidfd, sig, 0)
+}
+
+/// Sends `sig` through a pidfd, with `flags` (0: the process;
+/// [`PIDFD_SIGNAL_PROCESS_GROUP`]: the group it leads or led).
+#[cfg(target_os = "linux")]
+fn pidfd_send_signal_with(pidfd: libc::c_int, sig: i32, flags: libc::c_uint) -> io::Result<()> {
+    // SAFETY: pidfd_send_signal with a null siginfo sends `sig` as kill
+    // would, to what `pidfd` and `flags` name.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             pidfd,
             sig,
             std::ptr::null::<libc::siginfo_t>(),
-            0,
+            flags,
         )
     };
     if rc != 0 {
@@ -357,152 +378,160 @@ fn pidfd_send_signal(pidfd: libc::c_int, sig: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// What `OwnedSession` reads and does, so a recording model can stand in
-/// for the process table in tests: the candidate pids, a handle (a pidfd)
-/// per process, each process's session and group, whether the process a
-/// handle names still lives, and a signal through a handle.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) trait SessionTable {
-    type Handle;
-    /// Every pid that may be in the session.
-    fn pids(&mut self) -> io::Result<Vec<i32>>;
-    /// A handle on the process that has `pid` now; `Ok(None)` when no
-    /// process has it (`ESRCH`).
-    fn open(&mut self, pid: i32) -> io::Result<Option<Self::Handle>>;
-    /// The session and process group of the process that has `pid` now
-    /// (read by pid, so possibly another process than a handle taken
-    /// before); `Ok(None)` when no process has it.
-    fn ids(&mut self, pid: i32) -> io::Result<Option<(i32, i32)>>;
-    /// Whether the process the handle names has not exited. While it has
-    /// not, its pid was not given to another, so what was read by pid in
-    /// between was its own.
-    fn alive(&mut self, handle: &Self::Handle) -> io::Result<bool>;
-    /// Sends `sig` through the handle.
-    fn send(&mut self, handle: &Self::Handle, sig: i32) -> io::Result<()>;
+/// `pidfd_send_signal`'s flag that sends to the process group whose
+/// identity is the pidfd's process (the group it leads or led), as
+/// `kill_pgrp` does for the terminal's own signals: Linux 6.9
+/// (`include/uapi/linux/pidfd.h`; `kernel/signal.c`,
+/// `do_pidfd_send_signal`, which hands the pidfd's `struct pid` to
+/// `kill_pgrp_info` as the group). Older kernels refuse the flag with
+/// `EINVAL`.
+#[cfg(target_os = "linux")]
+const PIDFD_SIGNAL_PROCESS_GROUP: libc::c_uint = 1 << 2;
+
+/// Why `OwnedSession` reached no foreground job. It is always an error,
+/// never a delivery to nobody (lesson L-08); [`NoJob::of`] reads it back
+/// from the `io::Error` that carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoJob {
+    /// The terminal's foreground group is the monitor's own: the command is
+    /// stopped and the monitor holds the terminal.
+    MonitorHolds,
+    /// No process has the foreground group's number as its pid any more:
+    /// the group's leader has exited and been reaped (the first command of
+    /// a pipeline that ended before the others), so nothing holds the
+    /// group's identity to signal it through.
+    NoLeader,
+    /// The process whose pid is the group's number is not in the monitor's
+    /// session: the number no longer names the job that was read.
+    OutsideSession,
+    /// The group had no process left when the signal was sent.
+    Empty,
+    /// The kernel cannot signal a process group through a pidfd
+    /// (`PIDFD_SIGNAL_PROCESS_GROUP`, Linux 6.9) or has no `pidfd_open`
+    /// (Linux 5.3); nothing was sent.
+    Unsupported,
 }
 
-/// A session-scoped delivery that failed for some processes of the
-/// foreground job (and may have reached others): an error, never a
-/// success (lesson L-08). The error that carries it has the kind of the
-/// first failure.
-#[derive(Debug)]
-pub struct PartialDelivery {
-    /// The processes the signal was sent to.
-    pub signalled: usize,
-    /// The processes it could not be sent to, or that could not be
-    /// checked.
-    pub failed: usize,
-    /// The first failure.
-    pub first: io::Error,
+impl NoJob {
+    /// The reason an error from `OwnedSession` carries, if it is one.
+    pub fn of(e: &io::Error) -> Option<NoJob> {
+        e.get_ref()?.downcast_ref::<NoJob>().copied()
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn error(self) -> io::Error {
+        let kind = match self {
+            NoJob::Unsupported => io::ErrorKind::Unsupported,
+            _ => io::ErrorKind::NotFound,
+        };
+        io::Error::new(kind, self)
+    }
 }
 
-impl core::fmt::Display for PartialDelivery {
+impl core::fmt::Display for NoJob {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "the signal was sent to {} process(es) of the terminal's foreground job and failed \
-             for {}: {}",
-            self.signalled, self.failed, self.first
-        )
+        f.write_str(match self {
+            NoJob::MonitorHolds => "the PTY monitor holds the terminal: the command is stopped",
+            NoJob::NoLeader => "the terminal's foreground group has no leader to signal it through",
+            NoJob::OutsideSession => {
+                "the terminal's foreground group number names a process outside the session"
+            }
+            NoJob::Empty => "the terminal's foreground group has no process left",
+            NoJob::Unsupported => "this kernel cannot signal a process group through a pidfd",
+        })
     }
 }
 
-impl std::error::Error for PartialDelivery {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.first)
-    }
-}
+impl std::error::Error for NoJob {}
 
-/// Signals, through its own handle, every process of `table` whose session
-/// is `session` and whose process group is `foreground`, except the
-/// session's leader itself; returns how many. For each candidate pid, in
-/// this order: a handle is opened, the ids are read by pid, and the
-/// handle's process is checked to be alive, so the ids read were that
-/// process's (a pid is not reused while its process lives). A
-/// `foreground` equal to `session` (the leader's own group: the monitor
-/// took the terminal back) or below 2 selects nothing.
-///
-/// Every candidate is tried. A failure (a handle that cannot be opened, ids
-/// that cannot be read, a liveness check or a send that fails for another
-/// reason than the process having gone) does not stop the others; the
-/// result is then an error carrying [`PartialDelivery`]. A system without
-/// `pidfd_open` (`ENOSYS`) is that error itself, before anything is sent.
+/// What `OwnedSession` reads and does, so a recording model can stand in
+/// for the process table in tests: a handle on a process (a pidfd), the
+/// session of the process that has a pid, and a signal to the process
+/// group whose identity a handle holds.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn deliver_in_session<T: SessionTable>(
+pub(crate) trait GroupTable {
+    type Handle;
+    /// A handle on the process that has `pid` as its pid now; `Ok(None)`
+    /// when none has (it is gone, or the number names only a group whose
+    /// leader was reaped).
+    fn open(&mut self, pid: i32) -> io::Result<Option<Self::Handle>>;
+    /// The session of the process that has `pid` now, read by pid, so
+    /// possibly of another process than one a handle was opened on before;
+    /// `Ok(None)` when no process has it.
+    fn session_of(&mut self, pid: i32) -> io::Result<Option<i32>>;
+    /// Sends `sig`, as one operation of the kernel, to every process that
+    /// is then in the process group whose identity is the handle's process
+    /// (the group it leads or led): `ESRCH` when that group has no
+    /// process, `EINVAL` where the kernel cannot (Linux before 6.9), and
+    /// `EPERM` when no member could be signalled. Success means at least
+    /// one member was (`kill(2)`'s contract for a group).
+    fn signal_group(&mut self, handle: &Self::Handle, sig: i32) -> io::Result<()>;
+}
+
+/// Binds the job in the foreground group `foreground` of the terminal of
+/// the session `session` (the monitor's pid): a handle is opened on the
+/// process whose pid is the group's number, and only after that is that
+/// process's session read and checked to be `session`. Opened in this
+/// order, the session read is the handle's process's own whenever that
+/// process still has the number; if the number was given to another
+/// process in between, the handle's process had left nothing behind (a
+/// number is free only once no process, group or session uses it), so its
+/// group is empty and the signal reaches no one. A process whose session
+/// is `session` has been in it all its life, so the group it leads or led
+/// is in it too: the leader need not still be in that group, nor alive.
+///
+/// # Errors
+/// [`NoJob::MonitorHolds`] when `foreground` is the session's own group;
+/// [`NoJob::NoLeader`] when no process has the number as its pid;
+/// [`NoJob::OutsideSession`] when the process that has it is in another
+/// session; [`NoJob::Unsupported`] without `pidfd_open`;
+/// [`io::ErrorKind::InvalidInput`] for a number below 2; and the table's
+/// own errors.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn bind_job<T: GroupTable>(
     table: &mut T,
     session: i32,
     foreground: i32,
-    sig: i32,
-) -> io::Result<usize> {
-    if session < 2 || foreground < 2 || foreground == session {
-        return Ok(0);
+) -> io::Result<T::Handle> {
+    if session < 2 || foreground < 2 {
+        return Err(io::ErrorKind::InvalidInput.into());
     }
-    let mut signalled = 0usize;
-    let mut failed = 0usize;
-    let mut first: Option<io::Error> = None;
-    let mut fail = |e: io::Error, failed: &mut usize| {
-        *failed += 1;
-        first.get_or_insert(e);
+    if foreground == session {
+        return Err(NoJob::MonitorHolds.error());
+    }
+    let handle = match table.open(foreground) {
+        Ok(Some(handle)) => handle,
+        Ok(None) => return Err(NoJob::NoLeader.error()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => return Err(NoJob::Unsupported.error()),
+        Err(e) => return Err(e),
     };
-    for pid in table.pids()? {
-        if pid == session || pid < 2 {
-            continue;
-        }
-        let handle = match table.open(pid) {
-            Ok(Some(handle)) => handle,
-            // No process has the pid any more.
-            Ok(None) => continue,
-            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) && signalled == 0 && failed == 0 => {
-                return Err(e);
-            }
-            Err(e) => {
-                fail(e, &mut failed);
-                continue;
-            }
-        };
-        let ids = table.ids(pid);
-        match table.alive(&handle) {
-            Ok(true) => {}
-            // Exited since the handle was taken: what was read may belong
-            // to a process that took the pid after it.
-            Ok(false) => continue,
-            Err(e) => {
-                fail(e, &mut failed);
-                continue;
-            }
-        }
-        let (sid, pgrp) = match ids {
-            Ok(Some(ids)) => ids,
-            // Gone between the read and the check cannot be: it is alive.
-            Ok(None) => {
-                fail(io::ErrorKind::NotFound.into(), &mut failed);
-                continue;
-            }
-            Err(e) => {
-                fail(e, &mut failed);
-                continue;
-            }
-        };
-        if sid != session || pgrp != foreground {
-            continue;
-        }
-        match table.send(&handle, sig) {
-            Ok(()) => signalled += 1,
-            // Exited since the check.
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(e) => fail(e, &mut failed),
-        }
+    match table.session_of(foreground)? {
+        Some(sid) if sid == session => Ok(handle),
+        Some(_) => Err(NoJob::OutsideSession.error()),
+        // Reaped since the handle was opened: its group's members, if it
+        // has any, can no longer be shown to be in the session by it.
+        None => Err(NoJob::NoLeader.error()),
     }
-    match first {
-        None => Ok(signalled),
-        Some(first) => Err(io::Error::new(
-            first.kind(),
-            PartialDelivery {
-                signalled,
-                failed,
-                first,
-            },
-        )),
+}
+
+/// Signals the job [`bind_job`] bound, as one operation: every process in
+/// its group at that moment, and no other.
+///
+/// # Errors
+/// [`NoJob::Empty`] when the group has no process left (`ESRCH`);
+/// [`NoJob::Unsupported`] where the kernel cannot signal a group through
+/// a pidfd (`EINVAL`); `EPERM` when no member could be signalled.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn signal_job<T: GroupTable>(
+    table: &mut T,
+    handle: &T::Handle,
+    sig: i32,
+) -> io::Result<()> {
+    match table.signal_group(handle, sig) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Err(NoJob::Empty.error()),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Err(NoJob::Unsupported.error()),
+        Err(e) => Err(e),
     }
 }
 
@@ -522,6 +551,25 @@ impl core::fmt::Debug for OwnedSession<'_> {
     }
 }
 
+/// The foreground job of an [`OwnedSession`], bound: a pidfd on the
+/// process whose pid is the job's group number, checked to be in the
+/// session after it was opened (Linux).
+#[cfg(target_os = "linux")]
+pub struct ForegroundJob<'a> {
+    leader: OwnedFd,
+    group: i32,
+    _session: core::marker::PhantomData<&'a OwnedChild>,
+}
+
+#[cfg(target_os = "linux")]
+impl core::fmt::Debug for ForegroundJob<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ForegroundJob")
+            .field("group", &self.group)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl<'a> OwnedSession<'a> {
     /// The session `monitor` leads. The monitor called `setsid`, so its
@@ -531,21 +579,15 @@ impl<'a> OwnedSession<'a> {
         OwnedSession { monitor }
     }
 
-    /// Sends `sig` to every process of the session that is in the
-    /// foreground process group of the terminal whose master side is
-    /// `master` (`TIOCGPGRP`), each through a pidfd opened before its
-    /// session and group were read and checked to be alive after, and
-    /// never to the monitor itself. Returns how many processes were
-    /// signalled.
+    /// Binds the foreground job of the terminal whose master side is
+    /// `master` (`TIOCGPGRP`), as [`bind_job`] has it.
     ///
     /// # Errors
-    /// When the foreground group cannot be read or `/proc` cannot be
-    /// listed; `ENOSYS` (kind `Unsupported`) when the kernel has no
-    /// `pidfd_open`, before anything is sent; `ECHILD` when the monitor is
-    /// no longer this process's own unreaped child; otherwise an error
-    /// carrying [`PartialDelivery`] once every candidate was tried, when a
-    /// process could not be checked or signalled.
-    pub fn signal_foreground(&self, master: BorrowedFd<'_>, sig: i32) -> io::Result<usize> {
+    /// `ECHILD` when the monitor is no longer this process's own unreaped
+    /// child (this process reaps on its own, or something reaped it); an
+    /// error carrying a [`NoJob`] when there is no job of the session to
+    /// bind; `TIOCGPGRP`'s, `pidfd_open`'s and `/proc`'s other errors.
+    pub fn foreground_job(&self, master: BorrowedFd<'_>) -> io::Result<ForegroundJob<'a>> {
         // The session's id is the monitor's pid only while the monitor is
         // unreaped (the borrow says it is not reaped through its handle;
         // this says nothing else reaped it).
@@ -553,13 +595,48 @@ impl<'a> OwnedSession<'a> {
             return Err(io::Error::from_raw_os_error(libc::ECHILD));
         }
         crate::has_exited(self.monitor.pid)?;
-        let mut pgrp: libc::pid_t = 0;
-        // SAFETY: TIOCGPGRP writes one pid_t into `pgrp`; on a PTY's
-        // master side it reports the slave's foreground group.
-        if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPGRP as _, &mut pgrp) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        deliver_in_session(&mut ProcTable, self.monitor.pid, pgrp, sig)
+        let group = crate::pty::foreground_group(master)?;
+        let leader = bind_job(&mut ProcTable, self.monitor.pid, group)?;
+        Ok(ForegroundJob {
+            leader,
+            group,
+            _session: core::marker::PhantomData,
+        })
+    }
+
+    /// Sends `sig` to the foreground job of the terminal whose master side
+    /// is `master`: [`OwnedSession::foreground_job`], then
+    /// [`ForegroundJob::signal`].
+    ///
+    /// # Errors
+    /// Theirs.
+    pub fn signal_foreground(&self, master: BorrowedFd<'_>, sig: i32) -> io::Result<()> {
+        self.foreground_job(master)?.signal(sig)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ForegroundJob<'_> {
+    /// The job's process group number, for display and for reading what
+    /// the kernel reports; never a signal target.
+    pub fn group_id(&self) -> u32 {
+        self.group.unsigned_abs()
+    }
+
+    /// Sends `sig` to every process in the job's group at the moment of
+    /// delivery, through the leader's pidfd (`PIDFD_SIGNAL_PROCESS_GROUP`):
+    /// one operation of the kernel, which reads the group's members under
+    /// its task-list lock, so a member that left the group or the session
+    /// since the job was bound gets nothing. A member this process may not
+    /// signal (one that changed to another user) gets nothing either, and,
+    /// as with `kill(2)` of a group, the call succeeds when another member
+    /// received the signal.
+    ///
+    /// # Errors
+    /// An error carrying [`NoJob::Empty`] or [`NoJob::Unsupported`]
+    /// ([`signal_job`]); `EPERM` when no member could be signalled.
+    pub fn signal(&self, sig: i32) -> io::Result<()> {
+        signal_job(&mut ProcTable, &self.leader, sig)
     }
 }
 
@@ -568,29 +645,28 @@ impl<'a> OwnedSession<'a> {
 struct ProcTable;
 
 #[cfg(target_os = "linux")]
-impl SessionTable for ProcTable {
+impl GroupTable for ProcTable {
     type Handle = OwnedFd;
-
-    fn pids(&mut self) -> io::Result<Vec<i32>> {
-        let mut pids = Vec::new();
-        for entry in std::fs::read_dir("/proc")? {
-            let name = entry?.file_name();
-            if let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) {
-                pids.push(pid);
-            }
-        }
-        Ok(pids)
-    }
 
     fn open(&mut self, pid: i32) -> io::Result<Option<OwnedFd>> {
         match pidfd_open(pid) {
             Ok(fd) => Ok(Some(fd)),
-            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            // No task has the number as its pid: `ESRCH` (gone or reaped);
+            // `ENOENT` (Linux 6.9 on) or `EINVAL` (before) for a number a
+            // process group or a thread holds but no process.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ESRCH | libc::ENOENT | libc::EINVAL)
+                ) =>
+            {
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
 
-    fn ids(&mut self, pid: i32) -> io::Result<Option<(i32, i32)>> {
+    fn session_of(&mut self, pid: i32) -> io::Result<Option<i32>> {
         let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
             Err(e)
@@ -604,38 +680,11 @@ impl SessionTable for ProcTable {
         if f.pid != pid {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        Ok(Some((f.session, f.pgrp)))
+        Ok(Some(f.session))
     }
 
-    fn alive(&mut self, handle: &OwnedFd) -> io::Result<bool> {
-        loop {
-            let mut p = libc::pollfd {
-                fd: handle.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: `p` is one initialized pollfd; a zero timeout only
-            // looks. A pidfd is readable once its process has exited.
-            let rc = unsafe { libc::poll(&mut p, 1, 0) };
-            if rc == 0 {
-                return Ok(true);
-            }
-            if rc > 0 {
-                if p.revents & libc::POLLNVAL != 0 {
-                    return Err(io::ErrorKind::InvalidInput.into());
-                }
-                // POLLIN (exited) or POLLHUP (reaped).
-                return Ok(false);
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
-    }
-
-    fn send(&mut self, handle: &OwnedFd, sig: i32) -> io::Result<()> {
-        pidfd_send_signal(handle.as_raw_fd(), sig)
+    fn signal_group(&mut self, handle: &OwnedFd, sig: i32) -> io::Result<()> {
+        pidfd_send_signal_with(handle.as_raw_fd(), sig, PIDFD_SIGNAL_PROCESS_GROUP)
     }
 }
 
@@ -644,294 +693,392 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// One process in the model table: its session and group as `/proc`
-    /// shows them, and whether it still lives.
+    /// A process's identity: its pid and which incarnation of that pid it
+    /// is (a pidfd names one incarnation).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct Id {
+        pid: i32,
+        birth: u32,
+    }
+
+    /// One process of the model: its identity, its session, and its
+    /// group's identity (the process that created the group).
     #[derive(Clone, Copy, Debug)]
     struct Proc {
+        id: Id,
         sid: i32,
-        pgrp: i32,
-        alive: bool,
+        group: Id,
     }
 
-    /// What happens to a pid's process right after the model answers a
-    /// call about it (the race the order of calls must survive).
+    /// A change to the process table, made by the model between two calls.
     #[derive(Clone, Copy, Debug)]
-    enum Then {
-        /// The process exits and another one takes its pid at once.
-        Reused(Proc),
-        /// The process exits; nothing takes the pid.
-        Exits,
+    enum Change {
+        /// The process with this pid exits and is reaped.
+        Gone(i32),
+        /// It calls `setsid`: a new session and group of its own.
+        Setsid(i32),
+        /// It joins the group the process with the second pid created, in
+        /// its own session.
+        Join(i32, i32),
+        /// The first pid forks a child with the second pid, in its group.
+        Fork(i32, i32),
+        /// A new process takes this pid, in this session, leading a new
+        /// group of its own or (with `Some`) in the group the process with
+        /// that pid created. The model refuses it while the number is in
+        /// use, as the kernel does.
+        Born(i32, i32, Option<i32>),
     }
 
-    /// When the event fires: after the first call that touches the pid, or
-    /// after the `ids` read.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum After {
-        FirstTouch,
-        IdsRead,
-    }
-
-    /// A process table where a pid can name one process after another:
-    /// each pid has a list of incarnations, the last one current. A handle
-    /// names the incarnation that was current when it was opened; `ids`
-    /// reads the current one; `alive` reports on the handle's.
     #[derive(Default)]
     struct Model {
-        procs: BTreeMap<i32, Vec<Proc>>,
-        events: BTreeMap<i32, (After, Then)>,
-        touched: BTreeSet<i32>,
-        /// (pid, incarnation, signal) for every signal sent.
-        signalled: Vec<(i32, usize, i32)>,
-        /// Failures to inject: `open` or `send` for a pid returns this
-        /// errno.
-        open_errors: BTreeMap<i32, i32>,
-        send_errors: BTreeMap<i32, i32>,
-        alive_errors: BTreeSet<i32>,
-        ids_errors: BTreeSet<i32>,
+        procs: Vec<Proc>,
+        births: u32,
+        /// Changes made right after the n-th call (1-based) to the table.
+        after_call: BTreeMap<usize, Vec<Change>>,
+        calls: usize,
+        /// Every process each signal reached.
+        signalled: Vec<(Id, i32)>,
+        open_errno: Option<i32>,
+        signal_errno: Option<i32>,
     }
 
     impl Model {
-        fn insert(&mut self, pid: i32, sid: i32, pgrp: i32) {
-            self.procs.insert(
+        fn new() -> Self {
+            Model::default()
+        }
+
+        fn find(&self, pid: i32) -> Option<Proc> {
+            self.procs.iter().copied().find(|p| p.id.pid == pid)
+        }
+
+        fn in_use(&self, n: i32) -> bool {
+            self.procs
+                .iter()
+                .any(|p| p.id.pid == n || p.group.pid == n || p.sid == n)
+        }
+
+        fn born(&mut self, pid: i32, sid: i32, group: Option<i32>) -> Id {
+            assert!(!self.in_use(pid), "the kernel never gives out {pid} now");
+            self.births += 1;
+            let id = Id {
                 pid,
-                vec![Proc {
-                    sid,
-                    pgrp,
-                    alive: true,
-                }],
-            );
-        }
-
-        fn fire(&mut self, pid: i32, when: After) {
-            let first = self.touched.insert(pid);
-            let due = match self.events.get(&pid) {
-                Some((After::FirstTouch, _)) => first,
-                Some((After::IdsRead, _)) => when == After::IdsRead,
-                None => false,
+                birth: self.births,
             };
-            if !due {
-                return;
-            }
-            let Some((_, then)) = self.events.remove(&pid) else {
-                return;
-            };
-            let list = self.procs.get_mut(&pid).unwrap();
-            list.last_mut().unwrap().alive = false;
-            if let Then::Reused(next) = then {
-                list.push(next);
+            let group = group.map_or(id, |g| self.find(g).unwrap().group);
+            self.procs.push(Proc { id, sid, group });
+            id
+        }
+
+        fn apply(&mut self, change: Change) {
+            match change {
+                Change::Gone(pid) => self.procs.retain(|p| p.id.pid != pid),
+                Change::Setsid(pid) => {
+                    let p = self.procs.iter_mut().find(|p| p.id.pid == pid).unwrap();
+                    p.sid = pid;
+                    p.group = p.id;
+                }
+                Change::Join(pid, leader) => {
+                    let target = self.find(leader).unwrap();
+                    let p = self.procs.iter_mut().find(|p| p.id.pid == pid).unwrap();
+                    assert_eq!(p.sid, target.sid, "setpgid stays in the session");
+                    p.group = target.group;
+                }
+                Change::Fork(parent, pid) => {
+                    let parent = self.find(parent).unwrap();
+                    self.born(pid, parent.sid, Some(parent.id.pid));
+                }
+                Change::Born(pid, sid, group) => {
+                    self.born(pid, sid, group);
+                }
             }
         }
 
-        fn current(&self, pid: i32) -> Option<(usize, Proc)> {
-            let list = self.procs.get(&pid)?;
-            let p = *list.last()?;
-            p.alive.then(|| (list.len() - 1, p))
+        fn tick(&mut self) {
+            self.calls += 1;
+            for change in self.after_call.remove(&self.calls).unwrap_or_default() {
+                self.apply(change);
+            }
         }
 
-        /// The processes signalled: (pid, incarnation).
-        fn hit(&self) -> BTreeSet<(i32, usize)> {
-            self.signalled.iter().map(|(p, i, _)| (*p, *i)).collect()
+        fn hit(&self) -> BTreeSet<i32> {
+            self.signalled.iter().map(|(id, _)| id.pid).collect()
         }
     }
 
-    impl SessionTable for Model {
-        type Handle = (i32, usize);
-        fn pids(&mut self) -> io::Result<Vec<i32>> {
-            Ok(self.procs.keys().copied().collect())
+    impl GroupTable for Model {
+        type Handle = Id;
+        fn open(&mut self, pid: i32) -> io::Result<Option<Id>> {
+            let result = match self.open_errno {
+                Some(e) => Err(io::Error::from_raw_os_error(e)),
+                None => Ok(self.find(pid).map(|p| p.id)),
+            };
+            self.tick();
+            result
         }
-        fn open(&mut self, pid: i32) -> io::Result<Option<(i32, usize)>> {
-            if let Some(e) = self.open_errors.get(&pid) {
-                return Err(io::Error::from_raw_os_error(*e));
-            }
-            let handle = self.current(pid).map(|(i, _)| (pid, i));
-            self.fire(pid, After::FirstTouch);
-            Ok(handle)
+        fn session_of(&mut self, pid: i32) -> io::Result<Option<i32>> {
+            let sid = self.find(pid).map(|p| p.sid);
+            self.tick();
+            Ok(sid)
         }
-        fn ids(&mut self, pid: i32) -> io::Result<Option<(i32, i32)>> {
-            if self.ids_errors.contains(&pid) {
-                return Err(io::ErrorKind::InvalidData.into());
+        fn signal_group(&mut self, handle: &Id, sig: i32) -> io::Result<()> {
+            self.tick();
+            if let Some(e) = self.signal_errno {
+                return Err(io::Error::from_raw_os_error(e));
             }
-            let ids = self.current(pid).map(|(_, p)| (p.sid, p.pgrp));
-            self.fire(pid, After::FirstTouch);
-            self.fire(pid, After::IdsRead);
-            Ok(ids)
-        }
-        fn alive(&mut self, h: &(i32, usize)) -> io::Result<bool> {
-            if self.alive_errors.contains(&h.0) {
-                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            let members: Vec<Id> = self
+                .procs
+                .iter()
+                .filter(|p| p.group == *handle)
+                .map(|p| p.id)
+                .collect();
+            if members.is_empty() {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
             }
-            Ok(self.procs[&h.0][h.1].alive)
-        }
-        fn send(&mut self, h: &(i32, usize), sig: i32) -> io::Result<()> {
-            if let Some(e) = self.send_errors.get(&h.0) {
-                return Err(io::Error::from_raw_os_error(*e));
-            }
-            // A process that exited but is not reaped takes a signal
-            // without complaint, as a zombie does: recorded all the same.
-            self.signalled.push((h.0, h.1, sig));
+            self.signalled.extend(members.iter().map(|id| (*id, sig)));
             Ok(())
         }
     }
 
     const MONITOR: i32 = 500;
     const SHELL: i32 = 501;
-    const JOB: i32 = 510;
+    const LEADER: i32 = 510;
+    const PEER: i32 = 511;
+    const OTHER: i32 = 520;
+    const OTHER_PEER: i32 = 521;
 
-    fn table() -> Model {
-        let mut m = Model::default();
-        m.insert(MONITOR, MONITOR, MONITOR);
-        m.insert(SHELL, MONITOR, SHELL);
-        m.insert(JOB, MONITOR, JOB);
-        m.insert(JOB + 1, MONITOR, JOB);
+    /// The monitor's session: the monitor, a nested shell, the job (a
+    /// leader and a peer in its group), and a second job of the shell's in
+    /// a group of its own (for a delivery that must still go through).
+    fn session() -> Model {
+        let mut m = Model::new();
+        m.born(MONITOR, MONITOR, None);
+        m.born(SHELL, MONITOR, None);
+        m.born(LEADER, MONITOR, None);
+        m.born(PEER, MONITOR, Some(LEADER));
+        m.born(OTHER, MONITOR, None);
+        m.born(OTHER_PEER, MONITOR, Some(OTHER));
         m
     }
 
-    fn partial(e: &io::Error) -> &PartialDelivery {
-        e.get_ref()
-            .and_then(|inner| inner.downcast_ref::<PartialDelivery>())
-            .unwrap_or_else(|| panic!("not a partial delivery: {e:?}"))
+    fn deliver(m: &mut Model, foreground: i32, sig: i32) -> io::Result<()> {
+        let job = bind_job(m, MONITOR, foreground)?;
+        signal_job(m, &job, sig)
     }
 
-    /// Only the session's members in the foreground group are signalled,
-    /// each through its own handle: the job's two processes, not the
-    /// nested shell and not the monitor.
+    fn no_job(r: &io::Result<()>) -> Option<NoJob> {
+        r.as_ref().err().and_then(NoJob::of)
+    }
+
+    /// The job's group, as one: its leader and its peer, not the nested
+    /// shell, the monitor or the shell's other job.
     #[test]
-    fn the_foreground_job_of_the_session_and_nothing_else_is_signalled() {
-        let mut m = table();
-        let n = deliver_in_session(&mut m, MONITOR, JOB, libc::SIGTERM).unwrap();
-        assert_eq!(n, 2);
-        assert_eq!(
-            m.signalled,
-            vec![(JOB, 0, libc::SIGTERM), (JOB + 1, 0, libc::SIGTERM)]
-        );
+    fn the_foreground_job_and_nothing_else_is_signalled() {
+        let mut m = session();
+        deliver(&mut m, LEADER, libc::SIGTERM).unwrap();
+        assert_eq!(m.hit(), BTreeSet::from([LEADER, PEER]));
+        assert!(m.signalled.iter().all(|(_, s)| *s == libc::SIGTERM));
     }
 
-    /// A process outside the monitor's session that reports the same
-    /// group number gets nothing, nor does a process that left the session
-    /// with `setsid` (its session is its own now, its group number too or
-    /// one that matches).
+    /// Membership is read at the delivery, not at the binding (Codex's
+    /// review of PR #27): a member that left the session with `setsid`,
+    /// or moved to another group of it, after the job was bound gets
+    /// nothing; a child forked into the group meanwhile gets the signal,
+    /// in the session as it is. A delivery that checks each member first
+    /// and signals it after (the design before this one) signals the two
+    /// that left.
+    #[test]
+    fn membership_is_what_it_is_at_the_delivery() {
+        for (change, expected) in [
+            (Change::Setsid(PEER), vec![LEADER]),
+            (Change::Join(PEER, OTHER), vec![LEADER]),
+            (Change::Fork(LEADER, 530), vec![LEADER, PEER, 530]),
+        ] {
+            let mut m = session();
+            let job = bind_job(&mut m, MONITOR, LEADER).unwrap();
+            m.apply(change);
+            signal_job(&mut m, &job, libc::SIGHUP).unwrap();
+            assert_eq!(m.hit(), expected.into_iter().collect(), "{change:?}");
+            if let Change::Join(..) = change {
+                assert!(!m.hit().contains(&OTHER), "the group it joined");
+            }
+        }
+    }
+
+    /// The leader may leave its own group for another of the session: the
+    /// group it created is still signalled by its identity, and only its
+    /// members.
+    #[test]
+    fn the_leader_need_not_still_be_in_its_group() {
+        let mut m = session();
+        m.apply(Change::Join(LEADER, OTHER));
+        deliver(&mut m, LEADER, libc::SIGTERM).unwrap();
+        assert_eq!(m.hit(), BTreeSet::from([PEER]));
+    }
+
+    /// A group whose leader was reaped (a pipeline's first command that
+    /// ended first) has nothing to signal it through: `NoLeader` and
+    /// nothing sent, before the handle or between the handle and the read
+    /// (the read then finds no process, and cannot show the members in the
+    /// session).
+    #[test]
+    fn a_group_whose_leader_was_reaped_is_not_signalled_by_number() {
+        let mut m = session();
+        m.apply(Change::Gone(LEADER));
+        assert_eq!(no_job(&deliver(&mut m, LEADER, 15)), Some(NoJob::NoLeader));
+        let mut m = session();
+        m.after_call.insert(1, vec![Change::Gone(LEADER)]);
+        assert_eq!(no_job(&deliver(&mut m, LEADER, 15)), Some(NoJob::NoLeader));
+        assert!(m.signalled.is_empty(), "{:?}", m.signalled);
+    }
+
+    /// The three birth-identity schedules of an independent review oracle
+    /// (cycle 368), re-derived for a delivery by group identity: the job
+    /// ends and its number is given to a new process right after the
+    /// handle is opened, (1) in another session in a group of the same
+    /// number, (2) in the same session in another group, (3) in the same
+    /// session leading a new group of the same number. The new process and
+    /// its group get nothing: (1) is refused by the session read, and (2)
+    /// and (3) bind the old job, whose group is empty (`Empty`). In each,
+    /// the shell's other job is then signalled as a control, so a
+    /// delivery that reaches no one at all fails too. Read the session
+    /// before opening the handle and (1) signals the outsider.
+    #[test]
+    fn a_number_given_to_another_process_between_the_calls_reaches_no_one() {
+        let outsider_session = 899;
+        for (case, born, refused) in [
+            (
+                1,
+                Change::Born(LEADER, outsider_session, None),
+                NoJob::OutsideSession,
+            ),
+            (2, Change::Born(LEADER, MONITOR, Some(SHELL)), NoJob::Empty),
+            (3, Change::Born(LEADER, MONITOR, None), NoJob::Empty),
+        ] {
+            let mut m = session();
+            if case == 1 {
+                // The outsider's session is a real one.
+                m.born(outsider_session, outsider_session, None);
+            }
+            m.after_call
+                .insert(1, vec![Change::Gone(PEER), Change::Gone(LEADER), born]);
+            assert_eq!(
+                no_job(&deliver(&mut m, LEADER, libc::SIGTERM)),
+                Some(refused),
+                "case {case}"
+            );
+            assert!(m.signalled.is_empty(), "case {case}: {:?}", m.signalled);
+            deliver(&mut m, OTHER, libc::SIGTERM).unwrap();
+            assert_eq!(m.hit(), BTreeSet::from([OTHER, OTHER_PEER]), "case {case}");
+        }
+    }
+
+    /// The same after the read: the job ends and an outsider takes its
+    /// number with a group of its own before the signal. The signal names
+    /// the old group, now empty: `Empty`, and the outsider gets nothing.
+    #[test]
+    fn a_number_given_to_an_outsider_before_the_signal_reaches_no_one() {
+        let mut m = session();
+        m.born(899, 899, None);
+        m.after_call.insert(
+            2,
+            vec![
+                Change::Gone(PEER),
+                Change::Gone(LEADER),
+                Change::Born(LEADER, 899, None),
+            ],
+        );
+        assert_eq!(
+            no_job(&deliver(&mut m, LEADER, libc::SIGHUP)),
+            Some(NoJob::Empty)
+        );
+        assert!(m.signalled.is_empty(), "{:?}", m.signalled);
+    }
+
+    /// A number that names a process outside the session (a hostile or a
+    /// stale reading of the terminal) is refused before anything is sent,
+    /// even when that process reports the same group number. Drop the
+    /// session check and it is signalled.
     #[test]
     fn a_process_outside_the_session_with_the_same_group_number_gets_nothing() {
-        let mut m = table();
-        let outside = 900;
-        m.insert(outside, 899, JOB);
-        let left = 901;
-        m.insert(left, left, JOB);
-        deliver_in_session(&mut m, MONITOR, JOB, libc::SIGHUP).unwrap();
-        let hit = m.hit();
-        assert!(!hit.contains(&(outside, 0)), "outside the session: {hit:?}");
-        assert!(!hit.contains(&(left, 0)), "left the session: {hit:?}");
-        assert_eq!(hit, BTreeSet::from([(JOB, 0), (JOB + 1, 0)]));
-    }
-
-    /// The job's process exits right after the first call about its pid,
-    /// and a process outside the session with the same group number takes
-    /// the pid. It gets nothing: the handle was opened on the job's
-    /// process before its ids were read, so the ids read are the
-    /// newcomer's (outside the session) and the handle's process is dead.
-    /// Read the ids before opening the handle and the newcomer is
-    /// signalled (the mutation this test is for).
-    #[test]
-    fn a_pid_reused_by_an_outsider_between_the_calls_is_never_signalled() {
-        let mut m = table();
-        let outsider = Proc {
-            sid: 899,
-            pgrp: JOB,
-            alive: true,
-        };
-        m.events
-            .insert(JOB, (After::FirstTouch, Then::Reused(outsider)));
-        let n = deliver_in_session(&mut m, MONITOR, JOB, libc::SIGTERM).unwrap();
-        assert!(
-            !m.hit().contains(&(JOB, 1)),
-            "the process that took the pid was signalled: {:?}",
-            m.signalled
+        let mut m = session();
+        m.born(900, 899, None);
+        m.born(901, 899, Some(900));
+        assert_eq!(
+            no_job(&deliver(&mut m, 900, libc::SIGTERM)),
+            Some(NoJob::OutsideSession)
         );
-        assert_eq!(m.hit(), BTreeSet::from([(JOB + 1, 0)]));
-        assert_eq!(n, 1);
+        assert!(m.signalled.is_empty(), "{:?}", m.signalled);
     }
 
-    /// A process whose handle shows it exited between the `/proc` read and
-    /// the liveness check is skipped: its pid may be another process's by
-    /// then, and what was read may be that one's. Skip the check and the
-    /// exited process is counted (and, had the pid been reused before the
-    /// read, the ids would be another's).
+    /// The monitor's own group (it holds the terminal while the command is
+    /// stopped) and nonsense numbers select nothing, as errors.
     #[test]
-    fn a_process_that_exits_between_the_read_and_the_check_is_skipped() {
-        let mut m = table();
-        m.events.insert(JOB, (After::IdsRead, Then::Exits));
-        let n = deliver_in_session(&mut m, MONITOR, JOB, libc::SIGTERM).unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(m.signalled, vec![(JOB + 1, 0, libc::SIGTERM)]);
-    }
-
-    /// The monitor's own group (it took the terminal back while the command
-    /// is stopped) and nonsense group numbers select nothing.
-    #[test]
-    fn the_monitors_own_group_and_bad_numbers_select_nothing() {
-        for fg in [MONITOR, 0, 1, -JOB] {
-            let mut m = table();
-            assert_eq!(deliver_in_session(&mut m, MONITOR, fg, 15).unwrap(), 0);
-            assert!(m.signalled.is_empty(), "{fg}");
+    fn the_monitors_own_group_and_bad_numbers_are_errors_not_deliveries() {
+        let mut m = session();
+        assert_eq!(
+            no_job(&deliver(&mut m, MONITOR, 15)),
+            Some(NoJob::MonitorHolds)
+        );
+        for fg in [0, 1, -LEADER] {
+            let r = deliver(&mut m, fg, 15);
+            assert_eq!(r.unwrap_err().kind(), io::ErrorKind::InvalidInput, "{fg}");
         }
-    }
-
-    /// A member the signal cannot be sent to (`EPERM`: a setuid program's
-    /// process in the job) comes before a permitted one: the permitted one
-    /// is still signalled, and the delivery is an error that says one was
-    /// signalled and one failed, never a success. Stop at the first error
-    /// and the permitted member gets nothing.
-    #[test]
-    fn a_refused_member_does_not_stop_the_others_and_the_result_is_an_error() {
-        let mut m = table();
-        m.send_errors.insert(JOB, libc::EPERM);
-        let err = deliver_in_session(&mut m, MONITOR, JOB, libc::SIGTERM).unwrap_err();
-        assert_eq!(m.signalled, vec![(JOB + 1, 0, libc::SIGTERM)]);
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        let p = partial(&err);
-        assert_eq!((p.signalled, p.failed), (1, 1), "{p}");
-        assert_eq!(p.first.raw_os_error(), Some(libc::EPERM));
-    }
-
-    /// A kernel without `pidfd_open` (`ENOSYS`, before Linux 5.3): an
-    /// `Unsupported` error before anything is sent, not "sent to 0
-    /// processes", so the caller can narrow the signal or report it.
-    #[test]
-    fn no_pidfd_open_is_an_error_not_a_delivery_to_nobody() {
-        let mut m = table();
-        for pid in [MONITOR, SHELL, JOB, JOB + 1] {
-            m.open_errors.insert(pid, libc::ENOSYS);
-        }
-        let err = deliver_in_session(&mut m, MONITOR, JOB, libc::SIGHUP).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err:?}");
-        assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+        let r = bind_job(&mut m, 0, LEADER).map(|_| ());
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(m.signalled.is_empty());
+        assert_eq!(m.calls, 0, "nothing was even looked at");
     }
 
-    /// A candidate that cannot be checked (a handle that cannot be opened
-    /// for another reason, a liveness check or a `/proc` read that fails)
-    /// is a failure in the result, never skipped as if it were not in the
-    /// job; the others are still signalled.
+    /// A kernel without `pidfd_open` (`ENOSYS`) or without the process
+    /// group flag (`EINVAL`, before Linux 6.9): `Unsupported` before
+    /// anything is sent. `EPERM` from the delivery (no member could be
+    /// signalled) and other errors pass through as errors, never success.
     #[test]
-    fn a_candidate_that_cannot_be_checked_is_a_failure_not_a_skip() {
-        for inject in 0..3 {
-            let mut m = table();
-            match inject {
-                0 => {
-                    m.open_errors.insert(JOB, libc::EMFILE);
-                }
-                1 => {
-                    m.alive_errors.insert(JOB);
-                }
-                _ => {
-                    m.ids_errors.insert(JOB);
-                }
+    fn kernels_that_cannot_and_refusals_are_errors() {
+        let mut m = session();
+        m.open_errno = Some(libc::ENOSYS);
+        let r = deliver(&mut m, LEADER, 15);
+        assert_eq!(no_job(&r), Some(NoJob::Unsupported));
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        let mut m = session();
+        m.signal_errno = Some(libc::EINVAL);
+        assert_eq!(
+            no_job(&deliver(&mut m, LEADER, 15)),
+            Some(NoJob::Unsupported)
+        );
+        for errno in [libc::EPERM, libc::EMFILE] {
+            let mut m = session();
+            if errno == libc::EMFILE {
+                m.open_errno = Some(errno);
+            } else {
+                m.signal_errno = Some(errno);
             }
-            let err = deliver_in_session(&mut m, MONITOR, JOB, libc::SIGTERM).unwrap_err();
-            let p = partial(&err);
-            assert_eq!((p.signalled, p.failed), (1, 1), "case {inject}: {p}");
-            assert_eq!(m.signalled, vec![(JOB + 1, 0, libc::SIGTERM)], "{inject}");
+            let r = deliver(&mut m, LEADER, 15);
+            assert_eq!(r.unwrap_err().raw_os_error(), Some(errno));
+            assert!(m.signalled.is_empty());
         }
+    }
+
+    /// Every error `OwnedSession` reports names its reason, and the
+    /// `Unsupported` one alone has that kind.
+    #[test]
+    fn each_reason_reads_back_from_its_error() {
+        for why in [
+            NoJob::MonitorHolds,
+            NoJob::NoLeader,
+            NoJob::OutsideSession,
+            NoJob::Empty,
+            NoJob::Unsupported,
+        ] {
+            let e = why.error();
+            assert_eq!(NoJob::of(&e), Some(why));
+            assert_eq!(
+                e.kind() == io::ErrorKind::Unsupported,
+                why == NoJob::Unsupported
+            );
+            assert!(!e.to_string().is_empty());
+        }
+        assert_eq!(NoJob::of(&io::Error::from(io::ErrorKind::NotFound)), None);
     }
 
     /// A recording SIGCHLD table.
@@ -1013,6 +1160,98 @@ mod tests {
             keep_unreaped(&mut kept).is_err(),
             "a change that did not hold"
         );
+    }
+
+    /// An independent review oracle (cycle 369), adopted: each of the four
+    /// setups of the two flags against five behaviours of the system (the
+    /// change holds; it does not hold; the first read fails; the second
+    /// read fails; the change fails), with the result, the number of reads
+    /// and changes, and the setup left written down apart from the code:
+    /// twenty cases, seven of them successes. Leave the ignored flag
+    /// unchecked, skip the read after the change, or ignore a failed
+    /// change, and cases fail.
+    #[test]
+    fn every_setup_against_every_system_behaviour_gives_the_written_result() {
+        struct Sys {
+            before: ChildSignal,
+            after: ChildSignal,
+            scenario: u8,
+            reads: usize,
+            sets: usize,
+        }
+        impl SigchldOps for Sys {
+            fn read(&mut self) -> io::Result<ChildSignal> {
+                self.reads += 1;
+                if (self.scenario == 2 && self.reads == 1)
+                    || (self.scenario == 3 && self.reads == 2)
+                {
+                    return Err(io::ErrorKind::Other.into());
+                }
+                Ok(if self.sets == 0 {
+                    self.before
+                } else {
+                    self.after
+                })
+            }
+            fn stop_reaping_on_its_own(&mut self) -> io::Result<()> {
+                self.sets += 1;
+                if self.scenario == 4 {
+                    return Err(io::ErrorKind::Other.into());
+                }
+                if self.scenario != 1 {
+                    self.after = DEFAULT;
+                }
+                Ok(())
+            }
+        }
+        let (mut failed, mut successes) = (Vec::new(), 0);
+        for bits in 0u8..4 {
+            for scenario in 0u8..5 {
+                let before = ChildSignal {
+                    ignored: bits & 1 != 0,
+                    no_wait: bits & 2 != 0,
+                };
+                let mut sys = Sys {
+                    before,
+                    after: before,
+                    scenario,
+                    reads: 0,
+                    sets: 0,
+                };
+                let got = keep_unreaped(&mut sys).map_err(|e| match e.kind() {
+                    io::ErrorKind::PermissionDenied => 1,
+                    _ => 2,
+                });
+                let reaps = bits != 0;
+                let expected = if scenario == 2 {
+                    Err(2)
+                } else if !reaps || scenario == 0 {
+                    Ok(())
+                } else if scenario == 1 {
+                    Err(1)
+                } else {
+                    Err(2)
+                };
+                let sets = usize::from(reaps && scenario != 2);
+                let reads = if reaps && scenario != 2 && scenario != 4 {
+                    2
+                } else {
+                    1
+                };
+                let left = if reaps && matches!(scenario, 0 | 3) {
+                    DEFAULT
+                } else {
+                    before
+                };
+                if got != expected || sys.sets != sets || sys.reads != reads || sys.after != left {
+                    failed.push(bits * 5 + scenario);
+                } else if expected.is_ok() {
+                    successes += 1;
+                }
+            }
+        }
+        assert!(failed.is_empty(), "cases {failed:?}");
+        assert_eq!(successes, 7);
     }
 
     /// A recording system for a signal sent by number.

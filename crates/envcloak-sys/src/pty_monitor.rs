@@ -12,13 +12,16 @@
 //!    new session (`setsid`), puts the PTY's slave side on descriptors 0,
 //!    1 and 2 and the control channel on 3, closes every other descriptor,
 //!    and takes the slave as its controlling terminal (`TIOCSCTTY`);
-//! 2. ignores the terminal's job-control and keyboard signals (SIGTTOU, so
-//!    its own `tcsetpgrp` works from the background; SIGTTIN, SIGTSTP,
-//!    SIGINT, SIGQUIT) and SIGHUP, SIGTERM and SIGPIPE: on macOS `TIOCSIG`
+//! 2. ignores the terminal's job-control signals (SIGTTOU, so its own
+//!    `tcsetpgrp` works from the background; SIGTTIN, SIGTSTP) and SIGPIPE,
+//!    and catches the four signals the CLI forwards (SIGINT, SIGQUIT,
+//!    SIGTERM, SIGHUP) to pass them on to the command's group: `TIOCSIG`
 //!    signals whatever group is in the foreground, which is the monitor's
-//!    own while the command is stopped, and a hangup reaches it as the
-//!    session's leader. It ends when the CLI's end of the control channel
-//!    closes instead;
+//!    own while the command is stopped, so a signal the CLI forwards as the
+//!    command stops reaches the monitor, and goes on to the command from
+//!    there. A hangup reaches the monitor too, as the session's leader (the
+//!    CLI gone), and is passed on the same way. None of them ends the
+//!    monitor: it ends when the CLI's end of the control channel closes;
 //! 3. forks the command, which makes its own process group
 //!    (`setpgid(0, 0)`) the slave's foreground group (`tcsetpgrp`, SIGTTOU
 //!    still ignored and every signal blocked), resets every disposition
@@ -44,7 +47,12 @@
 //!   from another process, and stops the command before it restores the
 //!   outer terminal).
 //! - **`Signal(n)`**: `n` to the command's group, the one signal route the
-//!   monitor itself has (a signal narrowed on a system, D-35).
+//!   monitor itself has (the job while the command is stopped, or a
+//!   signal narrowed, D-35).
+//! - **SIGINT, SIGQUIT, SIGTERM or SIGHUP received**: passed on to the
+//!   command's group, once each time it arrives (a signal that arrives
+//!   twice before the monitor looks is passed on once, as the kernel
+//!   merges a pending signal).
 //! - **The command continues** (`Continued`) or **exits** (`Exited`): an
 //!   exit is observed with `WNOWAIT`, so the command stays unreaped and
 //!   its group's number cannot be reused: `Signal(n)` still reaches what
@@ -73,9 +81,10 @@
 //! written against [`MonitorOps`], so a recording model checks what it
 //! signals and in which order.
 //!
-//! SIGCHLD stays blocked except inside `pselect`, which unblocks it
-//! atomically, so a child that changes state between the monitor's last
-//! `waitid` and its wait still wakes it. A one-second tick backs that up
+//! SIGCHLD and the four relayed signals stay blocked except inside
+//! `pselect`, which unblocks them atomically, so a child that changes
+//! state, or a signal that arrives, between the monitor's last look and
+//! its wait still wakes it. A one-second tick backs that up
 //! where a system does not raise SIGCHLD for a continue.
 //!
 //! **The control protocol.** Fixed frames of [`FRAME`] bytes: a tag, a
@@ -85,6 +94,7 @@
 //! and [`decode_report`] are the only readers.
 
 use std::ffi::c_char;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::owned::OwnedChild;
 
@@ -260,8 +270,24 @@ pub(crate) trait MonitorOps {
     fn signal_group(&mut self, pgid: i32, sig: i32);
     /// Closes the monitor's descriptors on the slave.
     fn close_terminal(&mut self);
+    /// The relayed signals that arrived since the last call, as a set of
+    /// bits (`1 << signal`), and forgets them.
+    fn received(&mut self) -> u32;
     /// Reaps the command.
     fn reap(&mut self, pid: i32);
+}
+
+/// The signals the monitor catches and passes on to the command's group:
+/// the four the CLI forwards.
+pub(crate) const RELAYED: [libc::c_int; 4] =
+    [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP];
+
+/// The bit [`MonitorOps::received`] sets for `sig`.
+pub(crate) fn signal_bit(sig: libc::c_int) -> u32 {
+    u32::try_from(sig)
+        .ok()
+        .and_then(|s| 1u32.checked_shl(s))
+        .unwrap_or(0)
 }
 
 /// The monitor's loop, from the command's start to its reaping. `me` is
@@ -296,6 +322,15 @@ pub(crate) fn run<O: MonitorOps>(ops: &mut O, me: i32, child: i32) -> i32 {
                         control = false;
                     }
                 }
+            }
+        }
+        // A forwarded signal that reached the monitor (its group held the
+        // terminal) goes on to the command's group; its leader is
+        // unreaped, so the number is still its own after its exit.
+        let received = ops.received();
+        for sig in RELAYED {
+            if received & signal_bit(sig) != 0 {
+                ops.signal_group(child, sig);
             }
         }
         if exited && !control {
@@ -547,6 +582,10 @@ impl MonitorOps for SysOps {
             let _ = owned.reap();
         }
     }
+
+    fn received(&mut self) -> u32 {
+        RECEIVED.swap(0, Ordering::SeqCst)
+    }
 }
 
 /// How long the monitor waits, at the command's exit, for the master side
@@ -602,6 +641,15 @@ const LAST_SIGNAL: libc::c_int = 31;
 
 extern "C" fn on_child(_sig: libc::c_int) {}
 
+/// The relayed signals that arrived, as bits, until the loop takes them.
+static RECEIVED: AtomicU32 = AtomicU32::new(0);
+
+/// Notes a relayed signal for the loop. Async-signal-safe: one lock-free
+/// atomic operation.
+extern "C" fn on_relayed(sig: libc::c_int) {
+    RECEIVED.fetch_or(signal_bit(sig), Ordering::SeqCst);
+}
+
 /// Sets `sig`'s disposition to `handler` (`SIG_DFL`, `SIG_IGN` or a
 /// function), with no flags: no `SA_RESTART`, so a wait it interrupts
 /// returns.
@@ -615,7 +663,7 @@ fn disposition(sig: libc::c_int, handler: libc::sighandler_t) {
     unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) };
 }
 
-fn set_mask(how: libc::c_int, all: bool, only: Option<libc::c_int>) {
+fn set_mask(how: libc::c_int, all: bool, only: &[libc::c_int]) {
     // SAFETY: sigset_t is plain data, initialized by sigfillset or
     // sigemptyset before use.
     let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -626,8 +674,8 @@ fn set_mask(how: libc::c_int, all: bool, only: Option<libc::c_int>) {
         } else {
             libc::sigemptyset(&mut set);
         }
-        if let Some(sig) = only {
-            libc::sigaddset(&mut set, sig);
+        for sig in only {
+            libc::sigaddset(&mut set, *sig);
         }
         libc::sigprocmask(how, &set, std::ptr::null_mut());
     }
@@ -716,7 +764,7 @@ fn fail(e: libc::c_int) -> ! {
 pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
     // 1. No signal arrives while the dispositions change; each is reset,
     //    so none of the CLI's handlers runs here.
-    set_mask(libc::SIG_SETMASK, true, None);
+    set_mask(libc::SIG_SETMASK, true, &[]);
     for sig in 1..=LAST_SIGNAL {
         if sig != libc::SIGKILL && sig != libc::SIGSTOP {
             disposition(sig, libc::SIG_DFL);
@@ -756,18 +804,16 @@ pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
     if !ok {
         fail(errno());
     }
-    // 3. What the monitor ignores, and SIGCHLD to interrupt its wait.
-    for sig in [
-        libc::SIGTTOU,
-        libc::SIGTTIN,
-        libc::SIGTSTP,
-        libc::SIGINT,
-        libc::SIGQUIT,
-        libc::SIGHUP,
-        libc::SIGTERM,
-        libc::SIGPIPE,
-    ] {
+    // 3. What the monitor ignores, what it passes on to the command, and
+    //    SIGCHLD to interrupt its wait.
+    for sig in [libc::SIGTTOU, libc::SIGTTIN, libc::SIGTSTP, libc::SIGPIPE] {
         disposition(sig, libc::SIG_IGN);
+    }
+    for sig in RELAYED {
+        disposition(
+            sig,
+            on_relayed as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
     disposition(
         libc::SIGCHLD,
@@ -833,8 +879,19 @@ pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
     }
     // A channel already gone shows as its end at the loop's first read.
     ops.write_control(&encode_report(Report::Started(child)));
-    // 6. SIGCHLD blocked outside pselect; everything else unblocked.
-    set_mask(libc::SIG_SETMASK, false, Some(libc::SIGCHLD));
+    // 6. SIGCHLD and the relayed signals blocked outside pselect;
+    //    everything else unblocked.
+    set_mask(
+        libc::SIG_SETMASK,
+        false,
+        &[
+            libc::SIGCHLD,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGHUP,
+        ],
+    );
     // SAFETY: getpid has no preconditions; the monitor leads its session,
     // so its pid is its group.
     let me = unsafe { libc::getpid() };
@@ -867,7 +924,7 @@ unsafe fn command_main(p: &Prepared, err_read: libc::c_int, err_write: libc::c_i
         libc::close(CONTROL_FD);
         libc::close(err_read);
     }
-    set_mask(libc::SIG_SETMASK, false, None);
+    set_mask(libc::SIG_SETMASK, false, &[]);
     let mut last = libc::ENOENT;
     let mut refused = false;
     for i in 0..p.program_count {
@@ -973,6 +1030,8 @@ mod tests {
         Child(ChildChange),
         Control(Command),
         ControlEnd,
+        /// A relayed signal reaches the monitor.
+        Received(i32),
     }
 
     /// What the loop did, in order.
@@ -1019,6 +1078,18 @@ mod tests {
                 }
                 _ => None,
             }
+        }
+        fn received(&mut self) -> u32 {
+            // As for a child's change: a command half read comes first.
+            if self.pending.is_some() {
+                return 0;
+            }
+            let mut bits = 0;
+            while let Some(Step::Received(sig)) = self.steps.front() {
+                bits |= signal_bit(*sig);
+                self.steps.pop_front();
+            }
+            bits
         }
         fn read_control(&mut self, buf: &mut [u8]) -> ControlRead {
             if self.pending.is_none() {
@@ -1160,6 +1231,55 @@ mod tests {
         );
     }
 
+    /// A forwarded signal that reaches the monitor (its own group held the
+    /// terminal, the command stopped) goes on to the command's group, each
+    /// of the four, also after the command's exit and the channel's end
+    /// while the command is unreaped (the model fails on a signal after
+    /// the reap). Ignore them instead (the monitor before) and the command
+    /// never gets them.
+    #[test]
+    fn a_relayed_signal_goes_on_to_the_childs_group() {
+        let mut m = Model::new(&[
+            Step::Child(ChildChange::Stopped(libc::SIGTSTP)),
+            Step::Received(libc::SIGINT),
+            Step::Received(libc::SIGQUIT),
+            Step::Control(Command::Resume),
+            Step::Received(libc::SIGTERM),
+            Step::Child(ChildChange::Exited(libc::SIGTERM)),
+            Step::Received(libc::SIGHUP),
+            Step::ControlEnd,
+            Step::Received(libc::SIGINT),
+        ]);
+        assert_eq!(run(&mut m, ME, CHILD), 0);
+        let signals: Vec<_> = m
+            .did
+            .iter()
+            .filter_map(|d| match d {
+                Did::Signal(g, s) => Some((*g, *s)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            signals,
+            vec![
+                (CHILD, libc::SIGINT),
+                (CHILD, libc::SIGQUIT),
+                (CHILD, libc::SIGCONT),
+                (CHILD, libc::SIGTERM),
+                (CHILD, libc::SIGHUP),
+                (CHILD, libc::SIGINT),
+            ],
+            "{:?}",
+            m.did
+        );
+        assert_eq!(m.did.last(), Some(&Did::Reap(CHILD)));
+        for sig in RELAYED {
+            assert_ne!(signal_bit(sig), 0);
+        }
+        assert_eq!(signal_bit(-1), 0);
+        assert_eq!(signal_bit(40), 0);
+    }
+
     /// The loop's schedules with the control frames cut into pieces of
     /// every size from 1 to [`FRAME`] bytes, and reports that fail (the
     /// CLI gone), each against an event order written down separately from
@@ -1261,6 +1381,9 @@ mod tests {
             }
             fn reap(&mut self, p: i32) {
                 self.events.push(Event::Reap(p));
+            }
+            fn received(&mut self) -> u32 {
+                0
             }
         }
 
