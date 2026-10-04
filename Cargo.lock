@@ -255,6 +255,7 @@ dependencies = [
  "envcloak-sys",
  "envcloak-testkit",
  "getrandom 0.4.3",
+ "libc",
  "proptest",
  "secrecy",
  "serde",
@@ -327,6 +328,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "toml_edit",
+ "zeroize",
 ]
 
 [[package]]

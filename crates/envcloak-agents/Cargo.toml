@@ -33,6 +33,10 @@ envcloak-policy.workspace = true
 envcloak-scan.workspace = true
 envcloak-sys.workspace = true
 getrandom.workspace = true
+# The probes end what is left of a host's process group (SIGKILL) while
+# the host is still their unreaped child, and read files without following
+# a link (O_NOFOLLOW).
+libc.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
