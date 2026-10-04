@@ -1656,6 +1656,28 @@ fn a_double_install_with_the_plugin_is_found_in_either_order() {
         want["enabledPlugins"] = json!({"envcloak@market": true});
         want
     });
+    // The plugin enabled for one project only, EnvCloak's own install in
+    // the user's settings: refused, with what only the person can do
+    // (install cannot take its own out for one project).
+    std::fs::write(f.path(".claude/settings.json"), SETTINGS).unwrap();
+    age(&f.path(".claude/settings.json"), OLD);
+    let (v, code) = install();
+    assert_eq!(code, 0, "{v}");
+    let proj = f.path("proj");
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    std::fs::write(
+        proj.join(".claude/settings.local.json"),
+        "{\"enabledPlugins\": {\"envcloak@market\": true}}\n",
+    )
+    .unwrap();
+    let out = f.agents_in(&proj, &["status"]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.starts_with("envcloak: double_install: "), "{err}");
+    assert!(err.contains("~/proj/.claude/settings.local.json"), "{err}");
+    assert!(err.contains("for this project only"), "{err}");
+    let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{u}");
     f.sweep();
 }
 
