@@ -281,8 +281,10 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
             ]),
             Some(("claude-code", SAID)),
         ),
-        // Cursor CLI: its own node in its versions directory, and its
-        // index.js under any node; `exec -a` gives node the link's name.
+        // Cursor CLI: its own node in its versions directory running its
+        // index.js (`exec -a` gives node the link's name), and that
+        // index.js under any node: by its script only. Its node runs any
+        // script, so it is never Cursor by its path.
         (
             "cursor node".into(),
             proc_with(
@@ -290,10 +292,25 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
                 "node",
                 Some(&[
                     &format!("{home}/.local/bin/agent"),
+                    "--use-system-ca",
                     &format!("{cursor_dir}/index.js"),
                 ]),
             ),
-            Some(("cursor", BY_EXE)),
+            Some(("cursor", SAID)),
+        ),
+        (
+            "cursor's node running another script".into(),
+            proc_with(
+                Some(&format!("{cursor_dir}/node")),
+                "node",
+                Some(&["node", "/tmp/evil.js"]),
+            ),
+            None,
+        ),
+        (
+            "cursor's node, its arguments not read".into(),
+            proc_with(Some(&format!("{cursor_dir}/node")), "node", None),
+            None,
         ),
         (
             "cursor index.js".into(),
@@ -345,9 +362,10 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
             node(&["node", "/srv/gemini-cli/bundle/gemini.js"]),
             None,
         ),
-        // Copilot CLI: the platform binary (on Linux its command name is
-        // its main thread's), the install script's binary, and npm's
-        // launcher.
+        // Copilot CLI: the platform binary of npm's packages (on Linux its
+        // command name is its main thread's) and its signature, by its
+        // executable; the install script's binary, whose path the AWS
+        // Copilot CLI shares, by its name only; and npm's launcher.
         (
             "copilot platform binary".into(),
             proc_with(
@@ -360,9 +378,36 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
             Some(("copilot-cli", BY_EXE)),
         ),
         (
+            "copilot macOS platform binary".into(),
+            exe(
+                "/opt/homebrew/lib/node_modules/@github/copilot/node_modules/@github/copilot-darwin-arm64/copilot",
+            ),
+            Some(("copilot-cli", BY_EXE)),
+        ),
+        (
+            "copilot by its signature".into(),
+            signed("/Users/u/bin/gh-copilot", "copilot", Some("VEKTX9H2N7")),
+            Some(("copilot-cli", BY_EXE)),
+        ),
+        (
+            "copilot's identifier, another team".into(),
+            signed("/Users/u/bin/gh-copilot", "copilot", Some("ABCDE12345")),
+            None,
+        ),
+        (
             "copilot install script".into(),
             exe(&format!("{home}/.local/bin/copilot")),
-            Some(("copilot-cli", BY_EXE)),
+            Some(("copilot-cli", SAID)),
+        ),
+        (
+            "AWS Copilot CLI, by the same name".into(),
+            exe("/usr/local/bin/copilot"),
+            Some(("copilot-cli", SAID)),
+        ),
+        (
+            "another package's copilot".into(),
+            exe("/usr/local/lib/node_modules/@aws/copilot-linux-x64/copilot"),
+            Some(("copilot-cli", SAID)),
         ),
         (
             "copilot npm-loader".into(),
@@ -401,6 +446,11 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
             Some(("opencode", BY_EXE)),
         ),
         (
+            "opencode by its signature".into(),
+            signed("/Users/u/bin/oc", "opencode", Some("5NZ4Q7NXJ4")),
+            Some(("opencode", BY_EXE)),
+        ),
+        (
             "opencode renamed".into(),
             exe("/usr/local/bin/opencoder"),
             None,
@@ -435,10 +485,131 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
             proc_with(Some("/usr/bin/python3.12"), "kimi", None),
             Some(("kimi", SAID)),
         ),
+        // kimi-cli under Python: its `kimi` and `kimi-cli` scripts, and
+        // the title setproctitle gives it (`Kimi Code`, over its
+        // arguments, and on Linux its command name too), on each system.
+        (
+            "kimi-cli under python".into(),
+            proc_with(
+                Some(
+                    "/home/u/.local/share/uv/python/cpython-3.12.11-linux-x86_64-gnu/bin/python3.12",
+                ),
+                "python3.12",
+                Some(&[
+                    "/home/u/.local/share/uv/tools/kimi-cli/bin/python",
+                    "/home/u/.local/bin/kimi",
+                ]),
+            ),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "kimi-cli's second script".into(),
+            proc_with(
+                Some("/usr/bin/python3"),
+                "python3",
+                Some(&["python3", "/home/u/.local/bin/kimi-cli", "--yolo"]),
+            ),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "kimi-cli titled, Linux".into(),
+            proc_with(
+                Some("/usr/bin/python3.13"),
+                "Kimi Code",
+                Some(&["Kimi Code"]),
+            ),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "kimi-cli titled, Linux, arguments not read".into(),
+            proc_with(Some("/usr/bin/python3.13"), "Kimi Code", None),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "kimi-cli titled, macOS framework Python".into(),
+            proc_with(
+                Some(
+                    "/opt/homebrew/Cellar/python@3.13/3.13.5/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python",
+                ),
+                "Python",
+                Some(&["Kimi Code", "", ""]),
+            ),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "kimi-cli background worker, its command name cut".into(),
+            proc_with(Some("/usr/bin/python3.12"), "kimi-code-bg-wo", None),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "kimi-cli web worker, macOS".into(),
+            proc_with(
+                Some("/usr/local/bin/python3.12"),
+                "python3.12",
+                Some(&["kimi-code-worker"]),
+            ),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "a file named as a title is still only a name".into(),
+            exe("/opt/Kimi Code"),
+            Some(("kimi", SAID)),
+        ),
         ("kimi renamed".into(), exe("/usr/local/bin/kimi2"), None),
+        (
+            "another title".into(),
+            proc_with(Some("/usr/bin/python3.12"), "Kimi", Some(&["Kimi"])),
+            None,
+        ),
+        (
+            "a short command name is not a cut one".into(),
+            proc_with(Some("/usr/bin/python3.12"), "kimi-code-bg", None),
+            None,
+        ),
+        (
+            "python running another script".into(),
+            proc_with(
+                Some("/usr/bin/python3.12"),
+                "python3.12",
+                Some(&["python3", "/srv/kimi_tools.py"]),
+            ),
+            None,
+        ),
         (
             "another main.mjs".into(),
             node(&["node", "/srv/dist/main.mjs"]),
+            None,
+        ),
+        // An executable removed or renamed over while it runs (an agent, or
+        // node, that updated itself): Linux adds ` (deleted)` to its path,
+        // and the process still runs the file the path named.
+        (
+            "claude updated while it runs".into(),
+            exe(&format!(
+                "{home}/.local/share/claude/versions/2.1.280 (deleted)"
+            )),
+            Some(("claude-code", BY_EXE)),
+        ),
+        (
+            "opencode updated while it runs".into(),
+            exe(&format!("{home}/.opencode/bin/opencode (deleted)")),
+            Some(("opencode", BY_EXE)),
+        ),
+        (
+            "node updated while it runs Gemini CLI".into(),
+            proc_with(
+                Some("/usr/local/bin/node (deleted)"),
+                "node",
+                Some(&[
+                    "node",
+                    "/usr/local/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+                ]),
+            ),
+            Some(("gemini-cli", SAID)),
+        ),
+        (
+            "only the kernel's suffix is taken off".into(),
+            exe("/usr/local/bin/codex (deleted)x"),
             None,
         ),
         // Qwen Code: its entry script under node, or its `qwen` link.
@@ -521,13 +692,14 @@ fn install_trees_name_where_each_agents_installers_put_it() {
             "/usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
         ),
         (
-            "cursor",
-            "/home/u/.local/share/cursor-agent/versions/2026.09.28-64d2043/node",
+            "copilot-cli",
+            "/usr/local/lib/node_modules/@github/copilot/node_modules/@github/copilot-linux-x64/copilot",
         ),
-        ("copilot-cli", "/home/u/.local/bin/copilot"),
-        ("copilot-cli", "/usr/local/bin/copilot"),
         ("opencode", "/home/u/.opencode/bin/opencode"),
-        ("kimi", "/home/u/.kimi-code/bin/kimi"),
+        (
+            "opencode",
+            "/usr/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64/bin/opencode",
+        ),
     ];
     for (id, path) in inside {
         assert!(
@@ -544,9 +716,20 @@ fn install_trees_name_where_each_agents_installers_put_it() {
         ),
         ("claude-code", "/home/u/.local/share/claude/versions"),
         ("codex", "/home/u/bin/codex"),
+        // Cursor is known by its script only: no tree.
         ("cursor", "/home/u/.local/bin/agent"),
+        (
+            "cursor",
+            "/home/u/.local/share/cursor-agent/versions/2026.09.28-64d2043/node",
+        ),
+        // The install script's directories hold any program by that name
+        // (the AWS Copilot CLI's too): no tree.
+        ("copilot-cli", "/home/u/.local/bin/copilot"),
+        ("copilot-cli", "/usr/local/bin/copilot"),
         ("copilot-cli", "/home/u/.local/bin/opencode/../copilot"),
         ("opencode", "/home/u/.local/bin/opencode"),
+        // No Kimi Code build is pinned and measured: no tree.
+        ("kimi", "/home/u/.kimi-code/bin/kimi"),
         ("kimi", "/home/u/.kimi/bin/kimi"),
         (
             "gemini-cli",
@@ -569,6 +752,184 @@ fn install_trees_name_where_each_agents_installers_put_it() {
         Path::new("/home/u/.kimi-code/bin/claude"),
         home
     ));
+}
+
+/// What makes an agent's own executable run other code, as measured on
+/// its pinned builds (agent_hosts' `code_selecting_env_is_measured` checks
+/// each on both systems): `BUN_OPTIONS` for Claude Code's native build and
+/// `BUN_BE_BUN` for OpenCode's, nothing for Codex's or Copilot CLI's;
+/// nothing is known for an agent with no executable identity or an
+/// unknown id. Standing approvals read it (SPEC §10b).
+#[test]
+fn code_selecting_env_comes_from_the_builtin_catalog() {
+    let cat = AgentCatalog::builtin();
+    let measured: Vec<(&str, Vec<&str>)> = builtin_ids()
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                cat.code_selecting_env(id)
+                    .iter()
+                    .map(String::as_str)
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        measured,
+        [
+            ("claude-code", vec!["BUN_OPTIONS"]),
+            ("codex", vec![]),
+            ("cursor", vec![]),
+            ("gemini-cli", vec![]),
+            ("copilot-cli", vec![]),
+            ("opencode", vec!["BUN_BE_BUN"]),
+            ("kimi", vec![]),
+            ("qwen-code", vec![]),
+            ("fixture", vec![]),
+        ]
+    );
+    assert!(cat.code_selecting_env("no-such-agent").is_empty());
+}
+
+/// Cursor's process is the node it ships, which runs any script: Cursor is
+/// never matched by that node's path, so it roots no grant above a
+/// command's session, has no install tree and no signature, and the node
+/// it ships, running another script, is no agent at all.
+#[test]
+fn a_runtime_is_never_an_agents_identity() {
+    let cat = AgentCatalog::builtin();
+    let dir = "/home/u/.local/share/cursor-agent/versions/2026.09.28-64d2043";
+    let cursor = proc_with(
+        Some(&format!("{dir}/node")),
+        "node",
+        Some(&["/home/u/.local/bin/agent", &format!("{dir}/index.js")]),
+    );
+    let l = cat.classify(&cursor).unwrap();
+    assert_eq!((l.id.as_str(), l.basis), ("cursor", MatchBasis::Asserted));
+    assert!(!l.may_root_above_session());
+    assert!(!cat.within_install_tree(
+        "cursor",
+        Path::new(&format!("{dir}/node")),
+        Some(Path::new("/home/u"))
+    ));
+    let mut signed_node = signed(&format!("{dir}/node"), "node", Some("HX7739G8FX"));
+    signed_node.argv = Some(Argv::new(["node", "/tmp/x.js"]));
+    assert_eq!(id_of(&cat, &signed_node), None);
+    // Interpreters are never matched by path or signature.
+    for path in [
+        "/usr/local/bin/node",
+        "/usr/bin/python3.12",
+        "/opt/bun/bin/bun",
+    ] {
+        assert_eq!(id_of(&cat, &exe(path)), None, "{path}");
+    }
+}
+
+/// `names` are names, never an identity: a match on one is asserted, from
+/// the executable's file name, `argv[0]` or the command name (cut to the
+/// length the kernel keeps), and an extension may add them. Each name is
+/// 1 to 64 bytes without `/` or control characters.
+#[test]
+fn names_are_asserted_and_checked() {
+    let (root, dir) = data_dir();
+    write(
+        &dir,
+        "a.toml",
+        "[[agent]]\nid = \"aider\"\nname = \"Aider\"\nnames = [\"aider\", \"Aider Chat Assistant 1\"]\n",
+    );
+    for (file, names) in [
+        ("b.toml", "[\"a/b\"]"),
+        ("c.toml", "[\"\"]"),
+        ("d.toml", "[\"a\\u0007b\"]"),
+        ("e.toml", "[\"..\"]"),
+    ] {
+        write(
+            &dir,
+            file,
+            &format!(
+                "[[agent]]\nid = \"x{}\"\nname = \"X\"\nnames = {names}\n",
+                &file[..1]
+            ),
+        );
+    }
+    write(
+        &dir,
+        "f.toml",
+        &format!(
+            "[[agent]]\nid = \"xf\"\nname = \"X\"\nnames = [\"{}\"]\n",
+            "a".repeat(65)
+        ),
+    );
+    let cat = AgentCatalog::load(root.path());
+    let kinds: Vec<(String, CatalogErrorKind)> = cat
+        .problems()
+        .iter()
+        .map(|p| (p.file.to_string_lossy().into_owned(), p.error.kind()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("b.toml".to_owned(), CatalogErrorKind::InvalidAgentName),
+            ("c.toml".to_owned(), CatalogErrorKind::InvalidAgentName),
+            ("d.toml".to_owned(), CatalogErrorKind::InvalidAgentName),
+            ("e.toml".to_owned(), CatalogErrorKind::InvalidAgentName),
+            ("f.toml".to_owned(), CatalogErrorKind::InvalidAgentName),
+        ]
+    );
+    for p in [
+        exe("/usr/local/bin/aider"),
+        proc_with(
+            Some("/usr/bin/python3"),
+            "python3",
+            Some(&["/x/aider", "--yes"]),
+        ),
+        proc_with(Some("/usr/bin/python3"), "Aider Chat Assi", None),
+    ] {
+        let l = cat.classify(&p).unwrap();
+        assert_eq!(
+            (l.id.as_str(), l.source, l.basis),
+            ("aider", CatalogSource::Extension, MatchBasis::Asserted),
+            "{p:?}"
+        );
+    }
+    assert_eq!(
+        id_of(&cat, &proc_with(Some("/usr/bin/python3"), "Aider", None)),
+        None
+    );
+}
+
+/// Only the builtin catalog records what makes an agent's executable run
+/// other code: an extension that lists `code_selecting_env` is skipped and
+/// reported, like one with install trees.
+#[test]
+fn code_selecting_env_is_the_builtin_catalogs_alone() {
+    let (root, dir) = data_dir();
+    write(
+        &dir,
+        "a.toml",
+        "[[agent]]\nid = \"opencode\"\nexecutables = [\"oc\"]\ncode_selecting_env = [\"NODE_OPTIONS\"]\n",
+    );
+    write(
+        &dir,
+        "b.toml",
+        "[[agent]]\nid = \"y\"\nname = \"Y\"\nexecutables = [\"y\"]\ncode_selecting_env = [\"1BAD\"]\n",
+    );
+    let cat = AgentCatalog::load(root.path());
+    let kinds: Vec<(String, CatalogErrorKind)> = cat
+        .problems()
+        .iter()
+        .map(|p| (p.file.to_string_lossy().into_owned(), p.error.kind()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("a.toml".to_owned(), CatalogErrorKind::BuiltinOnly),
+            ("b.toml".to_owned(), CatalogErrorKind::InvalidMarker),
+        ]
+    );
+    assert_eq!(cat.code_selecting_env("opencode"), ["BUN_BE_BUN"]);
+    assert_eq!(id_of(&cat, &exe("/usr/bin/oc")), None, "a.toml was skipped");
 }
 
 #[test]
@@ -600,12 +961,22 @@ fn ordinary_programs_are_not_agents() {
         // The desktop app: another name, another case.
         "/Applications/Claude.app/Contents/MacOS/Claude",
         "/usr/local/bin/claude-helper",
-        "/usr/bin/python3",
     ] {
         let p = exe(path);
         assert_eq!(id_of(&cat, &p), None, "{path}");
         assert!(!cat.needs_argv(&p), "{path}");
     }
+    // Python is an interpreter (kimi-cli runs under it): its arguments are
+    // read, and a script that is no agent's is no agent.
+    let p = exe("/usr/bin/python3");
+    assert!(cat.needs_argv(&p));
+    assert_eq!(id_of(&cat, &p), None);
+    let p = proc_with(
+        Some("/usr/bin/python3.12"),
+        "python3.12",
+        Some(&["python3", "/srv/manage.py", "runserver"]),
+    );
+    assert_eq!(id_of(&cat, &p), None);
     // An interpreter running something else, or whose arguments were not
     // read.
     let p = proc_with(

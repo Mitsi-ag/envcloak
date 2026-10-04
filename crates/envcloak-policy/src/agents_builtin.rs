@@ -8,13 +8,16 @@
 pub(crate) static AGENTS_TOML: &str = r#"# Known AI coding agents, for caller evidence (SPEC §10a, §10b "Root
 # selection"). Format and rules: docs/AGENTS.md.
 #
-# A process in a caller's ancestry is an agent when its executable, its
-# script (under an interpreter) or its macOS code signature matches an entry
-# here. A match makes handling stricter (an agent subject, the agent
-# barrier, proofs refused); a pattern that misses an agent lets it ride a
-# terminal grant. A match on the executable's path or signature also makes
-# the agent the root of its grants above the caller's session, covering
-# every command it runs, so `executables` must name agents only. A match on
+# A process in a caller's ancestry is an agent when its executable, a name
+# it goes by, its script (under an interpreter) or its macOS code signature
+# matches an entry here. A match makes handling stricter (an agent
+# subject, the agent barrier, proofs refused); a pattern that misses an
+# agent lets it ride a terminal grant. A match on the executable's path or
+# signature also makes the agent the root of its grants above the caller's
+# session, covering every command it runs, so `executables` must name
+# agents only, and never an interpreter, which runs whatever it is given
+# (the builtin catalog fails to load otherwise). A match on `names`
+# (names other programs share, or titles a process gives itself), on
 # argv[0], a script or the command name, which a process sets itself, never
 # does that. Compiled into the release by scripts/gen-agents.py; users add
 # entries under <data>/agents.d/.
@@ -23,11 +26,15 @@ pub(crate) static AGENTS_TOML: &str = r#"# Known AI coding agents, for caller ev
 # real install observed (M2-04's pinned hosts, crates/envcloak-e2e/agents/
 # versions.toml, whose layouts and commands the `catalog` tests of
 # crates/envcloak-e2e/tests/agent_hosts.rs classify) or the agent's own
-# documentation, named beside it. `product` names the product an entry
-# belongs to, for coverage reporting. `install_trees` names the
+# documentation or source, named beside it. `product` names the product
+# an entry belongs to, for coverage reporting. `install_trees` names the
 # directories the agent's documented installers write to, for the Linux
 # standing statement (M2 plan D-10); an agent with none has no Linux
-# standing approval.
+# standing approval. `code_selecting_env` names the environment variables
+# that make the agent's own executable run other code, as measured on its
+# pinned builds (agent_hosts' `code_selecting_env_is_measured` checks each
+# entry with an executable identity on both systems), for standing
+# approvals (SPEC §10b).
 #
 # Left out for want of evidence: Goose (no install observed and no marker
 # documented; its command name `goose` is also a database migration
@@ -35,8 +42,25 @@ pub(crate) static AGENTS_TOML: &str = r#"# Known AI coding agents, for caller ev
 # signature observed) and Aider.
 
 # Executables that run scripts. For these, the script arguments are matched
-# against each agent's `scripts`.
-interpreters = ["node", "nodejs", "bun", "deno"]
+# against each agent's `scripts`, and argv[0] against its `names`. Python
+# runs kimi-cli (https://github.com/MoonshotAI/kimi-cli, pyproject.toml:
+# `kimi` and `kimi-cli` scripts); `Python` is the executable of macOS's
+# framework builds.
+interpreters = [
+  "node",
+  "nodejs",
+  "bun",
+  "deno",
+  "python",
+  "python3",
+  "python3.10",
+  "python3.11",
+  "python3.12",
+  "python3.13",
+  "python3.14",
+  "python3.15",
+  "Python",
+]
 
 [[agent]]
 id = "claude-code"
@@ -68,6 +92,10 @@ install_trees = [
   "/usr/local/lib/node_modules/@anthropic-ai/claude-code",
   "/usr/lib/node_modules/@anthropic-ai/claude-code",
 ]
+# The native build is a Bun executable: BUN_OPTIONS=--preload=<file> runs
+# that file in it first, under its path and its signature (measured on
+# 2.1.280; BUN_BE_BUN and NODE_OPTIONS change nothing there).
+code_selecting_env = ["BUN_OPTIONS"]
 
 [[agent]]
 id = "codex"
@@ -93,14 +121,17 @@ product = "cursor"
 # ~/.local/share/cursor-agent/versions/<version>/, whose cursor-agent
 # script runs that directory's own node on its index.js; ~/.local/bin/
 # agent and ~/.local/bin/cursor-agent link to the script. The command name
-# `agent` is too generic for a pattern, and the bundled node is signed by
-# the Node.js Foundation, not by Cursor (measured on M2-04's pinned
-# build), so only the versioned paths name it.
-executables = ["cursor-agent/versions/*/node"]
+# `agent` is too generic for a pattern. Its process is that node, which
+# runs any script (and is signed by the Node.js Foundation, not by
+# Cursor), so Cursor is known by its script only, never by an executable:
+# it roots no grant above a command's session and has no standing
+# approval. The binaries Anysphere signs in the package (cursorsandbox,
+# spawn-helper, crepectl, the worker) are not an identity either: the
+# sandbox and the spawn helper start whatever command they are given, and
+# none was observed in a command's ancestry.
 scripts = ["cursor-agent/versions/*/index.js"]
 # Set in the commands its agent and its sandbox run (Map C §2).
 markers = ["CURSOR_AGENT", "CURSOR_SANDBOX"]
-install_trees = ["~/.local/share/cursor-agent/versions"]
 
 [[agent]]
 id = "gemini-cli"
@@ -117,18 +148,31 @@ markers = ["GEMINI_CLI"]
 id = "copilot-cli"
 name = "GitHub Copilot CLI"
 product = "copilot-cli"
-# The native binary: npm's @github/copilot-<platform>/copilot, which `node
-# npm-loader.js` starts (on Linux its process takes its main thread's
-# name), or the install script's $PREFIX/bin/copilot (https://
-# raw.githubusercontent.com/github/copilot-cli/main/install.sh).
-executables = ["copilot"]
+# The native binary of npm's platform packages (@github/copilot's
+# optionalDependencies), which `node npm-loader.js` starts; on Linux its
+# process takes its main thread's name, `MainThread`.
+executables = [
+  "@github/copilot-linux-x64/copilot",
+  "@github/copilot-linux-arm64/copilot",
+  "@github/copilot-linuxmusl-x64/copilot",
+  "@github/copilot-linuxmusl-arm64/copilot",
+  "@github/copilot-darwin-x64/copilot",
+  "@github/copilot-darwin-arm64/copilot",
+]
+# The install script's $PREFIX/bin/copilot (https://raw.githubusercontent.
+# com/github/copilot-cli/main/install.sh: $HOME/.local, or /usr/local as
+# root) has a path the AWS Copilot CLI also installs to (/usr/local/bin/
+# copilot), so `copilot` is a name, not an identity: it makes a process an
+# agent and roots nothing above a session.
+names = ["copilot"]
 # npm's launcher, directly or through the `copilot` link.
 scripts = ["copilot", "@github/copilot/npm-loader.js"]
-# The install script's prefix, $HOME/.local, or /usr/local as root; npm's
-# global folder (as above).
+# Observed on the pinned 1.0.90 macOS binary.
+signatures = [{ team = "VEKTX9H2N7", identifier = "copilot" }]
+# npm's global folder (as above). The binary is a Node single executable
+# that refuses NODE_OPTIONS; BUN_OPTIONS and BUN_BE_BUN change nothing
+# (measured on 1.0.90).
 install_trees = [
-  "~/.local/bin",
-  "/usr/local/bin",
   "/usr/local/lib/node_modules/@github/copilot",
   "/usr/lib/node_modules/@github/copilot",
 ]
@@ -141,11 +185,17 @@ product = "opencode"
 # script's ~/.opencode/bin/opencode (https://raw.githubusercontent.com/
 # anomalyco/opencode/dev/install).
 executables = ["opencode"]
+# Observed on the pinned 1.18.34 macOS binary.
+signatures = [{ team = "5NZ4Q7NXJ4", identifier = "opencode" }]
 install_trees = [
   "~/.opencode/bin",
   "/usr/local/lib/node_modules/opencode-ai",
   "/usr/lib/node_modules/opencode-ai",
 ]
+# A Bun executable: BUN_BE_BUN=1 makes it Bun itself, which runs any script
+# it is given under OpenCode's path and signature (measured on 1.18.34;
+# BUN_OPTIONS and NODE_OPTIONS change nothing there).
+code_selecting_env = ["BUN_BE_BUN"]
 
 [[agent]]
 id = "kimi"
@@ -154,13 +204,19 @@ product = "kimi"
 # Kimi Code and kimi-cli both run as `kimi`; their installer tells them
 # apart by data root (~/.kimi-code, ~/.kimi). Kimi Code's native binary is
 # its install script's ~/.kimi-code/bin/kimi (https://code.kimi.com/
-# kimi-code/install.sh); npm's @moonshot-ai/kimi-code runs under node,
-# which renames its process and overwrites its own arguments with
-# `kimi-code`. kimi-cli's `kimi` is a Python script, known by its command
-# name on Linux.
-executables = ["kimi", "kimi-code"]
-scripts = ["kimi", "@moonshot-ai/kimi-code/dist/main.mjs"]
-install_trees = ["~/.kimi-code/bin"]
+# kimi-code/install.sh); no build of it is pinned, so what runs other
+# code in it is not measured and it has no install tree (no Linux standing
+# approval).
+executables = ["kimi"]
+# npm's @moonshot-ai/kimi-code runs under node, which renames its process
+# and overwrites its own arguments with `kimi-code` (measured on 2.1.1).
+# kimi-cli is Python: its `kimi` and `kimi-cli` scripts (pyproject.toml)
+# set the process title `Kimi Code` with setproctitle, which overwrites
+# the arguments and, on Linux, the command name; its workers are
+# `kimi-code-bg-worker` and `kimi-code-worker` (src/kimi_cli/cli/
+# __init__.py, src/kimi_cli/utils/proctitle.py).
+names = ["kimi-code", "kimi-cli", "Kimi Code", "kimi-code-bg-worker", "kimi-code-worker"]
+scripts = ["kimi", "kimi-cli", "@moonshot-ai/kimi-code/dist/main.mjs"]
 
 [[agent]]
 id = "qwen-code"
