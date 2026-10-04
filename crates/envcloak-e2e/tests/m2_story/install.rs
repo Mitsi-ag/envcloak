@@ -1108,13 +1108,16 @@ fn linked_layout(
 /// refuses a writable root named through a symlink: "symlinked writable
 /// roots are not supported"), and one in the project itself reaches
 /// nothing through the proxy (the rule behind the link is not read
-/// there). The fourth, by hand first like the first two: with the opt-out
-/// the session named through the link runs its command, and the rule
-/// behind the link widens the allowance to the listener; then install
-/// withholds the allowance (`network_settings_present`, exit 1) and the
-/// listener is not reached. Its control, the opt-out and no rule: install
-/// writes the allowance (exit 0), and the session through the link runs
-/// its command and reaches nothing through the proxy.
+/// there). The fourth is measured after its install, then by hand (a
+/// session named through a link may make Codex record that name as a
+/// trusted project, which the check then reads, hiding whether it read
+/// the opt-out): install withholds the allowance
+/// (`network_settings_present`, exit 1) and the listener is not reached;
+/// then, with the round-5 allowance by hand, the session named through the
+/// link runs its command and the rule behind the link widens the
+/// allowance to the listener. Its control, the opt-out and no rule:
+/// install writes the allowance (exit 0), and the session through the
+/// link runs its command and reaches nothing through the proxy.
 ///
 /// Mutations checked, each against real Codex: `.codex` looked at without
 /// following a symlink (`symlink_metadata` in `codex_layers::dot_codex`):
@@ -1215,15 +1218,18 @@ fn codex_linked_layers_keep_the_socket_allowance_out() {
         };
 
         // The control: the round-5 allowance, by hand. (A session named
-        // through a link is measured with EnvCloak's own allowance below:
-        // Codex may record that name as a trusted project of its own.)
-        if !through_link && name != OPTED_OUT_NO_RULE {
-            codex.codex_config(&format!(
-                "{trust}\n[sandbox_workspace_write]\nnetwork_access = true\n\n\
-                 [features.network_proxy]\nenabled = true\n\n\
-                 [features.network_proxy.unix_sockets]\n\"{}\" = \"allow\"\n",
-                socket.display()
-            ));
+        // through a link is measured with EnvCloak's own allowance first:
+        // Codex may record that name as a trusted project of its own,
+        // which the check would then read; the opted-out layout's control
+        // comes after its install.)
+        let round5 = format!(
+            "{trust}\n[sandbox_workspace_write]\nnetwork_access = true\n\n\
+             [features.network_proxy]\nenabled = true\n\n\
+             [features.network_proxy.unix_sockets]\n\"{}\" = \"allow\"\n",
+            socket.display()
+        );
+        if !through_link && !opted_out {
+            codex.codex_config(&round5);
             let (reached, said) = measure(&mut h, &codex, "with the round-5 allowance", &flags);
             assert!(
                 reached > 0 && !said.contains("was blocked"),
@@ -1285,6 +1291,16 @@ fn codex_linked_layers_keep_the_socket_allowance_out() {
             assert!(
                 refused_as(&v, "codex", "network_settings_present"),
                 "{name}: {v}"
+            );
+        }
+        if name == OPTED_OUT {
+            // The control, after the install: with the allowance by hand,
+            // the session named through the link reads the rule behind it.
+            codex.codex_config(&round5);
+            let (reached, said) = measure(&mut h, &codex, "with the round-5 allowance", &flags);
+            assert!(
+                reached > 0 && !said.contains("was blocked"),
+                "the control ({name}): the layer did not widen the allowance here: {said}"
             );
         }
         h.assert_swept("M2-08 Codex linked layers");
