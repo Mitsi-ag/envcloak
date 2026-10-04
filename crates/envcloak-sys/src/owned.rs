@@ -1390,3 +1390,408 @@ mod tests {
         );
     }
 }
+
+/// An independent review oracle (cycle 374), adopted: the review wrote its
+/// own recording process table and declared outcomes apart from this
+/// module's model, and ran this module's `NoJob`, `GroupTable`, `bind_job`
+/// and `signal_job` against them. Four processes (the job's leader and a
+/// peer in its group, another job of the session, a process of another
+/// session) and ten schedules (a stable job; a peer that leaves the group,
+/// leaves the session or is born into it; the leader that leaves its group
+/// or is gone; the group emptied; the number given to a newcomer outside
+/// the session, in its own group, or in another group of the session),
+/// each made before the binding, after its first call or after its
+/// second; the monitor's own group; bad numbers; failures to open, read
+/// and send; members that may not be signalled. Each case declares its
+/// result, the processes the signal reaches and the calls made, for
+/// SIGTERM and SIGHUP: 98 cases, 32 of them deliveries that must reach
+/// their members. Read the session before opening the handle and 26 cases
+/// fail; drop the session check and 6 do; count an empty group as a
+/// delivery and 16 do. Only counts and case numbers are printed.
+#[cfg(test)]
+mod independent_group_oracle {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Op {
+        Open,
+        Read,
+        Send,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Event {
+        Stable,
+        PeerLeave,
+        PeerSetsid,
+        PeerBorn,
+        LeaderLeave,
+        LeaderGone,
+        Empty,
+        ReplaceOutside,
+        ReplaceOwn,
+        ReplaceJoin,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Reason {
+        Ok,
+        Monitor,
+        Leader,
+        Outside,
+        Empty,
+        Unsupported,
+        Invalid,
+        InvalidData,
+        Raw(i32),
+    }
+
+    #[derive(Clone, Debug)]
+    struct Task {
+        role: u8,
+        pid: i32,
+        identity: u64,
+        group: u64,
+        session: i32,
+        permitted: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Handle {
+        key: u64,
+    }
+
+    struct Model {
+        tasks: Vec<Task>,
+        ops: Vec<Op>,
+        event: Event,
+        at: usize,
+        open_error: Option<i32>,
+        read_error: Option<io::ErrorKind>,
+        read_none: bool,
+        send_error: Option<i32>,
+        hits: BTreeSet<u8>,
+        sent: Vec<i32>,
+    }
+
+    const SESSION: i32 = 6100;
+    const LEADER: i32 = 6200;
+
+    impl Model {
+        fn new(event: Event, at: usize) -> Self {
+            let task = |role, pid, identity, group, session| Task {
+                role,
+                pid,
+                identity,
+                group,
+                session,
+                permitted: true,
+            };
+            let mut s = Model {
+                tasks: vec![
+                    task(0, LEADER, 1, 1, SESSION),
+                    task(1, 6300, 2, 1, SESSION),
+                    task(2, 6400, 3, 3, SESSION),
+                    task(3, 6500, 4, 4, 6500),
+                ],
+                ops: vec![],
+                event,
+                at,
+                open_error: None,
+                read_error: None,
+                read_none: false,
+                send_error: None,
+                hits: BTreeSet::new(),
+                sent: vec![],
+            };
+            if at == 0 {
+                s.change();
+            }
+            s
+        }
+
+        fn role(&mut self, role: u8) -> &mut Task {
+            self.tasks.iter_mut().find(|t| t.role == role).unwrap()
+        }
+
+        fn change(&mut self) {
+            match self.event {
+                Event::Stable => {}
+                Event::PeerLeave => self.role(1).group = 3,
+                Event::PeerSetsid => {
+                    let p = self.role(1);
+                    p.session = p.pid;
+                    p.group = p.identity;
+                }
+                Event::PeerBorn => self.tasks.push(Task {
+                    role: 4,
+                    pid: 6600,
+                    identity: 5,
+                    group: 1,
+                    session: SESSION,
+                    permitted: true,
+                }),
+                Event::LeaderLeave => self.role(0).group = 3,
+                Event::LeaderGone => self.tasks.retain(|t| t.role != 0),
+                Event::Empty | Event::ReplaceOutside | Event::ReplaceOwn | Event::ReplaceJoin => {
+                    self.tasks.retain(|t| t.group != 1);
+                    if !matches!(self.event, Event::Empty) {
+                        self.tasks.push(Task {
+                            role: 5,
+                            pid: LEADER,
+                            identity: 6,
+                            group: if matches!(self.event, Event::ReplaceJoin) {
+                                3
+                            } else {
+                                6
+                            },
+                            session: if matches!(self.event, Event::ReplaceOutside) {
+                                6500
+                            } else {
+                                SESSION
+                            },
+                            permitted: true,
+                        });
+                    }
+                }
+            }
+        }
+
+        fn tick(&mut self, op: Op) {
+            self.ops.push(op);
+            if self.ops.len() == self.at {
+                self.change();
+            }
+        }
+    }
+
+    impl GroupTable for Model {
+        type Handle = Handle;
+
+        fn open(&mut self, pid: i32) -> io::Result<Option<Handle>> {
+            let out = match self.open_error {
+                Some(e) => Err(io::Error::from_raw_os_error(e)),
+                None => Ok(self
+                    .tasks
+                    .iter()
+                    .find(|t| t.pid == pid)
+                    .map(|t| Handle { key: t.identity })),
+            };
+            self.tick(Op::Open);
+            out
+        }
+
+        fn session_of(&mut self, pid: i32) -> io::Result<Option<i32>> {
+            let out = if let Some(e) = self.read_error {
+                Err(e.into())
+            } else if self.read_none {
+                Ok(None)
+            } else {
+                Ok(self.tasks.iter().find(|t| t.pid == pid).map(|t| t.session))
+            };
+            self.tick(Op::Read);
+            out
+        }
+
+        fn signal_group(&mut self, handle: &Handle, sig: i32) -> io::Result<()> {
+            self.tick(Op::Send);
+            if let Some(e) = self.send_error {
+                return Err(io::Error::from_raw_os_error(e));
+            }
+            let members: Vec<&Task> = self
+                .tasks
+                .iter()
+                .filter(|t| t.group == handle.key)
+                .collect();
+            if members.is_empty() {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            let allowed: Vec<u8> = members
+                .iter()
+                .filter(|t| t.permitted)
+                .map(|t| t.role)
+                .collect();
+            if allowed.is_empty() {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            self.sent.extend(allowed.iter().map(|_| sig));
+            self.hits.extend(allowed);
+            Ok(())
+        }
+    }
+
+    struct Case {
+        model: Model,
+        session: i32,
+        foreground: i32,
+        reason: Reason,
+        hits: BTreeSet<u8>,
+        ops: Vec<Op>,
+    }
+
+    fn case(model: Model, reason: Reason, hits: &[u8], ops: &[Op]) -> Case {
+        Case {
+            model,
+            session: SESSION,
+            foreground: LEADER,
+            reason,
+            hits: hits.iter().copied().collect(),
+            ops: ops.to_vec(),
+        }
+    }
+
+    fn reason(r: &io::Result<()>) -> Reason {
+        let Err(e) = r else {
+            return Reason::Ok;
+        };
+        match NoJob::of(e) {
+            Some(NoJob::MonitorHolds) => Reason::Monitor,
+            Some(NoJob::NoLeader) => Reason::Leader,
+            Some(NoJob::OutsideSession) => Reason::Outside,
+            Some(NoJob::Empty) => Reason::Empty,
+            Some(NoJob::Unsupported) => Reason::Unsupported,
+            None => match (e.raw_os_error(), e.kind()) {
+                (Some(n), _) => Reason::Raw(n),
+                (None, io::ErrorKind::InvalidInput) => Reason::Invalid,
+                (None, io::ErrorKind::InvalidData) => Reason::InvalidData,
+                (None, _) => Reason::Raw(5),
+            },
+        }
+    }
+
+    fn packet() -> Vec<Case> {
+        use Op::{Open, Read, Send};
+        use Reason::{Empty, Leader, Ok as Good, Outside};
+        let full = &[Open, Read, Send];
+        let read = &[Open, Read];
+        let mut v = vec![case(Model::new(Event::Stable, 0), Good, &[0, 1], full)];
+        for at in 0..=2 {
+            let gone_ops = match at {
+                0 => vec![Open],
+                1 => read.to_vec(),
+                _ => full.to_vec(),
+            };
+            for (event, why, hits, ops) in [
+                (Event::PeerLeave, Good, vec![0], full.to_vec()),
+                (Event::PeerSetsid, Good, vec![0], full.to_vec()),
+                (Event::PeerBorn, Good, vec![0, 1, 4], full.to_vec()),
+                (Event::LeaderLeave, Good, vec![1], full.to_vec()),
+                (
+                    Event::LeaderGone,
+                    if at < 2 { Leader } else { Good },
+                    if at < 2 { vec![] } else { vec![1] },
+                    gone_ops.clone(),
+                ),
+                (
+                    Event::Empty,
+                    if at < 2 { Leader } else { Empty },
+                    vec![],
+                    gone_ops.clone(),
+                ),
+                (
+                    Event::ReplaceOutside,
+                    if at < 2 { Outside } else { Empty },
+                    vec![],
+                    if at < 2 { read.to_vec() } else { full.to_vec() },
+                ),
+                (
+                    Event::ReplaceOwn,
+                    if at == 0 { Good } else { Empty },
+                    if at == 0 { vec![5] } else { vec![] },
+                    full.to_vec(),
+                ),
+                (Event::ReplaceJoin, Empty, vec![], full.to_vec()),
+            ] {
+                v.push(case(Model::new(event, at), why, &hits, &ops));
+            }
+        }
+        let mut m = case(Model::new(Event::Stable, 0), Reason::Monitor, &[], &[]);
+        m.foreground = SESSION;
+        v.push(m);
+        for n in [-1, 0, 1] {
+            let mut c = case(Model::new(Event::Stable, 0), Reason::Invalid, &[], &[]);
+            c.session = n;
+            v.push(c);
+            let mut c = case(Model::new(Event::Stable, 0), Reason::Invalid, &[], &[]);
+            c.foreground = n;
+            v.push(c);
+        }
+        let mut m = Model::new(Event::Stable, 0);
+        m.tasks[0].session = 6500;
+        v.push(case(m, Outside, &[], read));
+        for n in [libc::ENOSYS, libc::EPERM, libc::EMFILE, 5] {
+            let mut m = Model::new(Event::Stable, 0);
+            m.open_error = Some(n);
+            let why = if n == libc::ENOSYS {
+                Reason::Unsupported
+            } else {
+                Reason::Raw(n)
+            };
+            v.push(case(m, why, &[], &[Open]));
+        }
+        for kind in [io::ErrorKind::Other, io::ErrorKind::InvalidData] {
+            let mut m = Model::new(Event::Stable, 0);
+            m.read_error = Some(kind);
+            let why = if kind == io::ErrorKind::InvalidData {
+                Reason::InvalidData
+            } else {
+                Reason::Raw(5)
+            };
+            v.push(case(m, why, &[], read));
+        }
+        let mut m = Model::new(Event::Stable, 0);
+        m.read_none = true;
+        v.push(case(m, Leader, &[], read));
+        for n in [libc::ESRCH, libc::EINVAL, libc::EPERM, 5] {
+            let mut m = Model::new(Event::Stable, 0);
+            m.send_error = Some(n);
+            let why = match n {
+                libc::ESRCH => Empty,
+                libc::EINVAL => Reason::Unsupported,
+                _ => Reason::Raw(n),
+            };
+            v.push(case(m, why, &[], full));
+        }
+        let mut m = Model::new(Event::Stable, 0);
+        m.tasks[1].permitted = false;
+        v.push(case(m, Good, &[0], full));
+        let mut m = Model::new(Event::Stable, 0);
+        m.tasks[0].permitted = false;
+        m.tasks[1].permitted = false;
+        v.push(case(m, Reason::Raw(libc::EPERM), &[], full));
+        v
+    }
+
+    #[test]
+    fn the_review_packet_holds_for_the_group_delivery() {
+        let (mut mismatches, mut positives, mut cases) = (Vec::new(), 0usize, 0usize);
+        for sig in [libc::SIGTERM, libc::SIGHUP] {
+            for mut c in packet() {
+                cases += 1;
+                let got = bind_job(&mut c.model, c.session, c.foreground)
+                    .and_then(|h| signal_job(&mut c.model, &h, sig));
+                let count = |ops: &[Op], op: Op| ops.iter().filter(|x| **x == op).count();
+                let good = reason(&got) == c.reason
+                    && c.model.hits == c.hits
+                    && c.model.ops.len() == c.ops.len()
+                    && [Op::Open, Op::Read, Op::Send]
+                        .into_iter()
+                        .all(|op| count(&c.model.ops, op) == count(&c.ops, op))
+                    && c.model.sent.len() == c.hits.len()
+                    && c.model.sent.iter().all(|s| *s == sig);
+                if !good {
+                    mismatches.push(cases);
+                } else if c.reason == Reason::Ok {
+                    positives += 1;
+                }
+            }
+        }
+        println!(
+            "cycle 374 packet: {cases} cases, {positives} deliveries, {} mismatches {mismatches:?}",
+            mismatches.len()
+        );
+        assert!(mismatches.is_empty(), "cases {mismatches:?}");
+        assert_eq!((cases, positives), (98, 32));
+    }
+}
