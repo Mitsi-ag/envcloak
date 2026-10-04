@@ -49,14 +49,23 @@ decisions as SPEC v0.4.1 wrote them (M3 plan task M3-01).
   derive` on x86_64) corrected §11, so it is an edit. The sentences that
   carry an M3 decision's security property are in the SPEC exactly once:
   the app role's runtime conditions and its verdict per connection, a peer
-  that fails them kept a client peer (D3-06, gate 22), the two §4.4
-  crossings of the app (the plan's wording check: a list left without the
-  new crossings fails), the signed form of a proof and the first unlocker
+  that fails them kept a client peer (D3-06, gate 22), the app role's
+  methods (the passphrase unlocker the one it removes) and the client's
+  reveal request, every §4.4 crossing of the app (the plan's wording
+  check: a list left without the new crossings fails) and the app's calls
+  of client methods, the app's sealed reveal named as the one exception to
+  the one-rule bullet and that bullet's last clause scoped to client
+  processes, screen lock and a session switch reported through the app
+  role, §6.7's reveal domain and who `envcloak reveal` files for, the
+  signed form of a proof, its statement domains and the first unlocker
   approved with the passphrase (D3-08, D3-10), a passphrase proof only
-  from a terminal subject and a signed one only from the app role, and the
-  macOS 26 floor (D3-04). The wording they replaced is gone: the macOS 14
-  floor, the screen lock any program could report, the proof taken only
-  from a terminal subject, and the old app-to-daemon list.
+  from a terminal subject and a signed one only from the app role, a
+  signed proof refused from an app an agent started, and the macOS 26
+  floor (D3-04). The wording they replaced is gone: the macOS 14 floor,
+  the screen lock any program could report, the proof taken only from a
+  terminal subject, the old app-role and app-to-daemon lists, an unlocker
+  statement the app signs, the removal of Secure Enclave unlockers by the
+  app, and a release clause that covers the app.
 - The status line says v0.4.1, and the file holds no em dash.
 
 Runs of whitespace, line breaks included, count as one space in the SPEC
@@ -144,7 +153,7 @@ M3_DECISIONS = [
         "`envcloak-reveal-statement/1`",
         "sent as the 64-byte raw `r || s`",
     ]),
-    ("D3-11", "edit", ["screen lock (reported by the app through the app role"]),
+    ("D3-11", "edit", ["reported by the app through the app role, so no other program can record either in the audit log"]),
     ("D3-12", "no edit", "docs/APP.md and docs/VAULT.md: the anchor store (M3-16)"),
     ("D3-13", "no edit", "SPEC §6.4 already keeps machine scans out of the daemon and the app"),
     ("D3-14", "no edit", "SPEC §5 already shows the Recovery Kit only on the terminal"),
@@ -327,18 +336,77 @@ REQUIRED = {
         "From M3, a peer that does not meet every condition of the `app` role is a client peer, "
         "and its `app` requests are rejected and audited the same way (gate 22)."
     ),
+    "§4.3 the app role's methods (D3-08, M3-01)": (
+        "Its methods are: unlock with the Secure Enclave; enrolling Secure Enclave unlockers, and "
+        "removing the passphrase unlocker (§5); the list of pending requests, and approval with a "
+        "signature; replacing and removing an item with a signature; reveal; paste-sheet ingest, "
+        "and answering the keys `envcloak add --ask` asks for (§6.3); the audit log's entries; and "
+        "lock with a reason (§5 \"Lock\")."
+    ),
+    "§4.3 the client's ask and reveal request (M3-01)": (
+        "`request_new_secret` (from M3, the ask `envcloak add --ask` files for the app's paste "
+        "sheet, and its state, §6.3), the reveal request `envcloak reveal` files for the app on "
+        "macOS (M3, §6.7),"
+    ),
     "§4.4 app to daemon (M3-01)": (
         "App to daemon: one HPKE-sealed VMK per unlock; the two public keys (`unlock` and "
-        "`approve`) of a new Secure Enclave unlocker; signed approval, write, unlocker, reveal, "
-        "policy and device statements; values typed into the paste sheet and replacement values, "
-        "each sealed to a daemon ephemeral key."
+        "`approve`) of a new Secure Enclave unlocker; signed approval, write, reveal, policy and "
+        "device statements; values typed into the paste sheet and replacement values, each sealed "
+        "to a daemon ephemeral key; the app's ephemeral public key for a sealed reveal; and request "
+        "metadata (request, ask and unlocker ids, an unlocker's label, the lock reason, slugs and "
+        "fields, and the audit log's filters)."
     ),
     "§4.4 daemon to app (M3-01)": (
         "Daemon to app: envelopes (ciphertext); approval request descriptors (metadata only); "
         "audit entries (metadata only, with command lines masked as the audit log keeps them); "
         "the paste and reveal requests the CLI filed (`envcloak add --ask`, `envcloak reveal`), "
-        "metadata only, with the requester's evidence; reveal values sealed to an app ephemeral "
-        "key after a signed reveal statement."
+        "metadata only, with the requester's evidence; other metadata: daemon ephemeral public "
+        "keys, challenges and nonces, ids and outcomes (a grant's id and expiry, an enrolment's "
+        "result, a new item's slug), and item metadata (slug, fields, bindings, grants, the count "
+        "of prior values and the classification); the paste sheet's reading of a staged value "
+        "(provider, class, length class, suggested slug and variable), never the value; reveal "
+        "values sealed to an app ephemeral key after a signed reveal statement."
+    ),
+    "§4.4 the app's calls of client methods (M3-01)": (
+        "The app's calls of client-role methods (`status`, the listing methods and, before the "
+        "`app` role exists, `items.add`) cross as a client's, under the two client bullets below."
+    ),
+    "§4.4 the app's sealed reveal, the one rule's exception (M3-01)": (
+        "from the reveal values the `app` role receives sealed after a signed reveal statement "
+        "(above),"
+    ),
+    "§4.4 no release to a client process rests on its code (M3-01)": (
+        "and for a client process no release depends on identifying the requesting process's "
+        "code: the daemon cannot read a hardened client's executable on Linux. The `app` role's "
+        "sealed reveal, the one release to a peer chosen by its code signature, exists on macOS "
+        "alone (§4.3)."
+    ),
+    "§5 screen lock and a session switch through the app role (D3-11)": (
+        "screen lock, and a switch to another user's login session (each reported by the app "
+        "through the app role, so no other program can record either in the audit log);"
+    ),
+    "§6.7 the reveal statement's domain (D3-10)": (
+        "The app shows the value after a signed reveal statement (Secure Enclave, reuse 0; domain "
+        "`envcloak-reveal-statement/1`, §10b)"
+    ),
+    "§6.7 who `envcloak reveal` files a request for (M3-01)": (
+        "On macOS, `envcloak reveal` files a request for the app only from a terminal subject: "
+        "an agent, unknown or terminal-less caller gets `proof_refused`, and nothing is filed."
+    ),
+    "§10b the statement domains (D3-10)": (
+        "Each statement starts with its domain: `envcloak-statement/1` for run approvals "
+        "(`envcloak-statement/2` once the live-key guard lands), `envcloak-unlocker-statement/1` "
+        "for adding a Secure Enclave unlocker with the passphrase in a terminal, "
+        "`envcloak-write-statement/1` for replacing or removing an item, adding another Secure "
+        "Enclave unlocker and removing the passphrase unlocker in the app, and "
+        "`envcloak-reveal-statement/1` for a reveal in the app (§6.7)."
+    ),
+    "§10b a signed proof refused from an app an agent started (M3-01)": (
+        "It refuses a signed proof from an `app` peer whose evidence names an agent (a known agent "
+        "in its ancestry or agent markers in its claims, as when an agent runs the app's "
+        "executable itself) or whose chain is cut at the walk's depth limit; the conditions only a "
+        "terminal subject meets (a controlling terminal, an ancestry that reaches its session "
+        "leader) are not asked of the app, which launchd starts."
     ),
     "§10b the signed form of a proof (D3-10)": (
         "From the `app` role (§4.3, M3): a P-256 ECDSA signature by the `approve` key of a Secure "
@@ -435,6 +503,16 @@ FORBIDDEN = {
     ),
     "the old app-to-daemon list (M3-01)": re.escape(
         "signed approval, policy, device and reveal statements; values typed into the paste sheet, sealed"
+    ),
+    "the old app-role list (M3-01)": re.escape(
+        "Its methods are: unlock with the Secure Enclave, approve with a signature, policy.set"
+    ),
+    "an unlocker statement the app signs (M3-01)": r"\bsigned (?:[a-z]+, )*unlocker\b",
+    "the removal of Secure Enclave unlockers by the app (M3-01)": re.escape(
+        "enrolling and removing Secure Enclave unlockers"
+    ),
+    "a release clause that covers the app (M3-01)": re.escape(
+        "receives any of them, and no release depends on identifying"
     ),
     "an em dash": "\u2014",
 }

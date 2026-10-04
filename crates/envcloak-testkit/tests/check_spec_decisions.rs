@@ -12,9 +12,15 @@
 //! where the sign-in driver starts from, a decision whose edit is gone, a
 //! decided sentence twice, an em dash and an older version. From SPEC
 //! v0.4.1 (task M3-01) it also refuses the M3 wording v0.4.1 replaced (the
-//! macOS 14 floor, a screen lock any program could report, the old §4.4
-//! app list) and a missing or weakened M3 clause (§4.4's new crossings, the
-//! app role's conditions, the signed proof and the first unlocker). With
+//! macOS 14 floor, a screen lock any program could report, the old §4.3
+//! and §4.4 app lists, an unlocker statement the app signs, the app
+//! removing Secure Enclave unlockers, a release clause that covers the
+//! app) and a missing or weakened M3 clause (every §4.4 crossing of the
+//! app and its client calls, the one rule's exception for the app's sealed
+//! reveal, the app role's methods and conditions, the client's reveal
+//! request, the session switch, §6.7's domain and filer, the statement
+//! domains, the signed proof, its refusal from an app an agent started,
+//! and the first unlocker). With
 //! `--pr-files` it refuses a SPEC pull request that changes any file but
 //! docs/SPEC.md.
 #![allow(clippy::unwrap_used)]
@@ -733,23 +739,52 @@ fn the_m2_res1_wording_is_required() {
 // --- SPEC v0.4.1, the M3 build decisions (M3 plan, task M3-01) ------------
 
 /// §4.4's app-to-daemon crossings in v0.4.1.
-const APP_TO_DAEMON: &str = "App to daemon: one HPKE-sealed VMK per unlock; the two public keys (`unlock` and `approve`) of a new Secure Enclave unlocker; signed approval, write, unlocker, reveal, policy and device statements; values typed into the paste sheet and replacement values, each sealed to a daemon ephemeral key.";
+const APP_TO_DAEMON: &str = "App to daemon: one HPKE-sealed VMK per unlock; the two public keys (`unlock` and `approve`) of a new Secure Enclave unlocker; signed approval, write, reveal, policy and device statements; values typed into the paste sheet and replacement values, each sealed to a daemon ephemeral key; the app's ephemeral public key for a sealed reveal; and request metadata (request, ask and unlocker ids, an unlocker's label, the lock reason, slugs and fields, and the audit log's filters).";
 /// §4.4's app-to-daemon crossings in v0.4, before M3-01.
 const OLD_APP_TO_DAEMON: &str = "App to daemon: one HPKE-sealed VMK per unlock; signed approval, policy, device and reveal statements; values typed into the paste sheet, sealed to a daemon ephemeral key.";
 /// §4.4's daemon-to-app crossings in v0.4.1.
-const DAEMON_TO_APP: &str = "Daemon to app: envelopes (ciphertext); approval request descriptors (metadata only); audit entries (metadata only, with command lines masked as the audit log keeps them); the paste and reveal requests the CLI filed (`envcloak add --ask`, `envcloak reveal`), metadata only, with the requester's evidence; reveal values sealed to an app ephemeral key after a signed reveal statement.";
+const DAEMON_TO_APP: &str = "Daemon to app: envelopes (ciphertext); approval request descriptors (metadata only); audit entries (metadata only, with command lines masked as the audit log keeps them); the paste and reveal requests the CLI filed (`envcloak add --ask`, `envcloak reveal`), metadata only, with the requester's evidence; other metadata: daemon ephemeral public keys, challenges and nonces, ids and outcomes (a grant's id and expiry, an enrolment's result, a new item's slug), and item metadata (slug, fields, bindings, grants, the count of prior values and the classification); the paste sheet's reading of a staged value (provider, class, length class, suggested slug and variable), never the value; reveal values sealed to an app ephemeral key after a signed reveal statement.";
+/// §4.4's daemon-to-app crossings in v0.4.
+const OLD_DAEMON_TO_APP: &str = "Daemon to app: envelopes (ciphertext); approval request descriptors (metadata only); reveal values sealed to an app ephemeral key after a signed reveal statement.";
+/// §4.4: the app's calls of client methods are client crossings.
+const APP_CLIENT_CALLS: &str = "The app's calls of client-role methods (`status`, the listing methods and, before the `app` role exists, `items.add`) cross as a client's, under the two client bullets below.";
+/// §4.4's one-rule bullet: the app's sealed reveal among its exceptions.
+const ONE_RULE_EXCEPTION: &str = "from the reveal values the `app` role receives sealed after a signed reveal statement (above),";
+/// §4.4's one-rule bullet: its last clause, about client processes.
+const CLIENT_CLAUSE: &str = "and for a client process no release depends on identifying the requesting process's code: the daemon cannot read a hardened client's executable on Linux. The `app` role's sealed reveal, the one release to a peer chosen by its code signature, exists on macOS alone (§4.3).";
+/// §4.3: the app role's methods in v0.4.1.
+const APP_METHODS: &str = "Its methods are: unlock with the Secure Enclave; enrolling Secure Enclave unlockers, and removing the passphrase unlocker (§5); the list of pending requests, and approval with a signature; replacing and removing an item with a signature; reveal; paste-sheet ingest, and answering the keys `envcloak add --ask` asks for (§6.3); the audit log's entries; and lock with a reason (§5 \"Lock\").";
+/// §4.3: the client's ask and reveal request.
+const CLIENT_REQUESTS: &str = "`request_new_secret` (from M3, the ask `envcloak add --ask` files for the app's paste sheet, and its state, §6.3), the reveal request `envcloak reveal` files for the app on macOS (M3, §6.7),";
+/// §5 Lock: screen lock and a session switch, through the app role.
+const LOCK_BULLET: &str = "screen lock, and a switch to another user's login session (each reported by the app through the app role, so no other program can record either in the audit log);";
+/// §6.7: the reveal statement's domain.
+const REVEAL_DOMAIN: &str = "The app shows the value after a signed reveal statement (Secure Enclave, reuse 0; domain `envcloak-reveal-statement/1`, §10b)";
+/// §6.7: who `envcloak reveal` files a request for.
+const REVEAL_FILER: &str = "On macOS, `envcloak reveal` files a request for the app only from a terminal subject: an agent, unknown or terminal-less caller gets `proof_refused`, and nothing is filed.";
+/// §10b: the statement domains.
+const DOMAINS: &str = "Each statement starts with its domain: `envcloak-statement/1` for run approvals (`envcloak-statement/2` once the live-key guard lands), `envcloak-unlocker-statement/1` for adding a Secure Enclave unlocker with the passphrase in a terminal, `envcloak-write-statement/1` for replacing or removing an item, adding another Secure Enclave unlocker and removing the passphrase unlocker in the app, and `envcloak-reveal-statement/1` for a reveal in the app (§6.7).";
+/// §10b: a signed proof from an app an agent started is refused.
+const SIGNED_PROOF_REFUSED: &str = "It refuses a signed proof from an `app` peer whose evidence names an agent (a known agent in its ancestry or agent markers in its claims, as when an agent runs the app's executable itself) or whose chain is cut at the walk's depth limit; the conditions only a terminal subject meets (a controlling terminal, an ancestry that reaches its session leader) are not asked of the app, which launchd starts.";
 
 /// The plan's mutation: §4.4's list left without the new crossings (the
-/// v0.4 bullet put back, or the daemon-to-app additions dropped) fails the
-/// wording check, and so does each new crossing removed or weakened.
+/// v0.4 bullets put back) fails the wording check, and so does each new
+/// crossing removed or weakened, among them the request metadata, the
+/// app's ephemeral key, the daemon's keys, challenges and nonces, item
+/// metadata and the paste sheet's reading (review: the bullets left them
+/// out while saying "This list is complete"). Naming an unlocker statement
+/// the app signs fails too: a terminal approves the unlocker statement.
 ///
 /// Mutation checked: the two §4.4 entries dropped from REQUIRED and the
-/// old list from FORBIDDEN: the v0.4 bullet passes, and this test fails.
+/// old list and the signed-unlocker pattern from FORBIDDEN: the v0.4
+/// bullets and the round-one bullets pass, and this test fails.
 #[test]
 fn a_44_list_without_the_new_crossings_fails() {
     let t = fixture();
     edit(&t, APP_TO_DAEMON, OLD_APP_TO_DAEMON);
+    edit(&t, DAEMON_TO_APP, OLD_DAEMON_TO_APP);
     assert_fails(&t.home(), &[], "§4.4 app to daemon (M3-01): found 0 times");
+    assert_fails(&t.home(), &[], "§4.4 daemon to app (M3-01): found 0 times");
     assert_fails(
         &t.home(),
         &[],
@@ -763,8 +798,14 @@ fn a_44_list_without_the_new_crossings_fails() {
                 " the two public keys (`unlock` and `approve`) of a new Secure Enclave unlocker;",
                 "",
             ),
-            (" write, unlocker,", ""),
+            (" write,", ""),
             (" and replacement values, each", ""),
+            (" the app's ephemeral public key for a sealed reveal;", ""),
+            (
+                "; and request metadata (request, ask and unlocker ids, an unlocker's label, the lock reason, slugs and fields, and the audit log's filters)",
+                "",
+            ),
+            (" the lock reason,", ""),
         ],
     );
     assert_each_change_fails(
@@ -779,6 +820,202 @@ fn a_44_list_without_the_new_crossings_fails() {
                 " the paste and reveal requests the CLI filed (`envcloak add --ask`, `envcloak reveal`), metadata only, with the requester's evidence;",
                 "",
             ),
+            (" daemon ephemeral public keys, challenges and nonces,", ""),
+            (
+                " (a grant's id and expiry, an enrolment's result, a new item's slug)",
+                "",
+            ),
+            (
+                ", and item metadata (slug, fields, bindings, grants, the count of prior values and the classification)",
+                "",
+            ),
+            (
+                " the paste sheet's reading of a staged value (provider, class, length class, suggested slug and variable), never the value;",
+                "",
+            ),
+            (", never the value", ""),
+        ],
+    );
+    let t = fixture();
+    edit(&t, " write, reveal,", " write, unlocker, reveal,");
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds an unlocker statement the app signs (M3-01)",
+    );
+}
+
+/// The app's calls of client methods cross as a client's, so the client
+/// bullets cover them (the app polls `status` and adds keys with
+/// `items.add` before the `app` role exists).
+///
+/// Mutation checked: the entry dropped from REQUIRED: the sentence removed
+/// passes, and this test fails.
+#[test]
+fn the_apps_client_calls_are_named_in_44() {
+    assert_each_change_fails(
+        "§4.4 the app's calls of client methods (M3-01)",
+        APP_CLIENT_CALLS,
+        &[
+            ("cross as a client's", "cross as the app's"),
+            (", under the two client bullets below", ""),
+        ],
+    );
+}
+
+/// The app's sealed reveal is named among the exceptions of the one-rule
+/// bullet, and the bullet's last clause is about client processes: the
+/// app's sealed reveal goes to a peer chosen by its code signature. The
+/// unscoped v0.4 clause is refused.
+///
+/// Mutation checked: the two entries dropped from REQUIRED and the
+/// unscoped clause from FORBIDDEN: the exception deleted (review probe P5)
+/// and the v0.4 clause put back pass, and this test fails.
+#[test]
+fn the_one_rule_exception_and_its_client_clause_are_required() {
+    assert_each_change_fails(
+        "§4.4 the app's sealed reveal, the one rule's exception (M3-01)",
+        ONE_RULE_EXCEPTION,
+        &[(" sealed after a signed reveal statement", " after a reveal")],
+    );
+    assert_each_change_fails(
+        "§4.4 no release to a client process rests on its code (M3-01)",
+        CLIENT_CLAUSE,
+        &[
+            ("for a client process ", ""),
+            (
+                " The `app` role's sealed reveal, the one release to a peer chosen by its code signature, exists on macOS alone (§4.3).",
+                "",
+            ),
+        ],
+    );
+    let t = fixture();
+    edit(&t, "and for a client process no release", "and no release");
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds a release clause that covers the app (M3-01)",
+    );
+}
+
+/// §4.3 lists the removal the app makes, the passphrase unlocker's (plan
+/// M3-14 and the `app.unlocker.remove` row), and the client's reveal
+/// request; the round-one promise to remove Secure Enclave unlockers and
+/// the v0.4 list are refused (review: deleting the removal promise passed).
+///
+/// Mutation checked: the two §4.3 entries dropped from REQUIRED and the
+/// Secure Enclave removal from FORBIDDEN: the round-one sentence passes,
+/// and this test fails.
+#[test]
+fn the_app_roles_methods_and_the_reveal_request_are_required() {
+    assert_each_change_fails(
+        "§4.3 the app role's methods (D3-08, M3-01)",
+        APP_METHODS,
+        &[
+            (
+                "removing the passphrase unlocker (§5)",
+                "removing unlockers",
+            ),
+            (" the audit log's entries;", ""),
+            (" and lock with a reason (§5 \"Lock\")", " and lock"),
+        ],
+    );
+    let t = fixture();
+    edit(
+        &t,
+        "unlock with the Secure Enclave; enrolling Secure Enclave unlockers, and removing the passphrase unlocker (§5);",
+        "unlock with the Secure Enclave, and enrolling and removing Secure Enclave unlockers;",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the removal of Secure Enclave unlockers by the app (M3-01)",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        APP_METHODS,
+        "Its methods are: unlock with the Secure Enclave, approve with a signature, policy.set, reveal, paste-sheet ingest, device.add, device.remove and registry.override.",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the old app-role list (M3-01)",
+    );
+    assert_each_change_fails(
+        "§4.3 the client's ask and reveal request (M3-01)",
+        CLIENT_REQUESTS,
+        &[(
+            " the reveal request `envcloak reveal` files for the app on macOS (M3, §6.7),",
+            "",
+        )],
+    );
+}
+
+/// §6.7's reveal domain and who `envcloak reveal` files a request for
+/// (the `reveal.request` row), each required whole.
+///
+/// Mutation checked: the two §6.7 entries dropped from REQUIRED: the
+/// sentences removed pass, and this test fails.
+#[test]
+fn the_reveal_domain_and_who_reveal_files_for_are_required() {
+    assert_each_change_fails(
+        "§6.7 the reveal statement's domain (D3-10)",
+        REVEAL_DOMAIN,
+        &[(
+            "reuse 0; domain `envcloak-reveal-statement/1`, §10b",
+            "§10b",
+        )],
+    );
+    assert_each_change_fails(
+        "§6.7 who `envcloak reveal` files a request for (M3-01)",
+        REVEAL_FILER,
+        &[
+            ("only from a terminal subject", "from any subject"),
+            (", and nothing is filed", ""),
+            ("an agent, unknown or terminal-less caller", "an agent"),
+        ],
+    );
+}
+
+/// §10b's statement domains, each with what it signs, required whole.
+///
+/// Mutation checked: the entry dropped from REQUIRED: a domain given
+/// another use passes, and this test fails.
+#[test]
+fn the_statement_domains_are_required() {
+    assert_each_change_fails(
+        "§10b the statement domains (D3-10)",
+        DOMAINS,
+        &[
+            (" with the passphrase in a terminal", ""),
+            (
+                " and removing the passphrase unlocker in the app",
+                " and removing an unlocker in the app",
+            ),
+            (
+                "`envcloak-reveal-statement/1` for a reveal in the app",
+                "`envcloak-reveal-statement/1` for a reveal",
+            ),
+        ],
+    );
+}
+
+/// A signed proof from an app peer whose evidence names an agent is
+/// refused (review: §10b covered only passphrase and Recovery Kit proofs,
+/// so §6.7's "refused anyway" did not hold for the app's reveal).
+///
+/// Mutation checked: the entry dropped from REQUIRED: the sentence
+/// removed passes, and this test fails.
+#[test]
+fn a_signed_proof_from_an_app_an_agent_started_is_refused() {
+    assert_each_change_fails(
+        "§10b a signed proof refused from an app an agent started (M3-01)",
+        SIGNED_PROOF_REFUSED,
+        &[
+            (" or agent markers in its claims", ""),
+            (" or whose chain is cut at the walk's depth limit", ""),
+            ("It refuses a signed proof", "It may refuse a signed proof"),
         ],
     );
 }
@@ -900,26 +1137,29 @@ fn the_signed_proof_and_the_first_unlocker_are_required() {
     );
 }
 
-/// §5's screen lock is reported through the app role (D3-11); the v0.4
-/// bullet is refused. And a decision whose edit is gone fails (D3-10).
+/// §5's screen lock and session switch are reported through the app role
+/// (D3-11); the v0.4 bullet is refused, and dropping the session switch
+/// (the reserved `lock.reason=session_resign`) fails. And a decision whose
+/// edit is gone fails (D3-10).
 ///
-/// Mutation checked: the old screen-lock bullet dropped from FORBIDDEN and
-/// D3-11's phrase changed to the old bullet's: the first case passes, and
-/// this test fails.
+/// Mutation checked: the old screen-lock bullet dropped from FORBIDDEN,
+/// D3-11's phrase changed to the old bullet's and the §5 entry dropped
+/// from REQUIRED: the first case passes, and this test fails.
 #[test]
 fn the_old_screen_lock_bullet_and_a_lost_m3_edit_fail() {
     let t = fixture();
-    edit(
-        &t,
-        "screen lock (reported by the app through the app role, so no other program can record a screen lock in the audit log);",
-        "screen lock (reported by the app);",
-    );
+    edit(&t, LOCK_BULLET, "screen lock (reported by the app);");
     assert_fails(
         &t.home(),
         &[],
         "the SPEC still holds the screen lock any program could report (D3-11)",
     );
     assert_fails(&t.home(), &[], "D3-11: the SPEC lacks");
+    assert_each_change_fails(
+        "§5 screen lock and a session switch through the app role (D3-11)",
+        LOCK_BULLET,
+        &[(", and a switch to another user's login session", "")],
+    );
     let t = fixture();
     let text = spec(&t).replace("`envcloak-write-statement/1`", "`envcloak-write/1`");
     std::fs::write(t.home().join(SPEC), text).unwrap();
