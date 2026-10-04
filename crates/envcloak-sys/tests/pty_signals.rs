@@ -60,6 +60,15 @@ const SIGNALS: [(i32, &str); 4] = [
 
 const PROMPT: &str = "EC-PROMPT> ";
 
+/// Typed into a nested shell before anything else: bash (macOS's `/bin/sh`
+/// is bash 3.2) turns its line editing off, so readline's signal handlers
+/// are out of the way. With them, the shell itself crashed (SIGSEGV, a
+/// stack overflow in nested signal handlers, seen in its crash reports)
+/// when a trapped SIGQUIT and SIGTERM came in quick succession under load;
+/// the monitor reported the crash as the command's exit. dash (Linux's
+/// `/bin/sh`) has no `BASH_VERSION` and skips it.
+const NO_EDITING: &str = "case ${BASH_VERSION-} in ?*) set +o emacs +o vi;; esac; ";
+
 fn main() {
     own_allocations();
     match my_role().as_deref() {
@@ -175,7 +184,7 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
         .iter()
         .map(|(_, name)| format!("trap 'echo x >> {}/shell-{name}' {name}; ", d.display()))
         .collect();
-    screen.type_bytes(format!("{traps}set -m\n").as_bytes());
+    screen.type_bytes(format!("{traps}{NO_EDITING}set -m\n").as_bytes());
     screen.expect(PROMPT, 2, "the shell set its traps");
     let exe = std::env::current_exe().unwrap();
     screen.type_bytes(
@@ -315,17 +324,30 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
         let file = d.join(format!("shell-{name}"));
         let end = std::time::Instant::now() + DEADLINE;
         while lines(&file) == 0 {
-            assert!(
-                std::time::Instant::now() < end,
-                "the shell did not count SIG{name} sent to its group; shell {:?}, job {:?}; \
-                 the terminal showed:\n{}",
-                counts(d, "shell"),
-                counts(d, "job"),
-                screen.text()
-            );
+            if std::time::Instant::now() >= end {
+                let mut fg: libc::pid_t = 0;
+                // SAFETY: TIOCGPGRP writes one pid_t; read for the message.
+                unsafe { libc::ioctl(screen.master().as_raw_fd(), libc::TIOCGPGRP as _, &mut fg) };
+                panic!(
+                    "the shell did not count SIG{name} sent to its group; shell {:?}, job {:?}; \
+                     foreground {fg} (monitor {}, shell {}); the monitor's next report: {:?}; \
+                     the terminal showed:\n{}",
+                    counts(d, "shell"),
+                    counts(d, "job"),
+                    monitor.monitor_id(),
+                    monitor.command_id(),
+                    monitor.next_event(Some(std::time::Duration::ZERO)),
+                    screen.text()
+                );
+            }
+            // A signal arriving while the shell edits the line can drop
+            // the typed command, so the prompt is waited for briefly and
+            // not required: the counter is what is asserted.
             let prompts = screen.count(PROMPT);
             screen.type_bytes(b":\n");
-            screen.expect(PROMPT, prompts + 1, "the shell ran a command");
+            screen.wait_for_within(std::time::Duration::from_secs(1), |s| {
+                s.count(PROMPT) > prompts
+            });
         }
     }
     screen.type_bytes(b"exit\n");
@@ -591,10 +613,12 @@ fn signals_to_a_stopped_command_wait_for_it_and_the_monitor_passes_them_on() {
     screen.expect("JOB-READY", 1, "the command started");
     let stop = |screen: &mut Screen, monitor: &mut envcloak_sys::pty::SessionMonitor| {
         screen.type_bytes(&[suspend]);
+        let ev = screen.next_event(monitor);
         assert_eq!(
-            screen.next_event(monitor),
+            ev,
             Some(MonitorEvent::Stopped(libc::SIGTSTP)),
-            "the suspend character did not stop the command"
+            "the suspend character did not stop the command: {}",
+            screen.text()
         );
     };
     let resume = |screen: &mut Screen, monitor: &mut envcloak_sys::pty::SessionMonitor| {
@@ -733,7 +757,7 @@ fn a_job_whose_group_leader_is_gone_is_narrowed_on_linux() {
         .iter()
         .map(|(_, name)| format!("trap 'echo x >> {}/shell-{name}' {name}; ", d.display()))
         .collect();
-    screen.type_bytes(format!("{traps}set -m\n").as_bytes());
+    screen.type_bytes(format!("{traps}{NO_EDITING}set -m\n").as_bytes());
     screen.expect(PROMPT, 2, "the shell set its traps");
     let exe = std::env::current_exe().unwrap();
     screen.type_bytes(
@@ -812,9 +836,14 @@ fn a_job_whose_group_leader_is_gone_is_narrowed_on_linux() {
                 "the shell did not count the narrowed signals: {:?}",
                 counts(d, "shell")
             );
+            // A signal arriving while the shell edits the line can drop
+            // the typed command, so the prompt is waited for briefly and
+            // not required: the counter is what is asserted.
             let prompts = screen.count(PROMPT);
             screen.type_bytes(b":\n");
-            screen.expect(PROMPT, prompts + 1, "the shell ran a command");
+            screen.wait_for_within(std::time::Duration::from_secs(1), |s| {
+                s.count(PROMPT) > prompts
+            });
         }
     }
     let (job_counts, shell_counts) = (counts(d, "job"), counts(d, "shell"));
