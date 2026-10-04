@@ -65,7 +65,7 @@ use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
 };
 use envcloak_ipc::{Frame, FrameError, RpcError, RunPathErrorKind, RunPaths};
-use envcloak_policy::{AgentCatalog, Claims, gather_hashed};
+use envcloak_policy::AgentCatalog;
 use envcloak_providers::Registry;
 use envcloak_sys::{PeerIdentity, TerminationSignals};
 
@@ -200,6 +200,28 @@ impl Shared {
     /// that hold it use [`State::audit`].
     pub(crate) fn audit(&self, e: AuditEvent) {
         locked(&self.state).audit(e);
+    }
+
+    /// What the daemon shares, as `run_daemon` makes it (the builtin
+    /// catalog, the production hash cache, no registry), with its vault
+    /// at `paths`, for tests of what requests read through it (on Linux,
+    /// where executables are hashed).
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn for_tests(paths: VaultPaths) -> Shared {
+        let clocks = SystemClocks;
+        let state = State::open(paths, crate::lock::DEFAULT_IDLE, Reading::now(&clocks));
+        Shared {
+            state: Mutex::new(state),
+            proof_gate: Mutex::new(()),
+            clocks,
+            places: Mutex::new(Places::default()),
+            runtime_dir_fallback: false,
+            catalog: AgentCatalog::builtin(),
+            exe_hashes: crate::exe_hash::ExeHashCache::new(),
+            registry: None,
+            value_checks: Mutex::new(crate::import::ValueChecks::default()),
+            deliveries: backups::Deliveries::default(),
+        }
     }
 }
 
@@ -906,11 +928,7 @@ pub(crate) fn refuse_if_traced() -> Result<(), RpcError> {
 fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<UnlockedView, RpcError> {
     let pass = p.passphrase.into_inner();
     refuse_if_traced()?;
-    let claims =
-        Claims::from_markers(&p.claims).map_err(|_| RpcError::new(ErrorKind::InvalidParams))?;
-    let mut hasher = crate::exe_hash::RequestHasher::new(&shared.exe_hashes);
-    let evidence = gather_hashed(peer, claims, &shared.catalog, &mut hasher)
-        .map_err(|e| RpcError::with_reason(ErrorKind::Evidence, e.token()))?;
+    let evidence = requests::evidence(shared, peer, &p.claims)?;
     requests::refuse_unless_prover(shared, peer, &evidence, "unlock")?;
     let _gate = locked(&shared.proof_gate);
     let begin = {

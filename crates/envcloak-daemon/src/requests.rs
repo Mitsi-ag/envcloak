@@ -165,8 +165,9 @@ fn refuse_requester_terminal(
 }
 
 /// Reads the caller's evidence, its ancestors' executables hashed on
-/// Linux (`crate::exe_hash`). Called before the state lock is taken, so
-/// hashing never holds it.
+/// Linux (`crate::exe_hash`): the one place a request's evidence is read,
+/// `unlock`'s included. Called before the state lock is taken, so hashing
+/// never holds it.
 pub(crate) fn evidence(
     shared: &Shared,
     peer: &PeerIdentity,

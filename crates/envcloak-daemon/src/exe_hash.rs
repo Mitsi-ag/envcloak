@@ -908,6 +908,43 @@ mod linux_tests {
         }
     }
 
+    /// Codex review (medium): the digests reach a request's evidence on
+    /// the daemon's own path, `requests::evidence` (which `unlock` reads
+    /// its evidence through too), with the production cache and settle
+    /// time: a caller running a system program, settled long ago, has
+    /// that program's SHA-256 as the system's tool computes it; a copy
+    /// written just now has none while it is not settled. Mutation checked
+    /// (CI, Linux): reading the evidence there without the hasher
+    /// (`gather`) fails this test.
+    #[test]
+    fn a_requests_evidence_carries_each_readable_executables_digest() {
+        let d = dir();
+        let shared = crate::server::Shared::for_tests(envcloak_core::vault::VaultPaths::under(
+            d.path().join("data"),
+        ));
+        let sleep = std::fs::canonicalize(sleep_bin()).unwrap();
+        let a = Running::start(&sleep);
+        let e = crate::requests::evidence(&shared, &a.peer(), &[]).unwrap();
+        assert_eq!(
+            e.chain()[0].instance.exe.as_ref().unwrap().sha256,
+            Some(oracle(&sleep)),
+            "{e:?}"
+        );
+        let p = d.path().join("agent");
+        install(&p, b"");
+        let written = FileKey::of(&File::open(&p).unwrap()).unwrap();
+        let b = Running::start(&p);
+        let e = crate::requests::evidence(&shared, &b.peer(), &[]).unwrap();
+        let answered = SystemTime::now();
+        let digest = e.chain()[0].instance.exe.as_ref().unwrap().sha256;
+        if settled(&written, answered, SETTLE) {
+            eprintln!("the copy settled before the request ended (a loaded machine)");
+            assert_eq!(digest, Some(oracle(&p)));
+        } else {
+            assert_eq!(digest, None, "not settled when the request ended");
+        }
+    }
+
     /// The walk records each hashed ancestor's digest; with the budget
     /// spent, none, and the classification (root, kind, labels, proof
     /// refusal, coverage) is the same either way, and the same as without
