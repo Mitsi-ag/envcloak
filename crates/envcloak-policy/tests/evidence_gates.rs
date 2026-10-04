@@ -10,6 +10,9 @@
 //!   refused. Only an agent's executable roots a grant above the caller's
 //!   session: a process that calls itself an agent by `argv[0]`, script
 //!   or command name is an agent subject, rooted in the caller's session.
+//!   kimi-cli's shape, a Python script that titles itself `Kimi Code` as
+//!   setproctitle does, is Kimi before and after its title, on each
+//!   system.
 //! - Gate 26, ancestry escape: a process under the fixture agent escapes by
 //!   double fork, `setsid`, `nohup` with `disown`, `launchctl submit`
 //!   (macOS) or `systemd-run --user` (Linux). Before the escape the same
@@ -633,6 +636,123 @@ fn gate23_a_command_an_agent_starts_on_a_pty_of_its_own_is_an_agent() {
             assert_eq!(control.proof_refusal(), None);
         }
         Some(_) => eprintln!("an agent runs this test: the control is inside its tree"),
+    }
+    s.finish();
+}
+
+/// A Python program in the shape of kimi-cli's launcher (`kimi`, a script
+/// whose shebang names the Python it runs under): it runs `ec-probe` under
+/// `env -i` as its shell tool runs a command, then titles itself as
+/// setproctitle does (kimi-cli's src/kimi_cli/utils/proctitle.py: the
+/// title written over its arguments, and on Linux its command name set
+/// with `prctl(PR_SET_NAME)`), and runs the probe again. An empty title
+/// skips the second run.
+const TITLED: &str = r#"
+import ctypes, subprocess, sys
+probe, sock, title = sys.argv[1], sys.argv[2], sys.argv[3]
+subprocess.run(["/usr/bin/env", "-i", probe, sock], check=True)
+if not title:
+    sys.exit(0)
+t = title.encode()
+if sys.platform == "darwin":
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    libc._NSGetArgv.restype = ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+    libc._NSGetArgc.restype = ctypes.POINTER(ctypes.c_int)
+    libc.strlen.restype = ctypes.c_size_t
+    libc.strlen.argtypes = [ctypes.c_void_p]
+    argv = libc._NSGetArgv().contents
+    argc = libc._NSGetArgc().contents.value
+    start = argv[0]
+    end = argv[argc - 1] + libc.strlen(argv[argc - 1]) + 1
+else:
+    libc = ctypes.CDLL(None)
+    libc.prctl(15, ctypes.c_char_p(t[:15]), 0, 0, 0)
+    stat = open("/proc/self/stat", "rb").read()
+    f = stat[stat.rindex(b")") + 2:].split()
+    start, end = int(f[45]), int(f[46])
+n = end - start
+ctypes.memmove(start, t + b"\0" * (n - len(t)), n)
+subprocess.run(["/usr/bin/env", "-i", probe, sock], check=True)
+"#;
+
+/// kimi-cli (task M2-10: Kimi, Kimi Code and kimi-cli by one entry) is a
+/// Python program: its `kimi` and `kimi-cli` scripts run under Python,
+/// which the catalog knows as an interpreter, and once it titles itself
+/// `Kimi Code` its arguments and (on Linux) its command name say so.
+/// Real processes on each system, the program's own commands as the
+/// callers: before the title (by its script, and on Linux by the command
+/// name the script gives it) and after it (by its title), Python is Kimi,
+/// asserted, so its commands are agent subjects whose proofs are refused
+/// and whose grants are rooted no higher than their session. The controls,
+/// the same program as `tool` and titled `Kimi Coder`, are not Kimi.
+/// Mutation checked: removing the Python interpreters fails the macOS
+/// cases and the scripts, and removing `Kimi Code` from the names fails the
+/// titled ones.
+#[test]
+fn kimi_cli_under_python_is_kimi_before_and_after_its_title() {
+    let l = Listener::new();
+    let bin = l.home.home().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let py = python3();
+    let body = format!("#!{}\n{TITLED}", py.display());
+    let script = |name: &str| {
+        let path = bin.join(name);
+        std::fs::write(&path, &body).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        path
+    };
+    let kimi_at_1 = |e: &SubjectEvidence, what: &str| {
+        let a = &e.chain()[1];
+        let label = a.agent.as_ref().unwrap_or_else(|| panic!("{what}: {e:?}"));
+        println!(
+            "measurement: catalog kimi-cli shape os={}: {what}: {} ({:?}), executable {:?}",
+            std::env::consts::OS,
+            label.id,
+            label.basis,
+            file_name(&a.instance)
+        );
+        assert_eq!(
+            (label.id.as_str(), label.basis),
+            ("kimi", MatchBasis::Asserted),
+            "{what}"
+        );
+        assert!(!label.may_root_above_session());
+        assert_eq!(e.kind(), SubjectKind::Agent, "{what}");
+        assert_eq!(e.proof_refusal(), Some(ProofRefusal::Agent), "{what}");
+        assert!(e.root_index() <= 2, "{what}: rooted in its session: {e:?}");
+    };
+    for name in ["kimi", "kimi-cli"] {
+        let path = script(name);
+        let (p, sock) = (probe(), l.sock.clone());
+        let args: Vec<&std::ffi::OsStr> = vec![
+            "--session".as_ref(),
+            "--".as_ref(),
+            path.as_os_str(),
+            p.as_os_str(),
+            sock.as_os_str(),
+            "Kimi Code".as_ref(),
+        ];
+        let s = Scenario::start(&l.home, &p, &args);
+        kimi_at_1(&l.next(), &format!("{name}, before its title"));
+        kimi_at_1(&l.next(), &format!("{name}, titled Kimi Code"));
+        s.finish();
+    }
+    // The controls: another name, another title.
+    let path = script("tool");
+    let (p, sock) = (probe(), l.sock.clone());
+    let args: Vec<&std::ffi::OsStr> = vec![
+        "--session".as_ref(),
+        "--".as_ref(),
+        path.as_os_str(),
+        p.as_os_str(),
+        sock.as_os_str(),
+        "Kimi Coder".as_ref(),
+    ];
+    let s = Scenario::start(&l.home, &p, &args);
+    for what in ["tool", "tool titled Kimi Coder"] {
+        let e = l.next();
+        assert!(e.chain()[1].agent.is_none(), "{what}: {e:?}");
     }
     s.finish();
 }
