@@ -13,6 +13,28 @@ use base64::Engine as _;
 use envcloak_redact::{Redactor, RedactorBuilder};
 use envcloak_testkit::fresh_seed;
 
+/// `assert_eq!` without the two sides in the message: they may hold a
+/// fixture value, and failures name a canary by its label or seed only
+/// (as `envcloak_testkit::Canary`'s `Debug` does), never by its bytes.
+macro_rules! assert_same {
+    ($a:expr, $b:expr $(,)?) => {
+        assert!($a == $b, "the two sides differ (not printed: they may hold a value)")
+    };
+    ($a:expr, $b:expr, $($msg:tt)+) => {
+        assert!($a == $b, $($msg)+)
+    };
+}
+
+/// `assert_ne!` without the two sides in the message (as [`assert_same`]).
+macro_rules! assert_differ {
+    ($a:expr, $b:expr $(,)?) => {
+        assert!(
+            $a != $b,
+            "the two sides are equal (not printed: they may hold a value)"
+        )
+    };
+}
+
 const LABEL: &str = "tls/key";
 const MARKER: &str = "[envcloak:tls/key]";
 
@@ -79,23 +101,23 @@ fn a_pem_block_in_its_cr_lf_form_is_redacted_whole() {
     let seed = fresh_seed();
     let value = pem(seed);
     let shown = as_a_terminal_writes_it(&value);
-    assert_ne!(shown, value);
+    assert_differ!(shown, value);
     let r = redactor(&value, true);
     let mut output = b"key follows\r\n".to_vec();
     output.extend_from_slice(&shown);
     output.extend_from_slice(b"done\r\n");
     let expected = format!("key follows\r\n{MARKER}done\r\n").into_bytes();
-    assert_eq!(r.redact(&output), expected, "seed {seed}");
+    assert_same!(r.redact(&output), expected, "seed {seed}");
     // Split at every byte: a value arriving in two reads is still caught.
     for split in 0..=output.len() {
-        assert_eq!(
+        assert_same!(
             streamed(&r, &output, split),
             expected,
             "seed {seed}, split {split}"
         );
     }
     // The raw form stays covered.
-    assert_eq!(r.redact(&value), MARKER.as_bytes(), "seed {seed}");
+    assert_same!(r.redact(&value), MARKER.as_bytes(), "seed {seed}");
     // A body line on its own is no match, and nothing of the block remains
     // after redaction.
     let body_line = value.split(|b| *b == b'\n').nth(1).unwrap();
@@ -110,8 +132,8 @@ fn without_the_variant_the_cr_lf_form_passes_through() {
     let value = pem(seed);
     let shown = as_a_terminal_writes_it(&value);
     let r = redactor(&value, false);
-    assert_eq!(r.redact(&value), MARKER.as_bytes(), "seed {seed}");
-    assert_eq!(r.redact(&shown), shown, "seed {seed}");
+    assert_same!(r.redact(&value), MARKER.as_bytes(), "seed {seed}");
+    assert_same!(r.redact(&shown), shown, "seed {seed}");
 }
 
 /// A CR already before an LF gets another, as `ONLCR` gives it; a value
@@ -125,8 +147,8 @@ fn every_lf_gets_its_cr_and_a_value_without_lf_has_no_other_form() {
     let shown = as_a_terminal_writes_it(&value);
     assert!(holds(&shown, b"\r\r\n"));
     let r = redactor(&value, true);
-    assert_eq!(r.redact(&shown), MARKER.as_bytes(), "seed {seed}");
+    assert_same!(r.redact(&shown), MARKER.as_bytes(), "seed {seed}");
     let flat: Vec<u8> = value.iter().copied().filter(|b| *b != b'\n').collect();
     let r = redactor(&flat, true);
-    assert_eq!(r.redact(&flat), MARKER.as_bytes());
+    assert_same!(r.redact(&flat), MARKER.as_bytes());
 }

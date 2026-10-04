@@ -677,15 +677,37 @@ fn reaps_on_its_own() -> bool {
     probe.wait().is_err()
 }
 
-/// The CLI stand-in started with its children reaped on their own (as
-/// `ENVCLOAK_PTY_SCENARIO` says: SIGCHLD ignored, or `SA_NOCLDWAIT`):
-/// reports its setup and whether the kernel does reap on its own, runs a
-/// command that exits 7 under the monitor, and reports what `finish`
-/// returned (the monitor's own status, which needs the monitor unreaped
-/// until then) and the setup after.
+/// The three ways a process can come to have its children reaped by the
+/// kernel on their own, and the setup each reads back as (ignored,
+/// `SA_NOCLDWAIT` set): `SA_NOCLDWAIT` set in the process; SIGCHLD ignored
+/// by whatever started it, inherited across `exec`; and SIGCHLD ignored by
+/// the process itself, which macOS reads back with `SA_NOCLDWAIT` set too
+/// (XNU marks the process so when `sigaction` ignores SIGCHLD).
+const REAPING: [(&str, &str); 3] = [
+    ("no-wait", "(false, true)"),
+    ("ignored-inherited", "(true, false)"),
+    (
+        "ignored-here",
+        if cfg!(target_os = "macos") {
+            "(true, true)"
+        } else {
+            "(true, false)"
+        },
+    ),
+];
+
+/// The CLI stand-in started with its children reaped on their own as
+/// `ENVCLOAK_PTY_SCENARIO` says ([`REAPING`]): reports its setup and
+/// whether the kernel does reap on its own, runs a command that exits 7
+/// under the monitor, and reports what `finish` returned (the monitor's
+/// own status, which needs the monitor unreaped until then) and the setup
+/// after.
 fn sigchld_ignored() {
-    if std::env::var(SCENARIO).as_deref() == Ok("NoWait") {
-        envcloak_sys::testing::set_sigchld(envcloak_sys::testing::ChildReaping::NoWait).unwrap();
+    use envcloak_sys::testing::{ChildReaping, set_sigchld};
+    match std::env::var(SCENARIO).as_deref() {
+        Ok("no-wait") => set_sigchld(ChildReaping::NoWait).unwrap(),
+        Ok("ignored-here") => set_sigchld(ChildReaping::Ignored).unwrap(),
+        _ => {}
     }
     let out = std::io::stdout();
     let said = |s: String| put(out.as_fd(), s.as_bytes());
@@ -726,47 +748,45 @@ fn sigchld_ignored() {
     drop(pty.master);
 }
 
-/// A CLI started with SIGCHLD ignored or with `SA_NOCLDWAIT` (inherited
-/// across `exec`) would have its monitor reaped by the kernel the moment it
-/// exits (Linux, for both; macOS for what it reaps on its own, measured and
-/// printed), its pid, the session's id and the handle's signal target,
-/// free for reuse while the handle still holds it. `spawn_session` gives
-/// SIGCHLD its default back, without `SA_NOCLDWAIT`, before the fork, so
-/// the monitor stays unreaped until `finish` reaps it, which returns its
-/// status. Skip that and the setup is still there after (both systems) and
-/// `finish` fails with `ECHILD` where the kernel reaped on its own.
+/// A CLI that has its children reaped by the kernel on their own (each of
+/// [`REAPING`]) would have its monitor reaped the moment it exits where
+/// the kernel does so (Linux for all three; on macOS 26.4.1 for
+/// `SA_NOCLDWAIT` and for SIGCHLD ignored in the process, not for one
+/// inherited across `exec`, measured and printed), its pid, the session's
+/// id and the handle's signal target, free for reuse while the handle
+/// still holds it. `spawn_session` gives SIGCHLD its default back, without
+/// `SA_NOCLDWAIT`, before the fork, so the monitor stays unreaped until
+/// `finish` reaps it, which returns its status. Skip that and the setup is
+/// still there after (both systems) and `finish` fails with `ECHILD` where
+/// the kernel reaped on its own.
 fn a_cli_that_inherited_sigchld_ignored_still_owns_its_monitor() {
-    use envcloak_sys::testing::ChildReaping;
-    for (how, setup) in [
-        (ChildReaping::NoWait, "(false, true)"),
-        (ChildReaping::Ignored, "(true, false)"),
-    ] {
+    for (how, setup) in REAPING {
         let mut cmd = role("sigchld-ignored");
-        cmd.env(SCENARIO, format!("{how:?}"))
+        cmd.env(SCENARIO, how)
             .stdin(Stdio::null())
             .stderr(Stdio::inherit());
-        if how == ChildReaping::Ignored {
+        if how == "ignored-inherited" {
             envcloak_sys::testing::sigchld_ignored_on_spawn(&mut cmd);
         }
         let out = cmd.output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success(), "{how:?}: {:?}\n{text}", out.status);
+        assert!(out.status.success(), "{how}: {:?}\n{text}", out.status);
         assert!(
             text.contains(&format!("SETUP-AT-START {setup}")),
-            "{how:?}: the stand-in did not start so (the setup failed):\n{text}"
+            "{how}: the stand-in did not start so (the setup failed):\n{text}"
         );
-        assert!(text.contains("EXITED Some(7)"), "{how:?}: {text}");
+        assert!(text.contains("EXITED Some(7)"), "{how}: {text}");
         assert!(
             text.contains("FINISH ok Some(0)"),
-            "{how:?}: the monitor was not this process's to reap:\n{text}"
+            "{how}: the monitor was not this process's to reap:\n{text}"
         );
         assert!(
             text.contains("SETUP-AFTER (false, false)") && text.contains("REAPS-AFTER false"),
-            "{how:?}: {text}"
+            "{how}: {text}"
         );
         let reaped = text.contains("REAPS-AT-START true");
         println!(
-            "pty ({}): SIGCHLD {how:?}: the kernel reaps children on its own: {reaped}; \
+            "pty ({}): SIGCHLD {how}: the kernel reaps children on its own: {reaped}; \
              the monitor stayed this process's to reap",
             std::env::consts::OS
         );

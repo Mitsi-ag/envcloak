@@ -69,14 +69,18 @@ pub fn force_descriptor_fallback() {
     DESCRIPTOR_FALLBACK.store(true, Ordering::Relaxed);
 }
 
-/// How a test makes a child start with its children reaped by the kernel
-/// on their own, as a parent may leave it (both survive `exec`).
+/// How a test makes a process have its children reaped by the kernel on
+/// their own, as a parent or a library may leave it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildReaping {
-    /// SIGCHLD ignored (`SIG_IGN`): Linux reaps on its own; macOS does not
-    /// (measured).
+    /// SIGCHLD ignored (`SIG_IGN`). Linux reaps on its own, set in the
+    /// process or inherited across `exec`. macOS 26.4.1 (measured): when
+    /// the process sets it itself, the kernel reaps on its own and
+    /// `sigaction` reads back `SA_NOCLDWAIT` set as well; when it was
+    /// inherited across `exec`, the kernel does not reap on its own.
     Ignored,
-    /// The default action with `SA_NOCLDWAIT`.
+    /// The default action with `SA_NOCLDWAIT`, set in the process (it does
+    /// not survive `exec`).
     NoWait,
 }
 
