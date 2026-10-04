@@ -962,7 +962,7 @@ fn an_extension_agent_above_the_session_does_not_widen_the_root() {
     assert!(!e.covered_by(&chain[4].instance, SubjectKind::Agent));
 
     // Within the session, an extension agent is the root as a builtin one.
-    let e = ev(terminal_chain(extension("aider")), true, &[]);
+    let e = ev(terminal_chain(extension("pairbot")), true, &[]);
     assert_eq!(e.root().pid, 80);
     assert!(e.covered_by(&e.root(), SubjectKind::Agent));
 }
