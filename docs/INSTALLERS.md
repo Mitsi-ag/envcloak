@@ -97,7 +97,8 @@ For each file the state names for the hosts and scopes given:
 - still byte for byte what EnvCloak last left (its SHA-256): each change's inserted text is taken out in reverse, which gives back the file as it was before the first install, byte for byte, its SHA-256 checked; a file EnvCloak created is removed;
 - changed since (the host rewrote it, the person edited it), or changed by EnvCloak in a way it undoes by structure: only EnvCloak's edits are taken out, by structure (the block; the array elements equal to the ones added, and the objects and arrays the install created once they are empty; the TOML keys still holding what EnvCloak wrote, set back to what they held before or removed); a file EnvCloak created that holds nothing else is removed;
 - a file that is EnvCloak's whole (Codex's rules) is removed only while it is exactly what EnvCloak wrote; changed since, it is left and reported (`modified`), and install does not replace it either;
-- the directories install made for the files it created (`~/.codex/rules`, a `~/.codex` that was not there) are removed once empty, innermost first; one that holds a file of the person's by then stays theirs.
+- the directories install made for the files it created (`~/.codex/rules`, a `~/.codex` that was not there) are removed once empty, innermost first; one that holds a file of the person's by then stays theirs;
+- a project's file (`--project`) is taken out only once no host its block was installed for is left: EnvCloak's record of it keeps those hosts, so `agents uninstall --project --agent codex` leaves a block Claude Code was installed to read (a lone `AGENTS.md` both read, or a file installed for both), says so (`keep EnvCloak's block, which it was installed for Claude Code to read too`, and in the dry run's JSON `kept_for`), and takes it out with Claude Code's uninstall (Codex review, round 7: every block of the project was taken out). A record from before the hosts were kept counts every host. The project's directories EnvCloak made go with the last of its files there.
 
 The same D-16 rule, backup and atomic replacement apply, to `.claude.json` as to every file: its `mcpServers.envcloak` is taken out of each `.claude.json` EnvCloak wrote it in, while it holds what EnvCloak wrote, and the `mcpServers` object install made goes once empty. A file whose last write was EnvCloak's own keeps that stamp known when uninstall finds nothing of EnvCloak's left in it, so an install right after is not held to the 2 minutes.
 
@@ -143,6 +144,61 @@ Each row is a way past the hook, with the commands of the bypass corpus (`crates
 
 The prompt check misses: a key made of words and separators that no provider pattern names (an AWS secret access key on its own), a key of exactly 40 or 64 hexadecimal digits, a URL whose password holds a character a URL must escape (a `/`, a space, a quote) written unescaped, and a key encoded or broken up by other text. Hooks see only what the host passes them: Codex's `write_stdin` into a running session does not rerun `PreToolUse`, hosted tools are not covered, and `@` mentions never reach Claude Code's `PreToolUse` (the `Read(**/.env*)` deny rule covers them, best effort).
 
+## Where the catalog looks
+
+`envcloak_agents::locations` is the only place host paths are named: the MCP configurations and credential stores `migrate-mcp` and doctor read (Map C §3 item 8, SPEC §6.6) and the stores a pasted or printed value can reach (Map C §2 and §4, D-15, and what the pinned versions were seen to write), emitted as `envcloak_scan::source::ConfigSource`. Each host's documented variable moves its paths: `CLAUDE_CONFIG_DIR` (Claude Code's directory and `.claude.json`), `CLAUDE_CODE_TMPDIR` (its temporary files, `/tmp` otherwise), `CODEX_HOME`, `CODEX_SQLITE_HOME` (and `sqlite_home` and `log_dir` in Codex's `config.toml`), `TMPDIR` (Codex's hook outputs), `COPILOT_HOME`, `KIMI_SHARE_DIR`, `KIMI_CODE_HOME`, `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. The table lists every store at its default place; `crates/envcloak-agents/tests/catalog_graph.rs` reads it and checks it against the catalog both ways (each row has a source, each source a row; Codex review, round 7: the catalog left out `mcp-secrets/`, `auth.json` and `tasks/`, and its test checked a list of its own). A path ending in `/` is a directory read whole; `<project>` is the project's directory.
+
+<!-- catalog -->
+| Host | Store | Kind |
+|---|---|---|
+| Claude Code | `~/.claude.json` | MCP configuration |
+| Claude Code | `~/.claude/settings.json` | MCP configuration (settings) |
+| Claude Code | `~/.claude/backups/` | its copies of `.claude.json` |
+| Claude Code | `~/.claude.json.backup.<time>` | its copies of `.claude.json`, beside it |
+| Claude Code | `<project>/.mcp.json` | project MCP configuration (Copilot CLI's too) |
+| Claude Code | `~/.claude/projects/<project-name>/<session>.jsonl` | transcript |
+| Claude Code | `~/.claude/projects/<project-name>/<session>/tool-results/<id>.txt` | long tool results |
+| Claude Code | `~/.claude/projects/<project-name>/<session>/subagents/<id>.jsonl` | subagent transcripts |
+| Claude Code | `~/.claude/history.jsonl` | prompt history |
+| Claude Code | `~/.claude/paste-cache/` | pasted text |
+| Claude Code | `~/.claude/file-history/` | snapshots of edited files |
+| Claude Code | `~/.claude/plans/` | plans |
+| Claude Code | `~/.claude/sessions/` | sessions |
+| Claude Code | `~/.claude/session-env/` | session environments |
+| Claude Code | `~/.claude/shell-snapshots/` | shell snapshots |
+| Claude Code | `~/.claude/todos/` | to-do lists |
+| Claude Code | `~/.claude/tasks/` | task lists |
+| Claude Code | `~/.claude/debug/` | debug logs |
+| Claude Code | `~/.claude/telemetry/` | telemetry |
+| Claude Code | `$CLAUDE_CODE_TMPDIR/claude-<uid>/` | a command's output so far, images, the scratchpad |
+| Claude Code | `$CLAUDE_CODE_TMPDIR/claude-<hex>-cwd` | a command's working directory |
+| Codex | `~/.codex/config.toml` | MCP configuration |
+| Codex | `<project>/.codex/config.toml` | project MCP configuration |
+| Codex | `~/.codex/sessions/` | transcripts |
+| Codex | `~/.codex/archived_sessions/` | archived transcripts |
+| Codex | `~/.codex/history.jsonl` | prompt history |
+| Codex | `~/.codex/log/` | logs |
+| Codex | `~/.codex/shell_snapshots/` | shell snapshots |
+| Codex | `~/.codex/memories/` | memories |
+| Codex | `~/.codex/state_5.sqlite` | SQLite state (not scanned) |
+| Codex | `$TMPDIR/hook_outputs/` | hook outputs |
+| Cursor | `~/.cursor/mcp.json` | MCP configuration |
+| Cursor | `<project>/.cursor/mcp.json` | project MCP configuration |
+| Gemini CLI | `~/.gemini/settings.json` | MCP configuration (settings) |
+| Gemini CLI | `<project>/.gemini/settings.json` | project MCP configuration |
+| Copilot CLI | `~/.copilot/mcp-config.json` | MCP configuration |
+| Copilot CLI | `~/.copilot/mcp-secrets/` | its MCP servers' secrets (reported, not migrated) |
+| Copilot CLI | `<project>/.github/mcp.json` | project MCP configuration |
+| VS Code | `<project>/.vscode/mcp.json` | project MCP configuration |
+| Kimi CLI | `~/.kimi/mcp.json` | MCP configuration |
+| Kimi Code | `~/.kimi-code/mcp.json` | MCP configuration |
+| Qwen Code | `~/.qwen/settings.json` | MCP configuration (settings) |
+| OpenCode | `~/.config/opencode/opencode.json` | MCP configuration |
+| OpenCode | `<project>/opencode.json` | project MCP configuration |
+| OpenCode | `~/.local/share/opencode/auth.json` | its provider credentials (reported, not migrated) |
+| Goose | `~/.config/goose/config.yaml` | MCP configuration (YAML, reported) |
+<!-- /catalog -->
+
 ## Claude Code plugin
 
 `integrations/claude-code/` is the same integration as a plugin for people who install through a marketplace: `.claude-plugin/plugin.json`, `skills/envcloak/SKILL.md` (the instruction block's text), `hooks/hooks.json` (the same hooks, with `envcloak` found on `PATH`) and `.mcp.json` (the same server). `integrations/codex/` holds the Codex hook and rules files as written. With the plugin enabled, `agents install` writes only the instruction block (above).
@@ -161,6 +217,6 @@ The prompt check misses: a key made of words and separators that no provider pat
 | The tests' own waits (Codex F-127) | `crates/envcloak-testkit/src/agents.rs` (a run leads a process group of its own; its exit and its output are waited for within its limit, what is left of its group killed; a child that closes its output and lives on is past its limit; output past a cap counted, not kept, and failing the run), used by the program, shell and ripgrep oracles, the hook's and the installer's CLI tests and git in the layer tests; `crates/envcloak-agents/tests/message_text.rs` (no printed text holds source indentation) |
 | `integrations/`: the plugin and Codex's files | `crates/envcloak-agents/tests/integrations.rs` (each file equal to what the installer writes), `crates/envcloak-cli/tests/agents.rs` (`a_double_install_with_the_plugin_is_found_in_either_order`: the plugin first, or EnvCloak's install first and the plugin after, which `agents status` refuses and the next install resolves) |
 | The MCP registration's owner and what it created | `crates/envcloak-cli/tests/agents.rs` (`a_registration_is_envcloaks_in_its_own_file_only`: after `CLAUDE_CONFIG_DIR` moves, the person's equal entry stays and EnvCloak's goes from its own file; `a_claude_json_the_install_created_is_removed_by_uninstall`: a fresh home's `.claude.json` removed while unchanged, kept with Claude Code's own state otherwise), `m2_story/install.rs` (`a_fresh_claude_home_comes_back_without_a_claude_json`: the same with the pinned Claude Code, which lists the server from the file EnvCloak wrote and writes its own state into it) |
-| The project scope, each host's file, Codex's budget | `crates/envcloak-cli/tests/agents.rs` (`the_project_scope_writes_where_each_host_reads_instructions`: a lone `CLAUDE.md` gets an `AGENTS.md` for Codex unless Codex reads `CLAUDE.md` itself or only Claude Code is asked for, an override written nowhere and said so; `the_codex_block_ends_within_what_codex_reads`: past 32 KiB at the top, no room refused, a smaller `project_doc_max_bytes` read) |
+| The project scope, each host's file, Codex's budget | `crates/envcloak-cli/tests/agents.rs` (`the_project_scope_writes_where_each_host_reads_instructions`: a lone `CLAUDE.md` gets an `AGENTS.md` for Codex unless Codex reads `CLAUDE.md` itself or only Claude Code is asked for, an override written nowhere and said so; `the_codex_block_ends_within_what_codex_reads`: past 32 KiB at the top, no room refused, a smaller `project_doc_max_bytes` read; `a_projects_shared_block_stays_for_the_host_still_installed`: uninstall for one host keeps a block another was installed to read, dry run and run), `crates/envcloak-agents/tests/project_hosts.rs` (each host its own file, one file both read, one host then the other, a record made before the hosts were kept) |
 | SPEC §5: nothing read under a tracer | `crates/envcloak-cli/tests/hook.rs` (`linux_a_traced_hook_reads_nothing`: the payload unread, the prompt and the tool call stopped as `traced`), `crates/envcloak-cli/tests/agents.rs` (`linux_traced_agents_commands_read_no_config`: install, uninstall and status) |
-| D-02, F-75: the scanner's descriptors and the one-way graph | `crates/envcloak-agents/tests/catalog_graph.rs` (and `every_store_the_hosts_write_has_a_source`: the catalog against the test kit's store list and Map C section 4's), `scripts/check-crate-graph.py` |
+| D-02, F-75: the scanner's descriptors and the one-way graph | `crates/envcloak-agents/tests/catalog_graph.rs` (and `every_store_the_hosts_write_has_a_source`: the catalog against the test kit's store list; `every_documented_store_has_a_source_and_every_source_a_row`: against the table above, both ways, credential stores by kind; `codex_settings_that_move_its_stores_are_read`), `crates/envcloak-agents/src/locations.rs` (`every_documented_variable_moves_its_stores`), `scripts/check-crate-graph.py` |
