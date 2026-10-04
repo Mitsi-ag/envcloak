@@ -409,10 +409,16 @@ impl Render for ItemView {
         let _ = writeln!(o, "  kind: {}", kind_word(self.classification));
         if let Some(x) = &self.exposed {
             let places: Vec<&str> = x.sources.iter().map(|k| k.words()).collect();
+            // The mark stays until every value from before it is replaced.
+            let each = if self.fields.len() > 1 {
+                " each of its fields"
+            } else {
+                ""
+            };
             let _ = writeln!(
                 o,
-                "  exposed: rotate (found in {}; {} since {}): its value is known outside the \
-                 vault, so replace it at the provider, then `envcloak rotate`",
+                "  exposed: rotate (found in {}; {}; marked {}): its value is known outside the \
+                 vault, so replace it at the provider, then `envcloak rotate`{each}",
                 places.join(", "),
                 plural(x.count, "place", "places"),
                 date(x.since_secs)
@@ -1465,7 +1471,7 @@ openai/acme-web-2  openai    test  value   2026-09-21  -
   id: 01K5TESTTESTTESTTESTTESTTE
   provider: openai
   kind: test key
-  exposed: rotate (found in agent transcripts, git history; 3 places since 2026-09-21): its value is known outside the vault, so replace it at the provider, then `envcloak rotate`
+  exposed: rotate (found in agent transcripts, git history; 3 places; marked 2026-09-21): its value is known outside the vault, so replace it at the provider, then `envcloak rotate`
   usual variable: OPENAI_API_KEY
   short values: not allowed
   account: you@work.example (org org-acme)
@@ -1485,6 +1491,15 @@ openai/acme-web-2  openai    test  value   2026-09-21  -
                 .to_string()
                 .contains(r#""exposed":{"count":3,"since_secs":1790000000,"sources":["transcript","git_history"]}"#)
         );
+        // An item of several fields is told to rotate each: the mark stays
+        // until every value from before it is replaced.
+        let mut two = found.clone();
+        let mut second = two.fields[0].clone();
+        second.name = "secondary".into();
+        two.fields.push(second);
+        assert!(two.human().contains(
+            "so replace it at the provider, then `envcloak rotate` each of its fields\n"
+        ));
         snap(
             ItemsView { items: vec![] }.human(),
             r#"The vault has no items yet. Add one with `envcloak add`.

@@ -680,7 +680,8 @@ pub struct ItemView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExposedView {
-    /// Unix seconds of the first mark.
+    /// Unix seconds of the mark: the first mark's, restarted by a mark
+    /// made while the item held a value set after it.
     pub since_secs: u64,
     /// Every kind of place, sorted, each once.
     pub sources: Vec<ExposureSourceView>,

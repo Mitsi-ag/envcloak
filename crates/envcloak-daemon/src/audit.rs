@@ -326,15 +326,18 @@ pub enum AuditEvent {
         counts: ScanCounts,
         outcome: &'static str,
     },
-    /// Items were marked "exposed: rotate" (`items.mark_exposed`): the
-    /// items the call marked, how many it found marked for those kinds of
-    /// place already, and how many ids named no item.
+    /// A checked `items.mark_exposed` call, however it ended: its outcome
+    /// (`marked`, or the token of the error it was refused with), the
+    /// items it marked, how many it found marked for those kinds of place
+    /// already, and how many ids named no secret item. The subject is the
+    /// pid alone when the caller's evidence could not be read.
     MarkedExposed {
         pid: i32,
         subject: SubjectSummary,
         marked: Vec<(ItemId, Slug)>,
         already: usize,
         missing: usize,
+        outcome: &'static str,
     },
 }
 
@@ -543,9 +546,10 @@ impl AuditEvent {
                 marked,
                 already,
                 missing,
+                outcome,
                 ..
             } => format!(
-                "envcloakd: audit: items marked exposed marked={} already={already} \
+                "envcloakd: audit: items marked exposed {outcome} marked={} already={already} \
                  missing={missing} pid={pid}",
                 marked.len()
             ),
@@ -915,6 +919,7 @@ impl AuditEvent {
                 marked,
                 already,
                 missing,
+                outcome,
                 ..
             } => AuditRecord {
                 subject: subject.clone(),
@@ -931,13 +936,13 @@ impl AuditEvent {
                         ),
                     ],
                     ..decision(
-                        "marked",
+                        outcome,
                         None,
                         Some("items.mark_exposed"),
                         Some(u64::try_from(marked.len()).unwrap_or(u64::MAX)),
                     )
                 },
-                ..AuditRecord::new(AuditKind::MarkExposed, "marked")
+                ..AuditRecord::new(AuditKind::MarkExposed, outcome)
             },
         }
     }

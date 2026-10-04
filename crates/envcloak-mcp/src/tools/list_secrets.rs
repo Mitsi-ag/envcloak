@@ -3,8 +3,9 @@
 //! project, which variables its `envcloak.toml` binds to which items and
 //! whether each resolves; and whether each key's value was found outside
 //! the vault (`exposed`, "exposed: rotate", which `items.mark_exposed`
-//! sets and a rotation clears). Never a value, and nothing of an item that
-//! is not a secret beyond its slug and class.
+//! sets and a rotation that leaves no value the mark covers clears). Never
+//! a value, and nothing of an item that is not a secret beyond its slug
+//! and class.
 
 use envcloak_client::fail::Failure;
 use envcloak_ipc::view::{ItemClassView, ItemView};

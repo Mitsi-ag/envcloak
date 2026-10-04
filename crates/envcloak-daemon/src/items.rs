@@ -25,9 +25,13 @@
 //!   it is detected as `items.add` detects it, stored in the same
 //!   transaction as the value, and a change (test to live, say) ends the
 //!   grants and pending requests that bind the item. A rotation also
-//!   clears the item's "exposed: rotate" mark: the value found elsewhere
-//!   is not the one it holds any more. A removal writes an encrypted
-//!   backup of the vault first,
+//!   clears the item's "exposed: rotate" mark when it leaves the item
+//!   holding no value the mark covers: the new value is another than the
+//!   one it replaces, and every other field of the item was given a value
+//!   after the mark. A rotation to the same value, or of one field of
+//!   several while another still holds a value from before the mark,
+//!   leaves the mark. A removal writes an encrypted backup of the vault
+//!   first,
 //!   which keeps the item's values (`envcloak recover` restores it), then
 //!   deletes the item and ends the grants and pending requests that bind
 //!   it. When the backup cannot be written, nothing is removed. A write
@@ -40,16 +44,19 @@
 //!   their values were found outside the vault, in the kinds of place it
 //!   names. Marking only tightens, so any caller may, with no proof; each
 //!   call is audited. A mark that names only kinds an item is marked for
-//!   already writes nothing, so a doctor run repeated changes nothing it
-//!   marked; an id that names no item (one removed meanwhile) is counted,
-//!   never an error for the rest.
+//!   already, on an item holding no value set after its mark, writes
+//!   nothing, so a doctor run repeated changes nothing it marked; one on an
+//!   item holding such a value restarts the mark's time, so the mark covers
+//!   that value too. Only `secret` items are marked: an id that names no
+//!   secret item (one removed meanwhile, a card's, a login's) is counted
+//!   as missing, never an error for the rest.
 //!
 //! Every write is refused on a vault that failed its integrity check.
 
 use std::path::Path;
 
 use envcloak_core::SecretBytes;
-use envcloak_core::audit::AuditKind;
+use envcloak_core::audit::{AuditKind, SubjectSummary};
 use envcloak_core::crypto::{CryptoErrorKind, ItemClass};
 use envcloak_core::vault::{
     Account, Classification, ExposureSource, FieldId, FieldName, ItemDetails, ItemId, ItemMeta,
@@ -65,8 +72,8 @@ use envcloak_ipc::view::{
     LengthClass, MarkedView, RefStatus, RemovedView, RotatedView, TargetView,
 };
 use envcloak_policy::{
-    BindErrorKind, Binding, EnvName, ManifestError, SubjectEvidence, bind_items, load_project,
-    value_shaped,
+    BindErrorKind, Binding, Claims, EnvName, ManifestError, SubjectEvidence, bind_items,
+    load_project, value_shaped,
 };
 use envcloak_sys::PeerIdentity;
 
@@ -649,15 +656,24 @@ pub fn rotate(
             classification: after,
             ..meta.details.clone()
         });
-        // The value and the classification change together, or neither;
-        // and the new value is no longer the one found elsewhere, so the
-        // item is no longer "exposed: rotate".
+        // The mark is cleared only when this rotation leaves the item
+        // holding no value it covers: the new value is another than the
+        // field's current one, and every other field's value was set after
+        // the mark (`ItemMeta::exposure_replaced_but`).
+        let changed = !v
+            .value_keys_of(ItemClass::Secret)
+            .contains(&(field, v.value_key(&value)));
+        let clears = changed && meta.exposure_replaced_but(field);
+        // The value, the classification and the mark change together, or
+        // none of them.
         v.transact(|txn| {
             txn.set_value(field, value)?;
             if let Some(details) = details {
                 txn.update_item(t.item, details)?;
             }
-            txn.clear_exposure(t.item)?;
+            if clears {
+                txn.clear_exposure(t.item)?;
+            }
             Ok(())
         })
         .map_err(|e| write_error(&e))?;
@@ -711,9 +727,13 @@ fn id_shaped(s: &str) -> bool {
 }
 
 /// `items.mark_exposed`. See the module documentation. The request is
-/// checked whole before anything is written: 1 to [`MAX_MARKED`] items,
-/// each named once by an id of the right shape, with at least one kind of
-/// place and a count of at least 1 (`invalid_params` otherwise).
+/// checked whole before anything is read or written: 1 to [`MAX_MARKED`]
+/// items, each named once by an id of the right shape, with at least one
+/// kind of place and a count of at least 1, and claims that are markers
+/// (`invalid_params` otherwise, nothing audited). Every call past those
+/// checks writes one audit entry: outcome `marked`, with the items marked,
+/// or the token of the error it was refused with (`evidence`,
+/// `vault_locked`, a write's), with none marked.
 pub fn mark_exposed(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -732,11 +752,60 @@ pub fn mark_exposed(
             return Err(RpcError::new(ErrorKind::InvalidParams));
         }
     }
+    Claims::from_markers(&p.claims).map_err(|_| RpcError::new(ErrorKind::InvalidParams))?;
+    let mut subject = None;
+    let done = mark(shared, peer, &p, &mut subject);
+    let (outcome, marked, already, missing) = match &done {
+        Ok(m) => ("marked", m.marked.clone(), m.already, m.missing),
+        Err(e) => (e.kind.token(), Vec::new(), 0, 0),
+    };
+    shared.audit(AuditEvent::MarkedExposed {
+        pid: peer.pid,
+        subject: subject.unwrap_or_else(|| SubjectSummary {
+            pid: peer.pid,
+            ..SubjectSummary::default()
+        }),
+        marked,
+        already,
+        missing,
+        outcome,
+    });
+    let m = done?;
+    Ok(MarkedView {
+        marked: u32::try_from(m.marked.len()).unwrap_or(u32::MAX),
+        already: u32::try_from(m.already).unwrap_or(u32::MAX),
+        missing: u32::try_from(m.missing).unwrap_or(u32::MAX),
+    })
+}
+
+/// What one `items.mark_exposed` did.
+struct Marked {
+    marked: Vec<(ItemId, Slug)>,
+    already: usize,
+    missing: usize,
+}
+
+/// The marks of a checked `items.mark_exposed` request, written; the
+/// caller's subject in `subject` once its evidence was read.
+fn mark(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: &MarkExposedParams,
+    subject: &mut Option<SubjectSummary>,
+) -> Result<Marked, RpcError> {
     let caller = evidence(shared, peer, &p.claims)?;
+    *subject = Some(subject_summary(peer, &caller));
     let mut s = locked(&shared.state);
     let v = s.unlocked_mut()?;
-    let by_id: std::collections::HashMap<String, &ItemMeta> =
-        v.items().iter().map(|m| (m.id.to_string(), m)).collect();
+    // Only a `secret` item is marked (R-M2-34): a card's or a login's id
+    // is counted as naming no item, as `scan.match` never answers one, and
+    // a rotation, which alone clears a mark, takes secrets only.
+    let by_id: std::collections::HashMap<String, &ItemMeta> = v
+        .items()
+        .iter()
+        .filter(|m| m.class == ItemClass::Secret)
+        .map(|m| (m.id.to_string(), m))
+        .collect();
     let (mut marks, mut already, mut missing) = (Vec::new(), 0usize, 0usize);
     for e in &p.items {
         let Some(m) = by_id.get(&e.item) else {
@@ -744,12 +813,15 @@ pub fn mark_exposed(
             continue;
         };
         let sources: Vec<ExposureSource> = e.sources.iter().map(|k| (*k).into()).collect();
-        // Marked for every kind named already: nothing to write.
+        // Marked for every kind named already, and the mark covers every
+        // value the item holds: nothing to write. A mark that does not
+        // cover a value set since (a field replaced after it) is written,
+        // and restarts (`Txn::mark_exposed`).
         let known = m
             .exposure
             .as_ref()
             .is_some_and(|x| sources.iter().all(|k| x.sources.contains(k)));
-        if known && m.rotate_recommended {
+        if known && m.rotate_recommended && m.exposure_covers() {
             already += 1;
         } else {
             marks.push((m.id, m.slug.clone(), sources, e.count));
@@ -764,20 +836,11 @@ pub fn mark_exposed(
         })
         .map_err(|e| write_error(&e))?;
     }
-    let marked: Vec<(ItemId, Slug)> = marks.into_iter().map(|(id, slug, ..)| (id, slug)).collect();
-    let view = MarkedView {
-        marked: u32::try_from(marked.len()).unwrap_or(u32::MAX),
-        already: u32::try_from(already).unwrap_or(u32::MAX),
-        missing: u32::try_from(missing).unwrap_or(u32::MAX),
-    };
-    s.audit(AuditEvent::MarkedExposed {
-        pid: peer.pid,
-        subject: subject_summary(peer, &caller),
-        marked,
+    Ok(Marked {
+        marked: marks.into_iter().map(|(id, slug, ..)| (id, slug)).collect(),
         already,
         missing,
-    });
-    Ok(view)
+    })
 }
 
 /// The classification the registry gives `value` in an item with
