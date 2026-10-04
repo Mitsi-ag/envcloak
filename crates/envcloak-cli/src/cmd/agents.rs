@@ -170,11 +170,21 @@ fn double_install() -> Option<String> {
     if own.is_empty() {
         return None;
     }
+    // `agents install` reads the user's settings for the plugin: what it
+    // can resolve, and what only the person can.
+    let user_plugin = install::read_json(&locations.claude_settings())
+        .is_some_and(|v| claude::plugin_enabled(&v));
+    let fix = if user_plugin {
+        "Run `envcloak agents install`, which takes out its own hooks and server while the \
+         plugin is enabled in your user settings, or disable the plugin"
+    } else {
+        "The plugin is enabled for this project only, while EnvCloak's own install covers every \
+         project: disable the plugin here, or run `envcloak agents uninstall` and enable the \
+         plugin in your user settings"
+    };
     Some(format!(
         "EnvCloak's Claude Code plugin is enabled ({}) and EnvCloak is installed without it too \
-         ({}): each hook runs twice, and the server is there twice. Run `envcloak agents \
-         install`, which takes out its own hooks and server while the plugin is enabled, or \
-         disable the plugin",
+         ({}): what both carry runs twice. {fix}",
         plugin.join(", "),
         own.join("; ")
     ))
