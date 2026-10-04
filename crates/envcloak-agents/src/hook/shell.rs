@@ -2267,16 +2267,21 @@ fn glob_match(pat: &[u8], name: &[u8]) -> bool {
             Some((b'*', rest)) => (0..=n.len()).any(|k| go(rest, &n[k..], budget)),
             Some((b'?', rest)) => !n.is_empty() && go(rest, &n[1..], budget),
             Some((b'[', rest)) => {
-                let Some(end) = rest.iter().position(|&b| b == b']') else {
+                let neg = matches!(rest.first(), Some(b'!' | b'^'));
+                let body = usize::from(neg);
+                // A `]` first in the class (after a `!` or `^`) is one of
+                // its members, as bash and zsh read it (`env[]i]ron` is
+                // `environ`): the class closes at the next one.
+                let close = rest
+                    .get(body + 1..)
+                    .and_then(|r| r.iter().position(|&b| b == b']'))
+                    .map(|p| p + body + 1);
+                let Some(end) = close else {
                     return n.first() == Some(&b'[') && go(rest, &n[1..], budget);
                 };
-                let (set, after) = (&rest[..end], &rest[end + 1..]);
+                let (set, after) = (&rest[body..end], &rest[end + 1..]);
                 let Some((&c, nrest)) = n.split_first() else {
                     return false;
-                };
-                let (neg, set) = match set.split_first() {
-                    Some((b'!' | b'^', s)) => (true, s),
-                    _ => (false, set),
                 };
                 let mut hit = false;
                 let mut k = 0;
