@@ -325,6 +325,21 @@ impl ValueChecks {
     }
 }
 
+#[cfg(test)]
+impl ValueChecks {
+    /// Unit tests only: the limit of a window, and each root's window, its
+    /// start (awake time) and count, as an independent model is compared
+    /// with (`scan_match::oracle`).
+    pub(crate) fn windows(&self) -> (usize, Vec<(&ProcessInstance, Duration, usize)>) {
+        let rows = self
+            .by_root
+            .iter()
+            .map(|(root, (start, count))| (root, *start, *count))
+            .collect();
+        (self.limit, rows)
+    }
+}
+
 /// Who asks to compare values: whether the caller is a person, to whom
 /// guessable values are compared too, and its evidence.
 struct Asker {
