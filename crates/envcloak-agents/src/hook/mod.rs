@@ -108,6 +108,10 @@ pub enum Reason {
     Approve,
     /// What the command reads or runs could not be told.
     Ambiguous,
+    /// What a command that reads files or the environment reads was not
+    /// resolved ([`Class::Unresolved`]): the person is asked (Claude Code),
+    /// or the call stopped (Codex).
+    Unresolved,
     /// The payload was larger than the handler reads, or did not arrive in
     /// time, so it was not checked.
     Unchecked,
@@ -119,13 +123,14 @@ pub enum Reason {
 
 impl Reason {
     /// Every reason, for the tests.
-    pub const ALL: [Reason; 8] = [
+    pub const ALL: [Reason; 9] = [
         Reason::KeyInPrompt,
         Reason::EnvFile,
         Reason::EnvDump,
         Reason::Reveal,
         Reason::Approve,
         Reason::Ambiguous,
+        Reason::Unresolved,
         Reason::Unchecked,
         Reason::Traced,
     ];
@@ -139,6 +144,7 @@ impl Reason {
             Reason::Reveal => "reveal",
             Reason::Approve => "approve",
             Reason::Ambiguous => "ambiguous",
+            Reason::Unresolved => "unresolved",
             Reason::Unchecked => "unchecked",
             Reason::Traced => "traced",
         }
@@ -187,6 +193,15 @@ impl Reason {
                  out plainly; if it needs keys, run it as `envcloak run -- <command>`. This hook \
                  prevents accidents; it is not a security boundary."
             }
+            Reason::Unresolved => {
+                "[envcloak:unresolved] EnvCloak's hook could not tell what this command reads: a \
+                 file name or a command only known when it runs, a glob read under shell options \
+                 that change what it matches, zsh's =command, or a program it does not know \
+                 running a command that reads files. It is not let through unchecked: if it \
+                 would read a .env file or print environment variables, do not run it; write the \
+                 file names out plainly, and run anything that needs keys as `envcloak run -- \
+                 <command>`. This hook prevents accidents; it is not a security boundary."
+            }
             Reason::Unchecked => {
                 "[envcloak:unchecked] EnvCloak's hook stopped this: the request was larger than \
                  the hook reads (2 MiB) or did not arrive within its 2 second limit, so it could \
@@ -207,6 +222,7 @@ impl Reason {
             Class::Reveal => Reason::Reveal,
             Class::Approve => Reason::Approve,
             Class::Ambiguous => Reason::Ambiguous,
+            Class::Unresolved => Reason::Unresolved,
         }
     }
 }
@@ -218,6 +234,11 @@ pub enum Decision {
     Allow,
     /// Stop it, with this reason.
     Deny(Reason),
+    /// Ask the person before it runs, with this reason (Claude Code's
+    /// `permissionDecision: "ask"`). Never answered to Codex, which runs a
+    /// call its hook asks about (Codex's cycle178 measurement): there it
+    /// is a [`Decision::Deny`].
+    Ask(Reason),
     /// The payload is not the one the hook was set up for.
     NoDecision,
 }
@@ -266,7 +287,7 @@ pub fn decide(host: Host, event: Event, payload: &SecretBuf) -> Decision {
 /// ([`shell::grep_tool_glob_may_name_env_file`], [`shell::RG_ENV_TYPES`]);
 /// and the argv of `run_with_secrets` ([`decide_argv`]).
 fn tool_call(host: Host, tool: &str, input: &Map<String, Value>) -> Decision {
-    let deny_if = |c: Option<Class>| c.map_or(Decision::Allow, |c| Decision::Deny(Reason::of(c)));
+    let deny_if = |c: Option<Class>| c.map_or(Decision::Allow, |c| for_host(host, c));
     let claude = host == Host::ClaudeCode;
     match tool {
         "Bash" => match input.get("command").and_then(Value::as_str) {
@@ -338,9 +359,21 @@ fn tool_call(host: Host, tool: &str, input: &Map<String, Value>) -> Decision {
     }
 }
 
+/// The answer to a tool call of class `class` from `host`: a denial, or for
+/// [`Class::Unresolved`] a question to the person where the host stops a
+/// call until they answer (Claude Code), and a denial where it does not
+/// (Codex runs a call its hook asks about: never a silent allow).
+fn for_host(host: Host, class: Class) -> Decision {
+    match (class, host) {
+        (Class::Unresolved, Host::ClaudeCode) => Decision::Ask(Reason::Unresolved),
+        (c, _) => Decision::Deny(Reason::of(c)),
+    }
+}
+
 /// The check `run_with_secrets` applies to its argv before it asks the
 /// daemon anything (D-22), and the hook to `mcp__envcloak__run_with_secrets`:
-/// the classes the `PreToolUse` hook denies in a shell command.
+/// the classes the `PreToolUse` hook denies in a shell command, and the
+/// ones it asks about (the server has no one to ask, so it refuses).
 pub fn decide_argv<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> Decision {
     shell::check_argv(argv).map_or(Decision::Allow, |c| Decision::Deny(Reason::of(c)))
 }
@@ -388,6 +421,20 @@ pub const NO_DECISION: u8 = 1;
 /// hosts' hook documentation). [`Decision::NoDecision`] is written by the
 /// command, which says why on standard error.
 pub fn answer(host: Host, event: Event, decision: Decision) -> Answer {
+    if let (Decision::Ask(reason), Host::ClaudeCode, Event::PreToolUse) = (decision, host, event) {
+        let mut stdout = serde_json::to_vec(&claude::ask(reason.message())).unwrap_or_default();
+        stdout.push(b'\n');
+        return Answer {
+            stdout,
+            stderr: Vec::new(),
+            code: 0,
+        };
+    }
+    let decision = match decision {
+        // Anywhere else a question is not asked: it is a denial.
+        Decision::Ask(r) => Decision::Deny(r),
+        d => d,
+    };
     let Decision::Deny(reason) = decision else {
         return Answer {
             stdout: Vec::new(),
@@ -850,5 +897,53 @@ mod tests {
         assert!(String::from_utf8_lossy(&a.stderr).starts_with("[envcloak:env_file]"));
         let a = answer(Host::Codex, Event::PreToolUse, Decision::Allow);
         assert_eq!((a.stdout.len(), a.stderr.len(), a.code), (0, 0, 0));
+    }
+
+    /// The orchestrator's finding, fail closed: a command whose reads are
+    /// not resolved is put to the person in Claude Code (`ask`, exit 0, the
+    /// reason shown) and stopped in Codex, which runs a call its hook asks
+    /// about (Codex's cycle178 measurement); the MCP server, with no one to
+    /// ask, refuses it.
+    ///
+    /// Mutation checked: `for_host` answering `Ask` to Codex too: Codex's
+    /// decision is not a denial and this fails.
+    #[test]
+    fn an_unresolved_read_is_asked_about_or_stopped_never_let_through() {
+        let cmd = "f=a.txt; cat \"$f\"";
+        let claude = decide(
+            Host::ClaudeCode,
+            Event::PreToolUse,
+            &buf(&claude_pre("Bash", serde_json::json!({"command": cmd}))),
+        );
+        assert_eq!(claude, Decision::Ask(Reason::Unresolved));
+        let a = answer(Host::ClaudeCode, Event::PreToolUse, claude);
+        assert_eq!(a.code, 0);
+        let v: Value = serde_json::from_slice(&a.stdout).unwrap_or(Value::Null);
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "ask");
+        assert!(
+            v["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("[envcloak:unresolved]"))
+        );
+        let codex = serde_json::json!({
+            "session_id": "s", "transcript_path": null, "cwd": "/w",
+            "hook_event_name": "PreToolUse", "model": "m", "turn_id": "t",
+            "permission_mode": "default", "tool_name": "Bash",
+            "tool_input": {"command": cmd}, "tool_use_id": "u",
+        });
+        let d = decide(Host::Codex, Event::PreToolUse, &buf(&codex));
+        assert_eq!(d, Decision::Deny(Reason::Unresolved));
+        assert_eq!(answer(Host::Codex, Event::PreToolUse, d).code, BLOCK);
+        // An `Ask` reaching Codex's answer anyway is a denial there.
+        let a = answer(
+            Host::Codex,
+            Event::PreToolUse,
+            Decision::Ask(Reason::Unresolved),
+        );
+        assert_eq!(a.code, BLOCK);
+        assert_eq!(
+            decide_argv(&["sh", "-c", cmd]),
+            Decision::Deny(Reason::Unresolved)
+        );
     }
 }

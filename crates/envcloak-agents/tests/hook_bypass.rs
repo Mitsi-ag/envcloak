@@ -356,11 +356,95 @@ const CORPUS: &[(&str, Option<Class>)] = &[
     // A `]` first in a class is one of its members (bash and zsh measured).
     ("cat /proc/self/env[]i]ron", Some(Class::EnvDump)),
     ("cat /proc/1/env[!]x]ron", Some(Class::EnvDump)),
+    // Fail closed (the orchestrator's finding): what a command that reads
+    // files or the environment reads, when the reader cannot resolve it,
+    // is put to the person (Claude Code) or stopped (Codex), never let
+    // through: a name only known when it runs, a glob under shell options
+    // this reader does not model, zsh's `=name` as an operand, a program
+    // it does not know running a reader.
+    ("f=.env; cat \"$f\"", Some(Class::Unresolved)),
+    (
+        "for f in .env*; do cat \"$f\"; done",
+        Some(Class::Unresolved),
+    ),
+    ("cat $(echo .env)", Some(Class::Unresolved)),
+    ("source \"$f\"", Some(Class::Unresolved)),
+    ("cat < \"$f\"", Some(Class::Unresolved)),
+    ("cat \"$d\"/environ", Some(Class::Unresolved)),
+    ("cat =ls", Some(Class::Unresolved)),
+    ("shopt -s dotglob; cat *", Some(Class::Unresolved)),
+    ("setopt globdots; cat *", Some(Class::Unresolved)),
+    ("set -o globdots; cat *", Some(Class::Unresolved)),
+    ("GLOBIGNORE=x; cat *", Some(Class::Unresolved)),
+    ("BASHOPTS=dotglob bash -c 'cat *'", Some(Class::Unresolved)),
+    ("bash -O dotglob -c 'cat *'", Some(Class::Unresolved)),
+    ("zsh -o globdots -c 'cat *'", Some(Class::Unresolved)),
+    ("dbus-run-session printenv", Some(Class::Unresolved)),
+    ("parallel ::: printenv", Some(Class::Unresolved)),
+    ("firejail cat .env", Some(Class::Unresolved)),
+    // A shell started with a file to read first.
+    ("BASH_ENV=.env bash -c 'echo $K'", Some(Class::EnvFile)),
+    ("env ENV=.env sh -i", Some(Class::EnvFile)),
+    // POSIX bracket expressions (the verifier's finding: read as members,
+    // so find, grep and the shells read `.env` through them).
+    (
+        "find . -name '.[[:alpha:]]nv' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    (
+        "find . -path './.e[[:alpha:]]v' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    (
+        "find . -name '.e[[=n=]]v*' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    (
+        "find . -iname '.E[[.n.]]V' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    (
+        "grep -r --include='.e[[:alpha:]]v' KEY .",
+        Some(Class::EnvFile),
+    ),
+    ("cat /proc/self/env[[:alpha:]]ron", Some(Class::EnvDump)),
+    ("head /proc/1/e[[:lower:]]viron", Some(Class::EnvDump)),
+    ("cat .e[[:alpha:]]v", Some(Class::EnvFile)),
+    // A class is a class, whatever it holds: it stands for a character of
+    // the name (the shell oracle's finding, read as a wildcard).
+    (
+        "find . -name '[[=.=]][[:lower:]]?[[:lower:]]' -exec cat {} +",
+        Some(Class::EnvFile),
+    ),
+    // macOS's grep matches `--include` against the whole path, `*` and `?`
+    // across a `/` (the verifier's finding).
+    ("grep -r --include='./su*env' KEY .", Some(Class::EnvFile)),
+    ("grep -r --include='./s*v' KEY .", Some(Class::EnvFile)),
+    ("grep -r --include='./sub?.env' KEY .", Some(Class::EnvFile)),
+    // A globbed component before `environ` (the verifier's finding).
+    ("cat /pro?/self/environ", Some(Class::EnvDump)),
+    ("cat /[p]roc/self/environ", Some(Class::EnvDump)),
+    ("cat /*/self/environ", Some(Class::EnvDump)),
+    (
+        "tr '\\0' '\\n' < /pr[o]c/self/environ",
+        Some(Class::EnvDump),
+    ),
+    // zsh, Claude Code's Bash tool's shell on macOS (the verifier's
+    // finding): `=name`, `typeset -m`, precommand modifiers, `repeat`.
+    ("=printenv", Some(Class::EnvDump)),
+    ("=env | sort", Some(Class::EnvDump)),
+    ("command =printenv", Some(Class::EnvDump)),
+    ("=cat .env", Some(Class::EnvFile)),
+    ("typeset -m '*'", Some(Class::EnvDump)),
+    ("declare -m '*'", Some(Class::EnvDump)),
+    ("export -m 'A*'", Some(Class::EnvDump)),
+    ("noglob cat .env", Some(Class::EnvFile)),
+    ("nocorrect cat .env", Some(Class::EnvFile)),
+    ("- cat .env", Some(Class::EnvFile)),
+    ("repeat 1 cat .env", Some(Class::EnvFile)),
+    ("coproc cat .env", Some(Class::EnvFile)),
     // What the hook lets through (docs/INSTALLERS.md, "What the hook does
     // not see").
-    ("f=.env; cat \"$f\"", None),
-    ("for f in .env*; do cat \"$f\"; done", None),
-    ("cat $(echo .env)", None),
     ("echo $OPENAI_API_KEY", None),
     ("ls -a | grep '^.env' | xargs cat", None),
     ("python3 -c 'print(open(\".env\").read())'", None),
@@ -372,11 +456,9 @@ const CORPUS: &[(&str, Option<Class>)] = &[
     ("git show HEAD:.env", None),
     ("iconv -f utf-8 -t utf-8 .env", None),
     ("grep -r KEY .", None),
-    ("shopt -s dotglob; cat *", None),
     ("e", None),
     ("cd /proc/self && cat environ", None),
-    ("dbus-run-session printenv", None),
-    ("parallel ::: printenv", None),
+    ("python -m venv env && dbus-run-session env", None),
 ];
 
 /// The examples in docs/INSTALLERS.md's "What the hook does not see".

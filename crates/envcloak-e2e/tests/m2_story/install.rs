@@ -441,6 +441,57 @@ fn the_installer_on_the_hosts_own_configs() {
         );
     }
 
+    // A command whose file the reader cannot resolve (fail closed: the
+    // orchestrator's finding) is not let through: Claude Code puts it to
+    // the person (`permissionDecision: "ask"`), which `-p` cannot answer,
+    // so it does not run; Codex runs a call its hook asks about (Codex's
+    // cycle178 measurement), so there the hook denies it. Either way the
+    // file's text never reaches the model, and the control after it runs.
+    let probe = format!("ecunres{:016x}", fresh_seed());
+    std::fs::write(home.join("plain.txt"), format!("{probe}\n")).unwrap();
+    for (a, flags) in [
+        (&claude, HostFlags::claude("default", &["Bash"])),
+        (
+            &codex,
+            HostFlags::codex("read-only", "never").with(&["--dangerously-bypass-hook-trust"]),
+        ),
+    ] {
+        let run = a.run(
+            &script("f=plain.txt; cat \"$f\""),
+            "Show the file.",
+            &flags,
+            &home,
+        );
+        h.record(
+            &format!("{:?} unresolved stdout", a.host),
+            &run.output.stdout,
+        );
+        h.record(
+            &format!("{:?} unresolved stderr", a.host),
+            &run.output.stderr,
+        );
+        assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
+        let after = request(&run, "step 1");
+        assert!(
+            !after.contains(&probe),
+            "{:?}: the unresolved read ran and its output reached the model",
+            a.host
+        );
+        let control = last_tool_output(&request(&run, "step 2"));
+        assert!(
+            control.contains("ecctl-hook-control"),
+            "{:?}: {control}",
+            a.host
+        );
+        println!(
+            "measurement: {:?} {}: an unresolved read did not run; EnvCloak's marker \
+             [envcloak:unresolved] in the next request: {}",
+            a.host,
+            a.installed.pin.version,
+            after.contains("[envcloak:unresolved]")
+        );
+    }
+
     // Claude Code's own file tool reaches the hook as well: a Read of an
     // env file of another profile, in another case, and on Linux of a
     // process's environment. (Grep, ToolSearch and the deferred Monitor
