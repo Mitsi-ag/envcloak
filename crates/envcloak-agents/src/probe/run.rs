@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 
 use super::controls::{
     self, contains, denial, forms, halves, key_shaped, last_tool_output, marker, picked, reached,
-    seen,
+    seen, unmarked,
 };
 use super::model::{self, ModelStub, Recorded};
 use super::{
@@ -872,7 +872,15 @@ fn denial_checks(
 ) -> Vec<Check> {
     let usable = r.usable();
     let ctl = usable && contains(r.after(1).as_bytes(), control.as_bytes());
-    let marked = usable && contains(r.after(2).as_bytes(), denial(reason).as_bytes());
+    let result = r.after(2);
+    let marked = usable && contains(result.as_bytes(), denial(reason).as_bytes());
+    // A denial without the marker is a failed probe (M2-09); what gave
+    // it is named from a fixed list.
+    let unmarked_why = if usable {
+        unmarked(&result)
+    } else {
+        "no denial with EnvCloak's marker reached the model"
+    };
     let leaked = seen(&r.requests, kept);
     vec![
         check(
@@ -885,7 +893,7 @@ fn denial_checks(
             "the probe call is denied with EnvCloak's marker",
             false,
             marked,
-            "no denial with EnvCloak's marker reached the model",
+            unmarked_why,
         ),
         check(
             "nothing it would have read reaches the model",

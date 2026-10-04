@@ -188,6 +188,37 @@ pub fn denial(reason: crate::hook::Reason) -> String {
     format!("[envcloak:{}]", reason.name())
 }
 
+/// What answered a probe call when EnvCloak's marker for it is not in
+/// the result the model got, named from a fixed list: the result itself
+/// is never printed, since it could hold fixture data (M2-08's refusal
+/// sources, Codex's cycle 321 review). The first text found names it.
+pub fn unmarked(result: &str) -> &'static str {
+    const SOURCES: [(&str, &str); 3] = [
+        (
+            "[envcloak:",
+            "EnvCloak's hook denied it, with another reason",
+        ),
+        (
+            "denied by your permission settings",
+            "the host's own permission settings refused it first, without EnvCloak's marker",
+        ),
+        (
+            "would block or produce infinite output",
+            "the host's device-file check refused it first, without EnvCloak's marker",
+        ),
+    ];
+    if result.is_empty() {
+        return "no result of the probe call reached the model";
+    }
+    SOURCES
+        .iter()
+        .find(|(text, _)| result.contains(text))
+        .map_or(
+            "a result without EnvCloak's marker, from no known source, reached the model",
+            |(_, source)| source,
+        )
+}
+
 /// Every form `value` is looked for in: as it is; base64 (standard and
 /// URL-safe alphabets, with and without padding, and the groups wholly
 /// inside it at the two other alignments in a longer stream);
@@ -403,6 +434,40 @@ mod tests {
         let (a, b) = halves(&m);
         assert_eq!(format!("{a}{b}"), m);
         assert!(!a.contains(&m) && !b.contains(&m));
+    }
+
+    /// What refused a probe call is named, never shown: the Linux CI run
+    /// measured Claude Code 2.1.280's permission settings refusing `Read
+    /// .env` before EnvCloak's hook, which this names.
+    ///
+    /// Mutation checked: the permission settings' row dropped from the
+    /// list: the refusal reads as from no known source and this fails.
+    #[test]
+    fn an_unmarked_result_is_named_from_a_fixed_list() {
+        let fixture = "ecp-env-0000-1111-2222-3333";
+        for (result, source) in [
+            ("", "no result of the probe call reached the model"),
+            (
+                "Permission to read /p/.env has been denied by your permission settings.",
+                "the host's own permission settings refused it first, without EnvCloak's marker",
+            ),
+            (
+                "Reading this file would block or produce infinite output.",
+                "the host's device-file check refused it first, without EnvCloak's marker",
+            ),
+            (
+                "Refused: [envcloak:env_dump] (EnvCloak)",
+                "EnvCloak's hook denied it, with another reason",
+            ),
+            (
+                fixture,
+                "a result without EnvCloak's marker, from no known source, reached the model",
+            ),
+        ] {
+            let named = unmarked(result);
+            assert_eq!(named, source, "{result}");
+            assert!(!named.contains(fixture));
+        }
     }
 
     /// The receiver corpus (Codex cycle354): only an accepted request

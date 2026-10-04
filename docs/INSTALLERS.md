@@ -241,17 +241,19 @@ Claude Code runs `-p` with `--permission-mode default` and only the tools a prob
 
 **What CI's probes found** (`crates/envcloak-e2e/tests/probes.rs` on the pinned hosts; `integrations/compat/matrix.toml`, which the test holds the report to):
 
-| Surface | Claude Code 2.1.280 (macOS, Linux) | Codex 0.159.2 (macOS) | Codex 0.159.2 (Linux) |
-|---|---|---|---|
-| prompt-to-model | `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)` | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)` | the same |
-| transcript | `unsupported (persists_blocked_prompt; probe=failed)` | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)`: a blocked prompt is in none of its stores | the same |
-| file read | `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)` | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)` | the same |
-| shell | `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)` | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)` | `unsupported (sandbox_blocks_socket; probe=passed)` |
-| MCP | `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)` | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)` | the same |
-| output | `active (probe=passed)` | `active (probe=passed)` | the same |
-| EnvCloak server | `needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)` | the same | the same |
+| Surface | Claude Code 2.1.280 (macOS) | Claude Code 2.1.280 (Linux) | Codex 0.159.2 (macOS) | Codex 0.159.2 (Linux) |
+|---|---|---|---|---|
+| prompt-to-model | `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)` | the same | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)` | the same |
+| transcript | `unsupported (persists_blocked_prompt; probe=failed)` | the same | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)`: a blocked prompt is in none of its stores | the same |
+| file read | `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)` | `degraded (fails_open_on_timeout, workspace_untrusted; probe=failed)`: Claude Code's own permission settings refuse `Read .env` before EnvCloak's hook, so the file never reaches the model but EnvCloak's marker does not either | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)` | the same |
+| shell | `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)` | the same | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)` | `unsupported (sandbox_blocks_socket; probe=passed)` |
+| MCP | `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)` | the same | `degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)` | the same |
+| output | `active (probe=passed)` | the same | `active (probe=passed)` | the same |
+| EnvCloak server | `needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)` | the same | the same | the same |
 
-Taking EnvCloak's hook for a surface out of the installed configuration fails that surface's probe on both hosts; taking out the `Read(**/.env*)` deny rule fails Claude Code's `@.env` case; Codex's hooks left untrusted (no trust bypass) fail every hook probe, which then reads `degraded (fails_open_on_timeout, hooks_untrusted; probe=failed)`.
+A denial without EnvCloak's marker is a failed probe, whatever refused the call: the probe names what did from a fixed list (EnvCloak's hook with another reason, the host's own permission settings, the host's device-file check, no result, or a result from no known source), never by printing the result.
+
+Taking EnvCloak's hook for a surface out of the installed configuration fails that surface's probe on both hosts; taking out the `Read(**/.env*)` deny rule fails Claude Code's `@.env` case and breaks nothing else that held (what refuses the `Read` call with the rule and without it is recorded on Linux); Codex's hooks left untrusted (no trust bypass) fail every hook probe, which then reads `degraded (fails_open_on_timeout, hooks_untrusted; probe=failed)`.
 
 **Not claimed.** A passed probe shows the integration acting on this machine for a scripted session; it is not a boundary (SPEC §7.2 rule 4): an agent with the person's shell can switch hooks off, and a timed-out hook lets the action through. `-p` sessions treat the folder as trusted: the interactive case (the trust dialog, a real paste, an `@` mention typed) is M2-26's variant. Probes on a person's own machine, in a probe home of their own with a probe daemon and an approval from a fresh terminal, are M2-28's; until then a person's `agents status` reads `not_probed` everywhere a probe decides.
 
