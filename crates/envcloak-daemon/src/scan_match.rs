@@ -40,7 +40,11 @@
 //!   ([`SecretValues`]), so no other class's value is compared at all.
 //! - One state lock is held from the vault's check to the answer's frame,
 //!   so the vault cannot lock between the budgets' count and the
-//!   comparisons it counts.
+//!   comparisons it counts. Under it the answer is built only while it can
+//!   still fit one frame ([`Answer`]): once its records' least sizes pass
+//!   [`MAX_FRAME`] none is built or kept, the matches are only counted,
+//!   and the call is `frame_too_large`, so many candidates of a value many
+//!   items hold cost a frame's worth of work, not one record a pair.
 //! - Each call whose request is well formed writes exactly one audit entry
 //!   (kind `scan_match`) with its purpose, source and counts, never a
 //!   candidate, after the answer is framed (F-77's order): its outcome is
@@ -53,18 +57,18 @@
 //! - Candidates live in wiped buffers and are dropped when the call ends.
 //!   No error repeats anything the client sent, and nothing is logged.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::SubjectSummary;
-use envcloak_core::vault::{FieldId, ItemMeta, ValueKey, Vault};
+use envcloak_core::vault::{ValueKey, Vault};
 use envcloak_ipc::proto::{
     CandidateForm, ErrorKind, MAX_CANDIDATE, MAX_SCAN_CANDIDATES, ScanMatch, ScanMatchParams,
     ScanPurpose,
 };
 use envcloak_ipc::view::{ScanMatchView, ScanMatchedView, ScanPatternView};
-use envcloak_ipc::{Frame, RpcError};
+use envcloak_ipc::{Frame, MAX_FRAME, RpcError};
 use envcloak_policy::{Claims, ProcessInstance};
 use envcloak_providers::{PasswordForm, password_form_chars};
 use envcloak_sys::PeerIdentity;
@@ -241,21 +245,12 @@ struct Found {
 
 /// The items holding the value of `key` now (its current value, never a
 /// prior one): looked up among the `secret` items' value keys alone
-/// (`secrets`), so a card's or a login's value is never compared. `owners`
-/// maps every field to its item, whatever its class: the class boundary
-/// is `secrets`, and only there.
-fn find(
-    shared: &Shared,
-    secrets: &SecretValues,
-    owners: &HashMap<FieldId, &ItemMeta>,
-    key: &ValueKey,
-    value: &SecretBytes,
-) -> Found {
+/// (`secrets`), so a card's or a login's value is never compared.
+fn find(shared: &Shared, secrets: &SecretValues, key: &ValueKey, value: &SecretBytes) -> Found {
     let mut holders: Vec<(String, String)> = secrets
         .fields(key)
         .iter()
-        .filter_map(|f| owners.get(f))
-        .map(|m| (m.id.to_string(), m.slug.as_str().to_owned()))
+        .map(|h| (h.item.id.to_string(), h.item.slug.as_str().to_owned()))
         .collect();
     holders.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     holders.dedup();
@@ -359,14 +354,9 @@ fn answer(
         return Err(RpcError::with_reason(ErrorKind::TooManyChecks, "limited"));
     }
     let secrets = SecretValues::of(v);
-    let owners: HashMap<FieldId, &ItemMeta> = v
-        .items()
-        .iter()
-        .flat_map(|m| m.fields.iter().map(move |f| (f.id, m)))
-        .collect();
     // Each distinct value is looked up once, by its keyed hash.
     let mut seen: BTreeMap<ValueKey, Found> = BTreeMap::new();
-    let (mut matches, mut patterns) = (Vec::new(), Vec::new());
+    let mut built = Answer::default();
     for (cand, _) in candidates
         .iter()
         .zip(&admitted.compare)
@@ -375,26 +365,23 @@ fn answer(
         let key = v.value_key(&cand.value);
         let found = seen
             .entry(key)
-            .or_insert_with(|| find(shared, &secrets, &owners, &key, &cand.value));
-        for (item, slug) in &found.holders {
-            matches.push(ScanMatchedView {
-                id: cand.id,
-                item: item.clone(),
-                slug: slug.clone(),
-            });
-        }
-        for provider in &found.providers {
-            patterns.push(ScanPatternView {
-                id: cand.id,
-                provider: provider.clone(),
-            });
-        }
+            .or_insert_with(|| find(shared, &secrets, &key, &cand.value));
+        built.add(cand.id, found);
     }
-    c.matches = matches.len();
-    c.patterns = patterns.len();
+    c.matches = built.matched;
+    c.patterns = built.patterned;
+    if built.over {
+        if envcloak_sys::test_trace() {
+            envcloak_sys::test_event(&format!(
+                "scan.match answer over a frame after {} records",
+                built.built
+            ));
+        }
+        return Err(RpcError::new(ErrorKind::FrameTooLarge));
+    }
     let view = ScanMatchView {
-        matches,
-        patterns,
+        matches: built.matches,
+        patterns: built.patterns,
         compared: u32::try_from(admitted.compared()).unwrap_or(u32::MAX),
         skipped_guessable: u32::try_from(admitted.skipped_guessable).unwrap_or(u32::MAX),
         limited: admitted.not_compared > 0,
@@ -402,6 +389,81 @@ fn answer(
     // Framed before the entry is written, so an answer too large for a
     // frame is recorded as such (`frame_too_large`), never as answered.
     result_framed::<ScanMatch>(id, &view)
+}
+
+/// The fewest bytes a match takes in the answer's frame, besides its item
+/// id and slug: `{"id":0,"item":"","slug":""}`, the shortest id, and no
+/// comma before it. Escaping only lengthens a string.
+const MATCH_FLOOR: usize = 28;
+/// The fewest bytes a pattern takes, besides its provider:
+/// `{"id":0,"provider":""}`.
+const PATTERN_FLOOR: usize = 22;
+
+/// A `scan.match` answer's matches and patterns, built only while they
+/// can still fit one frame (Codex review: many candidates of one value
+/// that many items hold would otherwise build millions of records under
+/// the state lock before the frame refused them). Each record adds at
+/// least its floor to the frame; once those floors pass [`MAX_FRAME`] the
+/// answer cannot fit, the records are dropped and no more are built
+/// (`over`), and only the counts go on, for the audit entry. Below that
+/// the frame itself is the exact check.
+#[derive(Debug, Default)]
+struct Answer {
+    matches: Vec<ScanMatchedView>,
+    patterns: Vec<ScanPatternView>,
+    /// The least the records built would take in a frame.
+    floor: usize,
+    /// The answer cannot fit a frame: no record is kept.
+    over: bool,
+    /// Records built, kept or dropped since.
+    built: usize,
+    /// Every match and pattern the answer holds, built or not.
+    matched: usize,
+    patterned: usize,
+}
+
+impl Answer {
+    /// Adds what the vault holds for candidate `id`.
+    fn add(&mut self, id: u32, found: &Found) {
+        self.matched += found.holders.len();
+        self.patterned += found.providers.len();
+        for (item, slug) in &found.holders {
+            if !self.room(MATCH_FLOOR + item.len() + slug.len()) {
+                return;
+            }
+            self.built += 1;
+            self.matches.push(ScanMatchedView {
+                id,
+                item: item.clone(),
+                slug: slug.clone(),
+            });
+        }
+        for provider in &found.providers {
+            if !self.room(PATTERN_FLOOR + provider.len()) {
+                return;
+            }
+            self.built += 1;
+            self.patterns.push(ScanPatternView {
+                id,
+                provider: provider.clone(),
+            });
+        }
+    }
+
+    /// Whether a record of at least `bytes` can still be added; once one
+    /// cannot, the answer is over a frame and keeps nothing.
+    fn room(&mut self, bytes: usize) -> bool {
+        if self.over {
+            return false;
+        }
+        self.floor = self.floor.saturating_add(bytes);
+        if self.floor > MAX_FRAME {
+            self.over = true;
+            self.matches = Vec::new();
+            self.patterns = Vec::new();
+        }
+        !self.over
+    }
 }
 
 #[cfg(test)]
@@ -523,6 +585,90 @@ mod tests {
         assert_eq!(
             scan.admit_up_to(&r, MAX_SCAN_CHECKS, t0),
             MAX_SCAN_CHECKS - 1
+        );
+    }
+
+    /// What the vault holds for one value: `n` items, ids and slugs of
+    /// real lengths, and no pattern.
+    fn held_by(n: usize) -> Found {
+        Found {
+            holders: (0..n)
+                .map(|i| (format!("{i:026}"), format!("same-value/holder-{i}")))
+                .collect(),
+            providers: Vec::new(),
+        }
+    }
+
+    /// Each floor is the fewest bytes its record takes in a frame: the
+    /// shortest record serializes to exactly it, and a real answer to at
+    /// least the floors of its records, so an answer the floors put over a
+    /// frame could never have fit.
+    #[test]
+    fn the_floors_are_the_least_a_record_takes() {
+        let m = ScanMatchedView {
+            id: 0,
+            item: String::new(),
+            slug: String::new(),
+        };
+        let p = ScanPatternView {
+            id: 0,
+            provider: String::new(),
+        };
+        assert_eq!(serde_json::to_vec(&m).unwrap().len(), MATCH_FLOOR);
+        assert_eq!(serde_json::to_vec(&p).unwrap().len(), PATTERN_FLOOR);
+        let mut a = Answer::default();
+        for id in [7, 4_000_000_000] {
+            a.add(id, &held_by(5));
+            a.add(
+                id,
+                &Found {
+                    holders: Vec::new(),
+                    providers: vec!["openai".to_owned(), "stripe".to_owned()],
+                },
+            );
+        }
+        assert!(!a.over);
+        assert_eq!((a.matches.len(), a.patterns.len()), (10, 4));
+        let records = serde_json::to_vec(&a.matches).unwrap().len()
+            + serde_json::to_vec(&a.patterns).unwrap().len();
+        assert!(records >= a.floor, "{records} {}", a.floor);
+    }
+
+    /// An answer that cannot fit a frame stops being built once its
+    /// records' floors pass one (Codex review): many candidates of one
+    /// value a thousand items hold (a million matches) build at most a
+    /// frame's worth of records, keep none, and still count every match
+    /// for the audit entry. A smaller answer is built whole, in order.
+    ///
+    /// Mutation: the bound only at the frame (`room` always true): the
+    /// million records are built, and this fails.
+    #[test]
+    fn an_answer_too_large_for_a_frame_stops_being_built() {
+        let found = held_by(1000);
+        let mut a = Answer::default();
+        for id in 0..1000 {
+            a.add(id, &found);
+        }
+        assert!(a.over);
+        assert!(a.built <= MAX_FRAME / MATCH_FLOOR + 1, "{}", a.built);
+        assert!(a.matches.is_empty() && a.patterns.is_empty());
+        assert_eq!((a.matched, a.patterned), (1_000_000, 0));
+        let mut a = Answer::default();
+        for id in 0..3 {
+            a.add(id, &held_by(2));
+        }
+        assert!(!a.over);
+        let got: Vec<(u32, &str)> = a.matches.iter().map(|m| (m.id, m.slug.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (0, "same-value/holder-0"),
+                (0, "same-value/holder-1"),
+                (1, "same-value/holder-0"),
+                (1, "same-value/holder-1"),
+                (2, "same-value/holder-0"),
+                (2, "same-value/holder-1"),
+            ]
         );
     }
 }
