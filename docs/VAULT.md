@@ -378,8 +378,8 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 | Number | Token | Task | Status | Use |
 |---|---|---|---|---|
 | 22 | `reveal` | M2-21 | reserved | a terminal reveal on Linux, before the value is written |
-| 23 | `scan_match` | M2-11 | reserved | a `scan.match` call: its purpose and counts, never a candidate |
-| 24 | `mark_exposed` | M2-11 | reserved | items marked "exposed: rotate" |
+| 23 | `scan_match` | M2-11 | landed | a `scan.match` call: its purpose and counts, never a candidate |
+| 24 | `mark_exposed` | M2-11 | landed | items marked "exposed: rotate" |
 | 25 | `backup_v2` | M2-05 | landed | a file backup v2 committed, with its creator and purpose |
 | 26 | `restore_v2` | M2-05 | landed | a restore lease opened, before the first chunk |
 | 27 | `agents_config` | M2-08 | reserved | an agent config EnvCloak changed, with its backup |

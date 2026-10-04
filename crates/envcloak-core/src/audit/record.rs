@@ -25,8 +25,15 @@ pub const MAX_ARGV_BYTES: usize = 16 * 1024;
 pub const MAX_ARGS: usize = 256;
 /// Items an entry names.
 pub const MAX_ITEMS: usize = 256;
+/// Named counts an entry keeps ([`DecisionSummary::counts`]).
+pub const MAX_COUNTS: usize = 16;
 
+/// The version of a record without named counts: every record an M1
+/// build wrote, and every record since that has none, byte for byte.
 const RECORD_VERSION: u8 = 1;
+/// The version of a record with named counts: version 1's fields, then
+/// the counts.
+const RECORD_VERSION_COUNTS: u8 = 2;
 
 /// What an entry records. The numbers are part of the log's format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -92,6 +99,15 @@ pub enum AuditKind {
     Recover = 21,
     // M2 and M2b: each kind joins `ALL`, which `verify` reads, with the task
     // that writes it (docs/VAULT.md "Reserved for M2 and M2b").
+    /// Candidate tokens were compared with the vault by keyed hash
+    /// (`scan.match`, for import, doctor or scrub), or the call was refused
+    /// for a spent budget. The reason is the purpose; the count says how
+    /// many were compared, and the named counts how many of each kind
+    /// (never a candidate).
+    ScanMatch = 23,
+    /// Items were marked "exposed: rotate" (`items.mark_exposed`): the items
+    /// marked; the count says how many.
+    MarkExposed = 24,
     /// A file backup v2 committed, with its creator and purpose. The request id
     /// is the backup's; the count says how many files.
     BackupV2 = 25,
@@ -103,7 +119,7 @@ pub enum AuditKind {
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 23] = [
+    pub const ALL: [AuditKind; 25] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -125,6 +141,8 @@ impl AuditKind {
         AuditKind::RecoveryConfirm,
         AuditKind::Backup,
         AuditKind::Recover,
+        AuditKind::ScanMatch,
+        AuditKind::MarkExposed,
         AuditKind::BackupV2,
         AuditKind::RestoreV2,
     ];
@@ -153,6 +171,8 @@ impl AuditKind {
             AuditKind::RecoveryConfirm => "recovery_confirm",
             AuditKind::Backup => "backup",
             AuditKind::Recover => "recover",
+            AuditKind::ScanMatch => "scan_match",
+            AuditKind::MarkExposed => "mark_exposed",
             AuditKind::BackupV2 => "backup_v2",
             AuditKind::RestoreV2 => "restore_v2",
         }
@@ -204,6 +224,10 @@ pub struct DecisionSummary {
     pub method: Option<String>,
     /// A count, for events that have one.
     pub count: Option<u64>,
+    /// Named counts, for events that have several (`scan.match`'s): each a
+    /// fixed token of the daemon's and a number, at most [`MAX_COUNTS`].
+    /// A record with none is written as version 1, as before they existed.
+    pub counts: Vec<(String, u64)>,
 }
 
 /// One audit entry. Metadata only; see the module documentation.
@@ -255,7 +279,13 @@ impl AuditRecord {
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         let mut e = Enc::new();
-        e.u8(RECORD_VERSION).u64(at_ms).u8(self.kind as u8);
+        let counts = &self.decision.counts[..self.decision.counts.len().min(MAX_COUNTS)];
+        let version = if counts.is_empty() {
+            RECORD_VERSION
+        } else {
+            RECORD_VERSION_COUNTS
+        };
+        e.u8(version).u64(at_ms).u8(self.kind as u8);
         opt_text(&mut e, self.request_id.as_deref());
         opt_text(&mut e, self.grant_id.as_deref());
         let s = &self.subject;
@@ -294,6 +324,12 @@ impl AuditRecord {
         opt_text(&mut e, d.method.as_deref());
         e.opt_u64(d.count);
         e.strs(&capped_argv(&self.argv_redacted));
+        if !counts.is_empty() {
+            e.raw(&u32::try_from(counts.len()).unwrap_or(0).to_be_bytes());
+            for (name, n) in counts {
+                e.str(&capped(name)).u64(*n);
+            }
+        }
         e.finish()
     }
 
@@ -303,7 +339,8 @@ impl AuditRecord {
     pub(crate) fn decode(b: &[u8]) -> Result<Self, VaultError> {
         let corrupt = || VaultError::from(VaultErrorKind::Corrupt);
         let mut d = Dec::new(b);
-        if d.u8()? != RECORD_VERSION {
+        let version = d.u8()?;
+        if version != RECORD_VERSION && version != RECORD_VERSION_COUNTS {
             return Err(corrupt());
         }
         let at = UNIX_EPOCH + Duration::from_millis(d.u64()?);
@@ -351,6 +388,18 @@ impl AuditRecord {
         let method = d.opt_string()?;
         let count = d.opt_u64()?;
         let argv_redacted = d.strings()?;
+        let mut counts = Vec::new();
+        if version == RECORD_VERSION_COUNTS {
+            let n = d.u32()?;
+            // Written only with one count or more, and never more than the cap.
+            if n == 0 || usize::try_from(n).map_err(|_| corrupt())? > MAX_COUNTS {
+                return Err(corrupt());
+            }
+            for _ in 0..n {
+                let name = d.string()?;
+                counts.push((name, d.u64()?));
+            }
+        }
         d.end()?;
         Ok(AuditRecord {
             at,
@@ -372,6 +421,7 @@ impl AuditRecord {
                 reason,
                 method,
                 count,
+                counts,
             },
             argv_redacted,
         })
@@ -445,6 +495,7 @@ mod tests {
                 reason: Some("because".into()),
                 method: Some("run.request".into()),
                 count: Some(3),
+                counts: Vec::new(),
             },
             argv_redacted: vec!["./emit".into(), String::new(), "\u{e9}".into()],
         }
@@ -463,9 +514,9 @@ mod tests {
             assert_eq!(AuditKind::from_u8(k as u8), Some(k));
         }
         assert_eq!(AuditKind::from_u8(0), None);
-        // Kinds 22 to 24 and from 27 on are reserved for later tasks, not
+        // Kind 22 and kinds from 27 on are reserved for later tasks, not
         // written by this build.
-        for n in [22, 23, 24, 27, 46] {
+        for n in [22, 27, 46] {
             assert_eq!(AuditKind::from_u8(n), None, "{n}");
         }
         // Numbers in order, each token its own.
@@ -482,6 +533,48 @@ mod tests {
         // The backup v2 kinds are read back: `verify` takes their entries.
         assert_eq!(AuditKind::from_u8(25), Some(AuditKind::BackupV2));
         assert_eq!(AuditKind::from_u8(26), Some(AuditKind::RestoreV2));
+        // And M2-11's.
+        assert_eq!(AuditKind::from_u8(23), Some(AuditKind::ScanMatch));
+        assert_eq!(AuditKind::from_u8(24), Some(AuditKind::MarkExposed));
+    }
+
+    /// A record's named counts (M2-11: `scan.match`'s counts by kind) come
+    /// back as written, in order. A record without any is written exactly
+    /// as before they existed (version 1, the bytes an M1 build wrote), so
+    /// every entry an earlier build wrote still reads, and a record with
+    /// some is version 2. More than [`MAX_COUNTS`] are cut to it, and each
+    /// name is capped like any string.
+    ///
+    /// Mutations: counts dropped on decode (the round trip fails); version
+    /// 2 for every record (the version 1 bytes change).
+    #[test]
+    fn named_counts_round_trip_and_leave_other_records_as_they_were() {
+        let plain = full();
+        let bytes = plain.encode();
+        assert_eq!(bytes[0], 1);
+        let mut counted = plain.clone();
+        counted.decision.counts = vec![
+            ("candidates".into(), 4096),
+            ("compared".into(), 0),
+            ("skipped_guessable".into(), u64::MAX),
+        ];
+        let with = counted.encode();
+        assert_eq!(with[0], 2);
+        assert_eq!(AuditRecord::decode(&with).unwrap(), counted);
+        // The same record without its counts is the version 1 record, byte
+        // for byte, but for the version and the counts at the end.
+        assert_eq!(with[1..bytes.len()], bytes[1..]);
+        let mut many = plain.clone();
+        many.decision.counts = (0..40).map(|i| (format!("count_{i}"), i)).collect();
+        many.decision.counts[0].0 = "\u{20ac}".repeat(4000);
+        let back = AuditRecord::decode(&many.encode()).unwrap();
+        assert_eq!(back.decision.counts.len(), MAX_COUNTS);
+        assert!(back.decision.counts[0].0.ends_with("bytes cut]"));
+        assert_eq!(back.decision.counts[1], ("count_1".to_owned(), 1));
+        assert_eq!(
+            back.decision.counts[MAX_COUNTS - 1].1,
+            (MAX_COUNTS - 1) as u64
+        );
     }
 
     /// 100 KB of command line (gate 31's size) and long strings everywhere
@@ -519,8 +612,19 @@ mod tests {
             assert!(AuditRecord::decode(&bytes[..cut]).is_err(), "{cut}");
         }
         let mut other = bytes.clone();
-        other[0] = 2;
+        other[0] = 3;
         assert!(AuditRecord::decode(&other).is_err());
+        // Version 2 says counts follow: a version 1 body under it is cut
+        // short, and a count list that is empty, or longer than the cap, is
+        // never written.
+        let mut two = bytes.clone();
+        two[0] = 2;
+        assert!(AuditRecord::decode(&two).is_err());
+        for n in [0u32, u32::try_from(MAX_COUNTS).unwrap() + 1] {
+            let mut listed = two.clone();
+            listed.extend_from_slice(&n.to_be_bytes());
+            assert!(AuditRecord::decode(&listed).is_err(), "{n}");
+        }
         let mut trailing = bytes;
         trailing.push(0);
         assert!(AuditRecord::decode(&trailing).is_err());
