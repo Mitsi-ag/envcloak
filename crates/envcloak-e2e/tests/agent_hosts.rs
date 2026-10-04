@@ -3866,7 +3866,15 @@ mod catalog {
     //! - for each tier-2 host M2-04 found drivable, a command its shell tool
     //!   starts on a pseudo-terminal of its own (the shape of Gemini CLI's
     //!   `node-pty`), under `env -i`, is an agent subject labeled with the
-    //!   host's entry, and its proofs are refused.
+    //!   host's entry, and its proofs are refused;
+    //! - and from each such pseudo-terminal (Codex's `tty: true` and every
+    //!   drivable host's, and the test fixture agent's), real proofs reach a
+    //!   real daemon and are refused there ([`ProofTarget`]): `envcloak
+    //!   approve` for an agent's pending request and `envcloak unlock` of
+    //!   the locked vault, each with the vault's passphrase on a
+    //!   descriptor. Nothing is approved or unlocked, no grant exists and
+    //!   the agent's run gets no value; the same proofs from a person's
+    //!   terminal are then taken, and the run gets its value (the control).
     //!
     //! The caller is `ec-probe`, which connects to a socket this test listens
     //! on, as the CLI connects to the daemon, and stays until it is closed;
@@ -3881,13 +3889,13 @@ mod catalog {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use envcloak_e2e::{python3, quoted, versions_toml};
+    use envcloak_e2e::{Harness, RECOVERY_KIT, python3, quoted, text, token, versions_toml};
     use envcloak_policy::{
         AgentCatalog, AgentLabel, Claims, MatchBasis, ProofRefusal, SubjectEvidence, SubjectKind,
         gather,
     };
     use envcloak_testkit::agents::{AgentHome, GroupChild, Host, HostFlags, Installed, require};
-    use envcloak_testkit::{TestHome, testkit_bin};
+    use envcloak_testkit::{Canary, TestHome, labels, testkit_bin};
     use serde_json::json;
 
     use super::{os, tier_2};
@@ -3990,14 +3998,14 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
         }
     }
 
-    /// The script a host's shell tool runs (`sh ./ec-pty-probe.sh`, in the
-    /// directory the host works in, so the command names no path a host
-    /// would ask about): `ec-probe <socket>` under `env -i`, leading a session
-    /// of its own on a new pseudo-terminal.
+    /// The line of the script a host's shell tool runs (`sh
+    /// ./ec-pty-probe.sh`, in the directory the host works in, so the
+    /// command names no path a host would ask about) that runs `ec-probe
+    /// <socket>` under `env -i`, leading a session of its own on a new
+    /// pseudo-terminal.
     fn probe_on_its_own_pty(sock: &Path) -> String {
         let probe = testkit_bin("ec-probe");
         let line = [
-            "exec".to_owned(),
             quoted(&python3().to_string_lossy()),
             "-c".to_owned(),
             quoted(PTY_ONCE),
@@ -4012,6 +4020,233 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
 
     /// The script's name, in the host's working directory.
     const PTY_SCRIPT: &str = "ec-pty-probe.sh";
+
+    /// How long a line the daemon wrote may take to reach its collected log.
+    const LOG_LIMIT: Duration = Duration::from_secs(10);
+
+    /// A daemon with an unlocked vault, a project (the canary
+    /// `OPENAI_API_KEY` imported from its `.env`) and the test fixture
+    /// agent's pending request (its `run -- ./emit`): what a command on an
+    /// agent's pseudo-terminal tries to prove itself to (gate 23 at the
+    /// daemon, Codex review). The proofs it tries are valid ones: the
+    /// vault's passphrase, on a descriptor.
+    pub(super) struct ProofTarget {
+        h: Harness,
+        repo: PathBuf,
+        id: String,
+        pass: PathBuf,
+        /// Where the attempts write their output and status.
+        dir: PathBuf,
+    }
+
+    impl ProofTarget {
+        pub(super) fn new() -> Self {
+            let mut h = Harness::start();
+            let pass = h.secret_file(labels::VAULT_PASSPHRASE, true);
+            let kit = h.files().join("kit");
+            let home = h.home.home();
+            let made = h.human(
+                &home,
+                &[
+                    "vault",
+                    "create",
+                    "--passphrase-fd",
+                    "3",
+                    "--kit-fd",
+                    "4",
+                    "--kdf-memory",
+                    "64MiB",
+                ],
+                &[(3, &pass, true), (4, &kit, false)],
+                &[],
+            );
+            assert_eq!(made.code, 0, "{}", made.all());
+            let kit_text = std::fs::read_to_string(&kit).unwrap();
+            h.add_canary(Canary::new(RECOVERY_KIT, kit_text.trim_end().to_owned()));
+            let repo = h.home.root().join("acme-web");
+            std::fs::create_dir_all(&repo).unwrap();
+            let env = format!(
+                "OPENAI_API_KEY={}\n",
+                h.canary(labels::OPENAI_API_KEY).as_str()
+            );
+            std::fs::write(repo.join(".env"), env).unwrap();
+            h.allow_plaintext(repo.join(".env"));
+            let imported = h.human(&repo, &["init", "--import", "--yes"], &[], &[]);
+            assert_eq!(imported.code, 0, "{}", imported.all());
+            envcloak_e2e::write_script(&repo.join("emit"), "#!/bin/sh\necho started\n");
+            let run = h.agent(&repo, &["run", "--", "./emit"]);
+            assert_eq!(run.status.code(), Some(125), "{}", text(&run));
+            assert_eq!(token(&run.stderr), "approval_required", "{}", text(&run));
+            let err = String::from_utf8_lossy(&run.stderr).into_owned();
+            let id = err
+                .split("request=")
+                .nth(1)
+                .and_then(|r| r.get(..8))
+                .unwrap_or_else(|| panic!("no request id: {err}"))
+                .to_owned();
+            let dir = h.files().join("attempts");
+            std::fs::create_dir_all(&dir).unwrap();
+            ProofTarget {
+                h,
+                repo,
+                id,
+                pass,
+                dir,
+            }
+        }
+
+        /// The shell commands a command on an agent's pseudo-terminal runs,
+        /// under `env -i` with only this daemon's home, each writing its
+        /// output and status beside the others: `envcloak approve <id> --for
+        /// 1h` for the pending request, with the vault's passphrase on
+        /// descriptor 3; `envcloak lock`, which needs no proof; then
+        /// `envcloak unlock`, with the passphrase on descriptor 3.
+        pub(super) fn attempts(&self) -> String {
+            let env = self
+                .h
+                .home
+                .vars()
+                .iter()
+                .map(|(k, v)| format!("{k}={}", quoted(&v.to_string_lossy())))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let cli = quoted(&self.h.cli().to_string_lossy());
+            let pass = quoted(&self.pass.to_string_lossy());
+            let one = |name: &str, args: &str| {
+                let at =
+                    |ext: &str| quoted(&self.dir.join(format!("{name}.{ext}")).to_string_lossy());
+                format!(
+                    "/usr/bin/env -i {env} {cli} {args} >{} 2>{}; echo $? >{}",
+                    at("out"),
+                    at("err"),
+                    at("code")
+                )
+            };
+            let proof = format!("--passphrase-fd 3 3<{pass}");
+            [
+                one("approve", &format!("approve {} --for 1h {proof}", self.id)),
+                one("lock", "lock"),
+                one("unlock", &format!("unlock {proof}")),
+            ]
+            .join("; ")
+        }
+
+        /// [`ProofTarget::attempts`] as a line a host's shell tool runs: on
+        /// a pseudo-terminal of its own, `sh` leading its session there.
+        pub(super) fn attempts_on_own_pty(&self) -> String {
+            [
+                quoted(&python3().to_string_lossy()),
+                "-c".to_owned(),
+                quoted(PTY_ONCE),
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                quoted(&self.attempts()),
+            ]
+            .join(" ")
+        }
+
+        /// Both proofs were refused as an agent's, and nothing came of them:
+        /// no approval in the daemon's audit, no grant, the vault still
+        /// locked (the lock between them ran), the agent's run given
+        /// nothing. Then the control: the same passphrase from a person's
+        /// terminal unlocks the vault and approves the agent's request (its
+        /// new one: the lock ended the first), and the run gets its value.
+        /// Prints the measurement.
+        pub(super) fn assert_refused_then_taken(mut self, host: &str) {
+            let read = |dir: &Path, name: &str, ext: &str| {
+                std::fs::read(dir.join(format!("{name}.{ext}"))).unwrap_or_default()
+            };
+            let dir = self.dir.clone();
+            assert_eq!(
+                String::from_utf8_lossy(&read(&dir, "lock", "code")).trim(),
+                "0",
+                "{host}: the lock between the proofs: {}",
+                String::from_utf8_lossy(&read(&dir, "lock", "err"))
+            );
+            for name in ["approve", "unlock"] {
+                let (out, err) = (read(&dir, name, "out"), read(&dir, name, "err"));
+                self.h.record(&format!("{host}: {name} (stdout)"), &out);
+                self.h.record(&format!("{host}: {name} (stderr)"), &err);
+                let code = String::from_utf8_lossy(&read(&dir, name, "code"))
+                    .trim()
+                    .to_owned();
+                println!(
+                    "measurement: catalog host={host} os={}: `envcloak {name}` with the \
+                     passphrase from its pseudo-terminal: exit {code}, {}",
+                    os(),
+                    token(&err)
+                );
+                assert!(
+                    !code.is_empty() && code != "0",
+                    "{host}: {name} ran or was taken: {code:?} {}",
+                    String::from_utf8_lossy(&err)
+                );
+                assert_eq!(
+                    token(&err),
+                    "proof_refused",
+                    "{host}: {name}: {}",
+                    String::from_utf8_lossy(&err)
+                );
+            }
+            let mut log = String::new();
+            for method in ["pending.get", "unlock"] {
+                log = self.h.expect_log(
+                    &format!("envcloakd: audit: proof refused method={method} reason=agent"),
+                    LOG_LIMIT,
+                );
+            }
+            assert!(
+                !log.contains("envcloakd: audit: approved request="),
+                "{host}: {log}"
+            );
+            let grants = self.h.agent(&self.repo, &["grants", "list", "--json"]);
+            assert_eq!(grants.status.code(), Some(0), "{}", text(&grants));
+            let g: serde_json::Value = serde_json::from_slice(&grants.stdout).unwrap();
+            assert_eq!(g["grants"], json!([]), "{host}: {g}");
+            let st = self.h.agent(&self.repo, &["status", "--json"]);
+            let st: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
+            assert_eq!(st["vault"]["state"], "locked", "{host}: {st}");
+            let run = self.h.agent(&self.repo, &["run", "--", "./emit"]);
+            assert_ne!(run.status.code(), Some(0), "{host}: {}", text(&run));
+            assert!(run.stdout.is_empty(), "{host}: {}", text(&run));
+            // The control, from a person's terminal.
+            let home = self.h.home.home();
+            let unlocked = self.h.human(
+                &home,
+                &["unlock", "--passphrase-fd", "3"],
+                &[(3, &self.pass, true)],
+                &[],
+            );
+            assert_eq!(unlocked.code, 0, "{host}: {}", unlocked.all());
+            let again = self.h.agent(&self.repo, &["run", "--", "./emit"]);
+            assert_eq!(
+                token(&again.stderr),
+                "approval_required",
+                "{}",
+                text(&again)
+            );
+            let err = String::from_utf8_lossy(&again.stderr).into_owned();
+            let id = err
+                .split("request=")
+                .nth(1)
+                .and_then(|r| r.get(..8))
+                .unwrap_or_else(|| panic!("no request id: {err}"))
+                .to_owned();
+            let typed = format!("{}\r", self.h.canary(labels::VAULT_PASSPHRASE).as_str());
+            let repo = self.repo.clone();
+            let approved = self.h.human(
+                &repo,
+                &["approve", &id, "--for", "1h"],
+                &[],
+                &[("Vault passphrase to approve this: ", &typed)],
+            );
+            assert_eq!(approved.code, 0, "{host}: {}", approved.all());
+            let run = self.h.agent(&self.repo, &["run", "--", "./emit"]);
+            assert_eq!(run.status.code(), Some(0), "{host}: {}", text(&run));
+            assert_eq!(String::from_utf8_lossy(&run.stdout), "started\n");
+            self.h.assert_swept(host);
+        }
+    }
 
     /// Checks the evidence of a command `id`'s host started on a
     /// pseudo-terminal of its own: it leads its session there, with no marker,
@@ -4061,6 +4296,7 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
         let Some(installed) = require(found, "a_codex_tty_true_command_is_an_agent") else {
             return;
         };
+        let target = ProofTarget::new();
         let a = AgentHome::start(Host::Codex, installed);
         let l = Listener::new();
         let probe = testkit_bin("ec-probe");
@@ -4071,6 +4307,8 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
         );
         let script = json!({"steps": [
             {"tool": "exec_command", "input": {"cmd": cmd, "tty": true, "yield_time_ms": 30000}},
+            {"tool": "exec_command",
+             "input": {"cmd": target.attempts(), "tty": true, "yield_time_ms": 60000}},
             {"say": "done"}
         ]});
         let running = a.spawn(
@@ -4090,10 +4328,13 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
         assert!(e.root_index() > 0);
         assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
         a.check_pinned();
+        target.assert_refused_then_taken("codex");
     }
 
-    /// One drivable tier-2 host's shell tool runs [`probe_on_its_own_pty`];
-    /// the command's evidence is gathered while the host runs.
+    /// One drivable tier-2 host's shell tool runs [`probe_on_its_own_pty`],
+    /// then `target`'s proofs on a pseudo-terminal of their own
+    /// ([`ProofTarget::attempts_on_own_pty`]); the probe's evidence is
+    /// gathered while the host runs, the proofs' outcome checked after it.
     fn drivable_pty_command(
         id: &str,
         variant: &str,
@@ -4106,10 +4347,15 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
         ),
     ) -> Option<SubjectEvidence> {
         pinned(id, variant, id)?;
+        let target = ProofTarget::new();
         let l = Listener::new();
         let mut input = input;
         input["command"] = json!(format!("sh ./{PTY_SCRIPT}"));
-        let script = probe_on_its_own_pty(&l.sock);
+        let script = format!(
+            "{}{}\n",
+            probe_on_its_own_pty(&l.sock),
+            target.attempts_on_own_pty()
+        );
         let setup = |home: &envcloak_testkit::TestHome,
                      model: &envcloak_testkit::agents::Model,
                      cmd: &mut std::process::Command| {
@@ -4125,12 +4371,14 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
         });
         let run = run?;
         let e = rx.recv().unwrap();
-        Some(e.unwrap_or_else(|why| {
+        let e = e.unwrap_or_else(|why| {
             panic!(
                 "{id}: {why}; the host said {}",
                 String::from_utf8_lossy(&run.output.stdout)
             )
-        }))
+        });
+        target.assert_refused_then_taken(id);
+        Some(e)
     }
 
     /// Gates 23 and 25 for Qwen Code (drivable, M2-04): node runs its entry
@@ -4497,7 +4745,9 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
     /// the home: the script and node copied (the kernel names a process after
     /// the file it runs, not a link to it), the rest linked. The script runs
     /// node on index.js, `argv[0]` set to the script's path; node is Cursor by
-    /// its path, and lies in the entry's install tree.
+    /// its script, asserted: the node it ships runs any script, so it is no
+    /// identity (it roots no grant above a session, and lies in no install
+    /// tree).
     #[test]
     fn cursor_cli_running_is_its_entry() {
         let Some(i) = pinned("cursor-cli", "native", "cursor_cli_running_is_its_entry") else {
@@ -4521,7 +4771,7 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
         }
         let node = version.join("node");
         assert!(
-            AgentCatalog::builtin().within_install_tree("cursor", &node, Some(&home.home())),
+            !AgentCatalog::builtin().within_install_tree("cursor", &node, Some(&home.home())),
             "{node:?}"
         );
         let script = version.join("cursor-agent");
@@ -4529,7 +4779,132 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
             "cursor-cli",
             &home,
             &[script.as_os_str()],
-            &[("node", "cursor", MatchBasis::Executable)],
+            &[("node", "cursor", MatchBasis::Asserted)],
         );
+    }
+
+    /// Gate 23 at the daemon, with no host installed: the test fixture
+    /// agent's shell runs [`ProofTarget::attempts_on_own_pty`], the shape
+    /// of a command `node-pty` or `tty: true` starts. The daemon refuses
+    /// both proofs as an agent's; a person's terminal then gives them.
+    /// Mutation checked (run outside any agent's tree): removing the
+    /// fixture agent's executable pattern fails this test (the proofs are
+    /// taken).
+    #[test]
+    fn a_proof_from_an_agents_own_pty_is_refused_by_the_daemon() {
+        let mut target = ProofTarget::new();
+        let line = target.attempts_on_own_pty();
+        let repo = target.repo.clone();
+        let out = target.h.agent_line(&repo, &line);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        target.assert_refused_then_taken("fixture");
+    }
+
+    /// The catalog's `code_selecting_env` against the pinned builds (M2-10
+    /// review): for every entry with an executable identity (an install
+    /// tree or a signature, what a standing approval could name), its
+    /// pinned native executable is run with each variable known to make a
+    /// Bun or Node executable run a file it is given (`BUN_OPTIONS
+    /// =--preload=`, `BUN_BE_BUN=1` with the file as its argument,
+    /// `NODE_OPTIONS=--require=`), the file writing a marker. The variables
+    /// whose marker appears are the entry's `code_selecting_env`, no more
+    /// and no fewer, on each system. Mutation checked: removing
+    /// `BUN_OPTIONS` from Claude Code's entry, or adding `NODE_OPTIONS` to
+    /// Copilot CLI's, fails this test.
+    #[test]
+    fn code_selecting_env_is_measured() {
+        let cat = AgentCatalog::builtin();
+        let home = TestHome::new();
+        let pinned_exe = |id: &str, variant: &str| -> Option<PathBuf> {
+            let i = pinned(id, variant, "code_selecting_env_is_measured")?;
+            Some(match &i.pin.starts {
+                Some((path, _)) => i.dir.join(path),
+                None => i.exe.clone(),
+            })
+        };
+        let entries = [
+            ("claude-code", "native"),
+            ("codex", "native"),
+            ("opencode", "native"),
+            ("copilot-cli", "npm"),
+        ];
+        // Every entry an identity could name is measured here.
+        let src = AgentCatalog::builtin_source();
+        for id in cat.ids() {
+            let identity = entry_has(src, id, "install_trees") || entry_has(src, id, "signatures");
+            assert_eq!(
+                identity,
+                entries.iter().any(|(e, _)| *e == id),
+                "{id}: an entry with an install tree or a signature is measured here"
+            );
+        }
+        let marker_dir = home.root().join("m");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        for (id, variant) in entries {
+            let Some(exe) = pinned_exe(id, variant) else {
+                return;
+            };
+            let mut ran = Vec::new();
+            for var in ["BUN_OPTIONS", "BUN_BE_BUN", "NODE_OPTIONS"] {
+                let marker = marker_dir.join(format!("{id}-{var}"));
+                let file = marker_dir.join(format!("{id}-{var}.js"));
+                std::fs::write(
+                    &file,
+                    format!(
+                        "require(\"fs\").writeFileSync({}, \"ran\");\n",
+                        json!(marker.to_string_lossy())
+                    ),
+                )
+                .unwrap();
+                let mut cmd = Command::new(&exe);
+                cmd.env_clear()
+                    .envs(home.vars())
+                    .env("DISABLE_AUTOUPDATER", "1")
+                    .env("COPILOT_AUTO_UPDATE", "false")
+                    .current_dir(home.home())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+                    cmd.env(k, "http://127.0.0.1:9");
+                }
+                match var {
+                    "BUN_OPTIONS" => {
+                        cmd.env(var, format!("--preload={}", file.display()))
+                            .arg("--version");
+                    }
+                    "BUN_BE_BUN" => {
+                        cmd.env(var, "1").arg(&file);
+                    }
+                    _ => {
+                        cmd.env(var, format!("--require={}", file.display()))
+                            .arg("--version");
+                    }
+                }
+                let mut child = GroupChild::spawn(&mut cmd).unwrap();
+                let _ = child.end_within(Duration::from_secs(30));
+                if marker.exists() {
+                    ran.push(var);
+                }
+            }
+            let want: Vec<&str> = cat
+                .code_selecting_env(id)
+                .iter()
+                .map(String::as_str)
+                .collect();
+            println!(
+                "measurement: catalog code_selecting_env os={} {id}: {ran:?}",
+                os()
+            );
+            assert_eq!(ran, want, "{id} ({})", exe.display());
+        }
+    }
+
+    /// Whether `id`'s `[[agent]]` table in the catalog text `src` sets
+    /// `key`.
+    fn entry_has(src: &str, id: &str, key: &str) -> bool {
+        src.split("[[agent]]")
+            .find(|t| t.contains(&format!("\nid = \"{id}\"\n")))
+            .is_some_and(|t| t.lines().any(|l| l.starts_with(&format!("{key} ="))))
     }
 }
