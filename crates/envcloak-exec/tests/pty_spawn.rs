@@ -51,15 +51,33 @@ fn main() {
             failures_before_the_start_keep_their_exit_codes,
         ),
     ];
-    let filter: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| !a.starts_with('-'))
-        .collect();
+    // Name filters: words that are not options, nor the value of a libtest
+    // option that takes one (`--test-threads 6`).
+    let mut filter = Vec::new();
+    let mut words = std::env::args().skip(1);
+    while let Some(a) = words.next() {
+        if [
+            "--test-threads",
+            "--skip",
+            "--color",
+            "--format",
+            "--logfile",
+            "-Z",
+        ]
+        .contains(&a.as_str())
+        {
+            words.next();
+        } else if !a.starts_with('-') {
+            filter.push(a);
+        }
+    }
     let mut failed = Vec::new();
+    let mut ran = 0usize;
     for (name, case) in cases {
         if !filter.is_empty() && !filter.iter().any(|f| name.contains(f.as_str())) {
             continue;
         }
+        ran += 1;
         match std::panic::catch_unwind(case) {
             Ok(()) => println!("pty_spawn: {name} ... ok"),
             Err(_) => {
@@ -68,6 +86,7 @@ fn main() {
             }
         }
     }
+    println!("pty_spawn: {ran} case(s) run, {} failed", failed.len());
     if !failed.is_empty() {
         println!("pty_spawn: failed: {failed:?}");
         std::process::exit(101);
