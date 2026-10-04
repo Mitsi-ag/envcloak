@@ -67,6 +67,10 @@ fn main() {
                 the_monitor_stops_cat_on_the_suspend_character_and_resumes_it,
             ),
             (
+                "suspend_stops_the_command_and_the_channels_end_hangs_it_up",
+                suspend_stops_the_command_and_the_channels_end_hangs_it_up,
+            ),
+            (
                 "an_outer_job_control_shell_regains_its_terminal_and_fg_resumes",
                 an_outer_job_control_shell_regains_its_terminal_and_fg_resumes,
             ),
@@ -247,6 +251,54 @@ fn the_monitor_stops_cat_on_the_suspend_character_and_resumes_it() {
     };
     assert_eq!(status.code(), Some(0), "{status:?}");
     assert!(monitor.finish().unwrap().success());
+}
+
+/// The monitor's other two commands on the real path: `Suspend` (the CLI
+/// got SIGTSTP from another process) stops the command, which `Resume`
+/// continues; and the end of the control channel while the command runs
+/// (the CLI gone) hangs the command up, so the monitor reaps it and exits
+/// on its own. `finish` returns only once that has happened.
+fn suspend_stops_the_command_and_the_channels_end_hangs_it_up() {
+    let (master, slave, _) = raw_pty(false);
+    let cat = cat_command();
+    let mut monitor = spawn_session(
+        &[OsStr::new(&cat)],
+        &[
+            (OsStr::new("PATH"), OsStr::new("/usr/bin:/bin")),
+            (OsStr::new(ROLE), OsStr::new("cat")),
+        ],
+        slave,
+    )
+    .unwrap();
+    let mut screen = Screen::new(master);
+    screen.type_bytes(b"line-one\n");
+    screen.expect("line-one\r\n", 1, "cat runs under the monitor");
+    monitor.send(MonitorCommand::Suspend).unwrap();
+    assert_eq!(
+        monitor.next_event(Some(DEADLINE)).unwrap(),
+        Some(MonitorEvent::Stopped(libc::SIGTSTP)),
+        "Suspend did not stop cat"
+    );
+    monitor.send(MonitorCommand::Resume).unwrap();
+    assert_eq!(
+        monitor.next_event(Some(DEADLINE)).unwrap(),
+        Some(MonitorEvent::Continued)
+    );
+    screen.type_bytes(b"line-two\n");
+    screen.expect("line-two\r\n", 1, "cat reads again");
+    // The CLI's end of the channel goes, the command still running.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(monitor.finish());
+    });
+    let finished = rx.recv_timeout(DEADLINE).expect("the monitor did not end");
+    assert!(finished.unwrap().success());
+    // Nothing holds the slave any more: the terminal ends.
+    assert!(
+        screen.wait_for_end(),
+        "the terminal did not end: {}",
+        screen.text()
+    );
 }
 
 /// The suspend and EOF characters of `slave`, as the shell left them.
