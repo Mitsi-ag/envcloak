@@ -61,6 +61,14 @@ Beyond the requirement the peer must run with the hardened runtime flag and carr
 - `security-framework` 3.x covers the audit-token guest lookup (`SecCodeCopyGuestWithAttributes`), the requirement check (`SecCodeCheckValidity`) and the data protection keychain items; it does not wrap `SecCodeCopySigningInformation`, which the runtime-flag and entitlement conditions need, so M3-07 calls that from `envcloak-sys` (the dependency trial, below).
 - A build that pins no signing identity (Linux, source and unsigned builds) has no `app` role, and its CLI reports "daemon identity unverified", as in M1.
 
+## The app run by an agent (M3-07 to M3-16)
+
+The `app` role says which code sent a request, not who started it. The daemon still reads the peer's evidence at each `app.` request: from an app whose evidence names an agent (an agent ran the app's executable itself, so the agent is in its ancestry or its markers are in the app's claims) or whose chain is cut at the walk's depth limit, every `app.` request but `app.lock` is refused (`proof_refused`) and audited before anything is answered, so no envelope, pending request or Touch ID prompt reaches it; `app.lock` is answered, since locking only tightens (SPEC §10b). An agent that starts the app through LaunchServices (`open -a`), or whose app outlives it and is reparented to launchd, is not seen this way; there the guard is user presence on the Secure Enclave key for the statement the app renders (SPEC §10b, "Honest limits").
+
+## Screen lock and session switch (M3-17)
+
+The app reports a screen lock and a switch away from the login session with `app.lock` (`screen_lock`, `session_resign`; SPEC §5 "Lock"), which no client can call. M3-17 picks the signal on macOS 26 and 27 (plan K3-04) among `NSWorkspace.screensDidSleepNotification`, `NSWorkspace.sessionDidResignActiveNotification` and the undocumented `com.apple.screenIsLocked` distributed notification, and records here which one, with the evidence, and whether another program running as the user can post it. Any such program can post a distributed notification, so if the app listens for one, a program can make it lock the vault early with that reason. Locking only tightens: what such a program changes is the recorded reason, never what a grant reaches. Not chosen yet.
+
 ## Build commands
 
 | Command | Task | What it does |
@@ -117,7 +125,7 @@ Run with `scripts/macos/qa-run.sh` on a clean macOS user account the founder cre
 | A11 Activity, verify log | gate 33 | not run |
 | A12 screen lock | g7 | not run |
 | A13 rollback | g5 | not run |
-| A14 forged app peers | g4, gate 22 | not run |
+| A14 forged app peers, and the genuine app run by the fixture agent (every request but `app.lock` refused) | g4, gates 22 and 23 | not run |
 | A15 a forged daemon | g1, gate 21 | not run |
 | A16 `envcloak reveal` from a person and an agent | R-M3-30 | not run |
 | A17 `envcloak add --ask` from an agent | R-M3-26 | not run |
