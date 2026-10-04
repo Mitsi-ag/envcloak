@@ -107,6 +107,7 @@ fn operate(
             project: Some(ProjectPlan {
                 dir: active.to_path_buf(),
                 notes: Vec::new(),
+                readers: Vec::new(),
                 steps: vec![Step {
                     what: "owned fixture note".to_owned(),
                     path: active.join("note.md"),
