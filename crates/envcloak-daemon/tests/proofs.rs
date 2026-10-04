@@ -118,6 +118,7 @@ fn a_caller_without_a_terminal_gives_no_proof() {
             expires_secs: None,
             account: None,
             detail: None,
+            exposed: None,
         },
         field: Some("value".into()),
         grants: 0,

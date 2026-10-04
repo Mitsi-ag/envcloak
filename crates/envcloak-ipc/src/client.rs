@@ -61,8 +61,7 @@ use crate::proto::{
     ImportVerify, PendingList, PendingListParams, PendingPoll, PendingStateParams, RecoverParams,
     RecoveryConfirm, RecoveryConfirmParams, RestoredFiles, VaultRecover, VerifyParams,
 };
-use crate::proto::{ScanMatch, ScanMatchParams};
-use crate::view::ScanMatchView;
+use crate::proto::{ItemsMarkExposed, MarkExposedParams, ScanMatch, ScanMatchParams};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
     ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
@@ -76,6 +75,7 @@ use crate::view::{
     BackupView, FileBackupView, ImportPlanView, PendingListView, RecoveredView,
     RecoveryConfirmedView, VerifyView,
 };
+use crate::view::{MarkedView, ScanMatchView};
 use crate::wire_secret::WireSecret;
 
 /// How long a call may wait for its response. `vault create` runs
@@ -712,6 +712,14 @@ impl Client {
     /// As [`Client::call`].
     pub fn scan_match(&mut self, p: &ScanMatchParams) -> Result<ScanMatchView, ClientError> {
         self.call::<ScanMatch>(p)
+    }
+
+    /// `items.mark_exposed`: marks `p`'s items "exposed: rotate".
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_mark_exposed(&mut self, p: &MarkExposedParams) -> Result<MarkedView, ClientError> {
+        self.call::<ItemsMarkExposed>(p)
     }
 
     /// `files.backup`: an encrypted backup of `p`'s files.

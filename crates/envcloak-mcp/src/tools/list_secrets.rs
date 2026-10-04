@@ -1,8 +1,10 @@
 //! `list_secrets { project_dir? }`: the vault's items, metadata only (SPEC
 //! §7): slug, class, provider, classification and field names, and, for a
 //! project, which variables its `envcloak.toml` binds to which items and
-//! whether each resolves. Never a value, and nothing of an item that is
-//! not a secret beyond its slug and class.
+//! whether each resolves; and whether each key's value was found outside
+//! the vault (`exposed`, "exposed: rotate", which `items.mark_exposed`
+//! sets and a rotation clears). Never a value, and nothing of an item that
+//! is not a secret beyond its slug and class.
 
 use envcloak_client::fail::Failure;
 use envcloak_ipc::view::{ItemClassView, ItemView};
@@ -95,8 +97,8 @@ fn item(v: &ItemView) -> Value {
         "provider": v.provider.as_deref().map(shown),
         "classification": serde_json::to_value(v.classification).unwrap_or(Value::Null),
         "fields": v.fields.iter().map(|f| shown(&f.name)).collect::<Vec<_>>(),
-        // Exposure ("exposed: rotate") is not tracked in this build.
-        "exposed": Value::Null,
+        // "exposed: rotate": the value was found outside the vault.
+        "exposed": v.exposed.is_some(),
     })
 }
 
@@ -132,7 +134,9 @@ fn list(args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> Result<Value, Fail
     Ok(json!({
         "items": items.items.iter().map(item).collect::<Vec<_>>(),
         "project": project,
-        "note": "Names and metadata only: EnvCloak never returns a key's value. `exposed` is null: \
-             exposure is not tracked in this build.",
+        "note": "Names and metadata only: EnvCloak never returns a key's value. `exposed` is true \
+             for a key whose value was found outside the vault (in an agent transcript, git \
+             history, a config backup, a synced folder, a shell profile, an agent config or an \
+             env file): the person should rotate it. It is null for an item that is not a key.",
     }))
 }

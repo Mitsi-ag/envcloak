@@ -1,6 +1,7 @@
 //! The item methods (SPEC §5 "Items", §6.3, §10b "Writes that need a
 //! proof"): `items.list`, `items.show`, `items.check`, `items.add`,
-//! `items.target`, `items.rotate` and `items.remove`.
+//! `items.target`, `items.rotate`, `items.remove` and
+//! `items.mark_exposed`.
 //!
 //! What they send back is metadata only (`envcloak_ipc::view`): no method
 //! here answers with a value, and none records one. Names a client sent
@@ -23,7 +24,10 @@
 //!   (SPEC §10b), unless the new value changes the item's classification:
 //!   it is detected as `items.add` detects it, stored in the same
 //!   transaction as the value, and a change (test to live, say) ends the
-//!   grants and pending requests that bind the item. A removal writes an encrypted backup of the vault first,
+//!   grants and pending requests that bind the item. A rotation also
+//!   clears the item's "exposed: rotate" mark: the value found elsewhere
+//!   is not the one it holds any more. A removal writes an encrypted
+//!   backup of the vault first,
 //!   which keeps the item's values (`envcloak recover` restores it), then
 //!   deletes the item and ends the grants and pending requests that bind
 //!   it. When the backup cannot be written, nothing is removed. A write
@@ -32,6 +36,13 @@
 //!   failed, with that reason, as a wrong passphrase is.
 //! - `items.target` shows what a rotation or removal would change, and is
 //!   served only to a caller that may give a proof, like `pending.get`.
+//! - `items.mark_exposed` marks items "exposed: rotate" (SPEC §6.4, §6.5):
+//!   their values were found outside the vault, in the kinds of place it
+//!   names. Marking only tightens, so any caller may, with no proof; each
+//!   call is audited. A mark that names only kinds an item is marked for
+//!   already writes nothing, so a doctor run repeated changes nothing it
+//!   marked; an id that names no item (one removed meanwhile) is counted,
+//!   never an error for the rest.
 //!
 //! Every write is refused on a vault that failed its integrity check.
 
@@ -41,17 +52,17 @@ use envcloak_core::SecretBytes;
 use envcloak_core::audit::AuditKind;
 use envcloak_core::crypto::{CryptoErrorKind, ItemClass};
 use envcloak_core::vault::{
-    Account, Classification, FieldId, FieldName, ItemDetails, ItemId, ItemMeta, MAX_FIELD, NewItem,
-    Slug, Vault, VaultError, VaultErrorKind,
+    Account, Classification, ExposureSource, FieldId, FieldName, ItemDetails, ItemId, ItemMeta,
+    MAX_FIELD, NewItem, Slug, Vault, VaultError, VaultErrorKind,
 };
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{
-    AddParams, CheckParams, ErrorKind, ListParams, RemoveParams, RotateParams, SlugParams,
-    TargetParams,
+    AddParams, CheckParams, ErrorKind, ListParams, MAX_MARKED, MarkExposedParams, RemoveParams,
+    RotateParams, SlugParams, TargetParams,
 };
 use envcloak_ipc::view::{
     AddedView, CheckBindingView, CheckView, ClassificationView, ItemDetail, ItemView, ItemsView,
-    LengthClass, RefStatus, RemovedView, RotatedView, TargetView,
+    LengthClass, MarkedView, RefStatus, RemovedView, RotatedView, TargetView,
 };
 use envcloak_policy::{
     BindErrorKind, Binding, EnvName, ManifestError, SubjectEvidence, bind_items, load_project,
@@ -638,12 +649,15 @@ pub fn rotate(
             classification: after,
             ..meta.details.clone()
         });
-        // The value and the classification change together, or neither.
+        // The value and the classification change together, or neither;
+        // and the new value is no longer the one found elsewhere, so the
+        // item is no longer "exposed: rotate".
         v.transact(|txn| {
             txn.set_value(field, value)?;
             if let Some(details) = details {
                 txn.update_item(t.item, details)?;
             }
+            txn.clear_exposure(t.item)?;
             Ok(())
         })
         .map_err(|e| write_error(&e))?;
@@ -686,6 +700,84 @@ pub fn rotate(
         reclassified_from: reclassified.then(|| ClassificationView::from(before)),
         grants_ended: u64::try_from(grants).unwrap_or(u64::MAX),
     })
+}
+
+/// Whether `s` is shaped like an item's id: 26 Crockford base32
+/// characters, as `ItemId`'s `Display` writes it.
+fn id_shaped(s: &str) -> bool {
+    s.len() == 26
+        && s.bytes()
+            .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
+}
+
+/// `items.mark_exposed`. See the module documentation. The request is
+/// checked whole before anything is written: 1 to [`MAX_MARKED`] items,
+/// each named once by an id of the right shape, with at least one kind of
+/// place and a count of at least 1 (`invalid_params` otherwise).
+pub fn mark_exposed(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: MarkExposedParams,
+) -> Result<MarkedView, RpcError> {
+    if p.items.is_empty() || p.items.len() > MAX_MARKED {
+        return Err(RpcError::new(ErrorKind::InvalidParams));
+    }
+    let mut named = std::collections::HashSet::with_capacity(p.items.len());
+    for e in &p.items {
+        if !id_shaped(&e.item)
+            || !named.insert(e.item.as_str())
+            || e.sources.is_empty()
+            || e.count == 0
+        {
+            return Err(RpcError::new(ErrorKind::InvalidParams));
+        }
+    }
+    let caller = evidence(shared, peer, &p.claims)?;
+    let mut s = locked(&shared.state);
+    let v = s.unlocked_mut()?;
+    let by_id: std::collections::HashMap<String, &ItemMeta> =
+        v.items().iter().map(|m| (m.id.to_string(), m)).collect();
+    let (mut marks, mut already, mut missing) = (Vec::new(), 0usize, 0usize);
+    for e in &p.items {
+        let Some(m) = by_id.get(&e.item) else {
+            missing += 1;
+            continue;
+        };
+        let sources: Vec<ExposureSource> = e.sources.iter().map(|k| (*k).into()).collect();
+        // Marked for every kind named already: nothing to write.
+        let known = m
+            .exposure
+            .as_ref()
+            .is_some_and(|x| sources.iter().all(|k| x.sources.contains(k)));
+        if known && m.rotate_recommended {
+            already += 1;
+        } else {
+            marks.push((m.id, m.slug.clone(), sources, e.count));
+        }
+    }
+    if !marks.is_empty() {
+        v.transact(|t| {
+            for (id, _, sources, count) in &marks {
+                t.mark_exposed(*id, sources, *count)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| write_error(&e))?;
+    }
+    let marked: Vec<(ItemId, Slug)> = marks.into_iter().map(|(id, slug, ..)| (id, slug)).collect();
+    let view = MarkedView {
+        marked: u32::try_from(marked.len()).unwrap_or(u32::MAX),
+        already: u32::try_from(already).unwrap_or(u32::MAX),
+        missing: u32::try_from(missing).unwrap_or(u32::MAX),
+    };
+    s.audit(AuditEvent::MarkedExposed {
+        pid: peer.pid,
+        subject: subject_summary(peer, &caller),
+        marked,
+        already,
+        missing,
+    });
+    Ok(view)
 }
 
 /// The classification the registry gives `value` in an item with

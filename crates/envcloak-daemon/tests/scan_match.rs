@@ -1,4 +1,4 @@
-//! `scan.match` over the daemon's socket (M2 plan
+//! `scan.match` and `items.mark_exposed` over the daemon's socket (M2 plan
 //! M2-11, D-32; SPEC §6.4, §6.5; gate 36's low-entropy part, gate 33):
 //! - a candidate short enough to guess, counted as a server reads it (in
 //!   characters, F-58; libpq's escapes decoded, F-65; a Go DSN whose
@@ -14,7 +14,9 @@
 //! - only `secret` items match: never a card's value or a login's;
 //! - a request that breaks the bounds is refused whole, and a frame over
 //!   1 MiB is refused before it is read;
-//! - every call is audited with counts and never a candidate.
+//! - every call is audited with counts and never a candidate;
+//! - `items.mark_exposed` marks, repeats change nothing, and a rotation
+//!   clears the mark.
 //!
 //! The caller is this test process, made a terminal session so the daemon
 //! takes its proofs (a person); the fixture agent's marker makes it an
@@ -42,10 +44,11 @@ use envcloak_core::vault::{
     VaultPaths,
 };
 use envcloak_ipc::proto::{
-    AddParams, CandidateForm, ErrorKind, ImportEntry, ImportParams, ImportProject, ImportScope,
-    MAX_CANDIDATE, MAX_SCAN_CANDIDATES, ScanCandidate, ScanMatchParams, ScanPurpose, ScanSource,
+    AddParams, CandidateForm, ErrorKind, ExposedItem, ImportEntry, ImportParams, ImportProject,
+    ImportScope, MAX_CANDIDATE, MAX_SCAN_CANDIDATES, MarkExposedParams, ScanCandidate,
+    ScanMatchParams, ScanPurpose, ScanSource,
 };
-use envcloak_ipc::view::{ScanMatchView, ScanMatchedView};
+use envcloak_ipc::view::{ExposureSourceView, ScanMatchView, ScanMatchedView};
 use envcloak_ipc::{Client, ClientError, WireSecret};
 use envcloak_testkit::{
     Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, find, fresh_seed, labels,
@@ -880,5 +883,167 @@ fn requests_over_the_bounds_are_refused_whole() {
     let scans = scan_entries(&entries);
     assert_eq!(scans.len(), 1);
     assert_eq!(named(&scans[0].3, "candidates_transcript"), 1);
+    f.sweep_with(&entries);
+}
+
+/// `items.mark_exposed` (R-M2-40): an item is marked "exposed: rotate" with
+/// the kinds of place and the count; a repeat of the same kinds changes
+/// nothing (the view and the audit say `already`); a new kind is added; an
+/// id of no item is counted missing, never an error for the rest; any
+/// caller may mark (tightening), an agent included; a malformed request is
+/// refused whole; and a rotation clears the mark. Each call is audited
+/// with the items it marked.
+///
+/// Mutations: a repeat written again (the count doubles and `already` is
+/// 0); rotation leaving the mark (the rotated item still shows it).
+#[test]
+fn marking_exposed_items_is_idempotent_and_rotation_clears_it() {
+    let mut f = Fixture::new(|_, _| {});
+    let mut c = client(&f.home);
+    let items = c.items_list(false).unwrap().items;
+    let id_of = |slug: &str| items.iter().find(|i| i.slug == slug).unwrap().id.clone();
+    let (openai, github) = (id_of("openai/acme-web"), id_of("github/acme-web"));
+    let mark = |item: &str, sources: &[ExposureSourceView], count| ExposedItem {
+        item: item.to_owned(),
+        sources: sources.to_vec(),
+        count,
+    };
+    let params = |items: Vec<ExposedItem>, claims: &[&str]| MarkExposedParams {
+        items,
+        claims: claims.iter().map(|c| (*c).to_owned()).collect(),
+    };
+    let first = c
+        .items_mark_exposed(&params(
+            vec![mark(&openai, &[ExposureSourceView::Transcript], 2)],
+            &[AGENT],
+        ))
+        .unwrap();
+    assert_eq!((first.marked, first.already, first.missing), (1, 0, 0));
+    let shown = c.items_show("openai/acme-web").unwrap();
+    let exposed = shown.exposed.clone().unwrap();
+    assert_eq!(exposed.sources, [ExposureSourceView::Transcript]);
+    assert_eq!(exposed.count, 2);
+    // The same again: nothing changes.
+    let again = c
+        .items_mark_exposed(&params(
+            vec![mark(&openai, &[ExposureSourceView::Transcript], 2)],
+            &[],
+        ))
+        .unwrap();
+    assert_eq!((again.marked, again.already, again.missing), (0, 1, 0));
+    assert_eq!(c.items_show("openai/acme-web").unwrap(), shown);
+    // A new kind is added, and an item of no id is counted.
+    let gone = "01K00000000000000000000000";
+    let more = c
+        .items_mark_exposed(&params(
+            vec![
+                mark(&openai, &[ExposureSourceView::GitHistory], 1),
+                mark(&github, &[ExposureSourceView::ConfigBackup], 1),
+                mark(gone, &[ExposureSourceView::Transcript], 1),
+            ],
+            &[],
+        ))
+        .unwrap();
+    assert_eq!((more.marked, more.already, more.missing), (2, 0, 1));
+    let exposed = c.items_show("openai/acme-web").unwrap().exposed.unwrap();
+    assert_eq!(
+        exposed.sources,
+        [
+            ExposureSourceView::Transcript,
+            ExposureSourceView::GitHistory
+        ]
+    );
+    assert_eq!(exposed.count, 3);
+    assert!(c.items_list(false).unwrap().items.iter().all(
+        |i| i.exposed.is_some() == (i.slug == "openai/acme-web" || i.slug == "github/acme-web")
+    ));
+    // Refused whole: no items, an id twice, a malformed id, no kind, a
+    // count of 0, too many items.
+    for bad in [
+        params(Vec::new(), &[]),
+        params(
+            vec![
+                mark(&github, &[ExposureSourceView::Transcript], 1),
+                mark(&github, &[ExposureSourceView::Transcript], 1),
+            ],
+            &[],
+        ),
+        params(
+            vec![mark(
+                "openai/acme-web",
+                &[ExposureSourceView::Transcript],
+                1,
+            )],
+            &[],
+        ),
+        params(vec![mark(&github, &[], 1)], &[]),
+        params(
+            vec![mark(&github, &[ExposureSourceView::Transcript], 0)],
+            &[],
+        ),
+        params(
+            (0..257)
+                .map(|i| mark(&format!("01K{i:023}"), &[ExposureSourceView::EnvFile], 1))
+                .collect(),
+            &[],
+        ),
+    ] {
+        let e = c.items_mark_exposed(&bad).unwrap_err();
+        assert_eq!(rpc(e), (ErrorKind::InvalidParams, None));
+    }
+    // A rotation clears the mark: the value found elsewhere is not the
+    // item's any more.
+    let target = c.items_target("openai/acme-web", None, &[]).unwrap();
+    let rotated = word(40);
+    f.keep("ROTATED", &rotated);
+    c.items_rotate(
+        &target,
+        SecretBytes::copy_from(rotated.as_bytes()),
+        passphrase(&f.cs),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(c.items_show("openai/acme-web").unwrap().exposed, None);
+    assert!(c.items_show("github/acme-web").unwrap().exposed.is_some());
+    drop(c);
+    let v = f.stop_and_open();
+    assert!(
+        v.find(&Slug::new("openai/acme-web").unwrap())
+            .unwrap()
+            .exposure
+            .is_none()
+    );
+    assert!(
+        !v.find(&Slug::new("openai/acme-web").unwrap())
+            .unwrap()
+            .rotate_recommended
+    );
+    let (entries, _) = v.read_audit().unwrap();
+    let marks: Vec<(u64, Vec<String>, u64, u64)> = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::MarkExposed)
+        .map(|e| {
+            let d = &e.record.decision;
+            (
+                d.count.unwrap(),
+                e.record.items.iter().map(|(_, s)| s.to_string()).collect(),
+                named(&d.counts, "already"),
+                named(&d.counts, "missing"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        marks,
+        [
+            (1, vec!["openai/acme-web".to_owned()], 0, 0),
+            (0, Vec::new(), 1, 0),
+            (
+                2,
+                vec!["openai/acme-web".to_owned(), "github/acme-web".to_owned()],
+                0,
+                1
+            ),
+        ]
+    );
     f.sweep_with(&entries);
 }
