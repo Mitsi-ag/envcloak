@@ -1281,6 +1281,98 @@ fn literals_in_the_configs_never_reach_the_state() {
     f.sweep();
 }
 
+/// The Codex review: a write stopped part way (the run killed while the
+/// new contents were written beside the config) leaves their first bytes
+/// under a temporary name, the person's literal key in them, and the next
+/// run took only whole copies and then forgot the record. Here a run is
+/// stopped so: the part is laid out as `replace_atomically` names it, and
+/// the state holds what the stopped run saved before it wrote (the digest
+/// of what it would write). The next install, which writes the same
+/// contents, removes the part; a file of that shape it cannot tell is
+/// its own stays, is named in the report (`leftovers`), and the run exits
+/// 1 until it is gone.
+///
+/// Mutation checked: `Writer::sweep` taking whole copies only (the
+/// previous digest check): the part holding the literal stays and this
+/// fails.
+#[test]
+fn what_a_stopped_write_left_beside_a_config_is_removed_or_named() {
+    let f = Fixture::new();
+    let lit = Canary::new(
+        "SETTINGS_ENV_LITERAL",
+        format!("ecst{:016x}{:016x}", fresh_seed(), fresh_seed()),
+    );
+    let settings = SETTINGS.replacen(
+        "{\n",
+        &format!(
+            "{{\n  \"env\": {{\n    \"API_TOKEN\": \"{}\"\n  }},\n",
+            lit.as_str()
+        ),
+        1,
+    );
+    std::fs::write(f.path(".claude/settings.json"), &settings).unwrap();
+    age(&f.path(".claude/settings.json"), OLD);
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    let installed = f.read(".claude/settings.json");
+    let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(f.text(".claude/settings.json"), settings);
+    // The stopped run: the new contents' first bytes, through the literal
+    // and into EnvCloak's first insertion, and the state it saved.
+    let first = installed
+        .iter()
+        .zip(settings.as_bytes())
+        .position(|(a, b)| a != b)
+        .unwrap();
+    let lit_at = settings.find(lit.as_str()).unwrap();
+    assert!(
+        lit_at + lit.as_str().len() < first,
+        "the literal comes first"
+    );
+    let part = f.path(".claude/.settings.json.envcloak-new-00000000000000aa.tmp");
+    std::fs::write(&part, &installed[..first + 4]).unwrap();
+    let foreign = f.path(".claude/.settings.json.envcloak-new-00000000000000bb.tmp");
+    std::fs::write(&foreign, b"{}").unwrap();
+    let state_path = data_dir(&f.home).join("agents").join("state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    let key = f
+        .path(".claude/settings.json")
+        .to_string_lossy()
+        .into_owned();
+    state["leftovers"][key.as_str()] = json!([envcloak_agents::install::digest(&installed)]);
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert!(
+        !part.exists(),
+        "the part holding the literal is still there"
+    );
+    assert!(foreign.exists());
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["complete"], false, "{v}");
+    assert_eq!(
+        v["leftovers"],
+        json!(["~/.claude/.settings.json.envcloak-new-00000000000000bb.tmp"]),
+        "{v}"
+    );
+    // The literal is in the config alone.
+    let elsewhere: Vec<String> = sweep_dir(&f.path(".claude"), std::slice::from_ref(&lit))
+        .into_iter()
+        .filter(|h| {
+            !matches!(h, envcloak_testkit::Hit::Canary { path, .. }
+                if path.raw() == f.path(".claude/settings.json"))
+        })
+        .map(|h| h.to_string())
+        .collect();
+    assert!(elsewhere.is_empty(), "{elsewhere:?}");
+    // Once it is gone, nothing is named, and the run is complete.
+    std::fs::remove_file(&foreign).unwrap();
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["leftovers"], json!([]), "{v}");
+    f.sweep();
+}
+
 /// With EnvCloak's plugin enabled, its hooks and MCP server are not
 /// installed again (each hook would run twice), but what no plugin
 /// carries still is: the deny rule, which also covers `@` file mentions,

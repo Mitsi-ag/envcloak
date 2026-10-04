@@ -511,11 +511,17 @@ pub struct ProjectReport {
 pub struct Report {
     pub hosts: Vec<HostReport>,
     pub project: Option<ProjectReport>,
+    /// Files under EnvCloak's temporary names that an earlier write left
+    /// beside a config and that were not shown to be EnvCloak's, or could
+    /// not be removed ([`Writer::leftovers_present`]): each may hold a copy
+    /// of part of the config, so they are named, and the run is not
+    /// complete while one is there (lesson L-08).
+    pub leftovers: Vec<PathBuf>,
 }
 
 impl Report {
-    /// Every change was made (or was there already), and every host named
-    /// with `--agent` was found.
+    /// Every change was made (or was there already), every host named
+    /// with `--agent` was found, and no leftover is there.
     pub fn complete(&self) -> bool {
         let ok =
             |r: &StepResult| !matches!(r.outcome, Outcome::Refused(_) | Outcome::Partial { .. });
@@ -526,6 +532,7 @@ impl Report {
                 .project
                 .as_ref()
                 .is_none_or(|p| p.results.iter().all(ok))
+            && self.leftovers.is_empty()
     }
 }
 
@@ -637,6 +644,7 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
     let mut report = Report {
         hosts: Vec::new(),
         project: None,
+        leftovers: Vec::new(),
     };
     // What earlier runs left under temporary names goes first.
     w.sweep_all();
@@ -686,6 +694,8 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
             results,
         });
     }
+    w.sweep_all();
+    report.leftovers = w.leftovers_present();
     report
 }
 
@@ -1001,6 +1011,7 @@ pub fn uninstall(ctx: &Context<'_>, opts: &Options, w: &mut Writer<'_>) -> Repor
     let mut report = Report {
         hosts: Vec::new(),
         project: None,
+        leftovers: Vec::new(),
     };
     w.sweep_all();
     let undo_files = |w: &mut Writer<'_>, host: &'static str, scope: &str, name: &'static str| {
@@ -1047,6 +1058,8 @@ pub fn uninstall(ctx: &Context<'_>, opts: &Options, w: &mut Writer<'_>) -> Repor
             results: undo_files(w, "project", &scope, "the agent"),
         });
     }
+    w.sweep_all();
+    report.leftovers = w.leftovers_present();
     report
 }
 
