@@ -345,14 +345,20 @@ impl LegacyState {
     /// The same state in format 2. Each registration becomes, or joins,
     /// its file's record as the edit EnvCloak now makes itself
     /// (`mcpServers.envcloak` holding the entry), so it is EnvCloak's
-    /// while it holds what EnvCloak registered, as format 1 had it: a
-    /// pending one (`mcp_intent`) too, which format 1 adopted when the
-    /// next run found the entry there, and a completed one wins over it.
-    /// A file the command created is removed by an undo while it is still
-    /// exactly what the command left (a record of one inserted run, the
-    /// whole file, over an empty one), and otherwise has the entry taken
-    /// out by structure; one whose size was not recorded is undone by
-    /// structure only. No text of any file is read or kept.
+    /// while it holds what EnvCloak registered, as format 1 had it. A
+    /// completed registration (`mcp`) and a pending one (`mcp_intent`) of
+    /// the same file are both kept when they differ (Codex's F-125
+    /// follow-up, cycle 355: keeping only the completed one lost the
+    /// pending entry a run stopped during a reinstall had written, which
+    /// format 1 adopted when the next run found it there; uninstall then
+    /// said complete and left it): the entry is EnvCloak's while it holds
+    /// either, and an undo takes out whichever it holds. A file the
+    /// command created is removed by an undo while it is still exactly
+    /// what the command left (a record of one inserted run, the whole
+    /// file, over an empty one), and otherwise has the entry taken out by
+    /// structure, with the `mcpServers` object the command made once it
+    /// is empty; one whose size was not recorded is undone by structure
+    /// only. No text of any file is read or kept.
     fn migrate(self) -> State {
         let mut state = State {
             version: STATE_VERSION,
@@ -361,20 +367,42 @@ impl LegacyState {
             leftovers: self.leftovers,
             dirs: self.dirs,
         };
-        let mut registrations = self.mcp;
-        for (k, r) in self.mcp_intent {
-            registrations.entry(k).or_insert(r);
+        let mut registrations: BTreeMap<String, Vec<LegacyMcp>> = BTreeMap::new();
+        for (k, r) in self.mcp.into_iter().chain(self.mcp_intent) {
+            registrations.entry(k).or_default().push(r);
         }
-        for (k, r) in registrations {
-            let edit = Edit::JsonMember {
-                path: vec![crate::hosts::claude::MCP_SERVERS.to_owned()],
-                key: crate::hosts::claude::SERVER.to_owned(),
-                value: r.entry,
-                created: usize::from(r.created.is_some()),
+        for (k, rs) in registrations {
+            // A file one of them created had its `mcpServers` made by
+            // EnvCloak, whichever entry it holds now.
+            let made = usize::from(rs.iter().any(|r| r.created.is_some()));
+            let mut edits: Vec<Edit> = Vec::new();
+            for r in &rs {
+                let edit = Edit::JsonMember {
+                    path: vec![crate::hosts::claude::MCP_SERVERS.to_owned()],
+                    key: crate::hosts::claude::SERVER.to_owned(),
+                    value: r.entry.clone(),
+                    created: made,
+                };
+                if !edits.contains(&edit) {
+                    edits.push(edit);
+                }
+            }
+            let mut rs = rs.into_iter();
+            let Some(first) = rs.next() else {
+                continue;
+            };
+            // The completed one comes first; the file facts are the first
+            // that has them.
+            let r = if first.created.is_some() {
+                first
+            } else {
+                rs.find(|r| r.created.is_some()).unwrap_or(first)
             };
             if let Some(rec) = state.files.get_mut(&k) {
-                if !rec.edits.contains(&edit) {
-                    rec.edits.push(edit);
+                for edit in edits {
+                    if !rec.edits.contains(&edit) {
+                        rec.edits.push(edit);
+                    }
                 }
                 rec.journal = None;
                 rec.host_owned = true;
@@ -411,7 +439,7 @@ impl LegacyState {
                     post_sha256: post,
                     stamp,
                     journal,
-                    edits: vec![edit],
+                    edits,
                     intent: None,
                 },
             );
