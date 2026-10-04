@@ -53,7 +53,7 @@ fn signed(path: &str, identifier: &str, team: Option<&str>) -> ProcInfo {
 }
 
 /// The builtin catalog's agents, in its order.
-const BUILTIN: [&str; 9] = [
+const BUILTIN: [&str; 11] = [
     "claude-code",
     "codex",
     "cursor",
@@ -62,6 +62,8 @@ const BUILTIN: [&str; 9] = [
     "opencode",
     "kimi",
     "qwen-code",
+    "goose",
+    "aider",
     "fixture",
 ];
 
@@ -668,6 +670,117 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
             node(&["node", "/srv/qwen-code/cli-entry.js"]),
             None,
         ),
+        // Goose: its one binary, wherever its install script, a package
+        // manager or its desktop app put it, by its name only (pressly's
+        // database migration tool is a `goose` too). Its macOS build is
+        // signed ad hoc: no signature names it.
+        (
+            "goose install script".into(),
+            exe(&format!("{home}/.local/bin/goose")),
+            Some(("goose", SAID)),
+        ),
+        (
+            "goose elsewhere".into(),
+            exe("/opt/homebrew/bin/goose"),
+            Some(("goose", SAID)),
+        ),
+        (
+            "goose in its desktop app".into(),
+            proc_with(
+                Some("/Applications/Goose.app/Contents/Resources/bin/goose"),
+                "goose",
+                Some(&[
+                    "/Applications/Goose.app/Contents/Resources/bin/goose",
+                    "serve",
+                ]),
+            ),
+            Some(("goose", SAID)),
+        ),
+        (
+            "goose signed ad hoc".into(),
+            signed(
+                &format!("{home}/.local/bin/goose"),
+                "goose-37a4aa07b5b08d24",
+                None,
+            ),
+            Some(("goose", SAID)),
+        ),
+        (
+            "goose by its command name, its executable hidden".into(),
+            proc_with(None, "goose", None),
+            Some(("goose", SAID)),
+        ),
+        (
+            "goose renamed".into(),
+            exe("/usr/local/bin/goose-cli"),
+            None,
+        ),
+        ("goosed".into(), exe("/usr/local/bin/goosed"), None),
+        (
+            "a script called goose under node".into(),
+            node(&["node", "/srv/goose"]),
+            None,
+        ),
+        // Aider: its console script under the Python of the tool
+        // environment uv, pipx or aider-install made, or `python -m aider`.
+        (
+            "aider under uv's Python".into(),
+            proc_with(
+                Some(
+                    "/home/u/.local/share/uv/python/cpython-3.12.11-linux-x86_64-gnu/bin/python3.12",
+                ),
+                "python3.12",
+                Some(&[
+                    "/home/u/.local/share/uv/tools/aider-chat/bin/python",
+                    "/home/u/.local/bin/aider",
+                    "--model",
+                    "x",
+                ]),
+            ),
+            Some(("aider", SAID)),
+        ),
+        (
+            "aider under pipx's Python".into(),
+            proc_with(
+                Some("/usr/bin/python3.11"),
+                "python3.11",
+                Some(&[
+                    "/home/u/.local/share/pipx/venvs/aider-chat/bin/python",
+                    "/home/u/.local/share/pipx/venvs/aider-chat/bin/aider",
+                ]),
+            ),
+            Some(("aider", SAID)),
+        ),
+        (
+            "python -m aider".into(),
+            proc_with(
+                Some("/usr/bin/python3"),
+                "python3",
+                Some(&["python3", "-m", "aider", "--yes-always"]),
+            ),
+            Some(("aider", SAID)),
+        ),
+        // Not Aider: a program by that name (it is a Python script), its
+        // installer, another script.
+        ("an aider binary".into(), exe("/usr/local/bin/aider"), None),
+        (
+            "aider-install".into(),
+            proc_with(
+                Some("/usr/bin/python3"),
+                "python3",
+                Some(&["python3", "/home/u/.local/bin/aider-install"]),
+            ),
+            None,
+        ),
+        (
+            "another python script".into(),
+            proc_with(
+                Some("/usr/bin/python3"),
+                "python3",
+                Some(&["python3", "/srv/aider_tools.py"]),
+            ),
+            None,
+        ),
     ];
     let products = [
         ("claude-code", "claude-code"),
@@ -677,6 +790,8 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
         ("opencode", "opencode"),
         ("kimi", "kimi"),
         ("qwen-code", "qwen-code"),
+        ("goose", "goose"),
+        ("aider", "aider"),
     ];
     for (what, p, want) in cases.drain(..) {
         let got = cat.classify(&p);
@@ -695,11 +810,14 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
         ("CURSOR_AGENT", "cursor"),
         ("CURSOR_SANDBOX", "cursor"),
         ("GEMINI_CLI", "gemini-cli"),
+        ("GOOSE_TERMINAL", "goose"),
     ] {
         let l = cat.agent_for_marker(marker).unwrap();
         assert_eq!((l.id.as_str(), l.basis), (id, SAID), "{marker}");
         assert!(!l.may_root_above_session());
     }
+    // `AGENT`, which Goose documents for every agent to set, is no marker.
+    assert!(cat.agent_for_marker("AGENT").is_none());
     assert_eq!(cat.product("fixture"), Some("fixture"));
 }
 
@@ -772,6 +890,10 @@ fn install_trees_name_where_each_agents_installers_put_it() {
             "/usr/local/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
         ),
         ("qwen-code", "/usr/local/bin/qwen"),
+        // Goose is known by its name only, Aider by its script: no tree.
+        ("goose", "/home/u/.local/bin/goose"),
+        ("goose", "/usr/local/bin/goose"),
+        ("aider", "/home/u/.local/bin/aider"),
         ("fixture", "/work/target/debug/fixture-agent"),
         ("no-such-agent", "/usr/local/bin/copilot"),
     ];
@@ -822,6 +944,8 @@ fn code_selecting_env_comes_from_the_builtin_catalog() {
             ("opencode", vec!["BUN_BE_BUN"]),
             ("kimi", vec![]),
             ("qwen-code", vec![]),
+            ("goose", vec![]),
+            ("aider", vec![]),
             ("fixture", vec![]),
         ]
     );
@@ -1018,7 +1142,7 @@ fn names_are_asserted_and_checked() {
     write(
         &dir,
         "a.toml",
-        "[[agent]]\nid = \"aider\"\nname = \"Aider\"\nnames = [\"aider\", \"Aider Chat Assistant 1\"]\n",
+        "[[agent]]\nid = \"pairbot\"\nname = \"Pairbot\"\nnames = [\"pairbot\", \"Pairbot Chat Assistant 1\"]\n",
     );
     for (file, names) in [
         ("b.toml", "[\"a/b\"]"),
@@ -1060,23 +1184,23 @@ fn names_are_asserted_and_checked() {
         ]
     );
     for p in [
-        exe("/usr/local/bin/aider"),
+        exe("/usr/local/bin/pairbot"),
         proc_with(
             Some("/usr/bin/python3"),
             "python3",
-            Some(&["/x/aider", "--yes"]),
+            Some(&["/x/pairbot", "--yes"]),
         ),
-        proc_with(Some("/usr/bin/python3"), "Aider Chat Assi", None),
+        proc_with(Some("/usr/bin/python3"), "Pairbot Chat As", None),
     ] {
         let l = cat.classify(&p).unwrap();
         assert_eq!(
             (l.id.as_str(), l.source, l.basis),
-            ("aider", CatalogSource::Extension, MatchBasis::Asserted),
+            ("pairbot", CatalogSource::Extension, MatchBasis::Asserted),
             "{p:?}"
         );
     }
     assert_eq!(
-        id_of(&cat, &proc_with(Some("/usr/bin/python3"), "Aider", None)),
+        id_of(&cat, &proc_with(Some("/usr/bin/python3"), "Pairbot", None)),
         None
     );
 }
@@ -1207,15 +1331,15 @@ fn extensions_add_agents_patterns_and_interpreters() {
     let (root, dir) = data_dir();
     write(
         &dir,
-        "aider.toml",
+        "pairbot.toml",
         r#"interpreters = ["python3"]
 
 [[agent]]
-id = "aider"
-name = "Aider"
-executables = ["aider"]
-scripts = ["aider"]
-markers = ["AIDER_SESSION"]
+id = "pairbot"
+name = "Pairbot"
+executables = ["pairbot"]
+scripts = ["pairbot"]
+markers = ["PAIRBOT_SESSION"]
 "#,
     );
     write(
@@ -1240,19 +1364,19 @@ executables = ["my-claude"]
     let cat = AgentCatalog::load(root.path());
     assert!(cat.problems().is_empty(), "{:?}", cat.problems());
     let mut want = builtin_ids();
-    want.push("aider");
+    want.push("pairbot");
     assert_eq!(cat.ids().collect::<Vec<_>>(), want);
 
-    let l = cat.classify(&exe("/usr/local/bin/aider")).unwrap();
-    assert_eq!((l.id.as_str(), l.name.as_str()), ("aider", "Aider"));
+    let l = cat.classify(&exe("/usr/local/bin/pairbot")).unwrap();
+    assert_eq!((l.id.as_str(), l.name.as_str()), ("pairbot", "Pairbot"));
     assert_eq!(l.source, CatalogSource::Extension);
     let py = proc_with(
         Some("/usr/bin/python3"),
         "python3",
-        Some(&["python3", "/home/u/.local/bin/aider", "--yes"]),
+        Some(&["python3", "/home/u/.local/bin/pairbot", "--yes"]),
     );
     assert!(cat.needs_argv(&py));
-    assert_eq!(cat.classify(&py).unwrap().id, "aider");
+    assert_eq!(cat.classify(&py).unwrap().id, "pairbot");
 
     // Builtin entries still match as builtin; the added pattern matches
     // as an extension.
@@ -1266,7 +1390,10 @@ executables = ["my-claude"]
         (l.id.as_str(), l.source),
         ("claude-code", CatalogSource::Extension)
     );
-    assert_eq!(cat.agent_for_marker("AIDER_SESSION").unwrap().id, "aider");
+    assert_eq!(
+        cat.agent_for_marker("PAIRBOT_SESSION").unwrap().id,
+        "pairbot"
+    );
     assert_eq!(id_of(&cat, &exe("/bin/zsh")), None);
     assert_eq!(id_of(&cat, &exe("/bin/bash")), None);
 }
@@ -1282,8 +1409,8 @@ fn products_and_install_trees_come_from_the_builtin_catalog() {
     write(
         &dir,
         "a.toml",
-        "[[agent]]\nid = \"aider\"\nname = \"Aider\"\nproduct = \"aider-chat\"\n\
-         executables = [\"aider\"]\n\n[[agent]]\nid = \"codex\"\nproduct = \"other\"\n\
+        "[[agent]]\nid = \"pairbot\"\nname = \"Pairbot\"\nproduct = \"pairbot-chat\"\n\
+         executables = [\"pairbot\"]\n\n[[agent]]\nid = \"codex\"\nproduct = \"other\"\n\
          executables = [\"codex-nightly\"]\n\n[[agent]]\nid = \"goose\"\nname = \"Goose\"\n\
          executables = [\"goose-agent\"]\n",
     );
@@ -1299,15 +1426,17 @@ fn products_and_install_trees_come_from_the_builtin_catalog() {
         "[[agent]]\nid = \"x\"\nname = \"X\"\nexecutables = [\"x\"]\nproduct = \"Not An Id\"\n",
     );
     let cat = AgentCatalog::load(root.path());
-    assert_eq!(cat.product("aider"), Some("aider-chat"));
+    assert_eq!(cat.product("pairbot"), Some("pairbot-chat"));
     assert_eq!(cat.product("goose"), Some("goose"));
     assert_eq!(cat.product("codex"), Some("codex"));
     assert_eq!(cat.product("nothing"), None);
     let l = cat.classify(&exe("/usr/local/bin/codex-nightly")).unwrap();
     assert_eq!((l.id.as_str(), l.product.as_str()), ("codex", "codex"));
     assert_eq!(
-        cat.classify(&exe("/usr/local/bin/aider")).unwrap().product,
-        "aider-chat"
+        cat.classify(&exe("/usr/local/bin/pairbot"))
+            .unwrap()
+            .product,
+        "pairbot-chat"
     );
     let problems: Vec<(String, CatalogErrorKind, Option<u32>)> = cat
         .problems()
@@ -1333,7 +1462,7 @@ fn products_and_install_trees_come_from_the_builtin_catalog() {
         Path::new("/tmp/claude"),
         Some(Path::new("/home/u"))
     ));
-    assert!(!cat.within_install_tree("aider", Path::new("/usr/local/bin/aider"), None));
+    assert!(!cat.within_install_tree("pairbot", Path::new("/usr/local/bin/pairbot"), None));
 }
 
 #[test]
@@ -1513,10 +1642,10 @@ fn what_a_process_says_about_itself_is_asserted() {
     write(
         &dir,
         "a.toml",
-        "[[agent]]\nid = \"aider\"\nname = \"Aider\"\nexecutables = [\"aider\"]\n",
+        "[[agent]]\nid = \"pairbot\"\nname = \"Pairbot\"\nexecutables = [\"pairbot\"]\n",
     );
     let cat = AgentCatalog::load(root.path());
-    let l = cat.classify(&exe("/usr/local/bin/aider")).unwrap();
+    let l = cat.classify(&exe("/usr/local/bin/pairbot")).unwrap();
     assert_eq!(
         (l.source, l.basis),
         (CatalogSource::Extension, MatchBasis::Executable)

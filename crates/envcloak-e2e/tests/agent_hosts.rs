@@ -3874,7 +3874,10 @@ mod catalog {
     //!   the locked vault, each with the vault's passphrase on a
     //!   descriptor. Nothing is approved or unlocked, no grant exists and
     //!   the agent's run gets no value; the same proofs from a person's
-    //!   terminal are then taken, and the run gets its value (the control).
+    //!   terminal are then taken, and the run gets its value (the control);
+    //!   and so are they from Goose's shell in a person's terminal (Goose
+    //!   is known by its name, which a copy of the fixture agent takes), and
+    //!   from the pseudo-terminal Aider's script gives a command.
     //!
     //! The caller is `ec-probe`, which connects to a socket this test listens
     //! on, as the CLI connects to the daemon, and stays until it is closed;
@@ -4980,6 +4983,68 @@ with open(out, "wb") as f:
         let out = target.h.agent_line(&repo, &line);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
         target.assert_refused_then_taken("fixture");
+    }
+
+    /// Gate 23 at the daemon for Goose (Codex review), which the catalog
+    /// knows by its name only (`goose` is also a database migration tool's
+    /// command): its shell tool runs a command as its child, in its own
+    /// session and on its terminal, a person's terminal when `goose
+    /// session` runs there. A copy of the fixture agent named `goose`,
+    /// started from a person's terminal, runs [`ProofTarget::attempts`] that
+    /// way. The daemon refuses each proof as an agent's, and the person's
+    /// terminal then gives them (the controls). Mutation checked (run
+    /// outside any agent's tree): removing Goose's name from the catalog
+    /// fails this test (the proofs from the person's terminal session are
+    /// taken).
+    #[test]
+    fn a_proof_from_gooses_shell_in_a_persons_terminal_is_refused_by_the_daemon() {
+        let mut target = ProofTarget::new();
+        let goose = target.dir.join("goose");
+        std::fs::copy(testkit_bin("fixture-agent"), &goose).unwrap();
+        let attempts = target.attempts();
+        let repo = target.repo.clone();
+        let ran = target.h.human_argv(
+            &repo,
+            &[goose.to_str().unwrap(), "/bin/sh", "-c", &attempts],
+            &[],
+            &[],
+        );
+        assert_eq!(ran.code, 0, "{}", ran.all());
+        target.assert_refused_then_taken("goose");
+    }
+
+    /// Gate 23 at the daemon for Aider, which the catalog knows by its
+    /// `aider` script under Python: started from a person's terminal, it
+    /// runs a command with pexpect, on a pseudo-terminal of the command's
+    /// own in a session the command leads (aider/run_cmd.py). A Python
+    /// script named `aider` doing that ([`PTY_ONCE`]) runs
+    /// [`ProofTarget::attempts`]. The daemon refuses each proof as an
+    /// agent's, and the person's terminal then gives them (the controls).
+    /// Mutation checked (run outside any agent's tree): removing Aider's
+    /// script from the catalog fails this test (the proofs from the
+    /// command's own terminal are taken).
+    #[test]
+    fn a_proof_from_aiders_own_pty_is_refused_by_the_daemon() {
+        let mut target = ProofTarget::new();
+        let aider = target.dir.join("aider");
+        std::fs::write(&aider, PTY_ONCE).unwrap();
+        let attempts = target.attempts();
+        let repo = target.repo.clone();
+        let py = python3();
+        let ran = target.h.human_argv(
+            &repo,
+            &[
+                py.to_str().unwrap(),
+                aider.to_str().unwrap(),
+                "/bin/sh",
+                "-c",
+                &attempts,
+            ],
+            &[],
+            &[],
+        );
+        assert_eq!(ran.code, 0, "{}", ran.all());
+        target.assert_refused_then_taken("aider");
     }
 
     /// A library each loader variable can name: its constructor, and

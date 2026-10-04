@@ -12,7 +12,11 @@
 //!   or command name is an agent subject, rooted in the caller's session.
 //!   kimi-cli's shape, a Python script that titles itself `Kimi Code` as
 //!   setproctitle does, is Kimi before and after its title, on each
-//!   system.
+//!   system. Goose, known by its name only, makes the commands it runs in
+//!   a person's terminal, or on a terminal of their own, agent subjects;
+//!   so does Aider, by its script under Python, for the commands it runs
+//!   on a terminal of their own (pexpect) or in its session. A
+//!   program by an interpreter's name at an agent's path is no agent.
 //! - Gate 26, ancestry escape: a process under the fixture agent escapes by
 //!   double fork, `setsid`, `nohup` with `disown`, `launchctl submit`
 //!   (macOS) or `systemd-run --user` (Linux). Before the escape the same
@@ -223,7 +227,13 @@ os.waitpid(pid, 0)
 /// `sh -c <script> sh <probe> <socket> <fixture-agent>` as the leader of a
 /// session on a new pseudo-terminal.
 fn on_terminal(l: &Listener, script: &str) -> Scenario {
-    let (p, f) = (probe(), fixture());
+    on_terminal_with(l, script, &fixture())
+}
+
+/// [`on_terminal`] with `holder` as the script's third argument in place
+/// of the fixture agent.
+fn on_terminal_with(l: &Listener, script: &str, holder: &Path) -> Scenario {
+    let (p, f) = (probe(), holder);
     let args: Vec<&std::ffi::OsStr> = vec![
         "-c".as_ref(),
         PTY.as_ref(),
@@ -673,6 +683,107 @@ fn gate23_a_command_an_agent_starts_on_a_pty_of_its_own_is_an_agent() {
     s.finish();
 }
 
+/// Codex review (high): Goose by its name, with real processes. Its shell
+/// tool runs a command as its child in its own session and on its
+/// terminal, which is a person's terminal when it runs there (`goose
+/// session`), and a command can also start one on a pseudo-terminal of
+/// its own. Here a copy of the fixture agent named `goose` (the catalog
+/// knows Goose by its name only) runs the caller in a person's terminal,
+/// with and without `env -i`, and on a new pseudo-terminal: each is an
+/// agent subject labeled Goose on an asserted basis, rooted no higher
+/// than its own session (at Goose in the person's session, the agent
+/// barrier then keeping the terminal's grants away), and its proofs are
+/// refused. The control: the same copy by another name in the person's
+/// terminal is a terminal subject a terminal grant covers and whose proofs
+/// are taken. Mutation checked: removing Goose's name from the catalog
+/// fails this test.
+#[test]
+fn goose_by_its_name_runs_agent_subjects_in_a_persons_terminal() {
+    let outer = outer_agent_root();
+    let l = Listener::new();
+    let goose = l.home.root().join("goose");
+    std::fs::copy(fixture(), &goose).unwrap();
+    let assert_goose = |e: &SubjectEvidence, at: usize| {
+        let (n, label) = e.nearest_agent().expect("Goose is found");
+        assert_eq!(n, at, "{e:?}");
+        assert_eq!(
+            (label.id.as_str(), label.source, label.basis),
+            ("goose", CatalogSource::Builtin, MatchBasis::Asserted)
+        );
+        assert!(!label.may_root_above_session());
+        assert_eq!(e.kind(), SubjectKind::Agent);
+        assert_eq!(e.proof_refusal(), Some(ProofRefusal::Agent));
+        assert!(e.agent_involved());
+    };
+    let s = on_terminal_with(
+        &l,
+        r#""$3" "$1" "$2"
+"$3" /usr/bin/env -i "$1" "$2"
+read x
+"#,
+        &goose,
+    );
+    for _ in 0..2 {
+        // probe <- goose <- sh, which leads the terminal's session (`env`
+        // runs the probe in its own place).
+        let e = l.next();
+        assert!(e.terminal(), "{e:?}");
+        let leader = e.session_leader().unwrap().clone();
+        assert_eq!(file_name(&e.chain()[1].instance), "goose", "{e:?}");
+        assert_goose(&e, 1);
+        assert!(e.chain()[2].instance.same(&leader), "{e:?}");
+        assert!(e.root().same(&e.chain()[1].instance), "rooted at Goose");
+        assert!(e.covered_by(&e.root(), SubjectKind::Agent));
+        assert!(!e.covered_by(&leader, SubjectKind::Terminal));
+        assert!(
+            !e.covered_by(&leader, SubjectKind::Agent),
+            "the agent barrier"
+        );
+        assert!(e.claims().markers().is_empty());
+    }
+    s.finish();
+
+    // On a pseudo-terminal of its own: probe (leading its session there)
+    // <- python3 (the pseudo-terminal's owner) <- goose.
+    let py = python3();
+    let p = probe();
+    let args: Vec<&std::ffi::OsStr> = vec![
+        py.as_os_str(),
+        "-c".as_ref(),
+        PTY.as_ref(),
+        "/usr/bin/env".as_ref(),
+        "-i".as_ref(),
+        p.as_os_str(),
+        l.sock.as_os_str(),
+    ];
+    let s = Scenario::start(&l.home, &goose, &args);
+    let e = l.next();
+    assert!(e.terminal(), "{e:?}");
+    assert!(e.session_leader().unwrap().same(e.caller()));
+    assert_goose(&e, 2);
+    assert!(e.root().same(e.caller()), "rooted in its own session");
+    assert!(!e.covered_by(e.caller(), SubjectKind::Terminal));
+    assert!(!e.covered_by(&e.chain()[2].instance, SubjectKind::Agent));
+    s.finish();
+
+    // The control: the same program by another name.
+    let other = l.home.root().join("not-an-agent");
+    std::fs::copy(fixture(), &other).unwrap();
+    let s = on_terminal_with(&l, "\"$3\" \"$1\" \"$2\"\nread x\n", &other);
+    let e = l.next();
+    let leader = e.session_leader().unwrap().clone();
+    match outer {
+        None => {
+            assert!(e.nearest_agent().is_none(), "{e:?}");
+            assert_eq!(e.kind(), SubjectKind::Terminal);
+            assert!(e.covered_by(&leader, SubjectKind::Terminal));
+            assert_eq!(e.proof_refusal(), None);
+        }
+        Some(_) => eprintln!("an agent runs this test: the control is inside its tree"),
+    }
+    s.finish();
+}
+
 /// A Python program in the shape of kimi-cli's launcher (`kimi`, a script
 /// whose shebang names the Python it runs under): it runs `ec-probe` under
 /// `env -i` as its shell tool runs a command, then titles itself as
@@ -788,6 +899,105 @@ fn kimi_cli_under_python_is_kimi_before_and_after_its_title() {
         assert!(e.chain()[1].agent.is_none(), "{what}: {e:?}");
     }
     s.finish();
+}
+
+/// A Python program in the shape of Aider's `aider` script running a
+/// command (aider/run_cmd.py): with pexpect, on a pseudo-terminal of the
+/// command's own, in a session it leads (when Aider's standard input is a
+/// terminal), and then through `subprocess`, in Aider's own session. Here
+/// the command is `ec-probe` under `env -i`.
+const PEXPECT_SHAPE: &str = r#"
+import os, pty, subprocess, sys
+probe, sock = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("/usr/bin/env", ["env", "-i", probe, sock])
+while True:
+    try:
+        data = os.read(fd, 65536)
+    except OSError:
+        break
+    if not data:
+        break
+os.waitpid(pid, 0)
+subprocess.run(["/usr/bin/env", "-i", probe, sock], check=True)
+"#;
+
+/// Aider (the class of Codex's Goose finding: an agent with official
+/// evidence left out) runs under Python as its `aider` script, which the
+/// catalog knows, and runs its commands on a pseudo-terminal of their own
+/// (pexpect) or in its own session. Real processes on each system: each
+/// command is an agent subject labeled Aider on an asserted basis, rooted
+/// no higher than its session, and its proofs are refused; the one on its
+/// own terminal is not covered by a grant for that terminal. The control:
+/// the same program as `tool`, whose command on its own terminal is a
+/// terminal subject. Mutation checked: removing Aider's script from the
+/// catalog fails this test.
+#[test]
+fn aider_under_python_runs_its_commands_as_agent_subjects() {
+    let outer = outer_agent_root();
+    let l = Listener::new();
+    let bin = l.home.home().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let body = format!("#!{}\n{PEXPECT_SHAPE}", python3().display());
+    let run = |name: &str| {
+        let path = bin.join(name);
+        std::fs::write(&path, &body).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let (p, sock) = (probe(), l.sock.clone());
+        let args: Vec<&std::ffi::OsStr> = vec![
+            "--session".as_ref(),
+            "--".as_ref(),
+            path.as_os_str(),
+            p.as_os_str(),
+            sock.as_os_str(),
+        ];
+        let s = Scenario::start(&l.home, &p, &args);
+        let on_pty = l.next();
+        let in_session = l.next();
+        s.finish();
+        (on_pty, in_session)
+    };
+    let (on_pty, in_session) = run("aider");
+    for (e, what) in [
+        (&on_pty, "on its own terminal"),
+        (&in_session, "in Aider's session"),
+    ] {
+        let (n, label) = e.nearest_agent().unwrap_or_else(|| panic!("{what}: {e:?}"));
+        assert_eq!(n, 1, "{what}: {e:?}");
+        assert_eq!(
+            (label.id.as_str(), label.source, label.basis),
+            ("aider", CatalogSource::Builtin, MatchBasis::Asserted),
+            "{what}"
+        );
+        assert!(!label.may_root_above_session());
+        assert_eq!(e.kind(), SubjectKind::Agent, "{what}");
+        assert_eq!(e.proof_refusal(), Some(ProofRefusal::Agent), "{what}");
+    }
+    assert!(on_pty.terminal(), "{on_pty:?}");
+    assert!(on_pty.session_leader().unwrap().same(on_pty.caller()));
+    assert!(
+        on_pty.root().same(on_pty.caller()),
+        "rooted in its own session"
+    );
+    assert!(!on_pty.covered_by(on_pty.caller(), SubjectKind::Terminal));
+    assert!(
+        in_session.root().same(&in_session.chain()[1].instance),
+        "rooted at Aider"
+    );
+    // The control.
+    let (on_pty, _) = run("tool");
+    assert!(on_pty.terminal(), "{on_pty:?}");
+    match outer {
+        None => {
+            assert!(on_pty.nearest_agent().is_none(), "{on_pty:?}");
+            assert_eq!(on_pty.kind(), SubjectKind::Terminal);
+            assert!(on_pty.covered_by(on_pty.caller(), SubjectKind::Terminal));
+            assert_eq!(on_pty.proof_refusal(), None);
+        }
+        Some(_) => eprintln!("an agent runs this test: the control is inside its tree"),
+    }
 }
 
 /// The gate 26 check: `escape` runs under the fixture agent after the same

@@ -30,10 +30,7 @@
 # approvals (SPEC §10b), which also refuse every dynamic loader variable
 # (`LD_*`, `DYLD_*`) for every agent without a list.
 #
-# Left out for want of evidence: Goose (no install observed and no marker
-# documented; its command name `goose` is also a database migration
-# tool's, so a pattern would root grants at that tool), the Cursor IDE (no
-# signature observed) and Aider.
+# Left out for want of evidence: the Cursor IDE (no signature observed).
 
 # Executables that run scripts. For these, the script arguments are matched
 # against each agent's `scripts`, and argv[0] against its `names`. A name
@@ -221,6 +218,45 @@ product = "qwen-code"
 # npm's @qwen-code/qwen-code under node: its entry script, or the `qwen`
 # link run through its shebang.
 scripts = ["qwen", "@qwen-code/qwen-code/cli-entry.js"]
+
+[[agent]]
+id = "goose"
+name = "Goose"
+product = "goose"
+# The goose CLI, one native binary: its install script puts it at
+# $GOOSE_BIN_DIR/goose, ~/.local/bin by default (https://raw.
+# githubusercontent.com/aaif-goose/goose/main/download_cli.sh), and the
+# desktop app runs the same binary it bundles as `goose serve`
+# (ui/desktop/src/main.ts). Its shell tool runs `bash -c <command>` as
+# its child, in goose's own session and on its terminal: no session or
+# terminal of its own (crates/goose/src/agents/platform_extensions/
+# developer/shell.rs, v1.53.0). Measured on 1.53.0's macOS arm64 release:
+# the process is `goose` by command name and argv[0], and its signature
+# is ad hoc, with no Team ID. `goose` is also a database migration tool's
+# command (pressly/goose), so it is a name, not an identity: it makes a
+# process an agent and roots nothing above a session, and Goose has no
+# install tree (no Linux standing approval).
+names = ["goose"]
+# Documented as set in the commands it runs (documentation/docs/guides/
+# environment-variables.md); 1.53.0's source sets it only for a recipe's
+# retry checks (crates/goose/src/agents/retry.rs), so the name above is
+# what finds its shell tool's commands. The other variable documented
+# there, `AGENT=goose`, is a generic name meant for every agent to set.
+markers = ["GOOSE_TERMINAL"]
+
+[[agent]]
+id = "aider"
+name = "Aider"
+product = "aider"
+# aider-chat under Python: its console script `aider` (pyproject.toml,
+# [project.scripts]), which aider-install, `uv tool install` and pipx put
+# in a tool environment whose python runs it (https://aider.chat/docs/
+# install.html), or `python -m aider`. When its own standard input is a
+# terminal it runs a shell command with pexpect, on a pseudo-terminal of
+# its own in a session the command leads; otherwise through `subprocess`
+# (aider/run_cmd.py). Known by its script only: it roots no grant above a
+# command's session and has no install tree.
+scripts = ["aider"]
 
 [[agent]]
 id = "fixture"
