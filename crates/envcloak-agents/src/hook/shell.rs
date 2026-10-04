@@ -12,9 +12,11 @@
 //!   that could match one (`.env*`, `.e?v`, `.*`) or `find -name .env
 //!   -exec cat {} \;`.
 //! - [`Class::EnvDump`]: prints the environment: `env` with no command to
-//!   run, `printenv`, `export` and `export -p`, a bare `set`, `declare -x`,
-//!   `declare -p`, `typeset`, `ps e` and `ps -E`, and any path naming
-//!   `/proc/<pid>/environ`.
+//!   run, `printenv`, `export` and `export -p` (with names too: zsh prints
+//!   their values, dash every exported variable), a bare `set`, `declare
+//!   -x`, `declare -p`, `typeset`, `ps e` and `ps -E`, and any path naming
+//!   `/proc/<pid>/environ`, a reader's program's included (sed's `r`, awk's
+//!   `getline <`: [`program`]).
 //! - [`Class::Reveal`] and [`Class::Approve`]: `envcloak reveal` and
 //!   `envcloak approve`, which only the person runs.
 //! - [`Class::Ambiguous`]: the reader could not tell what runs: a quote,
@@ -77,6 +79,7 @@ use envcloak_scan::{FileKind, dotenv_kind};
 use zeroize::{Zeroize, Zeroizing};
 
 mod glob;
+mod program;
 
 pub use glob::{RG_ENV_TYPES, glob_may_name_env_file, grep_tool_glob_may_name_env_file};
 
@@ -1635,9 +1638,13 @@ impl Analyzer {
                     self.assigned(a);
                 }
                 // zsh's `export -m PATTERN` prints the matching parameters
-                // with their values.
+                // with their values, and `-p` prints them with operands too
+                // (Codex review: zsh's `export -p NAME` prints NAME's value,
+                // as `typeset -p` does, and dash's prints every exported
+                // variable; measured with zsh 5.9 and dash).
                 if (operands == 0 && !flags.contains(&b'f') && !flags.contains(&b'n'))
                     || flags.contains(&b'm')
+                    || flags.contains(&b'p')
                 {
                     self.found.push(Class::EnvDump);
                 }
@@ -1718,6 +1725,12 @@ impl Analyzer {
                     self.reader_globs |= r.globbed;
                     self.reads(r.env, Class::EnvFile);
                     self.reads(r.environ, Class::EnvDump);
+                    if let Some(lang) = spec.lang {
+                        self.program(lang, &r);
+                    }
+                    for c in r.commands.iter() {
+                        self.command_text(c, next, true)?;
+                    }
                     Ok(())
                 } else if inert(other) {
                     Ok(())
@@ -1878,7 +1891,60 @@ impl Analyzer {
                 }
             )
         });
-        if !script_like || depth > MAX_DEPTH {
+        if !script_like {
+            return Ok(());
+        }
+        self.command_text(w, depth, false)
+    }
+
+    /// What a reader's program reads besides its input ([`program`]): a
+    /// file it names is read as an operand is (an env file's, a process's
+    /// environment); a program that is not resolved (a stretch only known
+    /// when it runs, code from a file, a command it runs, the whole
+    /// environment, none of the candidate words a program of its
+    /// language) is [`Class::Unresolved`].
+    fn program(&mut self, lang: program::Lang, r: &Reads) {
+        if r.program_elsewhere {
+            self.found.push(Class::Unresolved);
+        }
+        if r.programs.is_empty() {
+            return;
+        }
+        let mut known = false;
+        for w in r.programs.iter() {
+            let Some(text) = literal(w).map(Zeroizing::new) else {
+                self.found.push(Class::Unresolved);
+                continue;
+            };
+            let Some(p) = program::read(lang, &text) else {
+                continue;
+            };
+            known = true;
+            for f in &p.files {
+                let w = lits(f);
+                self.reads(operand_tri(&w), Class::EnvFile);
+                self.reads(environ_tri(&w), Class::EnvDump);
+            }
+            if p.unresolved {
+                self.found.push(Class::Unresolved);
+            }
+        }
+        if !known {
+            self.found.push(Class::Unresolved);
+        }
+    }
+
+    /// Shell text a program may run, read as a script of its own: any
+    /// class found in it makes the call [`Class::Unresolved`]. With
+    /// `strict` (the text is a command the program runs: a reader's pager
+    /// or preprocessor), so does text that cannot be read or is nested too
+    /// deep; otherwise (a word that may be another language's text) that
+    /// is let be.
+    fn command_text(&mut self, w: &Word, depth: usize, strict: bool) -> Result<(), Amb> {
+        if depth > MAX_DEPTH {
+            if strict {
+                self.found.push(Class::Unresolved);
+            }
             return Ok(());
         }
         let mut sub = Analyzer::new();
@@ -1889,7 +1955,7 @@ impl Analyzer {
             .and_then(|()| sub.classify_all());
         self.work = sub.work;
         self.tick(0)?;
-        if r.is_ok() && sub.result(Ok(())).is_some() {
+        if (r.is_ok() || strict) && sub.result(r).is_some() {
             self.found.push(Class::Unresolved);
         }
         Ok(())
@@ -3600,6 +3666,20 @@ struct Reader {
     type_opts: &'static [&'static str],
     /// Options whose value defines a file type (ripgrep's `--type-add`).
     type_add_opts: &'static [&'static str],
+    /// The language of the program the pattern is (sed's script, awk's
+    /// program, jq's filter), read for what it reads besides the input
+    /// ([`program`]; Codex review: these were taken as patterns).
+    lang: Option<program::Lang>,
+    /// Options whose value is a file holding the pattern or the program
+    /// (`grep -f`, `sed -f`, `awk -f`, `jq -f`): read like any file, and
+    /// no operand is the pattern then.
+    source_opts: &'static [&'static str],
+    /// Options that load code from elsewhere (gawk's `-i` and `-l`): what
+    /// it reads is not known.
+    code_opts: &'static [&'static str],
+    /// Options whose value is a command run (ripgrep's `--pre`, a pager):
+    /// read as shell text.
+    cmd_opts: &'static [&'static str],
 }
 
 const PLAIN: Reader = Reader {
@@ -3614,6 +3694,10 @@ const PLAIN: Reader = Reader {
     regex_opts: &[],
     type_opts: &[],
     type_add_opts: &[],
+    lang: None,
+    source_opts: &[],
+    code_opts: &[],
+    cmd_opts: &[],
 };
 
 impl Reader {
@@ -3677,9 +3761,9 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--italic-text",
                 "--decorations",
                 "--paging",
-                "--pager",
                 "--file-name",
             ],
+            cmd_opts: &["--pager"],
             ..PLAIN
         },
         b"od" => Reader {
@@ -3758,6 +3842,8 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--batch-size",
             ],
             file_opts: &["--files0-from"],
+            // The program sort runs on its temporary files.
+            cmd_opts: &["--compress-program"],
             ..PLAIN
         },
         b"uniq" => Reader {
@@ -3787,6 +3873,8 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--width",
             ],
             file_opts: &["-X", "--exclude-from"],
+            // sdiff's and diff3's program to compare with.
+            cmd_opts: &["--diff-program"],
             ..PLAIN
         },
         b"paste" => Reader {
@@ -3823,7 +3911,8 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--group-separator",
             ],
             pattern_opts: &["-e", "--regexp"],
-            file_opts: &["-f", "--file", "--exclude-from"],
+            source_opts: &["-f", "--file"],
+            file_opts: &["--exclude-from"],
             glob_opts: &["--include"],
             // macOS's grep (BSD 2.6.0) matches `--include` against the whole
             // path, its `*` and `?` matching a `/` (the verifier's finding:
@@ -3856,7 +3945,6 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "-d",
                 "-E",
                 "--encoding",
-                "--pre",
                 "--pre-glob",
                 "--sort",
                 "--sortr",
@@ -3874,10 +3962,12 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--generate",
             ],
             pattern_opts: &["-e", "--regexp"],
-            file_opts: &["-f", "--file", "--ignore-file"],
+            source_opts: &["-f", "--file"],
+            file_opts: &["--ignore-file"],
             glob_opts: &["-g", "--glob", "--iglob"],
             type_opts: &["-t", "--type"],
             type_add_opts: &["--type-add"],
+            cmd_opts: &["--pre"],
             ..PLAIN
         },
         b"ag" => Reader {
@@ -3891,35 +3981,42 @@ fn reader(name: &[u8]) -> Option<Reader> {
                 "--ignore",
                 "--ignore-dir",
                 "--depth",
-                "--pager",
                 "-W",
                 "--width",
             ],
             file_opts: &["-p", "--path-to-ignore"],
             regex_opts: &["-G", "--file-search-regex"],
+            cmd_opts: &["--pager"],
             ..PLAIN
         },
         b"sed" | b"gsed" => Reader {
             pattern_first: true,
             valued: &["-l", "--line-length"],
             pattern_opts: &["-e", "--expression"],
-            file_opts: &["-f", "--file"],
+            source_opts: &["-f", "--file"],
+            lang: Some(program::Lang::Sed),
             ..PLAIN
         },
         b"awk" | b"gawk" | b"mawk" | b"nawk" => Reader {
             pattern_first: true,
             valued: &["-v", "-F", "--assign", "--field-separator"],
-            pattern_opts: &["--source"],
-            file_opts: &["-f", "--file", "-i", "--include"],
+            pattern_opts: &["--source", "-e"],
+            source_opts: &["-f", "--file", "-E", "--exec"],
+            code_opts: &["-i", "--include", "-l", "--load"],
+            lang: Some(program::Lang::Awk),
             ..PLAIN
         },
         b"jq" | b"yq" | b"gojq" | b"jaq" => Reader {
             pattern_first: true,
-            valued: &["--indent", "-L", "--seq"],
+            // `--seq` is a flag: read as taking a value, `jq -R --seq .
+            // .env` had its file taken for the program (measured with jq
+            // 1.8.1: it prints the file).
+            valued: &["--indent", "-L"],
             pattern_opts: &[],
-            file_opts: &["-f", "--from-file"],
+            source_opts: &["-f", "--from-file"],
             two: &["--arg", "--argjson"],
             name_then_file: &["--slurpfile", "--rawfile"],
+            lang: Some(program::Lang::Jq),
             ..PLAIN
         },
         _ => return None,
@@ -3927,7 +4024,7 @@ fn reader(name: &[u8]) -> Option<Reader> {
 }
 
 /// What a reader command reads, as far as it is known.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct Reads {
     /// An env file ([`Tri::Maybe`]: a name only known when it runs).
     env: Tri,
@@ -3936,30 +4033,88 @@ struct Reads {
     /// A file operand holds an unquoted glob, which shell options this
     /// reader does not model may make match a dot file.
     globbed: bool,
+    /// The words that may be the program, for a reader with one
+    /// ([`Reader::lang`]): each `-e` value joined into one, or the first
+    /// operand as GNU and as BSD sed read the words (BSD's `-i` takes the
+    /// next word as its suffix: `sed -i '' 's/a/b/' f`).
+    programs: Zeroizing<Vec<Word>>,
+    /// The program, or code it loads, comes from elsewhere (a file, a
+    /// library): what it reads is not known.
+    program_elsewhere: bool,
+    /// The values of options that run a command ([`Reader::cmd_opts`]).
+    commands: Zeroizing<Vec<Word>>,
 }
 
 /// What a reader command, with `args`, reads: an env file as a file
 /// operand or as the value of an option that names a file it reads or
-/// picks the files it reads.
+/// picks the files it reads; and the program it runs, the code it loads
+/// and the commands it starts, for [`Analyzer::run`] to read.
 fn reads_env_file(spec: &Reader, args: &[Word]) -> Reads {
     let mut out = Reads {
         env: Tri::Not,
         environ: Tri::Not,
         globbed: false,
+        programs: Zeroizing::new(Vec::new()),
+        program_elsewhere: false,
+        commands: Zeroizing::new(Vec::new()),
     };
     let file = |out: &mut Reads, w: &Word| {
         out.env = worse(out.env, operand_tri(w));
         out.environ = worse(out.environ, environ_tri(w));
     };
     let mut pattern_given = false;
-    let mut operands: Vec<&Word> = Vec::new();
+    // The `-e` programs, joined with newlines as sed and gawk join them.
+    let mut given: Word = Vec::new();
+    // Operands, by their index in `args`.
+    let mut operands: Vec<usize> = Vec::new();
+    // The word after a separate `-i` or `-I` (sed): BSD's suffix, GNU's
+    // program or file.
+    let mut suffix_word: Option<usize> = None;
     let mut i = 0;
     let mut only_operands = false;
+    // What an option's value is, once its name is known.
+    let value_of =
+        |out: &mut Reads, pattern_given: &mut bool, given: &mut Word, name: &str, value: &Word| {
+            if spec.source_opts.contains(&name) {
+                *pattern_given = true;
+                out.program_elsewhere |= spec.lang.is_some();
+                file(out, value);
+            } else if spec.code_opts.contains(&name) {
+                out.program_elsewhere = true;
+                file(out, value);
+            } else if spec.file_opts.contains(&name) {
+                file(out, value);
+            } else if spec.pattern_opts.contains(&name) {
+                *pattern_given = true;
+                if spec.lang.is_some() {
+                    if !given.is_empty() {
+                        given.push(Ch::Lit {
+                            b: b'\n',
+                            quoted: true,
+                        });
+                    }
+                    given.extend_from_slice(value);
+                }
+            } else if spec.cmd_opts.contains(&name) {
+                out.commands.push(value.clone());
+            } else if spec.selects(name) && spec.selects_env(name, value) {
+                out.env = Tri::Is;
+            }
+        };
+    let takes_value = |name: &str| {
+        spec.source_opts.contains(&name)
+            || spec.code_opts.contains(&name)
+            || spec.file_opts.contains(&name)
+            || spec.pattern_opts.contains(&name)
+            || spec.cmd_opts.contains(&name)
+            || spec.selects(name)
+            || spec.valued.contains(&name)
+    };
     while i < args.len() {
         let a = &args[i];
         i += 1;
         if only_operands {
-            operands.push(a);
+            operands.push(i - 1);
             continue;
         }
         let o = match plain(a) {
@@ -3970,7 +4125,7 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> Reads {
             None => match literal(a) {
                 Some(t) if t.len() > 1 && t.starts_with(b"-") => Plain(Zeroizing::new(t)),
                 _ => {
-                    operands.push(a);
+                    operands.push(i - 1);
                     continue;
                 }
             },
@@ -3980,7 +4135,7 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> Reads {
             continue;
         }
         if !o.starts_with(b"-") || o == b"-" {
-            operands.push(a);
+            operands.push(i - 1);
             continue;
         }
         let text = Zeroizing::new(String::from_utf8_lossy(&o).into_owned());
@@ -3993,41 +4148,24 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> Reads {
                 None => (text.clone(), None),
             };
             let n = name.as_str();
-            if spec.selects(n) {
-                let picks_env = match value {
-                    Some(v) => spec.selects_env(n, &lits(v.as_bytes())),
-                    None => {
-                        i += 1;
-                        args.get(i - 1).is_some_and(|w| spec.selects_env(n, w))
-                    }
-                };
-                if picks_env {
-                    out.env = Tri::Is;
-                }
-            } else if spec.two.contains(&n) {
+            if spec.two.contains(&n) {
                 i += 2;
             } else if spec.name_then_file.contains(&n) {
                 if let Some(w) = args.get(i + 1) {
                     file(&mut out, w);
                 }
                 i += 2;
-            } else if spec.file_opts.contains(&n) {
-                match value {
-                    Some(v) => file(&mut out, &lits(v.as_bytes())),
+            } else if takes_value(n) {
+                let v: Option<Word> = match value {
+                    Some(v) => Some(lits(v.as_bytes())),
                     None => {
-                        if let Some(w) = args.get(i) {
-                            file(&mut out, w);
-                        }
                         i += 1;
+                        args.get(i - 1).cloned()
                     }
+                };
+                if let Some(v) = v {
+                    value_of(&mut out, &mut pattern_given, &mut given, n, &v);
                 }
-            } else if spec.pattern_opts.contains(&n) {
-                pattern_given = true;
-                if value.is_none() {
-                    i += 1;
-                }
-            } else if spec.valued.contains(&n) && value.is_none() {
-                i += 1;
             }
             continue;
         }
@@ -4042,48 +4180,61 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> Reads {
         for (k, &b) in bytes.iter().enumerate() {
             let flag = format!("-{}", char::from(b));
             let f = flag.as_str();
-            let is_file = spec.file_opts.contains(&f);
-            let is_pattern = spec.pattern_opts.contains(&f);
-            let selects = spec.selects(f);
-            if !(is_file || is_pattern || selects || spec.valued.contains(&f)) {
+            let rest = &bytes[k + 1..];
+            if spec.lang == Some(program::Lang::Sed) && (b == b'i' || b == b'I') {
+                // sed's in-place option: what follows it in the word is
+                // its suffix; with none, BSD sed takes the next word as
+                // the suffix and GNU sed does not.
+                if rest.is_empty() {
+                    suffix_word = Some(i);
+                }
+                break;
+            }
+            if !takes_value(f) {
                 continue;
             }
-            pattern_given |= is_pattern;
-            let rest = &bytes[k + 1..];
             if rest.is_empty() {
-                let value = args.get(i);
-                if is_file {
-                    if let Some(w) = value {
-                        file(&mut out, w);
-                    }
-                }
-                if selects && value.is_some_and(|w| spec.selects_env(f, w)) {
-                    out.env = Tri::Is;
+                if let Some(w) = args.get(i) {
+                    value_of(&mut out, &mut pattern_given, &mut given, f, w);
                 }
                 i += 1;
             } else {
-                if is_file {
-                    file(&mut out, &lits(rest));
-                }
-                if selects && spec.selects_env(f, &lits(rest)) {
-                    out.env = Tri::Is;
-                }
+                value_of(&mut out, &mut pattern_given, &mut given, f, &lits(rest));
             }
             break;
         }
     }
-    let files = if spec.pattern_first && !pattern_given {
+    let first_is_pattern = spec.pattern_first && !pattern_given;
+    let files = if first_is_pattern {
         operands.get(1..).unwrap_or(&[])
     } else {
         &operands[..]
     };
-    for w in files {
+    for &k in files {
+        let w = &args[k];
         // awk's `name=value` operands are assignments, not files.
         if spec.pattern_first && is_assignment(w) {
             continue;
         }
         file(&mut out, w);
         out.globbed |= globbed(w);
+    }
+    if spec.lang.is_some() {
+        if !given.is_empty() {
+            out.programs.push(given);
+        } else if first_is_pattern {
+            // GNU's reading: the first operand.
+            if let Some(&k) = operands.first() {
+                out.programs.push(args[k].clone());
+            }
+            // BSD's: the word after `-i` is its suffix, and the next
+            // operand the program.
+            if let Some(s) = suffix_word.filter(|s| operands.first() == Some(s)) {
+                if let Some(&k) = operands.iter().find(|k| **k != s) {
+                    out.programs.push(args[k].clone());
+                }
+            }
+        }
     }
     out
 }
@@ -4144,6 +4295,24 @@ mod tests {
             ". ./venv/bin/activate",
             "git log --grep cat",
             "cargo run -- --help",
+            // Readers' programs that read nothing but their input (round
+            // 6's controls), as agents write them on macOS and Linux.
+            "sed -n '/.env/p' .gitignore",
+            "sed -i '' 's/a/b/' notes.txt",
+            "sed -i.bak 's/a/b/' notes.txt",
+            "sed -i -e 's/a/b/' notes.txt",
+            "sed -E 's/(a|b)+/x/g; 1d' notes.txt",
+            "sed ':a;N;$!ba;s/\\n/ /g' notes.txt",
+            "sed -n 's/.env/x/w out.txt' notes.txt",
+            "awk '{ print $1 }' notes.txt",
+            "awk -F: -v k=2 'NR == k { print $2 }' /etc/passwd",
+            "awk '/a|b/ { n++ } END { print n }' notes.txt",
+            "awk '{ while ((getline line) > 0) print line }' notes.txt",
+            "jq .name package.json",
+            "jq -r '.scripts | keys[]' package.json",
+            "jq --arg v 1 '.version = $v' package.json",
+            "yq '.services' compose.yaml",
+            "grep -f patterns.txt src/main.rs",
         ] {
             assert_eq!(s(ok), None, "{ok}");
         }

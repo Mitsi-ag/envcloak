@@ -41,6 +41,13 @@
 //! changed options to any program, and has an interpreter's code or
 //! input name the file or the environment.
 //!
+//! Round 6 adds named parameters printed with their values to the
+//! environment family (`export -p NAME`, `readonly -p NAME`, `typeset -p
+//! NAME`): zsh prints them, and dash prints every exported variable.
+//! Mutation checked: `export`'s `-p` read only without operands (as before
+//! round 6): zsh's and dash's `export -p ECX_PROBE` print the canary and
+//! are allowed, and this fails.
+//!
 //! Mutations checked: POSIX bracket expressions read as plain members in
 //! `glob.rs` (`posix_end` answering `None`): `find -name '.[[:alpha:]]nv'`
 //! spellings that find reads `.env` with are allowed, and this fails.
@@ -316,6 +323,10 @@ struct Case {
     family: &'static str,
 }
 
+fn rng_pick(rng: &mut Rng, items: &[&str]) -> String {
+    items[rng.below(items.len())].to_owned()
+}
+
 fn read_cases(rng: &mut Rng, n: usize) -> Vec<Case> {
     let mut out = Vec::new();
     for _ in 0..n {
@@ -382,7 +393,7 @@ fn dump_cases(rng: &mut Rng, n: usize) -> Vec<Case> {
     let linux = cfg!(target_os = "linux");
     let mut out = Vec::new();
     for _ in 0..n {
-        let script = match rng.below(if linux { 12 } else { 10 }) {
+        let script = match rng.below(if linux { 14 } else { 12 }) {
             0 => command_word(rng, "printenv", "/usr/bin"),
             1 => command_word(rng, "env", "/usr/bin"),
             2 => "export -p".to_owned(),
@@ -393,6 +404,21 @@ fn dump_cases(rng: &mut Rng, n: usize) -> Vec<Case> {
             7 => "declare -p".to_owned(),
             8 => format!("{} | sort", command_word(rng, "env", "/usr/bin")),
             9 => "export".to_owned(),
+            // A named parameter printed with its value (Codex review,
+            // round 6: zsh's `export -p NAME` and `readonly -p NAME`
+            // print it, as `typeset -p NAME` does in bash and zsh, and
+            // dash's `export -p NAME` prints every exported variable).
+            10 => rng_pick(
+                rng,
+                &[
+                    "export -p ECX_PROBE",
+                    "readonly -p ECX_PROBE",
+                    "typeset -p ECX_PROBE",
+                    "declare -p ECX_PROBE",
+                    "export -pf ECX_PROBE",
+                ],
+            ),
+            11 => rng_pick(rng, &["local -p ECX_PROBE", "export -p -- ECX_PROBE"]),
             _ => {
                 let w = shell_word(rng, "proc/self/environ");
                 format!("tr '\\0' '\\n' < /{w}")

@@ -565,10 +565,76 @@ const CORPUS: &[(&str, Option<Class>)] = &[
         Some(Class::Unresolved),
     ),
     ("git commit -F .env", Some(Class::Unresolved)),
+    // Round 6 (Codex review): a reader's program read for what it reads
+    // and runs (sed's `r`, `R`, `e` and `s///e`, awk's `getline <`, pipes,
+    // `system`, `ARGV` and `ENVIRON`, jq's `env` and `$ENV`, yq's `load`),
+    // the file holding a pattern or a program, a pager or preprocessor
+    // command, and zsh's `export -p NAME`.
+    ("sed -n '1r .env' README.md", Some(Class::EnvFile)),
+    ("sed 'R .env' a.txt", Some(Class::EnvFile)),
+    (
+        "sed -n 'p;r /proc/self/environ' a.txt",
+        Some(Class::EnvDump),
+    ),
+    ("sed -i '' '1r .env' notes.txt", Some(Class::EnvFile)),
+    ("sed -e p -e '$r sub/.env' a.txt", Some(Class::EnvFile)),
+    ("sed '1e cat .env' a.txt", Some(Class::Unresolved)),
+    ("sed 's/.*/printenv/e' a.txt", Some(Class::Unresolved)),
+    ("sed -f script.sed a.txt", Some(Class::Unresolved)),
+    ("sed \"1r $f\" a.txt", Some(Class::Unresolved)),
+    (
+        "awk 'BEGIN { while ((getline l < \".env\") > 0) print l }'",
+        Some(Class::EnvFile),
+    ),
+    (
+        "gawk -e 'BEGIN { getline l < \"/proc/self/environ\"; print l }'",
+        Some(Class::EnvDump),
+    ),
+    (
+        "awk 'BEGIN { for (k in ENVIRON) print k, ENVIRON[k] }'",
+        Some(Class::Unresolved),
+    ),
+    (
+        "awk 'BEGIN { system(\"cat .env\") }'",
+        Some(Class::Unresolved),
+    ),
+    (
+        "awk 'BEGIN { \"cat .env\" | getline x; print x }'",
+        Some(Class::Unresolved),
+    ),
+    (
+        "awk 'BEGIN { ARGV[ARGC++] = \".env\" } 1'",
+        Some(Class::Unresolved),
+    ),
+    ("awk -f prog.awk a.txt", Some(Class::Unresolved)),
+    ("jq -n env", Some(Class::Unresolved)),
+    ("jq -n '$ENV'", Some(Class::Unresolved)),
+    ("jq -R --seq . .env", Some(Class::EnvFile)),
+    ("yq -n 'load(\".env\")'", Some(Class::EnvFile)),
+    ("jq -f filter.jq data.json", Some(Class::Unresolved)),
+    ("grep -v -f /dev/null .env", Some(Class::EnvFile)),
+    ("rg --pre printenv KEY", Some(Class::Unresolved)),
+    (
+        "sort -S 1 --compress-program=printenv a.txt",
+        Some(Class::Unresolved),
+    ),
+    (
+        "sdiff --diff-program='cat .env' a b",
+        Some(Class::Unresolved),
+    ),
+    (
+        "bat --paging=always --pager env README.md",
+        Some(Class::Unresolved),
+    ),
+    ("export -p OPENAI_API_KEY", Some(Class::EnvDump)),
+    ("readonly -p OPENAI_API_KEY", Some(Class::EnvDump)),
+    ("typeset -p OPENAI_API_KEY", Some(Class::EnvDump)),
     // What the hook lets through (docs/INSTALLERS.md, "What the hook does
     // not see").
     ("echo $OPENAI_API_KEY", None),
     ("node -e 'console.log(process.env.OPENAI_API_KEY)'", None),
+    ("awk 'BEGIN { print ENVIRON[\"OPENAI_API_KEY\"] }'", None),
+    ("jq -n env.OPENAI_API_KEY", None),
     ("ls -a | grep '^.e' | xargs cat", None),
     ("cp \"$F\" /dev/stdout", None),
     ("cp $(ls -a | grep '^.e') /dev/stdout", None),
