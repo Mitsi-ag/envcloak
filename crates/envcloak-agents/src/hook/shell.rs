@@ -22,9 +22,24 @@
 //!   known when it runs (`$CMD`, `c${IFS}at`), `eval` or `sh -c` of text
 //!   that is, or nesting past [`MAX_DEPTH`]. The hook denies these too
 //!   (the conservative reading, lesson L-06).
+//! - [`Class::Unresolved`]: a command that reads files or the environment
+//!   was read, but what it reads was not resolved (the orchestrator's
+//!   finding: fail closed rather than list bad forms): a file name only
+//!   known when it runs, zsh's `=name` as an operand, a reader's glob once
+//!   the script changes how globs are read, or a program the reader does
+//!   not know given a command that would read a secret. The hook asks the
+//!   person about these (Claude Code) or stops them (Codex).
 //!
-//! The grammar read is the POSIX shell's, with bash's additions an agent
-//! uses: single, double and `$'...'` quotes and backslashes; `$name`,
+//! A glob in a shell word is resolved when the shells' leading-dot rule
+//! decides it (`*`, `?` and a bracket expression never match a leading
+//! `.` under their default options, measured with bash, zsh and dash):
+//! `cat src/*.rs` reads no dot file. `tests/shell_oracle.rs` checks that
+//! no spelling the shells read a secret with is let through.
+//!
+//! The grammar read is the POSIX shell's, with bash's and zsh's additions
+//! an agent uses (zsh is Claude Code's Bash tool's shell on macOS): zsh's
+//! `=name`, precommand modifiers, `repeat`, `typeset -m`; brace sequences
+//! as the words they make; POSIX bracket expressions; and single, double and `$'...'` quotes and backslashes; `$name`,
 //! `${...}`, `$(...)`, backquotes and `$((...))`; brace expansion;
 //! pipelines and lists; subshells, groups, `if`, `while`, `until`, `for`,
 //! `select`, `case`, `[[ ]]`, `(( ))` and functions; redirections with
@@ -72,6 +87,15 @@ pub enum Class {
     Approve,
     /// What runs could not be told.
     Ambiguous,
+    /// A command that reads files or the environment was read, but what it
+    /// reads was not: a name only known when it runs (`cat "$f"`), a glob
+    /// read under shell options this reader does not model (`shopt -s
+    /// dotglob`), zsh's `=command` expansion in an operand, or a program
+    /// this reader does not know given a command that would read one
+    /// (`firejail cat .env`). The hook asks the person (Claude Code) or
+    /// stops it (Codex, which runs a call its hook asks about): never a
+    /// silent allow.
+    Unresolved,
 }
 
 /// The deepest nesting of substitutions, subshells and `sh -c` scripts
@@ -206,6 +230,13 @@ struct Analyzer {
     /// pass: Codex review).
     bodies: HashMap<usize, Vec<Body>>,
     found: Vec<Class>,
+    /// A command that changes how globs are read (bash's `shopt`, zsh's
+    /// `setopt`, `set -o`, `emulate`, `GLOBIGNORE`, `BASHOPTS`, a shell
+    /// started with `-O` or `-o`): the leading-dot rule the reader relies
+    /// on may not hold anywhere in the script.
+    glob_options: bool,
+    /// A file operand of a reader holds an unquoted glob.
+    reader_globs: bool,
     work: usize,
     /// Quotes, expansions and arrays open inside one another: past
     /// [`MAX_NEST`], ambiguous (each is a frame on the stack).
@@ -248,18 +279,28 @@ impl Analyzer {
             pending: Vec::new(),
             bodies: HashMap::new(),
             found: Vec::new(),
+            glob_options: false,
+            reader_globs: false,
             work: 0,
             nest: 0,
             next_id: 0,
         }
     }
 
+    /// The class to answer: the first that is a denial's, else
+    /// [`Class::Ambiguous`] when reading stopped, else
+    /// [`Class::Unresolved`] when a read was not resolved (a glob read
+    /// under changed glob options included), else none.
     fn result(&self, r: Result<(), Amb>) -> Option<Class> {
-        match (self.found.first(), r) {
-            (Some(&c), _) => Some(c),
-            (None, Err(Amb)) => Some(Class::Ambiguous),
-            (None, Ok(())) => None,
+        if let Some(&c) = self.found.iter().find(|c| **c != Class::Unresolved) {
+            return Some(c);
         }
+        if r.is_err() {
+            return Some(Class::Ambiguous);
+        }
+        let unresolved =
+            self.found.contains(&Class::Unresolved) || (self.glob_options && self.reader_globs);
+        unresolved.then_some(Class::Unresolved)
     }
 
     fn tick(&mut self, n: usize) -> Result<(), Amb> {
@@ -1050,16 +1091,23 @@ impl Analyzer {
     }
 
     fn classify(&mut self, cmd: &Cmd, bodies: &[Body]) -> Result<(), Amb> {
+        let mut cost = BraceCost::default();
         for r in &cmd.redirs {
-            if r.kind == RedirKind::Read && dotenv(&r.target) == Tri::Is {
-                self.found.push(Class::EnvFile);
-            }
-            if names_environ(&r.target) {
-                self.found.push(Class::EnvDump);
+            // A redirection's word is brace-expanded too (the shell oracle's
+            // finding: `< .{e..e}nv` reads `.env` in bash and zsh).
+            let targets = Zeroizing::new(brace_expand(&r.target, &mut cost, 0)?);
+            for t in targets.iter() {
+                if r.kind == RedirKind::Read {
+                    // Input from a file: an env file's, or one only known
+                    // when it runs (`< "$f"`), and the zsh `=command` form.
+                    self.reads(operand_tri(t), Class::EnvFile);
+                    self.reads(environ_tri(t), Class::EnvDump);
+                } else if environ_tri(t) == Tri::Is {
+                    self.found.push(Class::EnvDump);
+                }
             }
         }
         let mut words: Zeroizing<Vec<Word>> = Zeroizing::new(Vec::new());
-        let mut cost = BraceCost::default();
         for w in &cmd.words {
             words.extend(brace_expand(w, &mut cost, 0)?);
         }
@@ -1068,7 +1116,36 @@ impl Analyzer {
             .iter()
             .position(|w| !is_assignment(w))
             .unwrap_or(words.len());
+        for w in &words[..start] {
+            self.assigned(w);
+        }
         self.run(&words[start..], bodies, cmd.depth)
+    }
+
+    /// What reading a file whose name is `t` adds: `class` when it is
+    /// one, [`Class::Unresolved`] when it may be.
+    fn reads(&mut self, t: Tri, class: Class) {
+        match t {
+            Tri::Is => self.found.push(class),
+            Tri::Maybe => self.found.push(Class::Unresolved),
+            Tri::Not => {}
+        }
+    }
+
+    /// What an assignment (`NAME=value`, as a command's prefix, or given
+    /// to `env`, `export` or `declare`) does to what the script reads:
+    /// `BASHOPTS`, `SHELLOPTS` and `GLOBIGNORE` change how globs are read
+    /// (`GLOBIGNORE` turns bash's `dotglob` on); `BASH_ENV` and `ENV` name
+    /// a file a shell reads as it starts (`BASH_ENV=.env bash -c ...`).
+    fn assigned(&mut self, w: &[Ch]) {
+        let Some((name, value)) = assignment(w) else {
+            return;
+        };
+        match name.as_slice() {
+            b"BASHOPTS" | b"SHELLOPTS" | b"GLOBIGNORE" => self.glob_options = true,
+            b"BASH_ENV" | b"ENV" => self.reads(operand_tri(value), Class::EnvFile),
+            _ => {}
+        }
     }
 
     /// What `words`, a command and its arguments, runs.
@@ -1080,9 +1157,22 @@ impl Analyzer {
         let Some((w0, args)) = words.split_first() else {
             return Ok(());
         };
-        if args.iter().any(names_environ) || names_environ(w0) {
+        if args.iter().chain([w0]).any(|w| environ_tri(w) == Tri::Is) {
             self.found.push(Class::EnvDump);
         }
+        // zsh's `=name` (its default EQUALS option) runs `name`, found on
+        // `PATH` (the verifier's finding: `=printenv` was read as a command
+        // of that name).
+        let w0: &[Ch] = match w0.split_first() {
+            Some((
+                Ch::Lit {
+                    b: b'=',
+                    quoted: false,
+                },
+                rest,
+            )) if !rest.is_empty() => rest,
+            _ => w0,
+        };
         let Some(name) = command_name(w0)? else {
             return Ok(());
         };
@@ -1104,9 +1194,22 @@ impl Analyzer {
                 }
                 self.run(&args[i..], bodies, next)
             }
-            b"builtin" | b"nohup" | b"setsid" | b"unbuffer" | b"busybox" => {
+            // zsh's precommand modifiers `noglob`, `nocorrect` and `-`,
+            // and `coproc` (bash and zsh) run the command after them (the
+            // verifier's zsh finding).
+            b"builtin" | b"nohup" | b"setsid" | b"unbuffer" | b"busybox" | b"noglob"
+            | b"nocorrect" | b"-" | b"coproc" => {
                 let i = skip_flags(args, &[]);
                 self.run(&args[i..], bodies, next)
+            }
+            // zsh's `repeat N COMMAND`.
+            b"repeat" => self.run(args.get(1..).unwrap_or(&[]), bodies, next),
+            // What changes how a glob is read: the leading-dot rule this
+            // reader relies on may not hold (bash's `shopt -s dotglob`,
+            // zsh's `setopt globdots` or `extendedglob`).
+            b"shopt" | b"setopt" | b"unsetopt" | b"emulate" => {
+                self.glob_options = true;
+                Ok(())
             }
             b"exec" => {
                 let i = skip_flags(args, &[b"-a"]);
@@ -1323,8 +1426,8 @@ impl Analyzer {
             b"sh" | b"bash" | b"zsh" | b"dash" | b"ksh" | b"mksh" | b"ash" | b"yash" | b"posh"
             | b"fish" | b"rbash" | b"ksh93" | b"pdksh" | b"oksh" => self.shell(args, bodies, next),
             b"source" | b"." => {
-                if args.first().is_some_and(|f| dotenv(f) == Tri::Is) {
-                    self.found.push(Class::EnvFile);
+                if let Some(f) = args.first() {
+                    self.reads(operand_tri(f), Class::EnvFile);
                 }
                 Ok(())
             }
@@ -1335,7 +1438,14 @@ impl Analyzer {
             b"export" => {
                 let operands = args.iter().filter(|a| !is_option(a)).count();
                 let flags = option_chars(args);
-                if operands == 0 && !flags.contains(&b'f') && !flags.contains(&b'n') {
+                for a in args {
+                    self.assigned(a);
+                }
+                // zsh's `export -m PATTERN` prints the matching parameters
+                // with their values.
+                if (operands == 0 && !flags.contains(&b'f') && !flags.contains(&b'n'))
+                    || flags.contains(&b'm')
+                {
                     self.found.push(Class::EnvDump);
                 }
                 Ok(())
@@ -1343,15 +1453,26 @@ impl Analyzer {
             b"set" => {
                 if args.is_empty() {
                     self.found.push(Class::EnvDump);
+                } else if set_changes_globs(args) {
+                    self.glob_options = true;
                 }
                 Ok(())
             }
-            b"declare" | b"typeset" | b"local" | b"readonly" => {
+            b"declare" | b"typeset" | b"local" | b"readonly" | b"integer" | b"float" => {
                 let operands = args.iter().filter(|a| !is_option(a)).count();
                 let flags = option_chars(args);
+                for a in args {
+                    self.assigned(a);
+                }
                 let functions_only =
                     !flags.is_empty() && flags.iter().all(|f| *f == b'f' || *f == b'F');
-                if (operands == 0 && !functions_only) || flags.contains(&b'p') {
+                // zsh's `-m`: the operands are patterns, and every matching
+                // parameter is printed with its value (`typeset -m '*'`,
+                // the verifier's finding).
+                if (operands == 0 && !functions_only)
+                    || flags.contains(&b'p')
+                    || flags.contains(&b'm')
+                {
                     self.found.push(Class::EnvDump);
                 }
                 Ok(())
@@ -1389,37 +1510,27 @@ impl Analyzer {
             }
             b"find" => self.find(args, next),
             b"dd" => {
-                let reads_env = args.iter().any(|a| {
-                    a.len() > 3
-                        && a[..3]
-                            == [
-                                Ch::Lit {
-                                    b: b'i',
-                                    quoted: false,
-                                },
-                                Ch::Lit {
-                                    b: b'f',
-                                    quoted: false,
-                                },
-                                Ch::Lit {
-                                    b: b'=',
-                                    quoted: false,
-                                },
-                            ]
-                        && dotenv(&a[3..]) == Tri::Is
-                });
-                if reads_env {
-                    self.found.push(Class::EnvFile);
+                let input = (*b"if=").map(|b| Ch::Lit { b, quoted: false });
+                for a in args {
+                    if a.len() > 3 && a[..3] == input {
+                        self.reads(operand_tri(&a[3..]), Class::EnvFile);
+                        self.reads(environ_tri(&a[3..]), Class::EnvDump);
+                    }
                 }
                 Ok(())
             }
             other => {
                 if let Some(spec) = reader(other) {
-                    if reads_env_file(&spec, args) {
-                        self.found.push(Class::EnvFile);
-                    }
+                    let r = reads_env_file(&spec, args);
+                    self.reader_globs |= r.globbed;
+                    self.reads(r.env, Class::EnvFile);
+                    self.reads(r.environ, Class::EnvDump);
+                    Ok(())
+                } else if inert(other) {
+                    Ok(())
+                } else {
+                    self.unknown_runs(args, bodies, next)
                 }
-                Ok(())
             }
         }
     }
@@ -1472,12 +1583,53 @@ impl Analyzer {
         }
         let rest = args.get(i..).unwrap_or(&[]);
         let skip = rest.iter().take_while(|w| is_assignment(w)).count();
+        for w in &rest[..skip] {
+            self.assigned(w);
+        }
         let rest = &rest[skip..];
         if rest.is_empty() {
             self.found.push(Class::EnvDump);
             return Ok(());
         }
         self.run(rest, bodies, depth)
+    }
+
+    /// A program this reader does not know (Codex review: `repeat 1 cat
+    /// .env`, `dbus-run-session printenv`, `firejail cat .env` were let
+    /// through): if one of its words names a command this reader does
+    /// know, what follows is read as that command would run, and anything
+    /// it finds makes the call [`Class::Unresolved`] (the program may run
+    /// it, or may take the words as data). A bare `env`, `set`, `export`
+    /// or `declare` as the last word is read as data (`python -m venv
+    /// env`), and so is anything after a program known to take its words
+    /// as data ([`inert`]).
+    fn unknown_runs(&mut self, args: &[Word], bodies: &[Body], depth: usize) -> Result<(), Amb> {
+        for k in 0..args.len() {
+            self.tick(1)?;
+            let Some(name) = command_name(&args[k]).ok().flatten() else {
+                continue;
+            };
+            if !known_command(&name)
+                || (k + 1 == args.len()
+                    && matches!(
+                        name.as_slice(),
+                        b"env" | b"set" | b"export" | b"declare" | b"typeset" | b"local"
+                    ))
+            {
+                continue;
+            }
+            let found = self.found.len();
+            let (globs, unresolved) = (self.reader_globs, self.glob_options);
+            let r = self.run(&args[k..], bodies, depth);
+            let hit = r.is_err() || self.found.len() > found;
+            self.found.truncate(found);
+            (self.reader_globs, self.glob_options) = (globs, unresolved);
+            if hit {
+                self.found.push(Class::Unresolved);
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// `xargs [options] [command]`: the command runs with arguments read
@@ -1494,8 +1646,8 @@ impl Analyzer {
             }
             match o.as_slice() {
                 b"-a" | b"--arg-file" => {
-                    if args.get(i).is_some_and(|f| dotenv(f) == Tri::Is) {
-                        self.found.push(Class::EnvFile);
+                    if let Some(f) = args.get(i) {
+                        self.reads(operand_tri(f), Class::EnvFile);
                     }
                     i += 1;
                 }
@@ -1645,6 +1797,9 @@ impl Analyzer {
                 dash_c = true;
             }
             if o[1..].contains(&b'o') || o[1..].contains(&b'O') {
+                // `bash -O dotglob`, `zsh -o globdots`: the script's globs
+                // are read under options this reader does not model.
+                self.glob_options = true;
                 i += 1;
             }
         }
@@ -2138,7 +2293,7 @@ fn skip_flags_but(args: &[Word], valued: &[&[u8]], stop: &[&[u8]]) -> usize {
 /// command.
 pub fn path_class(path: &str) -> Option<Class> {
     let w: Zeroizing<Word> = Zeroizing::new(lits(path.as_bytes()));
-    if names_environ(&w) {
+    if environ_tri(&w) == Tri::Is {
         Some(Class::EnvDump)
     } else if dotenv(&w) == Tri::Is {
         Some(Class::EnvFile)
@@ -2231,76 +2386,273 @@ fn dotenv(w: &[Ch]) -> Tri {
     }
 }
 
-/// Whether the path `w` names a process's environment,
-/// `/proc/<pid>/environ` (any pid, a glob or a variable included).
-fn names_environ(w: &Word) -> bool {
-    let text: Zeroizing<Vec<u8>> = Zeroizing::new(
-        w.iter()
-            .map(|ch| match ch {
-                Ch::Lit { b, .. } => *b,
-                Ch::Unknown => b'*',
-            })
-            .collect(),
-    );
-    if !text.windows(6).any(|x| x == b"/proc/") && !text.starts_with(b"proc/") {
-        return false;
+/// The worse of two answers: [`Tri::Is`], then [`Tri::Maybe`].
+fn worse(a: Tri, b: Tri) -> Tri {
+    match (a, b) {
+        (Tri::Is, _) | (_, Tri::Is) => Tri::Is,
+        (Tri::Maybe, _) | (_, Tri::Maybe) => Tri::Maybe,
+        _ => Tri::Not,
     }
-    let tail = text.rsplit(|&b| b == b'/').next().unwrap_or(&[]);
-    glob_match(tail, b"environ")
 }
 
-/// Whether the glob `pat` (`*`, `?`, `[set]`) matches `name`, `*` and `?`
-/// matching any byte, a leading `.` included (as search tools' globs do).
-pub fn glob_matches(pat: &[u8], name: &[u8]) -> bool {
-    glob_match(pat, name)
+/// Whether a file operand names an env file ([`dotenv`]); one zsh expands
+/// as `=command` (a program's path, found on `PATH` when it runs) may.
+fn operand_tri(w: &[Ch]) -> Tri {
+    let equals = w.len() > 1
+        && w[0]
+            == Ch::Lit {
+                b: b'=',
+                quoted: false,
+            };
+    let t = dotenv(w);
+    if equals { worse(t, Tri::Maybe) } else { t }
 }
 
-/// Whether the glob `pat` (`*`, `?`, `[set]`) matches `name`.
-fn glob_match(pat: &[u8], name: &[u8]) -> bool {
-    fn go(p: &[u8], n: &[u8], budget: &mut usize) -> bool {
-        if *budget == 0 {
-            return true;
+/// The name and the value of an assignment word (`NAME=value`,
+/// `NAME+=value`, `NAME[k]=value`).
+fn assignment(w: &[Ch]) -> Option<(Vec<u8>, &[Ch])> {
+    let eq = w.iter().position(|ch| {
+        *ch == Ch::Lit {
+            b: b'=',
+            quoted: false,
         }
-        *budget -= 1;
-        match p.split_first() {
-            None => n.is_empty(),
-            Some((b'*', rest)) => (0..=n.len()).any(|k| go(rest, &n[k..], budget)),
-            Some((b'?', rest)) => !n.is_empty() && go(rest, &n[1..], budget),
-            Some((b'[', rest)) => {
-                let neg = matches!(rest.first(), Some(b'!' | b'^'));
-                let body = usize::from(neg);
-                // A `]` first in the class (after a `!` or `^`) is one of
-                // its members, as bash and zsh read it (`env[]i]ron` is
-                // `environ`): the class closes at the next one.
-                let close = rest
-                    .get(body + 1..)
-                    .and_then(|r| r.iter().position(|&b| b == b']'))
-                    .map(|p| p + body + 1);
-                let Some(end) = close else {
-                    return n.first() == Some(&b'[') && go(rest, &n[1..], budget);
+    })?;
+    if !is_assignment_prefix(&w[..=eq]) {
+        return None;
+    }
+    let name = w[..eq]
+        .iter()
+        .map_while(|ch| match ch {
+            Ch::Lit { b, .. } if b.is_ascii_alphanumeric() || *b == b'_' => Some(*b),
+            _ => None,
+        })
+        .collect();
+    Some((name, &w[eq + 1..]))
+}
+
+/// Whether `set`'s arguments change how globs are read: an option this
+/// reader does not know is harmless to them (a `-o NAME` other than
+/// bash's, which include no glob option, is zsh's, which may be
+/// `globdots` or `extendedglob`; a letter outside bash's `set` flags may
+/// be one of zsh's). `set -euo pipefail` is not.
+fn set_changes_globs(args: &[Word]) -> bool {
+    const BASH_O: &[&[u8]] = &[
+        b"allexport",
+        b"braceexpand",
+        b"emacs",
+        b"errexit",
+        b"errtrace",
+        b"functrace",
+        b"hashall",
+        b"histexpand",
+        b"history",
+        b"ignoreeof",
+        b"interactivecomments",
+        b"keyword",
+        b"monitor",
+        b"noclobber",
+        b"noexec",
+        b"noglob",
+        b"nolog",
+        b"notify",
+        b"nounset",
+        b"onecmd",
+        b"physical",
+        b"pipefail",
+        b"posix",
+        b"privileged",
+        b"verbose",
+        b"vi",
+        b"xtrace",
+    ];
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        let Some(o) = plain(a) else {
+            // An option only known when it runs.
+            return a
+                .first()
+                .is_some_and(|c| matches!(c, Ch::Lit { b: b'-' | b'+', .. } | Ch::Unknown));
+        };
+        if o == b"--" || o == b"-" || !(o.starts_with(b"-") || o.starts_with(b"+")) {
+            return false;
+        }
+        for (k, &f) in o[1..].iter().enumerate() {
+            if f == b'o' {
+                let name = if k + 2 < o.len() {
+                    Some(Zeroizing::new(o[k + 2..].to_vec()))
+                } else {
+                    i += 1;
+                    args.get(i - 1).and_then(|n| plain(n)).map(|p| p.0)
                 };
-                let (set, after) = (&rest[body..end], &rest[end + 1..]);
-                let Some((&c, nrest)) = n.split_first() else {
-                    return false;
-                };
-                let mut hit = false;
-                let mut k = 0;
-                while k < set.len() {
-                    if k + 2 < set.len() && set[k + 1] == b'-' {
-                        hit |= set[k] <= c && c <= set[k + 2];
-                        k += 3;
-                    } else {
-                        hit |= set[k] == c;
-                        k += 1;
-                    }
+                let known = name.as_ref().is_some_and(|n| {
+                    let n: Vec<u8> = n
+                        .iter()
+                        .filter(|b| **b != b'_')
+                        .map(u8::to_ascii_lowercase)
+                        .collect();
+                    BASH_O.contains(&n.as_slice())
+                });
+                if !known && name.as_ref().is_some_and(|n| !n.is_empty()) {
+                    return true;
                 }
-                hit != neg && go(after, nrest, budget)
+                break;
             }
-            Some((&b, rest)) => n.first() == Some(&b) && go(rest, &n[1..], budget),
+            if !b"abefhkmnptuvxBCEHPT".contains(&f) {
+                return true;
+            }
         }
     }
-    let mut budget = 100_000;
-    go(pat, name, &mut budget)
+    false
+}
+
+/// Programs known to take their words as data, never as a command to run
+/// ([`Analyzer::unknown_runs`]).
+fn inert(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"echo"
+            | b"printf"
+            | b"print"
+            | b"which"
+            | b"type"
+            | b"whence"
+            | b"where"
+            | b"man"
+            | b"info"
+            | b"help"
+            | b"apropos"
+            | b"whatis"
+            | b"hash"
+            | b"alias"
+            | b"unalias"
+            | b"unset"
+            | b"unfunction"
+            | b"complete"
+            | b"compgen"
+            | b"compdef"
+            | b"kill"
+            | b"pkill"
+            | b"pgrep"
+            | b"killall"
+            | b"test"
+            | b"["
+            | b"[["
+            | b"true"
+            | b"false"
+            | b":"
+            | b"cd"
+            | b"pushd"
+            | b"popd"
+            | b"ls"
+            | b"mkdir"
+            | b"rmdir"
+            | b"touch"
+            | b"rm"
+            | b"wc"
+            | b"stat"
+            | b"file"
+            | b"basename"
+            | b"dirname"
+            | b"realpath"
+            | b"readlink"
+    )
+}
+
+/// Whether this reader knows `name` as a command that reads a file, prints
+/// the environment or runs another command.
+fn known_command(name: &[u8]) -> bool {
+    reader(name).is_some()
+        || matches!(
+            name,
+            b"printenv"
+                | b"env"
+                | b"export"
+                | b"set"
+                | b"declare"
+                | b"typeset"
+                | b"local"
+                | b"readonly"
+                | b"integer"
+                | b"float"
+                | b"ps"
+                | b"source"
+                | b"."
+                | b"dd"
+                | b"find"
+                | b"xargs"
+                | b"eval"
+                | b"envcloak"
+                | b"command"
+                | b"builtin"
+                | b"exec"
+                | b"nohup"
+                | b"setsid"
+                | b"unbuffer"
+                | b"busybox"
+                | b"noglob"
+                | b"nocorrect"
+                | b"coproc"
+                | b"time"
+                | b"nice"
+                | b"stdbuf"
+                | b"timeout"
+                | b"sudo"
+                | b"doas"
+                | b"script"
+                | b"strace"
+                | b"ltrace"
+                | b"flock"
+                | b"watch"
+                | b"sh"
+                | b"bash"
+                | b"zsh"
+                | b"dash"
+                | b"ksh"
+                | b"mksh"
+                | b"ash"
+                | b"yash"
+                | b"posh"
+                | b"fish"
+                | b"rbash"
+                | b"ksh93"
+                | b"pdksh"
+                | b"oksh"
+        )
+}
+
+/// Whether the path `w` names a process's environment,
+/// `/proc/<pid>/environ` (any pid, `task/<tid>/` between): [`Tri::Is`]
+/// when its components, read in their own glob grammar, may spell it (one
+/// before the last may be `proc`, the last `environ`: `/pro?/self/
+/// environ`, `/[p]roc/1/env[[:alpha:]]ron` and `/*/self/environ`, which
+/// the shells expand to it, the verifier's finding: a literal `/proc/` was
+/// needed before); [`Tri::Maybe`] when that would take a stretch only
+/// known when the command runs (`"$d"/environ`); else [`Tri::Not`]. A
+/// relative path into `/proc` from elsewhere is not seen (docs/
+/// INSTALLERS.md).
+fn environ_tri(w: &[Ch]) -> Tri {
+    let comps: Vec<&[Ch]> = w
+        .split(|ch| matches!(ch, Ch::Lit { b: b'/', .. }))
+        .collect();
+    let Some((last, before)) = comps.split_last() else {
+        return Tri::Not;
+    };
+    if !glob::component_may_match(last, b"environ") {
+        return Tri::Not;
+    }
+    let unknown = |c: &&[Ch]| c.contains(&Ch::Unknown);
+    if before
+        .iter()
+        .any(|c| !c.is_empty() && !unknown(c) && glob::component_may_match(c, b"proc"))
+    {
+        return Tri::Is;
+    }
+    if unknown(last) || before.iter().any(unknown) {
+        Tri::Maybe
+    } else {
+        Tri::Not
+    }
 }
 
 /// Brace expansion of an unquoted `{a,b}` (each alternative a word) and
@@ -2321,6 +2673,54 @@ impl BraceCost {
         } else {
             Ok(())
         }
+    }
+}
+
+/// The words of a brace sequence `{x..y}` or `{x..y..step}` (its inside,
+/// `inner`): one character to another (bash's letters, zsh's any
+/// character), both ends included, or one integer to another, up to
+/// [`MAX_EXPANSIONS`] words; anything else, or more, is one stretch only
+/// known when the command runs.
+fn sequence(inner: &[Ch]) -> Vec<Word> {
+    let unknown = || vec![vec![Ch::Unknown]];
+    let Some(text) = literal(inner) else {
+        return unknown();
+    };
+    let lit = |bytes: &[u8]| -> Word {
+        bytes
+            .iter()
+            .map(|&b| Ch::Lit { b, quoted: false })
+            .collect()
+    };
+    // One character to another, read first, so `{....}` is `.` to `.`.
+    if text.len() >= 4
+        && &text[1..3] == b".."
+        && (text.len() == 4 || &text[4..6.min(text.len())] == b"..")
+    {
+        let (lo, hi) = (text[0].min(text[3]), text[0].max(text[3]));
+        return (lo..=hi).map(|c| lit(&[c])).collect();
+    }
+    let parts: Vec<&[u8]> = text
+        .windows(2)
+        .position(|x| x == b"..")
+        .map(|p| {
+            let rest = &text[p + 2..];
+            match rest.windows(2).position(|x| x == b"..") {
+                Some(q) => vec![&text[..p], &rest[..q], &rest[q + 2..]],
+                None => vec![&text[..p], rest],
+            }
+        })
+        .unwrap_or_default();
+    let (a, b) = match parts.as_slice() {
+        [a, b] | [a, b, _] => (*a, *b),
+        _ => return unknown(),
+    };
+    let num = |s: &[u8]| std::str::from_utf8(s).ok()?.parse::<i64>().ok();
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) if x.abs_diff(y) < MAX_EXPANSIONS as u64 => (x.min(y)..=x.max(y))
+            .map(|n| lit(n.to_string().as_bytes()))
+            .collect(),
+        _ => unknown(),
     }
 }
 
@@ -2380,14 +2780,22 @@ fn brace_expand(w: &Word, cost: &mut BraceCost, groups: usize) -> Result<Vec<Wor
         }
         let inner = &w[i + 1..end];
         if inner.windows(2).any(|x| is(&x[0], b'.') && is(&x[1], b'.')) {
-            cost.step(w.len())?;
-            let mut nw: Word = w[..i].to_vec();
-            nw.push(Ch::Lit {
-                b: b'*',
-                quoted: false,
-            });
-            nw.extend_from_slice(&w[end + 1..]);
-            return brace_expand(&nw, cost, groups + 1);
+            // A sequence: its words are literal text, which can begin a
+            // dot file's name (zsh's `{....}` is `.`; the shell oracle's
+            // finding: read as `*`, which never matches a leading `.`, it
+            // let `.{e..e}nv` through).
+            let mut out = Vec::new();
+            for item in sequence(inner) {
+                cost.step(w.len())?;
+                let mut nw: Word = w[..i].to_vec();
+                nw.extend(item);
+                nw.extend_from_slice(&w[end + 1..]);
+                out.extend(brace_expand(&nw, cost, groups + 1)?);
+                if out.len() > MAX_EXPANSIONS || cost.made > MAX_EXPANSIONS * 4 {
+                    return Err(Amb);
+                }
+            }
+            return Ok(out);
         }
     }
     cost.made += 1;
@@ -2416,6 +2824,8 @@ struct Reader {
     /// Options whose value is a glob picking the files the command reads
     /// (ripgrep's `--glob`, grep's `--include`).
     glob_opts: &'static [&'static str],
+    /// How those globs match the `/` between a path's components.
+    glob_slash: glob::Slash,
     /// Options whose value is a regular expression picking the files the
     /// command reads (ag's `-G`).
     regex_opts: &'static [&'static str],
@@ -2434,6 +2844,7 @@ const PLAIN: Reader = Reader {
     two: &[],
     name_then_file: &[],
     glob_opts: &[],
+    glob_slash: glob::Slash::Classes,
     regex_opts: &[],
     type_opts: &[],
     type_add_opts: &[],
@@ -2453,7 +2864,7 @@ impl Reader {
     /// ordinary values).
     fn selects_env(&self, opt: &str, value: &[Ch]) -> bool {
         if self.glob_opts.contains(&opt) {
-            glob::word_may_name_env_file(value, true, glob::Slash::Classes)
+            glob::word_may_name_env_file(value, true, self.glob_slash)
         } else if self.regex_opts.contains(&opt) {
             glob::regex_may_name_env_file(value)
         } else if self.type_opts.contains(&opt) {
@@ -2648,6 +3059,11 @@ fn reader(name: &[u8]) -> Option<Reader> {
             pattern_opts: &["-e", "--regexp"],
             file_opts: &["-f", "--file", "--exclude-from"],
             glob_opts: &["--include"],
+            // macOS's grep (BSD 2.6.0) matches `--include` against the whole
+            // path, its `*` and `?` matching a `/` (the verifier's finding:
+            // `--include='./su*env'` reads `sub/.env`); GNU grep the base
+            // name. Read as the first, which covers both.
+            glob_slash: glob::Slash::Any,
             ..PLAIN
         },
         b"rg" => Reader {
@@ -2744,10 +3160,31 @@ fn reader(name: &[u8]) -> Option<Reader> {
     })
 }
 
-/// Whether a reader command, with `args`, reads an env file: as a file
-/// operand or as the value of an option that names a file it reads.
-fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
-    let is_env = |w: &Word| dotenv(w) == Tri::Is;
+/// What a reader command reads, as far as it is known.
+#[derive(Debug, Clone, Copy)]
+struct Reads {
+    /// An env file ([`Tri::Maybe`]: a name only known when it runs).
+    env: Tri,
+    /// A process's environment, `/proc/<pid>/environ`.
+    environ: Tri,
+    /// A file operand holds an unquoted glob, which shell options this
+    /// reader does not model may make match a dot file.
+    globbed: bool,
+}
+
+/// What a reader command, with `args`, reads: an env file as a file
+/// operand or as the value of an option that names a file it reads or
+/// picks the files it reads.
+fn reads_env_file(spec: &Reader, args: &[Word]) -> Reads {
+    let mut out = Reads {
+        env: Tri::Not,
+        environ: Tri::Not,
+        globbed: false,
+    };
+    let file = |out: &mut Reads, w: &Word| {
+        out.env = worse(out.env, operand_tri(w));
+        out.environ = worse(out.environ, environ_tri(w));
+    };
     let mut pattern_given = false;
     let mut operands: Vec<&Word> = Vec::new();
     let mut i = 0;
@@ -2799,25 +3236,21 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
                     }
                 };
                 if picks_env {
-                    return true;
+                    out.env = Tri::Is;
                 }
             } else if spec.two.contains(&n) {
                 i += 2;
             } else if spec.name_then_file.contains(&n) {
-                if args.get(i + 1).is_some_and(is_env) {
-                    return true;
+                if let Some(w) = args.get(i + 1) {
+                    file(&mut out, w);
                 }
                 i += 2;
             } else if spec.file_opts.contains(&n) {
                 match value {
-                    Some(v) => {
-                        if is_env(&lits(v.as_bytes())) {
-                            return true;
-                        }
-                    }
+                    Some(v) => file(&mut out, &lits(v.as_bytes())),
                     None => {
-                        if args.get(i).is_some_and(is_env) {
-                            return true;
+                        if let Some(w) = args.get(i) {
+                            file(&mut out, w);
                         }
                         i += 1;
                     }
@@ -2853,17 +3286,22 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
             let rest = &bytes[k + 1..];
             if rest.is_empty() {
                 let value = args.get(i);
-                if is_file && value.is_some_and(is_env) {
-                    return true;
+                if is_file {
+                    if let Some(w) = value {
+                        file(&mut out, w);
+                    }
                 }
                 if selects && value.is_some_and(|w| spec.selects_env(f, w)) {
-                    return true;
+                    out.env = Tri::Is;
                 }
                 i += 1;
-            } else if (is_file && is_env(&lits(rest)))
-                || (selects && spec.selects_env(f, &lits(rest)))
-            {
-                return true;
+            } else {
+                if is_file {
+                    file(&mut out, &lits(rest));
+                }
+                if selects && spec.selects_env(f, &lits(rest)) {
+                    out.env = Tri::Is;
+                }
             }
             break;
         }
@@ -2873,10 +3311,26 @@ fn reads_env_file(spec: &Reader, args: &[Word]) -> bool {
     } else {
         &operands[..]
     };
-    files.iter().any(|w| {
+    for w in files {
         // awk's `name=value` operands are assignments, not files.
-        !(spec.pattern_first && is_assignment(w)) && is_env(w)
-    })
+        if spec.pattern_first && is_assignment(w) {
+            continue;
+        }
+        file(&mut out, w);
+        // zsh's extended glob operators (`#`, `^`, `~` past the start) are
+        // globs only under an option, the case `globbed` is kept for.
+        out.globbed |= (0..w.len()).any(|k| glob_at(w, k))
+            || w.iter().skip(1).any(|ch| {
+                matches!(
+                    ch,
+                    Ch::Lit {
+                        b: b'#' | b'^' | b'~',
+                        quoted: false
+                    }
+                )
+            });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2921,9 +3375,66 @@ mod tests {
             "sed -n 1,5p README.md",
             "find . -name '*.rs' -exec wc -l {} +",
             "cat *",
+            // Fail closed stops at what is not resolved: these are.
+            "cat src/*.rs",
+            "ls *.md",
+            "cat [Mm]akefile",
+            "set -euo pipefail; cat src/*.rs",
+            "set -x; head -n 3 src/*.rs",
+            "cat \"$HOME/notes.txt\"",
+            "wc -l \"$f\"",
+            "python -m venv env",
+            "which env",
+            "echo cat .env",
+            ". ./venv/bin/activate",
+            "git log --grep cat",
+            "cargo run -- --help",
         ] {
             assert_eq!(s(ok), None, "{ok}");
         }
+    }
+
+    /// The orchestrator's finding: what a command that reads files or the
+    /// environment reads, when it is not resolved, is never let through
+    /// (`Unresolved`: asked about, or stopped).
+    ///
+    /// Mutations checked: `result` answering `None` for `Unresolved` (the
+    /// previous first-found answer without it): each fails; the glob
+    /// options not read (`glob_options` never set): the option cases
+    /// fail; `unknown_runs` doing nothing: the wrapper cases fail.
+    #[test]
+    fn what_is_not_resolved_is_not_let_through() {
+        for un in [
+            "cat \"$f\"",
+            "head -n 5 $(git ls-files | head -1)",
+            "source \"$f\"",
+            "cat < \"$f\"",
+            "cat =ls",
+            "cat \"$d\"/environ",
+            "shopt -s dotglob; cat *",
+            "setopt extendedglob; cat .e#nv",
+            "GLOBIGNORE=x; cat *",
+            "bash -O dotglob -c 'cat *'",
+            "set -o globdots; cat *",
+            "set -G; cat *",
+            "firejail cat .env",
+            "dbus-run-session printenv",
+            "unshare -r cat .env",
+        ] {
+            assert_eq!(s(un), Some(Class::Unresolved), "{un}");
+        }
+        // A brace sequence's words are literal text (the shell oracle's
+        // finding: read as `*`, which never matches a leading `.`): zsh's
+        // `{....}` is `.`, and `.{d..f}nv` holds `.env`; a sequence it does
+        // not read is a stretch only known when it runs.
+        for env in ["cat {....}env", "cat .{d..f}nv", "cat < .{e..e}nv"] {
+            assert_eq!(s(env), Some(Class::EnvFile), "{env}");
+        }
+        assert_eq!(s("cat .{m..o}nv"), None);
+        assert_eq!(s("cat {.a..b}env"), Some(Class::Unresolved));
+        // A denial outranks it, and a parse that stops is ambiguous.
+        assert_eq!(s("cat \"$f\" .env"), Some(Class::EnvFile));
+        assert_eq!(s("cat \"$f\"; echo \"x"), Some(Class::Ambiguous));
     }
 
     #[test]

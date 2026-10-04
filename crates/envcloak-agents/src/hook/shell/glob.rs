@@ -209,6 +209,15 @@ fn class_parts(rest: &[Option<u8>]) -> Option<ClassParts> {
                 unknown = true;
                 k += 1;
             }
+            // A POSIX bracket expression inside the class (`[:alpha:]`,
+            // `[=e=]`, `[.e.]`; the verifier's finding, read as text
+            // before): the class is read as one that may match any byte,
+            // `/` included, rather than modelled set by set. Its `]` does
+            // not close the class.
+            Some(Some(b'[')) if posix_end(&rest[k..]).is_some() => {
+                unknown = true;
+                k += posix_end(&rest[k..]).unwrap_or(1);
+            }
             Some(Some(lo)) => {
                 let lo = *lo;
                 if let (Some(Some(b'-')), Some(Some(hi))) = (rest.get(k + 1), rest.get(k + 2)) {
@@ -233,6 +242,19 @@ fn class_parts(rest: &[Option<u8>]) -> Option<ClassParts> {
     })
 }
 
+/// The length of the POSIX bracket expression at the start of `at` inside
+/// a class (`[:name:]`, `[=c=]`, `[.c.]`, up to and with its closing
+/// delimiter and `]`), or `None` when `at` does not start one or it is not
+/// closed.
+fn posix_end(at: &[Option<u8>]) -> Option<usize> {
+    let (Some(Some(b'[')), Some(Some(d @ (b':' | b'=' | b'.')))) = (at.first(), at.get(1)) else {
+        return None;
+    };
+    (2..at.len().saturating_sub(1))
+        .find(|&j| at[j] == Some(*d) && at[j + 1] == Some(b']'))
+        .map(|j| j + 2)
+}
+
 impl ClassParts {
     /// Whether the class may match a `/`: it lists one (a range included),
     /// it is negated and does not, or what it holds is only known when the
@@ -249,7 +271,10 @@ impl ClassParts {
 fn class(rest: &[Option<u8>]) -> Option<(Tok, usize)> {
     let c = class_parts(rest)?;
     if c.unknown {
-        return Some((Tok::One, c.used));
+        // Any byte, and still a class, which stands for a character of
+        // the name (`[[=.=]]env`: the shell oracle's finding, read as a
+        // wildcard it was left out of what a name spells).
+        return Some((Tok::Set(Bytes::any()), c.used));
     }
     let mut set = Bytes::default();
     for b in 1..=255u8 {
@@ -402,18 +427,22 @@ impl Names {
 }
 
 /// Whether some env file's name matches the pieces `toks` (a search of
-/// the product of the glob's positions and the automaton's states).
-fn matches_a_name(toks: &[Tok]) -> bool {
+/// the product of the glob's positions and the automaton's states). With
+/// `spelled`, only a match in which a literal or a class, not a wildcard,
+/// stands for one of the bytes of `.env` itself counts (see
+/// [`component_may`]).
+fn matches_a_name(toks: &[Tok], spelled: bool) -> bool {
     let names = Names::new();
     let any = Bytes::any();
-    let mut seen: HashSet<(usize, usize)> = HashSet::new();
-    let mut todo: Vec<(usize, usize)> = Vec::new();
+    // (position, state, a literal or class stood for a byte of `.env`).
+    let mut seen: HashSet<(usize, usize, bool)> = HashSet::new();
+    let mut todo: Vec<(usize, usize, bool)> = Vec::new();
     // A run matches nothing too: every position a run can be skipped to.
-    let reach = |i: usize, q: usize, seen: &mut HashSet<_>, todo: &mut Vec<_>| {
+    let reach = |i: usize, q: usize, by: bool, seen: &mut HashSet<_>, todo: &mut Vec<_>| {
         let mut i = i;
         loop {
-            if seen.insert((i, q)) {
-                todo.push((i, q));
+            if seen.insert((i, q, by)) {
+                todo.push((i, q, by));
             }
             if toks.get(i) == Some(&Tok::Run) {
                 i += 1;
@@ -422,10 +451,10 @@ fn matches_a_name(toks: &[Tok]) -> bool {
             }
         }
     };
-    reach(0, START, &mut seen, &mut todo);
-    while let Some((i, q)) = todo.pop() {
+    reach(0, START, !spelled, &mut seen, &mut todo);
+    while let Some((i, q, by)) = todo.pop() {
         let Some(t) = toks.get(i) else {
-            if names.accepts(q) {
+            if by && names.accepts(q) {
                 return true;
             }
             continue;
@@ -439,40 +468,89 @@ fn matches_a_name(toks: &[Tok]) -> bool {
         states.sort_unstable();
         states.dedup();
         for q2 in states.into_iter().filter(|s| *s != DEAD) {
-            reach(next, q2, &mut seen, &mut todo);
+            // A step into `.`, `.e`, `.en` or `.env` made by a literal or a
+            // class.
+            let spells = matches!(t, Tok::Set(_)) && matches!(q2, DOT | E | EN | ENV) && q2 != q;
+            reach(next, q2, by || spells, &mut seen, &mut todo);
         }
     }
     false
 }
 
-/// Whether the letters `e`, `n` and `v` appear in that order among the
-/// literals and classes of `toks`.
-fn spells_env(toks: &[Tok]) -> bool {
-    let mut want = b"env".iter().peekable();
-    for t in toks {
-        if let (Tok::Set(s), Some(&&c)) = (t, want.peek()) {
-            if s.has(c) {
-                want.next();
+/// Whether one path component as a shell word (`c`: no `/` in it; a quoted
+/// glob character is itself, an unquoted one a wildcard, a class read in
+/// its own grammar and one holding a POSIX bracket expression read as any
+/// byte, a stretch only known when the command runs any text) may be
+/// `target` (in lower case), in any case.
+pub(super) fn component_may_match(c: &[Ch], target: &[u8]) -> bool {
+    let mut pat: Zeroizing<Vec<Option<u8>>> = Zeroizing::new(Vec::with_capacity(c.len() * 2));
+    for ch in c {
+        match ch {
+            Ch::Unknown => pat.push(None),
+            Ch::Lit { b, quoted: true } if matches!(b, b'*' | b'?' | b'[' | b'\\') => {
+                pat.push(Some(b'\\'));
+                pat.push(Some(*b));
             }
+            Ch::Lit { b, .. } => pat.push(Some(*b)),
         }
     }
-    want.peek().is_none()
+    let Some(toks) = tokens(&pat) else {
+        return true;
+    };
+    // Positions of `toks` that can stand where `target`'s first `k` bytes
+    // were matched, for each `k`.
+    let mut at: Vec<bool> = vec![false; toks.len() + 1];
+    at[0] = true;
+    let close = |at: &mut Vec<bool>| {
+        for i in 0..toks.len() {
+            if at[i] && toks[i] == Tok::Run {
+                at[i + 1] = true;
+            }
+        }
+    };
+    close(&mut at);
+    for &b in target {
+        let b = b.to_ascii_lowercase();
+        let mut next = vec![false; toks.len() + 1];
+        for i in 0..toks.len() {
+            if !at[i] {
+                continue;
+            }
+            match toks[i] {
+                Tok::Run => next[i] = true,
+                Tok::One => next[i + 1] = true,
+                Tok::Set(set) => {
+                    if set.has(b) {
+                        next[i + 1] = true;
+                    }
+                }
+            }
+        }
+        close(&mut next);
+        at = next;
+    }
+    at[toks.len()]
 }
 
 /// Whether a glob's last component (`None` for a stretch only known when
 /// the command runs) may pick out an env file. See the module
-/// documentation.
+/// documentation. One that starts with a wildcard may when an env file's
+/// name matches it with a literal or a class standing for a byte of `.env`
+/// itself (`*.env`, `*env*`, `*v`, which with a `/`-crossing `*` is
+/// `./s*v`'s `sub/.env`: the verifier's finding); one whose literals and
+/// classes would stand only for the suffix (`*.rs` matching `.env.rs`) is
+/// read as a search of every file (docs/INSTALLERS.md).
 fn component_may(c: &[Option<u8>]) -> bool {
     let Some(toks) = tokens(c) else {
         return true;
     };
     match toks.iter().position(|t| matches!(t, Tok::One | Tok::Run)) {
-        None => matches_a_name(&toks),
-        Some(0) => spells_env(&toks) && matches_a_name(&toks),
+        None => matches_a_name(&toks, false),
+        Some(0) => matches_a_name(&toks, true),
         Some(k) => {
             let mut start = Zeroizing::new(toks[..k].to_vec());
             start.push(Tok::Run);
-            matches_a_name(&start)
+            matches_a_name(&start, false)
         }
     }
 }
@@ -637,7 +715,7 @@ mod tests {
             ".env.examples",
             ".env.local.prod",
         ] {
-            assert!(matches_a_name(&lit(name)), "{name}");
+            assert!(matches_a_name(&lit(name), false), "{name}");
             assert!(
                 super::super::names_dotenv(name.as_bytes()),
                 "{name}: dotenv_kind disagrees"
@@ -653,7 +731,7 @@ mod tests {
             "x.env",
             ".env/x",
         ] {
-            assert!(!matches_a_name(&lit(name)), "{name}");
+            assert!(!matches_a_name(&lit(name), false), "{name}");
             assert!(
                 !super::super::names_dotenv(name.as_bytes()),
                 "{name}: dotenv_kind disagrees"

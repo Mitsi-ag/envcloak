@@ -11,7 +11,8 @@
 //!   prompt's text out of the block message (it can still reach the
 //!   transcript and history: SPEC §7.1).
 //! - A tool call is denied with `hookSpecificOutput.permissionDecision:
-//!   "deny"` and its `permissionDecisionReason`, which Claude reads.
+//!   "deny"` and its `permissionDecisionReason`, which Claude reads; with
+//!   `"ask"`, Claude Code puts it to the person, the reason shown.
 //! - `SessionStart` adds `hookSpecificOutput.additionalContext`.
 
 use serde_json::{Map, Value, json};
@@ -54,6 +55,19 @@ pub fn deny(event: Event, message: &str) -> Value {
             },
         }),
     }
+}
+
+/// A tool call put to the person, with `message`: Claude Code shows its
+/// permission prompt, the reason on it, and runs the call only once they
+/// allow it.
+pub fn ask(message: &str) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": message,
+        },
+    })
 }
 
 /// `SessionStart`'s added context.

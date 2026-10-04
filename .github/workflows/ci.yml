@@ -68,16 +68,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The hook's glob oracle (crates/envcloak-agents/tests/
       # grep_glob_oracle.rs) asks ripgrep which file a glob picks out; it
-      # fails here if ripgrep is missing.
-      - name: Install ripgrep
+      # fails here if ripgrep is missing. Its shell oracle (shell_oracle.rs)
+      # runs every spelling in bash, sh, dash and zsh (zsh is the shell of
+      # Claude Code's Bash tool on macOS), and fails here if one is missing.
+      - name: Install ripgrep and the shells
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get install -y --no-install-recommends ripgrep
+            sudo apt-get install -y --no-install-recommends ripgrep zsh dash
           else
             command -v rg >/dev/null || brew install ripgrep
           fi
           rg --version
           echo "ENVCLOAK_TEST_REQUIRE_RG=1" >> "$GITHUB_ENV"
+          echo "ENVCLOAK_TEST_REQUIRE_SHELLS=bash,sh,dash,zsh" >> "$GITHUB_ENV"
       # The gate 19 crash test runs its positive core-dump control only when
       # core files go to a known directory, which it checks and cleans up.
       # In CI it fails if the control cannot run.
