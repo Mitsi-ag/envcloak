@@ -36,9 +36,14 @@ variant that number declares, and the last is `_ => None`; every arm of
 whose kind is the number of the `PolicyKind` that `PolicyRecord::kind`
 gives that record. A number read twice, or as a variant another number
 declares, is an error, and a decoder of another form is refused, never
-skipped. `AuditKind::from_u8` and `ErrorKind::from_token` search
-`ALL` with `as u8` and `token()`, so their mapping is the declaration's
-own and there is nothing more to read.
+skipped. Each decoder must also read back every variant it declares (the
+review of round two: a decoder without the Recovery Kit's arm passed),
+but those the `NOT_DECODED` list names with the reason they are never
+stored (`ItemClass::None`, the class of a row that is not an item), which
+it must not read at all. `AuditKind::from_u8` and `ErrorKind::from_token`
+search `ALL` with `as u8` and `token()`, so their mapping is the
+declaration's own; `ALL` must then name every variant once, or the code
+could not read back an entry it writes.
 
 Each row has a status: `reserved` (not in the code yet), `landed` (in the
 code exactly as the row says) or `reuse` (an entry the code already has,
@@ -936,10 +941,23 @@ def some_arms(src, enum, fn, impl=None):
     return where, out
 
 
+# A declared entry that is never stored, so its decoder never reads it
+# back, with the reason. Its decoder must hold no arm for it, and every
+# other declared entry needs one (review of M3-01: a decoder without the
+# Recovery Kit's arm passed, though the vault could no longer read that
+# unlocker back). An entry here that the declaration no longer holds fails.
+NOT_DECODED = {
+    ("ItemClass", "None"): "the associated data's class of a row that is not an item (an unlocker, a backup); `items.class` never holds it",
+}
+
+
 def check_inverse(src, enum, where, numbers, decoded):
     """The decoder's (number, variant) pairs agree with the declaration:
     each number once, each naming a variant whose number it is, so no
-    entry is read back under two numbers and no number as two entries."""
+    entry is read back under two numbers and no number as two entries; and
+    every declared variant is read back, but the ones `NOT_DECODED` names,
+    which are not read at all, so no entry the code writes is refused as
+    unknown when it is read again."""
     seen = {}
     for n, v in decoded:
         if n in seen:
@@ -949,12 +967,57 @@ def check_inverse(src, enum, where, numbers, decoded):
             raise SourceError("%s: %s reads %d as `%s::%s`, which is not a variant" % (src.rel, where, n, enum, v))
         if numbers[v] != n:
             raise SourceError("%s: %s reads %d as `%s::%s`, whose number is %d: one entry with two numbers" % (src.rel, where, n, enum, v, numbers[v]))
+        if (enum, v) in NOT_DECODED:
+            raise SourceError("%s: %s reads %d as `%s::%s`, which is never stored (%s)" % (src.rel, where, n, enum, v, NOT_DECODED[(enum, v)]))
+    for e, v in sorted(NOT_DECODED):
+        if e == enum and v not in numbers:
+            raise SourceError("%s: the script's NOT_DECODED names `%s::%s`, which `%s` does not declare" % (src.rel, e, v, enum))
+    read = set(seen.values())
+    missing = [v for v in sorted(numbers, key=numbers.get) if v not in read and (enum, v) not in NOT_DECODED]
+    if missing:
+        raise SourceError("%s: %s reads no number as %s: an entry the code declares, which it would refuse as unknown when it reads it back" % (
+            src.rel, where, ", ".join("`%s::%s` (%d)" % (enum, v, numbers[v]) for v in missing)))
+
+
+ALL_LIST = re.compile(r"\bconst\s+ALL\s*:\s*\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*;[^\]=;{}]*\]\s*=\s*\[")
+
+
+def check_all_list(src, enum, variants):
+    """`<enum>::ALL`, the one list the decoder of a registry that holds no
+    second mapping searches (`AuditKind::from_u8`, `ErrorKind::from_token`),
+    names every variant of `enum` once, as `<enum>::V` or `Self::V`: a
+    variant left out is an entry the code writes and then cannot read back
+    (review of M3-01, the class of a decoder that misses a declared entry).
+    One `const ALL` in the enum's own `impl`, or none the reader can read,
+    is an error."""
+    spans = impl_spans(src, {enum}, traits=False)
+    found = [m for m in ALL_LIST.finditer(src.skel)
+             if m.group(1) in (enum, "Self") and any(a < m.start() < b for a, b in spans)]
+    if len(found) != 1:
+        raise SourceError("%s: `impl %s` has %d `const ALL: [%s; N] = [...]` the reader can read, not one" % (src.rel, enum, len(found), enum))
+    open_ = found[0].end() - 1
+    listed = []
+    for a, b, text in src.split_top(open_ + 1, src.close_of(open_)):
+        item = " ".join(text.split())
+        v = re.fullmatch(r"(?:%s|Self)\s*::\s*([A-Z][A-Za-z0-9]*)" % enum, item)
+        if not v:
+            raise SourceError("%s: `%s::ALL` holds an entry the reader cannot read (`%s`): it reads `%s::<Variant>`" % (src.rel, enum, item[:60], enum))
+        listed.append(v.group(1))
+    unique_or_fail(src, "`%s::ALL` entry" % enum, listed)
+    for v in listed:
+        if v not in variants:
+            raise SourceError("%s: `%s::ALL` names `%s::%s`, which is not a variant" % (src.rel, enum, enum, v))
+    missing = [v for v in variants if v not in listed]
+    if missing:
+        raise SourceError("%s: `%s::ALL` leaves out %s, which the code would then not read back" % (
+            src.rel, enum, ", ".join("`%s::%s`" % (enum, v) for v in missing)))
 
 
 def code_audit_kinds(root):
     src = Source(AUDIT_RS, read(root, AUDIT_RS))
     numbers = dict(numbered_variants(src, "AuditKind"))
     tokens = enum_arms(src, "AuditKind", "token", TOKEN_VALUE)
+    check_all_list(src, "AuditKind", list(numbers))
     return {tokens[v]: n for v, n in numbers.items()}
 
 
@@ -962,6 +1025,7 @@ def code_error_kinds(root):
     src = Source(PROTO_RS, read(root, PROTO_RS))
     codes = enum_arms(src, "ErrorKind", "code", CODE_VALUE, int_value)
     tokens = enum_arms(src, "ErrorKind", "token", TOKEN_VALUE)
+    check_all_list(src, "ErrorKind", [v for v, _ in enum_variants(src, "ErrorKind")])
     return {tokens[v]: c for v, c in codes.items()}
 
 
