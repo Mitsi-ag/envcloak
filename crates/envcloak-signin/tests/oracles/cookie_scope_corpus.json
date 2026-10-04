@@ -1,0 +1,547 @@
+{
+  "schema": 1,
+  "scope": "ASCII HTTP host/domain/path; expected delivery from hand-labelled cases and actual Chromium receipts",
+  "scenarios": [
+    {
+      "id": "host-only",
+      "domain_attribute": null,
+      "path_attribute": "/",
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 1,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "child.acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "otheracme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost.other.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "idp.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "domain",
+      "domain_attribute": "acme.localhost",
+      "path_attribute": "/",
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": false,
+        "path": "/"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 1,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "child.acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "otheracme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost.other.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "idp.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "leading-dot-domain",
+      "domain_attribute": ".acme.localhost",
+      "path_attribute": "/",
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": false,
+        "path": "/"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 1,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "child.acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "otheracme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost.other.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "idp.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "mixed-case-domain",
+      "domain_attribute": "ACME.LOCALHOST",
+      "path_attribute": "/",
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": false,
+        "path": "/"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 1,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "child.acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "otheracme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost.other.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "idp.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "default-path",
+      "domain_attribute": null,
+      "path_attribute": null,
+      "issue_path": "/login/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/login"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/login",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/login/",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/login/a",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/logins",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/Login",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/login%2Fa",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/other",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "invalid-path-default",
+      "domain_attribute": null,
+      "path_attribute": "relative",
+      "issue_path": "/login/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/login"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/login",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/login/a",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/relative",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/other",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "empty-path-default",
+      "domain_attribute": null,
+      "path_attribute": "",
+      "issue_path": "/login/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/login"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/login",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/login/a",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/other",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "single-segment-default",
+      "domain_attribute": null,
+      "path_attribute": null,
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/anything",
+          "expected": true
+        }
+      ]
+    },
+    {
+      "id": "segment-path",
+      "domain_attribute": null,
+      "path_attribute": "/app",
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/app"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app/",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app/home",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/apple",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/App",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app%2Fchild",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app2",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app?q=1",
+          "expected": true
+        }
+      ]
+    },
+    {
+      "id": "trailing-slash-path",
+      "domain_attribute": null,
+      "path_attribute": "/app/",
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/app/"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app/",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app/home",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/apple",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/APP/",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "encoded-path",
+      "domain_attribute": null,
+      "path_attribute": "/a%2Fb",
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/a%2Fb"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/a%2Fb",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/a%2Fb/c",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/a/b",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/a%2fb",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/a%2Fbc",
+          "expected": false
+        }
+      ]
+    },
+    {
+      "id": "case-sensitive-path",
+      "domain_attribute": null,
+      "path_attribute": "/App",
+      "issue_path": "/issue",
+      "scope": {
+        "domain": "acme.localhost",
+        "host_only": true,
+        "path": "/App"
+      },
+      "probes": [
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/App",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/App/a",
+          "expected": true
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/app",
+          "expected": false
+        },
+        {
+          "host": "acme.localhost",
+          "port": 0,
+          "path": "/APP",
+          "expected": false
+        }
+      ]
+    }
+  ],
+  "cookie_name": "ec_synthetic_session",
+  "common_attributes": {
+    "http_only": true,
+    "secure": false,
+    "same_site": "Lax",
+    "persistent": false
+  }
+}

@@ -59,7 +59,25 @@ def origin(o):
 
 
 def cookie(c):
-    return lp(host(c["host"])) + lp(text(c["name"]))
+    # The name; the domain (`1` and the host for a host-only cookie, `2`
+    # and the name for a domain cookie); the path; the partition (`0`, or
+    # `1`, the top-level site's scheme and host, and the ancestor bit).
+    if c["host_only"]:
+        domain = lp(b"\x01") + lp(host(c["host"]))
+    else:
+        domain = lp(b"\x02") + lp(text(c["host"]["name"]))
+    p = c["partition"]
+    if p is None:
+        partition = lp(b"\x00")
+    else:
+        scheme = {"http": b"\x01", "https": b"\x02"}[p["scheme"]]
+        partition = (
+            lp(b"\x01")
+            + lp(scheme)
+            + lp(host(p["host"]))
+            + lp(b"\x01" if p["cross_site_ancestor"] else b"\x00")
+        )
+    return lp(text(c["name"])) + lp(domain) + lp(text(c["path"])) + lp(partition)
 
 
 def storage(s):

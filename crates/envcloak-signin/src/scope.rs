@@ -15,8 +15,8 @@
 //! lifetime) and the daemon, vault and policy epochs.
 //!
 //! **No secret in it.** Every leaf is one of this crate's plain value
-//! types (ids, numbers, digests, ASCII hosts and validated labels), and the
-//! scope derives `Clone`, `Eq`, `Ord` and `Hash`, none of which
+//! types (ids, numbers, digests, ASCII hosts, cookie paths and validated
+//! labels), and the scope derives `Clone`, `Eq`, `Ord` and `Hash`, none of which
 //! `secrecy`'s wrappers or `envcloak_core::SecretBytes` implement, so no
 //! field can hold one; no credential is hashed into it either (the
 //! evidence and configuration digests are of metadata).
@@ -60,6 +60,9 @@ pub const MAX_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3600);
 pub const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 /// The most attempts one `dev` authorization may hold (plan M2b-01).
 pub const MAX_DEV_ATTEMPTS: u8 = 5;
+/// The longest cookie path, in bytes: Chromium's bound on a cookie
+/// attribute's value.
+pub const MAX_COOKIE_PATH: usize = 1024;
 
 /// Why a scope part was refused. Fixed and value-free: never the input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -94,6 +97,10 @@ pub enum ScopeError {
     /// A `dev` tier for a live identity (SPEC §6.8: `dev` is for test
     /// identities only).
     LiveDev,
+    /// A cookie path that does not start with `/`, is over
+    /// [`MAX_COOKIE_PATH`] bytes, or holds a byte that is not printable
+    /// ASCII (`!` to `~`), or a `;`.
+    CookiePath,
 }
 
 impl fmt::Display for ScopeError {
@@ -111,6 +118,7 @@ impl fmt::Display for ScopeError {
             ScopeError::Duration => "a duration out of range",
             ScopeError::Attempts => "an attempt count out of range",
             ScopeError::LiveDev => "dev tier for a live identity",
+            ScopeError::CookiePath => "cookie path not in the stored form",
         })
     }
 }
@@ -407,15 +415,16 @@ pub trait Element: Clone {
     fn element(&self, out: &mut Vec<u8>);
 }
 
+fn scheme_byte(s: Scheme) -> u8 {
+    match s {
+        Scheme::Http => 1,
+        Scheme::Https => 2,
+    }
+}
+
 impl Element for Origin {
     fn element(&self, out: &mut Vec<u8>) {
-        lp(
-            out,
-            &[match self.scheme {
-                Scheme::Http => 1,
-                Scheme::Https => 2,
-            }],
-        );
+        lp(out, &[scheme_byte(self.scheme)]);
         let mut h = Vec::new();
         self.host.encode(&mut h);
         lp(out, &h);
@@ -423,23 +432,158 @@ impl Element for Origin {
     }
 }
 
-/// A cookie the target declares for transfer: its host and name.
+/// Which hosts a declared cookie goes to, as the browser stored it (RFC
+/// 6265 §5.3 step 6 and §5.1.3): exactly its host, for a host-only cookie
+/// (set without a `Domain` attribute), or its domain and every host name
+/// under it, for a domain cookie. The two are different cookies even with
+/// the same name, host and path: a host-only cookie never reaches a child
+/// host and a domain cookie does. Kept as its own value, never folded into
+/// a leading dot; the browser helper's interface spells a domain cookie
+/// with one, and the adapter maps it (plan M2b-07).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CookieDomain {
+    /// Sent to this host only. A cookie set by an address is host-only.
+    HostOnly(Host),
+    /// Sent to this name and to every name under it.
+    Domain(HostName),
+}
+
+impl CookieDomain {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            CookieDomain::HostOnly(h) => {
+                lp(out, &[1]);
+                let mut b = Vec::new();
+                h.encode(&mut b);
+                lp(out, &b);
+            }
+            CookieDomain::Domain(n) => {
+                lp(out, &[2]);
+                lp(out, n.0.as_bytes());
+            }
+        }
+    }
+}
+
+/// A cookie's path as the browser stored it (RFC 6265 §5.2.4): `/`, then
+/// printable ASCII other than `;`, at most [`MAX_COOKIE_PATH`] bytes,
+/// compared byte for byte. Never normalized: a trailing slash, the case
+/// of a letter and the spelling of a percent-escape each make another
+/// path, as the browser's path match reads them. Its `Debug` shows only
+/// its length (L-12). [`CookiePath::new`] is the only way to make one:
+///
+/// ```
+/// use envcloak_signin::CookiePath;
+/// assert!(CookiePath::new("/app").is_ok());
+/// assert!(CookiePath::new("app").is_err());
+/// ```
+///
+/// ```compile_fail
+/// let _ = envcloak_signin::CookiePath(String::from("app"));
+/// ```
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CookiePath(String);
+
+impl CookiePath {
+    pub fn new(s: &str) -> Result<Self, ScopeError> {
+        let ok = s.starts_with('/')
+            && s.len() <= MAX_COOKIE_PATH
+            && s.bytes().all(|b| b.is_ascii_graphic() && b != b';');
+        if ok {
+            Ok(CookiePath(s.to_owned()))
+        } else {
+            Err(ScopeError::CookiePath)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CookiePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CookiePath({} bytes)", self.0.len())
+    }
+}
+
+/// A site, as a cookie's partition key names the top-level site: a scheme
+/// and a host, no port.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Site {
+    pub scheme: Scheme,
+    pub host: Host,
+}
+
+/// A declared cookie's partition (a `Partitioned` cookie, CHIPS): none, or
+/// the top-level site its partition key names and whether the browser
+/// recorded a cross-site ancestor in that key. Cookies with the same name,
+/// domain and path in different partitions are different cookies, and the
+/// same cookie with the ancestor bit dropped is sent elsewhere, so both
+/// parts belong to the declaration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CookiePartition {
+    Unpartitioned,
+    Partitioned {
+        site: Site,
+        cross_site_ancestor: bool,
+    },
+}
+
+impl CookiePartition {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            CookiePartition::Unpartitioned => lp(out, &[0]),
+            CookiePartition::Partitioned {
+                site,
+                cross_site_ancestor,
+            } => {
+                lp(out, &[1]);
+                lp(out, &[scheme_byte(site.scheme)]);
+                let mut h = Vec::new();
+                site.host.encode(&mut h);
+                lp(out, &h);
+                lp(out, &[u8::from(*cross_site_ancestor)]);
+            }
+        }
+    }
+}
+
+/// A cookie the target declares for transfer, named as the browser keys
+/// its cookies: its name, its domain (host-only, or a domain cookie), its
+/// path and its partition. Cookies that differ in any of these are
+/// different declarations, so a declaration names exactly one stored
+/// cookie, never a broader one found by its name alone (SPEC §6.8
+/// "Delivery": cookies are never rewritten to fit). Its other attributes
+/// (`Secure`, `HttpOnly`, `SameSite`, its expiry) move with it unchanged
+/// and are not part of what it names.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclaredCookie {
-    pub host: Host,
     pub name: Label,
+    pub domain: CookieDomain,
+    pub path: CookiePath,
+    pub partition: CookiePartition,
 }
 
 impl Element for DeclaredCookie {
     fn element(&self, out: &mut Vec<u8>) {
-        let mut h = Vec::new();
-        self.host.encode(&mut h);
-        lp(out, &h);
         lp(out, self.name.as_str().as_bytes());
+        let mut d = Vec::new();
+        self.domain.encode(&mut d);
+        lp(out, &d);
+        lp(out, self.path.0.as_bytes());
+        let mut p = Vec::new();
+        self.partition.encode(&mut p);
+        lp(out, &p);
     }
 }
 
-/// A storage key the target declares for transfer: its origin and key.
+/// A storage key the target declares for transfer: a key of its origin's
+/// local storage, as a top-level document of that origin sees it (SPEC
+/// §6.8 "Cookie scope": local storage is origin-scoped). Session storage
+/// and storage partitioned under another top-level site cannot be
+/// declared, so state held there is broader than declared and fails the
+/// operation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeclaredStorage {
     pub origin: Origin,
@@ -580,7 +724,12 @@ pub enum CheckKind {
     Element,
 }
 
-/// The target's declared identity check (SPEC §6.8 "Identity check").
+/// The target's declared identity check (SPEC §6.8 "Identity check"):
+/// its kind and what it reads (the endpoint's path, or the element). How
+/// its answer maps to an account, a tenant and a role is the target's
+/// registration (plan M2b-05); SPEC §6.8 changes the login's authorization
+/// revision (field 8) whenever the identity check or that mapping changes,
+/// so no scope outlives a change of either.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IdentityCheck {
     pub kind: CheckKind,
@@ -588,7 +737,11 @@ pub struct IdentityCheck {
 }
 
 /// The declared state that may move into the recipient context (SPEC
-/// §6.8 "Delivery"): cookies and storage keys, nothing else.
+/// §6.8 "Delivery"): cookies and storage keys, nothing else. The session's
+/// format (what state the adapter captures and how it moves) is the
+/// adapter's, which the scope names by its id and revision (fields 15 and
+/// 16); a change of it is a change of adapter behaviour, which changes the
+/// login's authorization revision too (SPEC §6.8 "Sign-in scope").
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransferScope {
     pub cookies: SortedSet<DeclaredCookie>,

@@ -45,10 +45,10 @@ pub use operation::{
     publication_decision,
 };
 pub use scope::{
-    Account, AdapterId, CheckKind, DaemonInstance, DeclaredCookie, DeclaredStorage, Delivery,
-    DeliveryMode, Environment, Epochs, Fingerprint, Host, HostName, IdentityCheck, Instance, Label,
-    Limits, Origin, ProjectScope, Scheme, ScopeError, SignInScope, SortedSet, Subject, Target,
-    TargetId, Tier, TransferScope,
+    Account, AdapterId, CheckKind, CookieDomain, CookiePartition, CookiePath, DaemonInstance,
+    DeclaredCookie, DeclaredStorage, Delivery, DeliveryMode, Environment, Epochs, Fingerprint,
+    Host, HostName, IdentityCheck, Instance, Label, Limits, Origin, ProjectScope, Scheme,
+    ScopeError, SignInScope, Site, SortedSet, Subject, Target, TargetId, Tier, TransferScope,
 };
 pub use statement::{
     ContextId, DEFAULT_DEV_ATTEMPTS, Nonce, Options, OptionsError, RequestId, SignInStatement,
