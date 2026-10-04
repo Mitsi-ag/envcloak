@@ -5025,7 +5025,10 @@ unsigned int la_version(unsigned int version) {
     }
 
     /// The loader variables measured to run [`MARKER_LIB`] in agent `id`'s
-    /// pinned build on this system (docs/AGENTS.md "Host behaviour").
+    /// pinned build on this system (docs/AGENTS.md "Host behaviour"); on
+    /// macOS, on a Mac that holds hardened programs to their signature's
+    /// `DYLD_*` rule (System Integrity Protection on, as on the Mac these
+    /// were measured on), which [`signed_controls`] tells.
     fn loaded_measured(id: &str) -> &'static [&'static str] {
         match (cfg!(target_os = "macos"), id) {
             (true, "opencode") => &["DYLD_INSERT_LIBRARIES"],
@@ -5128,6 +5131,88 @@ unsigned int la_version(unsigned int version) {
         }
     }
 
+    /// macOS: copies of [`PLAIN`] this test signs itself (ad hoc) with the
+    /// hardened runtime and each pair of the two entitlements that decide
+    /// whether `dyld` loads what `DYLD_INSERT_LIBRARIES` names:
+    /// `cs.allow-dyld-environment-variables` and
+    /// `cs.disable-library-validation`, as `[dyld, any_library]`. Run with
+    /// the variable, they show how this Mac treats each signature: one that
+    /// grants both loads the library on any Mac (the probe's control that
+    /// an allowing signature is honoured); one that grants
+    /// `disable-library-validation` alone (Claude Code's and Copilot CLI's
+    /// shape) loads it only on a Mac that does not hold hardened programs
+    /// to their signature's rule (measured: a Mac with System Integrity
+    /// Protection off).
+    fn signed_controls(dir: &Path, plain: &Path) -> Vec<([bool; 2], PathBuf)> {
+        let mut out = Vec::new();
+        for (dyld, any_library) in [(false, false), (false, true), (true, false), (true, true)] {
+            let name = format!("ec-hardened-{}-{}", u8::from(dyld), u8::from(any_library));
+            let exe = dir.join(&name);
+            std::fs::copy(plain, &exe).unwrap();
+            let keys: Vec<&str> = [
+                (dyld, "cs.allow-dyld-environment-variables"),
+                (any_library, "cs.disable-library-validation"),
+            ]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, k)| *k)
+            .collect();
+            let plist = dir.join(format!("{name}.plist"));
+            let entries: String = keys
+                .iter()
+                .map(|k| format!("<key>com.apple.security.{k}</key><true/>"))
+                .collect();
+            std::fs::write(
+                &plist,
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \
+                     \"-//Apple//DTD PLIST 1.0//EN\" \
+                     \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+                     <plist version=\"1.0\"><dict>{entries}</dict></plist>\n"
+                ),
+            )
+            .unwrap();
+            let mut cmd = Command::new("/usr/bin/codesign");
+            cmd.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .args(["-s", "-", "-f", "-o", "runtime"]);
+            if !keys.is_empty() {
+                cmd.arg("--entitlements").arg(&plist);
+            }
+            cmd.arg(&exe)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let signed = envcloak_testkit::agents::finish_within(cmd, Duration::from_secs(60));
+            assert!(
+                signed.status.success(),
+                "codesign {name}: {}",
+                String::from_utf8_lossy(&signed.stderr)
+            );
+            assert_eq!(signing(&exe), (true, [false, dyld, any_library]), "{name}");
+            out.push(([dyld, any_library], exe));
+        }
+        out
+    }
+
+    /// macOS `csrutil status`'s line, for the measurement.
+    fn sip_status() -> String {
+        let mut cmd = Command::new("/usr/bin/csrutil");
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .arg("status")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = envcloak_testkit::agents::finish_within(cmd, Duration::from_secs(60));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
     /// Whether macOS `codesign` shows `exe` signed with the hardened
     /// runtime, and which of the entitlements that matter here it has:
     /// `get-task-allow` (a debugger may attach),
@@ -5147,7 +5232,13 @@ unsigned int la_version(unsigned int version) {
             envcloak_testkit::agents::finish_within(cmd, Duration::from_secs(60))
         };
         let info = run(&["-dv"]);
-        let runtime = String::from_utf8_lossy(&info.stderr).contains("(runtime)");
+        // `flags=0x10000(runtime)`, or `0x10002(adhoc,runtime)` for a
+        // program signed ad hoc.
+        let runtime = String::from_utf8_lossy(&info.stderr)
+            .split("flags=")
+            .nth(1)
+            .and_then(|f| f.split_once('(')?.1.split_once(')'))
+            .is_some_and(|(flags, _)| flags.split(',').any(|f| f == "runtime"));
         let xml = run(&["-d", "--entitlements", "-", "--xml"]);
         let xml = String::from_utf8_lossy(&xml.stdout).into_owned();
         let has = |key: &str| xml.contains(&format!("<key>com.apple.security.{key}</key><true/>"));
@@ -5179,20 +5270,31 @@ unsigned int la_version(unsigned int version) {
     /// - with each dynamic loader variable of this system naming a
     ///   library this test builds ([`MARKER_LIB`]): `DYLD_INSERT_LIBRARIES`
     ///   on macOS, `LD_PRELOAD` and `LD_AUDIT` on Linux. A program this
-    ///   test builds must load it under each (the positive control). The
-    ///   variables whose marker appears are as measured
-    ///   ([`loaded_measured`]), and each is one the standing rule refuses
-    ///   for that agent ([`AgentCatalog::env_selects_code`]); on macOS
-    ///   they follow each build's signature: hardened runtime throughout,
-    ///   no `get-task-allow`, and `DYLD_INSERT_LIBRARIES` honoured exactly
-    ///   where `cs.allow-dyld-environment-variables` and
-    ///   `cs.disable-library-validation` are both granted (OpenCode's).
+    ///   test builds must load it under each (the positive control). Each
+    ///   variable whose marker appears is one the standing rule refuses for
+    ///   that agent ([`AgentCatalog::env_selects_code`]). On Linux they are
+    ///   as measured ([`loaded_measured`]). On macOS every build is signed
+    ///   with the hardened runtime and without `get-task-allow`, and
+    ///   whether `dyld` loads the library follows its signature and this
+    ///   Mac, which copies of a program this test signs itself tell
+    ///   ([`signed_controls`]; the one granting both entitlements must load
+    ///   it): on a Mac that holds hardened programs to their signature's
+    ///   rule (no copy whose signature does not allow `DYLD_*` loads it),
+    ///   the builds load it as measured, exactly where
+    ///   `cs.allow-dyld-environment-variables` and
+    ///   `cs.disable-library-validation` are both granted (OpenCode's); on
+    ///   one that does not (System Integrity Protection off, as on CI's
+    ///   macOS runner), each build whose signature grants both still loads
+    ///   it, and a build may stop at `dyld`'s refusal of the library
+    ///   (nothing of it ran), which is recorded. Every measurement is
+    ///   printed before any of them is judged.
     ///
     /// Mutation checked: removing `BUN_OPTIONS` from Claude Code's entry,
     /// or adding `NODE_OPTIONS` to Copilot CLI's, fails this test; so does
     /// a probe library whose constructor writes nothing (the positive
     /// control), and on macOS dropping `DYLD_INSERT_LIBRARIES` from
-    /// OpenCode's measurement.
+    /// OpenCode's measurement, or the signed control taken as granting
+    /// both entitlements when it grants one.
     #[test]
     fn code_selecting_env_is_measured() {
         let cat = AgentCatalog::builtin();
@@ -5245,6 +5347,47 @@ unsigned int la_version(unsigned int version) {
                 "the loader probe's positive control, {var}: {r:?}"
             );
         }
+        // macOS: how this Mac treats each signature (`signed_controls`).
+        // `enforced`: a hardened program whose signature does not allow
+        // `DYLD_*` is held to that.
+        let mut enforced = true;
+        if cfg!(target_os = "macos") {
+            let sip = sip_status();
+            println!("measurement: catalog loader probe os=macos: {sip}");
+            for ([dyld, any_library], exe) in signed_controls(&dir, &plain) {
+                let marker = exe.with_extension("marker");
+                let var = "DYLD_INSERT_LIBRARIES";
+                let r = probe_run(&home, &exe, &[], Some((var, lib.as_os_str())), &marker);
+                println!(
+                    "measurement: catalog loader probe os=macos: a program this test signed, \
+                     hardened runtime, allow-dyld-environment-variables {dyld}, \
+                     disable-library-validation {any_library}, {var}: {}",
+                    if r.marked { "loaded" } else { "not loaded" }
+                );
+                // It ran, or `dyld` refused the library (nothing of it ran).
+                assert!(
+                    r.marked || (r.ok && r.first_line == "ec-plain 1") || r.stderr.contains("dyld"),
+                    "the signed control ({dyld}, {any_library}) did not run: {r:?}"
+                );
+                if dyld && any_library {
+                    assert!(r.marked, "a signature allowing it is not honoured: {r:?}");
+                }
+                if !dyld && r.marked {
+                    enforced = false;
+                }
+            }
+            // With System Integrity Protection on (the Mac the builds were
+            // measured on), a hardened program is held to its signature's
+            // `DYLD_*` rule: a control that a Mac which should enforce does.
+            if sip.ends_with("status: enabled.") {
+                assert!(
+                    enforced,
+                    "{sip}, and a signature's DYLD_* rule was not kept"
+                );
+            }
+        }
+        // Every judgment, made once everything is measured and printed.
+        let mut wrong: Vec<String> = Vec::new();
         for (id, exe) in exes {
             let marker = dir.join(format!("{id}-control"));
             let control = probe_run(&home, &exe, &version, None, &marker);
@@ -5318,7 +5461,18 @@ unsigned int la_version(unsigned int version) {
             for var in loader_vars() {
                 let marker = dir.join(format!("{id}-{var}"));
                 let r = probe_run(&home, &exe, &version, Some((var, lib.as_os_str())), &marker);
-                reached(&r, var);
+                if !r.ok && !r.marked && !enforced && r.stderr.contains("dyld") {
+                    // `dyld` refused the library before anything of it ran
+                    // (nothing of it, no version): the variable reached it.
+                    println!(
+                        "measurement: catalog code_selecting_env os={} {id}: {var}: stopped \
+                         by dyld: {:?}",
+                        os(),
+                        r.stderr.lines().next().unwrap_or_default()
+                    );
+                } else {
+                    reached(&r, var);
+                }
                 if r.marked {
                     loaded.push(*var);
                 }
@@ -5332,10 +5486,20 @@ unsigned int la_version(unsigned int version) {
                 "measurement: catalog code_selecting_env os={} {id}: {ran:?}; loader {loaded:?}",
                 os()
             );
-            assert_eq!(ran, want, "{id} ({})", exe.display());
-            assert_eq!(loaded, loaded_measured(id), "{id} ({})", exe.display());
+            let mut judge = |ok: bool, what: String| {
+                if !ok {
+                    wrong.push(format!("{id} ({}): {what}", exe.display()));
+                }
+            };
+            judge(
+                ran == want,
+                format!("ran {ran:?}, the catalog lists {want:?}"),
+            );
             for var in &loaded {
-                assert!(cat.env_selects_code(id, var.as_bytes()), "{id} {var}");
+                judge(
+                    cat.env_selects_code(id, var.as_bytes()),
+                    format!("{var} loads and the standing rule does not refuse it"),
+                );
             }
             if cfg!(target_os = "macos") {
                 let (runtime, [debug, dyld, any_library]) = signing(&exe);
@@ -5344,14 +5508,36 @@ unsigned int la_version(unsigned int version) {
                      get-task-allow {debug}, allow-dyld-environment-variables {dyld}, \
                      disable-library-validation {any_library}"
                 );
-                assert!(runtime && !debug, "{id}: {runtime} {debug}");
-                assert_eq!(
-                    loaded.contains(&"DYLD_INSERT_LIBRARIES"),
-                    dyld && any_library,
-                    "{id}"
+                judge(
+                    runtime && !debug,
+                    format!("hardened runtime {runtime}, get-task-allow {debug}"),
+                );
+                let inserted = loaded.contains(&"DYLD_INSERT_LIBRARIES");
+                if enforced {
+                    judge(
+                        loaded == loaded_measured(id),
+                        format!("loader {loaded:?}, measured {:?}", loaded_measured(id)),
+                    );
+                    judge(
+                        inserted == (dyld && any_library),
+                        format!(
+                            "DYLD_INSERT_LIBRARIES loaded {inserted}, signature ({dyld}, {any_library})"
+                        ),
+                    );
+                } else {
+                    judge(
+                        inserted || !(dyld && any_library),
+                        "its signature allows DYLD_INSERT_LIBRARIES and it did not load".to_owned(),
+                    );
+                }
+            } else {
+                judge(
+                    loaded == loaded_measured(id),
+                    format!("loader {loaded:?}, measured {:?}", loaded_measured(id)),
                 );
             }
         }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// Whether `id`'s `[[agent]]` table in the catalog text `src` sets
