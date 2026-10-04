@@ -91,9 +91,11 @@
 //! [`ExeHasher`] it supplies (a cache and a per-request budget, M2 plan
 //! D-09). Hashing comes after the walk, so each identity is checked
 //! against it: the hasher compares the file it opened with the device and
-//! inode the walk read, and once every hash is taken the walk's start
-//! times are read again; an ancestor whose process exited or ran another
-//! file meanwhile keeps no hash. An identity that is not known (no hasher,
+//! inode the walk read, and once every hash is taken the whole chain is
+//! read again; when any process exited, ran another file, was reparented
+//! or left its session or terminal meanwhile, the chain is walked again
+//! (as when it changes during the walk), so no evidence is built from a
+//! chain as it was before hashing. An identity that is not known (no hasher,
 //! another user's process, a non-dumpable one, a file too large, a budget
 //! spent, a change while it was read) is `None`, which never changes the
 //! root, the kind, the label or a proof refusal: identity is recorded,
@@ -768,15 +770,20 @@ pub fn gather_hashed(
 
 /// [`gather_in`], and then, for each process of the caller's uid whose
 /// executable's device and inode the walk read, its SHA-256 from
-/// `hasher`, nearest the caller first. Once every hash is taken, each
-/// hashed process is read from `table` again: one that no longer has the
-/// start time and the executable file the walk saw (it exited, its pid was
-/// reused, it ran another file) keeps no hash. Nothing else changes: the
-/// root, the kind, the labels and the proof refusals are those
-/// [`gather_in`] gives.
+/// `hasher`, nearest the caller first. Once every hash is taken, every
+/// process of the chain is read from `table` again, hashed or not, its
+/// executable hidden or not: when one is no longer as the walk saw it
+/// (it exited, its pid was reused, it ran another file, it was
+/// reparented, it left its session or its terminal), the chain is walked
+/// and hashed again, up to [`GATHER_ATTEMPTS`] walks in all. So the
+/// root, the kind, the labels, the proof refusals and the digests all
+/// describe the chain as it was once hashing ended. A digest that is not
+/// known changes none of them: they are those [`gather_in`] gives for that
+/// chain.
 ///
 /// # Errors
-/// As [`gather_in`].
+/// As [`gather_in`]; [`EvidenceError::Changed`] also when the chain changed
+/// during every attempt's hashing.
 pub fn gather_in_hashed(
     table: &mut dyn ProcessTable,
     peer: &PeerIdentity,
@@ -807,14 +814,19 @@ pub fn gather_in(
 }
 
 /// Hashes each process of the caller's uid in `procs` whose executable
-/// file the walk read, then drops each hash whose process `table` no
-/// longer shows with the start time and the file the walk saw.
+/// file the walk read, nearest the caller first, then reads every process
+/// of `procs` again ([`recheck`]). Hashing takes time (up to the request's
+/// budget), and the evidence is built from `procs` afterwards: a chain
+/// that changed meanwhile is not used, digests or not.
+///
+/// # Errors
+/// As [`recheck`].
 fn hash_executables(
     table: &mut dyn ProcessTable,
     procs: &mut [ProcInfo],
     uid: u32,
     hasher: &mut dyn ExeHasher,
-) {
+) -> Result<bool, EvidenceError> {
     for p in procs.iter_mut() {
         if !classifiable(p, uid) || p.exe.as_ref().and_then(|e| e.file).is_none() {
             continue;
@@ -824,20 +836,36 @@ fn hash_executables(
             exe.sha256 = digest;
         }
     }
-    for p in procs.iter_mut() {
-        let Some(exe) = p.exe.as_mut() else {
-            continue;
+    recheck(table, procs)
+}
+
+/// Reads every process of `procs`, the walk's verified chain, from `table`
+/// again: `Ok(true)` when each is as the walk saw it
+/// ([`ProcInfo::unchanged`]: the same start time, parent, session,
+/// terminal, uid, command name and executable), `Ok(false)` when one
+/// changed or exited (the chain moved; the caller walks again).
+///
+/// # Errors
+/// [`EvidenceError::CallerGone`] when the caller exited or its pid is
+/// another process's, [`EvidenceError::Io`] when a read failed otherwise.
+fn recheck(table: &mut dyn ProcessTable, procs: &[ProcInfo]) -> Result<bool, EvidenceError> {
+    for (k, p) in procs.iter().enumerate() {
+        let again = match table.info(p.pid) {
+            Ok(a) => a,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && k == 0 => {
+                return Err(EvidenceError::CallerGone);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(EvidenceError::Io(e.kind())),
         };
-        if exe.sha256.is_none() {
-            continue;
+        if k == 0 && again.start_time != p.start_time {
+            return Err(EvidenceError::CallerGone);
         }
-        let same = table.info(p.pid).is_ok_and(|again| {
-            again.start_time == p.start_time && again.exe.as_ref().and_then(|e| e.file) == exe.file
-        });
-        if !same {
-            exe.sha256 = None;
+        if !again.unchanged(p) {
+            return Ok(false);
         }
     }
+    Ok(true)
 }
 
 fn gather_with(
@@ -845,24 +873,25 @@ fn gather_with(
     peer: &PeerIdentity,
     claims: Claims,
     cat: &AgentCatalog,
-    hasher: Option<&mut dyn ExeHasher>,
+    mut hasher: Option<&mut dyn ExeHasher>,
 ) -> Result<SubjectEvidence, EvidenceError> {
     let want_argv = |p: &ProcInfo| classifiable(p, peer.uid) && cat.needs_argv(p);
     let mut procs = None;
     for _ in 0..GATHER_ATTEMPTS {
-        match ancestry_in(table, peer, MAX_ANCESTRY, &want_argv) {
-            Ok(p) => {
-                procs = Some(p);
-                break;
-            }
-            Err(AncestryError::Changed) => {}
+        let mut walked = match ancestry_in(table, peer, MAX_ANCESTRY, &want_argv) {
+            Ok(p) => p,
+            Err(AncestryError::Changed) => continue,
             Err(e) => return Err(e.into()),
+        };
+        if let Some(h) = hasher.as_mut() {
+            if !hash_executables(table, &mut walked, peer.uid, &mut **h)? {
+                continue;
+            }
         }
+        procs = Some(walked);
+        break;
     }
-    let mut procs = procs.ok_or(EvidenceError::Changed)?;
-    if let Some(hasher) = hasher {
-        hash_executables(table, &mut procs, peer.uid, hasher);
-    }
+    let procs = procs.ok_or(EvidenceError::Changed)?;
     let end = if reaches_top(&procs) {
         ChainEnd::Top
     } else {

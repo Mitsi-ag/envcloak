@@ -27,10 +27,12 @@
 //!   2. every parent must have started no later than its child: a pid
 //!      reused after the real parent exited belongs to a newer process;
 //!   3. after the walk, and after any arguments were read, every entry is
-//!      read again and must still have its start time, parent, session and
-//!      terminal. A process lives under one pid until it exits, so an
-//!      entry that passes was the same process throughout, and each link
-//!      held when it was checked.
+//!      read again and must still have its start time, parent, session,
+//!      terminal, uid, command name and executable ([`ProcInfo::unchanged`]).
+//!      A process lives under one pid until it exits, so an entry that
+//!      passes was the same process throughout, running the same file (an
+//!      `exec` keeps the pid and the start time), and each link held when
+//!      it was checked.
 //!
 //!   A change is [`AncestryError::Changed`]; the caller walks again. A
 //!   parent that cannot be read while its child still names it is
@@ -225,6 +227,33 @@ pub struct ProcInfo {
     /// Filled in by [`ancestry`] for the processes its caller names; `None`
     /// otherwise, and when the kernel refused.
     pub argv: Option<Argv>,
+}
+
+impl ProcInfo {
+    /// Whether this reading of a process shows it as `earlier` did: the
+    /// same pid, parent, start time, uid, session, controlling terminal,
+    /// command name and executable (its path, its file and its signature;
+    /// not its SHA-256, which a reading of the kernel's never holds). An
+    /// `exec` keeps the pid and the start time but changes the executable
+    /// or the command name, a reparent the parent, `setsid` the session.
+    /// The arguments are not compared: a process rewrites them at will.
+    pub fn unchanged(&self, earlier: &ProcInfo) -> bool {
+        let same_exe = match (&self.exe, &earlier.exe) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.path == b.path && a.file == b.file && a.signature == b.signature
+            }
+            _ => false,
+        };
+        self.pid == earlier.pid
+            && self.ppid == earlier.ppid
+            && self.start_time == earlier.start_time
+            && self.uid == earlier.uid
+            && self.sid == earlier.sid
+            && self.controlling_tty == earlier.controlling_tty
+            && self.comm == earlier.comm
+            && same_exe
+    }
 }
 
 impl core::fmt::Debug for ProcInfo {
@@ -585,10 +614,13 @@ pub fn ancestry_in(
             }
             Err(e) => return Err(io(e)),
         };
+        // An `exec` between the two reads changes what the process is (its
+        // executable, its command name) but not its pid or start time.
         if again.start_time != p.start_time
             || again.ppid != p.ppid
             || again.sid != p.sid
             || again.controlling_tty != p.controlling_tty
+            || !again.unchanged(p)
         {
             return Err(if k == 0 && again.start_time != p.start_time {
                 AncestryError::PeerGone

@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use envcloak_sys::{
-    AncestryError, Argv, MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, PeerIdentity, PeerSource,
-    ProcInfo, ProcessTable, ProcessWatch, StartTime, ancestry, ancestry_in, effective_uid,
-    parse_cmdline, parse_proc_stat, parse_procargs2, parse_stat_state, peer_identity, proc_argv,
-    proc_info, process_running, process_start_time, reaches_top, stat_state_exited,
+    AncestryError, Argv, ExeIdentity, MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, PeerIdentity,
+    PeerSource, ProcInfo, ProcessTable, ProcessWatch, StartTime, ancestry, ancestry_in,
+    effective_uid, parse_cmdline, parse_proc_stat, parse_procargs2, parse_stat_state,
+    peer_identity, proc_argv, proc_info, process_running, process_start_time, reaches_top,
+    stat_state_exited,
 };
 use proptest::prelude::*;
 
@@ -567,6 +568,57 @@ fn a_reparented_or_resessioned_link_fails_revalidation() {
         ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),
         AncestryError::Changed
     );
+}
+
+/// An `exec` keeps a process's pid and start time: a link that ran another
+/// file (its executable, or only its command name, changed), or whose uid
+/// changed, between the walk and its check fails the check, and the
+/// caller walks again. Arguments are not compared. Mutation checked:
+/// leaving the executable and the command name out of the check fails
+/// this test.
+#[test]
+fn an_exec_between_the_walk_and_its_check_fails_revalidation() {
+    let exe = |path: &str, file: u64| {
+        Some(ExeIdentity {
+            path: PathBuf::from(path),
+            file: Some((1, file)),
+            sha256: None,
+            signature: None,
+        })
+    };
+    let with_exe = |path: &str, file: u64| {
+        let mut p = info(30, 20, 300);
+        p.exe = exe(path, file);
+        p
+    };
+    let renamed = {
+        let mut p = info(30, 20, 300);
+        p.comm = OsString::from("q");
+        p
+    };
+    let setuid = {
+        let mut p = info(30, 20, 300);
+        p.uid = 0;
+        p
+    };
+    for (before, after) in [
+        (with_exe("/bin/bash", 7), with_exe("/opt/agent", 8)),
+        (with_exe("/bin/bash", 7), with_exe("/bin/bash", 9)),
+        (info(30, 20, 300), renamed),
+        (info(30, 20, 300), setuid),
+    ] {
+        let mut t = steady().with(vec![Ok(before.clone()), Ok(after.clone())]);
+        assert_eq!(
+            ancestry_in(&mut t, &peer(40, 400), 64, &|_| false).unwrap_err(),
+            AncestryError::Changed,
+            "{before:?} -> {after:?}"
+        );
+        assert!(!after.unchanged(&before));
+    }
+    // The control: the same file and name, with new arguments, passes.
+    let mut t = steady().with(vec![Ok(with_exe("/bin/bash", 7))]);
+    let chain = ancestry_in(&mut t, &peer(40, 400), 64, &|_| true).unwrap();
+    assert!(chain[1].unchanged(&with_exe("/bin/bash", 7)));
 }
 
 #[test]
