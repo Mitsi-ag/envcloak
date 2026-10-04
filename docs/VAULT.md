@@ -448,7 +448,7 @@ Status: M3 plan decision D3-02 and lane C's rule 9, written by task M3-01. The v
 | Number | Token | Task | Status | Use |
 |---|---|---|---|---|
 | 46 | `unlocker_add` | M3-08 | reserved | a Secure Enclave unlocker enrolled (approved with the passphrase, or later signed in the app), with its label and both public keys' fingerprints |
-| 47 | `unlocker_remove` | M3-14 | reserved | the passphrase unlocker removed under a signed write statement (`app.unlocker.remove`) |
+| 47 | `unlocker_remove` | M3-14 | reserved | an unlocker removed under a signed write statement (`app.unlocker.remove`): the passphrase unlocker, or a Secure Enclave unlocker with its label and both public keys' fingerprints |
 | 48 | `reveal_app` | M3-14 | reserved | a reveal in the app, written durably before the sealed value is released |
 | 49 | `ask` | M3-14 | reserved | an ask filed by `envcloak add --ask`, and its outcome (added, declined or expired), with the requester's evidence |
 | 50 | `keychain_anchor_mismatch` | M3-16 | reserved | the keychain anchor is newer than the vault file (rolled back), or a vault that had an anchor has none; the anchor written again (named apart from `audit.verify`'s `anchor_mismatch`, the audit log's saved head) |
