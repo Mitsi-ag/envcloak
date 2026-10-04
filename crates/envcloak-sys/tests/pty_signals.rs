@@ -281,7 +281,7 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
         }
     }
     screen.type_bytes(b"exit\n");
-    let event = monitor.next_event(Some(DEADLINE)).unwrap();
+    let event = screen.next_event(&mut monitor);
     assert!(
         matches!(event, Some(MonitorEvent::Exited(_))),
         "{event:?}\n{}",
