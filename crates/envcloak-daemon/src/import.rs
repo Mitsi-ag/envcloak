@@ -102,8 +102,8 @@ use envcloak_core::file_backup::{
 };
 use envcloak_core::file_backup_v2::CreatorKind;
 use envcloak_core::vault::{
-    Classification, FieldId, FieldName, ItemDetails, ItemMeta, MAX_FIELD, NewItem, Slug, ValueKey,
-    Vault, VaultError, VaultErrorKind,
+    Classification, FieldId, FieldMeta, FieldName, ItemDetails, ItemMeta, MAX_FIELD, NewItem, Slug,
+    ValueKey, Vault, VaultError, VaultErrorKind,
 };
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_ipc::proto::{
@@ -591,49 +591,61 @@ fn new_slug(
 /// only values the import methods and `scan.match` compare a value with
 /// (SPEC §2a-bis, R-M2-34). It is built from the secret items' keys alone
 /// ([`Vault::value_keys_of`]), so a card's value or a login's is never
-/// compared at all, rather than compared and then left out.
-pub(crate) struct SecretValues {
-    by_key: HashMap<ValueKey, Vec<FieldId>>,
+/// compared at all, rather than compared and then left out. Each key
+/// lists the fields holding it with their items, found once when it is
+/// built, so a lookup costs what it finds, not the vault's size.
+pub(crate) struct SecretValues<'v> {
+    by_key: HashMap<ValueKey, Vec<Held<'v>>>,
 }
 
-impl SecretValues {
-    pub(crate) fn of(v: &Vault) -> Self {
-        let mut by_key: HashMap<ValueKey, Vec<FieldId>> = HashMap::new();
+/// A field holding a value, and its item.
+#[derive(Clone, Copy)]
+pub(crate) struct Held<'v> {
+    pub(crate) item: &'v ItemMeta,
+    pub(crate) field: &'v FieldMeta,
+}
+
+impl<'v> SecretValues<'v> {
+    pub(crate) fn of(v: &'v Vault) -> Self {
+        let owners: HashMap<FieldId, Held<'v>> = v
+            .items()
+            .iter()
+            .flat_map(|item| {
+                item.fields
+                    .iter()
+                    .map(move |field| (field.id, Held { item, field }))
+            })
+            .collect();
+        let mut by_key: HashMap<ValueKey, Vec<Held<'v>>> = HashMap::new();
         for (field, key) in v.value_keys_of(ItemClass::Secret) {
-            by_key.entry(key).or_default().push(field);
+            if let Some(h) = owners.get(&field) {
+                by_key.entry(key).or_default().push(*h);
+            }
         }
         SecretValues { by_key }
     }
 
-    /// The `secret` items' fields whose current value has `key`.
-    pub(crate) fn fields(&self, key: &ValueKey) -> &[FieldId] {
+    /// The `secret` items' fields whose current value has `key`, with
+    /// their items.
+    pub(crate) fn fields(&self, key: &ValueKey) -> &[Held<'v>] {
         self.by_key.get(key).map_or(&[], Vec::as_slice)
     }
 }
 
-/// The secret items of `v` whose value has `key` (in `secrets`), by slug,
-/// with the field.
-fn holders<'v>(
-    v: &'v Vault,
-    secrets: &SecretValues,
-    key: &ValueKey,
-) -> Vec<(&'v ItemMeta, FieldName)> {
-    let fields = secrets.fields(key);
-    if fields.is_empty() {
-        return Vec::new();
-    }
-    let mut out: Vec<(&ItemMeta, FieldName)> = v
-        .items()
-        .iter()
-        .filter_map(|m| {
-            m.fields
-                .iter()
-                .find(|f| fields.contains(&f.id))
-                .map(|f| (m, f.name.clone()))
-        })
-        .collect();
-    out.sort_by(|a, b| a.0.slug.cmp(&b.0.slug));
-    out
+/// The secret items whose value has `key` (in `secrets`), each once (its
+/// first field by name that holds it), by slug, with the field.
+fn holders<'v>(secrets: &SecretValues<'v>, key: &ValueKey) -> Vec<(&'v ItemMeta, FieldName)> {
+    let mut held: Vec<Held<'v>> = secrets.fields(key).to_vec();
+    held.sort_by(|a, b| {
+        a.item
+            .slug
+            .cmp(&b.item.slug)
+            .then_with(|| a.field.name.cmp(&b.field.name))
+    });
+    held.dedup_by(|b, a| a.item.id == b.item.id);
+    held.into_iter()
+        .map(|h| (h.item, h.field.name.clone()))
+        .collect()
 }
 
 fn reference(m: &ItemMeta, field: &FieldName) -> String {
@@ -741,7 +753,7 @@ fn new_item(
 ) -> Result<PlannedItem, RpcError> {
     let e = &input.entries[first];
     let length = LengthClass::of(e.value.len());
-    let found = holders(v, secrets, &key);
+    let found = holders(secrets, &key);
     if let Some((m, field)) = found.first() {
         return Ok(PlannedItem {
             key,
@@ -1065,7 +1077,13 @@ fn stored(
     };
     let holding = secrets.fields(&v.value_key(value));
     match bind_items(std::slice::from_ref(b), v.items()) {
-        Ok(bound) if bound.iter().all(|x| holding.contains(&x.field)) => EntryStatus::Stored,
+        Ok(bound)
+            if bound
+                .iter()
+                .all(|x| holding.iter().any(|h| h.field.id == x.field)) =>
+        {
+            EntryStatus::Stored
+        }
         _ => EntryStatus::NotStored,
     }
 }

@@ -16,10 +16,14 @@
 //!   1 MiB is refused before it is read;
 //! - every call is audited with counts and never a candidate;
 //! - an answer too large for a frame is audited as `frame_too_large`, and
-//!   a refused well-formed call is audited too;
+//!   built no further than a frame holds; a refused well-formed call is
+//!   audited too;
+//! - no card's or login's value key reaches a comparison (the daemon's
+//!   trace of the comparison boundary);
 //! - `items.mark_exposed` marks secrets only, repeats change nothing, a
-//!   mark after a partial rotation restarts, and a rotation clears the mark
-//!   only when the item holds no value the mark covers.
+//!   mark after a partial rotation covers the new value, and a rotation
+//!   clears the mark only when the item holds no value a mark covers,
+//!   wherever that value is now.
 //!
 //! The caller is this test process, made a terminal session so the daemon
 //! takes its proofs (a person); the fixture agent's marker makes it an
@@ -1141,18 +1145,22 @@ fn marking_exposed_items_is_idempotent_and_rotation_clears_it() {
     f.sweep_with(&entries);
 }
 
-/// An answer too large for one frame (a value many items hold, sent under
-/// many ids) is refused `frame_too_large`, and its audit entry says so,
-/// with the comparisons it counted, never that the matches were answered
-/// (L-08; F-77's order: the answer is framed before the entry is
-/// written). A smaller batch of the same value is answered and audited
+/// An answer too large for one frame (a value 64 items hold, sent under
+/// 4,096 ids: 262,144 matches) is refused `frame_too_large`, and its audit
+/// entry says so, with the comparisons it counted and every match, never
+/// that the matches were answered (L-08; F-77's order: the answer is
+/// framed before the entry is written). The daemon built no more of it
+/// than one frame holds (Codex review: its trace says how many records it
+/// built before it stopped, at most a frame over the least a record
+/// takes). A smaller batch of the same value is answered and audited
 /// `checked`.
 ///
-/// Mutation: an answer too large for its frame recorded as answered (the
-/// entry says `checked`).
+/// Mutations: an answer too large for its frame recorded as answered (the
+/// entry says `checked`); the bound only at the frame (every record
+/// built: the trace line is not written).
 #[test]
 fn an_answer_too_large_for_a_frame_is_audited_as_such() {
-    const HOLDERS: usize = 6;
+    const HOLDERS: usize = 64;
     let same = word(32);
     let held = same.clone();
     let mut f = Fixture::new(move |v, cs| {
@@ -1187,6 +1195,18 @@ fn an_answer_too_large_for_a_frame_is_audited_as_such() {
     )
     .unwrap_err();
     assert_eq!(rpc(e).0, ErrorKind::FrameTooLarge);
+    // `{"id":0,"item":"","slug":""}`: the least a match takes.
+    let floor = r#"{"id":0,"item":"","slug":""}"#.len();
+    let log = f.d.log_when(Duration::from_secs(10), |l| {
+        l.contains("scan.match answer over a frame")
+    });
+    let built: Vec<usize> = log
+        .lines()
+        .filter_map(|l| l.strip_prefix("envcloak test: scan.match answer over a frame after "))
+        .map(|l| l.trim_end_matches(" records").parse().unwrap())
+        .collect();
+    assert_eq!(built.len(), 1, "{log}");
+    assert!(built[0] <= envcloak_ipc::MAX_FRAME / floor + 1, "{built:?}");
     let a = scan(
         &mut c,
         ScanPurpose::Doctor,
