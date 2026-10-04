@@ -20,7 +20,7 @@
 //! stopped operation's value-free receipt stays until its `retry_until`
 //! ([`crate::RETRY_WINDOW`] after it stopped) has passed and its teardown,
 //! if one was asked for, was confirmed: a pending or failed close keeps it
-//! as a tombstone (and keeps its login from starting another attempt)
+//! as a tombstone (and keeps its account from starting another attempt)
 //! until a report confirms it. A daemon restart starts an empty store: no
 //! operation is claimed exactly-once across one.
 //!
@@ -34,12 +34,20 @@
 //! nothing a retry, a poll or a new key does moves them (SI-07).
 //!
 //! **Time and the world.** Every call takes the injected clock and a
-//! [`World`] (the current epochs, the revisions a scope pins, and which
-//! processes still run), and first brings every operation up to date:
-//! stops what a lock, root exit, epoch or revision change, replaced
-//! recipient or passed deadline ended, starts approved attempts whose
-//! login is free (attempts on one login are serialized), and forgets
-//! receipts past their window. What the daemon has to do in the world
+//! [`World`] (the current epochs, the [`Current`] state of what a scope
+//! took from the world, and which processes still run), and first brings
+//! every operation up to date: ends the authorizations and stops the
+//! operations that a root exit, an epoch change or any change to what
+//! their scope took from the world ended (the project, the login item,
+//! the target and adapter, the limits, the browser, the requesting
+//! instance's place in the root's tree; SPEC §10b "Match" rules 1 to 5 and
+//! "A grant ends on"), or a passed deadline; starts approved attempts
+//! whose account is free (attempts on one account are serialized,
+//! [`SignInScope::shares_account`]); and forgets receipts past their
+//! window. The other ends a grant has are calls: [`OperationStore::lock`]
+//! (a request, sleep, idle, logout or stop) and [`OperationStore::revoke`]
+//! or [`OperationStore::revoke_all`] (`envcloak grants revoke`); a daemon
+//! restart starts an empty store. What the daemon has to do in the world
 //! (start a worker, start a supervisor, tear something down) comes back
 //! from [`OperationStore::drain_effects`].
 
@@ -55,8 +63,8 @@ use crate::authorization::{
     Authorization, AuthorizationId, AuthorizationKind, BudgetError, CreditLease, Deadline,
 };
 use crate::operation::{
-    AttemptFailure, Channel, Checkpoint, Cleanup, Generation, IdentityResponse, Operation, Phase,
-    PublishDecision, RETRY_WINDOW, Refusal, Revisions, Stop, StopReason, SupervisorId, WorkerId,
+    AttemptFailure, Channel, Checkpoint, Cleanup, Current, Generation, IdentityResponse, Operation,
+    Phase, PublishDecision, RETRY_WINDOW, Refusal, Stop, StopReason, SupervisorId, WorkerId,
     publication_decision,
 };
 use crate::scope::{DaemonInstance, Epochs, Instance, SignInScope};
@@ -158,8 +166,12 @@ impl fmt::Debug for OperationKey {
 pub trait World {
     /// The current daemon instance, vault and policy epochs.
     fn epochs(&self) -> Epochs;
-    /// The current values of what `scope` pins.
-    fn revisions(&self, scope: &SignInScope) -> Revisions;
+    /// What `scope` took from the world, as it is now: the project as the
+    /// daemon opens it, the login item, the target and adapter, the limits
+    /// it would resolve, the browser instance's generation, and where the
+    /// requesting instance stands against the scope's root (SPEC §10b
+    /// "Match" rules 3 and 4). See [`Current`].
+    fn current(&self, scope: &SignInScope) -> Current;
     /// Whether `instance` still runs.
     fn alive(&self, instance: &Instance) -> bool;
 }
@@ -283,8 +295,9 @@ pub struct Injection {
 }
 
 /// What the daemon has to do after a call. The two start effects are the
-/// only place a [`WorkerId`] or a [`SupervisorId`] is made: each is handed
-/// out once, here, for the daemon to bind to the process it starts (see
+/// only place a [`WorkerId`] or a [`SupervisorId`] is made (a clone of the
+/// store's included), for the daemon to bind to the process it starts; an
+/// id names a generation and carries no authority beyond that binding (see
 /// [`crate::operation`], "What the store trusts").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Effect {
@@ -464,6 +477,11 @@ impl OperationStore {
             revision: 0,
             shown: None,
         };
+        // Covered only by a `dev` authorization of exactly this scope that
+        // is in force and has a credit left. The settle this call began
+        // with ended every authorization whose root exited or whose scope
+        // the world no longer holds as it was (SPEC §10b "Match" rules 1
+        // to 5), so none of those covers it.
         let epochs = world.epochs();
         let covering = self.auths.values_mut().find(|a| {
             a.kind() == AuthorizationKind::Dev
@@ -636,9 +654,54 @@ impl OperationStore {
         self.finish(now, world);
     }
 
-    /// Brings every operation up to date with `world` at `now`: after a
-    /// root exit, an epoch or revision change, a replaced recipient, and
-    /// on the clock's tick.
+    /// `envcloak grants revoke <id>` for a sign-in authorization (SPEC
+    /// §10b: any client may revoke, and tightening needs no proof): it
+    /// covers no new key and gives no credit again, and every operation
+    /// that holds it stops ([`StopReason::Revoked`]), a delivered session
+    /// included, with its teardown asked for. Every other authorization
+    /// and operation stays as it was. True if it was in force; an id that
+    /// is unknown, ended or past its deadline changes nothing.
+    pub fn revoke(&mut self, id: &AuthorizationId, now: &Now, world: &dyn World) -> bool {
+        self.settle(now, world);
+        let done = self.revoke_settled(id, now, world);
+        self.finish(now, world);
+        done
+    }
+
+    /// `envcloak grants revoke --all`: [`OperationStore::revoke`] for every
+    /// authorization in force. Returns how many it ended.
+    pub fn revoke_all(&mut self, now: &Now, world: &dyn World) -> usize {
+        self.settle(now, world);
+        let ids: Vec<AuthorizationId> = self.auths.keys().copied().collect();
+        let mut n = 0;
+        for id in ids {
+            n += usize::from(self.revoke_settled(&id, now, world));
+        }
+        self.finish(now, world);
+        n
+    }
+
+    fn revoke_settled(&mut self, id: &AuthorizationId, now: &Now, world: &dyn World) -> bool {
+        let epochs = world.epochs();
+        match self.auths.get_mut(id) {
+            Some(a) if a.in_force(&epochs, now) => a.end(),
+            _ => return false,
+        }
+        let holders: Vec<RequestId> = self
+            .ops
+            .values()
+            .filter(|op| op.stop.is_none() && op.authorization == Some(*id))
+            .map(|op| op.request)
+            .collect();
+        for r in holders {
+            self.stop_op(&r, StopReason::Revoked, now);
+        }
+        true
+    }
+
+    /// Brings every operation up to date with `world` at `now`: after any
+    /// change of the world (a root exit, an epoch change, a change to what
+    /// a scope took from it) and on the clock's tick.
     pub fn reconcile(&mut self, now: &Now, world: &dyn World) {
         self.finish(now, world);
     }
@@ -805,7 +868,7 @@ impl OperationStore {
         let at = Checkpoint {
             now: *now,
             epochs: world.epochs(),
-            revisions: world.revisions(&op.scope),
+            current: world.current(&op.scope),
             root_alive: world.alive(&op.owner()),
         };
         let authorization = op.authorization.and_then(|a| self.auths.get(&a));
@@ -983,7 +1046,7 @@ impl OperationStore {
             if !a.ended()
                 && (*s.epochs() != epochs
                     || !world.alive(&s.owner())
-                    || world.revisions(s) != Revisions::of(s))
+                    || !world.current(s).fresh_for(s))
             {
                 a.end();
             }
@@ -1003,14 +1066,16 @@ impl OperationStore {
         self.sweep(now);
     }
 
-    /// Starts approved attempts, oldest first, whose login has no other
+    /// Starts approved attempts, oldest first, whose account has no other
     /// attempt that may still be using its credentials: one running, or
     /// stopped while it ran and not yet confirmed torn down (SPEC §6.8:
     /// attempts on one account are serialised, so a worker that may still
-    /// run never overlaps the next). A failed close is not a confirmation:
-    /// it holds the login until a later report confirms the teardown. A
-    /// captured attempt frees it, since from capture on no credential step
-    /// is permitted for that generation.
+    /// run never overlaps the next). The account is the one the app tells
+    /// apart ([`SignInScope::shares_account`]), so two login items for one
+    /// account wait for each other too. A failed close is not a
+    /// confirmation: it holds the account until a later report confirms
+    /// the teardown. A captured attempt frees it, since from capture on no
+    /// credential step is permitted for that generation.
     fn start_ready(&mut self, now: &Now) {
         let mut ready: Vec<(u64, RequestId)> = self
             .ops
@@ -1020,11 +1085,11 @@ impl OperationStore {
             .collect();
         ready.sort();
         for (_, id) in ready {
-            let Some(login) = self.ops.get(&id).map(|op| op.scope.account().login_item) else {
+            let Some(op) = self.ops.get(&id) else {
                 continue;
             };
             let busy = self.ops.values().any(|o| {
-                o.scope.account().login_item == login
+                o.scope.shares_account(&op.scope)
                     && o.phase == Phase::AttemptRunning
                     && (o.stop.is_none() || o.cleanup != Cleanup::Done)
             });
@@ -1115,16 +1180,8 @@ fn stop_reason(
     if *s.epochs() != *epochs {
         return Some(StopReason::EpochChanged);
     }
-    let current = world.revisions(s);
-    let pinned = Revisions::of(s);
-    if current.login != pinned.login
-        || current.target != pinned.target
-        || current.adapter != pinned.adapter
-    {
-        return Some(StopReason::RevisionChanged);
-    }
-    if current.browser != pinned.browser || !current.requester_alive {
-        return Some(StopReason::RecipientReplaced);
+    if let Some(d) = world.current(s).departure(s) {
+        return Some(d.stop_reason());
     }
     if op.phase == Phase::Requested || op.phase == Phase::PendingApproval {
         return op

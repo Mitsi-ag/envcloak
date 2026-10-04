@@ -16,12 +16,16 @@
 //! generation's supervisor, the requesting client, a sibling `envcloak
 //! mcp` in the same root, another root's client) with status, cancel and
 //! end from another root, the cleanup result (a configuration where a
-//! close fails reports a failure first and a success after it), lock, and
-//! the world's own changes: root exit, an epoch bump, a revision change, a
-//! replaced recipient and a clock tick. Those last five are silent: they
-//! change the world or the clock and nothing calls the store, so the next
-//! call (a worker result, a supervisor message, a driver step) is the
-//! first to see them, as at the daemon's barriers (b9, b17). Two states
+//! close fails reports a failure first and a success after it), lock, a
+//! revocation of slot A's authorization by any client, and the world's
+//! own changes: root exit, an epoch bump, a revision change, a replaced
+//! recipient and a clock tick, or in one configuration root exit, the
+//! requester reparented out of the root's tree, a known agent coming
+//! between them, the project replaced and a clock tick. The world's
+//! changes are silent: they change the world or the clock and nothing
+//! calls the store, so the next call (a worker result, a supervisor
+//! message, a driver step) is the first to see them, as at the daemon's
+//! barriers (b9, b17). Two states
 //! that are equal (the store, the world, the clock and the monitor's
 //! history) have the same futures, so a state already explored with at
 //! least as many events left is not explored again: every ordering is
@@ -35,10 +39,11 @@
 //! - from its own record of times, locks, owners' stops and the world,
 //!   that nothing goes on that must have stopped (the store brought up to
 //!   date is checked after every event, the silent ones included): a
-//!   cancel, end or lock, a root exit, an epoch, revision or recipient
-//!   change, a statement's expiry, the authorization's end or window (a
-//!   delivered session included), the attempt's timeout, the session's
-//!   lifetime;
+//!   cancel, end, lock or revocation, a root exit, an epoch, project,
+//!   revision or recipient change, a requester no longer covered by a
+//!   grant rooted at its root (SPEC §10b "Match" rules 3 and 4), a
+//!   statement's expiry, the authorization's end or window (a delivered
+//!   session included), the attempt's timeout, the session's lifetime;
 //! - declared state, the decision, publication and the per-call check go
 //!   only to the generation's supervisor, each only in its own phase (the
 //!   supervisor's own messages out of turn are refused too), and every
@@ -52,15 +57,17 @@
 //! - a password or code step is permitted only for an attempt running at
 //!   that call: one password and two codes per attempt, no more attempts
 //!   than credits approved, a `once` authorization at most one attempt;
-//! - two attempts on one login never overlap: an attempt holds its login
-//!   from its start until it captured or its teardown was confirmed (a
-//!   failed close is not a confirmation);
+//! - two attempts on one account never overlap, whatever login items name
+//!   it: an attempt holds its account from its start until it captured or
+//!   its teardown was confirmed (a failed close is not a confirmation);
+//! - a revocation stops exactly the operations its authorization covers
+//!   and leaves every other authorization in force;
 //! - nothing is published or injected after a stop, and each authorization
 //!   ends at its window measured from its approval, never later, whatever
 //!   retries, polls and new keys do; no deadline or `retry_until` moves;
 //!   remaining credits never grow;
-//! - no new key is covered by an authorization that a lock, its window or
-//!   the world ended;
+//! - no new key is covered by an authorization that a lock, a revocation,
+//!   its window or the world ended;
 //! - the same key and scope give the same operation and change nothing; a
 //!   changed field gives `request_conflict` and changes nothing; another
 //!   root's key is never this root's;
@@ -88,15 +95,14 @@ use std::time::{Duration, SystemTime};
 use common::{
     MCP, OTHER_MCP, OTHER_ROOT, ROOT, SIBLING, Spec, TestWorld, Vary, at, scope, variations, varied,
 };
-use envcloak_core::vault::ItemId;
 use envcloak_policy::Now;
 use envcloak_signin::store::STATEMENT_TTL;
 use envcloak_signin::{
-    ApproveError, AttemptFailure, AuthorizationId, Channel, Cleanup, CreditLease, Deadline, Effect,
-    Fresh, Generation, IdentityResponse, Instance, Lookup, Nonce, NotFound, Operation,
-    OperationKey, OperationStore, Options, Phase, PublishDecision, RETRY_WINDOW, Request,
-    RequestError, RequestId, Revisions, SignInScope, State, Status, Step, StopReason, StoreLimits,
-    SupervisorId, WorkerId, World,
+    ApproveError, AttemptFailure, AuthorizationId, Channel, Cleanup, CreditLease, Current,
+    Deadline, Effect, Fresh, Generation, IdentityResponse, Instance, Lookup, Nonce, NotFound,
+    Operation, OperationKey, OperationStore, Options, Phase, PublishDecision, RETRY_WINDOW,
+    Request, RequestError, RequestId, Requester, SignInScope, State, Status, Step, StopReason,
+    StoreLimits, SupervisorId, WorkerId, World,
 };
 
 /// Events per ordering.
@@ -120,14 +126,42 @@ enum Ev {
     Foreign(usize),
     Cleanup(usize),
     Lock,
+    /// Any client revokes the authorization slot A's operation holds.
+    Revoke,
     RootExit,
     EpochBump,
     RevisionChange,
     RecipientReplaced,
+    /// The process between the root and the requesting instance exits,
+    /// and the requesting instance is reparented out of the root's tree.
+    LeaveRoot,
+    /// That process starts a known agent's executable.
+    AgentBetween,
+    /// The project's directory is replaced: another inode at its path.
+    ProjectReplaced,
     Tick,
 }
 
-fn events() -> Vec<Ev> {
+/// The world's changes most configurations make.
+const WORLD: &[Ev] = &[
+    Ev::RootExit,
+    Ev::EpochBump,
+    Ev::RevisionChange,
+    Ev::RecipientReplaced,
+    Ev::Tick,
+];
+
+/// The world's changes of the subject and the project (SPEC §10b "Match"
+/// rules 3 to 5).
+const SUBJECT_AND_PROJECT: &[Ev] = &[
+    Ev::RootExit,
+    Ev::LeaveRoot,
+    Ev::AgentBetween,
+    Ev::ProjectReplaced,
+    Ev::Tick,
+];
+
+fn events(cfg: &Config) -> Vec<Ev> {
     let mut v = Vec::new();
     for o in 0..2 {
         v.extend([
@@ -146,14 +180,8 @@ fn events() -> Vec<Ev> {
             Ev::Cleanup(o),
         ]);
     }
-    v.extend([
-        Ev::Lock,
-        Ev::RootExit,
-        Ev::EpochBump,
-        Ev::RevisionChange,
-        Ev::RecipientReplaced,
-        Ev::Tick,
-    ]);
+    v.extend([Ev::Lock, Ev::Revoke]);
+    v.extend_from_slice(cfg.world);
     v
 }
 
@@ -181,6 +209,8 @@ struct Config {
     limits: StoreLimits,
     /// A cleanup result reports a failed close first, then a confirmed one.
     close_fails: bool,
+    /// The world's changes.
+    world: &'static [Ev],
 }
 
 impl Config {
@@ -206,7 +236,7 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Seen {
     slot: usize,
-    login: ItemId,
+    scope: SignInScope,
     status: Status,
     /// The digest of the statement the slot was shown when it opened, if
     /// it waited for a proof.
@@ -224,7 +254,7 @@ struct Seen {
     passwords: u8,
     codes: u8,
     injections: u8,
-    /// Its attempt may still use the login: started, and neither
+    /// Its attempt may still use the account: started, and neither
     /// captured nor confirmed torn down.
     holds_login: bool,
     teardown_asked: bool,
@@ -251,6 +281,8 @@ struct AuthSeen {
     credits: u8,
     /// A lock came after its approval.
     locked: bool,
+    /// It was revoked.
+    revoked: bool,
     /// Attempts started under it.
     started: u8,
     /// Remaining credits and deadline the store last showed.
@@ -300,8 +332,19 @@ struct Reached {
     /// cover across slots is possible.
     coverable_across: usize,
     /// A new key not covered because a lock ended the authorization that
-    /// would have covered it.
+    /// would have covered it, or a revocation did.
     not_covered_after_lock: usize,
+    not_covered_after_revoke: usize,
+    /// Revocations, and those that left another authorization in force.
+    revocations: usize,
+    revoked_others_kept: usize,
+    /// An approved attempt kept waiting while another login item's attempt
+    /// on the same account held it.
+    waited_for_other_item: usize,
+    /// Operations stopped because their requester left the root's tree or
+    /// an agent came between, or their project was replaced.
+    subject_stops: usize,
+    project_stops: usize,
     published: usize,
     refused_publication: usize,
     stopped_before_publication: usize,
@@ -402,12 +445,23 @@ fn must_stop(x: &Operation, mon: &Monitor, world: &TestWorld, t: u64) -> Option<
     if world.epochs != *s.epochs() {
         return Some("after an epoch change");
     }
-    let (now, pinned) = (world.revisions(s), Revisions::of(s));
-    if (now.login, now.target, now.adapter) != (pinned.login, pinned.target, pinned.adapter) {
+    if world.project != *s.project() {
+        return Some("after its project was replaced");
+    }
+    if (world.login, world.target, world.adapter)
+        != (
+            s.account().authorization_revision,
+            s.target().revision,
+            s.target().adapter_revision,
+        )
+    {
         return Some("after a revision change");
     }
-    if now.browser != pinned.browser || !now.requester_alive {
+    if world.browser != s.delivery().browser || world.exited.contains(&s.delivery().requester) {
         return Some("after its recipient was replaced");
+    }
+    if world.current(s).requester != Requester::Covered {
+        return Some("after its requester left the root's tree or an agent came between");
     }
     if matches!(x.phase(), Phase::Requested | Phase::PendingApproval) {
         return (t >= seen.opened + STATEMENT_TTL.as_secs())
@@ -418,6 +472,9 @@ fn must_stop(x: &Operation, mon: &Monitor, world: &TestWorld, t: u64) -> Option<
     };
     if a.locked {
         return Some("after a lock ended its authorization");
+    }
+    if a.revoked {
+        return Some("after its authorization was revoked");
     }
     if t >= a.approved + a.window {
         return Some("after its authorization's window");
@@ -534,6 +591,7 @@ fn step(
                             window,
                             credits: cfg.credits(),
                             locked: false,
+                            revoked: false,
                             started: 0,
                             remaining: cfg.credits(),
                             deadline: Deadline::after(&now, Duration::from_secs(window)),
@@ -782,11 +840,34 @@ fn step(
                 a.locked = true;
             }
         }
+        Ev::Revoke => {
+            let Some(a) = known(0).and_then(Operation::authorization) else {
+                return Ok(None);
+            };
+            revoke(node, &mut sim, a, &now, reached)?;
+        }
         Ev::RootExit => {
             store_call = false;
             if !sim.world.exited.insert(ROOT) {
                 return Ok(None);
             }
+        }
+        Ev::LeaveRoot => {
+            store_call = false;
+            if sim.world.exited.contains(&common::SHELL) {
+                return Ok(None);
+            }
+            sim.world.leave_root();
+        }
+        Ev::AgentBetween => {
+            store_call = false;
+            if !sim.world.agents.insert(common::SHELL) {
+                return Ok(None);
+            }
+        }
+        Ev::ProjectReplaced => {
+            store_call = false;
+            sim.world.project.ino += 1;
         }
         Ev::EpochBump => {
             store_call = false;
@@ -827,6 +908,66 @@ fn step(
     }))
 }
 
+/// Any client revokes authorization `a`: taken exactly when the store
+/// brought up to date has it in force; it then stops exactly the
+/// operations that hold it, each `revoked`, and every other authorization
+/// in force stays so. Otherwise nothing changes.
+fn revoke(
+    node: &Node,
+    sim: &mut Sim,
+    a: AuthorizationId,
+    now: &Now,
+    reached: &mut Reached,
+) -> Result<(), Violation> {
+    let base = &node.base;
+    let epochs = sim.world.epochs;
+    let in_force = base
+        .authorization(&a)
+        .is_some_and(|x| x.in_force(&epochs, now));
+    let others: Vec<AuthorizationId> = base
+        .authorizations()
+        .filter(|x| x.id() != a && x.in_force(&epochs, now))
+        .map(|x| x.id())
+        .collect();
+    let world = sim.world.clone();
+    match (in_force, sim.store.revoke(&a, now, &world)) {
+        (false, false) => return unchanged(node, sim, "a revocation of nothing in force"),
+        (true, true) => {}
+        (f, got) => return Err(format!("a revocation gave {got} where in force={f}")),
+    }
+    for x in base.operations().filter(|x| x.stop().is_none()) {
+        let after = sim.store.operation(&x.request()).and_then(Operation::stop);
+        let holds = x.authorization() == Some(a);
+        match after {
+            Some(st) if holds && st.reason == StopReason::Revoked => {}
+            None if !holds => {}
+            got => {
+                return Err(format!(
+                    "{:?} (holds the revoked authorization: {holds}) stopped as {got:?}",
+                    x.request()
+                ));
+            }
+        }
+    }
+    for o in &others {
+        if !sim
+            .store
+            .authorization(o)
+            .is_some_and(|x| x.in_force(&epochs, now))
+        {
+            return Err(format!("revoking {a:?} ended {o:?}"));
+        }
+    }
+    sim.mon
+        .auths
+        .get_mut(&a)
+        .ok_or("a revoked authorization the monitor never saw approved")?
+        .revoked = true;
+    reached.revocations += 1;
+    reached.revoked_others_kept += usize::from(!others.is_empty());
+    Ok(())
+}
+
 /// A request that opened slot `o`'s operation.
 fn reserved(
     cfg: &Config,
@@ -859,10 +1000,11 @@ fn reserved(
     if node.sim.mon.auths.values().any(|a| {
         a.slot != o
             && !a.locked
+            && !a.revoked
             && t_of(node) < a.approved + a.window
             && a.remaining > 0
             && world.epochs == *a.scope.epochs()
-            && world.revisions(&a.scope) == Revisions::of(&a.scope)
+            && world.current(&a.scope) == Current::of(&a.scope)
             && world.alive(&a.scope.owner())
     }) {
         reached.coverable_across += 1;
@@ -882,6 +1024,16 @@ fn reserved(
             if seen.locked {
                 return Err("a new key covered by an authorization a lock ended".into());
             }
+            if seen.revoked {
+                return Err("a new key covered by a revoked authorization".into());
+            }
+            let w = &node.sim.world;
+            if w.epochs != *seen.scope.epochs()
+                || !w.alive(&seen.scope.owner())
+                || w.current(&seen.scope) != Current::of(&seen.scope)
+            {
+                return Err("a new key covered by an authorization the world ended".into());
+            }
             if t >= seen.approved + seen.window {
                 return Err("a new key covered after its authorization's window".into());
             }
@@ -897,14 +1049,14 @@ fn reserved(
         None => {
             // An authorization for this exact scope that would cover it
             // but for a lock.
-            if node
-                .sim
-                .mon
-                .auths
-                .values()
-                .any(|a| a.locked && a.scope == *sc && t < a.approved + a.window && a.remaining > 0)
-            {
+            let would =
+                |a: &AuthSeen| a.scope == *sc && t < a.approved + a.window && a.remaining > 0;
+            let auths = &node.sim.mon.auths;
+            if auths.values().any(|a| a.locked && would(a)) {
                 reached.not_covered_after_lock += 1;
+            }
+            if auths.values().any(|a| a.revoked && !a.locked && would(a)) {
+                reached.not_covered_after_revoke += 1;
             }
         }
     }
@@ -912,7 +1064,7 @@ fn reserved(
         st.request,
         Seen {
             slot: o,
-            login: sc.account().login_item,
+            scope: sc.clone(),
             status: st,
             shown,
             opened: t,
@@ -938,6 +1090,20 @@ fn reserved(
         },
     );
     Ok(())
+}
+
+/// Whether two scopes name one account at the app, read apart from the
+/// store: the same login item, or the same account name in any ASCII case
+/// at the same target or at a credential-entry origin both name.
+fn one_account(a: &SignInScope, b: &SignInScope) -> bool {
+    let name = |s: &SignInScope| s.account().account.as_str().to_ascii_lowercase();
+    a.account().login_item == b.account().login_item
+        || (name(a) == name(b)
+            && (a.target().id == b.target().id
+                || a.target()
+                    .entry_origins
+                    .iter()
+                    .any(|o| b.target().entry_origins.iter().any(|p| p == o))))
 }
 
 /// The identity the fixture app names for `scope`: exactly the expected
@@ -1183,11 +1349,11 @@ fn check(
                 {
                     return Err("an attempt started for a stopped operation".into());
                 }
-                let login = sim.mon.ops.get(request).ok_or("an unseen attempt")?.login;
+                let mine = &sim.mon.ops.get(request).ok_or("an unseen attempt")?.scope;
                 for (other, seen) in &sim.mon.ops {
-                    if other != request && seen.login == login && seen.holds_login {
+                    if other != request && one_account(&seen.scope, mine) && seen.holds_login {
                         return Err(format!(
-                            "{request:?} started while {other:?} may still use the login"
+                            "{request:?} started while {other:?} may still use the account"
                         ));
                     }
                 }
@@ -1219,6 +1385,20 @@ fn check(
                 let seen = sim.mon.ops.get_mut(request).ok_or("an unseen supervisor")?;
                 seen.supervisor = Some(*supervisor);
             }
+        }
+    }
+    // An approved attempt waiting on another login item's attempt on the
+    // same account.
+    for x in sim.store.operations() {
+        if x.stop().is_none()
+            && x.phase() == Phase::Approved
+            && sim.mon.ops.values().any(|seen| {
+                seen.holds_login
+                    && seen.scope.account().login_item != x.scope().account().login_item
+                    && one_account(&seen.scope, x.scope())
+            })
+        {
+            reached.waited_for_other_item += 1;
         }
     }
     // No eviction: an operation goes only once its retry window passed
@@ -1304,6 +1484,10 @@ fn check(
             return Err(format!("{id:?} was published after it stopped"));
         }
         if let Some(stop) = x.stop() {
+            if seen.status.receipt.reason.is_none() {
+                reached.subject_stops += usize::from(stop.reason == StopReason::SubjectIneligible);
+                reached.project_stops += usize::from(stop.reason == StopReason::ProjectChanged);
+            }
             if seen.status.receipt.reason.is_none() && stop.reason == StopReason::AuthorizationEnded
             {
                 if matches!(x.phase(), Phase::AttemptRunning | Phase::Captured) {
@@ -1433,7 +1617,7 @@ fn start(cfg: &Config) -> Node {
 }
 
 fn explore(cfg: &Config, depth: usize) -> Reached {
-    let events = events();
+    let events = events(cfg);
     let mut visited: HashMap<u128, usize> = HashMap::new();
     let mut reached = Reached::default();
     let empty = start(cfg);
@@ -1562,11 +1746,59 @@ fn new_keys_share_a_dev_budget_without_growing_it() {
         options: dev(2),
         limits: StoreLimits::default(),
         close_fails: false,
+        world: WORLD,
     });
     assert!(r.covered_across > 0);
     assert!(r.not_covered_after_lock > 0);
+    assert!(r.not_covered_after_revoke > 0);
+    assert!(r.revocations > 0);
     assert!(r.authorization_ran_out > 0);
     assert!(r.session_authorization_ended > 0);
+}
+
+/// The world's changes of the subject and the project, seen at every call
+/// (SPEC §10b "Match" rules 3 to 5, which a sign-in keeps): the requesting
+/// instance reparented out of the root's tree, a known agent coming
+/// between them, and the project replaced, each with no call after it,
+/// stop every operation of that scope at the next call, a delivered
+/// session included, and end its authorization. Mutations: "the store
+/// reads only whether the requester runs", "the project left out of the
+/// freshness check".
+#[test]
+fn the_subject_and_the_project_are_checked_at_every_call() {
+    let r = run(Config {
+        name: "subject and project",
+        slots: [
+            slot("a", ROOT, MCP, "editor"),
+            slot("b", ROOT, MCP, "editor"),
+        ],
+        options: dev(2),
+        limits: StoreLimits::default(),
+        close_fails: false,
+        world: SUBJECT_AND_PROJECT,
+    });
+    assert!(r.subject_stops > 0 && r.project_stops > 0, "{r:?}");
+    assert!(r.covered_across > 0);
+}
+
+/// Two login items for one account (the same account, tenant and target,
+/// another item id): each needs its own proof, and their attempts never
+/// overlap (SPEC §6.8 "Attempts on one account are serialised").
+/// Mutation: "attempts serialized per login item".
+#[test]
+fn two_items_for_one_account_never_overlap() {
+    let mut b = slot("b", ROOT, MCP, "editor");
+    b.spec.vary = Some(Vary::Field(7));
+    let r = run(Config {
+        name: "two items, one account",
+        slots: [slot("a", ROOT, MCP, "editor"), b],
+        options: dev(2),
+        limits: StoreLimits::default(),
+        close_fails: false,
+        world: WORLD,
+    });
+    assert_eq!(r.covered_across, 0);
+    assert!(r.waited_for_other_item > 0, "{r:?}");
 }
 
 /// A budget of one: the second key asks for a proof; a failed close keeps
@@ -1583,6 +1815,7 @@ fn a_spent_dev_budget_covers_nothing_and_a_failed_close_holds_the_login() {
         options: dev(1),
         limits: StoreLimits::default(),
         close_fails: true,
+        world: WORLD,
     });
     assert_eq!(r.covered_across, 0);
     assert!(r.cleanup_failed > 0);
@@ -1603,6 +1836,7 @@ fn once_requests_yield_at_most_one_attempt_each() {
         options: Options::Once,
         limits: StoreLimits::default(),
         close_fails: false,
+        world: WORLD,
     });
     assert_eq!(r.covered_across, 0);
 }
@@ -1620,6 +1854,7 @@ fn a_sibling_instance_is_another_recipient() {
         options: dev(2),
         limits: StoreLimits::default(),
         close_fails: false,
+        world: WORLD,
     });
     assert_eq!(r.covered_across, 0);
 }
@@ -1637,8 +1872,10 @@ fn another_role_never_uses_an_earlier_authorization() {
         options: dev(2),
         limits: StoreLimits::default(),
         close_fails: false,
+        world: WORLD,
     });
     assert_eq!(r.covered_across, 0);
+    assert!(r.revoked_others_kept > 0, "{r:?}");
 }
 
 /// The same key in another root is that root's own operation.
@@ -1653,6 +1890,7 @@ fn the_same_key_in_another_root_is_another_operation() {
         options: dev(2),
         limits: StoreLimits::default(),
         close_fails: false,
+        world: WORLD,
     });
     assert!(r.other_root_own_operation > 0);
     assert_eq!(r.covered_across, 0);
@@ -1675,6 +1913,7 @@ fn a_full_store_refuses_rather_than_evicting() {
             authorizations: 1,
         },
         close_fails: false,
+        world: WORLD,
     });
     assert!(r.full > 0);
 }
@@ -1708,6 +1947,7 @@ fn every_scope_part_is_its_own_scope_under_every_ordering() {
             options: dev(2),
             limits: StoreLimits::default(),
             close_fails: false,
+            world: WORLD,
         }
     };
     let control = explore(&config("isolation control", None), ISOLATION_DEPTH);
