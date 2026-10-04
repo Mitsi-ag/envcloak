@@ -289,8 +289,161 @@ pub struct CleanupInspection {
     pub uninspected: Vec<PathBuf>,
 }
 
-/// The state file's format version.
-pub const STATE_VERSION: u32 = 1;
+/// The state file's format version. 2: Claude Code's MCP registration
+/// is the record of its `.claude.json` ([`Edit::JsonMember`]). Format 1,
+/// which the earlier builds of this change wrote with the registrations
+/// apart (`mcp`, `mcp_intent`: registered through `claude mcp add-json`),
+/// is read and moved to 2 when the state is opened ([`LegacyState`]; Codex
+/// F-125: those states were refused as unreadable, and the installation
+/// they record could no longer be managed). Any other version is refused.
+pub const STATE_VERSION: u32 = 2;
+
+/// The state as format 1 kept it: [`State`]'s fields and the MCP
+/// registrations apart.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyState {
+    /// 1, read by [`decode_state`] before this is.
+    #[allow(dead_code)]
+    version: u32,
+    files: BTreeMap<String, FileRecord>,
+    #[serde(default)]
+    mcp: BTreeMap<String, LegacyMcp>,
+    #[serde(default)]
+    mcp_intent: BTreeMap<String, LegacyMcp>,
+    #[serde(default)]
+    written: BTreeMap<String, Stamp>,
+    #[serde(default)]
+    leftovers: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    dirs: BTreeMap<String, DirRecord>,
+}
+
+/// A registration format 1 made through Claude Code's command line, by
+/// the resolved path of its `.claude.json`: EnvCloak's entry, the
+/// `CLAUDE_CONFIG_DIR` it was made under (the key names the file now, so
+/// it is not needed), and, when the command created the file, what it
+/// held right after.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyMcp {
+    host: String,
+    entry: Value,
+    #[allow(dead_code)]
+    config_dir: Option<String>,
+    created: Option<LegacyCreated>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCreated {
+    sha256: String,
+    stamp: Option<Stamp>,
+}
+
+impl LegacyState {
+    /// The same state in format 2. Each registration becomes, or joins,
+    /// its file's record as the edit EnvCloak now makes itself
+    /// (`mcpServers.envcloak` holding the entry), so it is EnvCloak's
+    /// while it holds what EnvCloak registered, as format 1 had it: a
+    /// pending one (`mcp_intent`) too, which format 1 adopted when the
+    /// next run found the entry there, and a completed one wins over it.
+    /// A file the command created is removed by an undo while it is still
+    /// exactly what the command left (a record of one inserted run, the
+    /// whole file, over an empty one), and otherwise has the entry taken
+    /// out by structure; one whose size was not recorded is undone by
+    /// structure only. No text of any file is read or kept.
+    fn migrate(self) -> State {
+        let mut state = State {
+            version: STATE_VERSION,
+            files: self.files,
+            written: self.written,
+            leftovers: self.leftovers,
+            dirs: self.dirs,
+        };
+        let mut registrations = self.mcp;
+        for (k, r) in self.mcp_intent {
+            registrations.entry(k).or_insert(r);
+        }
+        for (k, r) in registrations {
+            let edit = Edit::JsonMember {
+                path: vec![crate::hosts::claude::MCP_SERVERS.to_owned()],
+                key: crate::hosts::claude::SERVER.to_owned(),
+                value: r.entry,
+                created: usize::from(r.created.is_some()),
+            };
+            if let Some(rec) = state.files.get_mut(&k) {
+                if !rec.edits.contains(&edit) {
+                    rec.edits.push(edit);
+                }
+                rec.journal = None;
+                rec.host_owned = true;
+                continue;
+            }
+            let whole = |c: &LegacyCreated| {
+                let size = usize::try_from(c.stamp?.size).ok()?;
+                Some(vec![vec![Hunk {
+                    at: 0,
+                    len: size,
+                    ws: String::new(),
+                }]])
+            };
+            let (created, pre, post, stamp, journal) = match r.created {
+                Some(c) => {
+                    let journal = whole(&c);
+                    let pre = if journal.is_some() {
+                        sha256_hex(b"")
+                    } else {
+                        String::new()
+                    };
+                    (true, pre, c.sha256, c.stamp, journal)
+                }
+                None => (false, String::new(), String::new(), None, None),
+            };
+            state.files.insert(
+                k,
+                FileRecord {
+                    host: r.host,
+                    scope: "global".to_owned(),
+                    host_owned: true,
+                    created,
+                    pre_sha256: pre,
+                    post_sha256: post,
+                    stamp,
+                    journal,
+                    edits: vec![edit],
+                    intent: None,
+                },
+            );
+        }
+        state
+    }
+}
+
+/// The state in `bytes`, of this format or format 1 ([`LegacyState`]).
+fn decode_state(bytes: &[u8]) -> Result<State, Refusal> {
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let unreadable = || {
+        Refusal::new(
+            "state_unreadable",
+            "EnvCloak's agent state file is not one this build reads",
+        )
+    };
+    let v: Version = serde_json::from_slice(bytes).map_err(|_| unreadable())?;
+    match v.version {
+        STATE_VERSION => serde_json::from_slice::<State>(bytes).map_err(|_| unreadable()),
+        1 => serde_json::from_slice::<LegacyState>(bytes)
+            .map(LegacyState::migrate)
+            .map_err(|_| unreadable()),
+        _ => Err(Refusal::new(
+            "state_unreadable",
+            "EnvCloak's agent state file is of another version",
+        )),
+    }
+}
 
 /// Where the state is saved as a run goes: before each file is changed,
 /// and again once it is.
@@ -356,21 +509,7 @@ impl StateFile {
         }
         sweep_state_saves(&root, &dir);
         let (state, stamp) = match read_plain(&root, Path::new(STATE_NAME), MAX_STATE) {
-            Ok((bytes, stamp)) => {
-                let state: State = serde_json::from_slice(&bytes).map_err(|_| {
-                    Refusal::new(
-                        "state_unreadable",
-                        "EnvCloak's agent state file is not one this build reads",
-                    )
-                })?;
-                if state.version != STATE_VERSION {
-                    return Err(Refusal::new(
-                        "state_unreadable",
-                        "EnvCloak's agent state file is of another version",
-                    ));
-                }
-                (state, Some(stamp))
-            }
+            Ok((bytes, stamp)) => (decode_state(&bytes)?, Some(stamp)),
             Err(e) if e.kind == ScanErrorKind::NotFound => (
                 State {
                     version: STATE_VERSION,
