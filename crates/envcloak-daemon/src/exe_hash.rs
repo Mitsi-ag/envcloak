@@ -15,9 +15,16 @@
 //! rewrite moves the change time, even when the size and the modification
 //! time are put back, and a rename over the path gives another inode. A
 //! cache, unlike a store of decisions, may forget: an entry pushed out is
-//! hashed again when next needed. Three rules keep a digest from outliving
+//! hashed again when next needed. Four rules keep a digest from outliving
 //! the bytes it was taken from:
 //!
+//! - A file whose last change is less than [`SETTLE`] before the lookup
+//!   began has no digest ([`HashError::Unsettled`]), and is not read. A
+//!   file system stamps every change within one tick of its clock with the
+//!   same time (a millisecond or a few on Linux, a second on HFS+, two on
+//!   FAT), so a write in that tick could leave the key as it was; once the
+//!   clock has moved past the file's last change, every write moves it, so
+//!   a key read again later, equal, shows the file unwritten since.
 //! - The key is read again after hashing: a file that changed while it was
 //!   read ([`HashError::Changed`]) has no identity for that request, and
 //!   nothing is cached.
@@ -25,12 +32,11 @@
 //!   after the digest was found, is the one it is cached under: a key read
 //!   before the file changed finds the digest of what the file held, and
 //!   gets [`HashError::Changed`] instead.
-//! - A file whose last change is less than [`SETTLE`] before the hashing
-//!   began is hashed for that request but not cached. A file system stamps
-//!   every change within one tick of its clock with the same time (a
-//!   millisecond or a few on Linux, a second on HFS+, two on FAT), so a
-//!   write in that tick could leave the key as it was; once the clock has
-//!   moved past the file's last change, every write moves it.
+//! - The digest goes to the walk with the key it describes
+//!   ([`envcloak_policy::ExeDigest`]), and the walk reads each hashed
+//!   file's key again ([`RequestHasher`]'s `key`) once the chain is read
+//!   again: a file written after it was hashed, in place (the same inode),
+//!   makes the walk start over (`envcloak_policy::gather_in_hashed`).
 //!
 //! Hashing runs outside the state lock, and outside the cache's own lock
 //! (two requests may hash the same file at once; each gets the digest).
@@ -39,7 +45,8 @@
 //! either, the executable's identity is unknown for that request. An
 //! unknown identity never changes a classification (the walk's root, kind,
 //! labels and proof refusals do not depend on it), and no standing
-//! approval can name it (M2 plan D-10).
+//! approval can name it (M2 plan D-10). An agent updated less than
+//! [`SETTLE`] before a request has no identity for that request.
 //!
 //! macOS: [`envcloak_sys::open_exe`] is unsupported and the walk reads no
 //! device and inode there, so nothing is hashed; the code signature's
@@ -52,7 +59,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use envcloak_policy::ExeHasher;
+use envcloak_policy::{ExeDigest, ExeHasher};
 use envcloak_sys::{FileKey, ProcInfo};
 use sha2::{Digest, Sha256};
 
@@ -64,8 +71,8 @@ pub(crate) const CACHE_ENTRIES: usize = 256;
 pub(crate) const MAX_HASHED: u64 = 512 * 1024 * 1024;
 /// The bytes one request may hash that are not already cached.
 pub(crate) const REQUEST_BUDGET: u64 = 1024 * 1024 * 1024;
-/// How long before the hashing began a file must have last changed for
-/// its digest to be cached (see the module documentation).
+/// How long before a lookup began a file must have last changed for it to
+/// have a digest (see the module documentation).
 pub(crate) const SETTLE: Duration = Duration::from_secs(2);
 /// The read size.
 const CHUNK: usize = 64 * 1024;
@@ -80,6 +87,9 @@ pub(crate) enum HashError {
     /// The file changed while it was read: its key after the read differs,
     /// or it ended before or ran past its size.
     Changed,
+    /// The file changed less than the settle time before the lookup began
+    /// ([`SETTLE`]): its key could stay the same through a later write.
+    Unsettled,
     /// A read failed.
     Io(io::ErrorKind),
 }
@@ -134,8 +144,8 @@ impl ExeHashCache {
     }
 
     /// A cache of `capacity` digests that hashes no file larger than
-    /// `max_size` and caches none changed less than `settle` before its
-    /// hashing began.
+    /// `max_size` and gives no digest for one changed less than `settle`
+    /// before the lookup began.
     pub(crate) fn with_limits(capacity: usize, max_size: u64, settle: Duration) -> Self {
         ExeHashCache {
             inner: Mutex::new(Inner::default()),
@@ -148,12 +158,15 @@ impl ExeHashCache {
     /// The SHA-256 of the open file `file`, whose key (`FileKey::of`) the
     /// caller read as `key`: from the cache when a digest for `key` is
     /// there and `file` still has that key, otherwise read from `file`,
-    /// within `budget`, its key read again afterwards. Either way the
-    /// digest is returned only for a file whose key, read after the digest
-    /// was found, is `key`: a key the caller read before the file changed
-    /// never answers with the digest of what it held.
+    /// within `budget`, its key read again afterwards, and cached. Either
+    /// way the digest is returned only for a file whose key, read after the
+    /// digest was found, is `key`: a key the caller read before the file
+    /// changed never answers with the digest of what it held. A file that
+    /// changed less than the settle time before the lookup began has none.
     ///
     /// # Errors
+    /// [`HashError::Unsettled`] for a file changed less than the settle
+    /// time before (and then nothing is read or taken),
     /// [`HashError::TooLarge`] above the largest size,
     /// [`HashError::OverBudget`] when `budget` has less left than the
     /// file's size (and then takes nothing), [`HashError::Changed`] when
@@ -165,6 +178,9 @@ impl ExeHashCache {
         key: &FileKey,
         budget: &mut HashBudget,
     ) -> Result<[u8; 32], HashError> {
+        if !settled(key, SystemTime::now(), self.settle) {
+            return Err(HashError::Unsettled);
+        }
         let cached = {
             let mut inner = locked(&self.inner);
             inner.lookups += 1;
@@ -188,7 +204,6 @@ impl ExeHashCache {
             return Err(HashError::TooLarge);
         }
         budget.take(key.size)?;
-        let began = SystemTime::now();
         let digest = hash_exactly(file, key.size)?;
         let after = FileKey::of(file).map_err(|e| HashError::Io(e.kind()))?;
         if after != *key {
@@ -196,26 +211,24 @@ impl ExeHashCache {
         }
         let mut inner = locked(&self.inner);
         inner.hashed = inner.hashed.saturating_add(key.size);
-        if settled(key, began, self.settle) {
-            if inner.entries.len() >= self.capacity {
-                let oldest = inner
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.used)
-                    .map(|(k, _)| *k);
-                if let Some(k) = oldest {
-                    inner.entries.remove(&k);
-                }
+        if inner.entries.len() >= self.capacity {
+            let oldest = inner
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                inner.entries.remove(&k);
             }
-            let used = inner.lookups;
-            inner.entries.insert(
-                *key,
-                Entry {
-                    sha256: digest,
-                    used,
-                },
-            );
         }
+        let used = inner.lookups;
+        inner.entries.insert(
+            *key,
+            Entry {
+                sha256: digest,
+                used,
+            },
+        );
         Ok(digest)
     }
 
@@ -269,20 +282,30 @@ fn hash_exactly(file: &File, size: u64) -> Result<[u8; 32], HashError> {
 }
 
 /// The digest of the file process `p` runs, if it is the file the walk
-/// saw: opened through `/proc/<pid>/exe`, its device and inode compared
-/// with those the walk read. `None` otherwise, and on macOS.
+/// saw, with the key it describes: opened through `/proc/<pid>/exe`, its
+/// device and inode compared with those the walk read. `None` otherwise,
+/// and on macOS.
 pub(crate) fn exe_sha256(
     cache: &ExeHashCache,
     p: &ProcInfo,
     budget: &mut HashBudget,
-) -> Option<[u8; 32]> {
+) -> Option<ExeDigest> {
     let walked = p.exe.as_ref()?.file?;
     let file = envcloak_sys::open_exe(p.pid).ok()?;
     let key = FileKey::of(&file).ok()?;
     if (key.dev, key.ino) != walked {
         return None;
     }
-    cache.lookup(&file, &key, budget).ok()
+    let sha256 = cache.lookup(&file, &key, budget).ok()?;
+    Some(ExeDigest { sha256, key })
+}
+
+/// The key of the file process `p` runs now, through a new descriptor
+/// opened from `/proc/<pid>/exe`. `None` when it cannot be opened (the
+/// process exited or is no longer dumpable), and on macOS.
+pub(crate) fn exe_key(p: &ProcInfo) -> Option<FileKey> {
+    let file = envcloak_sys::open_exe(p.pid).ok()?;
+    FileKey::of(&file).ok()
 }
 
 /// One request's hashing: the daemon's cache, and the request's budget.
@@ -306,8 +329,12 @@ impl<'a> RequestHasher<'a> {
 }
 
 impl ExeHasher for RequestHasher<'_> {
-    fn sha256(&mut self, p: &ProcInfo) -> Option<[u8; 32]> {
+    fn sha256(&mut self, p: &ProcInfo) -> Option<ExeDigest> {
         exe_sha256(self.cache, p, &mut self.budget)
+    }
+
+    fn key(&mut self, p: &ProcInfo) -> Option<FileKey> {
+        exe_key(p)
     }
 }
 
@@ -364,7 +391,9 @@ mod tests {
         envcloak_sys::wait_for_clock_past(&d, k.ctime, Duration::from_secs(5)).unwrap();
     }
 
-    fn unsettled() -> ExeHashCache {
+    /// A cache that takes every file as settled: the tests' files were
+    /// written just now.
+    pub(crate) fn settled_at_once() -> ExeHashCache {
         ExeHashCache::with_limits(CACHE_ENTRIES, MAX_HASHED, Duration::ZERO)
     }
 
@@ -384,7 +413,7 @@ mod tests {
         let p = d.path().join("agent");
         write(&p, &[1u8; 4096]);
         let f = File::options().read(true).write(true).open(&p).unwrap();
-        let cache = unsettled();
+        let cache = settled_at_once();
         let first = lookup(&cache, &f).unwrap();
         assert_eq!(first, oracle(&p));
         clock_past(d.path(), &f);
@@ -413,7 +442,7 @@ mod tests {
         let p = d.path().join("agent");
         write(&p, b"first build");
         let old = File::open(&p).unwrap();
-        let cache = unsettled();
+        let cache = settled_at_once();
         let first = lookup(&cache, &old).unwrap();
         let first_oracle = oracle(&p);
         assert_eq!(first, first_oracle);
@@ -431,7 +460,7 @@ mod tests {
         // The old file, by its descriptor, cached or hashed again.
         assert_eq!(lookup(&cache, &old).unwrap(), first_oracle);
         assert_eq!(
-            lookup(&ExeHashCache::new(), &old).unwrap(),
+            lookup(&settled_at_once(), &old).unwrap(),
             first_oracle,
             "hashed again from the descriptor"
         );
@@ -451,7 +480,7 @@ mod tests {
         let p = d.path().join("agent");
         write(&p, &[3u8; 1000]);
         let f = File::options().read(true).write(true).open(&p).unwrap();
-        let cache = unsettled();
+        let cache = settled_at_once();
         let stale = FileKey::of(&f).unwrap();
         clock_past(d.path(), &f);
         f.write_all_at(&[4], 10).unwrap();
@@ -472,7 +501,7 @@ mod tests {
         for size in [999, 1001] {
             let wrong = FileKey { size, ..now };
             assert_eq!(
-                ExeHashCache::new().lookup(&f, &wrong, &mut HashBudget::new(REQUEST_BUDGET)),
+                settled_at_once().lookup(&f, &wrong, &mut HashBudget::new(REQUEST_BUDGET)),
                 Err(HashError::Changed),
                 "size {size}"
             );
@@ -491,7 +520,7 @@ mod tests {
         let p = d.path().join("agent");
         write(&p, &[8u8; 2048]);
         let f = File::options().read(true).write(true).open(&p).unwrap();
-        let cache = unsettled();
+        let cache = settled_at_once();
         let stale = FileKey::of(&f).unwrap();
         let first = lookup(&cache, &f).unwrap();
         assert_eq!(first, oracle(&p));
@@ -522,7 +551,7 @@ mod tests {
         let f = File::create(&p).unwrap();
         f.set_len(200 * 1024 * 1024).unwrap();
         let f = File::open(&p).unwrap();
-        let cache = unsettled();
+        let cache = settled_at_once();
         let first = lookup(&cache, &f).unwrap();
         assert_eq!(cache.hashed_bytes(), 200 * 1024 * 1024);
         assert_eq!(lookup(&cache, &f).unwrap(), first);
@@ -530,24 +559,33 @@ mod tests {
         assert_eq!(first, oracle(&p));
     }
 
-    /// A file changed less than the settle time before its hashing began
-    /// is hashed for each request, not cached: a write in the same tick of
-    /// the file system's clock could leave its key as it was. Mutation
-    /// checked: caching it fails this test.
+    /// A file changed less than the settle time before the lookup began
+    /// has no digest, and is not read: a write in the same tick of the file
+    /// system's clock could leave its key as it was, so neither the cache
+    /// nor the walk's check of the key after hashing could tell that it
+    /// changed (Codex review: a digest kept past the bytes it names). A
+    /// settle time no test can outwait stands for "just now". Mutation
+    /// checked: dropping the settle check fails this test (the file is
+    /// hashed and its digest returned).
     #[test]
-    fn a_file_changed_just_now_is_not_cached() {
+    fn a_file_changed_just_now_has_no_digest() {
         let d = dir();
         let p = d.path().join("agent");
         write(&p, &[5u8; 512]);
         let f = File::open(&p).unwrap();
-        let cache = ExeHashCache::new();
-        let a = lookup(&cache, &f).unwrap();
-        let b = lookup(&cache, &f).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(cache.hashed_bytes(), 1024, "hashed twice");
-        // The control: settled at once, it is hashed once.
-        let cache = unsettled();
-        lookup(&cache, &f).unwrap();
+        let cache = ExeHashCache::with_limits(CACHE_ENTRIES, MAX_HASHED, Duration::from_secs(3600));
+        let mut budget = HashBudget::new(REQUEST_BUDGET);
+        let key = FileKey::of(&f).unwrap();
+        assert_eq!(
+            cache.lookup(&f, &key, &mut budget),
+            Err(HashError::Unsettled)
+        );
+        assert_eq!(budget, HashBudget::new(REQUEST_BUDGET), "nothing taken");
+        assert_eq!(cache.hashed_bytes(), 0, "nothing read");
+        assert!(locked(&cache.inner).entries.is_empty());
+        // The control: settled, it is hashed once and cached.
+        let cache = settled_at_once();
+        assert_eq!(lookup(&cache, &f).unwrap(), oracle(&p));
         lookup(&cache, &f).unwrap();
         assert_eq!(cache.hashed_bytes(), 512);
         // A change time the clock has not reached is not settled.
@@ -571,7 +609,7 @@ mod tests {
         let large = d.path().join("large");
         write(&large, &[7u8; 200]);
         let (small, large) = (File::open(&small).unwrap(), File::open(&large).unwrap());
-        let cache = unsettled();
+        let cache = settled_at_once();
         let mut budget = HashBudget::new(100);
         let k = FileKey::of(&large).unwrap();
         assert_eq!(
@@ -598,7 +636,7 @@ mod tests {
         let f = File::create(&huge).unwrap();
         f.set_len(MAX_HASHED + 1).unwrap();
         let f = File::open(&huge).unwrap();
-        let cache = ExeHashCache::new();
+        let cache = settled_at_once();
         assert_eq!(lookup(&cache, &f), Err(HashError::TooLarge));
         assert_eq!(cache.hashed_bytes(), 0);
     }
@@ -634,7 +672,7 @@ mod tests {
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod linux_tests {
     #![allow(clippy::unwrap_used)]
-    use super::tests::{dir, oracle};
+    use super::tests::{dir, oracle, settled_at_once};
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -724,7 +762,7 @@ mod linux_tests {
     }
 
     fn sha(p: &ProcInfo, cache: &ExeHashCache) -> Option<[u8; 32]> {
-        exe_sha256(cache, p, &mut HashBudget::new(REQUEST_BUDGET))
+        exe_sha256(cache, p, &mut HashBudget::new(REQUEST_BUDGET)).map(|d| d.sha256)
     }
 
     /// The digest of a running process's executable is that of the file it
@@ -739,7 +777,7 @@ mod linux_tests {
         install(&p, b"");
         let first = oracle(&p);
         let a = Running::start(&p);
-        let cache = ExeHashCache::new();
+        let cache = settled_at_once();
         assert_eq!(sha(&a.info(), &cache), Some(first));
         install(&p, b"\0another build");
         let second = oracle(&p);
@@ -773,7 +811,7 @@ mod linux_tests {
             .to_string_lossy()
             .into_owned();
         assert!(shown.ends_with(" (deleted)"), "{shown}");
-        assert_eq!(sha(&info, &ExeHashCache::new()), Some(first));
+        assert_eq!(sha(&info, &settled_at_once()), Some(first));
     }
 
     /// A descriptor whose file is not the one the walk saw (its device and
@@ -787,7 +825,87 @@ mod linux_tests {
         let mut info = a.info();
         let file = info.exe.as_ref().unwrap().file.unwrap();
         info.exe.as_mut().unwrap().file = Some((file.0, file.1 ^ 1));
-        assert_eq!(sha(&info, &ExeHashCache::new()), None);
+        assert_eq!(sha(&info, &settled_at_once()), None);
+        // The control: the walk's own device and inode.
+        assert!(sha(&a.info(), &settled_at_once()).is_some());
+    }
+
+    /// Codex review (medium): the walk keeps a digest only while the file
+    /// it was taken from is in that state. Right after the running file is
+    /// hashed, its state changes and its inode stays, as with a write in
+    /// place (here a permission change: a running file cannot be opened
+    /// for writing); the walk reads the file's key again through the
+    /// production hasher ([`RequestHasher`]), sees the change, and walks
+    /// and hashes again, so the evidence's digest is taken from the file
+    /// as it is now (the bytes are the same; the key is the new one). The
+    /// control: unchanged, it is hashed once. Mutation checked (CI, Linux):
+    /// leaving the key out of the walk's check after hashing fails this
+    /// test (hashed once).
+    #[test]
+    fn a_file_whose_state_changed_after_hashing_is_hashed_again() {
+        /// The production hasher, which changes the state of `path` once,
+        /// right after it hashed `pid`'s file.
+        struct ChangingOnce<'a> {
+            inner: RequestHasher<'a>,
+            path: PathBuf,
+            pid: i32,
+            change: bool,
+            hashed: usize,
+            keys: Vec<FileKey>,
+        }
+        impl ExeHasher for ChangingOnce<'_> {
+            fn sha256(&mut self, p: &ProcInfo) -> Option<ExeDigest> {
+                let d = self.inner.sha256(p);
+                if p.pid == self.pid {
+                    self.hashed += 1;
+                    if std::mem::take(&mut self.change) {
+                        let k = FileKey::of(&File::open(&self.path).unwrap()).unwrap();
+                        let dir = File::open(self.path.parent().unwrap()).unwrap();
+                        envcloak_sys::wait_for_clock_past(&dir, k.ctime, Duration::from_secs(5))
+                            .unwrap();
+                        std::fs::set_permissions(
+                            &self.path,
+                            std::fs::Permissions::from_mode(0o750),
+                        )
+                        .unwrap();
+                    }
+                }
+                d
+            }
+
+            fn key(&mut self, p: &ProcInfo) -> Option<FileKey> {
+                let k = self.inner.key(p);
+                if p.pid == self.pid {
+                    self.keys.extend(k);
+                }
+                k
+            }
+        }
+        let d = dir();
+        let p = d.path().join("agent");
+        install(&p, b"");
+        let first = oracle(&p);
+        let a = Running::start(&p);
+        let cat = AgentCatalog::builtin();
+        for change in [true, false] {
+            let cache = settled_at_once();
+            let mut h = ChangingOnce {
+                inner: RequestHasher::new(&cache),
+                path: p.clone(),
+                pid: a.info().pid,
+                change,
+                hashed: 0,
+                keys: Vec::new(),
+            };
+            let e = gather_hashed(&a.peer(), Claims::none(), &cat, &mut h).unwrap();
+            let now = FileKey::of(&File::open(&p).unwrap()).unwrap();
+            assert_eq!(h.hashed, if change { 2 } else { 1 }, "change: {change}");
+            assert_eq!(h.keys.last(), Some(&now), "change: {change}");
+            assert_eq!(
+                e.chain()[0].instance.exe.as_ref().unwrap().sha256,
+                Some(first)
+            );
+        }
     }
 
     /// The walk records each hashed ancestor's digest; with the budget
@@ -804,20 +922,21 @@ mod linux_tests {
         let first = oracle(&p);
         let a = Running::start(&p);
         let cat = AgentCatalog::builtin();
-        let cache = ExeHashCache::new();
+        let cache = settled_at_once();
         let plain = gather(&a.peer(), Claims::none(), &cat).unwrap();
         let mut full = RequestHasher::new(&cache);
         let hashed = gather_hashed(&a.peer(), Claims::none(), &cat, &mut full).unwrap();
-        let mut none = RequestHasher::with_budget(&cache, 0);
+        // A budget spent, on a cache that does not hold the file yet.
+        let empty = settled_at_once();
+        let mut none = RequestHasher::with_budget(&empty, 0);
         let spent = gather_hashed(&a.peer(), Claims::none(), &cat, &mut none).unwrap();
         let caller = |e: &envcloak_policy::SubjectEvidence| {
             e.chain()[0].instance.exe.as_ref().unwrap().sha256
         };
         assert_eq!(caller(&hashed), Some(first));
         assert_eq!(caller(&plain), None);
-        // The budget was spent on nothing cached: the caller's file is new
-        // (not settled), so it is not in the cache, and nothing is hashed.
         assert_eq!(caller(&spent), None);
+        assert_eq!(empty.hashed_bytes(), 0);
         for e in [&hashed, &spent] {
             assert_eq!(e.kind(), plain.kind());
             assert!(e.root().same(&plain.root()));

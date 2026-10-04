@@ -14,11 +14,11 @@ use std::path::PathBuf;
 
 use envcloak_policy::{
     AGENTS_DIR, AgentCatalog, AgentLabel, Ancestor, CatalogSource, ChainEnd, Claims, EvidenceError,
-    ExeHasher, GATHER_ATTEMPTS, MatchBasis, ProcessInstance, ProofRefusal, SubjectEvidence,
-    SubjectKind, gather_in, gather_in_hashed,
+    ExeDigest, ExeHasher, GATHER_ATTEMPTS, MatchBasis, ProcessInstance, ProofRefusal,
+    SubjectEvidence, SubjectKind, gather_in, gather_in_hashed,
 };
 use envcloak_sys::{
-    Argv, CodeSignature, ExeIdentity, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo,
+    Argv, CodeSignature, ExeIdentity, FileKey, MAX_ANCESTRY, PeerIdentity, PeerSource, ProcInfo,
     ProcessTable, StartTime,
 };
 
@@ -1794,17 +1794,64 @@ fn a_caller_that_is_gone_is_refused_at_once() {
 }
 
 /// A hasher a test scripts: a digest per pid, every pid it is asked for
-/// recorded.
+/// recorded, and each file's state. A pid's file can be written in place
+/// right after it is hashed (`rewrites`: how many times), which moves its
+/// change time and changes the digest it hashes to next; or become
+/// unreadable once hashed (`hidden_after`: no digest and no state).
 #[derive(Default)]
 struct Hasher {
     digests: HashMap<i32, [u8; 32]>,
     asked: Vec<i32>,
+    rewrites: HashMap<i32, usize>,
+    hidden_after: Vec<i32>,
+    /// The writes each pid's file has had so far.
+    written: HashMap<i32, u8>,
+    /// Each pid whose state was read again, in order.
+    keys_read: Vec<i32>,
+}
+
+impl Hasher {
+    /// The state of `p`'s file after `written` writes: its device and
+    /// inode never change (a write in place), its change time does.
+    fn state(p: &ProcInfo, written: u8) -> FileKey {
+        let (dev, ino) = p.exe.as_ref().and_then(|e| e.file).unwrap();
+        FileKey {
+            dev,
+            ino,
+            size: 4096,
+            ctime: (1_000 + i64::from(written), 0),
+        }
+    }
+
+    fn hidden(&self, pid: i32) -> bool {
+        self.hidden_after.contains(&pid) && self.asked.iter().filter(|a| **a == pid).count() > 1
+    }
 }
 
 impl ExeHasher for Hasher {
-    fn sha256(&mut self, p: &ProcInfo) -> Option<[u8; 32]> {
+    fn sha256(&mut self, p: &ProcInfo) -> Option<ExeDigest> {
         self.asked.push(p.pid);
-        self.digests.get(&p.pid).copied()
+        if self.hidden(p.pid) {
+            return None;
+        }
+        let mut sha256 = self.digests.get(&p.pid).copied()?;
+        let written = self.written.get(&p.pid).copied().unwrap_or(0);
+        sha256[0] = sha256[0].wrapping_add(written);
+        let key = Hasher::state(p, written);
+        if let Some(n) = self.rewrites.get_mut(&p.pid).filter(|n| **n > 0) {
+            *n -= 1;
+            *self.written.entry(p.pid).or_default() += 1;
+        }
+        Some(ExeDigest { sha256, key })
+    }
+
+    fn key(&mut self, p: &ProcInfo) -> Option<FileKey> {
+        self.keys_read.push(p.pid);
+        if self.hidden_after.contains(&p.pid) {
+            return None;
+        }
+        let written = self.written.get(&p.pid).copied().unwrap_or(0);
+        Some(Hasher::state(p, written))
     }
 }
 
@@ -2190,6 +2237,65 @@ fn a_chain_that_changes_during_every_hashing_is_refused() {
     let mut t = hashed_table(vec![caller90()], answers);
     assert_eq!(hashed(&mut t, &mut h).unwrap_err(), EvidenceError::Changed);
     assert_eq!(h.asked.len(), 2 * GATHER_ATTEMPTS);
+}
+
+/// Codex review (medium): a digest is kept only while the file it was
+/// taken from is in the state it was hashed in. A write in place keeps the
+/// file's path, device and inode, which is all the chain's check compares
+/// ([`ProcInfo::unchanged`]), and so does an `exec` of the same file after
+/// such a write: the digest would name bytes the file no longer holds.
+/// The state (device, inode, size, change time) of each hashed file is
+/// read again after the chain's check: a file written after it was hashed
+/// is walked and hashed again, and the evidence has the digest of what it
+/// holds now; one that keeps being written is refused; one that can no
+/// longer be read (the process became non-dumpable) is walked again and
+/// has no digest. The control: files left alone are hashed once, each
+/// state read once, and none of a process that was not hashed. Mutation
+/// checked: leaving the files' state out of the check after hashing fails
+/// this test (the earlier digest is kept).
+#[test]
+fn a_file_written_in_place_after_hashing_is_hashed_again() {
+    let mut h = hasher_80_70();
+    h.rewrites.insert(80, 1);
+    let mut t = hashed_table(vec![caller90()], vec![bash80()]);
+    let e = hashed(&mut t, &mut h).unwrap();
+    assert_eq!(h.asked, [80, 70, 80, 70], "walked and hashed again");
+    assert_eq!(h.keys_read, [80, 80, 70]);
+    let mut now = [8; 32];
+    now[0] = 9;
+    assert_eq!(digest(&e, 80), Some(now), "the digest of what it holds now");
+    assert_eq!(digest(&e, 70), Some([7; 32]));
+    decides_as(&e, &steady(caller90(), bash80()));
+    // Written after every hashing: refused.
+    for pid in [80, 70] {
+        let mut h = hasher_80_70();
+        h.rewrites.insert(pid, GATHER_ATTEMPTS);
+        let mut t = hashed_table(vec![caller90()], vec![bash80()]);
+        assert_eq!(
+            hashed(&mut t, &mut h).unwrap_err(),
+            EvidenceError::Changed,
+            "{pid}"
+        );
+        assert_eq!(h.asked.len(), 2 * GATHER_ATTEMPTS);
+    }
+    // Unreadable once hashed: walked again, no digest.
+    let mut h = hasher_80_70();
+    h.hidden_after.push(80);
+    let mut t = hashed_table(vec![caller90()], vec![bash80()]);
+    let e = hashed(&mut t, &mut h).unwrap();
+    assert_eq!(h.asked, [80, 70, 80, 70]);
+    assert_eq!((digest(&e, 80), digest(&e, 70)), (None, Some([7; 32])));
+    decides_as(&e, &steady(caller90(), bash80()));
+    // The control.
+    let mut h = hasher_80_70();
+    let mut t = hashed_table(vec![caller90()], vec![bash80()]);
+    let e = hashed(&mut t, &mut h).unwrap();
+    assert_eq!(h.asked, [80, 70]);
+    assert_eq!(h.keys_read, [80, 70], "the hashed files only, once each");
+    assert_eq!(
+        (digest(&e, 80), digest(&e, 70)),
+        (Some([8; 32]), Some([7; 32]))
+    );
 }
 
 /// The arguments a node process runs Gemini CLI by.

@@ -59,7 +59,7 @@ pub use envfile::{
     PlainVar, REFERENCE_SCHEME, parse_env_file_refs,
 };
 pub use evidence::{
-    Ancestor, ChainEnd, Claims, ClaimsError, EvidenceError, ExeHasher, GATHER_ATTEMPTS,
+    Ancestor, ChainEnd, Claims, ClaimsError, EvidenceError, ExeDigest, ExeHasher, GATHER_ATTEMPTS,
     ProcessInstance, ProofRefusal, SubjectEvidence, gather, gather_hashed, gather_in,
     gather_in_hashed,
 };

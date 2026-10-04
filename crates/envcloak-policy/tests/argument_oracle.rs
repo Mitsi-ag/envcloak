@@ -37,11 +37,11 @@ use std::io;
 use std::path::PathBuf;
 
 use envcloak_policy::{
-    AgentCatalog, Claims, EvidenceError, ExeHasher, GATHER_ATTEMPTS, MatchBasis, ProofRefusal,
-    SubjectKind, gather_in, gather_in_hashed,
+    AgentCatalog, Claims, EvidenceError, ExeDigest, ExeHasher, GATHER_ATTEMPTS, MatchBasis,
+    ProofRefusal, SubjectKind, gather_in, gather_in_hashed,
 };
 use envcloak_sys::{
-    Argv, ExeIdentity, PeerIdentity, PeerSource, ProcInfo, ProcessTable, StartTime,
+    Argv, ExeIdentity, FileKey, PeerIdentity, PeerSource, ProcInfo, ProcessTable, StartTime,
 };
 
 /// Gemini CLI's script under a distribution's npm global folder.
@@ -134,9 +134,29 @@ struct Hasher {
 }
 
 impl ExeHasher for Hasher {
-    fn sha256(&mut self, p: &ProcInfo) -> Option<[u8; 32]> {
+    fn sha256(&mut self, p: &ProcInfo) -> Option<ExeDigest> {
         self.asked.push(p.pid);
-        (!self.unknown).then_some([u8::try_from(p.pid).expect("synthetic id"); 32])
+        (!self.unknown).then(|| ExeDigest {
+            sha256: [u8::try_from(p.pid).expect("synthetic id"); 32],
+            key: unwritten(p),
+        })
+    }
+
+    fn key(&mut self, p: &ProcInfo) -> Option<FileKey> {
+        Some(unwritten(p))
+    }
+}
+
+/// The state of `p`'s file, the same at every read: no file is written in
+/// these cases (the hasher's interface carries it since the review that
+/// added the check of each hashed file's state).
+fn unwritten(p: &ProcInfo) -> FileKey {
+    let (dev, ino) = p.exe.as_ref().and_then(|e| e.file).unwrap_or_default();
+    FileKey {
+        dev,
+        ino,
+        size: 0,
+        ctime: (0, 0),
     }
 }
 
