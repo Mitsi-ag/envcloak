@@ -26,6 +26,12 @@
 //! Forwarding through the monitor's own child group (the shell's) would
 //! leave the job at 0 in step 1.
 //!
+//! On a Linux kernel without `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9),
+//! SIGTERM and SIGHUP are narrowed to the command's group (`Narrowed`):
+//! the job counts 0 and the shell 2 for them, and the measurement records
+//! the session delivery refused (`Unsupported`). A second case forces that
+//! on any Linux kernel, so the narrowed route runs where CI runs.
+//!
 //! No libtest harness (`harness = false`): a copy of this binary is the
 //! counting fixture, and nothing else runs in the process that forks the
 //! monitor.
@@ -84,6 +90,10 @@ fn main() {
             (
                 "forwarded_signals_reach_the_nested_shells_job_and_not_the_shell",
                 forwarded_signals_reach_the_nested_shells_job_and_not_the_shell,
+            ),
+            (
+                "on_a_kernel_without_group_signals_sigterm_and_sighup_are_narrowed",
+                on_a_kernel_without_group_signals_sigterm_and_sighup_are_narrowed,
             ),
             (
                 "a_process_that_leaves_the_job_before_the_delivery_gets_nothing",
@@ -161,6 +171,69 @@ fn counts(dir: &Path, who: &str) -> Vec<usize> {
 }
 
 fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
+    spike_d(false);
+}
+
+/// Keeps `OwnedSession` acting as on a Linux kernel before 6.9 (its group
+/// signal refused with `EINVAL`, nothing sent) while it lives.
+#[cfg(target_os = "linux")]
+struct NoGroupSignal;
+
+#[cfg(target_os = "linux")]
+impl NoGroupSignal {
+    fn force() -> Self {
+        envcloak_sys::testing::force_no_group_signal(true);
+        NoGroupSignal
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NoGroupSignal {
+    fn drop(&mut self) {
+        envcloak_sys::testing::force_no_group_signal(false);
+    }
+}
+
+/// (d) on a Linux kernel without `PIDFD_SIGNAL_PROCESS_GROUP` (before 6.9:
+/// Ubuntu 24.04's 6.8, Debian 12, RHEL 9), forced on the kernel this runs
+/// on (`envcloak_sys::testing::force_no_group_signal`), so the route those
+/// kernels take runs natively wherever this does: SIGTERM and SIGHUP are
+/// narrowed (`forward_signal` says `CommandGroup`, `Narrowed`) and reach
+/// the nested shell, not its job, which gets SIGINT and SIGQUIT as
+/// before. Report `Unsupported` as an error instead of narrowing and the
+/// forward fails; forward through the session regardless and the job
+/// counts. macOS sends all four with `TIOCSIG` and has nothing to narrow.
+fn on_a_kernel_without_group_signals_sigterm_and_sighup_are_narrowed() {
+    #[cfg(target_os = "linux")]
+    {
+        let _forced = NoGroupSignal::force();
+        spike_d(true);
+    }
+    #[cfg(not(target_os = "linux"))]
+    println!(
+        "pty_signals ({}): no route is narrowed here (TIOCSIG takes all four)",
+        std::env::consts::OS
+    );
+}
+
+/// Whether SIGTERM and SIGHUP are narrowed here: on Linux, where the kernel
+/// cannot signal a process group through a pidfd, or a test forced that.
+fn group_signals_narrowed(forced: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        forced || !group_signal_supported()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = forced;
+        false
+    }
+}
+
+/// Spike (d), with the group signal refused when `forced` (Linux).
+fn spike_d(forced: bool) {
+    let narrowing = group_signals_narrowed(forced);
+    let narrowed = |sig: i32| narrowing && signal_route(sig) == Some(SignalRoute::Session);
     let dir = short_dir();
     let d = dir.path();
     let home = d.join("home");
@@ -216,34 +289,36 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
     unsafe { libc::ioctl(screen.master().as_raw_fd(), libc::TIOCGPGRP as _, &mut fg) };
     assert_eq!(fg, job_group, "the job is the terminal's foreground group");
 
-    // 1. The route `envcloak run --pty` takes.
+    // 1. The route `envcloak run --pty` takes. A narrowed signal goes to
+    // the command's group, the shell's, which runs its trap once the job
+    // has ended (counted below); the job never gets it.
+    let mut expected = vec![0; 4];
     for (i, (sig, name)) in SIGNALS.iter().enumerate() {
         let forwarded = forward_signal(&monitor, screen.master(), *sig).unwrap();
-        assert_eq!(Some(forwarded.route), signal_route(*sig), "{name}");
-        assert_eq!(forwarded.reason, RouteReason::Measured, "{name}");
-        assert!(
-            wait_lines(&d.join(format!("job-{name}")), 1, DEADLINE),
-            "SIG{name} forwarded by {:?} did not reach the job; job {:?}, shell {:?}",
-            forwarded.route,
-            counts(d, "job"),
-            counts(d, "shell")
-        );
-        let mut expected = vec![0; 4];
-        for e in expected.iter_mut().take(i + 1) {
-            *e = 1;
+        if narrowed(*sig) {
+            assert_eq!(
+                (forwarded.route, forwarded.reason),
+                (SignalRoute::CommandGroup, RouteReason::Narrowed),
+                "{name}"
+            );
+        } else {
+            assert_eq!(Some(forwarded.route), signal_route(*sig), "{name}");
+            assert_eq!(forwarded.reason, RouteReason::Measured, "{name}");
+            assert!(
+                wait_lines(&d.join(format!("job-{name}")), 1, DEADLINE),
+                "SIG{name} forwarded by {:?} did not reach the job; job {:?}, shell {:?}",
+                forwarded.route,
+                counts(d, "job"),
+                counts(d, "shell")
+            );
+            expected[i] = 1;
         }
         assert_eq!(counts(d, "job"), expected, "after SIG{name}");
     }
 
-    // 2. The measurement behind the route table.
-    #[cfg(target_os = "linux")]
-    assert!(
-        group_signal_supported(),
-        "this kernel ({}) cannot signal a process group through a pidfd \
-         (PIDFD_SIGNAL_PROCESS_GROUP, Linux 6.9): SIGTERM and SIGHUP are narrowed to the \
-         command's group on it, which this measurement does not cover",
-        kernel_release()
-    );
+    // 2. The measurement behind the route table. Where the group signal is
+    // refused, the session delivery says `Unsupported` and sends nothing:
+    // the signal is narrowed there, as step 1 showed.
     let mut table = Vec::new();
     for (sig, name) in SIGNALS {
         let file = d.join(format!("job-{name}"));
@@ -274,12 +349,22 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
                         job_group,
                         "SIG{name}: the bound job is the job"
                     );
-                    job.signal(sig).unwrap();
-                    assert!(
-                        wait_lines(&file, before + 1, DEADLINE),
-                        "the session delivery took SIG{name} but the job did not count it"
-                    );
-                    SignalRoute::Session
+                    if narrowed(sig) {
+                        let refused = job.signal(sig).unwrap_err();
+                        assert_eq!(
+                            envcloak_sys::owned::NoJob::of(&refused),
+                            Some(envcloak_sys::owned::NoJob::Unsupported),
+                            "SIG{name}: {refused}"
+                        );
+                        SignalRoute::CommandGroup
+                    } else {
+                        job.signal(sig).unwrap();
+                        assert!(
+                            wait_lines(&file, before + 1, DEADLINE),
+                            "the session delivery took SIG{name} but the job did not count it"
+                        );
+                        SignalRoute::Session
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 SignalRoute::CommandGroup
@@ -291,10 +376,15 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
             screen.count("GOT [pending]") == 0
         });
         table.push((name, measured, flushed));
+        let routed = if narrowed(sig) {
+            Some(SignalRoute::CommandGroup)
+        } else {
+            signal_route(sig)
+        };
         assert_eq!(
             Some(measured),
-            signal_route(sig),
-            "SIG{name} measured by the spike is not pty::signal_route's"
+            routed,
+            "SIG{name} measured by the spike is not the route forward_signal took"
         );
     }
     let flushed = table.iter().find_map(|(_, _, f)| *f).unwrap();
@@ -302,9 +392,14 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
     // set; Linux's pty_signal does not.
     assert_eq!(flushed, cfg!(target_os = "macos"), "{table:?}");
     println!(
-        "pty_signals ({}{}): measured routes {:?}; TIOCSIG flushed unread input: {flushed}",
+        "pty_signals ({}{}{}): measured routes {:?}; TIOCSIG flushed unread input: {flushed}",
         std::env::consts::OS,
         kernel_release(),
+        match (narrowing, forced) {
+            (false, _) => "",
+            (true, true) => ", group signal refused by the test",
+            (true, false) => ", no group signal in this kernel",
+        },
         table
             .iter()
             .map(|(n, r, _)| format!("SIG{n} {r:?}"))
@@ -319,11 +414,30 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
     let prompts = screen.count(PROMPT);
     screen.type_bytes(b"done\n");
     screen.expect(PROMPT, prompts + 1, "the job ended");
-    for (sig, name) in SIGNALS {
+    // The narrowed signals of step 1, pending in the shell until now: `:`
+    // is typed until it has run their traps.
+    let narrowed_counts: Vec<usize> = SIGNALS
+        .iter()
+        .map(|(s, _)| usize::from(narrowed(*s)))
+        .collect();
+    let end = std::time::Instant::now() + DEADLINE;
+    while counts(d, "shell") != narrowed_counts {
+        assert!(
+            std::time::Instant::now() < end,
+            "the shell did not count the narrowed signals: {:?}",
+            counts(d, "shell")
+        );
+        let prompts = screen.count(PROMPT);
+        screen.type_bytes(b":\n");
+        screen.wait_for_within(std::time::Duration::from_secs(1), |s| {
+            s.count(PROMPT) > prompts
+        });
+    }
+    for (i, (sig, name)) in SIGNALS.into_iter().enumerate() {
         monitor.send(MonitorCommand::Signal(sig)).unwrap();
         let file = d.join(format!("shell-{name}"));
         let end = std::time::Instant::now() + DEADLINE;
-        while lines(&file) == 0 {
+        while lines(&file) <= narrowed_counts[i] {
             if std::time::Instant::now() >= end {
                 let mut fg: libc::pid_t = 0;
                 // SAFETY: TIOCGPGRP writes one pid_t; read for the message.
@@ -357,15 +471,17 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
         "{event:?}\n{}",
         screen.text()
     );
+    let job_counts: Vec<usize> = narrowed_counts.iter().map(|n| 2 - 2 * n).collect();
+    let shell_counts: Vec<usize> = narrowed_counts.iter().map(|n| 1 + n).collect();
     assert_eq!(
         counts(d, "job"),
-        vec![2; 4],
-        "the job: forwarded and measured"
+        job_counts,
+        "the job: forwarded and measured, unless narrowed"
     );
     assert_eq!(
         counts(d, "shell"),
-        vec![1; 4],
-        "the shell: the control only"
+        shell_counts,
+        "the shell: the control, and the narrowed signals"
     );
     drop(screen);
     monitor.finish().unwrap();

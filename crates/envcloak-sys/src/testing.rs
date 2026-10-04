@@ -74,6 +74,21 @@ pub fn force_descriptor_fallback() {
     DESCRIPTOR_FALLBACK.store(true, Ordering::Relaxed);
 }
 
+/// Set by [`force_no_group_signal`].
+#[cfg(target_os = "linux")]
+pub(crate) static NO_GROUP_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+/// While `on`, this process's `OwnedSession` deliveries act as on a Linux
+/// kernel before 6.9, whose `pidfd_send_signal` refuses
+/// `PIDFD_SIGNAL_PROCESS_GROUP` with `EINVAL`: nothing is sent and the
+/// delivery reports `NoJob::Unsupported`, so `forward_signal` narrows
+/// SIGTERM and SIGHUP as it does there. For the test of that route on any
+/// kernel.
+#[cfg(target_os = "linux")]
+pub fn force_no_group_signal(on: bool) {
+    NO_GROUP_SIGNAL.store(on, Ordering::SeqCst);
+}
+
 /// How a test makes a process have its children reaped by the kernel on
 /// their own, as a parent or a library may leave it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

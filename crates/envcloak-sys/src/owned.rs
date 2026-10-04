@@ -702,6 +702,13 @@ impl GroupTable for ProcTable {
     }
 
     fn signal_group(&mut self, handle: &OwnedFd, sig: i32) -> io::Result<()> {
+        #[cfg(feature = "testing")]
+        {
+            if crate::testing::NO_GROUP_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) {
+                // As a kernel before 6.9 answers the flag.
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+        }
         pidfd_send_signal_with(handle.as_raw_fd(), sig, PIDFD_SIGNAL_PROCESS_GROUP)
     }
 }
