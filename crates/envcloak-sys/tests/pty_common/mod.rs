@@ -225,7 +225,9 @@ pub fn my_role() -> Option<String> {
 /// `options` asks (`WEXITED`, `WSTOPPED`, `WCONTINUED`, with `WNOWAIT` to
 /// leave it as it is), up to [`DEADLINE`]; returns `(si_code, si_status)`
 /// or `None` when nothing changed in time. Polls without blocking, so a
-/// test fails rather than hangs.
+/// test fails rather than hangs. Only a record of a kind `options` asked
+/// for counts: macOS's `waitid` returns a stopped child's stop to a call
+/// asked for exits only (measured on macOS 26.4), which is no exit.
 pub fn wait_child(pid: i32, options: libc::c_int) -> Option<(i32, i32)> {
     wait_child_within(pid, options, DEADLINE)
 }
@@ -245,7 +247,7 @@ pub fn wait_child_within(pid: i32, options: libc::c_int, limit: Duration) -> Opt
             )
         };
         // SAFETY: waitid filled `info` in or left it zeroed.
-        if rc == 0 && unsafe { info.si_pid() } == pid {
+        if rc == 0 && unsafe { info.si_pid() } == pid && asked_for(options, info.si_code) {
             // SAFETY: as above.
             return Some((info.si_code, unsafe { info.si_status() }));
         }
@@ -254,6 +256,17 @@ pub fn wait_child_within(pid: i32, options: libc::c_int, limit: Duration) -> Opt
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Whether a record with `si_code` `code` is of a kind `options` asked for.
+fn asked_for(options: libc::c_int, code: libc::c_int) -> bool {
+    let wanted = match code {
+        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => libc::WEXITED,
+        libc::CLD_STOPPED | libc::CLD_TRAPPED => libc::WSTOPPED,
+        libc::CLD_CONTINUED => libc::WCONTINUED,
+        _ => return false,
+    };
+    options & wanted != 0
 }
 
 /// Whether this process's own child `pid` has exited, without reaping it.

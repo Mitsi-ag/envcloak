@@ -21,7 +21,9 @@
 //!   another process until the caller reaps it. A thread that sends the
 //!   child signals checks, under the same lock, that it has not exited
 //!   yet, and so never signals a pid that has been reused.
-//!   [`has_exited`] asks the same without waiting.
+//!   [`has_exited`] asks the same without waiting. A stopped child has not
+//!   exited, though macOS's `waitid` returns its stop to a caller that
+//!   asked for exits only: both read the record's kind first.
 //! - [`signal_process`] and [`signal_group`]: `kill` for one process, or
 //!   for every process in a group.
 
@@ -64,26 +66,32 @@ pub fn signal_group(pgid: i32, sig: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// Waits until child `pid` has exited or been killed, and leaves it
-/// waitable: `waitid(P_PID, pid, WEXITED | WNOWAIT)`. Its pid stays in use
-/// until the caller reaps it (`Child::wait`). Restarts after a signal.
-///
-/// # Errors
-/// [`io::ErrorKind::InvalidInput`] for a pid below 1, and `waitid`'s own
-/// errors: `ECHILD` when `pid` is not a child of this process.
-pub fn wait_for_exit(pid: i32) -> io::Result<()> {
-    let id = libc::id_t::try_from(pid)
-        .ok()
-        .filter(|_| pid >= 1)
-        .ok_or(io::ErrorKind::InvalidInput)?;
+/// Whether a `waitid` record's `si_code` is an exit: the child exited
+/// (`CLD_EXITED`) or a signal killed it (`CLD_KILLED`, `CLD_DUMPED`). A
+/// `waitid` asked for `WEXITED` alone can still return another kind on
+/// macOS: a stopped child whose stop nothing has consumed comes back as
+/// `CLD_STOPPED` (measured on macOS 26.4, with and without `WNOHANG`; the
+/// XNU behaviour behind Go issue 19314). Linux returns only exits there.
+/// Every reader of an exit record checks this first.
+pub(crate) fn is_exit_record(code: libc::c_int) -> bool {
+    matches!(code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED)
+}
+
+/// One `waitid(P_PID, id, options)`, restarted after a signal: the record's
+/// `si_code`, or `None` when the child has nothing to report (`WNOHANG`).
+fn wait_record(id: libc::id_t, options: libc::c_int) -> io::Result<Option<libc::c_int>> {
     loop {
-        // SAFETY: siginfo_t is plain data; waitid fills it in.
+        // SAFETY: siginfo_t is plain data; waitid fills it in, and leaves
+        // si_pid 0 when no child has changed state.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a writable siginfo_t; WNOWAIT leaves the child
-        // as it is.
-        let rc = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        // SAFETY: `info` is a writable siginfo_t; the caller's options
+        // include WNOWAIT, which leaves the child as it is.
+        let rc = unsafe { libc::waitid(libc::P_PID, id, &mut info, options) };
         if rc == 0 {
-            return Ok(());
+            // SAFETY: waitid filled `info` in for a child that changed
+            // state, or left it zeroed; si_pid is set in both cases.
+            let changed = unsafe { info.si_pid() } != 0;
+            return Ok(changed.then_some(info.si_code));
         }
         let err = io::Error::last_os_error();
         if err.kind() != io::ErrorKind::Interrupted {
@@ -92,44 +100,110 @@ pub fn wait_for_exit(pid: i32) -> io::Result<()> {
     }
 }
 
+fn child_id(pid: i32) -> io::Result<libc::id_t> {
+    libc::id_t::try_from(pid)
+        .ok()
+        .filter(|_| pid >= 1)
+        .ok_or_else(|| io::ErrorKind::InvalidInput.into())
+}
+
+/// Waits until child `pid` has exited or been killed, and leaves it
+/// waitable: `waitid(P_PID, pid, WEXITED | WNOWAIT)`. Its pid stays in use
+/// until the caller reaps it (`Child::wait`). Restarts after a signal. A
+/// child that is only stopped has not exited: where `waitid` returns its
+/// stop instead (macOS, [`is_exit_record`]), this waits for the exit
+/// itself (macOS: a `kqueue` `NOTE_EXIT` on the child), and leaves the
+/// stop for whoever consumes it.
+///
+/// # Errors
+/// [`io::ErrorKind::InvalidInput`] for a pid below 1, and `waitid`'s own
+/// errors: `ECHILD` when `pid` is not a child of this process.
+pub fn wait_for_exit(pid: i32) -> io::Result<()> {
+    let id = child_id(pid)?;
+    loop {
+        match wait_record(id, libc::WEXITED | libc::WNOWAIT)? {
+            Some(code) if is_exit_record(code) => return Ok(()),
+            _ => wait_for_exit_event(pid)?,
+        }
+    }
+}
+
+/// Waits until `pid`, this process's own unreaped child, exits, without
+/// `waitid`: a `kqueue` `NOTE_EXIT` on it. The child is unreaped, so its
+/// pid is still its own. Returns at once when the child is already a
+/// zombie (`ESRCH` at the registration); the caller's `waitid` then sees
+/// the exit.
+#[cfg(target_os = "macos")]
+fn wait_for_exit_event(pid: i32) -> io::Result<()> {
+    let ident = usize::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: kqueue creates a new descriptor or fails without effect; a
+    // kqueue is not inherited across fork.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: kqueue just created `kq`; nothing else owns it.
+    let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+    let change = libc::kevent {
+        ident,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    loop {
+        // SAFETY: kevent is plain data; the kernel fills it in.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        // SAFETY: one initialized change and room for one event; a null
+        // timeout waits until the event comes. Registering the same
+        // filter again after an interruption replaces it.
+        let n =
+            unsafe { libc::kevent(kq.as_raw_fd(), &change, 1, &mut event, 1, std::ptr::null()) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n > 0 && event.flags & libc::EV_ERROR != 0 {
+            let errno = libc::c_int::try_from(event.data).unwrap_or(libc::EIO);
+            // ESRCH: the child exited already (a zombie takes no filter).
+            return if errno == libc::ESRCH {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(errno))
+            };
+        }
+        return Ok(());
+    }
+}
+
+/// Elsewhere a `waitid` asked for `WEXITED` returns only exits, so this is
+/// never reached there; should a system return another kind, it looks
+/// again after a pause rather than spinning.
+#[cfg(not(target_os = "macos"))]
+fn wait_for_exit_event(_pid: i32) -> io::Result<()> {
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    Ok(())
+}
+
 /// Whether child `pid` has exited (or been killed), without waiting and
-/// without reaping it: `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`.
-/// The runner asks it before it passes a signal on, so a signal that comes
-/// once the child is gone is never passed to what it left behind as if the
-/// child still ran. Restarts after a signal.
+/// without reaping it: `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`,
+/// whose record counts only when it is an exit ([`is_exit_record`]): a
+/// stopped child, which macOS returns there, has not exited. The runner
+/// asks it before it passes a signal on, so a signal that comes once the
+/// child is gone is never passed to what it left behind as if the child
+/// still ran. Restarts after a signal.
 ///
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] for a pid below 1, and `waitid`'s own
 /// errors: `ECHILD` when `pid` is not a child of this process.
 pub fn has_exited(pid: i32) -> io::Result<bool> {
-    let id = libc::id_t::try_from(pid)
-        .ok()
-        .filter(|_| pid >= 1)
-        .ok_or(io::ErrorKind::InvalidInput)?;
-    loop {
-        // SAFETY: siginfo_t is plain data; waitid fills it in, and leaves
-        // si_pid 0 when no child has changed state.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is a writable siginfo_t; WNOWAIT leaves the child
-        // as it is and WNOHANG returns at once.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                id,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if rc == 0 {
-            // SAFETY: waitid filled `info` in for an exited child, or left
-            // it zeroed; si_pid is set in both cases.
-            return Ok(unsafe { info.si_pid() } != 0);
-        }
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    }
+    let id = child_id(pid)?;
+    let record = wait_record(id, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)?;
+    Ok(record.is_some_and(is_exit_record))
 }
 
 /// The pipe every [`SignalRelay`] writes to and reads from: created once,
