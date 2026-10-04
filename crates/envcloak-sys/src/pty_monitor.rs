@@ -32,7 +32,9 @@
 //!    sets the command's group too, closing the race. The command's parent,
 //!    the monitor, is in the same session but another group, so the
 //!    command's group is not orphaned and the suspend character stops it;
-//! 4. reports `Started` (or `ExecFailed` with the `errno` of the last
+//! 4. wipes its copy of the strings prepared for the exec (the paths,
+//!    argv and the environment with the values), which it needs no more,
+//!    reports `Started` (or `ExecFailed` with the `errno` of the last
 //!    `execve`, through a close-on-exec pipe) and then loops: it waits on
 //!    its own child only, through `waitid` (stops and continues consumed,
 //!    an exit observed without reaping and counted only when the record
@@ -100,6 +102,8 @@
 //! and [`decode_report`] are the only readers.
 
 use std::ffi::c_char;
+#[cfg(feature = "testing")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::owned::OwnedChild;
@@ -988,6 +992,19 @@ pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
     }
     // SAFETY: the monitor's own descriptor.
     unsafe { libc::close(err_read) };
+    // The command has executed, or could not be: the monitor needs none of
+    // the strings prepared for it, values included, and wipes its copy now
+    // rather than keep it for the session's life.
+    // SAFETY: `p`'s pointers are valid in this process's copy of the CLI's
+    // memory, the strings NUL-terminated and writable.
+    unsafe { wipe_prepared(p) };
+    #[cfg(feature = "testing")]
+    {
+        // SAFETY: as above.
+        if !unsafe { prepared_wiped(p) } {
+            PREPARED_KEPT.store(true, Ordering::SeqCst);
+        }
+    }
     let mut ops = SysOps {
         child,
         owned: Some(OwnedChild::from_fork_without_pidfd(child)),
@@ -997,8 +1014,7 @@ pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
         ops.reap(child);
         let e = if (1..=127).contains(&e) { e } else { libc::EIO };
         ops.write_control(&encode_report(Report::ExecFailed(e)));
-        // SAFETY: ends the monitor.
-        unsafe { libc::_exit(0) };
+        exit_monitor(0);
     }
     // A channel already gone shows as its end at the loop's first read.
     ops.write_control(&encode_report(Report::Started(child)));
@@ -1019,8 +1035,105 @@ pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
     // so its pid is its group.
     let me = unsafe { libc::getpid() };
     let code = run(&mut ops, me, child);
+    exit_monitor(code)
+}
+
+/// The exit code a monitor built with the `testing` feature ends with when
+/// a string prepared for the command was still there after
+/// [`wipe_prepared`], so a test sees it in [`crate::pty::SessionMonitor::finish`].
+#[cfg(feature = "testing")]
+pub const PREPARED_KEPT_EXIT: i32 = 86;
+
+/// Set in a monitor built with the `testing` feature when a prepared string
+/// was not wiped.
+#[cfg(feature = "testing")]
+static PREPARED_KEPT: AtomicBool = AtomicBool::new(false);
+
+/// Ends the monitor with `code` (with the `testing` feature,
+/// [`PREPARED_KEPT_EXIT`] instead when a prepared string was kept).
+fn exit_monitor(code: i32) -> ! {
+    #[cfg(feature = "testing")]
+    let code = if PREPARED_KEPT.load(Ordering::SeqCst) {
+        PREPARED_KEPT_EXIT
+    } else {
+        code
+    };
     // SAFETY: ends the monitor.
     unsafe { libc::_exit(code) }
+}
+
+/// Overwrites with zeros every string `p` points to: the candidate paths,
+/// argv and envp, the values included. Once the command has executed (or
+/// could not be) the monitor needs none of them, and its copy-on-write
+/// copy of them would otherwise stay in its memory for the session's life,
+/// after the CLI wiped its own (the verifier's review of PR #27). The rest
+/// of the monitor's image is the CLI's memory as it was at the fork (see
+/// `crate::pty`). Volatile writes, which the compiler keeps;
+/// async-signal-safe and allocation-free.
+///
+/// # Safety
+/// `p`'s pointers valid, and each string NUL-terminated and writable (the
+/// monitor's copy of buffers the CLI built with `as_mut_ptr`).
+unsafe fn wipe_prepared(p: &Prepared) {
+    // SAFETY: as the caller promises; each list ends with NULL.
+    unsafe {
+        wipe_strings(p.programs, p.program_count);
+        wipe_strings(p.argv, usize::MAX);
+        wipe_strings(p.envp, usize::MAX);
+    }
+}
+
+/// Wipes the NUL-terminated strings `list` points to, up to `max` of them
+/// or its NULL entry, whichever comes first.
+///
+/// # Safety
+/// As [`wipe_prepared`], for `list`.
+unsafe fn wipe_strings(list: *const *const c_char, max: usize) {
+    for i in 0..max {
+        // SAFETY: `list` has a NULL entry at or before `max`, and every
+        // entry before it is read here first.
+        let s = unsafe { *list.add(i) };
+        if s.is_null() {
+            return;
+        }
+        let mut at = s.cast_mut();
+        // SAFETY: `at` stays within the string, up to its NUL, which it
+        // leaves; the string is writable.
+        unsafe {
+            while at.read_volatile() != 0 {
+                at.write_volatile(0);
+                at = at.add(1);
+            }
+        }
+    }
+}
+
+/// Whether every string `p` points to starts with a NUL, as
+/// [`wipe_prepared`] leaves them (the program's path never does before).
+///
+/// # Safety
+/// As [`wipe_prepared`].
+#[cfg(feature = "testing")]
+unsafe fn prepared_wiped(p: &Prepared) -> bool {
+    let lists = [
+        (p.programs, p.program_count),
+        (p.argv, usize::MAX),
+        (p.envp, usize::MAX),
+    ];
+    for (list, max) in lists {
+        for i in 0..max {
+            // SAFETY: as in `wipe_strings`.
+            let s = unsafe { *list.add(i) };
+            if s.is_null() {
+                break;
+            }
+            // SAFETY: a NUL-terminated string has at least one byte.
+            if unsafe { s.read_volatile() } != 0 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The command, in the child the monitor forked. Never returns.
@@ -1690,6 +1803,60 @@ mod tests {
         // A stop, a trap or a continue is no exit, whatever its signal.
         for code in [libc::CLD_STOPPED, libc::CLD_TRAPPED, libc::CLD_CONTINUED, 0] {
             assert_eq!(exit_status(code, libc::SIGTSTP), None, "si_code {code}");
+        }
+    }
+
+    /// The monitor's wipe of the strings prepared for the exec: every byte
+    /// of every path, argument and `NAME=value`, up to each list's NULL (the
+    /// paths also by their count), is zero after it, and nothing past a
+    /// string's NUL is touched. Stop the wipe at a string's first byte, or
+    /// skip a list, and it fails.
+    #[test]
+    fn the_prepared_strings_are_wiped_whole() {
+        let mut bufs: Vec<Vec<u8>> = [
+            &b"/usr/bin/x"[..],
+            b"/bin/x",
+            b"x",
+            b"--flag",
+            b"",
+            b"NAME=fixture-value-made-here",
+            b"OTHER=1",
+        ]
+        .iter()
+        .map(|b| {
+            let mut v = b.to_vec();
+            v.push(0);
+            v.push(0x5a);
+            v
+        })
+        .collect();
+        let lens: Vec<usize> = bufs.iter().map(|b| b.len() - 2).collect();
+        let ptrs: Vec<*const c_char> = bufs
+            .iter_mut()
+            .map(|b| b.as_mut_ptr().cast::<c_char>().cast_const())
+            .collect();
+        let list = |range: std::ops::Range<usize>| -> Vec<*const c_char> {
+            ptrs[range]
+                .iter()
+                .copied()
+                .chain([std::ptr::null()])
+                .collect()
+        };
+        let (programs, argv, envp) = (list(0..2), list(2..5), list(5..7));
+        let p = Prepared {
+            slave: -1,
+            control: -1,
+            programs: programs.as_ptr(),
+            program_count: 2,
+            argv: argv.as_ptr(),
+            envp: envp.as_ptr(),
+        };
+        // SAFETY: every pointer is into a live, writable, NUL-terminated
+        // buffer of `bufs`, and each list ends with NULL.
+        unsafe { wipe_prepared(&p) };
+        for (b, len) in bufs.iter().zip(lens) {
+            assert!(b[..=len].iter().all(|c| *c == 0), "a string kept a byte");
+            assert_eq!(b[len + 1], 0x5a, "the wipe ran past a string's end");
         }
     }
 
