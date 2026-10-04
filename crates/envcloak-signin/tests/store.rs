@@ -8,6 +8,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use common::{
@@ -22,7 +23,7 @@ use envcloak_signin::{
     Generation, Instance, Lookup, Nonce, NotFound, Operation, OperationKey, OperationStore,
     Options, Phase, PublishDecision, RETRY_WINDOW, Refusal, Request, RequestError, RequestId,
     Revisions, Revocation, SignInScope, SignInStatement, State, Status, Step, StopReason,
-    StoreLimits, publication_decision,
+    StoreLimits, SupervisorId, WorkerId, publication_decision,
 };
 
 struct H {
@@ -33,6 +34,13 @@ struct H {
     wall: u64,
     awake: u64,
     draws: u8,
+    /// What the store asked the daemon to do, in order, as [`H::drain`]
+    /// has not yet returned it; and the worker and supervisor ids the
+    /// start effects handed out, the only place a test (or the daemon)
+    /// gets them.
+    effects: Vec<Effect>,
+    workers: BTreeMap<RequestId, WorkerId>,
+    supervisors: BTreeMap<RequestId, SupervisorId>,
 }
 
 impl H {
@@ -47,7 +55,55 @@ impl H {
             wall: 0,
             awake: 0,
             draws: 0,
+            effects: Vec::new(),
+            workers: BTreeMap::new(),
+            supervisors: BTreeMap::new(),
         }
+    }
+
+    /// Takes the store's effects, keeping the ids the start effects hand
+    /// out, as the daemon does.
+    fn harvest(&mut self) {
+        for e in self.store.drain_effects() {
+            match e {
+                Effect::StartAttempt {
+                    request, worker, ..
+                } => {
+                    assert!(self.workers.insert(request, worker).is_none());
+                }
+                Effect::StartSupervisor {
+                    request,
+                    supervisor,
+                } => {
+                    assert!(self.supervisors.insert(request, supervisor).is_none());
+                }
+                Effect::TearDown { .. } => {}
+            }
+            self.effects.push(e);
+        }
+    }
+
+    /// Every effect not yet returned, oldest first.
+    fn drain(&mut self) -> Vec<Effect> {
+        self.harvest();
+        std::mem::take(&mut self.effects)
+    }
+
+    /// `id`'s worker, as [`Effect::StartAttempt`] handed it out.
+    fn worker(&mut self, id: &RequestId) -> WorkerId {
+        if !self.workers.contains_key(id) {
+            self.harvest();
+        }
+        self.workers[id]
+    }
+
+    /// `id`'s supervisor channel, as [`Effect::StartSupervisor`] handed
+    /// its id out.
+    fn supervisor(&mut self, id: &RequestId) -> Channel {
+        if !self.supervisors.contains_key(id) {
+            self.harvest();
+        }
+        Channel::Supervisor(self.supervisors[id])
     }
 
     fn now(&self) -> Now {
@@ -120,14 +176,11 @@ impl H {
     }
 
     fn captured(&mut self, id: &RequestId) {
-        let g = self.generation(id);
+        let w = self.worker(id);
         self.store
-            .worker_captured(id, g, &self.now(), &self.world)
+            .worker_captured(id, &w, &self.now(), &self.world)
             .unwrap();
-    }
-
-    fn supervisor(&self, id: &RequestId) -> Channel {
-        Channel::Supervisor(self.op(id).supervisor().unwrap())
+        self.harvest();
     }
 
     fn inject(&mut self, id: &RequestId) {
@@ -193,12 +246,23 @@ fn a_retry_with_the_same_key_and_scope_joins_its_operation() {
         before.operation(&id).unwrap().context()
     );
     assert_eq!(h.op(&other).context().get(), h.op(&id).context().get() + 1);
-    // Approved and running: a retry still starts nothing.
+    // Approved and running: the approval asked for one attempt, with the
+    // worker id of the attempt's generation and the reserved lease; a retry
+    // still starts nothing.
     h.approve(&id, dev(2)).unwrap();
-    assert_eq!(h.store.drain_effects().len(), 1);
+    let (worker, lease) = (h.worker(&id), h.op(&id).lease().unwrap());
+    assert_eq!(worker.generation(), h.generation(&id));
+    assert_eq!(
+        h.drain(),
+        vec![Effect::StartAttempt {
+            request: id,
+            worker,
+            lease
+        }]
+    );
     let s = h.scope(&spec);
     assert!(matches!(h.request("intent-1", s), Ok(Lookup::Joined(_))));
-    assert!(h.store.drain_effects().is_empty());
+    assert!(h.drain().is_empty());
 }
 
 /// The same key with any one scope field changed is `request_conflict`,
@@ -366,12 +430,12 @@ fn a_finished_operation_answers_its_result_never_a_new_attempt() {
     let spec = Spec::dev();
     let id = h.open("k", &spec);
     h.approve(&id, dev(3)).unwrap();
-    let g = h.generation(&id);
-    h.store.drain_effects();
+    let g = h.worker(&id);
+    h.drain();
     h.store
         .worker_failed(
             &id,
-            g,
+            &g,
             AttemptFailure::CredentialsRejected,
             &h.now(),
             &h.world.clone(),
@@ -391,7 +455,7 @@ fn a_finished_operation_answers_its_result_never_a_new_attempt() {
         }
         other => panic!("{other:?}"),
     }
-    let effects = h.store.drain_effects();
+    let effects = h.drain();
     assert!(
         effects
             .iter()
@@ -411,17 +475,17 @@ fn a_once_approval_gives_one_attempt() {
     assert_eq!(st.state, State::AttemptRunning);
     let a = h.op(&id).authorization().unwrap();
     assert_eq!(h.store.authorization(&a).unwrap().remaining(), 0);
-    let g = h.generation(&id);
+    let g = h.worker(&id);
     let (now, w) = (h.now(), h.world.clone());
-    assert_eq!(h.store.permit(&id, g, Step::Password, &now, &w), Ok(()));
+    assert_eq!(h.store.permit(&id, &g, Step::Password, &now, &w), Ok(()));
     assert_eq!(
-        h.store.permit(&id, g, Step::Password, &now, &w),
+        h.store.permit(&id, &g, Step::Password, &now, &w),
         Err(AttemptError::Spent)
     );
-    assert_eq!(h.store.permit(&id, g, Step::Code, &now, &w), Ok(()));
-    assert_eq!(h.store.permit(&id, g, Step::Code, &now, &w), Ok(()));
+    assert_eq!(h.store.permit(&id, &g, Step::Code, &now, &w), Ok(()));
+    assert_eq!(h.store.permit(&id, &g, Step::Code, &now, &w), Ok(()));
     assert_eq!(
-        h.store.permit(&id, g, Step::Code, &now, &w),
+        h.store.permit(&id, &g, Step::Code, &now, &w),
         Err(AttemptError::Spent)
     );
     let other = h.open("k2", &spec);
@@ -452,11 +516,11 @@ fn a_dev_budget_only_shrinks_and_its_deadline_never_moves() {
         h.request("a", s).unwrap();
         h.status(&a);
     }
-    let g = h.generation(&a);
+    let g = h.worker(&a);
     h.store
         .worker_failed(
             &a,
-            g,
+            &g,
             AttemptFailure::CodeRejected,
             &h.now(),
             &h.world.clone(),
@@ -553,11 +617,11 @@ fn attempts_on_one_login_are_serialized() {
     h.approve(&c, dev(3)).unwrap();
     assert_eq!(h.op(&b).phase(), Phase::Approved);
     assert_eq!(h.op(&c).phase(), Phase::Approved);
-    let ga = h.generation(&a);
+    let ga = h.worker(&a);
     h.store
         .worker_failed(
             &a,
-            ga,
+            &ga,
             AttemptFailure::WorkerLost,
             &h.now(),
             &h.world.clone(),
@@ -565,7 +629,7 @@ fn attempts_on_one_login_are_serialized() {
         .unwrap();
     assert_eq!(h.op(&b).phase(), Phase::Approved);
     h.store
-        .cleanup_result(&a, ga, true, &h.now(), &h.world.clone())
+        .cleanup_result(&a, &ga, true, &h.now(), &h.world.clone())
         .unwrap();
     assert_eq!(h.op(&b).phase(), Phase::AttemptRunning);
     assert_eq!(h.op(&c).phase(), Phase::Approved);
@@ -597,7 +661,7 @@ fn a_revision_change_ends_everything_bound_to_it() {
             ..spec.clone()
         },
     );
-    h.store.drain_effects();
+    h.drain();
     h.world.login += 1;
     h.store.reconcile(&h.now(), &h.world.clone());
     for id in [delivered, running, pending] {
@@ -610,8 +674,7 @@ fn a_revision_change_ends_everything_bound_to_it() {
     assert_eq!(h.status(&running).state, State::Failed);
     assert!(h.store.authorizations().all(|a| a.ended()));
     let mut teardowns: Vec<(RequestId, bool)> = h
-        .store
-        .drain_effects()
+        .drain()
         .into_iter()
         .filter_map(|e| match e {
             Effect::TearDown {
@@ -656,7 +719,7 @@ fn a_stale_proof_mints_nothing() {
             .approve(&id, dev(2), &digest, &h.now(), &h.world.clone());
         assert_eq!(got, Err(ApproveError::NotPending));
         assert_eq!(h.store.authorizations().count(), 0);
-        assert!(h.store.drain_effects().is_empty());
+        assert!(h.drain().is_empty());
     }
 }
 
@@ -726,7 +789,7 @@ fn a_stop_before_publication_wins() {
     for (stop, state) in stops.into_iter().zip(states) {
         let mut h = H::new();
         let id = h.ready("k", &Spec::dev(), dev(2));
-        let g = h.generation(&id);
+        let g = h.worker(&id);
         stop(&mut h, &id);
         let before = h.store.clone();
         assert_eq!(
@@ -734,7 +797,7 @@ fn a_stop_before_publication_wins() {
             PublishDecision::Refuse(Refusal::Stopped)
         );
         let (now, w) = (h.now(), h.world.clone());
-        assert!(h.store.worker_captured(&id, g, &now, &w).is_err());
+        assert!(h.store.worker_captured(&id, &g, &now, &w).is_err());
         let from = h.supervisor(&id);
         assert!(h.store.published(&from, &id, &now, &w).is_err());
         assert!(h.store.check(&from, &id, &now, &w).is_err());
@@ -760,7 +823,7 @@ fn a_cancel_after_publication_reports_delivered_and_a_failed_close() {
     h.store
         .check(&from, &id, &h.now(), &h.world.clone())
         .unwrap();
-    h.store.drain_effects();
+    h.drain();
     let owner = h.op(&id).owner();
     let st = h
         .store
@@ -769,9 +832,9 @@ fn a_cancel_after_publication_reports_delivered_and_a_failed_close() {
     assert_eq!(st.state, State::Ended);
     assert!(st.receipt.delivered);
     assert_eq!(st.receipt.cleanup, Cleanup::Pending);
-    let g = h.generation(&id);
+    let (g, wk) = (h.generation(&id), h.worker(&id));
     assert_eq!(
-        h.store.drain_effects(),
+        h.drain(),
         vec![Effect::TearDown {
             request: id,
             generation: g,
@@ -784,7 +847,7 @@ fn a_cancel_after_publication_reports_delivered_and_a_failed_close() {
             .is_err()
     );
     h.store
-        .cleanup_result(&id, g, false, &h.now(), &h.world.clone())
+        .cleanup_result(&id, &wk, false, &h.now(), &h.world.clone())
         .unwrap();
     let st = h.status(&id);
     assert_eq!(st.receipt.cleanup, Cleanup::Failed);
@@ -843,8 +906,10 @@ fn only_the_exact_identity_publishes() {
 /// Declared state leaves the store only towards the operation's own
 /// generation's supervisor; no client (the requesting `envcloak mcp`, a
 /// sibling instance in the same root, the root itself, another root) and
-/// no other generation's supervisor can claim, publish or check (plan
-/// D-31, D-36; R-M2b-27).
+/// no other generation's supervisor can claim, publish or check, and no
+/// other attempt's worker reaches a running attempt (plan D-31, D-36;
+/// R-M2b-27). The ids are the ones the start effects handed out, as the
+/// daemon gets them; each own id is accepted (the positive controls).
 #[test]
 fn declared_state_goes_only_to_the_generations_supervisor() {
     let mut h = H::new();
@@ -852,23 +917,36 @@ fn declared_state_goes_only_to_the_generations_supervisor() {
     let a = h.open("a", &spec);
     h.approve(&a, dev(3)).unwrap();
     h.captured(&a);
+    // `a` captured, so the login is free: `b` runs and captures, then `c`
+    // runs; all three under one authorization, each its own generation.
     let b = h.open("b", &spec);
-    assert_eq!(h.op(&b).phase(), Phase::AttemptRunning);
+    h.captured(&b);
+    let c = h.open("c", &spec);
+    assert_eq!(h.op(&c).phase(), Phase::AttemptRunning);
     let other = h.supervisor(&b);
+    let (wa, wb, wc) = (h.worker(&a), h.worker(&b), h.worker(&c));
+    h.harvest();
     let before = h.store.clone();
     let (now, w) = (h.now(), h.world.clone());
-    // Worker results carrying another attempt's generation are discarded:
-    // `a`'s generation says nothing about `b`'s running attempt.
-    let ga = h.generation(&a);
-    assert!(h.store.worker_captured(&b, ga, &now, &w).is_err());
-    assert!(
-        h.store
-            .worker_failed(&b, ga, AttemptFailure::WorkerLost, &now, &w)
-            .is_err()
-    );
-    assert!(h.store.permit(&b, ga, Step::Password, &now, &w).is_err());
-    assert!(h.store.cleanup_result(&b, ga, true, &now, &w).is_err());
+    // Worker results carrying another attempt's id are discarded: `a`'s
+    // and `b`'s workers say nothing about `c`'s running attempt.
+    for wrong in [wa, wb] {
+        assert!(h.store.worker_captured(&c, &wrong, &now, &w).is_err());
+        assert!(
+            h.store
+                .worker_failed(&c, &wrong, AttemptFailure::WorkerLost, &now, &w)
+                .is_err()
+        );
+        assert!(
+            h.store
+                .permit(&c, &wrong, Step::Password, &now, &w)
+                .is_err()
+        );
+        assert!(h.store.cleanup_result(&c, &wrong, true, &now, &w).is_err());
+    }
     assert_eq!(h.store, before);
+    let mut own = h.store.clone();
+    assert_eq!(own.permit(&c, &wc, Step::Password, &now, &w), Ok(()));
     for from in [
         Channel::Client(MCP),
         Channel::Client(SIBLING),
@@ -915,7 +993,7 @@ fn deadlines_never_move_with_retries() {
     // An attempt past its timeout stops, and its late result is discarded.
     let id = h.open("k2", &spec);
     h.approve(&id, dev(2)).unwrap();
-    let g = h.generation(&id);
+    let g = h.worker(&id);
     h.tick(900);
     assert_eq!(
         h.status(&id).receipt.reason,
@@ -923,7 +1001,7 @@ fn deadlines_never_move_with_retries() {
     );
     assert!(
         h.store
-            .worker_captured(&id, g, &h.now(), &h.world.clone())
+            .worker_captured(&id, &g, &h.now(), &h.world.clone())
             .is_err()
     );
 }
@@ -1038,8 +1116,7 @@ impl H {
     }
 
     fn teardowns(&mut self) -> Vec<(RequestId, bool)> {
-        self.store
-            .drain_effects()
+        self.drain()
             .into_iter()
             .filter_map(|e| match e {
                 Effect::TearDown {
@@ -1170,10 +1247,10 @@ fn a_credential_step_needs_a_running_attempt_at_that_call() {
     // Positive control: a running attempt gets its password and a code.
     let mut h = H::new();
     let id = h.running("k", &Spec::dev(), long());
-    let g = h.generation(&id);
+    let g = h.worker(&id);
     let (now, w) = (h.now(), h.world.clone());
-    assert_eq!(h.store.permit(&id, g, Step::Password, &now, &w), Ok(()));
-    assert_eq!(h.store.permit(&id, g, Step::Code, &now, &w), Ok(()));
+    assert_eq!(h.store.permit(&id, &g, Step::Password, &now, &w), Ok(()));
+    assert_eq!(h.store.permit(&id, &g, Step::Code, &now, &w), Ok(()));
     let mut stops = attempt_changes();
     stops.extend([
         world_change(
@@ -1204,12 +1281,12 @@ fn a_credential_step_needs_a_running_attempt_at_that_call() {
     for c in stops {
         let mut h = H::new();
         let id = h.running("k", &Spec::dev(), c.options);
-        let g = h.generation(&id);
+        let g = h.worker(&id);
         (c.apply)(&mut h, &id);
         let (now, w) = (h.now(), h.world.clone());
         for step in [Step::Password, Step::Code] {
             assert_eq!(
-                h.store.permit(&id, g, step, &now, &w),
+                h.store.permit(&id, &g, step, &now, &w),
                 Err(AttemptError::NotRunning),
                 "{} {step:?}",
                 c.name
@@ -1237,31 +1314,34 @@ fn every_call_sees_a_change_made_before_it() {
         // The worker's results.
         let mut h = H::new();
         let id = h.running("k", &Spec::dev(), c.options);
-        let g = h.generation(&id);
-        h.store.drain_effects();
+        let g = h.worker(&id);
+        h.drain();
         (c.apply)(&mut h, &id);
         let (now, w) = (h.now(), h.world.clone());
         assert_eq!(
-            h.store.worker_captured(&id, g, &now, &w),
+            h.store.worker_captured(&id, &g, &now, &w),
             Err(Discarded),
             "{n}"
         );
-        assert!(
-            !h.store
-                .drain_effects()
-                .iter()
-                .any(|e| matches!(e, Effect::StartSupervisor { .. })),
+        // Only the change's teardown: no supervisor is started for it.
+        assert_eq!(
+            h.drain(),
+            vec![Effect::TearDown {
+                request: id,
+                generation: g.generation(),
+                delivered: false
+            }],
             "{n}"
         );
         assert_eq!(h.status(&id).receipt.reason, Some(c.reason), "{n}");
         let mut h = H::new();
         let id = h.running("k", &Spec::dev(), c.options);
-        let g = h.generation(&id);
+        let g = h.worker(&id);
         (c.apply)(&mut h, &id);
         let (now, w) = (h.now(), h.world.clone());
         let failed = h
             .store
-            .worker_failed(&id, g, AttemptFailure::WorkerLost, &now, &w);
+            .worker_failed(&id, &g, AttemptFailure::WorkerLost, &now, &w);
         assert_eq!(failed, Err(Discarded), "{n}");
         assert_eq!(h.status(&id).receipt.reason, Some(c.reason), "{n}");
         // The owner's cancel and a lock come after the change.
@@ -1282,11 +1362,11 @@ fn every_call_sees_a_change_made_before_it() {
         // The teardown the change asked for is confirmed by the next report.
         let mut h = H::new();
         let id = h.running("k", &Spec::dev(), c.options);
-        let g = h.generation(&id);
+        let g = h.worker(&id);
         (c.apply)(&mut h, &id);
         let (now, w) = (h.now(), h.world.clone());
         assert_eq!(
-            h.store.cleanup_result(&id, g, true, &now, &w),
+            h.store.cleanup_result(&id, &g, true, &now, &w),
             Ok(()),
             "{n}"
         );
@@ -1335,7 +1415,7 @@ fn every_call_sees_a_change_made_before_it() {
         // The per-call check on a published session.
         let mut h = H::new();
         let id = h.delivered("k", &Spec::dev(), c.options);
-        h.store.drain_effects();
+        h.drain();
         (c.apply)(&mut h, &id);
         assert_eq!(h.check_call(&id), Err(ChannelRefused), "{n}");
         assert_eq!(h.teardowns(), vec![(id, true)], "{n}");
@@ -1445,7 +1525,7 @@ fn the_publication_decision_refuses_each_reason_on_its_own() {
         Refuse(Refusal::NotReady)
     );
     let mut decided = h.store.clone();
-    let from = Channel::Supervisor(op.supervisor().unwrap());
+    let from = h.supervisor(&id);
     decided
         .identity_response(&from, &id, &me, &base.now, &w)
         .unwrap();
@@ -1542,7 +1622,7 @@ fn a_lock_ends_a_delivered_session_and_its_authorization() {
     let id = h.delivered("a", &spec, long());
     let auth = h.op(&id).authorization().unwrap();
     assert_eq!(h.check_call(&id), Ok(()));
-    h.store.drain_effects();
+    h.drain();
     let (now, w) = (h.now(), h.world.clone());
     h.store.lock(&now, &w);
     assert_eq!(h.check_call(&id), Err(ChannelRefused));
@@ -1570,7 +1650,7 @@ fn every_change_ends_a_delivered_session() {
         let mut h = H::new();
         let id = h.delivered("a", &Spec::dev(), c.options);
         let auth = h.op(&id).authorization().unwrap();
-        h.store.drain_effects();
+        h.drain();
         (c.apply)(&mut h, &id);
         h.store.reconcile(&h.now(), &h.world.clone());
         assert_eq!(h.teardowns(), vec![(id, true)], "{n}");
@@ -1595,7 +1675,7 @@ fn every_change_ends_a_delivered_session() {
 fn a_delivered_session_ends_with_its_authorization() {
     let mut h = H::new();
     let id = h.delivered("a", &Spec::dev(), short());
-    h.store.drain_effects();
+    h.drain();
     h.pass(599);
     assert_eq!(h.check_call(&id), Ok(()));
     h.pass(1);
@@ -1622,35 +1702,34 @@ fn a_failed_teardown_holds_the_login_until_a_close_is_confirmed() {
     let a = h.running("a", &spec, long());
     let b = h.open("b", &spec);
     assert_eq!(h.op(&b).phase(), Phase::Approved);
-    let g = h.generation(&a);
+    let g = h.worker(&a);
     let (now, w) = (h.now(), h.world.clone());
     h.store
-        .worker_failed(&a, g, AttemptFailure::WorkerLost, &now, &w)
+        .worker_failed(&a, &g, AttemptFailure::WorkerLost, &now, &w)
         .unwrap();
-    h.store.cleanup_result(&a, g, false, &now, &w).unwrap();
+    h.store.cleanup_result(&a, &g, false, &now, &w).unwrap();
     assert_eq!(h.op(&a).cleanup(), Cleanup::Failed);
     assert_eq!(h.op(&b).phase(), Phase::Approved);
     h.tick(60);
     assert_eq!(h.op(&b).phase(), Phase::Approved);
     let (now, w) = (h.now(), h.world.clone());
     assert_eq!(
-        h.store.cleanup_result(&a, g, false, &now, &w),
+        h.store.cleanup_result(&a, &g, false, &now, &w),
         Err(Discarded)
     );
     assert_eq!(h.op(&b).phase(), Phase::Approved);
     // The confirmation frees the login: `b` starts.
-    h.store.drain_effects();
-    assert_eq!(h.store.cleanup_result(&a, g, true, &now, &w), Ok(()));
+    h.drain();
+    assert_eq!(h.store.cleanup_result(&a, &g, true, &now, &w), Ok(()));
     assert_eq!(h.op(&a).cleanup(), Cleanup::Done);
     assert_eq!(h.op(&b).phase(), Phase::AttemptRunning);
+    let started = h.drain();
     assert!(
-        h.store
-            .drain_effects()
-            .iter()
-            .any(|e| matches!(e, Effect::StartAttempt { request, .. } if *request == b))
+        matches!(started.as_slice(), [Effect::StartAttempt { request, .. }] if *request == b),
+        "{started:?}"
     );
     assert_eq!(
-        h.store.cleanup_result(&a, g, true, &now, &w),
+        h.store.cleanup_result(&a, &g, true, &now, &w),
         Err(Discarded)
     );
 }
@@ -1668,11 +1747,11 @@ fn an_unconfirmed_teardown_is_kept_until_it_is_confirmed() {
         let mut h = H::new();
         let spec = Spec::dev();
         let id = h.running("k", &spec, long());
-        let g = h.generation(&id);
+        let g = h.worker(&id);
         let (o, now, w) = (h.owner_of(&id), h.now(), h.world.clone());
         h.store.cancel(&o, &id, &now, &w).unwrap();
         if fail_first {
-            h.store.cleanup_result(&id, g, false, &now, &w).unwrap();
+            h.store.cleanup_result(&id, &g, false, &now, &w).unwrap();
         }
         h.tick(RETRY_WINDOW.as_secs() * 3);
         let want = if fail_first {
@@ -1684,7 +1763,7 @@ fn an_unconfirmed_teardown_is_kept_until_it_is_confirmed() {
         let s = h.scope(&spec);
         assert!(matches!(h.request("k", s), Ok(Lookup::Joined(_))));
         let (now, w) = (h.now(), h.world.clone());
-        assert_eq!(h.store.cleanup_result(&id, g, true, &now, &w), Ok(()));
+        assert_eq!(h.store.cleanup_result(&id, &g, true, &now, &w), Ok(()));
         // Confirmed, and past its window: forgotten at once.
         assert!(h.store.operation(&id).is_none());
     }
@@ -2105,6 +2184,78 @@ fn reserving_a_credit_refuses_each_reason_on_its_own() {
     assert_eq!(once.deadline(), Deadline::after(&t0, hours(4)));
 }
 
+/// A valid capture asks the daemon to start exactly one supervisor, for
+/// this operation and its attempt's generation, and the id that effect
+/// hands out is the channel the declared state then goes to: the only way
+/// to a supervisor. A capture that is discarded asks for nothing
+/// (`every_call_sees_a_change_made_before_it`). Mutation: "worker_captured
+/// asks for no supervisor".
+#[test]
+fn a_valid_capture_starts_the_generations_supervisor() {
+    let mut h = H::new();
+    let id = h.running("k", &Spec::dev(), long());
+    let wk = h.worker(&id);
+    assert!(
+        h.drain()
+            .iter()
+            .all(|e| !matches!(e, Effect::StartSupervisor { .. }))
+    );
+    let (now, w) = (h.now(), h.world.clone());
+    h.store.worker_captured(&id, &wk, &now, &w).unwrap();
+    let effects = h.drain();
+    let [
+        Effect::StartSupervisor {
+            request,
+            supervisor,
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(*request, id);
+    assert_eq!(supervisor.generation(), h.generation(&id));
+    let inj = h
+        .store
+        .inject_state(&Channel::Supervisor(*supervisor), &id, &now, &w)
+        .unwrap();
+    assert_eq!(
+        (inj.generation, inj.context),
+        (h.generation(&id), h.op(&id).context())
+    );
+}
+
+/// Each supervisor message takes exactly its own phase. The per-call check
+/// is only for a published session: after the decision and before the
+/// supervisor's acknowledgement it is refused and changes nothing.
+/// Publication is one transition: a second acknowledgement, and a second
+/// identity response after it, are refused and change nothing. The
+/// positive controls: the first acknowledgement is taken, and the check
+/// passes after it. Mutations: "check takes a decided session",
+/// "published takes a published session".
+#[test]
+fn the_check_and_the_publication_each_take_their_own_phase() {
+    let mut h = H::new();
+    let id = h.ready("k", &Spec::dev(), long());
+    assert_eq!(h.decide(&id, "editor"), PublishDecision::Publish);
+    let from = h.supervisor(&id);
+    h.harvest();
+    let (now, w) = (h.now(), h.world.clone());
+    let before = h.store.clone();
+    assert_eq!(h.store.check(&from, &id, &now, &w), Err(ChannelRefused));
+    assert_eq!(h.store, before);
+    assert_eq!(h.store.published(&from, &id, &now, &w), Ok(()));
+    assert_eq!(h.op(&id).phase(), Phase::Published);
+    let before = h.store.clone();
+    assert_eq!(h.store.published(&from, &id, &now, &w), Err(ChannelRefused));
+    assert_eq!(
+        h.store
+            .identity_response(&from, &id, &identity("editor"), &now, &w),
+        Ok(PublishDecision::Refuse(Refusal::NotReady))
+    );
+    assert_eq!(h.store, before);
+    assert_eq!(h.store.check(&from, &id, &now, &w), Ok(()));
+}
+
 /// A `dev` authorization that is in force and has credits left covers a
 /// new key only for exactly its scope. Every part of the scope changed
 /// alone (each field of the encoding, and each part of a declared cookie,
@@ -2134,7 +2285,7 @@ fn every_scope_part_needs_its_own_approval() {
         h.approve(&a, long()).unwrap();
         let auth = h.op(&a).authorization().unwrap();
         assert_eq!(h.store.authorization(&auth).unwrap().remaining(), 1);
-        h.store.drain_effects();
+        h.drain();
         match h.request("b", changed) {
             Err(RequestError::WrongDaemon) if v == Vary::Field(29) => {}
             Ok(Lookup::Reserved(st)) if v != Vary::Field(29) => {
@@ -2153,8 +2304,7 @@ fn every_scope_part_needs_its_own_approval() {
             "{v:?}"
         );
         assert!(
-            h.store
-                .drain_effects()
+            h.drain()
                 .iter()
                 .all(|e| !matches!(e, Effect::StartAttempt { .. })),
             "{v:?}"

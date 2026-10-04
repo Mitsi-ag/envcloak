@@ -15,14 +15,30 @@
 //! the phase keeps saying how far the attempt got.
 //!
 //! **Generations and channels** (plan D-31, D-36). Each attempt gets a
-//! [`Generation`], unique in the daemon, and the worker's results carry
-//! it: a result with another generation is discarded. The generation's
-//! browser supervisor is a process the daemon starts; its control pipe is
-//! the only [`Channel::Supervisor`], identified by a [`SupervisorId`]
-//! that only the operation store makes. Declared state leaves the store
-//! only towards that channel, and claim, publish and the per-call check
-//! are accepted only from it; a client of the socket ([`Channel::Client`],
-//! a sibling `envcloak mcp` in the same root included) is never one.
+//! [`Generation`], unique in the daemon. Its worker (the reaper and driver
+//! the daemon starts for it) is named by a [`WorkerId`], and its browser
+//! supervisor, a process the daemon starts once the state is captured, by
+//! a [`SupervisorId`]: the store makes each once, in the effect that asks
+//! the daemon to start that process ([`crate::Effect::StartAttempt`],
+//! [`crate::Effect::StartSupervisor`]), and nothing else makes or returns
+//! one; a generation read from an operation does not make either. A
+//! worker's credential steps, results and teardown report are taken only
+//! with the attempt's own [`WorkerId`], and anything else is discarded.
+//! Declared state leaves the store only towards the generation's
+//! [`Channel::Supervisor`], and claim, publish and the per-call check are
+//! accepted only from it; a client of the socket ([`Channel::Client`], a
+//! sibling `envcloak mcp` in the same root included) is never one.
+//!
+//! **What the store trusts.** It cannot see where a message came from: it
+//! takes the channel and the worker id the daemon passes with a message.
+//! So the daemon (plan M2b-05, M2b-08, M2b-09) binds each id to the pipes
+//! it creates for that process when it starts it, and derives the channel
+//! and the id of every message from the pipe the message arrived on: never
+//! from a socket message, and never from anything a message says. A
+//! socket client (a sibling instance in the same root included) then
+//! reaches the supervisor's entry points only as [`Channel::Client`], and
+//! another generation's worker or supervisor only with its own id; the
+//! store refuses both.
 //!
 //! **Publication** is one decision, [`publication_decision`], taken under
 //! the store's lock when the supervisor returns the identity response read
@@ -59,10 +75,78 @@ impl Generation {
     }
 }
 
-/// The control pipe of one generation's browser supervisor. Only the
-/// operation store makes one, when the attempt starts; the daemon starts
+/// One attempt's worker: the reaper and driver the daemon starts for it.
+/// The store makes one only in [`crate::Effect::StartAttempt`]; the daemon
+/// binds it to those processes' pipes and passes it with every message
+/// read from them. See the module documentation.
+///
+/// A generation is read from it,
+///
+/// ```
+/// fn read(w: envcloak_signin::WorkerId) -> envcloak_signin::Generation {
+///     w.generation()
+/// }
+/// ```
+///
+/// but nothing outside the store makes one from a generation:
+///
+/// ```compile_fail
+/// fn make(g: envcloak_signin::Generation) -> envcloak_signin::WorkerId {
+///     envcloak_signin::WorkerId(g)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn make(g: envcloak_signin::Generation) -> envcloak_signin::WorkerId {
+///     envcloak_signin::WorkerId::new(g)
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkerId(Generation);
+
+impl WorkerId {
+    pub(crate) const fn new(g: Generation) -> Self {
+        WorkerId(g)
+    }
+
+    pub const fn generation(&self) -> Generation {
+        self.0
+    }
+}
+
+/// The control pipe of one generation's browser supervisor. The store
+/// makes one only in [`crate::Effect::StartSupervisor`]; the daemon starts
 /// the supervisor process with that pipe and passes the id with every
-/// message read from it.
+/// message read from it. See the module documentation.
+///
+/// A generation is read from it,
+///
+/// ```
+/// fn read(s: envcloak_signin::SupervisorId) -> envcloak_signin::Generation {
+///     s.generation()
+/// }
+/// ```
+///
+/// but nothing outside the store makes one, from a generation or from an
+/// operation:
+///
+/// ```compile_fail
+/// fn make(g: envcloak_signin::Generation) -> envcloak_signin::SupervisorId {
+///     envcloak_signin::SupervisorId(g)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn make(g: envcloak_signin::Generation) -> envcloak_signin::SupervisorId {
+///     envcloak_signin::SupervisorId::new(g)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn make(op: &envcloak_signin::Operation) -> Option<envcloak_signin::SupervisorId> {
+///     op.supervisor()
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SupervisorId(Generation);
 
@@ -82,7 +166,8 @@ pub enum Channel {
     /// A client of the socket, identified by its process instance. Never
     /// given declared state, and never able to claim, publish or check.
     Client(Instance),
-    /// A browser supervisor's control pipe.
+    /// A browser supervisor's control pipe, as the daemon bound it when it
+    /// started that supervisor.
     Supervisor(SupervisorId),
 }
 
@@ -325,13 +410,10 @@ impl Operation {
         self.lease
     }
 
+    /// The attempt's generation, once it started. A value to read, never
+    /// a [`WorkerId`] or a [`SupervisorId`].
     pub fn generation(&self) -> Option<Generation> {
         self.generation
-    }
-
-    /// The generation's supervisor, once the attempt started.
-    pub fn supervisor(&self) -> Option<SupervisorId> {
-        self.generation.map(SupervisorId::new)
     }
 
     /// When the pending statement expires.
