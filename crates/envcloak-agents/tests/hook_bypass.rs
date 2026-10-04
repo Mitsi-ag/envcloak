@@ -353,6 +353,9 @@ const CORPUS: &[(&str, Option<Class>)] = &[
         "find . -wholename './s*[e]nv' -exec cat {} +",
         Some(Class::EnvFile),
     ),
+    // A `]` first in a class is one of its members (bash and zsh measured).
+    ("cat /proc/self/env[]i]ron", Some(Class::EnvDump)),
+    ("cat /proc/1/env[!]x]ron", Some(Class::EnvDump)),
     // What the hook lets through (docs/INSTALLERS.md, "What the hook does
     // not see").
     ("f=.env; cat \"$f\"", None),
