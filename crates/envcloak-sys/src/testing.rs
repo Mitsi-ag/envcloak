@@ -56,6 +56,19 @@ use crate::alloc::Backing;
 /// The command line of the test binaries with their own `main`.
 pub mod libtest;
 
+/// Set by [`force_descriptor_fallback`]: the PTY monitor passes over its
+/// primary way of closing descriptors (`close_range` on Linux,
+/// `proc_pidinfo` on macOS).
+pub(crate) static DESCRIPTOR_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Makes the PTY monitors this process forks from now on close their
+/// inherited descriptors the second way (Linux: the `/proc/self/fd`
+/// listing; macOS has none, so they refuse to start the command), for the
+/// test of what happens where the first way fails.
+pub fn force_descriptor_fallback() {
+    DESCRIPTOR_FALLBACK.store(true, Ordering::Relaxed);
+}
+
 /// How a test makes a child start with its children reaped by the kernel
 /// on their own, as a parent may leave it (both survive `exec`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -45,11 +45,11 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::time::Duration;
 
-use envcloak_sys::pty::{MonitorCommand, MonitorEvent, open_pty, spawn_session};
+use envcloak_sys::pty::{MonitorCommand, MonitorEvent, SessionError, open_pty, spawn_session};
 use envcloak_sys::{TerminalGuard, TerminalSettings, set_window_size, window_size};
 use pty_common::{
-    DEADLINE, OwnPidOnly, ROLE, Screen, has_exited, my_role, own_allocations, put, run_cases,
-    short_dir, wait_child, wait_child_within,
+    DEADLINE, OwnPidOnly, ROLE, SCENARIO, Screen, has_exited, my_role, own_allocations, put,
+    run_cases, short_dir, wait_child, wait_child_within,
 };
 
 #[global_allocator]
@@ -61,6 +61,7 @@ fn main() {
         Some("driver") => return driver(),
         Some("probe") => return probe(),
         Some("cat") => return cat(),
+        Some("fd-stand-in") => return fd_stand_in(),
         Some(other) => panic!("unknown role {other}"),
         None => {}
     }
@@ -82,6 +83,10 @@ fn main() {
             (
                 "a_monitor_that_dies_ends_the_channel_for_the_cli",
                 a_monitor_that_dies_ends_the_channel_for_the_cli,
+            ),
+            (
+                "the_monitor_closes_a_descriptor_above_a_lowered_limit_or_refuses",
+                the_monitor_closes_a_descriptor_above_a_lowered_limit_or_refuses,
             ),
             (
                 "an_outer_job_control_shell_regains_its_terminal_and_fg_resumes",
@@ -416,6 +421,128 @@ fn a_monitor_that_dies_ends_the_channel_for_the_cli() {
         screen.wait_for_end(),
         "the hung-up session did not end the terminal: {}",
         screen.text()
+    );
+}
+
+/// The descriptor the stand-in leaves open above its lowered limit.
+const HIGH_FD: libc::c_int = 200;
+/// The stand-in's lowered soft limit on descriptors.
+const LOWERED_LIMIT: libc::rlim_t = 64;
+
+/// The CLI stand-in for the descriptor cleanup: opens descriptor 200
+/// without close-on-exec, lowers its soft `RLIMIT_NOFILE` to 64 (below
+/// it), forces the monitor's second way of closing descriptors when
+/// `ENVCLOAK_PTY_SCENARIO` is `fallback`, starts the probe under a monitor,
+/// and reports what the monitor holds (`MONITOR-FDS`), or `REFUSED` with
+/// the error when the monitor would not start the command.
+fn fd_stand_in() {
+    let out = std::io::stdout();
+    let say = |s: String| put(out.as_fd(), s.as_bytes());
+    let null = std::fs::File::open("/dev/null").unwrap();
+    // SAFETY: F_DUPFD makes a new descriptor at 200 or above, without
+    // close-on-exec, or fails without effect.
+    let high = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, HIGH_FD) };
+    assert_eq!(high, HIGH_FD, "{}", std::io::Error::last_os_error());
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is writable; then the soft limit alone is lowered.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim), 0);
+        lim.rlim_cur = LOWERED_LIMIT;
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &lim), 0);
+    }
+    // SAFETY: F_GETFD only reads a descriptor's flags.
+    let open_above = unsafe { libc::fcntl(HIGH_FD, libc::F_GETFD) } >= 0;
+    say(format!("HIGH-FD-OPEN {open_above}\n"));
+    if std::env::var(SCENARIO).as_deref() == Ok("fallback") {
+        envcloak_sys::testing::force_descriptor_fallback();
+    }
+    let (master, slave, _) = raw_pty(false);
+    let exe = std::env::current_exe().unwrap();
+    match spawn_session(
+        &[exe.as_os_str()],
+        &[
+            (OsStr::new("PATH"), OsStr::new("/usr/bin:/bin")),
+            (OsStr::new(ROLE), OsStr::new("probe")),
+        ],
+        slave,
+    ) {
+        Ok(mut monitor) => {
+            let mut screen = Screen::new(master);
+            screen.expect("PROBE", 1, "the probe reports");
+            let fds: Vec<i32> = descriptors_of(monitor.monitor_id())
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            let probe = screen.text();
+            say(format!(
+                "MONITOR-FDS {fds:?}\nCOMMAND-CLEAN {}\n",
+                probe.contains("fds=[0, 1, 2] ")
+            ));
+            screen.type_bytes(b"\n");
+            let event = screen.next_event(&mut monitor);
+            assert!(matches!(event, Some(MonitorEvent::Exited(_))), "{event:?}");
+            monitor.finish().unwrap();
+        }
+        Err(SessionError::Setup(e)) => say(format!("REFUSED {e}\n")),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// The monitor closes every descriptor it inherits but the slave and the
+/// channel, also one opened before the CLI lowered its limit and now above
+/// it (Codex's review of PR #27). The CLI stand-in holds descriptor 200,
+/// not close-on-exec, under a soft limit of 64. The primary way (Linux
+/// `close_range`, macOS `proc_pidinfo`) leaves the monitor 0 to 3 and the
+/// command 0 to 2; with it passed over, Linux's `/proc/self/fd` listing
+/// does the same, and macOS, which has no second listing, refuses to start
+/// the command (`SetupFailed`) rather than start it with what it could not
+/// close. Close up to the soft limit instead (the fallback before) and
+/// descriptor 200 is left in the monitor, and on macOS the command starts.
+fn the_monitor_closes_a_descriptor_above_a_lowered_limit_or_refuses() {
+    let mut seen = Vec::new();
+    for scenario in ["primary", "fallback"] {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("PATH", "/usr/bin:/usr/sbin:/bin")
+            .env(ROLE, "fd-stand-in")
+            .env(SCENARIO, scenario)
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{scenario}: {:?}\n{text}", out.status);
+        assert!(
+            text.contains("HIGH-FD-OPEN true"),
+            "{scenario}: the positive control: descriptor 200 was not open in the stand-in\n{text}"
+        );
+        if scenario == "fallback" && cfg!(target_os = "macos") {
+            assert!(
+                text.contains("REFUSED"),
+                "{scenario}: the monitor started a command it could not show clean:\n{text}"
+            );
+        } else {
+            assert!(
+                text.contains("MONITOR-FDS [0, 1, 2, 3]"),
+                "{scenario}: the monitor kept more than the slave and the channel:\n{text}"
+            );
+            assert!(
+                text.contains("COMMAND-CLEAN true"),
+                "{scenario}: the command started with more than the slave:\n{text}"
+            );
+        }
+        seen.push(format!(
+            "{scenario}: {}",
+            text.lines().nth(1).unwrap_or_default()
+        ));
+    }
+    println!(
+        "pty_topology ({}): descriptor 200 above a soft limit of 64: {}",
+        std::env::consts::OS,
+        seen.join("; ")
     );
 }
 
