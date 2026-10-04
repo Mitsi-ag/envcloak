@@ -1606,15 +1606,36 @@ fn only_the_executable_roots_a_grant_above_the_session() {
             Some(vec!["/opt/vendor/codex"]),
             "codex",
         ),
+        // Codex review (medium): a node placed where Claude Code's pattern
+        // takes any name is still an interpreter, read by its script.
+        (
+            "an interpreter at an agent's path",
+            holder(
+                Some("/Users/u/.local/share/claude/versions/node"),
+                "node",
+                None,
+            ),
+            Some(vec!["node", "/opt/x/@anthropic-ai/claude-code/cli.js"]),
+            "claude-code",
+        ),
     ];
-    // The control: node as itself is no agent, and roots nothing.
-    let mut t = sibling_sessions(
+    // The controls: node as itself is no agent, and roots nothing; nor
+    // does a node at an agent's path running another script (mutation
+    // checked: letting `claude/versions/*` take in a node fails this test
+    // and the case above).
+    for h in [
         holder(Some("/usr/bin/node"), "node", None),
-        Some(vec!["node"]),
-    );
-    let e = gather_in(&mut t, &peer(320), Claims::none(), &cat).unwrap();
-    assert!(e.nearest_agent().is_none());
-    assert_eq!(e.root().pid, 300);
+        holder(
+            Some("/Users/u/.local/share/claude/versions/node"),
+            "node",
+            None,
+        ),
+    ] {
+        let mut t = sibling_sessions(h, Some(vec!["node", "/tmp/x.js"]));
+        let e = gather_in(&mut t, &peer(320), Claims::none(), &cat).unwrap();
+        assert!(e.nearest_agent().is_none(), "{e:?}");
+        assert_eq!(e.root().pid, 300);
+    }
 
     for (what, h, argv, id) in asserted_cases {
         let mut t = sibling_sessions(h.clone(), argv.clone());
@@ -2012,17 +2033,20 @@ fn decides_as(e: &SubjectEvidence, want: &SubjectEvidence) {
 #[test]
 fn an_exec_while_hashing_is_walked_again() {
     let node80 = || with_file(info(80, 70, 70, 501, Some("/usr/bin/node")), (1, 82));
+    // Claude Code's native build, whose process kept node's command name.
     let claude_named_node = || {
-        with_file(
+        let mut p = with_file(
             info(
                 80,
                 70,
                 70,
                 501,
-                Some("/home/u/.local/share/claude/versions/node"),
+                Some("/home/u/.local/share/claude/versions/2.1.280"),
             ),
             (1, 83),
-        )
+        );
+        p.comm = OsString::from("node");
+        p
     };
     for (before, after) in [
         (bash80(), claude80()),
