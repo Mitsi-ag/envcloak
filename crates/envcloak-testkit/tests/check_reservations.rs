@@ -3236,3 +3236,73 @@ fn a_control_message_the_reader_cannot_read_is_refused() {
         "`runner Release` is `landed`, but the code has no such entry",
     );
 }
+
+/// A same-named enum in an inactive item, unused module or unexpanded
+/// macro is not evidence for the public type the codec uses. The reader
+/// refuses an unsupported binding, even when its variants match the table.
+#[test]
+fn control_message_declarations_must_bind_to_public_module_types() {
+    for name in ["Report", "Command"] {
+        for form in [
+            "conditional",
+            "nested",
+            "macro",
+            "private",
+            "restricted",
+            "attribute",
+        ] {
+            let t = fixture();
+            let path = t.home().join(MONITOR);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let head = format!("pub enum {name} {{");
+            let start = text.find(&head).unwrap();
+            let end = start + text[start..].find("\n}\n").unwrap() + 2;
+            let original = &text[start..end];
+            let actual = original.replacen(&head, &format!("pub enum Actual{name} {{"), 1);
+            let incidental = match form {
+                "conditional" => format!("#[cfg(any())]\n{original}"),
+                "nested" => format!("mod unused {{\n{original}\n}}"),
+                "macro" => format!("macro_rules! unused {{ () => {{\n{original}\n}} }}"),
+                "private" => original.replacen("pub enum", "enum", 1),
+                "restricted" => original.replacen("pub enum", "pub(crate) enum", 1),
+                "attribute" => format!("#[allow(dead_code)]\n{original}"),
+                _ => unreachable!(),
+            };
+            let replacement = match form {
+                "conditional" | "nested" | "macro" => {
+                    format!("{actual}\npub type {name} = Actual{name};\n{incidental}")
+                }
+                _ => incidental,
+            };
+            std::fs::write(&path, text.replacen(original, &replacement, 1)).unwrap();
+            assert_fails(&t, "must be a direct module-scope public enum");
+        }
+    }
+}
+
+/// File-level conditionals still affect the binding when an import ends
+/// between the attribute and the enum. A test-only decoy is removed by the
+/// existing source skeleton and must not obscure the ordinary public type.
+#[test]
+fn file_conditionals_are_refused_and_test_only_control_decoys_are_ignored() {
+    for attr in ["#![cfg(any())]", "#![cfg_attr(any(), cfg(any()))]"] {
+        let t = fixture();
+        let path = t.home().join(MONITOR);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{attr}\nuse std::marker::PhantomData;\n{text}"),
+        )
+        .unwrap();
+        assert_fails(&t, "conditional inner attribute");
+    }
+    let t = fixture();
+    let path = t.home().join(MONITOR);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{text}\n#[cfg(test)] mod decoy {{ pub enum Report {{ Ping }} pub enum Command {{ Ping }} }}\n"),
+    )
+    .unwrap();
+    assert_passes(&t.home());
+}

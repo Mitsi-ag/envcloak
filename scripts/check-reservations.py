@@ -2494,6 +2494,30 @@ CONTROL_CHANNELS = {
 }
 ENUM_DECL = re.compile(r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)")
 VARIANT = re.compile(r"([A-Z][A-Za-z0-9]*)(\s*\((?:[^()]|\([^()]*\))*\))?")
+CONTROL_ENUM_HEAD = re.compile(r"(?:\s*#\s*\[\s*derive\s*\([^()[\]{}]*\)\s*\])*\s*pub\s+")
+INNER_CONDITIONAL = re.compile(r"#\s*!\s*\[\s*(?:cfg|cfg_attr)\b")
+
+
+def direct_control_enum(src, start, line, name):
+    """Bind a message enum to its direct public declaration in this file.
+    A nested or macro declaration, or an unhandled attribute on the item,
+    does not establish that binding. Refuse those forms rather than count
+    the variants of an incidental enum with the same name."""
+    stack = []
+    item_start = 0
+    closes = {"(": ")", "[": "]", "{": "}"}
+    for i, c in enumerate(src.skel[:start]):
+        if c in closes:
+            stack.append(closes[c])
+        elif c in ")]}":
+            if not stack or stack.pop() != c:
+                raise SourceError("%s: unbalanced source before `enum %s`" % (line, name))
+            if not stack and c == "}":
+                item_start = i + 1
+        elif c == ";" and not stack:
+            item_start = i + 1
+    if stack or not CONTROL_ENUM_HEAD.fullmatch(src.skel[item_start:start]):
+        raise SourceError("%s: `enum %s` must be a direct module-scope public enum with only derive attributes; the reader cannot establish its control-message binding" % (line, name))
 
 
 def code_control_messages(root):
@@ -2503,11 +2527,17 @@ def code_control_messages(root):
     attribute on one (a `cfg` could take it away), a discriminant, a
     struct variant, or anything else is an error. So are an enum of the
     channel declared twice or not at all, generic, a message named twice
-    on one channel, and a `#[path]` module in the file."""
+    on one channel, and a `#[path]` module in the file. The named enums
+    must be direct module-scope public declarations with only derive
+    attributes; nested, macro, conditional or other unhandled bindings
+    are refused. A conditional inner attribute on the file is refused
+    too, even when imports separate it from the enum."""
     found = {}
     for channel, (rel, enums) in sorted(CONTROL_CHANNELS.items()):
         src = Source(rel, read(root, rel))
         refuse_path_attributes(src)
+        if INNER_CONDITIONAL.search(src.skel):
+            raise SourceError("%s: a conditional inner attribute prevents the reader from establishing its control-message bindings" % rel)
         bodies = {}
         for m in ENUM_DECL.finditer(src.skel):
             name = m.group(1)
@@ -2519,11 +2549,14 @@ def code_control_messages(root):
             brace = src.skel.find("{", m.end())
             if brace < 0 or src.skel[m.end():brace].strip():
                 raise SourceError("%s: `enum %s` is not a plain enum with a body the reader can read" % (line, name))
-            bodies[name] = (line, src.skel[brace + 1:src.block_end(brace) - 1])
+            bodies[name] = (line, src.skel[brace + 1:src.block_end(brace) - 1], m.start())
         for name in enums:
             if name not in bodies:
                 raise SourceError("%s: no `enum %s`, whose variants are the `%s` channel's messages" % (rel, name, channel))
-            line, body = bodies[name]
+            # Establish uniqueness before binding: a decoy encountered before
+            # the real declaration is still diagnosed as a duplicate enum.
+            line, body, start = bodies[name]
+            direct_control_enum(src, start, line, name)
             for item in split_generics(body):
                 v = VARIANT.fullmatch(item)
                 if not v:

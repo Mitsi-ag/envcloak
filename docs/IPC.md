@@ -422,6 +422,8 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 
 **Control-pipe messages** of the processes EnvCloak starts (never socket methods):
 
+The `pty_monitor` reader binds `Report` and `Command` to direct module-scope public enums in `crates/envcloak-sys/src/pty_monitor.rs`. Only `derive` attributes are supported on those declarations. Conditional, nested, macro-generated, aliased or otherwise unhandled bindings are refused rather than counted as the channel's messages; conditional inner attributes on the file are refused too. This checks message names, not numeric wire tags or payload layouts.
+
 <!-- reservations:control_message -->
 | Channel | Message | Task | Status | Use |
 |---|---|---|---|---|
