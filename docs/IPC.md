@@ -333,7 +333,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `backup.v2.list` | M2-05 | landed | backups with creator, purpose and state |
 | `files.show` | M1-AUDIT | landed | a file backup's maker and files, before the proof of `init --undo` (SPEC §6.4: the restore statement names the creator) |
 | `scan.match` | M2-11 | landed | candidate tokens compared by keyed hash, under the import rules and the two comparison budgets |
-| `items.mark_exposed` | M2-11 | reserved | marks items "exposed: rotate"; tightening, no proof |
+| `items.mark_exposed` | M2-11 | landed | marks items "exposed: rotate"; tightening, no proof |
 | `items.reclassify` | M2-13 | reserved | test, live or unknown; towards test or unknown with a proof |
 | `managed.register` | M2-27 | reserved | registers a managed MCP server and its launch or origin, with a proof |
 | `managed.unregister` | M2-27 | reserved | removes a managed server's record, with a proof |

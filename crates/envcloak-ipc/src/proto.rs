@@ -29,10 +29,10 @@ use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, BackupBegunView, BackupCommittedView, BackupListView,
     BackupPutView, BackupResultView, BackupView, CheckView, CreatedView, DecisionView, DeniedView,
-    FileBackupCreatorView, FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView,
-    LockedView, PendingListView, PendingStateView, RecoveredView, RecoveryConfirmedView,
-    RemovedView, RestoreFileView, RestoreLeaseView, RevokedView, RotatedView, ScanMatchView,
-    StatusView, TargetView, UnlockedView, VerifyView,
+    ExposureSourceView, FileBackupCreatorView, FileBackupView, GrantsView, ImportPlanView,
+    ItemView, ItemsView, LockedView, MarkedView, PendingListView, PendingStateView, RecoveredView,
+    RecoveryConfirmedView, RemovedView, RestoreFileView, RestoreLeaseView, RevokedView,
+    RotatedView, ScanMatchView, StatusView, TargetView, UnlockedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -632,6 +632,47 @@ pub struct RemoveParams {
     /// As [`UnlockParams::claims`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<String>,
+}
+
+/// `items.mark_exposed`: marks items "exposed: rotate" (SPEC §6.4, §6.5),
+/// with the kinds of place their values were found and how many. Marking
+/// only tightens, so it needs no proof; it is audited. A mark that names
+/// only kinds an item is marked for already changes nothing, so a doctor
+/// run repeated changes nothing it has marked. A rotation clears the mark.
+#[derive(Debug)]
+pub struct ItemsMarkExposed;
+
+impl Method for ItemsMarkExposed {
+    const NAME: &'static str = "items.mark_exposed";
+    type Params = MarkExposedParams;
+    type Output = MarkedView;
+}
+
+/// Items one `items.mark_exposed` names at most: its audit entry names
+/// each.
+pub const MAX_MARKED: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkExposedParams {
+    /// 1 to [`MAX_MARKED`], each item once.
+    pub items: Vec<ExposedItem>,
+    /// As [`UnlockParams::claims`], for the audit entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// One item to mark: its id (as `scan.match` answered it), where its value
+/// was found, and in how many places.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposedItem {
+    /// 26 Crockford base32 characters.
+    pub item: String,
+    /// At least one kind.
+    pub sources: Vec<ExposureSourceView>,
+    /// At least 1.
+    pub count: u64,
 }
 
 /// `import.plan`: what importing these env-file entries would do (SPEC
@@ -1318,7 +1359,7 @@ impl Method for BackupList {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 37] = [
+pub const CLIENT_METHODS: [&str; 38] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1339,6 +1380,7 @@ pub const CLIENT_METHODS: [&str; 37] = [
     ItemsTarget::NAME,
     ItemsRotate::NAME,
     ItemsRemove::NAME,
+    ItemsMarkExposed::NAME,
     ImportPlan::NAME,
     ImportCommit::NAME,
     ImportVerify::NAME,

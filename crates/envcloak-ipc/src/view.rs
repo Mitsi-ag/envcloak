@@ -14,7 +14,7 @@
 //! them through [`StatusView::sanitize`] before anyone prints them.
 
 use envcloak_core::crypto::ItemClass;
-use envcloak_core::vault::{Classification, ItemMeta};
+use envcloak_core::vault::{Classification, ExposureSource, ItemMeta};
 use envcloak_policy::{DenyReason, Mode, PendingId, PendingState, SubjectKind, Uses};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,7 @@ views!(
     BackupListView,
     BackupEntryView,
     ScanMatchView,
+    MarkedView,
 );
 
 /// What [`StatusView::sanitize`] puts in place of a version that is not
@@ -667,6 +668,80 @@ pub struct ItemView {
     /// The rest, for `show`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<ItemDetailView>,
+    /// Set when the item's value was found outside the vault: it is shown
+    /// "exposed: rotate" until a rotation replaces the value (SPEC §6.4,
+    /// §6.5). Absent for an item never found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposed: Option<ExposedView>,
+}
+
+/// That an item's value was found outside the vault: since when, where,
+/// and in how many places, summed over the marks that changed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposedView {
+    /// Unix seconds of the first mark.
+    pub since_secs: u64,
+    /// Every kind of place, sorted, each once.
+    pub sources: Vec<ExposureSourceView>,
+    pub count: u64,
+}
+
+/// A kind of place an item's value was found (the vault's
+/// [`ExposureSource`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExposureSourceView {
+    Transcript,
+    GitHistory,
+    ConfigBackup,
+    SyncedFolder,
+    ShellProfile,
+    AgentConfig,
+    EnvFile,
+}
+
+impl From<ExposureSource> for ExposureSourceView {
+    fn from(s: ExposureSource) -> Self {
+        match s {
+            ExposureSource::Transcript => ExposureSourceView::Transcript,
+            ExposureSource::GitHistory => ExposureSourceView::GitHistory,
+            ExposureSource::ConfigBackup => ExposureSourceView::ConfigBackup,
+            ExposureSource::SyncedFolder => ExposureSourceView::SyncedFolder,
+            ExposureSource::ShellProfile => ExposureSourceView::ShellProfile,
+            ExposureSource::AgentConfig => ExposureSourceView::AgentConfig,
+            ExposureSource::EnvFile => ExposureSourceView::EnvFile,
+        }
+    }
+}
+
+impl From<ExposureSourceView> for ExposureSource {
+    fn from(s: ExposureSourceView) -> Self {
+        match s {
+            ExposureSourceView::Transcript => ExposureSource::Transcript,
+            ExposureSourceView::GitHistory => ExposureSource::GitHistory,
+            ExposureSourceView::ConfigBackup => ExposureSource::ConfigBackup,
+            ExposureSourceView::SyncedFolder => ExposureSource::SyncedFolder,
+            ExposureSourceView::ShellProfile => ExposureSource::ShellProfile,
+            ExposureSourceView::AgentConfig => ExposureSource::AgentConfig,
+            ExposureSourceView::EnvFile => ExposureSource::EnvFile,
+        }
+    }
+}
+
+impl ExposureSourceView {
+    /// Words for the kind, as `show` prints them.
+    pub fn words(self) -> &'static str {
+        match self {
+            ExposureSourceView::Transcript => "agent transcripts",
+            ExposureSourceView::GitHistory => "git history",
+            ExposureSourceView::ConfigBackup => "config backups",
+            ExposureSourceView::SyncedFolder => "synced folders",
+            ExposureSourceView::ShellProfile => "shell profiles",
+            ExposureSourceView::AgentConfig => "agent configs",
+            ExposureSourceView::EnvFile => "env files",
+        }
+    }
 }
 
 /// How much of an item [`ItemView::from_meta`] fills.
@@ -726,6 +801,16 @@ impl ItemView {
             expires_secs: d.expires_at,
             account,
             detail: full,
+            exposed: m.exposure.as_ref().map(|e| ExposedView {
+                since_secs: e.since,
+                sources: e
+                    .sources
+                    .iter()
+                    .copied()
+                    .map(ExposureSourceView::from)
+                    .collect(),
+                count: e.count,
+            }),
         }
     }
 }
@@ -1270,6 +1355,17 @@ pub struct ScanPatternView {
     pub id: u32,
     /// A provider registry id.
     pub provider: String,
+}
+
+/// `items.mark_exposed`: how many items were marked, how many were marked
+/// for those kinds of place already (and left as they were), and how many
+/// ids named no item (one removed meanwhile).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MarkedView {
+    pub marked: u32,
+    pub already: u32,
+    pub missing: u32,
 }
 
 /// `import.verify`: whether an import's env files may be deleted.

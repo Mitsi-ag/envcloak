@@ -2673,6 +2673,50 @@ fn items_that_are_not_secrets_are_named_only_and_never_bound() {
     f.sweep();
 }
 
+/// `list_secrets` says which keys were found outside the vault (M2-11,
+/// R-M2-40): `exposed` is true for a key marked "exposed: rotate" and
+/// false for the others, and the note says what it means. (The daemon's
+/// `items.mark_exposed` and the rotation that clears the mark are tested
+/// in crates/envcloak-daemon/tests/scan_match.rs; here the mark is made in
+/// the vault before the daemon starts.)
+///
+/// Mutation: `exposed` left null for every key, as before M2-11: this
+/// fails.
+#[test]
+fn list_secrets_says_which_keys_are_exposed() {
+    use envcloak_core::SecretBytes;
+    use envcloak_core::vault::{ExposureSource, LockedVault, Slug, VaultPaths};
+    let mut f = Fixture::without_daemon();
+    {
+        let pass = SecretBytes::copy_from(by_label(&f.cs, labels::VAULT_PASSPHRASE).value());
+        let mut v = LockedVault::open(&VaultPaths::under(common::data_dir(&f.home)))
+            .unwrap()
+            .unlock_with_passphrase(&pass)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        let github = v.find(&Slug::new("github/acme-web").unwrap()).unwrap().id;
+        v.transact(|t| t.mark_exposed(github, &[ExposureSource::Transcript], 2))
+            .unwrap();
+    }
+    f.start_daemon();
+    let mut m = Mcp::start(&f.home, &f.project, &["--wait-ms", "1000"], &f.cs);
+    m.initialize();
+    let list = structured(&m.call("list_secrets", json!({}))).clone();
+    let exposed: Vec<(String, Value)> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["slug"].as_str().unwrap().to_owned(), i["exposed"].clone()))
+        .collect();
+    assert!(!exposed.is_empty(), "{list}");
+    for (slug, e) in &exposed {
+        assert_eq!(e, &json!(slug == "github/acme-web"), "{slug}: {list}");
+    }
+    assert!(list["note"].as_str().unwrap().contains("rotate"), "{list}");
+    m.finish();
+    f.sweep();
+}
+
 /// Gate b18 through the MCP server (plan task M2-07, SPEC §6.8 "Login
 /// fields are typed"): a login is named and never bound. `list_secrets`
 /// shows it by its slug and class alone; `add_reference` refuses it,

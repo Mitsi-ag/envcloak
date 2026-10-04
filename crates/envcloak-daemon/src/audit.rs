@@ -308,6 +308,16 @@ pub enum AuditEvent {
         counts: ScanCounts,
         refused: bool,
     },
+    /// Items were marked "exposed: rotate" (`items.mark_exposed`): the
+    /// items the call marked, how many it found marked for those kinds of
+    /// place already, and how many ids named no item.
+    MarkedExposed {
+        pid: i32,
+        subject: SubjectSummary,
+        marked: Vec<(ItemId, Slug)>,
+        already: usize,
+        missing: usize,
+    },
 }
 
 impl AuditEvent {
@@ -514,6 +524,17 @@ impl AuditEvent {
                 c.guessable + c.other,
                 c.skipped_guessable,
                 c.not_compared,
+            ),
+            AuditEvent::MarkedExposed {
+                pid,
+                marked,
+                already,
+                missing,
+                ..
+            } => format!(
+                "envcloakd: audit: items marked exposed marked={} already={already} \
+                 missing={missing} pid={pid}",
+                marked.len()
             ),
         })
     }
@@ -884,6 +905,35 @@ impl AuditEvent {
                     ..AuditRecord::new(AuditKind::ScanMatch, outcome)
                 }
             }
+            AuditEvent::MarkedExposed {
+                subject,
+                marked,
+                already,
+                missing,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: marked.clone(),
+                decision: DecisionSummary {
+                    counts: vec![
+                        (
+                            "already".to_owned(),
+                            u64::try_from(*already).unwrap_or(u64::MAX),
+                        ),
+                        (
+                            "missing".to_owned(),
+                            u64::try_from(*missing).unwrap_or(u64::MAX),
+                        ),
+                    ],
+                    ..decision(
+                        "marked",
+                        None,
+                        Some("items.mark_exposed"),
+                        Some(u64::try_from(marked.len()).unwrap_or(u64::MAX)),
+                    )
+                },
+                ..AuditRecord::new(AuditKind::MarkExposed, "marked")
+            },
         }
     }
 }

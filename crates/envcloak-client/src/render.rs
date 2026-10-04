@@ -359,9 +359,14 @@ impl Render for ItemsView {
             return "The vault has no items yet. Add one with `envcloak add`.\n".to_owned();
         }
         let long = self.items.iter().any(|i| i.account.is_some());
+        // Only when an item's value was found outside the vault.
+        let exposed = self.items.iter().any(|i| i.exposed.is_some());
         let mut header = vec!["SLUG", "PROVIDER", "KIND", "FIELDS", "UPDATED"];
         if long {
             header.extend(["ENV", "ACCOUNT", "TITLE"]);
+        }
+        if exposed {
+            header.push("NOTE");
         }
         let mut rows = vec![header.into_iter().map(str::to_owned).collect::<Vec<_>>()];
         for i in &self.items {
@@ -377,6 +382,13 @@ impl Render for ItemsView {
                 row.push(shown_or_dash(i.env_hint.as_deref()));
                 row.push(account_line(i).unwrap_or_else(|| "-".to_owned()));
                 row.push(shown(&i.title));
+            }
+            if exposed {
+                row.push(if i.exposed.is_some() {
+                    "exposed: rotate".to_owned()
+                } else {
+                    "-".to_owned()
+                });
             }
             rows.push(row);
         }
@@ -395,6 +407,17 @@ impl Render for ItemView {
         }
         let _ = writeln!(o, "  provider: {}", shown_or_dash(self.provider.as_deref()));
         let _ = writeln!(o, "  kind: {}", kind_word(self.classification));
+        if let Some(x) = &self.exposed {
+            let places: Vec<&str> = x.sources.iter().map(|k| k.words()).collect();
+            let _ = writeln!(
+                o,
+                "  exposed: rotate (found in {}; {} since {}): its value is known outside the \
+                 vault, so replace it at the provider, then `envcloak rotate`",
+                places.join(", "),
+                plural(x.count, "place", "places"),
+                date(x.since_secs)
+            );
+        }
         if let Some(e) = &self.env_hint {
             let _ = writeln!(o, "  usual variable: {}", shown(e));
         }
@@ -1306,8 +1329,8 @@ impl Render for RecoveryConfirmedView {
 mod tests {
     use super::*;
     use envcloak_ipc::view::{
-        AccountView, CheckBindingView, CheckView, EnvRefView, FieldView, ItemDetailView, LinksView,
-        PlaintextView,
+        AccountView, CheckBindingView, CheckView, EnvRefView, ExposedView, ExposureSourceView,
+        FieldView, ItemDetailView, LinksView, PlaintextView,
     };
 
     const T0: u64 = 1_790_000_000;
@@ -1375,6 +1398,7 @@ mod tests {
                 last_used_secs: None,
                 notes: None,
             }),
+            exposed: None,
         }
     }
 
@@ -1410,6 +1434,56 @@ openai/acme-web-2  openai    test  value   2026-09-21
             r#"SLUG             PROVIDER  KIND  FIELDS  UPDATED     ENV             ACCOUNT                          TITLE
 openai/acme-web  openai    test  value   2026-09-21  OPENAI_API_KEY  you@work.example (org org-acme)  OpenAI
 "#,
+        );
+        // An item found outside the vault: a note in `ls`, a line in
+        // `show`, its record in JSON.
+        let mut found = item("openai/acme-web", 2);
+        found.exposed = Some(ExposedView {
+            since_secs: T0,
+            sources: vec![
+                ExposureSourceView::Transcript,
+                ExposureSourceView::GitHistory,
+            ],
+            count: 3,
+        });
+        let mut found_summary = item("openai/acme-web", 0);
+        found_summary.exposed.clone_from(&found.exposed);
+        snap(
+            ItemsView {
+                items: vec![found_summary, item("openai/acme-web-2", 0)],
+            }
+            .human(),
+            r#"SLUG               PROVIDER  KIND  FIELDS  UPDATED     NOTE
+openai/acme-web    openai    test  value   2026-09-21  exposed: rotate
+openai/acme-web-2  openai    test  value   2026-09-21  -
+"#,
+        );
+        snap(
+            found.human(),
+            r#"openai/acme-web
+  title: OpenAI
+  id: 01K5TESTTESTTESTTESTTESTTE
+  provider: openai
+  kind: test key
+  exposed: rotate (found in agent transcripts, git history; 3 places since 2026-09-21): its value is known outside the vault, so replace it at the provider, then `envcloak rotate`
+  usual variable: OPENAI_API_KEY
+  short values: not allowed
+  account: you@work.example (org org-acme)
+  fields:
+    value: set 2026-09-21 15:13:20 UTC, 1 prior value kept
+  created: 2026-09-21 14:13:20 UTC
+  updated: 2026-09-21 15:13:20 UTC
+  rotated: 2026-09-21 15:13:20 UTC
+  allowed hosts: api.openai.com
+  docs: https://platform.openai.com/docs
+  keys page: https://platform.openai.com/api-keys
+"#,
+        );
+        assert!(
+            found
+                .json()
+                .to_string()
+                .contains(r#""exposed":{"count":3,"since_secs":1790000000,"sources":["transcript","git_history"]}"#)
         );
         snap(
             ItemsView { items: vec![] }.human(),
