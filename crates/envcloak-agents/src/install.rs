@@ -161,7 +161,9 @@ impl CodexBudget {
                     return Err(Refusal::new(
                         "instruction_file_moved",
                         format!(
-                            "Codex now reads {} in this project instead (its settings or files                              changed since this run looked): the block was not written; run this                              again",
+                            "Codex now reads {} in this project instead (its settings or files \
+                             changed since this run looked): the block was not written; run this \
+                             again",
                             reads.display()
                         ),
                     ));
@@ -545,7 +547,11 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
     } else if socket.is_some() {
         hp.notes.push(note(
             "socket_allowance_scope",
-            "the socket allowance is limited to EnvCloak's socket for the Codex settings there now              (the system and managed files, your profiles, and each project you trust, looked              through); a project you trust later, a .codex/config.toml added later or a -c flag              with network settings of its own can widen it, as any Codex setting can: `agents              install` checks again each time it runs",
+            "the socket allowance is limited to EnvCloak's socket for the Codex settings there now \
+             (the system and managed files, your profiles, and each project you trust, looked \
+             through); a project you trust later, a .codex/config.toml added later or a -c flag \
+             with network settings of its own can widen it, as any Codex setting can: `agents \
+             install` checks again each time it runs",
         ));
     }
     if !linux && opts.consent_sockets && !qualified {
