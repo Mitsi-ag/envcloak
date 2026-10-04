@@ -35,9 +35,21 @@
 //!   one with no room for any is `too_many_checks` with the reason
 //!   `limited`, and nothing is compared.
 //! - Only `secret` items' current values are compared: never a card's or
-//!   a login's (R-M2-34; card detection is M4), nor a prior value.
-//! - Each call writes one audit entry (kind `scan_match`) with its purpose,
-//!   source and counts, and never a candidate; a refused one too.
+//!   a login's (R-M2-34; card detection is M4), nor a prior value. A
+//!   candidate is looked up among the secret items' value keys alone
+//!   ([`SecretValues`]), so no other class's value is compared at all.
+//! - One state lock is held from the vault's check to the answer's frame,
+//!   so the vault cannot lock between the budgets' count and the
+//!   comparisons it counts.
+//! - Each call whose request is well formed writes exactly one audit entry
+//!   (kind `scan_match`) with its purpose, source and counts, never a
+//!   candidate, after the answer is framed (F-77's order): its outcome is
+//!   `checked` or `limited` for an answer sent, and the error's token for
+//!   any refusal after the request's checks (`evidence`, `traced`,
+//!   `vault_locked`, `too_many_checks`, or `frame_too_large` for an answer
+//!   that did not fit a frame, its comparisons counted). A malformed
+//!   request (`invalid_params`) is refused before anything is read,
+//!   counted or audited.
 //! - Candidates live in wiped buffers and are dropped when the call ends.
 //!   No error repeats anything the client sent, and nothing is logged.
 
@@ -45,29 +57,32 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use envcloak_core::SecretBytes;
-use envcloak_core::crypto::ItemClass;
+use envcloak_core::audit::SubjectSummary;
 use envcloak_core::vault::{FieldId, ItemMeta, ValueKey, Vault};
-use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{
-    CandidateForm, ErrorKind, MAX_CANDIDATE, MAX_SCAN_CANDIDATES, ScanMatchParams, ScanPurpose,
+    CandidateForm, ErrorKind, MAX_CANDIDATE, MAX_SCAN_CANDIDATES, ScanMatch, ScanMatchParams,
+    ScanPurpose,
 };
 use envcloak_ipc::view::{ScanMatchView, ScanMatchedView, ScanPatternView};
-use envcloak_policy::ProcessInstance;
+use envcloak_ipc::{Frame, RpcError};
+use envcloak_policy::{Claims, ProcessInstance};
 use envcloak_providers::{PasswordForm, password_form_chars};
 use envcloak_sys::PeerIdentity;
 
 use crate::audit::{AuditEvent, ScanCounts};
 use crate::clock::now_of;
-use crate::import::{GUESSABLE_BELOW, ValueChecks, guessable};
+use crate::import::{GUESSABLE_BELOW, SecretValues, ValueChecks, guessable};
 use crate::requests::{evidence, subject_summary};
-use crate::server::{Shared, locked, refuse_if_traced};
+use crate::server::{Shared, locked, refuse_if_traced, result_framed};
 
 /// Candidates that are not guessable one subject root may have compared
-/// within [`crate::import::CHECK_WINDOW`] of awake time (`ScanChecks`, M2
-/// plan D-32). Sized from M2-04's measurement of what the pinned hosts
-/// write (docs/AGENTS.md: at most about 2,000 distinct candidates of 16 or
-/// more characters per MiB): about a GiB of transcripts an hour, after the
-/// CLI's de-duplication.
+/// within [`crate::import::CHECK_WINDOW`] of awake time (`ScanChecks`):
+/// D-32's initial size. M2-04 measured about 2,000 distinct raw tokens of
+/// 16 or more characters per MiB of what the pinned hosts wrote
+/// (docs/AGENTS.md); the scanners also send each token's decoded forms
+/// (base64, hex, percent, D-32), so how much of a transcript tree one
+/// window covers is M2-14's 1 GiB run to measure, not a figure stated
+/// here.
 pub const MAX_SCAN_CHECKS: usize = 2_000_000;
 
 /// A candidate's class: whether its value is short enough to guess.
@@ -190,14 +205,16 @@ fn invalid() -> RpcError {
     RpcError::new(ErrorKind::InvalidParams)
 }
 
-/// The candidates of `p`, checked before anything is read: at most
-/// [`MAX_SCAN_CANDIDATES`], each id once, each value 1 to
-/// [`MAX_CANDIDATE`] bytes. A request that breaks any of these is refused
-/// whole (`invalid_params`), and nothing is compared or counted.
-fn check(p: ScanMatchParams) -> Result<Vec<Candidate>, RpcError> {
+/// The candidates of `p` and its claims, checked before anything is read:
+/// at most [`MAX_SCAN_CANDIDATES`], each id once, each value 1 to
+/// [`MAX_CANDIDATE`] bytes, and claims that are markers. A request that
+/// breaks any of these is malformed: refused whole (`invalid_params`), and
+/// nothing is compared, counted or audited.
+fn check(p: ScanMatchParams) -> Result<(Vec<Candidate>, Vec<String>), RpcError> {
     if p.candidates.len() > MAX_SCAN_CANDIDATES {
         return Err(invalid());
     }
+    Claims::from_markers(&p.claims).map_err(|_| invalid())?;
     let mut ids = HashSet::with_capacity(p.candidates.len());
     let mut out = Vec::with_capacity(p.candidates.len());
     for c in p.candidates {
@@ -211,7 +228,7 @@ fn check(p: ScanMatchParams) -> Result<Vec<Candidate>, RpcError> {
             form: c.form,
         });
     }
-    Ok(out)
+    Ok((out, p.claims))
 }
 
 /// What the vault holds for one distinct candidate value: its `secret`
@@ -222,17 +239,20 @@ struct Found {
     providers: Vec<String>,
 }
 
-/// The items holding `value` now (its current value, never a prior one),
-/// from `owners`, the `secret` items' fields: a card's or a login's field
-/// is not in it, so neither ever matches.
+/// The items holding the value of `key` now (its current value, never a
+/// prior one): looked up among the `secret` items' value keys alone
+/// (`secrets`), so a card's or a login's value is never compared. `owners`
+/// maps every field to its item, whatever its class: the class boundary
+/// is `secrets`, and only there.
 fn find(
     shared: &Shared,
-    v: &Vault,
+    secrets: &SecretValues,
     owners: &HashMap<FieldId, &ItemMeta>,
+    key: &ValueKey,
     value: &SecretBytes,
 ) -> Found {
-    let mut holders: Vec<(String, String)> = v
-        .find_by_value(value)
+    let mut holders: Vec<(String, String)> = secrets
+        .fields(key)
         .iter()
         .filter_map(|f| owners.get(f))
         .map(|m| (m.id.to_string(), m.slug.as_str().to_owned()))
@@ -253,111 +273,135 @@ fn find(
     Found { holders, providers }
 }
 
-/// `scan.match`. See the module documentation.
+/// `scan.match`, answering request `id` with its result frame. See the
+/// module documentation: after the request's checks, every way the call
+/// ends writes its one audit entry, with the counts as far as it got and
+/// the caller's subject once its evidence was read.
 pub fn scan_match(
     shared: &Shared,
     peer: &PeerIdentity,
+    id: u64,
     p: ScanMatchParams,
-) -> Result<ScanMatchView, RpcError> {
+) -> Result<Frame, RpcError> {
     let purpose = p.purpose;
     let source = p.source_kind;
-    let claims = p.claims.clone();
-    let candidates = check(p)?;
+    let (candidates, claims) = check(p)?;
+    let mut call = Call {
+        subject: None,
+        counts: ScanCounts::new(purpose.as_str(), source.as_str(), candidates.len()),
+    };
+    let answered = answer(shared, peer, id, &claims, purpose, &candidates, &mut call);
+    drop(candidates);
+    let outcome = match &answered {
+        Ok(_) if call.counts.not_compared > 0 => "limited",
+        Ok(_) => "checked",
+        Err(e) => e.kind.token(),
+    };
+    shared.audit(AuditEvent::ScanMatched {
+        pid: peer.pid,
+        subject: call.subject.unwrap_or_else(|| SubjectSummary {
+            pid: peer.pid,
+            ..SubjectSummary::default()
+        }),
+        counts: call.counts,
+        outcome,
+    });
+    answered
+}
+
+/// What a call's audit entry records: who made it, once its evidence was
+/// read, and what it did, by count.
+struct Call {
+    subject: Option<SubjectSummary>,
+    counts: ScanCounts,
+}
+
+/// The call after its request's checks: the caller's evidence, the
+/// tracer, the vault's lock, the budgets, the comparisons and the answer's
+/// frame, filling in `call` as it goes. One state lock is held from the
+/// vault's check to the frame.
+fn answer(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    id: u64,
+    claims: &[String],
+    purpose: ScanPurpose,
+    candidates: &[Candidate],
+    call: &mut Call,
+) -> Result<Frame, RpcError> {
+    let caller = evidence(shared, peer, claims)?;
+    call.subject = Some(subject_summary(peer, &caller));
     refuse_if_traced()?;
-    locked(&shared.state).unlocked()?;
-    let caller = evidence(shared, peer, &claims)?;
     let person = caller.proof_refusal().is_none();
+    let root = caller.root();
     let classes: Vec<Class> = candidates
         .iter()
         .map(|c| class_of(shared, &c.value, c.form))
         .collect();
     let now = now_of(&shared.clocks);
+    let s = locked(&shared.state);
+    let v: &Vault = s.unlocked()?;
     let admitted = {
-        // Always `ValueChecks` first, as the import methods take it alone.
+        // The state lock, then `ValueChecks`, then `ScanChecks`: the order
+        // the import methods take the first two in.
         let mut value = locked(&shared.value_checks);
         let mut scan = locked(&shared.scan_checks);
         admit(
-            &classes,
-            purpose,
-            person,
-            &mut value,
-            &mut scan,
-            &caller.root(),
-            now.awake,
+            &classes, purpose, person, &mut value, &mut scan, &root, now.awake,
         )
     };
-    let mut counts = ScanCounts {
-        purpose: purpose.as_str(),
-        source: source.as_str(),
-        candidates: candidates.len(),
-        guessable: admitted.guessable,
-        other: admitted.other,
-        skipped_guessable: admitted.skipped_guessable,
-        not_compared: admitted.not_compared,
-        matches: 0,
-        patterns: 0,
-    };
+    let c = &mut call.counts;
+    c.guessable = admitted.guessable;
+    c.other = admitted.other;
+    c.skipped_guessable = admitted.skipped_guessable;
+    c.not_compared = admitted.not_compared;
     if admitted.compared() == 0 && admitted.not_compared > 0 {
-        shared.audit(AuditEvent::ScanMatched {
-            pid: peer.pid,
-            subject: subject_summary(peer, &caller),
-            counts,
-            refused: true,
-        });
         return Err(RpcError::with_reason(ErrorKind::TooManyChecks, "limited"));
     }
-    let mut s = locked(&shared.state);
-    let (matches, patterns) = {
-        let v = s.unlocked()?;
-        let owners: HashMap<FieldId, &ItemMeta> = v
-            .items()
-            .iter()
-            .filter(|m| m.class == ItemClass::Secret)
-            .flat_map(|m| m.fields.iter().map(move |f| (f.id, m)))
-            .collect();
-        // Each distinct value is looked up once, by its keyed hash.
-        let mut seen: BTreeMap<ValueKey, Found> = BTreeMap::new();
-        let (mut matches, mut patterns) = (Vec::new(), Vec::new());
-        for (c, _) in candidates
-            .iter()
-            .zip(&admitted.compare)
-            .filter(|(_, compare)| **compare)
-        {
-            let found = seen
-                .entry(v.value_key(&c.value))
-                .or_insert_with(|| find(shared, v, &owners, &c.value));
-            for (item, slug) in &found.holders {
-                matches.push(ScanMatchedView {
-                    id: c.id,
-                    item: item.clone(),
-                    slug: slug.clone(),
-                });
-            }
-            for provider in &found.providers {
-                patterns.push(ScanPatternView {
-                    id: c.id,
-                    provider: provider.clone(),
-                });
-            }
+    let secrets = SecretValues::of(v);
+    let owners: HashMap<FieldId, &ItemMeta> = v
+        .items()
+        .iter()
+        .flat_map(|m| m.fields.iter().map(move |f| (f.id, m)))
+        .collect();
+    // Each distinct value is looked up once, by its keyed hash.
+    let mut seen: BTreeMap<ValueKey, Found> = BTreeMap::new();
+    let (mut matches, mut patterns) = (Vec::new(), Vec::new());
+    for (cand, _) in candidates
+        .iter()
+        .zip(&admitted.compare)
+        .filter(|(_, compare)| **compare)
+    {
+        let key = v.value_key(&cand.value);
+        let found = seen
+            .entry(key)
+            .or_insert_with(|| find(shared, &secrets, &owners, &key, &cand.value));
+        for (item, slug) in &found.holders {
+            matches.push(ScanMatchedView {
+                id: cand.id,
+                item: item.clone(),
+                slug: slug.clone(),
+            });
         }
-        (matches, patterns)
-    };
-    drop(candidates);
-    counts.matches = matches.len();
-    counts.patterns = patterns.len();
-    s.audit(AuditEvent::ScanMatched {
-        pid: peer.pid,
-        subject: subject_summary(peer, &caller),
-        counts,
-        refused: false,
-    });
-    Ok(ScanMatchView {
+        for provider in &found.providers {
+            patterns.push(ScanPatternView {
+                id: cand.id,
+                provider: provider.clone(),
+            });
+        }
+    }
+    c.matches = matches.len();
+    c.patterns = patterns.len();
+    let view = ScanMatchView {
         matches,
         patterns,
         compared: u32::try_from(admitted.compared()).unwrap_or(u32::MAX),
         skipped_guessable: u32::try_from(admitted.skipped_guessable).unwrap_or(u32::MAX),
         limited: admitted.not_compared > 0,
-    })
+    };
+    // Framed before the entry is written, so an answer too large for a
+    // frame is recorded as such (`frame_too_large`), never as answered.
+    result_framed::<ScanMatch>(id, &view)
 }
 
 #[cfg(test)]

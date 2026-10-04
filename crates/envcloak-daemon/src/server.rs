@@ -814,9 +814,9 @@ fn respond<'s>(
         ItemsMarkExposed::NAME => {
             answer::<ItemsMarkExposed>(id, &req, |p| items::mark_exposed(shared, peer, p))
         }
-        ScanMatch::NAME => {
-            answer::<ScanMatch>(id, &req, |p| crate::scan_match::scan_match(shared, peer, p))
-        }
+        ScanMatch::NAME => framed::<ScanMatch>(id, &req, |p| {
+            crate::scan_match::scan_match(shared, peer, id, p)
+        }),
         ImportPlan::NAME => {
             answer::<ImportPlan>(id, &req, |p| import::import_plan(shared, peer, p))
         }
@@ -906,7 +906,8 @@ pub(crate) fn commit_framed<M: Method>(
 
 /// As [`answer`], for a method that frames its own result: a covered
 /// `run.request`, `files.restore` and `import.commit` frame their answer
-/// before they commit it (F-77, [`commit_framed`]).
+/// before they commit it (F-77, [`commit_framed`]), and `scan.match`
+/// before it writes its audit entry.
 fn framed<'a, M: Method>(
     id: u64,
     req: &IncomingRequest<'a>,

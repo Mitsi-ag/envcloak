@@ -89,6 +89,22 @@ pub struct ScanCounts {
 }
 
 impl ScanCounts {
+    /// A call of `candidates` candidates for `purpose` from `source`,
+    /// nothing compared yet.
+    pub fn new(purpose: &'static str, source: &'static str, candidates: usize) -> Self {
+        ScanCounts {
+            purpose,
+            source,
+            candidates,
+            guessable: 0,
+            other: 0,
+            skipped_guessable: 0,
+            not_compared: 0,
+            matches: 0,
+            patterns: 0,
+        }
+    }
+
     /// The entry's named counts.
     fn named(&self) -> Vec<(String, u64)> {
         let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
@@ -298,15 +314,17 @@ pub enum AuditEvent {
         files: usize,
         form: Option<&'static str>,
     },
-    /// Candidates were compared with the vault (`scan.match`), or the call
-    /// was refused because its budget was spent (`refused`,
-    /// `too_many_checks` with the reason `limited`): its purpose, source
-    /// and counts, never a candidate.
+    /// A well-formed `scan.match` call, however it ended: its outcome
+    /// (`checked` or `limited` for an answer sent, the error's token for a
+    /// refusal: `evidence`, `traced`, `vault_locked`, `too_many_checks`,
+    /// `frame_too_large`), purpose, source and counts, never a candidate.
+    /// The subject is the pid alone when the caller's evidence could not
+    /// be read.
     ScanMatched {
         pid: i32,
         subject: SubjectSummary,
         counts: ScanCounts,
-        refused: bool,
+        outcome: &'static str,
     },
     /// Items were marked "exposed: rotate" (`items.mark_exposed`): the
     /// items the call marked, how many it found marked for those kinds of
@@ -508,16 +526,11 @@ impl AuditEvent {
             AuditEvent::ScanMatched {
                 pid,
                 counts: c,
-                refused,
+                outcome,
                 ..
             } => format!(
-                "envcloakd: audit: scan {} purpose={} source={} candidates={} compared={} \
+                "envcloakd: audit: scan {outcome} purpose={} source={} candidates={} compared={} \
                  skipped_guessable={} not_compared={} pid={pid}",
-                if *refused {
-                    "refused reason=limited"
-                } else {
-                    "matched"
-                },
                 c.purpose,
                 c.source,
                 c.candidates,
@@ -877,18 +890,10 @@ impl AuditEvent {
             AuditEvent::ScanMatched {
                 subject,
                 counts,
-                refused,
+                outcome,
                 ..
             } => {
-                // Refused: `too_many_checks`, nothing compared; limited: a
-                // budget ran out during the call.
-                let outcome = if *refused {
-                    "refused"
-                } else if counts.not_compared > 0 {
-                    "limited"
-                } else {
-                    "checked"
-                };
+                let outcome = *outcome;
                 AuditRecord {
                     subject: subject.clone(),
                     decision: DecisionSummary {
