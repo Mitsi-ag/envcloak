@@ -35,9 +35,10 @@
 //!   (SPEC §7; `envcloak_mcp`, docs/MCP.md). It never receives a value:
 //!   `run_with_secrets` runs a child `envcloak run`.
 //! - `envcloak agents install` and `uninstall`, which teach Claude Code
-//!   and Codex EnvCloak and take it out again, and `envcloak hook`, the
-//!   handler their prompt and tool-call hooks run (SPEC §7;
-//!   `envcloak_agents`, docs/INSTALLERS.md).
+//!   and Codex EnvCloak and take it out again, `envcloak agents status`,
+//!   each host's coverage (SPEC §7.1), and `envcloak hook`, the handler
+//!   their prompt and tool-call hooks run (SPEC §7; `envcloak_agents`,
+//!   docs/INSTALLERS.md).
 //!
 //! Every command that reads, shows or sends a secret or a proof (`vault
 //! create`, `unlock`, `approve`, `run`, `add`, `rotate`, `rm`, `init`,
@@ -109,13 +110,15 @@ const HELP: &str = "usage:
   envcloak mcp [--host ID] [--wait-ms N]
   envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
   envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
+  envcloak agents status [--json]
   envcloak hook --host ID --event NAME
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
-  envcloak agents status | migrate-mcp
+  envcloak agents status --probe
+  envcloak agents migrate-mcp
   envcloak mcp-bridge
   envcloak standing
   envcloak login
@@ -201,9 +204,10 @@ fn main() -> ExitCode {
 }
 
 /// The refusal of an M2 or M2b command this build does not have, or of
-/// `run --pty`, chosen by the words that select it (the first, and for
-/// `agents` the second; for `run`, `--pty` anywhere before
-/// `--`); `None` for any other command line. No other argument is read.
+/// `run --pty` or `agents status --probe`, chosen by the words that select
+/// it (the first, and for `agents` the second; for `run`, `--pty` anywhere
+/// before `--`; for `agents status`, `--probe` anywhere); `None` for any
+/// other command line. No other argument is read.
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
@@ -214,7 +218,12 @@ fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Opti
         "standing" => cmd::standing::run(&[]),
         "login" => cmd::login::run(&[]),
         "signin" => cmd::signin::run(&[]),
-        "agents" if matches!(word(1)?, "status" | "migrate-mcp") => cmd::agents::run(&[word(1)?]),
+        "agents" if word(1)? == "migrate-mcp" => cmd::agents::run(&["migrate-mcp"]),
+        "agents"
+            if word(1)? == "status" && args[2..].iter().any(|a| a.as_os_str() == "--probe") =>
+        {
+            cmd::agents::status_probe()
+        }
         "run"
             if args[1..]
                 .iter()

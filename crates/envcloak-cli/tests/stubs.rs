@@ -26,7 +26,10 @@ const STUBS: &[(&[&str], &str)] = &[
     (&["reveal"], "`envcloak reveal`"),
     (&["doctor"], "`envcloak doctor`"),
     (&["scrub"], "`envcloak scrub`"),
-    (&["agents", "status"], "`envcloak agents status`"),
+    (
+        &["agents", "status", "--probe"],
+        "`envcloak agents status --probe` (probes on this machine, in a probe home of their own)",
+    ),
     (&["agents", "migrate-mcp"], "`envcloak agents migrate-mcp`"),
     (&["mcp-bridge"], "`envcloak mcp-bridge`"),
     (&["standing"], "`envcloak standing`"),
@@ -139,8 +142,9 @@ fn no_stub_asks_the_daemon_or_writes_in_the_home() {
 /// (review M2R-9: the check that refuses such an argument as a usage
 /// error ran first, so a stub exited 2 without `not_in_this_build`).
 ///
-/// Mutation checked: the stubs routed after that check, as before: each
-/// exits 2 and this fails.
+/// Mutations checked: the stubs routed after that check, as before: each
+/// exits 2 and this fails. `agents status` still routed there once it
+/// landed (M2-09): it runs the report, exits 0 and this fails.
 #[test]
 fn every_stub_refuses_an_argument_that_is_not_utf8() {
     let home = TestHome::new();
@@ -162,11 +166,15 @@ fn every_stub_refuses_an_argument_that_is_not_utf8() {
         assert_eq!(stdout(&out), "", "{what}");
         assert_eq!(stderr(&out), want, "{what}");
     }
-    // Elsewhere the argument is the usage error it was.
-    let mut cmd = cli_command(&home, &["run", "--"], &[]);
-    cmd.arg(bad);
-    let out = finish_within(cmd, Duration::from_secs(60));
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    // Elsewhere the argument is the usage error it was, `agents status`
+    // (landed by M2-09; its `--probe` is the stub) included.
+    for words in [&["run", "--"][..], &["agents", "status"]] {
+        let mut cmd = cli_command(&home, words, &[]);
+        cmd.arg(bad);
+        let out = finish_within(cmd, Duration::from_secs(60));
+        assert_eq!(out.status.code(), Some(2), "{words:?}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "", "{words:?}");
+    }
 }
 
 #[test]
