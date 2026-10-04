@@ -92,10 +92,14 @@
 //! D-09). Hashing comes after the walk, so each identity is checked
 //! against it: the hasher compares the file it opened with the device and
 //! inode the walk read, and once every hash is taken the whole chain is
-//! read again; when any process exited, ran another file, was reparented
+//! read again; when any process exited, ran another file, ran the same
+//! file with arguments that make it another agent or none, was reparented
 //! or left its session or terminal meanwhile, the chain is walked again
 //! (as when it changes during the walk), so no evidence is built from a
-//! chain as it was before hashing. An identity that is not known (no hasher,
+//! chain as it was before hashing. The walk without a hasher reads the
+//! chain again the same way: it read each process's arguments before its
+//! own check of that process, and an `exec` of the same file changes
+//! nothing that check compares. An identity that is not known (no hasher,
 //! another user's process, a non-dumpable one, a file too large, a budget
 //! spent, a change while it was read) is `None`, which never changes the
 //! root, the kind, the label or a proof refusal: identity is recorded,
@@ -772,8 +776,10 @@ pub fn gather_hashed(
 /// executable's device and inode the walk read, its SHA-256 from
 /// `hasher`, nearest the caller first. Once every hash is taken, every
 /// process of the chain is read from `table` again, hashed or not, its
-/// executable hidden or not: when one is no longer as the walk saw it
-/// (it exited, its pid was reused, it ran another file, it was
+/// executable hidden or not, and so are the arguments the catalog
+/// classified it by ([`recheck`]): when one is no longer as the walk saw
+/// it (it exited, its pid was reused, it ran another file, it ran the same
+/// file with arguments that make it another agent or none, it was
 /// reparented, it left its session or its terminal), the chain is walked
 /// and hashed again, up to [`GATHER_ATTEMPTS`] walks in all. So the
 /// root, the kind, the labels, the proof refusals and the digests all
@@ -795,8 +801,11 @@ pub fn gather_in_hashed(
 }
 
 /// Walks `peer`'s ancestry in `table` (up to [`GATHER_ATTEMPTS`] times
-/// while it changes under the walk), classifies it with `cat`, and adds
-/// `claims`. Executables are not hashed: see [`gather_in_hashed`].
+/// while it changes under the walk), reads it again as [`gather_in_hashed`]
+/// does after hashing (each process, and the arguments it is classified
+/// by, which the walk read before its own check), classifies it with
+/// `cat`, and adds `claims`. Executables are not hashed: see
+/// [`gather_in_hashed`].
 ///
 /// # Errors
 /// [`EvidenceError::CallerGone`] when the peer is no longer the process
@@ -814,19 +823,11 @@ pub fn gather_in(
 }
 
 /// Hashes each process of the caller's uid in `procs` whose executable
-/// file the walk read, nearest the caller first, then reads every process
-/// of `procs` again ([`recheck`]). Hashing takes time (up to the request's
-/// budget), and the evidence is built from `procs` afterwards: a chain
-/// that changed meanwhile is not used, digests or not.
-///
-/// # Errors
-/// As [`recheck`].
-fn hash_executables(
-    table: &mut dyn ProcessTable,
-    procs: &mut [ProcInfo],
-    uid: u32,
-    hasher: &mut dyn ExeHasher,
-) -> Result<bool, EvidenceError> {
+/// file the walk read, nearest the caller first. Hashing takes time (up to
+/// the request's budget), and the evidence is built from `procs`
+/// afterwards, so the caller then reads the chain again ([`recheck`]): a
+/// chain that changed meanwhile is not used, digests or not.
+fn hash_executables(procs: &mut [ProcInfo], uid: u32, hasher: &mut dyn ExeHasher) {
     for p in procs.iter_mut() {
         if !classifiable(p, uid) || p.exe.as_ref().and_then(|e| e.file).is_none() {
             continue;
@@ -836,19 +837,39 @@ fn hash_executables(
             exe.sha256 = digest;
         }
     }
-    recheck(table, procs)
 }
 
 /// Reads every process of `procs`, the walk's verified chain, from `table`
-/// again: `Ok(true)` when each is as the walk saw it
-/// ([`ProcInfo::unchanged`]: the same start time, parent, session,
-/// terminal, uid, command name and executable), `Ok(false)` when one
-/// changed or exited (the chain moved; the caller walks again).
+/// again: `Ok(true)` when each is as the walk saw it, `Ok(false)` when one
+/// changed or exited (the chain moved; the caller walks again). As the
+/// walk saw it means:
+/// - [`ProcInfo::unchanged`]: the same start time, parent, session,
+///   terminal, uid, command name and executable;
+/// - and for a process whose arguments the catalog reads (`cat.needs_argv`,
+///   of the caller's uid), its arguments, read again after that, classify
+///   it as the walk's did. An `exec` of the same file keeps every field
+///   [`ProcInfo::unchanged`] compares (pid, start time, executable,
+///   command name) while its arguments name another script: `node
+///   tool.js` that becomes `node` running an agent's script is that agent
+///   now, and evidence built from its earlier arguments would miss it.
+///   The arguments are compared by what they make the process, not byte
+///   for byte, so a process that retitles itself without changing what it
+///   is (a progress title) is not walked again.
+///
+/// The walk read the arguments before its own check of each process, and
+/// this reads them after a check: a change between the two reads is seen
+/// here, whenever it came (during the walk, or while the chain was
+/// hashed).
 ///
 /// # Errors
 /// [`EvidenceError::CallerGone`] when the caller exited or its pid is
 /// another process's, [`EvidenceError::Io`] when a read failed otherwise.
-fn recheck(table: &mut dyn ProcessTable, procs: &[ProcInfo]) -> Result<bool, EvidenceError> {
+fn recheck(
+    table: &mut dyn ProcessTable,
+    procs: &[ProcInfo],
+    uid: u32,
+    cat: &AgentCatalog,
+) -> Result<bool, EvidenceError> {
     for (k, p) in procs.iter().enumerate() {
         let again = match table.info(p.pid) {
             Ok(a) => a,
@@ -863,6 +884,16 @@ fn recheck(table: &mut dyn ProcessTable, procs: &[ProcInfo]) -> Result<bool, Evi
         }
         if !again.unchanged(p) {
             return Ok(false);
+        }
+        if classifiable(p, uid) && cat.needs_argv(p) {
+            // `p` as it is now: every field the check above compared is
+            // the walk's, and the arguments are read again. A refused read
+            // leaves them `None`, as the walk's would.
+            let mut now = p.clone();
+            now.argv = table.argv(p.pid).ok();
+            if cat.classify(&now) != cat.classify(p) {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -884,9 +915,10 @@ fn gather_with(
             Err(e) => return Err(e.into()),
         };
         if let Some(h) = hasher.as_mut() {
-            if !hash_executables(table, &mut walked, peer.uid, &mut **h)? {
-                continue;
-            }
+            hash_executables(&mut walked, peer.uid, &mut **h);
+        }
+        if !recheck(table, &walked, peer.uid, cat)? {
+            continue;
         }
         procs = Some(walked);
         break;

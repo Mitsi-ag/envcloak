@@ -1240,12 +1240,13 @@ fn a_cut_chain_fails_closed() {
 }
 
 /// A process table a test scripts: each pid's answers in order, the last
-/// one repeated; argument reads are recorded.
+/// one repeated, and its arguments the same way; argument reads are
+/// recorded.
 #[derive(Default)]
 struct Table {
     answers: HashMap<i32, Vec<ProcInfo>>,
     reads: HashMap<i32, usize>,
-    argv: HashMap<i32, Vec<&'static str>>,
+    argv: HashMap<i32, Vec<Vec<&'static str>>>,
     argv_reads: Vec<i32>,
 }
 
@@ -1275,7 +1276,14 @@ impl Table {
     }
 
     fn with_argv(mut self, pid: i32, argv: Vec<&'static str>) -> Self {
-        self.argv.insert(pid, argv);
+        self.argv.insert(pid, vec![argv]);
+        self
+    }
+
+    /// `pid`'s arguments as each read answers them, in order, the last one
+    /// repeated.
+    fn with_argv_answers(mut self, pid: i32, answers: Vec<Vec<&'static str>>) -> Self {
+        self.argv.insert(pid, answers);
         self
     }
 }
@@ -1290,9 +1298,10 @@ impl ProcessTable for Table {
     }
 
     fn argv(&mut self, pid: i32) -> io::Result<Argv> {
+        let n = self.argv_reads.iter().filter(|r| **r == pid).count();
         self.argv_reads.push(pid);
-        let a = self.argv.get(&pid).ok_or(io::ErrorKind::PermissionDenied)?;
-        Ok(Argv::new(a))
+        let answers = self.argv.get(&pid).ok_or(io::ErrorKind::PermissionDenied)?;
+        Ok(Argv::new(&answers[n.min(answers.len() - 1)]))
     }
 }
 
@@ -1333,9 +1342,10 @@ fn gather_classifies_the_callers_processes_from_what_it_reads() {
     let pids: Vec<i32> = e.chain().iter().map(|a| a.instance.pid).collect();
     assert_eq!(pids, [90, 80, 70, 60, 1]);
     // Arguments were read for the hidden executable and the interpreter
-    // only: not for zsh, nor for processes of another user.
+    // only, by the walk and again after its check: not for zsh, nor for
+    // processes of another user.
     t.argv_reads.sort_unstable();
-    assert_eq!(t.argv_reads, [80, 90]);
+    assert_eq!(t.argv_reads, [80, 80, 90, 90]);
     assert_eq!(e.nearest_agent().unwrap().0, 1);
     assert_eq!(e.label().unwrap().id, "claude-code");
     // Known by its script, which it names itself; in the caller's session
@@ -1489,10 +1499,11 @@ fn an_extension_interpreter_does_not_widen_the_root() {
         assert!(e.nearest_agent().is_none());
         assert_eq!(e.root().pid, 300);
 
-        // With it they are, and the match is an extension's.
+        // With it they are (by the walk, and again after its check), and
+        // the match is an extension's.
         let mut t = table();
         let e = gather_in(&mut t, &peer(320), Claims::none(), &ext).unwrap();
-        assert_eq!(t.argv_reads, [200], "{argv:?}");
+        assert_eq!(t.argv_reads, [200, 200], "{argv:?}");
         let (n, l) = e.nearest_agent().unwrap();
         assert_eq!((n, l.source), (2, CatalogSource::Extension), "{argv:?}");
         assert_eq!(e.kind(), SubjectKind::Agent);
@@ -1703,7 +1714,10 @@ fn gather_walks_again_when_the_ancestry_changed() {
     ]);
     let e = gather_in(&mut t, &peer(90), Claims::none(), &cat).unwrap();
     assert_eq!(e.root().pid, 80);
-    assert_eq!(t.reads[&90], 4, "two walks, each reading the peer twice");
+    assert_eq!(
+        t.reads[&90], 5,
+        "two walks, each reading the peer twice, and the steady one read again"
+    );
 }
 
 #[test]
@@ -2152,4 +2166,131 @@ fn a_chain_that_changes_during_every_hashing_is_refused() {
     let mut t = hashed_table(vec![caller90()], answers);
     assert_eq!(hashed(&mut t, &mut h).unwrap_err(), EvidenceError::Changed);
     assert_eq!(h.asked.len(), 2 * GATHER_ATTEMPTS);
+}
+
+/// The arguments a node process runs Gemini CLI by.
+const GEMINI: [&str; 2] = [
+    "node",
+    "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+];
+/// The same node running a script no entry knows.
+const TOOL: [&str; 2] = ["node", "/home/u/tool.js"];
+/// [`TOOL`] retitled with another argument: still no agent.
+const TOOL_WATCH: [&str; 3] = ["node", "/home/u/tool.js", "--watch"];
+
+/// envcloak (90, its executable hidden) <- node (80, with its executable's
+/// device and inode, as on Linux) <- zsh (70, leading session 70, on a
+/// terminal) <- login (60, root's) <- init. Every reading of the
+/// processes is the same; node's arguments are `argv` in order, the last
+/// one repeated: the walk reads them before its own check, and again after
+/// it ([`gather_in`] at once, [`gather_in_hashed`] once hashing ended).
+fn node_table(argv: Vec<Vec<&'static str>>) -> Table {
+    hashed_table(
+        vec![caller90()],
+        vec![with_file(
+            info(80, 70, 70, 501, Some("/usr/bin/node")),
+            (1, 80),
+        )],
+    )
+    .with_argv_answers(80, argv)
+}
+
+/// The evidence of [`node_table`] with node's arguments steady at `argv`.
+fn node_steady(argv: &[&'static str]) -> SubjectEvidence {
+    gather_in(
+        &mut node_table(vec![argv.to_vec()]),
+        &peer(90),
+        Claims::none(),
+        &AgentCatalog::builtin(),
+    )
+    .unwrap()
+}
+
+/// Codex review (high): an `exec` of the same file keeps the pid, the
+/// start time, the executable (its path, device and inode) and the command
+/// name, and only the arguments say what runs now. node running a tool's
+/// script that becomes node running Gemini CLI's, after the walk read its
+/// arguments and while the chain was hashed, is Gemini CLI: its caller is
+/// an agent subject whose proofs are refused and which no terminal grant
+/// covers, as the chain is once hashing ended, never the terminal subject
+/// the earlier arguments made it. The reverse is walked again too. A
+/// change of arguments that leaves what the process is (a retitle) is not
+/// walked again. Mutation checked: leaving the arguments out of the check
+/// after hashing fails this test (the caller is a terminal subject whose
+/// proofs are taken).
+#[test]
+fn a_script_changed_while_hashing_is_walked_again() {
+    let mut h = hasher_80_70();
+    let mut t = node_table(vec![TOOL.to_vec(), GEMINI.to_vec()]);
+    let e = hashed(&mut t, &mut h).unwrap();
+    assert_eq!(h.asked, [80, 70, 80, 70], "walked and hashed again");
+    decides_as(&e, &node_steady(&GEMINI));
+    let (n, l) = e.nearest_agent().unwrap();
+    assert_eq!(
+        (n, l.id.as_str(), l.basis),
+        (1, "gemini-cli", MatchBasis::Asserted)
+    );
+    assert_eq!(e.kind(), SubjectKind::Agent);
+    assert_eq!(e.proof_refusal(), Some(ProofRefusal::Agent));
+    assert!(!e.covered_by(&inst(70, 700), SubjectKind::Terminal));
+    assert_eq!(digest(&e, 80), Some([8; 32]));
+    // Gemini CLI that became the tool: no agent now.
+    let mut h = hasher_80_70();
+    let mut t = node_table(vec![GEMINI.to_vec(), TOOL.to_vec()]);
+    let e = hashed(&mut t, &mut h).unwrap();
+    assert_eq!(h.asked, [80, 70, 80, 70]);
+    decides_as(&e, &node_steady(&TOOL));
+    assert_eq!(e.kind(), SubjectKind::Terminal);
+    // The control: retitled, still no agent, one walk.
+    let mut h = hasher_80_70();
+    let mut t = node_table(vec![TOOL.to_vec(), TOOL_WATCH.to_vec()]);
+    let e = hashed(&mut t, &mut h).unwrap();
+    assert_eq!(h.asked, [80, 70], "not walked again");
+    decides_as(&e, &node_steady(&TOOL));
+    assert_eq!(e.proof_refusal(), None);
+    assert_eq!(
+        t.argv_reads.iter().filter(|p| **p == 80).count(),
+        2,
+        "read by the walk, and again after hashing"
+    );
+}
+
+/// The walk reads a process's arguments before its own check of that
+/// process, which compares no argument: without a hasher, the chain is
+/// still read again after that check, and a script that changed between
+/// the two reads is walked again (Codex review, high: the same class of
+/// staleness, without the hashing window). Mutation checked: reading the
+/// chain again only when a hasher was given fails this test.
+#[test]
+fn a_script_changed_under_the_walk_is_walked_again() {
+    let cat = AgentCatalog::builtin();
+    let mut t = node_table(vec![TOOL.to_vec(), GEMINI.to_vec()]);
+    let e = gather_in(&mut t, &peer(90), Claims::none(), &cat).unwrap();
+    decides_as(&e, &node_steady(&GEMINI));
+    assert_eq!(e.proof_refusal(), Some(ProofRefusal::Agent));
+    assert_eq!(t.reads[&90], 6, "two walks, each read again");
+    // The control: steady arguments, one walk read again once.
+    let mut t = node_table(vec![TOOL.to_vec()]);
+    let e = gather_in(&mut t, &peer(90), Claims::none(), &cat).unwrap();
+    assert_eq!(e.kind(), SubjectKind::Terminal);
+    assert_eq!(t.reads[&90], 3);
+}
+
+/// A process whose arguments name another agent at every read is refused
+/// (`ancestry_changed`) after [`GATHER_ATTEMPTS`] walks, hashed or not, as
+/// a chain that changes under each walk is.
+#[test]
+fn a_script_that_keeps_changing_is_refused() {
+    let answers: Vec<Vec<&'static str>> = (0..GATHER_ATTEMPTS)
+        .flat_map(|_| [TOOL.to_vec(), GEMINI.to_vec()])
+        .collect();
+    let mut h = hasher_80_70();
+    let mut t = node_table(answers.clone());
+    assert_eq!(hashed(&mut t, &mut h).unwrap_err(), EvidenceError::Changed);
+    assert_eq!(h.asked.len(), 2 * GATHER_ATTEMPTS);
+    let mut t = node_table(answers);
+    assert_eq!(
+        gather_in(&mut t, &peer(90), Claims::none(), &AgentCatalog::builtin()).unwrap_err(),
+        EvidenceError::Changed
+    );
 }
