@@ -5278,15 +5278,18 @@ unsigned int la_version(unsigned int version) {
     ///   whether `dyld` loads the library follows its signature and this
     ///   Mac, which copies of a program this test signs itself tell
     ///   ([`signed_controls`]; the one granting both entitlements must load
-    ///   it): on a Mac that holds hardened programs to their signature's
-    ///   rule (no copy whose signature does not allow `DYLD_*` loads it),
+    ///   it): each build loads it exactly where the copy signed with the
+    ///   same entitlements does. On a Mac that holds hardened programs to
+    ///   their signature's rule (no copy whose signature does not allow
+    ///   `DYLD_*` loads it; System Integrity Protection on must mean this),
     ///   the builds load it as measured, exactly where
     ///   `cs.allow-dyld-environment-variables` and
     ///   `cs.disable-library-validation` are both granted (OpenCode's); on
     ///   one that does not (System Integrity Protection off, as on CI's
-    ///   macOS runner), each build whose signature grants both still loads
-    ///   it, and a build may stop at `dyld`'s refusal of the library
-    ///   (nothing of it ran), which is recorded. Every measurement is
+    ///   macOS runner), every copy and every build loaded it (measured).
+    ///   A library that ran counts whatever the build did next (Copilot
+    ///   CLI's Node then fails to read its own bundle); a build that `dyld`
+    ///   stops before the library runs is recorded. Every measurement is
     ///   printed before any of them is judged.
     ///
     /// Mutation checked: removing `BUN_OPTIONS` from Claude Code's entry,
@@ -5351,6 +5354,9 @@ unsigned int la_version(unsigned int version) {
         // `enforced`: a hardened program whose signature does not allow
         // `DYLD_*` is held to that.
         let mut enforced = true;
+        // Whether `dyld` loaded the library into the control signed with
+        // each `[dyld, any_library]` pair.
+        let mut control_loaded: Vec<([bool; 2], bool)> = Vec::new();
         if cfg!(target_os = "macos") {
             let sip = sip_status();
             println!("measurement: catalog loader probe os=macos: {sip}");
@@ -5375,6 +5381,7 @@ unsigned int la_version(unsigned int version) {
                 if !dyld && r.marked {
                     enforced = false;
                 }
+                control_loaded.push(([dyld, any_library], r.marked));
             }
             // With System Integrity Protection on (the Mac the builds were
             // measured on), a hardened program is held to its signature's
@@ -5461,7 +5468,21 @@ unsigned int la_version(unsigned int version) {
             for var in loader_vars() {
                 let marker = dir.join(format!("{id}-{var}"));
                 let r = probe_run(&home, &exe, &version, Some((var, lib.as_os_str())), &marker);
-                if !r.ok && !r.marked && !enforced && r.stderr.contains("dyld") {
+                if r.marked {
+                    // The library's code ran in the build's process, which
+                    // is what is measured, whatever the build did next.
+                    if !r.ok {
+                        println!(
+                            "measurement: catalog code_selecting_env os={} {id}: {var}: the \
+                             library ran, then the build failed: {:?}",
+                            os(),
+                            r.stderr
+                                .lines()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or_default()
+                        );
+                    }
+                } else if !r.ok && !enforced && r.stderr.contains("dyld") {
                     // `dyld` refused the library before anything of it ran
                     // (nothing of it, no version): the variable reached it.
                     println!(
@@ -5513,6 +5534,17 @@ unsigned int la_version(unsigned int version) {
                     format!("hardened runtime {runtime}, get-task-allow {debug}"),
                 );
                 let inserted = loaded.contains(&"DYLD_INSERT_LIBRARIES");
+                let shape = control_loaded
+                    .iter()
+                    .find(|(k, _)| *k == [dyld, any_library])
+                    .map(|(_, l)| *l);
+                judge(
+                    shape == Some(inserted),
+                    format!(
+                        "DYLD_INSERT_LIBRARIES loaded {inserted}, into a program this test \
+                         signed with the same entitlements {shape:?}"
+                    ),
+                );
                 if enforced {
                     judge(
                         loaded == loaded_measured(id),
@@ -5523,11 +5555,6 @@ unsigned int la_version(unsigned int version) {
                         format!(
                             "DYLD_INSERT_LIBRARIES loaded {inserted}, signature ({dyld}, {any_library})"
                         ),
-                    );
-                } else {
-                    judge(
-                        inserted || !(dyld && any_library),
-                        "its signature allows DYLD_INSERT_LIBRARIES and it did not load".to_owned(),
                     );
                 }
             } else {
