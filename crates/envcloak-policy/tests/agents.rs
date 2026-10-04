@@ -511,6 +511,42 @@ fn every_new_entry_has_positive_and_negative_fixtures() {
             ),
             Some(("kimi", SAID)),
         ),
+        // A Python or a node by a version the interpreters list does not
+        // name is still an interpreter (`python3.9`, `node22`): its script
+        // is read. A name that only starts like one is not.
+        (
+            "kimi-cli under a Python the list does not name".into(),
+            proc_with(
+                Some("/usr/bin/python3.9"),
+                "python3.9",
+                Some(&["python3.9", "/home/u/.local/bin/kimi"]),
+            ),
+            Some(("kimi", SAID)),
+        ),
+        (
+            "Gemini CLI under a versioned node".into(),
+            proc_with(
+                Some("/opt/node22/bin/node22"),
+                "node22",
+                Some(&[
+                    "node22",
+                    "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+                ]),
+            ),
+            Some(("gemini-cli", SAID)),
+        ),
+        (
+            "a name that only starts like an interpreter".into(),
+            proc_with(
+                Some("/usr/local/bin/nodemon"),
+                "nodemon",
+                Some(&[
+                    "nodemon",
+                    "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+                ]),
+            ),
+            None,
+        ),
         (
             "kimi-cli titled, Linux".into(),
             proc_with(
@@ -790,6 +826,56 @@ fn code_selecting_env_comes_from_the_builtin_catalog() {
         ]
     );
     assert!(cat.code_selecting_env("no-such-agent").is_empty());
+}
+
+/// The rule standing approvals apply (SPEC §10b): a variable selects code
+/// in an agent's process when it is a dynamic loader's (`LD_*`, `DYLD_*`),
+/// for every agent and an unknown one alike, measured or not (verifier
+/// review: `DYLD_INSERT_LIBRARIES` runs a library in OpenCode's macOS
+/// build, which its `code_selecting_env` never listed, and `LD_PRELOAD`
+/// in any dynamically linked Linux build), or one its entry lists. Nothing
+/// else, and names compare whole and by case. Mutation checked: dropping
+/// the `DYLD_` prefix, or the loader prefixes altogether, fails this test.
+#[test]
+fn a_loader_variable_selects_code_in_every_agent() {
+    let cat = AgentCatalog::builtin();
+    let mut ids = builtin_ids();
+    ids.push("no-such-agent");
+    for id in ids {
+        for var in [
+            "LD_PRELOAD",
+            "LD_AUDIT",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+        ] {
+            assert!(cat.env_selects_code(id, var.as_bytes()), "{id} {var}");
+        }
+        for var in [
+            "LD",
+            "DYLD",
+            "OLD_PRELOAD",
+            "ld_preload",
+            "XDYLD_INSERT_LIBRARIES",
+            "PATH",
+            "HOME",
+            "",
+        ] {
+            assert!(!cat.env_selects_code(id, var.as_bytes()), "{id} {var}");
+        }
+        for var in ["BUN_OPTIONS", "BUN_BE_BUN", "NODE_OPTIONS"] {
+            assert_eq!(
+                cat.env_selects_code(id, var.as_bytes()),
+                cat.code_selecting_env(id).iter().any(|v| v == var),
+                "{id} {var}"
+            );
+        }
+    }
+    assert!(cat.env_selects_code("claude-code", b"BUN_OPTIONS"));
+    assert!(cat.env_selects_code("opencode", b"BUN_BE_BUN"));
+    assert!(!cat.env_selects_code("opencode", b"BUN_BE_BUN_"));
+    assert!(!cat.env_selects_code("codex", b"BUN_OPTIONS"));
 }
 
 /// Cursor's process is the node it ships, which runs any script: Cursor is
