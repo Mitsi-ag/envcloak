@@ -1885,54 +1885,271 @@ fn gather_records_executable_digests_and_classifies_alike() {
     assert!(mac.asked.is_empty());
 }
 
-/// Start times are read again after hashing: a process that exited (its
-/// pid now another process's) or that runs another file since the walk
-/// keeps no digest, and the rest of the evidence is unchanged. Mutation
-/// checked: skipping the re-read after hashing fails this test.
+/// envcloak (90, its executable hidden) <- `p80` (80) <- zsh (70, leading
+/// session 70, on a terminal) <- login (60, root's) <- init, each with its
+/// executable's device and inode as on Linux. `p90` and `p80` are the
+/// answers for the caller and for 80, in order, the last one repeated: the
+/// walk reads each process twice (its walk and its check), and the check
+/// after hashing once more, so a third answer is how the process is once
+/// hashing ended.
+fn hashed_table(p90: Vec<ProcInfo>, p80: Vec<ProcInfo>) -> Table {
+    Table::default()
+        .add(p90)
+        .add(p80)
+        .add(vec![with_file(
+            info(70, 60, 70, 501, Some("/bin/zsh")),
+            (1, 70),
+        )])
+        .add(vec![info(60, 1, 60, 0, Some("/usr/bin/login"))])
+        .add(vec![info(1, 0, 1, 0, Some("/sbin/init"))])
+        .with_argv(90, vec!["envcloak", "approve", "r1"])
+}
+
+fn caller90() -> ProcInfo {
+    info(90, 80, 70, 501, None)
+}
+
+fn bash80() -> ProcInfo {
+    with_file(info(80, 70, 70, 501, Some("/bin/bash")), (1, 80))
+}
+
+/// Claude Code's native build, by its path: an agent that may root above
+/// the caller's session.
+fn claude80() -> ProcInfo {
+    with_file(
+        info(
+            80,
+            70,
+            70,
+            501,
+            Some("/home/u/.local/share/claude/versions/2.1.280"),
+        ),
+        (1, 81),
+    )
+}
+
+/// A hasher that knows a digest for 80 and 70.
+fn hasher_80_70() -> Hasher {
+    let mut h = Hasher::default();
+    h.digests.insert(80, [8; 32]);
+    h.digests.insert(70, [7; 32]);
+    h
+}
+
+fn hashed(t: &mut Table, h: &mut Hasher) -> Result<SubjectEvidence, EvidenceError> {
+    gather_in_hashed(t, &peer(90), Claims::none(), &AgentCatalog::builtin(), h)
+}
+
+/// The evidence of the steady chain `p90` <- `p80` <- ..., walked without
+/// hashing.
+fn steady(p90: ProcInfo, p80: ProcInfo) -> SubjectEvidence {
+    gather_in(
+        &mut hashed_table(vec![p90], vec![p80]),
+        &peer(90),
+        Claims::none(),
+        &AgentCatalog::builtin(),
+    )
+    .unwrap()
+}
+
+/// `e` and `want` decide alike: the same chain, kind, root, label, proof
+/// refusal, approval refusal for a person's request and coverage by every
+/// process of the chain for every kind of grant.
+fn decides_as(e: &SubjectEvidence, want: &SubjectEvidence) {
+    let pids = |e: &SubjectEvidence| -> Vec<(i32, Option<i32>, Option<u64>)> {
+        e.chain()
+            .iter()
+            .map(|a| (a.instance.pid, a.sid, a.terminal))
+            .collect()
+    };
+    assert_eq!(pids(e), pids(want));
+    assert_eq!(e.kind(), want.kind());
+    assert!(e.root().same(&want.root()));
+    assert_eq!(e.label(), want.label());
+    assert_eq!(e.proof_refusal(), want.proof_refusal());
+    assert_eq!(e.orphaned(), want.orphaned());
+    for a in want.chain() {
+        for kind in [
+            SubjectKind::Agent,
+            SubjectKind::Terminal,
+            SubjectKind::Unknown,
+        ] {
+            assert_eq!(
+                e.covered_by(&a.instance, kind),
+                want.covered_by(&a.instance, kind),
+                "{} {kind:?}",
+                a.instance.pid
+            );
+        }
+    }
+}
+
+/// Hashing takes time, and the evidence is built after it: a process of
+/// the chain that ran another file meanwhile (an `exec` keeps its pid and
+/// start time) makes the chain walked and hashed again, so every decision
+/// is the one the chain as it is now gives, never the one from before
+/// hashing. A shell that became Claude Code: its caller is an agent
+/// subject whose proofs are refused (from before hashing, a terminal
+/// subject whose proofs were taken). Claude Code that became a shell: no
+/// agent. And a node that became Claude Code's binary with the same
+/// command name: only its executable changed. Mutation checked: skipping
+/// the check after hashing fails this test, and so does leaving the
+/// executable out of it (the last case).
 #[test]
-fn a_digest_is_dropped_when_its_process_changed_while_hashing() {
-    let cat = AgentCatalog::builtin();
-    let mut reused = with_file(info(70, 60, 70, 501, Some("/bin/zsh")), (1, 70));
-    reused.start_time = StartTime::from_raw(99_999);
-    let execd = with_file(info(80, 70, 70, 501, Some("/usr/bin/node")), (1, 81));
-    let mut h = Hasher::default();
-    h.digests.insert(80, [8; 32]);
-    h.digests.insert(70, [7; 32]);
-    let e = gather_in_hashed(
-        &mut linux_table(Some(reused), Some(execd)),
-        &peer(90),
-        Claims::none(),
-        &cat,
-        &mut h,
-    )
-    .unwrap();
-    assert_eq!(h.asked, [80, 70]);
-    assert_eq!(digest(&e, 70), None, "its pid is another process's");
-    assert_eq!(digest(&e, 80), None, "it runs another file");
-    let plain = gather_in(
-        &mut linux_table(None, None),
-        &peer(90),
-        Claims::none(),
-        &cat,
-    )
-    .unwrap();
-    assert_eq!(e, plain);
-    // The control: unchanged, both keep their digests.
-    let mut h = Hasher::default();
-    h.digests.insert(80, [8; 32]);
-    h.digests.insert(70, [7; 32]);
-    let same70 = with_file(info(70, 60, 70, 501, Some("/bin/zsh")), (1, 70));
-    let same80 = with_file(info(80, 70, 70, 501, Some("/usr/bin/node")), (1, 80));
-    let e = gather_in_hashed(
-        &mut linux_table(Some(same70), Some(same80)),
-        &peer(90),
-        Claims::none(),
-        &cat,
-        &mut h,
-    )
-    .unwrap();
+fn an_exec_while_hashing_is_walked_again() {
+    let node80 = || with_file(info(80, 70, 70, 501, Some("/usr/bin/node")), (1, 82));
+    let claude_named_node = || {
+        with_file(
+            info(
+                80,
+                70,
+                70,
+                501,
+                Some("/home/u/.local/share/claude/versions/node"),
+            ),
+            (1, 83),
+        )
+    };
+    for (before, after) in [
+        (bash80(), claude80()),
+        (claude80(), bash80()),
+        (node80(), claude_named_node()),
+    ] {
+        assert_eq!(
+            before.comm == after.comm,
+            before.exe.as_ref().unwrap().path.ends_with("node")
+        );
+        let mut h = hasher_80_70();
+        let mut t = hashed_table(
+            vec![caller90()],
+            vec![before.clone(), before.clone(), after.clone()],
+        );
+        let e = hashed(&mut t, &mut h).unwrap();
+        assert_eq!(h.asked, [80, 70, 80, 70], "hashed again: {after:?}");
+        decides_as(&e, &steady(caller90(), after.clone()));
+        assert_eq!(
+            e.chain()[1].instance.exe.as_ref().unwrap().path,
+            after.exe.as_ref().unwrap().path
+        );
+        assert_eq!(digest(&e, 80), Some([8; 32]));
+    }
+    // The shell that became Claude Code, in full.
+    let mut t = hashed_table(vec![caller90()], vec![bash80(), bash80(), claude80()]);
+    let e = hashed(&mut t, &mut hasher_80_70()).unwrap();
+    let (n, l) = e.nearest_agent().unwrap();
     assert_eq!(
-        (digest(&e, 70), digest(&e, 80)),
-        (Some([7; 32]), Some([8; 32]))
+        (n, l.id.as_str(), l.basis),
+        (1, "claude-code", MatchBasis::Executable)
     );
+    assert_eq!(e.kind(), SubjectKind::Agent);
+    assert_eq!(e.proof_refusal(), Some(ProofRefusal::Agent));
+    assert!(!e.covered_by(&inst(70, 700), SubjectKind::Terminal));
+    // The control: nothing changed, one walk.
+    let mut h = hasher_80_70();
+    let e = hashed(&mut hashed_table(vec![caller90()], vec![bash80()]), &mut h).unwrap();
+    assert_eq!(h.asked, [80, 70]);
+    assert_eq!(e.kind(), SubjectKind::Terminal);
+    assert_eq!(e.proof_refusal(), None);
+    assert_eq!(
+        (digest(&e, 80), digest(&e, 70)),
+        (Some([8; 32]), Some([7; 32]))
+    );
+}
+
+/// The same for a process reparented while the chain was hashed (its
+/// session leader exited, or it double-forked away): the caller is an
+/// orphan whose proofs are refused, not the terminal subject it was; and
+/// for one that left its session (`setsid`). Mutation checked: skipping
+/// the check after hashing fails this test.
+#[test]
+fn a_reparent_or_a_new_session_while_hashing_is_walked_again() {
+    let mut reparented = bash80();
+    reparented.ppid = 1;
+    let mut setsid = bash80();
+    setsid.sid = Some(80);
+    setsid.controlling_tty = None;
+    for after in [reparented, setsid] {
+        let mut h = hasher_80_70();
+        let mut t = hashed_table(vec![caller90()], vec![bash80(), bash80(), after.clone()]);
+        let e = hashed(&mut t, &mut h).unwrap();
+        let want = steady(caller90(), after.clone());
+        decides_as(&e, &want);
+        assert_ne!(want.kind(), SubjectKind::Terminal, "{after:?}");
+        assert!(want.proof_refusal().is_some());
+    }
+}
+
+/// The caller, whose executable is hidden (the Linux CLI is not dumpable),
+/// is never hashed, yet it is read again after hashing like every other
+/// process: one that ran a program that calls itself Claude Code is an
+/// agent subject; one whose session lost its terminal gives no proof; one
+/// whose pid is now another process's is gone. Mutation checked: reading
+/// again only the processes that were hashed fails this test.
+#[test]
+fn a_hidden_caller_that_changed_while_hashing_is_walked_again() {
+    let mut says_claude = caller90();
+    says_claude.comm = OsString::from("claude");
+    let mut no_tty = caller90();
+    no_tty.controlling_tty = None;
+    for (after, refusal) in [
+        (says_claude, ProofRefusal::Agent),
+        (no_tty, ProofRefusal::NoTerminal),
+    ] {
+        let mut h = hasher_80_70();
+        let mut t = hashed_table(vec![caller90(), caller90(), after.clone()], vec![bash80()]);
+        let e = hashed(&mut t, &mut h).unwrap();
+        assert_eq!(h.asked, [80, 70, 80, 70]);
+        decides_as(&e, &steady(after, bash80()));
+        assert_eq!(e.proof_refusal(), Some(refusal));
+    }
+    let mut reused = caller90();
+    reused.start_time = StartTime::from_raw(99_999);
+    let mut t = hashed_table(vec![caller90(), caller90(), reused], vec![bash80()]);
+    assert_eq!(
+        hashed(&mut t, &mut hasher_80_70()).unwrap_err(),
+        EvidenceError::CallerGone
+    );
+}
+
+/// With the request's budget spent (or every file too large), no digest
+/// is known, and the chain is still read again after the hasher was
+/// asked: a reparent then makes it walked again. Mutation checked: reading
+/// again only the processes that were hashed fails this test.
+#[test]
+fn a_spent_budget_still_checks_the_chain_again() {
+    let mut reparented = bash80();
+    reparented.ppid = 1;
+    let mut spent = Hasher::default();
+    let mut t = hashed_table(
+        vec![caller90()],
+        vec![bash80(), bash80(), reparented.clone()],
+    );
+    let e = hashed(&mut t, &mut spent).unwrap();
+    // Asked again for the new chain, where 70 is no longer.
+    assert_eq!(spent.asked, [80, 70, 80]);
+    decides_as(&e, &steady(caller90(), reparented));
+    assert_eq!(e.proof_refusal(), Some(ProofRefusal::Orphaned));
+    assert_eq!((digest(&e, 80), digest(&e, 70)), (None, None));
+}
+
+/// A chain that changes while each attempt hashes it is refused
+/// (`ancestry_changed`) after [`GATHER_ATTEMPTS`] attempts, as one that
+/// changes under each walk is.
+#[test]
+fn a_chain_that_changes_during_every_hashing_is_refused() {
+    let named = |n: &str| {
+        let mut p = bash80();
+        p.comm = OsString::from(n);
+        p
+    };
+    let mut answers = Vec::new();
+    for k in 0..GATHER_ATTEMPTS {
+        let now = named(&format!("bash{k}"));
+        answers.extend([now.clone(), now]);
+        answers.push(named(&format!("bash{}", k + 1)));
+    }
+    let mut h = hasher_80_70();
+    let mut t = hashed_table(vec![caller90()], answers);
+    assert_eq!(hashed(&mut t, &mut h).unwrap_err(), EvidenceError::Changed);
+    assert_eq!(h.asked.len(), 2 * GATHER_ATTEMPTS);
 }
