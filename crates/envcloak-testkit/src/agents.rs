@@ -1532,7 +1532,24 @@ impl GroupChild {
         spawn: impl FnOnce(&mut Command) -> std::io::Result<Child>,
     ) -> std::io::Result<GroupChild> {
         cmd.process_group(0);
-        let child = spawn(cmd)?;
+        GroupChild::started(spawn(cmd)?)
+    }
+
+    /// Starts `cmd`, a command that makes itself the leader of a new
+    /// session, and so of a process group, as it starts (a wrapper that
+    /// calls `setsid` and then runs the program, as the CLI's tests detach
+    /// it from any terminal). It is not set to lead a group here: `setsid`
+    /// refuses a group leader. Its group is signalled as the one it leads;
+    /// before its `setsid`, no group has its id (its process id is in use),
+    /// and the signal reaches nothing.
+    ///
+    /// # Errors
+    /// When it cannot start.
+    pub fn spawn_session_leader(cmd: &mut Command) -> std::io::Result<GroupChild> {
+        GroupChild::started(cmd.spawn()?)
+    }
+
+    fn started(child: Child) -> std::io::Result<GroupChild> {
         let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
         let (tx, exited) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1866,6 +1883,18 @@ pub fn run_within(cmd: Command, limit: Duration) -> std::io::Result<Bounded> {
 /// When the process cannot start.
 pub fn run_capped(mut cmd: Command, limit: Duration, cap: usize) -> std::io::Result<Bounded> {
     Ok(start_capped(&mut cmd, cap)?.end_within(limit))
+}
+
+/// [`finish_within`] for a command that makes itself the leader of a
+/// new session as it starts ([`GroupChild::spawn_session_leader`]).
+///
+/// # Panics
+/// As [`finish_within`].
+pub fn finish_session_within(mut cmd: Command, limit: Duration) -> Output {
+    let mut child = GroupChild::spawn_session_leader(&mut cmd)
+        .unwrap_or_else(|e| panic!("cannot start a process: {e}"));
+    let collector = Collector::start(&mut child.child, usize::MAX);
+    collector.wait(&mut child, limit)
 }
 
 /// [`finish_within`], keeping at most `cap` bytes of each output stream:
@@ -2296,6 +2325,41 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(b.in_time && b.complete && !b.over_cap, "{b:?}");
         assert_eq!(b.output.stdout.len(), 1000);
+    }
+
+    /// A command that makes itself a session leader as it starts (the
+    /// CLI tests' detaching wrapper) runs, where one set to lead a group
+    /// first cannot (`setsid` refuses a group leader); a descendant it
+    /// leaves holding its output is killed with its group, and the output
+    /// ends at once.
+    ///
+    /// Mutation checked: `spawn_session_leader` setting `process_group(0)`
+    /// as `spawn` does: the wrapper's `setsid` fails and this fails.
+    #[test]
+    fn a_session_leader_is_run_and_its_group_killed() {
+        let python = [
+            "/usr/bin/python3",
+            "/usr/local/bin/python3",
+            "/opt/homebrew/bin/python3",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or_else(|| panic!("python3 is needed"));
+        let mut cmd = Command::new(python);
+        cmd.args([
+            "-c",
+            "import os; os.setsid(); os.execv('/bin/sh', ['sh', '-c', 'sleep 600 & echo led'])",
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let start = Instant::now();
+        let out = finish_session_within(cmd, Duration::from_secs(60));
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(out.stdout, b"led\n");
+        assert!(start.elapsed() < OUTPUT_GRACE, "{:?}", start.elapsed());
     }
 
     /// A started child is given its input, and ended as a run is.
