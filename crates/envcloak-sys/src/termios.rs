@@ -26,9 +26,13 @@
 //! guard is registered. One guard is registered at a time. A restore on
 //! another thread holds the registration while it runs: a guard dropped
 //! meanwhile waits for it before its descriptor closes, and no new guard
-//! registers over settings being read. [`TerminalGuard::release`] ends a
-//! guard and reports whether the restore worked; a drop restores without
-//! reporting.
+//! registers over settings being read. The panic hook's restore is final
+//! for the guard: a switch to raw mode already under way finishes first,
+//! and the restore comes after it; one asked for after it is refused
+//! (Codex's review of PR #27: a raw switch on one thread could otherwise
+//! land after the hook's restore on another, and the process abort with
+//! the terminal raw). [`TerminalGuard::release`] ends a guard and reports
+//! whether the restore worked; a drop restores without reporting.
 //!
 //! [`TerminalSettings`] are the settings themselves: the PTY's slave side
 //! starts with the outer terminal's (`crate::pty::open_pty`), so a
@@ -39,7 +43,7 @@ use std::cell::UnsafeCell;
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 /// A terminal's settings (`struct termios`), read with
 /// [`TerminalSettings::read`].
@@ -266,6 +270,11 @@ struct Slot {
     state: AtomicU32,
     fd: AtomicI32,
     saved: UnsafeCell<MaybeUninit<libc::termios>>,
+    /// The final restore has begun for this registration: raw mode is
+    /// refused from then on.
+    fatal: AtomicBool,
+    /// Switches to raw mode under way.
+    raw_switches: AtomicU32,
 }
 
 const READERS: u32 = (1 << 30) - 1;
@@ -294,6 +303,8 @@ impl Slot {
             state: AtomicU32::new(EMPTY),
             fd: AtomicI32::new(-1),
             saved: UnsafeCell::new(MaybeUninit::uninit()),
+            fatal: AtomicBool::new(false),
+            raw_switches: AtomicU32::new(0),
         }
     }
 
@@ -312,8 +323,50 @@ impl Slot {
         // thread writes the slot, and no reader is inside or can enter.
         unsafe { (*self.saved.get()).write(*saved) };
         self.fd.store(fd, Ordering::Relaxed);
+        self.fatal.store(false, Ordering::SeqCst);
         self.state.store(READY, Ordering::Release);
         Ok(())
+    }
+
+    /// Runs `switch`, a change of the registered terminal to raw mode,
+    /// unless the final restore has begun, which then waits for it to end
+    /// before it restores. Announcing the switch and reading `fatal`, and
+    /// setting `fatal` and reading the switches under way, are each
+    /// sequentially consistent, so one of the two sees the other: either
+    /// the switch is refused, or the restore waits for it.
+    fn raw_switch(&self, switch: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        self.raw_switches.fetch_add(1, Ordering::SeqCst);
+        let result = if self.fatal.load(Ordering::SeqCst) {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the terminal was restored for the process's end; raw mode is refused",
+            ))
+        } else {
+            switch()
+        };
+        self.raw_switches.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    /// The final restore: marks the registration so no switch to raw mode
+    /// starts after it, waits for one under way to end (up to
+    /// [`SWITCH_WAIT_MS`], in case it is this very thread's, interrupted),
+    /// then runs `restore` on the registered descriptor and settings with
+    /// the slot held. `None` when nothing is registered.
+    fn final_restore<R>(
+        &self,
+        restore: impl FnOnce(libc::c_int, &libc::termios) -> R,
+    ) -> Option<R> {
+        self.read(|fd, saved| {
+            self.fatal.store(true, Ordering::SeqCst);
+            let start = monotonic_ms();
+            while self.raw_switches.load(Ordering::SeqCst) != 0
+                && monotonic_ms().saturating_sub(start) < SWITCH_WAIT_MS
+            {
+                std::thread::yield_now();
+            }
+            restore(fd, saved)
+        })
     }
 
     /// Runs `f` on the registered descriptor and settings, with the slot
@@ -381,17 +434,39 @@ impl Slot {
 
 static SLOT: Slot = Slot::new();
 
+/// How long the final restore waits for a switch to raw mode under way,
+/// in milliseconds: a switch is one `tcsetattr`.
+const SWITCH_WAIT_MS: libc::time_t = 1000;
+
+/// The monotonic clock in milliseconds. Async-signal-safe
+/// (`clock_gettime`).
+fn monotonic_ms() -> libc::time_t {
+    // SAFETY: timespec is plain data; clock_gettime fills it in.
+    let mut t: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `t` is writable.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+    t.tv_sec
+        .saturating_mul(1000)
+        .saturating_add(t.tv_nsec / 1_000_000)
+}
+
 /// Puts the registered guard's saved settings back on its terminal with
-/// `TCSAFLUSH`, and returns whether it did. Async-signal-safe: it reads
-/// atomics and the saved settings and calls `tcsetattr`, which POSIX lists
-/// as safe in a signal handler, and it holds the slot while it does, so a
-/// guard dropped meanwhile on another thread waits for it before it closes
-/// the descriptor. The panic hook calls it first, so a release build,
-/// which aborts on a panic without running destructors, still leaves the
-/// terminal as it found it. The guard stays registered: its drop restores
-/// again, which changes nothing.
+/// `TCSAFLUSH`, for the process's end, and returns whether it did. It is
+/// final for the guard: a switch to raw mode under way on another thread
+/// ends first and this restore comes after it, and the guard's later
+/// switches to raw mode (`TerminalGuard::reenter_raw`) are refused. Only
+/// the panic hook, and a path that ends the process, calls it; a stop
+/// uses [`TerminalGuard::restore`]. Async-signal-safe: it reads and
+/// writes atomics, reads the saved settings and the monotonic clock, and
+/// calls `tcsetattr`, which POSIX lists as safe in a signal handler; and
+/// it holds the slot while it does, so a guard dropped meanwhile on
+/// another thread waits for it before it closes the descriptor. The panic
+/// hook calls it first, so a release build, which aborts on a panic
+/// without running destructors, still leaves the terminal as it found it.
+/// The guard stays registered: its drop restores again, which changes
+/// nothing.
 pub fn restore_outer_terminal() -> bool {
-    SLOT.read(|fd, saved| {
+    SLOT.final_restore(|fd, saved| {
         if fd < 0 {
             return false;
         }
@@ -452,7 +527,8 @@ impl TerminalGuard {
             saved,
             released: false,
         };
-        set(guard.fd.as_raw_fd(), libc::TCSANOW, &saved.raw().0)?;
+        let raw = saved.raw();
+        SLOT.raw_switch(|| set(guard.fd.as_raw_fd(), libc::TCSANOW, &raw.0))?;
         Ok(guard)
     }
 
@@ -481,9 +557,12 @@ impl TerminalGuard {
     /// SIGCONT).
     ///
     /// # Errors
-    /// When the settings cannot be changed.
+    /// When the settings cannot be changed; [`io::ErrorKind::Interrupted`]
+    /// once [`restore_outer_terminal`] has restored the terminal for the
+    /// process's end.
     pub fn reenter_raw(&self) -> io::Result<()> {
-        set(self.fd.as_raw_fd(), libc::TCSANOW, &self.saved.raw().0)
+        let raw = self.saved.raw();
+        SLOT.raw_switch(|| set(self.fd.as_raw_fd(), libc::TCSANOW, &raw.0))
     }
 
     /// Ends the guard on a way out that can still report: puts the saved
@@ -606,6 +685,72 @@ mod tests {
         );
         slot.register(200, &settings(200)).unwrap();
         assert_eq!(slot.read(|fd, t| (fd, t.c_iflag)), Some((200, 200)));
+    }
+
+    /// The final restore and a switch to raw mode on two threads (Codex's
+    /// review of PR #27): a switch under way when the final restore begins
+    /// ends first, and the restore lands after it, so the terminal is left
+    /// restored; a switch asked for after the final restore is refused and
+    /// changes nothing; a new registration takes raw mode again. Here the
+    /// terminal is a record of what was written to it, last write last.
+    /// Let the restore run without waiting for the switch, or the switch
+    /// run without looking at the mark, and the terminal is left raw.
+    #[test]
+    fn a_raw_switch_never_lands_after_the_final_restore() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let slot: &'static Slot = Box::leak(Box::new(Slot::new()));
+        slot.register(7, &settings(7)).unwrap();
+        let terminal = Arc::new(Mutex::new(Vec::<&str>::new()));
+        let (inside_tx, inside) = mpsc::channel();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let t = Arc::clone(&terminal);
+        let switcher = std::thread::spawn(move || {
+            slot.raw_switch(|| {
+                inside_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                t.lock().unwrap().push("raw");
+                Ok(())
+            })
+        });
+        inside.recv().unwrap();
+        let t = Arc::clone(&terminal);
+        let restorer = std::thread::spawn(move || {
+            slot.final_restore(|fd, saved| {
+                assert_eq!((fd, saved.c_iflag), (7, 7));
+                t.lock().unwrap().push("restored");
+            })
+        });
+        // The restore waits while the switch is under way (it would return
+        // at once without the wait).
+        let watch = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < watch {
+            assert!(
+                !restorer.is_finished(),
+                "the final restore did not wait for the switch under way"
+            );
+            std::thread::yield_now();
+        }
+        go.send(()).unwrap();
+        switcher.join().unwrap().unwrap();
+        assert_eq!(restorer.join().unwrap(), Some(()));
+        assert_eq!(*terminal.lock().unwrap(), vec!["raw", "restored"]);
+        // After it: refused, and nothing written.
+        let refused = slot.raw_switch(|| {
+            terminal.lock().unwrap().push("raw");
+            Ok(())
+        });
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            io::ErrorKind::Interrupted,
+            "a switch after the final restore"
+        );
+        assert_eq!(*terminal.lock().unwrap().last().unwrap(), "restored");
+        // A new registration starts unmarked.
+        slot.unregister();
+        slot.register(8, &settings(8)).unwrap();
+        slot.raw_switch(|| Ok(())).unwrap();
     }
 
     /// Teardown and re-registration racing readers: each guard registers a

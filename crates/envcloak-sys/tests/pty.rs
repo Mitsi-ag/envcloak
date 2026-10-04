@@ -73,6 +73,10 @@ fn main() {
                 input_typed_and_not_read_is_discarded_on_restore,
             ),
             (
+                "raw_mode_is_refused_after_the_final_restore",
+                raw_mode_is_refused_after_the_final_restore,
+            ),
+            (
                 "a_new_pty_starts_with_the_outer_settings_and_size",
                 a_new_pty_starts_with_the_outer_settings_and_size,
             ),
@@ -110,7 +114,11 @@ fn main() {
 ///   cannot unwind, so the process aborts as a release build does, after
 ///   the panic hook and without the guard's drop;
 /// - `stop`: SIGTSTP: restores the terminal and stops; on SIGCONT takes
-///   raw mode again, prints `RAW-AGAIN`, waits for SIGUSR1 and exits 0.
+///   raw mode again, prints `RAW-AGAIN`, waits for SIGUSR1 and exits 0;
+/// - `final`: SIGUSR1, then the panic hook's restore
+///   (`restore_outer_terminal`), then `TerminalGuard::reenter_raw`, which
+///   must be refused; prints `REFUSED` and whether the terminal is raw
+///   after it, and exits 0.
 fn guarded() {
     let scenario = std::env::var(SCENARIO).unwrap();
     if scenario == "abort" {
@@ -144,6 +152,23 @@ fn guarded() {
                 exit_by_signal(number);
             }
             "abort" => boom(),
+            "final" => {
+                assert!(envcloak_sys::restore_outer_terminal(), "nothing restored");
+                let again = guard.reenter_raw();
+                let raw = TerminalSettings::read(stdin.as_fd())?.is_raw();
+                put(
+                    stdout.as_fd(),
+                    format!(
+                        "{} RAW-AFTER={raw}\n",
+                        match again {
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => "REFUSED",
+                            Err(_) => "FAILED",
+                            Ok(()) => "TAKEN",
+                        }
+                    )
+                    .as_bytes(),
+                );
+            }
             "stop" => {
                 guard.restore()?;
                 // The relay's drop gives SIGTSTP its default action back.
@@ -395,6 +420,37 @@ fn restored_while_stopped_and_raw_again_after_sigcont() {
 /// checks this too; this is the plan's named case, on the drop path.)
 fn input_typed_and_not_read_is_discarded_on_restore() {
     restored_after("error", libc::SIGUSR1, |s| s.code() == Some(1), "unread");
+}
+
+/// The panic hook's restore is final for the guard (Codex's review of PR
+/// #27): `reenter_raw` after it is refused and the terminal stays as it
+/// was, read inside the program right after the refusal and by the test
+/// after the exit (also through `stty -g`). Let `reenter_raw` switch
+/// without the slot's check and the terminal is raw again after the
+/// restore.
+fn raw_mode_is_refused_after_the_final_restore() {
+    let (master, slave, before) = outer();
+    let stty_before = stty_g(slave.as_fd());
+    let (child, mut screen) = start_guarded("final", master, &slave);
+    // SAFETY: kill on this process's own, unreaped child.
+    assert_eq!(
+        unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGUSR1) },
+        0
+    );
+    screen.expect("RAW-AFTER=", 1, "the program reports");
+    assert!(
+        screen.text().contains("REFUSED RAW-AFTER=false"),
+        "{}",
+        screen.text()
+    );
+    assert_restored(
+        child,
+        &slave,
+        &before,
+        &stty_before,
+        |s| s.code() == Some(0),
+        "final",
+    );
 }
 
 fn cloexec(fd: BorrowedFd<'_>) -> bool {
