@@ -31,9 +31,16 @@ fn fixture_home() -> tempfile::TempDir {
     home
 }
 
+/// The catalog of `home`, the hosts' temporary directories in it too.
 fn catalog(home: &Path) -> Locations {
     let home = home.to_path_buf();
-    Locations::new(&move |k| (k == "HOME").then(|| OsString::from(&home))).unwrap()
+    Locations::new(&move |k| match k {
+        "HOME" => Some(OsString::from(&home)),
+        "CLAUDE_CODE_TMPDIR" => Some(home.join("claude-tmp").into_os_string()),
+        "TMPDIR" => Some(home.join("tmp").into_os_string()),
+        _ => None,
+    })
+    .unwrap()
 }
 
 /// What the scanner gets: its own type, by name, from the catalog.
@@ -77,9 +84,9 @@ fn a_fixture_catalog_emits_the_scanners_descriptors() {
     let stores = present(l.transcript_sources());
     assert!(stores.contains(&(
         h.join(".claude/projects"),
-        ConfigFormat::Jsonl,
+        ConfigFormat::Mixed,
         SourceKind::Transcript,
-        "Claude Code transcripts".to_owned()
+        "Claude Code transcripts and tool results".to_owned()
     )));
     assert!(stores.contains(&(
         h.join(".codex/sessions"),
@@ -147,4 +154,64 @@ fn the_graph_is_agents_to_scan_and_never_back() {
     // Control: the edge the check would see is there the other way.
     let agents = declared("envcloak-agents");
     assert!(agents.iter().any(|d| d == "envcloak-scan"), "{agents:?}");
+}
+
+/// Codex review: the catalog left out documented stores (Claude Code's
+/// `debug/`, `plans/` and temporary directory, Codex's `hook_outputs/`),
+/// and its tests checked chosen fixtures only. The catalog's stores are
+/// checked against two lists it does not make: every store the test kit
+/// sweeps, which M2-04 saw the pinned hosts write
+/// (`envcloak_testkit::transcripts::transcript_roots`), and Map C section
+/// 4's documented ones. Each needs a source that reads it: the same path
+/// or a directory above it read whole, or, for files kept among others,
+/// the directory with the same name filter.
+///
+/// Mutation checked: Claude Code's `debug/` source taken out of
+/// `transcript_sources`: the test kit's `claude/debug` is uncovered and
+/// this fails.
+#[test]
+fn every_store_the_hosts_write_has_a_source() {
+    use envcloak_testkit::agents::Host;
+    use envcloak_testkit::transcripts::{HostDirs, Shape, transcript_roots};
+    let home = fixture_home();
+    let h = home.path();
+    let l = catalog(h);
+    let mut sources = l.config_sources();
+    sources.extend(l.transcript_sources());
+    let covers = |path: &Path, names: Option<&str>| {
+        sources.iter().any(|s| match (names, &s.names) {
+            (None, None) => path.starts_with(&s.path),
+            (Some(n), Some(m)) => s.path == path && m == n,
+            _ => false,
+        })
+    };
+    let dirs = HostDirs {
+        home: h.to_path_buf(),
+        codex_home: h.join(".codex"),
+        claude_tmp: h.join("claude-tmp"),
+    };
+    let mut checked = 0;
+    for host in [Host::ClaudeCode, Host::Codex] {
+        for store in transcript_roots(host, &dirs) {
+            let ok = match store.shape {
+                Shape::Dir | Shape::File => covers(&store.path, None),
+                Shape::Named(part) => covers(&store.path, Some(part)),
+            };
+            assert!(ok, "{}: {} has no source", store.name, store.path.display());
+            checked += 1;
+        }
+    }
+    assert!(checked >= 20, "{checked}");
+    // Map C section 4's documented stores the test kit does not sweep.
+    for p in [
+        h.join(".claude/plans"),
+        h.join(".claude/projects/p/s/tool-results/t.txt"),
+        l.claude_tmp_dir().join("p/s/scratchpad"),
+        l.claude_tmp_dir().join("p/s/images"),
+        h.join("tmp/hook_outputs/s/u.txt"),
+    ] {
+        assert!(covers(&p, None), "{} has no source", p.display());
+    }
+    // Control: a path no store holds is not covered.
+    assert!(!covers(&h.join("project/.env"), None));
 }

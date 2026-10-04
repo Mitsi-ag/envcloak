@@ -22,6 +22,10 @@ pub enum ConfigFormat {
     Yaml,
     /// One JSON value per line.
     Jsonl,
+    /// A directory of JSONL and plain text files (Claude Code's
+    /// `projects/`: transcripts beside the text of long tool results),
+    /// each file read by its name: `.jsonl` as JSONL, any other as text.
+    Mixed,
     /// Bytes with no structure the scanner reads (pasted text, snapshots).
     Raw,
 }
@@ -46,6 +50,14 @@ pub enum SourceKind {
     /// A database the scanner does not read in M2 ("not scanned
     /// (database)").
     Database,
+    /// What the host keeps for a session besides its transcript: its
+    /// environment, shell snapshots, plans, to-do lists, memories.
+    Session,
+    /// The host's own logs (debug output, telemetry).
+    Log,
+    /// What the host keeps outside its directory while it runs: a
+    /// command's output so far, images, a scratchpad, hook output.
+    Temporary,
 }
 
 /// One place a scanner reads: a file, or a directory whose files of
@@ -58,4 +70,9 @@ pub struct ConfigSource {
     pub source_kind: SourceKind,
     /// What to call it in a report, such as "Claude Code user config".
     pub label: String,
+    /// With a directory `path`: only the files directly in it whose names
+    /// hold this (a host's files kept among others, such as Claude Code's
+    /// `.claude.json.backup.<time>` beside `.claude.json`). `None`: the
+    /// file, or every file under the directory.
+    pub names: Option<String>,
 }

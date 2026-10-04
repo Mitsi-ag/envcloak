@@ -40,6 +40,13 @@ pub struct Locations {
     claude_json: PathBuf,
     codex_home: PathBuf,
     xdg_config: PathBuf,
+    /// Where Claude Code makes its per-user temporary directory:
+    /// `CLAUDE_CODE_TMPDIR`, else `/tmp` (2.1.280 does not read `TMPDIR`
+    /// for it, M2-04).
+    claude_tmp: PathBuf,
+    /// Codex's temporary directory, `TMPDIR` else `/tmp` (Rust's
+    /// `temp_dir`).
+    tmp: PathBuf,
 }
 
 /// Why the catalog could not be built.
@@ -71,12 +78,17 @@ impl Locations {
             custom.map_or_else(|| home.join(".claude.json"), |d| d.join(".claude.json"));
         let codex_home = absolute(env("CODEX_HOME")).unwrap_or_else(|| home.join(".codex"));
         let xdg_config = absolute(env("XDG_CONFIG_HOME")).unwrap_or_else(|| home.join(".config"));
+        let claude_tmp =
+            absolute(env("CLAUDE_CODE_TMPDIR")).unwrap_or_else(|| PathBuf::from("/tmp"));
+        let tmp = absolute(env("TMPDIR")).unwrap_or_else(|| PathBuf::from("/tmp"));
         Ok(Locations {
             home,
             claude_dir,
             claude_json,
             codex_home,
             xdg_config,
+            claude_tmp,
+            tmp,
         })
     }
 
@@ -90,8 +102,8 @@ impl Locations {
     }
 
     /// Claude Code's own state file, which holds its user-scope MCP servers
-    /// and which it rewrites on every start: EnvCloak reads it and changes
-    /// it only through `claude mcp` (D-16).
+    /// and which it rewrites itself: EnvCloak changes its MCP server entry
+    /// there through its writer, under D-16's rules.
     pub fn claude_json(&self) -> &Path {
         &self.claude_json
     }
@@ -142,7 +154,29 @@ impl Locations {
             format,
             source_kind: kind,
             label: label.to_owned(),
+            names: None,
         }
+    }
+
+    /// A source of the files directly in `dir` whose names hold `names`.
+    fn named(
+        dir: PathBuf,
+        names: &str,
+        format: ConfigFormat,
+        kind: SourceKind,
+        label: &str,
+    ) -> ConfigSource {
+        ConfigSource {
+            names: Some(names.to_owned()),
+            ..Self::src(dir, format, kind, label)
+        }
+    }
+
+    /// Claude Code's per-user temporary directory: `claude-<uid>` in
+    /// `CLAUDE_CODE_TMPDIR`, else in `/tmp`.
+    pub fn claude_tmp_dir(&self) -> PathBuf {
+        self.claude_tmp
+            .join(format!("claude-{}", envcloak_sys::effective_uid()))
     }
 
     /// The configuration files in the home that can hold an MCP server's
@@ -273,19 +307,27 @@ impl Locations {
         ]
     }
 
-    /// The stores a pasted or printed value can reach (D-15; Map C §4),
-    /// for the tier-1 hosts.
+    /// The stores a pasted or printed value can reach, for the tier-1 hosts
+    /// (D-15; Map C section 4; and every store M2-04 saw the pinned
+    /// versions write, `envcloak_testkit::transcripts`: Codex review, the
+    /// catalog left out Claude Code's `debug/`, `plans/` and temporary
+    /// directory, Codex's `hook_outputs/`, and the text files in Claude
+    /// Code's `projects/`). `tests/catalog_graph.rs` keeps this equal to
+    /// both lists.
     pub fn transcript_sources(&self) -> Vec<ConfigSource> {
-        use ConfigFormat::{Jsonl, Raw};
-        use SourceKind::{Database, FileHistory, History, PasteCache, Transcript};
+        use ConfigFormat::{Json, Jsonl, Mixed, Raw};
+        use SourceKind::{
+            Database, FileHistory, History, HostBackup, Log, PasteCache, Session, Temporary,
+            Transcript,
+        };
         let c = &self.claude_dir;
         let x = &self.codex_home;
         vec![
             Self::src(
                 c.join("projects"),
-                Jsonl,
+                Mixed,
                 Transcript,
-                "Claude Code transcripts",
+                "Claude Code transcripts and tool results",
             ),
             Self::src(
                 c.join("history.jsonl"),
@@ -305,6 +347,45 @@ impl Locations {
                 FileHistory,
                 "Claude Code file history",
             ),
+            Self::src(c.join("plans"), Raw, Session, "Claude Code plans"),
+            Self::src(c.join("sessions"), Raw, Session, "Claude Code sessions"),
+            Self::src(
+                c.join("session-env"),
+                Raw,
+                Session,
+                "Claude Code session environments",
+            ),
+            Self::src(
+                c.join("shell-snapshots"),
+                Raw,
+                Session,
+                "Claude Code shell snapshots",
+            ),
+            Self::src(c.join("todos"), Raw, Session, "Claude Code to-do lists"),
+            Self::src(c.join("debug"), Raw, Log, "Claude Code debug logs"),
+            Self::src(c.join("telemetry"), Raw, Log, "Claude Code telemetry"),
+            Self::named(
+                self.claude_json
+                    .parent()
+                    .map_or_else(|| self.home.clone(), Path::to_path_buf),
+                ".claude.json.backup",
+                Json,
+                HostBackup,
+                "Claude Code config backups beside .claude.json",
+            ),
+            Self::src(
+                self.claude_tmp_dir(),
+                Raw,
+                Temporary,
+                "Claude Code temporary files (command output so far, images, scratchpad)",
+            ),
+            Self::named(
+                self.claude_tmp.clone(),
+                "-cwd",
+                Raw,
+                Temporary,
+                "Claude Code working-directory files",
+            ),
             Self::src(x.join("sessions"), Jsonl, Transcript, "Codex sessions"),
             Self::src(
                 x.join("archived_sessions"),
@@ -318,12 +399,26 @@ impl Locations {
                 History,
                 "Codex prompt history",
             ),
-            Self::src(x.join("log"), Raw, Transcript, "Codex logs"),
+            Self::src(x.join("log"), Raw, Log, "Codex logs"),
             Self::src(
+                x.join("shell_snapshots"),
+                Raw,
+                Session,
+                "Codex shell snapshots",
+            ),
+            Self::src(x.join("memories"), Raw, Session, "Codex memories"),
+            Self::named(
                 x.clone(),
+                ".sqlite",
                 Raw,
                 Database,
-                "Codex SQLite state (*.sqlite, not scanned)",
+                "Codex SQLite state (not scanned)",
+            ),
+            Self::src(
+                self.tmp.join("hook_outputs"),
+                Raw,
+                Temporary,
+                "Codex hook outputs",
             ),
         ]
     }
