@@ -396,6 +396,150 @@ fn linked_folders_worktrees_and_profiles_are_read_as_codex_reads_them() {
     assert!(misses.is_empty(), "{misses:#?}");
 }
 
+/// The verifier's round-7 finding, measured on the pinned Codex in
+/// `m2_story`: with `allow_symlinked_codex_home = true` in the user's
+/// `config.toml`, a session named through a folder link at or beneath
+/// Codex's directory runs its commands, and reads the layer of the folder
+/// the link leads to. With the key, every folder Codex's directory leads
+/// to is checked, links followed, trusted or not:
+///
+/// - a trusted project in Codex's directory, with a folder link to a
+///   folder whose `.codex` holds a domain rule: present; controls: the
+///   same without the key, with the key `false`, and with the key and no
+///   rule, all fit;
+/// - two links in a row, and a link straight from Codex's directory with
+///   nothing trusted: present (the walk does not work out which folder a
+///   link makes trusted);
+/// - a folder of a trusted project walked first without links (the
+///   project's own walk), then reached from Codex's directory through a
+///   link, whose own folder link leads to the rule: present;
+/// - Codex's directory itself a link (its name and where it leads both
+///   walked), a loop and a link to nothing beside it: fit without a rule;
+/// - a link to a folder that cannot be listed: unknown;
+/// - a value that is not a boolean: counted as set (Codex refuses the
+///   file), present.
+///
+/// Mutations checked, each failing here: the key not read
+/// (`symlinked_home_allowed` answering `false`): the present cases fit;
+/// links not followed in Codex's directory (`walk` pushing folders only):
+/// the same; the seen-set keyed without the way of walking: the folder
+/// walked first without links is skipped and its link's rule missed.
+#[test]
+fn with_the_symlinked_home_opt_out_every_folder_codex_home_leads_to_is_read() {
+    let present = Some("network_settings_present".to_owned());
+    let unknown = Some("network_settings_unknown".to_owned());
+    let key = "allow_symlinked_codex_home = true";
+    let mut misses: Vec<String> = Vec::new();
+    let mut expect = |name: &str, fx: &Fx, want: &Option<String>| {
+        let got = refusal(&fx.locations());
+        if &got != want {
+            misses.push(format!("{name}: {got:?}, not {want:?}"));
+        }
+    };
+    let link = |fx: &Fx, to: &str, at: &str| {
+        let at = fx.root.join(at);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(fx.root.join(to), at).unwrap();
+    };
+
+    // The verifier's layout, and its controls.
+    for (name, extra, rule, want) in [
+        ("the opt-out, a rule behind the link", key, true, &present),
+        ("no opt-out (control)", "", true, &None),
+        (
+            "the opt-out false (control)",
+            "allow_symlinked_codex_home = false",
+            true,
+            &None,
+        ),
+        ("the opt-out, no rule (control)", key, false, &None),
+        (
+            "a value that is not a boolean",
+            "allow_symlinked_codex_home = \"yes\"",
+            true,
+            &present,
+        ),
+    ] {
+        let fx = Fx::new();
+        std::fs::create_dir_all(fx.root.join("home/.codex/proj/.git")).unwrap();
+        if rule {
+            fx.write("work/elsewhere/.codex/config.toml", RULE);
+        } else {
+            fx.write("work/elsewhere/.codex/config.toml", "model = \"m\"\n");
+        }
+        link(&fx, "work/elsewhere", "home/.codex/proj/link");
+        fx.trust(&fx.root.join("home/.codex/proj"), extra);
+        expect(name, &fx, want);
+    }
+
+    // Two links in a row; a link from Codex's directory, nothing trusted.
+    let fx = Fx::new();
+    fx.write("work/far/.codex/config.toml", RULE);
+    link(&fx, "work/far", "work/mid/on");
+    link(&fx, "work/mid", "home/.codex/proj/first");
+    fx.trust(&fx.root.join("home/.codex/proj"), key);
+    expect("two links in a row", &fx, &present);
+    let fx = Fx::new();
+    fx.write("work/far/.codex/config.toml", RULE);
+    link(&fx, "work/far", "home/.codex/l");
+    fx.write("home/.codex/config.toml", &format!("{key}\n"));
+    expect(
+        "a link from Codex's directory, nothing trusted",
+        &fx,
+        &present,
+    );
+
+    // A trusted project's folder walked first without links, then reached
+    // through a link from Codex's directory.
+    let fx = Fx::new();
+    fx.write("work/far/.codex/config.toml", RULE);
+    link(&fx, "work/far", "work/p/sub/on");
+    link(&fx, "work/p", "home/.codex/to-p");
+    fx.trust(&fx.root.join("work/p"), key);
+    expect("a folder walked twice", &fx, &present);
+    // Control: without the key, the project's own walk takes no link.
+    fx.trust(&fx.root.join("work/p"), "");
+    expect("a folder walked once (control)", &fx, &None);
+
+    // Codex's directory a link; a loop and a link to nothing in it.
+    let fx = Fx::new();
+    std::fs::remove_dir(fx.root.join("home/.codex")).unwrap();
+    std::fs::create_dir_all(fx.root.join("data/codex/a")).unwrap();
+    link(&fx, "data/codex", "home/.codex");
+    link(&fx, "data/codex", "data/codex/a/up");
+    link(&fx, "nowhere", "data/codex/gone");
+    fx.trust(&fx.root.join("work/p"), key);
+    std::fs::create_dir_all(fx.root.join("work/p")).unwrap();
+    expect(
+        "Codex's directory a link, a loop, a link to nothing",
+        &fx,
+        &None,
+    );
+    fx.write("work/far/.codex/config.toml", RULE);
+    link(&fx, "work/far", "data/codex/a/far");
+    expect(
+        "Codex's directory a link, a rule behind a link",
+        &fx,
+        &present,
+    );
+
+    // A link to a folder that cannot be listed.
+    let fx = Fx::new();
+    let locked = fx.root.join("work/locked");
+    std::fs::create_dir_all(locked.join("in")).unwrap();
+    link(&fx, "work/locked", "home/.codex/l");
+    fx.write("home/.codex/config.toml", &format!("{key}\n"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        eprintln!("skipped the unlistable case: the folder can still be listed (root)");
+    } else {
+        expect("a link to a folder that cannot be listed", &fx, &unknown);
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
 #[test]
 fn the_instruction_settings_are_the_merged_ones() {
     let mut misses: Vec<String> = Vec::new();

@@ -29,7 +29,10 @@
 //!   the system, user, profile and managed files; each one, and each
 //!   linked git worktree of it (Codex trusts a worktree through its main
 //!   checkout), is looked through with the folders above it, by its name
-//!   and by where that leads, within [`MAX_DIRS`] folders.
+//!   and by where that leads, within [`MAX_DIRS`] folders. With
+//!   `allow_symlinked_codex_home` set in the user's `config.toml`, every
+//!   folder Codex's own directory leads to, through folder links too, is
+//!   looked through as well, trusted or not ([`SYMLINKED_HOME`]).
 //!
 //! A folder's project layer is read as Codex reads it
 //! (`discover_project_layers`): its `.codex` followed through a symlink
@@ -534,21 +537,68 @@ fn linked_worktrees(project: &Path) -> Result<Vec<PathBuf>, Refusal> {
     Ok(out)
 }
 
+/// The key in the user's `config.toml` that lets Codex's `workspace-write`
+/// sandbox take a writable root at or beneath Codex's directory named
+/// through folder links (pinned 0.159.2: `allow_symlinked_codex_home`,
+/// read from the user's own file at its top level only,
+/// `codex-rs/config/src/codex_home_symlink.rs`; the sandbox's refusal of a
+/// symlinked writable root names it, `codex-rs/sandboxing/src/seatbelt.rs`).
+/// With it, a session named through a link beneath Codex's directory
+/// runs its commands, and reads the layers of the folders the link leads
+/// to (measured in `m2_story`, the verifier's round-7 finding): those
+/// folders are looked through too.
+pub const SYMLINKED_HOME: &str = "allow_symlinked_codex_home";
+
+/// Whether the user's `config.toml` sets [`SYMLINKED_HOME`]: any value but
+/// `false` is counted as set (Codex reads only `true`, and refuses a file
+/// whose value is not a boolean).
+///
+/// # Errors
+/// `network_settings_unknown` when the file is there and not readable
+/// TOML.
+fn symlinked_home_allowed(l: &Locations) -> Result<bool, Refusal> {
+    let path = l.codex_config();
+    match read_layer(&path) {
+        Layer::Absent => Ok(false),
+        Layer::Unreadable => Err(unknown(&format!(
+            "{} could not be read as TOML",
+            path.display()
+        ))),
+        Layer::Doc(d) => Ok(d
+            .get(SYMLINKED_HOME)
+            .is_some_and(|v| v.as_bool() != Some(false))),
+    }
+}
+
 /// Every folder at or below `root`, each one's project layer passed to
-/// [`check_dir`]; within `budget` folders, each counted once (`seen`:
-/// device and inode). A folder link is not followed: a session Codex
+/// [`check_dir`]; within `budget` folders, each counted once for each way
+/// of walking (`seen`: device, inode, and whether links are followed; a
+/// folder walked with links followed is not walked again without).
+///
+/// Without `follow`, a folder link is not followed: a session Codex
 /// starts in a folder it finds itself is in a resolved path, and one named
 /// through a link (`codex -C`) runs no command in Codex's
 /// `workspace-write` sandbox, the one the allowance is for (pinned
 /// 0.159.2, measured in `m2_story`: "symlinked writable roots are not
-/// supported"). A folder's `.codex` that is a link is read all the same
-/// ([`dot_codex`]).
+/// supported"), unless the root is at or beneath Codex's directory and
+/// the user's `config.toml` sets [`SYMLINKED_HOME`]: then Codex's
+/// directory is walked with `follow`, every folder link taken (measured
+/// in `m2_story`: a session named through such a link runs its commands
+/// and reads the layer the link leads to). A folder's `.codex` that is a
+/// link is read either way ([`dot_codex`]).
 fn walk(
     root: &Path,
     home: &Home,
+    follow: bool,
     budget: &mut usize,
-    seen: &mut HashSet<(u64, u64)>,
+    seen: &mut HashSet<(u64, u64, bool)>,
 ) -> Result<(), Refusal> {
+    // Where the walk is, for its messages.
+    let place = if follow {
+        "in Codex's directory, whose folder links allow_symlinked_codex_home lets Codex follow"
+    } else {
+        "in a project you trust"
+    };
     let mut stack = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
         let meta = match std::fs::metadata(&d) {
@@ -557,18 +607,25 @@ fn walk(
             Err(e) if not_there(&e) => continue,
             Err(_) => {
                 return Err(unknown(&format!(
-                    "the folder {} in a project you trust could not be looked at",
+                    "the folder {} {place} could not be looked at",
                     d.display()
                 )));
             }
         };
-        if !seen.insert((meta.dev(), meta.ino())) {
+        let (dev, ino) = (meta.dev(), meta.ino());
+        let first = if follow {
+            seen.insert((dev, ino, true))
+        } else {
+            !seen.contains(&(dev, ino, true)) && seen.insert((dev, ino, false))
+        };
+        if !first {
             continue;
         }
         if *budget == 0 {
             return Err(unknown(&format!(
-                "the projects you trust in Codex hold more folders than EnvCloak looks through, \
-                 among them {}, any of which may hold a .codex/config.toml",
+                "the projects you trust in Codex (and Codex's directory, with \
+                 allow_symlinked_codex_home) hold more folders than EnvCloak looks through, among \
+                 them {}, any of which may hold a .codex/config.toml",
                 root.display()
             )));
         }
@@ -576,7 +633,7 @@ fn walk(
         check_dir(&d, home)?;
         let cannot = || {
             unknown(&format!(
-                "the folder {} in a project you trust could not be listed",
+                "the folder {} {place} could not be listed",
                 d.display()
             ))
         };
@@ -587,7 +644,8 @@ fn walk(
         };
         for e in rd {
             let e = e.map_err(|_| cannot())?;
-            if e.file_type().map_err(|_| cannot())?.is_dir() {
+            let kind = e.file_type().map_err(|_| cannot())?;
+            if kind.is_dir() || (follow && kind.is_symlink()) {
                 stack.push(e.path());
             }
         }
@@ -658,7 +716,7 @@ pub fn other_layers_fit_within(l: &Locations, max_dirs: usize) -> Result<(), Ref
     let layers = settings_layers(l, &profiles);
     let home = Home::of(l);
     let mut budget = max_dirs;
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut seen: HashSet<(u64, u64, bool)> = HashSet::new();
     let mut above: HashSet<PathBuf> = HashSet::new();
     for project in trusted_projects(&layers) {
         let mut roots = vec![project.clone()];
@@ -678,7 +736,24 @@ pub fn other_layers_fit_within(l: &Locations, max_dirs: usize) -> Result<(), Ref
                     check_dir(a, &home)?;
                 }
             }
-            walk(&root, &home, &mut budget, &mut seen)?;
+            walk(&root, &home, false, &mut budget, &mut seen)?;
+        }
+    }
+    // With `allow_symlinked_codex_home`, a session's folder at or beneath
+    // Codex's directory may be named through folder links, and Codex reads
+    // the layers of every folder from its project root down to it: the
+    // folders above Codex's directory, and every folder it leads to, links
+    // followed (trusted or not: a folder reached through a link is trusted
+    // by its own name, where it leads, or its project root's, which the
+    // walk does not work out).
+    if symlinked_home_allowed(l)? {
+        for start in [&home.spelled, &home.real] {
+            for a in start.ancestors().skip(1) {
+                if above.insert(a.to_path_buf()) {
+                    check_dir(a, &home)?;
+                }
+            }
+            walk(start, &home, true, &mut budget, &mut seen)?;
         }
     }
     Ok(())

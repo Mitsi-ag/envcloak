@@ -1014,12 +1014,38 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// The verifier's round-7 layout: a trusted project in Codex's directory
+/// holding a folder link to a folder whose `.codex` holds the rule, and
+/// `allow_symlinked_codex_home = true` in the user's `config.toml`.
+const OPTED_OUT: &str = "a folder link in Codex's directory, opted out";
+/// The same, the folder behind the link holding no network setting.
+const OPTED_OUT_NO_RULE: &str = "a folder link in Codex's directory, opted out, no rule";
+
 /// The layouts of [`codex_linked_layers_keep_the_socket_allowance_out`]:
-/// in `work`, a trusted project with a proxy domain rule for `127.0.0.1`
-/// where Codex reads it; the project, the session's folder, and the flags
-/// naming it.
-fn linked_layout(name: &str, work: &Path, rule: &str) -> (PathBuf, PathBuf, Vec<String>) {
+/// in `work` (or Codex's directory), a trusted project with a proxy
+/// domain rule for `127.0.0.1` where Codex reads it; the project, the
+/// session's folder, and the flags naming it.
+fn linked_layout(
+    name: &str,
+    work: &Path,
+    codex_home: &Path,
+    rule: &str,
+) -> (PathBuf, PathBuf, Vec<String>) {
     match name {
+        OPTED_OUT | OPTED_OUT_NO_RULE => {
+            let p = codex_home.join("proj");
+            std::fs::create_dir_all(p.join(".git")).unwrap();
+            std::fs::create_dir_all(work.join("elsewhere/.codex")).unwrap();
+            let body = if name == OPTED_OUT {
+                rule
+            } else {
+                "model_verbosity = \"low\"\n"
+            };
+            std::fs::write(work.join("elsewhere/.codex/config.toml"), body).unwrap();
+            std::os::unix::fs::symlink(work.join("elsewhere"), p.join("link")).unwrap();
+            let through = p.join("link").to_str().unwrap().to_owned();
+            (p.clone(), p, vec!["-C".to_owned(), through])
+        }
         "a .codex link to a folder" => {
             let p = work.join("linked");
             std::fs::create_dir_all(p.join(".git")).unwrap();
@@ -1051,10 +1077,10 @@ fn linked_layout(name: &str, work: &Path, rule: &str) -> (PathBuf, PathBuf, Vec<
     }
 }
 
-/// The verifier's round-6 finding (Codex F-128) and its class, on the
-/// pinned Codex (L-02): layers of a trusted project that Codex reads and
-/// the round-6 check did not look at. Three layouts, each with a proxy
-/// domain rule for `127.0.0.1` where Codex reads it:
+/// The verifier's round-6 and round-7 findings (Codex F-128) and their
+/// class, on the pinned Codex (L-02): layers of a trusted project that
+/// Codex reads and the check did not look at. Four layouts, each with a
+/// proxy domain rule for `127.0.0.1` where Codex reads it:
 ///
 /// - the project's `.codex` is a link to a folder holding the rule;
 /// - a linked git worktree of the project (made by git, outside it) holds
@@ -1062,7 +1088,12 @@ fn linked_layout(name: &str, work: &Path, rule: &str) -> (PathBuf, PathBuf, Vec<
 ///   (Codex trusts it through its main checkout);
 /// - a folder link inside the project leads to a folder whose `.codex`
 ///   holds the rule, and the session is named through the link (`codex
-///   exec -C <project>/link`).
+///   exec -C <project>/link`);
+/// - the same inside Codex's own directory, with `allow_symlinked_codex_home
+///   = true` in the user's `config.toml`: the opt-out Codex's refusal of a
+///   symlinked writable root names, which lets a writable root at or
+///   beneath Codex's directory be named through links (and a control with
+///   no rule behind the link).
 ///
 /// Measured first, for each, with the allowance as round 5 wrote it (by
 /// hand): from the first two, a request from Codex's `workspace-write`
@@ -1077,15 +1108,23 @@ fn linked_layout(name: &str, work: &Path, rule: &str) -> (PathBuf, PathBuf, Vec<
 /// refuses a writable root named through a symlink: "symlinked writable
 /// roots are not supported"), and one in the project itself reaches
 /// nothing through the proxy (the rule behind the link is not read
-/// there).
+/// there). The fourth, by hand first like the first two: with the opt-out
+/// the session named through the link runs its command, and the rule
+/// behind the link widens the allowance to the listener; then install
+/// withholds the allowance (`network_settings_present`, exit 1) and the
+/// listener is not reached. Its control, the opt-out and no rule: install
+/// writes the allowance (exit 0), and the session through the link runs
+/// its command and reaches nothing through the proxy.
 ///
 /// Mutations checked, each against real Codex: `.codex` looked at without
 /// following a symlink (`symlink_metadata` in `codex_layers::dot_codex`):
 /// the first layout's allowance is written and the listener reached after
 /// install; `linked_worktrees` not called: the second's; folder links
-/// followed in `codex_layers::walk` (as the round-7 draft did): the third
-/// layout's install withholds the allowance, which no session there could
-/// use, and exits 1.
+/// followed in every walk (as the round-7 draft did): the third layout's
+/// install withholds the allowance, which no session there could use, and
+/// exits 1; the opt-out not read (`symlinked_home_allowed` answering
+/// `false`): the fourth layout's allowance is written and the listener
+/// reached after install.
 #[test]
 fn codex_linked_layers_keep_the_socket_allowance_out() {
     if !cfg!(target_os = "macos") {
@@ -1105,8 +1144,11 @@ fn codex_linked_layers_keep_the_socket_allowance_out() {
         "a .codex link to a folder",
         "a linked worktree",
         "a folder link named by -C",
+        OPTED_OUT,
+        OPTED_OUT_NO_RULE,
     ] {
         let through_link = name == "a folder link named by -C";
+        let opted_out = name == OPTED_OUT || name == OPTED_OUT_NO_RULE;
         let mut h = Harness::start();
         vault(&mut h);
         let mut codex = AgentHome::within(&h.home, Host::Codex, xi.clone());
@@ -1116,13 +1158,19 @@ fn codex_linked_layers_keep_the_socket_allowance_out() {
         let work = home.join("work");
         std::fs::create_dir_all(&work).unwrap();
         let work = std::fs::canonicalize(&work).unwrap();
-        let (project, cwd, extra) = linked_layout(name, &work, rule);
+        let codex_home = std::fs::canonicalize(home.join(".codex")).unwrap();
+        let (project, cwd, extra) = linked_layout(name, &work, &codex_home, rule);
         let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
         let base =
             HostFlags::codex("workspace-write", "never").with(&["--dangerously-bypass-hook-trust"]);
         let flags = base.clone().with(&extra);
         let trust = format!(
-            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            "{}[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            if opted_out {
+                "allow_symlinked_codex_home = true\n"
+            } else {
+                ""
+            },
             project.display()
         );
         let socket = daemon_socket(&h.home);
@@ -1169,7 +1217,7 @@ fn codex_linked_layers_keep_the_socket_allowance_out() {
         // The control: the round-5 allowance, by hand. (A session named
         // through a link is measured with EnvCloak's own allowance below:
         // Codex may record that name as a trusted project of its own.)
-        if !through_link {
+        if !through_link && name != OPTED_OUT_NO_RULE {
             codex.codex_config(&format!(
                 "{trust}\n[sandbox_workspace_write]\nnetwork_access = true\n\n\
                  [features.network_proxy]\nenabled = true\n\n\
@@ -1217,6 +1265,16 @@ fn codex_linked_layers_keep_the_socket_allowance_out() {
             // fails the whole call when its proxy blocks a request).
             let (reached, said) = measure(&mut h, &codex, "after install, in the project", &base);
             assert_eq!(reached, 0, "{name}: the listener was reached");
+            assert!(
+                said.contains("PROXIEDNO") || said.contains("was blocked"),
+                "{name}: {said}"
+            );
+        } else if name == OPTED_OUT_NO_RULE {
+            // The control: nothing behind the link widens the allowance,
+            // which is written, and the command runs and reaches nothing.
+            assert_eq!(code, 0, "{name}: {v}");
+            assert!(toml.contains("network_access = true"), "{name}: {toml}");
+            assert!(!said.contains(refused_root), "{name}: {said}");
             assert!(
                 said.contains("PROXIEDNO") || said.contains("was blocked"),
                 "{name}: {said}"
