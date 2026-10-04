@@ -4289,7 +4289,10 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
     /// pseudo-terminal of its own. Under `env -i`, with no sandbox in the way
     /// of the socket (`danger-full-access`; the classification, not the
     /// sandbox, is measured here), the command is an agent subject rooted at
-    /// the pinned `codex` binary, above its session.
+    /// the pinned `codex` binary, above its session. A second `tty: true`
+    /// command gives real proofs to a real daemon, which refuses them
+    /// ([`ProofTarget`]). Mutation checked (outside any agent's tree):
+    /// removing Codex's executable and signature fails this test.
     #[test]
     fn a_codex_tty_true_command_is_an_agent() {
         let found = Installed::find(&versions_toml(), Host::Codex.id(), "native");
