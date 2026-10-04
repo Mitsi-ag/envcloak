@@ -3891,8 +3891,8 @@ mod catalog {
 
     use envcloak_e2e::{Harness, RECOVERY_KIT, python3, quoted, text, token, versions_toml};
     use envcloak_policy::{
-        AgentCatalog, AgentLabel, Claims, MatchBasis, ProofRefusal, SubjectEvidence, SubjectKind,
-        gather,
+        AgentCatalog, AgentLabel, ApprovalOptions, Claims, MatchBasis, PendingDescriptor,
+        ProofRefusal, SubjectEvidence, SubjectKind, gather, statement_digest,
     };
     use envcloak_testkit::agents::{AgentHome, GroupChild, Host, HostFlags, Installed, require};
     use envcloak_testkit::{Canary, TestHome, labels, testkit_bin};
@@ -4024,17 +4024,66 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
     /// How long a line the daemon wrote may take to reach its collected log.
     const LOG_LIMIT: Duration = Duration::from_secs(10);
 
+    /// A client of the daemon's socket that speaks its protocol itself
+    /// (docs/IPC.md: a 4-byte big-endian length, then a JSON-RPC 2.0
+    /// request), with nothing of the CLI's: `get <socket> <request> <out>`
+    /// sends `pending.get`; `approve <socket> <request> <out> <digest file>
+    /// <options file> <passphrase file>` sends `approve` with that
+    /// statement digest, those options and the passphrase (up to its first
+    /// newline, as `--passphrase-fd` reads it). Either writes the daemon's
+    /// whole answer to `<out>` and exits 0 once it has one.
+    const IPC: &str = r#"import base64, json, socket, struct, sys
+op, path, request, out = sys.argv[1:5]
+params = {"request": request, "claims": []}
+if op == "get":
+    method = "pending.get"
+else:
+    method = "approve"
+    with open(sys.argv[5]) as f:
+        params["digest"] = f.read().strip()
+    with open(sys.argv[6]) as f:
+        params["options"] = json.load(f)
+    with open(sys.argv[7], "rb") as f:
+        passphrase = f.read().split(b"\n", 1)[0]
+    params["passphrase"] = base64.b64encode(passphrase).decode()
+body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(path)
+s.sendall(struct.pack(">I", len(body)) + body)
+def read(n):
+    got = b""
+    while len(got) < n:
+        chunk = s.recv(n - len(got))
+        if not chunk:
+            sys.exit("the daemon closed the connection")
+        got += chunk
+    return got
+n = struct.unpack(">I", read(4))[0]
+with open(out, "wb") as f:
+    f.write(read(n))
+"#;
+
+    /// The options every approval here asks for: a session grant of an
+    /// hour, as `envcloak approve <id> --for 1h` does.
+    fn approval_options() -> ApprovalOptions {
+        ApprovalOptions::session(Duration::from_secs(3600))
+    }
+
     /// A daemon with an unlocked vault, a project (the canary
     /// `OPENAI_API_KEY` imported from its `.env`) and the test fixture
     /// agent's pending request (its `run -- ./emit`): what a command on an
     /// agent's pseudo-terminal tries to prove itself to (gate 23 at the
     /// daemon, Codex review). The proofs it tries are valid ones: the
-    /// vault's passphrase, on a descriptor.
+    /// vault's passphrase, on a descriptor, and for the direct approval the
+    /// pending request's own statement digest, which a person's terminal
+    /// fetched beforehand ([`ProofTarget::statement`]).
     pub(super) struct ProofTarget {
         h: Harness,
         repo: PathBuf,
         id: String,
         pass: PathBuf,
+        /// The daemon's socket.
+        sock: PathBuf,
         /// Where the attempts write their output and status.
         dir: PathBuf,
     }
@@ -4077,30 +4126,86 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
             let run = h.agent(&repo, &["run", "--", "./emit"]);
             assert_eq!(run.status.code(), Some(125), "{}", text(&run));
             assert_eq!(token(&run.stderr), "approval_required", "{}", text(&run));
-            let err = String::from_utf8_lossy(&run.stderr).into_owned();
-            let id = err
-                .split("request=")
-                .nth(1)
-                .and_then(|r| r.get(..8))
-                .unwrap_or_else(|| panic!("no request id: {err}"))
-                .to_owned();
+            let id = request_id(&run.stderr);
             let dir = h.files().join("attempts");
             std::fs::create_dir_all(&dir).unwrap();
-            ProofTarget {
+            std::fs::write(dir.join("ipc.py"), IPC).unwrap();
+            // The socket the CLI resolves in this home: under the data
+            // directory on macOS, under XDG_RUNTIME_DIR on Linux.
+            let sock = if cfg!(target_os = "macos") {
+                h.data_dir().join("run").join("envcloakd.sock")
+            } else {
+                h.home
+                    .root()
+                    .join("run")
+                    .join("envcloak")
+                    .join("envcloakd.sock")
+            };
+            let mut t = ProofTarget {
                 h,
                 repo,
                 id,
                 pass,
+                sock,
                 dir,
-            }
+            };
+            let id = t.id.clone();
+            t.statement(&id, "approve-ipc");
+            t
+        }
+
+        /// Runs [`IPC`] from a person's terminal with `args`, its answer
+        /// written to `<name>.json` among the attempts, and returns the
+        /// answer, recorded for the sweep.
+        fn person_ipc(&mut self, name: &str, args: &[&str]) -> serde_json::Value {
+            let out = self.dir.join(format!("{name}.json"));
+            let (py, ipc) = (python3(), self.dir.join("ipc.py"));
+            let (sock, out_s) = (self.sock.to_string_lossy(), out.to_string_lossy());
+            let mut argv = vec![py.to_str().unwrap(), ipc.to_str().unwrap(), args[0]];
+            argv.extend([sock.as_ref(), args[1], out_s.as_ref()]);
+            argv.extend_from_slice(&args[2..]);
+            let repo = self.repo.clone();
+            let ran = self.h.human_argv(&repo, &argv, &[], &[]);
+            assert_eq!(ran.code, 0, "the person's {name}: {}", ran.all());
+            let bytes = std::fs::read(&out).unwrap();
+            self.h.record(&format!("the person's {name}"), &bytes);
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        /// From a person's terminal, `pending.get` for request `id`, then the
+        /// digest of its statement with [`approval_options`], as `envcloak
+        /// approve` computes it from the same answer (`statement_digest`):
+        /// written to `<name>.digest` and `<name>.options` among the
+        /// attempts, for [`IPC`]'s `approve`.
+        fn statement(&mut self, id: &str, name: &str) {
+            let answer = self.person_ipc(&format!("{name}.descriptor"), &["get", id]);
+            let descriptor: PendingDescriptor = serde_json::from_value(answer["result"].clone())
+                .unwrap_or_else(|e| {
+                    panic!("no pending request {id} for a person's terminal: {e}: {answer}")
+                });
+            let digest: String = statement_digest(&descriptor, &approval_options())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            std::fs::write(self.dir.join(format!("{name}.digest")), digest).unwrap();
+            let options = serde_json::to_vec(&approval_options()).unwrap();
+            std::fs::write(self.dir.join(format!("{name}.options")), options).unwrap();
         }
 
         /// The shell commands a command on an agent's pseudo-terminal runs,
         /// under `env -i` with only this daemon's home, each writing its
-        /// output and status beside the others: `envcloak approve <id> --for
-        /// 1h` for the pending request, with the vault's passphrase on
-        /// descriptor 3; `envcloak lock`, which needs no proof; then
-        /// `envcloak unlock`, with the passphrase on descriptor 3.
+        /// output and status beside the others:
+        /// 1. [`IPC`]'s `approve` of the pending request, straight to the
+        ///    daemon's socket: its statement digest (a person's terminal
+        ///    fetched it), the vault's passphrase and the options it was
+        ///    computed for, so nothing but the caller's evidence stands
+        ///    between it and a grant (Codex review: the CLI below is
+        ///    refused at `pending.get`, before it reads the passphrase or
+        ///    sends `approve`);
+        /// 2. `envcloak approve <id> --for 1h`, with the passphrase on
+        ///    descriptor 3;
+        /// 3. `envcloak lock`, which needs no proof;
+        /// 4. `envcloak unlock`, with the passphrase on descriptor 3.
         pub(super) fn attempts(&self) -> String {
             let env = self
                 .h
@@ -4110,23 +4215,37 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
                 .map(|(k, v)| format!("{k}={}", quoted(&v.to_string_lossy())))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let cli = quoted(&self.h.cli().to_string_lossy());
-            let pass = quoted(&self.pass.to_string_lossy());
-            let one = |name: &str, args: &str| {
-                let at =
-                    |ext: &str| quoted(&self.dir.join(format!("{name}.{ext}")).to_string_lossy());
+            let q = |p: &Path| quoted(&p.to_string_lossy());
+            let at = |name: &str, ext: &str| q(&self.dir.join(format!("{name}.{ext}")));
+            let one = |name: &str, command: &str| {
                 format!(
-                    "/usr/bin/env -i {env} {cli} {args} >{} 2>{}; echo $? >{}",
-                    at("out"),
-                    at("err"),
-                    at("code")
+                    "/usr/bin/env -i {env} {command} >{} 2>{}; echo $? >{}",
+                    at(name, "out"),
+                    at(name, "err"),
+                    at(name, "code")
                 )
             };
+            let cli = q(&self.h.cli());
+            let pass = q(&self.pass);
             let proof = format!("--passphrase-fd 3 3<{pass}");
+            let direct = format!(
+                "{} {} approve {} {} {} {} {} {pass}",
+                q(&python3()),
+                q(&self.dir.join("ipc.py")),
+                q(&self.sock),
+                self.id,
+                at("approve-ipc", "json"),
+                at("approve-ipc", "digest"),
+                at("approve-ipc", "options"),
+            );
             [
-                one("approve", &format!("approve {} --for 1h {proof}", self.id)),
-                one("lock", "lock"),
-                one("unlock", &format!("unlock {proof}")),
+                one("approve-ipc", &direct),
+                one(
+                    "approve",
+                    &format!("{cli} approve {} --for 1h {proof}", self.id),
+                ),
+                one("lock", &format!("{cli} lock")),
+                one("unlock", &format!("{cli} unlock {proof}")),
             ]
             .join("; ")
         }
@@ -4145,13 +4264,16 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
             .join(" ")
         }
 
-        /// Both proofs were refused as an agent's, and nothing came of them:
+        /// Every proof was refused as an agent's, each at the method that
+        /// takes it (`approve` sent straight to the socket, the CLI's
+        /// `approve` at `pending.get`, `unlock`), and nothing came of them:
         /// no approval in the daemon's audit, no grant, the vault still
         /// locked (the lock between them ran), the agent's run given
-        /// nothing. Then the control: the same passphrase from a person's
-        /// terminal unlocks the vault and approves the agent's request (its
-        /// new one: the lock ended the first), and the run gets its value.
-        /// Prints the measurement.
+        /// nothing. Then the controls, from a person's terminal: the same
+        /// passphrase unlocks the vault, and the same direct `approve`, with
+        /// the digest of the agent's new request (the lock ended the first),
+        /// creates a grant, so the run gets its value. Prints the
+        /// measurement.
         pub(super) fn assert_refused_then_taken(mut self, host: &str) {
             let read = |dir: &Path, name: &str, ext: &str| {
                 std::fs::read(dir.join(format!("{name}.{ext}"))).unwrap_or_default()
@@ -4162,6 +4284,32 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
                 "0",
                 "{host}: the lock between the proofs: {}",
                 String::from_utf8_lossy(&read(&dir, "lock", "err"))
+            );
+            // The direct approval reached the daemon and was answered.
+            let (code, err) = (
+                read(&dir, "approve-ipc", "code"),
+                read(&dir, "approve-ipc", "err"),
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&code).trim(),
+                "0",
+                "{host}: the direct approval got no answer: {}",
+                String::from_utf8_lossy(&err)
+            );
+            let answer = read(&dir, "approve-ipc", "json");
+            self.h
+                .record(&format!("{host}: the direct approval's answer"), &answer);
+            let answer: serde_json::Value = serde_json::from_slice(&answer).unwrap();
+            println!(
+                "measurement: catalog host={host} os={}: `approve` sent to the socket with the \
+                 request's statement digest and the passphrase from its pseudo-terminal: {}",
+                os(),
+                answer["error"]["data"]["kind"]
+            );
+            assert!(answer.get("result").is_none(), "{host}: approved: {answer}");
+            assert_eq!(
+                answer["error"]["data"]["kind"], "proof_refused",
+                "{host}: {answer}"
             );
             for name in ["approve", "unlock"] {
                 let (out, err) = (read(&dir, name, "out"), read(&dir, name, "err"));
@@ -4189,7 +4337,7 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
                 );
             }
             let mut log = String::new();
-            for method in ["pending.get", "unlock"] {
+            for method in ["approve", "pending.get", "unlock"] {
                 log = self.h.expect_log(
                     &format!("envcloakd: audit: proof refused method={method} reason=agent"),
                     LOG_LIMIT,
@@ -4209,7 +4357,7 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
             let run = self.h.agent(&self.repo, &["run", "--", "./emit"]);
             assert_ne!(run.status.code(), Some(0), "{host}: {}", text(&run));
             assert!(run.stdout.is_empty(), "{host}: {}", text(&run));
-            // The control, from a person's terminal.
+            // The controls, from a person's terminal.
             let home = self.h.home.home();
             let unlocked = self.h.human(
                 &home,
@@ -4225,27 +4373,39 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
                 "{}",
                 text(&again)
             );
-            let err = String::from_utf8_lossy(&again.stderr).into_owned();
-            let id = err
-                .split("request=")
-                .nth(1)
-                .and_then(|r| r.get(..8))
-                .unwrap_or_else(|| panic!("no request id: {err}"))
-                .to_owned();
-            let typed = format!("{}\r", self.h.canary(labels::VAULT_PASSPHRASE).as_str());
-            let repo = self.repo.clone();
-            let approved = self.h.human(
-                &repo,
-                &["approve", &id, "--for", "1h"],
-                &[],
-                &[("Vault passphrase to approve this: ", &typed)],
+            let id = request_id(&again.stderr);
+            self.statement(&id, "control");
+            let pass = self.pass.to_string_lossy().into_owned();
+            let at = |ext: &str| {
+                dir.join(format!("control.{ext}"))
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let (digest, options) = (at("digest"), at("options"));
+            let approved = self.person_ipc(
+                "control.approve",
+                &["approve", &id, &digest, &options, &pass],
             );
-            assert_eq!(approved.code, 0, "{host}: {}", approved.all());
+            assert!(
+                approved["result"]["grant"].is_string(),
+                "{host}: the person's direct approval: {approved}"
+            );
             let run = self.h.agent(&self.repo, &["run", "--", "./emit"]);
             assert_eq!(run.status.code(), Some(0), "{host}: {}", text(&run));
             assert_eq!(String::from_utf8_lossy(&run.stdout), "started\n");
             self.h.assert_swept(host);
         }
+    }
+
+    /// The request id `envcloak run` printed on its standard error
+    /// (`approval_required request=<id>`).
+    fn request_id(stderr: &[u8]) -> String {
+        let err = String::from_utf8_lossy(stderr);
+        err.split("request=")
+            .nth(1)
+            .and_then(|r| r.get(..8))
+            .unwrap_or_else(|| panic!("no request id: {err}"))
+            .to_owned()
     }
 
     /// Checks the evidence of a command `id`'s host started on a
@@ -4508,15 +4668,34 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
     /// What the daemon would make of process `pid` as an ancestor of a caller
     /// of this uid: read as `gather` reads it (its executable, and its
     /// arguments where the catalog needs them), then classified.
+    ///
+    /// As the daemon's evidence does, the process is read again after its
+    /// arguments, and its arguments after that, which must classify it
+    /// alike: a host that changed between the reads (an `exec`, a new
+    /// title) is read again, and one that keeps changing fails the test.
     fn classify_running(cat: &AgentCatalog, pid: i32) -> Option<AgentLabel> {
-        let mut p = envcloak_sys::proc_info(pid).ok()?;
-        if p.uid != envcloak_sys::effective_uid() {
-            return None;
+        for _ in 0..3 {
+            let mut p = envcloak_sys::proc_info(pid).ok()?;
+            if p.uid != envcloak_sys::effective_uid() {
+                return None;
+            }
+            if cat.needs_argv(&p) {
+                p.argv = envcloak_sys::proc_argv(pid).ok();
+            }
+            let again = envcloak_sys::proc_info(pid).ok()?;
+            if !again.unchanged(&p) {
+                continue;
+            }
+            let mut now = p.clone();
+            if cat.needs_argv(&p) {
+                now.argv = envcloak_sys::proc_argv(pid).ok();
+            }
+            let label = cat.classify(&p);
+            if cat.classify(&now) == label {
+                return label;
+            }
         }
-        if cat.needs_argv(&p) {
-            p.argv = envcloak_sys::proc_argv(pid).ok();
-        }
-        cat.classify(&p)
+        panic!("process {pid} kept changing while it was read")
     }
 
     /// Process `root` and its descendants, from `ps`.
@@ -4803,17 +4982,217 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
         target.assert_refused_then_taken("fixture");
     }
 
-    /// The catalog's `code_selecting_env` against the pinned builds (M2-10
-    /// review): for every entry with an executable identity (an install
-    /// tree or a signature, what a standing approval could name), its
-    /// pinned native executable is run with each variable known to make a
-    /// Bun or Node executable run a file it is given (`BUN_OPTIONS
-    /// =--preload=`, `BUN_BE_BUN=1` with the file as its argument,
-    /// `NODE_OPTIONS=--require=`), the file writing a marker. The variables
-    /// whose marker appears are the entry's `code_selecting_env`, no more
-    /// and no fewer, on each system. Mutation checked: removing
-    /// `BUN_OPTIONS` from Claude Code's entry, or adding `NODE_OPTIONS` to
-    /// Copilot CLI's, fails this test.
+    /// A library each loader variable can name: its constructor, and
+    /// `la_version` when `LD_AUDIT` loads it as an audit library, write
+    /// `ran` to the file `EC_MARKER` names.
+    const MARKER_LIB: &str = r#"#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void mark(void) {
+    const char *path = getenv("EC_MARKER");
+    if (path != NULL) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            (void)write(fd, "ran", 3);
+            close(fd);
+        }
+    }
+}
+
+__attribute__((constructor)) static void ec_marker(void) { mark(); }
+
+unsigned int la_version(unsigned int version) {
+    mark();
+    return version;
+}
+"#;
+
+    /// The loader probe's positive control: a program this test builds,
+    /// which no hardened runtime or static link keeps from its loader's
+    /// variables.
+    const PLAIN: &str = "#include <stdio.h>\nint main(void) { puts(\"ec-plain 1\"); return 0; }\n";
+
+    /// The dynamic loader variables tried on this system: `dyld`'s
+    /// `DYLD_INSERT_LIBRARIES` on macOS; `ld.so`'s `LD_PRELOAD` and
+    /// `LD_AUDIT` on Linux.
+    fn loader_vars() -> &'static [&'static str] {
+        if cfg!(target_os = "macos") {
+            &["DYLD_INSERT_LIBRARIES"]
+        } else {
+            &["LD_PRELOAD", "LD_AUDIT"]
+        }
+    }
+
+    /// The loader variables measured to run [`MARKER_LIB`] in agent `id`'s
+    /// pinned build on this system (docs/AGENTS.md "Host behaviour").
+    fn loaded_measured(id: &str) -> &'static [&'static str] {
+        match (cfg!(target_os = "macos"), id) {
+            (true, "opencode") => &["DYLD_INSERT_LIBRARIES"],
+            (true, _) | (false, "codex") => &[],
+            (false, _) => &["LD_PRELOAD", "LD_AUDIT"],
+        }
+    }
+
+    /// Builds [`MARKER_LIB`] and [`PLAIN`] in `dir` with the system's C
+    /// compiler (`cc`), in a cleared environment. The library's path and
+    /// the program's.
+    fn build_loader_probe(dir: &Path, home: &TestHome) -> (PathBuf, PathBuf) {
+        let cc = envcloak_e2e::find_on_path("cc").unwrap_or_else(|| {
+            panic!("the loader probe needs a C compiler, cc, on PATH (Xcode's tools, or gcc)")
+        });
+        std::fs::write(dir.join("marker.c"), MARKER_LIB).unwrap();
+        std::fs::write(dir.join("plain.c"), PLAIN).unwrap();
+        let (lib, shared): (PathBuf, &[&str]) = if cfg!(target_os = "macos") {
+            (dir.join("libecmarker.dylib"), &["-dynamiclib"])
+        } else {
+            (dir.join("libecmarker.so"), &["-shared", "-fPIC"])
+        };
+        let plain = dir.join("ec-plain");
+        let mut lib_args = shared.to_vec();
+        lib_args.extend(["-o", lib.to_str().unwrap(), "marker.c"]);
+        for args in [lib_args, vec!["-o", plain.to_str().unwrap(), "plain.c"]] {
+            let mut cmd = Command::new(&cc);
+            cmd.env_clear()
+                .envs(home.vars())
+                .args(&args)
+                .current_dir(dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let out = envcloak_testkit::agents::finish_within(cmd, Duration::from_secs(120));
+            assert!(
+                out.status.success(),
+                "cc {args:?}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        (lib, plain)
+    }
+
+    /// One run of a probe: whether it exited within its limit with status
+    /// 0, what it printed first on its standard output, and whether its
+    /// marker was written.
+    #[derive(Debug)]
+    struct ProbeRun {
+        ok: bool,
+        first_line: String,
+        marked: bool,
+        stderr: String,
+    }
+
+    /// Runs `exe` with `args` in a cleared environment (the test home's,
+    /// with no network and no update checks), `var` set as given, and
+    /// `EC_MARKER` naming `marker`, which is removed first.
+    fn probe_run(
+        home: &TestHome,
+        exe: &Path,
+        args: &[&std::ffi::OsStr],
+        var: Option<(&str, &std::ffi::OsStr)>,
+        marker: &Path,
+    ) -> ProbeRun {
+        let _ = std::fs::remove_file(marker);
+        let mut cmd = Command::new(exe);
+        cmd.env_clear()
+            .envs(home.vars())
+            .env("DISABLE_AUTOUPDATER", "1")
+            .env("COPILOT_AUTO_UPDATE", "false")
+            .env("EC_MARKER", marker)
+            .args(args)
+            .current_dir(home.home())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+            cmd.env(k, "http://127.0.0.1:9");
+        }
+        if let Some((k, v)) = var {
+            cmd.env(k, v);
+        }
+        let run = envcloak_testkit::agents::run_within(cmd, Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("{}: cannot start: {e}", exe.display()));
+        ProbeRun {
+            ok: run.in_time && run.output.status.success(),
+            first_line: String::from_utf8_lossy(&run.output.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            marked: marker.exists(),
+            stderr: String::from_utf8_lossy(&run.output.stderr)
+                .chars()
+                .take(400)
+                .collect(),
+        }
+    }
+
+    /// Whether macOS `codesign` shows `exe` signed with the hardened
+    /// runtime, and which of the entitlements that matter here it has:
+    /// `get-task-allow` (a debugger may attach),
+    /// `cs.allow-dyld-environment-variables` and
+    /// `cs.disable-library-validation` (`dyld` honours `DYLD_*` and loads
+    /// a library no team signed).
+    fn signing(exe: &Path) -> (bool, [bool; 3]) {
+        let run = |args: &[&str]| {
+            let mut cmd = Command::new("/usr/bin/codesign");
+            cmd.env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .args(args)
+                .arg(exe)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            envcloak_testkit::agents::finish_within(cmd, Duration::from_secs(60))
+        };
+        let info = run(&["-dv"]);
+        let runtime = String::from_utf8_lossy(&info.stderr).contains("(runtime)");
+        let xml = run(&["-d", "--entitlements", "-", "--xml"]);
+        let xml = String::from_utf8_lossy(&xml.stdout).into_owned();
+        let has = |key: &str| xml.contains(&format!("<key>com.apple.security.{key}</key><true/>"));
+        (
+            runtime,
+            [
+                has("get-task-allow"),
+                has("cs.allow-dyld-environment-variables"),
+                has("cs.disable-library-validation"),
+            ],
+        )
+    }
+
+    /// The catalog's `code_selecting_env` and the loader rule against the
+    /// pinned builds (M2-10 review). For every entry with an executable
+    /// identity (an install tree or a signature, what a standing approval
+    /// could name), its pinned native executable is run:
+    /// - once plainly (`--version`), which must exit 0 and print its
+    ///   version: the control that it runs at all here, so a variable that
+    ///   ran nothing is told from a binary that never started;
+    /// - with each runtime variable tried, the file it names writing a
+    ///   marker: `BUN_OPTIONS=--preload=<file>` and
+    ///   `NODE_OPTIONS=--require=<file>` (with `--version`), and
+    ///   `BUN_BE_BUN=1` (once with `--version`, then with the file as its
+    ///   argument). Each `--version` run must exit 0 and print a version,
+    ///   so the variable was read by a running binary. The variables whose
+    ///   marker appears are the entry's `code_selecting_env`, no more and
+    ///   no fewer, among those tried;
+    /// - with each dynamic loader variable of this system naming a
+    ///   library this test builds ([`MARKER_LIB`]): `DYLD_INSERT_LIBRARIES`
+    ///   on macOS, `LD_PRELOAD` and `LD_AUDIT` on Linux. A program this
+    ///   test builds must load it under each (the positive control). The
+    ///   variables whose marker appears are as measured
+    ///   ([`loaded_measured`]), and each is one the standing rule refuses
+    ///   for that agent ([`AgentCatalog::env_selects_code`]); on macOS
+    ///   they follow each build's signature: hardened runtime throughout,
+    ///   no `get-task-allow`, and `DYLD_INSERT_LIBRARIES` honoured exactly
+    ///   where `cs.allow-dyld-environment-variables` and
+    ///   `cs.disable-library-validation` are both granted (OpenCode's).
+    ///
+    /// Mutation checked: removing `BUN_OPTIONS` from Claude Code's entry,
+    /// or adding `NODE_OPTIONS` to Copilot CLI's, fails this test; so does
+    /// a probe library whose constructor writes nothing (the positive
+    /// control), and on macOS dropping `DYLD_INSERT_LIBRARIES` from
+    /// OpenCode's measurement.
     #[test]
     fn code_selecting_env_is_measured() {
         let cat = AgentCatalog::builtin();
@@ -4841,16 +5220,42 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
                 "{id}: an entry with an install tree or a signature is measured here"
             );
         }
-        let marker_dir = home.root().join("m");
-        std::fs::create_dir_all(&marker_dir).unwrap();
+        let mut exes = Vec::new();
         for (id, variant) in entries {
             let Some(exe) = pinned_exe(id, variant) else {
                 return;
             };
-            let mut ran = Vec::new();
-            for var in ["BUN_OPTIONS", "BUN_BE_BUN", "NODE_OPTIONS"] {
-                let marker = marker_dir.join(format!("{id}-{var}"));
-                let file = marker_dir.join(format!("{id}-{var}.js"));
+            exes.push((id, exe));
+        }
+        let dir = home.root().join("m");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (lib, plain) = build_loader_probe(&dir, &home);
+        let os_ = |s: &str| std::ffi::OsString::from(s);
+        let version: [&std::ffi::OsStr; 1] = ["--version".as_ref()];
+        for var in loader_vars() {
+            let marker = dir.join(format!("plain-{var}"));
+            let r = probe_run(&home, &plain, &[], Some((var, lib.as_os_str())), &marker);
+            println!(
+                "measurement: catalog loader probe os={}: a program this test built, {var}: {}",
+                os(),
+                if r.marked { "loaded" } else { "not loaded" }
+            );
+            assert!(
+                r.ok && r.first_line == "ec-plain 1" && r.marked,
+                "the loader probe's positive control, {var}: {r:?}"
+            );
+        }
+        for (id, exe) in exes {
+            let marker = dir.join(format!("{id}-control"));
+            let control = probe_run(&home, &exe, &version, None, &marker);
+            assert!(
+                control.ok && !control.first_line.is_empty() && !control.marked,
+                "{id} ({}) does not run here: {control:?}",
+                exe.display()
+            );
+            let script = |var: &str| {
+                let marker = dir.join(format!("{id}-{var}"));
+                let file = dir.join(format!("{id}-{var}.js"));
                 std::fs::write(
                     &file,
                     format!(
@@ -4859,35 +5264,63 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
                     ),
                 )
                 .unwrap();
-                let mut cmd = Command::new(&exe);
-                cmd.env_clear()
-                    .envs(home.vars())
-                    .env("DISABLE_AUTOUPDATER", "1")
-                    .env("COPILOT_AUTO_UPDATE", "false")
-                    .current_dir(home.home())
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
-                    cmd.env(k, "http://127.0.0.1:9");
-                }
-                match var {
-                    "BUN_OPTIONS" => {
-                        cmd.env(var, format!("--preload={}", file.display()))
-                            .arg("--version");
-                    }
+                (marker, file)
+            };
+            let reached = |r: &ProbeRun, what: &str| {
+                assert!(
+                    r.ok && !r.first_line.is_empty(),
+                    "{id} with {what} did not run to its version (exit 0, a line printed): \
+                     {:?}, it said {:?}",
+                    r.first_line,
+                    r.stderr
+                );
+            };
+            let mut ran = Vec::new();
+            for var in ["BUN_OPTIONS", "BUN_BE_BUN", "NODE_OPTIONS"] {
+                let (marker, file) = script(var);
+                let marked = match var {
                     "BUN_BE_BUN" => {
-                        cmd.env(var, "1").arg(&file);
+                        let r = probe_run(&home, &exe, &version, Some((var, &os_("1"))), &marker);
+                        reached(&r, var);
+                        println!(
+                            "measurement: catalog code_selecting_env os={} {id}: BUN_BE_BUN=1 \
+                             --version: {:?} (plainly {:?})",
+                            os(),
+                            r.first_line,
+                            control.first_line
+                        );
+                        let r = probe_run(
+                            &home,
+                            &exe,
+                            &[file.as_os_str()],
+                            Some((var, &os_("1"))),
+                            &marker,
+                        );
+                        r.marked
                     }
                     _ => {
-                        cmd.env(var, format!("--require={}", file.display()))
-                            .arg("--version");
+                        let flag = if var == "BUN_OPTIONS" {
+                            "--preload"
+                        } else {
+                            "--require"
+                        };
+                        let value = os_(&format!("{flag}={}", file.display()));
+                        let r = probe_run(&home, &exe, &version, Some((var, &value)), &marker);
+                        reached(&r, var);
+                        r.marked
                     }
-                }
-                let mut child = GroupChild::spawn(&mut cmd).unwrap();
-                let _ = child.end_within(Duration::from_secs(30));
-                if marker.exists() {
+                };
+                if marked {
                     ran.push(var);
+                }
+            }
+            let mut loaded = Vec::new();
+            for var in loader_vars() {
+                let marker = dir.join(format!("{id}-{var}"));
+                let r = probe_run(&home, &exe, &version, Some((var, lib.as_os_str())), &marker);
+                reached(&r, var);
+                if r.marked {
+                    loaded.push(*var);
                 }
             }
             let want: Vec<&str> = cat
@@ -4896,10 +5329,28 @@ sys.exit(os.waitstatus_to_exitcode(status) & 255)
                 .map(String::as_str)
                 .collect();
             println!(
-                "measurement: catalog code_selecting_env os={} {id}: {ran:?}",
+                "measurement: catalog code_selecting_env os={} {id}: {ran:?}; loader {loaded:?}",
                 os()
             );
             assert_eq!(ran, want, "{id} ({})", exe.display());
+            assert_eq!(loaded, loaded_measured(id), "{id} ({})", exe.display());
+            for var in &loaded {
+                assert!(cat.env_selects_code(id, var.as_bytes()), "{id} {var}");
+            }
+            if cfg!(target_os = "macos") {
+                let (runtime, [debug, dyld, any_library]) = signing(&exe);
+                println!(
+                    "measurement: catalog signing os=macos {id}: hardened runtime {runtime}, \
+                     get-task-allow {debug}, allow-dyld-environment-variables {dyld}, \
+                     disable-library-validation {any_library}"
+                );
+                assert!(runtime && !debug, "{id}: {runtime} {debug}");
+                assert_eq!(
+                    loaded.contains(&"DYLD_INSERT_LIBRARIES"),
+                    dyld && any_library,
+                    "{id}"
+                );
+            }
         }
     }
 
