@@ -555,17 +555,21 @@ fn the_installer_on_the_hosts_own_configs() {
     h.assert_swept("M2-08 install");
 }
 
-/// Codex review: in a fresh home `claude mcp add-json` creates
+/// Codex review: in a fresh home the registration created
 /// `~/.claude.json`, and uninstall took EnvCloak's entry out and left the
-/// file. With the pinned Claude Code's own command (L-02): in a home with
-/// no `.claude.json`, install registers EnvCloak's server (Claude Code
-/// creates the file) and `claude mcp list` lists it; uninstall then
-/// removes the file, which holds nothing but what the registration made,
-/// and the files install created go too.
+/// file. In a home with no `.claude.json`, install creates it with
+/// EnvCloak's entry alone (through its own writer); uninstall right after
+/// removes it, and the files install created go too. Installed again, the
+/// pinned Claude Code (L-02) lists EnvCloak's server from the file and
+/// writes its own state into it (measured with 2.1.280: `claude mcp list`
+/// rewrites a file without its start-up fields); the file is then Claude
+/// Code's as much as EnvCloak's, and uninstall, once the 2 minutes since
+/// Claude Code's write are over, takes out EnvCloak's entry only: Claude
+/// Code still reads the file, and no longer lists the server.
 ///
-/// Mutation checked: the file's creation not recorded (`created` always
-/// `None` in `install::try_register`): uninstall takes the entry out with
-/// `claude mcp remove` and leaves the file, and this fails.
+/// Mutation checked: the file's creation not recorded (`FileRecord`'s
+/// `created` always `false` in `Writer::try_change`): uninstall leaves an
+/// empty `.claude.json` and this fails.
 #[test]
 fn a_fresh_claude_home_comes_back_without_a_claude_json() {
     let claude_found = Installed::find(&versions_toml(), Host::ClaudeCode.id(), "native");
@@ -587,9 +591,6 @@ fn a_fresh_claude_home_comes_back_without_a_claude_json() {
     );
     assert_eq!(code, 0, "{v}");
     assert!(home.join(".claude.json").exists(), "{v}");
-    let out = claude.host_cli(&["mcp", "list"]);
-    let said = text(&out);
-    assert!(out.status.success() && said.contains("envcloak"), "{said}");
     let (u, code) = agents(
         &mut h,
         &bin,
@@ -600,6 +601,39 @@ fn a_fresh_claude_home_comes_back_without_a_claude_json() {
     for f in [".claude.json", ".claude/settings.json", ".claude/CLAUDE.md"] {
         assert!(!home.join(f).exists(), "{f} is still there: {u}");
     }
+    // Again, and Claude Code reads the file and writes its own state in.
+    let (v, code) = agents(
+        &mut h,
+        &bin,
+        &tmp,
+        &["install", "--agent", "claude-code", "--yes"],
+    );
+    assert_eq!(code, 0, "{v}");
+    let out = claude.host_cli(&["mcp", "list"]);
+    let said = text(&out);
+    assert!(out.status.success() && said.contains("envcloak"), "{said}");
+    age(&home.join(".claude.json"), Duration::from_secs(600));
+    let (u, code) = agents(
+        &mut h,
+        &bin,
+        &tmp,
+        &["uninstall", "--agent", "claude-code", "--yes"],
+    );
+    assert_eq!(code, 0, "{u}");
+    let left: Value =
+        serde_json::from_slice(&std::fs::read(home.join(".claude.json")).unwrap_or_default())
+            .unwrap_or(Value::Null);
+    assert!(left.is_object(), "{u}");
+    assert!(
+        left.get("mcpServers")
+            .and_then(|m| m.get("envcloak"))
+            .is_none(),
+        "{left}"
+    );
+    let out = claude.host_cli(&["mcp", "list"]);
+    let said = text(&out);
+    assert!(out.status.success() && !said.contains("envcloak"), "{said}");
+    claude.check_isolated();
 }
 
 /// K-01 on macOS, as the installer writes it: with consent, a command in

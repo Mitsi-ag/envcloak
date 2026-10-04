@@ -347,6 +347,7 @@ fn print_plan(home: &Path, plan: &Plan, json: bool) {
             json!({
                 "dir": escape_for_display(&p.dir.display().to_string()),
                 "changes": p.steps.iter().map(|s| step_json(home, s)).collect::<Vec<_>>(),
+                "notes": notes_json(&p.notes),
             })
         });
         print_json(&json!({"hosts": hosts, "project": project, "applied": false}));
@@ -368,6 +369,9 @@ fn print_plan(home: &Path, plan: &Plan, json: bool) {
         );
         for s in &p.steps {
             println!("  {}", step_line(home, s));
+        }
+        for n in &p.notes {
+            println!("  note ({}): {}", n.name, n.text);
         }
     }
     println!("Nothing was changed: run this again with --yes to write it.");
@@ -410,12 +414,18 @@ fn print_report(home: &Path, report: &Report, json: bool, install: bool, saved: 
             json!({
                 "dir": escape_for_display(&p.dir.display().to_string()),
                 "changes": p.results.iter().map(|r| result_json(home, r)).collect::<Vec<_>>(),
+                "notes": notes_json(&p.notes),
             })
         });
         print_json(&json!({
             "hosts": hosts,
             "project": project,
             "leftovers": report.leftovers.iter().map(|p| shown(home, p)).collect::<Vec<_>>(),
+            "cleanup_unconfirmed": report
+                .cleanup_unconfirmed
+                .iter()
+                .map(|p| shown(home, p))
+                .collect::<Vec<_>>(),
             "applied": true,
             "complete": report.complete() && saved,
         }));
@@ -444,8 +454,25 @@ fn print_report(home: &Path, report: &Report, json: bool, install: bool, saved: 
             escape_for_display(&p.dir.display().to_string())
         );
         print_results(home, &p.results);
+        for n in &p.notes {
+            println!("  note ({}): {}", n.name, n.text);
+        }
     }
     print_leftovers(home, &report.leftovers);
+    print_unconfirmed(home, &report.cleanup_unconfirmed);
+}
+
+/// The places whose cleanup could not be confirmed (F123): places to look,
+/// never files to remove.
+fn print_unconfirmed(home: &Path, unconfirmed: &[PathBuf]) {
+    for p in unconfirmed {
+        println!(
+            "Cleanup not confirmed: {}: EnvCloak could not look in this directory (or remove \
+             the one it made), so what an earlier run left there may still be there; give \
+             yourself access to it again and run this again",
+            shown(home, p)
+        );
+    }
 }
 
 /// The files an earlier write left under EnvCloak's temporary names and
@@ -470,7 +497,7 @@ pub fn project_note(dir: &Path, json: bool) -> Result<(), Failure> {
     let home = ctx.locations.home().to_path_buf();
     let plan = Plan {
         hosts: Vec::new(),
-        project: Some(install::project_plan(dir)),
+        project: Some(install::project_plan(dir, &install::TIER_1, &ctx.locations)),
     };
     let mut client = envcloak_client::connect::connect()?;
     require_unlocked(&mut client)?;
@@ -491,17 +518,27 @@ pub fn project_note(dir: &Path, json: bool) -> Result<(), Failure> {
     let saved = file.save(&state);
     let complete = report.complete();
     let leftovers = report.leftovers;
-    let results = report.project.map(|p| p.results).unwrap_or_default();
+    let unconfirmed = report.cleanup_unconfirmed;
+    let (results, notes) = report
+        .project
+        .map(|p| (p.results, p.notes))
+        .unwrap_or_default();
     if json {
         print_json(&json!({
             "agents_note": results.iter().map(|r| result_json(&home, r)).collect::<Vec<_>>(),
+            "notes": notes_json(&notes),
             "leftovers": leftovers.iter().map(|p| shown(&home, p)).collect::<Vec<_>>(),
+            "cleanup_unconfirmed": unconfirmed.iter().map(|p| shown(&home, p)).collect::<Vec<_>>(),
             "complete": saved.is_ok() && complete,
         }));
     } else {
         println!("Agent note:");
         print_results(&home, &results);
+        for n in &notes {
+            println!("  note ({}): {}", n.name, n.text);
+        }
         print_leftovers(&home, &leftovers);
+        print_unconfirmed(&home, &unconfirmed);
     }
     saved.map_err(|r| state_failure(&r))?;
     if !complete {
@@ -634,7 +671,7 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
             backups: &mut backups,
             now: SystemTime::now(),
         };
-        install::uninstall(&ctx, &a.opts, &mut w)
+        install::uninstall(&a.opts, &mut w)
     };
     // The report is printed whatever the last save says: a file changed
     // above is reported as changed (L-08).

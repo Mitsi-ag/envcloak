@@ -75,8 +75,16 @@ use zeroize::Zeroizing;
 
 use crate::hunks::{self, Hunk};
 
-/// The largest file the installer reads (1 MiB).
+/// The largest file the installer reads (1 MiB), unless a target says
+/// otherwise ([`Target::limit`]).
 pub const MAX_FILE: usize = 1024 * 1024;
+/// The largest Claude Code `.claude.json` read (64 MiB): Claude Code keeps
+/// its state for every project there, so a person's grows past
+/// [`MAX_FILE`], while EnvCloak changes only its one MCP server entry.
+pub const MAX_HOST_STATE: usize = 64 * 1024 * 1024;
+/// The largest file a sweep reads under a temporary name: as large as
+/// any target's.
+const MAX_LEFTOVER: usize = MAX_HOST_STATE;
 /// The largest state file read (8 MiB).
 const MAX_STATE: usize = 8 * 1024 * 1024;
 
@@ -140,6 +148,15 @@ pub enum Edit {
         path: Vec<String>,
         value: Value,
         previous: Option<Value>,
+        created: usize,
+    },
+    /// A member `key` added to the JSON object at `path` (Claude Code's
+    /// MCP server, `mcpServers.envcloak` in `.claude.json`), `created` of
+    /// `path`'s last keys made for it.
+    JsonMember {
+        path: Vec<String>,
+        key: String,
+        value: Value,
         created: usize,
     },
     /// A file that is EnvCloak's whole.
@@ -225,21 +242,6 @@ pub struct State {
     pub version: u32,
     /// By absolute path.
     pub files: BTreeMap<String, FileRecord>,
-    /// The MCP server entries EnvCloak registered through a host's own
-    /// command line, by the absolute path of the file the host keeps them
-    /// in, its directories resolved (Claude Code's `.claude.json`, which
-    /// `CLAUDE_CONFIG_DIR` moves): an entry is EnvCloak's in that file only
-    /// (Codex review: keyed by host, an equal entry the person registered
-    /// in another file was taken for EnvCloak's, and the one EnvCloak
-    /// registered left behind).
-    #[serde(default)]
-    pub mcp: BTreeMap<String, McpRecord>,
-    /// The MCP server entries EnvCloak is registering, keyed as
-    /// [`State::mcp`]: saved before the host's command runs, so a run
-    /// stopped after it still owns the entry (the next run finds it there
-    /// and adopts it) and one stopped before it does not.
-    #[serde(default)]
-    pub mcp_intent: BTreeMap<String, McpRecord>,
     /// Files EnvCloak gave back by an undo, so nothing of its own is left
     /// in them, by absolute path, with the stamp that write left: while a
     /// file's stamp is still this one, EnvCloak's next change of it (an
@@ -261,7 +263,7 @@ pub struct State {
     /// The directories EnvCloak made for files it wrote (none was there),
     /// by path (resolved), with the host and scope they were made for:
     /// uninstall removes each once it is empty (the class of Codex's
-    /// finding that a `.claude.json` an install created was left).
+    /// finding that a file an install created was left).
     #[serde(default)]
     pub dirs: BTreeMap<String, DirRecord>,
 }
@@ -276,33 +278,15 @@ pub struct DirRecord {
     pub scope: String,
 }
 
-/// An MCP server entry EnvCloak registered through a host's own command
-/// line. Holds EnvCloak's own entry and paths only.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct McpRecord {
-    /// The host (`claude-code`).
-    pub host: String,
-    /// The entry, as registered.
-    pub entry: Value,
-    /// The host's directory variable (`CLAUDE_CONFIG_DIR`) as it was when
-    /// the entry was registered, `None` when it was not set: the host's
-    /// command is pointed at the same file again to take the entry out.
-    pub config_dir: Option<String>,
-    /// What the file held right after the registration, when the
-    /// registration created it (there was no file before): uninstall
-    /// removes a file still exactly so, which holds nothing but what the
-    /// registration made (Codex review: a file created this way was left).
-    pub created: Option<Created>,
-}
-
-/// A file a host's command created for EnvCloak: its SHA-256 and stamp
-/// right after.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Created {
-    pub sha256: String,
-    pub stamp: Option<Stamp>,
+/// What a run could see of the leftovers of EnvCloak's writes
+/// ([`Writer::cleanup_inspection`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanupInspection {
+    /// Files under EnvCloak's temporary names, still there.
+    pub leftovers: Vec<PathBuf>,
+    /// Directories that could not be listed, so whether one is there is
+    /// not known: places to look, never files to remove.
+    pub uninspected: Vec<PathBuf>,
 }
 
 /// The state file's format version.
@@ -623,6 +607,9 @@ pub struct Target {
     pub host_owned: bool,
     /// The host's name, for messages.
     pub host_name: &'static str,
+    /// The largest file read and written ([`MAX_FILE`], or
+    /// [`MAX_HOST_STATE`] for Claude Code's `.claude.json`).
+    pub limit: usize,
 }
 
 /// What an edit makes of a file.
@@ -721,7 +708,7 @@ fn make_dirs(path: &Path) -> Result<Vec<PathBuf>, Refusal> {
         .collect())
 }
 
-fn open_target(path: &Path) -> Result<Read, Refusal> {
+fn open_target(path: &Path, limit: usize) -> Result<Read, Refusal> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(Refusal::new("invalid_path", "not a file's path"));
     };
@@ -731,7 +718,7 @@ fn open_target(path: &Path) -> Result<Read, Refusal> {
         _ => Refusal::new("unreadable", "its directory could not be opened"),
     })?;
     let name = PathBuf::from(name);
-    let current = match read_plain(&root, &name, MAX_FILE) {
+    let current = match read_plain(&root, &name, limit) {
         Ok((bytes, stamp)) => {
             if stamp.nlink > 1 {
                 return Err(Refusal::new(
@@ -869,7 +856,7 @@ impl Writer<'_> {
                 },
             );
         }
-        let r = open_target(&t.path)?;
+        let r = open_target(&t.path, t.limit)?;
         let k = key(&t.path);
         let before = r.current.as_ref().map(|(b, _)| b.as_slice());
         self.settle(&k, before);
@@ -892,14 +879,10 @@ impl Writer<'_> {
         else {
             return Ok(Outcome::Unchanged);
         };
-        if after.len() > MAX_FILE {
+        if after.len() > t.limit {
             // Written, it could be neither changed again nor taken out,
             // since the writer reads at most this much.
-            return Err(Refusal::new(
-                "too_large",
-                "the change would make the file larger than EnvCloak reads (1 MiB), so it could \
-                 not be taken out again: left as it is",
-            ));
+            return Err(too_large_after());
         }
         if before == Some(after.as_slice()) {
             // The file holds what it should; EnvCloak's record of it may
@@ -1069,13 +1052,19 @@ impl Writer<'_> {
             .filter(|r| digests.contains(&sha256_hex(r)))
             .collect();
         let mut kept = false;
-        for entry in entries.flatten() {
+        for entry in entries {
+            // An entry that could not be read may be a leftover: not shown
+            // gone, so the record stays (F123).
+            let Ok(entry) = entry else {
+                kept = true;
+                continue;
+            };
             let n = entry.file_name();
             let Some(shape) = temp_of(name, &n) else {
                 continue;
             };
             let rel = Path::new(&n);
-            let Ok((bytes, stamp)) = read_plain(&root, rel, MAX_FILE) else {
+            let Ok((bytes, stamp)) = read_plain(&root, rel, MAX_LEFTOVER) else {
                 // Not a regular file of this user that can be read: it is
                 // not shown to be EnvCloak's.
                 kept = true;
@@ -1106,7 +1095,7 @@ impl Writer<'_> {
         let keys: Vec<String> = self.state.leftovers.keys().cloned().collect();
         for k in keys {
             let path = PathBuf::from(&k);
-            let current: Option<Zeroizing<Vec<u8>>> = open_target(&path)
+            let current: Option<Zeroizing<Vec<u8>>> = open_target(&path, MAX_LEFTOVER)
                 .ok()
                 .and_then(|r| r.current)
                 .map(|(b, _)| Zeroizing::new(b));
@@ -1115,28 +1104,50 @@ impl Writer<'_> {
         }
     }
 
-    /// The files under EnvCloak's temporary names still beside the files
-    /// the state names leftovers for: what a sweep could not show to be
-    /// EnvCloak's, or could not remove. Each may hold a copy of part of
-    /// the file, so a report names it (lesson L-08).
-    pub fn leftovers_present(&self) -> Vec<PathBuf> {
-        let mut out = Vec::new();
+    /// What is still beside the files the state names leftovers for
+    /// (lesson L-08): the files under EnvCloak's temporary names, what a
+    /// sweep could not show to be EnvCloak's or could not remove, each of
+    /// which may hold a copy of part of the file; and the directories that
+    /// could not be listed (F123: one was read as empty, and the run said
+    /// complete while a leftover was there). A directory that is not there
+    /// holds none.
+    pub fn cleanup_inspection(&self) -> CleanupInspection {
+        let mut out = CleanupInspection::default();
         for k in self.state.leftovers.keys() {
             let path = Path::new(k);
             let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                out.uninspected.push(path.to_path_buf());
                 continue;
             };
-            let Ok(entries) = std::fs::read_dir(parent) else {
-                continue;
+            let entries = match std::fs::read_dir(parent) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    out.uninspected.push(parent.to_path_buf());
+                    continue;
+                }
             };
-            for e in entries.flatten() {
-                if temp_of(name, &e.file_name()).is_some() {
-                    out.push(parent.join(e.file_name()));
+            for e in entries {
+                match e {
+                    Ok(e) if temp_of(name, &e.file_name()).is_some() => {
+                        out.leftovers.push(parent.join(e.file_name()));
+                    }
+                    Ok(_) => {}
+                    Err(_) => out.uninspected.push(parent.to_path_buf()),
                 }
             }
         }
-        out.sort();
+        out.leftovers.sort();
+        out.leftovers.dedup();
+        out.uninspected.sort();
+        out.uninspected.dedup();
         out
+    }
+
+    /// The files under EnvCloak's temporary names still there
+    /// ([`Writer::cleanup_inspection`]'s leftovers).
+    pub fn leftovers_present(&self) -> Vec<PathBuf> {
+        self.cleanup_inspection().leftovers
     }
 
     /// Puts back the record a change replaced.
@@ -1180,7 +1191,7 @@ impl Writer<'_> {
         if !self.state.files.contains_key(&k) {
             return Ok(Outcome::Unchanged);
         }
-        let r = open_target(&t.path)?;
+        let r = open_target(&t.path, t.limit)?;
         self.settle(&k, r.current.as_ref().map(|(b, _)| b.as_slice()));
         let Some(rec) = self.state.files.get(&k).cloned() else {
             return Ok(Outcome::Unchanged);
@@ -1215,16 +1226,35 @@ impl Writer<'_> {
             ..t.clone()
         };
         let dir = dir_of(&t.path);
+        // Nothing of EnvCloak's is left to take out: the record goes, and
+        // a stamp that is still EnvCloak's own last write's stays known, so
+        // EnvCloak's next change of the file is its own edit too (D-16;
+        // the record was dropped with it before, and an install right after
+        // was held to the 2 minutes for EnvCloak's own write).
+        let keep_own = |w: &mut Self| {
+            if rec.stamp == Some(Stamp::from(*stamp)) {
+                w.state.written.insert(k.clone(), Stamp::from(*stamp));
+            }
+        };
         match plan {
             Undo::Nothing => {
+                keep_own(self);
                 self.state.files.remove(&k);
                 let _ = self.journal.save(self.state);
                 Ok(Outcome::Unchanged)
             }
             Undo::Rewrite(after) if &after == bytes => {
+                keep_own(self);
                 self.state.files.remove(&k);
                 let _ = self.journal.save(self.state);
                 Ok(Outcome::Unchanged)
+            }
+            Undo::Rewrite(after) if after.len() > t.limit => {
+                // Codex F124: a structural undo can make a file the person
+                // grew to the limit larger still. Refused before any
+                // backup, save or write, and the record kept, so a retry
+                // takes it out once the person makes room.
+                Err(too_large_after())
             }
             Undo::Rewrite(after) => {
                 self.host_rule(&t, &r, stamp)?;
@@ -1310,6 +1340,17 @@ impl Writer<'_> {
     }
 }
 
+/// A change, or an undo, whose result would be larger than the writer
+/// reads: refused before anything is backed up, saved or written, since
+/// the result could be neither changed again nor taken out.
+fn too_large_after() -> Refusal {
+    Refusal::new(
+        "too_large",
+        "the result would be larger than EnvCloak reads, so it could not be changed or taken \
+         out again: left as it is",
+    )
+}
+
 /// The directory a target's temporary names are in, for messages.
 fn dir_of(path: &Path) -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or_default()
@@ -1318,14 +1359,14 @@ fn dir_of(path: &Path) -> PathBuf {
 /// Whether the file `r` read now holds exactly `want` (a change that
 /// reported a failure may have been made: what the file holds says).
 fn holds(r: &Read, want: &[u8]) -> bool {
-    read_plain(&r.root, &r.name, want.len().max(MAX_FILE))
+    read_plain(&r.root, &r.name, want.len().max(MAX_LEFTOVER))
         .is_ok_and(|(b, _)| *Zeroizing::new(b) == want)
 }
 
 /// Whether a file has the name `r` read.
 fn present(r: &Read) -> bool {
     !matches!(
-        read_plain(&r.root, &r.name, MAX_FILE),
+        read_plain(&r.root, &r.name, MAX_LEFTOVER),
         Err(e) if e.kind == ScanErrorKind::NotFound
     )
 }
@@ -1424,8 +1465,15 @@ fn key_dir(d: &Path) -> String {
 
 /// Removes the directories EnvCloak made for `host`'s files in `scope`
 /// that are empty, innermost first, and forgets each one gone or holding
-/// something now (the person's: never removed). Returns those removed.
-pub fn remove_made_dirs(w: &mut Writer<'_>, host: &str, scope: &str) -> Vec<PathBuf> {
+/// something now (the person's: never removed). Returns those removed, and
+/// those that could not be removed for another reason (kept in the state,
+/// tried again by the next uninstall, and reported: F123's class, a
+/// cleanup that failed was reported complete).
+pub fn remove_made_dirs(
+    w: &mut Writer<'_>,
+    host: &str,
+    scope: &str,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut dirs: Vec<String> = w
         .state
         .dirs
@@ -1435,6 +1483,7 @@ pub fn remove_made_dirs(w: &mut Writer<'_>, host: &str, scope: &str) -> Vec<Path
         .collect();
     dirs.sort_by_key(|d| std::cmp::Reverse(d.len()));
     let mut removed = Vec::new();
+    let mut left = Vec::new();
     for d in dirs {
         match std::fs::remove_dir(&d) {
             Ok(()) => {
@@ -1450,13 +1499,13 @@ pub fn remove_made_dirs(w: &mut Writer<'_>, host: &str, scope: &str) -> Vec<Path
                 w.state.dirs.remove(&d);
             }
             // Tried again by the next uninstall.
-            Err(_) => {}
+            Err(_) => left.push(PathBuf::from(d)),
         }
     }
     if !removed.is_empty() {
         let _ = w.journal.save(w.state);
     }
-    removed
+    (removed, left)
 }
 
 /// The state's key for a path: its directories resolved, so one file is
@@ -1531,6 +1580,7 @@ mod tests {
             scope: "global".to_owned(),
             host_owned,
             host_name: "Claude Code",
+            limit: MAX_FILE,
         }
     }
 
@@ -1673,6 +1723,57 @@ mod tests {
             matches!(&o, Outcome::Refused(r) if r.name == "recently_changed"),
             "{o:?}"
         );
+    }
+
+    /// The class of the stale stamp (found with `.claude.json`): a file
+    /// whose last write was EnvCloak's own, with nothing of EnvCloak's left
+    /// in it (a run took its last edit out: the MCP server the enabled
+    /// plugin now carries), has its record dropped by uninstall, and its
+    /// stamp stays EnvCloak's own, so an install right after needs no
+    /// 2-minute wait.
+    ///
+    /// Mutation checked: the stamp not kept when an undo finds nothing to
+    /// take out (`keep_own` doing nothing in `try_undo`): the install after
+    /// it is refused `recently_changed` and this fails.
+    #[test]
+    fn a_stamp_of_envcloaks_own_survives_an_undo_with_nothing_to_take_out() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, b"{}\n").unwrap_or_else(|e| panic!("{e}"));
+        let old = SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .and_then(|f| f.set_modified(old))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let t = target(&p, true);
+        assert!(matches!(
+            w.change(&t, &mut append("x")),
+            Outcome::Changed { .. }
+        ));
+        // A later run takes EnvCloak's edit out by structure: the file
+        // changes, by EnvCloak, and holds nothing of EnvCloak's.
+        let mut drop_it = |b: Option<&[u8]>, _: Option<&FileRecord>| {
+            let v = b.unwrap_or_default();
+            let v = v.strip_suffix(b"x").unwrap_or(v).to_vec();
+            Ok(Some(Change {
+                bytes: v,
+                added: Vec::new(),
+                dropped: vec![Edit::Block],
+            }))
+        };
+        assert!(matches!(
+            w.change(&t, &mut drop_it),
+            Outcome::Changed { .. }
+        ));
+        let u = w.undo(&t, &mut nothing);
+        assert_eq!(u, Outcome::Unchanged);
+        assert!(w.state.files.is_empty());
+        let o = w.change(&t, &mut append("y"));
+        assert!(matches!(o, Outcome::Changed { .. }), "{o:?}");
     }
 
     /// A change made by someone else between EnvCloak's read and its
@@ -2102,6 +2203,58 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// F123: a directory that cannot be listed was read as empty, so a
+    /// leftover in it was not named and the run said complete. Now the
+    /// record stays, the directory is named as not inspected (a place to
+    /// look, never a file to remove), and once it can be listed again the
+    /// sweep removes EnvCloak's copy and forgets the record. A directory
+    /// that is not there holds nothing.
+    ///
+    /// Mutation checked: `cleanup_inspection` reading a directory it
+    /// cannot list as empty (the `Err(_)` arm `continue`): nothing is named
+    /// and this fails.
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_named_and_its_record_kept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let base = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+        let dir = base.join("cfg");
+        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let p = dir.join("settings.json");
+        let body = b"{}\n".to_vec();
+        std::fs::write(&p, &body).unwrap_or_else(|e| panic!("{e}"));
+        let copy = temp(&dir, "settings.json", "swap", "0123456789abcdef");
+        std::fs::write(&copy, &body).unwrap_or_else(|e| panic!("{e}"));
+        let mut state = State::default();
+        state.leftovers.insert(key(&p), vec![sha256_hex(&body)]);
+        let gone = base.join("gone").join("settings.json");
+        state.leftovers.insert(key(&gone), vec![sha256_hex(&body)]);
+        let (mut saved, mut kept) = (Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        // Write and search, no read: the directory cannot be listed.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let listable = std::fs::read_dir(&dir).is_ok();
+        w.sweep_all();
+        let seen = w.cleanup_inspection();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| panic!("{e}"));
+        if listable {
+            // Run as root, whom no mode stops: nothing to measure.
+            eprintln!("skipped: the directory could still be listed");
+            return;
+        }
+        assert!(copy.exists(), "removed unseen");
+        assert!(w.state.leftovers.contains_key(&key(&p)), "the record went");
+        assert_eq!(seen.uninspected, vec![dir.clone()], "{seen:?}");
+        assert!(seen.leftovers.is_empty(), "{seen:?}");
+        // Listable again: EnvCloak's copy goes, and so does the record.
+        w.sweep_all();
+        assert!(!copy.exists(), "the copy stayed");
+        assert!(!w.state.leftovers.contains_key(&key(&p)));
+        assert_eq!(w.cleanup_inspection(), CleanupInspection::default());
     }
 
     /// The Codex review: a write stopped in the middle (the run killed)

@@ -24,6 +24,15 @@
 //! A block whose text is not EnvCloak's (the person edited it between the
 //! markers) is neither replaced nor removed ([`BlockError::Modified`]):
 //! that text is theirs.
+//!
+//! A file Codex reads is read only up to a budget (`project_doc_max_bytes`,
+//! 32 KiB unless config.toml says less, counted from the first of the
+//! instruction files it joins): a block past it is never read (Codex
+//! review). [`insert_within`] puts the block where it ends within that
+//! budget: appended when it fits there, else at the top of the file (and
+//! an existing block past the budget moves there); when the files read
+//! before this one leave no room for it, the block is refused
+//! ([`BlockError::OverBudget`]) rather than written where it is not read.
 
 /// The line that opens the block.
 pub const BEGIN: &str = "<!-- envcloak:begin -->";
@@ -56,6 +65,9 @@ pub enum BlockError {
     Unclosed,
     /// The text between the markers is not one EnvCloak wrote.
     Modified,
+    /// The block would not end within the bytes Codex reads of the
+    /// instruction files ([`insert_within`]).
+    OverBudget,
 }
 
 impl BlockError {
@@ -66,6 +78,7 @@ impl BlockError {
             BlockError::Damaged => "block_damaged",
             BlockError::Unclosed => "inside_comment",
             BlockError::Modified => "block_modified",
+            BlockError::OverBudget => "instruction_budget",
         }
     }
 
@@ -85,6 +98,12 @@ impl BlockError {
                 "the text between EnvCloak's markers changed since EnvCloak wrote it, so it was \
                  left as it is: it may be yours. Take out what is yours, or the whole block, and \
                  run this again"
+            }
+            BlockError::OverBudget => {
+                "Codex reads only the first project_doc_max_bytes (32 KiB unless config.toml \
+                 says less) of the instruction files it joins, and the files it reads before \
+                 this one leave no room for the block, which would not be read: it was not \
+                 written. Shorten those files, or raise project_doc_max_bytes, and run this again"
             }
         }
     }
@@ -252,6 +271,39 @@ pub fn insert(text: &[u8]) -> Result<Change, BlockError> {
     }
 }
 
+/// `text` with the block in it ending within `limit` bytes (what is left of
+/// Codex's budget after the files it reads before this one): as
+/// [`insert`] when the block then ends within it; else at the top of the
+/// file, followed by a blank line, an existing block moved there.
+///
+/// # Errors
+/// As [`insert`]; [`BlockError::OverBudget`] when the block itself does
+/// not fit in `limit`.
+pub fn insert_within(text: &[u8], limit: usize) -> Result<Change, BlockError> {
+    let want = block();
+    if want.len() > limit {
+        // Checked first: also refused when a block is there already, since
+        // it is not read.
+        let _ = std::str::from_utf8(text).map_err(|_| BlockError::NotUtf8)?;
+        return Err(BlockError::OverBudget);
+    }
+    let appended = insert(text)?;
+    let as_now = match &appended {
+        Change::Unchanged => std::str::from_utf8(text).map_err(|_| BlockError::NotUtf8)?,
+        Change::New(t) => t.as_str(),
+    };
+    match find(as_now)? {
+        Some((_, e)) if e <= limit => return Ok(appended),
+        _ => {}
+    }
+    // Past the budget: the block at the top instead.
+    let without = match remove(as_now.as_bytes())? {
+        Change::Unchanged => as_now.to_owned(),
+        Change::New(t) => t,
+    };
+    Ok(Change::New(format!("{want}\n{without}")))
+}
+
 /// `text` without the block: the block, and the blank line before it that
 /// [`insert`] adds, taken out (kept when no blank line or end of file
 /// follows the block, so the text on either side stays apart).
@@ -270,13 +322,21 @@ pub fn remove(text: &[u8]) -> Result<Change, BlockError> {
         return Err(BlockError::Modified);
     }
     let mut start = b;
+    let mut end = e;
     let after = &text[e..];
-    if text[..b].ends_with("\n\n")
+    if b == 0 {
+        // At the top ([`insert_within`]): the blank line after it goes.
+        if after.starts_with('\n') {
+            end += 1;
+        } else if after.starts_with("\r\n") {
+            end += 2;
+        }
+    } else if text[..b].ends_with("\n\n")
         && (after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n"))
     {
         start -= 1;
     }
-    Ok(Change::New(format!("{}{}", &text[..start], &text[e..])))
+    Ok(Change::New(format!("{}{}", &text[..start], &text[end..])))
 }
 
 /// Every `envcloak <command>` the block names.
@@ -432,6 +492,62 @@ mod tests {
         assert_eq!(insert(b"<!-- an open comment\n"), Err(BlockError::Unclosed));
         assert_eq!(insert(b"```\ncode\n"), Err(BlockError::Unclosed));
         assert!(insert(b"<!-- closed -->\n```\ncode\n```\n").is_ok());
+    }
+
+    /// Codex review: a block appended past Codex's 32 KiB budget is never
+    /// read. At the boundary it is appended; a byte past, it goes to the
+    /// top, and so does an existing block past the budget; a budget the
+    /// block does not fit in refuses it. Each comes out again as it went
+    /// in.
+    ///
+    /// Mutation checked: `insert_within` appending whatever the budget
+    /// (the `e <= limit` check always true): the block ends past the
+    /// budget and this fails.
+    #[test]
+    fn the_block_ends_within_codexs_budget_or_is_refused() {
+        let want = block();
+        let limit = 32 * 1024;
+        // Appended after "\n" (the text ends with a newline): text, the
+        // blank line, the block.
+        let fits = limit - want.len() - 1;
+        for (size, top) in [(fits, false), (fits + 1, true), (limit * 2, true)] {
+            let mut text = "x".repeat(size - 1);
+            text.push('\n');
+            let with = new(insert_within(text.as_bytes(), limit).unwrap_or(Change::Unchanged));
+            let at = with.find(&want).unwrap_or(usize::MAX);
+            assert!(
+                at + want.len() <= limit,
+                "{size}: ends at {}",
+                at + want.len()
+            );
+            assert_eq!(at == 0, top, "{size}");
+            assert_eq!(
+                insert_within(with.as_bytes(), limit),
+                Ok(Change::Unchanged),
+                "{size}"
+            );
+            assert_eq!(
+                new(remove(with.as_bytes()).unwrap_or(Change::Unchanged)),
+                text
+            );
+        }
+        // A block an earlier run appended, now past the budget: moved up.
+        let mut text = "y".repeat(limit);
+        text.push('\n');
+        let late = new(insert(text.as_bytes()).unwrap_or(Change::Unchanged));
+        let moved = new(insert_within(late.as_bytes(), limit).unwrap_or(Change::Unchanged));
+        assert!(moved.starts_with(&want), "not moved");
+        assert_eq!(moved.matches(BEGIN).count(), 1);
+        assert_eq!(
+            new(remove(moved.as_bytes()).unwrap_or(Change::Unchanged)),
+            text
+        );
+        // No room left: refused, written nowhere.
+        assert_eq!(
+            insert_within(b"# Notes\n", want.len() - 1),
+            Err(BlockError::OverBudget)
+        );
+        assert_eq!(insert_within(b"", 0), Err(BlockError::OverBudget));
     }
 
     #[test]
