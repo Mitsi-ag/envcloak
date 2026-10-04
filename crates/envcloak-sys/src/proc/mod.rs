@@ -32,7 +32,10 @@
 //!      A process lives under one pid until it exits, so an entry that
 //!      passes was the same process throughout, running the same file (an
 //!      `exec` keeps the pid and the start time), and each link held when
-//!      it was checked.
+//!      it was checked. Its arguments are not checked: an `exec` of the
+//!      same file with others changes nothing compared here, so a caller
+//!      that decides by them reads them again after this check (see
+//!      [`ProcInfo::unchanged`]).
 //!
 //!   A change is [`AncestryError::Changed`]; the caller walks again. A
 //!   parent that cannot be read while its child still names it is
@@ -236,7 +239,13 @@ impl ProcInfo {
     /// not its SHA-256, which a reading of the kernel's never holds). An
     /// `exec` keeps the pid and the start time but changes the executable
     /// or the command name, a reparent the parent, `setsid` the session.
-    /// The arguments are not compared: a process rewrites them at will.
+    /// The arguments are not compared: a reading of [`ProcInfo`] from the
+    /// kernel holds none (they are read apart, [`proc_argv`]), and a
+    /// process rewrites them at will. An `exec` of the same file keeps
+    /// every field compared here while its arguments name another script,
+    /// so a caller that decides by arguments reads them again after this
+    /// check (`envcloak-policy`'s evidence does, and walks again when they
+    /// make the process another agent or none).
     pub fn unchanged(&self, earlier: &ProcInfo) -> bool {
         let same_exe = match (&self.exe, &earlier.exe) {
             (None, None) => true,
