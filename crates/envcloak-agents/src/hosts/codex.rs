@@ -45,35 +45,6 @@ pub const SERVER: &str = "envcloak";
 /// default (`project_doc_max_bytes`, Map C section 2.2).
 pub const DOC_BUDGET: usize = 32 * 1024;
 
-/// What a `config.toml` says of the instruction files Codex reads: its
-/// `project_doc_max_bytes` (a non-negative integer, else `None`) and its
-/// `project_doc_fallback_filenames` (the strings, in order). A file that
-/// is not TOML says nothing.
-pub fn doc_settings(config: &[u8]) -> (Option<usize>, Vec<String>) {
-    let Some(doc) = std::str::from_utf8(config)
-        .ok()
-        .and_then(|t| t.parse::<DocumentMut>().ok())
-    else {
-        return (None, Vec::new());
-    };
-    let max = doc
-        .get("project_doc_max_bytes")
-        .and_then(Item::as_integer)
-        .and_then(|n| usize::try_from(n).ok());
-    let fallbacks = doc
-        .get("project_doc_fallback_filenames")
-        .and_then(Item::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .filter(|n| !n.is_empty() && !n.contains('/'))
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    (max, fallbacks)
-}
-
 /// EnvCloak's rules file: `forbidden` prefix rules for the commands that
 /// print secrets, each with examples Codex checks when it loads them.
 pub const RULES: &str = r#"# EnvCloak: commands that print secrets, refused before they run.

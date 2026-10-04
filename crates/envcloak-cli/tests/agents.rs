@@ -1436,6 +1436,200 @@ fn f_text(p: &Path) -> String {
     std::fs::read_to_string(p).unwrap()
 }
 
+/// Codex review, round 6: the project block followed the user's
+/// config.toml alone, while Codex merges its layers. A project's
+/// `project_doc_fallback_filenames` replaces the user's (Codex merges
+/// arrays by replacing them; the installer had joined the two lists, so
+/// with both candidates there it wrote the user's while Codex read the
+/// project's), an empty list included; and the project root whose files
+/// Codex reads first is found by `project_root_markers` (the installer
+/// knew `.git` only): with a custom marker, a root file that fills the
+/// budget refuses the block (`instruction_budget`); with no markers, Codex
+/// reads the working directory's file alone, and the block is written.
+///
+/// Mutations checked: the fallback lists joined again in
+/// `codex_layers::doc_view`: the block goes into `GEMINI.md` and this fails.
+/// `.git` as the only marker: the custom-marker case is written past the
+/// budget, the no-marker case refused, and this fails.
+#[test]
+fn the_codex_block_follows_codexs_merged_settings() {
+    let f = Fixture::new();
+    let config = f.text(".codex/config.toml");
+    let root = f.home.root().join("projects");
+    let p = root.join("merged");
+    std::fs::create_dir_all(p.join(".git")).unwrap();
+    std::fs::create_dir_all(p.join(".codex")).unwrap();
+    std::fs::write(
+        f.path(".codex/config.toml"),
+        format!("project_doc_fallback_filenames = [\"GEMINI.md\"]\n{config}"),
+    )
+    .unwrap();
+    std::fs::write(
+        p.join(".codex/config.toml"),
+        "project_doc_fallback_filenames = [\"CLAUDE.md\"]\n",
+    )
+    .unwrap();
+    std::fs::write(p.join("GEMINI.md"), "# User\n").unwrap();
+    std::fs::write(p.join("CLAUDE.md"), "# Project\n").unwrap();
+    let project = |dir: &Path, verb: &str| {
+        let out = f.agents_in(
+            dir,
+            &[verb, "--project", "--agent", "codex", "--yes", "--json"],
+        );
+        let v: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("{}{}", stdout(&out), stderr(&out)));
+        (v, out.status.code())
+    };
+    let (v, code) = project(&p, "install");
+    assert_eq!(code, Some(0), "{v}");
+    assert!(
+        f_text(&p.join("CLAUDE.md")).ends_with(&blocks::block()),
+        "{v}"
+    );
+    assert_eq!(f_text(&p.join("GEMINI.md")), "# User\n");
+    assert!(!p.join("AGENTS.md").exists());
+    let (v, code) = project(&p, "uninstall");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(f_text(&p.join("CLAUDE.md")), "# Project\n");
+    // An empty list in the project: Codex reads neither, a new AGENTS.md.
+    std::fs::write(
+        p.join(".codex/config.toml"),
+        "project_doc_fallback_filenames = []\n",
+    )
+    .unwrap();
+    let (v, code) = project(&p, "install");
+    assert_eq!(code, Some(0), "{v}");
+    assert!(
+        f_text(&p.join("AGENTS.md")).ends_with(&blocks::block()),
+        "{v}"
+    );
+    assert_eq!(f_text(&p.join("GEMINI.md")), "# User\n");
+    assert_eq!(f_text(&p.join("CLAUDE.md")), "# Project\n");
+    let (v, code) = project(&p, "uninstall");
+    assert_eq!(code, Some(0), "{v}");
+    assert!(!p.join("AGENTS.md").exists());
+
+    // A custom marker puts the root above, and its file fills the budget.
+    std::fs::write(
+        f.path(".codex/config.toml"),
+        format!("project_root_markers = [\".hg\"]\n{config}"),
+    )
+    .unwrap();
+    let hg = root.join("hg");
+    let sub = hg.join("s");
+    std::fs::create_dir_all(hg.join(".hg")).unwrap();
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(hg.join("AGENTS.md"), "y".repeat(33 * 1024)).unwrap();
+    std::fs::write(sub.join("AGENTS.md"), "# Sub\n").unwrap();
+    let (v, code) = project(&sub, "install");
+    assert_eq!(code, Some(1), "{v}");
+    let change = &v["project"]["changes"][0];
+    assert_eq!(change["outcome"], "refused", "{v}");
+    assert_eq!(change["reason"], "instruction_budget", "{v}");
+    assert_eq!(f_text(&sub.join("AGENTS.md")), "# Sub\n");
+    // No markers: the working directory's file alone, below a repository
+    // root whose file would fill the budget.
+    std::fs::write(
+        f.path(".codex/config.toml"),
+        format!("project_root_markers = []\n{config}"),
+    )
+    .unwrap();
+    let repo = root.join("repo");
+    let below = repo.join("s");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(&below).unwrap();
+    std::fs::write(repo.join("AGENTS.md"), "y".repeat(33 * 1024)).unwrap();
+    std::fs::write(below.join("AGENTS.md"), "# Below\n").unwrap();
+    let (v, code) = project(&below, "install");
+    assert_eq!(code, Some(0), "{v}");
+    assert!(
+        f_text(&below.join("AGENTS.md")).ends_with(&blocks::block()),
+        "{v}"
+    );
+    let (v, code) = project(&below, "uninstall");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(f_text(&below.join("AGENTS.md")), "# Below\n");
+    f.sweep();
+}
+
+/// Codex review, round 6 (high): the socket allowance's check read only
+/// the config.toml it edits, while Codex merges its other layers into it:
+/// a domain rule in a trusted project's `.codex/config.toml` (or in a
+/// profile file, the system or the managed file) was switched on by the
+/// allowance's `network_access` and proxy. With such a rule in a trusted
+/// project, consent writes the server and no allowance, the step is
+/// reported refused (`network_settings_present`) and the run exits 1; the
+/// rule gone, the allowance is written (the control); a profile file with
+/// a rule then refuses it again and the allowance written before is taken
+/// out (`socket_allowance_removed`). Uninstall gives the bytes back. On
+/// Linux no allowance is ever written.
+///
+/// Mutation checked: `codex_layers::other_layers_fit` answering `Ok`: the
+/// allowance is written beside the project's rule and this fails (on
+/// macOS).
+#[test]
+fn network_settings_in_codexs_other_layers_keep_the_allowance_out() {
+    let f = Fixture::new();
+    let p = f.home.root().join("projects/trusted");
+    std::fs::create_dir_all(p.join(".codex")).unwrap();
+    let rule = "[features.network_proxy.domains]\n\"127.0.0.1\" = \"allow\"\n";
+    std::fs::write(p.join(".codex/config.toml"), rule).unwrap();
+    let config = format!(
+        "{}\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+        config_toml(),
+        p.display()
+    );
+    std::fs::write(f.path(".codex/config.toml"), &config).unwrap();
+    age(&f.path(".codex/config.toml"), OLD);
+    let macos = cfg!(target_os = "macos");
+    let install = || {
+        f.report(&[
+            "install",
+            "--agent",
+            "codex",
+            "--consent-sandbox-sockets",
+            "--yes",
+        ])
+    };
+    let has_allowance = |toml: &str| {
+        ["network_access", "network_proxy", "unix_sockets"]
+            .iter()
+            .any(|w| toml.contains(w))
+    };
+    let refused_as = |v: &Value, reason: &str| {
+        outcomes(v).into_iter().any(|(h, path, o, r)| {
+            h == "codex" && path == "~/.codex/config.toml" && o == "refused" && r == reason
+        })
+    };
+    let (v, code) = install();
+    let toml = f.text(".codex/config.toml");
+    assert!(toml.contains("[mcp_servers.envcloak]"), "{toml}");
+    assert!(!has_allowance(&toml), "{toml}");
+    assert_eq!(code, if macos { 1 } else { 0 }, "{v}");
+    assert_eq!(refused_as(&v, "network_settings_present"), macos, "{v}");
+    // The rule gone: the allowance is written (on macOS).
+    std::fs::write(p.join(".codex/config.toml"), "model = \"m\"\n").unwrap();
+    let (v, code) = install();
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(has_allowance(&f.text(".codex/config.toml")), macos, "{v}");
+    // A profile file with a rule: refused, and the allowance taken out.
+    std::fs::write(f.path(".codex/work.config.toml"), rule).unwrap();
+    let (v, code) = install();
+    assert!(!has_allowance(&f.text(".codex/config.toml")), "{v}");
+    assert_eq!(code, if macos { 1 } else { 0 }, "{v}");
+    assert_eq!(refused_as(&v, "network_settings_present"), macos, "{v}");
+    assert_eq!(
+        notes(&v, "codex").contains(&"socket_allowance_removed".to_owned()),
+        macos,
+        "{v}"
+    );
+    std::fs::remove_file(f.path(".codex/work.config.toml")).unwrap();
+    let (u, code) = f.report(&["uninstall", "--agent", "codex", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(f.text(".codex/config.toml"), config);
+    f.sweep();
+}
+
 /// `envcloak init --agents-note` (SPEC §6.4 step 4) writes the project's
 /// block as `agents install --project` does: into a lone `AGENTS.md`,
 /// with no `CLAUDE.md` beside it; a dry run of `--import` writes nothing.
