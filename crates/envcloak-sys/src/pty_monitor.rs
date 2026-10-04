@@ -681,66 +681,161 @@ fn set_mask(how: libc::c_int, all: bool, only: &[libc::c_int]) {
     }
 }
 
-/// Closes every descriptor from `low` up: `close_range` on Linux; on macOS
-/// the descriptors `proc_pidinfo` lists (a loop up to the limit would be a
-/// million calls where the limit is a million); a loop up to the limit
-/// where neither works.
-fn close_from(low: libc::c_int) {
+/// Whether a test asked for the primary way of closing descriptors to be
+/// passed over (`crate::testing::force_descriptor_fallback`), so the way
+/// after it is the one tested. Always false outside the `testing` feature.
+fn primary_closing_passed_over() -> bool {
+    #[cfg(feature = "testing")]
+    {
+        crate::testing::DESCRIPTOR_FALLBACK.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        false
+    }
+}
+
+/// Closes every descriptor from `low` up, and says so only once it can
+/// tell: on Linux `close_range`, and where that fails (before 5.9) the
+/// descriptors `/proc/self/fd` lists, read with `getdents64` until a pass
+/// finds none; on macOS the descriptors `proc_pidinfo` lists, until a pass
+/// finds none. A bound such as `RLIMIT_NOFILE` is never trusted: a
+/// descriptor opened before the limit was lowered sits above it (Codex's
+/// review of PR #27). `Err(errno)` when no listing could be read: the
+/// monitor then refuses to start the command.
+fn close_from(low: libc::c_int) -> Result<(), libc::c_int> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: close_range closes descriptors and has no other effect.
-        let rc = unsafe { libc::syscall(libc::SYS_close_range, low, libc::c_uint::MAX, 0) };
-        if rc == 0 {
-            return;
+        if !primary_closing_passed_over() {
+            // SAFETY: close_range closes descriptors and has no other
+            // effect.
+            let rc = unsafe { libc::syscall(libc::SYS_close_range, low, libc::c_uint::MAX, 0) };
+            if rc == 0 {
+                return Ok(());
+            }
         }
+        close_listed_linux(low)
     }
     #[cfg(target_os = "macos")]
     {
-        const ENTRIES: usize = 256;
-        let entry = std::mem::size_of::<libc::proc_fdinfo>();
-        let size = libc::c_int::try_from(ENTRIES * entry).unwrap_or(0);
-        // SAFETY: getpid has no preconditions.
-        let me = unsafe { libc::getpid() };
-        loop {
-            // SAFETY: proc_fdinfo is plain data.
-            let mut list: [libc::proc_fdinfo; ENTRIES] = unsafe { std::mem::zeroed() };
-            // SAFETY: `list` is writable for `size` bytes; proc_pidinfo is
-            // one system call that fills it with this process's
-            // descriptors.
-            let bytes = unsafe {
-                libc::proc_pidinfo(me, libc::PROC_PIDLISTFDS, 0, list.as_mut_ptr().cast(), size)
+        if primary_closing_passed_over() {
+            return Err(libc::ENOTSUP);
+        }
+        close_listed_macos(low)
+    }
+}
+
+/// Closes the descriptors from `low` up that `/proc/self/fd` lists, pass
+/// after pass, until a pass finds none but the listing's own.
+/// Async-signal-safe: `open`, `getdents64` and `close`, on a stack buffer.
+#[cfg(target_os = "linux")]
+fn close_listed_linux(low: libc::c_int) -> Result<(), libc::c_int> {
+    const DIR: &[u8] = b"/proc/self/fd\0";
+    loop {
+        // SAFETY: DIR is NUL-terminated; open has no other effect.
+        let dir = unsafe {
+            libc::open(
+                DIR.as_ptr().cast(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if dir < 0 {
+            return Err(errno());
+        }
+        let mut found = false;
+        let mut buf = [0u8; 2048];
+        let result = loop {
+            // SAFETY: `buf` is writable for its length; getdents64 fills it
+            // with whole records.
+            let n =
+                unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len()) };
+            let Ok(n) = usize::try_from(n) else {
+                break Err(errno());
             };
-            let Ok(bytes) = usize::try_from(bytes) else {
-                break;
-            };
-            if bytes == 0 {
-                break;
+            if n == 0 {
+                break Ok(());
             }
-            let mut closed = false;
-            for info in list.iter().take(bytes / entry) {
-                if info.proc_fd >= low {
-                    // SAFETY: closes one of this process's descriptors.
-                    unsafe { libc::close(info.proc_fd) };
-                    closed = true;
+            let mut at = 0usize;
+            while let Some(record) = buf.get(at..n) {
+                // linux_dirent64: d_ino (8), d_off (8), d_reclen (2),
+                // d_type (1), then the NUL-terminated name.
+                let Some(len) = record
+                    .get(16..18)
+                    .map(|b| usize::from(u16::from_ne_bytes([b[0], b[1]])))
+                else {
+                    break;
+                };
+                if len == 0 {
+                    break;
                 }
+                let name = record.get(19..len.min(record.len())).unwrap_or_default();
+                let mut fd: libc::c_int = 0;
+                let mut digits = 0usize;
+                for b in name.iter().take_while(|b| **b != 0) {
+                    if !b.is_ascii_digit() {
+                        digits = 0;
+                        break;
+                    }
+                    fd = fd
+                        .saturating_mul(10)
+                        .saturating_add(libc::c_int::from(b - b'0'));
+                    digits += 1;
+                }
+                if digits > 0 && fd >= low && fd != dir {
+                    found = true;
+                    // SAFETY: closes one of this process's descriptors.
+                    unsafe { libc::close(fd) };
+                }
+                at = at.saturating_add(len);
             }
-            if !closed {
-                return;
-            }
+        };
+        // SAFETY: the listing's own descriptor.
+        unsafe { libc::close(dir) };
+        result?;
+        if !found {
+            return Ok(());
         }
     }
-    // SAFETY: rlimit is plain data; getrlimit fills it in.
-    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
-    // SAFETY: `lim` is writable.
-    let top = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
-        libc::c_int::try_from(lim.rlim_cur.min(1 << 20)).unwrap_or(1 << 20)
-    } else {
-        1 << 16
-    };
-    for fd in low..top {
-        // SAFETY: closing a descriptor number that may not be open fails
-        // with EBADF and has no other effect.
-        unsafe { libc::close(fd) };
+}
+
+/// Closes the descriptors from `low` up that `proc_pidinfo` lists, pass
+/// after pass, until a pass finds none. One system call per pass (a loop
+/// up to the limit would be a million calls where the limit is a
+/// million). Async-signal-safe.
+#[cfg(target_os = "macos")]
+fn close_listed_macos(low: libc::c_int) -> Result<(), libc::c_int> {
+    const ENTRIES: usize = 256;
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    let size = libc::c_int::try_from(ENTRIES * entry).unwrap_or(0);
+    // SAFETY: getpid has no preconditions.
+    let me = unsafe { libc::getpid() };
+    loop {
+        // SAFETY: proc_fdinfo is plain data.
+        let mut list: [libc::proc_fdinfo; ENTRIES] = unsafe { std::mem::zeroed() };
+        // SAFETY: `list` is writable for `size` bytes; proc_pidinfo is one
+        // system call that fills it with this process's descriptors.
+        let bytes = unsafe {
+            libc::proc_pidinfo(me, libc::PROC_PIDLISTFDS, 0, list.as_mut_ptr().cast(), size)
+        };
+        // A process always has descriptors 0 to 3 here: an empty or a
+        // failed listing is no listing.
+        let Ok(bytes) = usize::try_from(bytes) else {
+            return Err(errno());
+        };
+        if bytes == 0 {
+            return Err(libc::EIO);
+        }
+        let mut found = false;
+        for info in list.iter().take(bytes / entry) {
+            if info.proc_fd >= low {
+                // SAFETY: closes one of this process's descriptors.
+                unsafe { libc::close(info.proc_fd) };
+                found = true;
+            }
+        }
+        if !found {
+            return Ok(());
+        }
     }
 }
 
@@ -792,7 +887,9 @@ pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
         unsafe { libc::dup2(p.control, CONTROL_FD) };
         fail(e);
     }
-    close_from(CONTROL_FD + 1);
+    if let Err(e) = close_from(CONTROL_FD + 1) {
+        fail(e);
+    }
     // SAFETY: F_SETFD on the monitor's own descriptor: the command does not
     // inherit the channel. TIOCSCTTY with 0 takes the slave as the
     // controlling terminal of the session this process leads, stealing
