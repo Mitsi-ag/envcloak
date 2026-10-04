@@ -1469,10 +1469,7 @@ fn what_a_stopped_write_left_beside_a_config_is_removed_or_named() {
     std::fs::write(&foreign, b"{}").unwrap();
     let state_path = data_dir(&f.home).join("agents").join("state.json");
     let mut state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
-    let key = f
-        .path(".claude/settings.json")
-        .to_string_lossy()
-        .into_owned();
+    let key = envcloak_agents::writer::key(&f.path(".claude/settings.json"));
     state["leftovers"][key.as_str()] = json!([envcloak_agents::install::digest(&installed)]);
     std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
     let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);

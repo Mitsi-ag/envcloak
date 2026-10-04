@@ -316,9 +316,10 @@ fn claude_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
         hp.notes.push(note(
             "plugin_enabled",
             "the EnvCloak plugin is enabled in Claude Code: its hooks and MCP server are already \
-             there, so they are not written again, and the ones an earlier install wrote are \
-             taken out (with both, each hook ran twice); the instruction block, the deny rule \
-             and the sandbox settings, which the plugin does not carry, are written",
+             there, so they are not written (with both, each hook would run twice), and those an \
+             earlier install wrote are taken out, as the lines here say; the instruction block, \
+             the deny rule and the sandbox settings, which the plugin does not carry, are \
+             written",
         ));
         hp.steps.push(Step {
             what: "remove the MCP server EnvCloak registered with `claude mcp add-json`, if it \
@@ -359,9 +360,10 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
     if l.codex_instructions_override().exists() {
         hp.notes.push(note(
             "override_file",
-            "~/.codex/AGENTS.override.md exists and Codex reads it instead of AGENTS.md, so the \
-             instruction block was not written: add it to the override yourself, or remove the \
-             override and run this again",
+            "~/.codex/AGENTS.override.md exists and Codex reads it instead of AGENTS.md, so this \
+             run writes no instruction block for Codex (one in AGENTS.md is not read while the \
+             override is there): add the block to the override yourself, or remove the override \
+             and run this again",
         ));
     } else {
         hp.steps.push(Step {
@@ -884,13 +886,7 @@ struct ClaudeFile {
 /// under ([`crate::writer::State::mcp`]): its path with its directories
 /// resolved, so the same file is one key however it is reached.
 pub fn mcp_key(path: &Path) -> String {
-    let resolved = match (path.parent(), path.file_name()) {
-        (Some(d), Some(n)) => {
-            std::fs::canonicalize(d).map_or_else(|_| path.to_path_buf(), |d| d.join(n))
-        }
-        _ => path.to_path_buf(),
-    };
-    crate::writer::key(&resolved)
+    crate::writer::key(path)
 }
 
 /// The user-scope MCP entry in the `.claude.json` at `path`, read beneath
