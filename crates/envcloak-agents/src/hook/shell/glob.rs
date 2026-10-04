@@ -568,6 +568,50 @@ fn component_may(c: &[Option<u8>]) -> bool {
     }
 }
 
+/// Whether a shell word part of which is only known when the command runs
+/// may name an env file, as a program the reader does not know is given
+/// it: its last component read with the stretch only known when it runs
+/// as any text (a leading `.` included) and the shell's own wildcards as
+/// wildcards, under [`component_may`]'s rule for a component that starts
+/// with either (its literals and classes must spell part of `.env`
+/// itself). `$(printf .)env` and `.$(x)nv` may; `$TARGET` and `$X.txt`
+/// are not read as env files (the shell oracle's finding, round 5). A
+/// component with both a stretch only known when it runs and a wildcard
+/// of the shell's may, whatever its literals: the stretch can make the
+/// leading `.` the wildcards then need (the shell oracle's finding:
+/// `$(printf .)??${X:-v}` expands to `.env`).
+pub(super) fn shell_word_may_name_env_file(w: &[Ch]) -> bool {
+    let start = w
+        .iter()
+        .rposition(|ch| matches!(ch, Ch::Lit { b: b'/', .. }))
+        .map_or(0, |p| p + 1);
+    let comp = &w[start..];
+    let wildcard = comp.iter().any(|ch| {
+        matches!(
+            ch,
+            Ch::Lit {
+                b: b'*' | b'?' | b'[',
+                quoted: false
+            }
+        )
+    });
+    if wildcard && comp.contains(&Ch::Unknown) {
+        return true;
+    }
+    let mut pat: Zeroizing<Vec<Option<u8>>> = Zeroizing::new(Vec::with_capacity(w.len() * 2));
+    for ch in comp {
+        match ch {
+            Ch::Unknown => pat.push(None),
+            Ch::Lit { b, quoted: true } if matches!(b, b'*' | b'?' | b'[' | b'\\') => {
+                pat.push(Some(b'\\'));
+                pat.push(Some(*b));
+            }
+            Ch::Lit { b, .. } => pat.push(Some(*b)),
+        }
+    }
+    component_may(&pat)
+}
+
 /// A word as a tool reads its glob: the shell's quoting is gone, so a
 /// quoted `*` or `{` is the tool's to read.
 fn as_tool_glob(w: &[Ch]) -> Word {

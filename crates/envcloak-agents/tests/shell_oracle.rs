@@ -29,12 +29,29 @@
 //! every shell, a share of the random spellings does, and `cat a.txt`
 //! does not and is allowed.
 //!
+//! A fourth family (`more_cases`) spells what the reader resolves only by
+//! failing closed: names in variables and zsh's flagged expansions,
+//! values read by a name only known when it runs, programs not on the
+//! reader list given the file, a shell given it as its script, `emulate
+//! -c`, and globs under changed options. A fifth (`carried_cases`)
+//! carries the name the script spells to a program not on the reader
+//! list by a value only known when it runs (a variable, an array, a
+//! loop's name, positional parameters, names read from input, a
+//! command's output, a shell's script from a pipe), gives globs under
+//! changed options to any program, and has an interpreter's code or
+//! input name the file or the environment.
+//!
 //! Mutations checked: POSIX bracket expressions read as plain members in
 //! `glob.rs` (`posix_end` answering `None`): `find -name '.[[:alpha:]]nv'`
 //! spellings that find reads `.env` with are allowed, and this fails.
 //! zsh's `=name` not read (`run` taking `=printenv` as its own name): zsh's
 //! `=printenv` spellings print the canary and are allowed, and this fails
-//! where zsh is installed.
+//! where zsh is installed. Round 5: zsh's `$~x` read as a `$` of its own
+//! (`zsh_flagged` answering false), the indirection check taken out
+//! (`indirect` answering false), programs not on the reader list let be
+//! (`unknown_named` doing nothing), a shell's script file not read, and
+//! `emulate -c` not read: each makes `more_cases` spellings that reach
+//! the canary allowed, and this fails.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -389,6 +406,91 @@ fn dump_cases(rng: &mut Rng, n: usize) -> Vec<Case> {
     out
 }
 
+/// What the reader resolves only by failing closed (round 5's sweep of
+/// the zsh-grammar and reader-list classes): a name held in a variable and
+/// expanded by bash's or zsh's rules (`$x`, zsh's `$~x`, `$=x`, `${~x}`), a
+/// value read by a name only known when it runs (bash's `${!v}`, zsh's
+/// `${(P)n}`, zsh's `$mapfile`), programs not on the reader list given the
+/// file (`pr`, `iconv`, `cp ... /dev/stdout`, `gzip -c`, `tar`), a shell
+/// given it as its script (`bash -x`), `emulate -c`, and globs read under
+/// changed options (`setopt globdots`, `shopt -s dotglob`, zsh's `^`).
+fn more_cases(rng: &mut Rng, n: usize) -> Vec<Case> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let path = if rng.chance(1, 3) { "sub/.env" } else { ".env" };
+        let w = shell_word(rng, path);
+        let script = match rng.below(20) {
+            0 => format!("x={w}; cat $x"),
+            1 => format!("x='{path}'; cat $~x"),
+            2 => "x='.e*'; cat $~x".to_owned(),
+            3 => format!("x='{path}'; cat ${{~x}}"),
+            4 => format!("x='{path}'; head -n 5 $=x"),
+            5 => "for n in ${(k)parameters}; do print -r -- $n=${(P)n}; done".to_owned(),
+            6 => "for v in $(compgen -e); do echo \"$v=${!v}\"; done".to_owned(),
+            7 => format!("zmodload zsh/mapfile; print -r -- $mapfile[{path}]"),
+            8 => format!("pr -t {w}"),
+            9 => format!("iconv -f utf-8 -t utf-8 {w}"),
+            10 => format!("cp {w} /dev/stdout"),
+            11 => format!("gzip -c {w} | gunzip"),
+            // Not into a directory the spelling also matches (`[!q]?*[!q]`
+            // matches `sub`): a recursive read is a row of its own in the
+            // honesty table.
+            12 => format!("tar cf - --no-recursion {w} | tar xOf -"),
+            13 => format!("bash -x {w}"),
+            14 => format!("sh -v {w}"),
+            15 => format!("emulate sh -c 'cat {path}'"),
+            16 => "setopt globdots; cat *".to_owned(),
+            17 => "shopt -s dotglob; cat *".to_owned(),
+            18 => "setopt extendedglob; cat ^a.txt".to_owned(),
+            _ => "setopt globdots; cat < *".to_owned(),
+        };
+        out.push(Case {
+            script,
+            family: "more",
+        });
+    }
+    out
+}
+
+/// The class swept further in round 5: an env file's name the script
+/// spells, carried to a program not on the reader list by a value only
+/// known when it runs (a variable, an array, a loop's or a case's name,
+/// positional parameters, names read from input, a command's output, a
+/// shell's script from a pipe); globs under changed options given to any
+/// program; an interpreter's code or input naming the file, or the
+/// environment.
+fn carried_cases(rng: &mut Rng, n: usize) -> Vec<Case> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let path = if rng.chance(1, 3) { "sub/.env" } else { ".env" };
+        let w = shell_word(rng, path);
+        let script = match rng.below(17) {
+            0 => format!("x={w}; cp $x /dev/stdout"),
+            1 => format!("for f in {w}; do cp \"$f\" /dev/stdout; done"),
+            2 => format!("echo {w} | xargs cat"),
+            3 => format!("printf '%s\\n' {w} | xargs -I@ cp @ /dev/stdout"),
+            4 => format!("sh -c 'cp \"$1\" /dev/stdout' _ {w}"),
+            5 => format!("read f <<< {w}; cp \"$f\" /dev/stdout"),
+            6 => format!("printf 'cat {path}' | sh"),
+            7 => format!("cp $(echo {w}) /dev/stdout"),
+            8 => format!("a=({w}); cp \"${{a[@]}}\" /dev/stdout"),
+            9 => format!("case x in x) f={w};; esac; cp $f /dev/stdout"),
+            10 => "setopt globdots; tar cf - --no-recursion * | tar xOf -".to_owned(),
+            11 => "shopt -s dotglob; tar cf - --no-recursion * | tar xOf -".to_owned(),
+            12 => format!("python3 -c 'print(open(\"{path}\").read())'"),
+            13 => "python3 -c 'import os; print(dict(os.environ))'".to_owned(),
+            14 => "perl -e 'print \"$_=$ENV{$_}\\n\" for keys %ENV'".to_owned(),
+            15 => format!("perl -ne print {w}"),
+            _ => format!("python3 - <<'EOF'\nprint(open('{path}').read())\nEOF"),
+        };
+        out.push(Case {
+            script,
+            family: "carried",
+        });
+    }
+    out
+}
+
 #[test]
 fn every_spelling_that_reaches_a_secret_is_not_allowed() {
     let shells = shells();
@@ -449,6 +551,8 @@ fn every_spelling_that_reaches_a_secret_is_not_allowed() {
     let mut all = read_cases(&mut rng, cases);
     all.extend(tool_cases(&mut rng, cases / 2));
     all.extend(dump_cases(&mut rng, cases / 3));
+    all.extend(more_cases(&mut rng, cases / 2));
+    all.extend(carried_cases(&mut rng, cases / 2));
     let mut misses: Vec<String> = Vec::new();
     let mut counts: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
     for case in &all {
