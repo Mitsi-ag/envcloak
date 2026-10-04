@@ -3144,3 +3144,95 @@ fn a_compiled_corpus_of_constructors_and_layouts_is_read_or_refused() {
         }
     }
 }
+
+const MONITOR: &str = "crates/envcloak-sys/src/pty_monitor.rs";
+
+/// The control-message reader (M2-17, Codex's review of PR #27): the PTY
+/// monitor's messages are the variants of its `Report` and `Command`
+/// enums. The tree as it is passes (above); each disagreement between the
+/// table and the code fails: a message the code no longer declares that a
+/// row says is `landed`, a message the code declares that no row reserves,
+/// and a `reserved` row for a message the code has.
+#[test]
+fn the_monitors_messages_and_their_rows_must_agree() {
+    let t = fixture();
+    edit(
+        &t,
+        MONITOR,
+        "    /// The command continued.\n    Continued,\n",
+        "",
+    );
+    assert_fails(
+        &t,
+        "`pty_monitor Continued` is `landed`, but the code has no such entry",
+    );
+    let t = fixture();
+    edit(&t, MONITOR, "    Suspend,\n", "    Suspend,\n    Ping,\n");
+    assert_fails(
+        &t,
+        "the code has `pty_monitor Ping` (crates/envcloak-sys/src/pty_monitor.rs), which no \
+         `landed` row reserves",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `pty_monitor` | `Resume` | M2-17 | landed |",
+        "| `pty_monitor` | `Resume` | M2-17 | reserved |",
+    );
+    assert_fails(
+        &t,
+        "`pty_monitor Resume` is reserved, but the code already has it",
+    );
+}
+
+/// The reader reads every variant or refuses it, never skipping one: an
+/// attribute on a variant (a `cfg` could take it away), a struct variant
+/// and a discriminant are refused; so are the enum missing and declared
+/// twice. A message named on a channel no reader reads stays `reserved`:
+/// marked `landed` it fails as one the code lacks.
+#[test]
+fn a_control_message_the_reader_cannot_read_is_refused() {
+    for (_what, from, to) in [
+        (
+            "an attribute",
+            "    Suspend,\n",
+            "    #[cfg(any())]\n    Suspend,\n",
+        ),
+        (
+            "a struct variant",
+            "    Suspend,\n",
+            "    Suspend { now: bool },\n",
+        ),
+        ("a discriminant", "    Suspend,\n", "    Suspend = 2,\n"),
+    ] {
+        let t = fixture();
+        edit(&t, MONITOR, from, to);
+        assert_fails(&t, "`enum Command` has a variant the reader cannot read");
+    }
+    let t = fixture();
+    edit(&t, MONITOR, "pub enum Report {", "pub enum Reports {");
+    assert_fails(
+        &t,
+        "no `enum Report`, whose variants are the `pty_monitor` channel's messages",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        MONITOR,
+        "/// A command from the CLI to the monitor.\n",
+        "mod again {\n    pub enum Command {\n        Resume,\n    }\n}\n\n/// A command from the CLI to the monitor.\n",
+    );
+    assert_fails(&t, "`enum Command` is declared twice");
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `runner` | `Release` | M2-27 | reserved |",
+        "| `runner` | `Release` | M2-27 | landed |",
+    );
+    assert_fails(
+        &t,
+        "`runner Release` is `landed`, but the code has no such entry",
+    );
+}
