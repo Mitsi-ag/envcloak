@@ -435,12 +435,15 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `supervisor` | `Publish` | M2b-05 | reserved | daemon to supervisor: the serialized publication decision |
 | `supervisor` | `Check` | M2b-05 | reserved | supervisor to daemon: the grant check before each browser tool call |
 | `supervisor` | `Close` | M2b-05 | reserved | daemon to supervisor: the generation ends |
-| `pty_monitor` | `Stopped` | M2-17 | reserved | the command stopped, with the signal |
-| `pty_monitor` | `Continued` | M2-17 | reserved | the command continued |
-| `pty_monitor` | `Exited` | M2-17 | reserved | the command's status |
-| `pty_monitor` | `Resume` | M2-17 | reserved | the CLI is back in raw mode: hand the terminal back and continue the command |
-| `pty_monitor` | `Suspend` | M2-17 | reserved | stop the command first (a SIGTSTP from another process) |
-| `pty_monitor` | `Signal` | M2-17 | reserved | a signal narrowed to the command's own process group |
+| `pty_monitor` | `Started` | M2-17 | landed | monitor to CLI: the command was executed, with its pid (the first report) |
+| `pty_monitor` | `SetupFailed` | M2-17 | landed | monitor to CLI: the session, the descriptors or the terminal could not be set up, with the `errno`; no command ran |
+| `pty_monitor` | `ExecFailed` | M2-17 | landed | monitor to CLI: no candidate path could be executed, with the `errno` of the last `execve` (`EACCES` when one was refused) |
+| `pty_monitor` | `Stopped` | M2-17 | landed | monitor to CLI: the command stopped, with the signal; the monitor holds the terminal |
+| `pty_monitor` | `Continued` | M2-17 | landed | monitor to CLI: the command continued |
+| `pty_monitor` | `Exited` | M2-17 | landed | monitor to CLI: the command's wait status, once what it wrote was read (up to 2 s); the command stays unreaped until the channel closes |
+| `pty_monitor` | `Resume` | M2-17 | landed | CLI to monitor: the CLI is back in raw mode: hand the terminal back and continue the command |
+| `pty_monitor` | `Suspend` | M2-17 | landed | CLI to monitor: stop the command first (a SIGTSTP from another process) |
+| `pty_monitor` | `Signal` | M2-17 | landed | CLI to monitor: a signal to the command's own process group (the job while the command is stopped, or a signal narrowed) |
 | `signin_driver` | `NeedUsername` | M2b-07 | reserved | the login state machine reached the username step |
 | `signin_driver` | `NeedPassword` | M2b-07 | reserved | the password step |
 | `signin_driver` | `NeedCode` | M2b-07 | reserved | a one-time-code step, with its time step |

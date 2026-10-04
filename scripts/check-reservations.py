@@ -219,10 +219,13 @@ needs a `landed` row like any token. It also takes the tokens of audit
 kinds, error kinds and reasons, so a `landed` or `reuse` row in one of
 the tables printed as `envcloak: <token>`, or in the audit-kind table,
 accounts for a failure token; a row in any other table does not. A table
-with no code reader yet (the coverage tokens, control messages, fields
-and sign-in tokens) takes no `landed` row: the task that lands one adds
-its reader first. The policy kinds are read from `PolicyKind` in the
-vault's policies module (M2-07).
+with no code reader yet (the coverage tokens, fields and sign-in tokens)
+takes no `landed` row: the task that lands one adds its reader first. The
+policy kinds are read from `PolicyKind` in the vault's policies module
+(M2-07). The control messages are read, channel by channel, from the
+enums CONTROL_CHANNELS names (M2-17: the PTY monitor's `Report` and
+`Command`); a channel it does not name has no reader yet, so its rows
+stay `reserved`, and a `landed` row there fails as one the code lacks.
 
 Usage: scripts/check-reservations.py [--root <repository root>]
 Prints "check-reservations: ok" and exits 0, or names every problem on
@@ -2481,6 +2484,59 @@ def code_mcp_tools(root):
     return found
 
 
+# The control channels whose messages the code declares, each with the
+# file that declares them and the enums whose variants are its messages
+# (M2-17: the PTY monitor's reports and the CLI's commands to it). A
+# channel not here has no reader: its rows stay `reserved` until its task
+# adds one.
+CONTROL_CHANNELS = {
+    "pty_monitor": ("crates/envcloak-sys/src/pty_monitor.rs", ("Report", "Command")),
+}
+ENUM_DECL = re.compile(r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)")
+VARIANT = re.compile(r"([A-Z][A-Za-z0-9]*)(\s*\((?:[^()]|\([^()]*\))*\))?")
+
+
+def code_control_messages(root):
+    """The control-pipe messages each channel of CONTROL_CHANNELS declares:
+    every variant of its enums, keyed `<channel> <Message>`. Each variant
+    is read or refused, never skipped: a unit or tuple variant is read; an
+    attribute on one (a `cfg` could take it away), a discriminant, a
+    struct variant, or anything else is an error. So are an enum of the
+    channel declared twice or not at all, generic, a message named twice
+    on one channel, and a `#[path]` module in the file."""
+    found = {}
+    for channel, (rel, enums) in sorted(CONTROL_CHANNELS.items()):
+        src = Source(rel, read(root, rel))
+        refuse_path_attributes(src)
+        bodies = {}
+        for m in ENUM_DECL.finditer(src.skel):
+            name = m.group(1)
+            if name not in enums:
+                continue
+            line = "%s line %d" % (rel, src.skel.count("\n", 0, m.start()) + 1)
+            if name in bodies:
+                raise SourceError("%s: `enum %s` is declared twice; the reader cannot tell which holds the `%s` channel's messages" % (line, name, channel))
+            brace = src.skel.find("{", m.end())
+            if brace < 0 or src.skel[m.end():brace].strip():
+                raise SourceError("%s: `enum %s` is not a plain enum with a body the reader can read" % (line, name))
+            bodies[name] = (line, src.skel[brace + 1:src.block_end(brace) - 1])
+        for name in enums:
+            if name not in bodies:
+                raise SourceError("%s: no `enum %s`, whose variants are the `%s` channel's messages" % (rel, name, channel))
+            line, body = bodies[name]
+            for item in split_generics(body):
+                v = VARIANT.fullmatch(item)
+                if not v:
+                    raise SourceError("%s: `enum %s` has a variant the reader cannot read (`%s`): each message is a unit or tuple variant with no attribute and no discriminant" % (line, name, " ".join(item.split())[:60]))
+                key = "%s %s" % (channel, v.group(1))
+                if key in found:
+                    raise SourceError("%s: the message `%s` is declared twice on the `%s` channel" % (line, v.group(1), channel))
+                found[key] = rel
+    if not found:
+        raise SourceError("no control message found in %s" % ", ".join(f for f, _ in CONTROL_CHANNELS.values()))
+    return found
+
+
 STATEMENT_DOMAIN = re.compile(r"(envcloak-[a-z0-9-]*statement/[0-9]+)")
 # `#[path = "..."]` and `#[cfg_attr(<cfg>, path = "...")]`: a module read
 # from a file the walk may never reach (verifier review of M2-RES1).
@@ -2617,7 +2673,7 @@ REGISTRIES = {
                      name="Token", grammar=TOKEN, code=None),
     "control_message": dict(doc="docs/IPC.md", cols=["Channel", "Message", "Task", "Status", "Use"],
                             name="Message", scope="Channel", scope_grammar=TOKEN, grammar=MESSAGE,
-                            code=None),
+                            code=code_control_messages),
     "statement_domain": dict(doc="docs/IPC.md", cols=["Domain", "Task", "Status", "Use"],
                              name="Domain", grammar=DOMAIN, code=code_statement_domains),
     "mcp_tool": dict(doc="docs/IPC.md", cols=["Tool", "Task", "Status", "Use"],
