@@ -307,7 +307,7 @@ SECTIONS = {
 }
 HEADING = re.compile(r"^## (.*?)[ \t]*$", re.M)
 STATUSES = ("reserved", "landed", "reuse")
-COVERAGE_KINDS = ("state", "reason", "outcome")
+COVERAGE_KINDS = ("state", "reason", "outcome", "availability")
 
 # The tables whose tokens the person reads as `envcloak: <token>`: one
 # namespace, so one name never means two things there (R-7).
@@ -1259,6 +1259,23 @@ def all_methods(root):
 
 
 POLICIES_RS = "crates/envcloak-core/src/vault/policies.rs"
+COVERAGE_RS = "crates/envcloak-agents/src/coverage.rs"
+# The enums whose `fn name` arms are the coverage tokens (M2-09).
+COVERAGE_ENUMS = ("State", "Reason", "Outcome", "Availability")
+
+
+def code_coverage(root):
+    """The coverage tokens: every `fn name` arm of the coverage module's
+    state, reason, outcome and availability enums, each enum read whole (a
+    variant without an arm the reader can read is an error). A token two
+    enums give (`needs_host_approval`, a reason and an availability) is
+    one entry: the coverage tokens are one namespace."""
+    src = Source(COVERAGE_RS, read(root, COVERAGE_RS))
+    out = {}
+    for enum in COVERAGE_ENUMS:
+        for token in enum_arms(src, enum, "name", TOKEN_VALUE).values():
+            out[token] = COVERAGE_RS
+    return out
 
 
 def code_policy_kinds(root):
@@ -3125,7 +3142,7 @@ REGISTRIES = {
     "exit_token": dict(doc="docs/IPC.md", cols=["Token", "Task", "Status", "Use"],
                        name="Token", grammar=TOKEN, code=code_exit_tokens),
     "coverage": dict(doc="docs/IPC.md", cols=["Token", "Kind", "Task", "Status", "Use"],
-                     name="Token", grammar=TOKEN, code=None),
+                     name="Token", grammar=TOKEN, code=code_coverage),
     "control_message": dict(doc="docs/IPC.md", cols=["Channel", "Message", "Task", "Status", "Use"],
                             name="Message", scope="Channel", scope_grammar=TOKEN, grammar=MESSAGE,
                             code=code_control_messages),
