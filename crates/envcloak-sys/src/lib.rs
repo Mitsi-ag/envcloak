@@ -53,8 +53,14 @@
 //!   [`hung_up`] (a pipe no process can write to any more), and
 //!   [`Interrupter`] (a thread blocked writing to an output nobody reads,
 //!   broken out of the write once the runner gives up on it).
+//! - PTY mode (`envcloak run --pty`, M2): [`pty`] (the PTY, its monitor
+//!   session, the control channel and signal forwarding),
+//!   [`TerminalGuard`] (the outer terminal in raw mode, restored on every
+//!   way out) and [`OwnedChild`] and, on Linux, [`owned::OwnedSession`]
+//!   (the only processes the PTY path signals).
 //! - Panics (gate 12): [`install_panic_hook`], which both binaries call so
-//!   a panic shows its place and never its message; [`panic_point`], where
+//!   a panic shows its place and never its message, after it puts back a
+//!   terminal a [`TerminalGuard`] holds raw; [`panic_point`], where
 //!   a test build panics on request; and [`panic_with_input`], behind the
 //!   binaries' hidden `internal panic`.
 //!
@@ -77,13 +83,17 @@ mod harden;
 mod interrupt;
 mod inuse;
 mod lockfile;
+pub mod owned;
 mod panic;
 mod peer;
 mod perm;
 mod proc;
+pub mod pty;
+mod pty_monitor;
 mod signal;
 mod sock;
 mod sync;
+mod termios;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod tty;
@@ -111,6 +121,7 @@ pub use harden::{
 pub use interrupt::Interrupter;
 pub use inuse::{InUse, open_elsewhere};
 pub use lockfile::try_lock_exclusive;
+pub use owned::OwnedChild;
 pub use panic::{
     fail_point, idle_connection_override, install as install_panic_hook, panic_point,
     panic_with_input, pause_point, test_event, test_trace,
@@ -133,5 +144,9 @@ pub use signal::{
 };
 pub use sock::connect_unix;
 pub use sync::{SyncMethod, sync_file};
+pub use termios::{
+    TerminalGuard, TerminalSettings, WindowSize, restore_outer_terminal, set_window_size,
+    window_size,
+};
 pub use tty::{SecretInput, hung_up, wait_readable, wait_writable};
 pub use watch::ProcessWatch;

@@ -659,6 +659,8 @@ pub struct StatFields {
     pub comm: Vec<u8>,
     /// Field 4.
     pub ppid: i32,
+    /// Field 5: the process group.
+    pub pgrp: i32,
     /// Field 6.
     pub session: i32,
     /// Field 7: the controlling terminal's device number, 0 for none.
@@ -710,6 +712,7 @@ pub fn parse_proc_stat(stat: &[u8]) -> Option<StatFields> {
         pid: i32::try_from(pid).ok()?,
         comm,
         ppid: i32::try_from(parse_int(field(4)?)?).ok()?,
+        pgrp: i32::try_from(parse_int(field(5)?)?).ok()?,
         session: i32::try_from(parse_int(field(6)?)?).ok()?,
         tty_nr: parse_int(field(7)?)?,
         start_time: StartTime::from_raw(start.parse().ok()?),
@@ -852,6 +855,7 @@ mod tests {
             assert_eq!(f.pid, 4242);
             assert_eq!(f.comm, comm.as_bytes());
             assert_eq!(f.ppid, 17);
+            assert_eq!(f.pgrp, 4242);
             assert_eq!(f.session, 4200);
             assert_eq!(f.tty_nr, 34816);
             assert_eq!(f.start_time, StartTime::from_raw(987_654));
@@ -876,7 +880,7 @@ mod tests {
     #[test]
     fn the_argument_area_is_fields_48_and_49() {
         let f = parse_proc_stat(&full_stat("140736000000000", "140736000000040")).unwrap();
-        assert_eq!((f.pid, f.ppid, f.session), (4242, 4, 6));
+        assert_eq!((f.pid, f.ppid, f.pgrp, f.session), (4242, 4, 5, 6));
         assert_eq!(f.start_time, StartTime::from_raw(987_654));
         assert_eq!(f.arg_area, Some((140_736_000_000_000, 140_736_000_000_040)));
         assert_eq!(f.arg_area_len(), Some(40));
