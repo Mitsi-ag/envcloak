@@ -255,21 +255,30 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
     );
 
     // 3. The positive control: the command's own group is the shell's.
-    // The job ends first; at its prompt the shell runs a trap once it reads
-    // the next line.
+    // The job ends first. At its prompt the shell runs a pending trap once
+    // it has read and run the next command (`:`), before its next prompt.
+    // The monitor sends the signal on its own time after `send` returns,
+    // so the command is typed again until the trap has run.
     let prompts = screen.count(PROMPT);
     screen.type_bytes(b"done\n");
     screen.expect(PROMPT, prompts + 1, "the job ended");
     for (sig, name) in SIGNALS {
         monitor.send(MonitorCommand::Signal(sig)).unwrap();
-        let prompts = screen.count(PROMPT);
-        screen.type_bytes(b"\n");
-        screen.expect(PROMPT, prompts + 1, "the shell read a line");
-        assert!(
-            wait_lines(&d.join(format!("shell-{name}")), 1, DEADLINE),
-            "the shell did not count SIG{name} sent to its group; shell {:?}",
-            counts(d, "shell")
-        );
+        let file = d.join(format!("shell-{name}"));
+        let end = std::time::Instant::now() + DEADLINE;
+        while lines(&file) == 0 {
+            assert!(
+                std::time::Instant::now() < end,
+                "the shell did not count SIG{name} sent to its group; shell {:?}, job {:?}; \
+                 the terminal showed:\n{}",
+                counts(d, "shell"),
+                counts(d, "job"),
+                screen.text()
+            );
+            let prompts = screen.count(PROMPT);
+            screen.type_bytes(b":\n");
+            screen.expect(PROMPT, prompts + 1, "the shell ran a command");
+        }
     }
     screen.type_bytes(b"exit\n");
     let event = monitor.next_event(Some(DEADLINE)).unwrap();
