@@ -3,7 +3,8 @@
 //!
 //! - [`open_pty`]: a new PTY, its slave side starting with the outer
 //!   terminal's settings (so a remapped or disabled suspend character
-//!   carries over) and size. Both sides are close-on-exec.
+//!   carries over) and size. Both sides are close-on-exec from their
+//!   creation.
 //! - [`spawn_session`]: forks the PTY monitor (`crate::pty_monitor`),
 //!   which leads a new session on the slave and starts the command in a
 //!   process group of its own, the slave's foreground group. The command
@@ -84,35 +85,90 @@ impl core::fmt::Debug for Pty {
     }
 }
 
-/// Opens a new PTY (`openpty`). The slave side starts with `settings`
-/// (the outer terminal's, [`crate::TerminalGuard::saved`]) and `size`
-/// when given, the system's defaults otherwise. Both descriptors are made
-/// close-on-exec at once.
+/// Opens a new PTY. The slave side starts with `settings` (the outer
+/// terminal's, [`crate::TerminalGuard::saved`]) and `size` when given, the
+/// system's defaults otherwise. Both sides are close-on-exec from their
+/// creation (`posix_openpt` with `O_CLOEXEC`; the slave opened with it, by
+/// `TIOCGPTPEER` on Linux, by name elsewhere), so a program another thread
+/// starts meanwhile never inherits them (`openpty` sets no such flag, and
+/// one set after it leaves a moment when it is missing). Neither side
+/// becomes this process's controlling terminal (`O_NOCTTY`).
 ///
 /// # Errors
-/// When no PTY can be opened.
+/// When no PTY can be opened, or the settings or the size cannot be given
+/// to it.
 pub fn open_pty(size: Option<WindowSize>, settings: Option<&TerminalSettings>) -> io::Result<Pty> {
-    let (mut m, mut s): (libc::c_int, libc::c_int) = (-1, -1);
-    let mut t = settings.map(|s| s.0);
-    let mut ws = size.map(WindowSize::to_raw);
-    let tp = t.as_mut().map_or(std::ptr::null_mut(), std::ptr::from_mut);
-    let wp = ws.as_mut().map_or(std::ptr::null_mut(), std::ptr::from_mut);
-    // SAFETY: `m` and `s` are writable; `tp` and `wp` are null or point to
-    // initialized values that live across the call; a null name is
-    // allowed.
-    let rc = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), tp.cast(), wp.cast()) };
-    if rc != 0 {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: posix_openpt opens a new master side, or fails without
+    // effect.
+    let m = unsafe { libc::posix_openpt(flags) };
+    if m < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: openpty returned two open descriptors that nothing else owns.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
-    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
-        // SAFETY: F_SETFD on a descriptor this process owns.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+    // SAFETY: `m` was just opened and nothing else owns it.
+    let master = unsafe { OwnedFd::from_raw_fd(m) };
+    // SAFETY: grantpt and unlockpt on the master side just opened.
+    if unsafe { libc::grantpt(m) } != 0 || unsafe { libc::unlockpt(m) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let slave = open_slave(&master, flags)?;
+    if let Some(t) = settings {
+        crate::termios::set(slave.as_raw_fd(), libc::TCSANOW, &t.0)?;
+    }
+    if let Some(ws) = size {
+        set_window_size(slave.as_fd(), ws)?;
     }
     Ok(Pty { master, slave })
+}
+
+/// Opens the slave side of `master` with `flags`: `TIOCGPTPEER` (Linux
+/// 4.13), which needs no name; by its name where the kernel is older.
+#[cfg(target_os = "linux")]
+fn open_slave(master: &OwnedFd, flags: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: TIOCGPTPEER takes the open flags by value and returns a new
+    // descriptor for the master's slave side, or fails without effect.
+    let fd = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER as _, flags) };
+    if fd >= 0 {
+        // SAFETY: the kernel just created `fd`; nothing else owns it.
+        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    open_slave_by_name(master, flags)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_slave(master: &OwnedFd, flags: libc::c_int) -> io::Result<OwnedFd> {
+    open_slave_by_name(master, flags)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// `ptsname_r(3)`, in macOS's libc since 10.13.4 (the `libc` crate
+    /// does not declare it there).
+    fn ptsname_r(fd: libc::c_int, buf: *mut c_char, len: libc::size_t) -> libc::c_int;
+}
+
+#[cfg(not(target_os = "macos"))]
+use libc::ptsname_r;
+
+fn open_slave_by_name(master: &OwnedFd, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let mut name = [0 as c_char; 128];
+    // SAFETY: `name` is writable for its length; ptsname_r writes a
+    // NUL-terminated path into it, or fails without effect.
+    let rc = unsafe { ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    if rc != 0 {
+        return Err(if rc > 0 {
+            io::Error::from_raw_os_error(rc)
+        } else {
+            io::Error::last_os_error()
+        });
+    }
+    // SAFETY: `name` holds a NUL-terminated path.
+    let fd = unsafe { libc::open(name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: open just created `fd`; nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// What the monitor reports about the command.
@@ -221,6 +277,13 @@ fn candidates(program: &[u8], path: &[u8]) -> io::Result<Vec<Zeroizing<Vec<u8>>>
         .collect()
 }
 
+/// The control channel: a connected pair of stream sockets, both
+/// close-on-exec. On Linux they are made so at their creation
+/// (`SOCK_CLOEXEC`). macOS has no such flag for `socketpair`, so the flag
+/// is set just after, and a program another thread of this process starts
+/// in that moment would inherit the pair (hiding the monitor's end, or the
+/// CLI's, from the other side); see [`spawn_session`] for what the caller
+/// owes there.
 fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [-1 as libc::c_int; 2];
     #[cfg(target_os = "linux")]
@@ -270,6 +333,13 @@ fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 /// returns. The slave is closed in this process; the command, the monitor
 /// and their descendants hold it. Returns once the command has been
 /// executed.
+///
+/// On macOS the control channel's two descriptors are made close-on-exec
+/// just after they are created (macOS's `socketpair` has no flag for it):
+/// call this before any other thread of the process can start a program,
+/// as `envcloak run --pty` does (M2-19 starts the session before it starts
+/// anything else). The PTY's own descriptors ([`open_pty`]) and the
+/// monitor's are close-on-exec from their creation on both systems.
 ///
 /// # Errors
 /// [`SessionError::Exec`] when the command could not be executed;
