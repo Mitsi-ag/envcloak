@@ -371,7 +371,13 @@ fn monitor_cycle(cat: &str, reads_on: bool) {
     } else {
         assert_eq!(status.code(), Some(1), "{cat}: {status:?}");
     }
-    assert!(monitor.finish().unwrap().success());
+    // The monitor ends with `PREPARED_KEPT_EXIT` (this binary has the
+    // `testing` feature) when it kept a string prepared for the exec.
+    let monitor_status = monitor.finish().unwrap();
+    assert!(
+        monitor_status.success(),
+        "{cat}: the monitor ended {monitor_status:?}"
+    );
     println!(
         "pty_topology ({}): {} under the monitor: stopped by the suspend character, \
          continued by Resume, {}",

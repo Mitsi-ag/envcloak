@@ -445,7 +445,17 @@ fn gate14_stand_in() {
         matches!(event, Some(MonitorEvent::Exited(s)) if s.success()),
         "{event:?}"
     );
-    monitor.finish().unwrap();
+    // The monitor wiped its copy of the strings prepared for the exec,
+    // the value's `NAME=value` among them, once the command had executed:
+    // built with the `testing` feature, it ends with
+    // `PREPARED_KEPT_EXIT` when one of them was still there.
+    let monitor_status = monitor.finish().unwrap();
+    assert_ne!(
+        monitor_status.code(),
+        Some(envcloak_sys::testing::PREPARED_KEPT_EXIT),
+        "the monitor kept its copy of the command's environment"
+    );
+    assert!(monitor_status.success(), "{monitor_status:?}");
     let all = screen.read_to_end();
     assert!(!holds(&all, value), "the value reached the terminal");
     assert!(

@@ -330,9 +330,11 @@ fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 /// `crate::pty_monitor`). `env` is the command's whole environment; its
 /// `PATH` (or `/usr/bin:/bin`) finds a program named without a `/`. The C
 /// strings built for the exec, values included, are wiped when this
-/// returns. The slave is closed in this process; the command, the monitor
-/// and their descendants hold it. Returns once the command has been
-/// executed.
+/// returns, and the monitor wipes its own copy of them once the command
+/// has executed (the rest of the monitor's memory is a copy of this
+/// process's at the fork, under the same protections). The slave is
+/// closed in this process; the command, the monitor and their descendants
+/// hold it. Returns once the command has been executed.
 ///
 /// On macOS the control channel's two descriptors are made close-on-exec
 /// just after they are created (macOS's `socketpair` has no flag for it):
@@ -360,13 +362,13 @@ pub fn spawn_session(
         .rev()
         .find(|(name, _)| name.as_bytes() == b"PATH")
         .map_or(DEFAULT_PATH, |(_, v)| v.as_bytes());
-    let programs = candidates(program.as_bytes(), path).map_err(SessionError::Setup)?;
-    let args = argv
+    let mut programs = candidates(program.as_bytes(), path).map_err(SessionError::Setup)?;
+    let mut args = argv
         .iter()
         .map(|a| c_string(a.as_bytes()))
         .collect::<io::Result<Vec<_>>>()
         .map_err(SessionError::Setup)?;
-    let vars = env
+    let mut vars = env
         .iter()
         .map(|(name, value)| {
             let (name, value) = (name.as_bytes(), value.as_bytes());
@@ -381,15 +383,17 @@ pub fn spawn_session(
         })
         .collect::<io::Result<Vec<_>>>()
         .map_err(SessionError::Setup)?;
-    let pointers = |list: &[Zeroizing<Vec<u8>>]| -> Vec<*const c_char> {
-        list.iter()
-            .map(|c| c.as_ptr().cast::<c_char>())
+    // Pointers taken with `as_mut_ptr`: the monitor writes through them
+    // when it wipes its copy of the strings (`pty_monitor::wipe_prepared`).
+    let pointers = |list: &mut [Zeroizing<Vec<u8>>]| -> Vec<*const c_char> {
+        list.iter_mut()
+            .map(|c| c.as_mut_ptr().cast::<c_char>().cast_const())
             .chain(std::iter::once(std::ptr::null()))
             .collect()
     };
-    let program_ptrs = pointers(&programs);
-    let argv_ptrs = pointers(&args);
-    let envp_ptrs = pointers(&vars);
+    let program_ptrs = pointers(&mut programs);
+    let argv_ptrs = pointers(&mut args);
+    let envp_ptrs = pointers(&mut vars);
     // The monitor must stay unreaped until `finish`: an inherited ignored
     // SIGCHLD would let the kernel reap it the moment it exits.
     crate::owned::keep_children_unreaped().map_err(SessionError::Setup)?;

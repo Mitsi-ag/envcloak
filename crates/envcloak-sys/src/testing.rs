@@ -56,6 +56,11 @@ use crate::alloc::Backing;
 /// The command line of the test binaries with their own `main`.
 pub mod libtest;
 
+/// The exit code of a PTY monitor (built with this feature) that found a
+/// string prepared for the command still there after it wiped them:
+/// `SessionMonitor::finish` returns it instead of the monitor's own.
+pub use crate::pty_monitor::PREPARED_KEPT_EXIT;
+
 /// Set by [`force_descriptor_fallback`]: the PTY monitor passes over its
 /// primary way of closing descriptors (`close_range` on Linux,
 /// `proc_pidinfo` on macOS).
