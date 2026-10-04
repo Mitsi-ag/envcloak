@@ -246,10 +246,10 @@ fn settled(key: &FileKey, began: SystemTime, settle: Duration) -> bool {
 }
 
 /// The SHA-256 of the first `size` bytes of `file`, read from its start
-/// whatever its offset. A file that ends sooner changed (and the read
-/// stops there); one that is longer, or changed in any other way, is
-/// caught by its key, which [`ExeHashCache::lookup`] reads again after
-/// this.
+/// whatever its offset. The read stops, `Changed`, where a file shorter
+/// than `size` ends; a file whose size is not `size`, or that changed in
+/// any other way, is caught by its key, which [`ExeHashCache::lookup`]
+/// reads again after this (so stopping early only ends the loop).
 fn hash_exactly(file: &File, size: u64) -> Result<[u8; 32], HashError> {
     let mut h = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
@@ -439,10 +439,12 @@ mod tests {
 
     /// The key is read again after hashing: a file that changed after its
     /// key was read has no digest, and nothing is cached for the stale key.
-    /// A key whose size the file does not have gives none either: a
-    /// shorter file ends the read early, and a longer one's key, read
-    /// again, differs. Mutation checked: skipping the key's re-read fails
-    /// this test.
+    /// A key whose size the file does not have gives none either: the
+    /// file's key, read again after the read, differs (and a file shorter
+    /// than that size ends the read early). Mutation checked: skipping the
+    /// key's re-read fails this test; treating an early end as the end of
+    /// the file does not (the key's re-read catches it), so that branch
+    /// only ends the loop.
     #[test]
     fn a_file_changed_while_it_is_read_has_no_digest() {
         let d = dir();
