@@ -8,6 +8,11 @@
 //! workspace's sources the code holds the entry, a code entry that neither
 //! a `landed` row nor the baseline of M1's entries accounts for, and a
 //! baseline that is missing, malformed or no longer what the code holds.
+//! The M3 reservations (task M3-01) are read under their own heading as
+//! one table with M2's per registry: a number or name taken in both fails,
+//! a row under the other milestone's heading fails, the M3 task and join
+//! ids are known and no other, app-role methods and unlocker kinds are read
+//! from the code, and every row the M3 plan lists is reserved.
 //! Its readers take every form Rust gives a declaration (hexadecimal and
 //! other integer literals, `Self::` arms, raw strings, escapes, `&str`
 //! with or without `'static`, a method in any file of the protocol crate)
@@ -315,7 +320,7 @@ fn an_unknown_task_or_status_fails() {
         "| `signin.status` | M2b-05 |",
         "| `signin.status` | M2-29 |",
     );
-    assert_fails(&t, "names 'M2-29', which is not an M2 or M2b task");
+    assert_fails(&t, "names 'M2-29', which is not an M2, M2b or M3 task");
     let t = fixture();
     edit(
         &t,
@@ -3305,4 +3310,465 @@ fn file_conditionals_are_refused_and_test_only_control_decoys_are_ignored() {
     )
     .unwrap();
     assert_passes(&t.home());
+}
+
+// --- The M3 reservations (M3 plan, task M3-01) ----------------------------
+
+const ENVELOPE: &str = "crates/envcloak-core/src/crypto/envelope.rs";
+
+/// The text of `doc` under its "## Reserved for M3" heading, up to the next
+/// `## ` heading or the end.
+fn m3_section(doc: &str) -> String {
+    let text = std::fs::read_to_string(repo_root().join(doc)).unwrap();
+    let start = text.find("\n## Reserved for M3\n").unwrap();
+    let rest = &text[start + 1..];
+    let end = rest[3..].find("\n## ").map_or(rest.len(), |i| i + 3);
+    rest[..end].to_owned()
+}
+
+/// Every name and number the M3 plan's task M3-01 lists is reserved under
+/// "Reserved for M3", with the lane-C task the plan builds it in: methods
+/// (client and app role), fields, error kinds from -32051, reasons, exit
+/// tokens, statement domains, audit kinds from 46 and unlocker kind 3.
+///
+/// Mutation checked: the `app.lock` row deleted from docs/IPC.md: the
+/// script still passes (it does not know the plan), and this test fails.
+#[test]
+fn every_row_the_m3_plan_reserves_is_under_its_heading() {
+    let ipc = m3_section(IPC);
+    let vault = m3_section(VAULT);
+    let ipc_rows = [
+        "| `signature_invalid` | -32051 | M3-09 | reserved |",
+        "| `unlock_failed` | -32052 | M3-08 | reserved |",
+        "| `no_unlocker` | -32053 | M3-08 | reserved |",
+        "| `ask_closed` | -32054 | M3-14 | reserved |",
+        "| `code_identity` | M3-07 | reserved |",
+        "| `rolled_back` | M3-16 | reserved |",
+        "| `anchor_missing` | M3-16 | reserved |",
+        "| `projects.list` | M3-04 | reserved |",
+        "| `items.ask` | M3-14 | reserved |",
+        "| `items.ask_state` | M3-14 | reserved |",
+        "| `reveal.request` | M3-14 | reserved |",
+        "| `app.pending.list` | M3-09 | reserved |",
+        "| `app.pending.get` | M3-09 | reserved |",
+        "| `app.approve` | M3-09 | reserved |",
+        "| `app.unlocker.enroll.begin` | M3-08 | reserved |",
+        "| `app.unlocker.enroll` | M3-08 | reserved |",
+        "| `app.unlocker.add` | M3-14 | reserved |",
+        "| `app.unlocker.remove` | M3-14 | reserved |",
+        "| `app.unlock.begin` | M3-08 | reserved |",
+        "| `app.unlock` | M3-08 | reserved |",
+        "| `app.items.target` | M3-14 | reserved |",
+        "| `app.items.rotate` | M3-14 | reserved |",
+        "| `app.items.remove` | M3-14 | reserved |",
+        "| `app.reveal.begin` | M3-14 | reserved |",
+        "| `app.reveal` | M3-14 | reserved |",
+        "| `app.paste.begin` | M3-14 | reserved |",
+        "| `app.paste.inspect` | M3-14 | reserved |",
+        "| `app.paste` | M3-14 | reserved |",
+        "| `app.asks.list` | M3-14 | reserved |",
+        "| `app.asks.decline` | M3-14 | reserved |",
+        "| `app.audit.list` | M3-16 | reserved |",
+        "| `app.lock` | M3-16 | reserved |",
+        "| `app.policy.set` | spare | reserved |",
+        "| `app.registry.override` | spare | reserved |",
+        "| `app.device.add` | M5 | reserved |",
+        "| `app.device.remove` | M5 | reserved |",
+        "| `status` | `daemon.identity` | M3-07 | reserved |",
+        "| `status` | `vault.anchor` | M3-16 | reserved |",
+        "| `status` | `app_requests` | M3-14 | reserved |",
+        "| `status` | `lock.reason=screen_lock` | M3-16 | reserved |",
+        "| `status` | `lock.reason=session_resign` | M3-16 | reserved |",
+        "| `binding_absent` | M3-04 | reserved |",
+        "| `declined` | M3-19 | reserved |",
+        "| `expired` | M3-19 | reserved |",
+        "| `envcloak-unlocker-statement/1` | M3-08 | reserved |",
+        "| `envcloak-write-statement/1` | M3-14 | reserved |",
+        "| `envcloak-reveal-statement/1` | M3-14 | reserved |",
+    ];
+    for row in ipc_rows {
+        assert_eq!(ipc.matches(row).count(), 1, "{row} under IPC.md's heading");
+    }
+    let vault_rows = [
+        "| 46 | `unlocker_add` | M3-08 | reserved |",
+        "| 47 | `unlocker_remove` | M3-14 | reserved |",
+        "| 48 | `reveal_app` | M3-14 | reserved |",
+        "| 49 | `ask` | M3-14 | reserved |",
+        "| 50 | `anchor_mismatch` | M3-16 | reserved |",
+        "| 3 | `secure_enclave` | M3-08 | reserved |",
+    ];
+    for row in vault_rows {
+        assert_eq!(
+            vault.matches(row).count(),
+            1,
+            "{row} under VAULT.md's heading"
+        );
+    }
+}
+
+/// A number or name is taken once across both headings: the M3 plan's
+/// mutation (-32051 reserved twice) fails within its own section and
+/// across the two, and so do an audit kind and a method name.
+///
+/// Mutation checked: check_rows starting a fresh set of names and numbers
+/// for each section: the three cases across the two sections pass, and
+/// this test fails.
+#[test]
+fn a_number_or_name_reserved_in_both_sections_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `unlock_failed` | -32052 |",
+        "| `unlock_failed` | -32051 |",
+    );
+    assert_fails(
+        &t,
+        "`error_kind`: number -32051 is reserved twice (`signature_invalid` and `unlock_failed`)",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `request_conflict` | -32047 |",
+        "| `request_conflict` | -32051 |",
+    );
+    assert_fails(
+        &t,
+        "`error_kind`: number -32051 is reserved twice (`request_conflict` and `signature_invalid`)",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        VAULT,
+        "| 45 | `signin_cleanup` |",
+        "| 46 | `signin_cleanup` |",
+    );
+    assert_fails(
+        &t,
+        "`audit_kind`: number 46 is reserved twice (`signin_cleanup` and `unlocker_add`)",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `items.ask` | M3-14 |",
+        "| `scan.match` | M3-14 |",
+    );
+    assert_fails(&t, "`method`: `scan.match` is reserved twice");
+}
+
+/// The script knows the M3 plan's tasks, `M3-01` to `M3-21`, and its joins,
+/// `M3-J1` to `M3-J6`, and no other `M3-` id: the plan's mutation (a row
+/// for `M3-99`) fails.
+///
+/// Mutation checked: TASKS taking any `M3-` id (`M3-%02d` for 1 to 99):
+/// `M3-22` and `M3-99` pass, and this test fails.
+#[test]
+fn every_m3_task_and_join_is_known_and_no_other_m3_id() {
+    let t = fixture();
+    let ids: Vec<String> = (1..=21)
+        .map(|n| format!("M3-{n:02}"))
+        .chain((1..=6).map(|n| format!("M3-J{n}")))
+        .collect();
+    // The 25 app-method rows and the two `status` lock fields take one id
+    // each, so one run reads all 27.
+    let ipc = std::fs::read_to_string(t.home().join(IPC)).unwrap();
+    let start = ipc.find("<!-- reservations:app_method -->").unwrap();
+    let end = start + ipc[start..].find("<!-- /reservations -->").unwrap();
+    let mut table = ipc[start..end].to_owned();
+    let mut taken = 0;
+    for line in ipc[start..end].lines().filter(|l| l.starts_with("| `app.")) {
+        let cells: Vec<&str> = line.split(" | ").collect();
+        let new = format!("{} | {} | {}", cells[0], ids[taken], cells[2..].join(" | "));
+        table = table.replacen(line, &new, 1);
+        taken += 1;
+    }
+    let mut changed = format!("{}{}{}", &ipc[..start], table, &ipc[end..]);
+    for field in [
+        "`lock.reason=screen_lock` | M3-16",
+        "`lock.reason=session_resign` | M3-16",
+    ] {
+        let new = field.replace("M3-16", &ids[taken]);
+        assert_eq!(changed.matches(field).count(), 1, "{field}");
+        changed = changed.replacen(field, &new, 1);
+        taken += 1;
+    }
+    assert_eq!(taken, ids.len(), "every id is used once");
+    std::fs::write(t.home().join(IPC), changed).unwrap();
+    assert_passes(&t.home());
+
+    let t = fixture();
+    let bad = ["M3-00", "M3-22", "M3-99", "M3-J0", "M3-J7", "M3-1"];
+    let rows = [
+        "| `app.asks.list` | M3-14 |",
+        "| `app.asks.decline` | M3-14 |",
+        "| `app.paste.begin` | M3-14 |",
+        "| `app.paste.inspect` | M3-14 |",
+        "| `app.reveal.begin` | M3-14 |",
+        "| `app.items.target` | M3-14 |",
+    ];
+    for (row, id) in rows.iter().zip(bad) {
+        edit(&t, IPC, row, &row.replace("M3-14", id));
+    }
+    let out = run(&t.home());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    for id in bad {
+        let why = format!("names '{id}', which is not an M2, M2b or M3 task");
+        assert!(stderr.contains(&why), "expected {why:?} in: {stderr}");
+    }
+}
+
+/// A row of an M3 task belongs under "Reserved for M3" and a row of an M2
+/// or M2b task under "Reserved for M2 and M2b"; a bare later milestone
+/// must come after the section's own.
+///
+/// Mutation checked: check_rows without the section rule: each case
+/// passes, and this test fails.
+#[test]
+fn a_row_under_the_other_milestones_heading_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `items.reclassify` | M2-13 |",
+        "| `items.reclassify` | M3-14 |",
+    );
+    assert_fails(
+        &t,
+        "`items.reclassify` is M3-14's, so its row belongs under \"Reserved for M3\", not \"Reserved for M2 and M2b\"",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `projects.list` | M3-04 |",
+        "| `projects.list` | M2-11 |",
+    );
+    assert_fails(
+        &t,
+        "`projects.list` is M2-11's, so its row belongs under \"Reserved for M2 and M2b\", not \"Reserved for M3\"",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        VAULT,
+        "| 3 | `secure_enclave` | M3-08 |",
+        "| 3 | `secure_enclave` | M3 |",
+    );
+    assert_fails(
+        &t,
+        "`secure_enclave` names M3, which is not a milestone after the one \"Reserved for M3\" reserves for",
+    );
+}
+
+/// Each heading holds a registry's table once, and a table outside the two
+/// headings is refused.
+///
+/// Mutation checked: read_tables keyed by the table alone (a second table
+/// under one heading merged in): the first case passes, and this test
+/// fails.
+#[test]
+fn a_table_twice_under_one_heading_or_under_another_heading_fails() {
+    let block = "\n<!-- reservations:reason -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `spare_reason` | spare | reserved | kept free |\n<!-- /reservations -->\n";
+    let t = fixture();
+    let path = t.home().join(IPC);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}{block}")).unwrap();
+    assert_fails(
+        &t,
+        "the `reason` table appears twice under \"Reserved for M3\"",
+    );
+    let t = fixture();
+    let path = t.home().join(IPC);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}\n## Reserved for M4\n{block}")).unwrap();
+    assert_fails(
+        &t,
+        "the `reason` table is under \"Reserved for M4\", not one of the headings",
+    );
+}
+
+/// App-role methods have their own table: an `app.` name in the client
+/// table, and a client name in the app table, are malformed.
+///
+/// Mutation checked: the client table's grammar taking any method name
+/// (METHOD, as before M3-01): the first case passes, and this test fails.
+#[test]
+fn an_app_method_in_the_client_table_or_the_reverse_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `reveal.request` | M3-14 |",
+        "| `app.reveal.request` | M3-14 |",
+    );
+    assert_fails(
+        &t,
+        "`method`: `app.reveal.request` is not a well-formed name for this table",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `app.asks.decline` | M3-14 |",
+        "| `asks.decline` | M3-14 |",
+    );
+    assert_fails(
+        &t,
+        "`app_method`: `asks.decline` is not a well-formed name for this table",
+    );
+}
+
+/// The app-role methods are read from the code: an `impl Method` named
+/// `app.lock` makes its `reserved` row fail, and its `landed` row pass; an
+/// app method no row reserves fails, and so does a `landed` row the code
+/// lacks. The client table does not count an app method.
+///
+/// Mutation checked: no reader for `app_method` (`code=None`): a reserved
+/// row the code has passes, and this test fails. And code_methods keeping
+/// `app.` names: the landed `app.lock` fails the client table, and this
+/// test fails.
+#[test]
+fn app_methods_are_read_from_the_code() {
+    let t = fixture();
+    add_method(&t, "app.lock");
+    assert_fails(
+        &t,
+        "`app_method`: `app.lock` is reserved, but the code already has it",
+    );
+    let t = fixture();
+    add_method(&t, "app.lock");
+    edit(
+        &t,
+        IPC,
+        "| `app.lock` | M3-16 | reserved |",
+        "| `app.lock` | M3-16 | landed |",
+    );
+    assert_passes(&t.home());
+    let t = fixture();
+    add_method(&t, "app.unreserved");
+    assert_fails(
+        &t,
+        &format!(
+            "`app_method`: the code has `app.unreserved` ({PROTO}), which no `landed` row reserves"
+        ),
+    );
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `app.lock` | M3-16 | reserved |",
+        "| `app.lock` | M3-16 | landed |",
+    );
+    assert_fails(&t, "`app.lock` is `landed`, but the code has no such entry");
+}
+
+/// The unlocker kinds are read from `UnlockerKind`: M1's two from the
+/// baseline, kind 3 reserved until the code has it, and a kind no row
+/// reserves refused.
+///
+/// Mutation checked: no reader for `unlocker_kind` (`code=None`): a
+/// reserved kind the code has passes, and this test fails.
+#[test]
+fn unlocker_kinds_are_read_from_the_code() {
+    let t = fixture();
+    edit(
+        &t,
+        ENVELOPE,
+        "    RecoveryKit = 2,\n}",
+        "    RecoveryKit = 2,\n    SecureEnclave = 3,\n}",
+    );
+    assert_fails(
+        &t,
+        "`unlocker_kind`: `secure_enclave` is reserved, but the code already has it",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        ENVELOPE,
+        "    RecoveryKit = 2,\n}",
+        "    RecoveryKit = 2,\n    SecureEnclave = 3,\n}",
+    );
+    edit(
+        &t,
+        VAULT,
+        "| 3 | `secure_enclave` | M3-08 | reserved |",
+        "| 3 | `secure_enclave` | M3-08 | landed |",
+    );
+    assert_passes(&t.home());
+    let t = fixture();
+    edit(
+        &t,
+        ENVELOPE,
+        "    RecoveryKit = 2,\n}",
+        "    RecoveryKit = 2,\n    Device = 4,\n}",
+    );
+    assert_fails(
+        &t,
+        "the code has `device` = 4 in the reserved range with no `landed` row",
+    );
+    let t = fixture();
+    edit(&t, BASELINE, "unlocker_kind recovery_kit 2\n", "");
+    assert_fails(
+        &t,
+        "`unlocker_kind`: the code has `recovery_kit` = 2, which no `landed` row reserves",
+    );
+}
+
+/// A field nested with dots (`daemon.identity` in `status`) is read, and a
+/// malformed one is refused.
+///
+/// Mutation checked: FIELD taking any text: the empty component passes,
+/// and this test fails.
+#[test]
+fn a_dotted_field_is_read_and_a_malformed_one_fails() {
+    assert_passes(&fixture().home());
+    let t = fixture();
+    edit(
+        &t,
+        IPC,
+        "| `status` | `daemon.identity` |",
+        "| `status` | `daemon..identity` |",
+    );
+    assert_fails(
+        &t,
+        "`daemon..identity` is not a well-formed name for this table",
+    );
+}
+
+/// The M3 plan's code-owned paths (task M3-01): the macOS app, its build
+/// and signing scripts, and the pinned requirements, beside the two
+/// checks whose tables the M3 tasks take their rows from.
+///
+/// Mutation checked: the `/apps/macos/` line removed from
+/// .github/CODEOWNERS: this test fails.
+#[test]
+fn codeowners_name_an_owner_for_the_m3_paths() {
+    let text = std::fs::read_to_string(repo_root().join(".github/CODEOWNERS")).unwrap();
+    let owned: Vec<(&str, usize)> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let mut words = l.split_whitespace();
+            let pattern = words.next().unwrap();
+            (pattern, words.filter(|w| w.starts_with('@')).count())
+        })
+        .collect();
+    for want in [
+        "/apps/macos/",
+        "/scripts/macos/",
+        "/crates/envcloak-sys/src/peer_code.rs",
+        "/crates/envcloak-sys/src/peer_code/",
+        "/scripts/check-reservations.py",
+        "/scripts/check-reservations-baseline.txt",
+        "/scripts/check-spec-decisions.py",
+    ] {
+        assert!(
+            owned.iter().any(|(p, owners)| *p == want && *owners > 0),
+            "CODEOWNERS names no owner for {want}"
+        );
+    }
 }
