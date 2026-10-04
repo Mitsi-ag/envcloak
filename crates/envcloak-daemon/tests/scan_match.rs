@@ -15,6 +15,8 @@
 //! - a request that breaks the bounds is refused whole, and a frame over
 //!   1 MiB is refused before it is read;
 //! - every call is audited with counts and never a candidate;
+//! - an answer too large for a frame is audited as `frame_too_large`, and
+//!   a refused well-formed call is audited too;
 //! - `items.mark_exposed` marks, repeats change nothing, and a rotation
 //!   clears the mark.
 //!
@@ -607,8 +609,9 @@ fn spend(c: &mut Client, v: &[u8], total: usize) -> ScanMatchView {
 /// candidates are still compared, charged to `ValueChecks`, up to its
 /// 100,000, where the same happens; `import.plan`, which counts against
 /// the same `ValueChecks`, is then refused too. Every comparison is
-/// counted in the audit entries, by budget, and each refusal and each
-/// call cut short is audited as such. (That a guessable candidate never
+/// counted in the audit entries, by budget, and each refusal
+/// (`too_many_checks`) and each call cut short (`limited`) is audited as
+/// such. (That a guessable candidate never
 /// draws on `ScanChecks` while `ValueChecks` is spent and `ScanChecks` has
 /// room is the unit test `each_budget_stops_at_its_limit_and_the_other_
 /// goes_on` in src/scan_match.rs, with an injected clock.)
@@ -683,7 +686,7 @@ fn each_budget_stops_at_its_limit_and_one_spent_leaves_the_other() {
     let refused: Vec<usize> = outcomes
         .iter()
         .enumerate()
-        .filter(|(_, o)| **o == "refused")
+        .filter(|(_, o)| **o == "too_many_checks")
         .map(|(i, _)| i)
         .collect();
     assert_eq!(refused.len(), 2);
@@ -823,13 +826,17 @@ fn unknown_keys_are_reported_by_their_provider_pattern() {
 
 /// A request that breaks the bounds is refused whole (`invalid_params`):
 /// more than [`MAX_SCAN_CANDIDATES`] candidates, an empty value, one over
-/// [`MAX_CANDIDATE`] bytes, an id twice. Nothing is compared or audited for
-/// it. A frame over 1 MiB (a batch the CLI would split) is refused before
-/// its body is read (`frame_too_large`) and the connection closed. A
-/// locked vault answers `vault_locked`.
+/// [`MAX_CANDIDATE`] bytes, an id twice, a claim that names no marker.
+/// Nothing is compared or audited for it. A frame over 1 MiB (a batch the
+/// CLI would split) is refused before its body is read (`frame_too_large`)
+/// and the connection closed. A well-formed call on a locked vault answers
+/// `vault_locked` and is audited as such, with the caller's subject and
+/// nothing compared (Codex review: every well-formed call writes one
+/// entry, a refused one too).
 ///
-/// Mutation: no bound on the candidates of a call (the 4,097 are
-/// compared).
+/// Mutations: no bound on the candidates of a call (the 4,097 are
+/// compared); a refused call left unaudited (the locked call has no
+/// entry).
 #[test]
 fn requests_over_the_bounds_are_refused_whole() {
     let mut f = Fixture::new(|_, _| {});
@@ -846,6 +853,15 @@ fn requests_over_the_bounds_are_refused_whole() {
         let e = scan(&mut c, ScanPurpose::Import, &[], candidates).unwrap_err();
         assert_eq!(rpc(e), (ErrorKind::InvalidParams, None), "{n}");
     }
+    // A claim that is not a marker's name is malformed too.
+    let e = scan(
+        &mut c,
+        ScanPurpose::Import,
+        &["not a marker"],
+        copies(&long, 1, 0),
+    )
+    .unwrap_err();
+    assert_eq!(rpc(e), (ErrorKind::InvalidParams, None));
     // The largest value is taken.
     let most = vec![cand(1, &vec![b'a'; MAX_CANDIDATE], CandidateForm::Raw)];
     assert_eq!(
@@ -873,16 +889,44 @@ fn requests_over_the_bounds_are_refused_whole() {
     assert_eq!(error_kind(&answer), "frame_too_large");
     assert!(answer["id"].is_null());
     assert!(closed(&mut s));
+    // A well-formed call on a locked vault is refused and audited, its
+    // entry queued until the vault is unlocked: nothing compared.
     c.lock().unwrap();
-    let e = scan(&mut c, ScanPurpose::Import, &[], copies(&long, 1, 0)).unwrap_err();
+    let e = scan(&mut c, ScanPurpose::Doctor, &[AGENT], copies(&long, 3, 0)).unwrap_err();
     assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
+    c.unlock(passphrase(&f.cs), &[]).unwrap();
     drop(c);
     let v = f.stop_and_open();
     let (entries, _) = v.read_audit().unwrap();
-    // The one call answered is the only one audited.
+    // The call answered and the call refused on the locked vault are
+    // audited, and nothing malformed is.
     let scans = scan_entries(&entries);
-    assert_eq!(scans.len(), 1);
+    let outcomes: Vec<(&str, &str, u64)> = scans
+        .iter()
+        .map(|s| (s.0.as_str(), s.1.as_str(), s.2))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [("checked", "import", 1), ("vault_locked", "doctor", 0)]
+    );
     assert_eq!(named(&scans[0].3, "candidates_transcript"), 1);
+    let locked = &scans[1].3;
+    assert_eq!(named(locked, "candidates_transcript"), 3);
+    for n in [
+        "compared_guessable",
+        "compared_other",
+        "matches",
+        "patterns",
+    ] {
+        assert_eq!(named(locked, n), 0, "{n}");
+    }
+    // Its subject is the caller's, read before the vault's lock was.
+    let refused = entries
+        .iter()
+        .filter(|e| e.record.kind == AuditKind::ScanMatch)
+        .nth(1)
+        .unwrap();
+    assert_eq!(refused.record.subject.kind.as_deref(), Some("agent"));
     f.sweep_with(&entries);
 }
 
@@ -1044,6 +1088,82 @@ fn marking_exposed_items_is_idempotent_and_rotation_clears_it() {
                 1
             ),
         ]
+    );
+    f.sweep_with(&entries);
+}
+
+/// An answer too large for one frame (a value many items hold, sent under
+/// many ids) is refused `frame_too_large`, and its audit entry says so,
+/// with the comparisons it counted, never that the matches were answered
+/// (L-08; F-77's order: the answer is framed before the entry is
+/// written). A smaller batch of the same value is answered and audited
+/// `checked`.
+///
+/// Mutation: an answer too large for its frame recorded as answered (the
+/// entry says `checked`).
+#[test]
+fn an_answer_too_large_for_a_frame_is_audited_as_such() {
+    const HOLDERS: usize = 6;
+    let same = word(32);
+    let held = same.clone();
+    let mut f = Fixture::new(move |v, cs| {
+        cs.push(Canary::new("HELD_BY_MANY", held.clone()));
+        v.transact(|t| {
+            for i in 0..HOLDERS {
+                let id = t.create_item(NewItem {
+                    class: ItemClass::Secret,
+                    slug: Slug::new(&format!(
+                        "same-value/holder-{i}-of-many-items-that-hold-one-value"
+                    ))
+                    .unwrap(),
+                    details: ItemDetails::default(),
+                })?;
+                t.add_field(
+                    id,
+                    FieldName::new("value").unwrap(),
+                    SecretBytes::copy_from(held.as_bytes()),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    });
+    f.keep("SAME", &same);
+    let mut c = client(&f.home);
+    let e = scan(
+        &mut c,
+        ScanPurpose::Doctor,
+        &[],
+        copies(same.as_bytes(), MAX_SCAN_CANDIDATES, 0),
+    )
+    .unwrap_err();
+    assert_eq!(rpc(e).0, ErrorKind::FrameTooLarge);
+    let a = scan(
+        &mut c,
+        ScanPurpose::Doctor,
+        &[],
+        copies(same.as_bytes(), 100, 0),
+    )
+    .unwrap();
+    assert_eq!((a.compared, a.matches.len()), (100, 100 * HOLDERS));
+    drop(c);
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    let scans = scan_entries(&entries);
+    let outcomes: Vec<(&str, u64)> = scans.iter().map(|s| (s.0.as_str(), s.2)).collect();
+    assert_eq!(
+        outcomes,
+        [
+            (
+                "frame_too_large",
+                u64::try_from(MAX_SCAN_CANDIDATES).unwrap()
+            ),
+            ("checked", 100)
+        ]
+    );
+    assert_eq!(
+        named(&scans[0].3, "matches"),
+        u64::try_from(MAX_SCAN_CANDIDATES * HOLDERS).unwrap()
     );
     f.sweep_with(&entries);
 }
