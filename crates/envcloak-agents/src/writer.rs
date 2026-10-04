@@ -1357,9 +1357,19 @@ fn remove_file(
     injected(|| remove_checked_at(root, name, expect, at))
 }
 
-/// The state's key for a path.
+/// The state's key for a path: its directories resolved, so one file is
+/// one key however it is reached (`HOME` through a symlink or not; the
+/// class of Codex's finding that a registration was keyed by something
+/// other than the file it is in). A directory that does not exist yet is
+/// kept as written.
 pub fn key(path: &Path) -> String {
-    String::from_utf8_lossy(path.as_os_str().as_bytes()).into_owned()
+    let resolved = match (path.parent(), path.file_name()) {
+        (Some(d), Some(n)) => {
+            std::fs::canonicalize(d).map_or_else(|_| path.to_path_buf(), |d| d.join(n))
+        }
+        _ => path.to_path_buf(),
+    };
+    String::from_utf8_lossy(resolved.as_os_str().as_bytes()).into_owned()
 }
 
 #[cfg(test)]
@@ -2017,8 +2027,10 @@ mod tests {
     /// this fails.
     #[test]
     fn what_a_stopped_write_left_is_removed_by_the_next_run() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let p = dir.path().join("settings.json");
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        // Its directories resolved, as the state names the files beside it.
+        let dir = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+        let p = dir.join("settings.json");
         let key_text = canary(0x5eed);
         let before = format!("{{\"env\": {{\"K\": \"{key_text}\"}}}}\n").into_bytes();
         std::fs::write(&p, &before).unwrap_or_else(|e| panic!("{e}"));
@@ -2049,24 +2061,24 @@ mod tests {
         // The run stopped with the old contents swapped out and the new
         // ones staged: the file itself as it was.
         std::fs::write(&p, &before).unwrap_or_else(|e| panic!("{e}"));
-        let staged = temp(dir.path(), "settings.json", "new", "0123456789abcdef");
-        let old = temp(dir.path(), "settings.json", "swap", "fedcba9876543210");
+        let staged = temp(dir.as_path(), "settings.json", "new", "0123456789abcdef");
+        let old = temp(dir.as_path(), "settings.json", "swap", "fedcba9876543210");
         std::fs::write(&staged, &after).unwrap_or_else(|e| panic!("{e}"));
         std::fs::write(&old, &before).unwrap_or_else(|e| panic!("{e}"));
         // Another write stopped part way: the new contents' first bytes,
         // the key's half included; and one stopped before its first byte.
         let cut = before.len() - 10;
-        let part = temp(dir.path(), "settings.json", "new", "00000000000000aa");
+        let part = temp(dir.as_path(), "settings.json", "new", "00000000000000aa");
         std::fs::write(&part, &after[..cut]).unwrap_or_else(|e| panic!("{e}"));
-        let empty = temp(dir.path(), "settings.json", "new", "00000000000000bb");
+        let empty = temp(dir.as_path(), "settings.json", "new", "00000000000000bb");
         std::fs::write(&empty, b"").unwrap_or_else(|e| panic!("{e}"));
-        let theirs = temp(dir.path(), "settings.json", "new", "1111111111111111");
+        let theirs = temp(dir.as_path(), "settings.json", "new", "1111111111111111");
         std::fs::write(&theirs, b"not EnvCloak's").unwrap_or_else(|e| panic!("{e}"));
         // The first bytes of something else, under a name of the shape
         // a whole file is moved to: not shown to be EnvCloak's.
-        let moved_part = temp(dir.path(), "settings.json", "swap", "00000000000000cc");
+        let moved_part = temp(dir.as_path(), "settings.json", "swap", "00000000000000cc");
         std::fs::write(&moved_part, &after[..cut]).unwrap_or_else(|e| panic!("{e}"));
-        let odd = dir.path().join(".settings.json.envcloak-new-xyz.tmp");
+        let odd = dir.as_path().join(".settings.json.envcloak-new-xyz.tmp");
         std::fs::write(&odd, &after).unwrap_or_else(|e| panic!("{e}"));
         let mut state = on_disk;
         assert!(state.leftovers.contains_key(&key(&p)));
@@ -2104,7 +2116,7 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap_or_default(), after);
         // Nothing else holds the key beside the file but the person's own
         // file of another shape.
-        let mut names: Vec<PathBuf> = std::fs::read_dir(dir.path())
+        let mut names: Vec<PathBuf> = std::fs::read_dir(dir.as_path())
             .unwrap_or_else(|e| panic!("{e}"))
             .flatten()
             .map(|e| e.path())
@@ -2114,6 +2126,35 @@ mod tests {
         want.sort();
         assert_eq!(names, want);
         assert!(String::from_utf8_lossy(&after).contains(&key_text));
+    }
+
+    /// The class of Codex's finding (a registration's owner keyed by
+    /// something other than its file): one file is one key, reached
+    /// through a symlinked directory or not; a directory not there yet is
+    /// kept as written.
+    ///
+    /// Mutation checked: `key` without resolving the directories (the
+    /// previous path as given): the two spellings are two keys and this
+    /// fails.
+    #[test]
+    fn one_file_is_one_key_however_it_is_reached() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let real = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::create_dir(real.join("home")).unwrap_or_else(|e| panic!("{e}"));
+        std::os::unix::fs::symlink(real.join("home"), real.join("link"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            key(&real.join("link/.claude.json")),
+            key(&real.join("home/.claude.json"))
+        );
+        assert_eq!(
+            key(&real.join("home/.claude.json")),
+            real.join("home/.claude.json").to_string_lossy()
+        );
+        assert_eq!(
+            key(&real.join("absent/x.json")),
+            real.join("absent/x.json").to_string_lossy()
+        );
     }
 
     /// A save of the state stopped part way leaves its new contents under a
