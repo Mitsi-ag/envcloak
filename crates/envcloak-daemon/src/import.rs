@@ -676,32 +676,40 @@ fn plan(shared: &Shared, v: &Vault, input: &Input, person: bool) -> Result<Plan,
         .iter()
         .map(|e| compare(shared, e.name.as_str(), &e.value, person).map(|()| v.value_key(&e.value)))
         .collect();
-    let namers = namers(input, &keys);
-    let mut fates = Vec::with_capacity(input.entries.len());
-    let mut items: Vec<PlannedItem> = Vec::new();
+    // The items, made in their namers' order: the values a project holds,
+    // by the first project entry that holds each, then the values only the
+    // machine holds, by the first entry. A slug and its number then depend
+    // on the order within each scope only, never on how project and
+    // machine entries are interleaved (verifier review).
+    let mut order: Vec<(usize, ValueKey)> = namers(input, &keys)
+        .into_iter()
+        .map(|(key, namer)| (namer, key))
+        .collect();
+    order.sort_by_key(|(namer, _)| {
+        (
+            matches!(input.entries[*namer].scope, Scope::Machine(_)),
+            *namer,
+        )
+    });
+    let mut items: Vec<PlannedItem> = Vec::with_capacity(order.len());
     let mut by_key: BTreeMap<ValueKey, usize> = BTreeMap::new();
     let mut taken = BTreeSet::new();
+    for (namer, key) in order {
+        items.push(new_item(
+            shared, v, &secrets, &mut taken, input, namer, key,
+        )?);
+        by_key.insert(key, items.len() - 1);
+    }
+    let mut fates = Vec::with_capacity(input.entries.len());
     for (e, key) in input.entries.iter().zip(&keys) {
         let key = match key {
-            Ok(key) => *key,
+            Ok(key) => key,
             Err(r) => {
                 fates.push(Fate::Skip(*r));
                 continue;
             }
         };
-        let at = match by_key.get(&key) {
-            Some(&at) => at,
-            None => {
-                let namer = namers
-                    .get(&key)
-                    .copied()
-                    .ok_or(RpcError::new(ErrorKind::Internal))?;
-                let item = new_item(shared, v, &secrets, &mut taken, input, namer, key)?;
-                items.push(item);
-                by_key.insert(key, items.len() - 1);
-                items.len() - 1
-            }
-        };
+        let at = *by_key.get(key).ok_or(RpcError::new(ErrorKind::Internal))?;
         items[at].entries += 1;
         // A machine entry adopts no project.
         if let Scope::Project(project) = e.scope {
