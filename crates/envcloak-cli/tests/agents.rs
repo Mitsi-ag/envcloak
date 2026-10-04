@@ -37,14 +37,20 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
 use common::{
-    cli, cli_command, data_dir, finish_within, outside_dir, python3, run_on_terminal, secret_file,
-    seed_vault, start_daemon, stderr, stdout,
+    cli, cli_command, data_dir, outside_dir, python3, run_on_terminal, secret_file, seed_vault,
+    start_daemon, stderr, stdout,
 };
 use envcloak_agents::blocks;
 use envcloak_agents::hosts::claude::{READ_DENY, TOOL_MATCHER};
 use envcloak_agents::hosts::codex::RULES;
 use envcloak_core::file_backup_v2::list_file_backups_v2;
 use envcloak_core::vault::VaultPaths;
+// The processes these tests start lead a process group of their own, and
+// their exit and output are each waited for within a limit (the class of
+// Codex F-127: `common::finish_within` reads the output to its end without
+// a bound once the process has exited, so a process it left behind holding
+// the output would hang the test).
+use envcloak_testkit::agents::finish_within;
 use envcloak_testkit::{
     Canary, Daemon, TEST_PATH, TestHome, assert_no_canary, by_label, canaries, daemon_socket,
     fresh_seed, labels, sweep_dir,
@@ -2372,15 +2378,40 @@ fn linux_traced_agents_commands_read_no_config() {
         } else {
             cmd.spawn().unwrap()
         };
+        // Its output is read as it comes, and waited for within a bound
+        // once it has exited (a process it left behind may hold it).
+        let reader = |s: Option<Box<dyn std::io::Read + Send>>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                if let Some(mut s) = s {
+                    let _ = std::io::Read::read_to_end(&mut s, &mut b);
+                }
+                let _ = tx.send(b);
+            });
+            rx
+        };
+        let out_rx = reader(
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        );
+        let err_rx = reader(
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        );
         // Bounded: a traced run that goes on (the regression this test is
         // for) stops at its first signal (its child's exit), which nobody
         // continues, and this process, its tracer, is told of the stop: it
         // is killed then, or at the limit, and the test fails instead of
         // hanging.
         let start = std::time::Instant::now();
-        loop {
+        let status = loop {
             match child.try_wait().unwrap() {
-                Some(st) if st.stopped_signal().is_none() => break,
+                Some(st) if st.stopped_signal().is_none() => break st,
                 Some(_) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -2393,8 +2424,18 @@ fn linux_traced_agents_commands_read_no_config() {
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
-        }
-        let out = child.wait_with_output().unwrap();
+        };
+        let drained = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| {
+                    panic!("{args:?} (traced: {traced}): its output was held open after it exited")
+                })
+        };
+        let out = Output {
+            status,
+            stdout: drained(out_rx),
+            stderr: drained(err_rx),
+        };
         for cs in [&f.cs[..], std::slice::from_ref(&lit)] {
             assert_no_canary(&out.stdout, cs);
             assert_no_canary(&out.stderr, cs);

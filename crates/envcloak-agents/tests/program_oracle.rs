@@ -38,12 +38,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use envcloak_agents::hook::shell::{check_argv, check_script};
+use envcloak_testkit::agents::finish_capped;
 
 struct Rng(u64);
 
@@ -94,8 +94,20 @@ fn installed(candidates: &[&str]) -> Vec<PathBuf> {
     out
 }
 
+/// How long a tool may take, its output read to the end included.
+const LIMIT: Duration = Duration::from_secs(10);
+/// The most of each output stream a run keeps; more fails the oracle.
+const CAP: usize = 1 << 20;
+
 /// What `argv` prints (standard output and error), run with no shell in
-/// `dir` with only `env` in its environment, within 10 seconds.
+/// `dir` with only `env` in its environment. Every wait is bounded (Codex
+/// F-127: the output was read to its end before the clock started, and a
+/// run past its limit gave what it had printed as if it had ended): the
+/// tool leads a process group of its own, its exit is waited for within
+/// [`LIMIT`] of its start and its output read meanwhile, what is left of
+/// its group is killed, and a run past the limit, output not read to its
+/// end or more than [`CAP`] fails the oracle
+/// (`envcloak_testkit::agents::finish_capped`).
 fn run(argv: &[String], dir: &Path, env: &[(&str, &str)]) -> Vec<u8> {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -110,30 +122,10 @@ fn run(argv: &[String], dir: &Path, env: &[(&str, &str)]) -> Vec<u8> {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().unwrap();
-    let mut out = Vec::new();
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let reader = std::thread::spawn(move || {
-        let mut e = Vec::new();
-        let _ = stderr.read_to_end(&mut e);
-        e
-    });
-    let _ = stdout.read_to_end(&mut out);
-    let start = Instant::now();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            let _ = child.kill();
-            let _ = child.wait();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    out.extend(reader.join().unwrap());
-    out
+    let out = finish_capped(cmd, LIMIT, CAP);
+    let mut printed = out.stdout;
+    printed.extend(out.stderr);
+    printed
 }
 
 fn holds(out: &[u8], needle: &str) -> bool {
@@ -353,13 +345,23 @@ fn every_program_that_reaches_a_secret_is_not_allowed() {
     let jqs = installed(&["/usr/bin/jq", "/opt/homebrew/bin/jq", "/usr/local/bin/jq"]);
     let yqs = installed(&["/usr/bin/yq", "/opt/homebrew/bin/yq", "/usr/local/bin/yq"]);
     // Only mikefarah's yq has `load`; the Python wrapper of jq does not.
+    // Asked as each tool is run (Codex F-127: the version probe waited
+    // without a bound, in this test's environment).
+    let probe_home = tempfile::tempdir().unwrap();
     let yqs: Vec<PathBuf> = yqs
         .into_iter()
         .filter(|y| {
-            Command::new(y)
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| holds(&o.stdout, "mikefarah"))
+            let mut cmd = Command::new(y);
+            cmd.arg("--version")
+                .current_dir(probe_home.path())
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("HOME", probe_home.path())
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            holds(&finish_capped(cmd, LIMIT, CAP).stdout, "mikefarah")
         })
         .collect();
     if let Ok(want) = std::env::var("ENVCLOAK_TEST_REQUIRE_TOOLS") {

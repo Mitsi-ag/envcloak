@@ -34,12 +34,20 @@
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use envcloak_agents::hook::shell::{Class, RG_ENV_TYPES, check_script};
 use envcloak_agents::hook::{Decision, Event, Host, Reason, decide, decide_argv, names_env_file};
 use envcloak_core::SecretBuf;
+use envcloak_testkit::agents::finish_capped;
 use serde_json::json;
+
+/// How long ripgrep may take, its output read to the end included (Codex
+/// F-127's class: no wait for a tool the oracle runs is without a bound).
+const LIMIT: Duration = Duration::from_secs(30);
+/// The most of each output stream a run keeps; more fails the oracle.
+const CAP: usize = 4 << 20;
 
 /// ripgrep on `PATH`, or `None` (and the test passes) when it is not
 /// there and not required.
@@ -92,15 +100,17 @@ fn rg_files(rg: &Path, files: &[&str], args: &[String]) -> Vec<String> {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, b"").unwrap();
     }
-    let out = Command::new(rg)
-        .current_dir(dir.path())
+    let mut cmd = Command::new(rg);
+    cmd.current_dir(dir.path())
         .env_clear()
         .env("HOME", dir.path())
         .args(["--files", "--hidden", "--no-ignore", "--no-config"])
         .args(args)
         .arg(".")
-        .output()
-        .unwrap();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = finish_capped(cmd, LIMIT, CAP);
     assert!(
         out.status.code().is_some_and(|c| c <= 1),
         "rg failed on {args:?}: {}",
@@ -244,11 +254,13 @@ fn the_hook_stops_exactly_the_globs_ripgrep_reads_an_env_file_with() {
 
 /// The installed ripgrep's major version.
 fn rg_major(rg: &Path) -> (u32, String) {
-    let out = Command::new(rg)
-        .arg("--version")
+    let mut cmd = Command::new(rg);
+    cmd.arg("--version")
         .env_clear()
-        .output()
-        .unwrap();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = finish_capped(cmd, LIMIT, CAP);
     let line = String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()
@@ -284,11 +296,13 @@ fn ripgreps_own_types_that_hold_env_files_are_the_hooks() {
         return;
     };
     let (major, version) = rg_major(&rg);
-    let out = Command::new(&rg)
-        .args(["--no-config", "--type-list"])
+    let mut cmd = Command::new(&rg);
+    cmd.args(["--no-config", "--type-list"])
         .env_clear()
-        .output()
-        .unwrap();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = finish_capped(cmd, LIMIT, CAP);
     assert!(out.status.success());
     let list = String::from_utf8(out.stdout).unwrap();
     let prefix = env_prefix();
