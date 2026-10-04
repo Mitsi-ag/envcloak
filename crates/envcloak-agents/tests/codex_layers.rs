@@ -215,8 +215,9 @@ fn every_other_layer_is_read_before_the_socket_allowance_is_written() {
 }
 
 /// `git <args>` in `dir`, with a cleared environment and no user or system
-/// configuration, within a bound (`finish_capped`); it must succeed.
-fn git(dir: &Path, args: &[&str]) {
+/// configuration, within a bound (`finish_capped`); it must succeed, and
+/// what it printed is returned.
+fn git(dir: &Path, args: &[&str]) -> String {
     let mut cmd = Command::new("git");
     cmd.args([
         "-c",
@@ -244,6 +245,46 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// A repository at `main` whose git directory is elsewhere, with a linked
+/// worktree at `wt` (both made by git): `separate` puts it beside the
+/// checkout (`git init --separate-git-dir`, `main/.git` a file naming
+/// it); otherwise `main/.bare` is a bare repository and `main/.git` the
+/// pointer `gitdir: ./.bare`, the layout worktree workflows use. Returns
+/// the git directory.
+fn elsewhere_git_dir(root: &Path, main: &Path, wt: &Path, separate: bool) -> PathBuf {
+    std::fs::create_dir_all(main).unwrap();
+    if separate {
+        let gd = root.join("gitdata");
+        git(
+            main,
+            &["init", "-q", "--separate-git-dir", gd.to_str().unwrap()],
+        );
+        git(main, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        git(main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        gd
+    } else {
+        git(main, &["init", "-q", "--bare", ".bare"]);
+        std::fs::write(main.join(".git"), "gitdir: ./.bare\n").unwrap();
+        let tree = git(main, &["mktree"]);
+        let commit = git(main, &["commit-tree", tree.trim(), "-m", "start"]);
+        git(main, &["update-ref", "refs/heads/main", commit.trim()]);
+        git(
+            main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "w",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        main.join(".bare")
+    }
 }
 
 /// The verifier's round-6 finding (Codex F-128) and its class: a folder
@@ -393,6 +434,220 @@ fn linked_folders_worktrees_and_profiles_are_read_as_codex_reads_them() {
     .unwrap();
     expect("a device profile through a link", &fx, &unknown);
 
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+/// The verifier's round-7 finding (low): a repository whose `.git` is a
+/// file naming its git directory elsewhere has its worktrees registered
+/// there, and the pinned Codex trusts them through the main checkout
+/// (`trust.rs` reads the pointer). Two layouts made by git: a separate git
+/// directory (`git init --separate-git-dir`) and a bare repository with a
+/// `gitdir: ./.bare` pointer; in each, the worktree outside the checkout
+/// holding a domain rule is present, and without the rule it fits.
+///
+/// Mutation checked: the pointer not followed in `linked_worktrees`
+/// (`(!t.is_empty() && false).then(..)`): both present cases fit and this
+/// fails.
+#[test]
+fn a_git_directory_named_by_a_pointer_has_its_worktrees_read() {
+    let mut misses: Vec<String> = Vec::new();
+    for separate in [true, false] {
+        for rule in [true, false] {
+            let fx = Fx::new();
+            let main = fx.root.join("work/main");
+            let wt = fx.root.join("trees/wt");
+            let gd = elsewhere_git_dir(&fx.root, &main, &wt, separate);
+            assert!(std::fs::metadata(main.join(".git")).unwrap().is_file());
+            assert!(gd.join("worktrees").is_dir(), "{}", gd.display());
+            if rule {
+                fx.write("trees/wt/.codex/config.toml", RULE);
+            }
+            fx.trust(&main, "");
+            let want = rule.then(|| "network_settings_present".to_owned());
+            let got = refusal(&fx.locations());
+            if got != want {
+                misses.push(format!(
+                    "separate {separate}, rule {rule}: {got:?}, not {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(misses.is_empty(), "{misses:#?}");
+}
+
+/// The verifier's round-7 finding (low) and its class: every place whose
+/// failure to be read withholds the socket allowance
+/// (`network_settings_unknown`), each tested, where before only an
+/// unlistable folder of a trusted project was:
+///
+/// - the managed preferences, searchable and not listable, and a user
+///   folder in them that cannot be searched;
+/// - Codex's directory, searchable and not listable (its profile files);
+/// - a separate git directory's `worktrees`, not listable; a worktree's
+///   entry there that cannot be searched; its `gitdir` file that cannot be
+///   opened; a checkout's `.git` that is a link to itself;
+/// - a layer in a directory that cannot be searched, a layer that is a
+///   folder, one larger than EnvCloak reads, one that cannot be opened,
+///   one that is not UTF-8, and the user's `config.toml` that is not TOML;
+/// - a folder of a trusted project that can be listed and not searched.
+///
+/// Skipped as root, where permissions do not hold. Mutations checked, each
+/// failing here for its case: the preferences' listing error read as no
+/// entries (`codex_managed_preferences`); a user folder's error read as
+/// absent (`exists`); Codex's directory's listing error read as no
+/// profiles (`codex_profile_configs`); the registry's listing error, the
+/// entry's error and the `gitdir` file's open error read as no worktree;
+/// `.git`'s error read as no repository (`linked_worktrees`); a layer's
+/// `metadata`, `open` and UTF-8 errors read as absent (`read_layer`); the
+/// user's unreadable file read as no opt-out (`symlinked_home_allowed`);
+/// a folder's `metadata` error skipped (`walk`).
+#[test]
+fn every_place_that_cannot_be_read_withholds_the_allowance() {
+    use std::fs::Permissions;
+    let unknown = Some("network_settings_unknown".to_owned());
+    let misses: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    // Whether permissions hold for this process (not as root).
+    let probe = Fx::new();
+    let locked = probe.root.join("work/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+    let held = std::fs::read_dir(&locked).is_err();
+    std::fs::set_permissions(&locked, Permissions::from_mode(0o700)).unwrap();
+    if !held {
+        eprintln!("skipped: permissions do not hold for this process (root)");
+        return;
+    }
+    // `mode` on `path` while the check runs, then back to `0o700` (or
+    // `0o600` for a file).
+    let case = |name: &str, fx: &Fx, path: &Path, mode: u32| {
+        let file = std::fs::metadata(path).unwrap().is_file();
+        std::fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
+        let got = refusal(&fx.locations());
+        let back = if file { 0o600 } else { 0o700 };
+        std::fs::set_permissions(path, Permissions::from_mode(back)).unwrap();
+        if got != unknown {
+            misses.borrow_mut().push(format!("{name}: {got:?}"));
+        }
+    };
+
+    let fx = Fx::new();
+    case(
+        "the managed preferences not listable",
+        &fx,
+        &fx.root.join("prefs"),
+        0o300,
+    );
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.root.join("prefs/someone")).unwrap();
+    case(
+        "a user folder in the managed preferences not searchable",
+        &fx,
+        &fx.root.join("prefs/someone"),
+        0o000,
+    );
+    let fx = Fx::new();
+    case(
+        "Codex's directory not listable",
+        &fx,
+        &fx.root.join("home/.codex"),
+        0o300,
+    );
+
+    // A separate git directory, outside the trusted checkout (so the
+    // checkout's own walk does not meet it).
+    let fx = Fx::new();
+    let main = fx.root.join("work/main");
+    let wt = fx.root.join("trees/wt");
+    let gd = elsewhere_git_dir(&fx.root, &main, &wt, true);
+    fx.write("trees/wt/.codex/config.toml", RULE);
+    fx.trust(&main, "");
+    case(
+        "a separate git directory's worktrees not listable",
+        &fx,
+        &gd.join("worktrees"),
+        0o300,
+    );
+    case(
+        "a worktree's entry not searchable",
+        &fx,
+        &gd.join("worktrees/wt"),
+        0o000,
+    );
+    case(
+        "a worktree's gitdir file not readable",
+        &fx,
+        &gd.join("worktrees/wt/gitdir"),
+        0o000,
+    );
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.root.join("work/p")).unwrap();
+    std::os::unix::fs::symlink(fx.root.join("work/p/.git"), fx.root.join("work/p/.git")).unwrap();
+    fx.trust(&fx.root.join("work/p"), "");
+    if refusal(&fx.locations()) != unknown {
+        misses
+            .borrow_mut()
+            .push("a .git that is a link to itself".to_owned());
+    }
+
+    // Layers.
+    let fx = Fx::new();
+    fx.write("etc-codex/config.toml", "model = \"m\"\n");
+    case(
+        "the system directory not searchable",
+        &fx,
+        &fx.root.join("etc-codex"),
+        0o000,
+    );
+    case(
+        "a layer that cannot be opened",
+        &fx,
+        &fx.root.join("etc-codex/config.toml"),
+        0o000,
+    );
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.root.join("etc-codex/config.toml")).unwrap();
+    if refusal(&fx.locations()) != unknown {
+        misses
+            .borrow_mut()
+            .push("a layer that is a folder".to_owned());
+    }
+    let fx = Fx::new();
+    let mut big = "model = \"m\"\n".to_owned();
+    big.push_str(&"#".repeat(1024 * 1024));
+    fx.write("etc-codex/managed_config.toml", &big);
+    if refusal(&fx.locations()) != unknown {
+        misses
+            .borrow_mut()
+            .push("a layer larger than EnvCloak reads".to_owned());
+    }
+    let fx = Fx::new();
+    let p = fx.root.join("etc-codex/requirements.toml");
+    std::fs::write(&p, b"model = \"\xff\"\n").unwrap();
+    if refusal(&fx.locations()) != unknown {
+        misses
+            .borrow_mut()
+            .push("a layer that is not UTF-8".to_owned());
+    }
+    let fx = Fx::new();
+    fx.write("home/.codex/config.toml", "not = = toml\n");
+    if refusal(&fx.locations()) != unknown {
+        misses
+            .borrow_mut()
+            .push("the user's config.toml not TOML".to_owned());
+    }
+
+    // A folder of a trusted project listed and not searched.
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.root.join("work/p/s/in")).unwrap();
+    fx.trust(&fx.root.join("work/p"), "");
+    case(
+        "a folder that can be listed and not searched",
+        &fx,
+        &fx.root.join("work/p/s"),
+        0o400,
+    );
+
+    let misses = misses.into_inner();
     assert!(misses.is_empty(), "{misses:#?}");
 }
 
