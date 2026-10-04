@@ -63,7 +63,6 @@
 //! Nothing here keeps or returns text from the command: the result is a
 //! class.
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
@@ -225,10 +224,11 @@ impl<'a> Cur<'a> {
 struct Analyzer {
     cmds: Vec<Cmd>,
     pending: Vec<Pending>,
-    /// Here-document bodies read, by the id of the command they feed
-    /// (looked up once per command, so many bodies cost no more than one
-    /// pass: Codex review).
-    bodies: HashMap<usize, Vec<Body>>,
+    /// Here-document bodies read, at the id of the command they feed
+    /// (taken once per command, so many bodies cost no more than one pass:
+    /// Codex review; ids are dense, so a vector, with no hashing, keeps a
+    /// payload of many here-documents within the hook's deadline).
+    bodies: Vec<Vec<Body>>,
     found: Vec<Class>,
     /// A command that changes how globs are read (bash's `shopt`, zsh's
     /// `setopt`, `set -o`, `emulate`, `GLOBIGNORE`, `BASHOPTS`, a shell
@@ -277,7 +277,7 @@ impl Analyzer {
         Analyzer {
             cmds: Vec::new(),
             pending: Vec::new(),
-            bodies: HashMap::new(),
+            bodies: Vec::new(),
             found: Vec::new(),
             glob_options: false,
             reader_globs: false,
@@ -450,7 +450,7 @@ impl Analyzer {
                 Some(b'<' | b'>') => self.redirection(c, &mut cmd, depth)?,
                 Some(_) => {
                     let w = self.word(c, depth)?;
-                    if is_fd_prefix(&w) && matches!(c.peek(), Some(b'<' | b'>')) {
+                    if matches!(c.peek(), Some(b'<' | b'>')) && is_fd_prefix(&w) {
                         self.redirection(c, &mut cmd, depth)?;
                         continue;
                     }
@@ -564,7 +564,7 @@ impl Analyzer {
                 // A shell reads it as its script (`sh <<< 'cmd'`).
                 let mut body = joined(std::slice::from_ref(&target));
                 body.push(b'\n');
-                self.bodies.entry(cmd.id).or_default().push((body, true));
+                self.add_body(cmd.id, (body, true));
             }
             Op::HereDoc { strip } => {
                 let delim = literal(&target).ok_or(Amb)?;
@@ -620,7 +620,7 @@ impl Analyzer {
             if !p.quoted {
                 self.body_expansions(&body, p.depth)?;
             }
-            self.bodies.entry(p.cmd).or_default().push((body, p.quoted));
+            self.add_body(p.cmd, (body, p.quoted));
         }
         Ok(())
     }
@@ -1073,6 +1073,15 @@ impl Analyzer {
         }
     }
 
+    /// Keeps a here-document's or here-string's body for the command with
+    /// id `cmd`.
+    fn add_body(&mut self, cmd: usize, body: Body) {
+        if self.bodies.len() <= cmd {
+            self.bodies.resize_with(cmd + 1, Vec::new);
+        }
+        self.bodies[cmd].push(body);
+    }
+
     /// Looks at every command read, and at what they run (commands found
     /// on the way are read in turn). Each command and its bodies are taken
     /// once, by its id.
@@ -1081,7 +1090,11 @@ impl Analyzer {
         while i < self.cmds.len() {
             self.tick(1)?;
             let mut cmd = std::mem::take(&mut self.cmds[i]);
-            let bodies = self.bodies.remove(&cmd.id).unwrap_or_default();
+            let bodies = self
+                .bodies
+                .get_mut(cmd.id)
+                .map(std::mem::take)
+                .unwrap_or_default();
             let r = self.classify(&cmd, &bodies);
             cmd.wipe();
             r?;
@@ -2632,23 +2645,23 @@ fn known_command(name: &[u8]) -> bool {
 /// relative path into `/proc` from elsewhere is not seen (docs/
 /// INSTALLERS.md).
 fn environ_tri(w: &[Ch]) -> Tri {
-    let comps: Vec<&[Ch]> = w
-        .split(|ch| matches!(ch, Ch::Lit { b: b'/', .. }))
-        .collect();
-    let Some((last, before)) = comps.split_last() else {
-        return Tri::Not;
-    };
+    let is_slash = |ch: &Ch| matches!(ch, Ch::Lit { b: b'/', .. });
+    // The last component first, with nothing collected: almost every word
+    // a command is given cannot be `environ` (a payload of many commands
+    // is read within the hook's deadline).
+    let start = w.iter().rposition(is_slash).map_or(0, |p| p + 1);
+    let last = &w[start..];
     if !glob::component_may_match(last, b"environ") {
         return Tri::Not;
     }
-    let unknown = |c: &&[Ch]| c.contains(&Ch::Unknown);
-    if before
-        .iter()
-        .any(|c| !c.is_empty() && !unknown(c) && glob::component_may_match(c, b"proc"))
-    {
+    // The components before it (one empty one when there is no `/`, which
+    // changes nothing below).
+    let before = || w[..start.saturating_sub(1)].split(is_slash);
+    let unknown = |c: &[Ch]| c.contains(&Ch::Unknown);
+    if before().any(|c| !c.is_empty() && !unknown(c) && glob::component_may_match(c, b"proc")) {
         return Tri::Is;
     }
-    if unknown(last) || before.iter().any(unknown) {
+    if unknown(last) || before().any(unknown) {
         Tri::Maybe
     } else {
         Tri::Not

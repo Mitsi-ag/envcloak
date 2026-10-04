@@ -483,6 +483,19 @@ fn matches_a_name(toks: &[Tok], spelled: bool) -> bool {
 /// byte, a stretch only known when the command runs any text) may be
 /// `target` (in lower case), in any case.
 pub(super) fn component_may_match(c: &[Ch], target: &[u8]) -> bool {
+    // Plain text (no wildcard, class or escape read below, no stretch only
+    // known when it runs) is compared as it is, with nothing allocated: the
+    // reader asks this of every word a command is given.
+    let plain = c.iter().all(|ch| match ch {
+        Ch::Lit { b, quoted } => *quoted || !matches!(b, b'*' | b'?' | b'[' | b'\\'),
+        Ch::Unknown => false,
+    });
+    if plain {
+        return c.len() == target.len()
+            && c.iter()
+                .zip(target)
+                .all(|(ch, t)| matches!(ch, Ch::Lit { b, .. } if b.to_ascii_lowercase() == *t));
+    }
     let mut pat: Zeroizing<Vec<Option<u8>>> = Zeroizing::new(Vec::with_capacity(c.len() * 2));
     for ch in c {
         match ch {
