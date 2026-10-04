@@ -548,10 +548,11 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
         hp.notes.push(note(
             "socket_allowance_scope",
             "the socket allowance is limited to EnvCloak's socket for the Codex settings there now \
-             (the system and managed files, your profiles, and each project you trust, looked \
-             through); a project you trust later, a .codex/config.toml added later or a -c flag \
-             with network settings of its own can widen it, as any Codex setting can: `agents \
-             install` checks again each time it runs",
+             (the system and managed files, your profiles, and the .codex/config.toml files of \
+             each project you trust and its git worktrees, in every folder of them and above \
+             them); a project you trust later, a worktree or a .codex/config.toml added later, or \
+             a -c flag with network settings of its own can widen it, as any Codex setting can: \
+             `agents install` checks again each time it runs",
         ));
     }
     if !linux && opts.consent_sockets && !qualified {

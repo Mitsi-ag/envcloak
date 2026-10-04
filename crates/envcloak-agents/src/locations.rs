@@ -187,18 +187,25 @@ impl Locations {
 
     /// The device profiles that may give Codex managed settings (macOS):
     /// `com.openai.codex` in the managed preferences, for every user and
-    /// for each one.
-    pub fn codex_managed_preferences(&self) -> Vec<PathBuf> {
+    /// for each one (in each entry there: a folder, or a link to one).
+    ///
+    /// # Errors
+    /// The managed preferences are there and cannot be listed.
+    pub fn codex_managed_preferences(&self) -> std::io::Result<Vec<PathBuf>> {
         const NAME: &str = "com.openai.codex.plist";
         let mut out = vec![self.managed_preferences.join(NAME)];
-        if let Ok(rd) = std::fs::read_dir(&self.managed_preferences) {
-            for e in rd.flatten() {
-                if e.file_type().is_ok_and(|t| t.is_dir()) {
-                    out.push(e.path().join(NAME));
-                }
+        let rd = match std::fs::read_dir(&self.managed_preferences) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for e in rd {
+            let p = e?.path();
+            if p.file_name().is_some_and(|n| n != NAME) {
+                out.push(p.join(NAME));
             }
         }
-        out
+        Ok(out)
     }
 
     /// Codex's cache of the configuration an organization's workspace
@@ -210,19 +217,26 @@ impl Locations {
 
     /// The profile configurations `codex --profile NAME` reads on top of
     /// `config.toml`: `<NAME>.config.toml` in Codex's directory.
-    pub fn codex_profile_configs(&self) -> Vec<PathBuf> {
+    ///
+    /// # Errors
+    /// Codex's directory is there and cannot be listed.
+    pub fn codex_profile_configs(&self) -> std::io::Result<Vec<PathBuf>> {
         let mut out = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&self.codex_home) {
-            for e in rd.flatten() {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                if name.len() > ".config.toml".len() && name.ends_with(".config.toml") {
-                    out.push(e.path());
-                }
+        let rd = match std::fs::read_dir(&self.codex_home) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for e in rd {
+            let e = e?;
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.len() > ".config.toml".len() && name.ends_with(".config.toml") {
+                out.push(e.path());
             }
         }
         out.sort();
-        out
+        Ok(out)
     }
 
     /// The configuration a project's directory gives Codex (a layer when
