@@ -586,6 +586,48 @@ pub fn password_chars(value: &SecretBytes) -> Option<usize> {
     readings.found.iter().map(password_len).min()
 }
 
+/// The form a password was read out of, for [`password_form_chars`]: what
+/// a scanner sends as a password-form candidate (M2-11's `scan.match`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PasswordForm {
+    /// A URL's user information, where `%XX` escapes stand for bytes.
+    Url,
+    /// Go's MySQL DSN, whose driver takes the bytes as they are (`%XX`
+    /// decoded anyway, which only shortens the count).
+    Dsn,
+    /// A `password=`, `passwd=` or `pwd=` field of a connection string:
+    /// JDBC's `%XX` and libpq's backslash escapes, the fewer characters
+    /// counting.
+    Field,
+}
+
+/// How many characters a password has that was read out of a value of
+/// `form`, as a server reads it (SPEC §6.4, M2-11): the fewest of its
+/// characters as given, as `form`'s escapes decode them
+/// ([`password_len`]), and as any password reading [`password_chars`]
+/// finds inside it (a password that is itself shaped like a URL, a DSN or
+/// a field counts as its shortest reading). Taking the fewest only ever
+/// makes a password count as shorter, so a password sent already decoded
+/// counts no longer for being decoded again, and one sent still escaped
+/// counts as short as its server reads it. Characters are counted as
+/// [`SecretBytes::utf8_chars`] counts them, or, for bytes that are not
+/// UTF-8, as four bytes a character.
+///
+/// Read in place, like [`password_chars`]: only a count leaves, and each
+/// decoded copy is wiped.
+pub fn password_form_chars(password: &SecretBytes, form: PasswordForm) -> usize {
+    #[allow(clippy::disallowed_methods)] // Read in place; only a count leaves.
+    let v: &[u8] = password.expose_secret();
+    let escapes = match form {
+        PasswordForm::Url | PasswordForm::Dsn => Escapes::Percent,
+        PasswordForm::Field => Escapes::Field,
+    };
+    let given = password.utf8_chars().unwrap_or(password.len() / 4);
+    let decoded = password_len(&Reading { bytes: v, escapes });
+    let inner = password_chars(password).unwrap_or(usize::MAX);
+    given.min(decoded).min(inner)
+}
+
 fn key_shaped_run(v: &[u8]) -> bool {
     let (mut run, mut classes) = (0usize, 0u8);
     for &b in v {
@@ -618,6 +660,52 @@ mod shape_tests {
 
     fn password_chars(s: &[u8]) -> Option<usize> {
         super::password_chars(&SecretBytes::copy_from(s))
+    }
+
+    fn form_chars(s: &[u8], form: PasswordForm) -> usize {
+        super::password_form_chars(&SecretBytes::copy_from(s), form)
+    }
+
+    /// A password read out of its value (M2-11's password-form candidates)
+    /// counts as its server reads it: in characters, multibyte ones each
+    /// one (F-58); a URL's `%XX` escapes decoded; a field's `%XX` and
+    /// libpq's backslash escapes decoded, the fewer winning (F-65); a DSN's
+    /// bytes as given, with `%XX` decoded only to shorten; bytes that are
+    /// not UTF-8 four to a character; and a password that itself holds a
+    /// password reading, its shortest. Sent decoded, a password counts the
+    /// same, and never more.
+    ///
+    /// Mutations: bytes counted instead of characters (the multibyte cases
+    /// count 16); the field's backslashes not decoded (the libpq case
+    /// counts 16); the inner reading left out (the URL-shaped password
+    /// counts 22).
+    #[test]
+    fn a_password_read_out_of_its_value_counts_as_its_server_reads_it() {
+        use PasswordForm::{Dsn, Field, Url};
+        let eight_two_byte = "\u{e9}\u{fc}\u{f1}\u{f8}\u{e9}\u{fc}\u{f1}\u{f8}";
+        assert_eq!(eight_two_byte.len(), 16);
+        for form in [Url, Dsn, Field] {
+            assert_eq!(form_chars(eight_two_byte.as_bytes(), form), 8, "{form:?}");
+            assert_eq!(form_chars(b"abcdefghijklmnop", form), 16, "{form:?}");
+            // Not UTF-8: four bytes a character, as the import rules count.
+            assert_eq!(form_chars(&[0xff; 63], form), 15, "{form:?}");
+            assert_eq!(form_chars(&[0xff; 64], form), 16, "{form:?}");
+            // Escaped six times over: 18 bytes, 6 characters to a server
+            // (a DSN's driver would read 18, and fewer only counts shorter).
+            assert_eq!(form_chars(b"%61%62%63%64%65%66", form), 6, "{form:?}");
+            // A password that is itself a URL with a password.
+            assert_eq!(
+                form_chars(b"redis://:abcdefgh@cache:6379/0", form),
+                8,
+                "{form:?}"
+            );
+        }
+        // libpq's backslash: 15 characters written in 16 bytes.
+        assert_eq!(form_chars(b"abcdefg\\\\hijklmn", Field), 15);
+        assert_eq!(form_chars(b"abcdefg\\\\hijklmn", Url), 16);
+        // Sent decoded, the count is the same.
+        assert_eq!(form_chars(b"abcdef", Url), 6);
+        assert_eq!(form_chars(b"", Field), 0);
     }
 
     /// Only the password of a URL counts, its `%XX` escapes decoded, in

@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use envcloak_core::SecretBytes;
-use envcloak_providers::password_chars;
+use envcloak_providers::{PasswordForm, password_chars, password_form_chars};
 
 /// Each line of the fixture: libpq's count, whether EnvCloak's is exactly
 /// that or may be less, and the connection string.
@@ -85,4 +85,44 @@ fn libpq_passwords_count_no_more_than_libpq_decodes() {
     }
     // The fixture exercises both sides of the threshold, exactly.
     assert!(exact >= 200 && short >= 300 && controls >= 50);
+}
+
+/// A password a scanner read out of a connection string's field and sent
+/// alone (M2-11, `scan.match`'s `conn_password` form) counts no more
+/// characters than libpq decodes it to, as libpq's own parser counted it:
+/// each line of the fixture that is one unquoted `password=` field is read
+/// as that field's value, written as libpq escapes it. So a password under
+/// 16 characters to libpq counts as short however its escapes are written,
+/// and one of 16 written without `%` counts 16 (the controls).
+///
+/// Mutation: the field's backslashes not decoded (`PasswordForm::Url`'s
+/// escapes for a field): every escaped password under 16 counts 16 or
+/// more, and this fails.
+#[test]
+fn a_field_password_alone_counts_no_more_than_libpq_decodes() {
+    let (mut short, mut controls) = (0, 0);
+    for (line, libpq, is_exact, bytes) in cases() {
+        let Some(value) = bytes.strip_prefix(b"password=") else {
+            continue;
+        };
+        // One unquoted field and nothing after it: libpq's value ends at
+        // whitespace no backslash escapes.
+        if value.first().is_some_and(|b| matches!(b, b'\'' | b'"'))
+            || value
+                .windows(2)
+                .any(|w| w[0] != b'\\' && w[1].is_ascii_whitespace())
+        {
+            continue;
+        }
+        let got = password_form_chars(&SecretBytes::copy_from(value), PasswordForm::Field);
+        assert!(got <= libpq, "line {line}: {got} characters, libpq {libpq}");
+        if libpq < 16 {
+            assert!(got < 16, "line {line}");
+            short += 1;
+        } else if is_exact && !value.contains(&b'%') {
+            assert_eq!(got, libpq, "line {line}");
+            controls += 1;
+        }
+    }
+    assert!(short >= 20 && controls >= 10, "{short} {controls}");
 }
