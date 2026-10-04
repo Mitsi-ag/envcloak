@@ -21,6 +21,18 @@ use std::process::{Command, Stdio};
 use envcloak_redact::RedactorBuilder;
 use serde_json::Value;
 
+/// `assert_eq!` without the two sides in the message: they may hold a
+/// fixture value, and failures name a canary by its label or seed only
+/// (as `envcloak_testkit::Canary`'s `Debug` does), never by its bytes.
+macro_rules! assert_same {
+    ($a:expr, $b:expr $(,)?) => {
+        assert!($a == $b, "the two sides differ (not printed: they may hold a value)")
+    };
+    ($a:expr, $b:expr, $($msg:tt)+) => {
+        assert!($a == $b, $($msg)+)
+    };
+}
+
 fn bytes(v: &Value) -> Vec<u8> {
     v.as_array()
         .expect("an array of bytes")
@@ -63,17 +75,17 @@ fn every_cr_lf_form_a_real_terminal_writes_is_redacted() {
         let value = bytes(&row["value"]);
         let cooked = bytes(&row["cooked"]);
         let raw = bytes(&row["raw"]);
-        assert_eq!(raw, value, "shape {shape}: the raw capture is the value");
+        assert_same!(raw, value, "shape {shape}: the raw capture is the value");
         let (r, _) = RedactorBuilder::new()
             .crlf_variants(true)
             .secret("kernel", &value)
             .build();
-        assert_eq!(
+        assert_same!(
             r.redact(&cooked),
             marker,
             "shape {shape}: the terminal's form"
         );
-        assert_eq!(r.redact(&raw), marker, "shape {shape}: the raw form");
+        assert_same!(r.redact(&raw), marker, "shape {shape}: the raw form");
         assert!(
             r.find_labels(&cooked).contains(&"kernel"),
             "shape {shape}: owner"
@@ -88,7 +100,7 @@ fn every_cr_lf_form_a_real_terminal_writes_is_redacted() {
                 }
                 stream.push(&cooked[at..], &mut got);
                 stream.finish(&mut got);
-                assert_eq!(got, marker, "shape {shape}: split at {at}, idle {idle}");
+                assert_same!(got, marker, "shape {shape}: split at {at}, idle {idle}");
                 if idle {
                     idle_cuts += 1;
                 } else {
@@ -106,7 +118,7 @@ fn every_cr_lf_form_a_real_terminal_writes_is_redacted() {
                 }
             }
             stream.finish(&mut got);
-            assert_eq!(got, marker, "shape {shape}: byte by byte, idle {idle}");
+            assert_same!(got, marker, "shape {shape}: byte by byte, idle {idle}");
             streams += 1;
         }
         let (off, _) = RedactorBuilder::new()
@@ -114,7 +126,7 @@ fn every_cr_lf_form_a_real_terminal_writes_is_redacted() {
             .secret("kernel", &value)
             .build();
         if cooked == value {
-            assert_eq!(off.redact(&cooked), marker, "shape {shape}: no LF");
+            assert_same!(off.redact(&cooked), marker, "shape {shape}: no LF");
             unchanged += 1;
         } else if holds(&cooked, &value) {
             assert!(
@@ -123,14 +135,14 @@ fn every_cr_lf_form_a_real_terminal_writes_is_redacted() {
             );
             existing_raw += 1;
         } else {
-            assert_eq!(
+            assert_same!(
                 off.redact(&cooked),
                 cooked,
                 "shape {shape}: without the variant the terminal's form passes"
             );
             disabled_sensitive += 1;
         }
-        assert_eq!(r.redact(benign), benign, "shape {shape}: benign output");
+        assert_same!(r.redact(benign), benign, "shape {shape}: benign output");
     }
     assert_eq!(
         (disabled_sensitive, existing_raw, unchanged),
