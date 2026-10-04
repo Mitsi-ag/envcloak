@@ -10,8 +10,10 @@
 //! 1. blocks every signal and resets every disposition to its default
 //!    (the CLI's handlers would write into the CLI's own pipes), starts a
 //!    new session (`setsid`), puts the PTY's slave side on descriptors 0,
-//!    1 and 2 and the control channel on 3, closes every other descriptor,
-//!    and takes the slave as its controlling terminal (`TIOCSCTTY`);
+//!    1 and 2 and the control channel on 3, closes every other descriptor
+//!    (or, where it cannot show it did, reports `SetupFailed` and starts
+//!    nothing), and takes the slave as its controlling terminal
+//!    (`TIOCSCTTY`);
 //! 2. ignores the terminal's job-control signals (SIGTTOU, so its own
 //!    `tcsetpgrp` works from the background; SIGTTIN, SIGTSTP) and SIGPIPE,
 //!    and catches the four signals the CLI forwards (SIGINT, SIGQUIT,
@@ -71,10 +73,12 @@
 //! (D-34). The monitor runs in a child of a multi-threaded process,
 //! so between `fork` and `_exit` it calls only system calls on the
 //! async-signal-safe list (`sigprocmask`, `sigaction`, `setsid`, `fcntl`,
-//! `dup2`, `close`, `ioctl`, `pipe`, `fork`, `setpgid`, `tcsetpgrp`,
-//! `getpid`, `read`, `write`, `recv`, `waitid`, `waitpid`, `pselect`,
-//! `kill`, `execve`, `_exit`, `clock_gettime`, `nanosleep`, plus
-//! `close_range`, `proc_pidinfo` and `getrlimit`): no allocation, no lock, no panic path. A test allocator
+//! `dup2`, `open`, `close`, `ioctl`, `pipe`, `fork`, `setpgid`,
+//! `tcsetpgrp`, `getpid`, `read`, `write`, `recv`, `waitid`, `waitpid`,
+//! `pselect`, `kill`, `execve`, `_exit`, `clock_gettime`, `nanosleep`,
+//! plus the system calls `close_range` and `getdents64` on Linux and
+//! `proc_pidinfo` on macOS; its signal handlers only set an atomic): no
+//! allocation, no lock, no panic path. A test allocator
 //! that aborts in any process but the one that installed it runs a stop,
 //! resume and exit cycle through it
 //! (`crates/envcloak-sys/tests/pty_topology.rs`). The loop itself is
