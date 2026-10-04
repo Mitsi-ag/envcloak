@@ -145,6 +145,48 @@ pub fn plugin_enabled(settings: &Value) -> bool {
         })
 }
 
+/// Whether these settings hold EnvCloak's own hooks, as `agents install`
+/// writes them (`<envcloak> hook --host claude-code --event <name>`, the
+/// program named `envcloak`, quoted or not): the plugin's are in its own
+/// `hooks/hooks.json`, never in a settings file.
+pub fn envcloak_hooks(settings: &Value) -> bool {
+    let own = |cmd: &str| {
+        Event::ALL.iter().any(|e| {
+            let tail = format!(
+                " hook --host {} --event {}",
+                Host::ClaudeCode.id(),
+                e.name()
+            );
+            cmd.strip_suffix(tail.as_str()).is_some_and(|exe| {
+                let exe = exe
+                    .strip_prefix('\'')
+                    .and_then(|x| x.strip_suffix('\''))
+                    .unwrap_or(exe);
+                Path::new(exe).file_name() == Some(std::ffi::OsStr::new("envcloak"))
+            })
+        })
+    };
+    settings
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|events| {
+            events
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .any(|group| {
+                    group
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|hs| {
+                            hs.iter()
+                                .filter_map(|h| h.get("command").and_then(Value::as_str))
+                                .any(own)
+                        })
+                })
+        })
+}
+
 /// The user-scope MCP server entry named `envcloak` in `~/.claude.json`, as
 /// read (never written: D-16).
 ///
@@ -246,6 +288,34 @@ mod tests {
             Path::new("/d"),
         );
         assert_eq!(with.len(), adds.len() + 1);
+    }
+
+    #[test]
+    fn envcloaks_own_hooks_are_told_from_others() {
+        let mut v = json!({});
+        for (path, value) in hooks_additions(Path::new("/opt/homebrew/bin/envcloak")) {
+            let event = path[1];
+            v["hooks"][event] = json!([value]);
+        }
+        assert!(envcloak_hooks(&v));
+        let quoted = hook_command(
+            Path::new("/Users/a b/envcloak"),
+            Host::ClaudeCode,
+            Event::SessionStart,
+        );
+        assert!(envcloak_hooks(
+            &json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": quoted}]}]}})
+        ));
+        for other in [
+            "/usr/bin/true",
+            "/b/envcloakx hook --host claude-code --event PreToolUse",
+            "/b/envcloak hook --host codex --event PreToolUse",
+        ] {
+            assert!(!envcloak_hooks(
+                &json!({"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": other}]}]}})
+            ));
+        }
+        assert!(!envcloak_hooks(&json!({})));
     }
 
     #[test]

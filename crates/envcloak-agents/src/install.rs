@@ -39,7 +39,8 @@ use crate::hosts::{claude, codex};
 use crate::jsonedit::Doc;
 use crate::locations::Locations;
 use crate::writer::{
-    Edit, Edited, FileRecord, Made, Outcome, Refusal, Target, Undo, Writer, sha256_hex,
+    Change, Created, Edit, Edited, FileRecord, Made, McpRecord, Outcome, Refusal, Stamp, Target,
+    Undo, Writer, sha256_hex,
 };
 
 /// What the installer needs to know of the machine.
@@ -122,6 +123,9 @@ pub enum StepKind {
     OwnFile { content: String },
     /// EnvCloak's MCP server, registered with `claude mcp add-json`.
     ClaudeMcp { exe: PathBuf, entry: Value },
+    /// EnvCloak's own registration of its MCP server in Claude Code taken
+    /// out, if it made one: the enabled plugin carries the server.
+    ClaudeMcpRemove,
     /// A change asked for and not made, and why: nothing is written.
     Withheld(Refusal),
 }
@@ -212,7 +216,7 @@ fn strings(p: &[&str]) -> Vec<String> {
 }
 
 /// Reads a small JSON file for a decision, if it is there and is JSON.
-fn read_json(path: &Path) -> Option<Value> {
+pub fn read_json(path: &Path) -> Option<Value> {
     let root = open_root(path.parent()?).ok()?;
     let (bytes, _) =
         read_plain(&root, Path::new(path.file_name()?), crate::writer::MAX_FILE).ok()?;
@@ -312,9 +316,17 @@ fn claude_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
         hp.notes.push(note(
             "plugin_enabled",
             "the EnvCloak plugin is enabled in Claude Code: its hooks and MCP server are already \
-             there, so they are not written again (each hook would run twice); the instruction \
-             block, the deny rule and the sandbox settings, which the plugin does not carry, are",
+             there, so they are not written again, and the ones an earlier install wrote are \
+             taken out (with both, each hook ran twice); the instruction block, the deny rule \
+             and the sandbox settings, which the plugin does not carry, are written",
         ));
+        hp.steps.push(Step {
+            what: "remove the MCP server EnvCloak registered with `claude mcp add-json`, if it \
+                   registered one: the plugin carries it"
+                .to_owned(),
+            path: l.claude_json().to_path_buf(),
+            kind: StepKind::ClaudeMcpRemove,
+        });
     } else {
         hp.steps.push(Step {
             what: "register EnvCloak's MCP server with `claude mcp add-json --scope user` \
@@ -408,8 +420,7 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
                 format!(
                     "Codex {} is not a version EnvCloak's socket allowance was measured on ({}): \
                      on another version the proxy settings that limit command networking to \
-                     EnvCloak's socket may not hold, so the allowance was not written, and the \
-                     sandboxed shell cannot reach EnvCloak",
+                     EnvCloak's socket may not hold, so the allowance is not written for it",
                     d.version,
                     crate::locations::SOCKET_ALLOWANCE_QUALIFIED
                         .iter()
@@ -452,6 +463,105 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
          outside Codex's sandbox), and under `codex exec` with approval policy never refuses it; \
          the installer pre-approves no EnvCloak tool",
     ));
+}
+
+/// Settings EnvCloak may have written in an earlier run that `hp` no
+/// longer writes, and what the report says when they were taken out, or
+/// are still there.
+struct Watched {
+    path: PathBuf,
+    edit: fn(&Edit) -> bool,
+    removed: (&'static str, &'static str),
+    left: (&'static str, &'static str),
+}
+
+/// An edit of Codex's socket allowance.
+fn allowance_edit(e: &Edit) -> bool {
+    matches!(e, Edit::TomlValue { path, .. } if codex::is_allowance_path(path))
+}
+
+/// An edit of Claude Code's hooks.
+fn hook_edit(e: &Edit) -> bool {
+    matches!(e, Edit::JsonElement { path, .. } if path.first().is_some_and(|k| k == "hooks"))
+}
+
+/// Whether EnvCloak's record of the file at `path` holds an edit `edit`
+/// picks.
+fn recorded(w: &Writer<'_>, path: &Path, edit: fn(&Edit) -> bool) -> bool {
+    w.state
+        .files
+        .get(&crate::writer::key(path))
+        .is_some_and(|r| r.edits.iter().any(edit))
+}
+
+/// What of an earlier run `hp` no longer writes (lesson L-09: the report
+/// says what the files hold, not what this run alone did).
+fn watched(ctx: &Context<'_>, hp: &HostPlan) -> Vec<Watched> {
+    let writes = |pick: fn(&Edit) -> bool| {
+        hp.steps.iter().any(|s| match &s.kind {
+            StepKind::Toml { settings, .. } => settings.iter().any(|(p, v)| {
+                pick(&Edit::TomlValue {
+                    path: p.clone(),
+                    value: v.clone(),
+                    previous: None,
+                    created: 0,
+                })
+            }),
+            StepKind::Json { additions, .. } => additions.iter().any(|(p, v)| {
+                pick(&Edit::JsonElement {
+                    path: p.clone(),
+                    value: v.clone(),
+                    created: 0,
+                })
+            }),
+            _ => false,
+        })
+    };
+    if hp.steps.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    match hp.host {
+        Host::Codex if !writes(allowance_edit) => out.push(Watched {
+            path: ctx.locations.codex_config(),
+            edit: allowance_edit,
+            removed: (
+                "socket_allowance_removed",
+                "the socket allowance an earlier install wrote (network_access, the network \
+                 proxy and its unix_sockets rule for EnvCloak's socket) is not in config.toml \
+                 any more: this run does not write it (no --consent-sandbox-sockets, or a Codex \
+                 version it was not measured on), and took out what was left of it, so the \
+                 command networking it turned on is off and Codex's sandboxed shell cannot reach \
+                 EnvCloak",
+            ),
+            left: (
+                "socket_allowance_left",
+                "the socket allowance an earlier install wrote is still in config.toml, since \
+                 the change above was not made: command networking limited to EnvCloak's socket \
+                 stays on until it is taken out. Run this again once the reason above is gone, \
+                 or remove sandbox_workspace_write.network_access, [features.network_proxy] and \
+                 its unix_sockets rule for EnvCloak's socket yourself",
+            ),
+        }),
+        Host::ClaudeCode if !writes(hook_edit) => out.push(Watched {
+            path: ctx.locations.claude_settings(),
+            edit: hook_edit,
+            removed: (
+                "hooks_removed",
+                "the hooks an earlier install wrote are not in settings.json any more: the \
+                 enabled plugin carries them, so this run took out what was left of them (with \
+                 both, each hook ran twice)",
+            ),
+            left: (
+                "hooks_left",
+                "the hooks an earlier install wrote are still in settings.json, beside the \
+                 plugin's, since the change above was not made: each hook runs twice until they \
+                 are taken out (run this again once the reason above is gone)",
+            ),
+        }),
+        _ => {}
+    }
+    out
 }
 
 /// The project scope's steps (Map C §6).
@@ -560,7 +670,7 @@ fn edit_for(
     move |before: Option<&[u8]>, rec: Option<&FileRecord>| match kind {
         StepKind::Block => match blocks::insert(before.unwrap_or_default()) {
             Ok(blocks::Change::Unchanged) => Ok(None),
-            Ok(blocks::Change::New(t)) => Ok(Some((t.into_bytes(), vec![Edit::Block]))),
+            Ok(blocks::Change::New(t)) => Ok(Some(Change::new(t.into_bytes(), vec![Edit::Block]))),
             Err(e) => Err(Refusal::new(e.name(), e.message())),
         },
         StepKind::Json { additions, .. } => {
@@ -568,6 +678,34 @@ fn edit_for(
                 Some(b) => Doc::parse(b).map_err(|e| Refusal::new(e.name(), e.message()))?,
                 None => Doc::empty(),
             };
+            // EnvCloak's earlier elements this run does not add go first,
+            // while they are still there (the verifier's finding, in
+            // JSON: the hooks the enabled plugin now carries, a socket or
+            // a data directory that moved, were left beside the new ones).
+            let stale: Vec<Edit> = rec
+                .map(|r| {
+                    r.edits
+                        .iter()
+                        .filter(|e| {
+                            matches!(e, Edit::JsonElement { path, value, .. }
+                                if !additions.iter().any(|(p, v)| p == path && v == value))
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            for e in stale.iter().rev() {
+                if let Edit::JsonElement {
+                    path,
+                    value,
+                    created,
+                } = e
+                {
+                    let p: Vec<&str> = path.iter().map(String::as_str).collect();
+                    doc.remove_from_array(&p, value, *created)
+                        .map_err(|e| Refusal::new(e.name(), e.message()))?;
+                }
+            }
             let mut edits = Vec::new();
             for (path, value) in additions {
                 let p: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -582,10 +720,14 @@ fn edit_for(
                     });
                 }
             }
-            if edits.is_empty() {
+            if edits.is_empty() && stale.is_empty() {
                 return Ok(None);
             }
-            Ok(Some((doc.text().as_bytes().to_vec(), edits)))
+            Ok(Some(Change {
+                bytes: doc.text().as_bytes().to_vec(),
+                added: edits,
+                dropped: stale,
+            }))
         }
         StepKind::Toml { settings, .. } => {
             let owned = rec.map(|r| r.edits.as_slice()).unwrap_or_default();
@@ -594,17 +736,20 @@ fn edit_for(
         StepKind::OwnFile { content } => match (before, rec) {
             (Some(b), _) if b == content.as_bytes() => Ok(None),
             // An older version of EnvCloak's own file, as EnvCloak left it.
-            (Some(b), Some(r)) if r.created && sha256_hex(b) == r.post_sha256 => {
-                Ok(Some((content.as_bytes().to_vec(), vec![Edit::WholeFile])))
-            }
+            (Some(b), Some(r)) if r.created && sha256_hex(b) == r.post_sha256 => Ok(Some(
+                Change::new(content.as_bytes().to_vec(), vec![Edit::WholeFile]),
+            )),
             (Some(_), Some(_)) => Err(modified()),
             (Some(_), None) => Err(Refusal::new(
                 "conflict",
                 "a file of this name is already there, and EnvCloak did not write it",
             )),
-            (None, _) => Ok(Some((content.as_bytes().to_vec(), vec![Edit::WholeFile]))),
+            (None, _) => Ok(Some(Change::new(
+                content.as_bytes().to_vec(),
+                vec![Edit::WholeFile],
+            ))),
         },
-        StepKind::ClaudeMcp { .. } | StepKind::Withheld(_) => Ok(None),
+        StepKind::ClaudeMcp { .. } | StepKind::ClaudeMcpRemove | StepKind::Withheld(_) => Ok(None),
     }
 }
 
@@ -626,6 +771,14 @@ fn run_step(
 ) -> StepResult {
     let outcome = match &step.kind {
         StepKind::ClaudeMcp { exe, entry } => register_claude_mcp(ctx, w, exe, entry, notes),
+        StepKind::ClaudeMcpRemove => {
+            let key = mcp_key(ctx.locations.claude_json());
+            if w.state.mcp.contains_key(&key) || w.state.mcp_intent.contains_key(&key) {
+                unregister_claude_mcp(ctx, w, &key)
+            } else {
+                Outcome::Unchanged
+            }
+        }
         StepKind::Withheld(r) => Outcome::Refused(r.clone()),
         kind => {
             let mut edit = edit_for(kind);
@@ -651,6 +804,14 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
     for hp in &plan.hosts {
         let mut results = Vec::new();
         let mut notes = hp.notes.clone();
+        // What EnvCloak wrote before that this plan no longer writes (the
+        // socket allowance, the hooks the plugin carries): whether it was
+        // there before the steps, to say after them what became of it.
+        let watched = watched(ctx, hp);
+        let was: Vec<bool> = watched
+            .iter()
+            .map(|wt| recorded(w, &wt.path, wt.edit))
+            .collect();
         for step in &hp.steps {
             let host_owned = matches!(
                 step.kind,
@@ -670,6 +831,13 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
                 host_name(hp.host),
             );
             results.push(run_step(ctx, w, step, t, &mut notes));
+        }
+        for (wt, was) in watched.iter().zip(was) {
+            match (was, recorded(w, &wt.path, wt.edit)) {
+                (_, true) => notes.push(note(wt.left.0, wt.left.1)),
+                (true, false) => notes.push(note(wt.removed.0, wt.removed.1)),
+                (false, false) => {}
+            }
         }
         report.hosts.push(HostReport {
             host: hp.host,
@@ -699,18 +867,44 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
     report
 }
 
-/// The entry registered, and the file's bytes and permission bits.
-type Registered = (Option<Value>, Option<(Vec<u8>, u32)>);
+/// What a `.claude.json` holds: the user-scope MCP entry named
+/// `envcloak` (`None` for none), and the file (`None` when there is none).
+struct ClaudeJson {
+    entry: Option<Value>,
+    file: Option<ClaudeFile>,
+}
 
-/// The user-scope MCP entries in `~/.claude.json`, read beneath its
-/// directory: `None` when there is no file.
-fn claude_registered(ctx: &Context<'_>) -> Result<Registered, Refusal> {
-    let path = ctx.locations.claude_json();
+/// A `.claude.json` as read: its bytes and stamp.
+struct ClaudeFile {
+    bytes: Vec<u8>,
+    stamp: envcloak_scan::FileStamp,
+}
+
+/// The key the state keeps an MCP registration in the file at `path`
+/// under ([`crate::writer::State::mcp`]): its path with its directories
+/// resolved, so the same file is one key however it is reached.
+pub fn mcp_key(path: &Path) -> String {
+    let resolved = match (path.parent(), path.file_name()) {
+        (Some(d), Some(n)) => {
+            std::fs::canonicalize(d).map_or_else(|_| path.to_path_buf(), |d| d.join(n))
+        }
+        _ => path.to_path_buf(),
+    };
+    crate::writer::key(&resolved)
+}
+
+/// The user-scope MCP entry in the `.claude.json` at `path`, read beneath
+/// its directory.
+fn claude_registered(path: &Path) -> Result<ClaudeJson, Refusal> {
+    let none = || ClaudeJson {
+        entry: None,
+        file: None,
+    };
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-        return Ok((None, None));
+        return Ok(none());
     };
     let Ok(root) = open_root(dir) else {
-        return Ok((None, None));
+        return Ok(none());
     };
     match read_plain(&root, Path::new(name), 64 * 1024 * 1024) {
         // Claude Code rewrites the file through its own command, but the
@@ -723,10 +917,19 @@ fn claude_registered(ctx: &Context<'_>) -> Result<Registered, Refusal> {
             "it has another hard link, which would keep its old contents: reported, never \
              changed",
         )),
-        Ok((bytes, stamp)) => Ok((claude::registered(&bytes)?, Some((bytes, stamp.mode)))),
-        Err(e) if e.kind == ScanErrorKind::NotFound => Ok((None, None)),
+        Ok((bytes, stamp)) => Ok(ClaudeJson {
+            entry: claude::registered(&bytes)?,
+            file: Some(ClaudeFile { bytes, stamp }),
+        }),
+        Err(e) if e.kind == ScanErrorKind::NotFound => Ok(none()),
         Err(e) => Err(Refusal::new(e.kind.token(), e.kind.message())),
     }
+}
+
+/// Whether the `.claude.json` at `path` holds a user-scope MCP server
+/// named `envcloak` (anyone's), read as the installer reads it.
+pub fn claude_json_has_server(path: &Path) -> bool {
+    claude_registered(path).is_ok_and(|c| c.entry.is_some())
 }
 
 fn register_claude_mcp(
@@ -750,14 +953,23 @@ fn cli_failed(what: &str) -> Refusal {
 }
 
 /// Settles an MCP registration saved and not confirmed (a run stopped
-/// while `claude mcp` ran): EnvCloak's when the entry it was registering
-/// is there, else forgotten.
-fn settle_mcp(w: &mut Writer<'_>, host: &str, current: Option<&Value>) {
-    if let Some(intent) = w.state.mcp_intent.remove(host) {
-        if current == Some(&intent) {
-            w.state.mcp.insert(host.to_owned(), intent);
+/// while `claude mcp` ran) in the file keyed `key`: EnvCloak's when the
+/// entry it was registering is there, else forgotten.
+fn settle_mcp(w: &mut Writer<'_>, key: &str, current: Option<&Value>) {
+    if let Some(intent) = w.state.mcp_intent.remove(key) {
+        if current == Some(&intent.entry) {
+            w.state.mcp.insert(key.to_owned(), intent);
         }
     }
+}
+
+/// `CLAUDE_CONFIG_DIR` as the person's environment gives it, when it is
+/// one the catalog reads (absolute: [`Locations`]).
+fn config_dir(ctx: &Context<'_>) -> Option<String> {
+    (ctx.env)("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn try_register(
@@ -768,10 +980,13 @@ fn try_register(
     notes: &mut Vec<Note>,
 ) -> Result<Outcome, Refusal> {
     let host = Host::ClaudeCode.id();
-    let (current, file) = claude_registered(ctx)?;
-    settle_mcp(w, host, current.as_ref());
-    let ours = current.is_some() && w.state.mcp.get(host) == current.as_ref();
-    if current.as_ref() == Some(entry) {
+    let path = ctx.locations.claude_json().to_path_buf();
+    let key = mcp_key(&path);
+    let now = claude_registered(&path)?;
+    settle_mcp(w, &key, now.entry.as_ref());
+    let mine = w.state.mcp.get(&key).cloned();
+    let ours = now.entry.is_some() && mine.as_ref().map(|r| &r.entry) == now.entry.as_ref();
+    if now.entry.as_ref() == Some(entry) {
         if !ours {
             // The person's own entry, equal to EnvCloak's: left theirs, and
             // uninstall leaves it (Codex review).
@@ -784,7 +999,7 @@ fn try_register(
         }
         return Ok(Outcome::Unchanged);
     }
-    if current.is_some() && !ours {
+    if now.entry.is_some() && !ours {
         return Err(Refusal::new(
             "conflict",
             "an MCP server named `envcloak` is already registered in Claude Code, and EnvCloak \
@@ -792,26 +1007,40 @@ fn try_register(
         ));
     }
     // Claude Code changes its own file; EnvCloak backs it up first.
-    let path = ctx.locations.claude_json();
-    let backup = match &file {
-        Some((bytes, mode)) => Some(w.backups.back_up(path, bytes, *mode)?),
+    let backup = match &now.file {
+        Some(f) => Some(w.backups.back_up(&path, &f.bytes, f.stamp.mode)?),
         None => None,
     };
     let unmade = |w: &mut Writer<'_>| {
-        if let (Some(id), Some((bytes, _))) = (&backup, &file) {
-            let _ = w.backups.record(id, bytes);
+        if let (Some(id), Some(f)) = (&backup, &now.file) {
+            let _ = w.backups.record(id, &f.bytes);
         }
+    };
+    // The file holds only what EnvCloak's registrations made: there was
+    // none, or it is exactly what the last one left.
+    let fresh = match (&now.file, mine.as_ref().and_then(|r| r.created.as_ref())) {
+        (None, _) => true,
+        (Some(f), Some(c)) => sha256_hex(&f.bytes) == c.sha256,
+        (Some(_), None) => false,
     };
     // Saved before the host's command runs: a run stopped after it still
     // owns what it registered.
-    w.state.mcp_intent.insert(host.to_owned(), entry.clone());
+    w.state.mcp_intent.insert(
+        key.clone(),
+        McpRecord {
+            host: host.to_owned(),
+            entry: entry.clone(),
+            config_dir: config_dir(ctx),
+            created: None,
+        },
+    );
     if let Err(e) = w.journal.save(w.state) {
-        w.state.mcp_intent.remove(host);
+        w.state.mcp_intent.remove(&key);
         unmade(w);
         return Err(e);
     }
     let ran = (|| {
-        if current.is_some() {
+        if now.entry.is_some() {
             let out = claude::run(
                 exe,
                 &["mcp", "remove", "--scope", "user", claude::SERVER],
@@ -832,15 +1061,15 @@ fn try_register(
         }
         claude::run(exe, &["mcp", "get", claude::SERVER], ctx.env)
     })();
-    let (now, after) = claude_registered(ctx)?;
+    let after = claude_registered(&path)?;
     // Whatever the commands answered, the file says what is registered.
-    settle_mcp(w, host, now.as_ref());
-    if now.as_ref() != Some(entry) {
+    settle_mcp(w, &key, after.entry.as_ref());
+    if after.entry.as_ref() != Some(entry) {
         let _ = w.journal.save(w.state);
-        if now == current {
+        if after.entry == now.entry {
             unmade(w);
-        } else if let (Some(id), Some((bytes, _))) = (&backup, &after) {
-            let _ = w.backups.record(id, bytes);
+        } else if let (Some(id), Some(f)) = (&backup, &after.file) {
+            let _ = w.backups.record(id, &f.bytes);
         }
         return Err(ran.err().unwrap_or_else(|| {
             Refusal::new(
@@ -850,6 +1079,17 @@ fn try_register(
             )
         }));
     }
+    // What the file holds now, when it holds nothing but what EnvCloak's
+    // registrations made: uninstall removes it while it is still so.
+    if let Some(r) = w.state.mcp.get_mut(&key) {
+        r.created = match &after.file {
+            Some(f) if fresh => Some(Created {
+                sha256: sha256_hex(&f.bytes),
+                stamp: Some(Stamp::from(f.stamp)),
+            }),
+            _ => None,
+        };
+    }
     let mut failed = match ran {
         Ok(out) if out.status.success() => None,
         Ok(_) => Some(cli_failed("get")),
@@ -858,12 +1098,12 @@ fn try_register(
     if let Err(e) = w.journal.save(w.state) {
         failed.get_or_insert(e);
     }
-    if let (Some(id), Some((bytes, _))) = (&backup, &after) {
-        if let Err(e) = w.backups.record(id, bytes) {
+    if let (Some(id), Some(f)) = (&backup, &after.file) {
+        if let Err(e) = w.backups.record(id, &f.bytes) {
             failed.get_or_insert(e);
         }
     }
-    let made = if file.is_none() {
+    let made = if now.file.is_none() {
         Made::Created
     } else {
         Made::Changed
@@ -875,51 +1115,90 @@ fn try_register(
             failed,
         },
         None => Outcome::Changed {
-            created: file.is_none(),
+            created: now.file.is_none(),
             backup,
         },
     })
 }
 
-fn unregister_claude_mcp(ctx: &Context<'_>, w: &mut Writer<'_>) -> Option<StepResult> {
-    let host = Host::ClaudeCode.id();
-    if !w.state.mcp.contains_key(host) && !w.state.mcp_intent.contains_key(host) {
-        return None;
+/// The path a registration keyed `key` is shown by: the catalog's own
+/// spelling when it is the file `CLAUDE_CONFIG_DIR` names now (its
+/// directories unresolved, as a person knows them), else the key's.
+pub fn registration_path(ctx: &Context<'_>, key: &str) -> PathBuf {
+    let here = ctx.locations.claude_json();
+    if mcp_key(here) == key {
+        here.to_path_buf()
+    } else {
+        PathBuf::from(key)
     }
-    let path = ctx.locations.claude_json().to_path_buf();
+}
+
+/// The keys of the MCP registrations EnvCloak holds for Claude Code,
+/// confirmed or not.
+pub fn claude_registrations(state: &crate::writer::State) -> Vec<String> {
+    let host = Host::ClaudeCode.id();
+    let mut keys: Vec<String> = state
+        .mcp
+        .iter()
+        .chain(state.mcp_intent.iter())
+        .filter(|(_, r)| r.host == host)
+        .map(|(k, _)| k.clone())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Takes EnvCloak's MCP server out of the `.claude.json` keyed `key`,
+/// while it is the entry EnvCloak registered there: with `claude mcp
+/// remove`, pointed at that file (`CLAUDE_CONFIG_DIR` as it was when the
+/// entry was registered, or with none, `HOME` the file's directory), or,
+/// when EnvCloak's registration created the file and it is still exactly
+/// as that left it, by removing the file, which holds nothing else.
+fn unregister_claude_mcp(ctx: &Context<'_>, w: &mut Writer<'_>, key: &str) -> Outcome {
+    let path = PathBuf::from(key);
     let outcome = (|| -> Result<Outcome, Refusal> {
-        let (current, file) = claude_registered(ctx)?;
-        settle_mcp(w, host, current.as_ref());
-        let Some(recorded) = w.state.mcp.get(host).cloned() else {
+        let now = claude_registered(&path)?;
+        settle_mcp(w, key, now.entry.as_ref());
+        let Some(rec) = w.state.mcp.get(key).cloned() else {
             let _ = w.journal.save(w.state);
             return Ok(Outcome::Unchanged);
         };
-        if current.as_ref() != Some(&recorded) {
+        let (Some(file), true) = (&now.file, now.entry.as_ref() == Some(&rec.entry)) else {
             // Gone, or changed since: not EnvCloak's to remove.
-            w.state.mcp.remove(host);
+            w.state.mcp.remove(key);
             let _ = w.journal.save(w.state);
             return Ok(Outcome::Unchanged);
+        };
+        if rec
+            .created
+            .as_ref()
+            .is_some_and(|c| c.sha256 == sha256_hex(&file.bytes))
+        {
+            return remove_created(w, key, &path, file, &rec);
         }
         let exe = detect::detect(Host::ClaudeCode, &ctx.path, ctx.env)
             .map_err(|e| Refusal::new(e.name(), e.message()))?
             .exe;
-        let backup = match &file {
-            Some((bytes, mode)) => Some(w.backups.back_up(&path, bytes, *mode)?),
-            None => None,
+        let backup = Some(w.backups.back_up(&path, &file.bytes, file.stamp.mode)?);
+        let env = |k: &str| match (k, &rec.config_dir) {
+            ("CLAUDE_CONFIG_DIR", d) => d.as_ref().map(OsString::from),
+            ("HOME", None) => path.parent().map(|p| p.as_os_str().to_owned()),
+            _ => (ctx.env)(k),
         };
         let ran = claude::run(
             &exe,
             &["mcp", "remove", "--scope", "user", claude::SERVER],
-            ctx.env,
+            &env,
         );
-        let (now, after) = claude_registered(ctx)?;
-        if now.is_some() {
-            if let (Some(id), Some((bytes, _))) = (&backup, &after) {
-                let _ = w.backups.record(id, bytes);
+        let after = claude_registered(&path)?;
+        if after.entry.is_some() {
+            if let (Some(id), Some(f)) = (&backup, &after.file) {
+                let _ = w.backups.record(id, &f.bytes);
             }
             return Err(ran.err().unwrap_or_else(|| cli_failed("remove")));
         }
-        w.state.mcp.remove(host);
+        w.state.mcp.remove(key);
         let mut failed = match ran {
             Ok(out) if out.status.success() => None,
             Ok(_) => Some(cli_failed("remove")),
@@ -928,8 +1207,8 @@ fn unregister_claude_mcp(ctx: &Context<'_>, w: &mut Writer<'_>) -> Option<StepRe
         if let Err(e) = w.journal.save(w.state) {
             failed.get_or_insert(e);
         }
-        if let (Some(id), Some((bytes, _))) = (&backup, &after) {
-            if let Err(e) = w.backups.record(id, bytes) {
+        if let (Some(id), Some(f)) = (&backup, &after.file) {
+            if let Err(e) = w.backups.record(id, &f.bytes) {
                 failed.get_or_insert(e);
             }
         }
@@ -942,10 +1221,64 @@ fn unregister_claude_mcp(ctx: &Context<'_>, w: &mut Writer<'_>) -> Option<StepRe
             None => Outcome::Removed { backup },
         })
     })();
-    Some(StepResult {
-        what: "remove EnvCloak's MCP server with `claude mcp remove --scope user`".to_owned(),
-        path,
-        outcome: outcome.unwrap_or_else(Outcome::Refused),
+    outcome.unwrap_or_else(Outcome::Refused)
+}
+
+/// Removes the `.claude.json` at `path` that EnvCloak's registration
+/// created and that is still exactly as it left it (`rec.created`), after
+/// a backup: D-16's rules as for any host file (not open elsewhere; the 2
+/// minutes, unless its stamp is still the one the registration left).
+fn remove_created(
+    w: &mut Writer<'_>,
+    key: &str,
+    path: &Path,
+    file: &ClaudeFile,
+    rec: &McpRecord,
+) -> Result<Outcome, Refusal> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(Refusal::new("invalid_path", "not a file's path"));
+    };
+    let root = open_root(dir)
+        .map_err(|_| Refusal::new("unreadable", "its directory could not be opened"))?;
+    let own = rec
+        .created
+        .as_ref()
+        .is_some_and(|c| c.stamp == Some(Stamp::from(file.stamp)));
+    let at = if own {
+        let mtime = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(u64::try_from(file.stamp.mtime).unwrap_or(0));
+        w.now.max(mtime + envcloak_scan::MIN_AGE)
+    } else {
+        w.now
+    };
+    let id = w.backups.back_up(path, &file.bytes, file.stamp.mode)?;
+    let gone = envcloak_scan::remove_checked_at(&root, Path::new(name), &file.stamp, at);
+    let present = !matches!(
+        read_plain(&root, Path::new(name), crate::writer::MAX_FILE),
+        Err(e) if e.kind == ScanErrorKind::NotFound
+    );
+    let mut failed = match gone {
+        Ok(()) => None,
+        Err(e) if present => {
+            let _ = w.backups.record(&id, &file.bytes);
+            return Err(Refusal::new(e.kind.token(), e.kind.message()));
+        }
+        Err(e) => Some(Refusal::new(e.kind.token(), e.kind.message())),
+    };
+    w.state.mcp.remove(key);
+    if let Err(e) = w.journal.save(w.state) {
+        failed.get_or_insert(e);
+    }
+    if let Err(e) = w.backups.record(&id, b"") {
+        failed.get_or_insert(e);
+    }
+    Ok(match failed {
+        Some(failed) => Outcome::Partial {
+            made: Made::Removed,
+            backup: Some(id),
+            failed,
+        },
+        None => Outcome::Removed { backup: Some(id) },
     })
 }
 
@@ -1040,7 +1373,17 @@ pub fn uninstall(ctx: &Context<'_>, opts: &Options, w: &mut Writer<'_>) -> Repor
         for host in hosts {
             let mut results = undo_files(w, host.id(), "global", host_name(host));
             if host == Host::ClaudeCode {
-                results.extend(unregister_claude_mcp(ctx, w));
+                // Every file EnvCloak registered its server in, wherever
+                // `CLAUDE_CONFIG_DIR` points now.
+                for key in claude_registrations(w.state) {
+                    let outcome = unregister_claude_mcp(ctx, w, &key);
+                    results.push(StepResult {
+                        what: "remove EnvCloak's MCP server with `claude mcp remove --scope user`"
+                            .to_owned(),
+                        path: registration_path(ctx, &key),
+                        outcome,
+                    });
+                }
             }
             report.hosts.push(HostReport {
                 host,
@@ -1181,6 +1524,10 @@ sys.exit(2)
             path: bin.clone().into_os_string(),
             env: &env,
         };
+        // A file Claude Code wrote first, so `claude mcp remove` takes the
+        // entry out (a file the registration created is removed whole).
+        std::fs::write(home.join(".claude.json"), b"{\"numStartups\": 1}")
+            .unwrap_or_else(|e| panic!("{e}"));
         let entry = claude::mcp_entry(Path::new("/b/envcloak"));
         let mut state = crate::writer::State::default();
         let mut backups = NoBackups;
@@ -1198,10 +1545,11 @@ sys.exit(2)
         };
         let o = register_claude_mcp(&ctx, &mut w, &claude, &entry, &mut Vec::new());
         assert!(
-            matches!(&o, Outcome::Partial { made: Made::Created, failed, .. } if failed.name == "state_unwritable"),
+            matches!(&o, Outcome::Partial { made: Made::Changed, failed, .. } if failed.name == "state_unwritable"),
             "{o:?}"
         );
-        assert_eq!(w.state.mcp.get(Host::ClaudeCode.id()), Some(&entry));
+        let key = mcp_key(&home.join(".claude.json"));
+        assert_eq!(w.state.mcp.get(&key).map(|r| &r.entry), Some(&entry));
         // The only save after `claude mcp remove` fails.
         let mut saved = Saved {
             fail: vec![1],
@@ -1213,9 +1561,9 @@ sys.exit(2)
             backups: &mut backups,
             now: std::time::SystemTime::now(),
         };
-        let r = unregister_claude_mcp(&ctx, &mut w).map(|r| r.outcome);
+        let r = unregister_claude_mcp(&ctx, &mut w, &key);
         assert!(
-            matches!(&r, Some(Outcome::Partial { made: Made::Removed, failed, .. }) if failed.name == "state_unwritable"),
+            matches!(&r, Outcome::Partial { made: Made::Removed, failed, .. } if failed.name == "state_unwritable"),
             "{r:?}"
         );
         let left = std::fs::read(home.join(".claude.json")).unwrap_or_default();

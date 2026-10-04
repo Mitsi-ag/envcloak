@@ -555,6 +555,53 @@ fn the_installer_on_the_hosts_own_configs() {
     h.assert_swept("M2-08 install");
 }
 
+/// Codex review: in a fresh home `claude mcp add-json` creates
+/// `~/.claude.json`, and uninstall took EnvCloak's entry out and left the
+/// file. With the pinned Claude Code's own command (L-02): in a home with
+/// no `.claude.json`, install registers EnvCloak's server (Claude Code
+/// creates the file) and `claude mcp list` lists it; uninstall then
+/// removes the file, which holds nothing but what the registration made,
+/// and the files install created go too.
+///
+/// Mutation checked: the file's creation not recorded (`created` always
+/// `None` in `install::try_register`): uninstall takes the entry out with
+/// `claude mcp remove` and leaves the file, and this fails.
+#[test]
+fn a_fresh_claude_home_comes_back_without_a_claude_json() {
+    let claude_found = Installed::find(&versions_toml(), Host::ClaudeCode.id(), "native");
+    let Some(ci) = require(claude_found, "M2-08 fresh home (Claude Code)") else {
+        return;
+    };
+    let mut h = Harness::start();
+    vault(&mut h);
+    let claude = AgentHome::within(&h.home, Host::ClaudeCode, ci);
+    let home = h.home.home();
+    let bin = host_bin(&h, &[&claude]);
+    let tmp = claude.claude_tmp();
+    assert!(!home.join(".claude.json").exists(), "not a fresh home");
+    let (v, code) = agents(
+        &mut h,
+        &bin,
+        &tmp,
+        &["install", "--agent", "claude-code", "--yes"],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert!(home.join(".claude.json").exists(), "{v}");
+    let out = claude.host_cli(&["mcp", "list"]);
+    let said = text(&out);
+    assert!(out.status.success() && said.contains("envcloak"), "{said}");
+    let (u, code) = agents(
+        &mut h,
+        &bin,
+        &tmp,
+        &["uninstall", "--agent", "claude-code", "--yes"],
+    );
+    assert_eq!(code, 0, "{u}");
+    for f in [".claude.json", ".claude/settings.json", ".claude/CLAUDE.md"] {
+        assert!(!home.join(f).exists(), "{f} is still there: {u}");
+    }
+}
+
 /// K-01 on macOS, as the installer writes it: with consent, a command in
 /// Codex's `workspace-write` sandbox reaches EnvCloak's socket and nothing
 /// else. On Linux there is no such setting (the test above shows none is

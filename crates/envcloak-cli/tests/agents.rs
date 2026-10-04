@@ -251,23 +251,39 @@ impl Fixture {
 
     /// A stand-in host's command, in the home.
     fn host(&self, name: &str, args: &[&str]) -> Output {
+        self.host_with(name, args, &[])
+    }
+
+    /// A stand-in host's command, in the home, with `env` set too.
+    fn host_with(&self, name: &str, args: &[&str], env: &[(&str, &Path)]) -> Output {
         let mut cmd = Command::new(self.bin.join(name));
         self.home
             .apply(&mut cmd)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         finish_within(cmd, Duration::from_secs(30))
     }
 
     /// `envcloak agents <args>` in `cwd`, with the stand-ins on `PATH`;
     /// nothing it writes holds a canary.
     fn agents_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.agents_with(cwd, args, &[])
+    }
+
+    /// `envcloak agents <args>` in `cwd`, with `env` set too.
+    fn agents_with(&self, cwd: &Path, args: &[&str], env: &[(&str, &Path)]) -> Output {
         let mut argv = vec!["agents"];
         argv.extend_from_slice(args);
         let mut cmd = cli_command(&self.home, &argv, &[]);
         cmd.env("PATH", format!("{}:{TEST_PATH}", self.bin.display()))
             .current_dir(cwd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         let out = finish_within(cmd, Duration::from_secs(120));
         assert_no_canary(&out.stdout, &self.cs);
         assert_no_canary(&out.stderr, &self.cs);
@@ -280,9 +296,14 @@ impl Fixture {
 
     /// `agents <args> --json`: the report, and the exit code.
     fn report(&self, args: &[&str]) -> (Value, i32) {
+        self.report_with(args, &[])
+    }
+
+    /// `agents <args> --json` with `env` set too.
+    fn report_with(&self, args: &[&str], env: &[(&str, &Path)]) -> (Value, i32) {
         let mut a = args.to_vec();
         a.push("--json");
-        let out = self.agents(&a);
+        let out = self.agents_with(&self.home.home(), &a, env);
         let v = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|_| panic!("{}{}", stdout(&out), stderr(&out)));
         (v, out.status.code().unwrap())
@@ -911,6 +932,118 @@ fn the_socket_allowance_needs_a_codex_it_was_measured_on() {
     f.sweep();
 }
 
+/// The verifier's finding: the version gate only stopped new writes. An
+/// allowance written with consent for the measured Codex stayed in
+/// config.toml after Codex moved to an unmeasured version, while the
+/// report said it was not written. A run that does not write it (an
+/// unmeasured version, or no consent) takes EnvCloak's allowance out and
+/// says so (`socket_allowance_removed`); one whose change of config.toml
+/// is refused says it is still there (`socket_allowance_left`). The server
+/// stays throughout, and uninstall gives the bytes back. On Linux no
+/// allowance is ever written.
+///
+/// Mutation checked: the stale settings left in place (`undo_in` not
+/// called for them in `hosts::codex::apply`): after the upgrade
+/// config.toml still holds `network_access`, the proxy and the
+/// `unix_sockets` rule, and this fails.
+#[test]
+fn an_allowance_written_before_goes_when_it_is_not_written_again() {
+    let f = Fixture::new();
+    let codex = |version: &str| {
+        std::fs::write(
+            f.bin.join("codex"),
+            format!(
+                "#!{}\n{}",
+                python3().display(),
+                FAKE_CODEX.replace("codex-cli 0.159.2", &format!("codex-cli {version}"))
+            ),
+        )
+        .unwrap();
+    };
+    let before = f.text(".codex/config.toml");
+    let has_allowance = |toml: &str| {
+        ["network_access", "network_proxy", "unix_sockets"]
+            .iter()
+            .any(|w| toml.contains(w))
+    };
+    let install = |consent: bool| {
+        let mut a = vec!["install", "--agent", "codex", "--yes"];
+        if consent {
+            a.push("--consent-sandbox-sockets");
+        }
+        f.report(&a)
+    };
+    let (v, code) = install(true);
+    assert_eq!(code, 0, "{v}");
+    let macos = cfg!(target_os = "macos");
+    assert_eq!(has_allowance(&f.text(".codex/config.toml")), macos);
+    // Codex upgraded to a version the allowance was not measured on.
+    codex("0.159.3");
+    let (v, code) = install(true);
+    assert_eq!(code, if macos { 1 } else { 0 }, "{v}");
+    let toml = f.text(".codex/config.toml");
+    assert!(!has_allowance(&toml), "{toml}");
+    assert!(toml.contains("[mcp_servers.envcloak]"), "{toml}");
+    assert_eq!(
+        notes(&v, "codex").contains(&"socket_allowance_removed".to_owned()),
+        macos,
+        "{v}"
+    );
+    // Back on the measured version: with consent it is written again;
+    // without, taken out again.
+    codex("0.159.2");
+    let (v, code) = install(true);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(has_allowance(&f.text(".codex/config.toml")), macos);
+    let (v, code) = install(false);
+    assert_eq!(code, 0, "{v}");
+    assert!(!has_allowance(&f.text(".codex/config.toml")));
+    assert_eq!(
+        notes(&v, "codex").contains(&"socket_allowance_removed".to_owned()),
+        macos,
+        "{v}"
+    );
+    // Written once more, then a run whose change of config.toml is refused
+    // (Codex wrote the file a moment ago): still there, and said so.
+    let (v, code) = install(true);
+    assert_eq!(code, 0, "{v}");
+    let written = f.read(".codex/config.toml");
+    std::fs::write(f.path(".codex/config.toml"), &written).unwrap();
+    let (v, code) = install(false);
+    assert_eq!(f.read(".codex/config.toml"), written);
+    if macos {
+        assert_eq!(code, 1, "{v}");
+        let (outcome, reason, _) = outcome_of(&v, "~/.codex/config.toml");
+        assert_eq!(
+            (outcome.as_str(), reason),
+            ("refused", json!("recently_changed"))
+        );
+        assert!(
+            notes(&v, "codex").contains(&"socket_allowance_left".to_owned()),
+            "{v}"
+        );
+    } else {
+        assert_eq!(code, 0, "{v}");
+    }
+    age(&f.path(".codex/config.toml"), OLD);
+    let (u, code) = f.report(&["uninstall", "--agent", "codex", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    // Taken out by structure (values were set and taken out on the way):
+    // the person's settings and comment stay, nothing of EnvCloak's.
+    let toml = f.text(".codex/config.toml");
+    assert!(
+        !toml.contains("envcloak") && !has_allowance(&toml),
+        "{toml}"
+    );
+    for kept in ["# mine", "model = \"gpt-5\"", "[mcp_servers.other]"] {
+        assert!(
+            toml.contains(kept) && before.contains(kept),
+            "{kept}: {toml}"
+        );
+    }
+    f.sweep();
+}
+
 /// The Codex review: `~/.claude.json` reached Claude Code's own `claude mcp`
 /// commands without the writer's hard-link rule. With another hard link
 /// it is reported and no command that would change it runs, on install
@@ -1431,6 +1564,195 @@ fn a_plugin_install_still_gets_the_protections() {
     let (u, code) = f.report(&["uninstall", "--yes"]);
     assert_eq!(code, 0, "{u}");
     assert_eq!(f.text(".claude/settings.json"), settings);
+    f.sweep();
+}
+
+/// Codex's finding: installing directly and then enabling the plugin left
+/// both hook sets and both MCP servers, and nothing said so. In either
+/// order: the plugin first, then `agents install`, writes neither (no
+/// double install, and `agents status` finds none); `agents install`
+/// first, then the plugin, is a double install `agents status` refuses
+/// (`double_install`, naming both), and the next `agents install` takes
+/// out its own hooks and server (`hooks_removed`), the protections kept,
+/// after which `agents status` finds none.
+///
+/// Mutations checked: the hooks recorded before kept when the plan no
+/// longer adds them (the stale elements' removal skipped in `edit_for`):
+/// the second install leaves them and this fails; the plugin's
+/// `ClaudeMcpRemove` step not planned: the server stays and this fails;
+/// `double_install` answering `None`: `agents status` exits 125 on the
+/// double install and this fails.
+#[test]
+fn a_double_install_with_the_plugin_is_found_in_either_order() {
+    let f = Fixture::new();
+    let enable = |text: &str| {
+        text.replacen(
+            "  \"model\": \"opus\"",
+            "  \"model\": \"opus\",\n  \"enabledPlugins\": {\n    \"envcloak@market\": true\n  }",
+            1,
+        )
+    };
+    let status = || {
+        let out = f.agents(&["status"]);
+        (out.status.code().unwrap(), stderr(&out))
+    };
+    let own_hooks = || {
+        f.text(".claude/settings.json")
+            .contains(" hook --host claude-code ")
+    };
+    let own_server = || {
+        f.json(".claude.json")["mcpServers"]
+            .get("envcloak")
+            .is_some()
+    };
+    let install = || f.report(&["install", "--agent", "claude-code", "--yes"]);
+    // The plugin first.
+    std::fs::write(f.path(".claude/settings.json"), enable(SETTINGS)).unwrap();
+    age(&f.path(".claude/settings.json"), OLD);
+    let (v, code) = install();
+    assert_eq!(code, 0, "{v}");
+    assert!(!own_hooks() && !own_server());
+    let (code, err) = status();
+    assert_eq!(code, 125, "{err}");
+    assert!(err.starts_with("envcloak: not_in_this_build:"), "{err}");
+    let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(f.text(".claude/settings.json"), enable(SETTINGS));
+    // EnvCloak's own install first, then the person enables the plugin.
+    std::fs::write(f.path(".claude/settings.json"), SETTINGS).unwrap();
+    age(&f.path(".claude/settings.json"), OLD);
+    let (v, code) = install();
+    assert_eq!(code, 0, "{v}");
+    assert!(own_hooks() && own_server());
+    let installed = f.text(".claude/settings.json");
+    std::fs::write(f.path(".claude/settings.json"), enable(&installed)).unwrap();
+    age(&f.path(".claude/settings.json"), OLD);
+    let (code, err) = status();
+    assert_eq!(code, 1, "{err}");
+    assert!(err.starts_with("envcloak: double_install: "), "{err}");
+    for named in ["~/.claude/settings.json", "~/.claude.json"] {
+        assert!(err.contains(named), "{named}: {err}");
+    }
+    let (v, code) = install();
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        notes(&v, "claude-code").contains(&"hooks_removed".to_owned()),
+        "{v}"
+    );
+    assert_eq!(outcome_of(&v, "~/.claude.json").0, "removed", "{v}");
+    assert!(!own_hooks() && !own_server());
+    let s = f.json(".claude/settings.json");
+    assert!(
+        s["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(READ_DENY)),
+        "{s}"
+    );
+    let (code, err) = status();
+    assert_eq!(code, 125, "{err}");
+    // Uninstall leaves the person's own: the plugin, their settings.
+    let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(f.json(".claude/settings.json"), {
+        let mut want: Value = serde_json::from_str(SETTINGS).unwrap();
+        want["enabledPlugins"] = json!({"envcloak@market": true});
+        want
+    });
+    f.sweep();
+}
+
+/// Codex review: EnvCloak's ownership of its MCP registration was keyed by
+/// host only. After `CLAUDE_CONFIG_DIR` moved, uninstall took an equal
+/// entry the person registered in the new directory's `.claude.json` for
+/// EnvCloak's, removed it, and left the one EnvCloak registered. Now a
+/// registration is EnvCloak's in the file it was made in only: uninstall
+/// leaves the person's, and takes EnvCloak's out of its own file, with
+/// Claude Code's command pointed back at it.
+///
+/// Mutation checked: `unregister_claude_mcp` reading and changing the
+/// file `CLAUDE_CONFIG_DIR` names now (`ctx.locations.claude_json()`, the
+/// previous reading) instead of the registration's: the person's entry is
+/// removed, EnvCloak's stays, and this fails.
+#[test]
+fn a_registration_is_envcloaks_in_its_own_file_only() {
+    let f = Fixture::new();
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    let entry = f.json(".claude.json")["mcpServers"]["envcloak"].clone();
+    assert!(entry.is_object(), "{entry}");
+    let alt = f.path("alt-claude");
+    std::fs::create_dir(&alt).unwrap();
+    let env = [("CLAUDE_CONFIG_DIR", alt.as_path())];
+    let out = f.host_with(
+        "claude",
+        &[
+            "mcp",
+            "add-json",
+            "--scope",
+            "user",
+            "envcloak",
+            &entry.to_string(),
+        ],
+        &env,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let theirs = std::fs::read(alt.join(".claude.json")).unwrap();
+    // The listing names the file EnvCloak registered in.
+    let out = f.agents_with(
+        &f.home.home(),
+        &["uninstall", "--agent", "claude-code", "--json"],
+        &env,
+    );
+    let listed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(listed["mcp_servers"], json!(["~/.claude.json"]), "{listed}");
+    let (u, code) = f.report_with(&["uninstall", "--agent", "claude-code", "--yes"], &env);
+    assert!(
+        std::fs::read(alt.join(".claude.json")).unwrap() == theirs,
+        "the person's entry was taken for EnvCloak's: {u}"
+    );
+    assert!(
+        f.json(".claude.json")["mcpServers"]
+            .get("envcloak")
+            .is_none(),
+        "EnvCloak's own entry was left: {u}"
+    );
+    assert_eq!(code, 0, "{u}");
+    f.sweep();
+}
+
+/// Codex review: in a fresh home `claude mcp add-json` creates
+/// `~/.claude.json`, and uninstall took the entry out and left the file.
+/// The registration records that it created the file, and what it left:
+/// uninstall removes a file still exactly so; one Claude Code wrote its
+/// own state into since stays, with only EnvCloak's entry taken out.
+///
+/// Mutation checked: the file's creation not recorded (`created` always
+/// `None` in `try_register`): uninstall leaves `~/.claude.json` and this
+/// fails.
+#[test]
+fn a_claude_json_the_install_created_is_removed_by_uninstall() {
+    let f = Fixture::new();
+    std::fs::remove_file(f.path(".claude.json")).unwrap();
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(outcome_of(&v, "~/.claude.json").0, "created", "{v}");
+    let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(outcome_of(&u, "~/.claude.json").0, "removed", "{u}");
+    assert!(!f.path(".claude.json").exists());
+    // Again, and Claude Code writes its own state into it in between.
+    let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    let mut state = f.json(".claude.json");
+    state["numStartups"] = json!(1);
+    std::fs::write(f.path(".claude.json"), state.to_string()).unwrap();
+    age(&f.path(".claude.json"), OLD);
+    let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    let left = f.json(".claude.json");
+    assert_eq!(left["numStartups"], 1, "{left}");
+    assert!(left["mcpServers"].get("envcloak").is_none(), "{left}");
     f.sweep();
 }
 
