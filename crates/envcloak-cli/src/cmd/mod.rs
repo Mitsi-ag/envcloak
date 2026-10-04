@@ -12,7 +12,9 @@
 //! with `not_in_this_build` ([`not_in_this_build`]), reads and echoes no
 //! argument, and asks no daemon. M2-03 landed `pending` and `run`'s
 //! `--wait` and `--manifest`; M2-06 landed `mcp`; M2-08 landed `hook` and
-//! `agents install` and `uninstall`; M2-13 landed `items reclassify`.
+//! `agents install` and `uninstall`; M2-13 landed `items reclassify`;
+//! M2-09 landed `agents status`, whose `--probe` stays registered for
+//! M2-28.
 //!
 //! Argument errors never echo an argument: one could be a pasted secret.
 //! No command takes a value on the command line (gate 13): values come

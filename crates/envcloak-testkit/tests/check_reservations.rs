@@ -892,11 +892,11 @@ fn a_missing_or_malformed_baseline_fails() {
         &t,
         BASELINE,
         "\nmethod lock\n",
-        "\nmethod lock\ncoverage active\n",
+        "\nmethod lock\nsignin_token waiting_for_approval\n",
     );
     assert_fails(
         &t,
-        "`coverage` is not a registry whose code this script reads",
+        "`signin_token` is not a registry whose code this script reads",
     );
 }
 
@@ -1425,12 +1425,12 @@ fn a_landed_row_in_a_table_without_a_reader_fails() {
     edit(
         &t,
         IPC,
-        "| `active` | state | M2-09 | reserved |",
-        "| `active` | state | M2-09 | landed |",
+        "| `waiting_for_approval` | M2b-10 | reserved |",
+        "| `waiting_for_approval` | M2b-10 | landed |",
     );
     assert_fails(
         &t,
-        "`coverage`: `active` is `landed`, but this table has no code reader to check it against: add its reader first",
+        "`signin_token`: `waiting_for_approval` is `landed`, but this table has no code reader to check it against: add its reader first",
     );
 }
 

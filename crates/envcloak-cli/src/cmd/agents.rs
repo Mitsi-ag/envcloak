@@ -135,18 +135,17 @@ pub fn run(args: &[&str]) -> ExitCode {
 /// sets and both servers, and nothing said so), then the coverage report
 /// (M2-09).
 fn run_status(args: &[&str]) -> ExitCode {
+    // `--probe` is registered ahead of M2-28 and refuses whatever else is
+    // there (M2-02's rule), as `run --pty` does.
+    if args.contains(&"--probe") {
+        return status_probe();
+    }
     let json = match args {
         [] => false,
         ["--json"] => true,
         ["--help"] | ["-h"] => {
             println!("usage: {USAGE_TEXT}");
             return ExitCode::SUCCESS;
-        }
-        ["--probe"] | ["--probe", "--json"] | ["--json", "--probe"] => {
-            return super::not_in_this_build(
-                "`envcloak agents status --probe` (probes on this machine, in a probe home of \
-                 their own)",
-            );
         }
         _ => return usage(USAGE_TEXT),
     };
@@ -164,6 +163,14 @@ fn run_status(args: &[&str]) -> ExitCode {
         }
         Err(f) => f.report(FAILURE),
     }
+}
+
+/// `agents status --probe`'s refusal: probes on the person's machine are
+/// M2-28's.
+pub fn status_probe() -> ExitCode {
+    super::not_in_this_build(
+        "`envcloak agents status --probe` (probes on this machine, in a probe home of their own)",
+    )
 }
 
 /// One host's row of the coverage report.
