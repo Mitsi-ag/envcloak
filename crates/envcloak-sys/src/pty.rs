@@ -51,7 +51,10 @@ use crate::owned::OwnedChild;
 #[cfg(target_os = "linux")]
 use crate::owned::OwnedSession;
 use crate::pty_monitor::{self, FRAME, Report};
-use crate::termios::{TerminalSettings, WindowSize};
+pub use crate::termios::{
+    TerminalGuard, TerminalSettings, WindowSize, restore_outer_terminal, set_window_size,
+    window_size,
+};
 
 /// A new pseudo-terminal: the master side, which the CLI reads and writes,
 /// and the slave side, which becomes the command's terminal.
