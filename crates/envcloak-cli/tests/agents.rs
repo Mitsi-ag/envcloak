@@ -45,12 +45,13 @@ use envcloak_agents::hosts::claude::{READ_DENY, TOOL_MATCHER};
 use envcloak_agents::hosts::codex::RULES;
 use envcloak_core::file_backup_v2::list_file_backups_v2;
 use envcloak_core::vault::VaultPaths;
-// The processes these tests start lead a process group of their own, and
-// their exit and output are each waited for within a limit (the class of
-// Codex F-127: `common::finish_within` reads the output to its end without
-// a bound once the process has exited, so a process it left behind holding
-// the output would hang the test).
-use envcloak_testkit::agents::finish_within;
+// The processes these tests start lead a process group of their own (the
+// CLI, through `cli_command`'s wrapper, a session), and their exit and
+// output are each waited for within a limit, what is left of the group
+// killed (the class of Codex F-127: `common::finish_within` reads the
+// output to its end without a bound once the process has exited, so a
+// process it left behind holding the output would hang the test).
+use envcloak_testkit::agents::{finish_session_within, finish_within};
 use envcloak_testkit::{
     Canary, Daemon, TEST_PATH, TestHome, assert_no_canary, by_label, canaries, daemon_socket,
     fresh_seed, labels, sweep_dir,
@@ -292,7 +293,7 @@ impl Fixture {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let out = finish_within(cmd, Duration::from_secs(120));
+        let out = finish_session_within(cmd, Duration::from_secs(120));
         assert_no_canary(&out.stdout, &self.cs);
         assert_no_canary(&out.stderr, &self.cs);
         out
@@ -1142,7 +1143,7 @@ fn init_agents_note_prints_its_results_before_a_state_failure() {
     let init = |dir: &Path| {
         let mut cmd = cli_command(&f.home, &["init", "--agents-note"], &[]);
         cmd.current_dir(dir);
-        let out = finish_within(cmd, Duration::from_secs(120));
+        let out = finish_session_within(cmd, Duration::from_secs(120));
         assert_no_canary(&out.stdout, &f.cs);
         assert_no_canary(&out.stderr, &f.cs);
         out
@@ -1653,7 +1654,7 @@ fn init_agents_note_writes_the_projects_block() {
         argv.extend_from_slice(args);
         let mut cmd = cli_command(&f.home, &argv, &[]);
         cmd.current_dir(&dir);
-        let out = finish_within(cmd, Duration::from_secs(120));
+        let out = finish_session_within(cmd, Duration::from_secs(120));
         assert_no_canary(&out.stdout, &f.cs);
         assert_no_canary(&out.stderr, &f.cs);
         out
@@ -2293,7 +2294,7 @@ fn the_hooks_name_envcloak_by_its_link_on_path() {
         "PATH",
         format!("{}:{}:{TEST_PATH}", link.display(), f.bin.display()),
     );
-    let out = finish_within(cmd, Duration::from_secs(120));
+    let out = finish_session_within(cmd, Duration::from_secs(120));
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     let hooks = f.text(".codex/hooks.json");
     let want = format!("{} hook --host codex", link.join("envcloak").display());
@@ -2317,7 +2318,8 @@ fn arguments_are_never_echoed() {
             vec!["agents", "uninstall", v],
             vec!["agents", "install", "--yes", v],
         ] {
-            let out = finish_within(cli_command(&home, &args, &[]), Duration::from_secs(30));
+            let out =
+                finish_session_within(cli_command(&home, &args, &[]), Duration::from_secs(30));
             assert_eq!(out.status.code(), Some(2), "{args:?}");
             assert_no_canary(&out.stdout, &cs);
             assert_no_canary(&out.stderr, &cs);
