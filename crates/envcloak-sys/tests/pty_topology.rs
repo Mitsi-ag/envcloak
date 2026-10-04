@@ -36,11 +36,17 @@
 //!   for the CLI.
 //!
 //! The kill criterion of M2-17 is judged on these: on either system, a
-//! missing stop or report, the terminal not handed back before SIGCONT,
-//! the outer prompt, `jobs`, `stty -g` or `fg` failing, `/bin/cat` doing
-//! other than its baseline, or the retrying cat's round trip failing,
-//! fails (b) or (c). `/bin/cat`'s own ending on macOS is an application's
-//! (BSD cat does not retry a read `EINTR` interrupts), not the topology's.
+//! missing stop or report, the outer prompt, `jobs`, `stty -g` or `fg`
+//! failing, `/bin/cat` doing other than its baseline, or the retrying
+//! cat's round trip failing, fails (b) or (c). `/bin/cat`'s own ending on
+//! macOS is an application's (BSD cat does not retry a read `EINTR`
+//! interrupts), not the topology's. The order of `Resume` (the terminal
+//! handed back before SIGCONT) is gated by the monitor's model test
+//! (`a_resume_gives_the_terminal_back_before_sigcont_to_the_childs_group`
+//! in `crates/envcloak-sys/src/pty_monitor.rs`), on both systems, every
+//! time: with SIGCONT sent first, (b) and (c) failed on macOS in only 2 of
+//! 5 runs of a review, and pass on Linux, where the monitor's `tcsetpgrp`
+//! lands before cat reads again.
 //!
 //! No libtest harness (`harness = false`): a copy of this binary plays the
 //! driver and the probe, and nothing else runs in the process that forks
@@ -282,10 +288,11 @@ fn cat_label(cat: &str) -> &str {
 /// other error), writes whole, and keeps the default dispositions, so the
 /// suspend character stops it: it must make the round trip after the
 /// stop on each system. The kill criterion (M2-17) is judged on both: a
-/// missing stop or report, the terminal not handed back before SIGCONT,
-/// the outer shell's prompt, `jobs`, `stty -g` or `fg` failing, `/bin/cat`
-/// doing other than its baseline, or the fixture's round trip failing,
-/// on either system, fails (b) or (c).
+/// missing stop or report, the outer shell's prompt, `jobs`, `stty -g` or
+/// `fg` failing, `/bin/cat` doing other than its baseline, or the
+/// fixture's round trip failing, on either system, fails (b) or (c) (the
+/// order of `Resume` is the model test's to gate; see the module
+/// documentation).
 fn cats() -> Vec<(String, bool)> {
     vec![
         ("/bin/cat".to_owned(), bin_cat_reads_on_after_a_stop()),
