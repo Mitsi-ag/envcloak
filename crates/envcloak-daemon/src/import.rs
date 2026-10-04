@@ -25,6 +25,12 @@
 //!   [`SAFE_PROJECT`] instead, or left out, and no slug shaped like a key
 //!   is made. Its provider, classification, links and hosts are detected
 //!   from the value, as `add` detects them.
+//! - An entry found outside any project (machine scope: a shell profile,
+//!   an agent's MCP config, the AWS files, a vendor's export) is grouped
+//!   the same way, so a value a project holds too is the project's one
+//!   item; one found only there becomes `<provider or variable>/<label>`,
+//!   numbered when taken, with [`SAFE_MACHINE`] for a label shaped like a
+//!   key, and adopts no project.
 //! - The plan's digest covers every entry's fate, every item and each
 //!   value's keyed hash; `import.commit` works the plan out again under
 //!   the same lock it writes under, and refuses unless the digest is the
@@ -100,7 +106,7 @@ use envcloak_core::vault::{
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_ipc::proto::{
     self, ErrorKind, FilesBackupParams, FilesRestore, FilesRestoreParams, FilesShowParams,
-    FilesShown, ImportCommit, ImportCommitParams, ImportParams, RecoveryConfirmParams,
+    FilesShown, ImportCommit, ImportCommitParams, ImportParams, ImportScope, RecoveryConfirmParams,
     RestoredFile, RestoredFiles, ShownFile, VerifyParams,
 };
 use envcloak_ipc::view::{
@@ -169,6 +175,9 @@ pub const MAX_CHECKING_ROOTS: usize = 4096;
 /// The project part of new items' slugs when the project's name is shaped
 /// like a key.
 pub const SAFE_PROJECT: &str = "project";
+/// The label part of new machine-scope items' slugs when the label is
+/// shaped like a key.
+pub const SAFE_MACHINE: &str = "machine";
 /// Numbered slugs tried for a new item (`<base>/<project>-2`, ...).
 const SLUG_TRIES: usize = 99;
 /// The longest project part of a new item's slug.
@@ -338,9 +347,17 @@ fn classify(shared: &Shared, name: &str, value: &SecretBytes) -> Result<(), Skip
     }
 }
 
+/// Where a checked entry's item belongs.
+enum Scope {
+    /// The project of this index in [`Input::projects`].
+    Project(usize),
+    /// The machine, under this label (one slug part).
+    Machine(Slug),
+}
+
 /// One checked entry.
 struct Entry {
-    project: usize,
+    scope: Scope,
     profile: Option<ProfileName>,
     name: EnvName,
     value: SecretBytes,
@@ -371,10 +388,28 @@ fn check_input(shared: &Shared, p: ImportParams) -> Result<(Input, Vec<String>),
     }
     let mut entries = Vec::with_capacity(p.entries.len());
     for e in p.entries {
-        let project = usize::try_from(e.project).map_err(|_| invalid())?;
-        if project >= projects.len() {
-            return Err(invalid());
-        }
+        let scope = match e.scope {
+            ImportScope::Project(i) => {
+                let project = usize::try_from(i).map_err(|_| invalid())?;
+                if project >= projects.len() {
+                    return Err(invalid());
+                }
+                Scope::Project(project)
+            }
+            // The machine: one slug part, never one shaped like a key, and
+            // no profile (a profile is a project's).
+            ImportScope::Machine(m) => {
+                if m.label.contains('/') || e.profile.is_some() {
+                    return Err(invalid());
+                }
+                let label = if looks_like_value(shared, &m.label) {
+                    SAFE_MACHINE
+                } else {
+                    m.label.as_str()
+                };
+                Scope::Machine(Slug::new(label).map_err(|_| invalid())?)
+            }
+        };
         let profile = e
             .profile
             .as_deref()
@@ -382,7 +417,7 @@ fn check_input(shared: &Shared, p: ImportParams) -> Result<(Input, Vec<String>),
             .transpose()
             .map_err(|_| invalid())?;
         entries.push(Entry {
-            project,
+            scope,
             profile,
             name: EnvName::new(&e.name).map_err(|_| invalid())?,
             value: e.value.into_inner(),
@@ -546,7 +581,10 @@ fn plan(shared: &Shared, v: &Vault, input: &Input, person: bool) -> Result<Plan,
             }
         };
         items[at].entries += 1;
-        items[at].projects.insert(e.project);
+        // A machine entry adopts no project.
+        if let Scope::Project(project) = e.scope {
+            items[at].projects.insert(project);
+        }
         fates.push(Fate::Item(at));
     }
     let digest = digest(&fates, &items);
@@ -595,14 +633,13 @@ fn new_item(
         provider = d.provider.map(|p| p.as_str().to_owned());
     }
     let base = provider.clone().unwrap_or_else(|| name_base(&e.name));
-    let slug = new_slug(
-        shared,
-        v,
-        taken,
-        &base,
-        &input.projects[e.project],
-        e.profile.as_ref(),
-    )?;
+    // `<base>/<project>[-<profile>]`, or a machine item's `<base>/<label>`,
+    // numbered when taken.
+    let part = match &e.scope {
+        Scope::Project(project) => &input.projects[*project],
+        Scope::Machine(label) => label,
+    };
+    let slug = new_slug(shared, v, taken, &base, part, e.profile.as_ref())?;
     taken.insert(slug.clone());
     slug.as_str().clone_into(&mut details.title);
     let classification = details.classification;

@@ -27,7 +27,8 @@ use envcloak_core::vault::{FieldName, ItemDetails, LockedVault, NewItem, Slug, V
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_ipc::proto::{
     BackupFileParams, ErrorKind, FileLeft, FilesBackupParams, ImportCommitParams, ImportEntry,
-    ImportParams, ImportProject, VerifyEntry, VerifyFile, VerifyParams,
+    ImportParams, ImportProject, ImportScope, MachineScope, MachineSource, VerifyEntry, VerifyFile,
+    VerifyParams,
 };
 use envcloak_ipc::view::{EntryStatus, ImportPlanView, LengthClass, SkipReason, VerifyView};
 use envcloak_ipc::{ClientError, WireSecret};
@@ -120,7 +121,7 @@ impl Fixture {
 
 fn entry(project: u32, file: &str, profile: Option<&str>, name: &str, v: &[u8]) -> ImportEntry {
     ImportEntry {
-        project,
+        scope: ImportScope::Project(project),
         file: file.to_owned(),
         line: 1,
         profile: profile.map(str::to_owned),
@@ -171,6 +172,179 @@ fn two_repos(f: &Fixture) -> ImportParams {
         ],
         claims: Vec::new(),
     }
+}
+
+/// A machine-scope entry (M2-11): found under `label`, from `source`.
+fn machine(source: MachineSource, label: &str, file: &str, name: &str, v: &[u8]) -> ImportEntry {
+    ImportEntry {
+        scope: ImportScope::Machine(MachineScope {
+            source,
+            label: label.to_owned(),
+        }),
+        file: file.to_owned(),
+        line: 1,
+        profile: None,
+        name: name.to_owned(),
+        value: WireSecret::new(SecretBytes::copy_from(v)),
+    }
+}
+
+/// Machine-scope entries (M2-11; SPEC §6.4; gate 10, machine dedupe): a
+/// value found in a shell profile that a project's env file holds too is
+/// one item, the project's, which only the project's entry adopts; a value
+/// found only outside a project is a new item named `<provider or
+/// variable>/<label>`, numbered when the name is taken, with no project; a
+/// value the vault holds already binds to its item and reports it as the
+/// holder, from an MCP config as from a project; a label shaped like a key
+/// is never kept (`<base>/machine`); the commit makes exactly those items;
+/// and an agent's import of a machine value short enough to guess leaves
+/// it out as a project's would. A machine entry with a profile, or a
+/// label of two slug parts, is refused whole.
+///
+/// Mutations: machine entries counted as projects (the profile's item
+/// counts 2 projects); the label left out of the slug (both secrets of
+/// `secrets-sh` are named after the project, the request is refused).
+#[test]
+fn machine_scope_values_dedupe_with_projects_and_are_named_by_label() {
+    let mut f = Fixture::new(|_, _| {});
+    let rotated = by_label(&f.cs, labels::OPENAI_API_KEY_ROTATED)
+        .value()
+        .to_vec();
+    let stripe = by_label(&f.cs, labels::STRIPE_SECRET_KEY).value().to_vec();
+    let (a, b, aws) = (word(24), word(24), word(40));
+    // Letters and digits, 40 long: a label shaped like a key.
+    let hashed = format!("{}7{}", word(20), word(19));
+    for (label, v) in [("MACHINE_A", &a), ("MACHINE_B", &b), ("MACHINE_AWS", &aws)] {
+        f.cs.push(Canary::new(label, v.clone()));
+    }
+    f.cs.push(Canary::new("HASH_LABEL", hashed.clone()));
+    let short = f.short.clone();
+    let params = |claims: &[&str]| ImportParams {
+        projects: vec![ImportProject {
+            dir: f.dir("acme-api"),
+            name: "acme-api".into(),
+        }],
+        entries: vec![
+            entry(0, ".env", None, "OPENAI_API_KEY", &rotated),
+            machine(
+                MachineSource::Profile,
+                "zshrc",
+                "~/.zshrc",
+                "OPENAI_API_KEY",
+                &rotated,
+            ),
+            machine(
+                MachineSource::Profile,
+                "secrets-sh",
+                "~/.secrets.sh",
+                "DEEPSEEK_API_KEY",
+                a.as_bytes(),
+            ),
+            machine(
+                MachineSource::Profile,
+                "secrets-sh",
+                "~/.secrets.sh",
+                "DEEPSEEK_API_KEY",
+                b.as_bytes(),
+            ),
+            machine(
+                MachineSource::McpConfig,
+                "mcp-claude-code-fixture-stdio",
+                "~/.claude.json",
+                "STRIPE_API_KEY",
+                &stripe,
+            ),
+            machine(
+                MachineSource::Aws,
+                &hashed,
+                "~/.aws/credentials",
+                "AWS_SECRET_ACCESS_KEY",
+                aws.as_bytes(),
+            ),
+            machine(
+                MachineSource::Export,
+                "doppler",
+                "export.json",
+                "SHORT_TOKEN",
+                short.as_bytes(),
+            ),
+        ],
+        claims: claims.iter().map(|c| (*c).to_owned()).collect(),
+    };
+    let mut c = client(&f.home);
+    let before = c.items_list(false).unwrap().items.len();
+    let plan = c.import_plan(&params(&[])).unwrap();
+    assert!(plan.entries.iter().all(|e| e.skipped.is_none()));
+    // The profile's OpenAI key is the project's item, adopted by the
+    // project alone.
+    assert_eq!(plan.entries[1].item, plan.entries[0].item);
+    let openai = item_of(&plan, 0);
+    assert_eq!(openai.slug, "openai/acme-api");
+    assert_eq!((openai.entries, openai.projects), (2, 1));
+    // Machine values: `<variable>/<label>`, numbered, no project.
+    let first = item_of(&plan, 2);
+    assert_eq!(first.slug, "deepseek-api-key/secrets-sh");
+    assert_eq!(
+        (first.entries, first.projects, first.existing),
+        (1, 0, false)
+    );
+    assert_eq!(item_of(&plan, 3).slug, "deepseek-api-key/secrets-sh-2");
+    // The MCP config's Stripe key is the vault's.
+    let held = item_of(&plan, 4);
+    assert!(held.existing);
+    assert_eq!(held.holders, ["stripe/acme-web"]);
+    // A label shaped like a key is not kept.
+    assert_eq!(item_of(&plan, 5).slug, "aws-secret-access-key/machine");
+    assert_eq!(item_of(&plan, 6).slug, "short-token/doppler");
+    assert_no_canary(&json(&plan), &f.cs);
+    // Committed: exactly the new items.
+    let done = c
+        .import_commit(&ImportCommitParams {
+            import: params(&[]),
+            digest: plan.digest.clone(),
+        })
+        .unwrap();
+    assert_eq!(done, plan);
+    let slugs: Vec<String> = c
+        .items_list(false)
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|i| i.slug)
+        .collect();
+    assert_eq!(slugs.len(), before + 5);
+    for s in [
+        "openai/acme-api",
+        "deepseek-api-key/secrets-sh",
+        "deepseek-api-key/secrets-sh-2",
+        "aws-secret-access-key/machine",
+        "short-token/doppler",
+    ] {
+        assert!(slugs.iter().any(|x| x == s), "{s}");
+    }
+    // An agent's import of the machine value short enough to guess leaves
+    // it out, though the vault holds it now.
+    let agent = c.import_plan(&params(&[AGENT])).unwrap();
+    assert_eq!(agent.entries[6].skipped, Some(SkipReason::Guessable));
+    // Refused whole: a machine entry with a profile, a label of two parts.
+    let mut with_profile = params(&[]);
+    with_profile.entries[2].profile = Some("short".into());
+    let mut two_parts = params(&[]);
+    two_parts.entries[2] = machine(
+        MachineSource::Profile,
+        "secrets/sh",
+        "~/.secrets.sh",
+        "DEEPSEEK_API_KEY",
+        a.as_bytes(),
+    );
+    for p in [with_profile, two_parts] {
+        assert_eq!(
+            rpc(c.import_plan(&p).unwrap_err()),
+            ErrorKind::InvalidParams
+        );
+    }
+    drop(c);
+    f.sweep();
 }
 
 fn item_of(p: &ImportPlanView, entry: usize) -> &envcloak_ipc::view::ImportItemView {
