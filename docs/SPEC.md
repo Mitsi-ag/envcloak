@@ -583,7 +583,7 @@ Per agent:
   - `permissions.deny` entries `Read(**/.env*)`, which Claude Code also applies, best effort, to `@file` mentions that `PreToolUse` never sees.
   - Sandbox settings in the user's `~/.claude/settings.json`:
     - On macOS, add EnvCloak's socket path to `sandbox.network.allowUnixSockets`; otherwise sandboxed Bash cannot reach the daemon.
-    - On Linux the sandbox can only allow every Unix socket (`allowAllUnixSockets`), so the installer asks first. It never adds `envcloak` to `excludedCommands`, because that would run every wrapped command outside the sandbox.
+    - On Linux the sandbox can only allow every Unix socket (`allowAllUnixSockets`), and even then its pid namespace hides the daemon's pid, which the client requires, so no documented setting lets sandboxed Bash reach and verify the daemon (K-01, measured on the pinned version, docs/AGENTS.md "K-01 on Linux"). The installer writes no socket allowance and no broader network setting on Linux, with or without consent, and reports the sandboxed shell `unsupported (sandbox_blocks_socket)`; this is reconsidered only after the decision on a kernel-hidden daemon pid (M2 plan Q-16) and new host measurements. It never adds `envcloak` to `excludedCommands`, because that would run every wrapped command outside the sandbox.
     - `sandbox.credentials` deny entries for `EnvCloak/vault` and `EnvCloak/backups` stop sandboxed commands from copying the vault file.
   - Reported as degraded:
     - `disableAllHooks` in user, project, local or managed settings, managed `allowManagedHooksOnly`, and `CLAUDE_CONFIG_DIR` pointing elsewhere;
