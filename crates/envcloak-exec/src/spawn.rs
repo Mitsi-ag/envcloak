@@ -7,9 +7,15 @@
 //! the wiping allocator clears them then (gate 11). Nothing is written to
 //! a file or to this process's environment, and argv is the caller's own.
 //!
+//! In PTY mode ([`spawn_session`], M2 task M2-17) the command is started
+//! by the PTY monitor `envcloak_sys::pty::spawn_session` forks, from C
+//! strings built here and wiped when it returns: this process's
+//! environment with the values on top, the same as `Command::env` gives.
+//!
 //! This file is on security/expose-allowlist.txt: it hands the values to
 //! the child's environment.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::OwnedFd;
@@ -19,6 +25,7 @@ use std::process::{Child, Command, Stdio};
 
 use envcloak_core::SecretBytes;
 use envcloak_policy::EnvName;
+use envcloak_sys::pty::{SessionError, SessionMonitor};
 use secrecy::ExposeSecret;
 
 use crate::ExecError;
@@ -57,6 +64,56 @@ pub(crate) fn spawn(
 #[allow(clippy::disallowed_methods)] // The value goes to the child's environment.
 fn set_env(cmd: &mut Command, name: &EnvName, value: &SecretBytes) {
     cmd.env(name.as_str(), OsStr::from_bytes(value.expose_secret()));
+}
+
+#[allow(clippy::disallowed_methods)] // The value goes to the command's environment.
+fn exposed(value: &SecretBytes) -> &OsStr {
+    OsStr::from_bytes(value.expose_secret())
+}
+
+/// Starts `argv` on the PTY whose slave side is `slave`, under the PTY
+/// monitor (PTY mode), with `injected` added to this process's
+/// environment: a later entry for a name wins, and an injected name
+/// replaces an inherited one, as with `Command::env`. The command's
+/// environment is built here as C strings, which `spawn_session` wipes
+/// when it returns; nothing is written to a file or to this process's
+/// environment.
+pub(crate) fn spawn_session(
+    argv: &[OsString],
+    injected: &[(EnvName, SecretBytes)],
+    slave: OwnedFd,
+) -> Result<SessionMonitor, ExecError> {
+    if argv.is_empty() {
+        return Err(ExecError::NoCommand);
+    }
+    if injected.iter().any(|(_, v)| v.contains_byte(0)) {
+        return Err(ExecError::NulByte);
+    }
+    // The last entry for each injected name.
+    let mut seen = HashSet::new();
+    let mut chosen: Vec<&(EnvName, SecretBytes)> = injected
+        .iter()
+        .rev()
+        .filter(|(name, _)| seen.insert(name.as_str()))
+        .collect();
+    chosen.reverse();
+    let inherited: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(name, _)| name.to_str().is_none_or(|n| !seen.contains(n)))
+        .collect();
+    let mut env: Vec<(&OsStr, &OsStr)> = inherited
+        .iter()
+        .map(|(n, v)| (n.as_os_str(), v.as_os_str()))
+        .collect();
+    env.extend(
+        chosen
+            .iter()
+            .map(|(name, value)| (OsStr::new(name.as_str()), exposed(value))),
+    );
+    let argv: Vec<&OsStr> = argv.iter().map(OsString::as_os_str).collect();
+    envcloak_sys::pty::spawn_session(&argv, &env, slave).map_err(|e| match e {
+        SessionError::Exec(e) => spawn_error(&e),
+        SessionError::Setup(e) => ExecError::Setup(e.kind()),
+    })
 }
 
 /// What a failed spawn means for the exit code (SPEC §6.1 step 9): a

@@ -21,8 +21,9 @@
 //!    stream. Only what the redactor releases is written out. Relative
 //!    order between the two streams is not kept. Standard input is
 //!    inherited. The child sees pipes, not a terminal, so programs that
-//!    color their output only on a terminal print plain text; PTY mode
-//!    (`--pty`) is M2's.
+//!    color their output only on a terminal print plain text. PTY mode
+//!    (`--pty`) starts the command on a pseudo-terminal of its own instead
+//!    ([`start_pty`], M2 task M2-17; the relay is M2-19's).
 //! 4. Signals ([`signals`]): with a controlling terminal the child stays in
 //!    this process's group, so the terminal's SIGINT and SIGQUIT reach it
 //!    directly; SIGTERM and SIGHUP are passed on, and so are a SIGINT or
@@ -76,11 +77,58 @@ use std::time::Duration;
 use envcloak_core::SecretBytes;
 use envcloak_policy::EnvName;
 pub use envcloak_redact::Redactor;
-use envcloak_sys::Interrupter;
+use envcloak_sys::pty::SessionMonitor;
+use envcloak_sys::{Interrupter, TerminalSettings, WindowSize};
 
 pub use coverage::{
     COMFORT_LEN, CoverageReport, Label, MIN_VALUE_LEN, ShortPolicy, build_redactor,
 };
+
+/// A command started on a pseudo-terminal of its own (PTY mode; M2 task
+/// M2-17 starts it, M2-19 relays it): the PTY's master side, which carries
+/// the command's merged output and takes its input, and the PTY monitor
+/// that leads the command's session ([`envcloak_sys::pty`]).
+pub struct PtyCommand {
+    pub master: OwnedFd,
+    pub monitor: SessionMonitor,
+}
+
+impl std::fmt::Debug for PtyCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyCommand")
+            .field("monitor", &self.monitor)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Starts `argv` with `injected` in its environment on a new PTY whose
+/// slave side starts with `settings` (the outer terminal's) and `size`:
+/// the PTY monitor leads the session and the command runs as its
+/// foreground process group (M2 plan D-35). The values reach the
+/// command's environment only, as in [`run`].
+///
+/// # Errors
+/// [`ExecError::NoCommand`], [`ExecError::NulByte`], [`ExecError::NotFound`]
+/// and [`ExecError::NotExecutable`] before anything runs, and
+/// [`ExecError::Setup`] when no PTY can be opened or the monitor cannot set
+/// the session up.
+pub fn start_pty(
+    argv: &[OsString],
+    injected: &[(EnvName, SecretBytes)],
+    size: Option<WindowSize>,
+    settings: Option<&TerminalSettings>,
+) -> Result<PtyCommand, ExecError> {
+    if argv.is_empty() {
+        return Err(ExecError::NoCommand);
+    }
+    let pty =
+        envcloak_sys::pty::open_pty(size, settings).map_err(|e| ExecError::Setup(e.kind()))?;
+    let monitor = spawn::spawn_session(argv, injected, pty.slave)?;
+    Ok(PtyCommand {
+        master: pty.master,
+        monitor,
+    })
+}
 
 /// How long a pipe must be quiet before the redactor releases what it held
 /// back that cannot be the start of a value: 40 ms (SPEC §6.1 step 7), so

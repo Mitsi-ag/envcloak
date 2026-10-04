@@ -33,3 +33,9 @@ tempfile.workspace = true
 [[test]]
 name = "runner"
 harness = false
+
+# Its own main: the command it starts on a pseudo-terminal is this binary
+# (see the file).
+[[test]]
+name = "pty_spawn"
+harness = false
