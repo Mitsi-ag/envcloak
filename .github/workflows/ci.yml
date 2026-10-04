@@ -71,16 +71,21 @@ jobs:
       # fails here if ripgrep is missing. Its shell oracle (shell_oracle.rs)
       # runs every spelling in bash, sh, dash and zsh (zsh is the shell of
       # Claude Code's Bash tool on macOS), and fails here if one is missing.
-      - name: Install ripgrep and the shells
+      # Its program oracle (program_oracle.rs) runs readers' programs with
+      # sed, awk (mawk and gawk on Linux), jq and yq, and fails here if sed,
+      # awk or jq is missing.
+      - name: Install ripgrep, the shells and the readers
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get install -y --no-install-recommends ripgrep zsh dash
+            sudo apt-get install -y --no-install-recommends ripgrep zsh dash gawk jq
           else
             command -v rg >/dev/null || brew install ripgrep
+            command -v jq >/dev/null || brew install jq
           fi
           rg --version
           echo "ENVCLOAK_TEST_REQUIRE_RG=1" >> "$GITHUB_ENV"
           echo "ENVCLOAK_TEST_REQUIRE_SHELLS=bash,sh,dash,zsh" >> "$GITHUB_ENV"
+          echo "ENVCLOAK_TEST_REQUIRE_TOOLS=sed,awk,jq" >> "$GITHUB_ENV"
       # The gate 19 crash test runs its positive core-dump control only when
       # core files go to a known directory, which it checks and cleans up.
       # In CI it fails if the control cannot run.

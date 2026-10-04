@@ -1940,7 +1940,8 @@ fn key_shaped_arguments_are_refused_before_the_daemon_is_asked() {
 /// `PreToolUse` hook denies in a shell, with the hook's own message, before
 /// the daemon is asked, so a host without hooks gets the same accident
 /// prevention: an env file read, the environment printed, `envcloak
-/// approve` or `reveal` run by the agent, a script it cannot read. A
+/// approve` or `reveal` run by the agent, a script it cannot read, a
+/// reader's program that reads one or names the whole environment. A
 /// command the hook allows is the positive control: it reaches the daemon.
 ///
 /// Mutation checked: the `decide_argv` refusal removed from
@@ -1969,13 +1970,33 @@ fn hook_classes_are_refused_before_the_daemon_is_asked() {
         opened()
     };
     let before = control(&mut m, 0);
-    let cases: [(&[&str], &str); 6] = [
+    let cases: [(&[&str], &str); 11] = [
         (&["printenv"], "[envcloak:env_dump]"),
         (&["cat", ".env"], "[envcloak:env_file]"),
         (&["env"], "[envcloak:env_dump]"),
         (&["sh", "-c", "head -n 1 .env.local"], "[envcloak:env_file]"),
         (&["envcloak", "approve", "REQUEST"], "[envcloak:approve]"),
         (&["sh", "-c", "$c .env"], "[envcloak:ambiguous]"),
+        // A reader's program (Codex review, round 6): sed's `r`, awk's
+        // `getline <` and `ENVIRON`, jq's `env`, grep's patterns from a
+        // file.
+        (&["sed", "1r .env", "a.txt"], "[envcloak:env_file]"),
+        (
+            &[
+                "awk",
+                "BEGIN { while ((getline l < \".env\") > 0) print l }",
+            ],
+            "[envcloak:env_file]",
+        ),
+        (
+            &["awk", "BEGIN { for (k in ENVIRON) print k, ENVIRON[k] }"],
+            "[envcloak:unresolved]",
+        ),
+        (&["jq", "-n", "env"], "[envcloak:unresolved]"),
+        (
+            &["grep", "-v", "-f", "/dev/null", ".env"],
+            "[envcloak:env_file]",
+        ),
     ];
     for (argv, marker) in cases {
         let r = m.call(
