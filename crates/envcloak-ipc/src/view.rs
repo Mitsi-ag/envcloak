@@ -74,6 +74,7 @@ views!(
     BackupCreatorView,
     BackupListView,
     BackupEntryView,
+    ScanMatchView,
 );
 
 /// What [`StatusView::sanitize`] puts in place of a version that is not
@@ -1224,6 +1225,51 @@ pub struct ImportItemView {
     /// Entries that use it, and in how many projects.
     pub entries: u32,
     pub projects: u32,
+}
+
+/// `scan.match`: which candidates the vault's `secret` items hold, which
+/// match a provider's key pattern instead, and how many were compared.
+/// Never a value. A candidate short enough to guess that the caller may
+/// not have compared is counted in `skipped_guessable` and nowhere else,
+/// whether the vault holds it or not, so its answer is the same either
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanMatchView {
+    /// One per candidate and item holding it, in the order the candidates
+    /// were sent, then by slug.
+    pub matches: Vec<ScanMatchedView>,
+    /// Candidates compared that no item holds and a provider's key pattern
+    /// matches: one per candidate and provider.
+    pub patterns: Vec<ScanPatternView>,
+    /// Candidates compared, counted against the subject root's budgets.
+    pub compared: u32,
+    /// Candidates short enough to guess that this purpose, or this caller,
+    /// may not have compared.
+    pub skipped_guessable: u32,
+    /// A budget ran out during the call: the candidates in neither count
+    /// were not compared, and the run is incomplete (`limited`).
+    pub limited: bool,
+}
+
+/// A candidate an item holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanMatchedView {
+    /// The candidate's id, as sent.
+    pub id: u32,
+    /// The item's id: 26 Crockford base32 characters.
+    pub item: String,
+    pub slug: String,
+}
+
+/// A candidate no item holds that a provider's key pattern matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanPatternView {
+    pub id: u32,
+    /// A provider registry id.
+    pub provider: String,
 }
 
 /// `import.verify`: whether an import's env files may be deleted.

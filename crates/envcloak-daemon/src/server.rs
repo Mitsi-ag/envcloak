@@ -58,8 +58,8 @@ use envcloak_ipc::proto::{
     FilesRestore, FilesShow, GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify,
     IncomingRequest, ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow,
     ItemsTarget, Lock, Method, PendingGet, PendingList, PendingPoll, RecoveryConfirm, Role,
-    RunRequest, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams, VaultRecover,
-    loggable_method, required_role,
+    RunRequest, ScanMatch, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
+    VaultRecover, loggable_method, required_role,
 };
 use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
@@ -189,8 +189,14 @@ pub(crate) struct Shared {
     /// The provider registry compiled into this build, whose key patterns
     /// mask keys in the command lines the audit log keeps.
     pub(crate) registry: Option<Registry>,
-    /// Values compared with the vault, per subject root.
+    /// Values compared with the vault, per subject root: those of the
+    /// import methods and the guessable candidates of `scan.match`
+    /// (`ValueChecks`).
     pub(crate) value_checks: Mutex<crate::import::ValueChecks>,
+    /// `scan.match`'s candidates that are not guessable, per subject root
+    /// (`ScanChecks`, M2 plan D-32). Taken after `value_checks`, never
+    /// before.
+    pub(crate) scan_checks: Mutex<crate::import::ValueChecks>,
     /// The restore chunks on their way out, which a lock waits for.
     pub(crate) deliveries: backups::Deliveries,
 }
@@ -220,6 +226,9 @@ impl Shared {
             exe_hashes: crate::exe_hash::ExeHashCache::new(),
             registry: None,
             value_checks: Mutex::new(crate::import::ValueChecks::default()),
+            scan_checks: Mutex::new(crate::import::ValueChecks::with_limit(
+                crate::scan_match::MAX_SCAN_CHECKS,
+            )),
             deliveries: backups::Deliveries::default(),
         }
     }
@@ -342,6 +351,9 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         exe_hashes: crate::exe_hash::ExeHashCache::new(),
         registry,
         value_checks: Mutex::new(crate::import::ValueChecks::default()),
+        scan_checks: Mutex::new(crate::import::ValueChecks::with_limit(
+            crate::scan_match::MAX_SCAN_CHECKS,
+        )),
         deliveries: backups::Deliveries::default(),
     });
 
@@ -799,6 +811,9 @@ fn respond<'s>(
         }
         ItemsRotate::NAME => answer::<ItemsRotate>(id, &req, |p| items::rotate(shared, peer, p)),
         ItemsRemove::NAME => answer::<ItemsRemove>(id, &req, |p| items::remove(shared, peer, p)),
+        ScanMatch::NAME => {
+            answer::<ScanMatch>(id, &req, |p| crate::scan_match::scan_match(shared, peer, p))
+        }
         ImportPlan::NAME => {
             answer::<ImportPlan>(id, &req, |p| import::import_plan(shared, peer, p))
         }

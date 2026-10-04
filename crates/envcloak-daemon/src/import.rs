@@ -59,7 +59,9 @@
 //!   whether the vault holds it or not.
 //! - Each subject root may have [`MAX_VALUE_CHECKS`] values compared in
 //!   [`CHECK_WINDOW`] of awake time (`import.plan`, `import.commit` and
-//!   `import.verify` count), and more are refused (`too_many_checks`).
+//!   `import.verify` count, and `scan.match`'s guessable candidates), and
+//!   more are refused (`too_many_checks`). `scan.match`'s other candidates
+//!   count in a table of their own (`crate::scan_match`).
 //! - Each `import.plan`, `import.commit` and `import.verify` is audited
 //!   with the count of values compared (kind `import`, outcome `checked`),
 //!   and a refusal too.
@@ -208,7 +210,7 @@ fn secret_name(name: &str) -> bool {
 /// reading counts, so an `@` in a URL's path or query does not lengthen
 /// it. A password in any other form is measured with the whole value
 /// (docs/IMPORT.md "Who may compare values").
-fn guessable(shared: &Shared, value: &SecretBytes) -> bool {
+pub(crate) fn guessable(shared: &Shared, value: &SecretBytes) -> bool {
     if let Some(chars) = password_chars(value) {
         return chars < GUESSABLE_BELOW;
     }
@@ -224,28 +226,50 @@ fn guessable(shared: &Shared, value: &SecretBytes) -> bool {
 }
 
 /// Values compared with the vault, per subject root, in the current
-/// window of each.
-#[derive(Debug, Default)]
+/// window of each, against a limit per window: [`MAX_VALUE_CHECKS`] for
+/// the values `import.*` compares and the guessable candidates of
+/// `scan.match` (`ValueChecks`), and
+/// [`crate::scan_match::MAX_SCAN_CHECKS`] for `scan.match`'s other
+/// candidates (`ScanChecks`, M2 plan D-32). Two separate tables, so one
+/// spent leaves the other as it was.
+#[derive(Debug)]
 pub(crate) struct ValueChecks {
+    /// Values a root may have compared in one window.
+    limit: usize,
     /// Each root, when its window started (awake time) and how many values
     /// it has had compared since.
     by_root: HashMap<ProcessInstance, (Duration, usize)>,
 }
 
+impl Default for ValueChecks {
+    /// The `import.*` table: [`MAX_VALUE_CHECKS`] a root in a window.
+    fn default() -> Self {
+        ValueChecks::with_limit(MAX_VALUE_CHECKS)
+    }
+}
+
 impl ValueChecks {
-    /// Counts `n` values compared for `root` at `awake`; false (and
-    /// nothing counted) when that would pass [`MAX_VALUE_CHECKS`] in the
-    /// root's window. A call that compares nothing is admitted and not
-    /// counted, so it takes no place in the table. With
-    /// [`MAX_CHECKING_ROOTS`] roots counted, a new root takes the place of
-    /// the one whose window started first: that only forgets a count, so
-    /// no caller, however many roots it makes, can have another refused.
-    pub(crate) fn admit(&mut self, root: &ProcessInstance, n: usize, awake: Duration) -> bool {
+    /// A table that lets each root have `limit` values compared in a
+    /// window.
+    pub(crate) fn with_limit(limit: usize) -> Self {
+        ValueChecks {
+            limit,
+            by_root: HashMap::new(),
+        }
+    }
+
+    /// Forgets the windows that ended by `awake`.
+    fn expire(&mut self, awake: Duration) {
         self.by_root
             .retain(|_, (start, _)| awake.saturating_sub(*start) < CHECK_WINDOW);
-        if n == 0 {
-            return true;
-        }
+    }
+
+    /// The count of `root`'s window at `awake`, its window starting now
+    /// when it has none. With [`MAX_CHECKING_ROOTS`] roots counted, a new
+    /// root takes the place of the one whose window started first: that
+    /// only forgets a count, so no caller, however many roots it makes,
+    /// can have another refused.
+    fn count_of(&mut self, root: &ProcessInstance, awake: Duration) -> &mut usize {
         if !self.by_root.contains_key(root) && self.by_root.len() >= MAX_CHECKING_ROOTS {
             let oldest = self
                 .by_root
@@ -256,14 +280,48 @@ impl ValueChecks {
                 self.by_root.remove(&r);
             }
         }
-        let (_, count) = self.by_root.entry(root.clone()).or_insert((awake, 0));
+        &mut self.by_root.entry(root.clone()).or_insert((awake, 0)).1
+    }
+
+    /// Counts `n` values compared for `root` at `awake`; false (and
+    /// nothing counted) when that would pass the limit in the root's
+    /// window. A call that compares nothing is admitted and not counted,
+    /// so it takes no place in the table.
+    pub(crate) fn admit(&mut self, root: &ProcessInstance, n: usize, awake: Duration) -> bool {
+        self.expire(awake);
+        if n == 0 {
+            return true;
+        }
+        let limit = self.limit;
+        let count = self.count_of(root, awake);
         match count.checked_add(n) {
-            Some(total) if total <= MAX_VALUE_CHECKS => {
+            Some(total) if total <= limit => {
                 *count = total;
                 true
             }
             _ => false,
         }
+    }
+
+    /// Counts as many of `n` values for `root` at `awake` as its window
+    /// has room for, and returns how many: `n` while the window lasts, then
+    /// what is left of the limit, then none. Zero takes no place in the
+    /// table, as for [`ValueChecks::admit`].
+    pub(crate) fn admit_up_to(
+        &mut self,
+        root: &ProcessInstance,
+        n: usize,
+        awake: Duration,
+    ) -> usize {
+        self.expire(awake);
+        if n == 0 {
+            return 0;
+        }
+        let limit = self.limit;
+        let count = self.count_of(root, awake);
+        let admitted = limit.saturating_sub(*count).min(n);
+        *count += admitted;
+        admitted
     }
 }
 
@@ -1528,6 +1586,27 @@ mod tests {
             t0 + Duration::from_secs(2)
         ));
         assert!(!b.admit(&inst(101), 1, t0 + Duration::from_secs(2)));
+    }
+
+    /// A budget that admits part of a call (`scan.match`'s): as much as
+    /// the window has room for, then nothing until the window ends; its
+    /// own limit, apart from the import table's; zero takes no place.
+    ///
+    /// Mutation: the limit not looked at (every value admitted).
+    #[test]
+    fn a_partial_admission_stops_at_the_limit() {
+        let mut b = ValueChecks::with_limit(10);
+        let (one, two) = (inst(10), inst(20));
+        let t0 = Duration::from_secs(1000);
+        assert_eq!(b.admit_up_to(&one, 0, t0), 0);
+        assert!(b.by_root.is_empty());
+        assert_eq!(b.admit_up_to(&one, 7, t0), 7);
+        assert_eq!(b.admit_up_to(&one, 7, t0), 3);
+        assert_eq!(b.admit_up_to(&one, 1, t0), 0);
+        assert!(!b.admit(&one, 1, t0));
+        assert_eq!(b.admit_up_to(&two, usize::MAX, t0), 10);
+        assert_eq!(b.admit_up_to(&one, 4, t0 + CHECK_WINDOW), 4);
+        assert_eq!(ValueChecks::default().limit, MAX_VALUE_CHECKS);
     }
 
     /// Calls that compare nothing take no place: any number of roots

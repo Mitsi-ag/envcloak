@@ -42,6 +42,7 @@ mod items;
 mod lock;
 mod redact;
 mod requests;
+mod scan_match;
 mod server;
 mod state;
 

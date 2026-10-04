@@ -297,8 +297,8 @@ fn a_reserved_reason_the_code_already_has_fails() {
     edit(
         &t,
         IPC,
-        "| `limited` | M2-11 | reserved |",
-        "| `requester_terminal` | M2-11 | reserved |",
+        "| `limited` | M2-11 | landed |",
+        "| `requester_terminal` | M2-11 | reserved | a test row |\n| `limited` | M2-11 | landed |",
     );
     assert_fails(
         &t,
@@ -486,8 +486,8 @@ fn a_token_printed_directly_as_envcloak_token_counts() {
     edit(
         &t,
         IPC,
-        "| `limited` | M2-11 | reserved |",
-        "| `warning` | M2-11 | reserved |",
+        "| `limited` | M2-11 | landed |",
+        "| `warning` | M2-11 | reserved | a test row |\n| `limited` | M2-11 | landed |",
     );
     assert_fails(
         &t,
@@ -550,8 +550,8 @@ fn a_name_reserved_in_two_printed_tables_fails() {
     edit(
         &t,
         IPC,
-        "| `limited` | M2-11 | reserved |",
-        "| `incomplete` | M2-11 | reserved |",
+        "| `limited` | M2-11 | landed |",
+        "| `incomplete` | M2-11 | reserved | a test row |\n| `limited` | M2-11 | landed |",
     );
     assert_fails(
         &t,
@@ -580,8 +580,8 @@ fn a_name_the_shared_list_names_with_both_tables_passes() {
     edit(
         &t,
         IPC,
-        "| `limited` | M2-11 | reserved |",
-        "| `incomplete` | M2-11 | reserved |",
+        "| `limited` | M2-11 | landed |",
+        "| `incomplete` | M2-11 | reserved | a test row |\n| `limited` | M2-11 | landed |",
     );
     let script = t.home().join("check.py");
     let text = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();

@@ -314,7 +314,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `result_unrecorded` | M2-05 | landed | a backup whose creator exited before recording what the change left; it restores only with `--unrecorded`; M1-AUDIT: also a file backup (`init --undo`) that does not record what the deletion left of every file, or who made it (one an earlier EnvCloak made) |
 | `created_by_agent` | M2-05 | landed | a backup v2 an agent or unknown process made, restored without `--created-by-agent`; M1-AUDIT: also a file backup (`init --undo`) an agent or unknown process made, or one that does not record who made it |
 | `substituted` | M2-05 | landed | a file backup, a backup v2's directory or its `data`, or one of its results, that its name did not hold once published, or that did not hold exactly the bytes written (replaced, cut or written into in place), never answered as written (`files_backup_failed`) |
-| `limited` | M2-11 | reserved | a comparison budget stopped `scan.match`, so the run reports `incomplete (limited)` |
+| `limited` | M2-11 | landed | a comparison budget stopped `scan.match`, so the run reports `incomplete (limited)` |
 <!-- /reservations -->
 
 **Methods** (client role):
@@ -332,7 +332,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `backup.v2.read` | M2-05 | landed | one chunk under a restore lease |
 | `backup.v2.list` | M2-05 | landed | backups with creator, purpose and state |
 | `files.show` | M1-AUDIT | landed | a file backup's maker and files, before the proof of `init --undo` (SPEC §6.4: the restore statement names the creator) |
-| `scan.match` | M2-11 | reserved | candidate tokens compared by keyed hash, under the import rules and the two comparison budgets |
+| `scan.match` | M2-11 | landed | candidate tokens compared by keyed hash, under the import rules and the two comparison budgets |
 | `items.mark_exposed` | M2-11 | reserved | marks items "exposed: rotate"; tightening, no proof |
 | `items.reclassify` | M2-13 | reserved | test, live or unknown; towards test or unknown with a proof |
 | `managed.register` | M2-27 | reserved | registers a managed MCP server and its launch or origin, with a proof |

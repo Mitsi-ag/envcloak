@@ -61,6 +61,8 @@ use crate::proto::{
     ImportVerify, PendingList, PendingListParams, PendingPoll, PendingStateParams, RecoverParams,
     RecoveryConfirm, RecoveryConfirmParams, RestoredFiles, VaultRecover, VerifyParams,
 };
+use crate::proto::{ScanMatch, ScanMatchParams};
+use crate::view::ScanMatchView;
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
     ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
@@ -697,6 +699,19 @@ impl Client {
     /// As [`Client::call`].
     pub fn import_verify(&mut self, p: &VerifyParams) -> Result<VerifyView, ClientError> {
         self.call::<ImportVerify>(p)
+    }
+
+    /// `scan.match`: which of `p`'s candidates the vault holds, under the
+    /// rules of `p.purpose` (M2 plan D-32). The values in `p` are wiped
+    /// with the request frame. A caller sends its candidates in batches of
+    /// at most [`crate::proto::MAX_SCAN_CANDIDATES`] whose request fits in
+    /// a frame, and stops with its run `incomplete (limited)` when an
+    /// answer is `limited` or the call is refused `too_many_checks`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn scan_match(&mut self, p: &ScanMatchParams) -> Result<ScanMatchView, ClientError> {
+        self.call::<ScanMatch>(p)
     }
 
     /// `files.backup`: an encrypted backup of `p`'s files.
