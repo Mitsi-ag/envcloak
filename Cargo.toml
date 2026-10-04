@@ -177,6 +177,12 @@ opt-level = 3
 # calls; the crate and its tests are optimized in test builds.
 [profile.dev.package.envcloak-signin]
 opt-level = 3
+# The hook decides a 2 MiB payload within its 2 seconds (M2 plan M2-08);
+# its tests time the decision of such payloads, so the command reader is
+# optimized in test builds too, as it is in release (unoptimized, a payload
+# of 150,000 short commands took 0.8 s here and more on CI's runners).
+[profile.dev.package.envcloak-agents]
+opt-level = 2
 
 [profile.release]
 lto = "thin"
