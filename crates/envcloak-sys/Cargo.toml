@@ -54,6 +54,10 @@ harness = false
 # fixtures, and nothing else runs in the process that forks the PTY
 # monitor (see the files).
 [[test]]
+name = "pty"
+harness = false
+
+[[test]]
 name = "pty_topology"
 harness = false
 
