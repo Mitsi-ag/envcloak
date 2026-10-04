@@ -1,23 +1,29 @@
 //! The outer terminal in PTY mode (M2 plan M2-17, lesson L-13) and what
 //! the PTY carries: on a real pseudo-terminal of the test's own, a copy of
 //! this binary takes it raw with `TerminalGuard` and leaves it in each
-//! way `envcloak run --pty` can: a normal exit, an error, SIGTERM, SIGHUP,
-//! a release-build abort from a panic (the panic hook restores; no
+//! way `envcloak run --pty` can: a normal exit (through
+//! `TerminalGuard::release`, which reports), an error, SIGTERM, SIGHUP, a
+//! release-build abort from a panic (the panic hook restores; no
 //! destructor runs), and SIGTSTP then SIGCONT (restored while stopped, raw
-//! again after). Each time the settings read back equal to those before,
-//! and input typed and not read is discarded (`TCSAFLUSH`). Then the
-//! window size reaches the command, at the start and on a change, and the
-//! command's exec failures come back as `env(1)` reports them.
+//! again after). Before each way out, input is typed and left unread; each
+//! time the settings read back as before, both through the guard's own
+//! type and through `stty -g` (an independent reader), and the unread
+//! input is gone (`TCSAFLUSH`), on Linux as on macOS. Then: a new PTY
+//! starts with the outer terminal's settings (a remapped or a disabled
+//! suspend character) and size, both of its sides close-on-exec; the
+//! window size reaches the command and follows a change, as `stty size`
+//! inside the PTY reads it; the command's exec failures come back as
+//! `env(1)` reports them; and a CLI that inherited SIGCHLD ignored still
+//! owns its monitor until it reaps it.
 //!
 //! No libtest harness (`harness = false`): copies of this binary play the
-//! guarded program and the probe, and nothing else runs in the process
+//! guarded program and the probes, and nothing else runs in the process
 //! that forks the monitor.
 #![allow(unsafe_code, clippy::unwrap_used)]
 
 mod pty_common;
 
 use std::ffi::OsStr;
-use std::io::{BufRead, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
@@ -42,7 +48,8 @@ fn main() {
     own_allocations();
     match my_role().as_deref() {
         Some("guarded") => return guarded(),
-        Some("size") => return size_probe(),
+        Some("winch") => return winch_probe(),
+        Some("sigchld-ignored") => return sigchld_ignored(),
         Some(other) => panic!("unknown role {other}"),
         None => {}
     }
@@ -66,29 +73,44 @@ fn main() {
                 input_typed_and_not_read_is_discarded_on_restore,
             ),
             (
+                "a_new_pty_starts_with_the_outer_settings_and_size",
+                a_new_pty_starts_with_the_outer_settings_and_size,
+            ),
+            (
                 "the_window_size_reaches_the_command_and_follows_a_change",
                 the_window_size_reaches_the_command_and_follows_a_change,
+            ),
+            (
+                "the_last_output_before_the_exit_is_not_lost_at_the_close",
+                the_last_output_before_the_exit_is_not_lost_at_the_close,
             ),
             (
                 "exec_failures_read_as_env_1_has_them",
                 exec_failures_read_as_env_1_has_them,
             ),
+            (
+                "a_cli_that_inherited_sigchld_ignored_still_owns_its_monitor",
+                a_cli_that_inherited_sigchld_ignored_still_owns_its_monitor,
+            ),
         ],
     );
 }
 
-/// The guarded program, in the way out `ENVCLOAK_PTY_SCENARIO` names. It takes its
-/// standard input raw, prints `RAW`, and then:
-/// - `exit` and `error`: reads one byte, then returns normally or with an
-///   error (the guard dropped on the way);
-/// - `signal`: waits for SIGTERM or SIGHUP, drops the guard and ends by
-///   the signal;
-/// - `abort`: reads one byte, then panics inside an `extern "C"` function,
-///   which cannot unwind, so the process aborts as a release build does,
-///   after the panic hook and without the guard's drop;
-/// - `stop`: on SIGTSTP restores the terminal and stops; on SIGCONT takes
-///   raw mode again, prints `RAW-AGAIN`, reads one byte and exits;
-/// - `unread`: waits for SIGUSR1 without reading, then exits normally.
+/// The guarded program, in the way out `ENVCLOAK_PTY_SCENARIO` names. It
+/// takes its standard input raw, prints `RAW`, never reads it, and waits
+/// for the signal that starts its way out (so the test can leave input
+/// unread first):
+/// - `exit`: SIGUSR1, then `TerminalGuard::release`, which must report
+///   success, and exit 0;
+/// - `error`: SIGUSR1, then an error returned (the guard dropped on the
+///   way), exit 1;
+/// - `signal`: SIGTERM or SIGHUP; the guard dropped, then the end by that
+///   signal;
+/// - `abort`: SIGUSR1, then a panic inside an `extern "C"` function, which
+///   cannot unwind, so the process aborts as a release build does, after
+///   the panic hook and without the guard's drop;
+/// - `stop`: SIGTSTP: restores the terminal and stops; on SIGCONT takes
+///   raw mode again, prints `RAW-AGAIN`, waits for SIGUSR1 and exits 0.
 fn guarded() {
     let scenario = std::env::var(SCENARIO).unwrap();
     if scenario == "abort" {
@@ -97,54 +119,41 @@ fn guarded() {
         envcloak_sys::disable_core_dumps().unwrap();
         install_panic_hook("pty-test");
     }
-    let relay = match scenario.as_str() {
-        "signal" => Some(SignalRelay::install(&[libc::SIGTERM, libc::SIGHUP]).unwrap()),
-        "stop" => Some(SignalRelay::install(&[libc::SIGTSTP]).unwrap()),
-        "unread" => Some(SignalRelay::install(&[libc::SIGUSR1]).unwrap()),
-        _ => None,
+    let first: &[i32] = match scenario.as_str() {
+        "signal" => &[libc::SIGTERM, libc::SIGHUP],
+        "stop" => &[libc::SIGTSTP],
+        _ => &[libc::SIGUSR1],
     };
+    let relay = SignalRelay::install(first).unwrap();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let result = (|| -> std::io::Result<()> {
         let guard = TerminalGuard::enter_raw(stdin.as_fd())?;
         put(stdout.as_fd(), b"RAW\n");
-        let read_one = || {
-            let mut b = [0u8; 1];
-            std::io::stdin().read_exact(&mut b)
+        let Some(Relayed::Signal { number, .. }) = relay.next()? else {
+            panic!("no signal");
         };
         match scenario.as_str() {
-            "exit" => read_one()?,
-            "error" => {
-                read_one()?;
-                return Err(std::io::Error::other("an error on the way out"));
+            "exit" => {
+                guard.release()?;
+                return Ok(());
             }
+            "error" => return Err(std::io::Error::other("an error on the way out")),
             "signal" => {
-                let Some(Relayed::Signal { number, .. }) = relay.unwrap().next()? else {
-                    panic!("no signal");
-                };
                 drop(guard);
                 exit_by_signal(number);
             }
-            "abort" => {
-                read_one()?;
-                boom();
-            }
+            "abort" => boom(),
             "stop" => {
-                let relay = relay.unwrap();
-                let Some(Relayed::Signal { .. }) = relay.next()? else {
-                    panic!("no SIGTSTP");
-                };
                 guard.restore()?;
                 // The relay's drop gives SIGTSTP its default action back.
                 drop(relay);
                 // SAFETY: SIGTSTP to this process itself.
                 unsafe { libc::kill(libc::getpid(), libc::SIGTSTP) };
                 guard.reenter_raw()?;
+                let relay = SignalRelay::install(&[libc::SIGUSR1]).unwrap();
                 put(stdout.as_fd(), b"RAW-AGAIN\n");
-                read_one()?;
-            }
-            "unread" => {
-                relay.unwrap().next()?;
+                relay.next()?;
             }
             other => panic!("unknown scenario {other}"),
         }
@@ -189,6 +198,21 @@ fn outer() -> (OwnedFd, OwnedFd, TerminalSettings) {
     (master, slave, before)
 }
 
+/// What `stty -g` prints for the terminal `fd`: an independent reader of
+/// its settings.
+fn stty_g(fd: BorrowedFd<'_>) -> String {
+    let out = std::process::Command::new("/bin/stty")
+        .arg("-g")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::from(fd.try_clone_to_owned().unwrap()))
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stty -g failed: {:?}", out.status);
+    String::from_utf8(out.stdout).unwrap()
+}
+
 /// The guarded program in `scenario`, on the outer terminal `slave`, in a
 /// process group of its own (so a stop stops only it); returns once it has
 /// printed `RAW` and the terminal reads back raw.
@@ -223,12 +247,43 @@ fn pending_input(slave: BorrowedFd<'_>) -> usize {
     usize::try_from(n).unwrap()
 }
 
+/// Types a line the guarded program never reads and waits until the
+/// terminal holds it (a barrier, never a sleep).
+fn leave_unread(screen: &Screen, slave: &OwnedFd) {
+    screen.type_bytes(b"typed-and-not-read\n");
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while pending_input(slave.as_fd()) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the input never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The terminal is as it was before: the same settings read through the
+/// guard's own type and through `stty -g`, and no input left unread.
+fn assert_as_before(slave: &OwnedFd, before: &TerminalSettings, stty_before: &str, what: &str) {
+    let after = TerminalSettings::read(slave.as_fd()).unwrap();
+    assert!(
+        after.same_as(before),
+        "{what}: the terminal was left {after:?}, not {before:?}"
+    );
+    assert_eq!(stty_g(slave.as_fd()), stty_before, "{what}: stty -g");
+    assert_eq!(
+        pending_input(slave.as_fd()),
+        0,
+        "{what}: input typed while raw was left for the next reader"
+    );
+}
+
 /// Waits for the guarded program to end, checks how, and that the
-/// terminal's settings read back as they were before.
+/// terminal is as it was before.
 fn assert_restored(
     mut child: std::process::Child,
     slave: &OwnedFd,
     before: &TerminalSettings,
+    stty_before: &str,
     how: impl Fn(std::process::ExitStatus) -> bool,
     what: &str,
 ) {
@@ -240,68 +295,75 @@ fn assert_restored(
     let status = child.wait().unwrap();
     assert!(ended.is_some(), "{what}: the program did not end");
     assert!(how(status), "{what}: {status:?}");
-    let after = TerminalSettings::read(slave.as_fd()).unwrap();
-    assert!(
-        after.same_as(before),
-        "{what}: the terminal was left {after:?}, not {before:?}"
-    );
+    assert_as_before(slave, before, stty_before, what);
 }
 
-fn restored_after_a_normal_exit() {
+/// The way out `scenario` takes once `sig` is sent, with input left unread
+/// first.
+fn restored_after(
+    scenario: &str,
+    sig: i32,
+    how: impl Fn(std::process::ExitStatus) -> bool,
+    what: &str,
+) {
     let (master, slave, before) = outer();
-    let (child, screen) = start_guarded("exit", master, &slave);
-    screen.type_bytes(b"q");
-    assert_restored(child, &slave, &before, |s| s.code() == Some(0), "exit");
-}
-
-fn restored_after_an_error() {
-    let (master, slave, before) = outer();
-    let (child, screen) = start_guarded("error", master, &slave);
-    screen.type_bytes(b"q");
-    assert_restored(child, &slave, &before, |s| s.code() == Some(1), "error");
-}
-
-fn restored_after_signal(sig: i32, what: &str) {
-    let (master, slave, before) = outer();
-    let (child, _screen) = start_guarded("signal", master, &slave);
+    let stty_before = stty_g(slave.as_fd());
+    let (child, screen) = start_guarded(scenario, master, &slave);
+    leave_unread(&screen, &slave);
     // SAFETY: kill on this process's own, unreaped child.
     assert_eq!(
         unsafe { libc::kill(i32::try_from(child.id()).unwrap(), sig) },
         0
     );
-    assert_restored(child, &slave, &before, |s| s.signal() == Some(sig), what);
+    assert_restored(child, &slave, &before, &stty_before, how, what);
+}
+
+fn restored_after_a_normal_exit() {
+    restored_after("exit", libc::SIGUSR1, |s| s.code() == Some(0), "exit");
+}
+
+fn restored_after_an_error() {
+    restored_after("error", libc::SIGUSR1, |s| s.code() == Some(1), "error");
 }
 
 fn restored_after_sigterm() {
-    restored_after_signal(libc::SIGTERM, "SIGTERM");
+    restored_after(
+        "signal",
+        libc::SIGTERM,
+        |s| s.signal() == Some(libc::SIGTERM),
+        "SIGTERM",
+    );
 }
 
 fn restored_after_sighup() {
-    restored_after_signal(libc::SIGHUP, "SIGHUP");
+    restored_after(
+        "signal",
+        libc::SIGHUP,
+        |s| s.signal() == Some(libc::SIGHUP),
+        "SIGHUP",
+    );
 }
 
 /// A release build aborts on a panic: no destructor runs, so the guard's
-/// drop does not restore. The panic hook does.
+/// drop does not restore. The panic hook does, with `TCSAFLUSH`.
 fn restored_after_a_release_abort_by_the_panic_hook() {
-    let (master, slave, before) = outer();
-    let (child, screen) = start_guarded("abort", master, &slave);
-    screen.type_bytes(b"q");
-    assert_restored(
-        child,
-        &slave,
-        &before,
+    restored_after(
+        "abort",
+        libc::SIGUSR1,
         |s| s.signal() == Some(libc::SIGABRT),
         "abort",
     );
 }
 
-/// SIGTSTP from another process: the terminal is restored before the
-/// program stops (read while it is stopped), raw again after SIGCONT, and
-/// restored at the exit.
+/// SIGTSTP from another process: the terminal is restored, unread input
+/// discarded, before the program stops (read while it is stopped), raw
+/// again after SIGCONT, and restored at the exit.
 fn restored_while_stopped_and_raw_again_after_sigcont() {
     let (master, slave, before) = outer();
+    let stty_before = stty_g(slave.as_fd());
     let (child, mut screen) = start_guarded("stop", master, &slave);
     let pid = i32::try_from(child.id()).unwrap();
+    leave_unread(&screen, &slave);
     // SAFETY: kill on this process's own, unreaped child.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTSTP) }, 0);
     assert_eq!(
@@ -309,70 +371,108 @@ fn restored_while_stopped_and_raw_again_after_sigcont() {
         Some((libc::CLD_STOPPED, libc::SIGTSTP)),
         "the program did not stop"
     );
-    let stopped = TerminalSettings::read(slave.as_fd()).unwrap();
-    assert!(
-        stopped.same_as(&before),
-        "stopped with the terminal {stopped:?}"
-    );
+    assert_as_before(&slave, &before, &stty_before, "stopped");
     // SAFETY: as above.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
     screen.expect("RAW-AGAIN\n", 1, "continued");
     assert!(TerminalSettings::read(slave.as_fd()).unwrap().is_raw());
-    screen.type_bytes(b"q");
-    assert_restored(child, &slave, &before, |s| s.code() == Some(0), "stop");
+    leave_unread(&screen, &slave);
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
+    assert_restored(
+        child,
+        &slave,
+        &before,
+        &stty_before,
+        |s| s.code() == Some(0),
+        "stop",
+    );
 }
 
 /// Input typed while the terminal is raw and never read is discarded when
 /// the settings come back (`TCSAFLUSH`): it would otherwise reach the next
-/// program to read the terminal, usually the shell.
+/// program to read the terminal, usually the shell. (Every way out above
+/// checks this too; this is the plan's named case, on the drop path.)
 fn input_typed_and_not_read_is_discarded_on_restore() {
-    let (master, slave, before) = outer();
-    let (child, screen) = start_guarded("unread", master, &slave);
-    screen.type_bytes(b"typed-and-not-read\n");
-    let deadline = std::time::Instant::now() + DEADLINE;
-    while pending_input(slave.as_fd()) == 0 {
+    restored_after("error", libc::SIGUSR1, |s| s.code() == Some(1), "unread");
+}
+
+fn cloexec(fd: BorrowedFd<'_>) -> bool {
+    // SAFETY: F_GETFD only reads a descriptor's flags.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+    flags & libc::FD_CLOEXEC != 0
+}
+
+/// `open_pty` gives the new slave the outer terminal's settings, so a
+/// suspend character the person remapped, or disabled, carries over, and
+/// its size; both sides are close-on-exec. Read back through the guard's
+/// type and through `stty -g`, whose output must equal the outer
+/// terminal's. Ignore the settings and the remapped character is lost.
+fn a_new_pty_starts_with_the_outer_settings_and_size() {
+    let (_outer_master, outer_slave, cooked) = outer();
+    let size = WindowSize {
+        rows: 41,
+        cols: 97,
+        ..WindowSize::default()
+    };
+    const CTRL_X: u8 = 0x18;
+    for (what, settings) in [
+        ("suspend remapped", cooked.with_suspend_char(Some(CTRL_X))),
+        ("suspend disabled", cooked.with_suspend_char(None)),
+        ("echo off", cooked.with_echo(false)),
+    ] {
+        settings.apply(outer_slave.as_fd()).unwrap();
+        let outer_now = TerminalSettings::read(outer_slave.as_fd()).unwrap();
+        assert!(outer_now.same_as(&settings), "{what}: the outer terminal");
+        let pty = open_pty(Some(size), Some(&outer_now)).unwrap();
+        let slave_now = TerminalSettings::read(pty.slave.as_fd()).unwrap();
         assert!(
-            std::time::Instant::now() < deadline,
-            "the input never arrived"
+            slave_now.same_as(&outer_now),
+            "{what}: the new PTY has {slave_now:?}, the outer terminal {outer_now:?}"
         );
-        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            stty_g(pty.slave.as_fd()),
+            stty_g(outer_slave.as_fd()),
+            "{what}: stty -g"
+        );
+        assert_eq!(window_size(pty.slave.as_fd()).unwrap(), size, "{what}");
+        assert!(cloexec(pty.master.as_fd()), "{what}: the master");
+        assert!(cloexec(pty.slave.as_fd()), "{what}: the slave");
     }
-    // SAFETY: kill on this process's own, unreaped child.
+    let remapped = open_pty(None, Some(&cooked.with_suspend_char(Some(CTRL_X)))).unwrap();
     assert_eq!(
-        unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGUSR1) },
-        0
+        TerminalSettings::read(remapped.slave.as_fd())
+            .unwrap()
+            .suspend_char(),
+        Some(CTRL_X)
     );
-    assert_restored(child, &slave, &before, |s| s.code() == Some(0), "unread");
+    let disabled = open_pty(None, Some(&cooked.with_suspend_char(None))).unwrap();
     assert_eq!(
-        pending_input(slave.as_fd()),
-        0,
-        "input typed while raw was left for the next reader"
+        TerminalSettings::read(disabled.slave.as_fd())
+            .unwrap()
+            .suspend_char(),
+        None
     );
 }
 
-/// The size probe: prints `SIZE <rows> <cols>` at the start and after each
-/// SIGWINCH, and exits on a line from its terminal.
-fn size_probe() {
+/// The SIGWINCH probe: prints `WINCH-READY`, waits for SIGWINCH, prints
+/// `WINCH` and exits.
+fn winch_probe() {
     let relay = SignalRelay::install(&[libc::SIGWINCH]).unwrap();
-    let report = || {
-        let s = window_size(std::io::stdin().as_fd()).unwrap();
-        put(
-            std::io::stdout().as_fd(),
-            format!("SIZE {} {}\n", s.rows, s.cols).as_bytes(),
-        );
-    };
-    report();
-    std::thread::spawn(move || {
-        let _ = std::io::stdin().lock().lines().next();
-        std::process::exit(0);
-    });
-    while let Ok(Some(_)) = relay.next() {
-        report();
-    }
+    put(std::io::stdout().as_fd(), b"WINCH-READY\n");
+    let caught = relay.next().unwrap();
+    assert!(
+        matches!(caught, Some(Relayed::Signal { number, .. }) if number == libc::SIGWINCH),
+        "{caught:?}"
+    );
+    put(std::io::stdout().as_fd(), b"WINCH\n");
 }
 
 /// `open_pty` gives the slave the outer size, and `set_window_size` on the
-/// master changes it, which the command sees with SIGWINCH.
+/// master changes it, which the command's foreground group sees with
+/// SIGWINCH. The sizes are read inside the PTY by `stty size`, not by the
+/// code under test: the command is `sh -c 'stty size; <probe>; stty size'`.
 fn the_window_size_reaches_the_command_and_follows_a_change() {
     let start = WindowSize {
         rows: 33,
@@ -380,25 +480,74 @@ fn the_window_size_reaches_the_command_and_follows_a_change() {
         ..WindowSize::default()
     };
     let pty = open_pty(Some(start), None).unwrap();
-    assert_eq!(window_size(pty.slave.as_fd()).unwrap(), start);
     let exe = std::env::current_exe().unwrap();
     let mut monitor = spawn_session(
-        &[exe.as_os_str()],
-        &[(OsStr::new(ROLE), OsStr::new("size"))],
+        &[
+            OsStr::new("/bin/sh"),
+            OsStr::new("-c"),
+            OsStr::new("stty size; \"$WINCH_PROBE\"; stty size"),
+        ],
+        &[
+            (OsStr::new("PATH"), OsStr::new("/usr/bin:/bin")),
+            (OsStr::new("WINCH_PROBE"), exe.as_os_str()),
+            (OsStr::new(ROLE), OsStr::new("winch")),
+        ],
         pty.slave,
     )
     .unwrap();
     let mut screen = Screen::new(pty.master);
-    screen.expect("SIZE 33 101", 1, "the size at the start");
+    screen.expect("33 101\r\n", 1, "stty size at the start");
+    screen.expect("WINCH-READY", 1, "the probe runs");
     let changed = WindowSize {
         rows: 48,
         cols: 160,
         ..WindowSize::default()
     };
     set_window_size(screen.master(), changed).unwrap();
-    screen.expect("SIZE 48 160", 1, "the size after a change");
-    screen.type_bytes(b"\n");
-    let event = monitor.next_event(Some(DEADLINE)).unwrap();
+    screen.expect("WINCH\r\n", 1, "SIGWINCH after a change");
+    screen.expect("48 160\r\n", 1, "stty size after a change");
+    let event = screen.next_event(&mut monitor);
+    assert!(
+        matches!(event, Some(MonitorEvent::Exited(s)) if s.success()),
+        "{event:?}\n{}",
+        screen.text()
+    );
+    monitor.finish().unwrap();
+}
+
+/// What the command writes just before it exits still reaches the master
+/// side when the CLI reads it late: nothing is read until a second after
+/// the command could have exited; then the line is there, and the exit is
+/// reported. (The case where macOS's close of the slave loses a late
+/// line, and the monitor's wait for the read that prevents it, is (b) in
+/// `pty_topology.rs`.) Flush the terminal's output at the exit and the
+/// line is gone.
+fn the_last_output_before_the_exit_is_not_lost_at_the_close() {
+    let pty = open_pty(None, None).unwrap();
+    let mut monitor = spawn_session(
+        &[
+            OsStr::new("/bin/sh"),
+            OsStr::new("-c"),
+            OsStr::new("printf 'last-words\\n'"),
+        ],
+        &[(OsStr::new("PATH"), OsStr::new("/usr/bin:/bin"))],
+        pty.slave,
+    )
+    .unwrap();
+    let mut screen = Screen::new(pty.master);
+    // Nothing read for a second: the command has exited by then.
+    let early = monitor.next_event(Some(Duration::from_secs(1))).unwrap();
+    screen.wait_for(|s| s.count("last-words\r\n") == 1);
+    assert_eq!(
+        screen.count("last-words\r\n"),
+        1,
+        "the command's last line was lost: {:?}",
+        screen.text()
+    );
+    let event = match early {
+        Some(event) => Some(event),
+        None => screen.next_event(&mut monitor),
+    };
     assert!(
         matches!(event, Some(MonitorEvent::Exited(s)) if s.success()),
         "{event:?}"
@@ -458,4 +607,112 @@ fn exec_failures_read_as_env_1_has_them() {
         spawn_session(&[nul.as_os_str()], &[path], pty.slave),
         Err(SessionError::Setup(e)) if e.kind() == std::io::ErrorKind::InvalidInput
     ));
+}
+
+/// Whether the kernel reaps this process's children on its own now: a
+/// probe child is waited for, which fails (`ECHILD`) when it was reaped
+/// already.
+fn reaps_on_its_own() -> bool {
+    let mut probe = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    probe.wait().is_err()
+}
+
+/// The CLI stand-in started with its children reaped on their own (as
+/// `ENVCLOAK_PTY_SCENARIO` says: SIGCHLD ignored, or `SA_NOCLDWAIT`):
+/// reports its setup and whether the kernel does reap on its own, runs a
+/// command that exits 7 under the monitor, and reports what `finish`
+/// returned (the monitor's own status, which needs the monitor unreaped
+/// until then) and the setup after.
+fn sigchld_ignored() {
+    if std::env::var(SCENARIO).as_deref() == Ok("NoWait") {
+        envcloak_sys::testing::set_sigchld(envcloak_sys::testing::ChildReaping::NoWait).unwrap();
+    }
+    let out = std::io::stdout();
+    let said = |s: String| put(out.as_fd(), s.as_bytes());
+    said(format!(
+        "SETUP-AT-START {:?}\nREAPS-AT-START {}\n",
+        envcloak_sys::testing::sigchld_setup(),
+        reaps_on_its_own()
+    ));
+    let pty = open_pty(None, None).unwrap();
+    let mut monitor = spawn_session(
+        &[
+            OsStr::new("/bin/sh"),
+            OsStr::new("-c"),
+            OsStr::new("exit 7"),
+        ],
+        &[(OsStr::new("PATH"), OsStr::new("/usr/bin:/bin"))],
+        pty.slave,
+    )
+    .unwrap();
+    let event = monitor.next_event(Some(DEADLINE)).unwrap();
+    said(format!(
+        "EXITED {:?}\n",
+        match event {
+            Some(MonitorEvent::Exited(s)) => s.code(),
+            _ => None,
+        }
+    ));
+    let finished = monitor.finish();
+    said(format!(
+        "FINISH {}\nSETUP-AFTER {:?}\nREAPS-AFTER {}\n",
+        match &finished {
+            Ok(s) => format!("ok {:?}", s.code()),
+            Err(e) => format!("error {:?}", e.raw_os_error()),
+        },
+        envcloak_sys::testing::sigchld_setup(),
+        reaps_on_its_own()
+    ));
+    drop(pty.master);
+}
+
+/// A CLI started with SIGCHLD ignored or with `SA_NOCLDWAIT` (inherited
+/// across `exec`) would have its monitor reaped by the kernel the moment it
+/// exits (Linux, for both; macOS for what it reaps on its own, measured and
+/// printed), its pid, the session's id and the handle's signal target,
+/// free for reuse while the handle still holds it. `spawn_session` gives
+/// SIGCHLD its default back, without `SA_NOCLDWAIT`, before the fork, so
+/// the monitor stays unreaped until `finish` reaps it, which returns its
+/// status. Skip that and the setup is still there after (both systems) and
+/// `finish` fails with `ECHILD` where the kernel reaped on its own.
+fn a_cli_that_inherited_sigchld_ignored_still_owns_its_monitor() {
+    use envcloak_sys::testing::ChildReaping;
+    for (how, setup) in [
+        (ChildReaping::NoWait, "(false, true)"),
+        (ChildReaping::Ignored, "(true, false)"),
+    ] {
+        let mut cmd = role("sigchld-ignored");
+        cmd.env(SCENARIO, format!("{how:?}"))
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit());
+        if how == ChildReaping::Ignored {
+            envcloak_sys::testing::sigchld_ignored_on_spawn(&mut cmd);
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{how:?}: {:?}\n{text}", out.status);
+        assert!(
+            text.contains(&format!("SETUP-AT-START {setup}")),
+            "{how:?}: the stand-in did not start so (the setup failed):\n{text}"
+        );
+        assert!(text.contains("EXITED Some(7)"), "{how:?}: {text}");
+        assert!(
+            text.contains("FINISH ok Some(0)"),
+            "{how:?}: the monitor was not this process's to reap:\n{text}"
+        );
+        assert!(
+            text.contains("SETUP-AFTER (false, false)") && text.contains("REAPS-AFTER false"),
+            "{how:?}: {text}"
+        );
+        let reaped = text.contains("REAPS-AT-START true");
+        println!(
+            "pty ({}): SIGCHLD {how:?}: the kernel reaps children on its own: {reaped}; \
+             the monitor stayed this process's to reap",
+            std::env::consts::OS
+        );
+    }
 }
