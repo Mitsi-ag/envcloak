@@ -94,9 +94,12 @@
 //! inode the walk read, and once every hash is taken the whole chain is
 //! read again; when any process exited, ran another file, ran the same
 //! file with arguments that make it another agent or none, was reparented
-//! or left its session or terminal meanwhile, the chain is walked again
-//! (as when it changes during the walk), so no evidence is built from a
-//! chain as it was before hashing. The walk without a hasher reads the
+//! or left its session or terminal meanwhile, or the file a hashed process
+//! runs is no longer in the state it was hashed in (its device, inode,
+//! size and change time, read again: a rewrite in place keeps the inode),
+//! the chain is walked again (as when it changes during the walk), so no
+//! evidence is built from a chain as it was before hashing, and no digest
+//! outlives the bytes it was taken from. The walk without a hasher reads the
 //! chain again the same way: it read each process's arguments before its
 //! own check of that process, and an `exec` of the same file changes
 //! nothing that check compares. An identity that is not known (no hasher,
@@ -119,8 +122,8 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 
 use envcloak_sys::{
-    AncestryError, ExeIdentity, LiveProcesses, MAX_ANCESTRY, PeerIdentity, ProcInfo, ProcessTable,
-    StartTime, ancestry_in, reaches_top,
+    AncestryError, ExeIdentity, FileKey, LiveProcesses, MAX_ANCESTRY, PeerIdentity, ProcInfo,
+    ProcessTable, StartTime, ancestry_in, reaches_top,
 };
 
 use crate::agents::{AgentCatalog, AgentLabel};
@@ -728,14 +731,34 @@ fn roots_above_session(a: &Ancestor) -> bool {
         .is_some_and(AgentLabel::may_root_above_session)
 }
 
+/// The SHA-256 of the file a process runs, and the state of that file it
+/// was taken from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExeDigest {
+    pub sha256: [u8; 32],
+    /// The file's device, inode, size and change time, read before and
+    /// again after its bytes were (or, from a cache, after the digest was
+    /// found), and the same both times.
+    pub key: FileKey,
+}
+
 /// Reads the SHA-256 of a process's executable, which the walk does not
 /// (see the module documentation): the daemon's implementation reads it
 /// through a descriptor of the file the process runs, with a cache and a
 /// per-request budget (M2 plan D-09).
 pub trait ExeHasher {
     /// The SHA-256 of the file `p` runs, the file the walk saw (`p.exe`'s
-    /// device and inode), or `None` when it is not known.
-    fn sha256(&mut self, p: &ProcInfo) -> Option<[u8; 32]>;
+    /// device and inode), with the state of that file it describes; `None`
+    /// when it is not known. A file whose change time does not show every
+    /// later write (one changed within a tick of its file system's clock
+    /// before hashing began) has no digest: its state, read again later,
+    /// could not tell that it changed.
+    fn sha256(&mut self, p: &ProcInfo) -> Option<ExeDigest>;
+    /// The state of the file `p` runs now, read again (on Linux through a
+    /// new descriptor of it), or `None` when it cannot be read. The walk
+    /// keeps a digest only while the file is in the state the digest was
+    /// taken from ([`ExeDigest::key`]).
+    fn key(&mut self, p: &ProcInfo) -> Option<FileKey>;
 }
 
 /// Gathers the evidence for `peer` from the live process table: see
@@ -777,15 +800,17 @@ pub fn gather_hashed(
 /// `hasher`, nearest the caller first. Once every hash is taken, every
 /// process of the chain is read from `table` again, hashed or not, its
 /// executable hidden or not, and so are the arguments the catalog
-/// classified it by ([`recheck`]): when one is no longer as the walk saw
-/// it (it exited, its pid was reused, it ran another file, it ran the same
-/// file with arguments that make it another agent or none, it was
-/// reparented, it left its session or its terminal), the chain is walked
-/// and hashed again, up to [`GATHER_ATTEMPTS`] walks in all. So the
-/// root, the kind, the labels, the proof refusals and the digests all
-/// describe the chain as it was once hashing ended. A digest that is not
-/// known changes none of them: they are those [`gather_in`] gives for that
-/// chain.
+/// classified it by, and the state of each hashed file ([`recheck`]): when
+/// one is no longer as the walk saw it (it exited, its pid was reused, it
+/// ran another file, it ran the same file with arguments that make it
+/// another agent or none, it was reparented, it left its session or its
+/// terminal), or a hashed file is no longer in the state it was hashed in
+/// (written in place, or run again after such a write: the same path,
+/// device and inode), the chain is walked and hashed again, up to
+/// [`GATHER_ATTEMPTS`] walks in all. So the root, the kind, the labels,
+/// the proof refusals and the digests all describe the chain as it was
+/// once hashing ended. A digest that is not known changes none of them:
+/// they are those [`gather_in`] gives for that chain.
 ///
 /// # Errors
 /// As [`gather_in`]; [`EvidenceError::Changed`] also when the chain changed
@@ -823,20 +848,38 @@ pub fn gather_in(
 }
 
 /// Hashes each process of the caller's uid in `procs` whose executable
-/// file the walk read, nearest the caller first. Hashing takes time (up to
-/// the request's budget), and the evidence is built from `procs`
-/// afterwards, so the caller then reads the chain again ([`recheck`]): a
-/// chain that changed meanwhile is not used, digests or not.
-fn hash_executables(procs: &mut [ProcInfo], uid: u32, hasher: &mut dyn ExeHasher) {
-    for p in procs.iter_mut() {
-        if !classifiable(p, uid) || p.exe.as_ref().and_then(|e| e.file).is_none() {
-            continue;
-        }
-        let digest = hasher.sha256(p);
-        if let Some(exe) = p.exe.as_mut() {
-            exe.sha256 = digest;
-        }
-    }
+/// file the walk read, nearest the caller first, and returns, for each
+/// process of `procs`, the state of the file its digest was taken from
+/// (`None` where it has none). Hashing takes time (up to the request's
+/// budget), and the evidence is built from `procs` afterwards, so the
+/// caller then reads the chain, and each hashed file's state, again
+/// ([`recheck`]): a chain that changed meanwhile is not used, digests or
+/// not.
+fn hash_executables(
+    procs: &mut [ProcInfo],
+    uid: u32,
+    hasher: &mut dyn ExeHasher,
+) -> Vec<Option<FileKey>> {
+    procs
+        .iter_mut()
+        .map(|p| {
+            if !classifiable(p, uid) || p.exe.as_ref().and_then(|e| e.file).is_none() {
+                return None;
+            }
+            let digest = hasher.sha256(p);
+            if let Some(exe) = p.exe.as_mut() {
+                exe.sha256 = digest.map(|d| d.sha256);
+            }
+            digest.map(|d| d.key)
+        })
+        .collect()
+}
+
+/// The hasher a walk used, and the state of the file each process's digest
+/// was taken from (by index in the chain), for [`recheck`].
+struct Hashed<'h, 'k> {
+    hasher: &'h mut dyn ExeHasher,
+    keys: &'k [Option<FileKey>],
 }
 
 /// Reads every process of `procs`, the walk's verified chain, from `table`
@@ -852,9 +895,16 @@ fn hash_executables(procs: &mut [ProcInfo], uid: u32, hasher: &mut dyn ExeHasher
 ///   command name) while its arguments name another script: `node
 ///   tool.js` that becomes `node` running an agent's script is that agent
 ///   now, and evidence built from its earlier arguments would miss it.
-///   The arguments are compared by what they make the process, not byte
-///   for byte, so a process that retitles itself without changing what it
-///   is (a progress title) is not walked again.
+///   The arguments are compared by what they make the process, its label
+///   whole (which agent, not only whether one), not byte for byte, so a
+///   process that retitles itself without changing what it is (a progress
+///   title) is not walked again;
+/// - and for a process `hashed` has a digest for, the state of the file it
+///   runs, read again after all that ([`ExeHasher::key`]), is the one the
+///   digest was taken from. [`ProcInfo::unchanged`] compares the file's
+///   path, device and inode, which a write in place keeps, and so does an
+///   `exec` of the same file after one: the digest would name bytes the
+///   file no longer holds.
 ///
 /// The walk read the arguments before its own check of each process, and
 /// this reads them after a check: a change between the two reads is seen
@@ -869,6 +919,7 @@ fn recheck(
     procs: &[ProcInfo],
     uid: u32,
     cat: &AgentCatalog,
+    mut hashed: Option<Hashed<'_, '_>>,
 ) -> Result<bool, EvidenceError> {
     for (k, p) in procs.iter().enumerate() {
         let again = match table.info(p.pid) {
@@ -895,6 +946,13 @@ fn recheck(
                 return Ok(false);
             }
         }
+        if let Some(h) = hashed.as_mut() {
+            if let Some(want) = h.keys.get(k).copied().flatten() {
+                if h.hasher.key(p) != Some(want) {
+                    return Ok(false);
+                }
+            }
+        }
     }
     Ok(true)
 }
@@ -914,10 +972,15 @@ fn gather_with(
             Err(AncestryError::Changed) => continue,
             Err(e) => return Err(e.into()),
         };
-        if let Some(h) = hasher.as_mut() {
-            hash_executables(&mut walked, peer.uid, &mut **h);
-        }
-        if !recheck(table, &walked, peer.uid, cat)? {
+        let keys = match hasher.as_mut() {
+            Some(h) => hash_executables(&mut walked, peer.uid, &mut **h),
+            None => Vec::new(),
+        };
+        let hashed = hasher.as_deref_mut().map(|hasher| Hashed {
+            hasher,
+            keys: &keys,
+        });
+        if !recheck(table, &walked, peer.uid, cat, hashed)? {
             continue;
         }
         procs = Some(walked);

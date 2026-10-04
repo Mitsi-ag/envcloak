@@ -50,11 +50,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use envcloak_policy::{
-    AgentCatalog, Ancestor, Claims, EvidenceError, ExeHasher, SubjectEvidence, SubjectKind,
-    gather_in, gather_in_hashed,
+    AgentCatalog, Ancestor, Claims, EvidenceError, ExeDigest, ExeHasher, SubjectEvidence,
+    SubjectKind, gather_in, gather_in_hashed,
 };
 use envcloak_sys::{
-    Argv, CodeSignature, ExeIdentity, PeerIdentity, PeerSource, ProcInfo, ProcessTable, StartTime,
+    Argv, CodeSignature, ExeIdentity, FileKey, PeerIdentity, PeerSource, ProcInfo, ProcessTable,
+    StartTime,
 };
 use serde_json::{Value, json};
 
@@ -224,14 +225,34 @@ fn digest(pid: i32) -> [u8; 32] {
 }
 
 impl ExeHasher for Hasher {
-    fn sha256(&mut self, p: &ProcInfo) -> Option<[u8; 32]> {
+    fn sha256(&mut self, p: &ProcInfo) -> Option<ExeDigest> {
         self.asked.push(p.pid);
         if self.case == 11 {
             self.epoch.set(self.epoch.get() + 1);
         } else {
             self.epoch.set(1);
         }
-        (self.case != 1).then(|| digest(p.pid))
+        (self.case != 1).then(|| ExeDigest {
+            sha256: digest(p.pid),
+            key: unwritten(p),
+        })
+    }
+
+    fn key(&mut self, p: &ProcInfo) -> Option<FileKey> {
+        Some(unwritten(p))
+    }
+}
+
+/// The state of `p`'s file, the same at every read: no file is written in
+/// these cases (the hasher's interface carries it since the review that
+/// added the check of each hashed file's state).
+fn unwritten(p: &ProcInfo) -> FileKey {
+    let (dev, ino) = p.exe.as_ref().and_then(|e| e.file).unwrap_or_default();
+    FileKey {
+        dev,
+        ino,
+        size: 0,
+        ctime: (0, 0),
     }
 }
 
@@ -418,10 +439,17 @@ fn value(pid: i32) -> [u8; 32] {
 }
 
 impl ExeHasher for SnapshotHasher {
-    fn sha256(&mut self, p: &ProcInfo) -> Option<[u8; 32]> {
+    fn sha256(&mut self, p: &ProcInfo) -> Option<ExeDigest> {
         self.asked.push(p.pid);
         self.after.set(true);
-        (self.case != 1).then(|| value(p.pid))
+        (self.case != 1).then(|| ExeDigest {
+            sha256: value(p.pid),
+            key: unwritten(p),
+        })
+    }
+
+    fn key(&mut self, p: &ProcInfo) -> Option<FileKey> {
+        Some(unwritten(p))
     }
 }
 
