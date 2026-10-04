@@ -26,6 +26,20 @@ is not read: it holds names for gate 22's test and the log, no methods).
 The unlocker kinds are read from `UnlockerKind` (envcloak-core's
 crypto/envelope.rs); M1's two are in the baseline.
 
+Where the code reads a stored number back with arms of its own, the
+reader reads that decoder too, so it cannot hold a second mapping (review
+of task M3-01: a second number for one unlocker kind passed): every arm
+of `UnlockerKind::from_byte` and of `item_class_from` (vault/state.rs) is
+`<integer literal> [if <guard>] => Some(<Enum>::<Variant>)` naming the
+variant that number declares, and the last is `_ => None`; every arm of
+`PolicyRecord::decode` is `(<kind>, <version>) => PolicyRecord::<Record>(..)`
+whose kind is the number of the `PolicyKind` that `PolicyRecord::kind`
+gives that record. A number read twice, or as a variant another number
+declares, is an error, and a decoder of another form is refused, never
+skipped. `AuditKind::from_u8` and `ErrorKind::from_token` search
+`ALL` with `as u8` and `token()`, so their mapping is the declaration's
+own and there is nothing more to read.
+
 Each row has a status: `reserved` (not in the code yet), `landed` (in the
 code exactly as the row says) or `reuse` (an entry the code already has,
 which a task uses again for a new case). This script refuses:
@@ -867,6 +881,76 @@ TOKEN_VALUE = r"(?:r#*)?\"([a-z][a-z0-9_]*)\""
 CODE_VALUE = r"(-?\s*[0-9][0-9A-Za-z_]*)"
 
 
+MATCH = re.compile(r"\bmatch\b[^{;]*\{")
+INT_PATTERN = r"-?\s*(?:0x[0-9A-Fa-f_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:[iu](?:8|16|32|64|128|size))?"
+
+
+def match_arms(src, fn, impl=None):
+    """(pattern, value) of every arm of the one `match` in the one
+    `fn <fn>` (in an `impl <impl>` block when `impl` is given, else
+    anywhere in the file), each with its white space collapsed. A second
+    such function or none, a body with other than one `match`, and an arm
+    the reader cannot split are errors."""
+    bodies = src.fn_bodies(fn)
+    where = "`fn %s`" % fn
+    if impl:
+        spans = impl_spans(src, {impl}, traits=False)
+        bodies = [(a, b) for a, b in bodies if any(x < a < y for x, y in spans)]
+        where = "`%s::%s`" % (impl, fn)
+    if len(bodies) != 1:
+        raise SourceError("%s has %d %s, not one the reader can read" % (src.rel, len(bodies), where))
+    a, b = bodies[0]
+    found = list(MATCH.finditer(src.skel, a, b))
+    if len(found) != 1:
+        raise SourceError("%s: %s holds %d `match`, not the one the reader reads" % (src.rel, where, len(found)))
+    open_ = found[0].end() - 1
+    arms = []
+    for x, y, _ in src.split_top(open_ + 1, src.close_of(open_)):
+        arm = " ".join(src.code[x:y].split())
+        parts = arm.split("=>")
+        if len(parts) != 2:
+            raise SourceError("%s: %s has an arm the reader cannot read (`%s`)" % (src.rel, where, arm[:80]))
+        arms.append((parts[0].strip(), parts[1].strip()))
+    if not arms:
+        raise SourceError("%s: %s has no arms" % (src.rel, where))
+    return where, arms
+
+
+def some_arms(src, enum, fn, impl=None):
+    """[(number, variant)] from `fn <fn>`'s arms `<integer>[ | <integer>]
+    [if <guard>] => Some(<enum>::<Variant>)` (`Self::` in the enum's own
+    `impl`), whose last arm is `_ => None`; any other arm is an error."""
+    where, arms = match_arms(src, fn, impl)
+    names = "(?:%s|Self)" % enum if impl == enum else enum
+    pattern = re.compile(r"(%s(?:\s*\|\s*%s)*)(?:\s+if\s+.+)?" % (INT_PATTERN, INT_PATTERN))
+    value = re.compile(r"Some\s*\(\s*%s\s*::\s*([A-Z][A-Za-z0-9]*)\s*\)" % names)
+    if arms[-1] != ("_", "None"):
+        raise SourceError("%s: %s does not end with `_ => None`" % (src.rel, where))
+    out = []
+    for pat, val in arms[:-1]:
+        p, v = pattern.fullmatch(pat), value.fullmatch(val)
+        if not p or not v:
+            raise SourceError("%s: %s has an arm the reader cannot read (`%s => %s`): it reads `<integer> => Some(%s::<Variant>)`" % (src.rel, where, pat[:60], val[:60], enum))
+        for piece in p.group(1).split("|"):
+            out.append((int_value(piece.strip()), v.group(1)))
+    return where, out
+
+
+def check_inverse(src, enum, where, numbers, decoded):
+    """The decoder's (number, variant) pairs agree with the declaration:
+    each number once, each naming a variant whose number it is, so no
+    entry is read back under two numbers and no number as two entries."""
+    seen = {}
+    for n, v in decoded:
+        if n in seen:
+            raise SourceError("%s: %s reads %d twice (`%s::%s` and `%s::%s`)" % (src.rel, where, n, enum, seen[n], enum, v))
+        seen[n] = v
+        if v not in numbers:
+            raise SourceError("%s: %s reads %d as `%s::%s`, which is not a variant" % (src.rel, where, n, enum, v))
+        if numbers[v] != n:
+            raise SourceError("%s: %s reads %d as `%s::%s`, whose number is %d: one entry with two numbers" % (src.rel, where, n, enum, v, numbers[v]))
+
+
 def code_audit_kinds(root):
     src = Source(AUDIT_RS, read(root, AUDIT_RS))
     numbers = dict(numbered_variants(src, "AuditKind"))
@@ -933,9 +1017,13 @@ def methods_once(root):
 
 def code_unlocker_kinds(root):
     """The unlocker kinds: `UnlockerKind`'s variants in envelope.rs, each
-    with its explicit number."""
+    with its explicit number, which `UnlockerKind::from_byte` reads back
+    under that number alone."""
     src = Source(ENVELOPE_RS, read(root, ENVELOPE_RS))
-    return {snake(v): n for v, n in numbered_variants(src, "UnlockerKind")}
+    numbers = dict(numbered_variants(src, "UnlockerKind"))
+    where, decoded = some_arms(src, "UnlockerKind", "from_byte", impl="UnlockerKind")
+    check_inverse(src, "UnlockerKind", where, numbers, decoded)
+    return {snake(v): n for v, n in numbers.items()}
 
 
 def all_methods(root):
@@ -984,9 +1072,51 @@ POLICIES_RS = "crates/envcloak-core/src/vault/policies.rs"
 
 def code_policy_kinds(root):
     """The policy record kinds: `PolicyKind`'s variants in the vault's
-    policies module, each with its explicit number."""
+    policies module, each with its explicit number, which
+    `PolicyRecord::decode` reads back exactly: each arm's kind is the
+    number of the `PolicyKind` that `PolicyRecord::kind` gives the record
+    the arm makes."""
     src = Source(POLICIES_RS, read(root, POLICIES_RS))
-    return {snake(v): n for v, n in numbered_variants(src, "PolicyKind")}
+    numbers = dict(numbered_variants(src, "PolicyKind"))
+    where_kind, kind_arms = match_arms(src, "kind", impl="PolicyRecord")
+    record_kind = {}
+    for pat, val in kind_arms:
+        v = re.fullmatch(r"(?:PolicyKind|Self)\s*::\s*([A-Z][A-Za-z0-9]*)", val)
+        records = [re.fullmatch(r"(?:PolicyRecord|Self)\s*::\s*([A-Z][A-Za-z0-9]*)\s*\(\s*_\s*\)", p.strip())
+                   for p in pat.split("|")]
+        if not v or not all(records):
+            raise SourceError("%s: %s has an arm the reader cannot read (`%s => %s`): it reads `PolicyRecord::<Record>(_) => PolicyKind::<Kind>`" % (src.rel, where_kind, pat[:60], val[:60]))
+        for r in records:
+            if r.group(1) in record_kind:
+                raise SourceError("%s: %s names `PolicyRecord::%s` twice" % (src.rel, where_kind, r.group(1)))
+            record_kind[r.group(1)] = v.group(1)
+    where, arms = match_arms(src, "decode", impl="PolicyRecord")
+    pattern = re.compile(r"\(\s*(%s)\s*,\s*(%s)\s*\)" % (INT_PATTERN, INT_PATTERN))
+    value = re.compile(r"(?:PolicyRecord|Self)\s*::\s*([A-Z][A-Za-z0-9]*)\s*\(.*\)")
+    if arms[-1][0] != "_":
+        raise SourceError("%s: %s does not end with a `_` arm" % (src.rel, where))
+    decoded, versions = [], set()
+    for pat, val in arms[:-1]:
+        p, v = pattern.fullmatch(pat), value.fullmatch(val)
+        if not p or not v:
+            raise SourceError("%s: %s has an arm the reader cannot read (`%s => %s`): it reads `(<kind>, <version>) => PolicyRecord::<Record>(..)`" % (src.rel, where, pat[:60], val[:60]))
+        n, version = int_value(p.group(1)), int_value(p.group(2))
+        if (n, version) in versions:
+            raise SourceError("%s: %s reads kind %d version %d twice" % (src.rel, where, n, version))
+        versions.add((n, version))
+        if v.group(1) not in record_kind:
+            raise SourceError("%s: %s makes `PolicyRecord::%s`, which %s does not name" % (src.rel, where, v.group(1), where_kind))
+        decoded.append((n, record_kind[v.group(1)]))
+    # A kind may have several versions; each must read back as one kind.
+    once = []
+    for n, k in decoded:
+        if (n, k) not in once:
+            once.append((n, k))
+    check_inverse(src, "PolicyKind", where, numbers, once)
+    return {snake(v): n for v, n in numbers.items()}
+
+
+STATE_RS = "crates/envcloak-core/src/vault/state.rs"
 
 
 def tags(enum):
@@ -995,6 +1125,18 @@ def tags(enum):
         return {snake(v): n for v, n in numbered_variants(src, enum)}
 
     return reader
+
+
+def code_item_classes(root):
+    """The item classes: `ItemClass`'s variants in aad.rs, which
+    `item_class_from` (vault/state.rs) reads back from `items.class`
+    each under its own number."""
+    src = Source(AAD_RS, read(root, AAD_RS))
+    numbers = dict(numbered_variants(src, "ItemClass"))
+    state = Source(STATE_RS, read(root, STATE_RS))
+    where, decoded = some_arms(state, "ItemClass", "item_class_from")
+    check_inverse(state, "ItemClass", where, numbers, decoded)
+    return {snake(v): n for v, n in numbers.items()}
 
 
 STR_TYPE = r"(?:&\s*(?:'static\s+)?str|ExitToken)"
@@ -2748,7 +2890,7 @@ REGISTRIES = {
                        name="Token", num="Number", grammar=TOKEN, code=code_audit_kinds,
                        range=(22, 255)),
     "item_class": dict(doc="docs/VAULT.md", cols=["Number", "Class", "Task", "Status", "Use"],
-                       name="Class", num="Number", grammar=TOKEN, code=tags("ItemClass"),
+                       name="Class", num="Number", grammar=TOKEN, code=code_item_classes,
                        range=(4, 65535)),
     "table_tag": dict(doc="docs/VAULT.md", cols=["Number", "Table", "Task", "Status", "Use"],
                       name="Table", num="Number", grammar=TOKEN, code=tags("TableTag"),
