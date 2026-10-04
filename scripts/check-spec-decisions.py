@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Checks that docs/SPEC.md carries the M2 and M2b build decisions as the
-SPEC v0.4 pull request wrote them (plan task M2-01).
+SPEC v0.4 pull request wrote them (plan task M2-01), and the M3 build
+decisions as SPEC v0.4.1 wrote them (M3 plan task M3-01).
 
 - Every decision D-01 to D-36 of the M2 plan is listed once below, in order,
   either as an edit, with phrases its SPEC edit wrote, or as "no edit", with
@@ -41,7 +42,22 @@ SPEC v0.4 pull request wrote them (plan task M2-01).
   wordings reviewers wrote, and the paraphrases a review found passing
   (M2R-4); one they still miss is left to code-owner review of SPEC edits,
   which `main`'s branch protection must require (plan §3).
-- The status line says v0.4, and the file holds no em dash.
+- Every decision D3-01 to D3-18 of the M3 plan is listed once, in order,
+  in the same way (SPEC v0.4.1, task M3-01). D3-15 says the SPEC changes
+  only on its fallback; the dependency trial's measurement (hpke 0.14
+  compiles `zeroize_derive` on every target, X25519 `curve25519-dalek-
+  derive` on x86_64) corrected §11, so it is an edit. The sentences that
+  carry an M3 decision's security property are in the SPEC exactly once:
+  the app role's runtime conditions and its verdict per connection, a peer
+  that fails them kept a client peer (D3-06, gate 22), the two §4.4
+  crossings of the app (the plan's wording check: a list left without the
+  new crossings fails), the signed form of a proof and the first unlocker
+  approved with the passphrase (D3-08, D3-10), a passphrase proof only
+  from a terminal subject and a signed one only from the app role, and the
+  macOS 26 floor (D3-04). The wording they replaced is gone: the macOS 14
+  floor, the screen lock any program could report, the proof taken only
+  from a terminal subject, and the old app-to-daemon list.
+- The status line says v0.4.1, and the file holds no em dash.
 
 Runs of whitespace, line breaks included, count as one space in the SPEC
 and in every phrase, so rewrapping a sentence neither hides nor breaks it.
@@ -100,6 +116,45 @@ DECISIONS = [
     ("D-34", "edit", ["`cleanup_unconfirmed`", "EnvCloak signals only processes it owns"]),
     ("D-35", "edit", ["whose leader is EnvCloak's PTY monitor", "`pty_monitor_lost`"]),
     ("D-36", "edit", ["Daemon-started modes of `envcloak`", "no release depends on identifying the requesting process's code", "a sealed in-memory copy of that `envcloak`"]),
+]
+
+# The M3 plan's decisions, in the same form (SPEC v0.4.1, task M3-01).
+M3_DECISIONS = [
+    ("D3-01", "no edit", "M3 plan §1.1's order; SPEC §4.2 and §12 already say an unsigned build reports the daemon identity unverified"),
+    ("D3-02", "no edit", "the lane rules of the M3 plan (§1.2, §5) and .github/CODEOWNERS"),
+    ("D3-03", "no edit", "docs/APP.md: the Swift client and its cross-language vectors (M3-03)"),
+    ("D3-04", "edit", ["SwiftUI, macOS 26 or later, Swift 6."]),
+    ("D3-05", "no edit", "docs/APP.md: the signing tiers; SPEC §12 already separates M3 from M7"),
+    ("D3-06", "edit", [
+        '`identifier "ai.envcloak.app" and anchor apple generic and certificate leaf[subject.OU] = "<TEAMID>"`',
+        "The peer must also run with the hardened runtime flag",
+        "`allow-dyld-environment-variables`",
+        "keeps it for that connection alone",
+        "against the daemon's pinned requirement and the runtime conditions of §4.3",
+    ]),
+    ("D3-07", "no edit", "SPEC §4.1 already allows the CLI's LaunchAgent by absolute path; docs/APP.md"),
+    ("D3-08", "edit", [
+        "The first Secure Enclave unlocker is approved with the passphrase",
+        "the two public keys (`unlock` and `approve`) of a new Secure Enclave unlocker",
+    ]),
+    ("D3-09", "no edit", "docs/IPC.md \"Framing\": no client waits for a person on an open connection"),
+    ("D3-10", "edit", [
+        "`envcloak-unlocker-statement/1`",
+        "`envcloak-write-statement/1`",
+        "`envcloak-reveal-statement/1`",
+        "sent as the 64-byte raw `r || s`",
+    ]),
+    ("D3-11", "edit", ["screen lock (reported by the app through the app role"]),
+    ("D3-12", "no edit", "docs/APP.md and docs/VAULT.md: the anchor store (M3-16)"),
+    ("D3-13", "no edit", "SPEC §6.4 already keeps machine scans out of the daemon and the app"),
+    ("D3-14", "no edit", "SPEC §5 already shows the Recovery Kit only on the terminal"),
+    ("D3-15", "edit", [
+        "it compiles the proc-macro crate `zeroize_derive` on every target",
+        "compiles `curve25519-dalek-derive` on x86_64",
+    ]),
+    ("D3-16", "no edit", "SPEC §1.1 already shows an unshipped feature as unavailable"),
+    ("D3-17", "no edit", "docs/IPC.md \"Reserved for M3\": the `projects.list` row (Q3-04)"),
+    ("D3-18", "no edit", "docs/APP.md: the founder build"),
 ]
 
 REQUIRED = {
@@ -256,6 +311,56 @@ REQUIRED = {
         "reclassifying an item towards `test` or `unknown` (M2), which loosens the live-key guard "
         "and, towards `test`, what a standing approval can cover."
     ),
+    "§4.3 the app role's runtime conditions (D3-06)": (
+        "The peer must also run with the hardened runtime flag and carry neither "
+        "`com.apple.security.get-task-allow` nor any of the hardened runtime's exception "
+        "entitlements (`com.apple.security.cs.allow-jit`, `allow-unsigned-executable-memory`, "
+        "`allow-dyld-environment-variables`, `disable-library-validation`, "
+        "`disable-executable-page-protection` and `debugger`), since each of them lets another "
+        "process run code inside the signed app."
+    ),
+    "§4.3 the app role's verdict per connection (D3-06)": (
+        "The daemon takes this verdict at the connection's first `app` request and keeps it for "
+        "that connection alone, which it closes unanswered once another process sends on it"
+    ),
+    "§4.3 a peer that fails is a client peer (D3-06, gate 22)": (
+        "From M3, a peer that does not meet every condition of the `app` role is a client peer, "
+        "and its `app` requests are rejected and audited the same way (gate 22)."
+    ),
+    "§4.4 app to daemon (M3-01)": (
+        "App to daemon: one HPKE-sealed VMK per unlock; the two public keys (`unlock` and "
+        "`approve`) of a new Secure Enclave unlocker; signed approval, write, unlocker, reveal, "
+        "policy and device statements; values typed into the paste sheet and replacement values, "
+        "each sealed to a daemon ephemeral key."
+    ),
+    "§4.4 daemon to app (M3-01)": (
+        "Daemon to app: envelopes (ciphertext); approval request descriptors (metadata only); "
+        "audit entries (metadata only, with command lines masked as the audit log keeps them); "
+        "the paste and reveal requests the CLI filed (`envcloak add --ask`, `envcloak reveal`), "
+        "metadata only, with the requester's evidence; reveal values sealed to an app ephemeral "
+        "key after a signed reveal statement."
+    ),
+    "§10b the signed form of a proof (D3-10)": (
+        "From the `app` role (§4.3, M3): a P-256 ECDSA signature by the `approve` key of a Secure "
+        "Enclave unlocker enrolled in the vault, over the SHA-256 digest of the canonical statement "
+        "as a prehash, sent as the 64-byte raw `r || s`; the daemon rebuilds the statement from its "
+        "own record, verifies the signature with that unlocker's public key, and refuses a key that "
+        "is not enrolled or was removed."
+    ),
+    "§10b the first unlocker approved with the passphrase (D3-08)": (
+        "The first Secure Enclave unlocker is approved with the passphrase, since until it exists "
+        "the app has no key to sign with: the app asks for it, and the person runs `envcloak "
+        "approve <id>` in a terminal and reads an `envcloak-unlocker-statement/1` that names the "
+        "unlocker's label, the SHA-256 fingerprints of both its public keys, and the Team ID and "
+        "signing identifier the daemon verified for the app."
+    ),
+    "§10b which caller gives which proof (D3-10)": (
+        "The daemon takes a passphrase or Recovery Kit proof (approve, unlock, rotate, remove, "
+        "reveal, recover) only from a terminal subject (Subject kind, above), and a signed proof "
+        "only from the `app` role, and refuses a passphrase or Recovery Kit proof from every "
+        "other caller"
+    ),
+    "§12 the macOS 26 floor (D3-04)": "SwiftUI, macOS 26 or later, Swift 6.",
     "§6.8 the reaper and driver start from the daemon's own executable (D-25, D-36)": (
         "The daemon starts the reaper and the driver from its own executable as it was when the "
         "daemon started, never from a path it reads again: on Linux from a sealed in-memory copy "
@@ -322,10 +427,19 @@ FORBIDDEN = {
     "the old gate 38 bullet": re.escape("Activation and denial probes run for each agent in an isolated HOME, and coverage"),
     "the old gate 39": re.escape("No literal secret remains in any agent config."),
     "the old gate 41 release rule": re.escape("a host below that is published as"),
+    # What v0.4.1 replaced (M3 plan, task M3-01).
+    "the macOS 14 floor (D3-04)": r"\bmacOS 14\b",
+    "the screen lock any program could report (D3-11)": re.escape("screen lock (reported by the app);"),
+    "a proof taken only from a terminal subject, with no signed form (D3-10)": re.escape(
+        "The daemon takes a proof (approve, unlock, rotate, remove, reveal, recover) only from a terminal subject"
+    ),
+    "the old app-to-daemon list (M3-01)": re.escape(
+        "signed approval, policy, device and reveal statements; values typed into the paste sheet, sealed"
+    ),
     "an em dash": "\u2014",
 }
 
-STATUS = "Status: draft v0.4 "
+STATUS = "Status: draft v0.4.1 "
 
 problems = []
 
@@ -342,13 +456,16 @@ def flat(text):
 
 def check_spec(text):
     if not text.startswith("# EnvCloak: product and architecture spec\n\n" + STATUS):
-        fail("the status line does not say draft v0.4")
+        fail("the status line does not say draft v0.4.1")
     text = flat(text)
     ids = [d[0] for d in DECISIONS]
     expected = ["D-%02d" % n for n in range(1, 37)]
     if ids != expected:
         fail("the decision list is not D-01 to D-36, each once and in order")
-    for did, kind, what in DECISIONS:
+    m3_ids = [d[0] for d in M3_DECISIONS]
+    if m3_ids != ["D3-%02d" % n for n in range(1, 19)]:
+        fail("the M3 decision list is not D3-01 to D3-18, each once and in order")
+    for did, kind, what in DECISIONS + M3_DECISIONS:
         if kind == "edit":
             if not what:
                 fail("%s is an edit with no phrase to check" % did)
@@ -408,7 +525,7 @@ def main(argv):
         for p in problems:
             print("check-spec-decisions: " + p, file=sys.stderr)
         return 1
-    print("check-spec-decisions: ok (%d decisions, %d sentences)" % (len(DECISIONS), len(REQUIRED)))
+    print("check-spec-decisions: ok (%d decisions, %d sentences)" % (len(DECISIONS) + len(M3_DECISIONS), len(REQUIRED)))
     return 0
 
 
