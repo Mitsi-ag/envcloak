@@ -48,11 +48,24 @@
 //! it too. The signal then goes through that pidfd to the group the
 //! process leads or led (`PIDFD_SIGNAL_PROCESS_GROUP`, Linux 6.9), which
 //! the kernel resolves by the group's identity, never its number, and
-//! signals at the moment of delivery: a member that left the group or the
-//! session before then (`setpgid`, `setsid`) gets nothing, and a number
-//! reused since the read names no member of it. The group number read
-//! from the terminal (`TIOCGPGRP`) only says whose pidfd to open; it is
-//! never a signal target.
+//! signals at the moment of delivery: a member other than the leader that
+//! left the group or the session before then (`setpgid`, `setsid`) gets
+//! nothing, and a number reused since the read names no member of it. The
+//! group number read from the terminal (`TIOCGPGRP`) only says whose pidfd
+//! to open; it is never a signal target.
+//!
+//! The leader is the one process that can take the group's identity out
+//! of the session with it. Its pid is that identity, so a leader that
+//! leaves its group for another of the session and then calls `setsid`
+//! (which the kernel allows once no process is left in its old group)
+//! leads a new group of a new session under the same identity
+//! (`set_special_pids`), and a signal sent after that reaches it there,
+//! with any process it has started since in that new group. Those are the
+//! job's own leader and its descendants, never a process the job did not
+//! start (a process enters a session only by being created in it), but
+//! they are outside the monitor's session by then: the session check is of
+//! the moment of binding, and a delivery that follows it does not hold the
+//! leader in.
 
 use std::io;
 use std::os::unix::process::ExitStatusExt;
@@ -478,7 +491,10 @@ pub(crate) trait GroupTable {
 /// number is free only once no process, group or session uses it), so its
 /// group is empty and the signal reaches no one. A process whose session
 /// is `session` has been in it all its life, so the group it leads or led
-/// is in it too: the leader need not still be in that group, nor alive.
+/// is in it too at the binding: the leader need not still be in that
+/// group, nor alive. (A leader that later leaves the group and then the
+/// session takes the group's identity along: the module documentation
+/// says what a delivery after that reaches.)
 ///
 /// # Errors
 /// [`NoJob::MonitorHolds`] when `foreground` is the session's own group;
@@ -626,8 +642,10 @@ impl ForegroundJob<'_> {
     /// Sends `sig` to every process in the job's group at the moment of
     /// delivery, through the leader's pidfd (`PIDFD_SIGNAL_PROCESS_GROUP`):
     /// one operation of the kernel, which reads the group's members under
-    /// its task-list lock, so a member that left the group or the session
-    /// since the job was bound gets nothing. A member this process may not
+    /// its task-list lock, so a member other than the leader that left the
+    /// group or the session since the job was bound gets nothing (a leader
+    /// that left both takes the group's identity with it: see the module
+    /// documentation). A member this process may not
     /// signal (one that changed to another user) gets nothing either, and,
     /// as with `kill(2)` of a group, the call succeeds when another member
     /// received the signal.
@@ -773,8 +791,15 @@ mod tests {
             match change {
                 Change::Gone(pid) => self.procs.retain(|p| p.id.pid != pid),
                 Change::Setsid(pid) => {
+                    let id = self.find(pid).unwrap().id;
+                    assert!(
+                        !self.procs.iter().any(|p| p.group == id),
+                        "the kernel refuses setsid to {pid} while a group has its identity"
+                    );
                     let p = self.procs.iter_mut().find(|p| p.id.pid == pid).unwrap();
                     p.sid = pid;
+                    // `set_special_pids`: the new session's group has the
+                    // caller's own identity.
                     p.group = p.id;
                 }
                 Change::Join(pid, leader) => {
@@ -913,6 +938,45 @@ mod tests {
         m.apply(Change::Join(LEADER, OTHER));
         deliver(&mut m, LEADER, libc::SIGTERM).unwrap();
         assert_eq!(m.hit(), BTreeSet::from([PEER]));
+    }
+
+    /// The leader of a one-process job leaves its group for another of the
+    /// session and then the session itself (`setsid`, allowed once its old
+    /// group is empty), after the job was bound, and forks a child there.
+    /// The kernel gives the new session's group the leader's own identity
+    /// (`set_special_pids`), which is the identity the handle holds: the
+    /// delivery reaches the leader and its child in their new session, and
+    /// nothing else (not the group it passed through, not the shell). This
+    /// is what the documentation now says; the claim before it, that a
+    /// process that left the session gets nothing, holds for every member
+    /// but the leader. The model refuses the `setsid` while the old group
+    /// still has a member, as the kernel does.
+    #[test]
+    fn a_leader_that_leaves_the_session_takes_the_groups_identity_with_it() {
+        let mut m = session();
+        m.apply(Change::Gone(PEER));
+        let job = bind_job(&mut m, MONITOR, LEADER).unwrap();
+        m.apply(Change::Join(LEADER, OTHER));
+        m.apply(Change::Setsid(LEADER));
+        m.apply(Change::Fork(LEADER, 531));
+        signal_job(&mut m, &job, libc::SIGTERM).unwrap();
+        assert_eq!(m.hit(), BTreeSet::from([LEADER, 531]));
+        assert!(
+            m.procs
+                .iter()
+                .filter(|p| m.hit().contains(&p.id.pid))
+                .all(|p| p.sid == LEADER),
+            "both are in the leader's new session, outside the monitor's"
+        );
+        let refused = std::panic::catch_unwind(|| {
+            let mut m = session();
+            m.apply(Change::Join(LEADER, OTHER));
+            m.apply(Change::Setsid(LEADER));
+        });
+        assert!(
+            refused.is_err(),
+            "setsid while the peer is still in the old group"
+        );
     }
 
     /// A group whose leader was reaped (a pipeline's first command that
