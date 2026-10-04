@@ -62,12 +62,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use envcloak_agents::hook::shell::check_script;
+use envcloak_testkit::agents::finish_capped;
 
 /// A small seeded generator (xorshift64*).
 struct Rng(u64);
@@ -132,7 +132,12 @@ fn is_zsh(shell: &Path) -> bool {
 }
 
 /// What `shell -c script` prints (standard output and error), in `dir`,
-/// with only `env` in its environment, within 10 seconds.
+/// with only `env` in its environment, within 10 seconds of its start, its
+/// output read to the end, at most 1 MiB of each stream kept; a run past
+/// that fails the oracle (Codex F-127, the same class as the program
+/// oracle's: a run past its limit gave what it had printed as if it had
+/// ended, and the wait for its output was not bounded once the shell was
+/// killed). The shell leads a process group of its own, killed with it.
 fn run(shell: &Path, script: &str, dir: &Path, env: &[(&str, &str)]) -> Vec<u8> {
     let mut cmd = Command::new(shell);
     cmd.arg("-c")
@@ -148,34 +153,9 @@ fn run(shell: &Path, script: &str, dir: &Path, env: &[(&str, &str)]) -> Vec<u8> 
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().unwrap();
-    let mut out = child.stdout.take().unwrap();
-    let mut err = child.stderr.take().unwrap();
-    let t1 = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b);
-        b
-    });
-    let t2 = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        b
-    });
-    let start = Instant::now();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            // Our own unreaped child.
-            let _ = child.kill();
-            let _ = child.wait();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let mut b = t1.join().unwrap();
-    b.extend(t2.join().unwrap());
+    let out = finish_capped(cmd, Duration::from_secs(10), 1 << 20);
+    let mut b = out.stdout;
+    b.extend(out.stderr);
     b
 }
 

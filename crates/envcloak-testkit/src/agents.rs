@@ -1387,7 +1387,7 @@ impl AgentHome {
         let start = Instant::now();
         let mut child = GroupChild::spawn(&mut cmd)
             .unwrap_or_else(|e| panic!("start {}: {e}", self.installed.pin.id));
-        let collector = Collector::start(&mut child.child);
+        let collector = Collector::start(&mut child.child, usize::MAX);
         Running {
             child,
             collector,
@@ -1519,8 +1519,20 @@ impl GroupChild {
     /// # Errors
     /// When it cannot start.
     pub fn spawn(cmd: &mut Command) -> std::io::Result<GroupChild> {
+        GroupChild::spawn_with(cmd, Command::spawn)
+    }
+
+    /// [`GroupChild::spawn`], started by `spawn` (a traced start, say)
+    /// once `cmd` is set to lead a new process group.
+    ///
+    /// # Errors
+    /// When it cannot start.
+    pub fn spawn_with(
+        cmd: &mut Command,
+        spawn: impl FnOnce(&mut Command) -> std::io::Result<Child>,
+    ) -> std::io::Result<GroupChild> {
         cmd.process_group(0);
-        let child = cmd.spawn()?;
+        let child = spawn(cmd)?;
         let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
         let (tx, exited) = mpsc::channel();
         std::thread::spawn(move || {
@@ -1651,14 +1663,18 @@ enum Reading {
     Failed,
 }
 
-type Collected = std::sync::Arc<std::sync::Mutex<(Vec<u8>, Reading)>>;
+/// A stream's bytes as far as they are kept, how far it was read, and how
+/// many bytes past the cap were read and not kept.
+type Collected = std::sync::Arc<std::sync::Mutex<(Vec<u8>, Reading, u64)>>;
 
 /// Reads `s` to its end into `into`, then marks it [`Reading::Ended`]; a
 /// read interrupted by a signal is tried again, and any other error marks
 /// it [`Reading::Failed`] and stops (Codex review, medium: every error
 /// was taken for the end, so output cut short by one passed the sweep as
-/// whole).
-fn drain(mut s: impl Read, into: &Collected) {
+/// whole). Past `cap` bytes the rest is still read, so the writer never
+/// waits on a full pipe, and counted, not kept (Codex F-127: a program
+/// that prints without end must not fill the test's memory).
+fn drain(mut s: impl Read, into: &Collected, cap: usize) {
     let mut chunk = [0u8; 8192];
     loop {
         let read = s.read(&mut chunk);
@@ -1670,7 +1686,11 @@ fn drain(mut s: impl Read, into: &Collected) {
                 b.1 = Reading::Ended;
                 return;
             }
-            Ok(n) => b.0.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                let keep = n.min(cap.saturating_sub(b.0.len()));
+                b.0.extend_from_slice(&chunk[..keep]);
+                b.2 += (n - keep) as u64;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => {
                 b.1 = Reading::Failed;
@@ -1681,20 +1701,22 @@ fn drain(mut s: impl Read, into: &Collected) {
 }
 
 impl Collector {
-    fn start(child: &mut Child) -> Collector {
-        fn collect(s: Option<Box<dyn Read + Send>>) -> Collected {
+    /// Collects `child`'s output, keeping at most `cap` bytes of each
+    /// stream.
+    fn start(child: &mut Child, cap: usize) -> Collector {
+        let collect = |s: Option<Box<dyn Read + Send>>| -> Collected {
             let state = if s.is_some() {
                 Reading::Open
             } else {
                 Reading::Ended
             };
-            let buf: Collected = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), state)));
+            let buf: Collected = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), state, 0)));
             if let Some(s) = s {
                 let into = std::sync::Arc::clone(&buf);
-                std::thread::spawn(move || drain(s, &into));
+                std::thread::spawn(move || drain(s, &into, cap));
             }
             buf
-        }
+        };
         Collector {
             out: collect(
                 child
@@ -1759,6 +1781,12 @@ impl Collector {
         let complete = [&self.out, &self.err]
             .iter()
             .all(|c| state(c) == Reading::Ended);
+        let over_cap = [&self.out, &self.err].iter().any(|c| {
+            c.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .2
+                > 0
+        });
         let take = |c: &Collected| {
             std::mem::take(
                 &mut c
@@ -1776,6 +1804,7 @@ impl Collector {
             in_time,
             complete,
             read_failed,
+            over_cap,
         }
     }
 }
@@ -1797,6 +1826,9 @@ pub struct Bounded {
     /// A read of its output failed: what came after is missing (the run
     /// is not [`Bounded::complete`] either).
     pub read_failed: bool,
+    /// It printed more than the cap [`run_capped`] was given on a stream:
+    /// the rest was read and not kept, so the output is not whole.
+    pub over_cap: bool,
 }
 
 impl std::fmt::Debug for Bounded {
@@ -1806,6 +1838,7 @@ impl std::fmt::Debug for Bounded {
             .field("in_time", &self.in_time)
             .field("complete", &self.complete)
             .field("read_failed", &self.read_failed)
+            .field("over_cap", &self.over_cap)
             .field("stdout_len", &self.output.stdout.len())
             .field("stderr_len", &self.output.stderr.len())
             .finish()
@@ -1822,10 +1855,98 @@ impl std::fmt::Debug for Bounded {
 ///
 /// # Errors
 /// When the process cannot start.
-pub fn run_within(mut cmd: Command, limit: Duration) -> std::io::Result<Bounded> {
-    let mut child = GroupChild::spawn(&mut cmd)?;
-    let collector = Collector::start(&mut child.child);
-    Ok(collector.end(&mut child, limit, OUTPUT_GRACE))
+pub fn run_within(cmd: Command, limit: Duration) -> std::io::Result<Bounded> {
+    run_capped(cmd, limit, usize::MAX)
+}
+
+/// [`run_within`], keeping at most `cap` bytes of each output stream
+/// ([`Bounded::over_cap`] says when it printed more).
+///
+/// # Errors
+/// When the process cannot start.
+pub fn run_capped(mut cmd: Command, limit: Duration, cap: usize) -> std::io::Result<Bounded> {
+    Ok(start_capped(&mut cmd, cap)?.end_within(limit))
+}
+
+/// [`finish_within`], keeping at most `cap` bytes of each output stream:
+/// a process that prints more than that on one fails the test too (what
+/// it printed past the cap is read and not kept).
+///
+/// # Panics
+/// As [`finish_within`], and when it printed more than `cap` bytes on a
+/// stream. The messages name neither the command's arguments nor its
+/// output.
+pub fn finish_capped(mut cmd: Command, limit: Duration, cap: usize) -> Output {
+    let started =
+        start_capped(&mut cmd, cap).unwrap_or_else(|e| panic!("cannot start a process: {e}"));
+    started.finish_within(limit)
+}
+
+/// A process [`start_capped`] started: the leader of a process group of
+/// its own, its output collected as it comes. Given its input, it is
+/// ended with [`Started::end_within`]; dropped before, its group is
+/// killed and it is reaped.
+#[derive(Debug)]
+pub struct Started {
+    child: GroupChild,
+    collector: Collector,
+}
+
+impl Started {
+    /// Its standard input, when piped and not taken yet.
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.take_stdin()
+    }
+
+    /// As [`run_within`] from here: waits up to `limit` for it to exit,
+    /// kills what is left of its group, reaps it and reads its output.
+    pub fn end_within(mut self, limit: Duration) -> Bounded {
+        self.collector.end(&mut self.child, limit, OUTPUT_GRACE)
+    }
+
+    /// As [`finish_capped`] from here.
+    ///
+    /// # Panics
+    /// As [`finish_capped`].
+    pub fn finish_within(self, limit: Duration) -> Output {
+        let b = self.end_within(limit);
+        assert!(b.in_time, "a process did not exit within {limit:?}");
+        assert!(!b.read_failed, "incomplete output: a read of it failed");
+        assert!(
+            b.complete,
+            "incomplete output: {OUTPUT_GRACE:?} after the process exited and its group was \
+             killed, a process outside the group still held its output open"
+        );
+        assert!(
+            !b.over_cap,
+            "a process printed more on a stream than its test keeps"
+        );
+        b.output
+    }
+}
+
+/// Starts `cmd` (its standard output and error piped) as the leader of a
+/// process group of its own, collecting at most `cap` bytes of each
+/// output stream.
+///
+/// # Errors
+/// When the process cannot start.
+pub fn start_capped(cmd: &mut Command, cap: usize) -> std::io::Result<Started> {
+    start_capped_with(cmd, cap, Command::spawn)
+}
+
+/// [`start_capped`], started by `spawn` (a traced start, say).
+///
+/// # Errors
+/// When the process cannot start.
+pub fn start_capped_with(
+    cmd: &mut Command,
+    cap: usize,
+    spawn: impl FnOnce(&mut Command) -> std::io::Result<Child>,
+) -> std::io::Result<Started> {
+    let mut child = GroupChild::spawn_with(cmd, spawn)?;
+    let collector = Collector::start(&mut child.child, cap);
+    Ok(Started { child, collector })
 }
 
 /// Spawns `cmd` as the leader of a process group of its own and waits up
@@ -1838,7 +1959,7 @@ pub fn run_within(mut cmd: Command, limit: Duration) -> std::io::Result<Bounded>
 pub fn finish_within(mut cmd: Command, limit: Duration) -> Output {
     let mut child =
         GroupChild::spawn(&mut cmd).unwrap_or_else(|e| panic!("cannot start a process: {e}"));
-    let collector = Collector::start(&mut child.child);
+    let collector = Collector::start(&mut child.child, usize::MAX);
     collector.wait(&mut child, limit)
 }
 
@@ -2003,7 +2124,7 @@ mod tests {
             f = fifo.display()
         ));
         let mut child = GroupChild::spawn(&mut cmd).unwrap_or_else(|e| panic!("{e}"));
-        let collector = Collector::start(&mut child.child);
+        let collector = Collector::start(&mut child.child, usize::MAX);
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             collector.wait_grace(&mut child, Duration::from_secs(60), Duration::from_secs(1))
         }));
@@ -2038,9 +2159,9 @@ mod tests {
         let canary = format!("ecread{:016x}", crate::fresh_seed()).into_bytes();
         let read = |kind| {
             let into: Collected =
-                std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), Reading::Open)));
+                std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), Reading::Open, 0)));
             let script = vec![Ok(b"harmless ".to_vec()), Err(kind), Ok(canary.clone())];
-            drain(Script(script.into()), &into);
+            drain(Script(script.into()), &into, usize::MAX);
             let got = into
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2057,7 +2178,7 @@ mod tests {
         // A run whose output stream failed is incomplete, and its wait
         // fails; the control, both streams read to the end, is complete.
         let collector = |out: Reading| {
-            let stream = |state| std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), state)));
+            let stream = |state| std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), state, 0)));
             Collector {
                 out: stream(out),
                 err: stream(Reading::Ended),
@@ -2103,6 +2224,92 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    /// Codex F-127: the end of a child's output is not its end. A child
+    /// that closes its output (each stream, then both) and lives on is
+    /// past its limit within the limit and a bounded grace, its group
+    /// stopped; the control, a child that exits, is in time with both
+    /// streams and its exit status kept, and a nonzero status kept apart.
+    ///
+    /// Mutation checked: `Collector::end` taking the output's end for the
+    /// child's (no wait for its exit once both streams ended): the closed
+    /// cases are in time and this fails.
+    #[test]
+    fn a_child_that_closes_its_output_and_lives_on_is_past_its_limit() {
+        for script in [
+            "exec 1>&-; sleep 600",
+            "exec 2>&-; sleep 600",
+            "exec 1>&- 2>&-; sleep 600",
+        ] {
+            let start = Instant::now();
+            let b = run_capped(sh(script), Duration::from_secs(1), 1024)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(!b.in_time, "{script}: {b:?}");
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "{script}: {:?}",
+                start.elapsed()
+            );
+        }
+        let b = run_capped(
+            sh("printf out; printf err >&2"),
+            Duration::from_secs(30),
+            1024,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(b.in_time && b.complete && !b.over_cap, "{b:?}");
+        assert_eq!(
+            (b.output.stdout.as_slice(), b.output.stderr.as_slice()),
+            (&b"out"[..], &b"err"[..])
+        );
+        assert_eq!(b.output.status.code(), Some(0));
+        let b = run_capped(sh("exit 3"), Duration::from_secs(30), 1024)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(b.in_time && b.complete, "{b:?}");
+        assert_eq!(b.output.status.code(), Some(3));
+    }
+
+    /// Codex F-127: output past the cap is read and counted, not kept, on
+    /// either stream, and the writer is never held by a full pipe (it
+    /// exits in time); the control, output under the cap, is kept whole.
+    ///
+    /// Mutation checked: `drain` keeping every byte (the cap ignored): the
+    /// output is kept whole, `over_cap` is false, and this fails.
+    #[test]
+    fn output_past_the_cap_is_counted_and_not_kept() {
+        for (script, which) in [
+            ("head -c 300000 /dev/zero", "stdout"),
+            ("head -c 300000 /dev/zero >&2", "stderr"),
+        ] {
+            let b = run_capped(sh(script), Duration::from_secs(30), 1000)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(b.in_time && b.complete && b.over_cap, "{which}: {b:?}");
+            let kept = if which == "stdout" {
+                &b.output.stdout
+            } else {
+                &b.output.stderr
+            };
+            assert_eq!(kept.len(), 1000, "{which}");
+        }
+        let b = run_capped(sh("head -c 1000 /dev/zero"), Duration::from_secs(30), 1000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(b.in_time && b.complete && !b.over_cap, "{b:?}");
+        assert_eq!(b.output.stdout.len(), 1000);
+    }
+
+    /// A started child is given its input, and ended as a run is.
+    #[test]
+    fn a_started_child_is_given_its_input() {
+        let mut cmd = sh("cat");
+        cmd.stdin(Stdio::piped());
+        let mut started = start_capped(&mut cmd, 1024).unwrap_or_else(|e| panic!("{e}"));
+        let mut input = started.take_stdin().unwrap_or_else(|| panic!("no stdin"));
+        input.write_all(b"given").unwrap_or_else(|e| panic!("{e}"));
+        drop(input);
+        let b = started.end_within(Duration::from_secs(30));
+        assert!(b.in_time && b.complete, "{b:?}");
+        assert_eq!(b.output.stdout, b"given");
     }
 
     /// Dropped while it runs (a test that failed half way), the child's

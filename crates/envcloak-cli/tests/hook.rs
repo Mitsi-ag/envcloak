@@ -27,6 +27,7 @@ use common::{
     MANIFEST, cli, outside_dir, project, run_on_terminal, secret_file, seed_vault, start_daemon,
     stderr, stdout,
 };
+use envcloak_testkit::agents::start_capped;
 use envcloak_testkit::{TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels};
 use serde_json::{Value, json};
 
@@ -69,8 +70,15 @@ fn session_start(host: &str, cwd: &Path) -> Vec<u8> {
     serde_json::to_vec(&p).unwrap()
 }
 
+/// The most of each output stream of the hook a test keeps; more fails it.
+const CAP: usize = 1 << 20;
+
 /// `envcloak hook <args>` in `home`, fed `payload`; the writer ignores a
-/// closed pipe, as a host does once the hook has answered.
+/// closed pipe, as a host does once the hook has answered. The hook leads
+/// a process group of its own: its exit and its output are waited for
+/// within 30 s, and what is left of the group is killed either way (the
+/// class of Codex F-127: a wait past its limit failed the test but left
+/// the hook running, its output unread).
 fn hook(home: &TestHome, args: &[&str], payload: Vec<u8>) -> (Output, Duration) {
     let mut cmd = Command::new(cli());
     home.apply(&mut cmd)
@@ -81,25 +89,15 @@ fn hook(home: &TestHome, args: &[&str], payload: Vec<u8>) -> (Output, Duration) 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let start = Instant::now();
-    let mut child = cmd.spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
+    let mut started = start_capped(&mut cmd, CAP).unwrap();
+    let mut stdin = started.take_stdin().unwrap();
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&payload);
     });
-    let out = wait(child, Duration::from_secs(30));
+    let out = started.finish_within(Duration::from_secs(30));
     let took = start.elapsed();
     writer.join().unwrap();
     (out, took)
-}
-
-fn wait(child: std::process::Child, limit: Duration) -> Output {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    rx.recv_timeout(limit)
-        .expect("the hook did not exit")
-        .unwrap()
 }
 
 fn args(host: &str, event: &str) -> [String; 4] {
@@ -311,10 +309,10 @@ fn a_payload_too_large_or_too_slow_is_stopped_within_the_deadline() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let start = Instant::now();
-        let mut child = cmd.spawn().unwrap();
-        let mut stdin = child.stdin.take().unwrap();
+        let mut started = start_capped(&mut cmd, CAP).unwrap();
+        let mut stdin = started.take_stdin().unwrap();
         stdin.write_all(b"{\"hook_event_name\": ").unwrap();
-        let o = wait(child, Duration::from_secs(10));
+        let o = started.finish_within(Duration::from_secs(10));
         let took = start.elapsed();
         drop(stdin);
         assert_denied(&o, host, "PreToolUse", "[envcloak:unchecked]");
@@ -432,6 +430,7 @@ fn linux_a_traced_hook_reads_nothing() {
     use std::io::Seek;
 
     use envcloak_sys::testing::spawn_traced;
+    use envcloak_testkit::agents::start_capped_with;
 
     let home = TestHome::new();
     let cs = canaries(fresh_seed());
@@ -452,12 +451,12 @@ fn linux_a_traced_hook_reads_nothing() {
             .stdin(Stdio::from(f))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = if traced {
-            spawn_traced(&mut cmd).unwrap()
+        let started = if traced {
+            start_capped_with(&mut cmd, CAP, spawn_traced).unwrap()
         } else {
-            cmd.spawn().unwrap()
+            start_capped(&mut cmd, CAP).unwrap()
         };
-        let o = wait(child, Duration::from_secs(30));
+        let o = started.finish_within(Duration::from_secs(30));
         assert_no_canary(&o.stdout, &cs);
         assert_no_canary(&o.stderr, &cs);
         (o, probe.stream_position().unwrap())
