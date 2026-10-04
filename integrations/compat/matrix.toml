@@ -1,0 +1,60 @@
+# What `envcloak agents status` reports for each pinned tier-1 host, as
+# CI's coverage probes found it (M2 plan task M2-09; SPEC §7.1, gate 38):
+# per host version and system, each surface's state, its reason tokens and
+# its probe outcome, and EnvCloak's server line, in an isolated home with
+# EnvCloak installed by `envcloak agents install` and nothing switched
+# off. crates/envcloak-e2e/tests/probes.rs runs the probes on the pinned
+# hosts and fails when what they observe, or what `agents status` then
+# reports, differs from a row here; a change is made here with the run
+# that measured it, never by loosening the test. docs/INSTALLERS.md
+# ("Coverage") explains each value, and M2 plan §4's S4 takes its expected
+# tokens from here.
+#
+# Codex's hook probes run with `--dangerously-bypass-hook-trust`, standing
+# for the person's trust in `/hooks`, in the probe home only; a person's
+# own hooks still read `hooks_untrusted`, since Codex records their trust
+# where EnvCloak cannot read it.
+
+[[host]]
+id = "claude-code"
+version = "2.1.280"
+
+[host.macos]
+prompt_to_model = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+transcript = "unsupported (persists_blocked_prompt; probe=failed)"
+file_read = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+shell = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+mcp = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+output = "active (probe=passed)"
+envcloak_server = "needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)"
+
+[host.linux]
+prompt_to_model = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+transcript = "unsupported (persists_blocked_prompt; probe=failed)"
+file_read = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+shell = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+mcp = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+output = "active (probe=passed)"
+envcloak_server = "needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)"
+
+[[host]]
+id = "codex"
+version = "0.159.2"
+
+[host.macos]
+prompt_to_model = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+transcript = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+file_read = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+shell = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+mcp = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+output = "active (probe=passed)"
+envcloak_server = "needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)"
+
+[host.linux]
+prompt_to_model = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+transcript = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+file_read = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+shell = "unsupported (sandbox_blocks_socket; probe=passed)"
+mcp = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+output = "active (probe=passed)"
+envcloak_server = "needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)"
