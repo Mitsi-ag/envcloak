@@ -505,7 +505,7 @@ fn oracle_cases() -> Vec<(Raw, SignInStatement)> {
         name: "sid".into(),
         host_only: true,
         host: RawHost::V4([127, 0, 0, 1]),
-        path: "/a%2Fb/~!$&'()*+,=:@".into(),
+        path: "/a%2Fb/~!$&'()*+,=:@ x".into(),
         partition: Some((Scheme::Http, RawHost::V6([0; 16]), false)),
     }];
     r.storage = Vec::new();
@@ -1179,7 +1179,7 @@ proptest! {
         prop_assert_eq!(Label::new(&s).is_ok(), label_ok);
         let path_ok = s.starts_with('/')
             && s.len() <= 1024
-            && s.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';');
+            && s.bytes().all(|b| (0x20..=0x7e).contains(&b) && b != b';');
         prop_assert_eq!(CookiePath::new(&s).is_ok(), path_ok);
     }
 }
@@ -1435,8 +1435,10 @@ fn partitions_are_part_of_a_declared_cookie() {
     assert_eq!(flat.scope().unwrap_err(), ScopeError::Duplicate);
 }
 
-/// Cookie paths: `/` and then printable ASCII but `;`, at most 1,024
-/// bytes, kept byte for byte; the error never holds the input.
+/// Cookie paths: `/` and then the rest of RFC 6265's `path-value` (any
+/// character but controls and `;`: printable ASCII and the space), at
+/// most 1,024 bytes, kept byte for byte; the error never holds the input.
+/// Mutation: "the space refused" (the grammar narrower than RFC 6265's).
 #[test]
 fn cookie_paths_take_only_the_stored_form() {
     for ok in [
@@ -1447,6 +1449,10 @@ fn cookie_paths_take_only_the_stored_form() {
         "/a%2Fb",
         "/~!$&'()*+,=:@[]",
         "//",
+        "/a b",
+        "/a ",
+        "/ ",
+        "/\\\"<>`{|}^",
     ] {
         assert_eq!(CookiePath::new(ok).unwrap().as_str(), ok);
     }
@@ -1455,8 +1461,9 @@ fn cookie_paths_take_only_the_stored_form() {
         "".to_owned(),
         "app".to_owned(),
         " /".to_owned(),
-        "/a b".to_owned(),
         "/a;b".to_owned(),
+        "/a\u{0}b".to_owned(),
+        "/a\nb".to_owned(),
         "/a\tb".to_owned(),
         "/a\u{7f}".to_owned(),
         "/é".to_owned(),
