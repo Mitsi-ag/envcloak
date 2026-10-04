@@ -1955,12 +1955,13 @@ fn arguments_are_never_echoed() {
 ///
 /// Mutation checked: the `refuse_if_traced` check taken out of
 /// `cmd/agents.rs`: the traced install goes on, reads the configs and
-/// starts `claude --version`, and this fails (the run does not refuse;
-/// it stops at its child's signal, which nobody continues, and is killed
-/// at the 30-second limit).
+/// starts `claude --version`, and this fails (the run does not refuse; it
+/// stops at its child's signal, which nobody continues, and is killed).
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_traced_agents_commands_read_no_config() {
+    use std::os::unix::process::ExitStatusExt;
+
     use envcloak_sys::testing::spawn_traced;
 
     let f = Fixture::new();
@@ -1993,16 +1994,26 @@ fn linux_traced_agents_commands_read_no_config() {
             cmd.spawn().unwrap()
         };
         // Bounded: a traced run that goes on (the regression this test is
-        // for) stops at its first signal, which nobody continues, so it is
-        // killed at the limit and the test fails instead of hanging.
+        // for) stops at its first signal (its child's exit), which nobody
+        // continues, and this process, its tracer, is told of the stop: it
+        // is killed then, or at the limit, and the test fails instead of
+        // hanging.
         let start = std::time::Instant::now();
-        while child.try_wait().unwrap().is_none() {
-            if start.elapsed() > Duration::from_secs(30) {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{args:?} (traced: {traced}) did not exit within 30 s");
+        loop {
+            match child.try_wait().unwrap() {
+                Some(st) if st.stopped_signal().is_none() => break,
+                Some(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{args:?} (traced: {traced}) went on, and stopped at a signal");
+                }
+                None if start.elapsed() > Duration::from_secs(30) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{args:?} (traced: {traced}) did not exit within 30 s");
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
         let out = child.wait_with_output().unwrap();
         for cs in [&f.cs[..], std::slice::from_ref(&lit)] {
