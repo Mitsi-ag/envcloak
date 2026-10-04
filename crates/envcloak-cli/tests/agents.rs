@@ -1954,7 +1954,10 @@ fn arguments_are_never_echoed() {
 /// order of the check refuses the traced runs.
 ///
 /// Mutation checked: the `refuse_if_traced` check taken out of
-/// `cmd/agents.rs`: the traced install prints its plan and this fails.
+/// `cmd/agents.rs`: the traced install goes on, reads the configs and
+/// starts `claude --version`, and this fails (the run does not refuse;
+/// it stops at its child's signal, which nobody continues, and is killed
+/// at the 30-second limit).
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_traced_agents_commands_read_no_config() {
@@ -1984,11 +1987,23 @@ fn linux_traced_agents_commands_read_no_config() {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let child = if traced {
+        let mut child = if traced {
             spawn_traced(&mut cmd).unwrap()
         } else {
             cmd.spawn().unwrap()
         };
+        // Bounded: a traced run that goes on (the regression this test is
+        // for) stops at its first signal, which nobody continues, so it is
+        // killed at the limit and the test fails instead of hanging.
+        let start = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if start.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{args:?} (traced: {traced}) did not exit within 30 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let out = child.wait_with_output().unwrap();
         for cs in [&f.cs[..], std::slice::from_ref(&lit)] {
             assert_no_canary(&out.stdout, cs);
