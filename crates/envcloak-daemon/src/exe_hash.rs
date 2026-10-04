@@ -15,12 +15,16 @@
 //! rewrite moves the change time, even when the size and the modification
 //! time are put back, and a rename over the path gives another inode. A
 //! cache, unlike a store of decisions, may forget: an entry pushed out is
-//! hashed again when next needed. Two rules keep a digest from outliving
+//! hashed again when next needed. Three rules keep a digest from outliving
 //! the bytes it was taken from:
 //!
 //! - The key is read again after hashing: a file that changed while it was
 //!   read ([`HashError::Changed`]) has no identity for that request, and
 //!   nothing is cached.
+//! - A cached digest is returned only when the descriptor's key, read
+//!   after the digest was found, is the one it is cached under: a key read
+//!   before the file changed finds the digest of what the file held, and
+//!   gets [`HashError::Changed`] instead.
 //! - A file whose last change is less than [`SETTLE`] before the hashing
 //!   began is hashed for that request but not cached. A file system stamps
 //!   every change within one tick of its clock with the same time (a
@@ -143,29 +147,42 @@ impl ExeHashCache {
 
     /// The SHA-256 of the open file `file`, whose key (`FileKey::of`) the
     /// caller read as `key`: from the cache when a digest for `key` is
-    /// there, otherwise read from `file`, within `budget`, its key read
-    /// again afterwards.
+    /// there and `file` still has that key, otherwise read from `file`,
+    /// within `budget`, its key read again afterwards. Either way the
+    /// digest is returned only for a file whose key, read after the digest
+    /// was found, is `key`: a key the caller read before the file changed
+    /// never answers with the digest of what it held.
     ///
     /// # Errors
     /// [`HashError::TooLarge`] above the largest size,
     /// [`HashError::OverBudget`] when `budget` has less left than the
     /// file's size (and then takes nothing), [`HashError::Changed`] when
-    /// the file changed while it was read, [`HashError::Io`] when a read
-    /// failed.
+    /// the file no longer has `key`, or changed while it was read,
+    /// [`HashError::Io`] when a read failed.
     pub(crate) fn lookup(
         &self,
         file: &File,
         key: &FileKey,
         budget: &mut HashBudget,
     ) -> Result<[u8; 32], HashError> {
-        {
+        let cached = {
             let mut inner = locked(&self.inner);
             inner.lookups += 1;
             let now = inner.lookups;
-            if let Some(e) = inner.entries.get_mut(key) {
+            inner.entries.get_mut(key).map(|e| {
                 e.used = now;
-                return Ok(e.sha256);
-            }
+                e.sha256
+            })
+        };
+        if let Some(digest) = cached {
+            // Read after the lookup, outside the lock: the file is the
+            // one the key names now.
+            let now = FileKey::of(file).map_err(|e| HashError::Io(e.kind()))?;
+            return if now == *key {
+                Ok(digest)
+            } else {
+                Err(HashError::Changed)
+            };
         }
         if key.size > self.max_size {
             return Err(HashError::TooLarge);
@@ -229,8 +246,10 @@ fn settled(key: &FileKey, began: SystemTime, settle: Duration) -> bool {
 }
 
 /// The SHA-256 of the first `size` bytes of `file`, read from its start
-/// whatever its offset, which must be all of it: a file that ends sooner,
-/// or has a byte at `size`, changed.
+/// whatever its offset. A file that ends sooner changed (and the read
+/// stops there); one that is longer, or changed in any other way, is
+/// caught by its key, which [`ExeHashCache::lookup`] reads again after
+/// this.
 fn hash_exactly(file: &File, size: u64) -> Result<[u8; 32], HashError> {
     let mut h = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
@@ -245,15 +264,6 @@ fn hash_exactly(file: &File, size: u64) -> Result<[u8; 32], HashError> {
         };
         h.update(&buf[..n]);
         at += n as u64;
-    }
-    let mut past = [0u8; 1];
-    loop {
-        match file.read_at(&mut past, size) {
-            Ok(0) => break,
-            Ok(_) => return Err(HashError::Changed),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(HashError::Io(e.kind())),
-        }
     }
     Ok(h.finalize().into())
 }
@@ -429,8 +439,10 @@ mod tests {
 
     /// The key is read again after hashing: a file that changed after its
     /// key was read has no digest, and nothing is cached for the stale key.
-    /// So does a file that ends before, or runs past, the size its key
-    /// gives. Mutation checked: skipping the key's re-read fails this test.
+    /// A key whose size the file does not have gives none either: a
+    /// shorter file ends the read early, and a longer one's key, read
+    /// again, differs. Mutation checked: skipping the key's re-read fails
+    /// this test.
     #[test]
     fn a_file_changed_while_it_is_read_has_no_digest() {
         let d = dir();
@@ -463,6 +475,41 @@ mod tests {
                 "size {size}"
             );
         }
+    }
+
+    /// A cached digest is returned only for a file that still has the key
+    /// it is cached under: a key read before the file changed (the caller
+    /// read it, then the file was rewritten) finds the old digest in the
+    /// cache and gets `Changed`, not that digest; the file's key as it is
+    /// now gives what it holds now. Mutation checked: returning a cached
+    /// digest without reading the descriptor's key again fails this test.
+    #[test]
+    fn a_cached_digest_needs_the_file_to_still_have_its_key() {
+        let d = dir();
+        let p = d.path().join("agent");
+        write(&p, &[8u8; 2048]);
+        let f = File::options().read(true).write(true).open(&p).unwrap();
+        let cache = unsettled();
+        let stale = FileKey::of(&f).unwrap();
+        let first = lookup(&cache, &f).unwrap();
+        assert_eq!(first, oracle(&p));
+        clock_past(d.path(), &f);
+        f.write_all_at(&[9], 7).unwrap();
+        assert_ne!(FileKey::of(&f).unwrap(), stale);
+        let mut budget = HashBudget::new(REQUEST_BUDGET);
+        assert_eq!(
+            cache.lookup(&f, &stale, &mut budget),
+            Err(HashError::Changed)
+        );
+        assert_eq!(budget, HashBudget::new(REQUEST_BUDGET), "nothing hashed");
+        let now = lookup(&cache, &f).unwrap();
+        assert_eq!(now, oracle(&p));
+        assert_ne!(now, first);
+        // The control: the file unchanged, the cached digest comes back
+        // without a byte read.
+        let hashed = cache.hashed_bytes();
+        assert_eq!(lookup(&cache, &f).unwrap(), now);
+        assert_eq!(cache.hashed_bytes(), hashed);
     }
 
     /// A 200 MB binary is hashed once: the second lookup is the cache's.
