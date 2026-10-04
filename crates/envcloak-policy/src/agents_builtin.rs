@@ -261,8 +261,11 @@ product = "aider"
 # install.html), or `python -m aider`. When its own standard input is a
 # terminal it runs a shell command with pexpect, on a pseudo-terminal of
 # its own in a session the command leads; otherwise through `subprocess`
-# (aider/run_cmd.py). Known by its script only: it roots no grant above a
-# command's session and has no install tree.
+# (aider/run_cmd.py). Measured on 0.86.0 (`uv tool install`, macOS): uv's
+# python3.12 running the tool environment's bin/aider; `/run` runs the
+# command in a session of its own on a new pseudo-terminal. Known by its
+# script only: it roots no grant above a command's session and has no
+# install tree.
 scripts = ["aider"]
 
 [[agent]]
