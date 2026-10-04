@@ -1368,6 +1368,7 @@ pub fn uninstall(ctx: &Context<'_>, opts: &Options, w: &mut Writer<'_>) -> Repor
     if global {
         for host in hosts {
             let mut results = undo_files(w, host.id(), "global", host_name(host));
+            results.extend(made_dirs_removed(w, host.id(), "global"));
             if host == Host::ClaudeCode {
                 // Every file EnvCloak registered its server in, wherever
                 // `CLAUDE_CONFIG_DIR` points now.
@@ -1392,14 +1393,29 @@ pub fn uninstall(ctx: &Context<'_>, opts: &Options, w: &mut Writer<'_>) -> Repor
     }
     if let Some(dir) = &opts.project {
         let scope = dir.to_string_lossy().into_owned();
+        let mut results = undo_files(w, "project", &scope, "the agent");
+        results.extend(made_dirs_removed(w, "project", &scope));
         report.project = Some(ProjectReport {
             dir: dir.clone(),
-            results: undo_files(w, "project", &scope, "the agent"),
+            results,
         });
     }
     w.sweep_all();
     report.leftovers = w.leftovers_present();
     report
+}
+
+/// The directories EnvCloak made for `host`'s files in `scope`, removed
+/// once empty, as report lines.
+fn made_dirs_removed(w: &mut Writer<'_>, host: &str, scope: &str) -> Vec<StepResult> {
+    crate::writer::remove_made_dirs(w, host, scope)
+        .into_iter()
+        .map(|path| StepResult {
+            what: "remove the directory EnvCloak made, now empty".to_owned(),
+            path,
+            outcome: Outcome::Removed { backup: None },
+        })
+        .collect()
 }
 
 /// The SHA-256 of a file's bytes as the state keeps them, for tests and

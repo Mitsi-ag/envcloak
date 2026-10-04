@@ -258,6 +258,22 @@ pub struct State {
     /// literal key in it included, was left behind).
     #[serde(default)]
     pub leftovers: BTreeMap<String, Vec<String>>,
+    /// The directories EnvCloak made for files it wrote (none was there),
+    /// by path (resolved), with the host and scope they were made for:
+    /// uninstall removes each once it is empty (the class of Codex's
+    /// finding that a `.claude.json` an install created was left).
+    #[serde(default)]
+    pub dirs: BTreeMap<String, DirRecord>,
+}
+
+/// A directory EnvCloak made, and for what.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirRecord {
+    /// The host (`claude-code`, `codex`), or `project`.
+    pub host: String,
+    /// `global`, or the project directory.
+    pub scope: String,
 }
 
 /// An MCP server entry EnvCloak registered through a host's own command
@@ -675,17 +691,40 @@ struct Read {
     current: Option<(Vec<u8>, FileStamp)>,
 }
 
-fn open_target(path: &Path, create_dir: bool) -> Result<Read, Refusal> {
+/// Makes the directories missing above `path` (0700): those it made,
+/// outermost first, by their resolved paths.
+fn make_dirs(path: &Path) -> Result<Vec<PathBuf>, Refusal> {
+    let Some(parent) = path.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut missing = Vec::new();
+    let mut d = parent;
+    while std::fs::symlink_metadata(d).is_err() {
+        missing.push(d.to_path_buf());
+        match d.parent() {
+            Some(p) => d = p,
+            None => break,
+        }
+    }
+    if missing.is_empty() {
+        return Ok(missing);
+    }
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .map_err(|_| Refusal::new("unwritable", "its directory could not be made"))?;
+    missing.reverse();
+    Ok(missing
+        .into_iter()
+        .map(|d| std::fs::canonicalize(&d).unwrap_or(d))
+        .collect())
+}
+
+fn open_target(path: &Path) -> Result<Read, Refusal> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(Refusal::new("invalid_path", "not a file's path"));
     };
-    if create_dir && !parent.exists() {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(|_| Refusal::new("unwritable", "its directory could not be made"))?;
-    }
     let root = open_root(parent).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Refusal::scan(ScanErrorKind::NotFound),
         std::io::ErrorKind::PermissionDenied => Refusal::scan(ScanErrorKind::Unreadable),
@@ -819,7 +858,18 @@ impl Writer<'_> {
     }
 
     fn try_change(&mut self, t: &Target, edit: &mut EditFn<'_>) -> Result<Outcome, Refusal> {
-        let r = open_target(&t.path, true)?;
+        // The directories made for the file are EnvCloak's: recorded, so
+        // uninstall takes them out once they are empty.
+        for d in make_dirs(&t.path)? {
+            self.state.dirs.insert(
+                key_dir(&d),
+                DirRecord {
+                    host: t.host.to_owned(),
+                    scope: t.scope.clone(),
+                },
+            );
+        }
+        let r = open_target(&t.path)?;
         let k = key(&t.path);
         let before = r.current.as_ref().map(|(b, _)| b.as_slice());
         self.settle(&k, before);
@@ -1047,7 +1097,7 @@ impl Writer<'_> {
         let keys: Vec<String> = self.state.leftovers.keys().cloned().collect();
         for k in keys {
             let path = PathBuf::from(&k);
-            let current: Option<Zeroizing<Vec<u8>>> = open_target(&path, false)
+            let current: Option<Zeroizing<Vec<u8>>> = open_target(&path)
                 .ok()
                 .and_then(|r| r.current)
                 .map(|(b, _)| Zeroizing::new(b));
@@ -1121,7 +1171,7 @@ impl Writer<'_> {
         if !self.state.files.contains_key(&k) {
             return Ok(Outcome::Unchanged);
         }
-        let r = open_target(&t.path, false)?;
+        let r = open_target(&t.path)?;
         self.settle(&k, r.current.as_ref().map(|(b, _)| b.as_slice()));
         let Some(rec) = self.state.files.get(&k).cloned() else {
             return Ok(Outcome::Unchanged);
@@ -1355,6 +1405,49 @@ fn remove_file(
     at: SystemTime,
 ) -> Result<(), ModifyError> {
     injected(|| remove_checked_at(root, name, expect, at))
+}
+
+/// The state's key for a directory: its path, resolved.
+fn key_dir(d: &Path) -> String {
+    let resolved = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
+    String::from_utf8_lossy(resolved.as_os_str().as_bytes()).into_owned()
+}
+
+/// Removes the directories EnvCloak made for `host`'s files in `scope`
+/// that are empty, innermost first, and forgets each one gone or holding
+/// something now (the person's: never removed). Returns those removed.
+pub fn remove_made_dirs(w: &mut Writer<'_>, host: &str, scope: &str) -> Vec<PathBuf> {
+    let mut dirs: Vec<String> = w
+        .state
+        .dirs
+        .iter()
+        .filter(|(_, r)| r.host == host && r.scope == scope)
+        .map(|(k, _)| k.clone())
+        .collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.len()));
+    let mut removed = Vec::new();
+    for d in dirs {
+        match std::fs::remove_dir(&d) {
+            Ok(()) => {
+                w.state.dirs.remove(&d);
+                removed.push(PathBuf::from(d));
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                w.state.dirs.remove(&d);
+            }
+            // Tried again by the next uninstall.
+            Err(_) => {}
+        }
+    }
+    if !removed.is_empty() {
+        let _ = w.journal.save(w.state);
+    }
+    removed
 }
 
 /// The state's key for a path: its directories resolved, so one file is
