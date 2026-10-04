@@ -10,7 +10,11 @@
 //! (D-10, D-11) or launch-binding clause (D-33, D-36, gate 39), including
 //! what a bound launch does not bind, where a sealed copy cannot run and
 //! where the sign-in driver starts from, a decision whose edit is gone, a
-//! decided sentence twice, an em dash and an older version. With
+//! decided sentence twice, an em dash and an older version. From SPEC
+//! v0.4.1 (task M3-01) it also refuses the M3 wording v0.4.1 replaced (the
+//! macOS 14 floor, a screen lock any program could report, the old §4.4
+//! app list) and a missing or weakened M3 clause (§4.4's new crossings, the
+//! app role's conditions, the signed proof and the first unlocker). With
 //! `--pr-files` it refuses a SPEC pull request that changes any file but
 //! docs/SPEC.md.
 #![allow(clippy::unwrap_used)]
@@ -174,8 +178,8 @@ fn an_em_dash_fails() {
 #[test]
 fn an_older_spec_version_fails() {
     let t = fixture();
-    edit(&t, "Status: draft v0.4 ", "Status: draft v0.3.1 ");
-    assert_fails(&t.home(), &[], "the status line does not say draft v0.4");
+    edit(&t, "Status: draft v0.4.1 ", "Status: draft v0.4 ");
+    assert_fails(&t.home(), &[], "the status line does not say draft v0.4.1");
 }
 
 /// The §4.4 sentence on daemon-started recipients (CR-1).
@@ -724,4 +728,204 @@ fn the_m2_res1_wording_is_required() {
         );
         assert_fails(&t.home(), &[], &format!("{name}: found 0 times"));
     }
+}
+
+// --- SPEC v0.4.1, the M3 build decisions (M3 plan, task M3-01) ------------
+
+/// §4.4's app-to-daemon crossings in v0.4.1.
+const APP_TO_DAEMON: &str = "App to daemon: one HPKE-sealed VMK per unlock; the two public keys (`unlock` and `approve`) of a new Secure Enclave unlocker; signed approval, write, unlocker, reveal, policy and device statements; values typed into the paste sheet and replacement values, each sealed to a daemon ephemeral key.";
+/// §4.4's app-to-daemon crossings in v0.4, before M3-01.
+const OLD_APP_TO_DAEMON: &str = "App to daemon: one HPKE-sealed VMK per unlock; signed approval, policy, device and reveal statements; values typed into the paste sheet, sealed to a daemon ephemeral key.";
+/// §4.4's daemon-to-app crossings in v0.4.1.
+const DAEMON_TO_APP: &str = "Daemon to app: envelopes (ciphertext); approval request descriptors (metadata only); audit entries (metadata only, with command lines masked as the audit log keeps them); the paste and reveal requests the CLI filed (`envcloak add --ask`, `envcloak reveal`), metadata only, with the requester's evidence; reveal values sealed to an app ephemeral key after a signed reveal statement.";
+
+/// The plan's mutation: §4.4's list left without the new crossings (the
+/// v0.4 bullet put back, or the daemon-to-app additions dropped) fails the
+/// wording check, and so does each new crossing removed or weakened.
+///
+/// Mutation checked: the two §4.4 entries dropped from REQUIRED and the
+/// old list from FORBIDDEN: the v0.4 bullet passes, and this test fails.
+#[test]
+fn a_44_list_without_the_new_crossings_fails() {
+    let t = fixture();
+    edit(&t, APP_TO_DAEMON, OLD_APP_TO_DAEMON);
+    assert_fails(&t.home(), &[], "§4.4 app to daemon (M3-01): found 0 times");
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the old app-to-daemon list (M3-01)",
+    );
+    assert_each_change_fails(
+        "§4.4 app to daemon (M3-01)",
+        APP_TO_DAEMON,
+        &[
+            (
+                " the two public keys (`unlock` and `approve`) of a new Secure Enclave unlocker;",
+                "",
+            ),
+            (" write, unlocker,", ""),
+            (" and replacement values, each", ""),
+        ],
+    );
+    assert_each_change_fails(
+        "§4.4 daemon to app (M3-01)",
+        DAEMON_TO_APP,
+        &[
+            (
+                " audit entries (metadata only, with command lines masked as the audit log keeps them);",
+                "",
+            ),
+            (
+                " the paste and reveal requests the CLI filed (`envcloak add --ask`, `envcloak reveal`), metadata only, with the requester's evidence;",
+                "",
+            ),
+        ],
+    );
+}
+
+/// §12's floor is macOS 26 (D3-04), and "macOS 14" is gone from the SPEC.
+///
+/// Mutation checked: the "macOS 14" pattern dropped from FORBIDDEN: the
+/// second case passes, and this test fails.
+#[test]
+fn the_macos_14_floor_fails() {
+    let t = fixture();
+    edit(
+        &t,
+        "SwiftUI, macOS 26 or later, Swift 6.",
+        "SwiftUI, macOS 14 or later, Swift 6.",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the macOS 14 floor (D3-04)",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "§12 the macOS 26 floor (D3-04): found 0 times",
+    );
+    assert_fails(&t.home(), &[], "D3-04: the SPEC lacks");
+    let t = fixture();
+    edit(
+        &t,
+        "Secure Enclave and LocalAuthentication are used from Swift in the app.",
+        "Secure Enclave and LocalAuthentication are used from Swift in the app, on macOS 14 and later.",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the macOS 14 floor (D3-04)",
+    );
+}
+
+/// D3-06's conditions on the app's peer, its verdict per connection, and a
+/// peer that fails them kept a client peer (gate 22), each required whole.
+///
+/// Mutation checked: the three §4.3 entries dropped from REQUIRED: a
+/// weakened clause passes, and this test fails.
+#[test]
+fn the_app_roles_conditions_are_required() {
+    assert_each_change_fails(
+        "§4.3 the app role's runtime conditions (D3-06)",
+        "The peer must also run with the hardened runtime flag and carry neither `com.apple.security.get-task-allow` nor any of the hardened runtime's exception entitlements (`com.apple.security.cs.allow-jit`, `allow-unsigned-executable-memory`, `allow-dyld-environment-variables`, `disable-library-validation`, `disable-executable-page-protection` and `debugger`), since each of them lets another process run code inside the signed app.",
+        &[
+            ("run with the hardened runtime flag and ", ""),
+            (" `allow-dyld-environment-variables`,", ""),
+            ("neither `com.apple.security.get-task-allow` nor ", ""),
+        ],
+    );
+    assert_each_change_fails(
+        "§4.3 the app role's verdict per connection (D3-06)",
+        "The daemon takes this verdict at the connection's first `app` request and keeps it for that connection alone, which it closes unanswered once another process sends on it",
+        &[("for that connection alone", "for that process")],
+    );
+    assert_each_change_fails(
+        "§4.3 a peer that fails is a client peer (D3-06, gate 22)",
+        "From M3, a peer that does not meet every condition of the `app` role is a client peer, and its `app` requests are rejected and audited the same way (gate 22).",
+        &[("every condition", "the requirement")],
+    );
+}
+
+/// The signed form of a proof (an enrolled key, over the statement the
+/// daemon rebuilds), the first unlocker approved with the passphrase, and
+/// which caller gives which proof, each required whole; the v0.4 rule that
+/// took every proof from a terminal subject is refused.
+///
+/// Mutation checked: the three §10b entries dropped from REQUIRED: a
+/// weakened clause passes, and this test fails.
+#[test]
+fn the_signed_proof_and_the_first_unlocker_are_required() {
+    assert_each_change_fails(
+        "§10b the signed form of a proof (D3-10)",
+        "From the `app` role (§4.3, M3): a P-256 ECDSA signature by the `approve` key of a Secure Enclave unlocker enrolled in the vault, over the SHA-256 digest of the canonical statement as a prehash, sent as the 64-byte raw `r || s`; the daemon rebuilds the statement from its own record, verifies the signature with that unlocker's public key, and refuses a key that is not enrolled or was removed.",
+        &[
+            (" enrolled in the vault", ""),
+            (
+                "the daemon rebuilds the statement from its own record, ",
+                "",
+            ),
+            (
+                ", and refuses a key that is not enrolled or was removed",
+                "",
+            ),
+        ],
+    );
+    assert_each_change_fails(
+        "§10b the first unlocker approved with the passphrase (D3-08)",
+        "The first Secure Enclave unlocker is approved with the passphrase, since until it exists the app has no key to sign with: the app asks for it, and the person runs `envcloak approve <id>` in a terminal and reads an `envcloak-unlocker-statement/1` that names the unlocker's label, the SHA-256 fingerprints of both its public keys, and the Team ID and signing identifier the daemon verified for the app.",
+        &[
+            ("approved with the passphrase", "approved in the app"),
+            (
+                ", and the Team ID and signing identifier the daemon verified for the app",
+                "",
+            ),
+        ],
+    );
+    let t = fixture();
+    edit(
+        &t,
+        "The daemon takes a passphrase or Recovery Kit proof (approve, unlock, rotate, remove, reveal, recover) only from a terminal subject (Subject kind, above), and a signed proof only from the `app` role, and refuses a passphrase or Recovery Kit proof from every other caller",
+        "The daemon takes a proof (approve, unlock, rotate, remove, reveal, recover) only from a terminal subject (Subject kind, above), and refuses it from every other caller",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "§10b which caller gives which proof (D3-10): found 0 times",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds a proof taken only from a terminal subject, with no signed form (D3-10)",
+    );
+}
+
+/// §5's screen lock is reported through the app role (D3-11); the v0.4
+/// bullet is refused. And a decision whose edit is gone fails (D3-10).
+///
+/// Mutation checked: the old screen-lock bullet dropped from FORBIDDEN and
+/// D3-11's phrase changed to the old bullet's: the first case passes, and
+/// this test fails.
+#[test]
+fn the_old_screen_lock_bullet_and_a_lost_m3_edit_fail() {
+    let t = fixture();
+    edit(
+        &t,
+        "screen lock (reported by the app through the app role, so no other program can record a screen lock in the audit log);",
+        "screen lock (reported by the app);",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds the screen lock any program could report (D3-11)",
+    );
+    assert_fails(&t.home(), &[], "D3-11: the SPEC lacks");
+    let t = fixture();
+    let text = spec(&t).replace("`envcloak-write-statement/1`", "`envcloak-write/1`");
+    std::fs::write(t.home().join(SPEC), text).unwrap();
+    assert_fails(
+        &t.home(),
+        &[],
+        "D3-10: the SPEC lacks '`envcloak-write-statement/1`'",
+    );
 }
