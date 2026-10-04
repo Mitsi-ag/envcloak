@@ -1,0 +1,12 @@
+envcloak-deptrial v0.1.0 (/private/tmp/ec-m2-m3-01/crates/envcloak-deptrial)
+├── core-foundation v0.10.1
+│   ├── core-foundation-sys v0.8.7
+│   └── libc v0.2.189
+└── security-framework v3.7.0
+    ├── bitflags v2.13.2
+    ├── core-foundation v0.10.1 (*)
+    ├── core-foundation-sys v0.8.7
+    ├── libc v0.2.189
+    └── security-framework-sys v2.17.0
+        ├── core-foundation-sys v0.8.7
+        └── libc v0.2.189
