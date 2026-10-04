@@ -95,6 +95,10 @@ fn main() {
                 a_monitor_that_dies_ends_the_channel_for_the_cli,
             ),
             (
+                "a_command_that_stops_itself_after_each_resume_is_never_reported_exited",
+                a_command_that_stops_itself_after_each_resume_is_never_reported_exited,
+            ),
+            (
                 "the_monitor_closes_a_descriptor_above_a_lowered_limit_or_refuses",
                 the_monitor_closes_a_descriptor_above_a_lowered_limit_or_refuses,
             ),
@@ -467,6 +471,74 @@ fn a_monitor_that_dies_ends_the_channel_for_the_cli() {
         screen.wait_for_end(),
         "the hung-up session did not end the terminal: {}",
         screen.text()
+    );
+}
+
+/// How many stops the self-stopping command makes, at most.
+const STOP_CYCLES: usize = 20_000;
+/// How long its stop and resume cycles run, at most.
+const STOP_STRESS: Duration = Duration::from_secs(15);
+
+/// A command that stops itself again at once after every `Resume`
+/// (`kill -STOP $$` in a loop), so its stops race the monitor's two looks
+/// at it, thousands of times. Each must come as `Stopped(SIGSTOP)` (with
+/// `Continued` between), never as `Exited`: macOS's `waitid` returns a
+/// stop to the monitor's exit observer when the command stopped after the
+/// first look, and a monitor that counted it reported `Exited` with the
+/// stop's signal, closed the slave, and then hung reaping a command that
+/// was only stopped (the verifier's review of PR #27 found it within 206
+/// to 2124 cycles, 4 runs of 4). Then `Signal(SIGKILL)` ends the command,
+/// `Exited` says it was killed, and `finish` returns within the deadline.
+fn a_command_that_stops_itself_after_each_resume_is_never_reported_exited() {
+    let (master, slave, _) = raw_pty(false);
+    let mut monitor = spawn_session(
+        &[
+            OsStr::new("/bin/sh"),
+            OsStr::new("-c"),
+            OsStr::new("while :; do kill -STOP $$; done"),
+        ],
+        &[(OsStr::new("PATH"), OsStr::new("/usr/bin:/bin"))],
+        slave,
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let (mut stops, mut continues) = (0usize, 0usize);
+    while stops < STOP_CYCLES && start.elapsed() < STOP_STRESS {
+        match monitor.next_event(Some(DEADLINE)).unwrap() {
+            Some(MonitorEvent::Stopped(sig)) => {
+                assert_eq!(sig, libc::SIGSTOP, "after {stops} stops");
+                stops += 1;
+                monitor.send(MonitorCommand::Resume).unwrap();
+            }
+            Some(MonitorEvent::Continued) => continues += 1,
+            other => panic!(
+                "after {stops} stops and {continues} continues the monitor reported {other:?} \
+                 for a command that only stops itself"
+            ),
+        }
+    }
+    assert!(stops >= 100, "only {stops} stops in {STOP_STRESS:?}");
+    monitor.send(MonitorCommand::Signal(libc::SIGKILL)).unwrap();
+    let status = loop {
+        match monitor.next_event(Some(DEADLINE)).unwrap() {
+            Some(MonitorEvent::Stopped(_) | MonitorEvent::Continued) => {}
+            Some(MonitorEvent::Exited(status)) => break status,
+            None => panic!("no exit after SIGKILL"),
+        }
+    };
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(monitor.finish());
+    });
+    let finished = rx.recv_timeout(DEADLINE).expect("finish did not return");
+    assert!(finished.unwrap().success());
+    drop(master);
+    println!(
+        "pty_topology ({}): a command stopping itself after each Resume: {stops} stops and \
+         {continues} continues in {:?}, no exit until SIGKILL",
+        std::env::consts::OS,
+        start.elapsed()
     );
 }
 

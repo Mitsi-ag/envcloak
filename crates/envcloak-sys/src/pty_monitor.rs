@@ -35,7 +35,9 @@
 //! 4. reports `Started` (or `ExecFailed` with the `errno` of the last
 //!    `execve`, through a close-on-exec pipe) and then loops: it waits on
 //!    its own child only, through `waitid` (stops and continues consumed,
-//!    an exit observed without reaping), and on the control channel.
+//!    an exit observed without reaping and counted only when the record
+//!    is an exit, since macOS returns a stop there too), and on the
+//!    control channel.
 //!
 //! In the loop:
 //!
@@ -427,60 +429,80 @@ fn errno() -> libc::c_int {
         .unwrap_or(libc::EIO)
 }
 
-/// The raw wait status `waitid` describes in `info`, for an exit.
-fn wait_status(code: libc::c_int, status: libc::c_int) -> i32 {
-    match code {
+/// The raw wait status of an exit record (`si_code` and `si_status`), or
+/// `None` for a record that is not an exit ([`crate::child::is_exit_record`]):
+/// a stop is never read as a death by its signal.
+fn exit_status(code: libc::c_int, status: libc::c_int) -> Option<i32> {
+    if !crate::child::is_exit_record(code) {
+        return None;
+    }
+    Some(match code {
         libc::CLD_EXITED => (status & 0xff) << 8,
         libc::CLD_DUMPED => (status & 0x7f) | 0x80,
         _ => status & 0x7f,
+    })
+}
+
+/// One `waitid(P_PID, pid, options | WNOHANG)` on the monitor's own child:
+/// the record's `si_code` and `si_status`, or `None` when nothing changed
+/// (or the call failed). Async-signal-safe; allocates nothing.
+fn waitid_now(pid: libc::pid_t, options: libc::c_int) -> Option<(libc::c_int, libc::c_int)> {
+    let id = libc::id_t::try_from(pid).ok()?;
+    // SAFETY: siginfo_t is plain data; waitid fills it in, and leaves
+    // si_pid 0 when nothing changed.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is writable; the child is the caller's own. WNOHANG
+    // makes the call return at once.
+    let rc = unsafe { libc::waitid(libc::P_PID, id, &mut info, options | libc::WNOHANG) };
+    // SAFETY: waitid filled `info` in or left it zeroed; si_pid and
+    // si_status are set for a child's state change.
+    if rc == 0 && unsafe { info.si_pid() } == pid {
+        // SAFETY: as above.
+        return Some((info.si_code, unsafe { info.si_status() }));
     }
+    None
+}
+
+/// How many times [`next_change`] looks again when its exit observer
+/// found a record that is not an exit.
+const CHANGE_LOOKS: usize = 4;
+
+/// The command's next change, through `waitid` (one call with `WNOHANG`:
+/// [`waitid_now`], or a model's): first its next stop or continue,
+/// consumed (`WSTOPPED | WCONTINUED`), so each is reported once; else its
+/// exit, observed without reaping (`WEXITED | WNOWAIT`), counted only when
+/// the record is an exit. macOS returns a stopped child's unconsumed stop
+/// to the second call too (measured on macOS 26.4: `CLD_STOPPED`), when
+/// the command stopped after the first call looked; read as an exit, the
+/// monitor would report a stop as a death by SIGTSTP, close the slave and
+/// then block reaping a command that is only stopped (the verifier's
+/// review of PR #27). Such a record sends the loop back to the first call,
+/// which consumes and reports the stop. Should it still not settle, `None`:
+/// the stop's SIGCHLD is pending, so the monitor's wait returns at once
+/// and it looks again. Allocates nothing.
+pub(crate) fn next_change(
+    mut waitid: impl FnMut(libc::c_int) -> Option<(libc::c_int, libc::c_int)>,
+) -> Option<ChildChange> {
+    for _ in 0..CHANGE_LOOKS {
+        match waitid(libc::WSTOPPED | libc::WCONTINUED) {
+            Some((libc::CLD_STOPPED | libc::CLD_TRAPPED, sig)) => {
+                return Some(ChildChange::Stopped(sig));
+            }
+            Some((libc::CLD_CONTINUED, _)) => return Some(ChildChange::Continued),
+            _ => {}
+        }
+        let (code, status) = waitid(libc::WEXITED | libc::WNOWAIT)?;
+        if let Some(status) = exit_status(code, status) {
+            return Some(ChildChange::Exited(status));
+        }
+    }
+    None
 }
 
 impl MonitorOps for SysOps {
     fn child_change(&mut self) -> Option<ChildChange> {
-        let id = libc::id_t::try_from(self.child).ok()?;
-        // SAFETY: siginfo_t is plain data; waitid fills it in, and leaves
-        // si_pid 0 when nothing changed.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is writable; the child is the monitor's own.
-        // Stops and continues are consumed, so each is reported once.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                id,
-                &mut info,
-                libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG,
-            )
-        };
-        // SAFETY: waitid filled `info` in or left it zeroed; si_pid and
-        // si_status are set for a child's state change.
-        if rc == 0 && unsafe { info.si_pid() } == self.child {
-            // SAFETY: as above.
-            let status = unsafe { info.si_status() };
-            match info.si_code {
-                libc::CLD_STOPPED | libc::CLD_TRAPPED => return Some(ChildChange::Stopped(status)),
-                libc::CLD_CONTINUED => return Some(ChildChange::Continued),
-                _ => {}
-            }
-        }
-        // SAFETY: as above.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: as above; WNOWAIT leaves the child unreaped.
-        let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                id,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        // SAFETY: as above.
-        if rc == 0 && unsafe { info.si_pid() } == self.child {
-            // SAFETY: as above.
-            let status = unsafe { info.si_status() };
-            return Some(ChildChange::Exited(wait_status(info.si_code, status)));
-        }
-        None
+        let child = self.child;
+        next_change(|options| waitid_now(child, options))
     }
 
     fn read_control(&mut self, buf: &mut [u8]) -> ControlRead {
@@ -1657,11 +1679,189 @@ mod tests {
     #[test]
     fn wait_statuses_read_as_the_kernel_reports_them() {
         use std::os::unix::process::ExitStatusExt;
-        let s = std::process::ExitStatus::from_raw(wait_status(libc::CLD_EXITED, 3));
+        let status =
+            |code, value| std::process::ExitStatus::from_raw(exit_status(code, value).unwrap());
+        let s = status(libc::CLD_EXITED, 3);
         assert_eq!(s.code(), Some(3));
-        let s = std::process::ExitStatus::from_raw(wait_status(libc::CLD_KILLED, libc::SIGINT));
+        let s = status(libc::CLD_KILLED, libc::SIGINT);
         assert_eq!(s.signal(), Some(libc::SIGINT));
-        let s = std::process::ExitStatus::from_raw(wait_status(libc::CLD_DUMPED, libc::SIGABRT));
+        let s = status(libc::CLD_DUMPED, libc::SIGABRT);
         assert_eq!((s.signal(), s.core_dumped()), (Some(libc::SIGABRT), true));
+        // A stop, a trap or a continue is no exit, whatever its signal.
+        for code in [libc::CLD_STOPPED, libc::CLD_TRAPPED, libc::CLD_CONTINUED, 0] {
+            assert_eq!(exit_status(code, libc::SIGTSTP), None, "si_code {code}");
+        }
+    }
+
+    /// A recorded `waitid`: each call takes the next record of its kind
+    /// (the first call's, `WSTOPPED | WCONTINUED`, or the exit observer's,
+    /// `WEXITED | WNOWAIT`) and logs which call it was.
+    struct Records {
+        stops: Vec<Option<(libc::c_int, libc::c_int)>>,
+        exits: Vec<Option<(libc::c_int, libc::c_int)>>,
+        calls: Vec<&'static str>,
+    }
+
+    impl Records {
+        fn call(&mut self, options: libc::c_int) -> Option<(libc::c_int, libc::c_int)> {
+            let (name, list) = if options & libc::WEXITED != 0 {
+                assert_ne!(
+                    options & libc::WNOWAIT,
+                    0,
+                    "the exit observer reaps nothing"
+                );
+                ("exit", &mut self.exits)
+            } else {
+                assert_eq!(options & libc::WNOWAIT, 0, "stops are consumed");
+                ("stop", &mut self.stops)
+            };
+            self.calls.push(name);
+            if list.is_empty() {
+                None
+            } else {
+                list.remove(0)
+            }
+        }
+    }
+
+    const STOP: Option<(libc::c_int, libc::c_int)> = Some((libc::CLD_STOPPED, libc::SIGTSTP));
+
+    /// The command stops between the monitor's two looks: the first finds
+    /// nothing, and the exit observer finds the stop, as macOS's `waitid`
+    /// returns it to a call asked for exits only. The monitor looks again
+    /// and reports the stop, never an exit (it would read as killed by
+    /// SIGTSTP, and the monitor would then close the slave and block
+    /// reaping a command that is only stopped). A stop that keeps coming
+    /// back to the exit observer alone gives `None` after a bounded number
+    /// of looks (SIGCHLD then wakes the loop), never an exit; a real exit
+    /// and a plain "nothing" read as before. Count the exit observer's
+    /// record as an exit whatever its kind, and the first two fail.
+    #[test]
+    fn a_stop_the_exit_observer_finds_is_reported_as_a_stop() {
+        let mut r = Records {
+            stops: vec![None, STOP],
+            exits: vec![STOP],
+            calls: vec![],
+        };
+        assert_eq!(
+            next_change(|o| r.call(o)),
+            Some(ChildChange::Stopped(libc::SIGTSTP))
+        );
+        assert_eq!(r.calls, ["stop", "exit", "stop"]);
+        let mut r = Records {
+            stops: vec![],
+            exits: vec![STOP; CHANGE_LOOKS],
+            calls: vec![],
+        };
+        assert_eq!(next_change(|o| r.call(o)), None);
+        assert_eq!(r.calls.len(), 2 * CHANGE_LOOKS, "{:?}", r.calls);
+        let trapped = Some((libc::CLD_TRAPPED, libc::SIGTRAP));
+        let continued = Some((libc::CLD_CONTINUED, libc::SIGCONT));
+        for odd in [trapped, continued] {
+            let mut r = Records {
+                stops: vec![],
+                exits: vec![odd; CHANGE_LOOKS],
+                calls: vec![],
+            };
+            assert_eq!(next_change(|o| r.call(o)), None, "{odd:?}");
+        }
+        let mut r = Records {
+            stops: vec![],
+            exits: vec![Some((libc::CLD_EXITED, 7))],
+            calls: vec![],
+        };
+        assert_eq!(
+            next_change(|o| r.call(o)),
+            Some(ChildChange::Exited(7 << 8))
+        );
+        let mut r = Records {
+            stops: vec![],
+            exits: vec![],
+            calls: vec![],
+        };
+        assert_eq!(next_change(|o| r.call(o)), None);
+        assert_eq!(r.calls, ["stop", "exit"]);
+        let mut r = Records {
+            stops: vec![continued],
+            exits: vec![],
+            calls: vec![],
+        };
+        assert_eq!(next_change(|o| r.call(o)), Some(ChildChange::Continued));
+    }
+
+    /// Waits, without consuming anything, until this process's own child
+    /// `pid` has a stop to report, up to ten seconds.
+    fn stopped_unconsumed(pid: libc::pid_t) -> bool {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < end {
+            if waitid_now(pid, libc::WSTOPPED | libc::WNOWAIT).is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// On the real kernel: a child that stopped itself, its stop not yet
+    /// consumed, is not an exit to the monitor's exit observer, also when
+    /// the first look found nothing (the command stopped in between). On
+    /// macOS the exit observer's `waitid` returns that stop
+    /// (`CLD_STOPPED`); against the monitor before this check it read as
+    /// `Exited` with the stop's signal. The monitor's real looks then
+    /// report the stop, the continue and the exit, and nothing reaps the
+    /// child before its handle does.
+    #[test]
+    fn a_stopped_command_is_not_an_exited_one_on_the_real_kernel() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -STOP $$; read line; exit 7"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        assert!(stopped_unconsumed(pid), "the child did not stop");
+        let seen_late = next_change(|o| {
+            if o & libc::WEXITED != 0 {
+                waitid_now(pid, o)
+            } else {
+                None
+            }
+        });
+        assert!(
+            !matches!(seen_late, Some(ChildChange::Exited(_))),
+            "a stopped command read as exited: {seen_late:?}"
+        );
+        assert!(
+            stopped_unconsumed(pid),
+            "the exit observer consumed the stop"
+        );
+        assert_eq!(
+            next_change(|o| waitid_now(pid, o)),
+            Some(ChildChange::Stopped(libc::SIGSTOP))
+        );
+        assert_eq!(
+            next_change(|o| waitid_now(pid, o)),
+            None,
+            "the stop is reported once"
+        );
+        crate::signal_process(pid, libc::SIGCONT).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut continued = None;
+        while continued.is_none() && std::time::Instant::now() < end {
+            continued = next_change(|o| waitid_now(pid, o));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(continued, Some(ChildChange::Continued));
+        drop(child.stdin.take());
+        let mut exited = None;
+        while exited.is_none() && std::time::Instant::now() < end {
+            exited = next_change(|o| waitid_now(pid, o));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(exited, Some(ChildChange::Exited(7 << 8)));
+        assert_eq!(
+            child.wait().unwrap().code(),
+            Some(7),
+            "the observer left it unreaped"
+        );
     }
 }
