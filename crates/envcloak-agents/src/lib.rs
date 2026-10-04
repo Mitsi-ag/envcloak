@@ -15,9 +15,13 @@
 //! - [`tool_timeouts`]: each host's MCP tool cutoff as the installer sets
 //!   it, which bounds how long EnvCloak's MCP tools wait for a person
 //!   (M2-06).
+//! - [`coverage`] and the probes in [`probe`]: what `envcloak agents
+//!   status` reports each host's integration covers, per surface, and the
+//!   controlled activation and denial probes that establish it (M2-09).
 
 pub mod blocks;
 pub mod codex_layers;
+pub mod coverage;
 pub mod detect;
 pub mod hook;
 pub mod hosts;

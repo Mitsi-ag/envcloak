@@ -419,28 +419,35 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 <!-- reservations:coverage -->
 | Token | Kind | Task | Status | Use |
 |---|---|---|---|---|
-| `active` | state | M2-09 | reserved | a probe passed on this machine for this host version and configuration, and nothing degrades it |
-| `degraded` | state | M2-09 | reserved | installed, but needs trust, can be switched off or fails open; always with reasons |
-| `unsupported` | state | M2-09 | reserved | the host offers no contract for the surface |
-| `unverified` | state | M2-09 | reserved | not established on this machine; always with a reason |
-| `hooks_untrusted` | reason | M2-09 | reserved | Codex hooks the person has not trusted |
-| `workspace_untrusted` | reason | M2-09 | reserved | Claude Code holds back settings-file hooks until the folder's workspace trust is accepted |
-| `switched_off_user` | reason | M2-09 | reserved | a user setting switches the hooks off |
-| `switched_off_project` | reason | M2-09 | reserved | a project setting switches the hooks off |
-| `switched_off_local` | reason | M2-09 | reserved | a local setting switches the hooks off |
-| `managed_only` | reason | M2-09 | reserved | a managed setting allows managed hooks only |
-| `fails_open_on_timeout` | reason | M2-09 | reserved | a hook that times out lets the action through |
-| `override_file` | reason | M2-08 | reserved | Codex's `AGENTS.override.md` shadows the instructions |
-| `needs_host_approval` | reason | M2-09 | reserved | the host asks before each call of EnvCloak's tool, or refuses it (`codex exec` with approval policy "never") |
-| `outside_host_sandbox` | reason | M2-09 | reserved | commands `run_with_secrets` starts run outside the host's sandbox, as a qualification result |
-| `persists_blocked_prompt` | reason | M2-09 | reserved | the host keeps a blocked prompt in its local history |
+| `active` | state | M2-09 | landed | a probe passed on this machine for this host version and configuration, and nothing degrades it |
+| `degraded` | state | M2-09 | landed | installed, but needs trust, can be switched off or fails open; always with reasons |
+| `unsupported` | state | M2-09 | landed | the host offers no contract for the surface |
+| `unverified` | state | M2-09 | landed | not established on this machine; always with a reason |
+| `hooks_untrusted` | reason | M2-09 | landed | Codex hooks the person has not trusted |
+| `workspace_untrusted` | reason | M2-09 | landed | Claude Code holds back settings-file hooks until the folder's workspace trust is accepted |
+| `switched_off_user` | reason | M2-09 | landed | a user setting switches the hooks off |
+| `switched_off_project` | reason | M2-09 | landed | a project setting switches the hooks off |
+| `switched_off_local` | reason | M2-09 | landed | a local setting switches the hooks off |
+| `managed_only` | reason | M2-09 | landed | a managed setting allows managed hooks only |
+| `fails_open_on_timeout` | reason | M2-09 | landed | a hook that times out lets the action through |
+| `override_file` | reason | M2-08 | landed | Codex's `AGENTS.override.md` shadows the instructions |
+| `needs_host_approval` | reason | M2-09 | landed | the host asks before each call of EnvCloak's tool, or refuses it (`codex exec` with approval policy "never") |
+| `outside_host_sandbox` | reason | M2-09 | landed | commands `run_with_secrets` starts run outside the host's sandbox, as a qualification result |
+| `persists_blocked_prompt` | reason | M2-09 | landed | the host keeps a blocked prompt in its local history |
 | `not_drivable` | reason | M2-04 | reserved | no documented setting lets the scripted model drive the host |
-| `sandbox_blocks_socket` | reason | M2-04 | reserved | the host's sandbox cannot reach EnvCloak's socket with any documented allowance |
-| `probe_needs_terminal` | reason | M2-28 | reserved | the output probe needs an approval only a terminal subject can give |
-| `passed` | outcome | M2-09 | reserved | the probe and its control passed |
-| `failed` | outcome | M2-09 | reserved | the probe or its control failed; listed first |
-| `skipped` | outcome | M2-09 | reserved | the probe did not run, with the reason |
-| `not_qualified` | outcome | M2-28 | reserved | the probe is not qualified for this host version, which is not a failure |
+| `sandbox_blocks_socket` | reason | M2-04 | landed | the host's sandbox cannot reach EnvCloak's socket with any documented allowance |
+| `probe_needs_terminal` | reason | M2-28 | landed | the output probe needs an approval only a terminal subject can give |
+| `switched_off_managed` | reason | M2-09 | landed | a managed or system setting switches every hook off (Claude Code's managed `disableAllHooks`, Codex's `[features] hooks = false` in a system or managed layer) |
+| `config_dir_moved` | reason | M2-09 | landed | `CLAUDE_CONFIG_DIR` is set: sessions started with another value, or none, read other settings |
+| `hook_missing` | reason | M2-09 | landed | EnvCloak's hook for the surface is not in the host's configuration, or the program it names is gone (such a hook fails open) |
+| `not_probed` | reason | M2-09 | landed | no probe has run on this machine for this host |
+| `changed_since_probe` | reason | M2-09 | landed | the host binary, its version or its configuration changed since the last probe, whose result is then not used (L-09) |
+| `listed` | availability | M2-09 | landed | EnvCloak's MCP server is registered; how the host approves `run_with_secrets` could not be read |
+| `callable` | availability | M2-09 | landed | the person approved `run_with_secrets` in the host's own settings: the host calls it without asking |
+| `passed` | outcome | M2-09 | landed | the probe and its control passed |
+| `failed` | outcome | M2-09 | landed | the probe or its control failed; listed first |
+| `skipped` | outcome | M2-09 | landed | the probe did not run, with the reason |
+| `not_qualified` | outcome | M2-28 | landed | the probe is not qualified for this host version, which is not a failure |
 <!-- /reservations -->
 
 **Control-pipe messages** of the processes EnvCloak starts (never socket methods):
