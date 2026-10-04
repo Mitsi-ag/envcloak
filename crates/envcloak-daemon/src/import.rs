@@ -102,8 +102,8 @@ use envcloak_core::file_backup::{
 };
 use envcloak_core::file_backup_v2::CreatorKind;
 use envcloak_core::vault::{
-    Classification, FieldName, ItemDetails, ItemMeta, MAX_FIELD, NewItem, Slug, ValueKey, Vault,
-    VaultError, VaultErrorKind,
+    Classification, FieldId, FieldName, ItemDetails, ItemMeta, MAX_FIELD, NewItem, Slug, ValueKey,
+    Vault, VaultError, VaultErrorKind,
 };
 use envcloak_core::{RecoveryKit, SecretBytes};
 use envcloak_ipc::proto::{
@@ -332,22 +332,29 @@ struct Asker {
     person: bool,
 }
 
-/// Reads who asks, admits the values `count` says are compared for them
-/// (given whether they are a person), and audits the call (`method`) with
-/// that count, or the refusal.
-fn ask(
-    shared: &Shared,
+/// Reads who asks; then, under the state lock it hands back held, checks
+/// the vault is unlocked, admits the values `count` says are compared for
+/// them (given whether they are a person), and audits the call (`method`)
+/// with that count, or the refusal. The caller compares under that same
+/// lock, so a lock cannot come between the entry that counts the values
+/// and their comparison: an entry never counts values for a call that
+/// then compared none (`vault_locked`).
+fn ask<'s>(
+    shared: &'s Shared,
     peer: &PeerIdentity,
     claims: &[String],
     method: &'static str,
     count: impl FnOnce(bool) -> usize,
-) -> Result<Asker, RpcError> {
+) -> Result<(Asker, std::sync::MutexGuard<'s, State>), RpcError> {
     let evidence = evidence(shared, peer, claims)?;
     let person = evidence.proof_refusal().is_none();
     let n = count(person);
+    let mut s = locked(&shared.state);
+    s.unlocked()?;
     let now = now_of(&shared.clocks);
+    // The state lock, then `ValueChecks`: the order `scan.match` takes them.
     let admitted = locked(&shared.value_checks).admit(&evidence.root(), n, now.awake);
-    shared.audit(AuditEvent::ValuesChecked {
+    s.audit(AuditEvent::ValuesChecked {
         pid: peer.pid,
         subject: subject_summary(peer, &evidence),
         method,
@@ -357,7 +364,7 @@ fn ask(
     if !admitted {
         return Err(RpcError::new(ErrorKind::TooManyChecks));
     }
-    Ok(Asker { evidence, person })
+    Ok((Asker { evidence, person }, s))
 }
 
 /// Whether the value of the variable `name` is compared with the vault
@@ -580,13 +587,44 @@ fn new_slug(
         .ok_or_else(|| RpcError::with_reason(ErrorKind::InvalidItem, "no_free_slug"))
 }
 
-/// The secret items of `v` holding `value`, by slug, with the field.
-fn holders<'v>(v: &'v Vault, value: &SecretBytes) -> Vec<(&'v ItemMeta, FieldName)> {
-    let fields = v.find_by_value(value);
+/// The current values of the vault's `secret` items, by keyed hash: the
+/// only values the import methods and `scan.match` compare a value with
+/// (SPEC §2a-bis, R-M2-34). It is built from the secret items' keys alone
+/// ([`Vault::value_keys_of`]), so a card's value or a login's is never
+/// compared at all, rather than compared and then left out.
+pub(crate) struct SecretValues {
+    by_key: HashMap<ValueKey, Vec<FieldId>>,
+}
+
+impl SecretValues {
+    pub(crate) fn of(v: &Vault) -> Self {
+        let mut by_key: HashMap<ValueKey, Vec<FieldId>> = HashMap::new();
+        for (field, key) in v.value_keys_of(ItemClass::Secret) {
+            by_key.entry(key).or_default().push(field);
+        }
+        SecretValues { by_key }
+    }
+
+    /// The `secret` items' fields whose current value has `key`.
+    pub(crate) fn fields(&self, key: &ValueKey) -> &[FieldId] {
+        self.by_key.get(key).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The secret items of `v` whose value has `key` (in `secrets`), by slug,
+/// with the field.
+fn holders<'v>(
+    v: &'v Vault,
+    secrets: &SecretValues,
+    key: &ValueKey,
+) -> Vec<(&'v ItemMeta, FieldName)> {
+    let fields = secrets.fields(key);
+    if fields.is_empty() {
+        return Vec::new();
+    }
     let mut out: Vec<(&ItemMeta, FieldName)> = v
         .items()
         .iter()
-        .filter(|m| m.class == ItemClass::Secret)
         .filter_map(|m| {
             m.fields
                 .iter()
@@ -619,20 +657,34 @@ fn compared(shared: &Shared, input: &Input, person: bool) -> usize {
 /// Works out the plan, for a person or not ([`Asker::person`]). See the
 /// module documentation.
 fn plan(shared: &Shared, v: &Vault, input: &Input, person: bool) -> Result<Plan, RpcError> {
+    let secrets = SecretValues::of(v);
+    // Each entry's value key, or why it is left out.
+    let keys: Vec<Result<ValueKey, SkipReason>> = input
+        .entries
+        .iter()
+        .map(|e| compare(shared, e.name.as_str(), &e.value, person).map(|()| v.value_key(&e.value)))
+        .collect();
+    let namers = namers(input, &keys);
     let mut fates = Vec::with_capacity(input.entries.len());
     let mut items: Vec<PlannedItem> = Vec::new();
     let mut by_key: BTreeMap<ValueKey, usize> = BTreeMap::new();
     let mut taken = BTreeSet::new();
-    for (i, e) in input.entries.iter().enumerate() {
-        if let Err(r) = compare(shared, e.name.as_str(), &e.value, person) {
-            fates.push(Fate::Skip(r));
-            continue;
-        }
-        let key = v.value_key(&e.value);
+    for (e, key) in input.entries.iter().zip(&keys) {
+        let key = match key {
+            Ok(key) => *key,
+            Err(r) => {
+                fates.push(Fate::Skip(*r));
+                continue;
+            }
+        };
         let at = match by_key.get(&key) {
             Some(&at) => at,
             None => {
-                let item = new_item(shared, v, &mut taken, input, i, key)?;
+                let namer = namers
+                    .get(&key)
+                    .copied()
+                    .ok_or(RpcError::new(ErrorKind::Internal))?;
+                let item = new_item(shared, v, &secrets, &mut taken, input, namer, key)?;
                 items.push(item);
                 by_key.insert(key, items.len() - 1);
                 items.len() - 1
@@ -653,9 +705,35 @@ fn plan(shared: &Shared, v: &Vault, input: &Input, person: bool) -> Result<Plan,
     })
 }
 
+/// The entry each kept value's item is named after, should it be new: the
+/// first project entry that holds the value, or, when none does, the
+/// first entry that does. So a value a project's env file holds is named
+/// after the project (`<base>/<project>`, the project's variable for the
+/// base) in whatever order the entries came, never after a machine label
+/// (docs/IMPORT.md: such a value is one item, the project's); among
+/// entries of one scope, the first sent names it.
+fn namers(input: &Input, keys: &[Result<ValueKey, SkipReason>]) -> HashMap<ValueKey, usize> {
+    let mut out: HashMap<ValueKey, usize> = HashMap::new();
+    for (i, key) in keys.iter().enumerate() {
+        let Ok(key) = key else {
+            continue;
+        };
+        let project = matches!(input.entries[i].scope, Scope::Project(_));
+        out.entry(*key)
+            .and_modify(|at| {
+                if project && matches!(input.entries[*at].scope, Scope::Machine(_)) {
+                    *at = i;
+                }
+            })
+            .or_insert(i);
+    }
+    out
+}
+
 fn new_item(
     shared: &Shared,
     v: &Vault,
+    secrets: &SecretValues,
     taken: &mut BTreeSet<Slug>,
     input: &Input,
     first: usize,
@@ -663,7 +741,7 @@ fn new_item(
 ) -> Result<PlannedItem, RpcError> {
     let e = &input.entries[first];
     let length = LengthClass::of(e.value.len());
-    let found = holders(v, &e.value);
+    let found = holders(v, secrets, &key);
     if let Some((m, field)) = found.first() {
         return Ok(PlannedItem {
             key,
@@ -799,10 +877,9 @@ pub fn import_plan(
     let (input, claims) = check_input(shared, p)?;
     refuse_if_traced()?;
     locked(&shared.state).unlocked()?;
-    let asker = ask(shared, peer, &claims, "import.plan", |person| {
+    let (asker, s) = ask(shared, peer, &claims, "import.plan", |person| {
         compared(shared, &input, person)
     })?;
-    let s = locked(&shared.state);
     let v = s.unlocked()?;
     Ok(view(&plan(shared, v, &input, asker.person)?))
 }
@@ -822,13 +899,15 @@ pub fn import_commit(
     let (mut input, claims) = check_input(shared, p.import)?;
     refuse_if_traced()?;
     locked(&shared.state).unlocked()?;
-    let Asker {
-        evidence: caller,
-        person,
-    } = ask(shared, peer, &claims, "import.commit", |person| {
+    let (
+        Asker {
+            evidence: caller,
+            person,
+        },
+        mut s,
+    ) = ask(shared, peer, &claims, "import.commit", |person| {
         compared(shared, &input, person)
     })?;
-    let mut s = locked(&shared.state);
     let plan = plan(shared, s.unlocked()?, &input, person)?;
     if hex(&plan.digest) != wanted {
         return Err(RpcError::new(ErrorKind::PlanChanged));
@@ -908,7 +987,7 @@ pub fn import_verify(
     let m = &project.manifest;
     refuse_if_traced()?;
     locked(&shared.state).unlocked()?;
-    let asker = ask(shared, peer, &p.claims, "import.verify", |person| {
+    let asked = ask(shared, peer, &p.claims, "import.verify", |person| {
         p.files
             .iter()
             .flat_map(|f| f.entries.iter())
@@ -919,8 +998,9 @@ pub fn import_verify(
             })
             .count()
     })?;
-    let s = locked(&shared.state);
+    let (asker, s) = asked;
     let v = s.unlocked()?;
+    let secrets = SecretValues::of(v);
     let items = v.items();
     let recovery_confirmed = v
         .recovery_confirmed()
@@ -948,7 +1028,7 @@ pub fn import_verify(
             let value = e.value.into_inner();
             let (status, skipped) = match compare(shared, name.as_str(), &value, asker.person) {
                 Err(r) => (EntryStatus::LeftOut, Some(r)),
-                Ok(()) => (stored(v, &bindings, &name, &value), None),
+                Ok(()) => (stored(v, &secrets, &bindings, &name, &value), None),
             };
             entries.push(VerifyEntryView {
                 line: e.line,
@@ -970,19 +1050,22 @@ pub fn import_verify(
     })
 }
 
-/// Whether the item `bindings` binds `name` to holds `value` now.
-fn stored(v: &Vault, bindings: &[Binding], name: &EnvName, value: &SecretBytes) -> EntryStatus {
+/// Whether the item `bindings` binds `name` to holds `value` now: looked
+/// up among the `secret` items' values (`secrets`) alone, the only class a
+/// binding resolves to.
+fn stored(
+    v: &Vault,
+    secrets: &SecretValues,
+    bindings: &[Binding],
+    name: &EnvName,
+    value: &SecretBytes,
+) -> EntryStatus {
     let Some(b) = bindings.iter().find(|b| b.env_name == *name) else {
         return EntryStatus::NotStored;
     };
+    let holding = secrets.fields(&v.value_key(value));
     match bind_items(std::slice::from_ref(b), v.items()) {
-        Ok(bound)
-            if bound
-                .iter()
-                .all(|x| v.find_by_value(value).contains(&x.field)) =>
-        {
-            EntryStatus::Stored
-        }
+        Ok(bound) if bound.iter().all(|x| holding.contains(&x.field)) => EntryStatus::Stored,
         _ => EntryStatus::NotStored,
     }
 }

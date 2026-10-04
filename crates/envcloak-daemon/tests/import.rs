@@ -347,6 +347,170 @@ fn machine_scope_values_dedupe_with_projects_and_are_named_by_label() {
     f.sweep();
 }
 
+/// A value a project's env file holds is named after the project in any
+/// order the entries come (gate 10's machine dedupe; docs/IMPORT.md: such
+/// a value is one item, the project's): with the machine entries that hold
+/// it sent before the project's, the new item is still `<base>/<project>`,
+/// the project's variable naming the base (and its `env_hint`), and only
+/// the project's entry adopts it; the items are those of the same entries
+/// sent project first. A value only machine entries hold is named after
+/// the first of them sent. The commit makes the items so named.
+///
+/// Mutation: the first entry sent names the item (the machine-first plan
+/// names them `openai/zshrc` and `my-token/mcp-claude-code`).
+#[test]
+fn a_value_a_project_holds_is_named_after_the_project_in_any_order() {
+    let mut f = Fixture::new(|_, _| {});
+    let rotated = by_label(&f.cs, labels::OPENAI_API_KEY_ROTATED)
+        .value()
+        .to_vec();
+    let (token, other) = (word(24), word(24));
+    f.cs.push(Canary::new("PROJECT_TOKEN", token.clone()));
+    f.cs.push(Canary::new("MACHINE_ONLY", other.clone()));
+    let machine_first = || {
+        vec![
+            machine(
+                MachineSource::Profile,
+                "zshrc",
+                "~/.zshrc",
+                "OPENAI_API_KEY",
+                &rotated,
+            ),
+            machine(
+                MachineSource::McpConfig,
+                "mcp-claude-code",
+                "~/.claude.json",
+                "MY_TOKEN",
+                token.as_bytes(),
+            ),
+            entry(0, ".env", None, "OPENAI_API_KEY", &rotated),
+            entry(0, ".env", None, "APP_TOKEN", token.as_bytes()),
+            machine(
+                MachineSource::Profile,
+                "zshrc",
+                "~/.zshrc",
+                "OTHER_TOKEN",
+                other.as_bytes(),
+            ),
+            machine(
+                MachineSource::Profile,
+                "secrets-sh",
+                "~/.secrets.sh",
+                "OTHER_TOKEN",
+                other.as_bytes(),
+            ),
+        ]
+    };
+    let params = |entries: Vec<ImportEntry>| ImportParams {
+        projects: vec![ImportProject {
+            dir: f.dir("acme-api"),
+            name: "acme-api".into(),
+        }],
+        entries,
+        claims: Vec::new(),
+    };
+    let mut c = client(&f.home);
+    let plan = c.import_plan(&params(machine_first())).unwrap();
+    assert!(plan.entries.iter().all(|e| e.skipped.is_none()));
+    let named: Vec<(&str, u32, u32)> = [0, 1, 4]
+        .iter()
+        .map(|&i| {
+            let it = item_of(&plan, i);
+            (it.slug.as_str(), it.entries, it.projects)
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("openai/acme-api", 2, 1),
+            ("app-token/acme-api", 2, 1),
+            ("other-token/zshrc", 2, 0)
+        ]
+    );
+    // The same entries, the project's first: the same items.
+    let mut project_first = machine_first();
+    project_first.rotate_left(2);
+    let other_order = c.import_plan(&params(project_first)).unwrap();
+    assert_eq!(other_order.items, plan.items);
+    let done = c
+        .import_commit(&ImportCommitParams {
+            import: params(machine_first()),
+            digest: plan.digest.clone(),
+        })
+        .unwrap();
+    assert_eq!(done, plan);
+    let shown = c.items_show("app-token/acme-api").unwrap();
+    assert_eq!(shown.env_hint.as_deref(), Some("APP_TOKEN"));
+    assert!(c.items_show("other-token/zshrc").is_ok());
+    assert_no_canary(&json(&plan), &f.cs);
+    drop(c);
+    f.sweep();
+}
+
+/// The import methods compare a value with the `secret` items' values
+/// alone (R-M2-34): a value only a card holds, imported, is a new item,
+/// and the card is neither reported as its holder nor bound to; the same
+/// value a secret holds too binds to the secret, the card unreported.
+///
+/// Mutation: the values looked up among every class's keys (the plan
+/// binds the card as the value's holder).
+#[test]
+fn a_value_a_card_holds_is_never_compared_by_an_import() {
+    let (card, both) = (word(32), word(32));
+    let (a, b) = (card.clone(), both.clone());
+    let mut f = Fixture::new(move |v, _| {
+        v.transact(|t| {
+            for (slug, class, value) in [
+                ("card/one", ItemClass::Card, &a),
+                ("card/two", ItemClass::Card, &b),
+                ("token/secret", ItemClass::Secret, &b),
+            ] {
+                let id = t.create_item(NewItem {
+                    class,
+                    slug: Slug::new(slug).unwrap(),
+                    details: ItemDetails::default(),
+                })?;
+                t.add_field(
+                    id,
+                    FieldName::new("value").unwrap(),
+                    SecretBytes::copy_from(value.as_bytes()),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    });
+    f.cs.push(Canary::new("CARD_ONLY", card.clone()));
+    f.cs.push(Canary::new("CARD_AND_SECRET", both.clone()));
+    let mut c = client(&f.home);
+    let plan = c
+        .import_plan(&ImportParams {
+            projects: vec![ImportProject {
+                dir: f.dir("acme-api"),
+                name: "acme-api".into(),
+            }],
+            entries: vec![
+                entry(0, ".env", None, "PAYMENT_TOKEN", card.as_bytes()),
+                entry(0, ".env", None, "SHARED_TOKEN", both.as_bytes()),
+            ],
+            claims: Vec::new(),
+        })
+        .unwrap();
+    let new = item_of(&plan, 0);
+    assert_eq!(
+        (new.slug.as_str(), new.existing, new.holders.len()),
+        ("payment-token/acme-api", false, 0)
+    );
+    let held = item_of(&plan, 1);
+    assert_eq!(
+        (held.slug.as_str(), held.existing, held.holders.as_slice()),
+        ("token/secret", true, &["token/secret".to_owned()][..])
+    );
+    assert_no_canary(&json(&plan), &f.cs);
+    drop(c);
+    f.sweep();
+}
+
 fn item_of(p: &ImportPlanView, entry: usize) -> &envcloak_ipc::view::ImportItemView {
     let at = p.entries[entry].item.unwrap();
     &p.items[at as usize]
