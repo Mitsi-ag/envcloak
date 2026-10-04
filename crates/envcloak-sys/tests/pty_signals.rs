@@ -608,7 +608,25 @@ fn member() {
 /// it, so the counters of the two that left can count (a positive
 /// control). Bind each member with a pidfd of its own and signal them
 /// after (the design before this one) and the two that left are signalled.
+///
+/// Where the kernel has no group signal through a pidfd (Linux before
+/// 6.9), the bound job's signal is refused (`Unsupported`) and SIGTERM and
+/// SIGHUP are narrowed to the command's group, which here is the family's:
+/// a group signal of the monitor's, which leaves out the two that left as
+/// well. The case runs that way too on Linux, with the group signal
+/// refused as such a kernel refuses it.
 fn a_process_that_leaves_the_job_before_the_delivery_gets_nothing() {
+    leaving_members(false);
+    #[cfg(target_os = "linux")]
+    {
+        let _forced = NoGroupSignal::force();
+        leaving_members(true);
+    }
+}
+
+/// The case above, with the group signal refused when `forced` (Linux).
+fn leaving_members(forced: bool) {
+    let narrowing = group_signals_narrowed(forced);
     let dir = short_dir();
     let d = dir.path();
     let exe = std::env::current_exe().unwrap();
@@ -652,17 +670,37 @@ fn a_process_that_leaves_the_job_before_the_delivery_gets_nothing() {
             );
         }
     };
-    // Each process's control, on Linux the bound job's, and one forwarded.
-    let term = if cfg!(target_os = "linux") { 2 } else { 1 };
+    // Each process's control, on Linux the bound job's (refused where the
+    // group signal is), and one forwarded.
+    let term = if cfg!(target_os = "linux") && !narrowing {
+        2
+    } else {
+        1
+    };
     #[cfg(target_os = "linux")]
-    {
+    if narrowing {
+        let refused = job.signal(libc::SIGTERM).unwrap_err();
+        assert_eq!(
+            envcloak_sys::owned::NoJob::of(&refused),
+            Some(envcloak_sys::owned::NoJob::Unsupported),
+            "{refused}"
+        );
+    } else {
         job.signal(libc::SIGTERM).unwrap();
         both_count("TERM", term);
     }
     for (sig, name) in SIGNALS {
         let forwarded = forward_signal(&monitor, screen.master(), sig).unwrap();
-        assert_eq!(Some(forwarded.route), signal_route(sig), "SIG{name}");
-        assert_eq!(forwarded.reason, RouteReason::Measured, "SIG{name}");
+        if narrowing && signal_route(sig) == Some(SignalRoute::Session) {
+            assert_eq!(
+                (forwarded.route, forwarded.reason),
+                (SignalRoute::CommandGroup, RouteReason::Narrowed),
+                "SIG{name}"
+            );
+        } else {
+            assert_eq!(Some(forwarded.route), signal_route(sig), "SIG{name}");
+            assert_eq!(forwarded.reason, RouteReason::Measured, "SIG{name}");
+        }
         both_count(name, if sig == libc::SIGTERM { term + 1 } else { 1 });
     }
     for who in ["leader", "stay"] {
@@ -685,10 +723,15 @@ fn a_process_that_leaves_the_job_before_the_delivery_gets_nothing() {
     }
     monitor.finish().unwrap();
     println!(
-        "pty_signals ({}{}): two members that left the job (setsid, setpgid) before the \
+        "pty_signals ({}{}{}): two members that left the job (setsid, setpgid) before the \
          delivery got nothing; the leader and the member that stayed got each signal",
         std::env::consts::OS,
-        kernel_release()
+        kernel_release(),
+        match (narrowing, forced) {
+            (false, _) => "",
+            (true, true) => ", group signal refused by the test",
+            (true, false) => ", no group signal in this kernel",
+        }
     );
 }
 
