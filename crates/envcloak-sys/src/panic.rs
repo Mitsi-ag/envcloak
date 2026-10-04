@@ -27,8 +27,14 @@ const MAX_INPUT: u64 = 64 * 1024;
 /// path of this repository or of the standard library, and a line), and
 /// never the message. A write that fails is ignored: the process is going
 /// down, and standard error may be gone.
+///
+/// Before the line, the hook puts back the outer terminal a
+/// [`crate::TerminalGuard`] holds in raw mode
+/// ([`crate::restore_outer_terminal`], `TCSAFLUSH`): a release build aborts
+/// after the hook without running the guard's drop (lesson L-13).
 pub fn install(program: &'static str) {
     std::panic::set_hook(Box::new(move |info| {
+        crate::restore_outer_terminal();
         let line = match info.location() {
             Some(l) => format!(
                 "{program}: internal error: a panic at {}:{}; its message is not shown, since it \

@@ -50,6 +50,17 @@ harness = false
 name = "relay_terminal"
 harness = false
 
+# Their own main: a copy of each binary plays the PTY driver, probe and
+# fixtures, and nothing else runs in the process that forks the PTY
+# monitor (see the files).
+[[test]]
+name = "pty_topology"
+harness = false
+
+[[test]]
+name = "pty_signals"
+harness = false
+
 [dev-dependencies]
 # Enables the `testing` feature for this crate's own tests.
 envcloak-sys = { path = ".", features = ["testing"] }
