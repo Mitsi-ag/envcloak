@@ -29,6 +29,17 @@
 //! fails. A created file migrated without its whole-file run (`whole`
 //! answering `None`): the unchanged created file is rewritten, not
 //! removed, and this fails.
+//!
+//! The second test is Codex's cycle 355 gate (the F-125 follow-up): a
+//! completed registration A and a different pending one B of the same
+//! `.claude.json` (a run stopped during a reinstall with a changed entry),
+//! with the file holding A, B or the person's own entry, beside the
+//! person's other server and keys. Uninstall takes EnvCloak's entry out
+//! whichever of A and B it holds, keeps the person's, and keeps every
+//! other byte's meaning. Mutation checked: `LegacyState::migrate` keeping
+//! the completed registration over a different pending one (the earlier
+//! `registrations.entry(k).or_insert(r)`): the case holding B keeps B
+//! after an uninstall that says complete, and this fails.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -299,4 +310,87 @@ fn the_predecessors_journals_open_and_their_registrations_are_managed() {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Codex's cycle 355 gate, adopted: six homes, each with a format-1
+/// journal of the registrations named and a `.claude.json` holding the
+/// entry named, the person's other server and a key of theirs.
+#[test]
+fn a_completed_and_a_different_pending_registration_are_both_managed() {
+    let dir = tempfile::Builder::new()
+        .prefix("ecsp")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let a = entry();
+    let mut b = a.clone();
+    b["args"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("synthetic-alternate"));
+    let person = json!({"command": "synthetic-person-owned"});
+    let other = json!({"command": "synthetic-other"});
+    // (completed, pending, what the file holds, EnvCloak's to take out)
+    let cases: [(Option<&Value>, Option<&Value>, &Value, bool); 6] = [
+        (Some(&a), None, &a, true),
+        (None, Some(&b), &b, true),
+        (Some(&a), Some(&a), &a, true),
+        (Some(&a), Some(&b), &a, true),
+        (Some(&a), Some(&b), &b, true),
+        (Some(&a), Some(&b), &person, false),
+    ];
+    let mut misses = Vec::new();
+    let mut shapes = Vec::new();
+    for (id, (completed, pending, current, ours)) in cases.iter().enumerate() {
+        let home = root.join(format!("case-{id}"));
+        std::fs::create_dir(&home).unwrap();
+        let claude_json = home.join(".claude.json");
+        let key = claude_json.to_str().unwrap();
+        let input = json!({"custom": 7, "mcpServers": {"envcloak": current, "other": other}});
+        std::fs::write(&claude_json, serde_json::to_vec_pretty(&input).unwrap()).unwrap();
+        std::fs::set_permissions(&claude_json, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let reg = |e: &Value| json!({"host": "claude-code", "entry": e, "config_dir": null, "created": null});
+        let mcp: Vec<(&str, Value)> = completed.iter().map(|e| (key, reg(e))).collect();
+        let intent: Vec<(&str, Value)> = pending.iter().map(|e| (key, reg(e))).collect();
+        let data = root.join(format!("data-{id}"));
+        let p = store(&data, &legacy(&mcp, &intent));
+        let before = std::fs::read(&p).unwrap();
+        let (_lock, mut state) = StateFile::open(&data).unwrap();
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "{id}: the open writes nothing"
+        );
+        // Each distinct registration is one edit of the one record.
+        let distinct = usize::from(completed.is_some())
+            + usize::from(pending.is_some() && pending != completed);
+        let edits = state.files.values().flat_map(|r| &r.edits).count();
+        if edits != distinct {
+            shapes.push(format!("case {id}: {edits} edits, not {distinct}"));
+        }
+        let report = uninstall(&mut state);
+        let after: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
+        // Controls: the person's other server and key stay, and their own
+        // entry leaves the file as it was.
+        assert_eq!(after["custom"], json!(7), "{id}");
+        assert_eq!(after["mcpServers"]["other"], other, "{id}");
+        if !ours {
+            assert_eq!(after, input, "{id}: the person's entry is theirs");
+        }
+        let removed = after["mcpServers"].get("envcloak").is_none();
+        if removed != *ours {
+            misses.push(format!(
+                "case {id}: EnvCloak's entry {} after an uninstall that said complete={}",
+                if removed { "removed" } else { "left" },
+                report.complete()
+            ));
+        }
+        assert!(report.complete(), "{id}: {report:?}");
+        assert!(
+            state.files.is_empty(),
+            "{id}: the record is dropped once undone"
+        );
+    }
+    assert!(misses.is_empty(), "{misses:#?}");
+    assert!(shapes.is_empty(), "{shapes:#?}");
 }
