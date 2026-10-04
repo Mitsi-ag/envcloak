@@ -1,0 +1,4 @@
+
+[macOS only]
+security-framework = { version = "=3.7.0", default-features = false, features = ["OSX_10_15"] }
+core-foundation = "=0.10.1"

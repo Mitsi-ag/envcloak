@@ -1,0 +1,4 @@
+tree exit 0
+deny exit 0
+check-sources exit 0
+build and test on aarch64-apple-darwin exit 0

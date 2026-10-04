@@ -1,0 +1,20 @@
+[package]
+name = "envcloak-deptrial"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "nistp", "aes", "chacha"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "=3.7.0", default-features = false, features = ["OSX_10_15"] }
+core-foundation = "=0.10.1"

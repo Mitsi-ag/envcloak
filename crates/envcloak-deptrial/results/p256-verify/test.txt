@@ -1,0 +1,25 @@
+   Compiling block-buffer v0.12.1
+   Compiling digest v0.11.3
+   Compiling elliptic-curve v0.14.1
+   Compiling hmac v0.13.0
+   Compiling signature v3.0.0
+   Compiling sha2 v0.11.0
+   Compiling rfc6979 v0.6.0
+   Compiling primeorder v0.14.0
+   Compiling ecdsa v0.17.0
+   Compiling p256 v0.14.0
+   Compiling envcloak-deptrial v0.1.0 (/private/tmp/ec-m2-m3-01/crates/envcloak-deptrial)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.44s
+     Running unittests src/lib.rs (/tmp/ec-target-D/debug/deps/envcloak_deptrial-8de32db5fc7f41b5)
+
+running 1 test
+test p256::tests::a_malformed_key_is_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests envcloak_deptrial
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

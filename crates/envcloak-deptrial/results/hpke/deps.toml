@@ -1,0 +1,1 @@
+hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "nistp", "aes", "chacha"] }

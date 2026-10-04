@@ -1,0 +1,15 @@
+combined             aarch64-apple-darwin       crates= 64 proc-macros=zeroize_derive 1.5.0; build-scripts=curve25519-dalek, getrandom, libc, num-traits, proc-macro2, quote
+combined             x86_64-apple-darwin        crates= 65 proc-macros=curve25519-dalek-derive 0.1.1, zeroize_derive 1.5.0; build-scripts=curve25519-dalek, getrandom, libc, num-traits, proc-macro2, quote
+combined             x86_64-unknown-linux-gnu   crates= 60 proc-macros=curve25519-dalek-derive 0.1.1, zeroize_derive 1.5.0; build-scripts=curve25519-dalek, getrandom, libc, num-traits, proc-macro2, quote
+hpke                 aarch64-apple-darwin       crates= 56 proc-macros=zeroize_derive 1.5.0; build-scripts=curve25519-dalek, getrandom, libc, num-traits, proc-macro2, quote
+hpke                 x86_64-apple-darwin        crates= 57 proc-macros=curve25519-dalek-derive 0.1.1, zeroize_derive 1.5.0; build-scripts=curve25519-dalek, getrandom, libc, num-traits, proc-macro2, quote
+hpke                 x86_64-unknown-linux-gnu   crates= 57 proc-macros=curve25519-dalek-derive 0.1.1, zeroize_derive 1.5.0; build-scripts=curve25519-dalek, getrandom, libc, num-traits, proc-macro2, quote
+hpke-p256-fallback   aarch64-apple-darwin       crates= 49 proc-macros=zeroize_derive 1.5.0; build-scripts=getrandom, libc, num-traits, proc-macro2, quote
+hpke-p256-fallback   x86_64-apple-darwin        crates= 49 proc-macros=zeroize_derive 1.5.0; build-scripts=getrandom, libc, num-traits, proc-macro2, quote
+hpke-p256-fallback   x86_64-unknown-linux-gnu   crates= 49 proc-macros=zeroize_derive 1.5.0; build-scripts=getrandom, libc, num-traits, proc-macro2, quote
+p256-verify          aarch64-apple-darwin       crates= 33 proc-macros=none; build-scripts=libc, num-traits
+p256-verify          x86_64-apple-darwin        crates= 32 proc-macros=none; build-scripts=num-traits
+p256-verify          x86_64-unknown-linux-gnu   crates= 32 proc-macros=none; build-scripts=num-traits
+security-framework   aarch64-apple-darwin       crates=  6 proc-macros=none; build-scripts=libc
+security-framework   x86_64-apple-darwin        crates=  6 proc-macros=none; build-scripts=libc
+security-framework   x86_64-unknown-linux-gnu   crates=  0 proc-macros=none; build-scripts=none

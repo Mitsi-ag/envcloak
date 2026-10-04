@@ -1,0 +1,1 @@
+envcloak-deptrial v0.1.0 (/private/tmp/ec-m2-m3-01/crates/envcloak-deptrial)

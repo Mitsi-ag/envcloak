@@ -1,0 +1,6 @@
+    Updating crates.io index
+     Locking 4 packages to latest Rust 1.85 compatible versions
+      Adding core-foundation v0.10.1
+      Adding core-foundation-sys v0.8.7
+      Adding security-framework v3.7.0
+      Adding security-framework-sys v2.17.0
