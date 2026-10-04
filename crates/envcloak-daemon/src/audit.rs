@@ -803,6 +803,7 @@ fn decision(
         reason: reason.map(str::to_owned),
         method: method.map(str::to_owned),
         count,
+        counts: Vec::new(),
     }
 }
 
