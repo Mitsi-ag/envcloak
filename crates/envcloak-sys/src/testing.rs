@@ -53,6 +53,70 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use crate::WipingAllocator;
 use crate::alloc::Backing;
 
+/// The command line of the test binaries with their own `main`.
+pub mod libtest;
+
+/// How a test makes a child start with its children reaped by the kernel
+/// on their own, as a parent may leave it (both survive `exec`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildReaping {
+    /// SIGCHLD ignored (`SIG_IGN`): Linux reaps on its own; macOS does not
+    /// (measured).
+    Ignored,
+    /// The default action with `SA_NOCLDWAIT`.
+    NoWait,
+}
+
+/// Sets this process's SIGCHLD as `how` says (as another library in the
+/// process might). Async-signal-safe: `sigaction` only.
+///
+/// # Errors
+/// `sigaction`'s.
+pub fn set_sigchld(how: ChildReaping) -> io::Result<()> {
+    // SAFETY: sigaction is plain data; zeroed is an empty mask and no
+    // flags.
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    match how {
+        ChildReaping::Ignored => act.sa_sigaction = libc::SIG_IGN,
+        ChildReaping::NoWait => {
+            act.sa_sigaction = libc::SIG_DFL;
+            act.sa_flags = libc::SA_NOCLDWAIT;
+        }
+    }
+    // SAFETY: `act` is initialized.
+    if unsafe { libc::sigaction(libc::SIGCHLD, &act, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Makes the child `cmd` starts begin with SIGCHLD ignored, which `exec`
+/// keeps: for tests of a process that inherited it. (`SA_NOCLDWAIT` with
+/// the default action does not survive `exec`; [`set_sigchld`] sets it
+/// in the process itself.)
+pub fn sigchld_ignored_on_spawn(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure calls only sigaction, through set_sigchld, which
+    // is async-signal-safe, and allocates nothing.
+    unsafe {
+        cmd.pre_exec(|| set_sigchld(ChildReaping::Ignored));
+    }
+}
+
+/// This process's SIGCHLD setup: (ignored, `SA_NOCLDWAIT` set).
+pub fn sigchld_setup() -> (bool, bool) {
+    // SAFETY: sigaction is plain data; a null new action only reads the
+    // current one into `old`.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let rc = unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) };
+    assert_eq!(rc, 0, "sigaction: {}", io::Error::last_os_error());
+    (
+        old.sa_sigaction == libc::SIG_IGN,
+        old.sa_flags & libc::SA_NOCLDWAIT != 0,
+    )
+}
+
 /// Maximum number of needles a session can watch for.
 pub const MAX_NEEDLES: usize = 32;
 /// Maximum length of one needle.
