@@ -64,6 +64,46 @@ pub struct RequestAudit {
     pub count: Option<u64>,
 }
 
+/// What one `scan.match` call did, by count (M2-11): its entry holds
+/// these and never a candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCounts {
+    /// `import`, `doctor` or `scrub`.
+    pub purpose: &'static str,
+    /// Where the candidates were read (`transcript`, `shell_profile`, ...).
+    pub source: &'static str,
+    /// Candidates sent.
+    pub candidates: usize,
+    /// Guessable candidates compared, counted in `ValueChecks`.
+    pub guessable: usize,
+    /// Other candidates compared, counted in `ScanChecks`.
+    pub other: usize,
+    /// Guessable candidates this purpose or caller may not compare.
+    pub skipped_guessable: usize,
+    /// Candidates a spent budget left uncompared.
+    pub not_compared: usize,
+    /// Matches answered (a candidate and an item holding it).
+    pub matches: usize,
+    /// Key patterns answered (a candidate no item holds, and a provider).
+    pub patterns: usize,
+}
+
+impl ScanCounts {
+    /// The entry's named counts.
+    fn named(&self) -> Vec<(String, u64)> {
+        let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+        vec![
+            (format!("candidates_{}", self.source), n(self.candidates)),
+            ("compared_guessable".to_owned(), n(self.guessable)),
+            ("compared_other".to_owned(), n(self.other)),
+            ("skipped_guessable".to_owned(), n(self.skipped_guessable)),
+            ("not_compared".to_owned(), n(self.not_compared)),
+            ("matches".to_owned(), n(self.matches)),
+            ("patterns".to_owned(), n(self.patterns)),
+        ]
+    }
+}
+
 /// An event worth recording. The ids in it are the daemon's own
 /// (Crockford base32) and the tokens fixed; nothing a client sent but the
 /// masked command line.
@@ -258,6 +298,16 @@ pub enum AuditEvent {
         files: usize,
         form: Option<&'static str>,
     },
+    /// Candidates were compared with the vault (`scan.match`), or the call
+    /// was refused because its budget was spent (`refused`,
+    /// `too_many_checks` with the reason `limited`): its purpose, source
+    /// and counts, never a candidate.
+    ScanMatched {
+        pid: i32,
+        subject: SubjectSummary,
+        counts: ScanCounts,
+        refused: bool,
+    },
 }
 
 impl AuditEvent {
@@ -444,6 +494,26 @@ impl AuditEvent {
                 "envcloakd: audit: backup v2 restore lease opened id={backup} files={files}{} \
                  pid={pid}",
                 form_part(*form)
+            ),
+            AuditEvent::ScanMatched {
+                pid,
+                counts: c,
+                refused,
+                ..
+            } => format!(
+                "envcloakd: audit: scan {} purpose={} source={} candidates={} compared={} \
+                 skipped_guessable={} not_compared={} pid={pid}",
+                if *refused {
+                    "refused reason=limited"
+                } else {
+                    "matched"
+                },
+                c.purpose,
+                c.source,
+                c.candidates,
+                c.guessable + c.other,
+                c.skipped_guessable,
+                c.not_compared,
             ),
         })
     }
@@ -783,6 +853,37 @@ impl AuditEvent {
                 ),
                 ..AuditRecord::new(AuditKind::RestoreV2, "opened")
             },
+            AuditEvent::ScanMatched {
+                subject,
+                counts,
+                refused,
+                ..
+            } => {
+                // Refused: `too_many_checks`, nothing compared; limited: a
+                // budget ran out during the call.
+                let outcome = if *refused {
+                    "refused"
+                } else if counts.not_compared > 0 {
+                    "limited"
+                } else {
+                    "checked"
+                };
+                AuditRecord {
+                    subject: subject.clone(),
+                    decision: DecisionSummary {
+                        counts: counts.named(),
+                        ..decision(
+                            outcome,
+                            Some(counts.purpose),
+                            Some("scan.match"),
+                            Some(
+                                u64::try_from(counts.guessable + counts.other).unwrap_or(u64::MAX),
+                            ),
+                        )
+                    },
+                    ..AuditRecord::new(AuditKind::ScanMatch, outcome)
+                }
+            }
         }
     }
 }

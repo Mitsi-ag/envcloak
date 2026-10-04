@@ -31,8 +31,8 @@ use crate::view::{
     BackupPutView, BackupResultView, BackupView, CheckView, CreatedView, DecisionView, DeniedView,
     FileBackupCreatorView, FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView,
     LockedView, PendingListView, PendingStateView, RecoveredView, RecoveryConfirmedView,
-    RemovedView, RestoreFileView, RestoreLeaseView, RevokedView, RotatedView, StatusView,
-    TargetView, UnlockedView, VerifyView,
+    RemovedView, RestoreFileView, RestoreLeaseView, RevokedView, RotatedView, ScanMatchView,
+    StatusView, TargetView, UnlockedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -797,6 +797,129 @@ pub struct VerifyEntry {
     pub value: WireSecret,
 }
 
+/// `scan.match`: candidate tokens a scan found (doctor, scrub, the
+/// first-run import, `migrate-mcp`), compared with the vault's `secret`
+/// items by keyed hash in the daemon (SPEC §6.4, §6.5; M2 plan D-32). The
+/// daemon applies its purpose's rules before comparing: no caller is told
+/// whether the vault holds a value short enough to guess unless it may
+/// give a proof and the purpose is `import`, and comparisons count against
+/// the subject root's two budgets. Candidates are wiped once compared and
+/// never stored, logged or audited; the answer names items, never values.
+#[derive(Debug)]
+pub struct ScanMatch;
+
+impl Method for ScanMatch {
+    const NAME: &'static str = "scan.match";
+    type Params = ScanMatchParams;
+    type Output = ScanMatchView;
+}
+
+/// Candidates a call compares at most. With one item holding each, its
+/// answer fits in a frame (docs/IPC.md "scan.match").
+pub const MAX_SCAN_CANDIDATES: usize = 4096;
+/// The largest candidate value, in bytes.
+pub const MAX_CANDIDATE: usize = 4096;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanMatchParams {
+    /// At most [`MAX_SCAN_CANDIDATES`], each id once.
+    pub candidates: Vec<ScanCandidate>,
+    /// Where the candidates were read, recorded in the audit entry.
+    pub source_kind: ScanSource,
+    /// What the comparison is for: required, and it decides which
+    /// candidates are compared.
+    pub purpose: ScanPurpose,
+    /// As [`UnlockParams::claims`]: who asks decides which values the
+    /// daemon compares.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// One candidate: the caller's id for it, its value and how it was read.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanCandidate {
+    pub id: u32,
+    /// 1 to [`MAX_CANDIDATE`] bytes. A password-form candidate is the
+    /// password as its server reads it (escapes decoded).
+    pub value: WireSecret,
+    pub form: CandidateForm,
+}
+
+/// How a candidate was read: a token as it stands, or the password of a
+/// URL, of Go's MySQL DSN or of a connection string's `password=` field,
+/// which the daemon counts as that form's server reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateForm {
+    Raw,
+    UrlPassword,
+    DsnPassword,
+    ConnPassword,
+}
+
+/// What a `scan.match` is for (M2 plan D-32). `import` (the first-run
+/// scan, `migrate-mcp`) follows the import rules: a value short enough to
+/// guess is compared only for a caller that may give a proof. `doctor` and
+/// `scrub` compare only values that cannot be guessed (16 characters as a
+/// server reads them, or a provider's key pattern), for every caller, so
+/// doctor never reports a short value and scrub never rewrites one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanPurpose {
+    Import,
+    Doctor,
+    Scrub,
+}
+
+impl ScanPurpose {
+    /// The purpose as its audit entry records it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ScanPurpose::Import => "import",
+            ScanPurpose::Doctor => "doctor",
+            ScanPurpose::Scrub => "scrub",
+        }
+    }
+}
+
+/// The kind of place a `scan.match` call's candidates were read: one of
+/// the places an item is marked exposed for, the two first-run import
+/// sources that are not, or `mixed` for a batch drawn from several.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanSource {
+    EnvFile,
+    ShellProfile,
+    AgentConfig,
+    ConfigBackup,
+    Transcript,
+    GitHistory,
+    SyncedFolder,
+    Aws,
+    Export,
+    Mixed,
+}
+
+impl ScanSource {
+    /// The source as its audit entry records it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ScanSource::EnvFile => "env_file",
+            ScanSource::ShellProfile => "shell_profile",
+            ScanSource::AgentConfig => "agent_config",
+            ScanSource::ConfigBackup => "config_backup",
+            ScanSource::Transcript => "transcript",
+            ScanSource::GitHistory => "git_history",
+            ScanSource::SyncedFolder => "synced_folder",
+            ScanSource::Aws => "aws",
+            ScanSource::Export => "export",
+            ScanSource::Mixed => "mixed",
+        }
+    }
+}
+
 /// `files.backup`: an encrypted backup of files about to be deleted (SPEC
 /// §6.4 "Backups"), under a key of its own wrapped under the `backup`
 /// subkey. Answered once it is on disk.
@@ -1195,7 +1318,7 @@ impl Method for BackupList {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 36] = [
+pub const CLIENT_METHODS: [&str; 37] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1219,6 +1342,7 @@ pub const CLIENT_METHODS: [&str; 36] = [
     ImportPlan::NAME,
     ImportCommit::NAME,
     ImportVerify::NAME,
+    ScanMatch::NAME,
     FilesBackup::NAME,
     FilesShow::NAME,
     FilesRestore::NAME,
@@ -1360,7 +1484,8 @@ pub enum ErrorKind {
     FilesBackupFailed,
     /// The caller's process tree had as many values compared with the
     /// vault as an hour allows (`import.plan`, `import.commit`,
-    /// `import.verify`).
+    /// `import.verify`); or, with the reason `limited`, a `scan.match`
+    /// whose budget for its candidates was spent before it compared any.
     TooManyChecks,
     /// A delivery's audit entry could not be written, so nothing was
     /// released (`files.restore`).
@@ -1760,6 +1885,9 @@ pub const REASONS: &[&str] = &[
     // A backup the vault wrote that its name did not hold once published
     // (`files_backup_failed`).
     "substituted",
+    // A comparison budget of the caller's subject root stopped `scan.match`
+    // before it compared anything (`too_many_checks`).
+    "limited",
 ];
 
 /// An error response. Built from fixed tokens only.
@@ -1771,7 +1899,8 @@ pub struct RpcError {
     /// [`ErrorKind::ManifestInvalid`], [`ErrorKind::BindingUnresolved`],
     /// [`ErrorKind::InvalidOptions`], [`ErrorKind::NoSuchItem`],
     /// [`ErrorKind::InvalidItem`], [`ErrorKind::ProofRefused`]
-    /// (`requester_terminal` only), [`ErrorKind::TooManyPending`],
+    /// (`requester_terminal` only), [`ErrorKind::TooManyChecks`] (`limited`
+    /// only, from `scan.match`), [`ErrorKind::TooManyPending`],
     /// [`ErrorKind::RestoreRefused`] and [`ErrorKind::FilesBackupFailed`]
     /// (`too_large`, a backup v2 over its caps, and `substituted`, a
     /// backup replaced under its name, or cut or written into, before it

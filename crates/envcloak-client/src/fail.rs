@@ -281,6 +281,14 @@ const REASON_TEXTS: &[(&str, &str)] = &[
         "something replaced or changed the backup inside the vault's directory before it was \
          checked in place, so it was not taken as written; nothing was deleted",
     ),
+    // A comparison budget stopped a scan (`too_many_checks` from
+    // `scan.match`): the run is incomplete.
+    (
+        "limited",
+        "this process tree has used an hour's comparisons with the vault (100,000 short values \
+         for a person's import, 2,000,000 others), so nothing more was compared and the run is \
+         incomplete; run it again later",
+    ),
 ];
 
 /// Words for `reason` on an error of `kind`: [`reason_text`], except for
