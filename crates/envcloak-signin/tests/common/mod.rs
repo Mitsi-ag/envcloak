@@ -2,16 +2,17 @@
 //! a clock, and scopes built from typed fields.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use envcloak_core::vault::ItemId;
 use envcloak_policy::Now;
 use envcloak_signin::{
-    Account, AdapterId, CheckKind, CookieDomain, CookiePartition, CookiePath, DaemonInstance,
-    DeclaredCookie, DeclaredStorage, Delivery, DeliveryMode, Environment, Epochs, Host,
-    IdentityCheck, IdentityResponse, Instance, Label, Limits, Origin, ProjectScope, Revisions,
-    Scheme, SignInScope, Site, SortedSet, Subject, Target, TargetId, Tier, TransferScope, World,
+    Account, AdapterId, CheckKind, CookieDomain, CookiePartition, CookiePath, Current,
+    DaemonInstance, DeclaredCookie, DeclaredStorage, Delivery, DeliveryMode, Environment, Epochs,
+    Host, IdentityCheck, IdentityResponse, Instance, Label, Limits, LoginNow, Origin, ProjectScope,
+    Requester, Scheme, SignInScope, Site, SortedSet, Subject, Target, TargetId, TargetNow, Tier,
+    TransferScope, World,
 };
 
 pub const DAEMON: DaemonInstance = DaemonInstance::from_bytes([7; 16]);
@@ -37,8 +38,9 @@ pub fn wall(t: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_700_000_000 + t)
 }
 
-/// The world: one set of epochs and revisions, and the processes that
-/// exited.
+/// The world: one set of epochs and revisions, the project, the login
+/// item, the target and its adapter, the limits a person edited, the
+/// processes that exited, and the process tree as the kernel reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TestWorld {
     pub epochs: Epochs,
@@ -47,7 +49,38 @@ pub struct TestWorld {
     pub adapter: u64,
     pub browser: u64,
     pub exited: BTreeSet<Instance>,
+    /// The project as the daemon opens it now: what a new request takes.
+    pub project: ProjectScope,
+    /// The project's directory no longer opens.
+    pub project_gone: bool,
+    /// The login item was deleted.
+    pub login_deleted: bool,
+    /// The login item's class now.
+    pub environment: Environment,
+    /// The target was removed.
+    pub target_removed: bool,
+    /// The target's adapter now.
+    pub adapter_id: AdapterId,
+    /// A person changed the limits a scope resolves to: from the first to
+    /// the second.
+    pub limits_edit: Option<(Limits, Limits)>,
+    /// Each process's parent, as the kernel reports it.
+    pub parents: BTreeMap<Instance, Instance>,
+    /// The processes running a known agent's executable.
+    pub agents: BTreeSet<Instance>,
 }
+
+/// The fixture's project, as the daemon first opens it.
+pub fn fixture_project() -> ProjectScope {
+    ProjectScope {
+        dir: b"/work/app".to_vec(),
+        dev: 64,
+        ino: 4242,
+        config: [0x31; 32],
+    }
+}
+
+pub const ADAPTER: AdapterId = AdapterId::from_bytes([0x51; 16]);
 
 impl TestWorld {
     pub fn new() -> Self {
@@ -62,7 +95,71 @@ impl TestWorld {
             adapter: 1,
             browser: 1,
             exited: BTreeSet::new(),
+            project: fixture_project(),
+            project_gone: false,
+            login_deleted: false,
+            environment: Environment::Test,
+            target_removed: false,
+            adapter_id: ADAPTER,
+            limits_edit: None,
+            parents: [
+                (SHELL, ROOT),
+                (MCP, SHELL),
+                (SIBLING, ROOT),
+                (OTHER_MCP, OTHER_ROOT),
+            ]
+            .into_iter()
+            .collect(),
+            agents: [ROOT, OTHER_ROOT].into_iter().collect(),
         }
+    }
+
+    /// The process between the root and the requesting instance exits: the
+    /// kernel reparents the requesting instance to init, out of the root's
+    /// tree, while both still run.
+    pub fn leave_root(&mut self) {
+        self.exited.insert(SHELL);
+        self.parents.remove(&SHELL);
+        self.parents.insert(MCP, INIT);
+    }
+
+    /// The process between the root and the requesting instance starts a
+    /// known agent's executable: an agent now sits between them.
+    pub fn agent_between(&mut self) {
+        self.agents.insert(SHELL);
+    }
+
+    /// What a scope resolved with `limits` resolves to now.
+    pub fn limits_for(&self, limits: &Limits) -> Limits {
+        match &self.limits_edit {
+            Some((from, to)) if from == limits => to.clone(),
+            _ => limits.clone(),
+        }
+    }
+
+    /// Where `requester` stands against `root` (SPEC §10b "Match" rules 3
+    /// and 4), read from the tree as a separate reading of the rules: the
+    /// root in its ancestry, pid and start time alike, and no known agent
+    /// between them, the requester included, unless the root is that
+    /// agent.
+    fn requester(&self, requester: Instance, root: Instance) -> Requester {
+        if self.exited.contains(&requester) {
+            return Requester::Exited;
+        }
+        let mut at = requester;
+        for _ in 0..64 {
+            if at == root {
+                return Requester::Covered;
+            }
+            if self.agents.contains(&at) {
+                return Requester::Uncovered;
+            }
+            match self.parents.get(&at) {
+                Some(p) if !self.exited.contains(p) => at = *p,
+                _ => return Requester::Uncovered,
+            }
+        }
+        Requester::Uncovered
     }
 }
 
@@ -71,13 +168,21 @@ impl World for TestWorld {
         self.epochs
     }
 
-    fn revisions(&self, scope: &SignInScope) -> Revisions {
-        Revisions {
-            login: self.login,
-            target: self.target,
-            adapter: self.adapter,
+    fn current(&self, scope: &SignInScope) -> Current {
+        Current {
+            project: (!self.project_gone).then(|| self.project.clone()),
+            login: (!self.login_deleted).then_some(LoginNow {
+                revision: self.login,
+                environment: self.environment,
+            }),
+            target: (!self.target_removed).then_some(TargetNow {
+                revision: self.target,
+                adapter: self.adapter_id,
+                adapter_revision: self.adapter,
+            }),
+            limits: self.limits_for(scope.limits()),
             browser: self.browser,
-            requester_alive: !self.exited.contains(&scope.delivery().requester),
+            requester: self.requester(scope.delivery().requester, scope.owner()),
         }
     }
 
@@ -86,10 +191,17 @@ impl World for TestWorld {
     }
 }
 
+/// The root: an agent.
 pub const ROOT: Instance = Instance {
     pid: 100,
     start_time: 1000,
 };
+/// A process the agent started, between it and its `envcloak mcp`.
+pub const SHELL: Instance = Instance {
+    pid: 150,
+    start_time: 1500,
+};
+/// The requesting `envcloak mcp`.
 pub const MCP: Instance = Instance {
     pid: 101,
     start_time: 1010,
@@ -106,6 +218,11 @@ pub const OTHER_ROOT: Instance = Instance {
 pub const OTHER_MCP: Instance = Instance {
     pid: 201,
     start_time: 2010,
+};
+/// The process a reparented process gets as its parent.
+pub const INIT: Instance = Instance {
+    pid: 1,
+    start_time: 0,
 };
 
 pub const LOGIN: [u8; 16] = [0x11; 16];
@@ -206,12 +323,7 @@ fn base_scope(spec: &Spec, world: &TestWorld) -> SignInScope {
             root: spec.root,
             evidence: [0x21; 32],
         },
-        ProjectScope {
-            dir: b"/work/app".to_vec(),
-            dev: 64,
-            ino: 4242,
-            config: [0x31; 32],
-        },
+        world.project.clone(),
         Account {
             login_item: ItemId::from_bytes(LOGIN),
             authorization_revision: world.login,
@@ -223,7 +335,7 @@ fn base_scope(spec: &Spec, world: &TestWorld) -> SignInScope {
         Target {
             id: TargetId::from_bytes([0x41; 16]),
             revision: world.target,
-            adapter: AdapterId::from_bytes([0x51; 16]),
+            adapter: world.adapter_id,
             adapter_revision: world.adapter,
             entry_origins: SortedSet::new(vec![app.clone()]).unwrap(),
             identity_check: IdentityCheck {
@@ -244,14 +356,16 @@ fn base_scope(spec: &Spec, world: &TestWorld) -> SignInScope {
             requester: spec.requester,
             browser: world.browser,
         },
-        Limits::new(
-            spec.tier,
-            spec.attempts,
-            spec.approval,
-            spec.attempt_timeout,
-            spec.session_lifetime,
-        )
-        .unwrap(),
+        world.limits_for(
+            &Limits::new(
+                spec.tier,
+                spec.attempts,
+                spec.approval,
+                spec.attempt_timeout,
+                spec.session_lifetime,
+            )
+            .unwrap(),
+        ),
         world.epochs,
     )
     .unwrap()
@@ -327,10 +441,6 @@ pub fn varied(s: &SignInScope, v: Vary) -> Option<SignInScope> {
     let (mut tier, mut attempts) = (l.tier(), l.attempts());
     let (mut approval, mut timeout, mut lifetime) =
         (l.approval(), l.attempt_timeout(), l.session_lifetime());
-    let other = |i: Instance| Instance {
-        pid: i.pid.wrapping_add(1),
-        start_time: i.start_time,
-    };
     let mut cookies: Vec<DeclaredCookie> = target.transfer.cookies.iter().cloned().collect();
     let mut storage: Vec<DeclaredStorage> = target.transfer.storage.iter().cloned().collect();
     let mut origins: Vec<Origin> = target.entry_origins.iter().cloned().collect();
@@ -343,7 +453,10 @@ pub fn varied(s: &SignInScope, v: Vary) -> Option<SignInScope> {
         .position(|c| c.partition != CookiePartition::Unpartitioned)
         .expect("a partitioned cookie");
     match v {
-        Vary::Field(1) => subject.root = other(subject.root),
+        // Another root of the same requesting instance: the process between
+        // them (or the agent above it), so the scope stays one a grant
+        // rooted there covers.
+        Vary::Field(1) => subject.root = if subject.root == SHELL { ROOT } else { SHELL },
         Vary::Field(2) => subject.evidence[31] ^= 1,
         Vary::Field(3) => project.dir.push(b'x'),
         Vary::Field(4) => project.dev ^= 1,
@@ -397,7 +510,14 @@ pub fn varied(s: &SignInScope, v: Vary) -> Option<SignInScope> {
             origin: origins[0].clone(),
             key: label("extra"),
         }),
-        Vary::Field(22) => delivery.requester = other(delivery.requester),
+        // Another requesting instance in the same root.
+        Vary::Field(22) => {
+            delivery.requester = if delivery.requester == SIBLING {
+                MCP
+            } else {
+                SIBLING
+            }
+        }
         Vary::Field(23) => delivery.browser ^= 1,
         Vary::Field(24) => {
             tier = match tier {

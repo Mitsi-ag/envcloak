@@ -10,12 +10,13 @@
 //! own id is allowed (the positive control) and another live attempt's
 //! id, another generation's supervisor, a client in the owner root and a
 //! sibling client are refused, each leaving the whole store as it was.
-//! Both attempts run on different logins with different generations.
+//! Both attempts run on different accounts with different generations.
 //!
 //! Cleanup: for each stop (cancel, the owner's end, the worker's failure),
 //! with the close first reported failed or not, and confirmed before or
 //! after the retry window: exactly one teardown is asked for; an attempt
-//! queued on the same login does not start until the close is confirmed;
+//! queued on the same account does not start until the close is confirmed,
+//! while an attempt on another account keeps running;
 //! reports for another generation, another request or an unknown one are
 //! discarded and change nothing; an unconfirmed close outlives the retry
 //! window; only the exact confirmation starts exactly one new generation;
@@ -31,7 +32,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use common::{DAEMON, ROOT, SIBLING, Spec, TestWorld, at, identity, scope};
+use common::{DAEMON, ROOT, SIBLING, Spec, TestWorld, at, identity, label, scope};
 use envcloak_core::vault::ItemId;
 use envcloak_signin::{
     AttemptFailure, Channel, Cleanup, Discarded, Effect, Fresh, Lookup, Nonce, Operation,
@@ -69,9 +70,12 @@ fn take(store: &mut OperationStore, ids: &mut Ids) -> Vec<Effect> {
     effects
 }
 
-fn separate_login(original: &SignInScope) -> SignInScope {
+/// Another login item for another account at the same app: an attempt
+/// the first one's never waits for.
+fn separate_account(original: &SignInScope) -> SignInScope {
     let mut account = original.account().clone();
     account.login_item = ItemId::from_bytes([0x55; 16]);
+    account.account = label("viewer@fixture.test");
     SignInScope::new(
         original.subject().clone(),
         original.project().clone(),
@@ -95,7 +99,7 @@ fn reserve(
     let id = RequestId::from_bytes([tag; 16]);
     let normal = scope(spec, world);
     let sc = if separate {
-        separate_login(&normal)
+        separate_account(&normal)
     } else {
         normal
     };

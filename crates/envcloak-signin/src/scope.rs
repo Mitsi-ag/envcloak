@@ -947,6 +947,33 @@ impl SignInScope {
         self.subject.root
     }
 
+    /// Whether an attempt for `other` may sign in to the same account at
+    /// the app as an attempt for this scope (SPEC §6.8: "Attempts on one
+    /// account are serialised"): the same login item, or the same expected
+    /// account at the same target or at a credential-entry origin both
+    /// name, whatever the login item, the tenant or the role. The account
+    /// is compared ignoring ASCII case. Wider than one login item on
+    /// purpose, since the app tells accounts apart and not login items:
+    /// two items registered for one account, one account under two
+    /// targets of the same app, an account spelled in another case, or in
+    /// another tenant, are one account to it. Serializing two attempts
+    /// that are not costs only waiting.
+    pub fn shares_account(&self, other: &SignInScope) -> bool {
+        let (a, b) = (&self.account, &other.account);
+        if a.login_item == b.login_item {
+            return true;
+        }
+        if !a.account.as_str().eq_ignore_ascii_case(b.account.as_str()) {
+            return false;
+        }
+        self.target.id == other.target.id
+            || self
+                .target
+                .entry_origins
+                .iter()
+                .any(|o| other.target.entry_origins.iter().any(|p| p == o))
+    }
+
     /// The canonical encoding. See the module documentation.
     pub fn encode(&self) -> Vec<u8> {
         // Every field is named here, so a field added to a part and not

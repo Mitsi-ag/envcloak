@@ -13,17 +13,18 @@ use std::time::Duration;
 
 use common::{
     DAEMON, MCP, OTHER_MCP, OTHER_ROOT, ROOT, SIBLING, Spec, TestWorld, Vary, at, clock, identity,
-    scope, variations, varied,
+    label, origin, scope, variations, varied,
 };
 use envcloak_policy::Now;
 use envcloak_signin::store::STATEMENT_TTL;
 use envcloak_signin::{
-    ApproveError, AttemptError, AttemptFailure, Authorization, AuthorizationId, Channel,
-    ChannelRefused, Checkpoint, Cleanup, DaemonInstance, Deadline, Discarded, Effect, Fresh,
-    Generation, Instance, Lookup, Nonce, NotFound, Operation, OperationKey, OperationStore,
-    Options, Phase, PublishDecision, RETRY_WINDOW, Refusal, Request, RequestError, RequestId,
-    Revisions, Revocation, SignInScope, SignInStatement, State, Status, Step, StopReason,
-    StoreLimits, SupervisorId, WorkerId, publication_decision,
+    AdapterId, ApproveError, AttemptError, AttemptFailure, Authorization, AuthorizationId, Channel,
+    ChannelRefused, Checkpoint, Cleanup, Current, DaemonInstance, Deadline, Discarded, Effect,
+    Environment, Fresh, Generation, Instance, Limits, Lookup, Nonce, NotFound, Operation,
+    OperationKey, OperationStore, Options, Phase, PublishDecision, RETRY_WINDOW, Refusal, Request,
+    RequestError, RequestId, Requester, Revocation, Scheme, SignInScope, SignInStatement,
+    SortedSet, State, Status, Step, StopReason, StoreLimits, SupervisorId, TargetId, WorkerId,
+    publication_decision,
 };
 
 struct H {
@@ -637,6 +638,191 @@ fn attempts_on_one_login_are_serialized() {
     assert_eq!(h.op(&c).phase(), Phase::AttemptRunning);
 }
 
+/// `scope` for another login item, with its account, target and origin
+/// changed as `edit` says.
+fn another_item(
+    h: &H,
+    edit: impl Fn(&mut envcloak_signin::Account, &mut envcloak_signin::Target),
+) -> SignInScope {
+    let s = h.scope(&Spec::dev());
+    let mut account = s.account().clone();
+    let mut target = s.target().clone();
+    account.login_item = envcloak_core::vault::ItemId::from_bytes([0x66; 16]);
+    edit(&mut account, &mut target);
+    SignInScope::new(
+        s.subject().clone(),
+        s.project().clone(),
+        account,
+        target,
+        s.delivery().clone(),
+        s.limits().clone(),
+        *s.epochs(),
+    )
+    .unwrap()
+}
+
+/// Attempts on one account are serialized whatever login item names it
+/// (SPEC §6.8 "Attempts on one account are serialised"): a second item
+/// for the same account at the same target (a duplicate registration), in
+/// another tenant, spelled in another case, or under another target id
+/// that shares a credential-entry origin, waits until the running attempt
+/// captured, or stopped with its teardown confirmed. The positive
+/// controls: another account at the same target, and the same account
+/// name at another app (another target, no shared origin), start at once.
+/// Mutation: "attempts serialized per login item".
+#[test]
+fn attempts_on_one_account_are_serialized() {
+    type Edit = fn(&mut envcloak_signin::Account, &mut envcloak_signin::Target);
+    let same: [(&str, Edit); 4] = [
+        ("a duplicate item", |_, _| {}),
+        ("another tenant", |a, _| a.tenant = Some(label("globex"))),
+        ("another case", |a, _| {
+            a.account = label("Editor@Fixture.TEST");
+        }),
+        ("another target sharing an origin", |_, t| {
+            t.id = TargetId::from_bytes([0x42; 16]);
+        }),
+    ];
+    let other: [(&str, Edit); 2] = [
+        ("another account", |a, _| {
+            a.account = label("viewer@fixture.test");
+        }),
+        ("the same name at another app", |_, t| {
+            t.id = TargetId::from_bytes([0x42; 16]);
+            t.entry_origins =
+                SortedSet::new(vec![origin(Scheme::Https, "other.example", 443)]).unwrap();
+        }),
+    ];
+    for (n, edit) in same {
+        let mut h = H::new();
+        let a = h.running("a", &Spec::dev(), long());
+        let s = another_item(&h, edit);
+        assert!(s.shares_account(h.op(&a).scope()), "{n}");
+        let b = match h.request("b", s).unwrap() {
+            Lookup::Reserved(st) => st.request,
+            got => panic!("{n}: {got:?}"),
+        };
+        h.approve(&b, long()).unwrap();
+        assert_eq!(h.op(&b).phase(), Phase::Approved, "{n}");
+        // A failed close holds the account too.
+        let wa = h.worker(&a);
+        let (now, w) = (h.now(), h.world.clone());
+        h.store
+            .worker_failed(&a, &wa, AttemptFailure::WorkerLost, &now, &w)
+            .unwrap();
+        h.store.cleanup_result(&a, &wa, false, &now, &w).unwrap();
+        assert_eq!(h.op(&b).phase(), Phase::Approved, "{n}");
+        h.store.cleanup_result(&a, &wa, true, &now, &w).unwrap();
+        assert_eq!(h.op(&b).phase(), Phase::AttemptRunning, "{n}");
+        // And a capture frees it.
+        let mut h = H::new();
+        let a = h.running("a", &Spec::dev(), long());
+        let b = match h.request("b", another_item(&h, edit)).unwrap() {
+            Lookup::Reserved(st) => st.request,
+            got => panic!("{n}: {got:?}"),
+        };
+        h.approve(&b, long()).unwrap();
+        assert_eq!(h.op(&b).phase(), Phase::Approved, "{n}");
+        h.captured(&a);
+        assert_eq!(h.op(&b).phase(), Phase::AttemptRunning, "{n}");
+    }
+    for (n, edit) in other {
+        let mut h = H::new();
+        let a = h.running("a", &Spec::dev(), long());
+        let s = another_item(&h, edit);
+        assert!(!s.shares_account(h.op(&a).scope()), "{n}");
+        let b = match h.request("b", s).unwrap() {
+            Lookup::Reserved(st) => st.request,
+            got => panic!("{n}: {got:?}"),
+        };
+        h.approve(&b, long()).unwrap();
+        assert_eq!(h.op(&b).phase(), Phase::AttemptRunning, "{n}");
+        assert_eq!(h.op(&a).phase(), Phase::AttemptRunning, "{n}");
+    }
+}
+
+/// `grants revoke <id>` for a sign-in authorization (SPEC §10b: any client
+/// may revoke; tightening needs no proof): its delivered session, its
+/// running attempt and its queued operation stop with `revoked`, their
+/// teardowns are asked for (delivered as each was), and it covers no new
+/// key; another authorization is untouched: its delivered session's check
+/// passes, its running attempt takes its password, and it still covers a
+/// new key of its own scope. Revoking it again, an unknown id, or after
+/// the lock changes nothing. Mutations: "revoke leaves the authorization
+/// in force", "revoke stops no operation", "revoke stops every operation".
+#[test]
+fn revoking_one_authorization_ends_only_what_it_authorizes() {
+    let editor = Spec::dev();
+    let admin = Spec {
+        role: "admin",
+        ..Spec::dev()
+    };
+    let mut h = H::new();
+    // Five credits: three are taken below, so a refusal to cover a new key
+    // is never a spent budget.
+    let opts = Options::Dev {
+        window: Duration::from_secs(7200),
+        attempts: 5,
+    };
+    let delivered = h.delivered("a", &editor, opts);
+    // The other authorization, for another role.
+    let kept = h.delivered("d", &admin, opts);
+    let running = h.open("b", &editor);
+    let queued = h.open("c", &editor);
+    let auth = h.op(&delivered).authorization().unwrap();
+    let kept_auth = h.op(&kept).authorization().unwrap();
+    assert_ne!(kept_auth, auth);
+    assert_eq!(h.op(&running).authorization(), Some(auth));
+    assert_eq!(h.op(&running).phase(), Phase::AttemptRunning);
+    assert_eq!(h.op(&queued).authorization(), Some(auth));
+    assert_eq!(h.op(&queued).phase(), Phase::Approved);
+    assert_eq!(h.store.authorization(&auth).unwrap().remaining(), 2);
+    h.drain();
+    let (now, w) = (h.now(), h.world.clone());
+    assert!(h.store.revoke(&auth, &now, &w));
+    let mut teardowns = h.teardowns();
+    teardowns.sort();
+    let mut want = vec![(delivered, true), (running, false)];
+    want.sort();
+    assert_eq!(teardowns, want);
+    for (id, state) in [
+        (delivered, State::Ended),
+        (running, State::Failed),
+        (queued, State::Failed),
+    ] {
+        let st = h.status(&id);
+        assert_eq!(
+            (st.state, st.receipt.reason),
+            (state, Some(StopReason::Revoked))
+        );
+    }
+    assert!(!h.in_force(&auth));
+    assert_eq!(h.check_call(&delivered), Err(ChannelRefused));
+    // Nothing else changed.
+    assert!(h.in_force(&kept_auth));
+    assert_eq!(h.check_call(&kept), Ok(()));
+    assert_eq!(h.op(&kept).stop(), None);
+    // A new key of the revoked scope asks for a proof; one of the kept
+    // scope is covered and runs once the account is free.
+    let again = h.open("e", &editor);
+    assert_eq!(h.op(&again).authorization(), None);
+    assert_eq!(h.op(&again).phase(), Phase::PendingApproval);
+    let more = h.open("f", &admin);
+    assert_eq!(h.op(&more).authorization(), Some(kept_auth));
+    // Revoking again, or an unknown id, changes nothing.
+    let before = h.store.clone();
+    let (now, w) = (h.now(), h.world.clone());
+    assert!(!h.store.revoke(&auth, &now, &w));
+    assert!(!h.store.revoke(&AuthorizationId::new(999), &now, &w));
+    assert_eq!(h.store, before);
+    // `--all` ends the rest.
+    assert_eq!(h.store.revoke_all(&now, &w), 1);
+    assert!(!h.in_force(&kept_auth));
+    assert_eq!(h.check_call(&kept), Err(ChannelRefused));
+    assert_eq!(h.status(&kept).receipt.reason, Some(StopReason::Revoked));
+    assert_eq!(h.store.revoke_all(&now, &w), 0);
+}
+
 /// A change of the login's authorization revision ends its pending
 /// statements and authorizations, stops its attempts and tears down its
 /// delivered contexts, unlike a key rotation (R-M2b-17).
@@ -691,35 +877,83 @@ fn a_revision_change_ends_everything_bound_to_it() {
     assert_eq!(h.approve(&pending, dev(3)), Err(ApproveError::NotPending));
 }
 
-/// A target edit or a browser replacement while the proof is checked:
-/// the statement is no longer shown, the stale proof mints nothing, and
-/// nothing reaches the changed target (R-M2b-44, R-M2b-51, SI-05; L-09).
-/// Mutations: "statement without settle", "approve without settle".
+/// Any change of the world while the proof is checked (a target edit, a
+/// browser replacement, the requester leaving the root's tree or an agent
+/// coming between them, the project replaced, the login item deleted, ...)
+/// is seen before the authorization: the statement is no longer shown, the
+/// stale proof mints nothing, nothing reaches the changed target, and the
+/// operation reads the change's reason (R-M2b-44, R-M2b-51, SI-05; L-09;
+/// SPEC §10b "Match" rules 3 to 5). Mutations: "statement without settle",
+/// "approve without settle", "the world's subject, project, login item,
+/// target or limits left out of the freshness check".
 #[test]
 fn a_stale_proof_mints_nothing() {
-    for change in [
-        |w: &mut TestWorld| w.target += 1,
-        |w: &mut TestWorld| w.browser += 1,
-        |w: &mut TestWorld| w.adapter += 1,
-        |w: &mut TestWorld| w.epochs.policy += 1,
-    ] {
+    for c in world_changes() {
+        let n = c.name;
         // Not shown any more: the change stopped it at that call.
         let mut h = H::new();
         let id = h.open("k", &Spec::dev());
-        assert!(h.statement(&id, dev(2)).is_some());
-        change(&mut h.world);
-        assert!(h.statement(&id, dev(2)).is_none());
+        assert!(h.statement(&id, dev(2)).is_some(), "{n}");
+        (c.apply)(&mut h, &id);
+        assert!(h.statement(&id, dev(2)).is_none(), "{n}");
         // A proof checked meanwhile is refused by the approval itself.
         let mut h = H::new();
         let id = h.open("k", &Spec::dev());
         let digest = h.statement(&id, dev(2)).unwrap().digest();
-        change(&mut h.world);
+        (c.apply)(&mut h, &id);
         let got = h
             .store
             .approve(&id, dev(2), &digest, &h.now(), &h.world.clone());
-        assert_eq!(got, Err(ApproveError::NotPending));
-        assert_eq!(h.store.authorizations().count(), 0);
-        assert!(h.drain().is_empty());
+        assert_eq!(got, Err(ApproveError::NotPending), "{n}");
+        assert_eq!(h.store.authorizations().count(), 0, "{n}");
+        assert!(h.drain().is_empty(), "{n}");
+        assert_eq!(h.status(&id).receipt.reason, Some(c.reason), "{n}");
+    }
+    // The positive control: with no change the same proof approves.
+    let mut h = H::new();
+    let id = h.open("k", &Spec::dev());
+    let digest = h.statement(&id, dev(2)).unwrap().digest();
+    let (now, w) = (h.now(), h.world.clone());
+    assert!(h.store.approve(&id, dev(2), &digest, &now, &w).is_ok());
+}
+
+/// A `dev` authorization covers no new key once the world no longer holds
+/// what its scope took, though the key's scope is exactly its own (as a
+/// request the daemon resolved before the change and passed after it):
+/// the authorization ended at that call, the new operation waits for a
+/// proof and is stopped for the change's reason, and no credit is taken
+/// (SPEC §10b "Match": a sign-in is matched after rules 1 to 4, and rule
+/// 5's project). The positive control: with no change the key is covered.
+/// Mutation: "settle ends no authorization the world made stale".
+#[test]
+fn a_changed_world_covers_no_new_key() {
+    let spec = Spec::dev();
+    let mut h = H::new();
+    let a = h.running("a", &spec, long());
+    let auth = h.op(&a).authorization().unwrap();
+    let covered = h.open("b", &spec);
+    assert_eq!(h.op(&covered).authorization(), Some(auth));
+    for c in world_changes() {
+        let n = c.name;
+        let mut h = H::new();
+        let a = h.running("a", &spec, long());
+        let auth = h.op(&a).authorization().unwrap();
+        let s = h.scope(&spec);
+        (c.apply)(&mut h, &a);
+        let b = match h.request("b", s) {
+            Ok(Lookup::Reserved(st)) => st.request,
+            got => panic!("{n}: {got:?}"),
+        };
+        assert_eq!(h.op(&b).authorization(), None, "{n}");
+        assert_eq!(h.op(&b).phase(), Phase::PendingApproval, "{n}");
+        assert_eq!(h.status(&b).receipt.reason, Some(c.reason), "{n}");
+        assert!(!h.in_force(&auth), "{n}");
+        assert!(
+            h.store
+                .authorization(&auth)
+                .is_none_or(|x| x.remaining() == 1),
+            "{n}"
+        );
     }
 }
 
@@ -1136,6 +1370,13 @@ impl H {
     }
 }
 
+/// Revokes the authorization `id` holds, as any client may.
+fn revoke_own(h: &mut H, id: &RequestId) {
+    let auth = h.op(id).authorization().unwrap();
+    let (now, w) = (h.now(), h.world.clone());
+    assert!(h.store.revoke(&auth, &now, &w));
+}
+
 /// A change made with no call: the next call is the first to see it, as
 /// when the world moves at a barrier before a worker, driver or supervisor
 /// message (b9, b17). Owner calls are changes too, made through the store.
@@ -1156,8 +1397,39 @@ fn world_change(name: &'static str, apply: fn(&mut H, &RequestId), reason: StopR
     }
 }
 
-/// What ends an operation in any phase, with no call.
+/// What ends an operation in any phase, with no call: every change of
+/// the world.
 fn silent_changes() -> Vec<Change> {
+    let mut v = world_changes();
+    v.push(Change {
+        name: "authorization window",
+        apply: |h, _| h.pass(600),
+        reason: StopReason::AuthorizationEnded,
+        options: short(),
+    });
+    v
+}
+
+/// The limits [`Spec::dev`] resolves to, with the session lifetime one
+/// second shorter: a person edited them.
+fn edited_limits(h: &mut H) {
+    let l = h.scope(&Spec::dev()).limits().clone();
+    let shorter = Limits::new(
+        l.tier(),
+        l.attempts(),
+        l.approval(),
+        l.attempt_timeout(),
+        l.session_lifetime() - Duration::from_secs(1),
+    )
+    .unwrap();
+    h.world.limits_edit = Some((l, shorter));
+}
+
+/// Every change of the world (not the clock) that ends what a scope
+/// authorizes: each item of SPEC §10b's "A grant ends on" and "Match"
+/// rules 1 to 5 the world can change, and each part of §6.8's sign-in
+/// scope taken from the world.
+fn world_changes() -> Vec<Change> {
     vec![
         world_change(
             "root exit",
@@ -1203,12 +1475,66 @@ fn silent_changes() -> Vec<Change> {
             |h, _| h.world.browser += 1,
             StopReason::RecipientReplaced,
         ),
-        Change {
-            name: "authorization window",
-            apply: |h, _| h.pass(600),
-            reason: StopReason::AuthorizationEnded,
-            options: short(),
-        },
+        world_change(
+            "requester left the root's tree",
+            |h, _| h.world.leave_root(),
+            StopReason::SubjectIneligible,
+        ),
+        world_change(
+            "an agent between the root and the requester",
+            |h, _| h.world.agent_between(),
+            StopReason::SubjectIneligible,
+        ),
+        world_change(
+            "project replaced",
+            |h, _| h.world.project.ino += 1,
+            StopReason::ProjectChanged,
+        ),
+        world_change(
+            "project on another device",
+            |h, _| h.world.project.dev += 1,
+            StopReason::ProjectChanged,
+        ),
+        world_change(
+            "project moved",
+            |h, _| h.world.project.dir.push(b'2'),
+            StopReason::ProjectChanged,
+        ),
+        world_change(
+            "project gone",
+            |h, _| h.world.project_gone = true,
+            StopReason::ProjectChanged,
+        ),
+        world_change(
+            "sign-in configuration changed",
+            |h, _| h.world.project.config[0] ^= 1,
+            StopReason::ProjectChanged,
+        ),
+        world_change(
+            "login item deleted",
+            |h, _| h.world.login_deleted = true,
+            StopReason::RevisionChanged,
+        ),
+        world_change(
+            "login item made live",
+            |h, _| h.world.environment = Environment::Live,
+            StopReason::RevisionChanged,
+        ),
+        world_change(
+            "target removed",
+            |h, _| h.world.target_removed = true,
+            StopReason::RevisionChanged,
+        ),
+        world_change(
+            "adapter replaced",
+            |h, _| h.world.adapter_id = AdapterId::from_bytes([0x52; 16]),
+            StopReason::RevisionChanged,
+        ),
+        world_change(
+            "limits edited",
+            |h, _| edited_limits(h),
+            StopReason::LimitsChanged,
+        ),
     ]
 }
 
@@ -1277,6 +1603,7 @@ fn a_credential_step_needs_a_running_attempt_at_that_call() {
             },
             StopReason::Locked,
         ),
+        world_change("revoke", revoke_own, StopReason::Revoked),
     ]);
     for c in stops {
         let mut h = H::new();
@@ -1465,9 +1792,14 @@ fn a_retry_sees_the_store_as_it_stands_at_the_retry() {
 /// `publication_decision` on its own, one refusal at a time, each against
 /// a checkpoint that publishes (the positive control): the stop, the
 /// generation, the injected state, the identity, the root, the three
-/// epochs, the three revisions, the recipient, the attempt's deadline and
-/// the authorization (plan M2b-01 Interfaces; R-M2b-28, R-M2b-46).
-/// Mutations: each check dropped in turn.
+/// epochs, everything the scope took from the world (the project's
+/// directory, device, inode and configuration, or a project that no
+/// longer opens; the login item's revision and class, or a deleted item;
+/// the target's revision, adapter and adapter revision, or a removed
+/// target; the limits; the browser; the requesting instance exited, out
+/// of the root's tree or behind an agent), the attempt's deadline and the
+/// authorization (plan M2b-01 Interfaces; R-M2b-28, R-M2b-46; SPEC §10b
+/// "Match" rules 3 to 5). Mutations: each check dropped in turn.
 #[test]
 fn the_publication_decision_refuses_each_reason_on_its_own() {
     use PublishDecision::{Publish, Refuse};
@@ -1489,7 +1821,7 @@ fn the_publication_decision_refuses_each_reason_on_its_own() {
     let base = Checkpoint {
         now: h.now(),
         epochs: h.world.epochs,
-        revisions: Revisions::of(op.scope()),
+        current: Current::of(op.scope()),
         root_alive: true,
     };
     assert_eq!(
@@ -1540,12 +1872,12 @@ fn the_publication_decision_refuses_each_reason_on_its_own() {
         Refuse(Refusal::IdentityUnverified)
     );
     let with = |f: fn(&mut Checkpoint)| {
-        let mut c = base;
+        let mut c = base.clone();
         f(&mut c);
         c
     };
     type Edit = fn(&mut Checkpoint);
-    let cases: [(Edit, Refusal); 9] = [
+    let cases: [(Edit, Refusal); 21] = [
         (|c| c.root_alive = false, Refusal::RootExited),
         (|c| c.epochs.vault += 1, Refusal::EpochChanged),
         (|c| c.epochs.policy += 1, Refusal::EpochChanged),
@@ -1553,13 +1885,81 @@ fn the_publication_decision_refuses_each_reason_on_its_own() {
             |c| c.epochs.daemon = DaemonInstance::from_bytes([9; 16]),
             Refusal::EpochChanged,
         ),
-        (|c| c.revisions.login += 1, Refusal::RevisionChanged),
-        (|c| c.revisions.target += 1, Refusal::RevisionChanged),
-        (|c| c.revisions.adapter += 1, Refusal::RevisionChanged),
-        (|c| c.revisions.browser += 1, Refusal::RecipientChanged),
         (
-            |c| c.revisions.requester_alive = false,
+            |c| c.current.project.as_mut().unwrap().dir.push(b'x'),
+            Refusal::ProjectChanged,
+        ),
+        (
+            |c| c.current.project.as_mut().unwrap().dev ^= 1,
+            Refusal::ProjectChanged,
+        ),
+        (
+            |c| c.current.project.as_mut().unwrap().ino ^= 1,
+            Refusal::ProjectChanged,
+        ),
+        (
+            |c| c.current.project.as_mut().unwrap().config[0] ^= 1,
+            Refusal::ProjectChanged,
+        ),
+        (|c| c.current.project = None, Refusal::ProjectChanged),
+        (
+            |c| c.current.login.as_mut().unwrap().revision += 1,
+            Refusal::RevisionChanged,
+        ),
+        (
+            |c| c.current.login.as_mut().unwrap().environment = Environment::Live,
+            Refusal::RevisionChanged,
+        ),
+        (|c| c.current.login = None, Refusal::RevisionChanged),
+        (
+            |c| c.current.target.as_mut().unwrap().revision += 1,
+            Refusal::RevisionChanged,
+        ),
+        (
+            |c| c.current.target.as_mut().unwrap().adapter_revision += 1,
+            Refusal::RevisionChanged,
+        ),
+        (
+            |c| c.current.target.as_mut().unwrap().adapter = AdapterId::from_bytes([9; 16]),
+            Refusal::RevisionChanged,
+        ),
+        (|c| c.current.target = None, Refusal::RevisionChanged),
+        (
+            |c| {
+                let l = &c.current.limits;
+                c.current.limits = Limits::new(
+                    l.tier(),
+                    l.attempts(),
+                    l.approval(),
+                    l.attempt_timeout() + Duration::from_secs(1),
+                    l.session_lifetime(),
+                )
+                .unwrap();
+            },
+            Refusal::LimitsChanged,
+        ),
+        (
+            |c| {
+                let l = &c.current.limits;
+                c.current.limits = Limits::new(
+                    l.tier(),
+                    l.attempts() - 1,
+                    l.approval(),
+                    l.attempt_timeout(),
+                    l.session_lifetime(),
+                )
+                .unwrap();
+            },
+            Refusal::LimitsChanged,
+        ),
+        (|c| c.current.browser += 1, Refusal::RecipientChanged),
+        (
+            |c| c.current.requester = Requester::Exited,
             Refusal::RecipientChanged,
+        ),
+        (
+            |c| c.current.requester = Requester::Uncovered,
+            Refusal::SubjectIneligible,
         ),
     ];
     for (f, why) in cases {
@@ -1569,7 +1969,10 @@ fn the_publication_decision_refuses_each_reason_on_its_own() {
         );
     }
     // The attempt's deadline: 900 s after it started at 0.
-    let late = |t| Checkpoint { now: at(t), ..base };
+    let late = |t| Checkpoint {
+        now: at(t),
+        ..base.clone()
+    };
     assert_eq!(
         publication_decision(&op, Some(&auth), g, &me, &late(899)),
         Publish
@@ -1592,9 +1995,9 @@ fn the_publication_decision_refuses_each_reason_on_its_own() {
         Publish
     );
     for (a, at) in [
-        (None, base),
-        (Some(&another), base),
-        (Some(&ended), base),
+        (None, base.clone()),
+        (Some(&another), base.clone()),
+        (Some(&ended), base.clone()),
         (Some(&short_window), late(600)),
     ] {
         assert_eq!(
@@ -2049,6 +2452,8 @@ fn debug_output_holds_no_key_label_host_or_path() {
     );
     assert_eq!(found(&plain), markers.len() - 1);
     let mut h = H::new();
+    h.world.project = scope.project().clone();
+    h.world.adapter_id = scope.target().adapter;
     let id = match h.request("intent-marker-55aa", scope.clone()).unwrap() {
         Lookup::Reserved(st) => st.request,
         other => panic!("{other:?}"),
@@ -2060,7 +2465,16 @@ fn debug_output_holds_no_key_label_host_or_path() {
         tenant: None,
         role: l("role-marker-5b6a"),
     };
-    let all = format!("{:?} {st:?} {scope:?} {statement:?} {who:?}", h.store);
+    let at = Checkpoint {
+        now: h.now(),
+        epochs: h.world.epochs,
+        current: Current::of(&scope),
+        root_alive: true,
+    };
+    let all = format!(
+        "{:?} {st:?} {scope:?} {statement:?} {who:?} {at:?}",
+        h.store
+    );
     assert_eq!(found(&all), 0, "{all}");
     assert!(all.contains("OperationKey(..)"));
 }

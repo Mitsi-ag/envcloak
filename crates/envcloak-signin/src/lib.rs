@@ -18,12 +18,14 @@
 //!   [`Deadline`] and [`CreditLease`]s that are never refunded (R-M2b-15,
 //!   R-M2b-16).
 //! - [`operation`]: one [`Operation`], its [`Phase`]s, the attempt's
-//!   [`WorkerId`], the generation's supervisor [`Channel`] and
+//!   [`WorkerId`], the generation's supervisor [`Channel`], the
+//!   [`Current`] state of what a scope took from the world and
 //!   [`publication_decision`] (R-M2b-27, R-M2b-28).
 //! - [`status`]: the allowlisted [`Status`] with its revision (R-M2b-08).
 //! - [`store`]: the [`OperationStore`]: retries and conflicts, owners,
 //!   bounds, approvals, the worker's and the supervisor's messages, lock,
-//!   root exit, epochs, revisions and the clock (R-M2b-13, R-M2b-17).
+//!   revocation, root exit, epochs, the world's changes and the clock
+//!   (R-M2b-13, R-M2b-17).
 //!
 //! The TOTP function joins with plan task M2b-03. The contract's
 //! invariants are checked by exhaustive enumeration of event orderings in
@@ -40,9 +42,9 @@ pub use authorization::{
     Authorization, AuthorizationId, AuthorizationKind, BudgetError, CreditLease, Deadline,
 };
 pub use operation::{
-    AttemptFailure, Channel, Checkpoint, Cleanup, Generation, IdentityResponse, Operation, Phase,
-    PublishDecision, RETRY_WINDOW, Refusal, Revisions, Stop, StopReason, SupervisorId, WorkerId,
-    publication_decision,
+    AttemptFailure, Channel, Checkpoint, Cleanup, Current, Generation, IdentityResponse, LoginNow,
+    Operation, Phase, PublishDecision, RETRY_WINDOW, Refusal, Requester, Stop, StopReason,
+    SupervisorId, TargetNow, WorkerId, publication_decision,
 };
 pub use scope::{
     Account, AdapterId, CheckKind, CookieDomain, CookiePartition, CookiePath, DaemonInstance,
