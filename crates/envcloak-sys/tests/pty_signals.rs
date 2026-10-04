@@ -339,31 +339,33 @@ fn spike_d(forced: bool) {
                 assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "SIG{name}: {e}");
                 #[cfg(target_os = "linux")]
                 {
-                    let job = monitor
-                        .session()
-                        .unwrap()
-                        .foreground_job(screen.master())
-                        .unwrap();
-                    assert_eq!(
-                        i32::try_from(job.group_id()).unwrap(),
-                        job_group,
-                        "SIG{name}: the bound job is the job"
-                    );
-                    if narrowed(sig) {
-                        let refused = job.signal(sig).unwrap_err();
-                        assert_eq!(
-                            envcloak_sys::owned::NoJob::of(&refused),
-                            Some(envcloak_sys::owned::NoJob::Unsupported),
-                            "SIG{name}: {refused}"
-                        );
-                        SignalRoute::CommandGroup
-                    } else {
-                        job.signal(sig).unwrap();
-                        assert!(
-                            wait_lines(&file, before + 1, DEADLINE),
-                            "the session delivery took SIG{name} but the job did not count it"
-                        );
-                        SignalRoute::Session
+                    match bind_foreground(&monitor, screen.master(), narrowing) {
+                        // No pidfd_open: refused at the binding, narrowed.
+                        None => SignalRoute::CommandGroup,
+                        Some(job) => {
+                            assert_eq!(
+                                i32::try_from(job.group_id()).unwrap(),
+                                job_group,
+                                "SIG{name}: the bound job is the job"
+                            );
+                            if narrowed(sig) {
+                                let refused = job.signal(sig).unwrap_err();
+                                assert_eq!(
+                                    envcloak_sys::owned::NoJob::of(&refused),
+                                    Some(envcloak_sys::owned::NoJob::Unsupported),
+                                    "SIG{name}: {refused}"
+                                );
+                                SignalRoute::CommandGroup
+                            } else {
+                                job.signal(sig).unwrap();
+                                assert!(
+                                    wait_lines(&file, before + 1, DEADLINE),
+                                    "the session delivery took SIG{name} but the job did not \
+                                     count it"
+                                );
+                                SignalRoute::Session
+                            }
+                        }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -644,17 +646,15 @@ fn leaving_members(forced: bool) {
     let mut screen = Screen::new(pty.master);
     screen.expect("FAMILY-READY", 1, "the family started");
     #[cfg(target_os = "linux")]
-    let job = monitor
-        .session()
-        .unwrap()
-        .foreground_job(screen.master())
-        .unwrap();
+    let job = bind_foreground(&monitor, screen.master(), narrowing);
     #[cfg(target_os = "linux")]
-    assert_eq!(
-        job.group_id(),
-        monitor.command_id(),
-        "the job is the family"
-    );
+    if let Some(job) = &job {
+        assert_eq!(
+            job.group_id(),
+            monitor.command_id(),
+            "the job is the family"
+        );
+    }
     std::fs::write(d.join("leave"), b"").unwrap();
     for kind in ["setsid", "setpgid"] {
         assert!(wait_for_file(&d.join(format!("{kind}-left"))), "{kind}");
@@ -678,16 +678,21 @@ fn leaving_members(forced: bool) {
         1
     };
     #[cfg(target_os = "linux")]
-    if narrowing {
-        let refused = job.signal(libc::SIGTERM).unwrap_err();
-        assert_eq!(
-            envcloak_sys::owned::NoJob::of(&refused),
-            Some(envcloak_sys::owned::NoJob::Unsupported),
-            "{refused}"
-        );
-    } else {
-        job.signal(libc::SIGTERM).unwrap();
-        both_count("TERM", term);
+    match &job {
+        // No pidfd_open: refused at the binding already.
+        None => {}
+        Some(job) if narrowing => {
+            let refused = job.signal(libc::SIGTERM).unwrap_err();
+            assert_eq!(
+                envcloak_sys::owned::NoJob::of(&refused),
+                Some(envcloak_sys::owned::NoJob::Unsupported),
+                "{refused}"
+            );
+        }
+        Some(job) => {
+            job.signal(libc::SIGTERM).unwrap();
+            both_count("TERM", term);
+        }
     }
     for (sig, name) in SIGNALS {
         let forwarded = forward_signal(&monitor, screen.master(), sig).unwrap();
@@ -861,7 +866,12 @@ fn group_signal_supported() -> bool {
     // SAFETY: pidfd_open on this process itself; the descriptor is closed
     // below.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
-    assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+    if fd < 0 {
+        // No pidfd_open (Linux before 5.3): no group signal through one.
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSYS), "pidfd_open: {err}");
+        return false;
+    }
     let fd = libc::c_int::try_from(fd).unwrap();
     // SAFETY: signal 0 checks and sends nothing; flag 4 is
     // PIDFD_SIGNAL_PROCESS_GROUP.
@@ -878,6 +888,29 @@ fn group_signal_supported() -> bool {
     // SAFETY: closes the descriptor opened above.
     unsafe { libc::close(fd) };
     !refused
+}
+
+/// Binds the terminal's foreground job through the monitor's session. On a
+/// kernel without `pidfd_open` (Linux before 5.3) the binding itself is
+/// refused (`Unsupported`), which only a narrowing kernel may do: `None`.
+#[cfg(target_os = "linux")]
+fn bind_foreground<'a>(
+    monitor: &'a envcloak_sys::pty::SessionMonitor,
+    master: std::os::fd::BorrowedFd<'_>,
+    narrowing: bool,
+) -> Option<envcloak_sys::owned::ForegroundJob<'a>> {
+    match monitor.session().unwrap().foreground_job(master) {
+        Ok(job) => Some(job),
+        Err(e) => {
+            assert!(
+                narrowing
+                    && envcloak_sys::owned::NoJob::of(&e)
+                        == Some(envcloak_sys::owned::NoJob::Unsupported),
+                "the foreground job could not be bound: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// A job whose group leader is gone: a nested shell runs `true | counter`
