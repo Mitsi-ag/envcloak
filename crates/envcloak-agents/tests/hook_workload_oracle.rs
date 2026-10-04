@@ -20,6 +20,18 @@
 //! hundred (a `classify_all` that stops early): the end positions are
 //! allowed and this fails. The previous `self.bodies.iter().filter(...)`
 //! per command: the here-document rows take past 2 seconds and this fails.
+//!
+//! A second independent matrix (cycle 358, adopted with its controls) does
+//! the same for the fail-closed answer: two ordinary families at three
+//! sizes up to the payload limit, each as a control and with an
+//! unresolved read (a program the reader does not know given `.env`, given
+//! `--env-file=.env`, or given a variable holding `.env`) at the start,
+//! the middle and the end: 120 rows, 108 asked about on Claude Code and
+//! stopped on Codex, 12 allowed, each within the deadline; benign
+//! calibrations allowed, `cat .env` denied as the stronger class, a broken
+//! envelope given no decision. Mutation checked: `Analyzer::result`
+//! answering `None` for an unresolved read (as an allow): every
+//! uncertainty row fails.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -136,4 +148,88 @@ fn large_ordinary_payloads_are_decided_within_the_deadline_wherever_the_denial_i
     }
     assert_eq!(rows, 128);
     eprintln!("measurement: 128 rows, slowest decision {slowest:?}");
+}
+
+/// The cycle 358 uncertainty matrix (see the module documentation).
+#[test]
+fn unresolved_reads_are_asked_about_or_stopped_at_every_size_and_place() {
+    let want = |host: Host| {
+        if host == Host::ClaudeCode {
+            Decision::Ask(Reason::Unresolved)
+        } else {
+            Decision::Deny(Reason::Unresolved)
+        }
+    };
+    let units = ["echo ordinary; ", "cat <<'END'\nordinary\nEND\n"];
+    let unresolved = [
+        "opaque_reader .env; ",
+        "opaque_reader --env-file=.env; ",
+        "file=.env; opaque_reader \"$file\"; ",
+    ];
+    let (mut rows, mut controls, mut unknown) = (0, 0, 0);
+    for unit in units {
+        for budget in [1024, 65536, MAX_PAYLOAD - 16384] {
+            let n = budget / (serde_json::to_string(unit).unwrap().len() - 2);
+            for form in 0..=unresolved.len() {
+                for position in 0..if form == 0 { 1 } else { 3 } {
+                    let at = match position {
+                        0 => 0,
+                        1 => n / 2,
+                        _ => n,
+                    };
+                    let mut s = String::new();
+                    for i in 0..=n {
+                        if form > 0 && i == at {
+                            s.push_str(unresolved[form - 1]);
+                        }
+                        if i < n {
+                            s.push_str(unit);
+                        }
+                    }
+                    let class = check_script(&s);
+                    assert_eq!(
+                        class,
+                        (form > 0).then_some(Class::Unresolved),
+                        "the reader: form {form} at {position}, {budget} bytes"
+                    );
+                    for host in [Host::ClaudeCode, Host::Codex] {
+                        let (got, took, len) = decide(host, &envelope(host, &s));
+                        let expected = if form == 0 {
+                            Decision::Allow
+                        } else {
+                            want(host)
+                        };
+                        assert_eq!(got, expected, "{host:?}: form {form} at {position}");
+                        assert!(len <= MAX_PAYLOAD);
+                        assert!(took < Duration::from_secs(2), "{host:?}: {took:?}");
+                        rows += 1;
+                        if form == 0 {
+                            controls += 1;
+                        } else {
+                            unknown += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!((rows, controls, unknown), (120, 12, 108));
+    for host in [Host::ClaudeCode, Host::Codex] {
+        for benign in [
+            "opaque_reader ordinary.txt",
+            "opaque_reader --label=ordinary",
+            "echo .env",
+        ] {
+            assert_eq!(check_script(benign), None, "{benign}");
+            assert_eq!(decide(host, &envelope(host, benign)).0, Decision::Allow);
+        }
+        assert_eq!(check_script("cat .env"), Some(Class::EnvFile));
+        assert_eq!(
+            decide(host, &envelope(host, "cat .env")).0,
+            Decision::Deny(Reason::EnvFile)
+        );
+        let mut broken = envelope(host, "opaque_reader .env");
+        broken.as_object_mut().unwrap().remove("tool_name");
+        assert_eq!(decide(host, &broken).0, Decision::NoDecision);
+    }
 }
