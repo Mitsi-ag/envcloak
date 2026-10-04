@@ -48,9 +48,12 @@
 //! - **The command continues** (`Continued`) or **exits** (`Exited`): an
 //!   exit is observed with `WNOWAIT`, so the command stays unreaped and
 //!   its group's number cannot be reused: `Signal(n)` still reaches what
-//!   is left of the group. The monitor closes its slave descriptors (so
-//!   the master sees the end once no descendant holds the slave), reports
-//!   the status, and reaps the command when the CLI closes the channel.
+//!   is left of the group. The monitor waits (up to 2 s) until the master
+//!   side has read what the command wrote, since macOS discards unread
+//!   output at the slave's last close, then closes its slave descriptors
+//!   (so the master sees the end once no descendant holds the slave),
+//!   reports the status, and reaps the command when the CLI closes the
+//!   channel. The CLI reads the master while it waits for reports.
 //! - **The channel ends** while the command runs (the CLI is gone): SIGHUP
 //!   then SIGCONT to the command's group, as a hangup would, and the
 //!   monitor waits for the command to exit before it reaps it and exits.
@@ -62,8 +65,8 @@
 //! async-signal-safe list (`sigprocmask`, `sigaction`, `setsid`, `fcntl`,
 //! `dup2`, `close`, `ioctl`, `pipe`, `fork`, `setpgid`, `tcsetpgrp`,
 //! `getpid`, `read`, `write`, `recv`, `waitid`, `waitpid`, `pselect`,
-//! `kill`, `execve`, `_exit`, plus `close_range`, `proc_pidinfo` and
-//! `getrlimit`): no allocation, no lock, no panic path. A test allocator
+//! `kill`, `execve`, `_exit`, `clock_gettime`, `nanosleep`, plus
+//! `close_range`, `proc_pidinfo` and `getrlimit`): no allocation, no lock, no panic path. A test allocator
 //! that aborts in any process but the one that installed it runs a stop,
 //! resume and exit cycle through it
 //! (`crates/envcloak-sys/tests/pty_topology.rs`). The loop itself is
@@ -532,6 +535,7 @@ impl MonitorOps for SysOps {
     }
 
     fn close_terminal(&mut self) {
+        drain_output();
         for fd in 0..=2 {
             // SAFETY: closes the monitor's own descriptors on the slave.
             unsafe { libc::close(fd) };
@@ -542,6 +546,51 @@ impl MonitorOps for SysOps {
         if let Some(owned) = self.owned.take_if(|_| pid == self.child) {
             let _ = owned.reap();
         }
+    }
+}
+
+/// How long the monitor waits, at the command's exit, for the master side
+/// to read what the command wrote before it closes the slave, in
+/// milliseconds.
+const DRAIN_LIMIT_MS: libc::time_t = 2000;
+
+/// Waits until the master side has read everything written to the slave
+/// (`TIOCOUTQ` on the slave is 0), up to [`DRAIN_LIMIT_MS`]. On macOS the
+/// monitor's close of the slave can discard output the master has not
+/// read yet (measured: macOS's `/bin/cat`, stopped and continued, writes
+/// its last line and exits; a reader that comes to it after the monitor's
+/// close finds the terminal ended and the line gone). Linux keeps the
+/// bytes readable, and reports 0 here at once. Bounded, so a command whose
+/// descendants keep writing does not hold the exit report back past the
+/// CLI's own cutoff. Async-signal-safe: `ioctl`, `clock_gettime` and
+/// `nanosleep` only.
+fn drain_output() {
+    let now_ms = || {
+        // SAFETY: timespec is plain data; clock_gettime fills it in.
+        let mut t: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: `t` is writable.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+        t.tv_sec
+            .saturating_mul(1000)
+            .saturating_add(t.tv_nsec / 1_000_000)
+    };
+    let start = now_ms();
+    loop {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: TIOCOUTQ writes one int: the bytes written to the
+        // terminal and not yet read on the master side.
+        if unsafe { libc::ioctl(0, libc::TIOCOUTQ as _, &mut queued) } != 0 || queued <= 0 {
+            return;
+        }
+        if now_ms().saturating_sub(start) >= DRAIN_LIMIT_MS {
+            return;
+        }
+        let pause = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 5_000_000,
+        };
+        // SAFETY: `pause` is initialized; the remainder is not wanted.
+        unsafe { libc::nanosleep(&pause, std::ptr::null_mut()) };
     }
 }
 
@@ -1109,6 +1158,276 @@ mod tests {
                 Did::Reap(CHILD),
             ]
         );
+    }
+
+    /// The loop's schedules with the control frames cut into pieces of
+    /// every size from 1 to [`FRAME`] bytes, and reports that fail (the
+    /// CLI gone), each against an event order written down separately from
+    /// the loop, and each run's record checked by a receipt: every signal
+    /// to the command's group and none after the reap, the terminal given
+    /// only to the monitor's or the command's group, the slave closed once
+    /// and before the reap, exactly one reap and nothing after it. Four
+    /// faults put into each passing record (a signal after the reap, one to
+    /// another group, a second reap, no reap) must each fail the receipt,
+    /// so the receipt can fail. (An independent review oracle, adopted.)
+    mod fragmented {
+        use super::super::*;
+        use std::collections::VecDeque;
+
+        const ME: i32 = 50001;
+        const CHILD: i32 = 50002;
+
+        #[derive(Clone)]
+        enum Step {
+            Child(ChildChange),
+            Frame(Vec<u8>),
+            End,
+        }
+
+        #[derive(Clone, Debug, PartialEq)]
+        enum Event {
+            Foreground(i32),
+            Signal(i32, i32),
+            /// The report, and whether its write succeeded.
+            Report(Report, bool),
+            Close,
+            Reap(i32),
+        }
+
+        struct Model {
+            steps: VecDeque<Step>,
+            chunk: usize,
+            offset: usize,
+            events: Vec<Event>,
+            reports: usize,
+            /// The report (1-based) whose write fails.
+            fail: Option<usize>,
+            waits: usize,
+        }
+
+        impl MonitorOps for Model {
+            fn child_change(&mut self) -> Option<ChildChange> {
+                match self.steps.front() {
+                    Some(Step::Child(c)) => {
+                        let c = *c;
+                        self.steps.pop_front();
+                        Some(c)
+                    }
+                    _ => None,
+                }
+            }
+            fn read_control(&mut self, buf: &mut [u8]) -> ControlRead {
+                match self.steps.front() {
+                    Some(Step::End) => {
+                        self.steps.pop_front();
+                        ControlRead::End
+                    }
+                    Some(Step::Frame(f)) => {
+                        let n = self.chunk.min(buf.len()).min(f.len() - self.offset);
+                        buf[..n].copy_from_slice(&f[self.offset..self.offset + n]);
+                        self.offset += n;
+                        if self.offset == f.len() {
+                            self.steps.pop_front();
+                            self.offset = 0;
+                        }
+                        ControlRead::Data(n)
+                    }
+                    _ => ControlRead::Nothing,
+                }
+            }
+            fn write_control(&mut self, f: &[u8; FRAME]) -> bool {
+                self.reports += 1;
+                let ok = self.fail != Some(self.reports);
+                self.events
+                    .push(Event::Report(decode_report(f).unwrap(), ok));
+                ok
+            }
+            fn wait(&mut self, _: bool) {
+                self.waits += 1;
+                assert!(
+                    self.waits < 4,
+                    "a bounded schedule stalled: {:?}",
+                    self.events
+                );
+            }
+            fn set_foreground(&mut self, p: i32) {
+                self.events.push(Event::Foreground(p));
+            }
+            fn signal_group(&mut self, p: i32, s: i32) {
+                self.events.push(Event::Signal(p, s));
+            }
+            fn close_terminal(&mut self) {
+                self.events.push(Event::Close);
+            }
+            fn reap(&mut self, p: i32) {
+                self.events.push(Event::Reap(p));
+            }
+        }
+
+        fn command(c: Command) -> Step {
+            Step::Frame(encode_command(c).to_vec())
+        }
+
+        fn receipt_valid(e: &[Event]) -> bool {
+            let (mut reaped, mut closed, mut reaps) = (false, false, 0);
+            for x in e {
+                match x {
+                    Event::Signal(p, _) if *p != CHILD || reaped => return false,
+                    Event::Foreground(p) if ![ME, CHILD].contains(p) || reaped => return false,
+                    Event::Close if closed || reaped => return false,
+                    Event::Close => closed = true,
+                    Event::Reap(p) => {
+                        if *p != CHILD || !closed || reaped {
+                            return false;
+                        }
+                        reaped = true;
+                        reaps += 1;
+                    }
+                    _ => {}
+                }
+            }
+            reaps == 1 && e.last() == Some(&Event::Reap(CHILD))
+        }
+
+        #[test]
+        fn every_schedule_at_every_fragment_size_keeps_to_its_order_and_receipt() {
+            use ChildChange::{Continued, Exited, Stopped};
+            use Event::{Close as C, Foreground as F, Reap as P, Report as R, Signal as S};
+            let (hup, cont, stop) = (libc::SIGHUP, libc::SIGCONT, libc::SIGTSTP);
+            let mut cases: Vec<(Vec<Step>, Option<usize>, Vec<Event>)> = vec![
+                // Stop, resume, continue, exit, channel end.
+                (
+                    vec![
+                        Step::Child(Stopped(stop)),
+                        command(Command::Resume),
+                        Step::Child(Continued),
+                        Step::Child(Exited(0)),
+                        Step::End,
+                    ],
+                    None,
+                    vec![
+                        F(ME),
+                        R(Report::Stopped(stop), true),
+                        F(CHILD),
+                        S(CHILD, cont),
+                        R(Report::Continued, true),
+                        C,
+                        R(Report::Exited(0), true),
+                        P(CHILD),
+                    ],
+                ),
+                // The channel ends while the command runs.
+                (
+                    vec![Step::End, Step::Child(Exited(hup))],
+                    None,
+                    vec![S(CHILD, hup), S(CHILD, cont), C, P(CHILD)],
+                ),
+                // The stop's report fails.
+                (
+                    vec![
+                        Step::Child(Stopped(stop)),
+                        Step::Child(Exited(hup)),
+                        Step::End,
+                    ],
+                    Some(1),
+                    vec![
+                        F(ME),
+                        R(Report::Stopped(stop), false),
+                        S(CHILD, hup),
+                        S(CHILD, cont),
+                        C,
+                        P(CHILD),
+                    ],
+                ),
+                // The continue's report fails.
+                (
+                    vec![Step::Child(Continued), Step::Child(Exited(hup)), Step::End],
+                    Some(1),
+                    vec![
+                        R(Report::Continued, false),
+                        S(CHILD, hup),
+                        S(CHILD, cont),
+                        C,
+                        P(CHILD),
+                    ],
+                ),
+                // The exit's report fails: no signal to an exited leader.
+                (
+                    vec![Step::Child(Exited(0)), Step::End],
+                    Some(1),
+                    vec![C, R(Report::Exited(0), false), P(CHILD)],
+                ),
+                // A whole frame that is not a command.
+                (
+                    vec![
+                        Step::Frame(vec![0; FRAME]),
+                        Step::Child(Exited(0)),
+                        Step::End,
+                    ],
+                    None,
+                    vec![C, R(Report::Exited(0), true), P(CHILD)],
+                ),
+                // Half a command, then the channel ends.
+                (
+                    vec![Step::Frame(vec![0; 2]), Step::End, Step::Child(Exited(hup))],
+                    None,
+                    vec![S(CHILD, hup), S(CHILD, cont), C, P(CHILD)],
+                ),
+            ];
+            // After the exit: resume and suspend do nothing; the six signals
+            // reach the retained leader's group before the reap.
+            let mut steps = vec![
+                Step::Child(Exited(0)),
+                command(Command::Resume),
+                command(Command::Suspend),
+            ];
+            let mut events = vec![C, R(Report::Exited(0), true)];
+            for sig in [
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                hup,
+                libc::SIGKILL,
+                cont,
+            ] {
+                steps.push(command(Command::Signal(sig)));
+                events.push(S(CHILD, sig));
+            }
+            steps.push(Step::End);
+            events.push(P(CHILD));
+            cases.push((steps, None, events));
+            let (mut schedules, mut faults) = (0, 0);
+            for (steps, fail, expected) in &cases {
+                for chunk in 1..=FRAME {
+                    let mut model = Model {
+                        steps: steps.iter().cloned().collect(),
+                        chunk,
+                        offset: 0,
+                        events: vec![],
+                        reports: 0,
+                        fail: *fail,
+                        waits: 0,
+                    };
+                    assert_eq!(run(&mut model, ME, CHILD), 0);
+                    assert_eq!(&model.events, expected, "chunk {chunk}");
+                    assert!(receipt_valid(&model.events), "{:?}", model.events);
+                    schedules += 1;
+                    let mut late = model.events.clone();
+                    late.push(S(CHILD, cont));
+                    let mut foreign = model.events.clone();
+                    foreign.insert(0, S(ME, cont));
+                    let mut twice = model.events.clone();
+                    twice.push(P(CHILD));
+                    let mut unreaped = model.events.clone();
+                    unreaped.pop();
+                    for bad in [late, foreign, twice, unreaped] {
+                        assert!(!receipt_valid(&bad), "the receipt missed {bad:?}");
+                        faults += 1;
+                    }
+                }
+            }
+            assert_eq!((cases.len(), schedules, faults), (8, 64, 256));
+        }
     }
 
     #[test]
