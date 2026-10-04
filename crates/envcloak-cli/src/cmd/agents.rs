@@ -13,8 +13,16 @@
 //!   up, as a backup v2 the daemon seals, before it is changed.
 //! - `uninstall [--global] [--project] [--agent ID]... [--yes] [--json]`
 //!   takes out exactly what `install` added.
-//! - `status` (M2-09, M2-28) and `migrate-mcp` (M2-20) are not in this
-//!   build: each exits 125 with `not_in_this_build`, reading no argument.
+//! - `status` makes one check in this build (M2 plan M2-08): EnvCloak's
+//!   Claude Code plugin enabled (in the user's settings, or the working
+//!   directory's project or local settings) while EnvCloak's own hooks
+//!   (in one of those files) or an MCP server named `envcloak` (in
+//!   `.claude.json`) are there too, so each hook runs twice: refused,
+//!   exit 1 with `double_install`, naming both. Otherwise the coverage
+//!   report (M2-09, M2-28) is not in this build: exit 125 with
+//!   `not_in_this_build`. It reads no argument.
+//! - `migrate-mcp` (M2-20) is not in this build: it exits 125 with
+//!   `not_in_this_build`, reading no argument.
 //!
 //! Exit 0 when every change was made (or was there already); otherwise 1
 //! with `agents_incomplete`, after the report says which file was refused
@@ -78,7 +86,7 @@ fn parse(args: &[&str], install: bool) -> Option<Args> {
 
 pub fn run(args: &[&str]) -> ExitCode {
     match args {
-        ["status", ..] => super::not_in_this_build("`envcloak agents status`"),
+        ["status", ..] => run_status(),
         ["migrate-mcp", ..] => super::not_in_this_build("`envcloak agents migrate-mcp`"),
         [cmd @ ("install" | "uninstall"), rest @ ..] => {
             if rest == ["--help"] || rest == ["-h"] {
@@ -104,6 +112,72 @@ pub fn run(args: &[&str]) -> ExitCode {
         }
         _ => usage(USAGE_TEXT),
     }
+}
+
+/// `agents status` in this build: the double-install check (M2 plan
+/// M2-08; Codex review: a direct install followed by the plugin left both
+/// hook sets and both servers, and nothing said so), then
+/// `not_in_this_build` for the coverage report. No argument is read.
+fn run_status() -> ExitCode {
+    // The settings it reads can hold literal keys (SPEC §5).
+    if let Err(f) = refuse_if_traced() {
+        return f.report(FAILURE);
+    }
+    match double_install() {
+        Some(text) => Failure::new("double_install", text).report(FAILURE),
+        None => super::not_in_this_build("`envcloak agents status`"),
+    }
+}
+
+/// What makes a double install, said as the refusal says it, or `None`:
+/// EnvCloak's plugin enabled in a settings file Claude Code reads here (the
+/// user's, the working directory's project or local settings) while
+/// EnvCloak's own hooks are in one of them, or an MCP server named
+/// `envcloak` is in Claude Code's `.claude.json`.
+fn double_install() -> Option<String> {
+    use envcloak_agents::hosts::claude;
+    let locations = Locations::from_env().ok()?;
+    let home = locations.home().to_path_buf();
+    let mut files = vec![locations.claude_settings()];
+    if let Ok(cwd) = std::env::current_dir() {
+        files.push(cwd.join(".claude").join("settings.json"));
+        files.push(cwd.join(".claude").join("settings.local.json"));
+    }
+    files.dedup();
+    let read: Vec<(PathBuf, Value)> = files
+        .into_iter()
+        .filter_map(|p| install::read_json(&p).map(|v| (p, v)))
+        .collect();
+    let plugin: Vec<String> = read
+        .iter()
+        .filter(|(_, v)| claude::plugin_enabled(v))
+        .map(|(p, _)| shown(&home, p))
+        .collect();
+    if plugin.is_empty() {
+        return None;
+    }
+    let mut own: Vec<String> = read
+        .iter()
+        .filter(|(_, v)| claude::envcloak_hooks(v))
+        .map(|(p, _)| format!("its own hooks in {}", shown(&home, p)))
+        .collect();
+    if install::claude_json_has_server(locations.claude_json()) {
+        own.push(format!(
+            "an MCP server named `envcloak` in {}",
+            shown(&home, locations.claude_json())
+        ));
+    }
+    if own.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "EnvCloak's Claude Code plugin is enabled ({}) and EnvCloak is installed without it too \
+         ({}): each hook runs twice, and the server is there twice. Run `envcloak agents \
+         install`, which takes out its own hooks and server while the plugin is enabled, or \
+         disable the plugin",
+        plugin.join(", "),
+        own.join("; ")
+    ))
 }
 
 /// The project's directory: where the nearest manifest is, or here.
@@ -151,11 +225,18 @@ fn context() -> Result<Context<'static>, Failure> {
     })
 }
 
-/// A path as it is shown: the home as `~`, and escaped.
+/// A path as it is shown: the home as `~` (also when the path has the
+/// home's directories resolved, as a registration's key has), and
+/// escaped.
 fn shown(home: &Path, p: &Path) -> String {
-    let text = match p.strip_prefix(home) {
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => p.display().to_string(),
+    let resolved = std::fs::canonicalize(home).ok();
+    let rest = p
+        .strip_prefix(home)
+        .ok()
+        .or_else(|| resolved.as_deref().and_then(|h| p.strip_prefix(h).ok()));
+    let text = match rest {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
     };
     escape_for_display(&text)
 }
@@ -495,12 +576,24 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
             })
             .map(|(p, r)| json!({"path": shown(&home, Path::new(p)), "host": r.host}))
             .collect();
-        let mcp = global
-            && hosts.contains(&Host::ClaudeCode)
-            && (state.mcp.contains_key(Host::ClaudeCode.id())
-                || state.mcp_intent.contains_key(Host::ClaudeCode.id()));
+        // Every file EnvCloak registered its MCP server in, wherever
+        // `CLAUDE_CONFIG_DIR` points now.
+        let servers: Vec<String> = if global && hosts.contains(&Host::ClaudeCode) {
+            install::claude_registrations(&state)
+                .iter()
+                .map(|k| shown(&home, Path::new(k)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mcp = !servers.is_empty();
         if a.json {
-            print_json(&json!({"files": listed, "mcp_server": mcp, "applied": false}));
+            print_json(&json!({
+                "files": listed,
+                "mcp_server": mcp,
+                "mcp_servers": servers,
+                "applied": false,
+            }));
         } else {
             for f in &listed {
                 println!(
@@ -508,8 +601,10 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
                     f["path"].as_str().unwrap_or_default()
                 );
             }
-            if mcp {
-                println!("  Claude Code's MCP server envcloak: remove it with `claude mcp remove`");
+            for p in &servers {
+                println!(
+                    "  {p}: remove Claude Code's MCP server envcloak with `claude mcp remove`"
+                );
             }
             if listed.is_empty() && !mcp {
                 println!("Nothing of EnvCloak's is installed here.");

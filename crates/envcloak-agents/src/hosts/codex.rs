@@ -36,7 +36,7 @@ use toml_edit::{Array, DocumentMut, Item, Table};
 use super::{HOOK_TIMEOUT_SECS, hook_command};
 use crate::hook::{Event, Host};
 use crate::tool_timeouts;
-use crate::writer::{Edit, Edited, Refusal, Undo};
+use crate::writer::{Change, Edit, Edited, Refusal, Undo};
 
 /// The MCP server's name.
 pub const SERVER: &str = "envcloak";
@@ -396,9 +396,27 @@ fn allowance_fits(doc: &DocumentMut, settings: &[Setting], owned: &[Edit]) -> Re
     Ok(())
 }
 
+/// Whether `path` is one of the socket allowance's settings
+/// (`sandbox_workspace_write.network_access` and what is under
+/// `[features.network_proxy]`).
+pub fn is_allowance_path(path: &[String]) -> bool {
+    let p: Vec<&str> = path.iter().map(String::as_str).collect();
+    matches!(
+        p.as_slice(),
+        ["sandbox_workspace_write", "network_access"] | ["features", "network_proxy", ..]
+    )
+}
+
 /// `before` (`None` for no file) with `settings` set. `owned` names the
 /// settings EnvCloak wrote before, which it may change; another value
-/// already at the MCP server's place is a conflict, refused.
+/// already at the MCP server's place is a conflict, refused. The settings
+/// EnvCloak wrote before that are not among `settings` (the socket
+/// allowance, once consent is not given or the Codex version was not
+/// measured) are taken out first, by structure, as uninstall takes them
+/// out: set back to what they held before, or removed, while they still
+/// hold what EnvCloak wrote (the verifier's finding: an allowance written
+/// for a measured Codex stayed in place after an upgrade, while the report
+/// said it was not written).
 ///
 /// # Errors
 /// When the file is not TOML, a table on the way is not one, another
@@ -415,6 +433,15 @@ pub fn apply(
         None => "",
     };
     let mut doc: DocumentMut = text.parse().map_err(|_| not_toml())?;
+    let stale: Vec<Edit> = owned
+        .iter()
+        .filter(|e| {
+            matches!(e, Edit::TomlValue { path, .. }
+                if !settings.iter().any(|(p, _)| p == path))
+        })
+        .cloned()
+        .collect();
+    undo_in(&mut doc, &stale)?;
     allowance_fits(&doc, settings, owned)?;
     let mut edits = Vec::new();
     for (path, value) in settings {
@@ -490,10 +517,14 @@ pub fn apply(
             created,
         });
     }
-    if edits.is_empty() {
+    if edits.is_empty() && stale.is_empty() {
         return Ok(None);
     }
-    Ok(Some((doc.to_string().into_bytes(), edits)))
+    Ok(Some(Change {
+        bytes: doc.to_string().into_bytes(),
+        added: edits,
+        dropped: stale,
+    }))
 }
 
 /// `current` with EnvCloak's settings taken out by structure: each set
@@ -505,6 +536,21 @@ pub fn apply(
 pub fn undo(current: &[u8], edits: &[Edit], created_file: bool) -> Result<Undo, Refusal> {
     let text = std::str::from_utf8(current).map_err(|_| not_toml())?;
     let mut doc: DocumentMut = text.parse().map_err(|_| not_toml())?;
+    undo_in(&mut doc, edits)?;
+    let out = doc.to_string();
+    if created_file && out.trim().is_empty() {
+        return Ok(Undo::Remove);
+    }
+    if out.as_bytes() == current {
+        return Ok(Undo::Nothing);
+    }
+    Ok(Undo::Rewrite(out.into_bytes()))
+}
+
+/// `doc` with the TOML `edits` taken out by structure, in reverse: each
+/// set back to what was there before, or removed, while it still holds
+/// what EnvCloak wrote; then the tables made for it, while empty.
+fn undo_in(doc: &mut DocumentMut, edits: &[Edit]) -> Result<(), Refusal> {
     for e in edits.iter().rev() {
         let Edit::TomlValue {
             path,
@@ -553,14 +599,7 @@ pub fn undo(current: &[u8], edits: &[Edit], created_file: bool) -> Result<Undo, 
             parent.remove(&tables[depth]);
         }
     }
-    let out = doc.to_string();
-    if created_file && out.trim().is_empty() {
-        return Ok(Undo::Remove);
-    }
-    if out.as_bytes() == current {
-        return Ok(Undo::Nothing);
-    }
-    Ok(Undo::Rewrite(out.into_bytes()))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -570,7 +609,7 @@ mod tests {
 
     fn run(before: &str, settings: &[Setting]) -> (String, Vec<Edit>) {
         match apply(Some(before.as_bytes()), settings, &[]) {
-            Ok(Some((b, e))) => (String::from_utf8(b).unwrap_or_default(), e),
+            Ok(Some(c)) => (String::from_utf8(c.bytes).unwrap_or_default(), c.added),
             Ok(None) => (before.to_owned(), Vec::new()),
             Err(r) => panic!("{r:?}"),
         }
@@ -742,7 +781,12 @@ mod tests {
             "[mcp_servers.envcloak]\n",
             "[mcp_servers.envcloak]\n# my note\n",
         );
-        let Ok(Some((again, more))) = apply(Some(commented.as_bytes()), &new, &edits) else {
+        let Ok(Some(Change {
+            bytes: again,
+            added: more,
+            ..
+        })) = apply(Some(commented.as_bytes()), &new, &edits)
+        else {
             panic!("not changed");
         };
         let again = String::from_utf8(again).unwrap_or_default();
@@ -778,7 +822,12 @@ mod tests {
         let (after, edits) = run("[features.network_proxy]\nenabled = true\n", &s);
         assert!(after.contains("network_access = true"), "{after}");
         let theirs = after.replace("network_access = true", "network_access = false # mine");
-        let Ok(Some((again, more))) = apply(Some(theirs.as_bytes()), &s, &edits) else {
+        let Ok(Some(Change {
+            bytes: again,
+            added: more,
+            ..
+        })) = apply(Some(theirs.as_bytes()), &s, &edits)
+        else {
             panic!("not changed");
         };
         let again = String::from_utf8(again).unwrap_or_default();
@@ -790,6 +839,68 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert!(back.contains("network_access = false # mine"), "{back}");
+    }
+
+    /// The verifier's finding: the version gate stopped new writes of the
+    /// socket allowance, but one written earlier (for a measured Codex,
+    /// with consent) stayed in config.toml after an upgrade, while the
+    /// report said it was not written. A run that does not write it (no
+    /// consent, an unmeasured version) takes EnvCloak's own allowance out
+    /// by structure, as uninstall does, and says which edits it dropped;
+    /// the server stays; a value the person had before comes back; a
+    /// value the person set since is theirs and stays.
+    ///
+    /// Mutation checked: the stale settings left in place (`undo_in` not
+    /// called for them in `apply`): `network_access` and the proxy stay,
+    /// and this fails.
+    #[test]
+    fn an_allowance_written_before_goes_when_this_run_does_not_write_it() {
+        let with = config_settings(
+            Path::new("/b/envcloak"),
+            false,
+            Some(Path::new("/r/s.sock")),
+        );
+        let without = config_settings(Path::new("/b/envcloak"), false, None);
+        for before in [
+            "model = \"m\"\n",
+            "[sandbox_workspace_write]\nnetwork_access = false\n",
+        ] {
+            let (after, edits) = run(before, &with);
+            assert!(after.contains("unix_sockets"), "{after}");
+            let Ok(Some(c)) = apply(Some(after.as_bytes()), &without, &edits) else {
+                panic!("nothing taken out of {after}");
+            };
+            let out = String::from_utf8(c.bytes).unwrap_or_default();
+            for word in ["network_proxy", "unix_sockets", "network_access = true"] {
+                assert!(!out.contains(word), "{word}: {out}");
+            }
+            assert!(out.contains("[mcp_servers.envcloak]"), "{out}");
+            assert_eq!(
+                out.contains("network_access = false"),
+                before.contains("network_access = false"),
+                "{out}"
+            );
+            assert_eq!(c.dropped.len(), 3, "{:?}", c.dropped);
+            assert!(c.dropped.iter().all(|e| matches!(e,
+                Edit::TomlValue { path, .. } if is_allowance_path(path))));
+            // Taken out already: nothing more to do, the record updated.
+            match apply(Some(out.as_bytes()), &without, &edits) {
+                Ok(Some(again)) => {
+                    assert_eq!(again.bytes, out.as_bytes());
+                    assert_eq!(again.dropped.len(), 3);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // A value the person set since EnvCloak wrote it is theirs.
+        let (after, edits) = run("model = \"m\"\n", &with);
+        let theirs = after.replace("network_access = true", "network_access = false # mine");
+        let Ok(Some(c)) = apply(Some(theirs.as_bytes()), &without, &edits) else {
+            panic!("nothing taken out");
+        };
+        let out = String::from_utf8(c.bytes).unwrap_or_default();
+        assert!(out.contains("network_access = false # mine"), "{out}");
+        assert!(!out.contains("unix_sockets"), "{out}");
     }
 
     #[test]

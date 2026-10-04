@@ -67,6 +67,13 @@ pub enum Event {
 }
 
 impl Event {
+    /// Every event, in the order the hosts' hook files list them.
+    pub const ALL: [Event; 3] = [
+        Event::UserPromptSubmit,
+        Event::PreToolUse,
+        Event::SessionStart,
+    ];
+
     /// The event's name, as the hosts write it.
     pub fn name(self) -> &'static str {
         match self {

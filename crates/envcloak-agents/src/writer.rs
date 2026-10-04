@@ -226,15 +226,20 @@ pub struct State {
     /// By absolute path.
     pub files: BTreeMap<String, FileRecord>,
     /// The MCP server entries EnvCloak registered through a host's own
-    /// command line, by host id.
+    /// command line, by the absolute path of the file the host keeps them
+    /// in, its directories resolved (Claude Code's `.claude.json`, which
+    /// `CLAUDE_CONFIG_DIR` moves): an entry is EnvCloak's in that file only
+    /// (Codex review: keyed by host, an equal entry the person registered
+    /// in another file was taken for EnvCloak's, and the one EnvCloak
+    /// registered left behind).
     #[serde(default)]
-    pub mcp: BTreeMap<String, Value>,
-    /// The MCP server entries EnvCloak is registering, by host id: saved
-    /// before the host's command runs, so a run stopped after it still
-    /// owns the entry (the next run finds it there and adopts it) and one
-    /// stopped before it does not.
+    pub mcp: BTreeMap<String, McpRecord>,
+    /// The MCP server entries EnvCloak is registering, keyed as
+    /// [`State::mcp`]: saved before the host's command runs, so a run
+    /// stopped after it still owns the entry (the next run finds it there
+    /// and adopts it) and one stopped before it does not.
     #[serde(default)]
-    pub mcp_intent: BTreeMap<String, Value>,
+    pub mcp_intent: BTreeMap<String, McpRecord>,
     /// Files EnvCloak gave back by an undo, so nothing of its own is left
     /// in them, by absolute path, with the stamp that write left: while a
     /// file's stamp is still this one, EnvCloak's next change of it (an
@@ -253,6 +258,35 @@ pub struct State {
     /// literal key in it included, was left behind).
     #[serde(default)]
     pub leftovers: BTreeMap<String, Vec<String>>,
+}
+
+/// An MCP server entry EnvCloak registered through a host's own command
+/// line. Holds EnvCloak's own entry and paths only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRecord {
+    /// The host (`claude-code`).
+    pub host: String,
+    /// The entry, as registered.
+    pub entry: Value,
+    /// The host's directory variable (`CLAUDE_CONFIG_DIR`) as it was when
+    /// the entry was registered, `None` when it was not set: the host's
+    /// command is pointed at the same file again to take the entry out.
+    pub config_dir: Option<String>,
+    /// What the file held right after the registration, when the
+    /// registration created it (there was no file before): uninstall
+    /// removes a file still exactly so, which holds nothing but what the
+    /// registration made (Codex review: a file created this way was left).
+    pub created: Option<Created>,
+}
+
+/// A file a host's command created for EnvCloak: its SHA-256 and stamp
+/// right after.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Created {
+    pub sha256: String,
+    pub stamp: Option<Stamp>,
 }
 
 /// The state file's format version.
@@ -575,9 +609,33 @@ pub struct Target {
     pub host_name: &'static str,
 }
 
-/// What an edit makes of a file: its new contents and the edits they
-/// hold, or `None` for no change.
-pub type Edited = Option<(Vec<u8>, Vec<Edit>)>;
+/// What an edit makes of a file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    /// The file's new contents (the same bytes for a change of the record
+    /// only).
+    pub bytes: Vec<u8>,
+    /// The edits they hold that EnvCloak's record of the file did not.
+    pub added: Vec<Edit>,
+    /// EnvCloak's earlier edits of the file that it no longer holds: taken
+    /// out because this run does not write them (a setting the plan no
+    /// longer wants), or gone already.
+    pub dropped: Vec<Edit>,
+}
+
+impl Change {
+    /// New contents holding `added`, nothing dropped.
+    pub fn new(bytes: Vec<u8>, added: Vec<Edit>) -> Self {
+        Change {
+            bytes,
+            added,
+            dropped: Vec::new(),
+        }
+    }
+}
+
+/// What an edit makes of a file, or `None` for no change.
+pub type Edited = Option<Change>;
 /// An edit of a file's contents (`None` when it does not exist), given
 /// EnvCloak's record of the file, if it has one.
 pub type EditFn<'a> = dyn FnMut(Option<&[u8]>, Option<&FileRecord>) -> Result<Edited, Refusal> + 'a;
@@ -771,15 +829,25 @@ impl Writer<'_> {
         // that what this one would write is known: a write stopped part
         // way left the first bytes of these same contents (Codex review).
         let staged = match &edited {
-            Ok(Some((a, _))) => Some(a.as_slice()),
+            Ok(Some(c)) => Some(c.bytes.as_slice()),
             _ => None,
         };
         let refs: Vec<&[u8]> = before.into_iter().chain(staged).collect();
         self.sweep(&t.path, &refs);
-        let Some((after, edits)) = edited? else {
+        let Some(Change {
+            bytes: after,
+            added: edits,
+            dropped,
+        }) = edited?
+        else {
             return Ok(Outcome::Unchanged);
         };
         if before == Some(after.as_slice()) {
+            // The file holds what it should; EnvCloak's record of it may
+            // still name edits it no longer holds, which go (lesson L-09).
+            if let Some(rec) = self.state.files.get_mut(&k) {
+                rec.edits.retain(|e| !dropped.contains(e));
+            }
             return Ok(Outcome::Unchanged);
         }
         let backup = match &r.current {
@@ -817,6 +885,7 @@ impl Writer<'_> {
         };
         rec.post_sha256 = sha256_hex(&after);
         rec.stamp = None;
+        rec.edits.retain(|e| !dropped.contains(e));
         for e in edits {
             if !rec.edits.contains(&e) {
                 rec.edits.push(e);
@@ -1362,7 +1431,7 @@ mod tests {
                 return Ok(None);
             }
             v.extend_from_slice(text.as_bytes());
-            Ok(Some((v, vec![Edit::Block])))
+            Ok(Some(Change::new(v, vec![Edit::Block])))
         }
     }
 
@@ -1511,7 +1580,7 @@ mod tests {
             std::fs::write(&theirs, b"# theirs, longer\n").unwrap_or_else(|e| panic!("{e}"));
             let mut v = b.unwrap_or_default().to_vec();
             v.extend_from_slice(b"added\n");
-            Ok(Some((v, vec![Edit::Block])))
+            Ok(Some(Change::new(v, vec![Edit::Block])))
         };
         let o = w.change(&target(&p, false), &mut racing);
         assert!(
@@ -1590,7 +1659,7 @@ mod tests {
                 "\"z\": 1,\n  \"hooks\": {}\n",
                 1,
             );
-            Ok(Some((text.into_bytes(), vec![Edit::Block])))
+            Ok(Some(Change::new(text.into_bytes(), vec![Edit::Block])))
         };
         let mut edit = two_sites;
         assert!(matches!(w.change(&t, &mut edit), Outcome::Changed { .. }));
@@ -1970,7 +2039,7 @@ mod tests {
             }
             let mut v = b"// ".to_vec();
             v.extend_from_slice(b);
-            Ok(Some((v, vec![Edit::Block])))
+            Ok(Some(Change::new(v, vec![Edit::Block])))
         };
         let mut w = writer!(&mut state, &mut saved, &mut kept);
         let _ = w.change(&t, &mut comment);
@@ -2085,7 +2154,7 @@ mod tests {
         let t = target(&p, false);
         let mut whole = |b: Option<&[u8]>, _: Option<&FileRecord>| match b {
             Some(_) => Ok(None),
-            None => Ok(Some((b"rule\n".to_vec(), vec![Edit::WholeFile]))),
+            None => Ok(Some(Change::new(b"rule\n".to_vec(), vec![Edit::WholeFile]))),
         };
         assert!(matches!(w.change(&t, &mut whole), Outcome::Changed { .. }));
         std::fs::write(&p, b"rule\nmine\n").unwrap_or_else(|e| panic!("{e}"));
