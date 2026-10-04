@@ -26,10 +26,21 @@
 //!   changed by, and none that may hold one is out of EnvCloak's sight
 //!   (a device profile, an organization's settings, a file or folder it
 //!   cannot read). Trusted projects are found in the `projects` tables of
-//!   the system, user and managed files and looked through, the folders
-//!   above them included, within [`MAX_DIRS`] folders.
+//!   the system, user, profile and managed files; each one, and each
+//!   linked git worktree of it (Codex trusts a worktree through its main
+//!   checkout), is looked through with the folders above it, by its name
+//!   and by where that leads, within [`MAX_DIRS`] folders.
+//!
+//! A folder's project layer is read as Codex reads it
+//! (`discover_project_layers`): its `.codex` followed through a symlink
+//! when that is a folder, and skipped when it is not one or is Codex's
+//! own directory, by its name or by where it leads.
 
-use std::io::Read as _;
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::io::{ErrorKind, Read as _};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -135,6 +146,50 @@ pub fn project_root(dir: &Path, markers: &[String]) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Codex's own directory, by its name and by where it leads: a folder's
+/// `.codex` that is either one holds the user's layer, which Codex does
+/// not read again as a project's.
+struct Home {
+    spelled: PathBuf,
+    real: PathBuf,
+}
+
+impl Home {
+    fn of(l: &Locations) -> Home {
+        let spelled = l.codex_home().to_path_buf();
+        let real = std::fs::canonicalize(&spelled).unwrap_or_else(|_| spelled.clone());
+        Home { spelled, real }
+    }
+
+    fn is(&self, dot_codex: &Path) -> bool {
+        dot_codex == self.spelled
+            || dot_codex == self.real
+            || std::fs::canonicalize(dot_codex).is_ok_and(|r| r == self.real)
+    }
+}
+
+/// What a folder's `.codex` is to Codex (`discover_project_layers`).
+enum DotCodex {
+    /// Not a folder, or not there: no layer (Codex skips a `.codex` it
+    /// cannot look at too).
+    None,
+    /// Codex's own directory: the user's layer, not read again.
+    Home,
+    /// A layer: this `config.toml`, the folder followed through a symlink.
+    Layer(PathBuf),
+}
+
+fn dot_codex(dir: &Path, home: &Home) -> DotCodex {
+    let dot = dir.join(".codex");
+    if !std::fs::metadata(&dot).is_ok_and(|m| m.is_dir()) {
+        return DotCodex::None;
+    }
+    if home.is(&dot) {
+        return DotCodex::Home;
+    }
+    DotCodex::Layer(dot.join("config.toml"))
+}
+
 /// The directories from `root` down to `dir`, root first; `dir` alone
 /// without a root.
 fn dirs_down(root: Option<&Path>, dir: &Path) -> Vec<PathBuf> {
@@ -166,9 +221,13 @@ pub fn doc_view(l: &Locations, dir: &Path) -> DocView {
     }
     let markers = markers.unwrap_or_else(|| vec![".git".to_owned()]);
     let root = project_root(dir, &markers);
+    let home = Home::of(l);
     let project: Vec<Layer> = dirs_down(root.as_deref(), dir)
         .iter()
-        .map(|d| read_layer(&Locations::codex_project_config(d)))
+        .map(|d| match dot_codex(d, &home) {
+            DotCodex::Layer(p) => read_layer(&p),
+            DotCodex::None | DotCodex::Home => Layer::Absent,
+        })
         .collect();
     let mut limit = None;
     let mut fallbacks: Option<Vec<String>> = None;
@@ -323,12 +382,52 @@ fn check(path: &Path) -> Result<(), Refusal> {
     }
 }
 
+/// A folder's project layer, read for [`other_layers_fit`].
+fn check_dir(dir: &Path, home: &Home) -> Result<(), Refusal> {
+    match dot_codex(dir, home) {
+        DotCodex::Layer(p) => check(&p),
+        DotCodex::None | DotCodex::Home => Ok(()),
+    }
+}
+
+fn not_there(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+}
+
+/// Whether `path` is there, looked at without following a symlink.
+fn exists(path: &Path) -> Result<bool, Refusal> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if not_there(&e) => Ok(false),
+        Err(_) => Err(unknown(&format!(
+            "{} could not be looked at",
+            path.display()
+        ))),
+    }
+}
+
+/// The layers Codex learns from which projects are trusted and where a
+/// project's root is (the settings merged below the projects'): the
+/// system file, the user's, each profile file (any session may name one)
+/// and the managed file.
+fn settings_layers(l: &Locations, profiles: &[PathBuf]) -> Vec<(PathBuf, Layer)> {
+    let mut paths = vec![l.codex_system_config(), l.codex_config()];
+    paths.extend(profiles.iter().cloned());
+    paths.push(l.codex_managed_config());
+    paths
+        .into_iter()
+        .map(|p| {
+            let layer = read_layer(&p);
+            (p, layer)
+        })
+        .collect()
+}
+
 /// The projects the person trusts in Codex: `[projects."<path>"]` with
-/// `trust_level = "trusted"`, in the system, user and managed files.
-pub fn trusted_projects(l: &Locations) -> Vec<PathBuf> {
-    let (below, managed) = non_project(l);
+/// `trust_level = "trusted"`, in `layers`.
+fn trusted_projects(layers: &[(PathBuf, Layer)]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for layer in below.iter().chain(std::iter::once(&managed)) {
+    for (_, layer) in layers {
         let Layer::Doc(d) = layer else {
             continue;
         };
@@ -351,17 +450,121 @@ pub fn trusted_projects(l: &Locations) -> Vec<PathBuf> {
     out
 }
 
-/// Every `.codex/config.toml` at or below `root` (symlinks not followed:
-/// Codex's working directory is a resolved path), other than Codex's own
-/// directory's, each passed to `found`; within `budget` folders.
+/// The most of a git metadata file read (Codex reads no more).
+const MAX_GIT_FILE: u64 = 64 * 1024;
+
+/// A git metadata file's bytes; `None` when it is not there, not a file
+/// or larger than Codex reads.
+fn git_file(path: &Path) -> Result<Option<Vec<u8>>, Refusal> {
+    let cannot = || unknown(&format!("{} could not be read", path.display()));
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= MAX_GIT_FILE => {}
+        Ok(_) => return Ok(None),
+        Err(e) if not_there(&e) => return Ok(None),
+        Err(_) => return Err(cannot()),
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_GIT_FILE + 1).read_to_end(&mut bytes))
+        .map_err(|_| cannot())?;
+    Ok(Some(bytes))
+}
+
+/// The linked git worktrees of the repository checked out at `project`:
+/// Codex trusts a folder in one through its main checkout
+/// (`resolve_root_git_project_for_trust`), and reads the worktree's own
+/// `.codex/config.toml` files (`merge_root_checkout_project_hooks` takes
+/// only the hooks from the main checkout's). Each checkout named by a
+/// `worktrees/*/gitdir` file of the repository's git directory (`.git`, or
+/// the one a `.git` file names) is one, whether Codex would accept its
+/// links or not.
+fn linked_worktrees(project: &Path) -> Result<Vec<PathBuf>, Refusal> {
+    let dot_git = project.join(".git");
+    let git_dir = match std::fs::metadata(&dot_git) {
+        Ok(m) if m.is_dir() => dot_git,
+        Ok(_) => {
+            let named = git_file(&dot_git)?.and_then(|text| {
+                let t = text.trim_ascii().strip_prefix(b"gitdir:")?.trim_ascii();
+                (!t.is_empty()).then(|| project.join(OsStr::from_bytes(t)))
+            });
+            match named {
+                Some(d) => d,
+                None => return Ok(Vec::new()),
+            }
+        }
+        Err(e) if not_there(&e) => return Ok(Vec::new()),
+        Err(_) => {
+            return Err(unknown(&format!(
+                "{} could not be looked at",
+                dot_git.display()
+            )));
+        }
+    };
+    let listed = git_dir.join("worktrees");
+    let cannot = || {
+        unknown(&format!(
+            "the worktrees of the project you trust at {} could not be listed ({})",
+            project.display(),
+            listed.display()
+        ))
+    };
+    let rd = match std::fs::read_dir(&listed) {
+        Ok(rd) => rd,
+        Err(e) if not_there(&e) => return Ok(Vec::new()),
+        Err(_) => return Err(cannot()),
+    };
+    let mut out = Vec::new();
+    for e in rd {
+        let entry = e.map_err(|_| cannot())?.path();
+        let Some(text) = git_file(&entry.join("gitdir"))? else {
+            continue;
+        };
+        let t = text.trim_ascii();
+        if t.is_empty() {
+            continue;
+        }
+        // A relative path is read from the worktree's entry, resolved.
+        let base = std::fs::canonicalize(&entry).unwrap_or(entry);
+        let dot = base.join(OsStr::from_bytes(t));
+        if let Some(checkout) = dot.parent() {
+            out.push(checkout.to_path_buf());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Every folder at or below `root`, each one's project layer passed to
+/// [`check_dir`]; within `budget` folders, each counted once (`seen`:
+/// device and inode). A folder link is not followed: a session Codex
+/// starts in a folder it finds itself is in a resolved path, and one named
+/// through a link (`codex -C`) runs no command in Codex's
+/// `workspace-write` sandbox, the one the allowance is for (pinned
+/// 0.159.2, measured in `m2_story`: "symlinked writable roots are not
+/// supported"). A folder's `.codex` that is a link is read all the same
+/// ([`dot_codex`]).
 fn walk(
     root: &Path,
-    codex_home: &Path,
+    home: &Home,
     budget: &mut usize,
-    found: &mut dyn FnMut(&Path) -> Result<(), Refusal>,
+    seen: &mut HashSet<(u64, u64)>,
 ) -> Result<(), Refusal> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
+        let meta = match std::fs::metadata(&d) {
+            Ok(m) if m.is_dir() => m,
+            Ok(_) => continue,
+            Err(e) if not_there(&e) => continue,
+            Err(_) => {
+                return Err(unknown(&format!(
+                    "the folder {} in a project you trust could not be looked at",
+                    d.display()
+                )));
+            }
+        };
+        if !seen.insert((meta.dev(), meta.ino())) {
+            continue;
+        }
         if *budget == 0 {
             return Err(unknown(&format!(
                 "the projects you trust in Codex hold more folders than EnvCloak looks through, \
@@ -370,31 +573,23 @@ fn walk(
             )));
         }
         *budget -= 1;
+        check_dir(&d, home)?;
+        let cannot = || {
+            unknown(&format!(
+                "the folder {} in a project you trust could not be listed",
+                d.display()
+            ))
+        };
         let rd = match std::fs::read_dir(&d) {
             Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                return Err(unknown(&format!(
-                    "the folder {} in a project you trust could not be listed",
-                    d.display()
-                )));
-            }
+            Err(e) if not_there(&e) => continue,
+            Err(_) => return Err(cannot()),
         };
         for e in rd {
-            let Ok(e) = e else {
-                return Err(unknown(&format!(
-                    "the folder {} in a project you trust could not be listed",
-                    d.display()
-                )));
-            };
-            if !e.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
+            let e = e.map_err(|_| cannot())?;
+            if e.file_type().map_err(|_| cannot())?.is_dir() {
+                stack.push(e.path());
             }
-            let p = e.path();
-            if e.file_name() == ".codex" && p != codex_home {
-                found(&p.join("config.toml"))?;
-            }
-            stack.push(p);
         }
     }
     Ok(())
@@ -412,8 +607,8 @@ fn walk(
 /// `network_settings_unknown` when one may and cannot be read: a macOS
 /// device profile for Codex, a cache of an organization's settings (they
 /// come with the account), a file that is not readable TOML, a folder of
-/// a trusted project that cannot be listed, or more than [`MAX_DIRS`]
-/// folders to look through.
+/// a trusted project or of its worktrees that cannot be listed, or more
+/// than [`MAX_DIRS`] folders to look through.
 pub fn other_layers_fit(l: &Locations) -> Result<(), Refusal> {
     other_layers_fit_within(l, MAX_DIRS)
 }
@@ -424,8 +619,14 @@ pub fn other_layers_fit(l: &Locations) -> Result<(), Refusal> {
 /// # Errors
 /// As [`other_layers_fit`].
 pub fn other_layers_fit_within(l: &Locations, max_dirs: usize) -> Result<(), Refusal> {
-    for p in l.codex_managed_preferences() {
-        if std::fs::symlink_metadata(&p).is_ok() {
+    let prefs = l.codex_managed_preferences().map_err(|e| {
+        unknown(&format!(
+            "the managed preferences, where a device profile would give Codex settings, could \
+             not be listed ({e})"
+        ))
+    })?;
+    for p in prefs {
+        if exists(&p)? {
             return Err(unknown(&format!(
                 "a device profile gives Codex managed settings ({})",
                 p.display()
@@ -433,7 +634,7 @@ pub fn other_layers_fit_within(l: &Locations, max_dirs: usize) -> Result<(), Ref
         }
     }
     let cloud = l.codex_cloud_config_cache();
-    if std::fs::symlink_metadata(&cloud).is_ok() {
+    if exists(&cloud)? {
         return Err(unknown(&format!(
             "your account's workspace sends Codex settings of its own ({} is there)",
             cloud.display()
@@ -446,27 +647,39 @@ pub fn other_layers_fit_within(l: &Locations, max_dirs: usize) -> Result<(), Ref
     ] {
         check(&p)?;
     }
-    for p in l.codex_profile_configs() {
-        check(&p)?;
+    let profiles = l.codex_profile_configs().map_err(|e| {
+        unknown(&format!(
+            "Codex's directory, where its profile files are, could not be listed ({e})"
+        ))
+    })?;
+    for p in &profiles {
+        check(p)?;
     }
-    let codex_home =
-        std::fs::canonicalize(l.codex_home()).unwrap_or_else(|_| l.codex_home().to_path_buf());
+    let layers = settings_layers(l, &profiles);
+    let home = Home::of(l);
     let mut budget = max_dirs;
-    let mut walked: Vec<PathBuf> = Vec::new();
-    for project in trusted_projects(l) {
-        // The folders above a project: its layers start at its root, which
-        // a marker other than `.git` can put above it.
-        for a in project.ancestors().skip(1) {
-            if a.join(".codex") != codex_home {
-                check(&Locations::codex_project_config(a))?;
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut above: HashSet<PathBuf> = HashSet::new();
+    for project in trusted_projects(&layers) {
+        let mut roots = vec![project.clone()];
+        roots.extend(linked_worktrees(&project)?);
+        for root in roots {
+            // The folders above a checkout, by its name and where it leads:
+            // a root found by a marker other than `.git` can be one of them
+            // (a session's folder is a resolved path, so its folders above
+            // are those where the checkout's name leads).
+            let real = std::fs::canonicalize(&root).ok();
+            let ups = root
+                .ancestors()
+                .skip(1)
+                .chain(real.iter().flat_map(|r| r.ancestors().skip(1)));
+            for a in ups {
+                if above.insert(a.to_path_buf()) {
+                    check_dir(a, &home)?;
+                }
             }
+            walk(&root, &home, &mut budget, &mut seen)?;
         }
-        if walked.iter().any(|w| project.starts_with(w)) {
-            continue;
-        }
-        let real = std::fs::canonicalize(&project).unwrap_or_else(|_| project.clone());
-        walk(&real, &codex_home, &mut budget, &mut |p| check(p))?;
-        walked.push(project);
     }
     Ok(())
 }

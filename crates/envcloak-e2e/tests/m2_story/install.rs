@@ -982,6 +982,257 @@ fn codex_inherited_network_rules_keep_the_socket_allowance_out() {
     h.assert_swept("M2-08 Codex inherited network rules");
 }
 
+/// `git <args>` in `dir` with a cleared environment and no user or system
+/// configuration, within a bound; it must succeed.
+fn git(dir: &Path, args: &[&str]) {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args([
+        "-c",
+        "user.name=EnvCloak test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "init.defaultBranch=main",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ])
+    .args(args)
+    .current_dir(dir)
+    .env_clear()
+    .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+    .env("HOME", dir)
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("LC_ALL", "C")
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    let out = envcloak_testkit::agents::finish_capped(cmd, Duration::from_secs(60), 1 << 20);
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The layouts of [`codex_linked_layers_keep_the_socket_allowance_out`]:
+/// in `work`, a trusted project with a proxy domain rule for `127.0.0.1`
+/// where Codex reads it; the project, the session's folder, and the flags
+/// naming it.
+fn linked_layout(name: &str, work: &Path, rule: &str) -> (PathBuf, PathBuf, Vec<String>) {
+    match name {
+        "a .codex link to a folder" => {
+            let p = work.join("linked");
+            std::fs::create_dir_all(p.join(".git")).unwrap();
+            std::fs::create_dir_all(work.join("held")).unwrap();
+            std::fs::write(work.join("held/config.toml"), rule).unwrap();
+            std::os::unix::fs::symlink(work.join("held"), p.join(".codex")).unwrap();
+            (p.clone(), p, Vec::new())
+        }
+        "a linked worktree" => {
+            let main = work.join("main");
+            std::fs::create_dir_all(&main).unwrap();
+            git(&main, &["init", "-q"]);
+            git(&main, &["commit", "-q", "--allow-empty", "-m", "start"]);
+            let tree = work.join("trees/wt");
+            git(&main, &["worktree", "add", "-q", tree.to_str().unwrap()]);
+            std::fs::create_dir_all(tree.join(".codex")).unwrap();
+            std::fs::write(tree.join(".codex/config.toml"), rule).unwrap();
+            (main, tree, Vec::new())
+        }
+        _ => {
+            let p = work.join("named");
+            std::fs::create_dir_all(p.join(".git")).unwrap();
+            std::fs::create_dir_all(work.join("elsewhere/.codex")).unwrap();
+            std::fs::write(work.join("elsewhere/.codex/config.toml"), rule).unwrap();
+            std::os::unix::fs::symlink(work.join("elsewhere"), p.join("link")).unwrap();
+            let through = p.join("link").to_str().unwrap().to_owned();
+            (p.clone(), p, vec!["-C".to_owned(), through])
+        }
+    }
+}
+
+/// The verifier's round-6 finding (Codex F-128) and its class, on the
+/// pinned Codex (L-02): layers of a trusted project that Codex reads and
+/// the round-6 check did not look at. Three layouts, each with a proxy
+/// domain rule for `127.0.0.1` where Codex reads it:
+///
+/// - the project's `.codex` is a link to a folder holding the rule;
+/// - a linked git worktree of the project (made by git, outside it) holds
+///   the rule in its own `.codex/config.toml`, and the session runs there
+///   (Codex trusts it through its main checkout);
+/// - a folder link inside the project leads to a folder whose `.codex`
+///   holds the rule, and the session is named through the link (`codex
+///   exec -C <project>/link`).
+///
+/// Measured first, for each, with the allowance as round 5 wrote it (by
+/// hand): from the first two, a request from Codex's `workspace-write`
+/// sandbox goes through Codex's proxy to a loopback listener (Codex reads
+/// that layer, and its rule widens the allowance); then `agents install
+/// --consent-sandbox-sockets` writes the server and no allowance, reports
+/// the step refused (`network_settings_present`) and exits 1, and the same
+/// request reaches nothing. The third is measured with EnvCloak's own
+/// allowance: the check does not follow folder links, so install writes
+/// it (exit 0); the session named through the link, with the allowance
+/// and the rule behind the link both there, runs no command at all (Codex
+/// refuses a writable root named through a symlink: "symlinked writable
+/// roots are not supported"), and one in the project itself reaches
+/// nothing through the proxy (the rule behind the link is not read
+/// there).
+///
+/// Mutations checked, each against real Codex: `.codex` looked at without
+/// following a symlink (`symlink_metadata` in `codex_layers::dot_codex`):
+/// the first layout's allowance is written and the listener reached after
+/// install; `linked_worktrees` not called: the second's; folder links
+/// followed in `codex_layers::walk` (as the round-7 draft did): the third
+/// layout's install withholds the allowance, which no session there could
+/// use, and exits 1.
+#[test]
+fn codex_linked_layers_keep_the_socket_allowance_out() {
+    if !cfg!(target_os = "macos") {
+        eprintln!(
+            "codex_linked_layers_keep_the_socket_allowance_out: macOS only (K-01: no allowance \
+             on Linux)"
+        );
+        return;
+    }
+    let found = Installed::find(&versions_toml(), Host::Codex.id(), "native");
+    let Some(xi) = require(found, "M2-08 Codex linked layers") else {
+        return;
+    };
+    let rule = "[features.network_proxy.domains]\n\"127.0.0.1\" = \"allow\"\n";
+    let refused_root = "symlinked writable roots are not supported";
+    for name in [
+        "a .codex link to a folder",
+        "a linked worktree",
+        "a folder link named by -C",
+    ] {
+        let through_link = name == "a folder link named by -C";
+        let mut h = Harness::start();
+        vault(&mut h);
+        let mut codex = AgentHome::within(&h.home, Host::Codex, xi.clone());
+        let bin = host_bin(&h, &[&codex]);
+        let tmp = h.home.root().join("claude-tmp");
+        let home = h.home.home();
+        let work = home.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let work = std::fs::canonicalize(&work).unwrap();
+        let (project, cwd, extra) = linked_layout(name, &work, rule);
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let base =
+            HostFlags::codex("workspace-write", "never").with(&["--dangerously-bypass-hook-trust"]);
+        let flags = base.clone().with(&extra);
+        let trust = format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            project.display()
+        );
+        let socket = daemon_socket(&h.home);
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        tcp.set_nonblocking(true).unwrap();
+        let other = h.home.root().join("other.sock");
+        let _unix = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        let probe = h.home.root().join("egress.py");
+        std::fs::write(&probe, EGRESS).unwrap();
+        let proxied = format!(
+            "python3 {} proxied {port} {}",
+            quoted(probe.to_str().unwrap()),
+            quoted(other.to_str().unwrap())
+        );
+        let script = json!({"steps": [{"shell": proxied}, {"say": "done"}]});
+        let drained = |tcp: &std::net::TcpListener| {
+            let mut n = 0;
+            while tcp.accept().is_ok() {
+                n += 1;
+            }
+            n
+        };
+        let measure = |h: &mut Harness,
+                       codex: &AgentHome,
+                       when: &str,
+                       flags: &HostFlags|
+         -> (usize, String) {
+            let run = codex.run(&script, "Check.", flags, &cwd);
+            h.record(&format!("codex stdout ({when})"), &run.output.stdout);
+            h.record(&format!("codex stderr ({when})"), &run.output.stderr);
+            let said = last_tool_output(&request(&run, "step 1"));
+            let reached = drained(&tcp);
+            println!(
+                "measurement: Codex {} workspace-write, {name}, {when}: connections reaching the \
+                 loopback listener {}; {}",
+                codex.installed.pin.version,
+                reached,
+                said.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+            (reached, said)
+        };
+
+        // The control: the round-5 allowance, by hand. (A session named
+        // through a link is measured with EnvCloak's own allowance below:
+        // Codex may record that name as a trusted project of its own.)
+        if !through_link {
+            codex.codex_config(&format!(
+                "{trust}\n[sandbox_workspace_write]\nnetwork_access = true\n\n\
+                 [features.network_proxy]\nenabled = true\n\n\
+                 [features.network_proxy.unix_sockets]\n\"{}\" = \"allow\"\n",
+                socket.display()
+            ));
+            let (reached, said) = measure(&mut h, &codex, "with the round-5 allowance", &flags);
+            assert!(
+                reached > 0 && !said.contains("was blocked"),
+                "the control ({name}): the layer did not widen the allowance here: {said}"
+            );
+        }
+
+        // EnvCloak's install, with consent.
+        codex.codex_config(&trust);
+        age(&home.join(".codex/config.toml"), Duration::from_secs(600));
+        let (v, code) = agents(
+            &mut h,
+            &bin,
+            &tmp,
+            &[
+                "install",
+                "--agent",
+                "codex",
+                "--consent-sandbox-sockets",
+                "--yes",
+            ],
+        );
+        let toml = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(toml.contains("[mcp_servers.envcloak]"), "{name}: {toml}");
+        let (reached, said) = measure(&mut h, &codex, "after agents install", &flags);
+        assert_eq!(
+            reached, 0,
+            "{name}: the loopback listener was reached after install"
+        );
+        assert!(!said.contains("PROXIEDOK"), "{name}: {said}");
+        if through_link {
+            assert_eq!(code, 0, "{name}: {v}");
+            assert!(toml.contains("network_access = true"), "{name}: {toml}");
+            // The allowance and the rule behind the link are both there:
+            // the command does not run.
+            assert!(said.contains(refused_root), "{name}: {said}");
+            // The project itself, as Codex names it: the rule behind the
+            // link is not read, and the proxy blocks the listener (Codex
+            // fails the whole call when its proxy blocks a request).
+            let (reached, said) = measure(&mut h, &codex, "after install, in the project", &base);
+            assert_eq!(reached, 0, "{name}: the listener was reached");
+            assert!(
+                said.contains("PROXIEDNO") || said.contains("was blocked"),
+                "{name}: {said}"
+            );
+        } else {
+            assert!(!toml.contains("network_access"), "{name}: {toml}");
+            assert_eq!(code, 1, "{name}: {v}");
+            assert!(
+                refused_as(&v, "codex", "network_settings_present"),
+                "{name}: {v}"
+            );
+        }
+        h.assert_swept("M2-08 Codex linked layers");
+    }
+}
+
 /// Codex review, round 6, on the pinned Codex (L-02): which instruction
 /// file a session reads, and how much of it. Measured first, and the
 /// installer then judged by it:
