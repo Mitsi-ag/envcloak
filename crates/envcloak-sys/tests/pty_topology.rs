@@ -80,6 +80,10 @@ fn main() {
                 suspend_stops_the_command_and_the_channels_end_hangs_it_up,
             ),
             (
+                "a_monitor_that_dies_ends_the_channel_for_the_cli",
+                a_monitor_that_dies_ends_the_channel_for_the_cli,
+            ),
+            (
                 "an_outer_job_control_shell_regains_its_terminal_and_fg_resumes",
                 an_outer_job_control_shell_regains_its_terminal_and_fg_resumes,
             ),
@@ -371,6 +375,46 @@ fn suspend_stops_the_command_and_the_channels_end_hangs_it_up() {
     assert!(
         screen.wait_for_end(),
         "the terminal did not end: {}",
+        screen.text()
+    );
+}
+
+/// The monitor dies (SIGKILL, sent to it as this process's own unreaped
+/// child): the CLI sees the end of the control channel within the
+/// deadline (`UnexpectedEof`, what M2-19's `pty_monitor_lost` stands on),
+/// a command sent after it fails, `finish` reaps the monitor and returns
+/// how it died, and the kernel hangs the session up, so the command ends
+/// and the terminal with it. Keep a copy of the monitor's end of the
+/// channel in the CLI and the end never comes: the wait times out.
+fn a_monitor_that_dies_ends_the_channel_for_the_cli() {
+    let (master, slave, _) = raw_pty(false);
+    let mut monitor = spawn_session(
+        &[OsStr::new("/bin/cat")],
+        &[(OsStr::new("PATH"), OsStr::new("/usr/bin:/bin"))],
+        slave,
+    )
+    .unwrap();
+    let mut screen = Screen::new(master);
+    screen.type_bytes(b"line-one\n");
+    screen.expect("line-one\r\n", 1, "cat runs under the monitor");
+    let pid = i32::try_from(monitor.monitor_id()).unwrap();
+    // SAFETY: the monitor is this process's own, unreaped child (the
+    // session monitor's handle holds it).
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let lost = monitor.next_event(Some(DEADLINE));
+    assert!(
+        matches!(&lost, Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+        "the monitor's death was not seen as the channel's end: {lost:?}"
+    );
+    assert!(
+        monitor.send(MonitorCommand::Resume).is_err(),
+        "a command to a dead monitor was taken"
+    );
+    let status = monitor.finish().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    assert!(
+        screen.wait_for_end(),
+        "the hung-up session did not end the terminal: {}",
         screen.text()
     );
 }
