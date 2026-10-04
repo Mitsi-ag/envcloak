@@ -638,7 +638,9 @@ pub struct RemoveParams {
 /// with the kinds of place their values were found and how many. Marking
 /// only tightens, so it needs no proof; it is audited. A mark that names
 /// only kinds an item is marked for already changes nothing, so a doctor
-/// run repeated changes nothing it has marked. A rotation clears the mark.
+/// run repeated changes nothing it has marked. Only `secret` items are
+/// marked. A rotation that leaves the item holding no value the mark
+/// covers clears the mark.
 #[derive(Debug)]
 pub struct ItemsMarkExposed;
 

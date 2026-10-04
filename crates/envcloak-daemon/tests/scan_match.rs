@@ -17,8 +17,9 @@
 //! - every call is audited with counts and never a candidate;
 //! - an answer too large for a frame is audited as `frame_too_large`, and
 //!   a refused well-formed call is audited too;
-//! - `items.mark_exposed` marks, repeats change nothing, and a rotation
-//!   clears the mark.
+//! - `items.mark_exposed` marks secrets only, repeats change nothing, a
+//!   mark after a partial rotation restarts, and a rotation clears the mark
+//!   only when the item holds no value the mark covers.
 //!
 //! The caller is this test process, made a terminal session so the daemon
 //! takes its proofs (a person); the fixture agent's marker makes it an
@@ -938,8 +939,11 @@ fn requests_over_the_bounds_are_refused_whole() {
 /// refused whole; and a rotation clears the mark. Each call is audited
 /// with the items it marked.
 ///
+/// A checked call refused on a locked vault is audited `vault_locked`.
+///
 /// Mutations: a repeat written again (the count doubles and `already` is
-/// 0); rotation leaving the mark (the rotated item still shows it).
+/// 0); rotation leaving the mark (the rotated item still shows it); a
+/// refused call left unaudited (the locked call has no entry).
 #[test]
 fn marking_exposed_items_is_idempotent_and_rotation_clears_it() {
     let mut f = Fixture::new(|_, _| {});
@@ -1049,6 +1053,18 @@ fn marking_exposed_items_is_idempotent_and_rotation_clears_it() {
     .unwrap();
     assert_eq!(c.items_show("openai/acme-web").unwrap().exposed, None);
     assert!(c.items_show("github/acme-web").unwrap().exposed.is_some());
+    // A checked call refused on a locked vault is audited too, queued
+    // until the vault is unlocked, nothing marked.
+    c.lock().unwrap();
+    let e = c
+        .items_mark_exposed(&params(
+            vec![mark(&openai, &[ExposureSourceView::Transcript], 1)],
+            &[AGENT],
+        ))
+        .unwrap_err();
+    assert_eq!(rpc(e).0, ErrorKind::VaultLocked);
+    c.unlock(passphrase(&f.cs), &[]).unwrap();
+    assert_eq!(c.items_show("openai/acme-web").unwrap().exposed, None);
     drop(c);
     let v = f.stop_and_open();
     assert!(
@@ -1063,12 +1079,13 @@ fn marking_exposed_items_is_idempotent_and_rotation_clears_it() {
             .rotate_recommended
     );
     let (entries, _) = v.read_audit().unwrap();
-    let marks: Vec<(u64, Vec<String>, u64, u64)> = entries
+    let marks: Vec<(String, u64, Vec<String>, u64, u64)> = entries
         .iter()
         .filter(|e| e.record.kind == AuditKind::MarkExposed)
         .map(|e| {
             let d = &e.record.decision;
             (
+                d.outcome.clone(),
                 d.count.unwrap(),
                 e.record.items.iter().map(|(_, s)| s.to_string()).collect(),
                 named(&d.counts, "already"),
@@ -1076,17 +1093,22 @@ fn marking_exposed_items_is_idempotent_and_rotation_clears_it() {
             )
         })
         .collect();
+    let marked = |n, items: &[&str], already, missing| {
+        (
+            "marked".to_owned(),
+            n,
+            items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            already,
+            missing,
+        )
+    };
     assert_eq!(
         marks,
         [
-            (1, vec!["openai/acme-web".to_owned()], 0, 0),
-            (0, Vec::new(), 1, 0),
-            (
-                2,
-                vec!["openai/acme-web".to_owned(), "github/acme-web".to_owned()],
-                0,
-                1
-            ),
+            marked(1, &["openai/acme-web"], 0, 0),
+            marked(0, &[], 1, 0),
+            marked(2, &["openai/acme-web", "github/acme-web"], 0, 1),
+            ("vault_locked".to_owned(), 0, Vec::new(), 0, 0),
         ]
     );
     f.sweep_with(&entries);
@@ -1165,5 +1187,239 @@ fn an_answer_too_large_for_a_frame_is_audited_as_such() {
         named(&scans[0].3, "matches"),
         u64::try_from(MAX_SCAN_CANDIDATES * HOLDERS).unwrap()
     );
+    f.sweep_with(&entries);
+}
+
+/// The ids of the items `slugs` names, as `items.list` gives them.
+fn ids(c: &mut Client, slugs: &[&str]) -> Vec<String> {
+    let items = c.items_list(false).unwrap().items;
+    slugs
+        .iter()
+        .map(|s| items.iter().find(|i| i.slug == *s).unwrap().id.clone())
+        .collect()
+}
+
+/// One mark of `item`, found in a transcript, by any caller.
+fn mark_one(c: &mut Client, item: &str) -> envcloak_ipc::view::MarkedView {
+    c.items_mark_exposed(&MarkExposedParams {
+        items: vec![ExposedItem {
+            item: item.to_owned(),
+            sources: vec![ExposureSourceView::Transcript],
+            count: 1,
+        }],
+        claims: Vec::new(),
+    })
+    .unwrap()
+}
+
+/// Waits until the wall clock's second is past `secs` (Unix seconds): a
+/// write from then on is recorded later than one made in that second.
+fn after(secs: u64) {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    while now() <= secs {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Rotates `slug`'s `field` to `value`, as a person does.
+fn rotate(f: &Fixture, c: &mut Client, slug: &str, field: Option<&str>, value: &[u8]) {
+    let target = c.items_target(slug, field, &[]).unwrap();
+    c.items_rotate(
+        &target,
+        SecretBytes::copy_from(value),
+        passphrase(&f.cs),
+        &[],
+    )
+    .unwrap();
+}
+
+/// Only `secret` items are marked (R-M2-34, verifier review): a card's id
+/// and a login's are counted as naming no item, nothing is written for
+/// them, and the secret beside them is marked. `scan.match` never answers
+/// either, and a rotation, which alone clears a mark, takes secrets only,
+/// so a mark on one could never be cleared.
+///
+/// Mutation: any class marked (the card and the login are marked).
+#[test]
+fn only_secret_items_are_marked_exposed() {
+    let (card, password) = (word(24), word(24));
+    let (a, p) = (card.clone(), password.clone());
+    let mut f = Fixture::new(move |v, cs| {
+        cs.push(Canary::new("CARD", a.clone()));
+        cs.push(Canary::new("LOGIN_PASSWORD", p.clone()));
+        v.transact(|t| {
+            let id = t.create_item(NewItem {
+                class: ItemClass::Card,
+                slug: Slug::new("card/one").unwrap(),
+                details: ItemDetails::default(),
+            })?;
+            t.add_field(
+                id,
+                FieldName::new("value").unwrap(),
+                SecretBytes::copy_from(a.as_bytes()),
+            )?;
+            t.create_login(NewLogin {
+                slug: Slug::new("login/editor").unwrap(),
+                details: ItemDetails::default(),
+                meta: LoginMeta {
+                    tier: LoginTier::Dev,
+                    session_lifetime: 3600,
+                },
+                username: SecretBytes::copy_from(b"editor@example.test"),
+                password: SecretBytes::copy_from(p.as_bytes()),
+                totp: None,
+                adapter_key: None,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    });
+    let mut c = client(&f.home);
+    let named = ids(&mut c, &["card/one", "login/editor", "openai/acme-web"]);
+    let marked = c
+        .items_mark_exposed(&MarkExposedParams {
+            items: named
+                .iter()
+                .map(|id| ExposedItem {
+                    item: id.clone(),
+                    sources: vec![ExposureSourceView::Transcript],
+                    count: 1,
+                })
+                .collect(),
+            claims: vec![AGENT.to_owned()],
+        })
+        .unwrap();
+    assert_eq!((marked.marked, marked.already, marked.missing), (1, 0, 2));
+    let items = c.items_list(false).unwrap().items;
+    let exposed: Vec<&str> = items
+        .iter()
+        .filter(|i| i.exposed.is_some())
+        .map(|i| i.slug.as_str())
+        .collect();
+    assert_eq!(exposed, ["openai/acme-web"]);
+    drop(c);
+    let v = f.stop_and_open();
+    for slug in ["card/one", "login/editor"] {
+        let m = v.find(&Slug::new(slug).unwrap()).unwrap();
+        assert!(m.exposure.is_none() && !m.rotate_recommended, "{slug}");
+    }
+    let (entries, _) = v.read_audit().unwrap();
+    f.sweep_with(&entries);
+}
+
+/// A secret item of two fields, `a` and `b`, with generated values, made
+/// before the daemon starts.
+fn two_fields(slug: &'static str) -> impl FnOnce(&mut Vault, &mut Vec<Canary>) {
+    move |v, cs| {
+        let (a, b) = (word(40), word(40));
+        cs.push(Canary::new(format!("{slug}_A"), a.clone()));
+        cs.push(Canary::new(format!("{slug}_B"), b.clone()));
+        v.transact(|t| {
+            let id = t.create_item(NewItem {
+                class: ItemClass::Secret,
+                slug: Slug::new(slug).unwrap(),
+                details: ItemDetails::default(),
+            })?;
+            for (name, value) in [("a", &a), ("b", &b)] {
+                t.add_field(
+                    id,
+                    FieldName::new(name).unwrap(),
+                    SecretBytes::copy_from(value.as_bytes()),
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+/// When the mark was made, or last restarted.
+fn since(c: &mut Client, slug: &str) -> Option<u64> {
+    c.items_show(slug).unwrap().exposed.map(|x| x.since_secs)
+}
+
+/// A rotation clears the mark only when it leaves the item holding no
+/// value the mark covers (Codex review): a rotation to the value the field
+/// holds already leaves it; of an item of two fields, rotating one leaves
+/// it, since the other still holds its value from before the mark, and
+/// rotating the other then clears it.
+///
+/// Mutations: the mark cleared whatever the value written (the rotation
+/// to the same value clears it); the mark cleared whatever the item's
+/// other fields hold (rotating `a` alone clears it).
+#[test]
+fn a_rotation_clears_the_mark_only_when_no_covered_value_is_left() {
+    let mut f = Fixture::new(two_fields("two/fields"));
+    let mut c = client(&f.home);
+    // The same value again: still exposed.
+    let openai = ids(&mut c, &["openai/acme-web"]).remove(0);
+    assert_eq!(mark_one(&mut c, &openai).marked, 1);
+    let same = f.value(labels::OPENAI_API_KEY);
+    rotate(&f, &mut c, "openai/acme-web", None, &same);
+    assert!(since(&mut c, "openai/acme-web").is_some());
+    // Another value: cleared.
+    let fresh = word(40);
+    f.keep("OPENAI_FRESH", &fresh);
+    rotate(&f, &mut c, "openai/acme-web", None, fresh.as_bytes());
+    assert_eq!(since(&mut c, "openai/acme-web"), None);
+    // Two fields: one rotated leaves the mark, both clear it.
+    let two = ids(&mut c, &["two/fields"]).remove(0);
+    assert_eq!(mark_one(&mut c, &two).marked, 1);
+    after(since(&mut c, "two/fields").unwrap());
+    let (new_a, new_b) = (word(40), word(40));
+    f.keep("NEW_A", &new_a);
+    f.keep("NEW_B", &new_b);
+    rotate(&f, &mut c, "two/fields", Some("a"), new_a.as_bytes());
+    assert!(since(&mut c, "two/fields").is_some());
+    rotate(&f, &mut c, "two/fields", Some("b"), new_b.as_bytes());
+    assert_eq!(since(&mut c, "two/fields"), None);
+    drop(c);
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
+    f.sweep_with(&entries);
+}
+
+/// A mark made while the item holds a value set after its mark restarts
+/// the mark (Codex review): of an item of two fields, marked, `a` is
+/// rotated (the mark stays, `b` is from before it); `a`'s new value is then
+/// found and marked again, the same kind: that mark is written (not
+/// `already`) and restarts the mark's time, so rotating `b` afterwards
+/// leaves the mark, `a`'s value being covered now; rotating `a` again then
+/// clears it.
+///
+/// Mutation: a repeat of known kinds written as `already` whatever values
+/// the item holds (the second mark writes nothing, and rotating `b` clears
+/// the mark while `a`'s marked value is still there).
+#[test]
+fn a_mark_after_a_partial_rotation_covers_the_new_value() {
+    let mut f = Fixture::new(two_fields("re/marked"));
+    let mut c = client(&f.home);
+    let item = ids(&mut c, &["re/marked"]).remove(0);
+    assert_eq!(mark_one(&mut c, &item).marked, 1);
+    let first = since(&mut c, "re/marked").unwrap();
+    after(first);
+    let values: Vec<String> = (0..3).map(|_| word(40)).collect();
+    for (i, v) in values.iter().enumerate() {
+        f.keep(&format!("ROTATED_{i}"), v);
+    }
+    rotate(&f, &mut c, "re/marked", Some("a"), values[0].as_bytes());
+    assert_eq!(since(&mut c, "re/marked"), Some(first));
+    let again = mark_one(&mut c, &item);
+    assert_eq!((again.marked, again.already), (1, 0));
+    let restarted = since(&mut c, "re/marked").unwrap();
+    assert!(restarted > first);
+    after(restarted);
+    rotate(&f, &mut c, "re/marked", Some("b"), values[1].as_bytes());
+    assert_eq!(since(&mut c, "re/marked"), Some(restarted));
+    rotate(&f, &mut c, "re/marked", Some("a"), values[2].as_bytes());
+    assert_eq!(since(&mut c, "re/marked"), None);
+    drop(c);
+    let v = f.stop_and_open();
+    let (entries, _) = v.read_audit().unwrap();
     f.sweep_with(&entries);
 }
