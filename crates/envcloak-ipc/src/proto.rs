@@ -685,20 +685,63 @@ pub struct ImportProject {
     pub name: String,
 }
 
-/// One `NAME=value` entry of an env file.
+/// One `NAME=value` entry of an env file, a shell profile, an agent's MCP
+/// config, the AWS files or a vendor's export.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportEntry {
-    /// Index into [`ImportParams::projects`].
-    pub project: u32,
-    /// The file, relative to the project's directory.
+    /// Where the entry's item belongs: a project, or the machine.
+    pub scope: ImportScope,
+    /// The file: relative to the project's directory, or for a machine
+    /// entry its display path. Display text only.
     pub file: String,
     pub line: u32,
-    /// The profile the file is for; `None` for `[env]`.
+    /// The profile the file is for; `None` for `[env]`. A machine entry
+    /// has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub name: String,
     pub value: WireSecret,
+}
+
+/// Where an imported entry's item belongs (SPEC §6.4, M2 plan M2-11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImportScope {
+    /// A project: the index of its directory in [`ImportParams::projects`].
+    /// A new item is named `<provider or variable>/<project>`.
+    Project(u32),
+    /// The machine: a value found outside any project (a shell profile, an
+    /// agent's MCP config, the AWS files, a vendor's export). A new item
+    /// is named `<provider or variable>/<label>`, numbered when taken, and
+    /// no project is adopted for it.
+    Machine(MachineScope),
+}
+
+/// A machine-scope entry's source and label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineScope {
+    pub source: MachineSource,
+    /// One slug part that names where the value was found
+    /// (`secrets-sh`, `mcp-claude-code-fixture-stdio`). One shaped like a
+    /// key is never kept: the daemon names the item `<base>/machine`.
+    pub label: String,
+}
+
+/// Where a machine-scope entry was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineSource {
+    /// A shell profile or a file one sources.
+    Profile,
+    /// An agent's MCP server config.
+    McpConfig,
+    /// The AWS shared credentials or config file.
+    Aws,
+    /// A vendor's export (1Password, Bitwarden, Doppler, Infisical,
+    /// Vercel).
+    Export,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -42,7 +42,9 @@ use envcloak_client::gitignore::{Pos, ignores, ignores_every, shape};
 use envcloak_client::render::{HIDDEN, looks_like_value, print};
 use envcloak_core::SecretBytes;
 use envcloak_ipc::WireSecret;
-use envcloak_ipc::proto::{ImportCommitParams, ImportEntry, ImportParams, ImportProject};
+use envcloak_ipc::proto::{
+    ImportCommitParams, ImportEntry, ImportParams, ImportProject, ImportScope,
+};
 use envcloak_ipc::view::{
     EntryReport, FileChange, FileReport, ImportPlanView, ImportReport, ProjectReport, SkipReason,
     SkippedPath,
@@ -300,7 +302,7 @@ pub(crate) fn import_params(
                     continue;
                 }
                 entries.push(ImportEntry {
-                    project: u32::try_from(pi).unwrap_or(u32::MAX),
+                    scope: ImportScope::Project(u32::try_from(pi).unwrap_or(u32::MAX)),
                     file: f.file_name().to_owned(),
                     line: e.line,
                     profile: f.profile.as_ref().map(|p| p.as_str().to_owned()),
