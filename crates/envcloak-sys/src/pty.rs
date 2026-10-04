@@ -480,7 +480,7 @@ impl SessionMonitor {
     /// [`io::ErrorKind::InvalidInput`] for a signal the monitor does not
     /// send; [`io::ErrorKind::BrokenPipe`] when the monitor is gone; and
     /// `write`'s other errors.
-    pub fn send(&mut self, command: MonitorCommand) -> io::Result<()> {
+    pub fn send(&self, command: MonitorCommand) -> io::Result<()> {
         let command = match command {
             MonitorCommand::Resume => pty_monitor::Command::Resume,
             MonitorCommand::Suspend => pty_monitor::Command::Suspend,
@@ -620,7 +620,7 @@ pub fn signal_foreground_job(master: BorrowedFd<'_>, sig: i32) -> io::Result<()>
 /// [`io::ErrorKind::InvalidInput`] for a signal that is not forwarded; the
 /// route's own errors.
 pub fn forward_signal(
-    monitor: &mut SessionMonitor,
+    monitor: &SessionMonitor,
     master: BorrowedFd<'_>,
     sig: i32,
 ) -> io::Result<Forwarded> {
