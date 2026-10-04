@@ -8,14 +8,9 @@
 //! workspace's sources the code holds the entry, a code entry that neither
 //! a `landed` row nor the baseline of M1's entries accounts for, and a
 //! baseline that is missing, malformed or no longer what the code holds.
-//! The M3 reservations (task M3-01) are read under their own heading as
-//! one table with M2's per registry: a number or name taken in both fails,
-//! a row under the other milestone's heading fails, the M3 task and join
-//! ids are known and no other, app-role methods and unlocker kinds are read
-//! from the code, every row the M3 plan lists is reserved whatever its
-//! status, and no M3 name is one another registry holds. The decoders that
-//! read a stored unlocker kind, item class or policy kind back are read
-//! too, and a second number for one entry fails.
+//! The M3 reservations (task M3-01), the decoders and the `ALL` lists are
+//! tested in check_reservations_m3.rs, a file of their own so that lanes
+//! appending tests here and there do not edit one file's end.
 //! Its readers take every form Rust gives a declaration (hexadecimal and
 //! other integer literals, `Self::` arms, raw strings, escapes, `&str`
 //! with or without `'static`, a method in any file of the protocol crate)
@@ -132,7 +127,8 @@ const IPC: &str = "docs/IPC.md";
 const BASELINE: &str = "scripts/check-reservations-baseline.txt";
 const RECORD: &str = "crates/envcloak-core/src/audit/record.rs";
 
-/// Adds an `AuditKind` variant and its token to the copy of record.rs.
+/// Adds an `AuditKind` variant, its token and its entry in `AuditKind::ALL`
+/// to the copy of record.rs.
 fn add_audit_kind(t: &TestHome, variant: &str, number: u32, token: &str) {
     edit(
         t,
@@ -145,6 +141,18 @@ fn add_audit_kind(t: &TestHome, variant: &str, number: u32, token: &str) {
         RECORD,
         "AuditKind::Run => \"run\",",
         &format!("AuditKind::Run => \"run\",\n            AuditKind::{variant} => \"{token}\","),
+    );
+    add_to_all(t, variant);
+}
+
+/// Adds `AuditKind::<variant>` to the copy's `AuditKind::ALL`, which
+/// check-reservations.py holds to the enum from M3-01 on.
+fn add_to_all(t: &TestHome, variant: &str) {
+    edit(
+        t,
+        RECORD,
+        "        AuditKind::Run,\n",
+        &format!("        AuditKind::Run,\n        AuditKind::{variant},\n"),
     );
 }
 
@@ -691,6 +699,17 @@ fn a_reason_or_a_method_twice_in_the_code_fails() {
 
 // --- Code entries no row accounts for (D-23: reserved before use) ---------
 
+/// Adds `ErrorKind::<variant>` to the copy's `ErrorKind::ALL`, which
+/// check-reservations.py holds to the enum from M3-01 on.
+fn add_error_kind_to_all(t: &TestHome, variant: &str) {
+    edit(
+        t,
+        PROTO,
+        "        ErrorKind::Internal,\n    ];",
+        &format!("        ErrorKind::Internal,\n        ErrorKind::{variant},\n    ];"),
+    );
+}
+
 /// Appends a method `name` to the copy of proto.rs.
 fn add_method(t: &TestHome, name: &str) {
     let path = t.home().join(PROTO);
@@ -785,6 +804,7 @@ fn an_unreserved_error_kind_outside_the_reserved_range_fails() {
         "ErrorKind::Internal => \"internal\",",
         "ErrorKind::Internal => \"internal\",\n            ErrorKind::Fresh => \"fresh\",",
     );
+    add_error_kind_to_all(&t, "Fresh");
     assert_fails(
         &t,
         &format!(
@@ -910,6 +930,20 @@ fn policy_kinds_are_read_from_the_code() {
         "    ManagedServer = 3,\n}",
         "    ManagedServer = 3,\n    Spare = 9,\n}",
     );
+    // From M3-01 a kind is also read back by the decoder, so the probe is
+    // given a record and an arm, as a task that adds a kind does.
+    edit(
+        &t,
+        POLICIES,
+        "PolicyRecord::ManagedServer(_) => PolicyKind::ManagedServer,",
+        "PolicyRecord::ManagedServer(_) => PolicyKind::ManagedServer,\n            PolicyRecord::Spare(_) => PolicyKind::Spare,",
+    );
+    edit(
+        &t,
+        POLICIES,
+        "(3, 1) => PolicyRecord::ManagedServer(ManagedServer::decode(&mut d)?),",
+        "(3, 1) => PolicyRecord::ManagedServer(ManagedServer::decode(&mut d)?),\n            (9, 1) => PolicyRecord::Spare(Spare::decode(&mut d)?),",
+    );
     assert_fails(
         &t,
         "the code has `spare` = 9 in the reserved range with no `landed` row",
@@ -948,6 +982,15 @@ fn add_audit_variant(t: &TestHome, variant: &str, token: Option<(&str, &str)>) {
         "    Recover = 21,\n",
         &format!("    Recover = 21,\n    {variant}\n"),
     );
+    let name: String = variant
+        .lines()
+        .last()
+        .unwrap()
+        .trim()
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    add_to_all(t, &name);
     if let Some((name, token)) = token {
         edit(
             t,
@@ -1089,6 +1132,7 @@ fn an_error_kind_arm_written_with_self_counts() {
         "ErrorKind::Internal => \"internal\",",
         "ErrorKind::Internal => \"internal\",\n            Self::Fresh => \"fresh\",",
     );
+    add_error_kind_to_all(&t, "Fresh");
     assert_fails(
         &t,
         "`error_kind`: the code has `fresh` = -32000, which no `landed` row reserves",
@@ -3325,737 +3369,4 @@ fn file_conditionals_are_refused_and_test_only_control_decoys_are_ignored() {
     )
     .unwrap();
     assert_passes(&t.home());
-}
-
-// --- The M3 reservations (M3 plan, task M3-01) ----------------------------
-
-const ENVELOPE: &str = "crates/envcloak-core/src/crypto/envelope.rs";
-const STATE: &str = "crates/envcloak-core/src/vault/state.rs";
-const M3: &str = "\n## Reserved for M3\n";
-
-/// The part of a document's text under its "## Reserved for M3" heading,
-/// up to the next `## ` heading or the end.
-fn m3_section_of(text: &str) -> &str {
-    let start = text.find(M3).unwrap() + 1;
-    let rest = &text[start..];
-    let end = rest[3..].find("\n## ").map_or(rest.len(), |i| i + 3);
-    &rest[..end]
-}
-
-/// Adds `row` as the last row of the `registry` table under "Reserved for
-/// M3" in `doc` of the copy, whatever rows that table holds by then.
-fn add_m3_row(t: &TestHome, doc: &str, registry: &str, row: &str) {
-    let path = t.home().join(doc);
-    let text = std::fs::read_to_string(&path).unwrap();
-    let section = text.find(M3).unwrap();
-    let marker = format!("<!-- reservations:{registry} -->");
-    let open = section + text[section..].find(&marker).unwrap();
-    let close = open + text[open..].find("<!-- /reservations -->").unwrap();
-    std::fs::write(
-        &path,
-        format!("{}{row}\n{}", &text[..close], &text[close..]),
-    )
-    .unwrap();
-}
-
-/// Every row task M3-01 reserves, by the cells before its status: its
-/// name (and number, or method), and the lane-C task the M3 plan builds it
-/// in. The status is left to the script, which checks it against the code,
-/// so a task that lands its row changes nothing here (review: a test that
-/// pinned `reserved` would refuse every M3 task's landing).
-const M3_ROWS: &[(&str, &str)] = &[
-    (IPC, "| `signature_invalid` | -32051 | M3-09 |"),
-    (IPC, "| `unlock_failed` | -32052 | M3-08 |"),
-    (IPC, "| `no_unlocker` | -32053 | M3-08 |"),
-    (IPC, "| `ask_closed` | -32054 | M3-14 |"),
-    (IPC, "| `code_identity` | M3-07 |"),
-    (IPC, "| `rolled_back` | M3-16 |"),
-    (IPC, "| `keychain_anchor_missing` | M3-16 |"),
-    (IPC, "| `projects.list` | M3-04 |"),
-    (IPC, "| `items.ask` | M3-14 |"),
-    (IPC, "| `items.ask_state` | M3-14 |"),
-    (IPC, "| `reveal.request` | M3-14 |"),
-    (IPC, "| `app.pending.list` | M3-09 |"),
-    (IPC, "| `app.pending.get` | M3-09 |"),
-    (IPC, "| `app.approve` | M3-09 |"),
-    (IPC, "| `app.unlocker.enroll.begin` | M3-08 |"),
-    (IPC, "| `app.unlocker.enroll` | M3-08 |"),
-    (IPC, "| `app.unlocker.add` | M3-14 |"),
-    (IPC, "| `app.unlocker.remove` | M3-14 |"),
-    (IPC, "| `app.unlock.begin` | M3-08 |"),
-    (IPC, "| `app.unlock` | M3-08 |"),
-    (IPC, "| `app.items.target` | M3-14 |"),
-    (IPC, "| `app.items.rotate` | M3-14 |"),
-    (IPC, "| `app.items.remove` | M3-14 |"),
-    (IPC, "| `app.reveal.begin` | M3-14 |"),
-    (IPC, "| `app.reveal` | M3-14 |"),
-    (IPC, "| `app.paste.begin` | M3-14 |"),
-    (IPC, "| `app.paste.inspect` | M3-14 |"),
-    (IPC, "| `app.paste` | M3-14 |"),
-    (IPC, "| `app.asks.list` | M3-14 |"),
-    (IPC, "| `app.asks.decline` | M3-14 |"),
-    (IPC, "| `app.audit.list` | M3-16 |"),
-    (IPC, "| `app.lock` | M3-16 |"),
-    (IPC, "| `app.policy.set` | spare |"),
-    (IPC, "| `app.registry.override` | spare |"),
-    (IPC, "| `app.device.add` | M5 |"),
-    (IPC, "| `app.device.remove` | M5 |"),
-    (IPC, "| `status` | `vault.keychain_anchor` | M3-16 |"),
-    (IPC, "| `status` | `app_requests` | M3-14 |"),
-    (IPC, "| `status` | `lock.reason=screen_lock` | M3-16 |"),
-    (IPC, "| `status` | `lock.reason=session_resign` | M3-16 |"),
-    (IPC, "| `binding_absent` | M3-04 |"),
-    (IPC, "| `declined` | M3-19 |"),
-    (IPC, "| `expired` | M3-19 |"),
-    (IPC, "| `envcloak-statement/1` | M3-09 |"),
-    (IPC, "| `envcloak-unlocker-statement/1` | M3-08 |"),
-    (IPC, "| `envcloak-write-statement/1` | M3-14 |"),
-    (IPC, "| `envcloak-reveal-statement/1` | M3-14 |"),
-    (VAULT, "| 46 | `unlocker_add` | M3-08 |"),
-    (VAULT, "| 47 | `unlocker_remove` | M3-14 |"),
-    (VAULT, "| 48 | `reveal_app` | M3-14 |"),
-    (VAULT, "| 49 | `ask` | M3-14 |"),
-    (VAULT, "| 50 | `keychain_anchor_mismatch` | M3-16 |"),
-    (VAULT, "| 3 | `secure_enclave` | M3-08 |"),
-];
-
-/// Rows the M3 plan names that M3-01 does not reserve, with the reason in
-/// IPC.md's "Reserved for M3": `daemon.identity` is the CLI's own output
-/// since M1, and the keychain anchor's names say `keychain`, apart from the
-/// audit log's `anchor_mismatch`.
-const NOT_M3_ROWS: &[(&str, &str)] = &[
-    (IPC, "| `status` | `daemon.identity` |"),
-    (IPC, "| `status` | `vault.anchor` |"),
-    (IPC, "| `anchor_missing` |"),
-    (VAULT, "| 50 | `anchor_mismatch` |"),
-];
-
-/// What is wrong with the M3 rows of these two documents' texts.
-fn m3_row_problems(ipc: &str, vault: &str) -> Vec<String> {
-    let mut problems = Vec::new();
-    let section = |doc: &str| m3_section_of(if doc == IPC { ipc } else { vault }).to_owned();
-    for (doc, lead) in M3_ROWS {
-        let text = section(doc);
-        let rows: Vec<&str> = text.lines().filter(|l| l.starts_with(lead)).collect();
-        if rows.len() != 1 {
-            problems.push(format!(
-                "{lead} is under {doc}'s heading {} times",
-                rows.len()
-            ));
-            continue;
-        }
-        let status = rows[0][lead.len()..].trim_start();
-        if !["reserved |", "landed |", "reuse |"]
-            .iter()
-            .any(|s| status.starts_with(s))
-        {
-            problems.push(format!("{lead} has no status"));
-        }
-    }
-    for (doc, lead) in NOT_M3_ROWS {
-        if section(doc).lines().any(|l| l.starts_with(lead)) {
-            problems.push(format!("{lead} is a row under {doc}'s heading"));
-        }
-    }
-    problems
-}
-
-/// Every name and number the M3 plan's task M3-01 lists is reserved under
-/// "Reserved for M3", with the lane-C task the plan builds it in: methods
-/// (client and app role), fields, error kinds from -32051, reasons, exit
-/// tokens, statement domains, audit kinds from 46 and unlocker kind 3. A
-/// row whose status a later task changes still counts, and the names this
-/// task left out on purpose stay out.
-///
-/// Mutation checked: the `app.lock` row deleted from docs/IPC.md: the
-/// script still passes (it does not know the plan), and this test fails.
-/// And the rows matched with their status, as the first round did: the
-/// copy with `projects.list` landed fails, and this test fails.
-#[test]
-fn every_row_the_m3_plan_reserves_is_under_its_heading() {
-    let read = |doc: &str| std::fs::read_to_string(repo_root().join(doc)).unwrap();
-    let (ipc, vault) = (read(IPC), read(VAULT));
-    assert_eq!(m3_row_problems(&ipc, &vault), Vec::<String>::new());
-    // M3-04 landing `projects.list` changes its status alone.
-    let landed = ipc.replacen(
-        "| `projects.list` | M3-04 | reserved |",
-        "| `projects.list` | M3-04 | landed |",
-        1,
-    );
-    assert_ne!(landed, ipc);
-    assert_eq!(m3_row_problems(&landed, &vault), Vec::<String>::new());
-    // A row renamed away, or put back under a plan name left out, is not.
-    let gone = ipc.replacen("| `app.lock` | M3-16 |", "| `app.lock_screen` | M3-16 |", 1);
-    assert!(
-        m3_row_problems(&gone, &vault)
-            .iter()
-            .any(|p| p.contains("`app.lock` | M3-16 |"))
-    );
-    let back = vault.replacen("`keychain_anchor_mismatch`", "`anchor_mismatch`", 1);
-    assert_eq!(m3_row_problems(&ipc, &back).len(), 2);
-}
-
-/// What each registry's tables (in both documents and both sections) and
-/// the baseline name: (registry, name, status, whether the row is under
-/// "Reserved for M3"). A baseline line has the status `baseline`.
-fn registry_names(ipc: &str, vault: &str, baseline: &str) -> Vec<(String, String, String, bool)> {
-    let mut out = Vec::new();
-    for text in [ipc, vault] {
-        let m3_at = text.find(M3).unwrap_or(text.len());
-        let mut at = 0;
-        while let Some(i) = text[at..].find("<!-- reservations:") {
-            let open = at + i;
-            let reg_end = open + text[open..].find(" -->").unwrap();
-            let reg = &text[open + "<!-- reservations:".len()..reg_end];
-            let close = open + text[open..].find("<!-- /reservations -->").unwrap();
-            for line in text[reg_end..close].lines().skip(3) {
-                let cells: Vec<&str> = line
-                    .trim()
-                    .trim_matches('|')
-                    .split('|')
-                    .map(str::trim)
-                    .collect();
-                let ticked: Vec<&str> = cells
-                    .iter()
-                    .filter(|c| c.len() > 2 && c.starts_with('`') && c.ends_with('`'))
-                    .map(|c| &c[1..c.len() - 1])
-                    .collect();
-                let name = if reg == "field" || reg == "control_message" {
-                    ticked[1]
-                } else {
-                    ticked[0]
-                };
-                let status = cells[cells.len() - 2];
-                out.push((
-                    reg.to_owned(),
-                    name.to_owned(),
-                    status.to_owned(),
-                    open > m3_at,
-                ));
-            }
-            at = close;
-        }
-    }
-    for line in baseline.lines() {
-        let words: Vec<&str> = line.split('#').next().unwrap().split_whitespace().collect();
-        if words.len() >= 2 {
-            out.push((
-                words[0].to_owned(),
-                words[1].to_owned(),
-                "baseline".to_owned(),
-                false,
-            ));
-        }
-    }
-    out
-}
-
-/// Names an M3 row may share with another registry because the two mean
-/// one thing; a reviewer adds a pair here only after agreeing so. Empty.
-const M3_SHARED: &[(&str, &str)] = &[];
-
-/// The `reserved` M3 rows whose name another registry already holds.
-fn m3_names_held_elsewhere(ipc: &str, vault: &str, baseline: &str) -> Vec<String> {
-    let all = registry_names(ipc, vault, baseline);
-    let mut problems = Vec::new();
-    for (reg, name, status, in_m3) in &all {
-        if !in_m3 || status != "reserved" || M3_SHARED.contains(&(reg.as_str(), name.as_str())) {
-            continue;
-        }
-        for (other, other_name, other_status, _) in &all {
-            if other != reg && other_name == name {
-                problems.push(format!(
-                    "`{reg}` `{name}` is also `{other}` ({other_status})"
-                ));
-            }
-        }
-    }
-    problems
-}
-
-/// No name an M3 row reserves is one another registry already holds, in
-/// its tables or in the baseline (review: audit kind 50 was reserved as
-/// `anchor_mismatch`, which `audit.verify` and the CLI already use for the
-/// audit log's saved head, not the keychain anchor). The tree holds none;
-/// the round-one name put back is found.
-///
-/// Mutation checked: the comparison made within one registry only
-/// (`other == reg`): the round-one name passes, and this test fails.
-#[test]
-fn no_m3_reserved_name_is_another_registrys() {
-    let read = |rel: &str| std::fs::read_to_string(repo_root().join(rel)).unwrap();
-    let (ipc, vault, baseline) = (read(IPC), read(VAULT), read(BASELINE));
-    assert!(
-        registry_names(&ipc, &vault, &baseline)
-            .iter()
-            .any(|(reg, name, _, m3)| reg == "audit_kind"
-                && name == "keychain_anchor_mismatch"
-                && *m3),
-        "the reader finds the M3 rows"
-    );
-    assert_eq!(
-        m3_names_held_elsewhere(&ipc, &vault, &baseline),
-        Vec::<String>::new()
-    );
-    let back = vault.replacen("`keychain_anchor_mismatch`", "`anchor_mismatch`", 1);
-    assert_eq!(
-        m3_names_held_elsewhere(&ipc, &back, &baseline),
-        vec!["`audit_kind` `anchor_mismatch` is also `exit_token` (baseline)".to_owned()]
-    );
-}
-
-/// A number or name is taken once across both headings: the M3 plan's
-/// mutation (-32051 reserved twice) fails within its own section and
-/// across the two, and so do an audit kind and a method name.
-///
-/// Mutation checked: check_rows starting a fresh set of names and numbers
-/// for each section: the three cases across the two sections pass, and
-/// this test fails.
-#[test]
-fn a_number_or_name_reserved_in_both_sections_fails() {
-    let t = fixture();
-    edit(
-        &t,
-        IPC,
-        "| `unlock_failed` | -32052 |",
-        "| `unlock_failed` | -32051 |",
-    );
-    assert_fails(
-        &t,
-        "`error_kind`: number -32051 is reserved twice (`signature_invalid` and `unlock_failed`)",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        IPC,
-        "| `request_conflict` | -32047 |",
-        "| `request_conflict` | -32051 |",
-    );
-    assert_fails(
-        &t,
-        "`error_kind`: number -32051 is reserved twice (`request_conflict` and `signature_invalid`)",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        VAULT,
-        "| 45 | `signin_cleanup` |",
-        "| 46 | `signin_cleanup` |",
-    );
-    assert_fails(
-        &t,
-        "`audit_kind`: number 46 is reserved twice (`signin_cleanup` and `unlocker_add`)",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        IPC,
-        "| `items.ask` | M3-14 |",
-        "| `scan.match` | M3-14 |",
-    );
-    assert_fails(&t, "`method`: `scan.match` is reserved twice");
-}
-
-/// The script knows the M3 plan's tasks, `M3-01` to `M3-21`, and its joins,
-/// `M3-J1` to `M3-J6`, and no other `M3-` id: the plan's mutation (a row
-/// for `M3-99`) fails. Each id is given a row of its own, added to the
-/// table, so the test holds however the real rows change.
-///
-/// Mutation checked: TASKS taking any `M3-` id (`M3-%02d` for 1 to 99):
-/// `M3-22` and `M3-99` pass, and this test fails.
-#[test]
-fn every_m3_task_and_join_is_known_and_no_other_m3_id() {
-    let ids: Vec<String> = (1..=21)
-        .map(|n| format!("M3-{n:02}"))
-        .chain((1..=6).map(|n| format!("M3-J{n}")))
-        .collect();
-    let t = fixture();
-    for (i, id) in ids.iter().enumerate() {
-        add_m3_row(
-            &t,
-            IPC,
-            "exit_token",
-            &format!("| `zz_probe_{i}` | {id} | reserved | a probe row |"),
-        );
-    }
-    assert_passes(&t.home());
-
-    let t = fixture();
-    let bad = ["M3-00", "M3-22", "M3-99", "M3-J0", "M3-J7", "M3-1"];
-    for (i, id) in bad.iter().enumerate() {
-        add_m3_row(
-            &t,
-            IPC,
-            "exit_token",
-            &format!("| `zz_bad_{i}` | {id} | reserved | a probe row |"),
-        );
-    }
-    let out = run(&t.home());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{stderr}");
-    for id in bad {
-        let why = format!("names '{id}', which is not an M2, M2b or M3 task");
-        assert!(stderr.contains(&why), "expected {why:?} in: {stderr}");
-    }
-}
-
-/// A row of an M3 task belongs under "Reserved for M3" and a row of an M2
-/// or M2b task under "Reserved for M2 and M2b"; a bare later milestone
-/// must come after the section's own.
-///
-/// Mutation checked: check_rows without the section rule: each case
-/// passes, and this test fails.
-#[test]
-fn a_row_under_the_other_milestones_heading_fails() {
-    let t = fixture();
-    edit(
-        &t,
-        IPC,
-        "| `items.reclassify` | M2-13 |",
-        "| `items.reclassify` | M3-14 |",
-    );
-    assert_fails(
-        &t,
-        "`items.reclassify` is M3-14's, so its row belongs under \"Reserved for M3\", not \"Reserved for M2 and M2b\"",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        IPC,
-        "| `projects.list` | M3-04 |",
-        "| `projects.list` | M2-11 |",
-    );
-    assert_fails(
-        &t,
-        "`projects.list` is M2-11's, so its row belongs under \"Reserved for M2 and M2b\", not \"Reserved for M3\"",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        VAULT,
-        "| 3 | `secure_enclave` | M3-08 |",
-        "| 3 | `secure_enclave` | M3 |",
-    );
-    assert_fails(
-        &t,
-        "`secure_enclave` names M3, which is not a milestone after the one \"Reserved for M3\" reserves for",
-    );
-}
-
-/// Each heading holds a registry's table once, and a table outside the two
-/// headings is refused.
-///
-/// Mutation checked: read_tables keyed by the table alone (a second table
-/// under one heading merged in): the first case passes, and this test
-/// fails.
-#[test]
-fn a_table_twice_under_one_heading_or_under_another_heading_fails() {
-    let block = "\n<!-- reservations:reason -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `spare_reason` | spare | reserved | kept free |\n<!-- /reservations -->\n";
-    let t = fixture();
-    let path = t.home().join(IPC);
-    let text = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(&path, format!("{text}{block}")).unwrap();
-    assert_fails(
-        &t,
-        "the `reason` table appears twice under \"Reserved for M3\"",
-    );
-    let t = fixture();
-    let path = t.home().join(IPC);
-    let text = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(&path, format!("{text}\n## Reserved for M4\n{block}")).unwrap();
-    assert_fails(
-        &t,
-        "the `reason` table is under \"Reserved for M4\", not one of the headings",
-    );
-}
-
-/// App-role methods have their own table: an `app.` name in the client
-/// table, and a client name in the app table, are malformed.
-///
-/// Mutation checked: the client table's grammar taking any method name
-/// (METHOD, as before M3-01): the first case passes, and this test fails.
-#[test]
-fn an_app_method_in_the_client_table_or_the_reverse_fails() {
-    let t = fixture();
-    edit(
-        &t,
-        IPC,
-        "| `reveal.request` | M3-14 |",
-        "| `app.reveal.request` | M3-14 |",
-    );
-    assert_fails(
-        &t,
-        "`method`: `app.reveal.request` is not a well-formed name for this table",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        IPC,
-        "| `app.asks.decline` | M3-14 |",
-        "| `asks.decline` | M3-14 |",
-    );
-    assert_fails(
-        &t,
-        "`app_method`: `asks.decline` is not a well-formed name for this table",
-    );
-}
-
-/// The app-role methods are read from the code: an `impl Method` named
-/// like a `reserved` row fails, and passes once the row is `landed`; an
-/// app method no row reserves fails, and so does a `landed` row the code
-/// lacks. The client table does not count an app method. The probe row is
-/// added for the test, so it holds whatever the real rows' statuses.
-///
-/// Mutation checked: no reader for `app_method` (`code=None`): a reserved
-/// row the code has passes, and this test fails. And code_methods keeping
-/// `app.` names: the landed probe fails the client table, and this test
-/// fails.
-#[test]
-fn app_methods_are_read_from_the_code() {
-    let row = |status: &str| format!("| `app.zz_probe` | M3-16 | {status} | a probe row |");
-    let t = fixture();
-    add_m3_row(&t, IPC, "app_method", &row("reserved"));
-    add_method(&t, "app.zz_probe");
-    assert_fails(
-        &t,
-        "`app_method`: `app.zz_probe` is reserved, but the code already has it",
-    );
-    let t = fixture();
-    add_m3_row(&t, IPC, "app_method", &row("landed"));
-    add_method(&t, "app.zz_probe");
-    assert_passes(&t.home());
-    let t = fixture();
-    add_method(&t, "app.zz_unreserved");
-    assert_fails(
-        &t,
-        &format!(
-            "`app_method`: the code has `app.zz_unreserved` ({PROTO}), which no `landed` row reserves"
-        ),
-    );
-    let t = fixture();
-    add_m3_row(&t, IPC, "app_method", &row("landed"));
-    assert_fails(
-        &t,
-        "`app.zz_probe` is `landed`, but the code has no such entry",
-    );
-}
-
-/// Adds `variant = number` to the copy's `UnlockerKind` and the arm
-/// `arm => Some(UnlockerKind::<variant>)` to `UnlockerKind::from_byte`, at
-/// the top of each, so the edit holds whatever kinds the enum has by then.
-fn add_unlocker_kind(t: &TestHome, variant: &str, number: u32, arm: u32) {
-    edit(
-        t,
-        ENVELOPE,
-        "pub enum UnlockerKind {\n",
-        &format!("pub enum UnlockerKind {{\n    {variant} = {number},\n"),
-    );
-    add_unlocker_arm(t, &format!("{arm} => Some(UnlockerKind::{variant})"));
-}
-
-/// Adds `arm` as the first arm of the copy's `UnlockerKind::from_byte`.
-fn add_unlocker_arm(t: &TestHome, arm: &str) {
-    edit(
-        t,
-        ENVELOPE,
-        "        match b {\n",
-        &format!("        match b {{\n            {arm},\n"),
-    );
-}
-
-/// The unlocker kinds are read from `UnlockerKind`: M1's two from the
-/// baseline, a kind reserved until the code has it, and a kind no row
-/// reserves refused. The probe kind (9) is added for the test, so it holds
-/// once M3-08 lands `secure_enclave`.
-///
-/// Mutation checked: no reader for `unlocker_kind` (`code=None`): the
-/// tree itself fails (its baseline lines name a registry without a
-/// reader), a reserved kind the code has is not refused as such, and this
-/// test fails.
-#[test]
-fn unlocker_kinds_are_read_from_the_code() {
-    let row = |status: &str| format!("| 9 | `zz_probe` | M3-08 | {status} | a probe row |");
-    let t = fixture();
-    add_m3_row(&t, VAULT, "unlocker_kind", &row("reserved"));
-    add_unlocker_kind(&t, "ZzProbe", 9, 9);
-    assert_fails(
-        &t,
-        "`unlocker_kind`: `zz_probe` is reserved, but the code already has it",
-    );
-    let t = fixture();
-    add_m3_row(&t, VAULT, "unlocker_kind", &row("landed"));
-    add_unlocker_kind(&t, "ZzProbe", 9, 9);
-    assert_passes(&t.home());
-    let t = fixture();
-    add_unlocker_kind(&t, "ZzProbe", 9, 9);
-    assert_fails(
-        &t,
-        "the code has `zz_probe` = 9 in the reserved range with no `landed` row",
-    );
-    let t = fixture();
-    edit(&t, BASELINE, "unlocker_kind recovery_kit 2\n", "");
-    assert_fails(
-        &t,
-        "`unlocker_kind`: the code has `recovery_kit` = 2, which no `landed` row reserves",
-    );
-}
-
-/// `UnlockerKind::from_byte`, which reads a stored kind back, is read too
-/// and must name, for each number, the kind that number declares: a second
-/// number for one kind (the review's probe, `3 => Passphrase`), a kind
-/// read under a number other than its own, a number read twice and an arm
-/// the reader cannot read each fail, and the probe kind read under its own
-/// number passes.
-///
-/// Mutation checked: code_unlocker_kinds without the decoder (the
-/// declaration alone, as in round one): the probe's `3 => Passphrase`
-/// passes, and this test fails.
-#[test]
-fn the_unlocker_kind_decoder_is_the_declarations_inverse() {
-    let t = fixture();
-    add_unlocker_arm(&t, "3 => Some(UnlockerKind::Passphrase)");
-    assert_fails(
-        &t,
-        "`UnlockerKind::from_byte` reads 3 as `UnlockerKind::Passphrase`, whose number is 1: one entry with two numbers",
-    );
-    let t = fixture();
-    add_m3_row(
-        &t,
-        VAULT,
-        "unlocker_kind",
-        "| 9 | `zz_probe` | M3-08 | landed | a probe row |",
-    );
-    add_unlocker_kind(&t, "ZzProbe", 9, 8);
-    assert_fails(
-        &t,
-        "`UnlockerKind::from_byte` reads 8 as `UnlockerKind::ZzProbe`, whose number is 9",
-    );
-    let t = fixture();
-    add_unlocker_arm(&t, "1 => Some(UnlockerKind::Passphrase)");
-    assert_fails(&t, "`UnlockerKind::from_byte` reads 1 twice");
-    let t = fixture();
-    add_unlocker_arm(&t, "n if n == 3 => Some(UnlockerKind::Passphrase)");
-    assert_fails(
-        &t,
-        "`UnlockerKind::from_byte` has an arm the reader cannot read",
-    );
-    let t = fixture();
-    add_unlocker_arm(&t, "0x3 => Some(Self::Passphrase)");
-    assert_fails(
-        &t,
-        "reads 3 as `UnlockerKind::Passphrase`, whose number is 1",
-    );
-}
-
-/// The same class in the registries the script read before M3: the item
-/// class decoder (`item_class_from`, vault/state.rs) and the policy record
-/// decoder (`PolicyRecord::decode` through `PolicyRecord::kind`) are read,
-/// so a second number for one class or kind fails, as does a record that
-/// `kind` maps to another kind's number, and an arm the reader cannot read.
-///
-/// Mutation checked: code_item_classes and code_policy_kinds reading the
-/// declarations alone (`tags("ItemClass")` and `numbered_variants`): each
-/// case passes, and this test fails.
-#[test]
-fn the_item_class_and_policy_kind_decoders_are_read() {
-    let t = fixture();
-    edit(
-        &t,
-        STATE,
-        "    match v {\n",
-        "    match v {\n        5 => Some(ItemClass::Secret),\n",
-    );
-    assert_fails(
-        &t,
-        "`fn item_class_from` reads 5 as `ItemClass::Secret`, whose number is 1",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        POLICIES,
-        "        let record = match (kind, version) {\n",
-        "        let record = match (kind, version) {\n            (4, 1) => PolicyRecord::StandingApproval(StandingApproval::decode(&mut d)?),\n",
-    );
-    assert_fails(
-        &t,
-        "`PolicyRecord::decode` reads 4 as `PolicyKind::StandingApproval`, whose number is 1",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        POLICIES,
-        "PolicyRecord::SignInTarget(_) => PolicyKind::SigninTarget",
-        "PolicyRecord::SignInTarget(_) => PolicyKind::StandingApproval",
-    );
-    assert_fails(
-        &t,
-        "`PolicyRecord::decode` reads 2 as `PolicyKind::StandingApproval`, whose number is 1",
-    );
-    let t = fixture();
-    edit(
-        &t,
-        POLICIES,
-        "        let record = match (kind, version) {\n",
-        "        let record = match (kind, version) {\n            (k, 1) if k == 4 => PolicyRecord::StandingApproval(StandingApproval::decode(&mut d)?),\n",
-    );
-    assert_fails(
-        &t,
-        "`PolicyRecord::decode` has an arm the reader cannot read",
-    );
-}
-
-/// A field nested with dots (`vault.keychain_anchor` in `status`) is read,
-/// and a malformed one is refused.
-///
-/// Mutation checked: FIELD taking any text: the empty component passes,
-/// and this test fails.
-#[test]
-fn a_dotted_field_is_read_and_a_malformed_one_fails() {
-    assert_passes(&fixture().home());
-    let t = fixture();
-    edit(
-        &t,
-        IPC,
-        "| `status` | `vault.keychain_anchor` |",
-        "| `status` | `vault..keychain_anchor` |",
-    );
-    assert_fails(
-        &t,
-        "`vault..keychain_anchor` is not a well-formed name for this table",
-    );
-}
-
-/// The M3 plan's code-owned paths (task M3-01): the macOS app, its build
-/// and signing scripts, and the pinned requirements, beside the two
-/// checks whose tables the M3 tasks take their rows from.
-///
-/// Mutation checked: the `/apps/macos/` line removed from
-/// .github/CODEOWNERS: this test fails.
-#[test]
-fn codeowners_name_an_owner_for_the_m3_paths() {
-    let text = std::fs::read_to_string(repo_root().join(".github/CODEOWNERS")).unwrap();
-    let owned: Vec<(&str, usize)> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let mut words = l.split_whitespace();
-            let pattern = words.next().unwrap();
-            (pattern, words.filter(|w| w.starts_with('@')).count())
-        })
-        .collect();
-    for want in [
-        "/apps/macos/",
-        "/scripts/macos/",
-        "/crates/envcloak-sys/src/peer_code.rs",
-        "/crates/envcloak-sys/src/peer_code/",
-        "/scripts/check-reservations.py",
-        "/scripts/check-reservations-baseline.txt",
-        "/scripts/check-spec-decisions.py",
-    ] {
-        assert!(
-            owned.iter().any(|(p, owners)| *p == want && *owners > 0),
-            "CODEOWNERS names no owner for {want}"
-        );
-    }
 }
