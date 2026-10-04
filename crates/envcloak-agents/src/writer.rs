@@ -320,6 +320,7 @@ impl StateFile {
                 "another `envcloak agents install` or `uninstall` is running",
             ));
         }
+        sweep_state_saves(&root, &dir);
         let (state, stamp) = match read_plain(&root, Path::new(STATE_NAME), MAX_STATE) {
             Ok((bytes, stamp)) => {
                 let state: State = serde_json::from_slice(&bytes).map_err(|_| {
@@ -353,6 +354,36 @@ impl StateFile {
             },
             state,
         ))
+    }
+}
+
+/// Removes what saves of the state stopped part way left under its
+/// temporary names (`.state.json.envcloak-<new|swap|del>-<hex>.tmp`) in
+/// `<data>/agents/`, EnvCloak's own directory (0700), while the state's
+/// lock is held: no other program writes there, and the state holds no
+/// text of the person's files. A regular file of this user with no other
+/// link goes; anything else stays.
+fn sweep_state_saves(root: &ScanRoot, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for e in entries.flatten() {
+        let n = e.file_name();
+        if temp_of(OsStr::new(STATE_NAME), &n).is_none() {
+            continue;
+        }
+        let rel = Path::new(&n);
+        let Ok((bytes, stamp)) = read_plain(root, rel, MAX_STATE) else {
+            continue;
+        };
+        drop(Zeroizing::new(bytes));
+        if stamp.nlink != 1 {
+            continue;
+        }
+        let mtime =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(stamp.mtime).unwrap_or(0));
+        let _ = remove_checked_at(root, rel, &stamp, now.max(mtime + MIN_AGE));
     }
 }
 
@@ -730,13 +761,22 @@ impl Writer<'_> {
     }
 
     fn try_change(&mut self, t: &Target, edit: &mut EditFn<'_>) -> Result<Outcome, Refusal> {
-        self.sweep(&t.path);
         let r = open_target(&t.path, true)?;
         let k = key(&t.path);
         let before = r.current.as_ref().map(|(b, _)| b.as_slice());
         self.settle(&k, before);
         let prev = self.state.files.get(&k).cloned();
-        let Some((after, edits)) = edit(before, prev.as_ref())? else {
+        let edited = edit(before, prev.as_ref());
+        // What earlier writes of the file left beside it goes first, now
+        // that what this one would write is known: a write stopped part
+        // way left the first bytes of these same contents (Codex review).
+        let staged = match &edited {
+            Ok(Some((a, _))) => Some(a.as_slice()),
+            _ => None,
+        };
+        let refs: Vec<&[u8]> = before.into_iter().chain(staged).collect();
+        self.sweep(&t.path, &refs);
+        let Some((after, edits)) = edited? else {
             return Ok(Outcome::Unchanged);
         };
         if before == Some(after.as_slice()) {
@@ -870,12 +910,20 @@ impl Writer<'_> {
     }
 
     /// Removes what EnvCloak's earlier writes of `path` left beside it
-    /// under its temporary names ([`State::leftovers`]): each regular file
-    /// of this user of that shape holding exactly contents of a recorded
-    /// digest. A file of that shape holding anything else is not
-    /// EnvCloak's to remove, and stays. The record goes once nothing of it
-    /// is left. Nothing is reported: the write that left a file said so.
-    pub fn sweep(&mut self, path: &Path) {
+    /// under its temporary names ([`State::leftovers`]), given `refs`,
+    /// contents of the file EnvCloak is writing or wrote (the file as it
+    /// is, what this run would write): a regular file of this user of that
+    /// shape, with no other link, that holds exactly contents of a recorded
+    /// digest (a whole copy: new contents, old ones swapped out, a file
+    /// being removed); or, under a name new contents are written under,
+    /// the first bytes of contents of a recorded digest, nothing at all
+    /// included (a write stopped part way: Codex review, such a copy can
+    /// already hold a literal key, and was left and forgotten). Those
+    /// contents are among `refs`, since the state keeps no text of the file
+    /// (lesson L-12). Anything else of that shape is not shown to be
+    /// EnvCloak's and stays, and so does the record, so the file goes on
+    /// being reported ([`Writer::leftovers_present`]) until it is gone.
+    pub fn sweep(&mut self, path: &Path, refs: &[&[u8]]) {
         let k = key(path);
         let Some(digests) = self.state.leftovers.get(&k).cloned() else {
             return;
@@ -886,18 +934,30 @@ impl Writer<'_> {
         let (Ok(root), Ok(entries)) = (open_root(parent), std::fs::read_dir(parent)) else {
             return;
         };
+        // The contents a part may be of: those whose digest is recorded.
+        let whole: Vec<&[u8]> = refs
+            .iter()
+            .copied()
+            .filter(|r| digests.contains(&sha256_hex(r)))
+            .collect();
         let mut kept = false;
         for entry in entries.flatten() {
             let n = entry.file_name();
-            if !temp_of(name, &n) {
+            let Some(shape) = temp_of(name, &n) else {
                 continue;
-            }
+            };
             let rel = Path::new(&n);
             let Ok((bytes, stamp)) = read_plain(&root, rel, MAX_FILE) else {
+                // Not a regular file of this user that can be read: it is
+                // not shown to be EnvCloak's.
+                kept = true;
                 continue;
             };
             let bytes = Zeroizing::new(bytes);
-            if !digests.contains(&sha256_hex(&bytes)) {
+            let copy = digests.contains(&sha256_hex(&bytes));
+            let part = shape == TempShape::New && whole.iter().any(|w| w.starts_with(&bytes));
+            if stamp.nlink != 1 || !(copy || part || shape == TempShape::New && bytes.is_empty()) {
+                kept = true;
                 continue;
             }
             // EnvCloak's own file: the 2 minutes run from its own write.
@@ -912,12 +972,43 @@ impl Writer<'_> {
         }
     }
 
-    /// [`Writer::sweep`] for every file the state names leftovers for.
+    /// [`Writer::sweep`] for every file the state names leftovers for,
+    /// each with its contents as they are.
     pub fn sweep_all(&mut self) {
         let keys: Vec<String> = self.state.leftovers.keys().cloned().collect();
         for k in keys {
-            self.sweep(Path::new(&k));
+            let path = PathBuf::from(&k);
+            let current: Option<Zeroizing<Vec<u8>>> = open_target(&path, false)
+                .ok()
+                .and_then(|r| r.current)
+                .map(|(b, _)| Zeroizing::new(b));
+            let refs: Vec<&[u8]> = current.iter().map(|b| b.as_slice()).collect();
+            self.sweep(&path, &refs);
         }
+    }
+
+    /// The files under EnvCloak's temporary names still beside the files
+    /// the state names leftovers for: what a sweep could not show to be
+    /// EnvCloak's, or could not remove. Each may hold a copy of part of
+    /// the file, so a report names it (lesson L-08).
+    pub fn leftovers_present(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for k in self.state.leftovers.keys() {
+            let path = Path::new(k);
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                if temp_of(name, &e.file_name()).is_some() {
+                    out.push(parent.join(e.file_name()));
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Puts back the record a change replaced.
@@ -961,7 +1052,6 @@ impl Writer<'_> {
         if !self.state.files.contains_key(&k) {
             return Ok(Outcome::Unchanged);
         }
-        self.sweep(&t.path);
         let r = open_target(&t.path, false)?;
         self.settle(&k, r.current.as_ref().map(|(b, _)| b.as_slice()));
         let Some(rec) = self.state.files.get(&k).cloned() else {
@@ -969,18 +1059,29 @@ impl Writer<'_> {
         };
         let Some((bytes, stamp)) = &r.current else {
             // Gone already: nothing of EnvCloak's is left.
+            self.sweep(&t.path, &[]);
             self.state.files.remove(&k);
             let _ = self.journal.save(self.state);
             return Ok(Outcome::Unchanged);
         };
         let ours = sha256_hex(bytes) == rec.post_sha256;
         let plan = match Self::exact(&rec, bytes) {
-            Some(b) if rec.created && b.is_empty() => Undo::Remove,
-            Some(b) => Undo::Rewrite(b),
+            Some(b) if rec.created && b.is_empty() => Ok(Undo::Remove),
+            Some(b) => Ok(Undo::Rewrite(b)),
             // EnvCloak's whole file, exactly as it wrote it.
-            None if ours && rec.created && rec.edits.contains(&Edit::WholeFile) => Undo::Remove,
-            None => structural(bytes, &rec.edits, rec.created)?,
+            None if ours && rec.created && rec.edits.contains(&Edit::WholeFile) => Ok(Undo::Remove),
+            None => structural(bytes, &rec.edits, rec.created),
         };
+        // What earlier writes left beside it goes first, now that what
+        // this one would write is known (a stopped write left its first
+        // bytes).
+        let staged = match &plan {
+            Ok(Undo::Rewrite(a)) => Some(a.as_slice()),
+            _ => None,
+        };
+        let refs: Vec<&[u8]> = std::iter::once(bytes.as_slice()).chain(staged).collect();
+        self.sweep(&t.path, &refs);
+        let plan = plan?;
         let t = Target {
             host_owned: t.host_owned || rec.host_owned,
             ..t.clone()
@@ -1101,35 +1202,37 @@ fn present(r: &Read) -> bool {
     )
 }
 
-/// Whether `n` is a temporary name EnvCloak's atomic writes give a file
-/// named `name` while it changes (`envcloak_scan`'s `temp_name`:
-/// `.<name>.envcloak-<new|swap|del>-<16 hex>.tmp`, the name left out when
-/// it is longer than 128 bytes).
-fn temp_of(name: &OsStr, n: &OsStr) -> bool {
+/// What a temporary name holds while a file changes: new contents being
+/// written (`new`, the one a stopped write may leave in part), or a whole
+/// file moved there (`swap`, `del`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TempShape {
+    New,
+    Moved,
+}
+
+/// The shape of `n` when it is a temporary name EnvCloak's atomic writes
+/// give a file named `name` while it changes (`envcloak_scan`'s
+/// `temp_name`: `.<name>.envcloak-<new|swap|del>-<16 hex>.tmp`, the name
+/// left out when it is longer than 128 bytes); `None` otherwise.
+fn temp_of(name: &OsStr, n: &OsStr) -> Option<TempShape> {
     let n = n.as_bytes();
     let name = name.as_bytes();
-    let Some(rest) = n.strip_prefix(b".") else {
-        return false;
-    };
+    let rest = n.strip_prefix(b".")?;
     let rest = if name.len() <= 128 {
-        match rest.strip_prefix(name) {
-            Some(r) => r,
-            None => return false,
-        }
+        rest.strip_prefix(name)?
     } else {
         rest
     };
-    let Some(rest) = rest.strip_prefix(b".envcloak-") else {
-        return false;
-    };
-    let Some(hex) = [&b"new-"[..], b"swap-", b"del-"]
-        .iter()
-        .find_map(|w| rest.strip_prefix(*w))
-        .and_then(|r| r.strip_suffix(b".tmp"))
-    else {
-        return false;
-    };
-    hex.len() == 16 && hex.iter().all(|b| b.is_ascii_hexdigit())
+    let rest = rest.strip_prefix(b".envcloak-")?;
+    let (shape, hex) = [
+        (&b"new-"[..], TempShape::New),
+        (b"swap-", TempShape::Moved),
+        (b"del-", TempShape::Moved),
+    ]
+    .iter()
+    .find_map(|(w, shape)| Some((*shape, rest.strip_prefix(*w)?.strip_suffix(b".tmp")?)))?;
+    (hex.len() == 16 && hex.iter().all(u8::is_ascii_hexdigit)).then_some(shape)
 }
 
 /// A failure a unit test puts in a file operation: after it was done, or
@@ -1805,23 +1908,51 @@ mod tests {
         assert!(!q.exists());
     }
 
+    /// A key-shaped value made at run time (never a literal in the tree).
+    fn canary(seed: u64) -> String {
+        let mut x = seed | 1;
+        (0..40)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(
+                    b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"[(x % 56) as usize],
+                )
+            })
+            .collect()
+    }
+
     /// The Codex review: a write stopped in the middle (the run killed)
     /// leaves a copy of the config, a literal key in it included, under a
     /// temporary name beside it. The digests of what the write could
     /// leave are saved before it, so the next run removes those copies:
     /// files of the temporary names' shape holding exactly those
-    /// contents. Anything else stays: another digest, another shape.
-    /// The leftovers here are laid out as `replace_atomically` names them
-    /// (a run cannot be stopped inside it from a test).
+    /// contents, or (under a name new contents are written under) their
+    /// first bytes: a write stopped part way, the key already in it (the
+    /// second Codex review: such a copy was skipped, and its record
+    /// forgotten). Which contents a part is of is known once the next run
+    /// has worked out what it writes, the same contents; until then the
+    /// part stays, and so does the record, and the file is named
+    /// (`leftovers_present`). Anything else stays and stays named: another
+    /// digest, another shape. The leftovers here are laid out as
+    /// `replace_atomically` names them (a run cannot be stopped inside it
+    /// from a test), from the state as the stopped run saved it.
     ///
     /// Mutations checked: `expect_leftovers` adding nothing, and `sweep`
-    /// returning at once: the copies are still there and this fails.
+    /// returning at once: the copies are still there and this fails;
+    /// `sweep` taking only whole copies (the previous digest check): the
+    /// part holding the key stays and this fails; the record dropped
+    /// whatever is left (the previous `kept` only for a failed removal):
+    /// nothing is named while the part and the other file are there, and
+    /// this fails.
     #[test]
     fn what_a_stopped_write_left_is_removed_by_the_next_run() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let p = dir.path().join("settings.json");
-        let before = b"{\"env\": {\"K\": \"literal\"}}\n";
-        std::fs::write(&p, before).unwrap_or_else(|e| panic!("{e}"));
+        let key_text = canary(0x5eed);
+        let before = format!("{{\"env\": {{\"K\": \"{key_text}\"}}}}\n").into_bytes();
+        std::fs::write(&p, &before).unwrap_or_else(|e| panic!("{e}"));
         let t = target(&p, false);
         // The run's first save, its record and what it may leave, is all
         // that reached the disk.
@@ -1830,31 +1961,112 @@ mod tests {
             fail: vec![2],
             ..Saved::default()
         };
+        // A change whose new contents differ from the old from their first
+        // byte, so a part of them is no part of the file as it is.
+        let mut comment = |b: Option<&[u8]>, _: Option<&FileRecord>| {
+            let b = b.unwrap_or_default();
+            if b.starts_with(b"// ") {
+                return Ok(None);
+            }
+            let mut v = b"// ".to_vec();
+            v.extend_from_slice(b);
+            Ok(Some((v, vec![Edit::Block])))
+        };
         let mut w = writer!(&mut state, &mut saved, &mut kept);
-        let _ = w.change(&t, &mut append("x"));
+        let _ = w.change(&t, &mut comment);
         let on_disk = saved.saves.first().cloned().unwrap_or_default();
-        let mut after = before.to_vec();
-        after.extend_from_slice(b"x");
+        let mut after = b"// ".to_vec();
+        after.extend_from_slice(&before);
         // The run stopped with the old contents swapped out and the new
         // ones staged: the file itself as it was.
-        std::fs::write(&p, before).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&p, &before).unwrap_or_else(|e| panic!("{e}"));
         let staged = temp(dir.path(), "settings.json", "new", "0123456789abcdef");
         let old = temp(dir.path(), "settings.json", "swap", "fedcba9876543210");
         std::fs::write(&staged, &after).unwrap_or_else(|e| panic!("{e}"));
-        std::fs::write(&old, before).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&old, &before).unwrap_or_else(|e| panic!("{e}"));
+        // Another write stopped part way: the new contents' first bytes,
+        // the key's half included; and one stopped before its first byte.
+        let cut = before.len() - 10;
+        let part = temp(dir.path(), "settings.json", "new", "00000000000000aa");
+        std::fs::write(&part, &after[..cut]).unwrap_or_else(|e| panic!("{e}"));
+        let empty = temp(dir.path(), "settings.json", "new", "00000000000000bb");
+        std::fs::write(&empty, b"").unwrap_or_else(|e| panic!("{e}"));
         let theirs = temp(dir.path(), "settings.json", "new", "1111111111111111");
         std::fs::write(&theirs, b"not EnvCloak's").unwrap_or_else(|e| panic!("{e}"));
+        // The first bytes of something else, under a name of the shape
+        // a whole file is moved to: not shown to be EnvCloak's.
+        let moved_part = temp(dir.path(), "settings.json", "swap", "00000000000000cc");
+        std::fs::write(&moved_part, &after[..cut]).unwrap_or_else(|e| panic!("{e}"));
         let odd = dir.path().join(".settings.json.envcloak-new-xyz.tmp");
         std::fs::write(&odd, &after).unwrap_or_else(|e| panic!("{e}"));
         let mut state = on_disk;
         assert!(state.leftovers.contains_key(&key(&p)));
         let (mut saved, mut kept) = (Saved::default(), Kept::default());
         let mut w = writer!(&mut state, &mut saved, &mut kept);
+        // With the file as it is, whole copies go, and the empty part.
         w.sweep_all();
         assert!(!staged.exists() && !old.exists(), "EnvCloak's copies stay");
+        assert!(!empty.exists(), "the empty part stays");
+        assert!(part.exists(), "a part of what is not known yet went");
         assert!(theirs.exists() && odd.exists(), "another file was removed");
+        assert!(w.state.leftovers.contains_key(&key(&p)), "the record went");
+        assert_eq!(
+            w.leftovers_present(),
+            vec![part.clone(), theirs.clone(), moved_part.clone()]
+        );
+        // The next change of the file works out the same contents: the
+        // part is of them, and goes.
+        assert!(matches!(
+            w.change(&t, &mut comment),
+            Outcome::Changed { .. }
+        ));
+        assert!(!part.exists(), "the part holding the key stays");
+        assert!(theirs.exists() && moved_part.exists() && odd.exists());
+        assert_eq!(
+            w.leftovers_present(),
+            vec![theirs.clone(), moved_part.clone()]
+        );
+        // Gone, they are no longer named, and the record goes.
+        std::fs::remove_file(&theirs).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::remove_file(&moved_part).unwrap_or_else(|e| panic!("{e}"));
+        w.sweep_all();
+        assert!(w.leftovers_present().is_empty());
         assert!(w.state.leftovers.is_empty());
-        assert_eq!(std::fs::read(&p).unwrap_or_default(), before);
+        assert_eq!(std::fs::read(&p).unwrap_or_default(), after);
+        // Nothing else holds the key beside the file but the person's own
+        // file of another shape.
+        let mut names: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        names.sort();
+        let mut want = vec![p.clone(), odd.clone()];
+        want.sort();
+        assert_eq!(names, want);
+        assert!(String::from_utf8_lossy(&after).contains(&key_text));
+    }
+
+    /// A save of the state stopped part way leaves its new contents under a
+    /// temporary name in `<data>/agents/`: the next open removes them (the
+    /// class of the Codex review's finding: a stopped write's part was
+    /// never removed). A file of that shape for another name stays.
+    ///
+    /// Mutation checked: `sweep_state_saves` not called in
+    /// `StateFile::open`: the part stays and this fails.
+    #[test]
+    fn a_stopped_save_of_the_state_is_removed_when_it_is_opened() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let agents = dir.path().join("agents");
+        std::fs::create_dir(&agents).unwrap_or_else(|e| panic!("{e}"));
+        let part = temp(&agents, STATE_NAME, "new", "0123456789abcdef");
+        std::fs::write(&part, b"{\"version\": 1, \"fi").unwrap_or_else(|e| panic!("{e}"));
+        let other = temp(&agents, "other.json", "new", "0123456789abcdef");
+        std::fs::write(&other, b"x").unwrap_or_else(|e| panic!("{e}"));
+        let (_file, state) = StateFile::open(dir.path()).unwrap_or_else(|r| panic!("{r:?}"));
+        assert!(state.files.is_empty());
+        assert!(!part.exists(), "the stopped save is still there");
+        assert!(other.exists());
     }
 
     /// A file EnvCloak wrote whole is removed only while it is what

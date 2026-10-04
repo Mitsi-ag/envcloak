@@ -324,6 +324,7 @@ fn print_report(home: &Path, report: &Report, json: bool, install: bool, saved: 
         print_json(&json!({
             "hosts": hosts,
             "project": project,
+            "leftovers": report.leftovers.iter().map(|p| shown(home, p)).collect::<Vec<_>>(),
             "applied": true,
             "complete": report.complete() && saved,
         }));
@@ -352,6 +353,21 @@ fn print_report(home: &Path, report: &Report, json: bool, install: bool, saved: 
             escape_for_display(&p.dir.display().to_string())
         );
         print_results(home, &p.results);
+    }
+    print_leftovers(home, &report.leftovers);
+}
+
+/// The files an earlier write left under EnvCloak's temporary names and
+/// that were left there (lesson L-08: each may hold part of a config).
+fn print_leftovers(home: &Path, leftovers: &[PathBuf]) {
+    for p in leftovers {
+        println!(
+            "Left beside a config: {}: a file under EnvCloak's temporary name for it, which a \
+             stopped run may have left holding part of that config (a literal key included); \
+             EnvCloak could not tell it is its own, so it is still there: look at it, and \
+             remove it",
+            shown(home, p)
+        );
     }
 }
 
@@ -382,23 +398,22 @@ pub fn project_note(dir: &Path, json: bool) -> Result<(), Failure> {
     // above is reported as changed (L-08; the verifier's finding: the save
     // came first here, and its failure hid what was changed).
     let saved = file.save(&state);
+    let complete = report.complete();
+    let leftovers = report.leftovers;
     let results = report.project.map(|p| p.results).unwrap_or_default();
     if json {
         print_json(&json!({
             "agents_note": results.iter().map(|r| result_json(&home, r)).collect::<Vec<_>>(),
-            "complete": saved.is_ok() && results.iter().all(|r| {
-                !matches!(r.outcome, Outcome::Refused(_) | Outcome::Partial { .. })
-            }),
+            "leftovers": leftovers.iter().map(|p| shown(&home, p)).collect::<Vec<_>>(),
+            "complete": saved.is_ok() && complete,
         }));
     } else {
         println!("Agent note:");
         print_results(&home, &results);
+        print_leftovers(&home, &leftovers);
     }
     saved.map_err(|r| state_failure(&r))?;
-    if results
-        .iter()
-        .any(|r| matches!(r.outcome, Outcome::Refused(_) | Outcome::Partial { .. }))
-    {
+    if !complete {
         return Err(incomplete());
     }
     Ok(())
