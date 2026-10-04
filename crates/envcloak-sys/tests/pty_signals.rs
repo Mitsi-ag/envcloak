@@ -176,7 +176,7 @@ fn forwarded_signals_reach_the_nested_shells_job_and_not_the_shell() {
 
     // 1. The route `envcloak run --pty` takes.
     for (i, (sig, name)) in SIGNALS.iter().enumerate() {
-        let forwarded = forward_signal(&mut monitor, screen.master(), *sig).unwrap();
+        let forwarded = forward_signal(&monitor, screen.master(), *sig).unwrap();
         assert_eq!(Some(forwarded.route), signal_route(*sig), "{name}");
         assert!(
             wait_lines(&d.join(format!("job-{name}")), 1, DEADLINE),
