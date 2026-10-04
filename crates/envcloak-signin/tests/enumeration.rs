@@ -40,8 +40,15 @@
 //!   delivered session included), the attempt's timeout, the session's
 //!   lifetime;
 //! - declared state, the decision, publication and the per-call check go
-//!   only to the generation's supervisor, and every other channel's
-//!   message changes nothing;
+//!   only to the generation's supervisor, each only in its own phase (the
+//!   supervisor's own messages out of turn are refused too), and every
+//!   other channel's message changes nothing;
+//! - the effects of a call are exactly its transitions: an attempt that
+//!   started asks for one worker, with its generation's id and its lease;
+//!   a capture asks for one supervisor, with its generation's id; a stop
+//!   of a started attempt asks for one teardown, delivered as the stop
+//!   says; nothing else. The worker and supervisor ids every later event
+//!   uses are the ones these effects handed out, as the daemon gets them;
 //! - a password or code step is permitted only for an attempt running at
 //!   that call: one password and two codes per attempt, no more attempts
 //!   than credits approved, a `once` authorization at most one attempt;
@@ -85,10 +92,11 @@ use envcloak_core::vault::ItemId;
 use envcloak_policy::Now;
 use envcloak_signin::store::STATEMENT_TTL;
 use envcloak_signin::{
-    ApproveError, AttemptFailure, AuthorizationId, Channel, Cleanup, Deadline, Effect, Fresh,
-    Generation, IdentityResponse, Instance, Lookup, Nonce, NotFound, Operation, OperationKey,
-    OperationStore, Options, Phase, PublishDecision, RETRY_WINDOW, Request, RequestError,
-    RequestId, Revisions, SignInScope, State, Status, Step, StopReason, StoreLimits, World,
+    ApproveError, AttemptFailure, AuthorizationId, Channel, Cleanup, CreditLease, Deadline, Effect,
+    Fresh, Generation, IdentityResponse, Instance, Lookup, Nonce, NotFound, Operation,
+    OperationKey, OperationStore, Options, Phase, PublishDecision, RETRY_WINDOW, Request,
+    RequestError, RequestId, Revisions, SignInScope, State, Status, Step, StopReason, StoreLimits,
+    SupervisorId, WorkerId, World,
 };
 
 /// Events per ordering.
@@ -227,6 +235,9 @@ struct Seen {
     attempt: Option<Deadline>,
     session: Option<Deadline>,
     retry_until: Option<SystemTime>,
+    /// The ids the start effects handed out for it.
+    worker: Option<WorkerId>,
+    supervisor: Option<SupervisorId>,
 }
 
 /// What the monitor remembers of one authorization.
@@ -361,10 +372,13 @@ fn settled(store: &OperationStore, now: &Now, world: &TestWorld) -> (OperationSt
     (s, effects)
 }
 
-/// A refused call leaves the store as the store brought up to date.
+/// A refused call leaves the store as the store brought up to date, with
+/// the effects bringing it up to date took (left in the store for the
+/// call's own check).
 fn unchanged(node: &Node, sim: &mut Sim, what: &str) -> Result<(), Violation> {
-    let effects = sim.store.drain_effects();
-    if sim.store != node.base || effects != node.base_effects {
+    let mut store = sim.store.clone();
+    let effects = store.drain_effects();
+    if store != node.base || effects != node.base_effects {
         return Err(format!("{what} changed the store"));
     }
     Ok(())
@@ -580,9 +594,11 @@ fn step(
             }
         }
         Ev::Password(o) | Ev::Code(o) => {
-            let Some((id, g)) = known(o).and_then(|x| Some((x.request(), x.generation()?))) else {
+            let Some((id, wk)) = known(o).and_then(|x| Some((x.request(), worker_of(prev, x)?)))
+            else {
                 return Ok(None);
             };
+            let g = wk.generation();
             let (kind, done, max) = match ev {
                 Ev::Password(_) => (Step::Password, prev.mon.ops[&id].passwords, 1),
                 _ => (Step::Code, prev.mon.ops[&id].codes, 2),
@@ -592,7 +608,7 @@ fn step(
                     && x.phase() == Phase::AttemptRunning
                     && x.generation() == Some(g)
             });
-            let got = sim.store.permit(&id, g, kind, &now, &sim.world);
+            let got = sim.store.permit(&id, &wk, kind, &now, &sim.world);
             match (running && done < max, got) {
                 (true, Ok(())) => {
                     let seen = sim.mon.ops.get_mut(&id).unwrap();
@@ -619,20 +635,22 @@ fn step(
             }
         }
         Ev::Captured(o) | Ev::Failed(o) => {
-            let Some((id, g)) = known(o).and_then(|x| Some((x.request(), x.generation()?))) else {
+            let Some((id, wk)) = known(o).and_then(|x| Some((x.request(), worker_of(prev, x)?)))
+            else {
                 return Ok(None);
             };
+            let g = wk.generation();
             let running = current(o).is_some_and(|x| {
                 x.stop().is_none()
                     && x.phase() == Phase::AttemptRunning
                     && x.generation() == Some(g)
             });
             let got = if let Ev::Captured(_) = ev {
-                sim.store.worker_captured(&id, g, &now, &sim.world)
+                sim.store.worker_captured(&id, &wk, &now, &sim.world)
             } else {
                 sim.store.worker_failed(
                     &id,
-                    g,
+                    &wk,
                     AttemptFailure::CredentialsRejected,
                     &now,
                     &sim.world,
@@ -655,7 +673,8 @@ fn step(
             }
         }
         Ev::Claim(o) => {
-            let Some((id, sup)) = known(o).and_then(|x| Some((x.request(), x.supervisor()?)))
+            let Some((id, sup)) =
+                known(o).and_then(|x| Some((x.request(), supervisor_of(prev, x)?)))
             else {
                 return Ok(None);
             };
@@ -701,7 +720,7 @@ fn step(
             }) else {
                 return Ok(None);
             };
-            let Some(sup) = x.supervisor() else {
+            let Some(sup) = supervisor_of(prev, x) else {
                 return Ok(None);
             };
             supervisor_message(node, &mut sim, x, sup, &now, reached)?;
@@ -710,14 +729,16 @@ fn step(
             let Some(x) = known(o) else {
                 return Ok(None);
             };
-            foreign(&mut sim, x, o, &now)?;
+            foreign(node, &mut sim, x, o, &now)?;
             unchanged(node, &mut sim, "a message from another channel or root")?;
             reached.foreign_refused += 1;
         }
         Ev::Cleanup(o) => {
-            let Some((id, g)) = known(o).and_then(|x| Some((x.request(), x.generation()?))) else {
+            let Some((id, wk)) = known(o).and_then(|x| Some((x.request(), worker_of(prev, x)?)))
+            else {
                 return Ok(None);
             };
+            let g = wk.generation();
             let closed = !cfg.close_fails || prev.mon.ops[&id].close_failed;
             let takes = current(o).is_some_and(|x| {
                 x.generation() == Some(g)
@@ -728,7 +749,7 @@ fn step(
                 current(1 - o).is_some_and(|y| y.stop().is_none() && y.phase() == Phase::Approved);
             match (
                 takes,
-                sim.store.cleanup_result(&id, g, closed, &now, &sim.world),
+                sim.store.cleanup_result(&id, &wk, closed, &now, &sim.world),
             ) {
                 (true, Ok(())) => {
                     let seen = sim.mon.ops.get_mut(&id).unwrap();
@@ -838,7 +859,7 @@ fn reserved(
     if node.sim.mon.auths.values().any(|a| {
         a.slot != o
             && !a.locked
-            && node.sim.t < a.approved + a.window
+            && t_of(node) < a.approved + a.window
             && a.remaining > 0
             && world.epochs == *a.scope.epochs()
             && world.revisions(&a.scope) == Revisions::of(&a.scope)
@@ -912,6 +933,8 @@ fn reserved(
             attempt: None,
             session: None,
             retry_until: None,
+            worker: None,
+            supervisor: None,
         },
     );
     Ok(())
@@ -928,6 +951,20 @@ fn expected(scope: &SignInScope) -> IdentityResponse {
     }
 }
 
+fn t_of(node: &Node) -> u64 {
+    node.sim.t
+}
+
+/// `x`'s worker id, as its start effect handed it out.
+fn worker_of(sim: &Sim, x: &Operation) -> Option<WorkerId> {
+    sim.mon.ops.get(&x.request())?.worker
+}
+
+/// `x`'s supervisor id, as its start effect handed it out.
+fn supervisor_of(sim: &Sim, x: &Operation) -> Option<SupervisorId> {
+    sim.mon.ops.get(&x.request())?.supervisor
+}
+
 /// The supervisor's next message on its own channel, chosen by what it
 /// last knew: the identity response, the publication, or a per-call
 /// check. Each is judged by the store brought up to date at that call.
@@ -935,7 +972,7 @@ fn supervisor_message(
     node: &Node,
     sim: &mut Sim,
     x: &Operation,
-    sup: envcloak_signin::SupervisorId,
+    sup: SupervisorId,
     now: &Now,
     reached: &mut Reached,
 ) -> Result<(), Violation> {
@@ -1009,25 +1046,64 @@ fn supervisor_message(
 /// Every message `x` must refuse from a channel that is not its
 /// generation's supervisor, worker results of another generation, and
 /// status, cancel and end from other roots.
-fn foreign(sim: &mut Sim, x: &Operation, o: usize, now: &Now) -> Result<(), Violation> {
+fn foreign(
+    node: &Node,
+    sim: &mut Sim,
+    x: &Operation,
+    o: usize,
+    now: &Now,
+) -> Result<(), Violation> {
     let id = x.request();
     let other = 1 - o;
-    let other_op = sim.slots[other]
-        .and_then(|i| sim.store.operation(&i))
+    let other_seen = sim.slots[other]
+        .filter(|i| *i != id)
+        .and_then(|i| sim.mon.ops.get(&i))
         .cloned();
-    let other_gen: Option<Generation> = other_op
+    let other_worker: Option<WorkerId> = other_seen
         .as_ref()
-        .and_then(Operation::generation)
-        .filter(|g| Some(*g) != x.generation());
+        .and_then(|s| s.worker)
+        .filter(|w| Some(w.generation()) != x.generation());
     let mut channels = vec![
         Channel::Client(x.scope().delivery().requester),
         Channel::Client(SIBLING),
         Channel::Client(OTHER_MCP),
         Channel::Client(x.owner()),
     ];
-    if let Some(s) = other_op.as_ref().and_then(Operation::supervisor) {
+    if let Some(s) = other_seen.as_ref().and_then(|s| s.supervisor) {
         if Some(s.generation()) != x.generation() {
             channels.push(Channel::Supervisor(s));
+        }
+    }
+    // The operation's own supervisor, each message out of its turn as the
+    // store brought up to date has the operation: publication only
+    // acknowledges a decided session, the check only a published one, the
+    // claim only a captured one not yet given its state, and no decision
+    // publishes before that state was given.
+    let own = sim.mon.ops.get(&id).cloned();
+    if let Some(sup) = own.as_ref().and_then(|s| s.supervisor) {
+        let from = Channel::Supervisor(sup);
+        let cur = node.base.operation(&id);
+        let live = |p: Phase| cur.is_some_and(|y| y.stop().is_none() && y.phase() == p);
+        let injected = own.as_ref().is_some_and(|s| s.injections > 0);
+        if !live(Phase::PublishDecided) && sim.store.published(&from, &id, now, &sim.world).is_ok()
+        {
+            return Err("publication acknowledged out of turn".into());
+        }
+        if !live(Phase::Published) && sim.store.check(&from, &id, now, &sim.world).is_ok() {
+            return Err("a tool call checked out of turn".into());
+        }
+        if !(live(Phase::Captured) && !injected)
+            && sim.store.inject_state(&from, &id, now, &sim.world).is_ok()
+        {
+            return Err("declared state given out of turn".into());
+        }
+        if !(live(Phase::Captured) && injected)
+            && sim
+                .store
+                .identity_response(&from, &id, &expected(x.scope()), now, &sim.world)
+                .is_ok_and(|d| d == PublishDecision::Publish)
+        {
+            return Err("published out of turn".into());
         }
     }
     for from in &channels {
@@ -1047,20 +1123,20 @@ fn foreign(sim: &mut Sim, x: &Operation, o: usize, now: &Now) -> Result<(), Viol
             return Err(format!("a tool call checked for {from:?}"));
         }
     }
-    if let Some(g) = other_gen {
+    if let Some(w) = other_worker {
         let late = [
-            sim.store.worker_captured(&id, g, now, &sim.world).is_ok(),
+            sim.store.worker_captured(&id, &w, now, &sim.world).is_ok(),
             sim.store
-                .worker_failed(&id, g, AttemptFailure::WorkerLost, now, &sim.world)
+                .worker_failed(&id, &w, AttemptFailure::WorkerLost, now, &sim.world)
                 .is_ok(),
             sim.store
-                .permit(&id, g, Step::Password, now, &sim.world)
+                .permit(&id, &w, Step::Password, now, &sim.world)
                 .is_ok(),
             sim.store
-                .permit(&id, g, Step::Code, now, &sim.world)
+                .permit(&id, &w, Step::Code, now, &sim.world)
                 .is_ok(),
             sim.store
-                .cleanup_result(&id, g, true, now, &sim.world)
+                .cleanup_result(&id, &w, true, now, &sim.world)
                 .is_ok(),
         ];
         if late.iter().any(|ok| *ok) {
@@ -1090,11 +1166,16 @@ fn check(
     reached: &mut Reached,
 ) -> Result<(), Violation> {
     let t = sim.t;
+    transitions(prev, sim, effects)?;
     // Attempts started only for live operations, one login at a time,
     // within the credits approved.
     for e in effects {
         match e {
-            Effect::StartAttempt { request, lease, .. } => {
+            Effect::StartAttempt {
+                request,
+                lease,
+                worker,
+            } => {
                 if sim
                     .store
                     .operation(request)
@@ -1113,6 +1194,7 @@ fn check(
                 let seen = sim.mon.ops.get_mut(request).ok_or("an unseen attempt")?;
                 seen.started = Some(t);
                 seen.holds_login = true;
+                seen.worker = Some(*worker);
                 let a = sim
                     .mon
                     .auths
@@ -1130,7 +1212,13 @@ fn check(
                 let seen = sim.mon.ops.get_mut(request).ok_or("an unseen teardown")?;
                 seen.teardown_asked = true;
             }
-            Effect::StartSupervisor { .. } => {}
+            Effect::StartSupervisor {
+                request,
+                supervisor,
+            } => {
+                let seen = sim.mon.ops.get_mut(request).ok_or("an unseen supervisor")?;
+                seen.supervisor = Some(*supervisor);
+            }
         }
     }
     // No eviction: an operation goes only once its retry window passed
@@ -1250,6 +1338,72 @@ fn check(
         {
             return Err(format!("{id:?}: steps not as permitted"));
         }
+    }
+    Ok(())
+}
+
+/// The effects of a call against its transitions, from `prev` to `sim`:
+/// one [`Effect::StartAttempt`] for each operation whose attempt started,
+/// with a worker id of that generation and the operation's lease; one
+/// [`Effect::StartSupervisor`] for each that captured, with a supervisor
+/// id of that generation; one [`Effect::TearDown`] for each that stopped
+/// after its attempt started, with that generation and delivered as the
+/// stop says; and nothing else.
+fn transitions(prev: &Sim, sim: &Sim, effects: &[Effect]) -> Result<(), Violation> {
+    let mut starts: BTreeMap<RequestId, (WorkerId, CreditLease)> = BTreeMap::new();
+    let mut supervisors: BTreeMap<RequestId, SupervisorId> = BTreeMap::new();
+    let mut teardowns: BTreeMap<RequestId, (Generation, bool)> = BTreeMap::new();
+    for e in effects {
+        let twice = match *e {
+            Effect::StartAttempt {
+                request,
+                worker,
+                lease,
+            } => starts.insert(request, (worker, lease)).is_some(),
+            Effect::StartSupervisor {
+                request,
+                supervisor,
+            } => supervisors.insert(request, supervisor).is_some(),
+            Effect::TearDown {
+                request,
+                generation,
+                delivered,
+            } => teardowns.insert(request, (generation, delivered)).is_some(),
+        };
+        if twice {
+            return Err(format!("one call asked twice: {e:?}"));
+        }
+    }
+    for x in sim.store.operations() {
+        let id = x.request();
+        let before = prev.store.operation(&id);
+        let started = x.generation().is_some() && before.is_none_or(|p| p.generation().is_none());
+        match (started, starts.remove(&id)) {
+            (false, None) => {}
+            (true, Some((w, lease)))
+                if Some(w.generation()) == x.generation() && Some(lease) == x.lease() => {}
+            (s, got) => return Err(format!("{id:?}: started={s} asked {got:?}")),
+        }
+        let captured =
+            x.phase() >= Phase::Captured && before.is_none_or(|p| p.phase() < Phase::Captured);
+        match (captured, supervisors.remove(&id)) {
+            (false, None) => {}
+            (true, Some(s)) if Some(s.generation()) == x.generation() => {}
+            (c, got) => return Err(format!("{id:?}: captured={c} asked {got:?}")),
+        }
+        let stopped = x
+            .stop()
+            .filter(|_| before.is_none_or(|p| p.stop().is_none()));
+        let want = stopped.and_then(|s| Some((x.generation()?, s.delivered)));
+        let got = teardowns.remove(&id);
+        if want != got {
+            return Err(format!("{id:?}: teardown {got:?}, not {want:?}"));
+        }
+    }
+    if !(starts.is_empty() && supervisors.is_empty() && teardowns.is_empty()) {
+        return Err(format!(
+            "effects for no transition: {starts:?} {supervisors:?} {teardowns:?}"
+        ));
     }
     Ok(())
 }

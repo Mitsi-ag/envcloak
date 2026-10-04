@@ -56,7 +56,8 @@ use crate::authorization::{
 };
 use crate::operation::{
     AttemptFailure, Channel, Checkpoint, Cleanup, Generation, IdentityResponse, Operation, Phase,
-    PublishDecision, RETRY_WINDOW, Refusal, Revisions, Stop, StopReason, publication_decision,
+    PublishDecision, RETRY_WINDOW, Refusal, Revisions, Stop, StopReason, SupervisorId, WorkerId,
+    publication_decision,
 };
 use crate::scope::{DaemonInstance, Epochs, Instance, SignInScope};
 use crate::statement::{ContextId, Nonce, Options, OptionsError, RequestId, SignInStatement};
@@ -281,21 +282,25 @@ pub struct Injection {
     pub context: ContextId,
 }
 
-/// What the daemon has to do after a call.
+/// What the daemon has to do after a call. The two start effects are the
+/// only place a [`WorkerId`] or a [`SupervisorId`] is made: each is handed
+/// out once, here, for the daemon to bind to the process it starts (see
+/// [`crate::operation`], "What the store trusts").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Effect {
     /// Write the intent audit entry, then start the attempt's reaper and
-    /// driver; an audit failure is reported back as
+    /// driver, bound to `worker`; an audit failure is reported back as
     /// [`AttemptFailure::AuditFailed`] and starts nothing.
     StartAttempt {
         request: RequestId,
-        generation: Generation,
+        worker: WorkerId,
         lease: CreditLease,
     },
-    /// Start the generation's browser supervisor for the captured state.
+    /// Start the generation's browser supervisor for the captured state,
+    /// its control pipe bound to `supervisor`.
     StartSupervisor {
         request: RequestId,
-        generation: Generation,
+        supervisor: SupervisorId,
     },
     /// Stop the attempt, drop the captured state and close the recipient
     /// context; report back with [`OperationStore::cleanup_result`].
@@ -638,19 +643,19 @@ impl OperationStore {
         self.finish(now, world);
     }
 
-    /// The driver reached a credential step of `request`'s attempt of
-    /// `generation`: at most [`MAX_PASSWORDS`] password and [`MAX_CODES`]
-    /// code submissions per attempt.
+    /// The driver of `worker` reached a credential step of `request`'s
+    /// attempt: at most [`MAX_PASSWORDS`] password and [`MAX_CODES`] code
+    /// submissions per attempt, only while it runs.
     pub fn permit(
         &mut self,
         request: &RequestId,
-        generation: Generation,
+        worker: &WorkerId,
         step: Step,
         now: &Now,
         world: &dyn World,
     ) -> Result<(), AttemptError> {
         self.settle(now, world);
-        let done = self.permit_settled(request, generation, step);
+        let done = self.permit_settled(request, worker.generation(), step);
         self.finish(now, world);
         done
     }
@@ -679,16 +684,18 @@ impl OperationStore {
         Ok(())
     }
 
-    /// The worker of `generation` captured the declared state. Discarded
-    /// unless it is `request`'s running attempt.
+    /// `worker` captured the declared state: the daemon is asked to start
+    /// the generation's supervisor. Discarded unless it is `request`'s
+    /// running attempt.
     pub fn worker_captured(
         &mut self,
         request: &RequestId,
-        generation: Generation,
+        worker: &WorkerId,
         now: &Now,
         world: &dyn World,
     ) -> Result<(), Discarded> {
         self.settle(now, world);
+        let generation = worker.generation();
         let done = match self.ops.get_mut(request) {
             Some(op)
                 if op.stop.is_none()
@@ -698,7 +705,7 @@ impl OperationStore {
                 op.phase = Phase::Captured;
                 self.effects.push(Effect::StartSupervisor {
                     request: *request,
-                    generation,
+                    supervisor: SupervisorId::new(generation),
                 });
                 Ok(())
             }
@@ -708,12 +715,12 @@ impl OperationStore {
         done
     }
 
-    /// The worker of `generation` failed. Discarded unless it is
-    /// `request`'s running attempt. Its credit stays spent.
+    /// `worker` failed. Discarded unless it is `request`'s running
+    /// attempt. Its credit stays spent.
     pub fn worker_failed(
         &mut self,
         request: &RequestId,
-        generation: Generation,
+        worker: &WorkerId,
         failure: AttemptFailure,
         now: &Now,
         world: &dyn World,
@@ -721,7 +728,7 @@ impl OperationStore {
         self.settle(now, world);
         let running = self.ops.get(request).is_some_and(|op| {
             op.stop.is_none()
-                && op.generation == Some(generation)
+                && op.generation == Some(worker.generation())
                 && op.phase == Phase::AttemptRunning
         });
         let done = if running {
@@ -871,22 +878,24 @@ impl OperationStore {
         done
     }
 
-    /// The reaper or supervisor of `generation` reported `request`'s
-    /// teardown: `closed` false is a failed close, kept visible and never
-    /// taken as done; a later report that it closed confirms it. Anything
-    /// else (another generation, nothing asked for, already confirmed, a
-    /// failure reported again) is discarded.
+    /// The daemon reports, with the attempt's `worker`, the teardown a
+    /// [`Effect::TearDown`] asked for: confirmed once the reaper confirmed
+    /// the worker's end and, for a context that reached a supervisor, the
+    /// supervisor its close. `closed` false is a failed close, kept visible
+    /// and never taken as done; a later report that it closed confirms it.
+    /// Anything else (another attempt's worker, nothing asked for, already
+    /// confirmed, a failure reported again) is discarded.
     pub fn cleanup_result(
         &mut self,
         request: &RequestId,
-        generation: Generation,
+        worker: &WorkerId,
         closed: bool,
         now: &Now,
         world: &dyn World,
     ) -> Result<(), Discarded> {
         self.settle(now, world);
         let done = match self.ops.get_mut(request) {
-            Some(op) if op.generation == Some(generation) => match (op.cleanup, closed) {
+            Some(op) if op.generation == Some(worker.generation()) => match (op.cleanup, closed) {
                 (Cleanup::Pending | Cleanup::Failed, true) => {
                     op.cleanup = Cleanup::Done;
                     Ok(())
@@ -1032,7 +1041,7 @@ impl OperationStore {
                 if let Some(lease) = op.lease {
                     self.effects.push(Effect::StartAttempt {
                         request: id,
-                        generation,
+                        worker: WorkerId::new(generation),
                         lease,
                     });
                 }

@@ -17,9 +17,9 @@
 //! - [`authorization`]: [`Authorization`] (`once` or `dev`), its fixed
 //!   [`Deadline`] and [`CreditLease`]s that are never refunded (R-M2b-15,
 //!   R-M2b-16).
-//! - [`operation`]: one [`Operation`], its [`Phase`]s, the generation's
-//!   supervisor [`Channel`] and [`publication_decision`] (R-M2b-27,
-//!   R-M2b-28).
+//! - [`operation`]: one [`Operation`], its [`Phase`]s, the attempt's
+//!   [`WorkerId`], the generation's supervisor [`Channel`] and
+//!   [`publication_decision`] (R-M2b-27, R-M2b-28).
 //! - [`status`]: the allowlisted [`Status`] with its revision (R-M2b-08).
 //! - [`store`]: the [`OperationStore`]: retries and conflicts, owners,
 //!   bounds, approvals, the worker's and the supervisor's messages, lock,
@@ -41,7 +41,7 @@ pub use authorization::{
 };
 pub use operation::{
     AttemptFailure, Channel, Checkpoint, Cleanup, Generation, IdentityResponse, Operation, Phase,
-    PublishDecision, RETRY_WINDOW, Refusal, Revisions, Stop, StopReason, SupervisorId,
+    PublishDecision, RETRY_WINDOW, Refusal, Revisions, Stop, StopReason, SupervisorId, WorkerId,
     publication_decision,
 };
 pub use scope::{
