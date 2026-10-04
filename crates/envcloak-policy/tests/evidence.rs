@@ -2197,6 +2197,11 @@ const GEMINI: [&str; 2] = [
     "node",
     "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
 ];
+/// The same node running Qwen Code: another agent.
+const QWEN: [&str; 2] = [
+    "node",
+    "/usr/lib/node_modules/@qwen-code/qwen-code/cli-entry.js",
+];
 /// The same node running a script no entry knows.
 const TOOL: [&str; 2] = ["node", "/home/u/tool.js"];
 /// [`TOOL`] retitled with another argument: still no agent.
@@ -2300,21 +2305,63 @@ fn a_script_changed_under_the_walk_is_walked_again() {
     assert_eq!(t.reads[&90], 3);
 }
 
-/// A process whose arguments name another agent at every read is refused
-/// (`ancestry_changed`) after [`GATHER_ATTEMPTS`] walks, hashed or not, as
-/// a chain that changes under each walk is.
+/// Verifier review: arguments that make the process another agent, not
+/// only an agent or none, are walked again. node running Gemini CLI's
+/// script at the walk's read and Qwen Code's at the check's (an `exec` of
+/// the same node) is Qwen Code once the chain is walked again: its label
+/// and product are the later agent's, hashed or not. Mutation checked:
+/// comparing the arguments' classification by agent or none only (not by
+/// which agent) fails this test (the label stays Gemini CLI's).
+#[test]
+fn a_script_that_names_another_agent_is_walked_again() {
+    for (before, after, id) in [(GEMINI, QWEN, "qwen-code"), (QWEN, GEMINI, "gemini-cli")] {
+        let mut h = hasher_80_70();
+        let mut t = node_table(vec![before.to_vec(), after.to_vec()]);
+        let e = hashed(&mut t, &mut h).unwrap();
+        assert_eq!(h.asked, [80, 70, 80, 70], "walked and hashed again");
+        decides_as(&e, &node_steady(&after));
+        let (n, l) = e.nearest_agent().unwrap();
+        assert_eq!(
+            (n, l.id.as_str(), l.product.as_str(), l.basis),
+            (1, id, id, MatchBasis::Asserted)
+        );
+        assert_eq!(e.label().unwrap().id, id);
+        assert_eq!(digest(&e, 80), Some([8; 32]));
+        // Without a hasher: the walk's own read and the read after its
+        // check.
+        let mut t = node_table(vec![before.to_vec(), after.to_vec()]);
+        let e = gather_in(&mut t, &peer(90), Claims::none(), &AgentCatalog::builtin()).unwrap();
+        decides_as(&e, &node_steady(&after));
+        assert_eq!(e.label().unwrap().id, id);
+        assert_eq!(t.reads[&90], 6, "two walks, each read again");
+    }
+}
+
+/// A process whose arguments make it something else at every read is
+/// refused (`ancestry_changed`) after [`GATHER_ATTEMPTS`] walks, hashed or
+/// not, as a chain that changes under each walk is: arguments that name an
+/// agent and then none, and arguments that name one agent and then
+/// another. Mutation checked: comparing by agent or none only fails the
+/// second timeline (it is taken at the first walk).
 #[test]
 fn a_script_that_keeps_changing_is_refused() {
-    let answers: Vec<Vec<&'static str>> = (0..GATHER_ATTEMPTS)
-        .flat_map(|_| [TOOL.to_vec(), GEMINI.to_vec()])
-        .collect();
-    let mut h = hasher_80_70();
-    let mut t = node_table(answers.clone());
-    assert_eq!(hashed(&mut t, &mut h).unwrap_err(), EvidenceError::Changed);
-    assert_eq!(h.asked.len(), 2 * GATHER_ATTEMPTS);
-    let mut t = node_table(answers);
-    assert_eq!(
-        gather_in(&mut t, &peer(90), Claims::none(), &AgentCatalog::builtin()).unwrap_err(),
-        EvidenceError::Changed
-    );
+    for (a, b) in [(TOOL, GEMINI), (GEMINI, QWEN)] {
+        let answers: Vec<Vec<&'static str>> = (0..GATHER_ATTEMPTS)
+            .flat_map(|_| [a.to_vec(), b.to_vec()])
+            .collect();
+        let mut h = hasher_80_70();
+        let mut t = node_table(answers.clone());
+        assert_eq!(
+            hashed(&mut t, &mut h).unwrap_err(),
+            EvidenceError::Changed,
+            "{a:?} {b:?}"
+        );
+        assert_eq!(h.asked.len(), 2 * GATHER_ATTEMPTS);
+        let mut t = node_table(answers);
+        assert_eq!(
+            gather_in(&mut t, &peer(90), Claims::none(), &AgentCatalog::builtin()).unwrap_err(),
+            EvidenceError::Changed,
+            "{a:?} {b:?}"
+        );
+    }
 }
