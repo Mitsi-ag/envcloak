@@ -1,0 +1,376 @@
+{
+ "schema": 1,
+ "scope": "Chromium partitioned-cookie (CHIPS) delivery, measured through a transfer of three cookies of one name, host and path, partitioned under top-level sites a, b and c with cross-site ancestor bits true, true and false; metadata only, no cookie values",
+ "chromium": "147.0.7727.15",
+ "playwright": "1.58.0",
+ "source_cookies": [
+  {
+   "partition_site": "a",
+   "cross_site_ancestor": true
+  },
+  {
+   "partition_site": "b",
+   "cross_site_ancestor": true
+  },
+  {
+   "partition_site": "c",
+   "cross_site_ancestor": false
+  }
+ ],
+ "variants": {
+  "source": "the three cookies as the browser set them",
+  "exact": "every cookie object copied whole",
+  "public-fields-only": "the ancestor bit dropped (the import sets it), every other part kept",
+  "legacy-deduplicate": "one cookie kept per name, domain and path",
+  "one-partition": "only the cookie partitioned under a, whole",
+  "flatten-one-partition": "only the cookie partitioned under a, its partition removed",
+  "fresh": "nothing transferred"
+ },
+ "imports": [
+  {
+   "count": 3,
+   "first_party_partitioned": 1,
+   "partitioned": 3,
+   "variant": "source"
+  },
+  {
+   "count": 3,
+   "first_party_partitioned": 1,
+   "partitioned": 3,
+   "variant": "exact"
+  },
+  {
+   "count": 3,
+   "first_party_partitioned": 0,
+   "partitioned": 3,
+   "variant": "public-fields-only"
+  },
+  {
+   "count": 1,
+   "first_party_partitioned": 1,
+   "partitioned": 1,
+   "variant": "legacy-deduplicate"
+  },
+  {
+   "count": 1,
+   "first_party_partitioned": 0,
+   "partitioned": 1,
+   "variant": "one-partition"
+  },
+  {
+   "count": 1,
+   "first_party_partitioned": 0,
+   "partitioned": 0,
+   "variant": "flatten-one-partition"
+  },
+  {
+   "count": 0,
+   "first_party_partitioned": 0,
+   "partitioned": 0,
+   "variant": "fresh"
+  }
+ ],
+ "rows": [
+  {
+   "variant": "source",
+   "topology": "a",
+   "asserted": true,
+   "expected": [
+    "a"
+   ],
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "source",
+   "topology": "b",
+   "asserted": true,
+   "expected": [
+    "b"
+   ],
+   "observed": [
+    "b"
+   ]
+  },
+  {
+   "variant": "source",
+   "topology": "c",
+   "asserted": true,
+   "expected": [
+    "c"
+   ],
+   "observed": [
+    "c"
+   ]
+  },
+  {
+   "variant": "source",
+   "topology": "d",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "source",
+   "topology": "c-b-c",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "exact",
+   "topology": "a",
+   "asserted": true,
+   "expected": [
+    "a"
+   ],
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "exact",
+   "topology": "b",
+   "asserted": true,
+   "expected": [
+    "b"
+   ],
+   "observed": [
+    "b"
+   ]
+  },
+  {
+   "variant": "exact",
+   "topology": "c",
+   "asserted": true,
+   "expected": [
+    "c"
+   ],
+   "observed": [
+    "c"
+   ]
+  },
+  {
+   "variant": "exact",
+   "topology": "d",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "exact",
+   "topology": "c-b-c",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "public-fields-only",
+   "topology": "a",
+   "asserted": true,
+   "expected": [
+    "a"
+   ],
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "public-fields-only",
+   "topology": "b",
+   "asserted": true,
+   "expected": [
+    "b"
+   ],
+   "observed": [
+    "b"
+   ]
+  },
+  {
+   "variant": "public-fields-only",
+   "topology": "c",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "public-fields-only",
+   "topology": "d",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "public-fields-only",
+   "topology": "c-b-c",
+   "asserted": true,
+   "expected": [
+    "c"
+   ],
+   "observed": [
+    "c"
+   ]
+  },
+  {
+   "variant": "legacy-deduplicate",
+   "topology": "a",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "legacy-deduplicate",
+   "topology": "b",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "legacy-deduplicate",
+   "topology": "c",
+   "asserted": true,
+   "expected": [
+    "c"
+   ],
+   "observed": [
+    "c"
+   ]
+  },
+  {
+   "variant": "legacy-deduplicate",
+   "topology": "d",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "legacy-deduplicate",
+   "topology": "c-b-c",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "one-partition",
+   "topology": "a",
+   "asserted": true,
+   "expected": [
+    "a"
+   ],
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "one-partition",
+   "topology": "b",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "one-partition",
+   "topology": "c",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "one-partition",
+   "topology": "d",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "one-partition",
+   "topology": "c-b-c",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "flatten-one-partition",
+   "topology": "a",
+   "asserted": false,
+   "expected": null,
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "flatten-one-partition",
+   "topology": "b",
+   "asserted": false,
+   "expected": null,
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "flatten-one-partition",
+   "topology": "c",
+   "asserted": true,
+   "expected": [
+    "a"
+   ],
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "flatten-one-partition",
+   "topology": "d",
+   "asserted": false,
+   "expected": null,
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "flatten-one-partition",
+   "topology": "c-b-c",
+   "asserted": false,
+   "expected": null,
+   "observed": [
+    "a"
+   ]
+  },
+  {
+   "variant": "fresh",
+   "topology": "a",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "fresh",
+   "topology": "b",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "fresh",
+   "topology": "c",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "fresh",
+   "topology": "d",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  },
+  {
+   "variant": "fresh",
+   "topology": "c-b-c",
+   "asserted": true,
+   "expected": [],
+   "observed": []
+  }
+ ]
+}

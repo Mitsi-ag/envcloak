@@ -78,15 +78,17 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, SystemTime};
 
-use common::{MCP, OTHER_MCP, OTHER_ROOT, ROOT, SIBLING, Spec, TestWorld, at, identity, scope};
+use common::{
+    MCP, OTHER_MCP, OTHER_ROOT, ROOT, SIBLING, Spec, TestWorld, Vary, at, scope, variations, varied,
+};
 use envcloak_core::vault::ItemId;
 use envcloak_policy::Now;
 use envcloak_signin::store::STATEMENT_TTL;
 use envcloak_signin::{
     ApproveError, AttemptFailure, AuthorizationId, Channel, Cleanup, Deadline, Effect, Fresh,
-    Generation, Instance, Lookup, Nonce, NotFound, Operation, OperationKey, OperationStore,
-    Options, Phase, PublishDecision, RETRY_WINDOW, Request, RequestError, RequestId, Revisions,
-    SignInScope, State, Status, Step, StopReason, StoreLimits, World,
+    Generation, IdentityResponse, Instance, Lookup, Nonce, NotFound, Operation, OperationKey,
+    OperationStore, Options, Phase, PublishDecision, RETRY_WINDOW, Request, RequestError,
+    RequestId, Revisions, SignInScope, State, Status, Step, StopReason, StoreLimits, World,
 };
 
 /// Events per ordering.
@@ -174,12 +176,13 @@ struct Config {
 }
 
 impl Config {
-    /// How long an authorization the options open lasts, in seconds: the
-    /// `dev` window, or for `once` the scope's approval duration.
-    fn window(&self, slot: usize) -> u64 {
+    /// How long an authorization the options open for `scope` lasts, in
+    /// seconds: the `dev` window, or for `once` the scope's approval
+    /// duration.
+    fn window(&self, scope: &SignInScope) -> u64 {
         match self.options {
             Options::Dev { window, .. } => window.as_secs(),
-            Options::Once => self.slots[slot].spec.approval.as_secs(),
+            Options::Once => scope.limits().approval().as_secs(),
         }
     }
 
@@ -281,6 +284,10 @@ struct Reached {
     /// for the other slot.
     covered: usize,
     covered_across: usize,
+    /// New operations of one slot opened while an authorization approved
+    /// for the other slot was in force with a credit left: the moments a
+    /// cover across slots is possible.
+    coverable_across: usize,
     /// A new key not covered because a lock ended the authorization that
     /// would have covered it.
     not_covered_after_lock: usize,
@@ -365,16 +372,10 @@ fn unchanged(node: &Node, sim: &mut Sim, what: &str) -> Result<(), Violation> {
 
 /// Why `x` must have stopped by `t` in `world`, from the monitor's own
 /// record: `None` if it may go on.
-fn must_stop(
-    cfg: &Config,
-    x: &Operation,
-    mon: &Monitor,
-    world: &TestWorld,
-    t: u64,
-) -> Option<&'static str> {
+fn must_stop(x: &Operation, mon: &Monitor, world: &TestWorld, t: u64) -> Option<&'static str> {
     let seen = mon.ops.get(&x.request())?;
     let s = x.scope();
-    let spec = &cfg.slots[seen.slot].spec;
+    let limits = s.limits();
     if seen.by_owner {
         return Some("after the owner's cancel or end");
     }
@@ -410,11 +411,11 @@ fn must_stop(
     match x.phase() {
         Phase::AttemptRunning | Phase::Captured => seen
             .started
-            .is_some_and(|st| t >= st + spec.attempt_timeout.as_secs())
+            .is_some_and(|st| t >= st + limits.attempt_timeout().as_secs())
             .then_some("after its attempt timed out"),
         Phase::PublishDecided | Phase::Published => seen
             .decided
-            .is_some_and(|d| t >= d + spec.session_lifetime.as_secs())
+            .is_some_and(|d| t >= d + limits.session_lifetime().as_secs())
             .then_some("after its session's lifetime"),
         _ => None,
     }
@@ -503,6 +504,7 @@ fn step(
                 Ok(_) if !waiting => return Err("a proof approved an operation not waiting".into()),
                 Ok(_) => {
                     let x = sim.store.operation(&id).unwrap();
+                    let window = cfg.window(x.scope());
                     let a = x
                         .authorization()
                         .ok_or("approved without an authorization")?;
@@ -515,12 +517,12 @@ fn step(
                             slot: o,
                             scope: x.scope().clone(),
                             approved: sim.t,
-                            window: cfg.window(o),
+                            window,
                             credits: cfg.credits(),
                             locked: false,
                             started: 0,
                             remaining: cfg.credits(),
-                            deadline: Deadline::after(&now, Duration::from_secs(cfg.window(o))),
+                            deadline: Deadline::after(&now, Duration::from_secs(window)),
                         },
                     );
                     reached.approvals += 1;
@@ -540,7 +542,7 @@ fn step(
             let Some(id) = prev.slots[o] else {
                 return Ok(None);
             };
-            let owner = cfg.slots[o].spec.root;
+            let owner = slot_scope(cfg, o, &prev.world).owner();
             let got = if let Ev::Cancel(_) = ev {
                 sim.store.cancel(&owner, &id, &now, &sim.world)
             } else {
@@ -702,13 +704,13 @@ fn step(
             let Some(sup) = x.supervisor() else {
                 return Ok(None);
             };
-            supervisor_message(cfg, node, &mut sim, o, x, sup, &now, reached)?;
+            supervisor_message(node, &mut sim, x, sup, &now, reached)?;
         }
         Ev::Foreign(o) => {
             let Some(x) = known(o) else {
                 return Ok(None);
             };
-            foreign(cfg, &mut sim, x, o, &now)?;
+            foreign(&mut sim, x, o, &now)?;
             unchanged(node, &mut sim, "a message from another channel or root")?;
             reached.foreign_refused += 1;
         }
@@ -793,7 +795,7 @@ fn step(
     // must have stopped has.
     let (probe, probe_effects) = settled(&sim.store, &now_of(&sim), &sim.world);
     for x in probe.operations().filter(|x| x.stop().is_none()) {
-        if let Some(why) = must_stop(cfg, x, &sim.mon, &sim.world, sim.t) {
+        if let Some(why) = must_stop(x, &sim.mon, &sim.world, sim.t) {
             return Err(format!("{:?} goes on {why}", x.request()));
         }
     }
@@ -831,6 +833,18 @@ fn reserved(
             && cfg.slots[p].key == cfg.slots[o].key
     }) {
         reached.other_root_own_operation += 1;
+    }
+    let world = &sim.world;
+    if node.sim.mon.auths.values().any(|a| {
+        a.slot != o
+            && !a.locked
+            && node.sim.t < a.approved + a.window
+            && a.remaining > 0
+            && world.epochs == *a.scope.epochs()
+            && world.revisions(&a.scope) == Revisions::of(&a.scope)
+            && world.alive(&a.scope.owner())
+    }) {
+        reached.coverable_across += 1;
     }
     sim.slots[o] = Some(st.request);
     let shown = sim
@@ -903,15 +917,23 @@ fn reserved(
     Ok(())
 }
 
+/// The identity the fixture app names for `scope`: exactly the expected
+/// account, tenant and role.
+fn expected(scope: &SignInScope) -> IdentityResponse {
+    let a = scope.account();
+    IdentityResponse {
+        account: a.account.clone(),
+        tenant: a.tenant.clone(),
+        role: a.role.clone(),
+    }
+}
+
 /// The supervisor's next message on its own channel, chosen by what it
 /// last knew: the identity response, the publication, or a per-call
 /// check. Each is judged by the store brought up to date at that call.
-#[allow(clippy::too_many_arguments)]
 fn supervisor_message(
-    cfg: &Config,
     node: &Node,
     sim: &mut Sim,
-    o: usize,
     x: &Operation,
     sup: envcloak_signin::SupervisorId,
     now: &Now,
@@ -929,10 +951,9 @@ fn supervisor_message(
     match x.phase() {
         Phase::Captured => {
             let ready = live(Phase::Captured) && node.sim.mon.ops[&id].injections > 0;
-            let role = cfg.slots[o].spec.role;
             match sim
                 .store
-                .identity_response(&from, &id, &identity(role), now, &sim.world)
+                .identity_response(&from, &id, &expected(x.scope()), now, &sim.world)
             {
                 Ok(PublishDecision::Publish) if ready => {
                     let seen = sim.mon.ops.get_mut(&id).unwrap();
@@ -988,13 +1009,7 @@ fn supervisor_message(
 /// Every message `x` must refuse from a channel that is not its
 /// generation's supervisor, worker results of another generation, and
 /// status, cancel and end from other roots.
-fn foreign(
-    cfg: &Config,
-    sim: &mut Sim,
-    x: &Operation,
-    o: usize,
-    now: &Now,
-) -> Result<(), Violation> {
+fn foreign(sim: &mut Sim, x: &Operation, o: usize, now: &Now) -> Result<(), Violation> {
     let id = x.request();
     let other = 1 - o;
     let other_op = sim.slots[other]
@@ -1005,7 +1020,7 @@ fn foreign(
         .and_then(Operation::generation)
         .filter(|g| Some(*g) != x.generation());
     let mut channels = vec![
-        Channel::Client(cfg.slots[o].spec.requester),
+        Channel::Client(x.scope().delivery().requester),
         Channel::Client(SIBLING),
         Channel::Client(OTHER_MCP),
         Channel::Client(x.owner()),
@@ -1015,14 +1030,13 @@ fn foreign(
             channels.push(Channel::Supervisor(s));
         }
     }
-    let role = cfg.slots[o].spec.role;
     for from in &channels {
         if sim.store.inject_state(from, &id, now, &sim.world).is_ok() {
             return Err(format!("declared state given to {from:?}"));
         }
         if let Ok(PublishDecision::Publish) =
             sim.store
-                .identity_response(from, &id, &identity(role), now, &sim.world)
+                .identity_response(from, &id, &expected(x.scope()), now, &sim.world)
         {
             return Err(format!("published for {from:?}"));
         }
@@ -1509,4 +1523,71 @@ fn a_full_store_refuses_rather_than_evicting() {
         close_fails: false,
     });
     assert!(r.full > 0);
+}
+
+/// Events per ordering for the scope-isolation runs: enough for an
+/// approval of one slot, a new key of the other and the world's changes
+/// around them.
+const ISOLATION_DEPTH: usize = 5;
+
+/// Every part of the scope is its own scope under every ordering: slot B
+/// differs from slot A in that part alone (each field of the encoding, and
+/// each part of a declared cookie, storage key and credential-entry
+/// origin), and no new key of B is ever covered by A's authorization,
+/// though B opens new keys while A's authorization is in force with a
+/// credit left (counted, so the refusal is never a spent or ended
+/// budget), with every other invariant checked after every event. The
+/// positive control: with the same scope in both slots, B's new keys are
+/// covered at this depth. Fields 12 and 24 cannot change alone in a `dev`
+/// scope with credits to spare, and a scope of another daemon (29) is
+/// refused before any lookup (`tests/store.rs` covers it). Mutations: the
+/// cover check ignoring the project, the account, the target, the
+/// transfer scope, a cookie's domain or path (R-M2b-35, b7, b8).
+#[test]
+fn every_scope_part_is_its_own_scope_under_every_ordering() {
+    let config = |name: &'static str, vary: Option<Vary>| {
+        let mut b = slot("b", ROOT, MCP, "editor");
+        b.spec.vary = vary;
+        Config {
+            name,
+            slots: [slot("a", ROOT, MCP, "editor"), b],
+            options: dev(2),
+            limits: StoreLimits::default(),
+            close_fails: false,
+        }
+    };
+    let control = explore(&config("isolation control", None), ISOLATION_DEPTH);
+    assert!(control.covered_across > 0, "{control:?}");
+    let base = scope(&slot("b", ROOT, MCP, "editor").spec, &TestWorld::new());
+    let parts: Vec<Vary> = variations()
+        .into_iter()
+        .filter(|v| *v != Vary::Field(29) && varied(&base, *v).is_some())
+        .collect();
+    assert_eq!(parts.len(), variations().len() - 3);
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 6));
+    let results: Vec<(Vary, Reached)> = std::thread::scope(|s| {
+        let chunks: Vec<Vec<Vary>> = (0..threads)
+            .map(|i| parts.iter().copied().skip(i).step_by(threads).collect())
+            .collect();
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                s.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|v| (v, explore(&config("isolation", Some(v)), ISOLATION_DEPTH)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert_eq!(results.len(), parts.len());
+    for (v, r) in results {
+        assert_eq!(r.covered_across, 0, "{v:?}");
+        assert!(r.coverable_across > 0 && r.approvals > 0, "{v:?}: {r:?}");
+    }
 }

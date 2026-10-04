@@ -8,16 +8,18 @@
 //! can hold a secret.
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 use envcloak_core::vault::ItemId;
 use envcloak_signin::{
-    Account, AdapterId, CheckKind, ContextId, DaemonInstance, DeclaredCookie, DeclaredStorage,
-    Delivery, DeliveryMode, Environment, Epochs, Host, IdentityCheck, Instance, KeyError, Label,
-    Limits, Nonce, OperationKey, Options, OptionsError, Origin, ProjectScope, RequestId, Scheme,
-    ScopeError, SignInScope, SignInStatement, SortedSet, Subject, Target, TargetId, Tier,
-    TransferScope,
+    Account, AdapterId, CheckKind, ContextId, CookieDomain, CookiePartition, CookiePath,
+    DaemonInstance, DeclaredCookie, DeclaredStorage, Delivery, DeliveryMode, Environment, Epochs,
+    Host, HostName, IdentityCheck, Instance, KeyError, Label, Limits, Nonce, OperationKey, Options,
+    OptionsError, Origin, ProjectScope, RequestId, Scheme, ScopeError, SignInScope,
+    SignInStatement, Site, SortedSet, Subject, Target, TargetId, Tier, TransferScope,
 };
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -30,6 +32,28 @@ enum RawHost {
 }
 
 type RawOrigin = (Scheme, RawHost, u16);
+
+/// A declared cookie as typed parts: its name, whether it is host-only
+/// (else a domain cookie of a name), its host, its path and its partition
+/// (top-level site's scheme and host, and the cross-site ancestor bit).
+#[derive(Debug, Clone, PartialEq)]
+struct RawCookie {
+    name: String,
+    host_only: bool,
+    host: RawHost,
+    path: String,
+    partition: Option<(Scheme, RawHost, bool)>,
+}
+
+fn cookie(name: &str, host_only: bool, host: &str, path: &str) -> RawCookie {
+    RawCookie {
+        name: name.into(),
+        host_only,
+        host: RawHost::Name(host.into()),
+        path: path.into(),
+        partition: None,
+    }
+}
 
 /// A scope as typed fields, with every set in the order the test lists it.
 #[derive(Debug, Clone)]
@@ -52,7 +76,7 @@ struct Raw {
     adapter_rev: u64,
     origins: Vec<RawOrigin>,
     check: (CheckKind, String),
-    cookies: Vec<(RawHost, String)>,
+    cookies: Vec<RawCookie>,
     storage: Vec<(RawOrigin, String)>,
     requester: Instance,
     browser: u64,
@@ -79,6 +103,44 @@ fn host(h: &RawHost) -> Result<Host, ScopeError> {
 
 fn origin(o: &RawOrigin) -> Result<Origin, ScopeError> {
     Origin::new(o.0, host(&o.1)?, o.2)
+}
+
+fn declared(c: &RawCookie) -> Result<DeclaredCookie, ScopeError> {
+    let domain = match (&c.host, c.host_only) {
+        (h, true) => CookieDomain::HostOnly(host(h)?),
+        (RawHost::Name(n), false) => CookieDomain::Domain(HostName::new(n)?),
+        (_, false) => return Err(ScopeError::Host),
+    };
+    let partition = match &c.partition {
+        None => CookiePartition::Unpartitioned,
+        Some((scheme, h, ancestor)) => CookiePartition::Partitioned {
+            site: Site {
+                scheme: *scheme,
+                host: host(h)?,
+            },
+            cross_site_ancestor: *ancestor,
+        },
+    };
+    Ok(DeclaredCookie {
+        name: Label::new(&c.name)?,
+        domain,
+        path: CookiePath::new(&c.path)?,
+        partition,
+    })
+}
+
+fn cookie_json(c: &RawCookie) -> Value {
+    json!({
+        "name": c.name,
+        "host_only": c.host_only,
+        "host": host_json(&c.host),
+        "path": c.path,
+        "partition": c.partition.as_ref().map(|(scheme, h, ancestor)| json!({
+            "scheme": if *scheme == Scheme::Http { "http" } else { "https" },
+            "host": host_json(h),
+            "cross_site_ancestor": ancestor,
+        })),
+    })
 }
 
 fn host_json(h: &RawHost) -> Value {
@@ -142,13 +204,8 @@ impl Raw {
                     cookies: SortedSet::new(
                         self.cookies
                             .iter()
-                            .map(|(h, n)| {
-                                Ok(DeclaredCookie {
-                                    host: host(h)?,
-                                    name: Label::new(n)?,
-                                })
-                            })
-                            .collect::<Result<_, ScopeError>>()?,
+                            .map(declared)
+                            .collect::<Result<_, _>>()?,
                     )?,
                     storage: SortedSet::new(
                         self.storage
@@ -206,9 +263,7 @@ impl Raw {
                     "kind": if self.check.0 == CheckKind::Endpoint { "endpoint" } else { "element" },
                     "locator": self.check.1,
                 },
-                "cookies": self.cookies.iter()
-                    .map(|(h, n)| json!({ "host": host_json(h), "name": n }))
-                    .collect::<Vec<_>>(),
+                "cookies": self.cookies.iter().map(cookie_json).collect::<Vec<_>>(),
                 "storage": self.storage.iter()
                     .map(|(o, k)| json!({ "origin": origin_json(o), "key": k }))
                     .collect::<Vec<_>>(),
@@ -260,8 +315,15 @@ fn golden() -> Raw {
         ],
         check: (CheckKind::Endpoint, "/api/me".into()),
         cookies: vec![
-            (RawHost::Name("app.localhost".into()), "session".into()),
-            (RawHost::Name("app.localhost".into()), "csrf".into()),
+            cookie("session", true, "app.localhost", "/"),
+            RawCookie {
+                partition: Some((
+                    Scheme::Https,
+                    RawHost::Name("login.example.test".into()),
+                    true,
+                )),
+                ..cookie("csrf", false, "app.localhost", "/api")
+            },
         ],
         storage: vec![(app(3000), "token-meta".into())],
         requester: Instance {
@@ -335,9 +397,41 @@ fn golden_scope_and_statement_vectors() {
     assert_eq!(&o[..4], 2u32.to_be_bytes());
     assert_eq!(&o[4..8], 37u32.to_be_bytes());
     assert_eq!(&o[8..13], b"\x00\x00\x00\x01\x01");
-    // Cookies sorted: "csrf" before "session".
+    // Cookies sorted: "csrf" before "session". Each is its name, its
+    // domain (`2` and the name: a domain cookie; `1` and the host:
+    // host-only), its path and its partition (`1`, the top-level site's
+    // scheme and host, and the ancestor bit; or `0`).
     let c = f(19);
-    assert!(c.windows(4).position(|w| w == b"csrf") < c.windows(7).position(|w| w == b"session"));
+    let lp = |b: &[u8]| {
+        let mut v = (b.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(b);
+        v
+    };
+    let name_host = |n: &[u8]| [lp(&[1]), lp(n)].concat();
+    let csrf = [
+        lp(b"csrf"),
+        lp(&[lp(&[2]), lp(b"app.localhost")].concat()),
+        lp(b"/api"),
+        lp(&[
+            lp(&[1]),
+            lp(&[2]),
+            lp(&name_host(b"login.example.test")),
+            lp(&[1]),
+        ]
+        .concat()),
+    ]
+    .concat();
+    let session = [
+        lp(b"session"),
+        lp(&[lp(&[1]), lp(&name_host(b"app.localhost"))].concat()),
+        lp(b"/"),
+        lp(&lp(&[0])),
+    ]
+    .concat();
+    assert_eq!(
+        c,
+        [2u32.to_be_bytes().to_vec(), lp(&csrf), lp(&session)].concat()
+    );
     assert_eq!(f(21), [1]);
     assert_eq!(f(24), [2]);
     assert_eq!(f(25), [3]);
@@ -359,11 +453,11 @@ fn golden_scope_and_statement_vectors() {
     assert_eq!(sf[6].1, 9u64.to_be_bytes());
     assert_eq!(
         hex(scope.fingerprint().as_bytes()),
-        "734594f854bf1ba62a84cabb19d30e66e4a54a33fd827aa9a289f04ce16b707d"
+        "680d716ae5612deaca5f7f8f95c5e4640202f1f7b710ae319fd2075603a33d88"
     );
     assert_eq!(
         hex(&st.digest()),
-        "854d180e3be8a5dc885ccab708a54d6de6c61cec22a06768516f7faa5ebc45bd"
+        "b4269d52cd62ab81797d814c2b4eb0dc1ff068c07360c5d9101db664df5f7866"
     );
 }
 
@@ -407,7 +501,13 @@ fn oracle_cases() -> Vec<(Raw, SignInStatement)> {
         ),
         (Scheme::Https, RawHost::V4([10, 0, 0, 1]), 1),
     ];
-    r.cookies = vec![(RawHost::V4([127, 0, 0, 1]), "sid".into())];
+    r.cookies = vec![RawCookie {
+        name: "sid".into(),
+        host_only: true,
+        host: RawHost::V4([127, 0, 0, 1]),
+        path: "/a%2Fb/~!$&'()*+,=:@".into(),
+        partition: Some((Scheme::Http, RawHost::V6([0; 16]), false)),
+    }];
     r.storage = Vec::new();
     r.tier = Tier::Each;
     r.attempts = 1;
@@ -519,8 +619,27 @@ fn set_order_does_not_change_the_encoding_and_duplicates_are_refused() {
     // An element differing only in a byte is not a duplicate.
     let mut r = g.clone();
     r.cookies
-        .push((RawHost::Name("app.localhost".into()), "csrF".into()));
+        .push(cookie("csrF", false, "app.localhost", "/api"));
     assert!(r.scope().is_ok());
+    // Nor is one differing only in its domain's kind, its path, or its
+    // partition (present, its site, its ancestor bit).
+    let base = cookie("sid", true, "app.localhost", "/");
+    let parted = |site: &str, ancestor| RawCookie {
+        partition: Some((Scheme::Https, RawHost::Name(site.into()), ancestor)),
+        ..base.clone()
+    };
+    let mut r = g.clone();
+    r.cookies = vec![
+        base.clone(),
+        cookie("sid", false, "app.localhost", "/"),
+        cookie("sid", true, "app.localhost", "/app"),
+        cookie("sid", true, "app.localhost", "/app/"),
+        cookie("sid", true, "app.localhost", "/App"),
+        parted("a.example", true),
+        parted("b.example", true),
+        parted("a.example", false),
+    ];
+    assert_eq!(r.scope().unwrap().target().transfer.cookies.len(), 8);
     let mut r = g;
     r.origins = (1..=65).map(app).collect();
     assert_eq!(r.scope().unwrap_err(), ScopeError::TooMany);
@@ -608,9 +727,7 @@ fn change(r: &Raw, n: u16) -> Raw {
             .origins
             .push((Scheme::Https, RawHost::Name("other.test".into()), 443)),
         18 => r.check.1.push('/'),
-        19 => r
-            .cookies
-            .push((RawHost::Name("app.localhost".into()), "extra".into())),
+        19 => r.cookies.push(cookie("extra", true, "app.localhost", "/")),
         20 => r.storage.push((app(3000), "extra".into())),
         22 => r.requester = other(r.requester),
         23 => r.browser ^= 1,
@@ -1033,7 +1150,7 @@ proptest! {
     /// The parsers take any text without panicking and accept exactly
     /// their grammar, checked here by a separate reading of it.
     #[test]
-    fn parsers_accept_exactly_their_grammar(s in "\\PC{0,140}|[a-z0-9.-]{0,70}|[A-Za-z0-9._-]{0,130}|[a-z0-9-]{1,6}(\\.(0x[0-9a-fA-F]{0,3}|[0-9]{1,3}|[a-z0-9-]{1,6})){0,3}") {
+    fn parsers_accept_exactly_their_grammar(s in "\\PC{0,140}|[a-z0-9.-]{0,70}|[A-Za-z0-9._-]{0,130}|[a-z0-9-]{1,6}(\\.(0x[0-9a-fA-F]{0,3}|[0-9]{1,3}|[a-z0-9-]{1,6})){0,3}|/[ -~\\t\u{e9}]{0,40}") {
         let key_ok = !s.is_empty()
             && s.len() <= 128
             && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
@@ -1060,6 +1177,10 @@ proptest! {
             && s.len() <= 256
             && !s.chars().any(|c| c.is_control() || envcloak_policy::display_escaped(c));
         prop_assert_eq!(Label::new(&s).is_ok(), label_ok);
+        let path_ok = s.starts_with('/')
+            && s.len() <= 1024
+            && s.bytes().all(|b| (0x21..=0x7e).contains(&b) && b != b';');
+        prop_assert_eq!(CookiePath::new(&s).is_ok(), path_ok);
     }
 }
 
@@ -1070,4 +1191,284 @@ fn no_scope_field_can_hold_a_secret() {
     static_assertions::assert_impl_all!(SignInScope: Clone, Eq, Ord, std::hash::Hash, Send, Sync);
     static_assertions::assert_not_impl_any!(envcloak_core::SecretBytes: Clone, PartialEq, Ord, std::hash::Hash);
     static_assertions::assert_not_impl_any!(envcloak_core::SecretBuf: Clone, PartialEq, Ord, std::hash::Hash);
+}
+
+/// Each part of what a scope names reaches exactly its own field of the
+/// encoding, and the fingerprint: every field, and each part of a declared
+/// cookie (its name, its domain's kind, its host, its path, its partition,
+/// the partition's site and its ancestor bit, each alone), of a declared
+/// storage key (its origin, its key) and of a credential-entry origin (its
+/// port), over a `dev` and an `each` scope so that every part can change
+/// alone in one of them (R-M2b-12; SPEC §6.8 "transfer scope"). Mutations:
+/// "a cookie's path left out of its element", "a cookie's domain kind left
+/// out", "a cookie's partition left out".
+#[test]
+fn every_part_of_the_scope_reaches_its_own_field_and_the_fingerprint() {
+    use common::Vary;
+    let w = common::TestWorld::new();
+    let mut reached = BTreeSet::new();
+    for spec in [common::Spec::dev(), common::Spec::each()] {
+        let base = common::scope(&spec, &w);
+        for v in common::variations() {
+            let Some(changed) = common::varied(&base, v) else {
+                continue;
+            };
+            let want = match v {
+                Vary::Field(n) => n,
+                Vary::CookieName
+                | Vary::CookieDomainKind
+                | Vary::CookieHost
+                | Vary::CookiePath
+                | Vary::CookiePartition
+                | Vary::CookiePartitionSite
+                | Vary::CookieAncestor => 19,
+                Vary::StorageOrigin | Vary::StorageKey => 20,
+                Vary::OriginPort => 17,
+            };
+            assert_eq!(
+                changed_fields(&base.encode(), &changed.encode()),
+                vec![want],
+                "{v:?}"
+            );
+            assert_ne!(base.fingerprint(), changed.fingerprint(), "{v:?}");
+            reached.insert(v);
+        }
+    }
+    assert_eq!(reached.len(), common::variations().len());
+}
+
+/// A JSON file of `tests/oracles`, read when the test runs (the compiler
+/// reads only Rust files: scripts/check-sources.sh).
+fn oracle_json(name: &str) -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/oracles")
+        .join(name);
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// Field 19 of the golden scope with `cookies` as its declared cookies,
+/// and that scope's fingerprint.
+fn cookie_field(cookies: Vec<RawCookie>) -> (Vec<u8>, [u8; 32]) {
+    let mut r = golden();
+    r.cookies = cookies;
+    let s = r.scope().unwrap();
+    let enc = s.encode();
+    let fields = parse_fields(b"envcloak-signin-scope/1\n", &enc);
+    (fields[18].1.to_vec(), *s.fingerprint().as_bytes())
+}
+
+/// A declared cookie names a cookie as the browser stores it, so it tells
+/// apart exactly the cookies the browser delivers apart. The independent
+/// evidence is `tests/oracles/cookie_scope_corpus.json`: cookies a
+/// browser stored from `Set-Cookie` headers of differing spellings, each
+/// with the domain, host-only flag and path the browser stored, and the
+/// hosts and paths it was then sent to or not, measured in Chromium and
+/// agreeing with a separate reading of RFC 6265. Cookies the browser
+/// stored alike (a `Domain` attribute with a leading dot or in capitals; a
+/// default path from absent, empty or relative `Path` attributes) declare
+/// alike; cookies it stored differently declare differently, and so does
+/// every pair that one destination received differently. The positive
+/// control: naming a cookie by its host and name alone (the form before
+/// this one) declares alike pairs the browser delivered differently (a
+/// host-only and a domain cookie; `/` and `/app`; `/app` and `/app/`), so
+/// the comparison would catch it. Mutations: "a cookie's path left out of
+/// its element", "a cookie's domain kind left out".
+#[test]
+fn declared_cookies_tell_apart_what_the_browser_delivers_apart() {
+    let corpus: Value = oracle_json("cookie_scope_corpus.json");
+    let name = corpus["cookie_name"].as_str().unwrap();
+    let scenarios = corpus["scenarios"].as_array().unwrap();
+    let raw = |s: &Value| {
+        let sc = &s["scope"];
+        cookie(
+            name,
+            sc["host_only"].as_bool().unwrap(),
+            sc["domain"].as_str().unwrap(),
+            sc["path"].as_str().unwrap(),
+        )
+    };
+    // Where one destination received one cookie and not the other.
+    let delivered_apart = |a: &Value, b: &Value| {
+        let probes = |s: &Value| -> Vec<(String, u64, String, bool)> {
+            s["probes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    (
+                        p["host"].as_str().unwrap().to_owned(),
+                        p["port"].as_u64().unwrap(),
+                        p["path"].as_str().unwrap().to_owned(),
+                        p["expected"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        let pb = probes(b);
+        probes(a).iter().any(|(h, port, path, got)| {
+            pb.iter()
+                .any(|(h2, p2, path2, got2)| (h, port, path) == (h2, p2, path2) && got != got2)
+        })
+    };
+    let (mut alike, mut apart, mut measured, mut old_collides) = (0, 0, 0, 0);
+    for (i, a) in scenarios.iter().enumerate() {
+        for b in &scenarios[i + 1..] {
+            let (ra, rb) = (raw(a), raw(b));
+            let (fa, da) = cookie_field(vec![ra.clone()]);
+            let (fb, db) = cookie_field(vec![rb.clone()]);
+            let ids = (&a["id"], &b["id"]);
+            if a["scope"] == b["scope"] {
+                assert_eq!((&fa, da), (&fb, db), "{ids:?}");
+                assert!(!delivered_apart(a, b), "{ids:?}");
+                alike += 1;
+            } else {
+                assert_ne!(fa, fb, "{ids:?}");
+                assert_ne!(da, db, "{ids:?}");
+                apart += 1;
+            }
+            if delivered_apart(a, b) {
+                measured += 1;
+                if (&ra.host, &ra.name) == (&rb.host, &rb.name) {
+                    old_collides += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        alike >= 6 && apart >= 30 && measured >= 10,
+        "{alike} {apart} {measured}"
+    );
+    assert_eq!(old_collides, measured);
+    // The two cookies of one name at `/` and `/app` that one sign-in can
+    // set are two declarations in one set.
+    let (two, _) = cookie_field(vec![
+        cookie(name, true, "acme.localhost", "/"),
+        cookie(name, true, "acme.localhost", "/app"),
+    ]);
+    assert_eq!(&two[..4], 2u32.to_be_bytes());
+}
+
+/// Partitioned cookies (CHIPS): the browser keeps cookies of one name,
+/// domain and path under different partitions apart, and both parts of a
+/// partition change where it sends one. The independent evidence is
+/// `tests/oracles/cookie_partition_observations.json`, measured in
+/// Chromium: three such cookies under sites a, b and c, the last without
+/// the cross-site ancestor bit, delivered after transfers that keep or
+/// lose a part. Dropping the ancestor bit (`public-fields-only`) changed
+/// what a top-level and a nested page received; removing the partition
+/// (`flatten-one-partition`) sent the cookie where it had not gone; one
+/// cookie per name, domain and path (`legacy-deduplicate`) lost two of
+/// them. So the three are three declarations, and the cookie without its
+/// bit and the one without its partition declare differently from the
+/// cookies the browser set. The positive control: with the partition left
+/// out, the three collide as a duplicate. Mutation: "a cookie's partition
+/// left out of its element".
+#[test]
+fn partitions_are_part_of_a_declared_cookie() {
+    let obs: Value = oracle_json("cookie_partition_observations.json");
+    let rows = obs["rows"].as_array().unwrap();
+    let row = |variant: &str, topology: &str| {
+        rows.iter()
+            .find(|r| r["variant"] == variant && r["topology"] == topology)
+            .unwrap()
+    };
+    let apart = |a: &str, b: &str| {
+        ["a", "b", "c", "d", "c-b-c"]
+            .iter()
+            .filter(|t| {
+                let (x, y) = (row(a, t), row(b, t));
+                x["asserted"] == true && y["asserted"] == true && x["observed"] != y["observed"]
+            })
+            .count()
+    };
+    assert!(apart("source", "public-fields-only") > 0);
+    assert!(apart("one-partition", "flatten-one-partition") > 0);
+    assert!(apart("source", "legacy-deduplicate") > 0);
+    assert_eq!(apart("source", "exact"), 0);
+    let imports = obs["imports"].as_array().unwrap();
+    let count = |v: &str| imports.iter().find(|i| i["variant"] == v).unwrap()["count"].clone();
+    assert_eq!(
+        (count("source"), count("legacy-deduplicate")),
+        (json!(3), json!(1))
+    );
+
+    let name = "ec_partitioned";
+    let parted = |site: &str, ancestor: bool| RawCookie {
+        partition: Some((
+            Scheme::Https,
+            RawHost::Name(format!("{site}.test")),
+            ancestor,
+        )),
+        ..cookie(name, true, "c.test", "/")
+    };
+    let source: Vec<RawCookie> = obs["source_cookies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            parted(
+                c["partition_site"].as_str().unwrap(),
+                c["cross_site_ancestor"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    let (three, _) = cookie_field(source.clone());
+    assert_eq!(&three[..4], 3u32.to_be_bytes());
+    // The `c` cookie with the bit the import set, and the `a` cookie with
+    // no partition, are other declarations.
+    assert_ne!(
+        cookie_field(vec![parted("c", false)]),
+        cookie_field(vec![parted("c", true)])
+    );
+    assert_ne!(
+        cookie_field(vec![parted("a", true)]),
+        cookie_field(vec![cookie(name, true, "c.test", "/")])
+    );
+    let mut flat = golden();
+    flat.cookies = source
+        .into_iter()
+        .map(|c| RawCookie {
+            partition: None,
+            ..c
+        })
+        .collect();
+    assert_eq!(flat.scope().unwrap_err(), ScopeError::Duplicate);
+}
+
+/// Cookie paths: `/` and then printable ASCII but `;`, at most 1,024
+/// bytes, kept byte for byte; the error never holds the input.
+#[test]
+fn cookie_paths_take_only_the_stored_form() {
+    for ok in [
+        "/",
+        "/app",
+        "/app/",
+        "/App",
+        "/a%2Fb",
+        "/~!$&'()*+,=:@[]",
+        "//",
+    ] {
+        assert_eq!(CookiePath::new(ok).unwrap().as_str(), ok);
+    }
+    assert!(CookiePath::new(&format!("/{}", "a".repeat(1023))).is_ok());
+    for bad in [
+        "".to_owned(),
+        "app".to_owned(),
+        " /".to_owned(),
+        "/a b".to_owned(),
+        "/a;b".to_owned(),
+        "/a\tb".to_owned(),
+        "/a\u{7f}".to_owned(),
+        "/é".to_owned(),
+        "/\u{202e}".to_owned(),
+        format!("/{}", "a".repeat(1024)),
+    ] {
+        let e = CookiePath::new(&bad).unwrap_err();
+        assert_eq!(e, ScopeError::CookiePath, "{bad:?}");
+        assert_eq!(e.to_string(), "cookie path not in the stored form");
+    }
+    assert_eq!(
+        format!("{:?}", CookiePath::new("/secret-app").unwrap()),
+        "CookiePath(11 bytes)"
+    );
 }

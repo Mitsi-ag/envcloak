@@ -11,7 +11,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    DAEMON, MCP, OTHER_MCP, OTHER_ROOT, ROOT, SIBLING, Spec, TestWorld, at, clock, identity, scope,
+    DAEMON, MCP, OTHER_MCP, OTHER_ROOT, ROOT, SIBLING, Spec, TestWorld, Vary, at, clock, identity,
+    scope, variations, varied,
 };
 use envcloak_policy::Now;
 use envcloak_signin::store::STATEMENT_TTL;
@@ -261,7 +262,32 @@ fn the_same_key_with_any_scope_field_changed_conflicts_and_changes_nothing() {
         assert_eq!(h.request("k", s), Err(RequestError::Conflict));
         assert_eq!(h.store, before);
     }
+    // Every part of the scope changed alone, each field and each part of a
+    // declared cookie, storage key and origin: a conflict that changes
+    // nothing. A scope of another daemon is refused before the lookup, and
+    // another root's same key is that root's own operation.
+    let base = h.scope(&spec);
+    let mut tried = 0;
+    for v in variations() {
+        let Some(s) = varied(&base, v) else {
+            continue;
+        };
+        match (v, h.request("k", s)) {
+            (Vary::Field(29), Err(RequestError::WrongDaemon)) => {}
+            (Vary::Field(1), Ok(Lookup::Reserved(st))) => {
+                assert_ne!(st.request, id);
+                h.store = before.clone();
+            }
+            (Vary::Field(1 | 29), got) => panic!("{v:?}: {got:?}"),
+            (_, got) => assert_eq!(got, Err(RequestError::Conflict), "{v:?}"),
+        }
+        assert_eq!(h.store, before, "{v:?}");
+        tried += 1;
+    }
+    assert_eq!(tried, variations().len() - 2);
     assert_eq!(h.statement(&id, dev(2)).unwrap().digest(), digest);
+    // The positive control: the same key and scope join.
+    assert!(matches!(h.request("k", base), Ok(Lookup::Joined(st)) if st.request == id));
 }
 
 /// The key is looked up within the owner root only: another root's same
@@ -1791,17 +1817,18 @@ fn every_deadline_passes_on_either_clock() {
 
 /// Nothing a registration or a request gave shows in the `Debug` of the
 /// store, a status, a scope, a statement or an identity response: not
-/// the key, the account, tenant or role, a cookie name, a storage key,
-/// the identity check's locator, a host or the project's directory (L-12).
-/// The detector's positive control finds every marker in the labels' own
-/// text.
+/// the key, the account, tenant or role, a cookie name, a cookie's domain,
+/// path or partition site, a storage key, the identity check's locator, a
+/// host or the project's directory (L-12). The detector's positive
+/// control finds every marker in the labels' and paths' own text.
 #[test]
 fn debug_output_holds_no_key_label_host_or_path() {
     use envcloak_core::vault::ItemId;
     use envcloak_signin::{
-        Account, AdapterId, CheckKind, DeclaredCookie, DeclaredStorage, Delivery, DeliveryMode,
-        Environment, Host, IdentityCheck, IdentityResponse, Label, Limits, Origin, ProjectScope,
-        Scheme, SortedSet, Subject, Target, TargetId, Tier, TransferScope,
+        Account, AdapterId, CheckKind, CookieDomain, CookiePartition, CookiePath, DeclaredCookie,
+        DeclaredStorage, Delivery, DeliveryMode, Environment, Host, HostName, IdentityCheck,
+        IdentityResponse, Label, Limits, Origin, ProjectScope, Scheme, Site, SortedSet, Subject,
+        Target, TargetId, Tier, TransferScope,
     };
     let markers = [
         "intent-marker-55aa",
@@ -1813,6 +1840,9 @@ fn debug_output_holds_no_key_label_host_or_path() {
         "locator-marker-c7d6",
         "host-marker-e5f4",
         "dir-marker-0a1b",
+        "path-marker-4c3d",
+        "domain-marker-9e8f",
+        "site-marker-2b1a",
     ];
     let found = |s: &str| markers.iter().filter(|m| s.contains(*m)).count();
     let l = |s: &str| Label::new(s).unwrap();
@@ -1849,10 +1879,28 @@ fn debug_output_holds_no_key_label_host_or_path() {
                 locator: l("locator-marker-c7d6"),
             },
             transfer: TransferScope {
-                cookies: SortedSet::new(vec![DeclaredCookie {
-                    host,
-                    name: l("cookie-marker-7988"),
-                }])
+                cookies: SortedSet::new(vec![
+                    DeclaredCookie {
+                        name: l("cookie-marker-7988"),
+                        domain: CookieDomain::HostOnly(host),
+                        path: CookiePath::new("/path-marker-4c3d").unwrap(),
+                        partition: CookiePartition::Partitioned {
+                            site: Site {
+                                scheme: Scheme::Https,
+                                host: Host::name("site-marker-2b1a.example").unwrap(),
+                            },
+                            cross_site_ancestor: true,
+                        },
+                    },
+                    DeclaredCookie {
+                        name: l("cookie-marker-7988"),
+                        domain: CookieDomain::Domain(
+                            HostName::new("domain-marker-9e8f.localhost").unwrap(),
+                        ),
+                        path: CookiePath::new("/").unwrap(),
+                        partition: CookiePartition::Unpartitioned,
+                    },
+                ])
                 .unwrap(),
                 storage: SortedSet::new(vec![DeclaredStorage {
                     origin: app,
@@ -1880,15 +1928,47 @@ fn debug_output_holds_no_key_label_host_or_path() {
     // The positive control: the labels' own text holds every marker but
     // the key's.
     let a: &Account = scope.account();
+    let cookies: Vec<String> = scope
+        .target()
+        .transfer
+        .cookies
+        .iter()
+        .map(|c| {
+            let domain = match &c.domain {
+                CookieDomain::HostOnly(Host::Name(n)) | CookieDomain::Domain(n) => n.as_str(),
+                CookieDomain::HostOnly(_) => "",
+            };
+            let site = match &c.partition {
+                CookiePartition::Partitioned {
+                    site:
+                        Site {
+                            host: Host::Name(n),
+                            ..
+                        },
+                    ..
+                } => n.as_str(),
+                _ => "",
+            };
+            format!("{} {domain} {} {site}", c.name.as_str(), c.path.as_str())
+        })
+        .collect();
     let plain = format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
         a.account.as_str(),
         a.tenant.as_ref().unwrap().as_str(),
         a.role.as_str(),
         scope.target().identity_check.locator.as_str(),
         String::from_utf8_lossy(&scope.project().dir),
+        cookies.join(" "),
+        scope
+            .target()
+            .transfer
+            .storage
+            .iter()
+            .map(|k| k.key.as_str())
+            .collect::<String>(),
     );
-    assert_eq!(found(&plain), 5);
+    assert_eq!(found(&plain), markers.len() - 1);
     let mut h = H::new();
     let id = match h.request("intent-marker-55aa", scope.clone()).unwrap() {
         Lookup::Reserved(st) => st.request,
@@ -2023,4 +2103,66 @@ fn reserving_a_credit_refuses_each_reason_on_its_own() {
     let once = Authorization::once(id, &each, &t0);
     assert_eq!((once.credits(), once.remaining()), (1, 1));
     assert_eq!(once.deadline(), Deadline::after(&t0, hours(4)));
+}
+
+/// A `dev` authorization that is in force and has credits left covers a
+/// new key only for exactly its scope. Every part of the scope changed
+/// alone (each field of the encoding, and each part of a declared cookie,
+/// storage key and credential-entry origin) asks for a fresh proof,
+/// reserves nothing, starts nothing and leaves the budget as it was; then,
+/// in the same store, the exact scope under a new key is covered (the
+/// positive control, so no refusal comes from a spent budget). Fields 12
+/// and 24 cannot change alone in a `dev` scope with credits to spare (a
+/// live identity takes `each`, and `each` one attempt), and a scope of
+/// another daemon (29) is refused before any lookup (R-M2b-35, R-M2b-45;
+/// SPEC §6.8: "a new role, project or browser is a new scope and a new
+/// approval"). Mutations: the cover check ignoring the project, the
+/// account, the target, the transfer scope, a cookie's domain or path.
+#[test]
+fn every_scope_part_needs_its_own_approval() {
+    let spec = Spec::dev();
+    let mut tried = 0;
+    for v in variations() {
+        let mut h = H::new();
+        let base = h.scope(&spec);
+        let Some(changed) = varied(&base, v) else {
+            assert!(matches!(v, Vary::Field(12 | 24)), "{v:?}");
+            continue;
+        };
+        assert_ne!(changed.fingerprint(), base.fingerprint(), "{v:?}");
+        let a = h.open("a", &spec);
+        h.approve(&a, long()).unwrap();
+        let auth = h.op(&a).authorization().unwrap();
+        assert_eq!(h.store.authorization(&auth).unwrap().remaining(), 1);
+        h.store.drain_effects();
+        match h.request("b", changed) {
+            Err(RequestError::WrongDaemon) if v == Vary::Field(29) => {}
+            Ok(Lookup::Reserved(st)) if v != Vary::Field(29) => {
+                let b = h.op(&st.request);
+                assert_eq!(
+                    (b.authorization(), b.lease(), b.phase()),
+                    (None, None, Phase::PendingApproval),
+                    "{v:?}"
+                );
+            }
+            got => panic!("{v:?}: {got:?}"),
+        }
+        assert_eq!(
+            h.store.authorization(&auth).unwrap().remaining(),
+            1,
+            "{v:?}"
+        );
+        assert!(
+            h.store
+                .drain_effects()
+                .iter()
+                .all(|e| !matches!(e, Effect::StartAttempt { .. })),
+            "{v:?}"
+        );
+        let c = h.open("c", &spec);
+        assert_eq!(h.op(&c).authorization(), Some(auth), "{v:?}");
+        assert_eq!(h.store.authorization(&auth).unwrap().remaining(), 0);
+        tried += 1;
+    }
+    assert_eq!(tried, variations().len() - 2);
 }
