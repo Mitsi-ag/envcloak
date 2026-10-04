@@ -87,7 +87,8 @@ For each file the state names for the hosts and scopes given:
 
 - still byte for byte what EnvCloak last left (its SHA-256): each change's inserted text is taken out in reverse, which gives back the file as it was before the first install, byte for byte, its SHA-256 checked; a file EnvCloak created is removed;
 - changed since (the host rewrote it, the person edited it), or changed by EnvCloak in a way it undoes by structure: only EnvCloak's edits are taken out, by structure (the block; the array elements equal to the ones added, and the objects and arrays the install created once they are empty; the TOML keys still holding what EnvCloak wrote, set back to what they held before or removed); a file EnvCloak created that holds nothing else is removed;
-- a file that is EnvCloak's whole (Codex's rules) is removed only while it is exactly what EnvCloak wrote; changed since, it is left and reported (`modified`), and install does not replace it either.
+- a file that is EnvCloak's whole (Codex's rules) is removed only while it is exactly what EnvCloak wrote; changed since, it is left and reported (`modified`), and install does not replace it either;
+- the directories install made for the files it created (`~/.codex/rules`, a `~/.codex` that was not there) are removed once empty, innermost first; one that holds a file of the person's by then stays theirs.
 
 The same D-16 rule, backup and atomic replacement apply. The MCP server is removed with `claude mcp remove --scope user envcloak` from each `.claude.json` EnvCloak registered it in, only while that file holds exactly the entry EnvCloak registered; a `.claude.json` the registration created and that is still exactly as it left it is removed whole, after a backup, under D-16's rules.
 

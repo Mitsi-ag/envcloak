@@ -1753,6 +1753,36 @@ fn a_claude_json_the_install_created_is_removed_by_uninstall() {
     f.sweep();
 }
 
+/// The class of Codex's low finding (what an install created, left after
+/// uninstall): in a home with no `~/.codex`, install makes it and
+/// `~/.codex/rules`, and creates every file there; uninstall removes the
+/// files and then the directories it made, once empty. A directory it
+/// made that holds a file of the person's by then stays.
+///
+/// Mutation checked: the directories `make_dirs` made not recorded (the
+/// previous `open_target` making them unrecorded): `~/.codex` is left and
+/// this fails.
+#[test]
+fn the_directories_an_install_made_go_with_it() {
+    let f = Fixture::new();
+    std::fs::remove_dir_all(f.path(".codex")).unwrap();
+    let (v, code) = f.report(&["install", "--agent", "codex", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(f.path(".codex/rules/envcloak.rules").exists());
+    let (u, code) = f.report(&["uninstall", "--agent", "codex", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert!(!f.path(".codex").exists(), "{u}");
+    // Again, with a file of the person's in a directory install made.
+    let (v, code) = f.report(&["install", "--agent", "codex", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    std::fs::write(f.path(".codex/rules/mine.rules"), b"# mine\n").unwrap();
+    let (u, code) = f.report(&["uninstall", "--agent", "codex", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(f.read(".codex/rules/mine.rules"), b"# mine\n");
+    assert!(!f.path(".codex/rules/envcloak.rules").exists());
+    f.sweep();
+}
+
 /// An MCP server named `envcloak` the person registered themselves, with
 /// EnvCloak's very settings, stays theirs: install changes nothing and
 /// says so, and uninstall leaves it (Codex review: "removes exactly what
