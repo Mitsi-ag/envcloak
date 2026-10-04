@@ -639,11 +639,18 @@ impl AgentCatalog {
     /// For the Linux standing statement (M2 plan D-10, task M2-15:
     /// `identity_outside_install_tree`): a renamed copy of any program
     /// matches an agent by path, never by where its installer put it.
+    /// `false` too for an executable whose file name is an interpreter's
+    /// ([`interpreter_name`], the builtin catalog's interpreters): an
+    /// interpreter in an agent's tree is still no identity.
     pub fn within_install_tree(&self, id: &str, exe: &Path, home: Option<&Path>) -> bool {
-        self.agents
-            .iter()
-            .find(|a| a.id == id)
-            .is_some_and(|a| a.install_trees.iter().any(|t| t.contains(exe, home)))
+        let name = last_component(exe.as_os_str().as_bytes());
+        let name = name.strip_suffix(DELETED).unwrap_or(name);
+        !self.interpreter_named(name, false)
+            && self
+                .agents
+                .iter()
+                .find(|a| a.id == id)
+                .is_some_and(|a| a.install_trees.iter().any(|t| t.contains(exe, home)))
     }
 
     /// The environment variables that make agent `id`'s own executable run
@@ -714,10 +721,20 @@ impl AgentCatalog {
             argv.and_then(Argv::first)
                 .map(|a| last_component(a.as_bytes())),
         ];
+        names
+            .iter()
+            .flatten()
+            .any(|n| self.interpreter_named(n, extensions))
+    }
+
+    /// Whether `name` is an interpreter's ([`interpreter_name`]): one the
+    /// builtin catalog lists, or with `extensions` set one an extension
+    /// lists.
+    fn interpreter_named(&self, name: &[u8], extensions: bool) -> bool {
         self.interpreters
             .iter()
             .filter(|(_, s)| extensions || *s == CatalogSource::Builtin)
-            .any(|(i, _)| names.iter().flatten().any(|n| interpreter_name(n, i)))
+            .any(|(i, _)| interpreter_name(name, i))
     }
 
     /// Whether the catalog reads `p`'s arguments: its executable is hidden
@@ -751,7 +768,10 @@ impl AgentCatalog {
     /// The executable's path is taken without the ` (deleted)` Linux adds
     /// once the file a process runs was removed or renamed over (an agent
     /// or a node that updated itself while it ran): the process still runs
-    /// the file that path named.
+    /// the file that path named. A path whose file name is an
+    /// interpreter's ([`interpreter_name`]) matches no `executables`
+    /// pattern, a `*` included: an interpreter runs whatever script it is
+    /// given, so it is read by its script, as an interpreter anywhere is.
     ///
     /// Each pass uses `p`'s arguments only where that pass's catalog would
     /// read them itself ([`AgentCatalog::needs_argv`] reads them for either
@@ -787,8 +807,15 @@ impl AgentCatalog {
                 .map(|a| last_component(a.as_bytes()))
                 .filter(|n| !n.is_empty());
             let counts = |s: &CatalogSource| extensions || *s == CatalogSource::Builtin;
+            // An executable whose file name is an interpreter's runs
+            // whatever script it is given: its path names no agent, even
+            // where a pattern's `*` takes it in (`claude/versions/*` and a
+            // node placed there). Its script decides, as for any
+            // interpreter, and roots nothing above the session.
+            let path_names_agent =
+                path.filter(|_| !exe_name.is_some_and(|n| self.interpreter_named(n, extensions)));
             let by_executable = |a: &Agent| {
-                let by_path = path.is_some_and(|path| {
+                let by_path = path_names_agent.is_some_and(|path| {
                     a.executables
                         .iter()
                         .filter(|(_, s)| counts(s))
@@ -1022,21 +1049,51 @@ impl FileAgent {
 
 /// Whether `name` (an executable's file name, a command name or
 /// `argv[0]`'s last component) is interpreter `interp`'s: `interp` itself,
-/// or `interp` followed by a version, digits and dots with at least one
-/// digit (`python3.16`, `python3.9`, `node22`). No list holds every version
-/// an interpreter is installed under, and a name it missed would neither
-/// have its script read (an agent it runs unseen) nor be refused as an
-/// identity ([`CatalogErrorKind::RuntimeIdentity`]).
+/// or `interp` followed by a version, groups of digits joined by dots, the
+/// first after a dot when `interp` ends in a digit (`python3.16`,
+/// `python3.9`, `node22`), which may end in CPython's ABI
+/// flags ([`ABI_FLAGS`], each at most once: `python3.14t`, a free-threaded
+/// build; `python3.13d`, a debug build; `python3.13td`; `python3.7m`). No
+/// list holds every version and build an interpreter is installed under,
+/// and a name it missed would neither have its script read (an agent it
+/// runs unseen) nor be refused as an identity
+/// ([`CatalogErrorKind::RuntimeIdentity`]) or as an executable match
+/// ([`AgentCatalog::classify`]).
 fn interpreter_name(name: &[u8], interp: &[u8]) -> bool {
-    match name.strip_prefix(interp) {
-        Some([]) => true,
-        Some(version) => {
-            version.iter().all(|b| b.is_ascii_digit() || *b == b'.')
-                && version.iter().any(u8::is_ascii_digit)
-        }
-        None => false,
+    let Some(rest) = name.strip_prefix(interp) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
     }
+    let version = rest.len()
+        - rest
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphabetic())
+            .count();
+    let (version, flags) = rest.split_at(version);
+    // A name that ends in a digit goes on with its own version
+    // (`python3` and `.9`).
+    let version = match interp.last() {
+        Some(d) if d.is_ascii_digit() => version.strip_prefix(b".").unwrap_or(version),
+        _ => version,
+    };
+    !version.is_empty()
+        && version
+            .split(|b| *b == b'.')
+            .all(|group| !group.is_empty() && group.iter().all(u8::is_ascii_digit))
+        && flags.iter().all(|f| ABI_FLAGS.contains(f))
+        && flags
+            .iter()
+            .enumerate()
+            .all(|(k, f)| !flags[..k].contains(f))
 }
+
+/// CPython's ABI flags, which its executables' names end in after the
+/// version (`sys.abiflags`): `t` free-threaded (3.13 and later), `d` a
+/// debug build, `m` pymalloc (up to 3.7), `u` wide Unicode (up to 3.2).
+const ABI_FLAGS: &[u8] = b"tdmu";
 
 /// Parses the builtin catalog: [`parse_catalog`], and no `executables`
 /// pattern or signature may name one of its interpreters
@@ -1419,10 +1476,13 @@ mod tests {
         assert!(InstallTree::parse(&format!("/{}", "a".repeat(256))).is_none());
     }
 
-    /// An interpreter's name, or that name and a version: digits and dots,
-    /// at least one digit. Mutation checked: matching names only exactly
-    /// fails this test, and the classification cases of a Python and a
-    /// node the interpreters list does not name (tests/agents.rs).
+    /// An interpreter's name, or that name and a version: groups of digits
+    /// joined by dots, which may end in CPython's ABI flags (each at most
+    /// once). Mutation checked: matching names only exactly fails this
+    /// test, and the classification cases of a Python and a node the
+    /// interpreters list does not name (tests/agents.rs); so does taking a
+    /// version without its ABI flags (the free-threaded and debug builds
+    /// here and in tests/agents.rs).
     #[test]
     fn a_versioned_interpreter_name_is_the_interpreter() {
         for (name, interp) in [
@@ -1433,6 +1493,15 @@ mod tests {
             ("python3.16", "python3"),
             ("python3.16", "python"),
             ("bun1.3.14", "bun"),
+            // Free-threaded (python.org's, `uv python install 3.14t`,
+            // Fedora's), debug, both, and the pymalloc builds up to 3.7.
+            ("python3.14t", "python3"),
+            ("python3.13t", "python"),
+            ("python3.13d", "python3"),
+            ("python3.13td", "python3"),
+            ("python3.7m", "python3"),
+            ("python3.7dm", "python3"),
+            ("python3t", "python"),
         ] {
             assert!(
                 interpreter_name(name.as_bytes(), interp.as_bytes()),
@@ -1449,6 +1518,17 @@ mod tests {
             ("pytho", "python"),
             ("", "node"),
             ("bunx", "bun"),
+            // ABI flags only after a version, each once, and nothing else.
+            ("nodet", "node"),
+            ("python3t-config", "python3"),
+            ("python3t-config", "python"),
+            ("python3.14tt", "python3"),
+            ("python3.14x", "python3"),
+            ("python3.14-dbg", "python3"),
+            ("python3.", "python"),
+            ("python3..14", "python3"),
+            ("python.3", "python"),
+            ("python3.14t.1", "python3"),
         ] {
             assert!(
                 !interpreter_name(name.as_bytes(), interp.as_bytes()),
@@ -1466,11 +1546,12 @@ mod tests {
     /// `cursor-agent/versions/*/node`, the entry M2-10 first wrote, is one.
     #[test]
     fn the_builtin_catalog_names_no_interpreter_as_an_identity() {
-        let head = "interpreters = [\"node\", \"bun\"]\n[[agent]]\nid = \"a\"\nname = \"A\"\n";
+        let head = "interpreters = [\"node\", \"bun\", \"python3\"]\n[[agent]]\nid = \"a\"\nname = \"A\"\n";
         for bad in [
             "executables = [\"cursor-agent/versions/*/node\"]",
             "executables = [\"bun\"]",
             "executables = [\"tools/node22\"]",
+            "executables = [\"tools/python3.14t\"]",
             "signatures = [{ identifier = \"node\", team = \"HX7739G8FX\" }]",
         ] {
             let text = format!("{head}{bad}\n");

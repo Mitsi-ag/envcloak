@@ -912,6 +912,102 @@ fn a_runtime_is_never_an_agents_identity() {
     }
 }
 
+/// Codex review (medium): an interpreter placed where an agent's
+/// `executables` pattern takes any name (`claude/versions/*`) is still an
+/// interpreter. Its path matches no pattern: it is read by its script, as
+/// an interpreter anywhere is (Claude Code's `cli.js` under it is Claude
+/// Code on an asserted basis, which roots no grant above the session;
+/// another script under it is no agent), and it is in no install tree.
+/// So is one by a versioned name, an ABI-suffixed one, and one an
+/// extension's wildcard takes in. The agent's own build at the same place
+/// is still its executable. Mutation checked: letting a wildcard match an
+/// interpreter's path fails this test (and the root-confinement tests in
+/// tests/evidence.rs and tests/evidence_gates.rs); leaving interpreters in
+/// install trees fails it too.
+#[test]
+fn an_interpreter_at_an_agents_path_is_no_identity() {
+    let cat = AgentCatalog::builtin();
+    let home = Some(Path::new("/home/u"));
+    let versions = "/home/u/.local/share/claude/versions";
+    let cli = "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js";
+    for name in [
+        "node",
+        "node22",
+        "bun",
+        "python3.14t",
+        "python3.13td",
+        "Python",
+    ] {
+        let path = format!("{versions}/{name}");
+        assert_eq!(id_of(&cat, &exe(&path)), None, "{path}");
+        let running = proc_with(Some(&path), name, Some(&[name, "/tmp/x.js"]));
+        assert_eq!(id_of(&cat, &running), None, "{path}");
+        let claude = proc_with(Some(&path), name, Some(&[name, cli]));
+        let l = cat.classify(&claude).unwrap();
+        assert_eq!(
+            (l.id.as_str(), l.basis),
+            ("claude-code", MatchBasis::Asserted),
+            "{path}"
+        );
+        assert!(!l.may_root_above_session(), "{path}");
+        for id in ["claude-code", "opencode", "copilot-cli", "codex"] {
+            assert!(
+                !cat.within_install_tree(id, Path::new(&path), home),
+                "{id} {path}"
+            );
+        }
+        // Linux's mark of a removed file changes nothing.
+        let deleted = format!("{path} (deleted)");
+        assert_eq!(id_of(&cat, &exe(&deleted)), None, "{deleted}");
+        assert!(!cat.within_install_tree("claude-code", Path::new(&deleted), home));
+    }
+    for (id, path) in [
+        ("opencode", "/home/u/.opencode/bin/bun"),
+        (
+            "claude-code",
+            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/node",
+        ),
+        (
+            "copilot-cli",
+            "/usr/lib/node_modules/@github/copilot/node_modules/.bin/node",
+        ),
+    ] {
+        assert!(
+            !cat.within_install_tree(id, Path::new(path), home),
+            "{id} {path}"
+        );
+    }
+    // The control: the agent's own build there is its executable, in its
+    // tree.
+    let own = format!("{versions}/2.1.280");
+    let l = cat.classify(&exe(&own)).unwrap();
+    assert_eq!(
+        (l.id.as_str(), l.basis),
+        ("claude-code", MatchBasis::Executable)
+    );
+    assert!(l.may_root_above_session());
+    assert!(cat.within_install_tree("claude-code", Path::new(&own), home));
+    // An extension's wildcard takes in no interpreter either, builtin or
+    // its own.
+    let (root, dir) = data_dir();
+    write(
+        &dir,
+        "a.toml",
+        "interpreters = [\"ruby\"]\n[[agent]]\nid = \"tool\"\nname = \"Tool\"\nexecutables = [\"tool/bin/*\"]\n",
+    );
+    let ext = AgentCatalog::load(root.path());
+    assert!(ext.problems().is_empty());
+    for name in ["node", "python3.14t", "ruby", "ruby3.3"] {
+        let path = format!("/opt/tool/bin/{name}");
+        assert_eq!(id_of(&ext, &exe(&path)), None, "{path}");
+    }
+    let l = ext.classify(&exe("/opt/tool/bin/tool")).unwrap();
+    assert_eq!(
+        (l.id.as_str(), l.source, l.basis),
+        ("tool", CatalogSource::Extension, MatchBasis::Executable)
+    );
+}
+
 /// `names` are names, never an identity: a match on one is asserted, from
 /// the executable's file name, `argv[0]` or the command name (cut to the
 /// length the kernel keeps), and an extension may add them. Each name is

@@ -558,6 +558,39 @@ fn gate25_only_an_agents_executable_roots_a_grant_above_the_session() {
     }
     s.finish();
 
+    // A program by an interpreter's name where Claude Code's pattern takes
+    // any name (`claude/versions/*`, Codex review): read as an interpreter,
+    // by its script, which names no agent, so its path roots nothing. Run
+    // as `node` it is no agent; run by its path, its `argv[0]` says Claude
+    // Code's path, which labels it on an asserted basis only. Mutation
+    // checked: letting the pattern take in an interpreter's path fails
+    // this (Claude Code by its executable, the root of both sessions).
+    let versions = l.home.root().join("claude/versions");
+    std::fs::create_dir_all(&versions).unwrap();
+    let node_named = versions.join("node");
+    std::fs::copy(&f, &node_named).unwrap();
+    for arg0 in [Some("node"), None] {
+        let (first, second, holder, s) =
+            two_sessions_under(&l, &node_named, arg0, &["--".as_ref()]);
+        match (arg0, &first.chain()[2].agent) {
+            (Some(_), None) => {}
+            (None, Some(label)) => assert_eq!(
+                (label.id.as_str(), label.basis),
+                ("claude-code", MatchBasis::Asserted)
+            ),
+            _ => panic!("{arg0:?}: {first:?}"),
+        }
+        assert!(!first.root().same(&holder), "{first:?}");
+        for kind in [SubjectKind::Agent, SubjectKind::Unknown] {
+            assert!(!second.covered_by(&holder, kind), "{kind:?}");
+        }
+        if outer.is_none() {
+            assert!(first.root().same(first.caller()));
+            assert!(!second.covered_by(&first.root(), SubjectKind::Agent));
+        }
+        s.finish();
+    }
+
     let Some(node) = node() else {
         return;
     };
