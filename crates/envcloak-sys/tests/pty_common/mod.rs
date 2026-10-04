@@ -172,6 +172,13 @@ impl Screen {
         }
     }
 
+    /// Reads until the terminal ends (every descriptor on its slave side
+    /// closed), up to [`DEADLINE`]; returns whether it did.
+    pub fn wait_for_end(&mut self) -> bool {
+        self.wait_for(|_| false);
+        self.ended
+    }
+
     /// Waits until `needle` has been shown `times` times.
     pub fn expect(&mut self, needle: &str, times: usize, what: &str) {
         let ok = self.wait_for(|s| s.count(needle) >= times);
