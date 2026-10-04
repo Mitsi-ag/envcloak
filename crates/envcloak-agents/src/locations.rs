@@ -47,6 +47,14 @@ pub struct Locations {
     /// Codex's temporary directory, `TMPDIR` else `/tmp` (Rust's
     /// `temp_dir`).
     tmp: PathBuf,
+    /// Codex's system directory, `/etc/codex` (its system, legacy managed
+    /// and requirements files): another only in tests
+    /// ([`Locations::with_system_dirs`]).
+    codex_system: PathBuf,
+    /// macOS's managed preferences, where a device profile puts the
+    /// settings Codex reads from `com.openai.codex` (pinned 0.159.2,
+    /// `codex-rs/config/src/loader/macos.rs`).
+    managed_preferences: PathBuf,
 }
 
 /// Why the catalog could not be built.
@@ -89,7 +97,19 @@ impl Locations {
             xdg_config,
             claude_tmp,
             tmp,
+            codex_system: PathBuf::from("/etc/codex"),
+            managed_preferences: PathBuf::from("/Library/Managed Preferences"),
         })
+    }
+
+    /// The same catalog with Codex's system directory and the managed
+    /// preferences directory elsewhere: for tests, which cannot write
+    /// `/etc/codex` or `/Library/Managed Preferences`.
+    #[must_use]
+    pub fn with_system_dirs(mut self, codex_system: PathBuf, managed_preferences: PathBuf) -> Self {
+        self.codex_system = codex_system;
+        self.managed_preferences = managed_preferences;
+        self
     }
 
     pub fn home(&self) -> &Path {
@@ -146,6 +166,69 @@ impl Locations {
     /// EnvCloak's Codex rules file.
     pub fn codex_rules(&self) -> PathBuf {
         self.codex_home.join("rules").join("envcloak.rules")
+    }
+
+    /// Codex's system configuration, the lowest layer it merges (pinned
+    /// 0.159.2, `codex-rs/config/src/loader/mod.rs`).
+    pub fn codex_system_config(&self) -> PathBuf {
+        self.codex_system.join("config.toml")
+    }
+
+    /// Codex's legacy managed configuration, merged above every other
+    /// layer.
+    pub fn codex_managed_config(&self) -> PathBuf {
+        self.codex_system.join("managed_config.toml")
+    }
+
+    /// Codex's requirements, which constrain what the layers may set.
+    pub fn codex_requirements(&self) -> PathBuf {
+        self.codex_system.join("requirements.toml")
+    }
+
+    /// The device profiles that may give Codex managed settings (macOS):
+    /// `com.openai.codex` in the managed preferences, for every user and
+    /// for each one.
+    pub fn codex_managed_preferences(&self) -> Vec<PathBuf> {
+        const NAME: &str = "com.openai.codex.plist";
+        let mut out = vec![self.managed_preferences.join(NAME)];
+        if let Ok(rd) = std::fs::read_dir(&self.managed_preferences) {
+            for e in rd.flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    out.push(e.path().join(NAME));
+                }
+            }
+        }
+        out
+    }
+
+    /// Codex's cache of the configuration an organization's workspace
+    /// sends it (business, education and enterprise accounts; pinned
+    /// 0.159.2, `codex-rs/cloud-config/src/cache.rs`).
+    pub fn codex_cloud_config_cache(&self) -> PathBuf {
+        self.codex_home.join("cloud-config-bundle-cache.json")
+    }
+
+    /// The profile configurations `codex --profile NAME` reads on top of
+    /// `config.toml`: `<NAME>.config.toml` in Codex's directory.
+    pub fn codex_profile_configs(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.codex_home) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.len() > ".config.toml".len() && name.ends_with(".config.toml") {
+                    out.push(e.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The configuration a project's directory gives Codex (a layer when
+    /// the project is trusted).
+    pub fn codex_project_config(dir: &Path) -> PathBuf {
+        dir.join(".codex").join("config.toml")
     }
 
     fn src(path: PathBuf, format: ConfigFormat, kind: SourceKind, label: &str) -> ConfigSource {

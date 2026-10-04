@@ -7,7 +7,8 @@
 //!   [`detect`] and [`hosts`]: `envcloak agents install` and `uninstall`
 //!   for Claude Code and Codex (M2-08, D-16).
 //! - [`locations`]: the host, version and path catalog, the only place
-//!   host paths are named, which emits the scanner's descriptors (D-02).
+//!   host paths are named, which emits the scanner's descriptors (D-02);
+//!   [`codex_layers`]: Codex's settings as it merges its layers.
 //! - [`probe::model`]: the scripted model that the agent hosts are pointed
 //!   at when EnvCloak drives them for a coverage probe or a test (M2-04,
 //!   D-13), shipped as the program `envcloak-probe-model`.
@@ -16,6 +17,7 @@
 //!   (M2-06).
 
 pub mod blocks;
+pub mod codex_layers;
 pub mod detect;
 pub mod hook;
 pub mod hosts;

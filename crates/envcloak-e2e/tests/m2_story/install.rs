@@ -110,6 +110,43 @@ fn agents(h: &mut Harness, bin: &Path, claude_tmp: &Path, args: &[&str]) -> (Val
     (v, out.code)
 }
 
+/// `envcloak agents <args> --json` in `cwd` (a project's directory), as
+/// [`agents`] runs it.
+fn agents_in(
+    h: &mut Harness,
+    bin: &Path,
+    claude_tmp: &Path,
+    cwd: &Path,
+    args: &[&str],
+) -> (Value, i32) {
+    let path = format!("PATH={}:{TEST_PATH}", bin.display());
+    let tmp = format!("CLAUDE_CODE_TMPDIR={}", claude_tmp.display());
+    let cli = h.cli();
+    let mut argv = vec![
+        "/usr/bin/env",
+        path.as_str(),
+        tmp.as_str(),
+        cli.to_str().unwrap(),
+        "agents",
+    ];
+    argv.extend_from_slice(args);
+    argv.push("--json");
+    let out = h.human_argv(cwd, &argv, &[], &[]);
+    let v = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", out.all()));
+    (v, out.code)
+}
+
+/// Whether the report has `host`'s change of a file refused for `reason`.
+fn refused_as(v: &Value, host: &str, reason: &str) -> bool {
+    v["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x["host"] == host)
+        .flat_map(|x| x["changes"].as_array().unwrap().iter())
+        .any(|c| c["outcome"] == "refused" && c["reason"] == reason)
+}
+
 /// The notes a report has for `host`.
 fn notes(v: &Value, host: &str) -> Vec<String> {
     v["hosts"]
@@ -805,6 +842,296 @@ fn codex_reaches_the_socket_and_nothing_else_after_install() {
         "a connection reached the loopback listener"
     );
     h.assert_swept("M2-08 Codex socket allowance");
+}
+
+/// Codex review, round 6 (high), on the pinned Codex (L-02): Codex merges
+/// a trusted project's `.codex/config.toml` into the user's settings, so a
+/// proxy domain rule there, which on its own turns nothing on, is switched
+/// on by the socket allowance's `network_access` and proxy. Measured
+/// first: with the allowance as round 5 wrote it (by hand here), a request
+/// from Codex's `workspace-write` sandbox in that project goes through
+/// Codex's proxy to a loopback listener (the control: the rule widens the
+/// allowance on this host). Then `agents install --consent-sandbox-sockets`
+/// writes the server and no allowance, reports the step refused
+/// (`network_settings_present`) and exits 1, and from the same project the
+/// request reaches nothing (directly or through the proxy).
+///
+/// Mutation checked: `codex_layers::other_layers_fit` answering `Ok`: the
+/// installer writes the allowance, the request reaches the listener after
+/// install, and this fails.
+#[test]
+fn codex_inherited_network_rules_keep_the_socket_allowance_out() {
+    if !cfg!(target_os = "macos") {
+        eprintln!(
+            "codex_inherited_network_rules_keep_the_socket_allowance_out: macOS only (K-01: no \
+             allowance on Linux)"
+        );
+        return;
+    }
+    let found = Installed::find(&versions_toml(), Host::Codex.id(), "native");
+    let Some(xi) = require(found, "M2-08 Codex inherited network rules") else {
+        return;
+    };
+    let mut h = Harness::start();
+    vault(&mut h);
+    let mut codex = AgentHome::within(&h.home, Host::Codex, xi);
+    let bin = host_bin(&h, &[&codex]);
+    let tmp = h.home.root().join("claude-tmp");
+    let home = h.home.home();
+    let proj = home.join("work/proj");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::create_dir_all(proj.join(".codex")).unwrap();
+    std::fs::write(
+        proj.join(".codex/config.toml"),
+        "[features.network_proxy.domains]\n\"127.0.0.1\" = \"allow\"\n",
+    )
+    .unwrap();
+    let proj = std::fs::canonicalize(&proj).unwrap();
+    let trust = format!(
+        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+        proj.display()
+    );
+    let socket = daemon_socket(&h.home);
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = tcp.local_addr().unwrap().port();
+    let other = h.home.root().join("other.sock");
+    let _unix = std::os::unix::net::UnixListener::bind(&other).unwrap();
+    let probe = h.home.root().join("egress.py");
+    std::fs::write(&probe, EGRESS).unwrap();
+    let proxied = format!(
+        "python3 {} proxied {port} {}",
+        quoted(probe.to_str().unwrap()),
+        quoted(other.to_str().unwrap())
+    );
+    let flags =
+        HostFlags::codex("workspace-write", "never").with(&["--dangerously-bypass-hook-trust"]);
+    let drained = |tcp: &std::net::TcpListener| {
+        tcp.set_nonblocking(true).unwrap();
+        let mut n = 0;
+        while tcp.accept().is_ok() {
+            n += 1;
+        }
+        n
+    };
+
+    // The control: the allowance as round 5 wrote it, by hand.
+    codex.codex_config(&format!(
+        "{trust}\n[sandbox_workspace_write]\nnetwork_access = true\n\n\
+         [features.network_proxy]\nenabled = true\n\n\
+         [features.network_proxy.unix_sockets]\n\"{}\" = \"allow\"\n",
+        socket.display()
+    ));
+    let script = json!({"steps": [{"shell": proxied}, {"say": "done"}]});
+    let run = codex.run(&script, "Check.", &flags, &proj);
+    h.record("codex stdout (control)", &run.output.stdout);
+    h.record("codex stderr (control)", &run.output.stderr);
+    let through = last_tool_output(&request(&run, "step 1"));
+    // The listener never answers: a request the proxy lets through
+    // reaches it (a connection to accept) and ends in the probe's timeout.
+    let reached = drained(&tcp);
+    println!(
+        "measurement: Codex {} workspace-write in a trusted project whose settings allow \
+         127.0.0.1, with the round-5 allowance: connections reaching the loopback listener {}; \
+         {}",
+        codex.installed.pin.version,
+        reached,
+        through.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    assert!(
+        reached > 0 && !through.contains("was blocked"),
+        "the control: the project's rule did not widen the allowance here: {through}"
+    );
+
+    // EnvCloak's install, with consent.
+    codex.codex_config(&trust);
+    age(&home.join(".codex/config.toml"), Duration::from_secs(600));
+    let (v, code) = agents(
+        &mut h,
+        &bin,
+        &tmp,
+        &[
+            "install",
+            "--agent",
+            "codex",
+            "--consent-sandbox-sockets",
+            "--yes",
+        ],
+    );
+    let toml = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+    let run = codex.run(&script, "Check.", &flags, &proj);
+    h.record("codex stdout", &run.output.stdout);
+    h.record("codex stderr", &run.output.stderr);
+    let through = last_tool_output(&request(&run, "step 1"));
+    let reached = drained(&tcp);
+    println!(
+        "measurement: Codex {} workspace-write in that project after agents install \
+         --consent-sandbox-sockets: connections reaching the loopback listener {}; {}",
+        codex.installed.pin.version,
+        reached,
+        through.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    assert_eq!(
+        reached, 0,
+        "the loopback listener was reached after install"
+    );
+    assert!(!through.contains("PROXIEDOK"), "{through}");
+    assert!(!toml.contains("network_access"), "{toml}");
+    assert!(toml.contains("[mcp_servers.envcloak]"), "{toml}");
+    assert_eq!(code, 1, "{v}");
+    assert!(refused_as(&v, "codex", "network_settings_present"), "{v}");
+    h.assert_swept("M2-08 Codex inherited network rules");
+}
+
+/// Codex review, round 6, on the pinned Codex (L-02): which instruction
+/// file a session reads, and how much of it. Measured first, and the
+/// installer then judged by it:
+///
+/// - a trusted project's `project_doc_fallback_filenames` replaces the
+///   user's: with both lists' files there, Codex sends the project's
+///   file's text to the model and not the user's; `agents install
+///   --project` puts the block into the project's file, and the next
+///   session's request holds the block;
+/// - `project_root_markers` decides the project root: with `.hg` as the
+///   marker, Codex sends the root's file before the working directory's;
+///   once the root's file fills the 32 KiB budget, the working
+///   directory's file is not sent at all, and `agents install --project`
+///   there refuses the block (`instruction_budget`) instead of writing
+///   where it is never read.
+///
+/// Mutations checked: the fallback lists joined (as before round 6): the
+/// block goes into the user's file, which Codex does not read, and this
+/// fails. `.git` as the only marker: the block is written into the
+/// working directory's file past the budget, and this fails.
+#[test]
+fn codex_reads_the_project_block_where_install_put_it() {
+    let found = Installed::find(&versions_toml(), Host::Codex.id(), "native");
+    let Some(xi) = require(found, "M2-08 Codex merged instruction settings") else {
+        return;
+    };
+    let mut h = Harness::start();
+    vault(&mut h);
+    let mut codex = AgentHome::within(&h.home, Host::Codex, xi);
+    let bin = host_bin(&h, &[&codex]);
+    let tmp = h.home.root().join("claude-tmp");
+    let home = h.home.home();
+    let tag = format!("{:x}", fresh_seed());
+    let word = |what: &str| format!("ec{what}file{tag}");
+    let say = json!({"steps": [{"say": "done"}]});
+    let flags = HostFlags::codex("read-only", "never");
+
+    let proj = home.join("work/merged");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::create_dir_all(proj.join(".codex")).unwrap();
+    std::fs::write(
+        proj.join(".codex/config.toml"),
+        "project_doc_fallback_filenames = [\"CLAUDE.md\"]\n",
+    )
+    .unwrap();
+    std::fs::write(proj.join("GEMINI.md"), format!("# {}\n", word("user"))).unwrap();
+    std::fs::write(proj.join("CLAUDE.md"), format!("# {}\n", word("project"))).unwrap();
+    let proj = std::fs::canonicalize(&proj).unwrap();
+    codex.codex_config(&format!(
+        "project_doc_fallback_filenames = [\"GEMINI.md\"]\n\n[projects.\"{}\"]\ntrust_level = \
+         \"trusted\"\n",
+        proj.display()
+    ));
+    let run = codex.run(&say, "Hello.", &flags, &proj);
+    let sent = request(&run, "step 0");
+    println!(
+        "measurement: Codex {} with a user list [GEMINI.md] and a project list [CLAUDE.md], \
+         both there: project file sent {}, user file sent {}",
+        codex.installed.pin.version,
+        sent.contains(&word("project")),
+        sent.contains(&word("user"))
+    );
+    assert!(
+        sent.contains(&word("project")) && !sent.contains(&word("user")),
+        "the measurement: Codex read another file than the project's list names"
+    );
+    let (v, code) = agents_in(
+        &mut h,
+        &bin,
+        &tmp,
+        &proj,
+        &["install", "--project", "--agent", "codex", "--yes"],
+    );
+    assert_eq!(code, 0, "{v}");
+    let block = envcloak_agents::blocks::block();
+    let project = std::fs::read_to_string(proj.join("CLAUDE.md")).unwrap();
+    assert!(project.ends_with(&block), "{v}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("GEMINI.md")).unwrap(),
+        format!("# {}\n", word("user"))
+    );
+    let run = codex.run(&say, "Hello.", &flags, &proj);
+    let sent = request(&run, "step 0");
+    // A line of the block, as JSON carries it.
+    let line = block
+        .lines()
+        .find(|l| l.contains("envcloak run --"))
+        .unwrap()
+        .to_owned();
+    let encoded = serde_json::to_string(&line).unwrap();
+    assert!(
+        sent.contains(encoded.trim_matches('"')),
+        "the block did not reach Codex's model"
+    );
+
+    // Markers: `.hg` puts the root above the working directory.
+    let hg = home.join("work/hg");
+    let sub = hg.join("s");
+    std::fs::create_dir_all(hg.join(".hg")).unwrap();
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(hg.join("AGENTS.md"), format!("# {}\n", word("root"))).unwrap();
+    std::fs::write(sub.join("AGENTS.md"), format!("# {}\n", word("sub"))).unwrap();
+    let hg = std::fs::canonicalize(&hg).unwrap();
+    let sub = std::fs::canonicalize(&sub).unwrap();
+    codex.codex_config(&format!(
+        "project_root_markers = [\".hg\"]\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+        hg.display()
+    ));
+    let run = codex.run(&say, "Hello.", &flags, &sub);
+    let sent = request(&run, "step 0");
+    println!(
+        "measurement: Codex {} with project_root_markers [.hg], in a folder below the root: \
+         root file sent {}, the folder's sent {}",
+        codex.installed.pin.version,
+        sent.contains(&word("root")),
+        sent.contains(&word("sub"))
+    );
+    assert!(sent.contains(&word("root")) && sent.contains(&word("sub")));
+    // The root's file now fills the budget.
+    std::fs::write(
+        hg.join("AGENTS.md"),
+        format!("# {}\n{}\n", word("root"), "y".repeat(33 * 1024)),
+    )
+    .unwrap();
+    let run = codex.run(&say, "Hello.", &flags, &sub);
+    let sent = request(&run, "step 0");
+    println!(
+        "measurement: Codex {} once the root's file is past 32 KiB: the folder's file sent {}",
+        codex.installed.pin.version,
+        sent.contains(&word("sub"))
+    );
+    assert!(
+        !sent.contains(&word("sub")),
+        "the measurement: Codex read past its budget"
+    );
+    let (v, code) = agents_in(
+        &mut h,
+        &bin,
+        &tmp,
+        &sub,
+        &["install", "--project", "--agent", "codex", "--yes"],
+    );
+    assert_eq!(code, 1, "{v}");
+    let change = &v["project"]["changes"][0];
+    assert_eq!(change["reason"], "instruction_budget", "{v}");
+    assert_eq!(
+        std::fs::read_to_string(sub.join("AGENTS.md")).unwrap(),
+        format!("# {}\n", word("sub"))
+    );
+    h.assert_swept("M2-08 Codex merged instruction settings");
 }
 
 /// What a sandboxed command tries besides EnvCloak's socket: a loopback

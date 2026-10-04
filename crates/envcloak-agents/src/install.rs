@@ -35,6 +35,7 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::blocks;
+use crate::codex_layers;
 use crate::detect::{self, DetectError, Detected};
 use crate::hook::Host;
 use crate::hosts::{claude, codex};
@@ -118,16 +119,66 @@ pub struct CodexBudget {
     /// this file: looked for again when the block is written (lesson
     /// L-09), not only when the plan was made.
     pub shadowed_by: Option<PathBuf>,
+    /// What the budget, the files before and the file Codex reads are
+    /// read from again when the block is written (lesson L-09): Codex's
+    /// layered settings ([`codex_layers`]), not only when the plan was
+    /// made. `None`: `limit` and `before` as they are.
+    pub recheck: Option<Recheck>,
+}
+
+/// Where a [`CodexBudget`] is read again from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recheck {
+    /// The person's own `AGENTS.md` in Codex's directory.
+    User(Locations),
+    /// A project's: a session in `dir` reads `file`.
+    Project {
+        dir: PathBuf,
+        file: PathBuf,
+        locations: Locations,
+    },
 }
 
 impl CodexBudget {
+    /// The budget and the files read before this one, now.
+    ///
+    /// # Errors
+    /// `instruction_file_moved` when Codex now reads another file in the
+    /// project than the one planned (its settings or files changed since).
+    fn now(&self) -> Result<(usize, Vec<PathBuf>), Refusal> {
+        match &self.recheck {
+            None => Ok((self.limit, self.before.clone())),
+            Some(Recheck::User(l)) => Ok((codex_layers::user_doc_limit(l), Vec::new())),
+            Some(Recheck::Project {
+                dir,
+                file,
+                locations,
+            }) => {
+                let view = codex_layers::doc_view(locations, dir);
+                let reads = codex_layers::file_read_in(dir, &view.fallbacks)
+                    .unwrap_or_else(|| dir.join("AGENTS.md"));
+                if &reads != file {
+                    return Err(Refusal::new(
+                        "instruction_file_moved",
+                        format!(
+                            "Codex now reads {} in this project instead (its settings or files                              changed since this run looked): the block was not written; run this                              again",
+                            reads.display()
+                        ),
+                    ));
+                }
+                Ok((view.limit, codex_layers::files_before(&view, dir)))
+            }
+        }
+    }
+
     /// What is left of the budget for this file now: each file read
     /// before it costs its size and the blank line Codex joins them with.
     /// One whose size cannot be read (other than gone) takes it all: the
     /// block is then refused rather than written where it may not be read.
-    fn left(&self) -> usize {
+    fn left(&self) -> Result<usize, Refusal> {
+        let (limit, before) = self.now()?;
         let mut used = 0usize;
-        for p in &self.before {
+        for p in &before {
             match std::fs::metadata(p) {
                 Ok(m) => {
                     used = used.saturating_add(
@@ -137,10 +188,10 @@ impl CodexBudget {
                     );
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             }
         }
-        self.limit.saturating_sub(used)
+        Ok(limit.saturating_sub(used))
     }
 
     /// Refused when the override that shadows this file is there now.
@@ -166,10 +217,14 @@ pub enum StepKind {
         host_owned: bool,
         additions: Vec<(Vec<String>, Value)>,
     },
-    /// Settings in a TOML file.
+    /// Settings in a TOML file. With `allowance_layers`, the socket
+    /// allowance among them is written only while Codex's other layers
+    /// still leave it limited to EnvCloak's socket, read again when it is
+    /// written ([`codex_layers::other_layers_fit`]).
     Toml {
         host_owned: bool,
         settings: Vec<codex::Setting>,
+        allowance_layers: Option<Locations>,
     },
     /// A file that is EnvCloak's whole.
     OwnFile { content: String },
@@ -425,9 +480,10 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
             path: l.codex_instructions(),
             kind: StepKind::Block {
                 codex: Some(CodexBudget {
-                    limit: codex_doc_budget(&[l.codex_config()]).0,
+                    limit: codex_layers::user_doc_limit(l),
                     before: Vec::new(),
                     shadowed_by: Some(l.codex_instructions_override()),
+                    recheck: Some(Recheck::User(l.clone())),
                 }),
             },
         });
@@ -456,7 +512,13 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
     // settings to limit it to EnvCloak's socket, which M2-04 measured on
     // the pinned version only: another version gets none (Codex review).
     let qualified = crate::locations::socket_allowance_qualified(Host::Codex, &d.version);
-    let socket = (!linux && opts.consent_sockets && qualified).then_some(ctx.socket.as_path());
+    // Codex merges its other layers into the one EnvCloak writes: the
+    // allowance is limited to EnvCloak's socket only while none of them
+    // holds a network setting of its own, or may hold one EnvCloak cannot
+    // read (Codex review, round 6).
+    let layers =
+        (!linux && opts.consent_sockets && qualified).then(|| codex_layers::other_layers_fit(l));
+    let socket = matches!(layers, Some(Ok(()))).then_some(ctx.socket.as_path());
     hp.steps.push(Step {
         what: format!(
             "add [mcp_servers.envcloak] (tool_timeout_sec 60; no approval setting){}",
@@ -471,8 +533,21 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
         kind: StepKind::Toml {
             host_owned: true,
             settings: codex::config_settings(&ctx.envcloak, linux, socket),
+            allowance_layers: socket.is_some().then(|| l.clone()),
         },
     });
+    if let Some(Err(r)) = layers {
+        hp.steps.push(Step {
+            what: "with your consent, command networking limited to EnvCloak's socket".to_owned(),
+            path: l.codex_config(),
+            kind: StepKind::Withheld(r),
+        });
+    } else if socket.is_some() {
+        hp.notes.push(note(
+            "socket_allowance_scope",
+            "the socket allowance is limited to EnvCloak's socket for the Codex settings there now              (the system and managed files, your profiles, and each project you trust, looked              through); a project you trust later, a .codex/config.toml added later or a -c flag              with network settings of its own can widen it, as any Codex setting can: `agents              install` checks again each time it runs",
+        ));
+    }
     if !linux && opts.consent_sockets && !qualified {
         hp.steps.push(Step {
             what: "with your consent, command networking limited to EnvCloak's socket".to_owned(),
@@ -626,67 +701,6 @@ fn watched(ctx: &Context<'_>, hp: &HostPlan) -> Vec<Watched> {
     out
 }
 
-/// Codex's instruction budget and fallback file names, as the
-/// `config.toml` files at `configs` give them: the smallest budget of
-/// [`codex::DOC_BUDGET`] and theirs (a larger one is not counted on), and
-/// their fallback names, the first file's first.
-fn codex_doc_budget(configs: &[PathBuf]) -> (usize, Vec<String>) {
-    let mut limit = codex::DOC_BUDGET;
-    let mut fallbacks: Vec<String> = Vec::new();
-    for c in configs {
-        let Some(bytes) = c.parent().and_then(|d| {
-            let root = open_root(d).ok()?;
-            read_plain(&root, Path::new(c.file_name()?), crate::writer::MAX_FILE).ok()
-        }) else {
-            continue;
-        };
-        let (max, names) = codex::doc_settings(&Zeroizing::new(bytes.0));
-        if let Some(m) = max {
-            limit = limit.min(m);
-        }
-        for n in names {
-            if !fallbacks.contains(&n) {
-                fallbacks.push(n);
-            }
-        }
-    }
-    (limit, fallbacks)
-}
-
-/// The instruction file Codex reads in `dir`: at most one, the first of
-/// `AGENTS.override.md`, `AGENTS.md` and the fallback names that is there
-/// (Map C section 2.2).
-fn codex_file_in(dir: &Path, fallbacks: &[String]) -> Option<PathBuf> {
-    ["AGENTS.override.md", "AGENTS.md"]
-        .into_iter()
-        .map(str::to_owned)
-        .chain(fallbacks.iter().cloned())
-        .map(|n| dir.join(n))
-        .find(|p| std::fs::symlink_metadata(p).is_ok())
-}
-
-/// The files Codex reads before `dir`'s: one in each directory from the
-/// project root (the nearest directory above `dir` holding `.git`) down
-/// to `dir`'s parent, root first. None when no directory above holds
-/// `.git` (Codex then reads the working directory's only).
-fn codex_files_above(dir: &Path, fallbacks: &[String]) -> Vec<PathBuf> {
-    let above: Vec<&Path> = dir.ancestors().skip(1).collect();
-    if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
-        return Vec::new();
-    }
-    let Some(root) = above
-        .iter()
-        .position(|a| std::fs::symlink_metadata(a.join(".git")).is_ok())
-    else {
-        return Vec::new();
-    };
-    above[..=root]
-        .iter()
-        .rev()
-        .filter_map(|a| codex_file_in(a, fallbacks))
-        .collect()
-}
-
 /// A Claude Code instruction file in a directory above `dir` (other than
 /// the person's own `~/.claude/CLAUDE.md`, `user`): while one is there,
 /// Claude Code does not read `AGENTS.md` (Map C section 2.1).
@@ -765,8 +779,12 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
         }
     }
     if hosts.contains(&Host::Codex) {
-        let (limit, fallbacks) =
-            codex_doc_budget(&[l.codex_config(), dir.join(".codex").join("config.toml")]);
+        // The settings a session in `dir` gets, as Codex merges its layers
+        // (Codex review, round 6: the fallback names of two layers were
+        // joined, where the higher one's list replaces the lower one's, and
+        // the project root was found by `.git` alone, where
+        // `project_root_markers` decides it).
+        let view = codex_layers::doc_view(l, dir);
         if present("AGENTS.override.md") {
             notes.push(note(
                 "project_override_file",
@@ -775,11 +793,17 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
                  override): add the block to it yourself, or remove it and run this again",
             ));
         } else {
-            let file = codex_file_in(dir, &fallbacks).unwrap_or_else(|| dir.join("AGENTS.md"));
+            let file = codex_layers::file_read_in(dir, &view.fallbacks)
+                .unwrap_or_else(|| dir.join("AGENTS.md"));
             let budget = CodexBudget {
-                limit,
-                before: codex_files_above(dir, &fallbacks),
+                limit: view.limit,
+                before: codex_layers::files_before(&view, dir),
                 shadowed_by: Some(dir.join("AGENTS.override.md")),
+                recheck: Some(Recheck::Project {
+                    dir: dir.to_path_buf(),
+                    file: file.clone(),
+                    locations: l.clone(),
+                }),
             };
             add(file, Some(budget), "Codex");
         }
@@ -893,7 +917,7 @@ fn edit_for(
         StepKind::Block { codex } => match match codex {
             Some(b) => {
                 b.shadowed()?;
-                blocks::insert_within(before.unwrap_or_default(), b.left())
+                blocks::insert_within(before.unwrap_or_default(), b.left()?)
             }
             None => blocks::insert(before.unwrap_or_default()),
         } {
@@ -957,7 +981,16 @@ fn edit_for(
                 dropped: stale,
             }))
         }
-        StepKind::Toml { settings, .. } => {
+        StepKind::Toml {
+            settings,
+            allowance_layers,
+            ..
+        } => {
+            if let Some(l) = allowance_layers {
+                if settings.iter().any(|(p, _)| codex::is_allowance_path(p)) {
+                    codex_layers::other_layers_fit(l)?;
+                }
+            }
             let owned = rec.map(|r| r.edits.as_slice()).unwrap_or_default();
             codex::apply(before, settings, owned)
         }
@@ -1744,6 +1777,7 @@ mod tests {
                 limit: codex::DOC_BUDGET,
                 before: vec![locked.join("AGENTS.md")],
                 shadowed_by: None,
+                recheck: None,
             }),
         };
         let seen = std::fs::metadata(locked.join("AGENTS.md")).is_ok();
@@ -1758,6 +1792,106 @@ mod tests {
             matches!(&o, Outcome::Refused(r) if r.name == "instruction_budget"),
             "{o:?}"
         );
+    }
+
+    /// Lesson L-09 for Codex's layered settings (Codex review, round 6):
+    /// what the plan read of Codex's other layers is read again when the
+    /// file is written. A network setting that appears in a trusted
+    /// project after the plan refuses the socket allowance's step
+    /// (`network_settings_present`) and config.toml is left as it was;
+    /// without it, the same step writes the allowance (the control). A
+    /// project setting that makes Codex read another instruction file
+    /// after the plan refuses the block (`instruction_file_moved`).
+    ///
+    /// Mutations checked: the layers not read again in `edit_for` (the
+    /// `other_layers_fit` call there taken out): the allowance is written
+    /// beside the project's rule and this fails. `CodexBudget::now`
+    /// answering the planned budget whatever the recheck: the block goes
+    /// into the file Codex no longer reads and this fails.
+    #[test]
+    fn the_codex_layers_are_read_again_when_a_file_is_written() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        let home = root.join("home");
+        let proj = root.join("work/p");
+        for d in [
+            home.join(".codex"),
+            proj.join(".git"),
+            root.join("etc"),
+            root.join("prefs"),
+        ] {
+            std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let config = home.join(".codex/config.toml");
+        let person = format!(
+            "model = \"m\"\n\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            proj.display()
+        );
+        std::fs::write(&config, &person).unwrap_or_else(|e| panic!("{e}"));
+        aged(&config);
+        let h = home.clone().into_os_string();
+        let env = move |k: &str| (k == "HOME").then(|| h.clone());
+        let l = Locations::new(&env)
+            .unwrap_or_else(|_| panic!("no home"))
+            .with_system_dirs(root.join("etc"), root.join("prefs"));
+        let socket = root.join("envcloakd.sock");
+        let kind = StepKind::Toml {
+            host_owned: true,
+            settings: codex::config_settings(Path::new("/b/envcloak"), false, Some(&socket)),
+            allowance_layers: Some(l.clone()),
+        };
+        let t = target(&config, "codex", "global".to_owned(), true, "Codex");
+        let mut state = crate::writer::State::default();
+        let mut saved = Saved::default();
+        let mut backups = Kept::default();
+        let mut w = Writer {
+            state: &mut state,
+            journal: &mut saved,
+            backups: &mut backups,
+            now: std::time::SystemTime::now(),
+        };
+        // A rule the project gained after the plan.
+        let rule = proj.join(".codex/config.toml");
+        std::fs::create_dir_all(proj.join(".codex")).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(
+            &rule,
+            "[features.network_proxy.domains]\n\"127.0.0.1\" = \"allow\"\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let o = w.change(&t, &mut edit_for(&kind));
+        assert!(
+            matches!(&o, Outcome::Refused(r) if r.name == "network_settings_present"),
+            "{o:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap_or_default(), person);
+        // The control: without it, the same step writes the allowance.
+        std::fs::remove_file(&rule).unwrap_or_else(|e| panic!("{e}"));
+        let o = w.change(&t, &mut edit_for(&kind));
+        assert!(matches!(&o, Outcome::Changed { .. }), "{o:?}");
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap_or_default()
+                .contains("network_access = true")
+        );
+
+        // The instruction file: planned as a new AGENTS.md (Codex reads
+        // none there); then the project names a fallback that is there, so
+        // Codex reads it instead.
+        let plan = project_plan(&proj, &[Host::Codex], &l);
+        let [step] = plan.steps.as_slice() else {
+            panic!("{:?}", plan.steps);
+        };
+        assert_eq!(step.path, proj.join("AGENTS.md"));
+        std::fs::write(proj.join("NOTES.md"), "# Notes\n").unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&rule, "project_doc_fallback_filenames = [\"NOTES.md\"]\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let pt = target(&step.path, "project", "x".to_owned(), false, "the agent");
+        let o = w.change(&pt, &mut edit_for(&step.kind));
+        assert!(
+            matches!(&o, Outcome::Refused(r) if r.name == "instruction_file_moved"),
+            "{o:?}"
+        );
+        assert!(!proj.join("AGENTS.md").exists());
     }
 
     /// Lesson L-09 for the hooks' own command: a versioned install (a
