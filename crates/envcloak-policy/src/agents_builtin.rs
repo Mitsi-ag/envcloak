@@ -30,11 +30,12 @@ pub(crate) static AGENTS_TOML: &str = r#"# Known AI coding agents, for caller ev
 # an entry belongs to, for coverage reporting. `install_trees` names the
 # directories the agent's documented installers write to, for the Linux
 # standing statement (M2 plan D-10); an agent with none has no Linux
-# standing approval. `code_selecting_env` names the environment variables
-# that make the agent's own executable run other code, as measured on its
+# standing approval. `code_selecting_env` names the runtime variables that
+# make the agent's own executable run other code, among those tried on its
 # pinned builds (agent_hosts' `code_selecting_env_is_measured` checks each
 # entry with an executable identity on both systems), for standing
-# approvals (SPEC §10b).
+# approvals (SPEC §10b), which also refuse every dynamic loader variable
+# (`LD_*`, `DYLD_*`) for every agent without a list.
 #
 # Left out for want of evidence: Goose (no install observed and no marker
 # documented; its command name `goose` is also a database migration
@@ -42,7 +43,9 @@ pub(crate) static AGENTS_TOML: &str = r#"# Known AI coding agents, for caller ev
 # signature observed) and Aider.
 
 # Executables that run scripts. For these, the script arguments are matched
-# against each agent's `scripts`, and argv[0] against its `names`. Python
+# against each agent's `scripts`, and argv[0] against its `names`. A name
+# followed by a version (digits and dots, at least one digit: python3.16,
+# node22) is the interpreter's too, listed or not (docs/AGENTS.md). Python
 # runs kimi-cli (https://github.com/MoonshotAI/kimi-cli, pyproject.toml:
 # `kimi` and `kimi-cli` scripts); `Python` is the executable of macOS's
 # framework builds.

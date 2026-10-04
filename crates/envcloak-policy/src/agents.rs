@@ -100,6 +100,13 @@ const DELETED: &[u8] = b" (deleted)";
 const SCRIPT_ARGS: usize = 3;
 const SCRIPT_ARGS_SCANNED: usize = envcloak_sys::MAX_ARGV - 1;
 
+/// The prefixes of the dynamic loaders' environment variables: Linux
+/// `ld.so`'s (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`, ...) and macOS
+/// `dyld`'s (`DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`, ...). Each can
+/// make a dynamically linked executable load code it names
+/// ([`AgentCatalog::env_selects_code`]).
+pub const LOADER_ENV_PREFIXES: [&str; 2] = ["LD_", "DYLD_"];
+
 /// Where a catalog entry came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CatalogSource {
@@ -653,6 +660,31 @@ impl AgentCatalog {
             .map_or(&[], |a| a.code_selecting_env.as_slice())
     }
 
+    /// Whether a variable named `name`, set in the environment of agent
+    /// `id`'s process, may make that process's executable run code other
+    /// than the agent's: any dynamic loader variable
+    /// ([`LOADER_ENV_PREFIXES`]), for every agent and an unknown id alike,
+    /// or one of its entry's [`AgentCatalog::code_selecting_env`]. The rule
+    /// standing approvals apply (SPEC §10b, task M2-15).
+    ///
+    /// The loader variables need no measurement: every dynamically linked
+    /// executable the kernel does not protect loads what they name, as
+    /// SPEC §6.6 refuses them for a registered launch. Measured on the
+    /// pinned builds all the same (docs/AGENTS.md): `DYLD_INSERT_LIBRARIES`
+    /// runs a library in OpenCode's macOS build, whose signature allows
+    /// it, and not in Claude Code's, Codex's or Copilot CLI's. A
+    /// `code_selecting_env` list holds only what was tried and seen to run
+    /// code, so it never stands for every such variable alone.
+    pub fn env_selects_code(&self, id: &str, name: &[u8]) -> bool {
+        LOADER_ENV_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p.as_bytes()))
+            || self
+                .code_selecting_env(id)
+                .iter()
+                .any(|v| v.as_bytes() == name)
+    }
+
     /// Every environment marker the catalog knows, for the CLI's claims
     /// ([`crate::Claims::from_env`]).
     pub fn markers(&self) -> impl Iterator<Item = &str> {
@@ -685,7 +717,7 @@ impl AgentCatalog {
         self.interpreters
             .iter()
             .filter(|(_, s)| extensions || *s == CatalogSource::Builtin)
-            .any(|(i, _)| names.iter().flatten().any(|n| *n == i.as_slice()))
+            .any(|(i, _)| names.iter().flatten().any(|n| interpreter_name(n, i)))
     }
 
     /// Whether the catalog reads `p`'s arguments: its executable is hidden
@@ -977,7 +1009,7 @@ impl FileAgent {
     /// Whether an `executables` pattern ends in one of `interpreters`, or
     /// a signature's identifier is one ([`CatalogErrorKind::RuntimeIdentity`]).
     fn names_an_interpreter(&self, interpreters: &[Vec<u8>]) -> bool {
-        let is_interpreter = |n: &[u8]| interpreters.iter().any(|i| i.as_slice() == n);
+        let is_interpreter = |n: &[u8]| interpreters.iter().any(|i| interpreter_name(n, i));
         self.executables.iter().any(|p| match p.0.last() {
             Some(Component::Name(n)) => is_interpreter(n),
             _ => false,
@@ -985,6 +1017,24 @@ impl FileAgent {
             .signatures
             .iter()
             .any(|s| is_interpreter(s.identifier.as_bytes()))
+    }
+}
+
+/// Whether `name` (an executable's file name, a command name or
+/// `argv[0]`'s last component) is interpreter `interp`'s: `interp` itself,
+/// or `interp` followed by a version, digits and dots with at least one
+/// digit (`python3.16`, `python3.9`, `node22`). No list holds every version
+/// an interpreter is installed under, and a name it missed would neither
+/// have its script read (an agent it runs unseen) nor be refused as an
+/// identity ([`CatalogErrorKind::RuntimeIdentity`]).
+fn interpreter_name(name: &[u8], interp: &[u8]) -> bool {
+    match name.strip_prefix(interp) {
+        Some([]) => true,
+        Some(version) => {
+            version.iter().all(|b| b.is_ascii_digit() || *b == b'.')
+                && version.iter().any(u8::is_ascii_digit)
+        }
+        None => false,
     }
 }
 
@@ -1369,6 +1419,44 @@ mod tests {
         assert!(InstallTree::parse(&format!("/{}", "a".repeat(256))).is_none());
     }
 
+    /// An interpreter's name, or that name and a version: digits and dots,
+    /// at least one digit. Mutation checked: matching names only exactly
+    /// fails this test, and the classification cases of a Python and a
+    /// node the interpreters list does not name (tests/agents.rs).
+    #[test]
+    fn a_versioned_interpreter_name_is_the_interpreter() {
+        for (name, interp) in [
+            ("node", "node"),
+            ("node22", "node"),
+            ("python3", "python3"),
+            ("python3.9", "python3"),
+            ("python3.16", "python3"),
+            ("python3.16", "python"),
+            ("bun1.3.14", "bun"),
+        ] {
+            assert!(
+                interpreter_name(name.as_bytes(), interp.as_bytes()),
+                "{name} {interp}"
+            );
+        }
+        for (name, interp) in [
+            ("nodejs", "node"),
+            ("nodemon", "node"),
+            ("node.", "node"),
+            ("node-22", "node"),
+            ("python3.16a", "python3"),
+            ("Python3", "python"),
+            ("pytho", "python"),
+            ("", "node"),
+            ("bunx", "bun"),
+        ] {
+            assert!(
+                !interpreter_name(name.as_bytes(), interp.as_bytes()),
+                "{name} {interp}"
+            );
+        }
+    }
+
     /// The builtin catalog may not name an interpreter as an executable or
     /// by its signature: an interpreter's path or signature names whatever
     /// script it runs, and a builtin match on either roots grants above the
@@ -1382,6 +1470,7 @@ mod tests {
         for bad in [
             "executables = [\"cursor-agent/versions/*/node\"]",
             "executables = [\"bun\"]",
+            "executables = [\"tools/node22\"]",
             "signatures = [{ identifier = \"node\", team = \"HX7739G8FX\" }]",
         ] {
             let text = format!("{head}{bad}\n");
