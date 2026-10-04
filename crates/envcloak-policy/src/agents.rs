@@ -10,9 +10,9 @@
 //!   Nothing in them removes or narrows a builtin entry. A file that fails
 //!   a check is skipped and reported ([`AgentCatalog::problems`]).
 //! - [`AgentCatalog::classify`]: the agent a process is, from its
-//!   executable (path, `argv[0]` or command name), its script when an
-//!   interpreter runs it, or its macOS code signature. Builtin entries are
-//!   tried first, and the label says which kind matched
+//!   executable (path, `argv[0]` or command name), a name it goes by, its
+//!   script when an interpreter runs it, or its macOS code signature.
+//!   Builtin entries are tried first, and the label says which kind matched
 //!   ([`CatalogSource`]) and on what ([`MatchBasis`]).
 //!
 //! A match labels the process an agent, which only tightens: the caller
@@ -30,14 +30,23 @@
 //! where the builtin catalog alone would read them.
 //!
 //! So a builtin `executables` pattern must name agents only: one that also
-//! matched a terminal multiplexer's executable would root grants at it.
+//! matched a terminal multiplexer's executable would root grants at it. A
+//! name other programs also go by, or one a process gives itself (a
+//! process title), goes in `names`, whose matches are always
+//! [`MatchBasis::Asserted`]. Neither a builtin `executables` pattern nor a
+//! builtin signature may name an interpreter
+//! ([`CatalogErrorKind::RuntimeIdentity`]): an interpreter runs whatever
+//! script it is given, so its path or signature never names an agent.
 //! Errors are value-free: a kind and a line.
 //!
 //! Each entry also names its `product` ([`AgentLabel::product`], for
 //! coverage reporting) and, in the builtin catalog only, the
 //! `install_trees` its documented installers write to
 //! ([`AgentCatalog::within_install_tree`], for the Linux standing
-//! statement, M2 plan D-10). Neither changes what matches.
+//! statement, M2 plan D-10) and the `code_selecting_env` variables that
+//! make its own executable run other code, as measured on its builds
+//! ([`AgentCatalog::code_selecting_env`], for standing approvals, SPEC
+//! §10b). None of them changes what matches.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -75,6 +84,15 @@ const MAX_PATTERN: usize = 256;
 const MAX_NAME: usize = 64;
 /// Components in an install tree.
 const MAX_TREE_COMPONENTS: usize = 16;
+/// Bytes in a name (`names`).
+const MAX_NAME_BYTES: usize = 64;
+/// The longest command name a kernel keeps: 15 bytes on Linux
+/// (`TASK_COMM_LEN` less its NUL), 16 on macOS (`MAXCOMLEN`). A name at
+/// least this long may have been cut to it.
+const COMM_CUT: usize = 15;
+/// What Linux adds to the path of an executable that was removed (or
+/// renamed over) while it runs (`/proc/<pid>/exe`, proc(5)).
+const DELETED: &[u8] = b" (deleted)";
 /// How many arguments of an interpreter are looked at for its script:
 /// the first few that are not options, among the first few in all, which
 /// are all the kernel's view keeps after `argv[0]`
@@ -158,8 +176,8 @@ pub enum CatalogErrorKind {
     InvalidMarker,
     /// One file defines an id twice.
     DuplicateId,
-    /// An agent that matches nothing: no executables, scripts, signatures
-    /// or markers.
+    /// An agent that matches nothing: no executables, names, scripts,
+    /// signatures or markers.
     EmptyAgent,
     /// More entries than a list, a file or the catalog may hold.
     TooMany,
@@ -176,9 +194,18 @@ pub enum CatalogErrorKind {
     /// An install tree that is not an absolute or `~/` path of names and
     /// `*`.
     InvalidInstallTree,
-    /// `install_trees` in an extension: only the builtin catalog says
-    /// where an agent's own installers put it (M2 plan D-10).
+    /// `install_trees` or `code_selecting_env` in an extension: only the
+    /// builtin catalog says where an agent's own installers put it (M2
+    /// plan D-10) and what its builds were measured to do.
     BuiltinOnly,
+    /// Builtin catalog only: an `executables` pattern whose last component,
+    /// or a signature whose identifier, is one of `interpreters`. An
+    /// interpreter runs whatever script it is given, so its path or its
+    /// signature is never an agent's identity.
+    RuntimeIdentity,
+    /// A name (`names`) that is empty, longer than 64 bytes, holds `/`, or
+    /// holds a control or invisible character.
+    InvalidAgentName,
     /// Another I/O error.
     Io(io::ErrorKind),
 }
@@ -211,11 +238,13 @@ impl CatalogErrorKind {
                  ID>\" }, team optional"
             }
             K::InvalidMarker => {
-                "invalid marker: an environment variable name (an ASCII letter or _, then letters, \
-                 digits or _)"
+                "invalid marker or code_selecting_env: an environment variable name (an ASCII \
+                 letter or _, then letters, digits or _)"
             }
             K::DuplicateId => "an agent id is defined twice in one file",
-            K::EmptyAgent => "an agent must list executables, scripts, signatures or markers",
+            K::EmptyAgent => {
+                "an agent must list executables, names, scripts, signatures or markers"
+            }
             K::TooMany => "too many entries",
             K::UnsafeDirectory => {
                 "agents.d must be a directory of this user, not a symlink, and not writable by \
@@ -229,7 +258,15 @@ impl CatalogErrorKind {
                 "invalid install tree: /<path> or ~/<path>, components separated by /, each a \
                  name or *, at most 16 components and 256 bytes"
             }
-            K::BuiltinOnly => "install_trees may be set only in the builtin catalog",
+            K::BuiltinOnly => {
+                "install_trees and code_selecting_env may be set only in the builtin catalog"
+            }
+            K::RuntimeIdentity => {
+                "an executable pattern or a signature names an interpreter, which runs any script"
+            }
+            K::InvalidAgentName => {
+                "invalid name: 1 to 64 bytes, without /, control or invisible characters"
+            }
             K::Io(_) => "cannot read the catalog file",
         }
     }
@@ -426,11 +463,17 @@ struct Agent {
     name: String,
     product: String,
     executables: Vec<(Pattern, CatalogSource)>,
+    /// Names its process goes by that are not an identity: matched against
+    /// its executable's file name, `argv[0]` and its command name, and
+    /// always [`MatchBasis::Asserted`].
+    names: Vec<(Vec<u8>, CatalogSource)>,
     scripts: Vec<(Pattern, CatalogSource)>,
     signatures: Vec<(Signature, CatalogSource)>,
     markers: Vec<(String, CatalogSource)>,
     /// From the builtin catalog only ([`CatalogErrorKind::BuiltinOnly`]).
     install_trees: Vec<InstallTree>,
+    /// From the builtin catalog only ([`CatalogErrorKind::BuiltinOnly`]).
+    code_selecting_env: Vec<String>,
 }
 
 /// The known agents. See the module documentation.
@@ -452,7 +495,7 @@ impl AgentCatalog {
             interpreters: Vec::new(),
             problems: Vec::new(),
         };
-        let file = parse_catalog(AGENTS_TOML.as_bytes()).expect("the builtin agent catalog parses");
+        let file = parse_builtin(AGENTS_TOML.as_bytes()).expect("the builtin agent catalog parses");
         cat.merge(file, CatalogSource::Builtin);
         cat
     }
@@ -525,11 +568,11 @@ impl AgentCatalog {
                 Ok(file) if cat.agents.len() + file.new_ids(&cat) > MAX_AGENTS => {
                     cat.problem(name, CatalogErrorKind::TooMany.into());
                 }
-                Ok(file) if file.agents.iter().any(|a| !a.install_trees.is_empty()) => {
+                Ok(file) if file.agents.iter().any(FileAgent::has_builtin_only) => {
                     let line = file
                         .agents
                         .iter()
-                        .find(|a| !a.install_trees.is_empty())
+                        .find(|a| a.has_builtin_only())
                         .and_then(|a| a.line);
                     cat.problem(
                         name,
@@ -596,6 +639,20 @@ impl AgentCatalog {
             .is_some_and(|a| a.install_trees.iter().any(|t| t.contains(exe, home)))
     }
 
+    /// The environment variables that make agent `id`'s own executable run
+    /// code other than the agent's (a preload, a script in place of its
+    /// own), as the builtin catalog records them, measured on its pinned
+    /// builds (`agents-e2e` checks each): empty for an agent with none
+    /// measured, and for an unknown id. For standing approvals (SPEC §10b):
+    /// an agent process whose environment sets one runs code a program
+    /// chose under the agent's path and signature.
+    pub fn code_selecting_env(&self, id: &str) -> &[String] {
+        self.agents
+            .iter()
+            .find(|a| a.id == id)
+            .map_or(&[], |a| a.code_selecting_env.as_slice())
+    }
+
     /// Every environment marker the catalog knows, for the CLI's claims
     /// ([`crate::Claims::from_env`]).
     pub fn markers(&self) -> impl Iterator<Item = &str> {
@@ -620,10 +677,7 @@ impl AgentCatalog {
     /// count only when `extensions` is set.
     fn interpreter(&self, p: &ProcInfo, extensions: bool, argv: Option<&Argv>) -> bool {
         let names = [
-            p.exe
-                .as_ref()
-                .and_then(|e| e.path.file_name())
-                .map(OsStr::as_bytes),
+            exe_path(p).map(last_component),
             Some(p.comm.as_bytes()),
             argv.and_then(Argv::first)
                 .map(|a| last_component(a.as_bytes())),
@@ -658,7 +712,14 @@ impl AgentCatalog {
     /// `argv[0]`, the script and the command name are the process's own
     /// word (SPEC §10a "Environment markers and argv": caller-asserted), so
     /// a match on them is [`MatchBasis::Asserted`], which roots no grant
-    /// above the caller's session (review finding F-37).
+    /// above the caller's session (review finding F-37). So is a match on
+    /// an entry's `names`, its executable's file name included: a name
+    /// other programs share is never an identity.
+    ///
+    /// The executable's path is taken without the ` (deleted)` Linux adds
+    /// once the file a process runs was removed or renamed over (an agent
+    /// or a node that updated itself while it ran): the process still runs
+    /// the file that path named.
     ///
     /// Each pass uses `p`'s arguments only where that pass's catalog would
     /// read them itself ([`AgentCatalog::needs_argv`] reads them for either
@@ -667,11 +728,9 @@ impl AgentCatalog {
     /// or its script, even against a builtin pattern) is an extension
     /// match (review finding F-36).
     pub fn classify(&self, p: &ProcInfo) -> Option<AgentLabel> {
-        let path = p
-            .exe
-            .as_ref()
-            .map(|e| e.path.as_os_str().as_bytes())
-            .filter(|n| !n.is_empty());
+        let path = exe_path(p);
+        let exe_name = path.map(last_component);
+        let comm = p.comm.as_bytes();
         let signature = p.exe.as_ref().and_then(|e| e.signature.as_ref());
         for source in [CatalogSource::Builtin, CatalogSource::Extension] {
             let extensions = source == CatalogSource::Extension;
@@ -686,14 +745,15 @@ impl AgentCatalog {
             } else {
                 Vec::new()
             };
-            let said: Vec<&[u8]> = [
-                Some(p.comm.as_bytes()),
-                argv.and_then(Argv::first).map(OsStr::as_bytes),
-            ]
-            .into_iter()
-            .flatten()
-            .filter(|n| !n.is_empty())
-            .collect();
+            let said: Vec<&[u8]> = [Some(comm), argv.and_then(Argv::first).map(OsStr::as_bytes)]
+                .into_iter()
+                .flatten()
+                .filter(|n| !n.is_empty())
+                .collect();
+            let argv0_name = argv
+                .and_then(Argv::first)
+                .map(|a| last_component(a.as_bytes()))
+                .filter(|n| !n.is_empty());
             let counts = |s: &CatalogSource| extensions || *s == CatalogSource::Builtin;
             let by_executable = |a: &Agent| {
                 let by_path = path.is_some_and(|path| {
@@ -721,6 +781,11 @@ impl AgentCatalog {
                     .iter()
                     .filter(|(_, s)| counts(s))
                     .any(|(pat, _)| said.iter().any(|n| pat.matches(n)))
+                    || a.names.iter().filter(|(_, s)| counts(s)).any(|(n, _)| {
+                        exe_name == Some(n.as_slice())
+                            || argv0_name == Some(n.as_slice())
+                            || comm_names(comm, n)
+                    })
                     || a.scripts
                         .iter()
                         .filter(|(_, s)| counts(s))
@@ -748,12 +813,14 @@ impl AgentCatalog {
                 // An existing agent keeps its name and product.
                 Some(a) => {
                     a.executables.extend(tag(new.executables));
+                    a.names.extend(new.names.into_iter().map(|n| (n, source)));
                     a.scripts.extend(tag(new.scripts));
                     a.signatures
                         .extend(new.signatures.into_iter().map(|s| (s, source)));
                     a.markers
                         .extend(new.markers.into_iter().map(|m| (m, source)));
                     a.install_trees.extend(new.install_trees);
+                    a.code_selecting_env.extend(new.code_selecting_env);
                 }
                 None => self.agents.push(Agent {
                     // A new agent always has a name: `load` refuses an
@@ -761,8 +828,10 @@ impl AgentCatalog {
                     name: new.name.unwrap_or_else(|| new.id.clone()),
                     product: new.product.unwrap_or_else(|| new.id.clone()),
                     install_trees: new.install_trees,
+                    code_selecting_env: new.code_selecting_env,
                     id: new.id,
                     executables: tag(new.executables),
+                    names: new.names.into_iter().map(|n| (n, source)).collect(),
                     scripts: tag(new.scripts),
                     signatures: new.signatures.into_iter().map(|s| (s, source)).collect(),
                     markers: new.markers.into_iter().map(|m| (m, source)).collect(),
@@ -786,6 +855,24 @@ fn last_component(path: &[u8]) -> &[u8] {
     path.rsplit(|b| *b == b'/')
         .find(|c| !c.is_empty())
         .unwrap_or(path)
+}
+
+/// The path of the executable `p` runs, as the kernel reports it, without
+/// the ` (deleted)` Linux adds once that file was removed or renamed over
+/// while it runs: the process still runs the file the path named (see
+/// [`AgentCatalog::classify`]). `None` when it is hidden or empty.
+fn exe_path(p: &ProcInfo) -> Option<&[u8]> {
+    let path = p.exe.as_ref()?.path.as_os_str().as_bytes();
+    let path = path.strip_suffix(DELETED).unwrap_or(path);
+    (!path.is_empty()).then_some(path)
+}
+
+/// Whether the command name `comm` is `name`, or `name` cut to the length
+/// a kernel keeps ([`COMM_CUT`] bytes or more).
+fn comm_names(comm: &[u8], name: &[u8]) -> bool {
+    !comm.is_empty()
+        && (comm == name
+            || (comm.len() >= COMM_CUT && name.len() > comm.len() && name.starts_with(comm)))
 }
 
 /// The arguments of an interpreter that may name its script: the first
@@ -872,10 +959,54 @@ struct FileAgent {
     name: Option<String>,
     product: Option<String>,
     executables: Vec<Pattern>,
+    names: Vec<Vec<u8>>,
     scripts: Vec<Pattern>,
     signatures: Vec<Signature>,
     markers: Vec<String>,
     install_trees: Vec<InstallTree>,
+    code_selecting_env: Vec<String>,
+}
+
+impl FileAgent {
+    /// Whether it sets a key only the builtin catalog may set
+    /// ([`CatalogErrorKind::BuiltinOnly`]).
+    fn has_builtin_only(&self) -> bool {
+        !self.install_trees.is_empty() || !self.code_selecting_env.is_empty()
+    }
+
+    /// Whether an `executables` pattern ends in one of `interpreters`, or
+    /// a signature's identifier is one ([`CatalogErrorKind::RuntimeIdentity`]).
+    fn names_an_interpreter(&self, interpreters: &[Vec<u8>]) -> bool {
+        let is_interpreter = |n: &[u8]| interpreters.iter().any(|i| i.as_slice() == n);
+        self.executables.iter().any(|p| match p.0.last() {
+            Some(Component::Name(n)) => is_interpreter(n),
+            _ => false,
+        }) || self
+            .signatures
+            .iter()
+            .any(|s| is_interpreter(s.identifier.as_bytes()))
+    }
+}
+
+/// Parses the builtin catalog: [`parse_catalog`], and no `executables`
+/// pattern or signature may name one of its interpreters
+/// ([`CatalogErrorKind::RuntimeIdentity`]): a builtin match on the
+/// executable roots grants above the caller's session and may be a
+/// standing identity, and an interpreter's path or signature names
+/// whatever script it runs.
+fn parse_builtin(bytes: &[u8]) -> Result<CatalogFile, CatalogError> {
+    let file = parse_catalog(bytes)?;
+    if let Some(a) = file
+        .agents
+        .iter()
+        .find(|a| a.names_an_interpreter(&file.interpreters))
+    {
+        return Err(CatalogError {
+            kind: CatalogErrorKind::RuntimeIdentity,
+            line: a.line,
+        });
+    }
+    Ok(file)
 }
 
 /// Line numbers for byte offsets into a file.
@@ -999,6 +1130,13 @@ fn valid_team(s: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
+/// A name a process goes by (`names`): 1 to 64 bytes, without `/`, and
+/// without control or invisible characters; spaces are allowed (a process
+/// title such as `Kimi Code`).
+fn valid_agent_name(s: &str) -> bool {
+    s.len() <= MAX_NAME_BYTES && s != "." && s != ".." && !s.contains('/') && valid_project_name(s)
+}
+
 /// A signing identifier: printable ASCII without spaces, 1 to 128 bytes.
 fn valid_identifier(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && s.bytes().all(|c| c.is_ascii_graphic())
@@ -1015,10 +1153,12 @@ fn agent(
         name: None,
         product: None,
         executables: Vec::new(),
+        names: Vec::new(),
         scripts: Vec::new(),
         signatures: Vec::new(),
         markers: Vec::new(),
         install_trees: Vec::new(),
+        code_selecting_env: Vec::new(),
     };
     for (key, item) in t.iter() {
         let line = lines.key(t, key).or(at);
@@ -1076,12 +1216,26 @@ fn agent(
                     a.signatures.push(signature(lines, v, line)?);
                 }
             }
-            "markers" => {
+            "markers" | "code_selecting_env" => {
+                let mut v = Vec::new();
                 for s in strings(lines, item, line)? {
                     if !EnvName::valid(s.as_bytes()) {
                         return Err(lines.err(CatalogErrorKind::InvalidMarker, line));
                     }
-                    a.markers.push(s.to_owned());
+                    v.push(s.to_owned());
+                }
+                if key == "markers" {
+                    a.markers = v;
+                } else {
+                    a.code_selecting_env = v;
+                }
+            }
+            "names" => {
+                for s in strings(lines, item, line)? {
+                    if !valid_agent_name(s) {
+                        return Err(lines.err(CatalogErrorKind::InvalidAgentName, line));
+                    }
+                    a.names.push(s.as_bytes().to_vec());
                 }
             }
             _ => return Err(lines.err(CatalogErrorKind::UnknownKey, line)),
@@ -1091,6 +1245,7 @@ fn agent(
         return Err(lines.err(CatalogErrorKind::MissingKey, at));
     }
     if a.executables.is_empty()
+        && a.names.is_empty()
         && a.scripts.is_empty()
         && a.signatures.is_empty()
         && a.markers.is_empty()
@@ -1212,6 +1367,54 @@ mod tests {
         assert!(InstallTree::parse(&format!("/{}", ["a"; 16].join("/"))).is_some());
         assert!(InstallTree::parse(&format!("/{}", ["a"; 17].join("/"))).is_none());
         assert!(InstallTree::parse(&format!("/{}", "a".repeat(256))).is_none());
+    }
+
+    /// The builtin catalog may not name an interpreter as an executable or
+    /// by its signature: an interpreter's path or signature names whatever
+    /// script it runs, and a builtin match on either roots grants above the
+    /// caller's session. A pattern that ends in `*`, or in another name,
+    /// passes; an extension may (its matches never root above a session).
+    /// Mutation checked: dropping the check lets each bad file load, and
+    /// `cursor-agent/versions/*/node`, the entry M2-10 first wrote, is one.
+    #[test]
+    fn the_builtin_catalog_names_no_interpreter_as_an_identity() {
+        let head = "interpreters = [\"node\", \"bun\"]\n[[agent]]\nid = \"a\"\nname = \"A\"\n";
+        for bad in [
+            "executables = [\"cursor-agent/versions/*/node\"]",
+            "executables = [\"bun\"]",
+            "signatures = [{ identifier = \"node\", team = \"HX7739G8FX\" }]",
+        ] {
+            let text = format!("{head}{bad}\n");
+            let e = parse_builtin(text.as_bytes()).unwrap_err();
+            assert_eq!(
+                (e.kind(), e.line()),
+                (CatalogErrorKind::RuntimeIdentity, Some(2)),
+                "{bad}"
+            );
+            assert!(parse_catalog(text.as_bytes()).is_ok(), "{bad}");
+        }
+        for good in [
+            "executables = [\"claude/versions/*\"]",
+            "executables = [\"node-agent\"]",
+            "scripts = [\"x/node\"]",
+            "signatures = [{ identifier = \"com.example.node\" }]",
+        ] {
+            assert!(
+                parse_builtin(format!("{head}{good}\n").as_bytes()).is_ok(),
+                "{good}"
+            );
+        }
+        assert!(parse_builtin(AGENTS_TOML.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn comm_names_allow_for_the_kernels_cut() {
+        assert!(comm_names(b"Kimi Code", b"Kimi Code"));
+        assert!(comm_names(b"kimi-code-bg-wo", b"kimi-code-bg-worker"));
+        assert!(comm_names(b"kimi-code-bg-wor", b"kimi-code-bg-worker"));
+        assert!(!comm_names(b"kimi-code-bg", b"kimi-code-bg-worker"));
+        assert!(!comm_names(b"", b"x"));
+        assert!(!comm_names(b"kimi-code-bg-wo", b"kimi-code-bg-w"));
     }
 
     #[test]
