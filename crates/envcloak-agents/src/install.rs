@@ -114,23 +114,45 @@ pub struct Step {
 pub struct CodexBudget {
     pub limit: usize,
     pub before: Vec<PathBuf>,
+    /// The `AGENTS.override.md` that, once there, Codex reads instead of
+    /// this file: looked for again when the block is written (lesson
+    /// L-09), not only when the plan was made.
+    pub shadowed_by: Option<PathBuf>,
 }
 
 impl CodexBudget {
     /// What is left of the budget for this file now: each file read
     /// before it costs its size and the blank line Codex joins them with.
+    /// One whose size cannot be read (other than gone) takes it all: the
+    /// block is then refused rather than written where it may not be read.
     fn left(&self) -> usize {
-        let used: usize = self
-            .before
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| {
-                usize::try_from(m.len())
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(2)
-            })
-            .fold(0, usize::saturating_add);
+        let mut used = 0usize;
+        for p in &self.before {
+            match std::fs::metadata(p) {
+                Ok(m) => {
+                    used = used.saturating_add(
+                        usize::try_from(m.len())
+                            .unwrap_or(usize::MAX)
+                            .saturating_add(2),
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return 0,
+            }
+        }
         self.limit.saturating_sub(used)
+    }
+
+    /// Refused when the override that shadows this file is there now.
+    fn shadowed(&self) -> Result<(), Refusal> {
+        match &self.shadowed_by {
+            Some(o) if std::fs::symlink_metadata(o).is_ok() => Err(Refusal::new(
+                "override_file",
+                "an AGENTS.override.md beside it is what Codex reads instead, so the block would \
+                 not be read there: it was not written",
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -405,6 +427,7 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
                 codex: Some(CodexBudget {
                     limit: codex_doc_budget(&[l.codex_config()]).0,
                     before: Vec::new(),
+                    shadowed_by: Some(l.codex_instructions_override()),
                 }),
             },
         });
@@ -756,6 +779,7 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
             let budget = CodexBudget {
                 limit,
                 before: codex_files_above(dir, &fallbacks),
+                shadowed_by: Some(dir.join("AGENTS.override.md")),
             };
             add(file, Some(budget), "Codex");
         }
@@ -867,7 +891,10 @@ fn edit_for(
 ) -> impl FnMut(Option<&[u8]>, Option<&FileRecord>) -> Result<Edited, Refusal> + '_ {
     move |before: Option<&[u8]>, rec: Option<&FileRecord>| match kind {
         StepKind::Block { codex } => match match codex {
-            Some(b) => blocks::insert_within(before.unwrap_or_default(), b.left()),
+            Some(b) => {
+                b.shadowed()?;
+                blocks::insert_within(before.unwrap_or_default(), b.left())
+            }
             None => blocks::insert(before.unwrap_or_default()),
         } {
             Ok(blocks::Change::Unchanged) => Ok(None),
@@ -1656,6 +1683,82 @@ mod tests {
             Ok(Undo::Nothing) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Lesson L-09 for the Codex block (the class of stale derived state,
+    /// found sweeping the project-scope finding): the override that
+    /// shadows the file, and the sizes of the files Codex reads first,
+    /// are read when the block is written, not only when the plan was
+    /// made. An override that appeared since refuses the write
+    /// (`override_file`); a file read first whose size cannot be read
+    /// takes the whole budget, so the block is refused
+    /// (`instruction_budget`) rather than written where it may not be read.
+    ///
+    /// Mutations checked: `shadowed` not called in `edit_for` (the block is
+    /// written beside the new override) and an unreadable size counted as
+    /// nothing in `left` (the block is written): each fails this.
+    #[test]
+    fn the_codex_block_reads_its_shadow_and_budget_when_it_is_written() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        let proj = root.join("p");
+        std::fs::create_dir(&proj).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(proj.join("AGENTS.md"), "# P\n").unwrap_or_else(|e| panic!("{e}"));
+        let home = root.clone().into_os_string();
+        let env = move |k: &str| (k == "HOME").then(|| home.clone());
+        let l = Locations::new(&env).unwrap_or_else(|_| panic!("no home"));
+        let plan = project_plan(&proj, &[Host::Codex], &l);
+        let [step] = plan.steps.as_slice() else {
+            panic!("{:?}", plan.steps);
+        };
+        let target = |p: &Path| target(p, "project", "x".to_owned(), false, "the agent");
+        let mut state = crate::writer::State::default();
+        let mut saved = Saved::default();
+        let mut backups = Kept::default();
+        let mut w = Writer {
+            state: &mut state,
+            journal: &mut saved,
+            backups: &mut backups,
+            now: std::time::SystemTime::now(),
+        };
+        // The override appears after the plan.
+        std::fs::write(proj.join("AGENTS.override.md"), "# O\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let o = w.change(&target(&step.path), &mut edit_for(&step.kind));
+        assert!(
+            matches!(&o, Outcome::Refused(r) if r.name == "override_file"),
+            "{o:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(proj.join("AGENTS.md")).unwrap_or_default(),
+            "# P\n"
+        );
+        // A file Codex reads first that cannot be looked at.
+        let locked = root.join("locked");
+        std::fs::create_dir(&locked).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(locked.join("AGENTS.md"), "# L\n").unwrap_or_else(|e| panic!("{e}"));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let kind = StepKind::Block {
+            codex: Some(CodexBudget {
+                limit: codex::DOC_BUDGET,
+                before: vec![locked.join("AGENTS.md")],
+                shadowed_by: None,
+            }),
+        };
+        let seen = std::fs::metadata(locked.join("AGENTS.md")).is_ok();
+        let o = w.change(&target(&root.join("q.md")), &mut edit_for(&kind));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| panic!("{e}"));
+        if seen {
+            eprintln!("skipped: the directory could still be searched (root)");
+            return;
+        }
+        assert!(
+            matches!(&o, Outcome::Refused(r) if r.name == "instruction_budget"),
+            "{o:?}"
+        );
     }
 
     /// Lesson L-09 for the hooks' own command: a versioned install (a
