@@ -695,7 +695,10 @@ mod linux_tests {
         install(&p, b"\0another build");
         let second = oracle(&p);
         assert_ne!(first, second);
-        assert_eq!(a.info().exe.unwrap().path, p, "the path names the new file");
+        // The file it runs has no name now: the kernel shows the old path,
+        // marked removed, and the path names the new file.
+        let shown = a.info().exe.unwrap().path;
+        assert_eq!(shown, PathBuf::from(format!("{} (deleted)", p.display())));
         assert_eq!(sha(&a.info(), &cache), Some(first), "the file it runs");
         let b = Running::start(&p);
         assert_eq!(sha(&b.info(), &cache), Some(second));
