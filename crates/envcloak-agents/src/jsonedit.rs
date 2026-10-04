@@ -16,8 +16,10 @@
 //!
 //! The edits add to an array (creating the objects and the array on the
 //! way when they are missing) an element not already in it, and remove
-//! an element equal to one given, removing the containers the add created
-//! once they are empty again.
+//! an element equal to one given; and add a member to an object (Claude
+//! Code's `mcpServers` in `.claude.json`) where that key is free, and
+//! remove it while its value is still the one given. A removal takes out
+//! the containers the add created once they are empty again.
 
 use serde_json::Value;
 
@@ -128,6 +130,10 @@ impl P<'_> {
             Some(b'{') => {
                 self.i += 1;
                 let mut members: Vec<Member> = Vec::new();
+                // Claude Code's `.claude.json` keeps one member per
+                // project: keys are checked for duplicates in a set, not
+                // against every earlier member.
+                let mut keys = std::collections::HashSet::new();
                 self.ws()?;
                 if self.s.get(self.i) == Some(&b'}') {
                     self.i += 1;
@@ -139,7 +145,7 @@ impl P<'_> {
                         }
                         let key_start = self.i;
                         let key = self.string()?;
-                        if members.iter().any(|m| m.key == key) {
+                        if !keys.insert(key.clone()) {
                             return Err(JsonError::DuplicateKey);
                         }
                         self.ws()?;
@@ -572,6 +578,114 @@ impl Doc {
             changed = true;
         }
         // The containers the add created, innermost first, while empty.
+        let before = self.text.len();
+        self.remove_empty(path, created)?;
+        changed |= self.text.len() != before;
+        Ok(changed)
+    }
+
+    /// Adds the member `key: value` to the object at `path`, creating the
+    /// missing objects on the way. Returns how many keys of `path` it
+    /// created (0 when they were all there), or `None` when the member is
+    /// there already with an equal value.
+    ///
+    /// # Errors
+    /// [`JsonError::Shape`] when a value on the path is not an object, or
+    /// the member is there with another value (which is never written
+    /// over: the caller decides whose it is).
+    pub fn add_member(
+        &mut self,
+        path: &[&str],
+        key: &str,
+        value: &Value,
+    ) -> Result<Option<usize>, JsonError> {
+        let mut have = 0;
+        let mut node = &self.root;
+        for k in path {
+            let Kind::Object(ms) = &node.kind else {
+                return Err(JsonError::Shape);
+            };
+            match ms.iter().find(|m| m.key == *k) {
+                Some(m) => {
+                    node = &m.value;
+                    have += 1;
+                }
+                None => break,
+            }
+        }
+        let Kind::Object(ms) = &node.kind else {
+            return Err(JsonError::Shape);
+        };
+        if have == path.len() {
+            if let Some(m) = ms.iter().find(|m| m.key == key) {
+                let existing: Value = serde_json::from_str(&self.text[m.value.start..m.value.end])
+                    .map_err(|_| JsonError::Syntax)?;
+                return if &existing == value {
+                    Ok(None)
+                } else {
+                    Err(JsonError::Shape)
+                };
+            }
+            let node = node.clone();
+            let last = ms.last().map(|m| m.value.end);
+            let text = self.append_item(&node, last, Some(key), value);
+            self.reparse(text)?;
+            return Ok(Some(0));
+        }
+        let mut built = serde_json::Map::new();
+        built.insert(key.to_owned(), value.clone());
+        let mut built = Value::Object(built);
+        for k in path[have + 1..].iter().rev() {
+            let mut m = serde_json::Map::new();
+            m.insert((*k).to_owned(), built);
+            built = Value::Object(m);
+        }
+        let node = node.clone();
+        let last = ms.last().map(|m| m.value.end);
+        let text = self.append_item(&node, last, Some(path[have]), &built);
+        self.reparse(text)?;
+        Ok(Some(path.len() - have))
+    }
+
+    /// Removes the member `key` of the object at `path` while its value
+    /// equals `value` (one that differs is someone else's, and stays), and
+    /// then the last `created` keys of `path` while what they hold is
+    /// empty. Returns whether anything changed.
+    ///
+    /// # Errors
+    /// [`JsonError::Shape`] when the value at `path` is not an object.
+    pub fn remove_member(
+        &mut self,
+        path: &[&str],
+        key: &str,
+        value: &Value,
+        created: usize,
+    ) -> Result<bool, JsonError> {
+        let Some(node) = self.get(path) else {
+            return Ok(false);
+        };
+        let Kind::Object(ms) = &node.kind else {
+            return Err(JsonError::Shape);
+        };
+        let Some(k) = ms.iter().position(|m| m.key == key) else {
+            return Ok(false);
+        };
+        let m = &ms[k];
+        let existing: Value = serde_json::from_str(&self.text[m.value.start..m.value.end])
+            .map_err(|_| JsonError::Syntax)?;
+        if &existing != value {
+            return Ok(false);
+        }
+        let spans: Vec<(usize, usize)> = ms.iter().map(|m| (m.key_start, m.value.end)).collect();
+        let text = self.cut(node.start, node.end, &spans, k);
+        self.reparse(text)?;
+        self.remove_empty(path, created)?;
+        Ok(true)
+    }
+
+    /// Removes the last `created` keys of `path`, innermost first, while
+    /// what each holds is empty.
+    fn remove_empty(&mut self, path: &[&str], created: usize) -> Result<(), JsonError> {
         for depth in (path.len().saturating_sub(created)..path.len()).rev() {
             let Some(n) = self.get(&path[..=depth]) else {
                 continue;
@@ -584,8 +698,7 @@ impl Doc {
             if !empty {
                 break;
             }
-            let parent_path = &path[..depth];
-            let Some(parent) = self.get(parent_path) else {
+            let Some(parent) = self.get(&path[..depth]) else {
                 break;
             };
             let Kind::Object(ms) = &parent.kind else {
@@ -598,9 +711,8 @@ impl Doc {
                 ms.iter().map(|m| (m.key_start, m.value.end)).collect();
             let text = self.cut(parent.start, parent.end, &spans, k);
             self.reparse(text)?;
-            changed = true;
         }
-        Ok(changed)
+        Ok(())
     }
 
     /// The text without item `k` of the container spanning `start..end`,
@@ -754,6 +866,72 @@ mod tests {
         assert!(text.ends_with(
             "  },\n  \"sandbox\": {\n    \"network\": {\n      \"allowUnixSockets\": [\n        \"/s\"\n      ]\n    }\n  }\n}\n"
         ), "{text}");
+    }
+
+    /// Claude Code's `mcpServers` in `.claude.json`: a member added where
+    /// its key is free keeps every other byte and undoes exactly; one
+    /// there with another value is never written over, and one whose
+    /// value changed since is never removed.
+    ///
+    /// Mutation checked: `remove_member` without its value comparison
+    /// (any member of that name removed): the changed member is taken out
+    /// and this fails.
+    #[test]
+    fn members_are_added_where_free_and_removed_while_unchanged() {
+        let entry = json!({"command": "/b/envcloak", "args": ["mcp"], "timeout": 60000});
+        for src in [
+            "{}",
+            "{\n}\n",
+            "{\n  \"numStartups\": 3,\n  \"projects\": {\n    \"/w\": {}\n  }\n}",
+            "{\"mcpServers\":{\"other\":{\"command\":\"/usr/bin/true\"}}}",
+            "{\n  \"mcpServers\": {}\n}\n",
+        ] {
+            let mut d = Doc::parse(src.as_bytes()).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+            let created = d
+                .add_member(&["mcpServers"], "envcloak", &entry)
+                .unwrap_or_else(|e| panic!("{src}: {e:?}"))
+                .unwrap_or_else(|| panic!("{src}: nothing added"));
+            let text = d.text().to_owned();
+            assert_eq!(
+                d.value().pointer("/mcpServers/envcloak"),
+                Some(&entry),
+                "{text}"
+            );
+            let h = crate::hunks::hunks(src.as_bytes(), text.as_bytes())
+                .unwrap_or_else(|| panic!("{src}\n{text}"));
+            assert_eq!(
+                crate::hunks::unapply(text.as_bytes(), &h).as_deref(),
+                Some(src.as_bytes())
+            );
+            assert_eq!(d.add_member(&["mcpServers"], "envcloak", &entry), Ok(None));
+            assert_eq!(
+                d.add_member(&["mcpServers"], "envcloak", &json!({"command": "x"})),
+                Err(JsonError::Shape)
+            );
+            // Changed since: someone else's.
+            assert_eq!(
+                d.remove_member(
+                    &["mcpServers"],
+                    "envcloak",
+                    &json!({"command": "x"}),
+                    created
+                ),
+                Ok(false)
+            );
+            assert_eq!(d.text(), text);
+            assert_eq!(
+                d.remove_member(&["mcpServers"], "envcloak", &entry, created),
+                Ok(true)
+            );
+            let back: Value = serde_json::from_str(d.text()).unwrap_or(Value::Null);
+            let orig: Value = serde_json::from_str(src).unwrap_or(Value::Null);
+            assert_eq!(back, orig, "{src}\n{}", d.text());
+        }
+        let mut d = Doc::parse(b"{\"mcpServers\": []}").unwrap_or_else(|_| Doc::empty());
+        assert_eq!(
+            d.add_member(&["mcpServers"], "envcloak", &entry),
+            Err(JsonError::Shape)
+        );
     }
 
     #[test]

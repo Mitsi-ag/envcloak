@@ -16,16 +16,19 @@
 //!   with or without consent: K-01's measurement found no setting that
 //!   lets the pinned sandbox reach and verify the daemon, so the sandboxed
 //!   shell is `unsupported` there. `excludedCommands` is never written;
-//! - EnvCloak's MCP server, registered with Claude Code's own command,
-//!   `claude mcp add-json --scope user envcloak '{...}'` with its per-server
-//!   `timeout`, and checked with `claude mcp get` (D-16: `~/.claude.json`,
-//!   which Claude Code rewrites on every start, is never edited);
+//! - EnvCloak's MCP server in `~/.claude.json` (user scope,
+//!   `mcpServers.envcloak`, with its per-server `timeout`), written through
+//!   EnvCloak's own writer like every other file: span-preserving, its
+//!   stamp checked at the rename, after a backup, under D-16's rules for a
+//!   file the host rewrites (Codex review: registered through `claude mcp
+//!   add-json` and `remove` after the file was inspected, a save Claude
+//!   Code made in between defeated the ownership and backup checks). The
+//!   entry is what `claude mcp add-json --scope user envcloak '{...}'`
+//!   writes (measured with Claude Code 2.1.280: the object as given), and
+//!   a refused write names that command for the person to run;
 //! - no approval setting for any EnvCloak tool (D-22).
 
-use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -36,6 +39,8 @@ use crate::writer::Refusal;
 
 /// The MCP server's name.
 pub const SERVER: &str = "envcloak";
+/// The key of `.claude.json` that holds the user-scope MCP servers.
+pub const MCP_SERVERS: &str = "mcpServers";
 /// The deny rule for env files.
 pub const READ_DENY: &str = "Read(**/.env*)";
 /// The `PreToolUse` matcher for Claude Code's own tools: an exact list,
@@ -52,8 +57,6 @@ pub const READ_DENY: &str = "Read(**/.env*)";
 pub const TOOL_MATCHER: &str = "Bash|Monitor|Read|Edit|NotebookEdit|Grep|Glob|ReadMcpResourceTool|ReadMcpResourceDirTool|Artifact|Projects|Workflow|ClaudeDesign";
 /// The `PreToolUse` matcher for every MCP tool: a regular expression.
 pub const MCP_MATCHER: &str = "mcp__.*";
-/// How long a `claude mcp` command may take.
-const CLI_LIMIT: Duration = Duration::from_secs(60);
 
 /// The MCP server entry: EnvCloak's absolute path, `mcp --host
 /// claude-code`, and the per-server `timeout` (milliseconds) the tools'
@@ -188,7 +191,7 @@ pub fn envcloak_hooks(settings: &Value) -> bool {
 }
 
 /// The user-scope MCP server entry named `envcloak` in `~/.claude.json`, as
-/// read (never written: D-16).
+/// read.
 ///
 /// # Errors
 /// When the file is not JSON or its servers not an object.
@@ -205,57 +208,6 @@ pub fn registered(claude_json: &[u8]) -> Result<Option<Value>, Refusal> {
         Some(_) => Err(Refusal::new(
             "unexpected_shape",
             "Claude Code's MCP servers in ~/.claude.json are not an object",
-        )),
-    }
-}
-
-/// Runs `claude` with `args`, with only the environment Claude Code needs
-/// to find its files from `env`, within 60 seconds, its output read within
-/// them too ([`crate::detect::run_bounded`]).
-///
-/// # Errors
-/// When it cannot start or does not finish in time.
-pub fn run(
-    exe: &Path,
-    args: &[&str],
-    env: &dyn Fn(&str) -> Option<OsString>,
-) -> Result<Output, Refusal> {
-    let mut cmd = Command::new(exe);
-    cmd.args(args)
-        .env_clear()
-        .env("DISABLE_AUTOUPDATER", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for k in [
-        "HOME",
-        "PATH",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "LC_ALL",
-        "TMPDIR",
-        "CLAUDE_CONFIG_DIR",
-        "CLAUDE_CODE_TMPDIR",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_RUNTIME_DIR",
-    ] {
-        if let Some(v) = env(k) {
-            cmd.env(k, v);
-        }
-    }
-    match crate::detect::run_bounded(&mut cmd, CLI_LIMIT, 1 << 20) {
-        Ok(out) => Ok(out),
-        Err(crate::detect::Bounded::Failed) => Err(Refusal::new(
-            "host_cli_failed",
-            "Claude Code's `claude` command could not be started",
-        )),
-        Err(crate::detect::Bounded::Timeout) => Err(Refusal::new(
-            "host_cli_failed",
-            "Claude Code's `claude mcp` command did not finish within 60 seconds",
         )),
     }
 }

@@ -5,10 +5,12 @@
 //! The hosts here are stand-ins: `claude` and `codex` scripts that answer
 //! `--version` as the pinned versions do, and (`claude`) keep
 //! `~/.claude.json`'s `mcpServers` for `claude mcp add-json`, `get`,
-//! `remove` and `list` as Claude Code 2.1.280 was measured to. They are a
-//! weaker oracle than the hosts: crates/envcloak-e2e (`m2_story`,
-//! `install.rs`) runs the same install against the real, pinned Claude
-//! Code and Codex, on configs their own CLIs wrote, and has them load it.
+//! `remove` and `list` as Claude Code 2.1.280 was measured to, which the
+//! tests use as the person would (EnvCloak itself adds its entry through
+//! its own writer and runs none of them). They are a weaker oracle than
+//! the hosts: crates/envcloak-e2e (`m2_story`, `install.rs`) runs the same
+//! install against the real, pinned Claude Code and Codex, on configs
+//! their own CLIs wrote, and has them load it.
 //!
 //! - Install then uninstall gives every file back byte for byte, removes
 //!   what install created, and leaves the other MCP server listed;
@@ -1045,15 +1047,15 @@ fn an_allowance_written_before_goes_when_it_is_not_written_again() {
 }
 
 /// The Codex review: `~/.claude.json` reached Claude Code's own `claude mcp`
-/// commands without the writer's hard-link rule. With another hard link
-/// it is reported and no command that would change it runs, on install
+/// commands without the writer's hard-link rule. It goes through the
+/// writer now: with another hard link it is reported and left, on install
 /// and on uninstall; the link keeps its contents. A symlink is refused the
-/// same way.
+/// same way. The report names the command the person can run themselves
+/// (`mcp_by_hand`).
 ///
-/// Mutation checked: the `nlink > 1` refusal taken out of
-/// `claude_registered`: `claude mcp add-json` rewrites the file (the stand-in
-/// renames over it, as Claude Code does), the outcome is `changed`, and
-/// this fails.
+/// Mutation checked: the `nlink > 1` refusal taken out of the writer's
+/// `open_target`: the file is backed up before the replacement refuses it
+/// (`envcloak_scan`'s own check), and this fails.
 #[test]
 fn a_linked_claude_json_is_reported_and_left_alone() {
     let f = Fixture::new();
@@ -1061,6 +1063,7 @@ fn a_linked_claude_json_is_reported_and_left_alone() {
     std::fs::create_dir(&outside).unwrap();
     let before = f.read(".claude.json");
     std::fs::hard_link(f.path(".claude.json"), outside.join("claude.json")).unwrap();
+    let backups = f.backups();
     let (v, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
     assert_eq!(code, 1, "{v}");
     let (outcome, reason, backup) = outcome_of(&v, "~/.claude.json");
@@ -1070,6 +1073,22 @@ fn a_linked_claude_json_is_reported_and_left_alone() {
         "{v}"
     );
     assert!(backup.is_null(), "{v}");
+    // Refused as it was read: nothing was backed up for it either (the
+    // other files' backups aside).
+    let made: Vec<String> = f
+        .backups()
+        .into_iter()
+        .filter(|b| !backups.contains(b))
+        .collect();
+    let changed = outcomes(&v)
+        .iter()
+        .filter(|(_, _, o, _)| o == "changed")
+        .count();
+    assert_eq!(made.len(), changed, "{v}");
+    assert!(
+        notes(&v, "claude-code").contains(&"mcp_by_hand".to_owned()),
+        "{v}"
+    );
     assert_eq!(f.read(".claude.json"), before);
     assert_eq!(std::fs::read(outside.join("claude.json")).unwrap(), before);
     // Uninstall leaves it too: EnvCloak registered nothing.
@@ -1210,41 +1229,103 @@ fn no_approval_setting_is_written_for_envcloak() {
     f.sweep();
 }
 
-/// The project scope (Map C §6): the block goes into `CLAUDE.md` and
-/// `AGENTS.md` where they are, a lone `AGENTS.md` gets no `CLAUDE.md`
-/// beside it, and a project with neither gets an `AGENTS.md`. Uninstall
+/// The project scope (Map C section 6), each host's file by its own
+/// precedence (Codex review: one destination for every host missed Codex
+/// beside a lone `CLAUDE.md`, and wrote an `AGENTS.md` that an
+/// `AGENTS.override.md` shadows): the block goes into `CLAUDE.md` and
+/// `AGENTS.md` where they are; a lone `CLAUDE.md` gets an `AGENTS.md`
+/// beside it for Codex, unless Codex reads `CLAUDE.md` itself (named in
+/// `project_doc_fallback_filenames`) or only Claude Code is asked for; a
+/// lone `AGENTS.md` gets no `CLAUDE.md` beside it; a project with neither
+/// gets an `AGENTS.md`; with an `AGENTS.override.md`, Codex's file is not
+/// written and the report says so (`project_override_file`). Uninstall
 /// gives each back.
+///
+/// Mutations checked: `project_plan` choosing one file for every host (the
+/// previous `CLAUDE.md`-else-`AGENTS.md`): the lone `CLAUDE.md` gets no
+/// `AGENTS.md` and this fails; the override not read (`codex_file_in`
+/// starting at `AGENTS.md`): the shadowed `AGENTS.md` is written and this
+/// fails.
 #[test]
-fn the_project_scope_writes_where_the_project_already_keeps_instructions() {
+fn the_project_scope_writes_where_each_host_reads_instructions() {
     let f = Fixture::new();
     let root = f.home.root().join("projects");
     let lone = root.join("lone");
     let claude = root.join("claude");
     let both = root.join("both");
     let none = root.join("none");
-    for d in [&lone, &claude, &both, &none] {
+    let over = root.join("override");
+    let only = root.join("only-claude");
+    let fallback = root.join("fallback");
+    for d in [&lone, &claude, &both, &none, &over, &only, &fallback] {
         std::fs::create_dir_all(d).unwrap();
     }
     std::fs::write(lone.join("AGENTS.md"), "# Lone\n").unwrap();
     std::fs::write(claude.join("CLAUDE.md"), "# Claude\n").unwrap();
     std::fs::write(both.join("AGENTS.md"), "# A\n").unwrap();
     std::fs::write(both.join("CLAUDE.md"), "# C\n").unwrap();
-    for (dir, present, absent) in [
+    std::fs::write(over.join("CLAUDE.md"), "# C\n").unwrap();
+    std::fs::write(over.join("AGENTS.md"), "# A\n").unwrap();
+    std::fs::write(over.join("AGENTS.override.md"), "# Override\n").unwrap();
+    std::fs::write(only.join("CLAUDE.md"), "# Claude\n").unwrap();
+    std::fs::write(fallback.join("CLAUDE.md"), "# Claude\n").unwrap();
+    let config = f.text(".codex/config.toml");
+    type Case<'a> = (
+        &'a PathBuf,
+        &'a [&'a str],
+        &'a [&'a str],
+        &'a [&'a str],
+        &'a [&'a str],
+        Option<&'a str>,
+    );
+    let cases: [Case<'_>; 7] = [
         (
             &lone,
-            &["AGENTS.md"][..],
-            &["CLAUDE.md", "CLAUDE.local.md"][..],
+            &[],
+            &["AGENTS.md"],
+            &["CLAUDE.md", "CLAUDE.local.md"],
+            &[],
+            None,
         ),
-        (&claude, &["CLAUDE.md"], &["AGENTS.md"]),
-        (&both, &["AGENTS.md", "CLAUDE.md"], &[]),
-        (&none, &["AGENTS.md"], &["CLAUDE.md"]),
-    ] {
+        (&claude, &[], &["CLAUDE.md", "AGENTS.md"], &[], &[], None),
+        (&both, &[], &["AGENTS.md", "CLAUDE.md"], &[], &[], None),
+        (&none, &[], &["AGENTS.md"], &["CLAUDE.md"], &[], None),
+        (
+            &over,
+            &[],
+            &["CLAUDE.md"],
+            &[],
+            &["AGENTS.md", "AGENTS.override.md"],
+            Some("project_override_file"),
+        ),
+        (
+            &only,
+            &["--agent", "claude-code"],
+            &["CLAUDE.md"],
+            &["AGENTS.md"],
+            &[],
+            None,
+        ),
+        (&fallback, &[], &["CLAUDE.md"], &["AGENTS.md"], &[], None),
+    ];
+    for (dir, extra, present, absent, kept, note) in cases {
+        if dir == &fallback {
+            std::fs::write(
+                f.path(".codex/config.toml"),
+                format!("project_doc_fallback_filenames = [\"CLAUDE.md\"]\n{config}"),
+            )
+            .unwrap();
+        }
         let before: Vec<Option<Vec<u8>>> = present
             .iter()
+            .chain(kept)
             .map(|n| std::fs::read(dir.join(n)).ok())
             .collect();
-        let out = f.agents_in(dir, &["install", "--project", "--yes"]);
+        let mut args = vec!["install", "--project", "--yes", "--json"];
+        args.extend_from_slice(extra);
+        let out = f.agents_in(dir, &args);
         assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
         for n in present {
             let t = std::fs::read_to_string(dir.join(n)).unwrap();
             assert!(
@@ -1256,11 +1337,28 @@ fn the_project_scope_writes_where_the_project_already_keeps_instructions() {
         for n in absent {
             assert!(!dir.join(n).exists(), "{}", dir.join(n).display());
         }
+        for (n, b) in kept.iter().zip(&before[present.len()..]) {
+            assert_eq!(&std::fs::read(dir.join(n)).ok(), b, "{n}");
+        }
+        let names: Vec<&str> = v["project"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names.contains(&"project_override_file"),
+            note.is_some(),
+            "{}: {v}",
+            dir.display()
+        );
         // The global files are not touched by --project alone.
         assert_eq!(f.text(".claude/CLAUDE.md"), CLAUDE_MD);
-        let out = f.agents_in(dir, &["uninstall", "--project", "--yes"]);
+        let mut args = vec!["uninstall", "--project", "--yes"];
+        args.extend_from_slice(extra);
+        let out = f.agents_in(dir, &args);
         assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
-        for (n, b) in present.iter().zip(&before) {
+        for (n, b) in present.iter().chain(kept).zip(&before) {
             assert_eq!(
                 &std::fs::read(dir.join(n)).ok(),
                 b,
@@ -1270,6 +1368,72 @@ fn the_project_scope_writes_where_the_project_already_keeps_instructions() {
         }
     }
     f.sweep();
+}
+
+/// Codex review: Codex reads only the first `project_doc_max_bytes` (32
+/// KiB unless config.toml says less) of the instruction files it joins,
+/// and a block appended to a longer file was never read while install
+/// said complete. In a project whose `AGENTS.md` is past the budget the
+/// block goes to the top, where Codex reads it; in one below a repository
+/// root whose own `AGENTS.md` (read first) leaves no room, it is refused,
+/// named, and the run incomplete; a smaller `project_doc_max_bytes` is
+/// read. Uninstall gives each back.
+///
+/// Mutation checked: the project block written with `blocks::insert`
+/// whatever the budget (`StepKind::Block`'s `codex` ignored in
+/// `edit_for`): the block lands past 32 KiB and this fails.
+#[test]
+fn the_codex_block_ends_within_what_codex_reads() {
+    let f = Fixture::new();
+    let root = f.home.root().join("projects");
+    let long = root.join("long");
+    std::fs::create_dir_all(&long).unwrap();
+    let text = format!("# Long\n{}\n", "x".repeat(40 * 1024));
+    std::fs::write(long.join("AGENTS.md"), &text).unwrap();
+    let out = f.agents_in(&long, &["install", "--project", "--yes"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let t = f_text(&long.join("AGENTS.md"));
+    let at = t.find(&blocks::block()).unwrap();
+    assert!(at + blocks::block().len() <= 32 * 1024, "at {at}");
+    let out = f.agents_in(&long, &["uninstall", "--project", "--yes"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(f_text(&long.join("AGENTS.md")), text);
+    // Below a repository root whose AGENTS.md fills the budget.
+    let repo = root.join("repo");
+    let sub = repo.join("sub");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(repo.join("AGENTS.md"), "y".repeat(33 * 1024)).unwrap();
+    std::fs::write(sub.join("AGENTS.md"), "# Sub\n").unwrap();
+    let out = f.agents_in(&sub, &["install", "--project", "--yes", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let change = &v["project"]["changes"][0];
+    assert_eq!(change["outcome"], "refused", "{v}");
+    assert_eq!(change["reason"], "instruction_budget", "{v}");
+    assert_eq!(f_text(&sub.join("AGENTS.md")), "# Sub\n");
+    // A smaller budget in config.toml is the one read.
+    let small = root.join("small");
+    std::fs::create_dir_all(&small).unwrap();
+    std::fs::write(
+        small.join("AGENTS.md"),
+        format!("# S\n{}\n", "z".repeat(4096)),
+    )
+    .unwrap();
+    let config = f.text(".codex/config.toml");
+    std::fs::write(
+        f.path(".codex/config.toml"),
+        format!("project_doc_max_bytes = 2048\n{config}"),
+    )
+    .unwrap();
+    let out = f.agents_in(&small, &["install", "--project", "--yes"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(f_text(&small.join("AGENTS.md")).starts_with(&blocks::block()));
+    f.sweep();
+}
+
+fn f_text(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap()
 }
 
 /// `envcloak init --agents-note` (SPEC §6.4 step 4) writes the project's
@@ -1576,7 +1740,8 @@ fn a_plugin_install_still_gets_the_protections() {
 /// Mutations checked: the hooks recorded before kept when the plan no
 /// longer adds them (the stale elements' removal skipped in `edit_for`):
 /// the second install leaves them and this fails; the plugin's
-/// `ClaudeMcpRemove` step not planned: the server stays and this fails;
+/// `ClaudeMcp { entry: None }` step not planned: the server stays and this
+/// fails;
 /// `double_install` answering `None`: `agents status` exits 125 on the
 /// double install and this fails.
 #[test]
@@ -1636,7 +1801,8 @@ fn a_double_install_with_the_plugin_is_found_in_either_order() {
         notes(&v, "claude-code").contains(&"hooks_removed".to_owned()),
         "{v}"
     );
-    assert_eq!(outcome_of(&v, "~/.claude.json").0, "removed", "{v}");
+    // EnvCloak's entry taken out of the file, which stays.
+    assert_eq!(outcome_of(&v, "~/.claude.json").0, "changed", "{v}");
     assert!(!own_hooks() && !own_server());
     let s = f.json(".claude/settings.json");
     assert!(
@@ -1689,10 +1855,15 @@ fn a_double_install_with_the_plugin_is_found_in_either_order() {
 /// leaves the person's, and takes EnvCloak's out of its own file, with
 /// Claude Code's command pointed back at it.
 ///
-/// Mutation checked: `unregister_claude_mcp` reading and changing the
-/// file `CLAUDE_CONFIG_DIR` names now (`ctx.locations.claude_json()`, the
-/// previous reading) instead of the registration's: the person's entry is
-/// removed, EnvCloak's stays, and this fails.
+/// An install with `CLAUDE_CONFIG_DIR` set there finds the person's equal
+/// entry and leaves it theirs.
+///
+/// Mutation checked: an equal entry EnvCloak did not add claimed
+/// (`claude_mcp_edit` returning an `Edit::JsonMember` for it, and the
+/// writer recording the edits of a change that leaves the bytes as they
+/// are; either alone changes nothing, since the writer records no edit for
+/// unchanged bytes): the install with `CLAUDE_CONFIG_DIR` set claims the
+/// person's entry, uninstall removes it, and this fails.
 #[test]
 fn a_registration_is_envcloaks_in_its_own_file_only() {
     let f = Fixture::new();
@@ -1700,7 +1871,9 @@ fn a_registration_is_envcloaks_in_its_own_file_only() {
     assert_eq!(code, 0, "{v}");
     let entry = f.json(".claude.json")["mcpServers"]["envcloak"].clone();
     assert!(entry.is_object(), "{entry}");
-    let alt = f.path("alt-claude");
+    // Inside `~/.claude/`, a directory the daemon backs files up from
+    // (docs/IPC.md "Allowed roots").
+    let alt = f.path(".claude/alt-config");
     std::fs::create_dir(&alt).unwrap();
     let env = [("CLAUDE_CONFIG_DIR", alt.as_path())];
     let out = f.host_with(
@@ -1716,6 +1889,13 @@ fn a_registration_is_envcloaks_in_its_own_file_only() {
         &env,
     );
     assert!(out.status.success(), "{}", stderr(&out));
+    age(&alt.join(".claude.json"), OLD);
+    let (v, code) = f.report_with(&["install", "--agent", "claude-code", "--yes"], &env);
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        notes(&v, "claude-code").contains(&"mcp_server_yours".to_owned()),
+        "{v}"
+    );
     let theirs = std::fs::read(alt.join(".claude.json")).unwrap();
     // The listing names the file EnvCloak registered in.
     let out = f.agents_with(
@@ -1740,15 +1920,15 @@ fn a_registration_is_envcloaks_in_its_own_file_only() {
     f.sweep();
 }
 
-/// Codex review: in a fresh home `claude mcp add-json` creates
+/// Codex review: in a fresh home the registration created
 /// `~/.claude.json`, and uninstall took the entry out and left the file.
-/// The registration records that it created the file, and what it left:
+/// The writer records that it created the file, and what it left:
 /// uninstall removes a file still exactly so; one Claude Code wrote its
 /// own state into since stays, with only EnvCloak's entry taken out.
 ///
-/// Mutation checked: the file's creation not recorded (`created` always
-/// `None` in `try_register`): uninstall leaves `~/.claude.json` and this
-/// fails.
+/// Mutation checked: the file's creation not recorded (`FileRecord`'s
+/// `created` always `false` in `Writer::try_change`): uninstall leaves an
+/// empty `~/.claude.json` and this fails.
 #[test]
 fn a_claude_json_the_install_created_is_removed_by_uninstall() {
     let f = Fixture::new();
@@ -1810,8 +1990,8 @@ fn the_directories_an_install_made_go_with_it() {
 /// says so, and uninstall leaves it (Codex review: "removes exactly what
 /// was added").
 ///
-/// Mutation checked: the entry claimed when it is equal (the previous
-/// `w.state.mcp.insert` before `Outcome::Unchanged`): uninstall removes
+/// Mutation checked: the entry claimed when it is equal (as in
+/// `a_registration_is_envcloaks_in_its_own_file_only`): uninstall removes
 /// the person's entry and this fails.
 #[test]
 fn a_server_the_person_registered_stays_theirs() {
@@ -1945,18 +2125,23 @@ fn arguments_are_never_echoed() {
     }
 }
 
-/// The Codex review: `agents install` and `uninstall` read the agents'
-/// configs, which can hold literal keys, with no tracer check (SPEC §5).
-/// Traced from their first instruction, each exits 1 with `traced` before
-/// it reads one: no plan and no report is printed, and nothing changes.
-/// The control, untraced, prints the plan, which reading the configs
-/// makes (`~/.claude/settings.json` is read for the plugin), so only the
-/// order of the check refuses the traced runs.
+/// The Codex review: `agents install`, `uninstall` and `status` read the
+/// agents' configs, which can hold literal keys, with no tracer check
+/// (SPEC §5). Traced from their first instruction, each exits 1 with
+/// `traced` before it reads one: no plan, report or finding is printed,
+/// and nothing changes. The controls, untraced: install prints the plan,
+/// which reading the configs makes (`~/.claude/settings.json` is read for
+/// the plugin), and status reads the settings for a double install and
+/// answers `not_in_this_build`; so only the order of the check refuses the
+/// traced runs.
 ///
-/// Mutation checked: the `refuse_if_traced` check taken out of
+/// Mutations checked: the `refuse_if_traced` check taken out of `run` in
 /// `cmd/agents.rs`: the traced install goes on, reads the configs and
 /// starts `claude --version`, and this fails (the run does not refuse; it
 /// stops at its child's signal, which nobody continues, and is killed).
+/// The check taken out of `run_status` (the verifier's low finding, no
+/// test covered it): the traced status reads the settings and answers
+/// `not_in_this_build`, and this fails.
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_traced_agents_commands_read_no_config() {
@@ -2027,6 +2212,7 @@ fn linux_traced_agents_commands_read_no_config() {
         &["install", "--yes"],
         &["uninstall"],
         &["uninstall", "--yes"],
+        &["status"],
     ] {
         let out = agents(args, true);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
@@ -2039,9 +2225,16 @@ fn linux_traced_agents_commands_read_no_config() {
     }
     let now: Vec<Vec<u8>> = FILES.iter().map(|p| f.read(p)).collect();
     assert_eq!(now, before);
-    // The control: untraced, the plan is printed.
+    // The controls: untraced, the plan is printed, and status answers.
     let out = agents(&["install"], false);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("settings.json"), "{}", stdout(&out));
+    let out = agents(&["status"], false);
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    assert!(
+        stderr(&out).starts_with("envcloak: not_in_this_build:"),
+        "{}",
+        stderr(&out)
+    );
     f.sweep();
 }
