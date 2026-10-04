@@ -293,6 +293,87 @@ with open(spec["code"] + ".tmp", "w") as c:
 os.rename(spec["code"] + ".tmp", spec["code"])
 "#;
 
+/// The person at a terminal of their own ([`Harness::person`]): each
+/// command leads a session on a pseudo-terminal of its own, as
+/// [`Harness::human_argv`] runs it, and can run from any thread.
+pub struct Person {
+    python: PathBuf,
+    cli: PathBuf,
+    env: Vec<(OsString, OsString)>,
+    files: PathBuf,
+    n: std::sync::atomic::AtomicUsize,
+    kept: Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl std::fmt::Debug for Person {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Person").finish_non_exhaustive()
+    }
+}
+
+impl Person {
+    /// `envcloak <args>` in `cwd`, typing each step's text once its prompt
+    /// shows, within `limit`; `None` when it did not finish or a prompt did
+    /// not show.
+    pub fn run(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        steps: &[(&str, &str)],
+        limit: Duration,
+    ) -> Option<Human> {
+        let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let spec_path = self.files.join(format!("person-{n}.json"));
+        let transcript = self.files.join(format!("person-{n}.tty"));
+        let code = self.files.join(format!("person-{n}.code"));
+        let spec = serde_json::json!({
+            "limit": limit.as_secs().max(1),
+            "fds": [],
+            "steps": steps.iter().map(|(a, b)| serde_json::json!([a, b])).collect::<Vec<_>>(),
+            "transcript": transcript.to_str().unwrap_or(""),
+            "code": code.to_str().unwrap_or(""),
+        });
+        std::fs::write(&spec_path, spec.to_string()).ok()?;
+        let mut cmd = Command::new(&self.python);
+        cmd.env_clear()
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .arg("-c")
+            .arg(HUMAN)
+            .arg(&spec_path)
+            .arg(&self.cli)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = finish_within(cmd, limit + Duration::from_secs(30));
+        let tty = std::fs::read(&transcript).unwrap_or_default();
+        let _ = std::fs::remove_file(&transcript);
+        let _ = std::fs::remove_file(&spec_path);
+        let code_text = std::fs::read_to_string(&code).ok();
+        let _ = std::fs::remove_file(&code);
+        {
+            let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+            kept.push((
+                format!("the person's command p{n} (stdout)"),
+                out.stdout.clone(),
+            ));
+            kept.push((
+                format!("the person's command p{n} (stderr)"),
+                out.stderr.clone(),
+            ));
+            kept.push((format!("the person's command p{n} (terminal)"), tty.clone()));
+        }
+        let code = code_text.and_then(|c| c.trim().parse().ok())?;
+        Some(Human {
+            code,
+            stdout: out.stdout,
+            stderr: out.stderr,
+            tty,
+        })
+    }
+}
+
 /// The agent: `fixture-agent` running one `/bin/sh` that takes one command
 /// line after another. Killed on drop.
 struct Agent {
@@ -638,6 +719,38 @@ impl Harness {
         let mut argv = vec![cli.to_str().unwrap_or("")];
         argv.extend_from_slice(args);
         self.human_argv(cwd, &argv, fds, steps)
+    }
+
+    /// The person, apart from the harness: for a thread that acts while
+    /// something else runs (M2-09's probes ask for approvals while a host
+    /// runs). What it runs is kept for [`Harness::keep_person`].
+    pub fn person(&self) -> Person {
+        let mut env: Vec<(OsString, OsString)> = self
+            .home
+            .vars()
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), v))
+            .collect();
+        env.extend(self.env.iter().map(|(k, v)| (OsString::from(k), v.clone())));
+        let files = self.files().join("person");
+        std::fs::create_dir_all(&files)
+            .unwrap_or_else(|e| panic!("create the person's directory: {e}"));
+        Person {
+            python: python3(),
+            cli: self.cli(),
+            env,
+            files,
+            n: std::sync::atomic::AtomicUsize::new(0),
+            kept: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Sweeps and keeps what `person` printed and showed.
+    pub fn keep_person(&mut self, person: &Person) {
+        let kept = std::mem::take(&mut *person.kept.lock().unwrap_or_else(PoisonError::into_inner));
+        for (what, bytes) in kept {
+            self.keep(what, &bytes);
+        }
     }
 
     /// Starts the agent, whose shell runs in `dir`, if it is not running.

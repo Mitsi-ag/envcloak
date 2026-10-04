@@ -9,7 +9,12 @@
 //! - `wait {ms}`: answers after `ms` milliseconds (at most 600,000), with
 //!   the text `waited <ms>`;
 //! - `whoami {}`: the names of its environment variables (never their
-//!   values) and the command names of its ancestors, from `ps`.
+//!   values) and the command names of its ancestors, from `ps`;
+//! - `echo {text, more}`: the two joined (the coverage probe's control,
+//!   M2-09: a marker sent in two pieces comes back whole only from a call
+//!   that ran);
+//! - `read_file {path}`: the file's first 64 KiB (the coverage probe's
+//!   call that EnvCloak's hook must deny for `.env`).
 //!
 //! Test support only. It holds no value: the hosts start it with whatever
 //! environment they give their servers, and it reports names.
@@ -71,14 +76,21 @@ fn main() {
                     {"name": "whoami", "description": "Its environment's names and its ancestry.",
                      "inputSchema": {"type": "object", "properties": {},
                                      "additionalProperties": false}},
+                    {"name": "echo", "description": "Answers its two texts joined.",
+                     "inputSchema": {"type": "object",
+                                     "properties": {"text": {"type": "string"},
+                                                    "more": {"type": "string"}},
+                                     "required": ["text"], "additionalProperties": false}},
+                    {"name": "read_file", "description": "Answers a file's contents.",
+                     "inputSchema": {"type": "object",
+                                     "properties": {"path": {"type": "string"}},
+                                     "required": ["path"], "additionalProperties": false}},
                 ]})),
             ),
             "tools/call" => {
                 let name = msg["params"]["name"].as_str().unwrap_or("").to_owned();
-                let ms = msg["params"]["arguments"]["ms"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .min(600_000);
+                let args = msg["params"]["arguments"].clone();
+                let ms = args["ms"].as_u64().unwrap_or(0).min(600_000);
                 let out = Arc::clone(&out);
                 let id = id.clone();
                 calls.push(std::thread::spawn(move || {
@@ -88,9 +100,15 @@ fn main() {
                             format!("waited {ms}")
                         }
                         "whoami" => whoami(),
+                        "echo" => format!(
+                            "{}{}",
+                            args["text"].as_str().unwrap_or(""),
+                            args["more"].as_str().unwrap_or("")
+                        ),
+                        "read_file" => read_file(args["path"].as_str().unwrap_or("")),
                         _ => "no such tool".to_owned(),
                     };
-                    let error = name != "wait" && name != "whoami";
+                    let error = !matches!(name.as_str(), "wait" | "whoami" | "echo" | "read_file");
                     send(
                         &out,
                         &json!({"jsonrpc": "2.0", "id": id, "result": {
@@ -110,6 +128,20 @@ fn main() {
     // Input ended: answer the calls still running, then exit.
     for call in calls {
         let _ = call.join();
+    }
+}
+
+/// The first 64 KiB of the file at `path` (relative to the working
+/// directory), as text, or a fixed line when it cannot be read.
+fn read_file(path: &str) -> String {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    match std::fs::File::open(path) {
+        Ok(f) => {
+            let _ = f.take(64 * 1024).read_to_end(&mut out);
+            String::from_utf8_lossy(&out).into_owned()
+        }
+        Err(_) => "the file could not be read".to_owned(),
     }
 }
 
