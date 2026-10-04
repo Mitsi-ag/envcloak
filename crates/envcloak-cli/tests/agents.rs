@@ -1377,6 +1377,64 @@ fn the_project_scope_writes_where_each_host_reads_instructions() {
     f.sweep();
 }
 
+/// Codex review, round 7: a project's uninstall ignored `--agent`, and
+/// took out every block EnvCloak wrote in the project. With a lone
+/// `AGENTS.md`, which Claude Code and Codex both read and install wrote
+/// once for both, `uninstall --project --agent codex` says (dry run) and
+/// does (`--yes`) keep the block, which Claude Code still reads; Claude
+/// Code's uninstall then gives the file back byte for byte.
+///
+/// Mutation checked: the dry run listing every file of the project as
+/// taken out (`project_shares` ignored in `run_uninstall`): `kept_for` is
+/// missing and this fails.
+#[test]
+fn a_projects_shared_block_stays_for_the_host_still_installed() {
+    let f = Fixture::new();
+    let dir = f.home.root().join("projects/shared");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = "# Notes\n";
+    std::fs::write(dir.join("AGENTS.md"), text).unwrap();
+    let out = f.agents_in(&dir, &["install", "--project", "--yes"]);
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert!(f_text(&dir.join("AGENTS.md")).ends_with(&blocks::block()));
+    let out = f.agents_in(
+        &dir,
+        &["uninstall", "--project", "--agent", "codex", "--json"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["files"].as_array().map(Vec::len), Some(1), "{v}");
+    assert_eq!(v["files"][0]["kept_for"], json!(["claude-code"]), "{v}");
+    let out = f.agents_in(&dir, &["uninstall", "--project", "--agent", "codex"]);
+    assert!(
+        stdout(&out).contains("keep EnvCloak's block, which it was installed for Claude Code"),
+        "{}",
+        stdout(&out)
+    );
+    let out = f.agents_in(
+        &dir,
+        &[
+            "uninstall",
+            "--project",
+            "--agent",
+            "codex",
+            "--yes",
+            "--json",
+        ],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["complete"], true, "{v}");
+    assert!(f_text(&dir.join("AGENTS.md")).ends_with(&blocks::block()));
+    let out = f.agents_in(
+        &dir,
+        &["uninstall", "--project", "--agent", "claude-code", "--yes"],
+    );
+    assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(f_text(&dir.join("AGENTS.md")), text);
+    f.sweep();
+}
+
 /// Codex review: Codex reads only the first `project_doc_max_bytes` (32
 /// KiB unless config.toml says less) of the instruction files it joins,
 /// and a block appended to a longer file was never read while install

@@ -233,6 +233,13 @@ pub struct FileRecord {
     pub edits: Vec<Edit>,
     /// Set while the last change is written and not yet confirmed.
     pub intent: Option<Intent>,
+    /// For a project's file (`host` is `project`): the hosts, by id, the
+    /// block in it was installed for. Uninstall for some hosts takes the
+    /// block out only once none it was installed for is left (Codex
+    /// review, round 7: uninstalling Codex took out a block Claude Code was
+    /// installed to read). Empty in a record made before: every host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readers: Vec<String>,
 }
 
 /// EnvCloak's record of its agent integrations, `<data>/agents/state.json`.
@@ -441,6 +448,7 @@ impl LegacyState {
                     journal,
                     edits,
                     intent: None,
+                    readers: Vec::new(),
                 },
             );
         }
@@ -1080,6 +1088,7 @@ impl Writer<'_> {
             journal: Some(Vec::new()),
             edits: Vec::new(),
             intent: None,
+            readers: Vec::new(),
         });
         rec.host_owned |= t.host_owned;
         // The journal holds only while each change starts from what the

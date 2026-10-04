@@ -614,15 +614,25 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
             .project
             .as_ref()
             .map(|d| d.to_string_lossy().into_owned());
-        let listed: Vec<Value> = state
+        let mut listed: Vec<Value> = state
             .files
             .iter()
             .filter(|(_, r)| {
-                (global && r.scope == "global" && hosts.iter().any(|h| h.id() == r.host))
-                    || project.as_deref() == Some(r.scope.as_str())
+                global && r.scope == "global" && hosts.iter().any(|h| h.id() == r.host)
             })
             .map(|(p, r)| json!({"path": shown(&home, Path::new(p)), "host": r.host}))
             .collect();
+        // A project's file is taken out once no host its block was
+        // installed for is left; one another still reads is kept.
+        if let Some(scope) = project.as_deref() {
+            for (p, left) in install::project_shares(&state, scope, &hosts) {
+                listed.push(json!({
+                    "path": shown(&home, Path::new(&p)),
+                    "host": "project",
+                    "kept_for": left,
+                }));
+            }
+        }
         // Every file EnvCloak registered its MCP server in, wherever
         // `CLAUDE_CONFIG_DIR` points now.
         let servers: Vec<String> = if global && hosts.contains(&Host::ClaudeCode) {
@@ -643,10 +653,26 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
             }));
         } else {
             for f in &listed {
-                println!(
-                    "  {}: take out what EnvCloak added",
-                    f["path"].as_str().unwrap_or_default()
-                );
+                let path = f["path"].as_str().unwrap_or_default();
+                let kept: Vec<Host> = f["kept_for"]
+                    .as_array()
+                    .map(|a| {
+                        install::TIER_1
+                            .into_iter()
+                            .filter(|h| a.iter().any(|v| v.as_str() == Some(h.id())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if kept.is_empty() {
+                    println!("  {path}: take out what EnvCloak added");
+                } else {
+                    let names: Vec<&str> = kept.into_iter().map(host_name).collect();
+                    println!(
+                        "  {path}: keep EnvCloak's block, which it was installed for {} to read \
+                         too",
+                        names.join(" and ")
+                    );
+                }
             }
             for p in &servers {
                 println!(

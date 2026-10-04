@@ -256,6 +256,20 @@ pub struct ProjectPlan {
     pub dir: PathBuf,
     pub steps: Vec<Step>,
     pub notes: Vec<Note>,
+    /// The hosts each step's file is written for, by its path (a step
+    /// without an entry: every host). EnvCloak's record of the file keeps
+    /// them, so uninstall for one host leaves a block another still reads.
+    pub readers: Vec<(PathBuf, Vec<Host>)>,
+}
+
+impl ProjectPlan {
+    /// The hosts the step for `path` is written for.
+    pub fn readers_of(&self, path: &Path) -> Vec<Host> {
+        self.readers
+            .iter()
+            .find(|(p, _)| p == path)
+            .map_or_else(|| TIER_1.to_vec(), |(_, h)| h.clone())
+    }
 }
 
 /// Everything an install would do.
@@ -745,7 +759,12 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
     let present = |n: &str| std::fs::symlink_metadata(dir.join(n)).is_ok();
     let mut notes = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
-    let mut add = |path: PathBuf, codex: Option<CodexBudget>, who: &str| {
+    let mut readers: Vec<(PathBuf, Vec<Host>)> = Vec::new();
+    let mut add = |path: PathBuf, codex: Option<CodexBudget>, host: Host| {
+        match readers.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, hs)) => hs.push(host),
+            None => readers.push((path.clone(), vec![host])),
+        }
         if let Some(s) = steps.iter_mut().find(|s| s.path == path) {
             s.what = "add EnvCloak's instruction block (read by Claude Code and Codex)".to_owned();
             if let (StepKind::Block { codex: c @ None }, Some(b)) = (&mut s.kind, codex) {
@@ -754,7 +773,10 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
             return;
         }
         steps.push(Step {
-            what: format!("add EnvCloak's instruction block (read by {who})"),
+            what: format!(
+                "add EnvCloak's instruction block (read by {})",
+                host_name(host)
+            ),
             path,
             kind: StepKind::Block { codex },
         });
@@ -764,7 +786,7 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
             .into_iter()
             .find(|n| present(n))
         {
-            Some(n) => add(dir.join(n), None, "Claude Code"),
+            Some(n) => add(dir.join(n), None, Host::ClaudeCode),
             None => match claude_file_above(dir, &l.claude_instructions()) {
                 Some(above) => notes.push(note(
                     "claude_reads_above",
@@ -776,7 +798,7 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
                     ),
                 )),
                 None => {
-                    add(dir.join("AGENTS.md"), None, "Claude Code");
+                    add(dir.join("AGENTS.md"), None, Host::ClaudeCode);
                     notes.push(note(
                         "claude_reads_agents_md",
                         "Claude Code reads the block in this project's AGENTS.md from version \
@@ -814,13 +836,14 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
                     locations: l.clone(),
                 }),
             };
-            add(file, Some(budget), "Codex");
+            add(file, Some(budget), Host::Codex);
         }
     }
     ProjectPlan {
         dir: dir.to_path_buf(),
         steps,
         notes,
+        readers,
     }
 }
 
@@ -1114,7 +1137,17 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
             .iter()
             .map(|step| {
                 let t = target(&step.path, "project", scope.clone(), false, "the agent");
-                run_step(w, step, t, &mut Vec::new())
+                let before = w
+                    .state
+                    .files
+                    .get(&crate::writer::key(&step.path))
+                    .map(|r| r.readers.clone());
+                let result = run_step(w, step, t, &mut Vec::new());
+                // Only a block that is there now is there for these hosts.
+                if matches!(result.outcome, Outcome::Unchanged | Outcome::Changed { .. }) {
+                    add_readers(w, &step.path, before, &pp.readers_of(&step.path));
+                }
+                result
             })
             .collect();
         report.project = Some(ProjectReport {
@@ -1130,6 +1163,36 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
     report.cleanup_unconfirmed.sort();
     report.cleanup_unconfirmed.dedup();
     report
+}
+
+/// Records in EnvCloak's record of the project file at `path`, when there
+/// is one, the hosts its block is now there for: `hosts` beside those it
+/// was for already (`before`: the record's readers before this run's step,
+/// `None` when there was no record; an empty list is a record made before
+/// readers were kept, which counts every host). A file whose block
+/// EnvCloak did not write has no record and gets none.
+fn add_readers(w: &mut Writer<'_>, path: &Path, before: Option<Vec<String>>, hosts: &[Host]) {
+    let k = crate::writer::key(path);
+    let Some(rec) = w.state.files.get_mut(&k) else {
+        return;
+    };
+    let mut readers: Vec<String> = match before {
+        Some(r) if r.is_empty() => TIER_1.iter().map(|h| h.id().to_owned()).collect(),
+        Some(r) => r,
+        None => Vec::new(),
+    };
+    for h in hosts {
+        if !readers.iter().any(|r| r == h.id()) {
+            readers.push(h.id().to_owned());
+        }
+    }
+    readers.sort();
+    if rec.readers != readers {
+        rec.readers = readers;
+        // Saved again by the command once the run is over; a failure here
+        // is reported there (L-08).
+        let _ = w.journal.save(w.state);
+    }
 }
 
 /// The user-scope MCP entry named `envcloak` (anyone's) in the
@@ -1393,7 +1456,7 @@ pub fn uninstall(opts: &Options, w: &mut Writer<'_>) -> Report {
             .collect::<Vec<_>>()
     };
     if global {
-        for host in hosts {
+        for host in hosts.iter().copied() {
             // Every file of the host's EnvCloak changed, `.claude.json`
             // included, wherever `CLAUDE_CONFIG_DIR` points now: the
             // state keys each by the file it is in.
@@ -1415,13 +1478,48 @@ pub fn uninstall(opts: &Options, w: &mut Writer<'_>) -> Report {
     }
     if let Some(dir) = &opts.project {
         let scope = dir.to_string_lossy().into_owned();
-        let mut results = undo_files(w, "project", &scope, "the agent");
-        results.extend(made_dirs_removed(
-            w,
-            "project",
-            &scope,
-            &mut report.cleanup_unconfirmed,
-        ));
+        let mut results = Vec::new();
+        // Each file's block goes once no host it was installed for is
+        // left; one another host still reads stays, with that host's name.
+        for (p, left) in project_shares(w.state, &scope, &hosts) {
+            let path = PathBuf::from(&p);
+            if left.is_empty() {
+                let t = target(&path, "project", scope.clone(), false, "the agent");
+                let outcome = w.undo(&t, &mut structural);
+                results.push(StepResult {
+                    what: "take out what EnvCloak added".to_owned(),
+                    path,
+                    outcome,
+                });
+                continue;
+            }
+            if let Some(rec) = w.state.files.get_mut(&p) {
+                rec.readers.clone_from(&left);
+            }
+            let _ = w.journal.save(w.state);
+            results.push(StepResult {
+                what: format!(
+                    "keep EnvCloak's block, which it was installed for {} to read too",
+                    names_of(&left)
+                ),
+                path,
+                outcome: Outcome::Unchanged,
+            });
+        }
+        // The directories EnvCloak made go with the last of its files.
+        if !w
+            .state
+            .files
+            .values()
+            .any(|r| r.host == "project" && r.scope == scope)
+        {
+            results.extend(made_dirs_removed(
+                w,
+                "project",
+                &scope,
+                &mut report.cleanup_unconfirmed,
+            ));
+        }
         report.project = Some(ProjectReport {
             dir: dir.clone(),
             results,
@@ -1435,6 +1533,49 @@ pub fn uninstall(opts: &Options, w: &mut Writer<'_>) -> Report {
     report.cleanup_unconfirmed.sort();
     report.cleanup_unconfirmed.dedup();
     report
+}
+
+/// What uninstall for `hosts` does with each of EnvCloak's files in the
+/// project `scope` whose block was installed for one of them: the file's
+/// key, and the hosts it was installed for that are left (none: its
+/// block is taken out). A record made before EnvCloak kept the hosts
+/// counts every host.
+pub fn project_shares(
+    state: &crate::writer::State,
+    scope: &str,
+    hosts: &[Host],
+) -> Vec<(String, Vec<String>)> {
+    let ids: Vec<&str> = hosts.iter().map(|h| h.id()).collect();
+    state
+        .files
+        .iter()
+        .filter(|(_, r)| r.host == "project" && r.scope == scope)
+        .filter_map(|(p, r)| {
+            let readers: Vec<String> = if r.readers.is_empty() {
+                TIER_1.iter().map(|h| h.id().to_owned()).collect()
+            } else {
+                r.readers.clone()
+            };
+            if !readers.iter().any(|h| ids.contains(&h.as_str())) {
+                return None;
+            }
+            let left = readers
+                .into_iter()
+                .filter(|h| !ids.contains(&h.as_str()))
+                .collect();
+            Some((p.clone(), left))
+        })
+        .collect()
+}
+
+/// The display names of the hosts with these ids, joined.
+fn names_of(ids: &[String]) -> String {
+    let names: Vec<&str> = TIER_1
+        .iter()
+        .filter(|h| ids.iter().any(|i| i == h.id()))
+        .map(|h| host_name(*h))
+        .collect();
+    names.join(" and ")
 }
 
 /// The directories EnvCloak made for `host`'s files in `scope`, removed
@@ -1677,6 +1818,7 @@ mod tests {
             journal: None,
             edits,
             intent: None,
+            readers: Vec::new(),
         };
         let Ok(Some(first)) = run(&base, None, Some(&entry)) else {
             panic!("not added");
