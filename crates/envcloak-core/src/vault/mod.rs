@@ -922,6 +922,9 @@ impl Vault {
     /// The fields whose current value equals `v`, by keyed hash (gate 10's
     /// duplicate-owner report). Prior values are not searched.
     pub fn find_by_value(&self, v: &SecretBytes) -> Vec<FieldId> {
+        if envcloak_sys::test_trace() {
+            envcloak_sys::test_event("value keys of every class");
+        }
         txn::find_by_value(&self.keys, &self.state, v)
     }
 
@@ -939,7 +942,15 @@ impl Vault {
     /// other classes are never compared at all (M2-11: `scan.match` and
     /// the import methods compare `secret` items only, never a card's
     /// value or a login's, R-M2-34). Prior values are not listed.
+    ///
+    /// With every other way to a stored value's key ([`Vault::find_by_value`]),
+    /// it is the one boundary a comparison crosses, so a test build's trace
+    /// names each class asked for (`value keys of class <class>`): a test
+    /// sees which classes' keys a daemon compared, not only what it answered.
     pub fn value_keys_of(&self, class: crate::crypto::ItemClass) -> Vec<(FieldId, ValueKey)> {
+        if envcloak_sys::test_trace() {
+            envcloak_sys::test_event(&format!("value keys of class {class:?}"));
+        }
         self.state
             .fields
             .iter()

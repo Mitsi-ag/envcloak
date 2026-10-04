@@ -20,7 +20,7 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use common::{client, data_dir, passphrase, project, seed_vault, start};
+use common::{client, data_dir, passphrase, project, seed_vault};
 use envcloak_core::audit::{AuditEntry, AuditKind};
 use envcloak_core::crypto::ItemClass;
 use envcloak_core::vault::{FieldName, ItemDetails, LockedVault, NewItem, Slug, Vault, VaultPaths};
@@ -84,7 +84,13 @@ impl Fixture {
             })
             .collect();
         cs.push(Canary::new("SHORT_NEW", short.clone()));
-        let d = start(&home);
+        // The test trace on: it names the classes whose value keys a
+        // comparison took (`compared_secrets_only`), and must hold no value
+        // either.
+        let mut cmd = std::process::Command::new(common::exe());
+        home.apply(&mut cmd);
+        cmd.env("ENVCLOAK_TEST_TRACE", "1");
+        let d = Daemon::start_command(cmd, &[]);
         client(&home).unlock(passphrase(&cs), &[]).unwrap();
         Fixture {
             cs,
@@ -116,6 +122,22 @@ impl Fixture {
     fn sweep(&self) {
         assert_no_canary(&self.d.log_bytes(), &self.cs);
         self.home.assert_clean(&self.cs);
+    }
+
+    /// Asserts the daemon compared values with the vault since it started,
+    /// and with `secret` items' value keys alone, as its test trace names
+    /// every class whose keys it took (`envcloak-core`
+    /// `Vault::value_keys_of` and `Vault::find_by_value`, the only ways to
+    /// a stored value's key): no card's or login's key reached a
+    /// comparison, not even to be left out after (Codex review).
+    fn compared_secrets_only(&self) {
+        let log = self.d.log();
+        let classes: Vec<&str> = log
+            .lines()
+            .filter_map(|l| l.strip_prefix("envcloak test: value keys of "))
+            .collect();
+        assert!(!classes.is_empty(), "no comparison traced");
+        assert!(classes.iter().all(|c| *c == "class Secret"), "{classes:?}");
     }
 }
 
@@ -450,10 +472,16 @@ fn a_value_a_project_holds_is_named_after_the_project_in_any_order() {
 /// The import methods compare a value with the `secret` items' values
 /// alone (R-M2-34): a value only a card holds, imported, is a new item,
 /// and the card is neither reported as its holder nor bound to; the same
-/// value a secret holds too binds to the secret, the card unreported.
+/// value a secret holds too binds to the secret, the card unreported. No
+/// card's key is taken to compare with at all, by `import.plan`,
+/// `import.commit` or `import.verify` (the daemon's trace of the
+/// comparison boundary).
 ///
-/// Mutation: the values looked up among every class's keys (the plan
-/// binds the card as the value's holder).
+/// Mutations: the values looked up among every class's keys (the plan
+/// binds the card as the value's holder); every class's keys compared and
+/// the card holders filtered out after (`SecretValues::of` taking `Card`
+/// and `Login` keys too, `fields` keeping secret fields only): the plan is
+/// right, the trace names `class Card`, and this fails.
 #[test]
 fn a_value_a_card_holds_is_never_compared_by_an_import() {
     let (card, both) = (word(32), word(32));
@@ -483,19 +511,18 @@ fn a_value_a_card_holds_is_never_compared_by_an_import() {
     f.cs.push(Canary::new("CARD_ONLY", card.clone()));
     f.cs.push(Canary::new("CARD_AND_SECRET", both.clone()));
     let mut c = client(&f.home);
-    let plan = c
-        .import_plan(&ImportParams {
-            projects: vec![ImportProject {
-                dir: f.dir("acme-api"),
-                name: "acme-api".into(),
-            }],
-            entries: vec![
-                entry(0, ".env", None, "PAYMENT_TOKEN", card.as_bytes()),
-                entry(0, ".env", None, "SHARED_TOKEN", both.as_bytes()),
-            ],
-            claims: Vec::new(),
-        })
-        .unwrap();
+    let params = || ImportParams {
+        projects: vec![ImportProject {
+            dir: f.dir("acme-api"),
+            name: "acme-api".into(),
+        }],
+        entries: vec![
+            entry(0, ".env", None, "PAYMENT_TOKEN", card.as_bytes()),
+            entry(0, ".env", None, "SHARED_TOKEN", both.as_bytes()),
+        ],
+        claims: Vec::new(),
+    };
+    let plan = c.import_plan(&params()).unwrap();
     let new = item_of(&plan, 0);
     assert_eq!(
         (new.slug.as_str(), new.existing, new.holders.len()),
@@ -507,6 +534,14 @@ fn a_value_a_card_holds_is_never_compared_by_an_import() {
         ("token/secret", true, &["token/secret".to_owned()][..])
     );
     assert_no_canary(&json(&plan), &f.cs);
+    let done = c
+        .import_commit(&ImportCommitParams {
+            import: params(),
+            digest: plan.digest.clone(),
+        })
+        .unwrap();
+    assert_eq!(done, plan);
+    f.compared_secrets_only();
     drop(c);
     f.sweep();
 }
@@ -789,6 +824,8 @@ fn verify_answers_the_delete_gate_and_the_kit_is_confirmed_with_a_proof() {
     assert!(v.files[1].covered);
     assert!(!v.deletable());
     assert_no_canary(&json(&v), &f.cs);
+    // `import.verify` compared with `secret` items' value keys alone.
+    f.compared_secrets_only();
 
     // A manifest whose reference does not resolve.
     let bad = project(

@@ -709,12 +709,38 @@ fn each_budget_stops_at_its_limit_and_one_spent_leaves_the_other() {
     f.sweep_with(&entries);
 }
 
+/// The classes whose stored value keys the daemon took to compare with,
+/// as its test trace names each time it took some (`envcloak-core`
+/// `Vault::value_keys_of` and `Vault::find_by_value`, the only ways to
+/// them): `class Secret`, `class Card`, `every class`.
+fn compared_classes(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|l| l.strip_prefix("envcloak test: value keys of "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Asserts the daemon compared with the vault, and with `secret` items'
+/// value keys alone: no card's or login's key reached a comparison, not
+/// even to be left out of the answer after (Codex review).
+fn compared_secrets_only(f: &Fixture) {
+    let classes = compared_classes(&f.d.log());
+    assert!(!classes.is_empty(), "no comparison traced");
+    assert!(classes.iter().all(|c| c == "class Secret"), "{classes:?}");
+}
+
 /// Only `secret` items match (R-M2-34; card detection is M4): a value held
 /// by a card and by a secret matches the secret alone, one held by a card
 /// alone or by a login (its password, its username) matches nothing, for a
-/// person's import that compares each of them.
+/// person's import that compares each of them. No card's or login's value
+/// key is taken to compare with at all (the daemon's trace of the
+/// comparison boundary): leaving them out of the answer is not enough.
 ///
-/// Mutation: every item class compared (the card matches).
+/// Mutations: every item class compared (the card matches); every class's
+/// keys compared and the holders that are not secrets filtered out after
+/// (`SecretValues::of` taking `Card` and `Login` keys too, `find` keeping
+/// secret holders only): the answer is right, the trace names `class
+/// Card`, and this fails.
 #[test]
 fn cards_and_logins_never_match() {
     let (card_only, shared_value, password, username) = (word(24), word(24), word(24), word(24));
@@ -785,6 +811,7 @@ fn cards_and_logins_never_match() {
     assert_eq!(a.compared, 4);
     let found: Vec<(u32, &str)> = a.matches.iter().map(|m| (m.id, m.slug.as_str())).collect();
     assert_eq!(found, [(2, "secret/two")]);
+    compared_secrets_only(&f);
     drop(c);
     let v = f.stop_and_open();
     let (entries, _) = v.read_audit().unwrap();
