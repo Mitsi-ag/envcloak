@@ -1,13 +1,30 @@
 #!/usr/bin/env python3
 """Checks the names and numbers reserved for the M2 and M2b tasks (plan
-decision D-23) against each other and against the code.
+decision D-23) and the M3 tasks (M3 plan, lane C rule 9) against each
+other and against the code.
 
 Two lanes that append to the same fixed table can pick the same number or
-name (review R-7). So every shared registry the M2 and M2b tasks add to is
-assigned up front, in tables between `<!-- reservations:<registry> -->` and
-`<!-- /reservations -->` markers in docs/IPC.md ("Reserved for M2 and M2b")
-and docs/VAULT.md (the same heading). A task takes the rows it is named in;
-to take another, or a new one, it changes the table in its own pull request.
+name (review R-7). So every shared registry the M2, M2b and M3 tasks add
+to is assigned up front, in tables between `<!-- reservations:<registry>
+-->` and `<!-- /reservations -->` markers in docs/IPC.md and docs/VAULT.md,
+under the headings "Reserved for M2 and M2b" and "Reserved for M3". A task
+takes the rows it is named in; to take another, or a new one, it changes
+the table in its own pull request.
+
+Each section holds a registry's table at most once, and the script reads
+a registry's tables in both sections as one table, so a name or number is
+taken once across them (task M3-01: -32051 reserved under both headings is
+a number reserved twice). A table outside those two headings is an error.
+A row of an M2 or M2b task (or M1-AUDIT) belongs under "Reserved for M2
+and M2b" and a row of an M3 task or join under "Reserved for M3"; a later
+milestone (a bare `M<n>`) is a task only in the section of an earlier
+milestone, and `spare` in either. The app-role methods have their own
+table, `app_method`: every name in it starts with `app.` and no name in
+the client `method` table does, and each is read from the `impl Method
+for` blocks of envcloak-ipc, split by that prefix (M1's `APP_METHODS` list
+is not read: it holds names for gate 22's test and the log, no methods).
+The unlocker kinds are read from `UnlockerKind` (envcloak-core's
+crypto/envelope.rs); M1's two are in the baseline.
 
 Each row has a status: `reserved` (not in the code yet), `landed` (in the
 code exactly as the row says) or `reuse` (an entry the code already has,
@@ -241,19 +258,35 @@ DOCS = ("docs/IPC.md", "docs/VAULT.md")
 
 TOKEN = re.compile(r"^[a-z][a-z0-9_]*$")
 METHOD = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
-FIELD = re.compile(r"^[a-z][a-z0-9_]*(=[a-z][a-z0-9_]*)?$")
+# The client methods' table refuses an `app.` name, which belongs in the
+# app-method table, where every name has that prefix.
+CLIENT_METHOD = re.compile(r"^(?!app\.)[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$")
+APP_METHOD = re.compile(r"^app(\.[a-z][a-z0-9_]*)+$")
+# A field of a method's parameters or answer, nested with dots
+# (`daemon.identity` in `status`), and `=<value>` for a value it can take.
+FIELD = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*(=[a-z][a-z0-9_]*)?$")
 MESSAGE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 DOMAIN = re.compile(r"^envcloak-[a-z0-9-]+/[1-9][0-9]*$")
 TOOL = re.compile(r"^[a-z][a-z0-9_]*(_\*)?$")
 
-TASKS = (
+M2_TASKS = (
     {"M2-%02d" % n for n in range(1, 29)}
     | {"M2b-%02d" % n for n in range(1, 12)}
-    | {"M%d" % n for n in range(3, 12)}
     # Repairs of M1 that the M2 plan schedules (plan section 8).
     | {"M1-AUDIT"}
-    | {"spare"}
 )
+# The M3 plan's lane-C tasks and its joins (M3 plan section 7).
+M3_TASKS = {"M3-%02d" % n for n in range(1, 22)} | {"M3-J%d" % n for n in range(1, 7)}
+# Later milestones, named bare.
+LATER = {"M%d" % n for n in range(3, 12)}
+TASKS = M2_TASKS | M3_TASKS | LATER | {"spare"}
+# The headings a reservations table sits under: each section's own tasks,
+# and its milestone (a bare later milestone must come after it).
+SECTIONS = {
+    "Reserved for M2 and M2b": (M2_TASKS, 2),
+    "Reserved for M3": (M3_TASKS, 3),
+}
+HEADING = re.compile(r"^## (.*?)[ \t]*$", re.M)
 STATUSES = ("reserved", "landed", "reuse")
 COVERAGE_KINDS = ("state", "reason", "outcome")
 
@@ -270,6 +303,7 @@ SHARED = {}
 # Code sources, relative to the root.
 AUDIT_RS = "crates/envcloak-core/src/audit/record.rs"
 AAD_RS = "crates/envcloak-core/src/crypto/aad.rs"
+ENVELOPE_RS = "crates/envcloak-core/src/crypto/envelope.rs"
 PROTO_RS = "crates/envcloak-ipc/src/proto.rs"
 CRATES = "crates"
 BASELINE = "scripts/check-reservations-baseline.txt"
@@ -871,6 +905,40 @@ NAME_TYPE = re.compile(r"\s*:\s*&\s*(?:'static\s+)?str\s*([=;])")
 
 
 def code_methods(root):
+    """The client methods: every method name without the `app.` prefix."""
+    return {k: v for k, v in methods_once(root).items() if not k.startswith("app.")}
+
+
+def code_app_methods(root):
+    """The app-role methods: every method name with the `app.` prefix,
+    which may be none (before M3's first app method lands)."""
+    return {k: v for k, v in methods_once(root).items() if k.startswith("app.")}
+
+
+_methods = {}
+
+
+def methods_once(root):
+    """`all_methods(root)`, read once for both method tables; a source
+    error is raised again for each."""
+    if root not in _methods:
+        try:
+            _methods[root] = all_methods(root)
+        except SourceError as e:
+            _methods[root] = e
+    if isinstance(_methods[root], SourceError):
+        raise _methods[root]
+    return _methods[root]
+
+
+def code_unlocker_kinds(root):
+    """The unlocker kinds: `UnlockerKind`'s variants in envelope.rs, each
+    with its explicit number."""
+    src = Source(ENVELOPE_RS, read(root, ENVELOPE_RS))
+    return {snake(v): n for v, n in numbered_variants(src, "UnlockerKind")}
+
+
+def all_methods(root):
     """Method names: the `const NAME` of every `impl Method for` block in
     `envcloak-ipc`'s sources. A `const NAME` the reader cannot read (another
     type, a value that is not one string literal, a malformed name), one
@@ -2697,7 +2765,12 @@ REGISTRIES = {
     "reason": dict(doc="docs/IPC.md", cols=["Token", "Task", "Status", "Use"],
                    name="Token", grammar=TOKEN, code=code_reasons),
     "method": dict(doc="docs/IPC.md", cols=["Method", "Task", "Status", "Use"],
-                   name="Method", grammar=METHOD, code=code_methods),
+                   name="Method", grammar=CLIENT_METHOD, code=code_methods),
+    "app_method": dict(doc="docs/IPC.md", cols=["Method", "Task", "Status", "Use"],
+                       name="Method", grammar=APP_METHOD, code=code_app_methods),
+    "unlocker_kind": dict(doc="docs/VAULT.md", cols=["Number", "Kind", "Task", "Status", "Use"],
+                          name="Kind", num="Number", grammar=TOKEN, code=code_unlocker_kinds,
+                          range=(3, 255)),
     "field": dict(doc="docs/IPC.md", cols=["Method", "Field", "Task", "Status", "Use"],
                   name="Field", scope="Method", scope_grammar=METHOD, grammar=FIELD, code=None),
     "exit_token": dict(doc="docs/IPC.md", cols=["Token", "Task", "Status", "Use"],
@@ -2732,25 +2805,41 @@ def backticked(cell):
 
 
 def read_tables(root):
+    """Each registry's rows, from its tables in every section, as one list;
+    each row carries the heading it is under as `_section`."""
     tables = {}
+    seen = set()
     for doc in DOCS:
         text = read(root, doc)
         opened = OPEN.findall(text)
         closed = text.count("<!-- /reservations -->")
-        blocks = BLOCK.findall(text)
+        blocks = list(BLOCK.finditer(text))
         if len(blocks) != len(opened) or closed != len(opened):
             fail("%s: a reservations marker is unmatched or malformed" % doc)
-        for reg, body in blocks:
+        headings = [(m.start(), m.group(1)) for m in HEADING.finditer(text)]
+        for block in blocks:
+            reg, body = block.group(1), block.group(2)
+            above = [h for at, h in headings if at < block.start()]
+            section = above[-1] if above else None
+            if section not in SECTIONS:
+                fail("%s: the `%s` table is under %s, not one of the headings %s" % (
+                    doc, reg, "no heading" if section is None else "\"%s\"" % section,
+                    ", ".join("\"%s\"" % s for s in SECTIONS)))
+                continue
             if reg not in REGISTRIES:
                 fail("%s: unknown reservations table `%s`" % (doc, reg))
                 continue
             if REGISTRIES[reg]["doc"] != doc:
                 fail("%s: the `%s` table belongs in %s" % (doc, reg, REGISTRIES[reg]["doc"]))
                 continue
-            if reg in tables:
-                fail("%s: the `%s` table appears twice" % (doc, reg))
+            if (reg, section) in seen:
+                fail("%s: the `%s` table appears twice under \"%s\"" % (doc, reg, section))
                 continue
-            tables[reg] = parse_table(doc, reg, body)
+            seen.add((reg, section))
+            rows = parse_table(doc, reg, body)
+            for row in rows:
+                row["_section"] = section
+            tables.setdefault(reg, []).extend(rows)
     for reg, spec in REGISTRIES.items():
         if reg not in tables:
             fail("%s: the `%s` reservations table is missing" % (spec["doc"], reg))
@@ -2806,7 +2895,15 @@ def check_rows(reg, rows):
             key = "%s %s" % (scope, name)
         task, status = row["Task"], row["Status"]
         if task not in TASKS:
-            fail("%s: `%s` names %r, which is not an M2 or M2b task, a later milestone or `spare`" % (where, key, task))
+            fail("%s: `%s` names %r, which is not an M2, M2b or M3 task, a later milestone or `spare`" % (where, key, task))
+        section = row.get("_section")
+        if section in SECTIONS:
+            own, milestone = SECTIONS[section]
+            if task in (M2_TASKS | M3_TASKS) and task not in own:
+                home = [s for s, (tasks, _) in SECTIONS.items() if task in tasks]
+                fail("%s: `%s` is %s's, so its row belongs under \"%s\", not \"%s\"" % (where, key, task, home[0], section))
+            if task in LATER and int(task[1:]) <= milestone:
+                fail("%s: `%s` names %s, which is not a milestone after the one \"%s\" reserves for" % (where, key, task, section))
         if status not in STATUSES:
             fail("%s: `%s` has status %r, not one of %s" % (where, key, status, ", ".join(STATUSES)))
         if task == "spare" and status != "reserved":

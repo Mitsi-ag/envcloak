@@ -141,6 +141,8 @@ Response, one of:
 
 Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3): `app.unlock`, `app.approve`, `app.policy.set`, `app.reveal`, `app.paste`, `app.device.add`, `app.device.remove`, `app.registry.override`, and any other `app.` name. Before the macOS app (M3) no peer has that role: each call is answered `role_denied` (code -32001), changes nothing, and is audited as `audit: denied method=<name> reason=role_denied role=client pid=<pid> uid=<uid>`.
 
+From M3 (plan decision D3-06, task M3-07; not built yet) a connection is to get the role at its first `app.` request, and only when its peer's code signature, read from its audit token, satisfies the app's pinned requirement, the peer runs with the hardened runtime flag, and it carries neither `com.apple.security.get-task-allow` nor any of the hardened runtime's exception entitlements (SPEC §4.3). The verdict holds for that connection alone, which the daemon closes unanswered once another process sends on it ("Peer checks"). Every other peer stays a client peer, and its `app.` calls are answered `role_denied` and audited exactly as above: gate 22 (SPEC §15.2) keeps holding through M3, and each task that lands an app method adds it to the gate's test, `crates/envcloak-daemon/tests/roles.rs`. A build that pins no signing identity (Linux, source and unsigned builds) has no `app` role, as in M1. The M3 app methods are reserved in their own table under "Reserved for M3" below.
+
 ## Comparisons with the vault
 
 `scan.match` (M2 plan D-32, task M2-11) is the one way a scan's candidate tokens (doctor, scrub, the first-run import, `migrate-mcp`) are compared with the vault: by keyed hash under the `index` subkey, in the daemon, which alone holds the key. The CLI scans and removes duplicates first (one comparison per distinct candidate a run); nothing it says about a candidate widens what is compared. The code is `crates/envcloak-daemon/src/scan_match.rs`.
@@ -295,7 +297,7 @@ The other-uid checks need a second user and `sudo`; CI creates one on Linux (`EN
 
 Status: M2 plan decision D-23, written by task M2-01. Every name and number the M2 and M2b tasks will add to the protocol, the CLI's own failure tokens, coverage reporting and the MCP tools is assigned to its task here before any code uses it, so two lanes that append to one fixed table never take the same entry (review R-7). The vault's numbers (audit kinds, item classes, associated-data tags, policy record kinds) are in VAULT.md under the same heading.
 
-A task takes the rows it is named in. To take another row, or a new one, it changes the table in its own pull request; it never picks a number or name that is not here. Each row has a status: `reserved` (not in the code yet), `landed` (in the code exactly as the row says; the task that adds it changes the status in the same commit) or `reuse` (an entry the code already has, which a task uses again for its new case, unchanged). `scripts/check-reservations.py`, which CI runs, reads every table below and in VAULT.md and refuses a name or number taken twice, a malformed name, a task that is not an M2 or M2b task (or a later milestone, or `spare`), a `reserved` row the code already uses, a `landed` or `reuse` row the code does not hold exactly so, and any code entry, in every registry whose code it reads (audit kinds, item classes, associated-data tags, error kinds, reasons, methods, the CLI's failure tokens, statement domains and MCP tools), that no `landed` or `reuse` row accounts for and `scripts/check-reservations-baseline.txt` does not hold, whatever its number. The baseline lists the entries the code held before these reservations (M1) and only shrinks: a line the code no longer holds exactly so (gone or renumbered) is refused, and no task adds one. So every new method, reason, error kind, failure token, statement domain, audit kind, item class or tag needs a `landed` row here or in VAULT.md, in the commit that adds it to the code. Error kinds, reasons, the CLI's own failure tokens and sign-in tokens all reach the person as `envcloak: <token>`, so they share one namespace: a name is in at most one of those four tables, and a `reserved` name there is not one the code already uses in another, unless the script's `SHARED` list names it with both tables after a reviewer agrees the two rows mean one thing (it is empty). The code also has to keep each registry one to one: two entries with one number or token, or one entry with two, fail the check. The CLI's failure tokens are read from every crate's sources, not only the CLI's, where a failure gets its token; nothing the compiler builds a crate from is outside them (a `#[path]` attribute, a symbolic link under `src/`, a target file outside `src/`, a path dependency or workspace member outside `crates/` are refused), and code is ASCII outside comments, literals and test modules. `Failure`'s token is private, fail.rs names it only where a failure is made or its token read whole (a pattern, `ref mut`, an assignment or a local of that name there is refused), and `Failure` derives nothing that makes one, so a token is read where the failure is made: the first argument of every `new` called on `Failure`, each `::new` read back to its type however the path before it is written (a leading `::`, `<..>`, a turbofish, `Self`, an alias in any case; `new` on a type the script cannot tell, such as a macro's metavariable, is refused, and so are imports and type aliases a macro builds), the `token` field of a `Failure` literal, and the argument at each `token` position of a free or inherent function with a `token: &'static str` parameter in any position, at every call (one in a trait or its implementation, which code calls without naming it, is refused). A token argument is a string literal, a `&str` constant or static (read by its whole value, never by its leading literal), `concat!` of literals, another value's `.token()`, or a conditional of those; every `token:` field of other structs and every value a `fn token` returns count too, and every method named `token` returns a static string the script reads. Every string literal and `concat!` is searched for `envcloak: <token>:` anywhere in it, and the argument of a placeholder printed right after `envcloak:`, with white space or none, and before `:` is read as a token argument; a token printed in pieces is refused, and a format string is also read with the values of its arguments the script can read put in (so `"{}: {}:", "envcloak", "<token>"` counts). A usage line, `envcloak: {why}`, prints a message from its file's `fn parse`, and every value `fn parse` can give as its error is read the same way (an error given any other way, such as from a helper, is refused). Text from outside the source is refused: `include_str!` and the like, `env!` of a variable other than Cargo's own, a build script that sets one, and `concat!` or `stringify!` the script cannot read. A token in these forms that the script cannot read (a variable, a function pointer to a helper, a helper's `token` rebound) is refused, never skipped. A line put together at run time from pieces is beyond what a reader of the source can see (a value only the run knows, such as the program's name the panic hook prints, or a line printed in more than one call), and review keeps failures out of such lines (the script's docstring has the whole list). The script reads every declaration of these registries in any form Rust allows, or refuses it, never skipping one: a numbered enum variant whose number is not an integer literal (or that has none), an `AuditKind` or `ErrorKind` variant without one readable `fn token` and `fn code` arm, a method's `const NAME` or a `REASONS` entry that is not one string literal each fail the check; string literals count in every form (raw, byte, C), with their escapes decoded. MCP tools are read from the `envcloak-mcp` crate, where each tool's module declares its name as `const TOOL: &str = "<name>";` (M2-06). Where a table has no code to read yet (coverage tokens, control messages, sign-in tokens, method fields), the check covers the table alone; the task that lands the first entry of such a table adds its reader to the script.
+A task takes the rows it is named in. To take another row, or a new one, it changes the table in its own pull request; it never picks a number or name that is not here. Each row has a status: `reserved` (not in the code yet), `landed` (in the code exactly as the row says; the task that adds it changes the status in the same commit) or `reuse` (an entry the code already has, which a task uses again for its new case, unchanged). `scripts/check-reservations.py`, which CI runs, reads every table below and in VAULT.md and refuses a name or number taken twice, a malformed name, a task that is not an M2 or M2b task (or a later milestone, or `spare`; an M3 task's rows are in "Reserved for M3" below), a `reserved` row the code already uses, a `landed` or `reuse` row the code does not hold exactly so, and any code entry, in every registry whose code it reads (audit kinds, item classes, associated-data tags, error kinds, reasons, methods, the CLI's failure tokens, statement domains and MCP tools), that no `landed` or `reuse` row accounts for and `scripts/check-reservations-baseline.txt` does not hold, whatever its number. The baseline lists the entries the code held before these reservations (M1) and only shrinks: a line the code no longer holds exactly so (gone or renumbered) is refused, and no task adds one. So every new method, reason, error kind, failure token, statement domain, audit kind, item class or tag needs a `landed` row here or in VAULT.md, in the commit that adds it to the code. Error kinds, reasons, the CLI's own failure tokens and sign-in tokens all reach the person as `envcloak: <token>`, so they share one namespace: a name is in at most one of those four tables, and a `reserved` name there is not one the code already uses in another, unless the script's `SHARED` list names it with both tables after a reviewer agrees the two rows mean one thing (it is empty). The code also has to keep each registry one to one: two entries with one number or token, or one entry with two, fail the check. The CLI's failure tokens are read from every crate's sources, not only the CLI's, where a failure gets its token; nothing the compiler builds a crate from is outside them (a `#[path]` attribute, a symbolic link under `src/`, a target file outside `src/`, a path dependency or workspace member outside `crates/` are refused), and code is ASCII outside comments, literals and test modules. `Failure`'s token is private, fail.rs names it only where a failure is made or its token read whole (a pattern, `ref mut`, an assignment or a local of that name there is refused), and `Failure` derives nothing that makes one, so a token is read where the failure is made: the first argument of every `new` called on `Failure`, each `::new` read back to its type however the path before it is written (a leading `::`, `<..>`, a turbofish, `Self`, an alias in any case; `new` on a type the script cannot tell, such as a macro's metavariable, is refused, and so are imports and type aliases a macro builds), the `token` field of a `Failure` literal, and the argument at each `token` position of a free or inherent function with a `token: &'static str` parameter in any position, at every call (one in a trait or its implementation, which code calls without naming it, is refused). A token argument is a string literal, a `&str` constant or static (read by its whole value, never by its leading literal), `concat!` of literals, another value's `.token()`, or a conditional of those; every `token:` field of other structs and every value a `fn token` returns count too, and every method named `token` returns a static string the script reads. Every string literal and `concat!` is searched for `envcloak: <token>:` anywhere in it, and the argument of a placeholder printed right after `envcloak:`, with white space or none, and before `:` is read as a token argument; a token printed in pieces is refused, and a format string is also read with the values of its arguments the script can read put in (so `"{}: {}:", "envcloak", "<token>"` counts). A usage line, `envcloak: {why}`, prints a message from its file's `fn parse`, and every value `fn parse` can give as its error is read the same way (an error given any other way, such as from a helper, is refused). Text from outside the source is refused: `include_str!` and the like, `env!` of a variable other than Cargo's own, a build script that sets one, and `concat!` or `stringify!` the script cannot read. A token in these forms that the script cannot read (a variable, a function pointer to a helper, a helper's `token` rebound) is refused, never skipped. A line put together at run time from pieces is beyond what a reader of the source can see (a value only the run knows, such as the program's name the panic hook prints, or a line printed in more than one call), and review keeps failures out of such lines (the script's docstring has the whole list). The script reads every declaration of these registries in any form Rust allows, or refuses it, never skipping one: a numbered enum variant whose number is not an integer literal (or that has none), an `AuditKind` or `ErrorKind` variant without one readable `fn token` and `fn code` arm, a method's `const NAME` or a `REASONS` entry that is not one string literal each fail the check; string literals count in every form (raw, byte, C), with their escapes decoded. MCP tools are read from the `envcloak-mcp` crate, where each tool's module declares its name as `const TOOL: &str = "<name>";` (M2-06). Where a table has no code to read yet (coverage tokens, control messages, sign-in tokens, method fields), the check covers the table alone; the task that lands the first entry of such a table adds its reader to the script.
 
 **Error kinds** (`data.kind`; codes go on from -32034):
 
@@ -515,4 +517,107 @@ The `pty_monitor` reader binds `Report` and `Command` to direct module-scope pub
 | `cleanup_failed` | M2b-08 | reserved | a delivered context could not be closed |
 | `cleanup_unconfirmed` | M2b-09 | reserved | no reaper confirmed an attempt's teardown |
 | `ended_by_reboot` | M2b-09 | reserved | an unconfirmed attempt's tombstone, cleared because the boot id changed |
+<!-- /reservations -->
+
+## Reserved for M3
+
+Status: M3 plan decisions D3-02 and lane C's rule 9, written by task M3-01. Every name and number the M3 tasks will add to the protocol and to the CLI's own failure tokens is assigned to its task here before any code uses it, so the macOS app's lane and M2's two lanes, which all append to `crates/envcloak-ipc/src/proto.rs` and `crates/envcloak-daemon/src/server.rs`, never take the same entry (plan risk K3-08). The vault's numbers (audit kinds and the unlocker kind) are in VAULT.md under the same heading. Nothing below is built yet.
+
+The rules and statuses are those of "Reserved for M2 and M2b" above, and `scripts/check-reservations.py` reads each registry's tables in both sections as one table: a name or number is taken once across them, and a section holds each table at most once. A row here names an M3 task (`M3-01` to `M3-21`) or join (`M3-J1` to `M3-J6`), a later milestone or `spare`; a row of an M2 or M2b task stays in the section above, and a row of an M3 task in this one. The app-role methods have their own table: every name in it starts with `app.`, and no name in a client method table does. The script reads it from the `const NAME` of every `impl Method for` in `envcloak-ipc` whose name starts with `app.`, as it reads the client methods from the rest; the M1 list `APP_METHODS`, which gate 22's test and the daemon's log read, holds names, not methods. Each lane-C task changes its rows to `landed` in the commit that adds them to the code, and lands the typed Rust helper and the Swift type in the same task or the next lane-C task (plan rule 9).
+
+**Error kinds** (codes go on from -32050):
+
+<!-- reservations:error_kind -->
+| Token | Code | Task | Status | Use |
+|---|---|---|---|---|
+| `signature_invalid` | -32051 | M3-09 | reserved | a signed proof from the app whose P-256 signature does not verify with the `approve` key of a Secure Enclave unlocker enrolled in the vault (a key never enrolled, or removed, included); nothing is granted or written |
+| `unlock_failed` | -32052 | M3-08 | reserved | an `app.unlock` whose sealed VMK does not open, does not match the vault's sealed header, or answers an unlock request that is unknown, used or more than 60 seconds old; audited |
+| `no_unlocker` | -32053 | M3-08 | reserved | no enrolled Secure Enclave unlocker has the id (`app.unlock.begin`), or a removal would leave the vault without one (`app.unlocker.remove`, M3-14) |
+| `ask_closed` | -32054 | M3-14 | reserved | an ask that was declined, expired or answered already (`app.paste` for an ask, `app.asks.decline`) |
+<!-- /reservations -->
+
+**Reasons** (`data.reason`; each joins `envcloak_ipc::proto::REASONS` and its words in the CLI when it lands):
+
+<!-- reservations:reason -->
+| Token | Task | Status | Use |
+|---|---|---|---|
+| `code_identity` | M3-07 | reserved | `daemon_unverified` on a signed build: the daemon's code signature does not satisfy the daemon's pinned requirement and the runtime conditions of SPEC §4.3; the client sends nothing |
+| `rolled_back` | M3-16 | reserved | `vault_tampered`: the keychain anchor is newer than the vault file, which opens read-only |
+| `anchor_missing` | M3-16 | reserved | a vault that had a keychain anchor has none: reported, and the anchor written again with an audit entry |
+<!-- /reservations -->
+
+**Methods** (client role):
+
+<!-- reservations:method -->
+| Method | Task | Status | Use |
+|---|---|---|---|
+| `projects.list` | M3-04 | reserved | the vault's project index, newest first and paged within a frame: each project's display path, manifest hash, bindings and last use. Metadata, as `items.list` is, so any client, an agent included, can list project paths (plan D3-17 and Q3-04) |
+| `items.ask` | M3-14 | reserved | `envcloak add --ask`: files a request for the app's paste sheet with the requester's evidence, under the pending caps; takes no value and makes no grant |
+| `items.ask_state` | M3-14 | reserved | an ask's state (`pending`, `added` with the new slug, `declined`, `expired` or `unknown`), told only to the requester's own tree, as `pending.state` |
+| `reveal.request` | M3-14 | reserved | `envcloak reveal` on macOS: files a reveal for the app; refused (`proof_refused`) to an agent, unknown or terminal-less subject before anything is filed (SPEC §6.7) |
+<!-- /reservations -->
+
+**App-role methods** (SPEC §4.3):
+
+<!-- reservations:app_method -->
+| Method | Task | Status | Use |
+|---|---|---|---|
+| `app.unlock.begin` | M3-08 | reserved | starts a Secure Enclave unlock: the envelope, a 32-byte challenge and a fresh X25519 daemon key, kept 60 seconds for one use (SPEC §5 "Unlock flow") |
+| `app.unlock` | M3-08 | reserved | the VMK, HPKE-sealed to that key with the request id and the challenge as its associated data: the one VMK crossing of an unlock (SPEC §4.4) |
+| `app.unlocker.enroll.begin` | M3-08 | reserved | opens a pending `unlocker_add` request with the new unlocker's two public keys and label, which the person approves with `envcloak approve` and the passphrase (plan D3-08) |
+| `app.unlocker.enroll` | M3-08 | reserved | that request's outcome: `pending`, `enrolled` with the unlocker's id, `denied` or `expired` |
+| `app.unlocker.add` | M3-14 | reserved | another Secure Enclave unlocker, signed by an enrolled `approve` key (`envcloak-write-statement/1`) |
+| `app.unlocker.remove` | M3-14 | reserved | removes the passphrase unlocker under a signed write statement; never the Recovery Kit's, and never the last Secure Enclave unlocker |
+| `app.pending.list` | M3-09 | reserved | the pending run requests, at most 20, oldest first, each with its statement domain |
+| `app.pending.get` | M3-09 | reserved | one pending request's whole descriptor, for the approval window |
+| `app.approve` | M3-09 | reserved | a run approval: the statement's digest and its P-256 signature by an enrolled `approve` key, checked against the statement the daemon rebuilds from its own pending request |
+| `app.items.target` | M3-14 | reserved | the item a signed write names, with a nonce and a daemon key to seal a replacement value to |
+| `app.items.rotate` | M3-14 | reserved | replaces a value, sealed to that key, under a signed `envcloak-write-statement/1` |
+| `app.items.remove` | M3-14 | reserved | removes an item under a signed write statement, after an encrypted backup of the vault |
+| `app.reveal.begin` | M3-14 | reserved | starts a reveal, from the app or for a CLI's `reveal.request`: request id, nonce and descriptor |
+| `app.reveal` | M3-14 | reserved | the value HPKE-sealed to the app's ephemeral key after a signed `envcloak-reveal-statement/1`, its audit entry durable before release |
+| `app.paste.begin` | M3-14 | reserved | a paste stage and a daemon key to seal the pasted value to |
+| `app.paste.inspect` | M3-14 | reserved | what the pasted value looks like (provider, class, length class, suggested slug and variable); the value stays staged in daemon memory for 2 minutes, then is wiped |
+| `app.paste` | M3-14 | reserved | saves the staged value as a new item, or as the answer to an ask |
+| `app.asks.list` | M3-14 | reserved | the asks the CLI filed, with each requester's evidence |
+| `app.asks.decline` | M3-14 | reserved | declines an ask |
+| `app.audit.list` | M3-16 | reserved | audit entries, paged within a frame: metadata with masked command lines; in the app role so that no agent can page through the person's command history |
+| `app.lock` | M3-16 | reserved | locks with a reason (`screen_lock`, `session_resign` or `user`), audited and kept in `status.lock` (plan D3-11) |
+| `app.device.add` | M5 | reserved | pairs a device (SPEC §9) |
+| `app.device.remove` | M5 | reserved | revokes a device (SPEC §9) |
+| `app.policy.set` | spare | reserved | named by SPEC §4.3; no milestone builds it yet (there is no vault policy store, plan D3-16); kept so the name never means another method |
+| `app.registry.override` | spare | reserved | named by SPEC §4.3; no milestone builds it yet; kept so the name never means another method |
+<!-- /reservations -->
+
+**Fields and answers** added to existing methods:
+
+<!-- reservations:field -->
+| Method | Field | Task | Status | Use |
+|---|---|---|---|---|
+| `status` | `daemon.identity` | M3-07 | reserved | whether the client verified the daemon's code signature against the daemon's pinned requirement (`verified` or `unverified`), which `envcloak status` prints |
+| `status` | `vault.anchor` | M3-16 | reserved | the keychain anchor: `matched`, `ahead` (the file was rolled back), `missing`, `none`, or `unavailable` (a build without the helper's profile, and Linux) |
+| `status` | `app_requests` | M3-14 | reserved | how many asks and reveal requests wait for the app |
+| `status` | `lock.reason=screen_lock` | M3-16 | reserved | the vault locked because the screen locked (`app.lock`) |
+| `status` | `lock.reason=session_resign` | M3-16 | reserved | the vault locked because the login session was switched away from (`app.lock`) |
+<!-- /reservations -->
+
+**The CLI's own failure tokens**:
+
+<!-- reservations:exit_token -->
+| Token | Task | Status | Use |
+|---|---|---|---|
+| `binding_absent` | M3-04 | reserved | `envcloak ref --unset NAME` for a name the manifest does not bind; exit 1, and nothing is changed |
+| `declined` | M3-19 | reserved | `envcloak add --ask`: the person declined the paste sheet; exit 125. J5's `envcloak reveal` uses it again for a declined reveal |
+| `expired` | M3-19 | reserved | `envcloak add --ask`: the ask expired unanswered; exit 125. J5's `envcloak reveal` uses it again |
+<!-- /reservations -->
+
+**Statement domains**:
+
+<!-- reservations:statement_domain -->
+| Domain | Task | Status | Use |
+|---|---|---|---|
+| `envcloak-statement/1` | M3-09 | reuse | run approvals the app signs, until J1 moves them to `envcloak-statement/2` (M2-13, which then refuses version 1 digests) |
+| `envcloak-unlocker-statement/1` | M3-08 | reserved | adding a Secure Enclave unlocker, approved in a terminal with the passphrase: its label, the SHA-256 fingerprints of both its public keys and the Team ID and signing identifier the daemon verified for the app (plan D3-08) |
+| `envcloak-write-statement/1` | M3-14 | reserved | signed in the app: replacing or removing an item, adding or removing an unlocker |
+| `envcloak-reveal-statement/1` | M3-14 | reserved | a reveal in the app, signed (SPEC §6.7) |
 <!-- /reservations -->

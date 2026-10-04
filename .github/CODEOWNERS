@@ -53,3 +53,13 @@
 /scripts/check-reservations.py               @Mitsi-ag
 /scripts/check-reservations-baseline.txt     @Mitsi-ag
 /scripts/check-spec-decisions.py             @Mitsi-ag
+
+# M3 plan D3-02, D3-05 and D3-06 (task M3-01): the macOS app, its build and
+# signing scripts decide what is signed and with which entitlements, and
+# the pinned requirements decide which signed code the daemon gives the
+# `app` role and which daemon the clients trust (SPEC §4.3). Each needs a
+# code owner's review from the first file.
+/apps/macos/                                 @Mitsi-ag
+/scripts/macos/                              @Mitsi-ag
+/crates/envcloak-sys/src/peer_code.rs        @Mitsi-ag
+/crates/envcloak-sys/src/peer_code/          @Mitsi-ag

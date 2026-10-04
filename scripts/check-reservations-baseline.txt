@@ -388,3 +388,9 @@ table_tag audit 6
 table_tag unlockers 7
 table_tag backup 8
 table_tag file_backup 9
+
+# The unlocker kinds, read from task M3-01 on (M3 plan): M1's two, which
+# the code held before the reservations, as main still holds them. Like
+# every line above, they never grow; a new kind gets a reservation row.
+unlocker_kind passphrase 1
+unlocker_kind recovery_kit 2

@@ -372,7 +372,7 @@ Status: M2 plan decision D-23, written by task M2-01. The vault's numbers that M
 
 M2 and M2b change the vault format once: schema version 2, written by M2-07, holds item record v2 (exposure, the rotation flag and the classification's `changed_at`; v3 from M2-11, the exposure's cover), the `login` item class with typed fields, and the typed, versioned policy records below (plan decision D-08). Every later change to one of those records is a new version of that record, not a schema migration.
 
-**Audit kinds** (go on from 21; 46 to 50 are kept spare, and a task that needs one adds its row):
+**Audit kinds** (go on from 21; 46 to 50 are M3's, under "Reserved for M3" below, and an M2 or M2b task that needs another number takes the next free one, from 51, and adds its row):
 
 <!-- reservations:audit_kind -->
 | Number | Token | Task | Status | Use |
@@ -436,4 +436,28 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 | 2 | `signin_target` | M2-07 | landed | a sign-in target (M2b-05) |
 | 3 | `managed_server` | M2-07 | landed | a managed MCP server with its registered launch or origin (M2-27) |
 | 4 | `standing_set` | spare | reserved | not used: M2-07 keeps the standing set's generation and digest in the sealed header (header record version 2), not as a policy row; the number stays unused |
+<!-- /reservations -->
+
+## Reserved for M3
+
+Status: M3 plan decision D3-02 and lane C's rule 9, written by task M3-01. The vault's numbers that the M3 tasks will add are assigned here before any code uses them, under the rules and statuses of IPC.md's "Reserved for M2 and M2b" and "Reserved for M3", which `scripts/check-reservations.py` checks against the code: the audit kinds against `AuditKind` in `crates/envcloak-core/src/audit/record.rs`, read with the table above as one table, and the unlocker kinds against `UnlockerKind` in `crates/envcloak-core/src/crypto/envelope.rs`, where M1's `passphrase` (1) and `recovery_kit` (2) are in `scripts/check-reservations-baseline.txt`. Numbers are never reused. Nothing below is built yet. Whether a new unlocker kind, whose envelope is HPKE to a Secure Enclave key rather than CRYPTO.md's 159-byte envelope, changes the vault schema is M3-08's first question: if it does, that task stops and is planned again under M2's one-migration rule (M2 plan D-08).
+
+**Audit kinds** (46 to 50):
+
+<!-- reservations:audit_kind -->
+| Number | Token | Task | Status | Use |
+|---|---|---|---|---|
+| 46 | `unlocker_add` | M3-08 | reserved | a Secure Enclave unlocker enrolled (approved with the passphrase, or later signed in the app), with its label and both public keys' fingerprints |
+| 47 | `unlocker_remove` | M3-14 | reserved | an unlocker removed under a signed write statement |
+| 48 | `reveal_app` | M3-14 | reserved | a reveal in the app, written durably before the sealed value is released |
+| 49 | `ask` | M3-14 | reserved | an ask filed by `envcloak add --ask`, and its outcome (added, declined or expired), with the requester's evidence |
+| 50 | `anchor_mismatch` | M3-16 | reserved | the keychain anchor is newer than the vault file (rolled back), or a vault that had an anchor has none; the anchor written again |
+<!-- /reservations -->
+
+**Unlocker kinds** (`unlockers.kind`, and the envelope's kind):
+
+<!-- reservations:unlocker_kind -->
+| Number | Kind | Task | Status | Use |
+|---|---|---|---|---|
+| 3 | `secure_enclave` | M3-08 | reserved | the macOS Secure Enclave unlocker: the VMK HPKE-sealed to the `unlock` public key, beside the pinned `approve` public key, the label, the creation time and the Team ID and signing identifier it was enrolled under; public keys only (SPEC §5) |
 <!-- /reservations -->
