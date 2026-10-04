@@ -892,6 +892,15 @@ impl Writer<'_> {
         else {
             return Ok(Outcome::Unchanged);
         };
+        if after.len() > MAX_FILE {
+            // Written, it could be neither changed again nor taken out,
+            // since the writer reads at most this much.
+            return Err(Refusal::new(
+                "too_large",
+                "the change would make the file larger than EnvCloak reads (1 MiB), so it could \
+                 not be taken out again: left as it is",
+            ));
+        }
         if before == Some(after.as_slice()) {
             // The file holds what it should; EnvCloak's record of it may
             // still name edits it no longer holds, which go (lesson L-09).
@@ -2248,6 +2257,37 @@ mod tests {
             key(&real.join("absent/x.json")),
             real.join("absent/x.json").to_string_lossy()
         );
+    }
+
+    /// Found sweeping the leftovers' bound: a change that would make a
+    /// file larger than the writer reads (1 MiB: a file just under it with
+    /// EnvCloak's settings added) could be written, and then neither
+    /// changed again nor taken out by uninstall, which reads the file
+    /// first. It is refused before anything is written.
+    ///
+    /// Mutation checked: the size check taken out of `try_change`: the
+    /// file is written past 1 MiB and this fails.
+    #[test]
+    fn a_change_past_the_size_read_is_refused() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let p = tmp.path().join("big.md");
+        let before = vec![b'x'; MAX_FILE - 8];
+        std::fs::write(&p, &before).unwrap_or_else(|e| panic!("{e}"));
+        let (mut state, mut saved, mut kept) =
+            (State::default(), Saved::default(), Kept::default());
+        let mut w = writer!(&mut state, &mut saved, &mut kept);
+        let o = w.change(
+            &target(&p, false),
+            &mut append("a block of more than eight bytes\n"),
+        );
+        assert!(
+            matches!(&o, Outcome::Refused(r) if r.name == "too_large"),
+            "{o:?}"
+        );
+        assert!(w.state.files.is_empty());
+        drop(w);
+        assert_eq!(std::fs::read(&p).unwrap_or_default(), before);
+        assert!(kept.made.is_empty(), "backed up for a change not made");
     }
 
     /// A save of the state stopped part way leaves its new contents under a
