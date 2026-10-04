@@ -31,7 +31,8 @@ mod registry;
 mod safety;
 
 pub use detect::{
-    Detection, MAX_PASSWORD_READINGS, SECRET_RUN, password_chars, shaped_like_secret,
+    Detection, MAX_PASSWORD_READINGS, PasswordForm, SECRET_RUN, password_chars,
+    password_form_chars, shaped_like_secret,
 };
 pub use error::{RegistryError, RegistryErrorKind};
 #[cfg(feature = "testing")]
