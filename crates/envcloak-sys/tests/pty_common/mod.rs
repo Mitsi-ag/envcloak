@@ -179,6 +179,24 @@ impl Screen {
         self.ended
     }
 
+    /// The monitor's next event, reading the terminal meanwhile as the CLI
+    /// does (the monitor waits, at the command's exit, until what the
+    /// command wrote has been read), up to [`DEADLINE`]; `None` when no
+    /// event came. Panics on a monitor lost.
+    pub fn next_event(
+        &mut self,
+        monitor: &mut envcloak_sys::pty::SessionMonitor,
+    ) -> Option<envcloak_sys::pty::MonitorEvent> {
+        let end = Instant::now() + DEADLINE;
+        while Instant::now() < end {
+            if let Some(event) = monitor.next_event(Some(Duration::from_millis(10))).unwrap() {
+                return Some(event);
+            }
+            self.wait_for_within(Duration::from_millis(10), |_| false);
+        }
+        None
+    }
+
     /// Waits until `needle` has been shown `times` times.
     pub fn expect(&mut self, needle: &str, times: usize, what: &str) {
         let ok = self.wait_for(|s| s.count(needle) >= times);
@@ -268,54 +286,7 @@ pub fn wait_lines(path: &std::path::Path, n: usize, limit: Duration) -> bool {
     true
 }
 
-/// The name filters among `args` (what follows the binary on its command
-/// line): every word that is neither an option nor the value of a libtest
-/// option that takes one (`--test-threads 6`, `--skip x`), so
-/// `cargo test -- --test-threads 6` runs every case.
-pub fn filters(args: &[String]) -> Vec<String> {
-    const TAKES_A_VALUE: [&str; 6] = [
-        "--test-threads",
-        "--skip",
-        "--color",
-        "--format",
-        "--logfile",
-        "-Z",
-    ];
-    let mut out = Vec::new();
-    let mut words = args.iter();
-    while let Some(a) = words.next() {
-        if TAKES_A_VALUE.contains(&a.as_str()) {
-            words.next();
-        } else if !a.starts_with('-') {
-            out.push(a.clone());
-        }
-    }
-    out
-}
-
-/// Runs each test case, reports it, and exits non-zero when one failed.
-pub fn run_cases(name: &str, cases: &[(&str, fn())]) {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let filter = filters(&args);
-    let mut failed = Vec::new();
-    let mut ran = 0usize;
-    for (case, f) in cases {
-        if !filter.is_empty() && !filter.iter().any(|w| case.contains(w.as_str())) {
-            continue;
-        }
-        ran += 1;
-        let start = Instant::now();
-        match std::panic::catch_unwind(*f) {
-            Ok(()) => println!("{name}: {case} ... ok ({:?})", start.elapsed()),
-            Err(_) => {
-                println!("{name}: {case} ... FAILED");
-                failed.push(*case);
-            }
-        }
-    }
-    println!("{name}: {ran} case(s) run, {} failed", failed.len());
-    if !failed.is_empty() {
-        println!("{name}: failed: {failed:?}");
-        std::process::exit(101);
-    }
-}
+/// Runs the binary's cases as `cargo test` asks: filters, `--skip`,
+/// `--exact`, `--list` and `--help` read as libtest reads them, anything
+/// else refused before a case runs (review F-126).
+pub use envcloak_sys::testing::libtest::run_cases;

@@ -324,21 +324,34 @@ const TESTS: &[Test] = &[
 ];
 
 fn harness(args: &[OsString]) -> ExitCode {
-    if args.iter().any(|a| a == "--list") {
-        for (name, _) in TESTS {
-            println!("{name}: test");
+    use envcloak_sys::testing::libtest::{Action, Plan, USAGE};
+    // The command line as libtest reads it (`-- --test-threads 6` is not a
+    // filter), anything else refused before a test runs (review F-126).
+    let plan = match Plan::parse_os(args.iter().cloned()) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("runner: the command line was refused ({e:?})\n{USAGE}");
+            return ExitCode::from(2);
         }
-        return ExitCode::SUCCESS;
-    }
-    let filters: Vec<&str> = args
-        .iter()
-        .filter_map(|a| a.to_str())
-        .filter(|a| !a.starts_with('-'))
-        .collect();
+    };
     let chosen: Vec<&Test> = TESTS
         .iter()
-        .filter(|(n, _)| filters.is_empty() || filters.iter().any(|f| n.contains(f)))
+        .filter(|(n, _)| plan.selects(n, false))
         .collect();
+    match plan.action {
+        Action::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Action::List => {
+            for (name, _) in &chosen {
+                println!("{name}: test");
+            }
+            println!("\n{} tests, 0 benchmarks", chosen.len());
+            return ExitCode::SUCCESS;
+        }
+        Action::Run => {}
+    }
     println!("\nrunning {} tests", chosen.len());
     let started = Instant::now();
     let results: Vec<(&str, bool)> = std::thread::scope(|s| {
