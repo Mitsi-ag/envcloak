@@ -58,6 +58,11 @@ pub enum SourceKind {
     /// What the host keeps outside its directory while it runs: a
     /// command's output so far, images, a scratchpad, hook output.
     Temporary,
+    /// A store of an agent's own credentials (its provider keys, its MCP
+    /// servers' secrets: Copilot CLI's `mcp-secrets/`, OpenCode's
+    /// `auth.json`), which is reported as manual and never rewritten
+    /// (SPEC §6.6).
+    Credentials,
 }
 
 /// One place a scanner reads: a file, or a directory whose files of

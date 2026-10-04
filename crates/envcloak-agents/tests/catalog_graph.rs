@@ -202,7 +202,8 @@ fn every_store_the_hosts_write_has_a_source() {
         }
     }
     assert!(checked >= 20, "{checked}");
-    // Map C section 4's documented stores the test kit does not sweep.
+    // Documented stores the test kit does not sweep (the documentation's
+    // own list is read whole below).
     for p in [
         h.join(".claude/plans"),
         h.join(".claude/projects/p/s/tool-results/t.txt"),
@@ -214,4 +215,190 @@ fn every_store_the_hosts_write_has_a_source() {
     }
     // Control: a path no store holds is not covered.
     assert!(!covers(&h.join("project/.env"), None));
+}
+
+/// One row of docs/INSTALLERS.md's catalog table: the host, the store's
+/// path at its default place, what it is.
+struct Row {
+    host: String,
+    store: String,
+    kind: String,
+}
+
+/// The rows between `<!-- catalog -->` and `<!-- /catalog -->`.
+fn documented() -> Vec<Row> {
+    let doc = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/INSTALLERS.md"),
+    )
+    .unwrap();
+    let (_, rest) = doc.split_once("<!-- catalog -->").unwrap();
+    let (table, _) = rest.split_once("<!-- /catalog -->").unwrap();
+    table
+        .lines()
+        .filter(|l| l.starts_with("| ") && !l.starts_with("| Host"))
+        .map(|l| {
+            let cells: Vec<&str> = l.trim_matches('|').split(" | ").map(str::trim).collect();
+            assert_eq!(cells.len(), 3, "{l}");
+            Row {
+                host: cells[0].to_owned(),
+                store: cells[1].trim_matches('`').to_owned(),
+                kind: cells[2].to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// A documented store's path in the fixture home: `~` the home,
+/// `$CLAUDE_CODE_TMPDIR` and `$TMPDIR` the fixture's, `<project>` a
+/// project, any other `<...>` a sample name, and a directory (`/` at the
+/// end) a file in it.
+fn expand(store: &str, h: &Path, l: &Locations, project: &Path) -> PathBuf {
+    let tmp = l.claude_tmp_dir();
+    let mut s = store
+        .replacen(
+            "$CLAUDE_CODE_TMPDIR/claude-<uid>",
+            &tmp.to_string_lossy(),
+            1,
+        )
+        .replacen(
+            "$CLAUDE_CODE_TMPDIR",
+            &h.join("claude-tmp").to_string_lossy(),
+            1,
+        )
+        .replacen("$TMPDIR", &h.join("tmp").to_string_lossy(), 1)
+        .replacen("<project>", &project.to_string_lossy(), 1);
+    if let Some(rest) = s.strip_prefix("~/") {
+        s = h.join(rest).to_string_lossy().into_owned();
+    }
+    while let (Some(a), Some(b)) = (s.find('<'), s.find('>')) {
+        assert!(a < b, "{store}");
+        s.replace_range(a..=b, "x1");
+    }
+    if s.ends_with('/') {
+        s.push('f');
+    }
+    assert!(Path::new(&s).is_absolute(), "{store}");
+    PathBuf::from(s)
+}
+
+/// Whether `source` reads the file at `path`.
+fn reads(source: &ConfigSource, path: &Path) -> bool {
+    match &source.names {
+        None => path.starts_with(&source.path),
+        Some(n) => {
+            path.parent() == Some(source.path.as_path())
+                && path
+                    .file_name()
+                    .is_some_and(|f| f.to_string_lossy().contains(n.as_str()))
+        }
+    }
+}
+
+/// Codex review, round 7 (medium): the catalog left out documented stores
+/// (Copilot CLI's `mcp-secrets/`, OpenCode's `auth.json`, Claude Code's
+/// `tasks/`), and its test checked a list of its own making. The list is
+/// now the documentation's: docs/INSTALLERS.md's catalog table, every
+/// store Map C and SPEC §6.6 name, each at its default place, read here
+/// against the catalog both ways: every row has a source that reads it
+/// (an agent's credential store as `SourceKind::Credentials`), and every
+/// source reads a row. The three stores Codex named are asserted by name
+/// too. Control: a file no store holds has no source.
+///
+/// Mutations checked: Copilot CLI's `mcp-secrets/` source taken out of
+/// `config_sources`: its row has no source and this fails; a row taken
+/// out of the table (Claude Code's `telemetry/`): its source reads no row
+/// and this fails; OpenCode's `auth.json` given `SourceKind::McpConfig`:
+/// the credential row's kind fails.
+#[test]
+fn every_documented_store_has_a_source_and_every_source_a_row() {
+    let home = fixture_home();
+    let h = home.path();
+    let l = catalog(h);
+    let project = h.join("proj");
+    let mut sources = l.config_sources();
+    sources.extend(l.transcript_sources());
+    sources.extend(Locations::project_config_sources(&project));
+    let rows = documented();
+    assert!(rows.len() >= 40, "{}", rows.len());
+    let mut misses = Vec::new();
+    let mut read = vec![false; sources.len()];
+    for r in &rows {
+        let path = expand(&r.store, h, &l, &project);
+        let by: Vec<usize> = (0..sources.len())
+            .filter(|&i| reads(&sources[i], &path))
+            .collect();
+        if by.is_empty() {
+            misses.push(format!("{} {}: no source reads it", r.host, r.store));
+        }
+        if r.kind.contains("reported, not migrated")
+            && !by
+                .iter()
+                .any(|&i| sources[i].source_kind == SourceKind::Credentials)
+        {
+            misses.push(format!("{} {}: not a credential store", r.host, r.store));
+        }
+        for i in by {
+            read[i] = true;
+        }
+    }
+    for (s, r) in sources.iter().zip(&read) {
+        if !r {
+            misses.push(format!("{} ({}): in no row", s.label, s.path.display()));
+        }
+    }
+    for named in [
+        "~/.copilot/mcp-secrets/",
+        "~/.local/share/opencode/auth.json",
+        "~/.claude/tasks/",
+    ] {
+        if !rows.iter().any(|r| r.store == named) {
+            misses.push(format!("{named}: not documented"));
+        }
+    }
+    assert!(misses.is_empty(), "{misses:#?}");
+    // Control: a file no store holds.
+    let stray = h.join("proj/.env");
+    assert!(!sources.iter().any(|s| reads(s, &stray)));
+}
+
+/// Codex's `config.toml` moves its SQLite state (`sqlite_home`) and its
+/// logs (`log_dir`; Map C section 2.2), read as Codex reads a path there:
+/// a relative one from Codex's directory, `~/` from the home. The moved
+/// places are named beside the default ones; a value naming Codex's own
+/// directory adds nothing.
+///
+/// Mutation checked: `codex_moved` not read (both `None`): the moved
+/// places are not named and this fails.
+#[test]
+fn codex_settings_that_move_its_stores_are_read() {
+    let home = fixture_home();
+    let h = home.path();
+    std::fs::write(
+        h.join(".codex/config.toml"),
+        "model = \"m\"\nsqlite_home = \"db\"\nlog_dir = \"~/codex-logs\"\n",
+    )
+    .unwrap();
+    let stores = catalog(h).transcript_sources();
+    assert!(stores.iter().any(|s| s.path == h.join(".codex/db")
+        && s.names.as_deref() == Some(".sqlite")
+        && s.source_kind == SourceKind::Database));
+    assert!(
+        stores
+            .iter()
+            .any(|s| s.path == h.join("codex-logs") && s.source_kind == SourceKind::Log)
+    );
+    // The defaults stay.
+    assert!(stores.iter().any(|s| s.path == h.join(".codex/log")));
+    // Codex's own directory: nothing added.
+    std::fs::write(
+        h.join(".codex/config.toml"),
+        format!("sqlite_home = \"{}\"\n", h.join(".codex").display()),
+    )
+    .unwrap();
+    let n = catalog(h)
+        .transcript_sources()
+        .iter()
+        .filter(|s| s.names.as_deref() == Some(".sqlite"))
+        .count();
+    assert_eq!(n, 1);
 }
