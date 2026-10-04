@@ -87,3 +87,31 @@ fn building_and_dropping_the_redactor_leaves_nothing_under_the_wiping_allocator(
     assert_eq!(report.not_zeroed, 0, "{report:?}");
     assert_eq!(report.released_with_needle, 0, "{report:?}");
 }
+
+/// The CR LF forms PTY mode adds (D-19) are built and freed like the other
+/// variants: nothing holding the value is released unwiped.
+#[test]
+fn building_with_cr_lf_variants_leaves_nothing_under_the_wiping_allocator() {
+    let cs = canaries(fresh_seed());
+    let needle = by_label(&cs, labels::OPENAI_API_KEY).value();
+    let mut value = needle.to_vec();
+    value.extend_from_slice(b"\nsecond line\n");
+    let mut shown = needle.to_vec();
+    shown.extend_from_slice(b"\r\nsecond line\r\n");
+    let session = probe_canaries(&cs, ProbeMode::Wiping);
+    let (redactor, _) = RedactorBuilder::new()
+        .crlf_variants(true)
+        .secret("probe", &value)
+        .build();
+    let mut out = Vec::new();
+    let mut s = redactor.stream();
+    s.push(&shown, &mut out);
+    s.finish(&mut out);
+    drop(s);
+    drop(redactor);
+    let report = session.finish();
+    assert_eq!(out, b"[envcloak:probe]");
+    assert!(report.held_needle >= 1, "{report:?}");
+    assert_eq!(report.not_zeroed, 0, "{report:?}");
+    assert_eq!(report.released_with_needle, 0, "{report:?}");
+}

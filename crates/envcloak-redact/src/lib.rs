@@ -33,7 +33,12 @@
 //!   line-separator escapes, with uppercase or lowercase hex. The default
 //!   styles of serde_json, JavaScript, Python, Go, .NET, PHP and Ruby are
 //!   always generated; other combinations are capped and a capped secret is
-//!   listed in [`BuildReport::truncated`].
+//!   listed in [`BuildReport::truncated`];
+//! - with [`RedactorBuilder::crlf_variants`] (PTY mode, M2 plan D-19), the
+//!   CR LF form of a value holding LF: every LF preceded by a CR, as a
+//!   terminal's line discipline writes it (`ONLCR` maps NL to CR NL on
+//!   output, a CR already there included). Only the raw form: the
+//!   encodings above hold no raw LF.
 //!
 //! Anything else (compression, encryption, custom transforms, partial
 //! values) is not covered. Redaction is a guard against accidents, never a
@@ -88,12 +93,14 @@ pub struct BuildReport {
 pub struct RedactorBuilder {
     secrets: Vec<(String, Zeroizing<Vec<u8>>)>,
     min_len: Option<usize>,
+    crlf: bool,
 }
 
 impl std::fmt::Debug for RedactorBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedactorBuilder")
             .field("secrets", &self.secrets.len())
+            .field("crlf", &self.crlf)
             .finish_non_exhaustive()
     }
 }
@@ -107,6 +114,14 @@ impl RedactorBuilder {
     /// [`DEFAULT_MIN_SECRET_LEN`].
     pub fn min_secret_len(mut self, len: usize) -> Self {
         self.min_len = Some(len.max(1));
+        self
+    }
+
+    /// Whether each value holding LF is also matched in its CR LF form, as a
+    /// terminal writes it (`ONLCR`): on for PTY mode, whose output passes
+    /// through the slave's line discipline. Off by default.
+    pub fn crlf_variants(mut self, on: bool) -> Self {
+        self.crlf = on;
         self
     }
 
@@ -136,7 +151,12 @@ impl RedactorBuilder {
                 continue;
             }
             let owner = labels.len();
-            let (vars, partial, truncated) = variants(&value);
+            let (mut vars, partial, truncated) = variants(&value);
+            if self.crlf {
+                if let Some(crlf) = crlf_form(&value) {
+                    vars.push(crlf);
+                }
+            }
             if partial {
                 report.partial.push(label.clone());
             }
@@ -261,6 +281,23 @@ fn variants(value: &[u8]) -> (Vec<Zeroizing<Vec<u8>>>, bool, bool) {
         }
     }
     (out, partial, truncated)
+}
+
+/// `value` as a terminal's `ONLCR` writes it: a CR before every LF. `None`
+/// for a value without LF.
+fn crlf_form(value: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let lf = value.iter().filter(|b| **b == b'\n').count();
+    if lf == 0 {
+        return None;
+    }
+    let mut out = Zeroizing::new(Vec::with_capacity(value.len() + lf));
+    for &b in value {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    Some(out)
 }
 
 fn hex(value: &[u8], digits: &[u8; 16]) -> Zeroizing<Vec<u8>> {
