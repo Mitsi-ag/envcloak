@@ -932,6 +932,26 @@ impl Vault {
         ValueKey(values::value_hash(self.keys.key(Purpose::Index), v))
     }
 
+    /// The [`ValueKey`] of each current value an item of `class` holds,
+    /// by field, and of no other item's: the only keys a comparison
+    /// limited to that class looks a value up among, so the values of the
+    /// other classes are never compared at all (M2-11: `scan.match` and
+    /// the import methods compare `secret` items only, never a card's
+    /// value or a login's, R-M2-34). Prior values are not listed.
+    pub fn value_keys_of(&self, class: crate::crypto::ItemClass) -> Vec<(FieldId, ValueKey)> {
+        self.state
+            .fields
+            .iter()
+            .filter(|(_, f)| {
+                self.state
+                    .items
+                    .get(&f.item)
+                    .is_some_and(|i| i.class == class)
+            })
+            .map(|(id, f)| (*id, ValueKey(f.value_hash)))
+            .collect()
+    }
+
     /// Every project record. Fails with [`VaultErrorKind::Tampered`] unless
     /// the vault verified: a project's bindings decide what `run` releases.
     pub fn projects(

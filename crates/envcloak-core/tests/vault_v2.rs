@@ -184,6 +184,50 @@ fn a_login_value_never_matches_a_comparison() {
     }
 }
 
+/// The value keys of one class list that class's fields and no other's
+/// (M2-11: what `scan.match` and the import methods look a value up
+/// among, so a card's value or a login's is never compared, R-M2-34): a
+/// value a secret and a card both hold is listed once for each class, by
+/// its own field, under the key [`Vault::value_key`] gives it; a login's
+/// fields are listed for the login class alone, and its password's key is
+/// not the one the same text has as a secret's value (its own domain).
+///
+/// Mutation: the class filter dropped (the secret list holds the card's
+/// field and the login's).
+#[test]
+fn value_keys_of_a_class_list_that_class_alone() {
+    let (_f, mut v) = Fixture::create();
+    let same: &[u8] = b"one value a secret and a card hold";
+    let (secret_field, card_field, login_id) = v
+        .transact(|t| {
+            let s = t.create_item(secret_item("same/secret"))?;
+            let sf = t.add_field(s, name("value"), SecretBytes::copy_from(same))?;
+            let c = t.create_item(envcloak_core::vault::NewItem {
+                class: ItemClass::Card,
+                ..secret_item("same/card")
+            })?;
+            let cf = t.add_field(c, name("value"), SecretBytes::copy_from(same))?;
+            let l = t.create_login(login("fixture/editor"))?;
+            Ok((sf, cf, l))
+        })
+        .unwrap();
+    let key = v.value_key(&SecretBytes::copy_from(same));
+    assert_eq!(v.value_keys_of(ItemClass::Secret), [(secret_field, key)]);
+    assert_eq!(v.value_keys_of(ItemClass::Card), [(card_field, key)]);
+    let logins = v.value_keys_of(ItemClass::Login);
+    let fields: Vec<_> = v
+        .item(login_id)
+        .unwrap()
+        .fields
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(logins.len(), fields.len());
+    assert!(logins.iter().all(|(f, _)| fields.contains(f)));
+    let as_secret = v.value_key(&SecretBytes::copy_from(PASSWORD));
+    assert!(logins.iter().all(|(_, k)| *k != as_secret));
+}
+
 /// A policy row that is not a record this build knows is refused like
 /// tampering: the vault opens read-only and serves no policy. Never read
 /// as nothing, or as a default record. The control, a known record, opens.
@@ -441,6 +485,79 @@ fn exposure_and_the_classification_time_are_kept_by_the_vault() {
     assert_eq!((m.exposure.clone(), m.rotate_recommended), (None, false));
     assert_eq!(m.updated_at, CLEARED);
     assert_eq!(m.classification_changed_at, Some(RECLASSIFIED));
+}
+
+/// A mark covers the values an item held at its time (M2-11, Codex
+/// review): a second mark keeps the first mark's time while the item holds
+/// no value set after it, and restarts it once the item holds one (a field
+/// replaced since the mark, whose new value may be the one found), so the
+/// mark covers every value again. [`ItemMeta::exposure_covers`] and
+/// [`ItemMeta::exposure_replaced_but`] read the same rule: a value set in
+/// the mark's own second counts as covered, never as replaced.
+///
+/// Mutations: the first mark's time kept whatever the item holds (the
+/// third mark keeps it); a value set in the mark's second counted as
+/// replaced (`exposure_replaced_but` says true at the end).
+#[test]
+fn a_mark_restarts_when_the_item_holds_a_value_set_after_it() {
+    const CREATED: u64 = 1_800_000_000;
+    const FIRST_MARK: u64 = CREATED + 100;
+    const SECOND_MARK: u64 = CREATED + 150;
+    const SET_A: u64 = CREATED + 200;
+    const THIRD_MARK: u64 = CREATED + 300;
+
+    let (f, mut v) = Fixture::create();
+    let (item, a, b) = v
+        .transact_at_for_testing(CREATED, |t| {
+            let i = t.create_item(secret_item("two/fields"))?;
+            let a = t.add_field(i, name("a"), SecretBytes::copy_from(b"value of a"))?;
+            let b = t.add_field(i, name("b"), SecretBytes::copy_from(b"value of b"))?;
+            Ok((i, a, b))
+        })
+        .unwrap();
+    assert!(!v.item(item).unwrap().exposure_covers());
+    let mark = |v: &mut envcloak_core::vault::Vault, at, source| {
+        v.transact_at_for_testing(at, |t| t.mark_exposed(item, &[source], 1))
+            .unwrap();
+        v.item(item).unwrap().clone()
+    };
+    let m = mark(&mut v, FIRST_MARK, ExposureSource::Transcript);
+    assert_eq!(m.exposure.as_ref().unwrap().since, FIRST_MARK);
+    assert!(m.exposure_covers());
+    assert!(!m.exposure_replaced_but(a) && !m.exposure_replaced_but(b));
+    let m = mark(&mut v, SECOND_MARK, ExposureSource::GitHistory);
+    assert_eq!(m.exposure.as_ref().unwrap().since, FIRST_MARK);
+    // `a` replaced after the mark: the mark no longer covers every value,
+    // and replacing `b` too would leave none it covers.
+    v.transact_at_for_testing(SET_A, |t| {
+        t.set_value(a, SecretBytes::copy_from(b"new value of a"))
+    })
+    .unwrap();
+    let m = v.item(item).unwrap().clone();
+    assert!(!m.exposure_covers());
+    assert!(m.exposure_replaced_but(b) && !m.exposure_replaced_but(a));
+    // A mark now restarts the mark's time, the kinds and counts kept.
+    let m = mark(&mut v, THIRD_MARK, ExposureSource::Transcript);
+    let x = m.exposure.clone().unwrap();
+    assert_eq!(x.since, THIRD_MARK);
+    assert_eq!(
+        x.sources,
+        [ExposureSource::Transcript, ExposureSource::GitHistory]
+    );
+    assert_eq!(x.count, 3);
+    assert!(m.exposure_covers());
+    assert!(!m.exposure_replaced_but(b) && !m.exposure_replaced_but(a));
+    // A value set in the mark's own second is covered, not replaced.
+    v.transact_at_for_testing(THIRD_MARK, |t| {
+        t.set_value(b, SecretBytes::copy_from(b"new value of b"))
+    })
+    .unwrap();
+    let m = v.item(item).unwrap().clone();
+    assert!(m.exposure_covers());
+    assert!(!m.exposure_replaced_but(a));
+    drop(v);
+    let v = f.unlock();
+    assert_eq!(v.item(item).unwrap().exposure, Some(x));
 }
 
 /// A login item lists its typed fields with their kinds and its own
