@@ -56,7 +56,8 @@
 //!   monitor waits for the command to exit before it reaps it and exits.
 //!
 //! Every signal the monitor sends goes to the group of its own unreaped
-//! child (D-34). The monitor runs in a child of a multi-threaded process,
+//! child, through its [`OwnedChild`] handle, which the reap consumes
+//! (D-34). The monitor runs in a child of a multi-threaded process,
 //! so between `fork` and `_exit` it calls only system calls on the
 //! async-signal-safe list (`sigprocmask`, `sigaction`, `setsid`, `fcntl`,
 //! `dup2`, `close`, `ioctl`, `pipe`, `fork`, `setpgid`, `tcsetpgrp`,
@@ -81,6 +82,8 @@
 //! and [`decode_report`] are the only readers.
 
 use std::ffi::c_char;
+
+use crate::owned::OwnedChild;
 
 /// The size of every control frame.
 pub const FRAME: usize = 8;
@@ -367,6 +370,8 @@ pub(crate) struct Prepared {
 /// slave on 0 to 2, the channel on 3) and its own child.
 struct SysOps {
     child: libc::pid_t,
+    /// The handle every signal and the reap go through; `None` once reaped.
+    owned: Option<OwnedChild>,
 }
 
 const CONTROL_FD: libc::c_int = 3;
@@ -520,10 +525,9 @@ impl MonitorOps for SysOps {
     }
 
     fn signal_group(&mut self, pgid: i32, sig: i32) {
-        if pgid == self.child {
-            // SAFETY: kill has no memory effects; the group is the one the
-            // monitor's unreaped child leads.
-            unsafe { libc::kill(-pgid, sig) };
+        if let Some(owned) = self.owned.as_ref().filter(|_| pgid == self.child) {
+            // The group the monitor's unreaped child leads.
+            let _ = owned.signal_group(sig);
         }
     }
 
@@ -535,13 +539,8 @@ impl MonitorOps for SysOps {
     }
 
     fn reap(&mut self, pid: i32) {
-        let mut status: libc::c_int = 0;
-        loop {
-            // SAFETY: `status` is writable; `pid` is the monitor's child.
-            let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if rc >= 0 || errno() != libc::EINTR {
-                return;
-            }
+        if let Some(owned) = self.owned.take_if(|_| pid == self.child) {
+            let _ = owned.reap();
         }
     }
 }
@@ -771,7 +770,10 @@ pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
     }
     // SAFETY: the monitor's own descriptor.
     unsafe { libc::close(err_read) };
-    let mut ops = SysOps { child };
+    let mut ops = SysOps {
+        child,
+        owned: Some(OwnedChild::from_fork_without_pidfd(child)),
+    };
     if got > 0 {
         let e = i32::from_ne_bytes(code);
         ops.reap(child);

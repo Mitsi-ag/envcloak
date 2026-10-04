@@ -64,6 +64,19 @@ impl OwnedChild {
         }
     }
 
+    /// Takes ownership of `pid`, a child `fork` just returned, without a
+    /// pidfd: the PTY monitor's handle on its command, where a descriptor
+    /// would be one more than the slave and the control channel, and which
+    /// signals only by ownership (the monitor alone waits for the child,
+    /// and reaps it only through [`OwnedChild::reap`]). Allocates nothing.
+    pub(crate) fn from_fork_without_pidfd(pid: libc::pid_t) -> Self {
+        OwnedChild {
+            pid,
+            #[cfg(target_os = "linux")]
+            pidfd: None,
+        }
+    }
+
     /// The child's pid, for display and for reading what the kernel
     /// reports about it; never a signal target outside this handle.
     pub fn id(&self) -> u32 {
