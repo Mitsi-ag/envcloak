@@ -387,7 +387,8 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `aside_changed` | M2-05 | landed | a file was rewritten or written back, but what was under the temporary name the old file was left under is not the old file as it was checked (another program wrote into it there, or put its own file under that name, after the swap): it is kept as it is, and named, never called the old copy |
 | `hook_payload` | M2-08 | landed | `envcloak hook`: the payload on standard input is not the one `--host` and `--event` name (another host's or event's, or not JSON); no decision is made, and the hook exits 1, which both hosts take as an error that stops nothing |
 | `command_refused` | M2-08 | landed | `run_with_secrets`: an argv the `PreToolUse` hook denies in a shell (an env file read, the environment printed, `envcloak reveal` or `approve`, or a script it cannot read), refused with the hook's message before the daemon is asked (D-22) |
-| `agents_incomplete` | M2-08 | landed | `envcloak agents install` or `uninstall` (or `init --agents-note`) left a file as it was (refused, with the reason on its line of the report), or a host named with `--agent` is not installed; exit 1 |
+| `agents_incomplete` | M2-08 | landed | `envcloak agents install` or `uninstall` (or `init --agents-note`) left a file as it was (refused, with the reason on its line of the report), a host named with `--agent` is not installed, or a file an earlier write left beside a config under EnvCloak's temporary name is still there (named in the report); exit 1 |
+| `double_install` | M2-08 | landed | `envcloak agents status`: EnvCloak's Claude Code plugin is enabled while EnvCloak's own hooks or an `envcloak` MCP server are installed too, so each hook runs twice; the message names the files on both sides; exit 1 |
 <!-- /reservations -->
 
 **Coverage tokens** (`envcloak agents status`; states, reasons and probe outcomes share one namespace):
