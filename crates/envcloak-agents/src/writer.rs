@@ -2275,17 +2275,18 @@ mod tests {
         std::fs::write(&p, &before).unwrap_or_else(|e| panic!("{e}"));
         let (mut state, mut saved, mut kept) =
             (State::default(), Saved::default(), Kept::default());
-        let mut w = writer!(&mut state, &mut saved, &mut kept);
-        let o = w.change(
-            &target(&p, false),
-            &mut append("a block of more than eight bytes\n"),
-        );
+        let o = {
+            let mut w = writer!(&mut state, &mut saved, &mut kept);
+            w.change(
+                &target(&p, false),
+                &mut append("a block of more than eight bytes\n"),
+            )
+        };
         assert!(
             matches!(&o, Outcome::Refused(r) if r.name == "too_large"),
             "{o:?}"
         );
-        assert!(w.state.files.is_empty());
-        drop(w);
+        assert!(state.files.is_empty());
         assert_eq!(std::fs::read(&p).unwrap_or_default(), before);
         assert!(kept.made.is_empty(), "backed up for a change not made");
     }
