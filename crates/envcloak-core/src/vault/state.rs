@@ -621,6 +621,17 @@ pub(crate) fn load(
             },
         );
     }
+    // A mark read from item record version 2 does not say which values it
+    // covers: it covers every value its item holds now, so no value it may
+    // have been made for goes uncovered (docs/VAULT.md "Item"). The flag
+    // stays until the record is written as version 3 (`Txn::keep_cover`).
+    for (id, row) in &mut st.items {
+        if let (true, Some(x)) = (row.extra.cover_unknown, row.extra.exposure.as_mut()) {
+            for f in st.fields.values().filter(|f| f.item == *id) {
+                x.covered.add(&f.value_hash);
+            }
+        }
+    }
 
     let data = keys.key(Purpose::Data);
     for p in &raw.projects {

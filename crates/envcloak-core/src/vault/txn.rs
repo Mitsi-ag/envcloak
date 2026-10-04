@@ -22,9 +22,9 @@ use super::integrity::{
     unlocker_body,
 };
 use super::items::{
-    Exposure, ExposureSource, FieldId, FieldKind, FieldName, FieldRecord, ItemDetails, ItemExtra,
-    ItemId, MAX_FIELD, MAX_PRIOR, MAX_ROW, NewItem, PolicyId, ProjectId, ProjectKey, ProjectRecord,
-    Slug, encode_field, encode_item, encode_project,
+    Exposure, ExposureCover, ExposureSource, FieldId, FieldKind, FieldName, FieldRecord,
+    ItemDetails, ItemExtra, ItemId, MAX_FIELD, MAX_PRIOR, MAX_ROW, NewItem, PolicyId, ProjectId,
+    ProjectKey, ProjectRecord, Slug, encode_field, encode_item, encode_project,
 };
 use super::login::{LoginFieldValue, NewLogin};
 use super::policies::{PolicyRecord, StandingSetHeader};
@@ -236,15 +236,9 @@ impl<'v> Txn<'v> {
 
     /// Marks an item "exposed: rotate" (R-M2-40): its value was found in
     /// `count` places of the kinds in `sources` (at least one). Only adds:
-    /// the kinds are joined and the counts summed; rotation is then
-    /// recommended. The mark's time ([`Exposure::since`]) stands for the
-    /// values it covers, those set at or before it: it is the first
-    /// mark's, and it stays while the item holds no value set after it. A
-    /// mark made when the item holds one (a field replaced since, whose new
-    /// value may be the one found now) restarts it now, so the mark covers
-    /// every value the item holds again ([`ItemMeta::exposure_covers`]).
-    ///
-    /// [`ItemMeta::exposure_covers`]: super::ItemMeta::exposure_covers
+    /// the first mark's time stays, the kinds are joined, the counts
+    /// summed, and the cover ([`Exposure::covered`]) takes every value the
+    /// item holds now, whichever was found; rotation is then recommended.
     pub fn mark_exposed(
         &mut self,
         item: ItemId,
@@ -255,29 +249,15 @@ impl<'v> Txn<'v> {
             return Err(VaultErrorKind::InvalidRecord.into());
         }
         let old = self.item_row(item)?;
-        let fresh = Exposure {
+        let mut exposure = old.extra.exposure.clone().unwrap_or(Exposure {
             since: self.now,
             sources: Vec::new(),
             count: 0,
-        };
-        let mut exposure = match old.extra.exposure.clone() {
-            None => fresh,
-            Some(x) => {
-                let newer = self
-                    .state
-                    .fields
-                    .values()
-                    .any(|f| f.item == item && f.record.updated_at > x.since);
-                if newer {
-                    Exposure {
-                        since: self.now,
-                        ..x
-                    }
-                } else {
-                    x
-                }
-            }
-        };
+            covered: ExposureCover::default(),
+        });
+        for f in self.state.fields.values().filter(|f| f.item == item) {
+            exposure.covered.add(&f.value_hash);
+        }
         exposure.sources.extend_from_slice(sources);
         exposure.sources.sort_unstable();
         exposure.sources.dedup();
@@ -295,11 +275,7 @@ impl<'v> Txn<'v> {
         self.write_item(item, row, Some(&old))
     }
 
-    /// Clears an item's exposure and its rotation flag: its exposed value
-    /// was replaced (M2-11: a rotation that leaves no value the mark covers,
-    /// [`ItemMeta::exposure_replaced_but`]).
-    ///
-    /// [`ItemMeta::exposure_replaced_but`]: super::ItemMeta::exposure_replaced_but
+    /// Clears an item's exposure and its rotation flag.
     pub fn clear_exposure(&mut self, item: ItemId) -> Result<(), VaultError> {
         let old = self.item_row(item)?;
         if old.extra.exposure.is_none() && !old.extra.rotate_recommended {
@@ -316,6 +292,29 @@ impl<'v> Txn<'v> {
             ..old.clone()
         };
         self.write_item(item, row, Some(&old))
+    }
+
+    /// Clears an item's exposure when, as this transaction leaves it so
+    /// far, the item holds no value the mark covers: every value it was
+    /// marked for was replaced, by another (M2-11: a rotation clears the
+    /// mark). True when it cleared one. A value written again, or moved to
+    /// another field, or set back after a value in between, is still
+    /// covered, so the mark stays.
+    pub fn clear_exposure_if_replaced(&mut self, item: ItemId) -> Result<bool, VaultError> {
+        let old = self.item_row(item)?;
+        let Some(x) = old.extra.exposure.as_ref() else {
+            return Ok(false);
+        };
+        let held = self
+            .state
+            .fields
+            .values()
+            .any(|f| f.item == item && x.covered.has(&f.value_hash));
+        if held {
+            return Ok(false);
+        }
+        self.clear_exposure(item)?;
+        Ok(true)
     }
 
     /// Gives an item a new slug.
@@ -353,6 +352,55 @@ impl<'v> Txn<'v> {
         // Its size checked there (what the writer gives at most MAX_FIELD,
         // what the vault keeps after it), as the migration's records are.
         let record = encode_item(&row.slug, row.created_at, &row.details, &row.extra)?;
+        // Written as version 3: its cover is on disk now.
+        let row = ItemRow {
+            extra: ItemExtra {
+                cover_unknown: false,
+                ..row.extra
+            },
+            ..row
+        };
+        self.write_item_record(id, row, old, &record)
+    }
+
+    /// Before a write changes a value of `item`: when its mark was read
+    /// from item record version 2, whose cover unlock gave it from the
+    /// values the item held then ([`ItemExtra::cover_unknown`]), writes the
+    /// record as version 3, so that cover is kept and not given again from
+    /// the values the item holds after this write.
+    fn keep_cover(&mut self, item: ItemId) -> Result<(), VaultError> {
+        let old = self.item_row(item)?;
+        if !old.extra.cover_unknown {
+            return Ok(());
+        }
+        let row = ItemRow {
+            row_version: old.row_version + 1,
+            ..old.clone()
+        };
+        self.write_item(item, row, Some(&old))
+    }
+
+    /// Unit tests only: rewrites an item's row as item record version 2
+    /// holds it (no cover), as a vault written before version 3 holds it.
+    #[cfg(test)]
+    fn rewrite_item_as_v2(&mut self, id: ItemId) -> Result<(), VaultError> {
+        let old = self.item_row(id)?;
+        let row = ItemRow {
+            row_version: old.row_version + 1,
+            ..old.clone()
+        };
+        let record =
+            super::items::encode_item_v2(&row.slug, row.created_at, &row.details, &row.extra)?;
+        self.write_item_record(id, row, Some(&old), &record)
+    }
+
+    fn write_item_record(
+        &mut self,
+        id: ItemId,
+        row: ItemRow,
+        old: Option<&ItemRow>,
+        record: &[u8],
+    ) -> Result<(), VaultError> {
         let aad = self.ctx.aad(
             TableTag::Items,
             id.as_bytes(),
@@ -360,7 +408,7 @@ impl<'v> Txn<'v> {
             row.class,
             row.row_version,
         );
-        let sealed = seal_record(item_key(self.keys, row.class), &aad, &record)?;
+        let sealed = seal_record(item_key(self.keys, row.class), &aad, record)?;
         let hash = slug_hash(self.keys, &row.slug);
         let class = i64::from(row.class as u16);
         let updated_at = to_i64(row.updated_at)?;
@@ -411,6 +459,7 @@ impl<'v> Txn<'v> {
         if self.field_id(item, &name).is_some() {
             return Err(VaultErrorKind::DuplicateField.into());
         }
+        self.keep_cover(item)?;
         let id = self.new_field_id();
         let row = FieldRow {
             item,
@@ -560,6 +609,7 @@ impl<'v> Txn<'v> {
         if class == ItemClass::Login {
             return Err(VaultErrorKind::LoginField.into());
         }
+        self.keep_cover(old.item)?;
         let k = item_key(self.keys, class);
         let a = |f| {
             self.ctx.aad(
@@ -1038,6 +1088,70 @@ mod tests {
             .unlock(Vmk::import_for_testing(raw).unwrap())
             .map_err(|(_, e)| e)
             .unwrap()
+    }
+
+    /// A mark read from item record version 2, which does not say what it
+    /// covers, covers every value its item holds at unlock: a rotation of
+    /// one field of two keeps it (the other's value is covered), and the
+    /// next write of the record keeps that cover, as version 3. A mark
+    /// written as version 3 reads back with its cover, here one that
+    /// leaves out a value set after it.
+    ///
+    /// Mutation checked: the cover of a version 2 mark left empty at
+    /// unlock: the first rotation clears the mark while the other field
+    /// still holds its exposed value, and this fails.
+    #[test]
+    fn a_version_2_mark_covers_every_value_its_item_holds() {
+        let (_d, paths, raw, mut v) = vault();
+        let (item, a, b) = v
+            .transact(|t| {
+                let item = t.create_item(NewItem {
+                    class: ItemClass::Secret,
+                    slug: Slug::new("unit/two").unwrap(),
+                    details: ItemDetails::default(),
+                })?;
+                let a = t.add_field(
+                    item,
+                    FieldName::new("a").unwrap(),
+                    SecretBytes::copy_from(b"unit value of a"),
+                )?;
+                let b = t.add_field(
+                    item,
+                    FieldName::new("b").unwrap(),
+                    SecretBytes::copy_from(b"unit value of b"),
+                )?;
+                t.mark_exposed(item, &[ExposureSource::Transcript], 1)?;
+                t.rewrite_item_as_v2(item)?;
+                Ok((item, a, b))
+            })
+            .unwrap();
+        drop(v);
+        let mut v = reopened(&paths, &raw);
+        assert_eq!(v.integrity(), Integrity::Ok);
+        assert!(v.exposure_covers(item));
+        let cleared = v
+            .transact(|t| {
+                t.set_value(a, SecretBytes::copy_from(b"unit value of a, rotated"))?;
+                t.clear_exposure_if_replaced(item)
+            })
+            .unwrap();
+        assert!(!cleared);
+        assert!(!v.exposure_covers(item));
+        drop(v);
+        let mut v = reopened(&paths, &raw);
+        let x = v.item(item).unwrap().exposure.clone().unwrap();
+        assert!(
+            x.covered
+                .covers(&v.value_key(&SecretBytes::copy_from(b"unit value of b")))
+        );
+        let cleared = v
+            .transact(|t| {
+                t.set_value(b, SecretBytes::copy_from(b"unit value of b, rotated"))?;
+                t.clear_exposure_if_replaced(item)
+            })
+            .unwrap();
+        assert!(cleared);
+        assert_eq!(v.item(item).unwrap().exposure, None);
     }
 
     /// A field whose kind does not fit its item's class (a typed field on

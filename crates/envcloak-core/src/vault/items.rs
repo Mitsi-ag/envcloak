@@ -245,18 +245,81 @@ impl ExposureSource {
 }
 
 /// That an item's value was found outside the vault (R-M2-40): since when,
-/// where, and how many times it was marked. Set by
+/// where, how many times, and which values. Set by
 /// [`Txn::mark_exposed`](super::Txn::mark_exposed), which only adds to it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Exposure {
-    /// Unix seconds of the mark: the first mark's, restarted by a mark
-    /// made while the item held a value set after it. The mark covers the
-    /// values set at or before this time ([`ItemMeta::exposure_covers`]).
+    /// Unix seconds of the first mark.
     pub since: u64,
     /// Every kind of place it was found, sorted, each once; never empty.
     pub sources: Vec<ExposureSource>,
     /// Places found, summed over every mark.
     pub count: u64,
+    /// The values the mark covers: every value the item held at each mark.
+    pub covered: ExposureCover,
+}
+
+/// Bits in an [`ExposureCover`].
+pub const COVER_BITS: usize = 2048;
+/// Bits one value sets in an [`ExposureCover`].
+pub const COVER_HASHES: usize = 4;
+const COVER_BYTES: usize = COVER_BITS / 8;
+
+/// The values an exposure mark covers, by their keyed hashes (the
+/// [`ValueKey`](super::ValueKey) of each, M2-11): a filter of
+/// [`COVER_BITS`] bits in which a value sets [`COVER_HASHES`] bits, each
+/// read from two bytes of its own keyed hash. A mark adds every value its
+/// item holds; nothing takes a value out, and the cover goes with the
+/// mark. So a value it was given is always covered, and a rotation that
+/// leaves the item holding one keeps the mark, wherever that value is now
+/// (another field, or the same field after a value in between). It may
+/// say a value it was not given is covered (four bits set by others), which
+/// only keeps a mark: under one chance in 70,000 for a value against a
+/// cover of 32 values. What it covers is chosen by the vault, from values
+/// the item held, never by a caller. Part of the item record (version 3).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ExposureCover([u8; COVER_BYTES]);
+
+impl Default for ExposureCover {
+    fn default() -> Self {
+        ExposureCover([0; COVER_BYTES])
+    }
+}
+
+impl core::fmt::Debug for ExposureCover {
+    /// The bits set, never which.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let set: u32 = self.0.iter().map(|b| b.count_ones()).sum();
+        write!(f, "ExposureCover({set} bits)")
+    }
+}
+
+impl ExposureCover {
+    /// The bits a value with keyed hash `hash` sets.
+    fn bits(hash: &[u8; 32]) -> [usize; COVER_HASHES] {
+        core::array::from_fn(|i| {
+            usize::from(u16::from_be_bytes([hash[2 * i], hash[2 * i + 1]])) % COVER_BITS
+        })
+    }
+
+    /// Covers the value whose keyed hash is `hash`.
+    pub(crate) fn add(&mut self, hash: &[u8; 32]) {
+        for b in Self::bits(hash) {
+            self.0[b / 8] |= 1 << (b % 8);
+        }
+    }
+
+    /// Whether the value whose keyed hash is `hash` is covered.
+    pub(crate) fn has(&self, hash: &[u8; 32]) -> bool {
+        Self::bits(hash)
+            .iter()
+            .all(|b| self.0[b / 8] & (1 << (b % 8)) != 0)
+    }
+
+    /// Whether the value `key` stands for is covered.
+    pub fn covers(&self, key: &super::ValueKey) -> bool {
+        self.has(key.as_bytes())
+    }
 }
 
 /// A login's sign-in tier (SPEC §6.8 "Approval"). Part of the item
@@ -359,6 +422,11 @@ pub(crate) struct ItemExtra {
     pub rotate_recommended: bool,
     /// Present exactly on a login item.
     pub login: Option<LoginMeta>,
+    /// The exposure was read from a version 2 record, which does not say
+    /// which values it covers: unlock gives it every value the item holds
+    /// then (`state::load`), and before a write changes one of them the
+    /// record is written as version 3, with that cover (`Txn::keep_cover`).
+    pub cover_unknown: bool,
 }
 
 /// Who owns or pays for an item. Personal metadata: shown only where the
@@ -445,34 +513,6 @@ pub struct ItemMeta {
     pub login: Option<LoginMeta>,
 }
 
-impl ItemMeta {
-    /// Whether the item's "exposed: rotate" mark covers every value it
-    /// holds: each was set at or before the mark's time, so any of them
-    /// may be the one found. False for an item with no mark, and for one
-    /// holding a value set after its mark (a field replaced since), which
-    /// a new mark must restart the mark for ([`Txn::mark_exposed`]).
-    ///
-    /// [`Txn::mark_exposed`]: super::Txn::mark_exposed
-    pub fn exposure_covers(&self) -> bool {
-        self.exposure
-            .as_ref()
-            .is_some_and(|x| self.fields.iter().all(|f| f.updated_at <= x.since))
-    }
-
-    /// Whether replacing the value of `field` leaves the item holding no
-    /// value its mark covers: every other field's value was set after the
-    /// mark's time. A value set in the mark's own second counts as covered,
-    /// so a rotation then leaves the mark. False for an item with no mark.
-    pub fn exposure_replaced_but(&self, field: FieldId) -> bool {
-        self.exposure.as_ref().is_some_and(|x| {
-            self.fields
-                .iter()
-                .filter(|f| f.id != field)
-                .all(|f| f.updated_at > x.since)
-        })
-    }
-}
-
 /// What identifies a project directory to the vault: bytes chosen by the
 /// caller, such as the device and inode of the opened directory (T5). Kept
 /// sealed; the row stores only its keyed hash.
@@ -520,6 +560,9 @@ pub struct ProjectRecord {
 // record, read beside the old one, not a schema migration (plan D-08).
 const ITEM_RECORD_V1: u8 = 1;
 const ITEM_RECORD_V2: u8 = 2;
+/// Version 2 with the exposure's cover (M2-11): the version every item
+/// record is written at from schema version 2; version 2 is still read.
+const ITEM_RECORD_V3: u8 = 3;
 const FIELD_RECORD_V1: u8 = 1;
 const FIELD_RECORD_V2: u8 = 2;
 const PROJECT_RECORD: u8 = 1;
@@ -532,16 +575,18 @@ const MAX_SOURCES: usize = ExposureSource::ALL.len();
 
 /// The most bytes an item record holds after `notes`: the parts schema
 /// version 2 added, which the vault keeps itself ([`ItemExtra`]): the
-/// classification's last change (9), the exposure (1, then 8 + 8 + 4 and a
-/// byte per source), the rotation flag (1) and a login's block (1, then 1 +
-/// 8). They are bounded by their types and counted apart from
-/// [`MAX_FIELD`], which bounds the rest, what the item's writer gives: so
-/// neither the migration, which adds them to every record version 1 held,
-/// nor a mark the vault makes later (a classification change, an exposure)
-/// takes a record that was within the limit over it.
-pub(crate) const MAX_ITEM_KEPT: usize = 9 + (1 + 8 + 8 + 4 + MAX_SOURCES) + 1 + (1 + 1 + 8);
+/// classification's last change (9), the exposure (1, then 8 + 8 + 4, a
+/// byte per source and, from version 3, the cover's 256), the rotation
+/// flag (1) and a login's block (1, then 1 + 8). They are bounded by their
+/// types and counted apart from [`MAX_FIELD`], which bounds the rest, what
+/// the item's writer gives: so neither the migration, which adds them to
+/// every record version 1 held, nor a mark the vault makes later (a
+/// classification change, an exposure) takes a record that was within the
+/// limit over it.
+pub(crate) const MAX_ITEM_KEPT: usize =
+    9 + (1 + 8 + 8 + 4 + MAX_SOURCES + COVER_BYTES) + 1 + (1 + 1 + 8);
 
-/// The sealed plaintext of `items.sealed_meta`, version 2, and the one
+/// The sealed plaintext of `items.sealed_meta`, version 3, and the one
 /// check of its size, for every writer of one (a transaction and the
 /// migration alike): the record up to `notes`, what version 1 held and what
 /// the item's writer gives, is at most [`MAX_FIELD`] bytes, as version 1
@@ -553,8 +598,30 @@ pub(crate) fn encode_item(
     d: &ItemDetails,
     extra: &ItemExtra,
 ) -> Result<Vec<u8>, VaultError> {
+    encode_item_as(ITEM_RECORD_V3, slug, created_at, d, extra)
+}
+
+/// The sealed plaintext of `items.sealed_meta` as version 2 holds it,
+/// with no cover: what [`decode_item`] reads there. Unit tests only.
+#[cfg(test)]
+pub(crate) fn encode_item_v2(
+    slug: &Slug,
+    created_at: u64,
+    d: &ItemDetails,
+    extra: &ItemExtra,
+) -> Result<Vec<u8>, VaultError> {
+    encode_item_as(ITEM_RECORD_V2, slug, created_at, d, extra)
+}
+
+fn encode_item_as(
+    version: u8,
+    slug: &Slug,
+    created_at: u64,
+    d: &ItemDetails,
+    extra: &ItemExtra,
+) -> Result<Vec<u8>, VaultError> {
     let mut e = Enc::new();
-    e.u8(ITEM_RECORD_V2);
+    e.u8(version);
     encode_item_body(&mut e, slug, created_at, d);
     let given = e.len();
     if given > MAX_FIELD {
@@ -569,6 +636,9 @@ pub(crate) fn encode_item(
             e.u8(1).u64(x.since).u64(x.count).count(x.sources.len());
             for src in &x.sources {
                 e.u8(*src as u8);
+            }
+            if version == ITEM_RECORD_V3 {
+                e.raw(&x.covered.0);
             }
         }
     }
@@ -586,7 +656,7 @@ pub(crate) fn encode_item(
 }
 
 /// A version 1 item record (schema version 1) of an item of `class` as
-/// version 2: everything it holds kept, and what version 1 did not record
+/// version 3: everything it holds kept, and what version 1 did not record
 /// left empty (in particular the classification's last change, which is
 /// not known). The migration's one way to rewrite one: through
 /// [`encode_item`]'s check, so it writes no record a later write would
@@ -646,12 +716,14 @@ pub(crate) fn decode_item(
 ) -> Result<ItemRecord, VaultError> {
     let corrupt = || VaultError::from(VaultErrorKind::Corrupt);
     let mut d = Dec::new(b);
-    let want = if schema >= RECORDS_V2_FROM {
-        ITEM_RECORD_V2
+    // Version 1 at schema version 1; version 2 or 3 from version 2.
+    let version = d.u8()?;
+    let known = if schema >= RECORDS_V2_FROM {
+        version == ITEM_RECORD_V2 || version == ITEM_RECORD_V3
     } else {
-        ITEM_RECORD_V1
+        version == ITEM_RECORD_V1
     };
-    if d.u8()? != want {
+    if !known {
         return Err(corrupt());
     }
     let slug = Slug::new(&d.string()?).map_err(|_| corrupt())?;
@@ -690,7 +762,7 @@ pub(crate) fn decode_item(
         notes: d.string()?,
     };
     let mut extra = ItemExtra::default();
-    if want == ITEM_RECORD_V2 {
+    if version != ITEM_RECORD_V1 {
         extra.classification_changed_at = d.opt_u64()?;
         if d.bool()? {
             let since = d.u64()?;
@@ -704,10 +776,18 @@ pub(crate) fn decode_item(
             if sources.is_empty() || sources.windows(2).any(|w| w[0] >= w[1]) {
                 return Err(corrupt());
             }
+            // Version 2 does not say what the mark covers (`cover_unknown`).
+            let covered = if version == ITEM_RECORD_V3 {
+                ExposureCover(d.array::<COVER_BYTES>()?)
+            } else {
+                extra.cover_unknown = true;
+                ExposureCover::default()
+            };
             extra.exposure = Some(Exposure {
                 since,
                 sources,
                 count,
+                covered,
             });
         }
         extra.rotate_recommended = d.bool()?;
@@ -945,6 +1025,15 @@ mod tests {
         }
     }
 
+    /// A cover of the values whose keyed hashes are `hashes`.
+    fn cover_of(hashes: &[[u8; 32]]) -> ExposureCover {
+        let mut c = ExposureCover::default();
+        for h in hashes {
+            c.add(h);
+        }
+        c
+    }
+
     fn exposed() -> ItemExtra {
         ItemExtra {
             classification_changed_at: Some(11),
@@ -952,9 +1041,11 @@ mod tests {
                 since: 12,
                 sources: vec![ExposureSource::Transcript, ExposureSource::EnvFile],
                 count: 3,
+                covered: cover_of(&[[7; 32], [0xa5; 32]]),
             }),
             rotate_recommended: true,
             login: None,
+            cover_unknown: false,
         }
     }
 
@@ -966,6 +1057,77 @@ mod tests {
             }),
             ..ItemExtra::default()
         }
+    }
+
+    /// Item record version 2, which holds no cover, is still read from
+    /// schema version 2: as it was written, its exposure's cover marked
+    /// unknown for unlock to fill (`state::load`); one with no exposure has
+    /// nothing unknown. Version 3 is what every write makes, and neither is
+    /// read at schema version 1.
+    ///
+    /// Mutation checked: version 2 refused once version 3 is written (an
+    /// existing vault's marked item would not open), and this fails.
+    #[test]
+    fn version_2_records_are_read_with_their_cover_unknown() {
+        let details = details();
+        let slug = Slug::new("openai/work").unwrap();
+        let plain = encode_item_v2(&slug, 42, &details, &ItemExtra::default()).unwrap();
+        assert_eq!(plain[0], ITEM_RECORD_V2);
+        assert_eq!(
+            decode_item(&plain, 2, ItemClass::Secret).unwrap(),
+            (slug.clone(), 42, details.clone(), ItemExtra::default())
+        );
+        let marked = encode_item_v2(&slug, 42, &details, &exposed()).unwrap();
+        let (_, _, _, extra) = decode_item(&marked, 2, ItemClass::Secret).unwrap();
+        let mut want = exposed();
+        want.exposure.as_mut().unwrap().covered = ExposureCover::default();
+        want.cover_unknown = true;
+        assert_eq!(extra, want);
+        let v3 = encode_item(&slug, 42, &details, &exposed()).unwrap();
+        assert_eq!(v3[0], ITEM_RECORD_V3);
+        assert_eq!(v3.len(), marked.len() + COVER_BYTES);
+        for b in [&plain, &marked, &v3] {
+            assert!(decode_item(b, 1, ItemClass::Secret).is_err());
+        }
+    }
+
+    /// A cover never forgets a value it was given, whatever else it was
+    /// given, and covers few it was not: of 100,000 values never given, a
+    /// cover of 32 says about 1.4 are covered (at most 20 here, far from
+    /// the thousands a cover reading one bit or a few bytes would give).
+    ///
+    /// Mutations checked: `has` reading other bits than `add` sets (bits
+    /// taken from bytes 8 on): values given are not covered, and this
+    /// fails; one bit a value: about 1,500 of the values never given are
+    /// covered, and this fails.
+    #[test]
+    fn a_cover_never_forgets_a_value_and_seldom_claims_another() {
+        // Distinct keyed-hash-shaped inputs from a counter.
+        let hash = |n: u64| -> [u8; 32] {
+            let mut h = [0u8; 32];
+            let mut x = n.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xd1b5_4a32_d192_ed03;
+            for chunk in h.chunks_mut(8) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                chunk.copy_from_slice(&x.to_be_bytes());
+            }
+            h
+        };
+        let mut c = ExposureCover::default();
+        assert!(!c.has(&hash(1)));
+        for n in 0..32 {
+            c.add(&hash(n));
+            assert!((0..=n).all(|m| c.has(&hash(m))), "{n}");
+        }
+        let claimed = (1_000..101_000).filter(|n| c.has(&hash(*n))).count();
+        assert!(claimed <= 20, "{claimed}");
+        // A big cover still forgets nothing.
+        for n in 32..2_000 {
+            c.add(&hash(n));
+        }
+        assert!((0..2_000).all(|n| c.has(&hash(n))));
+        assert!(format!("{c:?}").starts_with("ExposureCover("));
     }
 
     #[test]
@@ -1089,6 +1251,7 @@ mod tests {
                         since: 1,
                         sources,
                         count: 1,
+                        covered: ExposureCover::default(),
                     }),
                     ..ItemExtra::default()
                 },
@@ -1168,12 +1331,14 @@ mod tests {
                 since: 12,
                 sources: ExposureSource::ALL.to_vec(),
                 count: u64::MAX,
+                covered: ExposureCover([0xff; COVER_BYTES]),
             }),
             rotate_recommended: true,
             login: Some(LoginMeta {
                 tier: LoginTier::NeverAgent,
                 session_lifetime: u64::MAX,
             }),
+            cover_unknown: false,
         }
     }
 

@@ -1338,20 +1338,24 @@ fn two_fields(slug: &'static str) -> impl FnOnce(&mut Vault, &mut Vec<Canary>) {
     }
 }
 
-/// When the mark was made, or last restarted.
+/// When the item was first marked, while its mark stands.
 fn since(c: &mut Client, slug: &str) -> Option<u64> {
     c.items_show(slug).unwrap().exposed.map(|x| x.since_secs)
 }
 
 /// A rotation clears the mark only when it leaves the item holding no
-/// value the mark covers (Codex review): a rotation to the value the field
-/// holds already leaves it; of an item of two fields, rotating one leaves
-/// it, since the other still holds its value from before the mark, and
-/// rotating the other then clears it.
+/// value the mark covers (Codex review: the values the item held at the
+/// mark, by keyed hash, wherever they are now): a rotation to the value the
+/// field holds already leaves it; of an item of two fields, `a` written
+/// again with its own value and then `b` rotated leaves it (`a` still
+/// holds an exposed value); `a` given `b`'s exposed value leaves it too;
+/// only `a` given a value no mark covers then clears it.
 ///
 /// Mutations: the mark cleared whatever the value written (the rotation
-/// to the same value clears it); the mark cleared whatever the item's
-/// other fields hold (rotating `a` alone clears it).
+/// to the same value clears it); the mark cleared by the times the fields
+/// were written (round 2's rule: `b` rotated after `a` was written again
+/// clears it); the mark cleared when the written field's new value is
+/// not covered, whatever the others hold (rotating `b` clears it).
 #[test]
 fn a_rotation_clears_the_mark_only_when_no_covered_value_is_left() {
     let mut f = Fixture::new(two_fields("two/fields"));
@@ -1367,16 +1371,23 @@ fn a_rotation_clears_the_mark_only_when_no_covered_value_is_left() {
     f.keep("OPENAI_FRESH", &fresh);
     rotate(&f, &mut c, "openai/acme-web", None, fresh.as_bytes());
     assert_eq!(since(&mut c, "openai/acme-web"), None);
-    // Two fields: one rotated leaves the mark, both clear it.
+    // Two fields.
     let two = ids(&mut c, &["two/fields"]).remove(0);
     assert_eq!(mark_one(&mut c, &two).marked, 1);
-    after(since(&mut c, "two/fields").unwrap());
+    let first = since(&mut c, "two/fields").unwrap();
+    // A second later, so a rule by the times of writes would see `a` as
+    // written after the mark.
+    after(first);
+    let (old_a, old_b) = (f.value("two/fields_A"), f.value("two/fields_B"));
+    rotate(&f, &mut c, "two/fields", Some("a"), &old_a);
     let (new_a, new_b) = (word(40), word(40));
     f.keep("NEW_A", &new_a);
     f.keep("NEW_B", &new_b);
-    rotate(&f, &mut c, "two/fields", Some("a"), new_a.as_bytes());
-    assert!(since(&mut c, "two/fields").is_some());
     rotate(&f, &mut c, "two/fields", Some("b"), new_b.as_bytes());
+    assert_eq!(since(&mut c, "two/fields"), Some(first));
+    rotate(&f, &mut c, "two/fields", Some("a"), &old_b);
+    assert_eq!(since(&mut c, "two/fields"), Some(first));
+    rotate(&f, &mut c, "two/fields", Some("a"), new_a.as_bytes());
     assert_eq!(since(&mut c, "two/fields"), None);
     drop(c);
     let v = f.stop_and_open();
@@ -1384,13 +1395,12 @@ fn a_rotation_clears_the_mark_only_when_no_covered_value_is_left() {
     f.sweep_with(&entries);
 }
 
-/// A mark made while the item holds a value set after its mark restarts
-/// the mark (Codex review): of an item of two fields, marked, `a` is
-/// rotated (the mark stays, `b` is from before it); `a`'s new value is then
-/// found and marked again, the same kind: that mark is written (not
-/// `already`) and restarts the mark's time, so rotating `b` afterwards
-/// leaves the mark, `a`'s value being covered now; rotating `a` again then
-/// clears it.
+/// A mark made while the item holds a value no mark covers yet covers it
+/// (Codex review): of an item of two fields, marked, `a` is rotated (the
+/// mark stays, `b`'s value is covered); `a`'s new value is then found and
+/// marked again, the same kind: that mark is written (not `already`) and
+/// keeps the first mark's time, and rotating `b` afterwards leaves the
+/// mark, `a`'s value being covered now; rotating `a` again then clears it.
 ///
 /// Mutation: a repeat of known kinds written as `already` whatever values
 /// the item holds (the second mark writes nothing, and rotating `b` clears
@@ -1402,7 +1412,6 @@ fn a_mark_after_a_partial_rotation_covers_the_new_value() {
     let item = ids(&mut c, &["re/marked"]).remove(0);
     assert_eq!(mark_one(&mut c, &item).marked, 1);
     let first = since(&mut c, "re/marked").unwrap();
-    after(first);
     let values: Vec<String> = (0..3).map(|_| word(40)).collect();
     for (i, v) in values.iter().enumerate() {
         f.keep(&format!("ROTATED_{i}"), v);
@@ -1411,11 +1420,11 @@ fn a_mark_after_a_partial_rotation_covers_the_new_value() {
     assert_eq!(since(&mut c, "re/marked"), Some(first));
     let again = mark_one(&mut c, &item);
     assert_eq!((again.marked, again.already), (1, 0));
-    let restarted = since(&mut c, "re/marked").unwrap();
-    assert!(restarted > first);
-    after(restarted);
+    assert_eq!(since(&mut c, "re/marked"), Some(first));
+    let repeat = mark_one(&mut c, &item);
+    assert_eq!((repeat.marked, repeat.already), (0, 1));
     rotate(&f, &mut c, "re/marked", Some("b"), values[1].as_bytes());
-    assert_eq!(since(&mut c, "re/marked"), Some(restarted));
+    assert_eq!(since(&mut c, "re/marked"), Some(first));
     rotate(&f, &mut c, "re/marked", Some("a"), values[2].as_bytes());
     assert_eq!(since(&mut c, "re/marked"), None);
     drop(c);

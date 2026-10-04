@@ -26,12 +26,11 @@
 //!   transaction as the value, and a change (test to live, say) ends the
 //!   grants and pending requests that bind the item. A rotation also
 //!   clears the item's "exposed: rotate" mark when it leaves the item
-//!   holding no value the mark covers: the new value is another than the
-//!   one it replaces, and every other field of the item was given a value
-//!   after the mark. A rotation to the same value, or of one field of
-//!   several while another still holds a value from before the mark,
-//!   leaves the mark. A removal writes an encrypted backup of the vault
-//!   first,
+//!   holding no value the mark covers (the values the item held at each
+//!   mark, by keyed hash, `Exposure::covered`): a rotation to the same
+//!   value, to a value another field holds or held at a mark, or of one
+//!   field of several while another still holds a covered value, leaves
+//!   the mark. A removal writes an encrypted backup of the vault first,
 //!   which keeps the item's values (`envcloak recover` restores it), then
 //!   deletes the item and ends the grants and pending requests that bind
 //!   it. When the backup cannot be written, nothing is removed. A write
@@ -44,10 +43,10 @@
 //!   their values were found outside the vault, in the kinds of place it
 //!   names. Marking only tightens, so any caller may, with no proof; each
 //!   call is audited. A mark that names only kinds an item is marked for
-//!   already, on an item holding no value set after its mark, writes
-//!   nothing, so a doctor run repeated changes nothing it marked; one on an
-//!   item holding such a value restarts the mark's time, so the mark covers
-//!   that value too. Only `secret` items are marked: an id that names no
+//!   already, on an item whose every value its mark covers, writes nothing,
+//!   so a doctor run repeated changes nothing it marked; one on an item
+//!   holding a value set since is written, and its mark covers that value
+//!   too. Only `secret` items are marked: an id that names no
 //!   secret item (one removed meanwhile, a card's, a login's) is counted
 //!   as missing, never an error for the rest.
 //!
@@ -656,24 +655,18 @@ pub fn rotate(
             classification: after,
             ..meta.details.clone()
         });
-        // The mark is cleared only when this rotation leaves the item
-        // holding no value it covers: the new value is another than the
-        // field's current one, and every other field's value was set after
-        // the mark (`ItemMeta::exposure_replaced_but`).
-        let changed = !v
-            .value_keys_of(ItemClass::Secret)
-            .contains(&(field, v.value_key(&value)));
-        let clears = changed && meta.exposure_replaced_but(field);
         // The value, the classification and the mark change together, or
-        // none of them.
+        // none of them. The mark is cleared only when the item, with its
+        // new value, holds no value the mark covers, read by the vault
+        // from the values the transaction leaves (`Exposure::covered`):
+        // the same value written again, a covered value moved to another
+        // field or set back keeps it.
         v.transact(|txn| {
             txn.set_value(field, value)?;
             if let Some(details) = details {
                 txn.update_item(t.item, details)?;
             }
-            if clears {
-                txn.clear_exposure(t.item)?;
-            }
+            txn.clear_exposure_if_replaced(t.item)?;
             Ok(())
         })
         .map_err(|e| write_error(&e))?;
@@ -816,12 +809,12 @@ fn mark(
         // Marked for every kind named already, and the mark covers every
         // value the item holds: nothing to write. A mark that does not
         // cover a value set since (a field replaced after it) is written,
-        // and restarts (`Txn::mark_exposed`).
+        // and covers it then (`Txn::mark_exposed`).
         let known = m
             .exposure
             .as_ref()
             .is_some_and(|x| sources.iter().all(|k| x.sources.contains(k)));
-        if known && m.rotate_recommended && m.exposure_covers() {
+        if known && m.rotate_recommended && v.exposure_covers(m.id) {
             already += 1;
         } else {
             marks.push((m.id, m.slug.clone(), sources, e.count));
