@@ -13,14 +13,27 @@
 //!   up, as a backup v2 the daemon seals, before it is changed.
 //! - `uninstall [--global] [--project] [--agent ID]... [--yes] [--json]`
 //!   takes out exactly what `install` added.
-//! - `status` makes one check in this build (M2 plan M2-08): EnvCloak's
-//!   Claude Code plugin enabled (in the user's settings, or the working
+//! - `status [--json]` (SPEC §7.1; M2 plan M2-09) reports, for each
+//!   tier-1 host found on `PATH` (and the hosts whose documentation leaves
+//!   a surface no contract, `envcloak_agents::coverage::STATIC_HOSTS`),
+//!   its version and six surfaces, each with its state, its reason
+//!   tokens and its probe outcome, failed probes first, and EnvCloak's
+//!   own MCP server line (`outside_host_sandbox`, with the sentinel
+//!   probe's evidence). States rest on the probe results kept for this
+//!   host binary (its SHA-256), version and configuration digest
+//!   (`<data>/agents/coverage.json`), recomputed here from the person's
+//!   real configuration, read-only: a result for anything else reads
+//!   `unverified (changed_since_probe)`, none at all `unverified
+//!   (not_probed)`, and only a passed probe that nothing degrades reads
+//!   `active`. Exit 0 once the report is printed. Before it, a double
+//!   install is refused (exit 1, `double_install`): EnvCloak's Claude
+//!   Code plugin enabled (in the user's settings, or the working
 //!   directory's project or local settings) while EnvCloak's own hooks
 //!   (in one of those files) or an MCP server named `envcloak` (in
-//!   `.claude.json`) are there too, so each hook runs twice: refused,
-//!   exit 1 with `double_install`, naming both. Otherwise the coverage
-//!   report (M2-09, M2-28) is not in this build: exit 125 with
-//!   `not_in_this_build`. It reads no argument.
+//!   `.claude.json`) are there too, so each hook runs twice; the message
+//!   names both (M2-08). `--probe`, which runs the probes on this machine
+//!   in a probe home of their own (M2-28), is not in this build: exit 125
+//!   with `not_in_this_build`.
 //! - `migrate-mcp` (M2-20) is not in this build: it exits 125 with
 //!   `not_in_this_build`, reading no argument.
 //!
@@ -33,6 +46,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
 
+use envcloak_agents::coverage::{self, Cache, ConfigSet, Coverage, Probed, Surface};
+use envcloak_agents::detect::{self, DetectError};
 use envcloak_agents::hook::Host;
 use envcloak_agents::install::{
     self, Context, HostReport, Note, Options, Plan, Report, Step, StepKind, StepResult, host_name,
@@ -49,7 +64,8 @@ use super::require_unlocked;
 
 const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
        envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
-       envcloak agents status | migrate-mcp (not in this build)";
+       envcloak agents status [--json]
+       envcloak agents status --probe | migrate-mcp (not in this build)";
 
 #[derive(Debug, Default)]
 struct Args {
@@ -86,7 +102,7 @@ fn parse(args: &[&str], install: bool) -> Option<Args> {
 
 pub fn run(args: &[&str]) -> ExitCode {
     match args {
-        ["status", ..] => run_status(),
+        ["status", rest @ ..] => run_status(rest),
         ["migrate-mcp", ..] => super::not_in_this_build("`envcloak agents migrate-mcp`"),
         [cmd @ ("install" | "uninstall"), rest @ ..] => {
             if rest == ["--help"] || rest == ["-h"] {
@@ -114,18 +130,217 @@ pub fn run(args: &[&str]) -> ExitCode {
     }
 }
 
-/// `agents status` in this build: the double-install check (M2 plan
-/// M2-08; Codex review: a direct install followed by the plugin left both
-/// hook sets and both servers, and nothing said so), then
-/// `not_in_this_build` for the coverage report. No argument is read.
-fn run_status() -> ExitCode {
+/// `agents status [--json]`: the double-install check (M2 plan M2-08;
+/// Codex review: a direct install followed by the plugin left both hook
+/// sets and both servers, and nothing said so), then the coverage report
+/// (M2-09).
+fn run_status(args: &[&str]) -> ExitCode {
+    let json = match args {
+        [] => false,
+        ["--json"] => true,
+        ["--help"] | ["-h"] => {
+            println!("usage: {USAGE_TEXT}");
+            return ExitCode::SUCCESS;
+        }
+        ["--probe"] | ["--probe", "--json"] | ["--json", "--probe"] => {
+            return super::not_in_this_build(
+                "`envcloak agents status --probe` (probes on this machine, in a probe home of \
+                 their own)",
+            );
+        }
+        _ => return usage(USAGE_TEXT),
+    };
     // The settings it reads can hold literal keys (SPEC §5).
     if let Err(f) = refuse_if_traced() {
         return f.report(FAILURE);
     }
-    match double_install() {
-        Some(text) => Failure::new("double_install", text).report(FAILURE),
-        None => super::not_in_this_build("`envcloak agents status`"),
+    if let Some(text) = double_install() {
+        return Failure::new("double_install", text).report(FAILURE);
+    }
+    match coverage_report() {
+        Ok(rows) => {
+            print_coverage(&rows, json);
+            ExitCode::SUCCESS
+        }
+        Err(f) => f.report(FAILURE),
+    }
+}
+
+/// One host's row of the coverage report.
+struct Row {
+    name: &'static str,
+    tier: u8,
+    /// Where the host's executable is, when it is one EnvCloak found.
+    exe: Option<PathBuf>,
+    /// `current`, `changed_since_probe` or `not_probed`: what the states
+    /// rest on.
+    probed: &'static str,
+    coverage: Coverage,
+}
+
+/// The report: each tier-1 host found on `PATH`, then each host whose
+/// documentation leaves a surface no contract.
+fn coverage_report() -> Result<Vec<Row>, Failure> {
+    let locations = Locations::from_env().map_err(|_| {
+        Failure::new(
+            "no_home",
+            "HOME is not set to an absolute path, so the agents' files cannot be found",
+        )
+    })?;
+    let data_dir = envcloak_core::vault::VaultPaths::for_user()
+        .map_err(|_| {
+            Failure::new(
+                "no_home",
+                "HOME is not set to an absolute path, so EnvCloak's data directory cannot be found",
+            )
+        })?
+        .data_dir;
+    let cache = Cache::load(&Cache::path(&data_dir));
+    let path = env("PATH").unwrap_or_default();
+    let project = project_dir()?;
+    let mut rows = Vec::new();
+    for host in install::TIER_1 {
+        let detected = detect::detect(host, &path, &env);
+        let d = match detected {
+            Ok(d) => d,
+            Err(DetectError::NotFound) => continue,
+            Err(_) => {
+                // Found, but its version could not be read: no probe result
+                // can be for it.
+                let cs = ConfigSet::read(
+                    host,
+                    &locations,
+                    &coverage::claude_managed_dir(),
+                    &project,
+                    &env,
+                );
+                let mut c = coverage::assemble(host, "", &cs, Probed::None);
+                c.version = None;
+                rows.push(Row {
+                    name: host_name(host),
+                    tier: 1,
+                    exe: detect::find_on_path(detect::exe_name(host), &path),
+                    probed: "not_probed",
+                    coverage: c,
+                });
+                continue;
+            }
+        };
+        let sha = std::fs::canonicalize(&d.exe)
+            .ok()
+            .and_then(|p| coverage::file_sha256(&p))
+            .unwrap_or_default();
+        let cs = ConfigSet::read(
+            host,
+            &locations,
+            &coverage::claude_managed_dir(),
+            &project,
+            &env,
+        );
+        let probed = cache.probed(host.id(), &sha, &d.version, &cs.digest());
+        let word = match probed {
+            Probed::Current(_) => "current",
+            Probed::Stale => "changed_since_probe",
+            Probed::None => "not_probed",
+        };
+        rows.push(Row {
+            name: host_name(host),
+            tier: 1,
+            exe: Some(d.exe.clone()),
+            probed: word,
+            coverage: coverage::assemble(host, &d.version, &cs, probed),
+        });
+    }
+    for (id, exe) in coverage::STATIC_HOSTS {
+        let Some(found) = detect::find_on_path(exe, &path) else {
+            continue;
+        };
+        let Some(surfaces) = coverage::static_rows(id) else {
+            continue;
+        };
+        rows.push(Row {
+            name: static_name(id),
+            tier: 2,
+            exe: Some(found),
+            probed: "not_probed",
+            coverage: Coverage {
+                agent: id.to_owned(),
+                version: None,
+                surfaces,
+                envcloak_server: None,
+            }
+            .sorted(),
+        });
+    }
+    Ok(rows)
+}
+
+fn static_name(id: &str) -> &'static str {
+    match id {
+        "copilot" => "Copilot CLI",
+        "opencode" => "OpenCode",
+        "goose" => "Goose",
+        _ => "an agent host",
+    }
+}
+
+fn print_coverage(rows: &[Row], json: bool) {
+    let home = Locations::from_env()
+        .map(|l| l.home().to_path_buf())
+        .unwrap_or_default();
+    if json {
+        let agents: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let mut v = serde_json::to_value(&r.coverage).unwrap_or(Value::Null);
+                v["name"] = json!(r.name);
+                v["tier"] = json!(r.tier);
+                v["exe"] = json!(r.exe.as_ref().map(|p| shown(&home, p)));
+                v["probed"] = json!(r.probed);
+                v
+            })
+            .collect();
+        print_json(&json!({ "agents": agents }));
+        return;
+    }
+    if rows.is_empty() {
+        println!("No agent host found on PATH.");
+        return;
+    }
+    let width = Surface::ALL
+        .iter()
+        .map(|s| s.shown().len())
+        .chain(["EnvCloak server".len()])
+        .max()
+        .unwrap_or(0);
+    for r in rows {
+        match &r.coverage.version {
+            Some(v) => println!("{} {}", r.name, escape_for_display(v)),
+            None => println!("{} (version not read)", r.name),
+        }
+        for s in &r.coverage.surfaces {
+            println!("  {:width$}  {s}", s.surface.shown());
+        }
+        if let Some(line) = &r.coverage.envcloak_server {
+            println!(
+                "  {:width$}  {line}: commands that run_with_secrets starts run outside {}'s \
+                 sandbox and hold the keys injected into them while they run",
+                "EnvCloak server", r.name
+            );
+        }
+        match r.probed {
+            "current" => {}
+            "changed_since_probe" => println!(
+                "  The probe results kept are for another binary, version or configuration of \
+                 {}: they are not used.",
+                r.name
+            ),
+            _ => println!(
+                "  No probe has run on this machine for this binary, version and configuration \
+                 of {}.",
+                r.name
+            ),
+        }
     }
 }
 

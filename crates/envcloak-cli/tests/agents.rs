@@ -66,7 +66,13 @@ const FAKE_CLAUDE: &str = r#"
 import json, os, sys
 args = sys.argv[1:]
 if args == ["--version"]:
-    print("2.1.280 (Claude Code)")
+    # Another version only where a test writes one (M2-09's cache test),
+    # so the program's own bytes stay the same.
+    try:
+        with open(os.path.join(os.environ["HOME"], ".fake-claude-version")) as f:
+            print(f.read().strip() + " (Claude Code)")
+    except FileNotFoundError:
+        print("2.1.280 (Claude Code)")
     sys.exit(0)
 d = os.environ.get("CLAUDE_CONFIG_DIR")
 path = os.path.join(d, ".claude.json") if d else os.path.join(os.environ["HOME"], ".claude.json")
@@ -2033,9 +2039,9 @@ fn a_double_install_with_the_plugin_is_found_in_either_order() {
     let (v, code) = install();
     assert_eq!(code, 0, "{v}");
     assert!(!own_hooks() && !own_server());
+    // No double install: the coverage report (M2-09).
     let (code, err) = status();
-    assert_eq!(code, 125, "{err}");
-    assert!(err.starts_with("envcloak: not_in_this_build:"), "{err}");
+    assert_eq!(code, 0, "{err}");
     let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
     assert_eq!(code, 0, "{u}");
     assert_eq!(f.text(".claude/settings.json"), enable(SETTINGS));
@@ -2072,7 +2078,7 @@ fn a_double_install_with_the_plugin_is_found_in_either_order() {
         "{s}"
     );
     let (code, err) = status();
-    assert_eq!(code, 125, "{err}");
+    assert_eq!(code, 0, "{err}");
     // Uninstall leaves the person's own: the plugin, their settings.
     let (u, code) = f.report(&["uninstall", "--agent", "claude-code", "--yes"]);
     assert_eq!(code, 0, "{u}");
@@ -2525,6 +2531,179 @@ fn linux_traced_agents_commands_read_no_config() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("settings.json"), "{}", stdout(&out));
     let out = agents(&["status"], false);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("Claude Code"), "{}", stdout(&out));
+    f.sweep();
+}
+
+// ---------------------------------------------------------------------------
+// `agents status` (M2 plan M2-09): the coverage report from the person's
+// real files and the probe results kept for this binary, version and
+// configuration.
+
+impl Fixture {
+    /// `agents status --json` in `cwd` with `env`: the report, its exit 0
+    /// checked.
+    fn status_in(&self, cwd: &Path, env: &[(&str, &Path)]) -> Value {
+        let out = self.agents_with(cwd, &["status", "--json"], env);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|_| panic!("{}{}", stdout(&out), stderr(&out)))
+    }
+
+    fn status_json(&self) -> Value {
+        self.status_in(&self.home.home(), &[])
+    }
+}
+
+/// `agent`'s row of a status report.
+fn row<'v>(v: &'v Value, agent: &str) -> &'v Value {
+    v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["agent"] == agent)
+        .unwrap_or_else(|| panic!("no {agent} in {v}"))
+}
+
+/// A surface of `agent`, as the human report prints it.
+fn surface_line(v: &Value, agent: &str, surface: &str) -> String {
+    let e = row(v, agent)["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["surface"] == surface)
+        .unwrap_or_else(|| panic!("no {surface}"))
+        .clone();
+    let reasons: Vec<&str> = e["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    let mut s = format!("{} (", e["state"].as_str().unwrap());
+    if !reasons.is_empty() {
+        s.push_str(&reasons.join(", "));
+        s.push_str("; ");
+    }
+    s.push_str(&format!("probe={})", e["probe"].as_str().unwrap()));
+    s
+}
+
+fn reasons_of(v: &Value, agent: &str, surface: &str) -> Vec<String> {
+    row(v, agent)["surfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["surface"] == surface)
+        .unwrap()["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_owned())
+        .collect()
+}
+
+const HOOK_SURFACES: [&str; 5] = ["prompt_to_model", "transcript", "file_read", "shell", "mcp"];
+
+/// With no probe result, nothing is `active`: every surface reads
+/// `unverified (not_probed)` with the degraders the configuration gives,
+/// but Claude Code's transcript, which its documentation leaves
+/// `unsupported (persists_blocked_prompt)`, and on Linux the sandboxed
+/// shells (K-01); EnvCloak's server line says `outside_host_sandbox`, its
+/// probe skipped. Before install, every hook surface reads `hook_missing`.
+#[test]
+fn status_without_a_probe_claims_nothing() {
+    let f = Fixture::new();
+    let v = f.status_json();
+    for agent in ["claude-code", "codex"] {
+        for s in HOOK_SURFACES {
+            assert!(
+                reasons_of(&v, agent, s).contains(&"hook_missing".to_owned())
+                    || (agent == "claude-code" && s == "transcript")
+                    || (agent == "codex" && s == "shell" && cfg!(target_os = "linux")),
+                "{agent} {s}: {v}"
+            );
+        }
+        assert!(row(&v, agent)["envcloak_server"].is_null(), "{v}");
+    }
+    let (r, code) = f.report(&["install", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    let v = f.status_json();
+    assert_eq!(
+        surface_line(&v, "claude-code", "prompt_to_model"),
+        "unverified (fails_open_on_timeout, not_probed, workspace_untrusted; probe=skipped)"
+    );
+    assert_eq!(
+        surface_line(&v, "claude-code", "transcript"),
+        "unsupported (persists_blocked_prompt; probe=skipped)"
+    );
+    assert_eq!(
+        surface_line(&v, "claude-code", "output"),
+        "unverified (not_probed; probe=skipped)"
+    );
+    assert_eq!(
+        surface_line(&v, "codex", "mcp"),
+        "unverified (fails_open_on_timeout, hooks_untrusted, not_probed; probe=skipped)"
+    );
+    let shell = surface_line(&v, "codex", "shell");
+    if cfg!(target_os = "linux") {
+        assert_eq!(shell, "unsupported (sandbox_blocks_socket; probe=skipped)");
+    } else {
+        assert!(shell.starts_with("unverified ("), "{shell}");
+    }
+    for agent in ["claude-code", "codex"] {
+        let a = row(&v, agent);
+        assert_eq!(a["probed"], "not_probed", "{a}");
+        assert_eq!(
+            a["version"],
+            if agent == "codex" {
+                "0.159.2"
+            } else {
+                "2.1.280"
+            }
+        );
+        assert!(
+            a["surfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["state"] != "active"),
+            "{a}"
+        );
+        let server = &a["envcloak_server"];
+        assert_eq!(server["availability"], "needs_host_approval", "{server}");
+        assert_eq!(
+            server["reasons"],
+            json!(["outside_host_sandbox"]),
+            "{server}"
+        );
+        assert_eq!(server["probe"], "skipped", "{server}");
+        assert_eq!(server["sentinel"], "not_run", "{server}");
+    }
+    // The human report says the same.
+    let out = f.agents(&["status"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    for want in [
+        "Claude Code 2.1.280",
+        "Codex 0.159.2",
+        "unsupported (persists_blocked_prompt; probe=skipped)",
+        "needs_host_approval; outside_host_sandbox (probe=skipped): commands that \
+         run_with_secrets starts run outside Codex's sandbox and hold the keys injected into \
+         them while they run",
+        "No probe has run on this machine",
+    ] {
+        assert!(text.contains(want), "{want}: {text}");
+    }
+    // `--probe` (probes on this machine) is M2-28's.
+    let out = f.agents(&["status", "--probe"]);
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     assert!(
         stderr(&out).starts_with("envcloak: not_in_this_build:"),
@@ -2532,4 +2711,265 @@ fn linux_traced_agents_commands_read_no_config() {
         stderr(&out)
     );
     f.sweep();
+}
+
+/// Each switch D-14 lists that a person's own files can hold, written
+/// into the file where the host reads it, gives its token on every hook
+/// surface and none other, and is gone once the switch is (the control).
+/// The managed and system switches are read from directories only the
+/// administrator writes, and are tested with temporary ones
+/// (crates/envcloak-agents/tests/coverage_config.rs).
+///
+/// Mutation checked: `degraders` without the user switch (`(cs.off_user,
+/// Reason::SwitchedOffUser)` dropped): `disableAllHooks` in the user's
+/// settings gives no token and this fails.
+#[test]
+fn status_reads_each_switch_from_the_persons_files() {
+    let f = Fixture::new();
+    let (r, code) = f.report(&["install", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    let proj = f.path("proj");
+    std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    let has = |v: &Value, agent: &str, token: &str| {
+        let on: Vec<&str> = HOOK_SURFACES
+            .iter()
+            .copied()
+            .filter(|s| reasons_of(v, agent, s).contains(&token.to_owned()))
+            .collect();
+        assert!(
+            !reasons_of(v, agent, "output").contains(&token.to_owned()),
+            "{agent} {token} on output: {v}"
+        );
+        on
+    };
+    // Claude Code's hook surfaces other than the transcript, whose state
+    // its documentation fixes until a probe.
+    let claude_hooked = ["prompt_to_model", "file_read", "shell", "mcp"];
+    let settings = f.path(".claude/settings.json");
+    let installed = f.text(".claude/settings.json");
+    let switched = |text: &str| {
+        let mut v: Value = serde_json::from_str(text).unwrap();
+        v["disableAllHooks"] = json!(true);
+        serde_json::to_string_pretty(&v).unwrap()
+    };
+    // User.
+    assert!(has(&f.status_json(), "claude-code", "switched_off_user").is_empty());
+    std::fs::write(&settings, switched(&installed)).unwrap();
+    assert_eq!(
+        has(&f.status_json(), "claude-code", "switched_off_user"),
+        claude_hooked
+    );
+    std::fs::write(&settings, &installed).unwrap();
+    // Project and local, in the project's directory.
+    for (file, token) in [
+        ("settings.json", "switched_off_project"),
+        ("settings.local.json", "switched_off_local"),
+    ] {
+        let p = proj.join(".claude").join(file);
+        assert!(has(&f.status_in(&proj, &[]), "claude-code", token).is_empty());
+        std::fs::write(&p, "{\"disableAllHooks\": true}\n").unwrap();
+        assert_eq!(
+            has(&f.status_in(&proj, &[]), "claude-code", token),
+            claude_hooked,
+            "{file}"
+        );
+        std::fs::remove_file(&p).unwrap();
+    }
+    // CLAUDE_CONFIG_DIR.
+    let moved = f.home.root().join("claude-config");
+    std::fs::create_dir_all(&moved).unwrap();
+    std::fs::write(moved.join("settings.json"), &installed).unwrap();
+    assert_eq!(
+        has(
+            &f.status_in(&f.home.home(), &[("CLAUDE_CONFIG_DIR", &moved)]),
+            "claude-code",
+            "config_dir_moved"
+        ),
+        claude_hooked
+    );
+    // Codex: hook trust always; `[features] hooks = false`; the override.
+    let all_codex: Vec<&str> = HOOK_SURFACES
+        .iter()
+        .copied()
+        .filter(|s| !(*s == "shell" && cfg!(target_os = "linux")))
+        .collect();
+    assert_eq!(has(&f.status_json(), "codex", "hooks_untrusted"), all_codex);
+    let config = f.path(".codex/config.toml");
+    let toml = f.text(".codex/config.toml");
+    std::fs::write(&config, format!("[features]\nhooks = false\n\n{toml}")).unwrap();
+    assert_eq!(
+        has(&f.status_json(), "codex", "switched_off_user"),
+        all_codex
+    );
+    std::fs::write(&config, &toml).unwrap();
+    assert!(has(&f.status_json(), "codex", "switched_off_user").is_empty());
+    std::fs::write(f.path(".codex/AGENTS.override.md"), "# mine\n").unwrap();
+    let want: Vec<&str> = ["file_read", "shell"]
+        .into_iter()
+        .filter(|s| !(*s == "shell" && cfg!(target_os = "linux")))
+        .collect();
+    assert_eq!(has(&f.status_json(), "codex", "override_file"), want);
+    f.sweep();
+}
+
+/// A probe result is used only for the host binary, version and
+/// configuration it was for: kept for this one, the surfaces read what it
+/// observed, a failed probe listed first; after the host reports another
+/// version, or its configuration changes, every surface reads `unverified
+/// (changed_since_probe)` and none `active`.
+///
+/// Mutation checked: `ProbeRecord::is_for` without the version (`&&
+/// self.version == version` dropped): the result is used for 2.1.281 and
+/// this fails.
+#[test]
+fn status_uses_a_probe_result_only_for_what_it_was_for() {
+    use envcloak_agents::coverage::{
+        Cache, ConfigSet, Observed, Outcome, ProbeRecord, Sentinel, ServerObserved, Surface,
+        claude_managed_dir, file_sha256,
+    };
+    use envcloak_agents::hook::Host;
+    use envcloak_agents::locations::Locations;
+    let f = Fixture::new();
+    let (r, code) = f.report(&["install", "--agent", "claude-code", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    let vars: Vec<(String, std::ffi::OsString)> = f
+        .home
+        .vars()
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+    let env = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let digest = || {
+        let l = Locations::new(&env).unwrap();
+        let home = std::fs::canonicalize(f.home.home()).unwrap();
+        ConfigSet::read(Host::ClaudeCode, &l, &claude_managed_dir(), &home, &env).digest()
+    };
+    let sha = file_sha256(&std::fs::canonicalize(f.bin.join("claude")).unwrap()).unwrap();
+    let observed: Vec<Observed> = Surface::ALL
+        .iter()
+        .map(|s| Observed {
+            surface: *s,
+            outcome: if *s == Surface::Transcript {
+                Outcome::Failed
+            } else {
+                Outcome::Passed
+            },
+            persisted: *s == Surface::Transcript,
+            why: Vec::new(),
+        })
+        .collect();
+    let mut cache = Cache::default();
+    cache.put(ProbeRecord {
+        host: "claude-code".to_owned(),
+        exe_sha256: sha,
+        version: "2.1.280".to_owned(),
+        config_digest: digest(),
+        os: std::env::consts::OS.to_owned(),
+        surfaces: observed,
+        server: ServerObserved {
+            outcome: Outcome::Passed,
+            sentinel: Sentinel::Appeared,
+            control_denied: true,
+        },
+        flags: Vec::new(),
+    });
+    cache.store(&Cache::path(&data_dir(&f.home))).unwrap();
+    let v = f.status_json();
+    let a = row(&v, "claude-code");
+    assert_eq!(a["probed"], "current", "{a}");
+    assert_eq!(
+        surface_line(&v, "claude-code", "prompt_to_model"),
+        "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+    );
+    assert_eq!(
+        surface_line(&v, "claude-code", "output"),
+        "active (probe=passed)"
+    );
+    assert_eq!(a["surfaces"][0]["surface"], "transcript", "{a}");
+    assert_eq!(
+        surface_line(&v, "claude-code", "transcript"),
+        "unsupported (persists_blocked_prompt; probe=failed)"
+    );
+    assert_eq!(a["envcloak_server"]["sentinel"], "appeared", "{a}");
+    let out = f.agents(&["status"]);
+    let text = stdout(&out);
+    let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s}: {text}"));
+    assert!(at("transcript") < at("prompt-to-model"), "{text}");
+    assert!(
+        text.contains(
+            "needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)"
+        ),
+        "{text}"
+    );
+    let stale = |v: &Value| {
+        let a = row(v, "claude-code");
+        assert_eq!(a["probed"], "changed_since_probe", "{a}");
+        for s in a["surfaces"].as_array().unwrap() {
+            assert_ne!(s["state"], "active", "{s}");
+            assert_ne!(s["probe"], "passed", "{s}");
+        }
+        assert!(
+            reasons_of(v, "claude-code", "output").contains(&"changed_since_probe".to_owned()),
+            "{a}"
+        );
+    };
+    // Another version of the host, its file the same.
+    let version = f.path(".fake-claude-version");
+    std::fs::write(&version, "2.1.281\n").unwrap();
+    stale(&f.status_json());
+    std::fs::remove_file(&version).unwrap();
+    assert_eq!(row(&f.status_json(), "claude-code")["probed"], "current");
+    // Another binary at the same version.
+    let claude = f.bin.join("claude");
+    let script = std::fs::read_to_string(&claude).unwrap();
+    std::fs::write(&claude, format!("{script}\n# rebuilt\n")).unwrap();
+    stale(&f.status_json());
+    std::fs::write(&claude, &script).unwrap();
+    assert_eq!(row(&f.status_json(), "claude-code")["probed"], "current");
+    // Another configuration.
+    let settings = f.path(".claude/settings.json");
+    let installed = f.text(".claude/settings.json");
+    let mut s: Value = serde_json::from_str(&installed).unwrap();
+    s["disableAllHooks"] = json!(true);
+    std::fs::write(&settings, serde_json::to_string_pretty(&s).unwrap()).unwrap();
+    stale(&f.status_json());
+    std::fs::write(&settings, &installed).unwrap();
+    assert_eq!(row(&f.status_json(), "claude-code")["probed"], "current");
+    f.sweep();
+}
+
+/// Copilot CLI, OpenCode and Goose have no prompt-rejection contract: on
+/// `PATH`, each is reported with its prompt guard (and so the blocked
+/// prompt's persistence) `unsupported` without a probe, and nothing
+/// `active`.
+#[test]
+fn hosts_without_a_prompt_contract_read_unsupported_without_a_probe() {
+    let f = Fixture::new();
+    for name in ["copilot", "opencode", "goose"] {
+        let p = f.bin.join(name);
+        std::fs::write(&p, "#!/bin/sh\necho 1.0.0\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let v = f.status_json();
+    for agent in ["copilot", "opencode", "goose"] {
+        assert_eq!(
+            surface_line(&v, agent, "prompt_to_model"),
+            "unsupported (probe=skipped)",
+            "{agent}"
+        );
+        assert_eq!(
+            surface_line(&v, agent, "transcript"),
+            "unsupported (probe=skipped)"
+        );
+        assert!(
+            row(&v, agent)["surfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["state"] != "active"),
+            "{agent}"
+        );
+    }
+    let out = f.agents(&["status"]);
+    assert!(stdout(&out).contains("Copilot CLI"), "{}", stdout(&out));
 }
