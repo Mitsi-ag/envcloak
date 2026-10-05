@@ -1,6 +1,13 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 
+# Legacy compatibility only in envcloak-signin/src/totp.rs. The canary in
+# tests/sha1_canary.rs proves that normal workspace code cannot use it.
+disallowed-types = [
+  { path = "sha1::Sha1", reason = "SHA-1 is confined to RFC 6238 in envcloak-signin/src/totp.rs", allow-invalid = true },
+  { path = "sha1::block_api::Sha1Core", reason = "SHA-1 is confined to RFC 6238 in envcloak-signin/src/totp.rs", allow-invalid = true },
+]
+
 # Opening a secret is allowed only in files listed in
 # security/expose-allowlist.txt, which mark each call site with
 # `#[allow(clippy::disallowed_methods)]`. scripts/check-unsafe.sh enforces
