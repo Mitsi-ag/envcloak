@@ -40,8 +40,10 @@ decisions as SPEC v0.4.1 wrote them (M3 plan task M3-01).
   or `/proc/<pid>/exe` of it being anything. The daemon cannot identify a
   hardened client's code on Linux (CR-1). These patterns catch the
   wordings reviewers wrote, and the paraphrases a review found passing
-  (M2R-4); one they still miss is left to code-owner review of SPEC edits,
-  which `main`'s branch protection must require (plan §3).
+  (M2R-4); one they still miss is left to code-owner review of SPEC edits
+  (.github/CODEOWNERS names docs/SPEC.md from task M3-01), which `main`'s
+  branch protection must require (plan §3). Until it does, that review is
+  not enforced, and such a sentence passes this check.
 - Every decision D3-01 to D3-18 of the M3 plan is listed once, in order,
   in the same way (SPEC v0.4.1, task M3-01). D3-15 says the SPEC changes
   only on its fallback; the dependency trial's measurement (hpke 0.14

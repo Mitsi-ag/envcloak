@@ -53,6 +53,13 @@
 /scripts/check-reservations.py               @Mitsi-ag
 /scripts/check-reservations-baseline.txt     @Mitsi-ag
 /scripts/check-spec-decisions.py             @Mitsi-ag
+# The SPEC check catches the wordings and paraphrases reviews found; one it
+# still misses is left to a code owner's review of the SPEC edit itself
+# (check-spec-decisions.py, M2 plan §3), so the SPEC is code-owned too
+# (task M3-01, whose security sentences rest on that review). Like the
+# lines above, it takes effect once main's branch protection requires
+# code-owner review.
+/docs/SPEC.md                                @Mitsi-ag
 
 # M3 plan D3-02, D3-05 and D3-06 (task M3-01): the macOS app, its build and
 # signing scripts decide what is signed and with which entitlements, and

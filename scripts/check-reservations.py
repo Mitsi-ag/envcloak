@@ -316,7 +316,9 @@ PRINTED = ("error_kind", "reason", "exit_token", "signin_token")
 # A name meant to be the same token in two of the PRINTED tables, with the
 # tables it may be in. Empty: no reserved name is shared today. An entry
 # needs a code owner's agreement that both rows mean one thing (this file
-# is code-owned, .github/CODEOWNERS).
+# is code-owned, .github/CODEOWNERS, which binds once main's branch
+# protection requires code-owner review; until then it is the reviewers'
+# rule, not the host's).
 SHARED = {}
 
 # Code sources, relative to the root.
