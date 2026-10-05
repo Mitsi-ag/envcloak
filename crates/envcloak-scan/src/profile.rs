@@ -148,7 +148,7 @@ fn parse(bytes: &[u8], shell: Shell) -> (ScanReport, Vec<Include>) {
                 rhs = &rhs[1..];
             }
         }
-        let (value, used, unsupported) = word(rhs, fish, exported);
+        let (value, used, unsupported) = word(rhs, fish, exported, false);
         let template = rhs[..used].contains(&b'$') || rhs[..used].contains(&b'`');
         let tail = &rhs[used..];
         let tail = tail
@@ -193,13 +193,16 @@ fn parse(bytes: &[u8], shell: Shell) -> (ScanReport, Vec<Include>) {
     (report, includes)
 }
 
-fn word(bytes: &[u8], fish: bool, exported: bool) -> (SecretBytes, usize, bool) {
+fn word(bytes: &[u8], fish: bool, exported: bool, home_prefix: bool) -> (SecretBytes, usize, bool) {
     let mut out = SecretBuf::with_capacity(bytes.len());
     let mut q = 0;
     let mut i = 0;
-    let mut unsupported = fish && bytes.contains(&b'\\');
+    let mut unsupported = false;
     while i < bytes.len() {
         let b = bytes[i];
+        if fish && b == b'\\' {
+            unsupported = true;
+        }
         if q == 0 && (blank(b) || matches!(b, b';' | b'&' | b'|' | b'<' | b'>')) {
             break;
         }
@@ -214,7 +217,7 @@ fn word(bytes: &[u8], fish: bool, exported: bool) -> (SecretBytes, usize, bool) 
             continue;
         }
         if q == 0
-            && (b == b'~'
+            && ((b == b'~' && !(home_prefix && i == 0))
                 || matches!(b, b'(' | b')')
                 || (exported && matches!(b, b'{' | b'}'))
                 || (fish && matches!(b, b'*' | b'?' | b'{' | b'}')))
@@ -250,13 +253,10 @@ fn word(bytes: &[u8], fish: bool, exported: bool) -> (SecretBytes, usize, bool) 
 // dollar inside single quotes. The decoded path still must stay in the root.
 fn source_path(raw: &[u8]) -> Option<Include> {
     let raw = &raw[raw.iter().position(|b| !blank(*b)).unwrap_or(raw.len())..];
-    if raw.starts_with(b"'") && raw.contains(&b'$') {
-        return None;
-    }
     let expand_home =
         raw.starts_with(b"~/") || raw.starts_with(b"$HOME/") || raw.starts_with(b"\"$HOME/");
-    let (v, n, bad) = word(raw, false, false);
-    if bad && !raw.starts_with(b"~/") {
+    let (v, n, bad) = word(raw, false, false, raw.starts_with(b"~/"));
+    if bad {
         return None;
     }
     let tail = &raw[n..];
