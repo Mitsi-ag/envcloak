@@ -711,6 +711,41 @@ impl SignalRelay {
         self.pipe.read.as_fd()
     }
 
+    /// Gives every signal the relay catches the disposition it had before
+    /// the relay, blocks again on the installing thread those it blocked
+    /// before, and waits for a handler still counting itself: from here on
+    /// a signal acts as it would have without the relay, and every one
+    /// caught before is in the relay to read ([`SignalRelay::try_next`]).
+    /// A reader draws this line before it decides how a run ended, so no
+    /// signal is caught and then left unread (`envcloak run --pty`, M2
+    /// task M2-19: a SIGTERM caught after the command's exit, while the
+    /// last output was written, still ends the run with 128 plus its
+    /// number). A handler the kernel entered on another thread just before
+    /// the change and that has not counted itself yet can still write
+    /// after this returns; on the installing thread, the one `envcloak run
+    /// --pty` relays on, every handler has ended by then. The drop does
+    /// nothing more for the dispositions afterwards.
+    pub fn restore_dispositions(&mut self) {
+        // SAFETY: pthread_self has no preconditions; pthread_equal compares
+        // two thread ids.
+        let installer = unsafe { libc::pthread_equal(self.thread, libc::pthread_self()) } != 0;
+        if installer && !self.reblock.is_empty() {
+            // Before the old dispositions come back, so a signal arriving
+            // meanwhile waits, as it did before the relay. Cannot fail:
+            // the same signals were unblocked at install.
+            let _ = mask_signals(libc::SIG_BLOCK, &self.reblock);
+        }
+        self.reblock.clear();
+        for (sig, old) in self.saved.drain(..).rev() {
+            // SAFETY: `old` is the disposition sigaction returned for `sig`;
+            // the previous one is not wanted.
+            unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
+        }
+        while IN_HANDLER.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+    }
+
     /// Takes one signal kept aside that is due: caught before the marks
     /// handed out so far, or between the last of them and now. Looks only
     /// when a handler has kept one, or a mark became due, since the last
@@ -847,20 +882,8 @@ pub(crate) fn mask_signals(how: libc::c_int, signals: &[i32]) -> io::Result<Vec<
 
 impl Drop for SignalRelay {
     fn drop(&mut self) {
-        // SAFETY: pthread_self has no preconditions; pthread_equal compares
-        // two thread ids.
-        let installer = unsafe { libc::pthread_equal(self.thread, libc::pthread_self()) } != 0;
-        if installer && !self.reblock.is_empty() {
-            // Before the old dispositions come back, so a signal arriving
-            // meanwhile waits, as it did before the relay. Cannot fail:
-            // the same signals were unblocked at install.
-            let _ = mask_signals(libc::SIG_BLOCK, &self.reblock);
-        }
-        for (sig, old) in self.saved.drain(..).rev() {
-            // SAFETY: `old` is the disposition sigaction returned for `sig`;
-            // the previous one is not wanted.
-            unsafe { libc::sigaction(sig, &old, std::ptr::null_mut()) };
-        }
+        // Nothing to do when `restore_dispositions` did it already.
+        self.restore_dispositions();
         WRITE_FD.store(-1, Ordering::SeqCst);
         // A handler that counted itself before the write end was cleared
         // may still write or keep a signal: wait for it, so nothing of this
@@ -957,6 +980,30 @@ mod tests {
         }
         got.truncate(at);
         got
+    }
+
+    /// The boundary a reader draws before it decides how a run ended
+    /// (M2-19): a signal caught before it is still there to read, the
+    /// dispositions are the ones from before the relay, and a signal after
+    /// it acts as it would have without the relay (SIGWINCH, ignored by
+    /// default, here), never caught and left unread. The drop after it
+    /// changes nothing more. Let `restore_dispositions` leave the handler
+    /// in place and the later SIGWINCH is caught and read.
+    #[test]
+    fn signals_caught_before_the_boundary_are_read_and_none_after_it_is_caught() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let before = disposition(libc::SIGWINCH);
+        let before_usr2 = disposition(libc::SIGUSR2);
+        let mut relay = SignalRelay::install(&[libc::SIGWINCH, libc::SIGUSR2]).unwrap();
+        raise(libc::SIGUSR2);
+        relay.restore_dispositions();
+        assert_eq!(disposition(libc::SIGWINCH), before);
+        assert_eq!(disposition(libc::SIGUSR2), before_usr2);
+        raise(libc::SIGWINCH);
+        assert_eq!(relay.try_next().unwrap(), own(libc::SIGUSR2));
+        assert_eq!(relay.try_next().unwrap(), None, "caught after the boundary");
+        drop(relay);
+        assert_eq!(disposition(libc::SIGWINCH), before);
     }
 
     /// Everything `relay` hands out until the stop, which this thread
