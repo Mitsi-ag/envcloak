@@ -143,9 +143,11 @@ products="$derived/Build/Products/Release"
 
 # 3. The bundle, staged beside the output.
 stage="$(mktemp -d "$out/.stage.XXXXXX")"
+incoming=""
 cleanup() {
   rm -f "$artifacts"
   rm -rf "$stage"
+  if [ -n "$incoming" ]; then rm -rf "$incoming"; fi
 }
 trap cleanup EXIT
 app="$stage/EnvCloak.app"
@@ -192,6 +194,7 @@ if [ "$install" = 1 ]; then
   fi
   mv "$incoming/EnvCloak.app" "$dest/EnvCloak.app"
   rm -rf "$incoming"
+  incoming=""
   echo "build-app: installed $dest/EnvCloak.app (version $version, signed $sign); a running background process was not restarted (task M3-06)" >&2
   app="$dest/EnvCloak.app"
 fi
