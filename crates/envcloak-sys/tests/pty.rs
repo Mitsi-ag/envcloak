@@ -69,6 +69,10 @@ fn main() {
                 restored_while_stopped_and_raw_again_after_sigcont,
             ),
             (
+                "the_settings_read_again_after_a_stop_are_what_comes_back",
+                the_settings_read_again_after_a_stop_are_what_comes_back,
+            ),
+            (
                 "input_typed_and_not_read_is_discarded_on_restore",
                 input_typed_and_not_read_is_discarded_on_restore,
             ),
@@ -115,13 +119,17 @@ fn main() {
 ///   the panic hook and without the guard's drop;
 /// - `stop`: SIGTSTP: restores the terminal and stops; on SIGCONT takes
 ///   raw mode again, prints `RAW-AGAIN`, waits for SIGUSR1 and exits 0;
+/// - `refresh`: as `stop`, but on SIGCONT reads the terminal's settings
+///   again (`TerminalGuard::refresh`) before raw mode, and on SIGUSR1
+///   panics inside an `extern "C"` function, so the process aborts after
+///   the panic hook's restore, without the guard's drop;
 /// - `final`: SIGUSR1, then the panic hook's restore
 ///   (`restore_outer_terminal`), then `TerminalGuard::reenter_raw`, which
 ///   must be refused; prints `REFUSED` and whether the terminal is raw
 ///   after it, and exits 0.
 fn guarded() {
     let scenario = std::env::var(SCENARIO).unwrap();
-    if scenario == "abort" {
+    if scenario == "abort" || scenario == "refresh" {
         // The abort leaves no core file behind (CI routes core files to a
         // directory gate 19 checks).
         envcloak_sys::disable_core_dumps().unwrap();
@@ -129,14 +137,14 @@ fn guarded() {
     }
     let first: &[i32] = match scenario.as_str() {
         "signal" => &[libc::SIGTERM, libc::SIGHUP],
-        "stop" => &[libc::SIGTSTP],
+        "stop" | "refresh" => &[libc::SIGTSTP],
         _ => &[libc::SIGUSR1],
     };
     let relay = SignalRelay::install(first).unwrap();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let result = (|| -> std::io::Result<()> {
-        let guard = TerminalGuard::enter_raw(stdin.as_fd())?;
+        let mut guard = TerminalGuard::enter_raw(stdin.as_fd())?;
         put(stdout.as_fd(), b"RAW\n");
         let Some(Relayed::Signal { number, .. }) = relay.next()? else {
             panic!("no signal");
@@ -169,16 +177,22 @@ fn guarded() {
                     .as_bytes(),
                 );
             }
-            "stop" => {
+            "stop" | "refresh" => {
                 guard.restore()?;
                 // The relay's drop gives SIGTSTP its default action back.
                 drop(relay);
                 // SAFETY: SIGTSTP to this process itself.
                 unsafe { libc::kill(libc::getpid(), libc::SIGTSTP) };
+                if scenario == "refresh" {
+                    guard.refresh()?;
+                }
                 guard.reenter_raw()?;
                 let relay = SignalRelay::install(&[libc::SIGUSR1]).unwrap();
                 put(stdout.as_fd(), b"RAW-AGAIN\n");
                 relay.next()?;
+                if scenario == "refresh" {
+                    boom();
+                }
             }
             other => panic!("unknown scenario {other}"),
         }
@@ -412,6 +426,68 @@ fn restored_while_stopped_and_raw_again_after_sigcont() {
         |s| s.code() == Some(0),
         "stop",
     );
+}
+
+/// The settings read again after a stop (`TerminalGuard::refresh`; the
+/// verifier's review of M2-19, L-09). Changed while the program was
+/// stopped, as the person's `stty` would (the suspend character remapped,
+/// echo off), they are what raw mode is taken from and what the panic
+/// hook's final restore puts back, read by the test and by `stty -g`.
+/// Left raw while it was stopped (as a shell that does not take a stopped
+/// job's terminal back leaves it), they are not kept: the settings from
+/// before come back, never raw ones.
+///
+/// Mutations checked: keep the settings read again in the guard but not in
+/// the panic hook's registration (the abort puts the old ones back), and
+/// keep raw settings (the abort leaves the terminal raw): each fails this.
+fn the_settings_read_again_after_a_stop_are_what_comes_back() {
+    for leave_raw in [false, true] {
+        let what = if leave_raw {
+            "left raw while stopped"
+        } else {
+            "changed while stopped"
+        };
+        let (master, slave, before) = outer();
+        let stty_before = stty_g(slave.as_fd());
+        let (child, mut screen) = start_guarded("refresh", master, &slave);
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: kill on this process's own, unreaped child.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTSTP) }, 0);
+        assert_eq!(
+            wait_child(pid, libc::WSTOPPED),
+            Some((libc::CLD_STOPPED, libc::SIGTSTP)),
+            "{what}: the program did not stop"
+        );
+        let changed = if leave_raw {
+            before.raw()
+        } else {
+            before.with_suspend_char(Some(0x18)).with_echo(false)
+        };
+        changed.apply(slave.as_fd()).unwrap();
+        let stty_changed = stty_g(slave.as_fd());
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        screen.expect("RAW-AGAIN\n", 1, what);
+        assert!(
+            TerminalSettings::read(slave.as_fd()).unwrap().is_raw(),
+            "{what}"
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
+        let (want, stty_want) = if leave_raw {
+            (&before, &stty_before)
+        } else {
+            (&changed, &stty_changed)
+        };
+        assert_restored(
+            child,
+            &slave,
+            want,
+            stty_want,
+            |s| s.signal() == Some(libc::SIGABRT),
+            what,
+        );
+    }
 }
 
 /// Input typed while the terminal is raw and never read is discarded when
