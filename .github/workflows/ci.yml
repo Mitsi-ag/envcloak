@@ -9,13 +9,19 @@ name: CI
 #
 # | Trigger      | Linux                                       | macOS                  |
 # |--------------|---------------------------------------------|------------------------|
-# | Pull request | lint, unit and integration as above; the    | none automatically; a  |
-# |              | path-filtered `gates` job (the story steps  | task on macOS-specific |
-# |              | in crates/envcloak-e2e/tests/m2_story/ with | paths links a green    |
-# |              | the pinned hosts); `agents-e2e` when        | manual run of its gate |
-# |              | envcloak-agents, envcloak-mcp, the agent    | modules on its branch  |
-# |              | harness or integrations/ change             |                        |
-# | Push to main | everything, `agents-e2e` with the stories   | the same               |
+# | Pull request | lint, unit and integration as above; the    | `macos-app` when       |
+# |              | path-filtered `gates` job (the story steps  | ci-paths.py's `app`    |
+# |              | in crates/envcloak-e2e/tests/m2_story/ with | answer says the change |
+# |              | the pinned hosts); `agents-e2e` when        | reaches the app (M3    |
+# |              | envcloak-agents, envcloak-mcp, the agent    | plan §5 rule 8), with  |
+# |              | harness or integrations/ change             | no UI tests; no other  |
+# |              |                                             | macOS job: a task on   |
+# |              |                                             | other macOS paths      |
+# |              |                                             | links a green manual   |
+# |              |                                             | run of its gate        |
+# |              |                                             | modules on its branch  |
+# | Push to main | everything, `agents-e2e` with the stories   | the same, `macos-app`  |
+# |              |                                             | with its UI tests      |
 # | Nightly      | everything, `release-check-models`          | the same               |
 # | Manual       | everything                                  | the same               |
 #
@@ -758,13 +764,14 @@ jobs:
   # macos-app job"). On pull requests only when ci-paths.py's `app` answer
   # says the change reaches the app; on main, nightly and manual runs
   # always. Xcode 26.6 is selected by path and the job fails when the runner
-  # lacks it (plan K3-07). The Swift rules and both script test suites run
-  # before anything is built; then the packages' tests, the app built and
-  # signed ad hoc (sign-check inside), the built app read by two signature
-  # readers and the kernel, an install into a temporary directory, the
-  # hosted tests, and the compiled-sources check over every build. The UI
-  # tests run on main, nightly and manual runs only, until they are shown
-  # stable on pull requests.
+  # lacks it (plan K3-07). The Swift rules and every script test suite
+  # (scripts/macos/tests/, each whole) run before anything is built; then
+  # the packages' tests, the app built and signed ad hoc (sign-check
+  # inside), the built app read by two signature readers and the kernel, an
+  # install into a temporary directory, the hosted tests, and the
+  # compiled-sources check over every build. The UI tests run on main,
+  # nightly and manual runs only, until they are shown stable on pull
+  # requests.
   macos-app:
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.app == 'true'
@@ -789,6 +796,11 @@ jobs:
           sw_vers
           python3 --version
           automationmodetool || true
+      # Every scripts/macos/tests/test_*.py runs here whole (every class;
+      # those that need a built app or build report their skips, and run
+      # again below with it): test_ci_job.py checks this job for each.
+      - name: The job runs every script test
+        run: python3 scripts/macos/tests/test_ci_job.py
       - name: Swift rules and their fixtures
         run: |
           scripts/macos/check-swift.sh
@@ -796,7 +808,11 @@ jobs:
       - name: The project's resolved settings
         run: python3 scripts/macos/tests/test_project_settings.py
       - name: sign-check's fixtures (gate 19 for the bundle)
-        run: python3 scripts/macos/tests/test_sign_check.py SignCheck
+        run: python3 scripts/macos/tests/test_sign_check.py
+      - name: build-app.sh keeps the previous app when a replacement fails
+        run: python3 scripts/macos/tests/test_build_swap.py
+      - name: check-sources.sh --swift's fixtures
+        run: python3 scripts/macos/tests/test_check_sources_swift.py
       - name: EnvCloakKit and EnvCloakDesign tests
         run: |
           for p in EnvCloakKit EnvCloakDesign; do
@@ -829,4 +845,9 @@ jobs:
         run: |
           for dd in "$RUNNER_TEMP"/dd-*; do
             scripts/check-sources.sh --swift "$dd"
+          done
+          # The app's own builds, and each again with a test file added to
+          # the app's compile list, which must fail.
+          for dd in "$RUNNER_TEMP/dd-release" "$RUNNER_TEMP/dd-debug"; do
+            python3 scripts/macos/tests/test_check_sources_swift.py --derived-data "$dd" RealBuild
           done

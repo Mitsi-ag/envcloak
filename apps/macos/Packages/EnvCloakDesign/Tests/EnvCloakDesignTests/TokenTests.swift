@@ -39,11 +39,17 @@ final class TokenTests: XCTestCase {
         return parts.dropFirst().dropLast().map { $0.trimmingCharacters(in: .whitespaces)[...] }
     }
 
+    /// A document the tests read lacks what they check: a failure, never a
+    /// skip (a skipped colour test would leave the run reported as passed).
+    struct DocumentChanged: Error, CustomStringConvertible {
+        var description: String
+    }
+
     /// The "Design tokens" table of docs/APP.md.
     static func table() throws -> [String: Row] {
         let text = try doc("docs/APP.md")
         guard let section = text.range(of: "## Design tokens") else {
-            throw XCTSkip("docs/APP.md has no Design tokens section")
+            throw DocumentChanged(description: "docs/APP.md has no Design tokens section")
         }
         var rows: [String: Row] = [:]
         for line in text[section.upperBound...].split(separator: "\n") {
