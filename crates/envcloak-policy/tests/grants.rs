@@ -2332,3 +2332,99 @@ fn a_statement_whose_proposals_changed_is_a_mismatch() {
     )
     .unwrap();
 }
+
+/// The same request asked again through another layer is a pending
+/// request of its own (Codex, round 3: deduplication by the fingerprint
+/// alone gave a request repeated through `--ref` the id of the one asked
+/// through `[env]`, whose statement advised editing `[env]` while the
+/// answer advised the `--ref`, and following the statement left the
+/// `--ref`'s live binding in place). The layer is not part of the match:
+/// the same request through the same layer is the one pending; one
+/// approval of either covers the other, as the grant match compares
+/// variable, item and field (rule 6); and flood control still sees one
+/// request (a denial of one denies the other as repeated). Each
+/// statement advises its own layer.
+///
+/// Mutation: deduplicate by the fingerprint alone (`same_layers`
+/// answering true): the `--ref` request gets the `[env]` request's id and
+/// this fails.
+#[test]
+fn a_request_through_another_layer_is_pending_on_its_own() {
+    let live_item = provider_item(
+        "stripe/acme-live",
+        "stripe",
+        Classification::Live,
+        None,
+        &["value"],
+    );
+    let test_item = provider_item(
+        "stripe/acme-test",
+        "stripe",
+        Classification::Test,
+        None,
+        &["value"],
+    );
+    let vault = vec![live_item.clone(), test_item];
+    let through = |source: BindingSource| {
+        let mut b = binding_of("STRIPE_SECRET_KEY", &live_item, "value");
+        b.source = source;
+        request(under_agent(), vec![b], &["./emit"])
+    };
+    let dev = BindingSource::Profile {
+        profile: "dev".to_owned(),
+    };
+    let mut s = store();
+    let now = now_at(0);
+    let env = pending_id(&s.decide(through(BindingSource::Env), &now));
+    let by_ref = pending_id(&s.decide(through(BindingSource::Ref), &now));
+    let by_dev = pending_id(&s.decide(through(dev.clone()), &now));
+    assert_ne!(env, by_ref);
+    assert_ne!(env, by_dev);
+    assert_ne!(by_ref, by_dev);
+    // The same layer again: the request already pending.
+    assert_eq!(
+        pending_id(&s.decide(through(BindingSource::Env), &now)),
+        env
+    );
+    assert_eq!(
+        pending_id(&s.decide(through(BindingSource::Ref), &now)),
+        by_ref
+    );
+    assert_eq!(pending_id(&s.decide(through(dev.clone()), &now)), by_dev);
+    // Each statement advises the layer its request came through.
+    for (id, source) in [
+        (env, BindingSource::Env),
+        (by_ref, BindingSource::Ref),
+        (by_dev, dev.clone()),
+    ] {
+        let d = s.pending_descriptor(&id, &now, &vault).unwrap();
+        assert_eq!(d.proposals.len(), 1);
+        assert_eq!(d.proposals[0].source, source, "{id}");
+    }
+    // Flood control sees one request: denying one denies the others as
+    // repeated, whatever layer they come through.
+    s.deny(&env, &now).unwrap();
+    assert_eq!(
+        s.decide(through(BindingSource::Ref), &now_at(1)),
+        Decision::Denied(DenyReason::Repeated)
+    );
+    // The match is not the layer's: one approval of a request through one
+    // layer covers the same bindings through another.
+    let mut s = store();
+    let id = pending_id(&s.decide(through(BindingSource::Ref), &now));
+    let opts = live(&["STRIPE_SECRET_KEY"], Uses::Session);
+    let shown = s.pending_descriptor(&id, &now, &vault).unwrap();
+    s.approve(
+        &id,
+        proof(terminal()),
+        opts.clone(),
+        statement_digest(&shown, &opts),
+        &now,
+        &vault,
+    )
+    .unwrap();
+    assert!(matches!(
+        s.decide(through(BindingSource::Env), &now),
+        Decision::Covered(_)
+    ));
+}

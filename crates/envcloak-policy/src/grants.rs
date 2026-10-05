@@ -546,6 +546,21 @@ fn fingerprint(r: &AccessRequest) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Whether `a` and `b`, of the same fingerprint, took each variable from
+/// the same layer ([`BoundRef::source`]).
+fn same_layers(a: &AccessRequest, b: &AccessRequest) -> bool {
+    fn layers(r: &AccessRequest) -> Vec<(&EnvName, &BindingSource)> {
+        let mut v: Vec<(&EnvName, &BindingSource)> = r
+            .bindings
+            .iter()
+            .map(|b| (&b.binding.env_name, &b.source))
+            .collect();
+        v.sort_by(|x, y| x.0.cmp(y.0));
+        v
+    }
+    layers(a) == layers(b)
+}
+
 impl GrantStore {
     /// An empty store at epoch 0.
     pub fn new() -> Self {
@@ -645,7 +660,8 @@ impl GrantStore {
     /// Decides `r` at `now`: covered, pending or denied. See the module
     /// documentation. A root auto-denied after repeated denials is denied
     /// first, before any grant is looked at. An identical request already
-    /// pending gets the same pending id.
+    /// pending, each binding from the same layer, gets the same pending
+    /// id.
     pub fn decide(&mut self, r: AccessRequest, now: &Now) -> Decision {
         self.expire(now);
         let root = r.subject.root();
@@ -662,7 +678,17 @@ impl GrantStore {
         if self.flood.recently_denied(&fp, now) {
             return Decision::Denied(DenyReason::Repeated);
         }
-        if let Some(p) = self.pending.values().find(|p| p.fingerprint == fp) {
+        // The same request asked again is the request already pending,
+        // when each binding also came from the same layer: the layer is
+        // not part of the match or of flood control, but the statement
+        // and the pending answer both advise from it (a `--ref` in place
+        // of the manifest's `[env]` is another edit), so a request whose
+        // bindings came from other layers is pending on its own.
+        if let Some(p) = self
+            .pending
+            .values()
+            .find(|p| p.fingerprint == fp && same_layers(&p.request, &r))
+        {
             return Decision::Pending(p.id);
         }
         let per_root = self
