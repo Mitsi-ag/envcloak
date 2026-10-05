@@ -232,6 +232,17 @@ jobs:
             # envcloak-e2e; they run on main, nightly and on demand.
             cargo test --workspace --locked --no-fail-fast --exclude envcloak-e2e
           fi
+      # M2-19's job-control gate through the whole of `envcloak run --pty`
+      # (crates/envcloak-e2e/tests/pty_job_control.rs) on pull requests
+      # too: an outer job-control shell on a terminal of the test's own, a
+      # daemon and the fixture project, no agent host. On full runs it is
+      # part of the step above.
+      - name: PTY job control through envcloak run --pty (pull requests)
+        if: env.FULL != 'true'
+        env:
+          RUST_LOG: trace
+          RUST_BACKTRACE: full
+        run: cargo test --locked -p envcloak-e2e --test pty_job_control --no-fail-fast
 
   # The shipped binaries as `cargo build --release` makes them: panic =
   # "abort" and no core file (gate 19), no test hook, a truthful `status`,
