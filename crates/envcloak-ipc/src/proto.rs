@@ -22,17 +22,18 @@ use serde_json::value::RawValue;
 
 use envcloak_policy::{
     ApprovalOptions, Binding, EnvFileNames, EnvFileRef, EnvName, ManifestError, PendingDescriptor,
-    PlainName,
+    PlainName, Proposal,
 };
 
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, BackupBegunView, BackupCommittedView, BackupListView,
-    BackupPutView, BackupResultView, BackupView, CheckView, CreatedView, DecisionView, DeniedView,
-    ExposureSourceView, FileBackupCreatorView, FileBackupView, GrantsView, ImportPlanView,
-    ItemView, ItemsView, LockedView, MarkedView, PendingListView, PendingStateView, RecoveredView,
-    RecoveryConfirmedView, RemovedView, RestoreFileView, RestoreLeaseView, RevokedView,
-    RotatedView, ScanMatchView, StatusView, TargetView, UnlockedView, VerifyView,
+    BackupPutView, BackupResultView, BackupView, CheckView, ClassificationView, CreatedView,
+    DecisionView, DeniedView, ExposureSourceView, FileBackupCreatorView, FileBackupView,
+    GrantsView, ImportPlanView, ItemView, ItemsView, LockedView, MarkedView, PendingListView,
+    PendingStateView, ReclassifiedView, RecoveredView, RecoveryConfirmedView, RemovedView,
+    RestoreFileView, RestoreLeaseView, RevokedView, RotatedView, ScanMatchView, StatusView,
+    TargetView, UnlockedView, VerifyView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -131,9 +132,11 @@ impl Method for RunRequest {
     type Output = RunAnswer;
 }
 
-/// What `run.request` answers: the decision, and with a covered one the
+/// What `run.request` answers: the decision, with a covered one the
 /// values of the run's bindings, one per variable, in the order the daemon
-/// resolved them. Values cross only here, and only to a client that has
+/// resolved them, and with a pending one the test items proposed for its
+/// live bindings (SPEC §10b "Live-key guard": the `approval_required` text
+/// names them). Values cross only here, and only to a client that has
 /// verified the daemon (SPEC §4.4).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,25 +144,53 @@ pub struct RunAnswer {
     pub decision: DecisionView,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<ReleasedValue>,
+    /// With a pending decision only: for each live binding whose
+    /// provider has a test item, that item and the reference that binds
+    /// it (`envcloak_policy::proposals`). The daemon never substitutes it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposals: Vec<Proposal>,
 }
 
 impl RunAnswer {
-    /// A decision that releases nothing.
+    /// A decision that releases nothing and proposes nothing.
     pub fn decided(decision: DecisionView) -> Self {
         RunAnswer {
             decision,
             values: Vec::new(),
+            proposals: Vec::new(),
+        }
+    }
+
+    /// A pending decision for request `request`, with the test items
+    /// proposed for its live bindings.
+    pub fn pending(request: String, proposals: Vec<Proposal>) -> Self {
+        RunAnswer {
+            decision: DecisionView::Pending { request },
+            values: Vec::new(),
+            proposals,
         }
     }
 
     /// Whether the answer has the shape a daemon sends: values only with a
     /// covered decision, each under a variable name and a slug of the
     /// right shape, no variable twice, and no value empty or holding a
-    /// NUL byte. A program answering in the daemon's place could send
-    /// anything (SPEC §1.1); a client uses no answer that fails this.
+    /// NUL byte; proposals only with a pending decision, each of the shape
+    /// [`Proposal::well_formed`] checks, no variable twice. A program
+    /// answering in the daemon's place could send anything (SPEC §1.1); a
+    /// client uses no answer that fails this.
     pub fn well_formed(&self) -> bool {
         if !self.values.is_empty() && !matches!(self.decision, DecisionView::Covered { .. }) {
             return false;
+        }
+        if !self.proposals.is_empty() && !matches!(self.decision, DecisionView::Pending { .. }) {
+            return false;
+        }
+        let mut proposed: Vec<&str> = Vec::with_capacity(self.proposals.len());
+        for x in &self.proposals {
+            if !x.well_formed() || proposed.contains(&x.env_name.as_str()) {
+                return false;
+            }
+            proposed.push(&x.env_name);
         }
         let mut names: Vec<&str> = Vec::with_capacity(self.values.len());
         for v in &self.values {
@@ -660,6 +691,43 @@ pub struct MarkExposedParams {
     /// 1 to [`MAX_MARKED`], each item once.
     pub items: Vec<ExposedItem>,
     /// As [`UnlockParams::claims`], for the audit entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `items.reclassify`: sets an item's classification by hand (SPEC
+/// §10b "Live-key guard", "Writes that need a proof"). Towards `live`
+/// tightens and needs no proof: any client may, and sends no passphrase or
+/// item id. Towards `test` or `unknown` loosens (an agent then gets the
+/// value without a `--live` tick) and is a proof, as [`ItemsRotate`] is,
+/// with the item's id from [`ItemsTarget`]. Either change ends the grants
+/// and pending requests that bind the item; a classification it has
+/// already changes nothing. Secret items only.
+#[derive(Debug)]
+pub struct ItemsReclassify;
+
+impl Method for ItemsReclassify {
+    const NAME: &'static str = "items.reclassify";
+    type Params = ReclassifyParams;
+    type Output = ReclassifiedView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReclassifyParams {
+    pub slug: String,
+    /// The classification the item gets.
+    pub to: ClassificationView,
+    /// Towards `test` or `unknown` only, with the passphrase: the item's
+    /// id from [`TargetView`], so the change is refused when the slug
+    /// names another item by now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    /// Towards `test` or `unknown` only: the proof. Towards `live`, none
+    /// is taken, and one sent is refused (`invalid_params`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<WireSecret>,
+    /// As [`UnlockParams::claims`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<String>,
 }
@@ -1361,7 +1429,7 @@ impl Method for BackupList {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 38] = [
+pub const CLIENT_METHODS: [&str; 39] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1383,6 +1451,7 @@ pub const CLIENT_METHODS: [&str; 38] = [
     ItemsRotate::NAME,
     ItemsRemove::NAME,
     ItemsMarkExposed::NAME,
+    ItemsReclassify::NAME,
     ImportPlan::NAME,
     ImportCommit::NAME,
     ImportVerify::NAME,
@@ -1560,12 +1629,16 @@ pub enum ErrorKind {
     /// A reference to a login's field (SPEC §6.8): `run`, `ref` and every
     /// resolver refuse it; only a sign-in opens a login's fields.
     LoginReference,
+    /// The live-key guard (SPEC §10b): an approval of an agent's or an
+    /// unknown subject's request whose statement leaves a live binding
+    /// unticked creates no grant.
+    LiveNotTicked,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 45] = [
+    pub const ALL: [ErrorKind; 46] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -1610,6 +1683,7 @@ impl ErrorKind {
         ErrorKind::NoSuchLease,
         ErrorKind::BackupFrozen,
         ErrorKind::LoginReference,
+        ErrorKind::LiveNotTicked,
         ErrorKind::Internal,
     ];
 
@@ -1660,6 +1734,7 @@ impl ErrorKind {
             ErrorKind::NoSuchLease => -32049,
             ErrorKind::BackupFrozen => -32050,
             ErrorKind::LoginReference => -32037,
+            ErrorKind::LiveNotTicked => -32038,
             ErrorKind::Internal => -32099,
         }
     }
@@ -1711,6 +1786,7 @@ impl ErrorKind {
             ErrorKind::NoSuchLease => "no_such_lease",
             ErrorKind::BackupFrozen => "backup_frozen",
             ErrorKind::LoginReference => "login_reference",
+            ErrorKind::LiveNotTicked => "live_not_ticked",
             ErrorKind::Internal => "internal",
         }
     }
@@ -1823,6 +1899,11 @@ impl ErrorKind {
             ErrorKind::LoginReference => {
                 "a reference names a login's field, which is never bound to a variable: only a \
                  sign-in opens a login, after the person approves it in EnvCloak"
+            }
+            ErrorKind::LiveNotTicked => {
+                "the request is an agent's or an unknown process's, and the approval leaves a live \
+                 key unticked, so no grant was made: tick each live binding with --live NAME, or \
+                 bind the test key the statement proposes"
             }
             ErrorKind::Internal => "the daemon failed",
         }

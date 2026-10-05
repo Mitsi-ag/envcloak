@@ -15,7 +15,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
-use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, Slug};
+use envcloak_core::crypto::ItemClass;
+use envcloak_core::vault::{
+    Classification, FieldId, FieldKind, FieldMeta, FieldName, ItemDetails, ItemId, ItemMeta, Slug,
+};
 use envcloak_ipc::proto::{ErrorKind, RpcError, RunAnswer};
 use envcloak_ipc::view::DecisionView;
 use envcloak_ipc::wait::{
@@ -431,6 +434,7 @@ fn the_driver_returns_the_deciding_answer_and_tells_each_notice_once() {
             allow_short: false,
             value: WireSecret::new(value),
         }],
+        proposals: Vec::new(),
     };
     let mut t = Scripted::new(
         [
@@ -493,6 +497,7 @@ fn covered_with_a_value() -> RunAnswer {
                 b"a value of the test, not a key",
             )),
         }],
+        proposals: Vec::new(),
     }
 }
 
@@ -1183,6 +1188,34 @@ fn person() -> SubjectEvidence {
     .unwrap()
 }
 
+/// The vault's metadata for `item`, as [`request_of`] binds it: one test
+/// secret with one field.
+fn metas(item: (ItemId, FieldId)) -> Vec<ItemMeta> {
+    vec![ItemMeta {
+        id: item.0,
+        class: ItemClass::Secret,
+        slug: Slug::new("openai/acme-web").unwrap(),
+        details: ItemDetails {
+            classification: Classification::Test,
+            ..ItemDetails::default()
+        },
+        created_at: 0,
+        updated_at: 0,
+        fields: vec![FieldMeta {
+            id: item.1,
+            name: FieldName::new("value").unwrap(),
+            kind: FieldKind::Value,
+            prior_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        }],
+        classification_changed_at: None,
+        exposure: None,
+        rotate_recommended: false,
+        login: None,
+    }]
+}
+
 fn request_of(n: i32, item: (ItemId, FieldId)) -> AccessRequest {
     AccessRequest {
         subject: under_agent(100 + n),
@@ -1272,15 +1305,18 @@ fn five_waiters(noisy: bool) -> Vec<Seen> {
                 ttl_secs: 600,
                 live: Vec::new(),
             };
-            let Some(d) = store.pending_descriptor(&id, &now) else {
+            let vault = metas(item);
+            let Some(d) = store.pending_descriptor(&id, &now, &vault) else {
                 continue;
             };
-            let digest = statement_digest(d, &opts);
+            let digest = statement_digest(&d, &opts);
             let proof = ApprovalProof {
                 approver: person(),
                 kind: ProofKind::Passphrase,
             };
-            store.approve(&id, proof, opts, digest, &now).unwrap();
+            store
+                .approve(&id, proof, opts, digest, &now, &vault)
+                .unwrap();
         }
         if noisy && t < ms(5000) && t.as_millis() % 10 == 0 {
             let _ = store.poll(&nobody, &noise, &now);

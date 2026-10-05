@@ -982,6 +982,21 @@ pub struct RotatedView {
     pub grants_ended: u64,
 }
 
+/// `items.reclassify`: the item's classification as it is now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReclassifiedView {
+    pub slug: String,
+    /// The item's classification now.
+    pub classification: ClassificationView,
+    /// Its classification before, when this changed it; `None` when it
+    /// had the classification already and nothing changed.
+    pub reclassified_from: Option<ClassificationView>,
+    /// Grants that bound it and ended (SPEC §10b: a reclassification ends
+    /// the grants and pending requests that bind the item).
+    pub grants_ended: u64,
+}
+
 /// `items.remove`: the item is gone from the vault.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -62,6 +62,7 @@ use crate::proto::{
     RecoveryConfirm, RecoveryConfirmParams, RestoredFiles, VaultRecover, VerifyParams,
 };
 use crate::proto::{ItemsMarkExposed, MarkExposedParams, ScanMatch, ScanMatchParams};
+use crate::proto::{ItemsReclassify, ReclassifyParams};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
     ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
@@ -75,6 +76,7 @@ use crate::view::{
     BackupView, FileBackupView, ImportPlanView, PendingListView, RecoveredView,
     RecoveryConfirmedView, VerifyView,
 };
+use crate::view::{ClassificationView, ReclassifiedView};
 use crate::view::{MarkedView, ScanMatchView};
 use crate::wire_secret::WireSecret;
 
@@ -670,6 +672,45 @@ impl Client {
             slug: target.item.slug.clone(),
             item: target.item.id.clone(),
             passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `items.reclassify` of `slug` to live: tightening, with no proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_reclassify_live(
+        &mut self,
+        slug: &str,
+        claims: &[String],
+    ) -> Result<ReclassifiedView, ClientError> {
+        self.call::<ItemsReclassify>(&ReclassifyParams {
+            slug: slug.to_owned(),
+            to: ClassificationView::Live,
+            item: None,
+            passphrase: None,
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `items.reclassify` of `target`'s item to `to` (`test` or
+    /// `unknown`), with the passphrase as the proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn items_reclassify(
+        &mut self,
+        target: &TargetView,
+        to: ClassificationView,
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<ReclassifiedView, ClientError> {
+        self.call::<ItemsReclassify>(&ReclassifyParams {
+            slug: target.item.slug.clone(),
+            to,
+            item: Some(target.item.id.clone()),
+            passphrase: Some(WireSecret::new(passphrase)),
             claims: claims.to_vec(),
         })
     }
