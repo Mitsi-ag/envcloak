@@ -14,6 +14,15 @@
 # for the person's trust in `/hooks`, in the probe home only; a person's
 # own hooks still read `hooks_untrusted`, since Codex records their trust
 # where EnvCloak cannot read it.
+#
+# The transcript probe runs the hosts as every probe does, `claude -p` and
+# `codex exec`, neither of which writes the prompt history their
+# interactive sessions keep (`history.jsonl`; measured on both pins,
+# docs/AGENTS.md): what it found is for the stores those modes write, and
+# the interactive history is a case not run here (`interactive_history
+# skipped`), which M2-26's interactive variant covers. Codex's `probe=passed`
+# says that `codex exec` keeps a blocked prompt in none of its stores, not
+# that its interactive sessions keep it out of their history.
 
 [[host]]
 id = "claude-code"
@@ -29,7 +38,7 @@ version = "2.1.280"
 # their own case).
 [host.macos]
 prompt_to_model = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
-transcript = "unsupported (persists_blocked_prompt; probe=failed)"
+transcript = "unsupported (persists_blocked_prompt; probe=failed, interactive_history skipped)"
 file_read = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
 shell = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
 mcp = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
@@ -42,7 +51,7 @@ envcloak_server = "needs_host_approval; outside_host_sandbox (probe=passed, sent
 # through its shell's run witness.
 [host.linux]
 prompt_to_model = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
-transcript = "unsupported (persists_blocked_prompt; probe=failed)"
+transcript = "unsupported (persists_blocked_prompt; probe=failed, interactive_history skipped)"
 file_read = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
 shell = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
 mcp = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
@@ -55,7 +64,7 @@ version = "0.159.2"
 
 [host.macos]
 prompt_to_model = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
-transcript = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+transcript = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed, interactive_history skipped)"
 file_read = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
 shell = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
 mcp = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
@@ -64,7 +73,7 @@ envcloak_server = "needs_host_approval; outside_host_sandbox (probe=passed, sent
 
 [host.linux]
 prompt_to_model = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
-transcript = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
+transcript = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed, interactive_history skipped)"
 file_read = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"
 shell = "unsupported (sandbox_blocks_socket; probe=passed)"
 mcp = "degraded (fails_open_on_timeout, hooks_untrusted; probe=passed)"

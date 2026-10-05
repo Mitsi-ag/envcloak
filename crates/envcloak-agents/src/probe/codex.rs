@@ -110,6 +110,42 @@ pub fn resume_args(
     out
 }
 
+/// The `-c` settings among `args` (`-c key=value`, `--config key=value`,
+/// `--config=key=value`), each as its key and its value's text.
+pub fn settings(args: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let setting = match a.as_str() {
+            "-c" | "--config" => it.next().map(String::as_str),
+            other => other.strip_prefix("--config="),
+        };
+        if let Some((k, v)) = setting.and_then(|s| s.split_once('=')) {
+            out.push((k.trim().to_owned(), v.trim().to_owned()));
+        }
+    }
+    out
+}
+
+/// The folder a `-c` setting's value names (Codex reads it as TOML, and as
+/// a plain string when it is not): an absolute path, or `~/` from `home`;
+/// `None` for anything else (a relative path, read from where Codex was
+/// started, is not taken as known).
+pub fn setting_path(value: &str, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let text = match value.parse::<toml_edit::Value>() {
+        Ok(toml_edit::Value::String(s)) => s.value().clone(),
+        Ok(_) => return None,
+        Err(_) => value.to_owned(),
+    };
+    match text.strip_prefix("~/") {
+        Some(rest) => Some(home.join(rest)),
+        None => {
+            let p = std::path::PathBuf::from(&text);
+            p.is_absolute().then_some(p)
+        }
+    }
+}
+
 /// A step that calls `tool` of MCP server `server` (Codex offers a
 /// server's tools as the Responses namespace `mcp__<server>`).
 pub fn mcp_step(server: &str, tool: &str, input: Value) -> Value {

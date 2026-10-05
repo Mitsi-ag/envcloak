@@ -723,7 +723,9 @@ impl Prober<'_, '_> {
         // Codex names no hook: its report counts only where EnvCloak's is
         // the only prompt hook (the class of the verifier's round-2
         // finding, a refusal taken as EnvCloak's without its provenance).
-        let ours = claude || self.config.as_ref().is_some_and(|c| !c.foreign_prompt_hook);
+        let ours = claude
+            || (self.config.as_ref().is_some_and(|c| !c.foreign_prompt_hook)
+                && !flags_add_rules_or_hooks(self.host.host, &self.flags.args));
         let token_forms = forms(token.as_bytes());
         let kept_out = rb.usable()
             && !seen(&ra.requests, &token_forms)
@@ -771,41 +773,12 @@ impl Prober<'_, '_> {
             ],
         );
         let blocked = prompt.outcome == Outcome::Passed;
-        let swept = controls::sweep(&self.stores(), &[&ctl_forms, &token_forms]);
+        let (stores, known) = self.stores();
+        let swept = controls::sweep(&stores, &[&ctl_forms, &token_forms]);
         let in_session = found
             .as_ref()
             .is_some_and(|(file, _)| swept.holders[0].iter().any(|h| h == file));
-        let found_token = swept.found[1];
-        let mut transcript = surface(
-            Surface::Transcript,
-            vec![
-                check(
-                    "the prompt was blocked",
-                    true,
-                    blocked,
-                    "the prompt probe did not pass",
-                ),
-                check(
-                    "the host's stores were read whole",
-                    true,
-                    swept.complete,
-                    "a store could not be read whole",
-                ),
-                check(
-                    "the control prompt is in its session's store",
-                    true,
-                    in_session,
-                    "the sweep did not find the control in its session's file",
-                ),
-                check(
-                    "the blocked prompt is in none of them",
-                    false,
-                    !found_token,
-                    "the blocked prompt is kept in the host's stores",
-                ),
-            ],
-        );
-        transcript.persisted = blocked && found_token;
+        let transcript = transcript(blocked, known, swept.complete, in_session, swept.found[1]);
         (prompt, transcript)
     }
 
@@ -845,22 +818,36 @@ impl Prober<'_, '_> {
         hits.next().is_none().then_some(first)
     }
 
-    /// The host's stores for a pasted or printed value (D-15), in the
-    /// probe home.
-    fn stores(&self) -> Vec<(PathBuf, Option<String>)> {
-        let Some(l) = self.locations() else {
-            return Vec::new();
+    /// The host's stores for a pasted or printed value (D-15), as the
+    /// probe context names them (Codex's round-3 review: they were taken
+    /// from the catalog and the user's `config.toml` alone, so a store
+    /// another layer moved was never swept and the sweep still read
+    /// whole): wherever the probe home's environment and every layer of
+    /// the host's settings place them ([`coverage::Context::stores`]), and
+    /// where a `-c` setting of the home's flags moves Codex's. And whether
+    /// those are all the stores there are: not when the context could not
+    /// be read, a layer that can move one cannot be read, or a setting
+    /// moves one where this cannot tell.
+    fn stores(&self) -> (Vec<(PathBuf, Option<String>)>, bool) {
+        let Some(c) = self.config.as_ref() else {
+            return (Vec::new(), false);
         };
-        let label = if self.claude() {
-            "Claude Code"
-        } else {
-            "Codex"
-        };
-        l.transcript_sources()
-            .into_iter()
-            .filter(|s| s.label.starts_with(label))
-            .map(|s| (s.path, s.names))
-            .collect()
+        let mut roots = c.context.sweep_roots();
+        let mut known = c.context.stores_known;
+        if !self.claude() {
+            for (key, value) in codex::settings(&self.flags.args) {
+                let names = match key.as_str() {
+                    "log_dir" => None,
+                    "sqlite_home" => Some(".sqlite".to_owned()),
+                    _ => continue,
+                };
+                match codex::setting_path(&value, &self.home.home) {
+                    Some(dir) => roots.push((dir, names)),
+                    None => known = false,
+                }
+            }
+        }
+        (roots, known)
     }
 
     /// Whether a refusal in the host's own words, of a call EnvCloak's host
@@ -872,10 +859,11 @@ impl Prober<'_, '_> {
     /// rule ([`controls::codex_rule_refused`]).
     fn rule_is_ours(&self) -> bool {
         !self.claude()
-            || self
+            || (self
                 .config
                 .as_ref()
                 .is_some_and(|c| c.read_deny && !c.foreign_read_deny)
+                && !flags_add_rules_or_hooks(self.host.host, &self.flags.args))
     }
 
     /// File read: a control read; the hook's case, a read of a `.env`
@@ -1296,6 +1284,85 @@ impl Prober<'_, '_> {
     }
 }
 
+/// Whether the probe home's flags can add a permission rule or a hook
+/// the configuration read for the directory does not show (the class of
+/// the verifier's round-3 finding, a refusal or a block counted as
+/// EnvCloak's while another source could give it): Claude Code's
+/// `--settings` (a file or JSON, which can hold both) and `--plugin-dir`;
+/// Codex's `-c` settings of `hooks` or `plugins`. A refusal or a block in
+/// the host's own words is then not known to be EnvCloak's.
+fn flags_add_rules_or_hooks(host: Host, args: &[String]) -> bool {
+    match host {
+        Host::ClaudeCode => args.iter().any(|a| {
+            ["--settings", "--plugin-dir"]
+                .iter()
+                .any(|f| a == f || a.starts_with(&format!("{f}=")))
+        }),
+        Host::Codex => codex::settings(args).iter().any(|(k, _)| {
+            let k = k.trim_matches('"');
+            ["hooks", "plugins"]
+                .iter()
+                .any(|t| k == *t || k.starts_with(&format!("{t}.")))
+        }),
+    }
+}
+
+/// The transcript surface from what the prompt probe and the sweep found:
+/// `blocked`, the prompt probe passed; `known`, every store the host may
+/// keep a prompt in was swept; `complete`, each was read whole;
+/// `in_session`, the control was found in its session's file; `kept`, the
+/// blocked token was found in a store. Its absence counts only after
+/// every control passed, and a token kept after a block is
+/// `persists_blocked_prompt`. The prompt history only the hosts'
+/// interactive sessions write is not what this swept: its case is not run
+/// (M2-26's interactive variant), and said so with the surface.
+fn transcript(
+    blocked: bool,
+    known: bool,
+    complete: bool,
+    in_session: bool,
+    kept: bool,
+) -> SurfaceProbe {
+    let mut out = surface(
+        Surface::Transcript,
+        vec![
+            check(
+                "the prompt was blocked",
+                true,
+                blocked,
+                "the prompt probe did not pass",
+            ),
+            check(
+                "every store the host may keep a prompt in is known",
+                true,
+                known,
+                "a setting that can move one of the host's stores could not be read",
+            ),
+            check(
+                "the host's stores were read whole",
+                true,
+                complete,
+                "a store could not be read whole",
+            ),
+            check(
+                "the control prompt is in its session's store",
+                true,
+                in_session,
+                "the sweep did not find the control in its session's file",
+            ),
+            check(
+                "the blocked prompt is in none of them",
+                false,
+                !kept,
+                "the blocked prompt is kept in the host's stores",
+            ),
+        ],
+    );
+    out.persisted = blocked && kept;
+    out.skipped = vec![Case::InteractiveHistory];
+    out
+}
+
 /// The rule's case of a probe ([`Prober::file_read`]): the call of step
 /// `n - 1`, one EnvCloak's own host rule covers, is refused, by that rule
 /// (the host's refusal under it, named from a fixed list:
@@ -1605,6 +1672,120 @@ mod tests {
             false,
         );
         assert!(c.passed, "{c:?}");
+    }
+
+    /// The transcript passes only with every control: the prompt blocked,
+    /// every store known (Codex's round-3 review: a store a layer moved
+    /// was never swept, and the probe passed), each read whole, the control
+    /// in its session's file; a token kept after a block is
+    /// `persists_blocked_prompt`; the interactive history's case is never
+    /// passed, only named.
+    ///
+    /// Mutation checked: the `known` check dropped from `transcript`: the
+    /// stores not all known pass and this fails.
+    #[test]
+    fn a_transcript_pass_needs_every_store_known_and_read() {
+        let pass = transcript(true, true, true, true, false);
+        assert_eq!(pass.outcome, Outcome::Passed);
+        assert_eq!(pass.skipped, [Case::InteractiveHistory]);
+        assert!(!pass.persisted);
+        for (name, t) in [
+            ("not blocked", transcript(false, true, true, true, false)),
+            (
+                "a store not known",
+                transcript(true, false, true, true, false),
+            ),
+            (
+                "a store not read whole",
+                transcript(true, true, false, true, false),
+            ),
+            ("no control", transcript(true, true, true, false, false)),
+        ] {
+            assert_eq!(t.outcome, Outcome::Failed, "{name}");
+            assert_eq!(t.skipped, [Case::InteractiveHistory], "{name}");
+            assert_eq!(t.checks.iter().filter(|c| !c.passed).count(), 1, "{name}");
+        }
+        let kept = transcript(true, true, true, true, true);
+        assert_eq!(kept.outcome, Outcome::Failed);
+        assert!(kept.persisted);
+        assert!(!transcript(false, true, true, true, true).persisted);
+    }
+
+    /// The home's flags that can add a rule or a hook the configuration
+    /// read does not show make a refusal or a block in the host's words
+    /// not EnvCloak's; other flags (the trust bypass CI pins) do not.
+    ///
+    /// Mutation checked: `flags_add_rules_or_hooks` answering false: the
+    /// `--settings` and `-c hooks` cases fail and this fails.
+    #[test]
+    fn flags_that_add_rules_or_hooks_are_told_apart() {
+        let v = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
+        for (host, args, adds) in [
+            (Host::ClaudeCode, v(&["--settings", "/x.json"]), true),
+            (Host::ClaudeCode, v(&["--settings={}"]), true),
+            (Host::ClaudeCode, v(&["--plugin-dir", "/p"]), true),
+            (Host::ClaudeCode, v(&["--model", "m"]), false),
+            (Host::Codex, v(&["-c", "hooks.UserPromptSubmit=[]"]), true),
+            (
+                Host::Codex,
+                v(&["--config", "plugins.\"x@y\".enabled=true"]),
+                true,
+            ),
+            (Host::Codex, v(&["--dangerously-bypass-hook-trust"]), false),
+            (Host::Codex, v(&["-c", "model=\"m\""]), false),
+        ] {
+            assert_eq!(
+                flags_add_rules_or_hooks(host, &args),
+                adds,
+                "{host:?} {args:?}"
+            );
+        }
+    }
+
+    /// The `-c` settings of a home's flags that move Codex's stores are
+    /// read as Codex reads them; a move this cannot place is not taken as
+    /// known.
+    #[test]
+    fn codex_settings_in_flags_are_read() {
+        let args: Vec<String> = [
+            "--dangerously-bypass-hook-trust",
+            "-c",
+            "log_dir=\"/var/x/logs\"",
+            "--config",
+            "sqlite_home = '~/state'",
+            "--config=log_dir=/plain/path",
+            "-c",
+            "model=\"m\"",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let got = codex::settings(&args);
+        assert_eq!(
+            got,
+            [
+                ("log_dir".to_owned(), "\"/var/x/logs\"".to_owned()),
+                ("sqlite_home".to_owned(), "'~/state'".to_owned()),
+                ("log_dir".to_owned(), "/plain/path".to_owned()),
+                ("model".to_owned(), "\"m\"".to_owned()),
+            ]
+        );
+        let home = Path::new("/h");
+        assert_eq!(
+            codex::setting_path("\"/var/x/logs\"", home),
+            Some(PathBuf::from("/var/x/logs"))
+        );
+        assert_eq!(
+            codex::setting_path("'~/state'", home),
+            Some(PathBuf::from("/h/state"))
+        );
+        assert_eq!(
+            codex::setting_path("/plain/path", home),
+            Some(PathBuf::from("/plain/path"))
+        );
+        for unknown in ["\"logs\"", "3", "[\"/x\"]", "relative/path"] {
+            assert_eq!(codex::setting_path(unknown, home), None, "{unknown}");
+        }
     }
 
     /// The prompt probe's witness texts are what the pinned hosts print

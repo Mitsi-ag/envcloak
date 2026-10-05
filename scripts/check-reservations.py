@@ -307,7 +307,8 @@ SECTIONS = {
 }
 HEADING = re.compile(r"^## (.*?)[ \t]*$", re.M)
 STATUSES = ("reserved", "landed", "reuse")
-COVERAGE_KINDS = ("state", "reason", "outcome", "availability")
+COVERAGE_KINDS = ("surface", "state", "reason", "outcome", "availability", "sentinel", "case", "probed",
+                  "identity")
 
 # The tables whose tokens the person reads as `envcloak: <token>`: one
 # namespace, so one name never means two things there (R-7).
@@ -1260,16 +1261,20 @@ def all_methods(root):
 
 POLICIES_RS = "crates/envcloak-core/src/vault/policies.rs"
 COVERAGE_RS = "crates/envcloak-agents/src/coverage.rs"
-# The enums whose `fn name` arms are the coverage tokens (M2-09).
-COVERAGE_ENUMS = ("State", "Reason", "Outcome", "Availability")
+# The enums whose `fn name` arms are the coverage tokens (M2-09): every
+# token `agents status` prints, in its report and in `--json`.
+COVERAGE_ENUMS = ("Surface", "State", "Reason", "Outcome", "Availability", "Sentinel", "Case",
+                  "ProbeStatus", "Identity")
 
 
 def code_coverage(root):
     """The coverage tokens: every `fn name` arm of the coverage module's
-    state, reason, outcome and availability enums, each enum read whole (a
-    variant without an arm the reader can read is an error). A token two
-    enums give (`needs_host_approval`, a reason and an availability) is
-    one entry: the coverage tokens are one namespace."""
+    surface, state, reason, outcome, availability, sentinel, case, probe
+    status and identity enums, each enum read whole (a variant without an arm the
+    reader can read is an error). A token two enums give
+    (`needs_host_approval`, a reason and an availability; `not_probed`, a
+    reason and a probe status) is one entry: the coverage tokens are one
+    namespace."""
     src = Source(COVERAGE_RS, read(root, COVERAGE_RS))
     out = {}
     for enum in COVERAGE_ENUMS:

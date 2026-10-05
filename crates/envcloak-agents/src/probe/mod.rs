@@ -18,11 +18,14 @@
 //!   in any form, anywhere the model recorded; and the session resumed
 //!   again with a second marker, which must reach the model with the
 //!   control's turn.
-//! - **transcript**: the host's stores (`Locations::transcript_sources`)
-//!   are swept after those runs, every file read whole and no link out of
-//!   them; the control's marker must be found by the sweep in its
-//!   session's file, and only then does the absence of the blocked token
-//!   count. A blocked token found there is `persists_blocked_prompt`.
+//! - **transcript**: the host's stores, where its environment and every
+//!   layer of its settings place them (`coverage::Context::stores`), are
+//!   swept after those runs, every file read whole and no link out of
+//!   them, and every store known; the control's marker must be found by
+//!   the sweep in its session's file, and only then does the absence of
+//!   the blocked token count. A blocked token found there is
+//!   `persists_blocked_prompt`. The prompt history only interactive
+//!   sessions write is a case not run (`interactive_history skipped`).
 //! - **file read** and **shell**: the host's own permission layer is opened
 //!   for the probe (Claude Code `--permission-mode default` with
 //!   `--allowedTools Bash,Read`; Codex `exec` with approval policy `never`
