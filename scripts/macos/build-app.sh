@@ -22,6 +22,12 @@
 #    background process when its version changed is task M3-06's; this
 #    script says that it did not.
 #
+# A replacement (steps 5 and 6) moves the previous app aside, then the new
+# one into place. If the second move fails, or the script stops between the
+# two (an error, SIGTERM, SIGHUP), the exit cleanup moves the previous app
+# back; if it cannot, it keeps the directory holding it and says where. It
+# never deletes the last working app (scripts/macos/tests/test_build_swap.py).
+#
 # Usage: scripts/macos/build-app.sh [--sign adhoc|development|ci] [--install]
 #            [--install-dir DIR] [--out DIR] [--derived-data DIR]
 #   --sign adhoc        tier 1: ad hoc, any Mac (the default)
@@ -144,12 +150,43 @@ products="$derived/Build/Products/Release"
 # 3. The bundle, staged beside the output.
 stage="$(mktemp -d "$out/.stage.XXXXXX")"
 incoming=""
+# Set by replace_app while a replacement is between its two moves.
+pending_backup=""
+pending_destination=""
 cleanup() {
+  local status=$?
+  local keep=""
+  if [ -n "$pending_backup" ] && { [ -e "$pending_backup" ] || [ -L "$pending_backup" ]; }; then
+    if [ ! -e "$pending_destination" ] && [ ! -L "$pending_destination" ] && mv "$pending_backup" "$pending_destination"; then
+      echo "build-app: the replacement did not finish; the previous app is back at $pending_destination" >&2
+    else
+      keep="$(dirname "$pending_backup")"
+      echo "build-app: the replacement did not finish; the previous app is kept at $pending_backup" >&2
+    fi
+  fi
   rm -f "$artifacts"
-  rm -rf "$stage"
-  if [ -n "$incoming" ]; then rm -rf "$incoming"; fi
+  if [ "$keep" != "$stage" ]; then rm -rf "$stage"; fi
+  if [ -n "$incoming" ] && [ "$keep" != "$incoming" ]; then rm -rf "$incoming"; fi
+  return "$status"
 }
 trap cleanup EXIT
+
+# replace_app NEW DESTINATION BACKUP: the previous app at DESTINATION (if
+# any) moves to BACKUP, then NEW to DESTINATION. The backup is recorded
+# before anything moves, so the exit cleanup can put it back after a failure
+# or a stop at any point between the moves; BACKUP's directory is removed
+# by the cleanup only once the new app is in place.
+replace_app() {
+  local candidate="$1" destination="$2" backup="$3"
+  pending_backup="$backup"
+  pending_destination="$destination"
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    mv "$destination" "$backup" || return
+  fi
+  mv "$candidate" "$destination" || return
+  pending_backup=""
+  pending_destination=""
+}
 app="$stage/EnvCloak.app"
 ditto "$products/EnvCloak.app" "$app"
 mkdir -p "$app/Contents/Helpers"
@@ -176,10 +213,7 @@ bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString'
 helper_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Helpers/EnvCloakAgent.app/Contents/Info.plist")"
 [ "$helper_version" = "$version" ] || die "the helper says version $helper_version, the CLI $version"
 
-if [ -e "$out/EnvCloak.app" ]; then
-  mv "$out/EnvCloak.app" "$stage/previous.app"
-fi
-mv "$app" "$out/EnvCloak.app"
+replace_app "$app" "$out/EnvCloak.app" "$stage/previous.app"
 app="$out/EnvCloak.app"
 
 # 6. Install.
@@ -189,10 +223,7 @@ if [ "$install" = 1 ]; then
   incoming="$(mktemp -d "$dest/.EnvCloak.install.XXXXXX")"
   ditto "$app" "$incoming/EnvCloak.app"
   "$here/sign-check.sh" "$incoming/EnvCloak.app"
-  if [ -e "$dest/EnvCloak.app" ]; then
-    mv "$dest/EnvCloak.app" "$incoming/previous.app"
-  fi
-  mv "$incoming/EnvCloak.app" "$dest/EnvCloak.app"
+  replace_app "$incoming/EnvCloak.app" "$dest/EnvCloak.app" "$incoming/previous.app"
   rm -rf "$incoming"
   incoming=""
   echo "build-app: installed $dest/EnvCloak.app (version $version, signed $sign); a running background process was not restarted (task M3-06)" >&2
