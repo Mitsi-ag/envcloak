@@ -24,9 +24,18 @@
 #
 # A replacement (steps 5 and 6) moves the previous app aside, then the new
 # one into place. If the second move fails, or the script stops between the
-# two (an error, SIGTERM, SIGHUP), the exit cleanup moves the previous app
-# back; if it cannot, it keeps the directory holding it and says where. It
-# never deletes the last working app (scripts/macos/tests/test_build_swap.py).
+# two (an error, or SIGHUP, SIGINT, SIGQUIT or SIGTERM), the exit cleanup
+# moves the previous app back; if it cannot, it keeps the directory holding
+# it and says where. It never deletes the last working app.
+#
+# However it stops, it leaves no step running and no directory of its own
+# behind (the staging directories beside the output and the installed app,
+# and its work directory): see "Stopping" below. A signal sent to the script
+# alone takes effect when the step in progress ends; one sent to its process
+# group (Ctrl-C, Ctrl-\, a closed terminal) ends that step too.
+# scripts/macos/tests/test_build_swap.py runs this script with stand-ins for
+# cargo, xcodebuild, codesign, sign-check.sh and mv, and checks each of
+# these.
 #
 # Usage: scripts/macos/build-app.sh [--sign adhoc|development|ci] [--install]
 #            [--install-dir DIR] [--out DIR] [--derived-data DIR]
@@ -94,25 +103,130 @@ case "$sign" in
   *) echo "build-app: --sign takes adhoc, development or ci, not '$sign'" >&2; usage ;;
 esac
 
+# Stopping. Every way this script stops (an error, a failed check, a
+# signal) goes through `cleanup`, and nothing it makes can be left behind.
+# Measured on this script with only an EXIT trap, under bash 3.2
+# (/bin/bash) and 5.3: SIGQUIT between the two moves of a replacement ended
+# bash 3.2 without the cleanup (the previous app stayed in the staging
+# directory, nothing at the destination); SIGINT sent to the script alone
+# was ignored and the new app went in; SIGTERM ran the cleanup at once while
+# the step in progress ran on, orphaned; and once standard error was
+# closed, the cleanup's first message ended it part way (bash 5.3 died of
+# SIGPIPE, bash 3.2's failed write ended the trap under `set -e`), leaving
+# its directories. So:
+# - HUP, INT, QUIT and TERM are trapped. bash runs a trap when the
+#   foreground command in progress ends, so no step is left running, and
+#   the handler leaves through the cleanup. Once the traps are set, no
+#   program runs inside a command substitution, where bash runs a trap
+#   without waiting for it (measured): programs write to files in the work
+#   directory instead.
+# - SIGPIPE is ignored, so a write to a closed standard error fails and
+#   `set -e` takes that path like any other error; the cleanup runs with
+#   `set +e`, so a message it cannot write stops nothing.
+# - Each directory the script makes is named `<prefix>.<pid>.<random>`,
+#   and the cleanup removes every such name of this process, so one made in
+#   the instant before its name reached a variable is removed too.
+# - The cleanup ignores the four signals while it runs, and the commands it
+#   starts inherit that, so a second signal cannot cut a restore short.
+# After the cleanup, a script stopped by HUP, INT or TERM ends by that
+# signal (a calling shell sees it); by QUIT, with status 131 and no core.
+out_prefix=""
+install_prefix=""
+work_prefix="${TMPDIR:-/tmp}"
+work_prefix="${work_prefix%/}/ec-build-app"
+work=""
+stage=""
+incoming=""
+# Set by replace_app while a replacement is between its two moves.
+pending_backup=""
+pending_destination=""
+stopped_by=""
+cleanup() {
+  local status=$?
+  set +e
+  trap '' HUP INT QUIT TERM
+  local keep="" dir prefix
+  if [ -n "$pending_backup" ] && { [ -e "$pending_backup" ] || [ -L "$pending_backup" ]; }; then
+    if [ ! -e "$pending_destination" ] && [ ! -L "$pending_destination" ] && mv "$pending_backup" "$pending_destination"; then
+      echo "build-app: the replacement did not finish; the previous app is back at $pending_destination" >&2
+    else
+      keep="${pending_backup%/*}"
+      echo "build-app: the replacement did not finish; the previous app is kept at $pending_backup" >&2
+    fi
+  fi
+  for prefix in "$work_prefix" "$out_prefix" "$install_prefix"; do
+    [ -n "$prefix" ] || continue
+    for dir in "$prefix".$$.*; do
+      if { [ -e "$dir" ] || [ -L "$dir" ]; } && [ "$dir" != "$keep" ]; then
+        rm -rf "$dir"
+      fi
+    done
+  done
+  if [ -n "$stopped_by" ]; then
+    echo "build-app: stopped by SIG$stopped_by" >&2
+    if [ "$stopped_by" != QUIT ]; then
+      trap - EXIT "$stopped_by"
+      kill -s "$stopped_by" "$$"
+    fi
+  fi
+  exit "$status"
+}
+stop() {
+  stopped_by="$1"
+  exit $((128 + $2))
+}
+trap cleanup EXIT
+trap 'stop HUP 1' HUP
+trap 'stop INT 2' INT
+trap 'stop QUIT 3' QUIT
+trap 'stop TERM 15' TERM
+trap '' PIPE
+
+# make_dir VAR PREFIX: makes the directory PREFIX.<pid>.<random> (0700; mkdir
+# refuses a name that exists, a symbolic link included) and sets VAR to it.
+make_dir() {
+  local path tries=0
+  while :; do
+    path="$2.$$.$RANDOM$RANDOM"
+    if mkdir -m 0700 "$path" 2>/dev/null; then
+      eval "$1=\$path"
+      return 0
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -lt 20 ] || die "cannot make a directory named $2.$$.*"
+  done
+}
+
+# first_line VAR FILE: VAR is FILE's first line.
+first_line() {
+  local line=""
+  IFS= read -r line <"$2" || [ -n "$line" ] || die "$2 is empty"
+  eval "$1=\$line"
+}
+
 mkdir -p "$out" "$derived"
 out="$(cd "$out" && pwd -P)"
 derived="$(cd "$derived" && pwd -P)"
+out_prefix="$out/.stage"
+make_dir work "$work_prefix"
 
 # 1. The Rust binaries, from cargo's report of what it built.
 cargo=("${CARGO:-cargo}")
-host="$("${cargo[0]}" -vV 2>/dev/null | sed -n 's/^host: //p')"
-[ -z "$host" ] && host="$(rustc -vV | sed -n 's/^host: //p')"
+"${cargo[0]}" -vV >"$work/cargo-version" 2>/dev/null || rustc -vV >"$work/cargo-version"
+host=""
+while IFS= read -r line; do
+  case "$line" in host:\ *) host="${line#host: }" ;; esac
+done <"$work/cargo-version"
 case "$host" in
   aarch64-apple-darwin) arch=arm64 ;;
   x86_64-apple-darwin) arch=x86_64 ;;
   *) die "unexpected Rust host '$host' (want aarch64-apple-darwin or x86_64-apple-darwin)" ;;
 esac
 echo "build-app: cargo build --release (envcloak, envcloakd) for $host" >&2
-artifacts="$(mktemp "${TMPDIR:-/tmp}/ec-build-app.XXXXXX")"
-trap 'rm -f "$artifacts"' EXIT
+artifacts="$work/cargo-build.json"
 (cd "$root" && "${cargo[@]}" build --release --locked -p envcloak --bin envcloak -p envcloakd --bin envcloakd \
   --message-format=json-render-diagnostics >"$artifacts")
-paths="$(python3 - "$artifacts" <<'PY'
+python3 - "$artifacts" >"$work/binaries" <<'PY'
 import json, sys
 found = {}
 for line in open(sys.argv[1]):
@@ -127,12 +241,14 @@ if sorted(found) != ["envcloak", "envcloakd"]:
 print(found["envcloak"])
 print(found["envcloakd"])
 PY
-)"
-cli_bin="$(printf '%s\n' "$paths" | sed -n 1p)"
-daemon_bin="$(printf '%s\n' "$paths" | sed -n 2p)"
+{ IFS= read -r cli_bin && IFS= read -r daemon_bin; } <"$work/binaries" || die "cargo's report names no binaries"
 [ -x "$cli_bin" ] && [ -x "$daemon_bin" ] || die "cargo's binaries are missing"
-version="$("$cli_bin" --version | sed -n 's/^envcloak //p')"
-[ -n "$version" ] || die "cannot read the CLI's version"
+"$cli_bin" --version >"$work/cli-version"
+first_line version "$work/cli-version"
+case "$version" in
+  envcloak\ ?*) version="${version#envcloak }" ;;
+  *) die "cannot read the CLI's version" ;;
+esac
 
 # 2. The app and the helper wrapper, unsigned.
 echo "build-app: xcodebuild EnvCloak (Release, $arch, version $version)" >&2
@@ -146,30 +262,6 @@ xcodebuild -project "$app_src/EnvCloak.xcodeproj" -scheme EnvCloak -configuratio
   -quiet build >&2
 products="$derived/Build/Products/Release"
 [ -d "$products/EnvCloak.app" ] && [ -d "$products/EnvCloakAgent.app" ] || die "xcodebuild left no EnvCloak.app or EnvCloakAgent.app in $products"
-
-# 3. The bundle, staged beside the output.
-stage="$(mktemp -d "$out/.stage.XXXXXX")"
-incoming=""
-# Set by replace_app while a replacement is between its two moves.
-pending_backup=""
-pending_destination=""
-cleanup() {
-  local status=$?
-  local keep=""
-  if [ -n "$pending_backup" ] && { [ -e "$pending_backup" ] || [ -L "$pending_backup" ]; }; then
-    if [ ! -e "$pending_destination" ] && [ ! -L "$pending_destination" ] && mv "$pending_backup" "$pending_destination"; then
-      echo "build-app: the replacement did not finish; the previous app is back at $pending_destination" >&2
-    else
-      keep="$(dirname "$pending_backup")"
-      echo "build-app: the replacement did not finish; the previous app is kept at $pending_backup" >&2
-    fi
-  fi
-  rm -f "$artifacts"
-  if [ "$keep" != "$stage" ]; then rm -rf "$stage"; fi
-  if [ -n "$incoming" ] && [ "$keep" != "$incoming" ]; then rm -rf "$incoming"; fi
-  return "$status"
-}
-trap cleanup EXIT
 
 # replace_app NEW DESTINATION BACKUP: the previous app at DESTINATION (if
 # any) moves to BACKUP, then NEW to DESTINATION. The backup is recorded
@@ -187,6 +279,15 @@ replace_app() {
   pending_backup=""
   pending_destination=""
 }
+
+# plist_version VAR PLIST: VAR is PLIST's CFBundleShortVersionString.
+plist_version() {
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$2" >"$work/plist-version"
+  first_line "$1" "$work/plist-version"
+}
+
+# 3. The bundle, staged beside the output.
+make_dir stage "$out_prefix"
 app="$stage/EnvCloak.app"
 ditto "$products/EnvCloak.app" "$app"
 mkdir -p "$app/Contents/Helpers"
@@ -208,9 +309,9 @@ sign_one "$app" ai.envcloak.app "$support/EnvCloak.entitlements"
 
 # 5. Checks, then the swap.
 "$here/sign-check.sh" "$app"
-bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
+plist_version bundle_version "$app/Contents/Info.plist"
 [ "$bundle_version" = "$version" ] || die "the bundle says version $bundle_version, its CLI $version"
-helper_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Helpers/EnvCloakAgent.app/Contents/Info.plist")"
+plist_version helper_version "$app/Contents/Helpers/EnvCloakAgent.app/Contents/Info.plist"
 [ "$helper_version" = "$version" ] || die "the helper says version $helper_version, the CLI $version"
 
 replace_app "$app" "$out/EnvCloak.app" "$stage/previous.app"
@@ -220,12 +321,12 @@ app="$out/EnvCloak.app"
 if [ "$install" = 1 ]; then
   mkdir -p "$install_dir"
   dest="$(cd "$install_dir" && pwd -P)"
-  incoming="$(mktemp -d "$dest/.EnvCloak.install.XXXXXX")"
+  install_prefix="$dest/.EnvCloak.install"
+  make_dir incoming "$install_prefix"
   ditto "$app" "$incoming/EnvCloak.app"
   "$here/sign-check.sh" "$incoming/EnvCloak.app"
   replace_app "$incoming/EnvCloak.app" "$dest/EnvCloak.app" "$incoming/previous.app"
   rm -rf "$incoming"
-  incoming=""
   echo "build-app: installed $dest/EnvCloak.app (version $version, signed $sign); a running background process was not restarted (task M3-06)" >&2
   app="$dest/EnvCloak.app"
 fi
