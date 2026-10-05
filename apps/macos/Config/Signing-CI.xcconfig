@@ -1,0 +1,9 @@
+// Tier 3 (M3 plan D3-05; docs/APP.md "Signing tiers"): a throwaway
+// self-signed code-signing identity in a temporary keychain, made by
+// scripts/macos/ci-identity.sh (task M3-07) and used only by tests, which
+// exports ENVCLOAK_CI_IDENTITY and ENVCLOAK_CI_KEYCHAIN. A test-only
+// setting a later task needs lives here and nowhere else, and
+// scripts/macos/sign-check.sh refuses a release artifact that holds one.
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = $(ENVCLOAK_CI_IDENTITY)
+OTHER_CODE_SIGN_FLAGS = --timestamp=none --keychain $(ENVCLOAK_CI_KEYCHAIN)

@@ -1,0 +1,9 @@
+// Tier 1 (M3 plan D3-05; docs/APP.md "Signing tiers"): ad hoc with the
+// hardened runtime, no keychain, any Mac. The EU-0 and EU-1 builds, and the
+// default for Xcode's own builds and tests. `envcloak status` reports
+// "daemon identity unverified" for such a build (SPEC §4.2).
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
+PROVISIONING_PROFILE_SPECIFIER =
+OTHER_CODE_SIGN_FLAGS = --timestamp=none

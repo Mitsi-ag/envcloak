@@ -1,0 +1,7 @@
+// Tier 2 (M3 plan D3-05; docs/APP.md "Signing tiers"): the team's Apple
+// Development certificate on the founder's Mac, from EU-2. Task M3-10 adds
+// the team, the two macOS development provisioning profiles (Keychain
+// Sharing for ai.envcloak.app and ai.envcloak.agent) and the keychain group.
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = Apple Development
+OTHER_CODE_SIGN_FLAGS = --timestamp=none
