@@ -36,8 +36,8 @@ use envcloak_ipc::proto::{AddParams, ErrorKind, RunRequestParams};
 use envcloak_ipc::view::{ClassificationView, DecisionView, TargetView};
 use envcloak_ipc::{Client, ClientError, RunPaths, WireSecret};
 use envcloak_policy::{
-    ApprovalOptions, EnvName, PendingId, Proposal, SubjectKind, Uses, render_statement,
-    statement_digest,
+    ApprovalOptions, BindingSource, EnvName, PendingId, Proposal, SubjectKind, Uses,
+    render_statement, statement_digest,
 };
 use envcloak_testkit::{
     Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels,
@@ -364,10 +364,17 @@ fn entries(v: &Vault, kind: AuditKind) -> Vec<AuditEntry> {
 /// approved with the tick, the grant holds it (`live`) and the run is
 /// covered.
 ///
+/// Asked without a passphrase (`envcloak approve`'s check, which reads
+/// none where the guard refuses), the approval is refused and audited the
+/// same way; with every tick it passes every check before the proof and
+/// ends there (`invalid_params`), with no grant and no attempt counted.
+///
 /// Mutations: remove the tick check (`unticked_live` answering none): the
 /// approval without `--live` makes a grant and this fails; apply it to
 /// agents only (`live_guarded` false for an unknown subject): the
-/// `unknown` round fails.
+/// `unknown` round fails; end a check at the proof before the guard (the
+/// missing passphrase refused first): the check is `invalid_params`, not
+/// audited, and this fails.
 #[test]
 fn an_agent_or_unknown_approval_needs_each_live_tick() {
     let mut f = Fixture::new();
@@ -416,6 +423,18 @@ fn an_agent_or_unknown_approval_needs_each_live_tick() {
                 "{mode} {names:?}"
             );
         }
+        // The check without a passphrase: refused the same way, and
+        // audited; with both ticks it ends at the proof it lacks.
+        let opts = ticking(&[], Uses::Session);
+        let e = c
+            .approve_check(&id, opts.clone(), &statement_digest(&d, &opts), &[])
+            .unwrap_err();
+        assert_eq!(rpc_kind(e), (ErrorKind::LiveNotTicked, None), "{mode}");
+        let both = ticking(&["STRIPE_SECRET_KEY", "OPENAI_API_KEY"], Uses::Session);
+        let e = c
+            .approve_check(&id, both.clone(), &statement_digest(&d, &both), &[])
+            .unwrap_err();
+        assert_eq!(rpc_kind(e), (ErrorKind::InvalidParams, None), "{mode}");
         assert_eq!(c.status().unwrap().approvals.proof_failures, failures);
         assert!(f.grants().is_empty(), "{mode}");
         assert_eq!(f.shown(&id), d, "{mode}: still pending, as it was");
@@ -425,7 +444,7 @@ fn an_agent_or_unknown_approval_needs_each_live_tick() {
                     "envcloakd: audit: approve refused reason=live_not_ticked request={id} "
                 ))
                 .count();
-        assert_eq!(refused, 3, "{mode}");
+        assert_eq!(refused, 4, "{mode}");
         // Both ticked: the grant holds both, and the run is covered.
         let g = f
             .approve(
@@ -455,7 +474,7 @@ fn an_agent_or_unknown_approval_needs_each_live_tick() {
     // and the items left unticked, never a value.
     let v = f.stop_and_open();
     let refused = entries(&v, AuditKind::LiveRefused);
-    assert_eq!(refused.len(), 6);
+    assert_eq!(refused.len(), 8);
     for e in &refused {
         assert_eq!(e.record.decision.outcome, "refused");
         assert_eq!(e.record.decision.reason.as_deref(), Some("live_not_ticked"));
@@ -517,6 +536,8 @@ fn the_test_item_is_proposed_and_a_changed_proposal_is_a_mismatch() {
         live_slug: "stripe/acme-live".to_owned(),
         test_slug: "stripe/acme-test".to_owned(),
         test_field: None,
+        // Asked with `--ref`: the advice is to give another.
+        source: BindingSource::Ref,
     }];
     assert_eq!(proposals, expected);
     let read = f.shown(&id);
@@ -525,7 +546,7 @@ fn the_test_item_is_proposed_and_a_changed_proposal_is_a_mismatch() {
     let opts = ticking(&["STRIPE_SECRET_KEY"], Uses::Once);
     let text = render_statement(&read, &opts);
     let test = text
-        .find("envcloak ref STRIPE_SECRET_KEY=stripe/acme-test")
+        .find("give `--ref STRIPE_SECRET_KEY=stripe/acme-test` in place of the --ref")
         .unwrap();
     let live = text.find("STRIPE_SECRET_KEY = stripe/acme-live").unwrap();
     assert!(test < live, "{text}");

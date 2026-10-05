@@ -10,18 +10,23 @@
 //! 2. it fetches the pending request from a verified daemon, which serves
 //!    it only to a caller that may give a proof (a terminal session with
 //!    no agent in it, SPEC §10b), and renders
-//!    the statement ([`render_statement`]): the caller, the project, the
-//!    same provider's test items the daemon proposes in place of live ones
-//!    with the `envcloak ref` line that binds each, every binding with its
-//!    classification and live tick, the full command line as an escaped
-//!    list (cut past 2 KB with a marker), and the grant the options ask
-//!    for;
+//!    the statement ([`render_statement_with`]): the caller, the project,
+//!    the same provider's test items the daemon proposes in place of live
+//!    ones with how to bind each (a name of one shaped like a key or token
+//!    hidden), every binding with its classification and live tick, the
+//!    full command line as an escaped list (cut past 2 KB with a marker),
+//!    and the grant the options ask for;
 //! 3. the live-key guard (SPEC §10b): when the request is an agent's or an
 //!    unknown process's and the options leave a live binding unticked
 //!    ([`unticked_live`]), it shows the statement, which names the
-//!    `--live` flags it lacks, and exits with `live_not_ticked` before
-//!    any passphrase is read (L-10); the daemon refuses such an approval
-//!    too, before Argon2id runs, and audits it;
+//!    `--live` flags it lacks and says that nothing is approved, and reads
+//!    no passphrase (L-10). It sends the approval without one, as a check
+//!    the daemon answers before any proof: the daemon refuses it
+//!    `live_not_ticked` and audits the refusal (kind `live_refused`), as it
+//!    does an approval with the passphrase, and the command exits with
+//!    the daemon's refusal, naming the test keys the statement proposes
+//!    for those bindings. Any other answer is the daemon's refusal, or, an
+//!    answer that is not one, `protocol_error`: a check never approves;
 //! 4. it reads the vault passphrase from `/dev/tty` with echo off, or from
 //!    the descriptor `--passphrase-fd` names, never from argv or the
 //!    environment;
@@ -43,12 +48,12 @@ use std::time::Duration;
 use envcloak_client::claims::refuse_if_claimed;
 use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
+use envcloak_client::render::looks_like_value;
 use envcloak_client::tty::{Terminal, read_secret_fd};
-use envcloak_ipc::ClientError;
-use envcloak_ipc::proto::{ErrorKind, RpcError};
+use envcloak_ipc::proto::ErrorKind;
 use envcloak_policy::{
     ApprovalOptions, DEFAULT_TTL, EnvName, GrantId, MAX_AGENT_TTL, PendingId, Uses,
-    escape_for_display, render_statement, statement_digest, unticked_live,
+    escape_for_display, proposed_for, render_statement_with, statement_digest, unticked_live,
 };
 
 use super::fd_number;
@@ -137,17 +142,32 @@ fn run_approve(a: ApproveArgs) -> Result<ExitCode, Failure> {
     // proof, so where none is taken this stops before the statement is
     // shown or the passphrase read.
     let descriptor = connect()?.pending_get(&id, &claims)?;
-    // The statement is rendered from what the daemon sent, escaped, and
-    // its digest is computed over exactly that (gate 23: a statement that
-    // differs from the pending request is rejected by the daemon).
-    let statement = render_statement(&descriptor, &a.options);
+    // The statement is rendered from what the daemon sent, escaped (a
+    // proposed name shaped like a key hidden), and its digest is computed
+    // over exactly that (gate 23: a statement that differs from the
+    // pending request is rejected by the daemon).
+    let statement = render_statement_with(&descriptor, &a.options, &looks_like_value);
     let digest = statement_digest(&descriptor, &a.options);
     // The live-key guard: the daemon would refuse this approval, so no
     // passphrase is read for it. The statement says which ticks it lacks
-    // and which test items could be bound instead.
-    if !unticked_live(&descriptor, &a.options).is_empty() {
+    // and which test items could be bound instead; the daemon is asked
+    // without a passphrase, so that the refusal is its own, and audited.
+    let unticked = unticked_live(&descriptor, &a.options);
+    if !unticked.is_empty() {
         print!("{statement}");
-        return Err(ClientError::Rpc(RpcError::new(ErrorKind::LiveNotTicked)).into());
+        let refused = match connect()?.approve_check(&id, a.options.clone(), &digest, &claims) {
+            Err(e) => Failure::from(e),
+            // A check never grants: an answer that says otherwise is not
+            // the daemon's to give.
+            Ok(_) => Failure::new("protocol_error", "the daemon's answer was malformed"),
+        };
+        return Err(match proposed_for(&descriptor, &unticked) {
+            Some(names) if refused.token() == ErrorKind::LiveNotTicked.token() => refused
+                .with_tail(&format!(
+                    "or bind the test key the statement proposes for {names}"
+                )),
+            _ => refused,
+        });
     }
     let passphrase = match a.passphrase_fd {
         Some(fd) => {

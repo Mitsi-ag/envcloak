@@ -521,7 +521,57 @@ fn policy(
     Ok(p)
 }
 
-/// The bindings a run asks for, sorted by variable name.
+/// Where a run's binding came from: the layer of [`resolve`] that set it,
+/// which says how another item is bound in its place (the advice a
+/// [`crate::Proposal`] gives). On the wire, `{"layer": "env"}`,
+/// `{"layer": "profile", "profile": "<name>"}`, `{"layer": "env_file",
+/// "line": <n>}` or `{"layer": "ref"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "layer", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BindingSource {
+    /// The manifest's `[env]`: `envcloak ref NAME=...` replaces it.
+    Env,
+    /// The manifest's `[env.<profile>]`, for a run with `--profile
+    /// <profile>`: `envcloak ref --profile <profile> NAME=...` replaces
+    /// it.
+    Profile { profile: String },
+    /// The run's `--env-file`, the reference on this line (from 1).
+    EnvFile { line: u32 },
+    /// A `--ref` argument of the run.
+    Ref,
+}
+
+impl BindingSource {
+    /// Whether it has the shape [`resolve_sourced`] gives it: a profile's
+    /// name a [`ProfileName`], a line from 1.
+    pub fn well_formed(&self) -> bool {
+        match self {
+            BindingSource::Env | BindingSource::Ref => true,
+            BindingSource::Profile { profile } => ProfileName::new(profile).is_ok(),
+            BindingSource::EnvFile { line } => *line >= 1,
+        }
+    }
+}
+
+/// The bindings a run asks for, sorted by variable name: [`resolve_sourced`]
+/// without the layers.
+///
+/// # Errors
+/// As [`resolve_sourced`].
+pub fn resolve(
+    m: &Manifest,
+    profile: Option<&ProfileName>,
+    refs: &[Binding],
+    env: Option<&EnvFileNames>,
+) -> Result<Vec<Binding>, ManifestError> {
+    Ok(resolve_sourced(m, profile, refs, env)?
+        .into_iter()
+        .map(|(b, _)| b)
+        .collect())
+}
+
+/// The bindings a run asks for, sorted by variable name, each with the
+/// layer that set it ([`BindingSource`]).
 ///
 /// Later layers replace earlier ones, variable by variable:
 /// 1. the manifest's `[env]`;
@@ -534,20 +584,34 @@ fn policy(
 ///
 /// A binding that changes here is a new binding for the grant check
 /// (SPEC §10b "Match"), which compares variable, item and field.
-pub fn resolve(
+///
+/// # Errors
+/// [`ManifestErrorKind::UnknownProfile`] for a profile the manifest does
+/// not have, [`ManifestErrorKind::DuplicateEnvName`] for a variable two
+/// explicit bindings name.
+pub fn resolve_sourced(
     m: &Manifest,
     profile: Option<&ProfileName>,
     refs: &[Binding],
     env: Option<&EnvFileNames>,
-) -> Result<Vec<Binding>, ManifestError> {
-    let mut out: BTreeMap<&EnvName, &Reference> =
-        m.env.iter().map(|b| (&b.env_name, &b.reference)).collect();
+) -> Result<Vec<(Binding, BindingSource)>, ManifestError> {
+    let mut out: BTreeMap<&EnvName, (&Reference, BindingSource)> = m
+        .env
+        .iter()
+        .map(|b| (&b.env_name, (&b.reference, BindingSource::Env)))
+        .collect();
     if let Some(p) = profile {
         let over = m
             .profiles
             .get(p)
             .ok_or(ManifestError::from(ManifestErrorKind::UnknownProfile))?;
-        out.extend(over.iter().map(|b| (&b.env_name, &b.reference)));
+        let layer = BindingSource::Profile {
+            profile: p.as_str().to_owned(),
+        };
+        out.extend(
+            over.iter()
+                .map(|b| (&b.env_name, (&b.reference, layer.clone()))),
+        );
     }
     let mut explicit = BTreeSet::new();
     let mut claim = |name: &EnvName, origin: Origin| {
@@ -560,7 +624,13 @@ pub fn resolve(
     if let Some(env) = env {
         for r in &env.refs {
             claim(&r.binding.env_name, Origin::EnvFile { line: r.line })?;
-            out.insert(&r.binding.env_name, &r.binding.reference);
+            out.insert(
+                &r.binding.env_name,
+                (
+                    &r.binding.reference,
+                    BindingSource::EnvFile { line: r.line },
+                ),
+            );
         }
         for p in &env.plain {
             claim(&p.name, Origin::EnvFile { line: p.line })?;
@@ -569,13 +639,18 @@ pub fn resolve(
     }
     for (index, b) in refs.iter().enumerate() {
         claim(&b.env_name, Origin::Ref { index })?;
-        out.insert(&b.env_name, &b.reference);
+        out.insert(&b.env_name, (&b.reference, BindingSource::Ref));
     }
     Ok(out
         .into_iter()
-        .map(|(n, r)| Binding {
-            env_name: n.clone(),
-            reference: r.clone(),
+        .map(|(n, (r, layer))| {
+            (
+                Binding {
+                    env_name: n.clone(),
+                    reference: r.clone(),
+                },
+                layer,
+            )
         })
         .collect())
 }

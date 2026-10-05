@@ -7,7 +7,9 @@ preceded by their count, numbers as decimal strings (a pid with its sign),
 booleans as `1` or `0`, an optional string as the string (empty when
 absent) and then whether it is there; the proposed test items come after
 the bindings, each as its variable, live slug, test slug and optional
-field. It shares no code with the crate.
+field, then the layer its live binding came from: the word `env`,
+`profile` with the profile's name, `env_file` with the line, or `ref`. It
+shares no code with the crate.
 
 Reads a JSON array of {"descriptor": ..., "options": ...} on standard
 input, as the crate serializes them, and writes a JSON array with, for
@@ -21,7 +23,11 @@ each, the statement in hex:
   crate's digests must never equal it (version 1 digests are refused
   after the upgrade), and two descriptors that differ in their proposals
   alone encode alike in it (a positive control that the proposals are
-  what version 2 adds).
+  what version 2 adds);
+- `unsourced`: version 2 without the proposals' layers: two descriptors
+  whose proposals differ in their layer alone encode alike in it (a
+  positive control that the layer, which the advice the statement shows
+  follows, is under the digest).
 """
 
 import json
@@ -48,7 +54,20 @@ def optional(s):
     return text(s if s is not None else "") + flag(s is not None)
 
 
-def encode(d, o, pid, version):
+def layer(source):
+    kind = source["layer"]
+    if kind == "env" and len(source) == 1:
+        return text("env")
+    if kind == "profile" and set(source) == {"layer", "profile"}:
+        return text("profile") + text(source["profile"])
+    if kind == "env_file" and set(source) == {"layer", "line"}:
+        return text("env_file") + num(source["line"])
+    if kind == "ref" and len(source) == 1:
+        return text("ref")
+    raise ValueError("unknown layer %r" % (source,))
+
+
+def encode(d, o, pid, version, sourced=True):
     s = d["subject"]
     root = s["root"]
     p = d["project"]
@@ -71,6 +90,8 @@ def encode(d, o, pid, version):
         for x in d["proposals"]:
             out += text(x["env_name"]) + text(x["live_slug"]) + text(x["test_slug"])
             out += optional(x["test_field"])
+            if sourced:
+                out += layer(x["source"])
     out += text(d["mode"]) + num(len(d["argv"]))
     for a in d["argv"]:
         out += text(a)
@@ -90,6 +111,7 @@ def main():
                 "signed": encode(d, o, num, 2).hex(),
                 "legacy": encode(d, o, lambda n: num(abs(n)), 2).hex(),
                 "v1": encode(d, o, num, 1).hex(),
+                "unsourced": encode(d, o, num, 2, sourced=False).hex(),
             }
         )
     json.dump(out, sys.stdout)

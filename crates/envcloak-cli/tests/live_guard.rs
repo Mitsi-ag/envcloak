@@ -2,11 +2,13 @@
 //! "Writes that need a proof"; gate 40, sentences 1 and 2; M2 plan
 //! M2-13): `envcloak approve` refuses an agent's or an unknown process's
 //! request whose live bindings it leaves unticked before it reads the
-//! passphrase, and approves it with the ticks; `envcloak run`'s
-//! `approval_required` line names the same provider's test item and the
-//! `envcloak ref` line that binds it, waiting or not; `envcloak items
-//! reclassify` tightens with no proof and loosens only with one. The
-//! daemon's side is in `crates/envcloak-daemon/tests/live_guard.rs`.
+//! passphrase, the refusal the daemon's own and audited, and approves it
+//! with the ticks; `envcloak run`'s `approval_required` line names the
+//! same provider's test item and how to bind it for the layer the live
+//! binding came from, waiting or not, and following that binds the test
+//! item; `envcloak items reclassify` tightens with no proof and loosens
+//! only with one. The daemon's side is in
+//! `crates/envcloak-daemon/tests/live_guard.rs`.
 //!
 //! The requesters are `envcloak run` without a terminal (an unknown
 //! subject) and `envcloak run` as the command of the fixture agent on a
@@ -23,9 +25,12 @@ use std::process::Output;
 use std::time::Duration;
 
 use common::{
-    MANIFEST, cli, finish_within, on_terminal_program, outside_dir, project, run, run_on_terminal,
-    secret_file, seed_vault, start_daemon, stderr, stdout,
+    MANIFEST, cli, cli_command, data_dir, finish_within, on_terminal_program, outside_dir, project,
+    run, run_on_terminal, secret_file, seed_vault, start_daemon, stderr, stdout,
 };
+use envcloak_core::SecretBytes;
+use envcloak_core::audit::AuditKind;
+use envcloak_core::vault::{LockedVault, VaultPaths};
 use envcloak_testkit::{
     Canary, Daemon, TestHome, assert_no_canary, by_label, canaries, fresh_seed, labels, testkit_bin,
 };
@@ -141,6 +146,25 @@ impl Fixture {
         assert_no_canary(&self.d.log_bytes(), &self.cs);
         self.home.assert_clean(&self.cs);
     }
+
+    /// The audit entries of `kind`, read from the vault once the daemon
+    /// stopped (SIGTERM locks it first).
+    fn audited(mut self, kind: AuditKind) -> Vec<envcloak_core::audit::AuditEntry> {
+        self.d.signal("-TERM");
+        assert!(self.d.wait_exit(Duration::from_secs(30)).is_some());
+        let v = LockedVault::open(&VaultPaths::under(data_dir(&self.home)))
+            .unwrap()
+            .unlock_with_passphrase(&SecretBytes::copy_from(
+                by_label(&self.cs, labels::VAULT_PASSPHRASE).value(),
+            ))
+            .map_err(|(_, e)| e)
+            .unwrap();
+        let (entries, _) = v.read_audit().unwrap();
+        entries
+            .into_iter()
+            .filter(|e| e.record.kind == kind)
+            .collect()
+    }
 }
 
 /// The request id in `approval_required: request=<id>:`.
@@ -160,15 +184,18 @@ fn request_id(err: &str) -> String {
 
 /// Gate 40, sentence 1, through the CLI: an unknown process's request
 /// binding the live OpenAI key. `envcloak approve` without `--live`
-/// shows the statement, which names the tick it lacks, and exits 1 with
-/// `live_not_ticked` before it sends anything: a wrong passphrase given is
-/// not counted, the daemon is asked nothing, and no grant is made. With
-/// `--live OPENAI_API_KEY` it approves, the statement saying the tick is
-/// the person's.
+/// shows the statement, which names the tick it lacks and says that
+/// nothing is approved, reads no passphrase, and asks the daemon without
+/// one: the daemon refuses `live_not_ticked` and audits it (Codex, round
+/// 2: the CLI's own refusal was never audited), a wrong passphrase given
+/// is not counted, and no grant is made. With no test key proposed, the
+/// failure names none. With `--live OPENAI_API_KEY` it approves, the
+/// statement saying the tick is the person's.
 ///
-/// Mutation: drop `envcloak approve`'s check (`unticked_live` answering
+/// Mutations: drop `envcloak approve`'s check (`unticked_live` answering
 /// none in the CLI): the passphrase is sent, the daemon refuses, the
-/// wrong one is counted, and this fails.
+/// wrong one is counted, and this fails; refuse in the CLI alone, as round
+/// 1 did (the check never sent): nothing is audited, and this fails.
 #[test]
 fn approve_refuses_an_unticked_live_key_before_the_passphrase() {
     let f = Fixture::new();
@@ -194,6 +221,16 @@ fn approve_refuses_an_unticked_live_key_before_the_passphrase() {
         shown.contains("Approve again with --live OPENAI_API_KEY."),
         "{shown}"
     );
+    assert!(
+        shown.ends_with(
+            "Nothing is approved: no passphrase is asked for an approval that leaves a live \
+             key unticked.\n"
+        ),
+        "{shown}"
+    );
+    assert!(!shown.contains("The passphrase you enter"), "{shown}");
+    // No test key of the provider: the failure names none.
+    assert!(!err.contains("or bind"), "{err}");
     // `status` names failed attempts only when there are some.
     let status = stdout(&run(&f.home, &["status"], &[]));
     assert!(!status.contains("failed passphrase attempts"), "{status}");
@@ -201,9 +238,17 @@ fn approve_refuses_an_unticked_live_key_before_the_passphrase() {
         status.contains("grants: 0 in force, 1 waiting for approval"),
         "{status}"
     );
+    // The refusal is the daemon's, and audited once.
     let log = f.d.log();
     assert!(!log.contains("approve failed"), "{log}");
-    assert!(!log.contains("approve refused"), "{log}");
+    assert_eq!(
+        log.matches(&format!(
+            "approve refused reason=live_not_ticked request={id} "
+        ))
+        .count(),
+        1,
+        "{log}"
+    );
     // Ticked: approved. (The grant holds the tick, which `grants.list`
     // shows while its root, the run that asked, lives: envcloakd's
     // tests/live_guard.rs.)
@@ -234,45 +279,133 @@ fn approve_refuses_an_unticked_live_key_before_the_passphrase() {
         "{shown}"
     );
     f.sweep();
+    // The sealed log holds the refusal (kind `live_refused`), naming the
+    // request and the item left unticked.
+    let refused = f.audited(AuditKind::LiveRefused);
+    assert_eq!(refused.len(), 1);
+    let r = &refused[0].record;
+    assert_eq!(r.request_id.as_deref(), Some(id.as_str()));
+    assert_eq!(r.decision.reason.as_deref(), Some("live_not_ticked"));
+    let slugs: Vec<&str> = r.items.iter().map(|(_, s)| s.as_str()).collect();
+    assert_eq!(slugs, ["openai/acme-web"]);
+}
+
+/// The project of the layer tests: the live Stripe key in `[env]` and in
+/// the profile `dev`.
+const LIVE_MANIFEST: &str = "[project]
+name = \"acme-live\"
+
+[env]
+STRIPE_SECRET_KEY = \"stripe/acme-live\"
+
+[env.dev]
+STRIPE_SECRET_KEY = \"stripe/acme-live\"
+";
+
+/// The slugs the person's `envcloak pending --json` lists for request
+/// `id`: what the request binds.
+fn pending_slugs(f: &Fixture, id: &str) -> Vec<String> {
+    let out = run_on_terminal(&f.home, &["pending", "--json"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let r = v["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["request"] == id)
+        .unwrap_or_else(|| panic!("{id} is not listed: {v}"));
+    r["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The text between `before` and the next backtick after it, in `line`.
+fn quoted_after<'a>(line: &'a str, before: &str) -> &'a str {
+    let rest = &line[line
+        .find(before)
+        .unwrap_or_else(|| panic!("no {before:?} in: {line}"))
+        + before.len()..];
+    &rest[..rest.find('`').unwrap()]
 }
 
 /// Gate 40, sentence 2, through the CLI: the agent's `envcloak run`
 /// binding the live Stripe key names, on its `approval_required` line,
-/// the same provider's test item and the `envcloak ref` line that binds
-/// it, waiting or not; `envcloak approve` lists it before the bindings.
-/// The daemon substitutes nothing: the statement still binds the live
-/// item.
+/// the same provider's test item and how to bind it, waiting or not;
+/// `envcloak approve` lists it before the bindings. The daemon
+/// substitutes nothing: the statement still binds the live item.
 ///
-/// Mutation: leave the proposals off the line (`proposed` answering
-/// nothing): the line names no test item and this fails.
+/// How to bind it follows the layer the live binding came from, and the
+/// test follows the line it is given, as an agent would, then asks again:
+/// the next request binds the test item, for each layer (verifier and
+/// Codex, round 2: `envcloak ref NAME=...` writes `[env]`, which a
+/// `--ref`, an env file and a profile replace, so following the line round
+/// 1 printed asked for the live item again). A `--ref` is replaced; the
+/// env file's line is set; a profile's binding is changed with `envcloak
+/// ref --profile`; `[env]`'s with `envcloak ref`. The control: the round-1
+/// line, followed for the `--ref` run, leaves the live item bound.
+///
+/// Mutations: leave the proposals off the line (`proposed` answering
+/// nothing): the line names no test item and this fails; advise every
+/// layer as `[env]` (`Proposal::advice` answering `envcloak ref NAME=...`
+/// whatever the source): the `--ref` line differs, and following the
+/// env file's and the profile's still binds the live item.
 #[test]
 fn the_approval_required_line_names_the_test_item() {
     let mut f = Fixture::new();
     f.add_stripe("stripe/acme-test", "test");
     f.add_stripe("stripe/acme-live", "live");
-    let m = f.manifest.to_str().unwrap().to_owned();
-    let refs = ["--ref", "STRIPE_SECRET_KEY=stripe/acme-live"];
+    let dir = project(&f.home, "acme-live", LIVE_MANIFEST);
+    let m = dir.join("envcloak.toml").to_str().unwrap().to_owned();
+    // The agent's `envcloak run` with `args`: its request id and line.
+    let ask = |args: &[&str]| -> (String, String) {
+        let mut argv = vec!["run", "--manifest", m.as_str()];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["--", "/usr/bin/true"]);
+        let out = f.agent(&argv);
+        assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+        let err = stderr(&out);
+        let id = request_id(&err);
+        let line = err
+            .lines()
+            .find(|l| l.contains("approval_required"))
+            .unwrap()
+            .to_owned();
+        (id, line)
+    };
+    // `envcloak <args>` in the project, as the agent runs `envcloak ref`.
+    let in_project = |args: &[&str]| {
+        let mut cmd = cli_command(&f.home, args, &[]);
+        cmd.current_dir(&dir);
+        let out = finish_within(cmd, Duration::from_secs(60));
+        f.swept(&out);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    };
+    let words = |cmd: &str| -> Vec<String> {
+        let w: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
+        assert_eq!(w[0], "envcloak", "{cmd}");
+        w[1..].to_vec()
+    };
+
+    // A `--ref`: give another.
+    let live_ref = "STRIPE_SECRET_KEY=stripe/acme-live";
+    let (id, line) = ask(&["--ref", live_ref]);
     let named = "STRIPE_SECRET_KEY is bound to the live key stripe/acme-live: to use the test \
-                 key stripe/acme-test instead, run `envcloak ref \
-                 STRIPE_SECRET_KEY=stripe/acme-test` and run this again";
-    let mut argv = vec!["run", "--manifest", &m];
-    argv.extend_from_slice(&refs);
-    argv.extend_from_slice(&["--", "/usr/bin/true"]);
-    let out = f.agent(&argv);
-    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
-    let err = stderr(&out);
-    let id = request_id(&err);
-    assert!(
-        err.starts_with(&format!(
+                 key stripe/acme-test instead, give `--ref STRIPE_SECRET_KEY=stripe/acme-test` \
+                 in place of the --ref for STRIPE_SECRET_KEY, and run this again";
+    assert_eq!(
+        line,
+        format!(
             "envcloak: approval_required: request={id}: run \"envcloak approve {id}\" in a \
-             terminal you control; {named}\n"
-        )),
-        "{err}"
+             terminal you control; {named}"
+        )
     );
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-live"]);
     // Waiting: the line it prints names it too.
-    let mut argv = vec!["run", "--manifest", &m, "--wait", "1s"];
-    argv.extend_from_slice(&refs);
-    argv.extend_from_slice(&["--", "/usr/bin/true"]);
+    let mut argv = vec!["run", "--manifest", m.as_str(), "--wait", "1s"];
+    argv.extend_from_slice(&["--ref", live_ref, "--", "/usr/bin/true"]);
     let out = f.agent(&argv);
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     let err = stderr(&out);
@@ -287,14 +420,117 @@ fn the_approval_required_line_names_the_test_item() {
     assert_eq!(shown.status.code(), Some(1), "{}", stderr(&shown));
     let text = stdout(&shown);
     let proposal = text
-        .find("      envcloak ref STRIPE_SECRET_KEY=stripe/acme-test")
+        .find("      to bind it: give `--ref STRIPE_SECRET_KEY=stripe/acme-test` in place")
         .unwrap_or_else(|| panic!("{text}"));
     let binding = text
         .find("STRIPE_SECRET_KEY = stripe/acme-live#value  (live key")
         .unwrap_or_else(|| panic!("{text}"));
     assert!(proposal < binding, "{text}");
-    // Without a test item of its provider there is nothing to name.
-    let out = f.agent(&["run", "--manifest", &m, "--", "/usr/bin/true"]);
+    // The failure names the test key it could bind instead.
+    assert!(
+        stderr(&shown).starts_with(
+            "envcloak: live_not_ticked: the request is an agent's or an unknown process's, and \
+             the approval leaves a live key unticked, so no grant was made: tick each live \
+             binding with --live NAME; or bind the test key the statement proposes for \
+             STRIPE_SECRET_KEY\n"
+        ),
+        "{}",
+        stderr(&shown)
+    );
+    // The control: round 1's line, `envcloak ref NAME=<test>`, followed for
+    // a `--ref` run, binds the live item still.
+    in_project(&["ref", "STRIPE_SECRET_KEY=stripe/acme-test"]);
+    let (id, _) = ask(&["--ref", live_ref]);
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-live"]);
+    in_project(&["ref", "STRIPE_SECRET_KEY=stripe/acme-live"]);
+    // Followed as given: the test item is bound.
+    let given = quoted_after(&line, "give `");
+    let (flag, binding) = given.split_once(' ').unwrap();
+    assert_eq!(flag, "--ref");
+    let (id, line) = ask(&["--ref", binding]);
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-test"]);
+    assert!(!line.contains("test key"), "{line}");
+
+    // The env file: set its line.
+    let env_file = f.files.path().join("refs.env");
+    let lines = [
+        "# the keys".to_owned(),
+        "PLAIN_SETTING=1".to_owned(),
+        "STRIPE_SECRET_KEY=envcloak://stripe/acme-live".to_owned(),
+    ];
+    std::fs::write(&env_file, lines.join("\n") + "\n").unwrap();
+    let env_arg = env_file.to_str().unwrap().to_owned();
+    let (id, line) = ask(&["--env-file", &env_arg]);
+    assert!(
+        line.contains(
+            "instead, set line 3 of the --env-file to \
+             `STRIPE_SECRET_KEY=envcloak://stripe/acme-test`, and run this again"
+        ),
+        "{line}"
+    );
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-live"]);
+    let at: usize = line
+        .split("set line ")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut changed = lines.clone();
+    changed[at - 1] = quoted_after(&line, "of the --env-file to `").to_owned();
+    std::fs::write(&env_file, changed.join("\n") + "\n").unwrap();
+    let (id, line) = ask(&["--env-file", &env_arg]);
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-test"]);
+    assert!(!line.contains("test key"), "{line}");
+
+    // A profile: `envcloak ref --profile`.
+    let (id, line) = ask(&["--profile", "dev"]);
+    assert!(
+        line.contains(
+            "instead, run `envcloak ref --profile dev STRIPE_SECRET_KEY=stripe/acme-test`, and \
+             run this again"
+        ),
+        "{line}"
+    );
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-live"]);
+    in_project(
+        &words(quoted_after(&line, "instead, run `"))
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let (id, line) = ask(&["--profile", "dev"]);
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-test"]);
+    assert!(!line.contains("test key"), "{line}");
+
+    // `[env]`: `envcloak ref`.
+    let (id, line) = ask(&[]);
+    assert!(
+        line.contains(
+            "instead, run `envcloak ref STRIPE_SECRET_KEY=stripe/acme-test`, and run this again"
+        ),
+        "{line}"
+    );
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-live"]);
+    in_project(
+        &words(quoted_after(&line, "instead, run `"))
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    let (id, line) = ask(&[]);
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-test"]);
+    assert!(!line.contains("test key"), "{line}");
+
+    // Without a live binding of a provider with a test item, there is
+    // nothing to name.
+    let out = f.agent(&[
+        "run",
+        "--manifest",
+        f.manifest.to_str().unwrap(),
+        "--",
+        "/usr/bin/true",
+    ]);
     assert!(!stderr(&out).contains("test key"), "{}", stderr(&out));
     f.sweep();
 }
@@ -315,8 +551,7 @@ fn items_reclassify_tightens_freely_and_loosens_with_a_proof() {
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     assert_eq!(
         stdout(&out),
-        "Reclassified stripe/acme-web from test to live: 0 grants that bound it ended, so its \
-         runs need a new approval.\n"
+        "Reclassified stripe/acme-web from test to live. No grant bound it.\n"
     );
     // The agent cannot loosen it: refused before any passphrase is read.
     let out = f.agent(&["items", "reclassify", "stripe/acme-web", "test"]);

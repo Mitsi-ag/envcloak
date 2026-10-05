@@ -29,8 +29,12 @@
 //! bindings an approval leaves unticked, and an approval with any creates
 //! no grant (`live_not_ticked`). When the same provider has a
 //! test-classified item, the statement proposes it, before the bindings
-//! and their ticks, with the `envcloak ref` line that binds it
-//! ([`Proposal`]); the daemon never substitutes an item. The daemon builds
+//! and their ticks, with how to bind it in the live one's place for the
+//! layer the live binding came from (the `envcloak ref` line for the
+//! manifest's `[env]` or a profile's table, the `--ref` or the env file's
+//! line otherwise: [`Proposal::advice`]); the daemon never substitutes an
+//! item. A proposal is not approved, so a name of one shaped like a key
+//! is not shown ([`HIDDEN`]). The daemon builds
 //! the classifications and the proposals from the vault when it shows the
 //! statement and again when it takes the approval (L-09), so a statement
 //! read before either changed is a `statement_mismatch`.
@@ -49,7 +53,8 @@ use sha2::{Digest, Sha256};
 
 use crate::effective::SubjectKind;
 use crate::grants::{ApprovalOptions, BoundRef, Uses};
-use crate::manifest::Mode;
+use crate::manifest::{BindingSource, Mode};
+use crate::names::value_shaped;
 
 /// Rendered argv beyond this many bytes is cut, with a marker.
 pub const RENDER_LIMIT: usize = 2048;
@@ -58,6 +63,12 @@ pub const RENDER_LIMIT: usize = 2048;
 /// domains"). Version 1 had no proposals; its digests are refused since
 /// (none equals a version 2 digest).
 pub const STATEMENT_DOMAIN: &[u8] = b"envcloak-statement/2\n";
+
+/// What is shown in place of a proposed name shaped like a key or token
+/// (a value pasted where a name belongs, or a name a program answering in
+/// the daemon's place chose): the same words every metadata command
+/// prints in its place.
+pub const HIDDEN: &str = "[not shown: looks like a key or token]";
 
 /// A pending request as an approval surface receives it (SPEC §10b
 /// `{request_id, daemon_nonce, subject evidence, project, bindings, mode,
@@ -89,8 +100,8 @@ pub struct PendingDescriptor {
 /// guard"): for the variable `env_name`, bound to the live item
 /// `live_slug`, the same provider's test item `test_slug` (with the same
 /// account label, when both have one). The daemon never substitutes it:
-/// the person, or the agent, binds it with [`Proposal::ref_line`] and asks
-/// again.
+/// the person, or the agent, binds it as [`Proposal::advice`] says, for
+/// the layer `source` the live binding came from, and asks again.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
@@ -100,6 +111,9 @@ pub struct Proposal {
     /// The test item's field to bind, when it has several: the one named
     /// as the live binding's field is. `None` when it has one.
     pub test_field: Option<String>,
+    /// Where the live binding came from, which says how the test item is
+    /// bound in its place.
+    pub source: BindingSource,
 }
 
 impl Proposal {
@@ -112,20 +126,53 @@ impl Proposal {
         }
     }
 
-    /// The command that binds the test item to the variable, escaped for
-    /// display: `envcloak ref NAME=<slug>[#field]`.
-    pub fn ref_line(&self) -> String {
-        format!(
-            "envcloak ref {}={}",
-            escape_for_display(&self.env_name),
-            escape_for_display(&self.reference())
-        )
+    /// How to bind the test item in the live one's place, for the layer
+    /// the live binding came from, so that the next request binds the test
+    /// item (resolution: a later layer replaces an earlier one, so the
+    /// change goes where the live binding is):
+    ///
+    /// - the manifest's `[env]`: run `envcloak ref NAME=<test>`;
+    /// - a profile's `[env.<profile>]`: run `envcloak ref --profile
+    ///   <profile> NAME=<test>`;
+    /// - the `--env-file`: set its line `<n>` to `NAME=envcloak://<test>`;
+    /// - a `--ref`: give `--ref NAME=<test>` in place of the `--ref` for
+    ///   `NAME`.
+    ///
+    /// Every name is escaped, and one that `looks_like_value` takes for a
+    /// key or token is [`HIDDEN`] (a proposal is not approved, so nothing
+    /// the person approves is hidden by this).
+    pub fn advice(&self, looks_like_value: &dyn Fn(&str) -> bool) -> String {
+        let name = shown_name(&self.env_name, looks_like_value);
+        let reference = self.shown_reference(looks_like_value);
+        match &self.source {
+            BindingSource::Env => format!("run `envcloak ref {name}={reference}`"),
+            BindingSource::Profile { profile } => format!(
+                "run `envcloak ref --profile {} {name}={reference}`",
+                shown_name(profile, looks_like_value)
+            ),
+            BindingSource::EnvFile { line } => {
+                format!("set line {line} of the --env-file to `{name}=envcloak://{reference}`")
+            }
+            BindingSource::Ref => {
+                format!("give `--ref {name}={reference}` in place of the --ref for {name}")
+            }
+        }
+    }
+
+    /// [`Proposal::reference`] as it may be shown: escaped, each of the slug
+    /// and the field [`HIDDEN`] when `looks_like_value` takes it for a key.
+    pub fn shown_reference(&self, looks_like_value: &dyn Fn(&str) -> bool) -> String {
+        let slug = shown_name(&self.test_slug, looks_like_value);
+        match &self.test_field {
+            Some(f) => format!("{slug}#{}", shown_name(f, looks_like_value)),
+            None => slug,
+        }
     }
 
     /// Whether every name has the shape the daemon gives it: a variable
-    /// name, two slugs and a field name. A program answering in the
-    /// daemon's place could send anything (SPEC §1.1); a client shows no
-    /// proposal that fails this.
+    /// name, two slugs, a field name and a well-formed layer. A program
+    /// answering in the daemon's place could send anything (SPEC §1.1); a
+    /// client shows no proposal that fails this.
     pub fn well_formed(&self) -> bool {
         crate::names::EnvName::new(&self.env_name).is_ok()
             && Slug::new(&self.live_slug).is_ok()
@@ -134,6 +181,18 @@ impl Proposal {
                 .test_field
                 .as_deref()
                 .is_none_or(|f| FieldName::new(f).is_ok())
+            && self.source.well_formed()
+    }
+}
+
+/// A name from a request or a proposal as it may be shown: escaped
+/// ([`escape_for_display`]), or [`HIDDEN`] when `looks_like_value` takes it
+/// for a key or token.
+pub fn shown_name(s: &str, looks_like_value: &dyn Fn(&str) -> bool) -> String {
+    if looks_like_value(s) {
+        HIDDEN.to_owned()
+    } else {
+        escape_for_display(s)
     }
 }
 
@@ -176,12 +235,13 @@ fn ticked(o: &ApprovalOptions, env_name: &str) -> bool {
 /// The test items to propose for `bindings` (SPEC §10b "Live-key
 /// guard"), from `items`, the vault's metadata now: for each binding whose
 /// item is a live-classified secret of a known provider, the same
-/// provider's test-classified secret item (not the same item), with the
-/// same account label when both have one, that a reference can bind
+/// provider's test-classified secret item (not the same item; never a
+/// live or an unknown one, which SPEC §10b says is not a test key), with
+/// the same account label when both have one, that a reference can bind
 /// unambiguously (its one field, or the field named as the binding's).
 /// One per binding, the first by: an account label equal to the live
-/// item's, then slug. A binding whose item is gone, or of no provider, has
-/// none.
+/// item's, then slug; with the layer the binding came from. A binding
+/// whose item is gone, or of no provider, has none.
 pub fn proposals(bindings: &[BoundRef], items: &[ItemMeta]) -> Vec<Proposal> {
     let mut out = Vec::new();
     for b in bindings {
@@ -230,6 +290,7 @@ pub fn proposals(bindings: &[BoundRef], items: &[ItemMeta]) -> Vec<Proposal> {
                 live_slug: live.slug.as_str().to_owned(),
                 test_slug: test_slug.to_owned(),
                 test_field,
+                source: b.source.clone(),
             });
         }
     }
@@ -396,6 +457,14 @@ pub fn canonical_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> Vec<u8
             .str(&x.test_slug)
             .str(x.test_field.as_deref().unwrap_or(""))
             .flag(x.test_field.is_some());
+        // The layer's word, then what that layer has: a profile's name, an
+        // env file's line, or nothing.
+        match &x.source {
+            BindingSource::Env => e.str("env"),
+            BindingSource::Profile { profile } => e.str("profile").str(profile),
+            BindingSource::EnvFile { line } => e.str("env_file").num(u64::from(*line)),
+            BindingSource::Ref => e.str("ref"),
+        };
     }
     e.str(mode_word(p.mode)).count(p.argv.len());
     for a in &p.argv {
@@ -551,11 +620,27 @@ fn binding_line(b: &BindingSummary, o: &ApprovalOptions, guarded: bool) -> Strin
     )
 }
 
+/// The statement as a person reads it ([`render_statement_with`]), a
+/// proposed name hidden when it is shaped like a generated key
+/// ([`value_shaped`]).
+pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
+    render_statement_with(p, o, &value_shaped)
+}
+
 /// The statement as a person reads it. Every string from the request is
 /// escaped; argv is a list, cut with a marker past [`RENDER_LIMIT`]. The
-/// bindings no grant in force covers come first.
-pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
+/// test items proposed come first, each name [`HIDDEN`] where
+/// `looks_like_value` takes it for a key or token (a proposal is not
+/// approved; the bindings, which are, are shown whole), then the bindings
+/// no grant in force covers. When the live-key guard refuses the approval
+/// as it stands, the statement says so, and that nothing is approved.
+pub fn render_statement_with(
+    p: &PendingDescriptor,
+    o: &ApprovalOptions,
+    looks_like_value: &dyn Fn(&str) -> bool,
+) -> String {
     let e = escape_for_display;
+    let hide = |s: &str| shown_name(s, looks_like_value);
     let mut t = String::with_capacity(1024);
     let _ = writeln!(t, "Approval request {}", e(&p.request));
     let who = match (&p.subject.kind, &p.subject.label) {
@@ -606,11 +691,11 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
             let _ = writeln!(
                 t,
                 "    {}: the test key {}, not the live key {}",
-                e(&x.env_name),
-                e(&x.reference()),
-                e(&x.live_slug)
+                hide(&x.env_name),
+                x.shown_reference(looks_like_value),
+                hide(&x.live_slug)
             );
-            let _ = writeln!(t, "      {}", x.ref_line());
+            let _ = writeln!(t, "      to bind it: {}", x.advice(looks_like_value));
         }
     }
     let guarded = live_guarded(p.subject.kind);
@@ -661,27 +746,42 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
         }
     }
     let unticked = unticked_live(p, o);
-    if !unticked.is_empty() {
-        let flags: Vec<String> = unticked
-            .iter()
-            .map(|n| format!("--live {}", e(n)))
-            .collect();
-        let _ = writeln!(
-            t,
-            "  live keys: {} gets a live key only where you tick it, and this approval leaves \
-             {} unticked, so it creates no grant (live_not_ticked). Approve again with {}{}.",
-            who.trim_end(),
-            unticked.len(),
-            flags.join(" "),
-            if p.proposals.is_empty() {
-                ""
-            } else {
-                ", or bind a test key proposed above"
-            }
-        );
+    if unticked.is_empty() {
+        t.push_str("The passphrase you enter approves exactly this, and nothing else.\n");
+        return t;
     }
-    t.push_str("The passphrase you enter approves exactly this, and nothing else.\n");
+    let flags: Vec<String> = unticked
+        .iter()
+        .map(|n| format!("--live {}", e(n)))
+        .collect();
+    let _ = writeln!(
+        t,
+        "  live keys: {} gets a live key only where you tick it, and this approval leaves {} \
+         unticked, so it creates no grant (live_not_ticked). Approve again with {}{}.",
+        who.trim_end(),
+        unticked.len(),
+        flags.join(" "),
+        proposed_for(p, &unticked)
+            .map(|names| format!(", or bind the test key proposed above for {names}"))
+            .unwrap_or_default()
+    );
+    t.push_str(
+        "Nothing is approved: no passphrase is asked for an approval that leaves a live key \
+         unticked.\n",
+    );
     t
+}
+
+/// The variables among `unticked` that a proposal names, escaped and
+/// joined with commas, or `None` when no proposal names any: the test keys
+/// a refusal of an approval that leaves them unticked can point to.
+pub fn proposed_for(p: &PendingDescriptor, unticked: &[&str]) -> Option<String> {
+    let names: Vec<String> = unticked
+        .iter()
+        .filter(|n| p.proposals.iter().any(|x| x.env_name == **n))
+        .map(|n| escape_for_display(n))
+        .collect();
+    (!names.is_empty()).then(|| names.join(", "))
 }
 
 #[cfg(test)]

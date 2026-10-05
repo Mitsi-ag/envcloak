@@ -185,6 +185,17 @@ fn statement(t: &TargetView, to: ClassificationView) -> String {
 fn human(v: &ReclassifiedView) -> String {
     let mut o = String::new();
     match v.reclassified_from {
+        // A run needs a new approval only where a grant ended: with none,
+        // the line says so rather than that runs need one.
+        Some(from) if v.grants_ended == 0 => {
+            let _ = writeln!(
+                o,
+                "Reclassified {} from {} to {}. No grant bound it.",
+                shown(&v.slug),
+                from.as_str(),
+                v.classification.as_str(),
+            );
+        }
         Some(from) => {
             let _ = writeln!(
                 o,

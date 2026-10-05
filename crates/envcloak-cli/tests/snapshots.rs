@@ -384,6 +384,8 @@ fn every_command_prints_its_value_free_snapshot() {
     // The request is an unknown process's, and binds two live keys: an
     // approval without their ticks is refused before the passphrase is
     // read (SPEC §10b "Live-key guard"), and the statement says which.
+    // The refusal is the daemon's, and audited: `audit verify` below
+    // counts its entry.
     s.snap(
         "approve-live-not-ticked",
         &s.person(&["approve", &id, "--passphrase-fd", "3"], &[]),

@@ -574,17 +574,49 @@ fn a_run_answer_carries_values_only_when_covered_and_well_formed() {
                 proposal("A", "b/live", "b/test", None),
             ],
         ),
+        // A layer of the wrong shape: a profile's name, an env file's
+        // line 0.
+        RunAnswer::pending(
+            "ABCDEFGH".into(),
+            vec![sourced(
+                proposal("A", "a/live", "a/test", None),
+                envcloak_policy::BindingSource::Profile {
+                    profile: "Not A Profile".into(),
+                },
+            )],
+        ),
+        RunAnswer::pending(
+            "ABCDEFGH".into(),
+            vec![sourced(
+                proposal("A", "a/live", "a/test", None),
+                envcloak_policy::BindingSource::EnvFile { line: 0 },
+            )],
+        ),
     ];
     for (i, a) in bad.iter().enumerate() {
         assert!(!a.well_formed(), "case {i}");
     }
     // The positive control: a pending answer with well-formed proposals,
-    // which crosses the wire whole.
+    // one from each layer, which crosses the wire whole.
     let proposed = RunAnswer::pending(
         "ABCDEFGH".into(),
         vec![
             proposal("A", "a/live", "a/test", None),
             proposal("B", "b/live", "b/test", Some("secret")),
+            sourced(
+                proposal("C", "c/live", "c/test", None),
+                envcloak_policy::BindingSource::Profile {
+                    profile: "dev".into(),
+                },
+            ),
+            sourced(
+                proposal("D", "d/live", "d/test", None),
+                envcloak_policy::BindingSource::EnvFile { line: 3 },
+            ),
+            sourced(
+                proposal("E", "e/live", "e/test", None),
+                envcloak_policy::BindingSource::Ref,
+            ),
         ],
     );
     assert!(proposed.well_formed());
@@ -604,7 +636,16 @@ fn proposal(env: &str, live: &str, test: &str, field: Option<&str>) -> envcloak_
         live_slug: live.to_owned(),
         test_slug: test.to_owned(),
         test_field: field.map(str::to_owned),
+        source: envcloak_policy::BindingSource::Env,
     }
+}
+
+/// `x` with the live binding from `source`.
+fn sourced(
+    x: envcloak_policy::Proposal,
+    source: envcloak_policy::BindingSource,
+) -> envcloak_policy::Proposal {
+    envcloak_policy::Proposal { source, ..x }
 }
 
 /// The tokens in the first column of docs/IPC.md's "Reasons" table, in

@@ -9,10 +9,10 @@
 #![allow(clippy::unwrap_used)]
 
 use envcloak_policy::{
-    ApprovalOptions, BindingSummary, EnvName, Mode, PendingDescriptor, ProcessSummary,
-    ProjectSummary, Proposal, RENDER_LIMIT, STATEMENT_DOMAIN, SubjectKind, SubjectSummary, Uses,
-    canonical_statement, escape_for_display, live_guarded, render_statement, statement_digest,
-    unticked_live,
+    ApprovalOptions, BindingSource, BindingSummary, EnvName, Mode, PendingDescriptor,
+    ProcessSummary, ProjectSummary, Proposal, RENDER_LIMIT, STATEMENT_DOMAIN, SubjectKind,
+    SubjectSummary, Uses, canonical_statement, escape_for_display, live_guarded, render_statement,
+    statement_digest, unticked_live,
 };
 
 fn descriptor(argv: Vec<String>) -> PendingDescriptor {
@@ -73,7 +73,13 @@ fn proposal(env: &str, live: &str, test: &str, field: Option<&str>) -> Proposal 
         live_slug: live.to_owned(),
         test_slug: test.to_owned(),
         test_field: field.map(str::to_owned),
+        source: BindingSource::Env,
     }
+}
+
+/// `x` with its live binding from `source`.
+fn from(x: Proposal, source: BindingSource) -> Proposal {
+    Proposal { source, ..x }
 }
 
 /// [`descriptor`] with the Stripe test item proposed for its live
@@ -401,9 +407,10 @@ fn each_pid_is_bound_with_its_sign() {
 }
 
 /// Golden vectors of `envcloak-statement/2` (M2-13): the digests of this
-/// file's descriptor without and with a proposal, as the independent
-/// encoder (`tests/oracles/statement.py`) gives them, fixed here so a
-/// change to the format is a change to this test. The version 1 digest of
+/// file's descriptor without a proposal, with one from `[env]` and with one
+/// from a profile, as the independent encoder
+/// (`tests/oracles/statement.py`) gives them, fixed here so a change to
+/// the format is a change to this test. The version 1 digest of
 /// the same descriptor (M1's golden vector, which the encoder's version 1
 /// reproduces) is not what the crate gives: a statement shown before the
 /// upgrade approves nothing after it (SPEC §10b; docs/IPC.md "Statement
@@ -420,11 +427,21 @@ fn statement_v2_golden_vectors() {
     );
     assert_eq!(
         hex(&proposed),
-        "76a96288a2d66e0bcb1168fd6c7684d478a78c381063241df613b132b7844a89"
+        "b53bf8045a752e521fedd2fe72df290b21a29e7831891d3b3b01beb6dc87b015"
+    );
+    let mut d = proposing(strings(&["./emit", "a b"]));
+    d.proposals[0].source = BindingSource::Profile {
+        profile: "dev".into(),
+    };
+    let profiled = statement_digest(&d, &o);
+    assert_eq!(
+        hex(&profiled),
+        "fe3898bdc573ccb385aa0b41706119ac6619eddb64d829e3e055b97651b27d36"
     );
     const V1: &str = "825ff7c19353506ba2da685f5081d90f44238198147ad60708dd84276201053f";
     assert_ne!(hex(&plain), V1);
     assert_ne!(hex(&proposed), V1);
+    assert_ne!(hex(&profiled), V1);
 }
 
 /// The canonical statement against an independent encoder of
@@ -481,7 +498,39 @@ fn the_canonical_statement_matches_an_independent_encoder() {
     several
         .proposals
         .push(proposal("中文", "a\u{202e}b", "c\u{0}d", Some("é")));
+    // Each layer, a profile's name empty and multibyte, a line at its
+    // bounds.
+    for source in [
+        BindingSource::Profile {
+            profile: "dev".into(),
+        },
+        BindingSource::Profile {
+            profile: String::new(),
+        },
+        BindingSource::Profile {
+            profile: "中\u{202e}".into(),
+        },
+        BindingSource::EnvFile { line: 1 },
+        BindingSource::EnvFile { line: u32::MAX },
+        BindingSource::Ref,
+    ] {
+        several
+            .proposals
+            .push(from(proposal("X", "x/live", "x/test", None), source));
+    }
     cases.push((several, once));
+    // A pair whose proposals differ in their layer alone.
+    let first_layer = cases.len();
+    for source in [
+        BindingSource::Env,
+        BindingSource::Profile {
+            profile: "env".into(),
+        },
+    ] {
+        let mut d = proposing(strings(&["./emit"]));
+        d.proposals[0].source = source;
+        cases.push((d, o.clone()));
+    }
     let input = serde_json::to_vec(
         &cases
             .iter()
@@ -538,6 +587,11 @@ fn the_canonical_statement_matches_an_independent_encoder() {
     // The second control: version 1 cannot tell the pair apart.
     let (a, b) = (&got[first_proposal], &got[first_proposal + 1]);
     assert_eq!(a["v1"], b["v1"]);
+    assert_ne!(a["signed"], b["signed"]);
+    // The third: without the layers, the pair that differs in its layer
+    // alone encodes alike; the crate tells it apart.
+    let (a, b) = (&got[first_layer], &got[first_layer + 1]);
+    assert_eq!(a["unsourced"], b["unsourced"]);
     assert_ne!(a["signed"], b["signed"]);
 }
 
@@ -649,24 +703,26 @@ Approval request ABCDEFGH
   manifest: /src/acme-web/envcloak.toml sha256 abababababababababababababababababababababababababababababababab
   test keys of the same provider, proposed instead of live ones (EnvCloak never swaps them in: bind one, then run the command again):
     STRIPE_SECRET_KEY: the test key stripe/acme-test, not the live key stripe/acme-web
-      envcloak ref STRIPE_SECRET_KEY=stripe/acme-test
+      to bind it: run `envcloak ref STRIPE_SECRET_KEY=stripe/acme-test`
     OPENAI_API_KEY: the test key openai/acme-\\u{1b}[31mtest#api\\u{200b}key, not the live key openai/acme\\u{202e}-live
-      envcloak ref OPENAI_API_KEY=openai/acme-\\u{1b}[31mtest#api\\u{200b}key
+      to bind it: run `envcloak ref OPENAI_API_KEY=openai/acme-\\u{1b}[31mtest#api\\u{200b}key`
   bindings (inject mode):
     OPENAI_API_KEY = openai/acme-web#value  (test key, first use: no project uses this item yet)
     STRIPE_SECRET_KEY = stripe/acme-web#value  (live key, live: not allowed by you, so this approval is refused unless you add --live STRIPE_SECRET_KEY)
   command (1 arguments):
     [0] ./emit
   grant: once, for the next matching request within 10m
-  live keys: agent EnvCloak test fixture agent gets a live key only where you tick it, and this approval leaves 1 unticked, so it creates no grant (live_not_ticked). Approve again with --live STRIPE_SECRET_KEY, or bind a test key proposed above.
-The passphrase you enter approves exactly this, and nothing else.
+  live keys: agent EnvCloak test fixture agent gets a live key only where you tick it, and this approval leaves 1 unticked, so it creates no grant (live_not_ticked). Approve again with --live STRIPE_SECRET_KEY, or bind the test key proposed above for STRIPE_SECRET_KEY.
+Nothing is approved: no passphrase is asked for an approval that leaves a live key unticked.
 ";
 
 /// Gate 40, sentence 2 (SPEC §10b): the test item is proposed first.
-/// The rendering lists each proposal, with the `envcloak ref` line that
-/// binds it, before the bindings and their ticks, every string escaped:
-/// a program answering in the daemon's place could send anything. The
-/// whole statement is compared ([`PROPOSED_SNAPSHOT`]).
+/// The rendering lists each proposal, with how to bind it (here the
+/// `envcloak ref` line, for bindings of `[env]`), before the bindings and
+/// their ticks, every string escaped: a program answering in the daemon's
+/// place could send anything. The whole statement is compared
+/// ([`PROPOSED_SNAPSHOT`]); refused as it stands, it says that nothing is
+/// approved, not what a passphrase approves.
 #[test]
 fn the_statement_lists_the_test_item_before_the_live_one() {
     let mut d = proposing(strings(&["./emit"]));
@@ -682,8 +738,166 @@ fn the_statement_lists_the_test_item_before_the_live_one() {
     let test = text.find("stripe/acme-test").unwrap();
     let live = text.find("STRIPE_SECRET_KEY = stripe/acme-web").unwrap();
     assert!(test < live, "{text}");
-    // With no proposal, no such section.
+    // With no proposal, no such section, and the refusal names no test
+    // key.
     let none = render_statement(&descriptor(strings(&["./emit"])), &ticking(&[]));
     assert!(!none.contains("test keys of the same provider"), "{none}");
-    assert!(!none.contains("or bind a test key"), "{none}");
+    assert!(!none.contains("or bind"), "{none}");
+    assert!(none.contains("Nothing is approved"), "{none}");
+    assert!(!none.contains("The passphrase you enter"), "{none}");
+    // Ticked, the approval goes ahead: the statement says what the
+    // passphrase approves.
+    let ticked = render_statement(&d, &ticking(&["STRIPE_SECRET_KEY"]));
+    assert!(
+        ticked.ends_with("The passphrase you enter approves exactly this, and nothing else.\n")
+    );
+    assert!(!ticked.contains("Nothing is approved"), "{ticked}");
+}
+
+/// The refusal's tail names a test key only for an unticked binding a
+/// proposal is for (verifier, round 2: it said "or bind a test key" when
+/// the only proposal was for another binding, or for none).
+///
+/// Mutation: the tail on any proposal at all (`!p.proposals.is_empty()`
+/// in place of `proposed_for`): the statement whose proposal is for a
+/// ticked binding says "or bind" and this fails.
+#[test]
+fn the_refusal_names_a_test_key_only_for_an_unticked_binding() {
+    let mut d = of_kind(
+        SubjectKind::Agent,
+        &[("A_KEY", "a/live", "live"), ("B_KEY", "b/live", "live")],
+    );
+    d.proposals = vec![proposal("B_KEY", "b/live", "b/test", None)];
+    // B is ticked, A is not: A has no test key to bind.
+    let text = render_statement(&d, &ticking(&["B_KEY"]));
+    assert!(text.contains("Approve again with --live A_KEY."), "{text}");
+    assert!(!text.contains("or bind"), "{text}");
+    // Neither ticked: B's test key is named, for B alone.
+    let text = render_statement(&d, &ticking(&[]));
+    assert!(
+        text.contains(
+            "Approve again with --live A_KEY --live B_KEY, or bind the test key proposed \
+             above for B_KEY."
+        ),
+        "{text}"
+    );
+}
+
+/// How to bind the test item follows the layer the live binding came from
+/// (verifier and Codex, round 2: `envcloak ref NAME=...` writes `[env]`,
+/// which a profile, an env file or a `--ref` replaces, so following it
+/// asked for the live item again): `[env]` and a profile name the
+/// `envcloak ref` line, with `--profile` for a profile; an env file names
+/// its line; a `--ref` says to give another. That following each binds the
+/// test item is checked end to end in `crates/envcloak-cli/tests/live_guard.rs`.
+///
+/// Mutation: every layer advised as `[env]` (`advice` answering `envcloak
+/// ref NAME=...` whatever the source): the profile, env file and `--ref`
+/// cases fail.
+#[test]
+fn the_advice_follows_the_layer_the_live_binding_came_from() {
+    let none = |_: &str| false;
+    let with = |source| {
+        from(
+            proposal("STRIPE_KEY", "stripe/live", "stripe/test", Some("secret")),
+            source,
+        )
+    };
+    let cases = [
+        (
+            BindingSource::Env,
+            "run `envcloak ref STRIPE_KEY=stripe/test#secret`",
+        ),
+        (
+            BindingSource::Profile {
+                profile: "dev".into(),
+            },
+            "run `envcloak ref --profile dev STRIPE_KEY=stripe/test#secret`",
+        ),
+        (
+            BindingSource::EnvFile { line: 7 },
+            "set line 7 of the --env-file to `STRIPE_KEY=envcloak://stripe/test#secret`",
+        ),
+        (
+            BindingSource::Ref,
+            "give `--ref STRIPE_KEY=stripe/test#secret` in place of the --ref for STRIPE_KEY",
+        ),
+    ];
+    for (source, advice) in cases {
+        let x = with(source);
+        assert_eq!(x.advice(&none), advice);
+        // The statement shows the same advice.
+        let mut d = proposing(strings(&["./emit"]));
+        d.proposals = vec![x];
+        let text = render_statement(&d, &ticking(&[]));
+        assert!(
+            text.contains(&format!("      to bind it: {advice}\n")),
+            "{text}"
+        );
+    }
+}
+
+/// A proposal is not approved, so a name of one shaped like a key or
+/// token is not shown: generated canaries, each a valid variable name,
+/// slug, field or profile name of a key's shape, never reach the statement
+/// or the advice, and [`HIDDEN`] stands in their place (Codex, round 2:
+/// the proposal paths escaped names but did not mask them). The bindings,
+/// which the passphrase approves, are shown whole (gate 23). The positive
+/// control: the same names, not taken for keys, are shown.
+///
+/// Mutation: the names escaped only (`shown_name` answering
+/// `escape_for_display` whatever it is asked): the canaries are in the
+/// text and this fails.
+#[test]
+fn a_proposed_name_shaped_like_a_key_is_not_shown() {
+    use envcloak_policy::{HIDDEN, render_statement_with, value_shaped};
+    // A key's shape from generated canaries: their letters and digits,
+    // lower case (a slug's, a field's and a profile's grammar), 48 of them.
+    let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+    let token: String = cs
+        .iter()
+        .flat_map(|c| c.value().to_vec())
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|b| char::from(b).to_ascii_lowercase())
+        .take(42)
+        .chain("x1y2z3".chars())
+        .collect();
+    assert_eq!(token.len(), 48);
+    assert!(value_shaped(&token), "{token}");
+    let upper = token.to_ascii_uppercase();
+    for x in [
+        proposal(&format!("K{upper}"), "stripe/live", "stripe/test", None),
+        proposal("KEY", &format!("stripe/{token}"), "stripe/test", None),
+        proposal("KEY", "stripe/live", &format!("stripe/{token}"), None),
+        proposal("KEY", "stripe/live", "stripe/test", Some(&token)),
+        from(
+            proposal("KEY", "stripe/live", "stripe/test", None),
+            BindingSource::Profile {
+                profile: token.clone(),
+            },
+        ),
+    ] {
+        assert!(x.well_formed(), "{x:?}");
+        let mut d = proposing(strings(&["./emit"]));
+        d.proposals = vec![x.clone()];
+        for text in [
+            render_statement(&d, &ticking(&[])),
+            render_statement_with(&d, &ticking(&[]), &value_shaped),
+        ] {
+            assert!(!text.to_ascii_lowercase().contains(&token), "{text}");
+            assert!(text.contains(HIDDEN), "{text}");
+        }
+        // The advice names no live slug; the rest is hidden there too.
+        let advice = x.advice(&value_shaped);
+        assert!(!advice.to_ascii_lowercase().contains(&token), "{advice}");
+        // The control: not taken for a key, the name is shown.
+        let shown = render_statement_with(&d, &ticking(&[]), &|_| false);
+        assert!(shown.to_ascii_lowercase().contains(&token[..24]), "{shown}");
+        assert!(!shown.contains(HIDDEN), "{shown}");
+    }
+    // A binding's own name is shown whole: the passphrase approves it.
+    let mut d = of_kind(SubjectKind::Terminal, &[("KEY", "stripe/live", "live")]);
+    d.bindings[0].slug = format!("stripe/{token}");
+    let text = render_statement(&d, &ticking(&[]));
+    assert!(text.contains(&format!("stripe/{token}")), "{text}");
 }

@@ -108,6 +108,7 @@ use std::time::Duration;
 use envcloak_client::claims::claims;
 use envcloak_client::connect::{connect, run_paths};
 use envcloak_client::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, traced, usage};
+use envcloak_client::render::proposal_text;
 use envcloak_client::run_status::{Exit, RunStatus};
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
@@ -120,7 +121,7 @@ use envcloak_ipc::wait::{
 use envcloak_ipc::{Client, ClientError};
 use envcloak_policy::{
     Binding, EnvFileRefs, EnvName, GrantId, MAX_ENV_FILE, Mode, PendingId, PendingState, PlainVar,
-    Proposal, escape_for_display, find_manifest, parse_env_file_refs,
+    Proposal, find_manifest, parse_env_file_refs,
 };
 use zeroize::Zeroize;
 
@@ -627,24 +628,16 @@ fn wait_for(
 
 /// What the `approval_required` line adds for the test items the daemon
 /// proposes in place of live ones (SPEC §10b "Live-key guard"): for each,
-/// the variable, the live item, and the `envcloak ref` line that binds the
-/// test item. The daemon never substitutes one. Every name is escaped; the
+/// the variable, the live item, the test item and how to bind it for the
+/// layer the live binding came from
+/// ([`envcloak_client::render::proposal_text`]: names escaped, one shaped
+/// like a key or token hidden). The daemon never substitutes one. The
 /// client took only an answer whose names have the daemon's shapes
 /// (`RunAnswer::well_formed`).
 fn proposed(proposals: &[Proposal]) -> String {
-    let e = escape_for_display;
     proposals
         .iter()
-        .map(|x| {
-            format!(
-                "; {} is bound to the live key {}: to use the test key {} instead, run `{}` \
-                 and run this again",
-                e(&x.env_name),
-                e(&x.live_slug),
-                e(&x.reference()),
-                x.ref_line()
-            )
-        })
+        .map(|x| format!("; {}", proposal_text(x, "run this again")))
         .collect()
 }
 
@@ -880,6 +873,60 @@ mod tests {
             file.read_to_end(&mut written).unwrap();
             assert_eq!(RunStatus::decode(&written), Some(record), "{what}");
         }
+    }
+
+    /// The `approval_required` line's test keys (SPEC §10b "Live-key
+    /// guard"): each with how to bind it; a name shaped like a key or
+    /// token (generated canaries, each a valid name of its kind) is never
+    /// printed, the words every metadata command prints in its place are
+    /// (Codex, round 2: the line escaped names but did not mask them). The
+    /// control: ordinary names are printed.
+    ///
+    /// Mutation: `proposal_text` escaping only: the canaries are on the
+    /// line and this fails.
+    #[test]
+    fn the_line_names_each_test_key_and_hides_a_key_shaped_name() {
+        use envcloak_policy::BindingSource;
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        let token: String = cs
+            .iter()
+            .flat_map(|c| c.value().to_vec())
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|b| char::from(b).to_ascii_lowercase())
+            .take(42)
+            .chain("x1y2z3".chars())
+            .collect();
+        let x = |env: &str, live: &str, test: &str, field: Option<&str>| Proposal {
+            env_name: env.to_owned(),
+            live_slug: live.to_owned(),
+            test_slug: test.to_owned(),
+            test_field: field.map(str::to_owned),
+            source: BindingSource::EnvFile { line: 4 },
+        };
+        let upper = format!("K{}", token.to_ascii_uppercase());
+        let slug = format!("stripe/{token}");
+        let line = proposed(&[
+            x("STRIPE_SECRET_KEY", "stripe/live", "stripe/test", None),
+            x(&upper, "stripe/live", "stripe/test", None),
+            x("A_KEY", &slug, "stripe/test", None),
+            x("B_KEY", "stripe/live", &slug, None),
+            x("C_KEY", "stripe/live", "stripe/test", Some(&token)),
+        ]);
+        assert!(!line.to_ascii_lowercase().contains(&token), "{line}");
+        assert_eq!(
+            line.matches(envcloak_client::render::HIDDEN).count(),
+            7,
+            "{line}"
+        );
+        assert!(
+            line.starts_with(
+                "; STRIPE_SECRET_KEY is bound to the live key stripe/live: to use the test key \
+                 stripe/test instead, set line 4 of the --env-file to \
+                 `STRIPE_SECRET_KEY=envcloak://stripe/test`, and run this again; "
+            ),
+            "{line}"
+        );
+        assert_eq!(proposed(&[]), "");
     }
 
     #[test]

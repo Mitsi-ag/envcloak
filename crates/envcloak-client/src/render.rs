@@ -36,7 +36,7 @@ use envcloak_ipc::view::{
     RecoveryConfirmedView, RefChange, RefEditView, RefStatus, RemovedView, RotatedView, SkipReason,
     TargetView, UndoReport, View,
 };
-use envcloak_policy::{display_escaped, escape_for_display, value_shaped};
+use envcloak_policy::{Proposal, display_escaped, escape_for_display, shown_name, value_shaped};
 
 /// The most env files `envcloak check` reads in a directory, the first by
 /// name; the rest are counted as not read, and the report says so.
@@ -156,8 +156,9 @@ pub fn print_json<T: serde::Serialize + ?Sized>(v: &T) {
     println!("{}", json_text(v));
 }
 
-/// What is printed in place of a name that looks like a value.
-pub const HIDDEN: &str = "[not shown: looks like a key or token]";
+/// What is printed in place of a name that looks like a value: the words
+/// an approval statement shows in place of a proposed name too.
+pub use envcloak_policy::HIDDEN;
 
 /// The provider registry compiled into this build, loaded once. `None`
 /// when it did not load; names are then checked by their shape alone.
@@ -187,6 +188,25 @@ pub fn shown(s: &str) -> String {
     } else {
         escape_for_display(s)
     }
+}
+
+/// A test item proposed in place of a live one (SPEC §10b "Live-key
+/// guard"), as the `approval_required` text of `envcloak run` and
+/// `envcloak mcp` names it: the variable, the live item, the test item and
+/// how to bind it in the live one's place for the layer the live binding
+/// came from ([`Proposal::advice`]), then `then`. Every name is escaped,
+/// and one that looks like a key or token ([`looks_like_value`]) is
+/// [`HIDDEN`]: the daemon's answer is the only source of these names, and
+/// a program can answer in its place (SPEC §1.1).
+pub fn proposal_text(x: &Proposal, then: &str) -> String {
+    let hide = |s: &str| shown_name(s, &looks_like_value);
+    format!(
+        "{} is bound to the live key {}: to use the test key {} instead, {}, and {then}",
+        hide(&x.env_name),
+        hide(&x.live_slug),
+        x.shown_reference(&looks_like_value),
+        x.advice(&looks_like_value)
+    )
 }
 
 /// A path as it may be printed: escaped only. A path is not a name in

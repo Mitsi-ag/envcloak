@@ -16,6 +16,7 @@ use envcloak_core::vault::{
     Account, Classification, FieldId, FieldKind, FieldMeta, FieldName, ItemDetails, ItemId,
     ItemMeta, Slug,
 };
+use envcloak_policy::BindingSource;
 use envcloak_policy::{
     AUTO_DENY, AccessRequest, Ancestor, ApprovalOptions, ApprovalProof, ApproveError,
     AttemptLimiter, BoundBinding, BoundRef, CatalogSource, ChainEnd, Claims, DENIAL_WINDOW,
@@ -161,6 +162,7 @@ fn bound(env: &str, it: &Item) -> BoundRef {
         slug: Slug::new(it.slug).unwrap(),
         field_name: FieldName::new("value").unwrap(),
         first_use: false,
+        source: envcloak_policy::BindingSource::Env,
     }
 }
 
@@ -1956,6 +1958,7 @@ fn binding_of(env: &str, m: &ItemMeta, field: &str) -> BoundRef {
         slug: m.slug.clone(),
         field_name: f.name.clone(),
         first_use: false,
+        source: envcloak_policy::BindingSource::Env,
     }
 }
 
@@ -1964,8 +1967,15 @@ fn binding_of(env: &str, m: &ItemMeta, field: &str) -> BoundRef {
 /// provider's, not a live or unknown one, not one whose account label
 /// differs from the live item's when both have one, not a card's or a
 /// login's, not one a reference cannot bind unambiguously. One per
-/// binding, the one with an equal account label first, then by slug; a
-/// test binding, an unknown one and an item of no provider get none.
+/// binding, the one with an equal account label first, then by slug, with
+/// the layer the binding came from; a test binding, an unknown one and an
+/// item of no provider get none.
+///
+/// Mutation (verifier, round 2): candidates of any classification but
+/// live (`classification != Live` in place of `== Test`): the unknown item
+/// of the same provider and label, which sorts before every test item, is
+/// proposed and this fails. And of any classification at all: the live one
+/// that sorts first is.
 #[test]
 fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
     let live_one = provider_item(
@@ -2047,6 +2057,44 @@ fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
         &["value"],
     );
     no_provider.details.provider = None;
+    // Of the same provider and the same account label as `live_one`, and
+    // sorting before every test item: an unknown key and another live
+    // one. Neither is a test key (SPEC §10b: `unknown` is not), so neither
+    // is ever proposed, whatever the order.
+    let unknown_first = provider_item(
+        "stripe/a-unknown",
+        "stripe",
+        Classification::Unknown,
+        Some("acme"),
+        &["value"],
+    );
+    let live_first = provider_item(
+        "stripe/a-live",
+        "stripe",
+        Classification::Live,
+        Some("acme"),
+        &["value"],
+    );
+    // A login and a card classified test, of the same provider and label,
+    // sorting before every secret: never proposed, as no reference binds
+    // them (verifier, round 2: the login sorted after the test items, so
+    // its filter could be dropped unseen).
+    let mut login_first = provider_item(
+        "stripe/a-a-login",
+        "stripe",
+        Classification::Test,
+        Some("acme"),
+        &["value"],
+    );
+    login_first.class = ItemClass::Login;
+    let mut card_first = provider_item(
+        "stripe/a-b-card",
+        "stripe",
+        Classification::Test,
+        Some("acme"),
+        &["value"],
+    );
+    card_first.class = ItemClass::Card;
     let vault = vec![
         live_one.clone(),
         live_two.clone(),
@@ -2059,24 +2107,36 @@ fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
         unknown_class.clone(),
         login,
         no_provider.clone(),
+        unknown_first.clone(),
+        live_first.clone(),
+        login_first.clone(),
+        card_first.clone(),
     ];
-    let bindings = vec![
+    let mut bindings = vec![
         binding_of("STRIPE_SECRET_KEY", &live_one, "value"),
         binding_of("STRIPE_TWO_KEY", &live_two, "secret"),
         binding_of("STRIPE_TEST_KEY", &test_unlabeled, "value"),
         binding_of("STRIPE_UNKNOWN_KEY", &unknown_class, "value"),
         binding_of("NO_PROVIDER_KEY", &no_provider, "value"),
     ];
+    // The second binding came from a profile: its proposal says so.
+    let dev = BindingSource::Profile {
+        profile: "dev".to_owned(),
+    };
+    bindings[1].source = dev.clone();
     let got = proposals(&bindings, &vault);
     assert_eq!(
         got,
         vec![
-            // The equal account label first, though another sorts before.
+            // The equal account label first, though another sorts before;
+            // never the unknown or the live one of that label, which sort
+            // first.
             Proposal {
                 env_name: "STRIPE_SECRET_KEY".to_owned(),
                 live_slug: "stripe/acme-live".to_owned(),
                 test_slug: "stripe/zzz-test".to_owned(),
                 test_field: None,
+                source: BindingSource::Env,
             },
             // No label on the live item: the first by slug that a
             // reference binds (one field, or the binding's field).
@@ -2085,8 +2145,51 @@ fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
                 live_slug: "stripe/two-live".to_owned(),
                 test_slug: "stripe/aa-other".to_owned(),
                 test_field: None,
+                source: dev.clone(),
             },
         ]
+    );
+    // With no test item of the provider left, nothing is proposed: not the
+    // unknown key, not the other live one, however they sort.
+    let no_test: Vec<ItemMeta> = vault
+        .iter()
+        .filter(|m| m.details.classification != Classification::Test)
+        .cloned()
+        .collect();
+    assert!(no_test.iter().any(|m| m.id == unknown_first.id));
+    assert!(no_test.iter().any(|m| m.id == live_first.id));
+    assert_eq!(proposals(&bindings, &no_test), Vec::<Proposal>::new());
+    // The positive controls: the login and the card made secrets are
+    // proposed first, as their label and slug put them; and the unknown
+    // item made a test key is proposed first.
+    for first in [&login_first, &card_first] {
+        let mut as_secret = vault.clone();
+        as_secret
+            .iter_mut()
+            .filter(|m| m.id == login_first.id || m.id == card_first.id)
+            .filter(|m| m.id != first.id)
+            .for_each(|m| m.details.classification = Classification::Live);
+        as_secret
+            .iter_mut()
+            .find(|m| m.id == first.id)
+            .unwrap()
+            .class = ItemClass::Secret;
+        assert_eq!(
+            proposals(&bindings[..1], &as_secret)[0].test_slug,
+            first.slug.as_str()
+        );
+    }
+    // The unknown item made a test key is proposed first.
+    let mut made_test = no_test.clone();
+    made_test
+        .iter_mut()
+        .find(|m| m.id == unknown_first.id)
+        .unwrap()
+        .details
+        .classification = Classification::Test;
+    assert_eq!(
+        proposals(&bindings[..1], &made_test)[0].test_slug,
+        "stripe/a-unknown"
     );
     // Without the item of an equal label, an unlabeled one; never the
     // other label's.
@@ -2099,7 +2202,16 @@ fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
         proposals(&bindings[..1], &fewer)[0].test_slug,
         "stripe/aaa-test"
     );
-    // A test item of several fields binds by the live binding's field.
+    // A test item of several fields binds by the live binding's field; one
+    // without that field cannot be bound by a reference, and is not
+    // proposed, though it is the only test item there.
+    assert_eq!(
+        proposals(
+            &bindings[1..2],
+            &[live_two.clone(), test_wrong_fields.clone()]
+        ),
+        Vec::<Proposal>::new()
+    );
     let only_two: Vec<ItemMeta> = vec![live_two.clone(), test_two_fields.clone()];
     assert_eq!(
         proposals(&bindings[1..2], &only_two),
@@ -2108,6 +2220,7 @@ fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
             live_slug: "stripe/two-live".to_owned(),
             test_slug: "stripe/bbb-test".to_owned(),
             test_field: Some("secret".to_owned()),
+            source: dev,
         }]
     );
     // The proposal is read from the vault as it is: the live item as a
@@ -2129,7 +2242,7 @@ fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
     let ticks = text.find("STRIPE_SECRET_KEY = stripe/acme-live").unwrap();
     assert!(test < ticks, "{text}");
     assert!(
-        text.contains("envcloak ref STRIPE_SECRET_KEY=stripe/zzz-test"),
+        text.contains("run `envcloak ref STRIPE_SECRET_KEY=stripe/zzz-test`"),
         "{text}"
     );
 }
