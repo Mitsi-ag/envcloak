@@ -9,7 +9,10 @@ values, executes profile contents, rewrites files, or grants cleanup authority.
 
 `scan_profiles` and `scan_config_sources` return a `ScanReport`, rather than the
 plan's sketch `Vec<Found>`, so partial findings and refusals cannot disappear.
-`complete()` is derived from its issues each time. Display paths and names must
+`complete()` is derived from its issues each time. `notes` lists existing
+credential and database stores deliberately outside scanner coverage; notes
+alone do not make a report incomplete. Absent optional stores produce neither
+notes nor issues. Unsafe or unreadable paths still produce issues. Display paths and names must
 pass the CLI's existing masking renderer; internal ranges, stamps, values and
 object identifiers are not report fields. Input-holding types have value-free
 Debug implementations. A consumer must treat an error or an incomplete report
@@ -25,19 +28,33 @@ a 1 MiB cap.
 Profiles cover the seven conventional shell files, literal `source`/`.` paths
 within the supplied home root, at most four source edges and 64 readable files.
 Only `$HOME` and `~` path prefixes expand. Assignments never execute. Dollar or
-backtick values contribute names only. POSIX quoting preserves Bash's ordinary
-double-quoted backslashes and CRLF bytes. Fish's supported subset is a single
-literal word in `set -x NAME value`. Lists, context-dependent expansion and
-unsupported commands are manual. Multiline assignments may supply values but
+backtick values contribute names only after syntax validation; comments do
+not affect value classification. POSIX quoting preserves Bash's ordinary
+double-quoted backslashes and CRLF bytes. Unquoted parentheses, including
+arrays, are manual; quoted and escaped parentheses remain literal. Fish's
+supported subset is a single literal word in `set -x`, `-gx`, `-Ux`, `-xg` or
+`-xU`. Lists, command and arithmetic substitutions, context-dependent expansion
+and unsupported commands are manual. Multiline assignments may supply values but
 cannot supply whole-line removal permission. Any unsupported syntax in a file
 removes automatic line-removal eligibility from its findings. M2-16 still has
 to satisfy every delete-plaintext gate before editing anything.
 
 JSON and TOML configs inspect MCP `env`/`environment`, `headers`/`http_headers`,
-`auth` and `envFile`. References contribute names only. JSON `args` literals
-carry a manual disposition. YAML and credential databases are reported without
-being parsed. `envFile` paths stay within the descriptor's approved root, use
-the dotenv reader, and consume the same byte budget. CodexBar's documented
+`auth` and `envFile` beneath `mcpServers`, `mcp_servers`, `mcp` or `servers`,
+plus top-level `env` settings. Both formats retain `args` literals with a manual
+disposition. The common config contract treats `${NAME}`, `${NAME:-default}`
+and `envcloak://` as names-only references. Other dollar bytes remain literal;
+unsupported braced syntax is manual with an issue. This conservative contract
+does not imply that every host interpolates these references.
+
+YAML produces an unsupported-format issue. Existing credential and database
+stores are noted without parsing contents. `envFile` directives stay distinct
+from bindings with that name. Included paths stay within the descriptor's
+approved root, use the dotenv reader, and consume the same byte and finding
+budgets. Template filenames such as `.env.example` contribute names only;
+unresolved include references produce `unread_env_file`. Candidate and
+occurrence limits bound config findings during accumulation, conservatively
+counting bindings before value de-duplication. CodexBar's documented
 provider key fields are inspected through provider-config descriptors, never
 registered as MCP servers. Host paths live only in the catalog.
 
@@ -66,9 +83,24 @@ A read file's stamp travels with occurrences; a change during the read makes
 the scan incomplete. Scrub must re-check that stamp at use.
 
 `Candidates` uses a new random BLAKE3 key for each run. Each distinct value and
-form has one id and every occurrence remains recorded. Default limits are
-1 GiB read, two million distinct candidates, four million occurrence records,
-10,000 source entries and 100,000 git objects. Limits are injectable in tests.
+form has one id. `Candidates::new` retains every accepted range for scrub.
+`Candidates::counted` instead retains a count per candidate and source (file or
+Git object), without ranges or rewrite authority. Doctor callers should use
+`Budget::for_counts()` for both the stream and collector. Repeated readings then
+consume no additional retained path or range record.
+
+Default limits are 1 GiB read, two million distinct candidates, four million
+emissions and retained records, 10,000 source entries and 100,000 Git objects.
+Count mode raises the emission allowance to 128 million, keeping the other
+limits. The retained-record cap applies to candidate/source pairs in count mode.
+At the denser host's measured 12,700 tokens/MiB and two readings per token
+(docs/AGENTS.md), four million emissions reach about 157 MiB; 128 million reach
+about 5,039 MiB, beyond the 1 GiB byte limit. Actual reach depends on token shape,
+unique candidates and source count; hitting any cap remains incomplete.
+A synthetic 32 MiB stream at that density with two distinct readings retained
+two count records versus 812,800 range records; peak RSS on arm64 macOS was
+about 3 MiB versus 121 MiB. This is a repeated-value measurement, not a bound for
+unique values. Limits are injectable in tests.
 A failed config read reserves its allowance against the byte budget; the report's
 byte count includes that conservative charge. No entry is evicted. A refused
 callback stops scanning with a reason. Callers
@@ -99,5 +131,6 @@ The tests use the independent cycle200 Bash corpus, Python JSON/encoding output,
 real git objects, and the pinned Claude Code and Codex CLIs and transcript
 stores. CodexBar is a documentation-derived fixture. Bounded proptest targets
 cover profile, config and transcript parsers; the milestone hardening task owns
-longer fuzz campaigns. Gate 11 uses the production wiping allocator, including
-library TOML parsing and its failure paths.
+longer fuzz campaigns. Gate 11 checks profile, JSON and JSONL buffers without allocator-assisted
+wiping as well as under the production wiping allocator. TOML's library parser
+is covered under the production allocator, including its failure paths.
