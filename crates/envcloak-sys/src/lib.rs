@@ -94,6 +94,7 @@ mod perm;
 mod proc;
 pub mod pty;
 mod pty_monitor;
+mod relay_io;
 mod session;
 mod signal;
 mod sock;
@@ -143,9 +144,10 @@ pub use proc::{
     parse_stat_state, parse_status_euid, proc_argv, proc_info, process_running, reaches_top,
     stat_state_exited,
 };
+pub use relay_io::{Readiness, reopen_terminal, set_nonblocking, wait_any};
 pub use session::new_session_on_spawn;
 pub use signal::{
-    TerminationSignals, TerminationWatch, exit_by_signal, interrupt_ends_process,
+    TerminationSignals, TerminationWatch, exit_by_signal, interrupt_ends_process, stop_own_job,
     termination_ends_process, termination_recorded, unblock_termination_on_spawn,
 };
 pub use sock::connect_unix;

@@ -299,6 +299,59 @@ fn unblock_here(signals: &[i32]) -> io::Result<()> {
     Ok(())
 }
 
+/// Stops this process's own process group as the suspend key would, and
+/// returns once it is continued: `SIGTSTP` gets its default action, the
+/// calling thread stops blocking it, `SIGTSTP` goes to the caller's own
+/// group (`kill(0, SIGTSTP)`, which names no number read from anywhere),
+/// and the disposition and the mask it had come back after. A job-control
+/// shell sees its job stopped and takes its terminal back; `fg` continues
+/// the group (SIGCONT), and this returns. `envcloak run --pty` calls it
+/// once its command is stopped and the outer terminal restored (M2 plan
+/// D-35). A group the kernel counts as orphaned (no parent in another
+/// group of its session, as under a terminal emulator that starts the
+/// program as its session's leader) is not stopped by `SIGTSTP`: this
+/// then returns at once.
+///
+/// # Errors
+/// When the disposition, the mask or the signal cannot be set or sent; a
+/// failure after the disposition changed puts it back first.
+pub fn stop_own_job() -> io::Result<()> {
+    // SAFETY: sigaction is plain data; the current action is read into it.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a null new action only reads the current one into `old`.
+    if unsafe { libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut old) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    default_action(libc::SIGTSTP)?;
+    let set = signal_set(&[libc::SIGTSTP])?;
+    // SAFETY: sigset_t is plain data; pthread_sigmask fills it in.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is initialized and `mask` writable; only the calling
+    // thread's mask changes.
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut mask) };
+    let sent = if rc == 0 {
+        // SAFETY: kill(0, ..) signals the caller's own process group; it
+        // has no memory effects. Delivered to this thread before kill
+        // returns (POSIX), the default action stops the process here.
+        if unsafe { libc::kill(0, libc::SIGTSTP) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    };
+    if rc == 0 {
+        // SAFETY: `mask` holds the mask pthread_sigmask returned above.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) };
+    }
+    // SAFETY: `old` is the action read above.
+    if unsafe { libc::sigaction(libc::SIGTSTP, &old, std::ptr::null_mut()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    sent
+}
+
 /// Ends the process by `sig` with its default action, as if the signal had
 /// never been caught: the parent sees a death by that signal. Falls back to
 /// exit status 128 + `sig` if the signal does not end the process.
