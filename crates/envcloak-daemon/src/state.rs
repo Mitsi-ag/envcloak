@@ -1068,15 +1068,20 @@ mod tests {
                 ttl_secs: DEFAULT_TTL.as_secs(),
                 live: Vec::new(),
             };
-            let digest =
-                statement_digest(s.grants().pending_descriptor(&approved, &t).unwrap(), &opts);
+            let vault = metas(&first);
+            let digest = statement_digest(
+                &s.grants()
+                    .pending_descriptor(&approved, &t, &vault)
+                    .unwrap(),
+                &opts,
+            );
             let proof = ApprovalProof {
                 approver: first.subject.clone(),
                 kind: ProofKind::Passphrase,
             };
             let g = s
                 .grants()
-                .approve(&approved, proof, opts, digest, &t)
+                .approve(&approved, proof, opts, digest, &t, &vault)
                 .unwrap();
             // Another item: the grant does not cover it.
             let Decision::Pending(waiting) = s.grants().decide(request("GITHUB_TOKEN"), &t) else {
@@ -1113,10 +1118,7 @@ mod tests {
             assert!(matches!(s.slot(), Slot::Locked(_)), "{reason:?}");
             assert_eq!(counts(&s, &t), (0, 0), "{reason:?}");
             assert!(s.grants().grant(g).is_none(), "{reason:?}");
-            assert!(
-                s.grants().pending_descriptor(&waiting, &t).is_none(),
-                "{reason:?}"
-            );
+            assert!(s.grants().pending(&waiting, &t).is_none(), "{reason:?}");
             // Unlocked again, the store starts empty: the request the
             // grant covered is pending again.
             unlock(&f, &mut s, PASS).unwrap();
@@ -1631,12 +1633,51 @@ mod tests {
         let Decision::Pending(id) = s.grants().decide(r.clone(), &t) else {
             panic!("expected a pending request");
         };
-        let digest = statement_digest(s.grants().pending_descriptor(&id, &t).unwrap(), &opts);
+        let vault = metas(&r);
+        let digest = statement_digest(
+            &s.grants().pending_descriptor(&id, &t, &vault).unwrap(),
+            &opts,
+        );
         let proof = ApprovalProof {
             approver: r.subject,
             kind: ProofKind::Passphrase,
         };
-        s.grants().approve(&id, proof, opts, digest, &t).unwrap()
+        s.grants()
+            .approve(&id, proof, opts, digest, &t, &vault)
+            .unwrap()
+    }
+
+    /// The vault's metadata for the items `r` binds: one secret with one
+    /// field each, classified as `r` read it.
+    fn metas(r: &envcloak_policy::AccessRequest) -> Vec<envcloak_core::vault::ItemMeta> {
+        use envcloak_core::crypto::ItemClass;
+        use envcloak_core::vault::{FieldKind, FieldMeta, ItemDetails, ItemMeta};
+        r.bindings
+            .iter()
+            .map(|b| ItemMeta {
+                id: b.binding.item,
+                class: ItemClass::Secret,
+                slug: b.slug.clone(),
+                details: ItemDetails {
+                    classification: b.binding.classification,
+                    ..ItemDetails::default()
+                },
+                created_at: 0,
+                updated_at: 0,
+                fields: vec![FieldMeta {
+                    id: b.binding.field,
+                    name: b.field_name.clone(),
+                    kind: FieldKind::Value,
+                    prior_count: 0,
+                    created_at: 0,
+                    updated_at: 0,
+                }],
+                classification_changed_at: None,
+                exposure: None,
+                rotate_recommended: false,
+                login: None,
+            })
+            .collect()
     }
 
     /// Every process is still running: what `alive` says when no root

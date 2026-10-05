@@ -56,10 +56,10 @@ use envcloak_ipc::proto::{
     self, Approve, AuditVerify, BackupBegin, BackupCommit, BackupCreate, BackupList,
     BackupOpenRestore, BackupPut, BackupRead, BackupRecordResult, Deny, ErrorKind, FilesBackup,
     FilesRestore, FilesShow, GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify,
-    IncomingRequest, ItemsAdd, ItemsCheck, ItemsList, ItemsMarkExposed, ItemsRemove, ItemsRotate,
-    ItemsShow, ItemsTarget, Lock, Method, PendingGet, PendingList, PendingPoll, RecoveryConfirm,
-    Role, RunRequest, ScanMatch, Status, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
-    VaultRecover, loggable_method, required_role,
+    IncomingRequest, ItemsAdd, ItemsCheck, ItemsList, ItemsMarkExposed, ItemsReclassify,
+    ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock, Method, PendingGet, PendingList,
+    PendingPoll, RecoveryConfirm, Role, RunRequest, ScanMatch, Status, Unlock, UnlockParams,
+    VaultCreate, VaultCreateParams, VaultRecover, loggable_method, required_role,
 };
 use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
@@ -811,6 +811,9 @@ fn respond<'s>(
         }
         ItemsRotate::NAME => answer::<ItemsRotate>(id, &req, |p| items::rotate(shared, peer, p)),
         ItemsRemove::NAME => answer::<ItemsRemove>(id, &req, |p| items::remove(shared, peer, p)),
+        ItemsReclassify::NAME => {
+            answer::<ItemsReclassify>(id, &req, |p| items::reclassify(shared, peer, p))
+        }
         ItemsMarkExposed::NAME => {
             answer::<ItemsMarkExposed>(id, &req, |p| items::mark_exposed(shared, peer, p))
         }

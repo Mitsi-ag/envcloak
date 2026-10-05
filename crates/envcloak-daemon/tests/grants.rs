@@ -1564,7 +1564,16 @@ fn permitted_caller_child() {
     let paths = envcloak_ipc::RunPaths::under(std::path::PathBuf::from(run_dir)).unwrap();
     let mut c = Client::connect(&paths).unwrap();
     let d = c.pending_get(id, &[]).unwrap();
-    let digest = statement_digest(&d, &session(60));
+    // The request is an agent's: its live keys are ticked, as a person
+    // must (SPEC §10b "Live-key guard").
+    let mut opts = session(60);
+    opts.live = d
+        .bindings
+        .iter()
+        .filter(|b| b.classification == "live")
+        .map(|b| envcloak_policy::EnvName::new(&b.env_name).unwrap())
+        .collect();
+    let digest = statement_digest(&d, &opts);
     match mode {
         "digest" => {
             let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -1574,7 +1583,7 @@ fn permitted_caller_child() {
             let mut pass = Vec::new();
             std::io::stdin().read_to_end(&mut pass).unwrap();
             let grant = c
-                .approve(id, session(60), &digest, SecretBytes::from_vec(pass), &[])
+                .approve(id, opts, &digest, SecretBytes::from_vec(pass), &[])
                 .unwrap();
             println!("\ngrant={}", grant.grant);
         }

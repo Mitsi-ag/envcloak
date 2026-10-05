@@ -1,6 +1,6 @@
 //! The item methods (SPEC §5 "Items", §6.3, §10b "Writes that need a
 //! proof"): `items.list`, `items.show`, `items.check`, `items.add`,
-//! `items.target`, `items.rotate`, `items.remove` and
+//! `items.target`, `items.rotate`, `items.remove`, `items.reclassify` and
 //! `items.mark_exposed`.
 //!
 //! What they send back is metadata only (`envcloak_ipc::view`): no method
@@ -39,6 +39,18 @@
 //!   failed, with that reason, as a wrong passphrase is.
 //! - `items.target` shows what a rotation or removal would change, and is
 //!   served only to a caller that may give a proof, like `pending.get`.
+//! - `items.reclassify` sets a secret item's classification by hand (SPEC
+//!   §10b "Live-key guard"). Towards `live` tightens (an agent then needs
+//!   a tick for it), so any caller may, with no proof. Towards `test` or
+//!   `unknown` loosens, so it is a proof as a rotation is, with the item's
+//!   id from `items.target`. Either change is written with the time it
+//!   happened (`classification_changed_at`) and ends the grants and
+//!   pending requests that bind the item, as a rotation that reclassifies
+//!   does; pending requests whose statements proposed the item read
+//!   differently from then on, so a statement read before is
+//!   `statement_mismatch`. A classification the item has already changes
+//!   nothing. Every call that reaches the vault is audited (kind
+//!   `reclassify`), with the change and the grants it ended.
 //! - `items.mark_exposed` marks items "exposed: rotate" (SPEC §6.4, §6.5):
 //!   their values were found outside the vault, in the kinds of place it
 //!   names. Marking only tightens, so any caller may, with no proof; each
@@ -63,12 +75,12 @@ use envcloak_core::vault::{
 };
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{
-    AddParams, CheckParams, ErrorKind, ListParams, MAX_MARKED, MarkExposedParams, RemoveParams,
-    RotateParams, SlugParams, TargetParams,
+    AddParams, CheckParams, ErrorKind, ListParams, MAX_MARKED, MarkExposedParams, ReclassifyParams,
+    RemoveParams, RotateParams, SlugParams, TargetParams,
 };
 use envcloak_ipc::view::{
     AddedView, CheckBindingView, CheckView, ClassificationView, ItemDetail, ItemView, ItemsView,
-    LengthClass, MarkedView, RefStatus, RemovedView, RotatedView, TargetView,
+    LengthClass, MarkedView, ReclassifiedView, RefStatus, RemovedView, RotatedView, TargetView,
 };
 use envcloak_policy::{
     BindErrorKind, Binding, Claims, EnvName, ManifestError, SubjectEvidence, bind_items,
@@ -509,6 +521,8 @@ pub fn target_view(
 enum Write {
     Rotate,
     Remove,
+    /// Towards `test` or `unknown` only: towards `live` takes no proof.
+    Reclassify,
 }
 
 impl Write {
@@ -516,6 +530,7 @@ impl Write {
         match self {
             Write::Rotate => "items.rotate",
             Write::Remove => "items.remove",
+            Write::Reclassify => "items.reclassify",
         }
     }
 
@@ -523,6 +538,7 @@ impl Write {
         match self {
             Write::Rotate => AuditKind::Rotate,
             Write::Remove => AuditKind::Remove,
+            Write::Reclassify => AuditKind::Reclassify,
         }
     }
 }
@@ -709,6 +725,147 @@ pub fn rotate(
         reclassified_from: reclassified.then(|| ClassificationView::from(before)),
         grants_ended: u64::try_from(grants).unwrap_or(u64::MAX),
     })
+}
+
+/// `items.reclassify`. See the module documentation. The request is
+/// checked whole before anything is read: towards `live` with neither a
+/// passphrase nor an item id, towards `test` or `unknown` with both
+/// (`invalid_params` otherwise, nothing audited).
+pub fn reclassify(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: ReclassifyParams,
+) -> Result<ReclassifiedView, RpcError> {
+    let to = match p.to {
+        ClassificationView::Live => Classification::Live,
+        ClassificationView::Test => Classification::Test,
+        ClassificationView::Unknown => Classification::Unknown,
+    };
+    match (to, p.passphrase, p.item) {
+        (Classification::Live, None, None) => without_proof(shared, peer, &p.slug, &p.claims, to),
+        (Classification::Test | Classification::Unknown, Some(pass), Some(item)) => loosen(
+            shared,
+            peer,
+            &p.slug,
+            &item,
+            to,
+            &p.claims,
+            pass.into_inner(),
+        ),
+        // A passphrase sent where none is taken is dropped, and wiped,
+        // unread.
+        _ => Err(RpcError::new(ErrorKind::InvalidParams)),
+    }
+}
+
+/// Sets `slug`'s item to `to` with no proof: only ever to live, which
+/// tightens, for any caller (SPEC §10b). A change ends the grants and
+/// pending requests that bind the item. Audited, a classification the item
+/// had already too.
+fn without_proof(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    slug: &str,
+    claims: &[String],
+    to: Classification,
+) -> Result<ReclassifiedView, RpcError> {
+    let caller = evidence(shared, peer, claims)?;
+    let mut s = locked(&shared.state);
+    let v = s.unlocked_mut()?;
+    let t = target(v, slug, None, None)?;
+    let before = set_classification(v, t.item, to)?;
+    Ok(reclassified(
+        &mut s,
+        peer,
+        subject_summary(peer, &caller),
+        &t,
+        before,
+        to,
+    ))
+}
+
+/// Sets the item `slug` names, which must still be `item`, to `to`
+/// (`test` or `unknown`): a loosening, so a proof, as a rotation is (see
+/// [`prove`]).
+fn loosen(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    slug: &str,
+    item: &str,
+    to: Classification,
+    claims: &[String],
+    pass: SecretBytes,
+) -> Result<ReclassifiedView, RpcError> {
+    let resolve = |v: &Vault| target(v, slug, None, Some(item));
+    let mut proven = prove(shared, peer, Write::Reclassify, claims, pass, &resolve)?;
+    let written = (|| {
+        let v = proven.s.unlocked_mut()?;
+        let t = resolve(v)?;
+        let before = set_classification(v, t.item, to)?;
+        Ok((t, before))
+    })();
+    let (t, before) = match written {
+        Ok(w) => w,
+        Err(e) => return Err(proven.aborted(peer, Write::Reclassify, e)),
+    };
+    let subject = subject_summary(peer, &proven.caller);
+    Ok(reclassified(&mut proven.s, peer, subject, &t, before, to))
+}
+
+/// Writes `to` as `item`'s classification, unless it has it already (the
+/// vault records when it changed); returns the classification before.
+fn set_classification(
+    v: &mut Vault,
+    item: ItemId,
+    to: Classification,
+) -> Result<Classification, RpcError> {
+    let meta = v.item(item).ok_or(RpcError::new(ErrorKind::Internal))?;
+    let before = meta.details.classification;
+    if before != to {
+        let details = ItemDetails {
+            classification: to,
+            ..meta.details.clone()
+        };
+        v.transact(|txn| txn.update_item(item, details))
+            .map_err(|e| write_error(&e))?;
+    }
+    Ok(before)
+}
+
+/// After a reclassification of `t`'s item from `before` to `to`: a change
+/// ends the grants and pending requests that bind the item (SPEC §10b "A
+/// grant ends on"), as a rotation that reclassifies does; the call is
+/// audited; the answer says what changed.
+fn reclassified(
+    s: &mut crate::state::State,
+    peer: &PeerIdentity,
+    subject: SubjectSummary,
+    t: &Target,
+    before: Classification,
+    to: Classification,
+) -> ReclassifiedView {
+    let changed = before != to;
+    let grants = if changed {
+        s.grants().on_item_reclassified(t.item)
+    } else {
+        0
+    };
+    let token = |c| ClassificationView::from(c).as_str();
+    s.audit(AuditEvent::Reclassified {
+        pid: peer.pid,
+        subject,
+        item: t.item,
+        slug: t.slug.clone(),
+        from: token(before),
+        to: token(to),
+        grants,
+    });
+    ReclassifiedView {
+        slug: t.slug.as_str().to_owned(),
+        classification: ClassificationView::from(to),
+        reclassified_from: changed.then(|| ClassificationView::from(before)),
+        grants_ended: u64::try_from(grants).unwrap_or(u64::MAX),
+    }
 }
 
 /// Whether `s` is shaped like an item's id: 26 Crockford base32

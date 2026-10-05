@@ -47,9 +47,20 @@
 //! session or terminal with an agent's or unknown requester's chain up to
 //! its root or its nearest agent (`requester_terminal`; `pending.get` is
 //! refused so too), the pending request must exist, the statement
-//! digest must be its own with the options sent, and the attempt limiter
-//! must admit the attempt. Argon2id then runs outside the state lock, with
-//! the vault taken out as an unlock takes it, one proof at a time.
+//! digest must be its own with the options sent, built from the vault as
+//! it is now (each binding's classification and the test items proposed
+//! for live ones, L-09), the live-key guard must hold (an agent's or an
+//! unknown subject's live bindings each ticked, or `live_not_ticked`,
+//! audited with the items left unticked), and the attempt limiter must
+//! admit the attempt. Argon2id then runs outside the state lock, with the
+//! vault taken out as an unlock takes it, one proof at a time; the store
+//! checks all of it again against the vault after.
+//!
+//! A pending `run.request` answer carries the same provider's test items
+//! proposed for its live bindings (`envcloak_policy::proposals`), which
+//! `envcloak run`'s `approval_required` line names; `pending.get` builds
+//! the descriptor's classifications and proposals from the vault each
+//! time it is asked.
 //!
 //! No grant is evaluated, and no proof taken, from a vault whose
 //! integrity check failed ([`crate::state::State::unlocked`]).
@@ -76,7 +87,7 @@ use std::path::Path;
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::{ProjectSummary, SubjectSummary};
 use envcloak_core::crypto::CryptoErrorKind;
-use envcloak_core::vault::{FieldId, ItemId, Slug, Vault, VaultErrorKind};
+use envcloak_core::vault::{FieldId, ItemId, ItemMeta, Slug, Vault, VaultErrorKind};
 use envcloak_ipc::proto::{
     ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, PendingListParams,
     PendingStateParams, ReleasedValue, RequestParams, RevokeParams, RunAnswer, RunRequest,
@@ -88,11 +99,11 @@ use envcloak_ipc::view::{
 };
 use envcloak_ipc::{Frame, RpcError, WireSecret};
 use envcloak_policy::{
-    AccessRequest, ApprovalProof, ApproveError, BindError, BindErrorKind, Binding, BoundRef,
-    Claims, Decision, DenyReason, EvidenceError, GrantId, ManifestError, Mode, PENDING_TTL,
-    Pending, PendingDescriptor, PendingId, PendingState, ProcessInstance, ProfileName, ProofKind,
-    RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy, bind_items,
-    effective_policy, gather_hashed, load_project, resolve,
+    AccessRequest, ApprovalOptions, ApprovalProof, ApproveError, BindError, BindErrorKind, Binding,
+    BoundRef, Claims, Decision, DenyReason, EvidenceError, GrantId, ManifestError, Mode, Now,
+    PENDING_TTL, Pending, PendingDescriptor, PendingId, PendingState, ProcessInstance, ProfileName,
+    ProofKind, RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy, bind_items,
+    effective_policy, gather_hashed, load_project, proposals, resolve,
 };
 use envcloak_sys::PeerIdentity;
 
@@ -210,6 +221,7 @@ fn approve_error(e: ApproveError) -> RpcError {
         ApproveError::InvalidOptions(o) => {
             RpcError::with_reason(ErrorKind::InvalidOptions, o.token())
         }
+        ApproveError::LiveNotTicked => RpcError::new(ErrorKind::LiveNotTicked),
         ApproveError::TooManyGrants => RpcError::new(ErrorKind::TooManyGrants),
     }
 }
@@ -503,6 +515,7 @@ pub fn run_request(
                                 value: WireSecret::new(value),
                             })
                             .collect(),
+                        proposals: Vec::new(),
                     };
                     let frame = result_framed::<RunRequest>(id, &answer);
                     // A test stops here, holding the framed answer and
@@ -575,14 +588,16 @@ pub fn run_request(
                 return Ok(frame);
             }
             Decision::Pending(id) => {
+                // The same provider's test items, for the live bindings, so
+                // the `approval_required` text names them (SPEC §10b); the
+                // daemon substitutes nothing.
+                let proposals = proposals(&again.bindings, s.unlocked()?.items());
                 s.audit(AuditEvent::Request(Box::new(RequestAudit {
                     decision: "pending",
                     request_id: Some(id.to_string()),
                     ..entry
                 })));
-                break RunAnswer::decided(DecisionView::Pending {
-                    request: id.to_string(),
-                });
+                break RunAnswer::pending(id.to_string(), proposals);
             }
             Decision::TooManyPending(cap) => {
                 // Written at once the first time, then counted and written
@@ -638,10 +653,37 @@ pub fn pending_get(
     // `approve` would be refused before its proof (review T9 open 6).
     s.refuse_if_tampered()?;
     refuse_requester_terminal(&mut s, peer, &caller, &id, &now, "pending.get")?;
+    if s.grants().pending(&id, &now).is_none() {
+        return Err(RpcError::new(ErrorKind::NoSuchRequest));
+    }
+    // The classifications and the proposed test items as the vault has
+    // them now (L-09), which `approve` builds again before it compares.
+    let items = s.unlocked()?.items().to_vec();
     s.grants()
-        .pending_descriptor(&id, &now)
-        .cloned()
+        .pending_descriptor(&id, &now, &items)
         .ok_or(RpcError::new(ErrorKind::NoSuchRequest))
+}
+
+/// Audits an approval of request `id` that the live-key guard refused,
+/// with the items whose live bindings `opts` left unticked, and returns
+/// the refusal.
+fn live_refused(
+    s: &mut crate::state::State,
+    peer: &PeerIdentity,
+    approver: SubjectSummary,
+    id: &PendingId,
+    opts: &ApprovalOptions,
+    now: &Now,
+    items: &[ItemMeta],
+) -> RpcError {
+    let unticked = s.grants().unticked_items(id, opts, now, items);
+    s.audit(AuditEvent::LiveRefused {
+        pid: peer.pid,
+        subject: approver,
+        request: id.to_string(),
+        items: unticked,
+    });
+    RpcError::new(ErrorKind::LiveNotTicked)
 }
 
 /// `pending.state`: how a request stands, for the caller's own process
@@ -770,12 +812,25 @@ pub fn approve(
     let (vault, generation) = {
         let mut s = locked(&shared.state);
         let now = now_of(&shared.clocks);
-        s.unlocked()?;
+        let items = s.unlocked()?.items().to_vec();
         refuse_requester_terminal(&mut s, peer, &approver, &id, &now, "approve")?;
-        // Everything but the passphrase is checked before Argon2id runs.
-        s.grants()
-            .check_approval(&id, &p.options, digest, &now)
-            .map_err(approve_error)?;
+        // Everything but the passphrase is checked before Argon2id runs,
+        // the live-key guard included: an approval that leaves a live
+        // binding unticked is refused, and audited, before the passphrase
+        // is looked at (L-10).
+        match s
+            .grants()
+            .check_approval(&id, &p.options, digest, &now, &items)
+        {
+            Ok(()) => {}
+            Err(ApproveError::LiveNotTicked) => {
+                let who = subject_summary(peer, &approver);
+                return Err(live_refused(
+                    &mut s, peer, who, &id, &p.options, &now, &items,
+                ));
+            }
+            Err(e) => return Err(approve_error(e)),
+        }
         s.limiter()
             .check(&now)
             .map_err(|_| RpcError::new(ErrorKind::TooManyAttempts))?;
@@ -790,6 +845,7 @@ pub fn approve(
         Ok(()) => {
             s.limiter().succeeded();
             back?;
+            let who = subject_summary(peer, &approver);
             let proof = ApprovalProof {
                 approver,
                 kind: ProofKind::Passphrase,
@@ -799,10 +855,20 @@ pub fn approve(
                 Uses::Once => "once",
                 Uses::Session => "session",
             };
-            let grant = s
+            // The vault as it is now, after Argon2id: the statement, and the
+            // classifications the guard reads, are built from it again.
+            let items = s.unlocked()?.items().to_vec();
+            let opts = p.options.clone();
+            let grant = match s
                 .grants()
-                .approve(&id, proof, p.options, digest, &now)
-                .map_err(approve_error)?;
+                .approve(&id, proof, p.options, digest, &now, &items)
+            {
+                Ok(g) => g,
+                Err(ApproveError::LiveNotTicked) => {
+                    return Err(live_refused(&mut s, peer, who, &id, &opts, &now, &items));
+                }
+                Err(e) => return Err(approve_error(e)),
+            };
             s.touch(Reading::now(&shared.clocks));
             s.audit(AuditEvent::Approved {
                 pid: peer.pid,
