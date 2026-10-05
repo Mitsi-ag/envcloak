@@ -17,7 +17,10 @@
 //!   through the guard's drop, and for a stop (the command suspended,
 //!   SIGTSTP) [`TerminalGuard::restore`] puts the settings back before the
 //!   process stops and [`TerminalGuard::reenter_raw`] takes raw mode again
-//!   after SIGCONT. [`restore_outer_terminal`] is async-signal-safe
+//!   after SIGCONT, from the settings [`TerminalGuard::refresh`] read again
+//!   once the person's shell has had the terminal (a `stty` change made
+//!   meanwhile is what later restores put back; review of M2-19, L-09).
+//!   [`restore_outer_terminal`] is async-signal-safe
 //!   (`tcsetattr` and atomics only), for a path that cannot run ordinary
 //!   code.
 //!
@@ -139,6 +142,26 @@ impl TerminalSettings {
     pub fn with_suspend_char(&self, c: Option<u8>) -> Self {
         let mut t = self.0;
         t.c_cc[libc::VSUSP] = c.unwrap_or_else(disabled_char);
+        TerminalSettings(t)
+    }
+
+    /// These settings with every control character that differs between
+    /// `old` and `new` set to `new`'s (the interrupt, quit, suspend, erase,
+    /// kill and end-of-file characters and the others), and every other
+    /// left as it is; `VMIN` and `VTIME`, which share the array but time a
+    /// read, never change. For the command's terminal once the person has
+    /// changed theirs while the command was stopped (`stty susp ^X`): the
+    /// change reaches the command, and what the command set for itself
+    /// stays.
+    pub fn with_changed_control_chars(&self, old: &Self, new: &Self) -> Self {
+        let mut t = self.0;
+        for (i, (was, now)) in old.0.c_cc.iter().zip(new.0.c_cc.iter()).enumerate() {
+            if was != now && i != libc::VMIN && i != libc::VTIME {
+                if let Some(c) = t.c_cc.get_mut(i) {
+                    *c = *now;
+                }
+            }
+        }
         TerminalSettings(t)
     }
 
@@ -289,12 +312,13 @@ const READY: u32 = 2 << 30;
 const RETIRING: u32 = 3 << 30;
 
 // SAFETY: `saved` and `fd` are written only by the thread that moved
-// `state` from EMPTY to WRITING, before it stores READY with Release; they
-// are read only by a reader that entered with an Acquire compare-exchange
-// from READY, and the phase leaves READY (for RETIRING, then EMPTY) only
-// once every reader inside has left with a Release decrement, which the
-// retiring thread observes with Acquire before the slot can be written
-// again.
+// `state` to WRITING (from EMPTY, or from READY with no reader inside, a
+// compare-exchange that fails while one is), before it stores READY with
+// Release; they are read only by a reader that entered with an Acquire
+// compare-exchange from READY, and the phase leaves READY (for RETIRING,
+// then EMPTY, or for WRITING) only once every reader inside has left with
+// a Release decrement, which the leaving phase's thread observes with
+// Acquire before the slot can be written again.
 unsafe impl Sync for Slot {}
 
 impl Slot {
@@ -324,6 +348,43 @@ impl Slot {
         unsafe { (*self.saved.get()).write(*saved) };
         self.fd.store(fd, Ordering::Relaxed);
         self.fatal.store(false, Ordering::SeqCst);
+        self.state.store(READY, Ordering::Release);
+        Ok(())
+    }
+
+    /// Writes `saved` over the registered settings, for a guard that read
+    /// its terminal's settings again ([`TerminalGuard::refresh`]): waits
+    /// until no reader is inside (each runs one `tcsetattr`), then holds
+    /// the slot, so no reader enters, while it writes. The registration's
+    /// descriptor and its final restore's mark are kept.
+    ///
+    /// # Errors
+    /// [`io::ErrorKind::NotFound`] when nothing is registered or the slot
+    /// is being retired; nothing is written then.
+    fn replace(&self, saved: &libc::termios) -> io::Result<()> {
+        loop {
+            match self.state.compare_exchange_weak(
+                READY,
+                WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                // A reader inside (or a spurious failure): its tcsetattr
+                // ends soon.
+                Err(now) if now & PHASE == READY => std::thread::yield_now(),
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "no terminal guard is registered",
+                    ));
+                }
+            }
+        }
+        // SAFETY: the phase is WRITING, which this thread set from READY
+        // with no reader inside: no other thread writes the slot, and no
+        // reader is inside or can enter until READY is stored below.
+        unsafe { (*self.saved.get()).write(*saved) };
         self.state.store(READY, Ordering::Release);
         Ok(())
     }
@@ -553,6 +614,32 @@ impl TerminalGuard {
         set(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.saved.0)
     }
 
+    /// Reads the terminal's settings again and keeps them as the saved
+    /// ones, for after a stop: the person's shell had the terminal
+    /// meanwhile, and may have changed it (`stty susp ^X`, `stty -echo`).
+    /// Every later restore, the panic hook's included, puts these back, and
+    /// raw mode is made from them. Settings that are raw themselves (no
+    /// line editing, no echo and no signal characters,
+    /// [`TerminalSettings::is_raw`]: the terminal as this guard left it,
+    /// which a shell that does not take a stopped job's terminal back
+    /// leaves so) are not kept, so the terminal is never restored raw.
+    /// Returns the settings saved before, which are still the saved ones
+    /// when nothing was kept.
+    ///
+    /// # Errors
+    /// When the settings cannot be read, or the guard is not registered
+    /// (never once it lives); nothing changes then.
+    pub fn refresh(&mut self) -> io::Result<TerminalSettings> {
+        let before = self.saved;
+        let now = TerminalSettings(get(self.fd.as_raw_fd())?);
+        if now.is_raw() {
+            return Ok(before);
+        }
+        SLOT.replace(&now.0)?;
+        self.saved = now;
+        Ok(before)
+    }
+
     /// Takes raw mode again after [`TerminalGuard::restore`] (after
     /// SIGCONT).
     ///
@@ -751,6 +838,92 @@ mod tests {
         slot.unregister();
         slot.register(8, &settings(8)).unwrap();
         slot.raw_switch(|| Ok(())).unwrap();
+    }
+
+    /// What the person changed among the control characters reaches the
+    /// command's terminal, and nothing else does: a character the command
+    /// set for itself stays, and `VMIN` and `VTIME` never change, even when
+    /// the person's differ. Let every character be copied and the
+    /// command's own end-of-file character and its read timing are lost.
+    #[test]
+    fn only_the_control_characters_the_person_changed_are_copied() {
+        // SAFETY: termios is plain data; zeroed is a valid value.
+        let base: libc::termios = unsafe { std::mem::zeroed() };
+        let mut old = base;
+        old.c_cc[libc::VSUSP] = 0x1a;
+        old.c_cc[libc::VINTR] = 0x03;
+        old.c_cc[libc::VMIN] = 1;
+        let mut new = old;
+        new.c_cc[libc::VSUSP] = 0x18;
+        new.c_cc[libc::VINTR] = disabled_char();
+        new.c_cc[libc::VMIN] = 9;
+        new.c_cc[libc::VTIME] = 9;
+        let mut command = old;
+        command.c_cc[libc::VEOF] = 0x01;
+        command.c_cc[libc::VMIN] = 0;
+        let got = TerminalSettings(command)
+            .with_changed_control_chars(&TerminalSettings(old), &TerminalSettings(new));
+        assert_eq!(got.suspend_char(), Some(0x18));
+        assert_eq!(got.interrupt_char(), None);
+        assert_eq!(got.eof_char(), Some(0x01), "the command's own");
+        assert_eq!(got.0.c_cc[libc::VMIN], 0, "VMIN");
+        assert_eq!(got.0.c_cc[libc::VTIME], 0, "VTIME");
+        // Nothing changed, nothing copied.
+        let same = TerminalSettings(command)
+            .with_changed_control_chars(&TerminalSettings(old), &TerminalSettings(old));
+        assert!(same.same_as(&TerminalSettings(command)));
+    }
+
+    /// A guard's settings read again replace the registered ones the panic
+    /// hook restores, once no reader is inside, and keep the final
+    /// restore's mark; with nothing registered nothing is written. Let
+    /// `replace` write without waiting for a reader and the reader finds
+    /// its settings rewritten under it.
+    #[test]
+    fn a_replace_waits_for_a_reader_inside_and_keeps_the_mark() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let slot: &'static Slot = Box::leak(Box::new(Slot::new()));
+        assert_eq!(
+            slot.replace(&settings(1)).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        slot.register(5, &settings(5)).unwrap();
+        let (inside_tx, inside) = mpsc::channel();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            slot.read(|fd, t| {
+                inside_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                // SAFETY: test-only peek, made while this reader holds the
+                // slot.
+                let now = unsafe { (*slot.saved.get()).assume_init_ref() };
+                (fd, t.c_iflag, now.c_iflag)
+            })
+        });
+        inside.recv().unwrap();
+        let replacer = std::thread::spawn(move || slot.replace(&settings(6)));
+        let watch = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < watch {
+            assert!(
+                !replacer.is_finished(),
+                "the settings were replaced while a restore was reading them"
+            );
+            std::thread::yield_now();
+        }
+        go.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), Some((5, 5, 5)));
+        replacer.join().unwrap().unwrap();
+        assert_eq!(slot.read(|fd, t| (fd, t.c_iflag)), Some((5, 6)));
+        // The final restore's mark survives a replace.
+        assert_eq!(slot.final_restore(|_, t| t.c_iflag), Some(6));
+        slot.replace(&settings(7)).unwrap();
+        assert_eq!(
+            slot.raw_switch(|| Ok(())).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        slot.unregister();
+        assert!(slot.replace(&settings(8)).is_err());
     }
 
     /// Teardown and re-registration racing readers: each guard registers a
