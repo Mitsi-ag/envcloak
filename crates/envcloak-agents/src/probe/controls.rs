@@ -10,17 +10,21 @@
 //! - A probe's value is *kept out* only when no recorded request holds it
 //!   in any form ([`forms`]: as it is, base64 in both alphabets, padded or
 //!   not and at every alignment, hexadecimal, percent-encoded, JSON
-//!   `\u` escapes), in any part of any request: its method, path and
-//!   query, every header's name and value, its body, and a refused
-//!   tunnel's forwarded target ([`seen`]).
+//!   `\u` escapes), as it is or in any decoded reading of what was sent
+//!   ([`holds`]: JSON string escapes of any serializer decoded, also
+//!   within a string held in a string, and percent-encodings of any
+//!   encoder decoded: the encodings SPEC §6.1's redaction covers), in any
+//!   part of any request: its method, path and query, every header's name
+//!   and value, its body, and a refused tunnel's forwarded target
+//!   ([`seen`]).
 //! - A tool's result is the last tool result in the request that came
 //!   after the call ([`last_tool_output`]), the place a host puts what a
 //!   command printed or a hook's denial.
 //! - The host's stores are read by [`sweep`], which looks in every file's
-//!   contents and every entry's name, and counts a needle found only
-//!   within what it read whole: a file it could not read, or past its
-//!   caps, makes the sweep incomplete, which no probe counts as clean
-//!   (L-08).
+//!   contents and every entry's name, decoded as above, and counts a
+//!   needle found only within what it read whole: a file it could not
+//!   read, or past its caps, makes the sweep incomplete, which no probe
+//!   counts as clean (L-08).
 
 use std::path::{Path, PathBuf};
 
@@ -76,35 +80,202 @@ pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// How many times [`each_view`] decodes JSON escapes: a value in a JSON
+/// string that is itself held in a JSON string (a tool's arguments, a
+/// result kept as a string) is escaped twice.
+const UNESCAPE_DEPTH: usize = 3;
+
+/// Visits each decoded reading of `bytes` a value may be in, beside the
+/// bytes themselves (Codex's round-3 review: a value holding a quote or a
+/// line break reaches the model as `\"` or `\n` in a JSON body, which no
+/// form of it matched), until `visit` says it is done: every JSON string
+/// escape decoded wherever it is, from any serializer (short escapes,
+/// `\/`, `\u` escapes in either case, surrogate pairs; up to
+/// [`UNESCAPE_DEPTH`] times, for a string within a string), and each of
+/// those and the bytes percent-decoded, `+` as itself and as a space
+/// (common encoders leave different characters as they are, and a form's
+/// `+` is a space). One reading at a time is kept, wiped when dropped.
+fn each_view(bytes: &[u8], visit: &mut dyn FnMut(&[u8]) -> bool) {
+    let percent = |from: &[u8], visit: &mut dyn FnMut(&[u8]) -> bool| {
+        [false, true]
+            .into_iter()
+            .filter_map(|plus| percent_decoded(from, plus))
+            .any(|p| visit(&p))
+    };
+    if percent(bytes, visit) {
+        return;
+    }
+    let mut last: Option<Zeroizing<Vec<u8>>> = None;
+    for _ in 0..UNESCAPE_DEPTH {
+        let from: &[u8] = last.as_deref().map_or(bytes, Vec::as_slice);
+        let Some(next) = unescaped(from) else {
+            return;
+        };
+        if visit(&next) || percent(&next, visit) {
+            return;
+        }
+        last = Some(next);
+    }
+}
+
+/// Whether `bytes`, or any decoded reading of them ([`each_view`]), holds
+/// any of `forms`.
+pub fn holds(bytes: &[u8], forms: &[Zeroizing<Vec<u8>>]) -> bool {
+    holds_any(bytes, &[forms]).into_iter().any(|x| x)
+}
+
+/// For each set of forms, whether `bytes` or a decoded reading of them
+/// holds one: each reading made once for every set.
+fn holds_any(bytes: &[u8], sets: &[&[Zeroizing<Vec<u8>>]]) -> Vec<bool> {
+    let mut found: Vec<bool> = sets
+        .iter()
+        .map(|forms| forms.iter().any(|f| contains(bytes, f)))
+        .collect();
+    if found.iter().all(|x| *x) {
+        return found;
+    }
+    each_view(bytes, &mut |v| {
+        for (i, forms) in sets.iter().enumerate() {
+            found[i] |= forms.iter().any(|f| contains(v, f));
+        }
+        found.iter().all(|x| *x)
+    });
+    found
+}
+
+/// `bytes` with every JSON string escape decoded, left to right (`\\` is
+/// one backslash, so `\\n` is a backslash and an `n`); an escape that is
+/// not one is kept as it is. `None` when there is no backslash.
+fn unescaped(bytes: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if !bytes.contains(&b'\\') {
+        return None;
+    }
+    let hex4 = |at: usize| -> Option<u32> {
+        let h = bytes.get(at..at + 4)?;
+        if !h.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()
+    };
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' || i + 1 >= bytes.len() {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let short = match bytes[i + 1] {
+            b'"' => Some(b'"'),
+            b'\\' => Some(b'\\'),
+            b'/' => Some(b'/'),
+            b'b' => Some(8),
+            b'f' => Some(12),
+            b'n' => Some(b'\n'),
+            b'r' => Some(b'\r'),
+            b't' => Some(b'\t'),
+            _ => None,
+        };
+        if let Some(c) = short {
+            out.push(c);
+            i += 2;
+            continue;
+        }
+        if bytes[i + 1] == b'u' {
+            if let Some(u) = hex4(i + 2) {
+                // A surrogate pair is one character.
+                let pair = (0xD800..0xDC00).contains(&u)
+                    && bytes.get(i + 6..i + 8) == Some(&b"\\u"[..])
+                    && hex4(i + 8).is_some_and(|l| (0xDC00..0xE000).contains(&l));
+                let (c, len) = if pair {
+                    let lo = hex4(i + 8).unwrap_or(0);
+                    (
+                        char::from_u32(0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00)),
+                        12,
+                    )
+                } else {
+                    (char::from_u32(u), 6)
+                };
+                if let Some(c) = c {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    i += len;
+                    continue;
+                }
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// `bytes` with every `%XX` decoded (either case), and with `plus`, every
+/// `+` a space. `None` when there is nothing to decode.
+fn percent_decoded(bytes: &[u8], plus: bool) -> Option<Zeroizing<Vec<u8>>> {
+    if !bytes.contains(&b'%') && !(plus && bytes.contains(&b'+')) {
+        return None;
+    }
+    let digit = |b: u8| char::from(b).to_digit(16);
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => match (
+                bytes.get(i + 1).and_then(|b| digit(*b)),
+                bytes.get(i + 2).and_then(|b| digit(*b)),
+            ) {
+                (Some(h), Some(l)) => {
+                    out.push(u8::try_from(h * 16 + l).unwrap_or(0));
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' if plus => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Whether the model accepted `r`: a request to one of its two APIs, with
 /// the run's token, answered 200 whole.
 pub fn accepted(r: &Recorded) -> bool {
     r.status == 200 && r.answered && matches!(r.api.as_deref(), Some("messages" | "responses"))
 }
 
-/// Whether any accepted request's body holds `marker`: the control
-/// reached the model.
+/// Whether any accepted request's body holds `marker`, as it is or in a
+/// decoded reading of the body ([`holds`]): the control reached the model.
 pub fn reached(requests: &[Recorded], marker: &str) -> bool {
-    requests
-        .iter()
-        .any(|r| accepted(r) && contains(&r.body, marker.as_bytes()))
+    let m = [Zeroizing::new(marker.as_bytes().to_vec())];
+    requests.iter().any(|r| accepted(r) && holds(&r.body, &m))
 }
 
 /// Whether anything recorded holds any of `forms`, in any part of any
-/// request, accepted or not: its method, path, query, header names and
-/// values, body and forwarded target (Codex review of M2-09: a value in a
-/// request's path or query went uncounted).
+/// request, accepted or not, as it is or in a decoded reading of that
+/// part ([`holds`]): its method, path, query, header names and values,
+/// body and forwarded target (Codex review of M2-09: a value in a
+/// request's path or query went uncounted; round 3: a value JSON escapes
+/// in a body went uncounted).
 pub fn seen(requests: &[Recorded], forms: &[Zeroizing<Vec<u8>>]) -> bool {
     requests.iter().any(|r| {
-        forms.iter().any(|f| {
-            contains(&r.body, f)
-                || contains(&r.forward, f)
-                || contains(r.method.as_bytes(), f)
-                || contains(r.path.as_bytes(), f)
-                || r.query.as_ref().is_some_and(|q| contains(q.as_bytes(), f))
-                || r.headers.iter().any(|h| contains(h.as_bytes(), f))
-                || r.values.iter().any(|v| contains(v, f))
-        })
+        holds(&r.body, forms)
+            || holds(&r.forward, forms)
+            || holds(r.method.as_bytes(), forms)
+            || holds(r.path.as_bytes(), forms)
+            || r.query.as_ref().is_some_and(|q| holds(q.as_bytes(), forms))
+            || r.headers.iter().any(|h| holds(h.as_bytes(), forms))
+            || r.values.iter().any(|v| holds(v, forms))
     })
 }
 
@@ -405,8 +576,8 @@ pub fn sweep(roots: &[(PathBuf, Option<String>)], needles: &[&[Zeroizing<Vec<u8>
         }
     }
     let hold = |s: &mut Swept, p: &Path, bytes: &[u8]| {
-        for (i, forms) in needles.iter().enumerate() {
-            if forms.iter().any(|f| contains(bytes, f)) {
+        for (i, hit) in holds_any(bytes, needles).into_iter().enumerate() {
+            if hit {
                 s.found[i] = true;
                 if !s.holders[i].iter().any(|h| h == p) {
                     s.holders[i].push(p.to_path_buf());
