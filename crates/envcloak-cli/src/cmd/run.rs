@@ -86,8 +86,10 @@
 //! one it exits 125 with `pty_unavailable` before anything is sent, and
 //! never falls back to pipe mode. When the PTY monitor dies before it
 //! reports the command's exit, the run restores the terminal, drains the
-//! output redacted and exits 125 with `pty_monitor_lost`. After `--`,
-//! `--pty` is the command's.
+//! output redacted and exits 125 with `pty_monitor_lost`; when the
+//! person's terminal cannot be put back in raw mode after a stop, the
+//! command is not continued and the run exits 125 with `run_failed`.
+//! After `--`, `--pty` is the command's.
 //!
 //! `--status-fd N` is for a program that starts `envcloak run` and must
 //! know how it ended (`envcloak mcp`; docs/RUN.md "Status descriptor"):
