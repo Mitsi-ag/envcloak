@@ -1313,3 +1313,38 @@ fn a_token_or_code_arm_the_reader_does_not_read_fails() {
         assert_fails(&t, expect);
     }
 }
+
+const INVERSE_MODEL: &str = "crates/envcloak-testkit/tests/oracles/check_inverse_model.py";
+
+/// `check_inverse` agrees with an independent model of its rule
+/// (tests/oracles/check_inverse_model.py): over every list of up to three
+/// (number, variant) pairs for five declarations, 21,845 cases, it passes
+/// exactly the lists that are the declaration's pairs as a multiset, less
+/// the never-stored entries, which must be declared. The model's 11
+/// positive controls must pass, and no verdict may differ.
+///
+/// Mutations checked: check_inverse without its missing-variant rule;
+/// separately without its never-stored rule; separately with the
+/// number-twice rule taken out: the model reports a disagreement for
+/// each, and this test fails.
+#[test]
+fn check_inverse_agrees_with_an_independent_model() {
+    let t = TestHome::new();
+    let mut cmd = Command::new("python3");
+    let out = t
+        .apply(&mut cmd)
+        .arg(repo_root().join(INVERSE_MODEL))
+        .arg(repo_root().join(SCRIPT))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the model disagrees: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.trim(),
+        r#"{"cases": 21845, "positive_controls": 11, "rejected": 21834, "mismatches": 0}"#
+    );
+}
