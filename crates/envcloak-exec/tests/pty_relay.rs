@@ -1920,8 +1920,9 @@ fn the_command_is_resumed_only_once_the_outer_terminal_is_raw_again() {
 /// after `fg` (a test build's injected failure in the suspension's own
 /// step, `exec.pty.raw`; the SIGCONT that follows takes raw mode as ever)
 /// resumes nothing. The command stays stopped and gets no key: the run
-/// ends at once, 125 with `run_failed`, and the outer shell's prompt comes
-/// back with the terminal as before.
+/// ends at once, 125 with `run_failed`, the outer shell's prompt comes
+/// back with the terminal as before, and the command is hung up with its
+/// session.
 ///
 /// Mutation checked: ignore the failure and resume the command (as before
 /// the review): the run goes on, no prompt comes, and this fails.
@@ -1959,6 +1960,12 @@ fn raw_mode_refused_after_fg_resumes_nothing_and_ends_the_run() {
     );
     assert_eq!(js.status(), 125);
     assert_eq!(js.stty_g(&case.path("after")), before, "the outer terminal");
+    // Hung up with its session: its group, orphaned with a stopped member
+    // once the monitor is gone, gets SIGHUP and SIGCONT from the kernel.
+    assert!(
+        wait_lines(&mut js.outer, &case.path("job-HUP"), 1),
+        "the stopped command was not hung up"
+    );
     js.exit();
 }
 
