@@ -211,3 +211,65 @@ fn templates_cannot_hide_unsupported_shell_syntax() {
         assert!(!finding.single_complete_line);
     }
 }
+
+#[test]
+fn fish_comment_backslashes_do_not_change_literal_values() {
+    let report = parse_profile(
+        &SecretBytes::copy_from(b"set -gx A fixtureZfishComment # C:\\notes $HOME `comment`\n"),
+        Shell::Fish,
+    );
+    assert!(report.complete());
+    assert_eq!(report.findings.len(), 1);
+    let finding = &report.findings[0];
+    assert!(
+        finding
+            .value
+            .as_ref()
+            .is_some_and(|v| v.ct_eq(b"fixtureZfishComment"))
+    );
+    assert!(finding.single_complete_line);
+}
+
+#[test]
+fn quoted_source_comments_do_not_change_literal_paths() {
+    let d = fixture();
+    std::fs::write(d.path().join("vars"), b"A=fixtureZsourceComment\n").unwrap();
+    std::fs::write(
+        d.path().join(".bashrc"),
+        b"source 'vars' # $HOME `comment`\n",
+    )
+    .unwrap();
+    let report = scan_profiles(&open_root(d.path()).unwrap()).unwrap();
+    assert!(report.complete());
+    assert_eq!(report.findings.len(), 1);
+    assert!(
+        report.findings[0]
+            .value
+            .as_ref()
+            .is_some_and(|v| v.ct_eq(b"fixtureZsourceComment"))
+    );
+}
+
+#[test]
+fn tilde_source_permission_does_not_allow_other_unsupported_syntax() {
+    let d = fixture();
+    for name in ["vars", "vars(array)"] {
+        std::fs::write(d.path().join(name), b"A=fixtureZsourceValue\n").unwrap();
+    }
+    std::fs::write(d.path().join(".bashrc"), b"source ~/vars\n").unwrap();
+    let root = open_root(d.path()).unwrap();
+    let report = scan_profiles(&root).unwrap();
+    assert!(report.complete() && report.findings.len() == 1);
+    for text in ["source ~/vars(array)\n", "source ~/vars'\n"] {
+        std::fs::write(d.path().join(".bashrc"), text).unwrap();
+        let report = scan_profiles(&root).unwrap();
+        assert!(!report.complete());
+        assert!(report.findings.is_empty());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.reason == "source_not_literal")
+        );
+    }
+}
