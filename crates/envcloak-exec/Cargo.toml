@@ -39,3 +39,9 @@ harness = false
 [[test]]
 name = "pty_spawn"
 harness = false
+
+# Its own main: the binary is also the runner of PTY mode the tests start
+# on a terminal of their own (see the file).
+[[test]]
+name = "pty_relay"
+harness = false
