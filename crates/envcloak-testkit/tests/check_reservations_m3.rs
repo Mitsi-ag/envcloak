@@ -214,7 +214,6 @@ const M3_ROWS: &[(&str, &str)] = &[
     (IPC, "| `binding_absent` | M3-04 |"),
     (IPC, "| `declined` | M3-19 |"),
     (IPC, "| `expired` | M3-19 |"),
-    (IPC, "| `envcloak-statement/1` | M3-09 |"),
     (IPC, "| `envcloak-unlocker-statement/1` | M3-08 |"),
     (IPC, "| `envcloak-write-statement/1` | M3-14 |"),
     (IPC, "| `envcloak-reveal-statement/1` | M3-14 |"),
@@ -228,10 +227,14 @@ const M3_ROWS: &[(&str, &str)] = &[
 
 /// Rows the M3 plan names that M3-01 does not reserve, with the reason in
 /// IPC.md's "Reserved for M3": `daemon.identity` is the CLI's own output
-/// since M1, and the keychain anchor's names say `keychain`, apart from the
-/// audit log's `anchor_mismatch`.
+/// since M1, the keychain anchor's names say `keychain`, apart from the
+/// audit log's `anchor_mismatch`, and run approvals are
+/// `envcloak-statement/2` since M2-13 (its row is M2-13's, and version 1
+/// digests are refused).
 const NOT_M3_ROWS: &[(&str, &str)] = &[
     (IPC, "| `status` | `daemon.identity` |"),
+    (IPC, "| `envcloak-statement/1` |"),
+    (IPC, "| `envcloak-statement/2` |"),
     (IPC, "| `status` | `vault.anchor` |"),
     (IPC, "| `anchor_missing` |"),
     (VAULT, "| 50 | `anchor_mismatch` |"),
