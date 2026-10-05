@@ -86,11 +86,17 @@ fn os() -> &'static str {
 
 /// The person approving the probes' requests from a terminal of their own:
 /// `envcloak pending --json` until one waits, then `envcloak approve <id>
-/// --for 1h` with the passphrase typed.
+/// --for 1h` with the passphrase typed, and a `--live` tick for each live
+/// key the request's project binds (SPEC §10b "Live-key guard", M2-13: the
+/// hosts' requests are an agent's, and an approval that leaves a live
+/// binding unticked makes no grant). The listing names a request's project
+/// but not its variables, so the ticks are the project's.
 struct Approve<'p> {
     person: &'p Person,
     cwd: PathBuf,
     typed: String,
+    /// Each project's canonical directory, with the live keys it binds.
+    live: Vec<(PathBuf, Vec<&'static str>)>,
     given: AtomicUsize,
 }
 
@@ -107,17 +113,21 @@ impl Approver for Approve<'_> {
                 )
                 .ok_or("pending did not finish")?;
             let v: Value = serde_json::from_slice(&listed.stdout).unwrap_or(Value::Null);
-            let id = v["requests"]
-                .as_array()
-                .and_then(|r| r.first())
-                .and_then(|r| r["request"].as_str())
-                .map(str::to_owned);
+            let first = v["requests"].as_array().and_then(|r| r.first());
+            let id = first.and_then(|r| r["request"].as_str()).map(str::to_owned);
             if let Some(id) = id {
+                let project = first.and_then(|r| r["project"].as_str()).unwrap_or("");
+                let mut args = vec!["approve", id.as_str(), "--for", "1h"];
+                for (_, names) in self.live.iter().filter(|(p, _)| p.as_os_str() == project) {
+                    for name in names {
+                        args.extend(["--live", name]);
+                    }
+                }
                 let done = self
                     .person
                     .run(
                         &self.cwd,
-                        &["approve", &id, "--for", "1h"],
+                        &args,
                         &[("Vault passphrase to approve this: ", &self.typed)],
                         Duration::from_secs(120),
                     )
@@ -335,6 +345,10 @@ impl Site {
             person: &person,
             cwd: self.h.home.home(),
             typed,
+            live: vec![(
+                std::fs::canonicalize(&self.output_project).unwrap(),
+                vec!["OPENAI_API_KEY"],
+            )],
             given: AtomicUsize::new(0),
         };
         let home = ProbeHome {
@@ -552,7 +566,13 @@ fn shown(v: &Value) -> String {
         s.push_str(&reasons.join(", "));
         s.push_str("; ");
     }
-    s.push_str(&format!("probe={})", v["probe"].as_str().unwrap()));
+    s.push_str(&format!("probe={}", v["probe"].as_str().unwrap()));
+    // A case not run, named after the outcome (`skipped`, left out when
+    // there is none).
+    for c in v["skipped"].as_array().into_iter().flatten() {
+        s.push_str(&format!(", {} skipped", c.as_str().unwrap()));
+    }
+    s.push(')');
     s
 }
 
