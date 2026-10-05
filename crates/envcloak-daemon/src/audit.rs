@@ -372,6 +372,85 @@ pub enum AuditEvent {
         missing: usize,
         outcome: &'static str,
     },
+    /// A managed MCP server registered, updated or removed
+    /// (`managed.register`, `managed.update`, `managed.unregister`), or the
+    /// proof of one failed (`wrong_passphrase`): its launch and revision,
+    /// the managed project, and counts and a digest prefix of the launch,
+    /// never an argument, a variable's value or a path inside it.
+    ManagedRegistered {
+        pid: i32,
+        subject: SubjectSummary,
+        outcome: &'static str,
+        launch: Option<String>,
+        project: Option<ProjectSummary>,
+        /// `(revision, arguments, variables, bindings, digest prefix)`.
+        counts: Option<ManagedCounts>,
+    },
+    /// A request against a managed project refused before any pending
+    /// request (`managed_command_mismatch`, `managed_launch_changed`,
+    /// `runner_unavailable`), with what changed and the old and new
+    /// identity metadata, never a value.
+    ManagedLaunch {
+        pid: i32,
+        subject: SubjectSummary,
+        outcome: &'static str,
+        /// `executable`, `entry_file` or `working_directory`, for a launch
+        /// that changed.
+        part: Option<&'static str>,
+        launch: Option<String>,
+        project: Option<ProjectSummary>,
+        revision: Option<u64>,
+        old: Option<IdentityMeta>,
+        new: Option<IdentityMeta>,
+    },
+}
+
+/// A managed launch's counts, as its audit entries record them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedCounts {
+    pub revision: u64,
+    pub arguments: usize,
+    pub variables: usize,
+    pub bindings: usize,
+    /// The first 8 bytes of the launch's digest (SHA-256 of its canonical
+    /// encoding, `envcloak_policy::managed`), big-endian.
+    pub digest_prefix: u64,
+}
+
+impl ManagedCounts {
+    fn named(&self) -> Vec<(String, u64)> {
+        let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+        vec![
+            ("revision".to_owned(), self.revision),
+            ("arguments".to_owned(), n(self.arguments)),
+            ("variables".to_owned(), n(self.variables)),
+            ("bindings".to_owned(), n(self.bindings)),
+            ("launch_digest".to_owned(), self.digest_prefix),
+        ]
+    }
+}
+
+/// A file's identity, as a managed launch check's audit entry records it:
+/// device, inode, and the first 8 bytes of its digest (SHA-256, or a
+/// cdhash), big-endian. `None` digest when the file could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityMeta {
+    pub dev: u64,
+    pub ino: u64,
+    pub digest_prefix: Option<u64>,
+}
+
+impl IdentityMeta {
+    fn named(&self, side: &str) -> Vec<(String, u64)> {
+        let mut v = vec![
+            (format!("{side}_dev"), self.dev),
+            (format!("{side}_ino"), self.ino),
+        ];
+        if let Some(d) = self.digest_prefix {
+            v.push((format!("{side}_digest"), d));
+        }
+        v
+    }
 }
 
 impl AuditEvent {
@@ -610,6 +689,29 @@ impl AuditEvent {
                 "envcloakd: audit: items marked exposed {outcome} marked={} already={already} \
                  missing={missing} pid={pid}",
                 marked.len()
+            ),
+            AuditEvent::ManagedRegistered {
+                pid,
+                outcome,
+                launch,
+                counts,
+                ..
+            } => format!(
+                "envcloakd: audit: managed server {outcome} launch={} revision={} pid={pid}",
+                launch.as_deref().unwrap_or("none"),
+                counts.map_or(0, |c| c.revision)
+            ),
+            AuditEvent::ManagedLaunch {
+                pid,
+                outcome,
+                part,
+                launch,
+                ..
+            } => format!(
+                "envcloakd: audit: managed launch refused reason={outcome} part={} launch={} \
+                 pid={pid}",
+                part.unwrap_or("none"),
+                launch.as_deref().unwrap_or("none")
             ),
         })
     }
@@ -1066,6 +1168,54 @@ impl AuditEvent {
                 },
                 ..AuditRecord::new(AuditKind::MarkExposed, outcome)
             },
+            AuditEvent::ManagedRegistered {
+                subject,
+                outcome,
+                launch,
+                project,
+                counts,
+                ..
+            } => AuditRecord {
+                request_id: launch.clone(),
+                subject: subject.clone(),
+                project: project.clone(),
+                decision: DecisionSummary {
+                    counts: counts.map(|c| c.named()).unwrap_or_default(),
+                    ..decision(outcome, None, Some("managed.register"), None)
+                },
+                ..AuditRecord::new(AuditKind::ManagedRegister, outcome)
+            },
+            AuditEvent::ManagedLaunch {
+                subject,
+                outcome,
+                part,
+                launch,
+                project,
+                revision,
+                old,
+                new,
+                ..
+            } => {
+                let mut counts: Vec<(String, u64)> = revision
+                    .map(|r| vec![("revision".to_owned(), r)])
+                    .unwrap_or_default();
+                if let Some(o) = old {
+                    counts.extend(o.named("old"));
+                }
+                if let Some(n) = new {
+                    counts.extend(n.named("new"));
+                }
+                AuditRecord {
+                    request_id: launch.clone(),
+                    subject: subject.clone(),
+                    project: project.clone(),
+                    decision: DecisionSummary {
+                        counts,
+                        ..decision(outcome, *part, Some("run.request"), None)
+                    },
+                    ..AuditRecord::new(AuditKind::ManagedLaunch, outcome)
+                }
+            }
         }
     }
 }

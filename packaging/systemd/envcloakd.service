@@ -7,6 +7,7 @@ Type=simple
 ExecStart=@ENVCLOAKD@ --foreground
 @ENVIRONMENT@Restart=on-failure
 RestartSec=2
+KillMode=process
 UMask=0077
 LimitCORE=0
 NoNewPrivileges=true
