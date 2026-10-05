@@ -1045,3 +1045,271 @@ fn the_all_lists_name_every_variant_once() {
         "`ErrorKind::ALL` leaves out `ErrorKind::LoginReference`, which the code would then not read back",
     );
 }
+
+const ITEMS: &str = "crates/envcloak-core/src/vault/items.rs";
+const SCHEMA: &str = "crates/envcloak-core/src/vault/schema.rs";
+
+/// A decoder's arm that no input reaches fails (Codex's review of round
+/// three: a guard was read as any text, so `2 if false` passed while the
+/// vault could no longer read a Recovery Kit back). The one guard the
+/// script takes is a schema condition it checks: `schema >= <constant>`
+/// with the decoder's own `schema: u16` and a constant between 1 and
+/// CURRENT_SCHEMA. A guard of another form, a constant above the schema
+/// the code writes, a guard parameter the decoder lacks, and an arm a
+/// `#[cfg]` takes out each fail; the tree's `4 if schema >=
+/// RECORDS_V2_FROM` passes.
+///
+/// Mutations checked: some_arms taking any guard, as in round three (the
+/// first three cases pass); schema_guards without its range rule (the
+/// two constant cases pass); each fails this test.
+#[test]
+fn a_decoder_arm_no_input_reaches_fails() {
+    assert_passes(&fixture().home());
+    for (rel, from, to, expect) in [
+        (
+            ENVELOPE,
+            "            2 => Some(UnlockerKind::RecoveryKit),\n",
+            "            2 if false => Some(UnlockerKind::RecoveryKit),\n",
+            "`UnlockerKind::from_byte` guards an arm with `if false`, which the reader does not take",
+        ),
+        (
+            STATE,
+            "        4 if schema >= RECORDS_V2_FROM => Some(ItemClass::Login),\n",
+            "        4 if schema >= 99 => Some(ItemClass::Login),\n",
+            "`fn item_class_from` guards an arm with `if schema >= 99`, which the reader does not take",
+        ),
+        (
+            STATE,
+            "        4 if schema >= RECORDS_V2_FROM => Some(ItemClass::Login),\n",
+            "        4 if schema >= RECORDS_V2_FROM && v < 0 => Some(ItemClass::Login),\n",
+            "`fn item_class_from` guards an arm with `if schema >= RECORDS_V2_FROM && v < 0`",
+        ),
+        (
+            ITEMS,
+            "pub(crate) const RECORDS_V2_FROM: u16 = 2;",
+            "pub(crate) const RECORDS_V2_FROM: u16 = 3;",
+            "`RECORDS_V2_FROM` is 3, which is not between 1 and CURRENT_SCHEMA (2)",
+        ),
+        (
+            SCHEMA,
+            "pub const CURRENT_SCHEMA: u16 = 2;",
+            "pub const CURRENT_SCHEMA: u16 = 1;",
+            "`RECORDS_V2_FROM` is 2, which is not between 1 and CURRENT_SCHEMA (1)",
+        ),
+        (
+            STATE,
+            "fn item_class_from(v: i64, schema: u16)",
+            "fn item_class_from(v: i64, schema: u32)",
+            "`fn item_class_from` has no parameter `schema: u16`",
+        ),
+        (
+            ENVELOPE,
+            "            2 => Some(UnlockerKind::RecoveryKit),\n",
+            "            #[cfg(any())]\n            2 => Some(UnlockerKind::RecoveryKit),\n",
+            "`UnlockerKind::from_byte` has an arm the reader cannot read (`#[cfg(any())] 2",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, rel, from, to);
+        assert_fails(&t, expect);
+    }
+}
+
+/// A decoder that changes its input before its `match`, or its value
+/// after it, fails (Codex's review of round three: the reader ignored the
+/// matched expression, so a decoder that transformed its input passed
+/// while it read every entry under another number). Each decoder the
+/// script reads is held to `match <input> { .. }` alone: a changed
+/// scrutinee, a statement before the `match` and code after it fail, for
+/// the unlocker kind, item class and policy decoders and for
+/// `PolicyRecord::kind`.
+///
+/// Mutation checked: match_arms without its scrutinee rule and its rule
+/// for what stands around the `match` (round three's reader): every case
+/// passes, and this test fails.
+#[test]
+fn a_decoder_that_changes_its_input_or_its_value_fails() {
+    for (rel, from, to, expect) in [
+        (
+            ENVELOPE,
+            "        match b {\n",
+            "        match b.wrapping_sub(1) {\n",
+            "`UnlockerKind::from_byte` matches on `b.wrapping_sub(1)`, not on `b`",
+        ),
+        (
+            ENVELOPE,
+            "        match b {\n",
+            "        let b = b ^ 3;\n        match b {\n",
+            "`UnlockerKind::from_byte` is not `match b { .. }` alone (it has `let b = b ^ 3;` before",
+        ),
+        (
+            STATE,
+            "    match v {\n",
+            "    match v - 1 {\n",
+            "`fn item_class_from` matches on `v - 1`, not on `v`",
+        ),
+        (
+            STATE,
+            "    match v {\n",
+            "    let found = match v {\n",
+            "`fn item_class_from` is not `match v { .. }` alone (it has `let found =` before",
+        ),
+        (
+            POLICIES,
+            "        let record = match (kind, version) {\n",
+            "        let record = match (version, kind) {\n",
+            "`PolicyRecord::decode` matches on `(version, kind)`, not on `(kind, version)`",
+        ),
+        (
+            POLICIES,
+            "        let record = match (kind, version) {\n",
+            "        let record = match (kind ^ 1, version) {\n",
+            "`PolicyRecord::decode` matches on `(kind ^ 1, version)`, not on `(kind, version)`",
+        ),
+        (
+            POLICIES,
+            "    pub fn kind(&self) -> PolicyKind {\n        match self {\n",
+            "    pub fn kind(&self) -> PolicyKind {\n        match &PolicyRecord::Probe {\n",
+            "`PolicyRecord::kind` matches on `&PolicyRecord::Probe`, not on `self`",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, rel, from, to);
+        assert_fails(&t, expect);
+    }
+}
+
+/// `PolicyRecord::decode` reads the kind and then the version as the
+/// record's first two bytes, refuses a pair it does not know as corrupt
+/// and gives the record its `match` made: the two reads swapped, a
+/// fallback arm that makes a record, an arm whose record is changed after
+/// it is made, and a different record given back each fail.
+///
+/// Mutation checked: code_policy_kinds with DECODE_BEFORE and DECODE_AFTER
+/// empty, the fallback arm's value and the arm's record read as round
+/// three read them: the cases pass, and this test fails.
+#[test]
+fn the_policy_decoder_reads_its_bytes_in_order_and_refuses_what_it_does_not_know() {
+    for (from, to, expect) in [
+        (
+            "        let kind = d.u8()?;\n        let version = d.u8()?;\n",
+            "        let version = d.u8()?;\n        let kind = d.u8()?;\n",
+            "`PolicyRecord::decode` is not `let mut d = Dec::new(b); let kind = d.u8()?; let version = d.u8()?; let record = match (kind, version) { .. }",
+        ),
+        (
+            "            _ => return Err(corrupt()),\n        };\n        d.end()?;\n",
+            "            _ => PolicyRecord::StandingApproval(StandingApproval::decode(&mut d)?),\n        };\n        d.end()?;\n",
+            "`PolicyRecord::decode` does not end with `_ => return Err(corrupt())`",
+        ),
+        (
+            "            (1, 1) => PolicyRecord::StandingApproval(StandingApproval::decode(&mut d)?),\n",
+            "            (1, 1) => PolicyRecord::StandingApproval(StandingApproval::decode(&mut d)?).probe(),\n",
+            "`PolicyRecord::decode` has an arm the reader cannot read (`(1, 1) => PolicyRecord::StandingApproval(",
+        ),
+        (
+            "        Ok(record)\n    }\n}\n",
+            "        Ok(PolicyRecord::probe(record))\n    }\n}\n",
+            "and `; d.end()?; if !record.in_bounds() { return Err(corrupt()); } Ok(PolicyRecord::probe(record))` after it",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, POLICIES, from, to);
+        assert_fails(&t, expect);
+    }
+}
+
+/// `AuditKind::from_u8` and `ErrorKind::from_token` are read as the
+/// searches of `ALL` they are, and `ALL` as the list the code builds: a
+/// search that changes its input, adds a condition or takes another
+/// parameter fails, and so does an entry of `ALL` behind a `#[cfg]`,
+/// which takes it out of the list (rustc compiles it so) though the
+/// reader counted it (round three read `ALL` with attributes blanked and
+/// the searches not at all).
+///
+/// Mutations checked: the check_all_search calls taken out (the first
+/// four cases pass); check_all_list reading entries with attributes
+/// blanked, as in round three (the last case passes); each fails this
+/// test.
+#[test]
+fn the_all_searches_and_lists_are_read_as_the_code_builds_them() {
+    for (rel, from, to, expect) in [
+        (
+            RECORD,
+            "AuditKind::ALL.into_iter().find(|k| *k as u8 == v)",
+            "AuditKind::ALL.into_iter().find(|k| *k as u8 == v.wrapping_add(1))",
+            "`AuditKind::from_u8` is `AuditKind::ALL.into_iter().find(|k| *k as u8 == v.wrapping_add(1))`",
+        ),
+        (
+            RECORD,
+            "AuditKind::ALL.into_iter().find(|k| *k as u8 == v)",
+            "AuditKind::ALL.into_iter().find(|k| *k as u8 == v && *k != AuditKind::Recover)",
+            "`AuditKind::from_u8` is `AuditKind::ALL.into_iter().find(|k| *k as u8 == v && *k != AuditKind::Recover)`",
+        ),
+        (
+            PROTO,
+            "ErrorKind::ALL.into_iter().find(|k| k.token() == token)",
+            "ErrorKind::ALL.into_iter().find(|k| k.token() == token.trim_start_matches('x'))",
+            "`ErrorKind::from_token` is `ErrorKind::ALL.into_iter().find(|k| k.token() == token.trim_start_matches('x'))`",
+        ),
+        (
+            PROTO,
+            "pub fn from_token(token: &str) -> Option<ErrorKind> {",
+            "pub fn from_token(token: &str, _probe: bool) -> Option<ErrorKind> {",
+            "`ErrorKind::from_token` is not `fn from_token(token: &str) -> Option<ErrorKind>`",
+        ),
+        (
+            RECORD,
+            "        AuditKind::Recover,\n",
+            "        #[cfg(any())]\n        AuditKind::Recover,\n",
+            "`AuditKind::ALL` holds an entry the reader cannot read (`#[cfg(any())] AuditKind::Recover`)",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, rel, from, to);
+        assert_fails(&t, expect);
+    }
+}
+
+/// `fn token` and `fn code`, whose values the registries take and
+/// `ErrorKind::from_token` searches, are read whole: an arm behind a
+/// `#[cfg]` is not counted (the variant has no arm the reader reads), an
+/// arm the reader cannot read fails even when every variant has one (a
+/// wildcard that would give a value the reader never sees), and so does
+/// a `match` on something other than `self`.
+///
+/// Mutation checked: enum_arms as in round three (a search for arms in
+/// the bodies of every `fn token`): every case passes, and this test
+/// fails.
+#[test]
+fn a_token_or_code_arm_the_reader_does_not_read_fails() {
+    for (rel, from, to, expect) in [
+        (
+            RECORD,
+            "            AuditKind::Recover => \"recover\",\n",
+            "            #[cfg(any())]\n            AuditKind::Recover => \"recover\",\n            _ => \"recover\",\n",
+            "`fn token` has no `AuditKind::<variant> => <value>` arm the reader can read for Recover",
+        ),
+        (
+            RECORD,
+            "            AuditKind::Recover => \"recover\",\n",
+            "            AuditKind::Recover => \"recover\",\n            _ => \"zz_probe\",\n",
+            "`fn token` has an arm the reader cannot read (`_ => \"zz_probe\"`)",
+        ),
+        (
+            PROTO,
+            "ErrorKind::Internal => -32099,",
+            "ErrorKind::Internal => -32099,\n            _ => -32098,",
+            "`fn code` has an arm the reader cannot read (`_ => -32098`)",
+        ),
+        (
+            RECORD,
+            "    pub const fn token(self) -> &'static str {\n        match self {\n",
+            "    pub const fn token(self) -> &'static str {\n        match AuditKind::Run {\n",
+            "`AuditKind::token` matches on `AuditKind::Run`, not on `self`",
+        ),
+    ] {
+        let t = fixture();
+        edit(&t, rel, from, to);
+        assert_fails(&t, expect);
+    }
+}
