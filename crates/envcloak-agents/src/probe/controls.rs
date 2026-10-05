@@ -333,7 +333,10 @@ pub fn forms(value: &[u8]) -> Vec<Zeroizing<Vec<u8>>> {
 pub struct Swept {
     /// For each needle, in the order given, whether some file held it.
     pub found: Vec<bool>,
-    /// Every file was read whole: nothing unreadable, nothing past a cap.
+    /// For each needle, the files whose contents or names held it.
+    pub holders: Vec<Vec<PathBuf>>,
+    /// Every file was read whole: nothing unreadable, nothing past a cap,
+    /// no link to what the sweep does not read.
     pub complete: bool,
     /// Files read.
     pub files: usize,
@@ -348,17 +351,35 @@ pub const SWEEP_FILES_CAP: usize = 100_000;
 
 /// Looks for each of `needles` (each a set of forms) in every regular
 /// file under `roots` (a root may be a file; with a name filter, only the
-/// files directly in it whose names hold the filter), and in the name of
+/// entries directly in it whose names hold the filter), and in the name of
 /// every entry met there (a store can name a file by what it holds),
 /// never following a link. A root that is not there holds nothing.
+///
+/// A link is not read through, so it is told apart (Codex review of
+/// M2-09: a store behind a link was skipped and the sweep still said it
+/// read everything): one that leads within what the sweep reads (a root,
+/// or an entry a filter takes) is covered there; one that leads nowhere
+/// holds nothing; one that leads anywhere else, or cannot be followed,
+/// makes the sweep incomplete. A socket or a pipe holds nothing at rest:
+/// only its name is looked at.
 pub fn sweep(roots: &[(PathBuf, Option<String>)], needles: &[&[Zeroizing<Vec<u8>>]]) -> Swept {
     let mut s = Swept {
         found: vec![false; needles.len()],
+        holders: vec![Vec::new(); needles.len()],
         complete: true,
         files: 0,
     };
     let mut total = 0u64;
     let mut stack: Vec<PathBuf> = Vec::new();
+    // What the walk reads, resolved: where a link may lead.
+    let mut covered: Vec<PathBuf> = Vec::new();
+    let cover = |p: &Path, covered: &mut Vec<PathBuf>| {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_symlink()) {
+            if let Ok(c) = std::fs::canonicalize(p) {
+                covered.push(c);
+            }
+        }
+    };
     for (root, names) in roots {
         match names {
             Some(part) => match std::fs::read_dir(root) {
@@ -366,6 +387,7 @@ pub fn sweep(roots: &[(PathBuf, Option<String>)], needles: &[&[Zeroizing<Vec<u8>
                     for e in rd {
                         match e {
                             Ok(e) if e.file_name().to_string_lossy().contains(part.as_str()) => {
+                                cover(&e.path(), &mut covered);
                                 stack.push(e.path());
                             }
                             Ok(_) => {}
@@ -376,9 +398,22 @@ pub fn sweep(roots: &[(PathBuf, Option<String>)], needles: &[&[Zeroizing<Vec<u8>
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => s.complete = false,
             },
-            None => stack.push(root.clone()),
+            None => {
+                cover(root, &mut covered);
+                stack.push(root.clone());
+            }
         }
     }
+    let hold = |s: &mut Swept, p: &Path, bytes: &[u8]| {
+        for (i, forms) in needles.iter().enumerate() {
+            if forms.iter().any(|f| contains(bytes, f)) {
+                s.found[i] = true;
+                if !s.holders[i].iter().any(|h| h == p) {
+                    s.holders[i].push(p.to_path_buf());
+                }
+            }
+        }
+    };
     while let Some(p) = stack.pop() {
         let meta = match std::fs::symlink_metadata(&p) {
             Ok(m) => m,
@@ -390,11 +425,15 @@ pub fn sweep(roots: &[(PathBuf, Option<String>)], needles: &[&[Zeroizing<Vec<u8>
         };
         if let Some(name) = p.file_name() {
             use std::os::unix::ffi::OsStrExt as _;
-            for (i, forms) in needles.iter().enumerate() {
-                if !s.found[i] && forms.iter().any(|f| contains(name.as_bytes(), f)) {
-                    s.found[i] = true;
-                }
+            hold(&mut s, &p, name.as_bytes());
+        }
+        if meta.file_type().is_symlink() {
+            match std::fs::canonicalize(&p) {
+                Ok(to) if covered.iter().any(|c| to.starts_with(c)) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => s.complete = false,
             }
+            continue;
         }
         if meta.is_dir() {
             match std::fs::read_dir(&p) {
@@ -427,13 +466,83 @@ pub fn sweep(roots: &[(PathBuf, Option<String>)], needles: &[&[Zeroizing<Vec<u8>
             continue;
         };
         total += bytes.len() as u64;
-        for (i, forms) in needles.iter().enumerate() {
-            if !s.found[i] && forms.iter().any(|f| contains(&bytes, f)) {
-                s.found[i] = true;
-            }
-        }
+        hold(&mut s, &p, &bytes);
     }
     s
+}
+
+/// Watches what a host prints for fixed texts, as it comes, keeping
+/// nothing of it but the last few bytes (a text cut across two reads is
+/// still found): whether each text was printed.
+#[derive(Debug)]
+pub struct Watch {
+    texts: Vec<&'static str>,
+    found: Vec<bool>,
+    tail: Zeroizing<Vec<u8>>,
+}
+
+impl Watch {
+    pub fn new(texts: &[&'static str]) -> Watch {
+        Watch {
+            texts: texts.to_vec(),
+            found: vec![false; texts.len()],
+            tail: Zeroizing::new(Vec::new()),
+        }
+    }
+
+    /// The next bytes printed.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        let keep = self.texts.iter().map(|t| t.len()).max().unwrap_or(0);
+        if keep == 0 {
+            return;
+        }
+        let mut window = Zeroizing::new(Vec::with_capacity(self.tail.len() + chunk.len()));
+        window.extend_from_slice(&self.tail);
+        window.extend_from_slice(chunk);
+        for (i, t) in self.texts.iter().enumerate() {
+            if !self.found[i] && contains(&window, t.as_bytes()) {
+                self.found[i] = true;
+            }
+        }
+        let from = window.len().saturating_sub(keep - 1);
+        self.tail = Zeroizing::new(window[from..].to_vec());
+    }
+
+    /// For each text, in the order given, whether it was printed.
+    pub fn found(&self) -> Vec<bool> {
+        self.found.clone()
+    }
+}
+
+/// A random version-4 UUID, the session id the probe gives Claude Code
+/// (`--session-id`).
+///
+/// # Errors
+/// When the system has no random bytes to give.
+pub fn session_uuid() -> std::io::Result<String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(std::io::Error::other)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = crate::coverage::hex(&b);
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    ))
+}
+
+/// Whether `s` is shaped as a UUID (8-4-4-4-12 hexadecimal digits).
+pub fn uuid_shaped(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A file read whole into a wiping buffer, without following a link at
@@ -680,5 +789,116 @@ mod tests {
         let _ =
             std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o600));
         assert!(!s.complete);
+    }
+
+    /// A link is never read through, so a store behind one is told apart
+    /// (Codex review of M2-09: a linked store was skipped and the sweep
+    /// still said it read everything): a link that leads within what the
+    /// sweep reads is covered there, one that leads nowhere holds nothing,
+    /// and one that leads anywhere else, a root or an entry, makes the
+    /// sweep incomplete. A socket holds nothing at rest. The files holding
+    /// each needle are named.
+    ///
+    /// Mutation checked: links skipped as before (`if
+    /// meta.file_type().is_symlink()` arm dropped, the link falling to `!
+    /// meta.is_file()`): the store behind a link outside reads complete
+    /// and this fails.
+    #[test]
+    fn a_link_out_of_the_stores_makes_the_sweep_incomplete() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = dir.path().join("store");
+        let outside = dir.path().join("outside");
+        for d in [&root, &outside] {
+            std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let ctl = forms(b"ecp-ctl-0000");
+        let token = forms(b"ecpk-token-0000");
+        std::fs::write(root.join("session.jsonl"), b"x ecp-ctl-0000 y")
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(outside.join("kept.jsonl"), b"ecpk-token-0000")
+            .unwrap_or_else(|e| panic!("{e}"));
+        // The control: the regular store alone is read whole, the control
+        // found in its one file.
+        let s = sweep(&[(root.clone(), None)], &[&ctl, &token]);
+        assert!(s.complete);
+        assert_eq!(s.found, [true, false]);
+        assert_eq!(s.holders[0], [root.join("session.jsonl")]);
+        // A link within the store, and one to nothing: still whole.
+        std::fs::create_dir_all(root.join("sub")).unwrap_or_else(|e| panic!("{e}"));
+        std::os::unix::fs::symlink(root.join("sub"), root.join("latest"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::os::unix::fs::symlink(root.join("gone"), root.join("dangling"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let _listener = std::os::unix::net::UnixListener::bind(root.join("sock"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let s = sweep(&[(root.clone(), None)], &[&ctl, &token]);
+        assert!(s.complete, "{s:?}");
+        // A link out of the stores, to where the token is kept: not read,
+        // so not whole.
+        std::os::unix::fs::symlink(outside.join("kept.jsonl"), root.join("linked.jsonl"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let s = sweep(&[(root.clone(), None)], &[&ctl, &token]);
+        assert!(!s.complete, "{s:?}");
+        assert_eq!(s.found, [true, false]);
+        // A root that is a link out, beside a regular one holding the
+        // control: not whole either.
+        std::fs::remove_file(root.join("linked.jsonl")).unwrap_or_else(|e| panic!("{e}"));
+        let linked_root = dir.path().join("linked-store");
+        std::os::unix::fs::symlink(&outside, &linked_root).unwrap_or_else(|e| panic!("{e}"));
+        let s = sweep(
+            &[(root.clone(), None), (linked_root.clone(), None)],
+            &[&ctl, &token],
+        );
+        assert!(!s.complete, "{s:?}");
+        // The same through a filtered root's entry.
+        let s = sweep(
+            &[
+                (root.clone(), None),
+                (dir.path().to_path_buf(), Some("linked-".to_owned())),
+            ],
+            &[&ctl, &token],
+        );
+        assert!(!s.complete, "{s:?}");
+        // A linked root whose target the sweep reads is covered.
+        let inner = dir.path().join("inner-link");
+        std::os::unix::fs::symlink(root.join("sub"), &inner).unwrap_or_else(|e| panic!("{e}"));
+        let s = sweep(&[(root, None), (inner, None)], &[&ctl, &token]);
+        assert!(s.complete, "{s:?}");
+    }
+
+    /// What a host prints is watched for fixed texts as it comes, a text
+    /// cut across two reads found, and nothing else said.
+    #[test]
+    fn a_watched_text_is_found_across_reads() {
+        let mut w = Watch::new(&["hook: UserPromptSubmit Blocked", "[envcloak:key_in_prompt]"]);
+        w.feed(b"noise hook: UserPromptSub");
+        w.feed(b"mit Blo");
+        assert_eq!(w.found(), [false, false]);
+        w.feed(b"cked\n");
+        assert_eq!(w.found(), [true, false]);
+        let mut w = Watch::new(&["[envcloak:key_in_prompt]"]);
+        for b in b"x [envcloak:key_in_prompt] y" {
+            w.feed(&[*b]);
+        }
+        assert_eq!(w.found(), [true]);
+        let mut none = Watch::new(&[]);
+        none.feed(b"anything");
+        assert!(none.found().is_empty());
+    }
+
+    #[test]
+    fn session_ids_are_uuids() {
+        let id = session_uuid().unwrap_or_default();
+        assert!(uuid_shaped(&id), "{id}");
+        assert_eq!(&id[14..15], "4");
+        assert!(uuid_shaped("01a10b22-4b5f-75c1-bae8-8ad8d35a305e"));
+        for bad in [
+            "",
+            "01a10b22-4b5f-75c1-bae8-8ad8d35a305",
+            "01a10b22x4b5f-75c1-bae8-8ad8d35a305e",
+            "g1a10b22-4b5f-75c1-bae8-8ad8d35a305e",
+        ] {
+            assert!(!uuid_shaped(bad), "{bad}");
+        }
     }
 }

@@ -27,15 +27,15 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use super::controls::{
-    self, contains, denial, forms, halves, key_shaped, last_tool_output, marker, picked, reached,
-    seen, unmarked,
+    self, Watch, contains, denial, forms, halves, key_shaped, last_tool_output, marker, picked,
+    reached, seen, session_uuid, unmarked, uuid_shaped,
 };
 use super::model::{self, ModelStub, Recorded};
 use super::{
     Check, HostFlags, ProbeHome, ProbeHost, ProbeReport, RunSummary, ServerProbe, SurfaceProbe,
     claude, codex,
 };
-use crate::coverage::{Case, Outcome, Reason, Sentinel, Surface};
+use crate::coverage::{self, Case, ConfigSet, Outcome, Reason, Sentinel, Surface};
 use crate::hook::{Host, Reason as Denied};
 use crate::hosts::shell_quote;
 use crate::locations::Locations;
@@ -46,6 +46,14 @@ const PROXIES: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_pr
 const MODEL_GRACE: Duration = Duration::from_secs(30);
 /// The environment variable a shell probe looks for in the host's output.
 const ENV_NAME: &str = "ECPROBE_ENV";
+/// What Claude Code prints when EnvCloak's prompt hook blocks a prompt
+/// (measured on the pinned 2.1.280: `UserPromptSubmit operation blocked by
+/// hook:` and the hook's reason, whose marker this is).
+pub const CLAUDE_BLOCKED: &str = "[envcloak:key_in_prompt]";
+/// What Codex prints when a prompt hook blocks a prompt (measured on the
+/// pinned 0.159.2, on its standard error; it names no hook and no
+/// reason).
+pub const CODEX_BLOCKED: &str = "hook: UserPromptSubmit Blocked";
 
 /// Every surface and EnvCloak's server, probed: see [`super`].
 pub fn run(host: &ProbeHost, home: &ProbeHome<'_>, flags: &HostFlags) -> ProbeReport {
@@ -75,6 +83,8 @@ pub fn run_surfaces(
         },
         runs: Vec::new(),
         flags: flags.args.clone(),
+        exe_sha256: String::new(),
+        config_digest: String::new(),
     };
     let want = |s: Surface| surfaces.contains(&s);
     if !model::qualified(host.host.id(), &host.version) {
@@ -91,7 +101,25 @@ pub fn run_surfaces(
         home,
         flags,
         runs: Vec::new(),
+        config: None,
     };
+    // What the result is for: the host binary run and the probe context
+    // of the directory the hosts run in, each read before and after (Codex
+    // review of M2-09: a result was kept under an identity the caller
+    // chose, not the one probed). One that changed while probing, or
+    // cannot be read, is no identity: the record is then current for
+    // nothing (`ProbeRecord::is_for`).
+    let exe = || {
+        std::fs::canonicalize(&host.exe)
+            .ok()
+            .and_then(|e| coverage::file_sha256(&e))
+    };
+    let exe_before = exe();
+    p.config = p.read_config();
+    let digest_before = p
+        .config
+        .as_ref()
+        .and_then(|c| c.fingerprint(&home.envcloak));
     let fixtures = Fixtures::write(&home.project, &home.root);
     let Ok(fx) = fixtures else {
         // No control could be set up: every probe fails through it.
@@ -129,6 +157,15 @@ pub fn run_surfaces(
     if server {
         report.server = p.sentinel();
     }
+    let digest_after = p.read_config().and_then(|c| c.fingerprint(&home.envcloak));
+    report.config_digest = match (digest_before, digest_after) {
+        (Some(a), Some(b)) if a == b => a,
+        _ => String::new(),
+    };
+    report.exe_sha256 = match (exe_before, exe()) {
+        (Some(a), Some(b)) if a == b => a,
+        _ => String::new(),
+    };
     report.runs = p.runs;
     report.surfaces.sort_by_key(|s| s.surface);
     report
@@ -252,6 +289,18 @@ fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.write_all(bytes)
 }
 
+/// How a run joins a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Session {
+    /// A session of its own.
+    New,
+    /// Claude Code: a new session under this id (`--session-id`).
+    Named(String),
+    /// The session with this id, resumed (Claude Code `--resume`, Codex
+    /// `exec resume`).
+    Resume(String),
+}
+
 /// One run of the host.
 struct Spec {
     name: &'static str,
@@ -265,10 +314,14 @@ struct Spec {
     cwd: PathBuf,
     /// Whether the run needs an approval while it runs.
     approve: bool,
+    session: Session,
+    /// Fixed texts looked for in what the host prints, which is read and
+    /// dropped as it comes ([`Watch`]): never kept, never shown.
+    watch: Vec<&'static str>,
 }
 
-/// What one run left: the model's records (wiped on drop) and how the
-/// host ended.
+/// What one run left: the requests the model recorded during it (wiped
+/// on drop), how the host ended, and which watched texts it printed.
 #[derive(Default)]
 struct HostRun {
     requests: Vec<Recorded>,
@@ -276,12 +329,14 @@ struct HostRun {
     exit: Option<i32>,
     timed_out: bool,
     approved: Option<bool>,
+    printed: Vec<bool>,
 }
 
 impl HostRun {
     /// The run is evidence at all: the host exited 0 in time and the model
-    /// served everything it was sent (a refused token, an unknown route, a
-    /// malformed body, a cap reached all say the run is not one to read).
+    /// served everything its session was sent (a refused token, an unknown
+    /// route, a malformed body, a cap reached all say the run is not one
+    /// to read).
     fn usable(&self) -> bool {
         self.exit == Some(0) && !self.timed_out && self.clean
     }
@@ -293,11 +348,28 @@ impl HostRun {
     }
 }
 
+/// One scripted model serving every run of a session: a probe and its
+/// controls reach the same receiver (Codex review of M2-09: the prompt
+/// probe and its control each had a model of their own, so a control's
+/// delivery said nothing of the probe's run).
+struct Receiver {
+    stub: ModelStub,
+    base: String,
+    token: Zeroizing<String>,
+    /// The last request number given to a run.
+    seen: u64,
+    /// The runs it served, by their place in [`Prober::runs`].
+    served: Vec<usize>,
+}
+
 struct Prober<'p, 'a> {
     host: &'p ProbeHost,
     home: &'p ProbeHome<'a>,
     flags: &'p HostFlags,
     runs: Vec<RunSummary>,
+    /// The host's configuration in the probe's directory, as read before
+    /// the probes: what tells a refusal or a block as EnvCloak's.
+    config: Option<ConfigSet>,
 }
 
 impl Prober<'_, '_> {
@@ -319,19 +391,101 @@ impl Prober<'_, '_> {
             env: Vec::new(),
             cwd: self.home.project.clone(),
             approve: false,
+            session: Session::New,
+            watch: Vec::new(),
         }
     }
 
-    /// Runs the host once as `spec` says.
+    /// The host's file locations in the probe home's environment.
+    fn locations(&self) -> Option<Locations> {
+        let env = |k: &str| {
+            self.home
+                .env
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
+        Locations::new(&env).ok()
+    }
+
+    /// The host's configuration for a session in the probe's directory,
+    /// read as `agents status` reads it.
+    fn read_config(&self) -> Option<ConfigSet> {
+        let env = |k: &str| {
+            self.home
+                .env
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
+        let l = self.locations()?;
+        Some(ConfigSet::read(
+            self.host.host,
+            &l,
+            &coverage::claude_managed_dir(),
+            &self.home.project,
+            &env,
+        ))
+    }
+
+    /// A model for a session of `runs` runs of `script`.
+    fn receiver(&self, script: &Value, runs: u32) -> Option<Receiver> {
+        let bytes = serde_json::to_vec(script).ok().map(Zeroizing::new)?;
+        let limit = self.home.run_limit.saturating_mul(runs.max(1)) + MODEL_GRACE;
+        let stub = ModelStub::start(&self.home.model_exe, &bytes, limit).ok()?;
+        let base = stub.base_url();
+        let token = Zeroizing::new(stub.api_key().as_str().to_owned());
+        Some(Receiver {
+            stub,
+            base,
+            token,
+            seen: 0,
+            served: Vec::new(),
+        })
+    }
+
+    /// Ends a session: whether the model served everything it was sent,
+    /// to its end; each run's summary says so too.
+    fn finish(&mut self, rx: Receiver) -> bool {
+        let clean = rx.stub.finish().is_ok_and(|r| r.outcome.clean());
+        for i in rx.served {
+            if let Some(r) = self.runs.get_mut(i) {
+                r.clean &= clean;
+            }
+        }
+        clean
+    }
+
+    /// Runs the host once as `spec` says, against a model of its own.
     fn run(&mut self, spec: &Spec) -> HostRun {
-        let start = Instant::now();
+        let Some(mut rx) = self.receiver(&spec.script, 1) else {
+            self.runs
+                .push(self.summary(spec, &HostRun::default(), Instant::now()));
+            return HostRun::default();
+        };
+        let mut out = self.run_on(&mut rx, spec);
+        out.clean &= self.finish(rx);
+        out
+    }
+
+    fn summary(&self, spec: &Spec, out: &HostRun, start: Instant) -> RunSummary {
         let mut flags = spec.probe.clone();
-        if !self.claude() {
-            flags.extend(["--sandbox".to_owned(), spec.sandbox.to_owned()]);
+        match (&spec.session, self.host.host) {
+            (Session::Named(_), _) => flags.push("--session-id <the probe's>".to_owned()),
+            (Session::Resume(_), Host::ClaudeCode) => {
+                flags.push("--resume <the control's session>".to_owned());
+            }
+            (Session::Resume(_), Host::Codex) => {
+                flags.push("resume <the control's session>".to_owned());
+                flags.push(format!("-c sandbox_mode={}", codex::toml_str(spec.sandbox)));
+            }
+            (Session::New, Host::Codex) => {
+                flags.extend(["--sandbox".to_owned(), spec.sandbox.to_owned()]);
+            }
+            (Session::New, Host::ClaudeCode) => {}
         }
         flags.extend(self.flags.args.iter().cloned());
-        let out = self.run_inner(spec, start);
-        self.runs.push(RunSummary {
+        RunSummary {
             name: spec.name,
             flags,
             exit: out.exit,
@@ -340,47 +494,84 @@ impl Prober<'_, '_> {
             clean: out.clean,
             elapsed: start.elapsed(),
             approved: out.approved,
-        });
+        }
+    }
+
+    /// Runs the host once as `spec` says, against `rx`: the requests it
+    /// made are those the model recorded since the session's last run.
+    fn run_on(&mut self, rx: &mut Receiver, spec: &Spec) -> HostRun {
+        let start = Instant::now();
+        let mut out = self.run_inner(rx, spec, start);
+        match rx.stub.requests() {
+            Ok(report) => {
+                out.clean = report.outcome.clean();
+                let before = rx.seen;
+                rx.seen = report
+                    .requests
+                    .iter()
+                    .map(|r| r.seq)
+                    .max()
+                    .unwrap_or(before)
+                    .max(before);
+                out.requests = report
+                    .requests
+                    .into_iter()
+                    .filter(|r| r.seq > before)
+                    .collect();
+            }
+            Err(_) => out.clean = false,
+        }
+        self.runs.push(self.summary(spec, &out, start));
+        rx.served.push(self.runs.len() - 1);
         out
     }
 
-    fn run_inner(&self, spec: &Spec, start: Instant) -> HostRun {
-        let mut out = HostRun::default();
-        let Ok(script) = serde_json::to_vec(&spec.script).map(Zeroizing::new) else {
-            return out;
+    fn run_inner(&self, rx: &Receiver, spec: &Spec, start: Instant) -> HostRun {
+        let mut out = HostRun {
+            printed: vec![false; spec.watch.len()],
+            ..HostRun::default()
         };
-        let Ok(stub) = ModelStub::start(
-            &self.home.model_exe,
-            &script,
-            self.home.run_limit + MODEL_GRACE,
-        ) else {
-            return out;
-        };
-        let base = stub.base_url();
-        let token = Zeroizing::new(stub.api_key().as_str().to_owned());
+        let base = &rx.base;
+        let token = &rx.token;
         let mut cmd = Command::new(&self.host.exe);
         cmd.env_clear()
             .envs(self.home.env.iter().map(|(k, v)| (k, v)));
         for k in PROXIES {
-            cmd.env(k, &base);
+            cmd.env(k, base);
         }
         for k in ["NO_PROXY", "no_proxy"] {
             cmd.env(k, "127.0.0.1,localhost");
         }
         let args = match self.host.host {
             Host::ClaudeCode => {
-                cmd.envs(claude::model_env(&base, &token));
-                claude::args(&spec.prompt, &spec.probe, &self.flags.args)
+                cmd.envs(claude::model_env(base, token));
+                let mut probe = spec.probe.clone();
+                match &spec.session {
+                    Session::New => {}
+                    Session::Named(id) => probe.extend(["--session-id".to_owned(), id.clone()]),
+                    Session::Resume(id) => probe.extend(["--resume".to_owned(), id.clone()]),
+                }
+                claude::args(&spec.prompt, &probe, &self.flags.args)
             }
             Host::Codex => {
-                cmd.envs(codex::model_env(&token));
-                codex::args(
-                    &base,
-                    &spec.prompt,
-                    spec.sandbox,
-                    &spec.probe,
-                    &self.flags.args,
-                )
+                cmd.envs(codex::model_env(token));
+                match &spec.session {
+                    Session::Resume(id) => codex::resume_args(
+                        base,
+                        id,
+                        &spec.prompt,
+                        spec.sandbox,
+                        &spec.probe,
+                        &self.flags.args,
+                    ),
+                    _ => codex::args(
+                        base,
+                        &spec.prompt,
+                        spec.sandbox,
+                        &spec.probe,
+                        &self.flags.args,
+                    ),
+                }
             }
         };
         cmd.args(&args)
@@ -391,11 +582,13 @@ impl Prober<'_, '_> {
             .stderr(Stdio::piped())
             .process_group(0);
         let Ok(mut child) = cmd.spawn() else {
-            drop(stub.finish());
             return out;
         };
         drop(args);
-        let readers = [drain(child.stdout.take()), drain(child.stderr.take())];
+        let readers = [
+            drain(child.stdout.take(), spec.watch.clone()),
+            drain(child.stderr.take(), spec.watch.clone()),
+        ];
         let deadline = start + self.home.run_limit;
         let stop = AtomicBool::new(false);
         let pid = i32::try_from(child.id()).unwrap_or(0);
@@ -428,7 +621,11 @@ impl Prober<'_, '_> {
         });
         let left = (deadline + Duration::from_secs(5)).saturating_duration_since(Instant::now());
         for r in readers {
-            let _ = r.recv_timeout(left);
+            if let Ok(found) = r.recv_timeout(left) {
+                for (seen, f) in out.printed.iter_mut().zip(found) {
+                    *seen |= f;
+                }
+            }
         }
         out.timed_out = timed_out;
         out.exit = if timed_out {
@@ -437,39 +634,103 @@ impl Prober<'_, '_> {
             status.and_then(|s| s.code())
         };
         out.approved = approved;
-        if let Ok(report) = stub.finish() {
-            out.clean = report.outcome.clean();
-            out.requests = report.requests;
-        }
         out
     }
 
-    /// The prompt guard and, from the same two runs, the transcript.
+    /// The prompt guard and the transcript, from one session against one
+    /// model (Codex review of M2-09: the control and the probe ran as two
+    /// sessions, so a probe run that ended without sending anything read
+    /// as a block, and the sweep took a control any session left):
+    ///
+    /// 1. the control: a benign prompt carrying a marker, in a session of
+    ///    its own (Claude Code's under an id the probe gives it), must
+    ///    reach the model;
+    /// 2. that session is found by its control in the host's store: its
+    ///    own file (Claude Code's `projects/<folder>/<id>.jsonl`, Codex's
+    ///    one `sessions/**/rollout-*-<id>.jsonl` that holds the control);
+    /// 3. the probe, the same session resumed with a prompt holding a
+    ///    runtime-generated key-shaped token: the host must report the
+    ///    block (Codex cycle177's hook invocation: Claude Code prints the
+    ///    hook's reason, EnvCloak's marker in it; Codex prints that a
+    ///    prompt hook blocked it, which counts only where no other prompt
+    ///    hook is there), and the token must reach the model in no run;
+    /// 4. the session resumed again with a second marker, which must reach
+    ///    the model with the control's turn in the same request: the host
+    ///    and the session went on after the block.
+    ///
+    /// The transcript is then swept: the control must be found in its
+    /// session's file by the sweep, which must have read everything, and
+    /// only then does the token's absence count.
     fn prompt_and_transcript(&mut self) -> (SurfaceProbe, SurfaceProbe) {
-        let (Ok(ctl), Ok(token)) = (marker("prompt"), key_shaped()) else {
+        let (Ok(ctl), Ok(again), Ok(token), Ok(id)) = (
+            marker("prompt"),
+            marker("again"),
+            key_shaped(),
+            session_uuid(),
+        ) else {
             return (
                 failed(Surface::PromptToModel, "no random bytes"),
                 failed(Surface::Transcript, "no random bytes"),
             );
         };
         let script = json!({"steps": [{"say": "done"}]});
-        let spec = self.spec(
+        let Some(mut rx) = self.receiver(&script, 3) else {
+            return (
+                failed(Surface::PromptToModel, "the scripted model could not start"),
+                failed(Surface::Transcript, "the scripted model could not start"),
+            );
+        };
+        let claude = self.claude();
+        let mut a = self.spec(
             "prompt control",
             script.clone(),
             format!("Reply with one word. {ctl}"),
         );
-        let c = self.run(&spec);
-        let control = c.usable() && reached(&c.requests, &ctl);
-        drop(c);
-        let spec = self.spec(
-            "prompt probe",
-            script,
-            format!("Deploy it with {} now.", token.as_str()),
-        );
-        let p = self.run(&spec);
+        if claude {
+            a.session = Session::Named(id.clone());
+        }
+        let mut ra = self.run_on(&mut rx, &a);
+        let ctl_forms = forms(ctl.as_bytes());
+        let found = self.session_store(&ctl_forms, claude.then_some(id.as_str()));
+        let (mut rb, mut rc) = (HostRun::default(), HostRun::default());
+        if let Some((_, sid)) = &found {
+            let mut b = self.spec(
+                "prompt probe",
+                script.clone(),
+                format!("Deploy it with {} now.", token.as_str()),
+            );
+            b.session = Session::Resume(sid.clone());
+            b.watch = vec![if claude {
+                CLAUDE_BLOCKED
+            } else {
+                CODEX_BLOCKED
+            }];
+            rb = self.run_on(&mut rx, &b);
+            let mut c = self.spec(
+                "prompt control after the block",
+                script,
+                format!("Reply with one word. {again}"),
+            );
+            c.session = Session::Resume(sid.clone());
+            rc = self.run_on(&mut rx, &c);
+        }
+        let clean = self.finish(rx);
+        for r in [&mut ra, &mut rb, &mut rc] {
+            r.clean &= clean;
+        }
+        let control = ra.usable() && reached(&ra.requests, &ctl);
+        let reported = rb.usable() && rb.printed.first().copied().unwrap_or(false);
+        // Codex names no hook: its report counts only where EnvCloak's is
+        // the only prompt hook (the class of the verifier's round-2
+        // finding, a refusal taken as EnvCloak's without its provenance).
+        let ours = claude || self.config.as_ref().is_some_and(|c| !c.foreign_prompt_hook);
         let token_forms = forms(token.as_bytes());
-        let blocked = p.usable() && !seen(&p.requests, &token_forms);
-        drop(p);
+        let kept_out = rb.usable()
+            && !seen(&ra.requests, &token_forms)
+            && !seen(&rb.requests, &token_forms)
+            && !seen(&rc.requests, &token_forms);
+        let went_on = rc.usable() && reached(&rc.requests, &again) && reached(&rc.requests, &ctl);
+        drop((ra, rb, rc));
         let prompt = surface(
             Surface::PromptToModel,
             vec![
@@ -480,23 +741,48 @@ impl Prober<'_, '_> {
                     "the control did not reach the model",
                 ),
                 check(
+                    "the control's session is found in the host's store",
+                    true,
+                    found.is_some(),
+                    "no one session file of the host's store holds the control",
+                ),
+                check(
+                    "the host reports EnvCloak's hook blocked the prompt",
+                    false,
+                    reported && ours,
+                    if reported {
+                        "a prompt hook blocked it, not known to be EnvCloak's"
+                    } else {
+                        "the host did not report a prompt hook blocking it"
+                    },
+                ),
+                check(
                     "a prompt holding a key-shaped token never reaches it",
                     false,
-                    blocked,
+                    kept_out,
                     "the token reached the model, or the run did not finish",
+                ),
+                check(
+                    "the session goes on after the block, the control's turn in it",
+                    true,
+                    went_on,
+                    "the session's next turn did not reach the model with the control's turn",
                 ),
             ],
         );
-        let ctl_forms = forms(ctl.as_bytes());
+        let blocked = prompt.outcome == Outcome::Passed;
         let swept = controls::sweep(&self.stores(), &[&ctl_forms, &token_forms]);
-        let (found_ctl, found_token) = (swept.found[0], swept.found[1]);
+        let in_session = found
+            .as_ref()
+            .is_some_and(|(file, _)| swept.holders[0].iter().any(|h| h == file));
+        let found_token = swept.found[1];
         let mut transcript = surface(
             Surface::Transcript,
             vec![
                 check(
                     "the prompt was blocked",
                     true,
-                    control && blocked,
+                    blocked,
                     "the prompt probe did not pass",
                 ),
                 check(
@@ -506,10 +792,10 @@ impl Prober<'_, '_> {
                     "a store could not be read whole",
                 ),
                 check(
-                    "the control prompt is in the host's stores",
+                    "the control prompt is in its session's store",
                     true,
-                    found_ctl,
-                    "the control is in none of the stores swept",
+                    in_session,
+                    "the sweep did not find the control in its session's file",
                 ),
                 check(
                     "the blocked prompt is in none of them",
@@ -519,21 +805,50 @@ impl Prober<'_, '_> {
                 ),
             ],
         );
-        transcript.persisted = control && blocked && found_token;
+        transcript.persisted = blocked && found_token;
         (prompt, transcript)
+    }
+
+    /// The store file of the session the control `ctl_forms` ran in, and
+    /// the session's id: for Claude Code, the transcript named by the id
+    /// the probe gave it (`claude_id`) that holds the control; for Codex,
+    /// the one session file holding the control, its id from its name
+    /// (`rollout-<time>-<id>.jsonl`). `None` unless exactly one is found.
+    fn session_store(
+        &self,
+        ctl_forms: &[Zeroizing<Vec<u8>>],
+        claude_id: Option<&str>,
+    ) -> Option<(PathBuf, String)> {
+        let l = self.locations()?;
+        let root = if self.claude() {
+            l.claude_dir().join("projects")
+        } else {
+            l.codex_home().join("sessions")
+        };
+        let swept = controls::sweep(&[(root, None)], &[ctl_forms]);
+        let id_of = |p: &Path| -> Option<String> {
+            let name = p.file_name()?.to_str()?;
+            match claude_id {
+                Some(id) => (name == format!("{id}.jsonl")).then(|| id.to_owned()),
+                None if !self.claude() => {
+                    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+                    let id = stem.get(stem.len().checked_sub(36)?..)?;
+                    uuid_shaped(id).then(|| id.to_owned())
+                }
+                None => None,
+            }
+        };
+        let mut hits = swept.holders[0]
+            .iter()
+            .filter_map(|p| Some((p.clone(), id_of(p)?)));
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
     }
 
     /// The host's stores for a pasted or printed value (D-15), in the
     /// probe home.
     fn stores(&self) -> Vec<(PathBuf, Option<String>)> {
-        let env = |k: &str| {
-            self.home
-                .env
-                .iter()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| v.clone())
-        };
-        let Ok(l) = Locations::new(&env) else {
+        let Some(l) = self.locations() else {
             return Vec::new();
         };
         let label = if self.claude() {
@@ -546,6 +861,21 @@ impl Prober<'_, '_> {
             .filter(|s| s.label.starts_with(label))
             .map(|s| (s.path, s.names))
             .collect()
+    }
+
+    /// Whether a refusal in the host's own words, of a call EnvCloak's host
+    /// rule covers, can only be that rule's (the verifier's round-2
+    /// finding: Claude Code's refusal names no rule, so any deny rule of
+    /// the person's gave it): Claude Code's when its settings hold
+    /// EnvCloak's `Read(**/.env*)` and no other deny rule for its file
+    /// tools; Codex's refusal carries the justification of EnvCloak's own
+    /// rule ([`controls::codex_rule_refused`]).
+    fn rule_is_ours(&self) -> bool {
+        !self.claude()
+            || self
+                .config
+                .as_ref()
+                .is_some_and(|c| c.read_deny && !c.foreign_read_deny)
     }
 
     /// File read: a control read; the hook's case, a read of a `.env`
@@ -599,7 +929,7 @@ impl Prober<'_, '_> {
         let r = self.run(&spec);
         let env_forms = forms(fx.env_file.as_bytes());
         let mut checks = denial_checks(&r, &fx.readme, Denied::EnvFile, &env_forms);
-        checks.push(rule_check(&r, 3, self.host.host));
+        checks.push(rule_check(&r, 3, self.host.host, self.rule_is_ours()));
         drop(r);
         let mut skipped = Vec::new();
         if self.claude() {
@@ -721,7 +1051,7 @@ impl Prober<'_, '_> {
         let env_forms = forms(fx.env_var.as_bytes());
         let mut checks = denial_checks(&r, &ctl, Denied::EnvDump, &env_forms);
         if !self.claude() {
-            checks.push(rule_check(&r, 3, self.host.host));
+            checks.push(rule_check(&r, 3, self.host.host, self.rule_is_ours()));
         }
         surface(Surface::Shell, checks)
     }
@@ -792,7 +1122,14 @@ impl Prober<'_, '_> {
             };
             return skipped(Surface::Output, Outcome::Skipped, &why);
         };
+        // The host runs in the probe's directory, as every probe's run does,
+        // so the probe context the result is kept for is the one it ran in
+        // (Codex review of M2-09); the command goes to the project whose
+        // manifest binds the values.
         let mut words = vec![
+            "cd".to_owned(),
+            shell_quote(&fixture.project.to_string_lossy()),
+            "&&".to_owned(),
             shell_quote(&self.home.envcloak.to_string_lossy()),
             "run".to_owned(),
             "--wait".to_owned(),
@@ -800,13 +1137,11 @@ impl Prober<'_, '_> {
             "--".to_owned(),
         ];
         words.extend(fixture.command.iter().map(|w| shell_quote(w)));
-        let project = fixture.project.clone();
         let mut spec = self.spec(
             "output",
             json!({"steps": [{"shell": words.join(" ")}, {"say": "done"}]}),
             "Run the emitter through EnvCloak.".to_owned(),
         );
-        spec.cwd = project;
         if self.claude() {
             spec.probe = claude::permissions(&["Bash"]);
         } else {
@@ -967,7 +1302,7 @@ impl Prober<'_, '_> {
 /// [`controls::rule_refusal`]) or by EnvCloak's hook (its marker).
 /// What refused it is named in the check's `why` either way, from the
 /// fixed list.
-fn rule_check(r: &HostRun, n: usize, host: Host) -> Check {
+fn rule_check(r: &HostRun, n: usize, host: Host, ours: bool) -> Check {
     let name = "the call EnvCloak's host rule covers is refused";
     let result = r.after(n);
     let by = if !r.usable() {
@@ -975,7 +1310,13 @@ fn rule_check(r: &HostRun, n: usize, host: Host) -> Check {
     } else if contains(result.as_bytes(), b"[envcloak:") {
         Ok("EnvCloak's hook, with its marker")
     } else {
-        controls::rule_refusal(host, &result).ok_or_else(|| unmarked(&result))
+        match controls::rule_refusal(host, &result) {
+            // The host's words name no rule: with another rule there that
+            // could give them, the refusal is not known to be EnvCloak's.
+            Some(_) if !ours => Err("the host refused it under a rule not known to be EnvCloak's"),
+            Some(by) => Ok(by),
+            None => Err(unmarked(&result)),
+        }
     };
     Check {
         name,
@@ -1030,15 +1371,25 @@ fn denial_checks(
 
 /// Reads a pipe to its end on a thread of its own, dropping what it reads
 /// through a wiping buffer (the host is never left blocked on a full
-/// pipe); the receiver says when it is done.
-fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> mpsc::Receiver<()> {
+/// pipe) after looking in it for each of `texts` ([`Watch`]); the receiver
+/// says, when it is done, which were printed.
+fn drain(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+    texts: Vec<&'static str>,
+) -> mpsc::Receiver<Vec<bool>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let mut watch = Watch::new(&texts);
         if let Some(mut p) = pipe {
             let mut buf = Zeroizing::new(vec![0u8; 64 * 1024]);
-            while matches!(p.read(&mut buf), Ok(n) if n > 0) {}
+            loop {
+                match p.read(&mut buf) {
+                    Ok(n) if n > 0 => watch.feed(&buf[..n]),
+                    _ => break,
+                }
+            }
         }
-        let _ = tx.send(());
+        let _ = tx.send(watch.found());
     });
     rx
 }
@@ -1187,6 +1538,7 @@ mod tests {
             exit,
             timed_out: false,
             approved: None,
+            printed: Vec::new(),
         };
         for (host, out, exit, passed) in [
             (
@@ -1231,10 +1583,66 @@ mod tests {
                 false,
             ),
         ] {
-            let c = rule_check(&run(out, exit), 3, host);
+            let c = rule_check(&run(out, exit), 3, host, true);
             assert_eq!(c.passed, passed, "{host:?} {out:?} {exit:?}: {c:?}");
             assert!(!c.why.is_empty());
         }
+        // Where another rule could give the host's words, its refusal is
+        // not EnvCloak's: Claude Code's names no rule (the verifier's
+        // round-2 finding); EnvCloak's marker still is EnvCloak's.
+        let claude_refusal =
+            "Permission to read /p/.env has been denied by your permission settings.";
+        let c = rule_check(&run(claude_refusal, Some(0)), 3, Host::ClaudeCode, false);
+        assert!(!c.passed, "{c:?}");
+        assert_eq!(
+            c.why,
+            "the host refused it under a rule not known to be EnvCloak's"
+        );
+        let c = rule_check(
+            &run("[envcloak:env_file] stopped", Some(0)),
+            3,
+            Host::ClaudeCode,
+            false,
+        );
+        assert!(c.passed, "{c:?}");
+    }
+
+    /// The prompt probe's witness texts are what the pinned hosts print
+    /// when EnvCloak's prompt hook blocks a prompt: Claude Code's is
+    /// EnvCloak's own marker for the reason.
+    #[test]
+    fn the_block_witness_is_envcloaks_marker_on_claude_code() {
+        assert_eq!(CLAUDE_BLOCKED, denial(Denied::KeyInPrompt));
+        assert!(CODEX_BLOCKED.contains("UserPromptSubmit"));
+    }
+
+    /// Codex resumes a session with the sandbox as a setting (`exec
+    /// resume` takes no `--sandbox`), the session's id before the prompt.
+    #[test]
+    fn a_codex_session_is_resumed_with_its_sandbox_as_a_setting() {
+        let words: Vec<String> = codex::resume_args(
+            "http://127.0.0.1:9",
+            "0000-id",
+            "the prompt",
+            "read-only",
+            &["-c".to_owned(), "x=1".to_owned()],
+            &["--home-flag".to_owned()],
+        )
+        .into_iter()
+        .map(|w| w.to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(words[..2], ["exec", "resume"]);
+        assert!(!words.iter().any(|w| w == "--sandbox"), "{words:?}");
+        assert!(words.iter().any(|w| w == "sandbox_mode=\"read-only\""));
+        assert_eq!(words[words.len() - 2..], ["0000-id", "the prompt"]);
+        let fresh: Vec<String> =
+            codex::args("http://127.0.0.1:9", "the prompt", "read-only", &[], &[])
+                .into_iter()
+                .map(|w| w.to_string_lossy().into_owned())
+                .collect();
+        assert_eq!(fresh[0], "exec");
+        assert!(fresh.windows(2).any(|w| w == ["--sandbox", "read-only"]));
+        assert_eq!(fresh.last().map(String::as_str), Some("the prompt"));
     }
 
     #[test]
@@ -1267,6 +1675,7 @@ mod tests {
             exit,
             timed_out: false,
             approved: None,
+            printed: Vec::new(),
         };
         let marked = "[envcloak:env_file] stopped";
         let all_pass = |c: &[Check]| c.iter().all(|c| c.passed);
