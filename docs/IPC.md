@@ -484,7 +484,7 @@ The `pty_monitor` reader binds `Report` and `Command` to direct module-scope pub
 <!-- reservations:statement_domain -->
 | Domain | Task | Status | Use |
 |---|---|---|---|
-| `envcloak-statement/2` | M2-13 | landed | approval statements with classifications, live ticks and test-item proposals; version 1 digests are refused after the upgrade |
+| `envcloak-statement/2` | M2-13 | landed | approval statements with classifications, live ticks and test-item proposals; version 1 digests are refused after the upgrade. M3-09's `app.approve` signs this statement too ("Reserved for M3") |
 | `envcloak-signin-statement/1` | M2b-01 | landed | sign-in approval statements (SPEC §6.8) |
 <!-- /reservations -->
 
@@ -529,7 +529,7 @@ Status: M3 plan decisions D3-02 and lane C's rule 9, written by task M3-01. Ever
 
 The rules and statuses are those of "Reserved for M2 and M2b" above, and `scripts/check-reservations.py` reads each registry's tables in both sections as one table: a name or number is taken once across them, and a section holds each table at most once. A row here names an M3 task (`M3-01` to `M3-21`) or join (`M3-J1` to `M3-J6`), a later milestone or `spare`; a row of an M2 or M2b task stays in the section above, and a row of an M3 task in this one. The app-role methods have their own table: every name in it starts with `app.`, and no name in a client method table does. The script reads it from the `const NAME` of every `impl Method for` in `envcloak-ipc` whose name starts with `app.`, as it reads the client methods from the rest; the M1 list `APP_METHODS`, which gate 22's test and the daemon's log read, holds names, not methods. Each lane-C task changes its rows to `landed` in the commit that adds them to the code, and lands the typed Rust helper and the Swift type in the same task or the next lane-C task (plan rule 9).
 
-The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --json` has reported `daemon.identity` (`verified` or `unverified`) since M1, from the client's own check of the daemon (`Client::identity` in `crates/envcloak-ipc/src/client.rs`); M3-07 makes that check pass on signed builds, and the daemon's `status` answer takes no such field, since a daemon cannot vouch for its own code. And three of the plan's names gain `keychain_` (the reason `keychain_anchor_missing`, the field `vault.keychain_anchor` and audit kind 50 `keychain_anchor_mismatch`), because `anchor` alone already names the audit log's saved head (`audit.verify`'s `anchor` and its problem and failure token `anchor_mismatch`).
+The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --json` has reported `daemon.identity` (`verified` or `unverified`) since M1, from the client's own check of the daemon (`Client::identity` in `crates/envcloak-ipc/src/client.rs`); M3-07 makes that check pass on signed builds, and the daemon's `status` answer takes no such field, since a daemon cannot vouch for its own code. And three of the plan's names gain `keychain_` (the reason `keychain_anchor_missing`, the field `vault.keychain_anchor` and audit kind 50 `keychain_anchor_mismatch`), because `anchor` alone already names the audit log's saved head (`audit.verify`'s `anchor` and its problem and failure token `anchor_mismatch`). The plan's run-approval domain `envcloak-statement/1` is not a row either: M2-13 moved run approvals to `envcloak-statement/2` and refuses version 1 digests, so M3-09's `app.approve` signs version 2, whose row is M2-13's under "Reserved for M2 and M2b" (a domain is taken once across the two sections).
 
 **Error kinds** (`data.kind`; -32051 to -32055, after M2's -32035 to -32050; and the two existing kinds M3 uses for a new case):
 
@@ -624,7 +624,6 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 <!-- reservations:statement_domain -->
 | Domain | Task | Status | Use |
 |---|---|---|---|
-| `envcloak-statement/1` | M3-09 | reuse | run approvals the app signs, until J1 moves them to `envcloak-statement/2` (M2-13, which then refuses version 1 digests) |
 | `envcloak-unlocker-statement/1` | M3-08 | reserved | adding a Secure Enclave unlocker, approved in a terminal with the passphrase: its label, the SHA-256 fingerprints of both its public keys and the Team ID and signing identifier the daemon verified for the app (plan D3-08) |
 | `envcloak-write-statement/1` | M3-14 | reserved | signed in the app: replacing or removing an item, adding or removing a Secure Enclave unlocker, removing the passphrase unlocker |
 | `envcloak-reveal-statement/1` | M3-14 | reserved | a reveal in the app, signed (SPEC §6.7) |
