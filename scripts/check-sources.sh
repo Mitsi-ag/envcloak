@@ -39,19 +39,24 @@
 #    resource_bundle_accessor.swift and Xcode's GeneratedAssetSymbols.swift,
 #    in the build's own DerivedSources/). So a Swift file referenced from
 #    outside apps/macos, linked in from elsewhere or written by a build phase
-#    is refused. Each list is a target's: one that ships (any whose name does
-#    not end in `Tests`) may compile only files check-swift.sh holds to the
-#    product rules, so a test file compiled into the app is refused. Every
-#    object the build linked (its *.LinkFileList files) must have been
-#    compiled from a Swift file in its target's list, or be another target's
-#    prelinked object or, in a test target, the host app's Debug dylib: an
-#    object compiled from C, Objective-C or assembly is refused, so
-#    check-swift.sh's rules hold for the Swift compiled into the app and
-#    nothing else is linked beside it. (check-swift.sh also refuses such
-#    sources in the tree.) The generated accessor's Debug-only environment
-#    override never ships: scripts/macos/sign-check.sh refuses an artifact
-#    that holds it.
-#    scripts/macos/check_compiled_swift.py does the comparison.
+#    is refused. What each target is comes from what its linker wrote (a
+#    .xctest bundle is a test bundle; a prelinked object in Build/Products
+#    or a file in an app ships), never from its name: one that ships may
+#    compile only files check-swift.sh holds to the product rules, so a test
+#    file compiled into the app, or into any library linked into it, is
+#    refused. What was linked is read from each target's link list, output
+#    file map and the linker's own record of every file it read
+#    (ld -dependency_info), all required: each object must be one the
+#    output file map assigns to a Swift file of the target, another
+#    target's prelinked object or, in a test bundle, the host app; and every
+#    other file the linker read must be a Swift module, the macOS SDK, the
+#    toolchain's runtime or, in a test bundle, XCTest. So an object compiled
+#    from C, Objective-C or assembly and a library from a flag or a search
+#    path are refused, and check-swift.sh's rules hold for everything linked
+#    into the app. (check-swift.sh also refuses such sources and settings in
+#    the tree.) The generated accessor's Debug-only environment override
+#    never ships: scripts/macos/sign-check.sh refuses an artifact that holds
+#    it. scripts/macos/check_compiled_swift.py does the comparison.
 #
 # Usage: scripts/check-sources.sh [workspace-root]
 #        scripts/check-sources.sh --swift <xcodebuild derived data> [workspace-root]
@@ -68,13 +73,22 @@ if [ "${1:-}" = "--swift" ]; then
   }
   derived="$(cd "$2" && pwd -P)"
   root="$(cd "${3:-$here/..}" && pwd -P)"
-  # The listing is named <prefix>.<pid>.<random> and the exit trap removes
-  # every such name of this process, so it goes however the script stops;
-  # the four signals leave through that trap (bash runs no EXIT trap on
-  # SIGQUIT or SIGPIPE, measured with 3.2 and 5.3).
+  # The listing is named <prefix>.<pid>.<run>.<random>, <run> drawn once
+  # from /dev/urandom, and the exit trap removes every such name of this
+  # run (not an earlier run's of the same pid), so it goes however the
+  # script stops; the four signals leave through that trap (bash runs no
+  # EXIT trap on SIGQUIT or SIGPIPE, measured with 3.2 and 5.3).
+  run_token="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  case "$run_token" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *)
+      echo "check-sources: cannot read a run token from /dev/urandom" >&2
+      exit 1
+      ;;
+  esac
   prefix="${TMPDIR:-/tmp}"
-  prefix="${prefix%/}/check-sources-swift"
-  trap 'rm -f "$prefix".$$.*' EXIT
+  prefix="${prefix%/}/check-sources-swift.$$.$run_token"
+  trap 'rm -f "$prefix".*' EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 131' QUIT
@@ -82,14 +96,14 @@ if [ "${1:-}" = "--swift" ]; then
   trap '' PIPE
   listed=""
   for _ in 1 2 3 4 5 6 7 8; do
-    candidate="$prefix.$$.$RANDOM$RANDOM"
+    candidate="$prefix.$RANDOM$RANDOM"
     if (set -C && : >"$candidate") 2>/dev/null; then
       listed="$candidate"
       break
     fi
   done
   [ -n "$listed" ] || {
-    echo "check-sources: cannot make a listing named $prefix.$$.*" >&2
+    echo "check-sources: cannot make a listing named $prefix.*" >&2
     exit 1
   }
   bash "$here/macos/check-swift.sh" --list-swift --root "$root" >"$listed"
