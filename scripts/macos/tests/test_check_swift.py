@@ -94,6 +94,14 @@ struct View: SwiftUI.View {
 public struct Client {
     public init() {}
     public func size(_ n: Int) -> Int { n / 2 }
+    // A child's streams are not the app's own.
+    public func child() -> Process {
+        let p = Process()
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = Pipe()
+        p.standardError = Pipe()
+        return p
+    }
 }
 """,
     TOKEN_FILE: """import os
@@ -191,6 +199,8 @@ SWIFT_REFUSALS = [
     ("user defaults", "launch-input", KIT, append(KIT, "let d = UserDefaults.standard.string(forKey: \"socket\")\n")),
     ("app storage", "launch-input", VIEW, replace(VIEW, "    let total: Int\n", "    let total: Int\n    @AppStorage(\"vault\") var vault = \"\"\n")),
     ("standard input", "launch-input", KIT, append(KIT, "let line = readLine()\n")),
+    ("the app's standard input handle", "launch-input", KIT, append(KIT, "let h = FileHandle.standardInput\n")),
+    ("the C standard input", "launch-input", KIT, append(KIT, "let c = getc(stdin)\n")),
     ("app intents", "side-door", APP, replace(APP, "import SwiftUI\n", "import SwiftUI\nimport AppIntents\n")),
     ("open url", "side-door", VIEW, replace(VIEW, "        .padding(total > 2 ? 8 : 4)\n", "        .padding(total > 2 ? 8 : 4)\n        .onOpenURL { _ in }\n")),
     ("external events", "side-door", APP, replace(APP, "Window(\"Demo\", id: \"main\") { View() }", "Window(\"Demo\", id: \"main\") { View() }.handlesExternalEvents(matching: [])")),
@@ -207,6 +217,7 @@ SWIFT_REFUSALS = [
     ("dump", "log", KIT, append(KIT, "func p(x: Int) { dump(x) }\n")),
     ("NSLog", "log", KIT, append(KIT, "func p() { NSLog(\"x\") }\n")),
     ("standard error", "log", KIT, append(KIT, "func p() { FileHandle.standardError.write(Data()) }\n")),
+    ("C standard output", "log", KIT, append(KIT, "func p() { fflush(stdout) }\n")),
     ("print in an interpolation", "log", KIT, append(KIT, "let s = \"\\(print(\"x\"))\"\n")),
     ("a value in a log message", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(AppEvent.launched.logToken, privacy: .public) \\(Secret.value)")),
     ("a public value", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(AppEvent.launched.rawValue, privacy: .public)")),
