@@ -2956,6 +2956,103 @@ fn status_uses_a_probe_result_only_for_what_it_was_for() {
     stale(&f.status_json());
     std::fs::write(&settings, &installed).unwrap();
     assert_eq!(row(&f.status_json(), "claude-code")["probed"], "current");
+    // EnvCloak's server registered otherwise in `.claude.json`, its name
+    // the same (the verifier's and Codex's round-2 finding): stale; put
+    // back, current, the cache reloaded by each run.
+    let claude_json = f.path(".claude.json");
+    let registered = f.text(".claude.json");
+    let v: Value = serde_json::from_str(&registered).unwrap();
+    assert!(v["mcpServers"]["envcloak"].is_object(), "{v}");
+    for (name, key, changed) in [
+        ("the command", "command", json!("/elsewhere/envcloak")),
+        ("the arguments", "args", json!(["mcp"])),
+        ("the timeout", "timeout", json!(1)),
+    ] {
+        let mut v = v.clone();
+        v["mcpServers"]["envcloak"][key] = changed;
+        std::fs::write(&claude_json, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        stale(&f.status_json());
+        std::fs::write(&claude_json, &registered).unwrap();
+        assert_eq!(
+            row(&f.status_json(), "claude-code")["probed"],
+            "current",
+            "{name} put back"
+        );
+    }
+    // Claude Code's own state written there: still current.
+    let mut v = v.clone();
+    v["numStartups"] = json!(3);
+    std::fs::write(&claude_json, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    assert_eq!(row(&f.status_json(), "claude-code")["probed"], "current");
+    std::fs::write(&claude_json, &registered).unwrap();
+    // Another working directory: another probe context, stale.
+    let elsewhere = f.path("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    stale(&f.status_in(&elsewhere, &[]));
+    f.sweep();
+}
+
+/// The host settings `agents status` reads are those of the directory it
+/// runs in, as the host reads them there (Codex review of M2-09: the
+/// nearest manifest's directory was read, so a folder below it with
+/// settings that switch the hooks off gave no token and a result stayed
+/// current): Claude Code's project settings and Codex's project layer in
+/// a folder below the manifest each give `switched_off_project`.
+///
+/// Mutation checked: status reading the manifest's directory
+/// (`working_dir()` replaced by `project_dir()` in `coverage_report`): the
+/// folder's settings give no token and this fails.
+#[test]
+fn status_reads_the_host_settings_of_its_working_directory() {
+    let f = Fixture::new();
+    let (r, code) = f.report(&["install", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    let proj = f.path("proj");
+    let sub = proj.join("sub");
+    std::fs::create_dir_all(sub.join(".claude")).unwrap();
+    std::fs::create_dir_all(sub.join(".codex")).unwrap();
+    std::fs::write(proj.join("envcloak.toml"), "[project]\nname = \"nested\"\n").unwrap();
+    let on = |v: &Value, agent: &str| -> Vec<String> {
+        HOOK_SURFACES
+            .iter()
+            .filter(|s| reasons_of(v, agent, s).contains(&"switched_off_project".to_owned()))
+            .map(|s| (*s).to_owned())
+            .collect()
+    };
+    // The control: nothing switched off there.
+    let v = f.status_in(&sub, &[]);
+    assert!(
+        on(&v, "claude-code").is_empty() && on(&v, "codex").is_empty(),
+        "{v}"
+    );
+    std::fs::write(
+        sub.join(".claude/settings.json"),
+        "{\"disableAllHooks\": true}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sub.join(".codex/config.toml"),
+        "[features]\nhooks = false\n",
+    )
+    .unwrap();
+    let v = f.status_in(&sub, &[]);
+    assert_eq!(
+        on(&v, "claude-code"),
+        ["prompt_to_model", "file_read", "shell", "mcp"],
+        "{v}"
+    );
+    let codex: Vec<&str> = HOOK_SURFACES
+        .iter()
+        .copied()
+        .filter(|s| !(*s == "shell" && cfg!(target_os = "linux")))
+        .collect();
+    assert_eq!(on(&v, "codex"), codex, "{v}");
+    // In the manifest's directory, a folder above: neither applies.
+    let v = f.status_in(&proj, &[]);
+    assert!(
+        on(&v, "claude-code").is_empty() && on(&v, "codex").is_empty(),
+        "{v}"
+    );
     f.sweep();
 }
 

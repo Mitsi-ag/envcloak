@@ -22,9 +22,11 @@
 //!   probe's evidence). States rest on the probe results kept for this
 //!   host binary (its SHA-256), version and probe context (the
 //!   fingerprint of the configuration facts, every configuration file the
-//!   host reads, the programs EnvCloak's hooks run and this `envcloak`
-//!   build; `<data>/agents/coverage.json`), recomputed here from the
-//!   person's real configuration, read-only: a result for anything else,
+//!   host reads for a session in the working directory, the parts of the
+//!   files it rewrites that register EnvCloak's server, the programs
+//!   EnvCloak's hooks run and this `envcloak` build;
+//!   `<data>/agents/coverage.json`), recomputed here from the person's
+//!   real configuration, read-only: a result for anything else,
 //!   or when the binary or the context cannot be wholly identified, reads
 //!   `unverified (changed_since_probe)`, none at all `unverified
 //!   (not_probed)`, and only a passed probe that nothing degrades reads
@@ -214,7 +216,10 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
         .data_dir;
     let cache = Cache::load(&Cache::path(&data_dir));
     let path = env("PATH").unwrap_or_default();
-    let project = project_dir()?;
+    // The configuration of a session in this directory, as each host reads
+    // it from where it runs (Codex review of M2-09: the nearest manifest's
+    // directory was read, and a nested directory's settings were not).
+    let cwd = working_dir()?;
     let mut rows = Vec::new();
     for host in install::TIER_1 {
         let detected = detect::detect(host, &path, &env);
@@ -228,7 +233,7 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
                     host,
                     &locations,
                     &coverage::claude_managed_dir(),
-                    &project,
+                    &cwd,
                     &env,
                 );
                 let mut c = coverage::assemble(host, "", &cs, Probed::None);
@@ -255,7 +260,7 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
             host,
             &locations,
             &coverage::claude_managed_dir(),
-            &project,
+            &cwd,
             &env,
         );
         let fingerprint = std::env::current_exe()
@@ -445,6 +450,13 @@ fn double_install() -> Option<String> {
 }
 
 /// The project's directory: where the nearest manifest is, or here.
+/// The working directory, resolved.
+fn working_dir() -> Result<PathBuf, Failure> {
+    std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| Failure::new("io", "the working directory could not be read"))
+}
+
 fn project_dir() -> Result<PathBuf, Failure> {
     let cwd = || Failure::new("io", "the working directory could not be read");
     match find_manifest(Path::new(".")).map_err(|_| cwd())? {
