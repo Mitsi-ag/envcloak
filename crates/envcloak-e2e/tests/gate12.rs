@@ -145,7 +145,16 @@ fn grant_the_agent(h: &mut Harness, repo: &Path, pass: &Path) {
         .to_owned();
     let approved = h.human(
         repo,
-        &["approve", &id, "--for", "1h", "--passphrase-fd", "3"],
+        &[
+            "approve",
+            &id,
+            "--for",
+            "1h",
+            "--live",
+            "OPENAI_API_KEY",
+            "--passphrase-fd",
+            "3",
+        ],
         &[(3, pass, true)],
         &[],
     );
@@ -260,7 +269,16 @@ fn panics_show_where_and_never_what() {
         .to_owned();
     let approved = h.human(
         &repo,
-        &["approve", &id, "--for", "1h", "--passphrase-fd", "3"],
+        &[
+            "approve",
+            &id,
+            "--for",
+            "1h",
+            "--live",
+            "OPENAI_API_KEY",
+            "--passphrase-fd",
+            "3",
+        ],
         &[(3, &pass, true)],
         &[],
     );

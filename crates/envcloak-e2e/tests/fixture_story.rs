@@ -147,12 +147,24 @@ fn check_emit(
     }
 }
 
-/// `envcloak approve <id> --for 1h` by the person, typing `pass`.
+/// `envcloak approve <id> --for 1h` by the person, typing `pass`, with
+/// the two live keys the project binds (OpenAI's and GitHub's) ticked: the
+/// request is an agent's, and SPEC §10b's live-key guard (M2) makes no
+/// grant without the ticks.
 fn approve(h: &mut Harness, repo: &Path, id: &str, pass: &str) -> Human {
     let typed = format!("{}\r", h.canary(pass).as_str());
     h.human(
         repo,
-        &["approve", id, "--for", "1h"],
+        &[
+            "approve",
+            id,
+            "--for",
+            "1h",
+            "--live",
+            "GITHUB_TOKEN",
+            "--live",
+            "OPENAI_API_KEY",
+        ],
         &[],
         &[("Vault passphrase to approve this: ", &typed)],
     )

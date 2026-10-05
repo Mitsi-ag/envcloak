@@ -116,16 +116,32 @@ pub(super) fn vault_and_import(h: &mut Harness, repo: &Path) {
     h.assert_swept("S0 setup");
 }
 
-/// `envcloak approve <id> --for 1h` by the person, typing the passphrase.
+/// `envcloak approve <id> --for 1h` by the person, typing the passphrase,
+/// with the two live keys the project binds (OpenAI's and GitHub's)
+/// ticked: the request is an agent's, and SPEC §10b's live-key guard
+/// makes no grant without the ticks.
 pub(super) fn approve(h: &mut Harness, repo: &Path, id: &str) -> Human {
     let typed = format!("{}\r", h.canary(labels::VAULT_PASSPHRASE).as_str());
     h.human(
         repo,
-        &["approve", id, "--for", "1h"],
+        &LIVE_APPROVAL.map(|a| if a == "ID" { id } else { a }),
         &[],
         &[("Vault passphrase to approve this: ", &typed)],
     )
 }
+
+/// `envcloak approve` with the ticks of the project's live keys, `ID`
+/// standing for the request.
+pub(super) const LIVE_APPROVAL: [&str; 8] = [
+    "approve",
+    "ID",
+    "--for",
+    "1h",
+    "--live",
+    "GITHUB_TOKEN",
+    "--live",
+    "OPENAI_API_KEY",
+];
 
 /// The request id in `approval_required: request=<ID>: ...`, as the host
 /// sent the command's output to its model.
