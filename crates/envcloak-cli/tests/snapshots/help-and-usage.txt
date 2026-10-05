@@ -8,7 +8,7 @@ usage:
   envcloak status [--json]
   envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
   envcloak daemon uninstall
-  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] -- <cmd...>
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] [--pty] -- <cmd...>
   envcloak pending [--json]
   envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
@@ -37,7 +37,6 @@ usage:
   envcloak hook --host ID --event NAME
   envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak run --pty
   envcloak reveal
   envcloak scrub
   envcloak agents migrate-mcp
@@ -64,7 +63,7 @@ usage:
   envcloak status [--json]
   envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
   envcloak daemon uninstall
-  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] -- <cmd...>
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] [--pty] -- <cmd...>
   envcloak pending [--json]
   envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
@@ -93,7 +92,6 @@ usage:
   envcloak hook --host ID --event NAME
   envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak run --pty
   envcloak reveal
   envcloak scrub
   envcloak agents migrate-mcp
@@ -142,32 +140,40 @@ envcloak: usage: envcloak daemon install [--daemon /absolute/path/to/envcloakd] 
 $ envcloak run --help
 exit: 0
 --- stdout
-usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] -- <cmd...>
+usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] [--pty] -- <cmd...>
+
+--pty runs the command on a terminal of its own: its output and errors merged, redacted on the way to yours (output a program rebuilds on the screen by moving the cursor is not covered). Your terminal is raw while it runs, so every key reaches the command, Ctrl-C included. The suspend key (Ctrl-Z, or whatever `stty susp` sets) stops the command and gives your shell its prompt back; `fg` resumes both. SIGINT, SIGQUIT, SIGTERM and SIGHUP sent to envcloak run by another process reach the command's foreground job (a nested shell's job included); a second SIGTERM kills the command. On Linux kernels before 6.9 (Ubuntu 24.04's original 6.8, Debian 12, RHEL 9), and for a job whose first process has ended, SIGTERM and SIGHUP go to the command's own process group instead: with a nested shell that is the shell, not its job. --pty needs a terminal on standard input and standard output, and exits 125 with pty_unavailable without one.
 --- stderr
 $ envcloak run
 exit: 2
 --- stdout
 --- stderr
 envcloak: run needs a command: envcloak run ... -- <cmd...>
-envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] -- <cmd...>
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] [--pty] -- <cmd...>
 $ envcloak run --bogus -- true
 exit: 2
 --- stdout
 --- stderr
 envcloak: unknown option; see envcloak run --help
-envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] -- <cmd...>
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] [--pty] -- <cmd...>
 $ envcloak run --wait 11m -- true
 exit: 2
 --- stdout
 --- stderr
 envcloak: --wait needs a duration from 1s to 10m, such as 30s or 5m
-envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] -- <cmd...>
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] [--pty] -- <cmd...>
 $ envcloak run --manifest envcloak.toml -- true
 exit: 2
 --- stdout
 --- stderr
 envcloak: --manifest needs the absolute path of an envcloak.toml
-envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] -- <cmd...>
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] [--pty] -- <cmd...>
+$ envcloak run --pty --pty -- true
+exit: 2
+--- stdout
+--- stderr
+envcloak: --pty is given twice
+envcloak: usage: envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] [--status-fd N] [--pty] -- <cmd...>
 $ envcloak pending --help
 exit: 0
 --- stdout
