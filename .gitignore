@@ -10,6 +10,9 @@
 # macOS app build output
 apps/macos/build/
 apps/macos/DerivedData/
+apps/macos/Packages/*/.build/
+apps/macos/Packages/*/.swiftpm/
+*.profraw
 *.xcuserstate
 xcuserdata/
 

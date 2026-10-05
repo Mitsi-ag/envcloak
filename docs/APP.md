@@ -73,6 +73,26 @@ That guard holds only if the way the app was started gives it no input. `open` s
 
 The app reports a screen lock and a switch away from the login session with `app.lock` (`screen_lock`, `session_resign`; SPEC §5 "Lock"), which no client can call. M3-17 picks the signal on macOS 26 and 27 (plan K3-04) among `NSWorkspace.screensDidSleepNotification`, `NSWorkspace.sessionDidResignActiveNotification` and the undocumented `com.apple.screenIsLocked` distributed notification, and records here which one, with the evidence, and whether another program running as the user can post it. Any such program can post a distributed notification, so if the app listens for one, a program can make it lock the vault early with that reason. Locking only tightens: what such a program changes is the recorded reason, never what a grant reaches. Not chosen yet.
 
+## Design tokens (M3-02)
+
+`EnvCloakDesign` holds the colours below as named colours in `Resources/Colors.xcassets`, each with a light, a dark and an Increase Contrast value in both appearances, and views take them as `ECToken.<name>.color` (`check-swift.sh`, rule `color`, refuses any other colour in the app). The values are docs/BRAND.md §3's; EnvCloakDesign's tests read this table, check every value against BRAND.md, resolve each token in light and dark as the app does, and read all four renditions of each (Increase Contrast included) from the compiled asset catalog with `assetutil` (an `NSAppearance` named for Increase Contrast resolves as plain Aqua while the system setting is off, measured on macOS 26.4.1, so a test cannot ask for those values the way the app gets them). Controls keep the system accent colour (BRAND §3).
+
+| Token | Light | Dark | Increase Contrast | Use |
+|---|---|---|---|---|
+| `background` | `#F3F0E8` | `#111110` | the same | Window and sheet content, welcome and About |
+| `raised` | `#FBFAF7` | `#1C1C1A` | the same | Code blocks, the value row, footers, the reveal field |
+| `text` | `#111110` | `#F3F0E8` | the same | Body text and marks |
+| `secondary` | `#5E5B54` | `#A9A59C` | `text` | Captions and metadata |
+| `rule` | `#D9D4C7` | `#2E2D2A` | `secondary` | Decorative dividers only, never a control's only edge |
+| `success` | `#1E6B3A` | `#4FC27E` | the same | With `checkmark.circle` and a word |
+| `warning` | `#9A4A00` | `#FF8C42` | the same | With `exclamationmark.triangle` and a word |
+| `danger` | `#B42318` | `#FF6B61` | the same | With `xmark.octagon` and a word; real failures only |
+| `info` | `#1D5A9E` | `#6EA8FE` | the same | With `info.circle` and a word |
+| `amber` | `#FFB000` | `#FFB000` | the same | The held value, only on Ink (`plate`, or the dark appearance) |
+| `plate` | `#111110` | `#0B0B0A` | the same | The approval mark's plate |
+
+Type: Martian Mono, the variable font `MartianMono[wdth,wght].ttf` from google/fonts (commit `c8bba5c4a69195e4fabc69d75136814c65fe0cf5`, SHA-256 `c3467843ec1c2574b05fbcfd7147c7bfbcf63ddca8fc2bcb9d117f1bfb1b22e7`), bundled as `Resources/Fonts/MartianMono.ttf` with its licence beside it and registered for the process at launch (`ECFonts`); `ECFont.martianMono(size:weight:width:)` comes from the motion file. Motion: `assets/brand/motion/swiftui/EnvCloakMotion.swift`, which `Sources/EnvCloakDesign/EnvCloakMotion.swift` links to rather than copies (§5 rule 5 of the M3 plan). The icon is `assets/brand/icon/EnvCloak.icon`, referenced from the project, never copied, and the menu bar template is the `EnvCloakMenuTemplate` image, whose asset links to `assets/brand/icon/menubar/EnvCloakMenuTemplate.svg`. The font's licence is a copy (a link would ship as a dangling link in the bundle), and a test keeps it byte for byte equal to `assets/brand/fonts/MartianMono-OFL.txt`.
+
 ## Build commands
 
 | Command | Task | What it does |
