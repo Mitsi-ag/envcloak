@@ -99,6 +99,7 @@ const HELP: &str = "usage:
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
+  envcloak items reclassify <slug> test|live|unknown [--passphrase-fd N] [--json]
   envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
   envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak import --scan <dir> [--yes] [--json]
@@ -117,7 +118,6 @@ Not in this build (each exits 125 with not_in_this_build):
   envcloak agents status | migrate-mcp
   envcloak mcp-bridge
   envcloak standing
-  envcloak items reclassify
   envcloak login
   envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
@@ -202,7 +202,7 @@ fn main() -> ExitCode {
 
 /// The refusal of an M2 or M2b command this build does not have, or of
 /// `run --pty`, chosen by the words that select it (the first, and for
-/// `agents` and `items` the second; for `run`, `--pty` anywhere before
+/// `agents` the second; for `run`, `--pty` anywhere before
 /// `--`); `None` for any other command line. No other argument is read.
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
@@ -215,7 +215,6 @@ fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Opti
         "login" => cmd::login::run(&[]),
         "signin" => cmd::signin::run(&[]),
         "agents" if matches!(word(1)?, "status" | "migrate-mcp") => cmd::agents::run(&[word(1)?]),
-        "items" => cmd::items::run(&[word(1)?]),
         "run"
             if args[1..]
                 .iter()

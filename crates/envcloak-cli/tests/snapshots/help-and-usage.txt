@@ -22,6 +22,7 @@ usage:
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
+  envcloak items reclassify <slug> test|live|unknown [--passphrase-fd N] [--json]
   envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
   envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak import --scan <dir> [--yes] [--json]
@@ -40,7 +41,6 @@ Not in this build (each exits 125 with not_in_this_build):
   envcloak agents status | migrate-mcp
   envcloak mcp-bridge
   envcloak standing
-  envcloak items reclassify
   envcloak login
   envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
@@ -76,6 +76,7 @@ usage:
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
+  envcloak items reclassify <slug> test|live|unknown [--passphrase-fd N] [--json]
   envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
   envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak import --scan <dir> [--yes] [--json]
@@ -94,7 +95,6 @@ Not in this build (each exits 125 with not_in_this_build):
   envcloak agents status | migrate-mcp
   envcloak mcp-bridge
   envcloak standing
-  envcloak items reclassify
   envcloak login
   envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.

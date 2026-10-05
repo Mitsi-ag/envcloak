@@ -80,13 +80,10 @@ impl Fixture {
         Agent::start(self)
     }
 
-    /// `envcloak approve <id> --for 1h` from a terminal of its own.
+    /// `envcloak approve <id> --for 1h` from a terminal of its own, with
+    /// the live keys ticked where the statement asks for them.
     fn approve(&self, id: &str) {
-        let out = run_on_terminal(
-            &self.home,
-            &["approve", id, "--for", "1h", "--passphrase-fd", "3"],
-            &[(3, &self.pass, true)],
-        );
+        let out = common::approve_ticking(&self.home, id, &["--for", "1h"], &self.pass);
         assert_no_canary(&out.stdout, &self.cs);
         assert_no_canary(&out.stderr, &self.cs);
         assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
