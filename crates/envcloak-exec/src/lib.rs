@@ -566,6 +566,12 @@ fn follow(
         if let Ok(f) = f {
             let _ = f.join();
         }
+        // A test build stops here on request: the forwarder ended, the
+        // result not chosen yet (M2-19's boundary gate, pipe mode).
+        envcloak_sys::pause_point("exec.follow.ended");
+        // A signal caught after the stop and not read still decides the
+        // result; one after this acts as without the relay.
+        forwarder.close(&cutoff);
         // The forwarder has read every signal caught before its stop: a
         // SIGTERM that came while the output was read (it stopped the run)
         // ends what the child left in its group too, before the child is
