@@ -123,13 +123,24 @@ esac
 # - SIGPIPE is ignored, so a write to a closed standard error fails and
 #   `set -e` takes that path like any other error; the cleanup runs with
 #   `set +e`, so a message it cannot write stops nothing.
-# - Each directory the script makes is named `<prefix>.<pid>.<random>`,
-#   and the cleanup removes every such name of this process, so one made in
-#   the instant before its name reached a variable is removed too.
+# - Each directory the script makes is named `<prefix>.<pid>.<run>.<random>`,
+#   where <run> is drawn once per run from /dev/urandom, and the cleanup
+#   removes every such name of this run, so one made in the instant before
+#   its name reached a variable is removed too. An earlier run with the same
+#   pid may have kept its previous app in such a directory ("kept at"); its
+#   <run> differs, so this run never removes it.
 # - The cleanup ignores the four signals while it runs, and the commands it
 #   starts inherit that, so a second signal cannot cut a restore short.
 # After the cleanup, a script stopped by HUP, INT or TERM ends by that
 # signal (a calling shell sees it); by QUIT, with status 131 and no core.
+# This run's part of every name it makes (12 hexadecimal digits), read
+# before any trap is set, so no program runs in a command substitution
+# after that.
+run_token="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+case "$run_token" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *) die "cannot read a run token from /dev/urandom" ;;
+esac
 out_prefix=""
 install_prefix=""
 work_prefix="${TMPDIR:-/tmp}"
@@ -156,7 +167,7 @@ cleanup() {
   fi
   for prefix in "$work_prefix" "$out_prefix" "$install_prefix"; do
     [ -n "$prefix" ] || continue
-    for dir in "$prefix".$$.*; do
+    for dir in "$prefix.$$.$run_token".*; do
       if { [ -e "$dir" ] || [ -L "$dir" ]; } && [ "$dir" != "$keep" ]; then
         rm -rf "$dir"
       fi
@@ -182,18 +193,19 @@ trap 'stop QUIT 3' QUIT
 trap 'stop TERM 15' TERM
 trap '' PIPE
 
-# make_dir VAR PREFIX: makes the directory PREFIX.<pid>.<random> (0700; mkdir
-# refuses a name that exists, a symbolic link included) and sets VAR to it.
+# make_dir VAR PREFIX: makes the directory PREFIX.<pid>.<run>.<random> (0700;
+# mkdir refuses a name that exists, a symbolic link included) and sets VAR
+# to it.
 make_dir() {
   local path tries=0
   while :; do
-    path="$2.$$.$RANDOM$RANDOM"
+    path="$2.$$.$run_token.$RANDOM$RANDOM"
     if mkdir -m 0700 "$path" 2>/dev/null; then
       eval "$1=\$path"
       return 0
     fi
     tries=$((tries + 1))
-    [ "$tries" -lt 20 ] || die "cannot make a directory named $2.$$.*"
+    [ "$tries" -lt 20 ] || die "cannot make a directory named $2.$$.$run_token.*"
   done
 }
 

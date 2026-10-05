@@ -28,7 +28,12 @@ Every case runs under each bash found: /bin/bash (3.2) and the first other
 bash on the usual paths, which `#!/usr/bin/env bash` picks on a Mac with
 Homebrew. Each script runs in its own session with a cleared environment,
 the four signals at their defaults and a core limit of zero, inside a short
-temporary directory that is removed afterwards.
+temporary directory that is removed afterwards. However a case ends, a
+failed assertion included, every process of the script's group is killed
+and the script reaped before its tree is removed (procgroup.py), and a
+cleanup that cannot be confirmed fails the case; a hold also gives up on
+its own after a bound. The script is never reaped before its group is
+empty, so no signal can reach a process that took a reaped pid (L-03).
 
 With --script PATH the cases run against another copy of build-app.sh. Run
 against the script before this test's round (an EXIT trap only, mktemp names
@@ -40,7 +45,6 @@ Usage: python3 scripts/macos/tests/test_build_swap.py [--script PATH]
 
 import hashlib
 import os
-import resource
 import shutil
 import signal
 import subprocess
@@ -50,6 +54,8 @@ import time
 import unittest
 
 sys.dont_write_bytecode = True
+
+from procgroup import Group  # noqa: E402 (after the bytecode switch)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = {"path": os.path.join(os.path.dirname(HERE), "build-app.sh")}
@@ -71,17 +77,20 @@ def bashes():
 
 
 # The loop counter is local: the mv stand-in's own `n` (the move's number)
-# must survive a hold.
+# must survive a hold. A hold gives up after twice WAIT whatever the test
+# does; with HEARTBEAT set it appends a byte there on each poll, so a test
+# can see from outside the tree whether any hold still runs.
 HOLD = """hold() {
   local tries=0
   : >"$FAKE/held.$1"
   while [ ! -e "$FAKE/release.$1" ]; do
+    [ -z "${HEARTBEAT:-}" ] || printf . >>"$HEARTBEAT"
     /bin/sleep 0.02
     tries=$((tries + 1))
-    [ "$tries" -lt 20000 ] || exit 99
+    [ "$tries" -lt %d ] || exit 99
   done
 }
-"""
+""" % int(2 * WAIT / 0.02)
 
 STUBS = {
     "cargo": """#!/bin/bash
@@ -180,26 +189,6 @@ def mark_app(path):
     return hashlib.sha256(data).digest()
 
 
-def live_in_group(pgid):
-    """Processes still running in a process group: read from ps, since
-    macOS answers kill(-pgid, 0) with EPERM while a member is a zombie
-    waiting to be reaped (seen in this test), which is no step left
-    running."""
-    out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,pgid=,stat="], stdout=subprocess.PIPE, check=True).stdout.decode()
-    live = []
-    for line in out.splitlines():
-        fields = line.split()
-        if len(fields) >= 3 and fields[1] == str(pgid) and not fields[2].startswith("Z"):
-            live.append(int(fields[0]))
-    return live
-
-
-def child_setup():
-    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGPIPE):
-        signal.signal(sig, signal.SIG_DFL)
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
-
 class Build:
     """One run of build-app.sh in its own tree."""
 
@@ -254,7 +243,8 @@ class Build:
             self.aside = out_moves + 1 if has_old else None
             self.move_in = out_moves + (2 if has_old else 1)
         self.restore = self.move_in + 1
-        self.proc = None
+        self.group = None
+        self.err_read = None
         self.err_path = os.path.join(r, "stderr")
         self.out_path = os.path.join(r, "stdout")
 
@@ -272,23 +262,22 @@ class Build:
             self.err_read, err_write = os.pipe()
             stderr = err_write
         else:
-            self.err_read = None
             stderr = open(self.err_path, "wb")
-        self.proc = subprocess.Popen(
-            args, cwd=self.root, env=self.env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True, preexec_fn=child_setup
-        )
-        stdout.close()
-        if stderr_pipe:
-            os.close(err_write)
-        else:
-            stderr.close()
+        try:
+            self.group = Group(args, cwd=self.root, env=self.env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+        finally:
+            stdout.close()
+            if stderr_pipe:
+                os.close(err_write)
+            else:
+                stderr.close()
 
     def wait_held(self, name):
         path = os.path.join(self.fake, "held." + name)
         deadline = time.monotonic() + WAIT
         while not os.path.exists(path):
-            if self.proc.poll() is not None:
-                raise AssertionError("the script ended (%s) before %s held\n%s" % (self.proc.returncode, name, self.stderr()))
+            if self.group.ended():
+                raise AssertionError("the script ended before %s held\n%s" % (name, self.stderr()))
             if time.monotonic() > deadline:
                 raise AssertionError("%s never held\n%s" % (name, self.stderr()))
             time.sleep(0.01)
@@ -297,44 +286,45 @@ class Build:
         write(os.path.join(self.fake, "release." + name), "")
 
     def signal(self, name, group):
-        sig = getattr(signal, "SIG" + name)
-        if group:
-            os.killpg(self.proc.pid, sig)
-        else:
-            os.kill(self.proc.pid, sig)
+        self.group.signal(getattr(signal, "SIG" + name), group)
+
+    def running(self):
+        """Whether the script has not ended (it is left unreaped)."""
+        return not self.group.ended()
 
     def finish(self):
-        """Waits for the script; returns (status, processes left)."""
-        try:
-            status = self.proc.wait(timeout=WAIT)
-        except subprocess.TimeoutExpired:
-            ps = subprocess.run(["/bin/ps", "-o", "pid,pgid,stat,command", "-g", str(self.proc.pid)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode()
+        """Waits for the script to end; returns (its status, whether a
+        process of its group was still running after it ended). Whatever is
+        left is killed and the script reaped (close)."""
+        if not self.group.wait_ended(WAIT):
+            ps = self.group.ps()
             files = sorted(n for n in os.listdir(self.fake) if n.startswith(("held.", "release.")))
-            for pid in live_in_group(self.proc.pid):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            self.proc.wait()
+            self.close()
             raise AssertionError("the script did not end\n%s\n%s\n%s" % (self.stderr(), ps, files))
+        # Read before the script is reaped, while the group's id is still
+        # this test's.
         left = True
         for _ in range(20):
-            if not live_in_group(self.proc.pid):
+            if not self.group.live():
                 left = False
                 break
             time.sleep(0.05)
-        if left:
-            for pid in live_in_group(self.proc.pid):
+        return self.close(), left
+
+    def close(self):
+        """Ends every process of the script's group and reaps the script
+        (procgroup.Group.close), then closes the test's end of a standard
+        error pipe; returns the script's status. Idempotent; raises when the
+        cleanup cannot be confirmed."""
+        try:
+            return self.group.close() if self.group is not None else None
+        finally:
+            if self.err_read is not None:
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    os.close(self.err_read)
                 except OSError:
                     pass
-        if self.err_read is not None:
-            try:
-                os.close(self.err_read)
-            except OSError:
-                pass
-        return status, left
+                self.err_read = None
 
     def stderr(self):
         try:
@@ -411,11 +401,19 @@ class BuildApp(unittest.TestCase):
         for bash in self.bashes:
             for site in sites:
                 with self.subTest(bash=bash, site=site):
-                    b = Build(self.base, bash, site, **kw)
-                    try:
-                        case(b)
-                    finally:
-                        b.remove()
+                    self.run_case(case, bash, site, **kw)
+
+    def run_case(self, case, bash, site, **kw):
+        """One case in its own tree. However it ends, its processes are
+        ended and confirmed gone before the tree is removed."""
+        b = Build(self.base, bash, site, **kw)
+        try:
+            case(b)
+        finally:
+            try:
+                b.close()
+            finally:
+                b.remove()
 
     def at(self, b, name):
         return b.where().get(name, [])
@@ -523,7 +521,7 @@ class BuildApp(unittest.TestCase):
         if not group:
             # Sent to the script alone, it waits for the step in progress.
             time.sleep(0.3)
-            self.assertIsNone(b.proc.poll(), "the script ended while its step still ran\n" + b.stderr())
+            self.assertTrue(b.running(), "the script ended while its step still ran\n" + b.stderr())
         b.release("mv%d" % b.aside)
         status, left = b.finish()
         self.assertEqual(status, STATUS[name], b.stderr())
@@ -588,7 +586,7 @@ class BuildApp(unittest.TestCase):
                     b.signal(name, group)
                     if not group:
                         time.sleep(0.3)
-                        self.assertIsNone(b.proc.poll(), "the script ended while %s still ran\n%s" % (step, b.stderr()))
+                        self.assertTrue(b.running(), "the script ended while %s still ran\n%s" % (step, b.stderr()))
                     b.release(step)
                     status, left = b.finish()
                     self.assertEqual(status, STATUS[name], b.stderr())
@@ -627,6 +625,69 @@ class BuildApp(unittest.TestCase):
             self.assertClean(b, left)
 
         self.each(case)
+
+    def test_an_earlier_runs_kept_app_with_the_same_pid_is_left_alone(self):
+        # An earlier run that could not restore kept the previous app in its
+        # staging directory and said where. A later run that happens to get
+        # the same pid removes only its own directories, whether it ends in
+        # success or by a signal between the moves.
+        for how in ("success", "signal"):
+            with self.subTest(how=how):
+
+                def case(b):
+                    b.start(CARGO_HOLD=1, **({"MV_HOLD_AFTER": b.aside} if how == "signal" else {}))
+                    b.wait_held("cargo")
+                    kept = []
+                    for d, prefix in ((b.out, ".stage."), (b.inst, ".EnvCloak.install."), (b.tmp, "ec-build-app.")):
+                        earlier = os.path.join(d, "%s%d.000000000000.1" % (prefix, b.group.pgid))
+                        b.marks["kept " + prefix] = mark_app(os.path.join(earlier, "previous.app"))
+                        kept.append(os.path.relpath(earlier, b.root))
+                    b.release("cargo")
+                    if how == "signal":
+                        b.wait_held("mv%d" % b.aside)
+                        b.signal("TERM", True)
+                        b.release("mv%d" % b.aside)
+                    status, left = b.finish()
+                    self.assertEqual(status, 0 if how == "success" else -signal.SIGTERM, b.stderr())
+                    for d, prefix in ((b.out, ".stage."), (b.inst, ".EnvCloak.install."), (b.tmp, "ec-build-app.")):
+                        self.assertEqual(self.at(b, "kept " + prefix), [os.path.join(os.path.relpath(d, b.root), "%s%d.000000000000.1" % (prefix, b.group.pgid), "previous.app")])
+                    self.assertClean(b, left, keep=kept)
+
+                self.each(case)
+
+    # ------------------------------------------------------------ harness
+
+    def test_a_case_that_fails_early_leaves_no_process_running(self):
+        # A case that fails while a stand-in holds (here, between the two
+        # moves of a replacement, the script waiting on it) still ends
+        # every process of the script's group: no hold polls on after the
+        # case, though its tree, and the release it waited for, are gone.
+        class Early(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory(prefix="ecbh", dir="/tmp") as watch:
+            heartbeat = os.path.join(watch, "beat")
+            started = []
+
+            def case(b):
+                started.append(b)
+                b.start(MV_HOLD_AFTER=b.aside, HEARTBEAT=heartbeat)
+                b.wait_held("mv%d" % b.aside)
+                self.assertTrue(b.group.live(), "nothing was running in the script's group")
+                raise Early()
+
+            try:
+                with self.assertRaises(Early):
+                    self.run_case(case, self.bashes[0], "output")
+                before = os.path.getsize(heartbeat)
+                time.sleep(1.0)
+                self.assertEqual(os.path.getsize(heartbeat), before, "a hold still polls after the case ended")
+                self.assertIsNotNone(started[0].group.status, "the script was not reaped")
+            finally:
+                # Without run_case's cleanup (the mutation this test is
+                # checked against), the hold is still running here.
+                for b in started:
+                    b.close()
 
 
 def main():
