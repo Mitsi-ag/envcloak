@@ -22,8 +22,12 @@
 //!    order between the two streams is not kept. Standard input is
 //!    inherited. The child sees pipes, not a terminal, so programs that
 //!    color their output only on a terminal print plain text. PTY mode
-//!    (`--pty`) starts the command on a pseudo-terminal of its own instead
-//!    ([`start_pty`], M2 task M2-17; the relay is M2-19's).
+//!    (`--pty`, [`RunSpec::pty`]) starts the command on a pseudo-terminal of
+//!    its own instead, under a PTY monitor ([`start_pty`]), and relays its
+//!    merged output through one stream of the redactor, which also holds
+//!    the CR LF form of every value holding LF ([`build_pty_redactor`]),
+//!    the person's keys to it, and its suspension and signals (`pty`,
+//!    `job_control`; docs/RUN.md "PTY mode").
 //! 4. Signals ([`signals`]): with a controlling terminal the child stays in
 //!    this process's group, so the terminal's SIGINT and SIGQUIT reach it
 //!    directly; SIGTERM and SIGHUP are passed on, and so are a SIGINT or
@@ -63,6 +67,8 @@
 //! process.
 
 mod coverage;
+mod job_control;
+mod pty;
 mod pump;
 mod signals;
 mod spawn;
@@ -81,8 +87,10 @@ use envcloak_sys::pty::SessionMonitor;
 use envcloak_sys::{Interrupter, TerminalSettings, WindowSize};
 
 pub use coverage::{
-    COMFORT_LEN, CoverageReport, Label, MIN_VALUE_LEN, ShortPolicy, build_redactor,
+    COMFORT_LEN, CoverageReport, Label, MIN_VALUE_LEN, ShortPolicy, build_pty_redactor,
+    build_redactor,
 };
+pub use pty::{INPUT_CHUNK, OUTPUT_LIMIT, OuterTerminal};
 
 /// A command started on a pseudo-terminal of its own (PTY mode; M2 task
 /// M2-17 starts it, M2-19 relays it): the PTY's master side, which carries
@@ -148,16 +156,30 @@ pub struct RunSpec {
     /// own: the values of the run's bindings and an env file's ordinary
     /// variables. A later entry for a name wins.
     pub injected: Vec<(EnvName, SecretBytes)>,
-    /// Built by [`build_redactor`] from the bindings' values.
+    /// Built by [`build_redactor`] from the bindings' values (by
+    /// [`build_pty_redactor`] for PTY mode).
     pub redactor: Redactor,
     /// [`IDLE_FLUSH`] ([`RunSpec::new`]), or shorter in tests.
     pub idle_flush: Duration,
-    /// The child's standard input; `None` shares this process's.
-    pub stdin: Option<OwnedFd>,
-    /// Where the redacted standard output goes.
-    pub stdout: OwnedFd,
-    /// Where the redacted standard error goes.
-    pub stderr: OwnedFd,
+    /// Pipes (the default) or a pseudo-terminal.
+    pub io: RunIo,
+}
+
+/// How the command's input and output are carried.
+pub enum RunIo {
+    /// Pipe mode: standard output and standard error are separate pipes,
+    /// each redacted on its own.
+    Pipes {
+        /// The child's standard input; `None` shares this process's.
+        stdin: Option<OwnedFd>,
+        /// Where the redacted standard output goes.
+        stdout: OwnedFd,
+        /// Where the redacted standard error goes.
+        stderr: OwnedFd,
+    },
+    /// PTY mode: the command on a pseudo-terminal of its own, its merged
+    /// output redacted to the outer terminal, which is raw for the run.
+    Pty(OuterTerminal),
 }
 
 impl RunSpec {
@@ -176,9 +198,32 @@ impl RunSpec {
             injected,
             redactor,
             idle_flush: IDLE_FLUSH,
-            stdin: None,
-            stdout,
-            stderr,
+            io: RunIo::Pipes {
+                stdin: None,
+                stdout,
+                stderr,
+            },
+        }
+    }
+
+    /// A PTY run of `argv` with `injected` in its environment, on a new
+    /// pseudo-terminal whose settings and size are `terminal`'s, its
+    /// merged output through `redactor` (from [`build_pty_redactor`]) to
+    /// `terminal`: the idle flush is [`IDLE_FLUSH`]. The window size is
+    /// read from `terminal` when the run starts, and again on each
+    /// SIGWINCH and resume.
+    pub fn pty(
+        argv: Vec<OsString>,
+        injected: Vec<(EnvName, SecretBytes)>,
+        redactor: Redactor,
+        terminal: OuterTerminal,
+    ) -> RunSpec {
+        RunSpec {
+            argv,
+            injected,
+            redactor,
+            idle_flush: IDLE_FLUSH,
+            io: RunIo::Pty(terminal),
         }
     }
 }
@@ -191,7 +236,17 @@ impl core::fmt::Debug for RunSpec {
             .field("injected", &names)
             .field("redactor", &self.redactor)
             .field("idle_flush", &self.idle_flush)
+            .field("pty", &matches!(self.io, RunIo::Pty(_)))
             .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for RunIo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            RunIo::Pipes { .. } => "Pipes",
+            RunIo::Pty(_) => "Pty",
+        })
     }
 }
 
@@ -257,6 +312,15 @@ pub enum ExecError {
     /// did what it did; how it ended is not known
     /// ([`ExecError::may_have_started`]).
     Followed(io::ErrorKind),
+    /// PTY mode without a terminal on standard input and standard output
+    /// (or one the relay cannot open): `--pty` never falls back to pipe
+    /// mode (SPEC §6.1 step 7). Nothing was started.
+    PtyUnavailable,
+    /// PTY mode: the monitor died before it reported the command's exit.
+    /// The kernel hung up the command's session; its output was drained
+    /// redacted until its end or the cutoff. The command was started, and
+    /// how it ended is not known (SPEC §6.1 step 8).
+    MonitorLost,
 }
 
 impl ExecError {
@@ -279,16 +343,19 @@ impl ExecError {
             ExecError::NotFound => "command_not_found",
             ExecError::NotExecutable(_) => "command_not_executable",
             ExecError::Setup(_) | ExecError::Followed(_) => "run_failed",
+            ExecError::PtyUnavailable => "pty_unavailable",
+            ExecError::MonitorLost => "pty_monitor_lost",
         }
     }
 
     /// Whether the command may have been started before this failure:
-    /// only [`ExecError::Followed`]. Every other failure comes before the
-    /// command could run (a spawn that fails runs nothing), so a program
-    /// that started `envcloak run` may tell "not started" from "may have
-    /// run" by this, never by the exit code or the output.
+    /// only [`ExecError::Followed`] and [`ExecError::MonitorLost`]. Every
+    /// other failure comes before the command could run (a spawn that
+    /// fails runs nothing), so a program that started `envcloak run` may
+    /// tell "not started" from "may have run" by this, never by the exit
+    /// code or the output.
     pub fn may_have_started(&self) -> bool {
-        matches!(self, ExecError::Followed(_))
+        matches!(self, ExecError::Followed(_) | ExecError::MonitorLost)
     }
 
     /// A fixed message: no argument, value or path.
@@ -311,6 +378,14 @@ impl ExecError {
             ExecError::Followed(_) => {
                 "the command was started, but could not be followed to its end (pipes, threads \
                  or waiting for it): it may have run"
+            }
+            ExecError::PtyUnavailable => {
+                "--pty needs a terminal on standard input and standard output; it never falls \
+                 back to pipe mode, and nothing was sent or started"
+            }
+            ExecError::MonitorLost => {
+                "the PTY monitor ended before it reported how the command ended; its session \
+                 was hung up and your terminal restored: the command may have run"
             }
         }
     }
@@ -340,13 +415,21 @@ pub fn run(spec: RunSpec) -> Result<ChildExit, ExecError> {
         injected,
         redactor,
         idle_flush,
-        stdin,
-        stdout,
-        stderr,
+        io,
     } = spec;
     if argv.is_empty() {
         return Err(ExecError::NoCommand);
     }
+    let (stdin, stdout, stderr) = match io {
+        RunIo::Pipes {
+            stdin,
+            stdout,
+            stderr,
+        } => (stdin, stdout, stderr),
+        RunIo::Pty(terminal) => {
+            return pty::run(&argv, injected, &redactor, idle_flush, terminal);
+        }
+    };
     let terminal = signals::controlling_terminal();
     // Caught before the child exists, so a signal that arrives just after
     // it starts is passed on rather than ending this process mid-output.
@@ -523,7 +606,7 @@ mod tests {
             dev_null(),
         );
         assert_eq!(spec.idle_flush, IDLE_FLUSH);
-        assert!(spec.stdin.is_none());
+        assert!(matches!(spec.io, RunIo::Pipes { stdin: None, .. }));
     }
 
     /// A run stopped by a signal after the child's exit reports 128 plus

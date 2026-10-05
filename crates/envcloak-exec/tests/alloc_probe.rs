@@ -69,16 +69,15 @@ fn starting_a_child_with_values_frees_nothing_unwiped() {
             .zip(values)
             .map(|(l, v)| (EnvName::new(l).unwrap(), v))
             .collect();
-        let exit = run(RunSpec {
-            argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+        let mut spec = RunSpec::new(
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
             injected,
             redactor,
-            idle_flush: Duration::from_millis(40),
-            stdin: None,
-            stdout: dev_null(),
-            stderr: dev_null(),
-        })
-        .unwrap();
+            dev_null(),
+            dev_null(),
+        );
+        spec.idle_flush = Duration::from_millis(40);
+        let exit = run(spec).unwrap();
         assert_eq!(exit, ChildExit::Code(0));
     }
     let report = session.finish();

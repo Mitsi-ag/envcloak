@@ -258,12 +258,99 @@ impl Forwarder {
     }
 }
 
+/// The signals PTY mode catches (`envcloak run --pty`, [`crate::pty`]):
+/// the four it forwards, SIGTSTP from another process, SIGCONT (the
+/// person's `fg`) and SIGWINCH (the outer terminal resized). With the outer
+/// terminal raw, the person's keys reach the command's terminal as bytes,
+/// so the outer terminal itself sends the CLI none of them: every SIGINT
+/// or SIGQUIT the CLI gets was sent by a process (or by a hangup).
+pub(crate) const PTY_CAUGHT: [i32; 7] = [
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGTSTP,
+    libc::SIGCONT,
+    libc::SIGWINCH,
+];
+
+/// What PTY mode does with a caught signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtyAct {
+    /// Forward it once to the slave's foreground job
+    /// (`envcloak_sys::pty::forward_signal`, M2 plan D-35).
+    Forward(i32),
+    /// SIGKILL to the command's group, through the monitor, in place of a
+    /// second SIGTERM (as in pipe mode: a command that ignores SIGTERM
+    /// would otherwise outlive the CLI killed in turn).
+    Kill,
+    /// The command has exited (or its monitor is gone): stop the run at
+    /// once, 128 plus this signal (review T12-2).
+    Stop(i32),
+    /// SIGTSTP from another process: stop the command first
+    /// ([`crate::job_control::stop_requested`]).
+    Suspend,
+    /// SIGCONT: raw mode and the size again.
+    Continued,
+    /// SIGWINCH: the outer terminal's size to the PTY.
+    Resize,
+    /// Nothing to do.
+    Nothing,
+}
+
+/// What PTY mode does with caught signal `sig`, once the command has
+/// exited (or its monitor is gone) when `ended`, after `terms_passed`
+/// SIGTERMs were forwarded.
+pub(crate) fn pty_act(sig: i32, ended: bool, terms_passed: u32) -> PtyAct {
+    match sig {
+        libc::SIGINT | libc::SIGQUIT | libc::SIGHUP | libc::SIGTERM if ended => PtyAct::Stop(sig),
+        libc::SIGTERM if terms_passed > 0 => PtyAct::Kill,
+        libc::SIGINT | libc::SIGQUIT | libc::SIGHUP | libc::SIGTERM => PtyAct::Forward(sig),
+        libc::SIGTSTP if !ended => PtyAct::Suspend,
+        libc::SIGCONT => PtyAct::Continued,
+        libc::SIGWINCH if !ended => PtyAct::Resize,
+        _ => PtyAct::Nothing,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    /// PTY mode: the four are forwarded once each while the command runs,
+    /// a second SIGTERM kills the command's group, every one of the four
+    /// stops the run once the command has exited; SIGTSTP stops the
+    /// command, SIGCONT and SIGWINCH reach the terminal. No signal is ever
+    /// turned into SIGSTOP.
+    #[test]
+    fn pty_mode_forwards_the_four_and_stops_the_run_after_the_exit() {
+        let (int, quit, term, hup) = (libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP);
+        for sig in [int, quit, term, hup] {
+            assert_eq!(pty_act(sig, false, 0), PtyAct::Forward(sig), "{sig}");
+            assert_eq!(pty_act(sig, true, 0), PtyAct::Stop(sig), "{sig}");
+        }
+        assert_eq!(pty_act(int, false, 3), PtyAct::Forward(int));
+        assert_eq!(pty_act(term, false, 1), PtyAct::Kill);
+        assert_eq!(pty_act(term, true, 1), PtyAct::Stop(term));
+        assert_eq!(pty_act(libc::SIGTSTP, false, 0), PtyAct::Suspend);
+        assert_eq!(pty_act(libc::SIGTSTP, true, 0), PtyAct::Nothing);
+        assert_eq!(pty_act(libc::SIGCONT, false, 0), PtyAct::Continued);
+        assert_eq!(pty_act(libc::SIGCONT, true, 0), PtyAct::Continued);
+        assert_eq!(pty_act(libc::SIGWINCH, false, 0), PtyAct::Resize);
+        assert_eq!(pty_act(libc::SIGWINCH, true, 0), PtyAct::Nothing);
+        assert_eq!(pty_act(libc::SIGUSR1, false, 0), PtyAct::Nothing);
+        for sig in PTY_CAUGHT {
+            for ended in [false, true] {
+                assert!(
+                    !matches!(pty_act(sig, ended, 0), PtyAct::Forward(libc::SIGSTOP)),
+                    "{sig}"
+                );
+            }
+        }
+    }
 
     /// The relay is process-wide, so the tests that install one take
     /// turns.
